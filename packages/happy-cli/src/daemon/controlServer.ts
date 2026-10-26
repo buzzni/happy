@@ -118,7 +118,7 @@ export function startDaemonControlServer({
 }: {
   getDeviceEnrollment?: () => ReturnType<typeof createDeviceEnrollment> | null;
   /** Saycode specs/claude-setup-token-account-selection — null until the AI credential runtime exists. */
-  getSetupTokenAccountSwitch?: () => SetupTokenAccountSwitch | null;
+  getSetupTokenAccountSwitch?: () => Pick<SetupTokenAccountSwitch, 'availability' | 'returnFromPersonal' | 'reportUsage' | 'rebind'> | null;
   writeScopeRuntime?: SessionWriteScopeRuntime | null;
   standaloneDrain?: StandaloneDrain;
   /** aplus codexcli-daemon-restart-drain — absent on preflight and in tests that do not drain. */

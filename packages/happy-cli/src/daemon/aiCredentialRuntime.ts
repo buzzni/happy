@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { createPersonalProbeScheduler } from './personalProbeScheduler'
 import { createTokenProbe, personalProbeSupported, readTokenRuntime } from './tokenProbe'
-import { createClaudeCollector, consumeCollectorPermit, collectorVerificationReady, authorizeCollectorRequest } from './claudeCollector'
+import { createClaudeCollector, createPermitMeasure, consumeCollectorPermit, collectorVerificationReady, authorizeCollectorRequest } from './claudeCollector'
 import { createCredentialGroupSync, type CredentialGroupRequest } from './aiCredentialGroups'
 import { createGroupProviderAdapters, groupAccountIdentity, groupPayloadIdentities } from './aiCredentialGroupAdapters'
 import { spawn as crossSpawn } from 'cross-spawn'
@@ -48,7 +48,7 @@ import {
 
 const MAX_PAYLOAD_BYTES = 1024 * 1024
 const CLAUDE_SWAP_PACKAGE = 'saycode-claude-swap'
-const CLAUDE_SWAP_VERSION = '0.27.0b2'
+const CLAUDE_SWAP_VERSION = '0.27.0b3'
 /** Windows: the daemon's claude-swap calls and `cswap auto` run through this verified base Python (RE8). */
 export const claudeSwapPython = createClaudeSwapPythonResolver({ platform: process.platform, find: () => findClaudeSwapPython(CLAUDE_SWAP_PACKAGE, process.env), verify: verifyClaudeSwapPython })
 const CLAUDE_STATUS_TIMEOUT_MS = 120_000
@@ -149,6 +149,11 @@ export type AiCredentialRuntimeDependencies = {
   codexProxyStatus?: () => { activeRoutes: number }
   /** Present only when the daemon has a trusted Studio origin configured. */
   setupTokenBinding?: Pick<SetupTokenBindingVerifier, 'verify' | 'available'>
+  /**
+   * Saycode specs/setup-token-switch-usage-check — Studio's pick among the accounts this shared PC holds; a move checks a
+   * candidate first. The account, null when none is usable, undefined when Studio could not answer.
+   */
+  sharedChoose?(input: { companyId: string; candidates: Array<{ managedAccountId: string; credentialGeneration: number }>; exclude: string[]; measure: boolean }): Promise<string | null | undefined>
   machineSetupTokenStart?(binding: MachineSetupTokenBindingRecord): Promise<void>
   machineSetupTokenAuthority?(binding: MachineSetupTokenBindingRecord): Promise<void>
   /** Managed account IDs the daemon's running sessions are bound to; a group sync leaves their slots for a later sync. */
@@ -2276,27 +2281,16 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
    * `account`: exactly the account a prepared launch runs on; `moveFrom`: another usable account for a
    * session leaving that one. Either is null when there is none.
    */
-  async function sharedMachineSessionEnvironment(choice?: { account: string | undefined } | { moveFrom: string }): Promise<Record<string, string> | null> {
-    if (!deps.machineId || await groups.hasManagedDesired('claude', 'user')) return null
-    const entries = await groups.machineManaged('claude', deps.machineId)
-    if (entries.length === 0) return null
-    if (entries.some(entry => entry.pending)) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_ASSIGNMENT_UNRESOLVED')
-    if (!await setupTokenRuntimeSupported()) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_UNSUPPORTED')
-    const identities = new Set(entries.flatMap(entry => entry.managed))
+  async function sharedMachineSessionEnvironment(choice?: { account: string | undefined } | { moveFrom: string } | { prefer: string }): Promise<Record<string, string> | null> {
+    const held = await sharedMachineCandidates()
+    if (!held) return null
     return withSafeErrors('CLAUDE_SETUP_TOKEN_MACHINE_DEFAULT_UNAVAILABLE', async () => {
-      const { listed, exported } = await readSlotRosterAndExport()
-      const slots: Array<Record<string, unknown>> = Array.isArray(exported?.accounts) ? exported.accounts : []
-      const candidates = slots.flatMap(slot => {
-        const id = managedSetupTokenId(slot?.email)
-        const accessToken = (slot?.credentials as { claudeAiOauth?: { accessToken?: unknown } } | undefined)?.claudeAiOauth?.accessToken
-        const enabled = listed.some(account => account.email === slot.email && account.disabled !== true)
-        return id !== null && identities.has(setupTokenGroupIdentity(id)) && enabled && slot.credentialType === 'setup_token'
-          && slot.managedAccountId === id && typeof accessToken === 'string' && accessToken.startsWith('sk-ant-oat01-') ? [{ managedAccountId: id, token: accessToken }] : []
-      })
+      const { candidates } = await held.read()
       const usable = candidates.filter(candidate => !sharedAccountUsedUp(candidate.managedAccountId))
       // With every account used up a launch still gets the default: the provider's refusal then speaks.
       const chosen = !choice ? usable[0] ?? candidates[0]
         : 'account' in choice ? candidates.find(candidate => candidate.managedAccountId === choice.account)
+        : 'prefer' in choice ? candidates.find(candidate => candidate.managedAccountId === choice.prefer) ?? usable[0] ?? candidates[0]
         : usable.find(candidate => candidate.managedAccountId !== choice.moveFrom)
       if (!chosen) {
         if (choice) return null
@@ -2306,6 +2300,61 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       return { ...cleared, CLAUDE_CODE_OAUTH_TOKEN: chosen.token, [HAPPY_AI_AUTH_SOURCE_ENV]: 'org-bundle', HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1',
         [SETUP_TOKEN_SHARED_ACCOUNT_ENV]: chosen.managedAccountId }
     })
+  }
+
+  /**
+   * The setup-token accounts assigned to this shared machine that its slots hold. Null when the machine has no such
+   * assignment or a user assignment desires a setup-token; `read` lists them (it reads the slot roster).
+   */
+  async function sharedMachineCandidates() {
+    if (!deps.machineId || await groups.hasManagedDesired('claude', 'user')) return null
+    const entries = await groups.machineManaged('claude', deps.machineId)
+    if (entries.length === 0) return null
+    if (entries.some(entry => entry.pending)) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_ASSIGNMENT_UNRESOLVED')
+    if (!await setupTokenRuntimeSupported()) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_UNSUPPORTED')
+    const identities = new Set(entries.flatMap(entry => entry.managed))
+    return {
+      companyId: entries.length === 1 ? entries[0].scope : null,
+      async read() {
+        const { listed, exported } = await readSlotRosterAndExport()
+        const slots: Array<Record<string, unknown>> = Array.isArray(exported?.accounts) ? exported.accounts : []
+        const candidates = slots.flatMap(slot => {
+          const id = managedSetupTokenId(slot?.email)
+          const accessToken = (slot?.credentials as { claudeAiOauth?: { accessToken?: unknown } } | undefined)?.claudeAiOauth?.accessToken
+          const enabled = listed.some(account => account.email === slot.email && account.disabled !== true)
+          return id !== null && identities.has(setupTokenGroupIdentity(id)) && enabled && slot.credentialType === 'setup_token'
+            && slot.managedAccountId === id && typeof accessToken === 'string' && accessToken.startsWith('sk-ant-oat01-')
+            ? [{ managedAccountId: id, token: accessToken, credentialGeneration: Number(slot.credentialGeneration) }] : []
+        })
+        return { candidates }
+      },
+    }
+  }
+  /**
+   * Saycode specs/setup-token-switch-usage-check Phase 4 — Studio's pick among the accounts this shared PC holds.
+   * Asked outside the launch queue: checking a candidate runs the collector, which queues there too.
+   * The account, null when Studio has none usable, undefined when Studio was not asked or could not answer.
+   */
+  async function sharedStudioChoice(moveFrom?: string): Promise<string | null | undefined> {
+    if (!deps.sharedChoose) return undefined
+    const held = await serializeLaunch('prepare', async () => {
+      // A launch on a Z.AI lease never runs on a shared account: no roster read for it.
+      if (moveFrom === undefined && (await readTrialMarker()).leases.zai) return null
+      const shared = await sharedMachineCandidates()
+      return shared?.companyId ? { companyId: shared.companyId, candidates: (await shared.read()).candidates } : null
+    }).catch(() => null)
+    if (!held?.candidates.length) return undefined
+    // Sessions' refusals stay on this PC, so Studio cannot know them: the accounts held as used up are excluded,
+    // and an answer naming one of them is not taken.
+    const exclude = [...new Set([...(moveFrom === undefined ? [] : [moveFrom]),
+      ...held.candidates.filter(candidate => sharedAccountUsedUp(candidate.managedAccountId)).map(candidate => candidate.managedAccountId)])]
+    const chosen = await deps.sharedChoose({ companyId: held.companyId, exclude, measure: moveFrom !== undefined,
+      candidates: held.candidates.map(({ managedAccountId, credentialGeneration }) => ({ managedAccountId, credentialGeneration })) })
+    if (chosen && exclude.includes(chosen)) {
+      logger.debug(`[setup-token-switch] Studio chose ${chosen}, which this PC holds as used up; choosing locally`)
+      return undefined
+    }
+    return chosen
   }
 
   /**
@@ -2346,6 +2395,13 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (observation) await sharedMachineUsage(managedAccountId, observation)
     // Asked to move: the account is used up even when the session has no reading of when it resets.
     if (!sharedAccountUsedUp(managedAccountId)) await sharedMachineUsage(managedAccountId, { observedAt: deps.now(), reason: 'rate-limited', retryAt: null, windows: [] })
+    const studio = await sharedStudioChoice(managedAccountId)
+    if (studio === null) return null
+    if (studio) {
+      const chosen = await serializeLaunch('prepare', () => sharedMachineSessionEnvironment({ account: studio }))
+      if (chosen) return chosen
+      logger.debug(`[setup-token-switch] Studio chose ${studio}, which this PC does not hold; choosing locally`)
+    }
     return serializeLaunch('prepare', () => sharedMachineSessionEnvironment({ moveFrom: managedAccountId }))
   }
   /** The environment of exactly that shared account, for a session catching up with a move; null when it is gone. */
@@ -2414,10 +2470,11 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (selection?.kind === 'claude-setup-token') return serializeLaunch('prepare', () => withSafeErrors('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE',
       () => setupTokenSessionEnvironment(agent, selection, recorded)))
     if (agent !== undefined && agent !== 'claude') return {}
+    const studio = await sharedStudioChoice()
     return serializeLaunch('prepare', async () => {
       const marker = await readTrialMarker()
       if (marker.leases.zai) return parseZaiEnvironment(await deps.readFile(zaiEnvironmentPath()))
-      const shared = await sharedMachineSessionEnvironment()
+      const shared = await sharedMachineSessionEnvironment(studio ? { prefer: studio } : undefined)
       if (shared) {
         sharedMachineLaunches.add(shared)
         return shared
@@ -2539,6 +2596,12 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     })
   }
 
+  /** Saycode specs/setup-token-switch-usage-check — an account measured with a reserved permit, through the collector boundary. */
+  const measureWithPermit = createPermitMeasure({
+    invoke: async args => (await deps.execFile('cswap', args, { ...cswapCollectorCommandOptions(args), environment: deps.env })).stdout,
+    collect: request => collectorProbe(request, request.machineId),
+  })
+
   // Launch eligibility only. Authority is still checked by Studio and at token/launch under serializeLaunch.
   const sharedMachineSetupTokenScope = () => serializeLaunch('scope', async () => {
     if (!deps.machineId || await groups.hasManagedDesired('claude', 'user') || (await readTrialMarker()).leases.zai) return null
@@ -2547,7 +2610,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (entries.length !== 1 || entries[0].pending) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_ASSIGNMENT_UNRESOLVED')
     return entries[0].scope
   })
-  return { sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, sharedMachineAccountEnvironment, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
+  return { sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, sharedMachineAccountEnvironment, measureWithPermit, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
     // One fresh runtime observation per RPC: launching cswap repeatedly can block a secured Windows host.
     let stdout = ''
     try { stdout = (await deps.execFile('cswap', ['token-runtime', 'capabilities'], { maxOutputBytes: 64 * 1024, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })).stdout } catch {}
@@ -3088,7 +3151,7 @@ export function createNodeAiCredentialRuntime(
   supervisor: Supervisor,
   env: Record<string, string | undefined> = process.env,
   homeDir: string = homedir(),
-  options: Pick<AiCredentialRuntimeDependencies, 'setupTokenBinding'|'machineId'|'setupTokenAccountsInUse'|'machineSetupTokenAuthority'|'machineSetupTokenStart'> = {},
+  options: Pick<AiCredentialRuntimeDependencies, 'setupTokenBinding'|'machineId'|'setupTokenAccountsInUse'|'machineSetupTokenAuthority'|'machineSetupTokenStart'|'sharedChoose'> = {},
 ) {
   return createAiCredentialRuntime({
     ...options,

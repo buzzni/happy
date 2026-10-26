@@ -167,6 +167,71 @@ describe('setup-token account switch (specs/claude-setup-token-account-selection
     expect(deps.sessionEnvironment).not.toHaveBeenCalled()
   })
 
+  // Saycode specs/setup-token-switch-usage-check — a candidate nobody measured recently is checked before the move.
+  describe('checking a candidate first', () => {
+    const permit = { version: 1, grant: 'grant', permitId: 'permit-c', companyId: 'org-a', managedAccountId: C, principalType: 'user', purpose: 'switch',
+      machineId: 'pc-a', credentialGeneration: 1, policyRevision: 2, reservedAt: 1, transportDeadline: 10001, expiresAt: 30001 }
+    const measuredObservation = { source: 'inference_probe', observedAt: 5, windows: [{ kind: 'unified5h', pct: 20, resetsAt: 50 }], coverage: 'unknown', reason: 'ok', retryAt: null }
+    const requests: Array<{ url: string; body: Record<string, unknown> }> = []
+    const studio = (rebinds: Array<{ status: number; body: Record<string, unknown> }>) => vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      requests.push({ url: String(url), body: JSON.parse(String(init?.body)) })
+      const path = String(url).split('/daemon/')[1]
+      if (path === 'rebind') { const next = rebinds.shift()!; return Response.json(next.body, { status: next.status }) }
+      if (path === 'measure/reserve') return Response.json(permit)
+      return Response.json({ version: 1, published: true })
+    }) as unknown as typeof fetch
+    const measureRequired = (managedAccountId: string) => ({ status: 409, body: { error: 'SETUP_TOKEN_DAEMON_MEASURE_REQUIRED', managedAccountId, credentialGeneration: 1 } })
+    const granted = { status: 200, body: { version: 1, bindingGrant: 'claims.signature', managedAccountId: B, credentialGeneration: 1 } }
+
+    it('measures the candidate Studio asks about, publishes the reading and asks again', async () => {
+      const measure = vi.fn(async () => measuredObservation)
+      requests.length = 0
+      const { switcher } = setup({ measure, fetch: studio([measureRequired(C), granted]) })
+      expect(await switcher.rebind('session-a', RUNNING_A)).toHaveProperty('ok', true)
+      const proof = { machineId: 'pc-a', sessionId: 'session-a', companyId: 'org-a', bindingNonce: NONCE_A }
+      expect(requests.map(request => [request.url.split('/daemon/')[1], request.body])).toEqual([
+        ['rebind', { ...proof, measureVersion: 1, measured: [] }],
+        ['measure/reserve', { ...proof, managedAccountId: C, credentialGeneration: 1 }],
+        ['measure/publish', { ...proof, managedAccountId: C, credentialGeneration: 1, permitId: 'permit-c', observation: measuredObservation }],
+        ['rebind', { ...proof, measureVersion: 1, measured: [C] }],
+      ])
+      expect(measure).toHaveBeenCalledWith({ companyId: 'org-a', machineId: 'pc-a', managedAccountId: C, credentialGeneration: 1, permit })
+    })
+
+    it('counts a check that told nothing, so Studio moves on to the next candidate', async () => {
+      requests.length = 0
+      const { switcher } = setup({ measure: vi.fn(async () => null), fetch: studio([measureRequired(C), granted]) })
+      expect(await switcher.rebind('session-a', RUNNING_A)).toHaveProperty('ok', true)
+      expect(requests.map(request => request.url.split('/daemon/')[1])).toEqual(['rebind', 'measure/reserve', 'rebind'])
+      expect(requests[2].body.measured).toEqual([C])
+    })
+
+    it('stops after three checks in one switch', async () => {
+      const ids = [B, C, '00000000-0000-4000-8000-00000000000d', '00000000-0000-4000-8000-00000000000e']
+      requests.length = 0
+      const { switcher } = setup({ measure: vi.fn(async () => null), fetch: studio(ids.map(measureRequired)) })
+      expect(await switcher.rebind('session-a', RUNNING_A)).toEqual({ ok: false, reason: 'NO_ACCOUNT' })
+      expect(requests.filter(request => request.url.endsWith('/measure/reserve'))).toHaveLength(3)
+    })
+
+    it('asks an older Studio again as before when it refuses the measurement fields', async () => {
+      requests.length = 0
+      const measure = vi.fn()
+      const { switcher } = setup({ measure, fetch: studio([{ status: 400, body: { error: 'SETUP_TOKEN_DAEMON_INVALID_INPUT' } }, granted]) })
+      expect(await switcher.rebind('session-a', RUNNING_A)).toHaveProperty('ok', true)
+      expect(requests.map(request => [request.url.split('/daemon/')[1], 'measureVersion' in request.body])).toEqual([['rebind', true], ['rebind', false]])
+      expect(measure).not.toHaveBeenCalled()
+    })
+
+    it('waits until the first candidate recovers when none is left', async () => {
+      vi.useFakeTimers({ now: 1_000 })
+      try {
+        const { switcher } = setup({ measure: vi.fn(), fetch: studio([{ status: 409, body: { error: 'SETUP_TOKEN_DAEMON_NO_ACCOUNT', earliestUsableAt: 3_601_000 } }]) })
+        expect(await switcher.rebind('session-a', RUNNING_A)).toEqual({ ok: false, reason: 'NO_ACCOUNT', retryAfterMs: 3_600_000 })
+      } finally { vi.useRealTimers() }
+    })
+  })
+
   // Saycode specs/claude-setup-token-managed-sync R6/R7: Studio picks only accounts this PC applied; a newer assignment must land first.
   it('answers APPLY_REQUIRED when Studio has an account this PC has not applied yet', async () => {
     const { switcher, deps } = setup({ fetch: vi.fn(async () => Response.json({ error: 'SETUP_TOKEN_DAEMON_APPLY_REQUIRED' }, { status: 409 })) as unknown as typeof fetch })
@@ -389,4 +454,46 @@ it('forwards authenticated failure context and rejects unsupported reason data',
  vi.mocked(f.deps.fetch).mockResolvedValueOnce(Response.json({version:1,bindingGrant:'claims.signature',managedAccountId:B,credentialGeneration:1,tier:'available'}))
  expect(await f.switcher.returnFromPersonal('session-a',RUNNING_A,failure)).toMatchObject({ok:true})
  expect(JSON.parse(String(vi.mocked(f.deps.fetch).mock.calls[2][1]?.body))).toHaveProperty('organizationFailure',failure)
+})
+
+// Saycode specs/setup-token-switch-usage-check Phase 4 — a shared PC asks Studio which of its accounts to use.
+describe('shared PC choice through Studio', () => {
+  const held = [{ managedAccountId: A, credentialGeneration: 1 }, { managedAccountId: B, credentialGeneration: 1 }]
+  const permit = { version: 1, grant: 'grant', permitId: 'permit-b', companyId: 'org-s', managedAccountId: B, principalType: 'machine', purpose: 'switch', machineId: 'pc-a', credentialGeneration: 1, policyRevision: 1 }
+  const studio = (answers: Array<{ status: number; body: Record<string, unknown> }>, requests: Array<{ path: string; body: Record<string, unknown> }>) => vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+    const path = String(url).split('/daemon/')[1]
+    requests.push({ path, body: JSON.parse(String(init?.body)) })
+    if (path === 'shared/select') { const next = answers.shift()!; return Response.json(next.body, { status: next.status }) }
+    if (path === 'shared/measure/reserve') return Response.json(permit)
+    return Response.json({ version: 1, published: true })
+  }) as unknown as typeof fetch
+
+  it('moves to the account Studio chose after checking it as the machine', async () => {
+    const requests: Array<{ path: string; body: Record<string, unknown> }> = []
+    const measure = vi.fn(async () => ({ reason: 'ok' }))
+    const { switcher } = setup({ measure, fetch: studio([
+      { status: 409, body: { error: 'SETUP_TOKEN_DAEMON_MEASURE_REQUIRED', managedAccountId: B, credentialGeneration: 1 } },
+      { status: 200, body: { version: 1, managedAccountId: B, credentialGeneration: 1 } },
+    ], requests) })
+    expect(await switcher.sharedChoose({ companyId: 'org-s', candidates: held, exclude: [A], measure: true })).toBe(B)
+    const proof = { machineId: 'pc-a', companyId: 'org-s' }
+    expect(requests).toEqual([
+      { path: 'shared/select', body: { ...proof, candidates: held, exclude: [A], measure: true, measured: [] } },
+      { path: 'shared/measure/reserve', body: { ...proof, managedAccountId: B, credentialGeneration: 1 } },
+      { path: 'shared/measure/publish', body: { ...proof, managedAccountId: B, credentialGeneration: 1, permitId: 'permit-b', observation: { reason: 'ok' } } },
+      { path: 'shared/select', body: { ...proof, candidates: held, exclude: [A], measure: true, measured: [B] } },
+    ])
+    expect(measure).toHaveBeenCalledWith({ companyId: 'org-s', machineId: 'pc-a', managedAccountId: B, credentialGeneration: 1, permit })
+  })
+
+  it('answers no account when Studio has none, and unknown when Studio cannot answer', async () => {
+    const { switcher } = setup({ fetch: studio([{ status: 409, body: { error: 'SETUP_TOKEN_DAEMON_NO_ACCOUNT', earliestUsableAt: null } }], []) })
+    expect(await switcher.sharedChoose({ companyId: 'org-s', candidates: held, exclude: [A], measure: true })).toBeNull()
+    const down = setup({ fetch: vi.fn(async () => { throw new Error('offline') }) as unknown as typeof fetch })
+    expect(await down.switcher.sharedChoose({ companyId: 'org-s', candidates: held, exclude: [], measure: false })).toBeUndefined()
+    const refused = setup({ fetch: studio([{ status: 403, body: { error: 'SETUP_TOKEN_DAEMON_MACHINE_FORBIDDEN' } }], []) })
+    expect(await refused.switcher.sharedChoose({ companyId: 'org-s', candidates: held, exclude: [], measure: false })).toBeUndefined()
+    const noOrigin = setup({ studioOrigin: null })
+    expect(await noOrigin.switcher.sharedChoose({ companyId: 'org-s', candidates: held, exclude: [], measure: false })).toBeUndefined()
+  })
 })

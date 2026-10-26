@@ -5,7 +5,7 @@ import { TmuxUtilities } from '../utils/tmux'
 import { createHash, createHmac, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 import { SETUP_TOKEN_BINDING_TYPE, createSetupTokenBindingVerifier } from './setupTokenBindingProof'
-import { createAiCredentialRuntime, type AiCredentialCommandResult } from './aiCredentialRuntime'
+import { createAiCredentialRuntime, type AiCredentialCommandResult, type AiCredentialRuntimeDependencies } from './aiCredentialRuntime'
 import { groupAccountIdentity } from './aiCredentialGroupAdapters'
 import {
   applyAppliedAiAuthSourceEnv, buildManagedSessionSpawnEnvironment, buildResumedSessionSpawnEnvironment, buildSpawnRequestEnvironment,
@@ -53,7 +53,7 @@ type Slot = { number: number; email: string; organizationUuid?: string; usageSta
 
 // A stateful stand-in for cswap. `marked` keeps managed metadata like the token runtime; an
 // unmarked build drops it, as upstream does.
-function fakeMachine(initial: Slot[], activeAccountNumber: number | null, options: { runtime?: 'marked' | 'unmarked' | 'missing'; ignoreForce?: boolean; tokenRuntimeStatus?: string; files?: Map<string, string>; binding?: false; env?: Record<string, string | undefined>; capabilities?: Record<string, unknown>; listFails?: boolean; clock?: { now: number }; advanceOnExport?: number; advanceOnNonceWrite?: number; durability?: 'missing' | 'file-fails' | 'directory-fails'; machineId?: string; machineAuthority?: () => Promise<void>; machineStart?: () => Promise<void>; cswapVersion?: string; noUvPython?: boolean; platform?: NodeJS.Platform; readError?: string; overlap?: { exportStarted: boolean; listSawExport: boolean[] }; hangingExport?: { cancelled: boolean }; inUse?: () => string[] } = {}) {
+function fakeMachine(initial: Slot[], activeAccountNumber: number | null, options: { runtime?: 'marked' | 'unmarked' | 'missing'; ignoreForce?: boolean; tokenRuntimeStatus?: string; files?: Map<string, string>; binding?: false; env?: Record<string, string | undefined>; capabilities?: Record<string, unknown>; listFails?: boolean; clock?: { now: number }; advanceOnExport?: number; advanceOnNonceWrite?: number; durability?: 'missing' | 'file-fails' | 'directory-fails'; machineId?: string; machineAuthority?: () => Promise<void>; machineStart?: () => Promise<void>; cswapVersion?: string; noUvPython?: boolean; platform?: NodeJS.Platform; readError?: string; overlap?: { exportStarted: boolean; listSawExport: boolean[] }; hangingExport?: { cancelled: boolean }; inUse?: () => string[]; sharedChoose?: AiCredentialRuntimeDependencies['sharedChoose'] } = {}) {
   const kind = options.runtime ?? 'marked'
   const state = { slots: [...initial], active: activeAccountNumber }
   const calls: Array<{ command: string; args: string[] }> = []
@@ -125,6 +125,7 @@ function fakeMachine(initial: Slot[], activeAccountNumber: number | null, option
     homeDir: join('/home', 'operator'), platform: options.platform, machineId: options.machineId ?? 'machine-1', now: () => options.clock?.now ?? NOW, env: options.env ?? {}, execFile,
     ...(options.binding === false ? {} : { setupTokenBinding: studioVerifier(options.machineId) }),
     ...(options.inUse ? { setupTokenAccountsInUse: options.inUse } : {}),
+    ...(options.sharedChoose ? { sharedChoose: options.sharedChoose } : {}),
     ...(options.durability === 'missing' ? {} : {
       syncFile: async (path: string) => { syncEvents.push('file:' + path); if (options.durability === 'file-fails') throw new Error('sync failed') },
       syncDirectory: async (path: string) => { syncEvents.push('directory:' + path); if (options.durability === 'directory-fails') throw new Error('sync failed') },
@@ -362,6 +363,71 @@ describe('managed Claude setup-token runtime', () => {
     expect(await runtime.sharedMachineRebind(B, refused)).toMatchObject({ HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: A })
     // B's weekly window outlasts the 5-hour refusal it was later asked to leave: a shorter reason never shortens it.
     expect(await runtime.sharedMachineRebind(A, { ...refused, observedAt: resetsAt, retryAt: resetsAt + 3_600_000 })).toBeNull()
+  })
+
+  // Saycode specs/setup-token-switch-usage-check Phase 4 — Studio chooses among the accounts this PC holds.
+  describe('choice through Studio', () => {
+    const assign = (runtime: ReturnType<typeof fakeMachine>['runtime']) => runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',
+      generation: 1, fingerprint: '1'.padStart(64, '0'), payload: payload(managed(A, 1, fakeToken('a')), managed(B, 1, fakeToken('b'))) })
+    const held = [{ managedAccountId: A, credentialGeneration: 1 }, { managedAccountId: B, credentialGeneration: 1 }]
+    const refused = { observedAt: NOW, reason: 'rate-limited' as const, retryAt: NOW + 3_600_000, windows: [] }
+
+    it('moves a session to the account Studio chose, checking candidates first', async () => {
+      const sharedChoose = vi.fn(async () => B)
+      const { runtime } = fakeMachine([], null, { machineId: 'machine-1', sharedChoose })
+      await assign(runtime)
+      expect(await runtime.sharedMachineRebind(A, refused)).toMatchObject({ CLAUDE_CODE_OAUTH_TOKEN: fakeToken('b'), HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: B })
+      expect(sharedChoose).toHaveBeenCalledWith({ companyId: 'company-1', candidates: held, exclude: [A], measure: true })
+    })
+
+    it('launches on the account Studio chose without measuring', async () => {
+      const sharedChoose = vi.fn(async () => B)
+      const { runtime } = fakeMachine([], null, { machineId: 'machine-1', sharedChoose })
+      await assign(runtime)
+      expect(await runtime.sessionEnvironment('claude')).toMatchObject({ HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: B })
+      expect(sharedChoose).toHaveBeenCalledWith({ companyId: 'company-1', candidates: held, exclude: [], measure: false })
+    })
+
+    it('stays put when Studio has no usable account, but still launches on the machine default', async () => {
+      const { runtime } = fakeMachine([], null, { machineId: 'machine-1', sharedChoose: vi.fn(async () => null) })
+      await assign(runtime)
+      expect(await runtime.sharedMachineRebind(A, refused)).toBeNull()
+      expect(await runtime.sessionEnvironment('claude')).toMatchObject({ HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: B })
+    })
+
+    it('chooses on this PC when Studio cannot answer, or names an account this PC does not hold', async () => {
+      for (const answer of [undefined, '00000000-0000-4000-8000-0000000000ff']) {
+        const { runtime } = fakeMachine([], null, { machineId: 'machine-1', sharedChoose: vi.fn(async () => answer) })
+        await assign(runtime)
+        expect(await runtime.sharedMachineRebind(A, refused)).toMatchObject({ HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: B })
+      }
+    })
+
+    it('never takes back an account this PC holds as used up, which Studio cannot know', async () => {
+      const sharedChoose = vi.fn(async () => A)
+      const { runtime } = fakeMachine([], null, { machineId: 'machine-1', sharedChoose })
+      await assign(runtime)
+      await runtime.sharedMachineUsage(A, refused)
+      expect(await runtime.sessionEnvironment('claude')).toMatchObject({ HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: B })
+      expect(sharedChoose).toHaveBeenLastCalledWith({ companyId: 'company-1', candidates: held, exclude: [A], measure: false })
+      expect(await runtime.sharedMachineRebind(B, refused)).toBeNull()
+      expect(sharedChoose).toHaveBeenLastCalledWith({ companyId: 'company-1', candidates: held, exclude: [B, A], measure: true })
+    })
+
+    it('does not ask Studio, or read the roster, for a launch on a Z.AI lease', async () => {
+      const sharedChoose = vi.fn(async () => B)
+      const { runtime, files, calls } = fakeMachine([], null, { machineId: 'machine-1', sharedChoose })
+      await assign(runtime)
+      files.set(join('/home', 'operator', '.happy', 'trial-ai-credential-leases.json'), JSON.stringify({ version: 1,
+        leases: { zai: { leaseId: 'synthetic', contentHash: 'a'.repeat(64), bundleVersion: 1 } } }))
+      files.set(join('/home', 'operator', '.happy', 'zai-claude-env.json'), JSON.stringify({ ANTHROPIC_AUTH_TOKEN: 'synthetic-zai',
+        ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic', API_TIMEOUT_MS: '3000000',
+        ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.3', ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-4.7', ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.7' }))
+      const before = calls.length
+      expect(await runtime.sessionEnvironment('claude')).toMatchObject({ ANTHROPIC_AUTH_TOKEN: 'synthetic-zai' })
+      expect(sharedChoose).not.toHaveBeenCalled()
+      expect(calls.slice(before)).toEqual([])
+    })
   })
 
   it('keeps a used-up window through readings that do not mention it or are older, until a newer one frees it', async () => {

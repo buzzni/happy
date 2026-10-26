@@ -44,7 +44,7 @@ const IS_WINDOWS = process.platform === 'win32';
 const CODEX_MULTI_AUTH_VERSION = '2.16.0';
 const MINIMUM_CODEX_MULTI_AUTH_VERSION = '2.16.0';
 const CLAUDE_SWAP_PACKAGE = 'saycode-claude-swap';
-const CLAUDE_SWAP_VERSION = '0.27.0b2';
+const CLAUDE_SWAP_VERSION = '0.27.0b3';
 
 // An unbounded child here would hang `npm install -g happy` itself. Matches the
 // timeoutMs aiCredentialRuntime uses for these same two install commands — a

@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { createClaudeCollector, consumeCollectorPermit, authorizeCollectorRequest } from './claudeCollector'
+import { createClaudeCollector, consumeCollectorPermit, authorizeCollectorRequest, createPermitMeasure } from './claudeCollector'
 const now = 2000000000000
 const pair = generateKeyPairSync('ed25519')
 const der = pair.publicKey.export({type:'spki',format:'der'}) as Buffer
@@ -185,5 +185,62 @@ describe('machine principal',()=>{
   await authorizeCollectorRequest(groups,identity,{...machineRequest,version:1,grant:''})
   expect(groups.authorizeMachine).toHaveBeenCalledWith('c','m','identity:'+request.managedAccountId)
   expect(groups.authorize).toHaveBeenCalledTimes(1)
+ })
+})
+// specs/setup-token-switch-usage-check (Saycode) — a candidate checked before a switch may use twice the budget.
+describe('switch check grant',()=>{
+ const switchCapable=(invoke:ReturnType<typeof setup>['invoke'])=>{
+  const original=invoke.getMockImplementation()!
+  invoke.mockImplementation(async(args,input)=>args.includes('capabilities')?JSON.stringify({...JSON.parse(await original(args,input)),switchProbeVersion:1}):original(args,input))
+ }
+ const collectInput=(invoke:ReturnType<typeof setup>['invoke'])=>JSON.parse(invoke.mock.calls.find(c=>c[0].includes('collect-org'))?.[1]??'null')
+ it('hands the switch purpose to a runtime that supports it',async()=>{
+  const {collector,invoke}=setup();switchCapable(invoke)
+  expect(await collector({...request,grant:envelope({purpose:'switch'})})).toMatchObject({status:'observed',permitId:request.permitId})
+  expect(collectInput(invoke).permit.purpose).toBe('switch')
+ })
+ it('keeps a periodic grant exactly as before',async()=>{
+  const {collector,invoke}=setup();switchCapable(invoke)
+  expect(await collector({...request,grant:envelope()})).toMatchObject({status:'observed'})
+  expect(collectInput(invoke).permit).not.toHaveProperty('purpose')
+ })
+ it('refuses a switch check on a runtime that would not recognize it, before spending the permit',async()=>{
+  const {collector,deps,invoke}=setup()
+  expect(await collector({...request,grant:envelope({purpose:'switch'})})).toMatchObject({error:'COLLECTOR_RUNTIME_UNSUPPORTED'})
+  expect(deps.consume).not.toHaveBeenCalled()
+  expect(collectInput(invoke)).toBeNull()
+ })
+ it('rejects any other purpose',async()=>{
+  const {collector,invoke}=setup();switchCapable(invoke)
+  expect(await collector({...request,grant:envelope({purpose:'periodic'})})).toMatchObject({error:'COLLECTOR_GRANT_INVALID'})
+ })
+})
+
+// Saycode specs/setup-token-switch-usage-check — the daemon measures a switch candidate through the same signed boundary.
+describe('switch candidate measurement',()=>{
+ const ref='22222222-2222-4222-8222-222222222222'
+ const permit={version:1,grant:'g.s',permitId:request.permitId,companyId:'c',managedAccountId:request.managedAccountId,userId:'u',principalType:'user',purpose:'switch',machineId:'m',credentialGeneration:4,policyRevision:2,reservedAt:now,transportDeadline:now+10000,expiresAt:now+30000}
+ const candidate={companyId:'c',machineId:'m',managedAccountId:request.managedAccountId,credentialGeneration:4,permit}
+ const roster=(accounts:unknown[])=>vi.fn(async()=>JSON.stringify({accounts}))
+ const observed={source:'inference_probe',observedAt:now,windows:[],coverage:'unknown',reason:'ok',retryAt:null}
+ it('finds the account on this PC and hands the collector the grant as its principal',async()=>{
+  const collect=vi.fn(async()=>({version:1,status:'observed',permitId:request.permitId,observation:observed}))
+  const measure=createPermitMeasure({invoke:roster([{managedAccountId:request.managedAccountId,credentialGeneration:4,accountRef:ref}]),collect})
+  expect(await measure(candidate)).toEqual(observed)
+  expect(collect).toHaveBeenCalledWith({version:1,companyId:'c',userId:'u',machineId:'m',managedAccountId:request.managedAccountId,accountRef:ref,permitId:request.permitId,credentialGeneration:4,policyRevision:2,grant:'g.s'})
+ })
+ it('collects a shared PC check as the machine',async()=>{
+  const collect=vi.fn(async(_request:unknown)=>({version:1,status:'observed',observation:observed}))
+  const {userId:_u,...machinePermit}=permit
+  await createPermitMeasure({invoke:roster([{managedAccountId:request.managedAccountId,credentialGeneration:4,accountRef:ref}]),collect})({...candidate,permit:{...machinePermit,principalType:'machine'}})
+  expect(collect).toHaveBeenCalledWith(expect.objectContaining({principalType:'machine'}))
+  expect(collect.mock.calls[0][0]).not.toHaveProperty('userId')
+ })
+ it('tells nothing when this PC does not hold exactly that generation, or the collector did not observe',async()=>{
+  const collect=vi.fn(async()=>({version:1,status:'unavailable',error:'COLLECTOR_REQUEST_FAILED'}))
+  expect(await createPermitMeasure({invoke:roster([{managedAccountId:request.managedAccountId,credentialGeneration:3,accountRef:ref}]),collect})(candidate)).toBeNull()
+  expect(collect).not.toHaveBeenCalled()
+  expect(await createPermitMeasure({invoke:roster([{managedAccountId:request.managedAccountId,credentialGeneration:4,accountRef:ref}]),collect})(candidate)).toBeNull()
+  expect(await createPermitMeasure({invoke:vi.fn(async()=>'not json'),collect})(candidate)).toBeNull()
  })
 })

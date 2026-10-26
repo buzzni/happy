@@ -24,7 +24,7 @@ vi.mock('@/ui/logger', () => ({
   logger: { debug: mocks.mockLoggerDebug },
 }))
 
-import { checkIfDaemonRunningAndCleanupStaleState, stopDaemon } from './controlClient'
+import { checkIfDaemonRunningAndCleanupStaleState, requestSetupTokenRebind, stopDaemon } from './controlClient'
 
 const DEAD_PID = 3058947
 const HTTP_PORT = 33417
@@ -252,3 +252,18 @@ it('passes the daemon\'s refusal code and the declined state of use-as-shared th
   await expect(useDeviceAsShared('company')).rejects.toThrow(/^DEVICE_USE_AS_SHARED_REFUSED$/);
  }finally{fetchSpy.mockRestore();}
 });
+
+// Saycode specs/setup-token-switch-usage-check — a later recovery than the session's background wait still holds it off.
+describe('requestSetupTokenRebind', () => {
+  it.each([
+    [60_000, 60_000],
+    [3_600_000, 1_800_000],
+  ])('passes a retry delay of %i ms to the session as %i ms', async (daemonDelay, sessionDelay) => {
+    const state = stateWithPid(process.pid)
+    mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state, raw: JSON.stringify(state) })
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json({ ok: false, reason: 'NO_ACCOUNT', retryAfterMs: daemonDelay }))
+    try {
+      expect(await requestSetupTokenRebind('session-a', 'binding')).toEqual({ ok: false, reason: 'NO_ACCOUNT', retryAfterMs: sessionDelay })
+    } finally { fetchSpy.mockRestore() }
+  })
+})
