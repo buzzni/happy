@@ -1192,3 +1192,92 @@ The reviewer reproduction uses `corepack pnpm -C packages/happy-cli exec vitest
 run --config /tmp/happy-t2rt-xr-v10/vitest.config.mjs --project unit
 /tmp/happy-t2rt-xr-v10/lifecycle-proof.test.ts --maxWorkers 2` from the clone root.
 The durable suite uses the standard unit command documented above.
+
+## T2RT-18: balance witness events for existing consumers (2026-10-26)
+
+Review base: `e68bed17d990f8ab6445efedffa51aa77ab9379d`. The medium finding is
+accepted. T2RT-17 closed the evidence snapshot but omitted the matching witness
+`turn-end`. `AutomationTurnTracker` had already observed W's `turn-start`, so its
+active scheduled run could never settle after the witness pointer was cleared.
+Terminal evidence alone does not complete the existing envelope lifecycle.
+
+TDD first ran the reviewer's unchanged `automation-settlement.test.ts`:
+**1 failed / 3 passed** on the review base. Evidence-on plus a consumed scanner
+row during awaited `afterTurn` produced no automation completion report. The
+evidence-off and no-boundary controls passed. The same unchanged matrix passes
+**4/4** on extracted `02497601`. The repository regression extends the existing
+`api/apiSession.inputEvidenceLifecycle.test.ts`, with the actual encrypted socket
+update that arms a scheduled run, real remote loop/ordered queue/API/tracker and
+real scanner JSONL delivery during `afterTurn`. Only SDK/network boundaries are
+scripted. Its stronger settlement assertions reproduced **3 failures / 5 passes**
+before the production fix: missing completion plus both missing consumed-boundary
+witness ends. T2RT-17's assertion forbidding any witness end was incorrect; it is
+replaced by exactly one non-routing end for the same witness ID.
+
+Correction: after conservatively settling W's evidence and releasing its active
+identity, emit W's matching `turn-end(status=completed)` through the existing
+evidence emitter and `ApiSessionClient.sendSessionProtocolMessage`. It carries
+no channel `requestId` and does not enter the routing mapper. All normal envelope
+consumers receive it. Later `onReady` finds no W pointer and emits no duplicate.
+The staged background evidence and T2RT-17's separate incomplete follow-up
+attribution are retained. This is an internal Core lifecycle correction; no
+schema, dependency, API, authority or routing-policy change is introduced.
+
+### Whole-package consumer audit (completed before commit)
+
+Searched the entire CLI package with `rg -n --hidden 'turn-start|turn-end|turnStart|turnEnd'
+packages/happy-cli`, excluding dependency/build directories, then inspected the
+event consumers and `SessionEnvelope`/`ev.t` publication paths. The broader
+case-insensitive search also checked timestamp/counter and provider lifecycle
+references. These are all consumers reachable by a Claude witness pair:
+
+| Consumer | Settlement path and balance confirmation |
+| --- | --- |
+| `api/turnInputEvidence.ts`: `TurnInputEvidence.stamp` | API stamps W's start and matching end; end retains terminal/incomplete evidence. Active W is already released, so it cannot intercept F or close twice. Actual-loop tests assert terminal state, separate F identity and one end per emitted start. |
+| `api/automationTurnTracker.ts`: `AutomationTurnTracker.observe`, via `ApiSessionClient.applySessionProtocolRuntimeSideEffects` | Both W events use the same API sink. The active run is cleared by W's matching end; the real encrypted scheduled-prompt matrix asserts exactly one `notifyDaemonAutomationTurnResult` with the parent's completed/null-answer result, including before `onReady` in the scanner case. |
+| `api/apiSession.ts`: `enqueueSessionProtocolEnvelope` and remaining runtime side effects | Start consumes the pending evidence flag; matching end reaches the existing tool/AskUserQuestion cleanup and retry/report logic once. Existing API, automation and launcher regressions exercise these consumers. No new routing call or channel state mutation is added. |
+| `api/apiSession.ts`: `enqueueMessage`/`flushOutbox` transport | Both events enter the same ordered encrypted session-message outbox; neither event type is filtered. Captured output has exactly one matching start/end and valid wire envelopes. Outgoing network/storage remains a mocked boundary in the regression. |
+| `daemon/automations/sessionFollowupRunner.ts`: `observeFollowupTurn` | Persisted session envelopes now contain W's end as well as its start. The new matrix replays the actual emitted envelopes through this observer and asserts `complete=true`, `failed=false`. |
+| `browserRuntime/e2e/realAgentHarness.ts`: `transcript`/`waitForTranscript`, used by `realAgentA01.ts`, `realAgentA01DesktopGui.ts`, `realAgentA08.ts`, `realAgentSandbox.ts`, `realAgentSandboxProd.ts` | Transcript normalization retains event type/time; these scripts wait for `turn-end` and now receive the end from the balanced published pair. They do not correlate turn IDs. Source path audited against the emitted sequence; live browser/agent scripts were not run. |
+| `testing/sessionWriteScopeFixture.ts`: `waitReply` | Reads stored session events and waits for a later `turn-end`; the common outbox now supplies both events. Source path audited against the balanced emitted sequence; its separate server integration fixture was not run. |
+
+Other matches are not subscribers to Claude witness envelopes:
+`agent/acp/runAcp.ts` formats its own ACP manager's events before sending them;
+`codex/runCodex.ts` inspects its own provider mapper's events before API dispatch.
+Claude/Codex/ACP mappers and channel/launcher helpers produce lifecycle events,
+not consume witness emissions. `openclaw/runOpenClaw.ts` forwards ACP events.
+Daemon idle reaper/runtime receipts consume derived thinking/tool/timestamp
+reports, not these envelopes. Prompt text, test assertions and permission reset
+reason strings introduce no additional event consumer. No consumer is bypassed
+by a special automation-only completion call.
+
+Verification:
+
+- Reviewer's unchanged automation reproduction: **4/4 passed** after the fix.
+- Repository lifecycle tests: **8/8 passed**, including all four T2RT-17 controls.
+  Every emitted turn-start has exactly one matching end. Capability-off remains
+  unchanged; the no-boundary case still closes at `onReady`.
+- The scheduled matrix checks mapper turn/request state, pending request and
+  task/tool request maps before/after scanner delivery and after `onReady`.
+- Routing parser, map insertion, rearm and final-answer helpers remain
+  byte-identical to `9ee84191`; API client, mapper and channel ordering source
+  remain unchanged from the review base.
+- Reviewer's unchanged T2RT-17 lifecycle reproduction: **4/4 passed** after this
+  fix, retaining all consumed-row/attachment/SDK/mapped-assistant controls.
+- Related standard suite: **46 files / 1312 tests passed**. The previous 44-file
+  selection now includes four additional scheduled-run cases, plus
+  `daemon/automations/sessionFollowupRunner.test.ts` (44 tests) and
+  `daemon/sessionIdleReaper.test.ts` (57 tests) for the audited consumers.
+- Standard global setup passed CLI typecheck, pkgroll and extension-copy build.
+  `git diff --check` passed. No Unix-socket EPERM or test failure occurred.
+  Existing bin/empty-chunk and listener/asynchronous-rejection warnings remain.
+  No whole-suite, live-provider, browser/Desktop or server integration claim is
+  made; the unchanged boot-suite ownership issue documented earlier was not rerun.
+
+Reproduction command from clone root: `corepack pnpm -C packages/happy-cli exec
+vitest run --config /tmp/happy-t2rt-xr-v11/vitest.config.mjs --project unit
+/tmp/happy-t2rt-xr-v11/automation-settlement.test.ts --maxWorkers 2` (substitute
+`parent.config.mjs` for the `02497601` control). Standard repository commands are
+unchanged. Revisit lifecycle handling only with a contract that accounts for all
+these consumers; terminal evidence is not a substitute for the matching end.
+Rollback is a revert of this follow-up, which would reintroduce T2RT-18.
