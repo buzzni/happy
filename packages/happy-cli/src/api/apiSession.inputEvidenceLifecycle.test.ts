@@ -1,4 +1,4 @@
-/** T2RT-16..27: replay real source revisions, not a second hand-written mapper. */
+/** T2RT-16..31: replay real source revisions, not a second hand-written mapper. */
 import { expect, it } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -39,13 +39,13 @@ it.each([false, true])('preserves merge-base turns/consumers with evidence opt-i
         const load = async (source: string): Promise<any[]> => (await readFile(join(directory, `${source}.jsonl`), 'utf8'))
             .trim().split('\n').map(line => JSON.parse(line));
         const baseline = await load('base'), head = await load('head');
-        expect(baseline).toHaveLength(58);
+        expect(baseline).toHaveLength(enabled ? 58 : 62);
         expect(head).toHaveLength(baseline.length);
         for (const original of baseline) {
             const actual = head.find(record => record.name === original.name);
             expect.soft(actual, original.name).toBeDefined();
             for (const field of ['turns', 'routing', 'reports', 'reportsBeforeCancel', 'followup', 'ready', 'outboxTurns', 'prompts',
-                ...(!enabled ? ['wire', 'metadata'] : [])]) {
+                ...(!enabled ? ['wire', 'metadata', 'metadataWrites', 'transitions'] : [])]) {
                 expect.soft(actual?.[field], `${original.name}: ${field}`).toEqual(original[field]);
             }
             for (const revision of actual?.evidence ?? []) {
@@ -71,6 +71,11 @@ it.each([false, true])('preserves merge-base turns/consumers with evidence opt-i
                 }
             }
             if (!enabled) expect.soft(actual.evidence ?? [], original.name).toEqual([]);
+            if (original.name.startsWith('off-marker-')) {
+                expect.soft(actual.metadataWrites, original.name).toEqual([]);
+                expect.soft(actual.transitions, original.name).toHaveLength(5);
+                for (const metadata of actual.transitions) expect.soft(metadata, original.name).toEqual(original.metadata);
+            }
             if (enabled && original.name.startsWith('full-') && original.name.endsWith('-true')) {
                 expect.soft(actual.metadata.runtimeCapabilities?.agentContact?.guardedPrompt, original.name).toBe(1);
                 if (original.name === 'full-codex-ordinary-true') expect.soft(actual.finals).toHaveLength(1);
@@ -96,7 +101,7 @@ it.each([false, true])('preserves merge-base turns/consumers with evidence opt-i
         for (const result of baseline.filter(record => record.name.startsWith('T18-'))) {
             expect(result.turns).toEqual([]); expect(result.reports).toEqual([]); expect(result.ready).toBe(1);
         }
-        console.info(`58 scenarios replayed on 9ee84191 and HEAD, opt-in=${enabled}; 116 source replays. Main follow-up controls:`,
+        console.info(`${baseline.length} scenarios replayed on 9ee84191 and HEAD, opt-in=${enabled}; ${baseline.length * 2} source replays. Main follow-up controls:`,
             baseline.filter(record => record.name.startsWith('T17-19-') && record.name.endsWith('-true'))
                 .map(record => ({ name: record.name, ...record.followup })));
         if (process.env.T2RT_PARITY_EXPORT) await writeFile(`${process.env.T2RT_PARITY_EXPORT}.${enabled ? 'on' : 'off'}.json`, JSON.stringify({ baseline, head }));

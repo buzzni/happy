@@ -207,6 +207,47 @@ async function harness(capability: boolean, outbox = false, scheduled = false) {
     };
 }
 
+// T2RT-31: actual socket observations and metadata CAS writes, including every
+// subsequent OFF mode transition. Main has no input-mode hook and publishes nothing.
+if (process.env.T2RT_PARITY_EVIDENCE === 'off') {
+    for (const flavor of ['claude', 'codex']) for (const initialMode of ['local', 'remote'] as const) {
+        it(`OFF marker-only ${flavor} starting ${initialMode}`, async () => {
+            const handlers = new Map<string, Array<(value: any) => void>>();
+            const session = { id: 'marker-session', seq: 0,
+                metadata: { path: '/tmp', host: 'localhost', flavor } as Metadata,
+                metadataVersion: 0, agentState: null, agentStateVersion: 0,
+                encryptionKey: new Uint8Array(32), encryptionVariant: 'legacy' as const };
+            let metadata = session.metadata, version = 0;
+            const metadataWrites: Metadata[] = [], transitions: Metadata[] = [];
+            const socket = { connected: true, connect: vi.fn(), off: vi.fn(), emit: vi.fn(), close: vi.fn(),
+                volatile: { emit: vi.fn() }, timeout() { return this; },
+                on: (event: string, handler: (value: any) => void) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
+                emitWithAck: vi.fn(async (_event: string, request: any) => {
+                    expect(request.expectedVersion).toBe(version);
+                    metadata = decrypt(session.encryptionKey, 'legacy', decodeBase64(request.metadata)) as Metadata;
+                    metadataWrites.push(metadata);
+                    return { result: 'success', version: ++version, metadata: request.metadata };
+                }) };
+            mocks.io.mockReturnValue(socket);
+            const client = new ApiSessionClient('fake-token', session);
+            const host = client as any;
+            try {
+                host.configureInputQueue?.(new MessageQueue2<string>(x => x), initialMode, false);
+                metadata = { ...metadata, inputEvidenceEnabled: true };
+                for (const handler of handlers.get('update') ?? []) handler({ body: { t: 'update-session', sid: session.id,
+                    metadata: { version: ++version, value: encodeBase64(encrypt(session.encryptionKey, 'legacy', metadata)) } } });
+                for (const mode of ['local', 'transitioning', 'remote', 'local', 'remote']) {
+                    host.setInputMode?.(mode);
+                    await new Promise(resolve => setImmediate(resolve));
+                    transitions.push(structuredClone(client.getMetadata()!));
+                }
+                await appendFile(process.env.T2RT_PARITY_OUTPUT!, JSON.stringify({ name: `off-marker-${flavor}-${initialMode}`,
+                    turns: [], wire: [], metadata, metadataWrites, transitions }) + '\n');
+            } finally { await client.close(); }
+        });
+    }
+}
+
 for (const capability of [false, true]) {
     for (const scenario of ['codex-ordinary', 'codex-channel', 'plan-empty', 'plan-nonempty', 'claude-ordinary',
         'claude-channel', 'permission', 'question', 'steer', 'codex-retry', 'claude-retry', 'metadata', 'guards'] as const) {

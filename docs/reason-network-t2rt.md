@@ -71,10 +71,11 @@ captures the validated `0`/`1` alongside that session's existing resume state an
 restores it after restart. A resume request's explicit setting overrides its own
 saved value. ON also records `metadata.inputEvidenceEnabled=true` for same-session
 recovery when no tracked environment survives; explicit OFF removes that marker.
-A live opted-in host repairs dropped evidence/contact markers without changing its
-captured setting or overwriting explicit values, another runtime's advertisement,
-or archival. **Residual for installed old app versions:** editing an offline
-session's metadata can erase the recovery marker. If no validated saved session
+Live hosts do not repair dropped evidence/contact markers on observation or
+ordinary metadata writes. An ambient ON marker alone never triggers an OFF
+host's mode-change metadata publication. **Residual for installed old app
+versions:** editing a session's metadata can erase the recovery marker, including
+while a host is live. If no validated saved session
 environment survives, later metadata-only recovery is OFF. This never enables
 evidence incorrectly; a validated saved value or explicit request still wins.
 
@@ -1818,6 +1819,11 @@ history rewrite, other-branch mutation, PR creation or publication.
 
 ## T2RT-29: metadata writer preservation and live repair (2026-10-26)
 
+**Historical implementation and verification.** The live repair described in
+this section was removed by the T2RT-30/31 decision below. App passthrough, title
+write-back/CAS/ACK preservation, the writer audit, and recovery precedence remain.
+Historical test counts here describe that earlier implementation only.
+
 Review base: `5c5d4f2b`. The approved scope includes happy-app write-back and
 shared CLI session-host repair, plus a read-only writer audit. One new behavioral
 commit and normal push on the same branch; no PR or history rewrite.
@@ -1944,3 +1950,72 @@ package/dependency/lockfile/version, Desktop source or runtime pin changed.
 Status: implementation, writer audit, residual documentation and focused local
 verification complete. One new behavioral commit on `5c5d4f2b`, normal push only;
 no PR creation, force-push, rebase, publication or other-branch mutation.
+
+## T2RT-30/31: remove live marker repair (2026-10-26)
+
+Current base: `9ddebeac` on `feat/rn-t2rt-followup` (PR #965), after #951 merged.
+The user's decision supersedes T2RT-29 part (b): remove live marker repair
+entirely, retaining app passthrough (a) and recovery precedence (c). This is an
+existing Core metadata consistency correction with no new dependency or protocol.
+The latest instruction authorizes one local commit and **no push**; the parent
+session will push after the review bot finishes.
+
+Plan and implementation:
+
+- Remove the repair state, observation hook, outgoing-transform/CAS repair,
+  repair-only no-op/ACK handling, and Claude offline-bridge repair configuration.
+  Session-owned capture and normal ON advertisement remain unchanged. Startup's
+  explicit OFF transform still removes the marker. Existing contact withdrawal
+  remains; a marker-only document cannot trigger an extra OFF mode-change write.
+- Replace repair expectations with real encrypted socket/CAS regressions for
+  Claude and Codex: passive setting/contact/both omissions, ordinary title writes,
+  overlapping ON hosts followed by production OFF startup, and marker-only
+  incoming metadata followed by local/transitioning/remote mode changes.
+- Keep the app producer-consumer, saved-environment/metadata/explicit override,
+  standalone resume, daemon recovery, hydration and environment tests. Extend
+  source parity with four OFF marker-only/mode-transition cases while retaining
+  all original 58 OFF and 58 ON scenarios.
+
+Recovery still prefers the original session's saved validated `0`/`1`, falls
+back to original metadata, then overlays any validated explicit request. No
+caller process environment or unrelated previous-session environment is inherited.
+**Residual:** an installed old app can strip the marker even while a session is
+live; no host restores it automatically. If only stripped metadata survives,
+later metadata-only recovery is OFF. This never turns evidence ON wrongly.
+Current app passthrough preserves the hint; saved validated environment or an
+explicit request remains authoritative. Revisit only with a separately approved
+ownership-fenced repair design and proof of strict OFF publication parity.
+
+TDD and final verification:
+
+- Red: all **10/10** new API cases failed (171 unrelated tests skipped),
+  reproducing both reviewer scenarios for Claude/Codex and the passive-omission
+  cases. Green: all 10 pass after removing repair. The handoff tests start with
+  an ON marker, observe the replacement ON owner, then use the actual reconnect
+  merge and OFF transform. Only the OFF runner's single startup refresh is sent;
+  the stale host never reclaims either marker, and OFF still refuses guarded input.
+- **8 files / 473 tests passed** in the final standard invocation: 181 API,
+  17 actual-app producer-consumer/recovery, 80 replacement recovery, 62 standalone
+  resume, 108 environment, 19 hydration, 4 Claude offline/reconnect and 2 source
+  parity parent tests. No skipped cases in this run.
+- Parity against `9ee84191`: original **58/58 OFF + 58/58 ON**, plus **4/4 OFF**
+  marker-only incoming documents across Claude/Codex and local/remote initial
+  modes. Each added case traverses local/transitioning/remote/local/remote,
+  preserves every whole metadata snapshot and emits **zero metadata writes**.
+  Total: **62 OFF + 58 ON**, **240 actual source replays**. Full OFF envelopes,
+  native turns, routing and consumer observations retain baseline parity.
+- CLI global setup passed `tsc --noEmit`, pkgroll and extension-copy build.
+  Existing bin-outside-dist/empty-chunk warnings remain; no Unix-socket EPERM
+  occurred. `git diff --check` and the T2rt documentation anchor check passed.
+
+Command from the clone root:
+`corepack pnpm -C packages/happy-cli exec vitest run --project unit <files> --maxWorkers 2`.
+Files: `src/api/appMetadata.inputEvidence.test.ts`, `src/api/apiSession.test.ts`,
+`src/api/apiSession.inputEvidenceLifecycle.test.ts`,
+`src/daemon/sessionRecovery.inputEvidence.test.ts`,
+`src/resume/handleResumeCommand.test.ts`, `src/daemon/sessionEnv.test.ts`,
+`src/daemon/persistedSessionHydration.test.ts`,
+`src/claude/runClaudeOfflineAck.test.ts`.
+Production `apiSession.ts` and `runClaude.ts` match their pre-repair parent
+`1e7549f6` exactly; app passthrough and recovery resolution sources are unchanged.
+No new PR or push is performed in this session.

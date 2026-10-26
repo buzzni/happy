@@ -62,14 +62,15 @@ defines the launching consumer's ownership and required reader compatibility.
 Happy-app metadata parsing passes through unknown keys, including nested runtime
 capabilities and summary fields. Title CAS retries merge only app-owned title
 fields onto the latest server document; acknowledged metadata and version stay
-together in its cache. An opted-in live CLI host restores missing evidence/contact
-markers using its captured setting and current mode, without overwriting explicit
-values, foreign runtime contact, archival, or newer observations. OFF adds no
-markers. Claude's offline-to-online local bridge owns only the captured recovery
-hint; it does not advertise queued input or admissions. This repair cannot protect an offline conversation from an old app that
-strips its metadata: with no validated daemon-saved environment, subsequent
-metadata-only recovery safely defaults OFF. See the
-[T2RT-29 writer audit](reason-network-t2rt.md#t2rt-29-metadata-writer-preservation-and-live-repair-2026-10-26).
+together in its cache. Live CLI hosts do not restore omitted evidence/contact
+markers on observation, title writes or CAS retries. An ambient marker alone
+cannot trigger metadata publication during OFF mode changes. Recovery prefers
+validated daemon-saved environment, then original-session metadata, with an
+explicit validated request overriding either. If an old app strips the hint and
+no validated saved setting survives, metadata-only recovery safely defaults OFF;
+this cannot incorrectly enable evidence. See the
+[T2RT-29 writer audit](reason-network-t2rt.md#t2rt-29-metadata-writer-preservation-and-live-repair-2026-10-26)
+and [T2RT-30/31 decision](reason-network-t2rt.md#t2rt-3031-remove-live-marker-repair-2026-10-26).
 
 ## Unconfigured synced plugin MCP servers
 

@@ -172,11 +172,10 @@ describe('runClaude offline start with required confirmed delivery', () => {
     });
 });
 
-describe('T2RT-29 Claude offline-to-online metadata ownership', () => {
-    it.each(['0', '1'])('passes captured %s to the local bridge without enabling a remote queue', async seed => {
-        const configureInputEvidenceRecovery = vi.fn();
+describe('T2RT-30 Claude offline-to-online metadata without live repair', () => {
+    it.each(['0', '1'])('retains captured %s in startup metadata without configuring repair or a remote queue', async seed => {
         const configureInputQueue = vi.fn();
-        mockSessionSyncClient.mockReturnValue({ configureInputEvidenceRecovery, configureInputQueue });
+        mockSessionSyncClient.mockReturnValue({ configureInputQueue });
         mockClaudeLocal.mockImplementationOnce(async () => {
             // The bridge appears after an async boundary and after the seed was consumed.
             process.env.HAPPY_INPUT_EVIDENCE = seed === '1' ? '0' : '1';
@@ -186,7 +185,6 @@ describe('T2RT-29 Claude offline-to-online metadata ownership', () => {
             await mockStartOfflineReconnection.mock.calls[0][0]!.onReconnected();
         });
         await expect(runOffline({ HAPPY_INPUT_EVIDENCE: seed })).rejects.toMatchObject({ code: 0 });
-        expect(configureInputEvidenceRecovery).toHaveBeenCalledWith(seed === '1');
         expect(configureInputQueue).not.toHaveBeenCalled();
         expect(mockSessionSyncClient.mock.calls[0][0].metadata.inputEvidenceEnabled).toBe(seed === '1' ? true : undefined);
     });
