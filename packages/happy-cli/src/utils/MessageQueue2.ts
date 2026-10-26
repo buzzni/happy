@@ -562,7 +562,8 @@ export class MessageQueue2<T> {
                 return;
             }
 
-            // Set the waiter
+            // Set the waiter. One slot: a replaced wait never resolves, so its caller hangs silently.
+            if (this.waiter) logger.debug('[MessageQueue2] Replacing a pending waiter; the earlier wait will never resolve');
             this.waiter = waiterFunc;
             logger.debug('[MessageQueue2] Waiting for messages...');
         });
