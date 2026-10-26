@@ -43,12 +43,16 @@ This document describes the Happy CLI (`packages/happy-cli`) and its daemon. The
 
 Provider/session mappers own wire turn starts, ends and routing identity.
 `TurnInputEvidence` only stamps existing mapped turns and publishes evidence
-revisions. A final without a mapped turn produces an incomplete revision with no
+revisions when the consumer explicitly opts in through the session launch
+environment (`HAPPY_INPUT_EVIDENCE=1`); Claude/Codex default off. A final without
+a mapped turn produces an incomplete revision with no
 envelope turn ID; its payload correlation token cannot become a turn or retry
 root. It cannot create lifecycle events for automation, daemon follow-ups or
 Desktop consumers. Main's behavior, including missing textless completion, is
 preserved. The source-parity regression and reconsideration boundary are recorded
 in [the T2rt report](reason-network-t2rt.md#t2rt-19-structural-correction-evidence-never-owns-wire-turns-2026-10-26).
+The [T2 hand-off](reason-network-t2rt.md#t2-hand-off-explicit-consumer-opt-in)
+defines the launching consumer's ownership and required reader compatibility.
 
 ## Unconfigured synced plugin MCP servers
 

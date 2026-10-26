@@ -201,6 +201,7 @@ describe('runClaude for a managed Cloud child', () => {
     let exitSpy: { mockRestore: () => void; mock: { calls: unknown[] } };
 
     beforeEach(() => {
+        vi.stubEnv('HAPPY_INPUT_EVIDENCE', undefined);
         listenersBefore = new Map(RUNNER_PROCESS_EVENTS.map((event) => [
             event,
             new Set(process.listeners(event as never) as Array<(...args: unknown[]) => void>),
@@ -318,7 +319,7 @@ describe('runClaude for a managed Cloud child', () => {
         expect(api.sessionSyncClient).toHaveBeenCalledWith(
             expect.objectContaining({ id: 'sess-managed-runner' }),
         );
-        expect(sessionClient.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', true);
+        expect(sessionClient.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', false);
         loopDeferred.resolve();
         await run.catch(() => {});
     }, 30_000);

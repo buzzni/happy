@@ -139,12 +139,14 @@ const sessionEvents: { message?: string }[] = [];
 let sessionMetadata: Record<string, unknown> = { path: '/workspace/project', codexThreadId: 'thread-1' };
 
 function sessionStub() {
-    const evidence = runtimeEvidence = new TurnInputEvidence('runtime-test', envelope => protocolMessages.push(envelope));
+    let evidenceEnabled = false;
+    const evidence = runtimeEvidence = new TurnInputEvidence('runtime-test', envelope => { if (evidenceEnabled) protocolMessages.push(envelope); });
     return {
         inputEvidence: evidence,
-        configureInputQueue: (queue: InstanceType<typeof import('@/utils/MessageQueue2').MessageQueue2>) => {
+        configureInputQueue: vi.fn((queue: InstanceType<typeof import('@/utils/MessageQueue2').MessageQueue2>, _mode: string, enabled: boolean) => {
+            evidenceEnabled = enabled;
             queue.setInputValidator(input => !input.continuation || evidence.isContinuationCurrent(input.continuation));
-        },
+        }),
         setInputSteerAvailable: vi.fn(),
         setPendingInputEvidence: (batch: EvidenceBatch | null) => evidence.setPending(batch),
         queueInput: (message: UserMessage) => ({ ref: { kind: 'rest', serverMessageId: message.serverMessageId ?? 'test-input', serverSeq: message.serverSeq ?? 1 } }),
@@ -153,7 +155,8 @@ function sessionStub() {
         awaitMessageAck: vi.fn(async () => ({ ok: true })),
         sendSessionEvent: vi.fn((event: { message?: string }) => { sessionEvents.push(event); }),
         sendSessionProtocolMessage: vi.fn((envelope: typeof protocolMessages[number]) => {
-            protocolMessages.push(evidence.stamp(envelope));
+            if (!evidenceEnabled && (envelope.ev.t === 'turn-input-evidence' || envelope.ev.t === 'hub-input-admission')) return;
+            protocolMessages.push(evidenceEnabled ? evidence.stamp(envelope) : envelope);
             const ev = envelope.ev;
             if (ev?.t === 'channel-ready') queueMicrotask(() => {
                 void rpc.get('channel-authorize')?.({ requestId: ev.requestId, expectedRuntimeId: 'runtime-test', nonce: ev.nonce, decision: 'allow' });
@@ -199,6 +202,7 @@ describe('automatic continuation after a capacity failure', () => {
         for (const key of Object.keys(process.env)) {
             if (key !== 'HAPPY_HOME_DIR' && /^(HAPPY|SAYCODE|APLUS|CODEX)_/.test(key)) vi.stubEnv(key, undefined);
         }
+        vi.stubEnv('HAPPY_INPUT_EVIDENCE', '1'); // These receipt tests explicitly consume evidence.
     });
     afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
@@ -221,6 +225,7 @@ describe('automatic continuation after a capacity failure', () => {
         onConnect = seed;
         try {
             await runCodex({ principal: { kind: 'account', credentials: { token: 't', secret: new Uint8Array(32) } as never } });
+            return stub;
         } finally {
             createSpy.mockRestore();
             cwdSpy.mockRestore();
@@ -229,6 +234,15 @@ describe('automatic continuation after a capacity failure', () => {
 
     const continuations = () => turnsSent.filter(text => text.includes(CODEX_CAPACITY_CONTINUE_PROMPT));
     const notices = () => sessionEvents.filter(e => e.message?.includes('at capacity') && e.message.includes('continuing automatically'));
+
+    it.each([undefined, '0', 'true', '1'])('T2RT-23 requires explicit evidence opt-in (%s)', async optIn => {
+        vi.stubEnv('HAPPY_INPUT_EVIDENCE', optIn);
+        script = [{ outcome: 'ok', after: closeQueue }];
+        const stub = await run(async () => { queues[0]!.push('hello', { permissionMode: 'default' } as never); });
+        expect(stub.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', optIn === '1');
+        const start = protocolMessages.find(event => event.ev.t === 'turn-start')!;
+        expect('inputEvidence' in start.ev).toBe(optIn === '1');
+    }, 60_000);
 
     it('T2RT-06 settles the original retry when the actual stdin.write throws after claim', async () => {
         script = [{ outcome: 'overloaded' }, { outcome: 'sync-write-failure' }];

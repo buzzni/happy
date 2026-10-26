@@ -1,4 +1,4 @@
-/** T2RT-16..20: replay real source revisions, not a second hand-written mapper. */
+/** T2RT-16..24: replay real source revisions, not a second hand-written mapper. */
 import { expect, it } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-it('preserves merge-base wire turns and consumer outcomes for the reviewer scenarios', async () => {
+it.each([false, true])('preserves merge-base turns/consumers with evidence opt-in=%s', async enabled => {
     const cli = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
     const root = resolve(cli, '../..');
     const directory = await mkdtemp(join(tmpdir(), 'happy-turn-parity-'));
@@ -25,7 +25,8 @@ it('preserves merge-base wire turns and consumer outcomes for the reviewer scena
                 resolve: { alias: { '@': join(source, 'src') } },
                 test: { name: index ? 'head' : 'base', root: source, environment: 'node', include: [fixture],
                     setupFiles: [join(cli, 'src/testing/unit.setup.ts')],
-                    env: { T2RT_PARITY_OUTPUT: join(directory, `${index ? 'head' : 'base'}.jsonl`) } },
+                    env: { T2RT_PARITY_OUTPUT: join(directory, `${index ? 'head' : 'base'}.jsonl`),
+                        T2RT_PARITY_EVIDENCE: enabled ? 'on' : 'off' } },
             })) },
         })};`);
         try {
@@ -38,33 +39,45 @@ it('preserves merge-base wire turns and consumer outcomes for the reviewer scena
         const load = async (source: string): Promise<any[]> => (await readFile(join(directory, `${source}.jsonl`), 'utf8'))
             .trim().split('\n').map(line => JSON.parse(line));
         const baseline = await load('base'), head = await load('head');
-        expect(baseline).toHaveLength(30);
+        expect(baseline).toHaveLength(32);
         expect(head).toHaveLength(baseline.length);
         for (const original of baseline) {
             const actual = head.find(record => record.name === original.name);
             expect.soft(actual, original.name).toBeDefined();
-            for (const field of ['turns', 'routing', 'reports', 'reportsBeforeCancel', 'followup', 'ready', 'outboxTurns', 'prompts']) {
+            for (const field of ['turns', 'routing', 'reports', 'reportsBeforeCancel', 'followup', 'ready', 'outboxTurns', 'prompts',
+                ...(!enabled ? ['wire'] : [])]) {
                 expect.soft(actual?.[field], `${original.name}: ${field}`).toEqual(original[field]);
             }
             for (const revision of actual?.evidence ?? []) {
                 expect.soft(revision.inputEvidence).toMatchObject({ coverage: 'incomplete', inputs: [], inputCount: 0, terminal: true });
                 expect.soft(revision.inputEvidence.incompleteReasons).toContain('unmapped-final-answer');
             }
-            if (original.name.endsWith('-true') && !['codex-', 'evidence-automation-', 'account-'].some(prefix => original.name.startsWith(prefix))) {
+            if (enabled && original.name.endsWith('-true') && !['codex-', 'evidence-automation-', 'account-'].some(prefix => original.name.startsWith(prefix))) {
                 expect.soft(actual.evidence.length, original.name).toBeGreaterThan(0);
             }
-            if (original.name.startsWith('account-') && original.name.endsWith('-true')) {
+            if (enabled && original.name.startsWith('account-') && original.name.endsWith('-true')) {
                 expect.soft(actual.settledEvidence, original.name).toMatchObject({ rootBatchId: actual.sourceEvidence.rootBatchId,
                     inputs: [{ kind: 'rest', serverMessageId: 'A', serverSeq: 1 }], terminal: true,
-                    continuation: { kind: 'claude-account-switch', state: 'completed' } });
+                    continuation: { kind: 'claude-account-switch', state: original.name.startsWith('account-empty-') ? 'cancelled' : 'completed' } });
+                if (original.name.startsWith('account-empty-')) {
+                    expect.soft(actual.settledEvidence).toMatchObject({ coverage: 'incomplete',
+                        incompleteReasons: expect.arrayContaining(['continuation-consumption-unproven']) });
+                    const root = actual.sourceEvidence.rootBatchId;
+                    expect.soft(actual.wire.filter((event: any) => event.ev.t === 'turn-input-evidence'
+                        && event.ev.inputEvidence.rootBatchId === root && event.ev.inputEvidence.terminal)).toHaveLength(1);
+                    expect.soft(actual.wire.find((event: any) => event.ev.t === 'turn-end').ev.inputEvidence).toMatchObject({
+                        rootBatchId: root, terminal: true, coverage: 'incomplete', continuation: { state: 'cancelled' },
+                    });
+                }
             }
+            if (!enabled) expect.soft(actual.evidence ?? [], original.name).toEqual([]);
             for (const final of actual?.finals ?? []) {
                 for (const revision of actual.evidence) {
                     expect.soft(final.turn, original.name).not.toBe(revision.inputEvidence.turnId);
                     expect.soft(final.ev.inputEvidence?.rootBatchId, original.name).not.toBe(revision.inputEvidence.rootBatchId);
                 }
             }
-            if (original.name.startsWith('T17-19-') && original.name.includes('-true-') && original.name.endsWith('-true')) {
+            if (enabled && original.name.startsWith('T17-19-') && original.name.includes('-true-') && original.name.endsWith('-true')) {
                 for (const final of actual.finals) {
                     expect.soft(final.ev.inputEvidence.inputs, original.name).not.toContainEqual({ kind: 'rest', serverMessageId: 'A', serverSeq: 1 });
                     expect.soft(final.ev.inputEvidence.coverage, original.name).toBe('incomplete');
@@ -76,9 +89,9 @@ it('preserves merge-base wire turns and consumer outcomes for the reviewer scena
         for (const result of baseline.filter(record => record.name.startsWith('T18-'))) {
             expect(result.turns).toEqual([]); expect(result.reports).toEqual([]); expect(result.ready).toBe(1);
         }
-        console.info('30 scenarios replayed on 9ee84191 and HEAD; 60 source replays passed. Main follow-up controls:',
+        console.info(`32 scenarios replayed on 9ee84191 and HEAD, opt-in=${enabled}; 64 source replays. Main follow-up controls:`,
             baseline.filter(record => record.name.startsWith('T17-19-') && record.name.endsWith('-true'))
                 .map(record => ({ name: record.name, ...record.followup })));
-        if (process.env.T2RT_PARITY_EXPORT) await writeFile(process.env.T2RT_PARITY_EXPORT, JSON.stringify({ baseline, head }));
+        if (process.env.T2RT_PARITY_EXPORT) await writeFile(`${process.env.T2RT_PARITY_EXPORT}.${enabled ? 'on' : 'off'}.json`, JSON.stringify({ baseline, head }));
     } finally { await rm(directory, { recursive: true, force: true }); }
 }, 120_000);

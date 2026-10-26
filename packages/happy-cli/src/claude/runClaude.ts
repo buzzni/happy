@@ -8,6 +8,7 @@ import { createTurnCardSwitch } from './utils/turnCardTools';
 import { randomUUID } from 'node:crypto';
 
 import { ApiClient } from '@/api/api';
+import { isInputEvidenceEnabled } from '@/api/turnInputEvidence';
 import { logger } from '@/ui/logger';
 import { loop } from '@/claude/loop';
 import { AgentGoalStatus, AgentState } from '@/api/types';
@@ -889,7 +890,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         disallowedTools: mode.disallowedTools,
         effort: mode.effort,
     }));
-    session.configureInputQueue(messageQueue, options.startingMode === 'remote' ? 'remote' : 'local', true);
+    session.configureInputQueue(messageQueue, options.startingMode === 'remote' ? 'remote' : 'local', isInputEvidenceEnabled());
     if (launchControl) {
         // Only the launch-bound local channel can drain this runtime; never a session RPC.
         const gate = new RuntimeProducerGate({

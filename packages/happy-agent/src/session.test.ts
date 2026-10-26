@@ -7,6 +7,7 @@ import {
     encrypt,
     getRandomBytes,
 } from './encryption';
+import { createEnvelope, sessionEnvelopeSchema, type InputEvidenceV1 } from '@slopus/happy-wire';
 import type { EncryptionVariant } from './api';
 
 // --- Mock socket.io-client ---
@@ -649,6 +650,51 @@ describe('SessionClient', () => {
     });
 
     describe('waitForTurnCompletion', () => {
+        for (const metadata of ['control', 'mapped-evidence', 'unmapped-evidence', 'admission'] as const) {
+            it.each(['idle', 'ready'] as const)(`T2RT-23 waits for B after late ${metadata} and %s`, async signal => {
+                const opts = makeOptions();
+                const client = new SessionClient(opts);
+                let resolved = false;
+                const completion = client.waitForTurnCompletion(1000).then(() => { resolved = true; });
+                const receive = (content: unknown) => mockSocketInstance!.simulateServerEvent('update', makeEncryptedUpdate(
+                    opts.encryptionKey, opts.encryptionVariant, content, opts.sessionId,
+                ));
+                try {
+                    client.sendMessage('B'); // The sender receives no server echo of its prompt.
+                    if (metadata !== 'control') {
+                        const unmapped = metadata === 'unmapped-evidence';
+                        const evidence: InputEvidenceV1 = {
+                            v: 1, runtimeId: 'runtime-A', turnId: 'A', batchId: 'batch-A', rootBatchId: 'batch-A', revision: 2,
+                            inputs: unmapped ? [] : [{ kind: 'rest', serverMessageId: 'A', serverSeq: 1 }], inputCount: unmapped ? 0 : 1,
+                            coverage: 'incomplete', incompleteReasons: [unmapped ? 'unmapped-final-answer' : 'missing-provider-turn'],
+                            additional: { attempted: 0, accepted: 0, pending: 0, unknown: 0, items: [] },
+                            continuation: { kind: 'none', state: 'none', previousTurn: null, retryId: null, rootExclusive: null }, terminal: true,
+                        };
+                        const envelope = metadata === 'admission' ? createEnvelope('agent', {
+                            t: 'hub-input-admission', v: 1, serverMessageId: 'A', targetSessionId: opts.sessionId,
+                            expectedRuntimeId: 'runtime-A', observedRuntimeId: 'runtime-A', expectedModeEpoch: 1, observedModeEpoch: 1,
+                            state: 'accepted', reason: 'matched',
+                        }) : createEnvelope('agent', { t: 'turn-input-evidence', inputEvidence: evidence }, unmapped ? {} : { turn: 'A' });
+                        sessionEnvelopeSchema.parse(envelope);
+                        receive({ role: 'session', content: envelope });
+                    }
+                    if (signal === 'idle') mockSocketInstance!.simulateServerEvent('update', makeSessionUpdate(
+                        opts.encryptionKey, opts.encryptionVariant, opts.sessionId,
+                        { agentState: { data: { controlledByUser: false, requests: {} }, version: 1 } },
+                    ));
+                    else receive({ role: 'agent', content: { type: 'event', data: { type: 'ready' } } });
+                    await Promise.resolve();
+                    expect.soft(resolved).toBe(false);
+                    receive({ role: 'session', content: createEnvelope('agent', { t: 'turn-start' }, { turn: 'B' }) });
+                    await Promise.resolve();
+                    expect.soft(resolved).toBe(false);
+                    receive({ role: 'session', content: createEnvelope('agent', { t: 'turn-end', status: 'completed' }, { turn: 'B' }) });
+                    await completion;
+                    expect(resolved).toBe(true);
+                } finally { client.close(); }
+            });
+        }
+
         it('resolves when a turn-end arrives after turn-start', async () => {
             const opts = makeOptions();
             const client = new SessionClient(opts);

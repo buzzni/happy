@@ -25,6 +25,7 @@ import { MANAGED_STOP_CLEAN } from '@/managed/managedControlChannel';
 const CODEX_END_INPUT_BUDGET_MS = 10_000;
 import React from "react";
 import { ApiClient } from '@/api/api';
+import { isInputEvidenceEnabled } from '@/api/turnInputEvidence';
 import { CodexAppServerClient } from './codexAppServerClient';
 import { describeCodexFailure, describeCodexInactivityAbort } from './codexAbortNotice';
 import {
@@ -456,7 +457,7 @@ export async function runCodex(opts: {
         sessionOptions: standaloneLaunch ? { trackShutdownStorage: true } : undefined,
         onSessionSwap: (newSession) => {
             session = newSession;
-            newSession.configureInputQueue(messageQueue, 'remote', true);
+            newSession.configureInputQueue(messageQueue, 'remote', isInputEvidenceEnabled());
             newSession.setInputSteerAvailable(true);
             // Update permission handler with new session to avoid stale reference
             if (permissionHandler) {
@@ -500,7 +501,7 @@ export async function runCodex(opts: {
     }
 
     const messageQueue = new MessageQueue2<EnhancedMode>(hashCodexEnhancedMode);
-    session.configureInputQueue(messageQueue, 'remote', true);
+    session.configureInputQueue(messageQueue, 'remote', isInputEvidenceEnabled());
     /**
      * Correlation for a turn answering an external messenger request
      * (Saycode specs/desktop-messenger-channels). Set when the batch carrying it becomes the
