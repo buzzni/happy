@@ -270,6 +270,7 @@ describe('runCodex itself, for a managed child', () => {
     }
 
     beforeEach(async () => {
+        vi.stubEnv('HAPPY_INPUT_EVIDENCE', undefined);
         for (const key of Object.keys(process.env)) {
             if (key.startsWith('HAPPY_RECONNECT_') || key.startsWith('HAPPY_FORK')
                 || key.startsWith('HAPPY_CREATED_BY') || key.startsWith('HAPPY_INITIAL_')) {
@@ -376,7 +377,7 @@ describe('runCodex itself, for a managed child', () => {
                 principal: { kind: 'managed', startup: { envelope: envelope(), attachment } },
             }).catch(() => { /* the run fails somewhere past the app-server */ });
             expect(mockAwaitMessageAck).toHaveBeenCalled();
-            expect(stub.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', true);
+            expect(stub.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', false);
             expect(mockClientConstructed).toHaveBeenCalled();
         } finally {
             managedSpy.mockRestore();

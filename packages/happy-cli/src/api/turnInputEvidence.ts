@@ -10,6 +10,9 @@ type AttemptState = InputEvidenceV1['additional']['items'][number]['state'];
 type ContinuationKind = InputEvidenceV1['continuation']['kind'];
 export type QueueInputEvidence = { ref: InputRef; guard?: unknown; continuation?: InputEvidenceV1 };
 
+/** Consumer launch opt-in. Default off protects installed readers that predate evidence. */
+export function isInputEvidenceEnabled(): boolean { return process.env.HAPPY_INPUT_EVIDENCE === '1'; }
+
 /** Host state, never inferred from delayed metadata echoes. Calls and transitions are synchronous. */
 export class HubInputGate {
     mode: 'remote' | 'local' | 'transitioning' = 'transitioning';
@@ -299,6 +302,14 @@ export class TurnInputEvidence {
             return envelope;
         }
         if (ev.t === 'turn-end') {
+            // A same-turn retry can return only an empty result. Its terminal proves
+            // completion, but no mapped activity proves that receipt's consumption.
+            if (this.current === turn && claimed?.runtimeId === this.runtimeId && claimed.turnId === turn
+                && claimed.continuation.retryId === value.continuation.retryId && value.continuation.state === 'pending'
+                && this.claimedContinuations.has(claimed)) {
+                this.cancelPendingDispatch('continuation-consumption-unproven');
+                this.pending = null;
+            }
             value.terminal = value.continuation.state !== 'pending';
             if (value.continuation.state === 'running') value.continuation.state = 'completed';
             if (this.current === turn) this.current = null;

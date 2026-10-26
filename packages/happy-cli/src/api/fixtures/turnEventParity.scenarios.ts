@@ -1,5 +1,5 @@
 /** Run unchanged against extracted main and HEAD; only provider/network/ID clocks are scripted. */
-import { beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { appendFile, mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -53,6 +53,7 @@ vi.mock('@/daemon/controlClient', () => ({ notifyDaemonSessionRuntime: vi.fn(asy
     } })) }));
 
 beforeEach(() => { vi.clearAllMocks(); mocks.id = mocks.wire = mocks.evidence = mocks.start = mocks.end = 0; });
+afterEach(() => { vi.unstubAllEnvs(); });
 type Source = 'consumed' | 'attachment' | 'sdk';
 const review = JSON.stringify({ findings: [{ severity: 'medium', title: 'remaining issue' }] });
 
@@ -95,6 +96,9 @@ async function followup(events: SessionEnvelope[]) {
 }
 
 async function harness(capability: boolean, outbox = false, scheduled = false) {
+    // Explicit consumer opt-in; the OFF replay leaves it unset for every scenario.
+    const enabled = capability && process.env.T2RT_PARITY_EVIDENCE !== 'off';
+    vi.stubEnv('HAPPY_INPUT_EVIDENCE', enabled ? '1' : undefined);
     const handlers = new Map<string, Array<(value: any) => void>>();
     mocks.io.mockReturnValue({ connected: true, connect: vi.fn(), off: vi.fn(), emit: vi.fn(),
         on: vi.fn((event, handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler])),
@@ -106,7 +110,7 @@ async function harness(capability: boolean, outbox = false, scheduled = false) {
     const client = new ApiSessionClient('fake-token', session);
     // These additive methods do not exist on main; absence must not change the stimulus.
     const evidenceClient = client as any;
-    evidenceClient.configureInputQueue?.(new MessageQueue2<string>(x => x), 'remote', capability);
+    evidenceClient.configureInputQueue?.(new MessageQueue2<string>(x => x), 'remote', enabled);
     vi.spyOn(client, 'updateMetadata').mockImplementation(() => undefined);
     vi.spyOn(evidenceClient.sendSync, 'invalidate').mockImplementation(() => {});
     const events: SessionEnvelope[] = [];
@@ -175,11 +179,19 @@ async function harness(capability: boolean, outbox = false, scheduled = false) {
     return { client, events, queue, sdk, batch, answer, assistant, end, consume, evidence, routing,
         async result(name: string, extra: object = {}) {
             for (const event of events) sessionEnvelopeSchema.parse(event);
+            // SDKToLogConverter assigns random transcript UUIDs in both revisions.
+            // Preserve their sharing/order bijectively; native envelope/turn IDs stay exact.
+            const transcriptIds = new Map<string, string>();
+            const wire = events.map(event => {
+                if (!event.claudeUuid || !/^[0-9a-f-]{36}$/.test(event.claudeUuid)) return event;
+                if (!transcriptIds.has(event.claudeUuid)) transcriptIds.set(event.claudeUuid, `transcript-${transcriptIds.size + 1}`);
+                return { ...event, claudeUuid: transcriptIds.get(event.claudeUuid)! };
+            });
             const turns = events.filter(e => e.ev.t === 'turn-start' || e.ev.t === 'turn-end').map(e => {
                 const { inputEvidence: _inputEvidence, ...ev } = e.ev as any;
                 return { id: e.id, role: e.role, turn: e.turn, ev };
             });
-            const record = { name, turns, routing: routing(), reports: mocks.report.mock.calls,
+            const record = { name, turns, wire, routing: routing(), reports: mocks.report.mock.calls,
                 followup: await followup(events), evidence: evidence(),
                 finals: events.filter(e => e.ev.t === 'final-answer').map(e => ({ turn: e.turn, ev: e.ev })), ...extra };
             await appendFile(process.env.T2RT_PARITY_OUTPUT!, JSON.stringify(record) + '\n');
@@ -193,7 +205,9 @@ async function harness(capability: boolean, outbox = false, scheduled = false) {
 }
 
 for (const capability of [false, true]) {
-    for (const failure of ['exception', 'result'] as const) it(`T20 account ${failure} capability=${capability}`, async () => {
+    for (const { failure, empty } of [
+        { failure: 'exception', empty: false }, { failure: 'result', empty: false }, { failure: 'exception', empty: true },
+    ] as const) it(`T20/24 account ${failure} empty=${empty} capability=${capability}`, async () => {
         const oldToken = process.env.CLAUDE_CODE_OAUTH_TOKEN, oldBinding = process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING;
         process.env.CLAUDE_CODE_OAUTH_TOKEN = 'sk-ant-oat01-first';
         process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING = '{"account":"first"}';
@@ -202,7 +216,7 @@ for (const capability of [false, true]) {
         vi.mocked(h.client.rpcHandlerManager.registerHandler).mockImplementation((name, handler) => { handlers.set(name, handler as any); });
         vi.spyOn(h.client, 'updateAgentState').mockImplementation(() => undefined);
         const queue = new MessageQueue2<any>(hashObject);
-        (h.client as any).configureInputQueue?.(queue, 'remote', capability);
+        (h.client as any).configureInputQueue?.(queue, 'remote', process.env.HAPPY_INPUT_EVIDENCE === '1');
         let generation = 0;
         const prompts: unknown[] = [];
         vi.mocked(query).mockImplementation(({ prompt }: any) => {
@@ -211,7 +225,7 @@ for (const capability of [false, true]) {
                 yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
                 for await (const input of prompt) {
                     prompts.push(input.message.content);
-                    yield { type: 'assistant', uuid: `partial-${n}`, session_id: 'claude-1', parent_tool_use_id: null,
+                    if (n === 1 || !empty) yield { type: 'assistant', uuid: `partial-${n}`, session_id: 'claude-1', parent_tool_use_id: null,
                         message: { id: `m-${n}`, role: 'assistant', model: 'claude-sonnet-5',
                             content: [{ type: 'text', text: n === 1 ? 'working before refusal' : 'recovered' }],
                             usage: { input_tokens: 1, output_tokens: 1 } } };
@@ -222,7 +236,7 @@ for (const capability of [false, true]) {
                         yield { type: 'result', subtype: 'success', result: 'rate limited', is_error: true, uuid: 'r-1' };
                         return;
                     }
-                    yield { type: 'result', subtype: 'success', result: 'recovered', is_error: false, uuid: 'r-2' };
+                    yield { type: 'result', subtype: 'success', result: empty ? '' : 'recovered', is_error: false, uuid: 'r-2' };
                     void handlers.get('switch')!();
                     return;
                 }
@@ -236,7 +250,7 @@ for (const capability of [false, true]) {
                 mcpServers: {}, api: { push: () => ({ sendSessionNotification: vi.fn() }) },
                 consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn() } as any);
             expect(generation).toBe(2); expect(prompts).toHaveLength(2);
-            await h.result(`account-${failure}-${capability}`, { prompts,
+            await h.result(`account-${empty ? 'empty-' : ''}${failure}-${capability}`, { prompts,
                 sourceEvidence: (h.events.find(event => event.ev.t === 'turn-start')?.ev as any)?.inputEvidence,
                 settledEvidence: (h.client as any).inputEvidence?.snapshot() });
         } finally {
@@ -380,5 +394,6 @@ it.each([false, true])('Codex no-start terminal channel=%s', async channel => {
     const state = { currentTurnId: null, dispatchedInput: true, pendingRequestId: channel ? 'channel-A' : null };
     const mapped = mapCodexMcpMessageToSessionEnvelopes({ type: 'turn_aborted' }, state);
     await appendFile(process.env.T2RT_PARITY_OUTPUT!, JSON.stringify({ name: `codex-${channel}`,
+        wire: mapped.envelopes,
         turns: mapped.envelopes.map(e => ({ id: e.id, role: e.role, turn: e.turn, ev: e.ev })) }) + '\n');
 });

@@ -37,8 +37,7 @@ textless automation completion and notification/intervention cases reproduced be
 
 **Desktop T2 enablement prerequisite:** “exclude turn-input-evidence/hub-input-admission
 from response activity and hydration; add an encrypted-history regression”. This
-is a hard prerequisite before Desktop enables the capability or upgrades its
-runtime pin to a build that enables it. No extra native end may compensate for
+is a hard prerequisite before Desktop opts in to the capability. No extra native end may compensate for
 an incompatible consumer. Capability-disabled sessions publish neither evidence
 revisions (standalone or mapped) nor admission metadata, including late callbacks.
 
@@ -46,12 +45,39 @@ Production-source check at Desktop `d58812b75e41f384d0c5242b011249fea074efea`:
 `config/happy-runtime-pin.json` pins CLI `1.1.10-aplus.357` / `9ee84191`, which
 does not implement this capability. No Desktop opt-in was found in `src`, `cli`,
 `config` or `scripts`. This is a source/pin check, not a live fleet assertion.
-The PR's Claude/Codex launchers configure evidence on automatically; upgrading
-the Desktop runtime pin therefore requires the consumer fix first. Desktop's
+At `c7b4f8c2` the Claude/Codex launchers still enabled evidence automatically;
+T2RT-23 replaces that behavior with the default-off launch contract below.
+Upgrading a runtime pin alone no longer enables evidence. Desktop's
 generic `messageContentHasAgentResponseActivity`, `apiMessagesResponseLifecycle`
 and raw-history hydration readers currently misclassify these metadata events.
 The earlier v12 consumer check below covered narrower parser/wait paths and
 does **not** establish compatibility for those generic readers.
+
+### T2 hand-off: explicit consumer opt-in
+
+`HAPPY_INPUT_EVIDENCE=1` in the **session process's launch environment** is the
+single production opt-in for Claude/Codex input evidence. Unset, empty, `0`,
+`true` and every other value mean OFF. Both initial configuration and Codex
+replacement-session configuration use this contract. ACP remains unsupported.
+The session host advertises `agentContact.inputEvidence=1` only when enabled
+and otherwise eligible under the existing account/remote-mode checks. The API
+publication gate suppresses all evidence/admission envelopes while OFF.
+
+The **Desktop T2 launching integration** owns setting this value for a session
+whose readers support the new envelopes, after completing the hard prerequisite
+above: exclude `turn-input-evidence`/`hub-input-admission` from response activity
+and hydration, and add an encrypted-history regression after a completed turn.
+Desktop has not been changed to set it in this PR. Other explicit consumer-owned
+launches can opt in under the same compatibility contract; do not set a
+machine-wide/daemon-wide export as a substitute for consumer readiness. Installed
+older happy-agent or other clients therefore receive main-compatible output by
+default, independent of a runtime pin. A newer happy-agent also ignores both
+metadata kinds before updating either completion-wait activity flag.
+
+This flag authorizes evidence publication only. It does not create native turns,
+route channels or grant provider/session authority. Disable the flag on the next
+launch to return to the default publication behavior; native lifecycle remains
+main's in either state.
 
 ## Scope and architecture
 
@@ -1432,6 +1458,8 @@ Verification:
 
 The fixture optionally exports observations with `T2RT_PARITY_EXPORT=<local path>`
 for review tools; default runs remove their extracted sources and observations.
+The T2RT-23 extension writes separate `<local path>.off.json` and
+`<local path>.on.json` observations for the two opt-in modes.
 CI's macOS full-unit checkout now fetches history so the pinned Git object exists;
 the SDK-update job already does so. Standalone/shallow checkouts must also contain
 `9ee84191` to run this test. No test performs an implicit network fetch.
@@ -1511,3 +1539,71 @@ Final related validation:
   side-effect method remain byte-identical to `9ee84191`. `git diff --check`
   passed. No native wire turn is constructed by evidence, and no routing state,
   request map, schema, dependency, Desktop source or runtime pin was changed.
+
+## T2RT-23..24: default-off opt-in, completion waiting and textless receipts
+
+The reviewer's unchanged reproductions first yielded **7 failures / 2 passing
+controls** on `c7b4f8c2`: six metadata-plus-idle/ready early completions and the
+pending textless recovery receipt. Durable happy-agent regressions reproduced
+all six failures, and real Claude/Codex entry-point tests rejected automatic
+enablement for unset/`0`/`true` while keeping `1` as the explicit ON control.
+
+**T2RT-23:** `happy-agent` ignores `turn-input-evidence` and
+`hub-input-admission` before changing either `sawActivity` or
+`sawNonReadyMessage` in completion waiting. The encrypted socket-update matrix
+covers late mapped evidence from A, turn-less evidence and admission before B
+starts, each followed by idle or legacy ready, plus both no-metadata controls.
+The same waiter remains pending through B's start and completes on B's end.
+All original 31 session tests and the eight new cases pass.
+
+The producer-side protection is the explicit launch opt-in documented above.
+Claude and both initial/replacement Codex queue configuration default OFF;
+older installed readers no longer need a runtime pin to avoid these envelopes.
+Enabled receipt tests set the flag explicitly, and the existing API capability
+gate remains the single publication boundary for evidence/admission metadata.
+Managed startup controls now assert the default-off configuration.
+
+**T2RT-24:** when a claimed continuation resumes inside a still-open native
+turn but returns only an empty result, its authoritative native terminal now
+settles that exact receipt. The guard requires the current native turn, runtime,
+claimed object membership and retry ID to match. With no mapped consumption
+proof, the original root receives one evidence-only terminal cancellation with
+incomplete coverage and `continuation-consumption-unproven`; the native completed
+end carries the same settled evidence. It retains A's original identifiers and
+does not invent a consumed retry input or a new turn. A stale native terminal or
+different retry receipt cannot cancel a newer pending continuation. Existing
+text/tool/final-producing recovery still completes normally on the same root.
+
+The launcher-level source replay now includes the reviewer's empty-result script
+with evidence OFF and explicitly ON. It preserves exactly main's one native
+start and one completed end and asserts terminal/cancelled evidence plus exactly
+one terminal metadata revision on the original root when enabled.
+
+Parity runs all **30 existing scenarios plus two textless recovery variants** in
+each opt-in mode. OFF compares **all session-protocol envelopes** with main,
+including IDs, payloads, order and count. Only independently random SDK transcript
+UUIDs are canonicalized bijectively; native wire envelope/turn IDs remain exact,
+with the existing scripted ID generator and clock. ON compares native turn
+sequences, routing and actual consumer outcomes and retains incomplete/no-cross-
+turn-stamp assertions. Separate observations can be exported as documented above.
+
+Final verification: **32/32 OFF and 32/32 ON scenarios**, **128 source replays**;
+happy-agent session/encryption/CLI checks **106/106** with typecheck/build passed;
+reviewer metadata/empty-result replay **9/9** against the actual updated sources
+(only copied consumer import paths/output and dependency alias were redirected,
+without changing assertions). The standard CLI selection excluding the separately
+run `runClaude` file passed **45 files / 1258 tests**. A prior parallel focused
+run hit one existing one-second `runClaude` harness-start wait; its timeout is
+unchanged. The isolated file passed **66/66** using the standard command, for
+**46 files / 1324 related CLI checks** across those runs. All personal-fallback,
+unchanged merge-base compatibility, API/evidence, mapper/scanner/channel, Codex,
+daemon and managed-startup checks passed.
+
+CLI typecheck and pkgroll/extension-copy build passed through standard global
+setup, including the isolated run. Happy-agent typecheck/pkgroll build also
+passed. Its dependencies were prepared with a filtered frozen-lockfile install;
+no dependency or lockfile changed. Existing bin/empty-chunk, listener and
+asynchronously-handled-rejection warnings remain; no Unix-socket EPERM occurred.
+The routing parser/insertion/rearm/final helpers and native API runtime side-effect
+method remain byte-identical to `9ee84191`. `git diff --check` passed. No Desktop,
+server, wire schema, channel routing or native lifecycle ownership changed.

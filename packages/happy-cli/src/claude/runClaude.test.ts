@@ -411,6 +411,14 @@ describe('runClaude remote JSONL scanner', () => {
         originalListeners.clear();
     });
 
+    it.each([undefined, '0', 'true', '1'])('T2RT-23 requires explicit evidence opt-in (%s)', async optIn => {
+        if (optIn === undefined) delete process.env.HAPPY_INPUT_EVIDENCE;
+        else process.env.HAPPY_INPUT_EVIDENCE = optIn;
+        const harness = await startRemoteRunClaudeHarness();
+        expect(harness.sessionClient.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', optIn === '1');
+        await harness.finish();
+    });
+
     it('persists an accepted active-turn prompt once and deduplicates the JSONL scanner copy', async () => {
         const harness = await startRemoteRunClaudeHarness();
 

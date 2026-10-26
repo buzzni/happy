@@ -16,6 +16,22 @@ function harness() {
     return { events, tracker, start, end };
 }
 describe('TurnInputEvidence', () => {
+    it('T2RT-24 does not settle a claimed receipt from a different native turn or retry', () => {
+        const h = harness(); h.start('older'); h.end('older');
+        h.tracker.setPending({ inputs: [ref('A')], inputCount: 1 }); h.start('a');
+        h.tracker.continuePending('claude-account-switch');
+        const claimed = h.tracker.claimContinuation(h.tracker.takeContinuation()!)!;
+        h.tracker.setPending({ inputs: [], inputCount: 0, continuation: claimed });
+        h.end('older');
+        expect(h.tracker.snapshot('a')).toMatchObject({ terminal: false, continuation: { state: 'pending' } });
+        h.tracker.continuePending('claude-transient'); // A newer decision has a different exact receipt.
+        expect(h.tracker.snapshot('a')!.continuation.retryId).not.toBe(claimed.continuation.retryId);
+        h.end('a');
+        expect(h.tracker.snapshot('a')).toMatchObject({ terminal: false, continuation: { kind: 'claude-transient', state: 'pending' } });
+        h.tracker.cancelContinuation('cancelled');
+        expect(h.tracker.snapshot('a')).toMatchObject({ terminal: true, continuation: { state: 'cancelled' } });
+    });
+
     for (const kind of ['claude-transient', 'claude-account-switch', 'codex-capacity'] as const) {
         it.each(['pre-write', 'post-write/pre-start'] as const)(`T2RT-06/22 settles ${kind} after %s failure`, phase => {
             const h = harness();
