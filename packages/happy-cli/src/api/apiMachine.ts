@@ -209,6 +209,7 @@ import { ensureViewerWebRoot } from '@/daemon/viewerWebRoot';
 import { BrowserSessionBrokerClient } from '@/daemon/browserSessionBrokerContract';
 import { readOrCreateBrowserBridgeToken } from '@/daemon/browserBridgeToken';
 import { deriveBrowserViewerBridgeToken } from '@/daemon/browserBridge';
+import { registerBrowserRuntimeUpdateRpc } from '@/daemon/browserRuntimeUpdateRpc';
 import { registerBrowserLocalSetupRpc } from '@/daemon/browserLocalSetupRpc';
 import { readFile, readdir } from 'node:fs/promises';
 import { DEFERRED_CONTINUATION_CONTEXT_MAX_BYTES } from '@/utils/deferredContinuationContext';
@@ -1659,6 +1660,7 @@ export class ApiMachineClient {
         // terminal-only Linux box needs no SSH session. See
         // specs/browser-setup-gui/.
         registerBrowserLocalSetupRpc(this.rpcHandlerManager);
+        registerBrowserRuntimeUpdateRpc(this.rpcHandlerManager);
         this.rpcHandlerManager.registerHandler('browser-setup:status', async () => {
             const chrome = await detectChrome();
             const state = await readDaemonState();

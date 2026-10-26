@@ -583,3 +583,33 @@ process/cache permissions and temporary-path assumptions, and dev H's mandatory 
 policy/root execution affected unrelated suites. These runs are not reported as passing.
 Reboot/crash recovery and real legacy copying remain unexecuted E2E scenarios; unit coverage
 is not a substitute for those deployment checks.
+
+## Signed updates requested from Desktop
+
+The installer now installs `/usr/local/sbin/abp-runtime-update` and its root-owned
+implementation. On dedicated hosts only, a sudoers entry permits `agent` to invoke
+that fixed wrapper **without arguments**. It reads an Ed25519 `abp-runtime-update`
+envelope on stdin and checks the configured issuer, machine/workspace, action,
+60-second lifetime and durable nonce before starting a worker. Interactive browser
+tokens cannot authorize an update. The daemon exposes only `browser-runtime:update`
+with `{token}`; no shell command or caller-selected image/URL is accepted.
+
+The existing `abp-install` administrator procedure must be rerun from a released
+package containing this helper on older hosts. A CLI npm update alone does not install
+root-owned tools. Browser-only hosts do not receive a guessed sudo grant for their
+preexisting daemon user. Strict server-key machines retain their existing remote
+management refusal; use their administrator-managed upgrade procedure.
+
+Studio must be configured with `AGENT_BROWSER_UPDATE_MANIFEST_PATH`, an absolute,
+operator-managed path to the official release's `scripts/agent-browser/abp-images.json`.
+It checks `machines.manage`, signs the selected manifest, and rechecks authority before
+RPC emission. Keep this artifact and its version consistent with the released package;
+never point it at a user-writable file. No version is installed by this source change.
+
+The root worker writes only fixed status fields under `/var/lib/abp/runtime-update`.
+A successful image switch is verified against the target digests and `abp-stack status`;
+Desktop then offers to reopen the console to check its actual approval-control support.
+A failed switch remains failed even when the previous images recover. Replay files
+survive restarts. An interrupted/stale worker is reported as unconfirmed, not restarted
+automatically; an administrator must inspect stack readiness and the worker before
+recovering it. Never blindly remove the busy marker while an update is running.
