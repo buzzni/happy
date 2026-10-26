@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
 import { ownershipDigest, sessionCreateBodyHash, sessionTagHash } from '@slopus/happy-wire';
 import { createOwnedSpawnJournal } from './ownedSpawnJournal';
-import { createOwnedSpawn, type OwnedSpawnDependencies } from './ownedSpawn';
+import { createOwnedSpawn, OwnedSpawnRejected, OwnedStartRefused, type OwnedSpawnDependencies } from './ownedSpawn';
 
 const homes: string[] = [];
 afterEach(async () => { await Promise.all(homes.splice(0).map(home => rm(home, { recursive: true, force: true }))); });
@@ -106,4 +106,48 @@ it('journal publication failures cannot issue create or provider start', async (
     f.deps.journal.write = async () => { throw new Error('disk unavailable') };
     await expect(r.commit({ creationRequestId: 'creation', preparationId: p.preparationId, ownershipProof: f.proof })).rejects.toThrow();
     expect(f.counts()).toEqual({ prepares: 1, commits: 0, starts: 0 });
+});
+
+it.each(['daemon-restarting', 'directory-approval-required', 'validation-error'] as const)('allows resubmission after definite pre-spawn refusal: %s', async reason => {
+    const f = await fixture(), r = f.runtime(), p = await f.prepare(r);
+    await r.commit({ creationRequestId: 'creation', preparationId: p.preparationId, ownershipProof: f.proof });
+    const start = f.deps.start;
+    f.deps.start = async () => { throw new OwnedStartRefused(reason); };
+    const command = { creationRequestId: 'creation', preparationId: p.preparationId, sessionId: 'session' };
+    expect(await r.start(command)).toMatchObject({ state: 'created', sessionId: 'session' });
+    const saved = await f.journal.read('creation');
+    expect(saved?.caller).toBeUndefined(); expect(saved?.providerRuntimeId).toBeUndefined();
+    f.deps.start = start;
+    expect(await f.runtime().start(command)).toMatchObject({ state: 'started' });
+    expect(f.counts()).toEqual({ prepares: 1, commits: 1, starts: 1 });
+});
+it('observes an uncertain start even when no process has been found yet', async () => {
+    const f = await fixture(), r = f.runtime(), p = await f.prepare(r);
+    await r.commit({ creationRequestId: 'creation', preparationId: p.preparationId, ownershipProof: f.proof });
+    let attempts = 0;
+    f.deps.start = async () => { attempts++; throw new Error('unknown dispatch outcome'); };
+    const command = { creationRequestId: 'creation', preparationId: p.preparationId, sessionId: 'session' };
+    expect(await r.start(command)).toMatchObject({ state: 'starting' });
+    expect(await f.runtime().start(command)).toMatchObject({ state: 'starting' });
+    expect(attempts).toBe(1);
+});
+
+it.each(['prepare', 'commit'])('settles failed launch resources even when the %s failure record cannot be saved', async phase => {
+    const f = await fixture(), r = f.runtime();
+    let settled = 0;
+    f.deps.failed = async () => { settled++; };
+    const write = f.deps.journal.write;
+    if (phase === 'prepare') {
+        f.deps.journal.write = async record => {
+            if (record.state === 'prepared' || record.state === 'failed') throw new Error('disk failure');
+            await write(record);
+        };
+        await expect(f.prepare(r)).rejects.toThrow('disk failure');
+    } else {
+        const prepared = await f.prepare(r);
+        f.deps.commit = async () => { throw new OwnedSpawnRejected(); };
+        f.deps.journal.write = async record => { if (record.state === 'failed') throw new Error('disk failure'); await write(record); };
+        await expect(r.commit({ creationRequestId: 'creation', preparationId: prepared.preparationId, ownershipProof: f.proof })).rejects.toThrow('disk failure');
+    }
+    expect(settled).toBe(1);
 });

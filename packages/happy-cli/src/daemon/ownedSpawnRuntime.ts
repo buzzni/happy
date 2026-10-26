@@ -1,13 +1,13 @@
 /** Production T4rt adapter. Credentials stay in daemon custody; only creation POST carries proofs. */
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
-import { ownershipFresh, verifyOwnership, rotationDecodeBinary, sessionCreateBodyHash, OwnershipCallerBindingSchema } from '@slopus/happy-wire';
+import { rotationIsFresh, verifyOwnership, rotationDecodeBinary, sessionCreateBodyHash, OwnershipCallerBindingSchema } from '@slopus/happy-wire';
 import { ApiClient } from '@/api/api';
 import { decodeBase64, decrypt, encodeBase64 } from '@/api/encryption';
 import type { Metadata, Session } from '@/api/types';
 import type { Credentials, SessionPersistenceResult } from '@/persistence';
 import type { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/registerCommonHandlers';
-import { createOwnedSpawn, OwnedSpawnRejected, type OwnedSpawnRecord, type OwnedSpawnSnapshot } from './ownedSpawn';
+import { createOwnedSpawn, OwnedSpawnRejected, OwnedStartRefused, type OwnedSpawnRecord, type OwnedSpawnSnapshot } from './ownedSpawn';
 import { createOwnedSpawnJournal } from './ownedSpawnJournal';
 import { createAgentCallerBindings } from './agentCallerBinding';
 import type { MachineSetupTokenRuntime } from './machineSetupTokenRuntime';
@@ -39,12 +39,31 @@ export interface OwnedSpawnRuntimeDependencies {
     persist(session: Session): Promise<SessionPersistenceResult>;
     fetch?: typeof fetch;
 }
+/** Private daemon dispatch evidence; never accepted from RPC, argv, or provider environment. */
+export function createOwnedStartGuard() {
+    const active = new WeakSet<SpawnSessionOptions>(), submitted = new WeakSet<SpawnSessionOptions>();
+    return {
+        submitted(options: SpawnSessionOptions) { if (active.has(options)) submitted.add(options); },
+        wasSubmitted(options: SpawnSessionOptions) { return submitted.has(options); },
+        async start(options: SpawnSessionOptions, launch: () => Promise<SpawnSessionResult>) {
+            active.add(options);
+            try {
+                const result = await launch();
+                if (result.type !== 'success' && !submitted.has(options)) {
+                    throw new OwnedStartRefused(result.type === 'requestToApproveDirectoryCreation' ? 'directory-approval-required'
+                        : result.code === 'daemon-restarting' ? 'daemon-restarting' : 'validation-error');
+                }
+                return result;
+            } finally { active.delete(options); submitted.delete(options); }
+        },
+    };
+}
 export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): OwnedSpawnRpc {
     const journal = createOwnedSpawnJournal(deps.home), fetcher = deps.fetch ?? fetch;
     let local: { machineId: string; happyAccountId: string; epoch: string } | null = null;
     const running = new Map<string, { stamp: string; binding: z.infer<typeof OwnershipCallerBindingSchema> }>();
     const startPrepared = new Map<string, { options: SpawnSessionOptions; launch?: PreparedLaunch }>();
-    const launchFlights = new Map<string, { resolve(session: Session): void; complete: Promise<PreparedLaunch> }>();
+    const launchFlights = new Map<string, { reject(error: Error): void; runtime: MachineSetupTokenRuntime; resolve(session: Session): void; complete: Promise<PreparedLaunch> }>();
     const stamps = new WeakMap<TrackedSession, string>();
     const stamp = (s: TrackedSession) => { let value = stamps.get(s); if (!value) { value = randomUUID(); stamps.set(s, value); } return `${s.pid}:${value}`; };
     const caller = createAgentCallerBindings({ identity: () => local, live: binding => {
@@ -163,8 +182,9 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
                 return record.snapshot ?? { ...makeSnapshot(deps.metadata(opts), record.preparationId), runtimeState: { executionCompanyId: null } };
             }
             if (!record.intent.companyId) throw new Error('execution-company-required');
-            let resolveSession!: (value: Session) => void;
-            const sessionReady = new Promise<Session>(resolve => { resolveSession = resolve });
+            let resolveSession!: (value: Session) => void, rejectSession!: (error: Error) => void;
+            const sessionReady = new Promise<Session>((resolve, reject) => { resolveSession = resolve; rejectSession = reject });
+            void sessionReady.catch(() => undefined);
             let ready!: (snapshot: OwnedSpawnSnapshot) => void, failed!: (error: unknown) => void;
             const prepared = new Promise<OwnedSpawnSnapshot>((resolve, reject) => { ready = resolve; failed = reject });
             const metadata = record.snapshot ? decrypt(decodeBase64(record.snapshot.encryptionKey), record.snapshot.encryptionVariant, decodeBase64(record.snapshot.body.metadata)) as Metadata : deps.metadata(opts);
@@ -177,11 +197,29 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
                     await publish(snapshot); ready(snapshot); return sessionReady;
                 } });
             void complete.catch(error => { launchFlights.delete(record.preparationId); failed(error); });
-            launchFlights.set(record.preparationId, { resolve: resolveSession, complete });
+            launchFlights.set(record.preparationId, { resolve: resolveSession, reject: rejectSession, runtime: rotation, complete });
             return prepared;
+        },
+        async failed(record) {
+            const flight = launchFlights.get(record.preparationId);
+            if (flight) {
+                flight.reject(new OwnedSpawnRejected());
+                await flight.complete.catch(() => undefined);
+                await flight.runtime.abandonOwnedLaunch(record.preparationId);
+                launchFlights.delete(record.preparationId);
+            } else {
+                const company = record.snapshot?.runtimeState?.executionCompanyId;
+                if (typeof company === 'string') {
+                    const runtime = await deps.rotation(options(record), company);
+                    if (!runtime) throw new Error('execution-unavailable');
+                    await runtime.abandonOwnedLaunch(record.preparationId);
+                }
+            }
         },
         async commit(record) {
             const snapshot = record.snapshot!;
+            if (snapshot.executionProof && (!rotationIsFresh(snapshot.executionProof.ticket.body, Date.now())
+                || !rotationIsFresh(snapshot.executionProof.deviceProof.body, Date.now()))) throw new OwnedSpawnRejected('execution-proof-expired');
             const response = z.object({ session: rawSessionSchema, ownership: z.unknown().optional() }).parse(await json('/v1/sessions', { ...snapshot.body,
                 ...(snapshot.executionProof ? { executionProof: snapshot.executionProof } : {}), ...(record.proof ? { ownershipProof: record.proof } : {}) }));
             const created = record.proof ? z.object({ sessionId: z.string(), ownershipBindingId: z.string(), registrationState: z.enum(['pending', 'confirmed']), createDigest: z.string() }).strict().parse(response.ownership)

@@ -103,3 +103,33 @@ T1c 기반 통합 전 비활성이다. 배지=T2, 공식 pin=T2r. 실제 서버�
     listen EPERM이고 timeout은 listen 성공 callback을 기다리는 테스트에서 발생했다.
   - `/tmp`가 UID 65534 소유여서 generation manifest ancestor 검증 거부: managedLauncherBoot 2 failed.
   - 로그: `/tmp/rn-t4rt-daemon-full.log`. macOS 재실행은 CI에서 확인해야 한다.
+
+## PR #966 bot 보완 — 시작 거절·실행 증명 만료 (2026-10-26)
+
+- daemon 내부 dispatch guard는 프로세스 생성 경계에 들어가기 전 반환된 restart·directory approval·
+  validation 거절만 `OwnedStartRefused`로 분류한다. owned journal은 `created`로 되돌리고 caller와
+  providerRuntimeId를 지운다. 동일 세션 start를 다시 제출할 수 있으며 thrown exception, spawn 이후
+  실패, 응답 유실은 `starting`에서 관찰만 한다. 표식은 WeakSet/내부 callback이고 RPC·env·argv로
+  받거나 전송하지 않는다. 일반/tmux 모두 자격 검증 뒤 실제 생성 호출 직전에 표시하며, native Windows는
+  suspended root 생성 전에 표시한다. owned tmux 생성 명령 이후 실패는 일반 spawn으로 재시도하지 않는다.
+- 실행 증명 만료는 사용자 허용 대안인 **로컬 명시 거절**로 처리한다. ticket도 60초이므로 deviceProof만
+  다시 서명해 만료 ticket을 살리지 않는다. commit에서 ticket과 deviceProof의 유효기간을 각각 확인해
+  stale이면 Happy POST 없이 `failed / execution-proof-expired`를 반환한다. encrypted body·tag·ticket은
+  교체하지 않는다. 기존 commitIssued는 durable 제출 의도이며 실제 HTTP 송신 횟수를 뜻하지 않는다.
+- 확정 생성 거절과 preparation 실패는 owned failed 상태를 기록하고 sessionReady를 reject하여
+  prepareLaunch의 대기/active lock을 해제한다. machine-rotation journal은 pending을 지우고 abandoned
+  tombstone을 저장한다. recovery가 abandoned를 재조회하지 않으며 같은 launchId의 재준비도 거부한다.
+  cleanup 저장 실패 후 daemon 재시작은 failed status에서 idempotent 정리를 재개한다. uncertain create는
+  failed로 바꾸거나 abandon하지 않고 기존 조회 복구를 유지한다. claim/commit 응답 유실도 기존 복구를 유지한다.
+- 회귀는 실제 machineSetupTokenRuntime과 owned adapter를 함께 구동해 ticket 만료, 별도 deviceProof
+  만료, Happy 403, cleanup 실패 후 재시작을 검증한다. abandoned tombstone의 실제 파일 journal 재개도
+  확인한다. Studio/Happy HTTP만 테스트 port이며 실제 배포 서비스·provider 검증으로 간주하지 않는다.
+- dispatch 가드는 기존 env 검증·credential launch 경계를 계속 검사한다. appliedSource 가드는 문자 수
+  400 제한 대신 두 실제 호출의 tmuxSelection/spawnSelection 전달을 정확히 검사하도록 보강했다.
+- 검증: 거절 rollback·증명 만료·pending 정리를 먼저 실패로 재현했다. 관련 13개 파일 274 passed /
+  1 의도적 미선택(ON parity), 추가 회귀 후 ownedSpawn + machineSetupTokenRuntime 48 passed.
+  각 최종 실행의 global setup tsc/pkgroll 통과. OFF는 9ee84191과 82개 시나리오 동일하다.
+  T4RT-01 unsigned 응답 유실 복구와 T4RT-02 실제 Codex 첫 프롬프트 소비 회귀도 통과했다.
+  failed 상태 저장이 실패해도 cleanup을 finally에서 실행하는 2개 회귀를 포함한다.
+  git diff --check 통과. 전체 daemon/CLI suite·실제 배포 서버·provider·Desktop 통합은 이번 보완에서
+  재실행하지 않았다. 직전 전체 daemon 실행의 환경 제약은 위 기록을 따른다.

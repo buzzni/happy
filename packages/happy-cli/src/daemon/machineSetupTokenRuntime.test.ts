@@ -1,7 +1,11 @@
 import axios from 'axios'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { createOwnedSpawnRuntime } from './ownedSpawnRuntime'
 import nacl from 'tweetnacl'
 import { describe, expect, it, vi } from 'vitest'
-import { rotationDigest, rotationSha256, sessionCreateBodyHash, sessionTagHash, signRotationDocument, verifyRotationDocument,
+import { rotationDigest, rotationSha256, ownershipDigest, signOwnership, sessionCreateBodyHash, sessionTagHash, signRotationDocument, verifyRotationDocument,
   type DaemonRotationRequestBody, type MachineSetupTokenBindingV2, type HappySessionExecutionProof } from '@slopus/happy-wire'
 import { ApiClient } from '@/api/api'
 import type { Metadata } from '@/api/types'
@@ -9,7 +13,8 @@ import type { SessionPersistenceResult } from '@/persistence'
 import type { DeviceOrgPin } from './deviceOrgPinStore'
 import { createMachineSetupTokenProtocol, MachineRotationError, type MachineRotationResult } from './machineSetupTokenProtocol'
 import { createMachineSetupTokenRuntime } from './machineSetupTokenRuntime'
-import type { MachineRotationJournalRecord } from './machineSetupTokenJournal'
+import { createMachineSetupTokenJournal, type MachineRotationJournalRecord } from './machineSetupTokenJournal'
+import { createOwnedSpawnJournal } from './ownedSpawnJournal'
 import { isMachineSetupTokenBinding, readSetupTokenResumeSelection, formatSetupTokenBinding, SETUP_TOKEN_BINDING_ENV } from './sessionEnv'
 import type { TrackedSession } from './types'
 
@@ -341,3 +346,79 @@ it('primary review: resume validates current committed authority rather than an 
  expect(await t.build().resume(tracked,binding)).toEqual(current)
  expect(t.requests.filter(r=>r.action==='rebind')).toHaveLength(1)
 })
+
+it.each(['expired-ticket', 'expired-device-proof', 'expired-ticket-signed', 'server-rejected', 'cleanup-restart', 'preparation-failed'] as const)('settles and abandons an owned machine launch on %s', async failure => {
+  const t = await setup(), rotation = t.build(), home = await mkdtemp(join(tmpdir(), 'owned-rotation-'));
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(NOW);
+  try {
+    const keys = nacl.sign.keyPair(), keyId = await rotationSha256(keys.publicKey);
+    const spawn = { directory: '/project', agent: 'claude' };
+    const intent = signOwnership({ version: 1, type: 'saycode-session-ownership-intent', issuer: studioOrigin, audience: happyOrigin,
+      keyId, issuedAt: NOW, expiresAt: NOW + 120000, intentId: 'intent', operationId: 'operation', creationRequestId: 'creation',
+      ownershipPolicy: 'prefer-owned', subject: { issuer: studioOrigin, userId: 'person' }, companyId, projectId: null,
+      machineId, machineAccountId: machineOwner, sessionAccountId: machineOwner, parentHubSessionId: null,
+      spawnDigest: await ownershipDigest(spawn) }, keys.secretKey);
+    let posts = 0;
+    const start = vi.fn();
+    const makeRuntime = () => createOwnedSpawnRuntime({ home, happyOrigin, env: { HAPPY_SESSION_OWNERSHIP_ENABLED: '1',
+      HAPPY_SESSION_OWNERSHIP_ISSUER: studioOrigin, HAPPY_SESSION_OWNERSHIP_AUDIENCE: happyOrigin,
+      HAPPY_SESSION_OWNERSHIP_PUBLIC_KEYS: JSON.stringify({ [keyId]: Buffer.from(keys.publicKey).toString('base64url') }) },
+      registration: async () => ({ machineId, epoch: 'epoch', credentials: { token: 'synthetic', encryption: { type: 'legacy', secret: new Uint8Array(32) } } }),
+      metadata: () => ({ path: '/project', host: 'box' }) as Metadata,
+      rotation: async () => rotation, tracked: () => undefined, live: () => false, persist: async () => ({ status: 'committed' }), start,
+      fetch: async (url) => {
+        if (String(url).endsWith('/v1/account/profile')) return Response.json({ id: machineOwner });
+        expect(String(url)).toBe(happyOrigin + '/v1/sessions'); posts++;
+        return Response.json({}, { status: 403 });
+      },
+    });
+    const runtime = makeRuntime();
+    if (failure === 'preparation-failed') {
+      t.invalidTicket('owner');
+      await expect(runtime.prepare({ spawn, intent })).rejects.toThrow('BINDING_REJECTED');
+    }
+    const prepared = failure === 'preparation-failed' ? (await createOwnedSpawnJournal(home).read('creation'))!
+      : await runtime.prepare({ spawn, intent });
+    if (failure !== 'preparation-failed') expect(t.disk.get(prepared.preparationId)?.pending?.ownershipManaged).toBe(true);
+    if (failure.startsWith('expired-')) {
+      // Isolate device expiry while the ticket remains fresh; preserve the exact encrypted body.
+      if (failure === 'expired-device-proof') {
+        const journal = createOwnedSpawnJournal(home), record = (await journal.read('creation'))!;
+        record.snapshot!.executionProof!.deviceProof.body.expiresAt = NOW + 1000;
+        await journal.write(record); clock.mockReturnValue(NOW + 1001);
+      } else clock.mockReturnValue(NOW + 60001);
+    }
+    const record = (await createOwnedSpawnJournal(home).read('creation'))!;
+    const { signature: _signature, ...intentBody } = intent;
+    const command = { creationRequestId: 'creation', preparationId: prepared.preparationId,
+      ...(failure === 'expired-ticket-signed' ? { ownershipProof: signOwnership({ ...intentBody, type: 'saycode-session-ownership',
+        issuedAt: Date.now(), expiresAt: Date.now() + 60000, nonce: Buffer.alloc(32, 1).toString('base64url'),
+        tagHash: await sessionTagHash(record.snapshot!.body.tag), createBodyHash: await sessionCreateBodyHash(record.snapshot!.body) }, keys.secretKey) }
+        : { unprovenReason: 'ownership-timeout' }) };
+    if (failure === 'preparation-failed') {
+      expect(await runtime.status({ creationRequestId: 'creation' })).toMatchObject({ state: 'failed', unprovenReason: 'preparation-failed' });
+    } else if (failure === 'cleanup-restart') {
+      vi.spyOn(rotation, 'abandonOwnedLaunch').mockRejectedValueOnce(new Error('cleanup persistence failed'));
+      await expect(runtime.commit(command)).rejects.toThrow('cleanup persistence failed');
+      expect(t.disk.get(prepared.preparationId)?.pending?.ownershipManaged).toBe(true);
+      expect(await makeRuntime().status({ creationRequestId: 'creation' })).toMatchObject({ state: 'failed' });
+    } else {
+      expect(await runtime.commit(command)).toMatchObject({ state: 'failed',
+        unprovenReason: failure === 'server-rejected' ? 'creation-rejected' : 'execution-proof-expired' });
+    }
+    expect(posts).toBe(failure.startsWith('expired-') || failure === 'preparation-failed' ? 0 : 1);
+    expect(t.disk.get(prepared.preparationId)).toMatchObject({ abandoned: true });
+    // The private journal schema persists the tombstone across an actual reopen as well.
+    await createMachineSetupTokenJournal(home).write(t.disk.get(prepared.preparationId)!);
+    expect(await createMachineSetupTokenJournal(home).read(prepared.preparationId)).toEqual({ version: 1, launchId: prepared.preparationId, abandoned: true });
+    expect(t.disk.get(prepared.preparationId)?.pending).toBeUndefined();
+    const requests = t.requests.length;
+    await rotation.recoverLaunches(); await t.build().recoverLaunches();
+    await runtime.status({ creationRequestId: 'creation' });
+    expect(t.requests).toHaveLength(requests);
+    // Rejection settled prepareLaunch: the live-launch lock is gone, but the tombstone refuses reuse.
+    await expect(rotation.prepareLaunch({ ...t.input, ownershipPreparation: { launchId: prepared.preparationId, tag: prepared.preparationId } }))
+      .rejects.toThrow('LAUNCH_ABANDONED');
+    expect(start).not.toHaveBeenCalled(); expect(t.sessionEnvironment).not.toHaveBeenCalled();
+  } finally { clock.mockRestore(); await rm(home, { recursive: true, force: true }); }
+});

@@ -31,6 +31,7 @@ export interface OwnedSpawnDependencies {
     verify(document: unknown): Promise<boolean>;
     scope(spawn: Record<string, unknown>): Promise<{ machineId: string; machineAccountId: string; sessionAccountId: string }>;
     prepare(record: OwnedSpawnRecord, publish: (snapshot: OwnedSpawnSnapshot) => Promise<void>): Promise<OwnedSpawnSnapshot>;
+    failed?(record: OwnedSpawnRecord): Promise<void>;
     commit(record: OwnedSpawnRecord): Promise<OwnedCreated>;
     /** Read-only recovery, including expired proof. Never creates a new tag or re-encrypts. */
     discover(record: OwnedSpawnRecord): Promise<OwnedCreated | null>;
@@ -39,7 +40,11 @@ export interface OwnedSpawnDependencies {
     observeStart(record: OwnedSpawnRecord): Promise<{ providerRuntimeId: string } | null>;
     caller(record: OwnedSpawnRecord): Promise<z.infer<typeof OwnershipCallerBindingSchema>>;
 }
-export class OwnedSpawnRejected extends Error { constructor() { super('owned-spawn-rejected'); } }
+export class OwnedSpawnRejected extends Error { constructor(readonly reason = 'creation-rejected') { super('owned-spawn-rejected'); } }
+/** Only trusted daemon code that knows dispatch never occurred may throw this. */
+export class OwnedStartRefused extends Error {
+    constructor(readonly reason: 'daemon-restarting' | 'directory-approval-required' | 'validation-error') { super('owned-start-refused'); }
+}
 const reference = z.object({ creationRequestId: ownershipId, preparationId: ownershipId });
 const refusal = (code = 'owned-spawn-conflict'): never => { throw new Error(code); };
 export function createOwnedSpawn(deps: OwnedSpawnDependencies) {
@@ -78,6 +83,7 @@ export function createOwnedSpawn(deps: OwnedSpawnDependencies) {
         await deps.journal.write(r);
     }
     async function recover(r: OwnedSpawnRecord) {
+        if (r.state === 'failed') await deps.failed?.(r);
         if (r.state === 'committing') { const found = await deps.discover(r); if (found) await created(r, found, true); }
         if (r.state === 'starting') {
             const found = await deps.observeStart(r);
@@ -100,11 +106,18 @@ export function createOwnedSpawn(deps: OwnedSpawnDependencies) {
                     await scope(r); await deps.journal.write(r);
                 }
                 if (r.state === 'preparing') {
-                    const snapshot = ownedSnapshotSchema.parse(await deps.prepare(r, async snapshot => {
-                        r!.snapshot = ownedSnapshotSchema.parse(snapshot); await deps.journal.write(r!);
-                    }));
-                    r.snapshot = snapshot; r.state = 'prepared'; await deps.journal.write(r);
+                    try {
+                        const snapshot = ownedSnapshotSchema.parse(await deps.prepare(r, async snapshot => {
+                            r!.snapshot = ownedSnapshotSchema.parse(snapshot); await deps.journal.write(r!);
+                        }));
+                        r.snapshot = snapshot; r.state = 'prepared'; await deps.journal.write(r);
+                    } catch (error) {
+                        r.state = 'failed'; r.unprovenReason = 'preparation-failed';
+                        try { await deps.journal.write(r); } finally { await deps.failed?.(r); }
+                        throw error;
+                    }
                 }
+                if (r.state === 'failed') { await deps.failed?.(r); refusal('creation-failed'); }
                 return { preparationId: r.preparationId, operationId: r.intent.operationId, intentDigest: r.intentDigest,
                     sessionCreateBodyHash: await sessionCreateBodyHash(r.snapshot!.body), sessionTagHash: await sessionTagHash(r.snapshot!.body.tag) };
             });
@@ -133,7 +146,10 @@ export function createOwnedSpawn(deps: OwnedSpawnDependencies) {
                 r.commitIssued = true; r.state = 'committing'; await deps.journal.write(r);
                 try { await created(r, await deps.commit(r)); }
                 catch (error) {
-                    if (error instanceof OwnedSpawnRejected) { r.state = 'failed'; r.unprovenReason = 'creation-rejected'; await deps.journal.write(r); }
+                    if (error instanceof OwnedSpawnRejected) {
+                        r.state = 'failed'; r.unprovenReason = error.reason;
+                        try { await deps.journal.write(r); } finally { await deps.failed?.(r); }
+                    }
                     // All uncertain outcomes are read-only recovered; never POST another session.
                 }
                 return view(r);
@@ -169,7 +185,13 @@ export function createOwnedSpawn(deps: OwnedSpawnDependencies) {
                 try {
                     const result = await deps.start(r); r.providerRuntimeId = result.providerRuntimeId; r.state = 'started';
                     await deps.journal.write(r);
-                } catch { /* A submitted start can only be observed, never resubmitted. */ }
+                } catch (error) {
+                    if (error instanceof OwnedStartRefused) {
+                        r.state = 'created'; delete r.providerRuntimeId; delete r.caller;
+                        await deps.journal.write(r);
+                    }
+                    // Unknown dispatch outcomes can only be observed, never resubmitted.
+                }
                 return view(r);
             });
         },

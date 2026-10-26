@@ -1,4 +1,4 @@
-import { createOwnedSpawnRuntime } from './ownedSpawnRuntime';
+import { createOwnedSpawnRuntime, createOwnedStartGuard } from './ownedSpawnRuntime';
 import { drainWorktreeOperations } from './worktreeOps';
 import { createMachineSetupTokenProtocol, MachineRotationError } from './machineSetupTokenProtocol';
 import { chooseLaunchRotation, createMachineRotationResolver } from './machineRotationResolver';
@@ -1849,6 +1849,7 @@ export async function startDaemon(): Promise<void> {
     let machineRotation: ReturnType<typeof createMachineRotationResolver<MachineSetupTokenRuntime>> | null = null;
     let sharedMachineScope = async (): Promise<string | null> => null;
     const pendingMachineStarts = new Set<string>();
+    const ownedStartGuard = createOwnedStartGuard();
     const ownedMachineLaunches = new WeakMap<SpawnSessionOptions, Awaited<ReturnType<MachineSetupTokenRuntime['prepareLaunch']>>>();
     const channelSessionKeys = new WeakMap<SpawnSessionOptions, { key: Uint8Array; wrapped: Uint8Array }>();
     /** The runtime of an existing machine-rotation launch; recovery never depends on new issuance being accepted. */
@@ -2419,7 +2420,9 @@ export async function startDaemon(): Promise<void> {
             sessionName: tmuxSessionName,
             windowName: windowName,
             cwd: directory
-          }, tmuxEnv, start => launchManagedAiCredentialSession(managedAiCredentialEnvironment, start));
+          }, tmuxEnv, start => launchManagedAiCredentialSession(managedAiCredentialEnvironment, () => {
+            ownedStartGuard.submitted(options); return start();
+          }));
 
           if (tmuxResult.success) {
             logger.debug(`[DAEMON RUN] Successfully spawned in tmux session: ${tmuxResult.sessionId}, PID: ${tmuxResult.pid}`);
@@ -2461,6 +2464,10 @@ export async function startDaemon(): Promise<void> {
               logger,
             }), tmuxSelection.appliedSource);
           } else {
+            // An owned tmux dispatch may have succeeded despite a missing PID/ACK. Never launch a second child.
+            if (ownedStartGuard.wasSubmitted(options)) return finishSpawn(Promise.resolve({
+              type: 'error', errorMessage: 'Owned tmux start outcome is unknown',
+            }));
             logger.debug(`[DAEMON RUN] Failed to spawn in tmux: ${tmuxResult.error}, falling back to regular spawning`);
             useTmux = false;
           }
@@ -2526,6 +2533,7 @@ export async function startDaemon(): Promise<void> {
             spawnEnvironment.HAPPY_SANDBOX_POLICY_MODE = 'mandatory';
           }
           return finishSpawn(spawnTrackedHappyProcess({
+            onProcessSubmission: () => ownedStartGuard.submitted(options),
             args,
             cwd: directory,
             env: spawnEnvironment,
@@ -2555,6 +2563,7 @@ export async function startDaemon(): Promise<void> {
     };
 
     const spawnTrackedHappyProcess = async ({
+      onProcessSubmission,
       args,
       cwd,
       env,
@@ -2564,6 +2573,8 @@ export async function startDaemon(): Promise<void> {
       resumeTargetSessionId,
       managedAiCredentialEnvironment = {},
     }: {
+      /** Internal dispatch evidence; never transported in provider env or RPC options. */
+      onProcessSubmission?: () => void;
       args: string[];
       cwd: string;
       env: NodeJS.ProcessEnv;
@@ -2583,6 +2594,7 @@ export async function startDaemon(): Promise<void> {
       }
       // Native preparation creates a suspended root; authorize execution at resume below.
       const prepareStartedAt = Date.now();
+      if (standaloneWindows) onProcessSubmission?.();
       const prepared = standaloneWindows ? await standaloneWindows.owner.prepare({ args, cwd, env }) : undefined;
       if (prepared) logger.debug(`[timing] spawn windows-prepare ${Date.now() - prepareStartedAt}ms`);
       const scopeReports = env.HAPPY_WRITE_SCOPE_SESSION === '1' ? writeScopeRuntime?.prepareReports(resumeTargetSessionId) : undefined;
@@ -2591,7 +2603,7 @@ export async function startDaemon(): Promise<void> {
         () => {
           const stdio: import('child_process').SpawnOptions['stdio'] = scopeReports ? ['ignore', 'ignore', 'ignore', 'pipe']
             : captureSpawnOutputStdio(startupLogFileName, `session ${resumeTargetSessionId ?? 'new'} from ${cwd}`);
-          try { return spawnHappyCLI(args, { cwd, detached: true, stdio, env: { ...env, ...scopeReports?.environment } }); }
+          try { onProcessSubmission?.(); return spawnHappyCLI(args, { cwd, detached: true, stdio, env: { ...env, ...scopeReports?.environment } }); }
           finally { closeCapturedSpawnOutputStdio(stdio); }
         });
       scopeReports?.attach(happyProcess);
@@ -5276,7 +5288,7 @@ export async function startDaemon(): Promise<void> {
         homeDir: os.homedir(), happyHomeDir: configuration.happyHomeDir, happyLibDir: projectPath(), happyToolsDir: join(projectPath(), 'tools', 'unpacked'),
         flavor: options.agent ?? 'claude', startedFromDaemon: true, startedBy: 'daemon', lifecycleState: 'running', lifecycleStateSince: Date.now() }),
       rotation: (options, companyId) => companyId ? machineRuntimeFor(companyId) : machineRotationFor(options),
-      start: (options, launch) => { if (launch) ownedMachineLaunches.set(options, launch); return spawnSessionAdmitted(options); },
+      start: (options, launch) => { if (launch) ownedMachineLaunches.set(options, launch); return ownedStartGuard.start(options, () => spawnSessionAdmitted(options)); },
       tracked: sessionId => findTrackedSessionById(sessionId) ?? sessionIdToFinishedSession.get(sessionId), live: tracked => tracked.pid > 0 && isPidAlive(tracked.pid),
       persist: async session => {
         // Rotation has already persisted its execution binding; retain that trusted resume state.

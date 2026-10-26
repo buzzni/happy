@@ -117,6 +117,12 @@ export function createMachineSetupTokenRuntime(deps: {
     signal?.throwIfAborted();
     return environment(current)
   }
+  async function abandonOwnedLaunch(launchId: string) {
+    const state = await journal.read(launchId);
+    if (!state || state.abandoned || state.current) return;
+    if (!state.pending?.ownershipManaged) throw new MachineRotationError('NOT_BOUND');
+    await journal.write({ version: 1, launchId, abandoned: true });
+  }
   async function recoverLaunches() {
     const recoveredSessions: TrackedSession[] = [];
     // Initial creates have no child yet. Reconstruct only from the exact encrypted body,
@@ -125,7 +131,7 @@ export function createMachineSetupTokenRuntime(deps: {
       if (activeLaunches.has(id)) continue;
       try {
       const state = await journal.read(id), pending = state?.pending;
-      if (!state || state.current || !pending || pending.request.action !== 'issue') continue;
+      if (!state || state.abandoned || state.current || !pending || pending.request.action !== 'issue') continue;
       if (!pending.createBody) throw new MachineRotationError('PERSISTENCE_INDETERMINATE');
       const snapshot = await deps.loadPrepared(id, pending.request.sessionCreateBodyHash);
       if (!snapshot) throw new MachineRotationError('PERSISTENCE_INDETERMINATE');
@@ -190,6 +196,7 @@ export function createMachineSetupTokenRuntime(deps: {
       // Durable before process submission; an uncertain outcome cannot authorize a fresh conversation.
       if (!state.startSubmitted) await journal.write({ ...state, startSubmitted: true });
     },
+    abandonOwnedLaunch,
     recoverLaunches() { recoveryFlight ??= recoverLaunches().finally(() => { recoveryFlight = null }); return recoveryFlight; },
     async prepareLaunch(input: {
       metadata: Metadata; ownerAccountId: string; machineOwnerAccountId: string; userHomeDir?: string;
@@ -203,6 +210,7 @@ export function createMachineSetupTokenRuntime(deps: {
       activeLaunches.add(launchId);
       try {
       let state: MachineRotationJournalRecord | undefined = input.ownershipPreparation ? await journal.read(launchId) ?? undefined : undefined
+      if (state?.abandoned) throw new MachineRotationError('LAUNCH_ABANDONED');
       const metadata = { ...input.metadata, setupTokenRotation: { version: 1 as const, principalType: 'machine' as const, bindingVersion: 2 as const } }
       const session = await input.createSession({ tag, metadata, state: { controlledByUser: false }, executionProof: async (body, encryption) => {
         const hashes = { sessionTagHash: await sessionTagHash(body.tag), sessionCreateBodyHash: await sessionCreateBodyHash(body) }

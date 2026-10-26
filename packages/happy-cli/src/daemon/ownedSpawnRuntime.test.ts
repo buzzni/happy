@@ -6,11 +6,11 @@ import nacl from 'tweetnacl';
 import { signOwnership, ownershipDigest, sessionCreateBodyHash, rotationSha256, sharedMachineRotationFixture } from '@slopus/happy-wire';
 import type { Metadata } from '@/api/types';
 import type { TrackedSession } from './types';
-import { createOwnedSpawnRuntime } from './ownedSpawnRuntime';
+import { createOwnedSpawnRuntime, createOwnedStartGuard } from './ownedSpawnRuntime';
 import { registerOwnedSpawnRpc } from './ownedSpawnRpc';
 import { createOwnedSpawnJournal } from './ownedSpawnJournal';
 const homes: string[] = [];
-afterEach(async () => { await Promise.all(homes.splice(0).map(home => rm(home, { recursive: true, force: true }))); });
+afterEach(async () => { vi.restoreAllMocks(); await Promise.all(homes.splice(0).map(home => rm(home, { recursive: true, force: true }))); });
 async function fixture() {
     const home = await mkdtemp(join(tmpdir(), 'owned-runtime-')); homes.push(home);
     const keys = nacl.sign.keyPair(), now = Date.now();
@@ -101,6 +101,7 @@ it('recovers an unsigned creation with null server agentState after a lost respo
 });
 
 it.each(['execution', 'ownership'])('keeps agentState bound during %s proof recovery', async kind => {
+    if (kind === 'execution') vi.spyOn(Date, 'now').mockReturnValue(sharedMachineRotationFixture.executionProof.ticket.body.issuedAt);
     const f = await fixture(), runtime = f.build();
     const p = await runtime.prepare({ spawn: f.spawn, intent: f.intent });
     if (kind === 'execution') {
@@ -116,4 +117,16 @@ it.each(['execution', 'ownership'])('keeps agentState bound during %s proof reco
     const next = f.build();
     expect(await next.status({ creationRequestId: 'creation' })).toMatchObject({ state: 'committing' });
     expect(f.counts()).toEqual({ posts: 1, starts: 0 });
+});
+
+it.each([
+    { type: 'error', code: 'daemon-restarting', errorMessage: 'retry later' },
+    { type: 'requestToApproveDirectoryCreation', directory: '/project' },
+    { type: 'error', errorMessage: 'validation failed' },
+] as const)('classifies only pre-dispatch refusals ($type)', async result => {
+    const guard = createOwnedStartGuard(), options = { directory: '/project', agent: 'codex' as const };
+    await expect(guard.start(options, async () => result)).rejects.toThrow('owned-start-refused');
+    expect(await guard.start(options, async () => { guard.submitted(options); expect(guard.wasSubmitted(options)).toBe(true); return result; })).toBe(result);
+    expect(guard.wasSubmitted(options)).toBe(false);
+    await expect(guard.start(options, async () => { throw new Error('uncertain'); })).rejects.toThrow('uncertain');
 });
