@@ -62,8 +62,8 @@ export class TurnInputEvidence {
         if (unmapped) incompleteReasons = [...incompleteReasons, 'background-co-consumption'];
         const reasons = [...incompleteReasons, 'background-co-consumption', ...(!source ? ['background-source-unavailable'] : [])];
         // A consumed scanner row starts a new provider lifecycle even when the
-        // routing mapper has no turn to close. Settle only our unmapped witness;
-        // publishing evidence must not synthesize a routing turn-end.
+        // routing mapper has no turn to close. Settle only our unmapped witness,
+        // including its matching end for automation and other envelope consumers.
         if (nextTurn && this.unmappedTurn) {
             const previous = this.unmappedTurn;
             for (const reason of reasons) this.incomplete(reason, previous);
@@ -76,6 +76,7 @@ export class TurnInputEvidence {
             }
             if (this.current === previous) this.current = null;
             this.unmappedTurn = null;
+            this.emit(createEnvelope('agent', { t: 'turn-end', status: 'completed' }, { turn: previous }));
         }
         // Scanner consumption can close the previous mapper turn before its envelopes are stamped.
         // Its background observation belongs to the next turn, not that still-stamped current turn.
