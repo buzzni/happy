@@ -1551,10 +1551,16 @@ real-runner receipt assertion independently reproduced the pending/nonterminal r
   the target runtime is live and evidence-ON, for example through a fresh
   `agentContact` with the matching `runtimeId`/`modeEpoch`, `inputEvidence:1`
   and `guardedPrompt:1`, and an ON `inputEvidenceEnabled` marker. It must also require a
-  message-bound admission receipt within a bounded timeout. Missing receipt
-  means **not delivered**; durable message storage alone is not admission, and
-  the caller must not wait forever. A runtime can be replaced after discovery,
-  so fresh discovery does not remove the receipt/timeout requirement.
+  message-bound admission receipt within a bounded timeout. When the timeout
+  passes without a receipt, the result is **unconfirmed**, not "not delivered".
+  The runtime may already have admitted or run the input while the receipt is
+  still in transit (T2RT-35). The caller must stop waiting and show that
+  uncertainty. It then reconciles any receipt that arrives late, using the
+  original `serverMessageId` and the expected `runtimeId`/`modeEpoch`.
+  It must not retry automatically as a fresh message unless an explicit
+  idempotency or reconciliation key prevents duplicate execution. Durable
+  message storage alone is not admission. A runtime can be replaced after
+  discovery, so fresh discovery does not remove the receipt/timeout requirement.
   An **OFF runtime never executes a guarded prompt** and publishes no admission
   envelopes. Its metadata may retain a prior ON runtime's advertisement. Handling
   this stale-advertisement/absent-receipt case belongs to the Desktop T2 sender;
