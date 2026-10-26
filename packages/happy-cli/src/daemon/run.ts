@@ -4659,7 +4659,8 @@ export async function startDaemon(): Promise<void> {
       machineSetupTokenAuthority: async binding => { await (await machineRuntimeFor(binding.companyId)).validateAuthority(binding); },
       setupTokenBinding: trustedStudioOrigin ? createSetupTokenBindingVerifier({ origin: trustedStudioOrigin, machineId }) : undefined,
       // Saycode specs/setup-token-switch-usage-check — a shared PC asks Studio which of its accounts to use (bound below).
-      sharedChoose: async input => setupTokenAccountSwitch ? setupTokenAccountSwitch.sharedChoose(input) : undefined,
+      // Without a trusted Studio there is no one to ask, so a launch reads the slot roster only once.
+      sharedChoose: trustedStudioOrigin ? async input => setupTokenAccountSwitch ? setupTokenAccountSwitch.sharedChoose(input) : undefined : undefined,
       // A group sync never removes the organization account a live session runs on; it waits for a later sync.
       setupTokenAccountsInUse: () => getCurrentChildren().flatMap(session => {
         // A corrupt record cannot be resumed anyway, so it holds no slot back.
