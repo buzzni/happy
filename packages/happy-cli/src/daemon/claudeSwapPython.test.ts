@@ -50,7 +50,7 @@ describe('claude-swap through its base Python on Windows', () => {
     expect(run).toHaveBeenLastCalledWith(target.python, ['-P', '-m', 'claude_swap', 'list', '--json'], { timeoutMs: 5, environment: { KEEP: '1', PYTHONPATH: target.sitePackages } })
     await routed('uv', ['--version'])
     expect(run).toHaveBeenLastCalledWith('uv', ['--version'], undefined)
-    await routed('uv', ['tool', 'install', 'saycode-claude-swap==0.27.0b2', '--force'])
+    await routed('uv', ['tool', 'install', 'saycode-claude-swap==0.27.0b3', '--force'])
     expect(resolver.forget).toHaveBeenCalledTimes(1)
     resolver.get.mockResolvedValueOnce(null as never)
     await routed('cswap', ['--version'])

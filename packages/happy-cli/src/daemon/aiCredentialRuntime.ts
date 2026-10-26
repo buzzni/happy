@@ -48,7 +48,7 @@ import {
 
 const MAX_PAYLOAD_BYTES = 1024 * 1024
 const CLAUDE_SWAP_PACKAGE = 'saycode-claude-swap'
-const CLAUDE_SWAP_VERSION = '0.27.0b2'
+const CLAUDE_SWAP_VERSION = '0.27.0b3'
 /** Windows: the daemon's claude-swap calls and `cswap auto` run through this verified base Python (RE8). */
 export const claudeSwapPython = createClaudeSwapPythonResolver({ platform: process.platform, find: () => findClaudeSwapPython(CLAUDE_SWAP_PACKAGE, process.env), verify: verifyClaudeSwapPython })
 const CLAUDE_STATUS_TIMEOUT_MS = 120_000
