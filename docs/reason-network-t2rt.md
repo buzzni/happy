@@ -24,6 +24,16 @@ incomplete with a background reason. Missing starts never borrow an earlier
 launch's run ID. Scanner consumption staged before the previous terminal is
 stamped belongs to the next evidence turn.
 
+The T2RT-19 structural decision below also makes **wire turn lifecycle identical
+to `9ee84191`**: T2rt cannot create, close or reorder turn-start/turn-end events.
+The separate unmapped lifecycle from `02497601`, `e68bed17` and `f93aeae0` is
+removed. Only native mapped turns can stamp finals or supply retry roots.
+An unmapped final publishes a terminal, incomplete `turn-input-evidence` revision
+without an envelope `turn`; its payload ID is only an evidence correlation token.
+It has empty inputs, no consumed-input claim and no eligibility for a later final.
+Automation/follow-up behavior remains main's, including the pre-existing missing
+textless automation completion and notification/intervention cases reproduced below.
+
 ## Scope and architecture
 
 Core: authoritative runtime input consumption, host mode transitions and permission
@@ -33,8 +43,8 @@ owner authority, server schema or provider protocol is introduced.
 The input witness is independent of routing `requestIds`, the channel `requestId`
 slot and `AutomationTurnTracker`. Original queue entries retain text/attachments
 locally for revalidation; only identifiers, counters and states enter evidence.
-Automation retains its single-run arming/carry semantics. Its settlement observes
-explicit continuation pending/cancel/replacement evidence when present.
+Automation retains main's single-run arming/carry semantics and native retry
+flags. Evidence revisions cannot carry, abandon or settle automation runs.
 
 Only the independent Happy clone is edited. T1b's `daemon/sessionEnv.ts`,
 `daemon/run.ts`, `commands/sessionAgentBroker.ts` and T4o's ownership/export files
@@ -1281,3 +1291,130 @@ vitest run --config /tmp/happy-t2rt-xr-v11/vitest.config.mjs --project unit
 unchanged. Revisit lifecycle handling only with a contract that accounts for all
 these consumers; terminal evidence is not a substitute for the matching end.
 Rollback is a revert of this follow-up, which would reintroduce T2RT-18.
+
+## T2RT-19 structural correction: evidence never owns wire turns (2026-10-26)
+
+Review base: `f93aeae0a07cbf4f48ff6ff28ec087beab646aa5`. The finding is accepted.
+Three successive fixes to an independent wire-emitting witness caused attribution,
+automation and follow-up regressions. The user's structural option supersedes the
+T2RT-16/17/18 lifecycle design and its historical verification claims above.
+The unchanged v12 follow-up reproduction initially reproduced **3 failures / 2
+passing controls**. Fixing notification classification alone would still leave
+T2rt owning turns, contrary to the standing scope decision.
+
+Removed behavior:
+
+| Commit | Removed behavior |
+| --- | --- |
+| `02497601` | `unmappedTurn`, synthetic witness start/final/end, API pending/ensure preparation state, synthetic retry preparation turns and mapped/unmapped interleaving settlement. Evidence can add a final to an already mapped native turn, but cannot create one. |
+| `e68bed17` | Consumed-scanner settlement and rotation of the separate unmapped witness. No such live witness now exists to intercept F or retain A's attribution. |
+| `f93aeae0` | Synchronous witness `turn-end` at scanner consumption and its extra automation completion report. Neither scanner request maps nor daemon follow-up interpretation is changed to accommodate invented turns. |
+
+The package-wide audit also found the earlier T2RT-05 Codex `dispatchedInput`
+mapper predicate synthesized turns for a written REST failure without a provider
+start. That predicate is removed and its terminal branch restored to `9ee84191`.
+The dispatch observation now supplies only an incomplete `provider-turn-unmapped`
+revision; main's existing channel-request failure start/end remains intact.
+The older API hooks that carried/abandoned automation from evidence are also
+removed: its complete automation/tool runtime-side-effect method is restored
+byte for byte to `9ee84191`. Only native events and main's retry flags settle runs.
+
+`TurnInputEvidence` now constructs only evidence revisions, never turn-start/end.
+An unmapped final produces `coverage=incomplete`, `inputs=[]`, `inputCount=0`,
+`terminal=true` and `unmapped-final-answer`, plus any staged background reasons.
+There is no envelope turn ID, registered turn snapshot, current/last witness or
+retry carry for that revision. Its required payload identity is a fresh opaque
+correlation token, not an invented routing turn. The pending unmapped batch is
+discarded rather than stamping a later mapped final; an unmapped gap also clears
+the previous mapped snapshot's default retry lookup. Explicit stored background
+source snapshots remain available through their actual native IDs. Mapped
+evidence, exact additional-input settlement and proven mapped retry roots stay.
+Account/refusal tests now distinguish an observed authentication-error turn from
+a textless refusal: only the former may preserve its witnessed retry root.
+
+### Durable source parity and main reproductions
+
+`api/apiSession.inputEvidenceLifecycle.test.ts` extracts CLI source from Git
+`9ee84191` into a temporary directory and runs the same
+`api/fixtures/turnEventParity.scenarios.ts` against that source and HEAD in
+isolated Vitest projects. No stored hand-written baseline mapper or `/tmp`
+review fixture is needed to run this regression. Both use the installed wire
+codec and dependencies; SDK/network boundaries are scripted. Routing IDs and
+envelope ID/time allocation are deterministic per native event kind so additive
+evidence/final frames cannot shift the oracle's IDs. The comparison retains
+turn/envelope IDs, role, request ID, status, order and count; only additive
+`inputEvidence` payloads are excluded from the turn-frame comparison.
+
+The **26 scenarios per revision / 52 source replays** include:
+
+- T2RT-16's channel A launch/result/final/real scanner attachment/rearm, evidence
+  off and on, with the real API client, converter and ordered queue.
+- T2RT-17/19's held result with consumed row, attachment or SDK receipt; textless
+  and mapped-review controls; and ordinary-session `afterTurn` consumption, all
+  in both capability states. Actual emitted envelopes feed `observeFollowupTurn`
+  and `runSessionFollowupTick`, including evaluate/deliver decisions.
+- T2RT-18's encrypted scheduled-prompt socket update and real awaited
+  `afterTurn`/scanner matrix, evidence off/on and boundary absent/present.
+- All three v12 overlapping B/outbox cases in both capability states: an actual
+  encrypted outbox POST is held while B opens, answers and receives the scanner
+  observation; transmitted frames equal the queued frames without duplicate
+  local IDs. Their turn sequences must equal main's.
+- Codex no-provider-start termination with and without a waiting channel request.
+- A mapped scheduled failure in both capability states, verifying completion
+  report timing before evidence cancellation as well as the eventual result.
+  This extra control first failed on evidence's automation carry hook; restoring
+  main's runtime-side-effect method makes it pass.
+
+The parity test failed before the structural correction (38 soft mismatches,
+including extra turns, consumer decisions/reports and absent non-turn revisions)
+and passes after it. It also checks standalone revisions are incomplete/empty,
+that their IDs/roots never stamp native finals, and that mapped follow-up finals
+cannot inherit A. A separate golden regression first failed on stale retry
+lookup after an unmapped gap, then passed after that lookup was removed.
+
+**T2RT-18 reproduces on `9ee84191`:** all four scheduled textless controls emit
+zero wire turn events, call `onReady` once and send zero automation completion
+reports. HEAD must do exactly that. The stranded scheduled run is pre-existing
+and out of scope; T2rt cannot repair it by inventing a turn.
+
+**Main also classifies the T2RT-19 consumed notification as intervention** when
+there was no mapped turn open before it: both the held-result and ordinary
+mapped-review controls return `userIntervened=true`, evaluate
+`TERMINATE/USER_INTERVENTION` and deliver zero follow-ups on `9ee84191` and HEAD.
+The attachment-with-no-native-turn control likewise reports intervention;
+SDK receipt without a scanner user envelope waits. These are main behaviors,
+not fixes claimed here. Notification identity/daemon follow-up hardening is a
+separate out-of-scope follow-up under the user's parity requirement.
+
+Verification:
+
+- Durable parity: **26/26 scenarios match main**, **52 source replays passed**.
+- Standard related selection: **46 files / 1305 tests passed**, including the
+  source-parity orchestrator, API/evidence, all launcher/fallback/channel tests,
+  unchanged merge-base routing compatibility, Codex consumers, daemon follow-up,
+  idle reaper and managed startup. Nested source replays are counted separately
+  above, not added to this Vitest parent-test total.
+- CLI global setup passed typecheck, pkgroll and extension-copy build; final
+  explicit CLI typecheck passed after the test-export addition.
+- Adapted v12 external consumer replay: **6/6 passed** (all outbox sources,
+  capability off/on, with baseline and HEAD emissions). Actual Desktop response
+  lifecycle/parser/wait snapshot, channel final tracker, Happy App normalization
+  and Happy Agent completion waits agree with main. Standalone incomplete
+  revisions cause no lifecycle change or premature completion. The supplied
+  artifacts' original synthetic-W expectations are intentionally superseded.
+- Routing parser, insertion, rearm and final-answer helpers remain byte-identical
+  to `9ee84191`; the merge-base routing test copies remain unchanged. Evidence
+  source contains no construction of turn-start/end. `git diff --check` passed.
+  No Unix-socket EPERM or failure occurred in the final related selection.
+  Existing bin/empty-chunk and listener/asynchronous-rejection warnings remain.
+  No whole-suite, live-provider or full Desktop application validation is claimed.
+
+The fixture optionally exports observations with `T2RT_PARITY_EXPORT=<local path>`
+for review tools; default runs remove their extracted sources and observations.
+CI's macOS full-unit checkout now fetches history so the pinned Git object exists;
+the SDK-update job already does so. Standalone/shallow checkouts must also contain
+`9ee84191` to run this test. No test performs an implicit network fetch.
+Standard test commands remain unchanged. No dependency/schema change, PR,
+rebase, force-push, main merge or other-branch mutation is introduced. Revisit
+wire ownership only with a separately approved protocol/lifecycle design that
+accounts for all consumers; terminal evidence must never acquire turn semantics.

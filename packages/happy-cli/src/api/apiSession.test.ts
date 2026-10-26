@@ -251,7 +251,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
             // The SDK delivered its final candidate; MCP recovery/afterTurn has not reached onReady.
             client.sendFinalAnswerForChannelTurn('textless background result');
             expect.soft(routing()).toEqual(beforeFinal);
-            const candidate = published.find(event => event.ev.t === 'final-answer');
+            const candidate = published.find(event => event.ev.t === 'turn-input-evidence');
             if (supported) expect(candidate?.ev).toMatchObject({ inputEvidence: { coverage: 'incomplete' } });
             else expect(candidate).toBeUndefined();
             const project = getProjectPath(directory);
@@ -270,10 +270,9 @@ describe('ApiSessionClient v3 messages API migration', () => {
             client.closeClaudeSessionTurn('completed');
             expect.soft(published.filter(event => event.ev.t === 'turn-end').at(-1)?.ev).toMatchObject({ requestId: 'channel-A' });
             if (supported) {
-                expect(published.find(event => event.turn === candidate?.turn && event.ev.t === 'turn-end')?.ev)
-                    .toMatchObject({ status: 'completed', inputEvidence: { terminal: true, coverage: 'incomplete' } });
-                expect(client.inputEvidence.snapshot(candidate?.turn)).toMatchObject({ terminal: true, coverage: 'incomplete',
-                    incompleteReasons: expect.arrayContaining(['background-co-consumption']) });
+                expect(candidate).not.toHaveProperty('turn');
+                expect(candidate?.ev).toMatchObject({ inputEvidence: { terminal: true, coverage: 'incomplete', inputs: [],
+                    incompleteReasons: expect.arrayContaining(['unmapped-final-answer']) } });
             }
             for (const event of published) expect(() => sessionEnvelopeSchema.parse(event)).not.toThrow();
         } finally {
@@ -301,11 +300,11 @@ describe('ApiSessionClient v3 messages API migration', () => {
             expect(state).toEqual(routing);
             client.closeClaudeSessionTurn('completed');
             expect(state).toEqual(routing);
-            expect(events.map(event => event.ev.t)).toEqual(supported ? ['turn-start', 'final-answer', 'final-answer', 'turn-end'] : []);
+            expect(events.map(event => event.ev.t)).toEqual(supported ? ['turn-input-evidence', 'turn-input-evidence'] : []);
             if (supported) {
-                expect(new Set(events.map(event => event.turn)).size).toBe(1);
-                expect(events.at(-1)?.ev).toMatchObject({ inputEvidence: { terminal: true, coverage: 'complete',
-                    inputs: [{ kind: 'rest', serverMessageId: 'textless', serverSeq: 1 }] } });
+                expect(events.every(event => !event.turn)).toBe(true);
+                expect(events.at(-1)?.ev).toMatchObject({ inputEvidence: { terminal: true, coverage: 'incomplete', inputs: [], inputCount: 0,
+                    incompleteReasons: expect.arrayContaining(['unmapped-final-answer']) } });
             }
             for (const event of events) expect(() => sessionEnvelopeSchema.parse(event)).not.toThrow();
         } finally { await client.close(); }
@@ -322,49 +321,26 @@ describe('ApiSessionClient v3 messages API migration', () => {
             client.startClaudeInputEvidence({ inputs: [{ kind: 'rest', serverMessageId: 'refused', serverSeq: 1 }], inputCount: 1 });
             client.continueClaudeInputEvidence('claude-transient');
             expect(state).toEqual(routing);
-            if (supported) expect(client.inputEvidence.snapshot()).toMatchObject({
-                inputs: [{ kind: 'rest', serverMessageId: 'refused', serverSeq: 1 }], continuation: { state: 'pending' } });
+            expect(client.inputEvidence.snapshot()).toBeNull();
+            expect(client.inputEvidence.takeContinuation()).toBeUndefined();
             client.closeClaudeSessionTurn('failed');
         } finally { await client.close(); }
     });
 
-    it('preserves the original textless input through an independent retry witness', async () => {
+    it('does not carry unmapped input into a later mapped turn', async () => {
         const client = new ApiSessionClient('fake-token', session);
         vi.spyOn(client, 'updateMetadata').mockImplementation(() => undefined);
         client.configureInputQueue(new MessageQueue2<string>(mode => mode), 'remote', true);
-        const state = (client as any).claudeSessionProtocolState as ClaudeSessionProtocolState;
-        const routing = { ...state };
         try {
-            client.startClaudeInputEvidence({ inputs: [{ kind: 'rest', serverMessageId: 'retry-input', serverSeq: 1 }], inputCount: 1 });
+            client.startClaudeInputEvidence({ inputs: [{ kind: 'rest', serverMessageId: 'A', serverSeq: 1 }], inputCount: 1 });
+            client.sendFinalAnswerForChannelTurn('unmapped A');
+            expect(client.inputEvidence.currentTurn()).toBeNull();
+            expect(client.inputEvidence.takeContinuation()).toBeUndefined();
             client.continueClaudeInputEvidence('claude-transient');
-            client.closeClaudeSessionTurn('failed');
-            expect(state).toEqual(routing);
-            const original = client.inputEvidence.snapshot()!;
-            expect(original).toMatchObject({ terminal: false, continuation: { state: 'pending' } });
-            const continuation = client.inputEvidence.claimContinuation(client.inputEvidence.takeContinuation()!)!;
-            client.startClaudeInputEvidence({ inputs: [], inputCount: 0, continuation });
-            client.sendFinalAnswerForChannelTurn('recovered');
+            client.sendClaudeSessionMessage({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'later turn' }] } } as any);
             client.closeClaudeSessionTurn('completed');
-            expect(state).toEqual(routing);
-            expect(client.inputEvidence.snapshot()).toMatchObject({ rootBatchId: original.rootBatchId, terminal: true,
-                inputs: original.inputs, coverage: 'complete', continuation: { kind: 'claude-transient', state: 'completed' } });
-        } finally { await client.close(); }
-    });
-
-    it('settles both witnesses conservatively if mapped output follows an unmapped final', async () => {
-        const client = new ApiSessionClient('fake-token', session);
-        vi.spyOn(client, 'updateMetadata').mockImplementation(() => undefined);
-        client.configureInputQueue(new MessageQueue2<string>(mode => mode), 'remote', true);
-        try {
-            client.startClaudeInputEvidence({ inputs: [{ kind: 'rest', serverMessageId: 'late-output', serverSeq: 1 }], inputCount: 1 });
-            client.sendFinalAnswerForChannelTurn('final before mapped output');
-            const witness = client.inputEvidence.currentTurn()!;
-            client.sendClaudeSessionMessage({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'late mapped output' }] } } as any);
-            const routed = client.inputEvidence.currentTurn()!;
-            expect(routed).not.toBe(witness);
-            client.closeClaudeSessionTurn('completed');
-            for (const turn of [witness, routed]) expect(client.inputEvidence.snapshot(turn)).toMatchObject({ terminal: true,
-                coverage: 'incomplete', incompleteReasons: expect.arrayContaining(['witness-turn-interleaved']) });
+            expect(client.inputEvidence.snapshot()).toMatchObject({ terminal: true, coverage: 'incomplete', inputs: [], inputCount: 0,
+                incompleteReasons: expect.arrayContaining(['unobserved-input']) });
         } finally { await client.close(); }
     });
 

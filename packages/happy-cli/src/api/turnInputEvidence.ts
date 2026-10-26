@@ -1,7 +1,7 @@
 /** Runtime input witnesses. This is deliberately independent of AutomationTurnTracker's single-run arming. */
 import { randomUUID } from 'node:crypto';
 import { createEnvelope, hubPromptGuardSchema, inputRefSchema, type HubInputAdmissionV1,
-    type InputEvidenceV1, type InputRef, type SessionEnvelope, type SessionTurnEndStatus } from '@slopus/happy-wire';
+    type InputEvidenceV1, type InputRef, type SessionEnvelope } from '@slopus/happy-wire';
 
 export type EvidenceBatch = { inputs: InputRef[]; inputCount: number; continuation?: InputEvidenceV1; incompleteReasons?: string[] };
 type AdditionalKind = InputEvidenceV1['additional']['items'][number]['kind'];
@@ -46,7 +46,6 @@ export class TurnInputEvidence {
     private readonly attempts = new WeakMap<InputEvidenceV1, Set<Attempt>>();
     private readonly turns = new Map<string, InputEvidenceV1>();
     private current: string | null = null;
-    private unmappedTurn: string | null = null;
     private last: string | null = null;
     private carry: InputEvidenceV1 | null = null;
     private readonly backgroundTurns = new Map<string, string>();
@@ -58,31 +57,12 @@ export class TurnInputEvidence {
         const turn = ids.map(id => this.backgroundTurns.get(id)).find(Boolean);
         for (const id of ids) this.backgroundTurns.delete(id);
         const source = turn ? this.snapshot(turn) : null;
-        const unmapped = this.current !== null && this.current === this.unmappedTurn;
-        if (unmapped) incompleteReasons = [...incompleteReasons, 'background-co-consumption'];
         const reasons = [...incompleteReasons, 'background-co-consumption', ...(!source ? ['background-source-unavailable'] : [])];
-        // A consumed scanner row starts a new provider lifecycle even when the
-        // routing mapper has no turn to close. Settle only our unmapped witness,
-        // including its matching end for automation and other envelope consumers.
-        if (nextTurn && this.unmappedTurn) {
-            const previous = this.unmappedTurn;
-            for (const reason of reasons) this.incomplete(reason, previous);
-            const value = this.turns.get(previous);
-            if (value) {
-                value.terminal = true;
-                if (value.continuation.state === 'pending' || value.continuation.state === 'running') value.continuation.state = 'cancelled';
-                if (this.carry?.turnId === previous) this.carry = null;
-                this.publish(value);
-            }
-            if (this.current === previous) this.current = null;
-            this.unmappedTurn = null;
-            this.emit(createEnvelope('agent', { t: 'turn-end', status: 'completed' }, { turn: previous }));
-        }
         // Scanner consumption can close the previous mapper turn before its envelopes are stamped.
         // Its background observation belongs to the next turn, not that still-stamped current turn.
         if (this.current && !nextTurn) for (const reason of reasons) this.incomplete(reason, this.current);
         if (this.pending) this.pending.incompleteReasons = [...(this.pending.incompleteReasons ?? []), ...reasons];
-        if ((this.current && !nextTurn && !unmapped) || this.pending) return;
+        if ((this.current && !nextTurn) || this.pending) return;
         if (this.background) {
             this.background.incompleteReasons = [...(this.background.incompleteReasons ?? []), ...reasons];
             return;
@@ -99,20 +79,21 @@ export class TurnInputEvidence {
     }
     constructor(readonly runtimeId: string, private readonly emit: (envelope: SessionEnvelope) => void) {}
     currentTurn(): string | null { return this.current; }
-    /** Textless dispatches need a witness, without opening or consuming a channel routing turn. */
-    startUnmappedTurn(): SessionEnvelope[] {
-        if (this.current || this.unmappedTurn) return [];
-        this.unmappedTurn = randomUUID();
-        return [createEnvelope('agent', { t: 'turn-start' }, { turn: this.unmappedTurn })];
-    }
-    unmappedFinalAnswer(text: string): SessionEnvelope[] {
-        if (typeof text !== 'string' || !text.trim()) return [];
-        const start = this.startUnmappedTurn();
-        const turn = this.current ?? this.unmappedTurn!;
-        return [...start, createEnvelope('agent', { t: 'final-answer', text }, { turn })];
-    }
-    closeUnmappedTurn(status: SessionTurnEndStatus): SessionEnvelope[] {
-        return this.unmappedTurn ? [createEnvelope('agent', { t: 'turn-end', status }, { turn: this.unmappedTurn })] : [];
+    /** A final without a routing turn has no provable turn identity or consumed inputs.
+     * This snapshot is never registered as a turn, current/last witness or retry carry.
+     */
+    unmappedFinalEvidence(reason = 'unmapped-final-answer'): SessionEnvelope {
+        const reasons = [reason, ...(this.pending?.incompleteReasons ?? []), ...(this.background?.incompleteReasons ?? [])];
+        this.pending = this.background = null;
+        this.last = null; // An unmapped gap cannot borrow the preceding mapped turn for a later retry.
+        const id = randomUUID();
+        const value: InputEvidenceV1 = {
+            v: 1, runtimeId: this.runtimeId, turnId: id, batchId: id, rootBatchId: id, revision: 1,
+            inputCount: 0, inputs: [], coverage: 'incomplete', incompleteReasons: [...new Set(reasons)].slice(0, 32),
+            additional: { attempted: 0, accepted: 0, pending: 0, unknown: 0, items: [] },
+            continuation: { kind: 'none', state: 'none', previousTurn: null, retryId: null, rootExclusive: null }, terminal: true,
+        };
+        return createEnvelope('agent', { t: 'turn-input-evidence', inputEvidence: value });
     }
 
     setPending(batch: EvidenceBatch | null): void {
@@ -217,6 +198,8 @@ export class TurnInputEvidence {
     }
     /** A decision to retry (or to wait for an account) must precede the failed terminal. */
     continuePending(kind: ContinuationKind): void {
+        // A newly pending batch cannot borrow the last mapped turn before it starts.
+        if (this.pending && !this.current) return;
         const value = this.snapshot();
         if (!value) return;
         const live = this.turns.get(value.turnId)!;
@@ -249,8 +232,6 @@ export class TurnInputEvidence {
         if (envelope.role !== 'agent' || envelope.subagent || !envelope.turn) return envelope;
         const { ev, turn } = envelope;
         if (ev.t === 'turn-start') {
-            const interleaved = this.unmappedTurn && this.unmappedTurn !== turn;
-            if (interleaved) this.incomplete('witness-turn-interleaved', this.unmappedTurn);
             const batch = this.pending ?? this.background;
             const continuation = batch?.continuation;
             const validContinuation = continuation && (continuation.continuation.kind === 'background'
@@ -264,7 +245,6 @@ export class TurnInputEvidence {
             const inputs = inherited?.inputs ?? batch?.inputs ?? [];
             const reasons = [...(inherited?.incompleteReasons ?? []), ...(batch?.incompleteReasons ?? [])];
             if (!batch) reasons.push('unobserved-input');
-            if (interleaved) reasons.push('witness-turn-interleaved');
             if (continuation && !validContinuation) reasons.push('continuation-invalidated');
             if (inputs.length > 256) reasons.push('input-limit');
             if (inputs.some(ref => !inputRefSchema.safeParse(ref).success)) reasons.push('invalid-input-ref');
@@ -296,7 +276,6 @@ export class TurnInputEvidence {
             return envelope;
         }
         if (ev.t === 'turn-end') {
-            if (this.unmappedTurn === turn) this.unmappedTurn = null;
             value.terminal = value.continuation.state !== 'pending';
             if (value.continuation.state === 'running') value.continuation.state = 'completed';
             if (this.current === turn) this.current = null;

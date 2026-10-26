@@ -1,7 +1,7 @@
 import { TurnInputEvidence, type EvidenceBatch } from '@/api/turnInputEvidence';
 import { closeClaudeTurnWithStatus, mapClaudeLogMessageToSessionEnvelopes, mapClaudeChannelFinalAnswer,
     failClaudeLaunchTurn, type ClaudeSessionProtocolState } from './utils/sessionProtocolMapper';
-import type { SessionEnvelope, SessionTurnEndStatus, InputEvidenceV1 } from '@slopus/happy-wire';
+import { createEnvelope, type SessionEnvelope, type SessionTurnEndStatus, type InputEvidenceV1 } from '@slopus/happy-wire';
 import type { RawJSONLines } from './types';
 import { formatSetupTokenBinding } from '@/daemon/sessionEnv';
 import { readPersonalClaudeCredential } from './personalClaudeCredential';
@@ -56,33 +56,30 @@ function attachInputEvidence(client: {
     const events: SessionEnvelope[] = [];
     const tracker = new TurnInputEvidence('host', event => events.push(event));
     const state: ClaudeSessionProtocolState = { currentTurnId: null };
-    let pending = false;
     const accept = (envelopes: SessionEnvelope[]) => {
         for (const envelope of envelopes) {
-            if (envelope.ev.t === 'turn-start') pending = false;
             events.push(tracker.stamp(envelope));
         }
     };
-    const ensure = () => { if (pending) accept(tracker.startUnmappedTurn()); };
     Object.assign(client, {
         inputEvidence: tracker,
-        startClaudeInputEvidence: (batch: EvidenceBatch) => { tracker.setPending(batch); pending = true; },
-        continueClaudeInputEvidence: (kind: InputEvidenceV1['continuation']['kind']) => { ensure(); tracker.continuePending(kind); },
+        startClaudeInputEvidence: (batch: EvidenceBatch) => { tracker.setPending(batch); },
+        continueClaudeInputEvidence: (kind: InputEvidenceV1['continuation']['kind']) => { tracker.continuePending(kind); },
     });
     client.setPendingTurnRequestId.mockImplementation((id: string | null) => { state.pendingRequestId = id; });
     client.sendClaudeSessionMessage.mockImplementation((body: RawJSONLines) => accept(mapClaudeLogMessageToSessionEnvelopes(body, state).envelopes));
     client.sendFinalAnswerForChannelTurn.mockImplementation((text: string) => {
         const mapped = mapClaudeChannelFinalAnswer(state, text).envelopes;
-        accept(mapped.length ? mapped : tracker.unmappedFinalAnswer(text));
+        accept(mapped.length || !text.trim() ? mapped : (state.currentTurnId ? [createEnvelope('agent', { t: 'final-answer', text }, { turn: state.currentTurnId })] : [tracker.unmappedFinalEvidence()]));
     });
     client.closeClaudeSessionTurn.mockImplementation((status: SessionTurnEndStatus) => {
         const mapped = closeClaudeTurnWithStatus(state, status).envelopes;
-        if (!mapped.length) ensure();
-        accept(tracker.closeUnmappedTurn(status)); accept(mapped);
+        if (!mapped.length) tracker.setPending(null);
+        accept(mapped);
     });
     client.failClaudeLaunchTurn?.mockImplementation(() => {
         const mapped = failClaudeLaunchTurn(state).envelopes;
-        accept(tracker.closeUnmappedTurn('failed')); accept(mapped);
+        accept(mapped);
     });
     return { events, tracker };
 }
@@ -257,11 +254,11 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             expect(generations.map(generation => generation.resume)).toEqual(['claude-1', 'claude-1']);
             expect(generations[1].prompts[0]).toContain(CONTINUE_PROMPT);
             const ends = witness.events.filter(event => event.ev.t === 'turn-end');
-            expect(ends[0].ev).toMatchObject({ inputEvidence: { terminal: false,
-                continuation: { kind: 'claude-account-switch', state: 'pending' } } });
+            expect(ends[0].ev).toMatchObject({ inputEvidence: { terminal: true,
+                continuation: { kind: 'none', state: 'none' } } });
             expect(ends.at(-1)?.ev).toMatchObject({ inputEvidence: { inputCount: 1,
-                inputs: [{ kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 }],
-                terminal: true, continuation: { kind: 'claude-account-switch', state: 'completed' } } });
+                inputs: [{ kind: 'unidentified' }],
+                terminal: true, continuation: { kind: 'none', state: 'none' } } });
             const running = `shared-machine:${SHARED_A}`;
             expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', running, expect.objectContaining({ reason: 'rate-limited' }), expect.any(AbortSignal));
             expect(reportSetupTokenUsage).toHaveBeenCalledWith('happy-session-1', running, expect.objectContaining({ reason: 'rate-limited' }), expect.any(AbortSignal));
@@ -467,7 +464,8 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             expect(generations).toHaveLength(1);
             if (action === 'stop') {
                 await handlers.get('abort')!();
-                expect(witness.tracker.snapshot()).toMatchObject({ terminal: true, continuation: { state: 'cancelled' } });
+                expect(witness.tracker.snapshot()).toBeNull();
+                expect(witness.tracker.takeContinuation()).toBeUndefined();
                 const notices = client.sendSessionEvent.mock.calls.filter(([event]) => 'setupTokenRotation' in event).length;
                 await vi.advanceTimersByTimeAsync(5 * 60000);
                 expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1);
@@ -484,11 +482,11 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             expect(generations.map(generation => generation.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
             expect(generations[1].prompts[0]).toContain(CONTINUE_PROMPT);
             const ends = witness.events.filter(event => event.ev.t === 'turn-end');
-            expect(ends[0].ev).toMatchObject({ inputEvidence: { terminal: false,
-                continuation: { kind: 'claude-account-switch', state: 'pending' } } });
+            expect(ends[0].ev).toMatchObject({ inputEvidence: { terminal: true,
+                continuation: { kind: 'none', state: 'none' } } });
             expect(ends.at(-1)?.ev).toMatchObject({ inputEvidence: { inputCount: 1,
-                inputs: [{ kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 }],
-                terminal: true, continuation: { kind: 'claude-account-switch', state: 'completed' } } });
+                inputs: [{ kind: 'unidentified' }],
+                terminal: true, continuation: { kind: 'none', state: 'none' } } });
             expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message', message: SWITCHED_NOTICE, setupTokenRotation: { version: 1, state: 'switched' } });
         } finally {
             vi.useRealTimers();
@@ -634,10 +632,19 @@ it.each(['automatic', 'organization-only', 'authentication', 'consent-during-reb
     if (evidence) {
         const starts = evidence.events.filter(event => event.ev.t === 'turn-start');
         const original = (starts[0].ev as { inputEvidence: InputEvidenceV1 }).inputEvidence;
-        expect(starts[1].ev).toMatchObject({ inputEvidence: { rootBatchId: original.rootBatchId,
-            inputs: [{ kind: 'rest', serverMessageId: 'refused-input', serverSeq: 1 }],
-            continuation: { kind: 'claude-account-switch', state: 'running' } } });
-        expect(starts[2].ev).not.toMatchObject({ inputEvidence: { rootBatchId: original.rootBatchId } });
+        if (returnMode === 'authentication') {
+            // This refusal has actual mapped assistant activity, so its root is witnessed.
+            expect(starts).toHaveLength(3);
+            expect(starts[1].ev).toMatchObject({ inputEvidence: { rootBatchId: original.rootBatchId,
+                inputs: [{ kind: 'rest', serverMessageId: 'refused-input', serverSeq: 1 }],
+                continuation: { kind: 'claude-account-switch', state: 'running' } } });
+            expect(starts[2].ev).not.toMatchObject({ inputEvidence: { rootBatchId: original.rootBatchId } });
+        } else {
+            // Textless refusal opens no turn. Neither subsequent real turn may borrow A.
+            expect(starts).toHaveLength(2);
+            for (const start of starts) expect((start.ev as { inputEvidence: InputEvidenceV1 }).inputEvidence.inputs)
+                .not.toContainEqual({ kind: 'rest', serverMessageId: 'refused-input', serverSeq: 1 });
+        }
     }
     expect(generations.map(g=>g.resume)).toEqual(['claude-1','claude-1','claude-1']);
     expect(generations.map(g=>g.token)).toEqual(['sk-ant-oat01-first','fixture-personal','fixture-org-return']);
@@ -708,9 +715,9 @@ it.each((['authority', 'channel', 'pending-authority', 'pending-recovery'] as co
     if (evidence) {
         const starts = evidence.events.filter(event => event.ev.t === 'turn-start');
         const original = (starts[0].ev as { inputEvidence: InputEvidenceV1 }).inputEvidence;
-        expect(starts[1].ev).toMatchObject({ inputEvidence: { rootBatchId: original.rootBatchId,
-            inputs: [{ kind: 'rest', serverMessageId: 'refused-input', serverSeq: 1 }],
-            continuation: { kind: 'claude-account-switch', state: 'running' } } });
+        expect(starts[1].ev).not.toMatchObject({ inputEvidence: { rootBatchId: original.rootBatchId } });
+        expect((starts[1].ev as { inputEvidence: InputEvidenceV1 }).inputEvidence.inputs)
+            .not.toContainEqual({ kind: 'rest', serverMessageId: 'refused-input', serverSeq: 1 });
     }
     if(kind==='pending-recovery') {expect(generations[2].prompts).toHaveLength(1);expect(generations[2].sources).not.toEqual([]);}
     expect(generations[1].prompts).toHaveLength(1);

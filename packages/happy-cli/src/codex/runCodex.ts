@@ -1908,7 +1908,6 @@ export async function runCodex(opts: {
             // The state object is rebuilt per call, so the correlation fields are carried in and
             // read back out rather than living on it.
             const turnState = {
-                dispatchedInput: dispatchedWithoutStart,
                 currentTurnId,
                 currentProviderTurnId,
                 startedSubagents: codexStartedSubagents,
@@ -2793,7 +2792,6 @@ export async function runCodex(opts: {
                     // dispatch or process failure is still the answer to whatever request was waiting
                     // on it; a fresh state object here would drop the id and leave the caller waiting.
                     const failureState: CodexTurnState = {
-                        dispatchedInput: dispatchedWithoutStart,
                         currentTurnId,
                         currentProviderTurnId,
                         startedSubagents: codexStartedSubagents,
@@ -2807,6 +2805,9 @@ export async function runCodex(opts: {
                         { type: 'turn_aborted', status: 'failed' },
                         failureState,
                     );
+                    if (dispatchedWithoutStart && !closed.envelopes.length) {
+                        session.sendSessionProtocolMessage(session.inputEvidence.unmappedFinalEvidence('provider-turn-unmapped'));
+                    }
                     codexPendingRequestId = failureState.pendingRequestId ?? null;
                     codexCurrentRequestId = failureState.currentRequestId ?? null;
                     currentTurnId = closed.currentTurnId;

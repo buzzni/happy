@@ -403,7 +403,6 @@ export class ApiSessionClient extends EventEmitter {
     readonly inputGate: HubInputGate;
     private inputEvidenceSupported = false;
     private contactSteer = false;
-    private pendingClaudeEvidence = false;
     private invalidateGuardedInputs: (() => void) | null = null;
     private rejectedInputs = new Set<string>();
     private acceptedInputs = new Set<string>();
@@ -457,15 +456,8 @@ export class ApiSessionClient extends EventEmitter {
     setPendingInputEvidence(batch: EvidenceBatch | null): void { this.inputEvidence.setPending(batch); }
     startClaudeInputEvidence(batch: EvidenceBatch): void {
         this.inputEvidence.setPending(batch);
-        this.pendingClaudeEvidence = true;
-    }
-    private ensureClaudeInputEvidence(): void {
-        if (this.inputEvidenceSupported && this.pendingClaudeEvidence) {
-            this.enqueueSessionProtocolEnvelopes(this.inputEvidence.startUnmappedTurn(), false);
-        }
     }
     continueClaudeInputEvidence(kind: Parameters<TurnInputEvidence['continuePending']>[0]): void {
-        this.ensureClaudeInputEvidence();
         this.inputEvidence.continuePending(kind);
     }
     /** Tool membership, rather than the mutable current turn, binds a permission answer. */
@@ -1733,8 +1725,11 @@ export class ApiSessionClient extends EventEmitter {
         // The same authoritative answer, for a scheduled prompt's turn (Saycode specs/_archive/automation-result-delivery).
         this.automationTurns.noteFinalAnswer(text);
         const mapped = mapClaudeChannelFinalAnswer(this.claudeSessionProtocolState, text);
-        const envelopes = mapped.envelopes.length || !this.inputEvidenceSupported
-            ? mapped.envelopes : this.inputEvidence.unmappedFinalAnswer(text);
+        const turn = this.claudeSessionProtocolState.currentTurnId;
+        const envelopes = mapped.envelopes.length || !this.inputEvidenceSupported || typeof text !== 'string' || !text.trim()
+            ? mapped.envelopes : turn
+                ? [createEnvelope('agent', { t: 'final-answer', text }, { turn })]
+                : [this.inputEvidence.unmappedFinalEvidence()];
         this.enqueueSessionProtocolEnvelopes(envelopes, false);
     }
 
@@ -1808,15 +1803,13 @@ export class ApiSessionClient extends EventEmitter {
     failClaudeLaunchTurn() {
         const mapped = failClaudeLaunchTurn(this.claudeSessionProtocolState);
         this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
-        if (this.inputEvidenceSupported) this.enqueueSessionProtocolEnvelopes(this.inputEvidence.closeUnmappedTurn('failed'), false);
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes);
     }
 
     closeClaudeSessionTurn(status: SessionTurnEndStatus = 'completed') {
         const mapped = closeClaudeTurnWithStatus(this.claudeSessionProtocolState, status);
         this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
-        if (!mapped.envelopes.length) this.ensureClaudeInputEvidence();
-        if (this.inputEvidenceSupported) this.enqueueSessionProtocolEnvelopes(this.inputEvidence.closeUnmappedTurn(status), false);
+        if (!mapped.envelopes.length) this.inputEvidence.setPending(null);
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes);
     }
 
@@ -1873,7 +1866,6 @@ export class ApiSessionClient extends EventEmitter {
 
     private enqueueSessionProtocolEnvelope(envelope: SessionEnvelope, invalidate: boolean = true, localId?: string) {
         if (this.inputEvidenceSupported) envelope = this.inputEvidence.stamp(envelope);
-        if (envelope.role === 'agent' && !envelope.subagent && envelope.ev.t === 'turn-start') this.pendingClaudeEvidence = false;
         if (envelope.role === 'agent' && !envelope.subagent && envelope.turn && envelope.ev.t === 'tool-call-start') {
             this.inputToolTurns.set(envelope.ev.call, envelope.turn);
             while (this.inputToolTurns.size > 512) this.inputToolTurns.delete(this.inputToolTurns.keys().next().value!);
@@ -1893,13 +1885,7 @@ export class ApiSessionClient extends EventEmitter {
 
     private applySessionProtocolRuntimeSideEffects(envelope: SessionEnvelope) {
         const settledAutomationTurn = this.automationTurns.observe(envelope);
-        if (envelope.ev.t === 'turn-input-evidence' && envelope.ev.inputEvidence.terminal
-            && ['cancelled', 'replaced'].includes(envelope.ev.inputEvidence.continuation.state)) {
-            for (const result of this.automationTurns.retryAbandoned()) this.reportAutomationTurn(result);
-        }
-        if (settledAutomationTurn && envelope.ev.t === 'turn-end' && envelope.ev.inputEvidence?.continuation.state === 'pending') {
-            this.automationTurns.carry(settledAutomationTurn);
-        } else if (settledAutomationTurn?.status === 'failed') {
+        if (settledAutomationTurn?.status === 'failed') {
             // The launcher decides on a retry right after it closes the turn; ask once it has.
             setTimeout(() => {
                 if (this.transientRetryPending) this.automationTurns.carry(settledAutomationTurn);

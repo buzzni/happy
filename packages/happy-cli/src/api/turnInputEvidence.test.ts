@@ -16,6 +16,23 @@ function harness() {
     return { events, tracker, start, end };
 }
 describe('TurnInputEvidence', () => {
+    it('reports an unmapped final without registering or carrying a turn witness', () => {
+        const h = harness();
+        h.tracker.setPending({ inputs: [ref('old')], inputCount: 1 }); h.start('old'); h.end('old');
+        h.tracker.setPending({ inputs: [ref('A')], inputCount: 1 });
+        const revision = h.tracker.unmappedFinalEvidence();
+        expect(revision).not.toHaveProperty('turn');
+        expect(revision.ev).toMatchObject({ t: 'turn-input-evidence', inputEvidence: {
+            terminal: true, coverage: 'incomplete', inputs: [], inputCount: 0, incompleteReasons: ['unmapped-final-answer'],
+        } });
+        h.tracker.continuePending('claude-transient');
+        expect(h.tracker.takeContinuation()).toBeUndefined();
+        expect(h.tracker.snapshot()).toBeNull();
+        expect(h.tracker.currentTurn()).toBeNull();
+        h.start('F'); h.end('F');
+        expect(h.tracker.snapshot()).toMatchObject({ inputs: [], inputCount: 0, coverage: 'incomplete' });
+        expect(() => sessionEnvelopeSchema.parse(revision)).not.toThrow();
+    });
     it('allows an offline batch to dispatch without publishing evidence', () => {
         const session = createOfflineSessionStub('test');
         session.setPendingInputEvidence({ inputs: [ref('offline')], inputCount: 1 });

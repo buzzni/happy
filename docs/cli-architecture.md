@@ -39,6 +39,17 @@ zero-sequence proof if session creation begins writing durable messages.
 
 This document describes the Happy CLI (`packages/happy-cli`) and its daemon. The CLI is both an interactive tool and a background session manager that keeps machine state in sync with the server.
 
+## Input evidence and native wire turns
+
+Provider/session mappers own wire turn starts, ends and routing identity.
+`TurnInputEvidence` only stamps existing mapped turns and publishes evidence
+revisions. A final without a mapped turn produces an incomplete revision with no
+envelope turn ID; its payload correlation token cannot become a turn or retry
+root. It cannot create lifecycle events for automation, daemon follow-ups or
+Desktop consumers. Main's behavior, including missing textless completion, is
+preserved. The source-parity regression and reconsideration boundary are recorded
+in [the T2rt report](reason-network-t2rt.md#t2rt-19-structural-correction-evidence-never-owns-wire-turns-2026-10-26).
+
 ## Unconfigured synced plugin MCP servers
 
 Claude loads synced plugin MCP definitions independently of Happy's injected
