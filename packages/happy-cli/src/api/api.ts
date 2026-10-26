@@ -1,3 +1,5 @@
+import { z } from 'zod';
+import { SessionOwnershipProofSchema, sessionCreateBodyHash, sessionTagHash, type SessionOwnershipProof } from '@slopus/happy-wire';
 import { HappySessionExecutionProofSchema, type HappySessionExecutionProof, type SessionExecutionCreateBody } from '@slopus/happy-wire';
 import type { createDeviceEnrollment } from '@/daemon/deviceEnrollment';
 import type { DeviceKeys } from '@/daemon/deviceKeys';
@@ -45,6 +47,20 @@ type ApiPrincipal =
     /** The raw machine key the parent wrapped. Used to read, never re-wrapped. */
     machineKey: Uint8Array;
   };
+
+/** Creation response only; never session metadata, provider state or event wire. */
+const ownershipCreatedSchema = z.object({
+  sessionId: z.string().min(1), ownershipBindingId: z.string().min(1),
+  registrationState: z.enum(['pending', 'confirmed']), createDigest: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict();
+export type OwnershipCreatedReceipt = z.infer<typeof ownershipCreatedSchema>;
+
+/** Safe for callers to classify without retaining Axios config, credentials or proof. */
+export class OwnershipSessionCreationError extends Error {
+  constructor(readonly commitIssued: boolean, readonly status?: number) {
+    super('Ownership-bound session creation failed');
+  }
+}
 
 export class ApiClient {
 
@@ -203,6 +219,10 @@ export class ApiClient {
     dataKey?: { key: Uint8Array, wrapped: Uint8Array },
     /** Trusted daemon preparation only: prove the exact already-encrypted create payload. */
     executionProof?: (body: Readonly<SessionExecutionCreateBody>, encryption: { encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey' }) => Promise<HappySessionExecutionProof>,
+    /** Trusted daemon only. Seals these exact bytes; a private journal owns prepare/commit. */
+    ownershipProof?: (body: Readonly<SessionExecutionCreateBody>, encryption: { encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey' }) => Promise<unknown>,
+    /** Persist the server's candidate before confirm/start. This is not effective owner authority. */
+    onOwnershipCreated?: (receipt: OwnershipCreatedReceipt) => Promise<void>,
   }): Promise<Session | null> {
     if (this.principal.kind === 'managed-session') {
       // Refused here rather than at the server: a managed run that reached
@@ -247,11 +267,20 @@ export class ApiClient {
       dataEncryptionKey: dataEncryptionKey ? encodeBase64(dataEncryptionKey) : null,
     });
     const executionProof = opts.executionProof ? HappySessionExecutionProofSchema.parse(await opts.executionProof(body, { encryptionKey, encryptionVariant })) : undefined;
+    let ownershipProof: SessionOwnershipProof | undefined;
+    if (opts.ownershipProof) {
+      try {
+        ownershipProof = SessionOwnershipProofSchema.parse(await opts.ownershipProof(body, { encryptionKey, encryptionVariant }));
+        if (ownershipProof.createBodyHash !== await sessionCreateBodyHash(body)
+          || ownershipProof.tagHash !== await sessionTagHash(body.tag)) throw new Error('body mismatch');
+      } catch { throw new OwnershipSessionCreationError(false); }
+    }
     // Create session
     try {
-      const response = await axios.post<CreateSessionResponse>(
+      const response = await axios.post<CreateSessionResponse & { ownership?: unknown }>(
         `${configuration.serverUrl}/v1/sessions`,
-        opts.executionProof ? { ...body, executionProof } : body,
+        ownershipProof ? { ...body, ...(executionProof ? { executionProof } : {}), ownershipProof }
+          : opts.executionProof ? { ...body, executionProof } : body,
         {
           headers: {
             'Authorization': `Bearer ${this.bearer()}`,
@@ -262,6 +291,13 @@ export class ApiClient {
         }
       )
 
+      if (ownershipProof) {
+        const receipt = ownershipCreatedSchema.parse(response.data.ownership);
+        if (receipt.sessionId !== response.data.session.id || receipt.createDigest !== ownershipProof.createBodyHash) {
+          throw new Error('creation receipt mismatch');
+        }
+        await opts.onOwnershipCreated?.(receipt);
+      }
       logger.debug(`Session created/loaded: ${response.data.session.id} (tag: ${opts.tag})`)
       let raw = response.data.session;
       let session: Session = {
@@ -278,6 +314,9 @@ export class ApiClient {
     } catch (error) {
       // A machine-v2 launch requires the registered execution relation before provider
       // start. Never return null (offline creation), or log request headers/proofs.
+      if (opts.ownershipProof) {
+        throw new OwnershipSessionCreationError(true, axios.isAxiosError(error) ? error.response?.status : undefined);
+      }
       if (opts.executionProof) throw new Error('Execution-bound session creation failed');
       logger.debug('[API] [ERROR] Failed to get or create session:', error);
 

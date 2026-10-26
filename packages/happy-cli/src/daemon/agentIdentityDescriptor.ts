@@ -1,19 +1,11 @@
 /** Personal same-account authority for the agent broker (Desktop P0a §4.4).
- * The T4o adapter owns HTTP authentication, signature/key policy and registration lookup.
+ * The runtime adapter must supply HTTP authentication, signature/key policy and independent local registration state.
  * An absent adapter is unknown, never evidence of a personal machine. */
-import { z } from 'zod'
+import { MachineAgentIdentitySchema, type MachineAgentIdentity } from '@slopus/happy-wire'
 
-const descriptorSchema = z.object({
-  descriptorId: z.string().min(1), machineId: z.string().min(1), happyAccountId: z.string().min(1),
-  epoch: z.string().min(1),
-  ownerSubject: z.object({ issuer: z.string().min(1), userId: z.string().min(1) }),
-  registrationType: z.literal('personal'), accountKind: z.literal('personal'),
-  registrationRevision: z.number().int().nonnegative(), observedAt: z.number().finite(), expiresAt: z.number().finite(),
-  issuer: z.string().min(1), audience: z.string().min(1), keyId: z.string().min(1), signature: z.string().min(1),
-})
-export type AgentIdentityDescriptor = z.infer<typeof descriptorSchema>
+export type AgentIdentityDescriptor = MachineAgentIdentity
 export interface AgentIdentityState {
-  machineId: string; happyAccountId: string; registrationRevision: number; epoch: string
+  machineId: string; happyAccountId: string; registrationRevision: string; epoch: string
 }
 export interface AgentOwnershipVerdict {
   relation: 'own-sibling' | 'other' | 'unknown'; proof: 'personal-same-account' | null; reason: string
@@ -36,21 +28,30 @@ export function createAgentIdentityAuthority(deps?: AgentIdentityDependencies): 
     if (!deps || !targetSessionId) return unknown('identity-unavailable')
     try {
       const current = deps.readState()
-      if (!current?.machineId || !current.happyAccountId || !current.epoch) return unknown('identity-unknown')
+      if (!current?.machineId || !current.happyAccountId || !current.epoch || !/^[a-f0-9]{64}$/.test(current.registrationRevision)) return unknown('identity-unknown')
       const state = { ...current }
+      // Epoch is local host state, not a field in A+'s signed descriptor. Keep it
+      // in the same live registration fence across every asynchronous boundary.
+      const unchanged = () => {
+        const latest = deps.readState()
+        return latest?.epoch === state.epoch && latest.machineId === state.machineId
+          && latest.happyAccountId === state.happyAccountId && latest.registrationRevision === state.registrationRevision
+      }
       const rawDescriptor = await deps.fetchDescriptor(state)
-      const parsed = descriptorSchema.safeParse(rawDescriptor)
+      if (!unchanged()) return unknown('identity-changed')
+      const parsed = MachineAgentIdentitySchema.safeParse(rawDescriptor)
       if (!parsed.success) return unknown('identity-unproven')
       const descriptor = parsed.data
-      const valid = () => descriptor.machineId === state.machineId && descriptor.happyAccountId === state.happyAccountId
-        && descriptor.epoch === state.epoch && descriptor.registrationRevision === state.registrationRevision && descriptor.observedAt <= deps.now()
+      const valid = () => descriptor.registrationType === 'personal' && descriptor.accountKind === 'personal'
+        && descriptor.ownerSubject?.issuer === descriptor.issuer && descriptor.machineId === state.machineId && descriptor.happyAccountId === state.happyAccountId
+        && descriptor.registrationRevision === state.registrationRevision && descriptor.observedAt <= deps.now()
         && descriptor.expiresAt > deps.now() && descriptor.expiresAt - descriptor.observedAt <= 60_000
         && descriptor.expiresAt > descriptor.observedAt
       if (!valid() || !await deps.verifyDescriptor(rawDescriptor, state)) return unknown('identity-unproven')
+      if (!unchanged()) return unknown('identity-changed')
+      if (!valid()) return unknown('identity-unproven')
       const account = await deps.targetAccount(targetSessionId, state)
-      const latest = deps.readState()
-      if (!latest || latest.epoch !== state.epoch || latest.machineId !== state.machineId
-        || latest.happyAccountId !== state.happyAccountId || latest.registrationRevision !== state.registrationRevision || !valid()) {
+      if (!unchanged() || !valid()) {
         return unknown('identity-changed')
       }
       if (!account) return unknown('target-owner-unknown')
