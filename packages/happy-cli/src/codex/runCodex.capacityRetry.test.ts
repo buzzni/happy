@@ -139,12 +139,14 @@ const sessionEvents: { message?: string }[] = [];
 let sessionMetadata: Record<string, unknown> = { path: '/workspace/project', codexThreadId: 'thread-1' };
 
 function sessionStub() {
-    const evidence = runtimeEvidence = new TurnInputEvidence('runtime-test', envelope => protocolMessages.push(envelope));
+    let evidenceEnabled = false;
+    const evidence = runtimeEvidence = new TurnInputEvidence('runtime-test', envelope => { if (evidenceEnabled) protocolMessages.push(envelope); });
     return {
         inputEvidence: evidence,
-        configureInputQueue: (queue: InstanceType<typeof import('@/utils/MessageQueue2').MessageQueue2>) => {
+        configureInputQueue: vi.fn((queue: InstanceType<typeof import('@/utils/MessageQueue2').MessageQueue2>, _mode: string, enabled: boolean) => {
+            evidenceEnabled = enabled;
             queue.setInputValidator(input => !input.continuation || evidence.isContinuationCurrent(input.continuation));
-        },
+        }),
         setInputSteerAvailable: vi.fn(),
         setPendingInputEvidence: (batch: EvidenceBatch | null) => evidence.setPending(batch),
         queueInput: (message: UserMessage) => ({ ref: { kind: 'rest', serverMessageId: message.serverMessageId ?? 'test-input', serverSeq: message.serverSeq ?? 1 } }),
@@ -153,7 +155,8 @@ function sessionStub() {
         awaitMessageAck: vi.fn(async () => ({ ok: true })),
         sendSessionEvent: vi.fn((event: { message?: string }) => { sessionEvents.push(event); }),
         sendSessionProtocolMessage: vi.fn((envelope: typeof protocolMessages[number]) => {
-            protocolMessages.push(evidence.stamp(envelope));
+            if (!evidenceEnabled && (envelope.ev.t === 'turn-input-evidence' || envelope.ev.t === 'hub-input-admission')) return;
+            protocolMessages.push(evidenceEnabled ? evidence.stamp(envelope) : envelope);
             const ev = envelope.ev;
             if (ev?.t === 'channel-ready') queueMicrotask(() => {
                 void rpc.get('channel-authorize')?.({ requestId: ev.requestId, expectedRuntimeId: 'runtime-test', nonce: ev.nonce, decision: 'allow' });
@@ -199,10 +202,11 @@ describe('automatic continuation after a capacity failure', () => {
         for (const key of Object.keys(process.env)) {
             if (key !== 'HAPPY_HOME_DIR' && /^(HAPPY|SAYCODE|APLUS|CODEX)_/.test(key)) vi.stubEnv(key, undefined);
         }
+        vi.stubEnv('HAPPY_INPUT_EVIDENCE', '1'); // These receipt tests explicitly consume evidence.
     });
     afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
-    async function run(seed: () => Promise<void>) {
+    async function run(seed: () => Promise<void>, afterCapture?: () => void) {
         const { runCodex } = await import('@/codex/runCodex');
         const { ApiClient } = await import('@/api/api');
         const stub = sessionStub();
@@ -213,7 +217,7 @@ describe('automatic continuation after a capacity failure', () => {
             agentState: null, agentStateVersion: 0,
         }));
         const createSpy = vi.spyOn(ApiClient, 'create').mockResolvedValue({
-            getOrCreateMachine: vi.fn(async () => ({ id: 'machine-test' })),
+            getOrCreateMachine: vi.fn(async () => { afterCapture?.(); return { id: 'machine-test' }; }),
             getOrCreateSession,
             sessionSyncClient: vi.fn(() => stub),
             push: vi.fn(() => ({ sendToAllDevices: vi.fn() })),
@@ -221,6 +225,7 @@ describe('automatic continuation after a capacity failure', () => {
         onConnect = seed;
         try {
             await runCodex({ principal: { kind: 'account', credentials: { token: 't', secret: new Uint8Array(32) } as never } });
+            return stub;
         } finally {
             createSpy.mockRestore();
             cwdSpy.mockRestore();
@@ -229,6 +234,39 @@ describe('automatic continuation after a capacity failure', () => {
 
     const continuations = () => turnsSent.filter(text => text.includes(CODEX_CAPACITY_CONTINUE_PROMPT));
     const notices = () => sessionEvents.filter(e => e.message?.includes('at capacity') && e.message.includes('continuing automatically'));
+
+    it.each([undefined, '0', 'true', '1'])('T2RT-23 requires explicit evidence opt-in (%s)', async optIn => {
+        vi.stubEnv('HAPPY_INPUT_EVIDENCE', optIn);
+        script = [{ outcome: 'ok', after: closeQueue }];
+        const stub = await run(async () => { queues[0]!.push('hello', { permissionMode: 'default' } as never); });
+        expect(stub.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', optIn === '1');
+        const start = protocolMessages.find(event => event.ev.t === 'turn-start')!;
+        expect('inputEvidence' in start.ev).toBe(optIn === '1');
+    }, 60_000);
+
+    it.each(['0', '1'])('T2RT-26 captures Codex %s before startup environment changes', async initial => {
+        vi.stubEnv('HAPPY_INPUT_EVIDENCE', initial);
+        script = [{ outcome: 'ok', after: closeQueue }];
+        const stub = await run(async () => { queues[0]!.push('hello', { permissionMode: 'default' } as never); },
+            () => { process.env.HAPPY_INPUT_EVIDENCE = initial === '1' ? '0' : '1'; });
+        expect(stub.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', initial === '1');
+        expect((getOrCreateSession.mock.calls[0] as any)[0].metadata.inputEvidenceEnabled).toBe(initial === '1' ? true : undefined);
+    }, 60_000);
+
+    it.each([undefined, '0'])('T2RT-26 restores Codex session opt-in with override %s', async override => {
+        vi.stubEnv('HAPPY_INPUT_EVIDENCE', override);
+        vi.stubEnv('HAPPY_RECONNECT_SESSION_ID', 'sess-1');
+        vi.stubEnv('HAPPY_RECONNECT_ENCRYPTION_KEY', Buffer.alloc(32).toString('base64'));
+        vi.stubEnv('HAPPY_RECONNECT_ENCRYPTION_VARIANT', 'legacy');
+        vi.stubEnv('HAPPY_RECONNECT_SEQ', '0');
+        vi.stubEnv('HAPPY_RECONNECT_METADATA_VERSION', '1');
+        vi.stubEnv('HAPPY_RECONNECT_AGENT_STATE_VERSION', '1');
+        vi.stubEnv('HAPPY_RECONNECT_SNAPSHOT', Buffer.from(JSON.stringify({ metadata: { path: '/workspace/project',
+            codexThreadId: 'thread-1', inputEvidenceEnabled: true }, seq: 0, metadataVersion: 1, agentStateVersion: 1 })).toString('base64'));
+        script = [{ outcome: 'ok', after: closeQueue }];
+        const stub = await run(async () => { queues[0]!.push('hello', { permissionMode: 'default' } as never); });
+        expect(stub.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', override !== '0');
+    }, 60_000);
 
     it('T2RT-06 settles the original retry when the actual stdin.write throws after claim', async () => {
         script = [{ outcome: 'overloaded' }, { outcome: 'sync-write-failure' }];
@@ -245,6 +283,23 @@ describe('automatic continuation after a capacity failure', () => {
         expect(protocolMessages.filter(event => event.ev.t === 'turn-start')).toHaveLength(1);
         expect(turnsSent).toHaveLength(1);
     }, 60_000);
+    it('T2RT-22 settles the original root when a written retry fails before task_started', async () => {
+        script = [{ outcome: 'overloaded' }, { outcome: 'write-failure' }];
+        await run(async () => {
+            queues[0]!.pushIsolated('original A', { permissionMode: 'default' } as never, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'A', serverSeq: 1 } });
+        });
+        const start = protocolMessages.find(event => event.ev.t === 'turn-start')!;
+        const source = runtimeEvidence.snapshot(start.turn)!;
+        expect(source).toMatchObject({ terminal: true, coverage: 'incomplete', inputs: [{ kind: 'rest', serverMessageId: 'A', serverSeq: 1 }],
+            continuation: { kind: 'codex-capacity', state: 'cancelled' }, incompleteReasons: expect.arrayContaining(['missing-provider-turn']) });
+        expect(protocolMessages.filter(event => event.ev.t === 'turn-input-evidence' && event.ev.inputEvidence.rootBatchId === source.rootBatchId
+            && event.ev.inputEvidence.terminal)).toHaveLength(1);
+        expect(protocolMessages.filter(event => event.ev.t === 'turn-start' || event.ev.t === 'turn-end').map(event => event.ev.t))
+            .toEqual(['turn-start', 'turn-end']);
+        expect(turnsSent).toHaveLength(2);
+    }, 60_000);
+
     it('T2RT-01 drops a retry replaced while the client prepares its write', async () => {
         script = [{ outcome: 'overloaded' }, { outcome: 'ok', beforeWrite: async () => {
             await Promise.resolve();
@@ -271,10 +326,12 @@ describe('automatic continuation after a capacity failure', () => {
         }).then(() => {
             const starts = protocolMessages.filter(event => event.ev.t === 'turn-start');
             const ends = protocolMessages.filter(event => event.ev.t === 'turn-end');
-            expect(starts).toHaveLength(outcome === 'write-failure' ? 1 : 0);
-            expect(ends).toHaveLength(outcome === 'write-failure' ? 1 : 0);
-            if (outcome === 'write-failure') expect(ends[0].ev).toMatchObject({ status: 'failed', inputEvidence: {
-                inputs: [{ kind: 'rest', serverMessageId: 'A', serverSeq: 1 }], terminal: true } });
+            expect(starts).toHaveLength(0);
+            expect(ends).toHaveLength(0);
+            const revision = protocolMessages.find(event => event.ev.t === 'turn-input-evidence');
+            if (outcome === 'write-failure') expect(revision).toMatchObject({ ev: { inputEvidence: {
+                coverage: 'incomplete', inputs: [], terminal: true, incompleteReasons: ['provider-turn-unmapped'] } } });
+            else expect(revision).toBeUndefined();
         });
     }, 60_000);
     it('continues the same thread once the overloaded turn has ended', async () => {

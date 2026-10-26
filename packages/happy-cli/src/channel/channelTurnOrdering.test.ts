@@ -16,7 +16,7 @@ import {
     observeClaudeBackgroundInput,
     type ClaudeSessionProtocolState,
 } from '@/claude/utils/sessionProtocolMapper';
-import type { SessionEnvelope, SessionTurnEndStatus } from '@slopus/happy-wire';
+import { createEnvelope, type SessionEnvelope, type SessionTurnEndStatus } from '@slopus/happy-wire';
 import {
     createOrderedTurnDispatcher,
     finalAnswerItem,
@@ -54,13 +54,16 @@ function harness(witnessed = false) {
         setPendingInputEvidence: (batch: EvidenceBatch) => evidence.setPending(batch),
         setPendingTurnRequestId: (requestId: string | null) => { state.pendingRequestId = requestId; },
         sendFinalAnswerForChannelTurn: (text: string) => {
-            append(mapClaudeChannelFinalAnswer(state, text, witnessed).envelopes);
+            const mapped = mapClaudeChannelFinalAnswer(state, text).envelopes;
+            append(mapped.length || !witnessed || !text.trim() ? mapped : (state.currentTurnId ? [createEnvelope('agent', { t: 'final-answer', text }, { turn: state.currentTurnId })] : [evidence.unmappedFinalEvidence()]));
         },
         sendStructuredOutput: (envelope: Parameters<typeof mapClaudeStructuredOutput>[1]) => {
             append(mapClaudeStructuredOutput(state, envelope).envelopes);
         },
         closeClaudeSessionTurn: (status: SessionTurnEndStatus) => {
-            append(closeClaudeTurnWithStatus(state, status).envelopes);
+            const mapped = closeClaudeTurnWithStatus(state, status).envelopes;
+            if (!mapped.length) evidence.setPending(null);
+            append(mapped);
         },
         sendClaudeSessionMessage: (logMessage: unknown) => {
             const mapped = mapClaudeLogMessageToSessionEnvelopes(logMessage as never, state);
@@ -327,7 +330,10 @@ describe('channel turn ordering through the launcher dispatcher', () => {
         queue.enqueue(finalAnswerItem('ordinary result'));
         queue.enqueue(turnEndItem('completed'));
         await queue.flush();
-        expect(shape(envelopes)).toEqual(['turn-start', 'final-answer', 'turn-end']);
+        expect(shape(envelopes)).toEqual(['turn-input-evidence']);
+        expect(envelopes[0]).not.toHaveProperty('turn');
+        expect(envelopes[0].ev).toMatchObject({ inputEvidence: { coverage: 'incomplete', inputs: [],
+            incompleteReasons: ['unmapped-final-answer'] } });
         expect(requestIds(envelopes)).toEqual([]);
         envelopes.length = 0;
         queue.enqueue(pendingRequestItem('core-empty'));

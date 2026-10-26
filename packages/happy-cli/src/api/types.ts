@@ -556,6 +556,8 @@ export type Metadata = {
   host: string,
   version?: string,
   setupTokenRotation?: { version: 1; principalType: 'machine'; bindingVersion: 0 | 2 },
+  /** Captured session opt-in, retained only when ON for resume/recovery. */
+  inputEvidenceEnabled?: boolean,
   runtimeCapabilities?: {
     agentContact?: { v: 1; runtimeId: string; principal: 'account' | 'managed'; prompt: boolean; steer: boolean;
       inputEvidence: 1 | null; guardedPrompt: 1 | null; mode: 'remote' | 'local' | 'transitioning'; modeEpoch: number },

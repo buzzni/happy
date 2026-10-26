@@ -670,7 +670,7 @@ export async function sessionUpdateMetadata(
     metadata: Metadata,
     expectedVersion: number,
     maxRetries: number = 3
-): Promise<{ version: number; metadata: string }> {
+): Promise<{ version: number; metadata: string; decryptedMetadata: Metadata }> {
     let currentVersion = expectedVersion;
     let currentMetadata = { ...metadata };
     let retryCount = 0;
@@ -695,9 +695,12 @@ export async function sessionUpdateMetadata(
         });
 
         if (result.result === 'success') {
+            const decryptedMetadata = await sessionEncryption.decryptMetadata(result.version!, result.metadata!);
+            if (!decryptedMetadata) throw new Error('Failed to decrypt updated session metadata');
             return {
                 version: result.version!,
-                metadata: result.metadata!
+                metadata: result.metadata!,
+                decryptedMetadata,
             };
         } else if (result.result === 'version-mismatch') {
             currentVersion = result.version!;
@@ -709,7 +712,11 @@ export async function sessionUpdateMetadata(
             // Merge: keep our summary change, use latest values for everything else
             currentMetadata = {
                 ...latestMetadata,
-                summary: metadata.summary
+                summary: metadata.summary ? {
+                    ...latestMetadata.summary,
+                    text: metadata.summary.text,
+                    updatedAt: metadata.summary.updatedAt,
+                } : latestMetadata.summary
             };
 
             retryCount++;

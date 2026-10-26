@@ -29,7 +29,6 @@ import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_NOT_READY_POLL_MS, reconnectDelayM
 import { createEnvelope, type CreateEnvelopeOptions, type SessionEnvelope, type SessionTurnEndStatus } from '@slopus/happy-wire';
 import {
     closeClaudeTurnWithStatus,
-    startClaudeInputTurn,
     observeClaudeBackgroundInput,
     failClaudeLaunchTurn,
     mapClaudeChannelFinalAnswer,
@@ -404,7 +403,6 @@ export class ApiSessionClient extends EventEmitter {
     readonly inputGate: HubInputGate;
     private inputEvidenceSupported = false;
     private contactSteer = false;
-    private pendingClaudeEvidence = false;
     private invalidateGuardedInputs: (() => void) | null = null;
     private rejectedInputs = new Set<string>();
     private acceptedInputs = new Set<string>();
@@ -420,6 +418,9 @@ export class ApiSessionClient extends EventEmitter {
         this.inputGate.transition(mode);
         this.invalidateGuardedInputs?.();
         this.pendingMessages = this.pendingMessages.filter(message => this.admitInput(this.queueInput(message)));
+        // OFF mode changes preserve the complete incoming document, including
+        // stale or foreign advertisements. Observing a contact grants no ownership.
+        if (!this.inputEvidenceSupported) return;
         const agentContact: NonNullable<Metadata['runtimeCapabilities']>['agentContact'] = {
             v: 1, runtimeId: this.runtimeId, principal: this.managed ? 'managed' : 'account',
             prompt: !this.managed && mode === 'remote', steer: !this.managed && mode === 'remote' && this.contactSteer,
@@ -438,6 +439,7 @@ export class ApiSessionClient extends EventEmitter {
     admitInput(input: QueueInputEvidence, publishAccepted = false): boolean {
         if (input.continuation && !this.inputEvidence.isContinuationCurrent(input.continuation)) return false;
         if (input.guard === undefined) return true;
+        if (!this.inputEvidenceSupported) return false;
         const admission = this.inputGate.check(input);
         if (!admission) return false;
         if (admission.state === 'rejected') {
@@ -458,13 +460,8 @@ export class ApiSessionClient extends EventEmitter {
     setPendingInputEvidence(batch: EvidenceBatch | null): void { this.inputEvidence.setPending(batch); }
     startClaudeInputEvidence(batch: EvidenceBatch): void {
         this.inputEvidence.setPending(batch);
-        this.pendingClaudeEvidence = true;
-    }
-    private ensureClaudeInputEvidence(): void {
-        if (this.pendingClaudeEvidence) this.enqueueSessionProtocolEnvelopes(startClaudeInputTurn(this.claudeSessionProtocolState).envelopes, false);
     }
     continueClaudeInputEvidence(kind: Parameters<TurnInputEvidence['continuePending']>[0]): void {
-        this.ensureClaudeInputEvidence();
         this.inputEvidence.continuePending(kind);
     }
     /** Tool membership, rather than the mutable current turn, binds a permission answer. */
@@ -1731,8 +1728,13 @@ export class ApiSessionClient extends EventEmitter {
     sendFinalAnswerForChannelTurn(text: string): void {
         // The same authoritative answer, for a scheduled prompt's turn (Saycode specs/_archive/automation-result-delivery).
         this.automationTurns.noteFinalAnswer(text);
-        const mapped = mapClaudeChannelFinalAnswer(this.claudeSessionProtocolState, text, true);
-        this.enqueueSessionProtocolEnvelopes(mapped.envelopes, false);
+        const mapped = mapClaudeChannelFinalAnswer(this.claudeSessionProtocolState, text);
+        const turn = this.claudeSessionProtocolState.currentTurnId;
+        const envelopes = mapped.envelopes.length || !this.inputEvidenceSupported || typeof text !== 'string' || !text.trim()
+            ? mapped.envelopes : turn
+                ? [createEnvelope('agent', { t: 'final-answer', text }, { turn })]
+                : [this.inputEvidence.unmappedFinalEvidence()];
+        this.enqueueSessionProtocolEnvelopes(envelopes, false);
     }
 
     /** Every later turn of this session closes with a verdict, filled in as `missing` if none came. */
@@ -1803,16 +1805,15 @@ export class ApiSessionClient extends EventEmitter {
 
     /** A launch that died before its first message: fail its turn, opening one if none is open. */
     failClaudeLaunchTurn() {
-        this.ensureClaudeInputEvidence();
         const mapped = failClaudeLaunchTurn(this.claudeSessionProtocolState);
         this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes);
     }
 
     closeClaudeSessionTurn(status: SessionTurnEndStatus = 'completed') {
-        this.ensureClaudeInputEvidence();
         const mapped = closeClaudeTurnWithStatus(this.claudeSessionProtocolState, status);
         this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
+        if (!mapped.envelopes.length) this.inputEvidence.setPending(null);
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes);
     }
 
@@ -1868,8 +1869,9 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private enqueueSessionProtocolEnvelope(envelope: SessionEnvelope, invalidate: boolean = true, localId?: string) {
+        // Includes late tracker callbacks and direct provider/admission publications.
+        if (!this.inputEvidenceSupported && (envelope.ev.t === 'turn-input-evidence' || envelope.ev.t === 'hub-input-admission')) return;
         if (this.inputEvidenceSupported) envelope = this.inputEvidence.stamp(envelope);
-        if (envelope.role === 'agent' && !envelope.subagent && envelope.ev.t === 'turn-start') this.pendingClaudeEvidence = false;
         if (envelope.role === 'agent' && !envelope.subagent && envelope.turn && envelope.ev.t === 'tool-call-start') {
             this.inputToolTurns.set(envelope.ev.call, envelope.turn);
             while (this.inputToolTurns.size > 512) this.inputToolTurns.delete(this.inputToolTurns.keys().next().value!);
@@ -1889,13 +1891,7 @@ export class ApiSessionClient extends EventEmitter {
 
     private applySessionProtocolRuntimeSideEffects(envelope: SessionEnvelope) {
         const settledAutomationTurn = this.automationTurns.observe(envelope);
-        if (envelope.ev.t === 'turn-input-evidence' && envelope.ev.inputEvidence.terminal
-            && ['cancelled', 'replaced'].includes(envelope.ev.inputEvidence.continuation.state)) {
-            for (const result of this.automationTurns.retryAbandoned()) this.reportAutomationTurn(result);
-        }
-        if (settledAutomationTurn && envelope.ev.t === 'turn-end' && envelope.ev.inputEvidence?.continuation.state === 'pending') {
-            this.automationTurns.carry(settledAutomationTurn);
-        } else if (settledAutomationTurn?.status === 'failed') {
+        if (settledAutomationTurn?.status === 'failed') {
             // The launcher decides on a retry right after it closes the turn; ask once it has.
             setTimeout(() => {
                 if (this.transientRetryPending) this.automationTurns.carry(settledAutomationTurn);

@@ -39,6 +39,47 @@ zero-sequence proof if session creation begins writing durable messages.
 
 This document describes the Happy CLI (`packages/happy-cli`) and its daemon. The CLI is both an interactive tool and a background session manager that keeps machine state in sync with the server.
 
+## Input evidence and native wire turns
+
+Provider/session mappers own wire turn starts, ends and routing identity.
+`TurnInputEvidence` only stamps existing mapped turns and publishes evidence
+revisions when the consumer explicitly opts in through the validated session
+launch setting (`environmentVariables.HAPPY_INPUT_EVIDENCE="1"`); Claude/Codex
+default off. Runners consume the seed once and retain a session-owned value
+through replacements and resume/recovery; daemon/new-session boundaries scrub
+implicit inheritance. Both retryable startup metadata refreshes reapply that
+captured setting on each CAS attempt while retaining the newest unrelated
+metadata; explicit OFF cannot recover as ON after a concurrent title edit.
+OFF adds neither T2rt contact capabilities nor its extra
+Codex non-channel final/empty-plan events. Guards received while OFF are refused;
+ON advertises guarded prompting together with its admission receipts. A final without
+a mapped turn produces an incomplete revision with no
+envelope turn ID; its payload correlation token cannot become a turn or retry
+root. It cannot create lifecycle events for automation, daemon follow-ups or
+Desktop consumers. Main's behavior, including missing textless completion, is
+preserved. The source-parity regression and reconsideration boundary are recorded
+in [the T2rt report](reason-network-t2rt.md#t2rt-19-structural-correction-evidence-never-owns-wire-turns-2026-10-26).
+The [T2 hand-off](reason-network-t2rt.md#t2-hand-off-explicit-consumer-opt-in)
+defines the launching consumer's ownership and required reader compatibility.
+The hard T2 caller contract beside T2RT-21 requires fresh live evidence-ON
+discovery and a bounded admission-receipt timeout; cached advertisements or
+durable message storage do not prove delivery. OFF never executes guarded prompts.
+
+Happy-app metadata parsing passes through unknown keys, including nested runtime
+capabilities and summary fields. Title CAS retries merge only app-owned title
+fields onto the latest server document; acknowledged metadata and version stay
+together in its cache. Live CLI hosts do not restore omitted evidence/contact
+markers on observation or ordinary post-startup metadata writes/CAS retries.
+OFF mode changes never publish metadata or delete incoming contacts, including
+stale or foreign runtime
+advertisements. Observed capabilities cannot enable an OFF host. Recovery prefers
+validated daemon-saved environment, then original-session metadata, with an
+explicit validated request overriding either. If an old app strips the hint and
+no validated saved setting survives, metadata-only recovery safely defaults OFF;
+this cannot incorrectly enable evidence. See the
+[T2RT-29 writer audit](reason-network-t2rt.md#t2rt-29-metadata-writer-preservation-and-live-repair-2026-10-26)
+and [T2RT-32 OFF parity](reason-network-t2rt.md#t2rt-32-off-mode-transitions-never-publish-metadata-2026-10-26).
+
 ## Unconfigured synced plugin MCP servers
 
 Claude loads synced plugin MCP definitions independently of Happy's injected

@@ -25,6 +25,7 @@ import { MANAGED_STOP_CLEAN } from '@/managed/managedControlChannel';
 const CODEX_END_INPUT_BUDGET_MS = 10_000;
 import React from "react";
 import { ApiClient } from '@/api/api';
+import { consumeInputEvidenceOption, inputEvidenceMetadata, resolveInputEvidenceOption } from '@/utils/inputEvidenceSettings';
 import { CodexAppServerClient } from './codexAppServerClient';
 import { describeCodexFailure, describeCodexInactivityAbort } from './codexAbortNotice';
 import {
@@ -238,6 +239,7 @@ export async function runCodex(opts: {
         sessionKind: LessonTurnKind;
     };
 }): Promise<void> {
+    const inputEvidenceOption = consumeInputEvidenceOption(process.env);
     await initializeScopeReportSigner();
     const scopeLaunch = takeScopeLaunchBootstrap();
     const standaloneLaunch = opts.standaloneLaunch ?? scopeLaunch;
@@ -383,7 +385,8 @@ export async function runCodex(opts: {
     // Resume-in-place must start from the latest server metadata snapshot.
     // Rebuilding a local document here can overwrite an existing title and
     // any provider fields while still satisfying the server CAS version.
-    const metadata = mergeReconnectSessionMetadata(reconnectSession?.metadata, freshMetadata);
+    const inputEvidenceEnabled = resolveInputEvidenceOption(inputEvidenceOption, reconnectSession?.metadata);
+    const metadata = inputEvidenceMetadata(mergeReconnectSessionMetadata(reconnectSession?.metadata, freshMetadata), inputEvidenceEnabled);
 
     let response: ApiSession | null;
     if (managedStartup) {
@@ -456,7 +459,7 @@ export async function runCodex(opts: {
         sessionOptions: standaloneLaunch ? { trackShutdownStorage: true } : undefined,
         onSessionSwap: (newSession) => {
             session = newSession;
-            newSession.configureInputQueue(messageQueue, 'remote', true);
+            newSession.configureInputQueue(messageQueue, 'remote', inputEvidenceEnabled);
             newSession.setInputSteerAvailable(true);
             // Update permission handler with new session to avoid stale reference
             if (permissionHandler) {
@@ -496,11 +499,11 @@ export async function runCodex(opts: {
         if (allowAutomationReconnectPrompt) {
             session.capRuntimeProcessedSeq(response?.seq ?? 0);
         }
-        session.updateMetadata((meta) => mergeReconnectSessionMetadata(meta, freshMetadata));
+        session.updateMetadata((meta) => inputEvidenceMetadata(mergeReconnectSessionMetadata(meta, freshMetadata), inputEvidenceEnabled));
     }
 
     const messageQueue = new MessageQueue2<EnhancedMode>(hashCodexEnhancedMode);
-    session.configureInputQueue(messageQueue, 'remote', true);
+    session.configureInputQueue(messageQueue, 'remote', inputEvidenceEnabled);
     /**
      * Correlation for a turn answering an external messenger request
      * (Saycode specs/desktop-messenger-channels). Set when the batch carrying it becomes the
@@ -1747,7 +1750,7 @@ export async function runCodex(opts: {
             return;
         }
         if (msg.type === 'plan_update') {
-            const plan = codexPlanEvent(msg);
+            const plan = codexPlanEvent(msg, inputEvidenceEnabled);
             if (plan) session.sendSessionProtocolMessage(createEnvelope('agent', plan, currentTurnId ? { turn: currentTurnId } : {}));
             return;
         }
@@ -1908,7 +1911,6 @@ export async function runCodex(opts: {
             // The state object is rebuilt per call, so the correlation fields are carried in and
             // read back out rather than living on it.
             const turnState = {
-                dispatchedInput: dispatchedWithoutStart,
                 currentTurnId,
                 currentProviderTurnId,
                 startedSubagents: codexStartedSubagents,
@@ -1918,7 +1920,7 @@ export async function runCodex(opts: {
                 currentRequestId: codexCurrentRequestId,
                 providerTurnToProtocol: codexProviderTurnToProtocol,
             };
-            const mapped = mapCodexMcpMessageToSessionEnvelopes(msg, turnState);
+            const mapped = mapCodexMcpMessageToSessionEnvelopes(msg, turnState, inputEvidenceEnabled);
             if (mapped.envelopes.some(envelope => envelope.ev.t === 'turn-start' || envelope.ev.t === 'turn-end')) dispatchedWithoutStart = false;
             codexPendingRequestId = turnState.pendingRequestId ?? null;
             codexCurrentRequestId = turnState.currentRequestId ?? null;
@@ -2793,7 +2795,6 @@ export async function runCodex(opts: {
                     // dispatch or process failure is still the answer to whatever request was waiting
                     // on it; a fresh state object here would drop the id and leave the caller waiting.
                     const failureState: CodexTurnState = {
-                        dispatchedInput: dispatchedWithoutStart,
                         currentTurnId,
                         currentProviderTurnId,
                         startedSubagents: codexStartedSubagents,
@@ -2807,6 +2808,9 @@ export async function runCodex(opts: {
                         { type: 'turn_aborted', status: 'failed' },
                         failureState,
                     );
+                    if (dispatchedWithoutStart && !closed.envelopes.length) {
+                        session.sendSessionProtocolMessage(session.inputEvidence.unmappedFinalEvidence('provider-turn-unmapped'));
+                    }
                     codexPendingRequestId = failureState.pendingRequestId ?? null;
                     codexCurrentRequestId = failureState.currentRequestId ?? null;
                     currentTurnId = closed.currentTurnId;

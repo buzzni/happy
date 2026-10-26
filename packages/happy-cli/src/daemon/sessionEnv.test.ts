@@ -22,6 +22,31 @@ import { sanitizeChildEnv } from '../utils/childEnv'
 import { expandEnvironmentVariables } from '../utils/expandEnvVars'
 
 describe('buildSessionSpawnEnvironment', () => {
+    it('T2RT-26 targets one session and never inherits another session opt-in', () => {
+        const opted = buildManagedSessionSpawnEnvironment({ HAPPY_INPUT_EVIDENCE: '1' },
+            buildSpawnRequestEnvironment({}, { HAPPY_INPUT_EVIDENCE: '1' }), {});
+        expect(opted.HAPPY_INPUT_EVIDENCE).toBe('1');
+        expect(buildManagedSessionSpawnEnvironment(opted, buildSpawnRequestEnvironment({}, {}), {}).HAPPY_INPUT_EVIDENCE).toBeUndefined();
+        expect(buildManagedSessionSpawnEnvironment(opted, buildSpawnRequestEnvironment({}, { HAPPY_INPUT_EVIDENCE: '0' }), {}).HAPPY_INPUT_EVIDENCE).toBe('0');
+        expect(sanitizeChildEnv(opted).HAPPY_INPUT_EVIDENCE).toBeUndefined();
+    });
+    it.each(['1', '0'])('T2RT-26 restores only the owning session setting %s on resume', value => {
+        const captured = captureSaycodeAgentEnvironment({ HAPPY_INPUT_EVIDENCE: value });
+        expect(captured).toEqual({ HAPPY_INPUT_EVIDENCE: value });
+        const restored = buildResumedSessionSpawnEnvironment({ inherited: { HAPPY_INPUT_EVIDENCE: value === '1' ? '0' : '1' },
+            explicit: {}, agentEnvironment: captured, sessionId: 'owner' });
+        expect(restored.HAPPY_INPUT_EVIDENCE).toBe(value);
+        expect(buildResumedSessionSpawnEnvironment({ inherited: restored, explicit: {}, sessionId: 'unrelated' }).HAPPY_INPUT_EVIDENCE).toBeUndefined();
+        const disabled = buildResumedSessionSpawnEnvironment({ inherited: {}, explicit: {}, runtime: { HAPPY_INPUT_EVIDENCE: '0' },
+            agentEnvironment: captured, sessionId: 'owner' });
+        expect(disabled.HAPPY_INPUT_EVIDENCE).toBe('0');
+        expect(buildResumedSessionSpawnEnvironment({ inherited: { HAPPY_INPUT_EVIDENCE: '1' }, explicit: {},
+            agentEnvironment: captureSaycodeAgentEnvironment(disabled), sessionId: 'owner' }).HAPPY_INPUT_EVIDENCE).toBe('0');
+    });
+    it.each(['', 'true', 'yes', '2'])('T2RT-26 rejects an invalid session opt-in %s', value => {
+        expect(() => buildSpawnRequestEnvironment({}, { HAPPY_INPUT_EVIDENCE: value })).toThrow(/HAPPY_INPUT_EVIDENCE/);
+    });
+
     it('lets daemon-managed credentials override inherited and caller-supplied auth fields', () => {
         expect(buildManagedSessionSpawnEnvironment({
             PATH: '/usr/bin',

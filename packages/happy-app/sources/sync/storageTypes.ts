@@ -4,47 +4,47 @@ import { z } from "zod";
 // Agent states
 //
 
+// Metadata is written back by clients: preserve keys owned by runtimes and newer writers.
 export const MetadataSchema = z.object({
     models: z.array(z.object({
         code: z.string(),
         value: z.string(),
         description: z.string().nullish(),
-    })).optional(),
+    }).passthrough()).optional(),
     currentModelCode: z.string().optional(),
     operatingModes: z.array(z.object({
         code: z.string(),
         value: z.string(),
         description: z.string().nullish(),
-    })).optional(),
+    }).passthrough()).optional(),
     currentOperatingModeCode: z.string().optional(),
     thoughtLevels: z.array(z.object({
         code: z.string(),
         value: z.string(),
         description: z.string().nullish(),
-    })).optional(),
+    }).passthrough()).optional(),
     currentThoughtLevelCode: z.string().optional(),
     path: z.string(),
     host: z.string(),
     version: z.string().optional(),
     runtimeCapabilities: z.object({
         saycodeSystemPromptPreference: z.boolean().optional(),
-    }).optional(),
+    }).passthrough().optional(),
     name: z.string().optional(),
     os: z.string().optional(),
     summary: z.object({
         text: z.string(),
         updatedAt: z.number(),
-        // Set by the CLI alongside the title. Declared here so it survives the
-        // decrypt/parse round-trip — zod strips unknown keys, and the app writes
-        // the parsed object back on any metadata update, which would erase it.
+        // Written by the CLI; typed for readers and retained alongside other
+        // unowned summary fields through parse and title write-back.
         branchSlug: z.string().optional()
-    }).optional(),
+    }).passthrough().optional(),
     machineId: z.string().optional(),
     claudeSessionId: z.string().optional(), // Claude Code session ID
     codexThreadId: z.string().optional(), // Codex app-server thread ID
     tools: z.array(z.string()).optional(),
     slashCommands: z.array(z.string()).optional(),
-    mcpServers: z.array(z.object({ name: z.string(), status: z.string() })).optional(),
+    mcpServers: z.array(z.object({ name: z.string(), status: z.string() }).passthrough()).optional(),
     skills: z.array(z.string()).optional(),
     homeDir: z.string().optional(), // User's home directory on the machine
     happyHomeDir: z.string().optional(), // Happy configuration directory 
@@ -69,19 +69,19 @@ export const MetadataSchema = z.object({
     forkedFromMessageId: z.string().optional(),
     /**
      * Who started the session (`user`, `schedule`, `github-trigger`, …), written by
-     * happy-cli at creation. An open enum, so a plain string: declared so the app's
-     * metadata write-back does not strip it (aplus-dev-studio specs/session-source-metadata).
+     * happy-cli at creation. An open enum, typed as a plain string for readers
+     * (aplus-dev-studio specs/session-source-metadata).
      * A malformed value is dropped rather than failing the whole document.
      */
     source: z.string().optional().catch(undefined),
     /**
      * The permission mode the session currently applies, published by happy-cli at start and on
-     * every change (aplus-dev-studio-desktop #2187). A plain string, declared only so the app's
-     * metadata write-back does not strip it; a malformed value is dropped.
+     * every change (aplus-dev-studio-desktop #2187). Typed as a plain string for readers;
+     * a malformed value is dropped.
      */
     permissionMode: z.string().optional().catch(undefined),
     permissionModeUpdatedAt: z.number().optional().catch(undefined),
-});
+}).passthrough();
 
 export type Metadata = z.infer<typeof MetadataSchema>;
 

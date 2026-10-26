@@ -784,24 +784,16 @@ export function observeClaudeBackgroundInput(message: RawJSONLines, state: Claud
     if (notification.subtype === 'task_notification') observeBackgroundCompletion(state, message, sdkBackgroundTaskCompletion(message), subagent);
 }
 
-/** A batch was dispatched, even when the provider produces no assistant text. */
-export function startClaudeInputTurn(state: ClaudeSessionProtocolState): ClaudeMapperResult {
-    const envelopes: SessionEnvelope[] = [];
-    ensureTurn(state, envelopes);
-    return { currentTurnId: state.currentTurnId, envelopes };
-}
-
 /** An authoritative result may be the first activity of a channel turn. */
 export function mapClaudeChannelFinalAnswer(
     state: ClaudeSessionProtocolState,
     text: string,
-    includeInputEvidenceFinal = false,
 ): ClaudeMapperResult {
     const envelopes: SessionEnvelope[] = [];
     const requestId = state.currentTurnId ? state.currentRequestId : state.pendingRequestId;
-    if ((requestId || includeInputEvidenceFinal) && typeof text === 'string' && text.trim().length > 0) {
+    if (requestId && typeof text === 'string' && text.trim().length > 0) {
         const turn = ensureTurn(state, envelopes);
-        envelopes.push(createEnvelope('agent', { t: 'final-answer', text, ...(requestId ? { requestId } : {}) }, { turn }));
+        envelopes.push(createEnvelope('agent', { t: 'final-answer', text, requestId }, { turn }));
     }
     return { currentTurnId: state.currentTurnId, envelopes };
 }

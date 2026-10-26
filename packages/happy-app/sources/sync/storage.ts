@@ -703,7 +703,7 @@ export const storage = create<StorageState>()((set, get) => {
                             ...(newTitle && session.metadata && {
                                 metadata: {
                                     ...session.metadata,
-                                    summary: { text: newTitle, updatedAt: Date.now() }
+                                    summary: { ...session.metadata.summary, text: newTitle, updatedAt: Date.now() }
                                 }
                             })
                         }
@@ -748,15 +748,25 @@ export const storage = create<StorageState>()((set, get) => {
                         session.metadata,
                         session.metadataVersion
                     ).then((result) => {
-                        // Update local metadataVersion to stay in sync with server
+                        // Keep the acknowledged document and version together after CAS merging.
                         set((state) => {
                             const s = state.sessions[sessionId];
-                            if (s) {
+                            if (s && result.version >= s.metadataVersion) {
+                                const metadata = {
+                                    ...result.decryptedMetadata,
+                                    // Keep a newer local title waiting for its own ACK, while
+                                    // adopting all unowned fields from the acknowledged record.
+                                    ...(s.metadata?.summary ? { summary: {
+                                        ...result.decryptedMetadata.summary,
+                                        text: s.metadata.summary.text,
+                                        updatedAt: s.metadata.summary.updatedAt,
+                                    } } : {}),
+                                };
                                 return {
                                     ...state,
                                     sessions: {
                                         ...state.sessions,
-                                        [sessionId]: { ...s, metadataVersion: result.version }
+                                        [sessionId]: { ...s, metadata, metadataVersion: result.version }
                                     }
                                 };
                             }

@@ -16,6 +16,67 @@ function harness() {
     return { events, tracker, start, end };
 }
 describe('TurnInputEvidence', () => {
+    it('T2RT-24 does not settle a claimed receipt from a different native turn or retry', () => {
+        const h = harness(); h.start('older'); h.end('older');
+        h.tracker.setPending({ inputs: [ref('A')], inputCount: 1 }); h.start('a');
+        h.tracker.continuePending('claude-account-switch');
+        const claimed = h.tracker.claimContinuation(h.tracker.takeContinuation()!)!;
+        h.tracker.setPending({ inputs: [], inputCount: 0, continuation: claimed });
+        h.end('older');
+        expect(h.tracker.snapshot('a')).toMatchObject({ terminal: false, continuation: { state: 'pending' } });
+        h.tracker.continuePending('claude-transient'); // A newer decision has a different exact receipt.
+        expect(h.tracker.snapshot('a')!.continuation.retryId).not.toBe(claimed.continuation.retryId);
+        h.end('a');
+        expect(h.tracker.snapshot('a')).toMatchObject({ terminal: false, continuation: { kind: 'claude-transient', state: 'pending' } });
+        h.tracker.cancelContinuation('cancelled');
+        expect(h.tracker.snapshot('a')).toMatchObject({ terminal: true, continuation: { state: 'cancelled' } });
+    });
+
+    for (const kind of ['claude-transient', 'claude-account-switch', 'codex-capacity'] as const) {
+        it.each(['pre-write', 'post-write/pre-start'] as const)(`T2RT-06/22 settles ${kind} after %s failure`, phase => {
+            const h = harness();
+            h.tracker.setPending({ inputs: [ref('A')], inputCount: 1 }); h.start('a');
+            const root = h.tracker.snapshot()!.rootBatchId;
+            h.tracker.continuePending(kind); h.end('a', 'failed');
+            h.tracker.setPending({ inputs: [], inputCount: 0, continuation: h.tracker.takeContinuation()! });
+            expect(h.tracker.commitPending()).toBe(true);
+            h.events.length = 0;
+            if (phase === 'pre-write') h.tracker.cancelPendingDispatch();
+            else {
+                const orphan = h.tracker.unmappedFinalEvidence('provider-turn-unmapped');
+                expect(orphan).not.toHaveProperty('turn');
+                expect(orphan.ev).toMatchObject({ inputEvidence: { inputs: [], coverage: 'incomplete' } });
+                expect((orphan.ev as any).inputEvidence.rootBatchId).not.toBe(root);
+            }
+            const source = h.tracker.snapshot('a')!;
+            expect(source).toMatchObject({ rootBatchId: root, inputs: [ref('A')], terminal: true,
+                continuation: { kind, state: 'cancelled' } });
+            if (phase === 'post-write/pre-start') expect(source).toMatchObject({ coverage: 'incomplete',
+                incompleteReasons: expect.arrayContaining(['missing-provider-turn']) });
+            h.tracker.cancelPendingDispatch(); h.tracker.cancelContinuation('cancelled');
+            expect(h.events).toHaveLength(1);
+            expect(h.events[0].ev).toMatchObject({ t: 'turn-input-evidence', inputEvidence: source });
+            for (const event of h.events) sessionEnvelopeSchema.parse(event);
+        });
+    }
+
+    it('reports an unmapped final without registering or carrying a turn witness', () => {
+        const h = harness();
+        h.tracker.setPending({ inputs: [ref('old')], inputCount: 1 }); h.start('old'); h.end('old');
+        h.tracker.setPending({ inputs: [ref('A')], inputCount: 1 });
+        const revision = h.tracker.unmappedFinalEvidence();
+        expect(revision).not.toHaveProperty('turn');
+        expect(revision.ev).toMatchObject({ t: 'turn-input-evidence', inputEvidence: {
+            terminal: true, coverage: 'incomplete', inputs: [], inputCount: 0, incompleteReasons: ['unmapped-final-answer'],
+        } });
+        h.tracker.continuePending('claude-transient');
+        expect(h.tracker.takeContinuation()).toBeUndefined();
+        expect(h.tracker.snapshot()).toBeNull();
+        expect(h.tracker.currentTurn()).toBeNull();
+        h.start('F'); h.end('F');
+        expect(h.tracker.snapshot()).toMatchObject({ inputs: [], inputCount: 0, coverage: 'incomplete' });
+        expect(() => sessionEnvelopeSchema.parse(revision)).not.toThrow();
+    });
     it('allows an offline batch to dispatch without publishing evidence', () => {
         const session = createOfflineSessionStub('test');
         session.setPendingInputEvidence({ inputs: [ref('offline')], inputCount: 1 });

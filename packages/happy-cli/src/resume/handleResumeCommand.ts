@@ -1,6 +1,8 @@
 import { existsSync } from 'node:fs';
 
 import type { Metadata } from '@/api/types';
+import { readPersistedSessions } from '@/persistence';
+import { INPUT_EVIDENCE_ENV, resolveRecoveredInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings';
 import { sanitizeChildEnv } from '@/utils/childEnv';
 import { spawnHappyCLI } from '@/utils/spawnHappyCLI';
 
@@ -20,7 +22,7 @@ export type ResumeLaunchOptions = {
     emptyMachineClaudeSession?: { sessionId: string; serverSeq?: number; processedSeq: number; startNeverSubmitted: true };
 };
 
-export function parseResumeCommandArgs(args: string[]): { showHelp: boolean; sessionId: string } {
+export function parseResumeCommandArgs(args: string[]): { showHelp: boolean; sessionId: string; inputEvidence?: '0' | '1' } {
     if (args.includes('-h') || args.includes('--help')) {
         return {
             showHelp: true,
@@ -31,13 +33,19 @@ export function parseResumeCommandArgs(args: string[]): { showHelp: boolean; ses
     if (args.length === 0) {
         throw new Error('Happy session ID is required: happy resume <session-id>');
     }
-    if (args.length > 1) {
+    let inputEvidence: '0' | '1' | undefined;
+    if (args[1] === '--input-evidence' && args.length <= 3) {
+        const value = args[2];
+        if (value !== '0' && value !== '1') throw new Error('--input-evidence must be "0" or "1"');
+        inputEvidence = value;
+    } else if (args.length > 1) {
         throw new Error(`Unexpected arguments for happy resume: ${args.slice(1).join(' ')}`);
     }
 
     return {
         showHelp: false,
         sessionId: args[0],
+        ...(inputEvidence !== undefined ? { inputEvidence } : {}),
     };
 }
 
@@ -101,7 +109,7 @@ export function formatResumeHelp(): string {
         'happy resume - Resume a previous Happy session',
         '',
         'Usage:',
-        '  happy resume <happy-session-id>',
+        '  happy resume <happy-session-id> [--input-evidence 0|1]',
         '',
         'Examples:',
         '  happy resume cmmij8olq00dp5jcxr3wtbpau',
@@ -109,17 +117,19 @@ export function formatResumeHelp(): string {
         '',
         'This reuses the saved worktree/path and resumes the underlying agent session',
         'when the backend supports it.',
+        'Input evidence keeps the original session setting; --input-evidence overrides it.',
+        "The caller's HAPPY_INPUT_EVIDENCE is ignored.",
     ].join('\n');
 }
 
-function spawnResumeChild(launch: ResumeLaunch): Promise<number | null> {
+function spawnResumeChild(launch: ResumeLaunch, evidenceEnvironment: Record<string, string>): Promise<number | null> {
     return new Promise((resolve, reject) => {
         const child = spawnHappyCLI(launch.args, {
             cwd: launch.cwd,
             // The resumed runner hosts another session: it must not start with the
             // caller's agent grant, checkpoint binding or connector grant (an agent
             // shell running `happy resume <id>`).
-            env: sanitizeChildEnv(process.env),
+            env: { ...sanitizeChildEnv(process.env), ...evidenceEnvironment },
             stdio: 'inherit',
         });
 
@@ -148,7 +158,12 @@ export async function handleResumeCommand(args: string[]): Promise<void> {
         throw new Error(`Saved session path does not exist: ${launch.cwd}`);
     }
 
-    const exitCode = await spawnResumeChild(launch);
+    const evidenceEnvironment = resolveRecoveredInputEvidenceEnvironment({
+        savedEnvironment: readPersistedSessions()[session.id]?.agentEnvironment,
+        metadata: session.metadata,
+        requestedEnvironment: parsed.inputEvidence === undefined ? undefined : { [INPUT_EVIDENCE_ENV]: parsed.inputEvidence },
+    });
+    const exitCode = await spawnResumeChild(launch, evidenceEnvironment);
     if (typeof exitCode === 'number' && exitCode !== 0) {
         process.exit(exitCode);
     }

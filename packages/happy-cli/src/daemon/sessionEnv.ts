@@ -23,6 +23,7 @@ import { normalizeSessionSource, SESSION_SOURCE_ENV } from '@/utils/sessionSourc
 import { DELEGATED_ATTENDANCE_ENV, parseDelegatedAttendance } from '@/api/turnAttendance'
 import { sanitizeChildEnv, SETUP_TOKEN_BINDING_ENV } from '@/utils/childEnv'
 import { OUTPUT_FORMAT_ENV, parseOutputFormat } from '@/claude/structuredOutput'
+import { INPUT_EVIDENCE_ENV, requestedInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings'
 
 function isValidOutputFormatSeed(raw: string): boolean {
     try {
@@ -49,7 +50,7 @@ type SaycodeAgentEnvironmentKey = typeof SAYCODE_AGENT_ENV_KEYS[number]
 const CHECKPOINT_CONTEXT_KEY = CHECKPOINT_SPAWN_CONTEXT_ENV_KEY
 /** Set from the spawn option `browserContinuation` only (request environment cannot carry HAPPY_AUTOMATION_*). */
 export const BROWSER_CONTINUATION_ENV = 'HAPPY_AUTOMATION_BROWSER_CONTINUATION'
-type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof BROWSER_CONTINUATION_ENV
+type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV
 
 export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey, string>>
 
@@ -187,6 +188,7 @@ export function buildSpawnRequestEnvironment(
         ...readRequestedSaycodeAgentGrant(requested ?? {}),
         ...readRequestedDelegatedAttendance(requested ?? {}),
         ...auth,
+        ...requestedInputEvidenceEnvironment(requested ?? {}),
     }
 }
 
@@ -233,6 +235,7 @@ export function captureSaycodeAgentEnvironment(
     env: NodeJS.ProcessEnv,
 ): SaycodeAgentEnvironment | undefined {
     const captured: SaycodeAgentEnvironment = {}
+    if (env[INPUT_EVIDENCE_ENV] === '0' || env[INPUT_EVIDENCE_ENV] === '1') captured[INPUT_EVIDENCE_ENV] = env[INPUT_EVIDENCE_ENV]
     if (env.SAYCODE_AGENT_ENV === '1' && env.SAYCODE_AGENT_ROOT?.trim()) {
         Object.assign(captured, Object.fromEntries(
             SAYCODE_AGENT_ENV_KEYS.flatMap((key) => env[key] === undefined ? [] : [[key, env[key]]]),
@@ -389,12 +392,19 @@ export function buildResumedSessionSpawnEnvironment(input: {
     const automation = expandEnvironmentVariables(
         sanitizeChildEnv(stripUnsafeRequestedEnvironment(input.automation ?? {})),
     )
+    const evidence = {
+        ...requestedInputEvidenceEnvironment(input.agentEnvironment ?? {}),
+        ...requestedInputEvidenceEnvironment(input.runtime ?? {}),
+        ...requestedInputEvidenceEnvironment(input.automation ?? {}),
+        ...requestedInputEvidenceEnvironment(input.explicit),
+    }
     return buildSessionSpawnEnvironment({ ...input.inherited, [policyKey]: undefined }, {
         // runtime (the resume request) and automation environments are request-supplied too.
         ...runtime,
         ...automation,
         ...input.explicit,
         ...(input.agentEnvironment ?? {}),
+        ...evidence,
         ...(policy !== undefined ? { [policyKey]: policy } : {}),
         APLUS_SESSION_ID: input.sessionId,
     })

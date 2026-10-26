@@ -84,6 +84,14 @@ function isReadyEvent(content: unknown): boolean {
     return body.type === 'event' && body.data?.type === 'ready';
 }
 
+function isInputMetadata(content: unknown): boolean {
+    if (content == null || typeof content !== 'object' || Array.isArray(content)) return false;
+    const envelope = content as SessionContentEnvelope;
+    if (envelope.role !== 'session') return false;
+    const body = envelope.content as { ev?: { t?: unknown } } | null;
+    return body?.ev?.t === 'turn-input-evidence' || body?.ev?.t === 'hub-input-admission';
+}
+
 // --- SessionClient ---
 
 export class SessionClient extends EventEmitter {
@@ -314,6 +322,8 @@ export class SessionClient extends EventEmitter {
             }, timeoutMs);
 
             const onMessage = (message: { content: unknown }) => {
+                // Late receipts from another input are neither response activity nor readiness.
+                if (isInputMetadata(message.content)) return;
                 sawActivity = true;
 
                 const turnEvent = getTurnEvent(message.content);

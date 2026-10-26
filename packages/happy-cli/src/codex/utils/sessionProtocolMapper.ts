@@ -7,8 +7,6 @@ import type { Thread, ThreadItem, ThreadTurn } from '../codexAppServerTypes';
 
 export type CodexTurnState = {
     currentTurnId: string | null;
-    /** Host observed turn/start written, but no provider start notification has opened its turn yet. */
-    dispatchedInput?: boolean;
     /**
      * Correlation for a turn that answers an external messenger request
      * (Saycode specs/desktop-messenger-channels). Set before the turn opens and consumed by the
@@ -455,7 +453,7 @@ function pickTurnEndStatus(message: Record<string, unknown>, type: unknown): Tur
     return 'completed';
 }
 
-export function mapCodexMcpMessageToSessionEnvelopes(message: Record<string, unknown>, state: CodexTurnState): CodexMapperResult {
+export function mapCodexMcpMessageToSessionEnvelopes(message: Record<string, unknown>, state: CodexTurnState, inputEvidence = false): CodexMapperResult {
     const type = message.type;
     const rawProviderTurnId = message.turn_id ?? message.turnId;
     const providerTurnId = typeof rawProviderTurnId === 'string' && rawProviderTurnId.length > 0
@@ -513,12 +511,10 @@ export function mapCodexMcpMessageToSessionEnvelopes(message: Record<string, unk
         }
         if (!state.currentTurnId) {
             // A run that failed before `task_started` reaches its terminal with nothing open. A
-            // written REST batch still needs a terminal witness. A channel request must also
-            // get its correlated answer so the next unrelated turn cannot inherit its id.
-            if (state.pendingRequestId || state.dispatchedInput) {
+            // channel request waiting on it must still get a correlated answer: without this the
+            // id is stranded and the next unrelated turn inherits it.
+            if (state.pendingRequestId) {
                 const strandedRequestId = state.pendingRequestId;
-                const request = strandedRequestId ? { requestId: strandedRequestId } : {};
-                state.dispatchedInput = false;
                 const strandedTurnId = createId();
                 state.pendingRequestId = null;
                 state.currentRequestId = null;
@@ -529,11 +525,11 @@ export function mapCodexMcpMessageToSessionEnvelopes(message: Record<string, unk
                     activeSubagents,
                     providerSubagentToSessionSubagent,
                     envelopes: [
-                        createEnvelope('agent', { t: 'turn-start', ...request }, { turn: strandedTurnId }),
+                        createEnvelope('agent', { t: 'turn-start', requestId: strandedRequestId }, { turn: strandedTurnId }),
                         createEnvelope('agent', {
                             t: 'turn-end',
                             status: pickTurnEndStatus(message, type),
-                            ...request,
+                            requestId: strandedRequestId,
                         }, { turn: strandedTurnId }),
                     ],
                 };
@@ -610,9 +606,10 @@ export function mapCodexMcpMessageToSessionEnvelopes(message: Record<string, unk
          * `final_answer` can legitimately be a clarifying question the model then continues past,
          * so what makes it deliverable is the matching `turn-end` with `status: 'completed'`.
          *
-         * REST input witnesses need the same candidate; the channel request slot stays optional.
+         * Opted-in REST input witnesses add the same candidate for mapped turns.
+         * The channel predicate remains main's, independently of that opt-in.
          */
-        if (message.phase === 'final_answer' && !subagent && state.currentTurnId) {
+        if (message.phase === 'final_answer' && !subagent && (state.currentRequestId || (inputEvidence && state.currentTurnId))) {
             envelopes.push(createEnvelope(
                 'agent',
                 { t: 'final-answer', text: message.message, ...(state.currentRequestId ? { requestId: state.currentRequestId } : {}) },
