@@ -1,12 +1,16 @@
 import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { readPersistedSessions, type PersistedSession } from '@/persistence';
+import { consumeInputEvidenceOption, resolveInputEvidenceOption } from '@/utils/inputEvidenceSettings';
+import { buildManagedSessionSpawnEnvironment, buildSpawnRequestEnvironment } from '@/daemon/sessionEnv';
 import { spawnHappyCLI } from '@/utils/spawnHappyCLI';
 
 import { buildResumeLaunch, formatResumeHelp, handleResumeCommand, parseResumeCommandArgs } from './handleResumeCommand';
 import { resolveHappySession } from './resolveHappySession';
 
+vi.mock('@/persistence', () => ({ readPersistedSessions: vi.fn(() => ({})) }));
 vi.mock('@/utils/spawnHappyCLI', () => ({ spawnHappyCLI: vi.fn() }));
 vi.mock('./resolveHappySession', () => ({ resolveHappySession: vi.fn() }));
 
@@ -41,12 +45,84 @@ describe('handleResumeCommand', () => {
     });
 });
 
+describe.each(['claude', 'codex'] as const)('T2RT-28 standalone %s resume evidence', agent => {
+    beforeEach(() => { vi.clearAllMocks(); });
+    afterEach(() => { vi.unstubAllEnvs(); });
+
+    const savedRecord = (agentEnvironment: Record<string, string>): PersistedSession => ({
+        encryptionKey: Buffer.alloc(32).toString('base64'), encryptionVariant: 'dataKey',
+        seq: 20, metadataVersion: 1, agentStateVersion: 1, savedAt: 1,
+        metadata: { path: tmpdir(), host: 'test-host', homeDir: '/home/test', happyHomeDir: '/home/test/.happy',
+            happyLibDir: '/opt/happy', happyToolsDir: '/opt/happy/tools' }, agentEnvironment,
+    });
+    const settings = [
+        { label: 'metadata only', marker: true, expected: true },
+        { label: 'saved ON only', saved: '1', expected: true },
+        { label: 'saved OFF beats metadata ON', saved: '0', marker: true, expected: false },
+        { label: 'saved ON beats metadata OFF', saved: '1', marker: false, expected: true },
+        { label: 'corrupt saved value falls back to metadata', saved: 'true', marker: true, expected: true },
+        { label: 'no setting defaults OFF', expected: false },
+    ];
+    for (const setting of settings) {
+        it.each([undefined, '0', '1'])(`${setting.label}, explicit override %s`, async override => {
+            // The caller may itself be an opted-in agent. Its flag is never the request.
+            vi.stubEnv('HAPPY_INPUT_EVIDENCE', setting.expected ? '0' : '1');
+            vi.stubEnv('SAYCODE_AGENT_ROOT', '/caller/root');
+            vi.stubEnv('HAPPY_PROJECT_SANDBOX_CONFIG', undefined);
+            vi.mocked(resolveHappySession).mockResolvedValue({
+                id: 'original', active: false, metadata: { path: tmpdir(), flavor: agent,
+                    ...(agent === 'claude' ? { claudeSessionId: 'native-owner' } : { codexThreadId: 'native-owner' }),
+                    ...(setting.marker !== undefined ? { inputEvidenceEnabled: setting.marker } : {}) } as never,
+            });
+            vi.mocked(readPersistedSessions).mockReturnValue(setting.saved === undefined ? {} : {
+                original: savedRecord({ HAPPY_INPUT_EVIDENCE: setting.saved, OLD_PROJECT_VARIABLE: 'do-not-copy',
+                    HAPPY_PROJECT_SANDBOX_CONFIG: '{"enabled":true}', SAYCODE_AGENT_ROOT: '/old/root' }),
+                // A record under the user's prefix must not override the resolved ID's setting.
+                orig: savedRecord({ HAPPY_INPUT_EVIDENCE: setting.expected ? '0' : '1' }),
+            });
+            const child = new EventEmitter();
+            vi.mocked(spawnHappyCLI).mockImplementation(() => {
+                queueMicrotask(() => child.emit('exit', 0, null));
+                return child as never;
+            });
+            await handleResumeCommand(['orig', ...(override === undefined ? [] : ['--input-evidence', override])]);
+            const [args, options] = vi.mocked(spawnHappyCLI).mock.calls[0];
+            expect(args).toEqual(agent === 'claude' ? ['claude', '--resume', 'native-owner'] : ['codex', '--resume', 'native-owner']);
+            const env = { ...options?.env };
+            expect(resolveInputEvidenceOption(consumeInputEvidenceOption(env))).toBe(override === undefined ? setting.expected : override === '1');
+            expect(readPersistedSessions).toHaveBeenCalledOnce();
+            for (const key of ['OLD_PROJECT_VARIABLE', 'HAPPY_PROJECT_SANDBOX_CONFIG', 'SAYCODE_AGENT_ROOT']) {
+                expect(env).not.toHaveProperty(key);
+            }
+            expect(process.env.HAPPY_INPUT_EVIDENCE).toBe(setting.expected ? '0' : '1');
+            const unrelated = buildManagedSessionSpawnEnvironment(options?.env ?? {}, buildSpawnRequestEnvironment({}, {}), {});
+            expect(resolveInputEvidenceOption(consumeInputEvidenceOption(unrelated))).toBe(false);
+        });
+    }
+
+    it.each(['true', '', '2'])('rejects invalid explicit override %j before launch', async value => {
+        await expect(handleResumeCommand(['original', '--input-evidence', value])).rejects.toThrow(/input.evidence/i);
+        expect(spawnHappyCLI).not.toHaveBeenCalled();
+    });
+});
+
 describe('parseResumeCommandArgs', () => {
     it('parses the happy session id', () => {
         expect(parseResumeCommandArgs(['cmmij8olq00dp5jcxr3wtbpau'])).toEqual({
             showHelp: false,
             sessionId: 'cmmij8olq00dp5jcxr3wtbpau',
         });
+    });
+
+    it.each(['0', '1'] as const)('parses explicit evidence override %s', inputEvidence => {
+        expect(parseResumeCommandArgs(['session', '--input-evidence', inputEvidence])).toEqual({ showHelp: false, sessionId: 'session', inputEvidence });
+    });
+
+    it('requires an override value and refuses duplicate or unexpected arguments', () => {
+        expect(() => parseResumeCommandArgs(['session', '--input-evidence'])).toThrow('--input-evidence must be');
+        expect(() => parseResumeCommandArgs(['session', '--input-evidence', '1', '--input-evidence', '0'])).toThrow('Unexpected arguments');
+        expect(() => parseResumeCommandArgs(['session', '--other'])).toThrow('Unexpected arguments');
+        expect(formatResumeHelp()).toContain('--input-evidence 0|1');
     });
 
     it('recognizes help flags', () => {
