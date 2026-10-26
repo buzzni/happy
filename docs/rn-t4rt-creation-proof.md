@@ -77,3 +77,29 @@ T1c 기반 통합 전 비활성이다. 배지=T2, 공식 pin=T2r. 실제 서버�
   initialPrompt/runCodex, Claude initialPrompt/runClaude, OFF parity 9개 파일 272 passed / 1 의도적
   미선택(ON parity). OFF는 9ee84191과 각각 82개 시나리오를 재생해 동일성을 확인했다.
   git diff --check 통과. 전체 suite·실제 배포 서버·실제 provider 실행은 수행하지 않았다.
+
+## PR #966 daemon 배선 가드 보완 (2026-10-26)
+
+- 판정 (b): `aiAuthSelectionWiring.test.ts`는 `machineRotationFor(options)`를 무조건 호출하는 이전
+  문장을 기대했다. `run.ts`는 이제 private `ownedMachineLaunches`에 이미 준비된 실행 launch가
+  있을 때만 재선택·재생성을 생략한다. ordinary/channel 경로의 selector·dataKey 경로는 유지된다.
+- owned precreate는 `ownedSpawnRuntime.ts`의 `rotation.prepareLaunch` → `input.executionProof` →
+  생성 POST → `complete`(실행 claim/commit 완료 대기)에서 수행된다. 재시작은 같은 company runtime의
+  `resume(tracked, binding)`으로 실행 결속을 재검증하고 reconnect 환경·launch를 공통 admitted spawn에
+  넘긴다. `run.ts`의 pendingMachineStarts, credential environment, reconnect 주입, webhook session ID
+  비교와 authority 검사에는 빠지는 분기가 없다.
+- 기존 가드의 나머지 기대값을 유지하고, 준비된 launch가 있을 때만 재선택을 생략하는 조건 및 두
+  경로의 공통 시작 처리를 검사한다. owned helper의 proof 운반·claim 완료·resume binding·공통 spawn
+  전달도 추가 검사한다. production 코드·공개 API·wire 변경은 없다.
+- 로컬에서 기존 가드 1 failed / 10 passed로 CI 실패를 재현했고, 수정 후 12 passed를 확인했다.
+- 요청 명령 `corepack pnpm -C packages/happy-cli exec vitest run --project unit src/daemon --maxWorkers 2`
+  전체 실행: 249 files passed / 8 failed / 7 skipped; 4524 tests passed / 122 failed / 49 skipped,
+  unhandled errors 3개. global setup tsc/pkgroll 통과. 배선 가드 12개와 T4rt 테스트는 통과했다.
+  전체를 통과로 표시하지 않는다. 다른 실패는 다음 환경 제약에서 발생했으며 코드를 변경하지 않았다.
+  - Git 2.25.1의 `git init --initial-branch=main` 미지원: worktreeOps(78), missingWorktreeRestore(16),
+    worktreeDependencyReclaim(18), 총 112 failed.
+  - Unix/abstract socket listen EPERM: launcherClient(1), browserAttentionDelivery(3),
+    browserSessionBrokerServer(2), managedWriterLock(2), 총 8 failed. 세 unhandled error도 Unix socket
+    listen EPERM이고 timeout은 listen 성공 callback을 기다리는 테스트에서 발생했다.
+  - `/tmp`가 UID 65534 소유여서 generation manifest ancestor 검증 거부: managedLauncherBoot 2 failed.
+  - 로그: `/tmp/rn-t4rt-daemon-full.log`. macOS 재실행은 CI에서 확인해야 한다.
