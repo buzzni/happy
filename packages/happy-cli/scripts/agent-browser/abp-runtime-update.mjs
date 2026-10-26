@@ -29,7 +29,7 @@ export function verifyRequest(token, config, now = Date.now()) {
     const p = JSON.parse(Buffer.from(parts[2], 'base64url').toString());
     if (p.kind !== 'runtime-update' || p.iss !== 'saycode-server' || p.aud !== config.machineId || p.machineId !== config.machineId || p.workspaceId !== config.workspaceId || !p.principalId || !uuid.test(p.requestId ?? ''))
         deny();
-    if (!Number.isSafeInteger(p.issuedAtMs) || !Number.isSafeInteger(p.expiresAtMs) || p.issuedAtMs > now || p.expiresAtMs <= now || p.expiresAtMs <= p.issuedAtMs || p.expiresAtMs - p.issuedAtMs > 60000)
+    if (!Number.isSafeInteger(p.issuedAtMs) || !Number.isSafeInteger(p.expiresAtMs) || p.issuedAtMs > now + 30_000 || p.expiresAtMs <= now || p.expiresAtMs <= p.issuedAtMs || p.expiresAtMs - p.issuedAtMs > 60000)
         deny();
     if (!['start', 'status'].includes(p.action))
         deny();
@@ -47,7 +47,8 @@ export async function runUpgrade(manifest, architecture, deps) {
     try {
         await deps.upgrade();
         const state = deps.current(), arch = ['x86_64', 'x64'].includes(architecture) ? 'amd64' : architecture === 'arm64' || architecture === 'aarch64' ? 'arm64' : undefined;
-        if (!arch || state.runtime !== manifest.runtime.ids[arch] || state.browser !== manifest.browser.ids[arch] || !(await deps.status()).ok)
+        const matches = role => state[role] === manifest[role].ids[arch] || state[role] === manifest[role].ref.split('@')[1];
+        if (!arch || !matches('runtime') || !matches('browser') || !(await deps.status()).ok)
             return { phase: 'failed', reason: 'verification-failed' };
         return { phase: 'complete' };
     }
