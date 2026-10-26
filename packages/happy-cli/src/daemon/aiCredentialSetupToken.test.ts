@@ -402,6 +402,32 @@ describe('managed Claude setup-token runtime', () => {
         expect(await runtime.sharedMachineRebind(A, refused)).toMatchObject({ HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: B })
       }
     })
+
+    it('never takes back an account this PC holds as used up, which Studio cannot know', async () => {
+      const sharedChoose = vi.fn(async () => A)
+      const { runtime } = fakeMachine([], null, { machineId: 'machine-1', sharedChoose })
+      await assign(runtime)
+      await runtime.sharedMachineUsage(A, refused)
+      expect(await runtime.sessionEnvironment('claude')).toMatchObject({ HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: B })
+      expect(sharedChoose).toHaveBeenLastCalledWith({ companyId: 'company-1', candidates: held, exclude: [A], measure: false })
+      expect(await runtime.sharedMachineRebind(B, refused)).toBeNull()
+      expect(sharedChoose).toHaveBeenLastCalledWith({ companyId: 'company-1', candidates: held, exclude: [B, A], measure: true })
+    })
+
+    it('does not ask Studio, or read the roster, for a launch on a Z.AI lease', async () => {
+      const sharedChoose = vi.fn(async () => B)
+      const { runtime, files, calls } = fakeMachine([], null, { machineId: 'machine-1', sharedChoose })
+      await assign(runtime)
+      files.set(join('/home', 'operator', '.happy', 'trial-ai-credential-leases.json'), JSON.stringify({ version: 1,
+        leases: { zai: { leaseId: 'synthetic', contentHash: 'a'.repeat(64), bundleVersion: 1 } } }))
+      files.set(join('/home', 'operator', '.happy', 'zai-claude-env.json'), JSON.stringify({ ANTHROPIC_AUTH_TOKEN: 'synthetic-zai',
+        ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic', API_TIMEOUT_MS: '3000000',
+        ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.3', ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-4.7', ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.7' }))
+      const before = calls.length
+      expect(await runtime.sessionEnvironment('claude')).toMatchObject({ ANTHROPIC_AUTH_TOKEN: 'synthetic-zai' })
+      expect(sharedChoose).not.toHaveBeenCalled()
+      expect(calls.slice(before)).toEqual([])
+    })
   })
 
   it('keeps a used-up window through readings that do not mention it or are older, until a newer one frees it', async () => {

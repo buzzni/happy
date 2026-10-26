@@ -2338,12 +2338,23 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   async function sharedStudioChoice(moveFrom?: string): Promise<string | null | undefined> {
     if (!deps.sharedChoose) return undefined
     const held = await serializeLaunch('prepare', async () => {
+      // A launch on a Z.AI lease never runs on a shared account: no roster read for it.
+      if (moveFrom === undefined && (await readTrialMarker()).leases.zai) return null
       const shared = await sharedMachineCandidates()
       return shared?.companyId ? { companyId: shared.companyId, candidates: (await shared.read()).candidates } : null
     }).catch(() => null)
     if (!held?.candidates.length) return undefined
-    return deps.sharedChoose({ companyId: held.companyId, exclude: moveFrom === undefined ? [] : [moveFrom], measure: moveFrom !== undefined,
+    // Sessions' refusals stay on this PC, so Studio cannot know them: the accounts held as used up are excluded,
+    // and an answer naming one of them is not taken.
+    const exclude = [...new Set([...(moveFrom === undefined ? [] : [moveFrom]),
+      ...held.candidates.filter(candidate => sharedAccountUsedUp(candidate.managedAccountId)).map(candidate => candidate.managedAccountId)])]
+    const chosen = await deps.sharedChoose({ companyId: held.companyId, exclude, measure: moveFrom !== undefined,
       candidates: held.candidates.map(({ managedAccountId, credentialGeneration }) => ({ managedAccountId, credentialGeneration })) })
+    if (chosen && exclude.includes(chosen)) {
+      logger.debug(`[setup-token-switch] Studio chose ${chosen}, which this PC holds as used up; choosing locally`)
+      return undefined
+    }
+    return chosen
   }
 
   /**
