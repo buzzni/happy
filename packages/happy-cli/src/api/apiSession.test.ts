@@ -310,6 +310,42 @@ describe('ApiSessionClient v3 messages API migration', () => {
         } finally { await client.close(); }
     });
 
+    it.each([false, true])('T2RT-21 gates every evidence/admission publication path (evidence=%s)', async supported => {
+        const client = new ApiSessionClient('fake-token', session);
+        vi.spyOn(client, 'updateMetadata').mockImplementation(() => undefined);
+        const queue = new MessageQueue2<string>(mode => mode);
+        client.configureInputQueue(queue, 'remote', true);
+        const events: SessionEnvelope[] = [];
+        vi.spyOn(client as any, 'enqueueMessage').mockImplementation((value: any) => {
+            if (value.role === 'session') events.push(value.content);
+        });
+        try {
+            client.setPendingInputEvidence({ inputs: [{ kind: 'rest', serverMessageId: 'A', serverSeq: 1 }], inputCount: 1 });
+            client.sendClaudeSessionMessage({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'A' }] } } as any);
+            client.closeClaudeSessionTurn('completed');
+            const nativeTurns = events.filter(event => event.ev.t === 'turn-start' || event.ev.t === 'turn-end');
+            expect(nativeTurns.map(event => event.ev.t)).toEqual(['turn-start', 'turn-end']);
+            // A late ACK/revision must obey the current capability even if its source was enabled.
+            client.configureInputQueue(queue, 'remote', supported);
+            events.length = 0;
+            client.inputEvidence.incomplete('late-ack');
+            client.sendSessionProtocolMessage(client.inputEvidence.unmappedFinalEvidence());
+            client.sendFinalAnswerForChannelTurn('unmapped after completed A');
+            const guard = { v: 1, targetSessionId: client.sessionId, expectedRuntimeId: client.runtimeId,
+                expectedMode: 'remote', expectedModeEpoch: client.inputGate.modeEpoch };
+            expect(client.admitInput({ ref: { kind: 'rest', serverMessageId: 'accepted', serverSeq: 2 }, guard }, true)).toBe(true);
+            expect(client.admitInput({ ref: { kind: 'rest', serverMessageId: 'rejected', serverSeq: 3 }, guard: { ...guard, v: 2 } })).toBe(false);
+            expect(events.map(event => event.ev.t)).toEqual(supported
+                ? ['turn-input-evidence', 'turn-input-evidence', 'turn-input-evidence', 'hub-input-admission', 'hub-input-admission'] : []);
+            // The gate must never suppress or create a native lifecycle boundary.
+            client.sendClaudeSessionMessage({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'B' }] } } as any);
+            client.closeClaudeSessionTurn('completed');
+            expect(events.filter(event => event.ev.t === 'turn-start' || event.ev.t === 'turn-end').map(event => event.ev.t))
+                .toEqual(['turn-start', 'turn-end']);
+            for (const event of events) sessionEnvelopeSchema.parse(event);
+        } finally { await client.close(); }
+    });
+
     it.each([false, true])('evidence preparation leaves a pending channel request unconsumed (evidence=%s)', async supported => {
         const client = new ApiSessionClient('fake-token', session);
         vi.spyOn(client, 'updateMetadata').mockImplementation(() => undefined);

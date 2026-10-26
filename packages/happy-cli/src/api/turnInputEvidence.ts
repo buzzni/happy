@@ -83,6 +83,8 @@ export class TurnInputEvidence {
      * This snapshot is never registered as a turn, current/last witness or retry carry.
      */
     unmappedFinalEvidence(reason = 'unmapped-final-answer'): SessionEnvelope {
+        // An orphan's fresh identity cannot settle the known root whose retry was written.
+        this.cancelPendingDispatch('missing-provider-turn');
         const reasons = [reason, ...(this.pending?.incompleteReasons ?? []), ...(this.background?.incompleteReasons ?? [])];
         this.pending = this.background = null;
         this.last = null; // An unmapped gap cannot borrow the preceding mapped turn for a later retry.
@@ -124,14 +126,20 @@ export class TurnInputEvidence {
         this.carry = null;
         return claimed;
     }
-    /** Called only when a claimed provider dispatch failed before any write was observed. */
-    cancelPendingDispatch(): void {
+    /** Settle a claimed dispatch with no mapped provider turn; never create a turn for it. */
+    cancelPendingDispatch(missingTurnReason?: string): void {
         const claimed = this.pending?.continuation;
         if (!claimed || !this.claimedContinuations.delete(claimed)) return;
         const source = this.turns.get(claimed.turnId) ?? claimed;
         if (source.continuation.retryId !== claimed.continuation.retryId || source.continuation.state !== 'pending') return;
         source.continuation.state = 'cancelled';
         source.terminal = true;
+        if (missingTurnReason) {
+            source.coverage = 'incomplete';
+            if (!source.incompleteReasons.includes(missingTurnReason)) {
+                source.incompleteReasons = [...source.incompleteReasons.slice(0, 31), missingTurnReason];
+            }
+        }
         this.publish(source);
     }
     private clone(value: InputEvidenceV1): InputEvidenceV1 {
@@ -270,6 +278,21 @@ export class TurnInputEvidence {
         }
         const value = this.turns.get(turn);
         if (!value) return envelope;
+        const claimed = this.pending?.continuation;
+        // Main may resume an account-refused provider inside the same native turn.
+        // Its next mapped activity proves progress without needing another turn-start.
+        if (this.current === turn && (ev.t === 'text' || ev.t === 'tool-call-start' || ev.t === 'final-answer')
+            && claimed?.turnId === turn && claimed.continuation.retryId === value.continuation.retryId
+            && value.continuation.state === 'pending' && this.claimedContinuations.delete(claimed)) {
+            const reasons = this.pending?.incompleteReasons ?? [];
+            this.pending = null;
+            value.continuation.state = 'running';
+            if (reasons.length) {
+                value.coverage = 'incomplete';
+                value.incompleteReasons = [...new Set([...value.incompleteReasons, ...reasons])].slice(0, 32);
+            }
+            this.publish(value);
+        }
         if (ev.t === 'final-answer' && Buffer.byteLength(ev.text, 'utf8') > 65536) {
             // The downgrade is published as its own revision; the answer still goes out, unstamped.
             this.incomplete('answer-too-large', turn);

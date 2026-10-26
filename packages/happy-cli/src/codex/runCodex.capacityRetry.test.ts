@@ -245,6 +245,23 @@ describe('automatic continuation after a capacity failure', () => {
         expect(protocolMessages.filter(event => event.ev.t === 'turn-start')).toHaveLength(1);
         expect(turnsSent).toHaveLength(1);
     }, 60_000);
+    it('T2RT-22 settles the original root when a written retry fails before task_started', async () => {
+        script = [{ outcome: 'overloaded' }, { outcome: 'write-failure' }];
+        await run(async () => {
+            queues[0]!.pushIsolated('original A', { permissionMode: 'default' } as never, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'A', serverSeq: 1 } });
+        });
+        const start = protocolMessages.find(event => event.ev.t === 'turn-start')!;
+        const source = runtimeEvidence.snapshot(start.turn)!;
+        expect(source).toMatchObject({ terminal: true, coverage: 'incomplete', inputs: [{ kind: 'rest', serverMessageId: 'A', serverSeq: 1 }],
+            continuation: { kind: 'codex-capacity', state: 'cancelled' }, incompleteReasons: expect.arrayContaining(['missing-provider-turn']) });
+        expect(protocolMessages.filter(event => event.ev.t === 'turn-input-evidence' && event.ev.inputEvidence.rootBatchId === source.rootBatchId
+            && event.ev.inputEvidence.terminal)).toHaveLength(1);
+        expect(protocolMessages.filter(event => event.ev.t === 'turn-start' || event.ev.t === 'turn-end').map(event => event.ev.t))
+            .toEqual(['turn-start', 'turn-end']);
+        expect(turnsSent).toHaveLength(2);
+    }, 60_000);
+
     it('T2RT-01 drops a retry replaced while the client prepares its write', async () => {
         script = [{ outcome: 'overloaded' }, { outcome: 'ok', beforeWrite: async () => {
             await Promise.resolve();

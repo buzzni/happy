@@ -1865,6 +1865,8 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private enqueueSessionProtocolEnvelope(envelope: SessionEnvelope, invalidate: boolean = true, localId?: string) {
+        // Includes late tracker callbacks and direct provider/admission publications.
+        if (!this.inputEvidenceSupported && (envelope.ev.t === 'turn-input-evidence' || envelope.ev.t === 'hub-input-admission')) return;
         if (this.inputEvidenceSupported) envelope = this.inputEvidence.stamp(envelope);
         if (envelope.role === 'agent' && !envelope.subagent && envelope.turn && envelope.ev.t === 'tool-call-start') {
             this.inputToolTurns.set(envelope.ev.call, envelope.turn);

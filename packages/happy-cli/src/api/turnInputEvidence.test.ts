@@ -16,6 +16,34 @@ function harness() {
     return { events, tracker, start, end };
 }
 describe('TurnInputEvidence', () => {
+    for (const kind of ['claude-transient', 'claude-account-switch', 'codex-capacity'] as const) {
+        it.each(['pre-write', 'post-write/pre-start'] as const)(`T2RT-06/22 settles ${kind} after %s failure`, phase => {
+            const h = harness();
+            h.tracker.setPending({ inputs: [ref('A')], inputCount: 1 }); h.start('a');
+            const root = h.tracker.snapshot()!.rootBatchId;
+            h.tracker.continuePending(kind); h.end('a', 'failed');
+            h.tracker.setPending({ inputs: [], inputCount: 0, continuation: h.tracker.takeContinuation()! });
+            expect(h.tracker.commitPending()).toBe(true);
+            h.events.length = 0;
+            if (phase === 'pre-write') h.tracker.cancelPendingDispatch();
+            else {
+                const orphan = h.tracker.unmappedFinalEvidence('provider-turn-unmapped');
+                expect(orphan).not.toHaveProperty('turn');
+                expect(orphan.ev).toMatchObject({ inputEvidence: { inputs: [], coverage: 'incomplete' } });
+                expect((orphan.ev as any).inputEvidence.rootBatchId).not.toBe(root);
+            }
+            const source = h.tracker.snapshot('a')!;
+            expect(source).toMatchObject({ rootBatchId: root, inputs: [ref('A')], terminal: true,
+                continuation: { kind, state: 'cancelled' } });
+            if (phase === 'post-write/pre-start') expect(source).toMatchObject({ coverage: 'incomplete',
+                incompleteReasons: expect.arrayContaining(['missing-provider-turn']) });
+            h.tracker.cancelPendingDispatch(); h.tracker.cancelContinuation('cancelled');
+            expect(h.events).toHaveLength(1);
+            expect(h.events[0].ev).toMatchObject({ t: 'turn-input-evidence', inputEvidence: source });
+            for (const event of h.events) sessionEnvelopeSchema.parse(event);
+        });
+    }
+
     it('reports an unmapped final without registering or carrying a turn witness', () => {
         const h = harness();
         h.tracker.setPending({ inputs: [ref('old')], inputCount: 1 }); h.start('old'); h.end('old');

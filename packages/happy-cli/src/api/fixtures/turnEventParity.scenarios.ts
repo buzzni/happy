@@ -9,7 +9,9 @@ import { ApiSessionClient } from '@/api/apiSession';
 import { encodeBase64, encrypt, decrypt, decodeBase64 } from '@/api/encryption';
 import type { Metadata } from '@/api/types';
 import { claudeRemote } from '@/claude/claudeRemote';
-import { query } from '@/claude/sdk';
+import { claudeRemoteLauncher } from '@/claude/claudeRemoteLauncher';
+import { query } from '@anthropic-ai/claude-agent-sdk';
+import { hashObject } from '@/utils/deterministicJson';
 import { OutgoingMessageQueue } from '@/claude/utils/OutgoingMessageQueue';
 import { SDKToLogConverter } from '@/claude/utils/sdkToLogConverter';
 import { createSessionScanner } from '@/claude/utils/sessionScanner';
@@ -31,7 +33,8 @@ vi.mock('@slopus/happy-wire', async importOriginal => {
                     ? `t${String(++mocks.end).padStart(23, '0')}` : `w${String(++mocks.wire).padStart(23, '0')}`),
     }) };
 });
-vi.mock('@/claude/sdk', () => ({ query: vi.fn(), AbortError: class AbortError extends Error {} }));
+vi.mock('@anthropic-ai/claude-agent-sdk', async original => ({ ...await original<typeof import('@anthropic-ai/claude-agent-sdk')>(), query: vi.fn() }));
+vi.mock('@/claude/utils/claudeCheckSession', () => ({ claudeCheckSession: () => true }));
 vi.mock('socket.io-client', () => ({ io: mocks.io }));
 vi.mock('axios', () => ({ default: { get: vi.fn(), post: vi.fn(), put: vi.fn() } }));
 vi.mock('@/configuration', () => ({ configuration: { serverUrl: 'https://server.test', happyHomeDir: '/tmp/happy-test-home' } }));
@@ -44,7 +47,10 @@ vi.mock('@/utils/time', () => ({ backoff: async <T>(callback: () => Promise<T>) 
     delay: vi.fn(async () => undefined), isSessionGoneError: () => false }));
 vi.mock('@/utils/lidState', () => ({ shouldReconnect: () => true }));
 vi.mock('@/daemon/controlClient', () => ({ notifyDaemonSessionRuntime: vi.fn(async () => ({ status: 'ok' })),
-    notifyDaemonAutomationTurnResult: mocks.report }));
+    notifyDaemonAutomationTurnResult: mocks.report, reportSetupTokenUsage: vi.fn(async () => {}),
+    requestSetupTokenRebind: vi.fn(async () => ({ ok: true, environment: {
+        CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-second', HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: '{"account":"second"}',
+    } })) }));
 
 beforeEach(() => { vi.clearAllMocks(); mocks.id = mocks.wire = mocks.evidence = mocks.start = mocks.end = 0; });
 type Source = 'consumed' | 'attachment' | 'sdk';
@@ -187,6 +193,59 @@ async function harness(capability: boolean, outbox = false, scheduled = false) {
 }
 
 for (const capability of [false, true]) {
+    for (const failure of ['exception', 'result'] as const) it(`T20 account ${failure} capability=${capability}`, async () => {
+        const oldToken = process.env.CLAUDE_CODE_OAUTH_TOKEN, oldBinding = process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING;
+        process.env.CLAUDE_CODE_OAUTH_TOKEN = 'sk-ant-oat01-first';
+        process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING = '{"account":"first"}';
+        const h = await harness(capability);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        vi.mocked(h.client.rpcHandlerManager.registerHandler).mockImplementation((name, handler) => { handlers.set(name, handler as any); });
+        vi.spyOn(h.client, 'updateAgentState').mockImplementation(() => undefined);
+        const queue = new MessageQueue2<any>(hashObject);
+        (h.client as any).configureInputQueue?.(queue, 'remote', capability);
+        let generation = 0;
+        const prompts: unknown[] = [];
+        vi.mocked(query).mockImplementation(({ prompt }: any) => {
+            const n = ++generation;
+            return Object.assign((async function* () {
+                yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+                for await (const input of prompt) {
+                    prompts.push(input.message.content);
+                    yield { type: 'assistant', uuid: `partial-${n}`, session_id: 'claude-1', parent_tool_use_id: null,
+                        message: { id: `m-${n}`, role: 'assistant', model: 'claude-sonnet-5',
+                            content: [{ type: 'text', text: n === 1 ? 'working before refusal' : 'recovered' }],
+                            usage: { input_tokens: 1, output_tokens: 1 } } };
+                    if (n === 1) {
+                        yield { type: 'rate_limit_event', uuid: 'rl-1', session_id: 'claude-1', rate_limit_info: {
+                            status: 'rejected', rateLimitType: 'five_hour', resetsAt: Math.floor(Date.now() / 1000) + 3600 } };
+                        if (failure === 'exception') throw new Error('provider exited after account refusal');
+                        yield { type: 'result', subtype: 'success', result: 'rate limited', is_error: true, uuid: 'r-1' };
+                        return;
+                    }
+                    yield { type: 'result', subtype: 'success', result: 'recovered', is_error: false, uuid: 'r-2' };
+                    void handlers.get('switch')!();
+                    return;
+                }
+            })(), { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as any;
+        });
+        queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' }, undefined, undefined, undefined, undefined,
+            { ref: { kind: 'rest', serverMessageId: 'A', serverSeq: 1 } });
+        try {
+            await claudeRemoteLauncher({ lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+                cancelLessonReview: vi.fn(), onAbort: vi.fn(), sessionId: 'claude-1', path: process.cwd(), queue, client: h.client,
+                mcpServers: {}, api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+                consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn() } as any);
+            expect(generation).toBe(2); expect(prompts).toHaveLength(2);
+            await h.result(`account-${failure}-${capability}`, { prompts,
+                sourceEvidence: (h.events.find(event => event.ev.t === 'turn-start')?.ev as any)?.inputEvidence,
+                settledEvidence: (h.client as any).inputEvidence?.snapshot() });
+        } finally {
+            await h.cleanup();
+            if (oldToken === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN; else process.env.CLAUDE_CODE_OAUTH_TOKEN = oldToken;
+            if (oldBinding === undefined) delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING; else process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING = oldBinding;
+        }
+    }, 15_000);
+
     it(`evidence cannot control automation capability=${capability}`, async () => {
         const h = await harness(capability, false, true);
         try {

@@ -1,4 +1,4 @@
-/** T2RT-16..19: replay real source revisions, not a second hand-written mapper. */
+/** T2RT-16..20: replay real source revisions, not a second hand-written mapper. */
 import { expect, it } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -38,20 +38,25 @@ it('preserves merge-base wire turns and consumer outcomes for the reviewer scena
         const load = async (source: string): Promise<any[]> => (await readFile(join(directory, `${source}.jsonl`), 'utf8'))
             .trim().split('\n').map(line => JSON.parse(line));
         const baseline = await load('base'), head = await load('head');
-        expect(baseline).toHaveLength(26);
+        expect(baseline).toHaveLength(30);
         expect(head).toHaveLength(baseline.length);
         for (const original of baseline) {
             const actual = head.find(record => record.name === original.name);
             expect.soft(actual, original.name).toBeDefined();
-            for (const field of ['turns', 'routing', 'reports', 'reportsBeforeCancel', 'followup', 'ready', 'outboxTurns']) {
+            for (const field of ['turns', 'routing', 'reports', 'reportsBeforeCancel', 'followup', 'ready', 'outboxTurns', 'prompts']) {
                 expect.soft(actual?.[field], `${original.name}: ${field}`).toEqual(original[field]);
             }
             for (const revision of actual?.evidence ?? []) {
                 expect.soft(revision.inputEvidence).toMatchObject({ coverage: 'incomplete', inputs: [], inputCount: 0, terminal: true });
                 expect.soft(revision.inputEvidence.incompleteReasons).toContain('unmapped-final-answer');
             }
-            if (original.name.endsWith('-true') && !original.name.startsWith('codex-') && !original.name.startsWith('evidence-automation-')) {
+            if (original.name.endsWith('-true') && !['codex-', 'evidence-automation-', 'account-'].some(prefix => original.name.startsWith(prefix))) {
                 expect.soft(actual.evidence.length, original.name).toBeGreaterThan(0);
+            }
+            if (original.name.startsWith('account-') && original.name.endsWith('-true')) {
+                expect.soft(actual.settledEvidence, original.name).toMatchObject({ rootBatchId: actual.sourceEvidence.rootBatchId,
+                    inputs: [{ kind: 'rest', serverMessageId: 'A', serverSeq: 1 }], terminal: true,
+                    continuation: { kind: 'claude-account-switch', state: 'completed' } });
             }
             for (const final of actual?.finals ?? []) {
                 for (const revision of actual.evidence) {
@@ -71,7 +76,7 @@ it('preserves merge-base wire turns and consumer outcomes for the reviewer scena
         for (const result of baseline.filter(record => record.name.startsWith('T18-'))) {
             expect(result.turns).toEqual([]); expect(result.reports).toEqual([]); expect(result.ready).toBe(1);
         }
-        console.info('26 scenarios replayed on 9ee84191 and HEAD; 52 source replays passed. Main follow-up controls:',
+        console.info('30 scenarios replayed on 9ee84191 and HEAD; 60 source replays passed. Main follow-up controls:',
             baseline.filter(record => record.name.startsWith('T17-19-') && record.name.endsWith('-true'))
                 .map(record => ({ name: record.name, ...record.followup })));
         if (process.env.T2RT_PARITY_EXPORT) await writeFile(process.env.T2RT_PARITY_EXPORT, JSON.stringify({ baseline, head }));
