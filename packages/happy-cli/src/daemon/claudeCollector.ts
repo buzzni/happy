@@ -71,13 +71,16 @@ export function createClaudeCollector(deps:Deps) {
    if(segments.length!==2||segments.some(s=>!s||!/^[A-Za-z0-9_-]+$/.test(s)))return failure('GRANT_INVALID')
    if(!verify(null,Buffer.from(segments[0]),trust.key,Buffer.from(segments[1],'base64url')))return failure('GRANT_INVALID')
    const c=JSON.parse(Buffer.from(segments[0],'base64url').toString('utf8'))
-   if(!exact(c,[...claimKeys,key])||c.v!==1||c.type!=='claude-collector-v1'||c.aud!==trust.audience||c.keyId!==trust.keyId||!uuid.test(c.permitId))return failure('GRANT_INVALID')
+   // A switch check (Saycode specs/setup-token-switch-usage-check) may spend up to twice the budget; only it carries a purpose.
+   const switchCheck='purpose' in c
+   if(switchCheck&&c.purpose!=='switch')return failure('GRANT_INVALID')
+   if(!exact(c,[...claimKeys,key,...switchCheck?['purpose']:[]])||c.v!==1||c.type!=='claude-collector-v1'||c.aud!==trust.audience||c.keyId!==trust.keyId||!uuid.test(c.permitId))return failure('GRANT_INVALID')
    for(const f of ['companyId',key,'machineId','managedAccountId','credentialGeneration','policyRevision','permitId'] as const)if(c[f]!==(r as Record<string,unknown>)[f])return failure('GRANT_INVALID')
    if(![c.reservedAt,c.transportDeadline,c.expiresAt].every(integer)||c.transportDeadline!==c.reservedAt+10000||c.expiresAt!==c.reservedAt+30000||c.reservedAt>deps.now())return failure('GRANT_INVALID')
    if(deps.now()>=c.transportDeadline)return failure('PERMIT_EXPIRED')
    if(!await deps.authorize(r))return failure('ACCOUNT_NOT_ASSIGNED')
    const caps=JSON.parse(await deps.invoke(['token-runtime','capabilities']))
-   if(caps.artifact!=='saycode-setup-token-runtime-v1'||caps.organizationCollectorVersion!==1)return failure('RUNTIME_UNSUPPORTED')
+   if(caps.artifact!=='saycode-setup-token-runtime-v1'||caps.organizationCollectorVersion!==1||switchCheck&&caps.switchProbeVersion!==1)return failure('RUNTIME_UNSUPPORTED')
    const roster=JSON.parse(await deps.invoke(['token-runtime','status']))
    const rows=roster.accounts?.filter((a:any)=>a.managedAccountId===r.managedAccountId)
    const a=rows?.length===1?rows[0]:null
@@ -86,7 +89,7 @@ export function createClaudeCollector(deps:Deps) {
    if(!await deps.authorize(r))return failure('ACCOUNT_NOT_ASSIGNED')
    if(deps.now()>=c.transportDeadline)return failure('PERMIT_EXPIRED')
    if(!await deps.consume(c.companyId+':'+c.permitId,c.expiresAt))return failure('PERMIT_REPLAYED')
-   const permit={version:1,permitId:c.permitId,companyId:c.companyId,machineId:c.machineId,managedAccountId:c.managedAccountId,credentialGeneration:c.credentialGeneration,policyRevision:c.policyRevision,reservedAt:c.reservedAt,transportDeadline:c.transportDeadline,expiresAt:c.expiresAt,timeoutMs:10000,accountRemaining:0,companyRemaining:0}
+   const permit={version:1,permitId:c.permitId,companyId:c.companyId,machineId:c.machineId,managedAccountId:c.managedAccountId,credentialGeneration:c.credentialGeneration,policyRevision:c.policyRevision,reservedAt:c.reservedAt,transportDeadline:c.transportDeadline,expiresAt:c.expiresAt,timeoutMs:10000,accountRemaining:0,companyRemaining:0,...switchCheck?{purpose:'switch'}:{}}
    const context={companyId:r.companyId,machineId:r.machineId,managedAccountId:r.managedAccountId,credentialGeneration:r.credentialGeneration,policyRevision:r.policyRevision,accountRef:a.accountRef}
    const result=JSON.parse(await deps.invoke(['token-runtime','collect-org'],JSON.stringify({version:1,context,permit,inUse:true,online:true})))
    if(!await deps.authorize(r))return failure('ACCOUNT_NOT_ASSIGNED')
@@ -95,6 +98,24 @@ export function createClaudeCollector(deps:Deps) {
    if(result.observation.accountRef!==a.accountRef||result.observation.credentialGeneration!==r.credentialGeneration)return failure('GENERATION_CHANGED')
    return {version:1,status:'observed',companyId:r.companyId,machineId:r.machineId,managedAccountId:r.managedAccountId,credentialGeneration:r.credentialGeneration,policyRevision:r.policyRevision,permitId:c.permitId,observation:observation(result.observation,c)}
   }catch{return failure('REQUEST_FAILED')}
+ }
+}
+/**
+ * Saycode specs/setup-token-switch-usage-check — measures an account with a permit Studio reserved (a switch check or
+ * this machine's own periodic collection), through the signed collector boundary. The reading to publish, or null.
+ */
+export function createPermitMeasure(deps:{invoke(args:string[]):Promise<string>;collect(request:CollectorRequest):Promise<any>}) {
+ return async (input:{companyId:string;machineId:string;managedAccountId:string;credentialGeneration:number;permit:Record<string,unknown>}):Promise<Record<string,unknown>|null> => {
+  try {
+   const roster=JSON.parse(await deps.invoke(['token-runtime','status']))
+   const rows=Array.isArray(roster?.accounts)?roster.accounts.filter((a:any)=>a?.managedAccountId===input.managedAccountId&&a.credentialGeneration===input.credentialGeneration):[]
+   if(rows.length!==1||typeof rows[0].accountRef!=='string')return null
+   const p=input.permit
+   const base={version:1 as const,companyId:input.companyId,machineId:input.machineId,managedAccountId:input.managedAccountId,accountRef:rows[0].accountRef,
+    permitId:String(p.permitId),credentialGeneration:input.credentialGeneration,policyRevision:Number(p.policyRevision),grant:String(p.grant)}
+   const result=await deps.collect(p.principalType==='machine'?{...base,principalType:'machine'}:{...base,userId:String(p.userId)})
+   return result?.status==='observed'&&result.observation?result.observation:null
+  }catch{return null}
  }
 }
 /** Exclusive on-disk lock; crash leaves the gate closed until explicit recovery. */
