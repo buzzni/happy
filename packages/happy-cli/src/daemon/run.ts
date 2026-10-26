@@ -1,3 +1,4 @@
+import { createOwnedSpawnRuntime, createOwnedStartGuard } from './ownedSpawnRuntime';
 import { drainWorktreeOperations } from './worktreeOps';
 import { createMachineSetupTokenProtocol, MachineRotationError } from './machineSetupTokenProtocol';
 import { chooseLaunchRotation, createMachineRotationResolver } from './machineRotationResolver';
@@ -66,6 +67,7 @@ import {
   readPersistedSessions,
   hardenHappyHomePermissions,
   persistSession,
+  persistSessionDurably,
   persistPreparedMachineLaunch,
   recoverPreparedMachineLaunch,
   preparedMachineLaunchHomeDirs,
@@ -1847,6 +1849,8 @@ export async function startDaemon(): Promise<void> {
     let machineRotation: ReturnType<typeof createMachineRotationResolver<MachineSetupTokenRuntime>> | null = null;
     let sharedMachineScope = async (): Promise<string | null> => null;
     const pendingMachineStarts = new Set<string>();
+    const ownedStartGuard = createOwnedStartGuard();
+    const ownedMachineLaunches = new WeakMap<SpawnSessionOptions, Awaited<ReturnType<MachineSetupTokenRuntime['prepareLaunch']>>>();
     const channelSessionKeys = new WeakMap<SpawnSessionOptions, { key: Uint8Array; wrapped: Uint8Array }>();
     /** The runtime of an existing machine-rotation launch; recovery never depends on new issuance being accepted. */
     const machineRuntimeFor = async (companyId: string): Promise<MachineSetupTokenRuntime> => {
@@ -2087,8 +2091,8 @@ export async function startDaemon(): Promise<void> {
         // specs/session-source-metadata). Malformed values are dropped, never stored.
         const sessionSource = normalizeSessionSource(options.sessionSource);
         const credentialStartedAt = Date.now();
-        let preparedMachineLaunch: Awaited<ReturnType<MachineSetupTokenRuntime['prepareLaunch']>> | undefined;
-        const machineRotationRuntime = await machineRotationFor(options);
+        let preparedMachineLaunch = ownedMachineLaunches.get(options);
+        const machineRotationRuntime = preparedMachineLaunch ? null : await machineRotationFor(options);
         if (machineRotationRuntime) {
           const ownerCredentials = stagedUserHomeDir
             ? parseCredentials(JSON.parse(await fs.readFile(join(stagedUserHomeDir, 'access.key'), 'utf8')))
@@ -2107,6 +2111,8 @@ export async function startDaemon(): Promise<void> {
               ...(sessionSource ? { source: sessionSource } : {}) },
             createSession: input => ownerApi.getOrCreateSession({ ...input, dataKey: channelSessionKeys.get(options) }),
           });
+        }
+        if (preparedMachineLaunch) {
           preparedMachineSessionId = preparedMachineLaunch.session.id;
           pendingMachineStarts.add(preparedMachineSessionId);
         }
@@ -2414,7 +2420,9 @@ export async function startDaemon(): Promise<void> {
             sessionName: tmuxSessionName,
             windowName: windowName,
             cwd: directory
-          }, tmuxEnv, start => launchManagedAiCredentialSession(managedAiCredentialEnvironment, start));
+          }, tmuxEnv, start => launchManagedAiCredentialSession(managedAiCredentialEnvironment, () => {
+            ownedStartGuard.submitted(options); return start();
+          }));
 
           if (tmuxResult.success) {
             logger.debug(`[DAEMON RUN] Successfully spawned in tmux session: ${tmuxResult.sessionId}, PID: ${tmuxResult.pid}`);
@@ -2456,6 +2464,10 @@ export async function startDaemon(): Promise<void> {
               logger,
             }), tmuxSelection.appliedSource);
           } else {
+            // An owned tmux dispatch may have succeeded despite a missing PID/ACK. Never launch a second child.
+            if (ownedStartGuard.wasSubmitted(options)) return finishSpawn(Promise.resolve({
+              type: 'error', errorMessage: 'Owned tmux start outcome is unknown',
+            }));
             logger.debug(`[DAEMON RUN] Failed to spawn in tmux: ${tmuxResult.error}, falling back to regular spawning`);
             useTmux = false;
           }
@@ -2521,6 +2533,7 @@ export async function startDaemon(): Promise<void> {
             spawnEnvironment.HAPPY_SANDBOX_POLICY_MODE = 'mandatory';
           }
           return finishSpawn(spawnTrackedHappyProcess({
+            onProcessSubmission: () => ownedStartGuard.submitted(options),
             args,
             cwd: directory,
             env: spawnEnvironment,
@@ -2550,6 +2563,7 @@ export async function startDaemon(): Promise<void> {
     };
 
     const spawnTrackedHappyProcess = async ({
+      onProcessSubmission,
       args,
       cwd,
       env,
@@ -2559,6 +2573,8 @@ export async function startDaemon(): Promise<void> {
       resumeTargetSessionId,
       managedAiCredentialEnvironment = {},
     }: {
+      /** Internal dispatch evidence; never transported in provider env or RPC options. */
+      onProcessSubmission?: () => void;
       args: string[];
       cwd: string;
       env: NodeJS.ProcessEnv;
@@ -2578,6 +2594,7 @@ export async function startDaemon(): Promise<void> {
       }
       // Native preparation creates a suspended root; authorize execution at resume below.
       const prepareStartedAt = Date.now();
+      if (standaloneWindows) onProcessSubmission?.();
       const prepared = standaloneWindows ? await standaloneWindows.owner.prepare({ args, cwd, env }) : undefined;
       if (prepared) logger.debug(`[timing] spawn windows-prepare ${Date.now() - prepareStartedAt}ms`);
       const scopeReports = env.HAPPY_WRITE_SCOPE_SESSION === '1' ? writeScopeRuntime?.prepareReports(resumeTargetSessionId) : undefined;
@@ -2586,7 +2603,7 @@ export async function startDaemon(): Promise<void> {
         () => {
           const stdio: import('child_process').SpawnOptions['stdio'] = scopeReports ? ['ignore', 'ignore', 'ignore', 'pipe']
             : captureSpawnOutputStdio(startupLogFileName, `session ${resumeTargetSessionId ?? 'new'} from ${cwd}`);
-          try { return spawnHappyCLI(args, { cwd, detached: true, stdio, env: { ...env, ...scopeReports?.environment } }); }
+          try { onProcessSubmission?.(); return spawnHappyCLI(args, { cwd, detached: true, stdio, env: { ...env, ...scopeReports?.environment } }); }
           finally { closeCapturedSpawnOutputStdio(stdio); }
         });
       scopeReports?.attach(happyProcess);
@@ -5259,8 +5276,31 @@ export async function startDaemon(): Promise<void> {
       logger.debug(`[channel-host] not started: ${channelHostEntry.code}`);
     }
 
+    const ownedSpawn = createOwnedSpawnRuntime({ home: configuration.happyHomeDir, happyOrigin: configuration.serverUrl, env: process.env,
+      registration: async () => {
+        const [currentCredentials, settings] = await Promise.all([readCredentials(), readSettings()]);
+        if (!currentCredentials || settings.machineId !== machineId || !settings.machineIdConfirmedByServer) throw new Error('identity-changed');
+        // Never replace the running daemon's registration with a descriptor's claims.
+        if (JSON.stringify(currentCredentials) !== JSON.stringify(credentials)) throw new Error('identity-changed');
+        return { machineId, credentials: currentCredentials, epoch: String(process.pid) };
+      },
+      metadata: options => ({ path: options.directory, host: os.hostname(), version: packageJson.version, os: os.platform(), machineId,
+        homeDir: os.homedir(), happyHomeDir: configuration.happyHomeDir, happyLibDir: projectPath(), happyToolsDir: join(projectPath(), 'tools', 'unpacked'),
+        flavor: options.agent ?? 'claude', startedFromDaemon: true, startedBy: 'daemon', lifecycleState: 'running', lifecycleStateSince: Date.now() }),
+      rotation: (options, companyId) => companyId ? machineRuntimeFor(companyId) : machineRotationFor(options),
+      start: (options, launch) => { if (launch) ownedMachineLaunches.set(options, launch); return ownedStartGuard.start(options, () => spawnSessionAdmitted(options)); },
+      tracked: sessionId => findTrackedSessionById(sessionId) ?? sessionIdToFinishedSession.get(sessionId), live: tracked => tracked.pid > 0 && isPidAlive(tracked.pid),
+      persist: async session => {
+        // Rotation has already persisted its execution binding; retain that trusted resume state.
+        const prior = readPersistedSessions()[session.id];
+        return persistSessionDurably(session.id, { ...prior, encryptionKey: encodeBase64(session.encryptionKey), encryptionVariant: session.encryptionVariant,
+          seq: session.seq, metadataVersion: session.metadataVersion, agentStateVersion: session.agentStateVersion, metadata: session.metadata,
+          savedAt: Date.now(), lastProcessedSeq: 0 });
+      },
+    });
     // Set RPC handlers
     apiMachine.setRPCHandlers({
+      ownedSpawn,
       daemonSessionState: createDaemonSessionStateHandler(getCurrentChildren),
       byosOfflineReceive,
       difficultyRouting: difficultyRoutingHost,

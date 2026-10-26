@@ -117,6 +117,12 @@ export function createMachineSetupTokenRuntime(deps: {
     signal?.throwIfAborted();
     return environment(current)
   }
+  async function abandonOwnedLaunch(launchId: string) {
+    const state = await journal.read(launchId);
+    if (!state || state.abandoned || state.current) return;
+    if (!state.pending?.ownershipManaged) throw new MachineRotationError('NOT_BOUND');
+    await journal.write({ version: 1, launchId, abandoned: true });
+  }
   async function recoverLaunches() {
     const recoveredSessions: TrackedSession[] = [];
     // Initial creates have no child yet. Reconstruct only from the exact encrypted body,
@@ -125,7 +131,7 @@ export function createMachineSetupTokenRuntime(deps: {
       if (activeLaunches.has(id)) continue;
       try {
       const state = await journal.read(id), pending = state?.pending;
-      if (!state || state.current || !pending || pending.request.action !== 'issue') continue;
+      if (!state || state.abandoned || state.current || !pending || pending.request.action !== 'issue') continue;
       if (!pending.createBody) throw new MachineRotationError('PERSISTENCE_INDETERMINATE');
       const snapshot = await deps.loadPrepared(id, pending.request.sessionCreateBodyHash);
       if (!snapshot) throw new MachineRotationError('PERSISTENCE_INDETERMINATE');
@@ -152,7 +158,7 @@ export function createMachineSetupTokenRuntime(deps: {
       await journal.write(state);
       const proof = rotationIsFresh(ticket, protocol.now()) && rotationIsFresh(proofBody, protocol.now())
         ? { ticket: issued.executionTicket, deviceProof: await protocol.sign(proofBody) } : undefined;
-      const raw = await deps.discoverSession(state, snapshot, proof);
+      const raw = await deps.discoverSession(state, snapshot, pending.ownershipManaged ? undefined : proof);
       if (!raw) throw new MachineRotationError('PERSISTENCE_INDETERMINATE');
       const binding: MachineSetupTokenBindingRecord = { ...body, execution: { sessionId: raw.id, initialNonce: body.nonce,
         issueOperationId: pending.request.operationId, sessionOwnerAccountId: pending.request.sessionOwnerAccountId,
@@ -190,26 +196,35 @@ export function createMachineSetupTokenRuntime(deps: {
       // Durable before process submission; an uncertain outcome cannot authorize a fresh conversation.
       if (!state.startSubmitted) await journal.write({ ...state, startSubmitted: true });
     },
+    abandonOwnedLaunch,
     recoverLaunches() { recoveryFlight ??= recoverLaunches().finally(() => { recoveryFlight = null }); return recoveryFlight; },
     async prepareLaunch(input: {
       metadata: Metadata; ownerAccountId: string; machineOwnerAccountId: string; userHomeDir?: string;
+      /** Internal T4rt snapshot owner: stable ids, sole authority to POST both proofs. */
+      ownershipPreparation?: { launchId: string; tag: string };
       createSession(input: { tag: string; metadata: Metadata; state: { controlledByUser: false }; executionProof(body: Readonly<SessionExecutionCreateBody>, encryption: { encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey' }): Promise<HappySessionExecutionProof> }): Promise<Session | null>;
     }) {
       await protocol.checkPublicKey()
-      const launchId = randomUUID(), tag = randomUUID()
+      const launchId = input.ownershipPreparation?.launchId ?? randomUUID(), tag = input.ownershipPreparation?.tag ?? randomUUID()
+      if (activeLaunches.has(launchId)) throw new MachineRotationError('LAUNCH_IN_PROGRESS')
       activeLaunches.add(launchId);
       try {
-      let state: MachineRotationJournalRecord | undefined
+      let state: MachineRotationJournalRecord | undefined = input.ownershipPreparation ? await journal.read(launchId) ?? undefined : undefined
+      if (state?.abandoned) throw new MachineRotationError('LAUNCH_ABANDONED');
       const metadata = { ...input.metadata, setupTokenRotation: { version: 1 as const, principalType: 'machine' as const, bindingVersion: 2 as const } }
       const session = await input.createSession({ tag, metadata, state: { controlledByUser: false }, executionProof: async (body, encryption) => {
         const hashes = { sessionTagHash: await sessionTagHash(body.tag), sessionCreateBodyHash: await sessionCreateBodyHash(body) }
-        const request = await protocol.request({ action: 'issue', operationId: randomUUID(), launchId, sessionOwnerAccountId: input.ownerAccountId, ...hashes })
+        if (state && (!state.pending?.ownershipManaged || state.pending.request.action !== 'issue' || state.pending.request.sessionCreateBodyHash !== hashes.sessionCreateBodyHash
+          || state.pending.request.sessionTagHash !== hashes.sessionTagHash || state.pending.request.sessionOwnerAccountId !== input.ownerAccountId
+          || state.pending.machineOwnerAccountId !== input.machineOwnerAccountId)) throw new MachineRotationError('STALE')
+        const request = state?.pending?.request ?? await protocol.request({ action: 'issue', operationId: randomUUID(), launchId, sessionOwnerAccountId: input.ownerAccountId, ...hashes })
+        const recovering = !!state
         const saved = await deps.savePrepared(launchId, hashes.sessionCreateBodyHash, { ...encryption, encryptionKey: encodeBase64(encryption.encryptionKey),
           seq: 0, metadataVersion: 0, agentStateVersion: 0, metadata, savedAt: protocol.now(), userHomeDir: input.userHomeDir, lastProcessedSeq: 0 });
         if (saved.status !== 'committed') throw new MachineRotationError('PERSISTENCE_INDETERMINATE');
-        state = { version: 1, launchId, pending: { request, createBody: body, machineOwnerAccountId: input.machineOwnerAccountId, claimOperationId: randomUUID(), commitOperationId: randomUUID() } }
+        state ??= { version: 1, launchId, pending: { request, ...(input.ownershipPreparation ? { ownershipManaged: true } : {}), createBody: body, machineOwnerAccountId: input.machineOwnerAccountId, claimOperationId: randomUUID(), commitOperationId: randomUUID() } }
         await journal.write(state)
-        const issued = await protocol.post(request)
+        const issued = recovering ? await queryOrRetry(request) : await protocol.post(request)
         if (issued.state === 'exhausted') throw new MachineRotationError('NO_ACCOUNT')
         if (!issued.binding || !issued.executionTicket || issued.state !== 'pending') throw new MachineRotationError('BINDING_REJECTED')
         const binding = await protocol.verifyBinding(issued.binding, launchId)
@@ -221,7 +236,7 @@ export function createMachineSetupTokenRuntime(deps: {
           || t.deviceKeyId !== a.deviceKeyId || await rotationSha256(rotationDecodeBinary(t.deviceSigningPublicKey, 32)) !== a.deviceKeyId || t.launchId !== launchId || t.initialNonce !== binding.nonce || t.operationId !== request.operationId
           || t.sessionOwnerAccountId !== input.ownerAccountId || t.machineOwnerAccountId !== input.machineOwnerAccountId
           || t.sessionTagHash !== hashes.sessionTagHash || t.sessionCreateBodyHash !== hashes.sessionCreateBodyHash) throw new MachineRotationError('BINDING_REJECTED')
-        const createProofBody: HappySessionCreateProofBody = { version: 1, type: 'happy-session-create-proof', audience: protocol.config.happyOrigin,
+        const createProofBody: HappySessionCreateProofBody = state.pending?.createProofBody ?? { version: 1, type: 'happy-session-create-proof', audience: protocol.config.happyOrigin,
           method: 'POST', path: '/v1/sessions', ticketDigest: await rotationDigest(issued.executionTicket), sessionOwnerAccountId: input.ownerAccountId,
           ...hashes, issuedAt: protocol.now(), expiresAt: Math.min(t.expiresAt, protocol.now() + 60000) };
         state.pending = { ...state.pending!, binding, bindingDigest: await rotationDigest(issued.binding), createProofBody }

@@ -23,12 +23,13 @@ export function prepareCodexInitialPrompt(input: {
   reconnectSessionId?: string
   automationRunOnceRequested: boolean
   allowAutomationReconnectPrompt?: boolean
+  freshLaunch?: boolean
 }): PreparedCodexInitialPrompt {
   const consumedPrompt = consumePendingInitialPrompt(input.env)
   const localId = consumePendingInitialPromptLocalId(input.env)
   const requireConfirmedDelivery = consumeConfirmedInitialPromptDelivery(input.env)
   const prompt = consumedPrompt
-    && (!input.reconnectSessionId || input.allowAutomationReconnectPrompt)
+    && (!input.reconnectSessionId || input.freshLaunch || input.allowAutomationReconnectPrompt)
     ? consumedPrompt
     : null
 

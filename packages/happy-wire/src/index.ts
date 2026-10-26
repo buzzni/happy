@@ -19,3 +19,4 @@ export * from './worktreeOps';
 export * from './orgSetupTokenApproval';
 export * from './scheduledTasks';
 export * from './sharedMachineRotation';
+export * from './sessionOwnership';

@@ -11,10 +11,10 @@ import { MachineMetadataSchema } from '@/api/types'
 import { AI_AUTH_SELECTION_CAPABILITY } from './sessionEnv'
 import { initialMachineMetadata } from './run'
 
-async function runSource(): Promise<string> {
+async function runSource(file: 'run.ts' | 'ownedSpawnRuntime.ts' = 'run.ts'): Promise<string> {
   const { readFile } = await import('node:fs/promises')
   const { fileURLToPath } = await import('node:url')
-  return readFile(fileURLToPath(new URL('./run.ts', import.meta.url)), 'utf8')
+  return readFile(fileURLToPath(new URL(file, import.meta.url)), 'utf8')
 }
 
 describe('capability 발행', () => {
@@ -84,10 +84,43 @@ describe('배선 가드: spawn 이 선택을 존중하고 검증하는가', () =
     // aplus Phase 3c — on by default, so a launch machine rotation cannot serve runs the current way instead of failing.
     expect(text).toContain('precreatedSession: !!options.reconnectEnvironment,');
     expect(text).toContain('resolver: machineRotation, scope: sharedMachineScope,');
-    expect(text).toContain('const machineRotationRuntime = await machineRotationFor(options);');
+    // Owned launches already passed prepareLaunch in ownedSpawnRuntime. Only those may skip
+    // a second selection/precreate; ordinary/channel launches must still use machineRotationFor.
+    expect(text).toMatch(/let preparedMachineLaunch = ownedMachineLaunches\.get\(options\);\s*const machineRotationRuntime = preparedMachineLaunch \? null : await machineRotationFor\(options\);/);
+    expect(text).toMatch(/if \(preparedMachineLaunch\) \{\s*preparedMachineSessionId = preparedMachineLaunch\.session\.id;\s*pendingMachineStarts\.add\(preparedMachineSessionId\);/);
+    expect(text).toContain('preparedMachineLaunch?.environment ?? (honorsManagedAiCredentials(options.aiAuthSelection)');
+    expect(text).toContain('if (preparedMachineLaunch) Object.assign(extraEnv, preparedMachineLaunch.reconnectEnvironment);');
     // Review #896 — a channel launch decides once; spawnSession must not decide again and drop the channel data key.
     expect(text).toContain('channelRotationRuntimes.set(options, runtime);');
     expect(text).toContain('const chosen = channelRotationRuntimes.get(options);');
+  });
+
+  it('owned precreate carries execution proof and reconnect binding into the same admitted spawn path', async () => {
+    const text = await runSource();
+    const owned = await runSource('ownedSpawnRuntime.ts');
+    // A company-bound recovery must use its original runtime; new launches use the same selector.
+    expect(text).toContain('rotation: (options, companyId) => companyId ? machineRuntimeFor(companyId) : machineRotationFor(options),');
+    expect(text).toContain('start: (options, launch) => { if (launch) ownedMachineLaunches.set(options, launch); return ownedStartGuard.start(options, () => spawnSessionAdmitted(options)); },');
+    expect(owned).toMatch(/rotation\.prepareLaunch\(\{ metadata, ownerAccountId: record\.intent\.sessionAccountId,\s*machineOwnerAccountId: record\.intent\.machineAccountId, ownershipPreparation:/);
+    expect(owned).toContain('snapshot.executionProof = await input.executionProof(snapshot.body, { encryptionKey: decodeBase64(snapshot.encryptionKey), encryptionVariant: snapshot.encryptionVariant });');
+    expect(owned).toContain('...(snapshot.executionProof ? { executionProof: snapshot.executionProof } : {})');
+    // Commit must finish the execution claim/commit before the prepared launch can be consumed.
+    expect(owned).toContain('flight.resolve(session(record.snapshot!, raw)); await flight.complete;');
+    expect(owned).toContain('await complete(record, response.session); return created;');
+    expect(owned).toContain('const runtime = await deps.rotation(options(record), company);');
+    expect(owned).toContain("if (!runtime) throw new Error('execution-unavailable');");
+    expect(owned).toContain("if (!tracked || !binding || !isMachineSetupTokenBinding(binding)) throw new Error('execution-recovery-pending');");
+    expect(owned).toContain('const environment = await runtime.resume(tracked, binding);');
+    expect(owned).toContain('const launch = await recoverLaunch(record, created);');
+    expect(owned).toContain('buildReconnectSessionEnvironment({ sessionId: created.id, encryption: created, serverSnapshot: created, baselineSeq: 0 })');
+    expect(owned).toContain('startPrepared.set(record.preparationId, { options: { ...opts, reconnectEnvironment }, launch });');
+    expect(owned).toContain('const result = await deps.start(prepared.options, prepared.launch);');
+    // Dispatch evidence is set at both process-launch boundaries, after validation. Without it
+    // a lost webhook could be misclassified as a retryable refusal and spawn a duplicate.
+    expect(text).toContain('onProcessSubmission: () => ownedStartGuard.submitted(options),');
+    expect(text).toContain('if (standaloneWindows) onProcessSubmission?.();');
+    expect(text).toContain('if (ownedStartGuard.wasSubmitted(options)) return finishSpawn(Promise.resolve({');
+    expect(text).toMatch(/try \{ onProcessSubmission\?\.\(\); return spawnHappyCLI\(/);
   });
 
   it('두 spawn 경로가 자식에게 건네는 바로 그 env 를 검증한다', async () => {
@@ -98,10 +131,10 @@ describe('배선 가드: spawn 이 선택을 존중하고 검증하는가', () =
     // 검증 대상이 최종 env 인지: 두 이름 모두 헬퍼가 만든 값이고 자식에게 그대로 간다.
     expect(text).toMatch(/const tmuxEnv = applyAppliedAiAuthSourceEnv\(/)
     expect(text).toMatch(/const spawnEnvironment = applyAppliedAiAuthSourceEnv\(/)
-    expect(text).toMatch(/\}, tmuxEnv, start => launchManagedAiCredentialSession\(managedAiCredentialEnvironment, start\)\)/)
+    expect(text).toMatch(/\}, tmuxEnv, start => launchManagedAiCredentialSession\(managedAiCredentialEnvironment, \(\) => \{\s*ownedStartGuard\.submitted\(options\); return start\(\);\s*\}\)\)/)
     expect(text).toMatch(/env: spawnEnvironment,\s*managedAiCredentialEnvironment,/)
     expect(text).toMatch(/launchManagedAiCredentialSession = aiCredentialRuntime\.launchSession/)
-    expect(text).toMatch(/await launchManagedAiCredentialSession\(managedAiCredentialEnvironment,\s*\(\) => \{[^;]*;\s*try \{ return spawnHappyCLI\(/)
+    expect(text).toMatch(/await launchManagedAiCredentialSession\(managedAiCredentialEnvironment,\s*\(\) => \{[^;]*;\s*try \{ onProcessSubmission\?\.\(\); return spawnHappyCLI\(/)
     expect(text).toMatch(/await launchManagedAiCredentialSession\(managedAiCredentialEnvironment, \(\) => prepared\.resume\(\)\)/)
     expect(text).toMatch(/resumeTargetSessionId: happySessionId,\s*managedAiCredentialEnvironment,/)
   })
@@ -116,8 +149,9 @@ describe('배선 가드: spawn 이 선택을 존중하고 검증하는가', () =
 
   it('적용된 원천이 spawn 결과에 실린다', async () => {
     const text = await runSource()
-    const passes = [...text.matchAll(/finishSpawn\([\s\S]{0,400}?, (\w+)\.appliedSource\)/g)]
-    expect(passes).toHaveLength(2)
+    const passes = [...text.matchAll(/finishSpawn\((?:waitForSessionWebhook|spawnTrackedHappyProcess)\(\{[\s\S]*?\n\s*\}\), (\w+)\.appliedSource\)/g)]
+      .map(match => match[1])
+    expect(passes).toEqual(['tmuxSelection', 'spawnSelection'])
     // 넘기기만 하고 결과에 안 합치면 값은 조용히 사라진다 — 뮤테이션으로 확인한 구멍.
     expect(text).toMatch(/\.\.\.result,\s*appliedAiAuthSource\s*\}/)
   })

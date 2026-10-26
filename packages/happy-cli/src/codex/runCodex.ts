@@ -143,7 +143,7 @@ import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPr
 import { NEXT_STEPS_PROMPT } from '@/prompt/nextStepsPrompt';
 import { createTurnCardSwitch } from '@/claude/utils/turnCardTools';
 import { codexPlanEvent } from './codexPlanEvent';
-import { consumeReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
+import { consumeReconnectFreshLaunch, consumeReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import {
     codexGoalActionCapabilities,
@@ -280,6 +280,7 @@ export async function runCodex(opts: {
         reconnectSessionId,
         automationRunOnceRequested,
         allowAutomationReconnectPrompt,
+        freshLaunch: consumeReconnectFreshLaunch(process.env),
     });
 
     // Early check: ensure Codex CLI is installed before proceeding
