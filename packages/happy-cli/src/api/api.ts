@@ -205,32 +205,9 @@ export class ApiClient {
     };
   }
 
-  async getOrCreateSession(opts: {
-    tag: string,
-    metadata: Metadata,
-    state: AgentState | null,
-    /**
-     * A session key the caller chose, with its envelope wrapped to the account public key.
-     *
-     * For a parent that creates the session and hands the key to someone else (the daemon's
-     * channel host): it must know the key the session is sealed with, so this call uploads
-     * exactly these bytes instead of minting its own. Legacy accounts have no per-session key.
-     */
-    dataKey?: { key: Uint8Array, wrapped: Uint8Array },
-    /** Trusted daemon preparation only: prove the exact already-encrypted create payload. */
-    executionProof?: (body: Readonly<SessionExecutionCreateBody>, encryption: { encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey' }) => Promise<HappySessionExecutionProof>,
-    /** Trusted daemon only. Seals these exact bytes; a private journal owns prepare/commit. */
-    ownershipProof?: (body: Readonly<SessionExecutionCreateBody>, encryption: { encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey' }) => Promise<unknown>,
-    /** Persist the server's candidate before confirm/start. This is not effective owner authority. */
-    onOwnershipCreated?: (receipt: OwnershipCreatedReceipt) => Promise<void>,
-  }): Promise<Session | null> {
-    if (this.principal.kind === 'managed-session') {
-      // Refused here rather than at the server: a managed run that reached
-      // this point would create a session sealed with a key its parent never
-      // saw, and nothing downstream could read the result.
-      throw new Error('managed sessions are created by the parent, not by this process');
-    }
-
+  /** Prepare once without sending a request. The daemon persists this private snapshot before commit. */
+  prepareSessionCreation(opts: { tag: string; metadata: Metadata; state: AgentState | null;
+    dataKey?: { key: Uint8Array; wrapped: Uint8Array } }) {
     // Resolve encryption key
     let dataEncryptionKey: Uint8Array | null = null;
     let encryptionKey: Uint8Array;
@@ -266,6 +243,36 @@ export class ApiClient {
       agentState: opts.state ? encodeBase64(encrypt(encryptionKey, encryptionVariant, opts.state)) : null,
       dataEncryptionKey: dataEncryptionKey ? encodeBase64(dataEncryptionKey) : null,
     });
+    return { body, encryptionKey, encryptionVariant };
+  }
+
+  async getOrCreateSession(opts: {
+    tag: string,
+    metadata: Metadata,
+    state: AgentState | null,
+    /**
+     * A session key the caller chose, with its envelope wrapped to the account public key.
+     *
+     * For a parent that creates the session and hands the key to someone else (the daemon's
+     * channel host): it must know the key the session is sealed with, so this call uploads
+     * exactly these bytes instead of minting its own. Legacy accounts have no per-session key.
+     */
+    dataKey?: { key: Uint8Array, wrapped: Uint8Array },
+    /** Trusted daemon preparation only: prove the exact already-encrypted create payload. */
+    executionProof?: (body: Readonly<SessionExecutionCreateBody>, encryption: { encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey' }) => Promise<HappySessionExecutionProof>,
+    /** Trusted daemon only. Seals these exact bytes; a private journal owns prepare/commit. */
+    ownershipProof?: (body: Readonly<SessionExecutionCreateBody>, encryption: { encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey' }) => Promise<unknown>,
+    /** Persist the server's candidate before confirm/start. This is not effective owner authority. */
+    onOwnershipCreated?: (receipt: OwnershipCreatedReceipt) => Promise<void>,
+  }): Promise<Session | null> {
+    if (this.principal.kind === 'managed-session') {
+      // Refused here rather than at the server: a managed run that reached
+      // this point would create a session sealed with a key its parent never
+      // saw, and nothing downstream could read the result.
+      throw new Error('managed sessions are created by the parent, not by this process');
+    }
+
+    const { body, encryptionKey, encryptionVariant } = this.prepareSessionCreation(opts);
     const executionProof = opts.executionProof ? HappySessionExecutionProofSchema.parse(await opts.executionProof(body, { encryptionKey, encryptionVariant })) : undefined;
     let ownershipProof: SessionOwnershipProof | undefined;
     if (opts.ownershipProof) {
