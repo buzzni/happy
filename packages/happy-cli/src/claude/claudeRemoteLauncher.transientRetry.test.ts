@@ -1,7 +1,7 @@
 import { HubInputGate, TurnInputEvidence, type EvidenceBatch } from '@/api/turnInputEvidence';
 import { closeClaudeTurnWithStatus, mapClaudeLogMessageToSessionEnvelopes, mapClaudeChannelFinalAnswer,
     type ClaudeSessionProtocolState } from './utils/sessionProtocolMapper';
-import type { SessionEnvelope, SessionTurnEndStatus, InputEvidenceV1 } from '@slopus/happy-wire';
+import { createEnvelope, type SessionEnvelope, type SessionTurnEndStatus, type InputEvidenceV1 } from '@slopus/happy-wire';
 import type { RawJSONLines } from './types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
@@ -75,7 +75,6 @@ async function runLauncher(step: Step, done: (prompts: string[]) => boolean, set
         setInputMode: (mode: 'remote' | 'local' | 'transitioning') => { gate.transition(mode); queue.discardInvalid(); },
         startClaudeInputEvidence: (batch: EvidenceBatch) => evidence.setPending(batch),
         continueClaudeInputEvidence: (kind: InputEvidenceV1['continuation']['kind']) => {
-            acceptEnvelopes(evidence.startUnmappedTurn());
             evidence.continuePending(kind);
         },
         sessionId: 'happy-session-1',
@@ -92,11 +91,12 @@ async function runLauncher(step: Step, done: (prompts: string[]) => boolean, set
         setPendingTurnRequestId: vi.fn((id: string | null) => { protocol.pendingRequestId = id; }),
         sendFinalAnswerForChannelTurn: vi.fn((text: string) => {
             const mapped = mapClaudeChannelFinalAnswer(protocol, text).envelopes;
-            acceptEnvelopes(mapped.length ? mapped : evidence.unmappedFinalAnswer(text));
+            acceptEnvelopes(mapped.length || !text.trim() ? mapped : (protocol.currentTurnId ? [createEnvelope('agent', { t: 'final-answer', text }, { turn: protocol.currentTurnId })] : [evidence.unmappedFinalEvidence()]));
         }),
         applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn((status: SessionTurnEndStatus) => {
             const mapped = closeClaudeTurnWithStatus(protocol, status).envelopes;
-            acceptEnvelopes(evidence.closeUnmappedTurn(status)); acceptEnvelopes(mapped);
+            if (!mapped.length) evidence.setPending(null);
+        acceptEnvelopes(mapped);
         }), sendSessionEvent: vi.fn(),
         failClaudeLaunchTurn: vi.fn(),
     };

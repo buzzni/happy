@@ -271,10 +271,12 @@ describe('automatic continuation after a capacity failure', () => {
         }).then(() => {
             const starts = protocolMessages.filter(event => event.ev.t === 'turn-start');
             const ends = protocolMessages.filter(event => event.ev.t === 'turn-end');
-            expect(starts).toHaveLength(outcome === 'write-failure' ? 1 : 0);
-            expect(ends).toHaveLength(outcome === 'write-failure' ? 1 : 0);
-            if (outcome === 'write-failure') expect(ends[0].ev).toMatchObject({ status: 'failed', inputEvidence: {
-                inputs: [{ kind: 'rest', serverMessageId: 'A', serverSeq: 1 }], terminal: true } });
+            expect(starts).toHaveLength(0);
+            expect(ends).toHaveLength(0);
+            const revision = protocolMessages.find(event => event.ev.t === 'turn-input-evidence');
+            if (outcome === 'write-failure') expect(revision).toMatchObject({ ev: { inputEvidence: {
+                coverage: 'incomplete', inputs: [], terminal: true, incompleteReasons: ['provider-turn-unmapped'] } } });
+            else expect(revision).toBeUndefined();
         });
     }, 60_000);
     it('continues the same thread once the overloaded turn has ended', async () => {
