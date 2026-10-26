@@ -214,6 +214,15 @@ describe('setup-token account switch (specs/claude-setup-token-account-selection
       expect(requests.filter(request => request.url.endsWith('/measure/reserve'))).toHaveLength(3)
     })
 
+    it('asks an older Studio again as before when it refuses the measurement fields', async () => {
+      requests.length = 0
+      const measure = vi.fn()
+      const { switcher } = setup({ measure, fetch: studio([{ status: 400, body: { error: 'SETUP_TOKEN_DAEMON_INVALID_INPUT' } }, granted]) })
+      expect(await switcher.rebind('session-a', RUNNING_A)).toHaveProperty('ok', true)
+      expect(requests.map(request => [request.url.split('/daemon/')[1], 'measureVersion' in request.body])).toEqual([['rebind', true], ['rebind', false]])
+      expect(measure).not.toHaveBeenCalled()
+    })
+
     it('waits until the first candidate recovers when none is left', async () => {
       vi.useFakeTimers({ now: 1_000 })
       try {

@@ -180,13 +180,19 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     let grant: Record<string, unknown>
     const proof = { machineId: deps.machineId, sessionId, companyId: binding.companyId, bindingNonce: binding.nonce }
     // Candidates checked in this switch; a switch to another account (not a return) offers to check.
-    const measured: string[] | null = deps.measure && !confirmedOnly ? [] : null
+    let measured: string[] | null = deps.measure && !confirmedOnly ? [] : null
     try {
       let response: Response, body: Record<string, unknown> | null
       while (true) {
         response = await post(confirmedOnly ? 'return' : 'rebind', { ...proof,
           ...(tokenProof ? { credentialProofVersion: 1 } : {}), ...(organizationFailure ? { organizationFailure } : {}), ...(measured ? { measureVersion: 1, measured: [...measured] } : {}) })
         body = await response.json().catch(() => null) as Record<string, unknown> | null
+        // A Studio from before candidate checks refuses the fields it does not know: ask again as before, once.
+        if (response.status === 400 && measured) {
+          logger.debug('[setup-token-switch] Studio refused candidate checks; asking again without them')
+          measured = null
+          continue
+        }
         if (response.status !== 409 || body?.error !== 'SETUP_TOKEN_DAEMON_MEASURE_REQUIRED') break
         const candidate = { managedAccountId: body.managedAccountId, credentialGeneration: body.credentialGeneration }
         if (!measured || measured.length >= MAX_CHECKS_PER_SWITCH || typeof candidate.managedAccountId !== 'string' || !UUID.test(candidate.managedAccountId)
