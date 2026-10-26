@@ -486,7 +486,7 @@ install_tools() {
     ensure_dir "$LIBEXEC" root root 0755
     ensure_dir "$LIBEXEC/lib" root root 0755
     local target
-    local targets="abp-firewall abp-stack.mjs abp-plan.mjs lib/abpPlan.mjs lib/profileCopy.mjs"
+    local targets="abp-firewall abp-stack.mjs abp-runtime-update.mjs abp-plan.mjs lib/abpPlan.mjs lib/profileCopy.mjs"
     [ "$HOST_MODE" = browser-only ] || targets="claude-sbx-launch abp-firewall-read $targets"
     for target in $targets; do safe_path "$LIBEXEC/$target" file root; done
     if [ "$HOST_MODE" != browser-only ]; then
@@ -496,11 +496,19 @@ install_tools() {
     fi
     run install -o root -g root -m 0755 "$here/abp-firewall" "$LIBEXEC/abp-firewall"
     run install -o root -g root -m 0644 "$here/abp-stack.mjs" "$LIBEXEC/abp-stack.mjs"
+    run install -o root -g root -m 0644 "$here/abp-runtime-update.mjs" "$LIBEXEC/abp-runtime-update.mjs"
     run install -o root -g root -m 0644 "$here/abp-plan.mjs" "$LIBEXEC/abp-plan.mjs"
     run install -o root -g root -m 0644 "$here/lib/abpPlan.mjs" "$LIBEXEC/lib/abpPlan.mjs"
     run install -o root -g root -m 0644 "$here/lib/profileCopy.mjs" "$LIBEXEC/lib/profileCopy.mjs"
     printf '#!/bin/sh\nexec /usr/bin/node %s/abp-stack.mjs "$@"\n' "$LIBEXEC" > "$WORK/wrapper"
     write_file /usr/local/sbin/abp-stack root root 0755 < "$WORK/wrapper"
+    printf '#!/bin/sh\n[ "$#" -eq 0 ] || exit 64\nexec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root /usr/bin/node %s/abp-runtime-update.mjs\n' "$LIBEXEC" > "$WORK/update-wrapper"
+    write_file /usr/local/sbin/abp-runtime-update root root 0755 < "$WORK/update-wrapper"
+    if [ "$HOST_MODE" != browser-only ]; then
+        printf 'agent ALL=(root) NOPASSWD: /usr/local/sbin/abp-runtime-update ""\n' > "$WORK/update-sudoers"
+        run visudo -cf "$WORK/update-sudoers"
+        write_file /etc/sudoers.d/abp-runtime-update root root 0440 show < "$WORK/update-sudoers"
+    fi
 }
 
 # The proxy (abp-proxy) may not send DNS through the firewall: glibc asks systemd-resolved over its socket.

@@ -136,6 +136,8 @@ describe('abp-install --dry-run', () => {
         expect(out).toMatch(/\+ install -o root -g abp-session -m 4750 \S+ \/usr\/local\/libexec\/abp\/abp-firewall-read/)
         expect(out).toMatch(/\+ visudo -cf \S+/)
         expect(out).toContain('+ write /etc/sudoers.d/abp-agent-sbx (root:root 0440')
+        expect(out).toContain('+ write /etc/sudoers.d/abp-runtime-update (root:root 0440')
+        expect(out).toContain('abp-runtime-update.mjs')
         expect(out).toContain('    | agent ALL=(agent-sbx) NOPASSWD: /usr/local/libexec/abp/claude-sbx-launch 0')
         expect(out).toContain('+ write /etc/aplus/sandbox-policy.json (root:root 0644')
         expect(out).toContain('    |   "mode": "mandatory"')
