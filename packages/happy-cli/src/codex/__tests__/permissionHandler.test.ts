@@ -89,6 +89,7 @@ describe('CodexPermissionHandler', () => {
             arguments: { title: 'Greeting' },
             status: 'approved',
             decision: 'approved',
+            resolution: 'auto-approved',
         });
     });
 
@@ -170,6 +171,7 @@ describe('CodexPermissionHandler', () => {
         expect(getState().completedRequests['codex_apps:42']).toMatchObject({
             tool: 'send_message',
             status: 'approved',
+            resolution: 'auto-approved',
         });
     });
 

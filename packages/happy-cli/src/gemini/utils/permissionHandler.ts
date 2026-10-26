@@ -131,7 +131,8 @@ export class GeminiPermissionHandler extends BasePermissionHandler {
                         createdAt: Date.now(),
                         completedAt: Date.now(),
                         status: 'approved',
-                        decision: this.currentPermissionMode === 'yolo' ? 'approved_for_session' : 'approved'
+                        decision: this.currentPermissionMode === 'yolo' ? 'approved_for_session' : 'approved',
+                        resolution: 'auto-approved',
                     }
                 }
             }));

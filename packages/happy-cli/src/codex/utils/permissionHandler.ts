@@ -239,6 +239,7 @@ export class CodexPermissionHandler extends BasePermissionHandler implements Pol
                         completedAt,
                         status: 'approved',
                         decision: 'approved',
+                        resolution: 'auto-approved',
                     },
                 },
             } satisfies AgentState));
