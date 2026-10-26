@@ -52,6 +52,7 @@ listed() { if [ "$DRY_RUN" = 1 ]; then printf '<%s>\n' "$1"; else docker "$@" 2>
 fence_sessions() {
     say "fence new sessions (no sudo path to agent-sbx, daemon stopped)"
     try rm -f /etc/sudoers.d/abp-agent-sbx
+    try rm -f /etc/sudoers.d/abp-runtime-update
     try systemctl disable --now abp-happy-daemon.service
 }
 
@@ -101,7 +102,7 @@ remove_files() {
         /etc/systemd/system/abp-stack.service /etc/systemd/system/abp-happy-daemon.service \
         /etc/systemd/system/abp-profile-prune.service /etc/systemd/system/abp-profile-prune.timer
     try systemctl daemon-reload
-    try rm -f /etc/tmpfiles.d/abp.conf /usr/local/sbin/abp-stack /run/abp-stack-start-request /etc/abp/browser-only.env
+    try rm -f /etc/tmpfiles.d/abp.conf /usr/local/sbin/abp-runtime-update /usr/local/sbin/abp-stack /run/abp-stack-start-request /etc/abp/browser-only.env
     try rm -rf "$LIBEXEC"
     if [ "$HOST_MODE" != browser-only ] && { [ "$DRY_RUN" = 1 ] || [ -L /usr/local/bin/happy ]; }; then try rm -f /usr/local/bin/happy; fi
 }
