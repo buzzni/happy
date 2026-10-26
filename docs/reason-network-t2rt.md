@@ -28,11 +28,30 @@ The T2RT-19 structural decision below also makes **wire turn lifecycle identical
 to `9ee84191`**: T2rt cannot create, close or reorder turn-start/turn-end events.
 The separate unmapped lifecycle from `02497601`, `e68bed17` and `f93aeae0` is
 removed. Only native mapped turns can stamp finals or supply retry roots.
-An unmapped final publishes a terminal, incomplete `turn-input-evidence` revision
+With input-evidence capability enabled, an unmapped final publishes a terminal,
+incomplete `turn-input-evidence` revision
 without an envelope `turn`; its payload ID is only an evidence correlation token.
 It has empty inputs, no consumed-input claim and no eligibility for a later final.
 Automation/follow-up behavior remains main's, including the pre-existing missing
 textless automation completion and notification/intervention cases reproduced below.
+
+**Desktop T2 enablement prerequisite:** “exclude turn-input-evidence/hub-input-admission
+from response activity and hydration; add an encrypted-history regression”. This
+is a hard prerequisite before Desktop enables the capability or upgrades its
+runtime pin to a build that enables it. No extra native end may compensate for
+an incompatible consumer. Capability-disabled sessions publish neither evidence
+revisions (standalone or mapped) nor admission metadata, including late callbacks.
+
+Production-source check at Desktop `d58812b75e41f384d0c5242b011249fea074efea`:
+`config/happy-runtime-pin.json` pins CLI `1.1.10-aplus.357` / `9ee84191`, which
+does not implement this capability. No Desktop opt-in was found in `src`, `cli`,
+`config` or `scripts`. This is a source/pin check, not a live fleet assertion.
+The PR's Claude/Codex launchers configure evidence on automatically; upgrading
+the Desktop runtime pin therefore requires the consumer fix first. Desktop's
+generic `messageContentHasAgentResponseActivity`, `apiMessagesResponseLifecycle`
+and raw-history hydration readers currently misclassify these metadata events.
+The earlier v12 consumer check below covered narrower parser/wait paths and
+does **not** establish compatibility for those generic readers.
 
 ## Scope and architecture
 
@@ -1399,9 +1418,11 @@ Verification:
 - Adapted v12 external consumer replay: **6/6 passed** (all outbox sources,
   capability off/on, with baseline and HEAD emissions). Actual Desktop response
   lifecycle/parser/wait snapshot, channel final tracker, Happy App normalization
-  and Happy Agent completion waits agree with main. Standalone incomplete
-  revisions cause no lifecycle change or premature completion. The supplied
-  artifacts' original synthetic-W expectations are intentionally superseded.
+  and Happy Agent completion waits agree with main for the readers exercised.
+  **Superseded compatibility scope:** v13 subsequently exposed the generic
+  Desktop activity/hydration regression; the hard prerequisite above applies.
+  The supplied artifacts' original synthetic-W expectations are intentionally
+  superseded.
 - Routing parser, insertion, rearm and final-answer helpers remain byte-identical
   to `9ee84191`; the merge-base routing test copies remain unchanged. Evidence
   source contains no construction of turn-start/end. `git diff --check` passed.
@@ -1418,3 +1439,75 @@ Standard test commands remain unchanged. No dependency/schema change, PR,
 rebase, force-push, main merge or other-branch mutation is introduced. Revisit
 wire ownership only with a separately approved protocol/lifecycle design that
 accounts for all consumers; terminal evidence must never acquire turn semantics.
+
+## T2RT-20..22: refusal parity, capability gate and missing retry settlement
+
+TDD on `b737fa36` first produced **6 failing tests / 223 passing tests**:
+the source orchestrator exposed both extra exception-turn sequences, the disabled
+capability test exposed four leaked metadata envelopes, all three retry kinds
+failed post-write/pre-start settlement, and the real Codex loop retained its
+pending root. Pre-write cancellation controls already passed. The reviewer's
+real-runner receipt assertion independently reproduced the pending/nonterminal root.
+
+- **T2RT-20:** remove the account-refusal exception branch's forced queue flush
+  and failed native close. Queue only the continuation-evidence observation;
+  main's existing finally flush and account-rebind ordering own the lifecycle.
+  An exception recovery stays in the same native turn. A claimed continuation's
+  next mapped text/tool/final can advance that existing witness to running; its
+  native end then completes the same root, without an additional turn-start.
+  The orchestrator now replays exception-before-result and result-message
+  refusals with capability off/on against both `9ee84191` and HEAD. Exceptions
+  have one completed turn; result-message refusals retain main's failed turn
+  followed by a completed recovery turn. Both paths preserve the original input
+  root when evidence is enabled. The same-root assertion first caught the
+  still-pending same-native-turn receipt after restoring native parity.
+- **T2RT-21:** the common API envelope publication boundary drops both
+  `turn-input-evidence` and `hub-input-admission` while the session's evidence
+  support is disabled. This covers direct sends, provider orphan snapshots,
+  accepted/rejected admissions and late tracker callbacks after disablement.
+  Admission validation still runs. Native start/end events are unaffected.
+  The two-state regression includes metadata after a completed turn and checks
+  no native boundary is suppressed or added. Production Desktop's pin/capability
+  answer and the hard consumer prerequisite are recorded at the top of this
+  report. The capability-on Desktop reader defect is intentionally deferred to
+  that prerequisite; these CLI changes do not claim to fix Desktop hydration.
+- **T2RT-22:** before an orphan snapshot discards a claimed continuation,
+  cancel its exact original retry receipt, make it terminal/incomplete and
+  publish an evidence-only revision with `missing-provider-turn`. A fresh empty
+  orphan revision can follow, but cannot substitute for settling that root or
+  claim the missing turn consumed input. Claim deletion and retry identity checks
+  prevent duplicate settlement. A six-case tracker matrix covers pre-write and
+  post-write/pre-start failures for `claude-transient`, `claude-account-switch`
+  and `codex-capacity`; the existing actual-stdin-write T2RT-06 case and a new real
+  Codex overload/write/pre-start-failure loop cover the transport boundary.
+  Claude normally reports launch failure through main's native mapper; the
+  shared tracker matrix covers missing-turn settlement without inventing a
+  Claude native no-start path.
+
+The focused four-file selection passes **229/229 tests**, including **30/30
+parity scenarios** (**60 source replays**). All 26 earlier scenarios remain in
+the orchestrator. The reviewer's unchanged launcher/Codex scripts pass **16/16**;
+their four refusal sequences equal the extracted baseline and their failed
+written retry's original root is now terminal/cancelled with the missing-turn
+reason and exactly the original two native lifecycle frames.
+
+Final related validation:
+
+- Standard 46-file selection: **1313 passed / 1 failed out of 1314**. The sole
+  failure was `runClaude.test.ts`'s one-second harness-start wait in the existing
+  already-titled-chat control. The unchanged file then passed **62/62** alone
+  with the standard command; no timeout or production change was made for it.
+- This selection passed all launcher/personal-fallback controls (including all
+  26 setup-token-switch tests), the 15 unchanged merge-base ordering cases,
+  mapper/scanner/channel/evidence/API, Codex retry, daemon and managed-startup
+  checks. The source orchestrator passed **30/30 scenarios / 60 source replays**.
+- The reviewer's root-settlement test also passed against fresh replay output
+  (only its external output-file path was redirected to preserve the original
+  reviewer artifacts). Its assertions were unchanged.
+- CLI typecheck and pkgroll/extension-copy build passed through standard global
+  setup, including the isolated rerun. Existing bin/empty-chunk, listener and
+  asynchronously-handled-rejection warnings remain. No Unix-socket EPERM occurred.
+- The routing parser/insertion/rearm/final helpers and the API native runtime
+  side-effect method remain byte-identical to `9ee84191`. `git diff --check`
+  passed. No native wire turn is constructed by evidence, and no routing state,
+  request map, schema, dependency, Desktop source or runtime pin was changed.
