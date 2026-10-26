@@ -206,7 +206,7 @@ describe('automatic continuation after a capacity failure', () => {
     });
     afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
-    async function run(seed: () => Promise<void>) {
+    async function run(seed: () => Promise<void>, afterCapture?: () => void) {
         const { runCodex } = await import('@/codex/runCodex');
         const { ApiClient } = await import('@/api/api');
         const stub = sessionStub();
@@ -217,7 +217,7 @@ describe('automatic continuation after a capacity failure', () => {
             agentState: null, agentStateVersion: 0,
         }));
         const createSpy = vi.spyOn(ApiClient, 'create').mockResolvedValue({
-            getOrCreateMachine: vi.fn(async () => ({ id: 'machine-test' })),
+            getOrCreateMachine: vi.fn(async () => { afterCapture?.(); return { id: 'machine-test' }; }),
             getOrCreateSession,
             sessionSyncClient: vi.fn(() => stub),
             push: vi.fn(() => ({ sendToAllDevices: vi.fn() })),
@@ -242,6 +242,30 @@ describe('automatic continuation after a capacity failure', () => {
         expect(stub.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', optIn === '1');
         const start = protocolMessages.find(event => event.ev.t === 'turn-start')!;
         expect('inputEvidence' in start.ev).toBe(optIn === '1');
+    }, 60_000);
+
+    it.each(['0', '1'])('T2RT-26 captures Codex %s before startup environment changes', async initial => {
+        vi.stubEnv('HAPPY_INPUT_EVIDENCE', initial);
+        script = [{ outcome: 'ok', after: closeQueue }];
+        const stub = await run(async () => { queues[0]!.push('hello', { permissionMode: 'default' } as never); },
+            () => { process.env.HAPPY_INPUT_EVIDENCE = initial === '1' ? '0' : '1'; });
+        expect(stub.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', initial === '1');
+        expect((getOrCreateSession.mock.calls[0] as any)[0].metadata.inputEvidenceEnabled).toBe(initial === '1' ? true : undefined);
+    }, 60_000);
+
+    it.each([undefined, '0'])('T2RT-26 restores Codex session opt-in with override %s', async override => {
+        vi.stubEnv('HAPPY_INPUT_EVIDENCE', override);
+        vi.stubEnv('HAPPY_RECONNECT_SESSION_ID', 'sess-1');
+        vi.stubEnv('HAPPY_RECONNECT_ENCRYPTION_KEY', Buffer.alloc(32).toString('base64'));
+        vi.stubEnv('HAPPY_RECONNECT_ENCRYPTION_VARIANT', 'legacy');
+        vi.stubEnv('HAPPY_RECONNECT_SEQ', '0');
+        vi.stubEnv('HAPPY_RECONNECT_METADATA_VERSION', '1');
+        vi.stubEnv('HAPPY_RECONNECT_AGENT_STATE_VERSION', '1');
+        vi.stubEnv('HAPPY_RECONNECT_SNAPSHOT', Buffer.from(JSON.stringify({ metadata: { path: '/workspace/project',
+            codexThreadId: 'thread-1', inputEvidenceEnabled: true }, seq: 0, metadataVersion: 1, agentStateVersion: 1 })).toString('base64'));
+        script = [{ outcome: 'ok', after: closeQueue }];
+        const stub = await run(async () => { queues[0]!.push('hello', { permissionMode: 'default' } as never); });
+        expect(stub.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', override !== '0');
     }, 60_000);
 
     it('T2RT-06 settles the original retry when the actual stdin.write throws after claim', async () => {

@@ -1,4 +1,4 @@
-/** T2RT-16..24: replay real source revisions, not a second hand-written mapper. */
+/** T2RT-16..27: replay real source revisions, not a second hand-written mapper. */
 import { expect, it } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -39,20 +39,20 @@ it.each([false, true])('preserves merge-base turns/consumers with evidence opt-i
         const load = async (source: string): Promise<any[]> => (await readFile(join(directory, `${source}.jsonl`), 'utf8'))
             .trim().split('\n').map(line => JSON.parse(line));
         const baseline = await load('base'), head = await load('head');
-        expect(baseline).toHaveLength(32);
+        expect(baseline).toHaveLength(58);
         expect(head).toHaveLength(baseline.length);
         for (const original of baseline) {
             const actual = head.find(record => record.name === original.name);
             expect.soft(actual, original.name).toBeDefined();
             for (const field of ['turns', 'routing', 'reports', 'reportsBeforeCancel', 'followup', 'ready', 'outboxTurns', 'prompts',
-                ...(!enabled ? ['wire'] : [])]) {
+                ...(!enabled ? ['wire', 'metadata'] : [])]) {
                 expect.soft(actual?.[field], `${original.name}: ${field}`).toEqual(original[field]);
             }
             for (const revision of actual?.evidence ?? []) {
                 expect.soft(revision.inputEvidence).toMatchObject({ coverage: 'incomplete', inputs: [], inputCount: 0, terminal: true });
                 expect.soft(revision.inputEvidence.incompleteReasons).toContain('unmapped-final-answer');
             }
-            if (enabled && original.name.endsWith('-true') && !['codex-', 'evidence-automation-', 'account-'].some(prefix => original.name.startsWith(prefix))) {
+            if (enabled && original.name.endsWith('-true') && ['T16-', 'T17-19-', 'T18-', 'outbox-'].some(prefix => original.name.startsWith(prefix))) {
                 expect.soft(actual.evidence.length, original.name).toBeGreaterThan(0);
             }
             if (enabled && original.name.startsWith('account-') && original.name.endsWith('-true')) {
@@ -71,6 +71,13 @@ it.each([false, true])('preserves merge-base turns/consumers with evidence opt-i
                 }
             }
             if (!enabled) expect.soft(actual.evidence ?? [], original.name).toEqual([]);
+            if (enabled && original.name.startsWith('full-') && original.name.endsWith('-true')) {
+                expect.soft(actual.metadata.runtimeCapabilities?.agentContact?.guardedPrompt, original.name).toBe(1);
+                if (original.name === 'full-codex-ordinary-true') expect.soft(actual.finals).toHaveLength(1);
+                if (original.name === 'full-plan-empty-true') expect.soft(actual.wire.map((event: any) => event.ev.t)).toEqual(['plan']);
+                if (original.name === 'full-guards-true') expect.soft(actual.wire.map((event: any) => event.ev.state))
+                    .toEqual(['accepted', 'rejected', 'rejected', 'rejected']);
+            }
             for (const final of actual?.finals ?? []) {
                 for (const revision of actual.evidence) {
                     expect.soft(final.turn, original.name).not.toBe(revision.inputEvidence.turnId);
@@ -89,7 +96,7 @@ it.each([false, true])('preserves merge-base turns/consumers with evidence opt-i
         for (const result of baseline.filter(record => record.name.startsWith('T18-'))) {
             expect(result.turns).toEqual([]); expect(result.reports).toEqual([]); expect(result.ready).toBe(1);
         }
-        console.info(`32 scenarios replayed on 9ee84191 and HEAD, opt-in=${enabled}; 64 source replays. Main follow-up controls:`,
+        console.info(`58 scenarios replayed on 9ee84191 and HEAD, opt-in=${enabled}; 116 source replays. Main follow-up controls:`,
             baseline.filter(record => record.name.startsWith('T17-19-') && record.name.endsWith('-true'))
                 .map(record => ({ name: record.name, ...record.followup })));
         if (process.env.T2RT_PARITY_EXPORT) await writeFile(`${process.env.T2RT_PARITY_EXPORT}.${enabled ? 'on' : 'off'}.json`, JSON.stringify({ baseline, head }));

@@ -8,7 +8,7 @@ import { createTurnCardSwitch } from './utils/turnCardTools';
 import { randomUUID } from 'node:crypto';
 
 import { ApiClient } from '@/api/api';
-import { isInputEvidenceEnabled } from '@/api/turnInputEvidence';
+import { consumeInputEvidenceOption, inputEvidenceMetadata, resolveInputEvidenceOption } from '@/utils/inputEvidenceSettings';
 import { logger } from '@/ui/logger';
 import { loop } from '@/claude/loop';
 import { AgentGoalStatus, AgentState } from '@/api/types';
@@ -216,6 +216,7 @@ export type RunnerPrincipal =
     | { kind: 'managed'; startup: ManagedStartup };
 
 export async function runClaude(principal: RunnerPrincipal, options: StartOptions = {}): Promise<void> {
+    const inputEvidenceOption = consumeInputEvidenceOption(process.env);
     await initializeScopeReportSigner();
     const scopeLaunch = takeScopeLaunchBootstrap();
     const scopeConfirmation = takeScopeConfirmation();
@@ -365,7 +366,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // otherwise pass CAS while deleting the existing summary/title.
     const reconnectSession = consumeReconnectSessionEnvironment(process.env);
     const reconnectSessionId = reconnectSession?.id;
-    const metadata = mergeReconnectSessionMetadata(reconnectSession?.metadata, freshMetadata);
+    const inputEvidenceEnabled = resolveInputEvidenceOption(inputEvidenceOption, reconnectSession?.metadata);
+    const metadata = inputEvidenceMetadata(mergeReconnectSessionMetadata(reconnectSession?.metadata, freshMetadata), inputEvidenceEnabled);
     const allowAutomationReconnectPrompt = process.env.HAPPY_AUTOMATION_RESUME_PROMPT === '1';
     delete process.env.HAPPY_AUTOMATION_RESUME_PROMPT;
     const preparedInitialPrompt = prepareClaudeInitialPrompt({
@@ -890,7 +892,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         disallowedTools: mode.disallowedTools,
         effort: mode.effort,
     }));
-    session.configureInputQueue(messageQueue, options.startingMode === 'remote' ? 'remote' : 'local', isInputEvidenceEnabled());
+    session.configureInputQueue(messageQueue, options.startingMode === 'remote' ? 'remote' : 'local', inputEvidenceEnabled);
     if (launchControl) {
         // Only the launch-bound local channel can drain this runtime; never a session RPC.
         const gate = new RuntimeProducerGate({

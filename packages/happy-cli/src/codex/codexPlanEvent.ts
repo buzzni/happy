@@ -17,7 +17,7 @@ const STATUS: Record<string, PlanStep['status']> = {
     completed: 'completed',
 };
 
-export function codexPlanEvent(msg: Record<string, unknown>): Extract<SessionEvent, { t: 'plan' }> | null {
+export function codexPlanEvent(msg: Record<string, unknown>, inputEvidence = false): Extract<SessionEvent, { t: 'plan' }> | null {
     if (!Array.isArray(msg.plan)) return null;
     const steps: PlanStep[] = [];
     for (const raw of msg.plan as Array<{ step?: unknown; status?: unknown } | null>) {
@@ -27,5 +27,5 @@ export function codexPlanEvent(msg: Record<string, unknown>): Extract<SessionEve
         steps.push({ text: step.slice(0, PLAN_LIMITS.text), status });
         if (steps.length === PLAN_LIMITS.steps) break;
     }
-    return steps.length > 0 || msg.plan.length === 0 ? { t: 'plan', steps } : null;
+    return steps.length > 0 || (inputEvidence && msg.plan.length === 0) ? { t: 'plan', steps } : null;
 }

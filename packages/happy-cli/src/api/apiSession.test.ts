@@ -333,7 +333,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
             client.sendFinalAnswerForChannelTurn('unmapped after completed A');
             const guard = { v: 1, targetSessionId: client.sessionId, expectedRuntimeId: client.runtimeId,
                 expectedMode: 'remote', expectedModeEpoch: client.inputGate.modeEpoch };
-            expect(client.admitInput({ ref: { kind: 'rest', serverMessageId: 'accepted', serverSeq: 2 }, guard }, true)).toBe(true);
+            expect(client.admitInput({ ref: { kind: 'rest', serverMessageId: 'accepted', serverSeq: 2 }, guard }, true)).toBe(supported);
             expect(client.admitInput({ ref: { kind: 'rest', serverMessageId: 'rejected', serverSeq: 3 }, guard: { ...guard, v: 2 } })).toBe(false);
             expect(events.map(event => event.ev.t)).toEqual(supported
                 ? ['turn-input-evidence', 'turn-input-evidence', 'turn-input-evidence', 'hub-input-admission', 'hub-input-admission'] : []);
@@ -390,9 +390,56 @@ describe('ApiSessionClient v3 messages API migration', () => {
         let metadata = session.metadata!;
         vi.spyOn(client, 'updateMetadata').mockImplementation(update => { metadata = update(metadata); });
         client.configureInputQueue(new MessageQueue2<string>(mode => mode), example.mode, example.supported);
+        if (!example.supported) {
+            expect(metadata).toEqual(session.metadata);
+            expect(metadata.runtimeCapabilities?.agentContact).toBeUndefined();
+            await client.close();
+            return;
+        }
         expect(metadata.runtimeCapabilities?.agentContact).toMatchObject({ v: 1, runtimeId: client.runtimeId,
             principal: example.managed ? 'managed' : 'account', prompt: example.prompt, inputEvidence: example.evidence,
             guardedPrompt: 1, mode: example.mode, modeEpoch: client.inputGate.modeEpoch });
+        await client.close();
+    });
+
+    it.each([false, true])('T2RT-27 advertises guards only with admission receipts (evidence=%s)', async enabled => {
+        const client = new ApiSessionClient('fake-token', session);
+        let metadata = session.metadata!;
+        vi.spyOn(client, 'updateMetadata').mockImplementation(update => { metadata = update(metadata); });
+        const queue = new MessageQueue2<string>(mode => mode);
+        client.configureInputQueue(queue, 'remote', enabled);
+        const events: SessionEnvelope[] = [];
+        vi.spyOn(client as any, 'enqueueMessage').mockImplementation((value: any) => { if (value.role === 'session') events.push(value.content); });
+        const guard = { v: 1, targetSessionId: client.sessionId, expectedRuntimeId: client.runtimeId,
+            expectedMode: 'remote', expectedModeEpoch: client.inputGate.modeEpoch };
+        const input = (id: string, value: unknown) => ({ ref: { kind: 'rest' as const, serverMessageId: id, serverSeq: 1 }, guard: value });
+        try {
+            expect(metadata.runtimeCapabilities?.agentContact?.guardedPrompt).toBe(enabled ? 1 : undefined);
+            expect(client.admitInput(input('accepted', guard), true)).toBe(enabled);
+            expect(client.admitInput(input('malformed', null), true)).toBe(false);
+            expect(client.admitInput(input('stale', { ...guard, expectedModeEpoch: -1 }), true)).toBe(false);
+            queue.push('guarded waiting input', 'mode', undefined, undefined, undefined, undefined, input('queued', guard));
+            client.setInputMode('local');
+            expect(queue.size()).toBe(0);
+            expect(client.admitInput(input('changed', guard), true)).toBe(false);
+            if (enabled) expect(events.map(event => event.ev)).toEqual(expect.arrayContaining([
+                expect.objectContaining({ t: 'hub-input-admission', state: 'accepted', serverMessageId: 'accepted' }),
+                expect.objectContaining({ t: 'hub-input-admission', state: 'rejected', serverMessageId: 'malformed' }),
+                expect.objectContaining({ t: 'hub-input-admission', state: 'rejected', serverMessageId: 'queued', reason: 'mode-changed' }),
+            ]));
+            else { expect(events).toEqual([]); expect(metadata).toEqual(session.metadata); }
+        } finally { await client.close(); }
+    });
+
+    it('T2RT-27 removes an earlier T2rt contact advertisement when the session is disabled', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        let metadata = session.metadata!;
+        vi.spyOn(client, 'updateMetadata').mockImplementation(update => { metadata = update(metadata); });
+        const queue = new MessageQueue2<string>(mode => mode);
+        client.configureInputQueue(queue, 'remote', true);
+        expect(metadata.runtimeCapabilities?.agentContact?.guardedPrompt).toBe(1);
+        client.configureInputQueue(queue, 'remote', false);
+        expect(metadata.runtimeCapabilities?.agentContact).toBeUndefined();
         await client.close();
     });
 

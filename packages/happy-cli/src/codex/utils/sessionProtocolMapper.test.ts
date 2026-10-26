@@ -2,6 +2,16 @@ import { describe, expect, it } from 'vitest';
 import { mapCodexMcpMessageToSessionEnvelopes } from './sessionProtocolMapper';
 
 describe('channel request correlation on Codex turn boundaries', () => {
+    it.each([false, true])('T2RT-25 gates only the non-channel final candidate (evidence=%s)', enabled => {
+        for (const requestId of [null, 'channel-A']) {
+            for (const turn of [null, 'native-A']) {
+                const state = { currentTurnId: turn, currentRequestId: requestId };
+                const mapped = mapCodexMcpMessageToSessionEnvelopes({ type: 'agent_message', phase: 'final_answer', message: 'done' }, state, enabled);
+                expect(mapped.envelopes.map(event => event.ev.t)).toEqual(requestId || (enabled && turn) ? ['text', 'final-answer'] : ['text']);
+                expect(state).toEqual({ currentTurnId: turn, currentRequestId: requestId });
+            }
+        }
+    });
     // Saycode specs/desktop-messenger-channels. Same contract as the Claude mapper: the handle
     // rides the turn boundary, because that is what says which work a reply belongs to.
     it('stamps the pending request id on the turn it opens and repeats it on the end', () => {

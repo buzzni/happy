@@ -402,6 +402,7 @@ export class ApiSessionClient extends EventEmitter {
     readonly inputEvidence = new TurnInputEvidence(this.runtimeId, envelope => this.sendSessionProtocolMessage(envelope));
     readonly inputGate: HubInputGate;
     private inputEvidenceSupported = false;
+    private inputContactAdvertised = false;
     private contactSteer = false;
     private invalidateGuardedInputs: (() => void) | null = null;
     private rejectedInputs = new Set<string>();
@@ -418,6 +419,20 @@ export class ApiSessionClient extends EventEmitter {
         this.inputGate.transition(mode);
         this.invalidateGuardedInputs?.();
         this.pendingMessages = this.pendingMessages.filter(message => this.admitInput(this.queueInput(message)));
+        if (!this.inputEvidenceSupported) {
+            // Fresh OFF sessions leave main's metadata untouched. Also withdraw an
+            // earlier host's T2rt advertisement rather than promising suppressed receipts.
+            if (this.inputContactAdvertised || this.metadata?.runtimeCapabilities?.agentContact) {
+                this.inputContactAdvertised = false;
+                this.updateMetadata(meta => {
+                    if (!meta.runtimeCapabilities?.agentContact) return meta;
+                    const { agentContact: _contact, ...capabilities } = meta.runtimeCapabilities;
+                    return { ...meta, runtimeCapabilities: capabilities };
+                });
+            }
+            return;
+        }
+        this.inputContactAdvertised = true;
         const agentContact: NonNullable<Metadata['runtimeCapabilities']>['agentContact'] = {
             v: 1, runtimeId: this.runtimeId, principal: this.managed ? 'managed' : 'account',
             prompt: !this.managed && mode === 'remote', steer: !this.managed && mode === 'remote' && this.contactSteer,
@@ -436,6 +451,7 @@ export class ApiSessionClient extends EventEmitter {
     admitInput(input: QueueInputEvidence, publishAccepted = false): boolean {
         if (input.continuation && !this.inputEvidence.isContinuationCurrent(input.continuation)) return false;
         if (input.guard === undefined) return true;
+        if (!this.inputEvidenceSupported) return false;
         const admission = this.inputGate.check(input);
         if (!admission) return false;
         if (admission.state === 'rejected') {
