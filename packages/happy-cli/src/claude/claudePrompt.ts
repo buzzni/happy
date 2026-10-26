@@ -42,7 +42,7 @@ export function buildClaudeSystemPromptOptions({
   /** Turn-card guidance (common:next-steps); only on a turn whose client draws the card. */
   nextStepsPrompt?: string;
   saycodeSystemPromptEnabled?: boolean;
-  /** Per-block overrides; default-on blocks do not inherit saycodeSystemPromptEnabled. */
+  /** Per-block overrides; only `nextSteps` is read, every other block follows saycodeSystemPromptEnabled. */
   saycodePromptBlocks?: SaycodePromptBlockOverrides;
 }): { customSystemPrompt?: string; appendSystemPrompt?: string } {
   const isCoAuthoredCreditEnabled = isSaycodePromptBlockEnabled(
@@ -54,9 +54,10 @@ export function buildClaudeSystemPromptOptions({
   const isAgentOrchestrationEnabled = isSaycodePromptBlockEnabled(
     'agentOrchestration', saycodePromptBlocks, saycodeSystemPromptEnabled,
   );
+  const isSaycodeEnabled = saycodeSystemPromptEnabled !== false;
   return {
     customSystemPrompt: customSystemPrompt
-      ? joinPromptBlocks([customSystemPrompt, chatTitlePrompt, isCoAuthoredCreditEnabled ? saycodeSystemPrompt : undefined, checkpointGuidance])
+      ? joinPromptBlocks([customSystemPrompt, chatTitlePrompt, isCoAuthoredCreditEnabled ? saycodeSystemPrompt : undefined, isSaycodeEnabled ? checkpointGuidance : undefined])
       : undefined,
     appendSystemPrompt: joinPromptBlocks([
       appendSystemPrompt,
@@ -65,9 +66,9 @@ export function buildClaudeSystemPromptOptions({
       isAgentOrchestrationEnabled ? agentOrchestrationPrompt : undefined,
       orchestratorPrompt,
       isWorkerDelegationEnabled ? workerDelegationPrompt : undefined,
-      connectorGuidance,
-      checkpointGuidance,
-      saycodeSystemPromptEnabled !== false ? SAYCODE_API_GATEWAY_PROMPT : undefined,
+      isSaycodeEnabled ? connectorGuidance : undefined,
+      isSaycodeEnabled ? checkpointGuidance : undefined,
+      isSaycodeEnabled ? SAYCODE_API_GATEWAY_PROMPT : undefined,
       isSaycodePromptBlockEnabled('nextSteps', saycodePromptBlocks, saycodeSystemPromptEnabled) ? nextStepsPrompt : undefined,
     ]),
   };

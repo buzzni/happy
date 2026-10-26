@@ -302,7 +302,8 @@ describe('claudeLocal --continue handling', () => {
         expect(spawnArgs).toContain('-r');
     });
 
-    it('keeps default-on child-session routing when the current policy is disabled', async () => {
+    // aplus-dev-studio specs/saycode-security-hardening D1 — off leaves only the title instruction.
+    it('keeps only the title instruction when the current policy is disabled', async () => {
         await claudeLocal({
             abort: new AbortController().signal,
             sessionId: null,
@@ -318,7 +319,7 @@ describe('claudeLocal --continue handling', () => {
         expect(promptArgs).toContain('test-title-prompt');
         expect(promptArgs).not.toContain('test-saycode-owned-prompt');
         expect(promptArgs).not.toContain('<saycode-api-gateway>');
-        expect(promptArgs).toContain('test-agent-orchestration-prompt');
+        expect(promptArgs).not.toContain('test-agent-orchestration-prompt');
     });
 
     it('keeps appending the Saycode-owned prompt alongside the title instruction when no policy is provided', async () => {
@@ -338,25 +339,7 @@ describe('claudeLocal --continue handling', () => {
         expect(promptArgs.match(/<saycode-api-gateway>/g)).toHaveLength(1);
     });
 
-    it('honors a per-block override that turns the Saycode-owned prompt off while the master value is on', async () => {
-        await claudeLocal({
-            abort: new AbortController().signal,
-            sessionId: null,
-            path: '/tmp',
-            onSessionFound,
-            claudeArgs: [],
-            saycodeSystemPromptEnabled: true,
-            saycodePromptBlocks: { coAuthoredCredit: false },
-        });
-
-        const spawnArgs = mockSpawn.mock.calls[0][1];
-        const promptArgs = spawnArgs.join('\n');
-        expect(promptArgs).toContain('test-title-prompt');
-        expect(promptArgs).not.toContain('test-saycode-owned-prompt');
-        expect(promptArgs).toContain('test-agent-orchestration-prompt');
-    });
-
-    it('honors a per-block override that turns the Saycode-owned prompt on while the master value is off', async () => {
+    it('ignores per-block overrides an older client still sends', async () => {
         await claudeLocal({
             abort: new AbortController().signal,
             sessionId: null,
@@ -364,16 +347,8 @@ describe('claudeLocal --continue handling', () => {
             onSessionFound,
             claudeArgs: [],
             saycodeSystemPromptEnabled: false,
-            saycodePromptBlocks: { coAuthoredCredit: true },
+            saycodePromptBlocks: { coAuthoredCredit: true, agentOrchestration: true },
         });
-
-        const spawnArgs = mockSpawn.mock.calls[0][1];
-        const promptArgs = spawnArgs.join('\n');
-        expect(promptArgs).toContain('test-title-prompt\n\ntest-saycode-owned-prompt');
-        expect(promptArgs).toContain('test-agent-orchestration-prompt');
-    });
-
-    it('drops child-session routing only when its block is explicitly disabled', async () => {
         await claudeLocal({
             abort: new AbortController().signal,
             sessionId: null,
@@ -381,12 +356,14 @@ describe('claudeLocal --continue handling', () => {
             onSessionFound,
             claudeArgs: [],
             saycodeSystemPromptEnabled: true,
-            saycodePromptBlocks: { agentOrchestration: false },
+            saycodePromptBlocks: { coAuthoredCredit: false, agentOrchestration: false },
         });
 
-        const promptArgs = mockSpawn.mock.calls[0][1].join('\n');
-        expect(promptArgs).toContain('test-title-prompt');
-        expect(promptArgs).not.toContain('test-agent-orchestration-prompt');
+        const off = mockSpawn.mock.calls[0][1].join('\n');
+        expect(off).not.toContain('test-saycode-owned-prompt');
+        expect(off).not.toContain('test-agent-orchestration-prompt');
+        const on = mockSpawn.mock.calls[1][1].join('\n');
+        expect(on).toContain('test-title-prompt\n\ntest-saycode-owned-prompt\n\ntest-agent-orchestration-prompt');
     });
 
     it('should initialize sandbox, wrap command, and cleanup on exit', async () => {

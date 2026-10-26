@@ -27,18 +27,24 @@ export const PROMPT_BLOCK_PROVENANCE = {
   'claude:co-authored-credit': 'saycode',
   'claude:orchestrator': 'selected-feature',
   'claude:worker-delegation': 'saycode',
-  'claude:connector-guidance': 'operational',
+  'claude:connector-guidance': 'saycode',
   'claude:ax-base': 'saycode',
   'claude:ax-step-guide': 'selected-feature',
   'claude:ax-dynamic-context': 'selected-feature',
   'codex:title': 'always-on',
-  'codex:connector-guidance': 'operational',
+  'codex:connector-guidance': 'saycode',
+  'common:checkpoint-guidance': 'saycode',
   'gemini:title': 'always-on',
   'client:append-system-prompt': 'client-composed',
 } as const satisfies Record<string, PromptProvenance>;
 
 /** Saycode-owned blocks controlled only by the existing master prompt switch. */
-export const SAYCODE_MASTER_PROMPT_PROVENANCE_IDS = ['common:api-gateway'] as const satisfies readonly PromptBlockId[];
+export const SAYCODE_MASTER_PROMPT_PROVENANCE_IDS = [
+  'common:api-gateway',
+  'claude:connector-guidance',
+  'codex:connector-guidance',
+  'common:checkpoint-guidance',
+] as const satisfies readonly PromptBlockId[];
 
 export type PromptBlockId = keyof typeof PROMPT_BLOCK_PROVENANCE;
 
@@ -91,7 +97,8 @@ export function splitClientTurnPromptBlocks(prompt: string | undefined): { stand
 }
 
 /**
- * Individually toggleable Saycode-owned prompt blocks. Provider title blocks
+ * Saycode-owned prompt block names on the wire. Only `nextSteps` still changes
+ * rendering; the others follow the master switch. Provider title blocks
  * are deliberately excluded — they are `always-on` (see
  * PROMPT_BLOCK_PROVENANCE) and never represented as a preference here.
  */
@@ -121,12 +128,11 @@ export const SAYCODE_PROMPT_BLOCK_PROVENANCE_IDS = {
 } as const satisfies Record<SaycodePromptBlockName, PromptBlockId>;
 
 /**
- * Resolves whether one Saycode-owned block should render, given an optional
- * per-block override and the legacy on/off value. A per-block override always
- * wins. Delegation blocks are product capabilities and default on independently
- * from the master switch; the remaining blocks inherit the legacy value.
- * Missing legacy value defaults to enabled, matching the existing wire
- * compatibility rule for older clients/runtimes.
+ * Resolves whether one Saycode-owned block should render. Saycode prompts are
+ * all on or all off (aplus-dev-studio specs/saycode-security-hardening D1):
+ * only the master value decides, and per-block overrides an older client still
+ * sends are ignored. Missing master value defaults to enabled, matching the
+ * existing wire compatibility rule for older clients/runtimes.
  */
 export function isSaycodePromptBlockEnabled(
   blockName: SaycodePromptBlockName,
@@ -137,8 +143,6 @@ export function isSaycodePromptBlockEnabled(
   // A client capability, not a preference: on only when this turn's client said it
   // draws the card, and still under the master switch (specs/desktop-next-steps-card).
   if (blockName === 'nextSteps') return override === true && saycodeSystemPromptEnabled !== false;
-  if (override !== undefined) return override;
-  if (blockName === 'agentOrchestration' || blockName === 'workerDelegation') return true;
   return saycodeSystemPromptEnabled !== false;
 }
 

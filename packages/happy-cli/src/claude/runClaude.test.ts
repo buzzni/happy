@@ -848,15 +848,14 @@ describe('runClaude remote JSONL scanner', () => {
 
         const harness = await startRemoteRunClaudeHarness();
 
-        expect(harness.loopOptions.messageQueue.queue[0].mode.appendSystemPrompt).toBe('USER PROJECT CONTEXT');
+        expect(harness.loopOptions.messageQueue.queue[0].mode.appendSystemPrompt).toContain('SAYCODE AX BASE');
 
         await harness.finish();
     });
 
-    it('strips a recovered AX base when only its block is seeded off', async () => {
-        // The per-turn path already honors the block gate; the recovery seed path
-        // must apply the same rule or a master-on/axBase-off account's recovered
-        // first turn re-injects the base the user turned off.
+    // aplus-dev-studio specs/saycode-security-hardening D1 — only the master decides; a seeded
+    // per-block override from an older client no longer strips the base on its own.
+    it('keeps a recovered AX base under master on even when only its block is seeded off', async () => {
         process.env.HAPPY_INITIAL_PROMPT = '복구 후 이어서 작업해줘';
         process.env.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED = 'true';
         process.env.HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS = '{"axBase":false}';
@@ -870,7 +869,7 @@ describe('runClaude remote JSONL scanner', () => {
 
         const harness = await startRemoteRunClaudeHarness();
 
-        expect(harness.loopOptions.messageQueue.queue[0].mode.appendSystemPrompt).toBe('USER PROJECT CONTEXT');
+        expect(harness.loopOptions.messageQueue.queue[0].mode.appendSystemPrompt).toContain('SAYCODE AX BASE');
 
         await harness.finish();
     });
@@ -2151,11 +2150,8 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
-    it('removes a stale AX Saycode base when only the axBase block is turned off', async () => {
-        // applyAxOrchestration's own merge strips the stale base, but it returns null on a
-        // non-AX / unavailable workspace — then this path is the only cleanup. Gating it on
-        // the master boolean alone leaves the base injected forever for a user who turned
-        // just this block off.
+    // aplus-dev-studio specs/saycode-security-hardening D1 — the axBase override alone no longer removes it.
+    it('keeps the AX Saycode base under master on even when an older client turns only its block off', async () => {
         const orchestration = vi.spyOn(axIntegration, 'applyAxOrchestration').mockResolvedValue(null);
         const harness = await startRemoteRunClaudeHarness();
         harness.sessionClient.hasTitle.mockReturnValue(true);
@@ -2165,7 +2161,7 @@ describe('runClaude remote JSONL scanner', () => {
         const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
 
         await userMessageHandler({
-            content: { text: 'continue without the AX base' },
+            content: { text: 'continue with the AX base' },
             meta: {
                 saycodeSystemPromptEnabled: true,
                 saycodePromptBlocks: { axBase: false },
@@ -2181,7 +2177,8 @@ describe('runClaude remote JSONL scanner', () => {
 
         const queued = harness.loopOptions.messageQueue.queue;
         expect(queued).toHaveLength(1);
-        expect(queued[0].mode.appendSystemPrompt).toBe('CUSTOM USER PROMPT');
+        expect(queued[0].mode.appendSystemPrompt).toContain('You are the Saycode AI assistant.');
+        expect(queued[0].mode.appendSystemPrompt).toContain('CUSTOM USER PROMPT');
         orchestration.mockRestore();
         await harness.finish();
     });

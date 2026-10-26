@@ -66,7 +66,7 @@ export function buildCodexDeveloperInstructions({
     nextStepsPrompt?: string;
     mode: Pick<CodexEnhancedMode, 'appendSystemPrompt' | 'saycodeSystemPromptEnabled' | 'saycodePromptBlocks'>;
 }): string | undefined {
-    const blocks = [connectorGuidance, checkpointGuidance];
+    const blocks = mode.saycodeSystemPromptEnabled !== false ? [connectorGuidance, checkpointGuidance] : [];
     if (isSaycodePromptBlockEnabled(
         'agentOrchestration',
         mode.saycodePromptBlocks,

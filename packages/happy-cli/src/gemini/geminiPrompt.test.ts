@@ -66,7 +66,7 @@ describe('buildGeminiTurnPrompt', () => {
     })).toBe(`CLIENT APPEND\n\n${SAYCODE_API_GATEWAY_PROMPT}\n\nresume`);
   });
 
-  it('keeps child-session orchestration on when the master is off unless its block is explicitly off', () => {
+  it('drops child-session orchestration with the master, whatever an older client overrides', () => {
     const base = {
       userText: 'delegate this',
       agentOrchestrationPrompt: 'AGENT ORCHESTRATION: happy agent spawn',
@@ -75,11 +75,16 @@ describe('buildGeminiTurnPrompt', () => {
       hasTitle: true,
     };
 
-    expect(buildGeminiTurnPrompt(base)).toContain('happy agent spawn');
+    expect(buildGeminiTurnPrompt(base)).not.toContain('happy agent spawn');
     expect(buildGeminiTurnPrompt({
       ...base,
-      saycodePromptBlocks: { agentOrchestration: false },
+      saycodePromptBlocks: { agentOrchestration: true },
     })).not.toContain('happy agent spawn');
+    expect(buildGeminiTurnPrompt({
+      ...base,
+      saycodeSystemPromptEnabled: true,
+      saycodePromptBlocks: { agentOrchestration: false },
+    })).toContain('happy agent spawn');
   });
 
   it('places prior conversation between client context and the current user turn', () => {
@@ -122,9 +127,9 @@ describe('hashGeminiMode', () => {
       .toBe(hashGeminiMode({ ...base, appendSystemPrompt: 'A', saycodeSystemPromptEnabled: true }));
   });
 
-  it('restarts the ACP session when child orchestration is explicitly toggled', () => {
+  it('does not restart for an orchestration override an older client sends', () => {
     expect(hashGeminiMode({ ...base, saycodePromptBlocks: { agentOrchestration: true } }))
-      .not.toBe(hashGeminiMode({ ...base, saycodePromptBlocks: { agentOrchestration: false } }));
+      .toBe(hashGeminiMode({ ...base, saycodePromptBlocks: { agentOrchestration: false } }));
   });
 
   it('does not restart for an explicit value equal to the default-on orchestration policy', () => {
