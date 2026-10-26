@@ -12,6 +12,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ExecSyncOptions } from 'node:child_process';
+import { logger } from '@/ui/logger';
 
 vi.mock('@/utils/broadKillShims', () => ({ installBroadKillShims: vi.fn() }));
 
@@ -30,6 +31,7 @@ vi.mock('@/ui/logger', () => ({
 }));
 vi.mock('@/daemon/controlClient', () => ({ notifyDaemonSessionStarted: vi.fn(async () => {}) }));
 vi.mock('@/daemon/run', () => ({ initialMachineMetadata: {} }));
+vi.mock('@/memory/codexRecallHost', () => ({ prepareCodexRecallHost: vi.fn(async () => null) }));
 vi.mock('@/persistence', async (importOriginal) => ({
     ...await importOriginal<typeof import('@/persistence')>(),
     readSettings: vi.fn(async () => ({ machineId: 'machine-test' })),
@@ -64,18 +66,23 @@ vi.mock('@/codex/codexAppServerClient', () => ({
         setApprovalHandler = vi.fn();
         setUserInputHandler = vi.fn();
         supportsGoalActions = () => false;
+        get threadId() { return threadId; }
         hasActiveThread = () => threadId !== null;
         readThread = vi.fn(async () => ({ thread: { id: threadId ?? 'thread-x', turns: [] } }));
         async connect() { await onConnect?.(); }
-        async resumeThread() { clientLog.push('resumeThread'); return { id: threadId }; }
-        async startThread() { threadId = 'thread-after'; clientLog.push('startThread'); return { id: threadId }; }
+        async resumeThread() { clientLog.push('resumeThread'); return { threadId, model: 'test-model' }; }
+        async startThread() { threadId = 'thread-after'; clientLog.push('startThread'); return { threadId, model: 'test-model' }; }
         clearThreadState = vi.fn(() => { clientLog.push('clearThreadState'); threadId = null; });
-        async sendTurnAndWait(input: unknown) {
-            const text = typeof input === 'object' && input !== null && 'text' in input
-                ? String((input as { text: unknown }).text) : String(input);
-            turnsSent.push({ text });
-            clientLog.push('sendTurnAndWait');
-            return { ok: true };
+        async sendTurnAndWait(input: unknown, options?: { beforeDispatch?: () => void; onDispatched?: () => void; onCompletionObservationSettled?: () => void }) {
+            try {
+                options?.beforeDispatch?.();
+                options?.onDispatched?.();
+                const text = typeof input === 'object' && input !== null && 'text' in input
+                    ? String((input as { text: unknown }).text) : String(input);
+                turnsSent.push({ text });
+                clientLog.push('sendTurnAndWait');
+                return { ok: true };
+            } finally { options?.onCompletionObservationSettled?.(); }
         }
         abortPreparedTurn = vi.fn();
         abortTurnWithFallback = vi.fn(async () => {});
@@ -99,7 +106,7 @@ function sessionStub() {
     return {
         configureInputQueue: vi.fn(), setInputSteerAvailable: vi.fn(), setPendingInputEvidence: vi.fn(),
         queueInput: vi.fn(() => ({ ref: { kind: 'unidentified', runtimeInputId: 'test-input' } })),
-        inputEvidence: { attempt: vi.fn(() => ({ settle: vi.fn() })), cancelContinuation: vi.fn(), continuePending: vi.fn(), takeContinuation: vi.fn() },
+        inputEvidence: { attempt: vi.fn(() => ({ settle: vi.fn() })), commitPending: vi.fn(() => true), cancelPendingDispatch: vi.fn(), cancelContinuation: vi.fn(), continuePending: vi.fn(), takeContinuation: vi.fn() },
         sessionId: 'sess-1',
         runtimeId: 'runtime-test',
         awaitMessageAck: vi.fn(async () => ({ ok: true })),
@@ -150,6 +157,7 @@ describe('the real Codex consumer loop', () => {
         queues.length = 0; clientLog.length = 0; protocolMessages.length = 0; sessionEvents.length = 0;
         turnsSent = []; rpc.clear(); threadId = 'thread-before'; onConnect = null;
         sessionMetadata = { path: '/workspace/project', codexThreadId: 'thread-before' };
+        vi.mocked(logger.warn).mockClear();
         for (const key of Object.keys(process.env)) {
             if (key.startsWith('HAPPY_RECONNECT_') || key.startsWith('HAPPY_FORK')
                 || key.startsWith('HAPPY_INITIAL_') || key.startsWith('HAPPY_CREATED_BY')) delete process.env[key];
@@ -179,6 +187,8 @@ describe('the real Codex consumer loop', () => {
             createSpy.mockRestore();
             cwdSpy.mockRestore();
         }
+        expect(vi.mocked(logger.warn).mock.calls.filter(([message]) => message === 'Error in codex session:')
+            .map(([, error]) => error instanceof Error ? error.stack : error)).toEqual([]);
         return { stub };
     }
 

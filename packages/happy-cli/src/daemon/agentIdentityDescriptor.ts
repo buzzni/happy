@@ -5,6 +5,7 @@ import { z } from 'zod'
 
 const descriptorSchema = z.object({
   descriptorId: z.string().min(1), machineId: z.string().min(1), happyAccountId: z.string().min(1),
+  epoch: z.string().min(1),
   ownerSubject: z.object({ issuer: z.string().min(1), userId: z.string().min(1) }),
   registrationType: z.literal('personal'), accountKind: z.literal('personal'),
   registrationRevision: z.number().int().nonnegative(), observedAt: z.number().finite(), expiresAt: z.number().finite(),
@@ -22,8 +23,8 @@ export interface AgentIdentityDependencies {
   /** Daemon-owned runtime-home identity, never request env/metadata. */
   readState(): AgentIdentityState | null
   fetchDescriptor(state: AgentIdentityState): Promise<unknown>
-  /** Must verify issuer/audience/key/signature against registered server authority. */
-  verifyDescriptor(descriptor: AgentIdentityDescriptor, state: AgentIdentityState): Promise<boolean>
+  /** Must verify the unmodified fetched document's issuer/audience/key/signature against registered server authority. */
+  verifyDescriptor(descriptor: unknown, state: AgentIdentityState): Promise<boolean>
   /** Authenticated Happy ownership lookup; list visibility is not ownership. */
   targetAccount(targetSessionId: string, state: AgentIdentityState): Promise<string | null>
   now(): number
@@ -37,14 +38,15 @@ export function createAgentIdentityAuthority(deps?: AgentIdentityDependencies): 
       const current = deps.readState()
       if (!current?.machineId || !current.happyAccountId || !current.epoch) return unknown('identity-unknown')
       const state = { ...current }
-      const parsed = descriptorSchema.safeParse(await deps.fetchDescriptor(state))
+      const rawDescriptor = await deps.fetchDescriptor(state)
+      const parsed = descriptorSchema.safeParse(rawDescriptor)
       if (!parsed.success) return unknown('identity-unproven')
       const descriptor = parsed.data
       const valid = () => descriptor.machineId === state.machineId && descriptor.happyAccountId === state.happyAccountId
-        && descriptor.registrationRevision === state.registrationRevision && descriptor.observedAt <= deps.now()
+        && descriptor.epoch === state.epoch && descriptor.registrationRevision === state.registrationRevision && descriptor.observedAt <= deps.now()
         && descriptor.expiresAt > deps.now() && descriptor.expiresAt - descriptor.observedAt <= 60_000
         && descriptor.expiresAt > descriptor.observedAt
-      if (!valid() || !await deps.verifyDescriptor(descriptor, state)) return unknown('identity-unproven')
+      if (!valid() || !await deps.verifyDescriptor(rawDescriptor, state)) return unknown('identity-unproven')
       const account = await deps.targetAccount(targetSessionId, state)
       const latest = deps.readState()
       if (!latest || latest.epoch !== state.epoch || latest.machineId !== state.machineId
