@@ -55,13 +55,37 @@ does **not** establish compatibility for those generic readers.
 
 ### T2 hand-off: explicit consumer opt-in
 
-`HAPPY_INPUT_EVIDENCE=1` in the **session process's launch environment** is the
-single production opt-in for Claude/Codex input evidence. Unset, empty, `0`,
-`true` and every other value mean OFF. Both initial configuration and Codex
-replacement-session configuration use this contract. ACP remains unsupported.
+The per-session launch option is `environmentVariables.HAPPY_INPUT_EVIDENCE`
+in a daemon spawn/resume request: only the strings `"1"` (ON) and `"0"` (OFF)
+are admitted; invalid request values are rejected before spawn. An unrelated
+new session with no option is OFF. A direct CLI launch can supply the same env
+seed; only literal `1` enables it, with other supplied values failing closed.
+Daemon and new-session environment sanitization remove implicit inheritance,
+including a daemon auto-start/restart from an opted-in CLI process.
+
+Each runner consumes the explicit seed **once before startup awaits**, then
+resolves it against only its own reconnect snapshot. The captured boolean drives
+initial configuration, Codex replacement-session configuration, final candidates
+and empty plans; later changes to `process.env` cannot change it. The daemon
+captures the validated `0`/`1` alongside that session's existing resume state and
+restores it after restart. A resume request's explicit setting overrides its own
+saved value. ON also records `metadata.inputEvidenceEnabled=true` for same-session
+recovery when no tracked environment survives; explicit OFF removes that marker.
+Fresh OFF sessions add no setting metadata. ACP remains unsupported.
 The session host advertises `agentContact.inputEvidence=1` only when enabled
 and otherwise eligible under the existing account/remote-mode checks. The API
-publication gate suppresses all evidence/admission envelopes while OFF.
+publication gate suppresses all evidence/admission envelopes while OFF, and
+does not add `agentContact` at all: main's metadata remains unchanged. Stale
+T2rt contact advertisements are withdrawn on disablement. All guarded input is
+refused while OFF, including matching, malformed and stale guards; no guard is
+ever stripped to execute its prompt as unguarded input. No guard/admission
+contract is advertised in that mode. Unguarded input retains main's behavior.
+
+ON advertises `guardedPrompt:1` only together with enabled admission publication.
+Matching guards receive a server-message-ID-bound accepted receipt at admission;
+malformed/stale/mode-invalid guards receive rejected receipts. Mode changes
+invalidate queued guarded input and publish its rejection while ON. The existing
+principal, runtime, session ID and mode/epoch checks continue to apply.
 
 The **Desktop T2 launching integration** owns setting this value for a session
 whose readers support the new envelopes, after completing the hard prerequisite
@@ -91,9 +115,11 @@ locally for revalidation; only identifiers, counters and states enter evidence.
 Automation retains main's single-run arming/carry semantics and native retry
 flags. Evidence revisions cannot carry, abandon or settle automation runs.
 
-Only the independent Happy clone is edited. T1b's `daemon/sessionEnv.ts`,
-`daemon/run.ts`, `commands/sessionAgentBroker.ts` and T4o's ownership/export files
-are excluded. `sessionProtocol.ts` is T2rt-owned and already exported by the
+Only the independent Happy clone is edited. The user's T2RT-26 request now
+authorizes narrow option validation/capture in `daemon/sessionEnv.ts` and child
+env scrubbing; credential policy in that file is unchanged. `daemon/run.ts`,
+`commands/sessionAgentBroker.ts` and T4o's ownership/export files remain excluded.
+`sessionProtocol.ts` is T2rt-owned and already exported by the
 existing barrel, so no shared export/manifest/lockfile reservation is needed.
 
 ## Implementation sequence
@@ -1607,3 +1633,75 @@ asynchronously-handled-rejection warnings remain; no Unix-socket EPERM occurred.
 The routing parser/insertion/rearm/final helpers and native API runtime side-effect
 method remain byte-identical to `9ee84191`. `git diff --check` passed. No Desktop,
 server, wire schema, channel routing or native lifecycle ownership changed.
+
+## T2RT-25..27: full OFF compatibility and session-owned settings
+
+The first durable focused run on `2881f960` produced **15 failures / 301 passes**:
+non-channel/empty-plan publication, per-request option admission and inheritance,
+resume retention/override, daemon spawn scrubbing, capability advertisement and
+guard acceptance/receipt consistency. The reviewer's request/environment helpers
+also failed both original scope cases. These tests pass after the changes.
+
+- **T2RT-25:** the Codex mapper's default final-candidate predicate is main's
+  channel predicate. Only an opted-in session adds non-channel candidates with
+  a mapped turn. Channel candidates retain main behavior even with no current
+  turn, independently of opt-in. A new null-turn channel control first caught
+  an overly restrictive draft condition, then passed after preserving the exact
+  main predicate. Empty SDK plans are ignored while OFF and published as a clear
+  only while ON; nonempty plans keep main's behavior in both modes. The runner
+  supplies its captured session setting to both converters.
+- **T2RT-26:** `utils/inputEvidenceSettings.ts` owns validation/capture, shared
+  by spawn handling and runners. Request `0`/`1` values are explicitly admitted
+  after environment scrubbing; unsupported request values fail before spawn.
+  Implicit inheritance is removed at daemon/new-session boundaries, including
+  both actual `daemon start` and `start-sync` spawn paths. The existing captured
+  session environment, persistence hydration and resume builder retain the
+  owner's value, with explicit resume overrides. Runner startup consumes the
+  seed before awaits, recovers only from its own metadata when needed, and uses
+  the captured boolean after auth/env changes and session replacements. OFF
+  fresh metadata remains unchanged; ON records a boolean recovery marker.
+- **T2RT-27:** OFF publishes no T2rt contact advertisement and withdraws stale
+  ones. Guarded inputs are refused in that mode, never run after removing their
+  guards. ON advertises the guard contract only with admission publication.
+  Acceptance tests cover matching/malformed/stale guards, queued mode-change
+  invalidation, durable accepted/rejected server-ID receipts, and OFF's unchanged
+  metadata/no receipts. Unguarded main input remains supported.
+
+The paired source orchestrator now covers **58 scenarios per mode**, all against
+actual `9ee84191` and HEAD sources. It retains all 32 prior scenarios and adds 26
+ordinary Codex/channel output, empty/nonempty plans, ordinary Claude/channel
+output, permission/question, steer, Codex/Claude retry, metadata-mode-transition
+and guard/admission cases in both capability states. OFF compares every
+session-protocol envelope **and the whole metadata document**, with exact native
+wire IDs, turn IDs, payloads, order and count. The fixture fixes the clock in
+both sources; independently generated transcript UUIDs retain the existing
+bijective canonicalization. ON retains native-turn/consumer parity and asserts
+the added candidates, empty plans, capabilities, admissions and evidence.
+
+Verification:
+
+- **58/58 OFF and 58/58 ON**, **232 source replays**. The external reviewer's
+  five fresh OFF full-wire captures also equal their merge-base captures,
+  including both Codex/channel and plan controls; neither OFF contact metadata
+  nor admission envelopes are added. Both reviewer environment cases now pass.
+- Standard related CLI selection: **52 files / 1481 tests passed**, including
+  source parity, API/evidence, all launcher/personal-fallback controls except the
+  separately run `runClaude` file, unchanged merge-base routing compatibility,
+  Codex, daemon resume/env/persistence hydration, actual daemon spawn, child-env
+  wiring and managed startup.
+- The separate 71-case `runClaude` file ran twice: each run passed 69 cases and
+  hit two different existing one-second harness-start waits. All four affected
+  controls passed when run by name (**4/4**); all new capture/recovery cases
+  passed in both runs. Its wait settings are unchanged. This records the flaky
+  full-file result rather than claiming a clean whole-file pass.
+- CLI typecheck and pkgroll/extension-copy build passed in standard global setup
+  after correcting a test-mock tuple typing error. Existing bin/empty-chunk,
+  listener and asynchronously-handled-rejection warnings remain. No Unix-socket
+  EPERM occurred. `git diff --check` passed; the Claude routing helpers and native
+  API runtime side-effect method remain byte-identical to `9ee84191`. No dependency,
+  lockfile, Desktop/server source, wire schema or other branch changed.
+
+Resume settings use existing per-session captured state and encrypted metadata;
+no daemon-wide preference, credential policy change or additional authority is
+introduced. The Desktop consumer prerequisites above remain mandatory before
+opting in. Native wire turn ownership and channel routing remain main's.

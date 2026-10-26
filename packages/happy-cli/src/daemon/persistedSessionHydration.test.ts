@@ -7,7 +7,7 @@ import {
   mergeTrackedSessionWebhook,
 } from './persistedSessionHydration';
 import type { PersistedSession } from '@/persistence';
-import { readSetupTokenResumeSelection } from './sessionEnv';
+import { buildResumedSessionSpawnEnvironment, readSetupTokenResumeSelection } from './sessionEnv';
 
 const metadata = { path: '/work/repo', host: 'mac' } as unknown as Metadata;
 
@@ -25,6 +25,15 @@ function persisted(overrides: Partial<PersistedSession> = {}): PersistedSession 
 }
 
 describe('hydrateTrackedSessionFromPersisted', () => {
+  it.each(['0', '1'])('T2RT-26 preserves session opt-in %s through daemon recovery', value => {
+    const saved = JSON.parse(JSON.stringify(persisted({ agentEnvironment: { HAPPY_INPUT_EVIDENCE: value } })));
+    for (const hydrated of [hydrateTrackedSessionFromPersisted(saved), hydrateRecoveredSessionFromPersisted(saved, 12)]) {
+      expect(hydrated.agentEnvironment).toEqual({ HAPPY_INPUT_EVIDENCE: value });
+      expect(buildResumedSessionSpawnEnvironment({ inherited: { HAPPY_INPUT_EVIDENCE: value === '1' ? '0' : '1' },
+        explicit: {}, agentEnvironment: hydrated.agentEnvironment, sessionId: 'owner' }).HAPPY_INPUT_EVIDENCE).toBe(value);
+    }
+  });
+
   it('shouldReturnNothingWhenNoRecordExists', () => {
     expect(hydrateTrackedSessionFromPersisted(undefined)).toEqual({});
   });

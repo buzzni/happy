@@ -9,6 +9,16 @@ import { preflightInstalledHappyCLI, resolveHappyCliSpawnCommand, spawnHappyCLI,
 vi.mock('cross-spawn', () => ({ spawn: vi.fn(() => ({})) }));
 
 describe('daemon working directory', () => {
+  it.each(['start', 'start-sync'])('T2RT-26 drops a session opt-in at the actual daemon %s spawn', subcommand => {
+    const env = { HAPPY_INPUT_EVIDENCE: '1', happy_input_evidence: '1', SAFE: 'kept' };
+    spawnHappyCLI(['daemon', subcommand], { env });
+    const actual = vi.mocked(crossSpawn).mock.calls.at(-1)![2]!.env!;
+    expect(actual.HAPPY_INPUT_EVIDENCE).toBeUndefined();
+    expect(actual.happy_input_evidence).toBeUndefined();
+    expect(actual.SAFE).toBe('kept');
+    expect(env.HAPPY_INPUT_EVIDENCE).toBe('1');
+  });
+
   it.each(['start', 'start-sync'])('scrubs a bound child token at the actual daemon %s spawn', (subcommand) => {
     const env = { HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: 'synthetic-record', CLAUDE_CODE_OAUTH_TOKEN: 'synthetic-bound', SAFE: 'kept' };
     spawnHappyCLI(['daemon', subcommand], { env });

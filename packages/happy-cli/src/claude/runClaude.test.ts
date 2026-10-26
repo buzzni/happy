@@ -419,6 +419,34 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
+    it.each(['0', '1'])('T2RT-26 captures %s before asynchronous startup changes the process env', async initial => {
+        process.env.HAPPY_INPUT_EVIDENCE = initial;
+        mockStartHookServer.mockImplementationOnce(async () => {
+            process.env.HAPPY_INPUT_EVIDENCE = initial === '1' ? '0' : '1';
+            return { port: 23456, stop: vi.fn() };
+        });
+        const harness = await startRemoteRunClaudeHarness();
+        try { expect(harness.sessionClient.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', initial === '1'); }
+        finally { await harness.finish(); }
+    });
+
+    it.each([undefined, '0', '1'])('T2RT-26 restores the owning session option with explicit override %s', async override => {
+        if (override === undefined) delete process.env.HAPPY_INPUT_EVIDENCE;
+        else process.env.HAPPY_INPUT_EVIDENCE = override;
+        Object.assign(process.env, {
+            HAPPY_RECONNECT_SESSION_ID: 'happy-session-1', HAPPY_RECONNECT_ENCRYPTION_KEY: Buffer.alloc(32).toString('base64'),
+            HAPPY_RECONNECT_ENCRYPTION_VARIANT: 'legacy', HAPPY_RECONNECT_SEQ: '0',
+            HAPPY_RECONNECT_METADATA_VERSION: '1', HAPPY_RECONNECT_AGENT_STATE_VERSION: '1',
+            HAPPY_RECONNECT_SNAPSHOT: Buffer.from(JSON.stringify({ metadata: { path: '/tmp/project', inputEvidenceEnabled: true },
+                seq: 0, metadataVersion: 1, agentStateVersion: 1 })).toString('base64'),
+        });
+        const harness = await startRemoteRunClaudeHarness();
+        try {
+            expect(harness.sessionClient.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', override !== '0');
+            expect((harness.api.sessionSyncClient.mock.calls[0] as any)[0].metadata.inputEvidenceEnabled).toBe(override === '0' ? undefined : true);
+        } finally { await harness.finish(); }
+    });
+
     it('persists an accepted active-turn prompt once and deduplicates the JSONL scanner copy', async () => {
         const harness = await startRemoteRunClaudeHarness();
 

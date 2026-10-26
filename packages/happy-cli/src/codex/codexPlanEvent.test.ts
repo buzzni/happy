@@ -34,6 +34,7 @@ describe('codexPlanEvent', () => {
 });
 
 it('carries an explicitly empty plan as a clear, not a malformed plan', () => {
-    expect(codexPlanEvent({ plan: [] })).toEqual({ t: 'plan', steps: [] });
+    expect(codexPlanEvent({ plan: [] })).toBeNull();
+    expect(codexPlanEvent({ plan: [] }, true)).toEqual({ t: 'plan', steps: [] });
     expect(codexPlanEvent({ plan: [null] })).toBeNull();
 });

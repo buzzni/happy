@@ -43,8 +43,13 @@ This document describes the Happy CLI (`packages/happy-cli`) and its daemon. The
 
 Provider/session mappers own wire turn starts, ends and routing identity.
 `TurnInputEvidence` only stamps existing mapped turns and publishes evidence
-revisions when the consumer explicitly opts in through the session launch
-environment (`HAPPY_INPUT_EVIDENCE=1`); Claude/Codex default off. A final without
+revisions when the consumer explicitly opts in through the validated session
+launch setting (`environmentVariables.HAPPY_INPUT_EVIDENCE="1"`); Claude/Codex
+default off. Runners consume the seed once and retain a session-owned value
+through replacements and resume/recovery; daemon/new-session boundaries scrub
+implicit inheritance. OFF adds neither T2rt contact capabilities nor its extra
+Codex non-channel final/empty-plan events. Guards received while OFF are refused;
+ON advertises guarded prompting together with its admission receipts. A final without
 a mapped turn produces an incomplete revision with no
 envelope turn ID; its payload correlation token cannot become a turn or retry
 root. It cannot create lifecycle events for automation, daemon follow-ups or

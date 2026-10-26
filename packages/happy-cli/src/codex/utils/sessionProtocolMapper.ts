@@ -453,7 +453,7 @@ function pickTurnEndStatus(message: Record<string, unknown>, type: unknown): Tur
     return 'completed';
 }
 
-export function mapCodexMcpMessageToSessionEnvelopes(message: Record<string, unknown>, state: CodexTurnState): CodexMapperResult {
+export function mapCodexMcpMessageToSessionEnvelopes(message: Record<string, unknown>, state: CodexTurnState, inputEvidence = false): CodexMapperResult {
     const type = message.type;
     const rawProviderTurnId = message.turn_id ?? message.turnId;
     const providerTurnId = typeof rawProviderTurnId === 'string' && rawProviderTurnId.length > 0
@@ -606,9 +606,10 @@ export function mapCodexMcpMessageToSessionEnvelopes(message: Record<string, unk
          * `final_answer` can legitimately be a clarifying question the model then continues past,
          * so what makes it deliverable is the matching `turn-end` with `status: 'completed'`.
          *
-         * REST input witnesses need the same candidate; the channel request slot stays optional.
+         * Opted-in REST input witnesses add the same candidate for mapped turns.
+         * The channel predicate remains main's, independently of that opt-in.
          */
-        if (message.phase === 'final_answer' && !subagent && state.currentTurnId) {
+        if (message.phase === 'final_answer' && !subagent && (state.currentRequestId || (inputEvidence && state.currentTurnId))) {
             envelopes.push(createEnvelope(
                 'agent',
                 { t: 'final-answer', text: message.message, ...(state.currentRequestId ? { requestId: state.currentRequestId } : {}) },

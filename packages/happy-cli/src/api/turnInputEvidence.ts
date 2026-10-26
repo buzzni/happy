@@ -10,9 +10,6 @@ type AttemptState = InputEvidenceV1['additional']['items'][number]['state'];
 type ContinuationKind = InputEvidenceV1['continuation']['kind'];
 export type QueueInputEvidence = { ref: InputRef; guard?: unknown; continuation?: InputEvidenceV1 };
 
-/** Consumer launch opt-in. Default off protects installed readers that predate evidence. */
-export function isInputEvidenceEnabled(): boolean { return process.env.HAPPY_INPUT_EVIDENCE === '1'; }
-
 /** Host state, never inferred from delayed metadata echoes. Calls and transitions are synchronous. */
 export class HubInputGate {
     mode: 'remote' | 'local' | 'transitioning' = 'transitioning';

@@ -4,7 +4,7 @@ import { appendFile, mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import axios from 'axios';
-import { sessionEnvelopeSchema, type SessionEnvelope, type SessionFollowupDaemon } from '@slopus/happy-wire';
+import { createEnvelope, sessionEnvelopeSchema, type SessionEnvelope, type SessionFollowupDaemon } from '@slopus/happy-wire';
 import { ApiSessionClient } from '@/api/apiSession';
 import { encodeBase64, encrypt, decrypt, decodeBase64 } from '@/api/encryption';
 import type { Metadata } from '@/api/types';
@@ -21,6 +21,8 @@ import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { observeFollowupTurn, runSessionFollowupTick, createSessionFollowupSyncState,
     type SessionFollowupRunnerInput } from '@/daemon/automations/sessionFollowupRunner';
 import { mapCodexMcpMessageToSessionEnvelopes } from '@/codex/utils/sessionProtocolMapper';
+import { codexPlanEvent } from '@/codex/codexPlanEvent';
+import { registerCodexSteerHandler } from '@/codex/codexSteerHandler';
 
 const mocks = vi.hoisted(() => ({ io: vi.fn(), report: vi.fn(async () => ({ status: 'ok' })), id: 0, wire: 0, evidence: 0, start: 0, end: 0 }));
 vi.mock('@paralleldrive/cuid2', () => ({ createId: () => `c${String(++mocks.id).padStart(23, '0')}` }));
@@ -52,8 +54,8 @@ vi.mock('@/daemon/controlClient', () => ({ notifyDaemonSessionRuntime: vi.fn(asy
         CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-second', HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: '{"account":"second"}',
     } })) }));
 
-beforeEach(() => { vi.clearAllMocks(); mocks.id = mocks.wire = mocks.evidence = mocks.start = mocks.end = 0; });
-afterEach(() => { vi.unstubAllEnvs(); });
+beforeEach(() => { vi.clearAllMocks(); vi.spyOn(Date, 'now').mockReturnValue(42); mocks.id = mocks.wire = mocks.evidence = mocks.start = mocks.end = 0; });
+afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 type Source = 'consumed' | 'attachment' | 'sdk';
 const review = JSON.stringify({ findings: [{ severity: 'medium', title: 'remaining issue' }] });
 
@@ -110,8 +112,9 @@ async function harness(capability: boolean, outbox = false, scheduled = false) {
     const client = new ApiSessionClient('fake-token', session);
     // These additive methods do not exist on main; absence must not change the stimulus.
     const evidenceClient = client as any;
+    let metadata = session.metadata;
+    vi.spyOn(client, 'updateMetadata').mockImplementation(update => { metadata = update(metadata); });
     evidenceClient.configureInputQueue?.(new MessageQueue2<string>(x => x), 'remote', enabled);
-    vi.spyOn(client, 'updateMetadata').mockImplementation(() => undefined);
     vi.spyOn(evidenceClient.sendSync, 'invalidate').mockImplementation(() => {});
     const events: SessionEnvelope[] = [];
     const realEnqueue = evidenceClient.enqueueMessage.bind(client);
@@ -176,7 +179,7 @@ async function harness(capability: boolean, outbox = false, scheduled = false) {
         return { current: state.currentTurnId, request: state.currentRequestId ?? null, pending: state.pendingRequestId ?? null,
             launches: [...(state.backgroundTaskRequestIds ?? [])] };
     };
-    return { client, events, queue, sdk, batch, answer, assistant, end, consume, evidence, routing,
+    return { client, enabled, events, queue, sdk, batch, answer, assistant, end, consume, evidence, routing,
         async result(name: string, extra: object = {}) {
             for (const event of events) sessionEnvelopeSchema.parse(event);
             // SDKToLogConverter assigns random transcript UUIDs in both revisions.
@@ -191,7 +194,7 @@ async function harness(capability: boolean, outbox = false, scheduled = false) {
                 const { inputEvidence: _inputEvidence, ...ev } = e.ev as any;
                 return { id: e.id, role: e.role, turn: e.turn, ev };
             });
-            const record = { name, turns, wire, routing: routing(), reports: mocks.report.mock.calls,
+            const record = { name, turns, wire, metadata, routing: routing(), reports: mocks.report.mock.calls,
                 followup: await followup(events), evidence: evidence(),
                 finals: events.filter(e => e.ev.t === 'final-answer').map(e => ({ turn: e.turn, ev: e.ev })), ...extra };
             await appendFile(process.env.T2RT_PARITY_OUTPUT!, JSON.stringify(record) + '\n');
@@ -205,6 +208,85 @@ async function harness(capability: boolean, outbox = false, scheduled = false) {
 }
 
 for (const capability of [false, true]) {
+    for (const scenario of ['codex-ordinary', 'codex-channel', 'plan-empty', 'plan-nonempty', 'claude-ordinary',
+        'claude-channel', 'permission', 'question', 'steer', 'codex-retry', 'claude-retry', 'metadata', 'guards'] as const) {
+        it(`full envelope ${scenario} capability=${capability}`, async () => {
+            const h = await harness(capability);
+            const client = h.client as any;
+            const state: any = { currentTurnId: null, pendingRequestId: scenario === 'codex-channel' ? 'channel-A' : null };
+            const codex = (message: any) => {
+                const mapped = mapCodexMcpMessageToSessionEnvelopes(message, state, h.enabled);
+                Object.assign(state, { currentTurnId: mapped.currentTurnId, currentProviderTurnId: mapped.currentProviderTurnId,
+                    startedSubagents: mapped.startedSubagents, activeSubagents: mapped.activeSubagents,
+                    providerSubagentToSessionSubagent: mapped.providerSubagentToSessionSubagent });
+                for (const envelope of mapped.envelopes) h.client.sendSessionProtocolMessage(envelope);
+            };
+            try {
+                if (scenario.startsWith('plan-')) {
+                    const plan = codexPlanEvent({ plan: scenario === 'plan-empty' ? [] : [{ step: 'finish', status: 'completed' }] }, h.enabled);
+                    if (plan) h.client.sendSessionProtocolMessage(createEnvelope('agent', plan));
+                } else if (scenario.startsWith('codex-') || scenario === 'steer') {
+                    client.setPendingInputEvidence?.({ inputs: [{ kind: 'rest', serverMessageId: 'A', serverSeq: 1 }], inputCount: 1 });
+                    codex({ type: 'task_started', turn_id: 'provider-A' });
+                    if (scenario === 'steer') {
+                        let steer!: (params: Record<string, unknown>) => Promise<unknown>;
+                        vi.mocked(h.client.rpcHandlerManager.registerHandler).mockImplementation((name, handler) => {
+                            if (name === 'steer') steer = handler as any;
+                        });
+                        registerCodexSteerHandler({ client: { steerTurn: vi.fn(async () => {}) }, session: h.client,
+                            protocolTurnId: () => state.currentTurnId, onFailure: vi.fn() });
+                        await steer({ text: 'steer A' });
+                    }
+                    if (scenario === 'codex-retry') {
+                        client.inputEvidence?.continuePending('codex-capacity');
+                        codex({ type: 'task_complete', status: 'failed', turn_id: 'provider-A' });
+                        client.setPendingInputEvidence?.({ inputs: [], inputCount: 0, continuation: client.inputEvidence?.takeContinuation() });
+                        client.inputEvidence?.commitPending();
+                        codex({ type: 'task_started', turn_id: 'provider-B' });
+                    }
+                    codex({ type: 'agent_message', phase: 'final_answer', message: 'done' });
+                    codex({ type: 'task_complete', status: 'completed' });
+                } else if (scenario === 'metadata') {
+                    client.setInputSteerAvailable?.(true);
+                    client.setInputMode?.('local'); client.setInputMode?.('remote');
+                } else if (scenario === 'guards') {
+                    const guard = { v: 1, targetSessionId: h.client.sessionId, expectedRuntimeId: client.runtimeId ?? 'base',
+                        expectedMode: 'remote', expectedModeEpoch: client.inputGate?.modeEpoch ?? 1 };
+                    const accept = (id: string, value: unknown) => client.admitInput?.({
+                        ref: { kind: 'rest', serverMessageId: id, serverSeq: 1 }, guard: value,
+                    }, true);
+                    accept('accepted', guard); accept('malformed', null);
+                    accept('stale', { ...guard, expectedModeEpoch: 0 });
+                    client.setInputMode?.('local'); accept('changed', guard);
+                } else {
+                    h.batch('A', scenario === 'claude-channel' ? 'channel-A' : null);
+                    if (scenario === 'permission' || scenario === 'question') {
+                        const tool = scenario === 'question' ? 'AskUserQuestion' : 'Bash';
+                        h.sdk({ type: 'assistant', message: { role: 'assistant', content: [
+                            { type: 'tool_use', id: 'tool-A', name: tool, input: {} },
+                        ] } });
+                        await h.queue.flush();
+                        client.recordPermissionInput?.('tool-A', tool, { id: 'tool-A', approved: true,
+                            ...(scenario === 'question' ? { updatedInput: { answers: { question: 'yes' } } } : {}) })?.();
+                        h.sdk({ type: 'user', message: { role: 'user', content: [
+                            { type: 'tool_result', tool_use_id: 'tool-A', content: 'allowed' },
+                        ] } });
+                    } else h.assistant('working');
+                    if (scenario === 'claude-retry') {
+                        await h.queue.flush(); client.continueClaudeInputEvidence?.('claude-transient');
+                        h.queue.enqueue(turnEndItem('failed')); await h.queue.flush();
+                        const receipt = client.inputEvidence?.takeContinuation();
+                        h.queue.enqueue(pendingRequestItem(null, { inputs: [], inputCount: 0,
+                            continuation: receipt ? client.inputEvidence.claimContinuation(receipt) : undefined }));
+                        h.assistant('recovered');
+                    }
+                    await h.answer('done'); await h.end();
+                }
+                await h.result(`full-${scenario}-${capability}`);
+            } finally { await h.cleanup(); }
+        });
+    }
+
     for (const { failure, empty } of [
         { failure: 'exception', empty: false }, { failure: 'result', empty: false }, { failure: 'exception', empty: true },
     ] as const) it(`T20/24 account ${failure} empty=${empty} capability=${capability}`, async () => {
