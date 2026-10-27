@@ -211,7 +211,7 @@ export const pl: TranslationStructure = {
 
     settingsFeatures: {
         saycodeGroupTitle: "Instrukcje Saycode",
-        saycodeGroupFooter: "Wywołania podrzędnego Agenta i wewnętrzne delegowanie pracy są domyślnie włączone nawet po wyłączeniu instrukcji Saycode. Generowanie tytułu czatu jest zawsze włączone.",
+        saycodeGroupFooter: "Wywołania podrzędnego Agenta, wewnętrzne delegowanie pracy, przepływ planowania i podpisy współautorów w commitach podążają za przełącznikiem instrukcji Saycode. Generowanie tytułu czatu jest zawsze włączone.",
         saycodeMaster: "Używaj instrukcji Saycode",
         saycodeMasterSubtitle: "Instrukcje zachowania dodawane przez Saycode. Twoje własne prompty, instrukcje projektu i umiejętności zawsze pozostają.",
         saycodeBlockOptionsGuidance: "Opcje odpowiedzi",
