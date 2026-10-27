@@ -129,7 +129,7 @@ import { sanitizeChildEnv } from '@/utils/childEnv';
 import { resolveRecoveredInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings';
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
 import { createCollectorSchedule } from './collectorSchedule';
-import { resumeSetupTokenEnvironment } from './resumeSetupTokenRebind';
+import { organizationResumeRefusal, resumeSetupTokenEnvironment, type ResumeAuthRequirement } from './resumeSetupTokenRebind';
 import type { AiAuthSource } from '@/usage/aiAuthSource';
 import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch } from '@/resume/handleResumeCommand';
@@ -2802,6 +2802,8 @@ export async function startDaemon(): Promise<void> {
 
     type ResumeSessionOptions = {
       model?: string;
+      /** Saycode specs/claude-org-personal-coexistence I: resume only on the recorded organization binding. */
+      aiAuthRequirement?: ResumeAuthRequirement;
       permissionMode?: string;
       environmentVariables?: Record<string, string>;
       mcpCallerGrantEnvelope?: string;
@@ -2849,6 +2851,10 @@ export async function startDaemon(): Promise<void> {
 
       if (!launchReadiness.isReady()) return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: 'Daemon is initializing; retry the resume shortly' };
       if (pendingMachineStarts.has(happySessionId)) return { type: 'error', code: 'SESSION_LIVE', errorMessage: 'The execution-bound session is still starting; retry shortly.' };
+      // Before a live child is reused or a new one started: a session with no record of the required organization
+      // would run on whatever login this PC has, which the caller asked to rule out.
+      const organizationRefusal = organizationResumeRefusal(options?.aiAuthRequirement, findTrackedSessionById(happySessionId)?.agentEnvironment);
+      if (organizationRefusal) return { type: 'error', code: 'CLAUDE_ORGANIZATION_RESUME_REQUIRED', errorMessage: `Session ${happySessionId} has no record of the required organization account.` };
       let endResumeLaunch: (() => void) | undefined;
       try {
         if (hasLiveDaemonChild(happySessionId, pidToTrackedSession.values(), isPidAlive, ownsUnresolvedJob)) {

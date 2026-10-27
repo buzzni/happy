@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { AiCredentialRuntimeError } from './aiCredentialRuntime'
-import { resumeSetupTokenEnvironment } from './resumeSetupTokenRebind'
+import { organizationResumeRefusal, parseResumeAuthRequirement, resumeSetupTokenEnvironment } from './resumeSetupTokenRebind'
 
 const RECORDED = '{"account":"removed"}'
 const NEXT = { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next', HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: '{"account":"assigned"}' }
@@ -40,5 +40,33 @@ describe('resume of a setup-token session whose account left this PC (Saycode sp
       await expect(resumeSetupTokenEnvironment({ sessionId: 's', recorded, resolve: async () => { throw error }, rebind })).rejects.toBe(error)
     }
     expect(rebind).not.toHaveBeenCalled()
+  })
+})
+
+// Saycode specs/claude-org-personal-coexistence I: a Desktop with personal Claude off cannot see which
+// account an idle-reaped conversation used, so it asks the daemon that holds the record to resume only on it.
+describe('organization-only resume requirement', () => {
+  const record = { managedAccountId: '0b6f2c1e-1111-4a2b-8c3d-000000000001', credentialGeneration: 3, groupScope: 'company-1', companyId: 'company-1', userId: 'user-1',
+    machineId: 'machine-1', keyId: 'a'.repeat(64), nonce: '6a1f7d3e-2222-4b2b-8c3d-000000000009', issuedAt: 1_800_000_000_000 }
+  const organizationSession = { HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: JSON.stringify({ version: 1, ...record }) }
+  const requirement = { version: 1, kind: 'organization', companyId: 'company-1' } as const
+
+  it('accepts only the closed requirement shape and treats absence as no requirement', () => {
+    expect(parseResumeAuthRequirement(undefined)).toBeUndefined()
+    expect(parseResumeAuthRequirement(requirement)).toEqual(requirement)
+    for (const value of [null, 'organization', { ...requirement, version: 2 }, { ...requirement, kind: 'personal' }, { ...requirement, companyId: '' }, { ...requirement, extra: true }]) {
+      expect(() => parseResumeAuthRequirement(value)).toThrow(/requirement/)
+    }
+  })
+
+  it('lets a session recorded on the required organization resume', () => {
+    expect(organizationResumeRefusal(requirement, organizationSession)).toBeUndefined()
+    expect(organizationResumeRefusal(undefined, {})).toBeUndefined()
+  })
+
+  it('refuses a session with no organization record, another organization, or an unreadable record', () => {
+    for (const environment of [undefined, {}, { HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: JSON.stringify({ version: 1, ...record, companyId: 'company-2', groupScope: 'company-2' }) }, { HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: '{"version":1}' }]) {
+      expect(organizationResumeRefusal(requirement, environment)).toBe('CLAUDE_ORGANIZATION_RESUME_REQUIRED')
+    }
   })
 })

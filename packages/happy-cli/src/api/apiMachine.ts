@@ -39,6 +39,7 @@ import {
     createMachineResourceService,
 } from '@/daemon/machineResourceService';
 import { AI_AUTH_SELECTION_CAPABILITY, parseAiAuthSelection } from '@/daemon/sessionEnv';
+import { parseResumeAuthRequirement, type ResumeAuthRequirement } from '@/daemon/resumeSetupTokenRebind';
 import { parseOutputFormat, STRUCTURED_OUTPUT_CAPABILITY } from '@/claude/structuredOutput';
 import { WRITE_FILE_ATTEMPT_CAPABILITY } from '@/modules/common/writeFileAttempts';
 import { backoff } from '@/utils/time';
@@ -578,6 +579,7 @@ type MachineRpcHandlers = {
         expectedConnectors?: string[];
         /** Present = authoritative (empty withdraws every root); absent = keep the session's roots. */
         additionalDirectories?: string[];
+        aiAuthRequirement?: ResumeAuthRequirement;
     }) => Promise<ResumeSessionResult>;
     recoverSession?: (sessionId: string, options: RecoverSessionOptions) => Promise<RecoverSessionResult>;
     stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
@@ -884,6 +886,7 @@ export class ApiMachineClient {
         expectedConnectors?: string[];
         /** Present = authoritative (empty withdraws every root); absent = keep the session's roots. */
         additionalDirectories?: string[];
+        aiAuthRequirement?: ResumeAuthRequirement;
     }) => Promise<ResumeSessionResult>) | null = null;
     private recoverSessionHandler: ((sessionId: string, options: RecoverSessionOptions) => Promise<RecoverSessionResult>) | null = null;
     private linkSpawnedSessionHandler: ((input: { sessionId: string; directory: string }) => void | Promise<void>) | null = null;
@@ -3419,6 +3422,7 @@ export class ApiMachineClient {
                         mcpConfigProjectId,
                         expectedConnectors,
                         additionalDirectories,
+                        aiAuthRequirement,
                     } = params || {};
 
                     if (!sessionId || typeof sessionId !== 'string') {
@@ -3446,6 +3450,7 @@ export class ApiMachineClient {
                         throw new Error('MCP config project ID must be a string');
                     }
                     const validExpectedConnectors = readExpectedConnectors(expectedConnectors);
+                    const validAiAuthRequirement = parseResumeAuthRequirement(aiAuthRequirement);
 
                     const handler = this.resumeSessionHandler;
                     if (!handler) {
@@ -3460,6 +3465,7 @@ export class ApiMachineClient {
                         mcpConfigProjectId,
                         expectedConnectors: validExpectedConnectors,
                         ...(validAdditionalDirectories !== undefined ? { additionalDirectories: validAdditionalDirectories } : {}),
+                        ...(validAiAuthRequirement ? { aiAuthRequirement: validAiAuthRequirement } : {}),
                     });
                     switch (result.type) {
                         case 'success':

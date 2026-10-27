@@ -35,4 +35,13 @@ describe('resume of a session whose organization account left this PC', () => {
     const resume = resumeBody(await runSource())
     expect(resume).toContain("[SETUP_TOKEN_RESUME_REBOUND_ENV]: resumedCredentials.rebound ? '1' : '',")
   })
+
+  // Saycode specs/claude-org-personal-coexistence I: before a live child is reused or a new one spawned.
+  it('checks an organization-only requirement against the recorded binding before any process is reused or started', async () => {
+    const resume = resumeBody(await runSource())
+    const check = resume.indexOf('organizationResumeRefusal(options?.aiAuthRequirement, findTrackedSessionById(happySessionId)?.agentEnvironment)')
+    expect(check).toBeGreaterThan(0)
+    expect(check).toBeLessThan(resume.indexOf('hasLiveDaemonChild('))
+    expect(resume.slice(check, check + 400)).toContain("code: 'CLAUDE_ORGANIZATION_RESUME_REQUIRED'")
+  })
 })

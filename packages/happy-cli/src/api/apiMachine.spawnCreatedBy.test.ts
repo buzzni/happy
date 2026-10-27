@@ -367,6 +367,24 @@ describe('ApiMachineClient spawn/resume RPC passthrough', () => {
             .rejects.toThrow('safe absolute paths');
     });
 
+    // Saycode specs/claude-org-personal-coexistence I: passed through only in its closed shape.
+    it('passes an organization-only resume requirement through and refuses a malformed one', async () => {
+        const resumeSession = vi.fn().mockResolvedValue({ type: 'success', sessionId: 'happy-1' });
+        const { ApiMachineClient } = await import('./apiMachine');
+        const client = new ApiMachineClient('token', machineClient());
+        client.setRPCHandlers(rpcHandlers({ resumeSession }));
+        const resume = handlersFrom(client).get('machine-1:resume-happy-session');
+        const requirement = { version: 1, kind: 'organization', companyId: 'company-1' };
+
+        await resume?.({ sessionId: 'happy-1', aiAuthRequirement: requirement });
+        await resume?.({ sessionId: 'happy-1' });
+
+        expect(resumeSession.mock.calls.map(([, options]) => options.aiAuthRequirement)).toEqual([requirement, undefined]);
+        await expect(resume?.({ sessionId: 'happy-1', aiAuthRequirement: { ...requirement, kind: 'personal' } }))
+            .rejects.toThrow('requirement');
+        expect(resumeSession).toHaveBeenCalledTimes(2);
+    });
+
     it('returns a structured untracked error without throwing away its code', async () => {
         const resumeSession = vi.fn().mockResolvedValue({
             type: 'error',

@@ -468,6 +468,8 @@ export type ResumeSessionErrorCode =
     | 'SESSION_DIRECTORY_MISSING'
     | 'SESSION_NATIVE_SESSION_MISSING'
     | 'MCP_CALLER_GRANT_REJECTED'
+    /** Saycode specs/claude-org-personal-coexistence I — no record of the organization the caller required; nothing ran. */
+    | 'CLAUDE_ORGANIZATION_RESUME_REQUIRED'
     | 'SESSION_RESUME_FAILED';
 
 export type ResumeSessionResult =
