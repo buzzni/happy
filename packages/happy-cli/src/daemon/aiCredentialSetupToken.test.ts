@@ -5,7 +5,7 @@ import { TmuxUtilities } from '../utils/tmux'
 import { createHash, createHmac, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 import { SETUP_TOKEN_BINDING_TYPE, createSetupTokenBindingVerifier } from './setupTokenBindingProof'
-import { createAiCredentialRuntime, type AiCredentialCommandResult, type AiCredentialRuntimeDependencies } from './aiCredentialRuntime'
+import { AiCredentialRuntimeError, createAiCredentialRuntime, type AiCredentialCommandResult, type AiCredentialRuntimeDependencies } from './aiCredentialRuntime'
 import { groupAccountIdentity } from './aiCredentialGroupAdapters'
 import {
   applyAppliedAiAuthSourceEnv, buildManagedSessionSpawnEnvironment, buildResumedSessionSpawnEnvironment, buildSpawnRequestEnvironment,
@@ -53,7 +53,7 @@ type Slot = { number: number; email: string; organizationUuid?: string; usageSta
 
 // A stateful stand-in for cswap. `marked` keeps managed metadata like the token runtime; an
 // unmarked build drops it, as upstream does.
-function fakeMachine(initial: Slot[], activeAccountNumber: number | null, options: { runtime?: 'marked' | 'unmarked' | 'missing'; ignoreForce?: boolean; tokenRuntimeStatus?: string; files?: Map<string, string>; binding?: false; env?: Record<string, string | undefined>; capabilities?: Record<string, unknown>; listFails?: boolean; clock?: { now: number }; advanceOnExport?: number; advanceOnNonceWrite?: number; durability?: 'missing' | 'file-fails' | 'directory-fails'; machineId?: string; machineAuthority?: () => Promise<void>; machineStart?: () => Promise<void>; cswapVersion?: string; noUvPython?: boolean; platform?: NodeJS.Platform; readError?: string; overlap?: { exportStarted: boolean; listSawExport: boolean[] }; hangingExport?: { cancelled: boolean }; inUse?: () => string[]; sharedChoose?: AiCredentialRuntimeDependencies['sharedChoose'] } = {}) {
+function fakeMachine(initial: Slot[], activeAccountNumber: number | null, options: { runtime?: 'marked' | 'unmarked' | 'missing'; ignoreForce?: boolean; tokenRuntimeStatus?: string; files?: Map<string, string>; binding?: false; env?: Record<string, string | undefined>; capabilities?: Record<string, unknown>; listFails?: boolean; captureFails?: boolean; clock?: { now: number }; advanceOnExport?: number; advanceOnNonceWrite?: number; durability?: 'missing' | 'file-fails' | 'directory-fails'; machineId?: string; machineAuthority?: () => Promise<void>; machineStart?: () => Promise<void>; cswapVersion?: string; noUvPython?: boolean; platform?: NodeJS.Platform; readError?: string; overlap?: { exportStarted: boolean; listSawExport: boolean[] }; hangingExport?: { cancelled: boolean }; inUse?: () => string[]; sharedChoose?: AiCredentialRuntimeDependencies['sharedChoose'] } = {}) {
   const kind = options.runtime ?? 'marked'
   const state = { slots: [...initial], active: activeAccountNumber }
   const calls: Array<{ command: string; args: string[] }> = []
@@ -82,6 +82,7 @@ function fakeMachine(initial: Slot[], activeAccountNumber: number | null, option
       if (args[1] === 'status') return { stdout: options.tokenRuntimeStatus ?? JSON.stringify({ version: 1, artifact: 'saycode-setup-token-runtime-v1', accounts: [] }), stderr: '' }
       return { stdout: options.capabilities ? JSON.stringify(options.capabilities) : MARKER, stderr: '' }
     }
+    if (command === 'cswap' && args[0] === 'add' && options.captureFails) throw new AiCredentialRuntimeError('COMMAND_FAILED')
     if (command === 'cswap' && args[0] === 'list' && options.listFails) throw Object.assign(new Error('list failed'), { kind: 'COMMAND_FAILED' })
     if (command === 'cswap' && args[0] === 'list' && options.overlap) {
       // A slow helper start: give a concurrent export the chance to begin before this read finishes.
@@ -658,6 +659,54 @@ describe('managed Claude setup-token runtime', () => {
     await expect(runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('org')))))).rejects.toThrow('AI_CREDENTIAL_PERSONAL_CAPTURE_REQUIRED')
     expect(calls.some(call => call.command === 'cswap' && call.args[0] === 'add')).toBe(true)
     expect(state.slots).toEqual([])
+  })
+
+  it('retries a shared Linux assignment after the operator preserves an environment-only token in cswap', async () => {
+    const configPath = join('/home', 'operator', '.claude.json')
+    const credentialsPath = join('/home', 'operator', '.claude', '.credentials.json')
+    const files = new Map([[configPath, JSON.stringify({ oauthAccount: { emailAddress: 'old@example.com' }, theme: 'dark' })]])
+    const personalToken = fakeToken('personal-environment')
+    const { runtime, calls, state } = fakeMachine([], null, { files, platform: 'linux', captureFails: true,
+      env: { CLAUDE_CODE_OAUTH_TOKEN: personalToken } })
+    const principal = { principalType: 'machine' as const, machineId: 'machine-1' }
+    const assignment = { version: 1 as const, scope: 'company-1', ...principal, provider: 'claude' as const,
+      generation: 1, fingerprint: '1'.padStart(64, '0'), payload: payload(managed(A, 1, fakeToken('shared'))) }
+
+    // The live Linux case had an identity, no credential file, and an empty cswap roster.
+    // Ordinary add cannot capture that environment token: no successful receipt may be written.
+    await expect(runtime.groupSync(assignment)).rejects.toMatchObject({ kind: 'COMMAND_FAILED' })
+    expect(calls.some(call => call.command === 'cswap' && call.args[0] === 'add')).toBe(true)
+    expect(calls.some(call => call.command === 'cswap' && call.args[0] === 'import')).toBe(false)
+    expect(await runtime.groupReceipt('company-1', 'claude', principal)).toMatchObject({ reconciled: false, appliedCredentials: [] })
+    expect(state.slots).toEqual([])
+    expect(files.has(credentialsPath)).toBe(false)
+
+    // State left by the operator's add-token - and switch 1 --force (not an automatic fallback).
+    const personal: Slot = { number: 1, email: 'setup-token-1@token.local', usageStatus: 'unavailable',
+      credentials: { claudeAiOauth: { accessToken: personalToken, scopes: ['user:inference'] } } }
+    state.slots.push(personal)
+    state.active = 1
+    files.set(configPath, JSON.stringify({ oauthAccount: { emailAddress: personal.email }, theme: 'dark' }))
+    files.set(credentialsPath, JSON.stringify(personal.credentials))
+    const savedConfig = files.get(configPath)
+    calls.length = 0
+
+    await expect(runtime.groupSync(assignment)).resolves.toMatchObject({ ...principal, reconciled: true,
+      appliedCredentials: [{ managedAccountId: A, credentialGeneration: 1 }] })
+    expect(await runtime.groupReceipt('company-1', 'claude', principal)).toMatchObject({ ...principal, reconciled: true })
+    expect(calls.some(call => call.command === 'cswap' && call.args[0] === 'add')).toBe(false)
+    expect(state.slots.find(slot => slot.number === 1)).toEqual(personal)
+    expect(state.active).toBe(1)
+    expect(files.get(configPath)).toBe(savedConfig)
+    expect(files.get(credentialsPath)).toBe(JSON.stringify(personal.credentials))
+
+    // The retained personal default must not leak into a shared-machine Claude launch.
+    const env = await runtime.sessionEnvironment('claude')
+    expect(env).toMatchObject({ CLAUDE_CODE_OAUTH_TOKEN: fakeToken('shared'), HAPPY_AI_AUTH_SOURCE: 'org-bundle' })
+    const start = vi.fn(() => 'started')
+    await expect(runtime.launchSession(env, start)).resolves.toBe('started')
+    expect(start).toHaveBeenCalledTimes(1)
+    expect(inference(calls)).toEqual([])
   })
 
   it('respects an explicitly default secure store without deleting a custom profile', async () => {
