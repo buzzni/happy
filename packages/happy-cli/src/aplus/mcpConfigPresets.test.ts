@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest'
-import { resolveMcpConfigPresetUrl } from './mcpConfigPresets'
+import { resolveDaemonPreset } from './mcpConfigPresets'
 
-describe('resolveMcpConfigPresetUrl', () => {
-    it('shouldResolveSaycodePresetToItsMcpConfigUrl', () => {
-        expect(resolveMcpConfigPresetUrl('saycode')).toBe('https://saycode.ai/api/me/mcp-config')
+describe('resolveDaemonPreset', () => {
+    it('resolves the fixed MCP and trusted Studio addresses together', () => {
+        expect(resolveDaemonPreset('saycode')).toEqual({
+            mcpConfigUrl: 'https://saycode.ai/api/me/mcp-config',
+            studioOrigin: 'https://saycode.ai',
+        })
     })
 
     it('shouldReturnUndefinedForUnknownPreset', () => {
-        expect(resolveMcpConfigPresetUrl('does-not-exist')).toBeUndefined()
+        expect(resolveDaemonPreset('does-not-exist')).toBeUndefined()
     })
 })

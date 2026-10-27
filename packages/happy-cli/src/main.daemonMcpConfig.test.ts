@@ -85,11 +85,15 @@ describe('daemon MCP config CLI startup', () => {
     const endpoint = 'https://saycode.ai/api/me/mcp-config'
     expect(readPersistedSettings()).toEqual({
       schemaVersion: 2, onboardingCompleted: false, aplusMcpConfigUrl: endpoint,
+      aplusStudioOrigin: 'https://saycode.ai',
     })
     expect(mocks.spawn).toHaveBeenCalledWith(['daemon', 'start-sync'], expect.objectContaining({
-      detached: true, env: expect.objectContaining({ HAPPY_APLUS_MCP_CONFIG_URL: endpoint }),
+      detached: true, env: expect.objectContaining({
+        HAPPY_APLUS_MCP_CONFIG_URL: endpoint, HAPPY_APLUS_STUDIO_ORIGIN: 'https://saycode.ai',
+      }),
     }))
     expect(process.env.HAPPY_APLUS_MCP_CONFIG_URL).toBeUndefined()
+    expect(process.env.HAPPY_APLUS_STUDIO_ORIGIN).toBeUndefined()
     expect(existsSync(join(happyHome, 'settings.json.lock'))).toBe(false)
 
     mocks.spawn.mockClear()
@@ -97,6 +101,7 @@ describe('daemon MCP config CLI startup', () => {
 
     expect(mocks.spawn).toHaveBeenCalledTimes(1)
     expect(mocks.spawn.mock.calls[0][1].env.HAPPY_APLUS_MCP_CONFIG_URL).toBe(endpoint)
+    expect(mocks.spawn.mock.calls[0][1].env.HAPPY_APLUS_STUDIO_ORIGIN).toBe('https://saycode.ai')
   })
 
   it('prefers and persists the explicit endpoint over a preset without persisting session secrets', async () => {
@@ -108,9 +113,44 @@ describe('daemon MCP config CLI startup', () => {
 
     expect(readPersistedSettings()).toEqual({
       schemaVersion: 2, onboardingCompleted: false, aplusMcpConfigUrl: endpoint,
+      aplusStudioOrigin: 'https://saycode.ai',
     })
     expect(mocks.spawn.mock.calls[0][1].env.HAPPY_APLUS_MCP_CONFIG_URL).toBe(endpoint)
+    expect(mocks.spawn.mock.calls[0][1].env.HAPPY_APLUS_STUDIO_ORIGIN).toBe('https://saycode.ai')
     expect(process.env.HAPPY_APLUS_MCP_CONFIG_URL).toBe(sessionUrl)
+  })
+
+  it.each(['https://studio.example', 'http://localhost:5174'])(
+    'keeps an explicit Studio origin over the saycode preset (%s)', async origin => {
+      vi.stubEnv('HAPPY_APLUS_STUDIO_ORIGIN', origin)
+
+      await runCommand('start', 'saycode')
+
+      expect(mocks.spawn.mock.calls[0][1].env.HAPPY_APLUS_STUDIO_ORIGIN).toBe(origin)
+      expect(readPersistedSettings().aplusStudioOrigin).toBe(origin)
+      expect(process.env.HAPPY_APLUS_STUDIO_ORIGIN).toBe(origin)
+    },
+  )
+
+  it('does not infer a trusted origin from an MCP URL without a preset', async () => {
+    vi.stubEnv('HAPPY_APLUS_MCP_CONFIG_URL', 'https://saycode.ai/api/me/mcp-config')
+
+    await runCommand('start')
+
+    expect(mocks.spawn.mock.calls[0][1].env.HAPPY_APLUS_STUDIO_ORIGIN).toBeUndefined()
+    expect(readPersistedSettings().aplusStudioOrigin).toBeUndefined()
+  })
+
+  it('keeps a previously configured Studio origin when using the saycode preset', async () => {
+    await import('./configuration')
+    writeFileSync(join(happyHome, 'settings.json'), JSON.stringify({
+      schemaVersion: 2, onboardingCompleted: true, aplusStudioOrigin: 'https://registered.example',
+    }))
+
+    await runCommand('start', 'saycode')
+
+    expect(mocks.spawn.mock.calls[0][1].env.HAPPY_APLUS_STUDIO_ORIGIN).toBe('https://registered.example')
+    expect(readPersistedSettings().aplusStudioOrigin).toBe('https://registered.example')
   })
 
   it('restores the endpoint into process.env before invoking startDaemon', async () => {

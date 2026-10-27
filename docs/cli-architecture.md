@@ -876,6 +876,13 @@ message ACL, exact proof replay or the original staged-account boundary to simpl
 
 ## Organization Claude collector boundary
 
+`happy daemon start saycode` supplies both the fixed MCP configuration endpoint and
+`https://saycode.ai` as the trusted Studio default, even when the relay is local or
+custom. Explicit Studio environment configuration and a previously saved Studio
+origin retain priority; the existing startup resolver validates and persists the
+chosen origin for later starts. A standalone MCP URL never establishes Studio
+trust. Revisit the preset defaults if the official cloud origin changes.
+
 Desktop owns authenticated Studio discovery/reserve/publish and OFF-default scheduling.
 The customer-bound `ai-credential:collector-probe` daemon RPC fetches an Ed25519 public
 key only from the configured `HAPPY_APLUS_STUDIO_ORIGIN` origin, validates signed

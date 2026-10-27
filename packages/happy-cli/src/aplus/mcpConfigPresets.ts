@@ -1,14 +1,18 @@
 /**
- * `happy daemon start <preset>` 뒤에 붙는 preset 이름 -> HAPPY_APLUS_MCP_CONFIG_URL 매핑.
+ * `happy daemon start <preset>`의 MCP 주소와 신뢰 Studio 주소 기본값.
  *
- * 매번 `HAPPY_APLUS_MCP_CONFIG_URL=https://saycode.ai/api/me/mcp-config happy daemon start`
- * 처럼 전체 URL을 입력하는 불편함을 줄이기 위한 shorthand.
+ * 신뢰 주소는 고정 프리셋이 소유하며 임의의 MCP 주소에서 추론하지 않는다.
  */
 
-export const MCP_CONFIG_PRESETS: Record<string, string> = {
-    saycode: 'https://saycode.ai/api/me/mcp-config',
+type DaemonPreset = { mcpConfigUrl: string; studioOrigin: string }
+
+const DAEMON_PRESETS: Record<string, DaemonPreset> = {
+    saycode: {
+        mcpConfigUrl: 'https://saycode.ai/api/me/mcp-config',
+        studioOrigin: 'https://saycode.ai',
+    },
 }
 
-export function resolveMcpConfigPresetUrl(preset: string): string | undefined {
-    return MCP_CONFIG_PRESETS[preset]
+export function resolveDaemonPreset(preset: string): DaemonPreset | undefined {
+    return DAEMON_PRESETS[preset]
 }
