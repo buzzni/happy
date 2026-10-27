@@ -44,4 +44,13 @@ describe('resume of a session whose organization account left this PC', () => {
     expect(check).toBeLessThan(resume.indexOf('hasLiveDaemonChild('))
     expect(resume.slice(check, check + 400)).toContain("code: 'CLAUDE_ORGANIZATION_RESUME_REQUIRED'")
   })
+
+  it('never vouches for a live child with the record, since it may be on a consented personal fallback', async () => {
+    const resume = resumeBody(await runSource())
+    const live = resume.indexOf('if (hasLiveDaemonChild(')
+    const reuse = resume.indexOf('a live child is already attached — reusing it')
+    const refusal = resume.indexOf("if (options?.aiAuthRequirement) return { type: 'error', code: 'CLAUDE_ORGANIZATION_RESUME_REQUIRED'", live)
+    expect(refusal).toBeGreaterThan(live)
+    expect(refusal).toBeLessThan(reuse)
+  })
 })

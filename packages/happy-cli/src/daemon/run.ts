@@ -2858,6 +2858,8 @@ export async function startDaemon(): Promise<void> {
       let endResumeLaunch: (() => void) | undefined;
       try {
         if (hasLiveDaemonChild(happySessionId, pidToTrackedSession.values(), isPidAlive, ownsUnresolvedJob)) {
+          // The record vouches only for a process this resume starts: a live child may be on a consented personal fallback.
+          if (options?.aiAuthRequirement) return { type: 'error', code: 'CLAUDE_ORGANIZATION_RESUME_REQUIRED', errorMessage: `Session ${happySessionId} is still running; its account cannot be vouched for by the record.` };
           if (options?.automation || options?.writeScopeEnvironment) {
             return {
               type: 'error',
