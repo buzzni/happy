@@ -6,6 +6,10 @@
  * shutdown, the next process starting, or an unattended wait running out — writes one of these
  * into `completedRequests[id].resolution`. Clients read it to close the card on every screen and
  * to tell a late answer what happened; it never says who answered or what they chose.
+ *
+ * `auto-approved` marks a call the runtime approved itself (Codex `codex_apps`·`change_title`,
+ * Gemini's always-allowed tools and yolo modes): it never waited, so clients skip it rather than
+ * guess it from the record's shape (aplus-dev-studio I6k). Claude's own allow paths write no record.
  */
 
 export type PermissionResolution =
@@ -16,7 +20,8 @@ export type PermissionResolution =
     | 'expired'
     | 'reset'
     | 'shutdown'
-    | 'runtime-restart';
+    | 'runtime-restart'
+    | 'auto-approved';
 
 /**
  * What the child says it did with an answer.
