@@ -798,6 +798,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             unattended: () => turnAttendance.policyUnattended(),
             terminalPrompt: () => currentSession?.mode === 'local',
             grantTtlMs: REMOTE_GRANT_TTL_MS,
+            rpc: session.rpcHandlerManager,
         })
         : null;
     // I1b: the user's own cua-driver runs behind the shadow proxy, which then decides its calls. Only

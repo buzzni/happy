@@ -163,6 +163,8 @@ export function createToolPolicyGate(deps: {
         decide: async (call, signal) => {
             if (isPolicyExcludedTool(call.toolName, tables)) return { kind: 'pass' };
             const args = isRecord(call.toolInput) ? call.toolInput : {};
+            // Read before the grants are: a revoke from here on keeps this answer from granting (R18).
+            const askedAt = deps.grants.revision();
             let verdict: PolicyVerdict;
             try {
                 verdict = await evaluate(call, args);
@@ -213,7 +215,7 @@ export function createToolPolicyGate(deps: {
                     deps.grants.recordDenial(verdict.denialKey);
                     return refuse(call, verdict, 'user_denied', 'denied', answer);
                 }
-                if (answer.policyGrant === 'session' && verdict.grantOffer === 'session') deps.grants.grant(verdict.grantKeys);
+                if (answer.policyGrant === 'session' && verdict.grantOffer === 'session') deps.grants.grant(verdict.grantKeys, askedAt);
                 audit(call, verdict, 'approved', 'ask');
                 return { kind: 'allow' };
             } catch {

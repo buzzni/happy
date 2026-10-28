@@ -303,7 +303,7 @@ describe('tool policy switch and capability', () => {
     it('is on by default and off with HAPPY_TOOL_POLICY=off', () => {
         expect(isToolPolicyEnabled({})).toBe(true);
         expect(isToolPolicyEnabled({ HAPPY_TOOL_POLICY: 'off' })).toBe(false);
-        expect(toolPolicyMachineCapability({})).toEqual({ version: 1, enforcement: ['claude-hook', 'cua-proxy', 'codex-bridge', 'verb-words:all'], policyVersion: BUILTIN_TABLES.policyVersion });
+        expect(toolPolicyMachineCapability({})).toEqual({ version: 1, enforcement: ['claude-hook', 'cua-proxy', 'codex-bridge', 'verb-words:all', 'grant-control'], policyVersion: BUILTIN_TABLES.policyVersion });
         expect(toolPolicyMachineCapability({ HAPPY_TOOL_POLICY: 'OFF' })).toBeUndefined();
     });
 

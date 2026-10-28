@@ -294,7 +294,7 @@ export const MachineMetadataSchema = z.object({
   daemonSessionState: z.object({ version: z.literal(1) }).optional(),
   /**
    * aplus-dev-studio specs/agent-tool-policy — this daemon decides `mcp__*` calls before they run.
-   * `enforcement` names the adapters in force (I1b adds `cua-proxy`, `codex-bridge`); a plain string
+   * `enforcement` names the adapters in force (I1b adds `cua-proxy`, `codex-bridge`; T22b `grant-control`); a plain string
    * array so a newer daemon's value never makes an older client drop the field. Absent: no policy
    * (older daemon, or `HAPPY_TOOL_POLICY=off`) — Desktop must not claim rules are enforced.
    * `policyVersion`: the table this daemon decides by, so Desktop stops labelling tools from its own

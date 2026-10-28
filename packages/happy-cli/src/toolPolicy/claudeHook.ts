@@ -11,6 +11,7 @@
 
 import { join } from 'node:path';
 import { parseMcpToolName } from './evaluate';
+import { TOOL_POLICY_GRANT_CONTROL } from './grantControl';
 import { snapshotContradictsTarget, type ToolPolicyGate } from './policyGate';
 import { BUILTIN_TABLES, type ToolPolicyTables } from './rules';
 
@@ -34,10 +35,11 @@ export function isToolPolicyEnabled(env: NodeJS.ProcessEnv): boolean {
  * server under Codex has no adapter (Q5) — hence no `codex-user-mcp`. `verb-words:<rule>` names the MCP
  * verb rule this daemon decides by (policy-tables §4), so Desktop labels a conversation's tools by its PC's rule.
  * `policyVersion` names its table: Desktop's labels use its own PC's dictionary, so a different version labels nothing.
+ * `grant-control`: a session lists and revokes its conversation grants over session RPCs (grantControl.ts, R18).
  */
 export function toolPolicyMachineCapability(env: NodeJS.ProcessEnv): { version: 1; enforcement: string[]; policyVersion: string } | undefined {
     return isToolPolicyEnabled(env)
-        ? { version: 1, enforcement: ['claude-hook', 'cua-proxy', 'codex-bridge', `verb-words:${BUILTIN_TABLES.mcp.verbWords}`], policyVersion: BUILTIN_TABLES.policyVersion }
+        ? { version: 1, enforcement: ['claude-hook', 'cua-proxy', 'codex-bridge', `verb-words:${BUILTIN_TABLES.mcp.verbWords}`, TOOL_POLICY_GRANT_CONTROL], policyVersion: BUILTIN_TABLES.policyVersion }
         : undefined;
 }
 
