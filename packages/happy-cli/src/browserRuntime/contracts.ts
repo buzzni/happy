@@ -451,9 +451,24 @@ export interface DriverOptions {
     validateDispatch?: () => void
 }
 
+/** What the Runtime's input leases say about a tab when one of its popups appears or is cleaned up. */
+export interface InputEvidence {
+    /** The tab's input owner now. */
+    owner: InputOwner['kind']
+    /**
+     * A user holds, is taking or drains input on the profile, or did within the user
+     * activation window (a user gesture may still be live in any of its pages).
+     */
+    userInputRecent: boolean
+    /** Increases every time a user may start giving input on the profile. */
+    userControlEpoch: number
+}
+
 export interface BrowserDriver {
     /** Identity of the browser process this driver is connected to. */
     browserInstanceId(): BrowserInstanceId
+    /** Popup provenance (cdpDriver): the Runtime's input evidence per tab. Without it no popup counts as the agent's. */
+    setInputEvidence?(source: (tabId: TabId) => InputEvidence | undefined): void
     openTab(url: string, allowedOrigins: string[], opts: DriverOptions): Promise<DriverTabHandle>
     closeTab(tabId: TabId, opts: DriverOptions): Promise<{ closed: boolean; beforeUnloadBlocked?: boolean }>
     hasTab(tabId: TabId): boolean

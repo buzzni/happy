@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { BrowserRuntimeError, type BrowserDriver, type BrowserInstanceId, type DriverOptions, type DriverTabHandle, type ElementDescription, type ElementRef, type FormSubmission, type ObservedElement, type Observation, type ScreenshotResult, type SnapshotId, type TabId, type WaitPredicate } from '../contracts'
+import { BrowserRuntimeError, type BrowserDriver, type BrowserInstanceId, type DriverOptions, type DriverTabHandle, type ElementDescription, type ElementRef, type FormSubmission, type InputEvidence, type ObservedElement, type Observation, type ScreenshotResult, type SnapshotId, type TabId, type WaitPredicate } from '../contracts'
 import { formDigest, originAllowed } from '../policy'
 
 export interface FakePage { url: string; title?: string; text?: string; elements?: ObservedElement[]; documentGeneration?: number; frameOrigins?: string[]; formAction?: string; formValues?: Record<string, string>
@@ -51,6 +51,10 @@ export class FakeBrowserDriver implements BrowserDriver {
         this.snapshotGenerations.clear()
     }
     armAction(actionId: string): void { this.currentActionId = actionId }
+    private inputEvidenceSource?: (tabId: TabId) => InputEvidence | undefined
+    setInputEvidence(source: (tabId: TabId) => InputEvidence | undefined): void { this.inputEvidenceSource = source }
+    /** What the Runtime currently says about `tabId` (what a real driver would read when a popup appears). */
+    inputEvidence(tabId: TabId): InputEvidence | undefined { return this.inputEvidenceSource?.(tabId) }
     setDelay(operation: Operation, ms: number): void { this.delays.set(operation, ms) }
     setIgnoreWaitAbort(ignore: boolean): void { this.ignoreWaitAbort = ignore }
     holdAfterNextDispatch(operation: Operation): { entered: Promise<void>; release(): void } {

@@ -30,6 +30,7 @@ import {
     type ElementDescription,
     type ElementRef,
     type FormSubmission,
+    type InputEvidence,
     type Observation,
     type ObservedElement,
     type ObservedFrame,
@@ -40,6 +41,7 @@ import {
 } from '../contracts'
 import { formDigest, originAllowed } from '../policy'
 import { CdpConnection, CdpProtocolError, connectionClosedError } from './cdpConnection'
+import { PopupProvenance, type PopupOpenedBy } from './popupProvenance'
 import { verifySubmissionRequest } from './submissionCheck'
 import { CHECK_ELEMENT, CLIMB_FRAMES, COLLECT_FRAME, DESCRIBE_ELEMENT, FRAME_HAS_TEXT, HIT_TEST, IN_THIS_DOCUMENT, LABEL_OF, SELECT_CONTENT, SUBMIT_GUARD, type CollectedFrame, type ElementState } from './pageScripts'
 
@@ -80,10 +82,15 @@ export interface BlockedReport {
 }
 
 export interface PopupReport {
+    /** The owned tab it (transitively) came from, by CDP opener — never the active tab or a window position */
     openerTabId: TabId
     targetId: string
     origin: string
     closed: boolean
+    /** See popupProvenance.ts. Only the agent's popups close with their opener. */
+    openedBy: PopupOpenedBy
+    /** Its opener tab is gone and it was kept open: no task or tab owns it any more. */
+    released?: true
 }
 
 const ISOLATED_WORLD = '__abp_driver__'
@@ -277,7 +284,9 @@ export class CdpDriver implements BrowserDriver {
     private readonly tabsByTarget = new Map<string, TabState>()
     private readonly sessions = new Map<string, SessionInfo>()
     private readonly closedTabs = new Set<TabId>()
-    private readonly popups = new Map<string, PopupReport>()
+    private readonly popups = new Map<string, Omit<PopupReport, 'openedBy'>>()
+    private readonly provenance = new PopupProvenance()
+    private inputEvidence?: (tabId: TabId) => InputEvidence | undefined
     private readonly disconnectListeners = new Set<() => void>()
     private readonly dialogs: DialogReport[] = []
     /**
@@ -396,7 +405,11 @@ export class CdpDriver implements BrowserDriver {
 
     /** Pages opened by owned tabs. They are never adopted as owned tabs. */
     popupReports(): PopupReport[] {
-        return [...this.popups.values()].map((report) => ({ ...report }))
+        return [...this.popups.values()].map((report) => ({ ...report, openedBy: this.provenance.openedBy(report.targetId) }))
+    }
+
+    setInputEvidence(source: (tabId: TabId) => InputEvidence | undefined): void {
+        this.inputEvidence = source
     }
 
     // -----------------------------------------------------------------------
@@ -578,8 +591,8 @@ export class CdpDriver implements BrowserDriver {
         return undefined
     }
 
-    /** A page target auto-attached at browser level (always paused when new). */
-    private onPageAttached(conn: CdpConnection, sessionId: string, info: any): void {
+    /** A page target auto-attached at browser level (paused when new; `created` says it is). */
+    private onPageAttached(conn: CdpConnection, sessionId: string, info: any, created: boolean): void {
         if (this.attaching.has(info.targetId)) return
         const waiter = this.claimWaiters.get(info.targetId)
         if (waiter) {
@@ -593,6 +606,8 @@ export class CdpDriver implements BrowserDriver {
             this.popupDepths.set(info.targetId, depth)
             this.popupTabs.set(info.targetId, openerTab)
             this.popupSessions.set(sessionId, info.targetId)
+            // Only a page seen being created has a provenance; one that existed before (a restart) stays unknown.
+            if (created) this.provenance.popupCreated(info.targetId, openerTab.tabId, this.inputEvidence?.(openerTab.tabId))
             this.onTargetInfo(conn, info)
             if (!this.windowAvailable()) {
                 // Over the window cap. It must still run (a same-site popup shares the opener's
@@ -660,6 +675,22 @@ export class CdpDriver implements BrowserDriver {
         }
     }
 
+    /**
+     * The explicit cleanup of an owned tab also closes the popups its agent inputs opened
+     * (popupProvenance.ts); a user's or unknown popup, or one a user may have used since,
+     * stays open and is released.
+     */
+    private closeAgentPopups(conn: CdpConnection, tab: TabState): Array<Promise<void>> {
+        const evidence = this.inputEvidence?.(tab.tabId)
+        return [...this.popups.values()]
+            .filter((report) => report.openerTabId === tab.tabId && !report.closed && this.provenance.closesWithOpener(report.targetId, evidence))
+            .map((report) => {
+                report.closed = true
+                conn.send('Target.closeTarget', { targetId: report.targetId }).catch(() => undefined)
+                return this.targetDestroyed(report.targetId)
+            })
+    }
+
     navigate(tabId: TabId, url: string, allowedOrigins: string[], opts: DriverOptions): Promise<{ url: string; documentGeneration: number }> {
         return this.run(opts, async (op, conn) => {
             const tab = this.requireTab(tabId)
@@ -691,8 +722,9 @@ export class CdpDriver implements BrowserDriver {
                 })
                 const onGone = () => {
                     cleanup()
-                    // Report closed once the window is really gone (its reservation is released then).
-                    void this.targetDestroyed(tab.targetId).then(() => resolve({ closed: true }))
+                    const popups = this.closeAgentPopups(conn, tab)
+                    // Report closed once the windows are really gone (their reservations are released then).
+                    void Promise.all([this.targetDestroyed(tab.targetId), ...popups]).then(() => resolve({ closed: true }))
                 }
                 const cleanup = () => {
                     offDialog()
@@ -883,21 +915,26 @@ export class CdpDriver implements BrowserDriver {
             if (live?.form) await this.armSubmitGuard(conn, tab, binding, objectId, live.form)
             opts.validateDispatch?.()
             op.markDispatch()
-            const base = { x: point.x, y: point.y, button: 'left', clickCount: 1 }
-            await conn.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed', buttons: 1 }, binding.sessionId)
-            await conn.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased', buttons: 0 }, binding.sessionId)
-            // A submission's verdict: the page's (at submit/formdata) and then the request check's.
-            const guard = live?.form ? tab.submitGuard : undefined
-            if (guard) {
-                // Any sign of a submission (a page report, or the request itself), then — if one is
-                // under way — the request check's verdict. Page reports may be suppressed or lost.
-                await this.submitGuardStatus(guard, GUARD_SETTLE_MS, ['armed'])
-                await this.submitGuardStatus(guard, GUARD_VERDICT_MS, ['submitted', 'submitting'])
+            const endInput = this.provenance.beginAgentInput(tab.tabId)
+            try {
+                const base = { x: point.x, y: point.y, button: 'left', clickCount: 1 }
+                await conn.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed', buttons: 1 }, binding.sessionId)
+                await conn.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased', buttons: 0 }, binding.sessionId)
+                // A submission's verdict: the page's (at submit/formdata) and then the request check's.
+                const guard = live?.form ? tab.submitGuard : undefined
+                if (guard) {
+                    // Any sign of a submission (a page report, or the request itself), then — if one is
+                    // under way — the request check's verdict. Page reports may be suppressed or lost.
+                    await this.submitGuardStatus(guard, GUARD_SETTLE_MS, ['armed'])
+                    await this.submitGuardStatus(guard, GUARD_VERDICT_MS, ['submitted', 'submitting'])
+                }
+                if (guard?.lastStatus === 'blocked') {
+                    throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'the form submission changed after it was classified; it was stopped before it was sent', false, true)
+                }
+                this.assertEnforced(tab)
+            } finally {
+                endInput()
             }
-            if (guard?.lastStatus === 'blocked') {
-                throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'the form submission changed after it was classified; it was stopped before it was sent', false, true)
-            }
-            this.assertEnforced(tab)
         }, true)
     }
 
@@ -971,14 +1008,19 @@ export class CdpDriver implements BrowserDriver {
             await this.assertSameLabel(conn, binding, objectId)
             this.assertFresh(tab, binding, snapshotId)
             op.markDispatch()
-            if (value) {
-                await conn.send('Input.insertText', { text: value }, binding.sessionId)
-            } else {
-                const key = { key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46 }
-                await conn.send('Input.dispatchKeyEvent', { ...key, type: 'keyDown' }, binding.sessionId)
-                await conn.send('Input.dispatchKeyEvent', { ...key, type: 'keyUp' }, binding.sessionId)
+            const endInput = this.provenance.beginAgentInput(tab.tabId)
+            try {
+                if (value) {
+                    await conn.send('Input.insertText', { text: value }, binding.sessionId)
+                } else {
+                    const key = { key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46 }
+                    await conn.send('Input.dispatchKeyEvent', { ...key, type: 'keyDown' }, binding.sessionId)
+                    await conn.send('Input.dispatchKeyEvent', { ...key, type: 'keyUp' }, binding.sessionId)
+                }
+                this.assertEnforced(tab)
+            } finally {
+                endInput()
             }
-            this.assertEnforced(tab)
         }, true)
     }
 
@@ -1152,6 +1194,7 @@ export class CdpDriver implements BrowserDriver {
         tab.worlds.clear()
         for (const listener of [...tab.goneListeners]) listener()
         tab.goneListeners.clear()
+        for (const report of this.popups.values()) if (report.openerTabId === tab.tabId && !report.closed) report.released = true
     }
 
     /** Lets a retried closeTab of an already-closed owned tab return the same result. */
@@ -1168,6 +1211,8 @@ export class CdpDriver implements BrowserDriver {
         this.popupTabs.clear()
         this.popupSessions.clear()
         this.unclaimed.clear()
+        // Whatever happened while this driver was not watching is unknown.
+        this.provenance.clear()
     }
 
     /** Page/frame session of an owned tab: interception first, then (if paused) let it run. */
@@ -1197,7 +1242,7 @@ export class CdpDriver implements BrowserDriver {
             const targetInfo = params.targetInfo
             if (!childSessionId) return
             if (!parentSessionId) {
-                this.onPageAttached(conn, childSessionId, targetInfo)
+                this.onPageAttached(conn, childSessionId, targetInfo, params.waitingForDebugger === true)
                 return
             }
             const parent = this.sessions.get(parentSessionId)
@@ -1321,10 +1366,15 @@ export class CdpDriver implements BrowserDriver {
         const opener = this.popupTabs.get(info.targetId) ?? this.ownerTabOf(info.openerId)
         if (!opener) return
         const origin = originOf(info.url)
-        const report = this.popups.get(info.targetId) ?? { openerTabId: opener.tabId, targetId: info.targetId, origin, closed: false }
+        const report = this.popups.get(info.targetId)
+            ?? { openerTabId: opener.tabId, targetId: info.targetId, origin, closed: false, ...(this.tabs.get(opener.tabId) === opener ? {} : { released: true as const }) }
         report.origin = origin || report.origin
         this.popups.set(info.targetId, report)
-        if (this.popups.size > MAX_POPUP_REPORTS) this.popups.delete(this.popups.keys().next().value!)
+        if (this.popups.size > MAX_POPUP_REPORTS) {
+            const oldest = this.popups.keys().next().value!
+            this.popups.delete(oldest)
+            this.provenance.forget(oldest)
+        }
         const pending = !info.url || info.url === 'about:blank'
         if (!pending && !report.closed && !originAllowed(opener.allowedOrigins, origin)) {
             report.closed = true

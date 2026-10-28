@@ -4,7 +4,7 @@ import { BrowserRuntimeError, POC_LIMITS, SCHEMA_VERSION, TERMINAL_STATUSES, typ
     type BatchResult, type BatchStep, type BrowserDriver, type BrowserInstanceId, type BrowserRuntimeApi, type GrantId,
         type ApproveResult, type ControlResult, type RuntimeErrorBody, type SnapshotId, type InputOwner, type Operation,
             type PrincipalId, type ProfileId, type RequestId, type TaskEvent, type TaskId, type TaskSpaceId, type TaskView, type TaskStatus,
-                type TabId, type ApprovalId,
+                type TabId, type ApprovalId, type InputEvidence,
                 type DispatchExpectation, type ElementDescription, type ElementRef, type Observation, type ScreenshotResult, type SubscribeResult } from './contracts'
 import { assertOperation } from './auth'
 import { approvalPayloadHash, createApproval } from './approvals'
@@ -86,6 +86,11 @@ type UserWaitCompletion = {
 /** Finished tasks are not offered to the console; the listing is bounded (D12). */
 const FINISHED_STATUSES: ReadonlySet<TaskStatus> = new Set(TERMINAL_STATUSES)
 const LIST_TASKS_LIMIT = 50
+/**
+ * How long after user input may have been possible on a profile a popup can still be
+ * the user's: Chromium keeps a user gesture live for 5 s; twice that for margin.
+ */
+export const USER_INPUT_ACTIVATION_MS = 10_000
 
 
 export class BrowserRuntime implements BrowserRuntimeApi {
@@ -111,12 +116,21 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     private readonly approvalModeRequests = new Map<TaskId, Map<string, { hash: string; pending: boolean; epoch: number; failed?: true }>>()
     private readonly recovery: Promise<void>
     private readonly cleanup: Promise<void>
+    /** Per profile: whether a user may give input now, since when not, and how often that started. */
+    private readonly userInput = new Map<ProfileId, { epoch: number; active: boolean; endedAtMs: number }>()
     constructor(private readonly options: BrowserRuntimeOptions) {
         this.drivers = options.drivers instanceof Map ? options.drivers : new Map(Object.entries(options.drivers) as [
             ProfileId,
             BrowserDriver
         ][])
         this.clock = options.clock ?? systemClock
+        // A restart may follow user input by moments: the first window counts as recent.
+        for (const profileId of this.drivers.keys())
+            this.userInput.set(profileId, { epoch: 0, active: false, endedAtMs: this.clock.now() })
+        this.leases.subscribe(() => this.trackUserInput())
+        this.trackUserInput()
+        for (const [profileId, driver] of this.drivers)
+            driver.setInputEvidence?.((tabId) => this.inputEvidence(profileId, tabId))
         // Both reject (every API call then fails RUNTIME_UNAVAILABLE) when another assignment's state could not be ended.
         this.cleanup = this.settleAssignments()
         this.cleanup.catch(() => undefined)
@@ -910,6 +924,30 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 tabTargets, tabLeaseEpochs }
         })
         return 'closed'
+    }
+    /** Lease listener: a user holding, taking or draining input anywhere on a profile counts for all its tabs. */
+    private trackUserInput(): void {
+        for (const [profileId, state] of this.userInput) {
+            const active = this.leases.isUserFenced(profileId)
+            if (active && !state.active)
+                this.userInput.set(profileId, { ...state, epoch: state.epoch + 1, active })
+            else if (!active && state.active)
+                this.userInput.set(profileId, { ...state, active, endedAtMs: this.clock.now() })
+        }
+    }
+    /** What the driver reads when a popup of `tabId` appears, or when its opener is cleaned up. */
+    private inputEvidence(profileId: ProfileId, tabId: TabId): InputEvidence | undefined {
+        const state = this.userInput.get(profileId)
+        if (!state)
+            return undefined
+        let owner: InputOwner['kind']
+        try {
+            owner = this.leases.owner(tabId, profileId).owner.kind
+        } catch {
+            return undefined
+        }
+        return { owner, userControlEpoch: state.epoch,
+            userInputRecent: state.active || this.clock.now() - state.endedAtMs < USER_INPUT_ACTIVATION_MS }
     }
     /**
      * An unfinished task of the agent session waits for the user: an approval, a login or other hand-off,

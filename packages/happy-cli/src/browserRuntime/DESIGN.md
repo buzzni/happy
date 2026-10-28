@@ -294,6 +294,38 @@ in the browser image. Accounting (review P1-8): one reservation per target — t
 with every request of it failed. Whether this meets the 30-minute soak criterion is measured by
 `soak.mjs`, which reports cgroup memory and the Chromium process RSS sum separately.
 
+### Tab provenance at task end (2026-10-29)
+
+Owned tabs are the agent's: only `openPage` creates them, and `adoptTab` re-takes them by persisted
+targetId after a Runtime restart. Pages the user opens without an owned opener are never attached
+by the driver and never closed by the Runtime. Finishing or cancelling a task closes nothing;
+cleanup (`closePage`, space reclamation, retention, local client end) closes a space's own tabs,
+and a tab a user holds stays open.
+
+A popup belongs to the owned tab it came from by CDP `openerId` (through frames and popups), never
+by the active tab or a window position. Its provenance (`drivers/popupProvenance.ts`,
+`PopupReport.openedBy`) is decided once, when the driver sees it created (`waitingForDebugger`):
+
+- `agent`: created during exactly one agent click or fill on that tab (from its first dispatched
+  event until it returned), the only popup of that input, while the Runtime reports the agent's
+  lease on the tab and no user input on the profile now or within `USER_INPUT_ACTIVATION_MS`
+  (10 s; Chromium keeps a gesture live for 5 s). The Runtime answers through
+  `BrowserDriver.setInputEvidence` from its input leases; a user holding, taking or draining
+  input anywhere on the profile counts for every tab, and so does the first window after start.
+- `user`: created while the user held the opener tab (takeover, a hand-off).
+- `unknown`: everything else — page timers or a popup after the input returned, a second popup of
+  one input, overlapping inputs, a popup that existed before a restart or a lost connection, a
+  driver without input evidence.
+
+When cleanup closes an owned tab, the driver also closes its `agent` popups, unless a user gained
+control on the profile since the popup appeared or may give input now; it waits for their windows
+to be gone. Every other popup stays open and is marked `released`. Real Chrome 156 (headless,
+popup blocker on): a synchronous `window.open` or `target=_blank` link in the click lands inside
+the input; a second `window.open` of one click is blocked; a timer's popup after the click is
+`unknown`. Not covered: popups of pages the driver does not own. Known gap, unchanged here: a
+popup opened before a Runtime restart is released at the new connection's attach, so its requests
+are no longer checked (observed 2026-10-29: a POST to a disallowed origin was sent after restart).
+
 ### Destinations before requests (review P0-3)
 
 The driver auto-attaches every new page at browser level, paused (`waitForDebuggerOnStart`).
