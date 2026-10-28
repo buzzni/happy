@@ -19,8 +19,8 @@ if (process.platform === 'darwin') {
     const library = process.argv[4] && resolve(process.argv[4]);
     if (!library || !existsSync(library)) throw new Error('Pass the target architecture node.lib after the output path');
     compiler = 'cl.exe';
-    args = ['/nologo', '/LD', '/O2', '/W4', '/WX', '/MD', '/DNAPI_VERSION=8', '/DNODE_GYP_MODULE_NAME=browser_host',
-        '/I' + headers, source, '/link', library, '/OUT:' + output];
+    args = ['/nologo', '/std:c11', '/LD', '/O2', '/W4', '/WX', '/MD', '/DNAPI_VERSION=8', '/DNODE_GYP_MODULE_NAME=browser_host',
+        '/I' + headers, source, '/link', library, 'Advapi32.lib', '/OUT:' + output];
 }
 const result = spawnSync(compiler, args, { stdio: 'inherit', shell: false, cwd: dirname(output) });
 if (result.error) throw result.error;

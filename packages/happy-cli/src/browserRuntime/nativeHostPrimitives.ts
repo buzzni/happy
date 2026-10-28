@@ -11,6 +11,7 @@ interface NativeHostBinding {
     bootId(): string
     verifyRootOwned(fd: number): void
     processPrincipal(pid: number): string | null
+    verifyServiceFile(fd: number, sid: string, privateFile: boolean): void
 }
 let binding: NativeHostBinding | undefined
 export function nativeHostBindingPath(): string {
@@ -40,14 +41,21 @@ export function readNativePidStartTime(pid: number): string | undefined {
     return pidStartTime
 }
 
-/** macOS effective UID. Windows token SID support is a separate service gate;
- * the native binding refuses it rather than equating a username with a SID. */
+/** macOS effective UID or Windows token-user SID; never a display name. */
 export function readNativeProcessPrincipal(pid: number): string | undefined {
     if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 0x7fffffff) throw new Error('NATIVE_INVALID_PID')
     const principal = native().processPrincipal(pid)
     if (principal === null) return undefined
-    if (!/^(0|[1-9][0-9]{0,9})$/.test(principal) || Number(principal) > 0xffffffff) throw new Error('NATIVE_PROCESS_UNKNOWN')
+    if (process.platform === 'win32' ? !/^S-1-[0-9]+(?:-[0-9]+){1,15}$/.test(principal)
+        : !/^(0|[1-9][0-9]{0,9})$/.test(principal) || Number(principal) > 0xffffffff) throw new Error('NATIVE_PROCESS_UNKNOWN')
     return principal
+}
+
+/** The caller holds this descriptor while reading; parents must be verified by
+ * the service before opening. This check never repairs a permissive ACL. */
+export function verifyWindowsServiceFile(file: FileHandle, serviceSid: string, privateFile: boolean): void {
+    if (process.platform !== 'win32') throw new Error('NATIVE_PATH_VERIFIER_UNSUPPORTED')
+    native().verifyServiceFile(file.fd, serviceSid, privateFile)
 }
 
 /** Check every component without following symlinks. A privileged administrator
