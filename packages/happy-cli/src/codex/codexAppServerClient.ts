@@ -2122,7 +2122,10 @@ export class CodexAppServerClient {
     }
 
     get authRecoveryBusy(): boolean {
-        return !!this.pendingTurnCompletion || !!this.pendingInterrupt || this.outstandingServerRequests > 0 || this.pending.size > 0;
+        // Display-only project RPCs can be abandoned when explicit recovery replaces the process.
+        const pendingControl = [...this.pending.values()].some(request =>
+            request.method !== 'project/list' && request.method !== 'thread/metadata/update');
+        return !!this.pendingTurnCompletion || !!this.pendingInterrupt || this.outstandingServerRequests > 0 || pendingControl;
     }
 
     /** Explicit, idle-only recovery. Unlike legacy reconnect, failure never discards the thread. */

@@ -26,6 +26,8 @@ skip the assignment and preserve the successfully created thread. It never
 creates projects or moves older conversations. Revisit the scope source when
 external worktrees receive an explicit original-project identity; do not infer
 membership from folder names or broaden execution scope for display grouping.
+These disposable display RPCs do not hold the explicit authentication-recovery
+busy gate; turn, approval and goal-control operations keep their existing guards.
 
 ## Worktree Git write ownership
 
