@@ -405,3 +405,30 @@ clicks that actually gained permission from Auto, preserving manual/site-auto be
 ### Desktop approval entry
 
 The console advertises task-scoped controls with `window.__abpTaskAutoControls === 1`. Desktop scoped launches withhold the interactive capability until this marker is confirmed. An older console never receives it through that path. `agentSessionId` is a UI selection hint, not authority: the task API still checks the capability owner/profile. An empty scope clears the previous selection and never picks another conversation. Approval cards share the explicit scope dialog; changing mode does not answer their pending approval.
+
+## Agent observation output (2026-10-29)
+
+`agentTools.ts` `wrapObservation` shapes the `Observation` DTO for the model in the observe tool,
+in the direct `result.steps[]` of submit_batch and in `getTask`'s last batch. The DTO, the DOM
+collector, refs and `sanitizeObservation` are unchanged; submit_batch's nested `task.lastBatch`
+is passed through as before.
+
+- Elements leave out `visible: true` and a `frameOrigin` equal to the origin of `url`. Applying
+  the note's two rules gives back the DTO's elements exactly.
+- Frame text is sent once when the frames' texts are the whole page text: the top document's
+  text was collected (`frames[0]`, which the driver lists first) and `text` is the join of the
+  non-empty frame texts, or `''` because a frame was denied. Then `pageText` is the top
+  document's text and each other frame keeps its own `frames[].pageText`; a frame without
+  `pageText` had no text collected. Otherwise (partial per-frame text, a fake driver) `pageText`
+  stays the whole page text and frames keep theirs, as before, so no text is dropped. The note
+  says which of the two the output is.
+
+`cdpDriver.poc.test.ts` "agent observation output" checks this on real same- and cross-origin
+frames. Measured through the real Runtime and tool handler on local fixtures, the observe tool
+output is 40–52% smaller (bytes and local tokenizer estimates); a whole submit_batch response
+shrinks less (18–25%) because `task.lastBatch` is unchanged. The longer note makes an observation
+with a denied frame and fewer than about four elements slightly larger. The collector path is
+untouched: timing the registered observe tool in-process (MCP client to response, through the
+Runtime and CDP collection) against the code before this change on the same fixtures, in eight
+interleaved rounds, gave the same median latency (within 1%) and overlapping p95 ranges.
+Transport, network, UI and model latency were not measured.

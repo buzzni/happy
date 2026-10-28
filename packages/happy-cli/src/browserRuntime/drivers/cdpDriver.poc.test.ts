@@ -6,8 +6,9 @@
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { randomUUID } from 'node:crypto'
-import { BrowserRuntimeError, type BrowserInstanceId, type DispatchExpectation, type ElementDescription, type ElementRef, type Observation, type TabId } from '../contracts'
-import { formDigest } from '../policy'
+import { wrapObservation } from '../agentTools'
+import { BrowserRuntimeError, type BrowserInstanceId, type DispatchExpectation, type ElementDescription, type ElementRef, type Observation, type ObservedElement, type TabId } from '../contracts'
+import { formDigest, originOf } from '../policy'
 import { CdpDriver } from './cdpDriver'
 import { HIT_SCRIPT, HarnessCdp, decodePng, delay, eventually, findChrome, launchChrome, startSite, type LaunchedChrome, type Site } from './pocTestKit'
 
@@ -197,6 +198,24 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
         a.route('/beforeunload', `${HIT_SCRIPT}<body><script>addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = '' })</script><button onclick="hit('bu')">Touch</button></body>`)
         a.route('/many', `<body>${Array.from({ length: 5 }, (_, i) => `<button>First ${i}</button>`).join('')}
             <section aria-label="Second list">${Array.from({ length: 30 }, (_, i) => `<button>Second ${i}</button>`).join('')}</section></body>`)
+        // A storefront-shaped page: navigation, a hidden mobile menu, a product grid, a same-origin
+        // reviews frame, a cross-origin pay widget and a frame of an origin the task does not allow.
+        a.route('/catalog', () => `<title>Catalog A</title>${HIT_SCRIPT}<body>
+            <nav aria-label="Main">${Array.from({ length: 12 }, (_, i) => `<a href="/dept/${i}">Department ${i}</a>`).join('')}</nav>
+            <nav aria-label="Mobile" style="display:none">${Array.from({ length: 6 }, (_, i) => `<a href="/m/${i}">Mobile link ${i}</a>`).join('')}</nav>
+            <form role="search" action="/search"><input name="q" aria-label="Search" value="lamp"><button>Search</button></form>
+            <main><h1>Lamps</h1><p>catalog-unique-text-a1 Prices include tax.</p>
+            ${Array.from({ length: 10 }, (_, i) => `<section aria-label="Product ${i}"><a href="/p/${i}">Lamp ${i}</a><p>Lamp ${i} costs ${10 + i} dollars</p>
+                <input type="number" aria-label="Quantity ${i}" value="1"><button onclick="hit('add-${i}')">Add to cart</button></section>`).join('')}
+            <button disabled>Checkout</button><div id="host"></div>
+            <label>Password <input type="password" value="synthetic-pass-canary-123"></label></main>
+            <iframe src="/reviews" style="width:400px;height:150px;border:0"></iframe>
+            <iframe src="${b.url('/pay-widget')}" style="width:400px;height:150px;border:0"></iframe>
+            <iframe src="${c.url('/plain')}" style="width:100px;height:50px;border:0"></iframe>
+            <script>document.getElementById('host').attachShadow({mode:'open'}).innerHTML = '<button>Shadow help</button>'</script></body>`)
+        a.route('/reviews', `${HIT_SCRIPT}<body style="margin:0"><p>reviews-unique-text-a2 Great lamp</p><button onclick="hit('helpful')">Add to cart</button></body>`)
+        b.route('/pay-widget', `${HIT_SCRIPT}<body style="margin:0"><p>pay-unique-text-b1 Card ending 4242</p><input aria-label="Card name" value="Synthetic">
+            <button onclick="hit('widget-add')">Add to cart</button></body>`)
     })
 
     const opened: TabId[] = []
@@ -500,6 +519,57 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             expect(scoped.truncated).toBe(false)
             expect(scoped.elements).toHaveLength(30)
             expect(scoped.elements.every((e) => e.name.startsWith('Second '))).toBe(true)
+        })
+    })
+
+    describe('agent observation output', () => {
+        type Sent = ReturnType<typeof wrapObservation>
+        type SentElement = Omit<ObservedElement, 'visible' | 'frameOrigin'> & { visible?: boolean; frameOrigin?: string }
+        // A consumer applying the note's rules gets the driver's elements and frame texts back.
+        const restoreElements = (sent: Sent) => (sent.elements as SentElement[]).map((e) => ({ ...e, visible: e.visible ?? true, frameOrigin: e.frameOrigin ?? originOf(sent.url) }))
+        const frameTexts = (sent: Sent) => sent.frames.map((frame, index) => index === 0 ? sent.pageText : (frame as { pageText?: string }).pageText)
+
+        it('sends each frame\'s text once and elements whose left-out defaults restore the driver snapshot (same- and cross-origin frames)', async () => {
+            const tab = await open('/catalog', [a.origin, b.origin])
+            await eventually(() => driver.observe(tab.tabId, [a.origin, b.origin], OPTS),
+                (o) => o.text.includes('reviews-unique-text-a2') && o.text.includes('pay-unique-text-b1'))
+            const obs = await driver.observe(tab.tabId, [a.origin, b.origin], OPTS)
+            const serialized = JSON.stringify(wrapObservation(obs))
+            const sent = JSON.parse(serialized) as Sent
+
+            expect(sent.note).toContain('top document')
+            expect(restoreElements(sent)).toEqual(obs.elements)
+            expect(sent.frames.map(({ pageText: _text, ...frame }: { pageText?: string }) => frame)).toEqual(obs.frames.map(({ text: _text, ...frame }) => frame))
+            expect(frameTexts(sent)).toEqual(obs.frames.map((frame) => frame.text))
+            expect(frameTexts(sent).filter(Boolean).join('\n\n')).toBe(obs.text)
+            for (const unique of ['catalog-unique-text-a1', 'reviews-unique-text-a2', 'pay-unique-text-b1'])
+                expect(serialized.split(unique), unique).toHaveLength(2)
+            expect(serialized).not.toContain('Charlie')
+            expect(serialized).not.toContain('synthetic-pass-canary')
+
+            // Same-label buttons in three frames stay distinct; a frame ref maps to its frames[] entry.
+            const adds = sent.elements.filter((e) => e.name === 'Add to cart' && e.ref.includes(':'))
+            const frameOf = (ref: string) => sent.frames.find((f) => f.frameKey === ref.slice(1, ref.indexOf(':')))!
+            const reviews = adds.find((e) => frameOf(e.ref).origin === a.origin)!
+            const widget = adds.find((e) => frameOf(e.ref).origin === b.origin)!
+            expect(reviews).toEqual({ ref: reviews.ref, role: 'button', name: 'Add to cart' })
+            expect(widget).toEqual({ ref: widget.ref, role: 'button', name: 'Add to cart', frameOrigin: b.origin })
+            expect(frameOf(widget.ref)).toMatchObject({ allowed: true, outOfProcess: true, pageText: expect.stringContaining('pay-unique-text-b1') })
+            expect(frameOf(reviews.ref)).toMatchObject({ allowed: true, outOfProcess: false, pageText: expect.stringContaining('reviews-unique-text-a2') })
+            expect(sent.elements.find((e) => e.name === 'Mobile link 0')).toMatchObject({ visible: false })
+            expect(sent.elements.find((e) => e.name === 'Checkout')).toMatchObject({ disabled: true })
+            expect(sent.elements.find((e) => e.name === 'Search' && e.role === 'textbox')).toMatchObject({ value: 'lamp' })
+
+            // The refs the agent reads still address exactly their own element.
+            await driver.click(tab.tabId, widget.ref as ElementRef, obs.snapshotId, OPTS)
+            expect(await eventually(() => b.hits('widget-add'), (n) => n === 1)).toBe(1)
+            await driver.click(tab.tabId, reviews.ref as ElementRef, obs.snapshotId, OPTS)
+            expect(await eventually(() => a.hits('helpful'), (n) => n === 1)).toBe(1)
+            await delay(200)
+            expect([a.hits('add-0'), a.hits('helpful'), b.hits('widget-add')]).toEqual([0, 1, 1])
+            const fresh = await driver.observe(tab.tabId, [a.origin, b.origin], OPTS)
+            await expectCode(driver.click(tab.tabId, widget.ref as ElementRef, obs.snapshotId, OPTS), 'STALE_REF')
+            expect(fresh.snapshotId).not.toBe(obs.snapshotId)
         })
     })
 
