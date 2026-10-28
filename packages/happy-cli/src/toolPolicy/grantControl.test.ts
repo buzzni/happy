@@ -33,6 +33,12 @@ function clock(start = 1_000) {
 }
 
 describe('tool policy grant control RPCs (aplus-dev-studio specs/agent-tool-policy R18, T22b)', () => {
+    it('uses the names Desktop calls, with no colon so a managed run can register them later', () => {
+        // happy-server authorizeManagedRpcName refuses any name with ':' before it reads its allowlist.
+        expect(TOOL_POLICY_GRANTS_RPC).toBe('tool-policy-grants');
+        expect(TOOL_POLICY_REVOKE_GRANT_RPC).toBe('tool-policy-revoke-grant');
+    });
+
     it('lists the live conversation grants as Desktop reads them', async () => {
         const time = clock();
         const grants = createPolicyGrantStore({ now: time.now, grantTtlMs: REMOTE_GRANT_TTL_MS });
