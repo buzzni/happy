@@ -186,6 +186,17 @@ describe('a tab handed to the user', () => {
         await h.store.close()
     })
 
+    it('leaves its space once the user has closed it in the browser, freeing the quotas', async () => {
+        const h = await harness()
+        const page = await h.open()
+        await h.handOff(page)
+        await h.runtime.endSession('session-a')
+        await h.driver.closeTab(page.tabId, { timeoutMs: 1000 })
+        expect(await h.runtime.reclaimSpaces()).toEqual([expect.objectContaining({ taskSpaceId: page.taskSpaceId, closed: true, closedTabs: [page.tabId] })])
+        expect(h.store.getSpace(page.taskSpaceId)?.tabDispositions ?? {}).toEqual({})
+        await h.store.close()
+    })
+
     it('keeps its task record through retention: the expired task is not purged while the tab is kept', async () => {
         const h = await harness()
         const page = await h.open()

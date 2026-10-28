@@ -905,11 +905,11 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     }
     /**
      * Closes one space tab in the browser and only then drops it from the space. A target
-     * that is already gone (closed just before a crash) counts as closed; a tab a user holds,
-     * or one kept for the user (unless an operator forces it), is not touched.
+     * that is already gone (closed just before a crash, or by the user) counts as closed; a tab a
+     * user holds, or one kept for the user that still exists (unless an operator forces it), is not touched.
      */
     private async closeSpaceTab(profileId: ProfileId, taskSpaceId: TaskSpaceId, tabId: TabId, force = false): Promise<'closed' | 'held' | 'retained' | 'blocked' | 'failed'> {
-        if (!force && this.isRetained(this.requireSpace(taskSpaceId), tabId))
+        if (!force && this.isRetained(this.requireSpace(taskSpaceId), tabId) && this.driver(profileId).hasTab(tabId))
             return 'retained'
         if (this.leases.owner(tabId, profileId).owner.kind !== 'none')
             return 'held'
