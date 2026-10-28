@@ -8,6 +8,7 @@ export default defineConfig({
         globalSetup: ['./src/test-setup.ts'],
         projects: [
             {
+                resolve: { alias: { '@': resolve('./src') } },
                 test: {
                     name: 'integration-claude-auth-pin',
                     environment: 'node',

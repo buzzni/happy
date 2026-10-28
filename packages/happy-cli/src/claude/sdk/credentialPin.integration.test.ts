@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { query as sdkQuery, type Query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { createServer, type Server } from 'node:http';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -6,6 +6,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { queryWithPinnedCredential } from './credentialPin';
+import { query as happyQuery } from './query';
 
 // Explicit real-SDK opt-in. All credentials, HOME, hooks, policies and HTTP traffic are local fixtures.
 const enabled = process.env.HAPPY_CLAUDE_AUTH_PIN_INTEGRATION === '1';
@@ -14,6 +15,7 @@ let root: string, server: Server | undefined, q: Query | undefined;
 let children: ChildProcess[] = [];
 afterEach(async () => {
     q?.close(); q = undefined;
+    vi.unstubAllEnvs();
     for (const child of children) if (child.exitCode === null && child.signalCode === null) {
         const stopped = await Promise.race([new Promise<boolean>(r => child.once('exit', () => r(true))), new Promise<boolean>(r => setTimeout(() => r(false), 3000))]);
         if (!stopped) { child.kill('SIGKILL'); throw new Error('owned SDK process did not exit'); }
@@ -28,10 +30,11 @@ describe.skipIf(!enabled)('real SDK credential pin with project rules', () => {
         const home = join(root, 'home'), config = join(home, '.claude'), project = join(root, 'project');
         mkdirSync(config, { recursive: true }); mkdirSync(join(project, '.claude'), { recursive: true });
         const policyPath = join(root, 'managed-settings.json');
-        const received: Array<{ owned: boolean; key: boolean; body: Record<string, any> }> = [];
+        const received: Array<{ owned: boolean; staleUser: boolean; key: boolean; body: Record<string, any> }> = [];
         server = createServer(async (req, res) => {
             let text = ''; for await (const chunk of req) text += chunk;
-            received.push({ owned: req.headers.authorization === `Bearer ${TOKEN}`, key: !!req.headers['x-api-key'], body: JSON.parse(text) });
+            if (!req.url?.startsWith('/v1/messages')) { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{}'); return; }
+            received.push({ owned: req.headers.authorization === `Bearer ${TOKEN}`, staleUser: req.headers.authorization === 'Bearer fixture-wrong-oauth', key: !!req.headers['x-api-key'], body: JSON.parse(text) });
             const result = { id: 'msg_fixture', type: 'message', role: 'assistant', model: 'claude-sonnet-4-6', content: [{ type: 'text', text: 'fixture result' }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } };
             if (!JSON.parse(text).stream) { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(result)); return; }
             if (managedConflict === 'reload') {
@@ -88,6 +91,81 @@ describe.skipIf(!enabled)('real SDK credential pin with project rules', () => {
         };
         return { received, options: { ...options, settingSources: [...options.settingSources] }, hooksPath, files, settings, args, stderr };
     }
+    it.each(['default', 'explicit'] as const)('pins organization requests through the real query adapter (%s sources)', async sources => {
+        const f = await prepare();
+        // Keep the endpoint local even before the fix; all credential conflicts still exercise the SDK.
+        f.files.forEach((path, i) => {
+            const settings = f.settings(['user', 'project', 'local'][i]);
+            delete (settings.env as Record<string, string>).ANTHROPIC_BASE_URL;
+            writeFileSync(path, JSON.stringify(settings));
+        });
+        const originals = f.files.map(path => readFileSync(path, 'utf8'));
+        for (const key of Object.keys(process.env)) if (key.startsWith('ANTHROPIC_') || key.startsWith('CLAUDE_CODE_')) vi.stubEnv(key, undefined);
+        for (const [key, value] of Object.entries(f.options.env)) vi.stubEnv(key, value);
+        vi.stubEnv('HAPPY_AI_AUTH_SOURCE', 'org-bundle');
+        vi.stubEnv('HAPPY_CLAUDE_PATH', undefined);
+        let next!: () => void; const second = new Promise<void>(resolve => { next = resolve; });
+        async function* prompt(): AsyncGenerator<SDKUserMessage> {
+            yield { type: 'user', parent_tool_use_id: null, message: { role: 'user', content: 'first-org-request' } };
+            await second;
+            yield { type: 'user', parent_tool_use_id: null, message: { role: 'user', content: 'second-org-request' } };
+            await new Promise(() => {});
+        }
+        q = happyQuery({ prompt: prompt(), options: { cwd: f.options.cwd, model: f.options.model,
+            settingSources: sources === 'default' ? undefined : f.options.settingSources,
+            spawnClaudeCodeProcess: f.options.spawnClaudeCodeProcess, persistSession: false, tools: [], maxTurns: 2 } });
+        let results = 0; let rules: string[] = [];
+        for await (const message of q) if (message.type === 'result') {
+            expect(message.is_error).toBe(false); results++;
+            if (results === 1) next(); else {
+                const controls = q as Query & { listPermissionRules(): Promise<{ state: { rules: Array<{ rule: string }> } }> };
+                rules = (await controls.listPermissionRules()).state.rules.map(rule => rule.rule);
+                break;
+            }
+        }
+        expect(results).toBe(2);
+        expect(f.received.length).toBeGreaterThanOrEqual(2);
+        expect(f.received.every(r => r.owned && !r.key)).toBe(true);
+        expect(f.files.map(path => readFileSync(path, 'utf8'))).toEqual(originals);
+        const hooks = readFileSync(f.hooksPath, 'utf8');
+        for (const source of ['user', 'project', 'local']) expect(hooks).toContain(source);
+        expect(f.received.some(r => JSON.stringify(r.body).includes('PROJECT_RULE_AUTH_PIN_729'))).toBe(true);
+        expect(rules).toEqual(expect.arrayContaining(['Bash(user-denied)', 'Bash(project-denied)', 'Bash(local-denied)']));
+        expect(f.args.flat().some(arg => arg.includes(TOKEN))).toBe(false);
+    }, 30_000);
+    it('reproduces a stale user OAuth override and verifies operator cleanup for an organization token', async () => {
+        const f = await prepare();
+        // The raw SDK route reproduces the original organization-launch conflict without Happy’s guard.
+        // Isolate exactly the live conflict: only the user file overrides OAuth; every other auth key is absent.
+        f.files.forEach((path, i) => writeFileSync(path, JSON.stringify({
+            permissions: { deny: [`Bash(source-${i}-denied)`] },
+            env: i === 0 ? { CLAUDE_CODE_OAUTH_TOKEN: 'fixture-wrong-oauth', KEEP_user: 'yes' } : {},
+        })));
+        const selected = JSON.parse(readFileSync(f.files[0], 'utf8'));
+        const originalProject = f.files.slice(1).map(path => readFileSync(path, 'utf8'));
+        for (const override of [true, false]) {
+            if (!override) {
+                // Equivalent to the operator's one-key cleanup; it must leave non-auth rules intact.
+                delete selected.env.CLAUDE_CODE_OAUTH_TOKEN;
+                writeFileSync(f.files[0], JSON.stringify(selected));
+            }
+            const start = f.received.length;
+            q = sdkQuery({ prompt: 'Reply OK only.', options: f.options });
+            try {
+                for await (const message of q) if (message.type === 'result') {
+                    expect(message.is_error).toBe(false);
+                    break;
+                }
+            } finally { q.close(); q = undefined; }
+            const requests = f.received.slice(start);
+            expect(requests.length).toBeGreaterThan(0);
+            expect(requests.every(r => r.owned === !override && r.staleUser === override && !r.key)).toBe(true);
+        }
+        expect(JSON.parse(readFileSync(f.files[0], 'utf8'))).toEqual({
+            permissions: { deny: ['Bash(source-0-denied)'] }, env: { KEEP_user: 'yes' },
+        });
+        expect(f.files.slice(1).map(path => readFileSync(path, 'utf8'))).toEqual(originalProject);
+    }, 30_000);
     it.each(['default', 'explicit'] as const)('keeps CLAUDE.md, hooks and deny rules through two personal requests (%s sources)', async sources => {
         const f = await prepare(); const originals = f.files.map(path => readFileSync(path, 'utf8'));
         let next!: () => void; const nextInput = new Promise<void>(r => { next = r; });

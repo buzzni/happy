@@ -1,4 +1,5 @@
 export const PERSONAL_CLAUDE_AUTH_FAILURE = 'CLAUDE_PERSONAL_AUTH_NOT_VERIFIED';
+export const ORGANIZATION_CLAUDE_AUTH_FAILURE = 'CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED';
 
 /**
  * What the user is told when Claude Code exits before its first SDK message (Desktop
@@ -8,6 +9,7 @@ export const PERSONAL_CLAUDE_AUTH_FAILURE = 'CLAUDE_PERSONAL_AUTH_NOT_VERIFIED';
  */
 export function describeClaudeLaunchFailure(error: unknown): string {
     const text = error instanceof Error ? error.message : String(error);
+    if (text === ORGANIZATION_CLAUDE_AUTH_FAILURE) return 'Organization Claude stopped because the assigned account or policy could not be verified. Check this machine’s CLI and assigned account, then send again.';
     if (text === PERSONAL_CLAUDE_AUTH_FAILURE) return 'Personal Claude stopped because the selected account or policy could not be verified. Check the account and send again.';
     const code = (error as { code?: unknown } | null)?.code;
     if (/cannot be used with root\/sudo privileges/i.test(text)) {

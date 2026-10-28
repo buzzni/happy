@@ -960,3 +960,22 @@ the corresponding CLI release retains the old facade. Publish/install acceptance
 ### Local applications using Agent Browser spaces
 
 `browserRuntime/localClients.ts` owns bounded client delegation separately from daemon session registrations. An existing authenticated session delegates its own space under the same principal; the runtime checks space membership, assignment and tab ownership. Client credentials can request only a narrow AgentGrant and cannot register or join other spaces. `runtime.ts` persists fixed client leases on spaces, fences expired/revoked clients and preserves ordinary reclaim behavior for other spaces. `browserRuntime/localClientSession.ts` holds the owner credential inside the trusted session process, requests human-only one-time approval and issues a private connection file. Claude/Codex wire the existing permission approver; other runners fail closed. `commands/browserClientCommand.ts` provides bounded collection/status/revocation without loading provider runtimes; public CLI issuance is disabled. This is not the Chrome extension bridge. See [the local-client contract](browser-local-client.md) for expiry, downgrade and same-OS-user limitations. Revisit this boundary before adding indefinite renewal, remote clients or a broader extraction API.
+
+
+### Organization OAuth at the SDK request boundary
+
+`claude/sdk/query` protects a daemon-applied `org-bundle` OAuth token with the same
+`credentialPin` controls as explicit personal fallback. Spawn-environment scrubbing alone
+is insufficient: Claude loads user/project/local `settings.env` after process startup.
+The guard pins authentication flags, checks effective settings and first-party token source
+before each input/side question, and ends the credential generation on mandatory policy changes.
+Project rules, hooks, permission denies and non-auth settings keep their original sources;
+credential conflicts never cause edits to user files or fallback to a different payer.
+
+The daemon remains responsible for assignment, custody, generation and rotation admission.
+Every new SDK query snapshots the token selected for that session generation, including
+resume and off-turn titles. API-key/gateway routes without a selected OAuth token and ordinary
+personal logins retain their existing route. Organization verification failures use
+`CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED`, independently of the personal failure code.
+The pinned SDK/CLI must prove the control/settings contract; a missing or incompatible
+contract fails closed. Revisit this boundary when upgrading the pinned Claude runtime.
