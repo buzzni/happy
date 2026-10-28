@@ -7,7 +7,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { randomUUID } from 'node:crypto'
 import { wrapObservation } from '../agentTools'
-import { BrowserRuntimeError, type BrowserInstanceId, type DispatchExpectation, type ElementDescription, type ElementRef, type InputEvidence, type Observation, type ObservedElement, type TabId } from '../contracts'
+import { BrowserRuntimeError, type BrowserInstanceId, type DispatchExpectation, type ElementDescription, type ElementRef, type Observation, type ObservedElement, type TabId } from '../contracts'
 import { formDigest, originOf } from '../policy'
 import { CdpDriver } from './cdpDriver'
 import { HIT_SCRIPT, HarnessCdp, decodePng, delay, eventually, findChrome, launchChrome, startSite, type LaunchedChrome, type Site } from './pocTestKit'
@@ -172,9 +172,6 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             <button onclick="window.worker = new Worker(window.URL.createObjectURL(new Blob(['fetch(\\'${a.url('/hit/worker-ran')}\\', { method: \\'POST\\' })'], { type: 'text/javascript' })))">Start worker</button>
             <button onclick="const f = document.createElement('iframe'); f.src = '${b.url('/frame-runs')}'; document.body.append(f)">Add frame</button></body>`)
         a.route('/popup-opener', () => `<body>popup</body>`)
-        a.route('/prov', () => `<body><button id="one" onclick="window.open('${a.url('/plain')}')">Open one</button>
-            <button onclick="setTimeout(() => window.open('${a.url('/plain?later')}'), 1500)">Open later</button>
-            <a href="${a.url('/plain?link')}" target="_blank">Blank link</a></body>`)
         b.route('/frame-runs', () => `<body><script>fetch('/hit/frame-ran', { method: 'POST' })</script>frame</body>`)
         const encodings = { get: ['get', 'application/x-www-form-urlencoded'], post: ['post', 'application/x-www-form-urlencoded'],
             multipart: ['post', 'multipart/form-data'], text: ['post', 'text/plain'] } as const
@@ -1182,158 +1179,6 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             await harness.closeTarget(tab.targetId)
             expect(await eventually(() => driver.hasTab(tab.tabId), (owned) => !owned)).toBe(false)
         })
-    })
-
-    describe('popup provenance and cleanup', () => {
-        // Its own browser: another driver attached to the same browser would release paused popups.
-        let own: LaunchedChrome
-        let ownHarness: HarnessCdp
-        let evidence: Record<string, InputEvidence>
-        const agentLease: InputEvidence = { owner: 'agent', userInputRecent: false, userControlEpoch: 0 }
-        const quiet: InputEvidence = { owner: 'none', userInputRecent: false, userControlEpoch: 0 }
-        const userHolds: InputEvidence = { owner: 'user', userInputRecent: true, userControlEpoch: 1 }
-        beforeAll(async () => {
-            own = await launchChrome()
-            ownHarness = await HarnessCdp.connect(own.browserWsUrl)
-        })
-        afterAll(async () => {
-            ownHarness?.close()
-            await own?.stop()
-        })
-        async function withDriver(body: (d: CdpDriver) => Promise<void>) {
-            evidence = {}
-            const d = new CdpDriver({ browserWsUrl: own.browserWsUrl, browserInstanceIdProvider: async () => instanceId, maxAgentWindows: 8 })
-            d.setInputEvidence((tabId) => evidence[tabId])
-            await d.connect()
-            try {
-                await body(d)
-            } finally {
-                await d.close()
-                for (const target of await ownHarness.targets()) if (target.type === 'page' && target.url !== 'about:blank') await ownHarness.closeTarget(target.targetId)
-            }
-        }
-        async function press(d: CdpDriver, tabId: TabId, name: string) {
-            const obs = await d.observe(tabId, [a.origin], OPTS)
-            await d.click(tabId, refOf(obs, name), obs.snapshotId, OPTS)
-        }
-        /** What a user's click in the viewer is: page input that is not a driver operation. */
-        const userClick = (targetId: string) => ownHarness.evaluate(targetId, `document.getElementById('one').click()`, { userGesture: true })
-        const popupsOf = (d: CdpDriver, tabId: TabId) => d.popupReports().filter((p) => p.openerTabId === tabId)
-        const alive = async (targetId: string) => (await ownHarness.targets()).some((t) => t.targetId === targetId)
-
-        it('closes the popup its agent input opened with the tab, and keeps one a page timer opened later', async () => {
-            await withDriver(async (d) => {
-                const tab = await d.openTab(a.url('/prov'), [a.origin], OPTS)
-                evidence[tab.tabId] = agentLease
-                await press(d, tab.tabId, 'Open one')
-                await press(d, tab.tabId, 'Blank link')
-                await press(d, tab.tabId, 'Open later')
-                const reports = await eventually(() => popupsOf(d, tab.tabId), (r) => r.length === 3, 10_000)
-                expect(reports.map((p) => p.openedBy)).toEqual(['agent', 'agent', 'unknown'])
-                evidence[tab.tabId] = quiet
-                expect(await d.closeTab(tab.tabId, OPTS)).toEqual({ closed: true })
-                const [byClick, byLink, byTimer] = popupsOf(d, tab.tabId)
-                for (const closed of [byClick, byLink]) {
-                    expect(closed.closed).toBe(true)
-                    expect(await alive(closed.targetId)).toBe(false)
-                }
-                expect(byTimer).toMatchObject({ openedBy: 'unknown', closed: false, released: true })
-                expect(await alive(byTimer.targetId)).toBe(true)
-                // Closed agent popups give their windows back; the preserved one keeps its own.
-                await eventually(() => d.debugCounts().windows, (n) => n === 1)
-            })
-        })
-
-        it('keeps a popup the user opened while holding the tab (hand-off) and one opened after a user had control', async () => {
-            await withDriver(async (d) => {
-                const tab = await d.openTab(a.url('/prov'), [a.origin], OPTS)
-                evidence[tab.tabId] = userHolds
-                await userClick(tab.targetId)
-                const [byUser] = await eventually(() => popupsOf(d, tab.tabId), (r) => r.length === 1)
-                expect(byUser.openedBy).toBe('user')
-                evidence[tab.tabId] = agentLease
-                await press(d, tab.tabId, 'Open one')
-                const reports = await eventually(() => popupsOf(d, tab.tabId), (r) => r.length === 2)
-                expect(reports[1].openedBy).toBe('agent')
-                // A user took control after the agent's popup appeared: it may be theirs now.
-                evidence[tab.tabId] = { ...quiet, userControlEpoch: 2 }
-                await d.closeTab(tab.tabId, OPTS)
-                for (const report of popupsOf(d, tab.tabId)) {
-                    expect(report).toMatchObject({ closed: false, released: true })
-                    expect(await alive(report.targetId)).toBe(true)
-                }
-            })
-        })
-
-        it('attributes simultaneous popups of two tabs to their own openers and closes only the cleaned-up tab\'s agent popup', async () => {
-            await withDriver(async (d) => {
-                const [mine, theirs] = await Promise.all([d.openTab(a.url('/prov'), [a.origin], OPTS), d.openTab(a.url('/prov'), [a.origin], OPTS)])
-                evidence[mine.tabId] = agentLease
-                evidence[theirs.tabId] = userHolds
-                await Promise.all([press(d, mine.tabId, 'Open one'), userClick(theirs.targetId)])
-                const [ofMine] = await eventually(() => popupsOf(d, mine.tabId), (r) => r.length === 1)
-                const [ofTheirs] = await eventually(() => popupsOf(d, theirs.tabId), (r) => r.length === 1)
-                expect([ofMine.openedBy, ofTheirs.openedBy]).toEqual(['agent', 'user'])
-                evidence[mine.tabId] = quiet
-                await d.closeTab(mine.tabId, OPTS)
-                expect(await alive(ofMine.targetId)).toBe(false)
-                expect(await alive(ofTheirs.targetId)).toBe(true)
-                expect(d.hasTab(theirs.tabId)).toBe(true)
-                evidence[theirs.tabId] = quiet
-                await d.closeTab(theirs.tabId, OPTS)
-                expect(await alive(ofTheirs.targetId)).toBe(true)
-            })
-        })
-
-        it('without input evidence closes no popup with its tab', async () => {
-            await withDriver(async (d) => {
-                const tab = await d.openTab(a.url('/prov'), [a.origin], OPTS)
-                await press(d, tab.tabId, 'Open one')
-                const [popup] = await eventually(() => popupsOf(d, tab.tabId), (r) => r.length === 1)
-                expect(popup.openedBy).toBe('unknown')
-                await d.closeTab(tab.tabId, OPTS)
-                expect(await alive(popup.targetId)).toBe(true)
-            })
-        })
-
-        it('after a Runtime restart keeps the popups it did not see created, and closes a new agent popup of the adopted tab', async () => {
-            let tab: Awaited<ReturnType<CdpDriver['openTab']>> | undefined
-            let before = ''
-            await withDriverKeepingPages(async (d) => {
-                tab = await d.openTab(a.url('/prov'), [a.origin], OPTS)
-                evidence[tab.tabId] = agentLease
-                await press(d, tab.tabId, 'Open one')
-                const [popup] = await eventually(() => popupsOf(d, tab!.tabId), (r) => r.length === 1)
-                expect(popup.openedBy).toBe('agent')
-                before = popup.targetId
-            })
-            await withDriver(async (restarted) => {
-                expect(await restarted.adoptTab(tab!.tabId, tab!.targetId, [a.origin], OPTS)).toBe(true)
-                evidence[tab!.tabId] = agentLease
-                // It may learn of the earlier popup through its opener, but never how it was created.
-                for (const report of popupsOf(restarted, tab!.tabId)) expect(report).toMatchObject({ targetId: before, openedBy: 'unknown' })
-                await press(restarted, tab!.tabId, 'Open one')
-                const [after] = await eventually(() => popupsOf(restarted, tab!.tabId).filter((p) => p.targetId !== before), (r) => r.length === 1)
-                expect(after.openedBy).toBe('agent')
-                evidence[tab!.tabId] = quiet
-                await restarted.closeTab(tab!.tabId, OPTS)
-                expect(await alive(after.targetId)).toBe(false)
-                expect(await alive(before)).toBe(true)
-            })
-        })
-
-        /** The first Runtime's driver: its process ends with the browser's pages left as they are. */
-        async function withDriverKeepingPages(body: (d: CdpDriver) => Promise<void>) {
-            evidence = {}
-            const d = new CdpDriver({ browserWsUrl: own.browserWsUrl, browserInstanceIdProvider: async () => instanceId, maxAgentWindows: 8 })
-            d.setInputEvidence((tabId) => evidence[tabId])
-            await d.connect()
-            try {
-                await body(d)
-            } finally {
-                await d.close()
-            }
-        }
     })
 
     describe('runtime restart', () => {

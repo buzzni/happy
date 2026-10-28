@@ -160,9 +160,13 @@ Saydo `specs/agent-browser-deploy/` D3 (verify), D4, D8, D9, D10 (Runtime side).
     Its windows still count toward `maxAgentWindows`.
   - A tab blocking unload stays open, is recorded in `reclaimBlockedTabs` and reported, and
     is retried on each pass.
-  - Operator: admin socket `GET /admin/spaces` (owner session, tasks, tabs, age, counted)
+  - Tabs kept for the user (2026-10-29): see "Tab provenance and tabs kept for the user"
+    below. Reclamation never closes them; a space holding one stays open (reclaiming) and
+    every pass reports them as `retainedTabs`.
+  - Operator: admin socket `GET /admin/spaces` (owner session, tasks, tabs, kept tabs, age, counted)
     and `POST /admin/close-space { taskSpaceId, force? }` (cancel, then close; `force`
-    also closes a space with unknown-outcome tasks, whose records stay for reconcile).
+    also closes a space with unknown-outcome tasks, whose records stay for reconcile, and
+    tabs kept for the user).
     TODO (S6 installer stream): wire `abp-stack spaces list|close <id> [--force]` to these.
 - Retention (`retentionDays`, config mode, at start and hourly): terminal tasks without
   uncertain actions whose last change is older than the retention are deleted
@@ -294,37 +298,44 @@ in the browser image. Accounting (review P1-8): one reservation per target — t
 with every request of it failed. Whether this meets the 30-minute soak criterion is measured by
 `soak.mjs`, which reports cgroup memory and the Chromium process RSS sum separately.
 
-### Tab provenance at task end (2026-10-29)
+### Tab provenance and tabs kept for the user (2026-10-29)
 
-Owned tabs are the agent's: only `openPage` creates them, and `adoptTab` re-takes them by persisted
-targetId after a Runtime restart. Pages the user opens without an owned opener are never attached
-by the driver and never closed by the Runtime. Finishing or cancelling a task closes nothing;
-cleanup (`closePage`, space reclamation, retention, local client end) closes a space's own tabs,
-and a tab a user holds stays open.
+Provenance. A space tab is the agent's only because `openPage` created it; its disposition
+(`SpaceRecord.tabDispositions[tabId]`, optional, compatible) records `createdBy: 'agent'`, and
+`adoptedAtMs` when a restarted Runtime re-took it by its persisted targetId (adoption is not
+creation). Everything else is of unknown origin and is never closed by task cleanup: popups
+(their opener is known from CDP, their cause is not — a page timer or an earlier user popup can
+open one during an agent click), and pages the user opens. The driver's existing security and
+quota closes (disallowed origin, failed interception, over the window cap) are unchanged. No
+popup, active tab or window position ever makes a page the agent's.
 
-A popup belongs to the owned tab it came from by CDP `openerId` (through frames and popups), never
-by the active tab or a window position. Its provenance (`drivers/popupProvenance.ts`,
-`PopupReport.openedBy`) is decided once, when the driver sees it created (`waitingForDebugger`):
+Kept for the user. From the moment a tab is handed to the user — a hand-off (`waitReason:
+'handoff'`), a page that lands on a login or captcha wait — or a user takes it over, its
+disposition carries `retained { reason, taskId, atMs }`, written before that step is acknowledged
+(a failed write fails the takeover or the step). It is sticky: giving control back, resuming,
+finishing, cancelling, the session ending, idling, expiring or a restart do not clear it. Such a
+tab keeps its task, space, target, lease epoch and disposition records and stays counted against
+`maxActiveTabs` and `maxAgentWindows`, and its task record is not purged:
 
-- `agent`: created during exactly one agent click or fill on that tab (from its first dispatched
-  event until it returned), the only popup of that input, while the Runtime reports the agent's
-  lease on the tab and no user input on the profile now or within `USER_INPUT_ACTIVATION_MS`
-  (10 s; Chromium keeps a gesture live for 5 s). The Runtime answers through
-  `BrowserDriver.setInputEvidence` from its input leases; a user holding, taking or draining
-  input anywhere on the profile counts for every tab, and so does the first window after start.
-- `user`: created while the user held the opener tab (takeover, a hand-off).
-- `unknown`: everything else — page timers or a popup after the input returned, a second popup of
-  one input, overlapping inputs, a popup that existed before a restart or a lost connection, a
-  driver without input evidence.
+- reclamation (session end, idle, operator without `force`) closes the space's other tabs and
+  reports the kept ones as `retainedTabs`; the space stays open (reclaiming, counted beyond the
+  reserve) and is reported on every pass;
+- retention keeps the expired task; a local client's end completes without waiting for it;
+- the agent's `closePage` and `closeSpace` refuse it (CONFLICT); only the operator's forced
+  `close-space` closes it;
+- a restart re-adopts it in the same browser with the disposition unchanged; a replaced browser
+  or a vanished target drops it (and its disposition) as before — nothing is re-attached by URL,
+  active tab or window position;
+- a record from before dispositions is repaired at restart from what its tasks say (a user wait
+  on that tab, or user control); until then the same rule decides.
 
-When cleanup closes an owned tab, the driver also closes its `agent` popups, unless a user gained
-control on the profile since the popup appeared or may give input now; it waits for their windows
-to be gone. Every other popup stays open and is marked `released`. Real Chrome 156 (headless,
-popup blocker on): a synchronous `window.open` or `target=_blank` link in the click lands inside
-the input; a second `window.open` of one click is blocked; a timer's popup after the click is
-`unknown`. Not covered: popups of pages the driver does not own. Known gap, unchanged here: a
-popup opened before a Runtime restart is released at the new connection's attach, so its requests
-are no longer checked (observed 2026-10-29: a POST to a disallowed origin was sent after restart).
+Not covered: after a task is terminal, the user cannot take over a kept tab again (takeover and
+the console listing still exclude finished tasks); the tab stays open in the profile's browser
+until the operator closes it. A profile reassignment (another owner or assignment) ends the
+previous assignment's spaces as before, kept tabs included. Stopping the browser stack still
+ends every page. Known gap, unchanged here: a popup opened before a Runtime restart is released
+at the new connection's attach, so its requests are no longer checked (observed 2026-10-29: a
+POST to a disallowed origin was sent after restart).
 
 ### Destinations before requests (review P0-3)
 

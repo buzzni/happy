@@ -4,7 +4,7 @@ import { BrowserRuntimeError, POC_LIMITS, SCHEMA_VERSION, TERMINAL_STATUSES, typ
     type BatchResult, type BatchStep, type BrowserDriver, type BrowserInstanceId, type BrowserRuntimeApi, type GrantId,
         type ApproveResult, type ControlResult, type RuntimeErrorBody, type SnapshotId, type InputOwner, type Operation,
             type PrincipalId, type ProfileId, type RequestId, type TaskEvent, type TaskId, type TaskSpaceId, type TaskView, type TaskStatus,
-                type TabId, type ApprovalId, type InputEvidence,
+                type TabId, type ApprovalId,
                 type DispatchExpectation, type ElementDescription, type ElementRef, type Observation, type ScreenshotResult, type SubscribeResult } from './contracts'
 import { assertOperation } from './auth'
 import { approvalPayloadHash, createApproval } from './approvals'
@@ -12,7 +12,7 @@ import { dispatchStep } from './batchWorker'
 import { systemClock, type RuntimeClock } from './clock'
 import { InputLeaseManager } from './inputLease'
 import { approvalBinding, assertAllowedOrigin, originAllowed, assertSiteAllowed, classifySiteAction, classifyUserWait, loginCompleted, payloadHash, redact, type SitePolicy } from './policy'
-import { RECLAIMING_SPACE_RESERVE, TaskStore, type SpaceRecord, type StoredTask, type StoreEventInput } from './taskStore'
+import { RECLAIMING_SPACE_RESERVE, TaskStore, type SpaceRecord, type StoredTask, type StoreEventInput, type TabDisposition } from './taskStore'
 import { browserInstanceMatches, inFlightWriteActions } from './recovery'
 import { transitionTask } from './stateMachine'
 /** Operations that only read a task's record: allowed on an earlier assignment's records for their owner. */
@@ -48,6 +48,8 @@ export interface SpaceReclaimReport {
     blockedTabs?: TabId[]
     /** A user holds these, or the browser could not close them; retried. */
     failedTabs?: TabId[]
+    /** Kept for the user (handed to them or taken over): never closed automatically, so the space stays open. */
+    retainedTabs?: TabId[]
     /** Tasks with an unknown write outcome, kept (paused) for the user. */
     retained?: TaskId[]
     /** Cancelled tasks whose batch has not stopped yet. */
@@ -65,6 +67,8 @@ export interface SpaceSummary {
     counted: boolean
     reclaimReason?: SpaceRecord['reclaimReason']
     reclaimBlockedTabs?: TabId[]
+    /** Tabs kept for the user (see TabDisposition.retained). */
+    retainedTabs?: TabId[]
     tabs: TabId[]
     tasks: Array<{ taskId: TaskId; agentSessionId: string; status: TaskView['status']; pauseReason?: string; uncertainActions: number; updatedAtMs: number }>
 }
@@ -86,11 +90,11 @@ type UserWaitCompletion = {
 /** Finished tasks are not offered to the console; the listing is bounded (D12). */
 const FINISHED_STATUSES: ReadonlySet<TaskStatus> = new Set(TERMINAL_STATUSES)
 const LIST_TASKS_LIMIT = 50
-/**
- * How long after user input may have been possible on a profile a popup can still be
- * the user's: Chromium keeps a user gesture live for 5 s; twice that for margin.
- */
-export const USER_INPUT_ACTIVATION_MS = 10_000
+/** The space's dispositions without `tabId` (it left the space). */
+function withoutDisposition(space: SpaceRecord, tabId: TabId): SpaceRecord['tabDispositions'] {
+    const { [tabId]: _gone, ...rest } = space.tabDispositions ?? {}
+    return rest
+}
 
 
 export class BrowserRuntime implements BrowserRuntimeApi {
@@ -116,21 +120,12 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     private readonly approvalModeRequests = new Map<TaskId, Map<string, { hash: string; pending: boolean; epoch: number; failed?: true }>>()
     private readonly recovery: Promise<void>
     private readonly cleanup: Promise<void>
-    /** Per profile: whether a user may give input now, since when not, and how often that started. */
-    private readonly userInput = new Map<ProfileId, { epoch: number; active: boolean; endedAtMs: number }>()
     constructor(private readonly options: BrowserRuntimeOptions) {
         this.drivers = options.drivers instanceof Map ? options.drivers : new Map(Object.entries(options.drivers) as [
             ProfileId,
             BrowserDriver
         ][])
         this.clock = options.clock ?? systemClock
-        // A restart may follow user input by moments: the first window counts as recent.
-        for (const profileId of this.drivers.keys())
-            this.userInput.set(profileId, { epoch: 0, active: false, endedAtMs: this.clock.now() })
-        this.leases.subscribe(() => this.trackUserInput())
-        this.trackUserInput()
-        for (const [profileId, driver] of this.drivers)
-            driver.setInputEvidence?.((tabId) => this.inputEvidence(profileId, tabId))
         // Both reject (every API call then fails RUNTIME_UNAVAILABLE) when another assignment's state could not be ended.
         this.cleanup = this.settleAssignments()
         this.cleanup.catch(() => undefined)
@@ -479,6 +474,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             tabs: [...space.tabs, handle.tabId],
             tabTargets: { ...space.tabTargets, [handle.tabId]: handle.targetId },
             tabLeaseEpochs: { ...space.tabLeaseEpochs, [handle.tabId]: tabEpoch },
+            tabDispositions: { ...space.tabDispositions, [handle.tabId]: { createdBy: 'agent',
+                ...(waitReason ? { retained: { reason: waitReason, taskId: task.taskId, atMs: this.clock.now() } } : {}) } },
         }))
         const result = { tabId: handle.tabId, actionId, url: redact(req.url), task: this.view(after) }
         await this.saveTaskRequest(after, auth, req.requestId, { operation: 'openPage', ...req }, result)
@@ -518,6 +515,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             && !this.options.store.listTasks().some(task => task.agentSessionId === (auth.credential as AgentGrant).agentSessionId
                 && task.taskSpaceId === space.taskSpaceId && task.tabs.includes(req.tabId)))
             throw new BrowserRuntimeError('SCOPE_DENIED', 'Local client may close only its own tabs')
+        if (this.isRetained(space, req.tabId))
+            throw new BrowserRuntimeError('CONFLICT', 'Tab is kept for the user')
         const refs = this.options.store.listTasks().filter((task) => task.tabs.includes(req.tabId) && (!['succeeded', 'failed',
             'cancelled'].includes(task.status) || this.workers.has(task.taskId)))
         if (refs.length)
@@ -537,7 +536,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             return {
                 tabs: current.tabs.filter((tab) => tab !== req.tabId),
                 goneTabs: [...new Set([...(current.goneTabs ?? []), req.tabId])],
-                tabTargets, tabLeaseEpochs,
+                tabTargets, tabLeaseEpochs, tabDispositions: withoutDisposition(current, req.tabId),
                 dedupe: this.spaceDedupe(current, auth, req.requestId, { operation: 'closePage', ...req }, response),
             }
         })
@@ -840,7 +839,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             if (replaced) {
                 const approvals = Object.fromEntries(Object.entries(task.approvals).map(([id, approval]) => [id, { ...approval,
                     state: approval.state === 'pending' ? 'expired' : approval.state }]))
-                await this.options.store.mutateSpace(task.taskSpaceId, (space) => ({ tabs: space.tabs.filter((tab) => !task.tabs.includes(tab)) }))
+                await this.options.store.mutateSpace(task.taskSpaceId, (space) => ({ tabs: space.tabs.filter((tab) => !task.tabs.includes(tab)),
+                    tabDispositions: Object.fromEntries(Object.entries(space.tabDispositions ?? {}).filter(([tab]) => !task.tabs.includes(tab as TabId))) }))
                 await this.commit(task, { status: 'paused', pauseReason: 'browser-replaced', tabs: [], pendingApproval: undefined,
                     approvals, browserInstanceId: currentInstance }, 'recovered', { driver: 'reconnected', browserReplaced: true,
                         attention: 'recovered' })
@@ -905,10 +905,12 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     }
     /**
      * Closes one space tab in the browser and only then drops it from the space. A target
-     * that is already gone (closed just before a crash) counts as closed; a tab a user holds
-     * is not touched.
+     * that is already gone (closed just before a crash) counts as closed; a tab a user holds,
+     * or one kept for the user (unless an operator forces it), is not touched.
      */
-    private async closeSpaceTab(profileId: ProfileId, taskSpaceId: TaskSpaceId, tabId: TabId): Promise<'closed' | 'held' | 'blocked' | 'failed'> {
+    private async closeSpaceTab(profileId: ProfileId, taskSpaceId: TaskSpaceId, tabId: TabId, force = false): Promise<'closed' | 'held' | 'retained' | 'blocked' | 'failed'> {
+        if (!force && this.isRetained(this.requireSpace(taskSpaceId), tabId))
+            return 'retained'
         if (this.leases.owner(tabId, profileId).owner.kind !== 'none')
             return 'held'
         const driver = this.driver(profileId)
@@ -921,33 +923,39 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             const { [tabId]: _target, ...tabTargets } = current.tabTargets ?? {}
             const { [tabId]: _epoch, ...tabLeaseEpochs } = current.tabLeaseEpochs ?? {}
             return { tabs: current.tabs.filter((tab) => tab !== tabId), goneTabs: [...new Set([...(current.goneTabs ?? []), tabId])],
-                tabTargets, tabLeaseEpochs }
+                tabTargets, tabLeaseEpochs, tabDispositions: withoutDisposition(current, tabId) }
         })
         return 'closed'
     }
-    /** Lease listener: a user holding, taking or draining input anywhere on a profile counts for all its tabs. */
-    private trackUserInput(): void {
-        for (const [profileId, state] of this.userInput) {
-            const active = this.leases.isUserFenced(profileId)
-            if (active && !state.active)
-                this.userInput.set(profileId, { ...state, epoch: state.epoch + 1, active })
-            else if (!active && state.active)
-                this.userInput.set(profileId, { ...state, active, endedAtMs: this.clock.now() })
-        }
+    /**
+     * Whether `tabId` is kept for the user. Its disposition decides; a tab without one (a record
+     * from before dispositions) is kept when a task of it was handed to the user or taken over.
+     */
+    private isRetained(space: SpaceRecord, tabId: TabId): boolean {
+        const disposition = space.tabDispositions?.[tabId]
+        if (disposition)
+            return Boolean(disposition.retained)
+        return this.legacyRetention(space, tabId) !== undefined
     }
-    /** What the driver reads when a popup of `tabId` appears, or when its opener is cleaned up. */
-    private inputEvidence(profileId: ProfileId, tabId: TabId): InputEvidence | undefined {
-        const state = this.userInput.get(profileId)
-        if (!state)
-            return undefined
-        let owner: InputOwner['kind']
-        try {
-            owner = this.leases.owner(tabId, profileId).owner.kind
-        } catch {
-            return undefined
+    private legacyRetention(space: SpaceRecord, tabId: TabId): TabDisposition['retained'] {
+        const tasks = this.spaceTasks(space.taskSpaceId).filter((task) => task.tabs.includes(tabId))
+        for (const task of tasks) {
+            if (task.waitReason && task.waitReason !== 'approval' && (task.waitCompletion as UserWaitCompletion | undefined)?.tabId === tabId)
+                return { reason: task.waitReason, taskId: task.taskId, atMs: this.clock.now() }
+            if (task.pauseReason === 'user-control' || task.pauseReason === 'user-input-complete' || space.profileUserOwner?.tabId === tabId)
+                return { reason: 'user-control', taskId: task.taskId, atMs: this.clock.now() }
         }
-        return { owner, userControlEpoch: state.epoch,
-            userInputRecent: state.active || this.clock.now() - state.endedAtMs < USER_INPUT_ACTIVATION_MS }
+        return undefined
+    }
+    /**
+     * Keeps `tabId` for the user from now on (sticky). Written before what hands the tab to the
+     * user is acknowledged, so a failed write fails that step instead of leaving it unrecorded.
+     */
+    private async retainTab(taskSpaceId: TaskSpaceId, tabId: TabId, taskId: TaskId, reason: NonNullable<TabDisposition['retained']>['reason']): Promise<void> {
+        await this.options.store.mutateSpace(taskSpaceId, (current) => !current.tabs.includes(tabId) || current.tabDispositions?.[tabId]?.retained ? null : {
+            tabDispositions: { ...current.tabDispositions, [tabId]: { createdBy: 'agent', ...current.tabDispositions?.[tabId],
+                retained: { reason, taskId, atMs: this.clock.now() } } },
+        })
     }
     /**
      * An unfinished task of the agent session waits for the user: an approval, a login or other hand-off,
@@ -1002,7 +1010,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             if (this.workers.has(task.taskId) || !FINISHED_STATUSES.has(task.status)) { pending = true; continue }
             for (const tabId of task.tabs) {
                 if (!this.requireSpace(task.taskSpaceId).tabs.includes(tabId)) continue
-                if (await this.closeSpaceTab(task.profileId, task.taskSpaceId, tabId) !== 'closed') pending = true
+                // A tab kept for the user stays with its task; the client's end does not wait for it.
+                if (!['closed', 'retained'].includes(await this.closeSpaceTab(task.profileId, task.taskSpaceId, tabId))) pending = true
             }
         }
         if (pending) {
@@ -1069,6 +1078,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 createdAtMs: space.createdAtMs, ageMs: now - space.createdAtMs, closed: Boolean(space.closed), counted,
                 ...(space.reclaimReason ? { reclaimReason: space.reclaimReason } : {}),
                 ...(space.reclaimBlockedTabs?.length ? { reclaimBlockedTabs: space.reclaimBlockedTabs } : {}),
+                ...(space.tabs.some((tab) => this.isRetained(space, tab)) ? { retainedTabs: space.tabs.filter((tab) => this.isRetained(space, tab)) } : {}),
                 tabs: [...space.tabs],
                 tasks: tasks.map((task) => ({ taskId: task.taskId, agentSessionId: task.agentSessionId, status: task.status,
                     ...(task.pauseReason ? { pauseReason: task.pauseReason } : {}), uncertainActions: task.uncertainActions.length,
@@ -1120,22 +1130,26 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             return { ...report, retained }
         const blockedTabs: TabId[] = []
         const failedTabs: TabId[] = []
+        const retainedTabs: TabId[] = []
         for (const tabId of space.tabs) {
-            const outcome = await this.closeSpaceTab(space.profileId, taskSpaceId, tabId)
+            const outcome = await this.closeSpaceTab(space.profileId, taskSpaceId, tabId, force)
             if (outcome === 'closed')
                 report.closedTabs.push(tabId)
             else if (outcome === 'blocked')
                 blockedTabs.push(tabId)
+            else if (outcome === 'retained')
+                retainedTabs.push(tabId)
             else
                 failedTabs.push(tabId)
         }
-        await this.options.store.mutateSpace(taskSpaceId, (latest) => blockedTabs.length || failedTabs.length
+        // Kept tabs keep the space open (with their targets, leases and dispositions) and are reported on every pass.
+        await this.options.store.mutateSpace(taskSpaceId, (latest) => blockedTabs.length || failedTabs.length || retainedTabs.length
             ? { reclaimBlockedTabs: blockedTabs }
-            : { tabs: [], tabTargets: {}, tabLeaseEpochs: {}, profileUserOwner: null, closed: true, reclaimBlockedTabs: undefined,
+            : { tabs: [], tabTargets: {}, tabLeaseEpochs: {}, tabDispositions: {}, profileUserOwner: null, closed: true, reclaimBlockedTabs: undefined,
                 goneTabs: [...new Set([...(latest.goneTabs ?? []), ...latest.tabs])] })
-        if (blockedTabs.length || failedTabs.length)
+        if (blockedTabs.length || failedTabs.length || retainedTabs.length)
             return { ...report, ...(blockedTabs.length ? { blockedTabs } : {}), ...(failedTabs.length ? { failedTabs } : {}),
-                ...(retained.length ? { retained } : {}) }
+                ...(retainedTabs.length ? { retainedTabs } : {}), ...(retained.length ? { retained } : {}) }
         return { ...report, closed: true, ...(retained.length ? { retained } : {}) }
     }
     async revokeGrant(grantId: GrantId): Promise<void> {
@@ -1512,6 +1526,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         }>
         const owner: InputOwner = { kind: 'user', principalId: interactive.principalId, viewerSessionId: interactive.viewerSessionId }
         const settling = this.inFlightDriverCalls.has(task.taskId)
+        await this.retainTab(task.taskSpaceId, req.tabId, task.taskId, 'user-control')
         const epoch = this.leases.fenceForTakeover(req.tabId, task.profileId, task.taskId, owner)
         await this.persistTabLease(task.taskId, task.taskSpaceId, req.tabId, epoch, { tabId: req.tabId, owner })
         await this.persistProfileUserOwner(task.profileId, { tabId: req.tabId, owner })
@@ -1835,6 +1850,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         if (this.options.store.listTasks().some((task) => task.taskSpaceId === req.taskSpaceId && (!['succeeded', 'failed',
             'cancelled'].includes(task.status) || this.workers.has(task.taskId))))
             throw new BrowserRuntimeError('CONFLICT', 'Task space has non-terminal or in-flight tasks')
+        if (space.tabs.some((tab) => this.isRetained(space, tab)))
+            throw new BrowserRuntimeError('CONFLICT', 'Task space has a tab kept for the user')
         const closedTabs: TabId[] = []
         for (const tab of space.tabs) {
             if (this.leases.owner(tab as TabId, space.profileId).owner.kind !== 'none')
@@ -1851,12 +1868,13 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     goneTabs: [...new Set([...(current.goneTabs ?? []), tab as TabId])],
                     tabTargets,
                     tabLeaseEpochs,
+                    tabDispositions: withoutDisposition(current, tab as TabId),
                 }
             })
         }
         const response = { closedTabs }
         await this.options.store.updateSpace(req.taskSpaceId, {
-            tabs: [], tabTargets: {}, tabLeaseEpochs: {}, profileUserOwner: null, closed: true,
+            tabs: [], tabTargets: {}, tabLeaseEpochs: {}, tabDispositions: {}, profileUserOwner: null, closed: true,
             dedupe: this.spaceDedupe(space, auth, req.requestId, { operation: 'closeSpace', ...req }, response),
         })
         return response
@@ -2049,9 +2067,14 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     ...references.map((task) => task.tabLeaseEpochs?.[tabId] ?? 0))
                 const persistedOwner = profileOwner?.tabId === tabId ? profileOwner.owner : { kind: 'none' as const }
                 const epoch = this.leases.restore(tabId, space.profileId, previousEpoch, persistedOwner)
-                await this.options.store.mutateSpace(space.taskSpaceId, (current) => ({
-                    tabLeaseEpochs: { ...current.tabLeaseEpochs, [tabId]: epoch },
-                }))
+                await this.options.store.mutateSpace(space.taskSpaceId, (current) => {
+                    // A record from before dispositions gets one here, once, from what its tasks say (isRetained).
+                    const legacy = current.tabDispositions?.[tabId] ? undefined : this.legacyRetention(current, tabId)
+                    const disposition: TabDisposition = { createdBy: 'agent', ...(legacy ? { retained: legacy } : {}),
+                        ...current.tabDispositions?.[tabId], adoptedAtMs: this.clock.now() }
+                    return { tabLeaseEpochs: { ...current.tabLeaseEpochs, [tabId]: epoch },
+                        tabDispositions: { ...current.tabDispositions, [tabId]: disposition } }
+                })
                 for (const task of references) {
                     await this.options.store.mutate(task.taskId, (current) => ({
                         patch: {
@@ -2074,6 +2097,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 goneTabs: [...new Set([...(current.goneTabs ?? []), tabId])],
                 tabTargets,
                 tabLeaseEpochs,
+                tabDispositions: withoutDisposition(current, tabId),
             }
         })
         for (const task of references) {
@@ -2204,7 +2228,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 archived.add(space.taskSpaceId)
                 await store.mutateSpace(space.taskSpaceId, (latest) => latest.closed && !latest.tabs.length && !latest.profileUserOwner
                     && !Object.keys(latest.tabLeaseEpochs ?? {}).length && !Object.keys(latest.tabTargets ?? {}).length ? null : {
-                    tabs: [], tabTargets: {}, tabLeaseEpochs: {}, profileUserOwner: null, closed: true,
+                    tabs: [], tabTargets: {}, tabLeaseEpochs: {}, tabDispositions: {}, profileUserOwner: null, closed: true,
                     reclaimReason: latest.closed ? latest.reclaimReason : 'principal-changed',
                     goneTabs: [...new Set([...(latest.goneTabs ?? []), ...latest.tabs])],
                 })
@@ -2374,6 +2398,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         let preserveLeases = false
         /** The step is not executed; the task waits for the user (takeover), then the agent re-observes. */
         const handOff = async (current: StoredTask, step: BatchStep, index: number, leaseEpoch: number, reason: BrowserRuntimeError) => {
+            await this.retainTab(current.taskSpaceId, step.tabId, current.taskId, 'handoff')
             const waiting = await this.commit(current, {
                 status: 'awaiting-user',
                 waitReason: 'handoff',
@@ -2728,6 +2753,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     completedSteps.push(step.stepId)
                     if (landedWaitReason) {
                         const notPathPrefix = landedWaitReason === 'login' ? '/login' : '/challenge'
+                        await this.retainTab(task.taskSpaceId, step.tabId, task.taskId, landedWaitReason)
                         task = await this.commit(task, {
                             status: 'awaiting-user',
                             waitReason: landedWaitReason,
