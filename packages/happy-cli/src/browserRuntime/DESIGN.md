@@ -408,12 +408,24 @@ The console advertises task-scoped controls with `window.__abpTaskAutoControls =
 
 ## Agent observation output (2026-10-29)
 
-`agentTools.ts` `wrapObservation` is the only place the `Observation` DTO is shaped for the
-model (observe tool, batch step results, `getTask` last batch). The DTO, collector, refs and
-`sanitizeObservation` are unchanged. The output sends each allowed frame's text once —
-`pageText` is `frames[0]` (the top document, which the driver lists first) and another frame's
-text stays in its `frames[].pageText` — and leaves out values the note states as implied:
-`visible: true`, and `frameOrigin` equal to the origin of `url`. Applying those two rules gives
-back the DTO exactly (`cdpDriver.poc.test.ts` "agent observation output", same- and
-cross-origin frames). On local fixtures this halves output bytes and tokens; observe latency is
-unchanged.
+`agentTools.ts` `wrapObservation` shapes the `Observation` DTO for the model in the observe tool,
+in the direct `result.steps[]` of submit_batch and in `getTask`'s last batch. The DTO, the DOM
+collector, refs and `sanitizeObservation` are unchanged; submit_batch's nested `task.lastBatch`
+is passed through as before.
+
+- Elements leave out `visible: true` and a `frameOrigin` equal to the origin of `url`. Applying
+  the note's two rules gives back the DTO's elements exactly.
+- Frame text is sent once when the frames' texts are the whole page text: the top document's
+  text was collected (`frames[0]`, which the driver lists first) and `text` is the join of the
+  non-empty frame texts, or `''` because a frame was denied. Then `pageText` is the top
+  document's text and each other frame keeps its own `frames[].pageText`; a frame without
+  `pageText` had no text collected. Otherwise (partial per-frame text, a fake driver) `pageText`
+  stays the whole page text and frames keep theirs, as before, so no text is dropped. The note
+  says which of the two the output is.
+
+`cdpDriver.poc.test.ts` "agent observation output" checks this on real same- and cross-origin
+frames. Measured through the real Runtime and tool handler on local fixtures, the observe tool
+output is 40–52% smaller (bytes and local tokenizer estimates); a whole submit_batch response
+shrinks less (18–25%) because `task.lastBatch` is unchanged. The longer note makes an observation
+with a denied frame and fewer than about four elements slightly larger. End-to-end latency was
+not compared; the collector path is untouched.

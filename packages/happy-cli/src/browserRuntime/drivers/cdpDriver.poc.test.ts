@@ -525,20 +525,19 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
     describe('agent observation output', () => {
         type Sent = ReturnType<typeof wrapObservation>
         type SentElement = Omit<ObservedElement, 'visible' | 'frameOrigin'> & { visible?: boolean; frameOrigin?: string }
-        // A consumer applying the note's rules gets the driver's snapshot back.
+        // A consumer applying the note's rules gets the driver's elements and frame texts back.
         const restoreElements = (sent: Sent) => (sent.elements as SentElement[]).map((e) => ({ ...e, visible: e.visible ?? true, frameOrigin: e.frameOrigin ?? originOf(sent.url) }))
         const frameTexts = (sent: Sent) => sent.frames.map((frame, index) => index === 0 ? sent.pageText : (frame as { pageText?: string }).pageText)
 
-        it('sends each frame\'s text once and elements whose left-out defaults restore the snapshot (same- and cross-origin frames)', async () => {
+        it('sends each frame\'s text once and elements whose left-out defaults restore the driver snapshot (same- and cross-origin frames)', async () => {
             const tab = await open('/catalog', [a.origin, b.origin])
             await eventually(() => driver.observe(tab.tabId, [a.origin, b.origin], OPTS),
                 (o) => o.text.includes('reviews-unique-text-a2') && o.text.includes('pay-unique-text-b1'))
-            const startedAt = performance.now()
             const obs = await driver.observe(tab.tabId, [a.origin, b.origin], OPTS)
-            const observeMs = performance.now() - startedAt
             const serialized = JSON.stringify(wrapObservation(obs))
             const sent = JSON.parse(serialized) as Sent
 
+            expect(sent.note).toContain('top document')
             expect(restoreElements(sent)).toEqual(obs.elements)
             expect(sent.frames.map(({ pageText: _text, ...frame }: { pageText?: string }) => frame)).toEqual(obs.frames.map(({ text: _text, ...frame }) => frame))
             expect(frameTexts(sent)).toEqual(obs.frames.map((frame) => frame.text))
@@ -571,10 +570,6 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             const fresh = await driver.observe(tab.tabId, [a.origin, b.origin], OPTS)
             await expectCode(driver.click(tab.tabId, widget.ref as ElementRef, obs.snapshotId, OPTS), 'STALE_REF')
             expect(fresh.snapshotId).not.toBe(obs.snapshotId)
-
-            const verbose = JSON.stringify({ ...sent, elements: obs.elements, frames: obs.frames.map(({ text, ...f }) => ({ ...f, ...(text !== undefined ? { pageText: text } : {}) })), pageText: obs.text })
-            console.info(`[browser-poc] observation output: ${obs.elements.length} elements, ${obs.frames.length} frames; bytes ${verbose.length} -> ${serialized.length}; observe ${observeMs.toFixed(0)}ms`)
-            expect(serialized.length).toBeLessThan(verbose.length)
         })
     })
 

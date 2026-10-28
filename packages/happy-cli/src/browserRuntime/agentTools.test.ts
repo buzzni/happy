@@ -222,9 +222,53 @@ describe('browser task agent tools', () => {
         expect(out.result.note).toContain('visible')
         expect(out.result.note).toContain('frameOrigin')
         expect(out.result.note).toContain('frames[].pageText')
+        expect(out.result.note).toContain('top document')
     })
 
-    it('compacts observations inside batch results the same way', async () => {
+    const partial = (texts: Array<string | undefined>, text: string) => ({
+        ...framedObservation(), elements: [], text,
+        frames: texts.map((frameText, index) => ({ frameKey: `f${index + 1}`, origin: 'https://shop.test', allowed: true, outOfProcess: false,
+            ...(frameText !== undefined ? { text: frameText } : {}) })),
+    })
+    async function observeOutput(observation: unknown) {
+        const client = await connect({ observe: vi.fn(async () => observation) })
+        const res = await client.callTool({ name: 'browser_task_observe', arguments: { taskId: 't', tabId: 'tb' } })
+        return { out: parse(res).result, serialized: (res as { content: Array<{ text: string }> }).content[0].text }
+    }
+
+    it.each([
+        ['the top document\'s text was not collected', [undefined, 'CHILD-ONLY'], 'TOP-ONLY\n\nCHILD-ONLY'],
+        ['a child frame\'s text was not collected', ['TOP-ONLY', undefined], 'TOP-ONLY\n\nCHILD-ONLY'],
+        ['the page text holds more than the frames', ['TOP-ONLY', ''], 'TOP-ONLY\n\nCHILD-ONLY'],
+    ])('keeps the whole page text when per-frame text cannot replace it (%s)', async (_case, texts, text) => {
+        const { out, serialized } = await observeOutput(partial(texts, text))
+        expect(out.pageText).toBe(text)
+        for (const unique of ['TOP-ONLY', 'CHILD-ONLY']) expect(serialized).toContain(unique)
+        expect(out.frames.map((frame: { pageText?: string }) => frame.pageText)).toEqual(texts)
+        expect(out.note).toContain('whole page')
+        expect(out.note).not.toContain('top document')
+    })
+
+    it('tells a top document whose text is empty apart from one whose text was not collected', async () => {
+        const empty = await observeOutput(partial(['', 'CHILD-ONLY'], 'CHILD-ONLY'))
+        expect(empty.out.pageText).toBe('')
+        expect(empty.out.frames.map((frame: { pageText?: string }) => frame.pageText)).toEqual([undefined, 'CHILD-ONLY'])
+        expect(empty.out.note).toContain('top document')
+        const missing = await observeOutput(partial([undefined, 'CHILD-ONLY'], 'CHILD-ONLY'))
+        expect(missing.out.pageText).toBe('CHILD-ONLY')
+        expect(missing.out.frames.map((frame: { pageText?: string }) => frame.pageText)).toEqual([undefined, 'CHILD-ONLY'])
+        expect(missing.out.note).toContain('whole page')
+    })
+
+    it('uses the allowed frames\' own text when the runtime blanked the page text for a denied frame', async () => {
+        const { out, serialized } = await observeOutput({ ...framedObservation(), text: '' })
+        expect(out.pageText).toBe('Cart total 30')
+        expect(out.frames[1].pageText).toBe('Card ending 4242')
+        expect(serialized.split('Cart total 30')).toHaveLength(2)
+        expect(out.note).toContain('top document')
+    })
+
+    it('compacts the step observations of a batch result the same way', async () => {
         const submitBatch = vi.fn(async () => ({ batchId: 'b', accepted: true, task: {}, result: { outcome: 'completed', steps: [{ stepId: 's1', status: 'succeeded', observation: framedObservation() }] } }))
         const client = await connect({ submitBatch })
         const out = parse(await client.callTool({ name: 'browser_task_submit_batch', arguments: {
