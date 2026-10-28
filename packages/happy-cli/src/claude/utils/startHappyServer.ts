@@ -36,6 +36,7 @@ import { join } from 'node:path';
 import { projectPath } from '@/projectPath';
 import { MandatorySandboxError } from '@/sandbox/sandboxPolicy';
 import { registerBrowserTaskTools, BROWSER_TASK_TOOL_NAMES } from '@/browserRuntime/agentTools';
+import { createSiteHints, siteSkillRoots } from '@/browserRuntime/siteHints';
 import { registerCheckpointAgentTools } from '@/checkpoint/checkpointAgentTools';
 import type { CheckpointAgentReader } from '@/checkpoint/checkpointAgentReader';
 import { RuntimeClient } from '@/browserRuntime/runtimeClient';
@@ -323,7 +324,11 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
     // Agent Browser PoC: the task runtime replaces the extension-bridge tools,
     // which fall back to the active tab and would bypass the task lease.
     if (handlers.browserTaskRuntime) {
-        registerBrowserTaskTools(mcp, handlers.browserTaskRuntime, { agentSessionId: handlers.client.sessionId, profileId: handlers.browserTaskProfileId ?? 'default', exitAfterFirstTurn: handlers.exitAfterFirstTurn, hostContinues: handlers.browserHostContinues });
+        // specs/browser-site-hints: the session agent's own skill folders; other agents have none to point at.
+        const metadata = handlers.client.getMetadata?.();
+        const flavor = metadata?.flavor === 'codex' ? 'codex' : metadata?.flavor === 'claude' || metadata?.flavor === undefined ? 'claude' : null;
+        const siteHints = flavor ? createSiteHints({ roots: siteSkillRoots({ flavor, cwd: metadata?.path }) }) : undefined;
+        registerBrowserTaskTools(mcp, handlers.browserTaskRuntime, { agentSessionId: handlers.client.sessionId, profileId: handlers.browserTaskProfileId ?? 'default', exitAfterFirstTurn: handlers.exitAfterFirstTurn, hostContinues: handlers.browserHostContinues, siteHints });
         if (handlers.browserLocalClients) registerLocalClientTools(mcp, handlers.browserLocalClients, runTool);
     } else if (!handlers.mandatorySandbox && !scopedSession) {
         registerBrowserTools(mcp, runTool);

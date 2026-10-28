@@ -7,6 +7,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { BrowserRuntimeError, type BatchStep, type Observation, type StepResult, type TaskView, type BatchResult } from './contracts'
 import type { RuntimeClient } from './runtimeClient'
+import type { SiteHint, SiteHints } from './siteHints'
 
 export const DEFAULT_BATCH_WAIT_MS = 110_000
 const DEFAULT_STEP_TIMEOUT_MS = 30_000
@@ -47,10 +48,15 @@ function wrapSteps(steps: StepResult[]) {
     }))
 }
 
-async function run(requestId: string | undefined, fn: () => Promise<unknown>): Promise<ToolResult> {
+/**
+ * `hint` adds a Core-provided `siteHint` beside the result (specs/browser-site-hints R6) — never inside the
+ * page data — and a failure there never fails the tool.
+ */
+async function run<T>(requestId: string | undefined, fn: () => Promise<T>, hint?: (result: T) => Promise<SiteHint | undefined>): Promise<ToolResult> {
     try {
         const result = await fn()
-        return text(requestId ? { requestId, result } : { result })
+        const siteHint = hint ? await hint(result).catch(() => undefined) : undefined
+        return text({ ...(requestId ? { requestId } : {}), result, ...(siteHint ? { siteHint } : {}) })
     } catch (err) {
         const error = err instanceof BrowserRuntimeError
             ? err.toBody()
@@ -91,6 +97,8 @@ export function registerBrowserTaskTools(mcp: McpServer, client: RuntimeClient, 
     profileId: string | (() => Promise<string>)
     exitAfterFirstTurn?: boolean
     hostContinues?: boolean
+    /** Points the agent at installed skills for the sites a task reaches (specs/browser-site-hints); absent → none. */
+    siteHints?: SiteHints
 }): void {
     const grantedProfile = typeof opts.profileId === 'string' ? async () => opts.profileId as string : opts.profileId
     // Known only from the broker's grant (execution machine H): that decides, a profile the agent names is ignored.
@@ -139,7 +147,8 @@ export function registerBrowserTaskTools(mcp: McpServer, client: RuntimeClient, 
         title: 'Open page in task',
         description: 'Open a new tab for the task at an allowed URL. Returns the explicit tabId to use in later calls.' + sessionNote,
         inputSchema: { taskId: z.string().min(1), url: z.string().min(1), requestId: reqId },
-    }, async (a) => { const r = id(a.requestId); return run(r, () => client.openPage({ taskId: a.taskId as never, url: a.url, requestId: r as never })) })
+    }, async (a) => { const r = id(a.requestId); return run(r, () => client.openPage({ taskId: a.taskId as never, url: a.url, requestId: r as never }),
+        opts.siteHints && (async () => opts.siteHints!.hintFor(a.taskId, [a.url]))) })
 
     mcp.registerTool('browser_task_observe', {
         title: 'Observe task page',
@@ -197,7 +206,10 @@ export function registerBrowserTaskTools(mcp: McpServer, client: RuntimeClient, 
                 stepIds: steps.map((s) => ({ stepId: s.stepId, actionId: s.actionId })),
                 ...(res.result ? { result: { ...res.result, steps: wrapSteps(res.result.steps) } } : {}),
             }
-        })
+        }, opts.siteHints && (async (res) => opts.siteHints!.hintFor(a.taskId, [
+            ...steps.flatMap((step) => (step.kind === 'navigate' && step.url ? [step.url] : [])),
+            ...(res.result?.steps ?? []).flatMap((step) => (step.observation?.url ? [step.observation.url] : [])),
+        ])))
     })
 
     mcp.registerTool('browser_task_get', {
