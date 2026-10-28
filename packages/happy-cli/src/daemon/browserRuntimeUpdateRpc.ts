@@ -30,13 +30,20 @@ function invokeHelper(token: string): Promise<unknown> {
         child.stdin.end(token);
     });
 }
-export function registerBrowserRuntimeUpdateRpc(manager: Manager, invoke = invokeHelper): void {
+/**
+ * Browser-only installs never receive the sudoers grant for the helper, so a signed
+ * update can only be applied locally there. `BROWSER_UPDATE_LOCAL_REQUIRED` is matched
+ * by Studio (HTTP 409 `local-update-required`); do not rename it.
+ */
+export function registerBrowserRuntimeUpdateRpc(manager: Manager, invoke = invokeHelper, env: NodeJS.ProcessEnv = process.env): void {
     manager.registerHandler('browser-runtime:update', async (params) => {
         if (!params || typeof params !== 'object' || Array.isArray(params))
             throw new Error('INVALID_UPDATE_REQUEST');
         const record = params as Record<string, unknown>;
         if (Object.keys(record).length !== 1 || typeof record.token !== 'string' || record.token.length > 16384 || !/^abp2\.[\w-]+\.[\w-]+\.[\w-]+$/.test(record.token))
             throw new Error('INVALID_UPDATE_REQUEST');
+        if (env.HAPPY_BROWSER_TASK_HOST_MODE === 'browser-only')
+            throw new Error('BROWSER_UPDATE_LOCAL_REQUIRED');
         return invoke(record.token);
     });
 }
