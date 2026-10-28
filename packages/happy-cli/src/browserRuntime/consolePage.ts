@@ -259,7 +259,7 @@ dialog input[type="checkbox"]{width:16px;height:16px;flex:none;padding:0;margin:
 <span id="capState" class="pill"><i></i><span>not connected</span></span></header>
 <main>
 <div class="card notice" id="notice" role="alert" hidden><svg aria-hidden="true"><use href="#i-shield"/></svg><span id="noticeText"></span><button id="noticeRetry" type="button" data-t="retry">Retry</button></div>
-<section class="card" id="placeholder"><div class="empty"><svg aria-hidden="true"><use href="#i-inbox"/></svg><b data-t="pickTitle">Pick a task</b><span data-t="pickBody">Tasks that need you are in the task menu above.</span></div></section>
+<section class="card" id="placeholder"><div class="empty"><svg aria-hidden="true"><use href="#i-inbox"/></svg><b data-t="pickTitle">Pick a task</b><span data-t="pickBody">Tasks that need you are in the task menu above. Pick one to change its approval mode (Auto).</span></div></section>
 <div id="detail" hidden>
 <section class="card" id="approvalBox" hidden><h2><svg aria-hidden="true"><use href="#i-shield"/></svg><span data-t="approvalTitle">Approval required</span></h2>
 <div id="approval"></div>
@@ -301,7 +301,7 @@ if(THEME==='dark'||THEME==='light')document.documentElement.setAttribute('data-t
 Object.defineProperty(window,'__abpTaskAutoControls',{value:1});
 var LANG=(Q.get('lang')||navigator.language||'en').toLowerCase().indexOf('ko')===0?'ko':'en';
 var M={en:{title:'Agent Browser',subtitle:'Runtime console',tasks:'Tasks',refresh:'Refresh',advanced:'Advanced',taskId:'Task id',tabId:'Tab id (for take over / release)',watch:'Watch task',
- paste:'Paste a capability token',useToken:'Use token',rawTask:'Task details',pickTitle:'Pick a task',pickBody:'Tasks that need you are in the task menu above.',pickTask:'Pick a task',
+ paste:'Paste a capability token',useToken:'Use token',rawTask:'Task details',pickTitle:'Pick a task',pickBody:'Tasks that need you are in the task menu above. Pick one to change its approval mode (Auto).',pickTask:'Pick a task',
  needCount:function(n){return n+(n>1?' tasks need you':' task needs you')},tasksFailed:'Could not load the tasks',retry:'Retry',viewMode:'Screen size',fit:'Fit to screen',actual:'Actual size',
  fitHint:'The whole screen, scaled to fit the frame',actualHint:'1:1 pixels. Without control the wheel pans the frame; with control it reaches the page (drag the scrollbars to pan)',
  screenEmptyTitle:'The screen is not open',screenEmptyBody:"Open screen shows the agent's browser here. Take over to use the page yourself (login, verification); release it and the agent continues.",
@@ -317,7 +317,7 @@ var M={en:{title:'Agent Browser',subtitle:'Runtime console',tasks:'Tasks',refres
  rReleased:'Resume to hand the page back to the agent, or wait for it to continue.',rLeaseAfterEnd:'This task is over, but the input control is still with this console: release it so the agent can use the browser again.',
  origin:'Site',expires:'Expires',ok:'Done'},
  ko:{title:'에이전트 브라우저',subtitle:'런타임 콘솔',tasks:'작업',refresh:'새로고침',advanced:'고급',taskId:'작업 ID',tabId:'탭 ID (제어권 가져오기/반납용)',watch:'작업 보기',
- paste:'권한 토큰 붙여넣기',useToken:'토큰 사용',rawTask:'작업 상세',pickTitle:'작업을 고르세요',pickBody:'확인이 필요한 작업은 위 작업 메뉴에 나타나요.',pickTask:'작업 선택',
+ paste:'권한 토큰 붙여넣기',useToken:'토큰 사용',rawTask:'작업 상세',pickTitle:'작업을 고르세요',pickBody:'확인이 필요한 작업은 위 작업 메뉴에 나타나요. 작업을 고르면 승인 방식(Auto)도 바꿀 수 있어요.',pickTask:'작업 선택',
  needCount:function(n){return '확인 필요 '+n+'개'},tasksFailed:'작업 목록을 불러오지 못했어요',retry:'다시 시도',viewMode:'화면 크기',fit:'화면 맞춤',actual:'실제 크기',
  fitHint:'화면 전체가 보이도록 틀에 맞춰 축소해요',actualHint:'1:1 크기로 보여요. 제어권이 없을 때는 휠로 틀을 이동하고, 제어권을 가지면 휠이 페이지에 전달돼요(틀 이동은 스크롤바)',
  screenEmptyTitle:'화면이 아직 열리지 않았어요',screenEmptyBody:'화면 보기를 누르면 에이전트의 브라우저가 여기에 보여요. 로그인이나 사람 확인처럼 직접 해야 할 때 제어권을 가져오고, 반납하면 에이전트가 이어서 진행해요.',
