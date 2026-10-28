@@ -979,3 +979,23 @@ personal logins retain their existing route. Organization verification failures 
 `CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED`, independently of the personal failure code.
 The pinned SDK/CLI must prove the control/settings contract; a missing or incompatible
 contract fails closed. Revisit this boundary when upgrading the pinned Claude runtime.
+
+## Native browser host portability (development only)
+
+`browserRuntime/nativeHostPrimitives` lazy-loads the platform Node-API module for
+macOS/Windows kernel locks and process creation/boot identities. The daemon keeps
+Linux procfs semantics (including explicit fixture roots); unavailable identity is
+unknown, never proof of exit. The lock descriptor stays in the runtime process,
+not a short-lived helper. Builds require explicit Node headers and, on Windows,
+the matching import library; there is no runtime compiler/download fallback.
+
+`drivers/cdpConnection.fromPipe` accepts supervisor-owned Chromium debugging pipes.
+It does not open a CDP TCP listener. A lost/oversized/timed-out pipe closes both
+ends and fails pending operations; the existing Linux WebSocket path remains.
+
+These primitives do not yet authorize a native production service. The Linux
+production flock guard is unchanged. Service identity, protected storage/IPC,
+independent network enforcement, signed packaging and Windows native acceptance
+must be integrated before enabling machine capabilities or an installer.
+Reconsider this boundary only with real separate-identity access tests and
+upgrade/rollback evidence. Build/verification details: [native host](../packages/happy-cli/native/README.md).

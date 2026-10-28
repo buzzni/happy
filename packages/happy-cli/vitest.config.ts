@@ -8,6 +8,17 @@ export default defineConfig({
         globalSetup: ['./src/test-setup.ts'],
         projects: [
             {
+                extends: true,
+                test: {
+                    name: 'browser-native-host',
+                    include: ['src/browserRuntime/**/*.native.test.ts'],
+                    setupFiles: ['./src/testing/unit.setup.ts'],
+                    fileParallelism: false,
+                    maxWorkers: 1,
+                    testTimeout: 15_000,
+                },
+            },
+            {
                 resolve: { alias: { '@': resolve('./src') } },
                 test: {
                     name: 'integration-claude-auth-pin',
@@ -62,7 +73,7 @@ export default defineConfig({
                 test: {
                     name: 'unit',
                     include: ['src/**/*.test.ts', 'scripts/**/*.test.ts'],
-                    exclude: ['src/**/*.integration.test.ts', 'src/**/*.poc.test.ts'],
+                    exclude: ['src/**/*.integration.test.ts', 'src/**/*.poc.test.ts', 'src/**/*.native.test.ts'],
                     setupFiles: ['./src/testing/unit.setup.ts'],
                     sequence: {
                         groupOrder: 0,
