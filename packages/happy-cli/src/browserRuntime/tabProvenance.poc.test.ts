@@ -120,6 +120,23 @@ describe.skipIf(!chromePath)('tab provenance at task end (real Chrome)', () => {
             expect(store.getSpace(plain.taskSpaceId)?.tabDispositions?.[held.tabId]?.retained?.reason).toBe('user-control')
             expect([await alive(targets.login), await alive(targets.held)]).toEqual([true, true])
 
+            // The browser connection is lost: the kept tabs are not known to the driver, but nothing proves them closed.
+            await runtime.onDriverDisconnected(profileId)
+            await driver.close()
+            const whileDisconnected = await runtime.reclaimSpaces()
+            expect(whileDisconnected).toEqual([expect.objectContaining({ taskSpaceId: plain.taskSpaceId, closed: false, closedTabs: [] })])
+            expect(new Set(store.getSpace(plain.taskSpaceId)?.tabs)).toEqual(new Set([login.tabId, held.tabId]))
+            await driver.connect()
+            await runtime.onDriverReconnected(profileId)
+            expect(driver.hasTab(login.tabId) && driver.hasTab(held.tabId)).toBe(true)
+            // The user closes one kept window: once the driver saw it go, it leaves the space with its disposition.
+            await harness.closeTarget(targets.held)
+            await eventually(() => driver.hasTab(held.tabId), (has) => !has)
+            const afterUserClose = await runtime.reclaimSpaces()
+            expect(afterUserClose).toEqual([expect.objectContaining({ taskSpaceId: plain.taskSpaceId, closed: false, closedTabs: [held.tabId], retainedTabs: [login.tabId] })])
+            expect(store.getSpace(plain.taskSpaceId)?.tabDispositions?.[held.tabId]).toBeUndefined()
+            expect(await alive(targets.login)).toBe(true)
+
             // Task B finishes (closes nothing) and closes its own page; its popup stays (unknown origin).
             const current = await runtime.getTask(other.auth, { taskId: other.taskId })
             await runtime.finishTask(other.auth, { taskId: other.taskId, expectedVersion: current.stateVersion, requestId: 'finish-b' as RequestId })

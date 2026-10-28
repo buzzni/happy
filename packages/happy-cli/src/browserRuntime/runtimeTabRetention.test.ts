@@ -348,6 +348,38 @@ describe('a tab handed to the user', () => {
         await restarted.store.close()
     })
 
+    it('drops a kept tab once the user closed its window: the space closes and stops counting', async () => {
+        const h = await harness()
+        const page = await h.open()
+        await h.handOff(page)
+        await h.runtime.endSession('session-a')
+        expect(await h.runtime.reclaimSpaces()).toEqual([expect.objectContaining({ closed: false, retainedTabs: [page.tabId] })])
+        h.driver.closeByUser(page.tabId)
+        expect(await h.runtime.reclaimSpaces()).toEqual([expect.objectContaining({ taskSpaceId: page.taskSpaceId, closed: true, closedTabs: [page.tabId] })])
+        expect(h.store.getSpace(page.taskSpaceId)).toMatchObject({ closed: true, tabs: [], tabDispositions: {} })
+        // Nothing open any more: its task can expire as usual.
+        h.clock.advance(400 * 24 * 60 * MINUTE)
+        expect(await h.runtime.purgeExpiredTasks(24 * 60 * MINUTE)).toEqual([page.taskId])
+        await h.store.close()
+    })
+
+    it('keeps a kept tab while the browser connection is lost (its absence is not proof it closed), and after the reconnect', async () => {
+        const h = await harness()
+        const page = await h.open()
+        await h.handOff(page)
+        await h.runtime.endSession('session-a')
+        await h.runtime.onDriverDisconnected(profileId)
+        h.driver.setDisconnected(true)
+        expect(await h.runtime.reclaimSpaces()).toEqual([expect.objectContaining({ closed: false, closedTabs: [] })])
+        expect(h.store.getSpace(page.taskSpaceId)?.tabs).toEqual([page.tabId])
+        expect(h.store.getSpace(page.taskSpaceId)?.tabDispositions?.[page.tabId]?.retained?.reason).toBe('handoff')
+        h.driver.setDisconnected(false)
+        await h.runtime.onDriverReconnected(profileId)
+        expect(await h.runtime.reclaimSpaces()).toEqual([expect.objectContaining({ closed: false, retainedTabs: [page.tabId] })])
+        expect(h.driver.hasTab(page.tabId)).toBe(true)
+        await h.store.close()
+    })
+
     it('reports kept tabs to the operator', async () => {
         const h = await harness()
         const page = await h.open()

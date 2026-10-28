@@ -330,6 +330,9 @@ tab keeps its task, space, target, lease epoch and disposition records and stays
 - retention keeps the expired task; a local client's end completes without waiting for it;
 - the agent's `closePage` and `closeSpace` refuse it (CONFLICT); only the operator's forced
   `close-space` closes it;
+- once the user closes its window and the driver saw the target go, the next cleanup drops it
+  with its disposition (the space can then close and stop counting); a tab the driver merely does
+  not know (connection lost, not yet re-adopted) is not taken as closed and stays, retried;
 - a restart re-adopts it in the same browser with the disposition unchanged; a replaced browser
   or a vanished target drops it (and its disposition) as before — nothing is re-attached by URL,
   active tab or window position;
