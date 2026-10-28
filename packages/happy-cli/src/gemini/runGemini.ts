@@ -25,7 +25,7 @@ import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { projectPath } from '@/projectPath';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
 import { fetchAplusMcpServers } from '@/aplus/fetchAplusMcpServers';
-import { bridgeAplusMcpServers, mergeMcpServers } from '@/aplus/mergeAplusMcpServers';
+import { bridgeAplusMcpServers, mergeMcpServers, withSaycodeInstructionsPreference } from '@/aplus/mergeAplusMcpServers';
 import { MessageBuffer } from '@/ui/ink/messageBuffer';
 import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
 import { encodeBase64 } from '@/api/encryption';
@@ -601,7 +601,10 @@ export async function runGemini(opts: {
   const happyServer = await startHappyServer(session);
   const bridgeCommand = join(projectPath(), 'bin', 'happy-mcp.mjs');
   const aplusMcpServers = bridgeAplusMcpServers(
-    await fetchAplusMcpServers(opts.credentials.token, machineId),
+    withSaycodeInstructionsPreference(
+      await fetchAplusMcpServers(opts.credentials.token, machineId),
+      currentSaycodeSystemPromptEnabled,
+    ),
     { bridgeCommand },
   );
   const mcpServers = mergeMcpServers({

@@ -4,6 +4,7 @@ import {
     bridgeAplusMcpServers,
     mergeAplusMcpServers,
     mergeMcpServers,
+    withSaycodeInstructionsPreference,
     type StdioMcpServerEntry,
 } from './mergeAplusMcpServers'
 
@@ -87,5 +88,32 @@ describe('mergeAplusMcpServers', () => {
         )
 
         expect(result['aplus-common'].command).toBe('/repo/bin/happy-mcp.mjs')
+    })
+})
+
+describe('withSaycodeInstructionsPreference', () => {
+    const servers = {
+        'aplus-common': { type: 'http' as const, url: 'https://studio/mcp/common', headers: { Authorization: 'Bearer token' } },
+        'aplus-company': { type: 'http' as const, url: 'https://studio/mcp/company/c1', headers: { Authorization: 'Bearer token' } },
+    }
+
+    it('asks aplus-common to skip its instructions when Saycode instructions are off', () => {
+        const result = withSaycodeInstructionsPreference(servers, false)
+
+        expect(result['aplus-common'].headers).toEqual({
+            Authorization: 'Bearer token',
+            'X-Aplus-Saycode-Instructions': 'off',
+        })
+        expect(result['aplus-company']).toBe(servers['aplus-company'])
+    })
+
+    it.each([true, undefined])('leaves the servers untouched when the switch is %s', (enabled) => {
+        expect(withSaycodeInstructionsPreference(servers, enabled)).toBe(servers)
+    })
+
+    it('does nothing when aplus-common is not configured', () => {
+        const companyOnly = { 'aplus-company': servers['aplus-company'] }
+
+        expect(withSaycodeInstructionsPreference(companyOnly, false)).toBe(companyOnly)
     })
 })

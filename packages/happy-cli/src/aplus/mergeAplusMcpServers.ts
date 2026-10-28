@@ -20,6 +20,27 @@ export function mergeAplusMcpServers(
     }
 }
 
+/**
+ * aplus-common sends a routing block and the common skill catalog in `initialize`.
+ * When the user turned Saycode instructions off, the server cannot see that (the
+ * switch lives in the encrypted account settings), so the session asks it to skip
+ * them. The tools stay connected. specs/saycode-security-hardening D2-1.
+ */
+export function withSaycodeInstructionsPreference(
+    aplusMcpServers: AplusMcpServersMap,
+    saycodeSystemPromptEnabled: boolean | undefined,
+): AplusMcpServersMap {
+    const common = aplusMcpServers['aplus-common']
+    if (saycodeSystemPromptEnabled !== false || !common) return aplusMcpServers
+    return {
+        ...aplusMcpServers,
+        'aplus-common': {
+            ...common,
+            headers: { ...common.headers, 'X-Aplus-Saycode-Instructions': 'off' },
+        },
+    }
+}
+
 export function bridgeAplusMcpServers(
     aplusMcpServers: AplusMcpServersMap,
     opts: {

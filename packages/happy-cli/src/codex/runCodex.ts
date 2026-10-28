@@ -74,7 +74,7 @@ import {
     resolveMcpFloorServerNames,
 } from '@/aplus/fetchAplusMcpServers';
 import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/connectorToolGuidance';
-import { bridgeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
+import { bridgeAplusMcpServers, withSaycodeInstructionsPreference } from '@/aplus/mergeAplusMcpServers';
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { CodexDisplay } from "@/ui/ink/CodexDisplay";
 import { trimIdent } from "@/utils/trimIdent";
@@ -2076,7 +2076,10 @@ export async function runCodex(opts: {
     orgGate?.onChange(applyOrgRequirements);
     const initialAplusMcpResult = initialAplusMcpSnapshot?.result ?? null;
     let configStatuses = initialAplusMcpResult ? mcpConfigFailureStatuses(initialAplusMcpResult) : [];
-    const initialAplusMcpServers = initialAplusMcpSnapshot?.servers ?? {};
+    const initialAplusMcpServers = withSaycodeInstructionsPreference(
+        initialAplusMcpSnapshot?.servers ?? {},
+        currentSaycodeSystemPromptEnabled,
+    );
     const initialMcpCheckedAt = Date.now();
     session.updateMetadata((current) => ({
         ...current,
@@ -2178,7 +2181,9 @@ export async function runCodex(opts: {
                 { sessionId: session.sessionId, lifecycle: 'turn', ...(orgGate ? { onRequirements: orgGate.onRequirements } : {}) },
             );
             configStatuses = mcpConfigFailureStatuses(result);
-            return result;
+            return result.ok
+                ? { ...result, servers: withSaycodeInstructionsPreference(result.servers, currentSaycodeSystemPromptEnabled) }
+                : result;
         },
         bridgeAplusServers: (servers) => bridgeAplusMcpServers(servers, bridgeOptions),
         onStatus: (status) => {
