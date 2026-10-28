@@ -1,4 +1,5 @@
-param([Parameter(Mandatory=$true)][string]$Source, [ValidateRange(0,60)][int]$ClientProbeSeconds = 0)
+param([Parameter(Mandatory=$true)][string]$Source, [ValidateRange(0,60)][int]$ClientProbeSeconds = 0,
+    [string]$Fence, [string]$NetworkProbeSource)
 $ErrorActionPreference = 'Stop'
 $name = 'SaycodeBrowserRuntimeVerification'
 $root = Join-Path $env:ProgramData $name
@@ -23,6 +24,9 @@ foreach ($id in @('S-1-5-18','S-1-5-32-544')) {
 $directory = New-Object IO.DirectoryInfo($root)
 $directory.Create($acl)
 $created = $false
+$fenced = $false
+$listeners = @()
+$udp = $null
 try {
     & $compiler /nologo /warnaserror+ /target:exe /reference:System.ServiceProcess.dll /out:$exe $Source
     Assert ($LASTEXITCODE -eq 0) 'Service compilation failed'
@@ -44,6 +48,7 @@ try {
     $first = (& $exe --probe-verification | ConvertFrom-Json)
     Assert ($LASTEXITCODE -eq 0 -and $first.principal -eq $sid.Value -and $first.runtimeReady -eq $false) 'Dedicated service identity/status failed'
     $key = Join-Path $state.FullName 'agent.key'
+    Assert ([IO.File]::ReadAllText($key) -cmatch '^[0-9a-f]{64}$') 'Credential does not match the runtime hex format'
     $hash = (Get-FileHash -LiteralPath $key -Algorithm SHA256).Hash
     Restart-Service $name
     (Get-Service $name).WaitForStatus('Running',[TimeSpan]::FromSeconds(15))
@@ -77,6 +82,72 @@ try {
         Write-Output 'READY for non-administrator client check'
         Start-Sleep -Seconds $ClientProbeSeconds
     }
+    if ($Fence) {
+        Stop-Service $name
+        $probeExe = Join-Path $root 'probe.exe'
+        & $compiler /nologo /warnaserror+ /target:exe /reference:System.ServiceProcess.dll /out:$probeExe $NetworkProbeSource
+        Assert ($LASTEXITCODE -eq 0) 'Network probe compilation failed'
+        $proxy = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Parse('127.0.0.1'),0)
+        $proxy.Start(); $listeners += $proxy
+        $port = $proxy.LocalEndpoint.Port
+        $udp = New-Object Net.Sockets.UdpClient
+        $udp.Client.Bind((New-Object Net.IPEndPoint([Net.IPAddress]::Loopback,$port)))
+        $udp.Client.ReceiveTimeout = 1500
+        function ReceivedDatagram {
+            $sender = New-Object Net.IPEndPoint([Net.IPAddress]::Any,0)
+            try { [void]$udp.Receive([ref]$sender); return $true }
+            catch [Net.Sockets.SocketException] {
+                if ($_.Exception.SocketErrorCode -eq [Net.Sockets.SocketError]::TimedOut) { return $false }
+                throw
+            }
+        }
+        $other = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Parse('127.0.0.1'),0)
+        $other.Start(); $listeners += $other
+        $address = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Parse('127.0.0.2'),$port)
+        $address.Start(); $listeners += $address
+        $ipv6 = New-Object Net.Sockets.TcpListener([Net.IPAddress]::IPv6Loopback,$port)
+        $ipv6.Start(); $listeners += $ipv6
+        [IO.File]::WriteAllLines((Join-Path $root 'probe-ports.txt'),[string[]]@($port,$other.LocalEndpoint.Port))
+        InvokeServiceControl @('config',$name,'binPath=',$probeExe)
+        $resultPath = Join-Path $state.FullName 'probe-result.txt'
+        function ProbeNetwork {
+            if (Test-Path $resultPath) { Remove-Item -LiteralPath $resultPath }
+            Start-Service $name
+            $deadline = (Get-Date).AddSeconds(15)
+            while (!(Test-Path $resultPath) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
+            Assert (Test-Path $resultPath) 'Network probe did not report'
+            $result = [IO.File]::ReadAllText($resultPath)
+            Stop-Service $name
+            return $result
+        }
+        Assert ((ProbeNetwork) -eq 'True,True,True,True,True') 'Unfenced network baseline failed'
+        Assert (ReceivedDatagram) 'Unfenced UDP packet did not arrive'
+        & $Fence install $sid.Value $port
+        Assert ($LASTEXITCODE -eq 0) 'Fence install failed'
+        $fenced = $true
+        & $Fence verify $sid.Value $port
+        Assert ($LASTEXITCODE -eq 0) 'Fence did not persist after installer exit'
+        Write-Output 'EXPECT refusal: duplicate policy installation'
+        & $Fence install $sid.Value $port
+        Assert ($LASTEXITCODE -ne 0) 'Fence replaced an existing policy'
+        & $Fence verify $sid.Value $port
+        Assert ($LASTEXITCODE -eq 0) 'Duplicate installation altered policy'
+        $blocked = ProbeNetwork
+        Assert ($blocked -match '^True,False,False,False,(True|False)$') ('Unexpected fenced connections: ' + $blocked)
+        # UDP Send may succeed even when WFP drops the packet; observe the receiver.
+        Assert (!(ReceivedDatagram)) 'Fenced UDP packet arrived'
+        Write-Output 'EXPECT refusal: removal for a different port'
+        & $Fence remove $sid.Value ($port + 1)
+        Assert ($LASTEXITCODE -ne 0) 'Fence accepted a mismatched removal'
+        & $Fence remove $sid.Value $port
+        Assert ($LASTEXITCODE -eq 0) 'Fence removal failed'
+        $fenced = $false
+        Assert ((ProbeNetwork) -eq 'True,True,True,True,True') 'Network did not recover after removal'
+        Assert (ReceivedDatagram) 'UDP did not recover after removal'
+        InvokeServiceControl @('config',$name,'binPath=',('"' + $exe + '" --verification'))
+        Start-Service $name
+        Write-Output 'PASS WFP persistent policy, exact local proxy, other port/address/IPv6/UDP refusal, scope-checked removal, network restoration'
+    }
     # Broaden only the synthetic test key. The service must refuse to start.
     Stop-Service $name
     $fileAcl = [IO.File]::GetAccessControl($key)
@@ -87,6 +158,9 @@ try {
     Assert $refused 'Service accepted public credential access'
     Write-Output 'PASS dedicated SID, service IPC, restart/crash custody, pipe squatting refusal, unsafe ACL refusal'
 } finally {
+    if ($fenced) { & $Fence remove $sid.Value $port; Assert ($LASTEXITCODE -eq 0) 'Fence cleanup failed' }
+    foreach ($listener in $listeners) { $listener.Stop() }
+    if ($udp) { $udp.Dispose() }
     if ($created) {
         Stop-Service $name -ErrorAction SilentlyContinue
         InvokeServiceControl @('delete',$name)

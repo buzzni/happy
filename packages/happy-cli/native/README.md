@@ -117,7 +117,7 @@ issuer의 작업별 발급/daemon 전송, OS별 IPC ACL·서비스 설치·WFP�
 
 `windowsBrowserService.cs`는 .NET Framework ServiceBase로 SCM 전용 가상 계정
 `NT SERVICE\SaycodeBrowserRuntime`에서 실행한다. 보호된 ProgramData 루트/상위
-경로/실행 파일/상태 ACL을 검사한 뒤 서비스 전용 32바이트 agent.key를 최초 생성하고
+경로/실행 파일/상태 ACL을 검사한 뒤 서비스 전용 256비트 난수를 기존 runtime과 같은 64자리 hex agent.key로 최초 저장하고
 재시작 시 재사용한다. root/system/관리자와 이 서비스 외의 private 접근을 거부한다.
 상위 Windows 시스템 경로의 TrustedInstaller는 명시적으로 신뢰한다.
 
@@ -137,3 +137,26 @@ Authenticated Users에는 version/principal/generation/runtimeReady만 제공한
 이 호스트는 아직 Node broker/Chrome을 실행하지 않으며 key를 런타임에 연결하지 않는다.
 전용 브라우저 프로세스/Job, WFP·부팅 보호, 설치 artifact 서명과 installer는 별도 미완료다.
 제품용 원클릭 설치나 전체 isolation 수락을 이 검사로 표시하지 않는다.
+
+## Windows WFP 정책 도구
+
+`windowsBrowserFence.c`는 활성 관리자 토큰으로만 install/verify/remove를 허용한다.
+전용 virtual service SID와 로컬 proxy port를 받고 고정 sublayer의 persistent block
+6개를 트랜잭션으로 설치한다. IPv4는 정확한 127.0.0.1/TCP/proxy port만 차단에서
+제외하고 IPv6 outbound 및 inbound accept는 차단한다. 기존 정책을 덮어쓰지 않고
+SID/port·필터 목록/동작/조건/우선순위를 검증한 정책만 제거한다. 추가 필터도 거부한다.
+BFE가 요청 우선순위 충돌 시 값을 올릴 수 있으므로 최소 요청값 이상만 허용한다.
+
+Windows Developer Prompt 빌드:
+```text
+cl /nologo /std:c11 /W4 /WX /O2 native\windowsBrowserFence.c /Fe:windowsBrowserFence.exe /link Fwpuclnt.lib Advapi32.lib Rpcrt4.lib Uuid.lib
+```
+위 서비스 수락 스크립트에 `-Fence <absolute-exe> -NetworkProbeSource
+<scripts/windows-browser-network-probe.cs>`를 추가하면 별도 SCM 테스트 workload로
+정책 전/중/후의 실제 TCP와 UDP 수신을 비교한다. UDP Send 성공은 전달 증거가 아니므로
+별도 수신 소켓에서 패킷 도착을 검사한다. 중복 설치와 다른 port 제거도 거부해야 한다.
+
+범위: 서비스 SID가 직접 여는 소켓의 실제 Windows x64 수락이다. DNS Client 등
+다른 신원의 시스템 서비스를 통한 간접 통신, raw ICMP/외부 NIC, BFE 재시작/OS reboot,
+실제 Chrome·privilege 제한·worker Job·runtime monitor 통합은 아직 검증되지 않았다.
+CLI `verified`는 필터 구조 조회이며 제품 전체 isolation/ready 증명이 아니다.

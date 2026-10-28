@@ -80,17 +80,26 @@ internal sealed class BrowserService : ServiceBase {
         VerifyDirectory(state, true);
         ExitCode = 14;
         if (!File.Exists(key)) {
-            byte[] secret = new byte[32];
+            byte[] secret = new byte[32], encoded = new byte[64];
             using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(secret);
             try {
-                using (var file = new FileStream(key, FileMode.CreateNew, FileSystemRights.Write, FileShare.None, 4096, FileOptions.WriteThrough, KeySecurity())) {
-                    file.Write(secret, 0, secret.Length); file.Flush(true);
+                const string hex = "0123456789abcdef";
+                for (int i = 0; i < secret.Length; ++i) {
+                    encoded[i * 2] = (byte)hex[secret[i] >> 4];
+                    encoded[i * 2 + 1] = (byte)hex[secret[i] & 15];
                 }
-            } finally { Array.Clear(secret, 0, secret.Length); }
+                using (var file = new FileStream(key, FileMode.CreateNew, FileSystemRights.Write, FileShare.None, 4096, FileOptions.WriteThrough, KeySecurity())) {
+                    file.Write(encoded, 0, encoded.Length); file.Flush(true);
+                }
+            } finally { Array.Clear(secret, 0, secret.Length); Array.Clear(encoded, 0, encoded.Length); }
         }
         using (var file = File.Open(key, FileMode.Open, FileAccess.Read, FileShare.Read)) {
             VerifyFile(file, true);
-            if (file.Length != 32) throw new IOException("Invalid credential length");
+            if (file.Length != 64) throw new IOException("Invalid credential length");
+            for (int i = 0; i < 64; ++i) {
+                int value = file.ReadByte();
+                if (!((value >= '0' && value <= '9') || (value >= 'a' && value <= 'f'))) throw new IOException("Invalid credential encoding");
+            }
         }
     }
     void VerifyFile(FileStream file, bool privateData) {
