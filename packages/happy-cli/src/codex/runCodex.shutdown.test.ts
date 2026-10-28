@@ -15,6 +15,7 @@ const fixture = vi.hoisted(() => ({
     onSteer: null as null | (() => Promise<void>),
     onConnect: null as null | (() => Promise<void>),
     onResumeThread: null as null | (() => Promise<void>),
+    onClearThreadState: null as null | (() => void),
     proposal: { name: 'Verified recovery' },
     gate: null as import('../sessionDrain/runtimeProducerGate').RuntimeProducerGate | null,
     events: [] as string[],
@@ -45,6 +46,7 @@ const fixture = vi.hoisted(() => ({
         updateMetadata: vi.fn(), updateAgentState: vi.fn(), keepAlive: vi.fn(() => { fixture.events.push('keepAlive'); }),
         sendSessionDeath: vi.fn(), flush: vi.fn(async () => {}), close: vi.fn(async () => {}),
         suppressNextArchiveSignal: vi.fn(), skipExistingMessages: vi.fn(), capRuntimeProcessedSeq: vi.fn(),
+        markLaunchedBackgroundJob: vi.fn(),
         rpcHandlerManager: { registerHandler: vi.fn() },
     },
 }));
@@ -84,7 +86,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     waitForOutputDrain = async () => {};
     cancelOutputDrain = () => {};
     finishShutdownObservation = () => {};
-    clearThreadState = vi.fn();
+    clearThreadState = vi.fn(() => { fixture.onClearThreadState?.(); });
     authRecoverySource = 'cli-login';
     authRecoveryBusy = false;
     reconnectForAuth = fixture.reconnect;
@@ -681,5 +683,127 @@ describe('Codex runtime producer bookkeeping', () => {
         };
         await start();
         expect(blockers).toEqual(['producer-busy', 'input-undelivered']);
+    });
+});
+describe('Codex sub-agent list metadata (codexSubagentTasks)', () => {
+    type MetadataUpdate = (metadata: Record<string, unknown>) => Record<string, unknown>;
+    const running = { startedAt: 1_000, available: true, tasks: [{ taskId: 'child-thread', label: 'Hume', kind: 'agent' }] };
+    const emptied = { startedAt: 1_000, available: true, tasks: [] };
+    const updates = () => fixture.session.updateMetadata.mock.calls.map(([update]) => update as MetadataUpdate);
+    /** The list writes, in order: the updates that set `codexSubagentTasks` on metadata without one. */
+    const listWrites = () => updates().filter(update => 'codexSubagentTasks' in update({}));
+    const storedMetadata = fixture.session.getMetadata;
+    /** The metadata the session starts with, as an earlier runtime of this conversation left it. */
+    const startWithStored = (metadata: Record<string, unknown>) => {
+        fixture.session.getMetadata = () => ({ ...storedMetadata(), ...metadata });
+    };
+    afterEach(() => {
+        fixture.onClearThreadState = null;
+        fixture.onConnect = null;
+        fixture.session.getMetadata = storedMetadata;
+        fixture.session.updateMetadata.mockReset();
+    });
+
+    it('writes nothing while no sub-agent was ever listed: a conversation without one keeps its metadata as before', async () => {
+        fixture.onConnect = async () => {
+            fixture.emit?.({ type: 'subagent_tasks', snapshot: { startedAt: 2_000, available: true, tasks: [] } });
+            fixture.emit?.({ type: 'subagent_tasks', snapshot: { startedAt: 2_000, available: false, tasks: null } });
+        };
+        await start();
+        expect(listWrites()).toEqual([]);
+        expect(fixture.session.markLaunchedBackgroundJob).not.toHaveBeenCalled();
+    });
+    it('writes each published list to the metadata and nothing to the transcript', async () => {
+        let envelopes = -1;
+        fixture.onSend = async () => {
+            const before = fixture.session.sendSessionProtocolMessage.mock.calls.length;
+            fixture.emit?.({ type: 'subagent_tasks', snapshot: running });
+            fixture.emit?.({ type: 'subagent_tasks', snapshot: emptied });
+            envelopes = fixture.session.sendSessionProtocolMessage.mock.calls.length - before;
+        };
+        await start();
+        expect(envelopes).toBe(0);
+        expect(listWrites().map(update => update({ path: '/chat' }))).toEqual([
+            { path: '/chat', codexSubagentTasks: running },
+            { path: '/chat', codexSubagentTasks: emptied },
+        ]);
+    });
+    it('replaces a list an earlier runtime left and keeps an identical one as it is', async () => {
+        const initial = { startedAt: 2_000, available: true, tasks: [] };
+        startWithStored({ codexSubagentTasks: running });
+        // The client publishes its first list while connecting.
+        fixture.onConnect = async () => { fixture.emit?.({ type: 'subagent_tasks', snapshot: initial }); };
+        await start();
+        const [write] = listWrites();
+        expect(write({ path: '/chat', codexSubagentTasks: running })).toEqual({ path: '/chat', codexSubagentTasks: initial });
+        const current = { path: '/chat', codexSubagentTasks: { startedAt: 2_000, available: true, tasks: [] } };
+        expect(write(current)).toBe(current);
+    });
+    it('leaves the metadata as it is when the same list is published again', async () => {
+        fixture.onSend = async () => {
+            fixture.emit?.({ type: 'subagent_tasks', snapshot: running });
+            fixture.emit?.({ type: 'subagent_tasks', snapshot: structuredClone(running) });
+        };
+        await start();
+        const [first, again] = listWrites();
+        const written = first({ path: '/chat' });
+        expect(again(written)).toBe(written);
+    });
+    it('swallows a metadata write that throws', async () => {
+        const failure = new Error('metadata write failed');
+        fixture.session.updateMetadata.mockImplementation((update: MetadataUpdate) => {
+            if ('codexSubagentTasks' in update({})) throw failure;
+        });
+        let thrown: unknown = null;
+        fixture.onSend = async () => {
+            try { fixture.emit?.({ type: 'subagent_tasks', snapshot: running }); } catch (error) { thrown = error; }
+        };
+        await start();
+        expect(thrown).toBeNull();
+        expect(logger.warn).toHaveBeenCalledWith('[Codex] Failed to publish the sub-agent list:', failure);
+        expect(fixture.send).toHaveBeenCalledOnce();
+    });
+    it('empties the list on /clear', async () => {
+        vi.spyOn(CodexAuthRecovery.prototype, 'beginTurn').mockImplementation(async () => { fixture.closeQueue?.(); });
+        startWithStored({ codexSubagentTasks: running });
+        // The real client resets its tracker in clearThreadState and publishes the empty list right there.
+        fixture.onClearThreadState = () => { fixture.emit?.({ type: 'subagent_tasks', snapshot: emptied }); };
+        await start('/clear');
+        expect(fixture.send).not.toHaveBeenCalled();
+        const metadata = updates().reduce<Record<string, unknown>>((current, update) => update(current),
+            { path: '/chat', codexThreadId: 'thread', codexSubagentTasks: running });
+        expect(metadata.codexSubagentTasks).toEqual(emptied);
+        expect(metadata).not.toHaveProperty('codexThreadId');
+    });
+});
+describe('Codex sub-agent turn-end reap exemption (markLaunchedBackgroundJob)', () => {
+    const running = { startedAt: 1_000, available: true, tasks: [{ taskId: 'child-thread', label: 'Hume', kind: 'agent' }] };
+    const emptied = { startedAt: 1_000, available: true, tasks: [] };
+    afterEach(() => { fixture.session.updateMetadata.mockReset(); });
+
+    it('marks the session once a published list holds a running sub-agent', async () => {
+        fixture.onConnect = async () => { fixture.emit?.({ type: 'subagent_tasks', snapshot: emptied }); };
+        fixture.onSend = async () => {
+            fixture.emit?.({ type: 'subagent_tasks', snapshot: running });
+            fixture.emit?.({ type: 'subagent_tasks', snapshot: emptied });
+        };
+        await start();
+        expect(fixture.session.markLaunchedBackgroundJob).toHaveBeenCalledOnce();
+    });
+    it('marks the session even when the list cannot be written to the metadata', async () => {
+        fixture.session.updateMetadata.mockImplementation((update: (metadata: Record<string, unknown>) => Record<string, unknown>) => {
+            if ('codexSubagentTasks' in update({})) throw new Error('metadata write failed');
+        });
+        fixture.onSend = async () => { fixture.emit?.({ type: 'subagent_tasks', snapshot: running }); };
+        await start();
+        expect(fixture.session.markLaunchedBackgroundJob).toHaveBeenCalledOnce();
+    });
+    it.each([
+        ['an empty list', emptied],
+        ['the list of a Codex too old to report sub-agents', { startedAt: 1_000, available: false, tasks: null }],
+    ])('never marks a session whose only list is %s', async (_name, snapshot) => {
+        fixture.onConnect = async () => { fixture.emit?.({ type: 'subagent_tasks', snapshot }); };
+        await start();
+        expect(fixture.session.markLaunchedBackgroundJob).not.toHaveBeenCalled();
     });
 });

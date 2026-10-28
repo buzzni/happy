@@ -1931,6 +1931,38 @@ describe('ApiSessionClient v3 messages API migration', () => {
         }));
     });
 
+    it('flags launchedBackgroundJob at turn end once a Codex sub-agent marks the conversation', () => {
+        const client = new ApiSessionClient('fake-token', session);
+        client.keepAlive(true, 'remote');
+        client.markLaunchedBackgroundJob();
+        mockNotifyDaemonSessionRuntime.mockClear();
+
+        // The main turn ends while the sub-agent keeps running.
+        client.keepAlive(false, 'remote');
+
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', expect.objectContaining({
+            lastTurnEndAt: expect.any(Number),
+            launchedBackgroundJob: true,
+        }));
+    });
+
+    it('sends a mark made after the turn-end report with the next periodic report', () => {
+        vi.useFakeTimers();
+        const client = new ApiSessionClient('fake-token', session);
+        client.keepAlive(true, 'remote');
+        client.keepAlive(false, 'remote');
+        // The sub-agent list can land just after the main turn ended (its first listing waits up to 1.5 s).
+        client.markLaunchedBackgroundJob();
+        mockNotifyDaemonSessionRuntime.mockClear();
+
+        vi.setSystemTime(Date.now() + 30_000);
+        client.keepAlive(false, 'remote');
+
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', expect.objectContaining({
+            launchedBackgroundJob: true,
+        }));
+    });
+
     it('reports AskUserQuestion wait state as idle to the local daemon', () => {
         const client = new ApiSessionClient('fake-token', session);
         mockAxiosPost.mockResolvedValue({

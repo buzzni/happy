@@ -67,6 +67,8 @@ For provider adapters, orphan handling is a CLI responsibility: if a subagent me
 
 Provider-native ids (Claude/Codex tool ids, etc.) must not be used as `subagent` values.
 
+**Codex sub-agents.** Codex child threads are not sent as `subagent` messages. The CLI keeps their notifications out of the main turn, the transcript and the stream preview. For each child the main thread spawns inside a turn, it adds only one pair to that turn: a `tool-call-start` (`name: "CodexAgent"`; `title`, `description` and `args.agent` are the child's name) immediately followed by its `tool-call-end`; the pair's call id is the child thread id, and neither carries a `backgroundTaskId` (that would read as a Claude background launch whose completion answers the request again). The children running now are listed in the session metadata `codexSubagentTasks` (`{ startedAt, available, tasks: [{ taskId, label, kind: "agent" }] | null }`, replaced as a whole on every publish). A session whose runtime never listed a child gets no such key: an empty or unavailable list is written only after a list was, or to replace one an earlier runtime left. Because `taskId` equals the row's call id, a client can show the row as running while the child is listed. Full contract: [specs/codex-subagent-activity](../specs/codex-subagent-activity/spec.md).
+
 ## Events
 
 ### `text`
@@ -112,7 +114,7 @@ Agent begins a tool invocation.
 | Field | Type | Description |
 |---|---|---|
 | `call` | string | Tool call identifier, matched by `tool-call-end` |
-| `name` | string | Tool name (lowercase, hyphenated) |
+| `name` | string | Tool name (lowercase, hyphenated); provider adapters also use prefixed names (`CodexBash`, `CodexPatch`, `CodexAgent`) |
 | `title` | string | Short summary (inline markdown: `` `code` ``, **bold**, *italic*, [links]) |
 | `description` | string | Full description (inline markdown: `` `code` ``, **bold**, *italic*, [links]) |
 | `args` | object | Tool input arguments |
@@ -128,6 +130,8 @@ Tool invocation completes. Matches a prior `tool-call-start` by `call`.
 | Field | Type | Description |
 |---|---|---|
 | `call` | string | Matches `tool-call-start.call` |
+| `images` | array? | Optional. Image blocks of the tool result (e.g. Read on an image file), each `{ mediaType, data }` with base64 `data`. They ride inline on this event instead of a separate upload; consumers that only read `call` are unaffected |
+| `backgroundTaskId` | string? | Optional. The detached job a Claude `run_in_background` launch created: later reports about that job carry this id, never the tool call id, and its completion answers the request again. Transport metadata, never rendered. A Codex `CodexAgent` row never carries it |
 
 ### `file`
 

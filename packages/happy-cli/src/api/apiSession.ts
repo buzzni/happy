@@ -2129,6 +2129,16 @@ export class ApiSessionClient extends EventEmitter {
         sessionBackgroundProcesses.markTurnAborted(this.sessionId, this.turns.current());
     }
 
+    /**
+     * Exempts the conversation from the daemon's turn-end reap, as a Claude `run_in_background` launch does: a Codex
+     * sub-agent keeps running after the main turn ends, and its `CodexAgent` tool call carries no background flag.
+     * Called by runCodex when the running sub-agent list holds a child. Sticky like the tool-call path; the next
+     * runtime report carries it (keep-alive resends an unchanged report within 30 s).
+     */
+    markLaunchedBackgroundJob(): void {
+        this.launchedBackgroundJob = true;
+    }
+
     private reportDaemonRuntime(thinking: boolean, force = false) {
         const hasOpenToolCall = this.openToolCallIds.size > 0;
         // Blocked waiting on a human: an open AskUserQuestion, or a pending

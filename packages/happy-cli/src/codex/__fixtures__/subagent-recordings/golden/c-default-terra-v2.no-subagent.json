@@ -1,0 +1,105 @@
+{
+  "resolvedAt": 5,
+  "eventTypes": [
+    "task_started(turn=d2a481)",
+    "token_count",
+    "token_count",
+    "token_count",
+    "task_complete(turn=d2a481)"
+  ],
+  "envelopeSummary": [
+    "0:agent:turn-start turn=1",
+    "4:agent:turn-end/completed turn=1"
+  ],
+  "streamDeltaText": "",
+  "events": [
+    {
+      "type": "task_started",
+      "turn_id": "01a17e41-cf58-7452-95e6-40da99d2a481"
+    },
+    {
+      "type": "token_count",
+      "total": {
+        "totalTokens": 23247,
+        "inputTokens": 23143,
+        "cachedInputTokens": 0,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 104,
+        "reasoningOutputTokens": 42
+      },
+      "last": {
+        "totalTokens": 23247,
+        "inputTokens": 23143,
+        "cachedInputTokens": 0,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 104,
+        "reasoningOutputTokens": 42
+      },
+      "modelContextWindow": 258400
+    },
+    {
+      "type": "token_count",
+      "total": {
+        "totalTokens": 46538,
+        "inputTokens": 46412,
+        "cachedInputTokens": 22272,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 126,
+        "reasoningOutputTokens": 42
+      },
+      "last": {
+        "totalTokens": 23291,
+        "inputTokens": 23269,
+        "cachedInputTokens": 22272,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 22,
+        "reasoningOutputTokens": 0
+      },
+      "modelContextWindow": 258400
+    },
+    {
+      "type": "token_count",
+      "total": {
+        "totalTokens": 46538,
+        "inputTokens": 46412,
+        "cachedInputTokens": 22272,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 126,
+        "reasoningOutputTokens": 42
+      },
+      "last": {
+        "totalTokens": 23291,
+        "inputTokens": 23269,
+        "cachedInputTokens": 22272,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 22,
+        "reasoningOutputTokens": 0
+      },
+      "modelContextWindow": 258400
+    },
+    {
+      "type": "task_complete",
+      "turn_id": "01a17e41-cf58-7452-95e6-40da99d2a481",
+      "status": "completed"
+    }
+  ],
+  "envelopes": [
+    {
+      "atEvent": 0,
+      "role": "agent",
+      "turn": 1,
+      "ev": {
+        "t": "turn-start"
+      }
+    },
+    {
+      "atEvent": 4,
+      "role": "agent",
+      "turn": 1,
+      "ev": {
+        "t": "turn-end",
+        "status": "completed"
+      }
+    }
+  ]
+}

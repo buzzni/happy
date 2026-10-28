@@ -1,0 +1,131 @@
+{
+  "resolvedAt": 7,
+  "eventTypes": [
+    "task_started(turn=02fb99)",
+    "token_count",
+    "token_count",
+    "agent_message_delta[item=msg_081e69]",
+    "agent_message[item=msg_081e69]",
+    "token_count",
+    "task_complete(turn=02fb99)"
+  ],
+  "envelopeSummary": [
+    "0:agent:turn-start turn=1",
+    "4:agent:text turn=1 text=\"DONE\"",
+    "6:agent:turn-end/completed turn=1"
+  ],
+  "streamDeltaText": "DONE",
+  "events": [
+    {
+      "type": "task_started",
+      "turn_id": "01a17e3f-a9cc-7df2-b2fe-b9a50a02fb99"
+    },
+    {
+      "type": "token_count",
+      "total": {
+        "totalTokens": 23181,
+        "inputTokens": 23114,
+        "cachedInputTokens": 0,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 67,
+        "reasoningOutputTokens": 25
+      },
+      "last": {
+        "totalTokens": 23181,
+        "inputTokens": 23114,
+        "cachedInputTokens": 0,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 67,
+        "reasoningOutputTokens": 25
+      },
+      "modelContextWindow": 258400
+    },
+    {
+      "type": "token_count",
+      "total": {
+        "totalTokens": 46405,
+        "inputTokens": 46317,
+        "cachedInputTokens": 22272,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 88,
+        "reasoningOutputTokens": 25
+      },
+      "last": {
+        "totalTokens": 23224,
+        "inputTokens": 23203,
+        "cachedInputTokens": 22272,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 21,
+        "reasoningOutputTokens": 0
+      },
+      "modelContextWindow": 258400
+    },
+    {
+      "type": "agent_message_delta",
+      "item_id": "msg_081e69390c87e2b6016ae0d4f550608191a5089273f3a2290d",
+      "index": 0,
+      "offset": 0,
+      "delta": "DONE",
+      "final": true
+    },
+    {
+      "type": "agent_message",
+      "message": "DONE",
+      "item_id": "msg_081e69390c87e2b6016ae0d4f550608191a5089273f3a2290d",
+      "phase": "final_answer"
+    },
+    {
+      "type": "token_count",
+      "total": {
+        "totalTokens": 69696,
+        "inputTokens": 69603,
+        "cachedInputTokens": 44544,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 93,
+        "reasoningOutputTokens": 25
+      },
+      "last": {
+        "totalTokens": 23291,
+        "inputTokens": 23286,
+        "cachedInputTokens": 22272,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 5,
+        "reasoningOutputTokens": 0
+      },
+      "modelContextWindow": 258400
+    },
+    {
+      "type": "task_complete",
+      "turn_id": "01a17e3f-a9cc-7df2-b2fe-b9a50a02fb99",
+      "status": "completed"
+    }
+  ],
+  "envelopes": [
+    {
+      "atEvent": 0,
+      "role": "agent",
+      "turn": 1,
+      "ev": {
+        "t": "turn-start"
+      }
+    },
+    {
+      "atEvent": 4,
+      "role": "agent",
+      "turn": 1,
+      "ev": {
+        "t": "text",
+        "text": "DONE"
+      }
+    },
+    {
+      "atEvent": 6,
+      "role": "agent",
+      "turn": 1,
+      "ev": {
+        "t": "turn-end",
+        "status": "completed"
+      }
+    }
+  ]
+}

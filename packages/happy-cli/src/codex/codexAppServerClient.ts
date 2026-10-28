@@ -22,6 +22,7 @@ import { withCodexRecallOwnership } from '@/memory/recallOwnerMarker';
 import { nativeCodexRecallOwnershipOverrides } from '@/memory/nativeCodexRecallOwnership';
 import { CODEX_CONFIG_UNREADABLE, CUA_DRIVER_SERVER } from '@/toolPolicy/cuaShadow';
 import { CodexBackgroundTasks, type CodexBackgroundTask } from './codexBackgroundTasks';
+import { CodexSubagentTracker, type CodexSubagentSpawn } from './codexSubagentTracker';
 import { readCodexOutput } from './codexOutputReader';
 import { resolveCodexStateEnvironment } from './codexStateRecovery';
 import type {
@@ -103,6 +104,8 @@ type NativeCompletionObservation = {
 
 const CODEX_AGENT_MESSAGE_DELTA_FLUSH_MS = 80;
 const CODEX_AGENT_MESSAGE_DELTA_MAX_CHARS = 2_048;
+/** How long a spawn row waits for the child's label: the tracker's first-listing wait, so both name the child alike. */
+const CODEX_SUBAGENT_LABEL_WAIT_MS = 1_500;
 
 export type UserInputHandler = (params: unknown, signal: AbortSignal) => Promise<{ answers: Record<string, { answers: string[] }> }>;
 
@@ -154,8 +157,8 @@ function readCodexCliVersion(): { major: number; minor: number; patch: number } 
     }
 }
 
-function isAppServerAvailable(): boolean {
-    const version = readCodexCliVersion();
+/** `version` is `readCodexCliVersion()`, read once per connect and shared with `isSubagentTrackingAvailable`. */
+function isAppServerAvailable(version: ReturnType<typeof readCodexCliVersion>): boolean {
     if (!version) {
         return false;
     }
@@ -172,6 +175,15 @@ function isGoalActionsAvailable(): boolean {
     const { major, minor } = version;
     // thread/goal/set and thread/goal/clear are present in Codex 0.140+.
     return major > 0 || minor >= 140;
+}
+
+function isSubagentTrackingAvailable(version: ReturnType<typeof readCodexCliVersion>): boolean {
+    if (!version) {
+        return false;
+    }
+    const { major, minor } = version;
+    // Child-thread notifications (0.81+), thread/read sources (0.94+) and thread/status/changed (0.105+).
+    return major > 0 || minor >= 105;
 }
 
 function normalizeRawFileChangeList(changes: unknown): LegacyPatchChanges | undefined {
@@ -356,6 +368,15 @@ export class CodexAppServerClient {
         (method, params) => this.request(method, params, 3000),
         (tasks) => this.eventHandler?.({ type: 'background_tasks', tasks }),
     );
+    // Sub-agent (child thread) list. Publishing never throws: the tracker catches a failing consumer.
+    private readonly subagents = new CodexSubagentTracker({
+        request: (method, params) => this.request(method, params, 3000),
+        publish: (snapshot) => this.eventHandler?.({ type: 'subagent_tasks', snapshot }),
+    });
+    /** The main thread the tracker was pointed at, and on which app-server process (see `pointSubagentsAtMainThread`). */
+    private subagentsMain: { threadId: string | null; epoch: number } = { threadId: null, epoch: -1 };
+    /** Connect-time version gate. Below it there is no list to follow, so no spawn row either (R13: as before). */
+    private subagentTrackingAvailable = false;
 
     restoreBackgroundTasks(tasks: CodexBackgroundTask[]): void {
         this.backgroundTasks.restore(tasks);
@@ -876,6 +897,34 @@ export class CodexAppServerClient {
         });
     }
 
+    /** The turn sendTurnAndWait is waiting on, by provider id; a deferred completion leaves it open. */
+    private isInsideActiveTurn(turnId: string | null): boolean {
+        const pending = this.pendingTurnCompletion;
+        return turnId !== null && pending !== null && pending.turnId === turnId && !this.completedTurnIds.has(turnId);
+    }
+
+    /** The spawn row (design §1.3), titled once the child's label is read; never after its turn or app-server ended. */
+    private async emitSubagentSpawned(spawn: CodexSubagentSpawn): Promise<void> {
+        const epoch = this.processEpoch;
+        try {
+            const label = await this.subagents.awaitLabel(spawn.threadId, CODEX_SUBAGENT_LABEL_WAIT_MS);
+            // A forced restart keeps the turn pending after reporting turn_aborted: an app-server going away ends it too.
+            if (this.processEpoch !== epoch || this.disconnectingEpoch === epoch || !this.isInsideActiveTurn(spawn.turnId)) {
+                logger.debug(`[CodexAppServer] Dropped the spawn row of thread ${spawn.threadId}: its turn or app-server ended`);
+                return;
+            }
+            this.eventHandler?.({
+                type: 'collab_agent_spawned',
+                call_id: spawn.callId,
+                turn_id: spawn.turnId,
+                thread_id: spawn.threadId,
+                label,
+            });
+        } catch (error) {
+            logger.debug('[CodexAppServer] Could not report a sub-agent spawn', { error: String(error) });
+        }
+    }
+
     private handleRawNotification(method: string, params: any): boolean {
         if (!this.shouldHandleRawNotification(method)) {
             return false;
@@ -983,6 +1032,17 @@ export class CodexAppServerClient {
         const item = params?.item;
         if (!item || typeof item !== 'object') {
             return method.startsWith('item/');
+        }
+
+        // The parent's own sub-agent items are never transcript items, and never new work of this turn:
+        // a V2 `subAgentActivity completed` comes after the turn ended, under its id (design §1.2, P4).
+        if ((method === 'item/started' || method === 'item/completed')
+            && (item.type === 'collabAgentToolCall' || item.type === 'subAgentActivity')) {
+            const spawn = this.subagents.observeMainItem(method, item, this.extractTurnId(params));
+            if (spawn && this.subagentTrackingAvailable && this.isInsideActiveTurn(spawn.turnId)) {
+                void this.emitSubagentSpawned(spawn);
+            }
+            return true;
         }
 
         if (method === 'item/started') {
@@ -1105,7 +1165,8 @@ export class CodexAppServerClient {
             await this.cleanupMultiAuthProxy();
         }
 
-        if (!isAppServerAvailable()) {
+        const codexVersion = readCodexCliVersion();
+        if (!isAppServerAvailable(codexVersion)) {
             throw new Error(
                 'Codex CLI is not installed\n\n' +
                 'Please install Codex CLI using one of these methods:\n\n' +
@@ -1249,6 +1310,7 @@ export class CodexAppServerClient {
             if (this.backgroundTimer) clearTimeout(this.backgroundTimer);
             this.backgroundTimer = null;
             this.backgroundTasks.invalidate();
+            this.subagents.invalidate();
             this.clearAgentMessageDeltas();
             void this.cleanupMultiAuthProxy();
             // Reject all pending requests
@@ -1330,6 +1392,8 @@ export class CodexAppServerClient {
             this.notify('initialized');
             this.initializedEpoch = epoch;
             this.connected = true;
+            this.subagentTrackingAvailable = isSubagentTrackingAvailable(codexVersion);
+            this.subagents.setAvailable(this.subagentTrackingAvailable);
             await confirmSessionWriteScope(scopeConfirmation, this.sandboxEnabled, this.sandboxConfig ?? undefined);
             logger.debug('[CodexAppServer] Connected and initialized');
         } catch (error) {
@@ -1435,6 +1499,7 @@ export class CodexAppServerClient {
         if (this.backgroundTimer) clearTimeout(this.backgroundTimer);
         this.backgroundTimer = null;
         this.backgroundTasks.invalidate();
+        this.subagents.invalidate();
         this.clearAgentMessageDeltas();
         if (!this.connected
             && !this.process
@@ -1724,6 +1789,7 @@ export class CodexAppServerClient {
 
         const result = await this.request('thread/start', params) as NewConversationResponse;
         this._threadId = result.thread.id;
+        this.pointSubagentsAtMainThread();
         this.rememberNativeThreadMetadata(result.thread);
         this.scheduleBackgroundRefresh();
         this._turnId = null;
@@ -1770,6 +1836,7 @@ export class CodexAppServerClient {
 
         const result = await this.request('thread/resume', params) as ResumeConversationResponse;
         this._threadId = result.thread.id;
+        this.pointSubagentsAtMainThread();
         this.rememberNativeThreadMetadata(result.thread);
         this.scheduleBackgroundRefresh();
         this._turnId = null;
@@ -1822,6 +1889,7 @@ export class CodexAppServerClient {
 
         const result = await this.request('thread/fork', params) as ForkConversationResponse;
         this._threadId = result.thread.id;
+        this.pointSubagentsAtMainThread();
         this.rememberNativeThreadMetadata(result.thread);
         this.scheduleBackgroundRefresh();
         this._turnId = null;
@@ -1847,6 +1915,17 @@ export class CodexAppServerClient {
             path: opts.path,
             cwd: opts.cwd,
         });
+    }
+
+    /**
+     * Points the sub-agent tracker at the current main thread. Another thread, or the first start/resume on a new
+     * app-server process, starts the list over. A same-process resume of the same thread (developer instructions,
+     * MCP sync) does not: Codex hands it to the loaded session, whose children keep running.
+     */
+    private pointSubagentsAtMainThread(): void {
+        if (this.subagentsMain.threadId === this._threadId && this.subagentsMain.epoch === this.processEpoch) return;
+        this.subagents.setMainThread(this._threadId);
+        this.subagentsMain = { threadId: this._threadId, epoch: this.processEpoch };
     }
 
     private rememberNativeThreadMetadata(thread: Thread): void {
@@ -2297,6 +2376,8 @@ export class CodexAppServerClient {
         }
 
         logger.warn(`[CodexAppServer] interrupt did not settle turn in ${gracePeriodMs}ms; force-restarting app-server`);
+        // The children go down with the app-server being restarted.
+        this.subagents.invalidate();
         const pendingTurnId = this.pendingTurnCompletion?.turnId ?? this._turnId;
         if (this.pendingTurnCompletion) {
             const inactivity = this.consumeInactivityAbortFields();
@@ -2618,6 +2699,8 @@ export class CodexAppServerClient {
         // rather than let it mislabel a later turn's abort.
         this.pendingInactivityAbort = null;
         this._threadId = null;
+        this.subagents.setMainThread(null);
+        this.subagentsMain = { threadId: null, epoch: -1 };
         this._turnId = null;
         this.nativeThreadMetadata = null;
         this.threadDefaults = null;
@@ -2925,6 +3008,22 @@ export class CodexAppServerClient {
                 this.userInputRequests.delete(params.requestId);
                 request.controller.abort();
             }
+            return;
+        }
+        // Sub-agent threads report on this connection too. Their lifecycle, items and statuses are not the
+        // main thread's (design §1.2): only the tracker sees them; their usage still counts.
+        const threadId = this.extractThreadId(params);
+        if (threadId && this.subagents.shouldDivert(threadId, this._threadId)) {
+            if (method === 'rawResponse/completed') this.emitCodexUsage(params);
+            this.subagents.observeOtherThread(method, params);
+            // A tracked child's progress is the waiting main turn's too: a parent blocked on `wait_agent` is not hung.
+            // Foreign and unclassified threads never count (specs/codex-subagent-activity R1).
+            if (this.subagents.isTracked(threadId)
+                && (method === 'turn/started' || method.startsWith('item/') || method === 'thread/tokenUsage/updated')) {
+                this.schedulePendingTurnInactivityTimeout();
+            }
+            // Deltas are too many to log.
+            if (!/delta$/i.test(method)) logger.debug(`[CodexAppServer] Diverted ${method} from thread ${threadId}`);
             return;
         }
         if (method === 'turn/completed' || method === 'turn/aborted') {

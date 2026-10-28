@@ -1,6 +1,7 @@
 import { installCodexUserInputBoundary } from './utils/codexUserInput';
 /** Orchestrates Codex sessions, initial prompts, MCP tools and session lifecycle. */
 import type { CodexBackgroundTask } from './codexBackgroundTasks';
+import type { CodexSubagentSnapshot } from './codexSubagentTracker';
 import { SessionLaunchControl } from '../sessionDrain/sessionLaunchControl';
 import type { StandaloneLaunchBootstrap } from '../daemon/standaloneLaunchProtocol';
 import { RuntimeProducerGate } from '../sessionDrain/runtimeProducerGate';
@@ -1734,6 +1735,8 @@ export async function runCodex(opts: {
         }),
     });
 
+    /** A sub-agent list was written by this runtime: from then on an emptied list must be written too. */
+    let codexSubagentListWritten = false;
     // Event handler: same EventMsg types as the legacy MCP server — no changes needed
     client.setEventHandler((msg) => {
         if (msg.type === 'agent_message_delta' && typeof msg.delta === 'string') activeLatency?.text(msg.delta);
@@ -1748,6 +1751,29 @@ export async function runCodex(opts: {
         if (msg.type === 'background_tasks') {
             const tasks = msg.tasks as CodexBackgroundTask[];
             session.updateMetadata(current => ({ ...current, codexBackgroundTasks: tasks }));
+            return;
+        }
+        // The running sub-agents (Saycode specs/subagent-running-indicator R11). The client publishes on connect and
+        // on every change, so the first publish replaces a list an earlier runtime left; an equal list stays as it is.
+        if (msg.type === 'subagent_tasks') {
+            try {
+                const snapshot = msg.snapshot as CodexSubagentSnapshot;
+                const listed = (snapshot.tasks?.length ?? 0) > 0;
+                // A listed child outlives the main turn like a Claude background launch, so the daemon's turn-end
+                // reap skips this conversation the same way. Empty and null lists never mark. Marked before the
+                // metadata write, which may fail; marking cannot.
+                if (listed) session.markLaunchedBackgroundJob();
+                // A conversation that never lists a sub-agent keeps its metadata as before: an empty or unavailable
+                // list is written only after a list was, or over one an earlier runtime left (specs/codex-subagent-activity R4).
+                if (!listed && !codexSubagentListWritten && session.getMetadata()?.codexSubagentTasks === undefined) return;
+                codexSubagentListWritten = true;
+                const next = JSON.stringify(snapshot);
+                session.updateMetadata(current => JSON.stringify(current.codexSubagentTasks) === next
+                    ? current
+                    : { ...current, codexSubagentTasks: snapshot });
+            } catch (error) {
+                logger.warn('[Codex] Failed to publish the sub-agent list:', error);
+            }
             return;
         }
         if (msg.type === 'plan_update') {
