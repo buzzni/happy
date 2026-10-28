@@ -3,7 +3,8 @@
  *
  * Assembles the gate every adapter calls — the Claude PreToolUse hook, the cua-driver shadow proxy
  * and the stdio bridge — with the per-process secret those out-of-process adapters present to the
- * session hook server, the machine policy loader, target resolver, grants and audit log.
+ * session hook server, the machine policy loader, target resolver, grants and audit log — and the
+ * session RPCs that list and revoke those grants (grantControl.ts).
  */
 
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -11,6 +12,7 @@ import { chmodSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createToolPolicyAuditLog, type ToolPolicyAuditRecord } from './audit';
 import { toolPolicyFilePath } from './claudeHook';
+import { registerToolPolicyGrantRpcs } from './grantControl';
 import { createPolicyGrantStore, type PolicyGrantStore } from './grants';
 import { createToolPolicyGate, type PolicyApprover, type ToolPolicyGate } from './policyGate';
 import { createMachinePolicyLoader } from './rules';
@@ -34,6 +36,8 @@ export function createToolPolicyRuntime(input: {
     unattended: () => boolean;
     terminalPrompt: () => boolean;
     grantTtlMs: number | null;
+    /** The session's RPC handlers; every adapter shares the one grant store these revoke from. */
+    rpc: Parameters<typeof registerToolPolicyGrantRpcs>[0];
 }): ToolPolicyRuntime {
     const secret = randomBytes(32).toString('hex');
     const hooksDir = join(input.happyHomeDir, 'tmp', 'hooks');
@@ -44,6 +48,7 @@ export function createToolPolicyRuntime(input: {
 
     const policyFile = toolPolicyFilePath(input.happyHomeDir);
     const grants = createPolicyGrantStore({ grantTtlMs: input.grantTtlMs });
+    registerToolPolicyGrantRpcs(input.rpc, grants);
     const gate = createToolPolicyGate({
         loadMachinePolicy: createMachinePolicyLoader(policyFile),
         resolver: createTargetResolver(),

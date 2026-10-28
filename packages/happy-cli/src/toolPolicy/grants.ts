@@ -27,7 +27,8 @@ export interface PolicyGrantStore {
     recordDenial(key: string): void;
     /** R13: the person's next message lifts the refusal memory. */
     onUserMessage(): void;
-    revoke(key: string): void;
+    /** R18: true when a live grant was removed; an expired or unknown key is false. */
+    revoke(key: string): boolean;
     list(): PolicyGrantRecord[];
     clear(): void;
 }
@@ -66,7 +67,7 @@ export function createPolicyGrantStore(options: { now?: () => number; grantTtlMs
         },
         recordDenial: (key) => { denials.set(key, now()); },
         onUserMessage: () => { denials.clear(); },
-        revoke: (key) => { grants.delete(key); },
+        revoke: (key) => live(grants.get(key)) && grants.delete(key),
         list: () => [...grants.values()].filter((record) => live(record)),
         clear: () => { grants.clear(); denials.clear(); },
     };
