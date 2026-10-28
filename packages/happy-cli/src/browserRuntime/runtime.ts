@@ -928,24 +928,26 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         return 'closed'
     }
     /**
-     * Whether `tabId` is kept for the user. Its disposition decides; a tab without one (a record
-     * from before dispositions) is kept when a task of it was handed to the user or taken over.
+     * Whether `tabId` is kept for the user: retained, or of unknown history. A tab without a
+     * disposition comes from a Runtime before dispositions; nothing says it was never handed over.
      */
     private isRetained(space: SpaceRecord, tabId: TabId): boolean {
         const disposition = space.tabDispositions?.[tabId]
-        if (disposition)
-            return Boolean(disposition.retained)
-        return this.legacyRetention(space, tabId) !== undefined
+        return !disposition || Boolean(disposition.retained || disposition.retentionUnknown)
     }
-    private legacyRetention(space: SpaceRecord, tabId: TabId): TabDisposition['retained'] {
-        const tasks = this.spaceTasks(space.taskSpaceId).filter((task) => task.tabs.includes(tabId))
-        for (const task of tasks) {
+    /**
+     * The disposition for a tab of a record from before dispositions: a hand-off or user control
+     * its tasks still show is proven; otherwise its history is unknown (a release, resume or finish
+     * clears what tasks show, so their silence proves nothing).
+     */
+    private legacyDisposition(space: SpaceRecord, tabId: TabId): TabDisposition {
+        for (const task of this.spaceTasks(space.taskSpaceId).filter((item) => item.tabs.includes(tabId))) {
             if (task.waitReason && task.waitReason !== 'approval' && (task.waitCompletion as UserWaitCompletion | undefined)?.tabId === tabId)
-                return { reason: task.waitReason, taskId: task.taskId, atMs: this.clock.now() }
+                return { createdBy: 'agent', retained: { reason: task.waitReason, taskId: task.taskId, atMs: this.clock.now() } }
             if (task.pauseReason === 'user-control' || task.pauseReason === 'user-input-complete' || space.profileUserOwner?.tabId === tabId)
-                return { reason: 'user-control', taskId: task.taskId, atMs: this.clock.now() }
+                return { createdBy: 'agent', retained: { reason: 'user-control', taskId: task.taskId, atMs: this.clock.now() } }
         }
-        return undefined
+        return { createdBy: 'agent', retentionUnknown: true }
     }
     /**
      * Keeps `tabId` for the user from now on (sticky). Written before what hands the tab to the
@@ -1511,22 +1513,20 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         requestId: RequestId
     }): Promise<ControlResult> {
         await this.recovery
-        const task = this.requireTask(req.taskId)
+        let task = this.requireTask(req.taskId)
         await this.authorizeTask(auth, 'takeOver', task)
-        if (['succeeded', 'failed', 'cancelled'].includes(task.status))
-            throw new BrowserRuntimeError('CONFLICT', 'Terminal tasks cannot be taken over')
-        this.assertTaskTab(task, req.tabId)
-        if (task.waitReason === 'approval')
-            throw new BrowserRuntimeError('CONFLICT', 'Approval waits cannot be replaced with user takeover')
-        const lease = this.leases.owner(req.tabId, task.profileId)
-        if (lease.leaseEpoch !== req.expectedEpoch)
-            throw new BrowserRuntimeError('STALE_LEASE', 'Lease epoch changed')
+        this.assertTakeOverAllowed(task, req)
+        await this.retainTab(task.taskSpaceId, req.tabId, task.taskId, 'user-control')
+        // Anything may have changed while the retention was written (cancel, revocation, another
+        // takeover, the tab leaving): check again, and fence with no await in between.
+        task = this.requireTask(req.taskId)
+        this.checkCredential(auth, 'takeOver', task.profileId, task.taskSpaceId)
+        this.assertTakeOverAllowed(task, req)
         const interactive = auth.credential as Extract<AuthContext['credential'], {
             kind: 'interactive'
         }>
         const owner: InputOwner = { kind: 'user', principalId: interactive.principalId, viewerSessionId: interactive.viewerSessionId }
         const settling = this.inFlightDriverCalls.has(task.taskId)
-        await this.retainTab(task.taskSpaceId, req.tabId, task.taskId, 'user-control')
         const epoch = this.leases.fenceForTakeover(req.tabId, task.profileId, task.taskId, owner)
         await this.persistTabLease(task.taskId, task.taskSpaceId, req.tabId, epoch, { tabId: req.tabId, owner })
         await this.persistProfileUserOwner(task.profileId, { tabId: req.tabId, owner })
@@ -1544,6 +1544,19 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         this.controllers.get(task.taskId)?.abort(new Error('user takeover'))
         const currentOwner = this.leases.owner(req.tabId, task.profileId).owner
         return { leaseEpoch: epoch, owner: currentOwner, task: this.view(paused), settling }
+    }
+    /** Takeover preconditions on the task as it is now (no I/O). */
+    private assertTakeOverAllowed(task: StoredTask, req: { tabId: TabId; expectedEpoch: number }): void {
+        if (['succeeded', 'failed', 'cancelled'].includes(task.status))
+            throw new BrowserRuntimeError('CONFLICT', 'Terminal tasks cannot be taken over')
+        this.assertTaskTab(task, req.tabId)
+        if (task.waitReason === 'approval')
+            throw new BrowserRuntimeError('CONFLICT', 'Approval waits cannot be replaced with user takeover')
+        const space = this.requireSpace(task.taskSpaceId)
+        if (space.closed || !space.tabs.includes(req.tabId))
+            throw new BrowserRuntimeError('CONFLICT', 'Tab is no longer open in its task space')
+        if (this.leases.owner(req.tabId, task.profileId).leaseEpoch !== req.expectedEpoch)
+            throw new BrowserRuntimeError('STALE_LEASE', 'Lease epoch changed')
     }
     private async releaseControlImpl(auth: AuthContext, req: {
         taskId: TaskId
@@ -2068,10 +2081,9 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 const persistedOwner = profileOwner?.tabId === tabId ? profileOwner.owner : { kind: 'none' as const }
                 const epoch = this.leases.restore(tabId, space.profileId, previousEpoch, persistedOwner)
                 await this.options.store.mutateSpace(space.taskSpaceId, (current) => {
-                    // A record from before dispositions gets one here, once, from what its tasks say (isRetained).
-                    const legacy = current.tabDispositions?.[tabId] ? undefined : this.legacyRetention(current, tabId)
-                    const disposition: TabDisposition = { createdBy: 'agent', ...(legacy ? { retained: legacy } : {}),
-                        ...current.tabDispositions?.[tabId], adoptedAtMs: this.clock.now() }
+                    // A record from before dispositions gets one here, once (legacyDisposition).
+                    const disposition: TabDisposition = { ...current.tabDispositions?.[tabId] ?? this.legacyDisposition(current, tabId),
+                        adoptedAtMs: this.clock.now() }
                     return { tabLeaseEpochs: { ...current.tabLeaseEpochs, [tabId]: epoch },
                         tabDispositions: { ...current.tabDispositions, [tabId]: disposition } }
                 })

@@ -268,23 +268,83 @@ describe('a tab handed to the user', () => {
         await h.store.close()
     })
 
-    it('repairs a record written before dispositions existed at restart: a tab its task handed to the user is kept, the others close', async () => {
+    it('keeps a tab of a record from before dispositions whose task was handed to the user, released, resumed and finished (history unknown)', async () => {
         const driver = new FakeBrowserDriver()
         const first = await harness({ driver })
         const page = await first.open()
-        const other = await first.open('session-a', '/other', page.taskSpaceId)
+        const plain = await first.open('session-a', '/other', page.taskSpaceId)
         await first.handOff(page)
-        // As an earlier Runtime wrote it: no dispositions.
+        const taken = await first.takeOver(page)
+        const released = await first.release(page, taken.leaseEpoch)
+        const resumed = await first.runtime.resume(first.ui, { taskId: page.taskId, expectedVersion: released.task.stateVersion, requestId: rid('resume') })
+        await first.runtime.finishTask(page.auth, { taskId: page.taskId, expectedVersion: resumed.stateVersion, requestId: rid('finish') })
+        // What an earlier Runtime leaves on disk: no dispositions at all, and nothing current says the tab was handed over.
+        await first.store.updateSpace(page.taskSpaceId, { tabDispositions: undefined })
+        expect(first.store.getTask(page.taskId)).toMatchObject({ status: 'succeeded', waitReason: undefined })
+        await first.store.close()
+
+        const restarted = await harness({ dir: first.dir, driver, clock: first.clock })
+        await restarted.runtime.getTask(page.auth, { taskId: page.taskId })
+        // Unknown is not a proven hand-off: kept, and labelled as unknown history.
+        for (const tabId of [page.tabId, plain.tabId])
+            expect(restarted.store.getSpace(page.taskSpaceId)?.tabDispositions?.[tabId]).toEqual({ createdBy: 'agent', adoptedAtMs: expect.any(Number), retentionUnknown: true })
+        // A tab this Runtime opens itself has its history: it still closes as before.
+        const fresh = await restarted.open('session-a', '/fresh', page.taskSpaceId)
+        await restarted.runtime.endSession('session-a')
+        const [report] = await restarted.runtime.reclaimSpaces()
+        expect(report).toMatchObject({ closed: false, closedTabs: [fresh.tabId] })
+        expect(new Set(report.retainedTabs)).toEqual(new Set([page.tabId, plain.tabId]))
+        expect(await restarted.runtime.reclaimSpaces()).toEqual([expect.objectContaining({ closed: false, closedTabs: [] })])
+        await expect(restarted.runtime.closePage(page.auth, { taskSpaceId: page.taskSpaceId, tabId: page.tabId, requestId: rid('close') }))
+            .rejects.toMatchObject({ code: 'CONFLICT' })
+        await expect(restarted.runtime.closeSpace(page.auth, { taskSpaceId: page.taskSpaceId, requestId: rid('close-space') }))
+            .rejects.toMatchObject({ code: 'CONFLICT' })
+        restarted.clock.advance(400 * 24 * 60 * MINUTE)
+        // Only the task of the closed fresh tab expires; the kept tabs' tasks stay.
+        expect(await restarted.runtime.purgeExpiredTasks(24 * 60 * MINUTE)).toEqual([fresh.taskId])
+        expect(new Set(restarted.runtime.spaceReport()[0].retainedTabs)).toEqual(new Set([page.tabId, plain.tabId]))
+        await restarted.store.close()
+
+        // A second restart re-adopts them with the same unknown history.
+        const again = await harness({ dir: first.dir, driver, clock: first.clock })
+        await again.runtime.reclaimSpaces()
+        expect(again.store.getSpace(page.taskSpaceId)?.tabDispositions?.[page.tabId]).toMatchObject({ retentionUnknown: true })
+        expect(again.store.getSpace(page.taskSpaceId)?.tabDispositions?.[page.tabId]?.retained).toBeUndefined()
+        expect([driver.hasTab(page.tabId), driver.hasTab(plain.tabId), driver.hasTab(fresh.tabId)]).toEqual([true, true, false])
+        expect(again.store.getTask(page.taskId)).toBeDefined()
+        await again.store.close()
+    })
+
+    it('records a hand-off still pending in a record from before dispositions as a proven hand-off', async () => {
+        const driver = new FakeBrowserDriver()
+        const first = await harness({ driver })
+        const page = await first.open()
+        await first.handOff(page)
         await first.store.updateSpace(page.taskSpaceId, { tabDispositions: undefined })
         await first.store.close()
         const restarted = await harness({ dir: first.dir, driver, clock: first.clock })
         await restarted.runtime.getTask(page.auth, { taskId: page.taskId })
-        expect(restarted.store.getSpace(page.taskSpaceId)?.tabDispositions).toEqual({
-            [page.tabId]: { createdBy: 'agent', adoptedAtMs: expect.any(Number), retained: { reason: 'handoff', taskId: page.taskId, atMs: expect.any(Number) } },
-            [other.tabId]: { createdBy: 'agent', adoptedAtMs: expect.any(Number) } })
-        await restarted.runtime.endSession('session-a')
-        expect(await restarted.runtime.reclaimSpaces()).toEqual([expect.objectContaining({ closedTabs: [other.tabId], retainedTabs: [page.tabId] })])
-        expect([driver.hasTab(page.tabId), driver.hasTab(other.tabId)]).toEqual([true, false])
+        expect(restarted.store.getSpace(page.taskSpaceId)?.tabDispositions?.[page.tabId]).toEqual({ createdBy: 'agent', adoptedAtMs: expect.any(Number),
+            retained: { reason: 'handoff', taskId: page.taskId, atMs: expect.any(Number) } })
+        await restarted.store.close()
+    })
+
+    it('lets a local client end while a tab of unknown history stays', async () => {
+        const driver = new FakeBrowserDriver()
+        const first = await harness({ driver })
+        const owner = first.agent('session-a')
+        const { taskSpaceId } = await first.runtime.createSpace(owner, { profileId, requestId: rid('space') })
+        const client = { ...first.agent('client-1').credential, taskSpaceIds: [taskSpaceId] } as AgentGrant
+        await first.runtime.attachLocalClient(owner, client, first.clock.now() + 60 * MINUTE)
+        const auth = { credential: client, verifiedAtMs: first.clock.now() }
+        const task = await first.runtime.createTask(auth, { taskSpaceId, requestId: rid('task') })
+        const opened = await first.runtime.openPage(auth, { taskId: task.taskId, url: `${ORIGIN}/start`, requestId: rid('open') })
+        await first.store.updateSpace(taskSpaceId, { tabDispositions: undefined })
+        await first.store.close()
+        const restarted = await harness({ dir: first.dir, driver, clock: first.clock })
+        await restarted.runtime.endLocalClient('client-1')
+        expect(driver.hasTab(opened.tabId)).toBe(true)
+        expect(restarted.store.getTask(task.taskId)?.status).toBe('cancelled')
         await restarted.store.close()
     })
 
@@ -305,6 +365,60 @@ describe('a tab never handed to the user', () => {
         expect(await h.runtime.reclaimSpaces()).toEqual([expect.objectContaining({ closed: true, closedTabs: [page.tabId] })])
         expect(h.driver.hasTab(page.tabId)).toBe(false)
         expect(h.store.getSpace(page.taskSpaceId)?.tabDispositions ?? {}).toEqual({})
+        await h.store.close()
+    })
+})
+
+describe('taking over a tab while its retention is written', () => {
+    it('lets exactly one of two takeovers with the same epoch succeed', async () => {
+        const h = await harness()
+        const page = await h.open()
+        const expectedEpoch = h.runtime.leases.owner(page.tabId, profileId).leaseEpoch
+        const results = await Promise.allSettled([1, 2].map(() => h.runtime.takeOver(h.ui, { taskId: page.taskId, tabId: page.tabId, expectedEpoch, requestId: rid('take') })))
+        expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+        expect(results.filter((result) => result.status === 'rejected').map((result) => (result as PromiseRejectedResult).reason.code)).toEqual(['STALE_LEASE'])
+        expect(h.store.getSpace(page.taskSpaceId)?.tabDispositions?.[page.tabId]?.retained?.reason).toBe('user-control')
+        await h.store.close()
+    })
+
+    /** Holds the next spaces.json write (the retention record) until released. */
+    function barrier() {
+        let armed = false
+        let entered!: () => void
+        let release!: () => void
+        const enteredPromise = new Promise<void>((resolve) => { entered = resolve })
+        const gate = new Promise<void>((resolve) => { release = resolve })
+        const faults: FaultInjector = async (operation) => { if (armed && operation === 'metadata') { armed = false; entered(); await gate } }
+        return { faults, arm: () => { armed = true }, entered: enteredPromise, release }
+    }
+
+    it('refuses control of a task cancelled while the retention was written, and keeps the record', async () => {
+        const hold = barrier()
+        const h = await harness({ faults: hold.faults })
+        const page = await h.open()
+        hold.arm()
+        const pending = h.takeOver(page)
+        await hold.entered
+        const ui = { ...h.ui, credential: { ...h.ui.credential, operations: [...h.ui.credential.operations, 'cancel' as const] } }
+        expect((await h.runtime.cancel(ui, { taskId: page.taskId, requestId: rid('cancel') })).task.status).toBe('cancelled')
+        hold.release()
+        await expect(pending).rejects.toMatchObject({ code: 'CONFLICT' })
+        expect(h.runtime.leases.owner(page.tabId, profileId).owner.kind).toBe('none')
+        expect(h.store.getSpace(page.taskSpaceId)?.tabDispositions?.[page.tabId]?.retained?.reason).toBe('user-control')
+        await h.store.close()
+    })
+
+    it('refuses control when the capability expired while the retention was written', async () => {
+        const hold = barrier()
+        const h = await harness({ faults: hold.faults })
+        const page = await h.open()
+        hold.arm()
+        const pending = h.takeOver(page)
+        await hold.entered
+        h.clock.set(h.ui.credential.expiresAtMs + 1)
+        hold.release()
+        await expect(pending).rejects.toMatchObject({ code: 'UNAUTHORIZED' })
+        expect(h.runtime.leases.owner(page.tabId, profileId).owner.kind).toBe('none')
         await h.store.close()
     })
 })

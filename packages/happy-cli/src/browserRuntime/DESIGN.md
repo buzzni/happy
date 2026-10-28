@@ -312,7 +312,11 @@ popup, active tab or window position ever makes a page the agent's.
 Kept for the user. From the moment a tab is handed to the user — a hand-off (`waitReason:
 'handoff'`), a page that lands on a login or captcha wait — or a user takes it over, its
 disposition carries `retained { reason, taskId, atMs }`, written before that step is acknowledged
-(a failed write fails the takeover or the step). It is sticky: giving control back, resuming,
+(a failed write fails the takeover or the step). A takeover writes it first and then checks
+again — credential, task not terminal or waiting for an approval, tab still open in its space,
+lease epoch, in-flight driver call — and fences with no await in between: of two takeovers with
+the same epoch one succeeds and one gets `STALE_LEASE`, and a task cancelled meanwhile is not
+taken over. A refused takeover leaves the (sticky) record. It is sticky: giving control back, resuming,
 finishing, cancelling, the session ending, idling, expiring or a restart do not clear it. Such a
 tab keeps its task, space, target, lease epoch and disposition records and stays counted against
 `maxActiveTabs` and `maxAgentWindows`, and its task record is not purged:
@@ -326,14 +330,28 @@ tab keeps its task, space, target, lease epoch and disposition records and stays
 - a restart re-adopts it in the same browser with the disposition unchanged; a replaced browser
   or a vanished target drops it (and its disposition) as before — nothing is re-attached by URL,
   active tab or window position;
-- a record from before dispositions is repaired at restart from what its tasks say (a user wait
-  on that tab, or user control); until then the same rule decides.
+- a tab without a disposition comes from a Runtime before dispositions. Its tasks only show a
+  hand-off that is still current (a release, resume or finish clears it), so their silence proves
+  nothing: at restart it gets `retained` when a current user wait or user control on it is shown,
+  otherwise `retentionUnknown: true` — kept exactly like a retained tab (also across further
+  restarts, reclamation, agent close, local client end and retention), but not labelled a
+  hand-off. Until that repair a missing disposition counts as kept too. Tabs this Runtime opens
+  always carry their own disposition and close normally unless handed over.
 
 Not covered: after a task is terminal, the user cannot take over a kept tab again (takeover and
 the console listing still exclude finished tasks); the tab stays open in the profile's browser
 until the operator closes it. A profile reassignment (another owner or assignment) ends the
 previous assignment's spaces as before, kept tabs included. Stopping the browser stack still
-ends every page. Known gap, unchanged here: a popup opened before a Runtime restart is released
+ends every page.
+
+Downgrade risk: a Runtime from before dispositions ignores them and closes kept tabs on its next
+cleanup. Before running one on this state: fence new work, stop the Runtime only (keep the
+browser), keep the state volume and the inventory of kept browserInstanceId/targetId pairs, and
+either run a dispositions-aware Runtime or get an explicit decision for those targets. Do not
+erase dispositions, lower quotas or stop the whole stack to make a downgrade look clean. No
+command automates this.
+
+Known gap, unchanged here: a popup opened before a Runtime restart is released
 at the new connection's attach, so its requests are no longer checked (observed 2026-10-29: a
 POST to a disallowed origin was sent after restart).
 

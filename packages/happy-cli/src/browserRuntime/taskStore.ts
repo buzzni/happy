@@ -138,6 +138,11 @@ export interface TabDisposition {
      * automatic cleanup closes it, whatever happens to its task or the user's input control.
      */
     retained?: { reason: 'handoff' | 'login' | 'captcha' | 'user-control'; taskId: TaskId; atMs: number }
+    /**
+     * Written by a Runtime from before dispositions and not shown to be a hand-off: whether it was
+     * ever handed to the user is not known, so it is kept like a retained tab (not a proven hand-off).
+     */
+    retentionUnknown?: true
 }
 /**
  * Spaces being reclaimed do not count against maxSpacesPerProfile, except those beyond
