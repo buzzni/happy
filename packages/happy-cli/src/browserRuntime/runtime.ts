@@ -46,7 +46,7 @@ export interface SpaceReclaimReport {
     closedTabs: TabId[]
     /** beforeunload kept these open; retried on the next pass. */
     blockedTabs?: TabId[]
-    /** A user holds these, or the browser could not close them; retried. */
+    /** A user holds these, the browser could not close them, or a kept tab's browser could not be asked whether it is gone; retried. */
     failedTabs?: TabId[]
     /** Kept for the user (handed to them or taken over): never closed automatically, so the space stays open. */
     retainedTabs?: TabId[]
@@ -907,27 +907,63 @@ export class BrowserRuntime implements BrowserRuntimeApi {
      * Closes one space tab in the browser and only then drops it from the space. A target
      * that is already gone (closed just before a crash) counts as closed; a tab a user holds,
      * or one kept for the user (unless an operator forces it), is not touched. A kept tab the
-     * driver no longer has goes on to closeTab, which sends nothing for it: only a target the
-     * driver saw go counts as closed (and is dropped); a lost connection fails and is retried.
+     * driver does not have is never sent anything: only when its browser says the target is gone
+     * is it dropped; if that cannot be told it stays and is retried.
      */
     private async closeSpaceTab(profileId: ProfileId, taskSpaceId: TaskSpaceId, tabId: TabId, force = false): Promise<'closed' | 'held' | 'retained' | 'blocked' | 'failed'> {
-        if (!force && this.isRetained(this.requireSpace(taskSpaceId), tabId) && this.driver(profileId).hasTab(tabId))
-            return 'retained'
+        const driver = this.driver(profileId)
+        if (!force && this.isRetained(this.requireSpace(taskSpaceId), tabId)) {
+            if (driver.hasTab(tabId))
+                return 'retained'
+            const gone = await this.keptTargetGone(this.requireSpace(taskSpaceId), tabId)
+            if (gone === undefined)
+                return 'failed'
+            if (!gone)
+                return 'retained'
+            if (this.leases.owner(tabId, profileId).owner.kind !== 'none')
+                return 'held'
+            await this.dropSpaceTab(taskSpaceId, tabId)
+            return 'closed'
+        }
         if (this.leases.owner(tabId, profileId).owner.kind !== 'none')
             return 'held'
-        const driver = this.driver(profileId)
         const result = await driver.closeTab(tabId, { timeoutMs: 5000 }).catch(() => undefined)
         if (result?.beforeUnloadBlocked)
             return 'blocked'
         if (!result?.closed && !(result && !driver.hasTab(tabId)))
             return 'failed'
+        await this.dropSpaceTab(taskSpaceId, tabId)
+        return 'closed'
+    }
+    private async dropSpaceTab(taskSpaceId: TaskSpaceId, tabId: TabId): Promise<void> {
         await this.options.store.mutateSpace(taskSpaceId, (current) => {
             const { [tabId]: _target, ...tabTargets } = current.tabTargets ?? {}
             const { [tabId]: _epoch, ...tabLeaseEpochs } = current.tabLeaseEpochs ?? {}
             return { tabs: current.tabs.filter((tab) => tab !== tabId), goneTabs: [...new Set([...(current.goneTabs ?? []), tabId])],
                 tabTargets, tabLeaseEpochs, tabDispositions: withoutDisposition(current, tabId) }
         })
-        return 'closed'
+    }
+    /**
+     * Whether a kept tab's target is gone, by its persisted targetId, asked of the browser it was
+     * opened in: true or false only from that browser's own answer; undefined when it cannot be told
+     * (not connected, another browser instance, no answer). Session loss, a crash or the driver's
+     * memory of a closed tab are not evidence.
+     */
+    private async keptTargetGone(space: SpaceRecord, tabId: TabId): Promise<boolean | undefined> {
+        const driver = this.driver(space.profileId)
+        const references = this.spaceTasks(space.taskSpaceId).filter((task) => task.tabs.includes(tabId))
+        const targetId = space.tabTargets?.[tabId] ?? references.map((task) => task.tabTargets?.[tabId]).find(Boolean)
+        let instance: BrowserInstanceId | undefined
+        try {
+            instance = driver.browserInstanceId()
+        }
+        catch {
+            return undefined
+        }
+        if (!targetId || !driver.targetExists || !references.length || !references.every((task) => browserInstanceMatches(task, instance)))
+            return undefined
+        const exists = await driver.targetExists(targetId, { timeoutMs: 5000 })
+        return exists === undefined ? undefined : !exists
     }
     /**
      * Whether `tabId` is kept for the user: retained, or of unknown history. A tab without a

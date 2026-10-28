@@ -470,6 +470,14 @@ export class CdpDriver implements BrowserDriver {
         })
     }
 
+    targetExists(targetId: string, opts: DriverOptions): Promise<boolean | undefined> {
+        if (!this.isConnected()) return Promise.resolve(undefined)
+        return this.run(opts, async (_op, conn) => {
+            const { targetInfos } = await conn.send('Target.getTargets', {}) as { targetInfos: Array<{ targetId: string }> }
+            return targetInfos.some((info) => info.targetId === targetId)
+        }).catch(() => undefined)
+    }
+
     /**
      * Creates a background window and takes the session auto-attach gave it (paused,
      * so interception is on before anything loads). Falls back to an explicit attach

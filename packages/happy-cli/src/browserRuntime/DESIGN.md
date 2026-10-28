@@ -330,9 +330,12 @@ tab keeps its task, space, target, lease epoch and disposition records and stays
 - retention keeps the expired task; a local client's end completes without waiting for it;
 - the agent's `closePage` and `closeSpace` refuse it (CONFLICT); only the operator's forced
   `close-space` closes it;
-- once the user closes its window and the driver saw the target go, the next cleanup drops it
-  with its disposition (the space can then close and stop counting); a tab the driver merely does
-  not know (connection lost, not yet re-adopted) is not taken as closed and stays, retried;
+- once the user closed its window, the next cleanup drops it with its disposition (the space can
+  then close and stop counting) — but only when the browser it was opened in, connected and of the
+  same instance, no longer lists its persisted targetId (`BrowserDriver.targetExists`). The
+  driver's own view is not evidence: a detached session, a crashed renderer or a remembered close
+  leave a kept tab in place; while that cannot be asked (connection lost, another instance, no
+  answer) it stays and is retried. Nothing is ever sent to such a tab;
 - a restart re-adopts it in the same browser with the disposition unchanged; a replaced browser
   or a vanished target drops it (and its disposition) as before — nothing is re-attached by URL,
   active tab or window position;

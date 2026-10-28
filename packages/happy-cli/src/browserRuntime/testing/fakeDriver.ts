@@ -91,10 +91,18 @@ export class FakeBrowserDriver implements BrowserDriver {
         if (this.unloadBlocked.has(tabId)) return { closed: false, beforeUnloadBlocked: true }
         this.pages.delete(tabId); this.record(tabId, `target-${tabId}`, 'closeTab'); return { closed: true }
     }
-    hasTab(tabId: TabId): boolean { return !this.disconnected && this.pages.has(tabId) }
+    hasTab(tabId: TabId): boolean { return !this.disconnected && this.pages.has(tabId) && !this.forgotten.has(tabId) }
+    private readonly forgotten = new Set<TabId>()
+    /** The driver loses a tab whose page stays open (its session detached; not adopted again yet). */
+    forget(tabId: TabId): void { this.forgotten.add(tabId) }
+    async targetExists(targetId: string, _opts: DriverOptions): Promise<boolean | undefined> {
+        if (this.disconnected) return undefined
+        return [...this.targetIds].some(([tabId, target]) => target === targetId && this.pages.has(tabId))
+    }
     async adoptTab(tabId: TabId, targetId: string, _allowedOrigins: string[], _opts: DriverOptions): Promise<boolean> {
         this.throwNextFailure('adoptTab')
         const adopted = this.pages.has(tabId) && this.targetIds.get(tabId) === targetId
+        if (adopted) this.forgotten.delete(tabId)
         this.adoptedTabs.push({ tabId, targetId, adopted })
         return adopted
     }
