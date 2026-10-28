@@ -3,7 +3,7 @@ import { chmod, link, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { acquireNativeWriterLock, nativeHostBindingPath, readNativeSessionOwner, readNativePidStartTime, readNativeBootId } from './nativeHostPrimitives'
+import { acquireNativeWriterLock, nativeHostBindingPath, readNativeSessionOwner, readNativePidStartTime, readNativeBootId, verifyMacServiceExecutable, readNativeProcessPrincipal } from './nativeHostPrimitives'
 
 const cleanup: Array<() => Promise<unknown>> = []
 afterEach(async () => { for (const work of cleanup.splice(0).reverse()) await work() })
@@ -14,6 +14,17 @@ const directory = async () => {
 }
 // These assertions use the kernel, not a mocked lock implementation.
 describe.skipIf(!['darwin', 'win32'].includes(process.platform))('native browser host primitives', () => {
+    it.skipIf(process.platform !== 'darwin')('accepts protected system executables and rejects user-writable helper ancestry', async () => {
+        expect(readNativeProcessPrincipal(process.pid)).toBe(String(process.geteuid!()))
+        await expect(verifyMacServiceExecutable('/usr/bin/true')).resolves.toBeUndefined()
+        const dir = await directory(), path = join(dir, 'helper')
+        await writeFile(path, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+        await expect(verifyMacServiceExecutable(path)).rejects.toThrow()
+        await symlink('/usr/bin/true', join(dir, 'linked-helper'))
+        await expect(verifyMacServiceExecutable(join(dir, 'linked-helper'))).rejects.toThrow()
+        await expect(verifyMacServiceExecutable('/usr/bin/../bin/true')).rejects.toThrow()
+    })
+
     it('keeps the writer lock in the runtime process after the acquisition call returns', async () => {
         const path = join(await directory(), 'writer.lock')
         const lock = await acquireNativeWriterLock(path)

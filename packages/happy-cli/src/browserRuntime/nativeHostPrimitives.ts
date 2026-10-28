@@ -1,7 +1,7 @@
 import { constants } from 'node:fs'
 import { open, lstat, type FileHandle } from 'node:fs/promises'
 import { createRequire } from 'node:module'
-import { join } from 'node:path'
+import { join, dirname, isAbsolute, normalize } from 'node:path'
 import { projectPath } from '@/projectPath'
 import type { SessionOwner } from './sessionRegistration'
 
@@ -9,6 +9,8 @@ interface NativeHostBinding {
     lockWriter(fd: number): void
     processStart(pid: number): string | null
     bootId(): string
+    verifyRootOwned(fd: number): void
+    processPrincipal(pid: number): string | null
 }
 let binding: NativeHostBinding | undefined
 export function nativeHostBindingPath(): string {
@@ -36,6 +38,32 @@ export function readNativePidStartTime(pid: number): string | undefined {
     if (pidStartTime === null) return undefined
     if (!/^[0-9]+$/.test(pidStartTime)) throw new Error('NATIVE_PROCESS_UNKNOWN')
     return pidStartTime
+}
+
+/** macOS effective UID. Windows token SID support is a separate service gate;
+ * the native binding refuses it rather than equating a username with a SID. */
+export function readNativeProcessPrincipal(pid: number): string | undefined {
+    if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 0x7fffffff) throw new Error('NATIVE_INVALID_PID')
+    const principal = native().processPrincipal(pid)
+    if (principal === null) return undefined
+    if (!/^(0|[1-9][0-9]{0,9})$/.test(principal) || Number(principal) > 0xffffffff) throw new Error('NATIVE_PROCESS_UNKNOWN')
+    return principal
+}
+
+/** Check every component without following symlinks. A privileged administrator
+ * can still replace root-owned code; ordinary users cannot replace any ancestor. */
+export async function verifyMacServiceExecutable(path: string): Promise<void> {
+    if (process.platform !== 'darwin' || !isAbsolute(path) || normalize(path) !== path || path.includes('\0')) throw new Error('NATIVE_PATH_UNTRUSTED')
+    const components: string[] = []
+    for (let current = path; ; current = dirname(current)) { components.unshift(current); if (current === '/') break }
+    for (const component of components) {
+        const file = await open(component, constants.O_RDONLY | constants.O_NOFOLLOW)
+        try {
+            const info = await file.stat()
+            if (component === path ? !info.isFile() || !(info.mode & 0o111) : !info.isDirectory()) throw new Error('NATIVE_PATH_UNTRUSTED')
+            native().verifyRootOwned(file.fd)
+        } finally { await file.close() }
+    }
 }
 
 /** The service must own the parent directory. Hold this descriptor until runtime

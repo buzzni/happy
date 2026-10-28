@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <sys/sysctl.h>
 #include <libproc.h>
 #endif
@@ -105,6 +106,54 @@ static napi_value process_start(napi_env env, napi_callback_info info) {
     return text(env, value);
 }
 
+/* A protected Mac service binary and each ancestor are root owned and cannot
+ * carry ACL grants hidden by the POSIX mode bits. Read only, never fixes modes. */
+static napi_value verify_root_owned(napi_env env, napi_callback_info info) {
+    int fd;
+    if (!argument(env, info, 0, &fd)) return NULL;
+#ifdef _WIN32
+    (void)fd;
+    return error(env, "NATIVE_PATH_VERIFIER_UNSUPPORTED");
+#else
+    struct stat metadata;
+    filesec_t security = filesec_init();
+    if (!security) return error(env, "NATIVE_PATH_UNTRUSTED");
+    int observed = fstatx_np(fd, &metadata, security);
+    int acl_present = -1;
+    int queried = filesec_query_property(security, FILESEC_ACL, &acl_present);
+    filesec_free(security);
+    /* An explicit successful query is required: acl_get_fd_np returns ENOENT
+     * for no ACL, which must not be confused with a metadata access failure. */
+    if (observed != 0 || queried != 0 || acl_present != 0 || metadata.st_uid != 0 ||
+        (metadata.st_mode & (S_IWGRP | S_IWOTH)) ||
+        (!S_ISREG(metadata.st_mode) && !S_ISDIR(metadata.st_mode)) ||
+        (S_ISREG(metadata.st_mode) && metadata.st_nlink != 1))
+        return error(env, "NATIVE_PATH_UNTRUSTED");
+    napi_value result; napi_get_undefined(env, &result); return result;
+#endif
+}
+
+static napi_value process_principal(napi_env env, napi_callback_info info) {
+    int pid;
+    if (!argument(env, info, 1, &pid)) return NULL;
+#ifdef _WIN32
+    (void)pid;
+    /* A Windows service must supply a verified token SID, never a username or UID. */
+    return error(env, "NATIVE_PRINCIPAL_UNSUPPORTED");
+#else
+    struct proc_bsdinfo process;
+    memset(&process, 0, sizeof(process));
+    errno = 0;
+    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &process, sizeof(process)) != sizeof(process)) {
+        if (errno == ESRCH) return missing(env);
+        return error(env, "NATIVE_PROCESS_UNKNOWN");
+    }
+    if (process.pbi_pid != (uint32_t)pid) return error(env, "NATIVE_PROCESS_UNKNOWN");
+    char value[32]; snprintf(value, sizeof(value), "%u", process.pbi_uid);
+    return text(env, value);
+#endif
+}
+
 static napi_value boot_id(napi_env env, napi_callback_info info) {
     (void)info;
     char value[80];
@@ -140,8 +189,10 @@ static napi_value initialize(napi_env env, napi_value exports) {
         {"lockWriter", NULL, lock_writer, NULL, NULL, NULL, napi_default, NULL},
         {"processStart", NULL, process_start, NULL, NULL, NULL, napi_default, NULL},
         {"bootId", NULL, boot_id, NULL, NULL, NULL, napi_default, NULL},
+        {"verifyRootOwned", NULL, verify_root_owned, NULL, NULL, NULL, napi_default, NULL},
+        {"processPrincipal", NULL, process_principal, NULL, NULL, NULL, napi_default, NULL},
     };
-    if (napi_define_properties(env, exports, 3, properties) != napi_ok) return error(env, "NATIVE_INIT_FAILED");
+    if (napi_define_properties(env, exports, 5, properties) != napi_ok) return error(env, "NATIVE_INIT_FAILED");
     return exports;
 }
 NAPI_MODULE(NODE_GYP_MODULE_NAME, initialize)

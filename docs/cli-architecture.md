@@ -992,6 +992,20 @@ the matching import library; there is no runtime compiler/download fallback.
 `drivers/cdpConnection.fromPipe` accepts supervisor-owned Chromium debugging pipes.
 It does not open a CDP TCP listener. A lost/oversized/timed-out pipe closes both
 ends and fails pending operations; the existing Linux WebSocket path remains.
+`CdpDriver` accepts a supervisor-issued pipe/instance pair as an exclusive alternative
+to WebSocket discovery, coalesces concurrent connections, and discards late connections
+after close. `nativeBrowserSession` binds one such lifetime to the exact OS process and
+fresh independent protection snapshots, including the actual macOS effective UID.
+Process lifetime is checked around the principal query. Windows token SID validation
+is still a required service integration gate and fails closed until implemented.
+Identity/policy/generation/counter changes or
+unknown protection close admission and request service-owned process-tree termination;
+an unconfirmed stop is reported as such and is never automatically reconnected.
+`macNativeBrowserProtection` verifies every ancestor and the fixed helper executable
+(root ownership, non-writable modes, no ACL/symlinks), then its exact code signature,
+before reading the Network Guard XPC status. Descriptor-based `fstatx_np` metadata
+must explicitly prove ACL absence. These are service integration modules; their unit
+fixtures do not prove deployed service or network enforcement readiness.
 
 These primitives do not yet authorize a native production service. The Linux
 production flock guard is unchanged. Service identity, protected storage/IPC,

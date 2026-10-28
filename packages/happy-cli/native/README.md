@@ -4,8 +4,8 @@
 않으며 기존 Linux production 기동 검사를 변경하지 않는다. 생성된 `.node`는 Git에
 넣지 않는다. 릴리스에는 별도의 플랫폼 빌드·서명·패키징·수락이 필요하다.
 
-`browserHost.c`는 프로세스 안의 kernel lock, 정확한 생성 시각, kernel boot ID만
-Node-API로 전달한다. 토큰·설정·프로필을 읽거나 실행 명령을 받지 않는다.
+`browserHost.c`는 프로세스 안의 kernel lock, 정확한 생성 시각, kernel boot ID와
+Mac의 열린 파일 descriptor에 대한 root 소유·쓰기권한·ACL 검사를 Node-API로 전달한다. 토큰·설정·프로필을 읽거나 실행 명령을 받지 않는다.
 macOS는 flock/proc_pidinfo/sysctl, Windows는 LockFileEx/GetProcessTimes/
 NtQuerySystemInformation을 사용한다. 조회 거부는 unknown 오류이며 PID만 같다는
 이유로 세션을 재사용하거나 철회하지 않는다. Windows 코드는 실제 Windows 빌드와
@@ -34,6 +34,7 @@ ARM64는 해당 도구 체인·Node·node.lib를 쓰고 출력도 `native/win32-
 테스트는 실제 OS의 동시 잠금·소유 프로세스 종료·파일 링크·프로세스/부팅 식별을
 검사한다. macOS Chrome 테스트는 임시 프로필과 상속 파이프만 사용하며
 `SAYCODE_NATIVE_TEST_CHROME`으로 테스트용 Chrome 실행 파일을 지정할 수 있다.
+실제 `CdpDriver`로 로컬 임시 페이지 열기·내용 관측·탭 닫기까지 검사한다.
 Windows의 Chrome transport, pipe ACL, 서비스 수락은 이 테스트에 포함되지 않는다.
 
 관련 일반 테스트는 `vitest run --project unit`에 파일을 명시한다. 전체 테스트나
@@ -51,3 +52,33 @@ Windows의 Chrome transport, pipe ACL, 서비스 수락은 이 테스트에 포�
 lock의 부모 디렉터리는 서비스가 소유해야 한다. 파일 자체의 no-follow·하드링크
 검사는 부모 디렉터리/ACL 보호를 대체하지 않는다. `fromPipe`도 제공받은 descriptor의
 출처나 브라우저 프로필 격리를 스스로 보증하지 않는다.
+
+## 서비스 통합용 연결 경계
+
+`CdpDriver.connectPipe`는 pipe와 해당 프로세스의 browser instance ID를 함께 받는다.
+네트워크 endpoint와 동시에 설정할 수 없고 pipe 드라이버에 URL을 넣어 reconnect하면
+거부한다. 동시 connect는 하나로 합치며 close 이후 늦게 도착한 연결은 폐기한다.
+
+`openNativeBrowserSession`은 서비스가 제공한 descriptor·정확한 OS process owner·실제 effective UID와
+독립 보호 서비스 응답을 확인한 뒤 드라이버를 연다. 시작 전후와 주기 검사에서 identity,
+정책 epoch, 보호 서비스 generation, 차단 카운터를 비교한다. 조회 불명·timeout·재시작·
+카운터 변화·PID 교체·pipe EOF는 CDP 연결을 즉시 닫고 소유 서비스에 종료를 요청한다.
+종료 확인 실패는 `{ terminated: false }`로 남고 재연결하지 않는다. 종료 callback은
+서비스가 소유한 원래 process handle/tree의 종료를 보증해야 하며 PID 재조회로 대체하지 않는다.
+
+Mac 조회 adapter `createMacNativeBrowserProtection`은 고정 위치
+`/Library/Application Support/SaycodeNative/bin/network-guard-status`만 실행한다.
+각 상위 디렉터리와 실행 파일의 root 소유·쓰기권한·symlink·ACL을 확인하고, 빌드 계약의
+Team ID와 helper signing identifier를 codesign으로 검증한 뒤 XPC 조회 helper를 호출한다.
+설치 정책의 `serviceIdentifier`는 `com.saycode.nativeh.networkguard.status-check`여야 한다.
+숫자 정밀도를 잃은 OS 카운터와 오류 응답은 거부한다. Mac 파일 검사에서는 열린 descriptor의
+`fstatx_np`와 `filesec_query_property` 성공으로 ACL 부재를 확인하며, 조회 오류를 ACL 부재로
+간주하지 않는다. ACL이 있는 경로는 허용하지 않는다.
+
+위 adapter의 서명/상태 분기와 세션 중단은 단위 검사이며, 실제 설치된 Network Guard와
+전용 서비스 계정에서의 수락은 아직 수행하지 않았다. 설치판 service entrypoint,
+Windows WFP/IPC 보호, credential custody, 패키징은 계속 남은 production 경계다.
+
+Mac effective UID는 `proc_pidinfo`에서 읽고 보호 대상 UID와 대조한다. 그 조회 전후에
+동일한 boot/PID/creation lifetime인지 재확인한다. Windows token SID 조회는 아직
+미구현이므로 해당 native 경로는 명시적으로 거부하며 Mac UID로 대체하지 않는다.
