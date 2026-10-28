@@ -5,7 +5,8 @@ import { StreamCapture } from './bashStreamOutput';
 import { RuntimeProducerGate } from '@/sessionDrain/runtimeProducerGate';
 import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { createServer as createHttpServer, request } from 'node:http';
+import { createServer, request } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { createChangeTitleHandler, startHappyServer } from './startHappyServer';
@@ -432,39 +433,6 @@ describe('createChangeTitleHandler', () => {
 });
 
 describe('startHappyServer tool registration', () => {
-    // specs/browser-site-hints R4 (PR #980 review): the MCP server is rebuilt per request, so the site hints —
-    // read once per session, told once per task — must live with the session, not the request.
-    it('keeps browser site hints for the session across MCP requests', async () => {
-        const project = await mkdtemp(join(tmpdir(), 'happy-site-hint-project-'));
-        await mkdir(join(project, '.claude', 'skills', 'fixture-site'), { recursive: true });
-        await writeFile(join(project, '.claude', 'skills', 'fixture-site', 'SKILL.md'), '---\nname: fixture-site\ndescription: Fixture site notes\nsites: [site-hint-fixture.test]\n---\nbody\n');
-        const runtime = createHttpServer((req, res) => {
-            req.resume();
-            req.on('end', () => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: true, result: { tabId: 'tb1' } })));
-        });
-        await new Promise<void>((resolve) => runtime.listen(0, '127.0.0.1', resolve));
-        const address = runtime.address() as { port: number };
-        vi.stubEnv('HAPPY_BROWSER_TASK_RUNTIME_URL', `http://127.0.0.1:${address.port}`);
-        await writeFile(join(project, 'grant'), 'fixture-grant');
-        vi.stubEnv('HAPPY_BROWSER_TASK_GRANT_FILE', join(project, 'grant'));
-        const client = { ...makeFakeClient(false), sessionId: 'site-hint-session', getMetadata: () => ({ flavor: 'claude', path: project }) } as unknown as ApiSessionClient;
-        let server: Awaited<ReturnType<typeof startHappyServer>> | undefined;
-        try {
-            server = await startHappyServer(client, { mandatorySandbox: false });
-            const open = async (id: number) => JSON.parse((await callTool(server!, id, 'browser_task_open_page', { taskId: 'task-1', url: 'https://site-hint-fixture.test/page' })).result.content[0].text);
-            const first = await open(1);
-            expect(first.siteHint?.skills.map((skill: { name: string }) => skill.name)).toEqual(['fixture-site']);
-            const second = await open(2);
-            expect(second.result).toEqual({ tabId: 'tb1' });
-            expect(second.siteHint).toBeUndefined();
-        } finally {
-            server?.stop();
-            vi.unstubAllEnvs();
-            await new Promise<void>((resolve) => runtime.close(() => resolve()));
-            await rm(project, { recursive: true, force: true });
-        }
-    });
-
     // The MCP server is rebuilt per request, so a malformed tool schema does
     // not fail at startup — it breaks every tool in the session at call time.
     // Listing the tools over the real transport is what catches that.
@@ -727,6 +695,33 @@ describe('browser task runtime PoC flag', () => {
         } finally {
             server.stop();
             vi.unstubAllEnvs();
+        }
+    });
+
+    // specs/browser-site-hints R4: the per-request MCP server must not reset which skills a task was told about.
+    it('points out a site skill once per task across requests', async () => {
+        const project = await mkdtemp(join(tmpdir(), 'happy-site-hints-'));
+        const runtime = createServer((req, res) => {
+            req.resume();
+            req.on('end', () => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: true, result: { tabId: 'tb1' } })));
+        });
+        await new Promise<void>((resolve) => runtime.listen(0, '127.0.0.1', resolve));
+        let server: Awaited<ReturnType<typeof startHappyServer>> | undefined;
+        try {
+            await mkdir(join(project, '.claude', 'skills', 'github'), { recursive: true });
+            await writeFile(join(project, '.claude', 'skills', 'github', 'SKILL.md'), '---\nname: github\ndescription: GitHub URLs\nsites: [github.com]\n---\nbody\n');
+            await writeFile(join(project, 'grant'), 'synthetic-grant-token');
+            vi.stubEnv('HAPPY_BROWSER_TASK_RUNTIME_URL', `http://127.0.0.1:${(runtime.address() as AddressInfo).port}`);
+            vi.stubEnv('HAPPY_BROWSER_TASK_GRANT_FILE', join(project, 'grant'));
+            server = await startHappyServer({ ...client(), getMetadata: () => ({ flavor: 'claude', path: project }) } as unknown as ApiSessionClient);
+            const open = async (id: number, url: string) => JSON.parse((await callTool(server!, id, 'browser_task_open_page', { taskId: 't1', url })).result.content[0].text);
+            expect((await open(1, 'https://github.com/buzzni/happy')).siteHint?.skills.map((skill: { name: string }) => skill.name)).toEqual(['github']);
+            expect((await open(2, 'https://github.com/other')).siteHint).toBeUndefined();
+        } finally {
+            server?.stop();
+            runtime.close();
+            vi.unstubAllEnvs();
+            await rm(project, { recursive: true, force: true });
         }
     });
 
