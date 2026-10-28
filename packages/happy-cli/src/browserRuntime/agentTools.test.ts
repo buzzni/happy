@@ -6,6 +6,10 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { BrowserRuntimeError } from './contracts'
 import { BROWSER_TASK_TOOL_NAMES, DEFAULT_BATCH_WAIT_MS, registerBrowserTaskTools } from './agentTools'
 import type { RuntimeClient } from './runtimeClient'
+import { createSiteHints, SITE_HINT_NOTE } from './siteHints'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 async function connect(fake: Partial<Record<keyof RuntimeClient, ReturnType<typeof vi.fn>>>, exitAfterFirstTurn = false, hostContinues = false) {
     const mcp = new McpServer({ name: 't', version: '1' })
@@ -171,5 +175,52 @@ describe('browser task agent tools', () => {
         const client = await connect({ screenshot })
         const res = await client.callTool({ name: 'browser_task_screenshot', arguments: { taskId: 't', tabId: 'tb' } }) as { content: Array<{ type: string; data?: string }> }
         expect(res.content[0]).toMatchObject({ type: 'image', data: 'AAAA', mimeType: 'image/png' })
+    })
+})
+
+// specs/browser-site-hints R3, R4, R6: a skill for the site is pointed out next to — never inside — page data.
+describe('browser task site hints', () => {
+    async function withSkill(run: (client: Client) => Promise<void>, fake: Partial<Record<keyof RuntimeClient, ReturnType<typeof vi.fn>>>) {
+        const root = await mkdtemp(join(tmpdir(), 'happy-agent-site-'))
+        try {
+            await mkdir(join(root, 'github'), { recursive: true })
+            await writeFile(join(root, 'github', 'SKILL.md'), '---\nname: github\ndescription: GitHub URLs\nsites: [github.com]\n---\nbody\n')
+            const mcp = new McpServer({ name: 't', version: '1' })
+            registerBrowserTaskTools(mcp, fake as unknown as RuntimeClient, { agentSessionId: 'a1', profileId: 'main', siteHints: createSiteHints({ roots: [root] }) })
+            const [a, b] = InMemoryTransport.createLinkedPair()
+            const client = new Client({ name: 'c', version: '1' })
+            await Promise.all([mcp.connect(a), client.connect(b)])
+            await run(client)
+        } finally {
+            await rm(root, { recursive: true, force: true })
+        }
+    }
+
+    it('adds the matching skill to open_page once per task, beside the result', async () => {
+        const openPage = vi.fn(async () => ({ tabId: 'tb1' }))
+        await withSkill(async (client) => {
+            const first = parse(await client.callTool({ name: 'browser_task_open_page', arguments: { taskId: 't1', url: 'https://github.com/buzzni/happy' } }))
+            expect(first.result).toEqual({ tabId: 'tb1' })
+            expect(first.siteHint).toEqual({ note: SITE_HINT_NOTE, skills: [expect.objectContaining({ name: 'github', description: 'GitHub URLs' })] })
+            const again = parse(await client.callTool({ name: 'browser_task_open_page', arguments: { taskId: 't1', url: 'https://github.com/other' } }))
+            expect(again.siteHint).toBeUndefined()
+            const elsewhere = parse(await client.callTool({ name: 'browser_task_open_page', arguments: { taskId: 't2', url: 'https://example.com/' } }))
+            expect(elsewhere.siteHint).toBeUndefined()
+        }, { openPage })
+    })
+
+    it('reads navigate steps and observed URLs of a batch', async () => {
+        const submitBatch = vi.fn(async () => ({ task: { status: 'running' }, result: { outcome: 'completed', steps: [{ stepId: 's1', status: 'succeeded', observation: { url: 'https://github.com/pulls', frames: [], elements: [], text: '' } }] } }))
+        await withSkill(async (client) => {
+            const out = parse(await client.callTool({ name: 'browser_task_submit_batch', arguments: { taskId: 't1', expectedVersion: 1, steps: [{ kind: 'click', tabId: 'tb1', ref: '@e1' }] } }))
+            expect(out.siteHint?.skills.map((skill: { name: string }) => skill.name)).toEqual(['github'])
+            expect(out.result.result.steps[0].observation.note).not.toContain('Saycode')
+        }, { submitBatch })
+    })
+
+    it('leaves results unchanged without site hints', async () => {
+        const client = await connect({ openPage: vi.fn(async () => ({ tabId: 'tb1' })) })
+        const out = parse(await client.callTool({ name: 'browser_task_open_page', arguments: { taskId: 't1', url: 'https://github.com/' } }))
+        expect(Object.keys(out).sort()).toEqual(['requestId', 'result'])
     })
 })

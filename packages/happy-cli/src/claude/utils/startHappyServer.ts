@@ -36,6 +36,7 @@ import { join } from 'node:path';
 import { projectPath } from '@/projectPath';
 import { MandatorySandboxError } from '@/sandbox/sandboxPolicy';
 import { registerBrowserTaskTools, BROWSER_TASK_TOOL_NAMES } from '@/browserRuntime/agentTools';
+import { createSiteHints, siteSkillRoots, type SiteHints } from '@/browserRuntime/siteHints';
 import { registerCheckpointAgentTools } from '@/checkpoint/checkpointAgentTools';
 import type { CheckpointAgentReader } from '@/checkpoint/checkpointAgentReader';
 import { RuntimeClient } from '@/browserRuntime/runtimeClient';
@@ -69,6 +70,8 @@ export interface HappyServerHandlers {
     browserLocalClients?: LocalClientSession;
     /** The granted profile: fixed, or (execution machine H) the one the broker's grant names. */
     browserTaskProfileId?: string | (() => Promise<string>);
+    /** Session-scoped (specs/browser-site-hints): the MCP server is rebuilt per request, the hints must not be. */
+    browserSiteHints?: SiteHints;
     exitAfterFirstTurn?: boolean;
     /** The run-once host keeps the session parked while a browser task waits for the user. */
     browserHostContinues?: boolean;
@@ -323,7 +326,7 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
     // Agent Browser PoC: the task runtime replaces the extension-bridge tools,
     // which fall back to the active tab and would bypass the task lease.
     if (handlers.browserTaskRuntime) {
-        registerBrowserTaskTools(mcp, handlers.browserTaskRuntime, { agentSessionId: handlers.client.sessionId, profileId: handlers.browserTaskProfileId ?? 'default', exitAfterFirstTurn: handlers.exitAfterFirstTurn, hostContinues: handlers.browserHostContinues });
+        registerBrowserTaskTools(mcp, handlers.browserTaskRuntime, { agentSessionId: handlers.client.sessionId, profileId: handlers.browserTaskProfileId ?? 'default', exitAfterFirstTurn: handlers.exitAfterFirstTurn, hostContinues: handlers.browserHostContinues, siteHints: handlers.browserSiteHints });
         if (handlers.browserLocalClients) registerLocalClientTools(mcp, handlers.browserLocalClients, runTool);
     } else if (!handlers.mandatorySandbox && !scopedSession) {
         registerBrowserTools(mcp, runTool);
@@ -583,6 +586,10 @@ export async function startHappyServer(
     });
     const browserTaskRuntime = browserTask?.runtime;
     const browserTaskProfileId = browserTask?.profileId;
+    // specs/browser-site-hints: the session agent's own skill folders; other agents have none to point at.
+    const metadata = browserTaskRuntime ? client.getMetadata?.() : undefined;
+    const siteHintFlavor = metadata?.flavor === 'codex' ? 'codex' : metadata?.flavor === 'claude' || metadata?.flavor === undefined ? 'claude' : null;
+    const browserSiteHints = browserTaskRuntime && siteHintFlavor ? createSiteHints({ roots: siteSkillRoots({ flavor: siteHintFlavor, cwd: metadata?.path }) }) : undefined;
     if (browserTaskRuntime) {
         logger.debug('[happyMCP] legacy browser_* tools disabled by HAPPY_BROWSER_TASK_RUNTIME_URL (agent browser PoC)');
     }
@@ -661,6 +668,7 @@ export async function startHappyServer(
             currentTurnId: options.currentTurnId,
             browserTaskRuntime,
             browserTaskProfileId,
+            browserSiteHints,
             browserLocalClients: browserTask?.localClients,
             exitAfterFirstTurn: options.exitAfterFirstTurn,
             browserHostContinues: options.browserHostContinues,
