@@ -39,8 +39,9 @@ Happy CLI는 이 알림을 메인 대화에 섞지 않는다. 대신 클라이�
      줄을 만들지 않는다. 자식 하나에 한 번만 만든다. 손자(자식이 띄운 자식)는 줄 없이 목록에만 든다.
    - 활성 메인 턴: `sendTurnAndWait`가 기다리는 턴과 항목의 turn id가 같고 그 턴이 아직 끝나지 않았다.
      다른 turn id로 온 항목은 목록만 갱신한다.
-   - 줄 제목은 자식 이름(R4-3)을 최대 1.5초 기다려 정하고, 못 받으면 폴백 이름을 쓴다. 기다린 뒤 그 턴이
-     끝났거나, app-server 프로세스가 바뀌었거나, 끊기는 중(강제 재시작 포함)이면 줄을 버린다.
+   - 줄 제목은 자식 이름(R4-3)을 최대 1.5초 기다려 정하고, 못 받으면 폴백 이름을 쓴다. 첫 `thread/read`가 실패하면
+     재시도(2초 뒤)가 대기보다 늦으므로 더 기다리지 않고 폴백 이름으로 바로 정한다(실앱 2026-10-28, context D16).
+     기다린 뒤 그 턴이 끝났거나, app-server 프로세스가 바뀌었거나, 끊기는 중(강제 재시작 포함)이면 줄을 버린다.
    - 이벤트 `collab_agent_spawned { call_id, turn_id, thread_id, label }`를 매퍼가
      `tool-call-start { call, name: 'CodexAgent', title: label, description: label, args: { agent: label } }`와
      `tool-call-end { call }`로 바꾼다. `call`은 자식 threadId다. 기존 wire 필드만 쓰고, envelope `subagent`는
@@ -70,7 +71,8 @@ Happy CLI는 이 알림을 메인 대화에 섞지 않는다. 대신 클라이�
      정한다. Codex TUI `format_agent_picker_item_name` 규칙에 `agent_path` 단계만 더한 것이다. 앞뒤 공백을 지우고
      200 UTF-16 단위까지 자른다(서로게이트 쌍은 쪼개지 않음).
      자식을 처음 목록에 넣을 때 분류 `thread/read`가 진행 중이면 응답이나 1.5초 가운데 먼저 오는 쪽까지 발행을
-     미뤄 이름이 두 번 바뀌어 보이지 않게 한다. 그 사이 끝난 자식은 발행하지 않는다.
+     미뤄 이름이 두 번 바뀌어 보이지 않게 한다. 그 사이 끝난 자식은 발행하지 않는다. 첫 읽기가 실패하면 바로
+     발행하고, 재시도가 이름을 받으면 목록 이름만 바뀐다(줄 제목은 폴백 그대로 — D16, 사용자 수용).
    - **R4-4 available 게이트.** 연결 때 `codex --version`이 0.105 이상이면 `available: true`다. 그보다 낮거나 버전을
      읽지 못하면 `{ available: false, tasks: null }`을 한 번 발행한다. `tasks: null`은 `available: false`일 때만
      쓴다. 가용성을 알기 전에는 발행하지 않는다.
@@ -198,6 +200,7 @@ Desktop 표시(세션 flavor로 메타데이터 키 고르기, `CodexAgent` 줄�
   - `[9] a spawn whose label read outlasts the main turn reports no row (%s)` (2: `answered after the turn`, `never answered`)
   - `[9] a spawn whose label read is cut short by a forced app-server restart reports no row`
   - `[10] a failed thread/read still reports one %s row, with the fallback label` (2: `V2`, `V1`)
+  - `[10] reports the row of a child whose first thread/read failed before a parent turn that ends at once`
 - `__tests__/sessionProtocolMapper.test.ts` › `mapCodexMcpMessageToSessionEnvelopes` › `collab_agent_spawned` ›
   - `adds one CodexAgent row to the open turn, the child thread as its call id and no background task id`
   - `falls back to the Agent label and a generated call id, and omits a missing child thread id`
@@ -205,7 +208,7 @@ Desktop 표시(세션 flavor로 메타데이터 키 고르기, `CodexAgent` 줄�
   - `never ties the row to a session sub-agent, even when the message names a parent call`
 - `codexSubagentTracker.test.ts` ›
   - `[3] out-of-order and duplicate notifications` › `returns a spawn only once for the same child`
-  - `[11] awaitLabel` 전체 (4)
+  - `[11] awaitLabel` 전체 (5)
 - `codexSubagentReplay.test.ts` › `Codex sub-agent recordings: full stream target` › `<녹음>` ›
   - `full stream: exactly one collab_agent_spawned event, inside the main turn` (×6)
   - `full stream: exactly one CodexAgent row inside the main turn, none after it` (×6)

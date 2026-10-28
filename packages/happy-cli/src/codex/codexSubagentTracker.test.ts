@@ -725,6 +725,23 @@ describe('[11] awaitLabel', () => {
         await expect(label).resolves.toBe('Agent');
     });
 
+    // Real app 2026-10-28: the first read can fail before Codex writes the child's rollout. Its retry lands after any
+    // label wait, so waiting on cannot improve the label — and a parent turn ending meanwhile would drop the spawn row.
+    it('answers at once with the fallback label when the first thread/read fails', async () => {
+        const t = started();
+        t.tracker.observeMainItem('item/completed', v2Spawn, 'turn-1');
+        let settled: string | undefined;
+        void t.tracker.awaitLabel(CHILD, 1500).then(label => { settled = label; });
+        t.calls[0].reject(new Error('failed to read session metadata'));
+        await flush();
+        expect(settled).toBe('ok_reply');
+
+        await vi.advanceTimersByTimeAsync(2000);
+        t.calls[1].resolve(threadRead(CHILD, MAIN, { nickname: 'Locke' }));
+        await flush();
+        await expect(t.tracker.awaitLabel(CHILD, 1500)).resolves.toBe('Locke');
+    });
+
     it('answers at once for an unknown thread and for a child whose thread/read failed twice', async () => {
         const t = started();
         await expect(t.tracker.awaitLabel('unknown-thread', 1500)).resolves.toBe('Agent');

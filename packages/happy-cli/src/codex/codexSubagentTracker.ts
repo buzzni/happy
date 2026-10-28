@@ -301,7 +301,12 @@ export class CodexSubagentTracker {
         if (generation !== this.generation) return;
         if (!thread && attempt === 1) {
             const retry = this.after(READ_RETRY_DELAY_MS, () => this.background('Classification', this.classify(threadId, child, 2)));
-            if (retry) return;
+            if (retry) {
+                // The retry lands after any label wait, so waiting on cannot improve the label; the spawn row
+                // must not outlast its parent turn waiting for it.
+                for (const waiter of this.waiters) if (waiter.child === child) this.settle(waiter);
+                return;
+            }
         }
         if (thread) {
             child.parentId = thread.parentId;

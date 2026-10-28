@@ -6412,16 +6412,28 @@ describe('sub-agent thread separation', () => {
         const s = await openSession({ readThread: () => ({ error: { code: -32600, message: 'thread not loaded' } }) });
         const { done: turn } = await startMainTurn(s);
         spawn(s);
-        await vi.advanceTimersByTimeAsync(1_400);
-        expect(spawnRows(s.events)).toEqual([]);
-        await vi.advanceTimersByTimeAsync(200);
+        // Its retry lands after any label wait, so the row does not wait for it.
+        await vi.advanceTimersByTimeAsync(5);
         expect(spawnRows(s.events)).toEqual([{ type: 'collab_agent_spawned', call_id: callId, turn_id: MAIN_TURN, thread_id: CHILD, label }]);
         // The retry 2 s after the first failure fails as well: still one row.
-        await vi.advanceTimersByTimeAsync(1_000);
+        await vi.advanceTimersByTimeAsync(2_600);
         expect(spawnRows(s.events)).toHaveLength(1);
         expect(s.requests.filter((request) => request.method === 'thread/read' && request.params?.threadId === CHILD)).toHaveLength(2);
         endMainTurn(s);
         await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: false });
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    // Real app 2026-10-28: Codex had not written the child's rollout yet, and the parent answered and ended its turn a
+    // second later — the row waiting out the label was dropped with its turn.
+    it('[10] reports the row of a child whose first thread/read failed before a parent turn that ends at once', async () => {
+        const s = await openSession({ readThread: () => ({ error: { code: -32600, message: 'failed to read session metadata' } }) });
+        const { done: turn } = await startMainTurn(s);
+        spawnV2(s);
+        await vi.advanceTimersByTimeAsync(5);
+        endMainTurn(s);
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: false });
+        expect(spawnRows(s.events)).toEqual([{ type: 'collab_agent_spawned', call_id: 'call-started-thread-child', turn_id: MAIN_TURN, thread_id: CHILD, label: 'ok_reply' }]);
         await settled(s.client.disconnect(), 'disconnect');
     });
 
