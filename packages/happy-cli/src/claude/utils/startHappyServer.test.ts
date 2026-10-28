@@ -3,9 +3,10 @@ import { localToolAgentContext, requestLocalToolAgent } from '@/daemon/localTool
 import { runBashStream } from './bashStream';
 import { StreamCapture } from './bashStreamOutput';
 import { RuntimeProducerGate } from '@/sessionDrain/runtimeProducerGate';
-import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { request } from 'node:http';
+import { createServer, request } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { createChangeTitleHandler, startHappyServer } from './startHappyServer';
@@ -694,6 +695,33 @@ describe('browser task runtime PoC flag', () => {
         } finally {
             server.stop();
             vi.unstubAllEnvs();
+        }
+    });
+
+    // specs/browser-site-hints R4: the per-request MCP server must not reset which skills a task was told about.
+    it('points out a site skill once per task across requests', async () => {
+        const project = await mkdtemp(join(tmpdir(), 'happy-site-hints-'));
+        const runtime = createServer((req, res) => {
+            req.resume();
+            req.on('end', () => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: true, result: { tabId: 'tb1' } })));
+        });
+        await new Promise<void>((resolve) => runtime.listen(0, '127.0.0.1', resolve));
+        let server: Awaited<ReturnType<typeof startHappyServer>> | undefined;
+        try {
+            await mkdir(join(project, '.claude', 'skills', 'github'), { recursive: true });
+            await writeFile(join(project, '.claude', 'skills', 'github', 'SKILL.md'), '---\nname: github\ndescription: GitHub URLs\nsites: [github.com]\n---\nbody\n');
+            await writeFile(join(project, 'grant'), 'synthetic-grant-token');
+            vi.stubEnv('HAPPY_BROWSER_TASK_RUNTIME_URL', `http://127.0.0.1:${(runtime.address() as AddressInfo).port}`);
+            vi.stubEnv('HAPPY_BROWSER_TASK_GRANT_FILE', join(project, 'grant'));
+            server = await startHappyServer({ ...client(), getMetadata: () => ({ flavor: 'claude', path: project }) } as unknown as ApiSessionClient);
+            const open = async (id: number, url: string) => JSON.parse((await callTool(server!, id, 'browser_task_open_page', { taskId: 't1', url })).result.content[0].text);
+            expect((await open(1, 'https://github.com/buzzni/happy')).siteHint?.skills.map((skill: { name: string }) => skill.name)).toEqual(['github']);
+            expect((await open(2, 'https://github.com/other')).siteHint).toBeUndefined();
+        } finally {
+            server?.stop();
+            runtime.close();
+            vi.unstubAllEnvs();
+            await rm(project, { recursive: true, force: true });
         }
     });
 
