@@ -107,8 +107,8 @@ function issuerKey(issuers: readonly TrustedIssuer[], kid: string): KeyObject | 
 }
 
 /** The payload of an abp2 token of header type `typ`, signed by a trusted issuer. */
-function openServerEnvelope<T>(parts: string[], typ: string, trustedIssuers: readonly TrustedIssuer[]): T {
-    if (parts.length !== 4) throw new BrowserRuntimeError('UNAUTHORIZED', 'Malformed credential')
+export function openServerEnvelope<T>(parts: string[], typ: string, trustedIssuers: readonly TrustedIssuer[]): T {
+    if (parts.length !== 4 || parts[0] !== 'abp2') throw new BrowserRuntimeError('UNAUTHORIZED', 'Malformed credential')
     const header = decodeJson<{ alg?: unknown; kid?: unknown; typ?: unknown }>(parts[1])
     if (!header || header.alg !== 'EdDSA' || header.typ !== typ || typeof header.kid !== 'string') throw new BrowserRuntimeError('UNAUTHORIZED', 'Unsupported credential header')
     const key = issuerKey(trustedIssuers, header.kid)

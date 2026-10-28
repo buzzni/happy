@@ -80,5 +80,27 @@ Team ID와 helper signing identifier를 codesign으로 검증한 뒤 XPC 조회 
 Windows WFP/IPC 보호, credential custody, 패키징은 계속 남은 production 경계다.
 
 Mac effective UID는 `proc_pidinfo`에서 읽고 보호 대상 UID와 대조한다. 그 조회 전후에
-동일한 boot/PID/creation lifetime인지 재확인한다. Windows token SID 조회는 아직
-미구현이므로 해당 native 경로는 명시적으로 거부하며 Mac UID로 대체하지 않는다.
+동일한 boot/PID/creation lifetime인지 재확인한다. Windows에서는 process token의 TokenUser SID를
+읽는다. 조회 실패는 unknown이며 Mac UID로 대체하지 않는다. Windows 실행 수락은 아직 남아 있다.
+
+
+## Windows ACL·native broker 인증 (소스 후보)
+
+Windows verifyServiceFile은 열린 handle의 owner/DACL/reparse/hardlink를 읽는다.
+service SID, SYSTEM, Administrators만 쓰기를 허용하며 private 파일은 보호된 DACL과
+외부 read 거부를 요구한다. 부모 디렉터리 보호·ACL 생성·서비스 신원 설정을 대체하지
+않는다. 실제 Windows 테스트는 windowsServiceSecurity.native.test.ts이며 Mac skip은
+Windows 빌드/수락 증거가 아니다.
+
+Native broker 모드의 별도 인증은 src/browserRuntime/nativeBrokerAuthorization.ts에
+있다. 신뢰된 issuer가 권한을 검사한 정확한 HTTP 작업을 abp-native-command로
+서명해야 한다. 서비스 generation, machine/workspace, UUID requestId, method,
+원문 path/query, body SHA-256, 최대 60초 수명이 필수다. generation은 시작마다
+새로 생성하고 requestId는 dispatch 전에 소비한다. 응답 유실/실패는 자동 재실행
+허가가 아니다. 발급자는 머신 관리 작업과 대화 등록·lineage에 각각 기존 권한
+검사를 적용해야 하며 session-user attestation만으로 이 서명을 발급하면 안 된다.
+
+현재 production runtime 진입점은 Linux 경로를 유지한다. native 서비스 진입점,
+issuer의 작업별 발급/daemon 전송, OS별 IPC ACL·서비스 설치·WFP와 서명 installer는
+아직 연결되지 않았다. 이 addon이나 broker 단위 테스트만으로 native 설치를
+활성화하지 않는다. 실제 전용 identity/서비스/서명 패키지 수락 때 이 경계를 재검토한다.

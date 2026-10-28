@@ -55,6 +55,7 @@ import { openLocalClientApps } from './localClientApps'
 import type { AgentGrant, AuthContext } from './contracts'
 import { sessionOwnerSchema } from './sessionRegistration'
 import type { TenancyMode } from './tenancy'
+import { nativeBrokerAuthorization } from './nativeBrokerAuthorization'
 
 /** Session processes renew 5 minutes before expiry. */
 export const BROKER_GRANT_TTL_MS = 55 * 60_000
@@ -67,7 +68,9 @@ export interface BrokerOptions {
     server?: Server
     /** Registrations are persisted here (the Runtime state volume). */
     stateDir: string
-    daemonTokenSha256: string
+    daemonTokenSha256?: string
+    /** Native services use one-use issuer commands; never a shared daemon secret. */
+    nativeAuthorization?: true
     identity: { machineId: MachineId; workspaceId: WorkspaceId }
     /** Profiles sessions may use, with their owning principal. */
     profiles: ReadonlyMap<ProfileId, PrincipalId>
@@ -149,7 +152,9 @@ function header(req: IncomingMessage, name: string): string {
     return typeof value === 'string' ? value : ''
 }
 
+const authorizedBodies = new WeakMap<IncomingMessage, unknown>()
 async function readJson(req: IncomingMessage): Promise<unknown> {
+    if (authorizedBodies.has(req)) return authorizedBodies.get(req)
     let raw = ''
     for await (const chunk of req) {
         raw += chunk
@@ -172,7 +177,12 @@ function send(res: ServerResponse, status: number, body: unknown): void {
 export async function startBroker(options: BrokerOptions): Promise<Broker> {
     const now = options.now ?? Date.now
     const log = options.log ?? (() => {})
-    const expectedDaemonToken = Buffer.from(options.daemonTokenSha256, 'hex')
+    if (options.nativeAuthorization ? options.daemonTokenSha256 !== undefined : !/^[a-f0-9]{64}$/i.test(options.daemonTokenSha256 ?? ''))
+        throw new Error('Configure exactly one broker authorization mechanism')
+    const nativeAuth = options.nativeAuthorization ? nativeBrokerAuthorization({
+        identity: options.identity, trustedIssuers: options.trustedIssuers ?? [], now,
+    }) : undefined
+    const expectedDaemonToken = Buffer.from(options.daemonTokenSha256 ?? '', 'hex')
     const registryPath = join(options.stateDir, REGISTRY_FILE)
     const tenancyMode = options.tenancyMode ?? 'dedicated'
     let registry: RegistryFile = { schemaVersion: tenancyMode === 'shared' ? 2 : 1, registrations: {} }
@@ -215,9 +225,10 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
         return run
     }
 
-    const assertDaemon = (req: IncomingMessage): void => {
+    const assertDaemon = async (req: IncomingMessage): Promise<void> => {
+        if (nativeAuth) { authorizedBodies.set(req, await nativeAuth.authorize(req)); return }
         const supplied = sha256(header(req, 'x-abp-daemon-token'))
-        if (!header(req, 'x-abp-daemon-token') || !timingSafeEqual(supplied, expectedDaemonToken)) throw new BrowserRuntimeError('UNAUTHORIZED', 'daemon token required')
+        if (!header(req, 'x-abp-daemon-token') || expectedDaemonToken.length !== supplied.length || !timingSafeEqual(supplied, expectedDaemonToken)) throw new BrowserRuntimeError('UNAUTHORIZED', 'daemon token required')
     }
     const findByAgentSession = (agentSessionId: string): [string, Registration] | undefined =>
         Object.entries(registry.registrations).find(([, registration]) => registration.agentSessionId === agentSessionId)
@@ -303,14 +314,14 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
 
     const routes: Record<string, (req: IncomingMessage, url: URL) => Promise<unknown>> = {
         'GET /v1/sessions': async (req) => {
-            assertDaemon(req)
+            await assertDaemon(req)
             return exclusive(async () => Object.entries(registry.registrations).map(([registrationId, registration]) => ({
                 registrationId, agentSessionId: registration.agentSessionId, owner: registration.owner, bootId: registration.bootId,
                 createdAtMs: registration.createdAtMs, revoking: registration.revoking === true,
             })))
         },
         'POST /v1/sessions/register': async (req) => {
-            assertDaemon(req)
+            await assertDaemon(req)
             const body = parse(schemas.register, await readJson(req))
             await options.admit?.()
             const attested = body.attestation === undefined ? undefined
@@ -327,7 +338,7 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
             })
         },
         'POST /v1/sessions/bind': async (req) => {
-            assertDaemon(req)
+            await assertDaemon(req)
             const body = parse(schemas.bind, await readJson(req))
             await options.admit?.()
             return exclusive(async () => {
@@ -345,7 +356,7 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
             })
         },
         'POST /v1/sessions/revoke': async (req) => {
-            assertDaemon(req)
+            await assertDaemon(req)
             const body = parse(schemas.revoke, await readJson(req))
             return exclusive(async () => {
                 const entry = 'registrationId' in body
@@ -403,18 +414,20 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
             })
         },
         'GET /v1/sessions/waiting': async (req, url) => {
-            assertDaemon(req)
+            await assertDaemon(req)
             const query = parse(schemas.waiting, Object.fromEntries(url.searchParams))
             if (ledger.isRetired(query.agentSessionId)) return { waiting: false }
             return { waiting: options.sessionWaiting ? await options.sessionWaiting(query.agentSessionId) : false }
         },
         'GET /v1/attention': async (req, url) => {
-            assertDaemon(req)
+            await assertDaemon(req)
             const query = parse(schemas.attention, Object.fromEntries(url.searchParams))
             await options.admit?.()
             return options.attention.wait(query.afterSeq, query.waitMs)
         },
     }
+
+    if (nativeAuth) routes['GET /v1/native/challenge'] = async () => nativeAuth.challenge()
 
     // Both protocol registries share admission so concurrent v1/v2 issuance cannot exceed the principal limit.
     let localClientTail: Promise<unknown> = Promise.resolve()
@@ -445,8 +458,13 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
         const route = routes[`${req.method} ${url.pathname}`]
         if (!route) return send(res, 404, { ok: false, error: { code: 'UNSUPPORTED_OPERATION', message: 'not found', retryable: false, mayHaveSideEffects: false } })
         route(req, url).then((result) => send(res, 200, { ok: true, result }), (error: unknown) => {
-            const body = error instanceof BrowserRuntimeError ? error.toBody()
+            let body = error instanceof BrowserRuntimeError ? error.toBody()
                 : { code: 'RUNTIME_UNAVAILABLE' as const, message: 'internal error', retryable: true, mayHaveSideEffects: false }
+            if (nativeAuth && req.method === 'POST' && authorizedBodies.has(req)) {
+                // Authority was consumed. A lost/failed persistence acknowledgement
+                // cannot invite a fresh registration with a second signed request.
+                body = { ...body, retryable: false, mayHaveSideEffects: true }
+            }
             // Path only: headers carry secrets.
             log(`broker ${req.method} ${url.pathname} -> ${body.code}`)
             send(res, error instanceof BrowserRuntimeError ? httpStatusFor(body.code) : 500, { ok: false, error: body })
