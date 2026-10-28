@@ -49,4 +49,23 @@ describe('policy grants', () => {
         store.revoke('app:a');
         expect(store.list().map((record) => record.key)).toEqual(['app:b']);
     });
+
+    it('does not bring a revoked grant back from an answer asked for before the revoke (R18)', () => {
+        const store = createPolicyGrantStore();
+        const askedBefore = store.revision();
+        store.grant(['app:a']);
+        store.revoke('app:a');
+        store.grant(['app:a', 'app:b'], askedBefore);
+        expect(store.list().map((record) => record.key)).toEqual(['app:b']);
+
+        // Nothing live to remove, yet the answer still pending loses its grant.
+        const pending = store.revision();
+        expect(store.revoke('app:c')).toBe(false);
+        store.grant(['app:c'], pending);
+        expect(store.view().hasGrant('app:c')).toBe(false);
+
+        // Asked after the revoke: the person allowed it again.
+        store.grant(['app:a'], store.revision());
+        expect(store.view().hasGrant('app:a')).toBe(true);
+    });
 });

@@ -2,14 +2,14 @@ import { mkdtempSync } from 'node:fs';
 import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { startHookServer, type HookServer } from '@/claude/utils/startHookServer';
 import { handOffCuaToShadowProxy } from './claudeHook';
 import { CUA_DRIVER_SERVER } from './cuaShadow';
 import { createPolicyGrantStore, REMOTE_GRANT_TTL_MS } from './grants';
 import { registerToolPolicyGrantRpcs, TOOL_POLICY_GRANTS_RPC, TOOL_POLICY_REVOKE_GRANT_RPC } from './grantControl';
 import { toolPolicyAdapterEnv, toolPolicyClientFromEnv } from './policyClient';
-import type { PolicyApprover } from './policyGate';
+import type { PolicyApprovalAnswer, PolicyApprover } from './policyGate';
 import { createToolPolicyRuntime, type ToolPolicyRuntime } from './runtime';
 
 type Handler = (params: unknown) => unknown;
@@ -170,5 +170,80 @@ describe('revoking a grant in a running session', () => {
         expect(await rpc.call(TOOL_POLICY_REVOKE_GRANT_RPC, { key: 'clipboard:clipboard_read' })).toEqual({ revoked: true });
         expect(await proxy.decide({ tool: 'clipboard_read', args: {}, toolUseId: 'c3' })).toEqual({ kind: 'allow' });
         expect(asked).toEqual([...Array(3).fill('mcp__fake__send_mail'), 'mcp__cua-driver__clipboard_read', 'mcp__cua-driver__clipboard_read']);
+    });
+
+    /** Answers wait until the test gives them, so two prompts can be open at once. */
+    function heldApprover() {
+        const open: Array<(answer: PolicyApprovalAnswer) => void> = [];
+        const approver: PolicyApprover = { requestPolicyApproval: () => new Promise((resolve) => { open.push(resolve); }) };
+        return { approver, open };
+    }
+
+    function sendMailRuntime(approver: PolicyApprover, rpc: ReturnType<typeof registrar>) {
+        runtime = createToolPolicyRuntime({
+            happyHomeDir: mkdtempSync(join(tmpdir(), 'policy-grant-race-')),
+            sessionId: () => 'session-1',
+            publishRecent: () => undefined,
+            approver: () => approver,
+            unattended: () => false,
+            terminalPrompt: () => false,
+            grantTtlMs: null,
+            rpc,
+        });
+        const gate = runtime.gate;
+        return (id: string) => gate.decide({ toolName: 'mcp__fake__send_mail', toolInput: { to: 'a@b.c' }, toolUseId: id, origin: 'bridge' }, new AbortController().signal);
+    }
+
+    const SEND_MAIL = 'tool:mcp__fake__send_mail';
+    const SESSION_ALLOW: PolicyApprovalAnswer = { approved: true, policyGrant: 'session' };
+
+    it('lets a parallel answer that lands just before the revoke allow its own call but not grant again', async () => {
+        const held = heldApprover();
+        const rpc = registrar();
+        const call = sendMailRuntime(held.approver, rpc);
+
+        const a = call('a');
+        const b = call('b');
+        await vi.waitFor(() => expect(held.open).toHaveLength(2));
+        held.open[0](SESSION_ALLOW);
+        expect(await a).toEqual({ kind: 'allow' });
+        expect(await rpc.call(TOOL_POLICY_GRANTS_RPC, {})).toMatchObject({ grants: [{ key: SEND_MAIL }] });
+
+        // B's answer is in, but the gate has not read it yet when the revoke runs.
+        held.open[1](SESSION_ALLOW);
+        expect(await rpc.call(TOOL_POLICY_REVOKE_GRANT_RPC, { key: SEND_MAIL })).toEqual({ revoked: true });
+        expect(await b).toEqual({ kind: 'allow' });
+        expect(await rpc.call(TOOL_POLICY_GRANTS_RPC, {})).toEqual({ grants: [] });
+
+        const c = call('c');
+        await vi.waitFor(() => expect(held.open).toHaveLength(3));
+        held.open[2]({ approved: false, policyGrant: 'once' });
+        expect(await c).toMatchObject({ kind: 'deny' });
+    });
+
+    it('does not grant from a prompt that was still waiting when the person revoked', async () => {
+        const held = heldApprover();
+        const rpc = registrar();
+        const call = sendMailRuntime(held.approver, rpc);
+
+        const a = call('a');
+        const b = call('b');
+        await vi.waitFor(() => expect(held.open).toHaveLength(2));
+        held.open[0](SESSION_ALLOW);
+        await a;
+        expect(await rpc.call(TOOL_POLICY_REVOKE_GRANT_RPC, { key: SEND_MAIL })).toEqual({ revoked: true });
+        // B's prompt stays open well past the revoke before the person answers it.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        held.open[1](SESSION_ALLOW);
+        expect(await b).toEqual({ kind: 'allow' });
+        expect(await rpc.call(TOOL_POLICY_GRANTS_RPC, {})).toEqual({ grants: [] });
+
+        // A prompt asked after the revoke grants again: that is a new answer.
+        const c = call('c');
+        await vi.waitFor(() => expect(held.open).toHaveLength(3));
+        held.open[2](SESSION_ALLOW);
+        expect(await c).toEqual({ kind: 'allow' });
+        expect(await rpc.call(TOOL_POLICY_GRANTS_RPC, {})).toMatchObject({ grants: [{ key: SEND_MAIL }] });
+        expect(held.open).toHaveLength(3);
     });
 });

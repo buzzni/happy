@@ -6,6 +6,11 @@
  * from this PC gets a 30-minute TTL; the daemon cannot yet tell where a session was started, so
  * the caller passes `grantTtlMs` for every session until Desktop reports the origin (I1c).
  *
+ * A grant answers a prompt, and the prompt may still be open when the person revokes that grant —
+ * a second call asking in parallel, or one left waiting. That answer must not bring it back: the
+ * gate notes `revision()` before it asks and hands it to `grant`, which skips any key revoked since.
+ * The call itself was still allowed; only the grant for later calls is dropped.
+ *
  * A refusal is remembered for 5 minutes per (tool, target) so the same prompt does not come back
  * in a loop, and is forgotten as soon as the person sends their next message.
  */
@@ -23,11 +28,15 @@ export interface PolicyGrantRecord {
 
 export interface PolicyGrantStore {
     view(): PolicyGrantView;
-    grant(keys: string[]): void;
+    /** Counts revokes; pass the value read before asking to `grant`. */
+    revision(): number;
+    /** `askedAt`: a `revision()` from before the prompt — keys revoked after it are not granted. */
+    grant(keys: string[], askedAt?: number): void;
     recordDenial(key: string): void;
     /** R13: the person's next message lifts the refusal memory. */
     onUserMessage(): void;
-    /** R18: true when a live grant was removed; an expired or unknown key is false. */
+    /** R18: true when a live grant was removed; an expired or unknown key is false. Either way an
+     *  answer to a prompt asked before this revoke no longer grants the key. */
     revoke(key: string): boolean;
     list(): PolicyGrantRecord[];
     clear(): void;
@@ -38,6 +47,8 @@ export function createPolicyGrantStore(options: { now?: () => number; grantTtlMs
     const ttl = options.grantTtlMs ?? null;
     const grants = new Map<string, PolicyGrantRecord>();
     const denials = new Map<string, number>();
+    let revision = 0;
+    const revokedAt = new Map<string, number>();
 
     const live = (record: PolicyGrantRecord | undefined): boolean => {
         if (!record) return false;
@@ -61,13 +72,20 @@ export function createPolicyGrantStore(options: { now?: () => number; grantTtlMs
                 return true;
             },
         }),
-        grant: (keys) => {
+        revision: () => revision,
+        grant: (keys, askedAt) => {
             const createdAt = now();
-            for (const key of keys) grants.set(key, { key, createdAt, expiresAt: ttl === null ? null : createdAt + ttl });
+            for (const key of keys) {
+                if (askedAt !== undefined && (revokedAt.get(key) ?? 0) > askedAt) continue;
+                grants.set(key, { key, createdAt, expiresAt: ttl === null ? null : createdAt + ttl });
+            }
         },
         recordDenial: (key) => { denials.set(key, now()); },
         onUserMessage: () => { denials.clear(); },
-        revoke: (key) => live(grants.get(key)) && grants.delete(key),
+        revoke: (key) => {
+            revokedAt.set(key, ++revision);
+            return live(grants.get(key)) && grants.delete(key);
+        },
         list: () => [...grants.values()].filter((record) => live(record)),
         clear: () => { grants.clear(); denials.clear(); },
     };
