@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { AiCredentialRuntimeError } from './aiCredentialRuntime'
-import { organizationResumeRefusal, parseResumeAuthRequirement, resumeSetupTokenEnvironment } from './resumeSetupTokenRebind'
+import type { ResumeSessionResult } from '@/modules/common/registerCommonHandlers'
+import { organizationResumeRefusal, parseResumeAuthRequirement, resumeSetupTokenEnvironment, shareResumeInFlight } from './resumeSetupTokenRebind'
 
 const RECORDED = '{"account":"removed"}'
 const NEXT = { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next', HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: '{"account":"assigned"}' }
@@ -68,5 +69,23 @@ describe('organization-only resume requirement', () => {
     for (const environment of [undefined, {}, { HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: JSON.stringify({ version: 1, ...record, companyId: 'company-2', groupScope: 'company-2' }) }, { HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: '{"version":1}' }]) {
       expect(organizationResumeRefusal(requirement, environment)).toBe('CLAUDE_ORGANIZATION_RESUME_REQUIRED')
     }
+  })
+
+  // Review #976: a joiner shares the first resume's result, which was decided without the joiner's requirement.
+  it('refuses a requirement resume that would join one already in flight, and retries it alone once that settles', async () => {
+    const inflight = new Map<string, Promise<ResumeSessionResult>>()
+    let release!: () => void
+    const start = vi.fn(() => new Promise<ResumeSessionResult>(resolve => { release = () => resolve({ type: 'success', sessionId: 's1' }) }))
+
+    const personal = shareResumeInFlight(inflight, 's1', undefined, start)
+    const organization = shareResumeInFlight(inflight, 's1', requirement, start)
+    release()
+
+    expect(await personal).toEqual({ type: 'success', sessionId: 's1' })
+    expect(await organization).toMatchObject({ type: 'error', code: 'SESSION_LIVE' })
+    expect(start).toHaveBeenCalledTimes(1)
+    const own = vi.fn(async (): Promise<ResumeSessionResult> => ({ type: 'error', code: 'CLAUDE_ORGANIZATION_RESUME_REQUIRED', errorMessage: 'no record' }))
+    expect(await shareResumeInFlight(inflight, 's1', requirement, own)).toMatchObject({ code: 'CLAUDE_ORGANIZATION_RESUME_REQUIRED' })
+    expect(own).toHaveBeenCalledTimes(1)
   })
 })

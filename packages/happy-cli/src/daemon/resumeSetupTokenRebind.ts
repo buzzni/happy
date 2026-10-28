@@ -6,7 +6,9 @@
  * conversation was bound to. That conversation stays the same session: it moves onto an account Studio
  * still assigns, through the same rebind a used-up account takes mid-session, and resumes on it.
  */
+import type { ResumeSessionResult } from '@/modules/common/registerCommonHandlers'
 import { AiCredentialRuntimeError } from './aiCredentialRuntime'
+import { shareInFlight } from './resumeGuards'
 import type { RebindResult } from './setupTokenAccountSwitch'
 import { readSetupTokenResumeSelection, type SaycodeAgentEnvironment } from './sessionEnv'
 
@@ -56,4 +58,20 @@ export function organizationResumeRefusal(requirement: ResumeAuthRequirement | u
   let companyId: string | undefined
   try { companyId = readSetupTokenResumeSelection(agentEnvironment)?.binding.companyId } catch { /* An unreadable record proves nothing. */ }
   return companyId === requirement.companyId ? undefined : 'CLAUDE_ORGANIZATION_RESUME_REQUIRED'
+}
+
+/**
+ * Concurrent resumes of one session share a single attempt, decided with the first caller's options only.
+ * A caller with a requirement never takes that result: it may be a child on this PC's login (review #976).
+ */
+export function shareResumeInFlight(
+  inflight: Map<string, Promise<ResumeSessionResult>>,
+  sessionId: string,
+  requirement: ResumeAuthRequirement | undefined,
+  start: () => Promise<ResumeSessionResult>,
+): Promise<ResumeSessionResult> {
+  if (requirement && inflight.has(sessionId)) {
+    return Promise.resolve({ type: 'error', code: 'SESSION_LIVE', errorMessage: `Session ${sessionId} is already being resumed; retry once it settles.` })
+  }
+  return shareInFlight(inflight, sessionId, start)
 }
