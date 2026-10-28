@@ -857,6 +857,25 @@ export class CodexAppServerClient {
         this.pendingAgentMessageDeltaChars = 0;
     }
 
+    /** `rawResponse/completed` → `codex_usage` for the thread and turn that reported it. */
+    private emitCodexUsage(params: any): void {
+        const responseId = typeof params?.responseId === 'string' ? params.responseId : '';
+        const usage = params?.usage;
+        if (!responseId || !usage || typeof usage !== 'object') {
+            logger.warn('[CodexAppServer] Ignoring malformed rawResponse/completed usage notification');
+            return;
+        }
+        const threadId = typeof params?.threadId === 'string' ? params.threadId : undefined;
+        const turnId = typeof params?.turnId === 'string' ? params.turnId : undefined;
+        this.eventHandler?.({
+            type: 'codex_usage',
+            ...(threadId ? { thread_id: threadId } : {}),
+            ...(turnId ? { turn_id: turnId } : {}),
+            response_id: responseId,
+            usage,
+        });
+    }
+
     private handleRawNotification(method: string, params: any): boolean {
         if (!this.shouldHandleRawNotification(method)) {
             return false;
@@ -948,21 +967,7 @@ export class CodexAppServerClient {
         }
 
         if (method === 'rawResponse/completed') {
-            const responseId = typeof params?.responseId === 'string' ? params.responseId : '';
-            const usage = params?.usage;
-            if (!responseId || !usage || typeof usage !== 'object') {
-                logger.warn('[CodexAppServer] Ignoring malformed rawResponse/completed usage notification');
-                return true;
-            }
-            const threadId = typeof params?.threadId === 'string' ? params.threadId : undefined;
-            const turnId = typeof params?.turnId === 'string' ? params.turnId : undefined;
-            this.eventHandler?.({
-                type: 'codex_usage',
-                ...(threadId ? { thread_id: threadId } : {}),
-                ...(turnId ? { turn_id: turnId } : {}),
-                response_id: responseId,
-                usage,
-            });
+            this.emitCodexUsage(params);
             return true;
         }
 
