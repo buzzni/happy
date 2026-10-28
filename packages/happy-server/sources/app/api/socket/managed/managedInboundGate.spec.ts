@@ -50,6 +50,13 @@ describe('registration is by exact session and listed name', () => {
         expect(await inbound('rpc-unregister', { method: `${SID}:permission` })).toEqual({ ok: true });
     });
 
+    it('accepts the session\'s own tool-policy grant handlers', async () => {
+        for (const name of ['tool-policy-grants', 'tool-policy-revoke-grant']) {
+            expect(await inbound('rpc-register', { method: `${SID}:${name}` }), name)
+                .toEqual({ ok: true });
+        }
+    });
+
     it('refuses steering, which no admission covers', async () => {
         // Steering injects free text into the turn already running. Unlike
         // `goal-action`, the name carries no sub-mode that could be allowed on

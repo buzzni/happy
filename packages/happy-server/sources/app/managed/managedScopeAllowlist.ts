@@ -140,6 +140,12 @@ const ALLOWED_RPC_NAMES: readonly string[] = [
     // registration is refused on every socket reconnect and a managed run
     // never reports connector status at all.
     'mcp-status',
+    // The session's own tool-policy grants (happy-cli `toolPolicy/grantControl.ts`):
+    // the owner lists what was allowed "in this conversation" and takes it back.
+    // Listing shows only this session's grant keys and revoking only tightens,
+    // so the runner registers them and no relay purpose reaches them.
+    'tool-policy-grants',
+    'tool-policy-revoke-grant',
 
     'bash',
     'copyFile',

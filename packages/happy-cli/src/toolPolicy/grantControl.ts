@@ -7,11 +7,11 @@
  * reaches them; the server lane does not list them. A revoke only tightens, so it needs no further
  * confirmation. The daemon announces them with `grant-control` in the machine `toolPolicy` capability.
  *
- * The names carry no `:` because happy-server's managed scope refuses any such name outright. Managed
- * runs still do not get them: its `ALLOWED_RPC_NAMES` does not list them yet, so registration is
- * refused and the call comes back `RPC method not available` — which Desktop, like for a conversation
- * on an older CLI, reads as "not supported here". Listing them is a change to that server security
- * boundary (a separately approved plan), not to this file.
+ * The names carry no `:` because happy-server's managed scope refuses any such name outright. That
+ * scope's `ALLOWED_RPC_NAMES` lists both for the runner (a separately approved server change). Against
+ * a server that predates it, a managed run's registration is refused and the call comes back
+ * `RPC method not available` — which Desktop, like for a conversation on an older CLI, reads as
+ * "not supported here".
  */
 
 import type { PolicyGrantRecord, PolicyGrantStore } from './grants';
