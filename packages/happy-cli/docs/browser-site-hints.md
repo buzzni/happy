@@ -25,7 +25,7 @@ sites:
 - Codex sessions: `<session folder>/.agents/skills` and `$CODEX_HOME/skills` (default `~/.codex/skills`).
 - Other agents get no site hints.
 
-The folders are read once per session, on the first browser call that could match; a skill installed later applies from the next session. At most 200 skills are read, and a SKILL.md over 64 KiB is skipped. A folder or file that cannot be read is skipped without failing the tool.
+The folders are read once per session, on the first browser call that could match; a skill installed later applies from the next session. At most 200 SKILL.md files are read per session (site skills or not), and a SKILL.md over 64 KiB is skipped. A multi-line `description: |` or `>` is read as one line. A folder or file that cannot be read is skipped without failing the tool.
 
 ## What the agent sees
 

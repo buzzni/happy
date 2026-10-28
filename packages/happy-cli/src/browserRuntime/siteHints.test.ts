@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createSiteHints, matchesSitePattern, parseSkillSites, siteSkillRoots } from './siteHints'
+import { createSiteHints, MAX_SKILL_FILES, matchesSitePattern, parseSkillSites, siteSkillRoots } from './siteHints'
 
 const dirs: string[] = []
 async function tempDir(): Promise<string> {
@@ -25,6 +25,12 @@ describe('parseSkillSites (R1)', () => {
             .toEqual({ name: 'github', description: 'GitHub shortcuts', sites: ['github.com', 'gist.github.com'] })
         expect(parseSkillSites("---\nname: wiki\ndescription: Confluence\nsites: [ '*.atlassian.net/wiki/**', notion.so ]\n---\n"))
             .toEqual({ name: 'wiki', description: 'Confluence', sites: ['*.atlassian.net/wiki/**', 'notion.so'] })
+    })
+
+    // PR #980 review: a block scalar's indicator is not the description.
+    it('reads a multi-line literal or folded description', () => {
+        expect(parseSkillSites('---\nname: a\ndescription: |\n  First line\n  second line\nsites: [a.com]\n---\n')?.description).toBe('First line second line')
+        expect(parseSkillSites('---\nname: a\ndescription: >-\n  Folded\n  text\nsites: [a.com]\n---\n')?.description).toBe('Folded text')
     })
 
     it('ignores skills without sites, without frontmatter, or with only invalid patterns', () => {
@@ -87,6 +93,14 @@ describe('createSiteHints (R2–R5)', () => {
         expect((await hints.hintFor('t', ['https://ok.com/']))?.skills.map((s) => s.name)).toEqual(['ok'])
         await skill(root, 'late', 'name: late\ndescription: added later\nsites: [late.com]')
         expect(await hints.hintFor('t', ['https://late.com/'])).toBeUndefined()
+    })
+
+    // PR #980 review: the cap bounds the SKILL.md files read, not only the site skills found.
+    it('reads at most the capped number of SKILL.md files, site skills or not', async () => {
+        const root = await tempDir()
+        for (let index = 0; index < MAX_SKILL_FILES; index += 1) await skill(root, `a-${String(index).padStart(3, '0')}`, 'name: plain\ndescription: no sites')
+        await skill(root, 'z-site', 'name: z\ndescription: past the cap\nsites: [z.com]')
+        expect(await createSiteHints({ roots: [root] }).hintFor('t', ['https://z.com/'])).toBeUndefined()
     })
 
     it('trims long descriptions and uses the folder name when the skill has none', async () => {

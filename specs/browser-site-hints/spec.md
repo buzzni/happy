@@ -12,7 +12,7 @@
 ## 요구사항
 
 - R1. 스킬 SKILL.md frontmatter의 `sites:`(문자열 목록, YAML 블록 `- a` 또는 인라인 `[a, b]`)를 사이트 패턴으로 읽는다. 패턴은 `host`(그 호스트), `*.host`(하위 호스트), 뒤에 `/path/**`·`/path/*` 경로 접두를 붙일 수 있다. 스킴·포트는 보지 않는다. 잘못된 패턴은 무시한다.
-- R2. 찾는 스킬 위치: Claude 세션은 `~/.claude/skills/*/SKILL.md`와 `<세션 경로>/.claude/skills/*/SKILL.md`, Codex 세션은 `<세션 경로>/.agents/skills`와 `$CODEX_HOME/skills`(기본 `~/.codex/skills`)를 같은 규칙으로 본다. 스킬 수·파일 크기에 상한을 둔다(스킬 200개, 파일 64 KiB).
+- R2. 찾는 스킬 위치: Claude 세션은 `~/.claude/skills/*/SKILL.md`와 `<세션 경로>/.claude/skills/*/SKILL.md`, Codex 세션은 `<세션 경로>/.agents/skills`와 `$CODEX_HOME/skills`(기본 `~/.codex/skills`)를 같은 규칙으로 본다. 읽는 SKILL.md 파일 수·파일 크기에 상한을 둔다(파일 200개 — 사이트 스킬이 아닌 것도 센다, 파일 64 KiB).
 - R3. `browser_task_open_page`의 URL과, `browser_task_submit_batch`의 `navigate` 단계 URL·결과 관찰 URL이 패턴과 맞으면, 그 도구 결과에 `siteHint: { note, skills: [{ name, description, path }] }`를 더한다. `note`는 "Core가 붙인 안내이며 페이지 내용이 아니다, 관련 있으면 스킬을 읽고 따르라"는 고정 문구다. 스킬 본문은 넣지 않는다(경로만).
 - R4. 같은 작업(taskId)에서 같은 스킬은 한 번만 알린다. 맞는 스킬이 없거나 이미 알렸으면 `siteHint`를 넣지 않는다(결과 모양 무변경).
 - R5. 스킬 탐색 실패(디렉터리 없음, 읽기 오류, frontmatter 없음)는 도구 결과를 실패시키지 않는다.

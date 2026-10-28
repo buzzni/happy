@@ -9,7 +9,8 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 const SKILL_FILE = 'SKILL.md'
-const MAX_SKILLS = 200
+/** SKILL.md files read per session, site skills or not (specs/browser-site-hints R2). */
+export const MAX_SKILL_FILES = 200
 const MAX_SKILL_BYTES = 64 * 1024
 const MAX_DESCRIPTION = 200
 /** A host (optionally `*.`-prefixed), then an optional path prefix ending in `/*` or `/**`. */
@@ -37,6 +38,12 @@ export function parseSkillSites(source: string): SiteSkill | null {
         const field = /^(name|description|sites):\s*(.*)$/.exec(lines[index])
         if (!field) continue
         if (field[1] === 'name') name = scalar(field[2])
+        else if (field[1] === 'description' && /^[|>][+-]?$/.test(field[2].trim())) {
+            // A YAML block scalar: the text is the indented lines that follow, read here as one line.
+            const block: string[] = []
+            for (let next = index + 1; next < lines.length && /^\s+\S/.test(lines[next]); next += 1) block.push(lines[next].trim())
+            description = block.join(' ')
+        }
         else if (field[1] === 'description') description = scalar(field[2])
         else if (field[2].trim().startsWith('[')) sites.push(...field[2].trim().replace(/^\[|\]$/g, '').split(',').map(scalar))
         else for (let next = index + 1; next < lines.length && /^\s*-\s/.test(lines[next]); next += 1) sites.push(scalar(lines[next].replace(/^\s*-\s/, '')))
@@ -70,15 +77,17 @@ export function siteSkillRoots(opts: { flavor: 'claude' | 'codex'; cwd?: string;
 
 async function readSiteSkills(roots: readonly string[]): Promise<Array<SiteSkill & { path: string }>> {
     const skills: Array<SiteSkill & { path: string }> = []
+    let files = 0
     for (const root of roots) {
         let entries: string[]
         try { entries = await readdir(root) } catch { continue }
         for (const entry of entries.sort()) {
-            if (skills.length >= MAX_SKILLS) return skills
             const path = join(root, entry, SKILL_FILE)
             try {
                 const stat = await lstat(path)
-                if (!stat.isFile() || stat.size > MAX_SKILL_BYTES) continue
+                if (!stat.isFile()) continue
+                if (++files > MAX_SKILL_FILES) return skills
+                if (stat.size > MAX_SKILL_BYTES) continue
                 const parsed = parseSkillSites(await readFile(path, 'utf8'))
                 if (parsed) skills.push({ ...parsed, name: parsed.name || entry, description: parsed.description.slice(0, MAX_DESCRIPTION), path })
             } catch {
