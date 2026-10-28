@@ -112,3 +112,28 @@ Native broker 모드의 별도 인증은 src/browserRuntime/nativeBrokerAuthoriz
 issuer의 작업별 발급/daemon 전송, OS별 IPC ACL·서비스 설치·WFP와 서명 installer는
 아직 연결되지 않았다. 이 addon이나 broker 단위 테스트만으로 native 설치를
 활성화하지 않는다. 실제 전용 identity/서비스/서명 패키지 수락 때 이 경계를 재검토한다.
+
+## Windows 전용 서비스 custody 호스트
+
+`windowsBrowserService.cs`는 .NET Framework ServiceBase로 SCM 전용 가상 계정
+`NT SERVICE\SaycodeBrowserRuntime`에서 실행한다. 보호된 ProgramData 루트/상위
+경로/실행 파일/상태 ACL을 검사한 뒤 서비스 전용 32바이트 agent.key를 최초 생성하고
+재시작 시 재사용한다. root/system/관리자와 이 서비스 외의 private 접근을 거부한다.
+상위 Windows 시스템 경로의 TrustedInstaller는 명시적으로 신뢰한다.
+
+`*-status-v1` named pipe는 first-instance·원격 클라이언트 거부로 생성하며 local
+Authenticated Users에는 version/principal/generation/runtimeReady만 제공한다.
+응답 읽기 전 disconnect로 데이터가 사라지지 않도록 ACK 또는 연결 종료를 기다리고,
+끊긴 클라이언트/timeout은 해당 요청만 정리한다. 임의 명령·토큰·키를 받거나 내보내지 않는다.
+`runtimeReady`는 broker/worker/보호 계층이 연결되기 전까지 false다.
+
+관리자 Windows에서 `scripts/windows-browser-service.check.ps1 -Source <windowsBrowserService.cs>`
+는 경고 오류 빌드, 별도 Verification 서비스 설치·SID/IPC·재시작/강제 종료 후 custody·
+파이프 선점/넓어진 ACL 거부를 검사하고 자신이 만든 서비스/디렉터리만 제거한다.
+`-ClientProbeSeconds 50` 동안 비관리자 계정으로
+`scripts/windows-browser-service-client.check.ps1`을 실행해 private 읽기 거부와
+공개 상태·중도 연결 종료 회복을 확인한다. 기존 검증 디렉터리/서비스는 덮어쓰지 않는다.
+
+이 호스트는 아직 Node broker/Chrome을 실행하지 않으며 key를 런타임에 연결하지 않는다.
+전용 브라우저 프로세스/Job, WFP·부팅 보호, 설치 artifact 서명과 installer는 별도 미완료다.
+제품용 원클릭 설치나 전체 isolation 수락을 이 검사로 표시하지 않는다.
