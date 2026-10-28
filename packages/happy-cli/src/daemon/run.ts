@@ -129,7 +129,7 @@ import { sanitizeChildEnv } from '@/utils/childEnv';
 import { resolveRecoveredInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings';
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
 import { createCollectorSchedule } from './collectorSchedule';
-import { organizationResumeRefusal, resumeSetupTokenEnvironment, type ResumeAuthRequirement } from './resumeSetupTokenRebind';
+import { organizationResumeRefusal, resumeSetupTokenEnvironment, shareResumeInFlight, type ResumeAuthRequirement } from './resumeSetupTokenRebind';
 import type { AiAuthSource } from '@/usage/aiAuthSource';
 import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch } from '@/resume/handleResumeCommand';
@@ -3258,7 +3258,7 @@ export async function startDaemon(): Promise<void> {
     };
 
     const resumeSession = (happySessionId: string, options?: ResumeSessionOptions): Promise<ResumeSessionResult> =>
-      shareInFlight(resumeInFlight, happySessionId, () => spawnResumedSession(happySessionId, options));
+      shareResumeInFlight(resumeInFlight, happySessionId, options?.aiAuthRequirement, () => spawnResumedSession(happySessionId, options));
 
     const queueCheckpointRestart = createCheckpointRestartQueue();
     const restartCheckpointSession = (authority: CheckpointRpcSessionAuthority, preserveProtection = false): Promise<void> =>

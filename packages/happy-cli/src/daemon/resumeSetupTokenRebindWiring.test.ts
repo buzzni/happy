@@ -53,4 +53,9 @@ describe('resume of a session whose organization account left this PC', () => {
     expect(refusal).toBeGreaterThan(live)
     expect(refusal).toBeLessThan(reuse)
   })
+
+  // Review #976: the check above runs only for the caller that starts the attempt, not for one that joins it.
+  it('never lets a requirement resume join one already in flight', async () => {
+    expect(await runSource()).toContain('shareResumeInFlight(resumeInFlight, happySessionId, options?.aiAuthRequirement, () => spawnResumedSession(happySessionId, options))')
+  })
 })
