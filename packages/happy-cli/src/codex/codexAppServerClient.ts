@@ -25,6 +25,7 @@ import { CodexBackgroundTasks, type CodexBackgroundTask } from './codexBackgroun
 import { CodexSubagentTracker, type CodexSubagentSpawn } from './codexSubagentTracker';
 import { readCodexOutput } from './codexOutputReader';
 import { resolveCodexStateEnvironment } from './codexStateRecovery';
+import { bindCodexThreadToProject } from './codexProjectBinding';
 import type {
     InitializeParams,
     NewConversationParams,
@@ -320,6 +321,7 @@ export class CodexAppServerClient {
 
     // Session state
     private _threadId: string | null = null;
+    private pendingProjectBinding: { threadId: string; cwd: string; projectRoot: string | undefined; epoch: number } | null = null;
     private _turnId: string | null = null;
     private nativeThreadMetadata: { id: string; path: string } | null = null;
     private readonly nativeCompletionObservations = new Set<NativeCompletionObservation>();
@@ -1806,6 +1808,10 @@ export class CodexAppServerClient {
         this._turnId = null;
         this.rememberThreadDefaults(opts);
         logger.debug('[CodexAppServer] Thread started:', this._threadId);
+        // Native metadata updates need a rollout, which Codex persists on the first user turn.
+        this.pendingProjectBinding = process.env.SAYCODE_AGENT_ENV === '1'
+            ? { threadId: result.thread.id, cwd: params.cwd ?? process.cwd(), projectRoot: process.env.SAYCODE_AGENT_SCOPE, epoch: this.processEpoch }
+            : null;
         return { threadId: result.thread.id, model: result.model };
     }
 
@@ -2483,6 +2489,16 @@ export class CodexAppServerClient {
             ? this.request('turn/start', params, undefined, opts)
             : this.request('turn/start', params)) as { turn?: { id?: string | null } };
         try { opts?.onSubmitted?.(); } catch { logger.warn('[CodexAppServer] Submission observer failed'); }
+        const binding = this.pendingProjectBinding;
+        if (binding && binding.threadId === params.threadId) {
+            this.pendingProjectBinding = null;
+            void bindCodexThreadToProject({
+                ...binding,
+                request: (method, payload, timeoutMs) => binding.epoch === this.processEpoch
+                    ? this.request(method, payload, timeoutMs)
+                    : Promise.reject(new Error('Codex connection replaced')),
+            });
+        }
         const turnId = result?.turn?.id;
         if (typeof turnId === 'string' && turnId.length > 0) {
             if (observation && this.nativeCompletionObservations.has(observation)) {
