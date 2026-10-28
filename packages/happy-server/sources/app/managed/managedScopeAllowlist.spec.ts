@@ -421,3 +421,57 @@ describe('RPCs that only exist as a relay', () => {
         expect(managedRpcRequiresRelayAuthority('abort')).toBe(false);
     });
 });
+
+describe('the session\'s own tool-policy grants', () => {
+    /*
+     * What the person allowed "in this conversation" and how they take it back
+     * (happy-cli `toolPolicy/grantControl.ts`). Listing reads only this
+     * session's grant keys; revoking only removes permission.
+     */
+    const GRANT_RPCS = ['tool-policy-grants', 'tool-policy-revoke-grant'] as const;
+
+    it('lets the run register both handlers under its own session', () => {
+        for (const name of GRANT_RPCS) {
+            expect(authorizeManagedRpcName({
+                method: `${SID}:${name}`, sessionId: SID, purpose: 'runner',
+            }), name).toEqual(allow);
+        }
+    });
+
+    it('refuses them under another session', () => {
+        for (const name of GRANT_RPCS) {
+            expect(authorizeManagedRpcName({
+                method: `${OTHER}:${name}`, sessionId: SID, purpose: 'runner',
+            }), name).toEqual(denied('session-mismatch'));
+        }
+    });
+
+    it('opens them to no purpose but the runner', () => {
+        for (const name of GRANT_RPCS) {
+            for (const purpose of ['approval-control', 'transcript-read', 'message-send'] as const) {
+                expect(authorizeManagedRpcName({
+                    method: `${SID}:${name}`, sessionId: SID, purpose,
+                }), `${purpose} ${name}`).toEqual(denied('purpose-not-allowed'));
+            }
+        }
+    });
+
+    it('still refuses the colon spelling, which the name rule has no exception for', () => {
+        expect(authorizeManagedRpcName({
+            method: `${SID}:tool-policy:grants`, sessionId: SID, purpose: 'runner',
+        })).toEqual(denied('rpc-name-malformed'));
+        expect(authorizeManagedRpcName({
+            method: `${SID}:tool-policy:revoke-grant`, sessionId: SID, purpose: 'runner',
+        })).toEqual(denied('rpc-name-malformed'));
+    });
+
+    it('leaves them reachable by the owner\'s own client and by no relay', () => {
+        for (const name of GRANT_RPCS) {
+            expect(managedRpcRequiresRelayAuthority(name), name).toBe(false);
+            for (const purpose of ['approval-control', 'message-send', 'transcript-read', 'runner'] as const) {
+                expect(authorizeManagedRelay({ purpose, rpcName: name }), `${purpose} ${name}`)
+                    .toEqual(denied('purpose-not-allowed'));
+            }
+        }
+    });
+});
