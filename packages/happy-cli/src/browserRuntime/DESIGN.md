@@ -405,3 +405,15 @@ clicks that actually gained permission from Auto, preserving manual/site-auto be
 ### Desktop approval entry
 
 The console advertises task-scoped controls with `window.__abpTaskAutoControls === 1`. Desktop scoped launches withhold the interactive capability until this marker is confirmed. An older console never receives it through that path. `agentSessionId` is a UI selection hint, not authority: the task API still checks the capability owner/profile. An empty scope clears the previous selection and never picks another conversation. Approval cards share the explicit scope dialog; changing mode does not answer their pending approval.
+
+## Agent observation output (2026-10-29)
+
+`agentTools.ts` `wrapObservation` is the only place the `Observation` DTO is shaped for the
+model (observe tool, batch step results, `getTask` last batch). The DTO, collector, refs and
+`sanitizeObservation` are unchanged. The output sends each allowed frame's text once —
+`pageText` is `frames[0]` (the top document, which the driver lists first) and another frame's
+text stays in its `frames[].pageText` — and leaves out values the note states as implied:
+`visible: true`, and `frameOrigin` equal to the origin of `url`. Applying those two rules gives
+back the DTO exactly (`cdpDriver.poc.test.ts` "agent observation output", same- and
+cross-origin frames). On local fixtures this halves output bytes and tokens; observe latency is
+unchanged.
