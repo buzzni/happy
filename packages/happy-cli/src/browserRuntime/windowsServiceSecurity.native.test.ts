@@ -26,7 +26,7 @@ it.skipIf(process.platform !== 'win32')('checks actual process SID and refuses c
                     $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier($identity)), 'FullControl', 'Allow')))
                 }
                 ${broaden ? "$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier('S-1-1-0')), 'Read', 'Allow')))" : ''}
-                Set-Acl -LiteralPath $path -AclObject $acl
+                [IO.File]::SetAccessControl($path,$acl)
             `
             const result = spawnSync(join(process.env.SystemRoot!, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
                 ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { encoding: 'utf8', timeout: 15000 })

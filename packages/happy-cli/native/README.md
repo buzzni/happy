@@ -92,6 +92,14 @@ service SID, SYSTEM, Administrators만 쓰기를 허용하며 private 파일은 
 않는다. 실제 Windows 테스트는 windowsServiceSecurity.native.test.ts이며 Mac skip은
 Windows 빌드/수락 증거가 아니다.
 
+Windows에서 Node가 연 파일의 descriptor는 `uv_get_osfhandle`로 변환한다. addon의
+CRT `_get_osfhandle`을 직접 쓰면 CRT descriptor 테이블 차이로 프로세스가
+fast-fail할 수 있다. Windows Build Tools 개발 프롬프트에서 addon을 빌드한 뒤
+`node scripts/windows-browser-native.check.cjs native/win32-x64/browser-host.node`로
+의존성 설치 없이 커널 boot/process SID, 잠금 경쟁·강제 종료 후 회수, 하드링크 및
+synthetic credential ACL 거부를 확인한다. 이 검사는 임시 파일/자식 프로세스만
+사용하며 서비스·WFP·별도 사용자·재부팅 수락을 대신하지 않는다.
+
 Native broker 모드의 별도 인증은 src/browserRuntime/nativeBrokerAuthorization.ts에
 있다. 신뢰된 issuer가 권한을 검사한 정확한 HTTP 작업을 abp-native-command로
 서명해야 한다. 서비스 generation, machine/workspace, UUID requestId, method,

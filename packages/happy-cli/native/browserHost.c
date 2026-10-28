@@ -7,6 +7,9 @@
 #include <string.h>
 #include <limits.h>
 #ifdef _WIN32
+/* Resolve Node's descriptors through Node/libuv's CRT, not this addon's CRT.
+ * _get_osfhandle can fast-fail the process even for a valid Node descriptor. */
+#include <uv.h>
 #include <windows.h>
 #include <aclapi.h>
 #include <sddl.h>
@@ -53,7 +56,7 @@ static napi_value lock_writer(napi_env env, napi_callback_info info) {
     int fd;
     if (!argument(env, info, 0, &fd)) return NULL;
 #ifdef _WIN32
-    HANDLE handle = (HANDLE)_get_osfhandle(fd);
+    HANDLE handle = (HANDLE)uv_get_osfhandle(fd);
     BY_HANDLE_FILE_INFORMATION metadata;
     if (handle == INVALID_HANDLE_VALUE || GetFileType(handle) != FILE_TYPE_DISK ||
         !GetFileInformationByHandle(handle, &metadata) ||
@@ -202,7 +205,7 @@ static napi_value verify_service_file(napi_env env, napi_callback_info info) {
         napi_get_value_string_utf8(env, args[1], sid_text, sizeof(sid_text), &length) != napi_ok ||
         napi_get_value_bool(env, args[2], &private_file) != napi_ok || strlen(sid_text) != length)
         return error(env, "NATIVE_INVALID_ARGUMENT");
-    HANDLE handle = (HANDLE)_get_osfhandle((int)number);
+    HANDLE handle = (HANDLE)uv_get_osfhandle((int)number);
     BY_HANDLE_FILE_INFORMATION metadata;
     if (handle == INVALID_HANDLE_VALUE || GetFileType(handle) != FILE_TYPE_DISK ||
         !GetFileInformationByHandle(handle, &metadata) || (metadata.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
