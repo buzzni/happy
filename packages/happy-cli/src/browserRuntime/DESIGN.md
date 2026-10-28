@@ -427,5 +427,8 @@ is passed through as before.
 frames. Measured through the real Runtime and tool handler on local fixtures, the observe tool
 output is 40–52% smaller (bytes and local tokenizer estimates); a whole submit_batch response
 shrinks less (18–25%) because `task.lastBatch` is unchanged. The longer note makes an observation
-with a denied frame and fewer than about four elements slightly larger. End-to-end latency was
-not compared; the collector path is untouched.
+with a denied frame and fewer than about four elements slightly larger. The collector path is
+untouched: timing the registered observe tool in-process (MCP client to response, through the
+Runtime and CDP collection) against the code before this change on the same fixtures, in eight
+interleaved rounds, gave the same median latency (within 1%) and overlapping p95 ranges.
+Transport, network, UI and model latency were not measured.
