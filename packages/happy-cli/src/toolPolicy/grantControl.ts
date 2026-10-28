@@ -6,6 +6,11 @@
  * They ride the session's own encrypted RPC channel, so only someone who can open the conversation
  * reaches them; the server lane does not list them. A revoke only tightens, so it needs no further
  * confirmation. The daemon announces them with `grant-control` in the machine `toolPolicy` capability.
+ *
+ * Not on managed runs: happy-server's managed scope allowlist neither lists these names nor accepts a
+ * `:` in one, so it refuses to register them and the call comes back `RPC method not available` —
+ * which Desktop, like for a conversation on an older CLI, reads as "not supported here". Supporting
+ * them there is a change to that server security boundary, not to this file.
  */
 
 import type { PolicyGrantRecord, PolicyGrantStore } from './grants';
