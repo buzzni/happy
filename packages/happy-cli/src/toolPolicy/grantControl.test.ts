@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { startHookServer, type HookServer } from '@/claude/utils/startHookServer';
+import { handOffCuaToShadowProxy } from './claudeHook';
+import { CUA_DRIVER_SERVER } from './cuaShadow';
 import { createPolicyGrantStore, REMOTE_GRANT_TTL_MS } from './grants';
 import { registerToolPolicyGrantRpcs, TOOL_POLICY_GRANTS_RPC, TOOL_POLICY_REVOKE_GRANT_RPC } from './grantControl';
 import { toolPolicyAdapterEnv, toolPolicyClientFromEnv } from './policyClient';
@@ -119,7 +121,7 @@ describe('revoking a grant in a running session', () => {
         });
     }
 
-    it('asks again through the hook and the bridge right after the grant is revoked', async () => {
+    it('asks again through the hook, the bridge and the cua shadow proxy right after the grant is revoked', async () => {
         const asked: string[] = [];
         const approver: PolicyApprover = {
             requestPolicyApproval: async (request) => { asked.push(request.toolName); return { approved: true, policyGrant: 'session' }; },
@@ -135,10 +137,13 @@ describe('revoking a grant in a running session', () => {
             grantTtlMs: REMOTE_GRANT_TTL_MS,
             rpc,
         });
+        // As runClaude wires it when the user's cua-driver runs behind the shadow proxy.
+        const gate = handOffCuaToShadowProxy(runtime.gate, { terminalPrompt: () => false });
         server = await startHookServer({
             onSessionHook: () => undefined,
-            preToolUse: { secret: runtime.secret, decide: runtime.gate.decide, toolsListed: runtime.gate.toolsListed },
+            preToolUse: { secret: runtime.secret, decide: gate.decide, toolsListed: gate.toolsListed },
         });
+        const proxy = toolPolicyClientFromEnv(toolPolicyAdapterEnv({ port: server.port, secretFile: runtime.secretFile, server: CUA_DRIVER_SERVER }), 'cua-proxy')!;
         const bridge = toolPolicyClientFromEnv(toolPolicyAdapterEnv({ port: server.port, secretFile: runtime.secretFile, server: 'fake' }), 'bridge')!;
         const hookCall = (id: string) => postFromHook(server!.port, runtime!.secret, { tool_name: 'mcp__fake__send_mail', tool_input: { to: 'a@b.c' }, tool_use_id: id });
 
@@ -157,5 +162,13 @@ describe('revoking a grant in a running session', () => {
         await rpc.call(TOOL_POLICY_REVOKE_GRANT_RPC, { key: 'tool:mcp__fake__send_mail' });
         expect(await hookCall('t4')).toMatchObject({ kind: 'allow' });
         expect(asked).toHaveLength(3);
+
+        // The shadow proxy's grants live in the same store.
+        expect(await proxy.decide({ tool: 'clipboard_read', args: {}, toolUseId: 'c1' })).toEqual({ kind: 'allow' });
+        expect(await proxy.decide({ tool: 'clipboard_read', args: {}, toolUseId: 'c2' })).toEqual({ kind: 'pass' });
+        expect(asked).toHaveLength(4);
+        expect(await rpc.call(TOOL_POLICY_REVOKE_GRANT_RPC, { key: 'clipboard:clipboard_read' })).toEqual({ revoked: true });
+        expect(await proxy.decide({ tool: 'clipboard_read', args: {}, toolUseId: 'c3' })).toEqual({ kind: 'allow' });
+        expect(asked).toEqual([...Array(3).fill('mcp__fake__send_mail'), 'mcp__cua-driver__clipboard_read', 'mcp__cua-driver__clipboard_read']);
     });
 });
