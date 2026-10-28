@@ -316,7 +316,10 @@ disposition carries `retained { reason, taskId, atMs }`, written before that ste
 again — credential, task not terminal or waiting for an approval, tab still open in its space,
 lease epoch, in-flight driver call — and fences with no await in between: of two takeovers with
 the same epoch one succeeds and one gets `STALE_LEASE`, and a task cancelled meanwhile is not
-taken over. A refused takeover leaves the (sticky) record. It is sticky: giving control back, resuming,
+taken over. A refused takeover leaves the (sticky) record. The store's metadata queue only
+serializes space writes; it does not lock the tab's lifecycle (driver events, and other work
+after the write completes, can still run before the takeover continues), which is why the
+final synchronous checks, not the queue, make the fence safe. The record is sticky: giving control back, resuming,
 finishing, cancelling, the session ending, idling, expiring or a restart do not clear it. Such a
 tab keeps its task, space, target, lease epoch and disposition records and stays counted against
 `maxActiveTabs` and `maxAgentWindows`, and its task record is not purged:
@@ -333,7 +336,9 @@ tab keeps its task, space, target, lease epoch and disposition records and stays
 - a tab without a disposition comes from a Runtime before dispositions. Its tasks only show a
   hand-off that is still current (a release, resume or finish clears it), so their silence proves
   nothing: at restart it gets `retained` when a current user wait or user control on it is shown,
-  otherwise `retentionUnknown: true` — kept exactly like a retained tab (also across further
+  otherwise `retentionUnknown: true`. That `retained` reason can be inferred from task-level
+  state (a task paused for user control marks each of its tabs), so it is not proof that the
+  user controlled that particular tab. Either way the tab is kept exactly like a retained tab (also across further
   restarts, reclamation, agent close, local client end and retention), but not labelled a
   hand-off. Until that repair a missing disposition counts as kept too. Tabs this Runtime opens
   always carry their own disposition and close normally unless handed over.
