@@ -1251,6 +1251,13 @@ describe('managed Claude setup-token runtime', () => {
       await expect(runtime.sessionEnvironment('claude', resume.selection, { ...resume.binding, credentialGeneration: 2 })).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE')
     })
 
+    // Saycode specs/claude-org-personal-coexistence I: the daemon enforces the requirement itself, binding support or not.
+    it('advertises the organization-only resume requirement on every daemon that enforces it', async () => {
+      for (const machine of [fakeMachine([], null), fakeMachine([], null, { binding: false }), fakeMachine([], null, { runtime: 'unmarked' })]) {
+        expect(await machine.runtime.capabilities()).toMatchObject({ setupTokenResumeRequirementVersion: 1 })
+      }
+    })
+
     it('advertises binding only with the marked runtime and a verifiable Studio key', async () => {
       expect(await fakeMachine([], null).runtime.capabilities()).toMatchObject({ newSessionProfileBinding: true, setupTokenSessionBindingVersion: 1 })
       for (const machine of [fakeMachine([], null, { binding: false }), fakeMachine([], null, { runtime: 'unmarked' })]) {

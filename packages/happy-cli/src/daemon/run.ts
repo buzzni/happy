@@ -129,7 +129,7 @@ import { sanitizeChildEnv } from '@/utils/childEnv';
 import { resolveRecoveredInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings';
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
 import { createCollectorSchedule } from './collectorSchedule';
-import { resumeSetupTokenEnvironment } from './resumeSetupTokenRebind';
+import { organizationResumeRefusal, resumeSetupTokenEnvironment, shareResumeInFlight, type ResumeAuthRequirement } from './resumeSetupTokenRebind';
 import type { AiAuthSource } from '@/usage/aiAuthSource';
 import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch } from '@/resume/handleResumeCommand';
@@ -2802,6 +2802,8 @@ export async function startDaemon(): Promise<void> {
 
     type ResumeSessionOptions = {
       model?: string;
+      /** Saycode specs/claude-org-personal-coexistence I: resume only on the recorded organization binding. */
+      aiAuthRequirement?: ResumeAuthRequirement;
       permissionMode?: string;
       environmentVariables?: Record<string, string>;
       mcpCallerGrantEnvelope?: string;
@@ -2849,9 +2851,15 @@ export async function startDaemon(): Promise<void> {
 
       if (!launchReadiness.isReady()) return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: 'Daemon is initializing; retry the resume shortly' };
       if (pendingMachineStarts.has(happySessionId)) return { type: 'error', code: 'SESSION_LIVE', errorMessage: 'The execution-bound session is still starting; retry shortly.' };
+      // Before a live child is reused or a new one started: a session with no record of the required organization
+      // would run on whatever login this PC has, which the caller asked to rule out.
+      const organizationRefusal = organizationResumeRefusal(options?.aiAuthRequirement, findTrackedSessionById(happySessionId)?.agentEnvironment);
+      if (organizationRefusal) return { type: 'error', code: 'CLAUDE_ORGANIZATION_RESUME_REQUIRED', errorMessage: `Session ${happySessionId} has no record of the required organization account.` };
       let endResumeLaunch: (() => void) | undefined;
       try {
         if (hasLiveDaemonChild(happySessionId, pidToTrackedSession.values(), isPidAlive, ownsUnresolvedJob)) {
+          // The record vouches only for a process this resume starts: a live child may be on a consented personal fallback.
+          if (options?.aiAuthRequirement) return { type: 'error', code: 'CLAUDE_ORGANIZATION_RESUME_REQUIRED', errorMessage: `Session ${happySessionId} is still running; its account cannot be vouched for by the record.` };
           if (options?.automation || options?.writeScopeEnvironment) {
             return {
               type: 'error',
@@ -3250,7 +3258,7 @@ export async function startDaemon(): Promise<void> {
     };
 
     const resumeSession = (happySessionId: string, options?: ResumeSessionOptions): Promise<ResumeSessionResult> =>
-      shareInFlight(resumeInFlight, happySessionId, () => spawnResumedSession(happySessionId, options));
+      shareResumeInFlight(resumeInFlight, happySessionId, options?.aiAuthRequirement, () => spawnResumedSession(happySessionId, options));
 
     const queueCheckpointRestart = createCheckpointRestartQueue();
     const restartCheckpointSession = (authority: CheckpointRpcSessionAuthority, preserveProtection = false): Promise<void> =>

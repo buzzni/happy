@@ -35,4 +35,27 @@ describe('resume of a session whose organization account left this PC', () => {
     const resume = resumeBody(await runSource())
     expect(resume).toContain("[SETUP_TOKEN_RESUME_REBOUND_ENV]: resumedCredentials.rebound ? '1' : '',")
   })
+
+  // Saycode specs/claude-org-personal-coexistence I: before a live child is reused or a new one spawned.
+  it('checks an organization-only requirement against the recorded binding before any process is reused or started', async () => {
+    const resume = resumeBody(await runSource())
+    const check = resume.indexOf('organizationResumeRefusal(options?.aiAuthRequirement, findTrackedSessionById(happySessionId)?.agentEnvironment)')
+    expect(check).toBeGreaterThan(0)
+    expect(check).toBeLessThan(resume.indexOf('hasLiveDaemonChild('))
+    expect(resume.slice(check, check + 400)).toContain("code: 'CLAUDE_ORGANIZATION_RESUME_REQUIRED'")
+  })
+
+  it('never vouches for a live child with the record, since it may be on a consented personal fallback', async () => {
+    const resume = resumeBody(await runSource())
+    const live = resume.indexOf('if (hasLiveDaemonChild(')
+    const reuse = resume.indexOf('a live child is already attached — reusing it')
+    const refusal = resume.indexOf("if (options?.aiAuthRequirement) return { type: 'error', code: 'CLAUDE_ORGANIZATION_RESUME_REQUIRED'", live)
+    expect(refusal).toBeGreaterThan(live)
+    expect(refusal).toBeLessThan(reuse)
+  })
+
+  // Review #976: the check above runs only for the caller that starts the attempt, not for one that joins it.
+  it('never lets a requirement resume join one already in flight', async () => {
+    expect(await runSource()).toContain('shareResumeInFlight(resumeInFlight, happySessionId, options?.aiAuthRequirement, () => spawnResumedSession(happySessionId, options))')
+  })
 })

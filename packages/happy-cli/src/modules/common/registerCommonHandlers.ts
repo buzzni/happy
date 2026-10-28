@@ -468,6 +468,11 @@ export type ResumeSessionErrorCode =
     | 'SESSION_DIRECTORY_MISSING'
     | 'SESSION_NATIVE_SESSION_MISSING'
     | 'MCP_CALLER_GRANT_REJECTED'
+    /**
+     * Saycode specs/claude-org-personal-coexistence I — the recorded binding cannot vouch for the process this resume would
+     * use: no record of the required organization, another organization, or a live child. Nothing ran.
+     */
+    | 'CLAUDE_ORGANIZATION_RESUME_REQUIRED'
     | 'SESSION_RESUME_FAILED';
 
 export type ResumeSessionResult =
