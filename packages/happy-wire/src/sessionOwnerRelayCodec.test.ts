@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import nacl from 'tweetnacl';
 import fixture from './fixtures/sessionOwnerRelay.v1.json';
 import { verifyOwnership } from './sessionOwnership';
+import { SessionMessageSchema } from './messages';
 import { rotationBase64url, rotationDecodeBinary } from './sharedMachineRotation';
 import { OwnerRelayRequestSchema, OwnerRelayReplySchema } from './sessionOwnerRelay';
 import { signOwnerRelayRequest, signOwnerRelayReply, verifyOwnerRelayRequest, verifyOwnerRelayReply,
@@ -122,4 +123,40 @@ it.each([0, 1, 3, 4, 5, 6, 7])('rejects a correctly signed receipt for another t
     else changed.childSpawn.parentSessionId = 'another';
     const c = i === 1 ? fixture.personalContact : contact;
     expect(await verifyOwnerRelayReply(signOwnerRelayReply(changed, desktop.secretKey), request, c, now)).toBe(false);
+});
+
+// H1-R-01: reads preserve persisted envelope IDs; prompt IDs are a separate contract.
+describe('H1-R-01 persisted message localId compatibility', () => {
+    it.each([
+        ['Unicode', '기존메시지'],
+        ['spaces', 'existing message'],
+        ['Unicode and spaces', '기존 메시지'],
+        ['over 128 characters', 'x'.repeat(129)],
+        ['null', null],
+        ['omitted', undefined],
+        ['empty string', ''],
+        ['prompt-compatible', 'uuid'],
+    ] as const)('read signing and codec preserve %s', async (_label, localId) => {
+        const stored = SessionMessageSchema.parse({
+            id: 'legacy-message', seq: 1, createdAt: 1, updatedAt: 1,
+            ...(localId === undefined ? {} : { localId }),
+            content: { t: 'encrypted', c: 'stored-ciphertext' },
+        });
+        const event = { ...stored, content: { role: 'user', content: { type: 'text', text: '기존 내용' } } };
+        const { request, reply } = await pair(1);
+        if (reply.result !== 'allowed' || reply.operation !== 'read-session') throw new Error('Expected read fixture');
+        const signed = signOwnerRelayReply({ ...reply, sessionView: { ...reply.sessionView, events: [event] } }, desktop.secretKey);
+        const decoded = decodeOwnerRelayReply(encodeOwnerRelayReply(signed));
+        expect(decoded).toEqual(signed);
+        if (decoded.result !== 'allowed' || decoded.operation !== 'read-session') throw new Error('Expected read reply');
+        expect(decoded.sessionView.events).toEqual([event]);
+        expect(await verifyOwnerRelayReply(decoded, request, fixture.personalContact, now)).toBe(true);
+        decoded.sessionView.events[0].localId = 'unsigned-change';
+        expect(await verifyOwnerRelayReply(decoded, request, fixture.personalContact, now)).toBe(false);
+    });
+    it.each(['기존 메시지', 'existing message', 'x'.repeat(129)])('keeps prompt and storage ID restrictions for %s', localId => {
+        expect(OwnerRelayRequestSchema.safeParse({ ...fixture.vectors[2].request, localId }).success).toBe(false);
+        const reply = fixture.vectors[2].reply;
+        expect(OwnerRelayReplySchema.safeParse({ ...reply, storage: { ...reply.storage, localId } }).success).toBe(false);
+    });
 });

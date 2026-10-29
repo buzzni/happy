@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { ownershipId as id, ownershipHash } from './sessionOwnership';
-import { MessageMetaSchema, MessageContentSchema, type MessageContent } from './messages';
+import { MessageMetaSchema, MessageContentSchema, SessionMessageSchema, type MessageContent } from './messages';
 import { hubPromptGuardSchema } from './sessionProtocol';
 
 export const relayCount = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
@@ -53,7 +53,7 @@ export const OwnerRelaySnapshotSchema = z.object({ active: z.boolean().nullable(
 // Validate the existing message union, but preserve legacy/event extension data for signing and
 // transcript fidelity. A normal parse would silently strip fields belonging to existing producers.
 const content = z.custom<MessageContent>(value => MessageContentSchema.safeParse(value).success);
-export const OwnerRelayReadEventSchema = z.object({ id, seq: relayCount, localId: relayLocalId.nullish(),
+export const OwnerRelayReadEventSchema = z.object({ id, seq: relayCount, localId: SessionMessageSchema.shape.localId,
     content, createdAt: relayCount, updatedAt: relayCount,
 }).strict();
 // Mirrors daemon/ownedSpawnRuntime.ts's supported options; no arbitrary argv, executable or RPC.

@@ -121,11 +121,25 @@ H2 이후: 신뢰할 caller/contact 연결, 실제 nonce 재사용 방지, owner
   최종적으로 `pnpm --filter @slopus/happy-wire install --frozen-lockfile
   --store-dir node_modules/.pnpm-store --ignore-scripts`를 사용했다. 모든 설치 산출물은 Git 제외다.
 
-커밋 차단 (2026-10-30): 구현과 검증은 완료했으나 `git add`/`git commit`은
-`/home/walter/workspace/happy/.git/worktrees/happy-wt-rn-t1cb2-h1/index.lock` 생성 시
-`Read-only file system`으로 실패했다. 새 작업트리의 `.git` 포인터가 여전히 그 경로를
-사용한다. 변경은 이 작업트리에 unstaged/untracked로 보존돼 있으며 신규 커밋은 없다.
-Git metadata의 쓰기 가능한 연결이 준비되면 위 9개 변경 파일만 stage하고
-`[behavioral] owner-relay-v1 strict wire와 서명 codec 추가`로 커밋한다.
-코드가 바뀌지 않았다면 통과한 테스트를 반복할 필요는 없다. Git 구조 재작성·다른 저장소
-수정·push/PR/merge/태그/릴리스·자식 세션 생성은 하지 않았다.
+초기 커밋은 Git metadata가 읽기 전용이라 이 세션에서 만들지 못했다.
+지휘 세션이 같은 작업트리의 H1 변경을 `e2b2dd3e`로 커밋했다.
+
+## H1-R-01 교차 리뷰 반영 (2026-10-30)
+
+read 이벤트의 localId에 prompt 전용 ASCII/1–128자 제한을 적용한 결함을 수정했다.
+`OwnerRelayReadEventSchema`는 이제 `SessionMessageSchema.shape.localId`를 직접 재사용한다.
+기존 메시지의 Unicode·공백·긴 localId를 보존하며 prompt 요청/저장 receipt의 제한은 유지한다.
+
+회귀 테스트는 기존 SessionMessageSchema에서 허용한 행을 복호화 메시지 형태로 옮겨
+read 응답 서명 → encode → decode → 서명 검증까지 통과하는지 확인한다. Unicode,
+공백, 두 조건의 조합, 129자, null, 생략, 빈 문자열(기존 read schema가 허용), 일반 ID
+8건을 포함하며 localId 변조 시 서명 검증 실패도 확인한다. 별도 3건으로 prompt/receipt의
+기존 제한을 검증한다. 새 쓰기 API가 빈 문자열을 받도록 바꾼 것은 아니다.
+
+- 수정 전: 추가 테스트 **5 실패 / 6 통과** (기존 45건은 `-t H1-R-01`로 미선택).
+- 수정 후: 추가 테스트 **11건 통과**.
+- 수정한 schema 한 줄을 원래대로 되돌렸을 때 **동일한 5건 실패**를 확인한 뒤 수정본 복원.
+- 최종: `pnpm -C packages/happy-wire exec vitest run src/sessionOwnerRelay.test.ts
+  src/sessionOwnerRelayCodec.test.ts src/messages.test.ts` — **3개 파일 / 115건 통과**.
+- `pnpm -C packages/happy-wire run typecheck`, `git diff --check` 통과.
+- 사용자 지시대로 파일만 수정했다. 이 후속 변경의 커밋은 지휘 세션이 맡는다.
