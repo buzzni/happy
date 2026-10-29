@@ -955,4 +955,26 @@ describe('organization authentication failure recovery the member can take', () 
         // Personal availability is not asked where personal Claude is off.
         expect(requestSetupTokenAvailability).not.toHaveBeenCalled();
     });
+
+    it.each(['STUDIO_UNAVAILABLE', 'UNSUPPORTED', 'ROTATION_LIMIT', 'NOT_BOUND', 'STALE'])('offers no organization switch that cannot pass after %s', async reason => {
+        vi.mocked(requestSetupTokenRebind).mockReset().mockResolvedValue({ ok: false, reason });
+        let none: any;
+        const h = harness(async rpc => { none = await offerOf(rpc, 'none'); await rpc({ action: 'retry' }); });
+        await h.run();
+        expect(none).toEqual({ state: 'none' });
+    });
+
+    it('keeps the personal Claude offer when this binding cannot rotate', async () => {
+        vi.mocked(requestSetupTokenRebind).mockReset().mockResolvedValue({ ok: false, reason: 'STUDIO_UNAVAILABLE' });
+        vi.mocked(requestSetupTokenAvailability).mockImplementation(async (_id, _binding, consent) => ({ allLimited: false, availableAccountIds: [], consentApproved: !!consent, fallbackReason: 'organization-authentication' as const }));
+        vi.mocked(readPersonalClaudeCredential).mockResolvedValue({ accountRef: 'a'.repeat(64), label: 'pe…@example.test', accessToken: 'fixture-personal', expiresAt: Date.now() + 600000 });
+        let offer: any;
+        const h = harness(async rpc => {
+            await vi.waitFor(async () => { offer = (await rpc({ action: 'status' })).offer; expect(offer?.state).toBe('offer'); });
+            await rpc({ action: 'retry' });
+        });
+        await h.run();
+        expect(offer).toMatchObject({ state: 'offer' });
+        expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1);
+    });
 });

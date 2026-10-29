@@ -509,9 +509,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     const clearAuthenticationFailure = () => { lastOrganizationAuthenticationFailed = false; personalFallback?.noteOrganizationAuthentication(false); };
     /** The automatic switch after the failure is still running: it answers before the member is offered anything. */
     const organizationSwitchPending = () => authenticationRefused() && !!setupTokenSwitching?.canSwitch() && setupTokenSwitching.lastFailure() === null;
-    /** The automatic switch could not bind yet another account may: the member can ask again now; none left is said instead. */
+    /**
+     * The automatic switch could not bind yet another account may: the member can ask again now. None left, or a binding
+     * that cannot rotate, falls through to the personal offer or none.
+     */
     const organizationSwitchOffered = () => authenticationRefused() && !!setupTokenSwitching?.canSwitch()
-        && !['NO_ACCOUNT', null].includes(setupTokenSwitching.lastFailure());
+        && setupTokenSwitching.lastFailureMayPass();
     const wakeOrganizationRecovery = () => { organizationRecoveryWake.abort(); organizationRecoveryWake = new AbortController(); };
     let providerCredentialGeneration = 0;
     const setupTokenSwitching = runningAuthority() ? createSetupTokenAccountSwitching({
