@@ -36,6 +36,21 @@ describe('personal desktop runtime bootstrap', () => {
             brokerSocket: '/Users/u/Library/Application Support/Saycode/browser-runtime/run/broker.sock' })
         expect(personalRuntimePaths('win32', { LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local' }).profileDir).toBe('C:\\Users\\u\\AppData\\Local\\Saycode\\browser-runtime\\profile')
         expect(() => personalRuntimePaths('win32', {})).toThrow(/application directory/)
+        const windows = personalRuntimePaths('win32', { LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local' })
+        expect(windows.brokerSocket).toMatch(/^\\\\\.\\pipe\\saycode-browser-runtime-[0-9a-f]{16}-broker$/)
+        expect(windows.adminSocket).toBe(windows.brokerSocket.replace(/-broker$/, '-admin'))
+        expect(personalRuntimePaths('win32', { LOCALAPPDATA: 'C:\\Users\\other\\AppData\\Local' }).brokerSocket).not.toBe(windows.brokerSocket)
+    })
+
+    it('runs a Windows browser as the runtime token user, with named pipes and no POSIX ownership checks', async () => {
+        const windowsPaths = personalRuntimePaths('win32', { LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local' })
+        const windowsConfig = { ...config(), personalDesktop: { platform: 'win32' as const, browserExecutable: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe' } }
+        const { deps } = harness({ platform: 'win32', uid: undefined, identity: 'S-1-5-21-1-2-3-1001',
+            env: { ABP_CONFIG_FILE: windowsPaths.configFile, LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local' } })
+        const runtime = await bootstrapPersonalDesktopRuntime(windowsConfig, windowsPaths.stateDir, deps)
+        expect(runtime.sockets).toEqual({ broker: windowsPaths.brokerSocket, admin: windowsPaths.adminSocket })
+        expect(deps.prepareDirectory).toHaveBeenCalledWith(windowsPaths.profileDir, undefined)
+        expect(deps.openSession).toHaveBeenCalledWith(expect.objectContaining({ protection: { mode: 'basic', identity: 'S-1-5-21-1-2-3-1001' } }))
     })
 
     it('prepares private directories, verifies the browser, locks, then opens a same-user session on the dedicated profile', async () => {

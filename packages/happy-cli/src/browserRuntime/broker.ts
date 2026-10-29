@@ -525,6 +525,16 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
  * run is removed; any other file type at the path is refused.
  */
 export async function listenOnSocket(server: ReturnType<typeof createServer>, socketPath: string, mode: number, gid?: number): Promise<void> {
+    // A Windows named pipe has no file to replace or chmod; a pipe name already served by
+    // another process fails to bind (first instance), never shared.
+    if (/^\\\\[.?]\\pipe\\/i.test(socketPath)) {
+        if (gid !== undefined) throw new Error('ABP named pipes take no socket group')
+        await new Promise<void>((resolve, reject) => {
+            server.once('error', reject)
+            server.listen(socketPath, () => { server.off('error', reject); resolve() })
+        })
+        return
+    }
     await mkdir(join(socketPath, '..'), { recursive: true })
     try {
         if (!(await lstat(socketPath)).isSocket()) throw new Error(`ABP socket path is not a socket: ${socketPath}`)

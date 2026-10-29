@@ -1,5 +1,6 @@
 import { spawn as spawnProcess, type ChildProcess } from 'node:child_process'
 import type { Readable, Writable } from 'node:stream'
+import { enterNativeOwnedJob, type NativeOwnedJob } from './nativeHostPrimitives'
 
 /** Variables the browser may see. Everything else (Saycode credentials, provider keys,
  * NODE_OPTIONS, proxies) stays with the runtime; values are copied, never invented. */
@@ -54,6 +55,18 @@ export function processGroupTree(pgid: number, leaderExited: () => boolean, kill
     }
 }
 
+/** Windows: the runtime's own kill-on-close job holds the browser tree. The browser is ended
+ * through libuv's original process handle, then the remaining members still in the job. */
+export function ownedJobTree(child: Pick<ChildProcess, 'kill' | 'exitCode' | 'signalCode'>, job: NativeOwnedJob): PersonalProcessTree {
+    return {
+        signal(signal) {
+            if (child.exitCode === null && child.signalCode === null) child.kill()
+            if (signal === 'SIGKILL') job.terminateMembers()
+        },
+        alive: () => job.members().length > 0,
+    }
+}
+
 export interface PersonalBrowserLaunchOptions {
     platform: 'darwin' | 'win32'
     executable: string
@@ -66,6 +79,8 @@ export interface PersonalBrowserLaunchOptions {
 
 export interface PersonalBrowserLaunchDependencies {
     spawn?: typeof spawnProcess
+    /** Windows: joined before the browser starts so the browser is born inside it. */
+    job?: () => NativeOwnedJob
     tree?: (child: ChildProcess) => PersonalProcessTree
     pollMs?: number
 }
@@ -83,10 +98,11 @@ export interface PersonalBrowser {
  * including when the runtime is killed. */
 export async function launchPersonalBrowser(options: PersonalBrowserLaunchOptions, dependencies: PersonalBrowserLaunchDependencies = {}): Promise<PersonalBrowser> {
     const { platform, executable, profileDir } = options
-    if (platform !== 'darwin') throw new Error('PERSONAL_BROWSER_UNSUPPORTED')
+    const job = platform === 'win32' ? (dependencies.job ?? enterNativeOwnedJob)() : undefined
     const termGrace = options.termGraceMs ?? 5000, killGrace = options.killGraceMs ?? 3000, poll = dependencies.pollMs ?? 100
     const child = (dependencies.spawn ?? spawnProcess)(executable, personalBrowserArgs(platform, profileDir), {
-        detached: true, env: personalBrowserEnv(platform, options.env), stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'],
+        // macOS: a new process group. Windows: the inherited job, not a detached console group.
+        detached: platform === 'darwin', env: personalBrowserEnv(platform, options.env), stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'],
     })
     const started = new Promise<void>((resolve, reject) => {
         child.once('spawn', resolve)
@@ -97,7 +113,7 @@ export async function launchPersonalBrowser(options: PersonalBrowserLaunchOption
     if (!pid) throw new Error('PERSONAL_BROWSER_EXITED')
     let leaderExited = false
     child.once('exit', () => { leaderExited = true })
-    const tree = (dependencies.tree ?? (() => processGroupTree(pid, () => leaderExited)))(child)
+    const tree = (dependencies.tree ?? (() => job ? ownedJobTree(child, job) : processGroupTree(pid, () => leaderExited)))(child)
     const input = child.stdio[3] as Writable, output = child.stdio[4] as Readable
     input.on('error', () => {}) // Pipe loss is observed by the session as EOF.
     const settled = async (ms: number) => {

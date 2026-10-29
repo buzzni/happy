@@ -15,6 +15,9 @@ interface NativeHostBinding {
     verifyPrivateDirectory(fd: number, uid: number): void
     verifyPublicDirectory(fd: number, uid: number): void
     dropMacIdentity(uid: number, gid: number): void
+    enterOwnedJob(): void
+    jobMembers(): number[]
+    terminateJobMembers(): void
 }
 let binding: NativeHostBinding | undefined
 export function nativeHostBindingPath(): string {
@@ -107,4 +110,22 @@ export async function acquireNativeWriterLock(path: string): Promise<{ close(): 
         const held = file
         return { close: () => closing ??= held.close() }
     } catch (error) { await file?.close(); throw error }
+}
+
+/** Windows personal runtime: this process and every process it starts later belong to one
+ * kill-on-close job held only by this process. Joined once, before the browser starts. */
+export interface NativeOwnedJob {
+    /** Other processes still in the job; throws when the job cannot be read. */
+    members(): number[]
+    /** Ends the other members still confirmed in the job; never acts on a bare PID. */
+    terminateMembers(): void
+}
+let ownedJob: NativeOwnedJob | undefined
+export function enterNativeOwnedJob(): NativeOwnedJob {
+    if (process.platform !== 'win32') throw new Error('NATIVE_JOB_UNSUPPORTED')
+    if (!ownedJob) {
+        native().enterOwnedJob()
+        ownedJob = { members: () => native().jobMembers(), terminateMembers: () => native().terminateJobMembers() }
+    }
+    return ownedJob
 }

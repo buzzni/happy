@@ -324,6 +324,87 @@ static napi_value boot_id(napi_env env, napi_callback_info info) {
     return text(env, value);
 }
 
+#ifdef _WIN32
+/* Personal desktop: the runtime joins its own kill-on-close job before it starts the
+ * browser, so the whole browser tree ends with the runtime even after a hard crash.
+ * The handle is not inheritable and is never closed by this process. */
+static HANDLE owned_job = NULL;
+typedef struct { JOBOBJECT_BASIC_PROCESS_ID_LIST list; ULONG_PTR more[1023]; } job_ids;
+static int read_job_ids(job_ids *ids) {
+    memset(ids, 0, sizeof(*ids));
+    return owned_job && QueryInformationJobObject(owned_job, JobObjectBasicProcessIdList, ids, sizeof(*ids), NULL) &&
+        ids->list.NumberOfProcessIdsInList == ids->list.NumberOfAssignedProcesses;
+}
+#endif
+
+static napi_value enter_owned_job(napi_env env, napi_callback_info info) {
+    (void)info;
+#ifdef _WIN32
+    if (owned_job) return error(env, "NATIVE_JOB_EXISTS");
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+    memset(&limits, 0, sizeof(limits));
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE; /* no breakaway */
+    HANDLE job = CreateJobObjectW(NULL, NULL);
+    if (!job || !SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) ||
+        !AssignProcessToJobObject(job, GetCurrentProcess())) {
+        if (job) CloseHandle(job);
+        return error(env, "NATIVE_JOB_FAILED");
+    }
+    owned_job = job;
+    napi_value result; napi_get_undefined(env, &result); return result;
+#else
+    return error(env, "NATIVE_JOB_UNSUPPORTED");
+#endif
+}
+
+/* Process ids in the owned job other than this process. */
+static napi_value job_members(napi_env env, napi_callback_info info) {
+    (void)info;
+#ifdef _WIN32
+    job_ids ids;
+    if (!read_job_ids(&ids)) return error(env, "NATIVE_JOB_UNKNOWN");
+    napi_value result;
+    if (napi_create_array(env, &result) != napi_ok) return error(env, "NATIVE_RESULT_FAILED");
+    uint32_t index = 0;
+    DWORD self = GetCurrentProcessId();
+    for (DWORD i = 0; i < ids.list.NumberOfProcessIdsInList; ++i) {
+        DWORD pid = (DWORD)ids.list.ProcessIdList[i];
+        if (pid == self) continue;
+        napi_value value;
+        if (napi_create_uint32(env, pid, &value) != napi_ok || napi_set_element(env, result, index++, value) != napi_ok)
+            return error(env, "NATIVE_RESULT_FAILED");
+    }
+    return result;
+#else
+    return error(env, "NATIVE_JOB_UNSUPPORTED");
+#endif
+}
+
+/* Terminates the other members. A listed id is opened and confirmed to still be in the
+ * owned job before termination, so a reused id of an unrelated process is never killed.
+ * A member that cannot be opened or ended stays listed; the caller's membership poll,
+ * not this call, decides whether the tree is gone. */
+static napi_value terminate_job_members(napi_env env, napi_callback_info info) {
+    (void)info;
+#ifdef _WIN32
+    job_ids ids;
+    if (!read_job_ids(&ids)) return error(env, "NATIVE_JOB_UNKNOWN");
+    DWORD self = GetCurrentProcessId();
+    for (DWORD i = 0; i < ids.list.NumberOfProcessIdsInList; ++i) {
+        DWORD pid = (DWORD)ids.list.ProcessIdList[i];
+        if (pid == self) continue;
+        HANDLE process = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!process) continue;
+        BOOL member = FALSE;
+        if (IsProcessInJob(process, owned_job, &member) && member) TerminateProcess(process, 1);
+        CloseHandle(process);
+    }
+    napi_value result; napi_get_undefined(env, &result); return result;
+#else
+    return error(env, "NATIVE_JOB_UNSUPPORTED");
+#endif
+}
+
 static napi_value initialize(napi_env env, napi_value exports) {
     napi_property_descriptor properties[] = {
         {"lockWriter", NULL, lock_writer, NULL, NULL, NULL, napi_default, NULL},
@@ -335,6 +416,9 @@ static napi_value initialize(napi_env env, napi_value exports) {
         {"verifyPrivateDirectory", NULL, verify_private_directory, NULL, NULL, NULL, napi_default, NULL},
         {"verifyPublicDirectory", NULL, verify_public_directory, NULL, NULL, NULL, napi_default, NULL},
         {"dropMacIdentity", NULL, drop_mac_identity, NULL, NULL, NULL, napi_default, NULL},
+        {"enterOwnedJob", NULL, enter_owned_job, NULL, NULL, NULL, napi_default, NULL},
+        {"jobMembers", NULL, job_members, NULL, NULL, NULL, napi_default, NULL},
+        {"terminateJobMembers", NULL, terminate_job_members, NULL, NULL, NULL, napi_default, NULL},
     };
     if (napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties) != napi_ok) return error(env, "NATIVE_INIT_FAILED");
     return exports;

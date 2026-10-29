@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import { describe, expect, it, vi } from 'vitest'
-import { launchPersonalBrowser, personalBrowserArgs, personalBrowserEnv, processGroupTree, type PersonalProcessTree } from './personalBrowserProcess'
+import { launchPersonalBrowser, ownedJobTree, personalBrowserArgs, personalBrowserEnv, processGroupTree, type PersonalProcessTree } from './personalBrowserProcess'
 
 function fakeChild(pid: number | undefined) {
     const child = Object.assign(new EventEmitter(), { pid, stdio: [null, null, null, new PassThrough(), new PassThrough()] })
@@ -72,8 +72,32 @@ describe('personal browser launch', () => {
         expect(() => processGroupTree(1, () => true)).toThrow('PERSONAL_BROWSER_EXITED')
     })
 
-    it('does not start on a platform whose process-tree custody is not wired yet', async () => {
-        await expect(launchPersonalBrowser({ platform: 'win32', executable: 'C:\\c.exe', profileDir: 'C:\\p', env: {} }, { spawn: vi.fn() as never }))
-            .rejects.toThrow('PERSONAL_BROWSER_UNSUPPORTED')
+    it('joins the owned job before the Windows browser starts, without a detached console group', async () => {
+        const order: string[] = []
+        const spawn = vi.fn(() => { order.push('spawn'); return fakeChild(31) })
+        const job = { members: () => [], terminateMembers: vi.fn() }
+        await launchPersonalBrowser({ platform: 'win32', executable: 'C:\\c.exe', profileDir: 'C:\\p', env: { SystemRoot: 'C:\\Windows' } },
+            { spawn: spawn as never, job: () => { order.push('job'); return job } })
+        expect(order).toEqual(['job', 'spawn'])
+        const [, , options] = spawn.mock.calls[0] as unknown as [string, string[], { detached: boolean }]
+        expect(options.detached).toBe(false)
+    })
+
+    it('ends the Windows browser through its own handle, then the members still confirmed in the job', () => {
+        const child = { kill: vi.fn(), exitCode: null, signalCode: null }
+        let members = [31, 32]
+        const job = { members: () => members, terminateMembers: vi.fn(() => { members = [] }) }
+        const tree = ownedJobTree(child as never, job)
+        expect(tree.alive()).toBe(true)
+        tree.signal('SIGTERM')
+        expect(child.kill).toHaveBeenCalledTimes(1)
+        expect(job.terminateMembers).not.toHaveBeenCalled()
+        tree.signal('SIGKILL')
+        expect(job.terminateMembers).toHaveBeenCalledTimes(1)
+        expect(tree.alive()).toBe(false)
+        // An exited browser is not signalled again through a stale handle.
+        const exited = { kill: vi.fn(), exitCode: 0, signalCode: null }
+        ownedJobTree(exited as never, job).signal('SIGTERM')
+        expect(exited.kill).not.toHaveBeenCalled()
     })
 })
