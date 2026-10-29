@@ -4,7 +4,7 @@ import { BrowserRuntimeError, POC_LIMITS, SCHEMA_VERSION, TERMINAL_STATUSES, typ
     type BatchResult, type BatchStep, type BrowserDriver, type BrowserInstanceId, type BrowserRuntimeApi, type GrantId,
         type ApproveResult, type ControlResult, type RuntimeErrorBody, type SnapshotId, type InputOwner, type Operation,
             type PrincipalId, type ProfileId, type RequestId, type TaskEvent, type TaskId, type TaskSpaceId, type TaskView, type TaskStatus,
-                type TabId, type ApprovalId, type ActionObservations, type ActionReceipt,
+                type TabId, type ApprovalId, type ActionObservations, type ActionReceipt, type HandoffDetail, type HandoffReason,
                 type DispatchExpectation, type ElementDescription, type ElementRef, type Observation, type ScreenshotResult, type SubscribeResult } from './contracts'
 import { assertOperation } from './auth'
 import { quotaPreferenceKey, resourceAdmissionLimit, type QuotaReading } from './resourceQuota'
@@ -918,16 +918,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 continue
             }
             const previousStatus = task.previousDriverStatus as TaskStatus | undefined
-            const writes = inFlightWriteActions(task)
-            const workerExists = this.workers.has(task.taskId)
-            const previous: TaskStatus = task.pauseReason === 'outcome-unknown' || writes.length
-                || previousStatus === 'running' && !workerExists ? 'paused' : previousStatus ?? 'paused'
-            const pauseReason = writes.length || task.pauseReason === 'outcome-unknown'
-                ? 'outcome-unknown' : previousStatus === 'running' && !workerExists ? 'awaiting-agent' : task.pauseReason
-            const patch: Partial<StoredTask> = previous === 'paused'
-                ? { status: previous, pauseReason: pauseReason ?? 'awaiting-agent' as const,
-                    ...(writes.length ? { uncertainActions: [...new Set([...task.uncertainActions, ...writes])] } : {}) }
-                : { status: previous, pauseReason: undefined }
+            const patch = statusAfterDisconnect(task, this.workers.has(task.taskId))
             // A batch the agent was waiting on ended with the disconnect: the agent must re-plan.
             await this.commit(task, { ...patch, previousDriverStatus: undefined }, 'recovered', { driver: 'reconnected',
                 browserReplaced: false, ...(previousStatus === 'running' && patch.status === 'paused' ? { attention: 'recovered' } : {}) })
@@ -1311,6 +1302,11 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 // in between would mark a replaced browser's task as merely waiting for the agent.
                 if (current.status === 'recovering' && !this.workers.has(current.taskId) && driverConnected
                     && !this.reconnecting.has(current.profileId)) {
+                    // Not running when the connection dropped (waiting for the user, under their control, paused): back to
+                    // that state, as on a reconnect. Nothing ran, so nothing is fenced.
+                    if (wasIdleAtDisconnect(current))
+                        return { patch: { ...statusAfterDisconnect(current, false), previousDriverStatus: undefined },
+                            event: this.event('recovered', { recoveredWithoutWorker: true, uncertainActions: [] }, current.stateVersion + 1) }
                     const writes = inFlightWriteActions(current)
                     const actions = { ...current.actions }
                     for (const actionId of writes)
@@ -1345,8 +1341,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         return null
                     // The user finished a login or hand-off and nothing runs until the agent resumes (with a new grant,
                     // which resume accepts from here). Keep that record instead of turning it into a new wait.
-                    if (reason === 'grant-expired' && current.status === 'paused' && current.pauseReason === 'user-input-complete'
-                        && !revokedActionIds.length)
+                    if (reason === 'grant-expired' && userReturned(current) && !revokedActionIds.length)
                         return null
                     fenceReason = reason
                     // The grant is no longer live: a write whose input gate is still closed is refused at it.
@@ -1356,11 +1351,11 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     // digest and expiry; any later dispatch revalidates both under a live grant.
                     const approvals = current.approvals
                     return {
-                        patch: { status: 'paused', pauseReason: uncertainWrites.length ? 'outcome-unknown' : reason, actions,
+                        patch: scopeHandoff(current, { status: 'paused', pauseReason: uncertainWrites.length ? 'outcome-unknown' : reason, actions,
                             ...(uncertainWrites.length ? { uncertainActions: [...new Set([...current.uncertainActions,
                                 ...uncertainWrites])] } : {}),
                             approvals,
-                            ...(reason === 'approval-expired' ? { pendingApproval: undefined } : {}) },
+                            ...(reason === 'approval-expired' ? { pendingApproval: undefined } : {}) }),
                         event: this.event('state-changed', { pauseReason: reason }, current.stateVersion + 1),
                     }
                 }
@@ -1761,6 +1756,11 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             throw new BrowserRuntimeError('CONFLICT', 'Task is not resumable')
         if (auth.credential.kind !== 'agent-grant')
             throw new BrowserRuntimeError('SCOPE_DENIED', 'Agent grant required to resume')
+        // A user wait parked for its expired grant is still the user's: a live grant rebinds it, it never stands in
+        // for the user's return (as for an approval above).
+        if (task.pauseReason === 'grant-expired' && task.waitReason && task.waitReason !== 'approval')
+            return this.view(await this.commit(task, { status: 'awaiting-user', pauseReason: undefined, agentGrant: auth.credential },
+                'state-changed', { status: 'awaiting-user', waitReason: task.waitReason }))
         if (task.pauseReason === 'user-input-complete' && task.waitReason) {
             if (Number(task.waitExpiresAtMs ?? 0) > 0 && this.clock.now() > Number(task.waitExpiresAtMs))
                 return this.view(await this.commit(task, { status: 'paused', pauseReason: 'user-wait-expired' }, 'state-changed',
@@ -1822,8 +1822,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             for (const tab of task.tabs)
                 if (!driver.hasTab(tab))
                     throw new BrowserRuntimeError('TARGET_GONE', 'Task tabs were lost with the browser instance')
-            return this.view(await this.commit(task, { status: 'paused', pauseReason: 'awaiting-agent',
-                browserInstanceId: driver.browserInstanceId() }, 'recovered', { browserInstanceId: driver.browserInstanceId() }))
+            // A user wait ended with the browser: not kept, so that a later grant expiry cannot park the task on it again.
+            return this.view(await this.commit(task, { status: 'paused', pauseReason: 'awaiting-agent', waitReason: undefined,
+                waitCompletion: undefined, waitExpiresAtMs: undefined, browserInstanceId: driver.browserInstanceId() }, 'recovered',
+                { browserInstanceId: driver.browserInstanceId() }))
         }
         if (task.pauseReason === 'awaiting-agent')
             return this.view(task)
@@ -2471,8 +2473,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 patch = unresolved.length ? { status: 'paused', pauseReason: 'cancelled-with-unknown-effect',
                     uncertainActions: unresolved, actions } : { status: 'cancelled' }
             }
-            else if (!taskGrant || taskGrant.expiresAtMs <= this.clock.now()
-                || this.options.store.isRevoked(taskGrant.grantId) || revokedSegmentActions.length) {
+            // A wait the user already gave back stays given back when only the grant ended (as in the sweep): the agent
+            // resumes it with a new grant. The browser, pending-write and revoked-segment checks still apply.
+            else if (((!taskGrant || taskGrant.expiresAtMs <= this.clock.now() || this.options.store.isRevoked(taskGrant.grantId))
+                && !userReturned(task)) || revokedSegmentActions.length) {
                 const approvals = task.approvals
                 const awaitingApproval = task.waitReason === 'approval'
                     && Object.values(approvals).some((approval) => approval.state === 'pending')
@@ -2494,6 +2498,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 patch = { status: 'paused', pauseReason: 'outcome-unknown', uncertainActions: [...new Set([...task.uncertainActions,
                     ...pendingWrites.map(([id]) => id as ActionId)])], actions, ...batchPatch }
             }
+            // Its connection dropped while it was not running: back to that state, as on a reconnect. A user wait or the
+            // user's control does not end because the Runtime restarted.
+            else if (task.status === 'recovering' && wasIdleAtDisconnect(task))
+                patch = { ...statusAfterDisconnect(task, false), previousDriverStatus: undefined, actions }
             else if (task.status === 'running' || task.status === 'recovering') {
                 patch = {
                     status: 'paused',
@@ -2543,20 +2551,28 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const receipts = new Map<ActionId, ActionReceipt>()
         const receiptOf = (actionId: ActionId) => receipts.has(actionId) ? { receipt: receipts.get(actionId)! } : {}
         let preserveLeases = false
-        /** The step is not executed; the task waits for the user (takeover), then the agent re-observes. */
-        const handOff = async (current: StoredTask, step: BatchStep, index: number, leaseEpoch: number, reason: BrowserRuntimeError) => {
+        /**
+         * The task waits for the user (takeover), then the agent re-observes. With `refused`, the step is not executed
+         * (the batch continues at it); without, it was done and the batch continues after it.
+         */
+        const handOff = async (current: StoredTask, step: BatchStep, index: number, leaseEpoch: number, reason: HandoffReason,
+            refused?: BrowserRuntimeError) => {
             await this.retainTab(current.taskSpaceId, step.tabId, current.taskId, 'handoff')
+            const handoff: HandoffDetail = { reason, tabId: step.tabId, actionId: step.actionId, atMs: this.clock.now() }
             const waiting = await this.commit(current, {
                 status: 'awaiting-user',
                 waitReason: 'handoff',
+                handoff,
                 waitExpiresAtMs: this.clock.now() + POC_LIMITS.userWaitMs,
-                waitCompletion: { batchId, nextStep: index, tabId: step.tabId, handoff: true },
-                actions: { ...current.actions, [step.actionId]: { ...current.actions[step.actionId], state: 'failed' } },
-            }, 'state-changed', { status: 'awaiting-user', waitReason: 'handoff', actionId: step.actionId, error: safeError(reason) }, leaseEpoch)
+                waitCompletion: { batchId, nextStep: refused ? index : index + 1, tabId: step.tabId, handoff: true },
+                ...(refused ? { actions: { ...current.actions, [step.actionId]: { ...current.actions[step.actionId], state: 'failed' } } } : {}),
+            }, 'state-changed', { status: 'awaiting-user', waitReason: 'handoff', handoff: reason, actionId: step.actionId,
+                ...(refused ? { error: safeError(refused) } : {}) }, leaseEpoch)
             preserveLeases = true
-            results.push({ stepId: step.stepId, actionId: step.actionId, outcome: 'awaiting-user', error: safeError(reason) })
+            if (refused)
+                results.push({ stepId: step.stepId, actionId: step.actionId, outcome: 'awaiting-user', error: safeError(refused) })
             return this.saveBatchResult(waiting, batchId, { batchId, taskId: waiting.taskId, outcome: 'awaiting-user', completedSteps,
-                mayHaveSideEffects: false, lastCheckpointSeq: waiting.highWatermarkSeq + 1, steps: results, waitReason: 'handoff' })
+                mayHaveSideEffects: false, lastCheckpointSeq: waiting.highWatermarkSeq + 1, steps: results, waitReason: 'handoff', handoff })
         }
         try {
             for (let index = fromIndex; index < steps.length; index++) {
@@ -2745,9 +2761,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval binding changed before dispatch')
                 }
                 // Nothing to bind an approval to (a navigation) or nothing that can be bound: the user does it.
+                // 'handoff' is a form the digest cannot bind; a held navigation is the site policy's.
                 if (decision === 'handoff' || (step.kind === 'navigate' && decision === 'requires-approval'))
-                    return handOff(task, step, index, leaseEpoch, new BrowserRuntimeError('APPROVAL_REQUIRED',
-                        'Site policy hands this action to the user', false, false))
+                    return handOff(task, step, index, leaseEpoch, decision === 'handoff' ? 'manual-control' : 'permission',
+                        new BrowserRuntimeError('APPROVAL_REQUIRED', 'Site policy hands this action to the user', false, false))
                 if (['click', 'fill'].includes(step.kind) && decision === 'requires-approval') {
                     const expiresAtMs = this.clock.now() + POC_LIMITS.userWaitMs
                     const approval = createApproval({
@@ -2936,6 +2953,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         ...(step.kind === 'observe' && dispatchResult && 'snapshotId' in dispatchResult
                             ? { observation: sanitizeObservation(dispatchResult, grant.allowedOrigins) } : {}) })
                     completedSteps.push(step.stepId)
+                    // The browser reported a file chooser during this write: the agent cannot answer it, so nothing else runs
+                    // before the user. Seen during the call, not proof the write opened it; stopping is the safe reading.
+                    if (receipts.get(step.actionId)?.fileChoosers?.length)
+                        return handOff(task, step, index, leaseEpoch, 'file-chooser')
                     if (landedWaitReason) {
                         const notPathPrefix = landedWaitReason === 'login' ? '/login' : '/challenge'
                         await this.retainTab(task.taskSpaceId, step.tabId, task.taskId, landedWaitReason)
@@ -3034,7 +3055,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     // The driver could not verify the action (e.g. a transformed frame) and sent nothing: the user does it.
                     // Only without evidence that the input left; otherwise it is an unknown outcome like any other.
                     if (!sent && error instanceof BrowserRuntimeError && error.code === 'APPROVAL_REQUIRED' && !error.mayHaveSideEffects)
-                        return handOff(task, step, index, leaseEpoch, error)
+                        return handOff(task, step, index, leaseEpoch, error.handoff ?? 'unknown', error)
                     // A destination refused after the input began does not undo what was sent: unknown, not a safe failure.
                     const deniedOrigin = runtimeError?.code === 'ORIGIN_DENIED'
                     const uncertain = sent
@@ -3275,9 +3296,9 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     private allocateTabId(): TabId { return `lease-reservation-${randomUUID()}` as TabId; }
     private view(task: StoredTask): TaskView { const { owner: _owner, agentGrant: _grant, actions: _actions, approvals: _approvals,
         batches: _batches, dedupe: _dedupe, tabTargets: _tabTargets, tabLeaseEpochs: _tabLeaseEpochs,
-        __events: _events, lastSeq: _lastSeq, ...view } = task;
+        __events: _events, lastSeq: _lastSeq, handoff, ...view } = task;
         const auto = this.autoApprovalFor(task)
-        return structuredClone({ ...view,
+        return structuredClone({ ...view, ...(handoff && handoffLasts(task) ? { handoff } : {}),
         approvalMode: { mode: auto ? 'auto' as const : 'manual' as const, origins: auto?.origins ?? [],
             availableOrigins: this.availableAutoOrigins(task), runtimeId: this.approvalRuntimeId,
             ...(auto ? { expiresAtMs: auto.expiresAtMs } : {}) },
@@ -3346,6 +3367,47 @@ function identity(auth: AuthContext): {
     workspaceId: string
     machineId: string
 } { return { principalId: auth.credential.principalId, workspaceId: auth.credential.workspaceId, machineId: auth.credential.machineId }; }
+/**
+ * What a task whose driver connection dropped (`recovering`) goes back to once the browser is the same one: the
+ * state it held then, except that a write still in flight is an unknown outcome and a batch whose worker is gone
+ * ends (the agent re-plans).
+ */
+function statusAfterDisconnect(task: StoredTask, workerExists: boolean): Partial<StoredTask> {
+    const previousStatus = task.previousDriverStatus as TaskStatus | undefined
+    const writes = inFlightWriteActions(task)
+    const previous: TaskStatus = task.pauseReason === 'outcome-unknown' || writes.length
+        || previousStatus === 'running' && !workerExists ? 'paused' : previousStatus ?? 'paused'
+    const pauseReason = writes.length || task.pauseReason === 'outcome-unknown'
+        ? 'outcome-unknown' : previousStatus === 'running' && !workerExists ? 'awaiting-agent' : task.pauseReason
+    return previous === 'paused'
+        ? { status: previous, pauseReason: pauseReason ?? 'awaiting-agent' as const,
+            ...(writes.length ? { uncertainActions: [...new Set([...task.uncertainActions, ...writes])] } : {}) }
+        : { status: previous, pauseReason: undefined }
+}
+/**
+ * Whether the task's hand-off (HandoffDetail) still lasts: waiting for the user, under their control or released until
+ * resumed, parked for a grant, or across a reconnect. Describes the wait only; it never decides what may run.
+ */
+function handoffLasts(task: Pick<StoredTask, 'status' | 'pauseReason' | 'waitReason'>): boolean {
+    return task.waitReason === 'handoff' && (task.status === 'awaiting-user' || task.status === 'recovering'
+        || task.status === 'paused' && ['user-control', 'user-input-complete', 'grant-expired'].includes(task.pauseReason ?? ''))
+}
+/**
+ * The patch, dropping the hand-off detail when the task it leads to no longer is that hand-off, for a pause that keeps
+ * `waitReason` (an expiry): a later takeover must not show the old hand-off again. The view hides it in all other cases.
+ */
+function scopeHandoff(current: StoredTask, patch: Partial<StoredTask>): Partial<StoredTask> {
+    return (patch.handoff ?? current.handoff) && !handoffLasts({ ...current, ...patch }) ? { ...patch, handoff: undefined } : patch
+}
+/** The user gave the page back (released, not resumed yet), also when the connection dropped afterwards. */
+function userReturned(task: StoredTask): boolean {
+    const state = task.status === 'recovering' && wasIdleAtDisconnect(task) ? statusAfterDisconnect(task, false) : task
+    return state.status === 'paused' && state.pauseReason === 'user-input-complete'
+}
+/** A `recovering` task that was not running when its connection dropped (a record without that state: unknown, not idle). */
+function wasIdleAtDisconnect(task: StoredTask): boolean {
+    return task.previousDriverStatus !== undefined && task.previousDriverStatus !== 'running'
+}
 function rebaseTaskPatch(base: StoredTask, current: StoredTask, patch: Partial<StoredTask>): Partial<StoredTask> {
     const result = { ...patch }
     for (const field of ['actions', 'approvals', 'batches', 'dedupe'] as const) {

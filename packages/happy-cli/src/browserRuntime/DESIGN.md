@@ -436,6 +436,36 @@ still allowed). Fault-injection hook: `testHooks.guardFailure`.
   login *detection* is still the fixture's `/login` path rule.
 - Harness mode: `testing/fixtureSitePolicy.ts` reproduces the PoC classifier for the synthetic origins.
 
+### Hand-off reasons and returning a hand-off (2026-10-29)
+
+- `TaskView.handoff` and `BatchResult.handoff` (optional `HandoffDetail { reason, tabId, actionId, atMs }`) come with
+  `waitReason: 'handoff'`. The reason is only what the Runtime decided or the driver reported: `permission` (a
+  navigation the site policy holds), `manual-control` (a form the digest cannot bind; a target the driver cannot
+  verify, such as a transformed frame — `BrowserRuntimeError.handoff`), `file-chooser` (a gated driver's receipt
+  reported `Page.fileChooserOpened` during the write: the write stays confirmed and the batch stops after it), `unknown`
+  (a driver hand-off without a stated cause). A reader maps any other value, or no detail (an older Runtime), to the
+  general hand-off.
+- Not detected: browser permission prompts (camera, location, notifications) and OS dialogs, which no CDP event the
+  driver uses reports; no native API is added for them. Nor a chooser opened after the call ended, during a click
+  that waits for its postcondition, or on a driver without receipts. A reported chooser is not proof the write opened it.
+- The detail is shown while the hand-off lasts (waiting, under the user's control or released until resumed, parked
+  for a grant, recovering); the view hides it otherwise and an expiry drops it from the record. It only describes the
+  wait: nothing reads it to decide what may run.
+- A hand-off (and a login or captcha wait) goes back to the agent only by an explicit resume of the current state:
+  the user's takeover, release (current lease epoch) and resume (current `stateVersion`, the task's stored grant
+  valid), or the agent's resume after that release with a live grant. Never by a prompt closing (no event is acted
+  on), a reconnect, a Runtime restart or a new grant:
+  - a user wait parked for its expired grant goes back to `awaiting-user` on the agent's resume with a new grant
+    (before: `awaiting-agent`, and the agent's next write ran without the user);
+  - a task whose connection dropped while it was not running gets back the state it had (`statusAfterDisconnect`)
+    also when the Runtime restarts before the reconnect, or a sweep finds it still `recovering` (before: `awaiting-agent`);
+  - a wait lost with a replaced browser is cleared on resume, so a later grant expiry cannot restore it;
+  - a wait the user already gave back (released, not resumed) stays given back when only its grant ended, in the
+    sweep and in restart recovery, also while the connection was down: the agent resumes it with a new grant (a
+    login still needs its site condition). A revoked running segment, a pending write or a replaced browser decide
+    as before.
+- The console names the known reasons and shows the general text otherwise; the user's control state comes first.
+
 ## Task-scoped Auto (2026-10-23 source candidate)
 
 `approve` accepts either the existing bound action decision or a separate human-only

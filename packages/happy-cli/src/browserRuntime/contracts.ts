@@ -80,6 +80,8 @@ export class BrowserRuntimeError extends Error {
         readonly retryable = false,
         readonly mayHaveSideEffects = false,
         readonly quotaKind?: RuntimeErrorBody['quotaKind'],
+        /** APPROVAL_REQUIRED from a driver: why the action goes to the user. Absent: 'unknown'. Not a wire field. */
+        readonly handoff?: HandoffReason,
     ) {
         super(message)
         this.name = 'BrowserRuntimeError'
@@ -202,6 +204,33 @@ export type PauseReason = (typeof PAUSE_REASONS)[number]
 /** handoff: the user performs an action the agent may not (it cannot be bound for approval or verified) */
 export type WaitReason = 'approval' | 'login' | 'captcha' | 'handoff'
 
+/**
+ * Why a hand-off (`waitReason: 'handoff'`) gives the page to the user, only from what the Runtime decided or the
+ * browser reported to the driver — never inferred from what the page, the browser UI or the OS might be showing:
+ * - permission: the site policy does not let the agent do the action (a navigation it holds);
+ * - file-chooser: the browser reported a file chooser during the agent's write, which the agent cannot answer
+ *   (seen during the call, not proof the write opened it);
+ * - manual-control: the action cannot be bound or verified for the agent (a form whose content cannot be bound,
+ *   a target the driver cannot verify), so it is done by hand;
+ * - unknown: a hand-off whose cause was not stated.
+ * A reader treats any other value, or a hand-off without a detail (an older Runtime), as 'unknown'.
+ */
+export const HANDOFF_REASONS = ['permission', 'file-chooser', 'manual-control', 'unknown'] as const
+export type HandoffReason = (typeof HANDOFF_REASONS)[number]
+
+/**
+ * The current hand-off: set with `waitReason: 'handoff'` and kept while it lasts (waiting, under the user's control,
+ * released until resumed, parked for a grant, across a reconnect); gone once it is resumed, expired or the task ended.
+ * It never resumes anything: a task goes back to the agent only by an explicit resume (see DESIGN.md).
+ */
+export interface HandoffDetail {
+    reason: HandoffReason
+    tabId: TabId
+    /** The step the hand-off stopped at (a file-chooser hand-off: the write during which the chooser was reported) */
+    actionId: ActionId
+    atMs: number
+}
+
 export type ActionState = 'planned' | 'intent-committed' | 'dispatched' | 'confirmed' | 'uncertain' | 'failed' | 'skipped'
 
 export type StepKind = 'navigate' | 'observe' | 'screenshot' | 'fill' | 'click' | 'waitFor'
@@ -278,6 +307,8 @@ export interface BatchResult {
     /** When outcome = awaiting-user */
     pendingApproval?: PendingApprovalSummary
     waitReason?: WaitReason
+    /** When waitReason = handoff (absent on older Runtimes) */
+    handoff?: HandoffDetail
 }
 
 export interface PendingApprovalSummary {
@@ -301,6 +332,8 @@ export interface TaskView {
     status: TaskStatus
     pauseReason?: PauseReason
     waitReason?: WaitReason
+    /** While a hand-off is current (absent on older Runtimes) */
+    handoff?: HandoffDetail
     cancelRequested: boolean
     stateVersion: number
     highWatermarkSeq: number

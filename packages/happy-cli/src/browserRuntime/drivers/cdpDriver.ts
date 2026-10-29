@@ -1810,7 +1810,7 @@ export class CdpDriver implements BrowserDriver {
                 arguments: [{ value: incoming }], returnByValue: true }, sessionId)
             const climb = result.value as { covered?: true; top?: true; unsupported?: true; point?: { x: number; y: number }; levels?: number } | undefined
             if (climb?.unsupported) {
-                throw new BrowserRuntimeError('APPROVAL_REQUIRED', 'the element\'s frame is transformed or zoomed; its overlay check cannot be verified, hand this action to the user', false, false)
+                throw new BrowserRuntimeError('APPROVAL_REQUIRED', 'the element\'s frame is transformed or zoomed; its overlay check cannot be verified, hand this action to the user', false, false, undefined, 'manual-control')
             }
             if (!climb || climb.covered) throw covered()
             if (climb.top) return
