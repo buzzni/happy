@@ -35,6 +35,21 @@ async function harness(origins: string[], answers: Array<{ address: string; fami
     return { proxy, port, upstream, upstreamPort, dial, lookup }
 }
 
+it('closes incomplete handshakes during service shutdown and never accepts a new policy', async () => {
+    const h = await harness(['https://shop.example'])
+    const client = createConnection({ host: '127.0.0.1', port: h.port })
+    client.on('error', () => {})
+    const closed = new Promise<void>(resolve => client.once('close', () => resolve()))
+    await new Promise<void>(resolve => client.once('connect', resolve))
+    client.write(Buffer.from([5]))
+    await h.proxy.close()
+    await closed
+    await h.proxy.close()
+    expect(h.proxy.server.listening).toBe(false)
+    expect(() => h.proxy.setAllowedOrigins(['https://shop.example'])).toThrow('closed')
+    expect(h.dial).not.toHaveBeenCalled()
+})
+
 function domainRequest(host: string, port: number, command = 1): Buffer {
     const name = Buffer.from(host, 'ascii')
     return Buffer.concat([Buffer.from([5, command, 0, 3, name.length]), name, Buffer.from([port >> 8, port & 255])])

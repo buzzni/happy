@@ -983,3 +983,51 @@ the user notice can tell a slow start or check from an account or policy mismatc
 (`specs/claude-init-timeout-split/`).
 The pinned SDK/CLI must prove the control/settings contract; a missing or incompatible
 contract fails closed. Revisit this boundary when upgrading the pinned Claude runtime.
+
+## Native browser host portability (development only)
+
+`browserRuntime/nativeHostPrimitives` lazy-loads the platform Node-API module for
+macOS/Windows kernel locks and process creation/boot identities. The daemon keeps
+Linux procfs semantics (including explicit fixture roots); unavailable identity is
+unknown, never proof of exit. The lock descriptor stays in the runtime process,
+not a short-lived helper. Builds require explicit Node headers and, on Windows,
+the matching import library; there is no runtime compiler/download fallback.
+
+`drivers/cdpConnection.fromPipe` accepts supervisor-owned Chromium debugging pipes.
+It does not open a CDP TCP listener. A lost/oversized/timed-out pipe closes both
+ends and fails pending operations; the existing Linux WebSocket path remains.
+`CdpDriver` accepts a supervisor-issued pipe/instance pair as an exclusive alternative
+to WebSocket discovery, coalesces concurrent connections, and discards late connections
+after close. `nativeBrowserSession` binds one such lifetime to the exact OS process and
+the actual macOS effective UID. Explicit `nativeService.networkProtection=basic`
+keeps process/identity checks without requiring OS network protection. `guard` (also
+used for legacy configs missing the field) additionally requires fresh independent
+protection snapshots. The mode is pinned for the session lifetime; loss of protection
+never downgrades it. Basic mode's proxy policy is not an OS network isolation guarantee.
+Process lifetime is checked around the principal query. Windows token SID validation
+is still a required service integration gate and fails closed until implemented.
+Identity/policy/generation/counter changes or
+unknown protection close admission and request service-owned process-tree termination;
+an unconfirmed stop is reported as such and is never automatically reconnected.
+`macNativeBrowserProtection` verifies every ancestor and the fixed helper executable
+(root ownership, non-writable modes, no ACL/symlinks), then its exact code signature,
+before reading the Network Guard XPC status. Descriptor-based `fstatx_np` metadata
+must explicitly prove ACL absence. These are service integration modules; their unit
+fixtures do not prove deployed service or network enforcement readiness.
+
+`macNativeRuntime` now provides the explicit production bootstrap: verify the
+fixed protected configuration/directories, retain a kernel writer lock, verify the
+signed guardian (and Network Guard in guard mode), start Chrome under a distinct UID/GID, then
+irreversibly drop the runtime identity before CDP/HTTP/SOCKS input. The root
+`macBrowserGuardian` owns the original process group; a root-only durable crash
+latch prevents restarting after unconfirmed termination or guardian SIGKILL.
+Origin allowlists belong to the service's SOCKS proxy and are revoked on close.
+The existing Linux production flock and daemon-token paths are unchanged.
+
+Native service integration is still not accepted or enabled. Signed request
+issuance/daemon transport, launchd/SCM installation, full independent network
+containment, OS packaging and Windows worker admission remain required.
+A source-checkout build produces a platform-checked self-contained runtime bundle
+and file hash manifest, not an OS installer or a published CLI/native release.
+Reconsider this boundary only with real separate-identity access tests and
+upgrade/rollback evidence. Build/verification details: [native host](../packages/happy-cli/native/README.md).

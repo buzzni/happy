@@ -317,6 +317,32 @@ describe('attention delivery over the existing encrypted server path', () => {
         expect(await readdir(dir)).not.toContain('browser-attention')
     })
 
+    it('polls a personal runtime with a fresh Studio-signed command and no daemon token', async () => {
+        const dir = await tempDir(); const socketPath = join(dir, 'native.sock')
+        const seen: Array<{ url?: string; command?: string; daemonToken?: string }> = []
+        let arrived!: () => void
+        const polling = new Promise<void>(resolve => { arrived = resolve })
+        const generation = 'G'.repeat(43)
+        const server = createServer((req, res) => {
+            seen.push({ url: req.url, command: req.headers['x-abp-native-command'] as string | undefined, daemonToken: req.headers['x-abp-daemon-token'] as string | undefined })
+            res.setHeader('content-type', 'application/json')
+            if (req.url === '/v1/native/challenge') { res.end(JSON.stringify({ ok: true, result: { schemaVersion: 1, machineId: 'machine-1', workspaceId: 'personal:u', generation } })); return }
+            arrived()
+        })
+        await new Promise<void>(resolve => server.listen(socketPath, resolve))
+        cleanup.push(() => new Promise<void>(resolve => { server.closeAllConnections(); server.close(() => resolve()) }))
+        const issued: unknown[] = []
+        const native = { socketPath, machineId: 'machine-1', workspaceId: 'personal:u',
+            issue: async (command: unknown) => { issued.push(command); return { token: 'signed-once', expiresAtMs: Date.now() + 60_000 } } }
+        const stop = startBrowserAttentionWatcher({ happyHomeDir: dir, machineId: 'machine-1', serverUrl: 'http://127.0.0.1:1', findSession: () => undefined,
+            isAlive: () => false, readToken: async () => null, log: () => {}, env: {}, native })
+        await polling; await stop()
+        expect(issued).toEqual([{ generation, method: 'GET', path: '/v1/attention?afterSeq=0&waitMs=30000', body: '' }])
+        expect(seen.map(entry => entry.url)).toEqual(['/v1/native/challenge', '/v1/attention?afterSeq=0&waitMs=30000'])
+        expect(seen[1].command).toBe('signed-once')
+        expect(seen.every(entry => entry.daemonToken === undefined)).toBe(true)
+    })
+
     it('rejects oversized broker replies and cancels a hanging poll promptly', async () => {
         const dir = await tempDir(); const socketPath = join(dir, 's.sock'); let oversized = true
         const server = createServer((_req, res) => { if (oversized) res.end('x'.repeat(1024 * 1024 + 1)) })

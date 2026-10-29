@@ -194,6 +194,8 @@ import {
 import { machineIdentityMetadataUpdate } from './machineIdentityMetadata';
 import { listMachineIdTwins } from './machineIdTwins';
 import { agentBrowserMachineCapability, agentBrowserMetadataUpdate, browserTaskLineage, createBrowserTaskSessionBroker, spawnResumedWithBrowserTaskRegistration, startBrowserTaskReconciliation, type BrowserTaskSessionBroker } from './browserTaskBroker';
+import { watchPersonalBrowserRuntime } from './personalBrowserRuntime';
+import type { NativeBrokerRequestOptions } from '@/browserRuntime/brokerGrantSource';
 import { createHeldBrowserAttentions, findBrowserAttentionSession, startBrowserAttentionWatcher, type HeldBrowserAttention } from './browserAttentionDelivery';
 import {
   createProcFs,
@@ -1842,7 +1844,36 @@ export async function startDaemon(): Promise<void> {
     } catch (error) {
       logger.warn(`[DAEMON RUN] Browser task broker disabled: ${error instanceof Error ? error.message : 'unknown error'}`);
     }
-    const stopBrowserTaskReconciliation = startBrowserTaskReconciliation(browserTaskBroker);
+    let stopBrowserTaskReconciliation = startBrowserTaskReconciliation(browserTaskBroker);
+    // Single-user Mac/Windows PC: the runtime Desktop configures for this user and machine after sign-in,
+    // picked up without a restart. An installer-managed host (its own broker) keeps its configuration.
+    let personalBrowserNative: NativeBrokerRequestOptions | undefined;
+    let onPersonalBrowserActive: ((native: NativeBrokerRequestOptions) => void) | undefined;
+    /** Set once the machine sync client exists; an activation before that is published with the first metadata check. */
+    let publishAgentBrowserCapability: (() => void) | undefined;
+    const personalBrowserWatch = browserTaskBroker || process.env.HAPPY_BROWSER_TASK_RUNTIME_URL ? undefined : watchPersonalBrowserRuntime({
+      machineId, studioOrigin: readTrustedStudioOrigin(process.env), token: () => credentials.token, log: (message) => logger.warn(message),
+      activate: (runtime) => {
+        let broker: BrowserTaskSessionBroker | undefined;
+        try {
+          broker = createBrowserTaskSessionBroker(process.env, undefined, {
+            native: runtime.native, pendingRevocationsFile: join(configuration.happyHomeDir, 'browser-task-revocations.json'),
+          });
+        } catch (error) {
+          logger.warn(`[DAEMON RUN] Personal browser broker disabled: ${error instanceof Error ? error.message : 'unknown error'}`);
+        }
+        if (!broker) return false;
+        Object.assign(process.env, runtime.sessionEnv);
+        browserTaskBroker = broker;
+        stopBrowserTaskReconciliation();
+        stopBrowserTaskReconciliation = startBrowserTaskReconciliation(broker);
+        personalBrowserNative = runtime.native;
+        onPersonalBrowserActive?.(runtime.native);
+        publishAgentBrowserCapability?.();
+        logger.debug('[DAEMON RUN] Personal browser runtime activated');
+        return true;
+      },
+    });
     const reportBrowserTaskRevokeFailure = (error: unknown): void => {
       logger.warn(`[DAEMON RUN] ${error instanceof Error ? error.message : 'Browser task revocation failed'}`);
     };
@@ -4256,6 +4287,11 @@ export async function startDaemon(): Promise<void> {
       void apiMachine.updateMachineMetadata((metadata) => agentBrowserMetadataUpdate(metadata, agentBrowserMachineCapability()) ?? metadata!)
         .catch((error) => logger.debug('[DAEMON RUN] agent browser capability not published', error));
     }
+    // A personal runtime activated later (Desktop installed it after sign-in) is published then.
+    publishAgentBrowserCapability = () => {
+      void apiMachine.updateMachineMetadata((metadata) => agentBrowserMetadataUpdate(metadata, agentBrowserMachineCapability()) ?? metadata!)
+        .catch((error) => logger.debug('[DAEMON RUN] agent browser capability not published', error));
+    };
     // Same for the tool policy capability (aplus-dev-studio specs/agent-tool-policy): Desktop must not
     // claim enforcement the daemon is not doing, nor miss enforcement it is.
     if (toolPolicyMetadataUpdate(machine.metadata, toolPolicyMachineCapability(process.env))) {
@@ -5351,8 +5387,10 @@ export async function startDaemon(): Promise<void> {
       portRegistry,
       automationStore,
       aiCredentialRuntime,
-      ...(browserTaskBroker ? {
-        browserSessionWaiting: async (sessionId: string) => heldBrowserAttentions.answerWaiting(sessionId) || browserTaskBroker!.waiting(sessionId),
+      // A personal runtime may activate after this registration: resolve the broker per call.
+      ...(browserTaskBroker || personalBrowserWatch ? {
+        browserSessionWaiting: async (sessionId: string) => heldBrowserAttentions.answerWaiting(sessionId)
+          || (browserTaskBroker ? browserTaskBroker.waiting(sessionId) : false),
       } : {}),
       autonomousQualityGate: createAutonomousQualityGateRpcHandlers(autonomousQualityGateRegistry),
       checkpoint: {
@@ -5776,6 +5814,7 @@ export async function startDaemon(): Promise<void> {
 
       stopBrowserTaskReconciliation();
       await stopBrowserAttention();
+      await personalBrowserWatch?.stop();
 
       // Clear health check interval
       if (restartOnStaleVersionAndHeartbeat) {
@@ -5834,7 +5873,7 @@ export async function startDaemon(): Promise<void> {
       process.exit(0);
     };
 
-    stopBrowserAttention = startBrowserAttentionWatcher({
+    const browserAttentionOptions: Parameters<typeof startBrowserAttentionWatcher>[0] = {
       happyHomeDir: configuration.happyHomeDir,
       serverUrl: configuration.serverUrl,
       machineId,
@@ -5852,7 +5891,16 @@ export async function startDaemon(): Promise<void> {
         ? readStagedTokenFromHomeDir(session.userHomeDir)
         : credentials.token,
       log: (message) => logger.debug(message),
-    });
+    };
+    stopBrowserAttention = startBrowserAttentionWatcher(browserAttentionOptions);
+    // The personal runtime may become active later; its attention feed then starts too.
+    const startPersonalBrowserAttention = (native: NativeBrokerRequestOptions) => {
+      const stopPersonal = startBrowserAttentionWatcher({ ...browserAttentionOptions, native });
+      const stopPrevious = stopBrowserAttention;
+      stopBrowserAttention = async () => { await stopPrevious(); await stopPersonal(); };
+    };
+    if (personalBrowserNative) startPersonalBrowserAttention(personalBrowserNative);
+    else onPersonalBrowserActive = startPersonalBrowserAttention;
 
     logger.debug('[DAEMON RUN] Daemon started successfully, waiting for shutdown request');
 

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { BrowserRuntimeError } from './contracts'
-import { PROFILE_PROVISIONING_WAIT_MS, brokerRequest, createBrokerGrantSource } from './brokerGrantSource'
+import { PROFILE_PROVISIONING_WAIT_MS, brokerRequest, createBrokerGrantSource, createNativeBrokerRequest } from './brokerGrantSource'
 
 const SECRET = 'synthetic-session-secret-0123456789abcdef'
 const cleanups: Array<() => Promise<unknown>> = []
@@ -120,4 +120,40 @@ describe('broker grant source', () => {
         expect(await brokerRequest(broker.socketPath, 'POST', '/v1/sessions/register', { 'x-abp-daemon-token': 'synthetic' }, { schemaVersion: 1 }))
             .toEqual({ status: 200, body: { ok: true, result: { seen: 'synthetic' } } })
     })
+})
+
+it('native transport signs each immutable request after checking the current service generation', async () => {
+    let generation = 'a'.repeat(43), sent = 0
+    const h = await fakeBroker((body, req) => {
+        if (req.url === '/v1/native/challenge') return { status: 200, body: { ok: true, result: { schemaVersion: 1, machineId: 'm', workspaceId: 'w', generation } } }
+        expect(req.headers['x-abp-daemon-token']).toBeUndefined()
+        expect(req.headers['x-abp-native-command']).toBe(`signed-${++sent}`)
+        expect(body).toEqual({ schemaVersion: 1 })
+        return { status: 200, body: { ok: true, result: {} } }
+    })
+    const commands: unknown[] = [], body = { schemaVersion: 1 }
+    const request = createNativeBrokerRequest({ socketPath: h.socketPath, machineId: 'm', workspaceId: 'w', issue: async command => {
+        commands.push(command); body.schemaVersion = 99
+        return { token: `signed-${commands.length}`, expiresAtMs: Date.now() + 60000 }
+    } })
+    await request(h.socketPath, 'POST', '/v1/sessions/register', {}, body)
+    generation = 'b'.repeat(43)
+    await request(h.socketPath, 'POST', '/v1/sessions/register', {}, { schemaVersion: 1 })
+    expect(commands).toEqual(['a', 'b'].map(letter => ({ generation: letter.repeat(43), method: 'POST', path: '/v1/sessions/register', body: '{"schemaVersion":1}' })))
+})
+it('native transport refuses another service scope and never retries an uncertain operation', async () => {
+    let machineId = 'other', issued = 0, dispatched = 0
+    const h = await fakeBroker((_body, req) => req.url === '/v1/native/challenge'
+        ? { status: 200, body: { ok: true, result: { schemaVersion: 1, machineId, workspaceId: 'w', generation: 'a'.repeat(43) } } }
+        : (dispatched++, { status: 500, body: { ok: false } }))
+    const request = createNativeBrokerRequest({ socketPath: h.socketPath, machineId: 'm', workspaceId: 'w', issue: async () => {
+        issued++; return { token: 'signed', expiresAtMs: Date.now() + 60000 }
+    } })
+    await expect(request(h.socketPath, 'GET', '/v1/sessions', {})).rejects.toThrow('NATIVE_SCOPE_CHANGED')
+    expect(issued).toBe(0)
+    machineId = 'm'
+    expect((await request(h.socketPath, 'POST', '/v1/sessions/register', {}, { schemaVersion: 1 })).status).toBe(500)
+    expect(issued).toBe(1); expect(dispatched).toBe(1)
+    await expect(request('other-socket', 'GET', '/v1/sessions', {})).rejects.toThrow('NATIVE_SCOPE_CHANGED')
+    await expect(request(h.socketPath, 'GET', '/v1/sessions', { 'x-abp-daemon-token': 'legacy' })).rejects.toThrow('NATIVE_SCOPE_CHANGED')
 })

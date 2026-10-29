@@ -38,14 +38,24 @@ const EXPECTED_INSTALLED_FILES = [
     'node_modules/@paralleldrive/cuid2/package.json',
     'node_modules/@paralleldrive/cuid2/node_modules/@noble/hashes/package.json'
 ];
+// Personal desktop AI browser addons, built per platform by the publish workflow's browser-host job.
+// Each must be a real executable image, not a placeholder: Mach-O 64 (little-endian) or PE.
+const BROWSER_HOSTS = [
+    { entry: 'package/native/darwin-arm64/browser-host.node', magic: Buffer.from([0xcf, 0xfa, 0xed, 0xfe]) },
+    { entry: 'package/native/darwin-x64/browser-host.node', magic: Buffer.from([0xcf, 0xfa, 0xed, 0xfe]) },
+    { entry: 'package/native/win32-x64/browser-host.node', magic: Buffer.from('MZ', 'latin1') }
+];
 const MAX_PRINTED_ERRORS = 30;
 
 function parseArgs(argv) {
-    const args = { artifact: undefined, installSmoke: false };
+    const args = { artifact: undefined, installSmoke: false, requireBrowserHosts: false };
 
     for (const arg of argv) {
         if (arg === '--install-smoke') {
             args.installSmoke = true;
+        } else if (arg === '--require-browser-hosts') {
+            // The publish workflow: every platform's addon must be packed.
+            args.requireBrowserHosts = true;
         } else if (!args.artifact) {
             args.artifact = arg;
         } else {
@@ -126,6 +136,23 @@ function extractTarEntry(tarball, entry) {
 
 function readTarJson(tarball, entry) {
     return JSON.parse(extractTarEntry(tarball, entry));
+}
+
+/** Every packed addon must be a real executable image; publication also needs all of them. */
+function collectBrowserHostErrors(tarball, entries, requireBrowserHosts) {
+    const entrySet = new Set(entries);
+    const errors = [];
+    for (const { entry, magic } of BROWSER_HOSTS) {
+        if (!entrySet.has(entry)) {
+            if (requireBrowserHosts) errors.push(`tarball is missing bundled file: ${entry}`);
+            continue;
+        }
+        const head = childProcess.spawnSync('tar', ['-xOzf', tarball, entry], { maxBuffer: 64 * 1024 * 1024 }).stdout;
+        if (!Buffer.isBuffer(head) || head.length < 64 || !head.subarray(0, magic.length).equals(magic)) {
+            errors.push(`browser host is not an executable image: ${entry}`);
+        }
+    }
+    return errors;
 }
 
 function hasLocalProtocol(spec) {
@@ -382,7 +409,8 @@ function guardPublishArtifact() {
         const packageJson = readTarJson(packed.tarball, 'package/package.json');
         const errors = [
             ...collectMetadataErrors(packageJson),
-            ...collectTarErrors(entries)
+            ...collectTarErrors(entries),
+            ...collectBrowserHostErrors(packed.tarball, entries, args.requireBrowserHosts)
         ];
 
         if (errors.length > 0) {
