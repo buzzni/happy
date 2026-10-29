@@ -155,7 +155,9 @@ describe('pinned credential at the SDK request boundary', () => {
         const second = q.next().catch((error: unknown) => error);
         await vi.advanceTimersByTimeAsync(610_001);
         expect(await second).toMatchObject({ stage: 'recheck', reason: 'timeout' });
-        expect(debug.mock.calls.map(call => call.join(' ')).join('\n')).toMatch(/recheck timeout after 10000ms/);
+        const lines = debug.mock.calls.map(call => call.join(' ')).join('\n');
+        expect(lines).toMatch(/recheck timeout after 10000ms/);
+        expect(lines.match(/credential refused/g)).toHaveLength(1);
     });
     it.each([
         ['getSettings-hang', 'settings', 'timeout'],

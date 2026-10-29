@@ -40,13 +40,18 @@ export function queryWithPinnedCredential(
     const diagnosis = (error: unknown, stage: ClaudeAuthCheckStage) => error instanceof ClaudeAuthNotVerifiedError
         ? error : new ClaudeAuthNotVerifiedError(failureCode, stage, 'control_failed');
     let response: Query;
+    let loggedRefusal: Error | undefined;
     let rejectFailure!: (error: Error) => void;
     const failed = new Promise<never>((_resolve, reject) => { rejectFailure = reject; });
     void failed.catch(() => {});
 
     function refuse(upstreamError: Error | undefined, refusal: ClaudeAuthNotVerifiedError): never {
         const error = signal?.aborted ? new AbortError('Claude request aborted') : upstreamError ?? refusal;
-        if (error === refusal) logger.debug(`[credentialPin] ${source} credential refused: stage=${refusal.stage} reason=${refusal.reason} ${Date.now() - startedAt}ms after query start`);
+        // checked() refuses first and guardedInput's catch refuses again with the same error; log once.
+        if (error === refusal && loggedRefusal !== refusal) {
+            loggedRefusal = refusal;
+            logger.debug(`[credentialPin] ${source} credential refused: stage=${refusal.stage} reason=${refusal.reason} ${Date.now() - startedAt}ms after query start`);
+        }
         rejectFailure(error);
         try { response.close(); } catch { /* already closed */ }
         throw error;
