@@ -647,6 +647,24 @@ export class ApiSessionClient extends EventEmitter {
         return this.managed?.serverOrigin ?? null;
     }
 
+    /**
+     * Desktop P0a §4.5 owner-relay-v1 call over the existing rpc-call protocol, sealed with this
+     * session's key (T1c-b2 H2). One attempt, 20s deadline; the key and remote errors stay here.
+     */
+    async callOwnerRelay(method: string, request: unknown, signal: AbortSignal): Promise<unknown> {
+        if (!/^owner-relay-v1:[A-Za-z0-9_-]{16,128}$/.test(method)) throw new Error('invalid-owner-relay-method');
+        signal.throwIfAborted();
+        const params = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, request));
+        const response = await this.socket.timeout(20_000).emitWithAck('rpc-call', { method, params });
+        signal.throwIfAborted();
+        let reply: unknown = null;
+        try {
+            if (response?.ok && typeof response.result === 'string') reply = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(response.result));
+        } catch { reply = null; }
+        if (reply === null || reply === undefined) throw new Error('owner-relay-unavailable');
+        return reply;
+    }
+
     constructor(token: string, session: Session, managed?: ManagedCredentialMode, private readonly options: { trackShutdownStorage?: boolean; storageHighWaterBytes?: number; storageHighWaterWrites?: number } = {}) {
         super()
         for (const value of [options.storageHighWaterBytes, options.storageHighWaterWrites]) {

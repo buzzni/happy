@@ -216,6 +216,13 @@ async function daemonPost(
   }
 }
 
+/** T1c-b2 H2 owner-contact bootstrap; only the host's runtime and public key leave this process. */
+export async function requestDaemonCallerBinding(report: { sessionId: string; runtimeId: string; hostPid: number; callerPublicKey: string }): Promise<unknown> {
+  const result = await daemonPost('/caller-binding', report);
+  if (!result || typeof result !== 'object' || 'error' in result) throw new Error('owner-contact-unavailable');
+  return result;
+}
+
 const SESSION_STARTED_RETRY_TIMEOUT_MS = 3000;
 async function scopeReportHeaders(kind: ManagedReportKind, body: unknown): Promise<Record<string, string>> {
   const signer = await initializeScopeReportSigner();

@@ -58,3 +58,31 @@ export function createAgentCallerBindings(deps: {
         revoke(sessionId: string) { callers.get(sessionId)?.key.fill(0); callers.delete(sessionId); },
     };
 }
+/** Host-held key for a daemon-issued launch binding (T1c-b2 H2). The secret never leaves this closure. */
+export function adoptAgentCallerBinding(input: { binding: Caller; secretKey: Uint8Array; live(): boolean }) {
+    const caller = OwnershipCallerBindingSchema.parse(input.binding);
+    if (Buffer.from(input.secretKey.subarray(32)).toString('base64url') !== caller.callerPublicKey) throw new Error('caller-key-mismatch');
+    let key: Uint8Array | null = input.secretKey;
+    const same = (binding: Caller) => canonicalOrgSetupTokenJson(binding) === canonicalOrgSetupTokenJson(caller);
+    function current() {
+        if (!key || !input.live()) throw new Error('caller-not-running');
+        return key;
+    }
+    return {
+        async query(raw: unknown) {
+            const request = z.object({ sessionId: ownershipId, nonce: z.string().min(16).max(256) }).strict().parse(raw);
+            if (request.sessionId !== caller.sessionId) throw new Error('caller-unavailable');
+            current();
+            return { version: 1 as const, nonce: request.nonce, caller: { ...caller } };
+        },
+        async signRelay(binding: Caller, request: unknown) {
+            if (!same(binding)) throw new Error('caller-changed');
+            const result = await signOwnerRelayRequest(request, current());
+            current();
+            return result;
+        },
+        revokeBinding(binding: Caller) {
+            if (key && same(binding)) { key.fill(0); key = null; }
+        },
+    };
+}

@@ -16,7 +16,8 @@ function harness(enabled = true) {
         publicKey: Buffer.from(desktop.publicKey).toString('base64url'), issuedAt: now, expiresAt: now + 60000 }, server.secretKey);
     const port = createSessionOwnerContact({ enabled, binding, registry, now: () => now,
         trust: { issuer: contact.issuer, audience: contact.audience, publicKey: id => id === contact.keyId ? server.publicKey : null },
-        lookup: async query => { lookups++; expect(query).toEqual({ sessionId: 'source', machineId: 'machine', happyAccountId: 'account' }); return [contact]; },
+        lookup: async query => { lookups++; expect(query).toEqual({ sessionId: 'source', machineId: 'machine', happyAccountId: 'account',
+            callerBindingId: binding.callerBindingId, hostEpoch: binding.hostEpoch }); return [contact]; },
         currentContact: async () => true,
         exchange: async (_contact, request) => {
             sends++;

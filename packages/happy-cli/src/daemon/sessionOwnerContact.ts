@@ -12,16 +12,17 @@ export interface SessionOwnerContactDependencies {
     /** Trusted host configuration, never a request/provider environment switch. Default OFF. */
     enabled?: boolean;
     binding: Binding;
-    registry: ReturnType<typeof createAgentCallerBindings>;
+    registry: Pick<ReturnType<typeof createAgentCallerBindings>, 'query' | 'signRelay' | 'revokeBinding'>;
     now(): number;
     trust: { issuer: string; audience: string; publicKey(keyId: string): Uint8Array | null };
-    /** Machine-authenticated, source/account-limited A+ lookup. No arbitrary target or URL. */
-    lookup(source: { sessionId: string; machineId: string; happyAccountId: string }, signal: AbortSignal): Promise<unknown[]>;
+    /** Machine-authenticated A+ lookup limited to this source binding. No arbitrary target or URL. */
+    lookup(source: OwnerContactSource, signal: AbortSignal): Promise<unknown[]>;
     /** Recheck registration/revocation against current authority, including after the reply. */
     currentContact(contact: OwnershipRelayContact, signal: AbortSignal): Promise<boolean>;
     /** Session-DEK-bound Happy RPC, pinned to contact.method; no retry/failover. */
     exchange(contact: OwnershipRelayContact, request: OwnerRelayRequest, signal: AbortSignal): Promise<unknown>;
 }
+export type OwnerContactSource = { sessionId: string; machineId: string; happyAccountId: string; callerBindingId: string; hostEpoch: string };
 export interface SessionOwnerContact { call(raw: unknown): Promise<OwnerRelayReply>; close(): void }
 export function createSessionOwnerContact(deps: SessionOwnerContactDependencies): SessionOwnerContact {
     const binding = OwnershipCallerBindingSchema.parse(deps.binding);
@@ -52,7 +53,7 @@ export function createSessionOwnerContact(deps: SessionOwnerContactDependencies)
             const work = async () => {
                 await current();
                 const candidates = await deps.lookup({ sessionId: binding.sessionId, machineId: binding.machineId,
-                    happyAccountId: binding.happyAccountId }, signal);
+                    happyAccountId: binding.happyAccountId, callerBindingId: binding.callerBindingId, hostEpoch: binding.hostEpoch }, signal);
                 await current(); signal.throwIfAborted();
                 if (!Array.isArray(candidates) || candidates.length > 100) throw new Error('contact-unavailable');
                 const contacts = candidates.map(c => OwnershipRelayContactSchema.safeParse(c))

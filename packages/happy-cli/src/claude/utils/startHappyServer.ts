@@ -1,6 +1,9 @@
 import { createLocalClientSession, registerLocalClientTools, LOCAL_CLIENT_TOOL_NAMES, type LocalClientSession } from '@/browserRuntime/localClientSession';
 import type { PolicyApprover } from '@/toolPolicy/policyGate';
 import { startSessionAgentBroker } from '@/commands/sessionAgentBroker';
+import { startHostOwnerContact } from '@/daemon/sessionOwnerContactHost';
+import { requestDaemonCallerBinding } from '@/daemon/controlClient';
+import { readCredentials } from '@/persistence';
 import type { DelegatedAttendance } from '@/api/turnAttendance';
 import { registerSessionWriteScopeTools } from '@/daemon/sessionWriteScopeAgentTools';
 import { localToolAgentContext, requestLocalToolAgent } from '@/daemon/localToolAgentRelay';
@@ -717,9 +720,13 @@ export async function startHappyServer(
         if (privateDir) rmSync(privateDir, { recursive: true, force: true });
         throw error;
     });
-    const agentBroker = options.agentControl
-        ? await startSessionAgentBroker(client.sessionId, process.env, options.admitTool, undefined, options.delegatedAttendance)
-        : null;
+    // T1c-b2 H2 owner contact, default OFF (HAPPY_OWNER_CONTACT_V1): off starts exactly the existing broker.
+    const ownerContact = await startHostOwnerContact({ env: process.env, session: client, issue: requestDaemonCallerBinding,
+        token: async () => (await readCredentials())?.token ?? null,
+        startBroker: contact => options.agentControl
+            ? startSessionAgentBroker(client.sessionId, process.env, options.admitTool, undefined, options.delegatedAttendance, undefined, contact)
+            : Promise.resolve(null) });
+    const agentBroker = ownerContact.broker;
     // Env for the stdio bridge. Codex and ACP agents receive it over JSON-RPC, not argv.
     const bridgeEnv: Record<string, string> = socketPath
         ? { SAYCODE_MCP_SOCKET: socketPath, SAYCODE_MCP_TOKEN: token }
@@ -745,6 +752,7 @@ export async function startHappyServer(
         stop: () => {
             logger.debug(`[happyMCP] server:stop sessionId=${client.sessionId}`);
             void agentBroker?.close();
+            void ownerContact.close();
             server.close(() => { if (privateDir) rmSync(privateDir, { recursive: true, force: true }); });
             server.closeAllConnections();
             removeBashStreamSpillStore(client.sessionId);
