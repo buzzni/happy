@@ -116,7 +116,10 @@ export function startDaemonControlServer({
   browserLocalSetup,
   getDeviceEnrollment = () => null,
   getSetupTokenAccountSwitch = () => null,
+  getCallerLaunches = () => null,
 }: {
+  /** T1c-b2 H2 owner-contact launch bootstrap; null while the rollout switch is off. */
+  getCallerLaunches?: () => { issue(raw: unknown): Promise<unknown> } | null;
   getDeviceEnrollment?: () => ReturnType<typeof createDeviceEnrollment> | null;
   /** Saycode specs/claude-setup-token-account-selection — null until the AI credential runtime exists. */
   getSetupTokenAccountSwitch?: () => Pick<SetupTokenAccountSwitch, 'availability' | 'returnFromPersonal' | 'reportUsage' | 'reportActivity' | 'rebind'> | null;
@@ -507,6 +510,15 @@ export function startDaemonControlServer({
       if (!switcher) return { ok: false as const, reason: 'STUDIO_UNAVAILABLE' }
       return action === 'availability' ? switcher.availability(request.body.sessionId, request.body.binding, request.body.personalConsent, request.body.organizationFailure)
         : switcher.returnFromPersonal(request.body.sessionId, request.body.binding, request.body.organizationFailure)
+    });
+    // Host bootstrap before provider start: the host reports only its runtime and public key, and the
+    // daemon answers from its own launch state. Not a managed report path, so a managed runtime refuses.
+    typed.post('/caller-binding', { bodyLimit: 4096, schema: { body: z.unknown() } }, async (request, reply) => {
+      const launches = getCallerLaunches();
+      try {
+        if (launches) return await launches.issue(request.body);
+      } catch { /* The refusal reason stays in the daemon. */ }
+      return reply.code(403).send({ error: 'owner-contact-unavailable' });
     });
     typed.post('/setup-token/rebind', {
       bodyLimit: 4096,

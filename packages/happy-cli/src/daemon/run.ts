@@ -1,4 +1,5 @@
 import { createOwnedSpawnRuntime, createOwnedStartGuard } from './ownedSpawnRuntime';
+import { createAgentCallerLaunches, OWNER_CONTACT_SWITCH, readOwnerContactTrust } from './agentCallerLaunches';
 import { drainWorktreeOperations } from './worktreeOps';
 import { createMachineSetupTokenProtocol, MachineRotationError } from './machineSetupTokenProtocol';
 import { chooseLaunchRotation, createMachineRotationResolver } from './machineRotationResolver';
@@ -4053,8 +4054,11 @@ export async function startDaemon(): Promise<void> {
       stopBlocked: () => restartDrainRuntime?.controlPort.stopBlocked() ?? false,
       handingOff: () => restartDrainRuntime?.controlPort.handingOff() ?? false,
     };
+    // T1c-b2 H2 owner-contact launch bindings; assigned with the owned-spawn runtime below.
+    let callerLaunches: ReturnType<typeof createAgentCallerLaunches> | null = null;
     const { port: controlPort, stop: stopControlServer, controlSecret } = await startDaemonControlServer({
       restartDrain: restartDrainControlPort,
+      getCallerLaunches: () => callerLaunches,
       getSetupTokenAccountSwitch: () => setupTokenAccountSwitch,
       getChildren: getCurrentChildren,
       stopSession,
@@ -5298,20 +5302,31 @@ export async function startDaemon(): Promise<void> {
       logger.debug(`[channel-host] not started: ${channelHostEntry.code}`);
     }
 
-    const ownedSpawn = createOwnedSpawnRuntime({ home: configuration.happyHomeDir, happyOrigin: configuration.serverUrl, env: process.env,
-      registration: async () => {
-        const [currentCredentials, settings] = await Promise.all([readCredentials(), readSettings()]);
-        if (!currentCredentials || settings.machineId !== machineId || !settings.machineIdConfirmedByServer) throw new Error('identity-changed');
-        // Never replace the running daemon's registration with a descriptor's claims.
-        if (JSON.stringify(currentCredentials) !== JSON.stringify(credentials)) throw new Error('identity-changed');
-        return { machineId, credentials: currentCredentials, epoch: String(process.pid) };
+    const ownedRegistration = async () => {
+      const [currentCredentials, settings] = await Promise.all([readCredentials(), readSettings()]);
+      if (!currentCredentials || settings.machineId !== machineId || !settings.machineIdConfirmedByServer) throw new Error('identity-changed');
+      // Never replace the running daemon's registration with a descriptor's claims.
+      if (JSON.stringify(currentCredentials) !== JSON.stringify(credentials)) throw new Error('identity-changed');
+      return { machineId, credentials: currentCredentials, epoch: String(process.pid) };
+    };
+    const liveLaunch = (tracked: TrackedSession) => tracked.pid > 0 && isPidAlive(tracked.pid);
+    // Default OFF: the route refuses and agent-caller-binding answers only owned-journal sources.
+    callerLaunches = createAgentCallerLaunches({ enabled: process.env[OWNER_CONTACT_SWITCH] === '1',
+      identity: async () => {
+        try {
+          const state = await ownedRegistration();
+          return { machineId: state.machineId, happyAccountId: await authenticatedAccountId(state.credentials.token), epoch: state.epoch };
+        } catch { return null; }
       },
+      trust: () => readOwnerContactTrust(process.env, configuration.serverUrl), trackedByPid: pid => pidToTrackedSession.get(pid), live: liveLaunch });
+    const ownedSpawn = createOwnedSpawnRuntime({ home: configuration.happyHomeDir, happyOrigin: configuration.serverUrl, env: process.env,
+      registration: ownedRegistration, launchCallers: callerLaunches,
       metadata: options => ({ path: options.directory, host: os.hostname(), version: packageJson.version, os: os.platform(), machineId,
         homeDir: os.homedir(), happyHomeDir: configuration.happyHomeDir, happyLibDir: projectPath(), happyToolsDir: join(projectPath(), 'tools', 'unpacked'),
         flavor: options.agent ?? 'claude', startedFromDaemon: true, startedBy: 'daemon', lifecycleState: 'running', lifecycleStateSince: Date.now() }),
       rotation: (options, companyId) => companyId ? machineRuntimeFor(companyId) : machineRotationFor(options),
       start: (options, launch) => { if (launch) ownedMachineLaunches.set(options, launch); return ownedStartGuard.start(options, () => spawnSessionAdmitted(options)); },
-      tracked: sessionId => findTrackedSessionById(sessionId) ?? sessionIdToFinishedSession.get(sessionId), live: tracked => tracked.pid > 0 && isPidAlive(tracked.pid),
+      tracked: sessionId => findTrackedSessionById(sessionId) ?? sessionIdToFinishedSession.get(sessionId), live: liveLaunch,
       persist: async session => {
         // Rotation has already persisted its execution binding; retain that trusted resume state.
         const prior = readPersistedSessions()[session.id];

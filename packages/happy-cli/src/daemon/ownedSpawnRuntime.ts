@@ -38,6 +38,8 @@ export interface OwnedSpawnRuntimeDependencies {
     live(session: TrackedSession): boolean;
     persist(session: Session): Promise<SessionPersistenceResult>;
     fetch?: typeof fetch;
+    /** T1c-b2 H2: daemon-vouched bindings of other daemon launches (agentCallerLaunches). */
+    launchCallers?: { query(raw: unknown): Promise<unknown> };
 }
 /** Private daemon dispatch evidence; never accepted from RPC, argv, or provider environment. */
 export function createOwnedStartGuard() {
@@ -278,6 +280,7 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
                 if (!known || known.stamp !== stamp(tracked)) await bind(record);
                 return caller.query(input);
             }
+            if (deps.launchCallers) return deps.launchCallers.query(input);
             throw new Error('caller-unavailable');
         },
     };
