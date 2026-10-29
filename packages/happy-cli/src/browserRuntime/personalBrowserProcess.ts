@@ -18,12 +18,13 @@ export function personalBrowserEnv(platform: 'darwin' | 'win32', source: NodeJS.
     return env
 }
 
-/** A visible window on the user's desktop: the user signs in to sites there. */
+/** Headful (the user signs in to sites in its windows), but it opens no window of its own: one appears only
+ * when an agent opens a page, so a prepared PC does not show an empty browser. */
 export function personalBrowserArgs(platform: 'darwin' | 'win32', profileDir: string): string[] {
     return ['--remote-debugging-pipe', `--user-data-dir=${profileDir}`,
         '--no-first-run', '--no-default-browser-check', '--disable-sync', '--disable-extensions',
         ...platform === 'darwin' ? ['--password-store=basic', '--use-mock-keychain'] : [],
-        'about:blank']
+        '--no-startup-window']
 }
 
 export interface PersonalProcessTree {

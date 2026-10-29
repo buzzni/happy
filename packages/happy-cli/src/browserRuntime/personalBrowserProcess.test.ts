@@ -23,6 +23,9 @@ describe('personal browser launch', () => {
         expect(args).toContain('--remote-debugging-pipe')
         expect(args).toContain('--user-data-dir=/p/profile')
         expect(args.some(arg => arg.startsWith('--remote-debugging-port') || arg.startsWith('--headless'))).toBe(false)
+        // No window until an agent opens a page: a prepared PC does not show an empty browser.
+        expect(args).toContain('--no-startup-window')
+        expect(args).not.toContain('about:blank')
     })
 
     it('spawns detached with fd 3/4 pipes and the filtered environment', async () => {
