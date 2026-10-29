@@ -347,11 +347,17 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       if (!deps.studioOrigin) return undefined
       const proof = { machineId: deps.machineId, companyId: input.companyId }
       const measured: string[] = []
-      const selectionRequestId = randomUUID()
+      let selectionRequestId: string | undefined = randomUUID()
       try {
         while (true) {
-          const response = await post('shared/select', { ...proof, selectionRequestId, candidates: input.candidates, exclude: input.exclude, measure: input.measure, measured: [...measured] })
+          const response = await post('shared/select', { ...proof, ...(selectionRequestId ? { selectionRequestId } : {}), candidates: input.candidates, exclude: input.exclude, measure: input.measure, measured: [...measured] })
           const body = await response.json().catch(() => null) as Record<string, unknown> | null
+          // A Studio from before selection requests refuses the field it does not know: ask again without it, once.
+          if (response.status === 400 && selectionRequestId) {
+            logger.debug('[setup-token-switch] shared choice: Studio refused selectionRequestId; asking again without it')
+            selectionRequestId = undefined
+            continue
+          }
           if (response.ok && typeof body?.managedAccountId === 'string') return body.managedAccountId
           if (response.status === 409 && body?.error === 'SETUP_TOKEN_DAEMON_NO_ACCOUNT') return null
           const candidate = { managedAccountId: body?.managedAccountId, credentialGeneration: body?.credentialGeneration }
