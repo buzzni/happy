@@ -216,3 +216,36 @@ provisioning 및 등록 후 인증된 설정 전송은 이 빌드에 포함되�
 추가 보호 `guard`와 필드가 없는 과거 설정은 Guard 실패 시 실행을 거부한다.
 모드는 세션 시작 시 고정되며 옵션 변경으로 살아 있는 보호 세션을 강등할 수 없다.
 사용자 설정·설치기 연결은 별도이며 이 필드를 agent 요청으로 바꾸지 않는다.
+
+## Mac 전용 계정 수명과 명시적 복구
+
+root guardian의 상속 stdin/stdout에서 32-byte random nonce를 왕복하여 현재 원래
+Chrome child의 UID·생성 시각을 확인한다. runtime 신원으로 권한을 낮춘 뒤 다른 UID의
+proc_pidinfo를 직접 읽을 수 없는 경우에도 PID/UID 검사를 생략하지 않는다. 응답 초과,
+불일치, EOF, timeout은 영구 실패이며 guardian 수명을 끝낸다.
+
+제품 bootstrap은 `--dedicated-user-domain`을 사용한다. guardian은 200~499 UID,
+`_saycodebrowser`로 시작하는 서비스 계정명, 지정 GID, `/usr/bin/false` shell,
+고정 browser-profile home과 시작 전 UID 프로세스 부재를 확인한다. 설치기는 실제
+Directory Services의 home도 이 경로로 등록해야 한다(HOME 환경변수만으로 부족).
+원래 Chrome process group을 끝낸 뒤 고정 `/bin/launchctl bootout user/<uid>`로
+전용 계정의 macOS 보조 서비스를 닫고 UID 전체의 잔류 부재를 재확인한다. 일반
+primitive 호출에는 이 정리를 적용하지 않는다. 로그인 사용자 영역은 대상이 아니다.
+
+확정할 수 없는 종료는 root 전용 active 기록을 유지한다. 자동 시작은 이를 지우지
+않는다. 관리자가 중지 상태를 조사한 뒤 `browser-guardian --recover <uid> <gid>
+<home> <recovery-directory>`를 호출하면 보호 디렉터리·배타 잠금·정확한 기록과 전용
+계정을 검증하고 이전 guardian PID와 해당 UID 프로세스가 없을 때만 기록을 지운다.
+PID 재사용·권한 불명·잔류 프로세스·변조 기록은 거부하며 프로세스를 임의로 죽이지 않는다.
+
+전용 Chrome은 앱이 중지 중에 버전을 교체한다. Chrome 자체 업데이트용
+MacAppCodeSignClone은 실행 파일의 hard link를 사용자 캐시에 만들어 강제 종료 후
+단일-link 검사를 깨뜨리므로 해당 feature만 비활성화한다. sandbox, 서명, root 소유와
+single-link 검사는 유지한다. Chrome 버전 또는 업데이트 소유권 변경 시 재검토한다.
+
+실기 검사: `mac-browser-guardian.check.cjs`에 전용 계정 home을
+`SAYCODE_GUARDIAN_DEDICATED_HOME`으로 전달하면 정상 종료/재시작과 관리자 복구를
+검사한다. 별도로 `SAYCODE_NATIVE_SERVICE_ACCEPTANCE=1`은 사전 설치한
+runtime-basic-verification 서비스의 실제 Chrome 연결·401·두 번의 종료/재시작·UID
+잔류 부재를 검사한다. 테스트 전용 PC에서만 실행하며 설치나 launchd 등록은 하지 않는다.
+이 검사는 실제 서명 task 발급·로그인 사이트 조작·Desktop 설치판 수락을 대체하지 않는다.

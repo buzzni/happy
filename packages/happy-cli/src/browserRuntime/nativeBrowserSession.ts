@@ -56,7 +56,8 @@ function deadline<T>(operation: () => Promise<T>, ms: number): Promise<T> {
  * The service supplies protected descriptors and an authenticated guard; this module
  * does not provision identities/ACLs or replace independent OS network enforcement. */
 export async function openNativeBrowserSession(options: NativeBrowserSessionOptions,
-    dependencies: { readOwner?: typeof readNativeSessionOwner; readPrincipal?: (pid: number) => string | undefined } = {}): Promise<NativeBrowserSession> {
+    dependencies: { readOwner?: typeof readNativeSessionOwner; readPrincipal?: (pid: number) => string | undefined;
+        probeOwner?: () => Promise<{ owner: SessionOwner; identity: string }> } = {}): Promise<NativeBrowserSession> {
     const interval = options.checkIntervalMs ?? 1000, timeout = options.checkTimeoutMs ?? 3000
     if (!Number.isSafeInteger(interval) || interval < 10 || interval > 5000 ||
         !Number.isSafeInteger(timeout) || timeout < 10 || timeout > 10_000) throw new Error('Invalid native browser monitor limits')
@@ -99,6 +100,12 @@ export async function openNativeBrowserSession(options: NativeBrowserSessionOpti
             if (closed || status.identity !== guard.identity || status.epoch !== guard.epoch) throw unavailable()
             if (baseline && (status.generation !== baseline.generation || status.violations !== baseline.violations)) throw unavailable()
             baseline ??= status
+        }
+        if (dependencies.probeOwner) {
+            const current = await deadline(dependencies.probeOwner, timeout)
+            if (closed || current.identity !== protection.identity || current.owner.bootId !== owner.bootId ||
+                current.owner.pid !== owner.pid || current.owner.pidStartTime !== owner.pidStartTime) throw unavailable()
+            return
         }
         const current = readOwner(owner.pid)
         if (!current || current.bootId !== owner.bootId || current.pid !== owner.pid || current.pidStartTime !== owner.pidStartTime) throw unavailable()

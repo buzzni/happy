@@ -4,6 +4,7 @@ import type { Readable, Writable } from 'node:stream'
 import { createMacNativeBrowserProtection } from './macNativeBrowserProtection'
 import { openNativeBrowserSession, type NativeBrowserSession } from './nativeBrowserSession'
 import { readNativeSessionOwner, verifyMacPrivateDirectory, verifyMacServiceExecutable } from './nativeHostPrimitives'
+import { macGuardianChannel } from './macGuardianChannel'
 import { macEgressChromeArgs } from './nativeMacEgressFence'
 
 const root = '/Library/Application Support/SaycodeNative'
@@ -31,11 +32,14 @@ export async function prepareMacNativeBrowser(options: {
         await exec('/usr/bin/codesign', ['--verify', '--strict', '-R', requirement, path], { timeout: 10000, maxBuffer: 8192, env: { PATH: '/usr/bin:/bin' } })
     }
     const baseline = protection ? JSON.stringify(await protection.snapshot()) : undefined
-    const child = spawn(guardian, [String(browserUid), String(browserGid), profile, `${root}/guardian-state`, chrome,
+    const child = spawn(guardian, [String(browserUid), String(browserGid), profile, `${root}/guardian-state`, '--dedicated-user-domain', chrome,
         '--headless=new', '--remote-debugging-pipe', `--user-data-dir=${profile}`,
         '--disable-crash-reporter', '--disable-breakpad', `--crash-dumps-dir=${profile}/crashes`,
         '--no-first-run', '--no-default-browser-check', '--disable-extensions',
         '--disable-background-networking', '--disable-sync', '--disable-component-update',
+        // The pinned service bundle is replaced only while stopped. Chrome's
+        // update clone hard-links the executable and survives forced shutdown.
+        '--disable-features=kMacAppCodeSignClone,MacAppCodeSignClone',
         '--password-store=basic', '--use-mock-keychain', ...macEgressChromeArgs(proxyPort), 'about:blank',
     ], { env: { PATH: '/usr/bin:/bin', HOME: profile, LANG: 'en_US.UTF-8' }, stdio: ['pipe', 'pipe', 'ignore', 'pipe', 'pipe'] })
     child.stdin!.on('error', () => {}) // EOF/exit is reconciled through the guardian's exit status.
@@ -55,22 +59,8 @@ export async function prepareMacNativeBrowser(options: {
         } finally { clearTimeout(timer) }
     })()
     try {
-        const pid = await new Promise<number>((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error('NATIVE_START_TIMEOUT')), 10000)
-            let buffer = ''
-            child.stdout!.on('data', chunk => {
-                buffer += chunk.toString('utf8')
-                if (buffer.length > 512) { clearTimeout(timer); reject(new Error('NATIVE_RECEIPT_INVALID')); return }
-                if (!buffer.includes('\n')) return
-                clearTimeout(timer)
-                try {
-                    const row = JSON.parse(buffer)
-                    if (Object.keys(row).sort().join(',') !== 'pid,uid,version' || row.version !== 1 || row.uid !== browserUid || !Number.isSafeInteger(row.pid) || row.pid <= 0) throw new Error()
-                    resolve(row.pid)
-                } catch { reject(new Error('NATIVE_RECEIPT_INVALID')) }
-            })
-            void exited.then(() => { clearTimeout(timer); reject(new Error('NATIVE_BROWSER_EXITED')) }, error => { clearTimeout(timer); reject(error) })
-        })
+        const channel = macGuardianChannel(child.stdin!, child.stdout!, exited, browserUid, 10000)
+        const pid = await channel.launch
         const owner = readNativeSessionOwner(pid)
         if (!owner) throw new Error('NATIVE_BROWSER_EXITED')
         let consumed = false
@@ -87,7 +77,7 @@ export async function prepareMacNativeBrowser(options: {
                         const current = await protection.snapshot()
                         if (guardianGone || JSON.stringify(current) !== baseline) throw new Error('NATIVE_PROTECTION_CHANGED')
                         return current
-                    } } : { mode: 'basic', identity: String(browserUid) }, checkTimeoutMs: 10000 })
+                    } } : { mode: 'basic', identity: String(browserUid) }, checkTimeoutMs: 10000 }, { probeOwner: () => channel.probe(owner) })
                 if (guardianGone) { await session.close(); throw new Error('NATIVE_OWNER_LOST') }
                 return session
             },

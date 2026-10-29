@@ -143,3 +143,14 @@ it('cannot downgrade a live guarded session by changing its options', async () =
     await expect(session.check()).rejects.toMatchObject({ code: 'RUNTIME_UNAVAILABLE' })
     expect(await session.stopped).toEqual({ terminated: true })
 })
+
+it('uses fresh supervisor evidence across service UIDs and stops on changed creation identity', async () => {
+    const h = fixture()
+    const probeOwner = vi.fn(async () => ({ owner: { ...h.options.owner }, identity: 'browser-user' }))
+    const session = await openNativeBrowserSession(h.options, { probeOwner, readOwner: () => { throw new Error('cross-UID access denied') } })
+    closers.push(session.close)
+    expect(session.driver.isConnected()).toBe(true)
+    probeOwner.mockResolvedValue({ owner: { ...h.options.owner, pidStartTime: '101' }, identity: 'browser-user' })
+    await expect(session.check()).rejects.toMatchObject({ code: 'RUNTIME_UNAVAILABLE' })
+    expect(await session.stopped).toEqual({ terminated: true })
+})

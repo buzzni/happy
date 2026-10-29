@@ -161,3 +161,87 @@ test('refuses a writable or symlinked recovery directory without creating a rece
   const link = join(recoveryDirectory(), 'link'); fs.symlinkSync(recovery, link);
   assert.notEqual((await launch('/usr/bin/true', [], uid, link).exited).code, 0);
 });
+
+// Explicit dedicated account acceptance; never use a logged-in user's UID.
+test('dedicated service domain drains and the same recovery directory can restart', { skip: !process.env.SAYCODE_GUARDIAN_DEDICATED_HOME }, async () => {
+  const home = process.env.SAYCODE_GUARDIAN_DEDICATED_HOME;
+  const recovery = recoveryDirectory();
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const child = spawn(guardian, [uid, gid, home, recovery, '--dedicated-user-domain', '/bin/sleep', '120'], {
+      env: { PATH: '/usr/bin:/bin' }, stdio: ['pipe', 'pipe', 'inherit', 'pipe', 'pipe'],
+    });
+    const exited = once(child, 'exit');
+    try {
+      const receipt = await Promise.race([once(child.stdout, 'data'), exited.then(([code]) => { throw new Error(`no launch receipt: ${code}`); })]);
+      assert.equal(JSON.parse(receipt[0]).uid, Number(uid));
+      child.stdin.end();
+      assert.deepEqual(await exited, [0, null]);
+      assert.equal(fs.existsSync(join(recovery, 'active')), false);
+    } finally { child.stdin.destroy(); await exited; }
+  }
+});
+
+test('explicit recovery refuses a live guardian and only clears a drained dedicated identity', { skip: !process.env.SAYCODE_GUARDIAN_DEDICATED_HOME }, async () => {
+  const home = process.env.SAYCODE_GUARDIAN_DEDICATED_HOME, recovery = recoveryDirectory();
+  const recover = () => spawnSync(guardian, ['--recover', uid, gid, home, recovery], { encoding: 'utf8' });
+  const run = launch('/bin/sleep', ['120'], uid, recovery);
+  await run.ready;
+  assert.notEqual(recover().status, 0, 'a live owner retains its latch');
+  run.child.stdin.end(); await run.exited;
+  // A root-owned stale operation from an exited guardian, never an invented PID.
+  fs.writeFileSync(join(recovery, 'active'), `v1 uid=${uid} guardian=${run.child.pid}\n`, { mode: 0o600 });
+  fs.chmodSync(join(recovery, 'active'), 0o644);
+  assert.notEqual(recover().status, 0, 'unprotected records cannot authorize recovery');
+  fs.chmodSync(join(recovery, 'active'), 0o600);
+  const other = launch('/bin/sleep', ['120']);
+  await other.ready;
+  try { assert.notEqual(recover().status, 0, 'UID residue blocks recovery even with no previous guardian'); }
+  finally { other.child.stdin.end(); await other.exited; }
+  assert.equal(recover().status, 0);
+  assert.equal(fs.existsSync(join(recovery, 'active')), false);
+});
+
+test('installed basic service connects, drains and restarts without a Guard', { skip: process.env.SAYCODE_NATIVE_SERVICE_ACCEPTANCE !== '1', timeout: 45000 }, async () => {
+  const root = '/Library/Application Support/SaycodeNative';
+  const config = JSON.parse(fs.readFileSync(join(root, 'runtime.json'), 'utf8'));
+  assert.equal(config.nativeService.networkProtection, 'basic');
+  assert.equal(config.nativeService.browserUid, Number(uid));
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const child = spawn(join(root, 'runtime-basic-verification/node'), [join(root, 'runtime-basic-verification/dist/runtime.mjs')], {
+      env: { PATH: '/usr/bin:/bin', ABP_CONFIG_FILE: join(root, 'runtime.json'), ABP_STATE_DIR: join(root, 'runtime-state') },
+      stdio: ['ignore', 'ignore', 'inherit'],
+    });
+    const exited = once(child, 'exit');
+    try {
+      let healthy = false;
+      for (let check = 0; check < 100 && child.exitCode === null; check++) {
+        const health = await fetch(`http://127.0.0.1:${config.runtimePort}/v1/health`).then(r => r.json()).catch(() => null);
+        if (health?.pid === child.pid && health.profiles?.length && health.profiles.every(p => p.connected)) { healthy = true; break; }
+        await delay(100);
+      }
+      assert.equal(healthy, true, 'this service must connect its own browser');
+      const status = await new Promise((resolve, reject) => {
+        const request = require('node:http').get({ socketPath: config.brokerSocketPath, path: '/v1/sessions' }, response => { response.resume(); resolve(response.statusCode); });
+        request.on('error', reject);
+      });
+      assert.equal(status, 401, 'native commands still require a fresh signature');
+    } finally {
+      child.kill('SIGTERM');
+      assert.deepEqual(await exited, [0, null]);
+    }
+    assert.equal(fs.existsSync(join(root, 'guardian-state/active')), false);
+    assert.equal(fs.statSync(join(root, 'browser/Google Chrome.app/Contents/MacOS/Google Chrome')).nlink, 1);
+    const identities = execFileSync('/bin/ps', ['-axo', 'uid='], { encoding: 'utf8' }).trim().split(/\s+/).map(Number);
+    assert.equal(identities.includes(Number(uid)), false);
+    assert.equal(identities.includes(config.nativeService.runtimeUid), false);
+  }
+});
+
+test('dedicated cleanup refuses interactive UIDs and mismatched service homes', async () => {
+  for (const [identity, home] of [['501', '/Library/Application Support/SaycodeNative/browser-profile'], [uid, '/var/empty']]) {
+    const recovery = recoveryDirectory();
+    const result = spawnSync(guardian, [identity, gid, home, recovery, '--dedicated-user-domain', '/usr/bin/true'], { stdio: ['pipe', 'pipe', 'pipe', 'pipe', 'pipe'] });
+    assert.equal(result.status, 125);
+    assert.equal(fs.existsSync(join(recovery, 'active')), false);
+  }
+});
