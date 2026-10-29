@@ -3,7 +3,7 @@ import { startDaemonControlServer } from './controlServer'
 
 const report = { sessionId: 'source', runtimeId: 'runtime', hostPid: 42, callerPublicKey: 'k'.repeat(43) }
 async function control(issue: ((raw: unknown) => Promise<unknown>) | null, managedRuntime = false,
-  current: (raw: unknown) => { current: boolean } = () => ({ current: false })) {
+  current: (raw: unknown) => Promise<{ current: boolean }> = async () => ({ current: false })) {
   return startDaemonControlServer({
     getCallerLaunches: () => issue ? { issue, current } : null, managedRuntime,
     getChildren: () => [], stopSession: () => ({ status: 'not-found' } as any),
@@ -45,10 +45,10 @@ describe('owner-contact caller-binding control route (T1c-b2 H2)', () => {
     } finally { await server.stop() }
   })
   it('answers whether a binding is still current, and nothing else [H2-R-03]', async () => {
-    const current = vi.fn((raw: unknown) => ({ current: (raw as { callerBindingId: string }).callerBindingId === 'live' }))
+    const current = vi.fn(async (raw: unknown) => ({ current: (raw as { callerBindingId: string }).callerBindingId === 'live' }))
     const server = await control(async () => ({}), false, current)
     const absent = await control(null)
-    const throwing = await control(async () => ({}), false, () => { throw new Error('detail') })
+    const throwing = await control(async () => ({}), false, async () => { throw new Error('detail') })
     try {
       const body = { sessionId: 'source', callerBindingId: 'live' }
       expect((await post(server, body, false, '/caller-binding/current')).status).toBe(401)

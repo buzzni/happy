@@ -5317,11 +5317,15 @@ export async function startDaemon(): Promise<void> {
     };
     const liveLaunch = (tracked: TrackedSession) => tracked.pid > 0 && isPidAlive(tracked.pid);
     // Default OFF: the route refuses and agent-caller-binding answers only owned-journal sources.
+    // A token's account never changes, so only a confirmed answer is remembered; registration is re-read every time.
+    const accountByToken = new Map<string, string>();
     callerLaunches = createAgentCallerLaunches({ enabled: process.env[OWNER_CONTACT_SWITCH] === '1',
       identity: async () => {
         try {
-          const state = await ownedRegistration();
-          return { machineId: state.machineId, happyAccountId: await authenticatedAccountId(state.credentials.token), epoch: state.epoch };
+          const state = await ownedRegistration(), token = state.credentials.token;
+          const happyAccountId = accountByToken.get(token) ?? await authenticatedAccountId(token);
+          accountByToken.set(token, happyAccountId);
+          return { machineId: state.machineId, happyAccountId, epoch: state.epoch };
         } catch { return null; }
       },
       trust: () => readOwnerContactTrust(process.env, configuration.serverUrl), trackedByPid: pid => pidToTrackedSession.get(pid), live: liveLaunch });

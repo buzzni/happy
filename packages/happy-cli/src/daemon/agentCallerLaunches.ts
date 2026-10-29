@@ -36,6 +36,9 @@ export function readOwnerContactTrust(env: Record<string, string | undefined>, h
     } catch { return null; }
 }
 
+const sameIdentity = (current: Identity | null, issued: Identity) => current?.epoch === issued.epoch
+    && current.machineId === issued.machineId && current.happyAccountId === issued.happyAccountId;
+
 export function createAgentCallerLaunches(deps: {
     /** Rollout switch (HAPPY_OWNER_CONTACT_V1). Default OFF; enabling grants no authority by itself. */
     enabled: boolean;
@@ -102,13 +105,21 @@ export function createAgentCallerLaunches(deps: {
             bound.set(report.sessionId, { pid: report.hostPid, caller, identity });
             return { caller: { ...caller }, trust };
         },
-        /** Lets a host check, before each signature and reply, that the daemon still vouches for its binding. */
-        current(raw: unknown) {
+        /** Lets a host check, before each signature and reply, that the daemon still vouches for its binding.
+         * Same fences as query(): an ended launch or a changed/unknown identity revokes the binding. */
+        async current(raw: unknown): Promise<{ current: boolean }> {
             const input = z.object({ sessionId: ownershipId, callerBindingId: ownershipId }).strict().parse(raw);
-            const entry = bound.get(input.sessionId), session = entry && deps.trackedByPid(entry.pid);
-            return { current: deps.enabled && !!session && entry.caller.callerBindingId === input.callerBindingId && session.pid === entry.pid
-                && session.startedBy === 'daemon' && deps.live(session)
-                && (session.happySessionId === undefined || session.happySessionId === input.sessionId) };
+            const entry = bound.get(input.sessionId);
+            if (!deps.enabled || !entry || entry.caller.callerBindingId !== input.callerBindingId) return { current: false };
+            const session = deps.trackedByPid(entry.pid);
+            if (!session || session.pid !== entry.pid || session.startedBy !== 'daemon' || !deps.live(session)
+                || (session.happySessionId !== undefined && session.happySessionId !== input.sessionId)) {
+                bound.delete(input.sessionId); return { current: false };
+            }
+            const identity = await deps.identity().catch(() => null);
+            if (bound.get(input.sessionId) !== entry) return { current: false };
+            if (!sameIdentity(identity, entry.identity)) { bound.delete(input.sessionId); return { current: false }; }
+            return { current: true };
         },
         /** agent-caller-binding for non-journal sources. Never reconstructs a binding. */
         async query(raw: unknown) {
@@ -119,12 +130,9 @@ export function createAgentCallerLaunches(deps: {
             const pending = deps.trackedByPid(entry.pid);
             if (pending?.pid === entry.pid && pending.happySessionId === undefined && deps.live(pending)) throw new Error('caller-pending');
             try { launch(input.sessionId, entry.pid, true); } catch (error) { bound.delete(input.sessionId); throw error; }
-            const identity = await deps.identity();
+            const identity = await deps.identity().catch(() => null);
             if (bound.get(input.sessionId) !== entry) throw new Error('caller-changed');
-            if (identity?.epoch !== entry.identity.epoch || identity.machineId !== entry.identity.machineId
-                || identity.happyAccountId !== entry.identity.happyAccountId) {
-                bound.delete(input.sessionId); throw new Error('identity-changed');
-            }
+            if (!sameIdentity(identity, entry.identity)) { bound.delete(input.sessionId); throw new Error('identity-changed'); }
             return { version: 1 as const, nonce: input.nonce, caller: { ...entry.caller } };
         },
     };

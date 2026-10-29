@@ -25,7 +25,9 @@ function harness(options: { enabled?: boolean; tracked?: Partial<TrackedSession>
     let alive = true;
     let session: TrackedSession | undefined = options.tracked === null ? undefined : { startedBy: 'daemon', pid: 42, directory: '/project',
         happySessionId: 'source', ...options.tracked } as TrackedSession;
-    const build = () => createAgentCallerLaunches({ enabled: options.enabled ?? true, identity: async () => identity, trust: () => trust,
+    let identityFails = false;
+    const build = () => createAgentCallerLaunches({ enabled: options.enabled ?? true,
+        identity: async () => { if (identityFails) throw new Error('profile unavailable'); return identity; }, trust: () => trust,
         trackedByPid: pid => pid === session?.pid ? session : undefined, live: () => alive, realpath: path => path });
     let launches = build();
     let capabilities = new Map<number, string | undefined>();
@@ -39,7 +41,9 @@ function harness(options: { enabled?: boolean; tracked?: Partial<TrackedSession>
     return { get launches() { return launches; }, spawn, report, stop: () => { alive = false; }, resume: (pid: number) => { session = { ...session!, pid }; },
         restartDaemon: () => { launches = build(); capabilities = new Map(); },
         webhook: (id: string | undefined) => { session = { ...session!, happySessionId: id }; },
-        switchAccount: () => { identity = { ...identity!, happyAccountId: 'other' }; }, forget: () => { identity = null; } };
+        switchAccount: () => { identity = { ...identity!, happyAccountId: 'other' }; }, forget: () => { identity = null; },
+        changeEpoch: () => { identity = { ...identity!, epoch: 'e2' }; }, failIdentity: () => { identityFails = true; },
+        restoreIdentity: () => { identity = { machineId: 'machine', happyAccountId: 'account', epoch: 'e1' }; } };
 }
 const nonce = 'n'.repeat(32);
 describe('daemon launch caller bindings', () => {
@@ -128,6 +132,31 @@ describe('daemon launch caller bindings', () => {
         expect(resumed.caller.callerBindingId).not.toBe(old.caller.callerBindingId);
         expect(resumed.caller.hostEpoch).not.toBe(old.caller.hostEpoch);
         expect((await h.launches.query({ sessionId: 'source', nonce })).caller).toEqual(resumed.caller);
+    });
+    it.each(['switchAccount', 'forget', 'changeEpoch'] as const)('current() revokes the binding after %s [H2-R-06]', async action => {
+        const h = harness(); await h.spawn();
+        const issued = await h.launches.issue(h.report());
+        const ask = () => h.launches.current({ sessionId: 'source', callerBindingId: issued.caller.callerBindingId });
+        expect(await ask()).toEqual({ current: true });
+        h[action]();
+        expect(await ask()).toEqual({ current: false });
+        h.restoreIdentity();
+        expect(await ask()).toEqual({ current: false });
+        await expect(h.launches.query({ sessionId: 'source', nonce })).rejects.toThrow('caller-unavailable');
+    });
+    it('query() revokes when the identity lookup fails, like current() [H2-R-06]', async () => {
+        const h = harness(); await h.spawn();
+        await h.launches.issue(h.report());
+        h.failIdentity();
+        await expect(h.launches.query({ sessionId: 'source', nonce })).rejects.toThrow('identity-changed');
+        h.restoreIdentity();
+        await expect(h.launches.query({ sessionId: 'source', nonce })).rejects.toThrow('caller-unavailable');
+    });
+    it('current() answers false when the identity lookup fails [H2-R-06]', async () => {
+        const h = harness(); await h.spawn();
+        const issued = await h.launches.issue(h.report());
+        h.failIdentity();
+        expect(await h.launches.current({ sessionId: 'source', callerBindingId: issued.caller.callerBindingId })).toEqual({ current: false });
     });
     it.each(['stop', 'switchAccount', 'forget'] as const)('stops vouching after %s', async action => {
         const h = harness(); await h.spawn();

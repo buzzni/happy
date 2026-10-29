@@ -49,9 +49,17 @@ ON이어도 trust 설정(`HAPPY_SESSION_OWNERSHIP_ENABLED/ISSUER/AUDIENCE/PUBLIC
   depth 0, scope는 daemon이 실제로 띄운 cwd의 realpath. agent grant가 있는 launch는 lineage를 daemon이
   확인할 수 없으므로 `caller-lineage-unknown`으로 소유 확장만 unavailable이다. 기존 provider env 전달은
   그대로다. depth≥1 binding은 daemon이 기록한 owned lineage(H3)에서만 생긴다.
-- **현재 binding 확인(H2-R-03)**: host는 서명 전·전송 후·응답 채택 전 각 단계에서 daemon
+- **현재 binding 확인(H2-R-03·R-06)**: host는 서명 전·전송 후·응답 채택 전 각 단계에서 daemon
   `/caller-binding/current`로 자기 callerBindingId가 아직 현재인지 확인한다. 재개로 교체되었거나 launch가
   끝났으면 만료 전 contact가 남아 있어도 서명·전송·응답 채택을 하지 않는다. 확인 실패는 "현재 아님"이다.
+  current와 `agent-caller-binding` 조회는 같은 울타리를 쓴다: 발급 당시 machine/account/등록 epoch와 현재
+  identity가 다르거나 identity 조회가 실패하면 binding을 폐기하며, identity가 돌아와도 되살리지 않는다.
+  daemon은 token별 account id 확인값만 기억하고 등록 상태는 매번 다시 읽는다.
+- **세션 경계의 env(H2-R-05)**: `SAYCODE_OWNER_CONTACT_*`는 session-scope(같은 세션의 agent CLI까지만),
+  `HAPPY_OWNER_CONTACT_FD`는 spawn-seed로 분류해 새 세션 경계에서 지운다. host bootstrap은 capability 없음·
+  managed·스위치 off를 포함한 모든 경로에서 broker 시작 전에 상속 주소를 지운다. 스위치
+  `HAPPY_OWNER_CONTACT_V1`은 daemon 설정이므로 그대로 전달된다. 요청 env는 기존 sanitizer가
+  `HAPPY_`/`SAYCODE_` 접두어를 이미 막는다.
 - **webhook 순서**: Claude는 session-started 보고가 이 지점보다 늦을 수 있다. 발급은 launch pid로 하되
   launch가 다른 sessionId를 이미 갖고 있으면 거부한다. 조회는 webhook이 같은 sessionId를 확정한 뒤에만
   답하며, 확정 전은 `caller-pending`(binding 유지), 다른 세션·종료·계정 변경은 폐기다.
@@ -95,6 +103,8 @@ ON이어도 trust 설정(`HAPPY_SESSION_OWNERSHIP_ENABLED/ISSUER/AUDIENCE/PUBLIC
   daemon depth 고정.
 - 교차 리뷰(H2-R-01~04) 역검증 6건: capability 비교, capability 일회성, lineage 거부, daemon 현재 binding
   확인, 자식 연산 통과, 스위치 off에서도 capability 소비. 각각 되돌리면 해당 테스트가 실패하고 복원 후 통과했다.
+- 확인 재리뷰(H2-R-05·06) 역검증 6건: 조기 반환 전 주소 삭제, 두 env 분류, current의 identity 비교와 폐기,
+  query의 identity 조회 실패 폐기.
 
 이전 부분 구현(63195d7b, 27e5490d)의 내부 port·broker private IPC·local transport는 그대로 재사용했다.
 그 커밋의 local transport 15건은 지휘 세션 셸에서 실소켓으로 통과했다.
