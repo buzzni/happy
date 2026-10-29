@@ -10,6 +10,7 @@
 
 - 브랜치 `ernie/codex-subagent-activity`. 기준 커밋 `346fe458`(`.362` 릴리스, 2026-10-28 원격 main과 같음).
   `a8e0ddac`(`.360`)에서 fast-forward했고, 그사이 들어온 11개 파일은 이 작업 파일과 겹치지 않는다.
+  2026-10-29 최신 main(34c1272a, `.363`·`.364` 포함)을 병합 커밋 07287f9d로 가져왔다(충돌 없음).
 - 주문 01~05·05b 구현과 이 문서 세트를 로컬 커밋 2개(구조 `emitCodexUsage()` 추출 → 기능)로 남겼다. 출시 전 실앱
   검증(2026-10-28, 개인 공간·buzzni)에서 찾은 줄 빠짐을 D16 커밋으로 고쳤다. push·PR·버전 bump·태그·발행은 하지
   않았다. 실앱 검증 기록은 Desktop 작업트리 `.aplus/verification/evidence/20261028-codex-subagent-real/RESULTS.md`.
@@ -155,7 +156,7 @@
 | `… src/codex/codexSubagentReplay.test.ts` | 36 passed, skip 0 | 주문 04, 05, 05b |
 | `… src/codex/__tests__/sessionProtocolMapper.test.ts` | 23 passed | 주문 04 |
 | `… src/codex/runCodex.shutdown.test.ts` | 43 passed → 47 passed → 48 passed | 주문 04 → 05b(검수 수정 뒤) → 2026-10-28 셀프 리뷰(목록이 없던 대화는 빈 목록을 쓰지 않음) |
-| `… src/api/apiSession.test.ts` / `src/utils/offlineSessionStub.test.ts` | 220 passed + 작업 전부터 실패하던 1건 / 1 passed | 주문 05b |
+| `… src/api/apiSession.test.ts` / `src/utils/offlineSessionStub.test.ts` | 220 passed + 작업 전부터 실패하던 1건 / 1 passed | 주문 05b. 그 1건의 원인은 2026-10-29에 확인했다: 테스트가 Saycode 세션이 넣은 `HAPPY_AI_AUTH_SOURCE` 등 환경 변수를 막지 않는다. `env -u HAPPY_AI_AUTH_SOURCE -u HAPPY_AI_AUTH_CONNECTION_VERSION -u HAPPY_AI_AUTH_SETUP_TOKEN_BINDING`로 돌리면 통과한다 |
 | `… runCodex.capacityRetry` / `runCodex.channelClear` / `runCodex.lessonProposal` | 31 / 7 / 34 passed | 주문 04, 05, 05b |
 | `… codexThreadFork` / `codexThreadTransfer` / `resumeExistingThread` / `codexEndInput` / `codexAbortNotice` | 4 / 9 / 2 / 10 / 6 passed | 주문 03 |
 
@@ -163,6 +164,8 @@
 - 빌드 없는 회귀: 주문 04에서 코덱스 매퍼·runCodex를 쓰는 테스트와 작업 전 기준 코덱스 묶음까지 28파일 통과.
   2026-10-28 문서 작성 때 spec의 테스트 이름을 대조하려고 5파일(클라이언트·재생·트래커·`runCodex.shutdown`·매퍼)을
   다시 돌려 387 passed.
+- 2026-10-29 최신 main 병합(07287f9d, 충돌 없음) 뒤: typecheck 통과. 트래커·클라이언트·재생·`runCodex.shutdown`·매퍼·
+  `apiSession`·`offlineSessionStub` 7파일 624 passed(위 환경 변수를 뺀 실행).
 - 녹음 재생 하네스(바뀐 런타임으로 실시간 1/4 축소 재생): 6개 녹음 모두 한 턴, 그 턴 안에 `CodexAgent` 줄 한 쌍,
   `turn-end` 뒤 envelope 0개, 목록 발행 `[]` → `[자식]` → `[]`. 목록 발행이 줄보다 먼저 나가 Desktop에서 줄이
   처음부터 "실행 중"으로 보인다. 서브 에이전트 흔적을 뺀 재생은 작업 전 출력과 같다(앞쪽 빈 목록 발행 1건 제외).
@@ -235,8 +238,8 @@
 - [x] 1. 기능 변경 커밋(사용자 승인 뒤). 구조 변경 `emitCodexUsage()` 추출(동작 동일)을 `[structural]`로 먼저, 나머지를
   `[behavioral]`로 나눈다.
 - [ ] 2. push → PR(`gh pr create --repo buzzni/happy --base main …`) → CI 통과 → main 머지. push·PR 생성·머지는
-  각각 사용자 승인 뒤에 한다. 이 브랜치는 `.362`(346fe458) 위에 있다. PR 전에 최신 main을 가져온다(2026-10-29
-  `git merge-tree`로 `.364`(3bc47156)와 충돌 없음 확인).
+  각각 사용자 승인 뒤에 한다. 2026-10-29 사용자 승인으로 최신 main(34c1272a, `.364` 이후)을 병합 커밋 07287f9d로
+  가져왔다(충돌 없음). PR 직전에 다시 `git fetch`해서, main이 더 나아갔으면 한 번 더 병합한다.
 - [ ] 3. 버전 bump(**사용자 승인 뒤 메인 세션이 커밋**): `packages/happy-cli/package.json`을 그때 main의 번호 →
   다음 빈 번호(2026-10-29 기준 `1.1.10-aplus.365`). 이 저장소 관례대로 bump만 담은 `[behavioral] release(cli): … 후보
   준비` 커밋·PR로 main에 머지한다. 런북 Version Bump 2단계대로 빌드와 관련 테스트를 돌린다. 직전에 그 번호가 비어
