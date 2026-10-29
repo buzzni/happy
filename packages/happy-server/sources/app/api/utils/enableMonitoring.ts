@@ -1,12 +1,14 @@
 import { db } from "@/storage/db";
 import { Fastify } from "../types";
 import {
+    automationReadRequestsCounter,
     httpRequestsCounter,
     httpRequestDurationHistogram,
     httpRequestPhaseDurationHistogram,
     eventLoopLagMaxMsSinceScrape,
     getMetricsLabelsFromRequest,
 } from "@/app/monitoring/metrics2";
+import { AutomationReadDiagnostics, automationReadSource, isAutomationReadRoute } from "@/app/monitoring/automationReadDiagnostics";
 import { log, warn, error } from "@/utils/log";
 
 // 이보다 오래 걸린 요청만 접근 로그를 남긴다.
@@ -96,6 +98,7 @@ async function sendHealth(reply: { code: (statusCode: number) => { send: (payloa
 }
 
 export function enableMonitoring(app: Fastify) {
+    const automationReads = new AutomationReadDiagnostics();
     // Add metrics hooks
     app.addHook('onRequest', async (request, reply) => {
         request.startTime = Date.now();
@@ -138,6 +141,12 @@ export function enableMonitoring(app: Fastify) {
 
         // Increment request counter
         httpRequestsCounter.inc({ method, route, status, ...labels });
+        if (isAutomationReadRoute(route, method)) {
+            const source = automationReadSource(request.headers['x-happy-read-source']);
+            automationReadRequestsCounter.inc({ route, status, source });
+            const sample = automationReads.observe({ accountId: request.userId, projectId: (request.params as { projectId?: string })?.projectId, route, source, status: reply.statusCode }, end);
+            if (sample) warn({ module: 'automation-read', ...sample }, 'Automation read burst (observation only)');
+        }
 
         // Record request duration
         httpRequestDurationHistogram.observe({ method, route, status, ...labels }, duration);
