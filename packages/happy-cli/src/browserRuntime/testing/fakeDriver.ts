@@ -80,15 +80,29 @@ export class FakeBrowserDriver implements BrowserDriver {
     }
     /** Make closeTab report a beforeunload prompt for `tabId` (the page stays open). */
     blockUnload(tabId: TabId, blocked: boolean): void { if (blocked) this.unloadBlocked.add(tabId); else this.unloadBlocked.delete(tabId) }
+    /** The user closes the window: the target is gone, and the driver saw it go. */
+    closeByUser(tabId: TabId): void { this.pages.delete(tabId) }
+    private disconnected = false
+    /** A lost browser connection: no tab is known and closeTab fails, while the pages stay open. */
+    setDisconnected(disconnected: boolean): void { this.disconnected = disconnected }
     async closeTab(tabId: TabId, opts: DriverOptions): Promise<{ closed: boolean; beforeUnloadBlocked?: boolean }> {
+        if (this.disconnected) throw new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'driver is not connected', true, false)
         await this.delay('closeTab', opts); this.throwNextFailure('closeTab'); const page = this.pages.get(tabId); if (!page) return { closed: false }
         if (this.unloadBlocked.has(tabId)) return { closed: false, beforeUnloadBlocked: true }
         this.pages.delete(tabId); this.record(tabId, `target-${tabId}`, 'closeTab'); return { closed: true }
     }
-    hasTab(tabId: TabId): boolean { return this.pages.has(tabId) }
+    hasTab(tabId: TabId): boolean { return !this.disconnected && this.pages.has(tabId) && !this.forgotten.has(tabId) }
+    private readonly forgotten = new Set<TabId>()
+    /** The driver loses a tab whose page stays open (its session detached; not adopted again yet). */
+    forget(tabId: TabId): void { this.forgotten.add(tabId) }
+    async targetExists(targetId: string, _opts: DriverOptions): Promise<boolean | undefined> {
+        if (this.disconnected) return undefined
+        return [...this.targetIds].some(([tabId, target]) => target === targetId && this.pages.has(tabId))
+    }
     async adoptTab(tabId: TabId, targetId: string, _allowedOrigins: string[], _opts: DriverOptions): Promise<boolean> {
         this.throwNextFailure('adoptTab')
         const adopted = this.pages.has(tabId) && this.targetIds.get(tabId) === targetId
+        if (adopted) this.forgotten.delete(tabId)
         this.adoptedTabs.push({ tabId, targetId, adopted })
         return adopted
     }

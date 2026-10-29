@@ -160,9 +160,13 @@ Saydo `specs/agent-browser-deploy/` D3 (verify), D4, D8, D9, D10 (Runtime side).
     Its windows still count toward `maxAgentWindows`.
   - A tab blocking unload stays open, is recorded in `reclaimBlockedTabs` and reported, and
     is retried on each pass.
-  - Operator: admin socket `GET /admin/spaces` (owner session, tasks, tabs, age, counted)
+  - Tabs kept for the user (2026-10-29): see "Tab provenance and tabs kept for the user"
+    below. Reclamation never closes them; a space holding one stays open (reclaiming) and
+    every pass reports them as `retainedTabs`.
+  - Operator: admin socket `GET /admin/spaces` (owner session, tasks, tabs, kept tabs, age, counted)
     and `POST /admin/close-space { taskSpaceId, force? }` (cancel, then close; `force`
-    also closes a space with unknown-outcome tasks, whose records stay for reconcile).
+    also closes a space with unknown-outcome tasks, whose records stay for reconcile, and
+    tabs kept for the user).
     TODO (S6 installer stream): wire `abp-stack spaces list|close <id> [--force]` to these.
 - Retention (`retentionDays`, config mode, at start and hourly): terminal tasks without
   uncertain actions whose last change is older than the retention are deleted
@@ -293,6 +297,74 @@ in the browser image. Accounting (review P1-8): one reservation per target — t
 (a failed cleanup keeps it); popups of owned tabs count too, and a popup over the cap is closed
 with every request of it failed. Whether this meets the 30-minute soak criterion is measured by
 `soak.mjs`, which reports cgroup memory and the Chromium process RSS sum separately.
+
+### Tab provenance and tabs kept for the user (2026-10-29)
+
+Provenance. A space tab is the agent's only because `openPage` created it; its disposition
+(`SpaceRecord.tabDispositions[tabId]`, optional, compatible) records `createdBy: 'agent'`, and
+`adoptedAtMs` when a restarted Runtime re-took it by its persisted targetId (adoption is not
+creation). Everything else is of unknown origin and is never closed by task cleanup: popups
+(their opener is known from CDP, their cause is not — a page timer or an earlier user popup can
+open one during an agent click), and pages the user opens. The driver's existing security and
+quota closes (disallowed origin, failed interception, over the window cap) are unchanged. No
+popup, active tab or window position ever makes a page the agent's.
+
+Kept for the user. From the moment a tab is handed to the user — a hand-off (`waitReason:
+'handoff'`), a page that lands on a login or captcha wait — or a user takes it over, its
+disposition carries `retained { reason, taskId, atMs }`, written before that step is acknowledged
+(a failed write fails the takeover or the step). A takeover writes it first and then checks
+again — credential, task not terminal or waiting for an approval, tab still open in its space,
+lease epoch, in-flight driver call — and fences with no await in between: of two takeovers with
+the same epoch one succeeds and one gets `STALE_LEASE`, and a task cancelled meanwhile is not
+taken over. A refused takeover leaves the (sticky) record. The store's metadata queue only
+serializes space writes; it does not lock the tab's lifecycle (driver events, and other work
+after the write completes, can still run before the takeover continues), which is why the
+final synchronous checks, not the queue, make the fence safe. The record is sticky: giving control back, resuming,
+finishing, cancelling, the session ending, idling, expiring or a restart do not clear it. Such a
+tab keeps its task, space, target, lease epoch and disposition records and stays counted against
+`maxActiveTabs` and `maxAgentWindows`, and its task record is not purged:
+
+- reclamation (session end, idle, operator without `force`) closes the space's other tabs and
+  reports the kept ones as `retainedTabs`; the space stays open (reclaiming, counted beyond the
+  reserve) and is reported on every pass;
+- retention keeps the expired task; a local client's end completes without waiting for it;
+- the agent's `closePage` and `closeSpace` refuse it (CONFLICT); only the operator's forced
+  `close-space` closes it;
+- once the user closed its window, the next cleanup drops it with its disposition (the space can
+  then close and stop counting) — but only when the browser it was opened in, connected and of the
+  same instance, no longer lists its persisted targetId (`BrowserDriver.targetExists`). The
+  driver's own view is not evidence: a detached session, a crashed renderer or a remembered close
+  leave a kept tab in place; while that cannot be asked (connection lost, another instance, no
+  answer) it stays and is retried. Nothing is ever sent to such a tab;
+- a restart re-adopts it in the same browser with the disposition unchanged; a replaced browser
+  or a vanished target drops it (and its disposition) as before — nothing is re-attached by URL,
+  active tab or window position;
+- a tab without a disposition comes from a Runtime before dispositions. Its tasks only show a
+  hand-off that is still current (a release, resume or finish clears it), so their silence proves
+  nothing: at restart it gets `retained` when a current user wait or user control on it is shown,
+  otherwise `retentionUnknown: true`. That `retained` reason can be inferred from task-level
+  state (a task paused for user control marks each of its tabs), so it is not proof that the
+  user controlled that particular tab. Either way the tab is kept exactly like a retained tab (also across further
+  restarts, reclamation, agent close, local client end and retention), but not labelled a
+  hand-off. Until that repair a missing disposition counts as kept too. Tabs this Runtime opens
+  always carry their own disposition and close normally unless handed over.
+
+Not covered: after a task is terminal, the user cannot take over a kept tab again (takeover and
+the console listing still exclude finished tasks); the tab stays open in the profile's browser
+until the operator closes it. A profile reassignment (another owner or assignment) ends the
+previous assignment's spaces as before, kept tabs included. Stopping the browser stack still
+ends every page.
+
+Downgrade risk: a Runtime from before dispositions ignores them and closes kept tabs on its next
+cleanup. Before running one on this state: fence new work, stop the Runtime only (keep the
+browser), keep the state volume and the inventory of kept browserInstanceId/targetId pairs, and
+either run a dispositions-aware Runtime or get an explicit decision for those targets. Do not
+erase dispositions, lower quotas or stop the whole stack to make a downgrade look clean. No
+command automates this.
+
+Known gap, unchanged here: a popup opened before a Runtime restart is released
+at the new connection's attach, so its requests are no longer checked (observed 2026-10-29: a
+POST to a disallowed origin was sent after restart).
 
 ### Destinations before requests (review P0-3)
 

@@ -1202,6 +1202,40 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
         })
     })
 
+    describe('targetExists (asked of the browser)', () => {
+        it('tells a live, a closed and a crashed target apart from what the driver remembers, and knows nothing while disconnected', async () => {
+            const own = await launchChrome()
+            const ownHarness = await HarnessCdp.connect(own.browserWsUrl)
+            const d = new CdpDriver({ browserWsUrl: own.browserWsUrl, browserInstanceIdProvider: async () => instanceId })
+            try {
+                await d.connect()
+                const [kept, closed, crashed] = await Promise.all([0, 1, 2].map(() => d.openTab(a.url('/plain'), [a.origin], OPTS)))
+                expect(await d.targetExists(kept.targetId, OPTS)).toBe(true)
+                await ownHarness.closeTarget(closed.targetId)
+                await eventually(() => d.hasTab(closed.tabId), (has) => !has)
+                expect(await d.targetExists(closed.targetId, OPTS)).toBe(false)
+                // A crashed renderer: the driver forgets the tab (as if closed), the target is still there.
+                const { sessionId } = await ownHarness.conn.send('Target.attachToTarget', { targetId: crashed.targetId, flatten: true })
+                // The renderer dies before it can answer: do not wait for the reply.
+                void ownHarness.conn.send('Page.crash', {}, sessionId).catch(() => undefined)
+                await eventually(() => d.hasTab(crashed.tabId), (has) => !has)
+                expect(await d.targetExists(crashed.targetId, OPTS)).toBe(true)
+                // Adopted again by a fresh connection and then disconnected: nothing remembered answers for the browser.
+                await d.close()
+                expect(await d.targetExists(kept.targetId, OPTS)).toBeUndefined()
+                await d.connect()
+                expect(await d.adoptTab(kept.tabId, kept.targetId, [a.origin], OPTS)).toBe(true)
+                await d.close()
+                expect(await d.targetExists(kept.targetId, OPTS)).toBeUndefined()
+                expect(await d.targetExists(closed.targetId, OPTS)).toBeUndefined()
+            } finally {
+                await d.close()
+                ownHarness.close()
+                await own.stop()
+            }
+        })
+    })
+
     describe('connection loss', () => {
         it('rejects pending calls with RUNTIME_UNAVAILABLE, drops tabs, and reconnects only explicitly', async () => {
             const first = await launchChrome()

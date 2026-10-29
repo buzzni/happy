@@ -124,6 +124,25 @@ export interface SpaceRecord {
     assignmentId?: string
     /** Tabs a reclamation could not close (beforeunload); reported, retried. */
     reclaimBlockedTabs?: TabId[]
+    /** What the Runtime knows about each of `tabs` beyond its target and lease (absent in records from before 2026-10-29). */
+    tabDispositions?: Record<string, TabDisposition>
+}
+/** Where a space tab came from and whether it is kept for the user. */
+export interface TabDisposition {
+    /** openPage created it: the only way a tab becomes the Runtime's. */
+    createdBy: 'agent'
+    /** Last re-taken by its persisted targetId after a Runtime restart (adoption is not creation). */
+    adoptedAtMs?: number
+    /**
+     * Handed to the user (a hand-off, login or captcha wait) or taken over by them: from then on no
+     * automatic cleanup closes it, whatever happens to its task or the user's input control.
+     */
+    retained?: { reason: 'handoff' | 'login' | 'captcha' | 'user-control'; taskId: TaskId; atMs: number }
+    /**
+     * Written by a Runtime from before dispositions and not shown to be a hand-off: whether it was
+     * ever handed to the user is not known, so it is kept like a retained tab (not a proven hand-off).
+     */
+    retentionUnknown?: true
 }
 /**
  * Spaces being reclaimed do not count against maxSpacesPerProfile, except those beyond
