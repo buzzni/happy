@@ -223,6 +223,16 @@ describe('host owner-contact wiring (startHappyServer)', () => {
         expect(h.lookups).toEqual([]);
         expect((await contact.call({ ...request, entry: 'chat' })).result).toBe('allowed');
     });
+    it('lets a depth >= 1 broker agent reach its own owned-child operations [H2-R-04]', async () => {
+        const h = harness({ depth: '1' }), w = wiring(h, { broker: true });
+        await w.start();
+        const contact = (w.startBroker.mock.calls[0] as unknown[])[0] as { call(raw: unknown): Promise<unknown> };
+        h.register({ ...(await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller, depth: 1 });
+        const child = { operationId: 'operation', spawnId: 'spawn', spawnDigest: 'a'.repeat(64) };
+        await contact.call({ v: 1, entry: 'agent', operation: 'owned-child-status', payload: child }).catch(() => undefined);
+        // Past the broker policy: the contact was looked up for this source (the fake main then answers).
+        expect(h.lookups.length).toBeGreaterThan(0);
+    });
     it.skipIf(process.platform === 'win32')('keeps direct agent commands at every depth', async () => {
         const h = harness({ depth: '3' }), w = wiring(h);
         const started = await w.start();

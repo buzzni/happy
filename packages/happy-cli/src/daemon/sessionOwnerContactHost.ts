@@ -113,11 +113,12 @@ export async function startHostOwnerContact<Broker>(input: {
     const host = await startSessionOwnerContactHost({ enabled: true, session: input.session, hostPid: input.hostPid,
         live: () => !closed, capability, issue: input.issue, current: input.current, token: input.token, fetch: input.fetch });
     // Main cannot tell a broker caller from a direct one, so the broker's fixed entry policy lives here:
-    // a broker agent command below depth 0 gets no sibling/parent exposure or prompt (Desktop P0a §2.3).
+    // a broker agent command below depth 0 gets no sibling/parent exposure or mutation (Desktop P0a §2.3).
+    // Its own owned-child operations are not sibling extension and pass to main (§4.6).
     const brokerContact: SessionOwnerContact | undefined = host && host.binding.depth > 0 ? { close: () => host.contact.close(),
         call: async raw => {
             const request = OwnerContactRequestSchema.parse(raw);
-            if (request.entry === 'agent') throw new Error('owner-contact-unavailable');
+            if (request.entry === 'agent' && !OWNED_CHILD_OPERATIONS.has(request.operation)) throw new Error('owner-contact-unavailable');
             return host.contact.call(request);
         } } : host?.contact;
     const broker = await input.startBroker(brokerContact);
@@ -131,3 +132,4 @@ export async function startHostOwnerContact<Broker>(input: {
         await local?.close();
     } };
 }
+const OWNED_CHILD_OPERATIONS = new Set(['spawn-owned-child', 'owned-child-status']);
