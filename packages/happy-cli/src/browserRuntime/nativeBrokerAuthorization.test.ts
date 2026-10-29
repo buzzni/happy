@@ -64,7 +64,7 @@ it('registers with an exact signed operation and refuses reuse, legacy tokens an
 it('rejects changes to exact bytes, path, scope, generation, lifetime or signature', async () => {
     const h = await setup(), path = '/v1/sessions/register', body = '{"schemaVersion":1}'
     expect((await h.call(path, '{ "schemaVersion":1}', h.envelope(path, body))).status).toBe(401)
-    for (const change of [ { machineId: 'machine-b' }, { workspaceId: 'workspace-b' }, { aud: 'machine-b' },
+    for (const change of [ { principalId: 'other-user' }, { machineId: 'machine-b' }, { workspaceId: 'workspace-b' }, { aud: 'machine-b' },
         { generation: 'old-service-generation' }, { expiresAtMs: 99999 }, { issuedAtMs: 100001 },
         { expiresAtMs: 160001 }, { path: '/v1/sessions/revoke' }, { method: 'GET' }, { kind: 'interactive' } ]) {
         expect((await h.call(path, body, h.envelope(path, body, change))).status).toBe(401)
@@ -110,4 +110,10 @@ it('never invites automatic replay after an authorized mutation fails without a 
     const result = await h.call(path, body, h.envelope(path, body))
     expect(result.status).toBe(500)
     expect(result.json.error).toMatchObject({ retryable: false, mayHaveSideEffects: true })
+})
+
+it('refuses shared or ambiguous principal configuration before accepting native requests', async () => {
+    await expect(setup({ tenancyMode: 'shared' })).rejects.toThrow('one dedicated principal')
+    await expect(setup({ profiles: new Map() })).rejects.toThrow('one dedicated principal')
+    await expect(setup({ profiles: new Map([['a', 'user-a'], ['b', 'user-b']]) as unknown as BrokerOptions['profiles'] })).rejects.toThrow('one dedicated principal')
 })

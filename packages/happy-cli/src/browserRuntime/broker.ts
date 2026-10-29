@@ -179,8 +179,11 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
     const log = options.log ?? (() => {})
     if (options.nativeAuthorization ? options.daemonTokenSha256 !== undefined : !/^[a-f0-9]{64}$/i.test(options.daemonTokenSha256 ?? ''))
         throw new Error('Configure exactly one broker authorization mechanism')
+    const nativePrincipals = new Set(options.profiles.values())
+    if (options.nativeAuthorization && (options.tenancyMode === 'shared' || nativePrincipals.size !== 1))
+        throw new Error('Native service requires one dedicated principal')
     const nativeAuth = options.nativeAuthorization ? nativeBrokerAuthorization({
-        identity: options.identity, trustedIssuers: options.trustedIssuers ?? [], now,
+        identity: { ...options.identity, principalId: [...nativePrincipals][0] }, trustedIssuers: options.trustedIssuers ?? [], now,
     }) : undefined
     const expectedDaemonToken = Buffer.from(options.daemonTokenSha256 ?? '', 'hex')
     const registryPath = join(options.stateDir, REGISTRY_FILE)

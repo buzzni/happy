@@ -249,3 +249,18 @@ single-link 검사는 유지한다. Chrome 버전 또는 업데이트 소유권 
 runtime-basic-verification 서비스의 실제 Chrome 연결·401·두 번의 종료/재시작·UID
 잔류 부재를 검사한다. 테스트 전용 PC에서만 실행하며 설치나 launchd 등록은 하지 않는다.
 이 검사는 실제 서명 task 발급·로그인 사이트 조작·Desktop 설치판 수락을 대체하지 않는다.
+
+## Current-PC exact-command issuer/client integration
+
+Studio's authenticated native-command route derives the local machine owner and workspace
+(companyId, or `personal:<userId>` for a personal machine) and signs only explicit session
+broker operations for 60 seconds. Native broker admission requires a single configured
+principal and matches that principal too; a valid issuer signature for another user is refused.
+
+`createNativeBrokerRequest` snapshots request bytes before async work, validates a fresh
+service generation and scope, asks the supplied Core issuer for an exact command and sends
+it once without a legacy daemon token. `createBrowserTaskSessionBroker` accepts this native
+configuration separately from Linux token-file configuration. No signing token is persisted.
+A Core-authenticated issuer still must be supplied by the product startup path; the daemon
+entrypoint does not automatically enable this based on an environment URL or attestation.
+Real account/installer integration and Windows service acceptance remain outstanding.

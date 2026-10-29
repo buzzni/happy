@@ -20,7 +20,7 @@ const denied = () => new BrowserRuntimeError('UNAUTHORIZED', 'A fresh signed nat
  * Issuers must authorize the operation and scope before signing; a session-user
  * attestation alone is deliberately insufficient. */
 export function nativeBrokerAuthorization(options: {
-    identity: { machineId: string; workspaceId: string }
+    identity: { machineId: string; workspaceId: string; principalId: string }
     trustedIssuers: readonly TrustedIssuer[]
     now: () => number
 }) {
@@ -34,7 +34,7 @@ export function nativeBrokerAuthorization(options: {
     let lastNow = options.now()
     let clockFailed = false
     return {
-        challenge: () => ({ schemaVersion: 1 as const, ...identity, generation }),
+        challenge: () => ({ schemaVersion: 1 as const, machineId: identity.machineId, workspaceId: identity.workspaceId, generation }),
         async authorize(req: IncomingMessage): Promise<unknown> {
             const token = req.headers['x-abp-native-command']
             if (typeof token !== 'string' || token.length > 8192 || req.headers['x-abp-daemon-token'] !== undefined) throw denied()
@@ -46,7 +46,7 @@ export function nativeBrokerAuthorization(options: {
             if (!Number.isSafeInteger(now) || now < lastNow) clockFailed = true
             lastNow = now
             if (clockFailed || claims.machineId !== identity.machineId || claims.aud !== identity.machineId ||
-                claims.workspaceId !== identity.workspaceId || claims.generation !== generation ||
+                claims.workspaceId !== identity.workspaceId || claims.principalId !== identity.principalId || claims.generation !== generation ||
                 claims.method !== req.method || claims.path !== req.url ||
                 claims.issuedAtMs > now || claims.expiresAtMs <= now || claims.expiresAtMs <= claims.issuedAtMs ||
                 claims.expiresAtMs - claims.issuedAtMs > 60000) throw denied()
