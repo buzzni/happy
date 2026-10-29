@@ -20,7 +20,8 @@ export interface NativeBrowserSessionOptions {
     input: Writable
     output: Readable
     owner: SessionOwner
-    protection: {
+    protection: { mode: 'basic'; identity: string } | {
+        mode?: 'guard'
         identity: string
         epoch: string
         /** Authenticated OS channel. A missing/unreadable reply is never readiness. */
@@ -60,7 +61,9 @@ export async function openNativeBrowserSession(options: NativeBrowserSessionOpti
     if (!Number.isSafeInteger(interval) || interval < 10 || interval > 5000 ||
         !Number.isSafeInteger(timeout) || timeout < 10 || timeout > 10_000) throw new Error('Invalid native browser monitor limits')
     const owner = { ...options.owner }
-    const expected = { identity: options.protection.identity, epoch: options.protection.epoch }
+    // Pin the selected mode for this lifetime. A lost guard never becomes basic.
+    const protection = { ...options.protection }
+    const guard = protection.mode === 'basic' ? undefined : protection
     const readOwner = dependencies.readOwner ?? readNativeSessionOwner
     const readPrincipal = dependencies.readPrincipal ?? readNativeProcessPrincipal
     const connection = CdpConnection.fromPipe(options.input, options.output)
@@ -91,16 +94,18 @@ export async function openNativeBrowserSession(options: NativeBrowserSessionOpti
     }
     const verify = async () => {
         if (closed) throw unavailable()
-        const status = protectionSchema.parse(await deadline(() => options.protection.snapshot(), timeout))
-        if (closed || status.identity !== expected.identity || status.epoch !== expected.epoch) throw unavailable()
-        if (baseline && (status.generation !== baseline.generation || status.violations !== baseline.violations)) throw unavailable()
+        if (guard) {
+            const status = protectionSchema.parse(await deadline(() => guard.snapshot(), timeout))
+            if (closed || status.identity !== guard.identity || status.epoch !== guard.epoch) throw unavailable()
+            if (baseline && (status.generation !== baseline.generation || status.violations !== baseline.violations)) throw unavailable()
+            baseline ??= status
+        }
         const current = readOwner(owner.pid)
         if (!current || current.bootId !== owner.bootId || current.pid !== owner.pid || current.pidStartTime !== owner.pidStartTime) throw unavailable()
-        if (readPrincipal(owner.pid) !== expected.identity) throw unavailable()
+        if (readPrincipal(owner.pid) !== protection.identity) throw unavailable()
         // The UID/SID query must describe the same lifetime, not a replacement PID.
         const after = readOwner(owner.pid)
         if (!after || after.bootId !== owner.bootId || after.pid !== owner.pid || after.pidStartTime !== owner.pidStartTime) throw unavailable()
-        baseline ??= status
     }
     function check(): Promise<void> {
         if (closed) return Promise.reject(unavailable())

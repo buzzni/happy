@@ -22,7 +22,9 @@ describe('parseRuntimeConfig', () => {
         const nativeService = { platform: 'darwin', runtimeUid: 472, runtimeGid: 472, browserUid: 471, browserGid: 471, policyEpoch: 1, proxyPort: 18789 }
         const input = { ...valid(), daemonTokenSha256: undefined, runtimeHost: '127.0.0.1', nativeService,
             brokerSocketPath: '/Library/Application Support/SaycodeNative/run/broker.sock', adminSocketPath: '/Library/Application Support/SaycodeNative/run/admin.sock' }
-        expect(parseRuntimeConfig(input).nativeService).toEqual(nativeService)
+        expect(parseRuntimeConfig(input).nativeService).toEqual({ ...nativeService, networkProtection: 'guard' })
+        expect(parseRuntimeConfig({ ...input, nativeService: { ...nativeService, networkProtection: 'basic' } }).nativeService).toMatchObject({ networkProtection: 'basic' })
+        expect(() => parseRuntimeConfig({ ...input, nativeService: { ...nativeService, networkProtection: 'auto' } })).toThrow()
         for (const change of [{ authMode: 'harness' }, { runtimeHost: '0.0.0.0' }, { daemonTokenSha256: 'a'.repeat(64) },
             { nativeService: { ...nativeService, runtimeUid: 471 } }, { nativeService: { ...nativeService, browserUid: 0 } },
             { nativeService: { ...nativeService, platform: 'win32' } },

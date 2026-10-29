@@ -40,6 +40,8 @@ const schema = z.object({
     admissionHold: z.boolean().default(false),
     authMode: z.enum(['harness', 'production']),
     nativeService: z.object({
+        // Legacy native installations remain guarded; new basic installs opt in explicitly.
+        networkProtection: z.enum(['basic', 'guard']).default('guard'),
         platform: z.literal('darwin'), runtimeUid: z.number().int().min(200).max(0x7fffffff),
         runtimeGid: z.number().int().min(200).max(0x7fffffff), browserUid: z.number().int().min(200).max(0x7fffffff),
         browserGid: z.number().int().min(200).max(0x7fffffff), policyEpoch: z.number().int().positive().safe(),

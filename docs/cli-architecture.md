@@ -995,7 +995,11 @@ ends and fails pending operations; the existing Linux WebSocket path remains.
 `CdpDriver` accepts a supervisor-issued pipe/instance pair as an exclusive alternative
 to WebSocket discovery, coalesces concurrent connections, and discards late connections
 after close. `nativeBrowserSession` binds one such lifetime to the exact OS process and
-fresh independent protection snapshots, including the actual macOS effective UID.
+the actual macOS effective UID. Explicit `nativeService.networkProtection=basic`
+keeps process/identity checks without requiring OS network protection. `guard` (also
+used for legacy configs missing the field) additionally requires fresh independent
+protection snapshots. The mode is pinned for the session lifetime; loss of protection
+never downgrades it. Basic mode's proxy policy is not an OS network isolation guarantee.
 Process lifetime is checked around the principal query. Windows token SID validation
 is still a required service integration gate and fails closed until implemented.
 Identity/policy/generation/counter changes or
@@ -1009,7 +1013,7 @@ fixtures do not prove deployed service or network enforcement readiness.
 
 `macNativeRuntime` now provides the explicit production bootstrap: verify the
 fixed protected configuration/directories, retain a kernel writer lock, verify the
-signed Network Guard and guardian, start Chrome under a distinct UID/GID, then
+signed guardian (and Network Guard in guard mode), start Chrome under a distinct UID/GID, then
 irreversibly drop the runtime identity before CDP/HTTP/SOCKS input. The root
 `macBrowserGuardian` owns the original process group; a root-only durable crash
 latch prevents restarting after unconfirmed termination or guardian SIGKILL.

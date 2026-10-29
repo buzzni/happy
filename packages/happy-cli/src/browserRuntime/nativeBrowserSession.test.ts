@@ -123,3 +123,23 @@ it('does not reconnect when closed during a pending protection check', async () 
     expect(await checking).toMatchObject({ code: 'RUNTIME_UNAVAILABLE' })
     expect(session.driver.isConnected()).toBe(false)
 })
+
+
+it('runs explicit basic mode without a Guard but still stops on process identity changes', async () => {
+    const h = fixture()
+    h.options.protection = { mode: 'basic', identity: 'browser-user' }
+    const session = await h.open()
+    expect(session.driver.isConnected()).toBe(true)
+    expect(h.snapshot).not.toHaveBeenCalled()
+    h.readPrincipal.mockReturnValue('another-user')
+    await expect(session.check()).rejects.toMatchObject({ code: 'RUNTIME_UNAVAILABLE' })
+    expect(await session.stopped).toEqual({ terminated: true })
+})
+
+it('cannot downgrade a live guarded session by changing its options', async () => {
+    const h = fixture(), session = await h.open()
+    h.options.protection = { mode: 'basic', identity: 'browser-user' }
+    h.snapshot.mockRejectedValue(new Error('guard lost'))
+    await expect(session.check()).rejects.toMatchObject({ code: 'RUNTIME_UNAVAILABLE' })
+    expect(await session.stopped).toEqual({ terminated: true })
+})

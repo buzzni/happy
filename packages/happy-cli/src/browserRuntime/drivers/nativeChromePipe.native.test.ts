@@ -7,6 +7,7 @@ import type { Readable, Writable } from 'node:stream'
 import { expect, it } from 'vitest'
 import { CdpConnection } from './cdpConnection'
 import { CdpDriver } from './cdpDriver'
+import { openNativeBrowserSession } from '../nativeBrowserSession'
 import { readNativeSessionOwner } from '../nativeHostPrimitives'
 import type { BrowserInstanceId } from '../contracts'
 
@@ -67,3 +68,39 @@ it.skipIf(process.platform !== 'darwin')('drives an isolated Chrome through inhe
         await new Promise<void>(resolve => site.close(() => resolve()))
     }
 }, 15_000)
+
+
+it.skipIf(process.platform !== 'darwin')('opens a real basic browser session without a Guard provider', async () => {
+    const profile = await mkdtemp(join(tmpdir(), 'abp-basic-chrome-'))
+    const site = createServer((_req, res) => { res.setHeader('Content-Type', 'text/html'); res.end('<title>Basic mode</title><p>Basic mode canary</p>') })
+    await new Promise<void>(resolve => site.listen(0, '127.0.0.1', resolve))
+    const origin = `http://127.0.0.1:${(site.address() as { port: number }).port}`
+    const chrome = process.env.SAYCODE_NATIVE_TEST_CHROME ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+    const child = spawn(chrome, ['--headless=new', '--remote-debugging-pipe', `--user-data-dir=${profile}`,
+        '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--disable-background-networking',
+        '--disable-sync', '--disable-component-update', '--password-store=basic', '--use-mock-keychain',
+        '--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1', 'about:blank'],
+        { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] })
+    const exited = new Promise<void>(resolve => child.once('close', () => resolve()))
+    let session: Awaited<ReturnType<typeof openNativeBrowserSession>> | undefined
+    try {
+        await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject) })
+        const owner = readNativeSessionOwner(child.pid!)
+        expect(owner).toBeDefined()
+        session = await openNativeBrowserSession({ owner: owner!, input: child.stdio[3] as Writable, output: child.stdio[4] as Readable,
+            protection: { mode: 'basic', identity: String(process.getuid!()) },
+            terminate: async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM'); await exited },
+            checkTimeoutMs: 10000 })
+        const tab = await session.driver.openTab(origin, [origin], { timeoutMs: 5000 })
+        expect(JSON.stringify(await session.driver.observe(tab.tabId, [origin], { timeoutMs: 5000 }))).toContain('Basic mode canary')
+        await session.check()
+        expect(await session.close()).toEqual({ terminated: true })
+        expect(session.driver.isConnected()).toBe(false)
+    } finally {
+        await session?.close()
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+        await exited
+        await rm(profile, { recursive: true, force: true })
+        await new Promise<void>(resolve => site.close(() => resolve()))
+    }
+}, 20000)

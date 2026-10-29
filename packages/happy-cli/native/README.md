@@ -207,3 +207,12 @@ provisioning 및 등록 후 인증된 설정 전송은 이 빌드에 포함되�
 재검토: 실제 필터 교체, 별도 runtime 신원의 Chrome 기동, guardian 강제 종료 후
 사람의 명시적 복구, OS 위임 통신, installer upgrade/rollback을 검증한 뒤 위 미완료
 경계를 갱신한다. launchd KeepAlive로 종료 불명 상태를 반복 실행하지 않는다.
+
+## 선택적 네트워크 보호
+
+새 기본 설치는 보호된 runtime 설정의 `nativeService.networkProtection`을 `basic`으로
+명시한다. 이 모드는 Guard를 조회하지 않지만 프로필/별도 신원/프로세스 수명/서명/작업
+인증은 유지한다. 프록시의 origin 정책은 OS 네트워크 차단 보장이 아니다.
+추가 보호 `guard`와 필드가 없는 과거 설정은 Guard 실패 시 실행을 거부한다.
+모드는 세션 시작 시 고정되며 옵션 변경으로 살아 있는 보호 세션을 강등할 수 없다.
+사용자 설정·설치기 연결은 별도이며 이 필드를 agent 요청으로 바꾸지 않는다.

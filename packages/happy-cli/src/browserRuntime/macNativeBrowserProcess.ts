@@ -16,12 +16,13 @@ const exec = promisify(execFile)
  * CDP response until connect() confirms the distinct, dropped runtime identity. */
 export async function prepareMacNativeBrowser(options: {
     browserUid: number; browserGid: number; runtimeUid: number; policyEpoch: number; proxyPort: number
+    networkProtection?: 'basic' | 'guard'
 }) {
     const { browserUid, browserGid, runtimeUid, policyEpoch, proxyPort } = options
     if (process.platform !== 'darwin' || process.getuid?.() !== 0 || process.geteuid?.() !== 0 ||
         [browserUid, browserGid, runtimeUid].some(id => !Number.isSafeInteger(id) || id < 200 || id > 0x7fffffff) || browserUid === runtimeUid)
         throw new Error('NATIVE_SERVICE_IDENTITY_REQUIRED')
-    const protection = createMacNativeBrowserProtection({ browserUid, epoch: policyEpoch })
+    const protection = options.networkProtection === 'basic' ? undefined : createMacNativeBrowserProtection({ browserUid, epoch: policyEpoch })
     await verifyMacServiceExecutable(guardian)
     await verifyMacServiceExecutable(chrome)
     await verifyMacPrivateDirectory(profile, browserUid)
@@ -29,7 +30,7 @@ export async function prepareMacNativeBrowser(options: {
         [chrome, '=anchor apple generic and certificate leaf[subject.OU] = "EQHXZ8M8AV" and identifier "com.google.Chrome"']]) {
         await exec('/usr/bin/codesign', ['--verify', '--strict', '-R', requirement, path], { timeout: 10000, maxBuffer: 8192, env: { PATH: '/usr/bin:/bin' } })
     }
-    const baseline = JSON.stringify(await protection.snapshot())
+    const baseline = protection ? JSON.stringify(await protection.snapshot()) : undefined
     const child = spawn(guardian, [String(browserUid), String(browserGid), profile, `${root}/guardian-state`, chrome,
         '--headless=new', '--remote-debugging-pipe', `--user-data-dir=${profile}`,
         '--disable-crash-reporter', '--disable-breakpad', `--crash-dumps-dir=${profile}/crashes`,
@@ -81,12 +82,12 @@ export async function prepareMacNativeBrowser(options: {
                 }
                 consumed = true
                 session = await openNativeBrowserSession({ ...driverOptions, owner, input: child.stdio[3] as Writable, output: child.stdio[4] as Readable, terminate,
-                    protection: { ...protection, snapshot: async () => {
+                    protection: protection ? { ...protection, snapshot: async () => {
                         if (guardianGone) throw new Error('NATIVE_OWNER_LOST')
                         const current = await protection.snapshot()
                         if (guardianGone || JSON.stringify(current) !== baseline) throw new Error('NATIVE_PROTECTION_CHANGED')
                         return current
-                    } }, checkTimeoutMs: 10000 })
+                    } } : { mode: 'basic', identity: String(browserUid) }, checkTimeoutMs: 10000 })
                 if (guardianGone) { await session.close(); throw new Error('NATIVE_OWNER_LOST') }
                 return session
             },

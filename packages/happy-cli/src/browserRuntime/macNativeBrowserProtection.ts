@@ -27,7 +27,7 @@ export function createMacNativeBrowserProtection(expected: { browserUid: number;
     platform: process.platform, verifyExecutable: verifyMacServiceExecutable,
     run: (path, args) => exec(path, args, { timeout: 4000, maxBuffer: 8192, encoding: 'utf8',
         env: { PATH: '/usr/bin:/bin', LANG: 'C' } }),
-}): NativeBrowserSessionOptions['protection'] {
+}): Exclude<NativeBrowserSessionOptions['protection'], { mode: 'basic' }> {
     const { browserUid, epoch } = expected
     if (io.platform !== 'darwin' || !Number.isSafeInteger(browserUid) || browserUid < 200 || browserUid > 0xffffffff ||
         !Number.isSafeInteger(epoch) || epoch < 1) throw new Error('NATIVE_PROTECTION_UNSUPPORTED')
