@@ -59,3 +59,13 @@ export function isClaudeAuthenticationFailure(value: { type?: unknown; error?: u
         || /oauth session expired and could not be refreshed/i.test(text)
         || /^(?:API Error: 401\b|Failed to authenticate\b)/i.test(text.trim())));
 }
+
+/** A failed refresh or generic 401 is not proof that the credential generation was revoked. */
+export function isClaudeRevokedTokenFailure(value: Parameters<typeof isClaudeAuthenticationFailure>[0] & { message?: unknown }): boolean {
+    if (!isClaudeAuthenticationFailure(value)) return false;
+    const message = value.message as { content?: unknown } | undefined;
+    const content = Array.isArray(message?.content) ? message.content : [];
+    const texts = [value.result, ...(Array.isArray(value.errors) ? value.errors : []),
+        ...content.flatMap(block => block?.type === 'text' ? [block.text] : [])];
+    return texts.some(text => typeof text === 'string' && /\boauth token (?:has been )?revoked\b/i.test(text));
+}
