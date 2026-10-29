@@ -70,7 +70,9 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
   }
   /** Notices already given since the last switch: each is said once. */
   const told = new Set<string>()
-  let inFlight: Promise<{ switched: boolean; continueAfter: boolean }> | null = null
+  let inFlight: Promise<{ switched: boolean; continueAfter: boolean; reason?: string }> | null = null
+  /** Why the latest attempt bound nothing, until one succeeds or the member moves on; an offer to the member reads it. */
+  let lastFailure: string | null = null
   /**
    * A refused turn waiting in the background for an account. `done`: a finished switch the launcher has not taken
    * yet. `shared`: a turn boundary awaits the running attempt too, so its result is handed over there, not twice.
@@ -118,7 +120,8 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
       if (PERMANENT.has(result.reason) || result.reason === 'STALE') endBackground()
       if (result.reason === 'ROTATION_LIMIT' || result.reason === 'STALE' || result.reason === 'NOT_BOUND' || result.reason === 'STUDIO_UNAVAILABLE') tell('Organization account rotation could not continue. Retry manually or start a new conversation.', 'failed')
       // Anything else may pass: the next turn boundary (or background attempt) asks again.
-      return { switched: false, continueAfter: false }
+      lastFailure = result.reason
+      return { switched: false, continueAfter: false, reason: result.reason }
     }
     wanted = false
     if (result.environment.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING === binding) return { switched: false, continueAfter: false }
@@ -128,7 +131,7 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
     switches++; told.clear(); lastReportAt = -Infinity; lastReportedExhausted = false
     logger.debug(`[setup-token-switch] session ${sessionId} moved to another organization account (${switches} of ${MAX_SWITCHES})`)
     const continueAfter = refused && user === userEpoch
-    refused = false; authenticationFailed = false; latestObservation = undefined; retryDeadline = null; retryAfterMs = 0
+    refused = false; authenticationFailed = false; lastFailure = null; latestObservation = undefined; retryDeadline = null; retryAfterMs = 0
     emit(switchedAfterAuthenticationFailure ? 'This organization Claude account could not authenticate, so the session moved to another organization account.' : SWITCHED_NOTICE, 'switched')
     return { switched: true, continueAfter }
   }
@@ -172,10 +175,15 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
     scheduleBackground(current)
   }
 
+  /** A turn boundary needs only what happened; why a switch failed is for the member's own request. */
+  const boundaryResult = ({ switched, continueAfter }: { switched: boolean; continueAfter: boolean }) => ({ switched, continueAfter })
+  /** Whether another switch may still be asked for: an offer to the member must not promise one that cannot run. */
+  const canSwitch = () => !disposed && !paused && !stopped && switches < MAX_SWITCHES
+
   return {
     onAuthenticationFailure(revoked: boolean) {
       if (disposed || stopped || paused) return
-      wanted = true; refused = true; authenticationFailed = true
+      wanted = true; refused = true; authenticationFailed = true; lastFailure = null
       if (latestObservation?.reason === 'authentication-failed') return
       latestObservation = revoked ? { observedAt: now(), windows: [], reason: 'authentication-failed', retryAt: null } : undefined
       // Rebind carries this evidence atomically; quota reports may otherwise race the account change.
@@ -206,7 +214,7 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
       if (disposed || paused || stopped) return Promise.resolve({ switched: false, continueAfter: false })
       if (inFlight) {
         if (background) background.shared = true
-        return inFlight
+        return inFlight.then(boundaryResult)
       }
       if (background?.done) {
         const done = background.done
@@ -223,7 +231,26 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
       return attempt(sessionId, binding).then(result => {
         // Switched at this boundary: nothing is left to wait for.
         if (result.switched) endBackground()
-        return result
+        return boundaryResult(result)
+      })
+    },
+    canSwitch,
+    /** Why the latest attempt bound nothing (`NO_ACCOUNT`: none is left), or null. */
+    lastFailure: () => lastFailure,
+    /** The latest attempt bound nothing, yet asking again may: not when none is left or this binding cannot rotate. */
+    lastFailureMayPass: () => lastFailure !== null && lastFailure !== 'NO_ACCOUNT' && !PERMANENT.has(lastFailure) && lastFailure !== 'STALE',
+    /**
+     * The member asked to move on now instead of waiting for the background attempt (Saycode
+     * specs/org-auth-failure-account-switch). An attempt already running is awaited; if it bound nothing, this asks once more.
+     */
+    switchNow(): Promise<{ switched: boolean; reason?: string }> {
+      const sessionId = deps.sessionId(), binding = deps.binding()
+      if (!canSwitch() || !sessionId || !binding) return Promise.resolve({ switched: false, reason: 'UNAVAILABLE' })
+      const ask = () => { wanted = true; return attempt(sessionId, binding) }
+      const running = inFlight
+      return (running ? running.then(result => result.switched || !canSwitch() ? result : ask()) : ask()).then(result => {
+        if (result.switched) endBackground()
+        return result.switched ? { switched: true } : { switched: false, reason: result.reason ?? 'UNAVAILABLE' }
       })
     },
     /** Aborted when a background switch finished: the launcher stops waiting for input and takes it with `switchIfWanted`. */
@@ -232,9 +259,9 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
     },
     /** The user's own message replaces the automatic continuation: the background wait ends. */
     cancelBackground() { userEpoch++; refused = false; endBackground() },
-    userTurnStarted() { if (paused) cancellation = new AbortController(); paused = false; userEpoch++; refused = false; endBackground() },
+    userTurnStarted() { if (paused) cancellation = new AbortController(); paused = false; userEpoch++; refused = false; lastFailure = null; endBackground() },
     hasAccountRefusal() { return refused && !paused && !disposed },
-    cancelForStop() { cancellation.abort(); paused = true; cancelEpoch++; userEpoch++; wanted = false; refused = false; authenticationFailed = false; latestObservation = undefined; retryDeadline = null; endBackground() },
+    cancelForStop() { cancellation.abort(); paused = true; cancelEpoch++; userEpoch++; wanted = false; refused = false; authenticationFailed = false; lastFailure = null; latestObservation = undefined; retryDeadline = null; endBackground() },
     /** The session ended: terminal, including for an attempt still in flight. */
     dispose() {
       disposed = true; cancellation.abort(); cancelEpoch++

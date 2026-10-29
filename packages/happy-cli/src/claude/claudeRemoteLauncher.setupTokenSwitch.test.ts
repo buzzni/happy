@@ -742,7 +742,9 @@ it.each(['automatic', 'organization-only', 'authentication', 'consent-during-reb
                     if(returnMode==='authentication') yield {...assistant('auth-refused'),error:'authentication_failed'}; else yield refused;
                     setTimeout(() => { void (async () => {
                         if (returnMode === 'consent-during-rebind') await vi.waitFor(() => expect(finishRebind).toBeTypeOf('function'));
-                        const offer=(await handlers.get('personal-claude-fallback')!({action:'status'})).offer;
+                        // After an authentication failure the automatic organization switch answers first (specs/org-auth-failure-account-switch).
+                        let offer: any;
+                        await vi.waitFor(async () => { offer=(await handlers.get('personal-claude-fallback')!({action:'status'})).offer; expect(offer?.state).toBe('offer'); });
                         await handlers.get('personal-claude-fallback')!({action:'accept',accountRef:offer.accountRef,nonce:offer.nonce,consentProof:'fixture-proof'});
                         finishRebind?.();
                     })(); }, 0);
@@ -872,4 +874,107 @@ it.each((['authority', 'channel', 'pending-authority', 'pending-recovery'] as co
         expect(client.setPendingTurnRequestId.mock.invocationCallOrder.at(-1)).toBeLessThan(client.sendFinalAnswerForChannelTurn.mock.invocationCallOrder[notice]);
         expect(client.sendFinalAnswerForChannelTurn.mock.invocationCallOrder[notice]).toBeLessThan(client.failClaudeLaunchTurn.mock.invocationCallOrder[0]);
     }
+});
+
+// Saycode specs/org-auth-failure-account-switch — after an organization authentication failure the switch runs by
+// itself (#990); the member can take another account now instead of waiting, or send the refused turn again.
+describe('organization authentication failure recovery the member can take', () => {
+    beforeEach(() => {
+        vi.mocked(requestSetupTokenAvailability).mockReset();
+        vi.mocked(readPersonalClaudeCredential).mockResolvedValue(null);
+    });
+    const dedicated = () => formatSetupTokenBinding({ companyId:'org',groupScope:'org',userId:'owner',machineId:'pc',managedAccountId:'11111111-1111-4111-8111-111111111111',credentialGeneration:1,keyId:'f'.repeat(64),nonce:'22222222-2222-4222-8222-222222222222',issuedAt:1 });
+    function harness(afterRefusal: (rpc: (params: Record<string, unknown>) => Promise<any>, end: () => void) => Promise<void>) {
+        process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING = dedicated();
+        const queue = new MessageQueue2<EnhancedMode>(hashObject), handlers = new Map<string, (params?: any) => Promise<any>>();
+        const client = { sessionId:'happy-session-1',rpcHandlerManager:{registerHandler:(name:string,handler:any)=>handlers.set(name,handler)},
+            updateAgentState:vi.fn(),updateMetadata:vi.fn(),getMetadata:()=>({}),setPersonalClaudeFallback:vi.fn(),setClaudeRuntimeAccount:vi.fn(),
+            sendClaudeSessionMessage:vi.fn(),sendStreamDelta:vi.fn(),setPendingTurnRequestId:vi.fn(),sendFinalAnswerForChannelTurn:vi.fn(),
+            applyClaudeTurnResult:vi.fn(),noteContextUsageSignal:vi.fn(),closeClaudeSessionTurn:vi.fn(),sendSessionEvent:vi.fn() };
+        const generations: Array<{ token: string | undefined; resume: string | undefined; prompts: string[] }> = [];
+        const rpc = (params: Record<string, unknown>) => handlers.get('personal-claude-fallback')!(params);
+        const end = () => { void handlers.get('switch')!(); };
+        let refusedOnce = false;
+        vi.mocked(query).mockImplementation(({ prompt, options }) => {
+            const generation = { token: process.env.CLAUDE_CODE_OAUTH_TOKEN, resume: options?.resume, prompts: [] as string[] };
+            generations.push(generation);
+            return Object.assign((async function* () {
+                yield { type:'system',subtype:'init',session_id:'',tools:[],mcp_servers:[],apiKeySource:'none' };
+                for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                    generation.prompts.push(JSON.stringify(message.message.content));
+                    if (!refusedOnce) {
+                        refusedOnce = true;
+                        yield { ...assistant('auth-refused'), error: 'authentication_failed', message: { ...assistant('auth-refused').message, content: [{ type: 'text', text: 'Failed to authenticate. API Error: 401 OAuth access token has been revoked.' }] } };
+                        setTimeout(() => { void afterRefusal(rpc, end); }, 0);
+                        yield { type:'result',subtype:'error_during_execution',is_error:true,errors:['Failed to authenticate. API Error: 401 OAuth access token has been revoked.'],uuid:'refused' };
+                        continue;
+                    }
+                    yield assistant(`answered-${generations.length}-${generation.prompts.length}`);
+                    yield { type:'result',subtype:'success',result:'done',is_error:false,uuid:`done-${generations.length}-${generation.prompts.length}` };
+                    end();
+                    return;
+                }
+            })(), { ...pinnedSdkControls(), mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+        });
+        // An existing conversation: the refused turn continues by a note, not by replaying its input.
+        queue.push('review and open a PR', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        const session = { lessonReviewLifecycle:{controller:new AbortController(),completedAssistantTurns:0},cancelLessonReview:vi.fn(),sessionId:'claude-1',path:process.cwd(),queue,client,mcpServers:{},
+            api:{push:()=>({sendSessionNotification:vi.fn()})},consumeOneTimeFlags:vi.fn(),onThinkingChange:vi.fn(),onAbort:vi.fn() };
+        return { generations, client, run: () => claudeRemoteLauncher(session as unknown as Session) };
+    }
+    const offerOf = async (rpc: (params: Record<string, unknown>) => Promise<any>, state: string) => {
+        let offer: any;
+        await vi.waitFor(async () => { offer = (await rpc({ action: 'status', personal: false })).offer; expect(offer?.state).toBe(state); });
+        return offer;
+    };
+
+    it('offers another organization account while the automatic switch could not finish, and continues on it when taken', async () => {
+        // The automatic attempt at the turn boundary meets a passing failure and waits in the background.
+        vi.mocked(requestSetupTokenRebind).mockReset()
+            .mockResolvedValueOnce({ ok: false, reason: 'REQUEST_FAILED' })
+            .mockResolvedValue({ ok: true, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-second', HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: '{"account":"second"}' } });
+        let switched: any;
+        const h = harness(async rpc => { await offerOf(rpc, 'organization-offer'); switched = await rpc({ action: 'switch-organization' }); });
+        await h.run();
+        expect(switched).toMatchObject({ version: 1, supported: true, switched: true });
+        expect(requestSetupTokenRebind).toHaveBeenCalledTimes(2);
+        expect(h.generations.map(g => g.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
+        expect(h.generations.map(g => g.resume)).toEqual(['claude-1', 'claude-1']);
+        expect(h.generations[1].prompts).toEqual([expect.stringContaining('another account')]);
+    });
+
+    it('says no other account is left once the automatic switch found none, and sends the refused turn again on request', async () => {
+        vi.mocked(requestSetupTokenRebind).mockReset().mockResolvedValue({ ok: false, reason: 'NO_ACCOUNT' });
+        let none: any, retried: any;
+        const h = harness(async rpc => { none = await offerOf(rpc, 'none'); retried = await rpc({ action: 'retry' }); });
+        await h.run();
+        expect(none).toEqual({ state: 'none' });
+        expect(retried).toMatchObject({ version: 1, supported: true, retried: true });
+        expect(h.generations.every(g => g.token === 'sk-ant-oat01-first' && g.resume === 'claude-1')).toBe(true);
+        expect(h.generations.flatMap(g => g.prompts)).toEqual([JSON.stringify('review and open a PR'), expect.stringContaining('Try the request again')]);
+        // Personal availability is not asked where personal Claude is off.
+        expect(requestSetupTokenAvailability).not.toHaveBeenCalled();
+    });
+
+    it.each(['STUDIO_UNAVAILABLE', 'UNSUPPORTED', 'ROTATION_LIMIT', 'NOT_BOUND', 'STALE'])('offers no organization switch that cannot pass after %s', async reason => {
+        vi.mocked(requestSetupTokenRebind).mockReset().mockResolvedValue({ ok: false, reason });
+        let none: any;
+        const h = harness(async rpc => { none = await offerOf(rpc, 'none'); await rpc({ action: 'retry' }); });
+        await h.run();
+        expect(none).toEqual({ state: 'none' });
+    });
+
+    it('keeps the personal Claude offer when this binding cannot rotate', async () => {
+        vi.mocked(requestSetupTokenRebind).mockReset().mockResolvedValue({ ok: false, reason: 'STUDIO_UNAVAILABLE' });
+        vi.mocked(requestSetupTokenAvailability).mockImplementation(async (_id, _binding, consent) => ({ allLimited: false, availableAccountIds: [], consentApproved: !!consent, fallbackReason: 'organization-authentication' as const }));
+        vi.mocked(readPersonalClaudeCredential).mockResolvedValue({ accountRef: 'a'.repeat(64), label: 'pe…@example.test', accessToken: 'fixture-personal', expiresAt: Date.now() + 600000 });
+        let offer: any;
+        const h = harness(async rpc => {
+            await vi.waitFor(async () => { offer = (await rpc({ action: 'status' })).offer; expect(offer?.state).toBe('offer'); });
+            await rpc({ action: 'retry' });
+        });
+        await h.run();
+        expect(offer).toMatchObject({ state: 'offer' });
+        expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1);
+    });
 });

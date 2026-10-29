@@ -67,5 +67,5 @@ export function isClaudeRevokedTokenFailure(value: Parameters<typeof isClaudeAut
     const content = Array.isArray(message?.content) ? message.content : [];
     const texts = [value.result, ...(Array.isArray(value.errors) ? value.errors : []),
         ...content.flatMap(block => block?.type === 'text' ? [block.text] : [])];
-    return texts.some(text => typeof text === 'string' && /\boauth token (?:has been )?revoked\b/i.test(text));
+    return texts.some(text => typeof text === 'string' && /\boauth (?:access )?token (?:has been )?revoked\b/i.test(text));
 }

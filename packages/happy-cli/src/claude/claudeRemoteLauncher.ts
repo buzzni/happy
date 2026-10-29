@@ -70,6 +70,9 @@ import {
 } from './claudeTransientRetry';
 import { SETUP_TOKEN_BINDING_ENV, SETUP_TOKEN_RESUME_REBOUND_ENV, sharedMachineSetupTokenAuthority } from '@/daemon/sessionEnv';
 
+/** Sent when the member retries a turn the organization account refused to authenticate (Saycode specs/org-auth-failure-account-switch). */
+const AUTHENTICATION_RETRY_PROMPT = 'The previous request stopped because the organization Claude account could not authenticate. Try the request again from where you stopped.';
+
 export async function claudeRemoteLauncher(session: Session): Promise<'switch' | 'exit'> {
     logger.debug('[claudeRemoteLauncher] Starting remote launcher');
 
@@ -390,6 +393,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
      * would relay whatever text happened to be standing (Saycode specs/desktop-messenger-channels).
      */
     let lastResultSucceeded = true, lastOrganizationAuthenticationFailed = false;
+    /**
+     * Saycode specs/org-auth-failure-account-switch — the switch after an organization authentication failure runs by
+     * itself; aborted when the member took another account now or asked to retry a first turn, so the waiting provider
+     * ends and the next one continues.
+     */
+    let organizationRecoveryWake = new AbortController();
     /** The drain reads it: after its interrupt Claude Code exits 1, which only an interrupted turn explains. */
     let lastResultInterrupted = false;
     /*
@@ -442,7 +451,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             throw error;
         }
     };
-    session.client.rpcHandlerManager.registerHandler('personal-claude-fallback', async (params: { action?: unknown; accountRef?: unknown; nonce?: unknown; consentProof?: unknown }) => {
+    session.client.rpcHandlerManager.registerHandler('personal-claude-fallback', async (params: { action?: unknown; accountRef?: unknown; nonce?: unknown; consentProof?: unknown; personal?: unknown }) => {
         if (!personalFallback) return { version: 1, supported: false };
         if (params.action === 'restore-organization') {
             const restored = await personalFallback.restoreOrganization();
@@ -460,9 +469,53 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             if (!lastResultSucceeded && !lastTurnChannel && continueRefusal) continuation = lastTurnMode;
             return { version: 1, supported: true, accepted: true };
         }
+        if (params.action === 'switch-organization') {
+            if (!organizationSwitchOffered()) return { version: 1, supported: true, switched: false, reason: 'UNAVAILABLE' };
+            const continueRefusal = !lastResultSucceeded && !lastTurnChannel;
+            const result = await setupTokenSwitching!.switchNow();
+            if (!result.switched) return { version: 1, supported: true, switched: false, reason: result.reason };
+            if (continueRefusal) continuation = lastTurnMode;
+            clearAuthenticationFailure();
+            wakeOrganizationRecovery();
+            return { version: 1, supported: true, switched: true };
+        }
+        if (params.action === 'retry') {
+            if (!authenticationRefused() || !lastTurnMode || pending || session.queue.size() !== 0 || session.queue.isClosed()) return { version: 1, supported: true, retried: false };
+            // No native transcript yet: send the actual request again, with its attachments and authority.
+            if (!session.sessionId && lastCommittedBatch) {
+                pending = { ...lastCommittedBatch, mode: lastTurnMode, continuation: session.client.inputEvidence?.takeContinuation() };
+                wakeOrganizationRecovery();
+            } else {
+                session.queue.unshiftIsolated(AUTHENTICATION_RETRY_PROMPT, lastTurnMode, undefined, session.turnAttendance?.continuationInput(), {
+                    ref: { kind: 'unidentified', runtimeInputId: randomUUID() },
+                    continuation: session.client.inputEvidence?.takeContinuation(),
+                });
+            }
+            clearAuthenticationFailure();
+            return { version: 1, supported: true, retried: true };
+        }
         if (params.action !== 'status') throw new Error('CLAUDE_PERSONAL_FALLBACK_INVALID_ACTION');
-        return { version: 1, supported: true, offer: await personalFallback.status() };
+        // Another organization account first: it spends no personal quota. `personal: false` — this PC does not allow one.
+        if (organizationSwitchOffered()) return { version: 1, supported: true, offer: { state: 'organization-offer' } };
+        // The automatic switch has not answered yet: nothing to offer until it does.
+        if (organizationSwitchPending()) return { version: 1, supported: true, offer: null };
+        const offer = params.personal === false ? null : await personalFallback.status();
+        return { version: 1, supported: true, offer: offer ?? (authenticationRefused() ? { state: 'none' } : null) };
     });
+    /** The last turn failed organization authentication and nothing has run since. */
+    const authenticationRefused = () => lastOrganizationAuthenticationFailed && !lastResultSucceeded && !lastTurnChannel
+        && !session.thinking && !personalFallback?.identity();
+    /** Taken up by the member: the offer must not reappear while the next provider starts. A new failure sets it again. */
+    const clearAuthenticationFailure = () => { lastOrganizationAuthenticationFailed = false; personalFallback?.noteOrganizationAuthentication(false); };
+    /** The automatic switch after the failure is still running: it answers before the member is offered anything. */
+    const organizationSwitchPending = () => authenticationRefused() && !!setupTokenSwitching?.canSwitch() && setupTokenSwitching.lastFailure() === null;
+    /**
+     * The automatic switch could not bind yet another account may: the member can ask again now. None left, or a binding
+     * that cannot rotate, falls through to the personal offer or none.
+     */
+    const organizationSwitchOffered = () => authenticationRefused() && !!setupTokenSwitching?.canSwitch()
+        && setupTokenSwitching.lastFailureMayPass();
+    const wakeOrganizationRecovery = () => { organizationRecoveryWake.abort(); organizationRecoveryWake = new AbortController(); };
     let providerCredentialGeneration = 0;
     const setupTokenSwitching = runningAuthority() ? createSetupTokenAccountSwitching({
         sessionId: () => session.client.sessionId ?? null,
@@ -1058,12 +1111,15 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // (Saycode specs/claude-setup-token-managed-sync R7).
                             const switchWake = setupTokenSwitching?.backgroundSignal() ?? null;
                             const personalWake = personalFallback?.signal() ?? null;
-                            const wakes = [retryWake, switchWake, personalWake].filter((signal): signal is AbortSignal => signal !== null);
+                            const organizationWake = organizationRecoveryWake.signal;
+                            const wakes = [retryWake, switchWake, personalWake, organizationWake].filter((signal): signal is AbortSignal => signal !== null);
                             msg = await session.queue.waitForMessagesAndGetAsString(
                                 AbortSignal.any([controller.signal, generationEnded.signal, ...wakes]),
                                 drain ? () => drain.claimTurn() : undefined,
                             );
                             if (!msg && personalWake?.aborted && !controller.signal.aborted && providerStale()) return null;
+                            // The member took another account (a stale provider) or asked to resend a first turn (pending).
+                            if (!msg && organizationWake.aborted && !controller.signal.aborted && (providerStale() || pending)) return null;
                             if (!msg && switchWake?.aborted && !controller.signal.aborted) {
                                 // A wait an ended provider left behind leaves the finished switch to the live generation.
                                 if (providerEnded) return null;
