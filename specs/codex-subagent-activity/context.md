@@ -14,7 +14,7 @@
   검증(2026-10-28, 개인 공간·buzzni)에서 찾은 줄 빠짐을 D16 커밋으로 고쳤다. push·PR·버전 bump·태그·발행은 하지
   않았다. 실앱 검증 기록은 Desktop 작업트리 `.aplus/verification/evidence/20261028-codex-subagent-real/RESULTS.md`.
 - 2026-10-29 Fable 검수(`.work/reviews/postreal-r15-d16-review.md`, D16·출시 점검표 번호): pass-with-fixes. 권장 F1을
-  D16 보완으로 고쳤고(미커밋), 점검표 번호는 `.365`로 맞췄다(미커밋).
+  D16 보완으로 고쳤고, 점검표 번호는 `.365`로 맞췄다(사용자 승인으로 커밋 dc9f3121, push 안 함).
 - 요구사항 R1~R8과 테스트 대응은 [spec.md](./spec.md), 단계별 내용과 검증은 [plan.md](./plan.md)에 있다.
 - 주문 05(워치독 완화)는 2026-10-28 사용자가 채택해 구현했다(아래 열린 문제 7, plan Phase 5).
 - 주문 05b(60분 정리기 면제)는 2026-10-28 사용자가 채택해 구현했다(아래 열린 문제 6, plan Phase 5b).
