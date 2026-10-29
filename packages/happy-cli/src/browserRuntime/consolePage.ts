@@ -315,7 +315,10 @@ var M={en:{title:'Agent Browser',subtitle:'Runtime console',tasks:'Tasks',refres
  needApproval:'Needs your approval',needLogin:'Login needed',needCaptcha:'Human verification needed',needHandoff:'Waiting for you',userControl:'You have control',
  running:'Running',paused:'Paused',awaitingUser:'Needs you',awaitingAgent:'Waiting for the agent',released:'Released',succeeded:'Finished',failed:'Failed',cancelled:'Cancelled',releaseNeeded:'Release control',
  rLogin:'Take over, sign in on the screen, then release.',rCaptcha:'Take over and complete the verification on the screen, then release.',
- rHandoff:'The agent handed the page to you. Take over to continue.',rApproval:'The agent wants to do something that needs your approval.',
+ rHandoff:'The agent handed the page to you. Take over to continue.',
+ rHandoffFile:'The page opened a file chooser, which the agent cannot answer. Take over, choose the file (or cancel) on the screen, then release.',
+ rHandoffPermission:'The site policy does not let the agent do this step. Take over and do it yourself if you want it done, then release.',
+ rHandoffManual:'The agent cannot verify this step safely, so it is yours to do. Take over, do it on the screen, then release.',rApproval:'The agent wants to do something that needs your approval.',
  rControl:'Your input reaches the page. Release when you are done so the agent continues.',rRunning:'The agent is working on it.',
  rReleased:'Resume to hand the page back to the agent, or wait for it to continue.',rLeaseAfterEnd:'This task is over, but the input control is still with this console: release it so the agent can use the browser again.',
  origin:'Site',expires:'Expires',ok:'Done'},
@@ -331,7 +334,10 @@ var M={en:{title:'Agent Browser',subtitle:'Runtime console',tasks:'Tasks',refres
  needApproval:'승인 필요',needLogin:'로그인 필요',needCaptcha:'사람 확인 필요',needHandoff:'직접 조작 대기',userControl:'내가 제어 중',
  running:'진행 중',paused:'일시 정지',awaitingUser:'확인 필요',awaitingAgent:'에이전트 대기',released:'제어권 반납됨',succeeded:'완료됨',failed:'실패',cancelled:'취소됨',releaseNeeded:'제어권 반납 필요',
  rLogin:'제어권을 가져와 화면에서 로그인한 뒤 반납하세요.',rCaptcha:'제어권을 가져와 화면에서 확인을 마친 뒤 반납하세요.',
- rHandoff:'에이전트가 화면을 넘겼어요. 제어권을 가져와 이어서 진행하세요.',rApproval:'에이전트가 승인이 필요한 작업을 하려고 해요.',
+ rHandoff:'에이전트가 화면을 넘겼어요. 제어권을 가져와 이어서 진행하세요.',
+ rHandoffFile:'페이지가 파일 선택 창을 열었고, 에이전트는 여기에 답할 수 없어요. 제어권을 가져와 화면에서 파일을 고르거나 취소한 뒤 반납하세요.',
+ rHandoffPermission:'사이트 정책상 에이전트가 이 단계를 할 수 없어요. 필요하면 제어권을 가져와 직접 한 뒤 반납하세요.',
+ rHandoffManual:'에이전트가 이 단계를 안전하게 확인할 수 없어 직접 해야 해요. 제어권을 가져와 화면에서 한 뒤 반납하세요.',rApproval:'에이전트가 승인이 필요한 작업을 하려고 해요.',
  rControl:'입력이 화면에 전달되고 있어요. 다 하면 반납해야 에이전트가 이어서 진행해요.',rRunning:'에이전트가 작업하고 있어요.',
  rReleased:'계속 진행을 눌러 에이전트에게 넘기거나, 에이전트가 이어서 진행하기를 기다리세요.',rLeaseAfterEnd:'이 작업은 끝났지만 입력 제어권이 아직 이 콘솔에 있어요. 반납해야 에이전트가 브라우저를 다시 쓸 수 있어요.',
  origin:'사이트',expires:'만료',ok:'완료했어요'}};
@@ -419,16 +425,21 @@ function describe(t){
  var waiting=t.status==='awaiting-user'||t.pauseReason==='grant-expired';
  if(waiting&&t.waitReason==='login')return {label:T.needLogin,tone:'warn',reason:T.rLogin,icon:'i-hand'};
  if(waiting&&t.waitReason==='captcha')return {label:T.needCaptcha,tone:'warn',reason:T.rCaptcha,icon:'i-hand'};
- if(waiting&&t.waitReason==='handoff')return {label:T.needHandoff,tone:'warn',reason:T.rHandoff,icon:'i-hand'};
+ if(waiting&&t.waitReason==='handoff')return {label:T.needHandoff,tone:'warn',reason:handoffText(t.handoff),icon:'i-hand'};
  if(t.status==='awaiting-user')return {label:T.awaitingUser,tone:'warn',reason:'',icon:'i-hand'};
  if(t.status==='running')return {label:T.running,tone:'run',reason:T.rRunning,icon:'i-activity'};
  if(t.pauseReason==='awaiting-agent')return {label:T.awaitingAgent,tone:'',reason:'',icon:'i-activity'};
  if(t.status==='paused')return {label:T.paused,tone:'',reason:'',icon:'i-globe'};
  return {label:t.status||'',tone:'',reason:'',icon:'i-globe'}}
+/**
+ * The Runtime's reason for a hand-off, in the user's words. A reason this console does not know, or none (an older
+ * Runtime), reads as the general hand-off. It only explains the wait; what the buttons may do follows the task state.
+ */
+function handoffText(h){var r=h&&h.reason;return r==='file-chooser'?T.rHandoffFile:r==='permission'?T.rHandoffPermission:r==='manual-control'?T.rHandoffManual:T.rHandoff}
 /** The Runtime's terminal statuses: listTasks leaves them out, so the menu does too. */
 function finished(t){return t.status==='succeeded'||t.status==='failed'||t.status==='cancelled'}
 function chip(el,d){el.className='chip'+(d.tone?' '+d.tone:'');el.textContent=d.label}
-function showTask(t){if(taskSession&&t.agentSessionId!==taskSession)return;if(modeDialogTask&&modeDialogTask.taskId!==t.taskId)closeAutoDialog();S.task=t;$('task').textContent=JSON.stringify({status:t.status,pauseReason:t.pauseReason,waitReason:t.waitReason,stateVersion:t.stateVersion,tabs:t.tabs,cancelRequested:t.cancelRequested,uncertainActions:t.uncertainActions},null,2);
+function showTask(t){if(taskSession&&t.agentSessionId!==taskSession)return;if(modeDialogTask&&modeDialogTask.taskId!==t.taskId)closeAutoDialog();S.task=t;$('task').textContent=JSON.stringify({status:t.status,pauseReason:t.pauseReason,waitReason:t.waitReason,handoff:t.handoff,stateVersion:t.stateVersion,tabs:t.tabs,cancelRequested:t.cancelRequested,uncertainActions:t.uncertainActions},null,2);
  // The tab the controls name must be this task's: coming back from another task (or a typed id) must not send
  // the other task's tab (SCOPE_DENIED) — an empty or foreign id falls back to the task's first tab.
  if(t.tabs&&t.tabs.length&&t.tabs.indexOf($('tabId').value.trim())<0)$('tabId').value=t.tabs[0];

@@ -327,6 +327,47 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         } finally { listedTasks = defaultTasks(); taskDetail = undefined }
     }, 30_000)
 
+    it('names the hand-off reason the Runtime observed, falls back to the general hand-off, and lets the control state decide', async () => {
+        const now = Date.now()
+        const task = (taskId: string, extra: Record<string, unknown>) => ({ taskId, status: 'awaiting-user', waitReason: 'handoff', tabs: ['tab-1'], updatedAtMs: now, ...extra })
+        listedTasks = [
+            task('task-file', { handoff: { reason: 'file-chooser', tabId: 'tab-1', actionId: 'a1', atMs: now } }),
+            task('task-policy', { handoff: { reason: 'permission', tabId: 'tab-1', actionId: 'a2', atMs: now } }),
+            task('task-manual', { handoff: { reason: 'manual-control', tabId: 'tab-1', actionId: 'a3', atMs: now } }),
+            // A reason from a newer Runtime, and a hand-off from an older one (no detail): the general text.
+            task('task-future', { handoff: { reason: 'os-permission', tabId: 'tab-1', actionId: 'a4', atMs: now } }),
+            task('task-legacy', {}),
+            // The user holds or gave back control: that state is shown, not the hand-off reason.
+            task('task-held', { status: 'paused', pauseReason: 'user-control', handoff: { reason: 'file-chooser', tabId: 'tab-1', actionId: 'a5', atMs: now } }),
+            task('task-given', { status: 'paused', pauseReason: 'user-input-complete', handoff: { reason: 'file-chooser', tabId: 'tab-1', actionId: 'a6', atMs: now } }),
+        ]
+        taskDetails = Object.fromEntries(listedTasks.map((t) => [String(t.taskId), { ...t, stateVersion: 4, uncertainActions: [], cancelRequested: false,
+            tabLeases: [{ tabId: 'tab-1', leaseEpoch: 2, owner: t.pauseReason === 'user-control'
+                ? { kind: 'user', principalId: 'user-1', viewerSessionId: 'viewer-this' } : { kind: 'none' } }] }]))
+        try {
+            const target = await harness.openFrontTab(`${origin}/console?lang=en#abp-cap=${token('handoff', Date.now() + 600_000)}&abp-exp=${Date.now() + 600_000}`)
+            await eventually(() => harness.evaluate(target, `document.querySelectorAll('#tasks button').length`), (n) => n === listedTasks.length, 10_000)
+            const shown: Record<string, { label: string; reason: string }> = {}
+            for (const { taskId } of listedTasks) {
+                await harness.evaluate(target, `document.querySelector('[data-task="${taskId}"]').click()`)
+                await eventually(() => harness.evaluate(target, `document.getElementById('detailId').textContent`), (id) => id === taskId, 10_000)
+                shown[String(taskId)] = JSON.parse(String(await harness.evaluate(target, `JSON.stringify({ label: document.getElementById('detailTitle').textContent,
+                    reason: document.getElementById('detailReason').textContent })`)))
+            }
+            const general = 'The agent handed the page to you. Take over to continue.'
+            expect(shown).toEqual({
+                'task-file': { label: 'Waiting for you', reason: 'The page opened a file chooser, which the agent cannot answer. Take over, choose the file (or cancel) on the screen, then release.' },
+                'task-policy': { label: 'Waiting for you', reason: 'The site policy does not let the agent do this step. Take over and do it yourself if you want it done, then release.' },
+                'task-manual': { label: 'Waiting for you', reason: 'The agent cannot verify this step safely, so it is yours to do. Take over, do it on the screen, then release.' },
+                'task-future': { label: 'Waiting for you', reason: general },
+                'task-legacy': { label: 'Waiting for you', reason: general },
+                'task-held': { label: 'You have control', reason: 'Your input reaches the page. Release when you are done so the agent continues.' },
+                'task-given': { label: 'Released', reason: 'Resume to hand the page back to the agent, or wait for it to continue.' },
+            })
+            await harness.closeTarget(target)
+        } finally { listedTasks = defaultTasks(); taskDetails = {} }
+    }, 60_000)
+
     it('opens the screen through a one-time viewer ticket for the capability profile', async () => {
         ops.length = 0
         const cap = token('screen', Date.now() + 600_000)

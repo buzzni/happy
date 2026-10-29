@@ -470,11 +470,13 @@ describe('action receipts', () => {
     it('reports the input and what the driver saw on the step result, durably and in the driver-call event', async () => {
         const h = await harness('abp-boundary-receipt-')
         const t = await openTask(h)
-        h.driver.observeDuringNext('click', { dialogs: [{ type: 'alert' }], popups: [{ origin: 'https://fixture.test', closed: false }], fileChoosers: [{ mode: 'selectSingle' }] })
+        h.driver.observeDuringNext('click', { dialogs: [{ type: 'alert' }], popups: [{ origin: 'https://fixture.test', closed: false }] })
+        // A reported file chooser hands the page to the user after its step, so it is the last step's here.
+        h.driver.observeDuringNext('fill', { fileChoosers: [{ mode: 'selectSingle' }] })
         const submitted = await submit(h, t, [writeStep(t, 'click', 'click-receipt'), writeStep(t, 'fill', 'fill-receipt')], 'batch-receipt')
         expect(submitted.result?.steps.map((step) => step.receipt)).toEqual([
-            { input: 'sent', dialogs: [{ type: 'alert' }], popups: [{ origin: 'https://fixture.test', closed: false }], fileChoosers: [{ mode: 'selectSingle' }] },
-            { input: 'sent' },
+            { input: 'sent', dialogs: [{ type: 'alert' }], popups: [{ origin: 'https://fixture.test', closed: false }] },
+            { input: 'sent', fileChoosers: [{ mode: 'selectSingle' }] },
         ])
         const events = await h.runtime.subscribe(h.auth, { taskId: t.taskId, afterSeq: 0 })
         expect(events.kind).toBe('events')
@@ -484,7 +486,7 @@ describe('action receipts', () => {
         await h.store.close()
         const restarted = await harness('', h.driver, h.dir)
         await restarted.runtime.started()
-        expect(restarted.store.getTask(t.taskId)?.lastBatch?.steps[0].receipt).toMatchObject({ input: 'sent', fileChoosers: [{ mode: 'selectSingle' }] })
+        expect(restarted.store.getTask(t.taskId)?.lastBatch?.steps[1].receipt).toMatchObject({ input: 'sent', fileChoosers: [{ mode: 'selectSingle' }] })
         await restarted.store.close()
     })
 
