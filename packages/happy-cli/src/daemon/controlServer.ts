@@ -482,8 +482,8 @@ export function startDaemonControlServer({
     const setupTokenWindow = z.object({ kind: z.enum(['unified5h', 'unified7d']), pct: z.number().min(0).max(100).nullable(), resetsAt: z.number().int().nonnegative().nullable() }).strict();
     const setupTokenObservation = z.object({ observationId: z.string().min(1).max(128).optional(),
       observedAt: z.number().int().nonnegative(), windows: z.array(setupTokenWindow).max(2),
-      reason: z.enum(['ok', 'rate-limited']), retryAt: z.number().int().nonnegative().nullable(),
-    }).strict().refine(o => o.windows.length > 0 || o.reason === 'rate-limited');
+      reason: z.enum(['ok', 'rate-limited', 'authentication-failed']), retryAt: z.number().int().nonnegative().nullable(),
+    }).strict().refine(o => o.windows.length > 0 || o.reason === 'rate-limited' || o.reason === 'authentication-failed');
     const rotationSignal = (response: { on(event: 'close', listener: () => void): unknown; writableEnded: boolean }) => {
       const cancellation = new AbortController();
       response.on('close', () => { if (!response.writableEnded) cancellation.abort(); });

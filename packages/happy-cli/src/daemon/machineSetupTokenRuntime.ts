@@ -306,6 +306,6 @@ function toRotationObservation(binding: MachineSetupTokenBindingRecord, observat
   return { observationId: observation.observationId ?? createHash('sha256').update(JSON.stringify([binding.nonce, observation])).digest('hex'), observedAt: observation.observedAt,
     managedAccountId: binding.managedAccountId, credentialGeneration: binding.credentialGeneration,
     windows: observation.windows.filter(w => w.pct !== null).map(w => ({ kind: w.kind === 'unified5h' ? 'five_hour' : 'seven_day',
-      utilizationBps: Math.round(w.pct! * 100), resetsAt: w.resetsAt })), accountWideRefusal: observation.reason === 'rate-limited' ? 'account_limit' : null }
+      utilizationBps: Math.round(w.pct! * 100), resetsAt: w.resetsAt })), accountWideRefusal: observation.reason === 'authentication-failed' ? 'authentication_failed' : observation.reason === 'rate-limited' ? 'account_limit' : null }
 }
 export type MachineSetupTokenRuntime = ReturnType<typeof createMachineSetupTokenRuntime>

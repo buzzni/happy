@@ -41,7 +41,7 @@ export type MachineSetupTokenBindingV2 = z.infer<typeof MachineSetupTokenBinding
 export const RotationObservationSchema = z.object({
   observationId: id, observedAt: integer, managedAccountId: id, credentialGeneration: positive,
   windows: z.array(z.object({ kind: z.enum(['five_hour', 'seven_day']), utilizationBps: integer.refine(v => v <= 10000), resetsAt: integer.nullable() }).strict()).max(2),
-  accountWideRefusal: z.literal('account_limit').nullable(),
+  accountWideRefusal: z.enum(['account_limit', 'authentication_failed']).nullable(),
 }).strict().refine(v => new Set(v.windows.map(w => w.kind)).size === v.windows.length)
   .refine(v => v.windows.length > 0 || v.accountWideRefusal !== null);
 export type RotationObservation = z.infer<typeof RotationObservationSchema>;

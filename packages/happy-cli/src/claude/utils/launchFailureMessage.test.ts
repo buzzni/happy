@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CLAUDE_NOT_SIGNED_IN_NOTICE, isClaudeAuthenticationFailure, claudeNotSignedInNotice, describeClaudeLaunchFailure, isClaudeTokenRefreshFailure } from './launchFailureMessage';
+import { CLAUDE_NOT_SIGNED_IN_NOTICE, isClaudeRevokedTokenFailure, isClaudeAuthenticationFailure, claudeNotSignedInNotice, describeClaudeLaunchFailure, isClaudeTokenRefreshFailure } from './launchFailureMessage';
 
 // Desktop specs/headless-standalone-server R21: the user sees why Claude Code did not start, but
 // never raw stderr — it can carry paths, env values or tokens.
@@ -63,3 +63,12 @@ describe('isClaudeTokenRefreshFailure', () => {
   expect(isClaudeAuthenticationFailure({is_error:false,result:'API Error: 401 example'})).toBe(false);
   expect(isClaudeAuthenticationFailure({is_error:true,result:'Tool failed: permission denied'})).toBe(false);
  });
+
+it('requires explicit provider token revocation before permanently excluding an account', () => {
+ expect(isClaudeRevokedTokenFailure({ is_error: true, result: 'Failed to authenticate: OAuth token revoked. Please log in again or contact your administrator.' })).toBe(true);
+ expect(isClaudeRevokedTokenFailure({ type: 'assistant', error: 'authentication_failed', message: { content: [{ type: 'text', text: 'Failed to authenticate: OAuth token revoked.' }] } })).toBe(true);
+ expect(isClaudeRevokedTokenFailure({ type: 'assistant', error: 'authentication_failed' })).toBe(false);
+ expect(isClaudeRevokedTokenFailure({ is_error: true, result: 'Failed to authenticate: OAuth session expired and could not be refreshed' })).toBe(false);
+ expect(isClaudeRevokedTokenFailure({ is_error: true, result: 'API Error: 401 token expired' })).toBe(false);
+ expect(isClaudeRevokedTokenFailure({ is_error: false, result: 'Failed to authenticate: OAuth token revoked.' })).toBe(false);
+});

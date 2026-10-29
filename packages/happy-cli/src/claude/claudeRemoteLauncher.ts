@@ -47,7 +47,7 @@ import { publishClaudePromptSuggestion } from './promptSuggestionMetadata';
 import { createStreamDeltaRelay } from './streamDeltaRelay';
 import { contextUsageSignalItem, withContextUsageSignals } from './claudeContextUsage';
 import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
-import { claudeNotSignedInNotice, isClaudeAuthenticationFailure, isClaudeTokenRefreshFailure, describeClaudeLaunchFailure } from './utils/launchFailureMessage';
+import { claudeNotSignedInNotice, isClaudeAuthenticationFailure, isClaudeRevokedTokenFailure, isClaudeTokenRefreshFailure, describeClaudeLaunchFailure } from './utils/launchFailureMessage';
 import { buildMandatoryRemoteDenyRules, resolveClaudeRemoteSandbox } from '@/sandbox/claudeSdkSandbox';
 
 interface PermissionsField {
@@ -125,6 +125,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     let pending: CollectedBatch<EnhancedMode> | null = null;
     // A dequeued batch can still be awaiting lessons/checkpoints before the SDK write.
     let preparingBatch: CollectedBatch<EnhancedMode> | null = null;
+    let lastCommittedBatch: CollectedBatch<EnhancedMode> | null = null;
 
     /**
      * This generation's SDK exit observer, reachable from the abort path.
@@ -350,6 +351,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             const continuation = batch.continuation && session.client.inputEvidence
                 ? session.client.inputEvidence.claimContinuation(batch.continuation) : batch.continuation;
             if (batch.continuation && !continuation) return false;
+            lastCommittedBatch = batch;
             messageQueue.enqueue(pendingRequestItem(batch.channelRequestId ?? null, {
                 inputs: batch.inputs ?? [], inputCount: batch.inputCount, continuation,
             }));
@@ -489,6 +491,18 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     let lastTurnChannel = false;
     /** A refused turn to continue as the first turn of the next provider (set by a switch). */
     let continuation: EnhancedMode | null = null;
+    function enqueueAccountContinuation(mode: EnhancedMode) {
+        // No native transcript exists yet: retain the actual request, attachments and authority.
+        if (!session.sessionId && lastCommittedBatch) {
+            pending = { ...lastCommittedBatch, mode, continuation: session.client.inputEvidence?.takeContinuation() };
+            return;
+        }
+        session.queue.unshiftIsolated(CONTINUE_PROMPT, mode, undefined, session.turnAttendance?.continuationInput(), {
+            ref: { kind: 'unidentified', runtimeInputId: randomUUID() },
+            continuation: session.client.inputEvidence?.takeContinuation(),
+        });
+    }
+
     /** The provider runs on a binding the session has since switched away from. */
     const providerStale = () => providerRunning && (providerCredentialGeneration !== (personalFallback?.generation() ?? 0) || providerBinding !== undefined && providerBinding !== runningAuthority());
 
@@ -499,7 +513,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     }
 
     function onMessage(message: SDKMessage) {
-        if (isClaudeAuthenticationFailure(message) && !personalFallback?.identity()) { lastOrganizationAuthenticationFailed = true; personalFallback?.noteOrganizationAuthentication(true); }
+        if (isClaudeAuthenticationFailure(message) && !personalFallback?.identity() && !providerStale()) {
+            lastOrganizationAuthenticationFailed = true; personalFallback?.noteOrganizationAuthentication(true);
+            setupTokenSwitching?.onAuthenticationFailure(isClaudeRevokedTokenFailure(message));
+        }
         sideQuestion.noteMainMessage(message);
         transientRetry.observe(message);
         if (!personalFallback?.identity() && (message as { type?: unknown }).type === 'rate_limit_event') {
@@ -939,10 +956,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         // The next provider's first turn: ahead of anything the user queued meanwhile, and alone.
                         if (!providerRunning && continuation) {
                             if (!pending && session.queue.size() === 0 && !session.queue.isClosed()) {
-                                session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation, undefined, session.turnAttendance?.continuationInput(), {
-                                    ref: { kind: 'unidentified', runtimeInputId: randomUUID() },
-                                    continuation: session.client.inputEvidence?.takeContinuation(),
-                                });
+                                enqueueAccountContinuation(continuation);
                             }
                             continuation = null;
                         }
@@ -994,7 +1008,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 p = { ...p, mode: revisedMode };
                             }
                             dispatchTurn();
-                            return { ...p, commitInput: commitInput(p), latency: toTurnLatency(p) };
+                            return { ...p, message: claudeBatchMessage(p), commitInput: commitInput(p), latency: toTurnLatency(p) };
                         }
 
                         /*
@@ -1062,10 +1076,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 if (providerOptionsStale()) return null;
                                 if (!providerRunning && continuation) {
                                     if (!pending && session.queue.size() === 0 && !session.queue.isClosed()) {
-                                        session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation, undefined, session.turnAttendance?.continuationInput(), {
-                                            ref: { kind: 'unidentified', runtimeInputId: randomUUID() },
-                                            continuation: session.client.inputEvidence?.takeContinuation(),
-                                        });
+                                        enqueueAccountContinuation(continuation);
                                     }
                                     continuation = null;
                                 }
@@ -1221,46 +1232,6 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 msg = { ...msg, mode: revisedMode };
                             }
 
-                            // Per-message attachments are already claimed by the message
-                            // when it was pushed onto the queue, so there is no race window
-                            // to wait out here — just consume what travelled with the batch.
-                            const attachments = msg.attachments ?? [];
-                            if (attachments.length > 0) {
-                                const contentBlocks: ContentBlockParam[] = [];
-                                for (const att of attachments) {
-                                    // Detect media type from the decrypted bytes' magic header
-                                    // rather than trusting the wire-supplied mimeType. iOS image
-                                    // pickers happily report things like "image/heic" or no
-                                    // mimeType at all, which the Anthropic API rejects with a
-                                    // strict enum validation error. If the bytes look like one
-                                    // of the four formats Claude accepts, send that label —
-                                    // otherwise skip the attachment with a debug log.
-                                    const detected = detectClaudeImageMime(att.data);
-                                    if (!detected) {
-                                        logger.debug(`[remote] Skipping unsupported attachment (no magic-byte match): ${att.name}, claimed mimeType=${att.mimeType}`);
-                                        continue;
-                                    }
-                                    contentBlocks.push({
-                                        type: 'image' as const,
-                                        source: {
-                                            type: 'base64' as const,
-                                            media_type: detected,
-                                            data: Buffer.from(att.data).toString('base64'),
-                                        },
-                                    });
-                                }
-                                contentBlocks.push({ type: 'text' as const, text: msg.message });
-                                logger.debug(`[remote] Combined ${contentBlocks.length - 1} image(s) with text message`);
-                                dispatchTurn();
-                                return {
-                                    commitInput: commitInput(msg),
-                                    message: contentBlocks,
-                                    mode: msg.mode,
-                                    latency,
-                                    ...(msg.channelRequestId !== undefined ? { channelRequestId: msg.channelRequestId } : {}),
-                                };
-                            }
-
                             // Carried through so the slash-command parser in `claudeRemote` knows
                             // this text was relayed rather than typed into the app. A channel
                             // batch normally reaches that parser via the `pending` branch above,
@@ -1268,7 +1239,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             dispatchTurn();
                             return {
                                 commitInput: commitInput(msg),
-                                message: msg.message,
+                                message: claudeBatchMessage(msg),
                                 mode: msg.mode,
                                 latency,
                                 ...(msg.channelRequestId !== undefined ? { channelRequestId: msg.channelRequestId } : {}),
@@ -1427,6 +1398,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             } catch (e) {
                 if (e instanceof MandatorySandboxError) throw e;
                 logger.debug('[remote]: launch error', e);
+                const authenticationError = { is_error: true, result: e instanceof Error ? e.message : '' };
+                if (!exitReason && !controller.signal.aborted && !personalFallback?.identity() && !providerStale()
+                    && isClaudeAuthenticationFailure(authenticationError)) {
+                    lastOrganizationAuthenticationFailed = true;
+                    personalFallback?.noteOrganizationAuthentication(true);
+                    setupTokenSwitching?.onAuthenticationFailure(isClaudeRevokedTokenFailure(authenticationError));
+                }
                 if (!exitReason) {
                     // Reported after `finally` has flushed what the run already produced, so the
                     // failure is the last thing in the turn and closes it exactly once.
@@ -1626,4 +1604,20 @@ function detectClaudeImageMime(bytes: Uint8Array): 'image/jpeg' | 'image/png' | 
         return 'image/webp';
     }
     return null;
+}
+
+/** Both freshly dequeued and replayed input retain their own decrypted attachments. */
+function claudeBatchMessage(batch: CollectedBatch<EnhancedMode>): string | ContentBlockParam[] {
+    if (!batch.attachments?.length) return batch.message;
+    const content: ContentBlockParam[] = [];
+    for (const attachment of batch.attachments) {
+        const mediaType = detectClaudeImageMime(attachment.data);
+        if (!mediaType) {
+            logger.debug(`[remote] Skipping unsupported attachment (no magic-byte match): ${attachment.name}, claimed mimeType=${attachment.mimeType}`);
+            continue;
+        }
+        content.push({ type: 'image', source: { type: 'base64', media_type: mediaType, data: Buffer.from(attachment.data).toString('base64') } });
+    }
+    content.push({ type: 'text', text: batch.message });
+    return content;
 }

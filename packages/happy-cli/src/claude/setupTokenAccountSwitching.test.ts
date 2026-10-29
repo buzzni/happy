@@ -333,3 +333,43 @@ it('primary review: proactive warning failure does not consume a later refused-t
  expect(switching.backgroundSignal()).not.toBeNull()
  switching.dispose()
 })
+
+ it('rotates revoked credentials, preserves the refusal across unrelated quota events, and continues once', async () => {
+  const { switching, deps } = setup();
+  switching.onAuthenticationFailure(true);
+  switching.onRateLimitEvent(fine);
+  expect(await switching.switchIfWanted()).toEqual({ switched: true, continueAfter: true });
+  expect(deps.rebind).toHaveBeenCalledWith('session-a', 'binding-a', { observedAt: NOW, windows: [], reason: 'authentication-failed', retryAt: null }, expect.any(AbortSignal));
+  expect(await switching.switchIfWanted()).toEqual({ switched: false, continueAfter: false });
+  expect(deps.rebind).toHaveBeenCalledTimes(1);
+ });
+ it('never resumes an authentication refusal after user stop', async () => {
+  const { switching, deps } = setup();
+  switching.onAuthenticationFailure(true); switching.cancelForStop();
+  expect(await switching.switchIfWanted()).toEqual({ switched: false, continueAfter: false });
+  expect(deps.rebind).not.toHaveBeenCalled();
+ });
+
+it('retries the same auth refusal when the user sends again without refreshing its evidence', async () => {
+ const { switching, deps, advance } = setup({ rebind: vi.fn().mockResolvedValueOnce({ ok: false, reason: 'NO_ACCOUNT' }).mockResolvedValue({ ok: true, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'next' } }) })
+ switching.onAuthenticationFailure(true); await switching.switchIfWanted();
+ advance(1000); switching.userTurnStarted(); switching.onAuthenticationFailure(true);
+ expect(await switching.switchIfWanted()).toEqual({ switched: true, continueAfter: true });
+ expect(deps.rebind).toHaveBeenLastCalledWith('session-a', 'binding-a', expect.objectContaining({ observedAt: NOW, reason: 'authentication-failed' }), expect.any(AbortSignal));
+ switching.dispose();
+})
+
+it('announces the automatic rotation limit instead of silently retrying revoked accounts forever', async () => {
+ const { switching, deps } = setup();
+ for (let i = 0; i < 7; i++) { switching.onAuthenticationFailure(true); await switching.switchIfWanted(); }
+ expect(deps.rebind).toHaveBeenCalledTimes(5);
+ expect(vi.mocked(deps.notify).mock.calls.filter(([message]) => message.includes('automatic switching limit'))).toHaveLength(1);
+})
+
+it('rotates a recoverable authentication failure without permanently rejecting its credential generation', async () => {
+ const { switching, deps } = setup();
+ switching.onAuthenticationFailure(false);
+ switching.onRateLimitEvent(fine);
+ expect(await switching.switchIfWanted()).toEqual({ switched: true, continueAfter: true });
+ expect(deps.rebind).toHaveBeenCalledWith('session-a', 'binding-a', undefined, expect.any(AbortSignal));
+});

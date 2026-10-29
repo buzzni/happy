@@ -123,7 +123,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         expect(process.env.HAPPY_SETUP_TOKEN_RESUME_REBOUND).toBeUndefined();
     });
 
-    it.each(['result', 'exception'])('restarts the same conversation after a known account refusal (%s) and prioritizes the queued user message', async failure => {
+    it.each(['result', 'exception', 'auth-result', 'auth-exception', 'auth-continuation', 'auth-fresh', 'auth-thrown', 'auth-refresh'])('restarts the same conversation after a known account refusal (%s) and prioritizes the queued user message', async failure => {
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
         const handlers = new Map<string, () => Promise<unknown>>();
         const client = {
@@ -132,6 +132,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
             setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
             setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            failClaudeLaunchTurn: vi.fn(() => { void handlers.get('switch')!(); }),
             applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
         };
         const generations: Array<{ token?: string; resume?: string; prompts: string[] }> = [];
@@ -146,10 +147,12 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
                     generation.prompts.push(JSON.stringify(message.message.content));
                     if (first) {
                         // The user queued another message while the refused turn ran.
-                        queue.push('queued while refused', { permissionMode: 'default', model: 'claude-sonnet-5' });
-                        yield refused;
-                        if (failure === 'exception') throw new Error('Provider exited after known account-wide quota refusal');
-                        yield { type: 'result', subtype: 'success', result: 'Claude AI usage limit reached', is_error: true, uuid: 'result-1' };
+                        if (!['auth-continuation', 'auth-fresh', 'auth-thrown', 'auth-refresh'].includes(failure)) queue.push('queued while refused', { permissionMode: 'default', model: 'claude-sonnet-5' });
+                        if (failure === 'auth-thrown') throw new Error('Failed to authenticate: OAuth token revoked. Please log in again or contact your administrator.');
+                        if (failure === 'auth-exception') yield { ...assistant('auth'), error: 'authentication_failed' };
+                        else if (!failure.startsWith('auth')) yield refused;
+                        if (failure === 'exception' || failure === 'auth-exception') throw new Error('Provider exited after known account-wide quota refusal');
+                        yield { type: 'result', subtype: 'success', result: failure === 'auth-refresh' ? 'Failed to authenticate: OAuth session expired and could not be refreshed' : failure.startsWith('auth') ? 'Failed to authenticate: OAuth token revoked. Please log in again or contact your administrator.' : 'Claude AI usage limit reached', is_error: true, uuid: 'result-1' };
                         continue;
                     }
                     yield assistant(`msg-${generation.prompts.length + 1}`);
@@ -161,12 +164,12 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             })();
             return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
         });
-        queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' }, failure === 'auth-fresh' ? [{ data: new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]), mimeType: 'image/png', name: 'example.png' }] : undefined);
         const session: Record<string, unknown> = {
             lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
             cancelLessonReview: vi.fn(),
-            // Continuing an existing Claude conversation; both providers must resume it.
-            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            // A failed first request may not have created a native conversation yet.
+            sessionId: failure === 'auth-fresh' ? null : 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
             api: { push: () => ({ sendSessionNotification: vi.fn() }) },
             consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
         };
@@ -175,19 +178,21 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
 
         expect(generations.map(generation => generation.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
         expect(client.setClaudeRuntimeAccount.mock.calls.map(([binding]) => JSON.parse(String(binding)).account)).toEqual(['first', 'second']);
-        expect(generations.map(generation => generation.resume)).toEqual(['claude-1', 'claude-1']);
+        expect(generations.map(generation => generation.resume)).toEqual(failure === 'auth-fresh' ? [undefined, undefined] : ['claude-1', 'claude-1']);
         // A queued user turn replaces automatic continuation and runs alone on the new account.
-        expect(generations[1].prompts[0]).toContain('queued while refused');
-        expect(generations[1].prompts[0]).not.toContain(CONTINUE_PROMPT);
-        expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', '{"account":"first"}', expect.objectContaining({ reason: 'rate-limited' }), expect.any(AbortSignal));
-        expect(reportSetupTokenUsage).toHaveBeenCalledWith('happy-session-1', '{"account":"first"}', expect.objectContaining({ reason: 'rate-limited' }), expect.any(AbortSignal));
-        expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message', message: SWITCHED_NOTICE, setupTokenRotation: { version: 1, state: 'switched' } });
+        const automaticallyContinued = ['auth-continuation', 'auth-thrown', 'auth-refresh'].includes(failure);
+        expect(generations[1].prompts[0]).toContain(failure === 'auth-fresh' ? 'hello' : automaticallyContinued ? CONTINUE_PROMPT : 'queued while refused');
+        if (!automaticallyContinued) expect(generations[1].prompts[0]).not.toContain(CONTINUE_PROMPT);
+        if (failure === 'auth-fresh') expect(generations[1].prompts[0]).toContain('iVBORw0KGgo=');
+        expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', '{"account":"first"}', ['auth-refresh', 'auth-exception'].includes(failure) ? undefined : expect.objectContaining({ reason: failure.startsWith('auth') ? 'authentication-failed' : 'rate-limited' }), expect.any(AbortSignal));
+        if (!failure.startsWith('auth')) expect(reportSetupTokenUsage).toHaveBeenCalledWith('happy-session-1', '{"account":"first"}', expect.objectContaining({ reason: failure.startsWith('auth') ? 'authentication-failed' : 'rate-limited' }), expect.any(AbortSignal));
+        expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message', message: failure.startsWith('auth') ? 'This organization Claude account could not authenticate, so the session moved to another organization account.' : SWITCHED_NOTICE, setupTokenRotation: { version: 1, state: 'switched' } });
         expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1);
         expect(generations[0].prompts).toHaveLength(1);
         expect(generations[1].prompts).toHaveLength(1);
         // A restarted provider is not enough: the new reply must reach the user's session once.
         const replies = client.sendClaudeSessionMessage.mock.calls.flatMap(([body]) =>
-            body.type === 'assistant' ? [body.message] : []);
+            body.type === 'assistant' && body.message.id !== 'auth' ? [body.message] : []);
         expect(replies).toEqual([
             expect.objectContaining({ id: 'msg-2', content: [{ type: 'text', text: 'hi' }] }),
         ]);

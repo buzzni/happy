@@ -55,6 +55,7 @@ describe('portable rotation contract', () => {
     const observation = { observationId: 'o', observedAt: 1, managedAccountId: 'a', credentialGeneration: 1, windows: [], accountWideRefusal: null };
     expect(RotationObservationSchema.safeParse(observation).success).toBe(false);
     expect(RotationObservationSchema.safeParse({ ...observation, accountWideRefusal: 'account_limit' }).success).toBe(true);
+    expect(RotationObservationSchema.safeParse({ ...observation, accountWideRefusal: 'authentication_failed' }).success).toBe(true);
     expect(RotationObservationSchema.safeParse({ ...observation, accountWideRefusal: 'throttle' }).success).toBe(false);
   });
 

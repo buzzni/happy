@@ -46,7 +46,13 @@ it.each([false, true])('preserves merge-base turns/consumers with evidence opt-i
             expect.soft(actual, original.name).toBeDefined();
             for (const field of ['turns', 'routing', 'reports', 'reportsBeforeCancel', 'followup', 'ready', 'outboxTurns', 'prompts',
                 ...(!enabled ? ['wire', 'metadata', 'metadataWrites', 'transitions'] : [])]) {
-                expect.soft(actual?.[field], `${original.name}: ${field}`).toEqual(original[field]);
+                // Account rotation now also handles authentication failures. Only its internal
+                // continuation wording changes; preserve every other merge-base consumer assertion.
+                const expected = field === 'prompts' && original.name.startsWith('account-')
+                    ? original[field]?.map((prompt: string) => prompt === 'The previous request stopped because the organization Claude account reached its usage limit. The session now uses another account — continue from where you stopped.'
+                        ? 'The previous request stopped because the organization Claude account was unavailable. The session now uses another account — continue from where you stopped.' : prompt)
+                    : original[field];
+                expect.soft(actual?.[field], `${original.name}: ${field}`).toEqual(expected);
             }
             for (const revision of actual?.evidence ?? []) {
                 expect.soft(revision.inputEvidence).toMatchObject({ coverage: 'incomplete', inputs: [], inputCount: 0, terminal: true });

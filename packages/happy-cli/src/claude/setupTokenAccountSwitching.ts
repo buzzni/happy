@@ -49,7 +49,7 @@ export const APPLY_REQUIRED_NOTICE = 'This organization Claude account reached i
 export const FORBIDDEN_NOTICE = 'Saycode can no longer manage this session\'s organization Claude account, so it will not switch accounts. Start a new conversation to use the organization accounts assigned to you now.'
 /** Saycode specs/managed-account-session-continuation — the account this conversation ran on left the PC; it resumed on another. */
 export const RESUME_REBOUND_NOTICE = 'The organization Claude account this conversation used is no longer assigned to this PC, so it continues on another organization account.'
-export const CONTINUE_PROMPT = 'The previous request stopped because the organization Claude account reached its usage limit. The session now uses another account — continue from where you stopped.'
+export const CONTINUE_PROMPT = 'The previous request stopped because the organization Claude account was unavailable. The session now uses another account — continue from where you stopped.'
 
 export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchingDeps) {
   const now = deps.now ?? Date.now
@@ -57,6 +57,7 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
   const retryWindowMs = deps.retryWindowMs ?? RETRY_WINDOW_MS
   const tracker = createSetupTokenUsageTracker(now)
   let lastReportAt = -Infinity, lastReportedExhausted = false
+  let authenticationFailed = false
   let wanted = false, refused = false, switches = 0, stopped = false
   /** The session ended: nothing switches, retries or speaks any more, not even an attempt already in flight. */
   let disposed = false, paused = false, cancelEpoch = 0, userEpoch = 0
@@ -103,7 +104,7 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
       retryAfterMs = 'retryAfterMs' in result && typeof result.retryAfterMs === 'number' ? result.retryAfterMs : 0
       if (result.reason === 'NO_ACCOUNT') {
         wanted = false
-        tell(NO_ACCOUNT_NOTICE, 'exhausted')
+        tell(authenticationFailed ? 'This organization Claude account could not authenticate and no replacement organization account is available. The session will retry.' : NO_ACCOUNT_NOTICE, 'exhausted')
       } else if (PERMANENT.has(result.reason)) {
         wanted = false
         if (result.reason === 'FORBIDDEN') stop()
@@ -121,13 +122,14 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
     }
     wanted = false
     if (result.environment.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING === binding) return { switched: false, continueAfter: false }
+    const switchedAfterAuthenticationFailure = authenticationFailed
     deps.applyEnvironment(result.environment)
     tracker.reset()
     switches++; told.clear(); lastReportAt = -Infinity; lastReportedExhausted = false
     logger.debug(`[setup-token-switch] session ${sessionId} moved to another organization account (${switches} of ${MAX_SWITCHES})`)
     const continueAfter = refused && user === userEpoch
-    refused = false; latestObservation = undefined; retryDeadline = null; retryAfterMs = 0
-    emit(SWITCHED_NOTICE, 'switched')
+    refused = false; authenticationFailed = false; latestObservation = undefined; retryDeadline = null; retryAfterMs = 0
+    emit(switchedAfterAuthenticationFailure ? 'This organization Claude account could not authenticate, so the session moved to another organization account.' : SWITCHED_NOTICE, 'switched')
     return { switched: true, continueAfter }
   }
 
@@ -171,8 +173,15 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
   }
 
   return {
-    onRateLimitEvent(info: unknown) {
+    onAuthenticationFailure(revoked: boolean) {
       if (disposed || stopped || paused) return
+      wanted = true; refused = true; authenticationFailed = true
+      if (latestObservation?.reason === 'authentication-failed') return
+      latestObservation = revoked ? { observedAt: now(), windows: [], reason: 'authentication-failed', retryAt: null } : undefined
+      // Rebind carries this evidence atomically; quota reports may otherwise race the account change.
+    },
+    onRateLimitEvent(info: unknown) {
+      if (disposed || stopped || paused || authenticationFailed) return
       // The latest word decides: a refusal later followed by allowed requests cut nothing short.
       const status = (info as { status?: unknown } | null)?.status
       if (status !== undefined) refused = isSetupTokenAccountRefusal(info as Parameters<typeof isSetupTokenAccountRefusal>[0])
@@ -205,7 +214,12 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
         return Promise.resolve(done)
       }
       const sessionId = deps.sessionId(), binding = deps.binding()
-      if (disposed || paused || stopped || !wanted || !sessionId || !binding || switches >= MAX_SWITCHES) return Promise.resolve({ switched: false, continueAfter: false })
+      if (wanted && switches >= MAX_SWITCHES) {
+        tell('This conversation reached its automatic switching limit. Check the organization Claude accounts before retrying.', 'failed')
+        endBackground()
+        return Promise.resolve({ switched: false, continueAfter: false })
+      }
+      if (disposed || paused || stopped || !wanted || !sessionId || !binding) return Promise.resolve({ switched: false, continueAfter: false })
       return attempt(sessionId, binding).then(result => {
         // Switched at this boundary: nothing is left to wait for.
         if (result.switched) endBackground()
@@ -220,7 +234,7 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
     cancelBackground() { userEpoch++; refused = false; endBackground() },
     userTurnStarted() { if (paused) cancellation = new AbortController(); paused = false; userEpoch++; refused = false; endBackground() },
     hasAccountRefusal() { return refused && !paused && !disposed },
-    cancelForStop() { cancellation.abort(); paused = true; cancelEpoch++; userEpoch++; wanted = false; refused = false; latestObservation = undefined; retryDeadline = null; endBackground() },
+    cancelForStop() { cancellation.abort(); paused = true; cancelEpoch++; userEpoch++; wanted = false; refused = false; authenticationFailed = false; latestObservation = undefined; retryDeadline = null; endBackground() },
     /** The session ended: terminal, including for an attempt still in flight. */
     dispose() {
       disposed = true; cancellation.abort(); cancelEpoch++

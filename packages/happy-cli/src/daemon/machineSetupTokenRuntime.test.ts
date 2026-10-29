@@ -22,7 +22,7 @@ vi.mock('axios', () => ({ default: { post: vi.fn() } }))
 const NOW = 1800000000000, companyId = 'company', machineId = 'machine', studioOrigin = 'https://studio.test', happyOrigin = 'https://happy.test'
 const originalOwner = 'staged-personal-account', machineOwner = 'company-owner'
 const refusal = { observedAt: NOW, reason: 'rate-limited' as const, retryAt: null, windows: [] }
-async function setup() {
+async function setup(expectedRefusal: 'account_limit' | 'authentication_failed' = 'account_limit') {
   const keys = { signing: nacl.sign.keyPair(), recipient: nacl.box.keyPair() }, studio = nacl.sign.keyPair()
   const keyId = await rotationSha256(studio.publicKey), deviceKeyId = await rotationSha256(keys.signing.publicKey)
   const config = { companyId, machineId, studioOrigin, happyOrigin, studioPublicKey: Buffer.from(studio.publicKey).toString('base64url') }
@@ -59,7 +59,7 @@ async function setup() {
       expect(pending?.request.operationId).toBe(body.operationId) // Intent ACK BEFORE mutation.
       const previous = body.action === 'rebind' ? bindings.get(body.nonce)! : undefined
       if (body.action === 'rebind') {
-        expect(body.observation).toMatchObject({ managedAccountId: previous!.managedAccountId, credentialGeneration: 1, accountWideRefusal: 'account_limit', windows: [] })
+        expect(body.observation).toMatchObject({ managedAccountId: previous!.managedAccountId, credentialGeneration: 1, accountWideRefusal: expectedRefusal, windows: [] })
       }
       const binding: MachineSetupTokenBindingV2 = { version: 2, type: 'claude-setup-token-binding', audience: 'saycode-daemon', principalType: 'machine', companyId, machineId,
         groupScope: companyId, assignmentGeneration: 1, assignmentFingerprint: 'a'.repeat(64), managedAccountId: previous ? 'account-b' : 'account-a', credentialGeneration: 1,
@@ -422,3 +422,11 @@ it.each(['expired-ticket', 'expired-device-proof', 'expired-ticket-signed', 'ser
     expect(start).not.toHaveBeenCalled(); expect(t.sessionEnvironment).not.toHaveBeenCalled();
   } finally { clock.mockRestore(); await rm(home, { recursive: true, force: true }); }
 });
+
+it('preserves authentication failure in the signed machine observation and resumes with the replacement token', async () => {
+ const t = await setup('authentication_failed'), runtime = t.build(), launch = await runtime.prepareLaunch(t.input); t.attach(launch.environment)
+ const env = await runtime.rebind(launch.session.id, launch.environment[SETUP_TOKEN_BINDING_ENV], { ...refusal, reason: 'authentication-failed' })
+ expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe('SYNTHETIC-account-b')
+ const request = t.requests.find(r => r.action === 'rebind')
+ expect(request).toMatchObject({ observation: { accountWideRefusal: 'authentication_failed', managedAccountId: 'account-a', credentialGeneration: 1 } })
+})
