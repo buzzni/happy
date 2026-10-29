@@ -124,6 +124,11 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     private readonly inputGates = new Map<TaskId, InputGate>()
     /** Bumped on every driver disconnect: an input prepared on a lost connection is never sent on the next one. */
     private readonly connectionEpochs = new Map<ProfileId, number>()
+    /**
+     * Cancels per task that have revoked its leases but not yet recorded (or failed to record) the cancel;
+     * they persist the leases first. `settled` resolves once the last of them has ended.
+     */
+    private readonly cancelling = new Map<TaskId, { count: number; settled: Promise<void>; settle: () => void }>()
     private readonly latestAgentSnapshots = new Map<TabId, SnapshotId>()
     private readonly liveBatchSteps = new Map<BatchId, BatchStep[]>()
     /** Profiles between a driver disconnect and the end of its reconnect handling (which alone judges browser identity) */
@@ -1924,6 +1929,32 @@ export class BrowserRuntime implements BrowserRuntimeApi {
      * (`cancelled-with-unknown-effect`) instead of cancelled.
      */
     private async cancelTask(task: StoredTask): Promise<StoredTask> {
+        let pending = this.cancelling.get(task.taskId)
+        if (!pending) {
+            let settle!: () => void
+            const settled = new Promise<void>((resolve) => { settle = resolve })
+            pending = { count: 0, settled, settle }
+            this.cancelling.set(task.taskId, pending)
+        }
+        pending.count += 1
+        try {
+            return await this.recordCancel(task)
+        }
+        finally {
+            // Overlapping cancels: only the last one to end clears the mark (a failed one must not clear another's).
+            pending.count -= 1
+            if (pending.count === 0) {
+                this.cancelling.delete(task.taskId)
+                pending.settle()
+            }
+        }
+    }
+    /** Resolves once no cancel of the task is still between revoking its leases and recording the cancel. */
+    private async cancelsSettled(taskId: TaskId): Promise<void> {
+        for (let pending = this.cancelling.get(taskId); pending; pending = this.cancelling.get(taskId))
+            await pending.settled
+    }
+    private async recordCancel(task: StoredTask): Promise<StoredTask> {
         const revokedLeases = this.leases.revokeTask(task.taskId)
         for (const lease of revokedLeases)
             await this.persistTabLease(task.taskId, task.taskSpaceId, lease.tabId, lease.leaseEpoch)
@@ -2842,7 +2873,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         task.profileId).leaseEpoch !== leaseEpoch || task.status !== 'running') {
                         const uncertain = write
                         const state = uncertain ? 'uncertain' as const : 'skipped' as const
-                        // Still running: the lease moved without a fence that paused the task (a reconnect restored it).
+                        // Still running: the lease moved without a fence that paused the task (a reconnect restored it), or
+                        // every cancel that revoked it failed to record itself.
                         const stillRunning = task.status === 'running' && !task.cancelRequested
                         await this.commit(task, { actions: { ...task.actions, [step.actionId]: { ...task.actions[step.actionId],
                             state } }, ...(uncertain ? { uncertainActions: [...new Set([...task.uncertainActions,
@@ -2931,8 +2963,11 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     }
                 }
                 catch (error) {
-                    // A fence that queued its write before this result (cancel records after aborting the call) decides
-                    // first: an empty mutation waits for it without writing, so the action is judged on that record.
+                    // A cancel still persisting the leases it revoked decides first, whether it records the cancel or
+                    // fails (nothing here holds a store queue, and a cancel never waits for the worker). Then a fence that
+                    // queued its write before this result is waited for by an empty mutation, which writes nothing, so the
+                    // action and the task are judged on the latest record.
+                    await this.cancelsSettled(task.taskId)
                     await this.options.store.mutate(task.taskId, () => null).catch(() => undefined)
                     task = this.requireTask(task.taskId)
                     const runtimeError = error instanceof BrowserRuntimeError ? error : undefined
@@ -2971,7 +3006,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     if (task.pauseReason === 'user-control' || this.leases.owner(step.tabId, task.profileId).leaseEpoch !== leaseEpoch) {
                         const uncertain = sent
                         const state = uncertain ? 'uncertain' as const : 'skipped' as const
-                        // Still running: the lease moved without a fence that paused the task (a reconnect restored it).
+                        // Still running: the lease moved without a fence that paused the task (a reconnect restored it), or
+                        // every cancel that revoked it failed to record itself.
                         const stillRunning = task.status === 'running' && !task.cancelRequested
                         await this.commit(task, { actions: { ...task.actions, [step.actionId]: { ...task.actions[step.actionId],
                             state } }, ...(uncertain ? { uncertainActions: [...new Set([...task.uncertainActions,
