@@ -57,6 +57,7 @@ export const sessionToolCallEndEventSchema = z.object({
   call: z.string(),
   images: z.array(z.object({ mediaType: z.string(), data: z.string() })).optional(),
   backgroundTaskId: z.string().optional(),
+  browserQuotaKind: z.enum(['spaces', 'tabs', 'windows', 'time', 'journal']).optional(),
 });
 
 // chat-tool-output-streaming Phase 3 — daemon-emitted incremental

@@ -1023,3 +1023,10 @@ describe('channel correlation on runs that produce no text', () => {
         expect(followUpTurnStart(state)).toEqual({ t: 'turn-start', requestId: 'core-req-idle-both' });
     });
 });
+
+it('preserves typed browser quota failures in the tool end receipt', () => {
+ const state={currentTurnId:null};
+ mapClaudeLogMessageToSessionEnvelopes({type:'assistant',message:{content:[{type:'tool_use',id:'browser-quota',name:'browser_task_create_space',input:{}}]}} as any,state);
+ const result=mapClaudeLogMessageToSessionEnvelopes({type:'user',message:{content:[{type:'tool_result',tool_use_id:'browser-quota',is_error:true,content:[{type:'text',text:JSON.stringify({error:{code:'QUOTA_EXCEEDED',quotaKind:'spaces'}})}]}]}} as any,state);
+ expect(result.envelopes.find(e=>e.ev.t==='tool-call-end')?.ev).toMatchObject({browserQuotaKind:'spaces'});
+});

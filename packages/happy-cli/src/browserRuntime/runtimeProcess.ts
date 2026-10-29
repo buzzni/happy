@@ -1,3 +1,4 @@
+import { ResourceQuota, quotaPreferenceKey } from './resourceQuota'
 /**
  * Browser Runtime process (Agent Browser); `runtimeMain.ts` is the entry that runs it.
  *
@@ -338,8 +339,31 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     await attention.reconcile()
 
     const drivers = new Map<ProfileId, CdpDriver>()
+    const quotas = new Map(profiles.map(p => [p.profileId, new ResourceQuota(Math.min(config?.maxSpacesPerProfile ?? windows, windows))]))
+    const resourceQuota = (profileId: ProfileId) => {
+        const reading = quotas.get(profileId)!.read(Date.now(), drivers.get(profileId)?.debugCounts().windows ?? 0,
+            store.listSpaces().filter(s => !s.closed && s.profileId !== profileId).length)
+        const owner = config?.profilePrincipals.get(profileId)
+        const preference = owner ? store.getSpaceQuota(quotaPreferenceKey(profileId, owner, config?.profileAssignments?.get(profileId))) : undefined
+        return {...reading, limit:Math.min(reading.limit, preference?.ceiling ?? 16)}
+    }
+    // Old browser images return 404. Missing readings keep the installed fixed limits.
+    const sampleResources = async () => {
+        await Promise.all(profiles.map(async profile => {
+            try {
+                const response = await fetch(new URL('/resources', profile.instanceUrl), { signal: AbortSignal.timeout(2000) })
+                quotas.get(profile.profileId)!.observe(response.ok ? await response.json() : null, Date.now(), drivers.get(profile.profileId)?.debugCounts().windows ?? 0)
+            } catch { quotas.get(profile.profileId)!.observe(null, Date.now()) }
+        }))
+    }
+    let quotaTimer: ReturnType<typeof setInterval> | undefined
+    if (config?.adaptiveSpaceQuota) {
+        await sampleResources()
+        quotaTimer = setInterval(() => { void sampleResources() }, 10_000)
+        quotaTimer.unref()
+    }
     for (const profile of profiles) {
-        drivers.set(profile.profileId, new CdpDriver({ browserWsUrl: '', browserInstanceIdProvider: instanceIdProvider(profile), maxAgentWindows: windows }))
+        drivers.set(profile.profileId, new CdpDriver({ browserWsUrl: '', browserInstanceIdProvider: instanceIdProvider(profile), maxAgentWindows: windows, ...(config?.adaptiveSpaceQuota ? { windowLimit: () => { const q = resourceQuota(profile.profileId); return q.reason === 'measurement-unavailable' ? windows : q.limit } } : {}) }))
     }
     // Connect before recovery so it can compare browser instance ids.
     const { pending: connecting } = await connectAtStart(profiles.map((profile) => ({ profileId: profile.profileId, connect: () => connectWithRetry(drivers.get(profile.profileId)!, profile, log) })),
@@ -352,6 +376,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
         ...(config ? { profilePrincipals: config.profilePrincipals } : {}),
         ...(config?.profileAssignments ? { profileAssignments: config.profileAssignments } : {}),
         maxSpacesPerProfile: config?.maxSpacesPerProfile,
+        ...(config?.adaptiveSpaceQuota ? { resourceQuota } : {}),
         spaceIdleReclaimMs: config?.spaceIdleReclaimMs ?? (Number.isFinite(harnessIdleMs) ? harnessIdleMs : undefined) })
 
     for (const profile of profiles) {
@@ -547,6 +572,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
         port,
         health: () => ({
             pid: process.pid,
+            features: { spaceManagement: 1 },
             startedAtMs,
             profiles: profiles.map((profile) => ({ profileId: profile.profileId, connected: drivers.get(profile.profileId)!.isConnected() })),
         }),
@@ -597,6 +623,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
         clearInterval(retention)
         clearInterval(reclaimTimer)
         clearInterval(heartbeat)
+        if (quotaTimer) clearInterval(quotaTimer)
         await server.close()
         await admin.close()
         await broker?.close()

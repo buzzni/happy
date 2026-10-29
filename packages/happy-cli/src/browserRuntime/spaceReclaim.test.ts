@@ -9,7 +9,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { FakeClock } from './clock'
 import type { AgentGrant, ProfileId, RequestId, TaskSpaceId } from './contracts'
-import { BrowserRuntime } from './runtime'
+import { BrowserRuntime, type BrowserRuntimeOptions } from './runtime'
 import type { SitePolicy } from './policy'
 import { FakeBrowserDriver } from './testing/fakeDriver'
 import { TaskStore } from './taskStore'
@@ -26,7 +26,7 @@ async function tempDir(): Promise<string> { const dir = await mkdtemp(join(tmpdi
 let requests = 0
 const rid = (label: string) => `${label}-${++requests}` as RequestId
 
-async function start(dir: string, driver = new FakeBrowserDriver(), options: { maxSpacesPerProfile?: number; spaceIdleReclaimMs?: number } = {}) {
+async function start(dir: string, driver = new FakeBrowserDriver(), options: Pick<BrowserRuntimeOptions, 'maxSpacesPerProfile' | 'spaceIdleReclaimMs' | 'resourceQuota'> = {}) {
     const store = await TaskStore.open(dir)
     const clock = new FakeClock(1_000)
     const runtime = new BrowserRuntime({ store, drivers: new Map([[profileId, driver]]), clock, sites: SITES, ...options })
@@ -46,6 +46,19 @@ async function start(dir: string, driver = new FakeBrowserDriver(), options: { m
 }
 
 describe('space quota', () => {
+    it('enforces changing resource admission in the metadata queue and preserves existing spaces', async () => {
+        let limit = 3
+        const h = await start(await tempDir(), undefined, { resourceQuota: () => ({limit, mode:'automatic', reason:'resources-available'}) })
+        const outcomes = await Promise.allSettled(Array.from({length:5}, () => h.runtime.createSpace(h.agent(), {profileId, requestId:rid('auto')})))
+        expect(outcomes.filter(r => r.status === 'fulfilled')).toHaveLength(3)
+        limit = 1
+        await expect(h.runtime.createSpace(h.agent(), {profileId,requestId:rid('low')})).rejects.toMatchObject({code:'QUOTA_EXCEEDED'})
+        expect(h.store.listSpaces().filter(s => !s.closed)).toHaveLength(3)
+        limit = 5
+        await h.runtime.createSpace(h.agent(), {profileId,requestId:rid('recovered')})
+        await h.store.close()
+    })
+
     it('keeps the PoC quota without configuration and uses the configured one otherwise', async () => {
         const harness = await start(await tempDir())
         await harness.runtime.createSpace(harness.agent(), { profileId, requestId: rid('s') })

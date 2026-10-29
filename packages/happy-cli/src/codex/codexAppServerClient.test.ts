@@ -6045,3 +6045,14 @@ describe('explicit authentication recovery', () => {
     });
 
 });
+
+it('forwards raw browser MCP completion for immediate quota recovery', async () => {
+ const {CodexAppServerClient}=await import('./codexAppServerClient');
+ const client=new CodexAppServerClient(), events:Record<string,unknown>[]=[];
+ client.setEventHandler(event=>events.push(event));
+ const item={type:'mcpToolCall',id:'browser-space',server:'browser',tool:'browser_task_create_space',arguments:{},result:{isError:true,content:[{type:'text',text:'{"error":{"code":"QUOTA_EXCEEDED","quotaKind":"spaces"}}'}]}};
+ (client as any).handleRawNotification('item/started',{turnId:'t',item});
+ (client as any).handleRawNotification('item/completed',{turnId:'t',item});
+ expect(events.map(event=>event.type)).toEqual(['mcp_tool_call_begin','mcp_tool_call_end']);
+ expect(mapCodexMcpMessageToSessionEnvelopes(events[1],{currentTurnId:'t'}).envelopes[0]?.ev).toMatchObject({browserQuotaKind:'spaces'});
+});

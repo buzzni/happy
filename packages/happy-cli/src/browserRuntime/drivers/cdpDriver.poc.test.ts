@@ -270,6 +270,26 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
     })
 
     describe('agent window cap', () => {
+        it('applies resource capacity changes without evicting existing windows', async () => {
+            let limit = 2
+            const capped = new CdpDriver({ browserWsUrl: chrome.browserWsUrl, browserInstanceIdProvider: async () => instanceId, maxAgentWindows: 1, windowLimit: () => limit })
+            await capped.connect()
+            const tabs: TabId[] = []
+            try {
+                tabs.push((await capped.openTab(a.url('/plain'), [a.origin], OPTS)).tabId)
+                tabs.push((await capped.openTab(a.url('/plain'), [a.origin], OPTS)).tabId)
+                limit = 1
+                await expectCode(capped.openTab(a.url('/plain'), [a.origin], OPTS), 'QUOTA_EXCEEDED')
+                expect(capped.debugCounts().windows).toBe(2)
+                limit = 3
+                tabs.push((await capped.openTab(a.url('/plain'), [a.origin], OPTS)).tabId)
+                expect(capped.debugCounts().windows).toBe(3)
+            } finally {
+                for (const tab of tabs) await capped.closeTab(tab, OPTS)
+                await capped.close()
+            }
+        })
+
         it('gives each owned tab its own window and refuses a tab beyond maxAgentWindows before creating any target', async () => {
             const capped = new CdpDriver({ browserWsUrl: chrome.browserWsUrl, browserInstanceIdProvider: async () => instanceId, maxAgentWindows: 2 })
             await capped.connect()

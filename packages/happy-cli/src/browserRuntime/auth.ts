@@ -29,7 +29,7 @@ const interactiveCapabilityOperations = new Set<Operation>([
     'resume',
     'getTask',
     'subscribe',
-    'listTasks',
+    'listTasks', 'listSpaces', 'closeSpace',
 ])
 const issuedAtClockSkewMs = 30_000
 

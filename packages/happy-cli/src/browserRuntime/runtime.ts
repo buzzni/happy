@@ -7,6 +7,7 @@ import { BrowserRuntimeError, POC_LIMITS, SCHEMA_VERSION, TERMINAL_STATUSES, typ
                 type TabId, type ApprovalId,
                 type DispatchExpectation, type ElementDescription, type ElementRef, type Observation, type ScreenshotResult, type SubscribeResult } from './contracts'
 import { assertOperation } from './auth'
+import { quotaPreferenceKey, type QuotaReading } from './resourceQuota'
 import { approvalPayloadHash, createApproval } from './approvals'
 import { dispatchStep } from './batchWorker'
 import { systemClock, type RuntimeClock } from './clock'
@@ -25,6 +26,8 @@ export interface BrowserRuntimeOptions {
     sites: SitePolicy[]
     /** Open spaces per profile (runtime.json; the PoC limit without configuration). */
     maxSpacesPerProfile?: number
+    /** Current resource admission; never evicts existing work. */
+    resourceQuota?: (profileId: ProfileId) => QuotaReading
     /** Close spaces whose tasks are all finished after this long without activity; off when absent. */
     spaceIdleReclaimMs?: number
     /**
@@ -167,13 +170,45 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         if (space.closed || space.reclaimingSinceMs !== undefined || (space.localClientLeases?.[client.agentSessionId] ?? 0) <= this.clock.now())
             throw new BrowserRuntimeError('SCOPE_DENIED', 'Local client connection is closed or expired')
     }
+    private quotaPreference(profileId: ProfileId, principalId: string) {
+        return this.options.store.getSpaceQuota(quotaPreferenceKey(profileId, principalId, this.options.profileAssignments?.get(profileId)))
+    }
+    setSpaceQuota: BrowserRuntimeApi['setSpaceQuota'] = async (auth, req) => {
+        await this.recovery
+        const validate = () => {
+            this.checkCredential(auth, 'setSpaceQuota', req.profileId)
+            if (auth.credential.kind !== 'interactive') throw new BrowserRuntimeError('SCOPE_DENIED', 'Interactive capability required')
+            const owner = this.options.profilePrincipals?.get(req.profileId)
+            if (owner && owner !== auth.credential.principalId) throw new BrowserRuntimeError('SCOPE_DENIED', 'Profile owner changed')
+        }
+        validate()
+        if ((req.ceiling !== null && (!Number.isInteger(req.ceiling) || req.ceiling < 1 || req.ceiling > 16))
+            || !Number.isSafeInteger(req.expectedRevision) || req.expectedRevision < 0) throw new BrowserRuntimeError('INVALID_REQUEST', 'Invalid quota preference')
+        return this.options.store.setSpaceQuota(quotaPreferenceKey(req.profileId, auth.credential.principalId, this.options.profileAssignments?.get(req.profileId)),
+            req.ceiling, req.expectedRevision, validate)
+    }
     listSpaces: BrowserRuntimeApi['listSpaces'] = async (auth, req) => {
         await this.recovery
         this.checkCredential(auth, 'listSpaces', req.profileId)
-        const owner = identity(auth)
-        return { spaces: this.options.store.listSpaces(req.profileId).filter((space) => !space.owner || (space.owner.principalId === owner.principalId && space.owner.workspaceId === owner.workspaceId && space.owner.machineId === owner.machineId)).map((space) => ({
-            taskSpaceId: space.taskSpaceId, profileId: space.profileId, createdAtMs: space.createdAtMs, closed: Boolean(space.closed), tabs: [...space.tabs], memberSessionIds: [...(space.memberSessionIds ?? [])], membershipEvents: [...(space.membershipEvents ?? [])],
-        })) }
+        const owner = identity(auth), all = this.options.store.listSpaces(req.profileId)
+        const visible = all.filter(space => !space.owner || (space.owner.principalId === owner.principalId && space.owner.workspaceId === owner.workspaceId && space.owner.machineId === owner.machineId))
+        const tasks = this.options.store.listTasks()
+        const open = all.filter(s => !s.closed), reclaiming = open.filter(s => s.reclaimingSinceMs !== undefined).length
+        const used = open.length
+        const preference = this.quotaPreference(req.profileId, owner.principalId)
+        const resource = this.options.resourceQuota?.(req.profileId)
+        return { quota: { used, reclaimingReserve: Math.min(reclaiming, RECLAIMING_SPACE_RESERVE), hidden: open.filter(s => !visible.includes(s)).length,
+            limit: Math.min(preference.ceiling ?? 16, resource?.limit ?? this.options.maxSpacesPerProfile ?? POC_LIMITS.maxSpacesPerProfile),
+            mode: resource ? 'automatic' : 'fixed', reason: resource?.reason ?? 'fixed', preference },
+            spaces: visible.map(space => {
+                const members = tasks.filter(t => t.taskSpaceId === space.taskSpaceId)
+                return { taskSpaceId:space.taskSpaceId, profileId:space.profileId, createdAtMs:space.createdAtMs, closed:Boolean(space.closed),
+                    tabs:[...space.tabs], memberSessionIds:[...(space.memberSessionIds ?? [])], membershipEvents:[...(space.membershipEvents ?? [])],
+                    reclaiming:space.reclaimingSinceMs !== undefined,
+                    lastActivityAtMs:Math.max(space.createdAtMs, ...members.map(t => t.updatedAtMs)),
+                    tasks: members.map(t => ({taskId:t.taskId,status:t.status,pauseReason:t.pauseReason,pendingApproval:!!t.pendingApproval,
+                        uncertain:t.uncertainActions.length > 0,inFlight:this.workers.has(t.taskId)})) }
+            }) }
     }
     joinSpace: BrowserRuntimeApi['joinSpace'] = (auth, req) => this.withRequestFlight(auth, req.requestId, { operation: 'joinSpace', ...req }, async () => {
         await this.recovery
@@ -248,7 +283,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             ...(auth.credential.kind === 'agent-grant' ? { memberSessionIds: [auth.credential.agentSessionId] } : {}),
             ...(auth.credential.kind === 'agent-grant' ? { membershipEvents: [{ type: 'created' as const, agentSessionId: auth.credential.agentSessionId, atMs: this.clock.now() }] } : {}),
                 ...(this.options.profileAssignments?.has(req.profileId) ? { assignmentId: this.options.profileAssignments.get(req.profileId) } : {}) },
-            this.options.maxSpacesPerProfile)
+            () => Math.min(this.quotaPreference(req.profileId, auth.credential.principalId).ceiling ?? 16,
+                this.options.resourceQuota?.(req.profileId).limit ?? this.options.maxSpacesPerProfile ?? POC_LIMITS.maxSpacesPerProfile))
         return { taskSpaceId }
     }
     private async createTaskImpl(auth: AuthContext, req: {
@@ -307,7 +343,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         if (this.clock.now() - task.createdAtMs >= POC_LIMITS.taskTimeLimitMs) {
             await this.commit(task, { status: 'paused', pauseReason: 'task-time-limit' }, 'state-changed',
                 { pauseReason: 'task-time-limit' })
-            throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Task time limit reached')
+            throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Task time limit reached', false, false, 'time')
         }
         assertSiteAllowed(this.options.sites, req.url)
         // The same navigation policy as a navigate step; a held page is not opened (there is no tab to hand over yet).
@@ -320,8 +356,9 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const origin = assertAllowedOrigin(req.url, grant)
         const driver = this.driver(task.profileId)
         const totalTabs = this.options.store.listSpaces(task.profileId).reduce((sum, item) => sum + item.tabs.length, 0)
-        if (totalTabs >= POC_LIMITS.maxActiveTabs)
-            throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Profile has reached its active tab limit')
+        const admission = this.options.resourceQuota?.(task.profileId)
+        if (totalTabs >= (admission && admission.reason !== 'measurement-unavailable' ? admission.limit : POC_LIMITS.maxActiveTabs))
+            throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Profile has reached its active tab limit', true, false, 'tabs')
         const actionId = `action-${randomUUID()}` as ActionId
         const reservation = this.allocateTabId()
         const epoch = this.leases.acquire(reservation, task.profileId, { kind: 'agent', agentSessionId: task.agentSessionId,
@@ -604,7 +641,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         if (this.clock.now() - task.createdAtMs >= POC_LIMITS.taskTimeLimitMs) {
             await this.commit(task, { status: 'paused', pauseReason: 'task-time-limit' }, 'state-changed',
                 { pauseReason: 'task-time-limit' })
-            throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Task time limit reached')
+            throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Task time limit reached', false, false, 'time')
         }
         if (!req.steps.length || req.steps.length > POC_LIMITS.maxBatchSteps)
             throw new BrowserRuntimeError('INVALID_REQUEST', 'Batch size is invalid')

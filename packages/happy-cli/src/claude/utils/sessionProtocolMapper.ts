@@ -1,3 +1,4 @@
+import { browserQuotaFailure } from '../../utils/browserQuotaFailure';
 import { logger } from '@/ui/logger';
 import { BACKGROUND_HISTORY_LIMIT, BackgroundCompletionTracker } from './backgroundCompletionTracker';
 import { createId } from '@paralleldrive/cuid2';
@@ -1109,6 +1110,7 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
                     t: 'tool-call-end',
                     call: block.tool_use_id,
                     ...(images ? { images } : {}),
+                    ...(!redacted ? { browserQuotaKind: browserQuotaFailure(block.content) } : {}),
                     ...(backgroundTaskId ? { backgroundTaskId } : {}),
                 }, { turn: turnId, subagent }));
                 const completion = redacted || message.isSidechain || subagent ? null

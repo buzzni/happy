@@ -30,6 +30,7 @@ const version = z.number().int().nonnegative()
 
 export const REQUEST_SCHEMAS: Record<Operation, z.ZodType> = {
     createSpace: z.object({ profileId: id, requestId: id }).strict(),
+    setSpaceQuota: z.object({ profileId: id, ceiling: z.number().int().min(1).max(16).nullable(), expectedRevision: z.number().int().nonnegative() }).strict(),
     listSpaces: z.object({ profileId: id }).strict(),
     joinSpace: z.object({ taskSpaceId: id, requestId: id }).strict(),
     createTask: z.object({ taskSpaceId: id, requestId: id }).strict(),
