@@ -4,7 +4,7 @@ import { BrowserRuntimeError, POC_LIMITS, SCHEMA_VERSION, TERMINAL_STATUSES, typ
     type BatchResult, type BatchStep, type BrowserDriver, type BrowserInstanceId, type BrowserRuntimeApi, type GrantId,
         type ApproveResult, type ControlResult, type RuntimeErrorBody, type SnapshotId, type InputOwner, type Operation,
             type PrincipalId, type ProfileId, type RequestId, type TaskEvent, type TaskId, type TaskSpaceId, type TaskView, type TaskStatus,
-                type TabId, type ApprovalId,
+                type TabId, type ApprovalId, type ActionObservations, type ActionReceipt,
                 type DispatchExpectation, type ElementDescription, type ElementRef, type Observation, type ScreenshotResult, type SubscribeResult } from './contracts'
 import { assertOperation } from './auth'
 import { approvalPayloadHash, createApproval } from './approvals'
@@ -75,6 +75,15 @@ export interface SpaceSummary {
 type DriverWithAction = BrowserDriver & {
     armAction?: (actionId: string) => void
 }
+/**
+ * The write step a task's worker is running (one at a time per task). `started` once the driver
+ * called validateDispatch, i.e. began the input; `trusted` when the driver declares that nothing of
+ * the write is sent before that (BrowserDriver.gatesInputOnValidateDispatch). `refused` once
+ * validateDispatch refused: proof of nothing for a driver that is not trusted. `connection`: the
+ * profile's connection epoch when the intent was committed.
+ */
+type InputGate = { actionId: ActionId; started: boolean; trusted: boolean; refused: boolean; connection: number }
+const WRITE_KINDS: readonly string[] = ['navigate', 'click', 'fill']
 /** How a user wait is recognised as done (`task.waitCompletion`). */
 type UserWaitCompletion = {
     batchId?: string
@@ -106,6 +115,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     private readonly controllers = new Map<TaskId, AbortController>()
     private readonly workers = new Map<TaskId, Promise<BatchResult>>()
     private readonly inFlightDriverCalls = new Set<TaskId>()
+    /** Kept after the step: an intent whose gate never opened cannot run again (its actionId is spent). */
+    private readonly inputGates = new Map<TaskId, InputGate>()
+    /** Bumped on every driver disconnect: an input prepared on a lost connection is never sent on the next one. */
+    private readonly connectionEpochs = new Map<ProfileId, number>()
     private readonly latestAgentSnapshots = new Map<TabId, SnapshotId>()
     private readonly liveBatchSteps = new Map<BatchId, BatchStep[]>()
     /** Profiles between a driver disconnect and the end of its reconnect handling (which alone judges browser identity) */
@@ -687,10 +700,12 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             if (current.status === 'running') {
                 const unresolved = Object.entries(current.actions).filter(([, action]) => action.batchId === batchId && ['navigate',
                     'click', 'fill'].includes(String(action.kind)) && ['intent-committed', 'dispatched'].includes(String(action.state)))
-                const uncertainActions = unresolved.map(([id]) => id as ActionId)
+                // The worker is gone: an intent whose input gate never opened failed before its input.
+                const unsent = unresolved.map(([id]) => id as ActionId).filter((id) => this.inputNeverSent(current, id))
+                const uncertainActions = unresolved.map(([id]) => id as ActionId).filter((id) => !unsent.includes(id))
                 const actions = { ...current.actions }
                 for (const [id, action] of unresolved)
-                    actions[id] = { ...action, state: 'uncertain' }
+                    actions[id] = { ...action, state: unsent.includes(id as ActionId) ? 'failed' : 'uncertain' }
                 current = await this.commit(current, {
                     status: 'paused',
                     pauseReason: uncertainActions.length ? 'outcome-unknown' : 'awaiting-agent',
@@ -792,22 +807,34 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         })
         return read()
     }
+    /**
+     * A write intent of this process whose driver call never began the input and no longer can:
+     * the caller's fence is already in force, so validateDispatch refuses from now on. Only for a
+     * driver that gates its input on validateDispatch; anything else may have been sent.
+     */
+    private inputNeverSent(task: StoredTask, actionId: ActionId): boolean {
+        const gate = this.inputGates.get(task.taskId)
+        return Boolean(gate?.trusted && !gate.started && gate.actionId === actionId
+            && task.actions[actionId]?.state === 'intent-committed')
+    }
+    /** In-flight writes split by the fence that asks: unknown outcomes, and intents that never left (now skipped). */
+    private fencedWrites(task: StoredTask, candidates: ActionId[]): { uncertain: ActionId[]; unsent: ActionId[]; actions: StoredTask['actions'] } {
+        const unsent = candidates.filter((id) => this.inputNeverSent(task, id))
+        const actions = { ...task.actions }
+        for (const id of candidates)
+            actions[id] = { ...actions[id], state: unsent.includes(id) ? 'skipped' : 'uncertain' }
+        return { uncertain: candidates.filter((id) => !unsent.includes(id)), unsent, actions }
+    }
     async onDriverDisconnected(profileId: ProfileId): Promise<void> {
         this.reconnecting.add(profileId)
+        this.connectionEpochs.set(profileId, (this.connectionEpochs.get(profileId) ?? 0) + 1)
         await this.recovery
         for (const task of this.options.store.listTasks()) {
             if (task.profileId !== profileId || ['succeeded', 'failed', 'cancelled'].includes(task.status))
                 continue
             if (task.status === 'recovering')
                 continue
-            const writeIds = inFlightWriteActions(task)
-            const inflight = Object.entries(task.actions).filter(([, action]) => ['intent-committed', 'dispatched'].includes(action.state))
-            const actions = { ...task.actions }
-            for (const [id, action] of inflight) {
-                if (['navigate', 'click', 'fill'].includes(String(action.kind)))
-                    actions[id] = { ...action, state: 'uncertain' }
-            }
-            const writes = writeIds
+            const { uncertain: writes, actions } = this.fencedWrites(task, inFlightWriteActions(task))
             const pauseReason = writes.length ? 'outcome-unknown' : undefined
             await this.commit(task, { status: 'recovering', previousDriverStatus: task.status, ...(pauseReason ? { pauseReason,
                 uncertainActions: [...new Set([...task.uncertainActions, ...writes])] } : {}), actions }, 'recovered',
@@ -880,6 +907,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             this.controllers.delete(task.taskId)
             this.workers.delete(task.taskId)
             this.inFlightDriverCalls.delete(task.taskId)
+            this.inputGates.delete(task.taskId)
             this.commitTails.delete(task.taskId)
             for (const wake of this.eventWaiters.get(task.taskId) ?? [])
                 wake()
@@ -1277,17 +1305,15 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         && !revokedActionIds.length)
                         return null
                     fenceReason = reason
-                    const actions = { ...current.actions }
-                    const uncertainWrites = revokedActionIds.filter((id) => ['intent-committed', 'dispatched']
-                        .includes(actions[id]?.state ?? '') && ['navigate', 'click', 'fill'].includes(String(actions[id]?.kind)))
-                    for (const id of uncertainWrites)
-                        actions[id] = { ...actions[id], state: 'uncertain' }
+                    // The grant is no longer live: a write whose input gate is still closed is refused at it.
+                    const { uncertain: uncertainWrites, actions } = this.fencedWrites(current, revokedActionIds.filter((id) =>
+                        ['intent-committed', 'dispatched'].includes(current.actions[id]?.state ?? '') && WRITE_KINDS.includes(String(current.actions[id]?.kind))))
                     // Revocation fences execution, not user consent. Keep the approval's
                     // digest and expiry; any later dispatch revalidates both under a live grant.
                     const approvals = current.approvals
                     return {
-                        patch: { status: 'paused', pauseReason: uncertainWrites.length ? 'outcome-unknown' : reason,
-                            ...(uncertainWrites.length ? { actions, uncertainActions: [...new Set([...current.uncertainActions,
+                        patch: { status: 'paused', pauseReason: uncertainWrites.length ? 'outcome-unknown' : reason, actions,
+                            ...(uncertainWrites.length ? { uncertainActions: [...new Set([...current.uncertainActions,
                                 ...uncertainWrites])] } : {}),
                             approvals,
                             ...(reason === 'approval-expired' ? { pendingApproval: undefined } : {}) },
@@ -1570,15 +1596,12 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         await this.persistProfileUserOwner(task.profileId, { tabId: req.tabId, owner })
         if (!settling)
             this.leases.completePendingTakeovers(task.taskId)
-        const pending = Object.entries(task.actions).filter(([, action]) => ['click', 'fill',
-            'navigate'].includes(String(action.kind)) && ['intent-committed', 'dispatched'].includes(String(action.state)))
-        const actions = { ...task.actions }
-        for (const [id, action] of pending)
-            actions[id] = { ...action, state: 'uncertain' }
+        // The lease epoch moved: a write whose input gate is still closed is refused at it.
+        const { uncertain: pending, actions } = this.fencedWrites(task, inFlightWriteActions(task))
         const paused = await this.commit(task, { status: 'paused', pauseReason: 'user-control', actions,
             ...(pending.length ? { uncertainActions: [...new Set([...task.uncertainActions,
-                ...pending.map(([id]) => id as ActionId)])] } : {}) }, 'input-owner-changed', { tabId: req.tabId, owner: 'user',
-                    unsettledActions: pending.map(([id]) => id), settling }, epoch)
+                ...pending])] } : {}) }, 'input-owner-changed', { tabId: req.tabId, owner: 'user',
+                    unsettledActions: pending, settling }, epoch)
         this.controllers.get(task.taskId)?.abort(new Error('user takeover'))
         const currentOwner = this.leases.owner(req.tabId, task.profileId).owner
         return { leaseEpoch: epoch, owner: currentOwner, task: this.view(paused), settling }
@@ -1870,11 +1893,12 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const next = await this.options.store.mutate(task.taskId, (current) => {
             if (['succeeded', 'failed', 'cancelled'].includes(current.status))
                 return null
-            uncertain = [...new Set([...current.uncertainActions, ...Object.entries(current.actions).filter(([, action]) =>
-                ['navigate', 'click', 'fill'].includes(String(action.kind))
-                    && ['intent-committed', 'dispatched'].includes(action.state)).map(([id]) => id as ActionId)])]
+            // The leases are revoked and the worker aborted: an intent whose input gate is still closed never runs.
+            const fenced = this.fencedWrites(current, inFlightWriteActions(current))
+            uncertain = [...new Set([...current.uncertainActions, ...fenced.uncertain])]
             return {
                 patch: { cancelRequested: true, status: uncertain.length ? 'paused' : 'cancelled',
+                    ...(fenced.unsent.length || fenced.uncertain.length ? { actions: fenced.actions } : {}),
                     ...(uncertain.length ? { pauseReason: 'cancelled-with-unknown-effect', uncertainActions: uncertain } : {}) },
                 event: this.event('cancel-accepted', { cancelRequested: true, uncertainActions: uncertain },
                     current.stateVersion + 1),
@@ -2445,6 +2469,9 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const batchLeases = new Map<TabId, number>()
         const pendingPostconditions: Array<{ actionId: ActionId; stepId: BatchStep['stepId']; tabId: TabId }> = []
         const namedObservations = new Map<string, Observation>()
+        /** Receipts of this batch's write steps (gated drivers only), by action */
+        const receipts = new Map<ActionId, ActionReceipt>()
+        const receiptOf = (actionId: ActionId) => receipts.has(actionId) ? { receipt: receipts.get(actionId)! } : {}
         let preserveLeases = false
         /** The step is not executed; the task waits for the user (takeover), then the agent re-observes. */
         const handOff = async (current: StoredTask, step: BatchStep, index: number, leaseEpoch: number, reason: BrowserRuntimeError) => {
@@ -2553,6 +2580,11 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 if (!intent)
                     throw new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'Action intent was not committed')
                 task = intent
+                const write = WRITE_KINDS.includes(step.kind)
+                const gate: InputGate | undefined = write ? { actionId: step.actionId, started: false, refused: false,
+                    trusted: driver.gatesInputOnValidateDispatch === true, connection: this.connectionEpochs.get(task.profileId) ?? 0 } : undefined
+                if (gate)
+                    this.inputGates.set(task.taskId, gate)
                 let description: ElementDescription | undefined
                 const autoConsent = this.autoApprovalFor(task)
                 let usedAutoConsent = false
@@ -2715,13 +2747,41 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 const armed = driver as DriverWithAction
                 armed.armAction?.(step.actionId)
                 this.inFlightDriverCalls.add(task.taskId)
+                const observed: ActionObservations | undefined = gate?.trusted ? {} : undefined
+                const inputEpoch = leaseEpoch
+                // The last check before the write's input, run by the driver with nothing awaited before the input;
+                // 'prepare': the same check before a preparation step that changes page state, without opening the gate.
+                const validateDispatch = gate ? (phase?: 'prepare') => {
+                    try {
+                        const current = this.requireTask(task.taskId)
+                        if (this.inputGates.get(current.taskId) !== gate || controller.signal.aborted || current.cancelRequested
+                            || current.status !== 'running' || current.actions[step.actionId]?.state !== 'intent-committed'
+                            || !this.isCredentialLive(auth) || this.reconnecting.has(current.profileId)
+                            || (this.connectionEpochs.get(current.profileId) ?? 0) !== gate.connection
+                            || current.browserInstanceId !== driver.browserInstanceId())
+                            throw new BrowserRuntimeError('STALE_LEASE', 'Task execution fence changed before input', false, false)
+                        this.leases.assert(step.tabId, current.profileId, current.taskId, batchId, inputEpoch)
+                        if (usedAutoConsent && this.autoApprovalFor(current) !== autoConsent)
+                            throw new BrowserRuntimeError('APPROVAL_REQUIRED', 'Auto was disabled or expired before input', false, false)
+                    }
+                    catch (error) {
+                        gate.refused = true
+                        throw error
+                    }
+                    if (phase !== 'prepare')
+                        gate.started = true
+                } : undefined
+                let driverReturned = false
                 try {
-                    const dispatchResult = await this.dispatch(driver, effectiveStep, grant, controller.signal,
-                        step.kind === 'click' && description ? dispatchExpectation(description, usedAutoConsent) : undefined,
-                        usedAutoConsent ? () => {
-                            if (this.autoApprovalFor(this.requireTask(task.taskId)) !== autoConsent)
-                                throw new BrowserRuntimeError('APPROVAL_REQUIRED', 'Auto was disabled or expired before input', false, false)
-                        } : undefined)
+                    const dispatchResult = await this.dispatch(driver, effectiveStep, grant, controller.signal, {
+                        ...(step.kind === 'click' && description ? { expect: dispatchExpectation(description, usedAutoConsent) } : {}),
+                        ...(validateDispatch ? { validateDispatch } : {}),
+                        ...(observed ? { observed } : {}),
+                    }).finally(() => {
+                        if (gate?.trusted)
+                            receipts.set(step.actionId, { input: gate.started ? 'sent' : 'not-sent', ...observed })
+                    })
+                    driverReturned = true
                     const finalOrigin = await driver.currentOrigin(step.tabId)
                     if (!originAllowed(grant.allowedOrigins, finalOrigin))
                         throw new BrowserRuntimeError('ORIGIN_DENIED', 'Action navigated to a disallowed origin', false, false)
@@ -2741,17 +2801,21 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     task = this.requireTask(task.taskId)
                     if (task.cancelRequested || this.leases.owner(step.tabId,
                         task.profileId).leaseEpoch !== leaseEpoch || task.status !== 'running') {
-                        const uncertain = ['click', 'fill', 'navigate'].includes(step.kind)
+                        const uncertain = write
                         const state = uncertain ? 'uncertain' as const : 'skipped' as const
+                        // Still running: the lease moved without a fence that paused the task (a reconnect restored it).
+                        const stillRunning = task.status === 'running' && !task.cancelRequested
                         await this.commit(task, { actions: { ...task.actions, [step.actionId]: { ...task.actions[step.actionId],
                             state } }, ...(uncertain ? { uncertainActions: [...new Set([...task.uncertainActions,
-                                step.actionId])] } : {}) }, 'late-result', { actionId: step.actionId, ignored: true }, leaseEpoch)
+                                step.actionId])] } : {}),
+                            ...(stillRunning ? { status: 'paused', pauseReason: uncertain ? 'outcome-unknown' : 'awaiting-agent' } : {}) },
+                            'late-result', { actionId: step.actionId, ignored: true, ...receiptOf(step.actionId) }, leaseEpoch)
                         outcome = uncertain ? 'uncertain' : 'cancelled'
                         mayHaveSideEffects = uncertain
                         break
                     }
                     task = await this.commit(task, { actions: { ...task.actions, [step.actionId]: { ...task.actions[step.actionId],
-                        state: 'dispatched' } } }, 'action-dispatched', { actionId: step.actionId }, leaseEpoch)
+                        state: 'dispatched' } } }, 'action-dispatched', { actionId: step.actionId, ...receiptOf(step.actionId) }, leaseEpoch)
                     if (step.kind === 'waitFor') {
                         const observedPostconditions = pendingPostconditions.filter((pending) => pending.tabId === step.tabId)
                         if (observedPostconditions.length) {
@@ -2765,7 +2829,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                             }, leaseEpoch)
                             for (const pending of observedPostconditions) {
                                 completedSteps.push(pending.stepId)
-                                results.push({ stepId: pending.stepId, actionId: pending.actionId, outcome: 'succeeded' })
+                                results.push({ stepId: pending.stepId, actionId: pending.actionId, outcome: 'succeeded', ...receiptOf(pending.actionId) })
                                 pendingPostconditions.splice(pendingPostconditions.indexOf(pending), 1)
                             }
                         }
@@ -2783,7 +2847,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                             pauseReason: 'outcome-unknown',
                             uncertainActions: [...new Set([...task.uncertainActions, step.actionId])],
                         }, 'action-uncertain', { actionId: step.actionId, reason: 'postcondition-required' }, leaseEpoch)
-                        results.push({ stepId: step.stepId, actionId: step.actionId, outcome: 'uncertain' })
+                        results.push({ stepId: step.stepId, actionId: step.actionId, outcome: 'uncertain', ...receiptOf(step.actionId) })
                         failedStep = step.stepId
                         outcome = 'uncertain'
                         mayHaveSideEffects = true
@@ -2797,7 +2861,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     task = await this.commit(task, { actions, batches: { ...task.batches, [batchId]: {
                         ...task.batches[batchId], steps: persistedBatchSteps(steps),
                         nextStep: index + 1 } } }, 'action-confirmed', { actionId: step.actionId }, leaseEpoch)
-                    results.push({ stepId: step.stepId, actionId: step.actionId, outcome: 'succeeded',
+                    results.push({ stepId: step.stepId, actionId: step.actionId, outcome: 'succeeded', ...receiptOf(step.actionId),
                         ...(step.kind === 'observe' && dispatchResult && 'snapshotId' in dispatchResult
                             ? { observation: sanitizeObservation(dispatchResult, grant.allowedOrigins) } : {}) })
                     completedSteps.push(step.stepId)
@@ -2828,60 +2892,77 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     }
                 }
                 catch (error) {
+                    // A fence that queued its write before this result (cancel records after aborting the call) decides
+                    // first: an empty mutation waits for it without writing, so the action is judged on that record.
+                    await this.options.store.mutate(task.taskId, () => null).catch(() => undefined)
                     task = this.requireTask(task.taskId)
+                    const runtimeError = error instanceof BrowserRuntimeError ? error : undefined
+                    // Affirmative evidence wins: the driver call returned, its gate opened, or a fence already kept the
+                    // action unknown. Otherwise a gated driver sent nothing before its gate opened (what the fences use).
+                    // Any other driver's write is unknown unless its own error says it had no side effects: the Runtime's
+                    // refusal at the gate proves nothing about what such a driver sent before asking.
+                    const sent = write && (driverReturned || gate?.started === true || task.uncertainActions.includes(step.actionId)
+                        || (!gate?.trusted && (gate?.refused === true || runtimeError?.mayHaveSideEffects !== false)))
                     const pending = pendingPostconditions.filter((candidate) => candidate.tabId === step.tabId)
                     if (pending.length && task.status === 'running' && !task.cancelRequested) {
                         const actions = { ...task.actions }
                         for (const candidate of pending)
                             actions[candidate.actionId] = { ...actions[candidate.actionId], state: 'uncertain' }
-                        actions[step.actionId] = { ...actions[step.actionId], state: 'failed' }
+                        actions[step.actionId] = { ...actions[step.actionId], state: sent ? 'uncertain' : 'failed' }
                         const uncertainIds = [...new Set([...task.uncertainActions,
-                            ...pending.map((candidate) => candidate.actionId)])]
+                            ...pending.map((candidate) => candidate.actionId), ...(sent ? [step.actionId] : [])])]
                         task = await this.commit(task, { actions, status: 'paused', pauseReason: 'outcome-unknown',
                             uncertainActions: uncertainIds }, 'action-uncertain', {
                             actionIds: pending.map((candidate) => candidate.actionId),
                             postconditionActionId: step.actionId,
                             error: safeError(error),
+                            ...receiptOf(step.actionId),
                         }, leaseEpoch)
                         for (const candidate of pending) {
-                            results.push({ stepId: candidate.stepId, actionId: candidate.actionId, outcome: 'uncertain' })
+                            results.push({ stepId: candidate.stepId, actionId: candidate.actionId, outcome: 'uncertain', ...receiptOf(candidate.actionId) })
                             pendingPostconditions.splice(pendingPostconditions.indexOf(candidate), 1)
                         }
-                        results.push({ stepId: step.stepId, actionId: step.actionId, outcome: 'failed',
-                            error: safeError(error) })
+                        results.push({ stepId: step.stepId, actionId: step.actionId, outcome: sent ? 'uncertain' : 'failed',
+                            error: safeError(error), ...receiptOf(step.actionId) })
                         failedStep = pending[0].stepId
                         outcome = 'uncertain'
                         mayHaveSideEffects = true
                         break
                     }
                     if (task.pauseReason === 'user-control' || this.leases.owner(step.tabId, task.profileId).leaseEpoch !== leaseEpoch) {
-                        const uncertain = ['click', 'fill', 'navigate'].includes(step.kind)
+                        const uncertain = sent
                         const state = uncertain ? 'uncertain' as const : 'skipped' as const
+                        // Still running: the lease moved without a fence that paused the task (a reconnect restored it).
+                        const stillRunning = task.status === 'running' && !task.cancelRequested
                         await this.commit(task, { actions: { ...task.actions, [step.actionId]: { ...task.actions[step.actionId],
                             state } }, ...(uncertain ? { uncertainActions: [...new Set([...task.uncertainActions,
-                                step.actionId])] } : {}) }, 'late-result', { actionId: step.actionId, ignored: true }, leaseEpoch)
-                        outcome = uncertain ? 'uncertain' : 'cancelled'
+                                step.actionId])] } : {}),
+                            ...(stillRunning ? { status: 'paused', pauseReason: uncertain ? 'outcome-unknown' : 'awaiting-agent' } : {}) },
+                            'late-result', { actionId: step.actionId, ignored: true, ...receiptOf(step.actionId) }, leaseEpoch)
+                        results.push({ stepId: step.stepId, actionId: step.actionId, outcome: state, error: safeError(error), ...receiptOf(step.actionId) })
+                        failedStep = step.stepId
+                        outcome = uncertain ? 'uncertain' : stillRunning ? 'failed' : 'cancelled'
                         mayHaveSideEffects = uncertain
                         break
                     }
                     if (task.cancelRequested) {
-                        const uncertain = ['click', 'fill', 'navigate'].includes(step.kind)
+                        const uncertain = sent
                         const state = uncertain ? 'uncertain' as const : 'skipped' as const
                         const actions = { ...task.actions, [step.actionId]: { ...task.actions[step.actionId], state } }
                         await this.commit(task, { actions, ...(uncertain ? { status: 'paused',
                             pauseReason: 'cancelled-with-unknown-effect', uncertainActions: [...new Set([...task.uncertainActions,
                                 step.actionId])] } : { status: 'cancelled' }) }, 'late-result', { actionId: step.actionId,
-                                    cancelled: true }, leaseEpoch)
+                                    cancelled: true, ...receiptOf(step.actionId) }, leaseEpoch)
                         outcome = 'cancelled'
                         break
                     }
                     // The driver could not verify the action (e.g. a transformed frame) and sent nothing: the user does it.
-                    if (error instanceof BrowserRuntimeError && error.code === 'APPROVAL_REQUIRED' && !error.mayHaveSideEffects)
+                    // Only without evidence that the input left; otherwise it is an unknown outcome like any other.
+                    if (!sent && error instanceof BrowserRuntimeError && error.code === 'APPROVAL_REQUIRED' && !error.mayHaveSideEffects)
                         return handOff(task, step, index, leaseEpoch, error)
-                    const write = ['click', 'fill', 'navigate'].includes(step.kind)
-                    const runtimeError = error instanceof BrowserRuntimeError ? error : undefined
+                    // A destination refused after the input began does not undo what was sent: unknown, not a safe failure.
                     const deniedOrigin = runtimeError?.code === 'ORIGIN_DENIED'
-                    const uncertain = write && runtimeError?.mayHaveSideEffects !== false && !deniedOrigin
+                    const uncertain = sent
                     const actionState = uncertain ? 'uncertain' as const : 'failed' as const
                     const actions = { ...task.actions, [step.actionId]: { ...task.actions[step.actionId], state: actionState } }
                     const safeFailure = !uncertain && !deniedOrigin
@@ -2889,13 +2970,13 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         actions,
                         status: uncertain || safeFailure ? 'paused' : 'failed',
                         ...(uncertain
-                            ? { pauseReason: 'outcome-unknown', uncertainActions: [...task.uncertainActions, step.actionId] }
+                            ? { pauseReason: 'outcome-unknown', uncertainActions: [...new Set([...task.uncertainActions, step.actionId])] }
                             : safeFailure ? { pauseReason: 'awaiting-agent' } : {}),
                         ...(safeFailure ? { currentBatchId: undefined } : {}),
                     }, uncertain ? 'action-uncertain' : 'action-failed', { actionId: step.actionId,
-                                error: safeError(error) }, leaseEpoch)
+                                error: safeError(error), ...receiptOf(step.actionId) }, leaseEpoch)
                     results.push({ stepId: step.stepId, actionId: step.actionId, outcome: uncertain ? 'uncertain' : 'failed',
-                        error: safeError(error) })
+                        error: safeError(error), ...receiptOf(step.actionId) })
                     failedStep = step.stepId
                     outcome = uncertain ? 'uncertain' : 'failed'
                     mayHaveSideEffects = uncertain
@@ -2941,8 +3022,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         }
     }
     private async dispatch(driver: BrowserDriver, step: BatchStep, grant: AgentGrant,
-        signal: AbortSignal, expect?: DispatchExpectation, validateDispatch?: () => void): ReturnType<typeof dispatchStep> {
-        return dispatchStep(driver, step, grant, signal, expect, validateDispatch)
+        signal: AbortSignal, options: Parameters<typeof dispatchStep>[4] = {}): ReturnType<typeof dispatchStep> {
+        return dispatchStep(driver, step, grant, signal, options)
     }
     /**
      * `guard` runs against the current task inside the serialized write; if it throws,

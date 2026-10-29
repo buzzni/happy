@@ -13,6 +13,7 @@ import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { inflateSync } from 'node:zlib'
+import WebSocket, { WebSocketServer } from 'ws'
 import { CdpConnection } from './cdpConnection'
 
 /** Where a desktop Chrome usually is; CHROME_PATH overrides. A suite that finds none skips and says so. */
@@ -211,6 +212,92 @@ export class HarnessCdp {
 
     close(): void {
         this.conn.close()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CDP fault proxy: a WebSocket hop between a driver and Chrome for fault injection.
+// ---------------------------------------------------------------------------
+
+export interface CdpCommand { method: string; params: any; sessionId?: string }
+
+/**
+ * What happens to one matching driver → browser command: `drop-before` closes the driver's
+ * connection instead of sending it; `drop-after` sends it to Chrome and closes the driver's
+ * connection before the answer (Chrome still runs it); `{ failWith }` lets Chrome run it and
+ * answers the driver with that protocol error instead.
+ */
+export type CdpFault = 'drop-before' | 'drop-after' | { failWith: string }
+
+export interface CdpFaultProxy {
+    /** Browser-level WebSocket URL to connect a driver to */
+    url: string
+    /** Commands forwarded to Chrome, in order */
+    sent: CdpCommand[]
+    /** Applies `fault` to the next command `match` accepts (once). */
+    failNext(match: (command: CdpCommand) => boolean, fault: CdpFault): void
+    close(): Promise<void>
+}
+
+export async function startCdpFaultProxy(browserWsUrl: string): Promise<CdpFaultProxy> {
+    const rules: Array<{ match: (command: CdpCommand) => boolean; fault: CdpFault }> = []
+    const sent: CdpCommand[] = []
+    const server = new WebSocketServer({ host: '127.0.0.1', port: 0 })
+    await new Promise<void>((resolve) => server.once('listening', () => resolve()))
+    server.on('connection', (client) => {
+        const upstream = new WebSocket(browserWsUrl, { perMessageDeflate: false, maxPayload: 256 * 1024 * 1024 })
+        const replaced = new Map<number, string>()
+        const queued: string[] = []
+        let open = false
+        // Chrome keeps running what it already received; let it finish before this hop goes away.
+        const closeBoth = () => {
+            client.terminate()
+            setTimeout(() => upstream.close(), 500)
+        }
+        upstream.on('open', () => {
+            open = true
+            for (const raw of queued.splice(0)) upstream.send(raw)
+        })
+        upstream.on('message', (data) => {
+            const raw = data.toString()
+            const message = JSON.parse(raw)
+            const error = typeof message.id === 'number' ? replaced.get(message.id) : undefined
+            if (error !== undefined) {
+                replaced.delete(message.id)
+                client.send(JSON.stringify({ id: message.id, ...(message.sessionId ? { sessionId: message.sessionId } : {}), error: { code: -32000, message: error } }))
+                return
+            }
+            if (client.readyState === WebSocket.OPEN) client.send(raw)
+        })
+        upstream.on('close', () => client.terminate())
+        upstream.on('error', () => client.terminate())
+        client.on('close', () => setTimeout(() => upstream.close(), 500))
+        client.on('message', (data) => {
+            const raw = data.toString()
+            const message = JSON.parse(raw)
+            const command: CdpCommand = { method: message.method, params: message.params ?? {}, ...(message.sessionId ? { sessionId: message.sessionId } : {}) }
+            const index = rules.findIndex((rule) => rule.match(command))
+            const fault = index >= 0 ? rules.splice(index, 1)[0].fault : undefined
+            if (fault === 'drop-before') {
+                closeBoth()
+                return
+            }
+            sent.push(command)
+            if (typeof fault === 'object') replaced.set(message.id, fault.failWith)
+            const forward = () => upstream.send(raw, () => { if (fault === 'drop-after') closeBoth() })
+            if (open) forward()
+            else queued.push(raw)
+        })
+    })
+    const port = (server.address() as AddressInfo).port
+    return {
+        url: browserWsUrl.replace(/^ws:\/\/[^/]+/, `ws://127.0.0.1:${port}`),
+        sent,
+        failNext: (match, fault) => { rules.push({ match, fault }) },
+        close: () => new Promise((resolve) => {
+            for (const socket of server.clients) socket.terminate()
+            server.close(() => resolve())
+        }),
     }
 }
 
