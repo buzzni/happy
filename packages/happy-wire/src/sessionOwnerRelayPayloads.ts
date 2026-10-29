@@ -4,6 +4,9 @@ import { MessageMetaSchema, MessageContentSchema, SessionMessageSchema, type Mes
 import { hubPromptGuardSchema } from './sessionProtocol';
 
 export const relayCount = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+// IDs a relay carries from existing records (messages, permissions, activity, runtime) keep their producers'
+// unrestricted string contract; ownershipId is only for IDs this protocol mints (H1-R-02).
+export const persistedId = z.string().min(1);
 export const relayLocalId = z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/);
 const text = z.string();
 // Existing sessionConnection permission input and PendingPermissionRequest.arguments are dynamic
@@ -27,7 +30,7 @@ export const OwnerRelayPromptPayloadSchema = z.object({ text,
     delegatedAttendance: z.enum(['attended', 'unattended']).optional(), hubPrompt: hubPromptGuardSchema,
 }).strict();
 export const OwnerRelayPermissionPayloadSchema = z.object({ sessionId: id, runtimeId: id,
-    permissionId: id, approved: z.boolean(), updatedInput: toolData.optional(),
+    permissionId: persistedId, approved: z.boolean(), updatedInput: toolData.optional(),
     mode: z.enum(['default', 'acceptEdits', 'bypassPermissions']).optional(),
 }).strict();
 // A wire projection of Desktop PendingPermissionRequest, including its existing policy metadata.
@@ -35,25 +38,25 @@ const policy = z.object({ reasonCode: text, ruleId: text, humanOnly: z.boolean()
     target: z.object({ category: text, appName: text, bundleIdOrExe: text }).strict().optional(),
     action: text.optional(), grantOffer: z.enum(['once', 'session']),
 }).strict();
-export const OwnerRelayPendingPermissionSchema = z.object({ requestId: id, toolName: text, title: text,
+export const OwnerRelayPendingPermissionSchema = z.object({ requestId: persistedId, toolName: text, title: text,
     arguments: toolData, createdAt: relayCount.optional(), expiresAt: relayCount.optional(),
     kind: z.enum(['ask-user-question', 'exit-plan-mode', 'project-scope', 'generic']), policy: policy.optional(),
 }).strict();
 // Existing Desktop AgentActivity, with no invented idle/completion meaning for observation gaps.
 const activity = z.object({ state: z.enum(['known', 'none', 'unknown']), title: text.nullable(),
     inProgress: z.array(text), text: text.nullable(), source: z.enum(['TodoWrite', 'plan']).nullable(),
-    sourceMessageId: id.nullable(), sourceSeq: relayCount.nullable(), reason: text.nullable(),
+    sourceMessageId: persistedId.nullable(), sourceSeq: relayCount.nullable(), reason: text.nullable(),
     observedAt: relayCount.nullable(),
 }).strict();
 export const OwnerRelaySnapshotSchema = z.object({ active: z.boolean().nullable(), thinking: z.boolean().nullable(),
-    runtimeId: id.nullable().optional(), machineId: id.nullable().optional(),
+    runtimeId: persistedId.nullable().optional(), machineId: persistedId.nullable().optional(),
     agentControlledByUser: z.boolean().optional(), pendingPermissionRequests: z.array(OwnerRelayPendingPermissionSchema).optional(),
     activity: activity.optional(),
 }).strict();
 // Validate the existing message union, but preserve legacy/event extension data for signing and
 // transcript fidelity. A normal parse would silently strip fields belonging to existing producers.
 const content = z.custom<MessageContent>(value => MessageContentSchema.safeParse(value).success);
-export const OwnerRelayReadEventSchema = z.object({ id, seq: relayCount, localId: SessionMessageSchema.shape.localId,
+export const OwnerRelayReadEventSchema = z.object({ id: SessionMessageSchema.shape.id, seq: relayCount, localId: SessionMessageSchema.shape.localId,
     content, createdAt: relayCount, updatedAt: relayCount,
 }).strict();
 // Mirrors daemon/ownedSpawnRuntime.ts's supported options; no arbitrary argv, executable or RPC.

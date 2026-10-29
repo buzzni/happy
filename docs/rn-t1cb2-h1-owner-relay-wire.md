@@ -143,3 +143,11 @@ read 응답 서명 → encode → decode → 서명 검증까지 통과하는지
   src/sessionOwnerRelayCodec.test.ts src/messages.test.ts` — **3개 파일 / 115건 통과**.
 - `pnpm -C packages/happy-wire run typecheck`, `git diff --check` 통과.
 - 사용자 지시대로 파일만 수정했다. 이 후속 변경의 커밋은 지휘 세션이 맡는다.
+
+## H1-R-02 교차 리뷰 반영 (2026-10-30)
+
+같은 부류가 다른 식별자에도 남아 있었다. 기존 레코드에서 옮겨 오는 식별자(read 이벤트의 메시지 `id`,
+pending permission `requestId`, activity `sourceMessageId`, snapshot `runtimeId`·`machineId`)와 그 permission을
+가리키는 `reply-own-permission`의 `permissionId`(요청 payload·응답 control)는 `persistedId`(비어 있지 않은 문자열)로
+생산자의 기존 계약을 따른다. `ownershipId`는 이 프로토콜이 발급하는 ID에만 쓴다. 공백·129자 식별자가 read 응답의
+서명 → encode → decode → 검증과 permission 응답 요청 검증을 통과하는 회귀 4건을 추가했다(수정 전 4건 실패).

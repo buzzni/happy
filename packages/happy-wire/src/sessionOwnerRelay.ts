@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { ownerRelayJsonWithin, OWNER_RELAY_REQUEST_BYTES, OWNER_RELAY_REPLY_BYTES } from './sessionOwnerRelayJson';
 import { ownershipId as id, ownershipHash, OwnershipSourceAuthoritySchema, OwnershipSubjectSchema } from './sessionOwnership';
 import { rotationDecodeBinary } from './sharedMachineRotation';
-import { relayCount, relayLocalId, OwnerRelayPromptPayloadSchema, OwnerRelayPermissionPayloadSchema,
+import { relayCount, relayLocalId, persistedId, OwnerRelayPromptPayloadSchema, OwnerRelayPermissionPayloadSchema,
     OwnerRelaySnapshotSchema, OwnerRelayReadEventSchema, OwnerRelaySpawnOptionsSchema, OwnerRelayChildReferenceSchema } from './sessionOwnerRelayPayloads';
 const jsonRequest = z.unknown().refine(v => ownerRelayJsonWithin(v, OWNER_RELAY_REQUEST_BYTES), 'Invalid or oversized relay JSON');
 const jsonReply = z.unknown().refine(v => ownerRelayJsonWithin(v, OWNER_RELAY_REPLY_BYTES), 'Invalid or oversized relay JSON');
@@ -60,7 +60,7 @@ const results = [
     { operation: z.literal('prompt-own-session'), storage: z.object({ messageId: id, seq: relayCount,
         localId: relayLocalId, bodyVerified: z.boolean() }).strict() },
     { operation: z.literal('resume-own-session'), control: z.object(control).strict() },
-    { operation: z.literal('reply-own-permission'), control: z.object({ ...control, permissionId: id }).strict() },
+    { operation: z.literal('reply-own-permission'), control: z.object({ ...control, permissionId: persistedId }).strict() },
     { operation: z.literal('abort-own-turn'), control: z.object(control).strict() },
     { operation: z.literal('spawn-owned-child'), childSpawn: child },
     { operation: z.literal('owned-child-status'), childSpawn: child },

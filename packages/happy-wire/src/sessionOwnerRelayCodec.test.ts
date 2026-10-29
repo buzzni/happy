@@ -154,6 +154,23 @@ describe('H1-R-01 persisted message localId compatibility', () => {
         decoded.sessionView.events[0].localId = 'unsigned-change';
         expect(await verifyOwnerRelayReply(decoded, request, fixture.personalContact, now)).toBe(false);
     });
+    // H1-R-02: every persisted identifier a read carries keeps its producer's string contract, not ownershipId.
+    it.each(['legacy id with spaces', 'x'.repeat(129)])('read preserves persisted message, permission, activity and runtime IDs (%s)', async persisted => {
+        const { request, reply } = await pair(1);
+        if (reply.result !== 'allowed' || reply.operation !== 'read-session') throw new Error('Expected read fixture');
+        const snapshot = { ...reply.sessionView.snapshot, runtimeId: persisted, machineId: persisted,
+            pendingPermissionRequests: [{ ...reply.sessionView.snapshot.pendingPermissionRequests![0]!, requestId: persisted }],
+            activity: { state: 'known' as const, title: 't', inProgress: [], text: null, source: 'plan' as const, sourceMessageId: persisted, sourceSeq: 1, reason: null, observedAt: 1 } };
+        const event = { id: persisted, seq: 1, localId: null, createdAt: 1, updatedAt: 1, content: { role: 'user', content: { type: 'text', text: '기존 내용' } } };
+        const signed = signOwnerRelayReply({ ...reply, sessionView: { ...reply.sessionView, snapshot, events: [event] } }, desktop.secretKey);
+        const decoded = decodeOwnerRelayReply(encodeOwnerRelayReply(signed));
+        expect(decoded).toEqual(signed);
+        expect(await verifyOwnerRelayReply(decoded, request, fixture.personalContact, now)).toBe(true);
+    });
+    it.each(['legacy id with spaces', 'x'.repeat(129)])('reply-own-permission addresses a persisted permission ID (%s)', persisted => {
+        const vector = fixture.vectors.find((v: { request: { operation: string } }) => v.request.operation === 'reply-own-permission')!;
+        expect(OwnerRelayRequestSchema.safeParse({ ...vector.request, payload: { ...vector.request.payload, permissionId: persisted } }).success).toBe(true);
+    });
     it.each(['기존 메시지', 'existing message', 'x'.repeat(129)])('keeps prompt and storage ID restrictions for %s', localId => {
         expect(OwnerRelayRequestSchema.safeParse({ ...fixture.vectors[2].request, localId }).success).toBe(false);
         const reply = fixture.vectors[2].reply;
