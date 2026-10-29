@@ -117,3 +117,18 @@ it('refuses shared or ambiguous principal configuration before accepting native 
     await expect(setup({ profiles: new Map() })).rejects.toThrow('one dedicated principal')
     await expect(setup({ profiles: new Map([['a', 'user-a'], ['b', 'user-b']]) as unknown as BrokerOptions['profiles'] })).rejects.toThrow('one dedicated principal')
 })
+it('survives a backward wall-clock step without reviving used or expired commands', async () => {
+    let clock = 100000
+    const h = await setup({ now: () => clock } as Partial<BrokerOptions>)
+    const path = '/v1/sessions/register', body = '{"schemaVersion":1}'
+    const used = h.envelope(path, body)
+    expect((await h.call(path, body, used)).status).toBe(200)
+    clock = 120000 // past the first command's expiry: its nonce may be pruned.
+    const expired = h.envelope(path, body, { issuedAtMs: 101000, expiresAtMs: 116000 })
+    expect((await h.call(path, body, h.envelope(path, body, { issuedAtMs: 119000, expiresAtMs: 130000 }))).status).toBe(200)
+    clock = 105000 // The wall clock steps back.
+    expect((await h.call(path, body, used)).status).toBe(401)
+    expect((await h.call(path, body, expired)).status).toBe(401)
+    // A fresh command is still accepted: no permanent lock-out until restart.
+    expect((await h.call(path, body, h.envelope(path, body, { issuedAtMs: 104000, expiresAtMs: 131000 }))).status).toBe(200)
+})

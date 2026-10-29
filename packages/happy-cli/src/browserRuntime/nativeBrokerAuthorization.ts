@@ -31,8 +31,14 @@ export function nativeBrokerAuthorization(options: {
     const identity = { ...options.identity }
     // Copy the trust configuration so a later caller mutation cannot alter admission.
     const issuers = options.trustedIssuers.map(issuer => ({ ...issuer }))
-    let lastNow = options.now()
-    let clockFailed = false
+    let lastNow = Number.isSafeInteger(options.now()) ? options.now() : 0
+    /** The latest time seen, or undefined for an unusable clock reading (that request is denied). */
+    const observe = (): number | undefined => {
+        const now = options.now()
+        if (!Number.isSafeInteger(now)) return undefined
+        lastNow = Math.max(lastNow, now)
+        return lastNow
+    }
     return {
         challenge: () => ({ schemaVersion: 1 as const, machineId: identity.machineId, workspaceId: identity.workspaceId, generation }),
         async authorize(req: IncomingMessage): Promise<unknown> {
@@ -41,11 +47,11 @@ export function nativeBrokerAuthorization(options: {
             let claims: z.infer<typeof claimsSchema>
             try { claims = claimsSchema.parse(openServerEnvelope(token.split('.'), 'abp-native-command', issuers)) }
             catch { throw denied() }
-            const now = options.now()
-            // A backwards wall clock must not make pruned nonces valid again.
-            if (!Number.isSafeInteger(now) || now < lastNow) clockFailed = true
-            lastNow = now
-            if (clockFailed || claims.machineId !== identity.machineId || claims.aud !== identity.machineId ||
+            // Time only moves forward here: a backward wall-clock step can neither revive an expired
+            // command nor a pruned nonce (both are judged against the latest time seen), and it does not
+            // lock the runtime out until a restart either.
+            const now = observe()
+            if (now === undefined || claims.machineId !== identity.machineId || claims.aud !== identity.machineId ||
                 claims.workspaceId !== identity.workspaceId || claims.principalId !== identity.principalId || claims.generation !== generation ||
                 claims.method !== req.method || claims.path !== req.url ||
                 claims.issuedAtMs > now || claims.expiresAtMs <= now || claims.expiresAtMs <= claims.issuedAtMs ||
@@ -66,10 +72,8 @@ export function nativeBrokerAuthorization(options: {
             if (createHash('sha256').update(raw).digest('hex') !== claims.bodySha256) throw denied()
             // No await between the final time check and consume. Concurrent copies
             // cannot both dispatch. A failed/uncertain operation cannot be replayed.
-            const dispatchAt = options.now()
-            if (dispatchAt < lastNow || !Number.isSafeInteger(dispatchAt)) clockFailed = true
-            lastNow = dispatchAt
-            if (clockFailed || claims.expiresAtMs <= dispatchAt) throw denied()
+            const dispatchAt = observe()
+            if (dispatchAt === undefined || claims.expiresAtMs <= dispatchAt) throw denied()
             for (const [nonce, expiry] of consumed) if (expiry <= dispatchAt) consumed.delete(nonce)
             if (consumed.has(claims.requestId) || consumed.size >= 4096) throw denied()
             consumed.set(claims.requestId, claims.expiresAtMs)
