@@ -204,15 +204,15 @@ describe('a fence before the input: the write never left, so the task is not lef
         await h.store.close()
     })
 
-    it('a driver without the gate capability, its late result racing a cancel still persisting the revoked lease: unknown either way', async () => {
+    it.each([['without', false], ['with', true]] as const)('a driver %s the gate capability, its late result racing a cancel still persisting the revoked lease', async (_label, gated) => {
         let armed = false
         let entered!: () => void
         let release!: () => void
         const appendHeld = new Promise<void>((resolve) => { entered = resolve })
         const appendGate = new Promise<void>((resolve) => { release = resolve })
         const driver = new FakeBrowserDriver()
-        delete (driver as { gatesInputOnValidateDispatch?: boolean }).gatesInputOnValidateDispatch
-        const h = await harness('abp-boundary-legacy-race-', driver, undefined, async (operation) => {
+        if (!gated) delete (driver as { gatesInputOnValidateDispatch?: boolean }).gatesInputOnValidateDispatch
+        const h = await harness('abp-boundary-cancel-race-', driver, undefined, async (operation) => {
             if (armed && operation === 'event-append') {
                 armed = false
                 entered()
@@ -230,10 +230,112 @@ describe('a fence before the input: the write never left, so the task is not lef
         release()
         await cancel
         const result = (await batch).result
+        expect(h.driver.dispatchCounts.get('fill-race') ?? 0).toBe(0)
+        if (gated) {
+            // Refused at the gate: nothing was sent, and the record is the cancel's, not a failure the agent must handle.
+            expect(stored(h, t)).toMatchObject({ status: 'cancelled', pauseReason: undefined, uncertainActions: [] })
+            expect(stored(h, t).actions['fill-race'].state).toBe('skipped')
+            expect(result).toMatchObject({ outcome: 'cancelled', mayHaveSideEffects: false })
+            return void await h.store.close()
+        }
         expect(result).toMatchObject({ outcome: 'uncertain', mayHaveSideEffects: true })
         expect(stored(h, t).actions['fill-race'].state).toBe('uncertain')
         expect(stored(h, t)).toMatchObject({ status: 'paused', pauseReason: 'cancelled-with-unknown-effect', uncertainActions: ['fill-race'] })
-        expect(h.driver.dispatchCounts.get('fill-race') ?? 0).toBe(0)
+        await h.store.close()
+    })
+})
+
+describe('overlapping cancels of a gated write refused before its input', () => {
+    /** A store whose next `metadata` write can be held and whose next `event-append` can be failed. */
+    function faults() {
+        const state = { holdMetadata: false, failHeldMetadata: false, failAppend: false, entered: () => {}, release: () => {} }
+        const held = new Promise<void>((resolve) => { state.entered = resolve })
+        const gate = new Promise<void>((resolve) => { state.release = resolve })
+        const inject = async (operation: string) => {
+            if (state.holdMetadata && operation === 'metadata') {
+                state.holdMetadata = false
+                state.entered()
+                await gate
+                if (state.failHeldMetadata) {
+                    state.failHeldMetadata = false
+                    throw new Error('disk full')
+                }
+            }
+            if (state.failAppend && operation === 'event-append') {
+                state.failAppend = false
+                throw new Error('disk full')
+            }
+        }
+        return { state, held, inject }
+    }
+    function interactiveCancel(h: Harness) {
+        return { credential: { ...h.uiAuth.credential, capabilityId: 'ui-cancel', operations: ['cancel' as const] }, verifiedAtMs: h.clock.now() }
+    }
+
+    it.each(['fails', 'succeeds'] as const)('a second cancel that %s while the first still persists the revoked lease', async (second) => {
+        const f = faults()
+        const h = await harness(`abp-boundary-two-cancels-${second}-`, new FakeBrowserDriver(), undefined, f.inject)
+        const t = await openTask(h)
+        const { hold, batch } = await heldAt(h, t, 'fill', 'fill-two')
+        f.state.holdMetadata = true
+        const first = h.runtime.cancel(h.auth, { taskId: t.taskId, requestId: 'cancel-a' as RequestId })
+        await f.held
+        f.state.failAppend = second === 'fails'
+        const other = h.runtime.cancel(interactiveCancel(h), { taskId: t.taskId, requestId: 'cancel-b' as RequestId })
+        if (second === 'fails') await expect(other).rejects.toBeInstanceOf(BrowserRuntimeError)
+        else await other
+        hold.release()
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        f.state.release()
+        await first
+        const result = (await batch).result
+        expect(h.driver.dispatchCounts.get('fill-two') ?? 0).toBe(0)
+        expect(stored(h, t)).toMatchObject({ status: 'cancelled', pauseReason: undefined, uncertainActions: [] })
+        expect(stored(h, t).actions['fill-two'].state).toBe('skipped')
+        expect(result).toMatchObject({ outcome: 'cancelled', mayHaveSideEffects: false })
+        await h.store.close()
+    })
+
+    it('both cancels fail: the late result waits for them, pauses the task as if no cancel came, and the next batch runs', async () => {
+        const f = faults()
+        const h = await harness('abp-boundary-two-cancels-fail-', new FakeBrowserDriver(), undefined, f.inject)
+        const t = await openTask(h)
+        const { hold, batch } = await heldAt(h, t, 'fill', 'fill-both')
+        f.state.holdMetadata = true
+        f.state.failHeldMetadata = true
+        const first = h.runtime.cancel(h.auth, { taskId: t.taskId, requestId: 'cancel-a' as RequestId })
+        await f.held
+        f.state.failAppend = true
+        await expect(h.runtime.cancel(interactiveCancel(h), { taskId: t.taskId, requestId: 'cancel-b' as RequestId })).rejects.toBeInstanceOf(BrowserRuntimeError)
+        hold.release()
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        f.state.release()
+        await expect(first).rejects.toBeInstanceOf(BrowserRuntimeError)
+        const result = (await batch).result
+        expect(h.driver.dispatchCounts.get('fill-both') ?? 0).toBe(0)
+        expect(result).toMatchObject({ outcome: 'failed', mayHaveSideEffects: false })
+        expect(stored(h, t)).toMatchObject({ status: 'paused', pauseReason: 'awaiting-agent', cancelRequested: false, uncertainActions: [] })
+        const next = await submit(h, t, [writeStep(t, 'click', 'click-next')], 'batch-next')
+        expect(next.result?.outcome).toBe('succeeded')
+        expect(h.driver.dispatchCounts.get('click-next')).toBe(1)
+        await h.store.close()
+    })
+
+    it('a sole cancel that fails leaves no cancel in progress: the late result pauses the task, and a later cancel still works', async () => {
+        const f = faults()
+        const h = await harness('abp-boundary-cancel-fails-', new FakeBrowserDriver(), undefined, f.inject)
+        const t = await openTask(h)
+        const { hold, batch } = await heldAt(h, t, 'fill', 'fill-alone')
+        f.state.failAppend = true
+        await expect(h.runtime.cancel(h.auth, { taskId: t.taskId, requestId: 'cancel-x' as RequestId })).rejects.toBeInstanceOf(BrowserRuntimeError)
+        hold.release()
+        const result = (await batch).result
+        // The leases stayed revoked (the physical fence holds), so nothing was sent; no cancel was recorded.
+        expect(h.driver.dispatchCounts.get('fill-alone') ?? 0).toBe(0)
+        expect(result).toMatchObject({ outcome: 'failed', mayHaveSideEffects: false })
+        expect(stored(h, t)).toMatchObject({ status: 'paused', pauseReason: 'awaiting-agent', cancelRequested: false, uncertainActions: [] })
+        const retried = await h.runtime.cancel(h.auth, { taskId: t.taskId, requestId: 'cancel-y' as RequestId })
+        expect(retried.task.status).toBe('cancelled')
         await h.store.close()
     })
 })
