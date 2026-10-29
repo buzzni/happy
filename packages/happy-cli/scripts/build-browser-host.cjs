@@ -13,8 +13,11 @@ const source = join(__dirname, '..', 'native', 'browserHost.c');
 let compiler, args;
 if (process.platform === 'darwin') {
     compiler = '/usr/bin/xcrun';
+    // BROWSER_HOST_ARCH=x86_64 cross-builds the Intel addon on an Apple silicon release runner.
+    const arch = process.env.BROWSER_HOST_ARCH || (process.arch === 'x64' ? 'x86_64' : 'arm64');
+    if (!['arm64', 'x86_64'].includes(arch)) throw new Error('BROWSER_HOST_ARCH must be arm64 or x86_64');
     args = ['clang', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-fvisibility=hidden', '-DNAPI_VERSION=8', '-DNODE_GYP_MODULE_NAME=browser_host',
-        '-bundle', '-undefined', 'dynamic_lookup', '-I', headers, source, '-o', output];
+        '-arch', arch, '-bundle', '-undefined', 'dynamic_lookup', '-I', headers, source, '-o', output];
 } else {
     const library = process.argv[4] && resolve(process.argv[4]);
     if (!library || !existsSync(library)) throw new Error('Pass the target architecture node.lib after the output path');

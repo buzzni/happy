@@ -32,7 +32,73 @@ permissions:
     contents: read
 
 jobs:
+    # The personal desktop AI browser's Node-API addon (packages/happy-cli/native/browserHost.c) for the
+    # platforms Desktop ships. Never committed: built here from the tagged source, checked, then packed.
+    browser-host:
+        if: github.event_name == 'push'
+        strategy:
+            fail-fast: true
+            matrix:
+                include:
+                    - { runner: macos-14, platform: darwin-arm64, arch: arm64 }
+                    - { runner: macos-14, platform: darwin-x64, arch: x86_64 }
+                    - { runner: windows-latest, platform: win32-x64, arch: x64 }
+        runs-on: ${{ matrix.runner }}
+        timeout-minutes: 20
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Setup Node
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 22
+
+            - name: Set up MSVC
+              if: runner.os == 'Windows'
+              uses: ilammy/msvc-dev-cmd@v1
+              with:
+                  arch: x64
+
+            - name: Fetch Node headers
+              shell: bash
+              run: |
+                  npx --yes node-gyp@11 install --devdir="$RUNNER_TEMP/node-gyp"
+                  NODE_DIR="$RUNNER_TEMP/node-gyp/$(node -p process.versions.node)"
+                  echo "NODE_HEADERS=$NODE_DIR/include/node" >> "$GITHUB_ENV"
+                  echo "NODE_LIB=$NODE_DIR/x64/node.lib" >> "$GITHUB_ENV"
+
+            - name: Build browser host
+              shell: bash
+              env:
+                  BROWSER_HOST_ARCH: ${{ runner.os == 'macOS' && matrix.arch || '' }}
+              run: |
+                  OUT="packages/happy-cli/native/${{ matrix.platform }}/browser-host.node"
+                  if [ "$RUNNER_OS" = "Windows" ]; then
+                      node packages/happy-cli/scripts/build-browser-host.cjs "$NODE_HEADERS" "$OUT" "$NODE_LIB"
+                  else
+                      node packages/happy-cli/scripts/build-browser-host.cjs "$NODE_HEADERS" "$OUT"
+                      test "$(lipo -archs "$OUT")" = "${{ matrix.arch }}"
+                  fi
+
+            - name: Check browser host (native architecture only)
+              if: matrix.platform != 'darwin-x64'
+              shell: bash
+              run: |
+                  node -e "const h=require(process.argv[1]); if(!/^[0-9a-f-]{36}$/i.test(h.bootId())||!/^[0-9]+$/.test(h.processStart(process.pid))) process.exit(1)" "$PWD/packages/happy-cli/native/${{ matrix.platform }}/browser-host.node"
+                  if [ "$RUNNER_OS" = "Windows" ]; then
+                      node packages/happy-cli/scripts/windows-browser-native.check.cjs "packages/happy-cli/native/${{ matrix.platform }}/browser-host.node"
+                  fi
+
+            - name: Upload browser host
+              uses: actions/upload-artifact@v4
+              with:
+                  name: browser-host-${{ matrix.platform }}
+                  path: packages/happy-cli/native/${{ matrix.platform }}/browser-host.node
+                  if-no-files-found: error
+
     publish:
+        needs: browser-host
         if: github.event_name == 'push'
         runs-on: ubuntu-latest
         # The arm64 browser image builds under QEMU emulation (Chromium apt install), which takes a while.
@@ -109,6 +175,24 @@ jobs:
               if: steps.abp_images.outputs.enabled == 'true'
               # Writes scripts/agent-browser/abp-images.json into the package: the digests abp-stack pull checks.
               run: node packages/happy-cli/scripts/agent-browser/publish-images.mjs --repo namsangboy --version "${{ steps.release_version.outputs.version }}" --out packages/happy-cli/scripts/agent-browser/abp-images.json
+
+            - name: Download browser host (darwin-arm64)
+              uses: actions/download-artifact@v4
+              with:
+                  name: browser-host-darwin-arm64
+                  path: packages/happy-cli/native/darwin-arm64
+
+            - name: Download browser host (darwin-x64)
+              uses: actions/download-artifact@v4
+              with:
+                  name: browser-host-darwin-x64
+                  path: packages/happy-cli/native/darwin-x64
+
+            - name: Download browser host (win32-x64)
+              uses: actions/download-artifact@v4
+              with:
+                  name: browser-host-win32-x64
+                  path: packages/happy-cli/native/win32-x64
 
             - name: Prepare publish artifact
               run: node packages/happy-cli/scripts/prepare-publish-package.cjs --out "$RUNNER_TEMP/happy-cli-publish"

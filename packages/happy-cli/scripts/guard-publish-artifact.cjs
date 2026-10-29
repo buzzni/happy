@@ -17,6 +17,10 @@ const EXPECTED_BUNDLED_FILES = [
     'package/bin/happy-agent-task.mjs',
     'package/dist/browserNativeMessagingHost.mjs',
     'package/browser-extension/src/nativePairing.js',
+    // Personal desktop AI browser: built per platform by the publish workflow's browser-host job.
+    'package/native/darwin-arm64/browser-host.node',
+    'package/native/darwin-x64/browser-host.node',
+    'package/native/win32-x64/browser-host.node',
     'package/node_modules/@buzzni/saycode-cli/package.json',
     'package/node_modules/@buzzni/saycode-cli/index.mjs',
     'package/node_modules/@slopus/happy-wire/package.json',

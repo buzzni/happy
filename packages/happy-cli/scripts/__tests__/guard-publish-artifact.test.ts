@@ -26,6 +26,7 @@ function createPublishTarball(
         omitSaycodeAgent?: boolean
         omitTweetnacl?: boolean
         companionToolsSentinel?: boolean
+        omitBrowserHost?: string
     } = {}
 ): string {
     const fixtureRoot = mkdtempSync(join(tmpdir(), 'happy-cli-guard-test-'))
@@ -79,6 +80,9 @@ function createPublishTarball(
     writeFixtureFile(packageRoot, 'bin/happy-browser-native-host.mjs', '#!/usr/bin/env node\n')
     chmodSync(nativeHelper, options.nativeHelperExecutable === false ? 0o644 : 0o755)
     writeFixtureFile(packageRoot, 'bin/happy-agent-task.mjs', '#!/usr/bin/env node\n')
+    for (const platform of ['darwin-arm64', 'darwin-x64', 'win32-x64']) {
+        if (platform !== options.omitBrowserHost) writeFixtureFile(packageRoot, `native/${platform}/browser-host.node`, 'addon')
+    }
     writeFixtureFile(packageRoot, 'dist/browserNativeMessagingHost.mjs', 'export {}\n')
     if (!options.omitSaycodeAgent) {
         writeFixtureFile(packageRoot, 'node_modules/@buzzni/saycode-cli/package.json', JSON.stringify({
@@ -152,6 +156,13 @@ afterEach(() => {
 })
 
 describe('guard-publish-artifact', () => {
+    it.each(['darwin-arm64', 'darwin-x64', 'win32-x64'])('rejects a tarball missing the %s personal browser host', (platform) => {
+        const tarball = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56', { omitBrowserHost: platform })
+        const result = spawnSync(process.execPath, [GUARD_SCRIPT, tarball], { encoding: 'utf8', timeout: 30_000 })
+        expect(result.status).toBe(1)
+        expect(result.stderr).toContain(`package/native/${platform}/browser-host.node`)
+    })
+
     it('rejects a tarball missing the wire crypto runtime dependency', () => {
         const tarball = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56', { omitTweetnacl: true })
         const result = spawnSync(process.execPath, [GUARD_SCRIPT, tarball], { encoding: 'utf8', timeout: 30_000 })
