@@ -40,6 +40,7 @@
  * `admit` closes register, bind, grants and the attention feed until the Runtime has
  * ended the earlier assignment's state and any pending reassignment has been verified.
  */
+import { syncDirectory } from './syncDirectory'
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { chmod, chown, lstat, mkdir, open, readFile, rename, rm } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
@@ -208,8 +209,7 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
                 const handle = await open(temporary, 'wx', 0o600)
                 try { await handle.writeFile(snapshot); await handle.sync() } finally { await handle.close() }
                 await rename(temporary, registryPath)
-                const dir = await open(options.stateDir, 'r')
-                try { await dir.sync() } finally { await dir.close() }
+                await syncDirectory(options.stateDir)
             } catch (error) {
                 await rm(temporary, { force: true })
                 throw error

@@ -1,4 +1,5 @@
 /** Persistent, proof-bound application consent. All mutations and client grants share one queue. */
+import { syncDirectory } from './syncDirectory'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { open, readFile, rename, rm } from 'node:fs/promises'
 import { isAbsolute, join, relative } from 'node:path'
@@ -44,7 +45,7 @@ export async function openLocalClientApps(options: LocalClientOptions) {
             const fd = await open(tmp, 'wx', 0o600)
             try { await fd.writeFile(JSON.stringify({ schemaVersion: 2, apps, observedAtMs, requests })); await fd.sync() } finally { await fd.close() }
             await rename(tmp, file)
-            const dir = await open(options.stateDir, 'r'); try { await dir.sync() } finally { await dir.close() }
+            await syncDirectory(options.stateDir)
         } catch (e) { unhealthy = true; throw e } finally { await rm(tmp, { force: true }) }
     }
     const allowedClient = (clientId: string) => !unhealthy && options.now() >= observedAtMs && apps.some(a => !a.revoked && a.clientIds.includes(clientId))
