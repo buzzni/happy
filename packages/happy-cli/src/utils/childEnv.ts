@@ -82,6 +82,10 @@ export const NON_INHERITABLE_ENV: readonly NonInheritableEnvEntry[] = [
     // for Claude to expand, and the socket/token the stdio bridge reads. Anyone
     // holding them reaches that session's tools, bash_stream included.
     { prefix: 'SAYCODE_MCP_', kind: 'session-scope' },
+    // The host's owner-contact socket: whoever reaches it signs as that session's source (T1c-b2 H2).
+    // The launch capability descriptor is read once by that host; neither crosses a session boundary.
+    { prefix: 'SAYCODE_OWNER_CONTACT_', kind: 'session-scope' },
+    { prefix: 'HAPPY_OWNER_CONTACT_FD', kind: 'spawn-seed' },
 ]
 
 /**
