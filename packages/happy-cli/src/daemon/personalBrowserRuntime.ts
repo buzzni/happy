@@ -157,3 +157,35 @@ function superviseRuntime(options: PersonalBrowserRuntimeOptions, env: Record<st
         },
     }
 }
+
+/**
+ * Desktop writes the installation after sign-in, while this daemon already runs: check for it
+ * until it appears, then hand it to `activate` once and supervise its runtime. A repeated
+ * diagnostic is logged once, not every check.
+ */
+export function watchPersonalBrowserRuntime(options: PersonalBrowserRuntimeOptions & {
+    intervalMs?: number
+    /** Returns false when the daemon cannot use it (the broker failed); the check continues. */
+    activate(runtime: PersonalBrowserRuntime): boolean
+}): { stop(): Promise<void> } {
+    let lastMessage: string | undefined
+    const log = (message: string) => { if (message !== lastMessage) options.log(message); lastMessage = message }
+    let running: PersonalBrowserRuntimeProcess | undefined, stopped = false
+    let timer: ReturnType<typeof setInterval> | undefined
+    const check = () => {
+        if (stopped || running) return
+        const runtime = readPersonalBrowserRuntime({ ...options, log })
+        if (!runtime || !options.activate(runtime)) return
+        running = runtime.start()
+        if (timer) clearInterval(timer)
+    }
+    check()
+    if (!running) { timer = setInterval(check, options.intervalMs ?? 10_000); timer.unref?.() }
+    return {
+        async stop() {
+            stopped = true
+            if (timer) clearInterval(timer)
+            await running?.stop()
+        },
+    }
+}

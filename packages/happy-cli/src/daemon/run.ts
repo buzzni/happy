@@ -194,7 +194,8 @@ import {
 import { machineIdentityMetadataUpdate } from './machineIdentityMetadata';
 import { listMachineIdTwins } from './machineIdTwins';
 import { agentBrowserMachineCapability, agentBrowserMetadataUpdate, browserTaskLineage, createBrowserTaskSessionBroker, spawnResumedWithBrowserTaskRegistration, startBrowserTaskReconciliation, type BrowserTaskSessionBroker } from './browserTaskBroker';
-import { readPersonalBrowserRuntime } from './personalBrowserRuntime';
+import { watchPersonalBrowserRuntime } from './personalBrowserRuntime';
+import type { NativeBrokerRequestOptions } from '@/browserRuntime/brokerGrantSource';
 import { createHeldBrowserAttentions, findBrowserAttentionSession, startBrowserAttentionWatcher, type HeldBrowserAttention } from './browserAttentionDelivery';
 import {
   createProcFs,
@@ -1836,22 +1837,40 @@ export async function startDaemon(): Promise<void> {
     let browserTaskBroker: BrowserTaskSessionBroker | undefined;
     // Attentions for live Chat(beta) run-once turns, delivered by resuming the session at its exit.
     const heldBrowserAttentions = createHeldBrowserAttentions();
-    // Single-user Mac/Windows PC: the runtime the Desktop installer configured for this user and machine.
-    // An installer-managed host (explicit HAPPY_BROWSER_TASK_RUNTIME_URL) keeps its own configuration.
-    const personalBrowserRuntime = process.env.HAPPY_BROWSER_TASK_RUNTIME_URL ? undefined : readPersonalBrowserRuntime({
-      machineId, studioOrigin: readTrustedStudioOrigin(process.env), token: () => credentials.token, log: (message) => logger.warn(message),
-    });
-    if (personalBrowserRuntime) Object.assign(process.env, personalBrowserRuntime.sessionEnv);
     try {
       browserTaskBroker = createBrowserTaskSessionBroker(process.env, undefined, {
-        ...(personalBrowserRuntime ? { native: personalBrowserRuntime.native } : {}),
         pendingRevocationsFile: join(configuration.happyHomeDir, 'browser-task-revocations.json'),
       });
     } catch (error) {
       logger.warn(`[DAEMON RUN] Browser task broker disabled: ${error instanceof Error ? error.message : 'unknown error'}`);
     }
-    const personalBrowserRuntimeProcess = browserTaskBroker ? personalBrowserRuntime?.start() : undefined;
-    const stopBrowserTaskReconciliation = startBrowserTaskReconciliation(browserTaskBroker);
+    let stopBrowserTaskReconciliation = startBrowserTaskReconciliation(browserTaskBroker);
+    // Single-user Mac/Windows PC: the runtime Desktop configures for this user and machine after sign-in,
+    // picked up without a restart. An installer-managed host (its own broker) keeps its configuration.
+    let personalBrowserNative: NativeBrokerRequestOptions | undefined;
+    let onPersonalBrowserActive: ((native: NativeBrokerRequestOptions) => void) | undefined;
+    const personalBrowserWatch = browserTaskBroker || process.env.HAPPY_BROWSER_TASK_RUNTIME_URL ? undefined : watchPersonalBrowserRuntime({
+      machineId, studioOrigin: readTrustedStudioOrigin(process.env), token: () => credentials.token, log: (message) => logger.warn(message),
+      activate: (runtime) => {
+        let broker: BrowserTaskSessionBroker | undefined;
+        try {
+          broker = createBrowserTaskSessionBroker(process.env, undefined, {
+            native: runtime.native, pendingRevocationsFile: join(configuration.happyHomeDir, 'browser-task-revocations.json'),
+          });
+        } catch (error) {
+          logger.warn(`[DAEMON RUN] Personal browser broker disabled: ${error instanceof Error ? error.message : 'unknown error'}`);
+        }
+        if (!broker) return false;
+        Object.assign(process.env, runtime.sessionEnv);
+        browserTaskBroker = broker;
+        stopBrowserTaskReconciliation();
+        stopBrowserTaskReconciliation = startBrowserTaskReconciliation(broker);
+        personalBrowserNative = runtime.native;
+        onPersonalBrowserActive?.(runtime.native);
+        logger.debug('[DAEMON RUN] Personal browser runtime activated');
+        return true;
+      },
+    });
     const reportBrowserTaskRevokeFailure = (error: unknown): void => {
       logger.warn(`[DAEMON RUN] ${error instanceof Error ? error.message : 'Browser task revocation failed'}`);
     };
@@ -5785,7 +5804,7 @@ export async function startDaemon(): Promise<void> {
 
       stopBrowserTaskReconciliation();
       await stopBrowserAttention();
-      await personalBrowserRuntimeProcess?.stop();
+      await personalBrowserWatch?.stop();
 
       // Clear health check interval
       if (restartOnStaleVersionAndHeartbeat) {
@@ -5844,8 +5863,7 @@ export async function startDaemon(): Promise<void> {
       process.exit(0);
     };
 
-    stopBrowserAttention = startBrowserAttentionWatcher({
-      ...(personalBrowserRuntimeProcess && personalBrowserRuntime ? { native: personalBrowserRuntime.native } : {}),
+    const browserAttentionOptions: Parameters<typeof startBrowserAttentionWatcher>[0] = {
       happyHomeDir: configuration.happyHomeDir,
       serverUrl: configuration.serverUrl,
       machineId,
@@ -5863,7 +5881,16 @@ export async function startDaemon(): Promise<void> {
         ? readStagedTokenFromHomeDir(session.userHomeDir)
         : credentials.token,
       log: (message) => logger.debug(message),
-    });
+    };
+    stopBrowserAttention = startBrowserAttentionWatcher(browserAttentionOptions);
+    // The personal runtime may become active later; its attention feed then starts too.
+    const startPersonalBrowserAttention = (native: NativeBrokerRequestOptions) => {
+      const stopPersonal = startBrowserAttentionWatcher({ ...browserAttentionOptions, native });
+      const stopPrevious = stopBrowserAttention;
+      stopBrowserAttention = async () => { await stopPrevious(); await stopPersonal(); };
+    };
+    if (personalBrowserNative) startPersonalBrowserAttention(personalBrowserNative);
+    else onPersonalBrowserActive = startPersonalBrowserAttention;
 
     logger.debug('[DAEMON RUN] Daemon started successfully, waiting for shutdown request');
 

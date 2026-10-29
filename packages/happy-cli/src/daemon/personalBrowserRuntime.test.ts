@@ -3,7 +3,7 @@ import { PassThrough } from 'node:stream'
 import { describe, expect, it, vi } from 'vitest'
 import { generateKeyPairSync } from 'node:crypto'
 import { personalRuntimePaths } from '@/browserRuntime/personalDesktopRuntime'
-import { readPersonalBrowserRuntime } from './personalBrowserRuntime'
+import { readPersonalBrowserRuntime, watchPersonalBrowserRuntime } from './personalBrowserRuntime'
 
 const publicKeyPem = generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'pem' }).toString()
 const env = { HOME: '/Users/u', TMPDIR: '/tmp/u', HAPPY_SERVER_URL: 'https://s', HAPPY_ACCESS_KEY: 'secret', ANTHROPIC_API_KEY: 'secret' }
@@ -98,5 +98,46 @@ describe('personal browser runtime (daemon side)', () => {
         await stopping
         expect(timers.filter(timer => timer.ms !== 15_000)).toEqual([])
         await process.stop()
+    })
+})
+
+describe('watching for the personal runtime installation', () => {
+    it('activates once when Desktop writes the installation, logs a repeated diagnostic once, and stops the runtime', async () => {
+        vi.useFakeTimers()
+        try {
+            let installed: string | undefined
+            const log = vi.fn()
+            const activate = vi.fn(() => true)
+            const child = fakeChild()
+            const watch = watchPersonalBrowserRuntime({ ...base({ log, spawnImpl: () => child,
+                readConfig: () => { if (installed === undefined) throw Object.assign(new Error('missing'), { code: 'ENOENT' }); return installed } }), intervalMs: 1000, activate })
+            installed = config({ machineId: 'machine-2' })
+            await vi.advanceTimersByTimeAsync(3000)
+            expect(log.mock.calls.filter(([message]) => String(message).includes('another machine'))).toHaveLength(1)
+            expect(activate).not.toHaveBeenCalled()
+            installed = config()
+            await vi.advanceTimersByTimeAsync(1000)
+            expect(activate).toHaveBeenCalledTimes(1)
+            await vi.advanceTimersByTimeAsync(5000)
+            expect(activate).toHaveBeenCalledTimes(1)
+            const stopping = watch.stop()
+            await vi.advanceTimersByTimeAsync(0)
+            child.emit('exit', 0)
+            await stopping
+        } finally { vi.useRealTimers() }
+    })
+
+    it('keeps checking while the daemon cannot use an installation', async () => {
+        vi.useFakeTimers()
+        try {
+            const activate = vi.fn().mockReturnValueOnce(false).mockReturnValue(true)
+            const spawnImpl = vi.fn(() => fakeChild())
+            const watch = watchPersonalBrowserRuntime({ ...base({ spawnImpl }), intervalMs: 1000, activate })
+            expect(spawnImpl).not.toHaveBeenCalled()
+            await vi.advanceTimersByTimeAsync(1000)
+            expect(activate).toHaveBeenCalledTimes(2)
+            expect(spawnImpl).toHaveBeenCalledTimes(1)
+            void watch.stop()
+        } finally { vi.useRealTimers() }
     })
 })
