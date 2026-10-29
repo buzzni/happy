@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CLAUDE_NOT_SIGNED_IN_NOTICE, isClaudeRevokedTokenFailure, isClaudeAuthenticationFailure, claudeNotSignedInNotice, describeClaudeLaunchFailure, isClaudeTokenRefreshFailure } from './launchFailureMessage';
+import { ClaudeAuthNotVerifiedError, CLAUDE_NOT_SIGNED_IN_NOTICE, isClaudeRevokedTokenFailure, isClaudeAuthenticationFailure, claudeNotSignedInNotice, describeClaudeLaunchFailure, isClaudeTokenRefreshFailure } from './launchFailureMessage';
 
 // Desktop specs/headless-standalone-server R21: the user sees why Claude Code did not start, but
 // never raw stderr — it can carry paths, env values or tokens.
@@ -12,6 +12,22 @@ describe('describeClaudeLaunchFailure', () => {
         const text = describeClaudeLaunchFailure(new Error('CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED'));
         expect(text).toMatch(/Organization Claude stopped.*assigned account or policy/);
         expect(text).not.toMatch(/Personal|\/login|token=/);
+    });
+
+    it('says a slow start or check is not an account refusal, and points a slow start at startup hooks', () => {
+        for (const code of ['CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED', 'CLAUDE_PERSONAL_AUTH_NOT_VERIFIED']) {
+            const startup = describeClaudeLaunchFailure(new ClaudeAuthNotVerifiedError(code, 'initialize', 'timeout'));
+            expect(startup).toMatch(/took too long to start.*SessionStart/);
+            expect(startup).not.toMatch(/account or policy could not be verified/);
+            const check = describeClaudeLaunchFailure(new ClaudeAuthNotVerifiedError(code, 'recheck', 'timeout'));
+            expect(check).toMatch(/did not answer the account check in time/);
+            expect(check).not.toMatch(/account or policy could not be verified/);
+        }
+    });
+
+    it('keeps the account or policy sentence for every refusal that is not a timeout', () => {
+        expect(describeClaudeLaunchFailure(new ClaudeAuthNotVerifiedError('CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED', 'recheck', 'policy'))).toMatch(/Organization Claude stopped.*assigned account or policy/);
+        expect(describeClaudeLaunchFailure(new ClaudeAuthNotVerifiedError('CLAUDE_PERSONAL_AUTH_NOT_VERIFIED', 'initialize', 'unsupported'))).toMatch(/Personal Claude stopped.*account or policy/);
     });
 
     it('names the root refusal and what to do', () => {

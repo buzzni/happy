@@ -977,5 +977,9 @@ Every new SDK query snapshots the token selected for that session generation, in
 resume and off-turn titles. API-key/gateway routes without a selected OAuth token and ordinary
 personal logins retain their existing route. Organization verification failures use
 `CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED`, independently of the personal failure code.
+Initialization (which waits for SessionStart hooks, before any input exists) has a 60 s budget;
+every later control call keeps 10 s. Refusals carry only a fixed stage/reason so the daemon log and
+the user notice can tell a slow start or check from an account or policy mismatch
+(`specs/claude-init-timeout-split/`).
 The pinned SDK/CLI must prove the control/settings contract; a missing or incompatible
 contract fails closed. Revisit this boundary when upgrading the pinned Claude runtime.
