@@ -15,9 +15,11 @@ export async function dispatchStep(
     step: BatchStep,
     grant: AgentGrant,
     signal: AbortSignal,
-    /** click: what was classified/approved, re-verified by the driver right before input */
-    expect?: DispatchExpectation,
-    validateDispatch?: () => void,
+    { expect, validateDispatch }: {
+        /** click: what was classified/approved, re-verified by the driver right before input */
+        expect?: DispatchExpectation
+        validateDispatch?: () => void
+    } = {},
 ): Promise<Observation | { url: string; documentGeneration: number } | void> {
     const options = { signal, timeoutMs: step.timeoutMs, ...(validateDispatch ? { validateDispatch } : {}) }
     switch (step.kind) {

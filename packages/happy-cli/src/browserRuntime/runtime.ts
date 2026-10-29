@@ -2716,12 +2716,13 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 armed.armAction?.(step.actionId)
                 this.inFlightDriverCalls.add(task.taskId)
                 try {
-                    const dispatchResult = await this.dispatch(driver, effectiveStep, grant, controller.signal,
-                        step.kind === 'click' && description ? dispatchExpectation(description, usedAutoConsent) : undefined,
-                        usedAutoConsent ? () => {
+                    const dispatchResult = await this.dispatch(driver, effectiveStep, grant, controller.signal, {
+                        ...(step.kind === 'click' && description ? { expect: dispatchExpectation(description, usedAutoConsent) } : {}),
+                        ...(usedAutoConsent ? { validateDispatch: () => {
                             if (this.autoApprovalFor(this.requireTask(task.taskId)) !== autoConsent)
                                 throw new BrowserRuntimeError('APPROVAL_REQUIRED', 'Auto was disabled or expired before input', false, false)
-                        } : undefined)
+                        } } : {}),
+                    })
                     const finalOrigin = await driver.currentOrigin(step.tabId)
                     if (!originAllowed(grant.allowedOrigins, finalOrigin))
                         throw new BrowserRuntimeError('ORIGIN_DENIED', 'Action navigated to a disallowed origin', false, false)
@@ -2941,8 +2942,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         }
     }
     private async dispatch(driver: BrowserDriver, step: BatchStep, grant: AgentGrant,
-        signal: AbortSignal, expect?: DispatchExpectation, validateDispatch?: () => void): ReturnType<typeof dispatchStep> {
-        return dispatchStep(driver, step, grant, signal, expect, validateDispatch)
+        signal: AbortSignal, options: Parameters<typeof dispatchStep>[4] = {}): ReturnType<typeof dispatchStep> {
+        return dispatchStep(driver, step, grant, signal, options)
     }
     /**
      * `guard` runs against the current task inside the serialized write; if it throws,
