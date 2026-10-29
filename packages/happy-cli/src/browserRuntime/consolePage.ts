@@ -1,3 +1,4 @@
+import { spaceStyles, spaceMarkup, spaceScript } from './consoleSpaces'
 /**
  * Client console served at GET /console: find the principal's open tasks on the
  * capability's profile, watch a task's events, answer approvals, take/release
@@ -238,6 +239,7 @@ dialog .row{justify-content:flex-end;margin-top:24px}dialog button{height:36px;b
 dialog label{display:flex;align-items:flex-start;gap:8px;font-size:14px;font-weight:400;color:var(--foreground);overflow-wrap:anywhere;margin:8px 0}
 dialog input[type="checkbox"]{width:16px;height:16px;flex:none;padding:0;margin:3px 0;accent-color:var(--primary)}
 #modeError{font-size:12px;color:var(--danger-text);overflow-wrap:anywhere}#modeError:empty{display:none}
+${spaceStyles}
 </style></head><body>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
 <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
@@ -256,7 +258,8 @@ dialog input[type="checkbox"]{width:16px;height:16px;flex:none;padding:0;margin:
 <button id="refreshTasks" class="icon" type="button" data-tt="refresh" title="Refresh"><svg aria-hidden="true"><use href="#i-refresh"/></svg></button></div>
 <div id="tasks" class="muted">not connected</div></div></details>
 <span class="spacer"></span>
-<span id="capState" class="pill"><i></i><span>not connected</span></span></header>
+<button id="spaceToggle" type="button" aria-expanded="false" aria-controls="spacePanel">Spaces</button><span id="capState" class="pill"><i></i><span>not connected</span></span></header>
+${spaceMarkup}
 <main>
 <div class="card notice" id="notice" role="alert" hidden><svg aria-hidden="true"><use href="#i-shield"/></svg><span id="noticeText"></span><button id="noticeRetry" type="button" data-t="retry">Retry</button></div>
 <section class="card" id="placeholder"><div class="empty"><svg aria-hidden="true"><use href="#i-inbox"/></svg><b data-t="pickTitle">Pick a task</b><span data-t="pickBody">Tasks that need you are in the task menu above. Pick one to change its approval mode (Auto).</span></div></section>
@@ -382,7 +385,7 @@ function setCapability(token,expiresAtMs){var renewal=!!S.token;
  S.principalId=typeof payload.principalId==='string'?payload.principalId:'';S.viewerSessionId=typeof payload.viewerSessionId==='string'?payload.viewerSessionId:'';
  capPill(T.connected+(S.expiresAtMs?' · '+(LANG==='ko'?hhmm(S.expiresAtMs)+' '+T.until:T.until+' '+hhmm(S.expiresAtMs)):''),'on');
  $('capState').title='profile '+S.profileId;
- scheduleRenewal();if(renewal&&S.screenOpen)openScreen();return true}
+ spaceCapabilityChanged(payload);scheduleRenewal();if(renewal&&S.screenOpen)openScreen();return true}
 function scheduleRenewal(){clearTimeout(S.renewTimer);if(!S.expiresAtMs)return;
  var wait=Math.max(0,S.expiresAtMs-RENEW_BEFORE_MS-Date.now());
  S.renewTimer=setTimeout(askHost,wait)}
@@ -392,6 +395,7 @@ window.addEventListener('message',function(event){
  // The first capability lists the tasks; a renewal lists them again only when the last attempt failed (the alert is up).
  var first=!S.token;if(setCapability(d.token,d.expiresAtMs)&&(first||!$('notice').hidden))listTasks()});
 /** The fragment is read on load and again on a later change (the host reopens the same page with a new capability). */
+${spaceScript}
 function readFragment(){var h=location.hash.replace(/^#/,'');if(!h)return false;var q=new URLSearchParams(h);
  var token=q.get('abp-cap'),used=!!token&&token!==S.token&&setCapability(token,Number(q.get('abp-exp')));
  history.replaceState(null,'',location.pathname+location.search);return used}

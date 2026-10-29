@@ -51,6 +51,8 @@ export interface CdpDriverOptions {
     browserInstanceIdProvider: () => Promise<BrowserInstanceId>
     /** Owned tabs (= agent windows) this driver keeps open at once; default DEFAULT_MAX_AGENT_WINDOWS. */
     maxAgentWindows?: number
+    /** Runtime resource admission, also enforced for popups and in-flight windows. */
+    windowLimit?: () => number
     /** Test seams. Not for production wiring. */
     testHooks?: {
         afterCapture?: (tabId: TabId) => Promise<void>
@@ -448,7 +450,7 @@ export class CdpDriver implements BrowserDriver {
             if (!originAllowed(allowedOrigins, originOf(url))) throw originDenied('requested origin is not allowed')
             // Every owned tab (and popup) is a window, and windows are what cost browser memory.
             if (!this.windowAvailable()) {
-                throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'agent window limit reached; close a page first', true, false)
+                throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'agent window limit reached; close a page first', true, false, 'windows')
             }
             {
                 op.markDispatch()
@@ -491,7 +493,7 @@ export class CdpDriver implements BrowserDriver {
     }
 
     private windowAvailable(): boolean {
-        return this.windows.size + this.pendingWindows < (this.options.maxAgentWindows ?? DEFAULT_MAX_AGENT_WINDOWS)
+        return this.windows.size + this.pendingWindows < (this.options.windowLimit?.() ?? this.options.maxAgentWindows ?? DEFAULT_MAX_AGENT_WINDOWS)
     }
 
     adoptTab(tabId: TabId, targetId: string, allowedOrigins: string[], opts: DriverOptions): Promise<boolean> {

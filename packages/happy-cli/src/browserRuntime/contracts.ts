@@ -70,6 +70,7 @@ export interface RuntimeErrorBody {
     message: string
     retryable: boolean
     mayHaveSideEffects: boolean
+    quotaKind?: 'spaces' | 'tabs' | 'windows' | 'time' | 'journal'
 }
 
 export class BrowserRuntimeError extends Error {
@@ -78,13 +79,14 @@ export class BrowserRuntimeError extends Error {
         message: string,
         readonly retryable = false,
         readonly mayHaveSideEffects = false,
+        readonly quotaKind?: RuntimeErrorBody['quotaKind'],
     ) {
         super(message)
         this.name = 'BrowserRuntimeError'
     }
 
     toBody(): RuntimeErrorBody {
-        return { code: this.code, message: this.message, retryable: this.retryable, mayHaveSideEffects: this.mayHaveSideEffects }
+        return { code: this.code, message: this.message, retryable: this.retryable, mayHaveSideEffects: this.mayHaveSideEffects, ...(this.quotaKind ? {quotaKind:this.quotaKind} : {}) }
     }
 }
 
@@ -96,7 +98,7 @@ export class BrowserRuntimeError extends Error {
 export type Operation =
     | 'createSpace' | 'createTask' | 'openPage' | 'closePage' | 'observe' | 'screenshot'
     | 'submitBatch' | 'finishTask' | 'getTask' | 'subscribe' | 'approve' | 'takeOver'
-    | 'releaseControl' | 'resume' | 'cancel' | 'closeSpace' | 'viewerTicket' | 'listTasks' | 'listSpaces' | 'joinSpace'
+    | 'setSpaceQuota' | 'releaseControl' | 'resume' | 'cancel' | 'closeSpace' | 'viewerTicket' | 'listTasks' | 'listSpaces' | 'joinSpace'
 
 /** Operations an agent task grant may carry. approve/takeOver/releaseControl never. */
 export const AGENT_OPERATIONS: readonly Operation[] = [
@@ -104,7 +106,7 @@ export const AGENT_OPERATIONS: readonly Operation[] = [
     'submitBatch', 'finishTask', 'getTask', 'resume', 'cancel', 'closeSpace', 'listSpaces', 'joinSpace',
 ]
 /** Operations that require an interactive (human UI) capability. */
-export const INTERACTIVE_OPERATIONS: readonly Operation[] = ['approve', 'takeOver', 'releaseControl', 'viewerTicket']
+export const INTERACTIVE_OPERATIONS: readonly Operation[] = ['approve', 'takeOver', 'releaseControl', 'viewerTicket', 'setSpaceQuota']
 
 export interface AgentGrant {
     kind: 'agent-grant'
@@ -583,8 +585,18 @@ export type InputOwner =
     | { kind: 'user'; principalId: PrincipalId; viewerSessionId: string }
     | { kind: 'none' }
 
+export interface SpaceQuotaPreference { ceiling: number | null; revision: number }
+export interface SpaceListResult {
+    quota?: { used: number; reclaimingReserve?: number; limit: number; hidden: number; reason: string; mode: 'automatic' | 'fixed'; preference: SpaceQuotaPreference }
+    spaces: Array<{ taskSpaceId: TaskSpaceId; profileId: ProfileId; createdAtMs: number; closed: boolean; tabs: TabId[];
+        memberSessionIds: string[]; membershipEvents: Array<{ type:'created' | 'joined'; agentSessionId:string; atMs:number }>;
+        reclaiming?: boolean; lastActivityAtMs?: number;
+        tasks?: Array<{taskId:TaskId; status:TaskStatus; pauseReason?:string; pendingApproval:boolean; uncertain:boolean; inFlight:boolean}> }>
+}
+
 export interface BrowserRuntimeApi {
-    listSpaces(auth: AuthContext, req: { profileId: ProfileId }): Promise<{ spaces: Array<{ taskSpaceId: TaskSpaceId; profileId: ProfileId; createdAtMs: number; closed: boolean; tabs: TabId[]; memberSessionIds: string[]; membershipEvents: Array<{ type: 'created' | 'joined'; agentSessionId: string; atMs: number }> }> }>
+    listSpaces(auth: AuthContext, req: { profileId: ProfileId }): Promise<SpaceListResult>
+    setSpaceQuota(auth: AuthContext, req: { profileId: ProfileId; ceiling: number | null; expectedRevision: number }): Promise<SpaceQuotaPreference>
     joinSpace(auth: AuthContext, req: { taskSpaceId: TaskSpaceId; requestId: RequestId }): Promise<{ taskSpaceId: TaskSpaceId; memberSessionIds: string[] }>
     createSpace(auth: AuthContext, req: CreateSpaceRequest): Promise<{ taskSpaceId: TaskSpaceId }>
     createTask(auth: AuthContext, req: CreateTaskRequest): Promise<TaskView>

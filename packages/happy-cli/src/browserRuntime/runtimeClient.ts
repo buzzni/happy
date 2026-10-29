@@ -30,6 +30,7 @@ export class RuntimeClient {
     }
 
     createSpace(req: Req<'createSpace'>) { return this.call('createSpace', req) }
+    setSpaceQuota(req: Req<'setSpaceQuota'>) { return this.call('setSpaceQuota', req) }
     listSpaces(req: Req<'listSpaces'>) { return this.call('listSpaces', req) }
     joinSpace(req: Req<'joinSpace'>) { return this.call('joinSpace', req) }
     createTask(req: Req<'createTask'>) { return this.call('createTask', req) }
@@ -83,7 +84,7 @@ export class RuntimeClient {
             if (json.ok === true) return json.result as Res<K>
             const e = json.error ?? {}
             const code: ErrorCode = (ERROR_CODES as readonly string[]).includes(e.code as string) ? (e.code as ErrorCode) : 'RUNTIME_UNAVAILABLE'
-            throw new BrowserRuntimeError(code, e.message ?? `HTTP ${response.status}`, e.retryable ?? false, e.mayHaveSideEffects ?? false)
+            throw new BrowserRuntimeError(code, e.message ?? `HTTP ${response.status}`, e.retryable ?? false, e.mayHaveSideEffects ?? false, e.quotaKind)
         }
     }
 }

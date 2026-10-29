@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mapCodexMcpMessageToSessionEnvelopes } from './sessionProtocolMapper';
+import { mapCodexMcpMessageToSessionEnvelopes, mapCodexProcessorMessageToSessionEnvelopes, mapCodexThreadItemToSessionEnvelopes } from './sessionProtocolMapper';
 
 describe('channel request correlation on Codex turn boundaries', () => {
     it.each([false, true])('T2RT-25 gates only the non-channel final candidate (evidence=%s)', enabled => {
@@ -71,4 +71,21 @@ describe('Codex terminal paths that produce no turn', () => {
         const start = next.envelopes.find((envelope) => (envelope.ev as { t: string }).t === 'turn-start');
         expect(start?.ev).toEqual({ t: 'turn-start' });
     });
+});
+
+it('preserves typed browser quota failures in legacy Codex tool receipts', () => {
+ const result=mapCodexProcessorMessageToSessionEnvelopes({type:'tool-call-result',callId:'browser-quota',output:{content:JSON.stringify({error:{code:'QUOTA_EXCEEDED',quotaKind:'spaces'}})}} as any,{currentTurnId:'turn'});
+ expect(result.find(e=>e.ev.t==='tool-call-end')?.ev).toMatchObject({browserQuotaKind:'spaces'});
+});
+
+it('preserves typed quota from live and history MCP browser receipts', () => {
+ const invocation={server:'browser',tool:'browser_task_create_space',arguments:{}};
+ const output={isError:true,content:[{type:'text',text:JSON.stringify({error:{code:'QUOTA_EXCEEDED',quotaKind:'spaces'}})}]};
+ const state={currentTurnId:'turn'};
+ const start=mapCodexMcpMessageToSessionEnvelopes({type:'mcp_tool_call_begin',call_id:'c',invocation},state);
+ expect(start.envelopes[0]?.ev).toMatchObject({t:'tool-call-start',name:invocation.tool});
+ const end=mapCodexMcpMessageToSessionEnvelopes({type:'mcp_tool_call_end',call_id:'c',invocation,result:{Ok:output}},state);
+ expect(end.envelopes[0]?.ev).toMatchObject({t:'tool-call-end',browserQuotaKind:'spaces'});
+ const history=mapCodexThreadItemToSessionEnvelopes({id:'t',status:'completed',items:[]} as any,{type:'mcpToolCall',id:'c',...invocation,result:output});
+ expect(history.find(e=>e.ev.t==='tool-call-end')?.ev).toMatchObject({browserQuotaKind:'spaces'});
 });
