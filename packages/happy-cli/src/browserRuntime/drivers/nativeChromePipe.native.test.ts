@@ -43,12 +43,18 @@ it.skipIf(process.platform !== 'darwin')('drives an isolated Chrome through inhe
         const owner = readNativeSessionOwner(child.pid!)
         expect(owner).toBeDefined()
         const instance = `native-${owner!.bootId}-${owner!.pid}-${owner!.pidStartTime}` as BrowserInstanceId
-        const driver = new CdpDriver({ connectPipe: async () => ({ connection, browserInstanceId: instance }) })
+        let egress: readonly string[] = []
+        const driver = new CdpDriver({ connectPipe: async () => ({ connection, browserInstanceId: instance }), setAllowedOrigins: origins => { egress = origins } })
         expect(await driver.connect()).toBe(instance)
         const tab = await driver.openTab(origin, [origin], { timeoutMs: 5000 })
+        expect(egress).toEqual([origin])
+        const second = await driver.openTab(origin, [origin], { timeoutMs: 5000 })
         const observation = await driver.observe(tab.tabId, [origin], { timeoutMs: 5000 })
         expect(JSON.stringify(observation)).toContain('Native driver canary')
         expect(await driver.closeTab(tab.tabId, { timeoutMs: 5000 })).toEqual({ closed: true })
+        expect(egress).toEqual([origin])
+        await driver.closeTab(second.tabId, { timeoutMs: 5000 })
+        expect(egress).toEqual([])
         await driver.close()
         expect(driver.isConnected()).toBe(false)
     } catch (error) {

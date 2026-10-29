@@ -1007,9 +1007,19 @@ before reading the Network Guard XPC status. Descriptor-based `fstatx_np` metada
 must explicitly prove ACL absence. These are service integration modules; their unit
 fixtures do not prove deployed service or network enforcement readiness.
 
-These primitives do not yet authorize a native production service. The Linux
-production flock guard is unchanged. Service identity, protected storage/IPC,
-independent network enforcement, signed packaging and Windows native acceptance
-must be integrated before enabling machine capabilities or an installer.
+`macNativeRuntime` now provides the explicit production bootstrap: verify the
+fixed protected configuration/directories, retain a kernel writer lock, verify the
+signed Network Guard and guardian, start Chrome under a distinct UID/GID, then
+irreversibly drop the runtime identity before CDP/HTTP/SOCKS input. The root
+`macBrowserGuardian` owns the original process group; a root-only durable crash
+latch prevents restarting after unconfirmed termination or guardian SIGKILL.
+Origin allowlists belong to the service's SOCKS proxy and are revoked on close.
+The existing Linux production flock and daemon-token paths are unchanged.
+
+Native service integration is still not accepted or enabled. Signed request
+issuance/daemon transport, launchd/SCM installation, full independent network
+containment, OS packaging and Windows worker admission remain required.
+A source-checkout build produces a platform-checked self-contained runtime bundle
+and file hash manifest, not an OS installer or a published CLI/native release.
 Reconsider this boundary only with real separate-identity access tests and
 upgrade/rollback evidence. Build/verification details: [native host](../packages/happy-cli/native/README.md).

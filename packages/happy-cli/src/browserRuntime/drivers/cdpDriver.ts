@@ -57,6 +57,8 @@ export type CdpDriverOptions = CdpDriverCommonOptions & ({
 })
 
 interface CdpDriverCommonOptions {
+    /** Service-owned egress policy; updated before navigation and revoked on close. */
+    setAllowedOrigins?: (origins: readonly string[]) => void
     /** Owned tabs (= agent windows) this driver keeps open at once; default DEFAULT_MAX_AGENT_WINDOWS. */
     maxAgentWindows?: number
     /** Runtime resource admission, also enforced for popups and in-flight windows. */
@@ -805,7 +807,7 @@ export class CdpDriver implements BrowserDriver {
     ): Promise<Observation> {
         return this.run(opts, async (_op, conn) => {
             const tab = this.requireTab(tabId)
-            tab.allowedOrigins = allowedOrigins
+            this.setTabOrigins(tab, allowedOrigins)
             let scope: { binding: RefBinding; objectId: string } | undefined
             if (opts.scopeRef) {
                 if (!tab.snapshot) throw staleRef('no snapshot for scopeRef')
@@ -902,7 +904,7 @@ export class CdpDriver implements BrowserDriver {
     screenshot(tabId: TabId, allowedOrigins: string[], opts: DriverOptions): Promise<ScreenshotResult> {
         return this.run(opts, async (_op, conn) => {
             const tab = this.requireTab(tabId)
-            tab.allowedOrigins = allowedOrigins
+            this.setTabOrigins(tab, allowedOrigins)
             const before = tab.generation
             const frames = await this.collectFrames(conn, tab)
             for (const frame of frames) {
@@ -1229,7 +1231,7 @@ export class CdpDriver implements BrowserDriver {
             targetId,
             sessionId,
             sessions: new Set([sessionId]),
-            allowedOrigins,
+            allowedOrigins: [...allowedOrigins],
             generation: 0,
             blockedMain: 0,
             stamps: new Map(),
@@ -1240,16 +1242,31 @@ export class CdpDriver implements BrowserDriver {
             pendingSetups: new Set(),
             goneListeners: new Set(),
         }
+        this.syncEgress(tab)
         this.tabs.set(tab.tabId, tab)
         this.tabsByTarget.set(targetId, tab)
         this.sessions.set(sessionId, { tab, targetId, isMain: true })
         return tab
     }
 
+    private syncEgress(changed?: TabState): void {
+        const origins = new Set<string>()
+        for (const tab of this.tabs.values()) if (tab !== changed) for (const origin of tab.allowedOrigins) origins.add(origin)
+        for (const origin of changed?.allowedOrigins ?? []) origins.add(origin)
+        this.options.setAllowedOrigins?.([...origins])
+    }
+
+    private setTabOrigins(tab: TabState, origins: string[]): void {
+        const previous = tab.allowedOrigins
+        tab.allowedOrigins = [...origins]
+        try { this.syncEgress(tab) } catch (error) { tab.allowedOrigins = previous; throw error }
+    }
+
     /** Removes every trace of a tab. Refs die with it. */
     private forgetTab(tab: TabState): void {
         if (this.tabs.get(tab.tabId) !== tab) return
         this.tabs.delete(tab.tabId)
+        this.syncEgress()
         this.tabsByTarget.delete(tab.targetId)
         for (const sessionId of tab.sessions) {
             this.sessions.delete(sessionId)
@@ -1489,7 +1506,7 @@ export class CdpDriver implements BrowserDriver {
         validate?: () => void,
     ): Promise<{ url: string; documentGeneration: number }> {
         if (!originAllowed(allowedOrigins, originOf(url))) throw originDenied('requested origin is not allowed')
-        tab.allowedOrigins = allowedOrigins
+        this.setTabOrigins(tab, allowedOrigins)
         let navigated = false
         let offs: Array<() => void> = []
         const loaded = new Promise<void>((resolve, reject) => {

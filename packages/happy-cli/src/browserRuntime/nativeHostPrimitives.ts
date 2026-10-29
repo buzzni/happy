@@ -12,6 +12,9 @@ interface NativeHostBinding {
     verifyRootOwned(fd: number): void
     processPrincipal(pid: number): string | null
     verifyServiceFile(fd: number, sid: string, privateFile: boolean): void
+    verifyPrivateDirectory(fd: number, uid: number): void
+    verifyPublicDirectory(fd: number, uid: number): void
+    dropMacIdentity(uid: number, gid: number): void
 }
 let binding: NativeHostBinding | undefined
 export function nativeHostBindingPath(): string {
@@ -61,6 +64,10 @@ export function verifyWindowsServiceFile(file: FileHandle, serviceSid: string, p
 /** Check every component without following symlinks. A privileged administrator
  * can still replace root-owned code; ordinary users cannot replace any ancestor. */
 export async function verifyMacServiceExecutable(path: string): Promise<void> {
+    await verifyMacRootPath(path, 'executable')
+}
+export async function verifyMacServiceFile(path: string): Promise<void> { await verifyMacRootPath(path, 'file') }
+async function verifyMacRootPath(path: string, kind: 'executable' | 'file' | 'directory'): Promise<void> {
     if (process.platform !== 'darwin' || !isAbsolute(path) || normalize(path) !== path || path.includes('\0')) throw new Error('NATIVE_PATH_UNTRUSTED')
     const components: string[] = []
     for (let current = path; ; current = dirname(current)) { components.unshift(current); if (current === '/') break }
@@ -68,11 +75,22 @@ export async function verifyMacServiceExecutable(path: string): Promise<void> {
         const file = await open(component, constants.O_RDONLY | constants.O_NOFOLLOW)
         try {
             const info = await file.stat()
-            if (component === path ? !info.isFile() || !(info.mode & 0o111) : !info.isDirectory()) throw new Error('NATIVE_PATH_UNTRUSTED')
+            if (component === path && kind !== 'directory' ? !info.isFile() || (kind === 'executable' && !(info.mode & 0o111)) : !info.isDirectory()) throw new Error('NATIVE_PATH_UNTRUSTED')
             native().verifyRootOwned(file.fd)
         } finally { await file.close() }
     }
 }
+
+/** Fixed service directories have root-protected parents and no inherited ACLs. */
+export async function verifyMacPrivateDirectory(path: string, uid: number, publicDirectory = false): Promise<void> {
+    if (!isAbsolute(path) || normalize(path) !== path || path.includes('\0')) throw new Error('NATIVE_PATH_UNTRUSTED')
+    await verifyMacRootPath(dirname(path), 'directory')
+    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+    try { if (publicDirectory) native().verifyPublicDirectory(file.fd, uid); else native().verifyPrivateDirectory(file.fd, uid) } finally { await file.close() }
+}
+
+/** Must run before parsing any browser response or opening the task API. */
+export function dropMacServiceIdentity(uid: number, gid: number): void { native().dropMacIdentity(uid, gid) }
 
 /** The service must own the parent directory. Hold this descriptor until runtime
  * shutdown: no helper lifetime, PID lock, heartbeat or env flag can replace it. */

@@ -39,6 +39,12 @@ const schema = z.object({
     /** A reassignment awaits verification: task API and broker closed until opened on the admin socket. */
     admissionHold: z.boolean().default(false),
     authMode: z.enum(['harness', 'production']),
+    nativeService: z.object({
+        platform: z.literal('darwin'), runtimeUid: z.number().int().min(200).max(0x7fffffff),
+        runtimeGid: z.number().int().min(200).max(0x7fffffff), browserUid: z.number().int().min(200).max(0x7fffffff),
+        browserGid: z.number().int().min(200).max(0x7fffffff), policyEpoch: z.number().int().positive().safe(),
+        proxyPort: z.number().int().min(1024).max(65535),
+    }).strict().optional(),
     machineId: id,
     workspaceId: id,
     profiles: z.array(profileSchema),
@@ -109,8 +115,16 @@ const schema = z.object({
     if (config.authMode === 'production') {
         if (config.schemaVersion !== 2) ctx.addIssue({ code: 'custom', path: ['schemaVersion'], message: 'production needs schema 2 (profile assignments); reinstall with abp-install' })
         if (config.trustedIssuers.length === 0) ctx.addIssue({ code: 'custom', path: ['trustedIssuers'], message: 'production needs at least one trusted issuer' })
-        if (!config.daemonTokenSha256) ctx.addIssue({ code: 'custom', path: ['daemonTokenSha256'], message: 'production needs the daemon token hash' })
+        if (!config.daemonTokenSha256 && !config.nativeService) ctx.addIssue({ code: 'custom', path: ['daemonTokenSha256'], message: 'production needs the daemon token hash' })
     }
+    if (config.nativeService && (config.authMode !== 'production' || config.tenancyMode !== 'dedicated' ||
+        config.nativeService.runtimeUid === config.nativeService.browserUid || config.runtimeHost !== '127.0.0.1' ||
+        config.daemonTokenSha256 !== undefined || config.brokerSocketGid !== undefined ||
+        config.brokerSocketPath !== '/Library/Application Support/SaycodeNative/run/broker.sock' ||
+        config.adminSocketPath !== '/Library/Application Support/SaycodeNative/run/admin.sock' ||
+        config.nativeService.proxyPort === config.runtimePort ||
+        config.profiles.some(p => p.cdpHttpUrl || p.instanceUrl || p.vncAddress)))
+        ctx.addIssue({ code: 'custom', path: ['nativeService'], message: 'native production requires isolated identities, fixed local sockets and signed broker requests' })
 })
 
 export interface RuntimeConfig extends Omit<z.infer<typeof schema>, 'authMode' | 'machineId' | 'workspaceId' | 'trustedIssuers' | 'maxSpacesPerProfile' | 'profileTombstones'> {

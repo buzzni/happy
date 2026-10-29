@@ -108,9 +108,10 @@ Native broker 모드의 별도 인증은 src/browserRuntime/nativeBrokerAuthoriz
 허가가 아니다. 발급자는 머신 관리 작업과 대화 등록·lineage에 각각 기존 권한
 검사를 적용해야 하며 session-user attestation만으로 이 서명을 발급하면 안 된다.
 
-현재 production runtime 진입점은 Linux 경로를 유지한다. native 서비스 진입점,
-issuer의 작업별 발급/daemon 전송, OS별 IPC ACL·서비스 설치·WFP와 서명 installer는
-아직 연결되지 않았다. 이 addon이나 broker 단위 테스트만으로 native 설치를
+production runtime은 Linux 경로와 명시적 macOS nativeService bootstrap을 구분한다.
+macOS bootstrap은 보호 확인·전용 브라우저 시작 후 runtime UID로 불가역 전환하고
+그 뒤에만 CDP/HTTP/SOCKS를 처리한다. issuer의 작업별 발급/daemon 전송,
+OS별 서비스 설치·WFP 통합과 서명 installer는 아직 연결되지 않았다. 이 addon이나 broker 단위 테스트만으로 native 설치를
 활성화하지 않는다. 실제 전용 identity/서비스/서명 패키지 수락 때 이 경계를 재검토한다.
 
 ## Windows 전용 서비스 custody 호스트
@@ -160,3 +161,49 @@ cl /nologo /std:c11 /W4 /WX /O2 native\windowsBrowserFence.c /Fe:windowsBrowserF
 다른 신원의 시스템 서비스를 통한 간접 통신, raw ICMP/외부 NIC, BFE 재시작/OS reboot,
 실제 Chrome·privilege 제한·worker Job·runtime monitor 통합은 아직 검증되지 않았다.
 CLI `verified`는 필터 구조 조회이며 제품 전체 isolation/ready 증명이 아니다.
+
+
+## macOS production bootstrap과 guardian
+
+`macNativeRuntime.ts`는 고정 root 소유 설정, 보호된 runtime state(0700), IPC
+디렉터리(0755), 프로세스 내부 kernel writer lock을 확인한다. root에서 실행하는
+작은 `macBrowserGuardian.c`가 별도 브라우저 UID/GID/커널 그룹으로 Chrome을
+실행한다. Chrome·guardian은 지정한 서명을 검사한다. Network Guard의 signed XPC
+상태가 실제 정책 UID/epoch와 일치해야 시작하며, status 파일/구형 필터/일반 Chrome
+경로로 대신 성공시키지 않는다. 원본 프로필이나 공개 CDP 포트를 사용하지 않는다.
+
+`browser-guardian UID GID HOME RECOVERY_DIRECTORY EXECUTABLE [ARGS...]`는 root
+전용이며 setuid binary가 아니다. production 복구 디렉터리는
+`/Library/Application Support/SaycodeNative/guardian-state`(root:wheel 0700)이다.
+root 소유 디렉터리·ACL·symlink 검사 후 `owner.lock`의 kernel flock을 잡고, `active`
+기록을 exclusive create + file/directory fsync로 저장한 뒤 fork한다. 정상 종료와
+원래 그룹의 drain, 새 UID 프로세스가 남지 않았음을 확인한 경우에만 기록을 지운다.
+부모 runtime crash는 원래 그룹을 회수한다. guardian 자체 SIGKILL·그룹 이탈·관측
+실패는 기록을 남기고 다음 시작을 거부한다. stale 기록을 자동 삭제하는 복구는 없다.
+관리자가 종료와 보호 상태를 독립 확인하기 전에는 설치/재시작이 이를 지우면 안 된다.
+원래 leader를 reap하지 않은 채 process group을 관측하므로 PID 재사용 대상으로
+종료 신호를 보내지 않는다. 이 설계는 모든 OS 위임 프로세스의 kernel containment를
+증명하지 않으며, 이를 확인하지 않은 전체 isolation 수락은 계속 미완료다.
+
+소스 체크아웃에서:
+```sh
+npm run build:mac-browser-guardian
+sudo node scripts/mac-browser-guardian.check.cjs native/darwin-arm64/browser-guardian UID GID /absolute/path/browser-host.node
+npm run bundle:browser-native-runtime -- --out /absolute/new/output-directory
+```
+검사는 제공한 별도 테스트 UID/GID만 사용하며 루트 제어 EOF, exec 실패, 그룹 이탈,
+runtime SIGKILL, custody·root 복귀 거부, guardian SIGKILL의 영속 차단, 중복 시작,
+쓰기 가능한/symlink 복구 경로 거부를 실측한다. macOS arm64에서 8건 통과했다.
+검증 스크립트가 만든 임시 기록 정리는 테스트 fixture에만 해당하며 제품 복구가 아니다.
+
+`build-native-browser-runtime.mjs`는 현재 아키텍처의 두 Mach-O 입력을 검사하고
+`dist/runtime.mjs`, `native/darwin-*/browser-host.node`, `bin/browser-guardian`과
+각 파일의 size/SHA-256 manifest를 새 디렉터리에 쓴다. npm CLI 패키지와 독립된
+OS 설치기 입력이다. 기존 output을 덮어쓰지 않으며 Windows 미완성 실행부를
+패키징하지 않는다. Node·Chrome·Network Guard, OS installer/signing/launchd
+provisioning 및 등록 후 인증된 설정 전송은 이 빌드에 포함되지 않는다. 따라서
+이 묶음의 생성은 설치 지원/배포/실제 서비스 준비 완료의 증거가 아니다.
+
+재검토: 실제 필터 교체, 별도 runtime 신원의 Chrome 기동, guardian 강제 종료 후
+사람의 명시적 복구, OS 위임 통신, installer upgrade/rollback을 검증한 뒤 위 미완료
+경계를 갱신한다. launchd KeepAlive로 종료 불명 상태를 반복 실행하지 않는다.

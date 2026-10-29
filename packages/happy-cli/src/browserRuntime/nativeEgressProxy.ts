@@ -24,6 +24,7 @@ export type NativeEgressProxy = {
     readonly server: Server
     /** Replaces the allowed origins; closes tunnels to endpoints no longer allowed. */
     setAllowedOrigins(origins: readonly string[]): void
+    close(): Promise<void>
 }
 
 const HOSTNAME = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/
@@ -93,6 +94,8 @@ export function createNativeEgressProxy(options: { lookup?: NativeEgressLookup; 
     const connect = options.connect ?? createConnection
     let allowed = new Set<string>()
     const tunnels = new Map<string, Set<Socket>>()
+    const clients = new Set<Socket>()
+    let closing: Promise<void> | undefined
 
     const track = (key: string, client: Socket) => {
         const set = tunnels.get(key) ?? new Set<Socket>()
@@ -101,6 +104,9 @@ export function createNativeEgressProxy(options: { lookup?: NativeEgressLookup; 
     }
 
     const server = createServer((client) => {
+        if (closing) { client.destroy(); return }
+        clients.add(client)
+        client.once('close', () => clients.delete(client))
         let buffer = Buffer.alloc(0)
         let stage: 'greeting' | 'request' | 'pending' = 'greeting'
         let upstream: Socket | undefined
@@ -178,7 +184,16 @@ export function createNativeEgressProxy(options: { lookup?: NativeEgressLookup; 
 
     return {
         server,
+        close() {
+            return closing ??= new Promise<void>((resolve, reject) => {
+                allowed.clear()
+                for (const client of clients) client.destroy()
+                if (!server.listening) { resolve(); return }
+                server.close(error => error ? reject(error) : resolve())
+            })
+        },
         setAllowedOrigins(origins) {
+            if (closing && origins.length) throw new Error('egress proxy closed')
             let next = new Set<string>()
             try { next = endpointsFromOrigins(origins) } finally {
                 // Invalid input fails closed: nothing stays allowed.

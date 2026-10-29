@@ -486,7 +486,7 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
             recoveryTimer.unref()
         }
     }
-    if (!options.server) await listenOnSocket(server, options.socketPath, 0o660, options.socketGid)
+    if (!options.server) await listenOnSocket(server, options.socketPath, options.nativeAuthorization ? 0o666 : 0o660, options.socketGid)
     void replayRevocations().then(sweepOrphans).catch(() => log('broker orphan recovery incomplete; retrying'))
     const orphanTimer = setInterval(() => {
         void sweepOrphans().catch(() => log('broker orphan sweep incomplete; retrying'))

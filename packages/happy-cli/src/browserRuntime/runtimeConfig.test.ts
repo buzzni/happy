@@ -18,6 +18,19 @@ const valid = () => ({
 })
 
 describe('parseRuntimeConfig', () => {
+    it('admits native production only with distinct service identities, local API and signed broker authority', () => {
+        const nativeService = { platform: 'darwin', runtimeUid: 472, runtimeGid: 472, browserUid: 471, browserGid: 471, policyEpoch: 1, proxyPort: 18789 }
+        const input = { ...valid(), daemonTokenSha256: undefined, runtimeHost: '127.0.0.1', nativeService,
+            brokerSocketPath: '/Library/Application Support/SaycodeNative/run/broker.sock', adminSocketPath: '/Library/Application Support/SaycodeNative/run/admin.sock' }
+        expect(parseRuntimeConfig(input).nativeService).toEqual(nativeService)
+        for (const change of [{ authMode: 'harness' }, { runtimeHost: '0.0.0.0' }, { daemonTokenSha256: 'a'.repeat(64) },
+            { nativeService: { ...nativeService, runtimeUid: 471 } }, { nativeService: { ...nativeService, browserUid: 0 } },
+            { nativeService: { ...nativeService, platform: 'win32' } },
+            { profiles: [{ ...valid().profiles[0], cdpHttpUrl: 'http://127.0.0.1:9222' }] }]) {
+            expect(() => parseRuntimeConfig({ ...input, ...change })).toThrow()
+        }
+        expect(() => parseRuntimeConfig({ ...valid(), daemonTokenSha256: undefined })).toThrow(/daemon token/)
+    })
     it('accepts a production config and fills documented defaults', () => {
         const config = parseRuntimeConfig(valid())
         expect(config).toMatchObject({

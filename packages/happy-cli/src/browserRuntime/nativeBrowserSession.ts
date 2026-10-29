@@ -31,6 +31,8 @@ export interface NativeBrowserSessionOptions {
     terminate(): Promise<void>
     checkIntervalMs?: number
     checkTimeoutMs?: number
+    setAllowedOrigins?: (origins: readonly string[]) => void
+    maxAgentWindows?: number
 }
 export interface NativeBrowserSession {
     driver: CdpDriver
@@ -68,7 +70,7 @@ export async function openNativeBrowserSession(options: NativeBrowserSessionOpti
     let monitor: ReturnType<typeof setInterval> | undefined
     let resolveStopped!: (result: { terminated: boolean }) => void
     const stopped = new Promise<{ terminated: boolean }>(resolve => { resolveStopped = resolve })
-    const driver = new CdpDriver({ connectPipe: async () => {
+    const driver = new CdpDriver({ setAllowedOrigins: options.setAllowedOrigins, maxAgentWindows: options.maxAgentWindows, connectPipe: async () => {
         if (closed || consumed) throw unavailable()
         consumed = true
         await check()

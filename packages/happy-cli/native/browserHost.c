@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <sys/sysctl.h>
 #include <libproc.h>
+#include <grp.h>
 #endif
 
 static napi_value error(napi_env env, const char *code) {
@@ -135,6 +136,53 @@ static napi_value verify_root_owned(napi_env env, napi_callback_info info) {
         (!S_ISREG(metadata.st_mode) && !S_ISDIR(metadata.st_mode)) ||
         (S_ISREG(metadata.st_mode) && metadata.st_nlink != 1))
         return error(env, "NATIVE_PATH_UNTRUSTED");
+    napi_value result; napi_get_undefined(env, &result); return result;
+#endif
+}
+
+static int pair_arguments(napi_env env, napi_callback_info info, int values[2]) {
+    size_t count = 3; napi_value args[3];
+    if (napi_get_cb_info(env, info, &count, args, NULL, NULL) != napi_ok || count != 2) return 0;
+    for (int i = 0; i < 2; ++i) {
+        double n;
+        if (napi_get_value_double(env, args[i], &n) != napi_ok || !(n >= 0 && n <= INT_MAX) || n != (int)n) return 0;
+        values[i] = (int)n;
+    }
+    return 1;
+}
+
+static napi_value verify_owned_directory(napi_env env, napi_callback_info info, int private_data) {
+    int values[2];
+    if (!pair_arguments(env, info, values) || values[1] < 200) return error(env, "NATIVE_INVALID_ARGUMENT");
+#ifdef _WIN32
+    (void)private_data;
+    return error(env, "NATIVE_PATH_VERIFIER_UNSUPPORTED");
+#else
+    struct stat metadata;
+    filesec_t security = filesec_init();
+    if (!security) return error(env, "NATIVE_PATH_UNTRUSTED");
+    int observed = fstatx_np(values[0], &metadata, security), present = -1;
+    int queried = filesec_query_property(security, FILESEC_ACL, &present);
+    filesec_free(security);
+    if (observed || queried || present || !S_ISDIR(metadata.st_mode) ||
+        metadata.st_uid != (uid_t)values[1] || (metadata.st_mode & 07777) != (private_data ? 0700 : 0755))
+        return error(env, "NATIVE_PATH_UNTRUSTED");
+    napi_value result; napi_get_undefined(env, &result); return result;
+#endif
+}
+static napi_value verify_private_directory(napi_env env, napi_callback_info info) { return verify_owned_directory(env, info, 1); }
+static napi_value verify_public_directory(napi_env env, napi_callback_info info) { return verify_owned_directory(env, info, 0); }
+
+static napi_value drop_mac_identity(napi_env env, napi_callback_info info) {
+    int values[2];
+    if (!pair_arguments(env, info, values) || values[0] < 200 || values[1] < 200) return error(env, "NATIVE_INVALID_ARGUMENT");
+#ifdef _WIN32
+    return error(env, "NATIVE_IDENTITY_UNSUPPORTED");
+#else
+    uid_t uid = (uid_t)values[0]; gid_t gid = (gid_t)values[1], groups[16];
+    if (getuid() != 0 || geteuid() != 0 || setgroups(1, &gid) || setgid(gid) || setuid(uid) ||
+        getuid() != uid || geteuid() != uid || getgid() != gid || getegid() != gid ||
+        getgroups(16, groups) != 1 || groups[0] != gid) return error(env, "NATIVE_IDENTITY_DROP_FAILED");
     napi_value result; napi_get_undefined(env, &result); return result;
 #endif
 }
@@ -284,8 +332,11 @@ static napi_value initialize(napi_env env, napi_value exports) {
         {"verifyRootOwned", NULL, verify_root_owned, NULL, NULL, NULL, napi_default, NULL},
         {"processPrincipal", NULL, process_principal, NULL, NULL, NULL, napi_default, NULL},
         {"verifyServiceFile", NULL, verify_service_file, NULL, NULL, NULL, napi_default, NULL},
+        {"verifyPrivateDirectory", NULL, verify_private_directory, NULL, NULL, NULL, napi_default, NULL},
+        {"verifyPublicDirectory", NULL, verify_public_directory, NULL, NULL, NULL, napi_default, NULL},
+        {"dropMacIdentity", NULL, drop_mac_identity, NULL, NULL, NULL, napi_default, NULL},
     };
-    if (napi_define_properties(env, exports, 6, properties) != napi_ok) return error(env, "NATIVE_INIT_FAILED");
+    if (napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties) != napi_ok) return error(env, "NATIVE_INIT_FAILED");
     return exports;
 }
 NAPI_MODULE(NODE_GYP_MODULE_NAME, initialize)

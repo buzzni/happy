@@ -57,6 +57,7 @@ import { startRuntimeServer } from './server'
 import { TaskStore, RECLAIMING_SPACE_RESERVE } from './taskStore'
 import { ViewerProxy, type ViewerEndpoint } from './viewerProxy'
 import { holdsWriterFlock } from './writerFlock'
+import { bootstrapMacNativeRuntime } from './macNativeRuntime'
 
 /** Keep admission units and their last-safe fallbacks independent of space preferences. */
 export function createProfileResourceQuota(options: {
@@ -305,6 +306,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     const stateDir = requiredEnv('ABP_STATE_DIR')
     const config = process.env.ABP_CONFIG_FILE ? loadRuntimeConfig(process.env.ABP_CONFIG_FILE) : undefined
     const production = config?.authMode === 'production'
+    const native = config?.nativeService ? await bootstrapMacNativeRuntime(config, stateDir) : undefined
     // Secrets the runtime UID may not be able to read are read before dropping root.
     const vncPassword = loadVncPassword()
     const harnessKeys = process.env.ABP_KEYS_FILE ? loadKeys(process.env.ABP_KEYS_FILE, config ? ['agentKey'] : undefined) : undefined
@@ -339,7 +341,8 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     const keys: AuthKeys = production || !harnessKeys
         ? { agentKey: await loadOrCreateAgentKey(stateDir) }
         : harnessKeys
-    const profiles = config ? configProfiles(config) : JSON.parse(requiredEnv('ABP_PROFILES')) as ProfileConfig[]
+    const profiles: ProfileConfig[] = native && config ? config.profiles.map(profile => ({ profileId: profile.profileId as ProfileId, cdpHttpUrl: '', instanceUrl: '' }))
+        : config ? configProfiles(config) : JSON.parse(requiredEnv('ABP_PROFILES')) as ProfileConfig[]
     const host = config?.runtimeHost ?? process.env.ABP_RUNTIME_HOST ?? '0.0.0.0'
     const port = config?.runtimePort ?? Number(process.env.ABP_RUNTIME_PORT ?? '8787')
     const windows = maxAgentWindows(config)
@@ -353,7 +356,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     // D9: the entrypoint holds an exclusive kernel flock (flock -n -F) before node
     // starts. Production refuses to open the store or CDP without it.
     const flockPath = process.env.ABP_WRITER_FLOCK
-    const flockHeld = flockPath ? await holdsWriterFlock(flockPath) : false
+    const flockHeld = native ? true : flockPath ? await holdsWriterFlock(flockPath) : false
     if (production && !flockHeld) throw new Error('ABP writer flock is not held by this process (start through the image entrypoint)')
     if (!flockHeld) log('writer flock not verified; relying on the heartbeat lease only')
 
@@ -387,10 +390,10 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
         quotaTimer.unref()
     }
     for (const profile of profiles) {
-        drivers.set(profile.profileId, new CdpDriver({ browserWsUrl: '', browserInstanceIdProvider: instanceIdProvider(profile), maxAgentWindows: windows, ...(config?.adaptiveSpaceQuota ? { windowLimit: quotas.get(profile.profileId)!.windowLimit } : {}) }))
+        drivers.set(profile.profileId, native?.session.driver ?? new CdpDriver({ browserWsUrl: '', browserInstanceIdProvider: instanceIdProvider(profile), maxAgentWindows: windows, ...(config?.adaptiveSpaceQuota ? { windowLimit: quotas.get(profile.profileId)!.windowLimit } : {}) }))
     }
     // Connect before recovery so it can compare browser instance ids.
-    const { pending: connecting } = await connectAtStart(profiles.map((profile) => ({ profileId: profile.profileId, connect: () => connectWithRetry(drivers.get(profile.profileId)!, profile, log) })),
+    const { pending: connecting } = await connectAtStart((native ? [] : profiles).map((profile) => ({ profileId: profile.profileId, connect: () => connectWithRetry(drivers.get(profile.profileId)!, profile, log) })),
         config?.tenancyMode === 'shared' ? SHARED_START_CONNECT_MS : undefined)
     for (const profileId of connecting.keys()) log(`profile=${profileId} browser not connected at start; serving the other profiles meanwhile`)
 
@@ -404,8 +407,17 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
             spaceResourceQuota: (id: ProfileId) => quotas.get(id)!.readSpaces() } : {}),
         spaceIdleReclaimMs: config?.spaceIdleReclaimMs ?? (Number.isFinite(harnessIdleMs) ? harnessIdleMs : undefined) })
 
+    let shuttingDown = false
+    if (native) void native.session.stopped.then(async () => {
+        if (shuttingDown) return
+        shuttingDown = true
+        try { await runtime.onDriverDisconnected(profiles[0].profileId); await native.close() }
+        finally { process.exit(1) }
+    })
+
     for (const profile of profiles) {
         const driver = drivers.get(profile.profileId)!
+        if (native) continue // A native lifetime never reconnects to a replacement process.
         // One recovery chain per profile: a close during reconnect must not start a
         // second chain that races the first over the same tasks.
         let recovering: Promise<void> | undefined
@@ -521,6 +533,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     let admissionOpen = !config?.admissionHold
     if (!admissionOpen) log('admission on hold: a profile reassignment awaits verification (abp-stack)')
     const admit = async (): Promise<void> => {
+        await native?.session.check()
         // Only the cleanup, not the whole task recovery: the daemon's broker calls time out after 10 s.
         await runtime.assignmentsSettled()
         if (!admissionOpen) throw new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'The Runtime admits no work while a profile reassignment is verified', true)
@@ -531,10 +544,10 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     // Before the task API: grants of revocations a crash interrupted must be denied
     // from the first request (the broker replays them in the background).
     let broker: Broker | undefined
-    if (config?.daemonTokenSha256) {
+    if (config && (config.daemonTokenSha256 || native)) {
         broker = await startBroker({
             socketPath: config.brokerSocketPath, socketGid: config.brokerSocketGid, server: boundBroker, stateDir,
-            daemonTokenSha256: config.daemonTokenSha256,
+            ...(native ? { nativeAuthorization: true as const } : { daemonTokenSha256: config.daemonTokenSha256 }),
             orphanTtlMs: config.brokerOrphanTtlMs,
             identity: { machineId: config.machineId, workspaceId: config.workspaceId },
             profiles: config.profilePrincipals,
@@ -644,6 +657,8 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     log(`listening api=${server.url} mode=${config?.authMode ?? 'harness'} admin=${admin.port ?? 'socket'} broker=${broker ? 'socket' : 'off'} flock=${flockHeld} profiles=${profiles.length} viewer=${viewer ? vncEndpoints.size : 'off'}`)
 
     const shutdown = async () => {
+        if (shuttingDown) return
+        shuttingDown = true
         clearInterval(sweep)
         clearInterval(retention)
         clearInterval(reclaimTimer)
@@ -655,6 +670,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
         await attention.flush().catch(() => undefined)
         attention.close()
         for (const driver of drivers.values()) await driver.close()
+        await native?.close()
         await store.close()
         process.exit(0)
     }
