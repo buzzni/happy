@@ -202,7 +202,7 @@ jobs:
                   path: packages/happy-cli/native/win32-x64
 
             - name: Prepare publish artifact
-              run: node packages/happy-cli/scripts/prepare-publish-package.cjs --out "$RUNNER_TEMP/happy-cli-publish"
+              run: node packages/happy-cli/scripts/prepare-publish-package.cjs --out "$RUNNER_TEMP/happy-cli-publish" --require-browser-hosts
 
             - name: Pack publish artifact
               id: pack_publish_artifact
@@ -214,7 +214,7 @@ jobs:
                   echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
 
             - name: Guard publish artifact
-              run: node packages/happy-cli/scripts/guard-publish-artifact.cjs "${{ steps.pack_publish_artifact.outputs.tarball }}" --install-smoke
+              run: node packages/happy-cli/scripts/guard-publish-artifact.cjs "${{ steps.pack_publish_artifact.outputs.tarball }}" --install-smoke --require-browser-hosts
 
             - name: Publish to npm
               # Publish the exact tarball the guard verified. Anything that

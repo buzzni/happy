@@ -4,6 +4,13 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// Personal desktop AI browser addons. Built per platform only by the publish workflow; packed when present.
+const BROWSER_HOSTS = [
+    'native/darwin-arm64/browser-host.node',
+    'native/darwin-x64/browser-host.node',
+    'native/win32-x64/browser-host.node'
+];
+
 const BUNDLED_DEPENDENCIES = [
     '@slopus/happy-wire',
     '@buzzni/saycode-cli',
@@ -14,7 +21,7 @@ const BUNDLED_DEPENDENCIES = [
 ];
 
 function parseArgs(argv) {
-    const args = { out: undefined, withoutBrowserHosts: false };
+    const args = { out: undefined, requireBrowserHosts: false };
 
     for (let index = 0; index < argv.length; index += 1) {
         const arg = argv[index];
@@ -24,9 +31,9 @@ function parseArgs(argv) {
             index += 1;
         } else if (arg.startsWith('--out=')) {
             args.out = arg.slice('--out='.length);
-        } else if (arg === '--without-browser-hosts') {
-            // Smoke tests only: the per-platform addons exist only in the publish workflow.
-            args.withoutBrowserHosts = true;
+        } else if (arg === '--require-browser-hosts') {
+            // The publish workflow: every platform's addon must be packed.
+            args.requireBrowserHosts = true;
         } else {
             throw new Error(`Unknown argument: ${arg}`);
         }
@@ -99,10 +106,11 @@ function preparePublishPackage() {
         copyPath(path.join(cliDir, 'README.md'), path.join(outputDir, 'README.md'));
     }
 
-    const isBrowserHost = (entry) => /^native\/[^/]+\/browser-host\.node$/.test(entry);
-    if (args.withoutBrowserHosts) {
-        cliPackage.files = (cliPackage.files || []).filter((entry) => !isBrowserHost(entry));
+    const browserHosts = BROWSER_HOSTS.filter((entry) => fs.existsSync(path.join(cliDir, entry)));
+    if (args.requireBrowserHosts && browserHosts.length !== BROWSER_HOSTS.length) {
+        throw new Error(`Required publish input is missing: ${BROWSER_HOSTS.filter((entry) => !browserHosts.includes(entry)).join(', ')}`);
     }
+    cliPackage.files = [...(cliPackage.files || []), ...browserHosts];
 
     for (const entry of cliPackage.files || []) {
         if (entry === 'package.json') {

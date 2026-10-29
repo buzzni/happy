@@ -162,26 +162,26 @@ afterEach(() => {
 })
 
 describe('guard-publish-artifact', () => {
-    it.each(['darwin-arm64', 'darwin-x64', 'win32-x64'])('rejects a tarball missing the %s personal browser host', (platform) => {
+    it.each(['darwin-arm64', 'darwin-x64', 'win32-x64'])('rejects publication missing the %s personal browser host', (platform) => {
         const tarball = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56', { omitBrowserHost: platform })
-        const result = spawnSync(process.execPath, [GUARD_SCRIPT, tarball], { encoding: 'utf8', timeout: 30_000 })
+        const result = spawnSync(process.execPath, [GUARD_SCRIPT, tarball, '--require-browser-hosts'], { encoding: 'utf8', timeout: 30_000 })
         expect(result.status).toBe(1)
         expect(result.stderr).toContain(`package/native/${platform}/browser-host.node`)
     })
 
-    it.each(['darwin-arm64', 'win32-x64'])('rejects a %s browser host that is not an executable image', (platform) => {
+    it('accepts a local or smoke artifact without browser hosts unless publication requires them', () => {
+        const tarball = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56', { withoutBrowserHosts: true })
+        expect(spawnSync(process.execPath, [GUARD_SCRIPT, tarball], { encoding: 'utf8', timeout: 30_000 }).status).toBe(0)
+        expect(spawnSync(process.execPath, [GUARD_SCRIPT, tarball, '--require-browser-hosts'], { encoding: 'utf8', timeout: 30_000 }).status).toBe(1)
+        const complete = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56')
+        expect(spawnSync(process.execPath, [GUARD_SCRIPT, complete, '--require-browser-hosts'], { encoding: 'utf8', timeout: 30_000 }).status).toBe(0)
+    })
+
+    it.each(['darwin-arm64', 'win32-x64'])('always rejects a packed %s browser host that is not an executable image', (platform) => {
         const tarball = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56', { stubBrowserHost: platform })
         const result = spawnSync(process.execPath, [GUARD_SCRIPT, tarball], { encoding: 'utf8', timeout: 30_000 })
         expect(result.status).toBe(1)
         expect(result.stderr).toContain(`native/${platform}/browser-host.node`)
-    })
-
-    it('accepts a smoke artifact prepared without browser hosts only when asked to', () => {
-        const tarball = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56', { withoutBrowserHosts: true })
-        expect(spawnSync(process.execPath, [GUARD_SCRIPT, tarball, '--without-browser-hosts'], { encoding: 'utf8', timeout: 30_000 }).status).toBe(0)
-        expect(spawnSync(process.execPath, [GUARD_SCRIPT, tarball], { encoding: 'utf8', timeout: 30_000 }).status).toBe(1)
-        const withHosts = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56')
-        expect(spawnSync(process.execPath, [GUARD_SCRIPT, withHosts, '--without-browser-hosts'], { encoding: 'utf8', timeout: 30_000 }).status).toBe(1)
     })
 
     it('rejects a tarball missing the wire crypto runtime dependency', () => {

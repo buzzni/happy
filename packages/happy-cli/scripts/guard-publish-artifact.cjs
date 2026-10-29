@@ -48,14 +48,14 @@ const BROWSER_HOSTS = [
 const MAX_PRINTED_ERRORS = 30;
 
 function parseArgs(argv) {
-    const args = { artifact: undefined, installSmoke: false, withoutBrowserHosts: false };
+    const args = { artifact: undefined, installSmoke: false, requireBrowserHosts: false };
 
     for (const arg of argv) {
         if (arg === '--install-smoke') {
             args.installSmoke = true;
-        } else if (arg === '--without-browser-hosts') {
-            // Smoke-test artifacts only (prepare-publish-package.cjs --without-browser-hosts). Never for publication.
-            args.withoutBrowserHosts = true;
+        } else if (arg === '--require-browser-hosts') {
+            // The publish workflow: every platform's addon must be packed.
+            args.requireBrowserHosts = true;
         } else if (!args.artifact) {
             args.artifact = arg;
         } else {
@@ -138,16 +138,13 @@ function readTarJson(tarball, entry) {
     return JSON.parse(extractTarEntry(tarball, entry));
 }
 
-function collectBrowserHostErrors(tarball, entries, withoutBrowserHosts) {
+/** Every packed addon must be a real executable image; publication also needs all of them. */
+function collectBrowserHostErrors(tarball, entries, requireBrowserHosts) {
     const entrySet = new Set(entries);
     const errors = [];
     for (const { entry, magic } of BROWSER_HOSTS) {
-        if (withoutBrowserHosts) {
-            if (entrySet.has(entry)) errors.push(`smoke artifact unexpectedly ships ${entry}`);
-            continue;
-        }
         if (!entrySet.has(entry)) {
-            errors.push(`tarball is missing bundled file: ${entry}`);
+            if (requireBrowserHosts) errors.push(`tarball is missing bundled file: ${entry}`);
             continue;
         }
         const head = childProcess.spawnSync('tar', ['-xOzf', tarball, entry], { maxBuffer: 64 * 1024 * 1024 }).stdout;
@@ -413,7 +410,7 @@ function guardPublishArtifact() {
         const errors = [
             ...collectMetadataErrors(packageJson),
             ...collectTarErrors(entries),
-            ...collectBrowserHostErrors(packed.tarball, entries, args.withoutBrowserHosts)
+            ...collectBrowserHostErrors(packed.tarball, entries, args.requireBrowserHosts)
         ];
 
         if (errors.length > 0) {
