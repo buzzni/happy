@@ -3,6 +3,7 @@ import nacl from 'tweetnacl';
 import fixture from './fixtures/sessionOwnerRelay.v1.json';
 import { verifyOwnership } from './sessionOwnership';
 import { SessionMessageSchema } from './messages';
+import { canonicalOwnerRelayJson } from './sessionOwnerRelayJson';
 import { rotationBase64url, rotationDecodeBinary } from './sharedMachineRotation';
 import { OwnerRelayRequestSchema, OwnerRelayReplySchema } from './sessionOwnerRelay';
 import { signOwnerRelayRequest, signOwnerRelayReply, verifyOwnerRelayRequest, verifyOwnerRelayReply,
@@ -196,6 +197,30 @@ describe('H1-R-01 persisted message localId compatibility', () => {
         const aiAuthSelection = { kind: 'claude-setup-token', managedAccountId, groupScope, credentialGeneration: 1, bindingGrant: 'abc.def' };
         const spawnOptions = { ...spawn.request.payload.spawnOptions, aiAuthSelection };
         expect(OwnerRelayRequestSchema.safeParse({ ...spawn.request, payload: { ...spawn.request.payload, spawnOptions } }).success).toBe(ok);
+    });
+    // H1-R-06/07: the prompt receipt carries the stored row's own ID, and only a body-verified receipt is a success.
+    it.each(['legacy message id', 'x'.repeat(129)])('prompt storage carries the stored row ID (%s)', messageId => {
+        const prompt = vectorFor('prompt-own-session');
+        expect(OwnerRelayReplySchema.safeParse({ ...prompt.reply, storage: { ...prompt.reply.storage, messageId } }).success).toBe(true);
+    });
+    it('read snapshot keeps an empty machine observation from the existing session list', async () => {
+        const { reply } = await pair(1);
+        if (reply.result !== 'allowed' || reply.operation !== 'read-session') throw new Error('Expected read fixture');
+        expect(OwnerRelayReplySchema.safeParse({ ...reply, sessionView: { ...reply.sessionView, snapshot: { ...reply.sessionView.snapshot, machineId: '' } } }).success).toBe(true);
+    });
+    it('refuses a correctly signed prompt reply whose body was not verified', async () => {
+        const { request, reply } = await pair(2);
+        if (reply.result !== 'allowed' || reply.operation !== 'prompt-own-session') throw new Error('Expected prompt fixture');
+        const { signature: _, ...body } = { ...reply, storage: { ...reply.storage, bodyVerified: false } };
+        expect(OwnerRelayReplySchema.safeParse({ ...body, signature: reply.signature }).success).toBe(false);
+        // Signed over the same domain-separated canonical bytes, bypassing schema checks, so only the success rule can refuse it.
+        const bytes = new TextEncoder().encode('saycode-owner-relay/v1\u0000reply\u0000' + canonicalOwnerRelayJson(body));
+        const signed = { ...body, signature: rotationBase64url(nacl.sign.detached(bytes, desktop.secretKey)) };
+        expect(await verifyOwnerRelayReply(signed, request, contact, now)).toBe(false);
+        // Positive control: the same bytes with bodyVerified:true verify.
+        const good = { ...body, storage: { ...body.storage, bodyVerified: true } };
+        const goodBytes = new TextEncoder().encode('saycode-owner-relay/v1\u0000reply\u0000' + canonicalOwnerRelayJson(good));
+        expect(await verifyOwnerRelayReply({ ...good, signature: rotationBase64url(nacl.sign.detached(goodBytes, desktop.secretKey)) }, request, contact, now)).toBe(true);
     });
     it.each(['기존 메시지', 'existing message', 'x'.repeat(129)])('keeps prompt and storage ID restrictions for %s', localId => {
         expect(OwnerRelayRequestSchema.safeParse({ ...fixture.vectors[2].request, localId }).success).toBe(false);

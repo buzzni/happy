@@ -49,7 +49,7 @@ const activity = z.object({ state: z.enum(['known', 'none', 'unknown']), title: 
     observedAt: relayCount.nullable(),
 }).strict();
 export const OwnerRelaySnapshotSchema = z.object({ active: z.boolean().nullable(), thinking: z.boolean().nullable(),
-    runtimeId: persistedId.nullable().optional(), machineId: persistedId.nullable().optional(),
+    runtimeId: persistedId.nullable().optional(), machineId: text.nullable().optional(), // '' is the session list's "not observed" (H1-R-06)
     agentControlledByUser: z.boolean().optional(), pendingPermissionRequests: z.array(OwnerRelayPendingPermissionSchema).optional(),
     activity: activity.optional(),
 }).strict();

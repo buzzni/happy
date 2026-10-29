@@ -161,3 +161,12 @@ pending permission `requestId`, activity `sourceMessageId`, snapshot `runtimeId`
 - H1-R-05: `aiAuthSelection`(`claude-setup-token`)의 `managedAccountId`·`groupScope`는 daemon `sessionEnv.ts`와 같은
   형식(소문자 UUID, `[A-Za-z0-9_-]{1,128}`)만 받는다. daemon이 거부할 선택을 wire가 받지 않게 하기 위해서다.
 - 회귀: 위 경우 7건을 추가했다(수정 전 7건 실패).
+
+## H1-R-06·07 교차 리뷰 반영 (2026-10-30)
+
+- H1-R-06: prompt 저장 receipt의 `storage.messageId`는 저장된 행 자신의 ID라서 `persistedId`를 쓴다. 그래서 read
+  이벤트 ID와 같은 계약을 따른다. snapshot `machineId`는 기존 session list가 "관측 안 됨"을 `''`로 주므로
+  일반 문자열을 받는다.
+- H1-R-07: 성공 prompt 응답은 `bodyVerified: true`만 허용한다. 본문 불일치는 성공이 아니라 unknown 등의 실패
+  응답으로 표현한다. 서명 바이트를 직접 만든 false receipt도 응답 검증에서 거부한다. 회귀 테스트는 true 대조를
+  포함한다(수정을 되돌리면 실패하는 것도 확인).

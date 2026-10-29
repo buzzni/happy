@@ -57,8 +57,9 @@ const results = [
         relation: z.enum(['self', 'descendant', 'own-sibling', 'other', 'unknown']), reason: z.string().optional() }).strict()).max(100) },
     { operation: z.literal('read-session'), sessionView: z.object({ sessionId: id, cursor: z.string().nullable(),
         snapshot: OwnerRelaySnapshotSchema, events: z.array(OwnerRelayReadEventSchema).max(50), truncated: z.boolean() }).strict() },
-    { operation: z.literal('prompt-own-session'), storage: z.object({ messageId: id, seq: relayCount,
-        localId: relayLocalId, bodyVerified: z.boolean() }).strict() },
+    // The stored row's own ID (H1-R-06); only a body-verified receipt is a success, a mismatch is unknown (H1-R-07).
+    { operation: z.literal('prompt-own-session'), storage: z.object({ messageId: persistedId, seq: relayCount,
+        localId: relayLocalId, bodyVerified: z.literal(true) }).strict() },
     { operation: z.literal('resume-own-session'), control: z.object(control).strict() },
     { operation: z.literal('reply-own-permission'), control: z.object({ ...control, permissionId: persistedId }).strict() },
     { operation: z.literal('abort-own-turn'), control: z.object(control).strict() },
