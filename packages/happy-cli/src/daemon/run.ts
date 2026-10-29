@@ -5387,8 +5387,10 @@ export async function startDaemon(): Promise<void> {
       portRegistry,
       automationStore,
       aiCredentialRuntime,
-      ...(browserTaskBroker ? {
-        browserSessionWaiting: async (sessionId: string) => heldBrowserAttentions.answerWaiting(sessionId) || browserTaskBroker!.waiting(sessionId),
+      // A personal runtime may activate after this registration: resolve the broker per call.
+      ...(browserTaskBroker || personalBrowserWatch ? {
+        browserSessionWaiting: async (sessionId: string) => heldBrowserAttentions.answerWaiting(sessionId)
+          || (browserTaskBroker ? browserTaskBroker.waiting(sessionId) : false),
       } : {}),
       autonomousQualityGate: createAutonomousQualityGateRpcHandlers(autonomousQualityGateRegistry),
       checkpoint: {
