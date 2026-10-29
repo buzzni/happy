@@ -142,8 +142,20 @@ describe('pinned credential at the SDK request boundary', () => {
         const lines = debug.mock.calls.map(call => call.join(' ')).join('\n');
         expect(lines).toMatch(/SessionStart:startup hook started at \+\d+ms/);
         expect(lines).toMatch(/SessionStart:startup hook success at \+7\d{3}ms after 7\d{3}ms/);
-        expect(lines).toMatch(/organization credential refused: stage=initialize reason=timeout after 6\d{4}ms/);
+        expect(lines).toMatch(/initialize timeout after 60000ms/);
+        expect(lines).toMatch(/organization credential refused: stage=initialize reason=timeout \d+ms after query start/);
         expect(lines).not.toContain(TOKEN);
+    });
+    it('logs a failed recheck with the duration of that call, not the conversation age', async () => {
+        vi.useFakeTimers(); const f = fixture(); const debug = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+        async function* prompt() { for (const content of ['one', 'two']) { yield { type: 'user' as const, parent_tool_use_id: null, message: { role: 'user' as const, content } }; await new Promise(resolve => setTimeout(resolve, 600_000)); } }
+        const q = queryWithPinnedCredential(f.create as never, { prompt: prompt(), options }, TOKEN, 'organization');
+        await q.next();
+        f.controls.reinitialize.mockImplementation(() => new Promise(() => {}));
+        const second = q.next().catch((error: unknown) => error);
+        await vi.advanceTimersByTimeAsync(610_001);
+        expect(await second).toMatchObject({ stage: 'recheck', reason: 'timeout' });
+        expect(debug.mock.calls.map(call => call.join(' ')).join('\n')).toMatch(/recheck timeout after 10000ms/);
     });
     it.each([
         ['getSettings-hang', 'settings', 'timeout'],

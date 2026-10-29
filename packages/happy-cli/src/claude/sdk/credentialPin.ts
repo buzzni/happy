@@ -46,7 +46,7 @@ export function queryWithPinnedCredential(
 
     function refuse(upstreamError: Error | undefined, refusal: ClaudeAuthNotVerifiedError): never {
         const error = signal?.aborted ? new AbortError('Claude request aborted') : upstreamError ?? refusal;
-        if (error === refusal) logger.debug(`[credentialPin] ${source} credential refused: stage=${refusal.stage} reason=${refusal.reason} after ${Date.now() - startedAt}ms`);
+        if (error === refusal) logger.debug(`[credentialPin] ${source} credential refused: stage=${refusal.stage} reason=${refusal.reason} ${Date.now() - startedAt}ms after query start`);
         rejectFailure(error);
         try { response.close(); } catch { /* already closed */ }
         throw error;
@@ -66,6 +66,9 @@ export function queryWithPinnedCredential(
             const value = await Promise.race([Promise.resolve().then(call).catch(() => fail(stage, 'control_failed')), refused]);
             logger.debug(`[credentialPin] ${stage} answered in ${Date.now() - began}ms`);
             return value;
+        } catch (error) {
+            logger.debug(`[credentialPin] ${stage} ${error instanceof ClaudeAuthNotVerifiedError ? error.reason : 'control_failed'} after ${Date.now() - began}ms`);
+            throw error;
         } finally { clearTimeout(timer!); signal?.removeEventListener('abort', onAbort!); }
     }
     async function settings(stage: ClaudeAuthCheckStage): Promise<LiveSettings> {
