@@ -584,6 +584,43 @@ export function mapCodexMcpMessageToSessionEnvelopes(message: Record<string, unk
         };
     }
 
+    /*
+     * A sub-agent the main thread spawned in this turn: one `CodexAgent` row whose call id is the child
+     * thread, so a client shows it running while the runtime lists that thread (metadata
+     * `codexSubagentTasks`). No `backgroundTaskId`: clients read that as a Claude background launch whose
+     * completion answers a request again, which a Codex child never does. It belongs to the main
+     * transcript, never to a session sub-agent, and it never opens or revives a turn: with none open there
+     * is nothing to add.
+     */
+    if (type === 'collab_agent_spawned') {
+        const envelopes: SessionEnvelope[] = [];
+        if (state.currentTurnId) {
+            const label = typeof message.label === 'string' && message.label.trim().length > 0 ? message.label : 'Agent';
+            const childThreadId = typeof message.thread_id === 'string' && message.thread_id.length > 0 ? message.thread_id : null;
+            const call = childThreadId ?? pickCallId(message);
+            const spawnOpts = { turn: state.currentTurnId } satisfies CreateEnvelopeOptions;
+            envelopes.push(
+                createEnvelope('agent', {
+                    t: 'tool-call-start',
+                    call,
+                    name: 'CodexAgent',
+                    title: label,
+                    description: label,
+                    args: { agent: label },
+                }, spawnOpts),
+                createEnvelope('agent', { t: 'tool-call-end', call }, spawnOpts),
+            );
+        }
+        return {
+            currentTurnId: state.currentTurnId,
+            currentProviderTurnId: state.currentProviderTurnId ?? null,
+            startedSubagents,
+            activeSubagents,
+            providerSubagentToSessionSubagent,
+            envelopes,
+        };
+    }
+
     const subagent = resolveSessionSubagent(message, providerSubagentToSessionSubagent);
     const opts = buildEnvelopeOptions(state.currentTurnId, subagent);
 

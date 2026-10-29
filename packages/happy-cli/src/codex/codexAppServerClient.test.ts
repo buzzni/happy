@@ -1316,8 +1316,9 @@ describe('CodexAppServerClient sandbox integration', () => {
             },
         });
 
-        await waitFor(() => events.length === 1);
-        expect(events[0]).toEqual({
+        // Besides the sub-agent list published at connect (session metadata), usage is the only event.
+        await waitFor(() => events.some((event) => event.type === 'codex_usage'));
+        expect(events.filter((event) => event.type !== 'subagent_tasks')).toEqual([{
             type: 'codex_usage',
             thread_id: 'thread-1',
             turn_id: 'turn-1',
@@ -1330,7 +1331,7 @@ describe('CodexAppServerClient sandbox integration', () => {
                 outputTokens: 30,
                 reasoningOutputTokens: 5,
             },
-        });
+        }]);
 
         await client.disconnect();
     });
@@ -6044,6 +6045,723 @@ describe('explicit authentication recovery', () => {
         await client.disconnect();
     });
 
+});
+
+/**
+ * Sub-agent threads (design §1.2–§1.3). Codex reports every child thread on the same app-server
+ * connection; none of it may reach the main thread's turn lifecycle, transcript, preview or MCP
+ * table. The parent's own sub-agent items are intercepted before the resumed-work reopen, a spawn
+ * inside the open turn becomes one `collab_agent_spawned` event, and the running list goes out as
+ * `subagent_tasks`. Item and answer shapes follow the Codex 0.157.1 recordings in
+ * `__fixtures__/subagent-recordings/`; fake timers drive every scripted reply.
+ */
+describe('sub-agent thread separation', () => {
+    const MAIN = 'thread-main';
+    const MAIN_TURN = 'turn-main';
+    const CHILD = 'thread-child';
+    const CHILD_TURN = 'turn-child';
+    const FORK = 'thread-fork';
+    /** Text only a child produces: it must never reach an event or a log line. */
+    const CHILD_TEXT = 'CHILD-ONLY-TEXT';
+    /** The parent's prompt to a V1 child: it must never reach a log line. */
+    const SPAWN_PROMPT = 'SPAWN-PROMPT reply with OK';
+    /** Captured before fake timers replace it: lets Node report unhandled rejections. */
+    const realSetImmediate = globalThis.setImmediate;
+
+    type Event = Record<string, unknown>;
+    type Reply = { result: unknown } | { error: { code: number; message: string } };
+    type Session = Awaited<ReturnType<typeof openSession>>;
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mockResolveCodexStateEnvironment.mockImplementation(async env => env);
+        mockExecSync.mockReturnValue('codex-cli 0.157.1');
+        mockPrepareCodexMultiAuthProxy.mockResolvedValue(null);
+        vi.useFakeTimers();
+        return () => { vi.useRealTimers(); };
+    });
+
+    /** Moves fake time 1 ms at a time until `done()`, so scripted replies and client timers run. */
+    async function until(done: () => boolean, what: string, limitMs = 10_000): Promise<void> {
+        for (let elapsed = 0; !done(); elapsed++) {
+            if (elapsed >= limitMs) throw new Error(`Timed out waiting for ${what}`);
+            await vi.advanceTimersByTimeAsync(1);
+        }
+    }
+
+    async function settled<T>(promise: Promise<T>, what: string): Promise<T> {
+        let finished = false;
+        promise.then(() => { finished = true; }, () => { finished = true; });
+        await until(() => finished, what);
+        return promise;
+    }
+
+    /** Codex 0.157.1's `thread/read {includeTurns:false}` answer for a child of `parent`, by default the main thread (recorded shape, trimmed). */
+    function childThread(threadId: string, nickname: string | null, agentPath: string | null = null, parent = MAIN): Reply {
+        return { result: { thread: {
+            id: threadId, parentThreadId: parent, threadSource: 'subagent', agentNickname: nickname, agentRole: null,
+            status: { type: 'active', activeFlags: [] },
+            source: { subAgent: { thread_spawn: { parent_thread_id: parent, depth: 1, agent_path: agentPath, agent_nickname: nickname, agent_role: null } } },
+        } } };
+    }
+
+    // Parent-side items as recorded: V2 `subAgentActivity` (default model) and V1 `collabAgentToolCall`.
+    const v2Activity = (kind: string, threadId = CHILD, id = `call-${kind}-${threadId}`) => ({
+        type: 'subAgentActivity', id, kind, agentThreadId: threadId, agentPath: '/root/ok_reply',
+    });
+    const v1Call = (tool: string, id: string, status: string, receiverThreadIds: string[], agentsStates: Record<string, { status: string; message: string | null }> = {}) => ({
+        type: 'collabAgentToolCall', id, tool, status, senderThreadId: MAIN, receiverThreadIds,
+        prompt: tool === 'spawnAgent' ? SPAWN_PROMPT : null, model: null, reasoningEffort: null, agentsStates,
+    });
+
+    /** A connected client with thread `MAIN` started on a scripted app-server; a restart spawns a fresh one. */
+    async function openSession(opts: { readThread?: (threadId: string) => Reply | 'hold'; onEvent?: (event: Event) => void } = {}) {
+        const processes: any[] = [];
+        const requests: MockRpcMessage[] = [];
+        const heldReads: Array<{ threadId: string; answer: (reply: Reply) => void }> = [];
+        let turns = 0;
+        mockSpawn.mockImplementation(() => {
+            const proc = createMockProcess({ onRequest: (msg, stdout) => {
+                requests.push(msg);
+                if (msg.id == null) return;
+                const answer = (reply: Reply) => { setTimeout(() => pushJsonLine(stdout, { id: msg.id, ...reply }), 1); };
+                if (msg.method === 'thread/start') answer({ result: { thread: { id: MAIN }, model: 'gpt-test' } });
+                if (msg.method === 'thread/resume') answer({ result: { thread: { id: msg.params.threadId }, model: 'gpt-test' } });
+                if (msg.method === 'thread/backgroundTerminals/list') answer({ result: { data: [], nextCursor: null } });
+                if (msg.method === 'turn/interrupt') answer({ result: {} });
+                if (msg.method === 'thread/fork') {
+                    // Codex writes the answer and the new thread's thread/started back to back: one chunk here.
+                    setTimeout(() => stdout.push(`${JSON.stringify({ id: msg.id, result: { thread: { id: FORK }, model: 'gpt-test' } })}\n`
+                        + `${JSON.stringify({ method: 'thread/started', params: { thread: { id: FORK } } })}\n`), 1);
+                }
+                if (msg.method === 'turn/start') {
+                    turns += 1;
+                    const turnId = turns === 1 ? MAIN_TURN : `${MAIN_TURN}-${turns}`;
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: { turn: { id: turnId } } });
+                        pushJsonLine(stdout, { method: 'turn/started', params: { threadId: msg.params.threadId, turn: { id: turnId, status: 'inProgress' } } });
+                    }, 1);
+                }
+                if (msg.method === 'thread/read') {
+                    const threadId = String(msg.params?.threadId);
+                    const reply = opts.readThread?.(threadId) ?? childThread(threadId, 'Linnaeus', '/root/ok_reply');
+                    if (reply === 'hold') heldReads.push({ threadId, answer });
+                    else answer(reply);
+                }
+            } });
+            processes.push(proc);
+            return proc;
+        });
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Event[] = [];
+        client.setEventHandler((event) => {
+            events.push(event as Event);
+            opts.onEvent?.(event as Event);
+        });
+        await settled(client.connect(), 'connect');
+        await settled(client.startThread({ cwd: '/tmp/project' }), 'thread/start');
+        const notify = (method: string, params: Record<string, unknown>) => pushJsonLine(processes[processes.length - 1].stdout, { method, params });
+        return {
+            client, events, requests, heldReads, notify,
+            get proc() { return processes[processes.length - 1]; },
+            item: (method: 'item/started' | 'item/completed', threadId: string, turnId: string, item: unknown) => notify(method, { threadId, turnId, item }),
+        };
+    }
+
+    const snapshots = (events: Event[]) => events.filter((event) => event.type === 'subagent_tasks').map((event) => event.snapshot);
+    const tasksOf = (event: Event) => (event.snapshot as { tasks: unknown[] | null }).tasks;
+    const listed = (events: Event[]) => events.filter((event) => event.type === 'subagent_tasks').map(tasksOf);
+    const withoutSnapshots = (events: Event[]) => events.filter((event) => event.type !== 'subagent_tasks');
+    const spawnRows = (events: Event[]) => events.filter((event) => event.type === 'collab_agent_spawned');
+    const lifecycle = (events: Event[]) => events
+        .filter((event) => event.type === 'task_started' || event.type === 'task_complete' || event.type === 'turn_aborted')
+        .map((event) => ({ type: event.type, turn_id: event.turn_id }));
+    const task = (taskId: string, label: string) => ({ taskId, label, kind: 'agent' });
+
+    async function loggedText(): Promise<string> {
+        const { logger } = await import('@/ui/logger');
+        return JSON.stringify([logger.debug, logger.info, logger.warn].map((log) => vi.mocked(log).mock.calls));
+    }
+
+    /** Sends the main turn and waits until it starts; `done` is its sendTurnAndWait (wrapped: an async return would await it). */
+    async function startMainTurn(s: Session, opts?: { turnTimeoutMs: number }): Promise<{ done: Promise<{ aborted: boolean }> }> {
+        const done = s.client.sendTurnAndWait('spawn one sub-agent', opts);
+        await until(() => s.events.some((event) => event.type === 'task_started' && event.turn_id === MAIN_TURN), 'main turn start');
+        return { done };
+    }
+
+    /** The main thread's own end of the turn, idle first as Codex 0.157.1 sends it. */
+    function endMainTurn(s: Session, status = 'completed') {
+        s.notify('thread/status/changed', { threadId: MAIN, status: { type: 'idle' } });
+        s.notify('turn/completed', { threadId: MAIN, turn: { id: MAIN_TURN, status, error: null } });
+    }
+
+    /** A V2 spawn as Codex sends it: the child's first status comes before the parent's item. */
+    function spawnV2(s: Session, threadId = CHILD, turnId = MAIN_TURN) {
+        s.notify('thread/status/changed', { threadId, status: { type: 'idle' } });
+        s.item('item/started', MAIN, turnId, v2Activity('started', threadId));
+        s.item('item/completed', MAIN, turnId, v2Activity('started', threadId));
+        s.notify('thread/status/changed', { threadId, status: { type: 'active', activeFlags: [] } });
+        s.notify('turn/started', { threadId, turn: { id: CHILD_TURN, status: 'inProgress' } });
+    }
+
+    /** A V1 spawn as Codex sends it: spawnAgent started, the child's first status, spawnAgent completed (pendingInit). */
+    function spawnV1(s: Session, threadId = CHILD, turnId = MAIN_TURN) {
+        s.item('item/started', MAIN, turnId, v1Call('spawnAgent', 'exec-spawn', 'inProgress', []));
+        s.notify('thread/status/changed', { threadId, status: { type: 'idle' } });
+        s.item('item/completed', MAIN, turnId, v1Call('spawnAgent', 'exec-spawn', 'completed', [threadId], { [threadId]: { status: 'pendingInit', message: null } }));
+        s.notify('thread/status/changed', { threadId, status: { type: 'active', activeFlags: [] } });
+        s.notify('turn/started', { threadId, turn: { id: CHILD_TURN, status: 'inProgress' } });
+    }
+
+    function finishChild(s: Session, threadId = CHILD) {
+        s.notify('thread/status/changed', { threadId, status: { type: 'idle' } });
+        s.notify('turn/completed', { threadId, turn: { id: CHILD_TURN, status: 'completed', error: null } });
+    }
+
+    it('[1] a child idle status during the main turn leaves the turn open; the main turn/completed settles it (P1)', async () => {
+        const s = await openSession();
+        const { done: turn } = await startMainTurn(s);
+        let resolved = false;
+        void turn.then(() => { resolved = true; });
+        s.notify('thread/status/changed', { threadId: CHILD, status: { type: 'idle' } });
+        await vi.advanceTimersByTimeAsync(300);
+        expect(lifecycle(s.events)).toEqual([{ type: 'task_started', turn_id: MAIN_TURN }]);
+        expect(resolved).toBe(false);
+        s.notify('turn/completed', { threadId: MAIN, turn: { id: MAIN_TURN, status: 'completed', error: null } });
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: false });
+        expect(lifecycle(s.events)).toEqual([
+            { type: 'task_started', turn_id: MAIN_TURN },
+            { type: 'task_complete', turn_id: MAIN_TURN },
+        ]);
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it('[2] a child turn, item, delta and token report reach no event while the main thread is idle (P2, P3)', async () => {
+        const s = await openSession();
+        const { done: turn } = await startMainTurn(s);
+        endMainTurn(s);
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: false });
+        const before = withoutSnapshots(s.events).length;
+        s.notify('turn/started', { threadId: CHILD, turn: { id: CHILD_TURN, status: 'inProgress' } });
+        s.item('item/started', CHILD, CHILD_TURN, { type: 'agentMessage', id: 'child-message', text: '', phase: 'final_answer' });
+        s.notify('item/agentMessage/delta', { threadId: CHILD, turnId: CHILD_TURN, itemId: 'child-message', delta: CHILD_TEXT });
+        s.item('item/completed', CHILD, CHILD_TURN, { type: 'agentMessage', id: 'child-message', text: CHILD_TEXT, phase: 'final_answer' });
+        s.notify('thread/tokenUsage/updated', { threadId: CHILD, turnId: CHILD_TURN, tokenUsage: { total: { totalTokens: 5 } } });
+        s.notify('turn/completed', { threadId: CHILD, turn: { id: CHILD_TURN, status: 'completed', error: null } });
+        // Past the 80 ms delta flush and the 250 ms final-answer fallback.
+        await vi.advanceTimersByTimeAsync(300);
+        expect(withoutSnapshots(s.events).slice(before)).toEqual([]);
+        expect(s.client.turnId).toBeNull();
+        expect(await loggedText()).not.toContain(CHILD_TEXT);
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it('[3] a child rawResponse/completed still reaches codex_usage, tagged with the child thread', async () => {
+        const s = await openSession();
+        const { done: turn } = await startMainTurn(s);
+        const usage = { totalTokens: 15, inputTokens: 12, cachedInputTokens: 0, outputTokens: 3, reasoningOutputTokens: 0 };
+        s.notify('rawResponse/completed', { threadId: CHILD, turnId: CHILD_TURN, responseId: 'response-child', usage });
+        await vi.advanceTimersByTimeAsync(5);
+        expect(s.events.filter((event) => event.type === 'codex_usage')).toEqual([
+            { type: 'codex_usage', thread_id: CHILD, turn_id: CHILD_TURN, response_id: 'response-child', usage },
+        ]);
+        expect(lifecycle(s.events)).toEqual([{ type: 'task_started', turn_id: MAIN_TURN }]);
+        endMainTurn(s);
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: false });
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it('[4] a child MCP startup report leaves the main MCP status table alone (P6)', async () => {
+        const s = await openSession();
+        s.notify('mcpServer/startupStatus/updated', { threadId: MAIN, name: 'codex_apps', status: 'ready', error: null, failureReason: null });
+        await vi.advanceTimersByTimeAsync(1);
+        const main = s.client.getMcpStartupStatuses();
+        expect(main).toEqual([{ threadId: MAIN, name: 'codex_apps', status: 'ready' }]);
+        s.notify('mcpServer/startupStatus/updated', { threadId: CHILD, name: 'codex_apps', status: 'starting', error: null, failureReason: null });
+        s.notify('mcpServer/startupStatus/updated', { threadId: CHILD, name: 'child_only', status: 'failed', error: 'child failure', failureReason: null });
+        await vi.advanceTimersByTimeAsync(5);
+        expect(s.client.getMcpStartupStatuses()).toEqual(main);
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it('[5] a V2 spawn in the main turn reports one row on item/completed, labelled from thread/read, once per child', async () => {
+        const s = await openSession({ readThread: () => 'hold' });
+        const { done: turn } = await startMainTurn(s);
+        s.notify('thread/status/changed', { threadId: CHILD, status: { type: 'idle' } });
+        s.item('item/started', MAIN, MAIN_TURN, v2Activity('started'));
+        await vi.advanceTimersByTimeAsync(5);
+        expect(spawnRows(s.events)).toEqual([]);
+        s.item('item/completed', MAIN, MAIN_TURN, v2Activity('started'));
+        s.notify('turn/started', { threadId: CHILD, turn: { id: CHILD_TURN, status: 'inProgress' } });
+        await vi.advanceTimersByTimeAsync(100);
+        // The row waits for the child's label, read since the child's first status.
+        expect(spawnRows(s.events)).toEqual([]);
+        expect(s.heldReads.map((read) => read.threadId)).toEqual([CHILD]);
+        s.heldReads[0].answer(childThread(CHILD, 'Linnaeus', '/root/ok_reply'));
+        await vi.advanceTimersByTimeAsync(5);
+        const row = { type: 'collab_agent_spawned', call_id: 'call-started-thread-child', turn_id: MAIN_TURN, thread_id: CHILD, label: 'Linnaeus' };
+        expect(spawnRows(s.events)).toEqual([row]);
+        expect(listed(s.events).at(-1)).toEqual([task(CHILD, 'Linnaeus')]);
+        // The same child confirmed again is not a second row.
+        s.item('item/completed', MAIN, MAIN_TURN, v2Activity('started', CHILD, 'call-again'));
+        await vi.advanceTimersByTimeAsync(5);
+        expect(spawnRows(s.events)).toEqual([row]);
+        endMainTurn(s);
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: false });
+        expect(lifecycle(s.events)).toEqual([
+            { type: 'task_started', turn_id: MAIN_TURN },
+            { type: 'task_complete', turn_id: MAIN_TURN },
+        ]);
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it('[6] a V1 spawnAgent completed in the main turn reports one row; wait, sendInput and closeAgent report none', async () => {
+        const s = await openSession({ readThread: (threadId) => childThread(threadId, 'Plato') });
+        const { done: turn } = await startMainTurn(s);
+        spawnV1(s);
+        await vi.advanceTimersByTimeAsync(5);
+        for (const tool of ['wait', 'sendInput', 'closeAgent']) {
+            s.item('item/started', MAIN, MAIN_TURN, v1Call(tool, `exec-${tool}`, 'inProgress', [CHILD]));
+            s.item('item/completed', MAIN, MAIN_TURN, v1Call(tool, `exec-${tool}`, 'completed', [CHILD], {
+                [CHILD]: { status: tool === 'closeAgent' ? 'shutdown' : 'completed', message: CHILD_TEXT },
+            }));
+        }
+        await vi.advanceTimersByTimeAsync(100);
+        expect(spawnRows(s.events)).toEqual([
+            { type: 'collab_agent_spawned', call_id: 'exec-spawn', turn_id: MAIN_TURN, thread_id: CHILD, label: 'Plato' },
+        ]);
+        expect(withoutSnapshots(s.events).map((event) => event.type)).toEqual(['task_started', 'collab_agent_spawned']);
+        const logs = await loggedText();
+        expect(logs).not.toContain(SPAWN_PROMPT);
+        expect(logs).not.toContain(CHILD_TEXT);
+        endMainTurn(s);
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: false });
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it('[7] a V2 subAgentActivity completed after the main turn reopens nothing and reports no row (P4)', async () => {
+        const s = await openSession();
+        const { done: turn } = await startMainTurn(s);
+        spawnV2(s);
+        await vi.advanceTimersByTimeAsync(5);
+        endMainTurn(s);
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: false });
+        const after = withoutSnapshots(s.events).length;
+        // Recorded (b-default): the child outlives the turn and Codex reports its end under the finished turn id.
+        s.item('item/started', MAIN, MAIN_TURN, v2Activity('completed', CHILD, 'subagent-completed'));
+        s.item('item/completed', MAIN, MAIN_TURN, v2Activity('completed', CHILD, 'subagent-completed'));
+        await vi.advanceTimersByTimeAsync(300);
+        expect(withoutSnapshots(s.events).slice(after)).toEqual([]);
+        expect((s.client as any).completedTurnIds.has(MAIN_TURN)).toBe(true);
+        // The list followed the child: listed through the end of the turn, emptied by the completed item.
+        expect(listed(s.events)).toEqual([[], [task(CHILD, 'Linnaeus')], []]);
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it('[8] a spawn item under another turn id reports no row but still lists the child', async () => {
+        const s = await openSession();
+        const { done: turn } = await startMainTurn(s);
+        spawnV2(s, CHILD, 'turn-previous');
+        await vi.advanceTimersByTimeAsync(1_600);
+        expect(spawnRows(s.events)).toEqual([]);
+        expect(listed(s.events).at(-1)).toEqual([task(CHILD, 'Linnaeus')]);
+        endMainTurn(s);
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: false });
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it.each([
+        ['answered after the turn', 'Linnaeus'],
+        ['never answered', 'ok_reply'],
+    ])('[9] a spawn whose label read outlasts the main turn reports no row (%s)', async (mode, label) => {
+        const s = await openSession({ readThread: () => 'hold' });
+        const { done: turn } = await startMainTurn(s);
+        spawnV2(s);
+        await vi.advanceTimersByTimeAsync(5);
+        expect(s.requests.some((request) => request.method === 'thread/read' && request.params?.threadId === CHILD)).toBe(true);
+        endMainTurn(s);
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: false });
+        if (mode === 'answered after the turn') s.heldReads.find((read) => read.threadId === CHILD)!.answer(childThread(CHILD, 'Linnaeus'));
+        await vi.advanceTimersByTimeAsync(1_600);
+        expect(spawnRows(s.events)).toEqual([]);
+        expect(listed(s.events).at(-1)).toEqual([task(CHILD, label)]);
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it('[9] a spawn whose label read is cut short by a forced app-server restart reports no row', async () => {
+        const s = await openSession({ readThread: () => 'hold' });
+        const { done: turn } = await startMainTurn(s);
+        spawnV2(s);
+        await vi.advanceTimersByTimeAsync(5);
+        // The restart keeps sendTurnAndWait pending after reporting turn_aborted, until the thread is resumed.
+        const abort = s.client.abortTurnWithFallback({ gracePeriodMs: 1, forceRestartOnTimeout: true });
+        await expect(settled(abort, 'forced restart')).resolves.toMatchObject({ forcedRestart: true, resumedThread: true });
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: true });
+        await vi.advanceTimersByTimeAsync(1_600);
+        expect(s.events.some((event) => event.type === 'turn_aborted' && event.forced_restart === true)).toBe(true);
+        expect(spawnRows(s.events)).toEqual([]);
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it.each([
+        ['V2', spawnV2, 'call-started-thread-child', 'ok_reply'],
+        ['V1', spawnV1, 'exec-spawn', 'Agent'],
+    ] as const)('[10] a failed thread/read still reports one %s row, with the fallback label', async (_kind, spawn, callId, label) => {
+        const s = await openSession({ readThread: () => ({ error: { code: -32600, message: 'thread not loaded' } }) });
+        const { done: turn } = await startMainTurn(s);
+        spawn(s);
+        // Its retry lands after any label wait, so the row does not wait for it.
+        await vi.advanceTimersByTimeAsync(5);
+        expect(spawnRows(s.events)).toEqual([{ type: 'collab_agent_spawned', call_id: callId, turn_id: MAIN_TURN, thread_id: CHILD, label }]);
+        // The retry 2 s after the first failure fails as well: still one row.
+        await vi.advanceTimersByTimeAsync(2_600);
+        expect(spawnRows(s.events)).toHaveLength(1);
+        expect(s.requests.filter((request) => request.method === 'thread/read' && request.params?.threadId === CHILD)).toHaveLength(2);
+        endMainTurn(s);
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: false });
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    // Real app 2026-10-28: Codex had not written the child's rollout yet, and the parent answered and ended its turn a
+    // second later — the row waiting out the label was dropped with its turn.
+    it('[10] reports the row of a child whose first thread/read failed before a parent turn that ends at once', async () => {
+        const s = await openSession({ readThread: () => ({ error: { code: -32600, message: 'failed to read session metadata' } }) });
+        const { done: turn } = await startMainTurn(s);
+        spawnV2(s);
+        await vi.advanceTimersByTimeAsync(5);
+        endMainTurn(s);
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: false });
+        expect(spawnRows(s.events)).toEqual([{ type: 'collab_agent_spawned', call_id: 'call-started-thread-child', turn_id: MAIN_TURN, thread_id: CHILD, label: 'ok_reply' }]);
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    // The same failure can come back before the parent's spawn item: the waits that item starts must not hold the row
+    // and the first listing either (review 2026-10-29).
+    it('[10] reports the row and the listing of a child whose first thread/read failed before its spawn item', async () => {
+        const s = await openSession({ readThread: () => ({ error: { code: -32600, message: 'failed to read session metadata' } }) });
+        const { done: turn } = await startMainTurn(s);
+        s.notify('thread/status/changed', { threadId: CHILD, status: { type: 'idle' } });
+        await until(() => s.requests.some((request) => request.method === 'thread/read' && request.params?.threadId === CHILD), 'thread/read');
+        await vi.advanceTimersByTimeAsync(5);
+        s.item('item/started', MAIN, MAIN_TURN, v2Activity('started'));
+        s.item('item/completed', MAIN, MAIN_TURN, v2Activity('started'));
+        s.notify('thread/status/changed', { threadId: CHILD, status: { type: 'active', activeFlags: [] } });
+        s.notify('turn/started', { threadId: CHILD, turn: { id: CHILD_TURN, status: 'inProgress' } });
+        await vi.advanceTimersByTimeAsync(5);
+        expect(listed(s.events).at(-1)).toEqual([task(CHILD, 'ok_reply')]);
+        endMainTurn(s);
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: false });
+        expect(spawnRows(s.events)).toEqual([{ type: 'collab_agent_spawned', call_id: 'call-started-thread-child', turn_id: MAIN_TURN, thread_id: CHILD, label: 'ok_reply' }]);
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it.each(['process exit', 'clearThreadState', 'disconnect'])('[11] %s publishes an empty list and keeps the old child out of the main flow', async (ending) => {
+        const s = await openSession();
+        const { done: turn } = await startMainTurn(s);
+        spawnV2(s);
+        await vi.advanceTimersByTimeAsync(5);
+        expect(listed(s.events).at(-1)).toEqual([task(CHILD, 'Linnaeus')]);
+        const proc = s.proc;
+        if (ending === 'process exit') {
+            proc.exitCode = 1;
+            proc.emit('exit', 1, null);
+        } else if (ending === 'clearThreadState') {
+            s.client.clearThreadState();
+        } else {
+            await settled(s.client.disconnect(), 'disconnect');
+        }
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: true });
+        expect(listed(s.events).at(-1)).toEqual([]);
+        const count = s.events.length;
+        // The old child keeps talking on the old connection.
+        pushJsonLine(proc.stdout, { method: 'turn/started', params: { threadId: CHILD, turn: { id: 'turn-child-2', status: 'inProgress' } } });
+        pushJsonLine(proc.stdout, { method: 'item/completed', params: { threadId: CHILD, turnId: 'turn-child-2', item: { type: 'agentMessage', id: 'late', text: CHILD_TEXT, phase: 'final_answer' } } });
+        pushJsonLine(proc.stdout, { method: 'thread/status/changed', params: { threadId: CHILD, status: { type: 'idle' } } });
+        await vi.advanceTimersByTimeAsync(300);
+        expect(s.events.slice(count)).toEqual([]);
+        if (ending !== 'disconnect') await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it('[11] a forced app-server restart publishes an empty list before the forced turn_aborted, and the old child stays out', async () => {
+        const s = await openSession();
+        const { done: turn } = await startMainTurn(s);
+        spawnV2(s);
+        await vi.advanceTimersByTimeAsync(5);
+        expect(listed(s.events).at(-1)).toEqual([task(CHILD, 'Linnaeus')]);
+        const abort = s.client.abortTurnWithFallback({ gracePeriodMs: 1, forceRestartOnTimeout: true });
+        await expect(settled(abort, 'forced restart')).resolves.toEqual({ hadActiveTurn: true, aborted: true, forcedRestart: true, resumedThread: true });
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: true });
+        // The restart branch itself empties the list, ahead of the turn_aborted it reports.
+        const listedAt = s.events.findIndex((event) => event.type === 'subagent_tasks' && (tasksOf(event)?.length ?? 0) > 0);
+        const emptiedAt = s.events.findIndex((event, index) => index > listedAt && event.type === 'subagent_tasks');
+        const abortedAt = s.events.findIndex((event) => event.type === 'turn_aborted' && event.forced_restart === true);
+        expect(listedAt).toBeGreaterThan(-1);
+        expect(tasksOf(s.events[emptiedAt])).toEqual([]);
+        expect(emptiedAt).toBeLessThan(abortedAt);
+        expect(listed(s.events).at(-1)).toEqual([]);
+        expect(s.client.threadId).toBe(MAIN);
+        const count = s.events.length;
+        s.notify('turn/started', { threadId: CHILD, turn: { id: 'turn-child-2', status: 'inProgress' } });
+        s.notify('thread/status/changed', { threadId: CHILD, status: { type: 'active', activeFlags: [] } });
+        await vi.advanceTimersByTimeAsync(300);
+        expect(s.events.slice(count)).toEqual([]);
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it('[12] after a fork, the new main thread turn and items flow as before, with thread/started in the answer chunk', async () => {
+        const s = await openSession();
+        await expect(settled(s.client.forkThread({ threadId: MAIN }), 'thread/fork')).resolves.toMatchObject({ threadId: FORK });
+        expect(s.client.threadId).toBe(FORK);
+        const turn = s.client.sendTurnAndWait('after the fork');
+        await until(() => s.events.some((event) => event.type === 'task_started'), 'forked turn start');
+        s.item('item/completed', FORK, MAIN_TURN, { type: 'agentMessage', id: 'fork-message', text: 'FORKED', phase: 'final_answer' });
+        s.notify('turn/completed', { threadId: FORK, turn: { id: MAIN_TURN, status: 'completed', error: null } });
+        await expect(settled(turn, 'forked turn')).resolves.toEqual({ aborted: false });
+        expect(withoutSnapshots(s.events).map((event) => [event.type, event.turn_id ?? event.message])).toEqual([
+            ['task_started', MAIN_TURN],
+            ['agent_message', 'FORKED'],
+            ['task_complete', MAIN_TURN],
+        ]);
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it('[12] a same-process resume of the same thread keeps a running child listed and tracked', async () => {
+        const s = await openSession();
+        const setMainThread = vi.spyOn((s.client as any).subagents, 'setMainThread');
+        const { done: turn } = await startMainTurn(s);
+        spawnV2(s);
+        await vi.advanceTimersByTimeAsync(5);
+        endMainTurn(s);
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: false });
+        const published = snapshots(s.events).length;
+        // runCodex resumes the live thread before a turn (developer instructions, MCP sync); Codex keeps its session.
+        await expect(settled(s.client.resumeThread({ threadId: MAIN }), 'thread/resume')).resolves.toMatchObject({ threadId: MAIN });
+        await vi.advanceTimersByTimeAsync(5);
+        expect(setMainThread).not.toHaveBeenCalled();
+        expect(snapshots(s.events)).toHaveLength(published);
+        expect(listed(s.events).at(-1)).toEqual([task(CHILD, 'Linnaeus')]);
+        finishChild(s);
+        await vi.advanceTimersByTimeAsync(5);
+        expect(listed(s.events).at(-1)).toEqual([]);
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it('[12] a resume on a restarted app-server starts the list over and tracks new children', async () => {
+        const s = await openSession();
+        const { done: turn } = await startMainTurn(s);
+        spawnV2(s);
+        await vi.advanceTimersByTimeAsync(5);
+        endMainTurn(s);
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: false });
+        expect(listed(s.events).at(-1)).toEqual([task(CHILD, 'Linnaeus')]);
+        const setMainThread = vi.spyOn((s.client as any).subagents, 'setMainThread');
+        await expect(settled(s.client.reconnectAndResumeThread(), 'reconnect')).resolves.toBe(true);
+        expect(setMainThread.mock.calls).toEqual([[MAIN]]);
+        expect(listed(s.events).at(-1)).toEqual([]);
+        // The old child is gone with the old process; a child of the next turn is tracked as usual.
+        s.notify('turn/started', { threadId: CHILD, turn: { id: 'turn-child-2', status: 'inProgress' } });
+        await vi.advanceTimersByTimeAsync(5);
+        expect(listed(s.events).at(-1)).toEqual([]);
+        const next = s.client.sendTurnAndWait('second turn');
+        await until(() => s.events.some((event) => event.type === 'task_started' && event.turn_id === `${MAIN_TURN}-2`), 'second turn start');
+        spawnV2(s, 'thread-child-2', `${MAIN_TURN}-2`);
+        await vi.advanceTimersByTimeAsync(5);
+        expect(listed(s.events).at(-1)).toEqual([task('thread-child-2', 'Linnaeus')]);
+        expect(spawnRows(s.events).map((row) => row.thread_id)).toEqual([CHILD, 'thread-child-2']);
+        s.notify('turn/completed', { threadId: MAIN, turn: { id: `${MAIN_TURN}-2`, status: 'completed', error: null } });
+        await expect(settled(next, 'second turn')).resolves.toEqual({ aborted: false });
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it.each([
+        ['codex-cli 0.104.0', { available: false, tasks: null }],
+        ['codex-cli 0.105.0', { available: true, tasks: [] }],
+        ['codex-cli 0.157.1', { available: true, tasks: [] }],
+    ])('[13] %s publishes %j once, at connect', async (version, expected) => {
+        mockExecSync.mockReturnValue(version);
+        const s = await openSession();
+        await vi.advanceTimersByTimeAsync(5);
+        expect(snapshots(s.events)).toEqual([{ startedAt: expect.any(Number), ...expected }]);
+        expect(withoutSnapshots(s.events)).toEqual([]);
+        await settled(s.client.disconnect(), 'disconnect');
+        expect(snapshots(s.events)).toHaveLength(1);
+    });
+
+    it('[13] connects with a single `codex --version` read: the app-server and sub-agent list gates share it', async () => {
+        const s = await openSession();
+        expect(mockExecSync.mock.calls.filter(([command]) => command === 'codex --version')).toHaveLength(1);
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it('[13] an app-server too old for the list still keeps child threads out of the main flow, with no spawn row (R13)', async () => {
+        mockExecSync.mockReturnValue('codex-cli 0.104.0');
+        const s = await openSession();
+        const { done: turn } = await startMainTurn(s);
+        // 0.85–0.104 already send V1 spawn items; with no list to follow, a row could only ever read "done".
+        spawnV1(s);
+        s.item('item/completed', CHILD, CHILD_TURN, { type: 'agentMessage', id: 'child-message', text: CHILD_TEXT, phase: 'final_answer' });
+        finishChild(s);
+        await vi.advanceTimersByTimeAsync(1_600);
+        expect(withoutSnapshots(s.events)).toEqual([{ type: 'task_started', turn_id: MAIN_TURN }]);
+        expect(snapshots(s.events)).toEqual([{ startedAt: expect.any(Number), available: false, tasks: null }]);
+        endMainTurn(s);
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: false });
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it.each([
+        ['an error answer', (): Reply | 'hold' => ({ error: { code: -32603, message: 'busy' } })],
+        ['no answer (request timeout)', (): Reply | 'hold' => 'hold'],
+    ])('[14] thread/read failing with %s and a throwing consumer leave no unhandled rejection', async (_failure, readThread) => {
+        const unhandled = vi.fn();
+        process.on('unhandledRejection', unhandled);
+        try {
+            // The consumer fails on every new event, from the list published at connect on.
+            const s = await openSession({ readThread, onEvent: (event) => {
+                if (event.type === 'subagent_tasks' || event.type === 'collab_agent_spawned') throw new Error('consumer failed');
+            } });
+            // Connect survived it; a failed publish is retried on the next change (here: thread start).
+            expect(listed(s.events).length).toBeGreaterThan(0);
+            expect(listed(s.events).every((tasks) => Array.isArray(tasks) && tasks.length === 0)).toBe(true);
+            const { done: turn } = await startMainTurn(s);
+            spawnV2(s);
+            spawnV1(s, 'thread-child-v1');
+            // Label waits, read retries and reconciliation polls, all failing.
+            await vi.advanceTimersByTimeAsync(12_000);
+            for (const threadId of [CHILD, 'thread-child-v1']) {
+                expect(s.requests.filter((request) => request.method === 'thread/read' && request.params?.threadId === threadId).length).toBeGreaterThanOrEqual(3);
+            }
+            expect(spawnRows(s.events).map((row) => row.thread_id)).toEqual([CHILD, 'thread-child-v1']);
+            expect(listed(s.events).at(-1)).toEqual([task(CHILD, 'ok_reply'), task('thread-child-v1', 'Agent')]);
+            // The app-server dies with reads in flight.
+            s.proc.exitCode = 1;
+            s.proc.emit('exit', 1, null);
+            await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: true });
+            await vi.advanceTimersByTimeAsync(10_000);
+            await new Promise((resolve) => realSetImmediate(resolve));
+            expect(unhandled).not.toHaveBeenCalled();
+            await settled(s.client.disconnect(), 'disconnect');
+        } finally {
+            process.off('unhandledRejection', unhandled);
+        }
+    });
+
+    // Inactivity watchdog: a parent waiting on a sub-agent (`wait_agent`) reports nothing on the main thread, so only
+    // its tracked children show that the turn is alive. A 1000 ms timeout stands in for the 10-minute default.
+    const OTHER = 'thread-other';
+    const OTHER_TURN = 'turn-other';
+
+    /** `turn/interrupt` requests so far: the watchdog interrupts the provider when it fires. */
+    const interrupts = (s: Session) => s.requests.filter((request) => request.method === 'turn/interrupt').length;
+
+    /** One streamed chunk of a thread's answer: what a child reports while its parent waits on it. */
+    function streamDelta(s: Session, threadId = CHILD, turnId = CHILD_TURN) {
+        s.notify('item/agentMessage/delta', { threadId, turnId, itemId: `${threadId}-message`, delta: CHILD_TEXT });
+    }
+
+    /** Codex settles the turn the watchdog interrupted: it ends as the watchdog's abort, with the usual diagnostic. */
+    async function settleWatchdogAbort(s: Session, turn: Promise<{ aborted: boolean }>) {
+        s.notify('turn/completed', { threadId: MAIN, turn: { id: MAIN_TURN, status: 'interrupted', error: null } });
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: true });
+        expect(s.events.filter((event) => event.type === 'turn_aborted')).toEqual([
+            expect.objectContaining({ turn_id: MAIN_TURN, reason: 'inactivity_timeout', inactivity_timeout_ms: 1_000 }),
+        ]);
+    }
+
+    it('[15] a tracked child reporting every 900 ms keeps the waiting main turn past its 1000 ms inactivity timeout', async () => {
+        const s = await openSession();
+        const { done: turn } = await startMainTurn(s, { turnTimeoutMs: 1_000 });
+        spawnV2(s);
+        await vi.advanceTimersByTimeAsync(5);
+        expect(listed(s.events).at(-1)).toEqual([task(CHILD, 'Linnaeus')]);
+        // The parent waits on the child: for 5.4 s only the child reports.
+        for (let beat = 0; beat < 5; beat++) {
+            await vi.advanceTimersByTimeAsync(900);
+            streamDelta(s);
+        }
+        await vi.advanceTimersByTimeAsync(900);
+        expect(interrupts(s)).toBe(0);
+        expect(lifecycle(s.events)).toEqual([{ type: 'task_started', turn_id: MAIN_TURN }]);
+        endMainTurn(s);
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: false });
+        expect(lifecycle(s.events)).toEqual([
+            { type: 'task_started', turn_id: MAIN_TURN },
+            { type: 'task_complete', turn_id: MAIN_TURN },
+        ]);
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it.each([
+        ['outside the main lineage', (threadId: string): Reply | 'hold' => childThread(threadId, 'Stranger', null, 'stranger-thread'), 1],
+        ['whose thread/read failed twice, with no spawn item naming it', (): Reply | 'hold' => ({ error: { code: -32600, message: 'thread not loaded' } }), 2],
+        ['whose thread/read is still unanswered', (): Reply | 'hold' => 'hold', 1],
+    ])('[15] reports of a thread %s never count: the main turn is interrupted 1000 ms after its own last report', async (_kind, readThread, reads) => {
+        const s = await openSession({ readThread });
+        // The thread shows up before the turn, so its classification is settled (or still pending) when it reports.
+        s.notify('thread/status/changed', { threadId: OTHER, status: { type: 'idle' } });
+        await vi.advanceTimersByTimeAsync(2_100);
+        expect(s.requests.filter((request) => request.method === 'thread/read' && request.params?.threadId === OTHER)).toHaveLength(reads);
+        const { done: turn } = await startMainTurn(s, { turnTimeoutMs: 1_000 });
+        s.notify('turn/started', { threadId: OTHER, turn: { id: OTHER_TURN, status: 'inProgress' } });
+        await vi.advanceTimersByTimeAsync(900);
+        expect(interrupts(s)).toBe(0);
+        streamDelta(s, OTHER, OTHER_TURN);
+        await vi.advanceTimersByTimeAsync(900);
+        // 1.8 s after the main thread's last report: the watchdog fired at 1 s; the report at 0.9 s did not count.
+        expect(interrupts(s)).toBe(1);
+        expect(listed(s.events).at(-1)).toEqual([]);
+        await settleWatchdogAbort(s, turn);
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it('[15] once the tracked child goes quiet, the waiting main turn is interrupted 1000 ms after its last report, as before', async () => {
+        const s = await openSession();
+        const { done: turn } = await startMainTurn(s, { turnTimeoutMs: 1_000 });
+        spawnV2(s);
+        await vi.advanceTimersByTimeAsync(5);
+        for (let beat = 0; beat < 3; beat++) {
+            await vi.advanceTimersByTimeAsync(900);
+            streamDelta(s);
+        }
+        // Then neither the child nor the main thread reports.
+        await vi.advanceTimersByTimeAsync(900);
+        expect(interrupts(s)).toBe(0);
+        await vi.advanceTimersByTimeAsync(200);
+        expect(interrupts(s)).toBe(1);
+        await settleWatchdogAbort(s, turn);
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
+    it('[15] a tracked child reporting while an approval waits for the user leaves the watchdog disarmed, as before', async () => {
+        const s = await openSession();
+        let answerApproval: () => void = () => { throw new Error('approval not requested yet'); };
+        s.client.setApprovalHandler(async () => {
+            await new Promise<void>((resolve) => { answerApproval = resolve; });
+            return 'approved';
+        });
+        const { done: turn } = await startMainTurn(s, { turnTimeoutMs: 1_000 });
+        spawnV2(s);
+        // The child asks for approval, then keeps reporting while the user does not answer.
+        pushJsonLine(s.proc.stdout, { id: 901, method: 'item/commandExecution/requestApproval', params: {
+            threadId: CHILD, turnId: CHILD_TURN, itemId: 'child-exec', command: 'ls', cwd: '/tmp/project', reason: null,
+        } });
+        for (let beat = 0; beat < 3; beat++) {
+            await vi.advanceTimersByTimeAsync(900);
+            streamDelta(s);
+        }
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(interrupts(s)).toBe(0);
+        // Answering re-arms the watchdog with a full window; with no report after it, it fires 1000 ms later.
+        answerApproval();
+        await vi.advanceTimersByTimeAsync(900);
+        expect(interrupts(s)).toBe(0);
+        await vi.advanceTimersByTimeAsync(200);
+        expect(interrupts(s)).toBe(1);
+        await settleWatchdogAbort(s, turn);
+        await settled(s.client.disconnect(), 'disconnect');
+    });
 });
 
 it('forwards raw browser MCP completion for immediate quota recovery', async () => {

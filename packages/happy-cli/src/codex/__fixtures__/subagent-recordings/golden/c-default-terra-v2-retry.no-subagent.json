@@ -1,0 +1,84 @@
+{
+  "resolvedAt": 4,
+  "eventTypes": [
+    "task_started(turn=80a99d)",
+    "token_count",
+    "token_count",
+    "task_complete(turn=80a99d)"
+  ],
+  "envelopeSummary": [
+    "0:agent:turn-start turn=1",
+    "3:agent:turn-end/completed turn=1"
+  ],
+  "streamDeltaText": "",
+  "events": [
+    {
+      "type": "task_started",
+      "turn_id": "01a17e49-7eb8-7fd1-ac42-bd613f80a99d"
+    },
+    {
+      "type": "token_count",
+      "total": {
+        "totalTokens": 23224,
+        "inputTokens": 23149,
+        "cachedInputTokens": 1792,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 75,
+        "reasoningOutputTokens": 13
+      },
+      "last": {
+        "totalTokens": 23224,
+        "inputTokens": 23149,
+        "cachedInputTokens": 1792,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 75,
+        "reasoningOutputTokens": 13
+      },
+      "modelContextWindow": 258400
+    },
+    {
+      "type": "token_count",
+      "total": {
+        "totalTokens": 23224,
+        "inputTokens": 23149,
+        "cachedInputTokens": 1792,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 75,
+        "reasoningOutputTokens": 13
+      },
+      "last": {
+        "totalTokens": 23224,
+        "inputTokens": 23149,
+        "cachedInputTokens": 1792,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 75,
+        "reasoningOutputTokens": 13
+      },
+      "modelContextWindow": 258400
+    },
+    {
+      "type": "task_complete",
+      "turn_id": "01a17e49-7eb8-7fd1-ac42-bd613f80a99d",
+      "status": "completed"
+    }
+  ],
+  "envelopes": [
+    {
+      "atEvent": 0,
+      "role": "agent",
+      "turn": 1,
+      "ev": {
+        "t": "turn-start"
+      }
+    },
+    {
+      "atEvent": 3,
+      "role": "agent",
+      "turn": 1,
+      "ev": {
+        "t": "turn-end",
+        "status": "completed"
+      }
+    }
+  ]
+}

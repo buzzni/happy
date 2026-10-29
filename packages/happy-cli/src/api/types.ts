@@ -595,6 +595,17 @@ export type Metadata = {
     tasks: Array<{ taskId: string; label: string; kind: 'shell' | 'agent' }> | null;
   },
   codexBackgroundTasks?: Array<{ callId: string; command: string; processId?: string; status: 'running' | 'unknown' }>,
+  /**
+   * The Codex sub-agents (child threads) running now, the shape of `claudeBackgroundTasks`; REPLACE on every
+   * publish. `taskId` is the child thread id, which is also the call id of its `CodexAgent` row.
+   * `tasks` is null only with `available: false` (a Codex too old to report child threads).
+   * aplus-dev-studio-desktop specs/subagent-running-indicator R11.
+   */
+  codexSubagentTasks?: {
+    startedAt: number;
+    available: boolean;
+    tasks: Array<{ taskId: string; label: string; kind: 'agent' }> | null;
+  },
   mcpServers?: Array<{ name: string; status: string; error?: string; checkedAt?: number }>,
   skills?: string[],
   plugins?: Array<{ name: string; path: string }>,

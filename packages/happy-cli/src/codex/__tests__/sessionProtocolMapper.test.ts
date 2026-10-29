@@ -1,9 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createId, isCuid } from '@paralleldrive/cuid2';
 import {
+    sessionEnvelopeSchema,
+    sessionToolCallEndEventSchema,
+    sessionToolCallStartEventSchema,
+    type SessionEnvelope,
+} from '@slopus/happy-wire';
+import {
     mapCodexMcpMessageToSessionEnvelopes,
     mapCodexProcessorMessageToSessionEnvelopes,
     mapCodexThreadToSessionEnvelopes,
+    type CodexTurnState,
 } from '../utils/sessionProtocolMapper';
 
 describe('mapCodexMcpMessageToSessionEnvelopes', () => {
@@ -193,6 +200,163 @@ describe('mapCodexMcpMessageToSessionEnvelopes', () => {
 
         expect(result.envelopes).toHaveLength(0);
         expect(result.currentTurnId).toBe('turn-1');
+    });
+
+    // A sub-agent the main thread spawned inside its turn (CodexAppServerClient `collab_agent_spawned`).
+    describe('collab_agent_spawned', () => {
+        const spawned = {
+            type: 'collab_agent_spawned',
+            call_id: 'call-spawn-1',
+            turn_id: 'provider-1',
+            thread_id: 'child-thread-1',
+            label: 'Linnaeus [explorer]',
+        };
+
+        /** Every field is one the wire schemas know (strict: nothing stripped), and the envelope survives the wire. */
+        function expectWireValid(envelope: SessionEnvelope): void {
+            const eventSchema = envelope.ev.t === 'tool-call-start' ? sessionToolCallStartEventSchema : sessionToolCallEndEventSchema;
+            expect(eventSchema.strict().parse(envelope.ev)).toEqual(envelope.ev);
+            expect(sessionEnvelopeSchema.parse(JSON.parse(JSON.stringify(envelope)))).toEqual(envelope);
+        }
+
+        function withoutIdAndTime(envelope: SessionEnvelope): Omit<SessionEnvelope, 'id' | 'time'> {
+            expect(isCuid(envelope.id)).toBe(true);
+            expect(typeof envelope.time).toBe('number');
+            const { id: _id, time: _time, ...rest } = envelope;
+            return rest;
+        }
+
+        it('adds one CodexAgent row to the open turn, the child thread as its call id and no background task id', () => {
+            const result = mapCodexMcpMessageToSessionEnvelopes(
+                spawned,
+                { currentTurnId: 'turn-1', currentProviderTurnId: 'provider-1' }
+            );
+
+            expect(result.envelopes.map(withoutIdAndTime)).toEqual([
+                {
+                    role: 'agent',
+                    turn: 'turn-1',
+                    ev: {
+                        t: 'tool-call-start',
+                        call: 'child-thread-1',
+                        name: 'CodexAgent',
+                        title: 'Linnaeus [explorer]',
+                        description: 'Linnaeus [explorer]',
+                        args: { agent: 'Linnaeus [explorer]' },
+                    },
+                },
+                {
+                    role: 'agent',
+                    turn: 'turn-1',
+                    // No `backgroundTaskId`: clients read that as a Claude launch whose completion answers a request again.
+                    ev: { t: 'tool-call-end', call: 'child-thread-1' },
+                },
+            ]);
+            for (const envelope of result.envelopes) expectWireValid(envelope);
+            expect(result.currentTurnId).toBe('turn-1');
+            expect(result.currentProviderTurnId).toBe('provider-1');
+        });
+
+        it('adds nothing and changes nothing when no turn is open', () => {
+            const startedSubagents = new Set<string>(['subagent-1']);
+            const activeSubagents = new Set<string>(['subagent-1']);
+            const providerSubagentToSessionSubagent = new Map<string, string>([['parent-call-1', 'subagent-1']]);
+            const providerTurnToProtocol = new Map<string, string>([['provider-0', 'turn-0']]);
+            const state: CodexTurnState = {
+                currentTurnId: null,
+                currentProviderTurnId: null,
+                // A turn-start would consume this; never opening one leaves it waiting.
+                pendingRequestId: 'request-1',
+                currentRequestId: null,
+                startedSubagents,
+                activeSubagents,
+                providerSubagentToSessionSubagent,
+                providerTurnToProtocol,
+            };
+            const before = structuredClone(state);
+
+            const result = mapCodexMcpMessageToSessionEnvelopes(spawned, state);
+
+            expect(result.envelopes).toEqual([]);
+            expect(result.currentTurnId).toBeNull();
+            expect(result.currentProviderTurnId).toBeNull();
+            expect(result.startedSubagents).toBe(startedSubagents);
+            expect(result.activeSubagents).toBe(activeSubagents);
+            expect(result.providerSubagentToSessionSubagent).toBe(providerSubagentToSessionSubagent);
+            expect(state).toEqual(before);
+        });
+
+        it('adds nothing once its turn has ended, so nothing follows the turn-end', () => {
+            const started = mapCodexMcpMessageToSessionEnvelopes({ type: 'task_started', turn_id: 'provider-1' }, { currentTurnId: null });
+            const ended = mapCodexMcpMessageToSessionEnvelopes(
+                { type: 'task_complete', turn_id: 'provider-1' },
+                { currentTurnId: started.currentTurnId, currentProviderTurnId: started.currentProviderTurnId }
+            );
+            expect(ended.envelopes.map((envelope) => envelope.ev.t)).toEqual(['turn-end']);
+
+            const late = mapCodexMcpMessageToSessionEnvelopes(
+                spawned,
+                { currentTurnId: ended.currentTurnId, currentProviderTurnId: ended.currentProviderTurnId }
+            );
+            expect(late.envelopes).toEqual([]);
+            expect(late.currentTurnId).toBeNull();
+        });
+
+        it('falls back to the Agent label and a generated call id, and omits a missing child thread id', () => {
+            const result = mapCodexMcpMessageToSessionEnvelopes(
+                { type: 'collab_agent_spawned', turn_id: 'provider-1' },
+                { currentTurnId: 'turn-1' }
+            );
+
+            expect(result.envelopes).toHaveLength(2);
+            const [start, end] = result.envelopes;
+            expect(start.ev).toEqual({
+                t: 'tool-call-start',
+                call: expect.any(String),
+                name: 'CodexAgent',
+                title: 'Agent',
+                description: 'Agent',
+                args: { agent: 'Agent' },
+            });
+            const call = start.ev.t === 'tool-call-start' ? start.ev.call : '';
+            expect(call.length).toBeGreaterThan(0);
+            expect(end.ev).toEqual({ t: 'tool-call-end', call });
+            for (const envelope of result.envelopes) {
+                expect(envelope.turn).toBe('turn-1');
+                expectWireValid(envelope);
+            }
+        });
+
+        it.each([
+            ['not strings', { call_id: 42, thread_id: 7, label: { nickname: 'Linnaeus' } }],
+            ['empty', { call_id: '', thread_id: '', label: '  ' }],
+        ])('treats a label, call id and child thread id that are %s as missing', (_case, fields) => {
+            const result = mapCodexMcpMessageToSessionEnvelopes(
+                { type: 'collab_agent_spawned', turn_id: 'provider-1', ...fields },
+                { currentTurnId: 'turn-1' }
+            );
+
+            const [start, end] = result.envelopes;
+            expect(start.ev).toMatchObject({ t: 'tool-call-start', name: 'CodexAgent', title: 'Agent', description: 'Agent', args: { agent: 'Agent' } });
+            const call = start.ev.t === 'tool-call-start' ? start.ev.call : '';
+            expect(call.length).toBeGreaterThan(0);
+            expect(end.ev).toEqual({ t: 'tool-call-end', call });
+            for (const envelope of result.envelopes) expectWireValid(envelope);
+        });
+
+        it('never ties the row to a session sub-agent, even when the message names a parent call', () => {
+            const providerSubagentToSessionSubagent = new Map<string, string>();
+            const result = mapCodexMcpMessageToSessionEnvelopes(
+                { ...spawned, parent_call_id: 'parent-call-1', subagent: 'provider-subagent-1' },
+                { currentTurnId: 'turn-1', providerSubagentToSessionSubagent }
+            );
+
+            expect(result.envelopes.map((envelope) => envelope.ev.t)).toEqual(['tool-call-start', 'tool-call-end']);
+            for (const envelope of result.envelopes) expect(envelope).not.toHaveProperty('subagent');
+            expect(result.providerSubagentToSessionSubagent.size).toBe(0);
+            expect(result.startedSubagents.size).toBe(0);
+            expect(result.activeSubagents.size).toBe(0);
+        });
     });
 });
 
