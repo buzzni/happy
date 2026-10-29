@@ -5,6 +5,7 @@ import { request } from 'node:http'
 import { join } from 'node:path'
 import { readMessageAck } from '@/api/apiSession'
 import { encodeBase64, encrypt } from '@/api/encryption'
+import type { BrokerReply } from '@/browserRuntime/brokerGrantSource'
 import type { AttentionEvent, AttentionFeed } from '@/browserRuntime/contracts'
 import { BrowserAttentionWatcher, createAttentionCursorStore } from './browserAttentionWatcher'
 import { readBrowserTaskBrokerConfig, type BrowserTaskBrokerConfig } from './browserTaskBroker'
@@ -12,12 +13,16 @@ import type { TrackedSession } from './types'
 
 const MAX_REPLY_BYTES = 1024 * 1024
 
-export function pollBrowserAttention(config: BrowserTaskBrokerConfig, afterSeq: number, signal: AbortSignal): Promise<AttentionFeed> {
+export async function pollBrowserAttention(config: BrowserTaskBrokerConfig, afterSeq: number, signal: AbortSignal): Promise<AttentionFeed> {
+    const reply = await attentionBrokerGet(config.socketPath, `/v1/attention?afterSeq=${afterSeq}&waitMs=30000`, { 'x-abp-daemon-token': config.daemonToken }, signal)
+    if (reply.status !== 200 || reply.body.ok !== true || !reply.body.result) throw new Error('Invalid attention broker reply')
+    return reply.body.result as AttentionFeed
+}
+
+/** One bounded GET on the broker socket: a size cap and an absolute deadline that covers a long poll. */
+function attentionBrokerGet(socketPath: string, path: string, headers: Record<string, string>, signal: AbortSignal): Promise<BrokerReply> {
     return new Promise((resolve, reject) => {
-        const req = request({
-            socketPath: config.socketPath, method: 'GET', path: `/v1/attention?afterSeq=${afterSeq}&waitMs=30000`, signal,
-            headers: { 'x-abp-daemon-token': config.daemonToken },
-        }, res => {
+        const req = request({ socketPath, method: 'GET', path, signal, headers }, res => {
             const chunks: Buffer[] = []; let bytes = 0
             res.on('data', (chunk: Buffer) => {
                 bytes += chunk.length
@@ -26,11 +31,8 @@ export function pollBrowserAttention(config: BrowserTaskBrokerConfig, afterSeq: 
             })
             res.on('error', reject)
             res.on('end', () => {
-                try {
-                    const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { ok?: boolean; result?: AttentionFeed }
-                    if (res.statusCode !== 200 || body.ok !== true || !body.result) throw new Error('Attention broker refused request')
-                    resolve(body.result)
-                } catch { reject(new Error('Invalid attention broker reply')) }
+                try { resolve({ status: res.statusCode ?? 0, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) as BrokerReply['body'] }) }
+                catch { reject(new Error('Invalid attention broker reply')) }
             })
         })
         // Absolute deadline, including a broker that trickles a response forever.
