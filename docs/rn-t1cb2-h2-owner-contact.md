@@ -33,7 +33,8 @@ A+/Desktop 동작은 `lookup`, `currentContact`, `exchange` 주입 port로 테�
 2. `api/apiSession.ts`의 실제 session/runtime 수명주기와 위 registry/port의 연결. `runtimeId` 입력을
    지원한다는 사실은 실제 launch에서 공급된다는 뜻이 아니다. 현재 production에서 새 port를 생성하는 호출부는 없다.
 3. Gemini/opencode/grok 직접 runtime의 별도 local transport와 CLI discovery, source/entry 정책 연결.
-   broker private IPC만으로 직접 경로의 지원을 주장하지 않는다.
+   broker private IPC만으로 직접 경로의 지원을 주장하지 않는다. 아래 후속 local transport 모듈은 추가됐지만
+   실제 runtime 연결과 실소켓 수락은 아직 남아 있다.
 4. trust 설정·machine 인증 lookup·source-DEK RPC의 host assembly와 default-off rollout switch 연결.
    현재 `enabled`는 내부 주입 옵션이며 제품 설정/env 스위치가 아니다.
 5. 실제 생성/재개 bootstrap, 제한 lookup의 read ACL/depth 정책, 키 비노출 경계, 기존 read/후손
@@ -63,3 +64,41 @@ D1/A1/H3는 구현하지 않았다. 위 미완료를 그 작업들로 떠넘기�
 **1 failed / 9 passed**를 확인한 뒤 원본을 복원했다. 역검증용 임시 Vitest config는 global build를
 생략하여 해당 테스트만 실행했고 제거했다. 관련 소스 공백 검사 통과. manifest/lockfile과 기존
 sessionOwnership.ts는 H1 checkout과 바이트가 같다. Git metadata는 사용하지 않았다.
+
+
+## 63195d7b 이후: 직접 경로 local transport (미커밋·부분 검증)
+
+추가 파일은 `daemon/sessionOwnerContactLocal.ts`와 대응 테스트뿐이다. 새 외부 의존성이나 wire 변경은 없다.
+`startSessionOwnerContactLocal({ enabled, contact })`는 기본 off이며 off에서는 소켓 생성/host 호출/폐기를 하지 않는다.
+ON은 POSIX owner-only Unix socket으로 `/owner-contact-v1` POST만 받고 H1 local DTO를 검증한다.
+source/scope/depth/authority/argv 주입은 거부하며 기존 broker와 listener·protocol을 공유하지 않는다.
+반환 discovery는 `SAYCODE_OWNER_CONTACT_SOCKET` 주소 하나다. 주소는 owner 증명이 아니고,
+소유 권위는 공급받은 고정 host contact가 검증한다. 함수가 process.env를 읽거나 쓰지 않는다.
+
+- private 디렉터리 0700, socket 0600. TCP fallback과 새 bearer/key export 없음.
+- 요청 64KiB, fatal UTF-8 decoding, H1 응답 128KiB, 동시 요청 8개, 20초 socket deadline.
+- Origin·미지 URL·GET 거부. adapter exception/유효하지 않은 reply는 상세 없이 503.
+- close는 contact를 폐기하고 연결을 닫고 디렉터리를 삭제한다. adapter promise가 취소를 무시해도 기다리지 않는다.
+- Windows pipe ACL 구현·검증은 없으며 활성화하면 unsupported다. host/provider sandbox에 이 소켓의 접근을
+  전달하는 정책과 실제 runtime discovery 연결도 아직 구현하지 않았다.
+
+테스트 15건은 default off, 권한, DTO 필드 주입 6건, URL/verb/크기/lookup 제한, UTF-8, deadline,
+오류 비노출, pending close, concurrency, 기존 broker와의 병행 동작을 대상으로 한다.
+마지막 병행 테스트는 기존 broker **dispatch**가 read/wait/search/prompt/steer/stop을 계속 전달하는지 확인한다.
+실제 Desktop 후손 인가/원장 통합을 검증한다고 해석하지 않는다.
+
+초기 실패는 신규 모듈 부재로 타입 검사가 거부했다. 구현 뒤 표준 Vitest에서 local 테스트는
+**1 passed / 14 failed**이며 14건 모두 socket listen 전제에서 멈췄다. 이 세션의 환경에서
+Node Unix socket `listen`이 `/tmp`와 작업트리 상대 경로 모두 `EPERM`을 반환함을 최소 Node probe로 확인했다.
+TCP broker는 실행 가능했다. 이 환경 실패를 skip이나 통과로 바꾸지 않았다. 실소켓 실행이 가능한 환경에서
+15건을 다시 실행해야 하며, 실패가 환경뿐이라는 가정으로 나머지 assertion을 통과 처리하지 않는다.
+
+남은 H2는 실제 launch/resume private bootstrap, ApiSession 수명주기 배선, 이 transport의 runtime 연결,
+운영 host adapter assembly, read/후손 인가 통합 회귀다. local transport의 Unix 실검증과 Windows 지원도 남는다.
+계약 변경 필요성은 확인하지 않았다. 이번 후속에서는 의존성을 추가 설치하지 않았고 커밋하지 않았다.
+
+후속 검증 결과: 별도 CLI `tsc --noEmit`(8GiB NODE_OPTIONS) 통과. 기존 관련 4개 파일
+(`sessionOwnerContact`, `agentCallerBinding`, `sessionAgentBroker`, `agentBroker`)은 **23 passed / 1 skipped**.
+새 local transport의 default-off gate를 제거하면 해당 테스트가 실패하고 복원하면 통과했다.
+이 역검증은 임시 Vitest config와 `-t 'default off'`로 1건만 선택했으며 나머지 14건의 미선택을
+실행 통과로 세지 않는다. 임시 config는 제거하고 소스를 복원했다. Unix listen 제약은 해결하지 못했다.
