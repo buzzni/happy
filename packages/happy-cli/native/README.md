@@ -290,3 +290,21 @@ This is runtime process containment, not a Chrome isolation claim: browser execu
 a distinct SID, CDP transport, Windows production bootstrap, authenticated requests and
 installer/upgrade/reboot acceptance remain outstanding. runtimeReady stays false. Revisit
 the fixed payload and environment contract when connecting the Windows production bundle.
+
+## Windows worker review and Chrome transport check (2026-10-30)
+
+The host now acquires its first-instance status pipe before launching a worker. A pipe
+squatter therefore cannot cause a worker to run before the host rejects startup. The
+initial success exit code is set before starting the monitor, so an immediately failed
+worker cannot have its error overwritten. The SCM fixture now injects NODE_OPTIONS and
+a synthetic authority-free bearer marker into the host's registry environment and verifies
+that neither reaches the worker. The real Windows service regression passed after review.
+
+A diagnostic bundle using the actual CdpConnection and CdpDriver also ran Chrome
+156.0.8078.73 under the verification service identity, with an isolated profile and inherited
+pipes (no debugging port or sandbox-disabling switch). It opened a loopback test page,
+observed its canary and closed its tab. Stop/restart/host crash/worker exit checks passed.
+This diagnostic deliberately does not establish production credential isolation: Chrome
+and the diagnostic Node worker share the verification service SID. A separate browser SID
+and authenticated CDP handoff are required before enabling Windows product readiness.
+The Desktop evidence directory contains the diagnostic source/bundle and native logs.

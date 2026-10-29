@@ -143,8 +143,9 @@ internal sealed class BrowserService : ServiceBase {
     protected override void OnStart(string[] args) {
         PrepareCustody();
         ExitCode = 15;
-        try { StartWorker(); pending = CreateStatusPipe(); }
+        try { pending = CreateStatusPipe(); StartWorker(); }
         catch { OnStop(); throw; }
+        ExitCode = 0;
         if (worker!=null) Task.Run(async delegate {
             try {
                 while (true) {
@@ -154,7 +155,6 @@ internal sealed class BrowserService : ServiceBase {
             } catch { }
             if (!stopping) { ExitCode=16; Stop(); }
         });
-        ExitCode = 0;
         Task.Run(async delegate {
             try {
                 while (!stopping) {

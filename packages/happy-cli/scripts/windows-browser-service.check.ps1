@@ -47,6 +47,9 @@ try {
     }
     $state.Create($private)
     if ($WorkerFixture) {
+        # Set the SCM service environment, not just this test process environment.
+        # Neither variable may reach the worker even though both reach the host.
+        New-ItemProperty -Path ('HKLM:\SYSTEM\CurrentControlSet\Services\' + $name) -Name Environment -PropertyType MultiString -Value @('NODE_OPTIONS=--invalid-saycode-test-option','SAYCODE_TEST_BEARER=synthetic-no-authority') | Out-Null
         $runtime = Join-Path $root 'runtime'
         [void](New-Item -ItemType Directory -Path (Join-Path $runtime 'dist'))
         [IO.File]::WriteAllText((Join-Path $root 'runtime.json'), '{}')
@@ -64,7 +67,8 @@ class Fixture {
         if (args.Length != 1 || args[0] != Path.Combine(root,"runtime","dist","runtime.mjs") ||
             Environment.GetEnvironmentVariable("ABP_CONFIG_FILE") != Path.Combine(root,"runtime.json") ||
             Environment.GetEnvironmentVariable("ABP_STATE_DIR") != Path.Combine(root,"state") ||
-            Environment.GetEnvironmentVariable("NODE_OPTIONS") != null) return 41;
+            Environment.GetEnvironmentVariable("NODE_OPTIONS") != null ||
+            Environment.GetEnvironmentVariable("SAYCODE_TEST_BEARER") != null) return 41;
         using (var child = Process.Start(new ProcessStartInfo(typeof(Fixture).Assembly.Location,"child") { UseShellExecute=false, CreateNoWindow=true })) {
             File.WriteAllText(Path.Combine(root,"state","worker-child.txt"), child.Id.ToString());
             while (!File.Exists(Path.Combine(root,"state","worker-exit"))) Thread.Sleep(50);
