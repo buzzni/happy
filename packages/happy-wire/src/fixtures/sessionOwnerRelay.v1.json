@@ -1,0 +1,620 @@
+{
+  "description": "Public deterministic vectors generated independently with Node crypto Ed25519/SHA-256 and UTF-16 sorted JSON. Seeds are test-only. Includes confirmed and personal source contacts; no live credentials.",
+  "contact": {
+    "version": 1,
+    "type": "saycode-owner-relay-contact",
+    "issuer": "https://api.example.com",
+    "audience": "https://happy.example.com",
+    "keyId": "6c8f8607dbe87077a62a2990ce07d94aaf749df76f87b98eb786a6d10f030765",
+    "issuedAt": 1800000000000,
+    "expiresAt": 1800000060000,
+    "signature": "IaI3hGC63hJvFi72SfC3JDjUsoj_YgWTlp1wgYCNAFr9XnuUEBpgzpNtf8ib8iki_XuzjjyX349LgxDyl3F3CA",
+    "hubId": "source-1",
+    "sourceAuthority": {
+      "kind": "confirmed-owner",
+      "bindingId": "binding-1"
+    },
+    "callerBindingId": "caller-1",
+    "sourceRuntimeId": "runtime-1",
+    "hostEpoch": "host-1",
+    "callerPublicKey": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc",
+    "machineId": "machine-1",
+    "happyAccountId": "account-1",
+    "scope": "/project",
+    "depth": 0,
+    "ownerSubject": {
+      "issuer": "https://api.example.com",
+      "userId": "owner-1"
+    },
+    "desktopInstanceId": "desktop-1",
+    "publicKey": "oJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPA",
+    "method": "owner-relay-v1:abcdefghijklmnop",
+    "epoch": "relay-1"
+  },
+  "vectors": [
+    {
+      "request": {
+        "v": 1,
+        "requestId": "request-lookup-readable-sessions",
+        "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sourceHubSessionId": "source-1",
+        "sourceRuntimeId": "runtime-1",
+        "callerBindingId": "caller-1",
+        "hostEpoch": "host-1",
+        "sourceAuthority": {
+          "kind": "confirmed-owner",
+          "bindingId": "binding-1"
+        },
+        "relayEpoch": "relay-1",
+        "entry": "agent",
+        "operation": "lookup-readable-sessions",
+        "intentDigest": "11cac439b4acc8af3274094c555d6041ea45548c85a020908bbd91d1b36ddb13",
+        "payload": {
+          "sessionIds": [
+            "target-1"
+          ]
+        },
+        "callerSignature": "kQgp090XDSj5h8pYFZt3qo4e_ChOpTN9GQt2PwJZEiwsf8JpYCj2lQOMgwEDYewl2sZENHJjb5Dm4vtkCES6AQ"
+      },
+      "reply": {
+        "v": 1,
+        "requestId": "request-lookup-readable-sessions",
+        "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sourceHubSessionId": "source-1",
+        "sourceRuntimeId": "runtime-1",
+        "callerBindingId": "caller-1",
+        "hostEpoch": "host-1",
+        "sourceAuthority": {
+          "kind": "confirmed-owner",
+          "bindingId": "binding-1"
+        },
+        "relayEpoch": "relay-1",
+        "intentDigest": "11cac439b4acc8af3274094c555d6041ea45548c85a020908bbd91d1b36ddb13",
+        "responderSubject": {
+          "issuer": "https://api.example.com",
+          "userId": "owner-1"
+        },
+        "checkedAt": 1800000000000,
+        "result": "allowed",
+        "operation": "lookup-readable-sessions",
+        "signature": "s3ft2AyNMmDxAm3eP7eAK23qHEWV3106FyOHGMU7poUwjkLS-d_AfC4wvVu8M4ySz6JVjtQdZC0RwDYIFatsCA",
+        "owners": [
+          {
+            "sessionId": "target-1",
+            "proof": null,
+            "ownerSubject": null,
+            "relation": "unknown",
+            "reason": "owner-unknown"
+          }
+        ]
+      },
+      "intentInput": "saycode-owner-relay/v1\u0000intent\u0000{\"callerBindingId\":\"caller-1\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"operation\":\"lookup-readable-sessions\",\"payload\":{\"sessionIds\":[\"target-1\"]},\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}",
+      "requestSigningInput": "saycode-owner-relay/v1\u0000request\u0000{\"callerBindingId\":\"caller-1\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"intentDigest\":\"11cac439b4acc8af3274094c555d6041ea45548c85a020908bbd91d1b36ddb13\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"lookup-readable-sessions\",\"payload\":{\"sessionIds\":[\"target-1\"]},\"relayEpoch\":\"relay-1\",\"requestId\":\"request-lookup-readable-sessions\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}",
+      "replySigningInput": "saycode-owner-relay/v1\u0000reply\u0000{\"callerBindingId\":\"caller-1\",\"checkedAt\":1800000000000,\"hostEpoch\":\"host-1\",\"intentDigest\":\"11cac439b4acc8af3274094c555d6041ea45548c85a020908bbd91d1b36ddb13\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"lookup-readable-sessions\",\"owners\":[{\"ownerSubject\":null,\"proof\":null,\"reason\":\"owner-unknown\",\"relation\":\"unknown\",\"sessionId\":\"target-1\"}],\"relayEpoch\":\"relay-1\",\"requestId\":\"request-lookup-readable-sessions\",\"responderSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"result\":\"allowed\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}",
+      "requestWire": "{\"callerBindingId\":\"caller-1\",\"callerSignature\":\"kQgp090XDSj5h8pYFZt3qo4e_ChOpTN9GQt2PwJZEiwsf8JpYCj2lQOMgwEDYewl2sZENHJjb5Dm4vtkCES6AQ\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"intentDigest\":\"11cac439b4acc8af3274094c555d6041ea45548c85a020908bbd91d1b36ddb13\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"lookup-readable-sessions\",\"payload\":{\"sessionIds\":[\"target-1\"]},\"relayEpoch\":\"relay-1\",\"requestId\":\"request-lookup-readable-sessions\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}",
+      "replyWire": "{\"callerBindingId\":\"caller-1\",\"checkedAt\":1800000000000,\"hostEpoch\":\"host-1\",\"intentDigest\":\"11cac439b4acc8af3274094c555d6041ea45548c85a020908bbd91d1b36ddb13\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"lookup-readable-sessions\",\"owners\":[{\"ownerSubject\":null,\"proof\":null,\"reason\":\"owner-unknown\",\"relation\":\"unknown\",\"sessionId\":\"target-1\"}],\"relayEpoch\":\"relay-1\",\"requestId\":\"request-lookup-readable-sessions\",\"responderSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"result\":\"allowed\",\"signature\":\"s3ft2AyNMmDxAm3eP7eAK23qHEWV3106FyOHGMU7poUwjkLS-d_AfC4wvVu8M4ySz6JVjtQdZC0RwDYIFatsCA\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}"
+    },
+    {
+      "request": {
+        "v": 1,
+        "requestId": "request-read-session",
+        "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sourceHubSessionId": "source-1",
+        "sourceRuntimeId": "runtime-1",
+        "callerBindingId": "caller-1",
+        "hostEpoch": "host-1",
+        "sourceAuthority": {
+          "kind": "personal-account",
+          "descriptorId": "descriptor-1",
+          "registrationRevision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "relayEpoch": "relay-1",
+        "entry": "agent",
+        "operation": "read-session",
+        "intentDigest": "2e97eabb894ec3bf583cce46b653ccf4f939011ab87aae57663650e4a4b76bca",
+        "payload": {
+          "cursor": null,
+          "limit": 50,
+          "waitMs": 15000
+        },
+        "callerSignature": "IBcw7mOf83yZ3TjaaIK8E-9s8wJuznguu8lHTHrKYLsEnn1ynhmmf7zGbNc_CTAglGrWb3h4-I8m66cxhJ4mDQ",
+        "targetSessionId": "target-1"
+      },
+      "reply": {
+        "v": 1,
+        "requestId": "request-read-session",
+        "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sourceHubSessionId": "source-1",
+        "sourceRuntimeId": "runtime-1",
+        "callerBindingId": "caller-1",
+        "hostEpoch": "host-1",
+        "sourceAuthority": {
+          "kind": "personal-account",
+          "descriptorId": "descriptor-1",
+          "registrationRevision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "relayEpoch": "relay-1",
+        "intentDigest": "2e97eabb894ec3bf583cce46b653ccf4f939011ab87aae57663650e4a4b76bca",
+        "responderSubject": {
+          "issuer": "https://api.example.com",
+          "userId": "owner-1"
+        },
+        "checkedAt": 1800000000000,
+        "result": "allowed",
+        "operation": "read-session",
+        "signature": "qcml6ZTFQHJZLT4HzkYrt0E2oUYjRCc25dvXUy5mOH9fIsNe_h8eZFJWgWuUq1N2CTveONG_13IbpvJF8WzrCQ",
+        "sessionView": {
+          "sessionId": "target-1",
+          "cursor": null,
+          "snapshot": {
+            "active": true,
+            "thinking": false,
+            "pendingPermissionRequests": [
+              {
+                "requestId": "permission-1",
+                "toolName": "AskUserQuestion",
+                "title": "질문",
+                "arguments": {
+                  "answers": {
+                    "q": [
+                      "한글",
+                      -1,
+                      0.5
+                    ]
+                  }
+                },
+                "kind": "ask-user-question"
+              }
+            ]
+          },
+          "events": [],
+          "truncated": false
+        }
+      },
+      "intentInput": "saycode-owner-relay/v1\u0000intent\u0000{\"callerBindingId\":\"caller-1\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"operation\":\"read-session\",\"payload\":{\"cursor\":null,\"limit\":50,\"waitMs\":15000},\"sourceAuthority\":{\"descriptorId\":\"descriptor-1\",\"kind\":\"personal-account\",\"registrationRevision\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"targetSessionId\":\"target-1\",\"v\":1}",
+      "requestSigningInput": "saycode-owner-relay/v1\u0000request\u0000{\"callerBindingId\":\"caller-1\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"intentDigest\":\"2e97eabb894ec3bf583cce46b653ccf4f939011ab87aae57663650e4a4b76bca\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"read-session\",\"payload\":{\"cursor\":null,\"limit\":50,\"waitMs\":15000},\"relayEpoch\":\"relay-1\",\"requestId\":\"request-read-session\",\"sourceAuthority\":{\"descriptorId\":\"descriptor-1\",\"kind\":\"personal-account\",\"registrationRevision\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"targetSessionId\":\"target-1\",\"v\":1}",
+      "replySigningInput": "saycode-owner-relay/v1\u0000reply\u0000{\"callerBindingId\":\"caller-1\",\"checkedAt\":1800000000000,\"hostEpoch\":\"host-1\",\"intentDigest\":\"2e97eabb894ec3bf583cce46b653ccf4f939011ab87aae57663650e4a4b76bca\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"read-session\",\"relayEpoch\":\"relay-1\",\"requestId\":\"request-read-session\",\"responderSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"result\":\"allowed\",\"sessionView\":{\"cursor\":null,\"events\":[],\"sessionId\":\"target-1\",\"snapshot\":{\"active\":true,\"pendingPermissionRequests\":[{\"arguments\":{\"answers\":{\"q\":[\"한글\",-1,0.5]}},\"kind\":\"ask-user-question\",\"requestId\":\"permission-1\",\"title\":\"질문\",\"toolName\":\"AskUserQuestion\"}],\"thinking\":false},\"truncated\":false},\"sourceAuthority\":{\"descriptorId\":\"descriptor-1\",\"kind\":\"personal-account\",\"registrationRevision\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}",
+      "requestWire": "{\"callerBindingId\":\"caller-1\",\"callerSignature\":\"IBcw7mOf83yZ3TjaaIK8E-9s8wJuznguu8lHTHrKYLsEnn1ynhmmf7zGbNc_CTAglGrWb3h4-I8m66cxhJ4mDQ\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"intentDigest\":\"2e97eabb894ec3bf583cce46b653ccf4f939011ab87aae57663650e4a4b76bca\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"read-session\",\"payload\":{\"cursor\":null,\"limit\":50,\"waitMs\":15000},\"relayEpoch\":\"relay-1\",\"requestId\":\"request-read-session\",\"sourceAuthority\":{\"descriptorId\":\"descriptor-1\",\"kind\":\"personal-account\",\"registrationRevision\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"targetSessionId\":\"target-1\",\"v\":1}",
+      "replyWire": "{\"callerBindingId\":\"caller-1\",\"checkedAt\":1800000000000,\"hostEpoch\":\"host-1\",\"intentDigest\":\"2e97eabb894ec3bf583cce46b653ccf4f939011ab87aae57663650e4a4b76bca\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"read-session\",\"relayEpoch\":\"relay-1\",\"requestId\":\"request-read-session\",\"responderSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"result\":\"allowed\",\"sessionView\":{\"cursor\":null,\"events\":[],\"sessionId\":\"target-1\",\"snapshot\":{\"active\":true,\"pendingPermissionRequests\":[{\"arguments\":{\"answers\":{\"q\":[\"한글\",-1,0.5]}},\"kind\":\"ask-user-question\",\"requestId\":\"permission-1\",\"title\":\"질문\",\"toolName\":\"AskUserQuestion\"}],\"thinking\":false},\"truncated\":false},\"signature\":\"qcml6ZTFQHJZLT4HzkYrt0E2oUYjRCc25dvXUy5mOH9fIsNe_h8eZFJWgWuUq1N2CTveONG_13IbpvJF8WzrCQ\",\"sourceAuthority\":{\"descriptorId\":\"descriptor-1\",\"kind\":\"personal-account\",\"registrationRevision\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}"
+    },
+    {
+      "request": {
+        "v": 1,
+        "requestId": "request-prompt-own-session",
+        "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sourceHubSessionId": "source-1",
+        "sourceRuntimeId": "runtime-1",
+        "callerBindingId": "caller-1",
+        "hostEpoch": "host-1",
+        "sourceAuthority": {
+          "kind": "confirmed-owner",
+          "bindingId": "binding-1"
+        },
+        "relayEpoch": "relay-1",
+        "entry": "agent",
+        "operation": "prompt-own-session",
+        "intentDigest": "c92c9d581ffab8bdbd13b8d12adb4936de6e692ebce4f864266c873f75d16259",
+        "payload": {
+          "text": "안녕 🌍",
+          "settings": {
+            "model": "default",
+            "effort": null
+          },
+          "delegatedAttendance": "unattended",
+          "hubPrompt": {
+            "v": 1,
+            "targetSessionId": "target-1",
+            "expectedRuntimeId": "target-runtime",
+            "expectedMode": "remote",
+            "expectedModeEpoch": 2
+          }
+        },
+        "callerSignature": "q618ILZsva-GQxvesO6fb0nCwKeXyev83Ss79s98ezm-ksAnqU_OxP-NHxuwcIJCRqDg-pxawhLOSE5K_CPBAQ",
+        "targetSessionId": "target-1",
+        "localId": "local-1"
+      },
+      "reply": {
+        "v": 1,
+        "requestId": "request-prompt-own-session",
+        "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sourceHubSessionId": "source-1",
+        "sourceRuntimeId": "runtime-1",
+        "callerBindingId": "caller-1",
+        "hostEpoch": "host-1",
+        "sourceAuthority": {
+          "kind": "confirmed-owner",
+          "bindingId": "binding-1"
+        },
+        "relayEpoch": "relay-1",
+        "intentDigest": "c92c9d581ffab8bdbd13b8d12adb4936de6e692ebce4f864266c873f75d16259",
+        "responderSubject": {
+          "issuer": "https://api.example.com",
+          "userId": "owner-1"
+        },
+        "checkedAt": 1800000000000,
+        "result": "allowed",
+        "operation": "prompt-own-session",
+        "signature": "8Gl7AKvDuVZU1PHurbyx8zgHPolXa8KS3FTTeo37WklPYB6jPx6YBwC5MZ6peT3fMvDPoJEKI7XIBn50UAbBCQ",
+        "storage": {
+          "messageId": "message-1",
+          "seq": 1,
+          "localId": "local-1",
+          "bodyVerified": true
+        }
+      },
+      "intentInput": "saycode-owner-relay/v1\u0000intent\u0000{\"callerBindingId\":\"caller-1\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"localId\":\"local-1\",\"operation\":\"prompt-own-session\",\"payload\":{\"delegatedAttendance\":\"unattended\",\"hubPrompt\":{\"expectedMode\":\"remote\",\"expectedModeEpoch\":2,\"expectedRuntimeId\":\"target-runtime\",\"targetSessionId\":\"target-1\",\"v\":1},\"settings\":{\"effort\":null,\"model\":\"default\"},\"text\":\"안녕 🌍\"},\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"targetSessionId\":\"target-1\",\"v\":1}",
+      "requestSigningInput": "saycode-owner-relay/v1\u0000request\u0000{\"callerBindingId\":\"caller-1\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"intentDigest\":\"c92c9d581ffab8bdbd13b8d12adb4936de6e692ebce4f864266c873f75d16259\",\"localId\":\"local-1\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"prompt-own-session\",\"payload\":{\"delegatedAttendance\":\"unattended\",\"hubPrompt\":{\"expectedMode\":\"remote\",\"expectedModeEpoch\":2,\"expectedRuntimeId\":\"target-runtime\",\"targetSessionId\":\"target-1\",\"v\":1},\"settings\":{\"effort\":null,\"model\":\"default\"},\"text\":\"안녕 🌍\"},\"relayEpoch\":\"relay-1\",\"requestId\":\"request-prompt-own-session\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"targetSessionId\":\"target-1\",\"v\":1}",
+      "replySigningInput": "saycode-owner-relay/v1\u0000reply\u0000{\"callerBindingId\":\"caller-1\",\"checkedAt\":1800000000000,\"hostEpoch\":\"host-1\",\"intentDigest\":\"c92c9d581ffab8bdbd13b8d12adb4936de6e692ebce4f864266c873f75d16259\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"prompt-own-session\",\"relayEpoch\":\"relay-1\",\"requestId\":\"request-prompt-own-session\",\"responderSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"result\":\"allowed\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"storage\":{\"bodyVerified\":true,\"localId\":\"local-1\",\"messageId\":\"message-1\",\"seq\":1},\"v\":1}",
+      "requestWire": "{\"callerBindingId\":\"caller-1\",\"callerSignature\":\"q618ILZsva-GQxvesO6fb0nCwKeXyev83Ss79s98ezm-ksAnqU_OxP-NHxuwcIJCRqDg-pxawhLOSE5K_CPBAQ\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"intentDigest\":\"c92c9d581ffab8bdbd13b8d12adb4936de6e692ebce4f864266c873f75d16259\",\"localId\":\"local-1\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"prompt-own-session\",\"payload\":{\"delegatedAttendance\":\"unattended\",\"hubPrompt\":{\"expectedMode\":\"remote\",\"expectedModeEpoch\":2,\"expectedRuntimeId\":\"target-runtime\",\"targetSessionId\":\"target-1\",\"v\":1},\"settings\":{\"effort\":null,\"model\":\"default\"},\"text\":\"안녕 🌍\"},\"relayEpoch\":\"relay-1\",\"requestId\":\"request-prompt-own-session\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"targetSessionId\":\"target-1\",\"v\":1}",
+      "replyWire": "{\"callerBindingId\":\"caller-1\",\"checkedAt\":1800000000000,\"hostEpoch\":\"host-1\",\"intentDigest\":\"c92c9d581ffab8bdbd13b8d12adb4936de6e692ebce4f864266c873f75d16259\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"prompt-own-session\",\"relayEpoch\":\"relay-1\",\"requestId\":\"request-prompt-own-session\",\"responderSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"result\":\"allowed\",\"signature\":\"8Gl7AKvDuVZU1PHurbyx8zgHPolXa8KS3FTTeo37WklPYB6jPx6YBwC5MZ6peT3fMvDPoJEKI7XIBn50UAbBCQ\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"storage\":{\"bodyVerified\":true,\"localId\":\"local-1\",\"messageId\":\"message-1\",\"seq\":1},\"v\":1}"
+    },
+    {
+      "request": {
+        "v": 1,
+        "requestId": "request-resume-own-session",
+        "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sourceHubSessionId": "source-1",
+        "sourceRuntimeId": "runtime-1",
+        "callerBindingId": "caller-1",
+        "hostEpoch": "host-1",
+        "sourceAuthority": {
+          "kind": "confirmed-owner",
+          "bindingId": "binding-1"
+        },
+        "relayEpoch": "relay-1",
+        "entry": "agent",
+        "operation": "resume-own-session",
+        "intentDigest": "4f640ebb03315bfff0d94e41449bcb28a640e7464596a7805e4925a1ca4b4c16",
+        "payload": {
+          "sessionId": "target-1",
+          "expectedMachineId": "machine-1",
+          "runtimeId": null
+        },
+        "callerSignature": "wvSw1r-oqtiZ0RdLAEKRi2oWPcAhwEyrUx6oPdTedFTwAraIZvIuD54NhWzv3k8N55PlG0lgG2N_6pOMXVEXBw",
+        "targetSessionId": "target-1"
+      },
+      "reply": {
+        "v": 1,
+        "requestId": "request-resume-own-session",
+        "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sourceHubSessionId": "source-1",
+        "sourceRuntimeId": "runtime-1",
+        "callerBindingId": "caller-1",
+        "hostEpoch": "host-1",
+        "sourceAuthority": {
+          "kind": "confirmed-owner",
+          "bindingId": "binding-1"
+        },
+        "relayEpoch": "relay-1",
+        "intentDigest": "4f640ebb03315bfff0d94e41449bcb28a640e7464596a7805e4925a1ca4b4c16",
+        "responderSubject": {
+          "issuer": "https://api.example.com",
+          "userId": "owner-1"
+        },
+        "checkedAt": 1800000000000,
+        "result": "allowed",
+        "operation": "resume-own-session",
+        "signature": "2qqV8GL-E7fnlqSGrkYgVWtCYPUKMbkwLGlr-26VRSJTEkRA9ZJTyDNf_YSKx9nwSvAtDfs-b2hxZpb2_6f2Bw",
+        "control": {
+          "sessionId": "target-1",
+          "runtimeId": "new-runtime",
+          "state": "accepted"
+        }
+      },
+      "intentInput": "saycode-owner-relay/v1\u0000intent\u0000{\"callerBindingId\":\"caller-1\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"operation\":\"resume-own-session\",\"payload\":{\"expectedMachineId\":\"machine-1\",\"runtimeId\":null,\"sessionId\":\"target-1\"},\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"targetSessionId\":\"target-1\",\"v\":1}",
+      "requestSigningInput": "saycode-owner-relay/v1\u0000request\u0000{\"callerBindingId\":\"caller-1\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"intentDigest\":\"4f640ebb03315bfff0d94e41449bcb28a640e7464596a7805e4925a1ca4b4c16\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"resume-own-session\",\"payload\":{\"expectedMachineId\":\"machine-1\",\"runtimeId\":null,\"sessionId\":\"target-1\"},\"relayEpoch\":\"relay-1\",\"requestId\":\"request-resume-own-session\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"targetSessionId\":\"target-1\",\"v\":1}",
+      "replySigningInput": "saycode-owner-relay/v1\u0000reply\u0000{\"callerBindingId\":\"caller-1\",\"checkedAt\":1800000000000,\"control\":{\"runtimeId\":\"new-runtime\",\"sessionId\":\"target-1\",\"state\":\"accepted\"},\"hostEpoch\":\"host-1\",\"intentDigest\":\"4f640ebb03315bfff0d94e41449bcb28a640e7464596a7805e4925a1ca4b4c16\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"resume-own-session\",\"relayEpoch\":\"relay-1\",\"requestId\":\"request-resume-own-session\",\"responderSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"result\":\"allowed\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}",
+      "requestWire": "{\"callerBindingId\":\"caller-1\",\"callerSignature\":\"wvSw1r-oqtiZ0RdLAEKRi2oWPcAhwEyrUx6oPdTedFTwAraIZvIuD54NhWzv3k8N55PlG0lgG2N_6pOMXVEXBw\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"intentDigest\":\"4f640ebb03315bfff0d94e41449bcb28a640e7464596a7805e4925a1ca4b4c16\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"resume-own-session\",\"payload\":{\"expectedMachineId\":\"machine-1\",\"runtimeId\":null,\"sessionId\":\"target-1\"},\"relayEpoch\":\"relay-1\",\"requestId\":\"request-resume-own-session\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"targetSessionId\":\"target-1\",\"v\":1}",
+      "replyWire": "{\"callerBindingId\":\"caller-1\",\"checkedAt\":1800000000000,\"control\":{\"runtimeId\":\"new-runtime\",\"sessionId\":\"target-1\",\"state\":\"accepted\"},\"hostEpoch\":\"host-1\",\"intentDigest\":\"4f640ebb03315bfff0d94e41449bcb28a640e7464596a7805e4925a1ca4b4c16\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"resume-own-session\",\"relayEpoch\":\"relay-1\",\"requestId\":\"request-resume-own-session\",\"responderSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"result\":\"allowed\",\"signature\":\"2qqV8GL-E7fnlqSGrkYgVWtCYPUKMbkwLGlr-26VRSJTEkRA9ZJTyDNf_YSKx9nwSvAtDfs-b2hxZpb2_6f2Bw\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}"
+    },
+    {
+      "request": {
+        "v": 1,
+        "requestId": "request-reply-own-permission",
+        "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sourceHubSessionId": "source-1",
+        "sourceRuntimeId": "runtime-1",
+        "callerBindingId": "caller-1",
+        "hostEpoch": "host-1",
+        "sourceAuthority": {
+          "kind": "confirmed-owner",
+          "bindingId": "binding-1"
+        },
+        "relayEpoch": "relay-1",
+        "entry": "agent",
+        "operation": "reply-own-permission",
+        "intentDigest": "98629c5c40ed401242c993b593a396e45e48ac4401f0c12e9f151556684cf6a3",
+        "payload": {
+          "sessionId": "target-1",
+          "runtimeId": "target-runtime",
+          "permissionId": "permission-1",
+          "approved": true,
+          "updatedInput": {
+            "answers": {
+              "q": "한글"
+            },
+            "browserClientConsent": {
+              "leaseMinutes": 15,
+              "rememberSameScope": false
+            }
+          },
+          "mode": "default"
+        },
+        "callerSignature": "ryzu59SqO_5cwi4iTOi3_Xa7CPNn4qCdnaRMfxroPRAh9j0m7G8pwZF0jycB6w0sjWB2x7q3SkNCETI_ZHzmBg",
+        "targetSessionId": "target-1"
+      },
+      "reply": {
+        "v": 1,
+        "requestId": "request-reply-own-permission",
+        "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sourceHubSessionId": "source-1",
+        "sourceRuntimeId": "runtime-1",
+        "callerBindingId": "caller-1",
+        "hostEpoch": "host-1",
+        "sourceAuthority": {
+          "kind": "confirmed-owner",
+          "bindingId": "binding-1"
+        },
+        "relayEpoch": "relay-1",
+        "intentDigest": "98629c5c40ed401242c993b593a396e45e48ac4401f0c12e9f151556684cf6a3",
+        "responderSubject": {
+          "issuer": "https://api.example.com",
+          "userId": "owner-1"
+        },
+        "checkedAt": 1800000000000,
+        "result": "allowed",
+        "operation": "reply-own-permission",
+        "signature": "qoUkl4FT46Zvm6I1S7PTWPkguSQ1U30vq2y5h3gDogeoCwlEavHid7_b8CAwLci0V8Pir3H8Pay-SfYCpVDpCA",
+        "control": {
+          "sessionId": "target-1",
+          "runtimeId": "target-runtime",
+          "permissionId": "permission-1",
+          "state": "accepted"
+        }
+      },
+      "intentInput": "saycode-owner-relay/v1\u0000intent\u0000{\"callerBindingId\":\"caller-1\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"operation\":\"reply-own-permission\",\"payload\":{\"approved\":true,\"mode\":\"default\",\"permissionId\":\"permission-1\",\"runtimeId\":\"target-runtime\",\"sessionId\":\"target-1\",\"updatedInput\":{\"answers\":{\"q\":\"한글\"},\"browserClientConsent\":{\"leaseMinutes\":15,\"rememberSameScope\":false}}},\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"targetSessionId\":\"target-1\",\"v\":1}",
+      "requestSigningInput": "saycode-owner-relay/v1\u0000request\u0000{\"callerBindingId\":\"caller-1\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"intentDigest\":\"98629c5c40ed401242c993b593a396e45e48ac4401f0c12e9f151556684cf6a3\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"reply-own-permission\",\"payload\":{\"approved\":true,\"mode\":\"default\",\"permissionId\":\"permission-1\",\"runtimeId\":\"target-runtime\",\"sessionId\":\"target-1\",\"updatedInput\":{\"answers\":{\"q\":\"한글\"},\"browserClientConsent\":{\"leaseMinutes\":15,\"rememberSameScope\":false}}},\"relayEpoch\":\"relay-1\",\"requestId\":\"request-reply-own-permission\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"targetSessionId\":\"target-1\",\"v\":1}",
+      "replySigningInput": "saycode-owner-relay/v1\u0000reply\u0000{\"callerBindingId\":\"caller-1\",\"checkedAt\":1800000000000,\"control\":{\"permissionId\":\"permission-1\",\"runtimeId\":\"target-runtime\",\"sessionId\":\"target-1\",\"state\":\"accepted\"},\"hostEpoch\":\"host-1\",\"intentDigest\":\"98629c5c40ed401242c993b593a396e45e48ac4401f0c12e9f151556684cf6a3\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"reply-own-permission\",\"relayEpoch\":\"relay-1\",\"requestId\":\"request-reply-own-permission\",\"responderSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"result\":\"allowed\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}",
+      "requestWire": "{\"callerBindingId\":\"caller-1\",\"callerSignature\":\"ryzu59SqO_5cwi4iTOi3_Xa7CPNn4qCdnaRMfxroPRAh9j0m7G8pwZF0jycB6w0sjWB2x7q3SkNCETI_ZHzmBg\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"intentDigest\":\"98629c5c40ed401242c993b593a396e45e48ac4401f0c12e9f151556684cf6a3\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"reply-own-permission\",\"payload\":{\"approved\":true,\"mode\":\"default\",\"permissionId\":\"permission-1\",\"runtimeId\":\"target-runtime\",\"sessionId\":\"target-1\",\"updatedInput\":{\"answers\":{\"q\":\"한글\"},\"browserClientConsent\":{\"leaseMinutes\":15,\"rememberSameScope\":false}}},\"relayEpoch\":\"relay-1\",\"requestId\":\"request-reply-own-permission\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"targetSessionId\":\"target-1\",\"v\":1}",
+      "replyWire": "{\"callerBindingId\":\"caller-1\",\"checkedAt\":1800000000000,\"control\":{\"permissionId\":\"permission-1\",\"runtimeId\":\"target-runtime\",\"sessionId\":\"target-1\",\"state\":\"accepted\"},\"hostEpoch\":\"host-1\",\"intentDigest\":\"98629c5c40ed401242c993b593a396e45e48ac4401f0c12e9f151556684cf6a3\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"reply-own-permission\",\"relayEpoch\":\"relay-1\",\"requestId\":\"request-reply-own-permission\",\"responderSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"result\":\"allowed\",\"signature\":\"qoUkl4FT46Zvm6I1S7PTWPkguSQ1U30vq2y5h3gDogeoCwlEavHid7_b8CAwLci0V8Pir3H8Pay-SfYCpVDpCA\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}"
+    },
+    {
+      "request": {
+        "v": 1,
+        "requestId": "request-abort-own-turn",
+        "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sourceHubSessionId": "source-1",
+        "sourceRuntimeId": "runtime-1",
+        "callerBindingId": "caller-1",
+        "hostEpoch": "host-1",
+        "sourceAuthority": {
+          "kind": "confirmed-owner",
+          "bindingId": "binding-1"
+        },
+        "relayEpoch": "relay-1",
+        "entry": "agent",
+        "operation": "abort-own-turn",
+        "intentDigest": "3fb29df07c52f60a33697844501dd1ed6e3e1c0aa7090e86ffa16bcc677fb061",
+        "payload": {
+          "sessionId": "target-1",
+          "runtimeId": "target-runtime"
+        },
+        "callerSignature": "RA4k7WxZakXG3BVObjlA1Pg2itT0jj6aWVRBW5jySYiJLZIdWXoGl8bOTiKw7jKIiMhFhJqKVCoHVkR3enUNAQ",
+        "targetSessionId": "target-1"
+      },
+      "reply": {
+        "v": 1,
+        "requestId": "request-abort-own-turn",
+        "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sourceHubSessionId": "source-1",
+        "sourceRuntimeId": "runtime-1",
+        "callerBindingId": "caller-1",
+        "hostEpoch": "host-1",
+        "sourceAuthority": {
+          "kind": "confirmed-owner",
+          "bindingId": "binding-1"
+        },
+        "relayEpoch": "relay-1",
+        "intentDigest": "3fb29df07c52f60a33697844501dd1ed6e3e1c0aa7090e86ffa16bcc677fb061",
+        "responderSubject": {
+          "issuer": "https://api.example.com",
+          "userId": "owner-1"
+        },
+        "checkedAt": 1800000000000,
+        "result": "allowed",
+        "operation": "abort-own-turn",
+        "signature": "uKwvrtazwBnGEk4FYRy197yOtXhl-gILulPXTLdo-n2SlH4S1ErWtkLtPeaVZ6kEP-PxXNSOOtLYQWb2U7NBCA",
+        "control": {
+          "sessionId": "target-1",
+          "runtimeId": "target-runtime",
+          "state": "unknown"
+        }
+      },
+      "intentInput": "saycode-owner-relay/v1\u0000intent\u0000{\"callerBindingId\":\"caller-1\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"operation\":\"abort-own-turn\",\"payload\":{\"runtimeId\":\"target-runtime\",\"sessionId\":\"target-1\"},\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"targetSessionId\":\"target-1\",\"v\":1}",
+      "requestSigningInput": "saycode-owner-relay/v1\u0000request\u0000{\"callerBindingId\":\"caller-1\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"intentDigest\":\"3fb29df07c52f60a33697844501dd1ed6e3e1c0aa7090e86ffa16bcc677fb061\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"abort-own-turn\",\"payload\":{\"runtimeId\":\"target-runtime\",\"sessionId\":\"target-1\"},\"relayEpoch\":\"relay-1\",\"requestId\":\"request-abort-own-turn\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"targetSessionId\":\"target-1\",\"v\":1}",
+      "replySigningInput": "saycode-owner-relay/v1\u0000reply\u0000{\"callerBindingId\":\"caller-1\",\"checkedAt\":1800000000000,\"control\":{\"runtimeId\":\"target-runtime\",\"sessionId\":\"target-1\",\"state\":\"unknown\"},\"hostEpoch\":\"host-1\",\"intentDigest\":\"3fb29df07c52f60a33697844501dd1ed6e3e1c0aa7090e86ffa16bcc677fb061\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"abort-own-turn\",\"relayEpoch\":\"relay-1\",\"requestId\":\"request-abort-own-turn\",\"responderSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"result\":\"allowed\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}",
+      "requestWire": "{\"callerBindingId\":\"caller-1\",\"callerSignature\":\"RA4k7WxZakXG3BVObjlA1Pg2itT0jj6aWVRBW5jySYiJLZIdWXoGl8bOTiKw7jKIiMhFhJqKVCoHVkR3enUNAQ\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"intentDigest\":\"3fb29df07c52f60a33697844501dd1ed6e3e1c0aa7090e86ffa16bcc677fb061\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"abort-own-turn\",\"payload\":{\"runtimeId\":\"target-runtime\",\"sessionId\":\"target-1\"},\"relayEpoch\":\"relay-1\",\"requestId\":\"request-abort-own-turn\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"targetSessionId\":\"target-1\",\"v\":1}",
+      "replyWire": "{\"callerBindingId\":\"caller-1\",\"checkedAt\":1800000000000,\"control\":{\"runtimeId\":\"target-runtime\",\"sessionId\":\"target-1\",\"state\":\"unknown\"},\"hostEpoch\":\"host-1\",\"intentDigest\":\"3fb29df07c52f60a33697844501dd1ed6e3e1c0aa7090e86ffa16bcc677fb061\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"abort-own-turn\",\"relayEpoch\":\"relay-1\",\"requestId\":\"request-abort-own-turn\",\"responderSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"result\":\"allowed\",\"signature\":\"uKwvrtazwBnGEk4FYRy197yOtXhl-gILulPXTLdo-n2SlH4S1ErWtkLtPeaVZ6kEP-PxXNSOOtLYQWb2U7NBCA\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}"
+    },
+    {
+      "request": {
+        "v": 1,
+        "requestId": "request-spawn-owned-child",
+        "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sourceHubSessionId": "source-1",
+        "sourceRuntimeId": "runtime-1",
+        "callerBindingId": "caller-1",
+        "hostEpoch": "host-1",
+        "sourceAuthority": {
+          "kind": "confirmed-owner",
+          "bindingId": "binding-1"
+        },
+        "relayEpoch": "relay-1",
+        "entry": "agent",
+        "operation": "spawn-owned-child",
+        "intentDigest": "f2ae3f312a8448b2b4fcde2b11c715399d8db8b4d762205111faad8d38698f96",
+        "payload": {
+          "operationId": "operation-1",
+          "spawnId": "spawn-1",
+          "spawnDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "childAgentId": "agent-1",
+          "spawnOptions": {
+            "directory": "/project",
+            "agent": "claude",
+            "initialPrompt": "작업"
+          }
+        },
+        "callerSignature": "e2Om5Mc58TgG0p2XLUfLkelcF-xBQZuH_cfB5IDfdSLBZgBjeOJj-63W9Qv9yxWj8R84wE2qInEG31mjNiOfCw"
+      },
+      "reply": {
+        "v": 1,
+        "requestId": "request-spawn-owned-child",
+        "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sourceHubSessionId": "source-1",
+        "sourceRuntimeId": "runtime-1",
+        "callerBindingId": "caller-1",
+        "hostEpoch": "host-1",
+        "sourceAuthority": {
+          "kind": "confirmed-owner",
+          "bindingId": "binding-1"
+        },
+        "relayEpoch": "relay-1",
+        "intentDigest": "f2ae3f312a8448b2b4fcde2b11c715399d8db8b4d762205111faad8d38698f96",
+        "responderSubject": {
+          "issuer": "https://api.example.com",
+          "userId": "owner-1"
+        },
+        "checkedAt": 1800000000000,
+        "result": "allowed",
+        "operation": "spawn-owned-child",
+        "signature": "3NskGYuHGkFzWKUXbmk7HG-UeaqSobihpyOQaJ4DB__0CvzlGl7oI-YaC6q1akN6-ELsIMDJw4kAPYm5mnDqCA",
+        "childSpawn": {
+          "operationId": "operation-1",
+          "spawnId": "spawn-1",
+          "spawnDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "state": "started",
+          "stage": "provider-started",
+          "sessionId": "child-1",
+          "ownershipBindingId": "child-binding",
+          "ownerSubject": {
+            "issuer": "https://api.example.com",
+            "userId": "owner-1"
+          },
+          "parentSessionId": "source-1",
+          "providerRuntimeId": "child-runtime"
+        }
+      },
+      "intentInput": "saycode-owner-relay/v1\u0000intent\u0000{\"callerBindingId\":\"caller-1\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"operation\":\"spawn-owned-child\",\"payload\":{\"childAgentId\":\"agent-1\",\"operationId\":\"operation-1\",\"spawnDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"spawnId\":\"spawn-1\",\"spawnOptions\":{\"agent\":\"claude\",\"directory\":\"/project\",\"initialPrompt\":\"작업\"}},\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}",
+      "requestSigningInput": "saycode-owner-relay/v1\u0000request\u0000{\"callerBindingId\":\"caller-1\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"intentDigest\":\"f2ae3f312a8448b2b4fcde2b11c715399d8db8b4d762205111faad8d38698f96\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"spawn-owned-child\",\"payload\":{\"childAgentId\":\"agent-1\",\"operationId\":\"operation-1\",\"spawnDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"spawnId\":\"spawn-1\",\"spawnOptions\":{\"agent\":\"claude\",\"directory\":\"/project\",\"initialPrompt\":\"작업\"}},\"relayEpoch\":\"relay-1\",\"requestId\":\"request-spawn-owned-child\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}",
+      "replySigningInput": "saycode-owner-relay/v1\u0000reply\u0000{\"callerBindingId\":\"caller-1\",\"checkedAt\":1800000000000,\"childSpawn\":{\"operationId\":\"operation-1\",\"ownerSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"ownershipBindingId\":\"child-binding\",\"parentSessionId\":\"source-1\",\"providerRuntimeId\":\"child-runtime\",\"sessionId\":\"child-1\",\"spawnDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"spawnId\":\"spawn-1\",\"stage\":\"provider-started\",\"state\":\"started\"},\"hostEpoch\":\"host-1\",\"intentDigest\":\"f2ae3f312a8448b2b4fcde2b11c715399d8db8b4d762205111faad8d38698f96\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"spawn-owned-child\",\"relayEpoch\":\"relay-1\",\"requestId\":\"request-spawn-owned-child\",\"responderSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"result\":\"allowed\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}",
+      "requestWire": "{\"callerBindingId\":\"caller-1\",\"callerSignature\":\"e2Om5Mc58TgG0p2XLUfLkelcF-xBQZuH_cfB5IDfdSLBZgBjeOJj-63W9Qv9yxWj8R84wE2qInEG31mjNiOfCw\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"intentDigest\":\"f2ae3f312a8448b2b4fcde2b11c715399d8db8b4d762205111faad8d38698f96\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"spawn-owned-child\",\"payload\":{\"childAgentId\":\"agent-1\",\"operationId\":\"operation-1\",\"spawnDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"spawnId\":\"spawn-1\",\"spawnOptions\":{\"agent\":\"claude\",\"directory\":\"/project\",\"initialPrompt\":\"작업\"}},\"relayEpoch\":\"relay-1\",\"requestId\":\"request-spawn-owned-child\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}",
+      "replyWire": "{\"callerBindingId\":\"caller-1\",\"checkedAt\":1800000000000,\"childSpawn\":{\"operationId\":\"operation-1\",\"ownerSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"ownershipBindingId\":\"child-binding\",\"parentSessionId\":\"source-1\",\"providerRuntimeId\":\"child-runtime\",\"sessionId\":\"child-1\",\"spawnDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"spawnId\":\"spawn-1\",\"stage\":\"provider-started\",\"state\":\"started\"},\"hostEpoch\":\"host-1\",\"intentDigest\":\"f2ae3f312a8448b2b4fcde2b11c715399d8db8b4d762205111faad8d38698f96\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"spawn-owned-child\",\"relayEpoch\":\"relay-1\",\"requestId\":\"request-spawn-owned-child\",\"responderSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"result\":\"allowed\",\"signature\":\"3NskGYuHGkFzWKUXbmk7HG-UeaqSobihpyOQaJ4DB__0CvzlGl7oI-YaC6q1akN6-ELsIMDJw4kAPYm5mnDqCA\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}"
+    },
+    {
+      "request": {
+        "v": 1,
+        "requestId": "request-owned-child-status",
+        "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sourceHubSessionId": "source-1",
+        "sourceRuntimeId": "runtime-1",
+        "callerBindingId": "caller-1",
+        "hostEpoch": "host-1",
+        "sourceAuthority": {
+          "kind": "confirmed-owner",
+          "bindingId": "binding-1"
+        },
+        "relayEpoch": "relay-1",
+        "entry": "agent",
+        "operation": "owned-child-status",
+        "intentDigest": "5b059a626ab7b069020d9832d4e7e4e3da05ea83a5d431777fef3997b6dc3d26",
+        "payload": {
+          "operationId": "operation-1",
+          "spawnId": "spawn-1",
+          "spawnDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "callerSignature": "NafEUdPhY6RrcqIGREYTDnNfBf1WNZE5GhKJr_6deFg3OFepoJ2hnvHS6QPoaEDWT7COaXhBQrpSq-YrrjxUDA"
+      },
+      "reply": {
+        "v": 1,
+        "requestId": "request-owned-child-status",
+        "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sourceHubSessionId": "source-1",
+        "sourceRuntimeId": "runtime-1",
+        "callerBindingId": "caller-1",
+        "hostEpoch": "host-1",
+        "sourceAuthority": {
+          "kind": "confirmed-owner",
+          "bindingId": "binding-1"
+        },
+        "relayEpoch": "relay-1",
+        "intentDigest": "5b059a626ab7b069020d9832d4e7e4e3da05ea83a5d431777fef3997b6dc3d26",
+        "responderSubject": {
+          "issuer": "https://api.example.com",
+          "userId": "owner-1"
+        },
+        "checkedAt": 1800000000000,
+        "result": "allowed",
+        "operation": "owned-child-status",
+        "signature": "ytMW2bcrIyAhGCsxNQM7aWVnIhUX_ZE1yey-RZwXbo_rzewFRJKFnPds5ytQNuyjUxTqW4eXkakqtntKR1ioDA",
+        "childSpawn": {
+          "operationId": "operation-1",
+          "spawnId": "spawn-1",
+          "spawnDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "state": "started",
+          "stage": "provider-started",
+          "sessionId": "child-1",
+          "ownershipBindingId": "child-binding",
+          "ownerSubject": {
+            "issuer": "https://api.example.com",
+            "userId": "owner-1"
+          },
+          "parentSessionId": "source-1",
+          "providerRuntimeId": "child-runtime"
+        }
+      },
+      "intentInput": "saycode-owner-relay/v1\u0000intent\u0000{\"callerBindingId\":\"caller-1\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"operation\":\"owned-child-status\",\"payload\":{\"operationId\":\"operation-1\",\"spawnDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"spawnId\":\"spawn-1\"},\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}",
+      "requestSigningInput": "saycode-owner-relay/v1\u0000request\u0000{\"callerBindingId\":\"caller-1\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"intentDigest\":\"5b059a626ab7b069020d9832d4e7e4e3da05ea83a5d431777fef3997b6dc3d26\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"owned-child-status\",\"payload\":{\"operationId\":\"operation-1\",\"spawnDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"spawnId\":\"spawn-1\"},\"relayEpoch\":\"relay-1\",\"requestId\":\"request-owned-child-status\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}",
+      "replySigningInput": "saycode-owner-relay/v1\u0000reply\u0000{\"callerBindingId\":\"caller-1\",\"checkedAt\":1800000000000,\"childSpawn\":{\"operationId\":\"operation-1\",\"ownerSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"ownershipBindingId\":\"child-binding\",\"parentSessionId\":\"source-1\",\"providerRuntimeId\":\"child-runtime\",\"sessionId\":\"child-1\",\"spawnDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"spawnId\":\"spawn-1\",\"stage\":\"provider-started\",\"state\":\"started\"},\"hostEpoch\":\"host-1\",\"intentDigest\":\"5b059a626ab7b069020d9832d4e7e4e3da05ea83a5d431777fef3997b6dc3d26\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"owned-child-status\",\"relayEpoch\":\"relay-1\",\"requestId\":\"request-owned-child-status\",\"responderSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"result\":\"allowed\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}",
+      "requestWire": "{\"callerBindingId\":\"caller-1\",\"callerSignature\":\"NafEUdPhY6RrcqIGREYTDnNfBf1WNZE5GhKJr_6deFg3OFepoJ2hnvHS6QPoaEDWT7COaXhBQrpSq-YrrjxUDA\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"intentDigest\":\"5b059a626ab7b069020d9832d4e7e4e3da05ea83a5d431777fef3997b6dc3d26\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"owned-child-status\",\"payload\":{\"operationId\":\"operation-1\",\"spawnDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"spawnId\":\"spawn-1\"},\"relayEpoch\":\"relay-1\",\"requestId\":\"request-owned-child-status\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}",
+      "replyWire": "{\"callerBindingId\":\"caller-1\",\"checkedAt\":1800000000000,\"childSpawn\":{\"operationId\":\"operation-1\",\"ownerSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"ownershipBindingId\":\"child-binding\",\"parentSessionId\":\"source-1\",\"providerRuntimeId\":\"child-runtime\",\"sessionId\":\"child-1\",\"spawnDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"spawnId\":\"spawn-1\",\"stage\":\"provider-started\",\"state\":\"started\"},\"hostEpoch\":\"host-1\",\"intentDigest\":\"5b059a626ab7b069020d9832d4e7e4e3da05ea83a5d431777fef3997b6dc3d26\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"owned-child-status\",\"relayEpoch\":\"relay-1\",\"requestId\":\"request-owned-child-status\",\"responderSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"result\":\"allowed\",\"signature\":\"ytMW2bcrIyAhGCsxNQM7aWVnIhUX_ZE1yey-RZwXbo_rzewFRJKFnPds5ytQNuyjUxTqW4eXkakqtntKR1ioDA\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}"
+    }
+  ],
+  "keys": {
+    "hostSeed": "ERERERERERERERERERERERERERERERERERERERERERE",
+    "desktopSeed": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+    "issuerSeed": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM",
+    "issuerPublicKey": "F8t5-ytBIPKx7GXkGY1uCLKOgT_rAeSkAIObheGAgM4"
+  },
+  "personalContact": {
+    "version": 1,
+    "type": "saycode-owner-relay-contact",
+    "issuer": "https://api.example.com",
+    "audience": "https://happy.example.com",
+    "keyId": "6c8f8607dbe87077a62a2990ce07d94aaf749df76f87b98eb786a6d10f030765",
+    "issuedAt": 1800000000000,
+    "expiresAt": 1800000060000,
+    "signature": "UqQBW3UxkLvqPtl5RvgXbf8FnFM4QgjZK8dx1HBqJLzWyIRlkMi3sTEs_-DI8Op-7WgJAk9ak_CMXKSvA6WjDQ",
+    "hubId": "source-1",
+    "sourceAuthority": {
+      "kind": "personal-account",
+      "descriptorId": "descriptor-1",
+      "registrationRevision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "callerBindingId": "caller-1",
+    "sourceRuntimeId": "runtime-1",
+    "hostEpoch": "host-1",
+    "callerPublicKey": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc",
+    "machineId": "machine-1",
+    "happyAccountId": "account-1",
+    "scope": "/project",
+    "depth": 0,
+    "ownerSubject": {
+      "issuer": "https://api.example.com",
+      "userId": "owner-1"
+    },
+    "desktopInstanceId": "desktop-1",
+    "publicKey": "oJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPA",
+    "method": "owner-relay-v1:abcdefghijklmnop",
+    "epoch": "relay-1"
+  }
+}
