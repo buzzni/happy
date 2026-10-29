@@ -5,7 +5,9 @@ Automation GET observability retains the existing HTTP metrics and adds
 `automationReadDiagnostics` emits at most one structured sample per account per minute per replica
 after 30 reads in a 10-second window. Account/project IDs are log fields, never metric
 labels; headers, bodies, query strings and tokens are never copied. The observer is
-bounded to 1,024 tracked accounts per replica and changes no admission behavior.
+bounded to 1,024 tracked accounts per replica and changes no admission behavior. At capacity,
+it reclaims entries only after both the read window and sample cooldown have expired;
+low-rate polling does not require a full minute of inactivity to free a slot.
 
 Current-Chat AI repeating tools retain the existing v4 automation store and ordinary conversation delivery. `GET/PUT /v1/projects/:projectId/automations/registrations/:registrationKey` derives a stable scoped ID and creates only a paused definition inside the existing Serializable transaction/retry boundary. Duplicate inserts retain the original ciphertext and state; tombstones, owner and target conflicts cannot resurrect or move a definition. Studio records the execution binding before activating through the existing revision-CAS PATCH. The CLI compares decrypted retry intent and recovers using the same registration/ciphertext. No plaintext fingerprint, new table or scheduler is introduced. See [tool contract and verification](chat-scheduled-task-tools.md).
 

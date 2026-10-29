@@ -17,7 +17,7 @@ export class AutomationReadDiagnostics {
         let window = this.accounts.get(accountId);
         if (!window) {
             if (this.accounts.size >= 1_024) {
-                for (const [id, entry] of this.accounts) if (now - Math.max(entry.start, entry.lastLog) >= 60_000) this.accounts.delete(id);
+                for (const [id, entry] of this.accounts) if (now - entry.start >= 10_000 && now - entry.lastLog >= 60_000) this.accounts.delete(id);
                 if (this.accounts.size >= 1_024) return null;
             }
             window = { start: now, count: 0, lastLog: -Infinity };

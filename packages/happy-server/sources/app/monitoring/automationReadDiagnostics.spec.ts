@@ -36,6 +36,19 @@ describe('automation read diagnostics', () => {
         for (let i = 0; i < 29; i++) expect(observer.observe(request, 61_000)).toBeNull();
         expect(observer.observe(request, 61_000)?.accountId).toBe('account');
     });
+    it('reclaims expired low-rate windows without losing active log cooldowns', () => {
+        const observer = new AutomationReadDiagnostics();
+        for (let i = 0; i < 1_024; i++) {
+            for (let j = 0; j < 30; j++) observer.observe({ ...request, accountId: `account-${i}` }, 1_000);
+        }
+        for (let i = 0; i < 1_024; i++) observer.observe({ ...request, accountId: `account-${i}` }, 31_000);
+        // A 10-second window has expired, but a prior sample still needs its cooldown.
+        for (let i = 0; i < 30; i++) expect(observer.observe(request, 46_000)).toBeNull();
+        // Keep polling so no entry has been completely idle for a minute.
+        for (let i = 0; i < 1_024; i++) observer.observe({ ...request, accountId: `account-${i}` }, 61_000);
+        for (let i = 0; i < 29; i++) expect(observer.observe(request, 76_000)).toBeNull();
+        expect(observer.observe(request, 76_000)?.accountId).toBe('account');
+    });
     it('never includes request credentials or arbitrary fields in the sample', () => {
         const observer = new AutomationReadDiagnostics();
         const unsafe = { ...request, source: 'Bearer secret', authorization: 'secret', body: 'private' };
