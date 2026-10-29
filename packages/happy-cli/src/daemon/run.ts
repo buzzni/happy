@@ -1849,6 +1849,8 @@ export async function startDaemon(): Promise<void> {
     // picked up without a restart. An installer-managed host (its own broker) keeps its configuration.
     let personalBrowserNative: NativeBrokerRequestOptions | undefined;
     let onPersonalBrowserActive: ((native: NativeBrokerRequestOptions) => void) | undefined;
+    /** Set once the machine sync client exists; an activation before that is published with the first metadata check. */
+    let publishAgentBrowserCapability: (() => void) | undefined;
     const personalBrowserWatch = browserTaskBroker || process.env.HAPPY_BROWSER_TASK_RUNTIME_URL ? undefined : watchPersonalBrowserRuntime({
       machineId, studioOrigin: readTrustedStudioOrigin(process.env), token: () => credentials.token, log: (message) => logger.warn(message),
       activate: (runtime) => {
@@ -1867,6 +1869,7 @@ export async function startDaemon(): Promise<void> {
         stopBrowserTaskReconciliation = startBrowserTaskReconciliation(broker);
         personalBrowserNative = runtime.native;
         onPersonalBrowserActive?.(runtime.native);
+        publishAgentBrowserCapability?.();
         logger.debug('[DAEMON RUN] Personal browser runtime activated');
         return true;
       },
@@ -4284,6 +4287,11 @@ export async function startDaemon(): Promise<void> {
       void apiMachine.updateMachineMetadata((metadata) => agentBrowserMetadataUpdate(metadata, agentBrowserMachineCapability()) ?? metadata!)
         .catch((error) => logger.debug('[DAEMON RUN] agent browser capability not published', error));
     }
+    // A personal runtime activated later (Desktop installed it after sign-in) is published then.
+    publishAgentBrowserCapability = () => {
+      void apiMachine.updateMachineMetadata((metadata) => agentBrowserMetadataUpdate(metadata, agentBrowserMachineCapability()) ?? metadata!)
+        .catch((error) => logger.debug('[DAEMON RUN] agent browser capability not published', error));
+    };
     // Same for the tool policy capability (aplus-dev-studio specs/agent-tool-policy): Desktop must not
     // claim enforcement the daemon is not doing, nor miss enforcement it is.
     if (toolPolicyMetadataUpdate(machine.metadata, toolPolicyMachineCapability(process.env))) {
