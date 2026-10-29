@@ -1,6 +1,6 @@
 ---
 기능: codex-subagent-activity
-상태: 런타임 구현·문서 커밋과 출시 전 실앱 검증 완료 — PR·릴리스는 사용자 지시 대기
+상태: PR 생성(2026-10-29 사용자 지시: push·PR 생성까지) — 머지·버전 bump·태그·발행은 각각 사용자 승인 대기
 마지막 갱신: 2026-10-29
 ---
 
@@ -10,12 +10,16 @@
 
 - 브랜치 `ernie/codex-subagent-activity`. 기준 커밋 `346fe458`(`.362` 릴리스, 2026-10-28 원격 main과 같음).
   `a8e0ddac`(`.360`)에서 fast-forward했고, 그사이 들어온 11개 파일은 이 작업 파일과 겹치지 않는다.
-  2026-10-29 최신 main(34c1272a, `.363`·`.364` 포함)을 병합 커밋 07287f9d로 가져왔다(충돌 없음).
+  2026-10-29 최신 main(34c1272a, `.363`·`.364` 포함)을 병합 커밋 07287f9d로 가져왔다(충돌 없음). 같은 날 다시 최신
+  main(3d806062, `.365`·`.366` 포함)을 병합 커밋 5fa86142로 가져왔다. `codexAppServerClient.test.ts` 끝에서 양쪽이
+  각자 붙인 테스트(서브 에이전트 스레드 묶음, 브라우저 MCP 완료 전달)를 둘 다 남겼다.
 - 주문 01~05·05b 구현과 이 문서 세트를 로컬 커밋 2개(구조 `emitCodexUsage()` 추출 → 기능)로 남겼다. 출시 전 실앱
-  검증(2026-10-28, 개인 공간·buzzni)에서 찾은 줄 빠짐을 D16 커밋으로 고쳤다. push·PR·버전 bump·태그·발행은 하지
-  않았다. 실앱 검증 기록은 Desktop 작업트리 `.aplus/verification/evidence/20261028-codex-subagent-real/RESULTS.md`.
+  검증(2026-10-28, 개인 공간·buzzni)에서 찾은 줄 빠짐을 D16 커밋으로 고쳤다. 2026-10-29 사용자 지시로 push·PR 생성까지
+  했다. 머지·버전 bump·태그·발행은 하지 않았다. 실앱 검증 기록은 Desktop 작업트리
+  `.aplus/verification/evidence/20261028-codex-subagent-real/RESULTS.md`.
 - 2026-10-29 Fable 검수(`.work/reviews/postreal-r15-d16-review.md`, D16·출시 점검표 번호): pass-with-fixes. 권장 F1을
-  D16 보완으로 고쳤고, 점검표 번호는 `.365`로 맞췄다(사용자 승인으로 커밋 dc9f3121, push 안 함).
+  D16 보완으로 고쳤고, 점검표 번호는 `.365`로 맞췄다(커밋 dc9f3121). 그 뒤 `.365`(#990)·`.366`(Saycode CLI 0.9.9)도
+  이 기능 없이 발행돼, 점검표는 번호를 박지 않고 발행 직전에 원격 태그로 다음 빈 번호를 확인하게 바꿨다.
 - 요구사항 R1~R8과 테스트 대응은 [spec.md](./spec.md), 단계별 내용과 검증은 [plan.md](./plan.md)에 있다.
 - 주문 05(워치독 완화)는 2026-10-28 사용자가 채택해 구현했다(아래 열린 문제 7, plan Phase 5).
 - 주문 05b(60분 정리기 면제)는 2026-10-28 사용자가 채택해 구현했다(아래 열린 문제 6, plan Phase 5b).
@@ -239,23 +243,25 @@
   `[behavioral]`로 나눈다.
 - [ ] 2. push → PR(`gh pr create --repo buzzni/happy --base main …`) → CI 통과 → main 머지. push·PR 생성·머지는
   각각 사용자 승인 뒤에 한다. 2026-10-29 사용자 승인으로 최신 main(34c1272a, `.364` 이후)을 병합 커밋 07287f9d로
-  가져왔다(충돌 없음). PR 직전에 다시 `git fetch`해서, main이 더 나아갔으면 한 번 더 병합한다.
+  가져왔다(충돌 없음). 같은 날 사용자 지시로 최신 main(3d806062)을 병합 커밋 5fa86142로 다시 가져온 뒤 push·PR
+  생성까지 했다. 남은 것: CI 통과 확인 → main 머지(사용자 승인 뒤). 머지 직전 main이 더 나아갔으면 한 번 더 병합한다.
 - [ ] 3. 버전 bump(**사용자 승인 뒤 메인 세션이 커밋**): `packages/happy-cli/package.json`을 그때 main의 번호 →
-  다음 빈 번호(2026-10-29 기준 `1.1.10-aplus.365`). 이 저장소 관례대로 bump만 담은 `[behavioral] release(cli): … 후보
-  준비` 커밋·PR로 main에 머지한다. 런북 Version Bump 2단계대로 빌드와 관련 테스트를 돌린다. 직전에 그 번호가 비어
-  있는지 다시 본다(2026-10-29 확인: 원격 태그 `.363`(10-28 16:54)·`.364`(10-28 23:01)는 이 기능 없이 다른 변경으로
-  발행됐다). 그사이 main에 다른 변경이 들어왔으면 포함 범위를 커밋 본문에 적는다. 번호가 `.365`가 아니면 Desktop
-  문구 6줄(`git grep -n "aplus\.365"`)도 같은 번호로 바꾼다.
-- [ ] 4. 태그 push(**별도 직전 승인**): bump가 머지된 main 커밋에 태그 하나 — `git tag happy-cli-v1.1.10-aplus.365
-  <main 커밋>` → `git push origin happy-cli-v1.1.10-aplus.365`. 워크플로 `Publish @buzzni/happy-cli`가 태그와
+  다음 빈 번호. 번호는 미리 정하지 않고 bump 직전에 `git ls-remote --tags origin 'happy-cli-v*'`로 확인한다
+  (2026-10-29 16시 기준 `.363`~`.366`이 모두 이 기능 없이 다른 변경으로 발행돼, 미리 적어 둔 번호가 세 번 밀렸다).
+  이 저장소 관례대로 bump만 담은 `[behavioral] release(cli): … 후보 준비` 커밋·PR로 main에 머지한다. 런북 Version
+  Bump 2단계대로 빌드와 관련 테스트를 돌린다. 그사이 main에 다른 변경이 들어왔으면 포함 범위를 커밋 본문에 적는다.
+  번호가 정해지면 Desktop 문구 6곳(Desktop `specs/subagent-running-indicator/context.md`의 "코덱스에 필요한 런타임
+  번호를 적은 곳")에 그 번호를 채운다. 그 전까지 Desktop은 번호 없이 적어 둔다.
+- [ ] 4. 태그 push(**별도 직전 승인**): bump가 머지된 main 커밋에 태그 하나 — `git tag happy-cli-v<3의 번호>
+  <main 커밋>` → `git push origin happy-cli-v<3의 번호>`. 워크플로 `Publish @buzzni/happy-cli`가 태그와
   `package.json` 버전이 같은지 확인한 뒤 빌드·guard·발행·검증한다.
 - [ ] 5. 로컬 발행 금지: `npm publish`·`pnpm publish`·`yarn publish`를 어디서도 실행하지 않는다(준비 디렉터리와
   tarball 포함). 발행은 GitHub Actions만 한다. 실패한 발행 작업은 다시 돌리지 않는다.
 - [ ] 6. 서버 선배포 불필요: usage wire(`packages/happy-wire/src/usage.ts`)를 비롯해 `packages/happy-wire`를 바꾸지
   않았다. `CodexAgent` 줄은 기존 wire 필드만 쓴다.
-- [ ] 7. 레지스트리 확인: `latest`가 `1.1.10-aplus.365`, tarball URL 200, 새 prefix 설치 뒤 `happy daemon status` 성공
+- [ ] 7. 레지스트리 확인: `latest`가 3의 번호, tarball URL 200, 새 prefix 설치 뒤 `happy daemon status` 성공
   (워크플로의 검증 단계). 전파가 늦어 실패하면 재발행하지 말고 검증 전용 실행
-  (`gh workflow run publish-happy-cli.yml --repo buzzni/happy --ref main -f version=1.1.10-aplus.365`)을 쓴다. 이것도
+  (`gh workflow run publish-happy-cli.yml --repo buzzni/happy --ref main -f version=<3의 번호>`)을 쓴다. 이것도
   외부 행위라 승인 뒤에 한다.
 - [ ] 8. Desktop 런타임 pin은 7이 끝난 뒤(주문 10). 발행되지 않은 버전으로 pin을 쓰지 않는다.
 - [ ] 9. 런북 완료 기준의 나머지: `buzzni/aplus-dev-studio`의 `vendor/happy` 포인터를 머지된 main 커밋으로 올리는
