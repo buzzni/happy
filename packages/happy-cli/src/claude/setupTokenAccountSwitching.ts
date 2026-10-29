@@ -237,6 +237,8 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
     canSwitch,
     /** Why the latest attempt bound nothing (`NO_ACCOUNT`: none is left), or null. */
     lastFailure: () => lastFailure,
+    /** The latest attempt bound nothing, yet asking again may: not when none is left or this binding cannot rotate. */
+    lastFailureMayPass: () => lastFailure !== null && lastFailure !== 'NO_ACCOUNT' && !PERMANENT.has(lastFailure) && lastFailure !== 'STALE',
     /**
      * The member asked to move on now instead of waiting for the background attempt (Saycode
      * specs/org-auth-failure-account-switch). An attempt already running is awaited; if it bound nothing, this asks once more.
