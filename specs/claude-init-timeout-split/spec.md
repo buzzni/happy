@@ -26,3 +26,4 @@ SessionStart 훅이 끝나기를 기다리므로, 시작 훅이 10초를 넘는 
 ## 검증
 
 - `npx vitest run src/claude/sdk/credentialPin.test.ts src/claude/utils/launchFailureMessage.test.ts` (globalSetup이 `tsc` 포함 빌드)
+- 실제 SDK: `HAPPY_CLAUDE_AUTH_PIN_INTEGRATION=1 npx vitest run --project integration-claude-auth-pin src/claude/sdk/credentialPin.integration.test.ts` — 12초 SessionStart 훅에서 개인·조직 모두 약 12.3초에 완료, 초기화 제한을 10초로 되돌리면 두 건 실패(2026-10-30 확인). 로컬 더미 서버·토큰만 쓴다.

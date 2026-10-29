@@ -209,6 +209,20 @@ describe.skipIf(!enabled)('real SDK credential pin with project rules', () => {
         expect(files(root).some(path => readFileSync(path).includes(TOKEN))).toBe(false);
         expect(readFileSync(f.files[0], 'utf8')).toBe(originals[0]); expect(readFileSync(f.files[2], 'utf8')).toBe(originals[2]);
     }, 30_000);
+    // A SessionStart hook slower than the 10 s control limit delays only initialization.
+    it.each(['personal', 'organization'] as const)('waits for a twelve-second SessionStart hook with %s authentication', async source => {
+        const f = await prepare();
+        writeFileSync(f.files[1], JSON.stringify({
+            ...f.settings('project'),
+            hooks: { SessionStart: [{ hooks: [{ type: 'command', command: `${process.execPath} -e 'setTimeout(() => {}, 12000)'` }] }] },
+        }));
+        q = queryWithPinnedCredential(sdkQuery, { prompt: 'slow-startup-probe', options: f.options }, TOKEN, source);
+        let result: { is_error?: boolean } | undefined;
+        for await (const message of q) if (message.type === 'result') { result = message; break; }
+        expect(result?.is_error).toBe(false);
+        expect(f.received.filter(r => JSON.stringify(r.body).includes('slow-startup-probe'))).toHaveLength(1);
+        expect(f.received.every(r => r.owned && !r.key)).toBe(true);
+    }, 40_000);
     it.skipIf(process.platform !== 'linux').each([false, true])('ends an in-flight personal generation when managed policy changes (disableAllHooks=%s)', async disableHooks => {
         const f = await prepare('reload');
         async function* prompt(): AsyncGenerator<SDKUserMessage> {
