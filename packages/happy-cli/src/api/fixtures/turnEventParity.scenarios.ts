@@ -49,6 +49,7 @@ vi.mock('@/utils/time', () => ({ backoff: async <T>(callback: () => Promise<T>) 
     delay: vi.fn(async () => undefined), isSessionGoneError: () => false }));
 vi.mock('@/utils/lidState', () => ({ shouldReconnect: () => true }));
 vi.mock('@/daemon/controlClient', () => ({ notifyDaemonSessionRuntime: vi.fn(async () => ({ status: 'ok' })),
+    reportSetupTokenActivity: vi.fn(async () => ({ ok: true })),
     notifyDaemonAutomationTurnResult: mocks.report, reportSetupTokenUsage: vi.fn(async () => {}),
     requestSetupTokenRebind: vi.fn(async () => ({ ok: true, environment: {
         CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-second', HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: '{"account":"second"}',
