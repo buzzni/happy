@@ -5,7 +5,7 @@ import { request } from 'node:http'
 import { join } from 'node:path'
 import { readMessageAck } from '@/api/apiSession'
 import { encodeBase64, encrypt } from '@/api/encryption'
-import type { BrokerReply } from '@/browserRuntime/brokerGrantSource'
+import { createNativeBrokerRequest, type BrokerReply, type NativeBrokerRequestOptions } from '@/browserRuntime/brokerGrantSource'
 import type { AttentionEvent, AttentionFeed } from '@/browserRuntime/contracts'
 import { BrowserAttentionWatcher, createAttentionCursorStore } from './browserAttentionWatcher'
 import { readBrowserTaskBrokerConfig, type BrowserTaskBrokerConfig } from './browserTaskBroker'
@@ -15,6 +15,17 @@ const MAX_REPLY_BYTES = 1024 * 1024
 
 export async function pollBrowserAttention(config: BrowserTaskBrokerConfig, afterSeq: number, signal: AbortSignal): Promise<AttentionFeed> {
     const reply = await attentionBrokerGet(config.socketPath, `/v1/attention?afterSeq=${afterSeq}&waitMs=30000`, { 'x-abp-daemon-token': config.daemonToken }, signal)
+    if (reply.status !== 200 || reply.body.ok !== true || !reply.body.result) throw new Error('Invalid attention broker reply')
+    return reply.body.result as AttentionFeed
+}
+
+/** Personal runtime: each poll carries its own Studio-signed command (no daemon token exists). */
+export async function pollNativeBrowserAttention(native: NativeBrokerRequestOptions, afterSeq: number, signal: AbortSignal): Promise<AttentionFeed> {
+    const send = createNativeBrokerRequest(native, (socketPath, method, path, headers) => {
+        if (method !== 'GET') throw new Error('Attention polling only reads')
+        return attentionBrokerGet(socketPath, path, headers, signal)
+    })
+    const reply = await send(native.socketPath, 'GET', `/v1/attention?afterSeq=${afterSeq}&waitMs=30000`, {})
     if (reply.status !== 200 || reply.body.ok !== true || !reply.body.result) throw new Error('Invalid attention broker reply')
     return reply.body.result as AttentionFeed
 }
@@ -163,14 +174,18 @@ export function startBrowserAttentionWatcher(options: DeliveryOptions & {
     happyHomeDir: string
     machineId: string
     env?: NodeJS.ProcessEnv
+    /** Personal runtime: Studio signs each poll instead of a daemon token. */
+    native?: NativeBrokerRequestOptions
     log(message: string): void
 }): () => Promise<void> {
-    const config = readBrowserTaskBrokerConfig(options.env)
-    if (!config) return async () => {}
-    const scope = createHash('sha256').update(JSON.stringify([options.serverUrl, options.machineId, config.socketPath])).digest('hex')
+    const native = options.native
+    const config = native ? undefined : readBrowserTaskBrokerConfig(options.env)
+    const socketPath = native?.socketPath ?? config?.socketPath
+    if (!socketPath) return async () => {}
+    const scope = createHash('sha256').update(JSON.stringify([options.serverUrl, options.machineId, socketPath])).digest('hex')
     const watcher = new BrowserAttentionWatcher({
         store: createAttentionCursorStore(join(options.happyHomeDir, 'browser-attention', `${scope}.json`)),
-        poll: (afterSeq, signal) => pollBrowserAttention(config, afterSeq, signal),
+        poll: (afterSeq, signal) => native ? pollNativeBrowserAttention(native, afterSeq, signal) : pollBrowserAttention(config!, afterSeq, signal),
         deliver: (event, signal) => deliverBrowserAttention(event, signal, options),
         log: options.log,
     })

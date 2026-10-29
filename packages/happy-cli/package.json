@@ -61,6 +61,9 @@
     "./browserSessionBrokerMain": {
       "import": "./dist/browserSessionBrokerMain.mjs"
     },
+    "./browserRuntime/runtimeMain": {
+      "import": "./dist/browserRuntime/runtimeMain.mjs"
+    },
     "./electronGuiPreload": {
       "require": "./dist/electronGuiPreload.cjs"
     },
