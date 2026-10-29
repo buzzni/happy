@@ -222,6 +222,23 @@ describe('H1-R-01 persisted message localId compatibility', () => {
         const goodBytes = new TextEncoder().encode('saycode-owner-relay/v1\u0000reply\u0000' + canonicalOwnerRelayJson(good));
         expect(await verifyOwnerRelayReply({ ...good, signature: rotationBase64url(nacl.sign.detached(goodBytes, desktop.secretKey)) }, request, contact, now)).toBe(true);
     });
+    // H1-R-08: a stored receipt needs a positive seq, as the existing receipt producer requires.
+    it.each([[0, false], [1, true]] as const)('prompt storage seq %s is a success only when positive', async (seq, ok) => {
+        const { request, reply } = await pair(2);
+        if (reply.result !== 'allowed' || reply.operation !== 'prompt-own-session') throw new Error('Expected prompt fixture');
+        const { signature: _, ...body } = { ...reply, storage: { ...reply.storage, seq } };
+        const bytes = new TextEncoder().encode('saycode-owner-relay/v1\u0000reply\u0000' + canonicalOwnerRelayJson(body));
+        expect(await verifyOwnerRelayReply({ ...body, signature: rotationBase64url(nacl.sign.detached(bytes, desktop.secretKey)) }, request, contact, now)).toBe(ok);
+    });
+    // H1-R-09: a read carries the existing producer's empty permission key; acting on it is still refused.
+    it('read snapshot carries an empty pending permission requestId, while a permission reply cannot target it', async () => {
+        const { reply } = await pair(1);
+        if (reply.result !== 'allowed' || reply.operation !== 'read-session') throw new Error('Expected read fixture');
+        const snapshot = { ...reply.sessionView.snapshot, pendingPermissionRequests: [{ ...reply.sessionView.snapshot.pendingPermissionRequests![0]!, requestId: '' }] };
+        expect(OwnerRelayReplySchema.safeParse({ ...reply, sessionView: { ...reply.sessionView, snapshot } }).success).toBe(true);
+        const permission = vectorFor('reply-own-permission');
+        expect(OwnerRelayRequestSchema.safeParse({ ...permission.request, payload: { ...permission.request.payload, permissionId: '' } }).success).toBe(false);
+    });
     it.each(['기존 메시지', 'existing message', 'x'.repeat(129)])('keeps prompt and storage ID restrictions for %s', localId => {
         expect(OwnerRelayRequestSchema.safeParse({ ...fixture.vectors[2].request, localId }).success).toBe(false);
         const reply = fixture.vectors[2].reply;

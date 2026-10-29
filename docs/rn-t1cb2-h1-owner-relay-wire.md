@@ -170,3 +170,10 @@ pending permission `requestId`, activity `sourceMessageId`, snapshot `runtimeId`
 - H1-R-07: 성공 prompt 응답은 `bodyVerified: true`만 허용한다. 본문 불일치는 성공이 아니라 unknown 등의 실패
   응답으로 표현한다. 서명 바이트를 직접 만든 false receipt도 응답 검증에서 거부한다. 회귀 테스트는 true 대조를
   포함한다(수정을 되돌리면 실패하는 것도 확인).
+
+## H1-R-08·09 교차 리뷰 반영 (2026-10-30)
+
+- H1-R-08: 성공 prompt receipt의 `storage.seq`는 양의 정수만 받는다. 기존 receipt 생산자의 성공 조건과 같다.
+- H1-R-09: read snapshot의 pending permission `requestId`는 관측값이다. 그래서 기존 Desktop 생산자가 줄 수 있는
+  빈 map key(`''`)도 그대로 운반한다. 그 permission을 대상으로 하는 `reply-own-permission`의 `permissionId`는
+  실행 입력이라 여전히 비어 있지 않아야 한다.

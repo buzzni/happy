@@ -38,7 +38,8 @@ const policy = z.object({ reasonCode: text, ruleId: text, humanOnly: z.boolean()
     target: z.object({ category: text, appName: text, bundleIdOrExe: text }).strict().optional(),
     action: text.optional(), grantOffer: z.enum(['once', 'session']),
 }).strict();
-export const OwnerRelayPendingPermissionSchema = z.object({ requestId: persistedId, toolName: text, title: text,
+// requestId is an observation and may be the producer's '' map key; replying still needs a non-empty permissionId (H1-R-09).
+export const OwnerRelayPendingPermissionSchema = z.object({ requestId: text, toolName: text, title: text,
     arguments: toolData, createdAt: relayCount.optional(), expiresAt: relayCount.optional(),
     kind: z.enum(['ask-user-question', 'exit-plan-mode', 'project-scope', 'generic']), policy: policy.optional(),
 }).strict();
