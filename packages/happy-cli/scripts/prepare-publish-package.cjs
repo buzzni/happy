@@ -14,7 +14,7 @@ const BUNDLED_DEPENDENCIES = [
 ];
 
 function parseArgs(argv) {
-    const args = { out: undefined };
+    const args = { out: undefined, withoutBrowserHosts: false };
 
     for (let index = 0; index < argv.length; index += 1) {
         const arg = argv[index];
@@ -24,6 +24,9 @@ function parseArgs(argv) {
             index += 1;
         } else if (arg.startsWith('--out=')) {
             args.out = arg.slice('--out='.length);
+        } else if (arg === '--without-browser-hosts') {
+            // Smoke tests only: the per-platform addons exist only in the publish workflow.
+            args.withoutBrowserHosts = true;
         } else {
             throw new Error(`Unknown argument: ${arg}`);
         }
@@ -94,6 +97,11 @@ function preparePublishPackage() {
 
     if (fs.existsSync(path.join(cliDir, 'README.md'))) {
         copyPath(path.join(cliDir, 'README.md'), path.join(outputDir, 'README.md'));
+    }
+
+    const isBrowserHost = (entry) => /^native\/[^/]+\/browser-host\.node$/.test(entry);
+    if (args.withoutBrowserHosts) {
+        cliPackage.files = (cliPackage.files || []).filter((entry) => !isBrowserHost(entry));
     }
 
     for (const entry of cliPackage.files || []) {

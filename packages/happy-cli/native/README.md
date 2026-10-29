@@ -16,7 +16,7 @@ NtQuerySystemInformation을 사용한다. 조회 거부는 unknown 오류이며 
 개인 PC 기본 모드에 필요한 `browser-host.node`(darwin-arm64·darwin-x64·win32-x64)는
 `publish-happy-cli.yml`의 `browser-host` 작업이 태그 소스에서 빌드·검사해 패키지에 넣는다.
 darwin-x64는 Apple silicon 러너에서 `BROWSER_HOST_ARCH=x86_64`로 교차 빌드하고 `lipo`로 아키텍처만
-확인한다(실행 검사는 arm64·Windows). 셋 중 하나라도 없으면 `guard-publish-artifact.cjs`가 발행을 막는다.
+확인한다(실행 검사는 arm64·Windows). 셋 중 하나라도 없거나 실행 이미지(Mach-O/PE)가 아니면 `guard-publish-artifact.cjs`가 발행을 막는다. 모듈을 만들 수 없는 스모크·SDK 갱신 CI만 `--without-browser-hosts`로 준비·검사하며, 그 결과물은 발행하지 않는다.
 `browser-guardian` 등 보호 서비스용 바이너리는 포함하지 않는다.
 
 ## 빌드와 검사

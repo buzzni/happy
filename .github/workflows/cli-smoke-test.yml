@@ -96,8 +96,8 @@ jobs:
 
     - name: Pack packages
       run: |
-        node packages/happy-cli/scripts/prepare-publish-package.cjs --out "$RUNNER_TEMP/happy-cli-publish"
-        node packages/happy-cli/scripts/guard-publish-artifact.cjs "$RUNNER_TEMP/happy-cli-publish"
+        node packages/happy-cli/scripts/prepare-publish-package.cjs --out "$RUNNER_TEMP/happy-cli-publish" --without-browser-hosts
+        node packages/happy-cli/scripts/guard-publish-artifact.cjs "$RUNNER_TEMP/happy-cli-publish" --without-browser-hosts
         npm pack "$RUNNER_TEMP/happy-cli-publish" --ignore-scripts --pack-destination packages/happy-cli
         cp .npmrc "$RUNNER_TEMP/npmrc.backup"
         trap 'cp "$RUNNER_TEMP/npmrc.backup" .npmrc' EXIT
@@ -191,7 +191,7 @@ jobs:
     - name: Pack package
       run: |
         $publishDir = Join-Path $env:RUNNER_TEMP "happy-cli-publish"
-        node packages/happy-cli/scripts/prepare-publish-package.cjs --out $publishDir
+        node packages/happy-cli/scripts/prepare-publish-package.cjs --out $publishDir --without-browser-hosts
         npm pack $publishDir --ignore-scripts --pack-destination packages/happy-cli
 
     - name: Install packed package globally

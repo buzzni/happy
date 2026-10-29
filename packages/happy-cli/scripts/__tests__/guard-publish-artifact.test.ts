@@ -27,6 +27,8 @@ function createPublishTarball(
         omitTweetnacl?: boolean
         companionToolsSentinel?: boolean
         omitBrowserHost?: string
+        stubBrowserHost?: string
+        withoutBrowserHosts?: boolean
     } = {}
 ): string {
     const fixtureRoot = mkdtempSync(join(tmpdir(), 'happy-cli-guard-test-'))
@@ -80,8 +82,12 @@ function createPublishTarball(
     writeFixtureFile(packageRoot, 'bin/happy-browser-native-host.mjs', '#!/usr/bin/env node\n')
     chmodSync(nativeHelper, options.nativeHelperExecutable === false ? 0o644 : 0o755)
     writeFixtureFile(packageRoot, 'bin/happy-agent-task.mjs', '#!/usr/bin/env node\n')
-    for (const platform of ['darwin-arm64', 'darwin-x64', 'win32-x64']) {
-        if (platform !== options.omitBrowserHost) writeFixtureFile(packageRoot, `native/${platform}/browser-host.node`, 'addon')
+    for (const platform of options.withoutBrowserHosts ? [] : ['darwin-arm64', 'darwin-x64', 'win32-x64']) {
+        if (platform === options.omitBrowserHost) continue
+        // Real executable headers: Mach-O 64 (little-endian) or PE ("MZ").
+        const header = platform === options.stubBrowserHost ? Buffer.from('addon') : platform.startsWith('win32') ? Buffer.from('MZ\x90\x00', 'latin1') : Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0])
+        mkdirSync(join(packageRoot, 'native', platform), { recursive: true })
+        writeFileSync(join(packageRoot, 'native', platform, 'browser-host.node'), Buffer.concat([header, Buffer.alloc(128)]))
     }
     writeFixtureFile(packageRoot, 'dist/browserNativeMessagingHost.mjs', 'export {}\n')
     if (!options.omitSaycodeAgent) {
@@ -161,6 +167,21 @@ describe('guard-publish-artifact', () => {
         const result = spawnSync(process.execPath, [GUARD_SCRIPT, tarball], { encoding: 'utf8', timeout: 30_000 })
         expect(result.status).toBe(1)
         expect(result.stderr).toContain(`package/native/${platform}/browser-host.node`)
+    })
+
+    it.each(['darwin-arm64', 'win32-x64'])('rejects a %s browser host that is not an executable image', (platform) => {
+        const tarball = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56', { stubBrowserHost: platform })
+        const result = spawnSync(process.execPath, [GUARD_SCRIPT, tarball], { encoding: 'utf8', timeout: 30_000 })
+        expect(result.status).toBe(1)
+        expect(result.stderr).toContain(`native/${platform}/browser-host.node`)
+    })
+
+    it('accepts a smoke artifact prepared without browser hosts only when asked to', () => {
+        const tarball = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56', { withoutBrowserHosts: true })
+        expect(spawnSync(process.execPath, [GUARD_SCRIPT, tarball, '--without-browser-hosts'], { encoding: 'utf8', timeout: 30_000 }).status).toBe(0)
+        expect(spawnSync(process.execPath, [GUARD_SCRIPT, tarball], { encoding: 'utf8', timeout: 30_000 }).status).toBe(1)
+        const withHosts = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56')
+        expect(spawnSync(process.execPath, [GUARD_SCRIPT, withHosts, '--without-browser-hosts'], { encoding: 'utf8', timeout: 30_000 }).status).toBe(1)
     })
 
     it('rejects a tarball missing the wire crypto runtime dependency', () => {
