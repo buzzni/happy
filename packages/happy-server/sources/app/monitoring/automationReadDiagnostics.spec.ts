@@ -26,6 +26,16 @@ describe('automation read diagnostics', () => {
         expect(observer.observe({ ...request, accountId: 'another-account' }, 1_000)).toBeNull();
         expect(observer.observe(request, 1_000)?.accountId).toBe('account');
     });
+    it('bounds tracked accounts and admits new accounts after stale entries expire', () => {
+        const observer = new AutomationReadDiagnostics();
+        for (let i = 0; i < 1_024; i++) observer.observe({ ...request, accountId: `account-${i}` }, 1_000);
+        for (let i = 0; i < 30; i++) expect(observer.observe(request, 1_000)).toBeNull();
+        // Existing accounts still produce samples while new accounts are not tracked.
+        for (let i = 0; i < 28; i++) observer.observe({ ...request, accountId: 'account-0' }, 1_000);
+        expect(observer.observe({ ...request, accountId: 'account-0' }, 1_000)?.count).toBe(30);
+        for (let i = 0; i < 29; i++) expect(observer.observe(request, 61_000)).toBeNull();
+        expect(observer.observe(request, 61_000)?.accountId).toBe('account');
+    });
     it('never includes request credentials or arbitrary fields in the sample', () => {
         const observer = new AutomationReadDiagnostics();
         const unsafe = { ...request, source: 'Bearer secret', authorization: 'secret', body: 'private' };
