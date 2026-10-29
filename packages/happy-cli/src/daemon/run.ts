@@ -1,4 +1,5 @@
 import { createOwnedSpawnRuntime, createOwnedStartGuard } from './ownedSpawnRuntime';
+import { createAgentCallerLaunches, OWNER_CONTACT_SWITCH, readOwnerContactTrust } from './agentCallerLaunches';
 import { drainWorktreeOperations } from './worktreeOps';
 import { createMachineSetupTokenProtocol, MachineRotationError } from './machineSetupTokenProtocol';
 import { chooseLaunchRotation, createMachineRotationResolver } from './machineRotationResolver';
@@ -1162,6 +1163,9 @@ export async function startDaemon(): Promise<void> {
 
     // Setup state - key by PID
     const pidToTrackedSession = new Map<number, TrackedSession>();
+    // T1c-b2 H2 owner-contact launch bindings; assigned with the owned-spawn runtime below. Until then a
+    // launch gets no capability pipe and its host no binding.
+    let callerLaunches: ReturnType<typeof createAgentCallerLaunches> | null = null;
     // aplus-dev-studio strict-followup-plan F2 — a non-forced worktree removal waits for these to leave.
     worktreeRemovalReservations.setLiveSessions(() => [...pidToTrackedSession.values()]
       .map((session) => ({ pid: session.pid, directory: session.directory ?? session.happySessionMetadataFromLocalWebhook?.path })));
@@ -2599,15 +2603,20 @@ export async function startDaemon(): Promise<void> {
       const prepared = standaloneWindows ? await standaloneWindows.owner.prepare({ args, cwd, env }) : undefined;
       if (prepared) logger.debug(`[timing] spawn windows-prepare ${Date.now() - prepareStartedAt}ms`);
       const scopeReports = env.HAPPY_WRITE_SCOPE_SESSION === '1' ? writeScopeRuntime?.prepareReports(resumeTargetSessionId) : undefined;
+      // Owner contact (default OFF): a one-time capability on one more private pipe; null leaves the launch unchanged.
+      const ownerLaunch = prepared ? null : callerLaunches?.prepareLaunch({ cwd, agentEnvironment: captureSaycodeAgentEnvironment(env) }) ?? null;
+      const withOwnerPipe = (base: import('child_process').SpawnOptions['stdio']) =>
+        ownerLaunch?.stdio(base ?? 'ignore') ?? { stdio: base, environment: {} };
       const startupLogFileName = 'daemon-session-startup.log';
       const happyProcess = prepared?.childProcess ?? await launchManagedAiCredentialSession(managedAiCredentialEnvironment,
         () => {
-          const stdio: import('child_process').SpawnOptions['stdio'] = scopeReports ? ['ignore', 'ignore', 'ignore', 'pipe']
-            : captureSpawnOutputStdio(startupLogFileName, `session ${resumeTargetSessionId ?? 'new'} from ${cwd}`);
-          try { onProcessSubmission?.(); return spawnHappyCLI(args, { cwd, detached: true, stdio, env: { ...env, ...scopeReports?.environment } }); }
+          const { stdio, environment: ownerEnvironment } = withOwnerPipe(scopeReports ? ['ignore', 'ignore', 'ignore', 'pipe']
+            : captureSpawnOutputStdio(startupLogFileName, `session ${resumeTargetSessionId ?? 'new'} from ${cwd}`));
+          try { onProcessSubmission?.(); return spawnHappyCLI(args, { cwd, detached: true, stdio, env: { ...env, ...scopeReports?.environment, ...ownerEnvironment } }); }
           finally { closeCapturedSpawnOutputStdio(stdio); }
         });
       scopeReports?.attach(happyProcess);
+      ownerLaunch?.attach(happyProcess);
       const rootPid = prepared?.pid ?? happyProcess.pid;
       if (!rootPid) return { type: 'error', errorMessage: 'Failed to spawn Happy process - no PID returned' };
       logger.debug(`[DAEMON RUN] Spawned session root PID ${rootPid}`);
@@ -4055,6 +4064,7 @@ export async function startDaemon(): Promise<void> {
     };
     const { port: controlPort, stop: stopControlServer, controlSecret } = await startDaemonControlServer({
       restartDrain: restartDrainControlPort,
+      getCallerLaunches: () => callerLaunches,
       getSetupTokenAccountSwitch: () => setupTokenAccountSwitch,
       getChildren: getCurrentChildren,
       stopSession,
@@ -5298,20 +5308,35 @@ export async function startDaemon(): Promise<void> {
       logger.debug(`[channel-host] not started: ${channelHostEntry.code}`);
     }
 
-    const ownedSpawn = createOwnedSpawnRuntime({ home: configuration.happyHomeDir, happyOrigin: configuration.serverUrl, env: process.env,
-      registration: async () => {
-        const [currentCredentials, settings] = await Promise.all([readCredentials(), readSettings()]);
-        if (!currentCredentials || settings.machineId !== machineId || !settings.machineIdConfirmedByServer) throw new Error('identity-changed');
-        // Never replace the running daemon's registration with a descriptor's claims.
-        if (JSON.stringify(currentCredentials) !== JSON.stringify(credentials)) throw new Error('identity-changed');
-        return { machineId, credentials: currentCredentials, epoch: String(process.pid) };
+    const ownedRegistration = async () => {
+      const [currentCredentials, settings] = await Promise.all([readCredentials(), readSettings()]);
+      if (!currentCredentials || settings.machineId !== machineId || !settings.machineIdConfirmedByServer) throw new Error('identity-changed');
+      // Never replace the running daemon's registration with a descriptor's claims.
+      if (JSON.stringify(currentCredentials) !== JSON.stringify(credentials)) throw new Error('identity-changed');
+      return { machineId, credentials: currentCredentials, epoch: String(process.pid) };
+    };
+    const liveLaunch = (tracked: TrackedSession) => tracked.pid > 0 && isPidAlive(tracked.pid);
+    // Default OFF: the route refuses and agent-caller-binding answers only owned-journal sources.
+    // A token's account never changes, so only a confirmed answer is remembered; registration is re-read every time.
+    const accountByToken = new Map<string, string>();
+    callerLaunches = createAgentCallerLaunches({ enabled: process.env[OWNER_CONTACT_SWITCH] === '1',
+      identity: async () => {
+        try {
+          const state = await ownedRegistration(), token = state.credentials.token;
+          const happyAccountId = accountByToken.get(token) ?? await authenticatedAccountId(token);
+          accountByToken.set(token, happyAccountId);
+          return { machineId: state.machineId, happyAccountId, epoch: state.epoch };
+        } catch { return null; }
       },
+      trust: () => readOwnerContactTrust(process.env, configuration.serverUrl), trackedByPid: pid => pidToTrackedSession.get(pid), live: liveLaunch });
+    const ownedSpawn = createOwnedSpawnRuntime({ home: configuration.happyHomeDir, happyOrigin: configuration.serverUrl, env: process.env,
+      registration: ownedRegistration, launchCallers: callerLaunches,
       metadata: options => ({ path: options.directory, host: os.hostname(), version: packageJson.version, os: os.platform(), machineId,
         homeDir: os.homedir(), happyHomeDir: configuration.happyHomeDir, happyLibDir: projectPath(), happyToolsDir: join(projectPath(), 'tools', 'unpacked'),
         flavor: options.agent ?? 'claude', startedFromDaemon: true, startedBy: 'daemon', lifecycleState: 'running', lifecycleStateSince: Date.now() }),
       rotation: (options, companyId) => companyId ? machineRuntimeFor(companyId) : machineRotationFor(options),
       start: (options, launch) => { if (launch) ownedMachineLaunches.set(options, launch); return ownedStartGuard.start(options, () => spawnSessionAdmitted(options)); },
-      tracked: sessionId => findTrackedSessionById(sessionId) ?? sessionIdToFinishedSession.get(sessionId), live: tracked => tracked.pid > 0 && isPidAlive(tracked.pid),
+      tracked: sessionId => findTrackedSessionById(sessionId) ?? sessionIdToFinishedSession.get(sessionId), live: liveLaunch,
       persist: async session => {
         // Rotation has already persisted its execution binding; retain that trusted resume state.
         const prior = readPersistedSessions()[session.id];
