@@ -22,10 +22,10 @@ const WRITES: Write[] = ['click', 'fill', 'navigate']
 const dirs: string[] = []
 afterEach(async () => { await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))) })
 
-async function harness(prefix: string, driver = new FakeBrowserDriver(), existingDir?: string) {
+async function harness(prefix: string, driver = new FakeBrowserDriver(), existingDir?: string, fault?: Parameters<typeof TaskStore.open>[1]) {
     const dir = existingDir ?? await mkdtemp(join(tmpdir(), prefix))
     if (!existingDir) dirs.push(dir)
-    const store = await TaskStore.open(dir)
+    const store = await TaskStore.open(dir, fault)
     const clock = new FakeClock(100)
     const profileId = 'profile-1' as ProfileId
     const runtime = new BrowserRuntime({ sites: SITES, store, drivers: new Map([[profileId, driver]]), clock })
@@ -186,9 +186,84 @@ describe('a fence before the input: the write never left, so the task is not lef
         expect(stored(h, t)).toMatchObject({ status: 'paused', pauseReason: 'cancelled-with-unknown-effect', uncertainActions: ['click-ungated'] })
         await h.store.close()
     })
+
+    it.each(['absent', 'false'] as const)('a driver whose gate capability is %s: the late result keeps the action and the batch unknown', async (form) => {
+        const driver = new FakeBrowserDriver()
+        if (form === 'absent') delete (driver as { gatesInputOnValidateDispatch?: boolean }).gatesInputOnValidateDispatch
+        else driver.gatesInputOnValidateDispatch = false
+        const h = await harness(`abp-boundary-legacy-${form}-`, driver)
+        const t = await openTask(h)
+        const { hold, batch } = await heldAt(h, t, 'fill', 'fill-legacy')
+        await h.runtime.cancel(h.auth, { taskId: t.taskId, requestId: 'cancel' as RequestId })
+        hold.release()
+        const result = (await batch).result
+        expect(result).toMatchObject({ mayHaveSideEffects: true })
+        expect(result?.steps.find((step) => step.actionId === 'fill-legacy')).toMatchObject({ outcome: 'uncertain' })
+        expect(stored(h, t).actions['fill-legacy'].state).toBe('uncertain')
+        expect(stored(h, t)).toMatchObject({ status: 'paused', pauseReason: 'cancelled-with-unknown-effect', uncertainActions: ['fill-legacy'] })
+        await h.store.close()
+    })
+
+    it('a driver without the gate capability, its late result racing a cancel still persisting the revoked lease: unknown either way', async () => {
+        let armed = false
+        let entered!: () => void
+        let release!: () => void
+        const appendHeld = new Promise<void>((resolve) => { entered = resolve })
+        const appendGate = new Promise<void>((resolve) => { release = resolve })
+        const driver = new FakeBrowserDriver()
+        delete (driver as { gatesInputOnValidateDispatch?: boolean }).gatesInputOnValidateDispatch
+        const h = await harness('abp-boundary-legacy-race-', driver, undefined, async (operation) => {
+            if (armed && operation === 'event-append') {
+                armed = false
+                entered()
+                await appendGate
+            }
+        })
+        const t = await openTask(h)
+        const { hold, batch } = await heldAt(h, t, 'fill', 'fill-race')
+        armed = true
+        // Cancel revokes the lease, then waits on persisting it (held here) before it records the cancel.
+        const cancel = h.runtime.cancel(h.auth, { taskId: t.taskId, requestId: 'cancel' as RequestId })
+        await appendHeld
+        hold.release()
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        release()
+        await cancel
+        const result = (await batch).result
+        expect(result).toMatchObject({ outcome: 'uncertain', mayHaveSideEffects: true })
+        expect(stored(h, t).actions['fill-race'].state).toBe('uncertain')
+        expect(stored(h, t)).toMatchObject({ status: 'paused', pauseReason: 'cancelled-with-unknown-effect', uncertainActions: ['fill-race'] })
+        expect(h.driver.dispatchCounts.get('fill-race') ?? 0).toBe(0)
+        await h.store.close()
+    })
 })
 
 describe('after the input may have left: an unknown outcome, never replayed', () => {
+    it.each(['after the driver returned (a later origin read needs the user)', 'after the gate opened (a driver error mislabelled side-effect free)'] as const)(
+        'APPROVAL_REQUIRED %s is not handed off as if nothing was sent', async (when) => {
+            const readRefused = when.startsWith('after the driver returned')
+            class Driver extends FakeBrowserDriver {
+                reads = 0
+                override async currentOrigin(tabId: TabId): Promise<string> {
+                    // The runtime reads the origin before the intent, before the input and after it: refuse the third.
+                    if (readRefused && ++this.reads === 3) throw new BrowserRuntimeError('APPROVAL_REQUIRED', 'origin read needs the user', false, false)
+                    return super.currentOrigin(tabId)
+                }
+            }
+            const driver = new Driver()
+            if (readRefused) delete (driver as { gatesInputOnValidateDispatch?: boolean }).gatesInputOnValidateDispatch
+            const h = await harness('abp-boundary-approval-after-input-', driver)
+            const t = await openTask(h)
+            driver.reads = 0
+            if (!readRefused) driver.failAfterInput('fill', new BrowserRuntimeError('APPROVAL_REQUIRED', 'refused after typing', false, false))
+            const result = (await submit(h, t, [writeStep(t, 'fill', 'fill-handed')], 'batch-handed')).result
+            expect(h.driver.dispatchCounts.get('fill-handed')).toBe(1)
+            expect(result).toMatchObject({ outcome: 'uncertain', mayHaveSideEffects: true })
+            expect(stored(h, t)).toMatchObject({ status: 'paused', pauseReason: 'outcome-unknown', uncertainActions: ['fill-handed'] })
+            expect(stored(h, t).actions['fill-handed'].state).toBe('uncertain')
+            await h.store.close()
+        })
+
     it.each(WRITES)('cancel right after the %s input keeps the outcome unknown', async (kind) => {
         const h = await harness(`abp-boundary-cancel-after-${kind}-`)
         const t = await openTask(h)

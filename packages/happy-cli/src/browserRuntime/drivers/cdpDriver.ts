@@ -235,9 +235,33 @@ class OpContext {
      * caller's DriverOptions.validateDispatch) is the last check: if it throws, nothing is sent.
      */
     markDispatch(validate?: () => void): void {
-        if (this.aborted) throw new BrowserRuntimeError('OUTCOME_UNKNOWN', 'operation aborted before dispatch', false, false)
+        this.assertLive()
         validate?.()
         this.dispatched = true
+    }
+
+    assertLive(): void {
+        if (this.aborted) throw new BrowserRuntimeError('OUTCOME_UNKNOWN', 'operation aborted before dispatch', false, false)
+    }
+
+    /**
+     * Before each command that changes page or browser state while preparing a write (scroll, hover,
+     * focus and selection, the submission guard): the body outlives a call that was given up, so stop
+     * once it was or `validate('prepare')` no longer authorizes the write. Reads need no check.
+     */
+    prepare(validate?: (phase?: 'prepare') => void): void {
+        this.assertLive()
+        validate?.('prepare')
+    }
+
+    /**
+     * Before each further command of a write whose input began (the release, the key up): the body
+     * outlives a call that was given up, so stop once it was or `validate` no longer authorizes it.
+     * What was already sent (a press, a key down) cannot be taken back; the outcome stays unknown.
+     */
+    continueInput(validate?: () => void): void {
+        if (this.aborted) throw new BrowserRuntimeError('OUTCOME_UNKNOWN', 'operation aborted during input', false, true)
+        validate?.()
     }
 }
 
@@ -889,13 +913,14 @@ export class CdpDriver implements BrowserDriver {
         return this.run(opts, async (op, conn) => {
             const tab = this.requireTab(tabId)
             const { binding, objectId } = await this.resolveRef(conn, tab, ref, snapshotId)
-            const point = await this.prepareInput(conn, tab, binding, objectId, false)
+            const point = await this.prepareInput(conn, op, opts, tab, binding, objectId, false)
             this.assertFresh(tab, binding, snapshotId)
             // Hover first and re-verify: pages may swap the node on pointermove, and
             // pressing without re-checking would click whatever took its place.
             // A hover is not treated as a write.
+            op.prepare(opts.validateDispatch)
             await conn.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: point.x, y: point.y }, binding.sessionId)
-            const settled = await this.prepareInput(conn, tab, binding, objectId, false)
+            const settled = await this.prepareInput(conn, op, opts, tab, binding, objectId, false)
             this.assertFresh(tab, binding, snapshotId)
             if (Math.abs(settled.x - point.x) > 1 || Math.abs(settled.y - point.y) > 1) {
                 throw new BrowserRuntimeError('INVALID_REQUEST', 'element moved while the pointer arrived; not interacting', true, false)
@@ -904,10 +929,11 @@ export class CdpDriver implements BrowserDriver {
             // The page ran its hover handlers: what the runtime classified/approved must still hold.
             const live = opts.expect ? await this.assertExpectation(conn, binding, objectId, opts.expect) : undefined
             this.assertFresh(tab, binding, snapshotId)
-            if (live?.form) await this.armSubmitGuard(conn, tab, binding, objectId, live.form)
+            if (live?.form) await this.armSubmitGuard(conn, op, opts, tab, binding, objectId, live.form)
             op.markDispatch(opts.validateDispatch)
             const base = { x: point.x, y: point.y, button: 'left', clickCount: 1 }
             await conn.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed', buttons: 1 }, binding.sessionId)
+            op.continueInput(opts.validateDispatch)
             await conn.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased', buttons: 0 }, binding.sessionId)
             // A submission's verdict: the page's (at submit/formdata) and then the request check's.
             const guard = live?.form ? tab.submitGuard : undefined
@@ -920,8 +946,9 @@ export class CdpDriver implements BrowserDriver {
             if (guard?.lastStatus === 'blocked') {
                 throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'the form submission changed after it was classified; it was stopped before it was sent', false, true)
             }
-            // What the release caused (a file chooser) can arrive right after its answer: one more round trip on
-            // the connection delivers it while this call still observes. Its failure does not fail the click.
+            // What the release caused (a file chooser) can arrive right after its answer: one more round trip on the
+            // connection makes it likelier to arrive while this call still observes (a mitigation, not a guarantee).
+            // Its failure does not fail the click.
             if (opts.observed) await conn.send('Page.getFrameTree', {}, tab.sessionId).catch(() => undefined)
             this.assertEnforced(tab)
         }, true, tabId)
@@ -987,11 +1014,13 @@ export class CdpDriver implements BrowserDriver {
         return this.run(opts, async (op, conn) => {
             const tab = this.requireTab(tabId)
             const { binding, objectId } = await this.resolveRef(conn, tab, ref, snapshotId, true)
-            await this.prepareInput(conn, tab, binding, objectId, true)
+            await this.prepareInput(conn, op, opts, tab, binding, objectId, true)
             this.assertFresh(tab, binding, snapshotId)
             // Focus/select are not writes; verify the target really holds focus (a page may
             // move it on focus) before any text is typed.
+            op.prepare(opts.validateDispatch)
             await conn.send('DOM.focus', { backendNodeId: binding.backendNodeId }, binding.sessionId)
+            op.prepare(opts.validateDispatch)
             const { result: focus } = await conn.send('Runtime.callFunctionOn', { functionDeclaration: SELECT_CONTENT, objectId, returnByValue: true }, binding.sessionId)
             if (focus.value !== true) throw new BrowserRuntimeError('INVALID_REQUEST', 'focus moved away from the element; not typing', true, false)
             await this.assertSameLabel(conn, binding, objectId)
@@ -1002,6 +1031,7 @@ export class CdpDriver implements BrowserDriver {
             } else {
                 const key = { key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46 }
                 await conn.send('Input.dispatchKeyEvent', { ...key, type: 'keyDown' }, binding.sessionId)
+                op.continueInput(opts.validateDispatch)
                 await conn.send('Input.dispatchKeyEvent', { ...key, type: 'keyUp' }, binding.sessionId)
             }
             // A page that swapped the field while the text went in: where it landed is unknown, and typing again could repeat it.
@@ -1621,7 +1651,7 @@ export class CdpDriver implements BrowserDriver {
     }
 
     /** Refuses unusable targets, scrolls into view, hit-tests, returns the dispatch point in the session's viewport. */
-    private async prepareInput(conn: CdpConnection, tab: TabState, binding: RefBinding, objectId: string, forFill: boolean): Promise<{ x: number; y: number }> {
+    private async prepareInput(conn: CdpConnection, op: OpContext, opts: DriverOptions, tab: TabState, binding: RefBinding, objectId: string, forFill: boolean): Promise<{ x: number; y: number }> {
         const check = async () => {
             const { result } = await conn.send('Runtime.callFunctionOn', {
                 functionDeclaration: CHECK_ELEMENT,
@@ -1634,6 +1664,7 @@ export class CdpDriver implements BrowserDriver {
             if (state !== 'ok') throw new BrowserRuntimeError('INVALID_REQUEST', `element is ${state}; not interacting`, false, false)
         }
         await check()
+        op.prepare(opts.validateDispatch)
         await conn.send('DOM.scrollIntoViewIfNeeded', { backendNodeId: binding.backendNodeId }, binding.sessionId)
         await check()
         const { result: hit } = await conn.send('Runtime.callFunctionOn', { functionDeclaration: HIT_TEST, objectId, returnByValue: true }, binding.sessionId)
@@ -1674,17 +1705,20 @@ export class CdpDriver implements BrowserDriver {
         return live
     }
 
-    private async armSubmitGuard(conn: CdpConnection, tab: TabState, binding: RefBinding, objectId: string, expected: FormSubmission): Promise<void> {
+    private async armSubmitGuard(conn: CdpConnection, op: OpContext, opts: DriverOptions, tab: TabState, binding: RefBinding, objectId: string, expected: FormSubmission): Promise<void> {
         // The guard reports through a binding exposed only in the driver's isolated world. Bindings
         // need the Runtime domain on (only for the guard's lifetime) and must be added after it is,
         // to reach an isolated world that already exists.
+        op.prepare(opts.validateDispatch)
         await conn.send('Runtime.enable', {}, binding.sessionId)
+        op.prepare(opts.validateDispatch)
         await conn.send('Runtime.addBinding', { name: GUARD_BINDING, executionContextName: ISOLATED_WORLD }, binding.sessionId)
         setTimeout(() => {
             if (tab.submitGuard?.sessionId !== binding.sessionId || Date.now() >= tab.submitGuard.untilMs) conn.send('Runtime.disable', {}, binding.sessionId).catch(() => undefined)
         }, SUBMIT_GUARD_MS + 100)
         // Reports carry this id: a superseded guard's (its expiry, say) must not settle this one.
         const id = randomBytes(12).toString('hex')
+        op.prepare(opts.validateDispatch)
         const { result } = await conn.send('Runtime.callFunctionOn', { functionDeclaration: SUBMIT_GUARD, objectId,
             arguments: [{ value: expected }, { value: SUBMIT_GUARD_MS }, { value: id }], returnByValue: true }, binding.sessionId)
         if (result.value !== true) throw staleRef('the element is no longer in a form')

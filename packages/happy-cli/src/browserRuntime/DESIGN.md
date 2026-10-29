@@ -519,8 +519,19 @@ is never sent again. The durable intent, actionId reuse refusal and lease fencin
   page check) is `mayHaveSideEffects: true, retryable: false`; navigate counts as side-effecting
   too. After typing, fill checks the field is still in the document; a field the page replaced
   meanwhile is `OUTCOME_UNKNOWN` instead of a success.
+- The driver body can outlive a call that was given up (timeout, abort, a closed connection). So
+  every further command of a write whose input began (the mouse release after the press, the key
+  up after the key down) first checks the call was not given up and calls `validateDispatch`
+  again, and every command that changes page state while preparing it (scroll into view, hover,
+  focus and text selection, installing the submission guard) checks the same with
+  `validateDispatch('prepare')`, which does not open the gate. Reads are not checked. After a
+  fence (cancel, takeover, grant, another task's user control of the profile) nothing more is
+  sent. What was already sent cannot be taken back: a press without its release, or a key down
+  without its key up, may leave the page's pointer or key state pressed. The driver does not send
+  a release or key up once control has passed, and the outcome stays unknown.
 - Runtime: each write step has an in-memory input gate. `validateDispatch` (always passed for
-  writes, not only for Auto) checks, with nothing awaited before the input: the gate is current,
+  writes, not only for Auto, and again before each further command of the write) checks, with
+  nothing awaited before the input: the gate is current,
   the worker not aborted, the task running and not cancelled, the intent still committed, the
   grant live, no disconnect since the intent (a per-profile connection epoch, so an input prepared
   on a lost connection is never sent on the next one), the browser instance, the tab's lease
@@ -528,17 +539,26 @@ is never sent again. The durable intent, actionId reuse refusal and lease fencin
 - Fences (cancel, user takeover, grant revocation/expiry in sweep, driver disconnect) close the
   path to the gate first, then mark an intent whose gate never opened `skipped` instead of
   uncertain; the task ends `cancelled`, `user-control`, `grant-expired` or recovers to
-  `awaiting-agent` without an unknown outcome. A worker's late result uses the same knowledge;
-  when a reconnect left the task running, the late result pauses it.
+  `awaiting-agent` without an unknown outcome. A worker's late result uses the same knowledge,
+  and affirmative evidence wins: the driver call returned, the gate opened, or a fence already
+  kept the action unknown. A destination refused after the input began (a blocked redirect), or
+  an APPROVAL_REQUIRED after it (a later origin read that needs the user), is therefore an unknown
+  outcome, not a safe failure or a hand-off; refusals and hand-offs before the input stay
+  side-effect free. When a reconnect left the task running, the late result pauses it.
 - Only a driver that declares the gate is trusted this way. For any other driver, or after a
   Runtime restart (the gate is not persisted), an interrupted intent stays an unknown outcome, as
-  before.
+  before: such a driver may have sent input before asking, so the Runtime's own refusal at the
+  gate is no evidence, whichever of the late result and the fence's record comes first.
 - Receipts: `StepResult.receipt` (and the `receipt` field of the step's driver-call or failure
   event) for gated drivers: `input` (`sent` once the gate opened) and what the driver saw during
-  the call on that tab: dismissed dialogs (type only), pages the tab opened (origin as known when
+  the call on that tab: dialogs (type only; the driver asks to dismiss them and does not await
+  that), pages the tab opened (origin as known when
   the call ended, '' if not yet; `closed`), file choosers (mode). Bounded to 20 entries each.
   File choosers are observed with `Page.enable({ enableFileChooserOpenedEvent: true })` only; the
   driver does not intercept, answer or cancel them. A browser without that option reports none.
+  The event can follow the answer to the release; one more round trip at the end of an observed
+  click makes it likelier to be seen during the call, but that is a mitigation, not a protocol
+  guarantee: an absent entry proves nothing.
   A receipt is what was observed, not causation: a page or the user can open a popup at the same
   time, and a page can react after the call. It never decides tab ownership or cleanup.
 

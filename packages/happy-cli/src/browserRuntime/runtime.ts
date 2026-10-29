@@ -78,10 +78,11 @@ type DriverWithAction = BrowserDriver & {
 /**
  * The write step a task's worker is running (one at a time per task). `started` once the driver
  * called validateDispatch, i.e. began the input; `trusted` when the driver declares that nothing of
- * the write is sent before that (BrowserDriver.gatesInputOnValidateDispatch). `connection`: the
+ * the write is sent before that (BrowserDriver.gatesInputOnValidateDispatch). `refused` once
+ * validateDispatch refused: proof of nothing for a driver that is not trusted. `connection`: the
  * profile's connection epoch when the intent was committed.
  */
-type InputGate = { actionId: ActionId; started: boolean; trusted: boolean; connection: number }
+type InputGate = { actionId: ActionId; started: boolean; trusted: boolean; refused: boolean; connection: number }
 const WRITE_KINDS: readonly string[] = ['navigate', 'click', 'fill']
 /** How a user wait is recognised as done (`task.waitCompletion`). */
 type UserWaitCompletion = {
@@ -2580,7 +2581,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     throw new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'Action intent was not committed')
                 task = intent
                 const write = WRITE_KINDS.includes(step.kind)
-                const gate: InputGate | undefined = write ? { actionId: step.actionId, started: false,
+                const gate: InputGate | undefined = write ? { actionId: step.actionId, started: false, refused: false,
                     trusted: driver.gatesInputOnValidateDispatch === true, connection: this.connectionEpochs.get(task.profileId) ?? 0 } : undefined
                 if (gate)
                     this.inputGates.set(task.taskId, gate)
@@ -2748,20 +2749,29 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 this.inFlightDriverCalls.add(task.taskId)
                 const observed: ActionObservations | undefined = gate?.trusted ? {} : undefined
                 const inputEpoch = leaseEpoch
-                // The last check before the write's input, run by the driver with nothing awaited before the input.
-                const validateDispatch = gate ? () => {
-                    const current = this.requireTask(task.taskId)
-                    if (this.inputGates.get(current.taskId) !== gate || controller.signal.aborted || current.cancelRequested
-                        || current.status !== 'running' || current.actions[step.actionId]?.state !== 'intent-committed'
-                        || !this.isCredentialLive(auth) || this.reconnecting.has(current.profileId)
-                        || (this.connectionEpochs.get(current.profileId) ?? 0) !== gate.connection
-                        || current.browserInstanceId !== driver.browserInstanceId())
-                        throw new BrowserRuntimeError('STALE_LEASE', 'Task execution fence changed before input', false, false)
-                    this.leases.assert(step.tabId, current.profileId, current.taskId, batchId, inputEpoch)
-                    if (usedAutoConsent && this.autoApprovalFor(current) !== autoConsent)
-                        throw new BrowserRuntimeError('APPROVAL_REQUIRED', 'Auto was disabled or expired before input', false, false)
-                    gate.started = true
+                // The last check before the write's input, run by the driver with nothing awaited before the input;
+                // 'prepare': the same check before a preparation step that changes page state, without opening the gate.
+                const validateDispatch = gate ? (phase?: 'prepare') => {
+                    try {
+                        const current = this.requireTask(task.taskId)
+                        if (this.inputGates.get(current.taskId) !== gate || controller.signal.aborted || current.cancelRequested
+                            || current.status !== 'running' || current.actions[step.actionId]?.state !== 'intent-committed'
+                            || !this.isCredentialLive(auth) || this.reconnecting.has(current.profileId)
+                            || (this.connectionEpochs.get(current.profileId) ?? 0) !== gate.connection
+                            || current.browserInstanceId !== driver.browserInstanceId())
+                            throw new BrowserRuntimeError('STALE_LEASE', 'Task execution fence changed before input', false, false)
+                        this.leases.assert(step.tabId, current.profileId, current.taskId, batchId, inputEpoch)
+                        if (usedAutoConsent && this.autoApprovalFor(current) !== autoConsent)
+                            throw new BrowserRuntimeError('APPROVAL_REQUIRED', 'Auto was disabled or expired before input', false, false)
+                    }
+                    catch (error) {
+                        gate.refused = true
+                        throw error
+                    }
+                    if (phase !== 'prepare')
+                        gate.started = true
                 } : undefined
+                let driverReturned = false
                 try {
                     const dispatchResult = await this.dispatch(driver, effectiveStep, grant, controller.signal, {
                         ...(step.kind === 'click' && description ? { expect: dispatchExpectation(description, usedAutoConsent) } : {}),
@@ -2771,6 +2781,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         if (gate?.trusted)
                             receipts.set(step.actionId, { input: gate.started ? 'sent' : 'not-sent', ...observed })
                     })
+                    driverReturned = true
                     const finalOrigin = await driver.currentOrigin(step.tabId)
                     if (!originAllowed(grant.allowedOrigins, finalOrigin))
                         throw new BrowserRuntimeError('ORIGIN_DENIED', 'Action navigated to a disallowed origin', false, false)
@@ -2881,11 +2892,17 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     }
                 }
                 catch (error) {
+                    // A fence that queued its write before this result (cancel records after aborting the call) decides
+                    // first: an empty mutation waits for it without writing, so the action is judged on that record.
+                    await this.options.store.mutate(task.taskId, () => null).catch(() => undefined)
                     task = this.requireTask(task.taskId)
                     const runtimeError = error instanceof BrowserRuntimeError ? error : undefined
-                    // A write whose input began has an unknown outcome. A gated driver sent nothing before its gate opened
-                    // (the same knowledge the fences use); any other driver's write is unknown unless its error says otherwise.
-                    const sent = write && (gate?.trusted ? gate.started : runtimeError?.mayHaveSideEffects !== false)
+                    // Affirmative evidence wins: the driver call returned, its gate opened, or a fence already kept the
+                    // action unknown. Otherwise a gated driver sent nothing before its gate opened (what the fences use).
+                    // Any other driver's write is unknown unless its own error says it had no side effects: the Runtime's
+                    // refusal at the gate proves nothing about what such a driver sent before asking.
+                    const sent = write && (driverReturned || gate?.started === true || task.uncertainActions.includes(step.actionId)
+                        || (!gate?.trusted && (gate?.refused === true || runtimeError?.mayHaveSideEffects !== false)))
                     const pending = pendingPostconditions.filter((candidate) => candidate.tabId === step.tabId)
                     if (pending.length && task.status === 'running' && !task.cancelRequested) {
                         const actions = { ...task.actions }
@@ -2940,10 +2957,12 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         break
                     }
                     // The driver could not verify the action (e.g. a transformed frame) and sent nothing: the user does it.
-                    if (error instanceof BrowserRuntimeError && error.code === 'APPROVAL_REQUIRED' && !error.mayHaveSideEffects)
+                    // Only without evidence that the input left; otherwise it is an unknown outcome like any other.
+                    if (!sent && error instanceof BrowserRuntimeError && error.code === 'APPROVAL_REQUIRED' && !error.mayHaveSideEffects)
                         return handOff(task, step, index, leaseEpoch, error)
+                    // A destination refused after the input began does not undo what was sent: unknown, not a safe failure.
                     const deniedOrigin = runtimeError?.code === 'ORIGIN_DENIED'
-                    const uncertain = sent && !deniedOrigin
+                    const uncertain = sent
                     const actionState = uncertain ? 'uncertain' as const : 'failed' as const
                     const actions = { ...task.actions, [step.actionId]: { ...task.actions[step.actionId], state: actionState } }
                     const safeFailure = !uncertain && !deniedOrigin
@@ -2951,7 +2970,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         actions,
                         status: uncertain || safeFailure ? 'paused' : 'failed',
                         ...(uncertain
-                            ? { pauseReason: 'outcome-unknown', uncertainActions: [...task.uncertainActions, step.actionId] }
+                            ? { pauseReason: 'outcome-unknown', uncertainActions: [...new Set([...task.uncertainActions, step.actionId])] }
                             : safeFailure ? { pauseReason: 'awaiting-agent' } : {}),
                         ...(safeFailure ? { currentBatchId: undefined } : {}),
                     }, uncertain ? 'action-uncertain' : 'action-failed', { actionId: step.actionId,

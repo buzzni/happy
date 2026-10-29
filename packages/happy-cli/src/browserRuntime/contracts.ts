@@ -251,11 +251,11 @@ export interface StepResult {
  * later). Never an ownership or cleanup decision.
  */
 export interface ActionObservations {
-    /** JavaScript dialogs of the tab, dismissed by the driver (type only; the message is page text). */
+    /** JavaScript dialogs the tab opened (type only; the message is page text). The driver asks to dismiss each; it does not await that. */
     dialogs?: Array<{ type: string }>
-    /** Pages the tab opened (origin as first seen; closed = stopped by destination enforcement or the window cap). */
+    /** Pages the tab opened (origin as known when the call ended, '' if not yet; closed = stopped by destination enforcement or the window cap). */
     popups?: Array<{ origin: string; closed: boolean }>
-    /** File choosers the tab opened; the driver cancelled them (the agent cannot choose files). */
+    /** File choosers the tab opened, observed only: the driver does not intercept, answer or cancel them. */
     fileChoosers?: Array<{ mode: string }>
 }
 
@@ -469,8 +469,12 @@ export interface DriverOptions {
     timeoutMs: number
     /** click only */
     expect?: DispatchExpectation
-    /** In-process authorization fence, called immediately before actual input. Never a wire field. */
-    validateDispatch?: () => void
+    /**
+     * In-process authorization fence, called immediately before actual input (and before each further
+     * command of it). With 'prepare': only checks, before a preparation step that changes page state
+     * (scroll, hover, focus); a driver may skip those calls. Never a wire field.
+     */
+    validateDispatch?: (phase?: 'prepare') => void
     /** navigate/click/fill: in-process sink for what the driver observed during the call. Never a wire field. */
     observed?: ActionObservations
 }
