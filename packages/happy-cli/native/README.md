@@ -135,8 +135,8 @@ Authenticated Users에는 version/principal/generation/runtimeReady만 제공한
 `scripts/windows-browser-service-client.check.ps1`을 실행해 private 읽기 거부와
 공개 상태·중도 연결 종료 회복을 확인한다. 기존 검증 디렉터리/서비스는 덮어쓰지 않는다.
 
-이 호스트는 아직 Node broker/Chrome을 실행하지 않으며 key를 런타임에 연결하지 않는다.
-전용 브라우저 프로세스/Job, WFP·부팅 보호, 설치 artifact 서명과 installer는 별도 미완료다.
+설치된 runtime/node.exe·runtime/dist/runtime.mjs·runtime.json이 있으면 보호 경로와 열린 파일 ACL을 검사한 뒤 runtime worker를 시작한다. 없는 설치는 custody-only이며 부분 설치는 거부한다.
+실제 Windows broker/별도 Chrome 신원 연결, WFP·부팅 보호, 설치 artifact 서명과 installer는 별도 미완료다.
 제품용 원클릭 설치나 전체 isolation 수락을 이 검사로 표시하지 않는다.
 
 ## Windows WFP 정책 도구
@@ -264,3 +264,29 @@ configuration separately from Linux token-file configuration. No signing token i
 A Core-authenticated issuer still must be supplied by the product startup path; the daemon
 entrypoint does not automatically enable this based on an environment URL or attestation.
 Real account/installer integration and Windows service acceptance remain outstanding.
+
+## Windows runtime worker lifetime
+
+`windowsBrowserWorker.cs` is compiled with `windowsBrowserService.cs`. The service pins
+read-only handles to the fixed executable, bundle and enrollment configuration for the
+worker lifetime. It checks their protected ancestry, owner, ACL and single-link identity.
+The installer still owns artifact signature/hash validation; this host is not an installer.
+
+CreateProcess receives an atomic Job-list attribute and no inherited handles. The unnamed
+Job enables kill-on-close and does not allow breakaway. Only fixed ABP config/state paths,
+SystemRoot and private temporary paths enter the environment. Service stop terminates the
+Job and queries active process count; unconfirmed termination sets service error 17. A
+worker root exit stops the service and its descendants. A host crash closes the last Job
+handle in the kernel. There is no PID-based kill or automatic worker restart.
+
+`scripts/windows-browser-service.check.ps1 -Source <windowsBrowserService.cs> -WorkerFixture`
+compiles a synthetic executable that validates the environment and starts a real child.
+Windows x64 acceptance passed restart, host crash, unexpected worker exit and normal stop
+with held child process handles observing exit, plus incomplete bundle, unsafe executable
+ACL, occupied pipe and private key ACL refusal. The test removes its own temporary service
+and protected directory. The original custody-only check remains available without the flag.
+
+This is runtime process containment, not a Chrome isolation claim: browser execution under
+a distinct SID, CDP transport, Windows production bootstrap, authenticated requests and
+installer/upgrade/reboot acceptance remain outstanding. runtimeReady stays false. Revisit
+the fixed payload and environment contract when connecting the Windows production bundle.

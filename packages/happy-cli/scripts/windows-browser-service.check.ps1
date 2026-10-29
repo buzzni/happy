@@ -1,5 +1,5 @@
 param([Parameter(Mandatory=$true)][string]$Source, [ValidateRange(0,60)][int]$ClientProbeSeconds = 0,
-    [string]$Fence, [string]$NetworkProbeSource)
+    [string]$Fence, [string]$NetworkProbeSource, [switch]$WorkerFixture)
 $ErrorActionPreference = 'Stop'
 $name = 'SaycodeBrowserRuntimeVerification'
 $root = Join-Path $env:ProgramData $name
@@ -28,7 +28,10 @@ $fenced = $false
 $listeners = @()
 $udp = $null
 try {
-    & $compiler /nologo /warnaserror+ /target:exe /reference:System.ServiceProcess.dll /out:$exe $Source
+    $sources = @($Source)
+    $workerSource = Join-Path (Split-Path $Source) 'windowsBrowserWorker.cs'
+    if (Test-Path $workerSource) { $sources += $workerSource }
+    & $compiler /nologo /warnaserror+ /target:exe /reference:System.ServiceProcess.dll /out:$exe @sources
     Assert ($LASTEXITCODE -eq 0) 'Service compilation failed'
     InvokeServiceControl @('create',$name,'binPath=',('"' + $exe + '" --verification'),'start=','demand','obj=',('NT SERVICE\' + $name))
     $created = $true
@@ -43,6 +46,47 @@ try {
         $private.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier($id)),'FullControl','ContainerInherit,ObjectInherit','None','Allow')))
     }
     $state.Create($private)
+    if ($WorkerFixture) {
+        $runtime = Join-Path $root 'runtime'
+        [void](New-Item -ItemType Directory -Path (Join-Path $runtime 'dist'))
+        [IO.File]::WriteAllText((Join-Path $root 'runtime.json'), '{}')
+        [IO.File]::WriteAllText((Join-Path $runtime 'dist/runtime.mjs'), '// synthetic worker')
+        $fixture = Join-Path $root 'fixture.cs'
+        [IO.File]::WriteAllText($fixture, @'
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Threading;
+class Fixture {
+    static int Main(string[] args) {
+        if (args.Length == 1 && args[0] == "child") { Thread.Sleep(Timeout.Infinite); return 0; }
+        string root = Directory.GetParent(Path.GetDirectoryName(typeof(Fixture).Assembly.Location)).FullName;
+        if (args.Length != 1 || args[0] != Path.Combine(root,"runtime","dist","runtime.mjs") ||
+            Environment.GetEnvironmentVariable("ABP_CONFIG_FILE") != Path.Combine(root,"runtime.json") ||
+            Environment.GetEnvironmentVariable("ABP_STATE_DIR") != Path.Combine(root,"state") ||
+            Environment.GetEnvironmentVariable("NODE_OPTIONS") != null) return 41;
+        using (var child = Process.Start(new ProcessStartInfo(typeof(Fixture).Assembly.Location,"child") { UseShellExecute=false, CreateNoWindow=true })) {
+            File.WriteAllText(Path.Combine(root,"state","worker-child.txt"), child.Id.ToString());
+            while (!File.Exists(Path.Combine(root,"state","worker-exit"))) Thread.Sleep(50);
+        }
+        return 0;
+    }
+}
+'@)
+        $fixtureExe = Join-Path $runtime 'node.exe'
+        & $compiler /nologo /warnaserror+ /target:exe /out:$fixtureExe $fixture
+        Assert ($LASTEXITCODE -eq 0) 'Worker fixture compilation failed'
+        function ObserveWorker {
+            $path = Join-Path $state.FullName 'worker-child.txt'
+            $until = (Get-Date).AddSeconds(10)
+            while (!(Test-Path $path) -and (Get-Date) -lt $until) { Start-Sleep -Milliseconds 100 }
+            Assert (Test-Path $path) 'Service did not launch the runtime worker'
+            $child = [Diagnostics.Process]::GetProcessById([int][IO.File]::ReadAllText($path))
+            [void]$child.Handle
+            Remove-Item -LiteralPath $path
+            return $child
+        }
+    }
     try { Start-Service $name } catch { & "$env:SystemRoot\System32\sc.exe" query $name | Out-Host; throw }
     (Get-Service $name).WaitForStatus('Running',[TimeSpan]::FromSeconds(15))
     $first = (& $exe --probe-verification | ConvertFrom-Json)
@@ -50,7 +94,13 @@ try {
     $key = Join-Path $state.FullName 'agent.key'
     Assert ([IO.File]::ReadAllText($key) -cmatch '^[0-9a-f]{64}$') 'Credential does not match the runtime hex format'
     $hash = (Get-FileHash -LiteralPath $key -Algorithm SHA256).Hash
+    if ($WorkerFixture) { $workerChild = ObserveWorker }
     Restart-Service $name
+    if ($WorkerFixture) {
+        try { Assert ($workerChild.WaitForExit(5000)) 'Worker descendant survived service restart' }
+        finally { $workerChild.Dispose() }
+        $workerChild = ObserveWorker
+    }
     (Get-Service $name).WaitForStatus('Running',[TimeSpan]::FromSeconds(15))
     $second = (& $exe --probe-verification | ConvertFrom-Json)
     Assert ($LASTEXITCODE -eq 0 -and $first.generation -ne $second.generation) 'Restart generation did not change'
@@ -64,12 +114,32 @@ try {
         Assert ($process.WaitForExit(5000)) 'Service process did not exit'
     } finally { $process.Dispose() }
     (Get-Service $name).WaitForStatus('Stopped',[TimeSpan]::FromSeconds(15))
+    if ($WorkerFixture) {
+        try { Assert ($workerChild.WaitForExit(5000)) 'Worker descendant survived service crash' }
+        finally { $workerChild.Dispose() }
+    }
     Start-Service $name
     (Get-Service $name).WaitForStatus('Running',[TimeSpan]::FromSeconds(15))
     $recovered = (& $exe --probe-verification | ConvertFrom-Json)
     Assert ($LASTEXITCODE -eq 0 -and $recovered.generation -ne $second.generation) 'Crash generation did not change'
     Assert ((Get-FileHash -LiteralPath $key -Algorithm SHA256).Hash -eq $hash) 'Credential changed after crash'
+    if ($WorkerFixture) {
+        $workerChild = ObserveWorker
+        $exitSignal = Join-Path $state.FullName 'worker-exit'
+        [IO.File]::WriteAllText($exitSignal, 'exit')
+        (Get-Service $name).WaitForStatus('Stopped',[TimeSpan]::FromSeconds(15))
+        try { Assert ($workerChild.WaitForExit(5000)) 'Worker descendant survived unexpected runtime exit' }
+        finally { $workerChild.Dispose() }
+        Remove-Item -LiteralPath $exitSignal
+        Start-Service $name
+        $workerChild = ObserveWorker
+    }
     Stop-Service $name
+    if ($WorkerFixture) {
+        try { Assert ($workerChild.WaitForExit(5000)) 'Worker descendant survived service stop' }
+        finally { $workerChild.Dispose() }
+        Write-Output 'PASS runtime worker environment and descendant termination on stop/restart/service crash/runtime exit'
+    }
     $squatter = New-Object IO.Pipes.NamedPipeServerStream(($name + '-status-v1'))
     try {
         $refused = $false
@@ -156,6 +226,23 @@ try {
     $refused = $false
     try { Start-Service $name } catch { $refused = $true }
     Assert $refused 'Service accepted public credential access'
+    if ($WorkerFixture) {
+        $fileAcl.RemoveAccessRuleAll((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier('S-1-1-0')),'Read','Allow')))
+        [IO.File]::SetAccessControl($key,$fileAcl)
+        $scriptPath = Join-Path $runtime 'dist/runtime.mjs'
+        Move-Item -LiteralPath $scriptPath -Destination ($scriptPath + '.held')
+        $refused = $false
+        try { Start-Service $name } catch { $refused = $true }
+        Assert $refused 'Partial runtime payload was accepted'
+        Move-Item -LiteralPath ($scriptPath + '.held') -Destination $scriptPath
+        $workerAcl = [IO.File]::GetAccessControl($fixtureExe)
+        $workerAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier('S-1-1-0')),'Write','Allow')))
+        [IO.File]::SetAccessControl($fixtureExe,$workerAcl)
+        $refused = $false
+        try { Start-Service $name } catch { $refused = $true }
+        Assert $refused 'Publicly writable runtime executable was accepted'
+        Write-Output 'PASS incomplete payload and unsafe worker executable refusal'
+    }
     Write-Output 'PASS dedicated SID, service IPC, restart/crash custody, pipe squatting refusal, unsafe ACL refusal'
 } finally {
     if ($fenced) { & $Fence remove $sid.Value $port; Assert ($LASTEXITCODE -eq 0) 'Fence cleanup failed' }

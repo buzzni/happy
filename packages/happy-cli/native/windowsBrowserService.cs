@@ -1,5 +1,5 @@
-// Service identity and credential custody only. Runtime admission remains disabled
-// until the broker, process supervisor and independent network guard are connected.
+// Service identity, custody and runtime worker lifetime. Readiness remains false
+// until the authenticated broker and isolated browser are connected.
 using System;
 using System.IO;
 using System.IO.Pipes;
@@ -20,6 +20,8 @@ internal sealed class BrowserService : ServiceBase {
     readonly string generation = Guid.NewGuid().ToString("D");
     readonly object gate = new object();
     NamedPipeServerStream pending;
+    WindowsBrowserWorker worker;
+    readonly System.Collections.Generic.List<FileStream> workerInputs = new System.Collections.Generic.List<FileStream>();
     volatile bool stopping;
     static readonly SecurityIdentifier SystemSid = new SecurityIdentifier("S-1-5-18");
     static readonly SecurityIdentifier InstallerSid = new SecurityIdentifier("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464");
@@ -124,10 +126,34 @@ internal sealed class BrowserService : ServiceBase {
             return new NamedPipeServerStream(PipeDirection.InOut, true, false, handle);
         } finally { Marshal.FreeHGlobal(descriptor); }
     }
+    void StartWorker() {
+        string runtime = Path.Combine(root,"runtime"), config = Path.Combine(root,"runtime.json");
+        // An unenrolled custody-only host is not ready. Partial installations fail closed.
+        if (!Directory.Exists(runtime) && !File.Exists(config)) return;
+        string executable=Path.Combine(runtime,"node.exe"), script=Path.Combine(runtime,"dist","runtime.mjs");
+        VerifyDirectory(runtime,false);
+        VerifyDirectory(Path.GetDirectoryName(script),false);
+        foreach (string path in new[] { executable,script,config }) {
+            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint)!=0) throw new IOException("Reparse worker input");
+            var file=File.Open(path,FileMode.Open,FileAccess.Read,FileShare.Read);
+            workerInputs.Add(file); VerifyFile(file,false);
+        }
+        worker=WindowsBrowserWorker.Start(executable,script,config,Path.Combine(root,"state"));
+    }
     protected override void OnStart(string[] args) {
         PrepareCustody();
         ExitCode = 15;
-        pending = CreateStatusPipe();
+        try { StartWorker(); pending = CreateStatusPipe(); }
+        catch { OnStop(); throw; }
+        if (worker!=null) Task.Run(async delegate {
+            try {
+                while (true) {
+                    lock (gate) { if (stopping) return; if (worker.HasExited) break; }
+                    await Task.Delay(100).ConfigureAwait(false);
+                }
+            } catch { }
+            if (!stopping) { ExitCode=16; Stop(); }
+        });
         ExitCode = 0;
         Task.Run(async delegate {
             try {
@@ -151,7 +177,17 @@ internal sealed class BrowserService : ServiceBase {
         });
     }
     protected override void OnStop() {
-        lock (gate) { stopping = true; if (pending != null) pending.Dispose(); }
+        lock (gate) {
+            stopping = true;
+            if (pending != null) pending.Dispose();
+            try { if (worker != null) worker.Stop(); }
+            catch { ExitCode=17; }
+            finally {
+                if (worker != null) worker.Dispose();
+                foreach (var file in workerInputs) file.Dispose();
+                workerInputs.Clear();
+            }
+        }
         // Avoid waiting on this task when its own error path called Stop().
     }
     static int Probe(bool verification) {
