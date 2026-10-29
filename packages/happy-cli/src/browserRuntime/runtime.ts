@@ -2474,8 +2474,12 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 patch = unresolved.length ? { status: 'paused', pauseReason: 'cancelled-with-unknown-effect',
                     uncertainActions: unresolved, actions } : { status: 'cancelled' }
             }
-            else if (!taskGrant || taskGrant.expiresAtMs <= this.clock.now()
-                || this.options.store.isRevoked(taskGrant.grantId) || revokedSegmentActions.length) {
+            // As in the sweep, a login or hand-off the user finished keeps that record when its grant has ended:
+            // grant-expired with a user wait would ask the user again.
+            else if ((!taskGrant || taskGrant.expiresAtMs <= this.clock.now()
+                || this.options.store.isRevoked(taskGrant.grantId) || revokedSegmentActions.length)
+                && !(task.status === 'paused' && task.pauseReason === 'user-input-complete'
+                    && !revokedSegmentActions.length && !pendingWrites.length)) {
                 const approvals = task.approvals
                 const awaitingApproval = task.waitReason === 'approval'
                     && Object.values(approvals).some((approval) => approval.state === 'pending')

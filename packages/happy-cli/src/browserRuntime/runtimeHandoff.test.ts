@@ -221,6 +221,29 @@ describe('returning a hand-off', () => {
         await store.close()
     })
 
+    it.each(['handoff', 'login'] as const)('is the agent\'s again when the user finished a %s wait, its grant ended, and the Runtime restarted', async (wait) => {
+        const h = await createHarness({ sites: HELD, ...(wait === 'login' ? { url: `${origin}/login` } : {}) })
+        if (wait === 'handoff') await heldHandoff(h)
+        const taken = await h.takeOver('turn')
+        if (wait === 'login') h.driver.seedTab(h.opened.tabId, { url: `${origin}/account`, text: 'Signed in', elements: [] })
+        expect(await h.release('turn', taken.leaseEpoch)).toMatchObject({ status: 'paused', pauseReason: 'user-input-complete', waitReason: wait })
+        // The run-once turn ends: its grant is revoked, and the finished wait is kept as it is.
+        await h.runtime.revokeGrant(h.auth.credential.grantId)
+        await h.runtime.sweep(h.clock.now())
+        expect(await h.view()).toMatchObject({ status: 'paused', pauseReason: 'user-input-complete', waitReason: wait })
+        await h.store.close()
+        const store = await TaskStore.open(h.dir)
+        const runtime = new BrowserRuntime({ store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock, sites: HELD })
+        const recovered = await runtime.getTask(h.ui, { taskId: h.task.taskId })
+        expect(recovered).toMatchObject({ status: 'paused', pauseReason: 'user-input-complete', waitReason: wait })
+        // The user is not asked again; a fresh grant gives the task back as without the restart.
+        const fresh = { credential: h.grant('g2', 3_600_000), verifiedAtMs: h.clock.now() }
+        const resumed = await runtime.resume(fresh, { taskId: h.task.taskId, expectedVersion: recovered.stateVersion, requestId: 'restart-agent-resume' as RequestId })
+        expect(resumed).toMatchObject({ status: 'paused', pauseReason: 'awaiting-agent' })
+        expect(await runtime.sessionWaiting('a')).toBe(false)
+        await store.close()
+    })
+
     it('stays the user\'s when the reconnect could not be recorded and a later sweep finds the task still recovering', async () => {
         let failWrites = false
         const h = await createHarness({ faults: (operation) => { if (failWrites && operation === 'task-replace') throw new Error('injected write failure') } })
