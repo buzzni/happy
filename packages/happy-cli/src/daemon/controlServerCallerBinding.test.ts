@@ -2,16 +2,17 @@ import { describe, expect, it, vi } from 'vitest'
 import { startDaemonControlServer } from './controlServer'
 
 const report = { sessionId: 'source', runtimeId: 'runtime', hostPid: 42, callerPublicKey: 'k'.repeat(43) }
-async function control(issue: ((raw: unknown) => Promise<unknown>) | null, managedRuntime = false) {
+async function control(issue: ((raw: unknown) => Promise<unknown>) | null, managedRuntime = false,
+  current: (raw: unknown) => { current: boolean } = () => ({ current: false })) {
   return startDaemonControlServer({
-    getCallerLaunches: () => issue ? { issue } : null, managedRuntime,
+    getCallerLaunches: () => issue ? { issue, current } : null, managedRuntime,
     getChildren: () => [], stopSession: () => ({ status: 'not-found' } as any),
     spawnSession: async () => ({ type: 'error', errorMessage: 'unused' } as any), requestShutdown: () => {}, onHappySessionWebhook: () => {},
     portRegistry: { allocate: async () => ({ port: 30000, reused: false }), release: async () => false, readAll: async () => ({}) },
   })
 }
-async function post(server: { port: number; controlSecret: string }, body: unknown, authenticated = true) {
-  const response = await fetch(`http://127.0.0.1:${server.port}/caller-binding`, { method: 'POST',
+async function post(server: { port: number; controlSecret: string }, body: unknown, authenticated = true, path = '/caller-binding') {
+  const response = await fetch(`http://127.0.0.1:${server.port}${path}`, { method: 'POST',
     headers: { 'Content-Type': 'application/json', ...(authenticated ? { Authorization: `Bearer ${server.controlSecret}` } : {}) }, body: JSON.stringify(body) })
   return { status: response.status, body: await response.json() }
 }
@@ -42,5 +43,19 @@ describe('owner-contact caller-binding control route (T1c-b2 H2)', () => {
       expect((await post(server, report)).status).toBe(403)
       expect(issue).not.toHaveBeenCalled()
     } finally { await server.stop() }
+  })
+  it('answers whether a binding is still current, and nothing else [H2-R-03]', async () => {
+    const current = vi.fn((raw: unknown) => ({ current: (raw as { callerBindingId: string }).callerBindingId === 'live' }))
+    const server = await control(async () => ({}), false, current)
+    const absent = await control(null)
+    const throwing = await control(async () => ({}), false, () => { throw new Error('detail') })
+    try {
+      const body = { sessionId: 'source', callerBindingId: 'live' }
+      expect((await post(server, body, false, '/caller-binding/current')).status).toBe(401)
+      expect(await post(server, body, true, '/caller-binding/current')).toEqual({ status: 200, body: { current: true } })
+      expect(await post(server, { ...body, callerBindingId: 'old' }, true, '/caller-binding/current')).toEqual({ status: 200, body: { current: false } })
+      expect(await post(absent, body, true, '/caller-binding/current')).toEqual({ status: 200, body: { current: false } })
+      expect(await post(throwing, body, true, '/caller-binding/current')).toEqual({ status: 200, body: { current: false } })
+    } finally { await server.stop(); await absent.stop(); await throwing.stop() }
   })
 })

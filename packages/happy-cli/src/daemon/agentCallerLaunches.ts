@@ -1,8 +1,11 @@
 /** Daemon-vouched caller bindings for hosts this daemon launched (Desktop P0a §4.4 step 1-2).
- * The host contributes only its actual runtimeId and public key; scope, depth and identity come
- * from the daemon's own launch state, never from the report, provider env or workspace ledger. */
-import { randomUUID } from 'node:crypto';
+ * The host contributes only its actual runtimeId and public key, authenticated by a one-time launch
+ * capability on a private pipe. Scope, depth and identity come from the daemon's own launch state,
+ * never from the report, the requested/provider env or a workspace ledger. */
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { realpathSync } from 'node:fs';
+import type { ChildProcess, StdioOptions } from 'node:child_process';
+import type { Writable } from 'node:stream';
 import { z } from 'zod';
 import { OwnershipCallerBindingSchema, ownershipId } from '@slopus/happy-wire';
 import type { TrackedSession } from './types';
@@ -15,9 +18,11 @@ export interface OwnerContactTrust {
     /** The daemon's trusted Studio origin; the only lookup destination a host may use. */
     lookupOrigin: string;
 }
+const key32 = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const reportSchema = z.object({ sessionId: ownershipId, runtimeId: ownershipId, hostPid: z.number().int().positive(),
-    callerPublicKey: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).strict();
-const COUNT = /^\d{1,9}$/;
+    callerPublicKey: key32, capability: key32 }).strict();
+/** Names the inherited pipe that carries the launch capability; the value is only a descriptor number. */
+export const OWNER_CONTACT_FD = 'HAPPY_OWNER_CONTACT_FD';
 /** Rollout switch of the daemon and host. Default OFF; it never supplies source, owner or scope. */
 export const OWNER_CONTACT_SWITCH = 'HAPPY_OWNER_CONTACT_V1';
 
@@ -42,6 +47,8 @@ export function createAgentCallerLaunches(deps: {
     realpath?(path: string): string;
 }) {
     const bound = new Map<string, { pid: number; caller: Caller; identity: Identity }>();
+    /** In memory only: a daemon restart forgets them, so a recovered host gets no binding. */
+    const launches = new Map<number, { capability: Buffer; cwd: string; depth: 0 | null }>();
     const realpath = deps.realpath ?? realpathSync;
     /** Before the session-started webhook the launch may not know its session yet; it must never name another one. */
     function launch(sessionId: string, pid: number, confirmed: boolean) {
@@ -51,27 +58,57 @@ export function createAgentCallerLaunches(deps: {
         return session;
     }
     return {
-        /** Host bootstrap before provider start. First report wins for one launch (pid). */
+        /** At spawn: one capability per launch, written once to an extra stdio pipe the host closes before its provider starts. */
+        prepareLaunch(input: { cwd: string; agentEnvironment?: TrackedSession['agentEnvironment'] }) {
+            if (!deps.enabled) return null;
+            const capability = randomBytes(32);
+            // An agent grant's scope and depth come from the spawn request; the daemon has no lineage for them.
+            const depth = input.agentEnvironment?.SAYCODE_AGENT_ENV === '1' ? null : 0;
+            let index = -1;
+            return {
+                stdio(base: StdioOptions) {
+                    const list = Array.isArray(base) ? [...base] : [base, base, base];
+                    while (list.length < 3) list.push('ignore');
+                    index = list.length; list.push('pipe');
+                    return { stdio: list, environment: { [OWNER_CONTACT_FD]: String(index) } };
+                },
+                attach(child: ChildProcess) {
+                    const pipe = child.stdio[index] as Writable | null | undefined, pid = child.pid;
+                    if (!pid || index < 3 || !pipe) return;
+                    launches.set(pid, { capability, cwd: input.cwd, depth });
+                    const forget = () => { if (launches.get(pid)?.capability === capability) launches.delete(pid); };
+                    child.once('exit', forget); child.once('error', forget); pipe.on('error', forget);
+                    pipe.end(JSON.stringify({ capability: capability.toString('base64url') }));
+                },
+            };
+        },
+        /** Host bootstrap before provider start. The capability is single-use and bound to its launch pid. */
         async issue(raw: unknown): Promise<{ caller: Caller; trust: OwnerContactTrust }> {
             if (!deps.enabled) throw new Error('owner-contact-disabled');
             const report = reportSchema.parse(raw);
+            const record = launches.get(report.hostPid), offered = Buffer.from(report.capability, 'base64url');
+            if (!record || offered.length !== record.capability.length || !timingSafeEqual(offered, record.capability)) throw new Error('caller-capability-invalid');
+            launches.delete(report.hostPid);
             const trust = deps.trust();
             if (!trust) throw new Error('owner-contact-unconfigured');
-            const session = launch(report.sessionId, report.hostPid, false);
-            if (bound.get(report.sessionId)?.pid === report.hostPid) throw new Error('caller-already-bound');
+            launch(report.sessionId, report.hostPid, false);
+            if (record.depth === null) throw new Error('caller-lineage-unknown');
             const identity = await deps.identity();
             if (!identity) throw new Error('identity-unknown');
             launch(report.sessionId, report.hostPid, false);
-            if (bound.get(report.sessionId)?.pid === report.hostPid) throw new Error('caller-already-bound');
-            const agent = session.agentEnvironment;
-            const depth = agent?.SAYCODE_AGENT_DEPTH, scope = agent?.SAYCODE_AGENT_SCOPE ?? session.directory;
-            if (!scope || (depth !== undefined && !COUNT.test(depth))) throw new Error('caller-scope-unknown');
             const caller = OwnershipCallerBindingSchema.parse({ callerBindingId: randomUUID(), sessionId: report.sessionId,
                 runtimeId: report.runtimeId, machineId: identity.machineId, happyAccountId: identity.happyAccountId,
-                scope: realpath(scope), depth: depth === undefined ? 0 : Number(depth), hostEpoch: randomUUID(),
-                callerPublicKey: report.callerPublicKey });
+                scope: realpath(record.cwd), depth: record.depth, hostEpoch: randomUUID(), callerPublicKey: report.callerPublicKey });
             bound.set(report.sessionId, { pid: report.hostPid, caller, identity });
             return { caller: { ...caller }, trust };
+        },
+        /** Lets a host check, before each signature and reply, that the daemon still vouches for its binding. */
+        current(raw: unknown) {
+            const input = z.object({ sessionId: ownershipId, callerBindingId: ownershipId }).strict().parse(raw);
+            const entry = bound.get(input.sessionId), session = entry && deps.trackedByPid(entry.pid);
+            return { current: deps.enabled && !!session && entry.caller.callerBindingId === input.callerBindingId && session.pid === entry.pid
+                && session.startedBy === 'daemon' && deps.live(session)
+                && (session.happySessionId === undefined || session.happySessionId === input.sessionId) };
         },
         /** agent-caller-binding for non-journal sources. Never reconstructs a binding. */
         async query(raw: unknown) {

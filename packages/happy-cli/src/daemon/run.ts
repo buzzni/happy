@@ -1163,6 +1163,9 @@ export async function startDaemon(): Promise<void> {
 
     // Setup state - key by PID
     const pidToTrackedSession = new Map<number, TrackedSession>();
+    // T1c-b2 H2 owner-contact launch bindings; assigned with the owned-spawn runtime below. Until then a
+    // launch gets no capability pipe and its host no binding.
+    let callerLaunches: ReturnType<typeof createAgentCallerLaunches> | null = null;
     // aplus-dev-studio strict-followup-plan F2 — a non-forced worktree removal waits for these to leave.
     worktreeRemovalReservations.setLiveSessions(() => [...pidToTrackedSession.values()]
       .map((session) => ({ pid: session.pid, directory: session.directory ?? session.happySessionMetadataFromLocalWebhook?.path })));
@@ -2600,15 +2603,20 @@ export async function startDaemon(): Promise<void> {
       const prepared = standaloneWindows ? await standaloneWindows.owner.prepare({ args, cwd, env }) : undefined;
       if (prepared) logger.debug(`[timing] spawn windows-prepare ${Date.now() - prepareStartedAt}ms`);
       const scopeReports = env.HAPPY_WRITE_SCOPE_SESSION === '1' ? writeScopeRuntime?.prepareReports(resumeTargetSessionId) : undefined;
+      // Owner contact (default OFF): a one-time capability on one more private pipe; null leaves the launch unchanged.
+      const ownerLaunch = prepared ? null : callerLaunches?.prepareLaunch({ cwd, agentEnvironment: captureSaycodeAgentEnvironment(env) }) ?? null;
+      const withOwnerPipe = (base: import('child_process').SpawnOptions['stdio']) =>
+        ownerLaunch?.stdio(base ?? 'ignore') ?? { stdio: base, environment: {} };
       const startupLogFileName = 'daemon-session-startup.log';
       const happyProcess = prepared?.childProcess ?? await launchManagedAiCredentialSession(managedAiCredentialEnvironment,
         () => {
-          const stdio: import('child_process').SpawnOptions['stdio'] = scopeReports ? ['ignore', 'ignore', 'ignore', 'pipe']
-            : captureSpawnOutputStdio(startupLogFileName, `session ${resumeTargetSessionId ?? 'new'} from ${cwd}`);
-          try { onProcessSubmission?.(); return spawnHappyCLI(args, { cwd, detached: true, stdio, env: { ...env, ...scopeReports?.environment } }); }
+          const { stdio, environment: ownerEnvironment } = withOwnerPipe(scopeReports ? ['ignore', 'ignore', 'ignore', 'pipe']
+            : captureSpawnOutputStdio(startupLogFileName, `session ${resumeTargetSessionId ?? 'new'} from ${cwd}`));
+          try { onProcessSubmission?.(); return spawnHappyCLI(args, { cwd, detached: true, stdio, env: { ...env, ...scopeReports?.environment, ...ownerEnvironment } }); }
           finally { closeCapturedSpawnOutputStdio(stdio); }
         });
       scopeReports?.attach(happyProcess);
+      ownerLaunch?.attach(happyProcess);
       const rootPid = prepared?.pid ?? happyProcess.pid;
       if (!rootPid) return { type: 'error', errorMessage: 'Failed to spawn Happy process - no PID returned' };
       logger.debug(`[DAEMON RUN] Spawned session root PID ${rootPid}`);
@@ -4054,8 +4062,6 @@ export async function startDaemon(): Promise<void> {
       stopBlocked: () => restartDrainRuntime?.controlPort.stopBlocked() ?? false,
       handingOff: () => restartDrainRuntime?.controlPort.handingOff() ?? false,
     };
-    // T1c-b2 H2 owner-contact launch bindings; assigned with the owned-spawn runtime below.
-    let callerLaunches: ReturnType<typeof createAgentCallerLaunches> | null = null;
     const { port: controlPort, stop: stopControlServer, controlSecret } = await startDaemonControlServer({
       restartDrain: restartDrainControlPort,
       getCallerLaunches: () => callerLaunches,

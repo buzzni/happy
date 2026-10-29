@@ -1,8 +1,8 @@
 import { createLocalClientSession, registerLocalClientTools, LOCAL_CLIENT_TOOL_NAMES, type LocalClientSession } from '@/browserRuntime/localClientSession';
 import type { PolicyApprover } from '@/toolPolicy/policyGate';
 import { startSessionAgentBroker } from '@/commands/sessionAgentBroker';
-import { startHostOwnerContact } from '@/daemon/sessionOwnerContactHost';
-import { requestDaemonCallerBinding } from '@/daemon/controlClient';
+import { startHostOwnerContact, takeOwnerContactCapability } from '@/daemon/sessionOwnerContactHost';
+import { isDaemonCallerBindingCurrent, requestDaemonCallerBinding } from '@/daemon/controlClient';
 import { readCredentials } from '@/persistence';
 import type { DelegatedAttendance } from '@/api/turnAttendance';
 import { registerSessionWriteScopeTools } from '@/daemon/sessionWriteScopeAgentTools';
@@ -721,7 +721,8 @@ export async function startHappyServer(
         throw error;
     });
     // T1c-b2 H2 owner contact, default OFF (HAPPY_OWNER_CONTACT_V1): off starts exactly the existing broker.
-    const ownerContact = await startHostOwnerContact({ env: process.env, session: client, issue: requestDaemonCallerBinding,
+    const ownerContact = await startHostOwnerContact({ env: process.env, session: client,
+        capability: () => takeOwnerContactCapability(process.env), issue: requestDaemonCallerBinding, current: isDaemonCallerBindingCurrent,
         token: async () => (await readCredentials())?.token ?? null,
         startBroker: contact => options.agentControl
             ? startSessionAgentBroker(client.sessionId, process.env, options.admitTool, undefined, options.delegatedAttendance, undefined, contact)

@@ -119,7 +119,7 @@ export function startDaemonControlServer({
   getCallerLaunches = () => null,
 }: {
   /** T1c-b2 H2 owner-contact launch bootstrap; null while the rollout switch is off. */
-  getCallerLaunches?: () => { issue(raw: unknown): Promise<unknown> } | null;
+  getCallerLaunches?: () => { issue(raw: unknown): Promise<unknown>; current(raw: unknown): { current: boolean } } | null;
   getDeviceEnrollment?: () => ReturnType<typeof createDeviceEnrollment> | null;
   /** Saycode specs/claude-setup-token-account-selection — null until the AI credential runtime exists. */
   getSetupTokenAccountSwitch?: () => Pick<SetupTokenAccountSwitch, 'availability' | 'returnFromPersonal' | 'reportUsage' | 'reportActivity' | 'rebind'> | null;
@@ -519,6 +519,11 @@ export function startDaemonControlServer({
         if (launches) return await launches.issue(request.body);
       } catch { /* The refusal reason stays in the daemon. */ }
       return reply.code(403).send({ error: 'owner-contact-unavailable' });
+    });
+    // Read-only: a host rechecks before each signature and reply that its binding was not replaced or revoked.
+    typed.post('/caller-binding/current', { bodyLimit: 1024, schema: { body: z.unknown() } }, async request => {
+      try { return { current: getCallerLaunches()?.current(request.body).current === true }; }
+      catch { return { current: false }; }
     });
     typed.post('/setup-token/rebind', {
       bodyLimit: 4096,

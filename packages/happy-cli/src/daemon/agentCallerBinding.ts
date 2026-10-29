@@ -59,7 +59,9 @@ export function createAgentCallerBindings(deps: {
     };
 }
 /** Host-held key for a daemon-issued launch binding (T1c-b2 H2). The secret never leaves this closure. */
-export function adoptAgentCallerBinding(input: { binding: Caller; secretKey: Uint8Array; live(): boolean }) {
+export function adoptAgentCallerBinding(input: { binding: Caller; secretKey: Uint8Array; live(): boolean;
+    /** The issuer's current answer; a replaced or revoked binding stops signing even with an unexpired contact. */
+    current?(): Promise<boolean> }) {
     const caller = OwnershipCallerBindingSchema.parse(input.binding);
     if (Buffer.from(input.secretKey.subarray(32)).toString('base64url') !== caller.callerPublicKey) throw new Error('caller-key-mismatch');
     let key: Uint8Array | null = input.secretKey;
@@ -72,6 +74,8 @@ export function adoptAgentCallerBinding(input: { binding: Caller; secretKey: Uin
         async query(raw: unknown) {
             const request = z.object({ sessionId: ownershipId, nonce: z.string().min(16).max(256) }).strict().parse(raw);
             if (request.sessionId !== caller.sessionId) throw new Error('caller-unavailable');
+            current();
+            if (input.current && !await input.current().catch(() => false)) throw new Error('caller-changed');
             current();
             return { version: 1 as const, nonce: request.nonce, caller: { ...caller } };
         },
