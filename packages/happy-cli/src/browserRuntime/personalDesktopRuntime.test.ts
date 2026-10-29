@@ -37,7 +37,8 @@ describe('personal desktop runtime bootstrap', () => {
         expect(personalRuntimePaths('win32', { LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local' }).profileDir).toBe('C:\\Users\\u\\AppData\\Local\\Saycode\\browser-runtime\\profile')
         expect(() => personalRuntimePaths('win32', {})).toThrow(/application directory/)
         const windows = personalRuntimePaths('win32', { LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local' })
-        expect(windows.brokerSocket).toMatch(/^\\\\\.\\pipe\\saycode-browser-runtime-[0-9a-f]{16}-broker$/)
+        // Vector shared with Desktop tests/personalBrowserSetupBackend.test.ts.
+        expect(windows.brokerSocket).toBe('\\\\.\\pipe\\saycode-browser-runtime-0849b51c36e6fe53-broker')
         expect(windows.adminSocket).toBe(windows.brokerSocket.replace(/-broker$/, '-admin'))
         expect(personalRuntimePaths('win32', { LOCALAPPDATA: 'C:\\Users\\other\\AppData\\Local' }).brokerSocket).not.toBe(windows.brokerSocket)
     })
