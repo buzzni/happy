@@ -27,6 +27,7 @@ import { BrowserBridge, BridgeRequestError } from './browserBridge';
 import { attachTerminalWsRoute, type MachineEncryption as TerminalMachineEncryption } from './controlServerTerminalWs';
 import { scopeErrorCode } from './sessionWriteScopeErrors';
 import type { SessionWriteScopeRuntime } from './sessionWriteScopeRuntime';
+import { SetupTokenActivitySchema } from '@slopus/happy-wire';
 import type { SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
 import type { AutomationTurnResult } from '@/api/automationTurnTracker';
 
@@ -118,7 +119,7 @@ export function startDaemonControlServer({
 }: {
   getDeviceEnrollment?: () => ReturnType<typeof createDeviceEnrollment> | null;
   /** Saycode specs/claude-setup-token-account-selection — null until the AI credential runtime exists. */
-  getSetupTokenAccountSwitch?: () => Pick<SetupTokenAccountSwitch, 'availability' | 'returnFromPersonal' | 'reportUsage' | 'rebind'> | null;
+  getSetupTokenAccountSwitch?: () => Pick<SetupTokenAccountSwitch, 'availability' | 'returnFromPersonal' | 'reportUsage' | 'reportActivity' | 'rebind'> | null;
   writeScopeRuntime?: SessionWriteScopeRuntime | null;
   standaloneDrain?: StandaloneDrain;
   /** aplus codexcli-daemon-restart-drain — absent on preflight and in tests that do not drain. */
@@ -491,11 +492,12 @@ export function startDaemonControlServer({
     };
     typed.post('/setup-token/usage', {
       bodyLimit: 8192,
-      schema: { body: z.object({ sessionId: z.string().min(1).max(128), binding: z.string().min(1).max(8192), observation: setupTokenObservation }).strict() },
+      schema: { body: z.object({ sessionId: z.string().min(1).max(128), binding: z.string().min(1).max(8192), observation: setupTokenObservation.optional(), activity: SetupTokenActivitySchema.optional() }).strict().refine(v => !!v.observation !== !!v.activity) },
     }, async (request, reply) => {
       const signal = rotationSignal(reply.raw);
       const switcher = getSetupTokenAccountSwitch();
-      return switcher ? switcher.reportUsage(request.body.sessionId, request.body.binding, request.body.observation, signal) : { ok: false as const, reason: 'STUDIO_UNAVAILABLE' as const };
+      if (request.body.activity) return switcher ? switcher.reportActivity(request.body.sessionId, request.body.binding, request.body.activity, signal) : { ok: false, reason: 'STUDIO_UNAVAILABLE' };
+      return switcher ? switcher.reportUsage(request.body.sessionId, request.body.binding, request.body.observation!, signal) : { ok: false as const, reason: 'STUDIO_UNAVAILABLE' as const };
     });
     for (const action of ['availability', 'return'] as const) typed.post(`/setup-token/${action}`, {
       bodyLimit: 16384,

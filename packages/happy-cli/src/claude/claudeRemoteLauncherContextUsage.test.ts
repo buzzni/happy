@@ -51,6 +51,7 @@ vi.mock('@/modules/common/registerCommonHandlers', () => ({ registerCommonHandle
 vi.mock('@/daemon/controlClient', () => ({
     notifyDaemonSessionRuntime: vi.fn(async () => ({ status: 'ok' })),
     notifyDaemonAutomationTurnResult: vi.fn(async () => ({ status: 'ok' })),
+    reportSetupTokenActivity: vi.fn(async () => ({ ok: true })),
 }));
 
 type RecordedMessage = { label: string; type: string; [key: string]: unknown };

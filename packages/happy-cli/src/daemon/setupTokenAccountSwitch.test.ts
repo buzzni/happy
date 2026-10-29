@@ -63,7 +63,7 @@ describe('setup-token account switch (specs/claude-setup-token-account-selection
     const { switcher, requests, deps, session } = setup()
     const result = await switcher.rebind('session-a', RUNNING_A)
     expect(requests[0]).toEqual({ url: 'https://studio.test/api/claude-setup-token/daemon/rebind', authorization: 'Bearer machine-token',
-      body: { machineId: 'pc-a', sessionId: 'session-a', companyId: 'org-a', bindingNonce: NONCE_A } })
+      body: { machineId: 'pc-a', sessionId: 'session-a', companyId: 'org-a', bindingNonce: NONCE_A, selectionRequestId: expect.any(String) } })
     expect(deps.sessionEnvironment).toHaveBeenCalledWith('claude', { kind: 'claude-setup-token', managedAccountId: B, groupScope: 'org-a', credentialGeneration: 1, bindingGrant: 'claims.signature' })
     expect(result).toEqual({ ok: true, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next', HAPPY_AI_AUTH_SOURCE: 'org-bundle', [SETUP_TOKEN_BINDING_ENV]: formatSetupTokenBinding(binding(B)) } })
     expect(deps.recordAgentEnvironment).toHaveBeenCalledWith(session, formatSetupTokenBinding(binding(B)))
@@ -190,10 +190,10 @@ describe('setup-token account switch (specs/claude-setup-token-account-selection
       expect(await switcher.rebind('session-a', RUNNING_A)).toHaveProperty('ok', true)
       const proof = { machineId: 'pc-a', sessionId: 'session-a', companyId: 'org-a', bindingNonce: NONCE_A }
       expect(requests.map(request => [request.url.split('/daemon/')[1], request.body])).toEqual([
-        ['rebind', { ...proof, measureVersion: 1, measured: [] }],
+        ['rebind', { ...proof, selectionRequestId: expect.any(String), measureVersion: 1, measured: [] }],
         ['measure/reserve', { ...proof, managedAccountId: C, credentialGeneration: 1 }],
         ['measure/publish', { ...proof, managedAccountId: C, credentialGeneration: 1, permitId: 'permit-c', observation: measuredObservation }],
-        ['rebind', { ...proof, measureVersion: 1, measured: [C] }],
+        ['rebind', { ...proof, selectionRequestId: expect.any(String), measureVersion: 1, measured: [C] }],
       ])
       expect(measure).toHaveBeenCalledWith({ companyId: 'org-a', machineId: 'pc-a', managedAccountId: C, credentialGeneration: 1, permit })
     })
@@ -478,11 +478,12 @@ describe('shared PC choice through Studio', () => {
     expect(await switcher.sharedChoose({ companyId: 'org-s', candidates: held, exclude: [A], measure: true })).toBe(B)
     const proof = { machineId: 'pc-a', companyId: 'org-s' }
     expect(requests).toEqual([
-      { path: 'shared/select', body: { ...proof, candidates: held, exclude: [A], measure: true, measured: [] } },
+      { path: 'shared/select', body: { ...proof, selectionRequestId: expect.any(String), candidates: held, exclude: [A], measure: true, measured: [] } },
       { path: 'shared/measure/reserve', body: { ...proof, managedAccountId: B, credentialGeneration: 1 } },
       { path: 'shared/measure/publish', body: { ...proof, managedAccountId: B, credentialGeneration: 1, permitId: 'permit-b', observation: { reason: 'ok' } } },
-      { path: 'shared/select', body: { ...proof, candidates: held, exclude: [A], measure: true, measured: [B] } },
+      { path: 'shared/select', body: { ...proof, selectionRequestId: expect.any(String), candidates: held, exclude: [A], measure: true, measured: [B] } },
     ])
+    expect(requests[0].body.selectionRequestId).toBe(requests[3].body.selectionRequestId)
     expect(measure).toHaveBeenCalledWith({ companyId: 'org-s', machineId: 'pc-a', managedAccountId: B, credentialGeneration: 1, permit })
   })
 
@@ -495,6 +496,18 @@ describe('shared PC choice through Studio', () => {
     expect(await refused.switcher.sharedChoose({ companyId: 'org-s', candidates: held, exclude: [], measure: false })).toBeUndefined()
     const noOrigin = setup({ studioOrigin: null })
     expect(await noOrigin.switcher.sharedChoose({ companyId: 'org-s', candidates: held, exclude: [], measure: false })).toBeUndefined()
+  })
+
+  it('asks a Studio that refuses selectionRequestId again without it, once', async () => {
+    const requests: Array<{ path: string; body: Record<string, unknown> }> = []
+    const refusal = { status: 400, body: { error: 'INVALID_INPUT' } }
+    const { switcher } = setup({ fetch: studio([refusal, { status: 200, body: { version: 1, managedAccountId: B, credentialGeneration: 1 } }], requests) })
+    expect(await switcher.sharedChoose({ companyId: 'org-s', candidates: held, exclude: [A], measure: true })).toBe(B)
+    expect(requests.map(r => 'selectionRequestId' in r.body)).toEqual([true, false])
+    expect(requests[1].body).toEqual({ machineId: 'pc-a', companyId: 'org-s', candidates: held, exclude: [A], measure: true, measured: [] })
+    const stillRefused = setup({ fetch: studio([refusal, refusal], []) })
+    expect(await stillRefused.switcher.sharedChoose({ companyId: 'org-s', candidates: held, exclude: [], measure: false })).toBeUndefined()
+    expect(vi.mocked(stillRefused.deps.fetch)).toHaveBeenCalledTimes(2)
   })
 })
 

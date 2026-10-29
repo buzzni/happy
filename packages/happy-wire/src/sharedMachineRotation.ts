@@ -38,6 +38,8 @@ export const MachineSetupTokenBindingV2Schema = z.object({
 }).strict().refine(lifetime).refine(v => (v.bindingRevision === 1) === (v.previousNonce === null));
 export type MachineSetupTokenBindingV2 = z.infer<typeof MachineSetupTokenBindingV2Schema>;
 
+export const SetupTokenActivitySchema = z.object({ instanceId: id, turnId: id, seq: positive, state: z.enum(['active', 'finished']) }).strict();
+export type SetupTokenActivity = z.infer<typeof SetupTokenActivitySchema>;
 export const RotationObservationSchema = z.object({
   observationId: id, observedAt: integer, managedAccountId: id, credentialGeneration: positive,
   windows: z.array(z.object({ kind: z.enum(['five_hour', 'seven_day']), utilizationBps: integer.refine(v => v <= 10000), resetsAt: integer.nullable() }).strict()).max(2),
@@ -58,10 +60,10 @@ export const DaemonRotationRequestBodySchema = z.discriminatedUnion('action', [
   z.object({ ...requestCommon, action: z.literal('issue'), path: z.literal(DAEMON_ROTATION_PATHS.issue), sessionOwnerAccountId: id, ...hashes }).strict(),
   z.object({ ...requestCommon, action: z.literal('claim'), path: z.literal(DAEMON_ROTATION_PATHS.claim), ...claim }).strict(),
   z.object({ ...requestCommon, action: z.literal('commit'), path: z.literal(DAEMON_ROTATION_PATHS.commit), ...claim, bindingDigest: hash }).strict(),
-  z.object({ ...requestCommon, action: z.literal('usage'), path: z.literal(DAEMON_ROTATION_PATHS.usage), ...claim, observation: RotationObservationSchema }).strict(),
+  z.object({ ...requestCommon, action: z.literal('usage'), path: z.literal(DAEMON_ROTATION_PATHS.usage), ...claim, observation: RotationObservationSchema.optional(), activity: SetupTokenActivitySchema.optional() }).strict(),
   z.object({ ...requestCommon, action: z.literal('rebind'), path: z.literal(DAEMON_ROTATION_PATHS.rebind), ...claim, observation: RotationObservationSchema }).strict(),
   z.object({ ...requestCommon, action: z.literal('operation'), path: z.literal(DAEMON_ROTATION_PATHS.operation), targetOperationId: id }).strict(),
-]).refine(lifetime);
+]).refine(lifetime).refine(v => v.action !== 'usage' || !!v.observation !== !!v.activity);
 export type DaemonRotationRequestBody = z.infer<typeof DaemonRotationRequestBodySchema>;
 
 export const SessionExecutionTicketBodySchema = z.object({

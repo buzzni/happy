@@ -565,3 +565,9 @@ export async function returnFromPersonalClaude(sessionId: string, binding: strin
         return { ok: true, environment: result.environment }
     return { ok: false, reason: 'CLAUDE_ORGANIZATION_RETURN_UNCONFIRMED' }
 }
+
+/** Advisory organization turn load; never changes the binding. */
+export async function reportSetupTokenActivity(sessionId: string, binding: string, activity: import('@slopus/happy-wire').SetupTokenActivity): Promise<{ ok: boolean; reason?: string }> {
+  const result = await daemonPost('/setup-token/usage', { sessionId, binding, activity });
+  return result?.ok === true ? { ok: true } : { ok: false, reason: result?.reason ?? 'REQUEST_FAILED' };
+}

@@ -49,6 +49,7 @@ vi.mock('@/modules/common/registerCommonHandlers', () => ({ registerCommonHandle
 vi.mock('@/daemon/controlClient', () => ({
     notifyDaemonSessionRuntime: vi.fn(async () => ({ status: 'ok' })),
     notifyDaemonAutomationTurnResult: vi.fn(async () => ({ status: 'ok' })),
+    reportSetupTokenActivity: vi.fn(async () => ({ ok: true })),
 }));
 
 const schema = { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'], additionalProperties: false };

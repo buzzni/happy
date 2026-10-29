@@ -12,7 +12,7 @@ import type { Session } from './session';
 import type { EnhancedMode } from './loop';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
-import { requestSetupTokenRebind, reportSetupTokenUsage, requestSetupTokenAvailability, returnFromPersonalClaude } from '@/daemon/controlClient';
+import { requestSetupTokenRebind, reportSetupTokenActivity, reportSetupTokenUsage, requestSetupTokenAvailability, returnFromPersonalClaude } from '@/daemon/controlClient';
 import { APPLY_REQUIRED_NOTICE, CONTINUE_PROMPT, RESUME_REBOUND_NOTICE, SWITCHED_NOTICE } from './setupTokenAccountSwitching';
 import { PERSONAL_RECHECK_NOTICE } from './personalClaudeFallback';
 import { claudeCheckSession } from './utils/claudeCheckSession';
@@ -27,6 +27,7 @@ vi.mock('@/daemon/controlClient', async (original) => ({
     ...await original<typeof import('@/daemon/controlClient')>(),
     requestSetupTokenAvailability: vi.fn(), returnFromPersonalClaude: vi.fn(),
     reportSetupTokenUsage: vi.fn(async () => {}),
+    reportSetupTokenActivity: vi.fn(async () => ({ ok: true })),
     requestSetupTokenRebind: vi.fn(async () => ({ ok: true, environment: {
         CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-second', HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: '{"account":"second"}' } })),
 }));
@@ -177,6 +178,10 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         await claudeRemoteLauncher(session as unknown as Session);
 
         expect(generations.map(generation => generation.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
+        const activeBindings = vi.mocked(reportSetupTokenActivity).mock.calls.filter(c => c[2].state === 'active').map(c => c[1]);
+        expect(activeBindings).toContain('{"account":"first"}');
+        expect(activeBindings.at(-1)).toBe('{"account":"second"}');
+        expect(vi.mocked(reportSetupTokenActivity).mock.calls.at(-1)?.[2].state).toBe('finished');
         expect(client.setClaudeRuntimeAccount.mock.calls.map(([binding]) => JSON.parse(String(binding)).account)).toEqual(['first', 'second']);
         expect(generations.map(generation => generation.resume)).toEqual(failure === 'auth-fresh' ? [undefined, undefined] : ['claude-1', 'claude-1']);
         // A queued user turn replaces automatic continuation and runs alone on the new account.
@@ -257,6 +262,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             await claudeRemoteLauncher(session as unknown as Session);
 
             expect(generations.map(generation => generation.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
+        expect(reportSetupTokenActivity).not.toHaveBeenCalled();
             expect(generations.map(generation => generation.resume)).toEqual(['claude-1', 'claude-1']);
             expect(generations[1].prompts[0]).toContain(CONTINUE_PROMPT);
             const ends = witness.events.filter(event => event.ev.t === 'turn-end');
@@ -361,6 +367,10 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         await claudeRemoteLauncher(session as unknown as Session);
 
         expect(generations.map(generation => generation.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
+        const activeBindings = vi.mocked(reportSetupTokenActivity).mock.calls.filter(c => c[2].state === 'active').map(c => c[1]);
+        expect(activeBindings).toContain('{"account":"first"}');
+        expect(activeBindings.at(-1)).toBe('{"account":"second"}');
+        expect(vi.mocked(reportSetupTokenActivity).mock.calls.at(-1)?.[2].state).toBe('finished');
         expect(generations[0].prompts.join()).not.toContain('after the switch');
         expect(generations[1].prompts[0]).toContain('after the switch');
         expect(requestSetupTokenRebind).not.toHaveBeenCalled();
@@ -414,6 +424,10 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
 
         expect(requestSetupTokenRebind).toHaveBeenCalledTimes(2);
         expect(generations.map(generation => generation.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
+        const activeBindings = vi.mocked(reportSetupTokenActivity).mock.calls.filter(c => c[2].state === 'active').map(c => c[1]);
+        expect(activeBindings).toContain('{"account":"first"}');
+        expect(activeBindings.at(-1)).toBe('{"account":"second"}');
+        expect(vi.mocked(reportSetupTokenActivity).mock.calls.at(-1)?.[2].state).toBe('finished');
         expect(generations[0].prompts.join()).not.toContain('try again');
         expect(generations[1].prompts.join()).toContain('try again');
     });
@@ -486,6 +500,10 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
 
             expect(requestSetupTokenRebind).toHaveBeenCalledTimes(2);
             expect(generations.map(generation => generation.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
+        const activeBindings = vi.mocked(reportSetupTokenActivity).mock.calls.filter(c => c[2].state === 'active').map(c => c[1]);
+        expect(activeBindings).toContain('{"account":"first"}');
+        expect(activeBindings.at(-1)).toBe('{"account":"second"}');
+        expect(vi.mocked(reportSetupTokenActivity).mock.calls.at(-1)?.[2].state).toBe('finished');
             expect(generations[1].prompts[0]).toContain(CONTINUE_PROMPT);
             const ends = witness.events.filter(event => event.ev.t === 'turn-end');
             expect(ends[0].ev).toMatchObject({ inputEvidence: { terminal: true,
