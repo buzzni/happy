@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto'
+import type { SetupTokenActivity } from '@slopus/happy-wire'
 /**
  * Mid-session organization setup-token account switch (Saycode specs/claude-setup-token-account-selection).
  *
@@ -156,6 +158,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     } catch (error) { logger.debug(`${label}: check failed ${(error as Error)?.name ?? 'error'}`) }
   }
 
+  const selectionRequests = new Map<string, {id:string; expiresAt:number}>()
   async function rebindOnce(sessionId: string, running: string, confirmedOnly = false, organizationFailure?: { kind: 'authentication'; observedAt: number }): Promise<RebindResult> {
     const bound = boundSession(deps, sessionId, running)
     if (!bound) return failure('NOT_BOUND', `rebind: no binding recorded for session ${sessionId}`)
@@ -176,6 +179,13 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     }
     if (!deps.studioOrigin) return failure('STUDIO_UNAVAILABLE', 'rebind: Studio origin is not configured')
     const binding = recorded.binding
+    const requestKey = `${sessionId}-${binding.nonce}-${confirmedOnly}`
+    let selectionRequest = selectionRequests.get(requestKey)
+    if (!selectionRequest || selectionRequest.expiresAt <= Date.now()) {
+      for (const [key, value] of selectionRequests) if (value.expiresAt <= Date.now()) selectionRequests.delete(key)
+      selectionRequest = {id:randomUUID(), expiresAt:Date.now()+120_000}; selectionRequests.set(requestKey, selectionRequest)
+    }
+    let selectionRequestId: string | undefined = selectionRequest.id
     const tokenProof = !isMachineSetupTokenBinding(binding) && !!binding.tokenProof
     let grant: Record<string, unknown>
     const proof = { machineId: deps.machineId, sessionId, companyId: binding.companyId, bindingNonce: binding.nonce }
@@ -184,13 +194,14 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     try {
       let response: Response, body: Record<string, unknown> | null
       while (true) {
-        response = await post(confirmedOnly ? 'return' : 'rebind', { ...proof,
+        response = await post(confirmedOnly ? 'return' : 'rebind', { ...proof, ...(selectionRequestId ? { selectionRequestId } : {}),
           ...(tokenProof ? { credentialProofVersion: 1 } : {}), ...(organizationFailure ? { organizationFailure } : {}), ...(measured ? { measureVersion: 1, measured: [...measured] } : {}) })
         body = await response.json().catch(() => null) as Record<string, unknown> | null
         // A Studio from before candidate checks refuses the fields it does not know: ask again as before, once.
-        if (response.status === 400 && measured) {
+        if (response.status === 400 && (measured || selectionRequestId)) {
           logger.debug('[setup-token-switch] Studio refused candidate checks; asking again without them')
           measured = null
+          selectionRequestId = undefined
           continue
         }
         if (response.status !== 409 || body?.error !== 'SETUP_TOKEN_DAEMON_MEASURE_REQUIRED') break
@@ -267,6 +278,23 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
   }
 
   return {
+    async reportActivity(sessionId: string, running: string, activity: SetupTokenActivity, signal?: AbortSignal): Promise<{ ok: true } | { ok: false; reason: SwitchFailure }> {
+      const parsed = parseBinding(running)
+      if (parsed && isMachineSetupTokenBinding(parsed.binding)) {
+        try { const runtime = await deps.machineRuntime?.(parsed.binding.companyId)
+          return runtime ? await runtime.reportActivity(sessionId, running, activity, signal) : failure('STUDIO_UNAVAILABLE', 'activity runtime absent')
+        } catch (error) { return machineFailure(error) }
+      }
+      // Legacy unbound shared authority is never promoted into a binding proof.
+      const bound = boundSession(deps, sessionId, running)
+      if (!bound || !deps.studioOrigin) return failure('NOT_BOUND', 'activity: binding absent')
+      if (bound.state !== 'same' && activity.state !== 'finished') return failure('STALE', 'activity: provider binding changed')
+      const binding = parsed!.binding
+      try {
+        const response = await post('usage', { machineId: deps.machineId, sessionId, companyId: binding.companyId, bindingNonce: binding.nonce, activity })
+        return response.ok ? { ok: true } : failure(refusal(response.status), `activity ${response.status}`)
+      } catch { return failure('REQUEST_FAILED', 'activity report failed') }
+    },
     async availability(sessionId: string, running: string, personalConsent?: { proof: string; accountRef: string; nonce: string }, organizationFailure?: { kind: 'authentication'; observedAt: number }) {
       const bound = boundSession(deps, sessionId, running)
       if (!bound || isMachineSetupTokenBinding(bound.recorded.binding) || !deps.studioOrigin) return { ok: false as const, reason: 'NOT_BOUND' }
@@ -319,9 +347,10 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       if (!deps.studioOrigin) return undefined
       const proof = { machineId: deps.machineId, companyId: input.companyId }
       const measured: string[] = []
+      const selectionRequestId = randomUUID()
       try {
         while (true) {
-          const response = await post('shared/select', { ...proof, candidates: input.candidates, exclude: input.exclude, measure: input.measure, measured: [...measured] })
+          const response = await post('shared/select', { ...proof, selectionRequestId, candidates: input.candidates, exclude: input.exclude, measure: input.measure, measured: [...measured] })
           const body = await response.json().catch(() => null) as Record<string, unknown> | null
           if (response.ok && typeof body?.managedAccountId === 'string') return body.managedAccountId
           if (response.status === 409 && body?.error === 'SETUP_TOKEN_DAEMON_NO_ACCOUNT') return null

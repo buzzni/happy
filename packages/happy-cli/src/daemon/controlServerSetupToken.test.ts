@@ -4,7 +4,7 @@ import type { SetupTokenAccountSwitch } from './setupTokenAccountSwitch'
 
 const observation = { observedAt: 10, reason: 'ok', retryAt: null, windows: [{ kind: 'unified5h', pct: 96, resetsAt: 20 }] }
 
-async function control(switcher: Pick<SetupTokenAccountSwitch, 'availability' | 'returnFromPersonal' | 'reportUsage' | 'rebind'> | null) {
+async function control(switcher: Pick<SetupTokenAccountSwitch, 'availability' | 'returnFromPersonal' | 'reportUsage' | 'reportActivity' | 'rebind'> | null) {
   return startDaemonControlServer({
     getSetupTokenAccountSwitch: () => switcher,
     getChildren: () => [], stopSession: () => ({ status: 'not-found' } as any),
@@ -16,7 +16,7 @@ async function control(switcher: Pick<SetupTokenAccountSwitch, 'availability' | 
 describe('setup-token control routes (specs/claude-setup-token-account-selection)', () => {
   it('forwards a session usage report and a switch request, authenticated by the control secret', async () => {
     const switcher = { availability: vi.fn(async () => ({ ok: true as const, allLimited: true, availableAccountIds: [], consentApproved: true })), returnFromPersonal: vi.fn(async () => ({ ok: true as const, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'fixture-org' } })),
-      reportUsage: vi.fn(async () => ({ ok: true as const })),
+      reportActivity: vi.fn(async () => ({ok:true as const})), reportUsage: vi.fn(async () => ({ ok: true as const })),
       rebind: vi.fn(async () => ({ ok: true as const, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next' } })),
     }
     const server = await control(switcher)
@@ -27,6 +27,12 @@ describe('setup-token control routes (specs/claude-setup-token-account-selection
       expect(switcher.rebind).not.toHaveBeenCalled()
       expect(await (await post('/setup-token/usage', { sessionId: 'session-a', binding: '{}', observation })).json()).toEqual({ ok: true })
       expect(switcher.reportUsage).toHaveBeenCalledWith('session-a', '{}', observation, expect.any(AbortSignal))
+      const activity = {instanceId:'i',turnId:'t',seq:1,state:'active'}
+      expect((await post('/setup-token/usage', {sessionId:'session-a',binding:'{}',activity}, false)).status).toBe(401)
+      expect(switcher.reportActivity).not.toHaveBeenCalled()
+      expect(await (await post('/setup-token/usage', {sessionId:'session-a',binding:'{}',activity})).json()).toEqual({ok:true})
+      expect(switcher.reportActivity).toHaveBeenCalledWith('session-a','{}',activity,expect.any(AbortSignal))
+      expect((await post('/setup-token/usage', {sessionId:'session-a',binding:'{}',activity,observation})).status).toBe(400)
       const organizationFailure={kind:'authentication',observedAt:1000}
       const personalConsent={proof:'fixture-proof',accountRef:'a'.repeat(64),nonce:'b'.repeat(48)}
       expect((await post('/setup-token/availability',{sessionId:'session-a',binding:'{}',personalConsent,organizationFailure},false)).status).toBe(401)
@@ -51,7 +57,7 @@ describe('setup-token control routes (specs/claude-setup-token-account-selection
     let cancelled = false;
     let started!: () => void;
     const ready = new Promise<void>(resolve => { started = resolve });
-    const switcher = { availability: vi.fn(), returnFromPersonal: vi.fn(), reportUsage: vi.fn(), rebind: vi.fn<SetupTokenAccountSwitch['rebind']>(async (_id, _binding, _observation, signal) => {
+    const switcher = { availability: vi.fn(), returnFromPersonal: vi.fn(), reportActivity: vi.fn(async () => ({ok:true as const})), reportUsage: vi.fn(), rebind: vi.fn<SetupTokenAccountSwitch['rebind']>(async (_id, _binding, _observation, signal) => {
       started();
       await new Promise<void>(resolve => signal!.addEventListener('abort', () => { cancelled = true; resolve() }, { once: true }));
       return { ok: false, reason: 'REQUEST_FAILED' };

@@ -1,3 +1,4 @@
+import { createSetupTokenActivityReporter } from './setupTokenActivity';
 import { MandatorySandboxError } from '@/sandbox/sandboxPolicy';
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
@@ -62,7 +63,7 @@ import { readPersonalClaudeCredential } from './personalClaudeCredential';
 import { readSetupTokenResumeSelection, isMachineSetupTokenBinding } from '@/daemon/sessionEnv';
 import { createLessonTurnObservations } from '@/memory/lessonTurnObservations';
 import { createSetupTokenAccountSwitching, CONTINUE_PROMPT, RESUME_REBOUND_NOTICE } from './setupTokenAccountSwitching';
-import { reportSetupTokenUsage, requestSetupTokenRebind, requestSetupTokenAvailability, returnFromPersonalClaude } from '@/daemon/controlClient';
+import { reportSetupTokenActivity, reportSetupTokenUsage, requestSetupTokenRebind, requestSetupTokenAvailability, returnFromPersonalClaude } from '@/daemon/controlClient';
 import {
     CLAUDE_TRANSIENT_CONTINUE_PROMPT,
     CLAUDE_TRANSIENT_RETRY_DELAYS_MS,
@@ -487,6 +488,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     let lastTurnMode: EnhancedMode | null = null;
     /** The setup-token binding (or shared-PC account) the running provider started with; usage is booked to it, not to a later switch. */
     let providerBinding: string | undefined;
+    let providerActivityBinding: string | undefined;
+    const activityReporter = createSetupTokenActivityReporter({
+        sessionId: () => session.client.sessionId,
+        binding: () => providerActivityBinding,
+        report: reportSetupTokenActivity,
+        warn: () => logger.debug('[setup-token-load] Activity report unavailable; load is unobserved'),
+    });
     /** Whether the last turn answered a channel request; its lifecycle cannot authorize a second execution. */
     let lastTurnChannel = false;
     /** A refused turn to continue as the first turn of the next provider (set by a switch). */
@@ -846,6 +854,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             let modeHash: string | null = null;
             let mode: EnhancedMode | null = null;
             providerRunning = false;
+            // Capture authority before the first thinking callback, which can precede system/init.
+            providerBinding = runningAuthority();
+            providerActivityBinding = personalFallback?.identity() ? undefined : process.env[SETUP_TOKEN_BINDING_ENV];
             const optionsCredentialGeneration = personalFallback?.generation() ?? 0;
             const providerOptionsStale = () => providerStale() || optionsCredentialGeneration !== (personalFallback?.generation() ?? 0);
             try {
@@ -1306,7 +1317,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             ],
                         }));
                     },
-                    onThinkingChange: session.onThinkingChange,
+                    onThinkingChange: (thinking) => { activityReporter.thinking(thinking); session.onThinkingChange(thinking); },
                     claudeEnvVars: session.claudeEnvVars,
                     claudeArgs: session.claudeArgs,
                     onMessage,
@@ -1420,6 +1431,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     continue;
                 }
             } finally {
+                activityReporter.thinking(false);
                 providerEnded = true;
                 generationEnded.abort();
                 if (backgroundTasks) {
@@ -1527,6 +1539,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         session.client.setInputSteerAvailable?.(false);
         personalFallback?.cancel();
         if (personalFallback) { session.client.setPersonalClaudeFallback(undefined); session.client.setClaudeRuntimeAccount(undefined); }
+        await activityReporter.dispose();
         setupTokenSwitching?.dispose();
 
         // Clean up permission handler

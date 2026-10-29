@@ -260,6 +260,15 @@ export function createMachineSetupTokenRuntime(deps: {
     resume(session: TrackedSession, binding: MachineSetupTokenBindingRecord) {
       if (activeLaunches.has(binding.launchId)) return Promise.reject(new MachineRotationError('LAUNCH_IN_PROGRESS'));
       return serial(binding.launchId, () => recover(binding, session, false)) },
+    async reportActivity(sessionId: string, running: string, activity: import('@slopus/happy-wire').SetupTokenActivity, signal?: AbortSignal) {
+      const binding = bindingOf(running), session = deps.findSession(sessionId)
+      if (!session || binding.execution.sessionId !== sessionId || (session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV] !== running && activity.state !== 'finished')) throw new MachineRotationError('STALE')
+      const request = await protocol.request({ action: 'usage', operationId: randomUUID(), launchId: binding.launchId, sessionId,
+        nonce: binding.nonce, bindingRevision: binding.bindingRevision, activity })
+      const result = await protocol.post(request, false, signal)
+      if (result.state !== 'recorded') throw new MachineRotationError('REQUEST_FAILED')
+      return { ok: true as const }
+    },
     async reportUsage(sessionId: string, running: string, observation: SetupTokenUsageObservation, signal?: AbortSignal) {
       signal?.throwIfAborted();
       const binding = bindingOf(running), session = deps.findSession(sessionId)
