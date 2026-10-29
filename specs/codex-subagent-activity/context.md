@@ -1,7 +1,7 @@
 ---
 기능: codex-subagent-activity
-상태: 런타임 구현·문서 커밋 완료 — 출시 전 실앱 검증, PR·릴리스는 사용자 지시 대기
-마지막 갱신: 2026-10-28
+상태: 런타임 구현·문서 커밋과 출시 전 실앱 검증 완료 — PR·릴리스는 사용자 지시 대기
+마지막 갱신: 2026-10-29
 ---
 
 # Codex 서브 에이전트 활동 — 런타임 Context
@@ -13,6 +13,8 @@
 - 주문 01~05·05b 구현과 이 문서 세트를 로컬 커밋 2개(구조 `emitCodexUsage()` 추출 → 기능)로 남겼다. 출시 전 실앱
   검증(2026-10-28, 개인 공간·buzzni)에서 찾은 줄 빠짐을 D16 커밋으로 고쳤다. push·PR·버전 bump·태그·발행은 하지
   않았다. 실앱 검증 기록은 Desktop 작업트리 `.aplus/verification/evidence/20261028-codex-subagent-real/RESULTS.md`.
+- 2026-10-29 Fable 검수(`.work/reviews/postreal-r15-d16-review.md`, D16·출시 점검표 번호): pass-with-fixes. 권장 F1을
+  D16 보완으로 고쳤고(미커밋), 점검표 번호는 `.365`로 맞췄다(미커밋).
 - 요구사항 R1~R8과 테스트 대응은 [spec.md](./spec.md), 단계별 내용과 검증은 [plan.md](./plan.md)에 있다.
 - 주문 05(워치독 완화)는 2026-10-28 사용자가 채택해 구현했다(아래 열린 문제 7, plan Phase 5).
 - 주문 05b(60분 정리기 면제)는 2026-10-28 사용자가 채택해 구현했다(아래 열린 문제 6, plan Phase 5b).
@@ -93,6 +95,11 @@
     (예: `lion_sleep` / `Locke`). 사용자가 2026-10-28 "그대로 두기"로 수용했다(열린 문제 12).
   - 기각: 대기를 재시도 뒤까지 늘리기(줄이 늦어지고, 그 사이 턴이 끝나면 여전히 버려진다), 턴이 끝난 뒤에도 줄
     내기(끝난 턴을 다시 여는 문제 — D15와 같은 이유로 옛 Desktop 호환이 깨진다).
+  - 보완(2026-10-29 Fable 검수 F1): 위 결정은 실패 시점에 이미 있던 대기만 끝냈다. 실패가 메인의 spawn 항목보다 먼저
+    오면 그 항목이 만든 줄 대기·첫 목록 대기는 다시 1.5초를 기다려, 턴이 빨리 끝나면 줄이 버려지고 목록도 늦었다(R3·R4-3과
+    어긋남). 자식에 `readFailed`를 두어 첫 실패를 기억하고, 그 뒤 대기도 바로 답한다. 테스트 `[10] reports the row and
+    the listing of a child whose first thread/read failed before its spawn item`은 수정 전에 실패했다(5ms 시점 목록 비어
+    있음). 성공 경로와 재시도 뒤 동작은 그대로다.
 - **D13 매퍼 방어.** 이름이 비었거나 문자열이 아니면 `Agent`로 쓴다. call id는 자식 threadId를 쓰고(D15), threadId가
   없으면 받은 call id, 그것도 없으면 새로 만든다. 실제 경로의 이름 함수는 빈 값을 내지 않는다. envelope `subagent`는 쓰지 않는다. 자식의 내용을 보내지
   않으므로 세션 서브에이전트 매핑 표에 흔적을 남길 이유가 없다.
@@ -228,22 +235,24 @@
 - [x] 1. 기능 변경 커밋(사용자 승인 뒤). 구조 변경 `emitCodexUsage()` 추출(동작 동일)을 `[structural]`로 먼저, 나머지를
   `[behavioral]`로 나눈다.
 - [ ] 2. push → PR(`gh pr create --repo buzzni/happy --base main …`) → CI 통과 → main 머지. push·PR 생성·머지는
-  각각 사용자 승인 뒤에 한다.
-- [ ] 3. 버전 bump(**사용자 승인 뒤 메인 세션이 커밋**): `packages/happy-cli/package.json`을 `1.1.10-aplus.362` →
-  `1.1.10-aplus.363`. 이 저장소 관례대로 bump만 담은 `[behavioral] release(cli): … .363 후보 준비` 커밋·PR로 main에
-  머지한다. 런북 Version Bump 2단계대로 빌드와 관련 테스트를 돌린다. 직전에 `.363`이 비어 있는지 다시 본다
-  (2026-10-28 14시 확인: 원격 태그·npm `latest` 모두 `1.1.10-aplus.362`까지. `.361`·`.362`는 다른 변경으로 이미
-  발행됐다). 그사이 main에 다른 변경이 들어왔으면 포함 범위를 커밋 본문에 적는다.
-- [ ] 4. 태그 push(**별도 직전 승인**): bump가 머지된 main 커밋에 태그 하나 — `git tag happy-cli-v1.1.10-aplus.363
-  <main 커밋>` → `git push origin happy-cli-v1.1.10-aplus.363`. 워크플로 `Publish @buzzni/happy-cli`가 태그와
+  각각 사용자 승인 뒤에 한다. 이 브랜치는 `.362`(346fe458) 위에 있다. PR 전에 최신 main을 가져온다(2026-10-29
+  `git merge-tree`로 `.364`(3bc47156)와 충돌 없음 확인).
+- [ ] 3. 버전 bump(**사용자 승인 뒤 메인 세션이 커밋**): `packages/happy-cli/package.json`을 그때 main의 번호 →
+  다음 빈 번호(2026-10-29 기준 `1.1.10-aplus.365`). 이 저장소 관례대로 bump만 담은 `[behavioral] release(cli): … 후보
+  준비` 커밋·PR로 main에 머지한다. 런북 Version Bump 2단계대로 빌드와 관련 테스트를 돌린다. 직전에 그 번호가 비어
+  있는지 다시 본다(2026-10-29 확인: 원격 태그 `.363`(10-28 16:54)·`.364`(10-28 23:01)는 이 기능 없이 다른 변경으로
+  발행됐다). 그사이 main에 다른 변경이 들어왔으면 포함 범위를 커밋 본문에 적는다. 번호가 `.365`가 아니면 Desktop
+  문구 6줄(`git grep -n "aplus\.365"`)도 같은 번호로 바꾼다.
+- [ ] 4. 태그 push(**별도 직전 승인**): bump가 머지된 main 커밋에 태그 하나 — `git tag happy-cli-v1.1.10-aplus.365
+  <main 커밋>` → `git push origin happy-cli-v1.1.10-aplus.365`. 워크플로 `Publish @buzzni/happy-cli`가 태그와
   `package.json` 버전이 같은지 확인한 뒤 빌드·guard·발행·검증한다.
 - [ ] 5. 로컬 발행 금지: `npm publish`·`pnpm publish`·`yarn publish`를 어디서도 실행하지 않는다(준비 디렉터리와
   tarball 포함). 발행은 GitHub Actions만 한다. 실패한 발행 작업은 다시 돌리지 않는다.
 - [ ] 6. 서버 선배포 불필요: usage wire(`packages/happy-wire/src/usage.ts`)를 비롯해 `packages/happy-wire`를 바꾸지
   않았다. `CodexAgent` 줄은 기존 wire 필드만 쓴다.
-- [ ] 7. 레지스트리 확인: `latest`가 `1.1.10-aplus.363`, tarball URL 200, 새 prefix 설치 뒤 `happy daemon status` 성공
+- [ ] 7. 레지스트리 확인: `latest`가 `1.1.10-aplus.365`, tarball URL 200, 새 prefix 설치 뒤 `happy daemon status` 성공
   (워크플로의 검증 단계). 전파가 늦어 실패하면 재발행하지 말고 검증 전용 실행
-  (`gh workflow run publish-happy-cli.yml --repo buzzni/happy --ref main -f version=1.1.10-aplus.363`)을 쓴다. 이것도
+  (`gh workflow run publish-happy-cli.yml --repo buzzni/happy --ref main -f version=1.1.10-aplus.365`)을 쓴다. 이것도
   외부 행위라 승인 뒤에 한다.
 - [ ] 8. Desktop 런타임 pin은 7이 끝난 뒤(주문 10). 발행되지 않은 버전으로 pin을 쓰지 않는다.
 - [ ] 9. 런북 완료 기준의 나머지: `buzzni/aplus-dev-studio`의 `vendor/happy` 포인터를 머지된 main 커밋으로 올리는

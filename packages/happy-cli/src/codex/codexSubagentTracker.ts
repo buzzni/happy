@@ -38,6 +38,8 @@ const MAX_LABEL_LENGTH = 200;
 type Child = {
     /** `thread/read` settled: answered, or failed twice. Until then the child is a candidate. */
     classified: boolean;
+    /** The first `thread/read` failed and its retry is pending: no label wait can improve the label (D16). */
+    readFailed: boolean;
     /** Codex's own helper thread (review, compact, memory consolidation, …): never shown. */
     internal: boolean;
     /** Lineage: the parent `thread/read` reports, else the thread whose spawn item named this child. */
@@ -157,11 +159,12 @@ export class CodexSubagentTracker {
         });
     }
 
-    /** The spawn row title: the label once `thread/read` settles, or the fallback label after `timeoutMs`. */
+    /** The spawn row title: the label once `thread/read` settles, or the fallback label after `timeoutMs` — at once
+     *  after the first read failed. */
     awaitLabel(threadId: string, timeoutMs: number): Promise<string> {
         return new Promise(resolve => {
             const child = this.children.get(threadId);
-            if (!child || child.classified) return resolve(formatCodexAgentLabel(child ?? {}));
+            if (!child || child.classified || child.readFailed) return resolve(formatCodexAgentLabel(child ?? {}));
             const waiter: Waiter = { child, resolve, timer: null };
             this.waiters.add(waiter);
             waiter.timer = this.after(timeoutMs, () => this.settle(waiter));
@@ -227,7 +230,7 @@ export class CodexSubagentTracker {
         let child = this.children.get(threadId);
         if (!child) {
             child = {
-                classified: false, internal: false, parentId: null, spawnedBy: null, nickname: null, role: null, agentPath: null,
+                classified: false, readFailed: false, internal: false, parentId: null, spawnedBy: null, nickname: null, role: null, agentPath: null,
                 running: false, gone: false, listing: 'new', spawned: false, seq: 0,
             };
             this.children.set(threadId, child);
@@ -302,8 +305,9 @@ export class CodexSubagentTracker {
         if (!thread && attempt === 1) {
             const retry = this.after(READ_RETRY_DELAY_MS, () => this.background('Classification', this.classify(threadId, child, 2)));
             if (retry) {
-                // The retry lands after any label wait, so waiting on cannot improve the label; the spawn row
-                // must not outlast its parent turn waiting for it.
+                // The retry lands after any label wait, so waiting for it cannot improve the label; the spawn row
+                // must not outlast its parent turn waiting for it. Waits that start later answer at once as well.
+                child.readFailed = true;
                 for (const waiter of this.waiters) if (waiter.child === child) this.settle(waiter);
                 return;
             }

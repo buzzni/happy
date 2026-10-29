@@ -6437,6 +6437,26 @@ describe('sub-agent thread separation', () => {
         await settled(s.client.disconnect(), 'disconnect');
     });
 
+    // The same failure can come back before the parent's spawn item: the waits that item starts must not hold the row
+    // and the first listing either (review 2026-10-29).
+    it('[10] reports the row and the listing of a child whose first thread/read failed before its spawn item', async () => {
+        const s = await openSession({ readThread: () => ({ error: { code: -32600, message: 'failed to read session metadata' } }) });
+        const { done: turn } = await startMainTurn(s);
+        s.notify('thread/status/changed', { threadId: CHILD, status: { type: 'idle' } });
+        await until(() => s.requests.some((request) => request.method === 'thread/read' && request.params?.threadId === CHILD), 'thread/read');
+        await vi.advanceTimersByTimeAsync(5);
+        s.item('item/started', MAIN, MAIN_TURN, v2Activity('started'));
+        s.item('item/completed', MAIN, MAIN_TURN, v2Activity('started'));
+        s.notify('thread/status/changed', { threadId: CHILD, status: { type: 'active', activeFlags: [] } });
+        s.notify('turn/started', { threadId: CHILD, turn: { id: CHILD_TURN, status: 'inProgress' } });
+        await vi.advanceTimersByTimeAsync(5);
+        expect(listed(s.events).at(-1)).toEqual([task(CHILD, 'ok_reply')]);
+        endMainTurn(s);
+        await expect(settled(turn, 'main turn')).resolves.toEqual({ aborted: false });
+        expect(spawnRows(s.events)).toEqual([{ type: 'collab_agent_spawned', call_id: 'call-started-thread-child', turn_id: MAIN_TURN, thread_id: CHILD, label: 'ok_reply' }]);
+        await settled(s.client.disconnect(), 'disconnect');
+    });
+
     it.each(['process exit', 'clearThreadState', 'disconnect'])('[11] %s publishes an empty list and keeps the old child out of the main flow', async (ending) => {
         const s = await openSession();
         const { done: turn } = await startMainTurn(s);

@@ -134,7 +134,7 @@ fixture에 실제 홈 경로(`/Users/REDACTED`로 치환)·이메일·토큰·�
 
 1. 리뷰 → 결과 반영(주문 05·05b는 2026-10-28 채택·구현).
 2. 사용자 승인 뒤 커밋(구조 변경과 동작 변경을 나눔)·PR(`buzzni/happy`) → main 머지.
-3. `.363` 릴리스(context.md 체크리스트, 단계마다 직전 승인). `buzzni/aplus-dev-studio`의 `vendor/happy` 포인터 PR은
+3. 다음 빈 번호 릴리스(2026-10-29 기준 `.365` — `.363`·`.364`는 다른 변경으로 발행됨, context.md 체크리스트, 단계마다 직전 승인). `buzzni/aplus-dev-studio`의 `vendor/happy` 포인터 PR은
    메인 세션이 맡는다(주문 10의 릴리스 단계, 레지스트리 검증 뒤, 사용자 승인). wire를 바꾸지 않았으므로 태그 전에
    해야 하는 전제는 아니다.
 4. Desktop(`aplus-dev-studio-desktop`, 주문 07~09) → 실앱 검증과 Desktop 런타임 pin(주문 10, 레지스트리 검증 뒤).
