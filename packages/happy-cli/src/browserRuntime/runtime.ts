@@ -26,8 +26,10 @@ export interface BrowserRuntimeOptions {
     sites: SitePolicy[]
     /** Open spaces per profile (runtime.json; the PoC limit without configuration). */
     maxSpacesPerProfile?: number
-    /** Current resource admission; never evicts existing work. */
+    /** Profile-wide tab admission; excludes the space preference and fallback. */
     resourceQuota?: (profileId: ProfileId) => QuotaReading
+    /** Space-unit resource admission, before applying the user ceiling. */
+    spaceResourceQuota?: (profileId: ProfileId) => QuotaReading
     /** Close spaces whose tasks are all finished after this long without activity; off when absent. */
     spaceIdleReclaimMs?: number
     /**
@@ -196,7 +198,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const open = all.filter(s => !s.closed), reclaiming = open.filter(s => s.reclaimingSinceMs !== undefined).length
         const used = open.length
         const preference = this.quotaPreference(req.profileId, owner.principalId)
-        const resource = this.options.resourceQuota?.(req.profileId)
+        const resource = this.options.spaceResourceQuota?.(req.profileId)
         return { quota: { used, reclaimingReserve: Math.min(reclaiming, RECLAIMING_SPACE_RESERVE), hidden: open.filter(s => !visible.includes(s)).length,
             limit: Math.min(preference.ceiling ?? 16, resource?.limit ?? this.options.maxSpacesPerProfile ?? POC_LIMITS.maxSpacesPerProfile),
             mode: resource ? 'automatic' : 'fixed', reason: resource?.reason ?? 'fixed', preference },
@@ -284,7 +286,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             ...(auth.credential.kind === 'agent-grant' ? { membershipEvents: [{ type: 'created' as const, agentSessionId: auth.credential.agentSessionId, atMs: this.clock.now() }] } : {}),
                 ...(this.options.profileAssignments?.has(req.profileId) ? { assignmentId: this.options.profileAssignments.get(req.profileId) } : {}) },
             () => Math.min(this.quotaPreference(req.profileId, auth.credential.principalId).ceiling ?? 16,
-                this.options.resourceQuota?.(req.profileId).limit ?? this.options.maxSpacesPerProfile ?? POC_LIMITS.maxSpacesPerProfile))
+                this.options.spaceResourceQuota?.(req.profileId).limit ?? this.options.maxSpacesPerProfile ?? POC_LIMITS.maxSpacesPerProfile))
         return { taskSpaceId }
     }
     private async createTaskImpl(auth: AuthContext, req: {

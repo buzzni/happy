@@ -31,7 +31,7 @@ function valid(value: unknown): value is BrowserResources {
         && r.memoryLimitBytes > 0 && r.cpuLimit > 0 && r.pidsLimit > 0
         && (r.cpuUsageUsec === undefined || (Number.isFinite(r.cpuUsageUsec) && r.cpuUsageUsec >= 0))
 }
-/** Samples are timestamped by the runtime when received, not by the remote browser clock. */
+/** One tracker per admission unit (spaces, windows or tabs); runtime timestamps each sample. */
 export class ResourceQuota {
     private sample?: BrowserResources
     private sampledAt?: number
@@ -39,9 +39,9 @@ export class ResourceQuota {
     private lastSafeLimit?: number
     private growth: number
     private cpuBusy = false
-    private sampledWindows = 0
+    private sampledUnits = 0
     constructor(private readonly fallback: number) { this.growth = fallback }
-    observe(value: unknown, now: number, windows = 0): void {
+    observe(value: unknown, now: number, usedUnits = 0): void {
         if (!valid(value)) { this.sample = undefined; this.growthAt = undefined; this.growth = Math.min(this.fallback, this.lastSafeLimit ?? this.fallback); this.cpuBusy = false; return }
         const elapsed = this.sampledAt === undefined ? 0 : now - this.sampledAt
         this.cpuBusy = Boolean(this.sample?.cpuUsageUsec !== undefined && value.cpuUsageUsec !== undefined && elapsed > 0
@@ -55,11 +55,11 @@ export class ResourceQuota {
             this.growth = Math.min(RESOURCE_QUOTA_CEILING, this.growth + 2)
             this.growthAt = now
         }
-        this.sample = value; this.sampledAt = now; this.sampledWindows = windows
-        this.growth = Math.min(this.growth, this.read(now, windows, 0).limit)
+        this.sample = value; this.sampledAt = now; this.sampledUnits = usedUnits
+        this.growth = Math.min(this.growth, this.read(now, usedUnits, 0).limit)
     }
     /** otherReservations includes other profiles' allocated/empty spaces, conservatively reserved again. */
-    read(now: number, windows: number, otherReservations: number): QuotaReading {
+    read(now: number, usedUnits: number, otherReservations: number): QuotaReading {
         if (!this.sample || this.sampledAt === undefined || now < this.sampledAt || now - this.sampledAt > STALE_MS)
             return { limit: Math.min(this.fallback, this.lastSafeLimit ?? this.fallback), mode: 'automatic', reason: 'measurement-unavailable', ...(this.sampledAt !== undefined ? { sampledAtMs: this.sampledAt } : {}) }
         const r = this.sample
@@ -70,7 +70,7 @@ export class ResourceQuota {
         ))
         const bound = Math.max(0, Math.min(RESOURCE_QUOTA_CEILING,
             Math.floor((r.memoryLimitBytes - BROWSER_RESERVE) / WINDOW_BYTES), Math.floor(r.cpuLimit * 4),
-            Math.min(windows, this.sampledWindows) + (this.cpuBusy ? 0 : headroom)))
+            Math.min(usedUnits, this.sampledUnits) + (this.cpuBusy ? 0 : headroom)))
         const limit = Math.min(this.growth, bound)
         this.lastSafeLimit = limit
         return { limit, mode: 'automatic', sampledAtMs: this.sampledAt,

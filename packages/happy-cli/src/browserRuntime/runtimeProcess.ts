@@ -1,4 +1,4 @@
-import { ResourceQuota, quotaPreferenceKey, resourceAdmissionLimit } from './resourceQuota'
+import { ResourceQuota, resourceAdmissionLimit } from './resourceQuota'
 /**
  * Browser Runtime process (Agent Browser); `runtimeMain.ts` is the entry that runs it.
  *
@@ -54,9 +54,37 @@ import { parseSitePolicies, type SitePolicy } from './policy'
 import { BrowserRuntime } from './runtime'
 import { loadRuntimeConfig, type RuntimeConfig } from './runtimeConfig'
 import { startRuntimeServer } from './server'
-import { TaskStore } from './taskStore'
+import { TaskStore, RECLAIMING_SPACE_RESERVE } from './taskStore'
 import { ViewerProxy, type ViewerEndpoint } from './viewerProxy'
 import { holdsWriterFlock } from './writerFlock'
+
+/** Keep admission units and their last-safe fallbacks independent of space preferences. */
+export function createProfileResourceQuota(options: {
+    profileId: ProfileId; store: TaskStore; maxSpaces: number; maxWindows: number
+    counts: () => { windows: number; tabs: number }; now?: () => number
+}) {
+    const now = options.now ?? Date.now
+    const spaces = new ResourceQuota(options.maxSpaces)
+    const windows = new ResourceQuota(options.maxWindows)
+    const tabs = new ResourceQuota(POC_LIMITS.maxActiveTabs)
+    const openSpaces = () => {
+        const open = options.store.listSpaces(options.profileId).filter(s => !s.closed)
+        // Match TaskStore's admission count, including the bounded reclaim reserve.
+        return open.length - Math.min(RECLAIMING_SPACE_RESERVE, open.filter(s => s.reclaimingSinceMs !== undefined).length)
+    }
+    const reservations = () => options.store.listSpaces().filter(s => !s.closed && s.profileId !== options.profileId).length
+    return {
+        observe(value: unknown) {
+            const at = now(), counts = options.counts()
+            spaces.observe(value, at, openSpaces())
+            windows.observe(value, at, counts.windows)
+            tabs.observe(value, at, counts.tabs)
+        },
+        read: () => tabs.read(now(), options.counts().tabs, reservations()),
+        readSpaces: () => spaces.read(now(), openSpaces(), reservations()),
+        windowLimit: () => resourceAdmissionLimit(windows.read(now(), options.counts().windows, reservations()), options.maxWindows),
+    }
+}
 
 interface ProfileConfig {
     profileId: ProfileId
@@ -339,21 +367,17 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     await attention.reconcile()
 
     const drivers = new Map<ProfileId, CdpDriver>()
-    const quotas = new Map(profiles.map(p => [p.profileId, new ResourceQuota(Math.min(config?.maxSpacesPerProfile ?? windows, windows))]))
-    const resourceQuota = (profileId: ProfileId) => {
-        const reading = quotas.get(profileId)!.read(Date.now(), drivers.get(profileId)?.debugCounts().windows ?? 0,
-            store.listSpaces().filter(s => !s.closed && s.profileId !== profileId).length)
-        const owner = config?.profilePrincipals.get(profileId)
-        const preference = owner ? store.getSpaceQuota(quotaPreferenceKey(profileId, owner, config?.profileAssignments?.get(profileId))) : undefined
-        return {...reading, limit:Math.min(reading.limit, preference?.ceiling ?? 16)}
-    }
+    const quotas = new Map(profiles.map(p => [p.profileId, createProfileResourceQuota({
+        profileId: p.profileId, store, maxSpaces: Math.min(config?.maxSpacesPerProfile ?? windows, windows), maxWindows: windows,
+        counts: () => drivers.get(p.profileId)?.debugCounts() ?? { windows: 0, tabs: 0 },
+    })]))
     // Old browser images return 404. Missing readings keep the installed fixed limits.
     const sampleResources = async () => {
         await Promise.all(profiles.map(async profile => {
             try {
                 const response = await fetch(new URL('/resources', profile.instanceUrl), { signal: AbortSignal.timeout(2000) })
-                quotas.get(profile.profileId)!.observe(response.ok ? await response.json() : null, Date.now(), drivers.get(profile.profileId)?.debugCounts().windows ?? 0)
-            } catch { quotas.get(profile.profileId)!.observe(null, Date.now()) }
+                quotas.get(profile.profileId)!.observe(response.ok ? await response.json() : null)
+            } catch { quotas.get(profile.profileId)!.observe(null) }
         }))
     }
     let quotaTimer: ReturnType<typeof setInterval> | undefined
@@ -363,7 +387,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
         quotaTimer.unref()
     }
     for (const profile of profiles) {
-        drivers.set(profile.profileId, new CdpDriver({ browserWsUrl: '', browserInstanceIdProvider: instanceIdProvider(profile), maxAgentWindows: windows, ...(config?.adaptiveSpaceQuota ? { windowLimit: () => resourceAdmissionLimit(resourceQuota(profile.profileId), windows) } : {}) }))
+        drivers.set(profile.profileId, new CdpDriver({ browserWsUrl: '', browserInstanceIdProvider: instanceIdProvider(profile), maxAgentWindows: windows, ...(config?.adaptiveSpaceQuota ? { windowLimit: quotas.get(profile.profileId)!.windowLimit } : {}) }))
     }
     // Connect before recovery so it can compare browser instance ids.
     const { pending: connecting } = await connectAtStart(profiles.map((profile) => ({ profileId: profile.profileId, connect: () => connectWithRetry(drivers.get(profile.profileId)!, profile, log) })),
@@ -376,7 +400,8 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
         ...(config ? { profilePrincipals: config.profilePrincipals } : {}),
         ...(config?.profileAssignments ? { profileAssignments: config.profileAssignments } : {}),
         maxSpacesPerProfile: config?.maxSpacesPerProfile,
-        ...(config?.adaptiveSpaceQuota ? { resourceQuota } : {}),
+        ...(config?.adaptiveSpaceQuota ? { resourceQuota: (id: ProfileId) => quotas.get(id)!.read(),
+            spaceResourceQuota: (id: ProfileId) => quotas.get(id)!.readSpaces() } : {}),
         spaceIdleReclaimMs: config?.spaceIdleReclaimMs ?? (Number.isFinite(harnessIdleMs) ? harnessIdleMs : undefined) })
 
     for (const profile of profiles) {

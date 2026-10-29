@@ -26,7 +26,7 @@ async function tempDir(): Promise<string> { const dir = await mkdtemp(join(tmpdi
 let requests = 0
 const rid = (label: string) => `${label}-${++requests}` as RequestId
 
-async function start(dir: string, driver = new FakeBrowserDriver(), options: Pick<BrowserRuntimeOptions, 'maxSpacesPerProfile' | 'spaceIdleReclaimMs' | 'resourceQuota'> = {}) {
+async function start(dir: string, driver = new FakeBrowserDriver(), options: Pick<BrowserRuntimeOptions, 'maxSpacesPerProfile' | 'spaceIdleReclaimMs' | 'spaceResourceQuota'> = {}) {
     const store = await TaskStore.open(dir)
     const clock = new FakeClock(1_000)
     const runtime = new BrowserRuntime({ store, drivers: new Map([[profileId, driver]]), clock, sites: SITES, ...options })
@@ -48,7 +48,7 @@ async function start(dir: string, driver = new FakeBrowserDriver(), options: Pic
 describe('space quota', () => {
     it('enforces changing resource admission in the metadata queue and preserves existing spaces', async () => {
         let limit = 3
-        const h = await start(await tempDir(), undefined, { resourceQuota: () => ({limit, mode:'automatic', reason:'resources-available'}) })
+        const h = await start(await tempDir(), undefined, { spaceResourceQuota: () => ({limit, mode:'automatic', reason:'resources-available'}) })
         const outcomes = await Promise.allSettled(Array.from({length:5}, () => h.runtime.createSpace(h.agent(), {profileId, requestId:rid('auto')})))
         expect(outcomes.filter(r => r.status === 'fulfilled')).toHaveLength(3)
         limit = 1

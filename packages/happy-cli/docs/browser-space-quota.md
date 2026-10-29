@@ -10,6 +10,8 @@ No Docker socket, host mount or new privilege is required. Old images and unsupp
 fail closed to installed fixed limits. Sampling runs every 10 seconds with a 2-second timeout;
 readings older than 30 seconds cannot justify growth. After a valid sample, measurement loss retains the lower of the last safe limit and the installed limit; it never lifts a pressure restriction. Timer jitter does not reset accumulated stable observation time.
 
+Space, window and tab admission use independent trackers and installed fallbacks. Only space creation and the space list apply the user space ceiling. Space samples count admission-eligible spaces (including the bounded reclaim reserve), never windows: pressure cannot turn multiple windows in one space into additional spaces. Measurement loss retains each tracker’s own last-safe limit.
+
 The admission ceiling is 16. Each additional window reserves 256 MiB, with 256 MiB retained in the
 browser and 2 GiB on the host. Memory, CPU allocation (four windows per core), measured CPU usage
 (90% saturation stops growth), and PID headroom (16 reserve, eight per window) all bound admission.
