@@ -185,3 +185,10 @@ pending permission `requestId`, activity `sourceMessageId`, snapshot `runtimeId`
 - 같은 부류가 반복되어 지휘 세션이 read projection을 Desktop 생산자 타입과 직접 대조했다. read 이벤트는
   `SessionMessageSchema`의 `id`·`seq`·`localId`·`createdAt`·`updatedAt`을 그대로 쓴다. pending permission의 `kind` 열거,
   `policy`(`PermissionPolicyMeta`), activity의 나머지 필드(`sourceSeq`는 메시지 seq 정수)는 생산자 타입과 일치한다.
+
+## H1-R-11 교차 리뷰 반영 (2026-10-30)
+
+resume·permission·abort의 `control.state: 'accepted'`는 실행한 runtime(resume이면 새 runtime)을 `runtimeId`로 반드시 담는다.
+runtime을 확인하지 못한 결과는 `unknown`으로 표현하며 `accepted`+`runtimeId: null`은 schema에서 거부한다.
+permission·abort의 accepted는 기존 결속 검사로 요청 runtime과 일치해야 한다. 이번 리뷰의 식별자·문자열·성공 조건 전수
+대조표에서 남은 불일치는 이 항목뿐이었다.

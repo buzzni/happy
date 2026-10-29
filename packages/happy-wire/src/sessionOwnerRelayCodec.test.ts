@@ -262,6 +262,15 @@ describe('H1-R-01 persisted message localId compatibility', () => {
         const signed = signOwnerRelayReply({ ...reply, sessionView: { ...reply.sessionView, events: [event] } }, desktop.secretKey);
         expect(await verifyOwnerRelayReply(decodeOwnerRelayReply(encodeOwnerRelayReply(signed)), request, fixture.personalContact, now)).toBe(true);
     });
+    // H1-R-11: an accepted control names the runtime it ran on; an unconfirmed one is unknown, not accepted.
+    it.each(['resume-own-session', 'reply-own-permission', 'abort-own-turn'])('%s accepted needs a confirmed runtime', operation => {
+        const vector = vectorFor(operation);
+        const withControl = (patch: Record<string, unknown>) => ({ ...vector.reply, control: { ...vector.reply.control, ...patch } });
+        expect(OwnerRelayReplySchema.safeParse(withControl({ state: 'accepted', runtimeId: null })).success).toBe(false);
+        expect(OwnerRelayReplySchema.safeParse(withControl({ state: 'accepted', runtimeId: vector.reply.control?.runtimeId ?? 'target-runtime' })).success).toBe(true);
+        expect(OwnerRelayReplySchema.safeParse(withControl({ state: 'unknown', runtimeId: null })).success).toBe(true);
+        expect(OwnerRelayReplySchema.safeParse(withControl({ state: 'rejected', runtimeId: null })).success).toBe(true);
+    });
     it.each(['기존 메시지', 'existing message', 'x'.repeat(129)])('keeps prompt and storage ID restrictions for %s', localId => {
         expect(OwnerRelayRequestSchema.safeParse({ ...fixture.vectors[2].request, localId }).success).toBe(false);
         const reply = fixture.vectors[2].reply;

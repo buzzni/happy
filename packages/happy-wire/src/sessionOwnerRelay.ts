@@ -51,6 +51,8 @@ const child = z.object({ ...OwnerRelayChildReferenceSchema.shape, state: z.enum(
 }).strict().refine(v => v.state !== 'started' || (v.sessionId !== null && v.ownershipBindingId !== null
     && v.providerRuntimeId !== null && v.stage === 'provider-started'));
 const control = { sessionId: id, runtimeId: persistedId.nullable(), state: z.enum(['accepted', 'rejected', 'unknown']), reason: z.string().optional() };
+// accepted names the runtime it ran on (a resume's new one); an unconfirmed outcome is unknown, never accepted with no runtime (H1-R-11).
+const confirmed = (value: { state: string; runtimeId: string | null }) => value.state !== 'accepted' || value.runtimeId !== null;
 const results = [
     { operation: z.literal('lookup-readable-sessions'), owners: z.array(z.object({ sessionId: id,
         proof: OwnershipSourceAuthoritySchema.nullable(), ownerSubject: OwnershipSubjectSchema.nullable(),
@@ -60,9 +62,9 @@ const results = [
     // The stored row's own ID (H1-R-06); only a body-verified receipt is a success, a mismatch is unknown (H1-R-07).
     { operation: z.literal('prompt-own-session'), storage: z.object({ messageId: persistedId, seq: relayCount.min(1), // a stored row has a positive seq (H1-R-08)
         localId: relayLocalId, bodyVerified: z.literal(true) }).strict() },
-    { operation: z.literal('resume-own-session'), control: z.object(control).strict() },
-    { operation: z.literal('reply-own-permission'), control: z.object({ ...control, permissionId: persistedId }).strict() },
-    { operation: z.literal('abort-own-turn'), control: z.object(control).strict() },
+    { operation: z.literal('resume-own-session'), control: z.object(control).strict().refine(confirmed) },
+    { operation: z.literal('reply-own-permission'), control: z.object({ ...control, permissionId: persistedId }).strict().refine(confirmed) },
+    { operation: z.literal('abort-own-turn'), control: z.object(control).strict().refine(confirmed) },
     { operation: z.literal('spawn-owned-child'), childSpawn: child },
     { operation: z.literal('owned-child-status'), childSpawn: child },
 ] as const;
