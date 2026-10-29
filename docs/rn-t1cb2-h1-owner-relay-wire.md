@@ -151,3 +151,13 @@ pending permission `requestId`, activity `sourceMessageId`, snapshot `runtimeId`
 가리키는 `reply-own-permission`의 `permissionId`(요청 payload·응답 control)는 `persistedId`(비어 있지 않은 문자열)로
 생산자의 기존 계약을 따른다. `ownershipId`는 이 프로토콜이 발급하는 ID에만 쓴다. 공백·129자 식별자가 read 응답의
 서명 → encode → decode → 검증과 permission 응답 요청 검증을 통과하는 회귀 4건을 추가했다(수정 전 4건 실패).
+
+## H1-R-03·04·05 교차 리뷰 반영 (2026-10-30)
+
+- H1-R-03: read에서 관측해 그대로 넘기는 값도 `persistedId`를 쓴다. 대상은 resume의 `expectedMachineId`·`runtimeId`,
+  abort·permission 응답의 `runtimeId`, 응답 `control.runtimeId`다.
+- H1-R-04: spawn 옵션의 `initialPromptLocalId`는 daemon `ownedSpawnRuntime.ts`의 기존 문자열 옵션이다. 그래서 relay가
+  발급하는 prompt `localId` 제한(`relayLocalId`)을 적용하지 않는다.
+- H1-R-05: `aiAuthSelection`(`claude-setup-token`)의 `managedAccountId`·`groupScope`는 daemon `sessionEnv.ts`와 같은
+  형식(소문자 UUID, `[A-Za-z0-9_-]{1,128}`)만 받는다. daemon이 거부할 선택을 wire가 받지 않게 하기 위해서다.
+- 회귀: 위 경우 7건을 추가했다(수정 전 7건 실패).

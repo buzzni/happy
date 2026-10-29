@@ -171,6 +171,32 @@ describe('H1-R-01 persisted message localId compatibility', () => {
         const vector = fixture.vectors.find((v: { request: { operation: string } }) => v.request.operation === 'reply-own-permission')!;
         expect(OwnerRelayRequestSchema.safeParse({ ...vector.request, payload: { ...vector.request.payload, permissionId: persisted } }).success).toBe(true);
     });
+    // H1-R-03/04: IDs a caller copies from a read (machine, runtime) or from existing spawn options keep their producers' contract.
+    const vectorFor = (operation: string) => fixture.vectors.find((v: { request: { operation: string } }) => v.request.operation === operation)!;
+    it.each(['legacy id with spaces', 'x'.repeat(129)])('control requests address persisted machine and runtime IDs (%s)', persisted => {
+        const resume = vectorFor('resume-own-session'), abort = vectorFor('abort-own-turn'), permission = vectorFor('reply-own-permission');
+        expect(OwnerRelayRequestSchema.safeParse({ ...resume.request, payload: { ...resume.request.payload, expectedMachineId: persisted, runtimeId: persisted } }).success).toBe(true);
+        expect(OwnerRelayRequestSchema.safeParse({ ...abort.request, payload: { ...abort.request.payload, runtimeId: persisted } }).success).toBe(true);
+        expect(OwnerRelayRequestSchema.safeParse({ ...permission.request, payload: { ...permission.request.payload, runtimeId: persisted } }).success).toBe(true);
+        for (const vector of [resume, abort, permission]) expect(OwnerRelayReplySchema.safeParse({ ...vector.reply, control: { ...vector.reply.control, runtimeId: persisted } }).success).toBe(true);
+    });
+    it.each(['기존 메시지', 'x'.repeat(129)])('spawn options carry an existing initialPromptLocalId (%s)', initialPromptLocalId => {
+        const spawn = vectorFor('spawn-owned-child');
+        const spawnOptions = { ...spawn.request.payload.spawnOptions, initialPromptLocalId };
+        expect(OwnerRelayRequestSchema.safeParse({ ...spawn.request, payload: { ...spawn.request.payload, spawnOptions } }).success).toBe(true);
+    });
+    // H1-R-05: the wire refuses what the daemon would refuse (sessionEnv.ts MANAGED_ACCOUNT_ID / GROUP_SCOPE).
+    it.each([
+        ['a valid selection', '0f8fad5b-d9cb-469f-a165-70867728950e', 'company_1', true],
+        ['a non-UUID managed account', 'not-uuid', 'company_1', false],
+        ['an upper-case UUID', '0F8FAD5B-D9CB-469F-A165-70867728950E', 'company_1', false],
+        ['a Unicode group scope', '0f8fad5b-d9cb-469f-a165-70867728950e', '조직', false],
+    ] as const)('aiAuthSelection claude-setup-token accepts only daemon-valid IDs: %s', (_label, managedAccountId, groupScope, ok) => {
+        const spawn = vectorFor('spawn-owned-child');
+        const aiAuthSelection = { kind: 'claude-setup-token', managedAccountId, groupScope, credentialGeneration: 1, bindingGrant: 'abc.def' };
+        const spawnOptions = { ...spawn.request.payload.spawnOptions, aiAuthSelection };
+        expect(OwnerRelayRequestSchema.safeParse({ ...spawn.request, payload: { ...spawn.request.payload, spawnOptions } }).success).toBe(ok);
+    });
     it.each(['기존 메시지', 'existing message', 'x'.repeat(129)])('keeps prompt and storage ID restrictions for %s', localId => {
         expect(OwnerRelayRequestSchema.safeParse({ ...fixture.vectors[2].request, localId }).success).toBe(false);
         const reply = fixture.vectors[2].reply;

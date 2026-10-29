@@ -13,9 +13,9 @@ const operations = [
         payload: z.object({ cursor: z.string().nullable(), limit: relayCount.min(1).max(50), waitMs: relayCount.max(15000) }).strict() },
     { operation: z.literal('prompt-own-session'), targetSessionId: id, localId: relayLocalId, payload: OwnerRelayPromptPayloadSchema },
     { operation: z.literal('resume-own-session'), targetSessionId: id,
-        payload: z.object({ sessionId: id, expectedMachineId: id, runtimeId: id.nullable() }).strict() },
+        payload: z.object({ sessionId: id, expectedMachineId: persistedId, runtimeId: persistedId.nullable() }).strict() }, // copied from a read (H1-R-03)
     { operation: z.literal('reply-own-permission'), targetSessionId: id, payload: OwnerRelayPermissionPayloadSchema },
-    { operation: z.literal('abort-own-turn'), targetSessionId: id, payload: z.object({ sessionId: id, runtimeId: id }).strict() },
+    { operation: z.literal('abort-own-turn'), targetSessionId: id, payload: z.object({ sessionId: id, runtimeId: persistedId }).strict() },
     { operation: z.literal('spawn-owned-child'), payload: OwnerRelayChildReferenceSchema.extend({ childAgentId: id, spawnOptions: OwnerRelaySpawnOptionsSchema }).strict() },
     { operation: z.literal('owned-child-status'), payload: OwnerRelayChildReferenceSchema },
 ] as const;
@@ -50,7 +50,7 @@ const child = z.object({ ...OwnerRelayChildReferenceSchema.shape, state: z.enum(
     parentSessionId: id, providerRuntimeId: id.nullable(), reason: z.string().optional(),
 }).strict().refine(v => v.state !== 'started' || (v.sessionId !== null && v.ownershipBindingId !== null
     && v.providerRuntimeId !== null && v.stage === 'provider-started'));
-const control = { sessionId: id, runtimeId: id.nullable(), state: z.enum(['accepted', 'rejected', 'unknown']), reason: z.string().optional() };
+const control = { sessionId: id, runtimeId: persistedId.nullable(), state: z.enum(['accepted', 'rejected', 'unknown']), reason: z.string().optional() };
 const results = [
     { operation: z.literal('lookup-readable-sessions'), owners: z.array(z.object({ sessionId: id,
         proof: OwnershipSourceAuthoritySchema.nullable(), ownerSubject: OwnershipSubjectSchema.nullable(),

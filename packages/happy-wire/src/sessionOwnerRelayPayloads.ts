@@ -29,7 +29,7 @@ export const OwnerRelayPromptPayloadSchema = z.object({ text,
     }).strict(),
     delegatedAttendance: z.enum(['attended', 'unattended']).optional(), hubPrompt: hubPromptGuardSchema,
 }).strict();
-export const OwnerRelayPermissionPayloadSchema = z.object({ sessionId: id, runtimeId: id,
+export const OwnerRelayPermissionPayloadSchema = z.object({ sessionId: id, runtimeId: persistedId,
     permissionId: persistedId, approved: z.boolean(), updatedInput: toolData.optional(),
     mode: z.enum(['default', 'acceptEdits', 'bypassPermissions']).optional(),
 }).strict();
@@ -62,7 +62,7 @@ export const OwnerRelayReadEventSchema = z.object({ id: SessionMessageSchema.sha
 // Mirrors daemon/ownedSpawnRuntime.ts's supported options; no arbitrary argv, executable or RPC.
 // Environment is still subject to daemon/sessionEnv.ts admission at execution, never authority.
 export const OwnerRelaySpawnOptionsSchema = z.object({ directory: text.min(1), agent: z.enum(['claude', 'codex']),
-    model: text.optional(), effort: text.optional(), initialPrompt: text.optional(), initialPromptLocalId: relayLocalId.optional(),
+    model: text.optional(), effort: text.optional(), initialPrompt: text.optional(), initialPromptLocalId: text.optional(), // the daemon's existing spawn option, not a relay-minted ID (H1-R-04)
     permissionMode: MessageMetaSchema.shape.permissionMode, additionalDirectories: z.array(text).optional(),
     environmentVariables: z.custom<Record<string, string>>(v => v !== null && typeof v === 'object' && !Array.isArray(v)
         && Object.values(v).every(entry => typeof entry === 'string')).optional(), mcpConfigProjectId: text.optional(),
@@ -70,7 +70,9 @@ export const OwnerRelaySpawnOptionsSchema = z.object({ directory: text.min(1), a
     approvedNewDirectoryCreation: z.boolean().optional(),
     aiAuthSelection: z.discriminatedUnion('kind', [
         z.object({ kind: z.literal('machine-personal') }).strict(), z.object({ kind: z.literal('org-bundle') }).strict(),
-        z.object({ kind: z.literal('claude-setup-token'), managedAccountId: id, groupScope: id,
+        // Same formats as daemon/sessionEnv.ts MANAGED_ACCOUNT_ID / GROUP_SCOPE: the wire never accepts what the daemon refuses (H1-R-05).
+        z.object({ kind: z.literal('claude-setup-token'), managedAccountId: z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/),
+            groupScope: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
             credentialGeneration: relayCount.min(1), bindingGrant: text.max(4096).regex(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/),
             credentialProofVersion: z.literal(1).optional() }).strict(),
     ]).optional(),
