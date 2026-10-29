@@ -1,3 +1,4 @@
+import { browserQuotaFailure } from '../../utils/browserQuotaFailure';
 import { randomUUID } from 'node:crypto';
 import { createId } from '@paralleldrive/cuid2';
 import type { ReasoningOutput } from './reasoningProcessor';
@@ -280,6 +281,7 @@ function emitHistoricalToolCall(
     envelopes.push(createEnvelope('agent', {
         t: 'tool-call-end',
         call: item.id,
+        browserQuotaKind: browserQuotaFailure(output),
     }, {
         ...opts,
         id: `${item.id}:end`,
@@ -365,7 +367,7 @@ export function mapCodexThreadItemToSessionEnvelopes(
             const title = `${item.server}.${item.tool}`;
             const output = item.error !== undefined && item.error !== null
                 ? String(item.error)
-                : (item.result !== undefined && item.result !== null ? String(item.result) : null);
+                : (item.result !== undefined && item.result !== null ? (typeof item.result === 'string' ? item.result : JSON.stringify(item.result)) : null);
             emitHistoricalToolCall(
                 envelopes,
                 turn,
@@ -692,6 +694,25 @@ export function mapCodexMcpMessageToSessionEnvelopes(message: Record<string, unk
         };
     }
 
+    const invocation = message.invocation as { tool?: unknown; arguments?: unknown; server?: unknown } | undefined;
+    if ((type === 'mcp_tool_call_begin' || type === 'mcp_tool_call_end')
+        && typeof invocation?.tool === 'string' && invocation.tool.startsWith('browser_task_')) {
+        const call = pickCallId(message), envelopes: SessionEnvelope[] = [];
+        if (type === 'mcp_tool_call_begin') envelopes.push(createEnvelope('agent', {
+            t: 'tool-call-start', call, name: invocation.tool, title: invocation.tool, description: invocation.tool,
+            args: invocation.arguments && typeof invocation.arguments === 'object' && !Array.isArray(invocation.arguments)
+                ? invocation.arguments as Record<string, unknown> : {},
+        }, opts));
+        else {
+            const result = message.result as { Ok?: unknown } | undefined;
+            envelopes.push(createEnvelope('agent', { t: 'tool-call-end', call,
+                browserQuotaKind: browserQuotaFailure(result?.Ok ?? result),
+            }, opts));
+        }
+        return { currentTurnId: state.currentTurnId, currentProviderTurnId: state.currentProviderTurnId ?? null,
+            startedSubagents, activeSubagents, providerSubagentToSessionSubagent, envelopes };
+    }
+
     // exec_approval_request is intentionally NOT mapped here — the permission
     // handler already renders the approval UI via agent state.  Mapping it to
     // tool-call-start too would create a duplicate tool call card.
@@ -841,6 +862,7 @@ export function mapCodexProcessorMessageToSessionEnvelopes(
         envelopes.push(createEnvelope('agent', {
             t: 'tool-call-end',
             call: toolLikeMessage.callId,
+            browserQuotaKind: browserQuotaFailure(content),
         }, opts));
         return envelopes;
     }

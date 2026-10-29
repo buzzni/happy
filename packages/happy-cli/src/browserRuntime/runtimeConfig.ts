@@ -63,6 +63,7 @@ const schema = z.object({
     viewerOrigins: z.array(origin).default([]),
     /** Studio web origins that open the console through the preview relay and hand it its capability (window.opener). */
     consoleHostOrigins: z.array(origin).default([]),
+    adaptiveSpaceQuota: z.boolean().default(true),
     maxAgentWindows: z.number().int().min(1).max(16).default(4),
     /** Open task spaces per profile; default min(4, maxAgentWindows), never above maxAgentWindows. */
     maxSpacesPerProfile: z.number().int().min(1).max(16).optional(),

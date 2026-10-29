@@ -8,6 +8,7 @@ import {
     SCHEMA_VERSION,
     TERMINAL_STATUSES,
     type ActionId,
+    type SpaceQuotaPreference,
     type ActionState,
     type AgentGrant,
     type ApprovalId,
@@ -168,6 +169,7 @@ export class TaskStore {
     private lockHandle?: Awaited<ReturnType<typeof open>>
     private readonly tasks = new Map<TaskId, StoredTask>()
     private readonly spaces = new Map<TaskSpaceId, SpaceRecord>()
+    private spaceQuotas: Record<string, SpaceQuotaPreference> = {}
     private readonly revocations = new Set<string>()
     /** Profile assignments whose start-up cleanup completed (assignments.json); undefined before the first. */
     private appliedAssignments?: Record<string, string>
@@ -219,13 +221,30 @@ export class TaskStore {
             heartbeatAtMs: this.now(),
         }, 'metadata')
     }
-    async createSpace(record: SpaceRecord, maxSpacesPerProfile: number = POC_LIMITS.maxSpacesPerProfile): Promise<void> {
+    getSpaceQuota(key: string): SpaceQuotaPreference {
+        return { ...(this.spaceQuotas[key] ?? { ceiling:null, revision:0 }) }
+    }
+    async setSpaceQuota(key: string, ceiling: number | null, expectedRevision: number, validate: () => void): Promise<SpaceQuotaPreference> {
+        return this.withMetadataQueue(async () => {
+            await this.assertWriter(); validate()
+            const previous = this.spaceQuotas[key]
+            if ((previous?.revision ?? 0) !== expectedRevision) throw new BrowserRuntimeError('CONFLICT', 'Quota preference changed; refresh first')
+            const next = { ceiling, revision: expectedRevision + 1 }
+            this.spaceQuotas[key] = next
+            try { await this.writeMetadata() } catch (error) {
+                if (previous) this.spaceQuotas[key] = previous; else delete this.spaceQuotas[key]
+                throw error
+            }
+            return { ...next }
+        })
+    }
+    async createSpace(record: SpaceRecord, maxSpacesPerProfile: number | (() => number) = POC_LIMITS.maxSpacesPerProfile): Promise<void> {
         await this.withMetadataQueue(async () => {
             await this.assertWriter()
             const open = [...this.spaces.values()].filter((space) => space.profileId === record.profileId && !space.closed)
             const reclaiming = open.filter((space) => space.reclaimingSinceMs !== undefined).length
-            if (open.length - reclaiming + Math.max(0, reclaiming - RECLAIMING_SPACE_RESERVE) >= maxSpacesPerProfile)
-                throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Profile has reached its space limit')
+            if (open.length - reclaiming + Math.max(0, reclaiming - RECLAIMING_SPACE_RESERVE) >= (typeof maxSpacesPerProfile === 'function' ? maxSpacesPerProfile() : maxSpacesPerProfile))
+                throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Profile has reached its space limit', true, false, 'spaces')
             this.spaces.set(record.taskSpaceId, structuredClone(record))
             try {
                 await this.writeMetadata()
@@ -472,9 +491,9 @@ export class TaskStore {
         const eventCount = body.seq
         if (business && (bytes > POC_LIMITS.journalMaxBytesPerTask
             || eventCount > POC_LIMITS.journalMaxEventsPerTask - POC_LIMITS.journalControlReserveEvents))
-            throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Task journal business quota reached')
+            throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Task journal business quota reached', false, false, 'journal')
         if (!business && eventCount > POC_LIMITS.journalMaxEventsPerTask)
-            throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Task journal control reserve is exhausted')
+            throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Task journal control reserve is exhausted', false, false, 'journal')
         let previousEventSize: number | undefined
         let eventAppended = false
         try {
@@ -615,9 +634,17 @@ export class TaskStore {
             const metadata = JSON.parse(await readFile(join(this.stateDir, 'spaces.json'), 'utf8')) as {
                 schemaVersion: number
                 spaces: SpaceRecord[]
+                spaceQuotas?: Record<string, SpaceQuotaPreference>
             }
             if (metadata.schemaVersion !== SCHEMA_VERSION)
                 throw journalError('Unknown metadata schema')
+            if (metadata.spaceQuotas !== undefined) {
+                if (!metadata.spaceQuotas || typeof metadata.spaceQuotas !== 'object' || Array.isArray(metadata.spaceQuotas)
+                    || Object.values(metadata.spaceQuotas).some(q => !q || !Number.isSafeInteger(q.revision) || q.revision < 0
+                        || (q.ceiling !== null && (!Number.isInteger(q.ceiling) || q.ceiling < 1 || q.ceiling > 16))))
+                    throw journalError('Invalid quota preferences')
+                this.spaceQuotas = metadata.spaceQuotas
+            }
             for (const space of metadata.spaces)
                 this.spaces.set(space.taskSpaceId, space)
         }
@@ -661,7 +688,7 @@ export class TaskStore {
         await this.assertWriter()
         try {
             await this.atomicWrite(join(this.stateDir, 'spaces.json'), { schemaVersion: SCHEMA_VERSION,
-                spaces: [...this.spaces.values()] }, 'metadata')
+                spaces: [...this.spaces.values()], spaceQuotas: this.spaceQuotas }, 'metadata')
         }
         catch {
             throw journalError()

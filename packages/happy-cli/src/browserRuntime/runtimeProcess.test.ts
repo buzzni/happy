@@ -12,7 +12,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { PrivilegeOps } from './privilegeDrop'
 import type { ProfileId } from './contracts'
-import { browserReadiness, connectAtStart, runRuntime } from './runtimeProcess'
+import { createProfileResourceQuota, browserReadiness, connectAtStart, runRuntime } from './runtimeProcess'
 
 const ENV_KEYS = ['ABP_STATE_DIR', 'ABP_CONFIG_FILE', 'ABP_KEYS_FILE', 'ABP_PROFILES', 'ABP_RUNTIME_UID', 'ABP_RUNTIME_GID', 'ABP_WRITER_FLOCK'] as const
 const savedEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]))
@@ -106,5 +106,69 @@ describe('browser readiness', () => {
     })
     it("reports each browser on a shared machine, so one user's broken browser does not make the Runtime unready", () => {
         expect(browserReadiness('shared', ['a', 'b'] as ProfileId[], drivers)).toEqual({ browsers: true, profileBrowsers: { a: true, b: false } })
+    })
+})
+
+
+describe('profile resource admission', () => {
+    const profileId = 'quota-profile' as ProfileId
+    const resources = { version: 1, hostAvailableBytes: 16 * 1024 ** 3, memoryLimitBytes: 4 * 1024 ** 3,
+        memoryUsedBytes: 256 * 1024 ** 2, cpuLimit: 4, pidsLimit: 512, pidsUsed: 10, cpuUsageUsec: 0 }
+    async function fixture() {
+        const { TaskStore } = await import('./taskStore')
+        const { BrowserRuntime } = await import('./runtime')
+        const { FakeBrowserDriver } = await import('./testing/fakeDriver')
+        const { quotaPreferenceKey } = await import('./resourceQuota')
+        const dir = await mkdtemp(join(tmpdir(), 'abp-quota-'))
+        const store = await TaskStore.open(dir)
+        cleanups.push(async () => { await store.close(); await rm(dir, { recursive: true, force: true }) })
+        let now = Date.now()
+        const counts = { windows: 0, tabs: 0 }
+        const quota = createProfileResourceQuota({ profileId, store, maxSpaces: 2, maxWindows: 6,
+            counts: () => counts, now: () => now })
+        const runtime = new BrowserRuntime({ store, drivers: new Map([[profileId, new FakeBrowserDriver()]]),
+            sites: [{ origin: 'https://fixture.test', actions: [{ match: {}, risk: 'auto' }] }],
+            resourceQuota: quota.read, spaceResourceQuota: quota.readSpaces })
+        let request = 0
+        const rid = () => `quota-${++request}` as import('./contracts').RequestId
+        const auth = { verifiedAtMs: now, credential: { kind: 'agent-grant', grantId: 'g', principalId: 'p',
+            workspaceId: 'w', machineId: 'm', agentSessionId: 's', profileId, allowedOrigins: ['https://fixture.test'],
+            operations: ['createSpace', 'createTask', 'openPage', 'listSpaces'], taskSpaceIds: [], issuedAtMs: 0,
+            expiresAtMs: now + 600_000 } } as unknown as import('./contracts').AuthContext
+        const space = () => runtime.createSpace(auth, { profileId, requestId: rid() })
+        return { store, runtime, quota, counts, auth, rid, space, tick: () => { now += 10_000 },
+            ceiling: () => store.setSpaceQuota(quotaPreferenceKey(profileId, 'p'), 1, 0, () => {}) }
+    }
+    it('keeps ceiling=1 out of window and tab admission in one space', async () => {
+        const h = await fixture(); await h.ceiling(); h.quota.observe(resources)
+        const { taskSpaceId } = await h.space()
+        const task = await h.runtime.createTask(h.auth, { taskSpaceId, requestId: h.rid() })
+        for (let i = 0; i < 2; i++) await h.runtime.openPage(h.auth, { taskId: task.taskId, url: 'https://fixture.test/', requestId: h.rid() })
+        expect(h.quota.windowLimit()).toBe(6)
+        await expect(h.space()).rejects.toMatchObject({ code: 'QUOTA_EXCEEDED', quotaKind: 'spaces' })
+    })
+    it('retains the six-window fallback after telemetry loss, independently of the two-space fallback', async () => {
+        const h = await fixture(); h.quota.observe(resources); h.quota.observe(null)
+        expect(h.quota.windowLimit()).toBe(6)
+        expect(h.quota.read().limit).toBe(6)
+        expect(h.quota.readSpaces().limit).toBe(2)
+    })
+    it('counts one remaining allocation as one extra space even when the existing space has three windows', async () => {
+        const h = await fixture(); h.quota.observe(resources); await h.space()
+        h.counts.windows = 3; h.counts.tabs = 3; h.tick()
+        h.quota.observe({ ...resources, memoryUsedBytes: resources.memoryLimitBytes - 512 * 1024 ** 2 })
+        const outcomes = await Promise.allSettled([h.space(), h.space()])
+        expect(outcomes.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+        expect(h.store.listSpaces(profileId).filter(space => !space.closed)).toHaveLength(2)
+    })
+    it.each(['memory', 'cpu'])('does not turn multiple windows in one space into free spaces under %s pressure', async pressure => {
+        const h = await fixture(); h.quota.observe(resources); await h.space()
+        h.counts.windows = 3; h.counts.tabs = 3; h.tick()
+        h.quota.observe({ ...resources, ...(pressure === 'memory' ? { hostAvailableBytes: 0 } : { cpuUsageUsec: 40_000_000 }) })
+        const listed = await h.runtime.listSpaces(h.auth, { profileId })
+        expect(listed.quota?.limit).toBe(1)
+        await expect(h.space()).rejects.toMatchObject({ code: 'QUOTA_EXCEEDED', quotaKind: 'spaces' })
+        h.quota.observe(null)
+        await expect(h.space()).rejects.toMatchObject({ code: 'QUOTA_EXCEEDED', quotaKind: 'spaces' })
     })
 })

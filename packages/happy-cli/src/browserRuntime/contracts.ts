@@ -70,6 +70,7 @@ export interface RuntimeErrorBody {
     message: string
     retryable: boolean
     mayHaveSideEffects: boolean
+    quotaKind?: 'spaces' | 'tabs' | 'windows' | 'time' | 'journal'
 }
 
 export class BrowserRuntimeError extends Error {
@@ -78,13 +79,14 @@ export class BrowserRuntimeError extends Error {
         message: string,
         readonly retryable = false,
         readonly mayHaveSideEffects = false,
+        readonly quotaKind?: RuntimeErrorBody['quotaKind'],
     ) {
         super(message)
         this.name = 'BrowserRuntimeError'
     }
 
     toBody(): RuntimeErrorBody {
-        return { code: this.code, message: this.message, retryable: this.retryable, mayHaveSideEffects: this.mayHaveSideEffects }
+        return { code: this.code, message: this.message, retryable: this.retryable, mayHaveSideEffects: this.mayHaveSideEffects, ...(this.quotaKind ? {quotaKind:this.quotaKind} : {}) }
     }
 }
 
@@ -96,7 +98,7 @@ export class BrowserRuntimeError extends Error {
 export type Operation =
     | 'createSpace' | 'createTask' | 'openPage' | 'closePage' | 'observe' | 'screenshot'
     | 'submitBatch' | 'finishTask' | 'getTask' | 'subscribe' | 'approve' | 'takeOver'
-    | 'releaseControl' | 'resume' | 'cancel' | 'closeSpace' | 'viewerTicket' | 'listTasks' | 'listSpaces' | 'joinSpace'
+    | 'setSpaceQuota' | 'releaseControl' | 'resume' | 'cancel' | 'closeSpace' | 'viewerTicket' | 'listTasks' | 'listSpaces' | 'joinSpace'
 
 /** Operations an agent task grant may carry. approve/takeOver/releaseControl never. */
 export const AGENT_OPERATIONS: readonly Operation[] = [
@@ -104,7 +106,7 @@ export const AGENT_OPERATIONS: readonly Operation[] = [
     'submitBatch', 'finishTask', 'getTask', 'resume', 'cancel', 'closeSpace', 'listSpaces', 'joinSpace',
 ]
 /** Operations that require an interactive (human UI) capability. */
-export const INTERACTIVE_OPERATIONS: readonly Operation[] = ['approve', 'takeOver', 'releaseControl', 'viewerTicket']
+export const INTERACTIVE_OPERATIONS: readonly Operation[] = ['approve', 'takeOver', 'releaseControl', 'viewerTicket', 'setSpaceQuota']
 
 export interface AgentGrant {
     kind: 'agent-grant'
@@ -240,6 +242,28 @@ export interface StepResult {
     /** observe/screenshot payload summary; never raw secrets */
     observation?: Observation
     screenshot?: ScreenshotResult
+    /** navigate/click/fill on a driver that gates its input (BrowserDriver.gatesInputOnValidateDispatch) */
+    receipt?: ActionReceipt
+}
+
+/**
+ * What one navigate/click/fill driver call observed. Only what the browser reported to the driver
+ * during that call: an entry does not prove the action caused it (a page or the user can open a
+ * popup at the same time), and a missing entry does not prove nothing happened (a page can react
+ * later). Never an ownership or cleanup decision.
+ */
+export interface ActionObservations {
+    /** JavaScript dialogs the tab opened (type only; the message is page text). The driver asks to dismiss each; it does not await that. */
+    dialogs?: Array<{ type: string }>
+    /** Pages the tab opened (origin as known when the call ended, '' if not yet; closed = stopped by destination enforcement or the window cap). */
+    popups?: Array<{ origin: string; closed: boolean }>
+    /** File choosers the tab opened, observed only: the driver does not intercept, answer or cancel them. */
+    fileChoosers?: Array<{ mode: string }>
+}
+
+export interface ActionReceipt extends ActionObservations {
+    /** 'sent' once the driver passed the Runtime's input gate (began the input); the page may not have received it. */
+    input: 'not-sent' | 'sent'
 }
 
 export interface BatchResult {
@@ -447,11 +471,26 @@ export interface DriverOptions {
     timeoutMs: number
     /** click only */
     expect?: DispatchExpectation
-    /** In-process authorization fence, called immediately before actual input. Never a wire field. */
-    validateDispatch?: () => void
+    /**
+     * In-process authorization fence, called immediately before actual input (and before each further
+     * command of it). With 'prepare': only checks, before a preparation step that changes page state
+     * (scroll, hover, focus); a driver may skip those calls. Never a wire field.
+     */
+    validateDispatch?: (phase?: 'prepare') => void
+    /** navigate/click/fill: in-process sink for what the driver observed during the call. Never a wire field. */
+    observed?: ActionObservations
 }
 
 export interface BrowserDriver {
+    /**
+     * True only for a driver whose navigate/click/fill send none of the write's input (pointer press
+     * and release, typed text or keys, the navigation) before `validateDispatch` has returned, and
+     * none when it throws. Preparation the Runtime does not treat as the write (scroll, hover, focus,
+     * selecting the field's text) may come first. Only for such a driver may the Runtime conclude,
+     * from a callback that was never reached, that an interrupted write never left; for any other
+     * driver that write stays an unknown outcome.
+     */
+    readonly gatesInputOnValidateDispatch?: boolean
     /** Identity of the browser process this driver is connected to. */
     browserInstanceId(): BrowserInstanceId
     openTab(url: string, allowedOrigins: string[], opts: DriverOptions): Promise<DriverTabHandle>
@@ -546,8 +585,18 @@ export type InputOwner =
     | { kind: 'user'; principalId: PrincipalId; viewerSessionId: string }
     | { kind: 'none' }
 
+export interface SpaceQuotaPreference { ceiling: number | null; revision: number }
+export interface SpaceListResult {
+    quota?: { used: number; reclaimingReserve?: number; limit: number; hidden: number; reason: string; mode: 'automatic' | 'fixed'; preference: SpaceQuotaPreference }
+    spaces: Array<{ taskSpaceId: TaskSpaceId; profileId: ProfileId; createdAtMs: number; closed: boolean; tabs: TabId[];
+        memberSessionIds: string[]; membershipEvents: Array<{ type:'created' | 'joined'; agentSessionId:string; atMs:number }>;
+        reclaiming?: boolean; lastActivityAtMs?: number;
+        tasks?: Array<{taskId:TaskId; status:TaskStatus; pauseReason?:string; pendingApproval:boolean; uncertain:boolean; inFlight:boolean}> }>
+}
+
 export interface BrowserRuntimeApi {
-    listSpaces(auth: AuthContext, req: { profileId: ProfileId }): Promise<{ spaces: Array<{ taskSpaceId: TaskSpaceId; profileId: ProfileId; createdAtMs: number; closed: boolean; tabs: TabId[]; memberSessionIds: string[]; membershipEvents: Array<{ type: 'created' | 'joined'; agentSessionId: string; atMs: number }> }> }>
+    listSpaces(auth: AuthContext, req: { profileId: ProfileId }): Promise<SpaceListResult>
+    setSpaceQuota(auth: AuthContext, req: { profileId: ProfileId; ceiling: number | null; expectedRevision: number }): Promise<SpaceQuotaPreference>
     joinSpace(auth: AuthContext, req: { taskSpaceId: TaskSpaceId; requestId: RequestId }): Promise<{ taskSpaceId: TaskSpaceId; memberSessionIds: string[] }>
     createSpace(auth: AuthContext, req: CreateSpaceRequest): Promise<{ taskSpaceId: TaskSpaceId }>
     createTask(auth: AuthContext, req: CreateTaskRequest): Promise<TaskView>

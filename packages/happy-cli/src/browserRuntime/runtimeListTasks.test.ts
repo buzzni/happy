@@ -69,3 +69,41 @@ describe('listTasks (interactive)', () => {
         await h.store.close()
     })
 })
+
+describe('space management (interactive)', () => {
+    it('includes aggregate profile usage without exposing other owners spaces', async () => {
+        const h=await createHarness()
+        await h.newTask('p',h.profileA,'own')
+        await h.newTask('other',h.profileA,'hidden')
+        const result=await h.runtime.listSpaces(h.ui(h.profileA,['listSpaces']),{profileId:h.profileA})
+        expect(result.spaces).toHaveLength(1)
+        expect(result.quota).toMatchObject({used:2,hidden:1,reclaimingReserve:0})
+        await h.store.close()
+    })
+
+    it('shows scoped spaces and requires explicit close permission and terminal tasks', async () => {
+        const h = await createHarness()
+        const { task } = await h.newTask('p', h.profileA, 'managed')
+        const ui = h.ui(h.profileA, ['listSpaces', 'closeSpace', 'cancel'])
+        const list = await h.runtime.listSpaces(ui, {profileId:h.profileA})
+        expect(list.spaces[0]).toMatchObject({taskSpaceId:task.taskSpaceId, tasks:[{taskId:task.taskId}]})
+        await expect(h.runtime.closeSpace(ui,{taskSpaceId:task.taskSpaceId,requestId:'close-live' as RequestId})).rejects.toMatchObject({code:'CONFLICT'})
+        await h.runtime.cancel(ui,{taskId:task.taskId,requestId:'stop' as RequestId})
+        await h.runtime.closeSpace(ui,{taskSpaceId:task.taskSpaceId,requestId:'close-done' as RequestId})
+        expect((await h.runtime.listSpaces(ui,{profileId:h.profileA})).spaces[0].closed).toBe(true)
+        await h.store.close()
+    })
+    it('persists a ceiling with compare-and-set, refuses agents and other profiles', async () => {
+        const h = await createHarness()
+        const ui = h.ui(h.profileA, ['listSpaces','setSpaceQuota'])
+        await expect(h.runtime.setSpaceQuota(h.agent('p',h.profileA),{profileId:h.profileA,ceiling:1,expectedRevision:0})).rejects.toMatchObject({code:'SCOPE_DENIED'})
+        await expect(h.runtime.setSpaceQuota(ui,{profileId:h.profileB,ceiling:1,expectedRevision:0})).rejects.toMatchObject({code:'SCOPE_DENIED'})
+        expect(await h.runtime.setSpaceQuota(ui,{profileId:h.profileA,ceiling:1,expectedRevision:0})).toMatchObject({ceiling:1,revision:1})
+        await expect(h.runtime.setSpaceQuota(ui,{profileId:h.profileA,ceiling:2,expectedRevision:0})).rejects.toMatchObject({code:'CONFLICT'})
+        const dir = h.store.stateDir
+        await h.store.close()
+        const reopened = await TaskStore.open(dir)
+        expect(reopened.getSpaceQuota(JSON.stringify([h.profileA,'p','']))).toEqual({ceiling:1,revision:1})
+        await reopened.close()
+    })
+})

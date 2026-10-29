@@ -497,3 +497,9 @@ describe('shared PC choice through Studio', () => {
     expect(await noOrigin.switcher.sharedChoose({ companyId: 'org-s', candidates: held, exclude: [], measure: false })).toBeUndefined()
   })
 })
+
+it('carries authentication failure to rebind with the running binding proof before accepting another token', async () => {
+ const { switcher, requests } = setup()
+ expect(await switcher.rebind('session-a', RUNNING_A, { observedAt: 100, reason: 'authentication-failed', windows: [], retryAt: null })).toHaveProperty('ok', true)
+ expect(requests[0].body).toMatchObject({ bindingNonce: NONCE_A, organizationFailure: { kind: 'authentication', observedAt: 100 } })
+})

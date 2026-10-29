@@ -20,7 +20,7 @@ export type SetupTokenUsageObservation = {
   observationId?: string
   observedAt: number
   windows: Array<{ kind: 'unified5h' | 'unified7d'; pct: number | null; resetsAt: number | null }>
-  reason: 'ok' | 'rate-limited'
+  reason: 'ok' | 'rate-limited' | 'authentication-failed'
   retryAt: number | null
 }
 export type SetupTokenAccountSwitchDeps = {
@@ -353,7 +353,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       }
       const pending = inFlight.get(sessionId)
       if (pending) return pending
-      const started = (shared ? sharedRebindOnce(sessionId, shared, observation) : rebindOnce(sessionId, running)).finally(() => inFlight.delete(sessionId))
+      const started = (shared ? sharedRebindOnce(sessionId, shared, observation) : rebindOnce(sessionId, running, false, observation?.reason === 'authentication-failed' ? { kind: 'authentication', observedAt: observation.observedAt } : undefined)).finally(() => inFlight.delete(sessionId))
       inFlight.set(sessionId, started)
       return started
     },

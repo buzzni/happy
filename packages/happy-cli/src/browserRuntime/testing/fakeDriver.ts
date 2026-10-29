@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { BrowserRuntimeError, type BrowserDriver, type BrowserInstanceId, type DriverOptions, type DriverTabHandle, type ElementDescription, type ElementRef, type FormSubmission, type ObservedElement, type Observation, type ScreenshotResult, type SnapshotId, type TabId, type WaitPredicate } from '../contracts'
+import { BrowserRuntimeError, type ActionObservations, type BrowserDriver, type BrowserInstanceId, type DriverOptions, type DriverTabHandle, type ElementDescription, type ElementRef, type FormSubmission, type ObservedElement, type Observation, type ScreenshotResult, type SnapshotId, type TabId, type WaitPredicate } from '../contracts'
 import { formDigest, originAllowed } from '../policy'
 
 export interface FakePage { url: string; title?: string; text?: string; elements?: ObservedElement[]; documentGeneration?: number; frameOrigins?: string[]; formAction?: string; formValues?: Record<string, string>
@@ -13,6 +13,16 @@ export interface FakePage { url: string; title?: string; text?: string; elements
     linkUrls?: Record<string, string>
     uiActions?: Record<string, ElementDescription['uiAction']> }
 type Operation = 'openTab' | 'closeTab' | 'navigate' | 'observe' | 'describeRef' | 'screenshot' | 'click' | 'fill' | 'waitFor' | 'adoptTab'
+type InputOperation = 'navigate' | 'click' | 'fill'
+/** Where a test can pause the fake: a read before the input, or right before a write's input (before validateDispatch). */
+type HoldPoint = 'describeRef' | 'currentOrigin' | `input:${InputOperation}`
+interface Hold {
+    point: HoldPoint
+    /** Calls at this point to let pass before holding */
+    skip: number
+    entered(): void
+    gate: Promise<void>
+}
 interface HeldDispatch {
     operation: Operation
     entered(): void
@@ -20,6 +30,8 @@ interface HeldDispatch {
     gate: Promise<void>
 }
 export class FakeBrowserDriver implements BrowserDriver {
+    /** Like CdpDriver: navigate/click/fill send nothing before validateDispatch returns. A test may clear it (a driver without the guarantee). */
+    gatesInputOnValidateDispatch = true
     private instance = `browser-${randomUUID()}` as BrowserInstanceId
     private serial = 0
     private readonly pages = new Map<TabId, FakePage>()
@@ -39,6 +51,9 @@ export class FakeBrowserDriver implements BrowserDriver {
     private waitRelease?: () => void
     private ignoreWaitAbort = false
     private heldDispatch?: HeldDispatch
+    private readonly holds: Hold[] = []
+    private readonly failuresAfterInput = new Map<InputOperation, Error[]>()
+    private readonly receiptObservations = new Map<InputOperation, ActionObservations>()
     private dispatchObserver?: (actionId: string) => void
     private notifyWaitEntered!: () => void
     readonly waitForEntered = new Promise<void>((resolve) => { this.notifyWaitEntered = resolve })
@@ -62,6 +77,21 @@ export class FakeBrowserDriver implements BrowserDriver {
         return { entered, release }
     }
     observeDispatches(observer?: (actionId: string) => void): void { this.dispatchObserver = observer }
+    /** Pause the next call at `point` (after `skip` calls passed); a held write has not sent its input yet. */
+    holdBefore(point: HoldPoint, skip = 0): { entered: Promise<void>; release(): void } {
+        let notifyEntered!: () => void
+        let release!: () => void
+        const entered = new Promise<void>((resolve) => { notifyEntered = resolve })
+        const gate = new Promise<void>((resolve) => { release = resolve })
+        this.holds.push({ point, skip, entered: notifyEntered, gate })
+        return { entered, release }
+    }
+    /** The next `operation` sends its input and then fails (e.g. the response was lost). */
+    failAfterInput(operation: InputOperation, error: Error): void {
+        this.failuresAfterInput.set(operation, [...(this.failuresAfterInput.get(operation) ?? []), error])
+    }
+    /** What the next `operation` reports having seen during the call (opts.observed). */
+    observeDuringNext(operation: InputOperation, observed: ActionObservations): void { this.receiptObservations.set(operation, observed) }
     failNext(operation: Operation, error: Error): void {
         this.failures.set(operation, [...(this.failures.get(operation) ?? []), error])
     }
@@ -107,7 +137,7 @@ export class FakeBrowserDriver implements BrowserDriver {
         return adopted
     }
     async navigate(tabId: TabId, url: string, _origins: string[], opts: DriverOptions): Promise<{ url: string; documentGeneration: number }> {
-        await this.delay('navigate', opts); this.throwNextFailure('navigate'); const page = this.requirePage(tabId); page.url = url; page.documentGeneration = (page.documentGeneration ?? 0) + 1; this.record(tabId, `target-${tabId}`, 'navigate'); await this.afterDispatch('navigate'); return { url, documentGeneration: page.documentGeneration }
+        await this.delay('navigate', opts); this.throwNextFailure('navigate'); const page = this.requirePage(tabId); await this.beforeInput('navigate', opts); page.url = url; page.documentGeneration = (page.documentGeneration ?? 0) + 1; this.record(tabId, `target-${tabId}`, 'navigate'); await this.afterDispatch('navigate'); this.throwAfterInput('navigate'); return { url, documentGeneration: page.documentGeneration }
     }
     async observe(tabId: TabId, allowedOrigins: string[], opts: DriverOptions & { maxElements?: number; maxTextChars?: number; scopeRef?: ElementRef }): Promise<Observation> {
         await this.delay('observe', opts); this.throwNextFailure('observe'); const page = this.requirePage(tabId); const origin = new URL(page.url).origin
@@ -121,6 +151,7 @@ export class FakeBrowserDriver implements BrowserDriver {
         return { snapshotId, tabId, url: page.url, title: page.title ?? '', documentGeneration: page.documentGeneration ?? 1, elements, frames, truncated: false, text: originAllowed(allowedOrigins, origin) ? (page.text ?? '').slice(0, opts.maxTextChars ?? 20_000) : '' }
     }
     async describeRef(tabId: TabId, ref: ElementRef, snapshotId: SnapshotId, opts: DriverOptions): Promise<ElementDescription> {
+        await this.hold('describeRef')
         await this.delay('describeRef', opts)
         this.throwNextFailure('describeRef')
         const page = this.requirePage(tabId)
@@ -158,7 +189,7 @@ export class FakeBrowserDriver implements BrowserDriver {
         await this.delay('screenshot', opts); this.throwNextFailure('screenshot'); const page = this.requirePage(tabId); if ((page.frameOrigins ?? []).some((origin) => !originAllowed(allowedOrigins, origin))) throw new BrowserRuntimeError('ORIGIN_DENIED', 'A frame origin is not allowed')
         return { tabId, mimeType: 'image/png', data: Buffer.from('synthetic').toString('base64'), documentGeneration: page.documentGeneration ?? 1, targetId: `target-${tabId}`, capturedAtMs: Date.now() }
     }
-    async click(tabId: TabId, ref: ElementRef, snapshotId: SnapshotId, opts: DriverOptions): Promise<void> { this.clickExpectations.push(opts.expect); await this.delay('click', opts); this.throwNextFailure('click'); const page = this.requirePage(tabId); const element = this.snapshotElements.get(snapshotId)?.get(ref); this.assertSnapshot(tabId, snapshotId, page.documentGeneration ?? 1, element); const current = page.elements?.find((candidate) => candidate.ref === ref); if (!current || !sameNode(element!, current)) throw new BrowserRuntimeError('STALE_REF', 'Reference node was replaced', false, false); opts.validateDispatch?.(); this.dispatchedSnapshots.push({ tabId, snapshotId, operation: 'click' }); this.record(tabId, `target-${tabId}`, 'click'); await this.afterDispatch('click') }
+    async click(tabId: TabId, ref: ElementRef, snapshotId: SnapshotId, opts: DriverOptions): Promise<void> { this.clickExpectations.push(opts.expect); await this.delay('click', opts); this.throwNextFailure('click'); const page = this.requirePage(tabId); const element = this.snapshotElements.get(snapshotId)?.get(ref); this.assertSnapshot(tabId, snapshotId, page.documentGeneration ?? 1, element); const current = page.elements?.find((candidate) => candidate.ref === ref); if (!current || !sameNode(element!, current)) throw new BrowserRuntimeError('STALE_REF', 'Reference node was replaced', false, false); await this.beforeInput('click', opts); this.dispatchedSnapshots.push({ tabId, snapshotId, operation: 'click' }); this.record(tabId, `target-${tabId}`, 'click'); await this.afterDispatch('click'); this.throwAfterInput('click') }
     async fill(tabId: TabId, ref: ElementRef, snapshotId: SnapshotId, value: string, opts: DriverOptions): Promise<void> {
         await this.delay('fill', opts)
         this.throwNextFailure('fill')
@@ -168,12 +199,14 @@ export class FakeBrowserDriver implements BrowserDriver {
         const current = page.elements?.find((candidate) => candidate.ref === ref)
         if (!current || !sameNode(element!, current))
             throw new BrowserRuntimeError('STALE_REF', 'Reference node was replaced', false, false)
+        await this.beforeInput('fill', opts)
         const field = page.elements?.find((element) => element.ref === ref)
         if (field)
             field.value = value
         this.dispatchedSnapshots.push({ tabId, snapshotId, operation: 'fill' })
         this.record(tabId, `target-${tabId}`, 'fill')
         await this.afterDispatch('fill')
+        this.throwAfterInput('fill')
     }
     async waitFor(tabId: TabId, _predicate: WaitPredicate, _origins: string[], opts: DriverOptions): Promise<void> {
         if (!this.pages.has(tabId)) throw new BrowserRuntimeError('TARGET_GONE', 'Tab does not exist')
@@ -193,11 +226,37 @@ export class FakeBrowserDriver implements BrowserDriver {
             if (timeout !== undefined) setTimeout(release, timeout)
         })
     }
-    async currentOrigin(tabId: TabId): Promise<string> { return new URL(this.requirePage(tabId).url).origin }
+    async currentOrigin(tabId: TabId): Promise<string> { await this.hold('currentOrigin'); return new URL(this.requirePage(tabId).url).origin }
     async close(): Promise<void> { this.pages.clear() }
     seedTab(tabId: TabId, page: FakePage): void { this.pages.set(tabId, structuredClone(page)) }
 
     private requirePage(tabId: TabId): FakePage { const page = this.pages.get(tabId); if (!page) throw new BrowserRuntimeError('TARGET_GONE', 'Tab does not exist'); return page }
+    private async hold(point: HoldPoint): Promise<void> {
+        const index = this.holds.findIndex((candidate) => candidate.point === point)
+        if (index < 0)
+            return
+        const hold = this.holds[index]
+        if (hold.skip > 0) {
+            hold.skip -= 1
+            return
+        }
+        this.holds.splice(index, 1)
+        hold.entered()
+        await hold.gate
+    }
+    /** The last moment before a write's input: the Runtime's fence; nothing of the write happened before it. */
+    private async beforeInput(operation: InputOperation, opts: DriverOptions): Promise<void> {
+        await this.hold(`input:${operation}`)
+        opts.validateDispatch?.()
+        if (opts.observed)
+            Object.assign(opts.observed, structuredClone(this.receiptObservations.get(operation) ?? {}))
+        this.receiptObservations.delete(operation)
+    }
+    private throwAfterInput(operation: InputOperation): void {
+        const failure = this.failuresAfterInput.get(operation)?.shift()
+        if (failure)
+            throw failure
+    }
     private throwNextFailure(operation: Operation): void {
         const failure = this.failures.get(operation)?.shift()
         if (failure)
