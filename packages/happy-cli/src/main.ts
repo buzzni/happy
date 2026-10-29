@@ -45,7 +45,7 @@ import { ensureDaemonRunning } from './daemon/ensureDaemonRunning'
 import { handleCodexCommand } from './commands/codexCommand'
 import { runPreToolUseCli } from './hooks/runPreToolUseCli'
 import { preflightDaemonControlServer } from './daemon/controlServer'
-import { resolveMcpConfigPresetUrl } from './aplus/mcpConfigPresets'
+import { resolveDaemonPreset } from './aplus/mcpConfigPresets'
 import { readManagedStartup } from '@/managed/managedStartup';
 import { resolveDaemonMcpConfigEnvironment } from './daemon/daemonMcpConfig'
 import { resolveDaemonStudioOriginEnvironment } from './daemon/daemonStudioOrigin'
@@ -607,21 +607,20 @@ Conversation history is preserved on the server, but in-flight tool calls are in
       return
 
     } else if (daemonSubcommand === 'start' || daemonSubcommand === 'restart') {
-      // Optional preset name (e.g. `happy daemon start saycode`) resolves to
-      // HAPPY_APLUS_MCP_CONFIG_URL so it doesn't need to be exported by hand.
-      // An explicitly set env var always wins over the preset.
+      // A named preset supplies fixed MCP and Studio defaults; explicit settings retain priority.
       let daemonEnv = process.env
       const mcpConfigPreset = daemonSubcommand === 'start' ? args[2] : undefined
-      if (mcpConfigPreset && !process.env.HAPPY_APLUS_MCP_CONFIG_URL) {
-        const presetUrl = resolveMcpConfigPresetUrl(mcpConfigPreset)
-        if (!presetUrl) {
-          console.error(`Unknown mcp-config preset: ${mcpConfigPreset}`)
-          process.exit(1)
-        }
-        daemonEnv = { ...process.env, HAPPY_APLUS_MCP_CONFIG_URL: presetUrl }
+      const preset = mcpConfigPreset ? resolveDaemonPreset(mcpConfigPreset) : undefined
+      if (mcpConfigPreset && !preset) {
+        console.error(`Unknown mcp-config preset: ${mcpConfigPreset}`)
+        process.exit(1)
+        return
+      }
+      if (preset && process.env.HAPPY_APLUS_MCP_CONFIG_URL === undefined) {
+        daemonEnv = { ...process.env, HAPPY_APLUS_MCP_CONFIG_URL: preset.mcpConfigUrl }
       }
       try {
-        daemonEnv = await resolveDaemonStudioOriginEnvironment(daemonEnv, configuration.serverUrl)
+        daemonEnv = await resolveDaemonStudioOriginEnvironment(daemonEnv, preset?.studioOrigin ?? configuration.serverUrl)
         daemonEnv = await resolveDaemonMcpConfigEnvironment(daemonEnv, { persistExplicit: true })
       } catch (error) {
         console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Invalid daemon configuration')

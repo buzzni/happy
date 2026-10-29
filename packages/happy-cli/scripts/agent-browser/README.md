@@ -597,7 +597,10 @@ with `{token}`; no shell command or caller-selected image/URL is accepted.
 The existing `abp-install` administrator procedure must be rerun from a released
 package containing this helper on older hosts. A CLI npm update alone does not install
 root-owned tools. Browser-only hosts do not receive a guessed sudo grant for their
-preexisting daemon user. Strict server-key machines retain their existing remote
+preexisting daemon user, so on those hosts (`HAPPY_BROWSER_TASK_HOST_MODE=browser-only`)
+the daemon rejects `browser-runtime:update` with `BROWSER_UPDATE_LOCAL_REQUIRED` without
+calling the helper; Studio maps it to HTTP 409 `local-update-required` and the update must
+be applied locally by the administrator. Strict server-key machines retain their existing remote
 management refusal; use their administrator-managed upgrade procedure.
 
 Studio must be configured with `AGENT_BROWSER_UPDATE_MANIFEST_PATH`, an absolute,

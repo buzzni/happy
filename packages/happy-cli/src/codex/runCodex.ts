@@ -2034,6 +2034,7 @@ export async function runCodex(opts: {
             unattended: () => turnAttendance?.policyUnattended() ?? exitAfterFirstTurn,
             terminalPrompt: () => false,
             grantTtlMs: REMOTE_GRANT_TTL_MS,
+            rpc: session.rpcHandlerManager,
         });
         toolPolicy = policy;
         toolPolicyServer = await startHookServer({

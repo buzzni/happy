@@ -8,6 +8,12 @@ describe('describeClaudeLaunchFailure', () => {
         expect(describeClaudeLaunchFailure(new Error('CLAUDE_PERSONAL_AUTH_NOT_VERIFIED'))).toMatch(/Personal Claude stopped.*account or policy/);
     });
 
+    it('explains a refused organization credential without asking for a personal login', () => {
+        const text = describeClaudeLaunchFailure(new Error('CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED'));
+        expect(text).toMatch(/Organization Claude stopped.*assigned account or policy/);
+        expect(text).not.toMatch(/Personal|\/login|token=/);
+    });
+
     it('names the root refusal and what to do', () => {
         const message = describeClaudeLaunchFailure(new Error('Claude Code process exited with code 1. stderr: --dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons'));
         expect(message).toMatch(/root/);

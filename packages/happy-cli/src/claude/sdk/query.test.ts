@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const sdkQuery = vi.hoisted(() => vi.fn(() => ({ mocked: true })));
+const pinnedQuery = vi.hoisted(() => vi.fn(() => ({ pinned: true })));
+vi.mock('./credentialPin', () => ({ queryWithPinnedCredential: pinnedQuery }));
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
     query: sdkQuery,
@@ -15,6 +17,9 @@ describe('query adapter', () => {
     let configDirectory: string;
     beforeEach(() => {
         sdkQuery.mockClear();
+        pinnedQuery.mockClear();
+        vi.stubEnv('HAPPY_AI_AUTH_SOURCE', undefined);
+        vi.stubEnv('CLAUDE_CODE_OAUTH_TOKEN', undefined);
         configDirectory = mkdtempSync(join(tmpdir(), 'happy-plugin-config-'));
         vi.stubEnv('CLAUDE_CONFIG_DIR', configDirectory);
         vi.stubEnv('HAPPY_CLAUDE_PATH', undefined);
@@ -27,6 +32,35 @@ describe('query adapter', () => {
     function lastOptions(): Record<string, unknown> {
         return (sdkQuery.mock.calls as unknown as [{ options: Record<string, unknown> }][]).at(-1)![0].options;
     }
+
+    it('pins the assigned organization token on every query, including resume and title calls', () => {
+        vi.stubEnv('HAPPY_AI_AUTH_SOURCE', 'org-bundle');
+        for (const token of ['fixture-first-generation', 'fixture-next-generation']) {
+            vi.stubEnv('CLAUDE_CODE_OAUTH_TOKEN', token);
+            query({ prompt: 'continue', options: { resume: 'session', settingSources: ['user', 'project'], model: 'claude-opus-5-5' } });
+            expect(pinnedQuery).toHaveBeenLastCalledWith(sdkQuery, expect.objectContaining({
+                options: expect.objectContaining({ resume: 'session', settingSources: ['user', 'project'], env: expect.objectContaining({ CLAUDE_CODE_OAUTH_TOKEN: token }) }),
+            }), token, 'organization');
+        }
+        expect(sdkQuery).not.toHaveBeenCalled();
+    });
+
+    it.each(['personal-subscription', 'org-bundle-observed', undefined])('keeps ordinary token source %s on the existing route', source => {
+        vi.stubEnv('HAPPY_AI_AUTH_SOURCE', source);
+        vi.stubEnv('CLAUDE_CODE_OAUTH_TOKEN', 'fixture-token');
+        query({ prompt: 'hello' });
+        expect(pinnedQuery).not.toHaveBeenCalled();
+        expect(sdkQuery).toHaveBeenCalledOnce();
+    });
+
+    it('keeps non-OAuth organization routes and explicit personal fallback distinct', () => {
+        vi.stubEnv('HAPPY_AI_AUTH_SOURCE', 'org-bundle');
+        query({ prompt: 'hello' });
+        expect(sdkQuery).toHaveBeenCalledOnce();
+        vi.stubEnv('CLAUDE_CODE_OAUTH_TOKEN', 'fixture-org-token');
+        query({ prompt: 'hello', options: { personalClaudeAuth: { oauthToken: 'fixture-personal' } } });
+        expect(pinnedQuery).toHaveBeenLastCalledWith(sdkQuery, expect.anything(), 'fixture-personal');
+    });
 
     it('uses the SDK bundled executable unless a local path is explicitly configured', () => {
         query({ prompt: 'continue' });
@@ -205,6 +239,9 @@ describe('query adapter', () => {
         }));
 
         sdkQuery.mockClear();
+        pinnedQuery.mockClear();
+        vi.stubEnv('HAPPY_AI_AUTH_SOURCE', undefined);
+        vi.stubEnv('CLAUDE_CODE_OAUTH_TOKEN', undefined);
         query({ prompt: 'continue', options: { tools: ['Read'] } });
         expect(sdkQuery).toHaveBeenCalledWith(expect.objectContaining({
             options: expect.objectContaining({ tools: ['Read'] }),

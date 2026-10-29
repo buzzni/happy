@@ -465,6 +465,11 @@ export interface BrowserDriver {
      */
     adoptTab?(tabId: TabId, targetId: string, allowedOrigins: string[], opts: DriverOptions): Promise<boolean>
     /**
+     * Whether the connected browser has a target with this id, asked of the browser itself (not of
+     * what the driver remembers); undefined when that cannot be told (not connected, no answer).
+     */
+    targetExists?(targetId: string, opts: DriverOptions): Promise<boolean | undefined>
+    /**
      * Describe the element a ref of `snapshotId` points to in the CURRENT document,
      * without taking a new snapshot (so the agent's refs stay valid). Throws
      * STALE_REF exactly like click/fill would. Used for policy classification and

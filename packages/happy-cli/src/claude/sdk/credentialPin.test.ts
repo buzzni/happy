@@ -71,6 +71,17 @@ describe('pinned credential at the SDK request boundary', () => {
         await expect(request({ subtype: 'side_question', prompt: 'two' })).rejects.toThrow('CLAUDE_PERSONAL_AUTH_NOT_VERIFIED');
         expect(f.controls.request).toHaveBeenCalledOnce();
     });
+    it.each(['missing-control', 'restricted-org', 'later-change'])('refuses organization %s with a source-specific sanitized error', async kind => {
+        const f = fixture();
+        if (kind === 'missing-control') f.controls.getSettings = undefined as never;
+        if (kind === 'restricted-org') f.restrictOrganization();
+        const q = queryWithPinnedCredential(f.create as never, { prompt: 'hello', options }, TOKEN, 'organization');
+        if (kind === 'later-change') { await q.next(); f.tamper(); }
+        if (kind === 'later-change') await expect((q as unknown as {request(body: unknown): Promise<unknown>}).request({ subtype: 'side_question' })).rejects.toThrow('CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED');
+        else await expect(q.next()).rejects.toThrow('CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED');
+        expect(f.received).toHaveLength(kind === 'later-change' ? 1 : 0);
+        expect(f.controls.close).toHaveBeenCalled();
+    });
     it('bounds a hung control call without sending input', async () => {
         vi.useFakeTimers(); const f = fixture();
         f.controls.getSettings.mockImplementation(() => new Promise(() => {}));

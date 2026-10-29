@@ -297,6 +297,37 @@ describe('RPC targets exactly one connection', () => {
         expect(MANAGED_RPC_DEADLINE_MS).toBeLessThanOrEqual(60_000);
     });
 
+    it('delivers the owner\'s own tool-policy grant call, which needs no relayed authority', async () => {
+        /*
+         * Desktop lists and revokes this conversation's grants over its account
+         * socket's `rpc-call`, the same path a permission answer takes. No
+         * claims ride along, and none are required: the call reaches the run.
+         */
+        const registry = new ManagedSocketRegistry();
+        const emitted: unknown[] = [];
+        registry.add({
+            socketId: 'child', accountId: 'account-1', sessionId: 'session-1',
+            grantId: 'grant-child', runId: 'run-1', attemptId: 'attempt-1',
+            rpcNames: new Set(['tool-policy-grants', 'tool-policy-revoke-grant']), connectedAt: 1,
+            channel: new ManagedOutboundChannel(
+                {
+                    emit: (_event, ...args) => {
+                        emitted.push(args[0]);
+                        (args[1] as (r: unknown) => void)('AAECAwQFBgc=');
+                        return true;
+                    },
+                    disconnect: () => undefined,
+                },
+                async () => ({ ok: true }),
+            ),
+        });
+        expect(await dispatchManagedRpc(null, {
+            sessionId: 'session-1', accountId: 'account-1',
+            rpcName: 'tool-policy-revoke-grant', requestId: 'req-revoke', params: 'encrypted-key',
+        }, registry, { deadlineMs: 500 })).toEqual({ ok: true, result: 'AAECAwQFBgc=' });
+        expect(emitted).toMatchObject([{ method: 'session-1:tool-policy-revoke-grant', requestId: 'req-revoke' }]);
+    });
+
     it('reports no target rather than trying a different connection', async () => {
         const { registry } = rpcRegistry([
             { socketId: 'a', connectedAt: 1, rpcNames: ['bash'] },

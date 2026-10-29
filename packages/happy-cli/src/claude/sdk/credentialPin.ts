@@ -2,7 +2,7 @@ import { AbortError } from '@anthropic-ai/claude-agent-sdk';
 import type { Options, Query, SDKUserMessage, query } from '@anthropic-ai/claude-agent-sdk';
 import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS } from '../utils/claudeAuthOverrideEnv';
 
-import { PERSONAL_CLAUDE_AUTH_FAILURE } from '../utils/launchFailureMessage';
+import { ORGANIZATION_CLAUDE_AUTH_FAILURE, PERSONAL_CLAUDE_AUTH_FAILURE } from '../utils/launchFailureMessage';
 const CONTROL_TIMEOUT_MS = 10_000;
 type ObjectValue = Record<string, unknown>;
 const object = (v: unknown): v is ObjectValue => !!v && typeof v === 'object' && !Array.isArray(v);
@@ -14,8 +14,10 @@ export function queryWithPinnedCredential(
     create: typeof query,
     params: { prompt: string | AsyncIterable<SDKUserMessage>; options: Options },
     oauthToken: string,
+    source: 'personal' | 'organization' = 'personal',
 ): Query {
-    if (!oauthToken || /[\r\n\0]/.test(oauthToken)) throw new Error(PERSONAL_CLAUDE_AUTH_FAILURE);
+    const failureCode = source === 'organization' ? ORGANIZATION_CLAUDE_AUTH_FAILURE : PERSONAL_CLAUDE_AUTH_FAILURE;
+    if (!oauthToken || /[\r\n\0]/.test(oauthToken)) throw new Error(failureCode);
     const signal = params.options.abortController?.signal;
     const authEnv = Object.fromEntries(CLAUDE_AUTH_OVERRIDE_ENV_KEYS.map(key => [key, '']));
     // Newer backends/profiles must not inherit a different credential route.
@@ -30,18 +32,18 @@ export function queryWithPinnedCredential(
     void failed.catch(() => {});
 
     function refuse(upstreamError?: Error): never {
-        const error = signal?.aborted ? new AbortError('Claude request aborted') : upstreamError ?? new Error(PERSONAL_CLAUDE_AUTH_FAILURE);
+        const error = signal?.aborted ? new AbortError('Claude request aborted') : upstreamError ?? new Error(failureCode);
         rejectFailure(error);
         try { response.close(); } catch { /* already closed */ }
         throw error;
     }
     async function checked() { try { await verify(); } catch { refuse(); } }
     async function control<T>(call: () => Promise<T>): Promise<T> {
-        if (signal?.aborted) throw new Error(PERSONAL_CLAUDE_AUTH_FAILURE);
+        if (signal?.aborted) throw new Error(failureCode);
         let timer: ReturnType<typeof setTimeout>;
         let onAbort: () => void;
         const refused = new Promise<never>((_resolve, reject) => {
-            onAbort = () => reject(new Error(PERSONAL_CLAUDE_AUTH_FAILURE));
+            onAbort = () => reject(new Error(failureCode));
             timer = setTimeout(onAbort, CONTROL_TIMEOUT_MS);
             signal?.addEventListener('abort', onAbort, { once: true });
         });
@@ -52,10 +54,10 @@ export function queryWithPinnedCredential(
         // getSettings exists in the pinned SDK runtime, but is not in its public Query type.
         // Capability/shape checks are mandatory; a missing/changed implementation refuses input.
         const controls = response as Query & Partial<PinControls>;
-        if (typeof controls.getSettings !== 'function') throw new Error(PERSONAL_CLAUDE_AUTH_FAILURE);
+        if (typeof controls.getSettings !== 'function') throw new Error(failureCode);
         const value = await control(() => controls.getSettings!());
         if (!object(value) || !object(value.effective) || !Array.isArray(value.sources)
-            || value.sources.some(source => !object(source) || typeof source.source !== 'string' || !object(source.settings))) throw new Error(PERSONAL_CLAUDE_AUTH_FAILURE);
+            || value.sources.some(source => !object(source) || typeof source.source !== 'string' || !object(source.settings))) throw new Error(failureCode);
         return value as LiveSettings;
     }
     async function verify() {
@@ -65,11 +67,11 @@ export function queryWithPinnedCredential(
             || (effective.forceLoginMethod !== undefined && effective.forceLoginMethod !== 'claudeai')
             || (effective.allowedProviders !== undefined && (!Array.isArray(effective.allowedProviders) || !effective.allowedProviders.includes('anthropic')))
             || effective.apiKeyHelper !== '' || !object(env)
-            || Object.entries(authEnv).some(([key, value]) => env[key] !== value)) throw new Error(PERSONAL_CLAUDE_AUTH_FAILURE);
+            || Object.entries(authEnv).some(([key, value]) => env[key] !== value)) throw new Error(failureCode);
         const info = await control(() => response.reinitialize());
         const account = info.account;
         if (!account || account.apiProvider !== 'firstParty' || account.tokenSource !== 'CLAUDE_CODE_OAUTH_TOKEN'
-            || (account.apiKeySource !== undefined && account.apiKeySource !== 'none')) throw new Error(PERSONAL_CLAUDE_AUTH_FAILURE);
+            || (account.apiKeySource !== undefined && account.apiKeySource !== 'none')) throw new Error(failureCode);
     }
     async function* guardedInput(): AsyncGenerator<SDKUserMessage> {
         let readingInput = false;
@@ -77,10 +79,10 @@ export function queryWithPinnedCredential(
             // The SDK may start consuming its input inside create(), before it returns the Query.
             await Promise.resolve();
             if (typeof response.initializationResult !== 'function' || typeof response.applyFlagSettings !== 'function'
-                || typeof response.reinitialize !== 'function') throw new Error(PERSONAL_CLAUDE_AUTH_FAILURE);
+                || typeof response.reinitialize !== 'function') throw new Error(failureCode);
             const initialized = await control(() => response.initializationResult());
             const version = (initialized as { claude_code_version?: string }).claude_code_version?.match(/^2\.1\.(\d+)$/);
-            if (!version || Number(version[1]) < 308 || initialized.hooks_applied !== true) throw new Error(PERSONAL_CLAUDE_AUTH_FAILURE);
+            if (!version || Number(version[1]) < 308 || initialized.hooks_applied !== true) throw new Error(failureCode);
             const before = await settings();
             const flag = before.sources.find(source => source.source === 'flagSettings')?.settings;
             // Preserve existing flag-level non-auth env without promoting project/user values.
@@ -103,7 +105,7 @@ export function queryWithPinnedCredential(
         hooks: { ...params.options.hooks, ConfigChange: [
             ...(params.options.hooks?.ConfigChange ?? []),
             { hooks: [async input => {
-                // Never override an administrator's changed policy. End the personal generation
+                // Never override an administrator's changed policy. End the credential generation
                 // so the next launch can validate it before any more model requests.
                 if (input.hook_event_name === 'ConfigChange' && input.source === 'policy_settings') refuse();
                 return {};

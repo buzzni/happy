@@ -100,6 +100,13 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
         prompt: params.prompt as string | AsyncIterable<SDKUserMessage>, options: sdkOptions,
     }, opts.personalClaudeAuth.oauthToken)
 
+    // The daemon already selected this session's organization OAuth token. Pin it after
+    // filesystem settings load too: settings.env can otherwise replace the spawn's token.
+    // API-key/gateway and ordinary personal sessions keep their existing authentication.
+    if (env.HAPPY_AI_AUTH_SOURCE === 'org-bundle' && env.CLAUDE_CODE_OAUTH_TOKEN) return queryWithPinnedCredential(sdkQuery, {
+        prompt: params.prompt as string | AsyncIterable<SDKUserMessage>, options: sdkOptions,
+    }, env.CLAUDE_CODE_OAUTH_TOKEN, 'organization')
+
     return sdkQuery({
         prompt: params.prompt as string | AsyncIterable<SDKUserMessage>,
         options: sdkOptions,
