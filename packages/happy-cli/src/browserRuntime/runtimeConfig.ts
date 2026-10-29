@@ -9,6 +9,7 @@
  */
 import { createPublicKey } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { posix, win32 } from 'node:path'
 import { z } from 'zod'
 import type { TrustedIssuer } from './auth'
 import type { AuthMode, MachineId, PrincipalId, ProfileId, WorkspaceId } from './contracts'
@@ -47,6 +48,16 @@ const schema = z.object({
         browserGid: z.number().int().min(200).max(0x7fffffff), policyEpoch: z.number().int().positive().safe(),
         proxyPort: z.number().int().min(1024).max(65535),
     }).strict().optional(),
+    /** Single-user PC: the runtime and its browser run as the signed-in OS user (no service
+     * identity, no network guard). Paths and sockets derive from the user's fixed Saycode
+     * directory; brokerSocketPath/adminSocketPath are not used in this mode. */
+    personalDesktop: z.object({
+        platform: z.enum(['darwin', 'win32']),
+        browserExecutable: z.string().min(1).max(1024),
+    }).strict().refine(({ platform, browserExecutable }) => {
+        const path = platform === 'win32' ? win32 : posix
+        return path.isAbsolute(browserExecutable) && path.normalize(browserExecutable) === browserExecutable && !browserExecutable.includes('\0')
+    }, { path: ['browserExecutable'], message: 'must be a normalized absolute path' }).optional(),
     machineId: id,
     workspaceId: id,
     profiles: z.array(profileSchema),
@@ -117,7 +128,7 @@ const schema = z.object({
     if (config.authMode === 'production') {
         if (config.schemaVersion !== 2) ctx.addIssue({ code: 'custom', path: ['schemaVersion'], message: 'production needs schema 2 (profile assignments); reinstall with abp-install' })
         if (config.trustedIssuers.length === 0) ctx.addIssue({ code: 'custom', path: ['trustedIssuers'], message: 'production needs at least one trusted issuer' })
-        if (!config.daemonTokenSha256 && !config.nativeService) ctx.addIssue({ code: 'custom', path: ['daemonTokenSha256'], message: 'production needs the daemon token hash' })
+        if (!config.daemonTokenSha256 && !config.nativeService && !config.personalDesktop) ctx.addIssue({ code: 'custom', path: ['daemonTokenSha256'], message: 'production needs the daemon token hash' })
     }
     if (config.nativeService && (config.authMode !== 'production' || config.tenancyMode !== 'dedicated' ||
         config.nativeService.runtimeUid === config.nativeService.browserUid || config.runtimeHost !== '127.0.0.1' ||
@@ -127,6 +138,11 @@ const schema = z.object({
         config.nativeService.proxyPort === config.runtimePort ||
         config.profiles.some(p => p.cdpHttpUrl || p.instanceUrl || p.vncAddress)))
         ctx.addIssue({ code: 'custom', path: ['nativeService'], message: 'native production requires isolated identities, fixed local sockets and signed broker requests' })
+    // A personal runtime is never a weaker reading of a protected installation.
+    if (config.personalDesktop && (config.nativeService || config.authMode !== 'production' || config.tenancyMode !== 'dedicated' ||
+        config.runtimeHost !== '127.0.0.1' || config.daemonTokenSha256 !== undefined || config.brokerSocketGid !== undefined ||
+        config.profiles.some(p => p.cdpHttpUrl || p.instanceUrl || p.vncAddress)))
+        ctx.addIssue({ code: 'custom', path: ['personalDesktop'], message: 'a personal desktop runtime requires production, one local user, a loopback API and signed broker requests' })
 })
 
 export interface RuntimeConfig extends Omit<z.infer<typeof schema>, 'authMode' | 'machineId' | 'workspaceId' | 'trustedIssuers' | 'maxSpacesPerProfile' | 'profileTombstones'> {

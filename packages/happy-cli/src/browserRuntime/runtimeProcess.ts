@@ -58,6 +58,17 @@ import { TaskStore, RECLAIMING_SPACE_RESERVE } from './taskStore'
 import { ViewerProxy, type ViewerEndpoint } from './viewerProxy'
 import { holdsWriterFlock } from './writerFlock'
 import { bootstrapMacNativeRuntime } from './macNativeRuntime'
+import { bootstrapPersonalDesktopRuntime } from './personalDesktopRuntime'
+import type { NativeBrowserSession } from './nativeBrowserSession'
+
+/** A browser lifetime the runtime owns over pipes (installed service or personal desktop). */
+interface NativeRuntime {
+    session: NativeBrowserSession
+    close(): Promise<void>
+    /** Personal desktop: sockets in the user's directory instead of the config's. */
+    sockets?: { broker: string; admin: string }
+    onParentLost?(listener: () => void): void
+}
 
 /** Keep admission units and their last-safe fallbacks independent of space preferences. */
 export function createProfileResourceQuota(options: {
@@ -306,7 +317,9 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     const stateDir = requiredEnv('ABP_STATE_DIR')
     const config = process.env.ABP_CONFIG_FILE ? loadRuntimeConfig(process.env.ABP_CONFIG_FILE) : undefined
     const production = config?.authMode === 'production'
-    const native = config?.nativeService ? await bootstrapMacNativeRuntime(config, stateDir) : undefined
+    const native: NativeRuntime | undefined = config?.nativeService ? await bootstrapMacNativeRuntime(config, stateDir)
+        : config?.personalDesktop ? await bootstrapPersonalDesktopRuntime(config, stateDir) : undefined
+    const nativeSockets = native?.sockets
     // Secrets the runtime UID may not be able to read are read before dropping root.
     const vncPassword = loadVncPassword()
     const harnessKeys = process.env.ABP_KEYS_FILE ? loadKeys(process.env.ABP_KEYS_FILE, config ? ['agentKey'] : undefined) : undefined
@@ -546,7 +559,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     let broker: Broker | undefined
     if (config && (config.daemonTokenSha256 || native)) {
         broker = await startBroker({
-            socketPath: config.brokerSocketPath, socketGid: config.brokerSocketGid, server: boundBroker, stateDir,
+            socketPath: nativeSockets?.broker ?? config.brokerSocketPath, socketGid: config.brokerSocketGid, server: boundBroker, stateDir,
             ...(native ? { nativeAuthorization: true as const } : { daemonTokenSha256: config.daemonTokenSha256 }),
             orphanTtlMs: config.brokerOrphanTtlMs,
             identity: { machineId: config.machineId, workspaceId: config.workspaceId },
@@ -623,7 +636,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     const admin: AdminServer = await startAdminServer({
         runtime, drivers,
         listen: boundAdmin ? { server: boundAdmin }
-            : adminOnSocket || !harnessKeys?.adminToken ? { socketPath: config?.adminSocketPath ?? '/run/abp/admin.sock' }
+            : adminOnSocket || !harnessKeys?.adminToken ? { socketPath: nativeSockets?.admin ?? config?.adminSocketPath ?? '/run/abp/admin.sock' }
                 : { host, port: adminPort, adminToken: harnessKeys.adminToken },
         metrics: () => collectRuntimeMetrics({ store, drivers, stateDir, fenceAcksMs }),
         // Viewers of the capability stop synchronously, before the revocation is persisted (D2).
@@ -676,4 +689,6 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     }
     process.once('SIGTERM', () => void shutdown())
     process.once('SIGINT', () => void shutdown())
+    // A personal runtime belongs to the daemon that started it.
+    native?.onParentLost?.(() => { log('parent ended; shutting down'); void shutdown() })
 }
