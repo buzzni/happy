@@ -21,6 +21,13 @@ on:
     push:
         tags:
             - 'happy-cli-v*'
+    # Builds and checks the browser host addons before a release depends on them; never publishes.
+    pull_request:
+        paths:
+            - 'packages/happy-cli/native/browserHost.c'
+            - 'packages/happy-cli/scripts/build-browser-host.cjs'
+            - 'packages/happy-cli/scripts/windows-browser-native.check.cjs'
+            - '.github/workflows/publish-happy-cli.yml'
     workflow_dispatch:
         inputs:
             version:
@@ -35,7 +42,7 @@ jobs:
     # The personal desktop AI browser's Node-API addon (packages/happy-cli/native/browserHost.c) for the
     # platforms Desktop ships. Never committed: built here from the tagged source, checked, then packed.
     browser-host:
-        if: github.event_name == 'push'
+        if: github.event_name != 'workflow_dispatch'
         strategy:
             fail-fast: true
             matrix:
