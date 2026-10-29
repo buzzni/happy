@@ -71,4 +71,7 @@ it('requires explicit provider token revocation before permanently excluding an 
  expect(isClaudeRevokedTokenFailure({ is_error: true, result: 'Failed to authenticate: OAuth session expired and could not be refreshed' })).toBe(false);
  expect(isClaudeRevokedTokenFailure({ is_error: true, result: 'API Error: 401 token expired' })).toBe(false);
  expect(isClaudeRevokedTokenFailure({ is_error: false, result: 'Failed to authenticate: OAuth token revoked.' })).toBe(false);
+ // Saycode specs/org-auth-failure-account-switch — the wording a member actually saw (2026-10-29).
+ expect(isClaudeRevokedTokenFailure({ type: 'assistant', error: 'authentication_failed', message: { content: [{ type: 'text', text: 'Failed to authenticate. API Error: 401 OAuth access token has been revoked.' }] } })).toBe(true);
+ expect(isClaudeRevokedTokenFailure({ is_error: true, result: 'Failed to authenticate. API Error: 401 OAuth access token is invalid.' })).toBe(false);
 });
