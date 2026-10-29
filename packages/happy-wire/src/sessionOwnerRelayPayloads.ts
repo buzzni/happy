@@ -7,6 +7,8 @@ export const relayCount = z.number().int().nonnegative().max(Number.MAX_SAFE_INT
 // IDs a relay carries from existing records (messages, permissions, activity, runtime) keep their producers'
 // unrestricted string contract; ownershipId is only for IDs this protocol mints (H1-R-02).
 export const persistedId = z.string().min(1);
+// Observed times as the producers keep them: positive finite, fractional allowed (H1-R-10).
+const observedTime = z.number().finite().positive();
 export const relayLocalId = z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/);
 const text = z.string();
 // Existing sessionConnection permission input and PendingPermissionRequest.arguments are dynamic
@@ -40,14 +42,14 @@ const policy = z.object({ reasonCode: text, ruleId: text, humanOnly: z.boolean()
 }).strict();
 // requestId is an observation and may be the producer's '' map key; replying still needs a non-empty permissionId (H1-R-09).
 export const OwnerRelayPendingPermissionSchema = z.object({ requestId: text, toolName: text, title: text,
-    arguments: toolData, createdAt: relayCount.optional(), expiresAt: relayCount.optional(),
+    arguments: toolData, createdAt: observedTime.optional(), expiresAt: observedTime.optional(),
     kind: z.enum(['ask-user-question', 'exit-plan-mode', 'project-scope', 'generic']), policy: policy.optional(),
 }).strict();
 // Existing Desktop AgentActivity, with no invented idle/completion meaning for observation gaps.
 const activity = z.object({ state: z.enum(['known', 'none', 'unknown']), title: text.nullable(),
     inProgress: z.array(text), text: text.nullable(), source: z.enum(['TodoWrite', 'plan']).nullable(),
     sourceMessageId: persistedId.nullable(), sourceSeq: relayCount.nullable(), reason: text.nullable(),
-    observedAt: relayCount.nullable(),
+    observedAt: observedTime.nullable(),
 }).strict();
 export const OwnerRelaySnapshotSchema = z.object({ active: z.boolean().nullable(), thinking: z.boolean().nullable(),
     runtimeId: persistedId.nullable().optional(), machineId: text.nullable().optional(), // '' is the session list's "not observed" (H1-R-06)
@@ -57,8 +59,9 @@ export const OwnerRelaySnapshotSchema = z.object({ active: z.boolean().nullable(
 // Validate the existing message union, but preserve legacy/event extension data for signing and
 // transcript fidelity. A normal parse would silently strip fields belonging to existing producers.
 const content = z.custom<MessageContent>(value => MessageContentSchema.safeParse(value).success);
-export const OwnerRelayReadEventSchema = z.object({ id: SessionMessageSchema.shape.id, seq: relayCount, localId: SessionMessageSchema.shape.localId,
-    content, createdAt: relayCount, updatedAt: relayCount,
+const envelope = SessionMessageSchema.shape;
+export const OwnerRelayReadEventSchema = z.object({ id: envelope.id, seq: envelope.seq, localId: envelope.localId,
+    content, createdAt: envelope.createdAt, updatedAt: envelope.updatedAt,
 }).strict();
 // Mirrors daemon/ownedSpawnRuntime.ts's supported options; no arbitrary argv, executable or RPC.
 // Environment is still subject to daemon/sessionEnv.ts admission at execution, never authority.

@@ -239,6 +239,29 @@ describe('H1-R-01 persisted message localId compatibility', () => {
         const permission = vectorFor('reply-own-permission');
         expect(OwnerRelayRequestSchema.safeParse({ ...permission.request, payload: { ...permission.request.payload, permissionId: '' } }).success).toBe(false);
     });
+    // H1-R-10: observed times keep the producers' positive finite numbers (pendingPermission.timestampValue, agentActivity).
+    it('read snapshot carries fractional observed times from the existing producers', async () => {
+        const { request, reply } = await pair(1);
+        if (reply.result !== 'allowed' || reply.operation !== 'read-session') throw new Error('Expected read fixture');
+        const snapshot = { ...reply.sessionView.snapshot,
+            pendingPermissionRequests: [{ ...reply.sessionView.snapshot.pendingPermissionRequests![0]!, createdAt: 1.5, expiresAt: 2.5 }],
+            activity: { state: 'known' as const, title: 't', inProgress: [], text: null, source: 'plan' as const, sourceMessageId: 'm', sourceSeq: 1, reason: null, observedAt: 1.25 } };
+        const signed = signOwnerRelayReply({ ...reply, sessionView: { ...reply.sessionView, snapshot } }, desktop.secretKey);
+        const decoded = decodeOwnerRelayReply(encodeOwnerRelayReply(signed));
+        expect(decoded).toEqual(signed);
+        expect(await verifyOwnerRelayReply(decoded, request, fixture.personalContact, now)).toBe(true);
+        for (const bad of [0, -1, Number.NaN]) expect(OwnerRelayReplySchema.safeParse({ ...reply, sessionView: { ...reply.sessionView,
+            snapshot: { ...snapshot, pendingPermissionRequests: [{ ...snapshot.pendingPermissionRequests[0]!, createdAt: bad }] } } }).success).toBe(false);
+    });
+    // The read event as a whole is the existing SessionMessage envelope: its numbers keep that schema too.
+    it('read event keeps the existing envelope numbers', async () => {
+        const { request, reply } = await pair(1);
+        if (reply.result !== 'allowed' || reply.operation !== 'read-session') throw new Error('Expected read fixture');
+        const stored = SessionMessageSchema.parse({ id: 'm', seq: 0, createdAt: 1.5, updatedAt: 2.5, content: { t: 'encrypted', c: 'x' } });
+        const event = { ...stored, content: { role: 'user', content: { type: 'text', text: 't' } } };
+        const signed = signOwnerRelayReply({ ...reply, sessionView: { ...reply.sessionView, events: [event] } }, desktop.secretKey);
+        expect(await verifyOwnerRelayReply(decodeOwnerRelayReply(encodeOwnerRelayReply(signed)), request, fixture.personalContact, now)).toBe(true);
+    });
     it.each(['기존 메시지', 'existing message', 'x'.repeat(129)])('keeps prompt and storage ID restrictions for %s', localId => {
         expect(OwnerRelayRequestSchema.safeParse({ ...fixture.vectors[2].request, localId }).success).toBe(false);
         const reply = fixture.vectors[2].reply;

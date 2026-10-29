@@ -177,3 +177,11 @@ pending permission `requestId`, activity `sourceMessageId`, snapshot `runtimeId`
 - H1-R-09: read snapshot의 pending permission `requestId`는 관측값이다. 그래서 기존 Desktop 생산자가 줄 수 있는
   빈 map key(`''`)도 그대로 운반한다. 그 permission을 대상으로 하는 `reply-own-permission`의 `permissionId`는
   실행 입력이라 여전히 비어 있지 않아야 한다.
+
+## H1-R-10 교차 리뷰 반영과 read projection 전수 대조 (2026-10-30)
+
+- H1-R-10: pending permission `createdAt`·`expiresAt`, activity `observedAt`는 생산자(`pendingPermission.ts`
+  `timestampValue`, `agentActivity.ts`)처럼 양의 유한 숫자(소수 허용)를 받는다.
+- 같은 부류가 반복되어 지휘 세션이 read projection을 Desktop 생산자 타입과 직접 대조했다. read 이벤트는
+  `SessionMessageSchema`의 `id`·`seq`·`localId`·`createdAt`·`updatedAt`을 그대로 쓴다. pending permission의 `kind` 열거,
+  `policy`(`PermissionPolicyMeta`), activity의 나머지 필드(`sourceSeq`는 메시지 seq 정수)는 생산자 타입과 일치한다.
