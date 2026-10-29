@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { ResourceQuota, type BrowserResources } from './resourceQuota'
+import { ResourceQuota, resourceAdmissionLimit, type BrowserResources } from './resourceQuota'
 const MiB = 1024 * 1024
 const sample = (patch: Partial<BrowserResources> = {}): BrowserResources => ({ version: 1,
     hostAvailableBytes: 12 * 1024 * MiB, memoryLimitBytes: 8 * 1024 * MiB, memoryUsedBytes: 512 * MiB,
@@ -51,5 +51,27 @@ it('does not grow during measured CPU saturation and recovers gradually', () => 
  q.observe(sample({cpuUsageUsec:40_000_000}),10_000,3)
  expect(q.read(10_000,3,0)).toMatchObject({limit:3,reason:'resource-pressure'})
  q.observe(sample({cpuUsageUsec:41_000_000}),20_000,3)
- expect(q.read(20_000,3,0).limit).toBe(6)
+ expect(q.read(20_000,3,0).limit).toBe(5)
+})
+
+it('grows across timer jitter rather than resetting below the sampling interval', () => {
+ const q=new ResourceQuota(4)
+ for(const time of [0,10_100,20_050,30_100,40_050,50_100])q.observe(sample(),time)
+ expect(q.read(50_100,0,0).limit).toBeGreaterThan(6)
+})
+it('never raises a pressure-lowered limit on invalid or stale telemetry', () => {
+ for(const missing of [false,true]){
+  const q=new ResourceQuota(4);q.observe(sample({hostAvailableBytes:0}),0)
+  expect(q.read(0,0,0).limit).toBe(0)
+  if(missing)q.observe(null,10_000)
+  expect(q.read(40_000,0,0)).toMatchObject({limit:0,reason:'measurement-unavailable',sampledAtMs:0})
+ }
+})
+
+it('uses legacy fixed limits only before any supported resource sample', () => {
+ const q=new ResourceQuota(4)
+ expect(resourceAdmissionLimit(q.read(0,0,0),6)).toBe(6)
+ q.observe(sample({hostAvailableBytes:0}),0)
+ q.observe(null,10_000)
+ expect(resourceAdmissionLimit(q.read(40_000,0,0),6)).toBe(0)
 })

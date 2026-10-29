@@ -35,23 +35,33 @@ function valid(value: unknown): value is BrowserResources {
 export class ResourceQuota {
     private sample?: BrowserResources
     private sampledAt?: number
+    private growthAt?: number
+    private lastSafeLimit?: number
     private growth: number
     private cpuBusy = false
     private sampledWindows = 0
     constructor(private readonly fallback: number) { this.growth = fallback }
     observe(value: unknown, now: number, windows = 0): void {
-        if (!valid(value)) { this.sample = undefined; this.sampledAt = undefined; this.growth = this.fallback; this.cpuBusy = false; return }
+        if (!valid(value)) { this.sample = undefined; this.growthAt = undefined; this.growth = Math.min(this.fallback, this.lastSafeLimit ?? this.fallback); this.cpuBusy = false; return }
         const elapsed = this.sampledAt === undefined ? 0 : now - this.sampledAt
         this.cpuBusy = Boolean(this.sample?.cpuUsageUsec !== undefined && value.cpuUsageUsec !== undefined && elapsed > 0
             && (value.cpuUsageUsec - this.sample.cpuUsageUsec) / (elapsed * 1000 * value.cpuLimit) >= 0.9)
-        this.growth = this.sample && elapsed >= INTERVAL_MS && elapsed <= STALE_MS && !this.cpuBusy
-            ? Math.min(RESOURCE_QUOTA_CEILING, this.growth + 2) : this.fallback
+        const continuous = this.sample && elapsed >= 0 && elapsed <= STALE_MS
+            && !(this.sample.cpuUsageUsec !== undefined && value.cpuUsageUsec !== undefined && value.cpuUsageUsec < this.sample.cpuUsageUsec)
+        if (!continuous || this.cpuBusy) {
+            this.growth = Math.min(this.fallback, this.lastSafeLimit ?? this.fallback)
+            this.growthAt = now
+        } else if (now - (this.growthAt ?? now) >= INTERVAL_MS) {
+            this.growth = Math.min(RESOURCE_QUOTA_CEILING, this.growth + 2)
+            this.growthAt = now
+        }
         this.sample = value; this.sampledAt = now; this.sampledWindows = windows
+        this.growth = Math.min(this.growth, this.read(now, windows, 0).limit)
     }
     /** otherReservations includes other profiles' allocated/empty spaces, conservatively reserved again. */
     read(now: number, windows: number, otherReservations: number): QuotaReading {
         if (!this.sample || this.sampledAt === undefined || now < this.sampledAt || now - this.sampledAt > STALE_MS)
-            return { limit: this.fallback, mode: 'automatic', reason: 'measurement-unavailable' }
+            return { limit: Math.min(this.fallback, this.lastSafeLimit ?? this.fallback), mode: 'automatic', reason: 'measurement-unavailable', ...(this.sampledAt !== undefined ? { sampledAtMs: this.sampledAt } : {}) }
         const r = this.sample
         const headroom = Math.max(0, Math.min(
             Math.floor((r.memoryLimitBytes - r.memoryUsedBytes - BROWSER_RESERVE) / WINDOW_BYTES),
@@ -61,10 +71,17 @@ export class ResourceQuota {
         const bound = Math.max(0, Math.min(RESOURCE_QUOTA_CEILING,
             Math.floor((r.memoryLimitBytes - BROWSER_RESERVE) / WINDOW_BYTES), Math.floor(r.cpuLimit * 4),
             Math.min(windows, this.sampledWindows) + (this.cpuBusy ? 0 : headroom)))
-        return { limit: Math.min(this.growth, bound), mode: 'automatic', sampledAtMs: this.sampledAt,
+        const limit = Math.min(this.growth, bound)
+        this.lastSafeLimit = limit
+        return { limit, mode: 'automatic', sampledAtMs: this.sampledAt,
             reason: this.cpuBusy || headroom === 0 ? 'resource-pressure' : this.growth < bound ? 'stabilizing' : 'resources-available' }
     }
 }
 
 /** Preferences survive restart but never profile reassignment. A profile is shared across its owner's organizations. */
 export const quotaPreferenceKey = (profileId: string, principalId: string, assignmentId?: string): string => JSON.stringify([profileId, principalId, assignmentId ?? ''])
+
+/** Legacy images keep fixed limits; telemetry loss after pressure must not reopen admission. */
+export function resourceAdmissionLimit(reading: QuotaReading | undefined, fixed: number): number {
+    return !reading || (reading.reason === 'measurement-unavailable' && reading.sampledAtMs === undefined) ? fixed : reading.limit
+}

@@ -8,7 +8,7 @@ Agents cannot change quota preferences. Existing capabilities and fixed-config i
 instance endpoint exposes `/resources` from **Chromium's own cgroup v2**, not the runtime cgroup.
 No Docker socket, host mount or new privilege is required. Old images and unsupported controllers
 fail closed to installed fixed limits. Sampling runs every 10 seconds with a 2-second timeout;
-readings older than 30 seconds cannot justify growth.
+readings older than 30 seconds cannot justify growth. After a valid sample, measurement loss retains the lower of the last safe limit and the installed limit; it never lifts a pressure restriction. Timer jitter does not reset accumulated stable observation time.
 
 The admission ceiling is 16. Each additional window reserves 256 MiB, with 256 MiB retained in the
 browser and 2 GiB on the host. Memory, CPU allocation (four windows per core), measured CPU usage

@@ -1,4 +1,4 @@
-import { ResourceQuota, quotaPreferenceKey } from './resourceQuota'
+import { ResourceQuota, quotaPreferenceKey, resourceAdmissionLimit } from './resourceQuota'
 /**
  * Browser Runtime process (Agent Browser); `runtimeMain.ts` is the entry that runs it.
  *
@@ -363,7 +363,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
         quotaTimer.unref()
     }
     for (const profile of profiles) {
-        drivers.set(profile.profileId, new CdpDriver({ browserWsUrl: '', browserInstanceIdProvider: instanceIdProvider(profile), maxAgentWindows: windows, ...(config?.adaptiveSpaceQuota ? { windowLimit: () => { const q = resourceQuota(profile.profileId); return q.reason === 'measurement-unavailable' ? windows : q.limit } } : {}) }))
+        drivers.set(profile.profileId, new CdpDriver({ browserWsUrl: '', browserInstanceIdProvider: instanceIdProvider(profile), maxAgentWindows: windows, ...(config?.adaptiveSpaceQuota ? { windowLimit: () => resourceAdmissionLimit(resourceQuota(profile.profileId), windows) } : {}) }))
     }
     // Connect before recovery so it can compare browser instance ids.
     const { pending: connecting } = await connectAtStart(profiles.map((profile) => ({ profileId: profile.profileId, connect: () => connectWithRetry(drivers.get(profile.profileId)!, profile, log) })),

@@ -7,7 +7,7 @@ import { BrowserRuntimeError, POC_LIMITS, SCHEMA_VERSION, TERMINAL_STATUSES, typ
                 type TabId, type ApprovalId,
                 type DispatchExpectation, type ElementDescription, type ElementRef, type Observation, type ScreenshotResult, type SubscribeResult } from './contracts'
 import { assertOperation } from './auth'
-import { quotaPreferenceKey, type QuotaReading } from './resourceQuota'
+import { quotaPreferenceKey, resourceAdmissionLimit, type QuotaReading } from './resourceQuota'
 import { approvalPayloadHash, createApproval } from './approvals'
 import { dispatchStep } from './batchWorker'
 import { systemClock, type RuntimeClock } from './clock'
@@ -357,7 +357,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const driver = this.driver(task.profileId)
         const totalTabs = this.options.store.listSpaces(task.profileId).reduce((sum, item) => sum + item.tabs.length, 0)
         const admission = this.options.resourceQuota?.(task.profileId)
-        if (totalTabs >= (admission && admission.reason !== 'measurement-unavailable' ? admission.limit : POC_LIMITS.maxActiveTabs))
+        if (totalTabs >= resourceAdmissionLimit(admission, POC_LIMITS.maxActiveTabs))
             throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Profile has reached its active tab limit', true, false, 'tabs')
         const actionId = `action-${randomUUID()}` as ActionId
         const reservation = this.allocateTabId()
