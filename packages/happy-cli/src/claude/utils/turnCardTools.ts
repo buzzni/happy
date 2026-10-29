@@ -9,6 +9,12 @@
  * app, a Slack channel, an initial prompt — it refuses, so the model puts its recap and question
  * in its closing message where every client shows it.
  *
+ * `archive_conversation` (Saycode specs/chat-agent-self-archive) rides the same per-turn switch:
+ * the user asked in chat to archive this conversation, and the client that sent the turn archives
+ * it once the turn has ended. Archiving stops this process, so the tool only records the request.
+ * It follows its own capability (`saycodePromptBlocks.archiveRequest`), not the card's: the card
+ * sits under the Saycode instructions switch, archiving by request must not.
+ *
  * Runners: Claude and Codex wire the per-turn switch. Any other runner (ACP: Gemini, OpenCode, …)
  * is outside this feature; the tool still answers, with a refusal. The task list is not a tool
  * here: Claude Code's TodoWrite and Codex's built-in `update_plan` already keep it, and Codex's
@@ -27,19 +33,26 @@ import { logger } from '@/ui/logger';
 
 export type TurnCardRunner = 'claude' | 'codex';
 
-/** Whether the turn now running came from a client that draws the card. */
-export type TurnCards = { runner: TurnCardRunner; drawn: () => boolean };
+/** Whether the turn now running came from a client that draws the card / archives on request. */
+export type TurnCards = { runner: TurnCardRunner; drawn: () => boolean; archives: () => boolean };
 
 /** The per-turn switch a runner flips when it starts a turn with that turn's prompt blocks. */
-export type TurnCardSwitch = TurnCards & { set: (drawn: boolean) => void };
+export type TurnCardSwitch = TurnCards & { set: (drawn: boolean) => void; setArchives: (archives: boolean) => void };
 
 export function createTurnCardSwitch(runner: TurnCardRunner): TurnCardSwitch {
     let drawn = false;
-    return { runner, drawn: () => drawn, set: (next) => { drawn = next; } };
+    let archives = false;
+    return {
+        runner,
+        drawn: () => drawn,
+        archives: () => archives,
+        set: (next) => { drawn = next; },
+        setArchives: (next) => { archives = next; },
+    };
 }
 
 /** Tool names (without the `mcp__happy__` prefix) this module registers. */
-export const TURN_CARD_TOOL_NAMES = ['next_steps'] as const;
+export const TURN_CARD_TOOL_NAMES = ['next_steps', 'archive_conversation'] as const;
 
 type ToolReply = { content: Array<{ type: 'text'; text: string }>; isError?: boolean };
 type RunTool = (work: () => Promise<ToolReply>) => Promise<ToolReply>;
@@ -114,5 +127,22 @@ export function registerTurnCardTools(mcp: McpServer, options: {
         return reply(args.question
             ? 'Shown: the card with your recap, question and buttons is under this turn. Write nothing more; the user answers with a button or a message.'
             : 'Shown: the recap is under this turn. If you have more to say, say it now in a short closing message.');
+    }));
+
+    mcp.registerTool('archive_conversation', {
+        title: 'Archive this conversation',
+        description: 'Archive this conversation (move it to Done on the agent board) after your reply ends. Call it only when the user explicitly asked in this turn to archive, close or finish this conversation. The app archives it after your turn; the user can undo. If it is refused, tell the user to archive it from the app instead.',
+        inputSchema: {},
+    }, async () => runTool(async () => {
+        if (!turnCards?.archives()) {
+            return reply('ARCHIVE_UNSUPPORTED: the app this turn came from does not archive on request. Tell the user to archive the conversation from the app.', true);
+        }
+        try {
+            client.sendSessionProtocolMessage(createEnvelope('agent', { t: 'archive-request' }));
+        } catch (error) {
+            logger.debug(`[happyMCP] archive_conversation record failed: ${error instanceof Error ? error.message : String(error)}`);
+            return reply('ARCHIVE_NOT_RECORDED: the request could not be recorded. Tell the user to archive the conversation from the app.', true);
+        }
+        return reply('Requested: the app archives this conversation after your reply ends, and the user can undo it. Say so in one short sentence; do not say it is already archived.');
     }));
 }

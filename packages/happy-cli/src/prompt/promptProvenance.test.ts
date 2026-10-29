@@ -256,4 +256,13 @@ describe('nextSteps turn-card block', () => {
     expect(withoutTurnScopedBlocks({ axBase: true, nextSteps: true })).toEqual({ axBase: true });
     expect(resolveMessagePromptBlocks({ nextSteps: true }, undefined).turn).toEqual({});
   });
+
+  // specs/chat-agent-self-archive: "the client sending this turn archives on request" is the same kind of key.
+  it('treats archiveRequest as turn-scoped too: it holds for its own message and never becomes standing', () => {
+    const desktop = resolveMessagePromptBlocks({ axBase: false }, { saycodePromptBlocks: { nextSteps: true, archiveRequest: true } });
+    expect(desktop.turn).toEqual({ axBase: false, nextSteps: true, archiveRequest: true });
+    expect(desktop.standing).toEqual({ axBase: false });
+    expect(resolveMessagePromptBlocks(desktop.standing, {}).turn).toEqual({ axBase: false });
+    expect(withoutTurnScopedBlocks({ axBase: true, archiveRequest: true })).toEqual({ axBase: true });
+  });
 });

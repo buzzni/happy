@@ -490,6 +490,8 @@ async function runClaudeRemote(
     const turnCardsDrawn = Boolean(opts.turnCards)
         && isSaycodePromptBlockEnabled('nextSteps', initial.mode.saycodePromptBlocks, initial.mode.saycodeSystemPromptEnabled);
     opts.turnCards?.set(turnCardsDrawn);
+    // A capability of this turn's client, not under the Saycode instructions switch.
+    opts.turnCards?.setArchives(initial.mode.saycodePromptBlocks?.archiveRequest === true);
     const promptOptions = buildClaudeSystemPromptOptions({
         customSystemPrompt: initial.mode.customSystemPrompt,
         appendSystemPrompt: initial.mode.appendSystemPrompt,

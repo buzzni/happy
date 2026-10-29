@@ -2450,6 +2450,8 @@ export async function runCodex(opts: {
                     const checkpointGuidance = await checkpointComposition.agentReader?.guidance();
                     // The same gate buildCodexDeveloperInstructions applies to the guidance below.
                     turnCards.set(isSaycodePromptBlockEnabled('nextSteps', message.mode.saycodePromptBlocks, message.mode.saycodeSystemPromptEnabled));
+                    // A capability of this turn's client, not under the Saycode instructions switch.
+                    turnCards.setArchives(message.mode.saycodePromptBlocks?.archiveRequest === true);
                     const mcpSync = await measure('mcp-sync', () => mcpConfigSynchronizer.sync({
                         threadId: client.threadId,
                         resumeThread: client.threadId

@@ -434,6 +434,9 @@ export const MessageMetaSchema = z.object({
     // (specs/desktop-next-steps-card). Holds for its own message only — see
     // resolveMessagePromptBlocks.
     nextSteps: z.boolean().optional(),
+    // Not a preference either: "the client sending this turn archives the conversation when the
+    // agent asks" (specs/chat-agent-self-archive). Turn-scoped like nextSteps.
+    archiveRequest: z.boolean().optional(),
   }).nullable().optional().catch(undefined),
   allowedTools: z.array(z.string()).nullable().optional(), // Allowed tools for this message (null = reset)
   disallowedTools: z.array(z.string()).nullable().optional(), // Disallowed tools for this message (null = reset)
