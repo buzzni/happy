@@ -440,6 +440,13 @@ export const sessionPlanEventSchema = z.object({
   })).max(PLAN_LIMITS.steps),
 });
 
+// Saycode specs/chat-agent-self-archive — the agent's `archive_conversation` tool asks the
+// client to archive this conversation after the turn. It carries nothing: the client owns
+// when and whether it runs (turn end it saw itself, nobody waiting, user not moved on).
+export const sessionArchiveRequestEventSchema = z.object({
+  t: z.literal('archive-request'),
+});
+
 export const sessionEventSchema = z.discriminatedUnion('t', [
   sessionTextEventSchema,
   sessionServiceMessageEventSchema,
@@ -462,6 +469,7 @@ export const sessionEventSchema = z.discriminatedUnion('t', [
   sessionLessonCandidateEventSchema,
   sessionNextStepsEventSchema,
   sessionPlanEventSchema,
+  sessionArchiveRequestEventSchema,
 ]);
 
 export type SessionEvent = z.infer<typeof sessionEventSchema>;
@@ -495,7 +503,8 @@ export const sessionEnvelopeSchema = z
         path: ['role'],
       });
     }
-    if ((envelope.ev.t === 'start' || envelope.ev.t === 'stop') && envelope.role !== 'agent') {
+    // An archive request from a user-role row would let typed text archive a conversation.
+    if ((envelope.ev.t === 'start' || envelope.ev.t === 'stop' || envelope.ev.t === 'archive-request') && envelope.role !== 'agent') {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: `${envelope.ev.t} events must use role "agent"`,

@@ -146,6 +146,55 @@ describe('next_steps on a turn whose client does not draw the card', () => {
     });
 });
 
+// specs/chat-agent-self-archive (Saycode Desktop): the user asked in chat to archive this conversation.
+describe('archive_conversation tool', () => {
+    it('records an archive request the client runs after the turn, only when this turn\'s client archives on request', async () => {
+        const client = fakeClient();
+        const cards = createTurnCardSwitch('claude');
+        const server = await startHappyServer(client, { turnCards: cards });
+        try {
+            const refused = await callTool(server, 'archive_conversation', {});
+            expect(refused.result.isError).toBe(true);
+            expect(refused.result.content[0].text).toMatch(/^ARCHIVE_UNSUPPORTED: /);
+            expect(client.sendSessionProtocolMessage).not.toHaveBeenCalled();
+
+            cards.setArchives(true);
+            const reply = await callTool(server, 'archive_conversation', {});
+            expect(reply.result.isError).toBeFalsy();
+            expect(reply.result.content[0].text).toMatch(/after your reply ends/);
+            expect(client.sendSessionProtocolMessage).toHaveBeenCalledTimes(1);
+            const envelope = client.sendSessionProtocolMessage.mock.calls[0][0];
+            expect(sessionEnvelopeSchema.safeParse(envelope).success).toBe(true);
+            expect(envelope.role).toBe('agent');
+            expect(envelope.ev).toEqual({ t: 'archive-request' });
+        } finally { server.stop(); }
+    });
+
+    // The card follows the Saycode instructions switch; archiving must not, or a user who turned
+    // those instructions off could never archive by asking.
+    it('does not depend on whether the turn draws the next-steps card', async () => {
+        const client = fakeClient();
+        const cards = drawnTurn('codex');
+        const server = await startHappyServer(client, { turnCards: cards });
+        try {
+            expect((await callTool(server, 'archive_conversation', {})).result.isError).toBe(true);
+            cards.set(false);
+            cards.setArchives(true);
+            expect((await callTool(server, 'archive_conversation', {})).result.isError).toBeFalsy();
+        } finally { server.stop(); }
+    });
+
+    it('is offered to both runners', async () => {
+        for (const runner of ['claude', 'codex'] as const) {
+            const server = await startHappyServer(fakeClient(), { turnCards: drawnTurn(runner) });
+            try {
+                expect(server.toolNames).toContain('archive_conversation');
+                expect(await listNames(server)).toContain('archive_conversation');
+            } finally { server.stop(); }
+        }
+    });
+});
+
 describe('next_steps description', () => {
     it('defers when to call to the per-turn guidance instead of asking for a call every turn', async () => {
         const server = await startHappyServer(fakeClient(), { turnCards: drawnTurn('claude') });

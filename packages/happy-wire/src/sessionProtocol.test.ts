@@ -328,6 +328,14 @@ describe('session protocol schemas', () => {
     expect(sessionEventSchema.safeParse({ t: 'next-steps', summary: '', actions: [] }).success).toBe(false);
   });
 
+  it('accepts an archive request only from the agent', () => {
+    const ev = { t: 'archive-request' };
+    const parsed = sessionEnvelopeSchema.safeParse({ id: 'a', time: 1, role: 'agent', ev });
+    expect(parsed.success && parsed.data.ev).toEqual(ev);
+    expect(sessionEnvelopeSchema.safeParse({ id: 'u', time: 1, role: 'user', ev }).success).toBe(false);
+    expect(sessionEnvelopeSchema.safeParse({ id: 's', time: 1, role: 'session', ev }).success).toBe(false);
+  });
+
   it('accepts a plan update with step statuses', () => {
     const ev = { t: 'plan', steps: [{ text: 'Write the failing test', status: 'completed' }, { text: 'Fix the parser', status: 'in_progress' }] };
     const parsed = sessionEnvelopeSchema.safeParse({ id: 'a', time: 1, role: 'agent', ev });

@@ -159,8 +159,9 @@ export async function loop(opts: LoopOptions): Promise<number> {
         if (opts.scopeProcessSandbox && mode !== 'remote') throw new Error('Scope approval supports Claude remote mode only');
         switch (mode) {
             case 'local': {
-                // The terminal draws no card.
+                // The terminal draws no card and archives nothing.
                 opts.turnCards?.set(false);
+                opts.turnCards?.setArchives(false);
                 const result = await claudeLocalLauncher(session, {
                     saycodeSystemPromptEnabled: opts.getSaycodeSystemPromptEnabled(),
                     saycodePromptBlocks: opts.getSaycodePromptBlocks(),

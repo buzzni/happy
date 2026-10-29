@@ -102,7 +102,14 @@ export type SaycodePromptBlockName =
   | 'axBase'
   | 'nextSteps';
 
-export type SaycodePromptBlockOverrides = Partial<Record<SaycodePromptBlockName, boolean>>;
+/**
+ * `archiveRequest` is a client capability with no prompt block of its own: "the client sending
+ * this turn archives the conversation when the agent asks" (Saycode specs/chat-agent-self-archive).
+ * It rides here so it reaches the runners turn by turn exactly like `nextSteps`.
+ */
+export type SaycodePromptBlockOverrides = Partial<Record<SaycodePromptBlockName, boolean>> & { archiveRequest?: boolean };
+
+const TURN_SCOPED_KEYS = ['nextSteps', 'archiveRequest'] as const;
 
 /**
  * Ties each toggle to its entry in {@link PROMPT_BLOCK_PROVENANCE}. Without this link
@@ -159,8 +166,10 @@ export function resolveMessagePromptBlocks(
   meta: { saycodePromptBlocks?: SaycodePromptBlockOverrides | null } | undefined,
 ): { standing: SaycodePromptBlockOverrides | undefined; turn: SaycodePromptBlockOverrides | undefined } {
   const standing = standingPromptBlocks(current, meta);
-  const turnCards = meta?.saycodePromptBlocks?.nextSteps === true;
-  return { standing, turn: turnCards ? { ...standing, nextSteps: true } : standing };
+  const incoming = meta?.saycodePromptBlocks;
+  const turnScoped = TURN_SCOPED_KEYS.filter((key) => incoming?.[key] === true);
+  if (turnScoped.length === 0) return { standing, turn: standing };
+  return { standing, turn: { ...standing, ...Object.fromEntries(turnScoped.map((key) => [key, true])) } };
 }
 
 function standingPromptBlocks(
@@ -172,15 +181,15 @@ function standingPromptBlocks(
   const incoming = meta.saycodePromptBlocks;
   if (!incoming) return undefined;
   const keys = Object.keys(incoming);
-  if (keys.length > 0 && keys.every((key) => key === 'nextSteps')) return kept;
+  if (keys.length > 0 && keys.every((key) => (TURN_SCOPED_KEYS as readonly string[]).includes(key))) return kept;
   return withoutTurnScopedBlocks(incoming);
 }
 
-/** Drops `nextSteps` from a standing value (an initial env value or a pre-split cache). */
+/** Drops the turn-scoped keys from a standing value (an initial env value or a pre-split cache). */
 export function withoutTurnScopedBlocks(
   blocks: SaycodePromptBlockOverrides | undefined,
 ): SaycodePromptBlockOverrides | undefined {
-  if (!blocks || !('nextSteps' in blocks)) return blocks;
-  const { nextSteps: _turnScoped, ...rest } = blocks;
+  if (!blocks || !TURN_SCOPED_KEYS.some((key) => key in blocks)) return blocks;
+  const { nextSteps: _card, archiveRequest: _archive, ...rest } = blocks;
   return rest;
 }
