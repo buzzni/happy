@@ -31,8 +31,9 @@ function harness(options: { enabled?: boolean; daemonEnabled?: boolean; depth?: 
     let pid = 42, alive = true, sessionLive = true;
     const issued: unknown[] = [], lookups: Array<{ url: string; body: unknown; auth: string | null }> = [], sends: unknown[] = [];
     let contact: OwnershipRelayContact | null = null;
+    let identity: { machineId: string; happyAccountId: string; epoch: string } | null = { machineId: 'machine', happyAccountId: 'account', epoch: 'e1' };
     const launches = createAgentCallerLaunches({ enabled: options.daemonEnabled ?? true,
-        identity: async () => ({ machineId: 'machine', happyAccountId: 'account', epoch: 'e1' }),
+        identity: async () => identity,
         trust: () => ({ issuer: fixture.contact.issuer, audience: fixture.contact.audience,
             publicKeys: { [fixture.contact.keyId]: b64(server.publicKey) }, lookupOrigin: 'https://studio.example' }),
         trackedByPid: hostPid => hostPid === pid ? { startedBy: 'daemon', pid, directory: '/project', happySessionId: 'source' } as TrackedSession : undefined,
@@ -43,7 +44,7 @@ function harness(options: { enabled?: boolean; daemonEnabled?: boolean; depth?: 
         return options.depth ? { ...reply, caller: { ...reply.caller, depth: Number(options.depth) } } : reply;
     };
     const current = async (caller: { sessionId: string; callerBindingId: string }) =>
-        launches.current({ sessionId: caller.sessionId, callerBindingId: caller.callerBindingId }).current;
+        (await launches.current({ sessionId: caller.sessionId, callerBindingId: caller.callerBindingId })).current;
     const register = (caller: { callerBindingId: string; runtimeId: string; hostEpoch: string; callerPublicKey: string; scope: string; depth: number }) => {
         contact = signOwnership({ ...fixture.contact, hubId: 'source', sourceRuntimeId: caller.runtimeId, callerBindingId: caller.callerBindingId,
             hostEpoch: caller.hostEpoch, callerPublicKey: caller.callerPublicKey, machineId: 'machine', happyAccountId: 'account',
@@ -64,7 +65,8 @@ function harness(options: { enabled?: boolean; daemonEnabled?: boolean; depth?: 
         capability: await launchCapability(launches, pid) ?? '', current,
         issue: async report => { issued.push(report); return issue(report); }, token: async () => 'happy-token', fetch: fetcher, now: () => now });
     return { start, launches, issue, current, register, issued, lookups, sends, session, fetcher, contact: () => contact!, pid: () => pid,
-        resume: (next: number) => { pid = next; }, stopSession: () => { sessionLive = false; }, exit: () => { alive = false; } };
+        resume: (next: number) => { pid = next; }, stopSession: () => { sessionLive = false; }, exit: () => { alive = false; },
+        setIdentity: (next: typeof identity) => { identity = next; } };
 }
 describe('host owner-contact bootstrap', () => {
     it('is default off: no key, daemon report, lookup or env change', async () => {
@@ -130,6 +132,33 @@ describe('host owner-contact bootstrap', () => {
         await expect(host.contact.call(request)).rejects.toThrow();
         expect(h.sends).toHaveLength(1);
     });
+    it.each([
+        ['identity loss', null],
+        ['an account switch', { machineId: 'machine', happyAccountId: 'other-account', epoch: 'e1' }],
+        ['a registration epoch change', { machineId: 'machine', happyAccountId: 'account', epoch: 'e2' }],
+        ['a machine change', { machineId: 'other-machine', happyAccountId: 'account', epoch: 'e1' }],
+    ] as const)('stops signing and sending after %s, and the binding stays revoked [H2-R-06]', async (_name, next) => {
+        const h = harness();
+        const host = (await h.start())!;
+        h.register(host.binding);
+        h.setIdentity(next);
+        await expect(host.contact.call(request)).rejects.toThrow();
+        expect(h.sends).toEqual([]);
+        h.setIdentity({ machineId: 'machine', happyAccountId: 'account', epoch: 'e1' });
+        await expect(host.contact.call(request)).rejects.toThrow();
+        expect(h.sends).toEqual([]);
+    });
+    it('discards the reply when the identity changes during the exchange [H2-R-06]', async () => {
+        const h = harness();
+        const host = (await h.start())!;
+        h.register(host.binding);
+        const send = h.session.callOwnerRelay.getMockImplementation()!;
+        h.session.callOwnerRelay.mockImplementationOnce(async (method, relay) => {
+            h.setIdentity({ machineId: 'machine', happyAccountId: 'other-account', epoch: 'e1' }); return send(method, relay);
+        });
+        await expect(host.contact.call(request)).rejects.toThrow();
+        expect(h.sends).toHaveLength(1);
+    });
     it('rejects a stale binding after the session runtime stops', async () => {
         const h = harness();
         const host = (await h.start())!;
@@ -187,6 +216,22 @@ describe('host owner-contact wiring (startHappyServer)', () => {
         expect(started.broker).toEqual({ contact: undefined });
         expect(h.issued).toEqual([]); expect(w.env).toEqual(before);
         await started.close(); expect(w.env).toEqual(before);
+    });
+    it.each([
+        ['no launch capability', { capability: null }],
+        ['a managed session', { managed: true }],
+        ['the switch off', { switchOn: false }],
+    ] as const)('drops an inherited contact address before the broker starts with %s [H2-R-05]', async (_name, options) => {
+        const h = harness(), w = wiring(h, { ...options, broker: true });
+        if ('capability' in options) w.capability.mockResolvedValue(null);
+        w.env.SAYCODE_OWNER_CONTACT_SOCKET = '/parent/contact.sock';
+        const seen: Array<string | undefined> = [];
+        w.startBroker.mockImplementation(async contact => { seen.push(w.env.SAYCODE_OWNER_CONTACT_SOCKET); return { contact }; });
+        const started = await w.start();
+        expect(w.env.SAYCODE_OWNER_CONTACT_SOCKET).toBeUndefined();
+        expect(seen).toEqual([undefined]);
+        expect(w.startBroker).toHaveBeenCalledWith(undefined);
+        await started.close();
     });
     it('hands the contact to the broker without opening a local socket', async () => {
         const h = harness(), w = wiring(h, { broker: true });

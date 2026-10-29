@@ -104,11 +104,11 @@ export async function startHostOwnerContact<Broker>(input: {
     startBroker(contact: SessionOwnerContact | undefined): Promise<Broker | null>;
 }): Promise<{ broker: Broker | null; close(): Promise<void> }> {
     const capability = await input.capability();
+    // An inherited address names another host's contact, so no path may hand it to this host's provider.
+    delete input.env.SAYCODE_OWNER_CONTACT_SOCKET;
     if (input.env[OWNER_CONTACT_SWITCH] !== '1' || input.session.getManagedOrigin() !== null || !capability) {
         return { broker: await input.startBroker(undefined), close: async () => {} };
     }
-    // An inherited address names another host's contact; this host advertises only its own.
-    delete input.env.SAYCODE_OWNER_CONTACT_SOCKET;
     let closed = false;
     const host = await startSessionOwnerContactHost({ enabled: true, session: input.session, hostPid: input.hostPid,
         live: () => !closed, capability, issue: input.issue, current: input.current, token: input.token, fetch: input.fetch });
