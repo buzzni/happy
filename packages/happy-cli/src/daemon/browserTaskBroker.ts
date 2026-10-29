@@ -160,6 +160,8 @@ function writeQueueFileDurably(file: string, data: string): void {
         rmSync(temporary, { force: true })
         throw error
     }
+    // Windows directory handles do not support Node's fsync; file sync and rename still apply.
+    if (process.platform === 'win32') return
     const dirFd = openSync(dir, 'r')
     try { fsyncSync(dirFd) } finally { closeSync(dirFd) }
 }

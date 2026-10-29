@@ -817,7 +817,10 @@ export class TaskStore {
         await rename(temporary, file)
         await this.syncDirectory(dir)
     }
-    private async syncDirectory(dir: string): Promise<void> { const handle = await open(dir, 'r'); try {
+    private async syncDirectory(dir: string): Promise<void> {
+        // Windows directory handles do not support Node's fsync; file sync and rename still apply.
+        if (process.platform === 'win32') return
+        const handle = await open(dir, 'r'); try {
         await handle.sync()
     }
     finally {
