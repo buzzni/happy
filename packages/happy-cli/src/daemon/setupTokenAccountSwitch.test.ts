@@ -497,6 +497,18 @@ describe('shared PC choice through Studio', () => {
     const noOrigin = setup({ studioOrigin: null })
     expect(await noOrigin.switcher.sharedChoose({ companyId: 'org-s', candidates: held, exclude: [], measure: false })).toBeUndefined()
   })
+
+  it('asks a Studio that refuses selectionRequestId again without it, once', async () => {
+    const requests: Array<{ path: string; body: Record<string, unknown> }> = []
+    const refusal = { status: 400, body: { error: 'INVALID_INPUT' } }
+    const { switcher } = setup({ fetch: studio([refusal, { status: 200, body: { version: 1, managedAccountId: B, credentialGeneration: 1 } }], requests) })
+    expect(await switcher.sharedChoose({ companyId: 'org-s', candidates: held, exclude: [A], measure: true })).toBe(B)
+    expect(requests.map(r => 'selectionRequestId' in r.body)).toEqual([true, false])
+    expect(requests[1].body).toEqual({ machineId: 'pc-a', companyId: 'org-s', candidates: held, exclude: [A], measure: true, measured: [] })
+    const stillRefused = setup({ fetch: studio([refusal, refusal], []) })
+    expect(await stillRefused.switcher.sharedChoose({ companyId: 'org-s', candidates: held, exclude: [], measure: false })).toBeUndefined()
+    expect(vi.mocked(stillRefused.deps.fetch)).toHaveBeenCalledTimes(2)
+  })
 })
 
 it('carries authentication failure to rebind with the running binding proof before accepting another token', async () => {
