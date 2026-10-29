@@ -1341,8 +1341,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         return null
                     // The user finished a login or hand-off and nothing runs until the agent resumes (with a new grant,
                     // which resume accepts from here). Keep that record instead of turning it into a new wait.
-                    if (reason === 'grant-expired' && current.status === 'paused' && current.pauseReason === 'user-input-complete'
-                        && !revokedActionIds.length)
+                    if (reason === 'grant-expired' && userReturned(current) && !revokedActionIds.length)
                         return null
                     fenceReason = reason
                     // The grant is no longer live: a write whose input gate is still closed is refused at it.
@@ -2474,8 +2473,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 patch = unresolved.length ? { status: 'paused', pauseReason: 'cancelled-with-unknown-effect',
                     uncertainActions: unresolved, actions } : { status: 'cancelled' }
             }
-            else if (!taskGrant || taskGrant.expiresAtMs <= this.clock.now()
-                || this.options.store.isRevoked(taskGrant.grantId) || revokedSegmentActions.length) {
+            // A wait the user already gave back stays given back when only the grant ended (as in the sweep): the agent
+            // resumes it with a new grant. The browser, pending-write and revoked-segment checks still apply.
+            else if (((!taskGrant || taskGrant.expiresAtMs <= this.clock.now() || this.options.store.isRevoked(taskGrant.grantId))
+                && !userReturned(task)) || revokedSegmentActions.length) {
                 const approvals = task.approvals
                 const awaitingApproval = task.waitReason === 'approval'
                     && Object.values(approvals).some((approval) => approval.state === 'pending')
@@ -3397,6 +3398,11 @@ function handoffLasts(task: Pick<StoredTask, 'status' | 'pauseReason' | 'waitRea
  */
 function scopeHandoff(current: StoredTask, patch: Partial<StoredTask>): Partial<StoredTask> {
     return (patch.handoff ?? current.handoff) && !handoffLasts({ ...current, ...patch }) ? { ...patch, handoff: undefined } : patch
+}
+/** The user gave the page back (released, not resumed yet), also when the connection dropped afterwards. */
+function userReturned(task: StoredTask): boolean {
+    const state = task.status === 'recovering' && wasIdleAtDisconnect(task) ? statusAfterDisconnect(task, false) : task
+    return state.status === 'paused' && state.pauseReason === 'user-input-complete'
 }
 /** A `recovering` task that was not running when its connection dropped (a record without that state: unknown, not idle). */
 function wasIdleAtDisconnect(task: StoredTask): boolean {

@@ -304,6 +304,62 @@ describe('returning a hand-off', () => {
         await h.store.close()
     })
 
+    // Review of #996: a wait the user already gave back stays given back when the Runtime restarts after the grant ended.
+    it.each(['released', 'released, then the connection dropped'] as const)('does not ask the user again for a hand-off they gave back before a restart that found the grant ended (%s)', async (stage) => {
+        const h = await createHarness()
+        await chooserHandoff(h)
+        await userTurn(h, 'turn')
+        if (stage !== 'released') await h.runtime.onDriverDisconnected(h.profileId)
+        await h.runtime.revokeGrant(h.auth.credential.grantId)
+        await h.store.close()
+        const store = await TaskStore.open(h.dir)
+        const runtime = new BrowserRuntime({ store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock, sites: fixtureSitePolicies([origin]) })
+        const view = () => runtime.getTask(h.ui, { taskId: h.task.taskId })
+        const restarted = await view()
+        const fresh = { credential: h.grant('g2', 3_600_000), verifiedAtMs: h.clock.now() }
+        const resumed = await runtime.resume(fresh, { taskId: h.task.taskId, expectedVersion: restarted.stateVersion, requestId: 'restart-resume' as RequestId })
+        // The agent's next write right after its resume with the new grant: the user already gave the page back.
+        const next = await runtime.submitBatch(fresh, { taskId: h.task.taskId, expectedVersion: resumed.stateVersion, requestId: 'restart-next' as RequestId,
+            steps: [{ stepId: 's' as never, actionId: 'restart-next' as never, tabId: h.opened.tabId, kind: 'navigate', url: `${origin}/start?next`, timeoutMs: 1000 }] }, { waitMs: 1000 })
+            .then((accepted) => accepted.result, (error: unknown) => error)
+        expect(next).toMatchObject({ outcome: 'succeeded' })
+        expect(h.driver.dispatchCounts.get('restart-next')).toBe(1)
+        expect(restarted).toMatchObject({ status: 'paused', pauseReason: 'user-input-complete' })
+        expect(resumed).toMatchObject({ status: 'paused', pauseReason: 'awaiting-agent' })
+        await store.close()
+    })
+
+    // ...but only that: a wait not given back, a login whose site condition does not hold, or a replaced browser does
+    // not come back to the agent through a restart that found the grant ended.
+    it.each(['hand-off still waiting', 'login released but not completed', 'hand-off released, browser replaced'] as const)(
+        'keeps refusing the agent after a restart that found the grant ended (%s)', async (stage) => {
+            const h = await createHarness(stage.startsWith('login') ? { url: `${origin}/login` } : {})
+            if (!stage.startsWith('login')) await chooserHandoff(h)
+            if (stage !== 'hand-off still waiting') await userTurn(h, 'turn')
+            if (stage.endsWith('browser replaced')) h.driver.swapInstance()
+            await h.runtime.revokeGrant(h.auth.credential.grantId)
+            await h.store.close()
+            const store = await TaskStore.open(h.dir)
+            const runtime = new BrowserRuntime({ store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock, sites: fixtureSitePolicies([origin]) })
+            const restarted = await runtime.getTask(h.ui, { taskId: h.task.taskId })
+            const fresh = { credential: h.grant('g2', 3_600_000), verifiedAtMs: h.clock.now() }
+            const resumed = await runtime.resume(fresh, { taskId: h.task.taskId, expectedVersion: restarted.stateVersion, requestId: 'restart-resume' as RequestId })
+                .catch((error: unknown) => error)
+            const current = await runtime.getTask(h.ui, { taskId: h.task.taskId })
+            const next = await runtime.submitBatch(fresh, { taskId: h.task.taskId, expectedVersion: current.stateVersion, requestId: 'restart-next' as RequestId,
+                steps: [{ stepId: 's' as never, actionId: 'restart-next' as never, tabId: h.opened.tabId, kind: 'navigate', url: `${origin}/start?next`, timeoutMs: 1000 }] }, { waitMs: 1000 })
+                .then((accepted) => accepted.result, (error: unknown) => error)
+            expect(h.driver.dispatchCounts.get('restart-next') ?? 0).toBe(0)
+            if (stage.endsWith('browser replaced')) {
+                // The tabs went with the browser: nothing to write to, whatever the resume answered.
+                expect(restarted).toMatchObject({ status: 'paused', pauseReason: 'browser-replaced', tabs: [] })
+            } else {
+                expect(next).toMatchObject({ code: 'CONFLICT' })
+                expect(resumed).toMatchObject({ status: 'awaiting-user', waitReason: stage.startsWith('login') ? 'login' : 'handoff' })
+            }
+            await store.close()
+        })
+
     it('ends the hand-off detail when the wait expires, keeping the wait reason as before', async () => {
         const h = await createHarness()
         await chooserHandoff(h)

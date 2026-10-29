@@ -459,7 +459,11 @@ still allowed). Fault-injection hook: `testHooks.guardFailure`.
     (before: `awaiting-agent`, and the agent's next write ran without the user);
   - a task whose connection dropped while it was not running gets back the state it had (`statusAfterDisconnect`)
     also when the Runtime restarts before the reconnect, or a sweep finds it still `recovering` (before: `awaiting-agent`);
-  - a wait lost with a replaced browser is cleared on resume, so a later grant expiry cannot restore it.
+  - a wait lost with a replaced browser is cleared on resume, so a later grant expiry cannot restore it;
+  - a wait the user already gave back (released, not resumed) stays given back when only its grant ended, in the
+    sweep and in restart recovery, also while the connection was down: the agent resumes it with a new grant (a
+    login still needs its site condition). A revoked running segment, a pending write or a replaced browser decide
+    as before.
 - The console names the known reasons and shows the general text otherwise; the user's control state comes first.
 
 ## Task-scoped Auto (2026-10-23 source candidate)
