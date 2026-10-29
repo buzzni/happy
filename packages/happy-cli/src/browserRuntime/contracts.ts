@@ -240,6 +240,28 @@ export interface StepResult {
     /** observe/screenshot payload summary; never raw secrets */
     observation?: Observation
     screenshot?: ScreenshotResult
+    /** navigate/click/fill on a driver that gates its input (BrowserDriver.gatesInputOnValidateDispatch) */
+    receipt?: ActionReceipt
+}
+
+/**
+ * What one navigate/click/fill driver call observed. Only what the browser reported to the driver
+ * during that call: an entry does not prove the action caused it (a page or the user can open a
+ * popup at the same time), and a missing entry does not prove nothing happened (a page can react
+ * later). Never an ownership or cleanup decision.
+ */
+export interface ActionObservations {
+    /** JavaScript dialogs of the tab, dismissed by the driver (type only; the message is page text). */
+    dialogs?: Array<{ type: string }>
+    /** Pages the tab opened (origin as first seen; closed = stopped by destination enforcement or the window cap). */
+    popups?: Array<{ origin: string; closed: boolean }>
+    /** File choosers the tab opened; the driver cancelled them (the agent cannot choose files). */
+    fileChoosers?: Array<{ mode: string }>
+}
+
+export interface ActionReceipt extends ActionObservations {
+    /** 'sent' once the driver passed the Runtime's input gate (began the input); the page may not have received it. */
+    input: 'not-sent' | 'sent'
 }
 
 export interface BatchResult {
@@ -449,9 +471,20 @@ export interface DriverOptions {
     expect?: DispatchExpectation
     /** In-process authorization fence, called immediately before actual input. Never a wire field. */
     validateDispatch?: () => void
+    /** navigate/click/fill: in-process sink for what the driver observed during the call. Never a wire field. */
+    observed?: ActionObservations
 }
 
 export interface BrowserDriver {
+    /**
+     * True only for a driver whose navigate/click/fill send none of the write's input (pointer press
+     * and release, typed text or keys, the navigation) before `validateDispatch` has returned, and
+     * none when it throws. Preparation the Runtime does not treat as the write (scroll, hover, focus,
+     * selecting the field's text) may come first. Only for such a driver may the Runtime conclude,
+     * from a callback that was never reached, that an interrupted write never left; for any other
+     * driver that write stays an unknown outcome.
+     */
+    readonly gatesInputOnValidateDispatch?: boolean
     /** Identity of the browser process this driver is connected to. */
     browserInstanceId(): BrowserInstanceId
     openTab(url: string, allowedOrigins: string[], opts: DriverOptions): Promise<DriverTabHandle>

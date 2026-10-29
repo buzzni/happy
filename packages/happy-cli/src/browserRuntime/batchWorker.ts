@@ -1,5 +1,6 @@
 import {
     BrowserRuntimeError,
+    type ActionObservations,
     type AgentGrant,
     type BatchStep,
     type BrowserDriver,
@@ -15,13 +16,15 @@ export async function dispatchStep(
     step: BatchStep,
     grant: AgentGrant,
     signal: AbortSignal,
-    { expect, validateDispatch }: {
+    { expect, validateDispatch, observed }: {
         /** click: what was classified/approved, re-verified by the driver right before input */
         expect?: DispatchExpectation
+        /** navigate/click/fill: the Runtime's input gate (DriverOptions.validateDispatch) */
         validateDispatch?: () => void
+        observed?: ActionObservations
     } = {},
 ): Promise<Observation | { url: string; documentGeneration: number } | void> {
-    const options = { signal, timeoutMs: step.timeoutMs, ...(validateDispatch ? { validateDispatch } : {}) }
+    const options = { signal, timeoutMs: step.timeoutMs, ...(validateDispatch ? { validateDispatch } : {}), ...(observed ? { observed } : {}) }
     switch (step.kind) {
         case 'navigate': {
             if (!step.url) throw new BrowserRuntimeError('INVALID_REQUEST', 'navigate requires url')

@@ -22,6 +22,7 @@
 import { createHash, randomBytes } from 'node:crypto'
 import {
     BrowserRuntimeError,
+    type ActionObservations,
     type BrowserDriver,
     type BrowserInstanceId,
     type DispatchExpectation,
@@ -110,6 +111,8 @@ const GUARD_BINDING = '__abpGuardReport'
 const GUARD_SETTLE_MS = 300
 /** Deeper frame nesting than this is refused rather than walked for overlays. */
 const MAX_FRAME_DEPTH = 16
+/** Entries of each kind one write call reports (ActionObservations). */
+const MAX_OBSERVED = 20
 export const DEFAULT_MAX_AGENT_WINDOWS = 4
 
 async function withDeadline<T>(ms: number, message: string, body: () => Promise<T>): Promise<T> {
@@ -227,11 +230,20 @@ class OpContext {
         this.rejectAborted(error)
     }
 
-    /** Call immediately before sending anything with a page-visible effect. */
-    markDispatch(): void {
+    /**
+     * Call immediately before sending anything with a page-visible effect. `validate` (the
+     * caller's DriverOptions.validateDispatch) is the last check: if it throws, nothing is sent.
+     */
+    markDispatch(validate?: () => void): void {
         if (this.aborted) throw new BrowserRuntimeError('OUTCOME_UNKNOWN', 'operation aborted before dispatch', false, false)
+        validate?.()
         this.dispatched = true
     }
+}
+
+/** Once a write's input began, any failure is an unknown outcome: possibly effective, never to be retried as is. */
+function afterInput(error: BrowserRuntimeError): BrowserRuntimeError {
+    return error.mayHaveSideEffects && !error.retryable ? error : new BrowserRuntimeError(error.code, error.message, false, true)
 }
 
 function staleRef(why: string): BrowserRuntimeError {
@@ -270,6 +282,8 @@ function newId(prefix: string): string {
 }
 
 export class CdpDriver implements BrowserDriver {
+    /** navigate/click/fill send their input only through OpContext.markDispatch(opts.validateDispatch). */
+    readonly gatesInputOnValidateDispatch = true
     private conn?: CdpConnection
     private instanceId?: BrowserInstanceId
     private browserWsUrl: string
@@ -303,6 +317,8 @@ export class CdpDriver implements BrowserDriver {
     /** Targets being attached explicitly (adopt, fallback): their attach event is ours, not a page to release */
     private readonly attaching = new Set<string>()
     private readonly blocked: BlockedReport[] = []
+    /** The observation sink of the write call running on each tab (the input lease allows one at a time) */
+    private readonly observing = new Map<TabId, { sink: ActionObservations; popupTargets: string[] }>()
 
     constructor(private readonly options: CdpDriverOptions) {
         this.browserWsUrl = options.browserWsUrl
@@ -671,10 +687,10 @@ export class CdpDriver implements BrowserDriver {
     navigate(tabId: TabId, url: string, allowedOrigins: string[], opts: DriverOptions): Promise<{ url: string; documentGeneration: number }> {
         return this.run(opts, async (op, conn) => {
             const tab = this.requireTab(tabId)
-            const result = await this.navigateInternal(conn, tab, url, allowedOrigins, op)
+            const result = await this.navigateInternal(conn, tab, url, allowedOrigins, op, opts.validateDispatch)
             this.assertEnforced(tab)
             return result
-        })
+        }, true, tabId)
     }
 
     async currentOrigin(tabId: TabId): Promise<string> {
@@ -889,8 +905,7 @@ export class CdpDriver implements BrowserDriver {
             const live = opts.expect ? await this.assertExpectation(conn, binding, objectId, opts.expect) : undefined
             this.assertFresh(tab, binding, snapshotId)
             if (live?.form) await this.armSubmitGuard(conn, tab, binding, objectId, live.form)
-            opts.validateDispatch?.()
-            op.markDispatch()
+            op.markDispatch(opts.validateDispatch)
             const base = { x: point.x, y: point.y, button: 'left', clickCount: 1 }
             await conn.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed', buttons: 1 }, binding.sessionId)
             await conn.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased', buttons: 0 }, binding.sessionId)
@@ -905,8 +920,11 @@ export class CdpDriver implements BrowserDriver {
             if (guard?.lastStatus === 'blocked') {
                 throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'the form submission changed after it was classified; it was stopped before it was sent', false, true)
             }
+            // What the release caused (a file chooser) can arrive right after its answer: one more round trip on
+            // the connection delivers it while this call still observes. Its failure does not fail the click.
+            if (opts.observed) await conn.send('Page.getFrameTree', {}, tab.sessionId).catch(() => undefined)
             this.assertEnforced(tab)
-        }, true)
+        }, true, tabId)
     }
 
     describeRef(tabId: TabId, ref: ElementRef, snapshotId: SnapshotId, opts: DriverOptions): Promise<ElementDescription> {
@@ -978,7 +996,7 @@ export class CdpDriver implements BrowserDriver {
             if (focus.value !== true) throw new BrowserRuntimeError('INVALID_REQUEST', 'focus moved away from the element; not typing', true, false)
             await this.assertSameLabel(conn, binding, objectId)
             this.assertFresh(tab, binding, snapshotId)
-            op.markDispatch()
+            op.markDispatch(opts.validateDispatch)
             if (value) {
                 await conn.send('Input.insertText', { text: value }, binding.sessionId)
             } else {
@@ -986,8 +1004,11 @@ export class CdpDriver implements BrowserDriver {
                 await conn.send('Input.dispatchKeyEvent', { ...key, type: 'keyDown' }, binding.sessionId)
                 await conn.send('Input.dispatchKeyEvent', { ...key, type: 'keyUp' }, binding.sessionId)
             }
+            // A page that swapped the field while the text went in: where it landed is unknown, and typing again could repeat it.
+            const { result: after } = await conn.send('Runtime.callFunctionOn', { functionDeclaration: CHECK_ELEMENT, objectId, arguments: [{ value: true }], returnByValue: true }, binding.sessionId)
+            if (after.value === 'detached') throw new BrowserRuntimeError('OUTCOME_UNKNOWN', 'the field was replaced while typing; observe before typing again', false, true)
             this.assertEnforced(tab)
-        }, true)
+        }, true, tabId)
     }
 
     // -----------------------------------------------------------------------
@@ -1042,7 +1063,9 @@ export class CdpDriver implements BrowserDriver {
      * running in the background but `op.markDispatch()` refuses further
      * page-visible effects once aborted.
      */
-    private run<T>(opts: DriverOptions, body: (op: OpContext, conn: CdpConnection) => Promise<T>, sideEffecting = false): Promise<T> {
+    private run<T>(opts: DriverOptions, body: (op: OpContext, conn: CdpConnection) => Promise<T>, sideEffecting = false,
+        /** navigate/click/fill: the tab whose dialogs and popups go to opts.observed until the call settles */
+        observedTab?: TabId): Promise<T> {
         const op = new OpContext()
         return new Promise<T>((resolve, reject) => {
             let conn: CdpConnection
@@ -1060,9 +1083,10 @@ export class CdpDriver implements BrowserDriver {
                 for (const cleanup of cleanups) cleanup()
                 fn()
             }
+            const outcome = (error: BrowserRuntimeError) => sideEffecting && op.dispatched ? afterInput(error) : error
             const fail = (error: BrowserRuntimeError) => {
                 op.abort(error)
-                settle(() => reject(error))
+                settle(() => reject(outcome(error)))
             }
             if (opts.signal?.aborted) {
                 fail(this.abortError(opts.signal.reason, false))
@@ -1081,11 +1105,30 @@ export class CdpDriver implements BrowserDriver {
             cleanups.push(conn.onClose(() => {
                 fail(new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'browser connection closed', true, op.dispatched))
             }))
+            if (observedTab && opts.observed) cleanups.push(this.observeDuring(observedTab, opts.observed))
             body(op, conn).then(
                 (value) => settle(() => resolve(value)),
-                (error) => settle(() => reject(this.mapError(error, sideEffecting && op.dispatched))),
+                (error) => settle(() => reject(outcome(this.mapError(error, sideEffecting && op.dispatched)))),
             )
         })
+    }
+
+    /**
+     * Sends the tab's dialogs and popups to `sink` until the returned function is called; then the
+     * popups are reported as known at that moment (origin '' while the first document is not known).
+     */
+    private observeDuring(tabId: TabId, sink: ActionObservations): () => void {
+        const entry = { sink, popupTargets: [] as string[] }
+        this.observing.set(tabId, entry)
+        return () => {
+            if (this.observing.get(tabId) === entry) this.observing.delete(tabId)
+            // A report evicted from the bounded registry is left out rather than guessed.
+            const popups = entry.popupTargets.flatMap((targetId) => {
+                const report = this.popups.get(targetId)
+                return report ? [{ origin: report.origin, closed: report.closed }] : []
+            })
+            if (popups.length) sink.popups = popups
+        }
     }
 
     private abortError(reason: unknown, dispatched: boolean): BrowserRuntimeError {
@@ -1192,7 +1235,8 @@ export class CdpDriver implements BrowserDriver {
             this.sendGuard(conn, 'Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, sessionId, kind),
         ])
         await conn.send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => undefined)
-        const commands: Array<Promise<unknown>> = [conn.send('Page.enable', {}, sessionId)]
+        // Report file choosers without intercepting them (a browser that does not know the option ignores it: none are reported).
+        const commands: Array<Promise<unknown>> = [conn.send('Page.enable', { enableFileChooserOpenedEvent: true }, sessionId)]
         if (isMain) commands.push(conn.send('Emulation.setFocusEmulationEnabled', { enabled: true }, sessionId))
         await Promise.all(commands)
     }
@@ -1270,7 +1314,16 @@ export class CdpDriver implements BrowserDriver {
             if (!info) return
             this.dialogs.push({ tabId: info.tab.tabId, type: String(params.type), atMs: Date.now() })
             if (this.dialogs.length > MAX_POPUP_REPORTS) this.dialogs.shift()
+            const observed = this.observing.get(info.tab.tabId)?.sink
+            if (observed && (observed.dialogs?.length ?? 0) < MAX_OBSERVED) (observed.dialogs ??= []).push({ type: String(params.type) })
             conn.send('Page.handleJavaScriptDialog', { accept: false }, sessionId).catch(() => undefined)
+        })
+        // Observed only: the chooser is shown and answered as it would be without the driver.
+        conn.on('Page.fileChooserOpened', (params, sessionId) => {
+            if (!current() || !sessionId) return
+            const tabId = this.sessions.get(sessionId)?.tab.tabId
+            const observed = tabId ? this.observing.get(tabId)?.sink : undefined
+            if (observed && (observed.fileChoosers?.length ?? 0) < MAX_OBSERVED) (observed.fileChoosers ??= []).push({ mode: String(params.mode) })
         })
         // Destination enforcement: every guarded session's navigations and data-carrying
         // requests pause here; anything not on the tab's allowed origins is failed unsent.
@@ -1329,6 +1382,8 @@ export class CdpDriver implements BrowserDriver {
         const opener = this.popupTabs.get(info.targetId) ?? this.ownerTabOf(info.openerId)
         if (!opener) return
         const origin = originOf(info.url)
+        const observed = this.popups.has(info.targetId) ? undefined : this.observing.get(opener.tabId)
+        if (observed && observed.popupTargets.length < MAX_OBSERVED) observed.popupTargets.push(info.targetId)
         const report = this.popups.get(info.targetId) ?? { openerTabId: opener.tabId, targetId: info.targetId, origin, closed: false }
         report.origin = origin || report.origin
         this.popups.set(info.targetId, report)
@@ -1373,6 +1428,8 @@ export class CdpDriver implements BrowserDriver {
         url: string,
         allowedOrigins: string[],
         op: OpContext,
+        /** navigate: the caller's validateDispatch (openTab's first navigation has none) */
+        validate?: () => void,
     ): Promise<{ url: string; documentGeneration: number }> {
         if (!originAllowed(allowedOrigins, originOf(url))) throw originDenied('requested origin is not allowed')
         tab.allowedOrigins = allowedOrigins
@@ -1396,7 +1453,7 @@ export class CdpDriver implements BrowserDriver {
         loaded.catch(() => undefined)
         const blockedBefore = tab.blockedMain
         try {
-            op.markDispatch()
+            op.markDispatch(validate)
             const result = await conn.send('Page.navigate', { url }, tab.sessionId)
             // A redirect hop (the first request went to an allowed origin) was stopped unsent.
             if (tab.blockedMain !== blockedBefore) throw originDenied('navigation was stopped before reaching an origin that is not allowed', false, true)

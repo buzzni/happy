@@ -1,0 +1,324 @@
+/**
+ * The input boundary of a write step (navigate/click/fill): a fence or failure before the
+ * driver began the input is a recoverable failure, one after it an unknown outcome that is
+ * never replayed. Receipts report what the driver saw, nothing more.
+ */
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it } from 'vitest'
+import { FakeClock } from './clock'
+import { BrowserRuntimeError, type AgentGrant, type BatchStep, type InteractiveCapability, type ProfileId, type RequestId, type TabId } from './contracts'
+import { BrowserRuntime } from './runtime'
+import { TaskStore } from './taskStore'
+import { FakeBrowserDriver } from './testing/fakeDriver'
+import { fixtureSitePolicies } from './testing/fixtureSitePolicy'
+
+const ORIGIN = 'https://fixture.test'
+const SITES = fixtureSitePolicies([ORIGIN])
+type Write = 'click' | 'fill' | 'navigate'
+const WRITES: Write[] = ['click', 'fill', 'navigate']
+
+const dirs: string[] = []
+afterEach(async () => { await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))) })
+
+async function harness(prefix: string, driver = new FakeBrowserDriver(), existingDir?: string) {
+    const dir = existingDir ?? await mkdtemp(join(tmpdir(), prefix))
+    if (!existingDir) dirs.push(dir)
+    const store = await TaskStore.open(dir)
+    const clock = new FakeClock(100)
+    const profileId = 'profile-1' as ProfileId
+    const runtime = new BrowserRuntime({ sites: SITES, store, drivers: new Map([[profileId, driver]]), clock })
+    const credential: AgentGrant = { kind: 'agent-grant', grantId: 'g' as never, principalId: 'p' as never, workspaceId: 'w' as never,
+        machineId: 'm' as never, agentSessionId: 'a' as never, profileId, allowedOrigins: [ORIGIN],
+        operations: ['createSpace', 'createTask', 'openPage', 'submitBatch', 'getTask', 'subscribe', 'cancel', 'observe', 'finishTask', 'resume', 'closePage', 'closeSpace'],
+        taskSpaceIds: [], issuedAtMs: 0, expiresAtMs: 3_600_000 }
+    const auth = { credential, verifiedAtMs: clock.now() }
+    const ui: InteractiveCapability = { kind: 'interactive', capabilityId: 'ui' as never, principalId: 'p' as never, workspaceId: 'w' as never,
+        machineId: 'm' as never, viewerSessionId: 'viewer', profileId, operations: ['takeOver', 'releaseControl'], issuedAtMs: 0, expiresAtMs: 3_600_000 }
+    const uiAuth = { credential: ui, verifiedAtMs: clock.now() }
+    return { dir, store, clock, profileId, driver, runtime, auth, uiAuth }
+}
+type Harness = Awaited<ReturnType<typeof harness>>
+
+/** A task with one tab showing a button and a text field, observed by the agent. */
+async function openTask(h: Harness, name = 'one') {
+    const space = await h.runtime.createSpace(h.auth, { profileId: h.profileId, requestId: `space-${name}` as RequestId })
+    const task = await h.runtime.createTask(h.auth, { taskSpaceId: space.taskSpaceId, requestId: `task-${name}` as RequestId })
+    const opened = await h.runtime.openPage(h.auth, { taskId: task.taskId, url: `${ORIGIN}/start`, requestId: `open-${name}` as RequestId })
+    h.driver.seedTab(opened.tabId, { url: `${ORIGIN}/start`, elements: [
+        { ref: '@continue' as never, role: 'button', name: 'Continue', visible: true, frameOrigin: ORIGIN },
+        { ref: '@name' as never, role: 'textbox', name: 'Name', value: '', visible: true, frameOrigin: ORIGIN },
+    ] })
+    const observed = await h.runtime.observe(h.auth, { taskId: task.taskId, tabId: opened.tabId })
+    return { taskId: task.taskId, taskSpaceId: space.taskSpaceId, tabId: opened.tabId, snapshotId: observed.snapshotId }
+}
+type OpenTask = Awaited<ReturnType<typeof openTask>>
+
+function writeStep(t: OpenTask, kind: Write, actionId: string): BatchStep {
+    const base = { stepId: `${actionId}-step` as never, actionId: actionId as never, tabId: t.tabId, kind, timeoutMs: 1_000 }
+    if (kind === 'navigate') return { ...base, url: `${ORIGIN}/next` }
+    if (kind === 'fill') return { ...base, ref: '@name' as never, snapshotId: t.snapshotId, value: 'Neo' }
+    return { ...base, ref: '@continue' as never, snapshotId: t.snapshotId }
+}
+
+async function submit(h: Harness, t: OpenTask, steps: BatchStep[], requestId: string) {
+    const view = await h.runtime.getTask(h.auth, { taskId: t.taskId })
+    return h.runtime.submitBatch(h.auth, { taskId: t.taskId, expectedVersion: view.stateVersion, requestId: requestId as RequestId, steps }, { waitMs: 5_000 })
+}
+
+/** Starts a one-step write batch and waits until the fake is held at `point` (the input not sent). */
+async function heldAt(h: Harness, t: OpenTask, kind: Write, actionId: string, point: Parameters<FakeBrowserDriver['holdBefore']>[0] = `input:${kind}`, skip = 0) {
+    const hold = h.driver.holdBefore(point, skip)
+    const batch = submit(h, t, [writeStep(t, kind, actionId)], `batch-${actionId}`)
+    await hold.entered
+    return { hold, batch }
+}
+
+function stored(h: Harness, t: OpenTask) {
+    return h.store.getTask(t.taskId)!
+}
+
+function epochOf(h: Harness, tabId: TabId): number {
+    return h.runtime.leases.owner(tabId, h.profileId).leaseEpoch
+}
+
+describe('a fence before the input: the write never left, so the task is not left with an unknown outcome', () => {
+    it.each(WRITES)('cancel right before the %s input', async (kind) => {
+        const h = await harness(`abp-boundary-cancel-${kind}-`)
+        const t = await openTask(h)
+        const { hold, batch } = await heldAt(h, t, kind, `${kind}-1`)
+        const cancelled = await h.runtime.cancel(h.auth, { taskId: t.taskId, requestId: 'cancel' as RequestId })
+        expect(cancelled.task.status).toBe('cancelled')
+        expect(cancelled.task.uncertainActions).toEqual([])
+        hold.release()
+        await batch
+        expect(h.driver.dispatchCounts.get(`${kind}-1`) ?? 0).toBe(0)
+        expect(stored(h, t)).toMatchObject({ status: 'cancelled', uncertainActions: [] })
+        expect(stored(h, t).actions[`${kind}-1`].state).toBe('skipped')
+        await h.store.close()
+    })
+
+    it.each([['describeRef', 0], ['currentOrigin', 1]] as const)('cancel while the Runtime awaits %s after the intent', async (point, skip) => {
+        const h = await harness(`abp-boundary-cancel-${point}-`)
+        const t = await openTask(h)
+        const { hold, batch } = await heldAt(h, t, 'click', 'click-pre', point, skip)
+        expect(stored(h, t).actions['click-pre'].state).toBe('intent-committed')
+        const cancelled = await h.runtime.cancel(h.auth, { taskId: t.taskId, requestId: 'cancel' as RequestId })
+        expect(cancelled.task).toMatchObject({ status: 'cancelled', uncertainActions: [] })
+        hold.release()
+        await batch
+        expect(h.driver.dispatchCounts.get('click-pre') ?? 0).toBe(0)
+        expect(stored(h, t)).toMatchObject({ status: 'cancelled', uncertainActions: [] })
+        await h.store.close()
+    })
+
+    it('a user takeover right before the input leaves no unknown outcome, and the click never happens', async () => {
+        const h = await harness('abp-boundary-takeover-')
+        const t = await openTask(h)
+        const { hold, batch } = await heldAt(h, t, 'click', 'click-takeover')
+        const control = await h.runtime.takeOver(h.uiAuth, { taskId: t.taskId, tabId: t.tabId, expectedEpoch: epochOf(h, t.tabId), requestId: 'take' as RequestId })
+        expect(control.task).toMatchObject({ status: 'paused', pauseReason: 'user-control', uncertainActions: [] })
+        hold.release()
+        await batch
+        expect(h.driver.dispatchCounts.get('click-takeover') ?? 0).toBe(0)
+        expect(stored(h, t)).toMatchObject({ status: 'paused', pauseReason: 'user-control', uncertainActions: [] })
+        await h.store.close()
+    })
+
+    it('a user taking over another task\'s tab of the profile fences this task\'s input too', async () => {
+        const h = await harness('abp-boundary-profile-fence-')
+        const t = await openTask(h, 'one')
+        const other = await openTask(h, 'two')
+        const { hold, batch } = await heldAt(h, t, 'click', 'click-fenced')
+        await h.runtime.takeOver(h.uiAuth, { taskId: other.taskId, tabId: other.tabId, expectedEpoch: epochOf(h, other.tabId), requestId: 'take-other' as RequestId })
+        hold.release()
+        const result = (await batch).result
+        expect(h.driver.dispatchCounts.get('click-fenced') ?? 0).toBe(0)
+        expect(result).toMatchObject({ outcome: 'failed', mayHaveSideEffects: false })
+        expect(result?.steps[0].error?.code).toBe('STALE_LEASE')
+        expect(stored(h, t)).toMatchObject({ status: 'paused', pauseReason: 'awaiting-agent', uncertainActions: [] })
+        await h.store.close()
+    })
+
+    it('a grant revoked right before the input pauses for a grant, not for an unknown outcome', async () => {
+        const h = await harness('abp-boundary-revoke-')
+        const t = await openTask(h)
+        const { hold, batch } = await heldAt(h, t, 'fill', 'fill-revoked')
+        await h.runtime.revokeGrant('g' as never)
+        hold.release()
+        // submitBatch's final read uses the revoked grant; the batch itself has ended.
+        await batch.catch(() => undefined)
+        expect(h.driver.dispatchCounts.get('fill-revoked') ?? 0).toBe(0)
+        expect(stored(h, t)).toMatchObject({ status: 'paused', pauseReason: 'grant-expired', uncertainActions: [] })
+        await h.store.close()
+    })
+
+    it('a browser connection lost right before the input: after reconnect the agent can go on, with a new action', async () => {
+        const h = await harness('abp-boundary-disconnect-')
+        const t = await openTask(h)
+        const { hold, batch } = await heldAt(h, t, 'click', 'click-lost')
+        await h.runtime.onDriverDisconnected(h.profileId)
+        // The worker's late result arrives only after reconnect handling.
+        await h.runtime.onDriverReconnected(h.profileId)
+        hold.release()
+        await batch
+        expect(h.driver.dispatchCounts.get('click-lost') ?? 0).toBe(0)
+        expect(stored(h, t)).toMatchObject({ status: 'paused', pauseReason: 'awaiting-agent', uncertainActions: [] })
+        const again = await h.runtime.observe(h.auth, { taskId: t.taskId, tabId: t.tabId })
+        const retried = await submit(h, { ...t, snapshotId: again.snapshotId }, [writeStep({ ...t, snapshotId: again.snapshotId }, 'click', 'click-again')], 'batch-again')
+        expect(retried.result?.outcome).toBe('succeeded')
+        expect(h.driver.dispatchCounts.get('click-again')).toBe(1)
+        await h.store.close()
+    })
+
+    it('a driver that does not declare the input gate keeps the conservative unknown outcome', async () => {
+        const driver = new FakeBrowserDriver()
+        driver.gatesInputOnValidateDispatch = false
+        const h = await harness('abp-boundary-ungated-', driver)
+        const t = await openTask(h)
+        const { hold, batch } = await heldAt(h, t, 'click', 'click-ungated')
+        const cancelled = await h.runtime.cancel(h.auth, { taskId: t.taskId, requestId: 'cancel' as RequestId })
+        expect(cancelled.task).toMatchObject({ status: 'paused', pauseReason: 'cancelled-with-unknown-effect', uncertainActions: ['click-ungated'] })
+        hold.release()
+        // No receipt either: without the gate the Runtime cannot tell whether the input left.
+        expect((await batch).result?.steps.every((step) => step.receipt === undefined)).toBe(true)
+        expect(stored(h, t)).toMatchObject({ status: 'paused', pauseReason: 'cancelled-with-unknown-effect', uncertainActions: ['click-ungated'] })
+        await h.store.close()
+    })
+})
+
+describe('after the input may have left: an unknown outcome, never replayed', () => {
+    it.each(WRITES)('cancel right after the %s input keeps the outcome unknown', async (kind) => {
+        const h = await harness(`abp-boundary-cancel-after-${kind}-`)
+        const t = await openTask(h)
+        const held = h.driver.holdAfterNextDispatch(kind)
+        const batch = submit(h, t, [writeStep(t, kind, `${kind}-sent`)], `batch-${kind}-sent`)
+        await held.entered
+        const cancelled = await h.runtime.cancel(h.auth, { taskId: t.taskId, requestId: 'cancel' as RequestId })
+        expect(cancelled.task).toMatchObject({ status: 'paused', pauseReason: 'cancelled-with-unknown-effect', uncertainActions: [`${kind}-sent`] })
+        held.release()
+        await batch
+        expect(h.driver.dispatchCounts.get(`${kind}-sent`)).toBe(1)
+        expect(stored(h, t).actions[`${kind}-sent`].state).toBe('uncertain')
+        await h.store.close()
+    })
+
+    it('a lost response after the input (connection closed) pauses outcome-unknown, and neither resubmission nor resume replays it', async () => {
+        const h = await harness('abp-boundary-lost-response-')
+        const t = await openTask(h)
+        h.driver.failAfterInput('fill', new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'browser connection closed', false, true))
+        const first = await submit(h, t, [writeStep(t, 'fill', 'fill-lost')], 'batch-fill-lost')
+        expect(first.result).toMatchObject({ outcome: 'uncertain', mayHaveSideEffects: true })
+        expect(stored(h, t)).toMatchObject({ status: 'paused', pauseReason: 'outcome-unknown', uncertainActions: ['fill-lost'] })
+        await expect(h.runtime.resume(h.auth, { taskId: t.taskId, expectedVersion: stored(h, t).stateVersion, requestId: 'resume' as RequestId }))
+            .rejects.toBeInstanceOf(BrowserRuntimeError)
+        await expect(submit(h, t, [writeStep(t, 'fill', 'fill-lost')], 'batch-fill-lost-again')).rejects.toBeInstanceOf(BrowserRuntimeError)
+        expect(h.driver.dispatchCounts.get('fill-lost')).toBe(1)
+        await h.store.close()
+    })
+
+    it('a failure the driver labels side-effect free after the input began is still an unknown outcome', async () => {
+        const h = await harness('abp-boundary-mislabelled-')
+        const t = await openTask(h)
+        h.driver.failAfterInput('click', new BrowserRuntimeError('TARGET_GONE', 'Session with given id not found', false, false))
+        const result = (await submit(h, t, [writeStep(t, 'click', 'click-gone')], 'batch-click-gone')).result
+        expect(result).toMatchObject({ outcome: 'uncertain', mayHaveSideEffects: true })
+        expect(stored(h, t)).toMatchObject({ status: 'paused', pauseReason: 'outcome-unknown', uncertainActions: ['click-gone'] })
+        await h.store.close()
+    })
+
+    it('a browser connection lost after the input, reconnected before the worker\'s late result: outcome-unknown, sent once', async () => {
+        const h = await harness('abp-boundary-disconnect-after-')
+        const t = await openTask(h)
+        const held = h.driver.holdAfterNextDispatch('click')
+        h.driver.failAfterInput('click', new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'browser connection closed', true, true))
+        const batch = submit(h, t, [writeStep(t, 'click', 'click-sent-lost')], 'batch-click-sent-lost')
+        await held.entered
+        await h.runtime.onDriverDisconnected(h.profileId)
+        await h.runtime.onDriverReconnected(h.profileId)
+        held.release()
+        await batch
+        expect(stored(h, t)).toMatchObject({ status: 'paused', pauseReason: 'outcome-unknown', uncertainActions: ['click-sent-lost'] })
+        expect(h.driver.dispatchCounts.get('click-sent-lost')).toBe(1)
+        await h.store.close()
+    })
+
+    it('a browser connection lost after the input, the driver call then succeeding late: outcome-unknown, not left running', async () => {
+        const h = await harness('abp-boundary-disconnect-late-success-')
+        const t = await openTask(h)
+        const held = h.driver.holdAfterNextDispatch('fill')
+        const batch = submit(h, t, [writeStep(t, 'fill', 'fill-late')], 'batch-fill-late')
+        await held.entered
+        await h.runtime.onDriverDisconnected(h.profileId)
+        await h.runtime.onDriverReconnected(h.profileId)
+        held.release()
+        expect((await batch).result).toMatchObject({ outcome: 'uncertain', mayHaveSideEffects: true })
+        expect(stored(h, t)).toMatchObject({ status: 'paused', pauseReason: 'outcome-unknown', uncertainActions: ['fill-late'] })
+        expect(h.driver.dispatchCounts.get('fill-late')).toBe(1)
+        await h.store.close()
+    })
+
+    it('a read that succeeds only after a reconnect does not leave the task running without a worker', async () => {
+        const h = await harness('abp-boundary-late-read-')
+        const t = await openTask(h)
+        const held = h.driver.holdAfterNextDispatch('observe')
+        const batch = submit(h, t, [{ stepId: 'look-step' as never, actionId: 'look' as never, tabId: t.tabId, kind: 'observe', timeoutMs: 1_000 }], 'batch-look')
+        await held.entered
+        await h.runtime.onDriverDisconnected(h.profileId)
+        await h.runtime.onDriverReconnected(h.profileId)
+        held.release()
+        await batch
+        expect(stored(h, t)).toMatchObject({ status: 'paused', pauseReason: 'awaiting-agent', uncertainActions: [] })
+        await h.store.close()
+    })
+
+    it('an unknown outcome survives a Runtime restart and is still not replayed', async () => {
+        const h = await harness('abp-boundary-restart-')
+        const t = await openTask(h)
+        h.driver.failAfterInput('navigate', new BrowserRuntimeError('OUTCOME_UNKNOWN', 'driver operation timed out', false, true))
+        await submit(h, t, [writeStep(t, 'navigate', 'nav-unknown')], 'batch-nav-unknown')
+        await h.store.close()
+        const restarted = await harness('', h.driver, h.dir)
+        await restarted.runtime.started()
+        const task = restarted.store.getTask(t.taskId)!
+        expect(task).toMatchObject({ status: 'paused', pauseReason: 'outcome-unknown', uncertainActions: ['nav-unknown'] })
+        expect(task.actions['nav-unknown'].state).toBe('uncertain')
+        expect(h.driver.dispatchCounts.get('nav-unknown')).toBe(1)
+        await restarted.store.close()
+    })
+})
+
+describe('action receipts', () => {
+    it('reports the input and what the driver saw on the step result, durably and in the driver-call event', async () => {
+        const h = await harness('abp-boundary-receipt-')
+        const t = await openTask(h)
+        h.driver.observeDuringNext('click', { dialogs: [{ type: 'alert' }], popups: [{ origin: 'https://fixture.test', closed: false }], fileChoosers: [{ mode: 'selectSingle' }] })
+        const submitted = await submit(h, t, [writeStep(t, 'click', 'click-receipt'), writeStep(t, 'fill', 'fill-receipt')], 'batch-receipt')
+        expect(submitted.result?.steps.map((step) => step.receipt)).toEqual([
+            { input: 'sent', dialogs: [{ type: 'alert' }], popups: [{ origin: 'https://fixture.test', closed: false }], fileChoosers: [{ mode: 'selectSingle' }] },
+            { input: 'sent' },
+        ])
+        const events = await h.runtime.subscribe(h.auth, { taskId: t.taskId, afterSeq: 0 })
+        expect(events.kind).toBe('events')
+        if (events.kind === 'events')
+            expect(events.events.find((event) => event.type === 'action-dispatched' && event.data.actionId === 'click-receipt')?.data.receipt)
+                .toMatchObject({ input: 'sent', dialogs: [{ type: 'alert' }] })
+        await h.store.close()
+        const restarted = await harness('', h.driver, h.dir)
+        await restarted.runtime.started()
+        expect(restarted.store.getTask(t.taskId)?.lastBatch?.steps[0].receipt).toMatchObject({ input: 'sent', fileChoosers: [{ mode: 'selectSingle' }] })
+        await restarted.store.close()
+    })
+
+    it('a write refused right before its input reports input not-sent', async () => {
+        const h = await harness('abp-boundary-receipt-unsent-')
+        const t = await openTask(h, 'one')
+        const other = await openTask(h, 'two')
+        const { hold, batch } = await heldAt(h, t, 'navigate', 'nav-unsent')
+        await h.runtime.takeOver(h.uiAuth, { taskId: other.taskId, tabId: other.tabId, expectedEpoch: epochOf(h, other.tabId), requestId: 'take-other' as RequestId })
+        hold.release()
+        expect((await batch).result?.steps[0]).toMatchObject({ outcome: 'failed', receipt: { input: 'not-sent' } })
+        await h.store.close()
+    })
+})

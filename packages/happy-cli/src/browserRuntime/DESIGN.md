@@ -504,3 +504,44 @@ untouched: timing the registered observe tool in-process (MCP client to response
 Runtime and CDP collection) against the code before this change on the same fixtures, in eight
 interleaved rounds, gave the same median latency (within 1%) and overlapping p95 ranges.
 Transport, network, UI and model latency were not measured.
+
+## Input boundary and action receipts (2026-10-29)
+
+A write step (navigate/click/fill) is split at its input: before it, a failure or fence is a
+recoverable failure; from it on, an unknown outcome (`outcome-unknown`, operator reconcile) that
+is never sent again. The durable intent, actionId reuse refusal and lease fencing are unchanged.
+
+- Driver: navigate/click/fill send the write's input (pointer press and release, typed text or
+  keys, the navigation) only through `OpContext.markDispatch(opts.validateDispatch)`; scroll,
+  hover, focus and selecting the field's text come before it and are not treated as the write.
+  `CdpDriver.gatesInputOnValidateDispatch` declares this. From the first input on, every failure
+  (connection closed, timeout, abort, a session reported gone because the frame was replaced, a
+  page check) is `mayHaveSideEffects: true, retryable: false`; navigate counts as side-effecting
+  too. After typing, fill checks the field is still in the document; a field the page replaced
+  meanwhile is `OUTCOME_UNKNOWN` instead of a success.
+- Runtime: each write step has an in-memory input gate. `validateDispatch` (always passed for
+  writes, not only for Auto) checks, with nothing awaited before the input: the gate is current,
+  the worker not aborted, the task running and not cancelled, the intent still committed, the
+  grant live, no disconnect since the intent (a per-profile connection epoch, so an input prepared
+  on a lost connection is never sent on the next one), the browser instance, the tab's lease
+  (including a user holding any tab of the profile) and Auto. Passing opens the gate.
+- Fences (cancel, user takeover, grant revocation/expiry in sweep, driver disconnect) close the
+  path to the gate first, then mark an intent whose gate never opened `skipped` instead of
+  uncertain; the task ends `cancelled`, `user-control`, `grant-expired` or recovers to
+  `awaiting-agent` without an unknown outcome. A worker's late result uses the same knowledge;
+  when a reconnect left the task running, the late result pauses it.
+- Only a driver that declares the gate is trusted this way. For any other driver, or after a
+  Runtime restart (the gate is not persisted), an interrupted intent stays an unknown outcome, as
+  before.
+- Receipts: `StepResult.receipt` (and the `receipt` field of the step's driver-call or failure
+  event) for gated drivers: `input` (`sent` once the gate opened) and what the driver saw during
+  the call on that tab: dismissed dialogs (type only), pages the tab opened (origin as known when
+  the call ended, '' if not yet; `closed`), file choosers (mode). Bounded to 20 entries each.
+  File choosers are observed with `Page.enable({ enableFileChooserOpenedEvent: true })` only; the
+  driver does not intercept, answer or cancel them. A browser without that option reports none.
+  A receipt is what was observed, not causation: a page or the user can open a popup at the same
+  time, and a page can react after the call. It never decides tab ownership or cleanup.
+
+Not covered: exactly-once at the site; distinguishing, after a Runtime crash, an intent that never
+reached its input (that would need a durable write before every input); an async popup, dialog or
+chooser after the call ended; a page moving focus between the focus check and typing.
