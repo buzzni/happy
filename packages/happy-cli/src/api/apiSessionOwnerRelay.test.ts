@@ -1,4 +1,4 @@
-/** owner-relay-v1 calls use this session's DEK over the existing rpc-call protocol, once (T1c-b2 H2). */
+/** owner-relay-v1 calls use this session's DEK and the existing RPC binding over rpc-call, once (T1c-b2 H2, p0a §4.5). */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Metadata } from './types';
 import { decodeBase64, decrypt, encodeBase64, encrypt } from './encryption';
@@ -59,34 +59,56 @@ describe('ApiSessionClient owner relay call', () => {
     afterEach(() => { vi.useRealTimers(); });
     const method = 'owner-relay-v1:' + 'a'.repeat(22);
 
-    it.each(['legacy', 'dataKey'] as const)('encrypts the request and decrypts the reply with the session key (%s)', async encryptionVariant => {
-        const session = { ...makeSession(), encryptionKey: new Uint8Array(32).fill(7), encryptionVariant };
+    // p0a §4.5: the existing session-DEK RPC binding (method/scope/nonce), not the bare request (D1 wire alignment).
+    it('wraps the request in the session-DEK RPC binding and returns only the reply bound to its nonce', async () => {
+        const session = { ...makeSession(), encryptionKey: new Uint8Array(32).fill(7), encryptionVariant: 'dataKey' as const };
         const client = new ApiSessionClient('fake-token', session);
+        let sent: { rpcBinding: number; method: string; scope: string; issuedAt: number; nonce: string; params: unknown } | null = null;
         socket.emitWithAck.mockImplementation(async (event: string, data: { method: string; params: string }) => {
             expect(event).toBe('rpc-call');
             expect(data.method).toBe(method);
             expect(data.params).not.toContain('secret-request');
-            expect(decrypt(session.encryptionKey, encryptionVariant, decodeBase64(data.params))).toEqual({ text: 'secret-request' });
-            return { ok: true, result: encodeBase64(encrypt(session.encryptionKey, encryptionVariant, { reply: 1 })) };
+            sent = decrypt(session.encryptionKey, 'dataKey', decodeBase64(data.params)) as typeof sent;
+            return { ok: true, result: encodeBase64(encrypt(session.encryptionKey, 'dataKey', { rpcBinding: 1, nonce: sent!.nonce, result: { reply: 1 } })) };
         });
         expect(await client.callOwnerRelay(method, { text: 'secret-request' }, new AbortController().signal)).toEqual({ reply: 1 });
+        expect(sent).toMatchObject({ rpcBinding: 1, method, scope: session.id, params: { text: 'secret-request' } });
+        expect(sent!.nonce).toMatch(/^[A-Za-z0-9+/]{22}==$/);
+        expect(Math.abs(sent!.issuedAt - Date.now())).toBeLessThan(5_000);
         expect(socket.timeout).toHaveBeenCalledWith(20_000);
         expect(socket.emitWithAck).toHaveBeenCalledTimes(1);
     });
-    it('refuses another RPC method and never sends', async () => {
+    it.each([
+        ['another nonce', (nonce: string) => ({ rpcBinding: 1, nonce: nonce.replace(/^./, c => c === 'A' ? 'B' : 'A'), result: { reply: 1 } })],
+        ['an unbound reply', () => ({ reply: 1 })],
+    ])('refuses a reply bound to %s', async (_label, reply) => {
+        const session = { ...makeSession(), encryptionKey: new Uint8Array(32).fill(7), encryptionVariant: 'dataKey' as const };
+        const client = new ApiSessionClient('fake-token', session);
+        socket.emitWithAck.mockImplementation(async (_event: string, data: { params: string }) => {
+            const opened = decrypt(session.encryptionKey, 'dataKey', decodeBase64(data.params)) as { nonce: string };
+            return { ok: true, result: encodeBase64(encrypt(session.encryptionKey, 'dataKey', reply(opened.nonce))) };
+        });
+        await expect(client.callOwnerRelay(method, {}, new AbortController().signal)).rejects.toThrow('owner-relay-unavailable');
+    });
+    it('is unavailable for a session without a DEK and never sends under the legacy key', async () => {
         const client = new ApiSessionClient('fake-token', makeSession());
+        await expect(client.callOwnerRelay(method, {}, new AbortController().signal)).rejects.toThrow('owner-relay-unavailable');
+        expect(socket.emitWithAck).not.toHaveBeenCalled();
+    });
+    it('refuses another RPC method and never sends', async () => {
+        const client = new ApiSessionClient('fake-token', { ...makeSession(), encryptionVariant: 'dataKey' as const });
         await expect(client.callOwnerRelay('test-session-id:bash', {}, new AbortController().signal)).rejects.toThrow();
         expect(socket.emitWithAck).not.toHaveBeenCalled();
     });
     it('reports a failed or undecryptable reply as unavailable without retry', async () => {
-        const client = new ApiSessionClient('fake-token', makeSession());
+        const client = new ApiSessionClient('fake-token', { ...makeSession(), encryptionVariant: 'dataKey' as const });
         socket.emitWithAck.mockResolvedValueOnce({ ok: false, error: 'remote detail' }).mockResolvedValueOnce({ ok: true, result: 'garbage' });
         await expect(client.callOwnerRelay(method, {}, new AbortController().signal)).rejects.toThrow('owner-relay-unavailable');
         await expect(client.callOwnerRelay(method, {}, new AbortController().signal)).rejects.toThrow('owner-relay-unavailable');
         expect(socket.emitWithAck).toHaveBeenCalledTimes(2);
     });
     it('does not send after abort', async () => {
-        const client = new ApiSessionClient('fake-token', makeSession());
+        const client = new ApiSessionClient('fake-token', { ...makeSession(), encryptionVariant: 'dataKey' as const });
         const controller = new AbortController(); controller.abort();
         await expect(client.callOwnerRelay(method, {}, controller.signal)).rejects.toThrow();
         expect(socket.emitWithAck).not.toHaveBeenCalled();

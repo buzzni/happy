@@ -108,3 +108,15 @@ ON이어도 trust 설정(`HAPPY_SESSION_OWNERSHIP_ENABLED/ISSUER/AUDIENCE/PUBLIC
 
 이전 부분 구현(63195d7b, 27e5490d)의 내부 port·broker private IPC·local transport는 그대로 재사용했다.
 그 커밋의 local transport 15건은 지휘 세션 셸에서 실소켓으로 통과했다.
+
+## wire 정렬: 기존 session-DEK RPC binding (2026-10-30, D1 착수 중 발견)
+
+p0a §4.5는 owner relay wire에 기존 RPC의 암호화·method/scope/nonce 규칙을 재사용하라고 정한다. 그런데 처음 구현한
+`ApiSessionClient.callOwnerRelay`는 요청 본문을 그대로 암호화했고, legacy 키 세션에서도 보냈다. D1(Desktop main 수신)을
+시작하면서 이 어긋남을 확인해 바로잡았다.
+
+- 요청은 happy-wire `bindRpcRequest`로 `{rpcBinding:1, method, scope: source 세션 id, issuedAt, nonce(16바이트), params}`를 만들어
+  source 세션 DEK로 암호화한다.
+- 응답은 `readBoundRpcResponse`로 같은 nonce의 `{rpcBinding:1, nonce, result}`만 받는다.
+- DEK가 없는(legacy) 세션은 owner relay를 쓸 수 없다(`owner-relay-unavailable`, 송신 0회). account legacy 키를 대안으로 쓰지 않는다.
+- 수신 측(Desktop main D1)은 contact의 hubId로 source 세션 DEK를 정하고, 같은 envelope의 method·scope·issuedAt 창·nonce 일회성을 검사한다.
