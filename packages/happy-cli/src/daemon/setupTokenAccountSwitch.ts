@@ -169,8 +169,12 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     if (pending) {
       // Do not apply a retained grant to a replacement session or a different running authority.
       if (pending.running !== running || pending.committed !== session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV]) return failure('STALE', 'pending save belongs to another session authority')
-      if (pending.clearManual !== confirmedOnly) return failure('STALE', 'pending save belongs to another source transition')
-      return savePending(sessionId, session)
+      if (pending.clearManual === confirmedOnly) return savePending(sessionId, session)
+      if (!confirmedOnly) return failure('STALE', 'pending save belongs to another source transition')
+      if (pending.indeterminate) return failure('PERSISTENCE_INDETERMINATE', 'resume authority requires recovery')
+      // An ordinary grant may target an unconfirmed account. A deliberate return must
+      // select again with confirmedOnly, using the still-committed original authority.
+      pendingSaves.delete(session)
     }
     // Never move a session back onto a binding older than the one it runs.
     if (bound.state === 'daemon-behind') return failure('STALE', `session ${sessionId} runs a newer binding than this daemon records`)

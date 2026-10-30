@@ -547,3 +547,45 @@ it('clears a manual choice only in the durable explicit organization return', as
  await f.switcher.returnFromPersonal('session-a',RUNNING_A)
  expect(f.deps.recordAgentEnvironment).toHaveBeenCalledWith(f.session,expect.any(String),null)
 })
+
+it('reselects a confirmed organization account after an ordinary rebind save failed', async () => {
+ const f=setup(), key='HAPPY_AI_AUTH_MANUAL_PERSONAL', ref='a'.repeat(64)
+ f.session.agentEnvironment![key]=ref
+ let writes=0
+ vi.mocked(f.deps.recordAgentEnvironment).mockImplementation((session,next,manualRef)=>{
+  if(++writes===1) return {status:'failed'}
+  session.agentEnvironment![SETUP_TOKEN_BINDING_ENV]=next
+  if(manualRef===null) delete session.agentEnvironment![key]
+  return {status:'committed'}
+ })
+ vi.mocked(f.deps.fetch).mockResolvedValueOnce(Response.json({version:1,bindingGrant:'ordinary.signature',managedAccountId:B,credentialGeneration:1,tier:'unknown'}))
+  .mockResolvedValueOnce(Response.json({version:1,bindingGrant:'return.signature',managedAccountId:C,credentialGeneration:1,tier:'available'}))
+ vi.mocked(f.deps.sessionEnvironment).mockImplementation(async (_agent,selection)=>{
+  if(selection.kind!=='claude-setup-token') throw new Error('Unexpected selection')
+  return {CLAUDE_CODE_OAUTH_TOKEN:'synthetic-next',[SETUP_TOKEN_BINDING_ENV]:formatSetupTokenBinding(binding(selection.managedAccountId))}
+ })
+ expect(await f.switcher.rebind('session-a',RUNNING_A)).toEqual({ok:false,reason:'PERSISTENCE_FAILED'})
+ expect(f.session.agentEnvironment![key]).toBe(ref)
+ expect(await f.switcher.returnFromPersonal('session-a',RUNNING_A)).toMatchObject({ok:true,environment:{[SETUP_TOKEN_BINDING_ENV]:formatSetupTokenBinding(binding(C))}})
+ const calls=vi.mocked(f.deps.fetch).mock.calls
+ expect(calls.map(call=>String(call[0]).split('/').pop())).toEqual(['rebind','return'])
+ expect(JSON.parse(String(calls[1][1]?.body))).toMatchObject({bindingNonce:NONCE_A})
+ expect(f.deps.recordAgentEnvironment).toHaveBeenLastCalledWith(f.session,formatSetupTokenBinding(binding(C)),null)
+ expect(f.session.agentEnvironment![key]).toBeUndefined()
+})
+
+it.each(['indeterminate','throw'] as const)('keeps an uncertain ordinary publication blocked during explicit return (%s)', async outcome => {
+ const record=vi.fn(()=>{ if(outcome==='throw') throw new Error('Uncertain publication'); return {status:'indeterminate' as const} })
+ const f=setup({recordAgentEnvironment:record})
+ expect(await f.switcher.rebind('session-a',RUNNING_A)).toEqual({ok:false,reason:'PERSISTENCE_INDETERMINATE'})
+ expect(await f.switcher.returnFromPersonal('session-a',RUNNING_A)).toEqual({ok:false,reason:'PERSISTENCE_INDETERMINATE'})
+ expect(f.deps.fetch).toHaveBeenCalledTimes(1); expect(record).toHaveBeenCalledTimes(1)
+})
+
+it('refuses an ordinary rebind over a pending explicit organization return', async () => {
+ const f=setup({recordAgentEnvironment:vi.fn(()=>({status:'failed' as const}))})
+ vi.mocked(f.deps.fetch).mockResolvedValueOnce(Response.json({version:1,bindingGrant:'return.signature',managedAccountId:B,credentialGeneration:1,tier:'available'}))
+ expect(await f.switcher.returnFromPersonal('session-a',RUNNING_A)).toEqual({ok:false,reason:'PERSISTENCE_FAILED'})
+ expect(await f.switcher.rebind('session-a',RUNNING_A)).toEqual({ok:false,reason:'STALE'})
+ expect(f.deps.fetch).toHaveBeenCalledTimes(1); expect(f.deps.recordAgentEnvironment).toHaveBeenCalledTimes(1)
+})
