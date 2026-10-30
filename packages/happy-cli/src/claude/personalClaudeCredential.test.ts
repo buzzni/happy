@@ -21,3 +21,12 @@ describe('personal credential isolation', () => {
 it('does not offer a legacy organization OAuth bundle as a personal login', () => {
  expect(selectPersonalClaudeCredential({version:1,encrypted:false,accounts:[account]},journal,1000,[[account.email,account.organizationUuid]])).toBeNull()
 })
+
+it('selects an exact personal account among multiple verified slots without guessing a default', () => {
+ const second = { ...account, email: 'second@example.test', config: { oauthAccount: { emailAddress: 'second@example.test', organizationUuid: account.organizationUuid } } }
+ const pool = { version: 1, encrypted: false, accounts: [account,second] }
+ expect(selectPersonalClaudeCredential(pool,journal,1000)).toBeNull()
+ const ref = selectPersonalClaudeCredential({...pool,accounts:[second]},journal,1000)!.accountRef
+ expect(selectPersonalClaudeCredential(pool,journal,1000,[],ref)?.label).toBe('se…@example.test')
+ expect(selectPersonalClaudeCredential(pool,journal,1000,[],'unknown')).toBeNull()
+})

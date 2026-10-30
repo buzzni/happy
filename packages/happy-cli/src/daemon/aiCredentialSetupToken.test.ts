@@ -1,3 +1,4 @@
+import { createManualPersonalSpawn, MANUAL_PERSONAL_ENV } from './manualPersonalClaude'
 import { join } from 'node:path'
 import { spawn as crossSpawn } from 'cross-spawn'
 import { spawnHappyCLI } from '../utils/spawnHappyCLI'
@@ -1422,4 +1423,33 @@ describe('managed Claude setup-token runtime', () => {
     expect(state.slots.map(slot => slot.managedAccountId)).toEqual([A])
     expect(state.slots[0]!.credentials).toEqual(managed(A, 1, fakeToken('a')).credentials)
   })
+})
+
+it.each(['none', 'revoke', 'generation', 'expiry'] as const)('authorizes an exact personal child through the real prepared launch gate (%s)', async change => {
+ const clock={now:NOW}, {runtime}=fakeMachine([],null,{clock})
+ await runtime.groupSync(sync(1,payload(managed(A,1,fakeToken('a')))))
+ const grant=bindingGrant(), issued=JSON.parse(Buffer.from(grant.split('.')[0],'base64url').toString())
+ const chosen={version:1 as const,accountRef:'a'.repeat(64),nonce:'b'.repeat(48),launchId:'personal-launch',consentProof:''}
+ const claims={type:'claude-personal-selection-v1',purpose:'manual',aud:`claude-collector-v1@${STUDIO}`,keyId:signing.keyId,
+  companyId:'company-1',userId:'user-1',machineId:'machine-1',bindingNonce:issued.nonce,sessionId:chosen.launchId,accountRef:chosen.accountRef,nonce:chosen.nonce,issuedAt:NOW,expiresAt:NOW+60000}
+ const encoded=Buffer.from(JSON.stringify(claims)).toString('base64url'); chosen.consentProof=`${encoded}.${sign(null,Buffer.from(encoded),signing.privateKey).toString('base64url')}`
+ const selection={kind:'claude-setup-token' as const,managedAccountId:A,groupScope:'company-1',credentialGeneration:1,bindingGrant:grant,personalSelection:chosen}
+ const authority=await runtime.sessionEnvironment('claude',selection)
+ const personal=await createManualPersonalSpawn(STUDIO,'machine-1',{now:()=>clock.now,
+  key:async()=>({version:1,type:'claude-collector-v1',algorithm:'Ed25519',keyId:signing.keyId,publicKeyBase64:signing.publicKeyBase64,audience:'n/a'}),
+  personal:async()=>({accountRef:chosen.accountRef,label:'synthetic personal',accessToken:'fixture-personal',expiresAt:NOW+900000})})(selection,authority,{...claims,nonce:issued.nonce})
+ const spawn=vi.fn(()=>{expect(personal.CLAUDE_CODE_OAUTH_TOKEN).toBe('fixture-personal');return 123})
+ if(change==='none') {
+  await expect(runtime.launchSession(personal,spawn)).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE')
+  expect(await runtime.launchSession(authority,spawn)).toBe(123)
+  expect(personal[MANUAL_PERSONAL_ENV]).toBe(chosen.accountRef)
+  expect(JSON.stringify(captureSaycodeAgentEnvironment(personal))).not.toContain('fixture-personal')
+  await expect(runtime.launchSession(authority,spawn)).rejects.toThrow('REPLAYED')
+ } else {
+  if(change==='revoke') await runtime.groupSync(sync(2,null))
+  if(change==='generation') await runtime.groupSync(sync(2,payload(managed(A,2,fakeToken('b')))))
+  if(change==='expiry') clock.now+=60000
+  await expect(runtime.launchSession(authority,spawn)).rejects.toThrow(/CLAUDE_SETUP_TOKEN_BINDING/)
+  expect(spawn).not.toHaveBeenCalled()
+ }
 })

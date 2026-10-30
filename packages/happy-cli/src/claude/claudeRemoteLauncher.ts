@@ -1,3 +1,4 @@
+import { MANUAL_PERSONAL_ENV } from '@/daemon/manualPersonalClaude';
 import { createSetupTokenActivityReporter } from './setupTokenActivity';
 import { MandatorySandboxError } from '@/sandbox/sandboxPolicy';
 import { randomUUID } from "node:crypto";
@@ -433,10 +434,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     const personalFallback = initialPersonalAuthority && !isMachineSetupTokenBinding(initialPersonalAuthority) && !session.managedRun && !session.exitAfterFirstTurn ? createPersonalClaudeFallback({
         env: process.env, now: Date.now, binding: () => process.env[SETUP_TOKEN_BINDING_ENV], busy: () => session.thinking || lastTurnChannel,
         availability: (binding, consent, failure) => requestSetupTokenAvailability(session.client.sessionId, binding, consent, failure),
-        personal: readPersonalClaudeCredential,
+        commitManual: async (binding, consent) => { const result = await requestSetupTokenAvailability(session.client.sessionId, binding, consent); if (!result.consentApproved) throw new PersonalClaudeRecheckRequired(); },
+        personal: readPersonalClaudeCredential, initialManual: process.env[MANUAL_PERSONAL_ENV],
         rebind: (binding, failure) => returnFromPersonalClaude(session.client.sessionId, binding, failure),
         notify: message => session.client.sendSessionEvent({ type: 'message', message }),
     }) : null;
+    await personalFallback?.initialize();
     const recheckPersonalInput = async (message: { channelRequestId?: string } | null) => {
         if (!message) return;
         try {
@@ -454,6 +457,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     };
     session.client.rpcHandlerManager.registerHandler('personal-claude-fallback', async (params: { action?: unknown; accountRef?: unknown; nonce?: unknown; consentProof?: unknown; personal?: unknown }) => {
         if (!personalFallback) return { version: 1, supported: false };
+        if (params.action === 'prepare-manual') {
+            if (typeof params.accountRef !== 'string' || !/^[a-f0-9]{64}$/.test(params.accountRef)) throw new Error('CLAUDE_PERSONAL_SELECTION_INVALID');
+            return { version: 1, supported: true, offer: await personalFallback.status(params.accountRef) };
+        }
         if (params.action === 'restore-organization') {
             const restored = await personalFallback.restoreOrganization();
             // Control requests must not reach an old SDK process that still holds the personal token.
@@ -518,7 +525,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         && setupTokenSwitching.lastFailureMayPass();
     const wakeOrganizationRecovery = () => { organizationRecoveryWake.abort(); organizationRecoveryWake = new AbortController(); };
     let providerCredentialGeneration = 0;
-    const setupTokenSwitching = runningAuthority() ? createSetupTokenAccountSwitching({
+    const setupTokenSwitching = (runningAuthority() || initialPersonalAuthority) ? createSetupTokenAccountSwitching({
         sessionId: () => session.client.sessionId ?? null,
         binding: () => personalFallback?.identity() ? undefined : providerBinding ?? runningAuthority(),
         report: reportSetupTokenUsage,

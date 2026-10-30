@@ -107,7 +107,7 @@ async function readBounded(body: ReadableStream<Uint8Array>, limit: number): Pro
 const wellFormedEnvelope = (envelope: unknown): envelope is string =>
   typeof envelope === 'string' && envelope.length <= MAX_ENVELOPE && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(envelope)
 
-async function fetchStudioPublicKey(origin: string, fetcher: typeof fetch): Promise<StudioPublicKey | null> {
+export async function fetchStudioPublicKey(origin: string, fetcher: typeof fetch): Promise<StudioPublicKey | null> {
   try {
     const response = await fetcher(`${origin}${STUDIO_PUBLIC_KEY_PATH}`, {
       method: 'GET', redirect: 'error', signal: AbortSignal.timeout(10_000), headers: { accept: 'application/json' },
