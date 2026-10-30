@@ -441,8 +441,11 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       } else {
         const packageVersion = await assertSupportedCodexMultiAuthInstalled()
         let accounts: unknown
+        const accountsPath = join(codexMultiAuthDir(), 'openai-codex-accounts.json')
+        let accountsRaw: string
         try {
-          accounts = JSON.parse(await deps.readFile(join(codexMultiAuthDir(), 'openai-codex-accounts.json')))
+          accountsRaw = await deps.readFile(accountsPath)
+          accounts = JSON.parse(accountsRaw)
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
             warnCodexCaptureReadFailure('openai-codex-accounts.json', error)
@@ -466,6 +469,34 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
           accounts,
           settings,
         })
+        if (input.codexRecovery !== true) {
+          const bundle = parseCodexMultiAuthBundle(payload)
+          if (!bundle) throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
+          const livePath = deps.env.CODEX_CLI_AUTH_PATH || join(codexHome(), 'auth.json')
+          const liveRaw = await readOptionalText(deps, livePath)
+          const live = parseOptionalCredentialJson(liveRaw)
+          const tokens = isObject(live?.tokens) ? live.tokens : null
+          if (tokens && typeof tokens.account_id === 'string'
+            && typeof tokens.access_token === 'string' && typeof tokens.refresh_token === 'string' && tokens.refresh_token) {
+            const subject = tokenSubject(tokens.access_token)
+            const claims = tokenClaims(tokens.access_token)
+            const expiresAt = typeof claims.exp === 'number' && Number.isFinite(claims.exp) ? claims.exp * 1000 : 0
+            const matches = bundle.accounts.accounts.filter(account => account.accountId === tokens.account_id)
+            const account = matches.length === 1 ? matches[0] : undefined
+            const storedClaims = tokenClaims(account?.accessToken)
+            const storedExpiresAt = typeof storedClaims.exp === 'number' && Number.isFinite(storedClaims.exp) ? storedClaims.exp * 1000 : 0
+            // A re-login can leave the exported pool behind. Refresh only an existing, exact
+            // workspace AND user; never import a different live login or regress a newer pool.
+            if (account && subject !== null && subject === tokenSubject(account.accessToken)
+              && expiresAt > deps.now() && expiresAt > storedExpiresAt) {
+              account.accessToken = tokens.access_token
+              account.refreshToken = tokens.refresh_token
+              account.expiresAt = expiresAt
+              await assertCredentialsUnchanged(deps, [{ path: livePath, expected: liveRaw }, { path: accountsPath, expected: accountsRaw }])
+              payload = JSON.stringify(bundle)
+            }
+          }
+        }
       }
       if (selected === 'codex' && input.codexRecovery === true) {
         const bundle = parseCodexMultiAuthBundle(payload)
@@ -504,10 +535,15 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   }
 
   function tokenSubject(token: unknown): string | null {
+    const claims = tokenClaims(token)
+    return typeof claims.sub === 'string' && claims.sub ? claims.sub : null
+  }
+
+  function tokenClaims(token: unknown): Record<string, unknown> {
     try {
       const claims = JSON.parse(Buffer.from(String(token).split('.')[1] || '', 'base64url').toString())
-      return typeof claims.sub === 'string' && claims.sub ? claims.sub : null
-    } catch { return null }
+      return isObject(claims) ? claims : {}
+    } catch { return {} }
   }
 
   async function repairCodex(input: { provider: 'codex'; payload: string }) {
