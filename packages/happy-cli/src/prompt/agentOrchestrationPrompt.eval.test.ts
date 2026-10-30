@@ -20,8 +20,11 @@ describe('natural-language child orchestration routing eval (T14)', () => {
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain(expectedPlan);
   });
 
-  it('lets a human-started hub control only verified own siblings, naming the target first', () => {
-    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('`own-sibling`');
+  it('lets a human-started hub only prompt verified own siblings, naming the target first', () => {
+    // Bundled saycode-cli 0.9.9 denies steer/stop for non-descendants (descendant-required).
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('you may also `prompt` a sibling that `happy agent ls` marks `own-sibling`');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('Steer and stop are only for your proven descendants');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).not.toMatch(/steer, or stop a sibling/);
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain("name the target conversation's title and full id to the user");
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('Never control your parent, other people\'s sessions, or sessions whose ownership is unproven');
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).not.toContain('Do not control siblings');
