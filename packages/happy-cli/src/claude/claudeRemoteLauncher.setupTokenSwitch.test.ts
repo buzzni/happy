@@ -16,6 +16,7 @@ import { requestSetupTokenStart, requestSetupTokenRebind, reportSetupTokenActivi
 import { APPLY_REQUIRED_NOTICE, CONTINUE_PROMPT, RESUME_REBOUND_NOTICE, SWITCHED_NOTICE } from './setupTokenAccountSwitching';
 import { PERSONAL_RECHECK_NOTICE } from './personalClaudeFallback';
 import { claudeCheckSession } from './utils/claudeCheckSession';
+import { describeClaudeLaunchFailure } from './utils/launchFailureMessage';
 
 vi.mock('@anthropic-ai/claude-agent-sdk', async (original) => ({
     ...await original<typeof import('@anthropic-ai/claude-agent-sdk')>(),
@@ -206,6 +207,93 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         expect(queue.size()).toBe(action === 'switch' ? 1 : 0);
         expect(inputs).not.toHaveBeenCalled();
         expect(requestSetupTokenStart).toHaveBeenCalledTimes(1);
+    });
+    it('reports a start admission failure on a later turn instead of dropping the message silently', async () => {
+        vi.mocked(requestSetupTokenStart)
+            .mockResolvedValueOnce({ state: 'allowed', validForMs: 15000 })
+            .mockRejectedValueOnce(new Error('SETUP_TOKEN_START_UNAVAILABLE'));
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const client = {
+            sessionId: 'happy-session-1',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            failClaudeLaunchTurn: vi.fn(() => { void handlers.get('switch')!(); }),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        const prompts: string[] = [];
+        vi.mocked(query).mockImplementation(({ prompt }) => Object.assign((async function* () {
+            yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+            for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                prompts.push(JSON.stringify(message.message.content));
+                yield assistant(`msg-${prompts.length}`);
+                yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: `result-${prompts.length}` };
+                if (prompts.length === 1) queue.push('second message', { permissionMode: 'default', model: 'claude-sonnet-5' });
+            }
+        })(), { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>);
+        queue.push('first message', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 }, cancelLessonReview: vi.fn(),
+            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
+        };
+
+        const running = claudeRemoteLauncher(session as unknown as Session);
+        await vi.waitFor(() => expect(client.failClaudeLaunchTurn).toHaveBeenCalledTimes(1), { timeout: 3000 });
+        await running;
+
+        expect(prompts).toHaveLength(1);
+        expect(prompts[0]).toContain('first message');
+        expect(requestSetupTokenStart).toHaveBeenCalledTimes(2);
+        expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message',
+            message: describeClaudeLaunchFailure(new Error('SETUP_TOKEN_START_UNAVAILABLE')) });
+    });
+    it('queues a batch held back after start admission once when switching to local mode', async () => {
+        vi.mocked(requestSetupTokenStart)
+            .mockResolvedValueOnce({ state: 'allowed', validForMs: 15000 })
+            .mockImplementationOnce(async () => {
+                // Another turn boundary rebinds the account while this turn waits for admission.
+                process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING = '{"account":"second"}';
+                return { state: 'allowed', validForMs: 15000 };
+            });
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const client = {
+            sessionId: 'happy-session-1',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        const prompts: string[] = [];
+        vi.mocked(query).mockImplementation(({ prompt }) => Object.assign((async function* () {
+            yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+            for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                prompts.push(JSON.stringify(message.message.content));
+                yield assistant('msg-1');
+                yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: 'result-1' };
+                queue.push('second message', { permissionMode: 'default', model: 'claude-sonnet-5' });
+            }
+            // The input ended for the stale provider; the user switches to local mode while it still exits.
+            void handlers.get('switch')!();
+            await new Promise(resolve => setTimeout(resolve, 200));
+        })(), { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>);
+        queue.push('first message', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 }, cancelLessonReview: vi.fn(),
+            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
+        };
+
+        await claudeRemoteLauncher(session as unknown as Session);
+
+        expect(prompts).toHaveLength(1);
+        expect(queue.size()).toBe(1);
     });
 
     it.each(['result', 'exception', 'auth-result', 'auth-exception', 'auth-continuation', 'auth-fresh', 'auth-thrown', 'auth-refresh'])('restarts the same conversation after a known account refusal (%s) and prioritizes the queued user message', async failure => {
