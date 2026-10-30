@@ -60,6 +60,12 @@ ON이어도 trust 설정(`HAPPY_SESSION_OWNERSHIP_ENABLED/ISSUER/AUDIENCE/PUBLIC
   managed·스위치 off를 포함한 모든 경로에서 broker 시작 전에 상속 주소를 지운다. 스위치
   `HAPPY_OWNER_CONTACT_V1`은 daemon 설정이므로 그대로 전달된다. 요청 env는 기존 sanitizer가
   `HAPPY_`/`SAYCODE_` 접두어를 이미 막는다.
+- **broker IPC 표시(D2-R4-01)**: broker는 시작 시 env를 복사하고 socket 주소는 broker 시작 뒤에 정해지므로,
+  broker가 띄운 CLI에는 `SAYCODE_OWNER_CONTACT_SOCKET`이 없다. 그래서 broker executor는 이 host가 owner
+  contact를 넘겼을 때만 CLI 자식 env에 `SAYCODE_OWNER_CONTACT_BROKER_IPC=1`을 넣고, 상속된 같은 이름은 먼저
+  지운다(스위치 off·capability 없음·managed면 넣지 않음). session-scope라 새 세션 경계에서 지워진다.
+  Desktop CLI는 socket env가 없을 때 이 값이 `'1'`이고 broker 진입(`__agent-broker-v1`)의 IPC 채널이 연결된
+  경우에만 broker IPC로 owner 요청을 보낸다. 표시가 없으면 IPC를 보내지 않아 구 broker에서 기다리지 않는다.
 - **webhook 순서**: Claude는 session-started 보고가 이 지점보다 늦을 수 있다. 발급은 launch pid로 하되
   launch가 다른 sessionId를 이미 갖고 있으면 거부한다. 조회는 webhook이 같은 sessionId를 확정한 뒤에만
   답하며, 확정 전은 `caller-pending`(binding 유지), 다른 세션·종료·계정 변경은 폐기다.
