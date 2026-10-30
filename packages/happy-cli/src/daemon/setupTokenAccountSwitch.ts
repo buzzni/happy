@@ -1,3 +1,4 @@
+import { MANUAL_PERSONAL_ENV } from './manualPersonalClaude'
 import { randomUUID } from 'node:crypto'
 import type { SetupTokenActivity } from '@slopus/happy-wire'
 /**
@@ -11,7 +12,7 @@ import type { SetupTokenActivity } from '@slopus/happy-wire'
  */
 import { MachineRotationError } from './machineSetupTokenProtocol'
 import type { MachineSetupTokenRuntime } from './machineSetupTokenRuntime'
-import { isMachineSetupTokenBinding } from './sessionEnv'
+import { formatSetupTokenBinding, isMachineSetupTokenBinding } from './sessionEnv'
 import type { AiAuthSelection, SetupTokenBinding } from './sessionEnv'
 import { parseSharedMachineSetupTokenAuthority, readSetupTokenResumeSelection, SETUP_TOKEN_BINDING_ENV, sharedMachineSetupTokenAccount } from './sessionEnv'
 import type { TrackedSession } from './types'
@@ -44,7 +45,7 @@ export type SetupTokenAccountSwitchDeps = {
    */
   measure?(input: { companyId: string; machineId: string; managedAccountId: string; credentialGeneration: number; permit: Record<string, unknown> }): Promise<Record<string, unknown> | null>
   /** Durable ACK required; change committed memory only after publication succeeds. */
-  recordAgentEnvironment(session: TrackedSession, binding: string): SessionPersistenceResult | Promise<SessionPersistenceResult>
+  recordAgentEnvironment(session: TrackedSession, binding: string, manualRef?: string | null): SessionPersistenceResult | Promise<SessionPersistenceResult>
   /**
    * An unbound shared-PC session moves within the accounts assigned to this PC, without Studio
    * (Saycode specs/shared-pc-session-account-continuation). `rebind` and `environment` answer null when none is usable;
@@ -123,7 +124,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     }
     if (session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV] !== pending.committed) return failure('STALE', 'committed binding changed before publication')
     let result: SessionPersistenceResult | undefined
-    try { result = await deps.recordAgentEnvironment(session, pending.nextBinding) }
+    try { result = await deps.recordAgentEnvironment(session, pending.nextBinding, null) }
     catch {
       // An unexpected throw does not prove that publication never happened.
       pending.indeterminate = true
@@ -295,17 +296,23 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
         return response.ok ? { ok: true } : failure(refusal(response.status), `activity ${response.status}`)
       } catch { return failure('REQUEST_FAILED', 'activity report failed') }
     },
-    async availability(sessionId: string, running: string, personalConsent?: { proof: string; accountRef: string; nonce: string }, organizationFailure?: { kind: 'authentication'; observedAt: number }) {
+    async availability(sessionId: string, running: string, personalConsent?: { proof: string; accountRef: string; nonce: string; purpose?: 'manual'; commit?: true }, organizationFailure?: { kind: 'authentication'; observedAt: number }) {
       const bound = boundSession(deps, sessionId, running)
       if (!bound || isMachineSetupTokenBinding(bound.recorded.binding) || !deps.studioOrigin) return { ok: false as const, reason: 'NOT_BOUND' }
       const binding = bound.recorded.binding
       try {
         const response = await post('availability', { machineId: deps.machineId, sessionId, companyId: binding.companyId,
-          bindingNonce: binding.nonce, ...(organizationFailure ? { organizationFailure } : {}), ...(personalConsent ? { personalConsent } : {}), ...(binding.tokenProof ? { credentialProofVersion: 1 } : {}) })
+          bindingNonce: binding.nonce, ...(organizationFailure ? { organizationFailure } : {}), ...(personalConsent ? { personalConsent: { proof: personalConsent.proof, accountRef: personalConsent.accountRef, nonce: personalConsent.nonce, ...(personalConsent.purpose ? { purpose: personalConsent.purpose } : {}) } } : {}), ...(bound.session.agentEnvironment?.[MANUAL_PERSONAL_ENV] ? { manualSelection: true } : {}), ...(binding.tokenProof ? { credentialProofVersion: 1 } : {}) })
         const body = await response.json() as Record<string, unknown>
         if (body.fallbackReason !== undefined && (typeof body.fallbackReason !== 'string' || !['quota-exhausted', 'organization-authentication', 'organization-lookup'].includes(body.fallbackReason))) return { ok: false as const, reason: 'REQUEST_FAILED' as const }
         if (!response.ok || body.version !== 1 || typeof body.allLimited !== 'boolean' || !Array.isArray(body.availableAccountIds)
           || !body.availableAccountIds.every(id => typeof id === 'string' && UUID.test(id))) return { ok: false as const, reason: refusal(response.status) }
+        if (personalConsent?.purpose === 'manual' && personalConsent.commit === true && body.consentApproved === true) {
+          const current = boundSession(deps, sessionId, running)
+          if (!current || current.session !== bound.session || current.recorded.binding.nonce !== bound.recorded.binding.nonce) return { ok: false as const, reason: 'STALE' as const }
+          const result = await deps.recordAgentEnvironment(bound.session, formatSetupTokenBinding(bound.recorded.binding), personalConsent.accountRef)
+          if (result.status !== 'committed') return { ok: false as const, reason: 'REQUEST_FAILED' as const }
+        }
         return { ok: true as const, allLimited: body.allLimited, availableAccountIds: body.availableAccountIds as string[], consentApproved: body.consentApproved === true, ...(body.fallbackReason ? { fallbackReason: body.fallbackReason as 'quota-exhausted' | 'organization-authentication' | 'organization-lookup' } : {}) }
       } catch { return { ok: false as const, reason: 'REQUEST_FAILED' } }
     },

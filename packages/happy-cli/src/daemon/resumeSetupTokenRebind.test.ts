@@ -89,3 +89,20 @@ describe('organization-only resume requirement', () => {
     expect(own).toHaveBeenCalledTimes(1)
   })
 })
+
+it('does not mistake a saved manual choice with a valid organization anchor for an organization-only resume', () => {
+ const record = {version:1,managedAccountId:'00000000-0000-4000-8000-000000000001',credentialGeneration:1,groupScope:'org',companyId:'org',userId:'u',machineId:'pc',keyId:'f'.repeat(64),nonce:'00000000-0000-4000-8000-000000000002',issuedAt:1}
+ const requirement = {version:1 as const,kind:'organization' as const,companyId:'org'}, authority = {HAPPY_AI_AUTH_SETUP_TOKEN_BINDING:JSON.stringify(record)}
+ expect(organizationResumeRefusal(requirement,authority)).toBeUndefined()
+ expect(organizationResumeRefusal(requirement,{...authority,HAPPY_AI_AUTH_MANUAL_PERSONAL:'a'.repeat(64)})).toBe('CLAUDE_ORGANIZATION_RESUME_REQUIRED')
+ expect(organizationResumeRefusal(requirement,{...authority,HAPPY_AI_AUTH_MANUAL_PERSONAL:'a'.repeat(64)},true)).toBeUndefined()
+})
+it('preserves the exact manual choice when only its organization authority anchor has to be rebound', async () => {
+ const preserveManual = vi.fn(async()=>true), input = {sessionId:'s',recorded:RECORDED,manualChoice:'a'.repeat(64),preserveManual,
+   resolve:async()=>{throw refused('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE')},rebind:async()=>({ok:true as const,environment:NEXT})}
+ expect(await resumeSetupTokenEnvironment(input)).toEqual({environment:NEXT,rebound:true})
+ expect(preserveManual).toHaveBeenCalledWith(NEXT,'a'.repeat(64))
+ preserveManual.mockResolvedValue(false)
+ await expect(resumeSetupTokenEnvironment(input)).rejects.toThrow('PERSISTENCE_REQUIRED')
+ await expect(resumeSetupTokenEnvironment({...input,manualChoice:''})).rejects.toThrow('SELECTION_INVALID')
+})

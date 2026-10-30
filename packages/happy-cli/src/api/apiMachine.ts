@@ -1,3 +1,4 @@
+import { readPersonalClaudeCredentials } from '@/claude/personalClaudeCredential';
 import { registerOwnedSpawnRpc, type OwnedSpawnRpc } from '@/daemon/ownedSpawnRpc';
 import { z } from 'zod';
 import type { createDeviceEnrollment } from '@/daemon/deviceEnrollment';
@@ -1199,8 +1200,10 @@ export class ApiMachineClient {
         ));
         this.rpcHandlerManager.registerHandler('ai-credential:token-probe', params => aiCredentialRuntime.tokenProbe(params), { customerBound: true });
         this.rpcHandlerManager.registerHandler('ai-credential:collector-probe', params => aiCredentialRuntime.collectorProbe(params, this.machine.id), { customerBound: true });
+        this.rpcHandlerManager.registerHandler('ai-credential:personal-claude-accounts', async () => ({ version: 1, accounts: (await readPersonalClaudeCredentials()).map(({ accountRef, label, roster }) => ({ accountRef, label, roster })) }), { customerBound: true });
         this.rpcHandlerManager.registerHandler('ai-credential:capabilities', async () => {
-            const capabilities = await aiCredentialRuntime.capabilities(this.machine.id);
+            const baseCapabilities = await aiCredentialRuntime.capabilities(this.machine.id);
+            const capabilities = { ...baseCapabilities, ...(baseCapabilities.newSessionProfileBinding ? { personalClaudeSelectionVersion: 1 } : {}) };
             if (!setupTokenAssignmentKillSwitchEnabled()
                 && capabilities.setupTokenVersion === 1 && capabilities.setupTokenStatusVersion === 1) {
                 return {

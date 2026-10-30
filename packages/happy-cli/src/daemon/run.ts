@@ -1,3 +1,4 @@
+import { createManualPersonalSpawn, MANUAL_PERSONAL_ENV } from './manualPersonalClaude';
 import { createOwnedSpawnRuntime, createOwnedStartGuard } from './ownedSpawnRuntime';
 import { drainWorktreeOperations } from './worktreeOps';
 import { createMachineSetupTokenProtocol, MachineRotationError } from './machineSetupTokenProtocol';
@@ -1891,6 +1892,7 @@ export async function startDaemon(): Promise<void> {
       return value.id;
     };
 
+    const applyManualPersonal = createManualPersonalSpawn(readTrustedStudioOrigin(process.env), machineId);
     const spawnSessionUnchecked = async (
       options: SpawnSessionOptions,
       trustedMcpContext?: AutomationMcpSpawnContext,
@@ -2117,9 +2119,12 @@ export async function startDaemon(): Promise<void> {
           preparedMachineSessionId = preparedMachineLaunch.session.id;
           pendingMachineStarts.add(preparedMachineSessionId);
         }
-        const managedAiCredentialEnvironment = preparedMachineLaunch?.environment ?? (honorsManagedAiCredentials(options.aiAuthSelection)
+        let managedAiCredentialEnvironment = preparedMachineLaunch?.environment ?? (honorsManagedAiCredentials(options.aiAuthSelection)
           ? await resolveManagedAiCredentialEnvironment(options.agent, options.aiAuthSelection)
           : {});
+        const personalAnchor = readSetupTokenResumeSelection(managedAiCredentialEnvironment)?.binding;
+        managedAiCredentialEnvironment = await applyManualPersonal(options.aiAuthSelection, managedAiCredentialEnvironment,
+          personalAnchor && !isMachineSetupTokenBinding(personalAnchor) ? personalAnchor : undefined);
         logger.debug(`[timing] spawn managed-credential-environment ${Date.now() - credentialStartedAt}ms`);
         let extraEnv: Record<string, string> = injectMcpCallerGrant(
           stripManagedCredentialConflicts(
@@ -2853,7 +2858,9 @@ export async function startDaemon(): Promise<void> {
       if (pendingMachineStarts.has(happySessionId)) return { type: 'error', code: 'SESSION_LIVE', errorMessage: 'The execution-bound session is still starting; retry shortly.' };
       // Before a live child is reused or a new one started: a session with no record of the required organization
       // would run on whatever login this PC has, which the caller asked to rule out.
-      const organizationRefusal = organizationResumeRefusal(options?.aiAuthRequirement, findTrackedSessionById(happySessionId)?.agentEnvironment);
+      const resumeSource = findTrackedSessionById(happySessionId)?.agentEnvironment;
+      const restoreManualToOrganization = !!options?.aiAuthRequirement && resumeSource?.[MANUAL_PERSONAL_ENV] !== undefined && !hasLiveDaemonChild(happySessionId, pidToTrackedSession.values(), isPidAlive, ownsUnresolvedJob);
+      const organizationRefusal = organizationResumeRefusal(options?.aiAuthRequirement, resumeSource, restoreManualToOrganization);
       if (organizationRefusal) return { type: 'error', code: 'CLAUDE_ORGANIZATION_RESUME_REQUIRED', errorMessage: `Session ${happySessionId} has no record of the required organization account.` };
       let endResumeLaunch: (() => void) | undefined;
       try {
@@ -3080,6 +3087,8 @@ export async function startDaemon(): Promise<void> {
           resumedCredentials = recoveredMachineEnvironment ? { environment: recoveredMachineEnvironment, rebound: false } : await resumeSetupTokenEnvironment({
             sessionId: happySessionId,
             recorded: tracked.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV],
+            manualChoice: restoreManualToOrganization ? undefined : tracked.agentEnvironment?.[MANUAL_PERSONAL_ENV],
+            preserveManual: (environment, ref) => persistSetupTokenBinding(tracked, environment[SETUP_TOKEN_BINDING_ENV], ref).status === 'committed',
             resolve: () => resolveManagedAiCredentialEnvironment(resumeAgent, resumeBinding?.selection, resumeBinding?.binding),
             rebind: (sessionId, running) => setupTokenAccountSwitch?.rebind(sessionId, running) ?? Promise.resolve({ ok: false, reason: 'STUDIO_UNAVAILABLE' }),
           });
@@ -3087,6 +3096,7 @@ export async function startDaemon(): Promise<void> {
           resumingSetupTokenSessions.delete(happySessionId);
         }
         const managedAiCredentialEnvironment = resumedCredentials.environment;
+        if (restoreManualToOrganization && (!managedAiCredentialEnvironment[SETUP_TOKEN_BINDING_ENV] || persistSetupTokenBinding(tracked, managedAiCredentialEnvironment[SETUP_TOKEN_BINDING_ENV], null).status !== 'committed')) throw new Error('CLAUDE_PERSONAL_SELECTION_PERSISTENCE_REQUIRED');
         const mcpEnvironment = prepareMcpChildEnvironment({
           environmentVariables: overlayManagedCredentialEnvironment(buildResumedSessionSpawnEnvironment({
             inherited: inheritedResumeEnvironment,

@@ -66,7 +66,7 @@ describe('setup-token account switch (specs/claude-setup-token-account-selection
       body: { machineId: 'pc-a', sessionId: 'session-a', companyId: 'org-a', bindingNonce: NONCE_A, selectionRequestId: expect.any(String) } })
     expect(deps.sessionEnvironment).toHaveBeenCalledWith('claude', { kind: 'claude-setup-token', managedAccountId: B, groupScope: 'org-a', credentialGeneration: 1, bindingGrant: 'claims.signature' })
     expect(result).toEqual({ ok: true, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next', HAPPY_AI_AUTH_SOURCE: 'org-bundle', [SETUP_TOKEN_BINDING_ENV]: formatSetupTokenBinding(binding(B)) } })
-    expect(deps.recordAgentEnvironment).toHaveBeenCalledWith(session, formatSetupTokenBinding(binding(B)))
+    expect(deps.recordAgentEnvironment).toHaveBeenCalledWith(session, formatSetupTokenBinding(binding(B)), null)
   })
 
   it('treats a missing durable ACK as indeterminate and never returns a token', async () => {
@@ -515,4 +515,15 @@ it('carries authentication failure to rebind with the running binding proof befo
  const { switcher, requests } = setup()
  expect(await switcher.rebind('session-a', RUNNING_A, { observedAt: 100, reason: 'authentication-failed', windows: [], retryAt: null })).toHaveProperty('ok', true)
  expect(requests[0].body).toMatchObject({ bindingNonce: NONCE_A, organizationFailure: { kind: 'authentication', observedAt: 100 } })
+})
+
+it('stores an authorized manual choice only at commit and does not forward local commit flags to Studio', async () => {
+ const f=setup({fetch:vi.fn(async()=>Response.json({version:1,allLimited:false,availableAccountIds:[A],consentApproved:true})) as typeof fetch})
+ const consent={purpose:'manual' as const,proof:'fixture-proof',accountRef:'a'.repeat(64),nonce:'b'.repeat(48)}
+ expect(await f.switcher.availability('session-a',RUNNING_A,consent)).toMatchObject({ok:true,consentApproved:true})
+ expect(f.deps.recordAgentEnvironment).not.toHaveBeenCalled()
+ expect(await f.switcher.availability('session-a',RUNNING_A,{...consent,commit:true})).toMatchObject({ok:true,consentApproved:true})
+ expect(f.deps.recordAgentEnvironment).toHaveBeenCalledWith(f.session,RUNNING_A,consent.accountRef)
+ const sent=JSON.parse(String(vi.mocked(f.deps.fetch).mock.calls[1][1]?.body))
+ expect(sent.personalConsent).toEqual(consent)
 })

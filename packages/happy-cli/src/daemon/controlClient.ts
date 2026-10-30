@@ -552,7 +552,7 @@ export async function requestSetupTokenRebind(sessionId: string, binding: string
 }
 
 /** Secret-free, authenticated quota evidence. An unanswered/old server never authorizes personal spending. */
-export async function requestSetupTokenAvailability(sessionId: string, binding: string, personalConsent?: { proof: string; accountRef: string; nonce: string }, organizationFailure?: { kind: 'authentication'; observedAt: number }): Promise<{ allLimited: boolean; availableAccountIds: string[]; consentApproved: boolean; fallbackReason?: 'quota-exhausted' | 'organization-authentication' | 'organization-lookup' }> {
+export async function requestSetupTokenAvailability(sessionId: string, binding: string, personalConsent?: { proof: string; accountRef: string; nonce: string; purpose?: 'manual'; commit?: true }, organizationFailure?: { kind: 'authentication'; observedAt: number }): Promise<{ allLimited: boolean; availableAccountIds: string[]; consentApproved: boolean; fallbackReason?: 'quota-exhausted' | 'organization-authentication' | 'organization-lookup' }> {
     const result = await daemonPost('/setup-token/availability', { sessionId, binding, ...(personalConsent ? { personalConsent } : {}), ...(organizationFailure ? { organizationFailure } : {}) }, undefined, 30_000)
     if (result?.fallbackReason !== undefined && !['quota-exhausted', 'organization-authentication', 'organization-lookup'].includes(result.fallbackReason)) throw new Error('CLAUDE_ORGANIZATION_AVAILABILITY_UNCONFIRMED')
     if (result?.ok !== true || typeof result.allLimited !== 'boolean' || !Array.isArray(result.availableAccountIds)

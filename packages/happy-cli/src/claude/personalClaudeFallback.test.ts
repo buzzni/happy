@@ -1,13 +1,13 @@
 import { describe, it, expect, vi } from 'vitest'
 import { createPersonalClaudeFallback } from './personalClaudeFallback'
 const credential = { accountRef: 'personal-ref', label: 'pe…@example.test', accessToken: 'fixture-personal', expiresAt: 900000 }
-function fixture() {
+function fixture(busy = () => false) {
  const clock={now:1000}
  const env: Record<string, string | undefined> = { HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: 'org-binding', CLAUDE_CODE_OAUTH_TOKEN: 'fixture-org', ANTHROPIC_API_KEY: 'must-remove' }
  const availability = vi.fn(async () => ({ allLimited: true, consentApproved: true, availableAccountIds: [] as string[] }))
  const personal = vi.fn(async () => credential)
  const rebind = vi.fn(async () => ({ ok: true as const, environment: { HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: 'new-org-binding', CLAUDE_CODE_OAUTH_TOKEN: 'new-org-token' } }))
- const state = createPersonalClaudeFallback({ env, binding: () => env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING, availability, personal, rebind, busy: () => false, now: () => clock.now, notify: vi.fn() })
+ const state = createPersonalClaudeFallback({ env, binding: () => env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING, availability, personal, rebind, busy, now: () => clock.now, notify: vi.fn() })
  return { state, env, availability, personal, rebind, clock }
 }
 describe('same conversation personal fallback', () => {
@@ -105,4 +105,42 @@ it('rejects consent that expires during the online authority check', async () =>
  f.availability.mockImplementation(async()=>{f.clock.now=61001;return{allLimited:true,availableAccountIds:[],consentApproved:true}})
  await expect(f.state.accept(offer!.accountRef,offer!.nonce!,'fixture-proof')).rejects.toThrow()
  expect(f.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('fixture-org')
+})
+
+it('manually chooses personal Claude with organization quota left and keeps the choice', async () => {
+ const f=fixture(); f.availability.mockResolvedValue({allLimited:false, availableAccountIds:['org'], consentApproved:true})
+ const offer=await f.state.status(credential.accountRef)
+ expect(offer).toMatchObject({accountRef:credential.accountRef,reason:'manual-selection'})
+ await f.state.accept(offer!.accountRef,offer!.nonce!,'manual-proof')
+ expect(f.availability).toHaveBeenLastCalledWith('org-binding',expect.objectContaining({purpose:'manual'}),undefined)
+ await f.state.beforeUserTurn()
+ expect(f.rebind).not.toHaveBeenCalled()
+ expect(f.state.identity()).toMatchObject({accountRef:credential.accountRef})
+ expect(await f.state.restoreOrganization()).toBe(true)
+ expect(f.state.identity()).toBeNull()
+})
+
+it('defers a manual selection during a response until the next verified request boundary', async () => {
+ let busy = true
+ const f = fixture(() => busy), offer = await f.state.status(credential.accountRef)
+ await f.state.accept(offer!.accountRef, offer!.nonce!, 'manual-proof')
+ expect(f.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('fixture-org')
+ expect(f.state.identity()).toBeNull()
+ expect(f.state.generation()).toBe(0)
+ busy = false; await f.state.beforeUserTurn()
+ expect(f.state.identity()?.accountRef).toBe(credential.accountRef)
+ expect(f.state.generation()).toBe(1)
+ expect(await f.state.status()).toMatchObject({state:'personal', mode:'manual'})
+})
+
+it('revalidates a persisted manual choice before initializing the provider on the same conversation', async () => {
+ const f = fixture()
+ const restored = createPersonalClaudeFallback({ env:f.env, binding:()=>f.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING, initialManual:credential.accountRef,
+ availability:f.availability, personal:f.personal, rebind:f.rebind, busy:()=>false, now:()=>f.clock.now, notify:vi.fn() })
+ f.availability.mockResolvedValue({allLimited:false,availableAccountIds:['org'],consentApproved:false})
+ await restored.initialize(); await restored.beforeUserTurn()
+ expect(restored.identity()?.accountRef).toBe(credential.accountRef)
+ expect(f.rebind).not.toHaveBeenCalled()
+ f.availability.mockRejectedValue(new Error('revoked'))
+ await expect(restored.beforeUserTurn()).rejects.toThrow()
 })

@@ -1,3 +1,4 @@
+import { MANUAL_PERSONAL_ENV } from './manualPersonalClaude'
 /**
  * Resume authority for a setup-token-bound session whose recorded account left this PC
  * (Saycode specs/managed-account-session-continuation).
@@ -23,14 +24,18 @@ export async function resumeSetupTokenEnvironment(input: {
   /** The session's recorded binding; absent for a session that never ran on an organization account. */
   recorded: string | undefined
   resolve: () => Promise<Record<string, string>>
+  manualChoice?: string
+  preserveManual?: (environment: Record<string, string>, accountRef: string) => boolean | Promise<boolean>
   rebind: (sessionId: string, running: string) => Promise<RebindResult>
 }): Promise<{ environment: Record<string, string>; rebound: boolean }> {
+  if (input.manualChoice !== undefined && !/^[a-f0-9]{64}$/.test(input.manualChoice)) throw new Error('CLAUDE_PERSONAL_SELECTION_INVALID')
   try {
     return { environment: await input.resolve(), rebound: false }
   } catch (error) {
     if (!input.recorded || !(error instanceof AiCredentialRuntimeError) || error.failureCause || !ACCOUNT_LEFT.has(error.kind)) throw error
     const result = await input.rebind(input.sessionId, input.recorded)
     if (!result.ok) throw new AiCredentialRuntimeError(`CLAUDE_SETUP_TOKEN_RESUME_${result.reason}`)
+    if (input.manualChoice && (!input.preserveManual || !await input.preserveManual(result.environment, input.manualChoice))) throw new Error('CLAUDE_PERSONAL_SELECTION_PERSISTENCE_REQUIRED')
     return { environment: result.environment, rebound: true }
   }
 }
@@ -53,8 +58,9 @@ export function parseResumeAuthRequirement(value: unknown): ResumeAuthRequiremen
  * A Desktop that turned personal Claude off cannot see which account an idle-reaped conversation used.
  * The recorded binding can: a session that has one never resumes on a personal login (see above).
  */
-export function organizationResumeRefusal(requirement: ResumeAuthRequirement | undefined, agentEnvironment: SaycodeAgentEnvironment | undefined): string | undefined {
+export function organizationResumeRefusal(requirement: ResumeAuthRequirement | undefined, agentEnvironment: SaycodeAgentEnvironment | undefined, restoringManual = false): string | undefined {
   if (!requirement) return undefined
+  if (agentEnvironment?.[MANUAL_PERSONAL_ENV] !== undefined && !restoringManual) return 'CLAUDE_ORGANIZATION_RESUME_REQUIRED'
   let companyId: string | undefined
   try { companyId = readSetupTokenResumeSelection(agentEnvironment)?.binding.companyId } catch { /* An unreadable record proves nothing. */ }
   return companyId === requirement.companyId ? undefined : 'CLAUDE_ORGANIZATION_RESUME_REQUIRED'
