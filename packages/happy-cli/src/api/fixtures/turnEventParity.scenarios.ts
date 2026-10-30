@@ -49,6 +49,7 @@ vi.mock('@/utils/time', () => ({ backoff: async <T>(callback: () => Promise<T>) 
     delay: vi.fn(async () => undefined), isSessionGoneError: () => false }));
 vi.mock('@/utils/lidState', () => ({ shouldReconnect: () => true }));
 vi.mock('@/daemon/controlClient', () => ({ notifyDaemonSessionRuntime: vi.fn(async () => ({ status: 'ok' })),
+    requestSetupTokenStart: vi.fn(async () => ({ state: 'allowed', validForMs: 15_000 })),
     reportSetupTokenActivity: vi.fn(async () => ({ ok: true })),
     notifyDaemonAutomationTurnResult: mocks.report, reportSetupTokenUsage: vi.fn(async () => {}),
     requestSetupTokenRebind: vi.fn(async () => ({ ok: true, environment: {
