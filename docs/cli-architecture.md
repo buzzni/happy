@@ -13,6 +13,22 @@ and tombstone-based Chat resume keep their existing lifecycle.
 The policy and reconsideration boundaries are in
 [the implementation plan](plans/github-automation-artifact-reclaim.md).
 
+## Native Codex project grouping
+
+After a new native Codex thread's first user turn is accepted, `codexProjectBinding.ts` optionally
+assigns it to one existing native project whose canonical root exactly matches
+the SayCode launch's `SAYCODE_AGENT_SCOPE`. The canonical cwd must remain inside
+that scope. This background enrichment uses bounded `project/list` pagination
+and `thread/metadata/update` on the creating app-server connection. It does not
+change cwd, sandbox, Happy metadata, transcript, resume or thread/start arguments.
+Unsupported APIs, ambiguity, lookup/update failure, shutdown or a replaced process
+skip the assignment and preserve the successfully created thread. It never
+creates projects or moves older conversations. Revisit the scope source when
+external worktrees receive an explicit original-project identity; do not infer
+membership from folder names or broaden execution scope for display grouping.
+These disposable display RPCs do not hold the explicit authentication-recovery
+busy gate; turn, approval and goal-control operations keep their existing guards.
+
 ## Worktree Git write ownership
 
 Ticket-validated worktree writes share Desktop's common Git directory lock.
