@@ -248,7 +248,7 @@ describe('host owner-contact wiring (startHappyServer)', () => {
         expect(w.startBroker).toHaveBeenCalledWith(undefined);
         await started.close();
     });
-    it('hands the contact to the broker and opens a socket for the provider\'s chat only [D2pre-C]', async () => {
+    it.skipIf(process.platform === 'win32')('hands the contact to the broker and opens a socket for the provider\'s chat only [D2pre-C]', async () => {
         const h = harness(), w = wiring(h, { broker: true });
         w.env.SAYCODE_OWNER_CONTACT_SOCKET = '/parent/contact.sock';
         const started = await w.start();
@@ -302,13 +302,15 @@ describe('host owner-contact wiring (startHappyServer)', () => {
         ['abort-own-turn', { v: 1, entry: 'agent', operation: 'abort-own-turn', targetSessionId: 'sibling', payload: { sessionId: 'sibling', runtimeId: 'r' } }],
     ] as const)('refuses broker sibling/parent %s for an agent command at depth >= 1 (P0a §2.3)', async (_name, sibling) => {
         const h = harness({ depth: '1' }), w = wiring(h, { broker: true });
-        await w.start();
-        const contact = (w.startBroker.mock.calls[0] as unknown[])[0] as { call(raw: unknown): Promise<{ result: string }> };
-        h.register({ ...(await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller, depth: 1 });
-        await expect(contact.call(sibling)).rejects.toThrow();
-        expect(h.lookups).toEqual([]);
+        const started = await w.start();
+        try {
+            const contact = (w.startBroker.mock.calls[0] as unknown[])[0] as { call(raw: unknown): Promise<{ result: string }> };
+            h.register({ ...(await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller, depth: 1 });
+            await expect(contact.call(sibling)).rejects.toThrow();
+            expect(h.lookups).toEqual([]);
+        } finally { await started.close(); }
     });
-    it('below depth 0 a broker host refuses chat lookup but leaves explicit chat targets to main [D2pre-C]', async () => {
+    it.skipIf(process.platform === 'win32')('below depth 0 a broker host refuses chat lookup but leaves explicit chat targets to main [D2pre-C]', async () => {
         const h = harness({ depth: '1' }), w = wiring(h, { broker: true });
         const started = await w.start();
         const contact = (w.startBroker.mock.calls[0] as unknown[])[0] as { call(raw: unknown): Promise<unknown> };
@@ -328,13 +330,15 @@ describe('host owner-contact wiring (startHappyServer)', () => {
     });
     it('lets a depth >= 1 broker agent reach its own owned-child operations [H2-R-04]', async () => {
         const h = harness({ depth: '1' }), w = wiring(h, { broker: true });
-        await w.start();
-        const contact = (w.startBroker.mock.calls[0] as unknown[])[0] as { call(raw: unknown): Promise<unknown> };
-        h.register({ ...(await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller, depth: 1 });
-        const child = { operationId: 'operation', spawnId: 'spawn', spawnDigest: 'a'.repeat(64) };
-        await contact.call({ v: 1, entry: 'agent', operation: 'owned-child-status', payload: child }).catch(() => undefined);
-        // Past the broker policy: the contact was looked up for this source (the fake main then answers).
-        expect(h.lookups.length).toBeGreaterThan(0);
+        const started = await w.start();
+        try {
+            const contact = (w.startBroker.mock.calls[0] as unknown[])[0] as { call(raw: unknown): Promise<unknown> };
+            h.register({ ...(await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller, depth: 1 });
+            const child = { operationId: 'operation', spawnId: 'spawn', spawnDigest: 'a'.repeat(64) };
+            await contact.call({ v: 1, entry: 'agent', operation: 'owned-child-status', payload: child }).catch(() => undefined);
+            // Past the broker policy: the contact was looked up for this source (the fake main then answers).
+            expect(h.lookups.length).toBeGreaterThan(0);
+        } finally { await started.close(); }
     });
     it.skipIf(process.platform === 'win32')('keeps direct agent commands at every depth', async () => {
         const h = harness({ depth: '3' }), w = wiring(h);
@@ -355,6 +359,7 @@ describe('host owner-contact wiring (startHappyServer)', () => {
         const started = await w.start();
         expect(w.startBroker).toHaveBeenCalledWith(undefined);
         expect(started.broker).toEqual({ contact: undefined });
+        await started.close();
     });
 });
 describe('launch capability pipe (host side) [H2-R-01]', () => {
