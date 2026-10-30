@@ -856,7 +856,8 @@ describe('ApiMachineClient socket reconnection', () => {
             version: 1, kind: 'codex-multi-auth', packageVersion: '2.16.0', accounts,
             settings: { version: 1, pluginConfig: {} },
         });
-        expect(readFile).not.toHaveBeenCalledWith(join('/fixed/codex', 'auth.json'));
+        // Optional live-login freshness is checked; a missing auth file leaves the pool unchanged.
+        expect(readFile).toHaveBeenCalledWith(join('/fixed/codex', 'auth.json'));
         expect(writeFile).not.toHaveBeenCalled();
     });
 

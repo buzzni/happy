@@ -473,8 +473,15 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
           const bundle = parseCodexMultiAuthBundle(payload)
           if (!bundle) throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
           const livePath = deps.env.CODEX_CLI_AUTH_PATH || join(codexHome(), 'auth.json')
-          const liveRaw = await readOptionalText(deps, livePath)
-          const live = parseOptionalCredentialJson(liveRaw)
+          let liveRaw: string | null = null
+          let live: Record<string, unknown> | null = null
+          try {
+            liveRaw = await readOptionalText(deps, livePath)
+            live = parseOptionalCredentialJson(liveRaw)
+          } catch {
+            // This is an optional freshness overlay: a broken/unreadable live login
+            // must not prevent exporting an otherwise valid account pool.
+          }
           const tokens = isObject(live?.tokens) ? live.tokens : null
           if (tokens && typeof tokens.account_id === 'string'
             && typeof tokens.access_token === 'string' && typeof tokens.refresh_token === 'string' && tokens.refresh_token) {
