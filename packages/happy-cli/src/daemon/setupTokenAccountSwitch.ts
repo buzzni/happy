@@ -284,6 +284,24 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
   }
 
   return {
+    async requestStart(sessionId: string, running: string, requestId: string, signal?: AbortSignal) {
+      const parsed = parseBinding(running)
+      if (parsed && isMachineSetupTokenBinding(parsed.binding)) {
+        try {
+          const runtime = await deps.machineRuntime?.(parsed.binding.companyId)
+          return runtime ? await runtime.requestStart(sessionId, running, requestId, signal) : failure('STUDIO_UNAVAILABLE', 'start runtime absent')
+        } catch (error) { return machineFailure(error) }
+      }
+      const bound = boundSession(deps, sessionId, running)
+      if (!bound || !deps.studioOrigin || bound.state !== 'same') return failure('NOT_BOUND', 'start: current binding absent')
+      const binding = parsed!.binding
+      try {
+        signal?.throwIfAborted()
+        const response = await post('start', { machineId: deps.machineId, sessionId, companyId: binding.companyId, bindingNonce: binding.nonce, requestId })
+        if (!response.ok) return failure(refusal(response.status), 'start refused')
+        return { ok: true as const, admission: await response.json() }
+      } catch { return failure('REQUEST_FAILED', 'start unavailable') }
+    },
     async reportActivity(sessionId: string, running: string, activity: SetupTokenActivity, signal?: AbortSignal): Promise<{ ok: true } | { ok: false; reason: SwitchFailure }> {
       const parsed = parseBinding(running)
       if (parsed && isMachineSetupTokenBinding(parsed.binding)) {

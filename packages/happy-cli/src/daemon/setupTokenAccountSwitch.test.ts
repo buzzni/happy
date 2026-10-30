@@ -589,3 +589,14 @@ it('refuses an ordinary rebind over a pending explicit organization return', asy
  expect(await f.switcher.rebind('session-a',RUNNING_A)).toEqual({ok:false,reason:'STALE'})
  expect(f.deps.fetch).toHaveBeenCalledTimes(1); expect(f.deps.recordAgentEnvironment).toHaveBeenCalledTimes(1)
 })
+
+it('requests start admission using only the current authenticated binding', async () => {
+ const {switcher,deps,requests}=setup()
+ vi.mocked(deps.fetch).mockResolvedValueOnce(Response.json({version:1,state:'allowed',validForMs:15000}))
+ expect(await switcher.requestStart('session-a',RUNNING_A,'start-1')).toEqual({ok:true,admission:{version:1,state:'allowed',validForMs:15000}})
+ expect(requests).toHaveLength(0) // overridden fetch below is inspected directly
+ expect(vi.mocked(deps.fetch).mock.calls[0][0]).toBe('https://studio.test/api/claude-setup-token/daemon/start')
+ expect(JSON.parse(String(vi.mocked(deps.fetch).mock.calls[0][1]?.body))).toEqual({machineId:'pc-a',sessionId:'session-a',companyId:'org-a',bindingNonce:NONCE_A,requestId:'start-1'})
+ expect((await switcher.requestStart('other-session',RUNNING_A,'start-2')).ok).toBe(false)
+ expect(deps.fetch).toHaveBeenCalledTimes(1)
+})

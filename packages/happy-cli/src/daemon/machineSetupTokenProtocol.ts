@@ -15,7 +15,11 @@ export class MachineRotationError extends Error {
 }
 export type MachineRotationConfig = { companyId: string; machineId: string; studioOrigin: string; happyOrigin: string; studioPublicKey: string }
 const resultSchema = z.object({ version: z.literal(2), operationId: z.string().min(1).max(128),
-  state: z.enum(['pending', 'claimed', 'committed', 'exhausted', 'recorded']), tier: z.enum(['available', 'unknown', 'exhausted']).optional(),
+  state: z.enum(['pending', 'claimed', 'committed', 'exhausted', 'recorded', 'start']), tier: z.enum(['available', 'unknown', 'exhausted']).optional(),
+  admission: z.discriminatedUnion('state', [
+    z.object({ state: z.literal('allowed'), validForMs: z.number().int().positive().max(15000) }).strict(),
+    z.object({ state: z.literal('wait'), retryAfterMs: z.number().int().positive().max(600000), preferredAccountIds: z.array(z.string()) }).strict(),
+  ]).optional(),
   observationId: z.string().optional(), binding: MachineSetupTokenBindingV2DocumentSchema.optional(), executionTicket: SessionExecutionTicketSchema.optional(),
 }).strict()
 export type MachineRotationResult = z.infer<typeof resultSchema>
