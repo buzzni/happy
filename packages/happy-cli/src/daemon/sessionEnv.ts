@@ -1,3 +1,4 @@
+import { manualPersonalSelectionSchema, MANUAL_PERSONAL_ENV, type ManualPersonalSelection } from './manualPersonalClaude'
 import { MachineSetupTokenBindingV2Schema, parseCanonicalOrgSetupTokenJson, type MachineSetupTokenBindingV2 } from '@slopus/happy-wire'
 import { z } from 'zod'
 /**
@@ -50,7 +51,7 @@ type SaycodeAgentEnvironmentKey = typeof SAYCODE_AGENT_ENV_KEYS[number]
 const CHECKPOINT_CONTEXT_KEY = CHECKPOINT_SPAWN_CONTEXT_ENV_KEY
 /** Set from the spawn option `browserContinuation` only (request environment cannot carry HAPPY_AUTOMATION_*). */
 export const BROWSER_CONTINUATION_ENV = 'HAPPY_AUTOMATION_BROWSER_CONTINUATION'
-type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV
+type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV
 
 export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey, string>>
 
@@ -235,6 +236,7 @@ export function captureSaycodeAgentEnvironment(
     env: NodeJS.ProcessEnv,
 ): SaycodeAgentEnvironment | undefined {
     const captured: SaycodeAgentEnvironment = {}
+    if (env[MANUAL_PERSONAL_ENV] !== undefined) captured[MANUAL_PERSONAL_ENV] = /^[a-f0-9]{64}$/.test(env[MANUAL_PERSONAL_ENV]!) ? env[MANUAL_PERSONAL_ENV] : ''
     if (env[INPUT_EVIDENCE_ENV] === '0' || env[INPUT_EVIDENCE_ENV] === '1') captured[INPUT_EVIDENCE_ENV] = env[INPUT_EVIDENCE_ENV]
     if (env.SAYCODE_AGENT_ENV === '1' && env.SAYCODE_AGENT_ROOT?.trim()) {
         Object.assign(captured, Object.fromEntries(
@@ -493,7 +495,7 @@ export type AiAuthSelectionKind = (typeof AI_AUTH_SELECTION_KINDS)[number]
 export type AiAuthSelection =
     | { kind: 'machine-personal' | 'org-bundle' }
     /** `bindingGrant` is required on a new spawn; a resume rebuilds the selection from the recorded binding. */
-    | { kind: 'claude-setup-token'; managedAccountId: string; groupScope: string; credentialGeneration: number; bindingGrant?: string; credentialProofVersion?: 1 }
+    | { kind: 'claude-setup-token'; managedAccountId: string; groupScope: string; credentialGeneration: number; bindingGrant?: string; credentialProofVersion?: 1; personalSelection?: ManualPersonalSelection }
 
 /**
  * Advertised in `MachineMetadataSchema` so a client can tell this daemon
@@ -538,7 +540,9 @@ export function parseAiAuthSelection(value: unknown): AiAuthSelection | undefine
         }
         const credentialProofVersion = (value as { credentialProofVersion?: unknown }).credentialProofVersion
         if (credentialProofVersion !== undefined && credentialProofVersion !== 1) throw new Error('Unsupported setup-token credential proof version')
-        return { kind, managedAccountId, groupScope, credentialGeneration: Number(credentialGeneration), bindingGrant,
+        const rawPersonal = (value as { personalSelection?: unknown }).personalSelection
+        const personalSelection = rawPersonal === undefined ? undefined : manualPersonalSelectionSchema.parse(rawPersonal)
+        return { ...(personalSelection ? { personalSelection } : {}), kind, managedAccountId, groupScope, credentialGeneration: Number(credentialGeneration), bindingGrant,
             ...(credentialProofVersion === 1 ? { credentialProofVersion } : {}) }
     }
     return { kind: kind as 'machine-personal' | 'org-bundle' }
@@ -610,6 +614,7 @@ export function verifyAiAuthSelection(
 ): AiAuthSelectionVerdict {
     const appliedSource = normalizeAiAuthSource(env[HAPPY_AI_AUTH_SOURCE_ENV])
     if (selection === undefined) return { appliedSource }
+    if (selection.kind === 'claude-setup-token' && selection.personalSelection) return appliedSource === 'personal-subscription' && env[MANUAL_PERSONAL_ENV] === selection.personalSelection.accountRef ? { appliedSource } : { appliedSource, rejection: 'CLAUDE_PERSONAL_SELECTION_NOT_APPLIED' }
     if (appliedSource === selectionAppliedSource(selection.kind)) return { appliedSource }
     return {
         appliedSource,
