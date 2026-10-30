@@ -33,7 +33,7 @@ async function fixture() {
         return Response.json({ session: raw, ...(ownershipProof ? { ownership: { sessionId: 'session', ownershipBindingId: 'binding', registrationState: 'pending', createDigest: await sessionCreateBodyHash(create) } } : {}) });
     }) as typeof fetch;
     const persist = vi.fn(async () => ({ status: 'committed' as const }));
-    const build = () => createOwnedSpawnRuntime({ home, happyOrigin: signed.audience, env: { HAPPY_SESSION_OWNERSHIP_ENABLED: '1', HAPPY_SESSION_OWNERSHIP_ISSUER: signed.issuer,
+    const build = (extra: Partial<Parameters<typeof createOwnedSpawnRuntime>[0]> = {}) => createOwnedSpawnRuntime({ home, happyOrigin: signed.audience, env: { HAPPY_SESSION_OWNERSHIP_ENABLED: '1', HAPPY_SESSION_OWNERSHIP_ISSUER: signed.issuer,
         HAPPY_SESSION_OWNERSHIP_AUDIENCE: signed.audience, HAPPY_SESSION_OWNERSHIP_PUBLIC_KEYS: JSON.stringify({ [signed.keyId]: Buffer.from(keys.publicKey).toString('base64url') }) },
         registration: async () => { if (!current) throw new Error('identity-changed'); return { machineId: 'machine', epoch: 'registration', credentials: { token: 'synthetic-machine-bearer', encryption: { type: 'legacy', secret: new Uint8Array(32) } } }; },
         metadata: () => ({ path: '/project', host: 'box', machineId: 'machine', flavor: 'codex' }) as Metadata,
@@ -45,6 +45,7 @@ async function fixture() {
             tracked = { pid: 123, happySessionId: 'session', startedBy: 'daemon', directory: '/project' };
             return { type: 'success', sessionId: 'session' };
         },
+        ...extra,
     });
     return { spawn, intent, build, persist, journal: createOwnedSpawnJournal(home), clearAgentState: () => { raw!.agentState = null }, counts: () => ({ posts, starts }), lose: () => { lose = true }, logout: () => { current = false },
         proof: (p: { sessionCreateBodyHash: string; sessionTagHash: string }) => signOwnership({ ...signed, ...scope, type: 'saycode-session-ownership',
@@ -67,6 +68,14 @@ it('transports the signed snapshot through encrypted machine RPC and answers a m
     const fresh = await restarted.callerBinding({ sessionId: 'session', nonce }) as typeof reply;
     expect(fresh.caller.callerBindingId).not.toBe(reply.caller.callerBindingId);
     expect(f.counts()).toEqual({ posts: 1, starts: 1 });
+});
+it('answers non-journal sources only from daemon-vouched launch bindings (T1c-b2 H2)', async () => {
+    const f = await fixture(), nonce = 'main-verifier-nonce';
+    await expect(f.build().callerBinding({ sessionId: 'terminal-source', nonce })).rejects.toThrow('caller-unavailable');
+    const query = vi.fn(async (raw: unknown) => ({ version: 1, nonce, caller: { sessionId: (raw as { sessionId: string }).sessionId } }));
+    const runtime = f.build({ launchCallers: { query } });
+    expect(await runtime.callerBinding({ sessionId: 'launched-source', nonce })).toEqual({ version: 1, nonce, caller: { sessionId: 'launched-source' } });
+    expect(query).toHaveBeenCalledWith({ sessionId: 'launched-source', nonce });
 });
 it('rejects forged signatures and local registration changes without a POST', async () => {
     const f = await fixture(), runtime = f.build();

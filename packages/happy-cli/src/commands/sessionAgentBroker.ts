@@ -1,3 +1,4 @@
+import type { SessionOwnerContact } from '@/daemon/sessionOwnerContact'
 import { configuration } from '@/configuration'
 import { runAgentHostProcess } from './agentHostProcess'
 import { createAgentIdentityAuthority, type AgentIdentityAuthority } from '@/daemon/agentIdentityDescriptor'
@@ -16,6 +17,7 @@ export function createAgentHostExecutor(input: {
    * know the variable ignores it, and its children wait as before.
    */
   delegatedAttendance?: () => DelegatedAttendance | null
+  ownerContact?: SessionOwnerContact
   identityAuthority?: AgentIdentityAuthority
 }) {
   const directory = realpathSync(input.directory)
@@ -34,7 +36,7 @@ export function createAgentHostExecutor(input: {
     const attendance = input.delegatedAttendance?.() ?? null
     const callEnv = attendance ? { ...env, [DELEGATED_ATTENDANCE_ENV]: attendance } : env
     return runAgentHostProcess({ entrypoint, argv, directory, env: callEnv, signal,
-      sourceSessionId: input.sessionId, identityAuthority })
+      sourceSessionId: input.sessionId, identityAuthority, ownerContact: input.ownerContact })
   }
 }
 
@@ -52,11 +54,11 @@ export async function startSessionAgentBroker(sessionId: string, env: NodeJS.Pro
   admit: <T>(work: () => Promise<T>) => Promise<T> = work => work(),
   entrypoint: string | null = compatibleAgentHostEntrypoint(),
   delegatedAttendance?: () => DelegatedAttendance | null,
-  identityAuthority?: AgentIdentityAuthority) {
+  identityAuthority?: AgentIdentityAuthority, ownerContact?: SessionOwnerContact) {
   if (!entrypoint || env.SAYCODE_AGENT_ENV !== '1' || !env.SAYCODE_AGENT_ROOT || !sessionId) return null
   const trustedEnv: NodeJS.ProcessEnv = { ...env, HAPPY_HOME_DIR: configuration.happyHomeDir, HAPPY_SERVER_URL: configuration.serverUrl, SAYCODE_SERVER_URL: configuration.serverUrl }
   delete trustedEnv.SAYCODE_HAPPY_HOME
-  const execute = createAgentHostExecutor({ sessionId, directory: process.cwd(), env: trustedEnv, entrypoint, delegatedAttendance, identityAuthority })
+  const execute = createAgentHostExecutor({ sessionId, directory: process.cwd(), env: trustedEnv, entrypoint, delegatedAttendance, identityAuthority, ownerContact })
   const broker = await startAgentBroker({ execute: (argv, signal) => admit(() => execute(argv, signal)) })
   // A Happy host owns one provider session. Resume starts a new host and mints a fresh capability.
   const previous = { url: env.SAYCODE_AGENT_BROKER_URL, token: env.SAYCODE_AGENT_BROKER_CAPABILITY }
