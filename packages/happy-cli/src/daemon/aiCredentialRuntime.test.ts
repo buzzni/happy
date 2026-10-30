@@ -234,6 +234,29 @@ describe('AI credential machine runtime', () => {
     expect(configured.writeFile).not.toHaveBeenCalled()
   })
 
+  it.each([
+    { name: 'truncated', raw: '{"tokens":{"account_id":"acc' },
+    { name: 'non-object', raw: 'null' },
+    { name: 'unreadable', error: 'EACCES' },
+  ])('keeps the Codex pool capture when the live auth.json is $name', async ({ raw, error }) => {
+    const current = codexMultiAuthBundle()
+    const authPath = '/home/operator/.codex/auth.json'
+    const warn = vi.fn()
+    const configured = setup({ warn, readFile: vi.fn(async path => {
+      if (path === authPath && error) throw Object.assign(new Error('/private/path fixture-secret'), { code: error })
+      const value = configured.files.get(path)
+      if (value === undefined) throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+      return value
+    }) })
+    configured.files.set('/home/operator/.codex/multi-auth/openai-codex-accounts.json', JSON.stringify(current.accounts))
+    if (raw !== undefined) configured.files.set(authPath, raw)
+
+    expect(JSON.parse((await configured.runtime.capture({ provider: 'codex' })).payload)).toEqual(current)
+    expect(configured.writeFile).not.toHaveBeenCalled()
+    expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining('could not read auth.json'))
+    expect(warn.mock.calls.flat().join(' ')).not.toContain('fixture-secret')
+  })
+
   it('captures the working live Codex login into a recovery snapshot without changing the source files', async () => {
     const current = codexMultiAuthBundle()
     const token = (sub: string) => `header.${Buffer.from(JSON.stringify({ sub, exp: 9999999999 })).toString('base64url')}.signature`
