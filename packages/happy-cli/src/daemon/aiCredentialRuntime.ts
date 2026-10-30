@@ -414,7 +414,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   }
 
   function warnCodexCaptureReadFailure(
-    fileName: 'openai-codex-accounts.json' | 'settings.json',
+    fileName: 'openai-codex-accounts.json' | 'settings.json' | 'auth.json',
     error: unknown,
   ): void {
     const errorCode = (error as NodeJS.ErrnoException | undefined)?.code
@@ -473,14 +473,14 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
           const bundle = parseCodexMultiAuthBundle(payload)
           if (!bundle) throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
           const livePath = deps.env.CODEX_CLI_AUTH_PATH || join(codexHome(), 'auth.json')
+          // The live login only refreshes a pool entry; an unusable auth.json (e.g. mid-rewrite) means none.
           let liveRaw: string | null = null
           let live: Record<string, unknown> | null = null
           try {
             liveRaw = await readOptionalText(deps, livePath)
             live = parseOptionalCredentialJson(liveRaw)
-          } catch {
-            // This is an optional freshness overlay: a broken/unreadable live login
-            // must not prevent exporting an otherwise valid account pool.
+          } catch (error) {
+            warnCodexCaptureReadFailure('auth.json', error)
           }
           const tokens = isObject(live?.tokens) ? live.tokens : null
           if (tokens && typeof tokens.account_id === 'string'
