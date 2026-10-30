@@ -116,3 +116,48 @@ it('preserves all JSON keys in existing permission data, including prototype-loo
   r.payload.updatedInput = JSON.parse('{"__proto__":{"tool":"value"},"constructor":{"answer":1},"prototype":null}');
   expect(OwnerRelayRequestSchema.parse(r)).toEqual(r);
 });
+
+// D2 pre: main's live prompt guard observation on a read reply. Not write authority; main rechecks at prompt.
+describe('read snapshot promptGuard observation [D2pre-G]', () => {
+  const read = () => copy(fixture.vectors[1].reply) as any;
+  const guard = { v: 1, targetSessionId: 'target-1', expectedRuntimeId: 'runtime-target-1', expectedMode: 'remote', expectedModeEpoch: 3 };
+  const withGuard = (promptGuard: unknown) => { const r = read(); r.sessionView.snapshot.promptGuard = promptGuard; return r; };
+  it('golden fixture carries both a guarded and an unguarded read reply', () => {
+    const reads = fixture.vectors.filter(v => v.reply.operation === 'read-session').map(v => (v.reply as any).sessionView.snapshot.promptGuard);
+    expect(reads.some(g => g === null)).toBe(true);
+    expect(reads.some(g => g !== null && typeof g === 'object')).toBe(true);
+  });
+  it('accepts the live-checked guard for the read target and null for an unconfirmed one', () => {
+    expect(OwnerRelayReplySchema.parse(withGuard(guard))).toEqual(withGuard(guard));
+    expect(OwnerRelayReplySchema.safeParse(withGuard(null)).success).toBe(true);
+  });
+  it('requires an explicit observation: absence is not a silent null', () => {
+    const r = read(); delete r.sessionView.snapshot.promptGuard;
+    expect(OwnerRelayReplySchema.safeParse(r).success).toBe(false);
+  });
+  it.each([
+    ['a local mode', { ...guard, expectedMode: 'local' }],
+    ['no mode epoch', (({ expectedModeEpoch, ...g }) => g)(guard)],
+    ['a negative epoch', { ...guard, expectedModeEpoch: -1 }],
+    ['a fractional epoch', { ...guard, expectedModeEpoch: 1.5 }],
+    ['an unknown version', { ...guard, v: 2 }],
+    ['an empty runtime', { ...guard, expectedRuntimeId: '' }],
+    ['an unknown guard field', { ...guard, grant: 'write' }],
+    ['a non-object', 'remote'],
+  ])('rejects a guard with %s', (_name, value) => {
+    expect(OwnerRelayReplySchema.safeParse(withGuard(value)).success).toBe(false);
+  });
+  it('rejects a guard naming another target than the read session', () => {
+    expect(OwnerRelayReplySchema.safeParse(withGuard({ ...guard, targetSessionId: 'other-target' })).success).toBe(false);
+  });
+  it('rejects unknown snapshot fields next to the guard', () => {
+    const r = withGuard(guard); r.sessionView.snapshot.modeEpoch = 3;
+    expect(OwnerRelayReplySchema.safeParse(r).success).toBe(false);
+  });
+  it('is the same type a prompt payload carries as hubPrompt', () => {
+    const p = copy(fixture.vectors[2].request) as any;
+    const { entry, operation, payload } = p;
+    expect(OwnerContactRequestSchema.safeParse({ v: 1, entry, operation, targetSessionId: guard.targetSessionId, localId: p.localId,
+      payload: { ...payload, hubPrompt: guard } }).success).toBe(true);
+  });
+});

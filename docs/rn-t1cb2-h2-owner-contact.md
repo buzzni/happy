@@ -75,6 +75,8 @@ ON이어도 trust 설정(`HAPPY_SESSION_OWNERSHIP_ENABLED/ISSUER/AUDIENCE/PUBLIC
 - **직접 경로**: broker가 없으면 owner-only Unix socket(`sessionOwnerContactLocal`)을 열고 주소만
   `SAYCODE_OWNER_CONTACT_SOCKET`으로 provider env에 둔다. 상속된 주소는 먼저 지운다. 종료 시 binding 폐기,
   소켓·env 제거.
+- **broker 옆 chat 진입(D2 사전 보완)**: broker가 있어도 같은 owner-only socket을 열지만 chat verb만 받는다.
+  아래 "D2 사전 보완 — broker 모드의 chat 진입" 절 참조.
 - 기존 broker protocol `{version:1,argv}`, broker ownership IPC, 기존 read/후손 분기는 변경하지 않았다.
 
 ## 남은 것 — H2 밖이거나 이 변경으로 완료되지 않은 것
@@ -120,3 +122,36 @@ p0a §4.5는 owner relay wire에 기존 RPC의 암호화·method/scope/nonce 규
 - 응답은 `readBoundRpcResponse`로 같은 nonce의 `{rpcBinding:1, nonce, result}`만 받는다.
 - DEK가 없는(legacy) 세션은 owner relay를 쓸 수 없다(`owner-relay-unavailable`, 송신 0회). account legacy 키를 대안으로 쓰지 않는다.
 - 수신 측(Desktop main D1)은 contact의 hubId로 source 세션 DEK를 정하고, 같은 envelope의 method·scope·issuedAt 창·nonce 일회성을 검사한다.
+
+## D2 사전 보완 — broker 모드의 chat 진입 (2026-10-30)
+
+Desktop D2 사전 연결 검토 2항: broker가 있으면 socket을 만들지 않아, provider가 따로 실행한 credential 없는
+`saycode chat -s`가 owner relay에 닿을 수 없었다. p0a §2.3 "agent 환경 일반 chat, 모든 경로" 행과 §5.1("credential을
+읽을 수 없는 broker 환경도 §4.4 local port로 접속")을 따라 broker가 있을 때도 owner-only socket을 연다.
+
+- **socket은 chat verb만 받는다.** `entry:'agent'`는 503으로 거부한다(agent 명령은 기존처럼 broker IPC와 그 depth
+  정책만 쓴다). `spawn-owned-child`·`owned-child-status`도 거부한다. owned child는 broker가 예약에서 ID를 고정하는
+  연산이고(§4.5·§4.6), §5.1의 chat verb(조회·입력·resume·permission·abort)에 생성은 없다. steer/stop은 wire에 없으므로
+  넓어지지 않는다. 자기 대상 거부(self-target)는 main이 판정한다.
+- **depth≥1 broker 모드의 chat lookup은 거부한다.** 판단: §2.3 chat 행은 "모든 경로"에서 read ACL 안 own 조회를
+  허용하고 §4.5는 "agent 환경 chat의 own 허용은 모든 depth"라고 한다. 반면 §2.3 A3 문단은 "broker depth ≥1의 형제
+  비노출 등 원래 read 제한은 유지한다"고 하고, §4.5 lookup 문단은 "broker 하위 agent 명령의 형제 비노출 같은 경로
+  제한은 유지한다"고 한다. 같은 provider가 `chat`으로 lookup하면 agent 명령에 막힌 형제 열거를 다시 열 수 있는데,
+  계약은 이 경우를 명시하지 않는다. 그래서 지휘 결정대로 더 좁은 쪽을 구현했다: depth≥1 broker host의
+  `entry:'chat'` `lookup-readable-sessions`는 lookup 전에 거부한다. 우회 경로가 없도록 **broker IPC의 chat entry에도
+  같은 규칙을 적용**했다(기존 H2 테스트의 "depth≥1 broker IPC chat lookup 허용" 기대를 바꿨다). 명시한 target의
+  read/prompt/resume/permission/abort는 main 판정으로 보낸다(own은 모든 depth). depth 0과 직접 경로는 바뀌지 않는다.
+- **수명주기**: socket에 넘기는 contact는 binding을 폐기하지 않는다. socket이 시작에 실패하거나 먼저 닫혀도 broker가
+  쓰는 binding은 남고, binding 폐기는 host 종료(`close`)가 한 번 한다. 종료 시 env의 주소를 지우고 socket을 닫는다.
+  상속 주소 삭제(H2-R-05), 스위치 off·managed·capability 없음에서 socket·env 변경 없음은 기존과 같다.
+- 기존 broker protocol `{version:1,argv}`와 broker ownership IPC는 바꾸지 않았다.
+
+남은 것: provider sandbox(mandatory/wrapped)가 socket에 접근할 수 있는지는 기존 직접 경로와 같은 미확인이다.
+실제 broker host를 띄운 별도 CLI 프로세스의 왕복은 D2(Desktop CLI 소비자)에서 검증한다.
+
+검증: `sessionOwnerContactHost.test.ts`의 `[D2pre-C]` 4건 추가, 기존 1건(broker에 socket 없음 → chat socket)과
+depth≥1 broker 테스트의 chat lookup 기대를 갱신했다. 구현 전 2건 실패(socket 없음, depth≥1 chat lookup 허용).
+역검증 3건: depth≥1 chat lookup 규칙, socket contact의 binding 비폐기, socket의 chat-only 검사를 각각 되돌리면 해당
+테스트 1건씩만 실패했다. 관련 7파일(`sessionOwnerContactHost/Local/Contact`, `sessionAgentBroker`, `startHappyServer`,
+`childEnv`, `agentCallerLaunches`의 `.test.ts`) 159건 통과·1건 기존 skip, `tsc --noEmit` 통과. 실소켓 테스트는 이 세션
+셸에서 listen이 가능해 직접 실행했다.

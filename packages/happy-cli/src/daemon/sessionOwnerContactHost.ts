@@ -89,7 +89,8 @@ export async function startSessionOwnerContactHost(input: {
 }
 
 /** startHappyServer wiring before the provider starts. Broker hosts receive the contact through the
- * broker's private IPC; direct hosts get an owner-only local port whose address is the only env value.
+ * broker's private IPC; the owner-only local port, whose address is the only env value, serves direct hosts
+ * and, beside a broker, the provider's own credential-less `chat` (Desktop P0a §2.3/§5.1).
  * Switch OFF or a managed session: exactly the existing broker launch, no key, report or env change. */
 export async function startHostOwnerContact<Broker>(input: {
     env: NodeJS.ProcessEnv;
@@ -112,17 +113,9 @@ export async function startHostOwnerContact<Broker>(input: {
     let closed = false;
     const host = await startSessionOwnerContactHost({ enabled: true, session: input.session, hostPid: input.hostPid,
         live: () => !closed, capability, issue: input.issue, current: input.current, token: input.token, fetch: input.fetch });
-    // Main cannot tell a broker caller from a direct one, so the broker's fixed entry policy lives here:
-    // a broker agent command below depth 0 gets no sibling/parent exposure or mutation (Desktop P0a §2.3).
-    // Its own owned-child operations are not sibling extension and pass to main (§4.6).
-    const brokerContact: SessionOwnerContact | undefined = host && host.binding.depth > 0 ? { close: () => host.contact.close(),
-        call: async raw => {
-            const request = OwnerContactRequestSchema.parse(raw);
-            if (request.entry === 'agent' && !OWNED_CHILD_OPERATIONS.has(request.operation)) throw new Error('owner-contact-unavailable');
-            return host.contact.call(request);
-        } } : host?.contact;
-    const broker = await input.startBroker(brokerContact);
-    const local = host && !broker ? await startSessionOwnerContactLocal({ enabled: true, contact: host.contact }).catch(() => null) : null;
+    const broker = await input.startBroker(host && host.binding.depth > 0 ? brokerEntryPolicy(host, 'broker') : host?.contact);
+    const socketContact = host && (broker ? brokerEntryPolicy(host, 'chat-socket') : host.contact);
+    const local = socketContact ? await startSessionOwnerContactLocal({ enabled: true, contact: socketContact }).catch(() => null) : null;
     const address = local?.environment.SAYCODE_OWNER_CONTACT_SOCKET;
     if (address) input.env.SAYCODE_OWNER_CONTACT_SOCKET = address;
     return { broker, async close() {
@@ -133,3 +126,20 @@ export async function startHostOwnerContact<Broker>(input: {
     } };
 }
 const OWNED_CHILD_OPERATIONS = new Set(['spawn-owned-child', 'owned-child-status']);
+/** Main cannot tell a broker caller from a direct one, so a broker host's fixed entry policy lives here.
+ * Below depth 0 an agent command gets no sibling/parent exposure or mutation and chat gets no lookup
+ * enumeration; explicit chat targets and the agent's own owned-child operations (§4.6) go to main.
+ * The chat socket beside a broker takes only chat verbs: agent commands keep the broker IPC, owned
+ * children stay a broker reservation. It never revokes the binding the broker still uses. */
+function brokerEntryPolicy(host: OwnerContactHost, via: 'broker' | 'chat-socket'): SessionOwnerContact {
+    const nested = host.binding.depth > 0;
+    return { close: via === 'broker' ? () => host.contact.close() : () => {},
+        call: async raw => {
+            const request = OwnerContactRequestSchema.parse(raw);
+            const child = OWNED_CHILD_OPERATIONS.has(request.operation);
+            if ((via === 'chat-socket' && (request.entry !== 'chat' || child))
+                || (nested && request.entry === 'agent' && !child)
+                || (nested && request.entry === 'chat' && request.operation === 'lookup-readable-sessions')) throw new Error('owner-contact-unavailable');
+            return host.contact.call(request);
+        } };
+}

@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { PassThrough } from 'node:stream';
 import { closeSync, fstatSync, openSync, writeFileSync } from 'node:fs';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ChildProcess } from 'node:child_process';
@@ -12,6 +13,20 @@ import { startHostOwnerContact, startSessionOwnerContactHost, takeOwnerContactCa
 import type { TrackedSession } from './types';
 
 const request = { v: 1, entry: 'agent', operation: 'lookup-readable-sessions', payload: { sessionIds: ['target'] } } as const;
+const chatRead = { v: 1, entry: 'chat', operation: 'read-session', targetSessionId: 'sibling', payload: { cursor: null, limit: 1, waitMs: 0 } } as const;
+const childStatus = { v: 1, entry: 'chat', operation: 'owned-child-status', payload: { operationId: 'operation', spawnId: 'spawn', spawnDigest: 'a'.repeat(64) } } as const;
+/** What a provider-run `saycode chat -s` does: POST a local DTO to the owner-only socket. */
+function post(socketPath: string, body: unknown) {
+    return new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const req = httpRequest({ socketPath, path: '/owner-contact-v1', method: 'POST', agent: false }, res => {
+            const chunks: Buffer[] = [];
+            res.on('data', chunk => chunks.push(chunk));
+            res.on('end', () => resolve({ status: res.statusCode!, body: Buffer.concat(chunks).toString() }));
+        });
+        req.on('error', reject);
+        req.end(JSON.stringify(body));
+    });
+}
 const b64 = (bytes: Uint8Array) => Buffer.from(bytes).toString('base64url');
 /** The daemon spawn path: returns the capability the host would read from its private pipe. */
 async function launchCapability(launches: ReturnType<typeof createAgentCallerLaunches>, pid: number) {
@@ -233,18 +248,44 @@ describe('host owner-contact wiring (startHappyServer)', () => {
         expect(w.startBroker).toHaveBeenCalledWith(undefined);
         await started.close();
     });
-    it('hands the contact to the broker without opening a local socket', async () => {
+    it.skipIf(process.platform === 'win32')('hands the contact to the broker and opens a socket for the provider\'s chat only [D2pre-C]', async () => {
         const h = harness(), w = wiring(h, { broker: true });
         w.env.SAYCODE_OWNER_CONTACT_SOCKET = '/parent/contact.sock';
         const started = await w.start();
         const contact = (w.startBroker.mock.calls[0] as unknown[])[0] as { call(raw: unknown): Promise<{ result: string }> };
         expect(contact).toBeDefined();
-        expect(w.env.SAYCODE_OWNER_CONTACT_SOCKET).toBeUndefined();
+        const socket = w.env.SAYCODE_OWNER_CONTACT_SOCKET!;
+        expect(socket).toEqual(expect.any(String));
+        expect(socket).not.toBe('/parent/contact.sock');
         const binding = (await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller;
         h.register(binding);
         expect((await contact.call(request)).result).toBe('allowed');
+        const chat = await post(socket, { ...request, entry: 'chat' });
+        expect(chat.status).toBe(200); expect(JSON.parse(chat.body).result).toBe('allowed');
+        const lookups = h.lookups.length;
+        // Agent commands keep the broker IPC and its depth policy; owned children stay a broker reservation.
+        expect((await post(socket, request)).status).toBe(503);
+        expect((await post(socket, childStatus)).status).toBe(503);
+        expect(h.lookups).toHaveLength(lookups);
         await started.close();
+        expect(w.env.SAYCODE_OWNER_CONTACT_SOCKET).toBeUndefined();
+        await expect(post(socket, { ...request, entry: 'chat' })).rejects.toThrow();
         await expect(contact.call(request)).rejects.toThrow();
+    });
+    it('a chat socket that cannot start leaves the broker binding usable [D2pre-C]', async () => {
+        const h = harness(), w = wiring(h, { broker: true });
+        const previous = process.env.TMPDIR;
+        // Too long for a Unix socket path: the socket fails after taking the contact it was given.
+        const long = join(mkdtempSync(join(tmpdir(), 'oc-long-')), 'x'.repeat(100));
+        mkdirSync(long);
+        process.env.TMPDIR = long;
+        let started!: Awaited<ReturnType<typeof w.start>>;
+        try { started = await w.start(); } finally { if (previous === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = previous; rmSync(long, { recursive: true, force: true }); }
+        expect(w.env.SAYCODE_OWNER_CONTACT_SOCKET).toBeUndefined();
+        const contact = (w.startBroker.mock.calls[0] as unknown[])[0] as { call(raw: unknown): Promise<{ result: string }> };
+        h.register((await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller);
+        expect((await contact.call(request)).result).toBe('allowed');
+        await started.close();
     });
     it.skipIf(process.platform === 'win32')('gives a direct runtime only the local socket address and removes it on close', async () => {
         const h = harness(), w = wiring(h);
@@ -261,22 +302,43 @@ describe('host owner-contact wiring (startHappyServer)', () => {
         ['abort-own-turn', { v: 1, entry: 'agent', operation: 'abort-own-turn', targetSessionId: 'sibling', payload: { sessionId: 'sibling', runtimeId: 'r' } }],
     ] as const)('refuses broker sibling/parent %s for an agent command at depth >= 1 (P0a §2.3)', async (_name, sibling) => {
         const h = harness({ depth: '1' }), w = wiring(h, { broker: true });
-        await w.start();
-        const contact = (w.startBroker.mock.calls[0] as unknown[])[0] as { call(raw: unknown): Promise<{ result: string }> };
+        const started = await w.start();
+        try {
+            const contact = (w.startBroker.mock.calls[0] as unknown[])[0] as { call(raw: unknown): Promise<{ result: string }> };
+            h.register({ ...(await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller, depth: 1 });
+            await expect(contact.call(sibling)).rejects.toThrow();
+            expect(h.lookups).toEqual([]);
+        } finally { await started.close(); }
+    });
+    it.skipIf(process.platform === 'win32')('below depth 0 a broker host refuses chat lookup but leaves explicit chat targets to main [D2pre-C]', async () => {
+        const h = harness({ depth: '1' }), w = wiring(h, { broker: true });
+        const started = await w.start();
+        const contact = (w.startBroker.mock.calls[0] as unknown[])[0] as { call(raw: unknown): Promise<unknown> };
         h.register({ ...(await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller, depth: 1 });
-        await expect(contact.call(sibling)).rejects.toThrow();
+        const socket = w.env.SAYCODE_OWNER_CONTACT_SOCKET!;
+        // Sibling non-exposure below depth 0 (P0a §2.3) also holds for chat enumeration, over either entry point.
+        await expect(contact.call({ ...request, entry: 'chat' })).rejects.toThrow();
+        expect((await post(socket, { ...request, entry: 'chat' })).status).toBe(503);
         expect(h.lookups).toEqual([]);
-        expect((await contact.call({ ...request, entry: 'chat' })).result).toBe('allowed');
+        // An explicit target is main's decision (own at every depth, self refused there): it reaches the lookup.
+        await post(socket, chatRead);
+        const viaSocket = h.lookups.length;
+        expect(viaSocket).toBeGreaterThan(0);
+        await contact.call(chatRead).catch(() => undefined);
+        expect(h.lookups.length).toBeGreaterThan(viaSocket);
+        await started.close();
     });
     it('lets a depth >= 1 broker agent reach its own owned-child operations [H2-R-04]', async () => {
         const h = harness({ depth: '1' }), w = wiring(h, { broker: true });
-        await w.start();
-        const contact = (w.startBroker.mock.calls[0] as unknown[])[0] as { call(raw: unknown): Promise<unknown> };
-        h.register({ ...(await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller, depth: 1 });
-        const child = { operationId: 'operation', spawnId: 'spawn', spawnDigest: 'a'.repeat(64) };
-        await contact.call({ v: 1, entry: 'agent', operation: 'owned-child-status', payload: child }).catch(() => undefined);
-        // Past the broker policy: the contact was looked up for this source (the fake main then answers).
-        expect(h.lookups.length).toBeGreaterThan(0);
+        const started = await w.start();
+        try {
+            const contact = (w.startBroker.mock.calls[0] as unknown[])[0] as { call(raw: unknown): Promise<unknown> };
+            h.register({ ...(await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller, depth: 1 });
+            const child = { operationId: 'operation', spawnId: 'spawn', spawnDigest: 'a'.repeat(64) };
+            await contact.call({ v: 1, entry: 'agent', operation: 'owned-child-status', payload: child }).catch(() => undefined);
+            // Past the broker policy: the contact was looked up for this source (the fake main then answers).
+            expect(h.lookups.length).toBeGreaterThan(0);
+        } finally { await started.close(); }
     });
     it.skipIf(process.platform === 'win32')('keeps direct agent commands at every depth', async () => {
         const h = harness({ depth: '3' }), w = wiring(h);
@@ -284,11 +346,20 @@ describe('host owner-contact wiring (startHappyServer)', () => {
         expect(w.env.SAYCODE_OWNER_CONTACT_SOCKET).toBeDefined();
         await started.close();
     });
+    it.skipIf(process.platform === 'win32')('keeps the direct socket open to agent and chat lookup at every depth [D2pre-C]', async () => {
+        const h = harness({ depth: '3' }), w = wiring(h);
+        const started = await w.start();
+        h.register({ ...(await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller, depth: 3 });
+        const socket = w.env.SAYCODE_OWNER_CONTACT_SOCKET!;
+        for (const entry of ['agent', 'chat']) expect(JSON.parse((await post(socket, { ...request, entry })).body).result).toBe('allowed');
+        await started.close();
+    });
     it('starts without owner contact when the daemon refuses', async () => {
         const h = harness({ daemonEnabled: false }), w = wiring(h, { broker: true });
         const started = await w.start();
         expect(w.startBroker).toHaveBeenCalledWith(undefined);
         expect(started.broker).toEqual({ contact: undefined });
+        await started.close();
     });
 });
 describe('launch capability pipe (host side) [H2-R-01]', () => {
