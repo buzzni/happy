@@ -64,6 +64,26 @@ describe('McpCallerGrantEnvelopeConsumer', () => {
         });
     });
 
+    it('예약 실행이 교환한 trusted grant로 resume child env를 만든다', () => {
+        const consumer = { consume: () => { throw new Error('envelope must not be consumed'); } };
+
+        expect(prepareMcpChildEnvironment({
+            environmentVariables: { SAFE: 'value', HAPPY_APLUS_MCP_CALLER_GRANT: 'stale-grant' },
+            trustedMcpCallerGrant: grant({ projectId: 'chat:c' }),
+            mcpConfigProjectId: 'chat:c',
+            lifecycle: 'resume',
+            trustedConfigUrl: 'https://saycode.ai/api/me/mcp-config',
+        }, consumer)).toEqual({
+            ok: true,
+            environmentVariables: {
+                SAFE: 'value',
+                HAPPY_APLUS_MCP_CALLER_GRANT: grant({ projectId: 'chat:c' }),
+                HAPPY_APLUS_MCP_CONFIG_URL: 'https://saycode.ai/api/me/mcp-config?project_id=chat%3Ac',
+                HAPPY_APLUS_MCP_INITIAL_LIFECYCLE: 'resume',
+            },
+        });
+    });
+
     it('resume child용 envelope가 잘못되면 축소 권한 env를 만들지 않는다', () => {
         const keyPair = tweetnacl.box.keyPair();
         const consumer = new McpCallerGrantEnvelopeConsumer({

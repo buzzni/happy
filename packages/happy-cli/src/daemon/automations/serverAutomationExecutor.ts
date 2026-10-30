@@ -198,7 +198,7 @@ export interface ServerAutomationExecutorInput {
     claimToken: string
     sessionId: string
   }) => Promise<{ ok: boolean; error?: string; skipped?: boolean }>
-  deliverConversation?: (input: { runId: string; claimToken: string; sessionId: string; directory: string; prompt: string }) => Promise<{ ok: true; sessionId: string } | { ok: false; error: string }>
+  deliverConversation?: (input: { runId: string; claimToken: string; sessionId: string; directory: string; prompt: string; mcpSpawnContext?: AutomationMcpSpawnContext }) => Promise<{ ok: true; sessionId: string } | { ok: false; error: string }>
   resumeSession: (input: {
     sessionId: string
     directory: string
@@ -1881,7 +1881,7 @@ async function executeStartedRun(
   } else {
     step(payload.conversation ? 'deliver-conversation' : 'spawn-session')
     spawned = payload.conversation
-      ? await input.deliverConversation?.({ ...run, sessionId: payload.conversation.sessionId, directory: payload.directory, prompt: initialPrompt }) ?? { ok: false, error: 'conversation delivery unsupported' }
+      ? await input.deliverConversation?.({ ...run, sessionId: payload.conversation.sessionId, directory: payload.directory, prompt: initialPrompt, ...(spawnMcpContext ? { mcpSpawnContext: spawnMcpContext } : {}) }) ?? { ok: false, error: 'conversation delivery unsupported' }
       : await input.spawnSession(workerSpawnInput)
   }
   if (spawned.ok && agentTaskDispatch) input.maintainAgentTaskLease(agentTaskDispatch)

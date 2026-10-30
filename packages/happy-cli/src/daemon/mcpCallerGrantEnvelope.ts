@@ -211,6 +211,8 @@ export function prepareMcpChildEnvironment(
     input: {
         environmentVariables: Record<string, string>;
         mcpCallerGrantEnvelope?: string;
+        /** A grant the daemon exchanged itself (scheduled run); used only when no envelope is given. */
+        trustedMcpCallerGrant?: string;
         mcpConfigProjectId?: string;
         expectedConnectors?: string[];
         lifecycle?: 'spawn' | 'resume';
@@ -220,7 +222,7 @@ export function prepareMcpChildEnvironment(
 ): { ok: true; environmentVariables: Record<string, string> }
     | { ok: false; reason: ConsumeFailureReason } {
     const projectId = input.mcpConfigProjectId?.trim() || null;
-    let grant: string | undefined;
+    let grant: string | undefined = input.trustedMcpCallerGrant;
     if (input.mcpCallerGrantEnvelope) {
         const consumed = consumer.consume(input.mcpCallerGrantEnvelope, { projectId });
         if (!consumed.ok) return consumed;

@@ -4347,6 +4347,16 @@ describe('ordinary scheduled conversation execution', () => {
     expect(deliver).toHaveBeenCalledTimes(3); expect(f.spawnSession).not.toHaveBeenCalled(); expect(f.resumeSession).not.toHaveBeenCalled();
     expect(f.input.resolveProjectEnvironment).toHaveBeenCalledWith({ runId: 'r', claimToken: 't', conversationSessionId: 'ordinary' });
   });
+  it('hands the preflighted connector grant to the ordinary conversation so a stopped one resumes with connectors', async () => {
+    const f = setup({ claim: { ok: true, value: { runId: 'r', claimToken: 't' } } });
+    const context = { mcpCallerGrant: 'grant', mcpConfigProjectId: 'chat:c', bindingStatus: 'BOUND' as const, connectorPolicy: 'optional' as const, requiredConnectors: [] };
+    f.input.resolveMcpSpawnContext = async () => ({ ok: true, value: context });
+    const base = f.input.decryptPayload(cacheRecord(), new Uint8Array(32));
+    f.input.decryptPayload = () => ({ ...base, conversation: { sessionId: 'ordinary' } });
+    const deliver = vi.fn(async () => ({ ok: true as const, sessionId: 'ordinary' })); f.input.deliverConversation = deliver;
+    await runServerAutomationTick(f.input);
+    expect(deliver).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'ordinary', mcpSpawnContext: context }));
+  });
   it('revalidates the Project directory on each timer and never delivers after access is revoked', async () => {
     const f = setup({ claim: { ok: true, value: { runId: 'r', claimToken: 't' } } });
     f.input.resolveMcpSpawnContext = async () => ({ ok: true, value: { mcpCallerGrant: 'grant', mcpConfigProjectId: 'project', bindingStatus: 'BOUND', connectorPolicy: 'optional', requiredConnectors: [] } });

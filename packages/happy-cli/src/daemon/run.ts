@@ -2856,6 +2856,8 @@ export async function startDaemon(): Promise<void> {
       environmentVariables?: Record<string, string>;
       mcpCallerGrantEnvelope?: string;
       mcpConfigProjectId?: string;
+      /** Daemon-internal only: the grant a scheduled run exchanged for the conversation it delivers to. */
+      trustedMcpContext?: AutomationMcpSpawnContext;
       expectedConnectors?: string[];
       /** Present = replace the roots granted at spawn (a live child is left untouched). */
       additionalDirectories?: string[];
@@ -3138,6 +3140,14 @@ export async function startDaemon(): Promise<void> {
           resumingSetupTokenSessions.delete(happySessionId);
         }
         const managedAiCredentialEnvironment = resumedCredentials.environment;
+        if (options?.trustedMcpContext && options.mcpCallerGrantEnvelope) {
+          return {
+            type: 'error',
+            code: 'MCP_CALLER_GRANT_REJECTED',
+            errorMessage: 'MCP caller grant has conflicting trusted and envelope sources',
+          };
+        }
+        const resumeMcpConfigProjectId = options?.trustedMcpContext?.mcpConfigProjectId ?? options?.mcpConfigProjectId;
         if (restoreManualToOrganization && (!managedAiCredentialEnvironment[SETUP_TOKEN_BINDING_ENV] || persistSetupTokenBinding(tracked, managedAiCredentialEnvironment[SETUP_TOKEN_BINDING_ENV], null).status !== 'committed')) throw new Error('CLAUDE_PERSONAL_SELECTION_PERSISTENCE_REQUIRED');
         const mcpEnvironment = prepareMcpChildEnvironment({
           environmentVariables: overlayManagedCredentialEnvironment(buildResumedSessionSpawnEnvironment({
@@ -3170,7 +3180,8 @@ export async function startDaemon(): Promise<void> {
             sessionId: happySessionId,
           }), managedAiCredentialEnvironment),
           mcpCallerGrantEnvelope: options?.mcpCallerGrantEnvelope,
-          mcpConfigProjectId: options?.mcpConfigProjectId,
+          trustedMcpCallerGrant: options?.trustedMcpContext?.mcpCallerGrant,
+          mcpConfigProjectId: resumeMcpConfigProjectId,
           expectedConnectors: options?.expectedConnectors,
           lifecycle: 'resume',
           trustedConfigUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
@@ -3182,7 +3193,7 @@ export async function startDaemon(): Promise<void> {
             errorMessage: `MCP caller grant rejected (${mcpEnvironment.reason})`,
           };
         }
-        const checkpointProjectId = options?.mcpConfigProjectId?.trim()
+        const checkpointProjectId = resumeMcpConfigProjectId?.trim()
           || priorCheckpointContext?.projectId;
         if (
           priorCheckpointContext
@@ -3196,7 +3207,7 @@ export async function startDaemon(): Promise<void> {
           };
         }
         const authoritativeCheckpointProjectId = priorCheckpointContext?.projectId
-          ?? (options?.mcpCallerGrantEnvelope ? checkpointProjectId : undefined);
+          ?? (options?.mcpCallerGrantEnvelope || options?.trustedMcpContext ? checkpointProjectId : undefined);
         /*
          * Lesson wiring, re-established for the resumed child.
          *
@@ -5086,7 +5097,10 @@ export async function startDaemon(): Promise<void> {
             return tracked?.encryption && directory ? { directory, ...tracked.encryption } : null;
           },
           sameDirectory: async (left, right) => (await resolveAutomationDirectoryMatch(left, right)) === true,
-          ensureRunning: async (sessionId) => (await resumeSession(sessionId)).type === 'success',
+          ensureRunning: async (sessionId, mcpSpawnContext) => (await resumeSession(
+            sessionId,
+            mcpSpawnContext ? { trustedMcpContext: mcpSpawnContext } : undefined,
+          )).type === 'success',
           readSeq: async (sessionId) => {
             const tracked = findTrackedSessionById(sessionId);
             if (!tracked?.encryption) return null;
