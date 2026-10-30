@@ -49,7 +49,7 @@ export const RotationObservationSchema = z.object({
 export type RotationObservation = z.infer<typeof RotationObservationSchema>;
 export const DAEMON_ROTATION_PATHS = {
   issue: '/api/claude-setup-token/daemon/v2/issue', claim: '/api/claude-setup-token/daemon/v2/claim',
-  commit: '/api/claude-setup-token/daemon/v2/commit', usage: '/api/claude-setup-token/daemon/v2/usage',
+  start: '/api/claude-setup-token/daemon/v2/start', commit: '/api/claude-setup-token/daemon/v2/commit', usage: '/api/claude-setup-token/daemon/v2/usage',
   rebind: '/api/claude-setup-token/daemon/v2/rebind', operation: '/api/claude-setup-token/daemon/v2/operation',
 } as const;
 const requestCommon = { version: z.literal(2), type: z.literal('setup-token-daemon-request'),
@@ -60,6 +60,7 @@ export const DaemonRotationRequestBodySchema = z.discriminatedUnion('action', [
   z.object({ ...requestCommon, action: z.literal('issue'), path: z.literal(DAEMON_ROTATION_PATHS.issue), sessionOwnerAccountId: id, ...hashes }).strict(),
   z.object({ ...requestCommon, action: z.literal('claim'), path: z.literal(DAEMON_ROTATION_PATHS.claim), ...claim }).strict(),
   z.object({ ...requestCommon, action: z.literal('commit'), path: z.literal(DAEMON_ROTATION_PATHS.commit), ...claim, bindingDigest: hash }).strict(),
+  z.object({ ...requestCommon, action: z.literal('start'), path: z.literal(DAEMON_ROTATION_PATHS.start), ...claim, requestId: id }).strict(),
   z.object({ ...requestCommon, action: z.literal('usage'), path: z.literal(DAEMON_ROTATION_PATHS.usage), ...claim, observation: RotationObservationSchema.optional(), activity: SetupTokenActivitySchema.optional() }).strict(),
   z.object({ ...requestCommon, action: z.literal('rebind'), path: z.literal(DAEMON_ROTATION_PATHS.rebind), ...claim, observation: RotationObservationSchema }).strict(),
   z.object({ ...requestCommon, action: z.literal('operation'), path: z.literal(DAEMON_ROTATION_PATHS.operation), targetOperationId: id }).strict(),

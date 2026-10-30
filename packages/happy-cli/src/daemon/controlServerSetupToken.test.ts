@@ -4,7 +4,7 @@ import type { SetupTokenAccountSwitch } from './setupTokenAccountSwitch'
 
 const observation = { observedAt: 10, reason: 'ok', retryAt: null, windows: [{ kind: 'unified5h', pct: 96, resetsAt: 20 }] }
 
-async function control(switcher: Pick<SetupTokenAccountSwitch, 'availability' | 'returnFromPersonal' | 'reportUsage' | 'reportActivity' | 'rebind'> | null) {
+async function control(switcher: Pick<SetupTokenAccountSwitch, 'availability' | 'returnFromPersonal' | 'reportUsage' | 'reportActivity' | 'rebind'> & Partial<Pick<SetupTokenAccountSwitch, 'requestStart'>> | null) {
   return startDaemonControlServer({
     getSetupTokenAccountSwitch: () => switcher,
     getChildren: () => [], stopSession: () => ({ status: 'not-found' } as any),
@@ -16,6 +16,7 @@ async function control(switcher: Pick<SetupTokenAccountSwitch, 'availability' | 
 describe('setup-token control routes (specs/claude-setup-token-account-selection)', () => {
   it('forwards a session usage report and a switch request, authenticated by the control secret', async () => {
     const switcher = { availability: vi.fn(async () => ({ ok: true as const, allLimited: true, availableAccountIds: [], consentApproved: true })), returnFromPersonal: vi.fn(async () => ({ ok: true as const, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'fixture-org' } })),
+      requestStart: vi.fn(async () => ({ok:true as const, admission:{state:'allowed' as const,validForMs:15000}})),
       reportActivity: vi.fn(async () => ({ok:true as const})), reportUsage: vi.fn(async () => ({ ok: true as const })),
       rebind: vi.fn(async () => ({ ok: true as const, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next' } })),
     }
@@ -25,6 +26,14 @@ describe('setup-token control routes (specs/claude-setup-token-account-selection
     try {
       expect((await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}' }, false)).status).toBe(401)
       expect(switcher.rebind).not.toHaveBeenCalled()
+      const start={sessionId:'session-a',binding:'{}',requestId:'00000000-0000-4000-8000-000000000001'}
+      expect((await post('/setup-token/start',start,false)).status).toBe(401)
+      expect(switcher.requestStart).not.toHaveBeenCalled()
+      expect((await post('/setup-token/start',{...start,requestId:'invalid'})).status).toBe(400)
+      expect(switcher.requestStart).not.toHaveBeenCalled()
+      expect(await (await post('/setup-token/start',start)).json()).toEqual({ok:true,admission:{state:'allowed',validForMs:15000}})
+      expect(switcher.requestStart).toHaveBeenCalledWith('session-a','{}',start.requestId,expect.any(AbortSignal))
+
       expect(await (await post('/setup-token/usage', { sessionId: 'session-a', binding: '{}', observation })).json()).toEqual({ ok: true })
       expect(switcher.reportUsage).toHaveBeenCalledWith('session-a', '{}', observation, expect.any(AbortSignal))
       const activity = {instanceId:'i',turnId:'t',seq:1,state:'active'}
