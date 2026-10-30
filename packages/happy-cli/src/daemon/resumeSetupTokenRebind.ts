@@ -25,7 +25,6 @@ export async function resumeSetupTokenEnvironment(input: {
   recorded: string | undefined
   resolve: () => Promise<Record<string, string>>
   manualChoice?: string
-  preserveManual?: (environment: Record<string, string>, accountRef: string) => boolean | Promise<boolean>
   rebind: (sessionId: string, running: string) => Promise<RebindResult>
 }): Promise<{ environment: Record<string, string>; rebound: boolean }> {
   if (input.manualChoice !== undefined && !/^[a-f0-9]{64}$/.test(input.manualChoice)) throw new Error('CLAUDE_PERSONAL_SELECTION_INVALID')
@@ -35,7 +34,6 @@ export async function resumeSetupTokenEnvironment(input: {
     if (!input.recorded || !(error instanceof AiCredentialRuntimeError) || error.failureCause || !ACCOUNT_LEFT.has(error.kind)) throw error
     const result = await input.rebind(input.sessionId, input.recorded)
     if (!result.ok) throw new AiCredentialRuntimeError(`CLAUDE_SETUP_TOKEN_RESUME_${result.reason}`)
-    if (input.manualChoice && (!input.preserveManual || !await input.preserveManual(result.environment, input.manualChoice))) throw new Error('CLAUDE_PERSONAL_SELECTION_PERSISTENCE_REQUIRED')
     return { environment: result.environment, rebound: true }
   }
 }

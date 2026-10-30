@@ -144,3 +144,11 @@ it('revalidates a persisted manual choice before initializing the provider on th
  f.availability.mockRejectedValue(new Error('revoked'))
  await expect(restored.beforeUserTurn()).rejects.toThrow()
 })
+
+it.each([false, true])('keeps displayed manual consent through generic polling (organization limited=%s)', async limited => {
+ const f=fixture(); f.availability.mockResolvedValue({allLimited:limited, availableAccountIds:limited?[]:['org'], consentApproved:true})
+ const offered=await f.state.status(credential.accountRef)
+ await f.state.status()
+ await f.state.accept(offered!.accountRef,offered!.nonce!,'manual-proof')
+ expect(f.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('fixture-personal')
+})

@@ -2119,11 +2119,11 @@ export async function startDaemon(): Promise<void> {
           preparedMachineSessionId = preparedMachineLaunch.session.id;
           pendingMachineStarts.add(preparedMachineSessionId);
         }
-        let managedAiCredentialEnvironment = preparedMachineLaunch?.environment ?? (honorsManagedAiCredentials(options.aiAuthSelection)
+        const launchAuthorityEnvironment = preparedMachineLaunch?.environment ?? (honorsManagedAiCredentials(options.aiAuthSelection)
           ? await resolveManagedAiCredentialEnvironment(options.agent, options.aiAuthSelection)
           : {});
-        const personalAnchor = readSetupTokenResumeSelection(managedAiCredentialEnvironment)?.binding;
-        managedAiCredentialEnvironment = await applyManualPersonal(options.aiAuthSelection, managedAiCredentialEnvironment,
+        const personalAnchor = readSetupTokenResumeSelection(launchAuthorityEnvironment)?.binding;
+        const managedAiCredentialEnvironment = await applyManualPersonal(options.aiAuthSelection, launchAuthorityEnvironment,
           personalAnchor && !isMachineSetupTokenBinding(personalAnchor) ? personalAnchor : undefined);
         logger.debug(`[timing] spawn managed-credential-environment ${Date.now() - credentialStartedAt}ms`);
         let extraEnv: Record<string, string> = injectMcpCallerGrant(
@@ -2426,7 +2426,7 @@ export async function startDaemon(): Promise<void> {
             sessionName: tmuxSessionName,
             windowName: windowName,
             cwd: directory
-          }, tmuxEnv, start => launchManagedAiCredentialSession(managedAiCredentialEnvironment, () => {
+          }, tmuxEnv, start => launchManagedAiCredentialSession(launchAuthorityEnvironment, () => {
             ownedStartGuard.submitted(options); return start();
           }));
 
@@ -2544,6 +2544,7 @@ export async function startDaemon(): Promise<void> {
             cwd: directory,
             env: spawnEnvironment,
             managedAiCredentialEnvironment,
+            launchAuthorityEnvironment,
             directoryCreated,
             message: directoryCreated ? `The path '${directory}' did not exist. We created a new folder and spawned a new session there.` : undefined,
             userHomeDir: stagedUserHomeDir,
@@ -2578,6 +2579,7 @@ export async function startDaemon(): Promise<void> {
       userHomeDir,
       resumeTargetSessionId,
       managedAiCredentialEnvironment = {},
+      launchAuthorityEnvironment = managedAiCredentialEnvironment,
     }: {
       /** Internal dispatch evidence; never transported in provider env or RPC options. */
       onProcessSubmission?: () => void;
@@ -2594,6 +2596,7 @@ export async function startDaemon(): Promise<void> {
        */
       resumeTargetSessionId?: string;
       managedAiCredentialEnvironment?: Record<string, string>;
+      launchAuthorityEnvironment?: Record<string, string>;
     }): Promise<SpawnSessionResult> => {
       if (standaloneWindows && (!standaloneWindows.owner.acceptingLaunches || !acceptsStandaloneWindowsLaunch(args))) {
         return { type: 'error', errorMessage: 'Windows trial launch is closed or this provider is unsupported' };
@@ -2605,7 +2608,7 @@ export async function startDaemon(): Promise<void> {
       if (prepared) logger.debug(`[timing] spawn windows-prepare ${Date.now() - prepareStartedAt}ms`);
       const scopeReports = env.HAPPY_WRITE_SCOPE_SESSION === '1' ? writeScopeRuntime?.prepareReports(resumeTargetSessionId) : undefined;
       const startupLogFileName = 'daemon-session-startup.log';
-      const happyProcess = prepared?.childProcess ?? await launchManagedAiCredentialSession(managedAiCredentialEnvironment,
+      const happyProcess = prepared?.childProcess ?? await launchManagedAiCredentialSession(launchAuthorityEnvironment,
         () => {
           const stdio: import('child_process').SpawnOptions['stdio'] = scopeReports ? ['ignore', 'ignore', 'ignore', 'pipe']
             : captureSpawnOutputStdio(startupLogFileName, `session ${resumeTargetSessionId ?? 'new'} from ${cwd}`);
@@ -2657,7 +2660,7 @@ export async function startDaemon(): Promise<void> {
         try {
           if (!standaloneWindows?.owner.acceptingLaunches) throw new Error('Standalone launch frozen before resume');
           const resumeStartedAt = Date.now();
-          await launchManagedAiCredentialSession(managedAiCredentialEnvironment, () => prepared.resume()); resumed = true;
+          await launchManagedAiCredentialSession(launchAuthorityEnvironment, () => prepared.resume()); resumed = true;
           logger.debug(`[timing] spawn windows-resume ${Date.now() - resumeStartedAt}ms`);
         }
         catch (error) { webhookCancellation.abort(); prepared.cancelBeforeResume?.(); throw error; }
@@ -3088,7 +3091,6 @@ export async function startDaemon(): Promise<void> {
             sessionId: happySessionId,
             recorded: tracked.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV],
             manualChoice: restoreManualToOrganization ? undefined : tracked.agentEnvironment?.[MANUAL_PERSONAL_ENV],
-            preserveManual: (environment, ref) => persistSetupTokenBinding(tracked, environment[SETUP_TOKEN_BINDING_ENV], ref).status === 'committed',
             resolve: () => resolveManagedAiCredentialEnvironment(resumeAgent, resumeBinding?.selection, resumeBinding?.binding),
             rebind: (sessionId, running) => setupTokenAccountSwitch?.rebind(sessionId, running) ?? Promise.resolve({ ok: false, reason: 'STUDIO_UNAVAILABLE' }),
           });

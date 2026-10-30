@@ -97,12 +97,10 @@ it('does not mistake a saved manual choice with a valid organization anchor for 
  expect(organizationResumeRefusal(requirement,{...authority,HAPPY_AI_AUTH_MANUAL_PERSONAL:'a'.repeat(64)})).toBe('CLAUDE_ORGANIZATION_RESUME_REQUIRED')
  expect(organizationResumeRefusal(requirement,{...authority,HAPPY_AI_AUTH_MANUAL_PERSONAL:'a'.repeat(64)},true)).toBeUndefined()
 })
-it('preserves the exact manual choice when only its organization authority anchor has to be rebound', async () => {
- const preserveManual = vi.fn(async()=>true), input = {sessionId:'s',recorded:RECORDED,manualChoice:'a'.repeat(64),preserveManual,
-   resolve:async()=>{throw refused('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE')},rebind:async()=>({ok:true as const,environment:NEXT})}
+it('keeps manual resume within the atomic rebind contract and rejects malformed choices', async () => {
+ const rebind=vi.fn(async()=>({ok:true as const,environment:NEXT}))
+ const input={sessionId:'s',recorded:RECORDED,manualChoice:'a'.repeat(64),resolve:async()=>{throw refused('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE')},rebind}
  expect(await resumeSetupTokenEnvironment(input)).toEqual({environment:NEXT,rebound:true})
- expect(preserveManual).toHaveBeenCalledWith(NEXT,'a'.repeat(64))
- preserveManual.mockResolvedValue(false)
- await expect(resumeSetupTokenEnvironment(input)).rejects.toThrow('PERSISTENCE_REQUIRED')
+ expect(rebind).toHaveBeenCalledTimes(1)
  await expect(resumeSetupTokenEnvironment({...input,manualChoice:''})).rejects.toThrow('SELECTION_INVALID')
 })

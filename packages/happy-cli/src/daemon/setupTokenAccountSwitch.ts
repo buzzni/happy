@@ -103,7 +103,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
   // Retain a consumed grant's verified result until saved; retrying storage must not mint more grants.
   // This is process-local recovery only. A crash between nonce consumption and publication needs
   // the future server operation journal, not an invented rollback guarantee here.
-  const pendingSaves = new WeakMap<TrackedSession, { running: string; committed: string; nextBinding: string; indeterminate: boolean }>()
+  const pendingSaves = new WeakMap<TrackedSession, { running: string; committed: string; nextBinding: string; clearManual: boolean; indeterminate: boolean }>()
 
   async function savePending(sessionId: string, session: TrackedSession, prepared?: Record<string, string>): Promise<RebindResult> {
     const pending = pendingSaves.get(session)!
@@ -124,7 +124,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     }
     if (session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV] !== pending.committed) return failure('STALE', 'committed binding changed before publication')
     let result: SessionPersistenceResult | undefined
-    try { result = await deps.recordAgentEnvironment(session, pending.nextBinding, null) }
+    try { result = await deps.recordAgentEnvironment(session, pending.nextBinding, pending.clearManual ? null : undefined) }
     catch {
       // An unexpected throw does not prove that publication never happened.
       pending.indeterminate = true
@@ -169,6 +169,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     if (pending) {
       // Do not apply a retained grant to a replacement session or a different running authority.
       if (pending.running !== running || pending.committed !== session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV]) return failure('STALE', 'pending save belongs to another session authority')
+      if (pending.clearManual !== confirmedOnly) return failure('STALE', 'pending save belongs to another source transition')
       return savePending(sessionId, session)
     }
     // Never move a session back onto a binding older than the one it runs.
@@ -235,7 +236,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     if (!next || isMachineSetupTokenBinding(next) || isMachineSetupTokenBinding(binding) || next.userId !== binding.userId || next.companyId !== binding.companyId || next.machineId !== binding.machineId || !environment.CLAUDE_CODE_OAUTH_TOKEN || (tokenProof && !next.tokenProof)) {
       return failure('BINDING_REJECTED', 'the new binding changes member, machine or organization')
     }
-    pendingSaves.set(session, { running, committed, nextBinding: environment[SETUP_TOKEN_BINDING_ENV], indeterminate: false })
+    pendingSaves.set(session, { running, committed, nextBinding: environment[SETUP_TOKEN_BINDING_ENV], clearManual: confirmedOnly, indeterminate: false })
     return savePending(sessionId, session, environment)
   }
 

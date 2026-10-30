@@ -60,6 +60,7 @@ export function createPersonalClaudeFallback(deps: Deps) {
             if (!accountRef && (personal || pendingPersonal)) return { state: 'personal' as const, accountRef: (personal ?? pendingPersonal)!.accountRef, label: (personal ?? pendingPersonal)!.label, ...(manual ? { mode: 'manual' as const } : {}) }
             const binding = original ?? deps.binding(); if (!binding) return null
             const quota = await availability(binding)
+            if (!accountRef && offer?.reason === 'manual-selection' && offer.binding === binding && offer.expiresAt > deps.now() && !stopped && binding === (original ?? deps.binding())) return null
             if (stopped || binding !== (original ?? deps.binding()) || !accountRef && !reasonOf(quota)) { offer = null; return null }
             const candidate = await deps.personal(accountRef)
             if (!candidate || accountRef && candidate.accountRef !== accountRef || stopped || binding !== (original ?? deps.binding())) return null

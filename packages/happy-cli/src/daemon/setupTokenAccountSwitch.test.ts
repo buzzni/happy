@@ -66,7 +66,7 @@ describe('setup-token account switch (specs/claude-setup-token-account-selection
       body: { machineId: 'pc-a', sessionId: 'session-a', companyId: 'org-a', bindingNonce: NONCE_A, selectionRequestId: expect.any(String) } })
     expect(deps.sessionEnvironment).toHaveBeenCalledWith('claude', { kind: 'claude-setup-token', managedAccountId: B, groupScope: 'org-a', credentialGeneration: 1, bindingGrant: 'claims.signature' })
     expect(result).toEqual({ ok: true, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next', HAPPY_AI_AUTH_SOURCE: 'org-bundle', [SETUP_TOKEN_BINDING_ENV]: formatSetupTokenBinding(binding(B)) } })
-    expect(deps.recordAgentEnvironment).toHaveBeenCalledWith(session, formatSetupTokenBinding(binding(B)), null)
+    expect(deps.recordAgentEnvironment).toHaveBeenCalledWith(session, formatSetupTokenBinding(binding(B)), undefined)
   })
 
   it('treats a missing durable ACK as indeterminate and never returns a token', async () => {
@@ -526,4 +526,24 @@ it('stores an authorized manual choice only at commit and does not forward local
  expect(f.deps.recordAgentEnvironment).toHaveBeenCalledWith(f.session,RUNNING_A,consent.accountRef)
  const sent=JSON.parse(String(vi.mocked(f.deps.fetch).mock.calls[1][1]?.body))
  expect(sent.personalConsent).toEqual(consent)
+})
+
+it.each(['committed', 'failed'] as const)('keeps a manual choice atomic with ordinary rebind (%s)', async status => {
+ const f=setup(), key='HAPPY_AI_AUTH_MANUAL_PERSONAL', ref='a'.repeat(64)
+ f.session.agentEnvironment![key]=ref
+ vi.mocked(f.deps.recordAgentEnvironment).mockImplementation((_session,next,manualRef)=>{
+  if(status==='committed') { f.session.agentEnvironment![SETUP_TOKEN_BINDING_ENV]=next; if(manualRef===null) delete f.session.agentEnvironment![key] }
+  return {status}
+ })
+ await f.switcher.rebind('session-a',RUNNING_A)
+ expect(f.deps.recordAgentEnvironment).toHaveBeenCalledWith(f.session,expect.any(String),undefined)
+ expect(f.deps.recordAgentEnvironment).toHaveBeenCalledTimes(1)
+ expect(f.session.agentEnvironment![key]).toBe(ref)
+})
+
+it('clears a manual choice only in the durable explicit organization return', async () => {
+ const f=setup(); f.session.agentEnvironment!['HAPPY_AI_AUTH_MANUAL_PERSONAL']='a'.repeat(64)
+ vi.mocked(f.deps.fetch).mockResolvedValueOnce(Response.json({version:1,bindingGrant:'claims.signature',managedAccountId:B,credentialGeneration:1,tier:'available'}))
+ await f.switcher.returnFromPersonal('session-a',RUNNING_A)
+ expect(f.deps.recordAgentEnvironment).toHaveBeenCalledWith(f.session,expect.any(String),null)
 })
