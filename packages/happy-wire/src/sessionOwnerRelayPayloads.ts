@@ -55,6 +55,9 @@ export const OwnerRelaySnapshotSchema = z.object({ active: z.boolean().nullable(
     runtimeId: persistedId.nullable().optional(), machineId: text.nullable().optional(), // '' is the session list's "not observed" (H1-R-06)
     agentControlledByUser: z.boolean().optional(), pendingPermissionRequests: z.array(OwnerRelayPendingPermissionSchema).optional(),
     activity: activity.optional(),
+    // Main's live prompt-guard check (agentContact, live channel capability, agentContact again) just before replying;
+    // null when it failed, is unsupported or unconfirmed. An observation, not write authority: main rechecks at prompt.
+    promptGuard: hubPromptGuardSchema.nullable(),
 }).strict();
 // Validate the existing message union, but preserve legacy/event extension data for signing and
 // transcript fidelity. A normal parse would silently strip fields belonging to existing producers.

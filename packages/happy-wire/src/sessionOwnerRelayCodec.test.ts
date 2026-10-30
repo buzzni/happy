@@ -119,7 +119,8 @@ it.each([0, 1, 3, 4, 5, 6, 7])('rejects a correctly signed receipt for another t
     const { request, reply } = await pair(i);
     const changed: any = structuredClone(reply);
     if (i === 0) changed.owners[0].sessionId = 'another';
-    else if (i === 1) changed.sessionView.sessionId = 'another';
+    // A consistent guard for the other session still fails the request binding, not just the guard refine.
+    else if (i === 1) { changed.sessionView.sessionId = 'another'; changed.sessionView.snapshot.promptGuard.targetSessionId = 'another'; }
     else if (i < 6) changed.control.sessionId = 'another';
     else changed.childSpawn.parentSessionId = 'another';
     const c = i === 1 ? fixture.personalContact : contact;
@@ -275,5 +276,26 @@ describe('H1-R-01 persisted message localId compatibility', () => {
         expect(OwnerRelayRequestSchema.safeParse({ ...fixture.vectors[2].request, localId }).success).toBe(false);
         const reply = fixture.vectors[2].reply;
         expect(OwnerRelayReplySchema.safeParse({ ...reply, storage: { ...reply.storage, localId } }).success).toBe(false);
+    });
+});
+
+describe('read promptGuard signing [D2pre-G]', () => {
+    const guard = { v: 1 as const, targetSessionId: 'target-1', expectedRuntimeId: 'runtime-target-1', expectedMode: 'remote' as const, expectedModeEpoch: 3 };
+    it.each([['a guard', guard], ['null', null]] as const)('signs, round trips and verifies a read reply with %s', async (_name, promptGuard) => {
+        const { request, reply } = await pair(1);
+        if (reply.result !== 'allowed' || reply.operation !== 'read-session') throw new Error('Expected read fixture');
+        const signed = signOwnerRelayReply({ ...reply, sessionView: { ...reply.sessionView, snapshot: { ...reply.sessionView.snapshot, promptGuard } } }, desktop.secretKey);
+        const decoded = decodeOwnerRelayReply(encodeOwnerRelayReply(signed));
+        expect(decoded).toEqual(signed);
+        expect(await verifyOwnerRelayReply(decoded, request, fixture.personalContact, now)).toBe(true);
+    });
+    it.each([['epoch', { expectedModeEpoch: 4 }], ['runtime', { expectedRuntimeId: 'runtime-other' }]])('an unsigned guard %s change fails verification', async (_name, change) => {
+        const { request, reply } = await pair(1);
+        if (reply.result !== 'allowed' || reply.operation !== 'read-session') throw new Error('Expected read fixture');
+        const signed = signOwnerRelayReply({ ...reply, sessionView: { ...reply.sessionView, snapshot: { ...reply.sessionView.snapshot, promptGuard: guard } } }, desktop.secretKey) as any;
+        signed.sessionView.snapshot.promptGuard = { ...guard, ...change };
+        expect(await verifyOwnerRelayReply(signed, request, fixture.personalContact, now)).toBe(false);
+        signed.sessionView.snapshot.promptGuard = null;
+        expect(await verifyOwnerRelayReply(signed, request, fixture.personalContact, now)).toBe(false);
     });
 });

@@ -192,3 +192,30 @@ resume·permission·abort의 `control.state: 'accepted'`는 실행한 runtime(re
 runtime을 확인하지 못한 결과는 `unknown`으로 표현하며 `accepted`+`runtimeId: null`은 schema에서 거부한다.
 permission·abort의 accepted는 기존 결속 검사로 요청 runtime과 일치해야 한다. 이번 리뷰의 식별자·문자열·성공 조건 전수
 대조표에서 남은 불일치는 이 항목뿐이었다.
+
+## D2 사전 보완 — read snapshot의 prompt guard 관측 (2026-10-30)
+
+Desktop D2 사전 연결 검토(Desktop `specs/reason-network-adoption/plan.md` "T1c-b2 D2 사전 연결 검토" 1항)에서
+credential 없는 CLI가 prompt payload의 필수 `hubPrompt` guard를 얻을 경로가 없다는 공백을 확인했다.
+지휘 결정으로 새 verb 없이 기존 read 응답에 관측값을 싣는다(p0a §3.4.1·§4.5 `read-session`의 "기존 타입 재사용").
+
+- `OwnerRelaySnapshotSchema.promptGuard`: `hubPromptGuardSchema`(prompt의 `hubPrompt`와 같은 타입)`| null`, **필수 필드**.
+  main이 read 응답 직전에 `freshPromptGuard`와 같은 live 확인(metadata agentContact → live channel-capability →
+  metadata 재확인)에 성공했을 때만 채운다. 실패·미지원·확인 불가는 `null`이다. 생략은 거부한다. "확인하지 않음"과
+  "관측 없음"이 두 표현으로 갈리지 않게 하고 생산자가 매 응답에서 관측 결과를 명시하게 하기 위해서다.
+- guard의 `targetSessionId`는 `sessionView.sessionId`와 같아야 한다(schema refine). 응답의 sessionView는 기존
+  결속 검사로 요청 target과 같으므로 guard target도 요청 target에 묶인다. `expectedRuntimeId`와 snapshot
+  `runtimeId`의 일치는 강제하지 않는다. 서로 다른 시점의 관측일 수 있고, guard는 prompt 때 main이 다시 확인한다.
+- **쓰기 허가가 아니다.** CLI는 이 값을 prompt `hubPrompt`로 쓸 수 있을 뿐이며 main은 prompt 실행 때 owner/
+  runtime/mode를 다시 확인한다. 같은 localId 재시도에서 guard를 바꾸지 않는 §3.4.1 규칙은 그대로다. 실패 뒤
+  새 read의 guard로 같은 localId를 재사용하지 않는다.
+- 기존 필드 의미와 strict 규칙은 바꾸지 않았다. 다른 snapshot 미지 필드(예: `modeEpoch`)는 계속 거부한다.
+
+Golden fixture: 기존 read 벡터(personal source, vectors[1])의 응답에 guard를 넣고, confirmed source·`entry:'chat'`·
+`promptGuard:null` read 벡터를 vectors[8]로 추가했다. 기존 0–7번 index와 요청 바이트는 그대로다(vectors[1]은
+reply/replySigningInput/replyWire만 바뀜). 생성은 happy-wire를 import하지 않는 Node crypto Ed25519/SHA-256 +
+UTF-16 정렬 JSON 생성기로 했고, 같은 생성기가 기존 8개 벡터를 byte 단위로 재현하는지 먼저 확인했다.
+
+검증: 신규 `[D2pre-G]` 18건(schema 14, 서명 4). 구현 전 7건 실패(나머지는 strict 거부라 원래 통과). target refine을
+되돌리면 "다른 target 거부" 1건이 실패한다. 기존 receipt 결속 테스트(`another target/child (1)`)는 guard target도
+함께 옮겨 schema refine이 아니라 요청 결속 검사로 실패하는지 계속 확인한다. 관련 5파일 203건 통과, typecheck 통과.

@@ -58,7 +58,8 @@ const results = [
         proof: OwnershipSourceAuthoritySchema.nullable(), ownerSubject: OwnershipSubjectSchema.nullable(),
         relation: z.enum(['self', 'descendant', 'own-sibling', 'other', 'unknown']), reason: z.string().optional() }).strict()).max(100) },
     { operation: z.literal('read-session'), sessionView: z.object({ sessionId: id, cursor: z.string().nullable(),
-        snapshot: OwnerRelaySnapshotSchema, events: z.array(OwnerRelayReadEventSchema).max(50), truncated: z.boolean() }).strict() },
+        snapshot: OwnerRelaySnapshotSchema, events: z.array(OwnerRelayReadEventSchema).max(50), truncated: z.boolean() }).strict()
+        .refine(v => v.snapshot.promptGuard === null || v.snapshot.promptGuard.targetSessionId === v.sessionId, 'Prompt guard names another session') },
     // The stored row's own ID (H1-R-06); only a body-verified receipt is a success, a mismatch is unknown (H1-R-07).
     { operation: z.literal('prompt-own-session'), storage: z.object({ messageId: persistedId, seq: relayCount.min(1), // a stored row has a positive seq (H1-R-08)
         localId: relayLocalId, bodyVerified: z.literal(true) }).strict() },
