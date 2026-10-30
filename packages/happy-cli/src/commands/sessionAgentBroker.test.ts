@@ -68,6 +68,19 @@ describe('trusted session agent execution', () => {
     attendance = null
     expect(await read()).toBeNull()
   })
+  // D2-R4-01: the CLI decides from this mark whether broker IPC carries owner contact; the socket env is
+  // set only after the broker starts, so the broker's own copy of the env never has it.
+  it.each([
+    ['marks the bundled CLI when this host serves an owner contact', true, {}, '1'],
+    ['leaves the mark out without an owner contact', false, {}, null],
+    ['drops an inherited mark when this host has no owner contact', false, { SAYCODE_OWNER_CONTACT_BROKER_IPC: '1' }, null],
+  ] as const)('%s (D2-R4-01)', async (_name, served, env, expected) => {
+    const root = await fixture(), entrypoint = join(root, 'cli.mjs')
+    await writeFile(entrypoint, `console.log(JSON.stringify({exitCode:0,stdout:JSON.stringify({ok:true,mark:process.env.SAYCODE_OWNER_CONTACT_BROKER_IPC ?? null})}))`)
+    const execute = createAgentHostExecutor({ sessionId: 'current', directory: root, env: { ...env }, entrypoint,
+      ownerContact: served ? { call: async () => { throw new Error('unused') }, close() {} } : undefined })
+    expect(JSON.parse((await execute(['chat'], new AbortController().signal)).stdout).mark).toBe(expected)
+  })
   it('rotates the contact on resume, clears it on close and honors the runtime admission gate', async () => {
     const env: NodeJS.ProcessEnv = { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: process.cwd() }
     let admitted = 0

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { PassThrough } from 'node:stream';
 import { closeSync, fstatSync, openSync, writeFileSync } from 'node:fs';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, realpathSync, rmSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +11,7 @@ import { ownerRelayV1Fixture as fixture, signOwnership, signOwnerRelayReply, ver
 import { createAgentCallerLaunches } from './agentCallerLaunches';
 import { startHostOwnerContact, startSessionOwnerContactHost, takeOwnerContactCapability } from './sessionOwnerContactHost';
 import type { TrackedSession } from './types';
+import { startSessionAgentBroker } from '@/commands/sessionAgentBroker';
 
 const request = { v: 1, entry: 'agent', operation: 'lookup-readable-sessions', payload: { sessionIds: ['target'] } } as const;
 const chatRead = { v: 1, entry: 'chat', operation: 'read-session', targetSessionId: 'sibling', payload: { cursor: null, limit: 1, waitMs: 0 } } as const;
@@ -271,6 +272,24 @@ describe('host owner-contact wiring (startHappyServer)', () => {
         expect(w.env.SAYCODE_OWNER_CONTACT_SOCKET).toBeUndefined();
         await expect(post(socket, { ...request, entry: 'chat' })).rejects.toThrow();
         await expect(contact.call(request)).rejects.toThrow();
+    });
+    it.skipIf(process.platform === 'win32')('marks the broker-run CLI for owner IPC although the socket env comes after the broker [D2-R4-01]', async () => {
+        const h = harness(), w = wiring(h);
+        const root = realpathSync(mkdtempSync(join(tmpdir(), 'oc-broker-'))), entrypoint = join(root, 'cli.mjs');
+        writeFileSync(entrypoint, `console.log(JSON.stringify({exitCode:0,stdout:JSON.stringify({ok:true,mark:process.env.SAYCODE_OWNER_CONTACT_BROKER_IPC ?? null,socket:process.env.SAYCODE_OWNER_CONTACT_SOCKET ?? null})}))`);
+        Object.assign(w.env, { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: root });
+        w.startBroker.mockImplementation(contact => startSessionAgentBroker('source', w.env, undefined, entrypoint, undefined, undefined, contact as never) as never);
+        const started = await w.start();
+        try {
+            expect(w.env.SAYCODE_OWNER_CONTACT_SOCKET).toEqual(expect.any(String));
+            const response = await fetch(w.env.SAYCODE_AGENT_BROKER_URL!, { method: 'POST', headers: { authorization: `Bearer ${w.env.SAYCODE_AGENT_BROKER_CAPABILITY}` },
+                body: JSON.stringify({ version: 1, argv: ['whoami'] }) });
+            expect(JSON.parse((await response.json() as { stdout: string }).stdout)).toEqual({ ok: true, mark: '1', socket: null });
+        } finally {
+            await (started.broker as { close(): Promise<void> } | null)?.close();
+            await started.close();
+            rmSync(root, { recursive: true, force: true });
+        }
     });
     it('a chat socket that cannot start leaves the broker binding usable [D2pre-C]', async () => {
         const h = harness(), w = wiring(h, { broker: true });

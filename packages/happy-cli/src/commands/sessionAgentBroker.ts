@@ -27,6 +27,10 @@ export function createAgentHostExecutor(input: {
   delete env.SAYCODE_AGENT_BROKER_CAPABILITY
   // Only ever this session's own value, set per call below — never one inherited from a parent.
   delete env[DELEGATED_ATTENDANCE_ENV]
+  // Tells the bundled CLI this broker's IPC carries owner contact (D2-R4-01): the socket address is set
+  // only after the broker starts, so this copy never has it. Only this host's own value, never inherited.
+  delete env.SAYCODE_OWNER_CONTACT_BROKER_IPC
+  if (input.ownerContact) env.SAYCODE_OWNER_CONTACT_BROKER_IPC = '1'
   const manifestPath = input.entrypoint ? null : createRequire(import.meta.url).resolve('@buzzni/saycode-cli/package.json')
   const manifest = manifestPath ? JSON.parse(readFileSync(manifestPath, 'utf8')) : null
   if (!input.entrypoint && typeof manifest?.bin?.saycode !== 'string') throw new Error('Missing bundled agent CLI')
