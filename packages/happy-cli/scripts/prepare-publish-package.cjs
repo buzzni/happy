@@ -4,6 +4,13 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// Personal desktop AI browser addons. Built per platform only by the publish workflow; packed when present.
+const BROWSER_HOSTS = [
+    'native/darwin-arm64/browser-host.node',
+    'native/darwin-x64/browser-host.node',
+    'native/win32-x64/browser-host.node'
+];
+
 const BUNDLED_DEPENDENCIES = [
     '@slopus/happy-wire',
     '@buzzni/saycode-cli',
@@ -14,7 +21,7 @@ const BUNDLED_DEPENDENCIES = [
 ];
 
 function parseArgs(argv) {
-    const args = { out: undefined };
+    const args = { out: undefined, requireBrowserHosts: false };
 
     for (let index = 0; index < argv.length; index += 1) {
         const arg = argv[index];
@@ -24,6 +31,9 @@ function parseArgs(argv) {
             index += 1;
         } else if (arg.startsWith('--out=')) {
             args.out = arg.slice('--out='.length);
+        } else if (arg === '--require-browser-hosts') {
+            // The publish workflow: every platform's addon must be packed.
+            args.requireBrowserHosts = true;
         } else {
             throw new Error(`Unknown argument: ${arg}`);
         }
@@ -95,6 +105,12 @@ function preparePublishPackage() {
     if (fs.existsSync(path.join(cliDir, 'README.md'))) {
         copyPath(path.join(cliDir, 'README.md'), path.join(outputDir, 'README.md'));
     }
+
+    const browserHosts = BROWSER_HOSTS.filter((entry) => fs.existsSync(path.join(cliDir, entry)));
+    if (args.requireBrowserHosts && browserHosts.length !== BROWSER_HOSTS.length) {
+        throw new Error(`Required publish input is missing: ${BROWSER_HOSTS.filter((entry) => !browserHosts.includes(entry)).join(', ')}`);
+    }
+    cliPackage.files = [...(cliPackage.files || []), ...browserHosts];
 
     for (const entry of cliPackage.files || []) {
         if (entry === 'package.json') {

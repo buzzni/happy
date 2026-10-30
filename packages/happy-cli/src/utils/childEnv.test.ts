@@ -179,6 +179,14 @@ describe('sanitizeChildEnv', () => {
         expect(nonInheritableEnvEntry('HAPPY_HOME_DIR')).toBeUndefined()
     })
 
+    it('keeps the owner contact address inside its session only, never its launch descriptor, and passes the switch [H2-R-05]', () => {
+        const env = { SAYCODE_OWNER_CONTACT_SOCKET: '/parent/contact.sock', HAPPY_OWNER_CONTACT_FD: '4', HAPPY_OWNER_CONTACT_V1: '1', SAFE: 'kept' }
+        expect(sanitizeChildEnv(env)).toEqual({ HAPPY_OWNER_CONTACT_V1: '1', SAFE: 'kept' })
+        expect(sanitizeChildEnv(env, { boundary: 'in-session' })).toEqual({ SAYCODE_OWNER_CONTACT_SOCKET: '/parent/contact.sock', HAPPY_OWNER_CONTACT_V1: '1', SAFE: 'kept' })
+        expect(nonInheritableEnvEntry('SAYCODE_OWNER_CONTACT_SOCKET')?.kind).toBe('session-scope')
+        expect(nonInheritableEnvEntry('HAPPY_OWNER_CONTACT_FD')?.kind).toBe('spawn-seed')
+    })
+
     it('stays linear on a huge environment with long, prefix-like names', () => {
         const env: Record<string, string> = {}
         for (let index = 0; index < 20_000; index += 1) {

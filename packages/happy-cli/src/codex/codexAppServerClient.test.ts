@@ -166,6 +166,57 @@ describe('CodexAppServerClient sandbox integration', () => {
         process.env.RUST_LOG = originalRustLog;
     });
 
+    it.each([false, true])('starts the original thread and accepted turn without waiting for optional native project binding (initial rejection=%s)', async initialRejection => {
+        const previous = { enabled: process.env.SAYCODE_AGENT_ENV, scope: process.env.SAYCODE_AGENT_SCOPE };
+        process.env.SAYCODE_AGENT_ENV = '1';
+        process.env.SAYCODE_AGENT_SCOPE = process.cwd();
+        const requests: MockRpcMessage[] = [];
+        let turns = 0;
+        let replyProjects: (() => void) | undefined;
+        let replyAssignment: (() => void) | undefined;
+        mockSpawn.mockImplementation(() => createMockProcess({ onRequest: (message, stdout) => {
+            requests.push(message);
+            if (message.method === 'thread/start') pushJsonLine(stdout, { id: message.id, result: { thread: { id: 'thread-project' }, model: 'test' } });
+            if (message.method === 'turn/start') pushJsonLine(stdout, initialRejection && turns++ === 0
+                ? { id: message.id, error: { code: -32603, message: 'original turn refusal' } }
+                : { id: message.id, result: { turn: { id: 'turn-project' } } });
+            if (message.method === 'project/list') replyProjects = () => pushJsonLine(stdout, { id: message.id, result: { data: [{ id: 'native-project', roots: [{ path: process.cwd() }] }], nextCursor: null } });
+            if (message.method === 'thread/metadata/update') replyAssignment = () => pushJsonLine(stdout, { id: message.id, result: {} });
+        } }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        try {
+            await client.connect();
+            const started = await client.startThread({ cwd: process.cwd(), sandbox: 'read-only', approvalPolicy: 'never' });
+            expect(started.threadId).toBe('thread-project');
+            expect(client.threadId).toBe('thread-project');
+            const start = requests.find(message => message.method === 'thread/start');
+            expect(start?.params).toMatchObject({ cwd: process.cwd(), sandbox: 'read-only', approvalPolicy: 'never' });
+            expect(start?.params).not.toHaveProperty('projectId');
+            expect(requests.some(message => message.method === 'project/list')).toBe(false);
+            if (initialRejection) {
+                await expect(client.sendTurn('original user prompt')).rejects.toThrow('original turn refusal');
+                expect(requests.some(message => message.method === 'project/list')).toBe(false);
+            }
+            await client.sendTurn('original user prompt');
+            expect(requests.find(message => message.method === 'turn/start')?.params).toEqual({ threadId: 'thread-project', input: [{ type: 'text', text: 'original user prompt' }] });
+            await vi.waitFor(() => expect(replyProjects).toBeDefined());
+            expect(requests.some(message => message.method === 'thread/metadata/update')).toBe(false);
+            expect(client.authRecoveryBusy).toBe(false);
+            replyProjects!();
+            await vi.waitFor(() => expect(requests.find(message => message.method === 'thread/metadata/update')?.params).toEqual({ threadId: 'thread-project', projectId: 'native-project' }));
+            expect(client.authRecoveryBusy).toBe(false);
+            await client.sendTurn('follow up');
+            expect(requests.filter(message => message.method === 'project/list')).toHaveLength(1);
+            expect(requests.filter(message => message.method === 'thread/start')).toHaveLength(1);
+            replyAssignment!();
+        } finally {
+            await client.disconnect();
+            if (previous.enabled === undefined) delete process.env.SAYCODE_AGENT_ENV; else process.env.SAYCODE_AGENT_ENV = previous.enabled;
+            if (previous.scope === undefined) delete process.env.SAYCODE_AGENT_SCOPE; else process.env.SAYCODE_AGENT_SCOPE = previous.scope;
+        }
+    });
+
     it('gives Codex the session scope but not lineage or spawn seeds (utils/childEnv)', async () => {
         const { CodexAppServerClient } = await import('./codexAppServerClient');
         const injected = { HAPPY_RECONNECT_SESSION_ID: 'cmr-poisoned', HAPPY_INITIAL_PROMPT: 'seed', APLUS_SESSION_ID: 'self-session' }

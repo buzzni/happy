@@ -3,7 +3,7 @@ import { Readable } from "node:stream";
 import fastify from "fastify";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { enableMonitoring } from "./enableMonitoring";
-import { httpRequestPhaseDurationHistogram } from "@/app/monitoring/metrics2";
+import { automationReadRequestsCounter, httpRequestPhaseDurationHistogram } from "@/app/monitoring/metrics2";
 
 const { dbMock, logMock, warnMock, errorMock, debugMock } = vi.hoisted(() => ({
     dbMock: {
@@ -448,5 +448,33 @@ describe("enableMonitoring phase histograms", () => {
         await app.inject({ method: "GET", url: "/ready" });
 
         expect(Object.keys(await phaseSums("/ready")).sort()).toEqual(["handler", "prehandler", "send", "serialize"]);
+    });
+});
+
+describe("automation read observation", () => {
+    it("counts bounded causes and samples the authenticated account without changing responses", async () => {
+        vi.clearAllMocks();
+        automationReadRequestsCounter.reset();
+        const app = fastify();
+        enableMonitoring(app as never);
+        app.get("/v1/projects/:projectId/automations", async (request) => {
+            (request as unknown as { userId: string }).userId = "authenticated-account";
+            return { automations: [] };
+        });
+        try {
+            for (let i = 0; i < 35; i++) {
+                const response = await app.inject({ method: "GET", url: `/v1/projects/p-${i}/automations?ignored=private`, headers: { "x-happy-read-source": "socket", "authorization": "Bearer private" } });
+                expect(response.statusCode).toBe(200);
+                expect(response.json()).toEqual({ automations: [] });
+            }
+            expect(warnMock).toHaveBeenCalledTimes(1);
+            expect(warnMock.mock.calls[0][0]).toMatchObject({ module: "automation-read", accountId: "authenticated-account", projectId: "p-29", source: "socket", count: 30 });
+            expect(JSON.stringify(warnMock.mock.calls)).not.toContain("private");
+            await app.inject({ method: "GET", url: "/v1/projects/p/automations", headers: { "x-happy-read-source": "unbounded-value" } });
+            const samples = (await automationReadRequestsCounter.get()).values;
+            expect(samples.find(sample => sample.labels.source === "socket")).toMatchObject({ value: 35, labels: { route: "/v1/projects/:projectId/automations", status: "200" } });
+            expect(samples.find(sample => sample.labels.source === "unspecified")?.value).toBe(1);
+            expect(samples.every(sample => !("accountId" in sample.labels) && !("projectId" in sample.labels))).toBe(true);
+        } finally { await app.close(); }
     });
 });

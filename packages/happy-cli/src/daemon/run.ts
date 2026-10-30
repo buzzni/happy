@@ -1,5 +1,6 @@
 import { createManualPersonalSpawn, MANUAL_PERSONAL_ENV } from './manualPersonalClaude';
 import { createOwnedSpawnRuntime, createOwnedStartGuard } from './ownedSpawnRuntime';
+import { createAgentCallerLaunches, OWNER_CONTACT_SWITCH, readOwnerContactTrust } from './agentCallerLaunches';
 import { drainWorktreeOperations } from './worktreeOps';
 import { createMachineSetupTokenProtocol, MachineRotationError } from './machineSetupTokenProtocol';
 import { chooseLaunchRotation, createMachineRotationResolver } from './machineRotationResolver';
@@ -195,6 +196,8 @@ import {
 import { machineIdentityMetadataUpdate } from './machineIdentityMetadata';
 import { listMachineIdTwins } from './machineIdTwins';
 import { agentBrowserMachineCapability, agentBrowserMetadataUpdate, browserTaskLineage, createBrowserTaskSessionBroker, spawnResumedWithBrowserTaskRegistration, startBrowserTaskReconciliation, type BrowserTaskSessionBroker } from './browserTaskBroker';
+import { watchPersonalBrowserRuntime } from './personalBrowserRuntime';
+import type { NativeBrokerRequestOptions } from '@/browserRuntime/brokerGrantSource';
 import { createHeldBrowserAttentions, findBrowserAttentionSession, startBrowserAttentionWatcher, type HeldBrowserAttention } from './browserAttentionDelivery';
 import {
   createProcFs,
@@ -1163,6 +1166,9 @@ export async function startDaemon(): Promise<void> {
 
     // Setup state - key by PID
     const pidToTrackedSession = new Map<number, TrackedSession>();
+    // T1c-b2 H2 owner-contact launch bindings; assigned with the owned-spawn runtime below. Until then a
+    // launch gets no capability pipe and its host no binding.
+    let callerLaunches: ReturnType<typeof createAgentCallerLaunches> | null = null;
     // aplus-dev-studio strict-followup-plan F2 — a non-forced worktree removal waits for these to leave.
     worktreeRemovalReservations.setLiveSessions(() => [...pidToTrackedSession.values()]
       .map((session) => ({ pid: session.pid, directory: session.directory ?? session.happySessionMetadataFromLocalWebhook?.path })));
@@ -1843,7 +1849,36 @@ export async function startDaemon(): Promise<void> {
     } catch (error) {
       logger.warn(`[DAEMON RUN] Browser task broker disabled: ${error instanceof Error ? error.message : 'unknown error'}`);
     }
-    const stopBrowserTaskReconciliation = startBrowserTaskReconciliation(browserTaskBroker);
+    let stopBrowserTaskReconciliation = startBrowserTaskReconciliation(browserTaskBroker);
+    // Single-user Mac/Windows PC: the runtime Desktop configures for this user and machine after sign-in,
+    // picked up without a restart. An installer-managed host (its own broker) keeps its configuration.
+    let personalBrowserNative: NativeBrokerRequestOptions | undefined;
+    let onPersonalBrowserActive: ((native: NativeBrokerRequestOptions) => void) | undefined;
+    /** Set once the machine sync client exists; an activation before that is published with the first metadata check. */
+    let publishAgentBrowserCapability: (() => void) | undefined;
+    const personalBrowserWatch = browserTaskBroker || process.env.HAPPY_BROWSER_TASK_RUNTIME_URL ? undefined : watchPersonalBrowserRuntime({
+      machineId, studioOrigin: readTrustedStudioOrigin(process.env), token: () => credentials.token, log: (message) => logger.warn(message),
+      activate: (runtime) => {
+        let broker: BrowserTaskSessionBroker | undefined;
+        try {
+          broker = createBrowserTaskSessionBroker(process.env, undefined, {
+            native: runtime.native, pendingRevocationsFile: join(configuration.happyHomeDir, 'browser-task-revocations.json'),
+          });
+        } catch (error) {
+          logger.warn(`[DAEMON RUN] Personal browser broker disabled: ${error instanceof Error ? error.message : 'unknown error'}`);
+        }
+        if (!broker) return false;
+        Object.assign(process.env, runtime.sessionEnv);
+        browserTaskBroker = broker;
+        stopBrowserTaskReconciliation();
+        stopBrowserTaskReconciliation = startBrowserTaskReconciliation(broker);
+        personalBrowserNative = runtime.native;
+        onPersonalBrowserActive?.(runtime.native);
+        publishAgentBrowserCapability?.();
+        logger.debug('[DAEMON RUN] Personal browser runtime activated');
+        return true;
+      },
+    });
     const reportBrowserTaskRevokeFailure = (error: unknown): void => {
       logger.warn(`[DAEMON RUN] ${error instanceof Error ? error.message : 'Browser task revocation failed'}`);
     };
@@ -2607,15 +2642,20 @@ export async function startDaemon(): Promise<void> {
       const prepared = standaloneWindows ? await standaloneWindows.owner.prepare({ args, cwd, env }) : undefined;
       if (prepared) logger.debug(`[timing] spawn windows-prepare ${Date.now() - prepareStartedAt}ms`);
       const scopeReports = env.HAPPY_WRITE_SCOPE_SESSION === '1' ? writeScopeRuntime?.prepareReports(resumeTargetSessionId) : undefined;
+      // Owner contact (default OFF): a one-time capability on one more private pipe; null leaves the launch unchanged.
+      const ownerLaunch = prepared ? null : callerLaunches?.prepareLaunch({ cwd, agentEnvironment: captureSaycodeAgentEnvironment(env) }) ?? null;
+      const withOwnerPipe = (base: import('child_process').SpawnOptions['stdio']) =>
+        ownerLaunch?.stdio(base ?? 'ignore') ?? { stdio: base, environment: {} };
       const startupLogFileName = 'daemon-session-startup.log';
       const happyProcess = prepared?.childProcess ?? await launchManagedAiCredentialSession(launchAuthorityEnvironment,
         () => {
-          const stdio: import('child_process').SpawnOptions['stdio'] = scopeReports ? ['ignore', 'ignore', 'ignore', 'pipe']
-            : captureSpawnOutputStdio(startupLogFileName, `session ${resumeTargetSessionId ?? 'new'} from ${cwd}`);
-          try { onProcessSubmission?.(); return spawnHappyCLI(args, { cwd, detached: true, stdio, env: { ...env, ...scopeReports?.environment } }); }
+          const { stdio, environment: ownerEnvironment } = withOwnerPipe(scopeReports ? ['ignore', 'ignore', 'ignore', 'pipe']
+            : captureSpawnOutputStdio(startupLogFileName, `session ${resumeTargetSessionId ?? 'new'} from ${cwd}`));
+          try { onProcessSubmission?.(); return spawnHappyCLI(args, { cwd, detached: true, stdio, env: { ...env, ...scopeReports?.environment, ...ownerEnvironment } }); }
           finally { closeCapturedSpawnOutputStdio(stdio); }
         });
       scopeReports?.attach(happyProcess);
+      ownerLaunch?.attach(happyProcess);
       const rootPid = prepared?.pid ?? happyProcess.pid;
       if (!rootPid) return { type: 'error', errorMessage: 'Failed to spawn Happy process - no PID returned' };
       logger.debug(`[DAEMON RUN] Spawned session root PID ${rootPid}`);
@@ -4067,6 +4107,7 @@ export async function startDaemon(): Promise<void> {
     };
     const { port: controlPort, stop: stopControlServer, controlSecret } = await startDaemonControlServer({
       restartDrain: restartDrainControlPort,
+      getCallerLaunches: () => callerLaunches,
       getSetupTokenAccountSwitch: () => setupTokenAccountSwitch,
       getChildren: getCurrentChildren,
       stopSession,
@@ -4268,6 +4309,11 @@ export async function startDaemon(): Promise<void> {
       void apiMachine.updateMachineMetadata((metadata) => agentBrowserMetadataUpdate(metadata, agentBrowserMachineCapability()) ?? metadata!)
         .catch((error) => logger.debug('[DAEMON RUN] agent browser capability not published', error));
     }
+    // A personal runtime activated later (Desktop installed it after sign-in) is published then.
+    publishAgentBrowserCapability = () => {
+      void apiMachine.updateMachineMetadata((metadata) => agentBrowserMetadataUpdate(metadata, agentBrowserMachineCapability()) ?? metadata!)
+        .catch((error) => logger.debug('[DAEMON RUN] agent browser capability not published', error));
+    };
     // Same for the tool policy capability (aplus-dev-studio specs/agent-tool-policy): Desktop must not
     // claim enforcement the daemon is not doing, nor miss enforcement it is.
     if (toolPolicyMetadataUpdate(machine.metadata, toolPolicyMachineCapability(process.env))) {
@@ -5310,20 +5356,35 @@ export async function startDaemon(): Promise<void> {
       logger.debug(`[channel-host] not started: ${channelHostEntry.code}`);
     }
 
-    const ownedSpawn = createOwnedSpawnRuntime({ home: configuration.happyHomeDir, happyOrigin: configuration.serverUrl, env: process.env,
-      registration: async () => {
-        const [currentCredentials, settings] = await Promise.all([readCredentials(), readSettings()]);
-        if (!currentCredentials || settings.machineId !== machineId || !settings.machineIdConfirmedByServer) throw new Error('identity-changed');
-        // Never replace the running daemon's registration with a descriptor's claims.
-        if (JSON.stringify(currentCredentials) !== JSON.stringify(credentials)) throw new Error('identity-changed');
-        return { machineId, credentials: currentCredentials, epoch: String(process.pid) };
+    const ownedRegistration = async () => {
+      const [currentCredentials, settings] = await Promise.all([readCredentials(), readSettings()]);
+      if (!currentCredentials || settings.machineId !== machineId || !settings.machineIdConfirmedByServer) throw new Error('identity-changed');
+      // Never replace the running daemon's registration with a descriptor's claims.
+      if (JSON.stringify(currentCredentials) !== JSON.stringify(credentials)) throw new Error('identity-changed');
+      return { machineId, credentials: currentCredentials, epoch: String(process.pid) };
+    };
+    const liveLaunch = (tracked: TrackedSession) => tracked.pid > 0 && isPidAlive(tracked.pid);
+    // Default OFF: the route refuses and agent-caller-binding answers only owned-journal sources.
+    // A token's account never changes, so only a confirmed answer is remembered; registration is re-read every time.
+    const accountByToken = new Map<string, string>();
+    callerLaunches = createAgentCallerLaunches({ enabled: process.env[OWNER_CONTACT_SWITCH] === '1',
+      identity: async () => {
+        try {
+          const state = await ownedRegistration(), token = state.credentials.token;
+          const happyAccountId = accountByToken.get(token) ?? await authenticatedAccountId(token);
+          accountByToken.set(token, happyAccountId);
+          return { machineId: state.machineId, happyAccountId, epoch: state.epoch };
+        } catch { return null; }
       },
+      trust: () => readOwnerContactTrust(process.env, configuration.serverUrl), trackedByPid: pid => pidToTrackedSession.get(pid), live: liveLaunch });
+    const ownedSpawn = createOwnedSpawnRuntime({ home: configuration.happyHomeDir, happyOrigin: configuration.serverUrl, env: process.env,
+      registration: ownedRegistration, launchCallers: callerLaunches,
       metadata: options => ({ path: options.directory, host: os.hostname(), version: packageJson.version, os: os.platform(), machineId,
         homeDir: os.homedir(), happyHomeDir: configuration.happyHomeDir, happyLibDir: projectPath(), happyToolsDir: join(projectPath(), 'tools', 'unpacked'),
         flavor: options.agent ?? 'claude', startedFromDaemon: true, startedBy: 'daemon', lifecycleState: 'running', lifecycleStateSince: Date.now() }),
       rotation: (options, companyId) => companyId ? machineRuntimeFor(companyId) : machineRotationFor(options),
       start: (options, launch) => { if (launch) ownedMachineLaunches.set(options, launch); return ownedStartGuard.start(options, () => spawnSessionAdmitted(options)); },
-      tracked: sessionId => findTrackedSessionById(sessionId) ?? sessionIdToFinishedSession.get(sessionId), live: tracked => tracked.pid > 0 && isPidAlive(tracked.pid),
+      tracked: sessionId => findTrackedSessionById(sessionId) ?? sessionIdToFinishedSession.get(sessionId), live: liveLaunch,
       persist: async session => {
         // Rotation has already persisted its execution binding; retain that trusted resume state.
         const prior = readPersistedSessions()[session.id];
@@ -5363,8 +5424,10 @@ export async function startDaemon(): Promise<void> {
       portRegistry,
       automationStore,
       aiCredentialRuntime,
-      ...(browserTaskBroker ? {
-        browserSessionWaiting: async (sessionId: string) => heldBrowserAttentions.answerWaiting(sessionId) || browserTaskBroker!.waiting(sessionId),
+      // A personal runtime may activate after this registration: resolve the broker per call.
+      ...(browserTaskBroker || personalBrowserWatch ? {
+        browserSessionWaiting: async (sessionId: string) => heldBrowserAttentions.answerWaiting(sessionId)
+          || (browserTaskBroker ? browserTaskBroker.waiting(sessionId) : false),
       } : {}),
       autonomousQualityGate: createAutonomousQualityGateRpcHandlers(autonomousQualityGateRegistry),
       checkpoint: {
@@ -5788,6 +5851,7 @@ export async function startDaemon(): Promise<void> {
 
       stopBrowserTaskReconciliation();
       await stopBrowserAttention();
+      await personalBrowserWatch?.stop();
 
       // Clear health check interval
       if (restartOnStaleVersionAndHeartbeat) {
@@ -5846,7 +5910,7 @@ export async function startDaemon(): Promise<void> {
       process.exit(0);
     };
 
-    stopBrowserAttention = startBrowserAttentionWatcher({
+    const browserAttentionOptions: Parameters<typeof startBrowserAttentionWatcher>[0] = {
       happyHomeDir: configuration.happyHomeDir,
       serverUrl: configuration.serverUrl,
       machineId,
@@ -5864,7 +5928,16 @@ export async function startDaemon(): Promise<void> {
         ? readStagedTokenFromHomeDir(session.userHomeDir)
         : credentials.token,
       log: (message) => logger.debug(message),
-    });
+    };
+    stopBrowserAttention = startBrowserAttentionWatcher(browserAttentionOptions);
+    // The personal runtime may become active later; its attention feed then starts too.
+    const startPersonalBrowserAttention = (native: NativeBrokerRequestOptions) => {
+      const stopPersonal = startBrowserAttentionWatcher({ ...browserAttentionOptions, native });
+      const stopPrevious = stopBrowserAttention;
+      stopBrowserAttention = async () => { await stopPrevious(); await stopPersonal(); };
+    };
+    if (personalBrowserNative) startPersonalBrowserAttention(personalBrowserNative);
+    else onPersonalBrowserActive = startPersonalBrowserAttention;
 
     logger.debug('[DAEMON RUN] Daemon started successfully, waiting for shutdown request');
 

@@ -1,4 +1,5 @@
 /** Durable task state, grants, approvals and journal storage. */
+import { syncDirectory } from './syncDirectory'
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, open, readFile, readdir, rename, rm, truncate, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -817,10 +818,5 @@ export class TaskStore {
         await rename(temporary, file)
         await this.syncDirectory(dir)
     }
-    private async syncDirectory(dir: string): Promise<void> { const handle = await open(dir, 'r'); try {
-        await handle.sync()
-    }
-    finally {
-        await handle.close()
-    } }
+    private async syncDirectory(dir: string): Promise<void> { await syncDirectory(dir) }
 }

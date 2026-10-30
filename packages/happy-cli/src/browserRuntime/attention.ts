@@ -23,6 +23,7 @@
  * they were queued before the reassignment or not; `nextSeq` still moves past them,
  * so the daemon's cursor progresses and no old session is woken.
  */
+import { syncDirectory } from './syncDirectory'
 import { randomUUID } from 'node:crypto'
 import { mkdir, open, readFile, rename, rm } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -236,8 +237,7 @@ export class AttentionOutbox {
                 await handle.close()
             }
             await rename(temporary, file)
-            const dir = await open(this.stateDir, 'r')
-            try { await dir.sync() } finally { await dir.close() }
+            await syncDirectory(this.stateDir)
         } catch (error) {
             await rm(temporary, { force: true })
             throw error

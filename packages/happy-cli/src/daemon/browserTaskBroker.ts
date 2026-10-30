@@ -33,7 +33,7 @@
 import { randomUUID } from 'node:crypto'
 import { closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
-import { brokerRequest } from '@/browserRuntime/brokerGrantSource'
+import { brokerRequest, createNativeBrokerRequest, type NativeBrokerRequestOptions } from '@/browserRuntime/brokerGrantSource'
 import { logger } from '@/ui/logger'
 import { sessionRegistrationsSchema, type SessionOwner } from '@/browserRuntime/sessionRegistration'
 import { readBrowserTaskBootId, readBrowserTaskPidStartTime, readBrowserTaskSessionOwner } from './browserTaskSessionOwner'
@@ -90,6 +90,8 @@ export interface BrowserTaskSessionBroker {
 }
 
 export interface BrowserTaskSessionBrokerOptions {
+    /** Core-provided exact-command issuer for an installed native service. */
+    native?: NativeBrokerRequestOptions
     /** Linux procfs on the execution host; overridable for filesystem fixtures. */
     procRoot?: string
     /** Pending revocations survive daemon restarts here (the daemon's home dir). */
@@ -158,6 +160,8 @@ function writeQueueFileDurably(file: string, data: string): void {
         rmSync(temporary, { force: true })
         throw error
     }
+    // Windows directory handles do not support Node's fsync; file sync and rename still apply.
+    if (process.platform === 'win32') return
     const dirFd = openSync(dir, 'r')
     try { fsyncSync(dirFd) } finally { closeSync(dirFd) }
 }
@@ -204,10 +208,11 @@ export function createBrowserTaskSessionBroker(
     request: typeof brokerRequest = brokerRequest,
     options: BrowserTaskSessionBrokerOptions = {},
 ): BrowserTaskSessionBroker | undefined {
-    const config = readBrowserTaskBrokerConfig(env)
+    const config = options.native ? { socketPath: options.native.socketPath, daemonToken: undefined } : readBrowserTaskBrokerConfig(env)
     if (!config) return undefined
     const { socketPath, daemonToken } = config
-    const headers = { 'x-abp-daemon-token': daemonToken }
+    const headers: Record<string, string> = daemonToken ? { 'x-abp-daemon-token': daemonToken } : {}
+    if (options.native) request = createNativeBrokerRequest(options.native, request)
     /** The reply status, or 0 when the socket was unreachable. */
     const send = async (path: string, body: Record<string, unknown>): Promise<{ status: number; result?: Record<string, unknown>; transient?: boolean }> => {
         try {

@@ -138,6 +138,13 @@ export const httpRequestsCounter = new Counter({
     registers: [register]
 });
 
+export const automationReadRequestsCounter = new Counter({
+    name: 'automation_read_requests_total',
+    help: 'Automation GET requests by bounded refresh source',
+    labelNames: ['route', 'status', 'source'] as const,
+    registers: [register]
+});
+
 export const httpRequestDurationHistogram = new Histogram({
     name: 'http_request_duration_seconds',
     help: 'HTTP request duration in seconds',

@@ -18,6 +18,39 @@ const valid = () => ({
 })
 
 describe('parseRuntimeConfig', () => {
+    it('admits native production only with distinct service identities, local API and signed broker authority', () => {
+        const nativeService = { platform: 'darwin', runtimeUid: 472, runtimeGid: 472, browserUid: 471, browserGid: 471, policyEpoch: 1, proxyPort: 18789 }
+        const input = { ...valid(), daemonTokenSha256: undefined, runtimeHost: '127.0.0.1', nativeService,
+            brokerSocketPath: '/Library/Application Support/SaycodeNative/run/broker.sock', adminSocketPath: '/Library/Application Support/SaycodeNative/run/admin.sock' }
+        expect(parseRuntimeConfig(input).nativeService).toEqual({ ...nativeService, networkProtection: 'guard' })
+        expect(parseRuntimeConfig({ ...input, nativeService: { ...nativeService, networkProtection: 'basic' } }).nativeService).toMatchObject({ networkProtection: 'basic' })
+        expect(() => parseRuntimeConfig({ ...input, nativeService: { ...nativeService, networkProtection: 'auto' } })).toThrow()
+        for (const change of [{ authMode: 'harness' }, { runtimeHost: '0.0.0.0' }, { daemonTokenSha256: 'a'.repeat(64) },
+            { nativeService: { ...nativeService, runtimeUid: 471 } }, { nativeService: { ...nativeService, browserUid: 0 } },
+            { nativeService: { ...nativeService, platform: 'win32' } },
+            { profiles: [{ ...valid().profiles[0], cdpHttpUrl: 'http://127.0.0.1:9222' }] }]) {
+            expect(() => parseRuntimeConfig({ ...input, ...change })).toThrow()
+        }
+        expect(() => parseRuntimeConfig({ ...valid(), daemonTokenSha256: undefined })).toThrow(/daemon token/)
+    })
+    it('admits a personal desktop runtime as a separate same-user mode that never reads as a native service', () => {
+        const personalDesktop = { platform: 'darwin', browserExecutable: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' }
+        const input = { ...valid(), daemonTokenSha256: undefined, runtimeHost: '127.0.0.1', personalDesktop }
+        const config = parseRuntimeConfig(input)
+        expect(config.personalDesktop).toEqual(personalDesktop)
+        expect(config.nativeService).toBeUndefined()
+        expect(parseRuntimeConfig({ ...input, personalDesktop: { platform: 'win32', browserExecutable: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe' } }).personalDesktop?.platform).toBe('win32')
+        const nativeService = { platform: 'darwin', runtimeUid: 472, runtimeGid: 472, browserUid: 471, browserGid: 471, policyEpoch: 1, proxyPort: 18789 }
+        for (const change of [{ authMode: 'harness' }, { runtimeHost: '0.0.0.0' }, { daemonTokenSha256: 'a'.repeat(64) }, { brokerSocketGid: 20 },
+            { tenancyMode: 'shared' }, { nativeService },
+            { personalDesktop: { ...personalDesktop, browserExecutable: 'Google Chrome' } },
+            { personalDesktop: { ...personalDesktop, browserExecutable: '/Applications/../tmp/chrome' } },
+            { personalDesktop: { ...personalDesktop, platform: 'linux' } },
+            { personalDesktop: { ...personalDesktop, profileDir: '/tmp/other' } },
+            { profiles: [{ ...valid().profiles[0], cdpHttpUrl: 'http://127.0.0.1:9222' }] }]) {
+            expect(() => parseRuntimeConfig({ ...input, ...change })).toThrow()
+        }
+    })
     it('accepts a production config and fills documented defaults', () => {
         const config = parseRuntimeConfig(valid())
         expect(config).toMatchObject({

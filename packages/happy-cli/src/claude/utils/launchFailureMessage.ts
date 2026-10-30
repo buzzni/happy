@@ -1,13 +1,28 @@
 export const PERSONAL_CLAUDE_AUTH_FAILURE = 'CLAUDE_PERSONAL_AUTH_NOT_VERIFIED';
 export const ORGANIZATION_CLAUDE_AUTH_FAILURE = 'CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED';
 
+export type ClaudeAuthCheckStage = 'initialize' | 'settings' | 'apply' | 'recheck';
+export type ClaudeAuthCheckReason = 'timeout' | 'unsupported' | 'mismatch' | 'policy' | 'control_failed';
+
+/** A sanitized pinned-credential refusal: the message stays the code; only fixed values say where and why. */
+export class ClaudeAuthNotVerifiedError extends Error {
+    constructor(code: string, readonly stage: ClaudeAuthCheckStage, readonly reason: ClaudeAuthCheckReason) { super(code); }
+}
+
 /**
  * What the user is told when Claude Code exits before its first SDK message (Desktop
  * specs/headless-standalone-server R21). The SDK's error already carries the child's stderr, but that
  * text can hold paths, env values or tokens, so only recognised failures get a specific sentence;
  * anything else gets a generic one that points at the machine's log, where the full error is.
  */
+export const CLAUDE_STARTUP_TIMEOUT_NOTICE = 'Claude Code took too long to start on this machine, so the request was not sent. The account was not rejected. '
+    + 'Send again; if this repeats, check this project\'s SessionStart hooks.';
+export const CLAUDE_AUTH_CHECK_TIMEOUT_NOTICE = 'Claude Code did not answer the account check in time, so the request was not sent. The account was not rejected. Send again.';
+
 export function describeClaudeLaunchFailure(error: unknown): string {
+    if (error instanceof ClaudeAuthNotVerifiedError && error.reason === 'timeout') {
+        return error.stage === 'initialize' ? CLAUDE_STARTUP_TIMEOUT_NOTICE : CLAUDE_AUTH_CHECK_TIMEOUT_NOTICE;
+    }
     const text = error instanceof Error ? error.message : String(error);
     if (text === ORGANIZATION_CLAUDE_AUTH_FAILURE) return 'Organization Claude stopped because the assigned account or policy could not be verified. Check this machine’s CLI and assigned account, then send again.';
     if (text === PERSONAL_CLAUDE_AUTH_FAILURE) return 'Personal Claude stopped because the selected account or policy could not be verified. Check the account and send again.';

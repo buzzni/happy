@@ -14,7 +14,7 @@ import type { CodexTurnLatencyProgress } from '@/codex/codexTurnLatency';
 import { backoff, isSessionGoneError } from '@/utils/time';
 import { configuration } from '@/configuration';
 import { RawJSONLines } from '@/claude/types';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { SessionStateWrites, SessionStateWriteRefused } from './sessionStateWrites';
 import { SessionStorageBarrier, type StorageConfirmation } from './sessionStorageBarrier';
 import { deriveKey } from '@/utils/deriveKey';
@@ -26,7 +26,7 @@ import { hostManagedMachineTools } from '../modules/common/moaiMachineRunProfile
 import { calculateCost } from '@/utils/pricing';
 import { shouldReconnect } from '@/utils/lidState';
 import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_NOT_READY_POLL_MS, reconnectDelayMs } from '@/api/reconnectCadence';
-import { createEnvelope, type CreateEnvelopeOptions, type SessionEnvelope, type SessionTurnEndStatus } from '@slopus/happy-wire';
+import { bindRpcRequest, createEnvelope, readBoundRpcResponse, type CreateEnvelopeOptions, type SessionEnvelope, type SessionTurnEndStatus } from '@slopus/happy-wire';
 import {
     closeClaudeTurnWithStatus,
     observeClaudeBackgroundInput,
@@ -645,6 +645,30 @@ export class ApiSessionClient extends EventEmitter {
     /** The origin this client is allowed to talk to, when it is a managed one. */
     getManagedOrigin(): string | null {
         return this.managed?.serverOrigin ?? null;
+    }
+
+    /**
+     * Desktop P0a §4.5 owner-relay-v1 call over the existing rpc-call protocol, sealed with this
+     * session's key (T1c-b2 H2). One attempt, 20s deadline; the key and remote errors stay here.
+     */
+    async callOwnerRelay(method: string, request: unknown, signal: AbortSignal): Promise<unknown> {
+        if (!/^owner-relay-v1:[A-Za-z0-9_-]{16,128}$/.test(method)) throw new Error('invalid-owner-relay-method');
+        // p0a §4.5: only the source session's DEK, never the legacy/account key, and the existing RPC binding
+        // (method, scope = this source session, issuedAt, nonce) so the receiver can refuse replays and cross-method use.
+        if (this.encryptionVariant !== 'dataKey') throw new Error('owner-relay-unavailable');
+        signal.throwIfAborted();
+        const nonce = randomBytes(16).toString('base64');
+        const bound = bindRpcRequest({ method, scope: this.sessionId, params: request, issuedAt: Date.now(), nonce });
+        const params = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, bound));
+        const response = await this.socket.timeout(20_000).emitWithAck('rpc-call', { method, params });
+        signal.throwIfAborted();
+        let opened: unknown = null;
+        try {
+            if (response?.ok && typeof response.result === 'string') opened = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(response.result));
+        } catch { opened = null; }
+        const reply = readBoundRpcResponse(opened, nonce);
+        if (!reply.ok || reply.result === null || reply.result === undefined) throw new Error('owner-relay-unavailable');
+        return reply.result;
     }
 
     constructor(token: string, session: Session, managed?: ManagedCredentialMode, private readonly options: { trackShutdownStorage?: boolean; storageHighWaterBytes?: number; storageHighWaterWrites?: number } = {}) {

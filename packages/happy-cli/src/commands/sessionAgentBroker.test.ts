@@ -16,6 +16,17 @@ async function fixture() {
   return root
 }
 describe('trusted session agent execution', () => {
+  it('routes only typed owner requests over private IPC without exposing adapter errors', async () => {
+    const root = await fixture(), entrypoint = join(root, 'owner-cli.mjs')
+    await writeFile(entrypoint, `process.on('message', m => { console.log(JSON.stringify({exitCode:0,stdout:JSON.stringify({ok:true,response:m})})); process.disconnect() }); process.send({type:'owner-contact-v1',requestId:'request',request:{v:1,entry:'chat',operation:'lookup-readable-sessions',payload:{sessionIds:[]}}})`)
+    let received: unknown
+    const execute = createAgentHostExecutor({ sessionId: 'current', directory: root, env: {}, entrypoint,
+      ownerContact: { call: async request => { received = request; throw new Error('secret-bearer') }, close() {} } })
+    const output = JSON.parse((await execute(['chat'], new AbortController().signal)).stdout)
+    expect(received).toMatchObject({ v: 1, entry: 'chat', operation: 'lookup-readable-sessions' })
+    expect(output.response).toEqual({ type: 'owner-contact-v1-result', requestId: 'request', error: 'owner-contact-unavailable' })
+    expect(JSON.stringify(output)).not.toContain('secret-bearer')
+  })
   it('fixes identity, cwd and environment before caller execution and preserves the session capability through filtering', async () => {
     const root = await fixture(), entrypoint = join(root, 'cli.mjs')
     await writeFile(entrypoint, `console.log(JSON.stringify({exitCode:0,stdout:JSON.stringify({ok:true,id:process.env.APLUS_SESSION_ID,root:process.env.SAYCODE_AGENT_ROOT,args:process.argv.slice(2),broker:process.env.SAYCODE_AGENT_BROKER_CAPABILITY})}))`)

@@ -46,3 +46,7 @@ happy-*.tgz
 .npmrc
 .managed-image/
 .cache/
+
+# Platform-built Node-API browser host artifacts (source remains tracked).
+/native/darwin-*/
+/native/win32-*/

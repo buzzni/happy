@@ -44,11 +44,21 @@ import { CdpConnection, CdpProtocolError, connectionClosedError } from './cdpCon
 import { verifySubmissionRequest } from './submissionCheck'
 import { CHECK_ELEMENT, CLIMB_FRAMES, COLLECT_FRAME, DESCRIBE_ELEMENT, FRAME_HAS_TEXT, HIT_TEST, IN_THIS_DOCUMENT, LABEL_OF, SELECT_CONTENT, SUBMIT_GUARD, type CollectedFrame, type ElementState } from './pageScripts'
 
-export interface CdpDriverOptions {
-    /** Browser-level endpoint from `/json/version` (webSocketDebuggerUrl). */
+/** A pipe and its process identity are issued together by the trusted supervisor.
+ * Never accept a connection factory, descriptors or process identity from an agent. */
+export type CdpDriverOptions = CdpDriverCommonOptions & ({
     browserWsUrl: string
-    /** Read from the trusted browser start path; never derived from CDP. */
     browserInstanceIdProvider: () => Promise<BrowserInstanceId>
+    connectPipe?: never
+} | {
+    connectPipe: () => Promise<{ connection: CdpConnection; browserInstanceId: BrowserInstanceId }>
+    browserWsUrl?: never
+    browserInstanceIdProvider?: never
+})
+
+interface CdpDriverCommonOptions {
+    /** Service-owned egress policy; updated before navigation and revoked on close. */
+    setAllowedOrigins?: (origins: readonly string[]) => void
     /** Owned tabs (= agent windows) this driver keeps open at once; default DEFAULT_MAX_AGENT_WINDOWS. */
     maxAgentWindows?: number
     /** Runtime resource admission, also enforced for popups and in-flight windows. */
@@ -312,7 +322,9 @@ export class CdpDriver implements BrowserDriver {
     readonly gatesInputOnValidateDispatch = true
     private conn?: CdpConnection
     private instanceId?: BrowserInstanceId
-    private browserWsUrl: string
+    private browserWsUrl: string | undefined
+    private connecting?: Promise<BrowserInstanceId>
+    private connectGeneration = 0
     private readonly tabs = new Map<TabId, TabState>()
     private readonly tabsByTarget = new Map<string, TabState>()
     private readonly sessions = new Map<string, SessionInfo>()
@@ -354,8 +366,23 @@ export class CdpDriver implements BrowserDriver {
     // Connection lifecycle
     // -----------------------------------------------------------------------
 
-    async connect(): Promise<BrowserInstanceId> {
-        const conn = await CdpConnection.connect(this.browserWsUrl)
+    connect(): Promise<BrowserInstanceId> {
+        if (this.isConnected()) return Promise.resolve(this.instanceId!)
+        if (this.connecting) return this.connecting
+        const pending = this.connectTransport(++this.connectGeneration).finally(() => {
+            if (this.connecting === pending) this.connecting = undefined
+        })
+        this.connecting = pending
+        return pending
+    }
+
+    private async connectTransport(generation: number): Promise<BrowserInstanceId> {
+        const pipe = this.options.connectPipe ? await this.options.connectPipe() : undefined
+        const conn = pipe?.connection ?? await CdpConnection.connect(this.browserWsUrl!)
+        if (generation !== this.connectGeneration || conn.closed) {
+            conn.close()
+            throw connectionClosedError()
+        }
         this.conn = conn
         this.wire(conn)
         conn.onClose(() => {
@@ -369,7 +396,7 @@ export class CdpDriver implements BrowserDriver {
             // Every new page starts paused and is attached here first, so a popup of an owned
             // tab gets request interception before its first request; other pages are released.
             await conn.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true, filter: [{ type: 'page', exclude: false }] })
-            return this.options.browserInstanceIdProvider()
+            return pipe ? pipe.browserInstanceId : this.options.browserInstanceIdProvider!()
         }).catch((error) => {
             conn.close()
             throw error
@@ -386,12 +413,9 @@ export class CdpDriver implements BrowserDriver {
      * from the returned instance id whether this is the same browser.
      */
     async reconnect(browserWsUrl?: string): Promise<BrowserInstanceId> {
+        if (browserWsUrl !== undefined && this.options.connectPipe) throw new Error('Native pipe drivers cannot use a network endpoint')
         if (browserWsUrl) this.browserWsUrl = browserWsUrl
-        const old = this.conn
-        this.conn = undefined
-        this.dropAllTabs()
-        old?.close()
-        this.instanceId = undefined
+        await this.close()
         return this.connect()
     }
 
@@ -406,11 +430,14 @@ export class CdpDriver implements BrowserDriver {
     }
 
     browserInstanceId(): BrowserInstanceId {
-        if (!this.instanceId) throw new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'driver is not connected', true, false)
-        return this.instanceId
+        if (!this.isConnected()) throw new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'driver is not connected', true, false)
+        return this.instanceId!
     }
 
     async close(): Promise<void> {
+        ++this.connectGeneration
+        this.connecting = undefined
+        this.instanceId = undefined
         const conn = this.conn
         this.conn = undefined
         this.dropAllTabs()
@@ -780,7 +807,7 @@ export class CdpDriver implements BrowserDriver {
     ): Promise<Observation> {
         return this.run(opts, async (_op, conn) => {
             const tab = this.requireTab(tabId)
-            tab.allowedOrigins = allowedOrigins
+            this.setTabOrigins(tab, allowedOrigins)
             let scope: { binding: RefBinding; objectId: string } | undefined
             if (opts.scopeRef) {
                 if (!tab.snapshot) throw staleRef('no snapshot for scopeRef')
@@ -877,7 +904,7 @@ export class CdpDriver implements BrowserDriver {
     screenshot(tabId: TabId, allowedOrigins: string[], opts: DriverOptions): Promise<ScreenshotResult> {
         return this.run(opts, async (_op, conn) => {
             const tab = this.requireTab(tabId)
-            tab.allowedOrigins = allowedOrigins
+            this.setTabOrigins(tab, allowedOrigins)
             const before = tab.generation
             const frames = await this.collectFrames(conn, tab)
             for (const frame of frames) {
@@ -1204,7 +1231,7 @@ export class CdpDriver implements BrowserDriver {
             targetId,
             sessionId,
             sessions: new Set([sessionId]),
-            allowedOrigins,
+            allowedOrigins: [...allowedOrigins],
             generation: 0,
             blockedMain: 0,
             stamps: new Map(),
@@ -1215,16 +1242,31 @@ export class CdpDriver implements BrowserDriver {
             pendingSetups: new Set(),
             goneListeners: new Set(),
         }
+        this.syncEgress(tab)
         this.tabs.set(tab.tabId, tab)
         this.tabsByTarget.set(targetId, tab)
         this.sessions.set(sessionId, { tab, targetId, isMain: true })
         return tab
     }
 
+    private syncEgress(changed?: TabState): void {
+        const origins = new Set<string>()
+        for (const tab of this.tabs.values()) if (tab !== changed) for (const origin of tab.allowedOrigins) origins.add(origin)
+        for (const origin of changed?.allowedOrigins ?? []) origins.add(origin)
+        this.options.setAllowedOrigins?.([...origins])
+    }
+
+    private setTabOrigins(tab: TabState, origins: string[]): void {
+        const previous = tab.allowedOrigins
+        tab.allowedOrigins = [...origins]
+        try { this.syncEgress(tab) } catch (error) { tab.allowedOrigins = previous; throw error }
+    }
+
     /** Removes every trace of a tab. Refs die with it. */
     private forgetTab(tab: TabState): void {
         if (this.tabs.get(tab.tabId) !== tab) return
         this.tabs.delete(tab.tabId)
+        this.syncEgress()
         this.tabsByTarget.delete(tab.targetId)
         for (const sessionId of tab.sessions) {
             this.sessions.delete(sessionId)
@@ -1464,7 +1506,7 @@ export class CdpDriver implements BrowserDriver {
         validate?: () => void,
     ): Promise<{ url: string; documentGeneration: number }> {
         if (!originAllowed(allowedOrigins, originOf(url))) throw originDenied('requested origin is not allowed')
-        tab.allowedOrigins = allowedOrigins
+        this.setTabOrigins(tab, allowedOrigins)
         let navigated = false
         let offs: Array<() => void> = []
         const loaded = new Promise<void>((resolve, reject) => {

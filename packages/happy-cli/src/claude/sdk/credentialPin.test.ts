@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Options, Query, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { queryWithPinnedCredential } from './credentialPin';
+import { logger } from '@/lib';
 const TOKEN = 'fixture-owner-token';
 function fixture() {
     let effective: Record<string, any> = { apiKeyHelper: 'wrong helper', env: { CLAUDE_CODE_OAUTH_TOKEN: 'wrong' } };
@@ -19,7 +20,7 @@ function fixture() {
     return { controls, create, received, tamper: () => { effective.env.ANTHROPIC_BASE_URL = 'https://wrong.example.test'; }, restrictOrganization: () => { effective.forceLoginOrgUUID = 'fixture-org'; } };
 }
 const options: Options = { env: { CLAUDE_CODE_OAUTH_TOKEN: TOKEN }, settingSources: ['user', 'project', 'local'] };
-afterEach(() => vi.useRealTimers());
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 describe('pinned credential at the SDK request boundary', () => {
     it('applies only credential flags before input, preserving settings sources and existing flag env', async () => {
         const f = fixture(); const q = queryWithPinnedCredential(f.create as never, { prompt: 'hello', options }, TOKEN);
@@ -89,5 +90,102 @@ describe('pinned credential at the SDK request boundary', () => {
         const checked = expect(q.next()).rejects.toThrow('CLAUDE_PERSONAL_AUTH_NOT_VERIFIED');
         await vi.advanceTimersByTimeAsync(10_001); await checked;
         expect(f.received).toEqual([]); expect(f.controls.close).toHaveBeenCalled();
+    });
+    // A slow SessionStart hook delays initialization only; no input exists until it resolves.
+    it('waits past the control timeout for Claude Code to finish starting', async () => {
+        vi.useFakeTimers(); const f = fixture();
+        f.controls.initializationResult.mockImplementation(() => new Promise(resolve => setTimeout(() => resolve({ claude_code_version: '2.1.308', hooks_applied: true }), 12_000)));
+        const q = queryWithPinnedCredential(f.create as never, { prompt: 'hello', options }, TOKEN, 'organization');
+        const first = q.next();
+        await vi.advanceTimersByTimeAsync(12_001);
+        await expect(first).resolves.toMatchObject({ done: false });
+        expect(f.received).toHaveLength(1);
+    });
+    it('refuses without input when Claude Code does not finish starting within the startup budget', async () => {
+        vi.useFakeTimers(); const f = fixture();
+        f.controls.initializationResult.mockImplementation(() => new Promise(() => {}));
+        const q = queryWithPinnedCredential(f.create as never, { prompt: 'hello', options }, TOKEN, 'organization');
+        let settled = false;
+        const checked = q.next().then(() => { throw new Error('unexpected input'); }, (error: unknown) => { settled = true; return error; });
+        await vi.advanceTimersByTimeAsync(59_000); expect(settled).toBe(false);
+        await vi.advanceTimersByTimeAsync(1_001);
+        const error = await checked;
+        expect(error).toMatchObject({ message: 'CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED', stage: 'initialize', reason: 'timeout' });
+        expect(f.received).toEqual([]); expect(f.controls.close).toHaveBeenCalled();
+    });
+    it('ends a startup wait as an abort when the user stops', async () => {
+        vi.useFakeTimers(); const f = fixture(); const abortController = new AbortController();
+        f.controls.initializationResult.mockImplementation(() => new Promise(() => {}));
+        const q = queryWithPinnedCredential(f.create as never, { prompt: 'hello', options: { ...options, abortController } }, TOKEN, 'organization');
+        const checked = expect(q.next()).rejects.toThrow('Claude request aborted');
+        await vi.advanceTimersByTimeAsync(15_000); abortController.abort(); await checked;
+        expect(f.received).toEqual([]);
+    });
+    it('logs startup hook timing and the refused stage without hook output or credentials', async () => {
+        vi.useFakeTimers(); const f = fixture(); const debug = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+        f.controls.initializationResult.mockImplementation(() => new Promise(() => {}));
+        const hook = { type: 'system', hook_event: 'SessionStart', hook_id: 'h1', hook_name: 'SessionStart:startup' };
+        const create = vi.fn(({ prompt }: { prompt: AsyncIterable<SDKUserMessage> }) => Object.assign((async function* () {
+            // Like the SDK, consume input on its own while the output stream reports hooks.
+            void (async () => { try { for await (const message of prompt) f.received.push(message); } catch { /* refused */ } })();
+            yield { ...hook, subtype: 'hook_started' };
+            await new Promise(resolve => setTimeout(resolve, 7_000));
+            yield { ...hook, subtype: 'hook_response', outcome: 'success', output: TOKEN, stdout: TOKEN, stderr: '' };
+            await new Promise(() => {});
+        })(), f.controls) as unknown as Query);
+        const q = queryWithPinnedCredential(create as never, { prompt: 'hello', options }, TOKEN, 'organization');
+        await q.next();
+        const second = q.next();
+        await vi.advanceTimersByTimeAsync(7_001); await second;
+        const third = q.next().catch((error: unknown) => error);
+        await vi.advanceTimersByTimeAsync(60_000); await third;
+        const lines = debug.mock.calls.map(call => call.join(' ')).join('\n');
+        expect(lines).toMatch(/SessionStart:startup hook started at \+\d+ms/);
+        expect(lines).toMatch(/SessionStart:startup hook success at \+7\d{3}ms after 7\d{3}ms/);
+        expect(lines).toMatch(/initialize timeout after 60000ms/);
+        expect(lines).toMatch(/organization credential refused: stage=initialize reason=timeout \d+ms after query start/);
+        expect(lines).not.toContain(TOKEN);
+    });
+    it('logs a failed recheck with the duration of that call, not the conversation age', async () => {
+        vi.useFakeTimers(); const f = fixture(); const debug = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+        async function* prompt() { for (const content of ['one', 'two']) { yield { type: 'user' as const, parent_tool_use_id: null, message: { role: 'user' as const, content } }; await new Promise(resolve => setTimeout(resolve, 600_000)); } }
+        const q = queryWithPinnedCredential(f.create as never, { prompt: prompt(), options }, TOKEN, 'organization');
+        await q.next();
+        f.controls.reinitialize.mockImplementation(() => new Promise(() => {}));
+        const second = q.next().catch((error: unknown) => error);
+        await vi.advanceTimersByTimeAsync(610_001);
+        expect(await second).toMatchObject({ stage: 'recheck', reason: 'timeout' });
+        const lines = debug.mock.calls.map(call => call.join(' ')).join('\n');
+        expect(lines).toMatch(/recheck timeout after 10000ms/);
+        expect(lines.match(/credential refused/g)).toHaveLength(1);
+    });
+    it.each([
+        ['getSettings-hang', 'settings', 'timeout'],
+        ['apply-hang', 'apply', 'timeout'],
+        ['recheck-hang', 'recheck', 'timeout'],
+        ['missing-control', 'initialize', 'unsupported'],
+        ['old-version', 'initialize', 'unsupported'],
+        ['overlay-refused', 'apply', 'control_failed'],
+        ['managed-override', 'recheck', 'mismatch'],
+        ['wrong-account', 'recheck', 'mismatch'],
+        ['restricted-org', 'recheck', 'policy'],
+    ])('reports %s as stage %s / reason %s without upstream detail', async (kind, stage, reason) => {
+        vi.useFakeTimers(); const f = fixture();
+        if (kind === 'getSettings-hang') f.controls.getSettings.mockImplementation(() => new Promise(() => {}));
+        if (kind === 'apply-hang') f.controls.applyFlagSettings.mockImplementation(() => new Promise(() => {}));
+        if (kind === 'recheck-hang') f.controls.reinitialize.mockImplementation(() => new Promise(() => {}));
+        if (kind === 'missing-control') f.controls.applyFlagSettings = undefined as never;
+        if (kind === 'old-version') f.controls.initializationResult.mockResolvedValue({ claude_code_version: '2.1.100', hooks_applied: true });
+        if (kind === 'overlay-refused') f.controls.applyFlagSettings.mockRejectedValue(new Error(TOKEN));
+        if (kind === 'managed-override') f.controls.applyFlagSettings.mockImplementation(async () => {});
+        if (kind === 'wrong-account') f.controls.reinitialize.mockResolvedValue({ account: { apiProvider: 'bedrock', tokenSource: 'CLAUDE_CODE_OAUTH_TOKEN' } });
+        if (kind === 'restricted-org') f.restrictOrganization();
+        const q = queryWithPinnedCredential(f.create as never, { prompt: 'hello', options }, TOKEN, 'organization');
+        const checked = q.next().then(() => { throw new Error('unexpected input'); }, (error: unknown) => error);
+        await vi.advanceTimersByTimeAsync(10_001);
+        const error = await checked as Error & { stage?: string; reason?: string };
+        expect(error).toMatchObject({ message: 'CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED', stage, reason });
+        expect(JSON.stringify({ ...error, message: error.message })).not.toContain(TOKEN);
+        expect(f.received).toEqual([]);
     });
 });

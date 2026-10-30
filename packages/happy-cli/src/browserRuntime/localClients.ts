@@ -1,4 +1,5 @@
 /** Bounded browser delegation. Separate registry: old brokers must never widen client credentials. */
+import { syncDirectory } from './syncDirectory'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { open, readFile, rename, rm } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -63,7 +64,7 @@ export async function openLocalClients(options: LocalClientOptions) {
             const handle = await open(temporary, 'wx', 0o600)
             try { await handle.writeFile(JSON.stringify({ schemaVersion: 1, clients: records })); await handle.sync() } finally { await handle.close() }
             await rename(temporary, file)
-            const dir = await open(options.stateDir, 'r'); try { await dir.sync() } finally { await dir.close() }
+            await syncDirectory(options.stateDir)
         } finally { await rm(temporary, { force: true }) }
     }
     const credential = (r: ClientRecord): AgentGrant => ({
