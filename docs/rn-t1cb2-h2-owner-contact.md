@@ -181,18 +181,31 @@ contact를 골라, spawn은 desktop-z로, 뒤에 후보로 추가된 desktop-a�
   기록을 공유한다.
 - **송신했지만 끝나지 않은 operation은 지우지 않는다(PIN-R1-01).** RPC 하나가 끝났다고 Desktop의 operation이 끝난
   것은 아니다. 지운 키를 다시 보면 과거 operation인지 알 수 없어 새 후보에 재결속하게 되므로, 기록은 검증된 응답에서
-  종결을 관측했을 때만 정리 대상이 된다. 종결은 `allowed` 응답의 child `started`·`failed`와 prompt 저장 receipt뿐이다.
+  종결을 관측했을 때만 정리 대상이 된다. 종결은 `allowed` 응답의 prompt 저장 receipt뿐이다.
   `pending`·`parked`, `unknown`·`unavailable`·`not_owned`, timeout, 응답 검증 실패는 종결이 아니다. `localid_conflict`는
   wire에 별도 결과가 없어(불일치는 `unknown`) 종결로 보지 않는다.
-- **정리와 상한(PIN-R1-02).** 상한은 512건이다. 새 키를 넣을 때 진행 중이 아닌 종결 항목만, 마지막 사용 뒤 24시간이
+- **owned child의 기록은 host 수명 동안 남긴다(PIN-R2-01).** host가 `started`·`failed`를 검증했어도 그 receipt가 CLI에
+  닿았는지, CLI가 lineage를 기록했는지는 모른다(local socket이 먼저 닫히면 receipt는 버려진다). 이를 회수하는 status·
+  `--resume-op`에 답할 수 있는 것은 원래 Desktop의 생성 journal뿐이므로, `spawn-owned-child`·`owned-child-status` 기록은
+  종결 응답 뒤에도, 24시간이 지나도 정리하지 않는다.
+- **prompt 저장 receipt는 종결로 본다.** Desktop main은 같은 localId 재시도에서 먼저 target 세션의 서버 메시지를 localId로
+  찾아(`existing()`) 본문을 비교한 뒤 저장 receipt나 `localid_conflict`를 돌려준다. 저장 행은 서버에 있으므로 receipt를
+  잃은 뒤의 재시도가 다른 유효 Desktop으로 가도 같은 receipt를 받고 다시 저장하지 않는다. 그래서 저장 receipt 뒤의
+  prompt 기록은 정리해도 된다. receipt가 없는 prompt(unknown·timeout 등)는 원래 Desktop의 시도 기록이 판단에 쓰이므로
+  남긴다.
+- **정리와 상한(PIN-R1-02).** 상한은 512건이다. 근거: Desktop CLI의 spawn 예산은 host(세션)당 6시간 창에 최대
+  32건(`cli/domain/spawnBudget.ts`의 `AGENT_SPAWN_BUDGET_MAX`·`SPAWN_BUDGET_WINDOW_MS`)이라, 정리되지 않는 child 기록만으로
+  상한을 채우려면 최대 예산으로 쉬지 않고 4일(하루 128건)이 걸린다. 종결된 prompt는 정리되므로 상한을 차지하는 것은
+  child와 receipt 없는 prompt다. 항목 하나는 수백 바이트라 메모리는 문제가 아니다. 새 키를 넣을 때 진행 중이 아닌 종결 항목만, 마지막 사용 뒤 24시간이
   지났거나 상한에 닿은 경우 오래된 것부터 지운다. 미송신 항목은 마지막 호출이 끝날 때 지워진다. 정리한 뒤에도 상한이면
   새 operation은 송신 없이 `owner-contact-unavailable`이고, 이미 기록된 operation의 호출은 계속 받는다. 호출의 정리는
   작업이 끝날 때와 20초 기한이 끝날 때 중 먼저 오는 쪽에서 한 번 한다. adapter가 abort를 무시해 작업이 끝나지 않아도
   진행 중 수가 남지 않는다. 기한이 지난 뒤의 작업은 송신 전 abort 검사에 걸려 보내지 않는다.
 - **한계: host 재시작·재개 뒤에는 기록이 없다.** 새 binding의 첫 호출은 기존 정렬 규칙으로 고르므로, 그 사이 정렬상
   앞선 Desktop이 생겼으면 이전 operation의 status가 그 operation의 journal이 없는 Desktop으로 갈 수
-  있다. 정리는 종결된 operation만 지우므로 host 수명 안에서는 이 재결속이 생기지 않는다. 그 대가로 끝나지 않은
-  operation이 512건 쌓이면 그 host의 새 spawn·prompt는 host 재시작 전까지 unavailable이다. 영속 기록이나 Desktop 정보를
+  있다. 정리는 저장 receipt를 받은 prompt만 지우므로 host 수명 안에서는 이 재결속이 생기지 않는다. 그 대가로 child와
+  receipt 없는 prompt가 512건 쌓이면 그 host의 새 spawn·prompt는 host 재시작 전까지 unavailable이다. 4일 넘게 최대
+  예산으로 spawn하는 host가 실제로 있으면 상한을 다시 본다. 영속 기록이나 Desktop 정보를
   wire·CLI journal에 싣는 일은 wire 변경이라 하지 않았다.
 - **고정하지 않는 operation**: `lookup-readable-sessions`·`read-session`은 instance별 journal 없이 현재 상태를 읽는
   조회라 어느 유효 Desktop이 답해도 같다. `resume-own-session`·`reply-own-permission`·`abort-own-turn`은 wire에
@@ -211,3 +224,10 @@ adapter에서 기한 뒤 미송신 선택 해제. 상한 테스트는 `pinLimit`
 fake timer로 검증하려고 `AbortSignal.timeout`을 해제되는 일반 timer로 바꿨다(별도 구조 커밋). 구현 전 4건 실패.
 역검증 6건: 정리의 종결 조건 제거, 상한 거부 제거, 기한 경로의 해제 제거, child 종결 판정을 항상 거짓·항상 참으로,
 prompt 종결 판정을 거짓으로 바꾸면 해당 테스트가 각각 실패했다. 관련 3파일 74건 통과, `tsc --noEmit` 통과.
+
+PIN-R2 반영 검증: fixture를 Desktop별 생성 journal로 나눴다. journal이 없는 Desktop의 status는 `unknown`
+(`operation-not-found`)이고, 저장 prompt는 서버 공유다. 이전 "종결 뒤 정리되면 다른 Desktop으로 간다" 테스트는 "started 검증
+뒤 receipt 유실 → 25시간 경과·다른 키(상한의 두 배)로 압박 → 같은 operation status가 원래 Desktop에서 `started`"로 바꿨다.
+prompt receipt 테스트는 정리 뒤 다른 Desktop에서 같은 receipt를 받는지까지 확인한다. 공유 상태로 상한을 채우던 테스트는
+압박 키를 종결 prompt로 바꿨다. 구현 전 새 테스트 1건 실패. 역검증 3건: child 종결을 다시 정리 대상으로, prompt 종결을
+거짓으로, 정리의 종결 조건 제거를 각각 넣으면 해당 테스트가 실패했다. 관련 3파일 74건 통과, `tsc --noEmit` 통과.

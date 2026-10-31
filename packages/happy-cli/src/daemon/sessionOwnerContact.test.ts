@@ -32,8 +32,9 @@ function harness(enabled = true) {
     return { port, registry, binding, counts: () => ({ lookups, sends }), switch: () => { epoch = 'changed'; },
         tamper: () => { tamper = true; }, race: () => { race = true; }, stop: () => { live = false; }, corrupt: () => { contact = { ...contact, signature: Buffer.alloc(64).toString('base64url') }; } };
 }
-/** Several Desktop instances. An exchange is recorded, then answers with a signed child state when one is
- * set for its operationId, and otherwise times out as an unconfirmed send would. */
+/** Several Desktop instances, each with its own creation journal. An exchange is recorded, then answers with
+ * that Desktop's signed child state; a status it has no journal for is unknown (operation-not-found), and a
+ * spawn it has none for times out as an unconfirmed send would. Stored prompts live on the server, shared. */
 function desktops(initial: string[], pinLimit?: number) {
     const registry = createAgentCallerBindings({ identity: () => ({ machineId: 'machine', happyAccountId: 'account', epoch: 'registration' }), live: () => true });
     const binding = registry.prepare({ sessionId: 'source', runtimeId: 'actual-runtime', scope: '/project', depth: 0 });
@@ -47,7 +48,7 @@ function desktops(initial: string[], pinLimit?: number) {
             publicKey: Buffer.from(key.publicKey).toString('base64url'), issuedAt: now, expiresAt: now + 60000 }, server.secretKey);
     };
     const contacts = new Map(initial.map(id => [id, sign(id)])), revoked = new Set<string>(), stale = new Set<string>(), sent: string[] = [];
-    const states = new Map<string, 'pending' | 'started' | 'failed'>(), stored = new Set<string>();
+    const journals = new Map<string, Map<string, 'pending' | 'started' | 'failed'>>(), stored = new Set<string>();
     const port = createSessionOwnerContact({ enabled: true, binding, registry, now: () => now, pinLimit,
         trust: { issuer: fixture.contact.issuer, audience: fixture.contact.audience, publicKey: () => server.publicKey },
         lookup: async () => [...contacts.values()].filter(c => !revoked.has(c.desktopInstanceId)),
@@ -62,9 +63,11 @@ function desktops(initial: string[], pinLimit?: number) {
                     storage: { messageId: `message-${localId}`, seq: 1, localId, bodyVerified: true } }, desktopKey);
             }
             if (relay.operation !== 'spawn-owned-child' && relay.operation !== 'owned-child-status') throw new Error('timeout');
-            const state = states.get(relay.payload.operationId);
-            if (!state) throw new Error('timeout');
+            const state = journals.get(contact.desktopInstanceId)?.get(relay.payload.operationId);
             const { entry, payload, callerSignature, ...bound } = relay, started = state === 'started';
+            if (!state && relay.operation === 'owned-child-status') return signOwnerRelayReply({ ...bound, responderSubject: contact.ownerSubject,
+                checkedAt: now, result: 'unknown', reason: 'operation-not-found' }, desktopKey);
+            if (!state) throw new Error('timeout');
             return signOwnerRelayReply({ ...bound, responderSubject: contact.ownerSubject, checkedAt: now, result: 'allowed',
                 childSpawn: { operationId: payload.operationId, spawnId: payload.spawnId, spawnDigest: payload.spawnDigest, state,
                     stage: started ? 'provider-started' : 'intent', sessionId: started ? 'child' : null, ownershipBindingId: started ? 'child-binding' : null,
@@ -72,7 +75,10 @@ function desktops(initial: string[], pinLimit?: number) {
                 desktopKey);
         },
     });
-    return { port, sent, states, stored, add: (id: string) => { contacts.set(id, sign(id)); },
+    const journal = (desktopInstanceId: string, operationId: string, state: 'pending' | 'started' | 'failed') => {
+        journals.set(desktopInstanceId, (journals.get(desktopInstanceId) ?? new Map()).set(operationId, state));
+    };
+    return { port, sent, journal, stored, add: (id: string) => { contacts.set(id, sign(id)); },
         revoke: (id: string) => { revoked.add(id); }, restore: (id: string) => { revoked.delete(id); stale.delete(id); },
         /** Still listed by lookup but no longer current: chosen, then dropped before any send. */
         stale: (id: string) => { stale.add(id); }, hang: (on: boolean) => { hang = on; },
@@ -123,7 +129,7 @@ describe('host owner contact', () => {
         const d = desktops(['desktop-z']);
         await expect(d.port.call(spawn)).rejects.toThrow();
         d.add('desktop-a');
-        await expect(d.port.call(status)).rejects.toThrow();
+        await expect(d.port.call(status)).resolves.toMatchObject({ result: 'unknown' });
         await expect(d.port.call(spawn)).rejects.toThrow();
         expect(d.sent).toEqual(['spawn-owned-child@desktop-z', 'owned-child-status@desktop-z', 'spawn-owned-child@desktop-z']);
     });
@@ -134,7 +140,7 @@ describe('host owner contact', () => {
         await expect(d.port.call(status)).rejects.toThrow('owner-contact-unavailable');
         expect(d.sent).toEqual(['spawn-owned-child@desktop-z']);
         d.restore('desktop-z');
-        await expect(d.port.call(status)).rejects.toThrow();
+        await expect(d.port.call(status)).resolves.toMatchObject({ result: 'unknown' });
         expect(d.sent.at(-1)).toBe('owned-child-status@desktop-z');
     });
     it('retries a prompt with the same localId on the same Desktop only', async () => {
@@ -150,7 +156,7 @@ describe('host owner contact', () => {
         await expect(d.port.call(spawn)).rejects.toThrow();
         d.add('desktop-a');
         await expect(d.port.call(request)).rejects.toThrow();
-        await expect(d.port.call({ ...status, payload: { ...status.payload, operationId: 'operation-2' } })).rejects.toThrow();
+        await expect(d.port.call({ ...status, payload: { ...status.payload, operationId: 'operation-2' } })).resolves.toMatchObject({ result: 'unknown' });
         expect(d.sent.slice(1)).toEqual(['lookup-readable-sessions@desktop-a', 'owned-child-status@desktop-a']);
     });
     it('does not pin an operation that was never sent', async () => {
@@ -162,12 +168,12 @@ describe('host owner contact', () => {
     });
     // PIN-R1-01: only an observed terminal state frees a sent pin for cleanup.
     it('keeps a sent, unfinished operation pinned through a full table of other operations', async () => {
-        const d = desktops(['desktop-z'], LIMIT); d.states.set('operation-1', 'pending');
+        const d = desktops(['desktop-z'], LIMIT); d.journal('desktop-z', 'operation-1', 'pending');
         expect((await d.port.call(spawn)).result).toBe('allowed');
         d.add('desktop-a');
-        for (let i = 0; i < LIMIT; i++) {
-            d.states.set(`other-${i}`, 'started');
-            expect((await d.port.call(child(status, `other-${i}`))).result).toBe('allowed');
+        for (let i = 0; i < 2 * LIMIT; i++) {
+            d.stored.add(`other-${i}`);
+            expect((await d.port.call({ ...prompt, localId: `other-${i}` })).result).toBe('allowed');
         }
         await expect(d.port.call(status)).resolves.toBeDefined();
         expect(d.sent.at(-1)).toBe('owned-child-status@desktop-z');
@@ -176,26 +182,32 @@ describe('host owner contact', () => {
         const d = desktops(['desktop-z']);
         await expect(d.port.call(spawn)).rejects.toThrow();
         d.add('desktop-a'); d.advance(25 * 60 * 60 * 1000);
-        d.states.set('other', 'failed');
+        d.journal('desktop-a', 'other', 'failed');
         await d.port.call(child(status, 'other'));
-        await expect(d.port.call(status)).rejects.toThrow();
+        await expect(d.port.call(status)).resolves.toMatchObject({ result: 'unknown' });
         expect(d.sent).toEqual(['spawn-owned-child@desktop-z', 'owned-child-status@desktop-a', 'owned-child-status@desktop-z']);
     });
-    it('lets cleanup drop an operation only after its terminal state was observed', async () => {
-        const d = desktops(['desktop-z'], LIMIT); d.states.set('operation-1', 'started');
-        await d.port.call(spawn);
-        d.add('desktop-a');
-        for (let i = 0; i < LIMIT; i++) { d.states.set(`other-${i}`, 'started'); await d.port.call(child(status, `other-${i}`)); }
-        await d.port.call(status);
-        expect(d.sent.at(-1)).toBe('owned-child-status@desktop-a');
+    // PIN-R2-01: a verified started/failed may never have reached the CLI or its lineage record, and only the
+    // original Desktop's journal can answer the status that recovers it (--resume-op).
+    it('keeps an owned child pinned after its terminal state, so a lost receipt is recovered from its Desktop', async () => {
+        const d = desktops(['desktop-z'], LIMIT); d.journal('desktop-z', 'operation-1', 'started');
+        const first = await d.port.call(spawn);
+        expect(first.result === 'allowed' && first.operation === 'spawn-owned-child' && first.childSpawn.state).toBe('started');
+        d.add('desktop-a'); d.advance(25 * 60 * 60 * 1000);
+        for (let i = 0; i < 2 * LIMIT; i++) { d.stored.add(`other-${i}`); await d.port.call({ ...prompt, localId: `other-${i}` }); }
+        const again = await d.port.call(status);
+        expect(d.sent.at(-1)).toBe('owned-child-status@desktop-z');
+        expect(again.result === 'allowed' && again.operation === 'owned-child-status' && again.childSpawn.state).toBe('started');
     });
     it('treats a stored prompt receipt as the end of that localId', async () => {
         const d = desktops(['desktop-z'], LIMIT); d.stored.add('local-1');
         await d.port.call(prompt);
         d.add('desktop-a');
         for (let i = 0; i < LIMIT; i++) { d.stored.add(`other-${i}`); await d.port.call({ ...prompt, localId: `other-${i}` }); }
-        await d.port.call(prompt);
+        // The row is found by localId on the server, so any valid Desktop returns the same receipt; nothing is re-posted.
+        const again = await d.port.call(prompt);
         expect(d.sent.at(-1)).toBe('prompt-own-session@desktop-a');
+        expect(again.result === 'allowed' && again.operation === 'prompt-own-session' && again.storage.messageId).toBe('message-local-1');
     });
     // PIN-R1-02: a full table refuses only new operations; it never grows or evicts an unfinished one.
     it('refuses a new operation when every slot holds an unfinished one', async () => {
@@ -204,7 +216,7 @@ describe('host owner contact', () => {
         d.add('desktop-a');
         await expect(d.port.call(child(spawn, 'operation-new'))).rejects.toThrow('owner-contact-unavailable');
         expect(d.sent).toHaveLength(LIMIT);
-        await expect(d.port.call(child(status, 'operation-0'))).rejects.toThrow();
+        await expect(d.port.call(child(status, 'operation-0'))).resolves.toMatchObject({ result: 'unknown' });
         expect(d.sent.at(-1)).toBe('owned-child-status@desktop-z');
     });
     it('releases an unsent choice on the outer deadline even when the adapter ignores abort', async () => {
