@@ -754,6 +754,18 @@ function setupTokenAssignmentKillSwitchEnabled(): boolean {
     return ['1', 'true', 'on'].includes((process.env.APLUS_SETUP_TOKEN_ASSIGNMENT_KILL_SWITCH ?? '').toLowerCase());
 }
 
+/**
+ * An acked event can arrive without its ack (seen in the burst delivered right after a
+ * reconnect). Answering it would throw inside an async listener, an unhandled rejection
+ * that shuts the whole daemon down, so the event is dropped before any side effect:
+ * nobody is waiting for the shell or tunnel it would open.
+ */
+function hasAck(event: string, ack: unknown): ack is (response: any) => void {
+    if (typeof ack === 'function') return true;
+    logger.debug(`[API MACHINE] Dropping ${event} — no ack callback`);
+    return false;
+}
+
 export class ApiMachineClient {
     private socket!: Socket<ServerToDaemonEvents, DaemonToServerEvents>;
     /** Set when the managed credential ended; suppresses every reconnect. */
@@ -3868,10 +3880,12 @@ export class ApiMachineClient {
         // Not attached on a managed runtime: the preview WebSocket proxy reaches the host outside
         // the RPC dispatch gate, so the allowlist there would not see it.
         if (!this.managedHandlers && !this.windowsStandaloneTrial) this.socket.on('proxy-ws-open', async (params, ack) => {
+            if (!hasAck('proxy-ws-open', ack)) return;
             ack(await this.openPreviewWsTunnel(params));
         });
         // The bound variants reach the host the same way, so the same gate applies.
         if (!this.managedHandlers && !this.windowsStandaloneTrial) this.socket.on(PREVIEW_BOUND_WS_OPEN_EVENT as any, async (params: any, ack: (response: any) => void) => {
+            if (!hasAck(PREVIEW_BOUND_WS_OPEN_EVENT, ack)) return;
             ack(await this.openPreviewWsTunnelBound(params));
         });
         // specs/runtime-isolation-hardening (H3, P3) — viewer-bound relays and
@@ -3881,14 +3895,19 @@ export class ApiMachineClient {
         // is the only version of "old daemon refused" that happens *before*
         // anything reaches the port.
         this.socket.on(PREVIEW_VIEWER_BOUND_PROXY_EVENT as any, async (params: any, ack: (response: any) => void) => {
+            if (!hasAck(PREVIEW_VIEWER_BOUND_PROXY_EVENT, ack)) return;
             ack(await this.relayPreviewViewerBoundHttp(params));
         });
         if (!this.managedHandlers && !this.windowsStandaloneTrial) this.socket.on(PREVIEW_VIEWER_BOUND_WS_OPEN_EVENT as any, async (params: any, ack: (response: any) => void) => {
+            if (!hasAck(PREVIEW_VIEWER_BOUND_WS_OPEN_EVENT, ack)) return;
             ack(await this.openPreviewViewerWsTunnelBound(params));
         });
         this.socket.on(
             PREVIEW_VIEWER_RUNTIME_LEASE_EVENT as any,
-            (params: any, ack: (response: any) => void) => this.answerPreviewViewerRuntimeLease(params, ack),
+            (params: any, ack: (response: any) => void) => {
+                if (!hasAck(PREVIEW_VIEWER_RUNTIME_LEASE_EVENT, ack)) return;
+                return this.answerPreviewViewerRuntimeLease(params, ack);
+            },
         );
         this.socket.on('proxy-ws-data', (payload) => {
             this.previewWsProxy?.data(payload);
@@ -3914,6 +3933,7 @@ export class ApiMachineClient {
         // trial does attach it: its runtime roots every shell in the verified pty host and closes
         // terminals on drain (Desktop specs/windows-build-support W0-5h).
         if (!this.managedHandlers) this.socket.on('terminal-open-fwd', async (msg, ack) => {
+            if (!hasAck('terminal-open-fwd', ack)) return;
             try {
                 const { sessionId, params } = msg || {};
                 if (!sessionId || typeof sessionId !== 'string') {
