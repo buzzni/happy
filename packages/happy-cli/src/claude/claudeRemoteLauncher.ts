@@ -1210,6 +1210,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             if (msg && session.orgRequirements) {
                                 const org = session.orgRequirements.checkTurn(msg.mode);
                                 if (org.kind === 'refuse') {
+                                    // Still the person's own input: it replaces a waiting retry and an account wait, as below.
+                                    if (!msg.continuation) session.client.inputEvidence?.cancelContinuation('replaced');
+                                    transientRetry.userTurnStarted(); setupTokenSwitching?.userTurnStarted();
                                     refuseOrgTurn(msg, org.message);
                                     drain?.releaseClaim();
                                     msg = null;

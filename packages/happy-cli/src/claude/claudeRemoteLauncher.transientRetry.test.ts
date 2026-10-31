@@ -13,6 +13,11 @@ import { hashObject } from '@/utils/deterministicJson';
 import { CLAUDE_TRANSIENT_CONTINUE_PROMPT } from './claudeTransientRetry';
 import { RuntimeProducerGate } from '@/sessionDrain/runtimeProducerGate';
 import { ClaudeStandaloneDrain } from './claudeStandaloneDrain';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createOrgRequirementsGate } from '@/orgRequirements/gate';
+import { createClaudeOrgRequirements } from './claudeOrgRequirements';
 
 vi.mock('@anthropic-ai/claude-agent-sdk', async (original) => ({
     ...await original<typeof import('@anthropic-ai/claude-agent-sdk')>(),
@@ -240,6 +245,35 @@ describe('Claude transient API failure retry in the remote launcher (specs/claud
 
         expect(harness.prompts).toEqual(['hello', 'actually, do this instead']);
         expect(retryStates(harness.client)).toEqual([expect.objectContaining({ attempt: 1 }), null]);
+    });
+
+    it('lets a message the organization refuses during the wait replace the retry as well', async () => {
+        ladder.delays = [200];
+        const home = mkdtempSync(join(tmpdir(), 'retry-org-'));
+        const gate = createOrgRequirementsGate({ agent: 'claude', happyHomeDir: home, serverUrl: 'https://s', accountKey: 'a',
+            sessionId: () => 'happy-session-1', projectHint: null, publish: () => {}, refresh: async () => {} });
+        gate.onRequirements({ kind: 'response', status: 'ok', requirements: { schemaVersion: 1, companyId: 'c1', revision: 2, modelPolicyUpdatedAt: null, issuedAt: 1,
+            items: { 'ai.models': { kind: 'allowedSet', values: ['claude:claude-sonnet-5'], default: null, source: 'organization' } } } });
+        const orgRequirements = createClaudeOrgRequirements(gate, { normalizeModel: (model) => model, attendance: () => 'attended', initialPermissionMode: () => 'default' });
+        let queueRef: MessageQueue2<EnhancedMode> | null = null;
+        try {
+            const harness = await runLauncher(async (_prompt, index) => {
+                if (index === 0) {
+                    // Refused: a failed turn of its own. The person has spoken; the earlier turn is not continued.
+                    setTimeout(() => queueRef!.push('on a model the organization refuses', { ...MODE, model: 'claude-opus-5-5', orgModel: { requested: 'claude-opus-5-5', origin: 'explicit' } }), 30);
+                    setTimeout(() => queueRef!.push('then this', MODE), 450);
+                    return 'fail';
+                }
+                return 'answer';
+            }, (prompts) => prompts.includes('then this'), 0, { session: () => ({ orgRequirements }) });
+            queueRef = harness.queue;
+            await harness.run;
+
+            expect(harness.prompts).toEqual(['hello', 'then this']);
+            expect(retryStates(harness.client)).toEqual([expect.objectContaining({ attempt: 1 }), null]);
+        } finally {
+            rmSync(home, { recursive: true, force: true });
+        }
     });
 
     it('sends only the user message when it is queued as the retry falls due', async () => {
