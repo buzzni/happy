@@ -3,6 +3,9 @@ import { buildClaudeSystemPromptOptions } from '@/claude/claudePrompt';
 import { buildCodexDeveloperInstructions } from '@/codex/codexPrompt';
 import { buildGeminiTurnPrompt } from '@/gemini/geminiPrompt';
 import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from './agentOrchestrationPrompt';
+import packageJson from '../../package.json';
+
+const BUNDLED_SAYCODE_CLI_VERSION: string = packageJson.dependencies['@buzzni/saycode-cli'];
 
 const routingScenarios = [
   ['이 작업을 자식 에이전트에게 맡겨줘', 'happy agent spawn --prompt <text>'],
@@ -20,14 +23,20 @@ describe('natural-language child orchestration routing eval (T14)', () => {
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain(expectedPlan);
   });
 
-  it('lets a human-started hub only prompt verified own siblings, naming the target first', () => {
-    // Bundled saycode-cli 0.9.9 denies steer/stop for non-descendants (descendant-required).
-    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('you may also `prompt` a sibling that `happy agent ls` marks `own-sibling`');
-    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('Steer and stop are only for your proven descendants');
-    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).not.toMatch(/steer, or stop a sibling/);
+  it('lets a human-started hub prompt, steer, or abort verified own siblings, naming the target first', () => {
+    // saycode-cli 0.9.10 opens own-sibling steer and turn-abort stop to a depth 0 broker hub.
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('you may also prompt, steer, or stop a sibling that `happy agent ls` marks `own-sibling`');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('its stop only aborts the live turn');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).not.toContain('Steer and stop are only for your proven descendants');
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain("name the target conversation's title and full id to the user");
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('Never control your parent, other people\'s sessions, or sessions whose ownership is unproven');
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).not.toContain('Do not control siblings');
+  });
+
+  it('advertises sibling steer and stop only with a bundled saycode-cli that enforces them', () => {
+    const [major, minor, patch] = BUNDLED_SAYCODE_CLI_VERSION.split('.').map(Number);
+    const atLeast0910 = major > 0 || minor > 9 || (minor === 9 && patch >= 10);
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT.includes('steer, or stop a sibling')).toBe(atLeast0910);
   });
 
   it('routes an explicitly durable child away from provider-native subagents', () => {
