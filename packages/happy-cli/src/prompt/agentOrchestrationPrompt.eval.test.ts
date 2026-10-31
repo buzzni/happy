@@ -23,9 +23,11 @@ describe('natural-language child orchestration routing eval (T14)', () => {
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain(expectedPlan);
   });
 
-  it('lets a human-started hub prompt, steer, or abort verified own siblings, naming the target first', () => {
+  it('lets a human-started hub prompt verified own siblings, and only a Claude or Codex hub steer or abort them', () => {
     // saycode-cli 0.9.10 opens own-sibling steer and turn-abort stop to a depth 0 broker hub.
-    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('you may also prompt, steer, or stop a sibling that `happy agent ls` marks `own-sibling`');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('from a human-started hub you may also prompt a sibling that `happy agent ls` marks `own-sibling`');
+    // The CLI opens sibling steer/stop only on the broker path (Claude, Codex); Gemini, opencode and grok hubs share this prompt.
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('from a human-started Claude or Codex hub you may also steer or stop it');
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('its stop only aborts the live turn');
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).not.toContain('Steer and stop are only for your proven descendants');
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain("name the target conversation's title and full id to the user");
@@ -36,7 +38,7 @@ describe('natural-language child orchestration routing eval (T14)', () => {
   it('advertises sibling steer and stop only with a bundled saycode-cli that enforces them', () => {
     const [major, minor, patch] = BUNDLED_SAYCODE_CLI_VERSION.split('.').map(Number);
     const atLeast0910 = major > 0 || minor > 9 || (minor === 9 && patch >= 10);
-    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT.includes('steer, or stop a sibling')).toBe(atLeast0910);
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT.includes('you may also steer or stop it')).toBe(atLeast0910);
   });
 
   it('routes an explicitly durable child away from provider-native subagents', () => {
