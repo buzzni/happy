@@ -6,10 +6,20 @@ import { join } from 'node:path';
 import { protectStandaloneObservationDirectory } from './standaloneLaunchJournal';
 import { ownedSpawnRecordSchema, type OwnedSpawnRecord } from './ownedSpawn';
 
+/** One journal file: its record, or why it could not be read and the session it claims, if any is legible. */
+export type OwnedSpawnJournalEntry = { record: OwnedSpawnRecord } | { error: unknown; sessionId: string | null };
 export interface OwnedSpawnJournal {
     list(): Promise<OwnedSpawnRecord[]>;
+    entries(): Promise<OwnedSpawnJournalEntry[]>;
     read(id: string): Promise<OwnedSpawnRecord | null>;
     write(record: OwnedSpawnRecord): Promise<void>;
+}
+/** The created session an unreadable file still names legibly; null when nothing can be told. */
+function claimedSession(text: string | undefined): string | null {
+    try {
+        const sessionId = (JSON.parse(text ?? '') as { created?: { sessionId?: unknown } } | null)?.created?.sessionId;
+        return typeof sessionId === 'string' ? sessionId : null;
+    } catch { return null; }
 }
 export function createOwnedSpawnJournal(home: string): OwnedSpawnJournal {
     const directory = join(home, 'owned-spawns');
@@ -27,19 +37,31 @@ export function createOwnedSpawnJournal(home: string): OwnedSpawnJournal {
     }
     const journal: OwnedSpawnJournal = {
         async list() {
-            await prepare();
             const result: OwnedSpawnRecord[] = [];
+            for (const entry of await journal.entries()) {
+                if ('error' in entry) throw entry.error;
+                result.push(entry.record);
+            }
+            return result;
+        },
+        async entries() {
+            await prepare();
+            const result: OwnedSpawnJournalEntry[] = [];
             for (const name of await readdir(directory)) {
                 if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
-                const h = await open(join(directory, name), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
-                let id: string;
+                let text: string | undefined;
                 try {
-                    const stat = await h.stat();
-                    if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error('owned-spawn-journal-invalid');
-                    id = ownedSpawnRecordSchema.parse(JSON.parse(await h.readFile('utf8'))).intent.creationRequestId;
-                } finally { await h.close(); }
-                if (path(id) !== join(directory, name)) throw new Error('owned-spawn-journal-invalid');
-                const record = await journal.read(id); if (record) result.push(record);
+                    const h = await open(join(directory, name), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+                    let id: string;
+                    try {
+                        const stat = await h.stat();
+                        if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error('owned-spawn-journal-invalid');
+                        text = await h.readFile('utf8');
+                        id = ownedSpawnRecordSchema.parse(JSON.parse(text)).intent.creationRequestId;
+                    } finally { await h.close(); }
+                    if (path(id) !== join(directory, name)) throw new Error('owned-spawn-journal-invalid');
+                    const record = await journal.read(id); if (record) result.push({ record });
+                } catch (error) { result.push({ error, sessionId: claimedSession(text) }); }
             }
             return result;
         },

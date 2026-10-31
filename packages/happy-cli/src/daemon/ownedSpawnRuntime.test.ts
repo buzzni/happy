@@ -1,4 +1,5 @@
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -343,5 +344,22 @@ describe('journal compatibility with a daemon from before H3 (H3-R2-01)', () => 
         const raw = JSON.parse(await readFile(join(directory, name), 'utf8'));
         expect(() => preH3Schema.parse(raw)).not.toThrow();
         expect(raw).not.toHaveProperty('callerCustody');
+    });
+});
+
+/** A damaged journal file beside the real records; the name has the journal's shape but no record behind it. */
+async function damage(home: string, name: string, content: string) {
+    await writeFile(join(home, 'owned-spawns', createHash('sha256').update(name).digest('hex') + '.json'), content, { mode: 0o600 });
+}
+describe('owned-spawn journal listing', () => {
+    it('list() still refuses a damaged file; entries() reports it with the session it legibly names', async () => {
+        const f = await fixture(), runtime = f.build();
+        await runtime.start(await createdSession(f, runtime));
+        await damage(f.home, 'garbage', '{not json');
+        await damage(f.home, 'claims-other', JSON.stringify({ version: 1, created: { sessionId: 'other-session' } }));
+        await expect(f.journal.list()).rejects.toThrow();
+        const entries = await f.journal.entries();
+        expect(entries.flatMap(e => 'record' in e ? [e.record.created?.sessionId] : [])).toEqual(['session']);
+        expect(entries.flatMap(e => 'error' in e ? [e.sessionId] : []).sort()).toEqual([null, 'other-session'].sort());
     });
 });
