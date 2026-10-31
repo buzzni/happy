@@ -103,4 +103,55 @@ describe('remote launcher under organization requirements', () => {
         expect(refusal).toBeGreaterThanOrEqual(0);
         expect(transcript.slice(refusal + 1)).toEqual(['turn-end:failed', 'turn-end:completed']);
     });
+
+    it('does not let auto-routing raise a checked batch to a model the organization does not allow', async () => {
+        home = mkdtempSync(join(tmpdir(), 'launcher-org-'));
+        const gate = createOrgRequirementsGate({
+            agent: 'claude', happyHomeDir: home, serverUrl: 'https://s', accountKey: 'a',
+            sessionId: () => 'org-route-test', projectHint: null, publish: () => {}, refresh: async () => {},
+        });
+        gate.onRequirements({ kind: 'response', status: 'ok', requirements: {
+            schemaVersion: 1, companyId: 'c1', revision: 2, modelPolicyUpdatedAt: null, issuedAt: 1,
+            items: { 'ai.models': { kind: 'allowedSet', values: ['claude:claude-sonnet-5-5'], default: null, source: 'organization' } },
+        } });
+        const orgRequirements = createClaudeOrgRequirements(gate, { normalizeModel: (model) => model, attendance: () => 'attended', initialPermissionMode: () => 'default' });
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const launches: Options[] = [];
+        vi.mocked(query).mockImplementation(({ prompt, options }) => {
+            launches.push(options!);
+            const response = (async function* () {
+                yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [] };
+                for await (const _message of prompt as AsyncIterable<SDKUserMessage>) {
+                    yield { type: 'result', subtype: 'success', result: '', is_error: false, uuid: 'result-1' };
+                    void handlers.get('switch')!();
+                    return;
+                }
+            })();
+            return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+        });
+        const client = {
+            sessionId: 'org-route-test',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        queue.push('routed', { permissionMode: 'default', model: 'claude-sonnet-5-5', orgModel: { requested: 'claude-sonnet-5-5', origin: 'explicit' } }, undefined, ['req-1']);
+        const route = { model: 'claude-opus-5-5', effort: null };
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+            cancelLessonReview: vi.fn(),
+            sessionId: null, path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+            onModeResolved: vi.fn(() => route), onModeApplied: vi.fn(() => route),
+            orgRequirements,
+        } as unknown as Session;
+
+        await claudeRemoteLauncher(session);
+
+        expect(launches.map((launch) => launch.model)).toEqual(['claude-sonnet-5-5']);
+    });
 });

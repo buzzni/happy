@@ -378,6 +378,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         if (batch.channelRequestId) messageQueue.enqueue(finalAnswerItem(text));
         messageQueue.enqueue(turnEndItem('failed'));
     };
+    /** A routed model the organization does not allow is not applied: the batch keeps its checked model. */
+    const orgAllowedRoute = <R extends { model: string } | null | undefined>(route: R): R | null => (
+        route && session.orgRequirements && !session.orgRequirements.allowsRoutedModel(route.model) ? null : route
+    );
     /** Batches whose mode the ceiling clipped: a running provider must be told, it only reads its mode at launch. */
     const orgClampedBatches = new WeakSet<CollectedBatch<EnhancedMode>>();
 
@@ -1111,7 +1115,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                              * the stale model would make the state a claim
                              * rather than a record of what executed.
                              */
-                            const revisedPending = session.onModeApplied?.(p.requestIds, randomUUID());
+                            const revisedPending = orgAllowedRoute(session.onModeApplied?.(p.requestIds, randomUUID()));
                             if (revisedPending) {
                                 const revisedMode: EnhancedMode = {
                                     ...p.mode,
@@ -1289,7 +1293,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         if (msg) {
                             // Preview without committing: a changed engine setting needs a
                             // fresh SDK query before this request can be marked applied.
-                            const resolved = session.onModeResolved?.(msg.requestIds);
+                            const resolved = orgAllowedRoute(session.onModeResolved?.(msg.requestIds));
                             if (resolved) {
                                 msg = { ...msg, mode: { ...msg.mode, model: resolved.model,
                                     effort: (resolved.effort ?? undefined) as EnhancedMode['effort'] } };
@@ -1358,7 +1362,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                              * held back as `pending` is not committed here — it is
                              * committed by the generation that actually runs it.
                              */
-                            const revisedBatch = session.onModeApplied?.(msg.requestIds, randomUUID());
+                            const revisedBatch = orgAllowedRoute(session.onModeApplied?.(msg.requestIds, randomUUID()));
                             if (revisedBatch) {
                                 const revisedMode: EnhancedMode = {
                                     ...msg.mode,

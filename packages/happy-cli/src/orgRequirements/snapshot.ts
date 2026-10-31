@@ -24,6 +24,7 @@ import type { OrgRequirementsStore, OrgScopeKey } from './store';
 
 export const ORG_STALE_AFTER_MS = 24 * 60 * 60 * 1000;
 export const ORG_REFRESH_AFTER_MS = 5 * 60 * 1000;
+const LKG_REWRITE_AFTER_MS = 60 * 60 * 1000;
 
 export type OrgRequirementsFetchOutcome =
     /** No mcp-config URL: a local run with no Studio behind it, so no organization either. */
@@ -59,6 +60,9 @@ export function createOrgRequirementsSnapshot(options: {
     let lastLookupAt: number | null = null;
     let reportedStale = false;
     const listeners = new Set<() => void>();
+    /** What this process last stored, so an unchanged answer on every turn does not rewrite the files. */
+    let stored: { fingerprint: string; at: number } | null = null;
+    const scopesStored = new Set<string>();
 
     const audit = (item: string, applied: string | null, reason: Parameters<OrgRequirementsAuditLog['record']>[0]['reason'], companyId: string | null, revision: number | null, once = false) =>
         options.audit.record({ at: now(), item, requested: null, applied, reason, revision, companyId }, { once });
@@ -97,9 +101,13 @@ export function createOrgRequirementsSnapshot(options: {
     };
 
     const accept = (raw: unknown) => {
+        // A broken item keeps the previous value (R3) — the stored one for this organization when this
+        // process has none yet.
+        const companyId = raw && typeof raw === 'object' ? (raw as { companyId?: unknown }).companyId : undefined;
+        const previous = document ?? (typeof companyId === 'string' ? options.store.readLkg(companyId)?.document : undefined);
         let parsed;
         try {
-            parsed = parseOrgRequirements(raw, document ?? undefined);
+            parsed = parseOrgRequirements(raw, previous);
         } catch (error) {
             if (!(error instanceof OrgRequirementsDocumentError)) throw error;
             audit('document', null, 'document_rejected', null, null);
@@ -111,11 +119,22 @@ export function createOrgRequirementsSnapshot(options: {
         unknown = false;
         if (Object.keys(next.items).length === 0) {
             options.store.deleteLkg(next.companyId);
+            stored = null;
             replace(null, now());
             return;
         }
-        if (options.store.writeLkg(next, now()) === 'too_large') audit('document', null, 'lkg_too_large', next.companyId, next.revision, true);
-        for (const scope of options.scopes()) options.store.writeScope(scope, next.companyId);
+        const nextFingerprint = fingerprint(next)!;
+        // Rewritten when it changed, and hourly so another process measures staleness from a recent receipt.
+        if (stored?.fingerprint !== nextFingerprint || now() - stored.at >= LKG_REWRITE_AFTER_MS) {
+            if (options.store.writeLkg(next, now()) === 'too_large') audit('document', null, 'lkg_too_large', next.companyId, next.revision, true);
+            stored = { fingerprint: nextFingerprint, at: now() };
+        }
+        for (const scope of options.scopes()) {
+            const key = JSON.stringify([scope.kind, scope.id, next.companyId]);
+            if (scopesStored.has(key)) continue;
+            options.store.writeScope(scope, next.companyId);
+            scopesStored.add(key);
+        }
         replace(next, now());
     };
 
@@ -138,6 +157,7 @@ export function createOrgRequirementsSnapshot(options: {
             if (outcome.kind === 'response' && outcome.status === 'ok') return accept(outcome.requirements);
             if (outcome.kind === 'response' && outcome.status === 'no-company') {
                 for (const scope of options.scopes()) options.store.deleteScope(scope);
+                scopesStored.clear();
                 unknown = false;
                 replace(null, 0);
                 return;

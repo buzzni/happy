@@ -1031,7 +1031,11 @@ export async function runGemini(opts: {
         sendReady();
         continue;
       }
-      if (org.substituteModel) message.mode = { ...message.mode, model: org.substituteModel };
+      if (org.substituteModel) {
+        message.mode = { ...message.mode, model: org.substituteModel };
+        // A different substitute than the running backend's must restart it, as a model change does.
+        message.hash = hashGeminiMode(message.mode);
+      }
 
       let previousConversationContext: string | undefined;
       let startedNewBackendSession = false;

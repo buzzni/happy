@@ -135,6 +135,31 @@ describe('organization requirements snapshot', () => {
         expect(audited().filter((entry) => entry.reason === 'document_issue').map((entry) => entry.item)).toEqual(['permissions.mode', 'network.egress']);
     });
 
+    it('keeps a broken item from the stored last known good on the first answer of a new process (R3)', () => {
+        make().ingest(ok(doc('c1', 3, { 'permissions.mode': { kind: 'ceiling', max: 'acceptEdits' } })));
+        const later = make();
+        later.ingest(ok(doc('c1', 4, { 'permissions.mode': { kind: 'ceiling', max: 'readonly' } })));
+        expect(later.current()?.items['permissions.mode']).toEqual({ kind: 'ceiling', max: 'acceptEdits' });
+        // And what it stores still has it.
+        const fallback = make({ scopes: [{ kind: 'project', id: 'p1' }] });
+        fallback.ingest({ kind: 'failed' });
+        expect(fallback.current()?.items['permissions.mode']).toEqual({ kind: 'ceiling', max: 'acceptEdits' });
+    });
+
+    it('does not rewrite the stored files for an unchanged answer on every turn', () => {
+        const store = createOrgRequirementsStore({ happyHomeDir: home, serverUrl: 'https://s', accountKey: 'a', now: () => clock });
+        const writes = { lkg: 0, scope: 0 };
+        const counted = { ...store, writeLkg: (...args: Parameters<typeof store.writeLkg>) => { writes.lkg++; return store.writeLkg(...args); }, writeScope: (...args: Parameters<typeof store.writeScope>) => { writes.scope++; store.writeScope(...args); } };
+        const snapshot = createOrgRequirementsSnapshot({ store: counted, audit: createOrgRequirementsAuditLog({ path: auditPath(), sessionId: () => 's1' }), scopes: () => scopes, now: () => clock });
+        for (let i = 0; i < 5; i++) snapshot.ingest(ok(doc('c1', 3)));
+        expect(writes).toEqual({ lkg: 1, scope: 2 });
+        snapshot.ingest(ok(doc('c1', 4)));
+        expect(writes.lkg).toBe(2);
+        clock += HOUR;
+        snapshot.ingest(ok(doc('c1', 4)));
+        expect(writes.lkg).toBe(3);
+    });
+
     it('asks for a refresh at most every five minutes, counting any lookup', () => {
         const snapshot = make();
         expect(snapshot.shouldRefresh()).toBe(false); // nothing configured yet

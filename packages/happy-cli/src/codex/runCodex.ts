@@ -2738,7 +2738,9 @@ export async function runCodex(opts: {
                      * applied by the call itself, so a turn that then fails or is
                      * cancelled mid-flight still ran on this model.
                      */
-                    const appliedRoute = difficultyRoutingCommitter.commitApplied(message.requestIds, codexTurnId!);
+                    const committedRoute = difficultyRoutingCommitter.commitApplied(message.requestIds, codexTurnId!);
+                    // A routed model the organization does not allow is not applied: the checked model runs.
+                    const appliedRoute = committedRoute && orgGate && !orgGate.modelAllowed(committedRoute.model) ? null : committedRoute;
                     routingApplied = true;
                     latency?.submitted();
                     const memoryIngest = reserveCompletedTurnIngest(activeThreadId);

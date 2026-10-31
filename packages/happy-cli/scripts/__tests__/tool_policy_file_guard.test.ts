@@ -118,6 +118,10 @@ describe('tool_policy_file_guard protected directories', () => {
         expect(runWithDir(payload).status).toBe(0);
     });
 
+    it('treats a backslash as a separator too (Windows paths)', () => {
+        expect(targetsProtectedDirectory({ tool_name: 'Write', tool_input: { file_path: `${ORG_DIR}\\0123.json` } }, ORG_DIR, ENV)).toBe(true);
+    });
+
     it('still guards the policy file when directories are given', () => {
         expect(runWithDir({ tool_name: 'Write', tool_input: { file_path: POLICY_FILE } }).status).toBe(2);
     });

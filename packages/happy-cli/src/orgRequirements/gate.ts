@@ -24,6 +24,7 @@ import { join } from 'node:path';
 import { createEnvelope, type OrgRequirementEnforcement, type OrgRequirementReason, type OrgRequirementsAgentState, type SessionEnvelope } from '@slopus/happy-wire';
 import type { OrgToolRules } from '@/toolPolicy/evaluate';
 import { toolGlobMatches } from '@/toolPolicy/rules';
+import { isToolPolicyEnabled } from '@/toolPolicy/claudeHook';
 import { createOrgRequirementsAuditLog, type OrgRequirementsAuditRecord } from './audit';
 import {
     clampPermissionMode,
@@ -58,7 +59,9 @@ export function orgScopeHintEnvironment(projectId: string | null | undefined): R
  * Desktop never claims enforcement the daemon is not doing.
  */
 export function orgRequirementsMachineCapability(env: NodeJS.ProcessEnv): { version: 1; enforced: string[] } | undefined {
-    return isOrgRequirementsEnabled(env) ? { version: 1, enforced: ['models', 'permissionMode', 'tools', 'autopilot'] } : undefined;
+    if (!isOrgRequirementsEnabled(env)) return undefined;
+    // Organization tool rules are enforced by the tool policy gate, which `HAPPY_TOOL_POLICY=off` removes.
+    return { version: 1, enforced: ['models', 'permissionMode', ...(isToolPolicyEnabled(env) ? ['tools'] : []), 'autopilot'] };
 }
 
 /** The stored metadata with the capability brought up to date; undefined when nothing changes. */
@@ -126,6 +129,8 @@ export interface OrgRequirementsGate {
     /** The ceiling while it is below bypass, else null (Codex approval policy under Happy's sandbox, R10.9). */
     approvalCeiling(): 'default' | 'acceptEdits' | null;
     restrictsModels(): boolean;
+    /** A model chosen for the turn after it was checked (auto-routing's floor): allowed as an explicit choice? */
+    modelAllowed(model: string): boolean;
     toolRules(): OrgToolRules | null;
     autopilotDisabled(): boolean;
     /** Organization tool rule verdicts from the tool policy gate (R17). */
@@ -277,9 +282,9 @@ export function createOrgRequirementsGate(options: {
                 enforce(item, requested, null, reason);
                 return { kind: 'refuse' as const, reason, message: MESSAGES[reason](shown(requested)) };
             };
-            if (input.enforcesCeilingAndTools === false
-                && ((max !== null && permissionModeRank(agent, max) < BYPASS_RANK) || orgRules().length > 0)) {
-                return refuse('requirement_runtime_unsupported', max !== null ? 'permissions.mode' : 'tools.rules', agent);
+            const ceilingBelowBypass = max !== null && permissionModeRank(agent, max) < BYPASS_RANK;
+            if (input.enforcesCeilingAndTools === false && (ceilingBelowBypass || orgRules().length > 0)) {
+                return refuse('requirement_runtime_unsupported', ceilingBelowBypass ? 'permissions.mode' : 'tools.rules', agent);
             }
 
             const allowed = aiModels();
@@ -331,7 +336,9 @@ export function createOrgRequirementsGate(options: {
         ceilingCaused: ({ edit }) => {
             if (!lastTurn) return false;
             if (lastTurn.requested >= BYPASS_RANK && lastTurn.applied < BYPASS_RANK) return true;
-            return edit && lastTurn.requested === ACCEPT_EDITS_RANK && lastTurn.applied < ACCEPT_EDITS_RANK;
+            if (lastTurn.requested !== ACCEPT_EDITS_RANK || lastTurn.applied >= ACCEPT_EDITS_RANK) return false;
+            // Claude acceptEdits runs only edits unasked; Codex safe-yolo (on-request) runs commands unasked too.
+            return edit || agent === 'codex';
         },
         recordCeilingDenial: (toolName) => enforce('permissions.mode', toolName, ceiling(), 'requirement_ceiling'),
         bypassAllowed: () => {
@@ -343,6 +350,7 @@ export function createOrgRequirementsGate(options: {
             return max === 'default' || max === 'acceptEdits' ? max : max !== null && permissionModeRank(agent, max) < BYPASS_RANK ? 'default' : null;
         },
         restrictsModels: () => aiModels() !== null,
+        modelAllowed: (model) => judgeModel({ agent, model, origin: 'explicit', allowed: aiModels() }).kind === 'allow',
         toolRules: () => {
             const current = document();
             return current ? { companyId: current.companyId, revision: current.revision, rules: orgRules() } : null;

@@ -88,15 +88,16 @@ function targetsPolicyFile(payload, policyFile, env = defaultEnv(policyFile)) {
 const DIRECTORY_MESSAGE = '도구 정책으로 막힘: Saycode 조직 정책 보관 폴더는 에이전트가 바꾸거나 지울 수 없다 — 조직 정책은 조직 관리자가 정한다. 대신: 필요한 변경을 사용자에게 요청하라. 이 제한을 스크립트·자동화 도구·셸 명령 등 다른 방법으로 우회하지 마라.';
 
 function inside(resolved, dir) {
-    const trimmed = resolved.replace(/\/+$/, '');
-    return trimmed === dir || trimmed.startsWith(dir + '/') || globMatches(trimmed, dir);
+    // Both separators: `path.resolve` writes backslashes on Windows, and a command may use either.
+    const trimmed = resolved.replace(/[\\/]+$/, '');
+    return trimmed === dir || trimmed.startsWith(dir + '/') || trimmed.startsWith(dir + '\\') || globMatches(trimmed, dir);
 }
 
 function targetsProtectedDirectory(payload, protectedDir, env = defaultEnv(protectedDir)) {
     const input = (payload && payload.tool_input) || {};
     const cwd = payload.cwd || process.cwd();
     const fold = env.caseInsensitive ? (value) => value.toLowerCase() : (value) => value;
-    const dir = fold(path.resolve(protectedDir)).replace(/\/+$/, '');
+    const dir = fold(path.resolve(protectedDir)).replace(/[\\/]+$/, '');
     const parent = path.dirname(dir);
     const base = path.basename(dir);
     if (payload.tool_name === 'Bash') {
@@ -107,7 +108,7 @@ function targetsProtectedDirectory(payload, protectedDir, env = defaultEnv(prote
         for (const word of words) {
             const resolved = fold(normalize(word, cwd, env));
             if (inside(resolved, dir)) return true;
-            if (globMatches(resolved.replace(/\/+$/, ''), parent)) namesParent = true;
+            if (globMatches(resolved.replace(/[\\/]+$/, ''), parent)) namesParent = true;
             if (globMatches(fold(path.basename(word)), base)) namesBase = true;
         }
         return namesParent && namesBase;

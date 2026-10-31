@@ -122,6 +122,13 @@ describe('organization requirements session gate', () => {
             expect(gate.ceilingCaused({ edit: true })).toBe(false);
         });
 
+        it('treats every Codex request as caused by the ceiling when safe-yolo was clipped (it runs commands unasked)', () => {
+            const gate = make('codex');
+            gate.onRequirements({ kind: 'response', status: 'ok', requirements: doc(CEILING_DEFAULT) });
+            gate.checkTurn({ permissionMode: 'safe-yolo', model: undefined, modelOrigin: 'none' });
+            expect(gate.ceilingCaused({ edit: false })).toBe(true);
+        });
+
         it('records each immediate denial for the audit and Desktop', () => {
             const gate = make();
             gate.onRequirements({ kind: 'response', status: 'ok', requirements: doc(CEILING_DEFAULT) });
@@ -153,6 +160,14 @@ describe('organization requirements session gate', () => {
             expect(gate.restrictsModels()).toBe(true);
         });
 
+        it('judges a model chosen after the check, as an explicit choice', () => {
+            const gate = make();
+            expect(gate.modelAllowed('claude-opus-5-5')).toBe(true);
+            gate.onRequirements({ kind: 'response', status: 'ok', requirements: doc(MODELS) });
+            expect(gate.modelAllowed('claude-opus-5-5')).toBe(false);
+            expect(gate.modelAllowed('claude-sonnet-5-5')).toBe(true);
+        });
+
         it('says it cannot read a model name', () => {
             const gate = make();
             gate.onRequirements({ kind: 'response', status: 'ok', requirements: doc(MODELS) });
@@ -166,6 +181,10 @@ describe('organization requirements session gate', () => {
             gemini.onRequirements({ kind: 'response', status: 'ok', requirements: doc(CEILING_DEFAULT) });
             expect(gemini.checkTurn({ permissionMode: 'default', model: undefined, modelOrigin: 'none', enforcesCeilingAndTools: false }))
                 .toMatchObject({ kind: 'refuse', reason: 'requirement_runtime_unsupported' });
+            // A ceiling of bypass is no limit: a tool rule is what refuses, and the record says so.
+            gemini.onRequirements({ kind: 'response', status: 'ok', requirements: doc({ 'permissions.mode': { kind: 'ceiling', max: 'bypassPermissions' }, 'tools.rules': { kind: 'rules', rules: [{ id: 'r', tool: 'mcp__a__*', decision: 'ask', since: 4 }] } }, 4) });
+            gemini.checkTurn({ permissionMode: 'default', model: undefined, modelOrigin: 'none', enforcesCeilingAndTools: false });
+            expect(audit().filter((entry) => entry.reason === 'requirement_runtime_unsupported').map((entry) => entry.item)).toEqual(['permissions.mode', 'tools.rules']);
             const grok = make('grok');
             grok.onRequirements({ kind: 'response', status: 'ok', requirements: doc({ 'ai.models': { kind: 'allowedSet', values: ['grok:*'], default: null, source: 'organization' } }) });
             expect(grok.checkTurn({ permissionMode: 'default', model: 'grok-5', modelOrigin: 'explicit', enforcesCeilingAndTools: false })).toMatchObject({ kind: 'run' });
@@ -247,6 +266,8 @@ describe('organization requirements session gate', () => {
         const capability = orgRequirementsMachineCapability({});
         expect(capability).toEqual({ version: 1, enforced: ['models', 'permissionMode', 'tools', 'autopilot'] });
         expect(orgRequirementsMachineCapability({ [ORG_REQUIREMENTS_ENV]: 'off' })).toBeUndefined();
+        // Tool rules ride on the tool policy gate: not claimed without it.
+        expect(orgRequirementsMachineCapability({ HAPPY_TOOL_POLICY: 'off' })).toEqual({ version: 1, enforced: ['models', 'permissionMode', 'autopilot'] });
         const stored = { host: 'h', platform: 'darwin' } as Record<string, unknown>;
         expect(orgRequirementsMetadataUpdate(stored, capability)).toEqual({ host: 'h', platform: 'darwin', orgRequirements: capability });
         expect(orgRequirementsMetadataUpdate({ ...stored, orgRequirements: capability }, capability)).toBeUndefined();

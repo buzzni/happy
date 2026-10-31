@@ -3,8 +3,10 @@
  * specs/codexcli-org-requirements R10.1–R10.3, R10.10, R10.12).
  *
  * The launcher hands every batch to `checkTurn` at the moment it would become the running turn — the
- * one point every way into a turn passes (a person's message, the spawn's first prompt, a channel or
- * follow-up turn, a continuation) — and gets back the mode to run, or a refusal to close as failed.
+ * one point every new turn passes (a person's message, the spawn's first prompt, a channel or follow-up
+ * turn, a queued account continuation) — and gets back the mode to run, or a refusal to close as failed.
+ * A transient-failure retry repeats the turn already checked, with its mode: a running turn is not cut
+ * mid-way (R15), and the next turn is checked again.
  * The permission handler asks `declinesForCeiling` before raising a prompt and `clampAnswer` before
  * applying one; the terminal launcher asks `localLaunchArgs`. Without a document each is a no-op.
  */
@@ -30,6 +32,11 @@ export interface ClaudeOrgRequirements {
     declinesForCeiling(tool: { edit: boolean }): boolean;
     recordCeilingDenial(toolName: string): void;
     clampAnswer<T extends { mode?: string; allowTools?: string[] }>(answer: T): T;
+    /**
+     * Auto-routing may raise a checked batch's model at the engine boundary (its floor). A routed model
+     * the organization does not allow is not applied: the checked model runs instead.
+     */
+    allowsRoutedModel(model: string): boolean;
     /** The terminal (local mode) command line: no bypass flag and an explicit clipped mode under a ceiling (R10.10). */
     localLaunchArgs(args: string[] | undefined): { args: string[] | undefined; allowBypass: boolean };
 }
@@ -111,6 +118,7 @@ export function createClaudeOrgRequirements(gate: OrgRequirementsGate, deps: {
         declinesForCeiling: (tool) => deps.attendance() === 'unattended' && gate.ceilingCaused(tool),
         recordCeilingDenial: (toolName) => gate.recordCeilingDenial(toolName),
         clampAnswer: (answer) => gate.clampPermissionResponse(answer),
+        allowsRoutedModel: (model) => gate.modelAllowed(model),
         localLaunchArgs: (args) => {
             if (gate.bypassAllowed()) return { args, allowBypass: true };
             const kept: string[] = [];
