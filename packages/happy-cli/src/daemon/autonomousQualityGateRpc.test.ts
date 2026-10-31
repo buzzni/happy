@@ -35,6 +35,26 @@ describe('autonomous quality gate RPC handlers', () => {
         expect(registry.control).toHaveBeenCalledWith(expect.objectContaining({ action: 'pause' }));
     });
 
+    // codexcli-org-requirements R10.5: the session's organization switched autopilot off.
+    it('refuses a start the organization does not allow, before it reaches the registry', async () => {
+        const registry = { start: vi.fn(), status: vi.fn(), control: vi.fn() };
+        const refuseStart = vi.fn((request: { sessionId: string }) => request.sessionId === 'org-session' ? 'requirement_autopilot_disabled' : null);
+        const handlers = createAutonomousQualityGateRpcHandlers(registry, { refuseStart });
+        const start = {
+            schemaVersion: 1, requestId: 'start-1', sessionId: 'org-session', projectId: 'project-1', directory: '/repo',
+            recipeRevision: 'a'.repeat(64),
+            plan: { phases: [{ name: 'test', command: 'npm test', timeoutMs: 1_000 }] },
+            limits: { maxContinuations: 3, maxTurns: 12, maxTokens: 80_000, timeoutMs: 1_800_000, maxGateAttempts: 3 },
+        };
+        await expect(handlers.start(start)).rejects.toThrow('requirement_autopilot_disabled');
+        expect(registry.start).not.toHaveBeenCalled();
+        await handlers.start({ ...start, sessionId: 'other' });
+        expect(registry.start).toHaveBeenCalledOnce();
+        // Status and control of a run that already exists are not starts.
+        await handlers.status({ schemaVersion: 1, sessionId: 'org-session' });
+        expect(registry.status).toHaveBeenCalledWith('org-session');
+    });
+
     it('rejects malformed commands before they reach the registry', async () => {
         const registry = { start: vi.fn(), status: vi.fn(), control: vi.fn() };
         const handlers = createAutonomousQualityGateRpcHandlers(registry);

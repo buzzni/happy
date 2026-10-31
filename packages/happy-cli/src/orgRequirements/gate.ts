@@ -47,6 +47,27 @@ export function isOrgRequirementsEnabled(env: NodeJS.ProcessEnv): boolean {
     return env[ORG_REQUIREMENTS_ENV]?.trim().toLowerCase() !== 'off';
 }
 
+/** The daemon's own hint for one spawn: the project it was made for, when that is a usable id. */
+export function orgScopeHintEnvironment(projectId: string | null | undefined): Record<string, string> {
+    const value = projectId?.trim();
+    return value && /^[A-Za-z0-9._:-]{1,128}$/.test(value) ? { [ORG_SCOPE_HINT_ENV]: value } : {};
+}
+
+/**
+ * Machine metadata `orgRequirements` (R24): what this runtime enforces. Absent with the switch off, so
+ * Desktop never claims enforcement the daemon is not doing.
+ */
+export function orgRequirementsMachineCapability(env: NodeJS.ProcessEnv): { version: 1; enforced: string[] } | undefined {
+    return isOrgRequirementsEnabled(env) ? { version: 1, enforced: ['models', 'permissionMode', 'tools', 'autopilot'] } : undefined;
+}
+
+/** The stored metadata with the capability brought up to date; undefined when nothing changes. */
+export function orgRequirementsMetadataUpdate<M extends { orgRequirements?: unknown }>(stored: M | null, capability: ReturnType<typeof orgRequirementsMachineCapability>): M | undefined {
+    if (!stored || JSON.stringify(stored.orgRequirements) === JSON.stringify(capability)) return undefined;
+    const { orgRequirements: _previous, ...rest } = stored;
+    return (capability ? { ...rest, orgRequirements: capability } : rest) as M;
+}
+
 /** The project hint the daemon handed this spawn, read once and removed so the agent's children never see it. */
 export function consumeOrgScopeHint(env: NodeJS.ProcessEnv): string | null {
     const value = env[ORG_SCOPE_HINT_ENV]?.trim();

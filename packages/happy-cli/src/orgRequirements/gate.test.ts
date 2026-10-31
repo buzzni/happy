@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { OrgRequirementsAgentState } from '@slopus/happy-wire';
-import { consumeOrgScopeHint, createOrgRequirementsGate, isOrgRequirementsEnabled, orgAccountKey, refusedTurnEnvelopes, ORG_REQUIREMENTS_ENV, ORG_SCOPE_HINT_ENV, type OrgRequirementsGate } from './gate';
+import { consumeOrgScopeHint, createOrgRequirementsGate, isOrgRequirementsEnabled, orgAccountKey, orgRequirementsMachineCapability, orgRequirementsMetadataUpdate, refusedTurnEnvelopes, ORG_REQUIREMENTS_ENV, ORG_SCOPE_HINT_ENV, type OrgRequirementsGate } from './gate';
+import { MachineMetadataSchema } from '@/api/types';
 import { createOrgRequirementsStore } from './store';
 import type { OrgAgent } from './resolve';
 
@@ -240,6 +241,19 @@ describe('organization requirements session gate', () => {
         expect(new Set(envelopes.map((envelope) => envelope.turn)).size).toBe(1);
         expect(envelopes.every((envelope) => envelope.role === 'agent')).toBe(true);
         expect(refusedTurnEnvelopes('x', null).map((envelope) => envelope.ev)).toEqual([{ t: 'turn-start' }, { t: 'text', text: 'x' }, { t: 'turn-end', status: 'failed' }]);
+    });
+
+    it('advertises what this runtime enforces, and nothing with the switch off (R24)', () => {
+        const capability = orgRequirementsMachineCapability({});
+        expect(capability).toEqual({ version: 1, enforced: ['models', 'permissionMode', 'tools', 'autopilot'] });
+        expect(orgRequirementsMachineCapability({ [ORG_REQUIREMENTS_ENV]: 'off' })).toBeUndefined();
+        const stored = { host: 'h', platform: 'darwin' } as Record<string, unknown>;
+        expect(orgRequirementsMetadataUpdate(stored, capability)).toEqual({ host: 'h', platform: 'darwin', orgRequirements: capability });
+        expect(orgRequirementsMetadataUpdate({ ...stored, orgRequirements: capability }, capability)).toBeUndefined();
+        expect(orgRequirementsMetadataUpdate({ ...stored, orgRequirements: capability }, undefined)).toEqual(stored);
+        expect(orgRequirementsMetadataUpdate(null, capability)).toBeUndefined();
+        // The daemon parses its own metadata with this schema: the field must survive it.
+        expect(MachineMetadataSchema.partial().parse({ orgRequirements: capability }).orgRequirements).toEqual(capability);
     });
 
     it('is switched off by HAPPY_ORG_REQUIREMENTS=off only', () => {
