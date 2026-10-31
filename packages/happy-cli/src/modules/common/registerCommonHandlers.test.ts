@@ -322,6 +322,42 @@ describe('registerCommonHandlers writeFile attempts', () => {
     });
 });
 
+/*
+ * A 151 MB tree of a repository root went over happy-server's 100 MB message
+ * limit, so the server closed the machine socket on every answer and the caller
+ * asked again after each reconnect (2026-10-31). A partial tree would hide files
+ * without saying so; an over-limit tree is refused instead.
+ */
+describe('registerCommonHandlers getDirectoryTree entry limit', () => {
+    async function createTree(entries: number) {
+        const { handlers, workingDirectory } = await createHandlers(undefined, { directoryTreeMaxEntries: 4 });
+        await mkdir(join(workingDirectory, 'src'));
+        for (let i = 0; i < entries - 2; i++) await writeFile(join(workingDirectory, 'src', `f${i}.ts`), '');
+        return { handler: handlers.get('getDirectoryTree'), workingDirectory };
+    }
+
+    it('returns the tree when it holds exactly the limit', async () => {
+        const { handler, workingDirectory } = await createTree(4);
+
+        await expect(handler?.({ path: workingDirectory, maxDepth: 8 })).resolves.toMatchObject({
+            success: true,
+            tree: { children: [expect.objectContaining({ name: 'src', children: expect.any(Array) })] },
+        });
+    });
+
+    it('refuses a tree over the limit instead of returning part of it', async () => {
+        const { handler, workingDirectory } = await createTree(5);
+
+        const result = await handler?.({ path: workingDirectory, maxDepth: 8 });
+
+        expect(result).toEqual({
+            success: false,
+            errorCode: 'DIRECTORY_TREE_TOO_LARGE',
+            error: 'Directory tree has more than 4 entries; open a subdirectory or lower maxDepth',
+        });
+    });
+});
+
 describe('project-scoped file RPCs', () => {
     it('reads project files and returns structured absence without using legacy handlers', async () => {
         const { handlers, workingDirectory } = await createHandlers();
