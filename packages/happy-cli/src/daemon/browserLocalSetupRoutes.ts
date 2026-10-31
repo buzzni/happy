@@ -13,9 +13,26 @@ export function attachBrowserLocalSetupRoutes(app: FastifyInstance, setup: Brows
         async request => setup.status(request.body.viewerKey))
     typed.post('/browser/local-setup/revoke', { schema: { body: z.object({ viewerKey: scope }).strict() } },
         async request => setup.revoke(request.body.viewerKey))
+    // Extension-started connection: the native host asks on the extension's behalf, the daemon resolves whose key.
+    typed.post('/browser/local-setup/offer', { schema: { body: z.object({}).strict() } },
+        async (_request, reply) => {
+            try { return { ok: true, account: (await setup.offer()).account } }
+            catch (error) { reply.code(409); return { ok: false, error: setupErrorCode(error) } }
+        })
+    typed.post('/browser/local-setup/connect', { schema: { body: z.object({ profile: z.string().min(1).max(128) }).strict() } },
+        async (request, reply) => {
+            try { return { ok: true, config: await setup.connect(request.body.profile) } }
+            catch (error) { reply.code(409); return { ok: false, error: setupErrorCode(error) } }
+        })
     typed.post('/browser/local-setup/consume', { schema: { body: z.object({ operationId: z.string().regex(/^[A-Za-z0-9_-]{32}$/) }).strict() } },
         async (request, reply) => {
             try { return { ok: true, config: await setup.consume(request.body.operationId) } }
             catch { reply.code(409); return { ok: false, error: 'SETUP_EXPIRED' } }
         })
+}
+
+const SETUP_ERROR_CODES = new Set(['MACHINE_NOT_ELIGIBLE', 'SCOPE_UNAVAILABLE', 'INVALID_PROFILE'])
+/** Only known codes leave the daemon; anything else is a generic unavailability. */
+function setupErrorCode(error: unknown): string {
+    return error instanceof Error && SETUP_ERROR_CODES.has(error.message) ? error.message : 'SCOPE_UNAVAILABLE'
 }

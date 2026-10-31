@@ -34,6 +34,8 @@ export class BrowserLocalSetup {
         extension(): { directory: string; id: string; version: string }
         persistPolicy(policy: BrowserSetupPolicy): Promise<void>
         now?: () => number
+        /** This daemon's own server lookup of its owner's key; the extension never supplies one. */
+        extensionScope?(): Promise<{ viewerKey: string; account: string }>
     }) {}
 
     private scope(key: string) { if (!SCOPE.test(key)) throw new Error('INVALID_SCOPE') }
@@ -76,6 +78,26 @@ export class BrowserLocalSetup {
             op.consumed = true
             return { token, port: this.options.port, host: '127.0.0.1', viewerKey, pairingId: op.id, profile: op.profile }
         })
+    }
+    /** What the extension may show before the user approves; grants nothing. */
+    async offer(): Promise<{ account: string }> {
+        return { account: (await this.serverScope()).account }
+    }
+    /** The extension-side approval: the asking profile replaces this account's earlier pairing. */
+    async connect(profile: string) {
+        const { viewerKey } = await this.serverScope()
+        return this.consume((await this.begin(viewerKey, profile)).operationId)
+    }
+    private async serverScope(): Promise<{ viewerKey: string; account: string }> {
+        let scope: { viewerKey: string; account: string }
+        try {
+            if (!this.options.extensionScope) throw new Error('SCOPE_UNAVAILABLE')
+            scope = await this.options.extensionScope()
+        } catch (error) {
+            throw new Error(error instanceof Error && error.message === 'MACHINE_NOT_ELIGIBLE' ? 'MACHINE_NOT_ELIGIBLE' : 'SCOPE_UNAVAILABLE')
+        }
+        if (!SCOPE.test(scope.viewerKey)) throw new Error('SCOPE_UNAVAILABLE')
+        return scope
     }
     async status(viewerKey: string): Promise<LocalBrowserSetupStatus> {
         this.scope(viewerKey)

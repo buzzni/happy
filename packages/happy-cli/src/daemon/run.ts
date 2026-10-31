@@ -84,6 +84,7 @@ import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stop
 import { preflightDaemonControlServer, startDaemonControlServer } from './controlServer';
 import { BrowserBridge } from './browserBridge';
 import { BrowserLocalSetup, shouldEnableBrowserLocalSetup } from './browserLocalSetup';
+import { fetchBrowserExtensionScope } from './browserExtensionScope';
 import { readBrowserSetupPolicy, writeBrowserSetupPolicy, localBrowserExtensionMetadata } from './browserLocalSetupStore';
 import { BrowserSessionBrokerClient } from './browserSessionBrokerContract';
 import { getBusyDaemonTerminalCount, getDaemonTerminalSessionCount } from './daemonTerminalSessions';
@@ -4066,6 +4067,7 @@ export async function startDaemon(): Promise<void> {
         bridge: browserBridge, readToken: async () => nativeMessaging.token,
         port: DEFAULT_BROWSER_BRIDGE_PORT, extension: localBrowserExtensionMetadata,
         persistPolicy: policy => writeBrowserSetupPolicy(browserSetupPolicyFile, policy),
+        extensionScope: () => fetchBrowserExtensionScope({ origin: readTrustedStudioOrigin(process.env), machineId, token: credentials.token }),
       }) : undefined;
     let stopBrowserBridge: () => Promise<void> = async () => {};
     try {
