@@ -92,12 +92,28 @@ export async function enterDirectory(
 export interface WalkWorkspaceOptions {
     root: string
     presetMatcher: IgnoreMatcher
-    /** Called per file that survived the filter. */
-    onFile?: (absPath: string, relPath: string, stats: Stats) => void | Promise<void>
+    /** Called per file that survived the filter. Returning `false` stops the walk. */
+    onFile?: (absPath: string, relPath: string, stats: Stats) => boolean | void | Promise<boolean | void>
     /** Called per directory that survived the filter (before descending). */
     onDirectory?: (absPath: string, relPath: string) => void | Promise<void>
     /** Max descent levels below root. 0 = only direct children. Unlimited if omitted. */
     maxDepth?: number
+    /** Visit only paths that sort after this relPath (compareRelPaths), to resume a walk. */
+    after?: string
+}
+
+/**
+ * The order walkWorkspace visits paths in: segment by segment, by UTF-16 code
+ * unit. Comparing segments rather than whole strings keeps a directory's
+ * contents together ('a/z' before 'a-b', although '/' sorts after '-').
+ */
+export function compareRelPaths(a: string, b: string): number {
+    const as = a.split('/')
+    const bs = b.split('/')
+    for (let i = 0; i < Math.min(as.length, bs.length); i++) {
+        if (as[i] !== bs[i]) return as[i] < bs[i] ? -1 : 1
+    }
+    return as.length - bs.length
 }
 
 export async function walkWorkspace(opts: WalkWorkspaceOptions): Promise<void> {
@@ -105,21 +121,23 @@ export async function walkWorkspace(opts: WalkWorkspaceOptions): Promise<void> {
     await walkDir(opts.root, '', rootCtx, opts, 0)
 }
 
+/** Answers false once onFile asked the walk to stop. */
 async function walkDir(
     absDir: string,
     relDir: string,
     ctx: GitignoreContext,
     opts: WalkWorkspaceOptions,
     depth: number,
-): Promise<void> {
+): Promise<boolean> {
     const localCtx = await enterDirectory(ctx, absDir, relDir)
 
     let entries
     try {
         entries = await readdir(absDir, { withFileTypes: true })
     } catch {
-        return
+        return true
     }
+    entries.sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0))
 
     for (const entry of entries) {
         if (entry.isSymbolicLink()) continue
@@ -129,12 +147,17 @@ async function walkDir(
         const entryAbs = join(absDir, name)
         const isDir = entry.isDirectory()
 
+        // A directory on the way to `after` is re-entered; anything else at or
+        // before it was already visited.
+        if (opts.after !== undefined && !(isDir && opts.after.startsWith(`${entryRel}/`))
+            && compareRelPaths(entryRel, opts.after) <= 0) continue
+
         if (localCtx.ignores(entryRel, isDir)) continue
 
         if (isDir) {
             if (opts.onDirectory) await opts.onDirectory(entryAbs, entryRel)
             if (opts.maxDepth === undefined || depth < opts.maxDepth) {
-                await walkDir(entryAbs, entryRel, localCtx, opts, depth + 1)
+                if (!await walkDir(entryAbs, entryRel, localCtx, opts, depth + 1)) return false
             }
         } else if (entry.isFile() && opts.onFile) {
             let stats: Stats
@@ -143,7 +166,8 @@ async function walkDir(
             } catch {
                 continue
             }
-            await opts.onFile(entryAbs, entryRel, stats)
+            if (await opts.onFile(entryAbs, entryRel, stats) === false) return false
         }
     }
+    return true
 }

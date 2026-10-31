@@ -11,6 +11,7 @@ import { tmpdir } from 'os'
 import { join, dirname } from 'path'
 import {
     walkWorkspace,
+    compareRelPaths,
     createGitignoreContext,
     enterDirectory,
     type GitignoreContext,
@@ -152,6 +153,54 @@ describe('walkWorkspace', () => {
             },
         })
         expect(dirs.sort()).toEqual(['src'])
+    })
+
+    /*
+     * aplus-dev-studio specs/remote-file-list-pages R4 — a page resumes from the
+     * last relPath it returned, so the walk order must be the same every time and
+     * agree with compareRelPaths.
+     */
+    describe('ordered, resumable walk', () => {
+        async function walkInOrder(opts: Partial<Parameters<typeof walkWorkspace>[0]> = {}): Promise<string[]> {
+            const files: string[] = []
+            await walkWorkspace({ root, presetMatcher, onFile: (_abs, rel) => { files.push(rel) }, ...opts })
+            return files
+        }
+
+        beforeEach(async () => {
+            for (const rel of ['b.txt', 'a/z.txt', 'a/b/c.txt', 'a.txt', 'a-b/x.txt', 'C.txt']) await write(rel)
+        })
+
+        it('visits files in path-segment order', async () => {
+            const files = await walkInOrder()
+
+            expect(files).toEqual(['C.txt', 'a/b/c.txt', 'a/z.txt', 'a-b/x.txt', 'a.txt', 'b.txt'])
+            expect([...files].sort(compareRelPaths)).toEqual(files)
+        })
+
+        it('resumes after a file, including one inside a directory it has to re-enter', async () => {
+            await expect(walkInOrder({ after: 'a/b/c.txt' })).resolves.toEqual(['a/z.txt', 'a-b/x.txt', 'a.txt', 'b.txt'])
+            await expect(walkInOrder({ after: 'a-b/x.txt' })).resolves.toEqual(['a.txt', 'b.txt'])
+        })
+
+        it('resumes after a file that no longer exists', async () => {
+            await expect(walkInOrder({ after: 'a/m.txt' })).resolves.toEqual(['a/z.txt', 'a-b/x.txt', 'a.txt', 'b.txt'])
+        })
+
+        it('stops when onFile returns false', async () => {
+            const files: string[] = []
+            await walkWorkspace({ root, presetMatcher, onFile: (_abs, rel) => { files.push(rel); return files.length < 2 } })
+
+            expect(files).toEqual(['C.txt', 'a/b/c.txt'])
+        })
+    })
+})
+
+describe('compareRelPaths', () => {
+    it('orders by segment, so a directory sorts by its own name', () => {
+        expect(['a.txt', 'a/z', 'a-b/x'].sort(compareRelPaths)).toEqual(['a/z', 'a-b/x', 'a.txt'])
+        expect(compareRelPaths('a/b', 'a/b')).toBe(0)
+        expect(compareRelPaths('a', 'a/b')).toBeLessThan(0)
     })
 })
 
