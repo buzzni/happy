@@ -22,6 +22,7 @@ import {
     requiredCuaTarget,
     type CuaTargetRequest,
     type ListedTool,
+    type OrgToolRules,
     type PolicyCallInput,
     type PolicyTarget,
     type PolicyVerdict,
@@ -116,6 +117,13 @@ export function createToolPolicyGate(deps: {
     unattended: () => boolean;
     /** True while the session runs in Claude's terminal UI, where a person answers Claude's own prompt. */
     terminalPrompt?: () => boolean;
+    /**
+     * The session's organization tool rules, read on every call (codexcli-org-requirements R10.4). Also
+     * carries the document revision a conversation grant is stamped with (R1a), rules or not.
+     */
+    orgRules?: () => OrgToolRules | null;
+    /** Organization verdicts, for the organization audit as well (R17). */
+    orgAudit?: (entry: { tool: string; reasonCode: string; ruleId: string }) => void;
     platform?: NodeJS.Platform;
     tables?: ToolPolicyTables;
     now?: () => number;
@@ -149,12 +157,12 @@ export function createToolPolicyGate(deps: {
         return { kind: 'deny', reasonCode, reason: composePolicyDenyMessage(blockedMessage({ ...verdict, reasonCode }, call.toolName, tables), answer) };
     };
 
-    const evaluate = async (call: PreToolUseCall, args: Record<string, unknown>): Promise<PolicyVerdict> => {
+    const evaluate = async (call: PreToolUseCall, args: Record<string, unknown>, org: OrgToolRules | null): Promise<PolicyVerdict> => {
         const request = withSnapshotPid(requiredCuaTarget(call.toolName, args, tables), args, call.elementPid);
         const target = request.kind === 'none' ? undefined : await deps.resolver.resolve(request);
         return evaluateToolCall(
             { toolName: call.toolName, args, platform, target, ...(call.annotations ? { annotations: call.annotations } : {}) },
-            deps.loadMachinePolicy(), deps.grants.view(), tables, now(),
+            deps.loadMachinePolicy(), deps.grants.view(), tables, now(), org,
         );
     };
     const covered = new Set<string>();
@@ -165,11 +173,16 @@ export function createToolPolicyGate(deps: {
             const args = isRecord(call.toolInput) ? call.toolInput : {};
             // Read before the grants are: a revoke from here on keeps this answer from granting (R18).
             const askedAt = deps.grants.revision();
+            // One read per call: the rules judged and the revision a grant is stamped with are the same document's.
+            const org = deps.orgRules?.() ?? null;
             let verdict: PolicyVerdict;
             try {
-                verdict = await evaluate(call, args);
+                verdict = await evaluate(call, args, org);
             } catch {
                 verdict = evaluationErrorVerdict(call.toolName, tables);
+            }
+            if (verdict.decision !== 'allow' && (verdict.ruleId.startsWith('org:') || verdict.reasonCode === 'org_rule_revision')) {
+                deps.orgAudit?.({ tool: call.toolName, reasonCode: verdict.reasonCode, ruleId: verdict.ruleId });
             }
 
             if (verdict.decision === 'allow') {
@@ -215,7 +228,7 @@ export function createToolPolicyGate(deps: {
                     deps.grants.recordDenial(verdict.denialKey);
                     return refuse(call, verdict, 'user_denied', 'denied', answer);
                 }
-                if (answer.policyGrant === 'session' && verdict.grantOffer === 'session') deps.grants.grant(verdict.grantKeys, askedAt);
+                if (answer.policyGrant === 'session' && verdict.grantOffer === 'session') deps.grants.grant(verdict.grantKeys, askedAt, org?.revision ?? null);
                 audit(call, verdict, 'approved', 'ask');
                 return { kind: 'allow' };
             } catch {

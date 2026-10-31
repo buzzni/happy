@@ -14,6 +14,7 @@ import { createToolPolicyAuditLog, type ToolPolicyAuditRecord } from './audit';
 import { toolPolicyFilePath } from './claudeHook';
 import { registerToolPolicyGrantRpcs } from './grantControl';
 import { createPolicyGrantStore, type PolicyGrantStore } from './grants';
+import type { OrgToolRules } from './evaluate';
 import { createToolPolicyGate, type PolicyApprover, type ToolPolicyGate } from './policyGate';
 import { createMachinePolicyLoader } from './rules';
 import { createTargetResolver } from './targetResolver';
@@ -35,6 +36,9 @@ export function createToolPolicyRuntime(input: {
     /** Read on every decision: the current turn's attendance (codexcli-approval-session-binding R10a). */
     unattended: () => boolean;
     terminalPrompt: () => boolean;
+    /** The session's organization tool rules (codexcli-org-requirements R10.4); absent outside any organization. */
+    orgRules?: () => OrgToolRules | null;
+    orgAudit?: (entry: { tool: string; reasonCode: string; ruleId: string }) => void;
     grantTtlMs: number | null;
     /** The session's RPC handlers; every adapter shares the one grant store these revoke from. */
     rpc: Parameters<typeof registerToolPolicyGrantRpcs>[0];
@@ -61,6 +65,8 @@ export function createToolPolicyRuntime(input: {
         approver: input.approver,
         unattended: input.unattended,
         terminalPrompt: input.terminalPrompt,
+        ...(input.orgRules ? { orgRules: input.orgRules } : {}),
+        ...(input.orgAudit ? { orgAudit: input.orgAudit } : {}),
         // A call without a provider id (no `_meta`) still gets a request id no other call shares.
         newRequestId: () => `policy-${randomUUID()}`,
     });

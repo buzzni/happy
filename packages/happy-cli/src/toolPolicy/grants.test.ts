@@ -68,4 +68,14 @@ describe('policy grants', () => {
         store.grant(['app:a'], store.revision());
         expect(store.view().hasGrant('app:a')).toBe(true);
     });
+
+    it('remembers the organization revision a grant was made under, and re-granting replaces it (R1a)', () => {
+        const store = createPolicyGrantStore();
+        store.grant(['tool:a']);
+        expect(store.view().grantRevision?.('tool:a')).toBeNull();
+        expect(store.view().grantRevision?.('tool:none')).toBeUndefined();
+        store.grant(['tool:a'], undefined, 4);
+        expect(store.view().grantRevision?.('tool:a')).toBe(4);
+        expect(store.list()).toEqual([expect.objectContaining({ key: 'tool:a', orgRevision: 4 })]);
+    });
 });
