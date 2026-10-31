@@ -24,6 +24,7 @@ export type { PermissionMode } from "@/api/types"
 import type { PermissionMode } from "@/api/types"
 import type { ClaudeTitleBridge } from './claudeOffTurnTitle'
 import type { ClaudeOutputFormat } from './structuredOutput'
+import type { ClaudeOrgRequirements, OrgModelRequest } from './claudeOrgRequirements'
 
 export type ClaudeEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
@@ -40,6 +41,11 @@ export interface EnhancedMode {
     disallowedTools?: string[];
     /** Effort level passed through to the Claude Agent SDK as the `effort` option. */
     effort?: ClaudeEffort;
+    /**
+     * The model this batch asked for before runtime substitution, for the organization gate
+     * (codexcli-org-requirements R10.2). Batched only while an organization restricts models.
+     */
+    orgModel?: OrgModelRequest;
 }
 
 interface LoopOptions {
@@ -103,6 +109,8 @@ interface LoopOptions {
     getSaycodePromptBlocks: () => SaycodePromptBlockOverrides | undefined
     /** codexcli-approval-session-binding R10a — the run's turn attendance. */
     turnAttendance?: TurnAttendanceState
+    /** codexcli-org-requirements — absent outside any organization and with HAPPY_ORG_REQUIREMENTS=off. */
+    orgRequirements?: ClaudeOrgRequirements
 }
 
 export async function loop(opts: LoopOptions): Promise<number> {
@@ -141,6 +149,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
         exitAfterFirstTurn: opts.exitAfterFirstTurn,
         outputFormat: opts.outputFormat,
         turnAttendance: opts.turnAttendance,
+        orgRequirements: opts.orgRequirements,
         lessons: opts.lessons,
         lessonProposalTurn: opts.lessonProposalTurn,
         turnCards: opts.turnCards,

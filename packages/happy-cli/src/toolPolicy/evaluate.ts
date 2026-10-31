@@ -7,8 +7,11 @@
  * No I/O here: the gate (policyGate.ts) resolves targets, holds grants and asks people.
  *
  * Combination order (R2): fixed builtin blocks → machine rules (most restrictive wins, a builtin
- * `floor` turns their `allow` into `ask`) → builtin defaults → a session grant turns `ask` into
- * `allow` (never `blocked`).
+ * `floor` turns their `allow` into `ask`) → builtin defaults → organization rules, as the strictest of
+ * the two (aplus-dev-studio-desktop specs/codexcli-org-requirements R1, Q10 — they only ever tighten, so
+ * an organization `ask` cannot turn a builtin `blocked` into a prompt) → a session grant turns `ask`
+ * into `allow` (never `blocked`). An organization `ask` is human-only, and a grant answers it only when
+ * it was made at or after the rule's `since` (R1a).
  *
  * The machine file is user-writable, so it is never trusted to open anything on its own (spec 제약
  * "보안"): past an app's grade it can at most turn the builtin `blocked` into a person's `ask`.
@@ -29,6 +32,7 @@ import {
     type ToolPolicyDecision,
     type ToolPolicyTables,
 } from './rules';
+import type { OrgToolRuleV1 } from '@slopus/happy-wire';
 
 export type CuaTargetRequest =
     | { kind: 'none' }
@@ -52,7 +56,16 @@ export interface PolicyCallInput {
 
 export interface PolicyGrantView {
     hasGrant(key: string): boolean;
+    /** The organization document revision a live grant was made under (null: none); undefined without a grant. */
+    grantRevision?(key: string): number | null | undefined;
     recentlyDenied(key: string): boolean;
+}
+
+/** The organization `tools.rules` a session enforces (R10.4). Rules only `ask` or `block` (R3a). */
+export interface OrgToolRules {
+    companyId: string;
+    revision: number;
+    rules: readonly OrgToolRuleV1[];
 }
 
 export interface PolicyTarget {
@@ -80,6 +93,10 @@ export interface PolicyVerdict {
     auditAllow: boolean;
     /** R12 text for `blocked`. */
     message?: string;
+    /** An organization `ask` is in force: a grant must have been made at this revision or later (R1a). */
+    orgSince?: number;
+    /** That organization rule (`org:<id>`), also where `ruleId` still names the ask it joined (R17). */
+    orgRuleId?: string;
 }
 
 const NO_BYPASS = '이 제한을 스크립트·자동화 도구·셸 명령 등 다른 방법으로 우회하지 마라.';
@@ -126,6 +143,7 @@ export function evaluateToolCall(
     grants: PolicyGrantView,
     tables: ToolPolicyTables = BUILTIN_TABLES,
     now: number = Date.now(),
+    org: OrgToolRules | null = null,
 ): PolicyVerdict {
     const parsed = parseMcpToolName(input.toolName);
     const base = {
@@ -147,10 +165,16 @@ export function evaluateToolCall(
     const ignoreDegraded = verdict.decision === 'allow' && (verdict.action === 'observe' || verdict.action === 'session_meta');
     const ruled = fixed ? null : applyMachineRules(input.toolName, verdict, floor === true, machine.rules, now, { baseAction, ignoreDegraded });
     if (ruled) verdict = { ...verdict, ...ruled };
+    verdict = applyOrgRules(input.toolName, verdict, org);
 
     if (verdict.decision === 'ask') {
-        if (verdict.grantOffer === 'session' && verdict.grantKeys.every((key) => grants.hasGrant(key))) {
+        if (verdict.grantOffer === 'session' && verdict.grantKeys.every((key) => grants.hasGrant(key))
+            && !grantPredatesOrgRule(verdict, grants)) {
             return { ...verdict, decision: 'allow', reasonCode: 'session_grant', ruleId: `session:${verdict.grantKeys.join('+')}`, auditAllow: verdict.serverKind === 'cua-driver' && verdict.action !== 'observe' };
+        }
+        if (verdict.grantOffer === 'session' && verdict.grantKeys.length > 0 && verdict.grantKeys.every((key) => grants.hasGrant(key))) {
+            // The grant is older than the organization rule asking here: a person answers once more (R1a).
+            verdict = { ...verdict, reasonCode: 'org_rule_revision' };
         }
         if (grants.recentlyDenied(verdict.denialKey)) verdict = { ...verdict, decision: 'blocked', reasonCode: 'recently_denied', ruleId: 'session:recently_denied' };
     }
@@ -298,6 +322,39 @@ function applyMachineRules(
     }
 }
 
+/**
+ * R1 (나): the strictest of the verdict so far and the matching organization rules. A tie keeps the
+ * verdict (its message names the more specific cause); an organization `ask` over an `ask` adds only
+ * the human-only constraint and the revision a grant must reach.
+ */
+function applyOrgRules(toolName: string, verdict: PolicyVerdict, org: OrgToolRules | null): PolicyVerdict {
+    if (!org || org.rules.length === 0) return verdict;
+    const matching = org.rules.filter((rule) => toolGlobMatches(rule.tool, toolName)
+        && (rule.action === undefined || rule.action === verdict.action)
+        && (rule.target === undefined || targetMatches(rule.target, verdict.target)));
+    if (matching.length === 0) return verdict;
+    const blocking = matching.find((rule) => rule.decision === 'blocked');
+    if (blocking) {
+        return verdict.decision === 'blocked' ? verdict : { ...verdict, decision: 'blocked', reasonCode: 'org_rule', ruleId: `org:${blocking.id}`, auditAllow: true };
+    }
+    if (verdict.decision === 'blocked') return verdict;
+    const newest = matching.reduce((a, b) => (b.since > a.since ? b : a));
+    const constraint = { humanOnly: true, orgSince: newest.since, orgRuleId: `org:${newest.id}` };
+    return verdict.decision === 'allow'
+        ? { ...verdict, ...constraint, decision: 'ask', reasonCode: 'org_rule', ruleId: `org:${newest.id}`, auditAllow: true }
+        : { ...verdict, ...constraint };
+}
+
+function grantPredatesOrgRule(verdict: PolicyVerdict, grants: PolicyGrantView): boolean {
+    if (verdict.orgSince === undefined) return false;
+    const since = verdict.orgSince;
+    // No key to have granted: nothing a person approved earlier can stand for this organization `ask`.
+    return verdict.grantKeys.length === 0 || !verdict.grantKeys.every((key) => {
+        const revision = grants.grantRevision?.(key);
+        return typeof revision === 'number' && revision >= since;
+    });
+}
+
 function isDegradedRule(rule: MachineRule): boolean {
     return rule.id.endsWith(':invalid') || rule.id === 'file-unreadable';
 }
@@ -355,6 +412,7 @@ export function blockedMessage(verdict: Pick<PolicyVerdict, 'reasonCode' | 'targ
             case 'grade_exceeded': return `${target?.appName}(${category} 앱, 허용 등급 ${verdict.appGrade ?? tables.grades[category]})에는 ${verdict.action} 동작을 할 수 없다.`;
             case 'system_key_combo': return `시스템 키 조합${verdict.keyCombo ? ` ${verdict.keyCombo}` : ''}은 보낼 수 없다.`;
             case 'too_many_keys': return '한 동작에 키를 너무 많이 보낼 수 없다 (수식키가 아닌 키 1개, 전체 8개 이하).';
+            case 'org_rule': return `조직 정책이 ${toolName}${target ? ` (${target.appName})` : ''} 호출을 막았다 — 조직 관리자가 정한 규칙이다.`;
             case 'admin_tool': return `${toolName}은 컴퓨터 사용 도구 설정을 바꾸는 관리 도구라 에이전트가 부를 수 없다.`;
             case 'recently_denied': return `사용자가 방금 ${toolName}${target ? ` (${target.appName})` : ''} 호출을 거절했다.`;
             case 'user_denied': return `사용자가 ${toolName}${target ? ` (${target.appName})` : ''} 호출을 거절했다.`;

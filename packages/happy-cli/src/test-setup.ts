@@ -10,6 +10,10 @@ import { spawnSync } from 'node:child_process'
 export async function setup() {
     process.env.VITEST_POOL_TIMEOUT = '60000'
     process.env.HAPPY_RUN_SANDBOX_NETWORK_TESTS = '1'
+    // The daemon's state root (lessons, organization requirements). A shell inside a Saycode session
+    // exports the real one; every project's workers inherit this environment, so none writes there. A
+    // test that needs a state root sets its own.
+    delete process.env.HAPPY_LESSON_DAEMON_HOME
 
     const buildResult = spawnSync('pnpm', ['build'], { stdio: 'pipe' })
     const buildStdout = buildResult.stdout ? buildResult.stdout.toString() : ''

@@ -24,6 +24,11 @@ export interface PolicyGrantRecord {
     key: string;
     createdAt: number;
     expiresAt: number | null;
+    /**
+     * The organization requirements revision the session enforced when the person granted this
+     * (null: no document). An organization `ask` newer than it asks again (codexcli-org-requirements R1a).
+     */
+    orgRevision: number | null;
 }
 
 export interface PolicyGrantStore {
@@ -31,7 +36,7 @@ export interface PolicyGrantStore {
     /** Counts revokes; pass the value read before asking to `grant`. */
     revision(): number;
     /** `askedAt`: a `revision()` from before the prompt — keys revoked after it are not granted. */
-    grant(keys: string[], askedAt?: number): void;
+    grant(keys: string[], askedAt?: number, orgRevision?: number | null): void;
     recordDenial(key: string): void;
     /** R13: the person's next message lifts the refusal memory. */
     onUserMessage(): void;
@@ -62,6 +67,10 @@ export function createPolicyGrantStore(options: { now?: () => number; grantTtlMs
     return {
         view: () => ({
             hasGrant: (key) => live(grants.get(key)),
+            grantRevision: (key) => {
+                const record = grants.get(key);
+                return live(record) ? record!.orgRevision : undefined;
+            },
             recentlyDenied: (key) => {
                 const at = denials.get(key);
                 if (at === undefined) return false;
@@ -73,11 +82,11 @@ export function createPolicyGrantStore(options: { now?: () => number; grantTtlMs
             },
         }),
         revision: () => revision,
-        grant: (keys, askedAt) => {
+        grant: (keys, askedAt, orgRevision = null) => {
             const createdAt = now();
             for (const key of keys) {
                 if (askedAt !== undefined && (revokedAt.get(key) ?? 0) > askedAt) continue;
-                grants.set(key, { key, createdAt, expiresAt: ttl === null ? null : createdAt + ttl });
+                grants.set(key, { key, createdAt, expiresAt: ttl === null ? null : createdAt + ttl, orgRevision });
             }
         },
         recordDenial: (key) => { denials.set(key, now()); },

@@ -117,6 +117,21 @@ describe('createClaudeTitleBridge', () => {
         await expect(bridge.run({ prompt: 'P', signal: new AbortController().signal })).rejects.toThrow('error_during_execution');
     });
 
+    it('shouldPickTheTitleModelOnlyOnceTheMainQueryOptionsArrive', async () => {
+        const { runQuery, calls } = fakeQuery([{ type: 'result', subtype: 'success', result: '{"title":"T"}' }]);
+        let restricted = false;
+        const bridge = createClaudeTitleBridge({
+            runQuery: runQuery as never,
+            titleModel: (requested, launched) => (restricted ? launched : requested ?? launched),
+        });
+        const pending = bridge.run({ prompt: 'P', model: 'opus', signal: new AbortController().signal });
+        // The organization's model set comes into force between queueing the message and launching its turn.
+        restricted = true;
+        bridge.provide({ ...base, model: 'claude-sonnet-5-5' });
+        await expect(pending).resolves.toBe('{"title":"T"}');
+        expect(calls[0].options.model).toBe('claude-sonnet-5-5');
+    });
+
     it('shouldNotUseOptionsThatWereClearedByAnEndedMainQuery', async () => {
         const { runQuery } = fakeQuery([{ type: 'result', subtype: 'success', result: '{"title":"T"}' }]);
         const bridge = createClaudeTitleBridge({ runQuery: runQuery as never, waitMs: 20 });

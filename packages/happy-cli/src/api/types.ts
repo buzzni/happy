@@ -1,8 +1,8 @@
 export type SetupTokenRotationState = 'switching' | 'switched' | 'exhausted' | 'apply-required' | 'forbidden' | 'unsupported' | 'retrying' | 'retry-expired' | 'failed' | 'resume-rebound';
 import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { z } from 'zod'
-import type { ProviderUsageEventV1, Update, UpdateMachineBody } from '@slopus/happy-wire';
-import { authenticatedEnvelopesCapabilitySchema, companyKeyReseedCapabilitySchema, projectPurgeCapabilitySchema, rpcBindingCapabilitySchema, sealedSpawnEnvCapabilitySchema, worktreeOpsCapabilitySchema, type RpcBindingCapability } from '@slopus/happy-wire';
+import type { OrgRequirementsAgentState, ProviderUsageEventV1, Update, UpdateMachineBody } from '@slopus/happy-wire';
+import { authenticatedEnvelopesCapabilitySchema, companyKeyReseedCapabilitySchema, OrgRequirementsCapabilitySchema, projectPurgeCapabilitySchema, rpcBindingCapabilitySchema, sealedSpawnEnvCapabilitySchema, worktreeOpsCapabilitySchema, type RpcBindingCapability } from '@slopus/happy-wire';
 import { UsageSchema } from '@/claude/types'
 import { DifficultyRoutingCapabilitySchema, DifficultyRoutingIntentSchema } from '@/difficultyRouting'
 import type { SandboxConfig } from '@/persistence'
@@ -301,6 +301,11 @@ export const MachineMetadataSchema = z.object({
    * PC's table when they differ (aplus-dev-studio-desktop #2272).
    */
   toolPolicy: z.object({ version: z.literal(1), enforcement: z.array(z.string()), policyVersion: z.string().optional() }).optional(),
+  /**
+   * aplus-dev-studio-desktop specs/codexcli-org-requirements — what this runtime enforces of an organization's
+   * requirements. Absent: an older daemon or `HAPPY_ORG_REQUIREMENTS=off`; Desktop must not claim enforcement (R24).
+   */
+  orgRequirements: OrgRequirementsCapabilitySchema.optional(),
   /** aplus-dev-studio specs/e2ee-machine-control-boundary R18 — reads bound machine-scope requests (BYOS only). */
   rpcBinding: rpcBindingCapabilitySchema.optional(),
   /** aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 — runs `spawn-with-sealed-env`. */
@@ -741,6 +746,8 @@ export type AgentState = {
   transientRetry?: AgentTransientRetry | null
   /** aplus-dev-studio specs/agent-tool-policy R16 — latest 50 `ask`/`blocked` decisions, no arguments. */
   toolPolicy?: { recent: ToolPolicyAuditRecord[] }
+  /** aplus-dev-studio-desktop specs/codexcli-org-requirements R10.6, R16a — absent outside any organization. */
+  orgRequirements?: OrgRequirementsAgentState
 }
 
 /**

@@ -425,6 +425,34 @@ describe('claudeLocal --continue handling', () => {
         expect(mockSandboxCleanup).toHaveBeenCalledTimes(1);
     });
 
+    // codexcli-org-requirements R10.10: under an organization ceiling the sandbox no longer adds bypass.
+    it('does not add the bypass flag for the sandbox when bypass is not allowed', async () => {
+        await claudeLocal({
+            abort: new AbortController().signal,
+            sessionId: null,
+            path: '/tmp/workspace',
+            onSessionFound,
+            claudeArgs: ['--permission-mode', 'default'],
+            allowBypass: false,
+            sandboxConfig: {
+                enabled: true,
+                workspaceRoot: '~/projects',
+                sessionIsolation: 'workspace',
+                customWritePaths: [],
+                denyReadPaths: [],
+                extraWritePaths: [],
+                denyWritePaths: [],
+                networkMode: 'allowed',
+                allowedDomains: [],
+                deniedDomains: [],
+                allowLocalBinding: true,
+            },
+        });
+        const command = mockWrapCommand.mock.calls.at(-1)?.[0] as string;
+        expect(command).not.toContain('--dangerously-skip-permissions');
+        expect(command).toContain("'--permission-mode' 'default'");
+    });
+
 
     // root 프로브(2026-09-10): 기본 Docker 에서 initialize 는 성공하고 감싼 자식이
     // `bwrap: Creating new namespace failed` 로 죽는다. mandatory 머신에서는 그

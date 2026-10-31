@@ -6,7 +6,7 @@ const GUARD_SCRIPT = join(__dirname, '..', 'tool_policy_file_guard.cjs');
 const POLICY_FILE = '/Users/me/.happy/tool-policy.json';
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const { targetsPolicyFile } = require(GUARD_SCRIPT);
+const { targetsPolicyFile, targetsProtectedDirectory } = require(GUARD_SCRIPT);
 
 const ENV = { home: '/Users/me', happyHome: '/Users/me/.happy' };
 
@@ -83,5 +83,46 @@ describe('tool_policy_file_guard', () => {
     it('never breaks a session on input it cannot read', () => {
         expect(run('not json').status).toBe(0);
         expect(run({ tool_name: 'Write', tool_input: { file_path: POLICY_FILE } }, '').status).toBe(0);
+    });
+});
+
+// codexcli-org-requirements T15: the organization requirements cache is protected the same way.
+describe('tool_policy_file_guard protected directories', () => {
+    const ORG_DIR = '/Users/me/.happy/org-requirements';
+    const runWithDir = (payload: unknown) => spawnSync(process.execPath, [GUARD_SCRIPT, POLICY_FILE, '--dir', ORG_DIR], {
+        input: JSON.stringify(payload),
+        encoding: 'utf8',
+        env: { ...process.env, HOME: '/Users/me', HAPPY_HOME_DIR: '' },
+    });
+
+    it.each([
+        { tool_name: 'Write', tool_input: { file_path: `${ORG_DIR}/0123456789abcdef.json` } },
+        { tool_name: 'Edit', tool_input: { file_path: '~/.happy/org-requirements/scope-1.json' } },
+        bash('rm -rf ~/.happy/org-requirements'),
+        bash('rm ~/.happy/org-requirements/*.json'),
+        bash('cd ~/.happy && rm -r org-requirements'),
+        bash('D=$HOME/.happy; rm -rf $D/org-requirements'),
+    ])('blocks %j', (payload) => {
+        expect(targetsProtectedDirectory(payload, ORG_DIR, ENV)).toBe(true);
+        const result = runWithDir(payload);
+        expect(result.status).toBe(2);
+        expect(result.stderr).toContain('조직 정책');
+    });
+
+    it.each([
+        bash('ls ~/.happy'),
+        bash('cat ~/project/org-requirements/notes.md'),
+        { tool_name: 'Write', tool_input: { file_path: '/Users/me/.happy/org-requirements-notes.md' } },
+    ])('allows %j', (payload) => {
+        expect(targetsProtectedDirectory(payload, ORG_DIR, ENV)).toBe(false);
+        expect(runWithDir(payload).status).toBe(0);
+    });
+
+    it('treats a backslash as a separator too (Windows paths)', () => {
+        expect(targetsProtectedDirectory({ tool_name: 'Write', tool_input: { file_path: `${ORG_DIR}\\0123.json` } }, ORG_DIR, ENV)).toBe(true);
+    });
+
+    it('still guards the policy file when directories are given', () => {
+        expect(runWithDir({ tool_name: 'Write', tool_input: { file_path: POLICY_FILE } }).status).toBe(2);
     });
 });

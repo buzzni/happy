@@ -27,7 +27,10 @@ interface RpcRegistrar {
 }
 
 export function registerToolPolicyGrantRpcs(rpc: RpcRegistrar, grants: PolicyGrantStore): void {
-    rpc.registerHandler(TOOL_POLICY_GRANTS_RPC, async (): Promise<{ grants: PolicyGrantRecord[] }> => ({ grants: grants.list() }));
+    // The wire record stays as it was: the organization revision is this process's own bookkeeping (R1a).
+    rpc.registerHandler(TOOL_POLICY_GRANTS_RPC, async (): Promise<{ grants: Array<Omit<PolicyGrantRecord, 'orgRevision'>> }> => ({
+        grants: grants.list().map(({ key, createdAt, expiresAt }) => ({ key, createdAt, expiresAt })),
+    }));
     rpc.registerHandler(TOOL_POLICY_REVOKE_GRANT_RPC, async (params: unknown): Promise<{ revoked: boolean }> => {
         const key = params && typeof params === 'object' ? (params as { key?: unknown }).key : undefined;
         if (typeof key !== 'string' || !key) throw new Error('Invalid grant key');

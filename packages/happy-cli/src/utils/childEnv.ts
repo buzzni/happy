@@ -76,6 +76,8 @@ export const NON_INHERITABLE_ENV: readonly NonInheritableEnvEntry[] = [
     { prefix: 'HAPPY_BROWSER_VIEWER_', kind: 'session-scope' },
     { prefix: 'HAPPY_APLUS_EXPECTED_', kind: 'spawn-seed' },
     { prefix: 'HAPPY_APLUS_MCP_INITIAL_LIFECYCLE', kind: 'spawn-seed' },
+    // Which organization's last known good a runner falls back to (codexcli-org-requirements R16).
+    { prefix: 'HAPPY_ORG_SCOPE_', kind: 'spawn-seed' },
     // Read by CML's native hook inside the agent, so it stays in-session.
     { prefix: 'CLAUDE_MEMORY_LESSON_OWNER', kind: 'session-scope' },
     // The session's own MCP server: the TCP bearer the runner keeps in its env

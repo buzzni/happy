@@ -21,9 +21,21 @@ export interface AutonomousQualityGateRpcHandlers {
 
 export function createAutonomousQualityGateRpcHandlers(
     registry: AutonomousQualityGateRegistry,
+    options: {
+        /**
+         * A reason to refuse this start, or null (aplus-dev-studio-desktop specs/codexcli-org-requirements
+         * R10.5: the session's organization switched autopilot off). Refused before the registry sees it.
+         */
+        refuseStart?: (request: AutonomousQualityGateStartRequestV1) => string | null;
+    } = {},
 ): AutonomousQualityGateRpcHandlers {
     return {
-        start: async params => registry.start(AutonomousQualityGateStartRequestV1Schema.parse(params)),
+        start: async params => {
+            const request = AutonomousQualityGateStartRequestV1Schema.parse(params);
+            const refusal = options.refuseStart?.(request);
+            if (refusal) throw new Error(`autonomous quality gate refused: ${refusal}`);
+            return registry.start(request);
+        },
         status: async (params) => {
             const request = AutonomousQualityGateStatusRequestV1Schema.parse(params);
             return registry.status(request.sessionId);

@@ -19,6 +19,7 @@ import {
 import { injectMcpCallerGrant } from './mcpCallerGrantEnvelope'
 import { readAiAuthConnectionVersion } from '../usage/aiAuthSource'
 import { sanitizeChildEnv } from '../utils/childEnv'
+import { ORG_REQUIREMENTS_ENV, ORG_SCOPE_HINT_ENV, orgScopeHintEnvironment } from '../orgRequirements/gate'
 import { expandEnvironmentVariables } from '../utils/expandEnvVars'
 
 describe('buildSessionSpawnEnvironment', () => {
@@ -276,11 +277,31 @@ describe('buildSpawnRequestEnvironment', () => {
         expect(buildSpawnRequestEnvironment({}, requested)).toEqual({})
     })
 
+    // codexcli-org-requirements: the switch is the PC operator's and the hint is the daemon's — never a request's.
+    it('drops a requested organization requirements switch and scope hint', () => {
+        expect(buildSpawnRequestEnvironment({}, { [ORG_REQUIREMENTS_ENV]: 'off', [ORG_SCOPE_HINT_ENV]: 'proj-other', KEEP: '1' })).toEqual({ KEEP: '1' })
+    })
+
     it('never lets the request overwrite daemon-owned auth', () => {
         expect(buildSpawnRequestEnvironment(
             { CLAUDE_CODE_OAUTH_TOKEN: 'trusted' },
             { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/repo/app', CLAUDE_CODE_OAUTH_TOKEN: 'attacker' },
         ).CLAUDE_CODE_OAUTH_TOKEN).toBe('trusted')
+    })
+})
+
+describe('organization requirements spawn environment (codexcli-org-requirements)', () => {
+    it('hands the child the daemon-owned project hint, and nothing for a value that is not a project id', () => {
+        expect(orgScopeHintEnvironment('proj_1')).toEqual({ [ORG_SCOPE_HINT_ENV]: 'proj_1' })
+        expect(orgScopeHintEnvironment(null)).toEqual({})
+        expect(orgScopeHintEnvironment('a b')).toEqual({})
+    })
+
+    it('keeps the operator switch the daemon itself runs with, and no inherited hint', () => {
+        const env = buildSessionSpawnEnvironment({ [ORG_REQUIREMENTS_ENV]: 'off', [ORG_SCOPE_HINT_ENV]: 'stale' }, orgScopeHintEnvironment('proj_1'))
+        expect(env[ORG_REQUIREMENTS_ENV]).toBe('off')
+        expect(env[ORG_SCOPE_HINT_ENV]).toBe('proj_1')
+        expect(sanitizeChildEnv({ [ORG_SCOPE_HINT_ENV]: 'proj_1' })).toEqual({})
     })
 })
 

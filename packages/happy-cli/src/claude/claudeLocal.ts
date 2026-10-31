@@ -59,6 +59,8 @@ export async function claudeLocal(opts: {
     sandboxConfig?: SandboxConfig,
     /** 생략하면 개인 머신(owner-choice)으로 본다 — sandbox/sandboxPolicy.ts */
     sandboxPolicyMode?: SandboxPolicyMode,
+    /** False under an organization permission ceiling (codexcli-org-requirements R10.10): the sandbox adds no bypass flag. */
+    allowBypass?: boolean,
 }) {
 
     // Ensure project directory exists
@@ -322,7 +324,7 @@ export async function claudeLocal(opts: {
                                 opts.sandboxPolicyMode ?? 'owner-choice',
                             );
 
-                            if (!spawnArgs.includes('--dangerously-skip-permissions')) {
+                            if (opts.allowBypass !== false && !spawnArgs.includes('--dangerously-skip-permissions')) {
                                 spawnArgs = [...spawnArgs, '--dangerously-skip-permissions'];
                             }
 

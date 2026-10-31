@@ -54,15 +54,19 @@ export function extractTitleJson(text: string | null): string | null {
 
 type RunQuery = (params: { prompt: string; options?: QueryOptions }) => AsyncIterable<unknown>;
 
+/** Which model titles: the one the queued message asked for, or the one its launched query runs. */
+export type ClaudeTitleModel = (requested: string | undefined, launched: string | undefined) => string | undefined;
+
 /**
  * Connects the title job, started when a message is queued, to the options
  * claudeRemote settles once it handles that message. `run` waits for
  * `provide` (bounded by `waitMs` and the job's signal); `clear` withdraws the
  * options when that query ends, so a later run never reuses a stale launch.
  */
-export function createClaudeTitleBridge(opts: { runQuery?: RunQuery; waitMs?: number } = {}) {
+export function createClaudeTitleBridge(opts: { runQuery?: RunQuery; waitMs?: number; titleModel?: ClaudeTitleModel } = {}) {
     const runQuery = opts.runQuery ?? (query as RunQuery);
     const waitMs = opts.waitMs ?? DEFAULT_WAIT_MS;
+    const titleModel = opts.titleModel ?? ((requested, launched) => requested ?? launched);
     let provided: QueryOptions | null = null;
     const waiters = new Set<(options: QueryOptions) => void>();
 
@@ -84,6 +88,8 @@ export function createClaudeTitleBridge(opts: { runQuery?: RunQuery; waitMs?: nu
 
     const run: OffTurnTitleRunner = async ({ prompt, model, signal }) => {
         const base = await waitForOptions(signal);
+        // Decided once the launch is known, not when the message was queued: what applies may have changed.
+        const chosen = titleModel(model, base.model);
         const dir = await mkdtemp(join(tmpdir(), 'happy-claude-title-'));
         try {
             const settingsPath = join(dir, 'settings.json');
@@ -91,7 +97,7 @@ export function createClaudeTitleBridge(opts: { runQuery?: RunQuery; waitMs?: nu
             // run for a title.
             await writeFile(settingsPath, JSON.stringify({ disableAllHooks: true }));
             let result: string | null = null;
-            for await (const message of runQuery({ prompt, options: buildClaudeTitleQueryOptions(base, { model, settingsPath, signal }) })) {
+            for await (const message of runQuery({ prompt, options: buildClaudeTitleQueryOptions(base, { model: chosen, settingsPath, signal }) })) {
                 const value = message as { type?: string; subtype?: string; result?: unknown };
                 if (value.type !== 'result') continue;
                 if (value.subtype !== 'success') throw new Error(`Claude title query ended with ${value.subtype}`);

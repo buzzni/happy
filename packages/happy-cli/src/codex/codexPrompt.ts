@@ -10,6 +10,7 @@ import { hashObject } from '@/utils/deterministicJson';
 import { SAYCODE_API_GATEWAY_PROMPT } from '@/prompt/saycodeApiGatewayPrompt';
 
 import type { ReasoningEffort } from './codexAppServerTypes';
+import type { ModelOrigin } from '@/orgRequirements/resolve';
 
 export interface CodexEnhancedMode {
     permissionMode: PermissionMode;
@@ -22,6 +23,11 @@ export interface CodexEnhancedMode {
     saycodePromptBlocks?: SaycodePromptBlockOverrides;
     /** Reasoning effort passed through to Codex's sendTurnAndWait. */
     effort?: ReasoningEffort;
+    /**
+     * Where `model` came from, for the organization gate (codexcli-org-requirements R10.2a): a model a
+     * resumed conversation carried, or none chosen, runs on an allowed one instead of being refused.
+     */
+    orgModelOrigin?: ModelOrigin;
 }
 
 // Keep this identifier and array form stable: Desktop's staged-runtime guard also

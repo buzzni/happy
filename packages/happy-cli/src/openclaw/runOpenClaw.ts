@@ -33,6 +33,8 @@ import { OpenClawBackend } from './OpenClawBackend';
 import type { OpenClawGatewayConfig } from './openclawTypes';
 import type { AgentMessage, TurnInactivityWatchdog } from '@/agent/core';
 import { startTurnInactivityWatchdog } from '@/agent/core';
+import { refusedTurnEnvelopes } from '@/orgRequirements/gate';
+import { createLiteRuntimeTurnGate, createSessionOrgRequirementsGate } from '@/orgRequirements/sessionGate';
 
 /** Max time without any backend activity before the turn is cancelled. */
 const TURN_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
@@ -201,6 +203,13 @@ export async function runOpenClaw(opts: RunOpenClawOptions): Promise<void> {
     },
   });
   session = initialSession;
+  // Organization requirements (codexcli-org-requirements R10.7): OpenClaw enforces no ceiling or tool rule.
+  const orgTurn = createLiteRuntimeTurnGate(createSessionOrgRequirementsGate({
+    agent: 'openclaw',
+    credentials: opts.credentials,
+    machineId: settings.machineId,
+    session: { get sessionId() { return session.sessionId; }, updateAgentState: (update) => session.updateAgentState(update) },
+  }));
 
   if (response) {
     try {
@@ -390,6 +399,12 @@ export async function runOpenClaw(opts: RunOpenClawOptions): Promise<void> {
       }
 
       log(`Incoming prompt: ${batch.message.slice(0, 200)}`);
+      const org = await orgTurn({});
+      if (org.kind === 'refuse') {
+        sendEnvelopes(refusedTurnEnvelopes(org.message, null));
+        session.sendSessionEvent({ type: 'ready' });
+        continue;
+      }
       inTurn = true;
       sendEnvelopes(sessionManager.startTurn());
       const turnEnded = waitForTurnEnd();

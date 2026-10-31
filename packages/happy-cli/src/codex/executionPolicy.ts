@@ -20,13 +20,19 @@ export function resolveCodexSandboxPolicy(
     }
 }
 
+/**
+ * `orgCeiling`: an organization permission ceiling below bypass (aplus-dev-studio-desktop
+ * specs/codexcli-org-requirements R10.9). Under Happy's own sandbox the turn then asks at its (already
+ * clipped) mode's approval policy while the file boundary stays Happy's — no nested Codex sandbox.
+ */
 export function resolveCodexExecutionPolicy(
     permissionMode: import('@/api/types').PermissionMode,
     sandboxManagedByHappy: boolean,
+    orgCeiling: 'default' | 'acceptEdits' | null = null,
 ): { approvalPolicy: ApprovalPolicy; sandbox: SandboxMode } {
     if (sandboxManagedByHappy) {
         return {
-            approvalPolicy: 'never',
+            approvalPolicy: orgCeiling ? resolveCodexExecutionPolicy(permissionMode, false).approvalPolicy : 'never',
             sandbox: 'danger-full-access',
         };
     }

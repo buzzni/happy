@@ -28,6 +28,7 @@ import { ResolvedPermissionLog, type PermissionAck, type PermissionResolution } 
 import { ApprovalExpiryTimers, withoutExpiresAt } from "@/utils/approvalExpiry";
 import { unattendedExpiryMessage, type TurnAttendanceState } from "@/api/turnAttendance";
 import { composeDenyMessage, recordedDenyReason } from "@/utils/permissionDenyMessage";
+import { ceilingDenialMessage } from "@/orgRequirements/gate";
 
 export type { PermissionAck };
 
@@ -213,6 +214,17 @@ export class PermissionHandler implements PolicyApprover {
     }
 
     /**
+     * The organization ceiling clipped the mode of the turn about to run (codexcli-org-requirements R10.2):
+     * a running provider reads its mode only at launch, so it is told — otherwise a session that started in
+     * bypass would keep running unasked after the ceiling arrived.
+     */
+    applyModeToRunningQuery(mode: PermissionMode): void {
+        this.setPermissionModeCallback?.(mapToClaudeMode(mode)).catch((err) => {
+            logger.debug('Failed to apply the organization permission ceiling to the running query:', err);
+        });
+    }
+
+    /**
      * Set callback to dynamically change permission mode on the active query.
      * Called by claudeRemote after the Query object is created.
      */
@@ -342,7 +354,33 @@ export class PermissionHandler implements PolicyApprover {
         // Approval flow
         //
 
+        // Unattended, and only the organization ceiling made this ask: nobody will answer, so do not wait (R10.12).
+        if (this.session.orgRequirements?.declinesForCeiling({ edit: descriptor.edit })) {
+            return this.declineForCeiling(toolCallId, toolName, input);
+        }
+
         return this.handlePermissionRequest(toolCallId, toolName, input, options.signal);
+    }
+
+    /**
+     * Declined at once, never raised: no card, no push, no wait (codexcli-org-requirements R10.12). Recorded
+     * in `completedRequests` with `reason: 'requirement_ceiling'` and no `resolution` — the D1 vocabulary
+     * describes how a raised card stopped waiting, and nothing waited here.
+     */
+    private declineForCeiling(id: string, toolName: string, input: unknown): PermissionResult {
+        // Releases the delayed message that carries the tool call, as a raised prompt would.
+        this.onPermissionRequestCallback?.(id, toolName, this.nextInstanceSeq++);
+        this.session.orgRequirements?.recordCeilingDenial(toolName);
+        const now = Date.now();
+        this.session.client.updateAgentState((currentState) => ({
+            ...currentState,
+            completedRequests: {
+                ...currentState.completedRequests,
+                [id]: { tool: toolName, arguments: input, createdAt: now, completedAt: now, status: 'denied', reason: 'requirement_ceiling' },
+            },
+        }));
+        logger.debug(`Permission request ${id} declined: the organization permission ceiling in an unattended turn`);
+        return { behavior: 'deny', message: ceilingDenialMessage() };
     }
 
     /**
@@ -758,9 +796,11 @@ export class PermissionHandler implements PolicyApprover {
      */
     private consumeAnswer(
         id: string,
-        message: PermissionResponse,
+        answer: PermissionResponse,
         pending: PendingRequest,
     ): PermissionAck {
+        // An answer cannot widen past the organization's ceiling or name a tool it blocks (R10.3).
+        const message = this.session.orgRequirements?.clampAnswer(answer) ?? answer;
         this.responses.set(id, { ...message, receivedAt: Date.now() });
         this.pendingRequests.delete(id);
         this.expiry.clear(id);

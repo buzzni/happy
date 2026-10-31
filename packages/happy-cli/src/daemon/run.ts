@@ -402,6 +402,9 @@ import {
 import { machineRunCapabilitySupported, TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
 import { hostManagedMachineTools } from '@/modules/common/moaiMachineRunProfiles';
 import { toolPolicyMachineCapability, toolPolicyMetadataUpdate } from '@/toolPolicy/claudeHook';
+import { orgRequirementsMachineCapability, orgRequirementsMetadataUpdate, orgScopeHintEnvironment } from '@/orgRequirements/gate';
+import { createOrgRequirementsStore } from '@/orgRequirements/store';
+import { createOrgRequirementsAuditLog } from '@/orgRequirements/audit';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
 function shellescape(s: string): string {
@@ -446,6 +449,7 @@ export const initialMachineMetadata: MachineMetadata = {
   projectPurge: PROJECT_PURGE_CAPABILITY,
   ...(agentBrowserMachineCapability() ? { agentBrowser: agentBrowserMachineCapability() } : {}),
   ...(toolPolicyMachineCapability(process.env) ? { toolPolicy: toolPolicyMachineCapability(process.env) } : {}),
+  ...(orgRequirementsMachineCapability(process.env) ? { orgRequirements: orgRequirementsMachineCapability(process.env) } : {}),
 };
 
 // Agent children import the base metadata to register their existing machine.
@@ -1411,6 +1415,10 @@ export async function startDaemon(): Promise<void> {
       onRetired: pid => onChildExited(pid) });
     // Terminals run under the verified launcher in their own Job and close with the drain (W0-5h).
     if (standaloneWindows) configureWindowsTerminalHost(standaloneWindows.terminalHost);
+    // codexcli-org-requirements R10.5: which sessions' organizations switched autopilot off, as the
+    // session processes recorded it, and the daemon's own entries in the organization audit.
+    const orgRequirementsSessions = createOrgRequirementsStore({ happyHomeDir: configuration.happyHomeDir, serverUrl: configuration.serverUrl, accountKey: 'daemon' });
+    const orgRequirementsDaemonAudit = createOrgRequirementsAuditLog({ path: join(configuration.happyHomeDir, 'logs', 'org-requirements.jsonl'), sessionId: () => null });
     const autonomousQualityGateStore = await AutonomousQualityGateRunStore.open(
       join(configuration.happyHomeDir, 'autonomous-quality-gates.json'),
     );
@@ -2346,6 +2354,9 @@ export async function startDaemon(): Promise<void> {
         if (options.effort) {
           extraEnv.HAPPY_INITIAL_EFFORT = options.effort;
         }
+        // Organization requirements: the project this spawn is for picks the last known good a runner
+        // falls back to when Studio cannot answer (codexcli-org-requirements R16). A hint, never a grant.
+        Object.assign(extraEnv, orgScopeHintEnvironment(mcpConfigProjectId));
         // Structured output: caller-supplied JSON, injected after expansion for the same reason.
         if (options.outputFormat) {
           Object.assign(extraEnv, outputFormatSeed(options.outputFormat));
@@ -3185,6 +3196,7 @@ export async function startDaemon(): Promise<void> {
               } : {}),
               // Always written: a resume request cannot announce a move the daemon did not make.
               [SETUP_TOKEN_RESUME_REBOUND_ENV]: resumedCredentials.rebound ? '1' : '',
+              ...orgScopeHintEnvironment(resumeMcpConfigProjectId),
             },
             agentEnvironment: tracked.agentEnvironment,
             sessionId: happySessionId,
@@ -4342,6 +4354,11 @@ export async function startDaemon(): Promise<void> {
       void apiMachine.updateMachineMetadata((metadata) => toolPolicyMetadataUpdate(metadata, toolPolicyMachineCapability(process.env)) ?? metadata!)
         .catch((error) => logger.debug('[DAEMON RUN] tool policy capability not published', error));
     }
+    // And for organization requirements (codexcli-org-requirements R24).
+    if (orgRequirementsMetadataUpdate(machine.metadata, orgRequirementsMachineCapability(process.env))) {
+      void apiMachine.updateMachineMetadata((metadata) => orgRequirementsMetadataUpdate(metadata, orgRequirementsMachineCapability(process.env)) ?? metadata!)
+        .catch((error) => logger.debug('[DAEMON RUN] organization requirements capability not published', error));
+    }
     /** Set only for a managed runtime; the beat below keeps it current. */
     let managedCredentialState: {
       stateDir: string;
@@ -5454,7 +5471,17 @@ export async function startDaemon(): Promise<void> {
         browserSessionWaiting: async (sessionId: string) => heldBrowserAttentions.answerWaiting(sessionId)
           || (browserTaskBroker ? browserTaskBroker.waiting(sessionId) : false),
       } : {}),
-      autonomousQualityGate: createAutonomousQualityGateRpcHandlers(autonomousQualityGateRegistry),
+      autonomousQualityGate: createAutonomousQualityGateRpcHandlers(autonomousQualityGateRegistry, {
+        // The session process records what its organization enforces; an older runtime records nothing (R24).
+        refuseStart: (request) => {
+          if (!orgRequirementsSessions.readSessionSummary(request.sessionId)?.autopilotDisabled) return null;
+          orgRequirementsDaemonAudit.record({
+            at: Date.now(), item: 'autopilot.enabled', requested: 'autonomous-quality-gate', applied: null,
+            reason: 'requirement_autopilot_disabled', revision: null, companyId: null,
+          });
+          return 'requirement_autopilot_disabled';
+        },
+      }),
       checkpoint: {
         retireWorktree: (params) => new CheckpointRetention(join(configuration.happyHomeDir, 'checkpoints')).retireWorktree(params),
         ...createCheckpointRpcHandlers({

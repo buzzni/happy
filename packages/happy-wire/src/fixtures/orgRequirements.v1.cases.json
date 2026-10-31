@@ -1,0 +1,1607 @@
+{
+  "version": 1,
+  "about": "Shared case table for organization requirements (aplus-dev-studio-desktop specs/codexcli-org-requirements R1~R4, R3a, R1a, R10.2, R10.2a). Canonical copy (T12): the happy daemon tests read every section; Desktop tests/orgRequirements.test.ts and Studio companyRequirements.test.ts keep copies of the sections they implement and follow this file.",
+  "permissionModeOrder": [
+    "read-only",
+    "plan",
+    "default",
+    "acceptEdits",
+    "bypassPermissions"
+  ],
+  "permissionModeRank": {
+    "about": "spec R5.3 / plan '권한 모드 순위'. Agent-specific aliases: Claude safe-yolo runs as default, Codex safe-yolo is on-request/workspace-write.",
+    "cases": [
+      {
+        "mode": "read-only",
+        "agent": "claude",
+        "rank": 0
+      },
+      {
+        "mode": "plan",
+        "agent": "claude",
+        "rank": 1
+      },
+      {
+        "mode": "default",
+        "agent": "claude",
+        "rank": 2
+      },
+      {
+        "mode": "safe-yolo",
+        "agent": "claude",
+        "rank": 2
+      },
+      {
+        "mode": "acceptEdits",
+        "agent": "claude",
+        "rank": 3
+      },
+      {
+        "mode": "safe-yolo",
+        "agent": "codex",
+        "rank": 3
+      },
+      {
+        "mode": "bypassPermissions",
+        "agent": "claude",
+        "rank": 4
+      },
+      {
+        "mode": "yolo",
+        "agent": "codex",
+        "rank": 4
+      }
+    ]
+  },
+  "resolve": [
+    {
+      "name": "no requirement, user value wins",
+      "defaultValue": "default",
+      "userValue": "acceptEdits",
+      "requirement": null,
+      "expect": {
+        "value": "acceptEdits",
+        "source": "user",
+        "overridden": false
+      }
+    },
+    {
+      "name": "no requirement, no user value falls back to the app default",
+      "defaultValue": true,
+      "requirement": null,
+      "expect": {
+        "value": true,
+        "source": "default",
+        "overridden": false
+      }
+    },
+    {
+      "name": "fixed overrides a different user value and keeps it",
+      "defaultValue": true,
+      "userValue": true,
+      "requirement": {
+        "kind": "fixed",
+        "value": false
+      },
+      "revision": 3,
+      "expect": {
+        "value": false,
+        "source": "organization",
+        "overridden": true,
+        "userValue": true,
+        "constraint": {
+          "kind": "fixed",
+          "revision": 3,
+          "locked": true
+        }
+      }
+    },
+    {
+      "name": "fixed equal to the user value is still the organization's value",
+      "defaultValue": true,
+      "userValue": false,
+      "requirement": {
+        "kind": "fixed",
+        "value": false
+      },
+      "expect": {
+        "value": false,
+        "source": "organization",
+        "overridden": false,
+        "constraint": {
+          "kind": "fixed",
+          "revision": 0,
+          "locked": true
+        }
+      }
+    },
+    {
+      "name": "fixed with no user value",
+      "defaultValue": true,
+      "requirement": {
+        "kind": "fixed",
+        "value": false
+      },
+      "expect": {
+        "value": false,
+        "source": "organization",
+        "overridden": false,
+        "constraint": {
+          "kind": "fixed",
+          "revision": 0,
+          "locked": true
+        }
+      }
+    },
+    {
+      "name": "allowedSet keeps a user value inside the set",
+      "defaultValue": "claude:a",
+      "userValue": "codex:b",
+      "requirement": {
+        "kind": "allowedSet",
+        "values": [
+          "claude:a",
+          "codex:b"
+        ],
+        "default": "claude:a"
+      },
+      "expect": {
+        "value": "codex:b",
+        "source": "user",
+        "overridden": false,
+        "constraint": {
+          "kind": "allowedSet",
+          "revision": 0,
+          "locked": false
+        }
+      }
+    },
+    {
+      "name": "allowedSet prefers the app default when the user value is outside",
+      "defaultValue": "codex:b",
+      "userValue": "claude:x",
+      "requirement": {
+        "kind": "allowedSet",
+        "values": [
+          "claude:a",
+          "codex:b"
+        ],
+        "default": "claude:a"
+      },
+      "expect": {
+        "value": "codex:b",
+        "source": "default",
+        "overridden": true,
+        "userValue": "claude:x",
+        "constraint": {
+          "kind": "allowedSet",
+          "revision": 0,
+          "locked": false
+        }
+      }
+    },
+    {
+      "name": "allowedSet uses the recommended default when the app default is outside",
+      "defaultValue": "claude:x",
+      "requirement": {
+        "kind": "allowedSet",
+        "values": [
+          "claude:a",
+          "codex:b"
+        ],
+        "default": "codex:b"
+      },
+      "expect": {
+        "value": "codex:b",
+        "source": "organization",
+        "overridden": false,
+        "constraint": {
+          "kind": "allowedSet",
+          "revision": 0,
+          "locked": false
+        }
+      }
+    },
+    {
+      "name": "allowedSet falls back to the first value without a usable default",
+      "defaultValue": null,
+      "requirement": {
+        "kind": "allowedSet",
+        "values": [
+          "claude:a",
+          "codex:b"
+        ],
+        "default": null
+      },
+      "expect": {
+        "value": "claude:a",
+        "source": "organization",
+        "overridden": false,
+        "constraint": {
+          "kind": "allowedSet",
+          "revision": 0,
+          "locked": false
+        }
+      }
+    },
+    {
+      "name": "allowedSet from a member policy names the member source",
+      "defaultValue": null,
+      "userValue": "claude:x",
+      "requirement": {
+        "kind": "allowedSet",
+        "values": [
+          "codex:b"
+        ],
+        "default": null,
+        "source": "member"
+      },
+      "expect": {
+        "value": "codex:b",
+        "source": "member",
+        "overridden": true,
+        "userValue": "claude:x",
+        "constraint": {
+          "kind": "allowedSet",
+          "revision": 0,
+          "locked": true
+        }
+      }
+    },
+    {
+      "name": "allowedSet with one value is locked even when the user picked it",
+      "defaultValue": null,
+      "userValue": "codex:b",
+      "requirement": {
+        "kind": "allowedSet",
+        "values": [
+          "codex:b"
+        ],
+        "default": "codex:b"
+      },
+      "expect": {
+        "value": "codex:b",
+        "source": "user",
+        "overridden": false,
+        "constraint": {
+          "kind": "allowedSet",
+          "revision": 0,
+          "locked": true
+        }
+      }
+    },
+    {
+      "name": "empty allowedSet leaves no value",
+      "defaultValue": "claude:a",
+      "userValue": "claude:a",
+      "requirement": {
+        "kind": "allowedSet",
+        "values": [],
+        "default": null
+      },
+      "expect": {
+        "value": null,
+        "source": "organization",
+        "overridden": true,
+        "userValue": "claude:a",
+        "unavailable": true,
+        "constraint": {
+          "kind": "allowedSet",
+          "revision": 0,
+          "locked": true
+        }
+      }
+    },
+    {
+      "name": "ceiling clips a user value above it",
+      "defaultValue": "bypassPermissions",
+      "userValue": "bypassPermissions",
+      "requirement": {
+        "kind": "ceiling",
+        "max": "default"
+      },
+      "revision": 2,
+      "expect": {
+        "value": "default",
+        "source": "organization",
+        "overridden": true,
+        "userValue": "bypassPermissions",
+        "constraint": {
+          "kind": "ceiling",
+          "revision": 2,
+          "locked": true
+        }
+      }
+    },
+    {
+      "name": "ceiling clips the app default without marking an override",
+      "defaultValue": "bypassPermissions",
+      "requirement": {
+        "kind": "ceiling",
+        "max": "acceptEdits"
+      },
+      "expect": {
+        "value": "acceptEdits",
+        "source": "organization",
+        "overridden": false,
+        "constraint": {
+          "kind": "ceiling",
+          "revision": 0,
+          "locked": true
+        }
+      }
+    },
+    {
+      "name": "ceiling keeps a user value at or below it",
+      "defaultValue": "bypassPermissions",
+      "userValue": "plan",
+      "requirement": {
+        "kind": "ceiling",
+        "max": "default"
+      },
+      "expect": {
+        "value": "plan",
+        "source": "user",
+        "overridden": false,
+        "constraint": {
+          "kind": "ceiling",
+          "revision": 0,
+          "locked": false
+        }
+      }
+    },
+    {
+      "name": "ceiling keeps an app default equal to it",
+      "defaultValue": "default",
+      "requirement": {
+        "kind": "ceiling",
+        "max": "default"
+      },
+      "expect": {
+        "value": "default",
+        "source": "default",
+        "overridden": false,
+        "constraint": {
+          "kind": "ceiling",
+          "revision": 0,
+          "locked": false
+        }
+      }
+    },
+    {
+      "name": "ceiling treats a value outside the order as above it",
+      "defaultValue": "bypassPermissions",
+      "userValue": "everything",
+      "requirement": {
+        "kind": "ceiling",
+        "max": "default"
+      },
+      "expect": {
+        "value": "default",
+        "source": "organization",
+        "overridden": true,
+        "userValue": "everything",
+        "constraint": {
+          "kind": "ceiling",
+          "revision": 0,
+          "locked": true
+        }
+      }
+    }
+  ],
+  "parse": {
+    "about": "Client-side document validation (spec R3): an unknown schemaVersion or a broken envelope rejects the document (caller keeps its last known good); a broken or unknown item drops only that item and is listed in issues for audit (or keeps the previous value for a known item). Restrictive-only: a fixed true and a rule with decision allow are dropped, a garbled rule decision becomes ask.",
+    "cases": [
+      {
+        "name": "accepts every first-wave item",
+        "document": {
+          "schemaVersion": 1,
+          "companyId": "c1",
+          "revision": 4,
+          "modelPolicyUpdatedAt": null,
+          "issuedAt": 1,
+          "items": {
+            "ai.models": {
+              "kind": "allowedSet",
+              "values": [
+                "claude:a"
+              ],
+              "default": "claude:a",
+              "source": "organization"
+            },
+            "tools.rules": {
+              "kind": "rules",
+              "rules": [
+                {
+                  "id": "r1",
+                  "tool": "mcp__cua-driver__click",
+                  "decision": "blocked",
+                  "since": 4
+                }
+              ]
+            },
+            "permissions.mode": {
+              "kind": "ceiling",
+              "max": "default"
+            },
+            "approvals.aiReview": {
+              "kind": "fixed",
+              "value": false
+            },
+            "autopilot.enabled": {
+              "kind": "fixed",
+              "value": false
+            },
+            "developerFeatures.taskBoard": {
+              "kind": "fixed",
+              "value": false
+            }
+          }
+        },
+        "expect": {
+          "items": [
+            "ai.models",
+            "tools.rules",
+            "permissions.mode",
+            "approvals.aiReview",
+            "autopilot.enabled",
+            "developerFeatures.taskBoard"
+          ],
+          "issues": []
+        }
+      },
+      {
+        "name": "unknown schemaVersion rejects the document",
+        "document": {
+          "schemaVersion": 2,
+          "companyId": "c1",
+          "revision": 1,
+          "modelPolicyUpdatedAt": null,
+          "issuedAt": 1,
+          "items": {}
+        },
+        "expect": {
+          "rejected": true
+        }
+      },
+      {
+        "name": "broken envelope rejects the document",
+        "document": {
+          "schemaVersion": 1,
+          "companyId": "",
+          "revision": -1,
+          "modelPolicyUpdatedAt": null,
+          "issuedAt": 1,
+          "items": {}
+        },
+        "expect": {
+          "rejected": true
+        }
+      },
+      {
+        "name": "unknown item key is dropped alone",
+        "document": {
+          "schemaVersion": 1,
+          "companyId": "c1",
+          "revision": 1,
+          "modelPolicyUpdatedAt": null,
+          "issuedAt": 1,
+          "items": {
+            "network.egress": {
+              "kind": "fixed",
+              "value": false
+            },
+            "autopilot.enabled": {
+              "kind": "fixed",
+              "value": false
+            }
+          }
+        },
+        "expect": {
+          "items": [
+            "autopilot.enabled"
+          ],
+          "issues": [
+            {
+              "key": "network.egress",
+              "reason": "unknown_item"
+            }
+          ]
+        }
+      },
+      {
+        "name": "fixed true is not restrictive and is dropped",
+        "document": {
+          "schemaVersion": 1,
+          "companyId": "c1",
+          "revision": 1,
+          "modelPolicyUpdatedAt": null,
+          "issuedAt": 1,
+          "items": {
+            "autopilot.enabled": {
+              "kind": "fixed",
+              "value": true
+            }
+          }
+        },
+        "expect": {
+          "items": [],
+          "issues": [
+            {
+              "key": "autopilot.enabled",
+              "reason": "invalid_item"
+            }
+          ]
+        }
+      },
+      {
+        "name": "broken known item keeps the previous value",
+        "previous": {
+          "schemaVersion": 1,
+          "companyId": "c1",
+          "revision": 1,
+          "modelPolicyUpdatedAt": null,
+          "issuedAt": 1,
+          "items": {
+            "permissions.mode": {
+              "kind": "ceiling",
+              "max": "acceptEdits"
+            }
+          }
+        },
+        "document": {
+          "schemaVersion": 1,
+          "companyId": "c1",
+          "revision": 2,
+          "modelPolicyUpdatedAt": null,
+          "issuedAt": 2,
+          "items": {
+            "permissions.mode": {
+              "kind": "ceiling",
+              "max": "everything"
+            }
+          }
+        },
+        "expect": {
+          "items": [
+            "permissions.mode"
+          ],
+          "values": {
+            "permissions.mode": {
+              "kind": "ceiling",
+              "max": "acceptEdits"
+            }
+          },
+          "issues": [
+            {
+              "key": "permissions.mode",
+              "reason": "invalid_item_kept_previous"
+            }
+          ]
+        }
+      },
+      {
+        "name": "rule decisions: allow dropped, garbled becomes ask",
+        "document": {
+          "schemaVersion": 1,
+          "companyId": "c1",
+          "revision": 5,
+          "modelPolicyUpdatedAt": null,
+          "issuedAt": 1,
+          "items": {
+            "tools.rules": {
+              "kind": "rules",
+              "rules": [
+                {
+                  "id": "keep",
+                  "tool": "mcp__a__b",
+                  "decision": "ask",
+                  "since": 3
+                },
+                {
+                  "id": "open",
+                  "tool": "mcp__a__c",
+                  "decision": "allow",
+                  "since": 3
+                },
+                {
+                  "id": "odd",
+                  "tool": "mcp__a__d",
+                  "decision": "maybe",
+                  "since": 3
+                }
+              ]
+            }
+          }
+        },
+        "expect": {
+          "items": [
+            "tools.rules"
+          ],
+          "values": {
+            "tools.rules": {
+              "kind": "rules",
+              "rules": [
+                {
+                  "id": "keep",
+                  "tool": "mcp__a__b",
+                  "decision": "ask",
+                  "since": 3
+                },
+                {
+                  "id": "odd",
+                  "tool": "mcp__a__d",
+                  "decision": "ask",
+                  "since": 3
+                }
+              ]
+            }
+          },
+          "issues": [
+            {
+              "key": "tools.rules",
+              "reason": "rule_dropped:open"
+            },
+            {
+              "key": "tools.rules",
+              "reason": "rule_downgraded:odd"
+            }
+          ]
+        }
+      },
+      {
+        "name": "a rule without a usable id or tool is dropped (same limits as Studio)",
+        "document": {
+          "schemaVersion": 1,
+          "companyId": "c1",
+          "revision": 2,
+          "modelPolicyUpdatedAt": null,
+          "issuedAt": 1,
+          "items": {
+            "tools.rules": {
+              "kind": "rules",
+              "rules": [
+                {
+                  "id": "blank",
+                  "tool": "  ",
+                  "decision": "ask",
+                  "since": 1
+                },
+                {
+                  "id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                  "tool": "mcp__a__b",
+                  "decision": "ask",
+                  "since": 1
+                },
+                {
+                  "id": "ok",
+                  "tool": "mcp__a__b",
+                  "decision": "blocked",
+                  "since": 2
+                }
+              ]
+            }
+          }
+        },
+        "expect": {
+          "items": [
+            "tools.rules"
+          ],
+          "values": {
+            "tools.rules": {
+              "kind": "rules",
+              "rules": [
+                {
+                  "id": "ok",
+                  "tool": "mcp__a__b",
+                  "decision": "blocked",
+                  "since": 2
+                }
+              ]
+            }
+          },
+          "issues": [
+            {
+              "key": "tools.rules",
+              "reason": "rule_dropped"
+            },
+            {
+              "key": "tools.rules",
+              "reason": "rule_dropped"
+            }
+          ]
+        }
+      },
+      {
+        "name": "a model key with a colon after the agent prefix is accepted (split at the first colon, like Studio)",
+        "document": {
+          "schemaVersion": 1,
+          "companyId": "c1",
+          "revision": 2,
+          "modelPolicyUpdatedAt": null,
+          "issuedAt": 1,
+          "items": {
+            "ai.models": {
+              "kind": "allowedSet",
+              "values": [
+                "claude:anthropic.claude-v2:1",
+                "codex:gpt-5"
+              ],
+              "default": "claude:anthropic.claude-v2:1",
+              "source": "organization"
+            }
+          }
+        },
+        "expect": {
+          "items": [
+            "ai.models"
+          ],
+          "issues": []
+        }
+      }
+    ]
+  },
+  "studioValidate": {
+    "about": "Studio admin save validation (spec R3, R3a): 400 with a reason code; null means the save is accepted. Studio assigns since itself, so the input rules carry none.",
+    "cases": [
+      {
+        "name": "accepts a restrictive document",
+        "items": {
+          "permissions.mode": {
+            "kind": "ceiling",
+            "max": "default"
+          },
+          "autopilot.enabled": {
+            "kind": "fixed",
+            "value": false
+          },
+          "tools.rules": {
+            "kind": "rules",
+            "rules": [
+              {
+                "id": "r1",
+                "tool": "mcp__cua-driver__click",
+                "decision": "ask"
+              }
+            ]
+          }
+        },
+        "expectError": null
+      },
+      {
+        "name": "rejects an organization allow rule",
+        "items": {
+          "tools.rules": {
+            "kind": "rules",
+            "rules": [
+              {
+                "id": "r1",
+                "tool": "mcp__x__y",
+                "decision": "allow"
+              }
+            ]
+          }
+        },
+        "expectError": "REQUIREMENT_RULE_ALLOW"
+      },
+      {
+        "name": "rejects fixed true",
+        "items": {
+          "approvals.aiReview": {
+            "kind": "fixed",
+            "value": true
+          }
+        },
+        "expectError": "REQUIREMENT_NOT_RESTRICTIVE"
+      },
+      {
+        "name": "rejects a ceiling outside the order",
+        "items": {
+          "permissions.mode": {
+            "kind": "ceiling",
+            "max": "yolo"
+          }
+        },
+        "expectError": "REQUIREMENT_INVALID_VALUE"
+      },
+      {
+        "name": "rejects an unknown item key",
+        "items": {
+          "network.egress": {
+            "kind": "fixed",
+            "value": false
+          }
+        },
+        "expectError": "REQUIREMENT_UNKNOWN_ITEM"
+      },
+      {
+        "name": "rejects ai.models here (managed by the AI model policy screen)",
+        "items": {
+          "ai.models": {
+            "kind": "allowedSet",
+            "values": [
+              "claude:a"
+            ],
+            "default": null
+          }
+        },
+        "expectError": "REQUIREMENT_UNKNOWN_ITEM"
+      },
+      {
+        "name": "rejects a developer feature the registry does not let organizations lock",
+        "items": {
+          "developerFeatures.usage": {
+            "kind": "fixed",
+            "value": false
+          }
+        },
+        "expectError": "REQUIREMENT_UNKNOWN_ITEM"
+      },
+      {
+        "name": "accepts a lockable developer feature",
+        "items": {
+          "developerFeatures.standaloneMode": {
+            "kind": "fixed",
+            "value": false
+          }
+        },
+        "expectError": null
+      },
+      {
+        "name": "rejects duplicate rule ids",
+        "items": {
+          "tools.rules": {
+            "kind": "rules",
+            "rules": [
+              {
+                "id": "r1",
+                "tool": "mcp__x__y",
+                "decision": "ask"
+              },
+              {
+                "id": "r1",
+                "tool": "mcp__x__z",
+                "decision": "blocked"
+              }
+            ]
+          }
+        },
+        "expectError": "REQUIREMENT_INVALID_VALUE"
+      },
+      {
+        "name": "rejects a blank tool name",
+        "items": {
+          "tools.rules": {
+            "kind": "rules",
+            "rules": [
+              {
+                "id": "r1",
+                "tool": "  ",
+                "decision": "ask"
+              }
+            ]
+          }
+        },
+        "expectError": "REQUIREMENT_INVALID_VALUE"
+      },
+      {
+        "name": "rejects a rule id over 128 characters",
+        "items": {
+          "tools.rules": {
+            "kind": "rules",
+            "rules": [
+              {
+                "id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                "tool": "mcp__a__b",
+                "decision": "ask"
+              }
+            ]
+          }
+        },
+        "expectError": "REQUIREMENT_INVALID_VALUE"
+      }
+    ]
+  },
+  "sinceAssignment": {
+    "about": "spec R3a: same id with the same matcher (tool, target, action) and decision keeps its since; a new rule or a changed matcher/decision takes this save's revision; a since sent by the client is ignored.",
+    "cases": [
+      {
+        "name": "unchanged rule keeps since, changed and new rules take the new revision",
+        "previous": [
+          {
+            "id": "same",
+            "tool": "mcp__a__b",
+            "decision": "ask",
+            "since": 2
+          },
+          {
+            "id": "flip",
+            "tool": "mcp__a__c",
+            "decision": "blocked",
+            "since": 2
+          },
+          {
+            "id": "moved",
+            "tool": "mcp__a__d",
+            "decision": "ask",
+            "since": 1
+          }
+        ],
+        "next": [
+          {
+            "id": "same",
+            "tool": "mcp__a__b",
+            "decision": "ask",
+            "since": 99
+          },
+          {
+            "id": "flip",
+            "tool": "mcp__a__c",
+            "decision": "ask"
+          },
+          {
+            "id": "moved",
+            "tool": "mcp__a__d",
+            "target": "Finder",
+            "decision": "ask"
+          },
+          {
+            "id": "new",
+            "tool": "mcp__a__e",
+            "decision": "blocked"
+          }
+        ],
+        "revision": 5,
+        "expectSince": {
+          "same": 2,
+          "flip": 5,
+          "moved": 5,
+          "new": 5
+        }
+      }
+    ]
+  },
+  "toolRules": {
+    "about": "spec R1 rules combination (Q10) and R1a grant revision. base = the agent-tool-policy R2 steps 1-3 verdict without organization rules; org = the matching organization rule decisions; orgSince = the largest since among the organization rules that said ask; grant = a person's session grant for the call (orgRevision = the document revision when it was made, null = no document then).",
+    "cases": [
+      {
+        "name": "org ask cannot loosen a builtin blocked",
+        "base": "blocked",
+        "org": [
+          "ask"
+        ],
+        "grant": null,
+        "expect": {
+          "decision": "blocked"
+        }
+      },
+      {
+        "name": "org ask is human-only",
+        "base": "allow",
+        "org": [
+          "ask"
+        ],
+        "grant": null,
+        "expect": {
+          "decision": "ask",
+          "humanOnly": true
+        }
+      },
+      {
+        "name": "human grant made at or after the rule's since satisfies org ask",
+        "base": "allow",
+        "org": [
+          "ask"
+        ],
+        "orgSince": 3,
+        "grant": {
+          "orgRevision": 3
+        },
+        "expect": {
+          "decision": "allow"
+        }
+      },
+      {
+        "name": "grant made before the rule's since is asked again",
+        "base": "allow",
+        "org": [
+          "ask"
+        ],
+        "orgSince": 4,
+        "grant": {
+          "orgRevision": 3
+        },
+        "expect": {
+          "decision": "ask",
+          "reason": "org_rule_revision"
+        }
+      },
+      {
+        "name": "grant made with no document is asked again",
+        "base": "ask",
+        "org": [
+          "ask"
+        ],
+        "orgSince": 1,
+        "grant": {
+          "orgRevision": null
+        },
+        "expect": {
+          "decision": "ask",
+          "reason": "org_rule_revision"
+        }
+      },
+      {
+        "name": "grant never lifts org blocked",
+        "base": "allow",
+        "org": [
+          "blocked"
+        ],
+        "orgSince": 1,
+        "grant": {
+          "orgRevision": 9
+        },
+        "expect": {
+          "decision": "blocked"
+        }
+      },
+      {
+        "name": "machine allow plus org blocked stays blocked",
+        "base": "allow",
+        "org": [
+          "blocked"
+        ],
+        "grant": null,
+        "expect": {
+          "decision": "blocked"
+        }
+      },
+      {
+        "name": "no org rule keeps today's grant behavior",
+        "base": "ask",
+        "org": [],
+        "grant": {
+          "orgRevision": null
+        },
+        "expect": {
+          "decision": "allow"
+        }
+      },
+      {
+        "name": "org ask with no grant on a machine ask stays a human-only ask",
+        "base": "ask",
+        "org": [
+          "ask"
+        ],
+        "orgSince": 2,
+        "grant": null,
+        "expect": {
+          "decision": "ask",
+          "humanOnly": true
+        }
+      },
+      {
+        "name": "org blocked wins over org ask",
+        "base": "allow",
+        "org": [
+          "ask",
+          "blocked"
+        ],
+        "orgSince": 1,
+        "grant": {
+          "orgRevision": 5
+        },
+        "expect": {
+          "decision": "blocked"
+        }
+      },
+      {
+        "name": "no org rule keeps a builtin blocked",
+        "base": "blocked",
+        "org": [],
+        "grant": null,
+        "expect": {
+          "decision": "blocked"
+        }
+      }
+    ]
+  },
+  "modelNormalization": {
+    "about": "spec R10.2: the model a turn asked for (meta.model, else the spawn seed) as a Studio selection key <agent>:<model id>. Values each client really sends (T11 4, 2026-10-31): Desktop sends catalog ids and omits model for Default/Auto; happy-app sends aliases opus/sonnet/haiku and null for Default; automations send catalog ids or null; Studio keeps claude-fable-5 as an alias of claude-fable-5-1. null means no model was chosen (R10.2a decides); unknown cannot be normalized (requirement_model_unknown). Aliases follow the newest catalog model of each tier and are re-checked when the Claude CLI alias resolution or the Studio catalog moves.",
+    "cases": [
+      {
+        "name": "Desktop sends the catalog key",
+        "agent": "claude",
+        "model": "claude-sonnet-5-5",
+        "expect": "claude:claude-sonnet-5-5"
+      },
+      {
+        "name": "context-window suffix is dropped",
+        "agent": "claude",
+        "model": "claude-sonnet-5-5[1m]",
+        "expect": "claude:claude-sonnet-5-5"
+      },
+      {
+        "name": "case is folded",
+        "agent": "codex",
+        "model": "GPT-6.1-Sol",
+        "expect": "codex:gpt-6.1-sol"
+      },
+      {
+        "name": "surrounding space is trimmed",
+        "agent": "codex",
+        "model": " gpt-6-luna ",
+        "expect": "codex:gpt-6-luna"
+      },
+      {
+        "name": "happy-app opus alias names the newest opus",
+        "agent": "claude",
+        "model": "opus",
+        "expect": "claude:claude-opus-5-5"
+      },
+      {
+        "name": "happy-app sonnet alias names the newest sonnet",
+        "agent": "claude",
+        "model": "sonnet",
+        "expect": "claude:claude-sonnet-5-5"
+      },
+      {
+        "name": "happy-app haiku alias names the newest haiku",
+        "agent": "claude",
+        "model": "haiku",
+        "expect": "claude:claude-haiku-5-5"
+      },
+      {
+        "name": "fable alias names the newest fable",
+        "agent": "claude",
+        "model": "fable",
+        "expect": "claude:claude-fable-5-1"
+      },
+      {
+        "name": "an alias with a context suffix is still the alias",
+        "agent": "claude",
+        "model": "sonnet[1m]",
+        "expect": "claude:claude-sonnet-5-5"
+      },
+      {
+        "name": "retired claude-fable-5 is the Studio alias of claude-fable-5-1",
+        "agent": "claude",
+        "model": "claude-fable-5",
+        "expect": "claude:claude-fable-5-1"
+      },
+      {
+        "name": "a Z.AI model a Studio machine offers keeps its id",
+        "agent": "claude",
+        "model": "glm-5.3-flash",
+        "expect": "claude:glm-5.3-flash"
+      },
+      {
+        "name": "an older catalog id is not rewritten",
+        "agent": "claude",
+        "model": "claude-opus-5",
+        "expect": "claude:claude-opus-5"
+      },
+      {
+        "name": "gemini keeps its id",
+        "agent": "gemini",
+        "model": "gemini-3.1-pro-preview",
+        "expect": "gemini:gemini-3.1-pro-preview"
+      },
+      {
+        "name": "grok is a wildcard agent",
+        "agent": "grok",
+        "model": "grok-5",
+        "expect": "grok:*"
+      },
+      {
+        "name": "grok without a model is still the wildcard",
+        "agent": "grok",
+        "model": null,
+        "expect": "grok:*"
+      },
+      {
+        "name": "openclaw is a wildcard agent",
+        "agent": "openclaw",
+        "model": "anything",
+        "expect": "openclaw:*"
+      },
+      {
+        "name": "opencode keeps its provider slug (Studio has no opencode keys)",
+        "agent": "opencode",
+        "model": "opencode/glm-5.3-flash-free",
+        "expect": "opencode:opencode/glm-5.3-flash-free"
+      },
+      {
+        "name": "no model chosen resolves later by R10.2a",
+        "agent": "claude",
+        "model": "default",
+        "expect": null
+      },
+      {
+        "name": "happy-app Default sends null",
+        "agent": "claude",
+        "model": null,
+        "expect": null
+      },
+      {
+        "name": "an empty string is no model",
+        "agent": "codex",
+        "model": "",
+        "expect": null
+      },
+      {
+        "name": "a blank string is unknown",
+        "agent": "claude",
+        "model": "  ",
+        "expect": "unknown"
+      },
+      {
+        "name": "a string with inner space is unknown",
+        "agent": "claude",
+        "model": "claude opus",
+        "expect": "unknown"
+      },
+      {
+        "name": "an over-long string is unknown",
+        "agent": "codex",
+        "model": "ggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+        "expect": "unknown"
+      }
+    ]
+  },
+  "modelJudgment": {
+    "about": "spec R10.2 / R10.2a: what a turn runs under ai.models. origin explicit = chosen for this turn or by the spawn (a person or an automation picked it); resume = carried over from an earlier process (not chosen now); auto = picked by a router, not by the person (the client router's `modelSource: auto`, or the daemon's delegated difficulty routing), judged like resume; none = nothing chosen. allow runs the requested model unchanged; substitute runs the policy default of the same agent, else that agent's first allowed model, with the model's default effort; deny refuses the turn.",
+    "cases": [
+      {
+        "name": "no ai.models item allows anything",
+        "agent": "claude",
+        "model": "claude-opus-5",
+        "origin": "explicit",
+        "allowed": null,
+        "expect": {
+          "kind": "allow"
+        }
+      },
+      {
+        "name": "an allowed explicit model runs",
+        "agent": "claude",
+        "model": "claude-sonnet-5-5",
+        "origin": "explicit",
+        "allowed": {
+          "values": [
+            "claude:claude-sonnet-5-5",
+            "codex:gpt-6.1-sol"
+          ],
+          "default": "codex:gpt-6.1-sol"
+        },
+        "expect": {
+          "kind": "allow"
+        }
+      },
+      {
+        "name": "an explicit model outside the set is denied, never swapped",
+        "agent": "claude",
+        "model": "claude-opus-5-5",
+        "origin": "explicit",
+        "allowed": {
+          "values": [
+            "claude:claude-sonnet-5-5"
+          ],
+          "default": "claude:claude-sonnet-5-5"
+        },
+        "expect": {
+          "kind": "deny",
+          "reason": "requirement_model_denied"
+        }
+      },
+      {
+        "name": "an explicit model that cannot be normalized is unknown",
+        "agent": "claude",
+        "model": "  ",
+        "origin": "explicit",
+        "allowed": {
+          "values": [
+            "claude:claude-sonnet-5-5"
+          ],
+          "default": null
+        },
+        "expect": {
+          "kind": "deny",
+          "reason": "requirement_model_unknown"
+        }
+      },
+      {
+        "name": "no model chosen takes the policy default of the same agent",
+        "agent": "claude",
+        "model": null,
+        "origin": "none",
+        "allowed": {
+          "values": [
+            "claude:claude-haiku-5-5",
+            "claude:claude-sonnet-5-5"
+          ],
+          "default": "claude:claude-sonnet-5-5"
+        },
+        "expect": {
+          "kind": "substitute",
+          "model": "claude-sonnet-5-5"
+        }
+      },
+      {
+        "name": "a policy default of another agent is skipped for the agent's first allowed model",
+        "agent": "claude",
+        "model": null,
+        "origin": "none",
+        "allowed": {
+          "values": [
+            "codex:gpt-6.1-sol",
+            "claude:claude-haiku-5-5"
+          ],
+          "default": "codex:gpt-6.1-sol"
+        },
+        "expect": {
+          "kind": "substitute",
+          "model": "claude-haiku-5-5"
+        }
+      },
+      {
+        "name": "no model chosen and no allowed model of the agent is denied",
+        "agent": "claude",
+        "model": null,
+        "origin": "none",
+        "allowed": {
+          "values": [
+            "codex:gpt-6.1-sol"
+          ],
+          "default": "codex:gpt-6.1-sol"
+        },
+        "expect": {
+          "kind": "deny",
+          "reason": "requirement_model_denied"
+        }
+      },
+      {
+        "name": "a resumed model now outside the set continues on an allowed model",
+        "agent": "codex",
+        "model": "gpt-5.5",
+        "origin": "resume",
+        "allowed": {
+          "values": [
+            "codex:gpt-6.1-sol"
+          ],
+          "default": null
+        },
+        "expect": {
+          "kind": "substitute",
+          "model": "gpt-6.1-sol"
+        }
+      },
+      {
+        "name": "a resumed model still inside the set runs",
+        "agent": "codex",
+        "model": "gpt-6.1-sol",
+        "origin": "resume",
+        "allowed": {
+          "values": [
+            "codex:gpt-6.1-sol"
+          ],
+          "default": null
+        },
+        "expect": {
+          "kind": "allow"
+        }
+      },
+      {
+        "name": "an Auto pick outside the set runs on an allowed model, never refused",
+        "agent": "claude",
+        "model": "claude-opus-5-5",
+        "origin": "auto",
+        "allowed": {
+          "values": [
+            "claude:claude-sonnet-5-5"
+          ],
+          "default": null
+        },
+        "expect": {
+          "kind": "substitute",
+          "model": "claude-sonnet-5-5"
+        }
+      },
+      {
+        "name": "an Auto pick inside the set runs as routed",
+        "agent": "codex",
+        "model": "gpt-6.1-sol",
+        "origin": "auto",
+        "allowed": {
+          "values": [
+            "codex:gpt-5.5",
+            "codex:gpt-6.1-sol"
+          ],
+          "default": "codex:gpt-5.5"
+        },
+        "expect": {
+          "kind": "allow"
+        }
+      },
+      {
+        "name": "a wildcard agent is allowed by its wildcard key without a model",
+        "agent": "grok",
+        "model": null,
+        "origin": "none",
+        "allowed": {
+          "values": [
+            "grok:*"
+          ],
+          "default": null
+        },
+        "expect": {
+          "kind": "allow"
+        }
+      },
+      {
+        "name": "a wildcard agent outside the set is denied",
+        "agent": "openclaw",
+        "model": "x",
+        "origin": "explicit",
+        "allowed": {
+          "values": [
+            "claude:claude-sonnet-5-5"
+          ],
+          "default": null
+        },
+        "expect": {
+          "kind": "deny",
+          "reason": "requirement_model_denied"
+        }
+      },
+      {
+        "name": "opencode is never allowed under a restriction",
+        "agent": "opencode",
+        "model": null,
+        "origin": "none",
+        "allowed": {
+          "values": [
+            "claude:claude-sonnet-5-5"
+          ],
+          "default": null
+        },
+        "expect": {
+          "kind": "deny",
+          "reason": "requirement_model_denied"
+        }
+      },
+      {
+        "name": "an empty allowed set denies every model",
+        "agent": "claude",
+        "model": "claude-sonnet-5-5",
+        "origin": "explicit",
+        "allowed": {
+          "values": [],
+          "default": null
+        },
+        "expect": {
+          "kind": "deny",
+          "reason": "requirement_model_denied"
+        }
+      },
+      {
+        "name": "an alias inside the set runs as asked",
+        "agent": "claude",
+        "model": "opus",
+        "origin": "explicit",
+        "allowed": {
+          "values": [
+            "claude:claude-opus-5-5"
+          ],
+          "default": null
+        },
+        "expect": {
+          "kind": "allow"
+        }
+      }
+    ]
+  },
+  "permissionModeClamp": {
+    "about": "spec R10.1 / R10.2 / plan '권한 모드 순위': the resolved mode of a turn clipped to permissions.mode. A Codex mode is clipped to the highest Codex mode at or under the ceiling (acceptEdits -> safe-yolo). A value outside the order counts as above every ceiling (fail-closed).",
+    "cases": [
+      {
+        "agent": "claude",
+        "mode": "bypassPermissions",
+        "ceiling": "default",
+        "expect": "default",
+        "clamped": true
+      },
+      {
+        "agent": "claude",
+        "mode": "yolo",
+        "ceiling": "acceptEdits",
+        "expect": "acceptEdits",
+        "clamped": true
+      },
+      {
+        "agent": "claude",
+        "mode": "acceptEdits",
+        "ceiling": "default",
+        "expect": "default",
+        "clamped": true
+      },
+      {
+        "agent": "claude",
+        "mode": "acceptEdits",
+        "ceiling": "acceptEdits",
+        "expect": "acceptEdits",
+        "clamped": false
+      },
+      {
+        "agent": "claude",
+        "mode": "safe-yolo",
+        "ceiling": "default",
+        "expect": "safe-yolo",
+        "clamped": false
+      },
+      {
+        "agent": "claude",
+        "mode": "plan",
+        "ceiling": "default",
+        "expect": "plan",
+        "clamped": false
+      },
+      {
+        "agent": "claude",
+        "mode": "read-only",
+        "ceiling": "default",
+        "expect": "read-only",
+        "clamped": false
+      },
+      {
+        "agent": "claude",
+        "mode": "bypassPermissions",
+        "ceiling": "bypassPermissions",
+        "expect": "bypassPermissions",
+        "clamped": false
+      },
+      {
+        "agent": "claude",
+        "mode": "everything",
+        "ceiling": "acceptEdits",
+        "expect": "acceptEdits",
+        "clamped": true
+      },
+      {
+        "agent": "codex",
+        "mode": "yolo",
+        "ceiling": "default",
+        "expect": "default",
+        "clamped": true
+      },
+      {
+        "agent": "codex",
+        "mode": "yolo",
+        "ceiling": "acceptEdits",
+        "expect": "safe-yolo",
+        "clamped": true
+      },
+      {
+        "agent": "codex",
+        "mode": "safe-yolo",
+        "ceiling": "default",
+        "expect": "default",
+        "clamped": true
+      },
+      {
+        "agent": "codex",
+        "mode": "safe-yolo",
+        "ceiling": "acceptEdits",
+        "expect": "safe-yolo",
+        "clamped": false
+      },
+      {
+        "agent": "codex",
+        "mode": "read-only",
+        "ceiling": "default",
+        "expect": "read-only",
+        "clamped": false
+      }
+    ]
+  }
+}

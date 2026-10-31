@@ -17,7 +17,12 @@
  * read/parse failure exits 0 — this guard must never break a session — which is the opposite of
  * policy_hook_forwarder.cjs on purpose.
  *
- * Usage: node tool_policy_file_guard.cjs <policy-file-path>
+ * Directories passed with `--dir` are guarded the same way (aplus-dev-studio-desktop
+ * specs/codexcli-org-requirements T15: the organization requirements cache — deleting it while Studio is
+ * unreachable would lift the organization's policy). A file tool aimed inside one, or a Bash command naming
+ * a path inside one, is blocked.
+ *
+ * Usage: node tool_policy_file_guard.cjs <policy-file-path> [--dir <protected-directory>]...
  */
 
 const os = require('os');
@@ -80,8 +85,45 @@ function targetsPolicyFile(payload, policyFile, env = defaultEnv(policyFile)) {
     return fold(normalize(target, cwd, env)) === file;
 }
 
+const DIRECTORY_MESSAGE = '도구 정책으로 막힘: Saycode 조직 정책 보관 폴더는 에이전트가 바꾸거나 지울 수 없다 — 조직 정책은 조직 관리자가 정한다. 대신: 필요한 변경을 사용자에게 요청하라. 이 제한을 스크립트·자동화 도구·셸 명령 등 다른 방법으로 우회하지 마라.';
+
+function inside(resolved, dir) {
+    // Both separators: `path.resolve` writes backslashes on Windows, and a command may use either.
+    const trimmed = resolved.replace(/[\\/]+$/, '');
+    return trimmed === dir || trimmed.startsWith(dir + '/') || trimmed.startsWith(dir + '\\') || globMatches(trimmed, dir);
+}
+
+function targetsProtectedDirectory(payload, protectedDir, env = defaultEnv(protectedDir)) {
+    const input = (payload && payload.tool_input) || {};
+    const cwd = payload.cwd || process.cwd();
+    const fold = env.caseInsensitive ? (value) => value.toLowerCase() : (value) => value;
+    const dir = fold(path.resolve(protectedDir)).replace(/[\\/]+$/, '');
+    const parent = path.dirname(dir);
+    const base = path.basename(dir);
+    if (payload.tool_name === 'Bash') {
+        if (typeof input.command !== 'string') return false;
+        const words = input.command.match(/[^\s;|&<>()`'"=,]+/g) || [];
+        let namesParent = false;
+        let namesBase = false;
+        for (const word of words) {
+            const resolved = fold(normalize(word, cwd, env));
+            if (inside(resolved, dir)) return true;
+            if (globMatches(resolved.replace(/[\\/]+$/, ''), parent)) namesParent = true;
+            if (globMatches(fold(path.basename(word)), base)) namesBase = true;
+        }
+        return namesParent && namesBase;
+    }
+    const target = input.file_path || input.notebook_path;
+    if (typeof target !== 'string' || target.length === 0) return false;
+    return inside(fold(normalize(target, cwd, env)), dir);
+}
+
 function main() {
     const policyFile = process.argv[2];
+    const dirs = [];
+    for (let i = 3; i < process.argv.length - 1; i++) {
+        if (process.argv[i] === '--dir') dirs.push(process.argv[++i]);
+    }
     const chunks = [];
     process.stdin.on('data', (chunk) => chunks.push(chunk));
     process.stdin.on('end', () => {
@@ -89,6 +131,10 @@ function main() {
             const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
             if (policyFile && targetsPolicyFile(payload, path.resolve(policyFile))) {
                 process.stderr.write(MESSAGE + '\n');
+                process.exit(2);
+            }
+            if (dirs.some((dir) => dir && targetsProtectedDirectory(payload, path.resolve(dir)))) {
+                process.stderr.write(DIRECTORY_MESSAGE + '\n');
                 process.exit(2);
             }
         } catch {
@@ -99,7 +145,7 @@ function main() {
     process.stdin.resume();
 }
 
-module.exports = { targetsPolicyFile };
+module.exports = { targetsPolicyFile, targetsProtectedDirectory };
 
 if (require.main === module) {
     main();
