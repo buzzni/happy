@@ -21,6 +21,7 @@ import { createIgnoreMatcher } from './ignorePresets';
 import {
     createGitignoreContext,
     enterDirectory,
+    walkWorkspace,
     type GitignoreContext,
 } from './gitignoreWalker';
 import {
@@ -44,6 +45,10 @@ import type { ClaudeOutputFormat } from '@/claude/structuredOutput';
 
 const execAsync = promisify(exec);
 const READ_FILE_CHUNK_MAX_BYTES = 3 * 1024 * 1024;
+// A file entry is a few hundred bytes once sealed and base64-encoded, so even the
+// largest page stays far below happy-server's 100 MB socket message limit.
+const LIST_FILES_PAGE_DEFAULT_LIMIT = 5_000;
+const LIST_FILES_PAGE_MAX_LIMIT = 10_000;
 
 // Preset matcher is immutable at runtime — one instance covers every
 // getDirectoryTree call. Gitignore rules cascade per-request from this
@@ -208,6 +213,29 @@ interface EnsureDirectoryResponse {
 interface GetDirectoryTreeRequest {
     path: string;
     maxDepth: number;
+}
+
+interface ListFilesPageRequest {
+    path: string;
+    maxDepth: number;
+    /** relPath of the last entry of the previous page. */
+    cursor?: string;
+    limit?: number;
+}
+
+interface ListFilesPageEntry {
+    relPath: string;
+    absPath: string;
+    size: number;
+    modified: number;
+}
+
+interface ListFilesPageResponse {
+    success: boolean;
+    entries?: ListFilesPageEntry[];
+    /** null on the last page. */
+    nextCursor?: string | null;
+    error?: string;
 }
 
 interface TreeNode {
@@ -1225,6 +1253,57 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             logger.debug('Failed to get directory tree:', error);
             return { success: false, error: error instanceof Error ? error.message : 'Failed to get directory tree' };
         }
+    });
+
+    // The files getDirectoryTree would return for the same path and maxDepth, a page at a
+    // time, for callers that need every file of a tree too large for one socket message
+    // (aplus-dev-studio specs/remote-file-list-pages). Stateless: a page resumes after
+    // the cursor in walkWorkspace order.
+    rpcHandlerManager.registerHandler<ListFilesPageRequest, ListFilesPageResponse>('listFilesPage', async (data) => {
+        const validation = validatePath(data.path, workingDirectory);
+        if (!validation.valid) {
+            return { success: false, error: validation.error };
+        }
+        if (data.maxDepth < 0) {
+            return { success: false, error: 'maxDepth must be non-negative' };
+        }
+        const limit = data.limit ?? LIST_FILES_PAGE_DEFAULT_LIMIT;
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > LIST_FILES_PAGE_MAX_LIMIT) {
+            return { success: false, error: `limit must be an integer between 1 and ${LIST_FILES_PAGE_MAX_LIMIT}` };
+        }
+        const root = validation.resolvedPath!;
+        try {
+            // Same answer as getDirectoryTree for a root it cannot read, which callers
+            // read as "the workspace is not on this machine".
+            await stat(root);
+        } catch {
+            return { success: false, error: 'Failed to access the specified path' };
+        }
+        // getDirectoryTree's maxDepth counts the root as depth 0, so a file sits at most
+        // maxDepth segments down; walkWorkspace's maxDepth counts levels below the root.
+        if (data.maxDepth < 1) {
+            return { success: true, entries: [], nextCursor: null };
+        }
+
+        const entries: ListFilesPageEntry[] = [];
+        try {
+            await walkWorkspace({
+                root,
+                presetMatcher: directoryIgnoreMatcher,
+                maxDepth: data.maxDepth - 1,
+                after: data.cursor,
+                // One past the page tells whether another page follows.
+                onFile: (absPath, relPath, stats) => {
+                    entries.push({ relPath, absPath, size: stats.size, modified: stats.mtime.getTime() });
+                    return entries.length <= limit;
+                },
+            });
+        } catch (error) {
+            logger.debug('Failed to list files page:', error);
+            return { success: false, error: error instanceof Error ? error.message : 'Failed to list files' };
+        }
+        const page = entries.slice(0, limit);
+        return { success: true, entries: page, nextCursor: entries.length > limit ? page[page.length - 1].relPath : null };
     });
 
     // Ripgrep handler - raw interface to ripgrep
