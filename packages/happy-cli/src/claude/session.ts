@@ -1,4 +1,5 @@
 import type { TurnAttendanceState } from '@/api/turnAttendance';
+import type { ClaudeOrgRequirements } from './claudeOrgRequirements';
 import type { ScopeClaudeSandbox } from '@/daemon/sessionWriteScopeClaude';
 import type { ClaudeStandaloneDrain } from './claudeStandaloneDrain';
 import type { LessonProposalTurn } from '@/utils/lessonProposalTurn';
@@ -100,6 +101,9 @@ export class Session {
      */
     readonly turnAttendance: TurnAttendanceState | null;
 
+    /** codexcli-org-requirements: the organization gate's turn, prompt and terminal hooks; null outside any organization. */
+    readonly orgRequirements: ClaudeOrgRequirements | null;
+
     /** Tool policy R9: the MCP tool names of Claude's init message, for the coverage audit. */
     policyToolsSeen: ((tools: string[]) => void) | null = null;
     
@@ -149,8 +153,10 @@ export class Session {
         exitAfterFirstTurn?: boolean,
         outputFormat?: ClaudeOutputFormat,
         turnAttendance?: TurnAttendanceState,
+        orgRequirements?: ClaudeOrgRequirements,
     }) {
         this.turnAttendance = opts.turnAttendance ?? null;
+        this.orgRequirements = opts.orgRequirements ?? null;
         this.scopeProcessSandbox = opts.scopeProcessSandbox;
         this.path = opts.path;
         this.api = opts.api;

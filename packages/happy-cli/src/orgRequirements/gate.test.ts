@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { OrgRequirementsAgentState } from '@slopus/happy-wire';
-import { createOrgRequirementsGate, isOrgRequirementsEnabled, ORG_REQUIREMENTS_ENV, type OrgRequirementsGate } from './gate';
+import { consumeOrgScopeHint, createOrgRequirementsGate, isOrgRequirementsEnabled, orgAccountKey, refusedTurnEnvelopes, ORG_REQUIREMENTS_ENV, ORG_SCOPE_HINT_ENV, type OrgRequirementsGate } from './gate';
 import { createOrgRequirementsStore } from './store';
 import type { OrgAgent } from './resolve';
 
@@ -205,6 +205,40 @@ describe('organization requirements session gate', () => {
             gate.onRequirements({ kind: 'response', status: 'ok', requirements: doc({}, 4) });
             expect(daemonView.readSessionSummary('s1')).toBeNull();
         });
+    });
+
+    it('shows the clipped mode without recording an enforcement', () => {
+        const gate = make();
+        expect(gate.displayPermissionMode('bypassPermissions')).toBe('bypassPermissions');
+        gate.onRequirements({ kind: 'response', status: 'ok', requirements: doc(CEILING_DEFAULT) });
+        expect(gate.displayPermissionMode('bypassPermissions')).toBe('default');
+        expect(audit().filter((entry) => entry.reason === 'requirement_mode_clamped')).toEqual([]);
+    });
+
+    it('keys the cache by account without keeping the key material', () => {
+        const legacy = orgAccountKey({ encryption: { type: 'legacy', secret: new Uint8Array([1, 2, 3]) } });
+        expect(legacy).toMatch(/^[0-9a-f]{64}$/);
+        expect(orgAccountKey({ encryption: { type: 'legacy', secret: new Uint8Array([1, 2, 3]) } })).toBe(legacy);
+        expect(orgAccountKey({ encryption: { type: 'dataKey', publicKey: new Uint8Array([1, 2, 3]) } })).not.toBe(legacy);
+    });
+
+    it('reads the daemon project hint once and drops a malformed one', () => {
+        const env: NodeJS.ProcessEnv = { [ORG_SCOPE_HINT_ENV]: 'proj_1' };
+        expect(consumeOrgScopeHint(env)).toBe('proj_1');
+        expect(env).toEqual({});
+        expect(consumeOrgScopeHint({ [ORG_SCOPE_HINT_ENV]: 'a b' })).toBeNull();
+    });
+
+    it('builds a refused turn every client reads as a failed turn with its reason', () => {
+        const envelopes = refusedTurnEnvelopes('조직 정책', 'req-1');
+        expect(envelopes.map((envelope) => envelope.ev)).toEqual([
+            { t: 'turn-start', requestId: 'req-1' },
+            { t: 'text', text: '조직 정책' },
+            { t: 'turn-end', status: 'failed', requestId: 'req-1' },
+        ]);
+        expect(new Set(envelopes.map((envelope) => envelope.turn)).size).toBe(1);
+        expect(envelopes.every((envelope) => envelope.role === 'agent')).toBe(true);
+        expect(refusedTurnEnvelopes('x', null).map((envelope) => envelope.ev)).toEqual([{ t: 'turn-start' }, { t: 'text', text: 'x' }, { t: 'turn-end', status: 'failed' }]);
     });
 
     it('is switched off by HAPPY_ORG_REQUIREMENTS=off only', () => {

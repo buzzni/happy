@@ -28,6 +28,7 @@ import { formatClaudeMessageForInk } from "@/ui/messageFormatterInk";
 import { logger } from "@/ui/logger";
 import { SDKToLogConverter } from "./utils/sdkToLogConverter";
 import { EnhancedMode } from "./loop";
+import { orgRefusalTranscriptRecord } from "./claudeOrgRequirements";
 import { RawJSONLines } from "@/claude/types";
 import { OutgoingMessageQueue } from "./utils/OutgoingMessageQueue";
 import { installChannelPermissionWiring } from '@/channel/channelPermissionWiring';
@@ -365,6 +366,20 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             return true;
         };
     };
+
+    /*
+     * A batch the organization gate refused (codexcli-org-requirements R10.2): the input is consumed by a
+     * turn that says why and ends failed, so every client — older ones and a messenger channel included —
+     * sees a finished turn instead of a wait. Nothing reaches the provider.
+     */
+    const refuseOrgTurn = (batch: CollectedBatch<EnhancedMode>, text: string) => {
+        if (!commitInput(batch)()) return;
+        messageQueue.enqueue(orgRefusalTranscriptRecord(session.sessionId, text));
+        if (batch.channelRequestId) messageQueue.enqueue(finalAnswerItem(text));
+        messageQueue.enqueue(turnEndItem('failed'));
+    };
+    /** Batches whose mode the ceiling clipped: a running provider must be told, it only reads its mode at launch. */
+    const orgClampedBatches = new WeakSet<CollectedBatch<EnhancedMode>>();
 
     /*
      * The prompt→turn binding and the sanitized observation. The ordering this depends on lives in
@@ -1087,6 +1102,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             modeHash = p.hash;
                             mode = p.mode;
                             permissionHandler.handleModeChange(p.mode.permissionMode);
+                            if (orgClampedBatches.has(p)) permissionHandler.applyModeToRunningQuery(p.mode.permissionMode);
                             /*
                              * The boundary may raise a decision that was queued
                              * before the floor rose. Applying the revision to
@@ -1150,6 +1166,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                          * the two never both go out.
                          */
                         let msg: Awaited<ReturnType<typeof session.queue.waitForMessagesAndGetAsString>>;
+                        /** The organization ceiling clipped this batch's mode. */
+                        let orgClamped = false;
                         while (true) {
                             const retryWake = transientRetry.waitSignal();
                             // A refused turn waiting for an organization account in the background
@@ -1182,6 +1200,19 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                     continuation = null;
                                 }
                                 continue;
+                            }
+                            // The organization gate sees the batch as it would run, and may refuse it
+                            // (a failed turn with the reason) or clip its mode; then the wait goes on.
+                            if (msg && session.orgRequirements) {
+                                const org = session.orgRequirements.checkTurn(msg.mode);
+                                if (org.kind === 'refuse') {
+                                    refuseOrgTurn(msg, org.message);
+                                    drain?.releaseClaim();
+                                    msg = null;
+                                    continue;
+                                }
+                                if (org.mode !== msg.mode) msg = { ...msg, mode: org.mode };
+                                orgClamped = org.modeClamped;
                             }
                             // Anything but the retry's own wake (a closed queue, a refused claim, an
                             // abort) is handled below, as it would be without a retry waiting.
@@ -1288,6 +1319,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 if (!keepForBackgroundWork) {
                                     logger.debug('[remote]: mode has changed, pending message');
                                     pending = msg;
+                                    if (orgClamped) orgClampedBatches.add(msg);
                                     drain?.releaseClaim();
                                     return null;
                                 }
@@ -1308,6 +1340,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             lastTurnChannel = Boolean(msg.channelRequestId);
                             lastTurnCommand = isCommandText(msg.message);
                             permissionHandler.handleModeChange(mode.permissionMode);
+                            if (orgClamped) permissionHandler.applyModeToRunningQuery(mode.permissionMode);
                             const latency = toTurnLatency(msg);
 
                             /*

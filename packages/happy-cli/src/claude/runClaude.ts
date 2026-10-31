@@ -122,13 +122,16 @@ import {
 import { DifficultyRoutingCommitter } from '@/difficultyRoutingCommit';
 import { createSerialAsyncHandler } from '@/codex/utils/serialAsyncHandler';
 import { isDelegatedDifficultyRoutingMessage } from '@/difficultyRouting';
-import { createLazyLessonSessionHost } from '@/memory/lessonSessionHost';
+import { createLazyLessonSessionHost, lessonStateRoot } from '@/memory/lessonSessionHost';
 import { readLessonOwner } from '@/memory/lessonOwnerMarker';
 import type { StandaloneLaunchBootstrap } from '@/daemon/standaloneLaunchProtocol';
 import { SessionLaunchControl } from '@/sessionDrain/sessionLaunchControl';
 import { RuntimeProducerGate } from '@/sessionDrain/runtimeProducerGate';
 import { ClaudeStandaloneDrain } from './claudeStandaloneDrain';
 import { createClaudeDrainProvider } from './claudeDrainProvider';
+import { consumeOrgScopeHint, createOrgRequirementsGate, isOrgRequirementsEnabled, orgAccountKey } from '@/orgRequirements/gate';
+import { orgRequirementsDirectory } from '@/orgRequirements/store';
+import { createClaudeOrgRequirements, stripModelSelectionEnv, type OrgModelRequest } from './claudeOrgRequirements';
 
 /**
  * How long a confirmed initial prompt waits for its acknowledgement before the
@@ -762,6 +765,36 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // children this session delegates to all read it. A spawned child learns its parent's from env.
     const delegatedAttendance = consumeDelegatedAttendance(process.env);
     const turnAttendance = new TurnAttendanceState(exitAfterFirstTurn);
+    /*
+     * Organization requirements (aplus-dev-studio-desktop specs/codexcli-org-requirements R10): read from the
+     * mcp-config answers this session already gets, enforced at the turn boundary, the permission prompt,
+     * the terminal launch and the tool policy gate. Account sessions only: a managed run fetches no config.
+     * Kept under the state root the daemon names for every spawn (as lessons are), so a staged per-session
+     * home does not lose the last known good; a runner started outside a daemon uses its own home.
+     */
+    const orgScopeHint = consumeOrgScopeHint(process.env);
+    const orgRequirementsHome = lessonStateRoot(process.env) ?? configuration.happyHomeDir;
+    const orgGate = principal.kind === 'account' && isOrgRequirementsEnabled(process.env)
+        ? createOrgRequirementsGate({
+            agent: 'claude',
+            happyHomeDir: orgRequirementsHome,
+            serverUrl: configuration.serverUrl,
+            accountKey: orgAccountKey(principal.credentials),
+            sessionId: () => session.sessionId,
+            projectHint: orgScopeHint,
+            publish: (orgRequirements) => session.updateAgentState((current) => {
+                const { orgRequirements: _previous, ...rest } = current;
+                return orgRequirements ? { ...rest, orgRequirements } : rest;
+            }),
+            refresh: async () => {
+                await fetchAplusMcpConfigSnapshot(requireAccountToken(accountToken), requireAccountMachineId(machineId), {
+                    sessionId: session.sessionId,
+                    lifecycle: 'requirements-refresh',
+                    onRequirements: (outcome) => orgGate?.onRequirements(outcome),
+                });
+            },
+        })
+        : null;
     // Start Happy MCP server
     const happyServer = await startHappyServer(session, {
         browserClientApprover: () => currentSession?.policyApprover ?? null,
@@ -797,6 +830,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             approver: () => currentSession?.policyApprover ?? null,
             unattended: () => turnAttendance.policyUnattended(),
             terminalPrompt: () => currentSession?.mode === 'local',
+            ...(orgGate ? { orgRules: () => orgGate.toolRules(), orgAudit: (entry) => orgGate.auditToolRule(entry) } : {}),
             grantTtlMs: REMOTE_GRANT_TTL_MS,
             rpc: session.rpcHandlerManager,
         })
@@ -851,8 +885,18 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     });
     logger.debug(`[START] Hook server started on port ${hookServer.port}`);
 
-    // Generate hook settings file for Claude
-    const hookSettingsPath = generateHookSettingsFile(hookServer.port, toolPolicy ? { secretFile: toolPolicy.secretFile, policyFile: toolPolicy.policyFile } : undefined);
+    // Generate hook settings file for Claude. Rewritten when the organization requirements in force change:
+    // a ceiling below bypass locks bypass out, and the requirements cache joins the protected paths.
+    const writeHookSettings = () => generateHookSettingsFile(
+        hookServer.port,
+        toolPolicy ? {
+            secretFile: toolPolicy.secretFile,
+            policyFile: toolPolicy.policyFile,
+            ...(orgGate?.toolRules() ? { protectedDirs: [orgRequirementsDirectory(orgRequirementsHome)] } : {}),
+        } : undefined,
+        orgGate && !orgGate.bypassAllowed() ? { disableBypassPermissions: true } : {},
+    );
+    const hookSettingsPath = writeHookSettings();
 
     // Titles a new chat outside the user's turn with claudeRemote's own launch
     // options (see claudeOffTurnTitle). Managed runs, process sandboxes (scoped
@@ -892,6 +936,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         allowedTools: mode.allowedTools,
         disallowedTools: mode.disallowedTools,
         effort: mode.effort,
+        // Two batches that run the same runtime model may still differ in what they asked for (Z.AI aliases).
+        ...(orgGate?.restrictsModels() ? { orgModel: mode.orgModel } : {}),
     }));
     session.configureInputQueue(messageQueue, options.startingMode === 'remote' ? 'remote' : 'local', inputEvidenceEnabled);
     if (launchControl) {
@@ -936,6 +982,12 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     const requestedInitialModel = consumePendingInitialModel(process.env) ?? options.model;
     const explicitInitialModel = normalizeClaudeModelForRuntime(requestedInitialModel, process.env);
     const initialModelSeed = explicitInitialModel ?? defaultClaudeModelForRuntime(process.env, DEFAULT_CLAUDE_MODEL);
+    // What the organization gate judges (R10.2, R10.2a): the model asked for, not the runtime default, and a
+    // model a resumed conversation brought along is not this turn's choice.
+    const initialOrgModel: OrgModelRequest = requestedInitialModel
+        ? { requested: requestedInitialModel, origin: reconnectSession ? 'resume' : 'explicit' }
+        : { requested: null, origin: 'none' };
+    let currentOrgModel: OrgModelRequest = initialOrgModel;
     const rawInitialEffortSeed = consumePendingInitialEffort(process.env);
     if (rawInitialEffortSeed && !VALID_CLAUDE_EFFORTS.has(rawInitialEffortSeed)) {
         logger.debug(`[START] Ignoring invalid initial effort seed: ${rawInitialEffortSeed}`);
@@ -997,16 +1049,23 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // the one that loses the pin.
     sessionModelPinPublisher.publish({ specifiesModel: false, specifiesEffort: false });
     // The session's current permission mode, readable by every client (aplus-dev-studio-desktop #2187).
-    const permissionModePublisher = createSessionPermissionModePublisher({
+    const sessionPermissionModePublisher = createSessionPermissionModePublisher({
         published: publishedSessionPermissionMode(metadata),
         updateMetadata: (update) => session.updateMetadata(update),
     });
+    // The mode a turn runs is clipped at the turn boundary; what the session advertises is the clipped one too.
+    const permissionModePublisher = {
+        publish: (mode: PermissionMode | undefined) => sessionPermissionModePublisher.publish(
+            mode && orgGate ? orgGate.displayPermissionMode(mode) as PermissionMode : mode,
+        ),
+    };
     permissionModePublisher.publish(currentPermissionMode);
 
     const resetTurnScopedOptions = () => {
         currentPermissionMode = initialPermissionMode;
         permissionModePublisher.publish(currentPermissionMode);
         currentModel = initialModelSeed;
+        currentOrgModel = initialOrgModel;
         currentFallbackModel = undefined;
         currentCustomSystemPrompt = undefined;
         // Cached append prompt and account preference survive turn-scoped abort resets.
@@ -1027,6 +1086,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         allowedTools: currentAllowedTools,
         disallowedTools: currentDisallowedTools,
         effort: currentEffort,
+        orgModel: currentOrgModel,
     });
 
     /**
@@ -1290,7 +1350,10 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
 
         // Resolve model - use message.meta.model if provided, otherwise use current model
         let messageModel = currentModel;
+        let messageOrgModel = currentOrgModel;
         if (message.meta?.hasOwnProperty('model')) {
+            messageOrgModel = message.meta.model ? { requested: message.meta.model, origin: 'explicit' } : { requested: null, origin: 'none' };
+            if (!delegatedDifficultyRoutingMessage) currentOrgModel = messageOrgModel;
             messageModel = normalizeClaudeModelForRuntime(
                 message.meta.model || undefined,
                 process.env,
@@ -1542,6 +1605,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         if (outcome && isRoutingProtect(outcome)) {
             logger.debug(`[loop] Auto-route declined protectively (${outcome.reason}); keeping current model`);
             messageModel = currentModel;
+            messageOrgModel = currentOrgModel;
             messageEffort = currentEffort;
             // Visible to the client, not just to a debug log: the turn runs, but
             // the user should be able to see that routing had no say in it and
@@ -1589,6 +1653,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
 
         if (routed) {
             if (routed.route.model) {
+                messageOrgModel = { requested: routed.route.model, origin: 'explicit' };
                 messageModel = defaultClaudeModelForRuntime(
                     process.env,
                     normalizeClaudeModelForRuntime(routed.route.model, process.env),
@@ -1618,6 +1683,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             allowedTools: messageAllowedTools,
             disallowedTools: messageDisallowedTools,
             effort: messageEffort,
+            orgModel: messageOrgModel,
         };
 
         // Until the chat has a title, nudge the model to call `change_title`
@@ -1946,8 +2012,34 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     const initialAplusMcpSnapshot = accountToken === null ? null : await fetchAplusMcpConfigSnapshot(
         accountToken,
         requireAccountMachineId(machineId),
-        { sessionId: session.sessionId },
+        { sessionId: session.sessionId, ...(orgGate ? { onRequirements: orgGate.onRequirements } : {}) },
     );
+    /*
+     * R10.1: before the first turn, with what the same answer said. The session's first mode is clipped
+     * at the turn boundary like every other; here the session stops advertising bypass, the terminal and
+     * the SDK lose the way into it, and a request's model variables go when models are restricted (R10.8).
+     */
+    const claudeOrgRequirements = orgGate ? createClaudeOrgRequirements(orgGate, {
+        normalizeModel: (model) => defaultClaudeModelForRuntime(process.env, normalizeClaudeModelForRuntime(model, process.env)),
+        attendance: () => turnAttendance.current(),
+        initialPermissionMode: () => initialPermissionMode ?? 'default',
+    }) : undefined;
+    const applyOrgRequirements = () => {
+        if (!orgGate) return;
+        orgGate.prepare(initialPermissionMode ?? 'default');
+        permissionModePublisher.publish(currentPermissionMode);
+        const skip = dangerouslySkipPermissions && orgGate.bypassAllowed();
+        if ((session.getMetadata()?.dangerouslySkipPermissions ?? false) !== skip) {
+            session.updateMetadata((current) => ({ ...current, dangerouslySkipPermissions: skip }));
+        }
+        if (orgGate.restrictsModels()) {
+            const removed = stripModelSelectionEnv(process.env, options.claudeEnvVars);
+            if (removed.length > 0) logger.debug(`[org-requirements] Model variables removed while models are restricted: ${removed.join(', ')}`);
+        }
+        writeHookSettings();
+    };
+    if (orgGate?.toolRules()) applyOrgRequirements();
+    orgGate?.onChange(applyOrgRequirements);
     const initialAplusMcpResult = initialAplusMcpSnapshot?.result ?? null;
     for (const status of initialAplusMcpResult ? mcpConfigFailureStatuses(initialAplusMcpResult) : []) {
         session.updateMetadata((currentMetadata) => ({
@@ -2110,7 +2202,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 const account = requireAccountMachineId(machineId);
                 const refresh = () => refreshMcpCallerGrantIfExpiring(token, account, { sessionId: readLessonOwner() === 'host' ? session.sessionId : undefined });
                 await (measure ? measure('mcp-grant', refresh) : refresh());
-                const fetchConfig = () => fetchAplusMcpServersResult(token, account, { sessionId: session.sessionId, lifecycle: 'turn' });
+                const fetchConfig = () => fetchAplusMcpServersResult(token, account, { sessionId: session.sessionId, lifecycle: 'turn', ...(orgGate ? { onRequirements: orgGate.onRequirements } : {}) });
                 const fetched = await (measure ? measure('mcp-fetch', fetchConfig) : fetchConfig());
                 return fetched.ok ? { ...fetched, servers: shadowSafe(fetched.servers) } : fetched;
             },
@@ -2128,6 +2220,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         jsRuntime: options.jsRuntime,
         exitAfterFirstTurn,
         outputFormat,
+        ...(claudeOrgRequirements ? { orgRequirements: claudeOrgRequirements } : {}),
         getSaycodeSystemPromptEnabled: () => currentSaycodeSystemPromptEnabled,
         getSaycodePromptBlocks: () => currentSaycodePromptBlocks,
     });

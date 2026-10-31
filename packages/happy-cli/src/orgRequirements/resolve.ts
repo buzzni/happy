@@ -209,6 +209,12 @@ export function normalizeModelSelection(agent: OrgAgent, model: string | null | 
 /** Where the model a turn would run came from. */
 export type ModelOrigin = 'explicit' | 'resume' | 'none';
 
+/** The model a queued turn asked for, before any runtime substitution (Z.AI), and where it came from. */
+export interface OrgModelRequest {
+    requested: string | null;
+    origin: ModelOrigin;
+}
+
 export type ModelJudgment =
     | { kind: 'allow' }
     /** Run this model id (the key after its agent prefix) with the model's default effort. */

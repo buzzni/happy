@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildHookSettings } from './generateHookSettings';
+import { buildHookSettings, toolPolicyHookCommands } from './generateHookSettings';
 import { resolveMachineLockdownPolicy } from '@/daemon/machineLockdownPolicy';
 
 const base = { hookCommand: 'node fwd 1234', broadKillGuardCommand: 'node guard', homeDir: '/home/trial' };
@@ -47,5 +47,20 @@ describe('buildHookSettings', () => {
         expect(matcher.test('mcp__saycode__x')).toBe(false);
         expect(matcher.test('mcp__happy-extra__x')).toBe(true);
         expect(matcher.test('Bash')).toBe(false);
+    });
+
+    // codexcli-org-requirements R10.10 (measured T11 ⑤, Claude 2.1.305: the TUI then cannot cycle into bypass).
+    it('locks bypass mode out only under an organization ceiling, and is unchanged otherwise', () => {
+        const plain = buildHookSettings({ ...base, policy: resolveMachineLockdownPolicy({}) });
+        expect(buildHookSettings({ ...base, policy: resolveMachineLockdownPolicy({}), disableBypassPermissions: false })).toEqual(plain);
+        const locked = buildHookSettings({ ...base, policy: resolveMachineLockdownPolicy({}), disableBypassPermissions: true }) as { permissions: Record<string, unknown> };
+        expect(locked.permissions).toEqual({ deny: ['Bash(killall:*)'], disableBypassPermissionsMode: 'disable' });
+    });
+
+    it('passes protected directories to the file guard', () => {
+        const input = { execPath: '/n', scriptsDir: '/s', port: 1, secretFile: '/sec', policyFile: '/h/tool-policy.json' };
+        expect(toolPolicyHookCommands(input).fileGuardCommand).toBe('"/n" "/s/tool_policy_file_guard.cjs" "/h/tool-policy.json"');
+        expect(toolPolicyHookCommands({ ...input, protectedDirs: ['/h/org-requirements'] }).fileGuardCommand)
+            .toBe('"/n" "/s/tool_policy_file_guard.cjs" "/h/tool-policy.json" --dir "/h/org-requirements"');
     });
 });

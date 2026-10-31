@@ -19,8 +19,9 @@
  * delete the last known good or set `HAPPY_ORG_REQUIREMENTS=off` (plan "위협 모델" ②/③).
  */
 
+import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import type { OrgRequirementEnforcement, OrgRequirementReason, OrgRequirementsAgentState } from '@slopus/happy-wire';
+import { createEnvelope, type OrgRequirementEnforcement, type OrgRequirementReason, type OrgRequirementsAgentState, type SessionEnvelope } from '@slopus/happy-wire';
 import type { OrgToolRules } from '@/toolPolicy/evaluate';
 import { toolGlobMatches } from '@/toolPolicy/rules';
 import { createOrgRequirementsAuditLog, type OrgRequirementsAuditRecord } from './audit';
@@ -53,6 +54,12 @@ export function consumeOrgScopeHint(env: NodeJS.ProcessEnv): string | null {
     return value && /^[A-Za-z0-9._:-]{1,128}$/.test(value) ? value : null;
 }
 
+/** A stable account identity for the cache file names, from the account's key material, never stored itself. */
+export function orgAccountKey(credentials: { encryption: { type: 'legacy'; secret: Uint8Array } | { type: 'dataKey'; publicKey: Uint8Array } }): string {
+    const material = credentials.encryption.type === 'legacy' ? credentials.encryption.secret : credentials.encryption.publicKey;
+    return createHash('sha256').update(credentials.encryption.type).update(material).digest('hex');
+}
+
 export interface OrgTurnInput {
     /** The mode the turn would run with, after the runner's own resolution (bypass→default guard, sandbox rule). */
     permissionMode: string;
@@ -80,6 +87,8 @@ export interface OrgRequirementsGate {
     onRequirements(outcome: OrgRequirementsFetchOutcome): void;
     prepare(permissionMode: string): { permissionMode: string; clamped: boolean };
     checkTurn(input: OrgTurnInput): OrgTurnVerdict;
+    /** The mode as the session advertises it (metadata `permissionMode`): clipped, nothing recorded. */
+    displayPermissionMode(mode: string): string;
     clampPermissionResponse<T extends { mode?: string; allowTools?: string[] }>(answer: T): T;
     /** The last checked turn: would its requested mode have run this prompt without asking? */
     ceilingCaused(tool: { edit: boolean }): boolean;
@@ -102,6 +111,21 @@ const MESSAGES: Record<'requirement_model_denied' | 'requirement_model_unknown' 
     requirement_model_unknown: (model) => `모델 이름${model ? `(${model})` : ''}을 조직 정책으로 확인할 수 없어 이 메시지를 실행하지 않았어요. 모델을 다시 골라 보내 주세요.`,
     requirement_runtime_unsupported: () => '이 에이전트는 조직 정책(권한 상한·도구 규칙)을 지킬 수 없어 이 메시지를 실행하지 않았어요. Claude나 Codex로 대화를 이어 가 주세요.',
 };
+
+/**
+ * A refused turn in the session protocol (R10.2): `turn-start`, the reason, `turn-end{failed}` — the
+ * existing events, so an older Desktop, the web and mobile apps and a messenger channel all see a failed
+ * turn and its sentence rather than a wait. `requestId` answers a channel request.
+ */
+export function refusedTurnEnvelopes(text: string, requestId: string | null | undefined): SessionEnvelope[] {
+    const turn = randomUUID();
+    const request = requestId ? { requestId } : {};
+    return [
+        createEnvelope('agent', { t: 'turn-start', ...request }, { turn }),
+        createEnvelope('agent', { t: 'text', text }, { turn }),
+        createEnvelope('agent', { t: 'turn-end', status: 'failed', ...request }, { turn }),
+    ];
+}
 
 /** What the agent reads for an unattended prompt the ceiling declined (English, fixed — like the D1 expiry sentence). */
 export function ceilingDenialMessage(): string {
@@ -255,6 +279,7 @@ export function createOrgRequirementsGate(options: {
                 dropFallbackModel,
             };
         },
+        displayPermissionMode: (mode) => clampMode(mode).mode,
         clampPermissionResponse: (answer) => {
             if (!document()) return answer;
             const result = { ...answer };

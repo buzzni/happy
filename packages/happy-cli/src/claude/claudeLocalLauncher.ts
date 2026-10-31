@@ -117,6 +117,8 @@ export async function claudeLocalLauncher(
 
             // Launch
             logger.debug('[local]: launch');
+            // Recomputed per launch: the organization ceiling may have changed since the last one (R10.10).
+            const orgLaunch = session.orgRequirements?.localLaunchArgs(session.claudeArgs);
             try {
                 await claudeLocal({
                     path: session.path,
@@ -125,7 +127,8 @@ export async function claudeLocalLauncher(
                     onThinkingChange: session.onThinkingChange,
                     abort: processAbortController.signal,
                     claudeEnvVars: session.claudeEnvVars,
-                    claudeArgs: session.claudeArgs,
+                    claudeArgs: orgLaunch ? orgLaunch.args : session.claudeArgs,
+                    ...(orgLaunch && !orgLaunch.allowBypass ? { allowBypass: false } : {}),
                     mcpServers: session.mcpServers,
                     allowedTools: session.allowedTools,
                     saycodeSystemPromptEnabled: options.saycodeSystemPromptEnabled,

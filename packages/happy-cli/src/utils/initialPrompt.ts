@@ -108,7 +108,7 @@ export function consumePendingInitialModel(env: NodeJS.ProcessEnv): string | nul
   return model.length > 0 ? model : null
 }
 
-function isZaiClaudeRuntime(env: NodeJS.ProcessEnv): boolean {
+export function isZaiClaudeRuntime(env: NodeJS.ProcessEnv): boolean {
   return env.ANTHROPIC_BASE_URL === 'https://api.z.ai/api/anthropic'
 }
 
