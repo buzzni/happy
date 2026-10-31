@@ -138,12 +138,25 @@
       cursor: pointer;
     }
 
-    button#save {
+    summary {
+      font-weight: 600;
+      font-size: .9rem;
+      cursor: pointer;
+    }
+
+    #connect-question {
+      margin: var(--space-sm) 0 0;
+      font-weight: 600;
+    }
+
+    button#save, button.primary {
       background: var(--primary);
       color: var(--on-primary);
     }
 
-    button#save:hover { filter: brightness(1.08); }
+    button#save:hover, button.primary:hover { filter: brightness(1.08); }
+
+    button:disabled { opacity: .6; cursor: default; }
 
     button#toggle-debugger {
       background: transparent;
@@ -189,14 +202,24 @@
     <div class="logo-dot" aria-hidden="true"></div>
     <div>
       <h1>Happy Browser Bridge</h1>
-      <p>happy 데몬이 이 Chrome 프로필을 제어할 수 있게 연결합니다. 같은 컴퓨터의 데몬은 자동으로 연결하며, 자동 연결이 안 될 때만 아래 수동 설정을 사용하세요.</p>
+      <p>Saycode 대화가 이 Chrome 프로필을 쓸 수 있게 연결합니다. 같은 컴퓨터에서 Saycode가 실행 중이면 연결 버튼 한 번으로 끝납니다.</p>
     </div>
   </header>
 
   <div class="card">
-    <label>로컬 자동 연결</label>
+    <label>Saycode 연결</label>
     <p id="auto-pairing-status" aria-live="polite">확인 중…</p>
-    <button id="retry-auto-pairing" class="secondary" hidden>자동 연결 다시 시도</button>
+    <div id="connect-offer" hidden>
+      <p id="connect-question"></p>
+      <p class="hint">연결하면 이 계정의 Saycode 대화가 이 Chrome 프로필의 탭을 읽고 조작할 수 있습니다. 이 계정에 다른 Chrome 프로필이 연결돼 있었다면 그 연결은 끊어집니다.</p>
+      <button id="approve-connection" class="primary">연결</button>
+    </div>
+    <button id="retry-auto-pairing" class="secondary" hidden>다시 확인</button>
+  </div>
+
+  <details class="card">
+    <summary>고급: 직접 연결 설정</summary>
+    <p class="hint">원격 데몬에 연결하거나 위 연결을 쓸 수 없을 때만 사용하세요.</p>
 
     <label for="host">데몬 주소 <span class="hint">(기본 127.0.0.1 — 이 컴퓨터가 아닌 원격 서버라면 그 주소)</span></label>
     <input id="host" type="text" autocomplete="off" spellcheck="false" placeholder="127.0.0.1">
@@ -212,7 +235,7 @@
 
     <button id="save">저장하고 연결</button>
     <p id="status"></p>
-  </div>
+  </details>
 
   <div class="card">
     <label for="allowlist">사이트 allowlist <span class="hint">(선택)</span></label>
