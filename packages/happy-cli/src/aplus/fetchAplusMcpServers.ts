@@ -11,7 +11,8 @@
  */
 
 import { logger } from '@/ui/logger'
-import type { McpRuntimeServerStatus } from '@slopus/happy-wire'
+import { OrgRequirementsStatusSchema, ORG_REQUIREMENTS_VERSION_HEADER, type McpRuntimeServerStatus } from '@slopus/happy-wire'
+import type { OrgRequirementsFetchOutcome } from '@/orgRequirements/snapshot'
 
 type McpHttpServerEntry = {
     type: 'http'
@@ -103,11 +104,17 @@ const TIMEOUT_MS = 3000
 
 export type McpFetchContext = {
     sessionId?: string
-    lifecycle?: 'spawn' | 'resume' | 'turn'
+    lifecycle?: 'spawn' | 'resume' | 'turn' | 'requirements-refresh'
     configUrl?: string
     projectId?: string
     callerGrant?: string
     expectedConnectors?: string[]
+    /**
+     * Organization requirements ride on this same response (aplus-dev-studio-desktop
+     * specs/codexcli-org-requirements 결정 3). With a reader the request asks for them, and the reader
+     * gets one outcome per fetch — after the retry, whatever the MCP part of the answer was.
+     */
+    onRequirements?: (outcome: OrgRequirementsFetchOutcome) => void
 }
 
 function readExpectedNames(envName: string): string[] {
@@ -209,13 +216,27 @@ export async function fetchAplusMcpConfigSnapshot(
     machineId: string,
     context: McpFetchContext = {},
 ): Promise<AplusMcpConfigSnapshot> {
+    const requirements: { outcome?: OrgRequirementsFetchOutcome } = {}
+    const fetched = await fetchConfigSnapshot(token, machineId, context, requirements)
+    context.onRequirements?.(requirements.outcome ?? { kind: 'failed' })
+    return fetched
+}
+
+async function fetchConfigSnapshot(
+    token: string,
+    machineId: string,
+    context: McpFetchContext,
+    requirements: { outcome?: OrgRequirementsFetchOutcome },
+): Promise<AplusMcpConfigSnapshot> {
     const configuredUrl = context.configUrl ?? process.env.HAPPY_APLUS_MCP_CONFIG_URL
     if (!configuredUrl) {
         logger.debug('[aplus] HAPPY_APLUS_MCP_CONFIG_URL 미설정 — aplus MCP 자동등록 skip')
+        requirements.outcome = { kind: 'not-configured' }
         return snapshot({ ok: false, reason: 'not-configured', error: 'mcp-config URL is not configured' })
     }
     if (!machineId) {
         logger.debug('[aplus] machineId 없음 — aplus MCP 자동등록 skip')
+        requirements.outcome = { kind: 'not-configured' }
         return snapshot({ ok: false, reason: 'missing-machine-id', error: 'machineId is missing' })
     }
     let configUrl: string
@@ -246,6 +267,7 @@ export async function fetchAplusMcpConfigSnapshot(
                     ...(expected.length > 0 ? { 'X-Aplus-Expected-Connectors': expected.join(',') } : {}),
                     ...(sessionId ? { 'X-Aplus-Session-Id': sessionId } : {}),
                     ...(lifecycle ? { 'X-Aplus-Mcp-Lifecycle': lifecycle } : {}),
+                    ...(context.onRequirements ? { [ORG_REQUIREMENTS_VERSION_HEADER]: '1' } : {}),
                 },
                 signal: ctl.signal,
             })
@@ -264,6 +286,12 @@ export async function fetchAplusMcpConfigSnapshot(
                 browserViewerRouting?: { required?: unknown; viewerKey?: unknown }
                 connectorReadiness?: { expected?: unknown }
                 mcpReadiness?: { expected?: unknown; configured?: unknown; missing?: unknown }
+                requirementsStatus?: unknown
+                requirements?: unknown
+            }
+            if (body && typeof body === 'object') {
+                const status = OrgRequirementsStatusSchema.safeParse(body.requirementsStatus)
+                requirements.outcome = { kind: 'response', status: status.success ? status.data : undefined, requirements: body.requirements }
             }
             if (!body?.mcpServers || typeof body.mcpServers !== 'object') {
                 logger.debug('[aplus] mcp-config 응답에 mcpServers 없음 — skip')

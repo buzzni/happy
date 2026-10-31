@@ -366,6 +366,77 @@ describe('fetchAplusMcpServersResult', () => {
         expect(process.env.HAPPY_APLUS_EXPECTED_MCP_SERVICES).toBe('[]');
     });
 
+    describe('organization requirements on the same response (codexcli-org-requirements T13)', () => {
+        const requirements = { schemaVersion: 1, companyId: 'c1', revision: 2, modelPolicyUpdatedAt: null, issuedAt: 1, items: {} };
+        const headersOf = (mock: ReturnType<typeof vi.fn>) => (mock.mock.calls[0]![1] as RequestInit).headers as Record<string, string>;
+
+        it('asks for requirements only when a reader is attached, and hands over the outcome', async () => {
+            const fetchMock = vi.fn(async () => new Response(JSON.stringify({ mcpServers: {}, requirementsStatus: 'ok', requirements }), { status: 200 }));
+            vi.stubGlobal('fetch', fetchMock);
+            const outcomes: unknown[] = [];
+            await fetchAplusMcpServersResult('happy-token', 'machine-1', { sessionId: 's1', onRequirements: (outcome) => outcomes.push(outcome) });
+            expect(headersOf(fetchMock)['x-aplus-requirements-version']).toBe('1');
+            expect(outcomes).toEqual([{ kind: 'response', status: 'ok', requirements }]);
+        });
+
+        it('sends no requirements header without a reader (an older runtime path stays byte-identical)', async () => {
+            const fetchMock = vi.fn(async () => new Response(JSON.stringify({ mcpServers: {} }), { status: 200 }));
+            vi.stubGlobal('fetch', fetchMock);
+            await fetchAplusMcpServersResult('happy-token', 'machine-1', { sessionId: 's1' });
+            expect(headersOf(fetchMock)).not.toHaveProperty('x-aplus-requirements-version');
+        });
+
+        it('reads a response without the fields as a Studio that does not serve them', async () => {
+            vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ mcpServers: {} }), { status: 200 })));
+            const outcomes: unknown[] = [];
+            await fetchAplusMcpServersResult('happy-token', 'machine-1', { onRequirements: (outcome) => outcomes.push(outcome) });
+            expect(outcomes).toEqual([{ kind: 'response', status: undefined, requirements: undefined }]);
+        });
+
+        it('passes a garbled status on as no status rather than trusting it', async () => {
+            vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ mcpServers: {}, requirementsStatus: 'released', requirements: null }), { status: 200 })));
+            const outcomes: unknown[] = [];
+            await fetchAplusMcpServersResult('happy-token', 'machine-1', { onRequirements: (outcome) => outcomes.push(outcome) });
+            expect(outcomes).toEqual([{ kind: 'response', status: undefined, requirements: null }]);
+        });
+
+        it('keeps requirements independent of an MCP readiness failure on the same response', async () => {
+            vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+                mcpServers: {},
+                mcpReadiness: { status: 'mcp-config-missing', expected: ['argos'], configured: [], missing: [{ name: 'argos', reason: 'not-configured' }] },
+                requirementsStatus: 'ok',
+                requirements,
+            }), { status: 200 })));
+            const outcomes: unknown[] = [];
+            const result = await fetchAplusMcpServersResult('happy-token', 'machine-1', { onRequirements: (outcome) => outcomes.push(outcome) });
+            expect(result).toMatchObject({ ok: false, reason: 'mcp-config-missing' });
+            expect(outcomes).toEqual([{ kind: 'response', status: 'ok', requirements }]);
+        });
+
+        it('reports a failed lookup once, after the retry', async () => {
+            const fetchMock = vi.fn(async () => new Response('down', { status: 503 }));
+            vi.stubGlobal('fetch', fetchMock);
+            const outcomes: unknown[] = [];
+            await fetchAplusMcpServersResult('happy-token', 'machine-1', { onRequirements: (outcome) => outcomes.push(outcome) });
+            expect(fetchMock).toHaveBeenCalledTimes(2);
+            expect(outcomes).toEqual([{ kind: 'failed' }]);
+        });
+
+        it('reports a run with no config URL as not configured', async () => {
+            delete process.env.HAPPY_APLUS_MCP_CONFIG_URL;
+            const outcomes: unknown[] = [];
+            await fetchAplusMcpServersResult('happy-token', 'machine-1', { onRequirements: (outcome) => outcomes.push(outcome) });
+            expect(outcomes).toEqual([{ kind: 'not-configured' }]);
+        });
+
+        it('names the five-minute refresh in the lifecycle header', async () => {
+            const fetchMock = vi.fn(async () => new Response(JSON.stringify({ mcpServers: {} }), { status: 200 }));
+            vi.stubGlobal('fetch', fetchMock);
+            await fetchAplusMcpServersResult('happy-token', 'machine-1', { lifecycle: 'requirements-refresh', onRequirements: () => {} });
+            expect(headersOf(fetchMock)['X-Aplus-Mcp-Lifecycle']).toBe('requirements-refresh');
+        });
+    });
+
     describe('resolveMcpFloorServerNames', () => {
         it('protects org-registered servers but not connectors', () => {
             const names = resolveMcpFloorServerNames(
