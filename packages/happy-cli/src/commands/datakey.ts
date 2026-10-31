@@ -31,7 +31,7 @@ import { describeMachineControl, describeMachineKeyFingerprint } from '@/datakey
 import { hardenBlockingSessions, runHarden } from '@/datakey/hardenTransition'
 import { findAllHappyProcesses } from '@/daemon/doctor'
 import { rotateMachineAutomationKey } from '@/daemon/automations/machineAutomationKey'
-import { pendingMachineKeyRotationFile } from '@/datakey/machineControlIo'
+import { companyKeyRecordFile, pendingMachineKeyRotationFile } from '@/datakey/machineControlIo'
 
 const backupFile = () => join(configuration.happyHomeDir, 'access.key.legacy-backup')
 
@@ -218,6 +218,7 @@ async function handleHarden(): Promise<void> {
       })
     },
     discardPendingRotation: () => rm(pendingMachineKeyRotationFile(), { force: true }),
+    discardCompanyKeyRecord: () => rm(companyKeyRecordFile(), { force: true }),
     rotateAutomationKey: async () => rotateMachineAutomationKey(configuration.automationKeyFile),
     setStrict: async () => {
       await updateSettings((settings) => ({ ...settings, machineControl: 'strict' }))

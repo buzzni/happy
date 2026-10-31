@@ -61,6 +61,9 @@ function harness(options: {
             state.rotations.push({ machineId, request });
             if (options.rotate) await options.rotate(machineId, request);
         },
+        commitCompanyKey: async () => {},
+        readCompanyKeyRecord: async () => null,
+        writeCompanyKeyRecord: async () => {},
         randomKey: () => newKey,
         now: () => 1_000,
     };
@@ -78,7 +81,9 @@ function settle(h: ReturnType<typeof harness>, input: { mode: 'compat' | 'strict
     });
 }
 
-function pendingFrom(key: Uint8Array, overrides: Partial<PendingMachineKeyRotation> = {}): PendingMachineKeyRotation {
+type HardenRotation = Extract<PendingMachineKeyRotation, { version: 1 }>;
+
+function pendingFrom(key: Uint8Array, overrides: Partial<HardenRotation> = {}): HardenRotation {
     return {
         version: 1,
         machineId: 'machine-1',

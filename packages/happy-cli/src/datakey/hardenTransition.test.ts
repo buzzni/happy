@@ -29,6 +29,7 @@ function fakeIo(
         },
         dropNeverEscrowed: async () => { calls.push('drop-never-escrowed'); },
         discardPendingRotation: async () => { calls.push('discard-pending'); },
+        discardCompanyKeyRecord: async () => { calls.push('discard-company-key-record'); },
         rotateAutomationKey: async () => {
             calls.push('rotate-automation-key');
             return options.noAutomationKey ? 'absent' : 'rotated';
@@ -48,7 +49,14 @@ describe('runHarden', () => {
         const { io, calls } = fakeIo([compat(dataKey({ neverEscrowed: true }), true)]);
 
         expect(await runHarden(io)).toEqual({ ok: true, markedStrict: false, reset: { neverEscrowed: true, pending: true, automationKey: true } });
-        expect(calls).toEqual(['read', 'lock', 'sessions', 'read', 'drop-never-escrowed', 'discard-pending', 'rotate-automation-key', 'set-strict', 'release']);
+        expect(calls).toEqual(['read', 'lock', 'sessions', 'read', 'drop-never-escrowed', 'discard-pending', 'discard-company-key-record', 'rotate-automation-key', 'set-strict', 'release']);
+    });
+
+    it('forgets the company key record, so the first strict start trusts the key it holds then (F8 4-6)', async () => {
+        const { io, calls } = fakeIo([compat(dataKey())]);
+
+        await runHarden(io);
+        expect(calls).toContain('discard-company-key-record');
     });
 
     it('judges the files again once no daemon can write them', async () => {
@@ -64,7 +72,7 @@ describe('runHarden', () => {
         const { io, calls } = fakeIo([compat(dataKey())], { noAutomationKey: true });
 
         expect(await runHarden(io)).toEqual({ ok: true, markedStrict: false, reset: { neverEscrowed: false, pending: false, automationKey: false } });
-        expect(calls).toEqual(['read', 'lock', 'sessions', 'read', 'rotate-automation-key', 'set-strict', 'release']);
+        expect(calls).toEqual(['read', 'lock', 'sessions', 'read', 'discard-company-key-record', 'rotate-automation-key', 'set-strict', 'release']);
     });
 
     it('refuses while a daemon holds the start lock, and changes nothing', async () => {
@@ -88,7 +96,7 @@ describe('runHarden', () => {
         const { io, calls } = fakeIo([{ mode: 'strict', rawCredentials: dataKey({ neverEscrowed: true }), pendingExists: true }]);
 
         expect(await runHarden(io)).toEqual({ ok: true, markedStrict: true, reset: { neverEscrowed: true, pending: true, automationKey: true } });
-        expect(calls).toEqual(['read', 'lock', 'sessions', 'read', 'drop-never-escrowed', 'discard-pending', 'rotate-automation-key', 'set-strict', 'release']);
+        expect(calls).toEqual(['read', 'lock', 'sessions', 'read', 'drop-never-escrowed', 'discard-pending', 'discard-company-key-record', 'rotate-automation-key', 'set-strict', 'release']);
     });
 
     // A session is a detached process that outlives `happy daemon stop`. One started under compat
