@@ -10,6 +10,26 @@ const ALL_PERMISSION_MODES: readonly PermissionMode[] = [
     'default', 'acceptEdits', 'bypassPermissions', 'plan', 'read-only', 'safe-yolo', 'yolo',
 ];
 
+describe('resolveCodexExecutionPolicy under an organization ceiling (codexcli-org-requirements R10.9)', () => {
+    // Measured T11 ② (codex-cli 0.162.1): untrusted + danger-full-access asks before every command and
+    // edit; on-request + danger-full-access asks only for commands Codex rates dangerous.
+    it('asks under Happy\'s own sandbox at the clipped mode, and keeps the Codex sandbox off', () => {
+        expect(resolveCodexExecutionPolicy('default', true, 'default')).toEqual({ approvalPolicy: 'untrusted', sandbox: 'danger-full-access' });
+        expect(resolveCodexExecutionPolicy('safe-yolo', true, 'acceptEdits')).toEqual({ approvalPolicy: 'on-request', sandbox: 'danger-full-access' });
+        expect(resolveCodexExecutionPolicy('read-only', true, 'acceptEdits')).toEqual({ approvalPolicy: 'never', sandbox: 'danger-full-access' });
+    });
+
+    it('changes nothing without a ceiling below bypass', () => {
+        for (const mode of ALL_PERMISSION_MODES) {
+            for (const managed of [true, false]) {
+                expect(resolveCodexExecutionPolicy(mode, managed, null)).toEqual(resolveCodexExecutionPolicy(mode, managed));
+            }
+            // Outside Happy's sandbox the clipped mode already maps by itself.
+            expect(resolveCodexExecutionPolicy(mode, false, 'default')).toEqual(resolveCodexExecutionPolicy(mode, false));
+        }
+    });
+});
+
 describe('resolveCodexExecutionPolicy', () => {
     it('forces never + danger-full-access when sandbox is managed by Happy', () => {
         const policy = resolveCodexExecutionPolicy('default', true);

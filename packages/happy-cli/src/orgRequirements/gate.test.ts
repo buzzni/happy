@@ -220,6 +220,7 @@ describe('organization requirements session gate', () => {
         expect(legacy).toMatch(/^[0-9a-f]{64}$/);
         expect(orgAccountKey({ encryption: { type: 'legacy', secret: new Uint8Array([1, 2, 3]) } })).toBe(legacy);
         expect(orgAccountKey({ encryption: { type: 'dataKey', publicKey: new Uint8Array([1, 2, 3]) } })).not.toBe(legacy);
+        expect(orgAccountKey({ token: 't' })).toMatch(/^[0-9a-f]{64}$/);
     });
 
     it('reads the daemon project hint once and drops a malformed one', () => {

@@ -89,6 +89,9 @@ import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
 import type { PermissionMode } from '@/api/types';
 import type { ApiSessionClient } from '@/api/apiSession';
 import { resolveCodexExecutionPolicy } from './executionPolicy';
+import { consumeOrgScopeHint, createOrgRequirementsGate, isOrgRequirementsEnabled, orgAccountKey, refusedTurnEnvelopes, type OrgRequirementsGate } from '@/orgRequirements/gate';
+import type { ModelOrigin } from '@/orgRequirements/resolve';
+import { lessonStateRoot } from '@/memory/lessonSessionHost';
 import { resolveRemoteCodexPermissionMode } from './permissionMode';
 import { isSandboxFallbackNetworkLoss } from './sandboxInitFailurePolicy';
 import { readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv';
@@ -563,6 +566,11 @@ export async function runCodex(opts: {
     });
     let currentModel: string | undefined = explicitInitialModel;
     let currentEffort: ReasoningEffort | undefined = initialEffortSeed;
+    // For the organization gate (R10.2a): a reconnect pin is the earlier conversation's model, not a choice now.
+    const initialModelOrigin: ModelOrigin = opts.initialModel ?? pendingInitialModel ? 'explicit' : reconnectPin.model ? 'resume' : 'none';
+    let currentModelOrigin: ModelOrigin = initialModelOrigin;
+    /** Set once the session exists (below); read at the turn boundary, the approval boundary and the publisher. */
+    let orgGate: OrgRequirementsGate | null = null;
 
     // The model/effort the *user* pinned, advertised on the session so another
     // device can carry on with the same model. Native defaults are not a user
@@ -582,10 +590,16 @@ export async function runCodex(opts: {
     // the one that loses the pin.
     sessionModelPinPublisher.publish({ specifiesModel: false, specifiesEffort: false });
     // The session's current permission mode, readable by every client (aplus-dev-studio-desktop #2187).
-    const permissionModePublisher = createSessionPermissionModePublisher({
+    const sessionPermissionModePublisher = createSessionPermissionModePublisher({
         published: publishedSessionPermissionMode(metadata),
         updateMetadata: (update) => session.updateMetadata(update),
     });
+    // A turn runs its mode clipped to the organization ceiling; the session advertises the clipped one.
+    const permissionModePublisher = {
+        publish: (mode: PermissionMode | undefined) => sessionPermissionModePublisher.publish(
+            mode && orgGate ? orgGate.displayPermissionMode(mode) as PermissionMode : mode,
+        ),
+    };
     permissionModePublisher.publish(currentPermissionMode);
     let currentAppendSystemPrompt: string | undefined = initialAppendSystemPrompt;
     let currentSaycodeSystemPromptEnabled: boolean | undefined = initialSaycodeSystemPromptEnabled;
@@ -595,6 +609,7 @@ export async function runCodex(opts: {
         currentPermissionMode = DEFAULT_CODEX_PERMISSION_MODE;
         permissionModePublisher.publish(currentPermissionMode);
         currentModel = explicitInitialModel;
+        currentModelOrigin = initialModelOrigin;
         currentEffort = initialEffortSeed;
         sessionModelPinPublisher.reset();
         // Cached append prompt and account preference survive turn-scoped abort resets.
@@ -638,10 +653,13 @@ export async function runCodex(opts: {
 
         // Resolve model; explicit null resets to default (undefined)
         let messageModel = currentModel;
+        let messageModelOrigin = currentModelOrigin;
         if (message.meta?.hasOwnProperty('model')) {
             messageModel = message.meta.model || undefined;
+            messageModelOrigin = messageModel ? 'explicit' : 'none';
             if (!delegatedDifficultyRoutingMessage) {
                 currentModel = messageModel;
+                currentModelOrigin = messageModelOrigin;
                 logger.debug(`[Codex] Model updated from user message: ${messageModel || 'reset to default'}`);
             } else {
                 logger.debug(`[Codex] Auto-route fallback model received for this turn: ${messageModel || 'default'}`);
@@ -763,6 +781,7 @@ export async function runCodex(opts: {
                     : null;
 
         if (routed) {
+            if (routed.route.model) messageModelOrigin = 'explicit';
             messageModel = routed.route.model ?? messageModel;
             if (isSupportedCodexReasoningEffort(routed.route.effort)) {
                 messageEffort = routed.route.effort;
@@ -780,6 +799,7 @@ export async function runCodex(opts: {
             saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
             saycodePromptBlocks: messagePromptBlocks.turn,
             effort: messageEffort,
+            orgModelOrigin: messageModelOrigin,
         };
         const deferredTurn = deferredContinuation.prepare(message.content.text);
         let enqueueResult: ReturnType<typeof enqueueCodexUserText>;
@@ -934,6 +954,7 @@ export async function runCodex(opts: {
                 saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
                 saycodePromptBlocks: currentSaycodePromptBlocks,
                 effort: currentEffort,
+                orgModelOrigin: currentModelOrigin,
             }, undefined, initialPromptAttendance(delegatedAttendance, source));
             logger.debug('[START] Delivered initial prompt from HAPPY_INITIAL_PROMPT');
         },
@@ -1517,6 +1538,34 @@ export async function runCodex(opts: {
 
     permissionHandler = new CodexPermissionHandler(session);
     permissionHandler.setAttendance(turnAttendance);
+    /*
+     * Organization requirements (aplus-dev-studio-desktop specs/codexcli-org-requirements R10): read from
+     * the mcp-config answers this session already gets, enforced at the turn boundary (model, clipped
+     * mode), in the approval policy (R10.9), at the approval boundary (R10.12) and by the tool policy gate.
+     */
+    const orgScopeHint = consumeOrgScopeHint(process.env);
+    if (opts.principal.kind === 'account' && isOrgRequirementsEnabled(process.env)) {
+        const accountCredentials = opts.principal.credentials;
+        orgGate = createOrgRequirementsGate({
+            agent: 'codex',
+            happyHomeDir: lessonStateRoot(process.env) ?? configuration.happyHomeDir,
+            serverUrl: configuration.serverUrl,
+            accountKey: orgAccountKey(accountCredentials),
+            sessionId: () => session.sessionId,
+            projectHint: orgScopeHint,
+            publish: (orgRequirements) => session.updateAgentState((current) => {
+                const { orgRequirements: _previous, ...rest } = current;
+                return orgRequirements ? { ...rest, orgRequirements } : rest;
+            }),
+            refresh: async () => {
+                await fetchAplusMcpConfigSnapshot(accountCredentials.token, requireAccountMachineId(machineId), {
+                    sessionId: session.sessionId,
+                    lifecycle: 'requirements-refresh',
+                    onRequirements: (outcome) => orgGate?.onRequirements(outcome),
+                });
+            },
+        });
+    }
     // Drop any permission requests left in agent state from a previous CLI
     // process that died while a tool prompt was open — see the matching
     // call in claudeRemoteLauncher for the full rationale.
@@ -1656,6 +1705,7 @@ export async function runCodex(opts: {
                 saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
                 saycodePromptBlocks: currentSaycodePromptBlocks,
                 effort: currentEffort,
+                orgModelOrigin: currentModelOrigin,
             }), { queue: messageQueue, deferredContinuation });
         },
         now: () => Date.now(),
@@ -1733,6 +1783,11 @@ export async function runCodex(opts: {
             env: process.env,
             serverName: params.serverName,
         }),
+        declinesForCeiling: (tool) => {
+            const decline = turnAttendance?.current() === 'unattended' && (orgGate?.ceilingCaused(tool) ?? false);
+            if (decline) orgGate?.recordCeilingDenial(tool.toolName);
+            return decline;
+        },
     });
 
     /** A sub-agent list was written by this runtime: from then on an emptied list must be written too. */
@@ -1997,8 +2052,21 @@ export async function runCodex(opts: {
     const initialAplusMcpSnapshot = accountToken === null ? null : await fetchAplusMcpConfigSnapshot(
         accountToken,
         requireAccountMachineId(machineId),
-        { sessionId: session.sessionId },
+        { sessionId: session.sessionId, ...(orgGate ? { onRequirements: orgGate.onRequirements } : {}) },
     );
+    // R10.1: before the first turn — the session stops advertising bypass under a ceiling below it.
+    const dangerouslySkipPermissions = initialPermissionMode === 'yolo' || initialPermissionMode === 'bypassPermissions';
+    const applyOrgRequirements = () => {
+        if (!orgGate) return;
+        orgGate.prepare(initialPermissionMode);
+        permissionModePublisher.publish(currentPermissionMode);
+        const skip = dangerouslySkipPermissions && orgGate.bypassAllowed();
+        if ((session.getMetadata()?.dangerouslySkipPermissions ?? false) !== skip) {
+            session.updateMetadata((current) => ({ ...current, dangerouslySkipPermissions: skip }));
+        }
+    };
+    if (orgGate?.toolRules()) applyOrgRequirements();
+    orgGate?.onChange(applyOrgRequirements);
     const initialAplusMcpResult = initialAplusMcpSnapshot?.result ?? null;
     let configStatuses = initialAplusMcpResult ? mcpConfigFailureStatuses(initialAplusMcpResult) : [];
     const initialAplusMcpServers = initialAplusMcpSnapshot?.servers ?? {};
@@ -2033,6 +2101,7 @@ export async function runCodex(opts: {
             approver: () => permissionHandler,
             unattended: () => turnAttendance?.policyUnattended() ?? exitAfterFirstTurn,
             terminalPrompt: () => false,
+            ...(orgGate ? { orgRules: () => orgGate?.toolRules() ?? null, orgAudit: (entry: { tool: string; decision: string; reasonCode: string; ruleId: string }) => orgGate?.auditToolRule(entry) } : {}),
             grantTtlMs: REMOTE_GRANT_TTL_MS,
             rpc: session.rpcHandlerManager,
         });
@@ -2099,7 +2168,7 @@ export async function runCodex(opts: {
             const result = await fetchAplusMcpServersResult(
                 requireAccountToken(accountToken),
                 account,
-                { sessionId: session.sessionId, lifecycle: 'turn' },
+                { sessionId: session.sessionId, lifecycle: 'turn', ...(orgGate ? { onRequirements: orgGate.onRequirements } : {}) },
             );
             configStatuses = mcpConfigFailureStatuses(result);
             return result;
@@ -2344,6 +2413,35 @@ export async function runCodex(opts: {
             try {
                 if (!isCurrentCapacityContinuation(message.mode)) continue;
                 /*
+                 * The organization gate (codexcli-org-requirements R10.2): the batch as it would run. A
+                 * refused one never reaches Codex and still ends as a turn — the reason, then failed —
+                 * consuming its input; a clipped mode runs in its place.
+                 */
+                if (orgGate) {
+                    const org = orgGate.checkTurn({
+                        permissionMode: message.mode.permissionMode,
+                        model: message.mode.model ?? null,
+                        modelOrigin: message.mode.orgModelOrigin ?? (message.mode.model ? 'explicit' : 'none'),
+                    });
+                    if (org.kind === 'refuse') {
+                        latency?.finish('control');
+                        session.setPendingInputEvidence({ inputs: message.inputs ?? [], inputCount: message.inputCount, continuation: message.continuation });
+                        session.inputEvidence.commitPending();
+                        for (const envelope of refusedTurnEnvelopes(org.message, message.channelRequestId)) session.sendSessionProtocolMessage(envelope);
+                        messageBuffer.addMessage(org.message, 'status');
+                        emitReadyIfIdle({ pending, queueSize: () => messageQueue.size(), shouldExit, sendReady });
+                        continue;
+                    }
+                    if (org.modeClamped || org.substituteModel) {
+                        // The batch's own mode: what dispatch, a retry and a continuation of this turn read.
+                        message.mode = {
+                            ...message.mode,
+                            permissionMode: org.permissionMode as PermissionMode,
+                            ...(org.substituteModel ? { model: org.substituteModel, effort: undefined } : {}),
+                        };
+                    }
+                }
+                /*
                  * Relayed channel text is never read as session control. This is a *second* parser,
                  * on the consumer side: a channel turn reaches the queue through the session's own
                  * RPC and never passes the enqueue handler, but it does arrive here — where `/clear`
@@ -2426,6 +2524,7 @@ export async function runCodex(opts: {
                     const executionPolicy = resolveCodexExecutionPolicy(
                         message.mode.permissionMode,
                         sandboxManagedByHappy,
+                        orgGate?.approvalCeiling() ?? null,
                     );
 
                     // 샌드박스 초기화가 실패했고, 이 턴의 모드가 하필 네트워크를 잃는

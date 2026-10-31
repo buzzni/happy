@@ -31,6 +31,7 @@ function createBoundary(options: {
     providerTurnToProtocol?: Map<string, string>;
     throwOnSend?: boolean;
     autoApprove?: boolean;
+    declinesForCeiling?: (tool: { edit: boolean; toolName: string }) => boolean;
 } = {}) {
     const published: any[] = [];
     const written: string[] = [];
@@ -75,6 +76,7 @@ function createBoundary(options: {
                 ?? new Map([[PROVIDER_TURN, PROTOCOL_TURN]]),
         }),
         isAutoApproved: () => options.autoApprove === true,
+        ...(options.declinesForCeiling ? { declinesForCeiling: options.declinesForCeiling } : {}),
     });
 
     /**
@@ -195,6 +197,25 @@ describe('Codex approval boundary', () => {
         await boundary.requestApproval(OWNED);
         await boundary.answer(false);
         expect(boundary.decisions()).toEqual(['cancel']);
+    });
+
+    // codexcli-org-requirements R10.12: unattended, and only the organization ceiling made Codex ask.
+    it('declines at once, without a card or a wait, a request only the ceiling raised in an unattended turn', async () => {
+        const seen: Array<{ edit: boolean; toolName: string }> = [];
+        const boundary = createBoundary({ declinesForCeiling: (tool) => { seen.push(tool); return true; } });
+        await boundary.requestApproval(OWNED);
+        expect(boundary.decisions()).toEqual(['decline']);
+        expect(boundary.pending()).toEqual({});
+        expect(boundary.events()).toEqual([]);
+        expect(boundary.completed().call_exec_1).toMatchObject({ tool: 'CodexBash', status: 'denied', reason: 'requirement_ceiling' });
+        expect(boundary.completed().call_exec_1).not.toHaveProperty('resolution');
+        expect(seen).toEqual([{ edit: false, toolName: 'CodexBash' }]);
+    });
+
+    it('asks as before when the ceiling did not cause the request', async () => {
+        const boundary = createBoundary({ declinesForCeiling: () => false });
+        await boundary.requestApproval(OWNED);
+        expect(boundary.pending().call_exec_1).toMatchObject({ tool: 'CodexBash' });
     });
 
     it('asks nobody, and says nothing, for a call this run auto-approves', async () => {

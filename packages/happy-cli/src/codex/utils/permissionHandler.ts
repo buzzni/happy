@@ -204,6 +204,23 @@ export class CodexPermissionHandler extends BasePermissionHandler implements Pol
     }
 
     /**
+     * Declined at once, never raised (codexcli-org-requirements R10.12): recorded with
+     * `reason: 'requirement_ceiling'` and no `resolution` — nothing waited, so the D1 vocabulary of how a
+     * raised card stopped waiting does not apply.
+     */
+    declineForCeiling(toolCallId: string, toolName: string, input: unknown): void {
+        const now = Date.now();
+        this.session.updateAgentState((currentState) => ({
+            ...currentState,
+            completedRequests: {
+                ...currentState.completedRequests,
+                [toolCallId]: { tool: toolName, arguments: input, createdAt: now, completedAt: now, status: 'denied', decision: 'denied', reason: 'requirement_ceiling' },
+            },
+        } satisfies AgentState));
+        logger.debug(`${this.getLogPrefix()} Declined ${toolName} (${toolCallId}): the organization permission ceiling in an unattended turn`);
+    }
+
+    /**
      * Handle a tool permission request
      * @param toolCallId - The unique ID of the tool call
      * @param toolName - The name of the tool being called

@@ -78,6 +78,7 @@ export interface CodexApprovalBoundaryOptions {
         readonly threadId: string | null;
     };
     permissionHandler: {
+        declineForCeiling?(callId: string, toolName: string, input: unknown): void;
         handleToolCall(
             callId: string,
             toolName: string,
@@ -93,6 +94,11 @@ export interface CodexApprovalBoundaryOptions {
     runtimeId: string;
     /** True for a call into a broker this run registered itself — nothing to ask a person. */
     isAutoApproved(params: CodexApprovalRequest): boolean;
+    /**
+     * Unattended, and only the organization permission ceiling made Codex ask (codexcli-org-requirements
+     * R10.12): declined at once instead of waiting for nobody. `edit`: a file change.
+     */
+    declinesForCeiling?(tool: { edit: boolean; toolName: string }): boolean;
 }
 
 export type ReviewDecision = 'approved' | 'approved_for_session' | 'denied' | 'abort';
@@ -124,6 +130,10 @@ export function installCodexApprovalBoundary(options: CodexApprovalBoundaryOptio
     client.setApprovalHandler(async (params) => {
         if (options.isAutoApproved(params)) return 'approved';
         const { toolName, input } = codexApprovalToolCall(params);
+        if (options.declinesForCeiling?.({ edit: params.type === 'patch', toolName })) {
+            permissionHandler.declineForCeiling?.(params.callId, toolName, input);
+            return 'denied';
+        }
         /*
          * Guidance is attributed here and carried into `handleToolCall`, which publishes it once
          * the pending request exists. Nothing is published from this function, so there is no

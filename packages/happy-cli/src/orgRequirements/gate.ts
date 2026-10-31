@@ -54,10 +54,17 @@ export function consumeOrgScopeHint(env: NodeJS.ProcessEnv): string | null {
     return value && /^[A-Za-z0-9._:-]{1,128}$/.test(value) ? value : null;
 }
 
-/** A stable account identity for the cache file names, from the account's key material, never stored itself. */
-export function orgAccountKey(credentials: { encryption: { type: 'legacy'; secret: Uint8Array } | { type: 'dataKey'; publicKey: Uint8Array } }): string {
-    const material = credentials.encryption.type === 'legacy' ? credentials.encryption.secret : credentials.encryption.publicKey;
-    return createHash('sha256').update(credentials.encryption.type).update(material).digest('hex');
+/**
+ * A stable account identity for the cache file names, from the account's key material (else its token),
+ * never stored itself.
+ */
+export function orgAccountKey(credentials: { token?: string; encryption?: { type: 'legacy'; secret: Uint8Array } | { type: 'dataKey'; publicKey: Uint8Array } }): string {
+    const { encryption } = credentials;
+    const hash = createHash('sha256');
+    if (encryption?.type === 'legacy') hash.update('legacy').update(encryption.secret);
+    else if (encryption?.type === 'dataKey') hash.update('dataKey').update(encryption.publicKey);
+    else hash.update('token').update(credentials.token ?? '');
+    return hash.digest('hex');
 }
 
 export interface OrgTurnInput {
