@@ -20,6 +20,9 @@ import type { ExecSyncOptions } from 'node:child_process';
 import { logger } from '@/ui/logger';
 import { buildReconnectSessionEnvironment, RECONNECT_FRESH_LAUNCH_ENV } from '@/daemon/reconnectSessionEnv';
 import type { Metadata } from '@/api/types';
+import { rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { configuration } from '@/configuration';
 
 vi.mock('@/utils/broadKillShims', () => ({ installBroadKillShims: vi.fn() }));
 
@@ -174,6 +177,8 @@ describe('the real Codex consumer loop under organization requirements', () => {
         turnsSent = []; rpc.clear(); threadId = 'thread-before'; onConnect = null; titleRuns.length = 0; titled = true;
         sessionMetadata = { path: '/workspace/project', codexThreadId: 'thread-before' };
         vi.mocked(logger.warn).mockClear();
+        // Each scenario starts with no last known good: they share the session id that maps to it.
+        rmSync(join(configuration.happyHomeDir, 'org-requirements'), { recursive: true, force: true });
         for (const key of Object.keys(process.env)) {
             if (key.startsWith('HAPPY_RECONNECT_') || key.startsWith('HAPPY_FORK')
                 || key.startsWith('HAPPY_INITIAL_') || key.startsWith('HAPPY_CREATED_BY')) delete process.env[key];
@@ -209,13 +214,14 @@ describe('the real Codex consumer loop under organization requirements', () => {
     }
 
 
-    function stubRequirements(items: Record<string, unknown>) {
+    /** `null`: a Studio that does not serve requirements (no `requirementsStatus` in its answer). */
+    function stubRequirements(items: Record<string, unknown> | null) {
         vi.stubEnv('HAPPY_APLUS_MCP_CONFIG_URL', 'http://studio.test/api/me/mcp-config');
         const realFetch = globalThis.fetch;
         const fetchMock = vi.fn(async (url: unknown, init?: RequestInit) => {
             // Only the config lookup is faked; anything else (a WebAssembly module load) is real.
             if (!String(url).startsWith('http://studio.test/')) return realFetch(url as never, init);
-            return new Response(JSON.stringify({
+            return new Response(JSON.stringify(items === null ? { mcpServers: {} } : {
                 mcpServers: {},
                 requirementsStatus: 'ok',
                 requirements: { schemaVersion: 1, companyId: 'c1', revision: 3, modelPolicyUpdatedAt: null, issuedAt: 1, items },
@@ -275,6 +281,33 @@ describe('the real Codex consumer loop under organization requirements', () => {
         });
         expect(turnsSent).toHaveLength(1);
         expect(titleRuns).toEqual([{ model: 'gpt-6.1-sol' }]);
+    }, 60_000);
+
+    it('runs a model the router picked outside the set on the allowed one instead of refusing the turn (R10.2a Auto)', async () => {
+        stubRequirements({ 'ai.models': { kind: 'allowedSet', values: ['codex:gpt-6.1-sol'], default: null, source: 'organization' } });
+        await run(async () => {
+            const queue = queues[0]!;
+            queue.pushIsolated('routed', { permissionMode: 'yolo', model: 'gpt-5.5', orgModelOrigin: 'auto' } as never);
+            queue.close();
+        });
+        expect(turnsSent).toHaveLength(1);
+        expect(turnsSent[0].options).toMatchObject({ model: 'gpt-6.1-sol' });
+        expect(events().some((ev) => ev?.t === 'turn-end' && ev.status === 'failed')).toBe(false);
+    }, 60_000);
+
+    it('behaves exactly as before against a Studio that serves no requirements', async () => {
+        stubRequirements(null);
+        const { stub } = await run(async () => {
+            const queue = queues[0]!;
+            queue.pushIsolated('hello', { permissionMode: 'yolo', model: 'gpt-5.5' } as never);
+            queue.close();
+        });
+        expect(turnsSent).toHaveLength(1);
+        expect(turnsSent[0].options).toMatchObject({ model: 'gpt-5.5', approvalPolicy: 'never', sandbox: 'danger-full-access' });
+        expect(events().some((ev) => ev?.t === 'turn-end' && ev.status === 'failed')).toBe(false);
+        // R16: never received, so `unknown` (Desktop shows nothing for it) and nothing enforced.
+        const states = stub.updateAgentState.mock.calls.map(([update]) => (update as (state: Record<string, unknown>) => Record<string, unknown>)({}));
+        expect(states.filter((state) => 'orgRequirements' in state).map((state) => state.orgRequirements)).toEqual([{ state: 'unknown' }]);
     }, 60_000);
 
     it('behaves exactly as before when the organization releases everything', async () => {
