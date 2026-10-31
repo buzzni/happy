@@ -54,32 +54,22 @@ const machineEnvelopeSchema = z.union([
 export const automationAgentSchema = z.enum(['claude', 'codex', 'gemini', 'openclaw', 'opencode']);
 export type AutomationAgent = z.infer<typeof automationAgentSchema>;
 
+const wallClockTime = { hour: z.number().int().min(0).max(23), minute: z.number().int().min(0).max(59) };
+const calendarDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(isCalendarDate, 'not a calendar date');
+// 0 = Sunday, as Date#getDay.
+const weekdaysSchema = z.array(z.number().int().min(0).max(6)).min(1).max(7)
+  .refine((days) => new Set(days).size === days.length, 'duplicate day');
+
 export const automationScheduleSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('interval'), minutes: z.number().int().min(15) }),
   // A distinct discriminator makes older daemons reject GitHub triggers instead
   // of stripping githubTrigger and running them as ordinary scheduled prompts.
   z.object({ kind: z.literal('github'), minutes: z.literal(15) }),
-  z.object({
-    kind: z.literal('daily'),
-    hour: z.number().int().min(0).max(23),
-    minute: z.number().int().min(0).max(59),
-  }),
+  z.object({ kind: z.literal('daily'), ...wallClockTime }),
   // once/weekly are wall-clock times on the executing machine, like daily. Older
   // daemons fail to parse these kinds and skip the automation rather than run it.
-  z.object({
-    kind: z.literal('once'),
-    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(isCalendarDate, 'not a calendar date'),
-    hour: z.number().int().min(0).max(23),
-    minute: z.number().int().min(0).max(59),
-  }),
-  z.object({
-    kind: z.literal('weekly'),
-    // 0 = Sunday, as Date#getDay.
-    days: z.array(z.number().int().min(0).max(6)).min(1).max(7)
-      .refine((days) => new Set(days).size === days.length, 'duplicate day'),
-    hour: z.number().int().min(0).max(23),
-    minute: z.number().int().min(0).max(59),
-  }),
+  z.object({ kind: z.literal('once'), date: calendarDateSchema, ...wallClockTime }),
+  z.object({ kind: z.literal('weekly'), days: weekdaysSchema, ...wallClockTime }),
 ]);
 export type AutomationSchedule = z.infer<typeof automationScheduleSchema>;
 
