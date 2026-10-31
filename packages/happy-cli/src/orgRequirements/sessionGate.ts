@@ -23,6 +23,35 @@ export interface SessionOrgRequirements {
     lookup(): Promise<void>;
 }
 
+/** The organization gate's name for an ACP agent; one Studio has no key for judges as `opencode` does. */
+export function liteRuntimeAgent(agentName: string): OrgAgent {
+    return agentName === 'gemini' || agentName === 'grok' || agentName === 'openclaw' || agentName === 'opencode' ? agentName : 'opencode';
+}
+
+export type LiteRuntimeTurn = { kind: 'run'; substituteModel?: string } | { kind: 'refuse'; message: string };
+
+/**
+ * For a runtime that enforces neither a permission ceiling nor tool rules (Gemini, the ACP agents,
+ * OpenClaw — R10.7): its config lookup carries no session id, so the requirements lookup is its own,
+ * started now and awaited only by the first turn. Every turn is refused while a ceiling below bypass or
+ * a tool rule applies; otherwise only the model is judged.
+ */
+export function createLiteRuntimeTurnGate(org: SessionOrgRequirements | null): (turn: { model?: string | null }) => Promise<LiteRuntimeTurn> {
+    if (!org) return async () => ({ kind: 'run' });
+    const ready = org.lookup().catch(() => undefined);
+    return async (turn) => {
+        await ready;
+        const verdict = org.gate.checkTurn({
+            permissionMode: 'default',
+            model: turn.model ?? null,
+            modelOrigin: turn.model ? 'explicit' : 'none',
+            enforcesCeilingAndTools: false,
+        });
+        if (verdict.kind === 'refuse') return { kind: 'refuse', message: verdict.message };
+        return verdict.substituteModel ? { kind: 'run', substituteModel: verdict.substituteModel } : { kind: 'run' };
+    };
+}
+
 export function createSessionOrgRequirementsGate(input: {
     agent: OrgAgent;
     /** Null for a managed run. */

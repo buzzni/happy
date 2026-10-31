@@ -63,6 +63,7 @@ import {
 import { ConversationHistory } from '@/gemini/utils/conversationHistory';
 import { createDeferredContinuationContextConsumer } from '@/utils/deferredContinuationContext';
 import { consumeDelegatedAttendance, initialPromptAttendance, inputAttendanceFromMeta, TurnAttendanceState } from '@/api/turnAttendance';
+import { createLiteRuntimeTurnGate, createSessionOrgRequirementsGate } from '@/orgRequirements/sessionGate';
 
 
 /**
@@ -218,6 +219,13 @@ export async function runGemini(opts: {
     }
   });
   session = initialSession;
+  // Organization requirements (codexcli-org-requirements R10.7): Gemini enforces no ceiling or tool rule.
+  const orgTurn = createLiteRuntimeTurnGate(createSessionOrgRequirementsGate({
+    agent: 'gemini',
+    credentials: opts.credentials,
+    machineId,
+    session: { get sessionId() { return session.sessionId; }, updateAgentState: (update) => session.updateAgentState(update) },
+  }));
 
   const messageQueue = new MessageQueue2<GeminiMode>(hashGeminiMode);
   session.configureInputQueue(messageQueue, 'remote', false);
@@ -1013,6 +1021,17 @@ export async function runGemini(opts: {
       }
       // The batch that becomes the running turn decides its attendance by its own inputs (R10a).
       turnAttendance.startTurn({ allUnattended: message.allUnattended, channel: false });
+      // Refused as a failed turn with its reason, the way Gemini reports its own errors.
+      const org = await orgTurn({ model: message.mode.model });
+      if (org.kind === 'refuse') {
+        session.sendAgentMessage('gemini', { type: 'task_started', id: randomUUID() });
+        session.sendAgentMessage('gemini', { type: 'message', message: org.message });
+        session.sendAgentMessage('gemini', { type: 'turn_aborted', id: randomUUID() });
+        messageBuffer.addMessage(org.message, 'status');
+        sendReady();
+        continue;
+      }
+      if (org.substituteModel) message.mode = { ...message.mode, model: org.substituteModel };
 
       let previousConversationContext: string | undefined;
       let startedNewBackendSession = false;

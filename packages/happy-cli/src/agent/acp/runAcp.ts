@@ -40,6 +40,8 @@ import type { StandaloneLaunchBootstrap } from '@/daemon/standaloneLaunchProtoco
 import { SessionLaunchControl } from '@/sessionDrain/sessionLaunchControl';
 import { RuntimeProducerGate } from '@/sessionDrain/runtimeProducerGate';
 import { createAcpDrainProvider } from './acpDrainProvider';
+import { refusedTurnEnvelopes } from '@/orgRequirements/gate';
+import { createLiteRuntimeTurnGate, createSessionOrgRequirementsGate, liteRuntimeAgent } from '@/orgRequirements/sessionGate';
 
 /** Max time without any backend activity before the turn is cancelled. */
 const TURN_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
@@ -550,6 +552,13 @@ export async function runAcp(opts: {
     },
   });
   session = initialSession;
+  // Organization requirements (codexcli-org-requirements R10.7): ACP agents enforce no ceiling or tool rule.
+  const orgTurn = createLiteRuntimeTurnGate(createSessionOrgRequirementsGate({
+    agent: liteRuntimeAgent(opts.agentName),
+    credentials: opts.credentials,
+    machineId: settings.machineId,
+    session: { get sessionId() { return session.sessionId; }, updateAgentState: (update) => session.updateAgentState(update) },
+  }));
 
   if (response) {
     try {
@@ -1115,6 +1124,13 @@ export async function runAcp(opts: {
       if (!acpSessionId) {
         throw new Error('ACP session is not started');
       }
+      const org = await orgTurn({ model: typeof batch.mode.model === 'string' ? batch.mode.model : undefined });
+      if (org.kind === 'refuse') {
+        sendEnvelopes(refusedTurnEnvelopes(org.message, null));
+        session.sendSessionEvent({ type: 'ready' });
+        continue;
+      }
+      if (org.substituteModel) batch.mode = { ...batch.mode, model: org.substituteModel };
       if (runtimeGate && !runtimeGate.tryBeginPreparing()) {
         break;
       }
