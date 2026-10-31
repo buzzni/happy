@@ -318,6 +318,7 @@ import {
   injectMcpCallerGrant,
   McpCallerGrantEnvelopeConsumer,
   prepareMcpChildEnvironment,
+  resolveResumeMcpGrantSource,
 } from './mcpCallerGrantEnvelope';
 import { createSetupTokenBindingVerifier, readTrustedStudioOrigin } from './setupTokenBindingProof';
 import { createClaudeSwapSupervisor } from './claudeSwapSupervisor';
@@ -3140,14 +3141,19 @@ export async function startDaemon(): Promise<void> {
           resumingSetupTokenSessions.delete(happySessionId);
         }
         const managedAiCredentialEnvironment = resumedCredentials.environment;
-        if (options?.trustedMcpContext && options.mcpCallerGrantEnvelope) {
+        const resumeGrantSource = resolveResumeMcpGrantSource({
+          trustedMcpContext: options?.trustedMcpContext,
+          mcpCallerGrantEnvelope: options?.mcpCallerGrantEnvelope,
+          mcpConfigProjectId: options?.mcpConfigProjectId,
+        });
+        if (!resumeGrantSource.ok) {
           return {
             type: 'error',
             code: 'MCP_CALLER_GRANT_REJECTED',
             errorMessage: 'MCP caller grant has conflicting trusted and envelope sources',
           };
         }
-        const resumeMcpConfigProjectId = options?.trustedMcpContext?.mcpConfigProjectId ?? options?.mcpConfigProjectId;
+        const resumeMcpConfigProjectId = resumeGrantSource.mcpConfigProjectId;
         if (restoreManualToOrganization && (!managedAiCredentialEnvironment[SETUP_TOKEN_BINDING_ENV] || persistSetupTokenBinding(tracked, managedAiCredentialEnvironment[SETUP_TOKEN_BINDING_ENV], null).status !== 'committed')) throw new Error('CLAUDE_PERSONAL_SELECTION_PERSISTENCE_REQUIRED');
         const mcpEnvironment = prepareMcpChildEnvironment({
           environmentVariables: overlayManagedCredentialEnvironment(buildResumedSessionSpawnEnvironment({
@@ -3180,7 +3186,7 @@ export async function startDaemon(): Promise<void> {
             sessionId: happySessionId,
           }), managedAiCredentialEnvironment),
           mcpCallerGrantEnvelope: options?.mcpCallerGrantEnvelope,
-          trustedMcpCallerGrant: options?.trustedMcpContext?.mcpCallerGrant,
+          trustedMcpCallerGrant: resumeGrantSource.trustedMcpCallerGrant,
           mcpConfigProjectId: resumeMcpConfigProjectId,
           expectedConnectors: options?.expectedConnectors,
           lifecycle: 'resume',
@@ -3207,7 +3213,7 @@ export async function startDaemon(): Promise<void> {
           };
         }
         const authoritativeCheckpointProjectId = priorCheckpointContext?.projectId
-          ?? (options?.mcpCallerGrantEnvelope || options?.trustedMcpContext ? checkpointProjectId : undefined);
+          ?? (resumeGrantSource.hasAuthoritativeProject ? checkpointProjectId : undefined);
         /*
          * Lesson wiring, re-established for the resumed child.
          *
