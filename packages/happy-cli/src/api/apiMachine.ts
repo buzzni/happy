@@ -34,6 +34,8 @@ import { resolveDaemonAllowedRoot } from '../modules/common/resolveAllowedRoot';
 import { REMOTE_TERMINAL_DISABLED_ERROR, resolveMachineLockdownPolicy } from '../daemon/machineLockdownPolicy';
 import { homedir } from 'node:os';
 import { encodeBase64, decodeBase64, encrypt, decrypt, tryDecrypt } from './encryption';
+import { machineKeyTerminalCipher } from '@/daemon/terminalCipher';
+import { bindTerminal, createTerminalOpenNonceGuard, decideTerminalOpen, receiveBoundTerminalFrame, type BoundTerminal } from '@/daemon/terminalBindingSession';
 import { createTerminalOutputCoalescer } from '@/daemon/terminalOutputCoalescer';
 import {
     MACHINE_RESOURCE_METRICS_RPC,
@@ -89,6 +91,8 @@ const STRICT_VIEWER_REFUSAL = {
     code: 'STRICT_VIEWER_UNAVAILABLE',
     message: 'The remote screen is not available on a machine in strict mode',
 };
+/** What a relay terminal's open ack advertises (specs/desktop-terminal-reliability/ Phase 3). */
+const RELAY_TERMINAL_CAPS = { resume: true, snapshot: true, pagedResume: true };
 /** Upgrade counterpart of PREVIEW_BOUND_PROXY_EVENT — see openPreviewWsTunnelBound. */
 export const PREVIEW_BOUND_WS_OPEN_EVENT = 'preview-proxy-ws-open-bound';
 /**
@@ -229,6 +233,7 @@ import {
     removeDaemonTerminalSession,
 } from '@/daemon/daemonTerminalSessions';
 import { replyToTerminalResume, sendExitAfterReplay } from '@/daemon/terminalResumeReply';
+import type { DaemonTerminalEntry } from '@/daemon/daemonTerminalSessions';
 import type { ChildProcess } from 'node:child_process';
 import type { BrowserCdpPipe } from '@/daemon/browserCdpPipe';
 import { shouldReconnect } from '@/utils/lidState';
@@ -809,6 +814,8 @@ export class ApiMachineClient {
      * unwatched daemon costs exactly one idle object (specs/machine-resource-metrics).
      */
     private readonly machineResourceService = createMachineResourceService();
+    /** Remembers bound terminal opens across reconnects, so one recorded open opens one shell. */
+    private readonly terminalOpenNonceGuard = createTerminalOpenNonceGuard();
     // Live raw-TCP tunnels for preview WebSocket upgrades (previewWsProxy.ts).
     private previewWsProxy: PreviewWsProxy | null = null;
     /**
@@ -3738,6 +3745,34 @@ export class ApiMachineClient {
         this.socket?.close();
     }
 
+    /**
+     * A relay terminal's exit. A v2 terminal says it sealed first — the only close its client
+     * shows as an exit — and then in plaintext, which the relay keeps to answer a late resume.
+     */
+    private emitTerminalClosed(sessionId: string, entry: DaemonTerminalEntry, exit: { code: number; signal: number | null }): void {
+        const reason = entry.binding?.closeReason ?? entry.closeReason;
+        if (entry.binding) {
+            this.socket.emit('terminal-frame', {
+                sessionId,
+                data: entry.binding.sealOut({ kind: 'closed', code: exit.code, signal: exit.signal, lastSeq: entry.output.lastSeq(), ...(reason ? { reason } : {}) }),
+            });
+        }
+        this.socket.emit('terminal-closed', { sessionId, code: exit.code, signal: exit.signal, ...(entry.closeReason ? { reason: entry.closeReason } : {}) });
+    }
+
+    /** A v2 relay terminal's sealed frame: shared rules, relay delivery. */
+    private receiveBoundTerminalFrame(sessionId: string, entry: DaemonTerminalEntry, binding: BoundTerminal, data: string): void {
+        receiveBoundTerminalFrame({
+            sessionId,
+            entry,
+            binding,
+            data,
+            sendSealed: (sealed) => this.socket.emit('terminal-frame', { sessionId, data: sealed }),
+            sendClosed: (exit) => this.emitTerminalClosed(sessionId, entry, exit),
+            end: () => { void entry.session.terminate(); },
+        });
+    }
+
     connect() {
         const serverUrl = configuration.serverUrl.replace(/^http/, 'ws');
         logger.debug(`[API MACHINE] Connecting to ${serverUrl}`);
@@ -3909,6 +3944,7 @@ export class ApiMachineClient {
         const machineKey = this.machine.encryptionKey;
         const machineVariant = this.machine.encryptionVariant;
         const machineId = this.machine.id;
+        const terminalCipher = machineKeyTerminalCipher({ encryptionKey: machineKey, encryptionVariant: machineVariant });
         // Not attached on a managed runtime: the forwarded terminal opener reaches the host outside
         // the RPC dispatch gate, so the allowlist there would not see it. The Windows standalone
         // trial does attach it: its runtime roots every shell in the verified pty host and closes
@@ -3938,7 +3974,19 @@ export class ApiMachineClient {
                     ack({ ok: false, error: 'Failed to decrypt open params' });
                     return;
                 }
-                const opts: any = opened.value;
+                // terminal-binding-strict-design §4-2: a bound open with a terminal key is a v2
+                // terminal; the v1 open stays on compat and is refused under strict.
+                const decision = decideTerminalOpen(opened.value, {
+                    machineId,
+                    strict: configuration.machineControl === 'strict',
+                    nonceGuard: this.terminalOpenNonceGuard,
+                });
+                if (decision.kind === 'refused') {
+                    logger.debug(`[API MACHINE] terminal-open-fwd refused: ${decision.code}`);
+                    ack({ ok: false, error: decision.error, code: decision.code });
+                    return;
+                }
+                const opts: any = decision.params;
                 const auditUserId = typeof opts?.userId === 'string' ? opts.userId : 'remote-client';
                 // specs/remote-terminal-cwd-fallback/ — never let
                 // pty.spawn() chdir into a path that may not exist on
@@ -3975,6 +4023,16 @@ export class ApiMachineClient {
                     userId: auditUserId,
                     machineId,
                 });
+                const bound = decision.kind === 'bound'
+                    ? bindTerminal({ params: decision.params, nonce: decision.nonce, sessionId, caps: RELAY_TERMINAL_CAPS })
+                    : null;
+                if (bound) entry.binding = bound.terminal;
+                // A v2 frame carries its seq sealed; the relay sees only the session id.
+                const emitOutput = (seq: number, chunk: string) => {
+                    this.socket.emit('terminal-frame', entry.binding
+                        ? { sessionId, data: entry.binding.sealOut({ kind: 'output', seq, data: chunk }) }
+                        : { sessionId, seq, data: terminalCipher.seal(chunk) });
+                };
                 // Emit the fallback banner BEFORE registering pty.onData
                 // so the dim ANSI notice always lands ahead of the
                 // shell's first prompt chunk in the terminal-frame
@@ -3992,8 +4050,7 @@ export class ApiMachineClient {
                         // first real chunk would look like a duplicate.
                         const seq = entry.output.push(banner);
                         try {
-                            const data = encodeBase64(encrypt(machineKey, machineVariant, banner));
-                            this.socket.emit('terminal-frame', { sessionId, seq, data });
+                            emitOutput(seq, banner);
                             recordBytesOut(sessionId, banner.length);
                         } catch (e) {
                             logger.debug(`[API MACHINE] terminal-open-fwd banner encrypt failed: ${(e as Error).message}`);
@@ -4021,8 +4078,7 @@ export class ApiMachineClient {
                          */
                         const seq = entry.output.push(chunk);
                         try {
-                            const data = encodeBase64(encrypt(machineKey, machineVariant, chunk));
-                            this.socket.emit('terminal-frame', { sessionId, seq, data });
+                            emitOutput(seq, chunk);
                         } catch (e) {
                             logger.debug(`[API MACHINE] terminal-frame encrypt failed: ${(e as Error).message}`);
                         }
@@ -4043,7 +4099,7 @@ export class ApiMachineClient {
                     // R23: a restart close says so; Desktop shows why instead of a bare exit code.
                     sendExitAfterReplay({
                         output: entry.output,
-                        sendClosed: () => this.socket.emit('terminal-closed', { sessionId, code, signal, ...(entry.closeReason ? { reason: entry.closeReason } : {}) }),
+                        sendClosed: () => this.emitTerminalClosed(sessionId, entry, { code, signal }),
                     });
                     const closedAt = Date.now();
                     // Audit log per specs/remote-terminal/ §3 #7. Body is
@@ -4068,7 +4124,13 @@ export class ApiMachineClient {
                  * running in legacy mode all along, because nothing ever
                  * advertised these. Both are honoured below.
                  */
-                ack({ ok: true, pid: pty.pid, caps: { resume: true, snapshot: true, pagedResume: true } });
+                ack({
+                    ok: true,
+                    pid: pty.pid,
+                    caps: bound
+                        ? { ...RELAY_TERMINAL_CAPS, terminalBinding: { version: 1, proof: bound.proof } }
+                        : RELAY_TERMINAL_CAPS,
+                });
             } catch (e) {
                 const message = e instanceof Error ? e.message : String(e);
                 logger.debug(`[API MACHINE] terminal-open-fwd internal error: ${message}`);
@@ -4081,9 +4143,14 @@ export class ApiMachineClient {
         if (!this.managedHandlers) this.socket.on('terminal-frame-fwd', (msg) => {
             const { sessionId, data } = msg || {};
             const entry = getDaemonTerminalSession(sessionId);
-            if (!entry || entry.exit || typeof data !== 'string') return;
+            if (!entry || typeof data !== 'string') return;
+            if (entry.binding) {
+                this.receiveBoundTerminalFrame(sessionId, entry, entry.binding, data);
+                return;
+            }
+            if (entry.exit) return;
             try {
-                const chunk = decrypt(machineKey, machineVariant, decodeBase64(data));
+                const chunk = terminalCipher.open(data);
                 if (typeof chunk === 'string') {
                     entry.session.write(chunk);
                     recordBytesIn(sessionId, chunk.length);
@@ -4106,6 +4173,8 @@ export class ApiMachineClient {
             const { sessionId, afterSeq, maxChars, clientSocketId } = msg || {};
             if (!sessionId || typeof sessionId !== 'string') return;
             const entry = getDaemonTerminalSession(sessionId);
+            // A v2 terminal resumes through a sealed frame; this plaintext one is not its client's.
+            if (entry?.binding) return;
             /*
              * A resume is proof the client is still watching. Without this the
              * idle watchdog keeps counting from the last byte that actually
@@ -4128,7 +4197,7 @@ export class ApiMachineClient {
                     // The relay names the client socket that asked, so a reconnect
                     // mid-replay is answered afresh (the direct path resets on attach).
                     requester: typeof clientSocketId === 'string' ? clientSocketId : undefined,
-                    seal: (chunk) => encodeBase64(encrypt(machineKey, machineVariant, chunk)),
+                    seal: (chunk) => terminalCipher.seal(chunk),
                     emit: (event, payload) => this.socket.emit(event, payload as any),
                 });
             } catch (e) {
@@ -4145,7 +4214,8 @@ export class ApiMachineClient {
         this.socket.on('terminal-resize-fwd', (msg) => {
             const { sessionId, cols, rows } = msg || {};
             const entry = getDaemonTerminalSession(sessionId);
-            if (!entry || entry.exit) return;
+            // A v2 terminal resizes through a sealed frame only.
+            if (!entry || entry.exit || entry.binding) return;
             if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols <= 0 || rows <= 0) return;
             entry.session.resize(cols, rows);
         });
@@ -4154,6 +4224,9 @@ export class ApiMachineClient {
             const { sessionId } = msg || {};
             const entry = getDaemonTerminalSession(sessionId);
             if (!entry) return;
+            // terminal-binding-strict-design decision b: the relay can end a terminal anyway (it can
+            // drop the socket), so its plaintext close is honoured — and named as the relay's.
+            if (entry.binding && !entry.binding.closeReason) entry.binding.closeReason = 'relay-closed';
             // terminate(), not kill('SIGTERM'): an interactive shell ignores
             // SIGTERM, so the old close path left a live `/bin/bash -l` and its
             // pty descriptors behind on every single terminal close

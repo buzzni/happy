@@ -24,7 +24,7 @@ import { proxyHttp, PreviewProxyError } from './previewProxy';
 import { startServerProcess, StartServerError } from './startServer';
 import { stopServerProcess, StopServerError } from './stopServer';
 import { BrowserBridge, BridgeRequestError } from './browserBridge';
-import { attachTerminalWsRoute, type MachineEncryption as TerminalMachineEncryption } from './controlServerTerminalWs';
+import { attachTerminalWsRoute, type TerminalRouteMachine as TerminalMachineEncryption } from './controlServerTerminalWs';
 import { scopeErrorCode } from './sessionWriteScopeErrors';
 import type { SessionWriteScopeRuntime } from './sessionWriteScopeRuntime';
 import { SetupTokenActivitySchema } from '@slopus/happy-wire';
