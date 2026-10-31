@@ -912,17 +912,27 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             let providerEnded = false;
             /** Aborted with `providerEnded`: an input wait this generation left behind frees the queue's single waiter slot. */
             const generationEnded = new AbortController();
-            const admitTurn = async () => {
+            const admitTurn = async (message: { channelRequestId?: string } | null) => {
                 const binding = personalFallback?.identity() ? undefined : providerActivityBinding;
                 if (!binding) return true;
-                const sessionId = session.client.sessionId;
-                if (!sessionId) throw new Error('SETUP_TOKEN_START_SESSION_MISSING');
-                const admitted = await waitForSetupTokenStart({
-                    request: (requestId, signal) => requestSetupTokenStart(sessionId, binding, requestId, signal),
-                    signal: AbortSignal.any([controller.signal, generationEnded.signal]),
-                    notify: () => session.client.sendSessionEvent({ type: 'message', message: '계정의 작업 시작 한도에 도달해 기다리고 있습니다. 여유가 생기면 이어서 실행합니다.' }),
-                });
-                return admitted && !providerOptionsStale();
+                try {
+                    const sessionId = session.client.sessionId;
+                    if (!sessionId) throw new Error('SETUP_TOKEN_START_SESSION_MISSING');
+                    const admitted = await waitForSetupTokenStart({
+                        request: (requestId, signal) => requestSetupTokenStart(sessionId, binding, requestId, signal),
+                        signal: AbortSignal.any([controller.signal, generationEnded.signal]),
+                        notify: () => session.client.sendSessionEvent({ type: 'message', message: '계정의 작업 시작 한도에 도달해 기다리고 있습니다. 여유가 생기면 이어서 실행합니다.' }),
+                    });
+                    return admitted && !providerOptionsStale();
+                } catch (error) {
+                    // A later turn's rejection never reaches the launch catch (claudeRemote ends the input), so report it here.
+                    launchFailure = describeClaudeLaunchFailure(error);
+                    if (message) {
+                        messageQueue.enqueue(pendingRequestItem(message.channelRequestId ?? null));
+                        if (message.channelRequestId) messageQueue.enqueue(finalAnswerItem(launchFailure));
+                    }
+                    throw error;
+                }
             };
 
             abortFuture = new Future<void>();
@@ -1066,7 +1076,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // becomes the running turn.
 
                             preparingBatch = p; // A local-mode switch must retain input still waiting for admission.
-                            if (!await admitTurn()) { if (!controller.signal.aborted) pending = p; drain?.releaseClaim(); return null; }
+                            if (!await admitTurn(p)) { preparingBatch = null; if (!controller.signal.aborted) pending = p; drain?.releaseClaim(); return null; }
                             session.turnAttendance?.startTurn({ allUnattended: p.allUnattended, channel: p.channelRequestId !== undefined });
                             lastTurnChannel = Boolean(p.channelRequestId);
                             lastTurnCommand = isCommandText(p.message);
@@ -1181,7 +1191,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             const due = transientRetry.takeDue();
                             // Cancelled rather than due: keep waiting for the user.
                             if (!due) continue;
-                            if (!await admitTurn()) return null;
+                            if (!await admitTurn(null)) return null;
                             session.client.noteTransientRetryDispatched();
                             if (drain && !drain.claimTurn()) { exitReason = 'exit'; return null; }
                             await messageQueue.flush();
@@ -1293,7 +1303,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // inherits an id.
 
                             preparingBatch = msg;
-                            if (!await admitTurn()) { if (!controller.signal.aborted) pending = msg; drain?.releaseClaim(); return null; }
+                            if (!await admitTurn(msg)) { preparingBatch = null; if (!controller.signal.aborted) pending = msg; drain?.releaseClaim(); return null; }
                             session.turnAttendance?.startTurn({ allUnattended: msg.allUnattended, channel: msg.channelRequestId !== undefined });
                             lastTurnChannel = Boolean(msg.channelRequestId);
                             lastTurnCommand = isCommandText(msg.message);
