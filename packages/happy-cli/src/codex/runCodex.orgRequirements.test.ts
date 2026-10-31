@@ -60,6 +60,15 @@ vi.mock('@/utils/MessageQueue2', async (importOriginal) => {
     return { ...original, MessageQueue2: Recorded };
 });
 
+/** The off-turn title runs a provider query of its own: which model it was handed. */
+const titleRuns: { model?: string }[] = [];
+vi.mock('./codexOffTurnTitle', async (importOriginal) => ({
+    ...await importOriginal<typeof import('./codexOffTurnTitle')>(),
+    isOffTurnTitleEligible: () => true,
+    createCodexExecTitleRunner: () => async (input: { model?: string }) => { titleRuns.push({ model: input.model }); return null; },
+}));
+let titled = true;
+
 /** What the fake app-server client did, so a scenario can assert on real effects. */
 const clientLog: string[] = [];
 let threadId: string | null = 'thread-before';
@@ -143,7 +152,7 @@ function sessionStub() {
         onUserMessage: vi.fn(),
         onFileEvent: vi.fn(),
         on: vi.fn(),
-        hasTitle: vi.fn(() => true),
+        hasTitle: vi.fn(() => titled),
         skipExistingMessages: vi.fn(),
         capRuntimeProcessedSeq: vi.fn(),
         suppressNextArchiveSignal: vi.fn(),
@@ -162,7 +171,7 @@ function sessionStub() {
 describe('the real Codex consumer loop under organization requirements', () => {
     beforeEach(() => {
         queues.length = 0; clientLog.length = 0; protocolMessages.length = 0; sessionEvents.length = 0;
-        turnsSent = []; rpc.clear(); threadId = 'thread-before'; onConnect = null;
+        turnsSent = []; rpc.clear(); threadId = 'thread-before'; onConnect = null; titleRuns.length = 0; titled = true;
         sessionMetadata = { path: '/workspace/project', codexThreadId: 'thread-before' };
         vi.mocked(logger.warn).mockClear();
         for (const key of Object.keys(process.env)) {
@@ -253,6 +262,19 @@ describe('the real Codex consumer loop under organization requirements', () => {
         });
         expect(turnsSent).toHaveLength(1);
         expect(turnsSent[0].options).toMatchObject({ model: 'gpt-6.1-sol', approvalPolicy: 'never' });
+    }, 60_000);
+
+    it('titles a new chat only on the model its checked turn runs, never on a refused or unchosen one', async () => {
+        stubRequirements({ 'ai.models': { kind: 'allowedSet', values: ['codex:gpt-6.1-sol'], default: null, source: 'organization' } });
+        titled = false;
+        await run(async () => {
+            const queue = queues[0]!;
+            queue.pushIsolated('denied model', { permissionMode: 'yolo', model: 'gpt-5.5', orgModelOrigin: 'explicit' } as never);
+            queue.pushIsolated('no model', { permissionMode: 'yolo' } as never);
+            queue.close();
+        });
+        expect(turnsSent).toHaveLength(1);
+        expect(titleRuns).toEqual([{ model: 'gpt-6.1-sol' }]);
     }, 60_000);
 
     it('behaves exactly as before when the organization releases everything', async () => {

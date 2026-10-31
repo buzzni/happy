@@ -84,6 +84,15 @@ export function stripModelSelectionEnv(env: Record<string, string | undefined>, 
     return [...removed];
 }
 
+/**
+ * The model an off-turn chat title runs on (R10.2). The title job starts when a message is queued, before
+ * the turn is checked: the model it was queued with may be the runtime default or a model the organization
+ * refuses. While models are restricted, only the launched query's model — the checked turn's — titles.
+ */
+export function orgTitleModel(gate: OrgRequirementsGate | null, requested: string | undefined, launched: string | undefined): string | undefined {
+    return gate?.restrictsModels() ? launched : requested ?? launched;
+}
+
 const BYPASS_FLAGS = new Set(['--dangerously-skip-permissions', '--allow-dangerously-skip-permissions']);
 
 export function createClaudeOrgRequirements(gate: OrgRequirementsGate, deps: {

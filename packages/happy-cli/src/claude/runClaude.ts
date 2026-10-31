@@ -131,7 +131,7 @@ import { ClaudeStandaloneDrain } from './claudeStandaloneDrain';
 import { createClaudeDrainProvider } from './claudeDrainProvider';
 import { createSessionOrgRequirementsGate } from '@/orgRequirements/sessionGate';
 import { orgRequirementsDirectory } from '@/orgRequirements/store';
-import { createClaudeOrgRequirements, stripModelSelectionEnv, type OrgModelRequest } from './claudeOrgRequirements';
+import { createClaudeOrgRequirements, orgTitleModel, stripModelSelectionEnv, type OrgModelRequest } from './claudeOrgRequirements';
 
 /**
  * How long a confirmed initial prompt waits for its acknowledgement before the
@@ -885,7 +885,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // Titles a new chat outside the user's turn with claudeRemote's own launch
     // options (see claudeOffTurnTitle). Managed runs, process sandboxes (scoped
     // or mandatory policy) and run-once hosts keep the in-turn instruction.
-    const offTurnTitleBridge = createClaudeTitleBridge();
+    const offTurnTitleBridge = createClaudeTitleBridge({ titleModel: (requested, launched) => orgTitleModel(orgGate, requested, launched) });
     const offTurnTitleEligible = managedStartup === null && !scopeLaunch && !exitAfterFirstTurn
         && sandboxPolicyMode !== 'mandatory';
     const offTurnTitle = createOffTurnTitleJob({

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createOrgRequirementsGate, type OrgRequirementsGate } from '@/orgRequirements/gate';
 import type { TurnAttendance } from '@/api/turnAttendance';
-import { createClaudeOrgRequirements, stripModelSelectionEnv } from './claudeOrgRequirements';
+import { createClaudeOrgRequirements, orgTitleModel, stripModelSelectionEnv } from './claudeOrgRequirements';
 import type { EnhancedMode } from './loop';
 
 const doc = (items: Record<string, unknown>) => ({ schemaVersion: 1, companyId: 'c1', revision: 2, modelPolicyUpdatedAt: null, issuedAt: 1, items });
@@ -58,6 +58,16 @@ describe('Claude runner adapter of the organization gate', () => {
         expect(claude.declinesForCeiling({ edit: false })).toBe(true);
         claude.checkTurn(mode({ permissionMode: 'default' }));
         expect(claude.declinesForCeiling({ edit: true })).toBe(false);
+    });
+
+    it('titles a new chat with the model its checked turn runs while the organization restricts models', () => {
+        // No document: the model the message asked for, as before.
+        expect(orgTitleModel(gate, 'opus', 'claude-opus-5-5')).toBe('opus');
+        expect(orgTitleModel(null, undefined, 'claude-opus-5-5')).toBe('claude-opus-5-5');
+        gate.onRequirements({ kind: 'response', status: 'ok', requirements: doc({ 'ai.models': { kind: 'allowedSet', values: ['claude:claude-sonnet-5-5'], default: null, source: 'organization' } }) });
+        // Default (`opus` seed) or a refused explicit pick: never the queued model, only the launched, checked one.
+        expect(orgTitleModel(gate, 'opus', 'sonnet-runtime')).toBe('sonnet-runtime');
+        expect(orgTitleModel(gate, 'claude-opus-5-5', 'sonnet-runtime')).toBe('sonnet-runtime');
     });
 
     it('removes the variables that pick a model, except on a Z.AI runtime whose tier mapping the daemon set (R10.8)', () => {
