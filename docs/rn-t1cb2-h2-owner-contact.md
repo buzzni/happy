@@ -161,3 +161,83 @@ depth≥1 broker 테스트의 chat lookup 기대를 갱신했다. 구현 전 2�
 테스트 1건씩만 실패했다. 관련 7파일(`sessionOwnerContactHost/Local/Contact`, `sessionAgentBroker`, `startHappyServer`,
 `childEnv`, `agentCallerLaunches`의 `.test.ts`) 159건 통과·1건 기존 skip, `tsc --noEmit` 통과. 실소켓 테스트는 이 세션
 셸에서 listen이 가능해 직접 실행했다.
+
+## operation별 Desktop 고정 (2026-10-31, D4 교차 리뷰 R3-02)
+
+p0a §4.5 다중 Desktop 단락: "유효 contact 하나를 operation 시작 시 선택·고정하고, timeout에 다른 instance로
+재송신하지 않고 기존 operation/localId를 조회한다". 이전 `call()`은 호출마다 lookup 후 desktopInstanceId 정렬 첫
+contact를 골라, spawn은 desktop-z로, 뒤에 후보로 추가된 desktop-a가 앞서면 같은 operation의 status는 desktop-a로
+갔다. Desktop main의 생성 journal·localId 중복 판정은 instance별이라 원래 Desktop의 결과를 회수할 수 없었다.
+
+- **키는 wire에 이미 있는 값이다.** `spawn-owned-child`·`owned-child-status`는 `payload.operationId`,
+  `prompt-own-session`은 `(targetSessionId, localId)`. wire(schema·fixture)는 바꾸지 않았다.
+- **고정 시점은 실제 송신 직전이다.** 처음 고른 instance를 기록하고, exchange를 시작하면 그 기록이 확정된다.
+  timeout·응답 검증 실패 뒤에도 확정 기록은 남는다. lookup·`currentContact`·서명 단계에서 실패해 어느 Desktop에도
+  보내지 않았으면 기록을 지워, 다음 시도는 기존 규칙으로 고른다. 같은 operation의 동시 호출은 진행 중 기록을 공유한다.
+- **고정 Desktop이 유효 contact가 아니면 `owner-contact-unavailable`이다.** 철회·만료·서명 불일치·`currentContact`
+  거짓이면 다른 후보가 있어도 보내지 않는다. 호출자는 같은 operation으로 나중에 다시 조회한다. 같은 instance의
+  갱신된 contact(새 epoch)는 그대로 쓴다. 새 Desktop으로 재결속하지 않는다.
+- **기록은 contact(binding) 수명 동안 host 메모리에만 있다.** broker IPC와 chat socket은 같은 contact를 쓰므로
+  기록을 공유한다.
+- **송신했지만 끝나지 않은 operation은 지우지 않는다(PIN-R1-01).** RPC 하나가 끝났다고 Desktop의 operation이 끝난
+  것은 아니다. 지운 키를 다시 보면 과거 operation인지 알 수 없어 새 후보에 재결속하게 되므로, 기록은 검증된 응답에서
+  종결을 관측했을 때만 정리 대상이 된다. 종결은 `allowed` 응답의 prompt 저장 receipt뿐이다.
+  `pending`·`parked`, `unknown`·`unavailable`·`not_owned`, timeout, 응답 검증 실패는 종결이 아니다. `localid_conflict`는
+  wire에 별도 결과가 없어(불일치는 `unknown`) 종결로 보지 않는다.
+- **owned child의 기록은 host 수명 동안 남긴다(PIN-R2-01).** host가 `started`·`failed`를 검증했어도 그 receipt가 CLI에
+  닿았는지, CLI가 lineage를 기록했는지는 모른다(local socket이 먼저 닫히면 receipt는 버려진다). 이를 회수하는 status·
+  `--resume-op`에 답할 수 있는 것은 원래 Desktop의 생성 journal뿐이므로, `spawn-owned-child`·`owned-child-status` 기록은
+  종결 응답 뒤에도, 24시간이 지나도 정리하지 않는다.
+- **prompt 저장 receipt는 종결로 본다.** Desktop main은 같은 localId 재시도에서 먼저 target 세션의 서버 메시지를 localId로
+  찾아(`existing()`) 본문을 비교한 뒤 저장 receipt나 `localid_conflict`를 돌려준다. 저장 행은 서버에 있으므로 receipt를
+  잃은 뒤의 재시도가 다른 유효 Desktop으로 가도 같은 receipt를 받고 다시 저장하지 않는다. 그래서 저장 receipt 뒤의
+  prompt 기록은 정리해도 된다. receipt가 없는 prompt(unknown·timeout 등)는 원래 Desktop의 시도 기록이 판단에 쓰이므로
+  남긴다.
+- **정리와 상한(PIN-R1-02).** 상한은 512건이다. 근거: Desktop CLI의 spawn 예산은 host(세션)당 6시간 창에 최대
+  32건(`cli/domain/spawnBudget.ts`의 `AGENT_SPAWN_BUDGET_MAX`·`SPAWN_BUDGET_WINDOW_MS`)이라, 정리되지 않는 child 기록만으로
+  상한을 채우려면 최대 예산으로 쉬지 않고 4일(하루 128건)이 걸린다. 종결된 prompt는 정리되므로 상한을 차지하는 것은
+  child와 receipt 없는 prompt다. 항목 하나는 수백 바이트라 메모리는 문제가 아니다. 새 키를 넣을 때 진행 중이 아닌 종결 항목만, 마지막 사용 뒤 24시간이
+  지났거나 상한에 닿은 경우 오래된 것부터 지운다. 미송신 항목은 마지막 호출이 끝날 때 지워진다. 정리한 뒤에도 상한이면
+  새 operation은 송신 없이 `owner-contact-unavailable`이고, 이미 기록된 operation의 호출은 계속 받는다. 호출의 정리는
+  작업이 끝날 때와 20초 기한이 끝날 때 중 먼저 오는 쪽에서 한 번 한다. adapter가 abort를 무시해 작업이 끝나지 않아도
+  진행 중 수가 남지 않는다. 기한이 지난 뒤의 작업은 송신 전 abort 검사에 걸려 보내지 않는다.
+- **한계: host 재시작·재개 뒤에는 기록이 없다.** 새 binding의 첫 호출은 기존 정렬 규칙으로 고르므로, 그 사이 정렬상
+  앞선 Desktop이 생겼으면 이전 operation의 status가 그 operation의 journal이 없는 Desktop으로 갈 수
+  있다. 정리는 저장 receipt를 받은 prompt만 지우므로 host 수명 안에서는 이 재결속이 생기지 않는다. 그 대가로 child와
+  receipt 없는 prompt가 512건 쌓이면 그 host의 새 spawn·prompt는 host 재시작 전까지 unavailable이다. 4일 넘게 최대
+  예산으로 spawn하는 host가 실제로 있으면 상한을 다시 본다. 영속 기록이나 Desktop 정보를
+  wire·CLI journal에 싣는 일은 wire 변경이라 하지 않았다.
+- **고정하지 않는 operation**: `lookup-readable-sessions`·`read-session`은 instance별 journal 없이 현재 상태를 읽는
+  조회라 어느 유효 Desktop이 답해도 같다. `resume-own-session`·`reply-own-permission`·`abort-own-turn`은 wire에
+  operation 식별자가 없어 호출 하나가 operation 하나이고, 결과 unknown 뒤에는 같은 요청을 다른 Desktop에 재송신하는
+  대신 호출자가 read로 상태를 확인한다. target만으로 묶으면 무관한 operation까지 한 Desktop에 묶이므로 키로 쓰지 않는다.
+
+검증: `sessionOwnerContact.test.ts`에 5건(spawn→status 고정, 고정 Desktop 철회 시 다른 Desktop 0회·복구 후 같은
+Desktop, prompt 같은 localId 재시도 고정·다른 localId는 새 선택, 다른 operation·다른 operationId 영향 없음, 미송신
+선택은 고정하지 않음). 구현 전 앞의 3건 실패. 역검증 3건: 송신 확정 표시를 지우면 고정 3건, 고정 instance 대신
+첫 후보로 failover하면 철회 테스트, 미송신 기록 삭제를 지우면 미송신 테스트가 각각 실패했다. `sessionOwnerContact`·
+`sessionOwnerContactHost`·`sessionOwnerContactLocal` 테스트 68건 통과, `tsc --noEmit` 통과.
+
+PIN-R1 반영 검증: 6건 추가. 상한을 채운 다른 operation 뒤에도 pending operation 고정 유지, 24시간 뒤 timeout operation
+고정 유지, 종결 child·prompt receipt만 정리 대상, 모든 칸이 미종결이면 새 operation 거부·기존 operation 허용, abort를 무시한
+adapter에서 기한 뒤 미송신 선택 해제. 상한 테스트는 `pinLimit` 주입(8)으로 같은 경계를 빠르게 검증한다(기본 512). 기한을
+fake timer로 검증하려고 `AbortSignal.timeout`을 해제되는 일반 timer로 바꿨다(별도 구조 커밋). 구현 전 4건 실패.
+역검증 6건: 정리의 종결 조건 제거, 상한 거부 제거, 기한 경로의 해제 제거, child 종결 판정을 항상 거짓·항상 참으로,
+prompt 종결 판정을 거짓으로 바꾸면 해당 테스트가 각각 실패했다. 관련 3파일 74건 통과, `tsc --noEmit` 통과.
+
+PIN-R2 반영 검증: fixture를 Desktop별 생성 journal로 나눴다. journal이 없는 Desktop의 status는 `unknown`
+(`operation-not-found`)이고, 저장 prompt는 서버 공유다. 이전 "종결 뒤 정리되면 다른 Desktop으로 간다" 테스트는 "started 검증
+뒤 receipt 유실 → 25시간 경과·다른 키(상한의 두 배)로 압박 → 같은 operation status가 원래 Desktop에서 `started`"로 바꿨다.
+prompt receipt 테스트는 정리 뒤 다른 Desktop에서 같은 receipt를 받는지까지 확인한다. 공유 상태로 상한을 채우던 테스트는
+압박 키를 종결 prompt로 바꿨다. 구현 전 새 테스트 1건 실패. 역검증 3건: child 종결을 다시 정리 대상으로, prompt 종결을
+거짓으로, 정리의 종결 조건 제거를 각각 넣으면 해당 테스트가 실패했다. 관련 3파일 74건 통과, `tsc --noEmit` 통과.
+
+PIN-R3 반영(#1031 리뷰 `pin-table-filled-by-receipt-less-prompts`): Desktop에 아무것도 남기지 않는 응답도 종결로 본다.
+검증된 `not_owned` prompt는 저장 전에 거부된 것이고(p0a §5.1), 이 host가 spawn을 보낸 적 없는 operation의
+`owned-child-status`가 `allowed`가 아니면 회수할 journal이 없다. 이전에는 둘 다 기록을 남겨, 다른 소유자의 형제에게
+새 localId로 prompt가 512번 거부되면(prompt에는 예산이 없고 `--local-id` 생략 시 매번 새 UUID) 그 host의 새 spawn·prompt가
+재시작 전까지 unavailable이었다. 같은 operationId로 spawn을 보내면 그 기록은 다시 미종결이 되어 host 수명 동안 남는다.
+`unknown`·`unavailable` prompt와 timeout은 원래 Desktop의 시도 기록이 판단에 쓰이므로 그대로 남긴다. 검증: 3건 추가
+(거부 prompt로 상한의 두 배를 채운 뒤 prompt·spawn 허용, spawn 없는 status로 채운 뒤 spawn 허용, unknown status 뒤 spawn한
+child의 고정 유지). 구현 전 앞의 2건 실패. 역검증 2건: `not_owned` 종결 제거, spawn 송신 시 미종결 복원 제거가 각각 해당 테스트를
+실패시켰다.
