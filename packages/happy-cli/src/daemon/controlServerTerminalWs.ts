@@ -43,7 +43,7 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { WebSocketServer, type WebSocket, type RawData } from 'ws';
 import { logger } from '@/ui/logger';
-import { decodeBase64, encodeBase64, decrypt, encrypt } from '@/api/encryption';
+import { decodeBase64, decrypt } from '@/api/encryption';
 import { validatePath } from '@/modules/common/pathSecurity';
 import { decideTerminalCwd, formatCwdFallbackBanner } from './decideTerminalCwd';
 import { createPtySession, type PtySession } from './remoteTerminal';
@@ -58,6 +58,7 @@ import {
 } from './daemonTerminalSessions';
 import { createTerminalOutputCoalescer } from './terminalOutputCoalescer';
 import { replyToTerminalResume, resetPagedResume, sendExitAfterReplay } from './terminalResumeReply';
+import { machineKeyTerminalCipher, type MachineEncryption } from './terminalCipher';
 
 export interface TerminalWsRoute {
   wss: WebSocketServer;
@@ -68,10 +69,7 @@ export interface TerminalWsRoute {
   close: () => Promise<void>;
 }
 
-export interface MachineEncryption {
-  encryptionKey: Uint8Array;
-  encryptionVariant: 'legacy' | 'dataKey';
-}
+export type { MachineEncryption };
 
 /**
  * How long a direct terminal survives with no WebSocket attached. Same value
@@ -329,7 +327,7 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
         const emitFrame = (chunk: string) => {
           const seq = entry.output.push(chunk);
           try {
-            const encoded = encodeBase64(encrypt(machineEncryption.encryptionKey, machineEncryption.encryptionVariant, chunk));
+            const encoded = machineKeyTerminalCipher(machineEncryption).seal(chunk);
             sendOn(terminal.ws, { data: { event: 'terminal-frame', sessionId, seq, data: encoded } });
           } catch (e) {
             logger.debug(`[CONTROL SERVER] /terminal frame encrypt failed: ${(e as Error).message}`);
@@ -446,7 +444,7 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
             closeReason: terminal.entry.closeReason,
             afterSeq: data.afterSeq,
             maxChars: data.maxChars,
-            seal: (chunk) => encodeBase64(encrypt(machineEncryption.encryptionKey, machineEncryption.encryptionVariant, chunk)),
+            seal: (chunk) => machineKeyTerminalCipher(machineEncryption).seal(chunk),
             emit: (replyEvent, payload) => {
               // A held exit can come due after this connection lost the terminal:
               // then the grace window or the newer connection owns it.
@@ -470,7 +468,7 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
         if (!machineEncryption) return;
         let chunk: string | null = null;
         try {
-          chunk = decrypt(machineEncryption.encryptionKey, machineEncryption.encryptionVariant, decodeBase64(data.data));
+          chunk = machineKeyTerminalCipher(machineEncryption).open(data.data) as string | null;
         } catch {
           return;
         }
