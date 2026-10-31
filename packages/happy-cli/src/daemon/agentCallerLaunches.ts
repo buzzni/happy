@@ -60,6 +60,19 @@ export function createAgentCallerLaunches(deps: {
             || (confirmed || session.happySessionId !== undefined ? session.happySessionId !== sessionId : false)) throw new Error('caller-not-running');
         return session;
     }
+    /** The binding the daemon still vouches for: a confirmed live launch under the identity it was issued to. */
+    async function vouched(sessionId: string): Promise<Caller> {
+        const entry = bound.get(sessionId);
+        if (!deps.enabled || !entry) throw new Error('caller-unavailable');
+        // Main may ask before the session-started webhook; that is pending, not a stale launch.
+        const pending = deps.trackedByPid(entry.pid);
+        if (pending?.pid === entry.pid && pending.happySessionId === undefined && deps.live(pending)) throw new Error('caller-pending');
+        try { launch(sessionId, entry.pid, true); } catch (error) { bound.delete(sessionId); throw error; }
+        const identity = await deps.identity().catch(() => null);
+        if (bound.get(sessionId) !== entry) throw new Error('caller-changed');
+        if (!sameIdentity(identity, entry.identity)) { bound.delete(sessionId); throw new Error('identity-changed'); }
+        return { ...entry.caller };
+    }
     return {
         /** At spawn: one capability per launch, written once to an extra stdio pipe the host closes before its provider starts. */
         prepareLaunch(input: { cwd: string; agentEnvironment?: TrackedSession['agentEnvironment'] }) {
@@ -124,16 +137,7 @@ export function createAgentCallerLaunches(deps: {
         /** agent-caller-binding for non-journal sources. Never reconstructs a binding. */
         async query(raw: unknown) {
             const input = z.object({ sessionId: ownershipId, nonce: z.string().min(16).max(256) }).strict().parse(raw);
-            const entry = bound.get(input.sessionId);
-            if (!deps.enabled || !entry) throw new Error('caller-unavailable');
-            // Main may ask before the session-started webhook; that is pending, not a stale launch.
-            const pending = deps.trackedByPid(entry.pid);
-            if (pending?.pid === entry.pid && pending.happySessionId === undefined && deps.live(pending)) throw new Error('caller-pending');
-            try { launch(input.sessionId, entry.pid, true); } catch (error) { bound.delete(input.sessionId); throw error; }
-            const identity = await deps.identity().catch(() => null);
-            if (bound.get(input.sessionId) !== entry) throw new Error('caller-changed');
-            if (!sameIdentity(identity, entry.identity)) { bound.delete(input.sessionId); throw new Error('identity-changed'); }
-            return { version: 1 as const, nonce: input.nonce, caller: { ...entry.caller } };
+            return { version: 1 as const, nonce: input.nonce, caller: await vouched(input.sessionId) };
         },
     };
 }
