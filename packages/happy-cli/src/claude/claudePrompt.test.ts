@@ -25,10 +25,10 @@ describe('buildClaudeSystemPromptOptions', () => {
     expect(buildClaudeSystemPromptOptions({ ...input, saycodeSystemPromptEnabled: undefined })).toEqual(expected);
   });
 
-  it('removes only Saycode-owned blocks when disabled, keeping the chat title instruction', () => {
+  it('keeps only the chat title and the user-selected orchestrator when disabled', () => {
     expect(buildClaudeSystemPromptOptions({ ...input, saycodeSystemPromptEnabled: false })).toEqual({
       customSystemPrompt: 'USER CUSTOM\n\nCHAT TITLE',
-      appendSystemPrompt: 'CLIENT APPEND\n\nCHAT TITLE\n\nAGENT ORCHESTRATION: happy agent spawn\n\nORCHESTRATOR\n\nWORKER DELEGATION\n\nCONNECTOR FACTS',
+      appendSystemPrompt: 'CLIENT APPEND\n\nCHAT TITLE\n\nORCHESTRATOR',
     });
   });
 });
@@ -45,36 +45,17 @@ describe('buildClaudeSystemPromptOptions with per-block overrides', () => {
     connectorGuidance: 'CONNECTOR FACTS',
   };
 
-  it('keeps only the overridden-on block when the legacy value is off', () => {
+  it('lets the master switch alone decide, whatever an older client overrides', () => {
     expect(buildClaudeSystemPromptOptions({
       ...input,
       saycodeSystemPromptEnabled: false,
-      saycodePromptBlocks: { coAuthoredCredit: true },
-    })).toEqual({
-      customSystemPrompt: 'USER CUSTOM\n\nCHAT TITLE\n\nSAYCODE BASE',
-      appendSystemPrompt: 'CLIENT APPEND\n\nCHAT TITLE\n\nSAYCODE BASE\n\nAGENT ORCHESTRATION: happy agent spawn\n\nORCHESTRATOR\n\nWORKER DELEGATION\n\nCONNECTOR FACTS',
-    });
-  });
-
-  it('removes child-session routing only when its block is explicitly off', () => {
-    expect(buildClaudeSystemPromptOptions({
-      ...input,
-      saycodeSystemPromptEnabled: false,
-      saycodePromptBlocks: { agentOrchestration: false },
-    }).appendSystemPrompt).toBe(
-      'CLIENT APPEND\n\nCHAT TITLE\n\nORCHESTRATOR\n\nWORKER DELEGATION\n\nCONNECTOR FACTS',
-    );
-  });
-
-  it('drops only the overridden-off block when the legacy value is on', () => {
+      saycodePromptBlocks: { coAuthoredCredit: true, agentOrchestration: true, workerDelegation: true },
+    })).toEqual(buildClaudeSystemPromptOptions({ ...input, saycodeSystemPromptEnabled: false }));
     expect(buildClaudeSystemPromptOptions({
       ...input,
       saycodeSystemPromptEnabled: true,
-      saycodePromptBlocks: { workerDelegation: false },
-    })).toEqual({
-      customSystemPrompt: 'USER CUSTOM\n\nCHAT TITLE\n\nSAYCODE BASE',
-      appendSystemPrompt: 'CLIENT APPEND\n\nCHAT TITLE\n\nSAYCODE BASE\n\nAGENT ORCHESTRATION: happy agent spawn\n\nORCHESTRATOR\n\nCONNECTOR FACTS' + '\n\n' + SAYCODE_API_GATEWAY_PROMPT,
-    });
+      saycodePromptBlocks: { workerDelegation: false, agentOrchestration: false },
+    })).toEqual(buildClaudeSystemPromptOptions({ ...input, saycodeSystemPromptEnabled: true }));
   });
 });
 
@@ -106,6 +87,7 @@ it('includes active checkpoint facts with client instructions and leaves inactiv
   const custom = buildClaudeSystemPromptOptions({ saycodeSystemPrompt: '', customSystemPrompt: 'USER CUSTOM', checkpointGuidance: 'ACTIVE CHECKPOINT FACTS' });
   expect(custom.customSystemPrompt).toBe('USER CUSTOM\n\nACTIVE CHECKPOINT FACTS');
   expect(buildClaudeSystemPromptOptions({ saycodeSystemPrompt: '', checkpointGuidance: '' }).appendSystemPrompt).not.toContain('CHECKPOINT');
+  expect(buildClaudeSystemPromptOptions({ saycodeSystemPrompt: '', appendSystemPrompt: 'USER CONTEXT', checkpointGuidance: 'ACTIVE CHECKPOINT FACTS', saycodeSystemPromptEnabled: false }).appendSystemPrompt).toBe('USER CONTEXT');
 });
 
 describe('next-steps card guidance', () => {

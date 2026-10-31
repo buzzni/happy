@@ -297,20 +297,20 @@ describe('settings', () => {
             })).toBe(true);
         });
 
-        it('keeps child-agent calls and worker delegation on independently of the master', () => {
+        it('lets child-agent calls and worker delegation inherit the master like every other block', () => {
             for (const blockId of ['agentOrchestration', 'workerDelegation']) {
                 expect(resolveSaycodePromptBlockEnabled({
                     blockId,
                     overrides: {},
                     preference: false,
                     surface: 'mobile',
-                })).toBe(true);
+                })).toBe(false);
                 expect(resolveSaycodePromptBlockEnabled({
                     blockId,
-                    overrides: { [blockId]: false },
-                    preference: false,
+                    overrides: {},
+                    preference: true,
                     surface: 'mobile',
-                })).toBe(false);
+                })).toBe(true);
             }
         });
     });

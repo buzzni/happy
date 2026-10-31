@@ -103,14 +103,15 @@ describe.each([
     }),
   },
 ])('$provider orchestration prompt lifecycle (T13, T15)', ({ compose }) => {
-  it('injects the common block independently from the master setting', () => {
+  // aplus-dev-studio specs/saycode-security-hardening D1 — the block follows the master switch.
+  it('injects the common block only while Saycode prompts are on', () => {
     expect(compose(true)).toContain('happy agent whoami');
-    expect(compose(false)).toContain('happy agent whoami');
+    expect(compose(false) ?? '').not.toContain('happy agent');
   });
 
-  it('removes the common block only after its explicit block toggle is off', () => {
-    expect(compose(true, false) ?? '').not.toContain('happy agent');
-    expect(compose(false, false) ?? '').not.toContain('happy agent');
+  it('ignores the per-block override an older client still sends', () => {
+    expect(compose(true, false)).toContain('happy agent whoami');
+    expect(compose(false, true) ?? '').not.toContain('happy agent');
   });
 
   it.each([

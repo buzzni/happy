@@ -25,10 +25,7 @@ describe('buildSaycodeTurnMeta', () => {
             surface: 'mobile',
         });
         expect(meta.appendSystemPrompt).toBeUndefined();
-        expect(meta.saycodePromptBlocks).toEqual({
-            agentOrchestration: true,
-            workerDelegation: true,
-        });
+        expect(meta).not.toHaveProperty('saycodePromptBlocks');
     });
 
     it('marks app-composed guidance as client-turn scoped when enabled', () => {
@@ -39,7 +36,7 @@ describe('buildSaycodeTurnMeta', () => {
         });
         expect(meta.saycodeSystemPromptEnabled).toBe(true);
         expect(meta.appendSystemPrompt).toMatch(/<!-- saycode:client-turn-prompt:[a-z0-9]+-[a-z0-9]+:start -->/);
-        expect(meta.saycodePromptBlocks).toBeUndefined();
+        expect(meta).not.toHaveProperty('saycodePromptBlocks');
     });
 
     it('omits append when options guidance is off so runtime removes only its cached client-turn block', () => {
@@ -50,29 +47,21 @@ describe('buildSaycodeTurnMeta', () => {
         });
         expect(meta.appendSystemPrompt).toBeUndefined();
         // The app-composed id never travels on the wire — happy-cli does not know it.
-        expect(meta.saycodePromptBlocks).toBeUndefined();
+        expect(meta).not.toHaveProperty('saycodePromptBlocks');
         expect(meta.saycodeSystemPromptEnabled).toBe(true);
     });
 
-    it('sends only CLI-wire overrides on the wire', () => {
-        const meta = buildSaycodeTurnMeta({
-            preference: true,
-            overrides: { workerDelegation: false, optionsGuidance: false, retiredBlock: true },
-            surface: 'mobile',
-        });
-        expect(meta.saycodePromptBlocks).toEqual({ workerDelegation: false });
-    });
-
-    it('keeps explicit child-agent off without disabling worker delegation', () => {
-        const meta = buildSaycodeTurnMeta({
-            preference: false,
-            overrides: { agentOrchestration: false },
-            surface: 'mobile',
-        });
-        expect(meta.saycodePromptBlocks).toEqual({
-            agentOrchestration: false,
-            workerDelegation: true,
-        });
+    it('sends no per-block overrides because happy-cli follows only the master', () => {
+        // happy-cli ignores per-block values (aplus-dev-studio specs/saycode-security-hardening
+        // D1), so stored CLI-wire choices must not travel as if they still did something.
+        for (const preference of [true, false]) {
+            const meta = buildSaycodeTurnMeta({
+                preference,
+                overrides: { workerDelegation: false, coAuthoredCredit: false, agentOrchestration: true },
+                surface: 'mobile',
+            });
+            expect(meta).not.toHaveProperty('saycodePromptBlocks');
+        }
     });
 
     it('keeps the options guidance when the master is off but its block is overridden on', () => {
@@ -95,7 +84,7 @@ describe('next-steps card capability', () => {
     it('never sends nextSteps, even when the account settings hold one', () => {
         for (const preference of [true, false, null]) {
             const meta = buildSaycodeTurnMeta({ preference, overrides: { nextSteps: true }, surface: 'mobile' });
-            expect(meta.saycodePromptBlocks?.nextSteps).toBeUndefined();
+            expect(meta).not.toHaveProperty('saycodePromptBlocks');
         }
     });
 });
