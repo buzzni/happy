@@ -19,6 +19,9 @@ import { afterAll } from 'vitest'
 
 const isolatedHome = mkdtempSync(join(tmpdir(), 'happy-unit-home-'))
 process.env.HAPPY_HOME_DIR = isolatedHome
+// The daemon's state root (lessons, organization requirements). A shell inside a Saycode session exports
+// the real one; a test that needs it sets its own.
+delete process.env.HAPPY_LESSON_DAEMON_HOME
 
 afterAll(() => {
     rmSync(isolatedHome, { recursive: true, force: true })
