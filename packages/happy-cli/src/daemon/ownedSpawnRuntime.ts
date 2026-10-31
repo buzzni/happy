@@ -54,6 +54,8 @@ export interface OwnedSpawnRuntimeDependencies {
 export type OwnedSpawnRuntime = OwnedSpawnRpc & {
     /** Daemon-internal, never an RPC: the lineage a launch of this owned session must bind (H3). */
     launchLineage(sessionId: string): Promise<OwnedLaunchLineage | 'unknown' | null>;
+    /** Daemon-internal: this launch must carry the owner-contact pipe, so it may not go through tmux (H3). */
+    pipeOnlyLaunch(options: SpawnSessionOptions): boolean;
 };
 /** Private daemon dispatch evidence; never accepted from RPC, argv, or provider environment. */
 export function createOwnedStartGuard() {
@@ -93,6 +95,9 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
     };
     /** Lineages fixed for owned starts in flight, until the child host's binding is adopted. */
     const lineages = new Map<string, OwnedLaunchLineage>();
+    /** Recovery follows the custody the journal fixed at start, never today's trust (H3-R1-01). */
+    const hostCustody = (record: OwnedSpawnRecord) => record.callerCustody === 'host';
+    const pipeLaunches = new WeakSet<SpawnSessionOptions>();
     const realpath = (path: string) => { try { return (deps.realpath ?? realpathSync)(path); } catch { return path; } };
     function options(record: OwnedSpawnRecord): SpawnSessionOptions {
         const parsed = spawnSchema.parse(record.spawn), aiAuthSelection = parseAiAuthSelection(parsed.aiAuthSelection);
@@ -300,11 +305,12 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
         async start(record) {
             const prepared = startPrepared.get(record.preparationId); if (!prepared) throw new Error('start-not-prepared');
             startPrepared.delete(record.preparationId);
+            if (hostCustody(record)) pipeLaunches.add(prepared.options);
             const result = await deps.start(prepared.options, prepared.launch);
             launchFlights.delete(record.preparationId);
             const created = { id: record.created!.sessionId };
             if (result.type !== 'success' || result.sessionId !== created.id) throw new Error('provider-start-unknown');
-            if (!record.caller) {
+            if (hostCustody(record)) {
                 // Unconfirmed until the child host binds itself; status recovers it without another launch.
                 // Short: main's start RPC has a 20s deadline and the webhook wait already spent part of it.
                 const found = await hostStarted(record, deps.hostBindingWaitMs ?? 5_000);
@@ -314,12 +320,13 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
             const tracked = deps.tracked(created.id), entry = running.get(created.id);
             if (!tracked || !deps.live(tracked) || !entry) throw new Error('provider-start-unknown');
             entry.stamp = stamp(tracked);
-            return { providerRuntimeId: entry.binding.runtimeId };
+            return { providerRuntimeId: entry.binding.runtimeId, caller: entry.binding };
         },
         async observeStart(record) {
             const tracked = deps.tracked(record.created!.sessionId); if (!tracked || !deps.live(tracked)) return null;
-            if (!record.caller && hostCallers()) return hostStarted(record);
-            const binding = await bind(record); return { providerRuntimeId: binding.runtimeId };
+            // Host custody never falls back to a daemon key, whatever the trust is now.
+            if (hostCustody(record)) return hostStarted(record);
+            const binding = await bind(record); return { providerRuntimeId: binding.runtimeId, caller: binding };
         },
     });
     return { ...coordinator,
@@ -336,12 +343,15 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
             const reserved = lineages.get(sessionId); if (reserved) return { ...reserved };
             for (const record of await journal.list()) {
                 if (record.created?.sessionId !== sessionId) continue;
+                // A daemon-custody session already has its binding; its host gets no second one.
+                if (!hostCustody(record)) return 'unknown';
                 if (record.caller) return { sessionId, scope: record.caller.scope, depth: record.caller.depth };
                 // An owned session whose lineage cannot be read is never launched as depth 0.
                 return lineageOf(record).catch(() => 'unknown' as const);
             }
             return null;
         },
+        pipeOnlyLaunch: options => pipeLaunches.has(options),
         async callerBinding(raw) {
             const input = z.object({ sessionId: z.string().min(1).max(128), nonce: z.string().min(16).max(256) }).strict().parse(raw);
             await scope();
@@ -350,9 +360,12 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
                 if (record.created?.sessionId !== input.sessionId) continue;
                 if (record.intent.machineId !== local?.machineId || record.intent.sessionAccountId !== local?.happyAccountId) throw new Error('identity-changed');
                 const tracked = deps.tracked(input.sessionId); if (!tracked || !deps.live(tracked)) throw new Error('caller-not-running');
-                const known = running.get(input.sessionId);
                 // Host custody: only the binding the child host holds the key for, never a daemon-made replacement.
-                if (!known && hostCallers()) return deps.launchCallers!.query(input);
+                if (hostCustody(record)) {
+                    if (!deps.launchCallers) throw new Error('caller-unavailable');
+                    return deps.launchCallers.query(input);
+                }
+                const known = running.get(input.sessionId);
                 if (!known || known.stamp !== stamp(tracked)) await bind(record);
                 return caller.query(input);
             }

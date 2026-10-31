@@ -25,6 +25,34 @@ trial launch가 아닐 때(`agentCallerLaunches.available()` + run.ts의 `!stand
 
 스위치는 켜졌지만 trust가 없으면 기존 daemon key binding으로 돌아간다(H2 issue가 어차피 거부한다).
 
+## custody는 start 때 journal에 고정한다 (교차 리뷰 R1-01)
+
+host/daemon 중 누가 caller key를 갖는지는 start를 제출할 때 정해 journal `callerCustody`에 `starting`과 함께
+쓴다. 그 뒤 status·start·commit·`agent-caller-binding`·resume lineage는 모두 **저장된 custody**를 따르며 그
+시점의 trust·스위치를 보지 않는다. 처음 구현은 `record.caller` 유무와 현재 trust로 경로를 골라, 재시작하며
+trust가 바뀌면 host custody 작업에 daemon key가 생기거나 receipt의 caller와 runtimeId가 어긋났다.
+
+- **host custody**: 재시작·trust 제거 뒤에도 daemon key를 만들지 않는다. child binding이 없으면 `starting`이
+  유지되고 `agent-caller-binding`은 `caller-unavailable`이다(launch binding 조회만 한다).
+- **daemon custody**: 나중에 trust가 생겨도 daemon custody로 다룬다. 재시작 뒤 status는 기존 T4rt처럼 daemon
+  binding을 다시 만들어 `started`로 회수하고, receipt의 `caller`도 그 binding으로 함께 갱신한다. 이 세션의
+  launch에는 `'unknown'` lineage를 줘서 host가 같은 세션에 두 번째(host 보유) binding을 받지 못하게 한다.
+- **`adopt`**: started는 시작된 runtime의 caller가 있고 그 runtimeId·세션·intent machine/account가 모두 맞을
+  때만 기록한다. caller 없는 결과는 started가 될 수 없다(daemon custody도 binding을 함께 돌려준다).
+- `callerCustody`가 없는 H3 이전 기록은 daemon custody다. 새 필드가 있는 기록은 이 필드를 모르는 이전
+  daemon의 strict schema가 읽지 못한다(스위치 기본 OFF라 rollout 전에는 생기지 않는다).
+- definite pre-dispatch 거절(`OwnedStartRefused`)은 custody도 지워 다음 start가 다시 정한다.
+
+## host custody launch는 tmux를 쓰지 않는다 (교차 리뷰 R1-02)
+
+tmux launch에는 launch capability pipe가 없어 child host가 binding을 받을 수 없었다. host custody로 제출한
+start의 launch 옵션은 daemon 내부 `pipeOnlyLaunch`로 표시되고, run.ts는 `TMUX_SESSION_NAME`이 있어도 이
+launch를 일반 spawn(pipe 있음)으로 띄운다. tmux에 같은 handoff를 만드는 것은 이 범위가 아니다.
+
+**사용자에게 보이는 차이**: tmux 프로필(`TMUX_SESSION_NAME`)을 쓰는 머신에서 스위치 ON·trust 있음일 때,
+owned child는 tmux 창에 뜨지 않고 일반 백그라운드 프로세스로 실행된다. 앱의 세션 표시·제어는 같다.
+daemon custody(스위치 OFF 포함)와 owned가 아닌 spawn의 tmux 동작은 바뀌지 않는다.
+
 ## 구성과 결정
 
 | 구성 | 책임 |
@@ -34,7 +62,9 @@ trial launch가 아닐 때(`agentCallerLaunches.available()` + run.ts의 `!stand
 | `run.ts` `spawnTrackedHappyProcess` | resume target/reconnect session id로 lineage를 조회해 `prepareLaunch({ owned })`에 넘긴다 |
 | `agentCallerLaunches.ts` `prepareLaunch`·`issue` | owned launch는 daemon이 정한 depth/scope로 발급. 다른 세션 보고, key 재사용, 같은 세션의 두 번째 live host를 거부 |
 | `agentCallerLaunches.ts` `available`·`currentCaller` | host custody 가능 여부, owned start가 기다리는 child binding(기존 query와 같은 울타리) |
-| `ownedSpawn.ts` `adopt` | started는 이 세션·intent machine/account에 결속되고 runtimeId가 일치하는 child binding일 때만 기록 |
+| `ownedSpawn.ts` `adopt` | started는 이 세션·intent machine/account에 결속되고 runtimeId가 일치하는 caller가 있을 때만 기록 |
+| `ownedSpawn.ts` `callerCustody` | start 제출 때 custody를 journal에 고정 |
+| `ownedSpawnRuntime.ts` `pipeOnlyLaunch`, `run.ts` tmux 분기 | host custody launch는 tmux 대신 pipe 있는 spawn |
 
 - **provider 시작 경계에서 자기 binding**: host custody에서 owned start는 `caller`를 null로 두고(daemon key
   없음) provider를 띄운다. child host는 H2와 같은 launch capability pipe로 provider 시작 전에 자기 key의
@@ -91,6 +121,11 @@ trial launch가 아닐 때(`agentCallerLaunches.available()` + run.ts의 `!stand
 `NODE_OPTIONS=--max-old-space-size=8192 pnpm exec tsc --noEmit` 통과.
 
 - 새 테스트: `agentCallerLaunches.test.ts` H3 7건, `ownedSpawnRuntime.test.ts` H3 10건.
+- 교차 리뷰 R1 반영: `ownedSpawn.test.ts` 4건(caller 없음·runtime 불일치·세션 불일치·custody 기록),
+  `ownedSpawnRuntime.test.ts` 5건(trust 제거 후 재시작, trust 추가 후 재시작 각각 status/start/commit,
+  `TMUX_SESSION_NAME` owned start의 started, daemon custody의 기존 launch 선택, run.ts tmux 분기 고정).
+  역검증 8건: caller 없는 adopt, custody 미기록, trust 기준 fallback, `agent-caller-binding` host 분기,
+  daemon custody lineage, 낡은 receipt caller, pipe 표시, run.ts tmux 조건. 각각 되돌리면 테스트가 실패했다.
 - 역검증 11건: owned depth 적용, owned 세션 검사, key 재사용, 중복 live host, unknown lineage, lineage 대조,
   host custody 선택, `agent-caller-binding`의 daemon key 차단, capability 모양, 부모 binding 조회,
   `adopt`의 세션 검사. 각각 되돌리면 해당 테스트가 실패하고 복원하면 통과했다.

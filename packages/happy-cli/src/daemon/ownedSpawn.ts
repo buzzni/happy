@@ -21,6 +21,8 @@ export const ownedSpawnRecordSchema = z.object({ version: z.literal(1), intent: 
     unprovenReason: z.string().optional(), proof: SessionOwnershipProofSchema.optional(),
     created: ownedCreatedSchema.optional(), confirmedReceipt: OwnershipConfirmedReceiptSchema.optional(),
     providerRuntimeId: ownershipId.optional(), caller: OwnershipCallerBindingSchema.optional(),
+    /** Who holds the caller key, fixed when the start is submitted (H3). Absent on earlier records: daemon. */
+    callerCustody: z.enum(['host', 'daemon']).optional(),
 }).strict();
 export type OwnedSpawnRecord = z.infer<typeof ownedSpawnRecordSchema>;
 export type OwnedSpawnSnapshot = z.infer<typeof ownedSnapshotSchema>;
@@ -41,8 +43,8 @@ export interface OwnedSpawnDependencies {
     /** null: the child host holds its own key and its binding arrives with the started provider (T1c-b2 H3). */
     caller(record: OwnedSpawnRecord): Promise<z.infer<typeof OwnershipCallerBindingSchema> | null>;
 }
-/** caller: the binding the child host itself holds, present only under host custody. */
-type StartedProvider = { providerRuntimeId: string; caller?: z.infer<typeof OwnershipCallerBindingSchema> };
+/** caller: the binding of the started runtime, held by the child host (host custody) or the daemon. */
+type StartedProvider = { providerRuntimeId: string; caller: z.infer<typeof OwnershipCallerBindingSchema> };
 export class OwnedSpawnRejected extends Error { constructor(readonly reason = 'creation-rejected') { super('owned-spawn-rejected'); } }
 /** Only trusted daemon code that knows dispatch never occurred may throw this. */
 export class OwnedStartRefused extends Error {
@@ -85,15 +87,12 @@ export function createOwnedSpawn(deps: OwnedSpawnDependencies) {
         r.ownershipOutcome = r.creationMode === 'unsigned' ? 'unproven' : 'pending';
         await deps.journal.write(r);
     }
-    /** Started is recorded only with a caller bound to this session and the intent's machine/account. */
+    /** Started is recorded only with the started runtime's caller, bound to this session and the intent's machine/account. */
     function adopt(r: OwnedSpawnRecord, found: StartedProvider) {
-        if (found.caller) {
-            const caller = OwnershipCallerBindingSchema.parse(found.caller);
-            if (caller.sessionId !== r.created?.sessionId || caller.machineId !== r.intent.machineId
-                || caller.happyAccountId !== r.intent.sessionAccountId || caller.runtimeId !== found.providerRuntimeId) refusal('caller-mismatch');
-            r.caller = caller;
-        }
-        r.providerRuntimeId = found.providerRuntimeId; r.state = 'started';
+        const caller = OwnershipCallerBindingSchema.safeParse(found.caller);
+        if (!caller.success || caller.data.sessionId !== r.created?.sessionId || caller.data.machineId !== r.intent.machineId
+            || caller.data.happyAccountId !== r.intent.sessionAccountId || caller.data.runtimeId !== found.providerRuntimeId) refusal('caller-mismatch');
+        r.caller = caller.data; r.providerRuntimeId = found.providerRuntimeId; r.state = 'started';
     }
     async function recover(r: OwnedSpawnRecord) {
         if (r.state === 'failed') await deps.failed?.(r);
@@ -197,6 +196,7 @@ export function createOwnedSpawn(deps: OwnedSpawnDependencies) {
                 await deps.prepareStart?.(r);
                 await scope(r);
                 const caller = await deps.caller(r);
+                r.callerCustody = caller ? 'daemon' : 'host';
                 if (caller) {
                     r.caller = OwnershipCallerBindingSchema.parse(caller);
                     if (r.caller.sessionId !== input.sessionId || r.caller.machineId !== r.intent.machineId || r.caller.happyAccountId !== r.intent.sessionAccountId) return refusal('caller-mismatch');
@@ -207,7 +207,7 @@ export function createOwnedSpawn(deps: OwnedSpawnDependencies) {
                     await deps.journal.write(r);
                 } catch (error) {
                     if (error instanceof OwnedStartRefused) {
-                        r.state = 'created'; delete r.providerRuntimeId; delete r.caller;
+                        r.state = 'created'; delete r.providerRuntimeId; delete r.caller; delete r.callerCustody;
                         await deps.journal.write(r);
                     }
                     // Unknown dispatch outcomes can only be observed, never resubmitted.

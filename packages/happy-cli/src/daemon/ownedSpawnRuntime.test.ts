@@ -12,17 +12,18 @@ import { registerOwnedSpawnRpc } from './ownedSpawnRpc';
 import { createOwnedSpawnJournal } from './ownedSpawnJournal';
 const homes: string[] = [];
 afterEach(async () => { vi.restoreAllMocks(); await Promise.all(homes.splice(0).map(home => rm(home, { recursive: true, force: true }))); });
-async function fixture(options: { parent?: string } = {}) {
+async function fixture(options: { parent?: string; spawn?: Record<string, unknown> } = {}) {
     const home = await mkdtemp(join(tmpdir(), 'owned-runtime-')); homes.push(home);
     const keys = nacl.sign.keyPair(), now = Date.now();
     const signed = { version: 1, issuer: 'https://studio.test', audience: 'https://happy.test', keyId: await rotationSha256(keys.publicKey), issuedAt: now, expiresAt: now + 60_000 };
-    const spawn = { directory: '/project', agent: 'codex' };
+    const spawn = options.spawn ?? { directory: '/project', agent: 'codex' };
     const scope = { intentId: 'intent', operationId: 'operation', creationRequestId: 'creation', ownershipPolicy: 'prefer-owned', subject: { issuer: signed.issuer, userId: 'person' },
         companyId: null, projectId: null, machineId: 'machine', machineAccountId: 'account', sessionAccountId: 'account', parentHubSessionId: options.parent ?? null, spawnDigest: await ownershipDigest(spawn) };
     const intent = signOwnership({ ...signed, ...scope, type: 'saycode-session-ownership-intent' }, keys.secretKey);
     let raw: Record<string, unknown> | null = null, tracked: TrackedSession | undefined;
-    let posts = 0, starts = 0, lose = false, current = true;
+    let posts = 0, starts = 0, lose = false, current = true, alive = true;
     let onStart: (() => Promise<void>) | undefined;
+    let lastStart: unknown;
     const fetcher = vi.fn(async (url: string | URL | Request, options?: RequestInit) => {
         if (String(url).endsWith('/v1/account/profile')) return Response.json({ id: 'account' });
         if (String(url).includes('/v2/sessions')) return Response.json({ sessions: raw ? [raw] : [], hasNext: false, nextCursor: null });
@@ -40,8 +41,9 @@ async function fixture(options: { parent?: string } = {}) {
         registration: async () => { if (!current) throw new Error('identity-changed'); return { machineId: 'machine', epoch: 'registration', credentials: { token: 'synthetic-machine-bearer', encryption: { type: 'legacy', secret: new Uint8Array(32) } } }; },
         metadata: () => ({ path: '/project', host: 'box', machineId: 'machine', flavor: 'codex' }) as Metadata,
         rotation: async () => null, fetch: fetcher, persist,
-        tracked: () => tracked, live: s => s.pid > 0,
-        start: async options => {
+        tracked: () => tracked, live: s => alive && s.pid > 0,
+        start: async (options, launch) => {
+            lastStart = options; void launch;
             starts++; expect(options.reconnectEnvironment?.HAPPY_RECONNECT_SESSION_ID).toBe('session');
             expect(JSON.stringify(options)).not.toContain('signature'); expect(JSON.stringify(options)).not.toContain('synthetic-machine-bearer');
             tracked = { pid: 123, happySessionId: 'session', startedBy: 'daemon', directory: '/project' };
@@ -50,7 +52,8 @@ async function fixture(options: { parent?: string } = {}) {
         },
         ...extra,
     });
-    return { spawn, intent, build, persist, onStart: (hook: () => Promise<void>) => { onStart = hook; }, journal: createOwnedSpawnJournal(home), clearAgentState: () => { raw!.agentState = null }, counts: () => ({ posts, starts }), lose: () => { lose = true }, logout: () => { current = false },
+    return { spawn, intent, build, persist, onStart: (hook: () => Promise<void>) => { onStart = hook; },
+        setAlive: (value: boolean) => { alive = value; }, lastStart: () => lastStart, journal: createOwnedSpawnJournal(home), clearAgentState: () => { raw!.agentState = null }, counts: () => ({ posts, starts }), lose: () => { lose = true }, logout: () => { current = false },
         proof: (p: { sessionCreateBodyHash: string; sessionTagHash: string }) => signOwnership({ ...signed, ...scope, type: 'saycode-session-ownership',
             nonce: Buffer.alloc(32, 1).toString('base64url'), createBodyHash: p.sessionCreateBodyHash, tagHash: p.sessionTagHash }, keys.secretKey) };
 }
@@ -255,5 +258,72 @@ describe('owned child host custody (T1c-b2 H3)', () => {
         const reply = await runtime.callerBinding({ sessionId: 'session', nonce: 'main-verifier-nonce' }) as any;
         expect(reply.caller.runtimeId).toBe(s.providerRuntimeId);
         expect(hosts.query).not.toHaveBeenCalled();
+    });
+});
+
+describe('custody fixed at start survives trust changes (H3-R1-01)', () => {
+    it('host custody after trust is removed and the daemon restarts: no daemon key, stays starting', async () => {
+        const f = await fixture(), runtime = f.build({ launchCallers: hostCallers(), hostBindingWaitMs: 0 });
+        const start = await createdSession(f, runtime);
+        expect(await runtime.start(start)).toMatchObject({ state: 'starting' });
+        for (const restarted of [f.build({ launchCallers: hostCallers(false), hostBindingWaitMs: 0 }), f.build({ hostBindingWaitMs: 0 })]) {
+            expect(await restarted.status({ creationRequestId: 'creation' })).toMatchObject({ state: 'starting' });
+            expect(await restarted.start(start)).toMatchObject({ state: 'starting' });
+            expect(await restarted.commit({ creationRequestId: 'creation', preparationId: start.preparationId, ownershipProof: (await f.journal.read('creation'))!.proof }))
+                .toMatchObject({ state: 'starting' });
+            await expect(restarted.callerBinding({ sessionId: 'session', nonce: 'main-verifier-nonce' })).rejects.toThrow('caller-unavailable');
+        }
+        expect(await f.journal.read('creation')).toMatchObject({ state: 'starting', callerCustody: 'host' });
+        expect((await f.journal.read('creation'))!.caller).toBeUndefined();
+        expect(f.counts()).toEqual({ posts: 1, starts: 1 });
+    });
+    it('daemon custody after trust is added and the daemon restarts: keeps its own custody and an aligned receipt', async () => {
+        const f = await fixture(), runtime = f.build({ launchCallers: hostCallers(false) });
+        const start = await createdSession(f, runtime);
+        f.setAlive(false);
+        expect(await runtime.start(start)).toMatchObject({ state: 'starting' });
+        f.setAlive(true);
+        const hosts = hostCallers(), restarted = f.build({ launchCallers: hosts });
+        const s = await restarted.status({ creationRequestId: 'creation' }) as Record<string, any>;
+        expect(s).toMatchObject({ state: 'started' });
+        expect(s.caller.runtimeId).toBe(s.providerRuntimeId);
+        expect(await restarted.start(start)).toMatchObject({ state: 'started', providerRuntimeId: s.providerRuntimeId });
+        expect(await restarted.commit({ creationRequestId: 'creation', preparationId: start.preparationId, ownershipProof: (await f.journal.read('creation'))!.proof }))
+            .toMatchObject({ state: 'started' });
+        expect((await restarted.callerBinding({ sessionId: 'session', nonce: 'main-verifier-nonce' }) as any).caller).toEqual(s.caller);
+        expect(hosts.query).not.toHaveBeenCalled();
+        // Its host may not take a second, host-held binding for the same session.
+        expect(await restarted.launchLineage('session')).toBe('unknown');
+        expect((await f.journal.read('creation'))!.callerCustody).toBe('daemon');
+        expect(f.counts()).toEqual({ posts: 1, starts: 1 });
+    });
+});
+describe('host custody launches skip tmux (H3-R1-02)', () => {
+    it('an owned start with TMUX_SESSION_NAME is a pipe launch and reaches started with its own binding', async () => {
+        const spawn = { directory: '/project', agent: 'codex', environmentVariables: { TMUX_SESSION_NAME: 'work' } };
+        const f = await fixture({ spawn }), hosts = hostCallers(), runtime = f.build({ launchCallers: hosts });
+        let pipeOnly: boolean | undefined;
+        f.onStart(async () => {
+            pipeOnly = runtime.pipeOnlyLaunch(f.lastStart() as never);
+            hosts.callers.set('session', hostCaller({ sessionId: 'session', runtimeId: 'tmux-profile-runtime' }));
+        });
+        expect(await runtime.start(await createdSession(f, runtime))).toMatchObject({ state: 'started', providerRuntimeId: 'tmux-profile-runtime' });
+        expect(pipeOnly).toBe(true);
+        expect((f.lastStart() as { environmentVariables?: Record<string, string> }).environmentVariables?.TMUX_SESSION_NAME).toBe('work');
+    });
+    it('a daemon custody start keeps the existing launch choice', async () => {
+        const spawn = { directory: '/project', agent: 'codex', environmentVariables: { TMUX_SESSION_NAME: 'work' } };
+        const f = await fixture({ spawn }), runtime = f.build({ launchCallers: hostCallers(false) });
+        let pipeOnly: boolean | undefined;
+        f.onStart(async () => { pipeOnly = runtime.pipeOnlyLaunch(f.lastStart() as never); });
+        expect(await runtime.start(await createdSession(f, runtime))).toMatchObject({ state: 'started' });
+        expect(pipeOnly).toBe(false);
+    });
+    it('the daemon skips tmux for a pipe-only owned launch', async () => {
+        const { readFile } = await import('node:fs/promises');
+        const source = await readFile(new URL('./run.ts', import.meta.url), 'utf8');
+        expect(source).toMatch(/if \(!tmuxAvailable \|\| tmuxSessionName === undefined \|\| ownerPipeRequired\)/);
+        expect(source).toContain('const ownerPipeRequired = ownedPipeOnlyLaunch?.(options) === true;');
+        expect(source).toContain('ownedPipeOnlyLaunch = options => ownedSpawn.pipeOnlyLaunch(options);');
     });
 });

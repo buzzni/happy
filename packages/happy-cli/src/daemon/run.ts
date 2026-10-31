@@ -1175,6 +1175,8 @@ export async function startDaemon(): Promise<void> {
     let callerLaunches: ReturnType<typeof createAgentCallerLaunches> | null = null;
     /** H3: the lineage an owned session's launch binds (owned journal); null for any other launch. */
     let ownedLaunchLineage: ((sessionId: string) => Promise<OwnedLaunchLineage | 'unknown' | null>) | null = null;
+    /** H3: an owned host-custody launch needs the owner-contact pipe, which only the direct spawn carries. */
+    let ownedPipeOnlyLaunch: ((options: SpawnSessionOptions) => boolean) | null = null;
     // aplus-dev-studio strict-followup-plan F2 — a non-forced worktree removal waits for these to leave.
     worktreeRemovalReservations.setLiveSessions(() => [...pidToTrackedSession.values()]
       .map((session) => ({ pid: session.pid, directory: session.directory ?? session.happySessionMetadataFromLocalWebhook?.path })));
@@ -2400,13 +2402,16 @@ export async function startDaemon(): Promise<void> {
         // Get tmux session name from environment variables (now set by profile system)
         // Empty string means "use current/most recent session" (tmux default behavior)
         let tmuxSessionName: string | undefined = extraEnv.TMUX_SESSION_NAME;
+        // tmux launches carry no owner-contact pipe, so an owned child holding its own key starts directly.
+        const ownerPipeRequired = ownedPipeOnlyLaunch?.(options) === true;
 
         // If tmux is not available or session name is explicitly undefined, fall back to regular spawning
         // Note: Empty string is valid (means use current/most recent tmux session)
-        if (!tmuxAvailable || tmuxSessionName === undefined) {
+        if (!tmuxAvailable || tmuxSessionName === undefined || ownerPipeRequired) {
           useTmux = false;
           if (tmuxSessionName !== undefined) {
-            logger.debug(`[DAEMON RUN] tmux session name specified but tmux not available, falling back to regular spawning`);
+            logger.debug(ownerPipeRequired ? `[DAEMON RUN] owned child needs the owner-contact pipe, using regular spawning instead of tmux`
+              : `[DAEMON RUN] tmux session name specified but tmux not available, falling back to regular spawning`);
           }
         }
 
@@ -5426,6 +5431,7 @@ export async function startDaemon(): Promise<void> {
     });
     // Switch off: no lookup, so every launch is exactly the existing one.
     if (process.env[OWNER_CONTACT_SWITCH] === '1') ownedLaunchLineage = sessionId => ownedSpawn.launchLineage(sessionId);
+    ownedPipeOnlyLaunch = options => ownedSpawn.pipeOnlyLaunch(options);
     // Set RPC handlers
     apiMachine.setRPCHandlers({
       ownedSpawn,
