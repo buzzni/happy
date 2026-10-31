@@ -5,6 +5,7 @@ import {
     injectMcpCallerGrant,
     McpCallerGrantEnvelopeConsumer,
     prepareMcpChildEnvironment,
+    resolveResumeMcpGrantSource,
 } from './mcpCallerGrantEnvelope';
 
 const PROJECT_CONTEXT = { projectId: 'P-1' };
@@ -59,6 +60,26 @@ describe('McpCallerGrantEnvelopeConsumer', () => {
                 HAPPY_APLUS_MCP_CALLER_GRANT: grant(),
                 HAPPY_APLUS_MCP_CONFIG_URL: 'https://saycode.ai/api/me/mcp-config?project_id=P-1',
                 HAPPY_APLUS_EXPECTED_CONNECTORS: '["gmail","knoi"]',
+                HAPPY_APLUS_MCP_INITIAL_LIFECYCLE: 'resume',
+            },
+        });
+    });
+
+    it('예약 실행이 교환한 trusted grant로 resume child env를 만든다', () => {
+        const consumer = { consume: () => { throw new Error('envelope must not be consumed'); } };
+
+        expect(prepareMcpChildEnvironment({
+            environmentVariables: { SAFE: 'value', HAPPY_APLUS_MCP_CALLER_GRANT: 'stale-grant' },
+            trustedMcpCallerGrant: grant({ projectId: 'chat:c' }),
+            mcpConfigProjectId: 'chat:c',
+            lifecycle: 'resume',
+            trustedConfigUrl: 'https://saycode.ai/api/me/mcp-config',
+        }, consumer)).toEqual({
+            ok: true,
+            environmentVariables: {
+                SAFE: 'value',
+                HAPPY_APLUS_MCP_CALLER_GRANT: grant({ projectId: 'chat:c' }),
+                HAPPY_APLUS_MCP_CONFIG_URL: 'https://saycode.ai/api/me/mcp-config?project_id=chat%3Ac',
                 HAPPY_APLUS_MCP_INITIAL_LIFECYCLE: 'resume',
             },
         });
@@ -172,5 +193,41 @@ describe('McpCallerGrantEnvelopeConsumer', () => {
         expect(consumer.consume(first, PROJECT_CONTEXT).ok).toBe(true);
         expect(consumer.consume(second, PROJECT_CONTEXT)).toEqual({ ok: false, reason: 'capacity' });
         expect(consumer.consume(first, PROJECT_CONTEXT)).toEqual({ ok: false, reason: 'replayed' });
+    });
+});
+
+describe('resolveResumeMcpGrantSource', () => {
+    const trustedMcpContext = { mcpCallerGrant: 'grant', mcpConfigProjectId: 'chat:c' };
+
+    it('예약 실행의 trusted context만 오면 그 grant와 project를 권한 있는 범위로 쓴다', () => {
+        expect(resolveResumeMcpGrantSource({ trustedMcpContext, mcpConfigProjectId: 'other' })).toEqual({
+            ok: true,
+            trustedMcpCallerGrant: 'grant',
+            mcpConfigProjectId: 'chat:c',
+            hasAuthoritativeProject: true,
+        });
+    });
+
+    it('trusted context와 envelope이 함께 오면 거절한다', () => {
+        expect(resolveResumeMcpGrantSource({ trustedMcpContext, mcpCallerGrantEnvelope: 'sealed' }))
+            .toEqual({ ok: false });
+    });
+
+    it('envelope만 오면 기존처럼 요청 project를 권한 있는 범위로 쓴다', () => {
+        expect(resolveResumeMcpGrantSource({ mcpCallerGrantEnvelope: 'sealed', mcpConfigProjectId: 'P-1' })).toEqual({
+            ok: true,
+            trustedMcpCallerGrant: undefined,
+            mcpConfigProjectId: 'P-1',
+            hasAuthoritativeProject: true,
+        });
+    });
+
+    it('둘 다 없으면 grant 없이 요청 project만 넘기고 권한 범위로 보지 않는다', () => {
+        expect(resolveResumeMcpGrantSource({ mcpConfigProjectId: 'P-1' })).toEqual({
+            ok: true,
+            trustedMcpCallerGrant: undefined,
+            mcpConfigProjectId: 'P-1',
+            hasAuthoritativeProject: false,
+        });
     });
 });

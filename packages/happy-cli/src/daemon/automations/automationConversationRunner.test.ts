@@ -20,8 +20,14 @@ describe('ordinary conversation delivery', () => {
   })
   it('resumes the fixed ordinary session and appends a normal user envelope', async () => {
     const deps = setup(); expect(await deliverAutomationConversation(request, deps)).toEqual({ ok: true, sessionId: 's1' })
-    expect(deps.ensureRunning).toHaveBeenCalledWith('s1'); expect(deps.deliver).toHaveBeenCalledWith({ wireVersion: 1, runId: 'r1', claimToken: 'token', sessionId: 's1', expectedSeq: 4, contentCiphertext: 'ciphertext' })
+    expect(deps.ensureRunning).toHaveBeenCalledWith('s1', undefined); expect(deps.deliver).toHaveBeenCalledWith({ wireVersion: 1, runId: 'r1', claimToken: 'token', sessionId: 's1', expectedSeq: 4, contentCiphertext: 'ciphertext' })
     expect(deps.encryptUserMessage.mock.calls[0]?.[1]).toMatchObject({ role: 'user', content: { type: 'text', text: 'Report' }, localKey: 'happy-automation:r1', meta: { sentFrom: 'automation' } })
+  })
+  it('resumes a stopped conversation with the connector grant the run exchanged', async () => {
+    const deps = setup()
+    const mcpSpawnContext = { mcpCallerGrant: 'grant', mcpConfigProjectId: 'chat:c', bindingStatus: 'BOUND' as const, connectorPolicy: 'optional' as const, requiredConnectors: [] }
+    expect(await deliverAutomationConversation({ ...request, mcpSpawnContext }, deps)).toEqual({ ok: true, sessionId: 's1' })
+    expect(deps.ensureRunning).toHaveBeenCalledWith('s1', mcpSpawnContext)
   })
   it('does not execute without local binding or a matching canonical directory', async () => {
     const deps = setup(); deps.sameDirectory.mockResolvedValue(false)

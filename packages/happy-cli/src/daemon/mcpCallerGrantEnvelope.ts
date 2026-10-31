@@ -207,10 +207,31 @@ export class McpCallerGrantEnvelopeConsumer {
     }
 }
 
+/**
+ * Where a resumed child's caller grant comes from: a grant the daemon exchanged for a scheduled
+ * run (trusted), a client's sealed envelope, or neither. Both at once is refused.
+ */
+export function resolveResumeMcpGrantSource(input: {
+    trustedMcpContext?: { mcpCallerGrant?: string; mcpConfigProjectId: string };
+    mcpCallerGrantEnvelope?: string;
+    mcpConfigProjectId?: string;
+}): { ok: false }
+    | { ok: true; trustedMcpCallerGrant?: string; mcpConfigProjectId?: string; hasAuthoritativeProject: boolean } {
+    if (input.trustedMcpContext && input.mcpCallerGrantEnvelope) return { ok: false };
+    return {
+        ok: true,
+        trustedMcpCallerGrant: input.trustedMcpContext?.mcpCallerGrant,
+        mcpConfigProjectId: input.trustedMcpContext?.mcpConfigProjectId ?? input.mcpConfigProjectId,
+        hasAuthoritativeProject: Boolean(input.trustedMcpContext || input.mcpCallerGrantEnvelope),
+    };
+}
+
 export function prepareMcpChildEnvironment(
     input: {
         environmentVariables: Record<string, string>;
         mcpCallerGrantEnvelope?: string;
+        /** A grant the daemon exchanged itself (scheduled run); used only when no envelope is given. */
+        trustedMcpCallerGrant?: string;
         mcpConfigProjectId?: string;
         expectedConnectors?: string[];
         lifecycle?: 'spawn' | 'resume';
@@ -220,7 +241,7 @@ export function prepareMcpChildEnvironment(
 ): { ok: true; environmentVariables: Record<string, string> }
     | { ok: false; reason: ConsumeFailureReason } {
     const projectId = input.mcpConfigProjectId?.trim() || null;
-    let grant: string | undefined;
+    let grant: string | undefined = input.trustedMcpCallerGrant;
     if (input.mcpCallerGrantEnvelope) {
         const consumed = consumer.consume(input.mcpCallerGrantEnvelope, { projectId });
         if (!consumed.ok) return consumed;
