@@ -129,7 +129,7 @@ import { SessionLaunchControl } from '@/sessionDrain/sessionLaunchControl';
 import { RuntimeProducerGate } from '@/sessionDrain/runtimeProducerGate';
 import { ClaudeStandaloneDrain } from './claudeStandaloneDrain';
 import { createClaudeDrainProvider } from './claudeDrainProvider';
-import { consumeOrgScopeHint, createOrgRequirementsGate, isOrgRequirementsEnabled, orgAccountKey } from '@/orgRequirements/gate';
+import { createSessionOrgRequirementsGate } from '@/orgRequirements/sessionGate';
 import { orgRequirementsDirectory } from '@/orgRequirements/store';
 import { createClaudeOrgRequirements, stripModelSelectionEnv, type OrgModelRequest } from './claudeOrgRequirements';
 
@@ -772,29 +772,13 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
      * Kept under the state root the daemon names for every spawn (as lessons are), so a staged per-session
      * home does not lose the last known good; a runner started outside a daemon uses its own home.
      */
-    const orgScopeHint = consumeOrgScopeHint(process.env);
     const orgRequirementsHome = lessonStateRoot(process.env) ?? configuration.happyHomeDir;
-    const orgGate = principal.kind === 'account' && isOrgRequirementsEnabled(process.env)
-        ? createOrgRequirementsGate({
-            agent: 'claude',
-            happyHomeDir: orgRequirementsHome,
-            serverUrl: configuration.serverUrl,
-            accountKey: orgAccountKey(principal.credentials),
-            sessionId: () => session.sessionId,
-            projectHint: orgScopeHint,
-            publish: (orgRequirements) => session.updateAgentState((current) => {
-                const { orgRequirements: _previous, ...rest } = current;
-                return orgRequirements ? { ...rest, orgRequirements } : rest;
-            }),
-            refresh: async () => {
-                await fetchAplusMcpConfigSnapshot(requireAccountToken(accountToken), requireAccountMachineId(machineId), {
-                    sessionId: session.sessionId,
-                    lifecycle: 'requirements-refresh',
-                    onRequirements: (outcome) => orgGate?.onRequirements(outcome),
-                });
-            },
-        })
-        : null;
+    const orgGate = createSessionOrgRequirementsGate({
+        agent: 'claude',
+        credentials: principal.kind === 'account' ? principal.credentials : null,
+        machineId,
+        session,
+    })?.gate ?? null;
     // Start Happy MCP server
     const happyServer = await startHappyServer(session, {
         browserClientApprover: () => currentSession?.policyApprover ?? null,

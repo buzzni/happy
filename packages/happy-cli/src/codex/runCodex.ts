@@ -89,9 +89,9 @@ import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
 import type { PermissionMode } from '@/api/types';
 import type { ApiSessionClient } from '@/api/apiSession';
 import { resolveCodexExecutionPolicy } from './executionPolicy';
-import { consumeOrgScopeHint, createOrgRequirementsGate, isOrgRequirementsEnabled, orgAccountKey, refusedTurnEnvelopes, type OrgRequirementsGate } from '@/orgRequirements/gate';
+import { refusedTurnEnvelopes, type OrgRequirementsGate } from '@/orgRequirements/gate';
 import type { ModelOrigin } from '@/orgRequirements/resolve';
-import { lessonStateRoot } from '@/memory/lessonSessionHost';
+import { createSessionOrgRequirementsGate } from '@/orgRequirements/sessionGate';
 import { resolveRemoteCodexPermissionMode } from './permissionMode';
 import { isSandboxFallbackNetworkLoss } from './sandboxInitFailurePolicy';
 import { readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv';
@@ -1543,29 +1543,12 @@ export async function runCodex(opts: {
      * the mcp-config answers this session already gets, enforced at the turn boundary (model, clipped
      * mode), in the approval policy (R10.9), at the approval boundary (R10.12) and by the tool policy gate.
      */
-    const orgScopeHint = consumeOrgScopeHint(process.env);
-    if (opts.principal.kind === 'account' && isOrgRequirementsEnabled(process.env)) {
-        const accountCredentials = opts.principal.credentials;
-        orgGate = createOrgRequirementsGate({
-            agent: 'codex',
-            happyHomeDir: lessonStateRoot(process.env) ?? configuration.happyHomeDir,
-            serverUrl: configuration.serverUrl,
-            accountKey: orgAccountKey(accountCredentials),
-            sessionId: () => session.sessionId,
-            projectHint: orgScopeHint,
-            publish: (orgRequirements) => session.updateAgentState((current) => {
-                const { orgRequirements: _previous, ...rest } = current;
-                return orgRequirements ? { ...rest, orgRequirements } : rest;
-            }),
-            refresh: async () => {
-                await fetchAplusMcpConfigSnapshot(accountCredentials.token, requireAccountMachineId(machineId), {
-                    sessionId: session.sessionId,
-                    lifecycle: 'requirements-refresh',
-                    onRequirements: (outcome) => orgGate?.onRequirements(outcome),
-                });
-            },
-        });
-    }
+    orgGate = createSessionOrgRequirementsGate({
+        agent: 'codex',
+        credentials: opts.principal.kind === 'account' ? opts.principal.credentials : null,
+        machineId,
+        session,
+    })?.gate ?? null;
     // Drop any permission requests left in agent state from a previous CLI
     // process that died while a tool prompt was open — see the matching
     // call in claudeRemoteLauncher for the full rationale.
