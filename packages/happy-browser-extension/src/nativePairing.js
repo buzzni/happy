@@ -1,3 +1,5 @@
+import { ensureDefaultProfileName } from './profileId.js'
+
 export const BROWSER_NATIVE_HOST_NAME = 'ai.saycode.happy_browser'
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1'])
@@ -58,6 +60,48 @@ export async function attemptSetupPairing(chromeApi, operationId) {
     await chromeApi.storage.local.set({ token: config.token, port: config.port, host: config.host,
         viewerKey: config.viewerKey, pairingId: config.pairingId, profile: config.profile })
     return { status: 'paired' }
+}
+
+const VIEWER_KEY = /^bv1_[A-Za-z0-9_-]{32}$/
+const CONNECT_REFUSALS = new Set(['MACHINE_NOT_ELIGIBLE', 'SCOPE_UNAVAILABLE', 'DAEMON_OFFLINE', 'INVALID_PROFILE'])
+
+/**
+ * Startup path: a per-user pairing stays; otherwise the local daemon is asked
+ * which account it would connect, and nothing is paired until the user
+ * approves on the options page. A daemon that cannot offer (older CLI,
+ * ineligible machine) keeps the legacy local pairing.
+ */
+export async function prepareLocalConnection(chromeApi) {
+    const stored = await chromeApi.storage.local.get(['token', 'viewerKey', 'pairingId'])
+    if (hasToken(stored) && VIEWER_KEY.test(stored.viewerKey ?? '') && stored.pairingId) return { status: 'already-configured' }
+    let offer
+    try { offer = await chromeApi.runtime.sendNativeMessage(BROWSER_NATIVE_HOST_NAME, { type: 'connect-offer' }) } catch { /* no native host */ }
+    if (offer?.ok === true && typeof offer.account === 'string' && offer.account) return { status: 'awaiting-approval', account: offer.account }
+    const reason = refusalReason(offer)
+    const legacy = await attemptNativePairing(chromeApi)
+    return reason ? { ...legacy, reason } : legacy
+}
+
+/** The user's approval: connect this Chrome profile under the daemon owner's per-user key. */
+export async function approveLocalConnection(chromeApi) {
+    const profile = await ensureDefaultProfileName(chromeApi)
+    let response
+    try { response = await chromeApi.runtime.sendNativeMessage(BROWSER_NATIVE_HOST_NAME, { type: 'connect', profile }) }
+    catch { return { status: 'unavailable' } }
+    const reason = refusalReason(response)
+    if (reason) return { status: 'refused', reason }
+    const config = response?.config
+    if (!isValidPairingResponse(response) || !LOOPBACK_HOSTS.has(config.host) || !VIEWER_KEY.test(config.viewerKey ?? '')
+        || typeof config.pairingId !== 'string' || !config.pairingId || config.profile !== profile) {
+        return { status: 'invalid-response' }
+    }
+    await chromeApi.storage.local.set({ token: config.token, port: config.port, host: config.host,
+        viewerKey: config.viewerKey, pairingId: config.pairingId, profile: config.profile })
+    return { status: 'paired' }
+}
+
+function refusalReason(response) {
+    return response?.ok === false && CONNECT_REFUSALS.has(response.error) ? response.error : undefined
 }
 
 function exchangeSetupOverLoopback(operationId) {
