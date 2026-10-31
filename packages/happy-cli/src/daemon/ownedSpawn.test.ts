@@ -12,6 +12,8 @@ afterEach(async () => { await Promise.all(homes.splice(0).map(home => rm(home, {
 const now = Date.now();
 const signed = { version: 1, issuer: 'https://studio.test', audience: 'https://happy.test', keyId: 'a'.repeat(64),
     issuedAt: now, expiresAt: now + 60_000, signature: Buffer.alloc(64).toString('base64url') };
+const daemonCaller = { callerBindingId: 'caller', sessionId: 'session', runtimeId: 'runtime', machineId: 'machine', happyAccountId: 'account',
+    scope: '/project', depth: 0, hostEpoch: 'host', callerPublicKey: Buffer.alloc(32).toString('base64url') };
 async function fixture(policy: 'prefer-owned' | 'require-owned' = 'prefer-owned') {
     const home = await mkdtemp(join(tmpdir(), 'owned-spawn-')); homes.push(home);
     const journal = createOwnedSpawnJournal(home);
@@ -27,10 +29,9 @@ async function fixture(policy: 'prefer-owned' | 'require-owned' = 'prefer-owned'
         prepare: async () => { prepares++; return { body, encryptionKey: Buffer.alloc(32).toString('base64'), encryptionVariant: 'legacy' }; },
         commit: async () => { commits++; created = true; if (loseCommit) throw new Error('lost ack'); return { sessionId: 'session', ownershipBindingId: 'binding', registrationState: 'pending', createDigest: await sessionCreateBodyHash(body) }; },
         discover: async record => created ? { sessionId: 'session', ...(record.creationMode === 'signed' ? { ownershipBindingId: 'binding', registrationState: 'pending' as const } : {}), createDigest: await sessionCreateBodyHash(body) } : null,
-        start: async () => { starts++; running = true; if (loseStart) throw new Error('lost start ack'); return { providerRuntimeId: 'runtime' }; },
-        observeStart: async () => running ? { providerRuntimeId: 'runtime' } : null,
-        caller: async () => ({ callerBindingId: 'caller', sessionId: 'session', runtimeId: 'runtime', machineId: 'machine', happyAccountId: 'account',
-            scope: '/project', depth: 0, hostEpoch: 'host', callerPublicKey: Buffer.alloc(32).toString('base64url') }),
+        start: async () => { starts++; running = true; if (loseStart) throw new Error('lost start ack'); return { providerRuntimeId: 'runtime', caller: daemonCaller }; },
+        observeStart: async () => running ? { providerRuntimeId: 'runtime', caller: daemonCaller } : null,
+        caller: async () => daemonCaller,
     };
     const proof = { ...intent, type: 'saycode-session-ownership', nonce: Buffer.alloc(32, 1).toString('base64url'),
         tagHash: await sessionTagHash(body.tag), createBodyHash: await sessionCreateBodyHash(body) };
@@ -116,7 +117,7 @@ it.each(['daemon-restarting', 'directory-approval-required', 'validation-error']
     const command = { creationRequestId: 'creation', preparationId: p.preparationId, sessionId: 'session' };
     expect(await r.start(command)).toMatchObject({ state: 'created', sessionId: 'session' });
     const saved = await f.journal.read('creation');
-    expect(saved?.caller).toBeUndefined(); expect(saved?.providerRuntimeId).toBeUndefined();
+    expect(saved?.caller).toBeUndefined(); expect(saved?.providerRuntimeId).toBeUndefined(); expect(saved?.callerCustody).toBeUndefined();
     f.deps.start = start;
     expect(await f.runtime().start(command)).toMatchObject({ state: 'started' });
     expect(f.counts()).toEqual({ prepares: 1, commits: 1, starts: 1 });
@@ -150,4 +151,32 @@ it.each(['prepare', 'commit'])('settles failed launch resources even when the %s
         await expect(r.commit({ creationRequestId: 'creation', preparationId: prepared.preparationId, ownershipProof: f.proof })).rejects.toThrow('disk failure');
     }
     expect(settled).toBe(1);
+});
+
+it.each([
+    ['no caller', { providerRuntimeId: 'runtime' }],
+    ['a caller of another runtime', { providerRuntimeId: 'runtime', caller: { ...daemonCaller, runtimeId: 'other-runtime' } }],
+    ['a caller of another session', { providerRuntimeId: 'runtime', caller: { ...daemonCaller, sessionId: 'other' } }],
+])('never records started from a start result with %s (H3-R1-01)', async (_name, result) => {
+    const f = await fixture(), r = f.runtime(), p = await f.prepare(r);
+    await r.commit({ creationRequestId: 'creation', preparationId: p.preparationId, ownershipProof: f.proof });
+    f.deps.start = async () => result as never;
+    f.deps.observeStart = async () => result as never;
+    const command = { creationRequestId: 'creation', preparationId: p.preparationId, sessionId: 'session' };
+    expect(await r.start(command)).toMatchObject({ state: 'starting' });
+    expect(await f.runtime().status({ creationRequestId: 'creation' })).toMatchObject({ state: 'starting' });
+    expect((await f.journal.read('creation'))?.providerRuntimeId).toBeUndefined();
+});
+it('fixes the caller custody in the journal when the start is submitted (H3-R1-01)', async () => {
+    const f = await fixture(), r = f.runtime(), p = await f.prepare(r);
+    await r.commit({ creationRequestId: 'creation', preparationId: p.preparationId, ownershipProof: f.proof });
+    await r.start({ creationRequestId: 'creation', preparationId: p.preparationId, sessionId: 'session' });
+    // Daemon custody stays the pre-H3 record: no field, so a daemon from before H3 still reads it (H3-R2-01).
+    expect(Object.keys((await f.journal.read('creation'))!)).not.toContain('callerCustody');
+    const g = await fixture(), q = g.runtime(), pg = await g.prepare(q);
+    await q.commit({ creationRequestId: 'creation', preparationId: pg.preparationId, ownershipProof: g.proof });
+    g.deps.caller = async () => null;
+    g.deps.start = async () => { throw new Error('lost start ack'); };
+    await q.start({ creationRequestId: 'creation', preparationId: pg.preparationId, sessionId: 'session' });
+    expect(await g.journal.read('creation')).toMatchObject({ state: 'starting', callerCustody: 'host' });
 });

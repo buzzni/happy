@@ -96,8 +96,8 @@ ON이어도 trust 설정(`HAPPY_SESSION_OWNERSHIP_ENABLED/ISSUER/AUDIENCE/PUBLIC
   받아 binding이 없다. 실제 OS pipe로 daemon→host를 잇는 통합 테스트는 하지 않았다(양쪽 단위 테스트).
 - mandatory/wrapped sandbox provider가 local socket에 접근할 수 있는지(AF_UNIX seccomp 등)와 Windows pipe는
   미구현이다. 해당 직접 경로 provider에서는 own 확장이 unavailable이다.
-- owned child의 daemon 보유 binding을 child host에 넘기는 일은 H3다. 이 변경은 journal 세션의 기존
-  `agent-caller-binding` 응답을 바꾸지 않는다.
+- owned child의 binding을 child host가 갖게 하는 일은 H3(`docs/rn-t1cb2-h3-owned-child-contact.md`)에서
+  했다. 스위치 ON·trust 있음이면 owned child host가 자기 key로 owned lineage의 binding을 받는다.
 - rollout(스위치 ON)은 T2r 활성화 체크리스트에서 다룬다.
 
 ## 검증
