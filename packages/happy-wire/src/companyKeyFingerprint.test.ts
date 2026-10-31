@@ -17,6 +17,10 @@ describe('companyKeyFingerprint', () => {
     expect(companyKeyFingerprint(key)).not.toBe(machineKeyFingerprint('', key));
   });
 
+  it('matches the fixed vector the web client checks too', () => {
+    expect(companyKeyFingerprint(key)).toBe('SGFH-XQ2A-JH6M-ZNBE-RJQN');
+  });
+
   it('refuses a key that is not a 32-byte public key', () => {
     expect(() => companyKeyFingerprint(new Uint8Array(31))).toThrow();
   });
