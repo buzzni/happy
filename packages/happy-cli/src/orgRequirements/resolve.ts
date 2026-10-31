@@ -206,8 +206,17 @@ export function normalizeModelSelection(agent: OrgAgent, model: string | null | 
     return `${agent}:${agent === 'claude' ? CLAUDE_MODEL_ALIASES.get(id) ?? id : id}`;
 }
 
-/** Where the model a turn would run came from. */
-export type ModelOrigin = 'explicit' | 'resume' | 'none';
+/**
+ * Where the model a turn would run came from. `auto`: a router picked it (the client's own `modelSource: auto`,
+ * or the daemon's delegated difficulty routing), not the person — judged like `resume` (R10.2a).
+ */
+export type ModelOrigin = 'explicit' | 'resume' | 'auto' | 'none';
+
+/** A message's model as the gate sees it: named by the person, or by the client's router. */
+export function messageModelOrigin(model: string | null | undefined, modelSource: unknown): ModelOrigin {
+    if (!model) return 'none';
+    return modelSource === 'auto' ? 'auto' : 'explicit';
+}
 
 /** The model a queued turn asked for, before any runtime substitution (Z.AI), and where it came from. */
 export interface OrgModelRequest {

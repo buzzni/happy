@@ -132,6 +132,7 @@ import { createClaudeDrainProvider } from './claudeDrainProvider';
 import { createSessionOrgRequirementsGate } from '@/orgRequirements/sessionGate';
 import { orgRequirementsDirectory } from '@/orgRequirements/store';
 import { createClaudeOrgRequirements, orgTitleModel, stripModelSelectionEnv, type OrgModelRequest } from './claudeOrgRequirements';
+import { messageModelOrigin } from '@/orgRequirements/resolve';
 
 /**
  * How long a confirmed initial prompt waits for its acknowledgement before the
@@ -1336,7 +1337,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         let messageModel = currentModel;
         let messageOrgModel = currentOrgModel;
         if (message.meta?.hasOwnProperty('model')) {
-            messageOrgModel = message.meta.model ? { requested: message.meta.model, origin: 'explicit' } : { requested: null, origin: 'none' };
+            messageOrgModel = { requested: message.meta.model || null, origin: messageModelOrigin(message.meta.model, message.meta.modelSource) };
             if (!delegatedDifficultyRoutingMessage) currentOrgModel = messageOrgModel;
             messageModel = normalizeClaudeModelForRuntime(
                 message.meta.model || undefined,
@@ -1637,7 +1638,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
 
         if (routed) {
             if (routed.route.model) {
-                messageOrgModel = { requested: routed.route.model, origin: 'explicit' };
+                messageOrgModel = { requested: routed.route.model, origin: 'auto' };
                 messageModel = defaultClaudeModelForRuntime(
                     process.env,
                     normalizeClaudeModelForRuntime(routed.route.model, process.env),

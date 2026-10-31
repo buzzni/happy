@@ -3,9 +3,11 @@ import { orgRequirementsV1CasesFixture as cases } from '@slopus/happy-wire';
 import {
     clampPermissionMode,
     judgeModel,
+    messageModelOrigin,
     normalizeModelSelection,
     parseOrgRequirements,
     permissionModeRank,
+    type ModelOrigin,
     type OrgAgent,
     type OrgRequirementsDocument,
 } from './resolve';
@@ -58,8 +60,18 @@ describe('judgeModel (shared case table: modelJudgment)', () => {
     for (const entry of cases.modelJudgment.cases) {
         it(entry.name, () => {
             const allowed = entry.allowed ? { kind: 'allowedSet' as const, values: entry.allowed.values, default: entry.allowed.default, source: 'organization' as const } : null;
-            const verdict = judgeModel({ agent: entry.agent as OrgAgent, model: entry.model, origin: entry.origin as 'explicit' | 'resume' | 'none', allowed });
+            const verdict = judgeModel({ agent: entry.agent as OrgAgent, model: entry.model, origin: entry.origin as ModelOrigin, allowed });
             expect(verdict).toMatchObject(entry.expect);
         });
     }
+});
+
+describe('messageModelOrigin', () => {
+    it('reads a model the client router picked as not chosen by the person (R10.2a Auto)', () => {
+        expect(messageModelOrigin('claude-opus-5-5', 'auto')).toBe('auto');
+        expect(messageModelOrigin('claude-opus-5-5', 'user')).toBe('explicit');
+        expect(messageModelOrigin('claude-opus-5-5', undefined)).toBe('explicit');
+        expect(messageModelOrigin(null, 'auto')).toBe('none');
+        expect(messageModelOrigin('', undefined)).toBe('none');
+    });
 });

@@ -1250,7 +1250,7 @@
     ]
   },
   "modelJudgment": {
-    "about": "spec R10.2 / R10.2a: what a turn runs under ai.models. origin explicit = chosen for this turn or by the spawn (a person or an automation picked it); resume = carried over from an earlier process (not chosen now); none = nothing chosen. allow runs the requested model unchanged; substitute runs the policy default of the same agent, else that agent's first allowed model, with the model's default effort; deny refuses the turn.",
+    "about": "spec R10.2 / R10.2a: what a turn runs under ai.models. origin explicit = chosen for this turn or by the spawn (a person or an automation picked it); resume = carried over from an earlier process (not chosen now); auto = picked by a router, not by the person (the client router's `modelSource: auto`, or the daemon's delegated difficulty routing), judged like resume; none = nothing chosen. allow runs the requested model unchanged; substitute runs the policy default of the same agent, else that agent's first allowed model, with the model's default effort; deny refuses the turn.",
     "cases": [
       {
         "name": "no ai.models item allows anything",
@@ -1386,6 +1386,38 @@
             "codex:gpt-6.1-sol"
           ],
           "default": null
+        },
+        "expect": {
+          "kind": "allow"
+        }
+      },
+      {
+        "name": "an Auto pick outside the set runs on an allowed model, never refused",
+        "agent": "claude",
+        "model": "claude-opus-5-5",
+        "origin": "auto",
+        "allowed": {
+          "values": [
+            "claude:claude-sonnet-5-5"
+          ],
+          "default": null
+        },
+        "expect": {
+          "kind": "substitute",
+          "model": "claude-sonnet-5-5"
+        }
+      },
+      {
+        "name": "an Auto pick inside the set runs as routed",
+        "agent": "codex",
+        "model": "gpt-6.1-sol",
+        "origin": "auto",
+        "allowed": {
+          "values": [
+            "codex:gpt-5.5",
+            "codex:gpt-6.1-sol"
+          ],
+          "default": "codex:gpt-5.5"
         },
         "expect": {
           "kind": "allow"

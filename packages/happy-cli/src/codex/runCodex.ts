@@ -90,7 +90,7 @@ import type { PermissionMode } from '@/api/types';
 import type { ApiSessionClient } from '@/api/apiSession';
 import { resolveCodexExecutionPolicy } from './executionPolicy';
 import { refusedTurnEnvelopes, type OrgRequirementsGate } from '@/orgRequirements/gate';
-import type { ModelOrigin } from '@/orgRequirements/resolve';
+import { messageModelOrigin as orgModelOrigin, type ModelOrigin } from '@/orgRequirements/resolve';
 import { createSessionOrgRequirementsGate } from '@/orgRequirements/sessionGate';
 import { resolveRemoteCodexPermissionMode } from './permissionMode';
 import { isSandboxFallbackNetworkLoss } from './sandboxInitFailurePolicy';
@@ -656,7 +656,7 @@ export async function runCodex(opts: {
         let messageModelOrigin = currentModelOrigin;
         if (message.meta?.hasOwnProperty('model')) {
             messageModel = message.meta.model || undefined;
-            messageModelOrigin = messageModel ? 'explicit' : 'none';
+            messageModelOrigin = orgModelOrigin(messageModel, message.meta.modelSource);
             if (!delegatedDifficultyRoutingMessage) {
                 currentModel = messageModel;
                 currentModelOrigin = messageModelOrigin;
@@ -781,7 +781,7 @@ export async function runCodex(opts: {
                     : null;
 
         if (routed) {
-            if (routed.route.model) messageModelOrigin = 'explicit';
+            if (routed.route.model) messageModelOrigin = 'auto';
             messageModel = routed.route.model ?? messageModel;
             if (isSupportedCodexReasoningEffort(routed.route.effort)) {
                 messageEffort = routed.route.effort;
