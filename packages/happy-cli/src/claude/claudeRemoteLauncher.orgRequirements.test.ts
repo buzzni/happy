@@ -154,4 +154,62 @@ describe('remote launcher under organization requirements', () => {
 
         expect(launches.map((launch) => launch.model)).toEqual(['claude-sonnet-5-5']);
     });
+
+    it('relaunches the provider with the organization blocks when they change between two turns of one setting', async () => {
+        home = mkdtempSync(join(tmpdir(), 'launcher-org-'));
+        const gate = createOrgRequirementsGate({
+            agent: 'claude', happyHomeDir: home, serverUrl: 'https://s', accountKey: 'a',
+            sessionId: () => 'org-tools-test', projectHint: null, publish: () => {}, refresh: async () => {},
+        });
+        const rules = (tool: string) => ({ kind: 'response' as const, status: 'ok' as const, requirements: {
+            schemaVersion: 1, companyId: 'c1', revision: 2, modelPolicyUpdatedAt: null, issuedAt: 1,
+            items: { 'tools.rules': { kind: 'rules', rules: [{ id: 'r', tool, decision: 'blocked', since: 2 }] } },
+        } });
+        gate.onRequirements(rules('mcp__gmail__*'));
+        const orgRequirements = createClaudeOrgRequirements(gate, { normalizeModel: (model) => model, attendance: () => 'attended', initialPermissionMode: () => 'default' });
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const launches: Options[] = [];
+        const received: unknown[] = [];
+        vi.mocked(query).mockImplementation(({ prompt, options }) => {
+            launches.push(options!);
+            const response = (async function* () {
+                yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [] };
+                for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                    received.push(message.message.content);
+                    yield { type: 'result', subtype: 'success', result: '', is_error: false, uuid: `result-${received.length}` };
+                    // The 5-minute refresh brings a different block while the first turn's provider is still up.
+                    if (received.length === 1) gate.onRequirements(rules('mcp__github__*'));
+                    if (received.length === 2) { void handlers.get('switch')!(); return; }
+                }
+            })();
+            return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+        });
+        const client = {
+            sessionId: 'org-tools-test',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        const turnMode = (): EnhancedMode => ({ permissionMode: 'default', model: 'claude-sonnet-5-5', orgModel: { requested: 'claude-sonnet-5-5', origin: 'explicit' } });
+        queue.push('first', turnMode());
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+            cancelLessonReview: vi.fn(),
+            sessionId: null, path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+            orgRequirements,
+        } as unknown as Session;
+
+        const running = claudeRemoteLauncher(session);
+        await vi.waitFor(() => expect(received).toHaveLength(1));
+        queue.push('second', turnMode());
+        await running;
+
+        expect(received).toEqual(['first', 'second']);
+        expect(launches.map((launch) => launch.disallowedTools)).toEqual([['mcp__gmail'], ['mcp__github']]);
+    });
 });

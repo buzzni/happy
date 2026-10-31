@@ -109,6 +109,20 @@ describe('organization requirements session gate', () => {
         });
     });
 
+    describe('blanket tool blocks (R10.2 disallowedTools)', () => {
+        it('lists the tool globs of blocked rules naming no target or action, nothing without a document', () => {
+            const gate = make();
+            expect(gate.blockedTools()).toEqual([]);
+            gate.onRequirements({ kind: 'response', status: 'ok', requirements: doc({ 'tools.rules': { kind: 'rules', rules: [
+                { id: 'no-mail', tool: 'mcp__gmail__*', decision: 'blocked', since: 3 },
+                { id: 'notes-only', tool: 'mcp__cua-driver__*', target: 'com.apple.Notes', decision: 'blocked', since: 3 },
+                { id: 'ask-drive', tool: 'mcp__drive__*', decision: 'ask', since: 3 },
+                { id: 'no-delete', tool: 'mcp__github__delete_repo', decision: 'blocked', since: 3 },
+            ] } }) });
+            expect(gate.blockedTools()).toEqual(['mcp__gmail__*', 'mcp__github__delete_repo']);
+        });
+    });
+
     describe('unattended ceiling denial (R10.12)', () => {
         it('treats only what the requested mode would have run unasked as caused by the ceiling', () => {
             const gate = make();

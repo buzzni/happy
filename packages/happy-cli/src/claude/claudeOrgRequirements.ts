@@ -93,6 +93,22 @@ export function orgTitleModel(gate: OrgRequirementsGate | null, requested: strin
     return gate?.restrictsModels() ? launched : requested ?? launched;
 }
 
+/**
+ * An organization tool glob as a Claude Code permission rule, or null where Claude Code has none (R10.2): an
+ * exact name, or a whole MCP server (`mcp__srv__*` → `mcp__srv`). Any other glob stays with the tool policy hook.
+ */
+export function claudeDisallowRule(glob: string): string | null {
+    if (!glob.includes('*')) return glob;
+    const server = /^(mcp__[^*_]+(?:_[^*_]+)*)__\*$/.exec(glob);
+    return server ? server[1] : null;
+}
+
+/** The turn's `disallowedTools` with the organization's blanket blocks added: the SDK refuses them even with no hook. */
+function withOrgBlocks(disallowed: string[] | undefined, blocked: string[]): string[] | undefined {
+    const added = blocked.map(claudeDisallowRule).filter((rule): rule is string => rule !== null && !(disallowed ?? []).includes(rule));
+    return added.length === 0 ? disallowed : [...(disallowed ?? []), ...new Set(added)];
+}
+
 const BYPASS_FLAGS = new Set(['--dangerously-skip-permissions', '--allow-dangerously-skip-permissions']);
 
 export function createClaudeOrgRequirements(gate: OrgRequirementsGate, deps: {
@@ -111,12 +127,16 @@ export function createClaudeOrgRequirements(gate: OrgRequirementsGate, deps: {
                 fallbackModel: mode.fallbackModel,
             });
             if (verdict.kind === 'refuse') return { kind: 'refuse', message: verdict.message };
-            if (!verdict.modeClamped && !verdict.substituteModel && !verdict.dropFallbackModel) return { kind: 'run', mode, modeClamped: false };
+            const disallowedTools = withOrgBlocks(mode.disallowedTools, gate.blockedTools());
+            if (!verdict.modeClamped && !verdict.substituteModel && !verdict.dropFallbackModel && disallowedTools === mode.disallowedTools) {
+                return { kind: 'run', mode, modeClamped: false };
+            }
             return {
                 kind: 'run',
                 modeClamped: verdict.modeClamped,
                 mode: {
                     ...mode,
+                    ...(disallowedTools !== mode.disallowedTools ? { disallowedTools } : {}),
                     permissionMode: verdict.permissionMode as PermissionMode,
                     // A model the person did not pick this turn: its default effort, as Desktop resets it (R10.2a).
                     ...(verdict.substituteModel ? { model: deps.normalizeModel(verdict.substituteModel), effort: undefined } : {}),

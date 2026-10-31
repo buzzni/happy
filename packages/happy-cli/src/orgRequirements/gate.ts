@@ -132,6 +132,8 @@ export interface OrgRequirementsGate {
     /** A model chosen for the turn after it was checked (auto-routing's floor): allowed as an explicit choice? */
     modelAllowed(model: string): boolean;
     toolRules(): OrgToolRules | null;
+    /** Tool globs of `blocked` rules naming no target or action: blocked whatever the call says (R10.2, R10.3). */
+    blockedTools(): string[];
     autopilotDisabled(): boolean;
     /** Organization tool rule verdicts from the tool policy gate (R17). */
     auditToolRule(entry: { tool: string; decision: string; reasonCode: string; ruleId: string }): void;
@@ -218,6 +220,9 @@ export function createOrgRequirementsGate(options: {
         const item = document()?.items['tools.rules'];
         return item?.kind === 'rules' ? item.rules : [];
     };
+    // Rules naming a target or an action are judged per call by the tool policy gate; a blanket block
+    // also applies to what a turn or a remembered answer may allow.
+    const blanketBlocks = () => orgRules().filter((rule) => rule.decision === 'blocked' && rule.target === undefined && rule.action === undefined);
 
     const republish = () => {
         const state = snapshot.publicState();
@@ -322,9 +327,7 @@ export function createOrgRequirementsGate(options: {
                 result.mode = clamp.mode;
             }
             if (answer.allowTools) {
-                // Rules naming a target or an action are judged per call by the tool policy gate; a blanket
-                // block can be applied to the remembered allow-list itself.
-                const blocking = orgRules().filter((rule) => rule.decision === 'blocked' && rule.target === undefined && rule.action === undefined);
+                const blocking = blanketBlocks();
                 result.allowTools = answer.allowTools.filter((tool) => {
                     const blocked = blocking.some((rule) => toolGlobMatches(rule.tool, tool));
                     if (blocked) enforce('tools.rules', tool, null, 'requirement_tool_blocked', true);
@@ -351,6 +354,7 @@ export function createOrgRequirementsGate(options: {
         },
         restrictsModels: () => aiModels() !== null,
         modelAllowed: (model) => judgeModel({ agent, model, origin: 'explicit', allowed: aiModels() }).kind === 'allow',
+        blockedTools: () => blanketBlocks().map((rule) => rule.tool),
         toolRules: () => {
             const current = document();
             return current ? { companyId: current.companyId, revision: current.revision, rules: orgRules() } : null;

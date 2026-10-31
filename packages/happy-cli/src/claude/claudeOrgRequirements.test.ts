@@ -42,6 +42,21 @@ describe('Claude runner adapter of the organization gate', () => {
         expect(verdict).toEqual({ kind: 'run', modeClamped: true, mode: { permissionMode: 'default', model: 'sonnet-runtime', effort: undefined, fallbackModel: undefined, orgModel: { requested: null, origin: 'none' } } });
     });
 
+    it('adds the blanket organization blocks to the turn disallowedTools, in the forms Claude Code reads', () => {
+        gate.onRequirements({ kind: 'response', status: 'ok', requirements: doc({ 'tools.rules': { kind: 'rules', rules: [
+            { id: 'no-mail', tool: 'mcp__gmail__*', decision: 'blocked', since: 3 },
+            { id: 'no-delete', tool: 'mcp__github__delete_repo', decision: 'blocked', since: 3 },
+            // A glob Claude Code has no rule form for stays with the tool policy hook.
+            { id: 'no-mcp-delete', tool: 'mcp__*__delete*', decision: 'blocked', since: 3 },
+            { id: 'notes-only', tool: 'mcp__cua-driver__*', target: 'com.apple.Notes', decision: 'blocked', since: 3 },
+        ] } }) });
+        const verdict = adapter().checkTurn(mode({ disallowedTools: ['WebFetch', 'mcp__gmail'] }));
+        expect(verdict).toMatchObject({ kind: 'run', modeClamped: false, mode: { disallowedTools: ['WebFetch', 'mcp__gmail', 'mcp__github__delete_repo'] } });
+        // Nothing to add: the batch's own mode, unchanged.
+        const input = mode({ disallowedTools: ['mcp__gmail', 'mcp__github__delete_repo'] });
+        expect(adapter().checkTurn(input)).toEqual({ kind: 'run', mode: input, modeClamped: false });
+    });
+
     it('refuses a batch whose explicit model is outside the set', () => {
         gate.onRequirements({ kind: 'response', status: 'ok', requirements: doc({ 'ai.models': { kind: 'allowedSet', values: ['claude:claude-sonnet-5-5'], default: null, source: 'organization' } }) });
         expect(adapter().checkTurn(mode({ orgModel: { requested: 'claude-opus-5-5', origin: 'explicit' } }))).toMatchObject({ kind: 'refuse' });

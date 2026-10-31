@@ -1298,7 +1298,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 msg = { ...msg, mode: { ...msg.mode, model: resolved.model,
                                     effort: (resolved.effort ?? undefined) as EnhancedMode['effort'] } };
                             }
-                            const engineModeChanged = mode && (mode.model !== msg.mode.model || mode.effort !== msg.mode.effort);
+                            // The organization's blanket tool blocks join a batch's disallowedTools at the turn boundary,
+                            // after its hash was taken: a change reaches the SDK only with a new provider.
+                            const engineModeChanged = mode && (mode.model !== msg.mode.model || mode.effort !== msg.mode.effort
+                                || !isDeepStrictEqual(mode.disallowedTools, msg.mode.disallowedTools));
                             if ((modeHash && msg.hash !== modeHash) || engineModeChanged || msg.isolate) {
                                 /*
                                  * A restart ends this provider's input and waits for it to
