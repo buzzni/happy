@@ -173,6 +173,90 @@ function setup(
 }
 
 describe('AI credential machine runtime', () => {
+  it('captures a newer live Codex login instead of the stale pool credential, without running a provider request', async () => {
+    const token = (exp: number) => `header.${Buffer.from(JSON.stringify({ sub: 'same-user', exp })).toString('base64url')}.signature`
+    const current = codexMultiAuthBundle()
+    current.accounts.accounts[0]!.accessToken = token(1)
+    Object.assign(current.accounts, { activeIndex: 2, pinnedAccountIndex: 1, activeIndexByFamily: { codex: 2 } })
+    Object.assign(current.accounts.accounts[0]!, { enabled: false, currentWorkspaceIndex: 2 })
+    const live = { tokens: { account_id: 'account-a', access_token: token(9999999999), refresh_token: 'new-login-refresh', id_token: token(9999999999) } }
+    const configured = setup()
+    const poolPath = '/home/operator/.codex/multi-auth/openai-codex-accounts.json'
+    const authPath = '/home/operator/.codex/auth.json'
+    configured.files.set(poolPath, JSON.stringify(current.accounts))
+    configured.files.set(authPath, JSON.stringify(live))
+
+    const captured = JSON.parse((await configured.runtime.capture({ provider: 'codex' })).payload)
+
+    expect(captured.accounts.accounts[0]).toMatchObject({ accountId: 'account-a', accessToken: live.tokens.access_token, refreshToken: 'new-login-refresh' })
+    expect(captured.accounts.accounts.slice(1)).toEqual(current.accounts.accounts.slice(1))
+    expect(captured.accounts).toMatchObject({ activeIndex: 2, pinnedAccountIndex: 1, activeIndexByFamily: { codex: 2 } })
+    expect(captured.accounts.accounts[0]).toMatchObject({ enabled: false, currentWorkspaceIndex: 2 })
+    expect(configured.files.get(poolPath)).toBe(JSON.stringify(current.accounts))
+    expect(configured.files.get(authPath)).toBe(JSON.stringify(live))
+    expect(configured.calls.some(call => call.command === 'codex')).toBe(false)
+    expect(captured.recoveryAuth).toBeUndefined()
+  })
+
+  it.each([
+    { name: 'a newer pool login', storedExp: 9999999999, liveExp: 9999999998, accountId: 'account-a', subject: 'same-user' },
+    { name: 'an equally fresh pool login', storedExp: 9999999999, liveExp: 9999999999, accountId: 'account-a', subject: 'same-user' },
+    { name: 'an expired live login', storedExp: 1, liveExp: 2, accountId: 'account-a', subject: 'same-user' },
+    { name: 'another workspace of the same user', storedExp: 1, liveExp: 9999999999, accountId: 'other-workspace', subject: 'same-user' },
+    { name: 'another user on the same workspace', storedExp: 1, liveExp: 9999999999, accountId: 'account-a', subject: 'other-user' },
+  ])('preserves the Codex capture for $name', async ({ storedExp, liveExp, accountId, subject }) => {
+    const token = (sub: string, exp: number) => `header.${Buffer.from(JSON.stringify({ sub, exp })).toString('base64url')}.signature`
+    const current = codexMultiAuthBundle()
+    current.accounts.accounts[0]!.accessToken = token('same-user', storedExp)
+    const configured = setup({ now: () => 10000 })
+    configured.files.set('/home/operator/.codex/multi-auth/openai-codex-accounts.json', JSON.stringify(current.accounts))
+    configured.files.set('/home/operator/.codex/auth.json', JSON.stringify({ tokens: { account_id: accountId, access_token: token(subject, liveExp), refresh_token: 'different-refresh' } }))
+
+    expect(JSON.parse((await configured.runtime.capture({ provider: 'codex' })).payload)).toEqual(current)
+    expect(configured.writeFile).not.toHaveBeenCalled()
+  })
+
+  it.each(['auth.json', 'multi-auth/openai-codex-accounts.json'])('refuses a newer live Codex snapshot when %s changes during capture', async changedFile => {
+    const token = (exp: number) => `header.${Buffer.from(JSON.stringify({ sub: 'same-user', exp })).toString('base64url')}.signature`
+    const current = codexMultiAuthBundle()
+    current.accounts.accounts[0]!.accessToken = token(1)
+    let reads = 0
+    const configured = setup({ readFile: vi.fn(async path => {
+      const raw = configured.files.get(path)
+      if (path === `/home/operator/.codex/${changedFile}` && ++reads === 2) return `${raw} `
+      if (raw === undefined) throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+      return raw
+    }) })
+    configured.files.set('/home/operator/.codex/multi-auth/openai-codex-accounts.json', JSON.stringify(current.accounts))
+    configured.files.set('/home/operator/.codex/auth.json', JSON.stringify({ tokens: { account_id: 'account-a', access_token: token(9999999999), refresh_token: 'new-login-refresh' } }))
+
+    await expect(configured.runtime.capture({ provider: 'codex' })).rejects.toMatchObject({ kind: 'AI_CREDENTIAL_LOST_RACE' })
+    expect(configured.writeFile).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { name: 'truncated', raw: '{"tokens":{"account_id":"acc' },
+    { name: 'non-object', raw: 'null' },
+    { name: 'unreadable', error: 'EACCES' },
+  ])('keeps the Codex pool capture when the live auth.json is $name', async ({ raw, error }) => {
+    const current = codexMultiAuthBundle()
+    const authPath = '/home/operator/.codex/auth.json'
+    const warn = vi.fn()
+    const configured = setup({ warn, readFile: vi.fn(async path => {
+      if (path === authPath && error) throw Object.assign(new Error('/private/path fixture-secret'), { code: error })
+      const value = configured.files.get(path)
+      if (value === undefined) throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+      return value
+    }) })
+    configured.files.set('/home/operator/.codex/multi-auth/openai-codex-accounts.json', JSON.stringify(current.accounts))
+    if (raw !== undefined) configured.files.set(authPath, raw)
+
+    expect(JSON.parse((await configured.runtime.capture({ provider: 'codex' })).payload)).toEqual(current)
+    expect(configured.writeFile).not.toHaveBeenCalled()
+    expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining('could not read auth.json'))
+    expect(warn.mock.calls.flat().join(' ')).not.toContain('fixture-secret')
+  })
+
   it('captures the working live Codex login into a recovery snapshot without changing the source files', async () => {
     const current = codexMultiAuthBundle()
     const token = (sub: string) => `header.${Buffer.from(JSON.stringify({ sub, exp: 9999999999 })).toString('base64url')}.signature`
