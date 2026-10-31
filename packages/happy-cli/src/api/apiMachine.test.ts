@@ -1809,9 +1809,9 @@ describe('ApiMachineClient socket reconnection', () => {
         expect(machine.metadata?.automationSupport?.hostCommands).toBe(expected);
         expect(machine.metadata?.automationSupport?.conversation).toBe(true);
         expect(MachineMetadataSchema.parse(machine.metadata).automationSupport?.conversation).toBe(true);
-        // Desktop은 이 목록에 없는 일정 종류(once/weekly)를 저장하지 않는다 — 스키마가 걸러내면 기능이 조용히 꺼진다.
+        // Desktop은 이 목록에 없는 일정 종류(once/weekly/*-zoned)를 저장하지 않는다 — 스키마가 걸러내면 기능이 조용히 꺼진다.
         expect(MachineMetadataSchema.parse(machine.metadata).automationSupport?.scheduleKinds)
-            .toEqual(['interval', 'daily', 'once', 'weekly']);
+            .toEqual(['interval', 'daily', 'once', 'weekly', 'daily-zoned', 'once-zoned', 'weekly-zoned']);
         // Saycode specs/_archive/automation-result-delivery R3 — Desktop offers messenger delivery only on this.
         expect(MachineMetadataSchema.parse(machine.metadata).automationSupport?.delivery).toBe(1);
         client.shutdown();
