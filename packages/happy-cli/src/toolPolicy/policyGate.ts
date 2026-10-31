@@ -181,8 +181,8 @@ export function createToolPolicyGate(deps: {
             } catch {
                 verdict = evaluationErrorVerdict(call.toolName, tables);
             }
-            if (verdict.decision !== 'allow' && (verdict.ruleId.startsWith('org:') || verdict.reasonCode === 'org_rule_revision')) {
-                deps.orgAudit?.({ tool: call.toolName, decision: verdict.decision, reasonCode: verdict.reasonCode, ruleId: verdict.ruleId });
+            if (verdict.decision !== 'allow' && (verdict.ruleId.startsWith('org:') || verdict.orgRuleId !== undefined)) {
+                deps.orgAudit?.({ tool: call.toolName, decision: verdict.decision, reasonCode: verdict.reasonCode, ruleId: verdict.orgRuleId ?? verdict.ruleId });
             }
 
             if (verdict.decision === 'allow') {

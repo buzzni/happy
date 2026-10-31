@@ -95,6 +95,8 @@ export interface PolicyVerdict {
     message?: string;
     /** An organization `ask` is in force: a grant must have been made at this revision or later (R1a). */
     orgSince?: number;
+    /** That organization rule (`org:<id>`), also where `ruleId` still names the ask it joined (R17). */
+    orgRuleId?: string;
 }
 
 const NO_BYPASS = '이 제한을 스크립트·자동화 도구·셸 명령 등 다른 방법으로 우회하지 마라.';
@@ -337,7 +339,7 @@ function applyOrgRules(toolName: string, verdict: PolicyVerdict, org: OrgToolRul
     }
     if (verdict.decision === 'blocked') return verdict;
     const newest = matching.reduce((a, b) => (b.since > a.since ? b : a));
-    const constraint = { humanOnly: true, orgSince: newest.since };
+    const constraint = { humanOnly: true, orgSince: newest.since, orgRuleId: `org:${newest.id}` };
     return verdict.decision === 'allow'
         ? { ...verdict, ...constraint, decision: 'ask', reasonCode: 'org_rule', ruleId: `org:${newest.id}`, auditAllow: true }
         : { ...verdict, ...constraint };

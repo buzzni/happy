@@ -76,6 +76,15 @@ describe('tool policy gate with organization rules', () => {
         expect(asked).toHaveLength(2);
     });
 
+    it('records an organization ask that joins an ask of its own in the organization audit, under the organization rule', async () => {
+        const org = { current: { companyId: 'c1', revision: 5, rules: [{ id: 'ask-mail', tool: 'mcp__gmail__send_email', decision: 'ask' as const, since: 5 }] } };
+        const { call, asked, orgAudit } = setup(org);
+        expect(await call('mcp__gmail__send_email')).toEqual({ kind: 'allow' });
+        // The builtin write ask stays the cause shown; the organization adds who may answer.
+        expect(asked).toEqual([{ toolName: 'mcp__gmail__send_email', humanOnly: true, reasonCode: 'high_risk_write' }]);
+        expect(orgAudit).toEqual([{ tool: 'mcp__gmail__send_email', decision: 'ask', reasonCode: 'high_risk_write', ruleId: 'org:ask-mail' }]);
+    });
+
     it('records a document revision on grants even when that document has no tool rules', async () => {
         const org = { current: { companyId: 'c1', revision: 7, rules: [] } };
         const { call, grants } = setup(org);
