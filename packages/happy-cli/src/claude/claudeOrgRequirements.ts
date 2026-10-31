@@ -19,6 +19,7 @@ import type { OrgModelRequest } from '@/orgRequirements/resolve';
 import type { EnhancedMode, PermissionMode } from './loop';
 import { mapToClaudeMode } from './utils/permissionMode';
 import { isZaiClaudeRuntime } from '@/utils/initialPrompt';
+import { ZAI_CLAUDE_DEFAULT_MODEL, ZAI_CLAUDE_MODELS } from '@/managed/zaiClaudeEnvironment';
 
 export type { OrgModelRequest };
 
@@ -69,17 +70,26 @@ const MODEL_SELECTION_ENV = [
     'CLAUDE_CODE_SUBAGENT_MODEL',
 ] as const;
 
+/** The tier mapping the daemon's Z.AI credential sets (`aiCredentialRuntime` accepts no other values). */
+const ZAI_TIER_ENV: Partial<Record<typeof MODEL_SELECTION_ENV[number], string>> = {
+    ANTHROPIC_MODEL: ZAI_CLAUDE_DEFAULT_MODEL,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: ZAI_CLAUDE_MODELS.opus,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: ZAI_CLAUDE_MODELS.sonnet,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: ZAI_CLAUDE_MODELS.haiku,
+};
+
 /**
  * While an organization restricts models, a request's environment must not run a model the turn did not
- * name: the turn's model goes to the SDK explicitly, and these go. A Z.AI runtime keeps them — its tier
- * mapping is the daemon's own environment, and without it every model name misses. Returns what was removed.
+ * name: the turn's model goes to the SDK explicitly, and these go. A Z.AI runtime keeps exactly the daemon's
+ * tier mapping — without it every model name misses — and loses any other value. Returns what was removed.
  */
 export function stripModelSelectionEnv(env: Record<string, string | undefined>, extra: Record<string, string> | undefined): string[] {
-    if (isZaiClaudeRuntime(env as NodeJS.ProcessEnv)) return [];
+    const zai = isZaiClaudeRuntime(env as NodeJS.ProcessEnv);
     const removed = new Set<string>();
     for (const key of MODEL_SELECTION_ENV) {
-        if (env[key] !== undefined) { delete env[key]; removed.add(key); }
-        if (extra && extra[key] !== undefined) { delete extra[key]; removed.add(key); }
+        const kept = zai ? ZAI_TIER_ENV[key] : undefined;
+        if (env[key] !== undefined && env[key] !== kept) { delete env[key]; removed.add(key); }
+        if (extra && extra[key] !== undefined && extra[key] !== kept) { delete extra[key]; removed.add(key); }
     }
     return [...removed];
 }

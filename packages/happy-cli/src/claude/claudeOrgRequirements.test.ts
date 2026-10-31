@@ -91,9 +91,15 @@ describe('Claude runner adapter of the organization gate', () => {
         expect(stripModelSelectionEnv(env, extra).sort()).toEqual(['ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_MODEL', 'ANTHROPIC_SMALL_FAST_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL']);
         expect(env).toEqual({ PATH: '/bin' });
         expect(extra).toEqual({ KEEP: '1' });
-        const zai: Record<string, string | undefined> = { ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic', ANTHROPIC_MODEL: 'glm-5.3-flash' };
+        const zai: Record<string, string | undefined> = { ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic', ANTHROPIC_MODEL: 'glm-5.3-flash', ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.3' };
         expect(stripModelSelectionEnv(zai, undefined)).toEqual([]);
-        expect(zai.ANTHROPIC_MODEL).toBe('glm-5.3-flash');
+        expect(zai).toMatchObject({ ANTHROPIC_MODEL: 'glm-5.3-flash', ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.3' });
+        // Only the daemon's own tier mapping stays on Z.AI: a value it did not set, or a variable it never sets, goes.
+        const zaiOverridden: Record<string, string | undefined> = { ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic', ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-4.7', CLAUDE_CODE_SUBAGENT_MODEL: 'glm-5.3' };
+        const zaiExtra: Record<string, string> = { ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-5.3' };
+        expect(stripModelSelectionEnv(zaiOverridden, zaiExtra).sort()).toEqual(['ANTHROPIC_DEFAULT_HAIKU_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL']);
+        expect(zaiOverridden).toEqual({ ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic', ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-4.7' });
+        expect(zaiExtra).toEqual({});
     });
 
     it('launches the terminal without bypass and with the clipped mode under a ceiling', () => {
