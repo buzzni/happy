@@ -397,7 +397,7 @@ describe('once and weekly schedules', () => {
   it('accepts a one-time wall-clock date and a weekly day set', () => {
     expect(at({ kind: 'once', date: '2028-02-29', hour: 9, minute: 0 }).success).toBe(true);
     expect(at({ kind: 'weekly', days: [1, 3], hour: 23, minute: 59 }).success).toBe(true);
-    expect(AUTOMATION_SCHEDULE_KINDS).toEqual(['interval', 'daily', 'once', 'weekly']);
+    expect(AUTOMATION_SCHEDULE_KINDS).toEqual(['interval', 'daily', 'once', 'weekly', 'daily-zoned', 'once-zoned', 'weekly-zoned']);
   });
 
   it.each([
@@ -411,6 +411,36 @@ describe('once and weekly schedules', () => {
     { kind: 'weekly', days: [1], hour: 9, minute: 60 },
   ])('rejects a schedule no daemon can place on the calendar: %j', (schedule) => {
     expect(at(schedule).success).toBe(false);
+  });
+});
+
+describe('time-zoned schedules (aplus-dev-studio-desktop specs/chat-scheduled-tasks T42)', () => {
+  const at = (schedule: unknown) => automationPayloadSchema.safeParse({ ...payload, schedule });
+
+  it('keeps the IANA zone a wall-clock schedule is meant in', () => {
+    for (const schedule of [
+      { kind: 'daily-zoned', hour: 9, minute: 0, timeZone: 'Asia/Seoul' },
+      { kind: 'once-zoned', date: '2028-02-29', hour: 9, minute: 0, timeZone: 'UTC' },
+      { kind: 'weekly-zoned', days: [1, 3], hour: 23, minute: 59, timeZone: 'America/Los_Angeles' },
+    ]) {
+      const parsed = at(schedule);
+      expect(parsed.success && parsed.data.schedule).toEqual(schedule);
+    }
+  });
+
+  it.each([
+    { kind: 'daily-zoned', hour: 9, minute: 0 },
+    { kind: 'daily-zoned', hour: 9, minute: 0, timeZone: '' },
+    { kind: 'daily-zoned', hour: 9, minute: 0, timeZone: 'Mars/Olympus' },
+    { kind: 'once-zoned', date: '2027-02-29', hour: 9, minute: 0, timeZone: 'UTC' },
+    { kind: 'weekly-zoned', days: [], hour: 9, minute: 0, timeZone: 'UTC' },
+  ])('rejects a zoned schedule without a usable zone or calendar slot: %j', (schedule) => {
+    expect(at(schedule).success).toBe(false);
+  });
+
+  it('never strips the zone into a plain wall-clock schedule run on the PC clock', () => {
+    const parsed = at({ kind: 'daily', hour: 9, minute: 0, timeZone: 'Asia/Seoul' });
+    expect(parsed.success && parsed.data.schedule).toEqual({ kind: 'daily', hour: 9, minute: 0 });
   });
 });
 

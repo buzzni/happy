@@ -37,6 +37,9 @@ describe('automation draft', () => {
     it.each([
         { kind: 'once', date: '2026-10-19', hour: 9, minute: 0 },
         { kind: 'weekly', days: [1, 3], hour: 9, minute: 0 },
+        { kind: 'daily-zoned', hour: 9, minute: 0, timeZone: 'Asia/Seoul' },
+        { kind: 'once-zoned', date: '2026-10-19', hour: 9, minute: 0, timeZone: 'Asia/Seoul' },
+        { kind: 'weekly-zoned', days: [1], hour: 9, minute: 0, timeZone: 'Asia/Seoul' },
     ])('does not silently convert a $kind schedule into a daily one', (schedule) => {
         const project = { id: 'project-1', name: 'Project', membership: 'owner' as const, config: null };
         expect(() => automationDraftFor(project, { row: {} as never, payload: { schedule } as never, runs: [] }))

@@ -6,7 +6,7 @@ export const SCRIPT_AUTOMATION_PAYLOAD_VERSION = 3;
 export const SCRIPT_AUTOMATION_CAPABILITY = 'script-invocations-v1';
 export const SCRIPT_AUTOMATION_PROTOCOL_VERSION = 5;
 
-const timezoneSchema = z.string().min(1).max(100).refine((value) => {
+export const timezoneSchema = z.string().min(1).max(100).refine((value) => {
   try { new Intl.DateTimeFormat('en', { timeZone: value }); return true; }
   catch { return false; }
 }, 'Invalid IANA timezone');

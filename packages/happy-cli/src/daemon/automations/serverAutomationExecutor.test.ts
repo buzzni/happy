@@ -4845,6 +4845,25 @@ describe('one-time and weekly schedules (desktop-schedule-kinds)', () => {
     }
   }
 
+  it('runs a due time-zoned one-time schedule once and then never claims it again', async () => {
+    const fixture = setup({ claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } } })
+    withSchedule(fixture, { ...pastOnce, kind: 'once-zoned', timeZone: 'Asia/Seoul' })
+
+    await runServerAutomationTick(fixture.input)
+    expect(fixture.transport.claim).toHaveBeenCalledTimes(1)
+    expect(fixture.store.state().schedules[0]!.nextRunAt).toBe(NEVER_RUN_AT)
+  })
+
+  it('places a time-zoned one-time schedule at that zone\'s wall clock', async () => {
+    const fixture = setup({ generation: 3 })
+    fixture.store.write({ ...fixture.store.read(), schedules: [] })
+    withSchedule(fixture, { kind: 'once-zoned', date: '1970-01-02', hour: 9, minute: 0, timeZone: 'Asia/Seoul' })
+
+    await runServerAutomationTick(fixture.input)
+
+    expect(fixture.store.state().schedules[0]).toMatchObject({ generation: 3, nextRunAt: Date.UTC(1970, 0, 2, 0, 0) })
+  })
+
   it('claims a one-time schedule first seen shortly after its time', async () => {
     const fixture = setup({ generation: 3, claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } } })
     fixture.store.write({ ...fixture.store.read(), schedules: [] })

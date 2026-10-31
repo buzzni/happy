@@ -7,6 +7,7 @@ import {
   sealAuthenticatedEnvelope,
   type MachinePayloadOpening,
 } from './authenticatedEnvelope';
+import { timezoneSchema } from './scriptAutomation';
 
 export const AUTOMATION_RUN_NOW_PROTOCOL_VERSION = 2;
 export const AUTOMATION_ISSUE_TRIGGER_PROTOCOL_VERSION = 3;
@@ -70,11 +71,17 @@ export const automationScheduleSchema = z.discriminatedUnion('kind', [
   // daemons fail to parse these kinds and skip the automation rather than run it.
   z.object({ kind: z.literal('once'), date: calendarDateSchema, ...wallClockTime }),
   z.object({ kind: z.literal('weekly'), days: weekdaysSchema, ...wallClockTime }),
+  // The same slots in a named IANA zone instead of the machine clock. Separate
+  // kinds, not an optional field: an older daemon would strip the zone and run on
+  // its own clock, while an unknown kind makes it skip the automation.
+  z.object({ kind: z.literal('daily-zoned'), ...wallClockTime, timeZone: timezoneSchema }),
+  z.object({ kind: z.literal('once-zoned'), date: calendarDateSchema, ...wallClockTime, timeZone: timezoneSchema }),
+  z.object({ kind: z.literal('weekly-zoned'), days: weekdaysSchema, ...wallClockTime, timeZone: timezoneSchema }),
 ]);
 export type AutomationSchedule = z.infer<typeof automationScheduleSchema>;
 
 /** Prompt schedule kinds a daemon advertises as `automationSupport.scheduleKinds` (github is a trigger, not listed). */
-export const AUTOMATION_SCHEDULE_KINDS = ['interval', 'daily', 'once', 'weekly'] as const;
+export const AUTOMATION_SCHEDULE_KINDS = ['interval', 'daily', 'once', 'weekly', 'daily-zoned', 'once-zoned', 'weekly-zoned'] as const;
 
 function isCalendarDate(value: string): boolean {
   const [year, month, day] = value.split('-').map(Number);

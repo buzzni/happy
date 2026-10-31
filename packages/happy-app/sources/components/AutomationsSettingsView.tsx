@@ -41,8 +41,10 @@ function scheduleLabel(schedule: AutomationSchedule): string {
     if (schedule.kind === 'interval') return `Every ${schedule.minutes} minutes`;
     if (schedule.kind === 'github') return 'GitHub event trigger';
     const time = `${String(schedule.hour).padStart(2, '0')}:${String(schedule.minute).padStart(2, '0')}`;
-    if (schedule.kind === 'once') return `Once on ${schedule.date} at ${time}`;
-    if (schedule.kind === 'weekly') return `Weekly (${schedule.days.map((day) => WEEKDAYS[day]).join(', ')}) at ${time}`;
+    const zone = 'timeZone' in schedule ? ` (${schedule.timeZone})` : '';
+    if (schedule.kind === 'once' || schedule.kind === 'once-zoned') return `Once on ${schedule.date} at ${time}${zone}`;
+    if (schedule.kind === 'weekly' || schedule.kind === 'weekly-zoned') return `Weekly (${schedule.days.map((day) => WEEKDAYS[day]).join(', ')}) at ${time}${zone}`;
+    if (schedule.kind === 'daily-zoned') return `Daily at ${time}${zone}`;
     return `Daily at ${String(schedule.hour).padStart(2, '0')}:${String(schedule.minute).padStart(2, '0')}`;
 }
 
