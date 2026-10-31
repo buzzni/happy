@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import tweetnacl from 'tweetnacl';
 import { machineKeyDigest, signOrgSetupTokenDocument } from '@slopus/happy-wire';
 import { encodeBase64 } from '@/api/encryption';
-import { CompanyKeyReseedError } from '@/datakey/machineControl';
+import { CompanyKeyReseedError, CompanyKeyReseedUnsettledError } from '@/datakey/machineControl';
 import { createCompanyKeyReseedHandler } from './companyKeyReseedHandler';
 
 const org = tweetnacl.sign.keyPair();
@@ -96,6 +96,13 @@ describe('createCompanyKeyReseedHandler', () => {
         const { handler, events } = setup({ reseed: async () => { throw new CompanyKeyReseedError('STALE_GENERATION', 'old') } });
         expect(await handler({ companyId: 'company-1', declaration: await declaration() })).toMatchObject({ success: false, errorCode: 'STALE_GENERATION' });
         expect(events).toEqual(['close', 'reopen']);
+    });
+
+    it('stays closed and restarts when the server may already hold the new key', async () => {
+        const { handler, events } = setup({ reseed: async () => { throw new CompanyKeyReseedUnsettledError('unknown') } });
+        expect(await handler({ companyId: 'company-1', declaration: await declaration() })).toMatchObject({ success: false, errorCode: 'RESEED_FAILED' });
+        expect(events).toEqual(['close', 'restart']);
+        expect(await handler({ companyId: 'company-1', declaration: await declaration() })).toMatchObject({ success: false, errorCode: 'BUSY' });
     });
 
     it('does not restart when the machine already used the key', async () => {
