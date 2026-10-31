@@ -212,4 +212,50 @@ describe('remote launcher under organization requirements', () => {
         expect(received).toEqual(['first', 'second']);
         expect(launches.map((launch) => launch.disallowedTools)).toEqual([['mcp__gmail'], ['mcp__github']]);
     });
+
+    it('ends a run-once session whose only turn the organization refuses', async () => {
+        home = mkdtempSync(join(tmpdir(), 'launcher-org-'));
+        const gate = createOrgRequirementsGate({
+            agent: 'claude', happyHomeDir: home, serverUrl: 'https://s', accountKey: 'a',
+            sessionId: () => 'org-run-once-test', projectHint: null, publish: () => {}, refresh: async () => {},
+        });
+        gate.onRequirements({ kind: 'response', status: 'ok', requirements: {
+            schemaVersion: 1, companyId: 'c1', revision: 2, modelPolicyUpdatedAt: null, issuedAt: 1,
+            items: { 'ai.models': { kind: 'allowedSet', values: ['claude:claude-sonnet-5-5'], default: null, source: 'organization' } },
+        } });
+        const orgRequirements = createClaudeOrgRequirements(gate, { normalizeModel: (model) => model, attendance: () => 'unattended', initialPermissionMode: () => 'default' });
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const ends: string[] = [];
+        const client = {
+            sessionId: 'org-run-once-test',
+            rpcHandlerManager: { registerHandler: () => {} },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(),
+            closeClaudeSessionTurn: vi.fn((status: string) => ends.push(status)), sendSessionEvent: vi.fn(),
+        };
+        vi.mocked(query).mockImplementation(() => { throw new Error('a refused run-once turn must not reach the provider'); });
+        // The automation's one turn, on a model the organization does not allow; the queue stays open.
+        queue.push('scheduled', { permissionMode: 'default', model: 'claude-opus-5-5', orgModel: { requested: 'claude-opus-5-5', origin: 'explicit' } });
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+            cancelLessonReview: vi.fn(),
+            sessionId: null, path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+            exitAfterFirstTurn: true,
+            orgRequirements,
+        } as unknown as Session;
+
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const outcome = await Promise.race([
+            claudeRemoteLauncher(session),
+            new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('the run-once session kept waiting')), 5_000); }),
+        ]).finally(() => clearTimeout(timer));
+
+        expect(outcome).toBe('exit');
+        expect(ends).toEqual(['failed']);
+    }, 15_000);
 });
+

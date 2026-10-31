@@ -2412,6 +2412,11 @@ export async function runCodex(opts: {
                         session.inputEvidence.commitPending();
                         for (const envelope of refusedTurnEnvelopes(org.message, message.channelRequestId)) session.sendSessionProtocolMessage(envelope);
                         messageBuffer.addMessage(org.message, 'status');
+                        // A run-once session's one turn was this refusal: it ended like any finished turn.
+                        if (exitAfterFirstTurn) {
+                            runOnceTurnEnded = true;
+                            if (capacityRetryTimer === null) shouldExit = true;
+                        }
                         emitReadyIfIdle({ pending, queueSize: () => messageQueue.size(), shouldExit, sendReady });
                         continue;
                     }

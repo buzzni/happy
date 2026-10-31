@@ -1215,6 +1215,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                     transientRetry.userTurnStarted(); setupTokenSwitching?.userTurnStarted();
                                     refuseOrgTurn(msg, org.message);
                                     drain?.releaseClaim();
+                                    // A run-once session's one turn was this refusal: it ended, nothing else will come.
+                                    if (session.exitAfterFirstTurn) {
+                                        if (proof) proof.inputExhausted = true;
+                                        exitReason = 'exit';
+                                        transientRetry.cancel();
+                                        return null;
+                                    }
                                     msg = null;
                                     continue;
                                 }

@@ -295,6 +295,21 @@ describe('the real Codex consumer loop under organization requirements', () => {
         expect(events().some((ev) => ev?.t === 'turn-end' && ev.status === 'failed')).toBe(false);
     }, 60_000);
 
+    it('ends a run-once automation whose only turn the organization refuses', async () => {
+        stubRequirements({ 'ai.models': { kind: 'allowedSet', values: ['codex:gpt-6.1-sol'], default: null, source: 'organization' } });
+        vi.stubEnv('HAPPY_AUTOMATION_RUN_ONCE', '1');
+        vi.stubEnv('HAPPY_INITIAL_PROMPT', 'review the pull request');
+        vi.stubEnv('HAPPY_INITIAL_MODEL', 'gpt-5.5');
+        // No queue close: a run-once session ends on its own after its one turn, refused or not.
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+            run(async () => {}),
+            new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('the run-once session kept waiting')), 15_000); }),
+        ]).finally(() => clearTimeout(timer));
+        expect(turnsSent).toEqual([]);
+        expect(events().some((ev) => ev?.t === 'turn-end' && ev.status === 'failed')).toBe(true);
+    }, 60_000);
+
     it('behaves exactly as before against a Studio that serves no requirements', async () => {
         stubRequirements(null);
         const { stub } = await run(async () => {
