@@ -39,6 +39,7 @@ import { installManagedDaemonRpcExecutor } from "@/app/api/socket/managedDaemonR
 import type { ManagedDaemonClaims } from "@/app/auth/managedDaemonToken";
 import { socketCorsOrigin } from "./cors";
 import { buildClientConnection, transportOnlyFromHandshake } from "@/app/api/socket/buildClientConnection";
+import { rejectedHandshakeLogLabel } from "@/app/monitoring/handshakeClientLabel";
 
 export function startSocket(app: Fastify, managedControl: ManagedControlRuntime | null = null) {
     // engine.io claims `/v1/updates` purely by path prefix, blind to Host —
@@ -301,7 +302,7 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             // One message for every way authentication can fail. A caller
             // learning *which* way would learn whether a given credential or
             // grant exists.
-            log({ module: 'websocket' }, `Invalid token provided`);
+            log({ module: 'websocket' }, `Invalid token provided (${rejectedHandshakeLogLabel(socket.handshake)})`);
             next(new Error('Invalid authentication token'));
             return;
         }
