@@ -21,12 +21,15 @@ export async function readBrowserSetupPolicy(file: string): Promise<BrowserSetup
     return value.scopes
 }
 export async function writeBrowserSetupPolicy(file: string, scopes: BrowserSetupPolicy): Promise<void> {
+    await writePrivateJson(file, { version: 1, scopes })
+}
+async function writePrivateJson(file: string, value: unknown): Promise<void> {
     await mkdir(dirname(file), { recursive: true, mode: 0o700 })
     const temporary = `${file}.${randomBytes(8).toString('hex')}.tmp`
     // fsync before rename: a crash must leave the old policy or the new one, never a truncated file
     // (an unreadable policy disables the whole bridge).
     const handle = await open(temporary, 'wx', 0o600)
-    try { await handle.writeFile(JSON.stringify({ version: 1, scopes })); await handle.sync() } finally { await handle.close() }
+    try { await handle.writeFile(JSON.stringify(value)); await handle.sync() } finally { await handle.close() }
     await rename(temporary, file)
 }
 export function localBrowserExtensionMetadata() {
