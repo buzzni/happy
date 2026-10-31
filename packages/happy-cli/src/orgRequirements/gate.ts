@@ -205,7 +205,8 @@ export function createOrgRequirementsGate(options: {
     let lastPublished = 'null';
     let lastTurn: { requested: number; applied: number } | null = null;
     let refreshing = false;
-    let summaryWritten = false;
+    /** Whether a session summary may be on disk: an earlier process of this (resumed) session may have left one. */
+    let summaryWritten = true;
 
     const document = (): OrgRequirementsDocument | null => snapshot.current();
     const ceiling = (): string | null => {
@@ -241,7 +242,7 @@ export function createOrgRequirementsGate(options: {
         republish();
     };
 
-    snapshot.onChange(() => {
+    const writeSummary = () => {
         const sessionId = options.sessionId();
         const current = document();
         if (!sessionId) return;
@@ -253,7 +254,8 @@ export function createOrgRequirementsGate(options: {
             store.writeSessionSummary(sessionId, null);
             summaryWritten = false;
         }
-    });
+    };
+    snapshot.onChange(writeSummary);
 
     const clampMode = (mode: string): { mode: string; clamped: boolean } => {
         const max = ceiling();
@@ -263,6 +265,10 @@ export function createOrgRequirementsGate(options: {
     return {
         onRequirements: (outcome) => {
             snapshot.ingest(outcome);
+            // No document and not merely unknown: the organization let go (or there is none). A summary an
+            // earlier process left would otherwise keep the daemon refusing the quality gate; this process's
+            // own document never changed, so no change listener fires for it.
+            if (summaryWritten && !document() && !snapshot.publicState()) writeSummary();
             republish();
         },
         prepare: (permissionMode) => {

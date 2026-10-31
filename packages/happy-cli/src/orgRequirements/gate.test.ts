@@ -239,6 +239,20 @@ describe('organization requirements session gate', () => {
             gate.onRequirements({ kind: 'response', status: 'ok', requirements: doc({}, 4) });
             expect(daemonView.readSessionSummary('s1')).toBeNull();
         });
+
+        it('withdraws a summary an earlier process of this session left once the organization lets go, keeps it on a failed lookup', () => {
+            const daemonView = createOrgRequirementsStore({ happyHomeDir: home, serverUrl: 'https://s', accountKey: 'daemon' });
+            make().onRequirements({ kind: 'response', status: 'ok', requirements: doc({ 'autopilot.enabled': { kind: 'fixed', value: false } }) });
+            // A resumed session: a new process, nothing written by it yet.
+            const failed = make();
+            failed.onRequirements({ kind: 'failed' });
+            expect(daemonView.readSessionSummary('s1')).toEqual({ companyId: 'c1', autopilotDisabled: true });
+            make().onRequirements({ kind: 'response', status: 'ok', requirements: doc({}, 4) });
+            expect(daemonView.readSessionSummary('s1')).toBeNull();
+            make().onRequirements({ kind: 'response', status: 'ok', requirements: doc({ 'autopilot.enabled': { kind: 'fixed', value: false } }, 5) });
+            make().onRequirements({ kind: 'response', status: 'no-company', requirements: null });
+            expect(daemonView.readSessionSummary('s1')).toBeNull();
+        });
     });
 
     it('shows the clipped mode without recording an enforcement', () => {
