@@ -4187,7 +4187,13 @@ export class ApiMachineClient {
         if (!this.managedHandlers) this.socket.on('terminal-frame-fwd', (msg) => {
             const { sessionId, data } = msg || {};
             const entry = getDaemonTerminalSession(sessionId);
-            if (!entry || typeof data !== 'string') return;
+            if (typeof sessionId !== 'string' || typeof data !== 'string') return;
+            if (!entry) {
+                // A v2 resume arrives as a frame; with no keys left to seal an answer, the plaintext
+                // unknown-session of terminal-resume-fwd is it — silence left the client waiting forever.
+                this.socket.emit('terminal-closed', { sessionId, reason: 'unknown-session' });
+                return;
+            }
             if (entry.binding) {
                 this.receiveBoundTerminalFrame(sessionId, entry, entry.binding, data);
                 return;
