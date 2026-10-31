@@ -178,11 +178,21 @@ contact를 골라, spawn은 desktop-z로, 뒤에 후보로 추가된 desktop-a�
   거짓이면 다른 후보가 있어도 보내지 않는다. 호출자는 같은 operation으로 나중에 다시 조회한다. 같은 instance의
   갱신된 contact(새 epoch)는 그대로 쓴다. 새 Desktop으로 재결속하지 않는다.
 - **기록은 contact(binding) 수명 동안 host 메모리에만 있다.** broker IPC와 chat socket은 같은 contact를 쓰므로
-  기록을 공유한다. 상한 512건, 마지막 사용 후 24시간이 지난 항목은 새 항목을 넣을 때 정리하고, 상한에 닿으면
-  진행 중이 아닌 가장 오래된 항목부터 지운다.
+  기록을 공유한다.
+- **송신했지만 끝나지 않은 operation은 지우지 않는다(PIN-R1-01).** RPC 하나가 끝났다고 Desktop의 operation이 끝난
+  것은 아니다. 지운 키를 다시 보면 과거 operation인지 알 수 없어 새 후보에 재결속하게 되므로, 기록은 검증된 응답에서
+  종결을 관측했을 때만 정리 대상이 된다. 종결은 `allowed` 응답의 child `started`·`failed`와 prompt 저장 receipt뿐이다.
+  `pending`·`parked`, `unknown`·`unavailable`·`not_owned`, timeout, 응답 검증 실패는 종결이 아니다. `localid_conflict`는
+  wire에 별도 결과가 없어(불일치는 `unknown`) 종결로 보지 않는다.
+- **정리와 상한(PIN-R1-02).** 상한은 512건이다. 새 키를 넣을 때 진행 중이 아닌 종결 항목만, 마지막 사용 뒤 24시간이
+  지났거나 상한에 닿은 경우 오래된 것부터 지운다. 미송신 항목은 마지막 호출이 끝날 때 지워진다. 정리한 뒤에도 상한이면
+  새 operation은 송신 없이 `owner-contact-unavailable`이고, 이미 기록된 operation의 호출은 계속 받는다. 호출의 정리는
+  작업이 끝날 때와 20초 기한이 끝날 때 중 먼저 오는 쪽에서 한 번 한다. adapter가 abort를 무시해 작업이 끝나지 않아도
+  진행 중 수가 남지 않는다. 기한이 지난 뒤의 작업은 송신 전 abort 검사에 걸려 보내지 않는다.
 - **한계: host 재시작·재개 뒤에는 기록이 없다.** 새 binding의 첫 호출은 기존 정렬 규칙으로 고르므로, 그 사이 정렬상
   앞선 Desktop이 생겼으면 이전 operation의 status가 그 operation의 journal이 없는 Desktop으로 갈 수
-  있다. 상한·24시간 정리로 지워진 operation도 같다. 영속 기록이나 Desktop 정보를
+  있다. 정리는 종결된 operation만 지우므로 host 수명 안에서는 이 재결속이 생기지 않는다. 그 대가로 끝나지 않은
+  operation이 512건 쌓이면 그 host의 새 spawn·prompt는 host 재시작 전까지 unavailable이다. 영속 기록이나 Desktop 정보를
   wire·CLI journal에 싣는 일은 wire 변경이라 하지 않았다.
 - **고정하지 않는 operation**: `lookup-readable-sessions`·`read-session`은 instance별 journal 없이 현재 상태를 읽는
   조회라 어느 유효 Desktop이 답해도 같다. `resume-own-session`·`reply-own-permission`·`abort-own-turn`은 wire에
@@ -194,3 +204,10 @@ Desktop, prompt 같은 localId 재시도 고정·다른 localId는 새 선택, �
 선택은 고정하지 않음). 구현 전 앞의 3건 실패. 역검증 3건: 송신 확정 표시를 지우면 고정 3건, 고정 instance 대신
 첫 후보로 failover하면 철회 테스트, 미송신 기록 삭제를 지우면 미송신 테스트가 각각 실패했다. `sessionOwnerContact`·
 `sessionOwnerContactHost`·`sessionOwnerContactLocal` 테스트 68건 통과, `tsc --noEmit` 통과.
+
+PIN-R1 반영 검증: 6건 추가. 상한을 채운 다른 operation 뒤에도 pending operation 고정 유지, 24시간 뒤 timeout operation
+고정 유지, 종결 child·prompt receipt만 정리 대상, 모든 칸이 미종결이면 새 operation 거부·기존 operation 허용, abort를 무시한
+adapter에서 기한 뒤 미송신 선택 해제. 상한 테스트는 `pinLimit` 주입(8)으로 같은 경계를 빠르게 검증한다(기본 512). 기한을
+fake timer로 검증하려고 `AbortSignal.timeout`을 해제되는 일반 timer로 바꿨다(별도 구조 커밋). 구현 전 4건 실패.
+역검증 6건: 정리의 종결 조건 제거, 상한 거부 제거, 기한 경로의 해제 제거, child 종결 판정을 항상 거짓·항상 참으로,
+prompt 종결 판정을 거짓으로 바꾸면 해당 테스트가 각각 실패했다. 관련 3파일 74건 통과, `tsc --noEmit` 통과.

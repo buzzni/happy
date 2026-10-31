@@ -21,6 +21,8 @@ export interface SessionOwnerContactDependencies {
     currentContact(contact: OwnershipRelayContact, signal: AbortSignal): Promise<boolean>;
     /** Session-DEK-bound Happy RPC, pinned to contact.method; no retry/failover. */
     exchange(contact: OwnershipRelayContact, request: OwnerRelayRequest, signal: AbortSignal): Promise<unknown>;
+    /** Operation pin table capacity; defaults to 512. */
+    pinLimit?: number;
 }
 export type OwnerContactSource = { sessionId: string; machineId: string; happyAccountId: string; callerBindingId: string; hostEpoch: string };
 export interface SessionOwnerContact { call(raw: unknown): Promise<OwnerRelayReply>; close(): void }
@@ -33,21 +35,34 @@ function operationKey(request: OwnerContactRequest): string | null {
         default: return null;
     }
 }
+/** Only a verified terminal reply ends an operation: a started/failed child, a stored prompt receipt.
+ * pending/parked/unknown/unavailable/not_owned, a timeout or a rejected reply leave it to be recovered. */
+function finished(reply: OwnerRelayReply): boolean {
+    if (reply.result !== 'allowed') return false;
+    switch (reply.operation) {
+        case 'spawn-owned-child': case 'owned-child-status': return reply.childSpawn.state === 'started' || reply.childSpawn.state === 'failed';
+        case 'prompt-own-session': return true;
+        default: return false;
+    }
+}
 const PIN_LIMIT = 512, PIN_TTL_MS = 24 * 60 * 60 * 1000;
-type Pin = { desktopInstanceId: string; usedAt: number; sent: boolean; inflight: number };
+type Pin = { desktopInstanceId: string; usedAt: number; sent: boolean; finished: boolean; inflight: number };
 export function createSessionOwnerContact(deps: SessionOwnerContactDependencies): SessionOwnerContact {
     const binding = OwnershipCallerBindingSchema.parse(deps.binding);
     const enabled = deps.enabled === true;
     const lifetime = new AbortController();
     const same = (a: unknown, b: unknown) => canonicalOwnerRelayJson(a) === canonicalOwnerRelayJson(b);
-    // Host-memory only (lost on host restart). Bounded; idle entries are dropped oldest-first.
-    const pins = new Map<string, Pin>();
+    // Host-memory only (lost on host restart). A sent, unfinished operation is never dropped: forgetting it
+    // would re-bind its next status to another Desktop. Cleanup takes idle finished entries, oldest first
+    // (unsent ones go when their last call ends); a table still full refuses only a new operation.
+    const pins = new Map<string, Pin>(), pinLimit = deps.pinLimit ?? PIN_LIMIT;
     function claim(key: string, first: string | undefined): Pin | null {
         let pin = pins.get(key);
         if (!pin) {
             if (first === undefined) return null;
-            for (const [k, p] of pins) if (p.inflight === 0 && (deps.now() - p.usedAt > PIN_TTL_MS || pins.size >= PIN_LIMIT)) pins.delete(k);
-            pin = { desktopInstanceId: first, usedAt: 0, sent: false, inflight: 0 };
+            for (const [k, p] of pins) if (p.inflight === 0 && p.finished && (deps.now() - p.usedAt > PIN_TTL_MS || pins.size >= pinLimit)) pins.delete(k);
+            if (pins.size >= pinLimit) throw new Error('contact-unavailable');
+            pin = { desktopInstanceId: first, usedAt: 0, sent: false, finished: false, inflight: 0 };
         }
         pins.delete(key); pins.set(key, pin);
         pin.usedAt = deps.now(); pin.inflight++;
@@ -84,6 +99,8 @@ export function createSessionOwnerContact(deps: SessionOwnerContactDependencies)
             const signal = AbortSignal.any([lifetime.signal, deadline.signal]);
             const key = operationKey(local);
             let pin: Pin | null = null;
+            // Once per call, from whichever ends first: the work, or the deadline over an adapter ignoring abort.
+            const drop = () => { const held = pin; pin = null; if (key && held) release(key, held); };
             const work = async () => { try {
                 await current();
                 const candidates = await deps.lookup({ sessionId: binding.sessionId, machineId: binding.machineId,
@@ -110,8 +127,10 @@ export function createSessionOwnerContact(deps: SessionOwnerContactDependencies)
                     || !await verifyOwnerRelayReply(rawReply, request, contact, deps.now())) throw new Error('invalid-owner-reply');
                 await current(); signal.throwIfAborted();
                 if (!valid(contact)) throw new Error('contact-unavailable');
-                return OwnerRelayReplySchema.parse(rawReply);
-            } finally { if (key && pin) release(key, pin); } };
+                const reply = OwnerRelayReplySchema.parse(rawReply);
+                if (pin && finished(reply)) pin.finished = true;
+                return reply;
+            } finally { drop(); } };
             // Bound even an adapter that ignores AbortSignal; never expose its exception/credentials.
             let onAbort: () => void = () => {};
             try {
@@ -121,7 +140,7 @@ export function createSessionOwnerContact(deps: SessionOwnerContactDependencies)
                     if (signal.aborted) onAbort();
                 })]);
             } catch { throw new Error('owner-contact-unavailable'); }
-            finally { clearTimeout(timer); signal.removeEventListener('abort', onAbort); }
+            finally { clearTimeout(timer); signal.removeEventListener('abort', onAbort); drop(); }
         },
     };
 }
