@@ -20,6 +20,7 @@ import { createClaudeOrgRequirements } from './claudeOrgRequirements';
 import { claudeRemoteLauncher } from './claudeRemoteLauncher';
 import type { EnhancedMode } from './loop';
 import type { Session } from './session';
+import { FakeStreamableHttpMcpServer } from '@/testing/fakeStreamableHttpMcpServer';
 
 const MODEL = 'haiku';
 
@@ -127,5 +128,79 @@ describe('organization permission ceiling with the real Claude CLI', () => {
         const result = await runBypassTurn(dir, { 'autopilot.enabled': { kind: 'fixed', value: false } });
         expect(result.asked).toEqual([]);
         expect(result.ran).toBe(true);
+    }, 200_000);
+});
+
+/**
+ * The organization's blanket tool block as the turn's `disallowedTools` (R10.2): no PreToolUse hook
+ * runs here, which is what `HAPPY_TOOL_POLICY=off` or a hook that failed to start leaves.
+ */
+async function runMcpTurn(workdir: string, items: Record<string, unknown>) {
+    const mcp = new FakeStreamableHttpMcpServer();
+    await mcp.start();
+    const gate = createOrgRequirementsGate({
+        agent: 'claude', happyHomeDir: join(workdir, 'home'), serverUrl: 'https://s', accountKey: 'a',
+        sessionId: () => 'org-tools-cli', projectHint: null, publish: () => {}, refresh: async () => {},
+    });
+    gate.onRequirements({ kind: 'response', status: 'ok', requirements: { schemaVersion: 1, companyId: 'c1', revision: 1, modelPolicyUpdatedAt: null, issuedAt: 1, items } });
+    const orgRequirements = createClaudeOrgRequirements(gate, { normalizeModel: (model) => model, attendance: () => 'attended', initialPermissionMode: () => 'bypassPermissions' });
+    const queue = new MessageQueue2<EnhancedMode>(hashObject);
+    const handlers = new Map<string, (params: unknown) => Promise<unknown>>();
+    const results: string[] = [];
+    let ended!: () => void;
+    const turnEnded = new Promise<void>((resolve) => { ended = resolve; });
+    const client = {
+        sessionId: 'org-tools-cli',
+        rpcHandlerManager: { registerHandler: (name: string, handler: (params: unknown) => Promise<unknown>) => handlers.set(name, handler) },
+        updateAgentState: () => {}, updateMetadata: () => {}, getMetadata: () => ({}),
+        setClaudeRuntimeAccount: () => {},
+        sendClaudeSessionMessage: (record: { type?: string; message?: { content?: unknown } }) => {
+            const content = record.type === 'user' && Array.isArray(record.message?.content) ? record.message.content as Array<{ type?: string; content?: unknown }> : [];
+            for (const block of content) if (block.type === 'tool_result') results.push(JSON.stringify(block.content));
+        },
+        sendStreamDelta: () => {},
+        setPendingTurnRequestId: () => {}, sendFinalAnswerForChannelTurn: () => {},
+        applyClaudeTurnResult: () => {}, noteContextUsageSignal: () => {},
+        closeClaudeSessionTurn: () => { ended(); },
+        sendSessionEvent: () => {}, resetContextUsage: () => {}, sendTurnLatency: () => {},
+        sendSessionProtocolMessage: () => {}, bindChannelPermissionWhenKnown: () => {},
+        setTransientRetryPending: () => {}, noteInputQueueEmpty: () => {},
+    };
+    queue.push('Call the MCP tool mcp__fixture__read_fixture once if you have it, then reply with its output, or with the single word unavailable if you do not have that tool.', {
+        permissionMode: 'bypassPermissions', model: MODEL, orgModel: { requested: null, origin: 'none' },
+    });
+    const session = {
+        lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+        cancelLessonReview: () => {},
+        sessionId: null, path: workdir, queue, client, mcpServers: { fixture: { type: 'http', url: mcp.url } },
+        managedSettingsLockdown: true,
+        api: { push: () => ({ sendSessionNotification: () => {} }) },
+        consumeOneTimeFlags: () => {}, onThinkingChange: () => {}, onSessionFound: () => {}, clearSessionId: () => {},
+        orgRequirements,
+    } as unknown as Session;
+    const launched = claudeRemoteLauncher(session);
+    try {
+        await Promise.race([turnEnded, new Promise((_, reject) => setTimeout(() => reject(new Error('the turn did not end')), 150_000))]);
+    } finally {
+        void handlers.get('switch')?.(null);
+        await launched.catch(() => undefined);
+        await mcp.stop();
+    }
+    return { toolRan: results.some((result) => result.includes('fixture-ready')) };
+}
+
+describe('organization tool block with the real Claude CLI and no tool policy hook', () => {
+    it('keeps a blocked MCP server out of the turn', async (ctx) => {
+        dir = mkdtempSync(join(tmpdir(), 'org-tools-cli-'));
+        if (!await isClaudeAvailable(dir)) ctx.skip();
+        const result = await runMcpTurn(dir, { 'tools.rules': { kind: 'rules', rules: [{ id: 'no-fixture', tool: 'mcp__fixture__*', decision: 'blocked', since: 1 }] } });
+        expect(result.toolRan).toBe(false);
+    }, 200_000);
+
+    it('runs the same MCP tool when the organization blocks nothing (control)', async (ctx) => {
+        dir = mkdtempSync(join(tmpdir(), 'org-tools-cli-'));
+        if (!await isClaudeAvailable(dir)) ctx.skip();
+        const result = await runMcpTurn(dir, { 'autopilot.enabled': { kind: 'fixed', value: false } });
+        expect(result.toolRan).toBe(true);
     }, 200_000);
 });
