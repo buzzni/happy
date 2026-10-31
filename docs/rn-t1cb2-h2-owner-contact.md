@@ -161,3 +161,36 @@ depth≥1 broker 테스트의 chat lookup 기대를 갱신했다. 구현 전 2�
 테스트 1건씩만 실패했다. 관련 7파일(`sessionOwnerContactHost/Local/Contact`, `sessionAgentBroker`, `startHappyServer`,
 `childEnv`, `agentCallerLaunches`의 `.test.ts`) 159건 통과·1건 기존 skip, `tsc --noEmit` 통과. 실소켓 테스트는 이 세션
 셸에서 listen이 가능해 직접 실행했다.
+
+## operation별 Desktop 고정 (2026-10-31, D4 교차 리뷰 R3-02)
+
+p0a §4.5 다중 Desktop 단락: "유효 contact 하나를 operation 시작 시 선택·고정하고, timeout에 다른 instance로
+재송신하지 않고 기존 operation/localId를 조회한다". 이전 `call()`은 호출마다 lookup 후 desktopInstanceId 정렬 첫
+contact를 골라, spawn은 desktop-z로, 뒤에 후보로 추가된 desktop-a가 앞서면 같은 operation의 status는 desktop-a로
+갔다. Desktop main의 생성 journal·localId 중복 판정은 instance별이라 원래 Desktop의 결과를 회수할 수 없었다.
+
+- **키는 wire에 이미 있는 값이다.** `spawn-owned-child`·`owned-child-status`는 `payload.operationId`,
+  `prompt-own-session`은 `(targetSessionId, localId)`. wire(schema·fixture)는 바꾸지 않았다.
+- **고정 시점은 실제 송신 직전이다.** 처음 고른 instance를 기록하고, exchange를 시작하면 그 기록이 확정된다.
+  timeout·응답 검증 실패 뒤에도 확정 기록은 남는다. lookup·`currentContact`·서명 단계에서 실패해 어느 Desktop에도
+  보내지 않았으면 기록을 지워, 다음 시도는 기존 규칙으로 고른다. 같은 operation의 동시 호출은 진행 중 기록을 공유한다.
+- **고정 Desktop이 유효 contact가 아니면 `owner-contact-unavailable`이다.** 철회·만료·서명 불일치·`currentContact`
+  거짓이면 다른 후보가 있어도 보내지 않는다. 호출자는 같은 operation으로 나중에 다시 조회한다. 같은 instance의
+  갱신된 contact(새 epoch)는 그대로 쓴다. 새 Desktop으로 재결속하지 않는다.
+- **기록은 contact(binding) 수명 동안 host 메모리에만 있다.** broker IPC와 chat socket은 같은 contact를 쓰므로
+  기록을 공유한다. 상한 512건, 마지막 사용 후 24시간이 지난 항목은 새 항목을 넣을 때 정리하고, 상한에 닿으면
+  진행 중이 아닌 가장 오래된 항목부터 지운다.
+- **한계: host 재시작·재개 뒤에는 기록이 없다.** 새 binding의 첫 호출은 기존 정렬 규칙으로 고르므로, 그 사이 정렬상
+  앞선 Desktop이 생겼으면 이전 operation의 status가 그 operation의 journal이 없는 Desktop으로 갈 수
+  있다. 상한·24시간 정리로 지워진 operation도 같다. 영속 기록이나 Desktop 정보를
+  wire·CLI journal에 싣는 일은 wire 변경이라 하지 않았다.
+- **고정하지 않는 operation**: `lookup-readable-sessions`·`read-session`은 instance별 journal 없이 현재 상태를 읽는
+  조회라 어느 유효 Desktop이 답해도 같다. `resume-own-session`·`reply-own-permission`·`abort-own-turn`은 wire에
+  operation 식별자가 없어 호출 하나가 operation 하나이고, 결과 unknown 뒤에는 같은 요청을 다른 Desktop에 재송신하는
+  대신 호출자가 read로 상태를 확인한다. target만으로 묶으면 무관한 operation까지 한 Desktop에 묶이므로 키로 쓰지 않는다.
+
+검증: `sessionOwnerContact.test.ts`에 5건(spawn→status 고정, 고정 Desktop 철회 시 다른 Desktop 0회·복구 후 같은
+Desktop, prompt 같은 localId 재시도 고정·다른 localId는 새 선택, 다른 operation·다른 operationId 영향 없음, 미송신
+선택은 고정하지 않음). 구현 전 앞의 3건 실패. 역검증 3건: 송신 확정 표시를 지우면 고정 3건, 고정 instance 대신
+첫 후보로 failover하면 철회 테스트, 미송신 기록 삭제를 지우면 미송신 테스트가 각각 실패했다. `sessionOwnerContact`·
+`sessionOwnerContactHost`·`sessionOwnerContactLocal` 테스트 68건 통과, `tsc --noEmit` 통과.

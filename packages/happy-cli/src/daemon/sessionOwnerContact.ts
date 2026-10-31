@@ -3,7 +3,7 @@ import { randomUUID, randomBytes } from 'node:crypto';
 import {
     OwnerContactRequestSchema, OwnershipRelayContactSchema, OwnershipCallerBindingSchema,
     canonicalOwnerRelayJson, ownershipFresh, verifyOwnership, verifyOwnerRelayReply,
-    OwnerRelayReplySchema, type OwnerRelayRequest, type OwnerRelayReply, type OwnershipRelayContact,
+    OwnerRelayReplySchema, type OwnerContactRequest, type OwnerRelayRequest, type OwnerRelayReply, type OwnershipRelayContact,
 } from '@slopus/happy-wire';
 import { z } from 'zod';
 import type { createAgentCallerBindings } from './agentCallerBinding';
@@ -24,11 +24,39 @@ export interface SessionOwnerContactDependencies {
 }
 export type OwnerContactSource = { sessionId: string; machineId: string; happyAccountId: string; callerBindingId: string; hostEpoch: string };
 export interface SessionOwnerContact { call(raw: unknown): Promise<OwnerRelayReply>; close(): void }
+/** Desktop P0a §4.5: an operation stays on the instance it was first sent to; its creation journal and
+ * localId dedupe live only there. Keyed by wire ids; other operations keep a Desktop-free selection. */
+function operationKey(request: OwnerContactRequest): string | null {
+    switch (request.operation) {
+        case 'spawn-owned-child': case 'owned-child-status': return JSON.stringify(['child', request.payload.operationId]);
+        case 'prompt-own-session': return JSON.stringify(['prompt', request.targetSessionId, request.localId]);
+        default: return null;
+    }
+}
+const PIN_LIMIT = 512, PIN_TTL_MS = 24 * 60 * 60 * 1000;
+type Pin = { desktopInstanceId: string; usedAt: number; sent: boolean; inflight: number };
 export function createSessionOwnerContact(deps: SessionOwnerContactDependencies): SessionOwnerContact {
     const binding = OwnershipCallerBindingSchema.parse(deps.binding);
     const enabled = deps.enabled === true;
     const lifetime = new AbortController();
     const same = (a: unknown, b: unknown) => canonicalOwnerRelayJson(a) === canonicalOwnerRelayJson(b);
+    // Host-memory only (lost on host restart). Bounded; idle entries are dropped oldest-first.
+    const pins = new Map<string, Pin>();
+    function claim(key: string, first: string | undefined): Pin | null {
+        let pin = pins.get(key);
+        if (!pin) {
+            if (first === undefined) return null;
+            for (const [k, p] of pins) if (p.inflight === 0 && (deps.now() - p.usedAt > PIN_TTL_MS || pins.size >= PIN_LIMIT)) pins.delete(k);
+            pin = { desktopInstanceId: first, usedAt: 0, sent: false, inflight: 0 };
+        }
+        pins.delete(key); pins.set(key, pin);
+        pin.usedAt = deps.now(); pin.inflight++;
+        return pin;
+    }
+    function release(key: string, pin: Pin) {
+        // A choice that never reached a Desktop binds nothing; a sent one stays even after a timeout.
+        if (--pin.inflight === 0 && !pin.sent && pins.get(key) === pin) pins.delete(key);
+    }
     async function current() {
         if (lifetime.signal.aborted) throw new Error('owner-contact-closed');
         const result = await deps.registry.query({ sessionId: binding.sessionId, nonce: randomUUID() });
@@ -50,7 +78,9 @@ export function createSessionOwnerContact(deps: SessionOwnerContactDependencies)
             // Snapshot before awaits; strict local schema rejects source/scope/authority injection.
             const local = OwnerContactRequestSchema.parse(JSON.parse(canonicalOwnerRelayJson(raw, 65536)));
             const signal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(20000)]);
-            const work = async () => {
+            const key = operationKey(local);
+            let pin: Pin | null = null;
+            const work = async () => { try {
                 await current();
                 const candidates = await deps.lookup({ sessionId: binding.sessionId, machineId: binding.machineId,
                     happyAccountId: binding.happyAccountId, callerBindingId: binding.callerBindingId, hostEpoch: binding.hostEpoch }, signal);
@@ -59,7 +89,9 @@ export function createSessionOwnerContact(deps: SessionOwnerContactDependencies)
                 const contacts = candidates.map(c => OwnershipRelayContactSchema.safeParse(c))
                     .flatMap(p => p.success && valid(p.data) ? [p.data] : [])
                     .sort((a, b) => a.desktopInstanceId < b.desktopInstanceId ? -1 : a.desktopInstanceId > b.desktopInstanceId ? 1 : 0);
-                const contact = contacts[0];
+                pin = key ? claim(key, contacts[0]?.desktopInstanceId) : null;
+                // A pinned instance that is no longer a valid contact is unavailable; never fail over.
+                const contact = pin ? contacts.find(c => c.desktopInstanceId === pin!.desktopInstanceId) : contacts[0];
                 if (!contact || !await deps.currentContact(contact, signal)) throw new Error('contact-unavailable');
                 await current(); signal.throwIfAborted();
                 if (!valid(contact)) throw new Error('contact-unavailable');
@@ -67,6 +99,7 @@ export function createSessionOwnerContact(deps: SessionOwnerContactDependencies)
                     sourceHubSessionId: binding.sessionId, sourceRuntimeId: binding.runtimeId, callerBindingId: binding.callerBindingId,
                     hostEpoch: binding.hostEpoch, sourceAuthority: contact.sourceAuthority, relayEpoch: contact.epoch });
                 await current(); signal.throwIfAborted();
+                if (pin) pin.sent = true;
                 const rawReply = JSON.parse(canonicalOwnerRelayJson(await deps.exchange(contact, request, signal)));
                 await current(); signal.throwIfAborted();
                 if (!valid(contact) || !await deps.currentContact(contact, signal)
@@ -74,7 +107,7 @@ export function createSessionOwnerContact(deps: SessionOwnerContactDependencies)
                 await current(); signal.throwIfAborted();
                 if (!valid(contact)) throw new Error('contact-unavailable');
                 return OwnerRelayReplySchema.parse(rawReply);
-            };
+            } finally { if (key && pin) release(key, pin); } };
             // Bound even an adapter that ignores AbortSignal; never expose its exception/credentials.
             let onAbort: () => void = () => {};
             try {
