@@ -17,7 +17,7 @@ class Socket extends EventEmitter {
     }
     close() { this.closed = true; this.emit('close') }
 }
-function fixture() {
+function fixture(extensionScope: () => Promise<{ viewerKey: string; account: string }> = async () => ({ viewerKey: alice, account: 'alice@example.com' })) {
     const bridge = new BrowserBridge({ authToken: baseToken })
     let now = 1000
     const policies: unknown[] = []
@@ -25,6 +25,7 @@ function fixture() {
         bridge, readToken: async () => baseToken, port: 41777,
         extension: () => ({ directory: '/test/browser-extension', id: 'emaponnolfbhnoaabgiebjmbdlmoifke', version: '0.1.0' }),
         persistPolicy: async policy => { policies.push(structuredClone(policy)) }, now: () => now,
+        extensionScope,
     })
     return { bridge, setup, policies, expire: () => { now += 300001 } }
 }
@@ -137,5 +138,75 @@ describe('trusted local browser setup', () => {
         })
         await expect(setup.begin(alice, 'My Chrome')).rejects.toThrow('disk')
         expect(await setup.status(alice)).toMatchObject({ state: 'idle' })
+    })
+})
+
+describe('extension-started connection', () => {
+    it('offers the server-resolved account without granting anything', async () => {
+        const { setup, bridge, policies } = fixture()
+        expect(await setup.offer()).toEqual({ account: 'alice@example.com' })
+        expect(policies).toEqual([])
+        expect(Object.hasOwn(bridge.getSetupPolicy(), alice)).toBe(false)
+    })
+    it('connects the asking profile under the server key and the pairing admits only that profile', async () => {
+        const { setup, bridge } = fixture()
+        const config = await setup.connect('default-1f8b')
+        expect(config).toMatchObject({ viewerKey: alice, profile: 'default-1f8b', host: '127.0.0.1', port: 41777 })
+        expect(config.token).not.toBe(baseToken)
+        expect(bridge.getSetupPolicy()[alice]).toEqual({ pairingId: config.pairingId, profile: 'default-1f8b' })
+        expect(bridge.handleConnection(new Socket(), { ...config, profile: 'other' })).toBe(false)
+        expect(bridge.handleConnection(new Socket(), config)).toBe(true)
+        expect(await setup.status(alice)).toMatchObject({ state: 'connected', profile: 'default-1f8b' })
+    })
+    it('replaces the earlier profile when the same account connects another profile', async () => {
+        const { setup, bridge } = fixture()
+        const first = await setup.connect('default-aaaa')
+        const socket = new Socket()
+        expect(bridge.handleConnection(socket, first)).toBe(true)
+        await setup.connect('default-bbbb')
+        expect(socket.closed).toBe(true)
+        expect(bridge.handleConnection(new Socket(), first)).toBe(false)
+    })
+    it.each([
+        ['MACHINE_NOT_ELIGIBLE', async () => { throw new Error('MACHINE_NOT_ELIGIBLE') }],
+        ['SCOPE_UNAVAILABLE', async () => { throw new Error('network down') }],
+        ['SCOPE_UNAVAILABLE', async () => ({ viewerKey: 'forged', account: 'x' })],
+    ] as const)('fails with %s and writes no grant', async (code, scope) => {
+        const { setup, policies } = fixture(scope)
+        await expect(setup.offer()).rejects.toThrow(code)
+        await expect(setup.connect('default-1f8b')).rejects.toThrow(code)
+        expect(policies).toEqual([])
+    })
+    it('serves offer and connect only over the authenticated control server with code-only failures', async () => {
+        let eligible = true
+        const { setup, bridge } = fixture(async () => {
+            if (!eligible) throw new Error('MACHINE_NOT_ELIGIBLE')
+            return { viewerKey: alice, account: 'alice@example.com' }
+        })
+        const control = await startDaemonControlServer({ browserBridge: bridge, browserLocalSetup: setup,
+            getChildren: () => [], stopSession: () => ({ status: 'not-found' } as any),
+            spawnSession: async () => ({ type: 'error', errorMessage: 'unused' } as any), requestShutdown: () => {}, onHappySessionWebhook: () => {},
+            portRegistry: { allocate: async () => ({ port: 30000, reused: false }), release: async () => false, readAll: async () => ({}) },
+        })
+        const post = (path: string, body: unknown, authenticated = true) => fetch(`http://127.0.0.1:${control.port}/browser/local-setup/${path}`, { method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...(authenticated ? { Authorization: `Bearer ${control.controlSecret}` } : {}) }, body: JSON.stringify(body) })
+        try {
+            expect((await post('offer', {}, false)).status).toBe(401)
+            expect((await post('connect', { profile: 'default-1f8b' }, false)).status).toBe(401)
+            expect(await (await post('offer', {})).json()).toEqual({ ok: true, account: 'alice@example.com' })
+            const connected = await (await post('connect', { profile: 'default-1f8b' })).json() as { ok: boolean; config: Record<string, unknown> }
+            expect(connected).toMatchObject({ ok: true, config: { viewerKey: alice, profile: 'default-1f8b' } })
+            expect((await post('connect', { profile: 'x', viewerKey: bob })).status).toBe(400)
+            eligible = false
+            const refused = await post('connect', { profile: 'default-1f8b' })
+            expect(refused.status).toBe(409)
+            expect(await refused.json()).toEqual({ ok: false, error: 'MACHINE_NOT_ELIGIBLE' })
+        } finally { await control.stop() }
+    })
+    it('reports an unconfigured server lookup as unavailable', async () => {
+        const bridge = new BrowserBridge({ authToken: baseToken })
+        const setup = new BrowserLocalSetup({ bridge, readToken: async () => baseToken, port: 41777,
+            extension: () => ({ directory: '/test', id: 'emaponnolfbhnoaabgiebjmbdlmoifke', version: '0.1.0' }), persistPolicy: async () => {} })
+        await expect(setup.offer()).rejects.toThrow('SCOPE_UNAVAILABLE')
     })
 })

@@ -1,6 +1,6 @@
 import { parseAllowlist } from './allowlist.js'
 import { parseAutoConnectParams } from './autoConnect.js'
-import { attemptNativePairing, attemptSetupPairing } from './nativePairing.js'
+import { approveLocalConnection, attemptSetupPairing, prepareLocalConnection } from './nativePairing.js'
 
 const hostInput = document.getElementById('host')
 const portInput = document.getElementById('port')
@@ -10,6 +10,9 @@ const allowlistInput = document.getElementById('allowlist')
 const status = document.getElementById('status')
 const autoPairingStatus = document.getElementById('auto-pairing-status')
 const retryAutoPairingButton = document.getElementById('retry-auto-pairing')
+const connectOffer = document.getElementById('connect-offer')
+const connectQuestion = document.getElementById('connect-question')
+const approveConnectionButton = document.getElementById('approve-connection')
 const setupOperationId = new URLSearchParams(location.search).get('setup')
 if (setupOperationId) history.replaceState(null, '', location.pathname)
 
@@ -87,29 +90,68 @@ if (autoConnect) {
     }
 }
 
+const REFUSAL_MESSAGES = {
+    DAEMON_OFFLINE: '이 컴퓨터에서 Saycode가 실행 중이 아닙니다. Saycode를 실행한 뒤 다시 확인하세요.',
+    MACHINE_NOT_ELIGIBLE: '이 컴퓨터는 내 개인 컴퓨터로 등록돼 있지 않아 연결 버튼을 쓸 수 없습니다. 아래 고급 설정에서 직접 연결하세요.',
+    SCOPE_UNAVAILABLE: 'Saycode 서버에서 연결 정보를 받지 못했습니다. 잠시 뒤 다시 확인하세요.',
+    INVALID_PROFILE: '이 Chrome 프로필 이름을 쓸 수 없습니다. 고급 설정의 프로필 이름을 확인하세요.',
+}
+const HOST_MISSING_MESSAGE = '자동 연결 도우미를 찾지 못했습니다. Saycode를 최신 버전으로 업데이트한 뒤 Saycode와 Chrome을 다시 시작하세요.'
+
+async function showStoredConnection() {
+    const local = await chrome.storage.local.get(['host', 'port', 'token', 'profile'])
+    hostInput.value = local.host
+    portInput.value = local.port
+    tokenInput.value = local.token
+    profileInput.value = local.profile
+}
+
 async function tryNativePairing() {
     retryAutoPairingButton.hidden = true
-    autoPairingStatus.textContent = '이 컴퓨터의 Happy 데몬을 확인하고 있습니다…'
-    const result = await attemptNativePairing(chrome)
+    connectOffer.hidden = true
+    autoPairingStatus.textContent = '이 컴퓨터의 Saycode를 확인하고 있습니다…'
+    const result = await prepareLocalConnection(chrome)
 
-    if (result.status === 'paired') {
-        const local = await chrome.storage.local.get(['host', 'port', 'token'])
-        hostInput.value = local.host
-        portInput.value = local.port
-        tokenInput.value = local.token
-        autoPairingStatus.textContent = '자동 연결 설정을 저장했습니다. Happy 데몬에 연결을 시도합니다.'
+    if (result.status === 'awaiting-approval') {
+        autoPairingStatus.textContent = ''
+        connectQuestion.textContent = `${result.account} 계정으로 이 Chrome을 연결할까요?`
+        connectOffer.hidden = false
         return
     }
     if (result.status === 'already-configured') {
-        autoPairingStatus.textContent = '저장된 연결 설정을 사용하고 있습니다.'
+        const { viewerKey } = await chrome.storage.local.get(['viewerKey'])
+        autoPairingStatus.textContent = viewerKey
+            ? '이 Chrome은 Saycode에 연결돼 있습니다.'
+            : '저장된 연결 설정을 사용하고 있습니다.'
+        return
+    }
+    if (result.status === 'paired') {
+        await showStoredConnection()
+        autoPairingStatus.textContent = '자동 연결 설정을 저장했습니다. Happy 데몬에 연결을 시도합니다.'
         return
     }
 
-    autoPairingStatus.textContent = result.status === 'unavailable'
-        ? '자동 연결 도우미를 찾지 못했습니다. Happy 데몬을 업데이트한 뒤 데몬과 Chrome을 재시작하거나 아래에서 직접 설정하세요.'
-        : '자동 연결 응답을 확인하지 못했습니다. 아래에서 직접 설정하거나 다시 시도하세요.'
+    autoPairingStatus.textContent = REFUSAL_MESSAGES[result.reason]
+        ?? (result.status === 'unavailable' ? HOST_MISSING_MESSAGE : '연결 응답을 확인하지 못했습니다. 다시 확인하거나 아래 고급 설정에서 직접 연결하세요.')
     retryAutoPairingButton.hidden = false
 }
+
+approveConnectionButton.addEventListener('click', async () => {
+    approveConnectionButton.disabled = true
+    autoPairingStatus.textContent = '연결하고 있습니다…'
+    const result = await approveLocalConnection(chrome)
+    approveConnectionButton.disabled = false
+    if (result.status === 'paired') {
+        connectOffer.hidden = true
+        await showStoredConnection()
+        autoPairingStatus.textContent = '연결했습니다. 이제 Saycode 대화에서 이 Chrome을 쓸 수 있습니다.'
+        return
+    }
+    autoPairingStatus.textContent = REFUSAL_MESSAGES[result.reason]
+        ?? (result.status === 'unavailable' ? HOST_MISSING_MESSAGE : '연결하지 못했습니다. 다시 확인한 뒤 시도하세요.')
+    connectOffer.hidden = true
+    retryAutoPairingButton.hidden = false
+})
 
 retryAutoPairingButton.addEventListener('click', tryNativePairing)
 

@@ -11,21 +11,32 @@
  */
 
 import { createConnection } from './connection.js'
-import { attemptNativePairing } from './nativePairing.js'
+import { prepareLocalConnection } from './nativePairing.js'
 import { ensureDefaultProfileName } from './profileId.js'
 
 const connection = createConnection({ chrome, WebSocketImpl: WebSocket })
 let setupPromise = null
 
+/** Resolves to the startup preparation result; concurrent callers share one run. */
 function connectOrPair() {
     if (!setupPromise) {
         setupPromise = (async () => {
             await ensureDefaultProfileName(chrome)
-            await attemptNativePairing(chrome)
+            const prepared = await prepareLocalConnection(chrome)
+            if (prepared.status === 'awaiting-approval') await flagApproval()
             await connection.connect()
+            return prepared
         })().finally(() => { setupPromise = null })
     }
     return setupPromise
+}
+
+/** Approval happens only on the options page; the badge asks for it unless another pairing is already working. */
+async function flagApproval() {
+    const { token } = await chrome.storage.local.get(['token'])
+    if (token) return
+    chrome.action.setBadgeText({ text: '!' })
+    chrome.action.setBadgeBackgroundColor({ color: '#c2701c' })
 }
 
 chrome.action.onClicked.addListener(() => chrome.runtime.openOptionsPage())
@@ -38,5 +49,10 @@ chrome.storage.onChanged.addListener((changes, area) => {
 })
 
 chrome.runtime.onStartup.addListener(() => { void connectOrPair() })
-chrome.runtime.onInstalled.addListener(() => { void connectOrPair() })
+chrome.runtime.onInstalled.addListener(details => {
+    void connectOrPair().then(prepared => {
+        // Opened once, right after a fresh install, so the user sees the one approval step.
+        if (details.reason === 'install' && prepared.status === 'awaiting-approval') return chrome.runtime.openOptionsPage()
+    })
+})
 void connectOrPair()
