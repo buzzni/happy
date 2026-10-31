@@ -77,7 +77,11 @@ export function createSessionOwnerContact(deps: SessionOwnerContactDependencies)
             if (!enabled) throw new Error('owner-contact-disabled');
             // Snapshot before awaits; strict local schema rejects source/scope/authority injection.
             const local = OwnerContactRequestSchema.parse(JSON.parse(canonicalOwnerRelayJson(raw, 65536)));
-            const signal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(20000)]);
+            // A plain (unref'd, cleared) timer rather than AbortSignal.timeout, so the deadline is a normal timer.
+            const deadline = new AbortController();
+            const timer = setTimeout(() => deadline.abort(new DOMException('owner contact timed out', 'TimeoutError')), 20000);
+            timer.unref?.();
+            const signal = AbortSignal.any([lifetime.signal, deadline.signal]);
             const key = operationKey(local);
             let pin: Pin | null = null;
             const work = async () => { try {
@@ -117,7 +121,7 @@ export function createSessionOwnerContact(deps: SessionOwnerContactDependencies)
                     if (signal.aborted) onAbort();
                 })]);
             } catch { throw new Error('owner-contact-unavailable'); }
-            finally { signal.removeEventListener('abort', onAbort); }
+            finally { clearTimeout(timer); signal.removeEventListener('abort', onAbort); }
         },
     };
 }
