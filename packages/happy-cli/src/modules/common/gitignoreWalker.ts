@@ -139,33 +139,32 @@ async function walkDir(
     }
     entries.sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0))
 
-    for (const entry of entries) {
-        if (entry.isSymbolicLink()) continue
-
-        const name = entry.name
-        const entryRel = relDir ? `${relDir}/${name}` : name
-        const entryAbs = join(absDir, name)
+    const kept = entries.flatMap((entry) => {
+        if (entry.isSymbolicLink()) return []
+        const entryRel = relDir ? `${relDir}/${entry.name}` : entry.name
         const isDir = entry.isDirectory()
-
         // A directory on the way to `after` is re-entered; anything else at or
         // before it was already visited.
         if (opts.after !== undefined && !(isDir && opts.after.startsWith(`${entryRel}/`))
-            && compareRelPaths(entryRel, opts.after) <= 0) continue
+            && compareRelPaths(entryRel, opts.after) <= 0) return []
+        if (localCtx.ignores(entryRel, isDir)) return []
+        return [{ entry, entryRel, entryAbs: join(absDir, entry.name), isDir }]
+    })
+    // Stat a directory's files together and use them in order: one at a time,
+    // a large walk spends most of its time waiting on each stat in turn.
+    const fileStats = kept.map(({ entry, entryAbs }) => (
+        entry.isFile() && opts.onFile ? stat(entryAbs).catch(() => null) : null
+    ))
 
-        if (localCtx.ignores(entryRel, isDir)) continue
-
+    for (const [i, { entry, entryRel, entryAbs, isDir }] of kept.entries()) {
         if (isDir) {
             if (opts.onDirectory) await opts.onDirectory(entryAbs, entryRel)
             if (opts.maxDepth === undefined || depth < opts.maxDepth) {
                 if (!await walkDir(entryAbs, entryRel, localCtx, opts, depth + 1)) return false
             }
         } else if (entry.isFile() && opts.onFile) {
-            let stats: Stats
-            try {
-                stats = await stat(entryAbs)
-            } catch {
-                continue
-            }
+            const stats: Stats | null = await fileStats[i]
+            if (!stats) continue
             if (await opts.onFile(entryAbs, entryRel, stats) === false) return false
         }
     }
