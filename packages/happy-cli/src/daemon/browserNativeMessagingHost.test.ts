@@ -19,6 +19,41 @@ describe('runBrowserNativeMessagingHost', () => {
         })
         expect(decodeNativeMessage(output[0])).toEqual({ ok: true, config: { pairingId: operationId, token: 'scoped' } })
     })
+    it.each([
+        ['an offer', { type: 'connect-offer' }, { ok: true, account: 'a@example.com' }, { ok: true, account: 'a@example.com' }],
+        ['a refusal code', { type: 'connect-offer' }, { ok: false, error: 'MACHINE_NOT_ELIGIBLE' }, { ok: false, error: 'MACHINE_NOT_ELIGIBLE' }],
+        ['an unknown daemon error as unavailable', { type: 'connect-offer' }, { ok: false, error: 'stack trace with secrets' }, { ok: false, error: 'SCOPE_UNAVAILABLE' }],
+        ['a connection', { type: 'connect', profile: 'default-1f8b' }, { ok: true, config: { token: 'scoped' } }, { ok: true, config: { token: 'scoped' } }],
+    ])('relays %s from the local daemon without reading the base token', async (_name, request, daemon, expected) => {
+        const output: Buffer[] = []
+        const calls: unknown[] = []
+        await runBrowserNativeMessagingHost({
+            input: Readable.from([encodeNativeMessage(request)]),
+            write: chunk => output.push(chunk), writeError: () => {},
+            readToken: async () => { throw new Error('must not read legacy token') }, port: 41777, host: '127.0.0.1',
+            offerConnect: async () => { calls.push('offer'); return daemon },
+            connect: async profile => { calls.push(profile); return daemon },
+        })
+        expect(decodeNativeMessage(output[0])).toEqual(expected)
+        expect(calls).toEqual(['type' in request && request.type === 'connect' ? 'default-1f8b' : 'offer'])
+    })
+    it.each([
+        ['no local daemon', { type: 'connect-offer' }, 'DAEMON_OFFLINE'],
+        ['an invalid profile', { type: 'connect', profile: 'bad\u0000name' }, 'INVALID_PROFILE'],
+        ['a missing profile', { type: 'connect' }, 'INVALID_PROFILE'],
+    ])('answers %s with a code', async (_name, request, error) => {
+        const output: Buffer[] = []
+        let called = false
+        await runBrowserNativeMessagingHost({
+            input: Readable.from([encodeNativeMessage(request)]),
+            write: chunk => output.push(chunk), writeError: () => {},
+            readToken: async () => 'unused', port: 41777, host: '127.0.0.1',
+            offerConnect: async () => { throw new Error('SETUP_UNAVAILABLE') },
+            connect: async () => { called = true; return { ok: true } },
+        })
+        expect(decodeNativeMessage(output[0])).toEqual({ ok: false, error })
+        expect(called).toBe(false)
+    })
     it('keeps the executable stdout protocol-clean in dev mode', async () => {
         const testHome = await mkdtemp(join(tmpdir(), 'happy-native-host-'))
 
