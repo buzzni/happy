@@ -313,7 +313,7 @@ export async function reseedCompanyKey(input: {
   metadata: MachineMetadata
   io: MachineControlIo
   target: CompanyKeyTarget
-}): Promise<{ credentials: Credentials; changed: boolean }> {
+}): Promise<{ credentials: Credentials; changed: boolean; machineKey: Uint8Array }> {
   const { credentials, machineId, io, target } = input
   const encryption = credentials.encryption
   if (encryption.type !== 'dataKey' || !encryption.neverEscrowed) {
@@ -322,7 +322,7 @@ export async function reseedCompanyKey(input: {
   if (sameKey(encryption.publicKey, target.publicKey)) {
     await io.commitCompanyKey(target)
     await io.writeCompanyKeyRecord(recordFor(target.publicKey, target.generation))
-    return { credentials, changed: false }
+    return { credentials, changed: false, machineKey: encryption.machineKey }
   }
   const record = await io.readCompanyKeyRecord()
   if (record?.generation != null && target.generation <= record.generation) {
@@ -366,7 +366,7 @@ export async function reseedCompanyKey(input: {
     }
     if (after === undefined) throw error
   }
-  return { credentials: await commitReseed(io, credentials, pending), changed: true }
+  return { credentials: await commitReseed(io, credentials, pending), changed: true, machineKey }
 }
 
 /** Swaps only the envelope the reseed started from; a third value means someone else moved it. */

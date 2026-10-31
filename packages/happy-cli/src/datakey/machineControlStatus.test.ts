@@ -3,8 +3,8 @@
  * `happy datakey status` reports and when `happy datakey harden` may switch.
  */
 import { describe, expect, it } from 'vitest';
-import { describeMachineControl, describeMachineKeyFingerprint, planHarden } from './machineControlStatus';
-import { machineKeyFingerprint } from '@slopus/happy-wire';
+import { describeCompanyKeyFingerprint, describeMachineControl, describeMachineKeyFingerprint, planHarden } from './machineControlStatus';
+import { companyKeyFingerprint, machineKeyFingerprint } from '@slopus/happy-wire';
 
 const key = (fill: number) => Buffer.alloc(32, fill).toString('base64');
 const dataKey = (extra: Record<string, unknown> = {}) => ({ token: 't', encryption: { publicKey: key(2), machineKey: key(3), ...extra } });
@@ -87,5 +87,18 @@ describe('describeMachineKeyFingerprint', () => {
         expect(describeMachineKeyFingerprint({ rawCredentials: legacy, machineId: 'machine-1' })).toBeNull();
         expect(describeMachineKeyFingerprint({ rawCredentials: null, machineId: 'machine-1' })).toBeNull();
         expect(describeMachineKeyFingerprint({ rawCredentials: dataKey(), machineId: undefined })).toBeNull();
+    });
+});
+
+// aplus-dev-studio specs/e2ee-machine-control-boundary F8 — the company key new sessions are sealed to,
+// compared with the organization key screen.
+describe('describeCompanyKeyFingerprint', () => {
+    it('fingerprints the company key access.key wraps session keys to', () => {
+        expect(describeCompanyKeyFingerprint({ rawCredentials: dataKey() })).toBe(companyKeyFingerprint(Buffer.alloc(32, 2)));
+    });
+
+    it('has nothing to show without dataKey credentials', () => {
+        expect(describeCompanyKeyFingerprint({ rawCredentials: legacy })).toBeNull();
+        expect(describeCompanyKeyFingerprint({ rawCredentials: null })).toBeNull();
     });
 });

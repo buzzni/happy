@@ -2,7 +2,7 @@ export type SetupTokenRotationState = 'switching' | 'switched' | 'exhausted' | '
 import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { z } from 'zod'
 import type { ProviderUsageEventV1, Update, UpdateMachineBody } from '@slopus/happy-wire';
-import { authenticatedEnvelopesCapabilitySchema, projectPurgeCapabilitySchema, rpcBindingCapabilitySchema, sealedSpawnEnvCapabilitySchema, worktreeOpsCapabilitySchema, type RpcBindingCapability } from '@slopus/happy-wire';
+import { authenticatedEnvelopesCapabilitySchema, companyKeyReseedCapabilitySchema, projectPurgeCapabilitySchema, rpcBindingCapabilitySchema, sealedSpawnEnvCapabilitySchema, worktreeOpsCapabilitySchema, type RpcBindingCapability } from '@slopus/happy-wire';
 import { UsageSchema } from '@/claude/types'
 import { DifficultyRoutingCapabilitySchema, DifficultyRoutingIntentSchema } from '@/difficultyRouting'
 import type { SandboxConfig } from '@/persistence'
@@ -309,6 +309,8 @@ export const MachineMetadataSchema = z.object({
   worktreeOps: worktreeOpsCapabilitySchema.optional(),
   /** aplus-dev-studio strict-followup-plan F1 — runs `worktree:purge-project` (cleanup after a project delete). */
   projectPurge: projectPurgeCapabilitySchema.optional(),
+  /** aplus specs/e2ee-machine-control-boundary F8: `datakey:reseed`, strict machines with an org pin only. */
+  companyKeyReseed: companyKeyReseedCapabilitySchema.optional(),
   /**
    * Agent Browser execution machine. protocol 2: spawns accept `browserAttestation` (a session-user
    * attestation). Studio sends one only when this is reported, and treats the machine by `tenancyMode`.
