@@ -93,8 +93,18 @@ export function toolGlobMatches(glob: string, toolName: string): boolean {
     return globParts.length === nameParts.length;
 }
 
+/** Compiled segment patterns: every tool call reads the same rules again (machine and organization). */
+const SEGMENT_PATTERNS = new Map<string, RegExp>();
+const SEGMENT_PATTERN_LIMIT = 4096;
+
 function segmentMatches(pattern: string, value: string): boolean {
-    const regex = new RegExp('^' + pattern.split('*').map(escapeRegExp).join('.*') + '$');
+    if (!pattern.includes('*')) return pattern === value;
+    let regex = SEGMENT_PATTERNS.get(pattern);
+    if (!regex) {
+        regex = new RegExp('^' + pattern.split('*').map(escapeRegExp).join('.*') + '$');
+        if (SEGMENT_PATTERNS.size >= SEGMENT_PATTERN_LIMIT) SEGMENT_PATTERNS.clear();
+        SEGMENT_PATTERNS.set(pattern, regex);
+    }
     return regex.test(value);
 }
 
