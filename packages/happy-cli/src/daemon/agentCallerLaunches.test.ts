@@ -9,8 +9,9 @@ const key = () => Buffer.from(nacl.sign.keyPair().publicKey).toString('base64url
 const trust = { issuer: 'https://studio.example', audience: 'https://happy.example', publicKeys: { k1: 'x'.repeat(43) }, lookupOrigin: 'https://studio.example' };
 type Launches = ReturnType<typeof createAgentCallerLaunches>;
 /** Spawns a fake host through the daemon launch path and returns the capability its private pipe received. */
-async function spawnHost(launches: Launches, pid: number, input: { cwd?: string; agentEnvironment?: TrackedSession['agentEnvironment'] } = {}) {
-    const prepared = launches.prepareLaunch({ cwd: input.cwd ?? '/project', agentEnvironment: input.agentEnvironment });
+async function spawnHost(launches: Launches, pid: number, input: { cwd?: string; agentEnvironment?: TrackedSession['agentEnvironment'];
+    owned?: Parameters<Launches['prepareLaunch']>[0]['owned'] } = {}) {
+    const prepared = launches.prepareLaunch({ cwd: input.cwd ?? '/project', agentEnvironment: input.agentEnvironment, owned: input.owned });
     if (!prepared) return { capability: undefined, environment: {} as Record<string, string>, stdio: undefined };
     const { stdio, environment } = prepared.stdio(['ignore', 7, 7]);
     const pipe = new PassThrough(), chunks: Buffer[] = [];
@@ -170,6 +171,79 @@ describe('daemon launch caller bindings', () => {
             trust: () => null, trackedByPid: () => ({ startedBy: 'daemon', pid: 42, directory: '/p' }) as TrackedSession, live: () => true, realpath: p => p });
         const host = await spawnHost(launches, 42);
         await expect(launches.issue(h.report({ capability: host.capability }))).rejects.toThrow('owner-contact-unconfigured');
+    });
+});
+describe('owned child launch bindings (T1c-b2 H3)', () => {
+    const grant = { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/', SAYCODE_AGENT_DEPTH: '0' };
+    /** Two daemon launches: the parent host (pid 41) and its owned child (pid 42). */
+    function family() {
+        const sessions = new Map<number, TrackedSession>([
+            [41, { startedBy: 'daemon', pid: 41, directory: '/project', happySessionId: 'parent' } as TrackedSession],
+            [42, { startedBy: 'daemon', pid: 42, directory: '/project', happySessionId: 'child', agentEnvironment: grant } as TrackedSession],
+        ]);
+        const alive = new Set([41, 42]);
+        const launches = createAgentCallerLaunches({ enabled: true, identity: async () => ({ machineId: 'machine', happyAccountId: 'account', epoch: 'e1' }),
+            trust: () => trust, trackedByPid: pid => sessions.get(pid), live: s => alive.has(s.pid), realpath: path => path });
+        return { launches, sessions, alive };
+    }
+    const report = (capability: string | undefined, override: Record<string, unknown> = {}) =>
+        ({ sessionId: 'child', runtimeId: 'child-runtime', hostPid: 42, callerPublicKey: key(), capability, ...override });
+    it('issues the owned lineage the daemon fixed, not depth 0 or the requested agent grant', async () => {
+        const { launches } = family();
+        const host = await spawnHost(launches, 42, { cwd: '/project/sub', agentEnvironment: grant, owned: { sessionId: 'child', scope: '/project', depth: 2 } });
+        const issued = await launches.issue(report(host.capability));
+        expect(issued.caller).toMatchObject({ sessionId: 'child', runtimeId: 'child-runtime', scope: '/project', depth: 2 });
+        expect(await launches.currentCaller('child')).toEqual(issued.caller);
+    });
+    it('refuses an owned launch whose report names another session, such as its parent', async () => {
+        const { launches, sessions } = family();
+        // Before its session-started webhook the launch itself names no session; only the owned lineage does.
+        sessions.set(42, { ...sessions.get(42)!, happySessionId: undefined });
+        const host = await spawnHost(launches, 42, { owned: { sessionId: 'child', scope: '/project', depth: 1 } });
+        await expect(launches.issue(report(host.capability, { sessionId: 'parent' }))).rejects.toThrow('caller-not-running');
+        expect(await launches.currentCaller('child')).toBeNull();
+    });
+    it('refuses a child that presents its parent\'s key instead of its own', async () => {
+        const { launches } = family();
+        const parent = await spawnHost(launches, 41);
+        const parentKey = key();
+        await launches.issue({ sessionId: 'parent', runtimeId: 'parent-runtime', hostPid: 41, callerPublicKey: parentKey, capability: parent.capability });
+        const child = await spawnHost(launches, 42, { owned: { sessionId: 'child', scope: '/project', depth: 1, parentCallerPublicKey: parentKey } });
+        await expect(launches.issue(report(child.capability, { callerPublicKey: parentKey }))).rejects.toThrow('caller-key-reused');
+        expect(await launches.currentCaller('child')).toBeNull();
+    });
+    it('refuses a key already bound to any other launch', async () => {
+        const { launches } = family();
+        const parent = await spawnHost(launches, 41), shared = key();
+        await launches.issue({ sessionId: 'parent', runtimeId: 'parent-runtime', hostPid: 41, callerPublicKey: shared, capability: parent.capability });
+        const child = await spawnHost(launches, 42);
+        await expect(launches.issue(report(child.capability, { callerPublicKey: shared }))).rejects.toThrow('caller-key-reused');
+    });
+    it('refuses a second live host for the same session (duplicate start)', async () => {
+        const { launches, sessions, alive } = family();
+        const first = await spawnHost(launches, 42, { owned: { sessionId: 'child', scope: '/project', depth: 1 } });
+        const issued = await launches.issue(report(first.capability));
+        sessions.set(43, { startedBy: 'daemon', pid: 43, directory: '/project', happySessionId: 'child' } as TrackedSession);
+        alive.add(43);
+        const second = await spawnHost(launches, 43, { owned: { sessionId: 'child', scope: '/project', depth: 1 } });
+        await expect(launches.issue(report(second.capability, { hostPid: 43 }))).rejects.toThrow('caller-duplicate-launch');
+        expect(await launches.currentCaller('child')).toEqual(issued.caller);
+    });
+    it('gives an owned launch with unknown lineage no binding instead of depth 0', async () => {
+        const { launches } = family();
+        const host = await spawnHost(launches, 42, { owned: 'unknown' });
+        await expect(launches.issue(report(host.capability))).rejects.toThrow('caller-lineage-unknown');
+    });
+    it('currentCaller is null for a stopped host and available() needs the switch and trust', async () => {
+        const { launches, alive } = family();
+        const host = await spawnHost(launches, 42, { owned: { sessionId: 'child', scope: '/project', depth: 1 } });
+        await launches.issue(report(host.capability));
+        alive.delete(42);
+        expect(await launches.currentCaller('child')).toBeNull();
+        expect(launches.available()).toBe(true);
+        const base = { identity: async () => null, trackedByPid: () => undefined, live: () => true };
+        expect(createAgentCallerLaunches({ ...base, enabled: false, trust: () => trust }).available()).toBe(false);
+        expect(createAgentCallerLaunches({ ...base, enabled: true, trust: () => null }).available()).toBe(false);
     });
 });
 describe('owner-contact trust configuration', () => {

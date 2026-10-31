@@ -36,10 +36,13 @@ export interface OwnedSpawnDependencies {
     /** Read-only recovery, including expired proof. Never creates a new tag or re-encrypts. */
     discover(record: OwnedSpawnRecord): Promise<OwnedCreated | null>;
     prepareStart?(record: OwnedSpawnRecord): Promise<void>;
-    start(record: OwnedSpawnRecord): Promise<{ providerRuntimeId: string }>;
-    observeStart(record: OwnedSpawnRecord): Promise<{ providerRuntimeId: string } | null>;
-    caller(record: OwnedSpawnRecord): Promise<z.infer<typeof OwnershipCallerBindingSchema>>;
+    start(record: OwnedSpawnRecord): Promise<StartedProvider>;
+    observeStart(record: OwnedSpawnRecord): Promise<StartedProvider | null>;
+    /** null: the child host holds its own key and its binding arrives with the started provider (T1c-b2 H3). */
+    caller(record: OwnedSpawnRecord): Promise<z.infer<typeof OwnershipCallerBindingSchema> | null>;
 }
+/** caller: the binding the child host itself holds, present only under host custody. */
+type StartedProvider = { providerRuntimeId: string; caller?: z.infer<typeof OwnershipCallerBindingSchema> };
 export class OwnedSpawnRejected extends Error { constructor(readonly reason = 'creation-rejected') { super('owned-spawn-rejected'); } }
 /** Only trusted daemon code that knows dispatch never occurred may throw this. */
 export class OwnedStartRefused extends Error {
@@ -82,12 +85,26 @@ export function createOwnedSpawn(deps: OwnedSpawnDependencies) {
         r.ownershipOutcome = r.creationMode === 'unsigned' ? 'unproven' : 'pending';
         await deps.journal.write(r);
     }
+    /** Started is recorded only with a caller bound to this session and the intent's machine/account. */
+    function adopt(r: OwnedSpawnRecord, found: StartedProvider) {
+        if (found.caller) {
+            const caller = OwnershipCallerBindingSchema.parse(found.caller);
+            if (caller.sessionId !== r.created?.sessionId || caller.machineId !== r.intent.machineId
+                || caller.happyAccountId !== r.intent.sessionAccountId || caller.runtimeId !== found.providerRuntimeId) refusal('caller-mismatch');
+            r.caller = caller;
+        }
+        r.providerRuntimeId = found.providerRuntimeId; r.state = 'started';
+    }
     async function recover(r: OwnedSpawnRecord) {
         if (r.state === 'failed') await deps.failed?.(r);
         if (r.state === 'committing') { const found = await deps.discover(r); if (found) await created(r, found, true); }
         if (r.state === 'starting') {
             const found = await deps.observeStart(r);
-            if (found) { r.providerRuntimeId = found.providerRuntimeId; r.state = 'started'; await deps.journal.write(r); }
+            if (found) {
+                // A binding that is not this child's own leaves the start unconfirmed; it is never retried as a launch.
+                try { adopt(r, found); } catch { return view(r); }
+                await deps.journal.write(r);
+            }
         }
         return view(r);
     }
@@ -179,11 +196,14 @@ export function createOwnedSpawn(deps: OwnedSpawnDependencies) {
                 if (submitted) { await scope(r); await deps.journal.write(r); return view(r); }
                 await deps.prepareStart?.(r);
                 await scope(r);
-                r.caller = OwnershipCallerBindingSchema.parse(await deps.caller(r));
-                if (r.caller.sessionId !== input.sessionId || r.caller.machineId !== r.intent.machineId || r.caller.happyAccountId !== r.intent.sessionAccountId) return refusal('caller-mismatch');
+                const caller = await deps.caller(r);
+                if (caller) {
+                    r.caller = OwnershipCallerBindingSchema.parse(caller);
+                    if (r.caller.sessionId !== input.sessionId || r.caller.machineId !== r.intent.machineId || r.caller.happyAccountId !== r.intent.sessionAccountId) return refusal('caller-mismatch');
+                }
                 r.state = 'starting'; await deps.journal.write(r);
                 try {
-                    const result = await deps.start(r); r.providerRuntimeId = result.providerRuntimeId; r.state = 'started';
+                    adopt(r, await deps.start(r));
                     await deps.journal.write(r);
                 } catch (error) {
                     if (error instanceof OwnedStartRefused) {

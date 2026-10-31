@@ -1,6 +1,6 @@
 import { createManualPersonalSpawn, MANUAL_PERSONAL_ENV } from './manualPersonalClaude';
 import { createOwnedSpawnRuntime, createOwnedStartGuard } from './ownedSpawnRuntime';
-import { createAgentCallerLaunches, OWNER_CONTACT_SWITCH, readOwnerContactTrust } from './agentCallerLaunches';
+import { createAgentCallerLaunches, OWNER_CONTACT_SWITCH, readOwnerContactTrust, type OwnedLaunchLineage } from './agentCallerLaunches';
 import { drainWorktreeOperations } from './worktreeOps';
 import { createMachineSetupTokenProtocol, MachineRotationError } from './machineSetupTokenProtocol';
 import { chooseLaunchRotation, createMachineRotationResolver } from './machineRotationResolver';
@@ -1173,6 +1173,8 @@ export async function startDaemon(): Promise<void> {
     // T1c-b2 H2 owner-contact launch bindings; assigned with the owned-spawn runtime below. Until then a
     // launch gets no capability pipe and its host no binding.
     let callerLaunches: ReturnType<typeof createAgentCallerLaunches> | null = null;
+    /** H3: the lineage an owned session's launch binds (owned journal); null for any other launch. */
+    let ownedLaunchLineage: ((sessionId: string) => Promise<OwnedLaunchLineage | 'unknown' | null>) | null = null;
     // aplus-dev-studio strict-followup-plan F2 — a non-forced worktree removal waits for these to leave.
     worktreeRemovalReservations.setLiveSessions(() => [...pidToTrackedSession.values()]
       .map((session) => ({ pid: session.pid, directory: session.directory ?? session.happySessionMetadataFromLocalWebhook?.path })));
@@ -2647,7 +2649,10 @@ export async function startDaemon(): Promise<void> {
       if (prepared) logger.debug(`[timing] spawn windows-prepare ${Date.now() - prepareStartedAt}ms`);
       const scopeReports = env.HAPPY_WRITE_SCOPE_SESSION === '1' ? writeScopeRuntime?.prepareReports(resumeTargetSessionId) : undefined;
       // Owner contact (default OFF): a one-time capability on one more private pipe; null leaves the launch unchanged.
-      const ownerLaunch = prepared ? null : callerLaunches?.prepareLaunch({ cwd, agentEnvironment: captureSaycodeAgentEnvironment(env) }) ?? null;
+      const ownedSessionId = resumeTargetSessionId ?? env.HAPPY_RECONNECT_SESSION_ID;
+      const owned = prepared || !ownedSessionId || !ownedLaunchLineage ? null
+        : await ownedLaunchLineage(ownedSessionId).catch(() => 'unknown' as const);
+      const ownerLaunch = prepared ? null : callerLaunches?.prepareLaunch({ cwd, agentEnvironment: captureSaycodeAgentEnvironment(env), owned }) ?? null;
       const withOwnerPipe = (base: import('child_process').SpawnOptions['stdio']) =>
         ownerLaunch?.stdio(base ?? 'ignore') ?? { stdio: base, environment: {} };
       const startupLogFileName = 'daemon-session-startup.log';
@@ -5401,7 +5406,10 @@ export async function startDaemon(): Promise<void> {
       },
       trust: () => readOwnerContactTrust(process.env, configuration.serverUrl), trackedByPid: pid => pidToTrackedSession.get(pid), live: liveLaunch });
     const ownedSpawn = createOwnedSpawnRuntime({ home: configuration.happyHomeDir, happyOrigin: configuration.serverUrl, env: process.env,
-      registration: ownedRegistration, launchCallers: callerLaunches,
+      registration: ownedRegistration,
+      // The Windows trial launch carries no capability pipe, so its owned children keep the daemon-held binding.
+      launchCallers: { query: raw => callerLaunches!.query(raw), currentCaller: sessionId => callerLaunches!.currentCaller(sessionId),
+        available: () => !standaloneWindows && callerLaunches!.available() },
       metadata: options => ({ path: options.directory, host: os.hostname(), version: packageJson.version, os: os.platform(), machineId,
         homeDir: os.homedir(), happyHomeDir: configuration.happyHomeDir, happyLibDir: projectPath(), happyToolsDir: join(projectPath(), 'tools', 'unpacked'),
         flavor: options.agent ?? 'claude', startedFromDaemon: true, startedBy: 'daemon', lifecycleState: 'running', lifecycleStateSince: Date.now() }),
@@ -5416,6 +5424,8 @@ export async function startDaemon(): Promise<void> {
           savedAt: Date.now(), lastProcessedSeq: 0 });
       },
     });
+    // Switch off: no lookup, so every launch is exactly the existing one.
+    if (process.env[OWNER_CONTACT_SWITCH] === '1') ownedLaunchLineage = sessionId => ownedSpawn.launchLineage(sessionId);
     // Set RPC handlers
     apiMachine.setRPCHandlers({
       ownedSpawn,

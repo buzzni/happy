@@ -1,7 +1,7 @@
 /** The existing encrypted machine RPC binding is the only public entry to this coordinator. */
 import type { createOwnedSpawn } from './ownedSpawn';
 export interface OwnedSpawnRpc {
-    capabilities(raw: unknown): Promise<{ ownedSpawnPrepareV1: boolean }>;
+    capabilities(raw: unknown): Promise<{ ownedSpawnPrepareV1: boolean; ownedChildOwnerContactV1?: boolean }>;
     prepare: ReturnType<typeof createOwnedSpawn>['prepare'];
     commit: ReturnType<typeof createOwnedSpawn>['commit'];
     start: ReturnType<typeof createOwnedSpawn>['start'];

@@ -1,6 +1,7 @@
 /** Production T4rt adapter. Credentials stay in daemon custody; only creation POST carries proofs. */
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { rotationIsFresh, verifyOwnership, rotationDecodeBinary, sessionCreateBodyHash, OwnershipCallerBindingSchema } from '@slopus/happy-wire';
 import { ApiClient } from '@/api/api';
 import { decodeBase64, decrypt, encodeBase64 } from '@/api/encryption';
@@ -15,6 +16,9 @@ import { readSetupTokenResumeSelection, isMachineSetupTokenBinding, parseAiAuthS
 import { buildReconnectSessionEnvironment, RECONNECT_FRESH_LAUNCH_ENV } from './reconnectSessionEnv';
 import type { TrackedSession } from './types';
 import type { OwnedSpawnRpc } from './ownedSpawnRpc';
+import type { OwnedLaunchLineage } from './agentCallerLaunches';
+
+type Caller = z.infer<typeof OwnershipCallerBindingSchema>;
 
 const spawnSchema = z.object({ directory: z.string().min(1), agent: z.enum(['claude', 'codex']), model: z.string().optional(),
     effort: z.string().optional(), initialPrompt: z.string().optional(), initialPromptLocalId: z.string().optional(),
@@ -39,8 +43,18 @@ export interface OwnedSpawnRuntimeDependencies {
     persist(session: Session): Promise<SessionPersistenceResult>;
     fetch?: typeof fetch;
     /** T1c-b2 H2: daemon-vouched bindings of other daemon launches (agentCallerLaunches). */
-    launchCallers?: { query(raw: unknown): Promise<unknown> };
+    launchCallers?: { query(raw: unknown): Promise<unknown>;
+        /** H3 host custody: owner contact on and trusted, so an owned child host holds its own key. */
+        available?(): boolean;
+        currentCaller?(sessionId: string): Promise<Caller | null> };
+    /** How long an owned start waits for the child host's own binding before answering `starting` (H3). */
+    hostBindingWaitMs?: number;
+    realpath?(path: string): string;
 }
+export type OwnedSpawnRuntime = OwnedSpawnRpc & {
+    /** Daemon-internal, never an RPC: the lineage a launch of this owned session must bind (H3). */
+    launchLineage(sessionId: string): Promise<OwnedLaunchLineage | 'unknown' | null>;
+};
 /** Private daemon dispatch evidence; never accepted from RPC, argv, or provider environment. */
 export function createOwnedStartGuard() {
     const active = new WeakSet<SpawnSessionOptions>(), submitted = new WeakSet<SpawnSessionOptions>();
@@ -60,7 +74,7 @@ export function createOwnedStartGuard() {
         },
     };
 }
-export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): OwnedSpawnRpc {
+export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): OwnedSpawnRuntime {
     const journal = createOwnedSpawnJournal(deps.home), fetcher = deps.fetch ?? fetch;
     let local: { machineId: string; happyAccountId: string; epoch: string } | null = null;
     const running = new Map<string, { stamp: string; binding: z.infer<typeof OwnershipCallerBindingSchema> }>();
@@ -72,6 +86,14 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
         const session = deps.tracked(binding.sessionId), bound = running.get(binding.sessionId);
         return !!session && deps.live(session) && bound?.stamp === stamp(session) && bound.binding.callerBindingId === binding.callerBindingId;
     } });
+    /** Host custody (H3): the child host binds itself at provider start; the daemon keeps no key for it. */
+    const hostCallers = () => {
+        const launches = deps.launchCallers, currentCaller = launches?.currentCaller;
+        return launches?.available?.() === true && currentCaller ? { currentCaller: currentCaller.bind(launches), query: launches.query.bind(launches) } : null;
+    };
+    /** Lineages fixed for owned starts in flight, until the child host's binding is adopted. */
+    const lineages = new Map<string, OwnedLaunchLineage>();
+    const realpath = (path: string) => { try { return (deps.realpath ?? realpathSync)(path); } catch { return path; } };
     function options(record: OwnedSpawnRecord): SpawnSessionOptions {
         const parsed = spawnSchema.parse(record.spawn), aiAuthSelection = parseAiAuthSelection(parsed.aiAuthSelection);
         if (parsed.aiAuthSelection !== undefined && !aiAuthSelection) throw new Error('invalid-ai-selection');
@@ -170,6 +192,33 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
         const tracked = deps.tracked(sessionId);
         running.set(sessionId, { stamp: tracked ? stamp(tracked) : '', binding }); return binding;
     }
+    /** Depth and scope come from the journal and the parent's current binding, never from the parent's contact. */
+    async function lineageOf(record: OwnedSpawnRecord): Promise<OwnedLaunchLineage> {
+        const sessionId = record.created!.sessionId, parentId = record.intent.parentHubSessionId, directory = realpath(options(record).directory);
+        if (!parentId) return { sessionId, scope: directory, depth: 0 };
+        const parent = await hostCallers()?.currentCaller(parentId)
+            ?? (await caller.query({ sessionId: parentId, nonce: randomUUID() }).catch(() => null))?.caller;
+        if (!parent) throw new Error('caller-unavailable');
+        // Existing launch scope cannot widen while adding owner inheritance.
+        if (parent.scope !== directory) throw new Error('caller-scope-mismatch');
+        return { sessionId, scope: parent.scope, depth: parent.depth + 1, parentCallerPublicKey: parent.callerPublicKey };
+    }
+    /** The child host's own binding for its live launch, matching the fixed lineage; waits up to waitMs. */
+    async function hostStarted(record: OwnedSpawnRecord, waitMs = 0) {
+        const sessionId = record.created!.sessionId, hosts = hostCallers();
+        const lineage = hosts && (lineages.get(sessionId) ?? await lineageOf(record).catch(() => null));
+        if (!hosts || !lineage) return null;
+        for (const deadline = Date.now() + waitMs; ;) {
+            const tracked = deps.tracked(sessionId);
+            const bound = tracked && deps.live(tracked) ? await hosts.currentCaller(sessionId) : null;
+            if (bound && bound.depth === lineage.depth && bound.scope === lineage.scope && bound.callerPublicKey !== lineage.parentCallerPublicKey) {
+                lineages.delete(sessionId);
+                return { providerRuntimeId: bound.runtimeId, caller: bound };
+            }
+            if (Date.now() >= deadline) return null;
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+    }
     const coordinator = createOwnedSpawn({ journal, now: Date.now, verify, scope,
         async prepare(record, publish) {
             const opts = options(record), state = await deps.registration(), api = await ApiClient.create(state.credentials);
@@ -234,7 +283,11 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
             await complete(record, raw);
             return { sessionId: raw.id, createDigest: await sessionCreateBodyHash(record.snapshot!.body) };
         },
-        caller: bind,
+        async caller(record) {
+            if (!hostCallers()) return bind(record);
+            lineages.set(record.created!.sessionId, await lineageOf(record));
+            return null;
+        },
         async prepareStart(record) {
             const raw = await find(record); if (!raw) throw new Error('created-session-unavailable');
             const created = session(record.snapshot!, raw), opts = options(record);
@@ -251,6 +304,13 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
             launchFlights.delete(record.preparationId);
             const created = { id: record.created!.sessionId };
             if (result.type !== 'success' || result.sessionId !== created.id) throw new Error('provider-start-unknown');
+            if (!record.caller) {
+                // Unconfirmed until the child host binds itself; status recovers it without another launch.
+                // Short: main's start RPC has a 20s deadline and the webhook wait already spent part of it.
+                const found = await hostStarted(record, deps.hostBindingWaitMs ?? 5_000);
+                if (!found) throw new Error('provider-start-unknown');
+                return found;
+            }
             const tracked = deps.tracked(created.id), entry = running.get(created.id);
             if (!tracked || !deps.live(tracked) || !entry) throw new Error('provider-start-unknown');
             entry.stamp = stamp(tracked);
@@ -258,6 +318,7 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
         },
         async observeStart(record) {
             const tracked = deps.tracked(record.created!.sessionId); if (!tracked || !deps.live(tracked)) return null;
+            if (!record.caller && hostCallers()) return hostStarted(record);
             const binding = await bind(record); return { providerRuntimeId: binding.runtimeId };
         },
     });
@@ -266,7 +327,20 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
             const parsed = z.object({ spawn: spawnSchema }).strict().safeParse(raw);
             const configured = deps.env.HAPPY_SESSION_OWNERSHIP_ENABLED === '1' && !!deps.env.HAPPY_SESSION_OWNERSHIP_PUBLIC_KEYS
                 && !!deps.env.HAPPY_SESSION_OWNERSHIP_ISSUER && deps.env.HAPPY_SESSION_OWNERSHIP_AUDIENCE === deps.happyOrigin;
-            return { ownedSpawnPrepareV1: parsed.success && configured };
+            const supported = parsed.success && configured;
+            // Contacting an owned child is advertised apart from creating one; switch off answers exactly as before.
+            return hostCallers() ? { ownedSpawnPrepareV1: supported, ownedChildOwnerContactV1: supported } : { ownedSpawnPrepareV1: supported };
+        },
+        async launchLineage(sessionId) {
+            if (!hostCallers()) return null;
+            const reserved = lineages.get(sessionId); if (reserved) return { ...reserved };
+            for (const record of await journal.list()) {
+                if (record.created?.sessionId !== sessionId) continue;
+                if (record.caller) return { sessionId, scope: record.caller.scope, depth: record.caller.depth };
+                // An owned session whose lineage cannot be read is never launched as depth 0.
+                return lineageOf(record).catch(() => 'unknown' as const);
+            }
+            return null;
         },
         async callerBinding(raw) {
             const input = z.object({ sessionId: z.string().min(1).max(128), nonce: z.string().min(16).max(256) }).strict().parse(raw);
@@ -277,6 +351,8 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
                 if (record.intent.machineId !== local?.machineId || record.intent.sessionAccountId !== local?.happyAccountId) throw new Error('identity-changed');
                 const tracked = deps.tracked(input.sessionId); if (!tracked || !deps.live(tracked)) throw new Error('caller-not-running');
                 const known = running.get(input.sessionId);
+                // Host custody: only the binding the child host holds the key for, never a daemon-made replacement.
+                if (!known && hostCallers()) return deps.launchCallers!.query(input);
                 if (!known || known.stamp !== stamp(tracked)) await bind(record);
                 return caller.query(input);
             }

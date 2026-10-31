@@ -1,9 +1,10 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 import nacl from 'tweetnacl';
-import { signOwnership, ownershipDigest, sessionCreateBodyHash, rotationSha256, sharedMachineRotationFixture } from '@slopus/happy-wire';
+import { signOwnership, ownershipDigest, sessionCreateBodyHash, rotationSha256, sharedMachineRotationFixture, OwnershipCallerBindingSchema } from '@slopus/happy-wire';
 import type { Metadata } from '@/api/types';
 import type { TrackedSession } from './types';
 import { createOwnedSpawnRuntime, createOwnedStartGuard } from './ownedSpawnRuntime';
@@ -11,16 +12,17 @@ import { registerOwnedSpawnRpc } from './ownedSpawnRpc';
 import { createOwnedSpawnJournal } from './ownedSpawnJournal';
 const homes: string[] = [];
 afterEach(async () => { vi.restoreAllMocks(); await Promise.all(homes.splice(0).map(home => rm(home, { recursive: true, force: true }))); });
-async function fixture() {
+async function fixture(options: { parent?: string } = {}) {
     const home = await mkdtemp(join(tmpdir(), 'owned-runtime-')); homes.push(home);
     const keys = nacl.sign.keyPair(), now = Date.now();
     const signed = { version: 1, issuer: 'https://studio.test', audience: 'https://happy.test', keyId: await rotationSha256(keys.publicKey), issuedAt: now, expiresAt: now + 60_000 };
     const spawn = { directory: '/project', agent: 'codex' };
     const scope = { intentId: 'intent', operationId: 'operation', creationRequestId: 'creation', ownershipPolicy: 'prefer-owned', subject: { issuer: signed.issuer, userId: 'person' },
-        companyId: null, projectId: null, machineId: 'machine', machineAccountId: 'account', sessionAccountId: 'account', parentHubSessionId: null, spawnDigest: await ownershipDigest(spawn) };
+        companyId: null, projectId: null, machineId: 'machine', machineAccountId: 'account', sessionAccountId: 'account', parentHubSessionId: options.parent ?? null, spawnDigest: await ownershipDigest(spawn) };
     const intent = signOwnership({ ...signed, ...scope, type: 'saycode-session-ownership-intent' }, keys.secretKey);
     let raw: Record<string, unknown> | null = null, tracked: TrackedSession | undefined;
     let posts = 0, starts = 0, lose = false, current = true;
+    let onStart: (() => Promise<void>) | undefined;
     const fetcher = vi.fn(async (url: string | URL | Request, options?: RequestInit) => {
         if (String(url).endsWith('/v1/account/profile')) return Response.json({ id: 'account' });
         if (String(url).includes('/v2/sessions')) return Response.json({ sessions: raw ? [raw] : [], hasNext: false, nextCursor: null });
@@ -43,11 +45,12 @@ async function fixture() {
             starts++; expect(options.reconnectEnvironment?.HAPPY_RECONNECT_SESSION_ID).toBe('session');
             expect(JSON.stringify(options)).not.toContain('signature'); expect(JSON.stringify(options)).not.toContain('synthetic-machine-bearer');
             tracked = { pid: 123, happySessionId: 'session', startedBy: 'daemon', directory: '/project' };
+            await onStart?.();
             return { type: 'success', sessionId: 'session' };
         },
         ...extra,
     });
-    return { spawn, intent, build, persist, journal: createOwnedSpawnJournal(home), clearAgentState: () => { raw!.agentState = null }, counts: () => ({ posts, starts }), lose: () => { lose = true }, logout: () => { current = false },
+    return { spawn, intent, build, persist, onStart: (hook: () => Promise<void>) => { onStart = hook; }, journal: createOwnedSpawnJournal(home), clearAgentState: () => { raw!.agentState = null }, counts: () => ({ posts, starts }), lose: () => { lose = true }, logout: () => { current = false },
         proof: (p: { sessionCreateBodyHash: string; sessionTagHash: string }) => signOwnership({ ...signed, ...scope, type: 'saycode-session-ownership',
             nonce: Buffer.alloc(32, 1).toString('base64url'), createBodyHash: p.sessionCreateBodyHash, tagHash: p.sessionTagHash }, keys.secretKey) };
 }
@@ -138,4 +141,119 @@ it.each([
     expect(await guard.start(options, async () => { guard.submitted(options); expect(guard.wasSubmitted(options)).toBe(true); return result; })).toBe(result);
     expect(guard.wasSubmitted(options)).toBe(false);
     await expect(guard.start(options, async () => { throw new Error('uncertain'); })).rejects.toThrow('uncertain');
+});
+
+type Caller = z.infer<typeof OwnershipCallerBindingSchema>;
+const callerKey = () => Buffer.from(nacl.sign.keyPair().publicKey).toString('base64url');
+const hostCaller = (fields: Partial<Caller> & { sessionId: string }): Caller => ({ callerBindingId: `${fields.sessionId}-binding`, runtimeId: `${fields.sessionId}-runtime`,
+    machineId: 'machine', happyAccountId: 'account', scope: '/project', depth: 0, hostEpoch: `${fields.sessionId}-epoch`, callerPublicKey: callerKey(), ...fields });
+/** Daemon-vouched launch bindings (agentCallerLaunches) as seen by the owned runtime. */
+function hostCallers(available = true) {
+    const callers = new Map<string, Caller>();
+    return { callers, available: () => available, currentCaller: async (sessionId: string) => callers.get(sessionId) ?? null,
+        query: vi.fn(async (raw: unknown) => {
+            const { sessionId, nonce } = raw as { sessionId: string; nonce: string };
+            const caller = callers.get(sessionId); if (!caller) throw new Error('caller-unavailable');
+            return { version: 1, nonce, caller };
+        }) };
+}
+async function createdSession(f: Awaited<ReturnType<typeof fixture>>, runtime: ReturnType<Awaited<ReturnType<typeof fixture>>['build']>) {
+    const p = await runtime.prepare({ spawn: f.spawn, intent: f.intent });
+    await runtime.commit({ creationRequestId: 'creation', preparationId: p.preparationId, ownershipProof: f.proof(p) });
+    return { creationRequestId: 'creation', preparationId: p.preparationId, sessionId: 'session' };
+}
+describe('owned child host custody (T1c-b2 H3)', () => {
+    it('hands the child host its own binding at provider start and reports that runtime as started', async () => {
+        const f = await fixture(), hosts = hostCallers(), runtime = f.build({ launchCallers: hosts });
+        let lineage: unknown;
+        f.onStart(async () => {
+            lineage = await runtime.launchLineage('session');
+            hosts.callers.set('session', hostCaller({ sessionId: 'session', runtimeId: 'child-host-runtime' }));
+        });
+        const s = await runtime.start(await createdSession(f, runtime)) as Record<string, any>;
+        expect(lineage).toEqual({ sessionId: 'session', scope: '/project', depth: 0 });
+        expect(s).toMatchObject({ state: 'started', providerRuntimeId: 'child-host-runtime', caller: hosts.callers.get('session') });
+        // Main verifies the binding the child host holds the key for; the daemon keeps no second key for it.
+        expect((await runtime.callerBinding({ sessionId: 'session', nonce: 'main-verifier-nonce' }) as any).caller).toEqual(hosts.callers.get('session'));
+        expect(hosts.query).toHaveBeenCalledOnce();
+        expect(await runtime.launchLineage('session')).toEqual({ sessionId: 'session', scope: '/project', depth: 0 });
+        expect(f.counts()).toEqual({ posts: 1, starts: 1 });
+    });
+    it('derives a grandchild lineage from its parent\'s current binding, never from the parent contact', async () => {
+        const f = await fixture({ parent: 'parent' }), hosts = hostCallers(), runtime = f.build({ launchCallers: hosts });
+        const parent = hostCaller({ sessionId: 'parent', depth: 1 });
+        hosts.callers.set('parent', parent);
+        let lineage: unknown;
+        f.onStart(async () => {
+            lineage = await runtime.launchLineage('session');
+            hosts.callers.set('session', hostCaller({ sessionId: 'session', depth: 2 }));
+        });
+        const s = await runtime.start(await createdSession(f, runtime)) as Record<string, any>;
+        expect(lineage).toEqual({ sessionId: 'session', scope: '/project', depth: 2, parentCallerPublicKey: parent.callerPublicKey });
+        expect(s.state).toBe('started');
+        expect(s.caller.callerBindingId).not.toBe(parent.callerBindingId);
+    });
+    it('refuses before launch when the parent has no current binding', async () => {
+        const f = await fixture({ parent: 'parent' }), runtime = f.build({ launchCallers: hostCallers() });
+        await expect(runtime.start(await createdSession(f, runtime))).rejects.toThrow();
+        expect(f.counts()).toEqual({ posts: 1, starts: 0 });
+    });
+    it.each([
+        ['the parent\'s key', (parent: Caller) => ({ ...parent, sessionId: 'session', depth: 2 })],
+        ['another session\'s binding', () => hostCaller({ sessionId: 'other', depth: 2 })],
+    ])('does not report started with a binding that is not the child\'s own (%s)', async (_name, bindingFor) => {
+        const f = await fixture({ parent: 'parent' }), hosts = hostCallers(), runtime = f.build({ launchCallers: hosts, hostBindingWaitMs: 0 });
+        const parent = hostCaller({ sessionId: 'parent', depth: 1 });
+        hosts.callers.set('parent', parent);
+        f.onStart(async () => { hosts.callers.set('session', bindingFor(parent)); });
+        expect(await runtime.start(await createdSession(f, runtime))).toMatchObject({ state: 'starting' });
+        expect(await runtime.status({ creationRequestId: 'creation' })).toMatchObject({ state: 'starting' });
+        expect(f.counts()).toEqual({ posts: 1, starts: 1 });
+    });
+    it('recovers a late child binding through status without starting the provider again', async () => {
+        const f = await fixture(), hosts = hostCallers(), runtime = f.build({ launchCallers: hosts, hostBindingWaitMs: 0 });
+        const start = await createdSession(f, runtime);
+        expect(await runtime.start(start)).toMatchObject({ state: 'starting' });
+        expect(await runtime.start(start)).toMatchObject({ state: 'starting' });
+        hosts.callers.set('session', hostCaller({ sessionId: 'session', runtimeId: 'late-runtime' }));
+        expect(await runtime.status({ creationRequestId: 'creation' })).toMatchObject({ state: 'started', providerRuntimeId: 'late-runtime' });
+        expect(f.counts()).toEqual({ posts: 1, starts: 1 });
+    });
+    it('after a daemon restart recovers the same operation by status only: no new creation, start or daemon key', async () => {
+        const f = await fixture(), runtime = f.build({ launchCallers: hostCallers(), hostBindingWaitMs: 0 });
+        const start = await createdSession(f, runtime);
+        expect(await runtime.start(start)).toMatchObject({ state: 'starting' });
+        const restarted = f.build({ launchCallers: hostCallers(), hostBindingWaitMs: 0 });
+        expect(await restarted.status({ creationRequestId: 'creation' })).toMatchObject({ state: 'starting', sessionId: 'session' });
+        expect(await restarted.start(start)).toMatchObject({ state: 'starting' });
+        expect(await restarted.commit({ creationRequestId: 'creation', preparationId: start.preparationId, ownershipProof: (await f.journal.read('creation'))!.proof }))
+            .toMatchObject({ state: 'starting' });
+        await expect(restarted.callerBinding({ sessionId: 'session', nonce: 'main-verifier-nonce' })).rejects.toThrow('caller-unavailable');
+        expect(f.counts()).toEqual({ posts: 1, starts: 1 });
+    });
+    it('never lets a resumed owned session with unreadable lineage bind as depth 0', async () => {
+        const f = await fixture({ parent: 'parent' }), hosts = hostCallers(), runtime = f.build({ launchCallers: hosts, hostBindingWaitMs: 0 });
+        hosts.callers.set('parent', hostCaller({ sessionId: 'parent', depth: 1 }));
+        expect(await runtime.start(await createdSession(f, runtime))).toMatchObject({ state: 'starting' });
+        // Daemon restart: the parent binding is gone and the start never confirmed a child binding.
+        expect(await f.build({ launchCallers: hostCallers(), hostBindingWaitMs: 0 }).launchLineage('session')).toBe('unknown');
+        expect(await f.build({ launchCallers: hostCallers() }).launchLineage('unrelated')).toBeNull();
+    });
+    it('advertises owned-child contact separately from owned spawn and only for a supported spawn', async () => {
+        const f = await fixture();
+        expect(await f.build({ launchCallers: hostCallers() }).capabilities({ spawn: f.spawn })).toEqual({ ownedSpawnPrepareV1: true, ownedChildOwnerContactV1: true });
+        expect(await f.build({ launchCallers: hostCallers() }).capabilities({ spawn: { ...f.spawn, agent: 'gemini' } }))
+            .toEqual({ ownedSpawnPrepareV1: false, ownedChildOwnerContactV1: false });
+        // Switch off or contact unconfigured: exactly the existing answer.
+        expect(await f.build({ launchCallers: hostCallers(false) }).capabilities({ spawn: f.spawn })).toEqual({ ownedSpawnPrepareV1: true });
+    });
+    it('keeps the existing daemon-held binding when owner contact is unavailable', async () => {
+        const f = await fixture(), hosts = hostCallers(false), runtime = f.build({ launchCallers: hosts });
+        const s = await runtime.start(await createdSession(f, runtime)) as Record<string, any>;
+        expect(s.state).toBe('started');
+        expect(await runtime.launchLineage('session')).toBeNull();
+        const reply = await runtime.callerBinding({ sessionId: 'session', nonce: 'main-verifier-nonce' }) as any;
+        expect(reply.caller.runtimeId).toBe(s.providerRuntimeId);
+        expect(hosts.query).not.toHaveBeenCalled();
+    });
 });
