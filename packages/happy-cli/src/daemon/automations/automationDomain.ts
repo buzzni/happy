@@ -16,6 +16,10 @@ export type AutomationSchedule =
   | { kind: 'once'; date: string; hour: number; minute: number }
   /** 고른 요일(0=일요일, Date#getDay)의 실행 PC 현지 시각마다. 서버 예약 payload 전용. */
   | { kind: 'weekly'; days: readonly number[]; hour: number; minute: number }
+  /** 위 세 종류를 실행 PC 시계 대신 `timeZone`(IANA)의 달력으로. 서버 예약 payload 전용. */
+  | { kind: 'daily-zoned'; hour: number; minute: number; timeZone: string }
+  | { kind: 'once-zoned'; date: string; hour: number; minute: number; timeZone: string }
+  | { kind: 'weekly-zoned'; days: readonly number[]; hour: number; minute: number; timeZone: string }
 
 /**
  * `skipped-waiting`(aplus-dev-studio-desktop #2196): 직전 회차 대화가 사용자 답을 기다려 건너뛴 회차.
@@ -207,6 +211,58 @@ export function serializeScheduledAutomations(automations: readonly ScheduledAut
   return JSON.stringify(automations.slice(0, MAX_AUTOMATIONS))
 }
 
+/** 1회 예약(PC 시계·시간대 모두) — 지난 회차를 다시 실행하지 않는 판정에 쓴다. */
+export function isOnceSchedule(schedule: AutomationSchedule): boolean {
+  return schedule.kind === 'once' || schedule.kind === 'once-zoned'
+}
+
+const MINUTE_MS = 60_000
+
+function zonedWallParts(at: number, timeZone: string): number {
+  const parts = new Intl.DateTimeFormat('en-GB', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(at)
+  const value = (type: string) => Number(parts.find((part) => part.type === type)!.value)
+  return Date.UTC(value('year'), value('month') - 1, value('day'), value('hour'), value('minute'))
+}
+
+function zonedCalendarDate(at: number, timeZone: string): string {
+  return new Date(zonedWallParts(at, timeZone)).toISOString().slice(0, 10)
+}
+
+/**
+ * `date` `hour:minute` in `timeZone` as an instant, with the machine-clock rule of the
+ * local Date constructor: the first of a repeated time, a missing time moved forward.
+ * Same as aplus-dev-studio-desktop `src/domain/scheduleTimeZone.ts` wallClockAt.
+ */
+function zonedWallClockAt(date: string, hour: number, minute: number, timeZone: string): number {
+  const desired = Date.parse(`${date}T00:00:00Z`) + (hour * 60 + minute) * MINUTE_MS
+  const offsets = new Set<number>()
+  for (let hours = -36; hours <= 36; hours += 6) {
+    const probe = desired + hours * 60 * MINUTE_MS
+    offsets.add(zonedWallParts(probe, timeZone) - probe)
+  }
+  const candidates = [...offsets].map((offset) => desired - offset)
+  const exact = candidates.filter((at) => zonedWallParts(at, timeZone) === desired)
+  if (exact.length) return Math.min(...exact)
+  return candidates.filter((at) => zonedWallParts(at, timeZone) > desired)
+    .sort((a, b) => zonedWallParts(a, timeZone) - zonedWallParts(b, timeZone))[0] ?? Number.NaN
+}
+
+function nextZonedRunAt(schedule: Extract<AutomationSchedule, { timeZone: string }>, from: number): number | null {
+  if (schedule.kind === 'once-zoned') {
+    const at = zonedWallClockAt(schedule.date, schedule.hour, schedule.minute, schedule.timeZone)
+    return at > from ? at : null
+  }
+  const today = Date.parse(`${zonedCalendarDate(from, schedule.timeZone)}T12:00:00Z`)
+  // 오늘 포함 8일이면 고른 요일이 하나뿐이고 오늘 시각이 이미 지났어도 다음 주 같은 요일에 닿는다.
+  for (let offset = 0; offset <= 7; offset++) {
+    const noon = new Date(today + offset * 86_400_000)
+    if (schedule.kind === 'weekly-zoned' && !schedule.days.includes(noon.getUTCDay())) continue
+    const at = zonedWallClockAt(noon.toISOString().slice(0, 10), schedule.hour, schedule.minute, schedule.timeZone)
+    if (at > from) return at
+  }
+  return null
+}
+
 /**
  * `from` 보다 엄격히 뒤인 다음 실행 시각. 1회 예약이 이미 지났으면 null(다시 실행하지 않음).
  * 시각은 모두 실행 PC 현지 시각이다 — 로컬 Date 생성자가 DST로 없는 시각은 앞으로 밀고,
@@ -214,6 +270,7 @@ export function serializeScheduledAutomations(automations: readonly ScheduledAut
  */
 export function computeNextRunAt(schedule: AutomationSchedule, from: number): number | null {
   if (schedule.kind === 'interval' || schedule.kind === 'github') return from + schedule.minutes * 60_000
+  if (schedule.kind === 'daily-zoned' || schedule.kind === 'once-zoned' || schedule.kind === 'weekly-zoned') return nextZonedRunAt(schedule, from)
   if (schedule.kind === 'once') {
     const [year, month, day] = schedule.date.split('-').map(Number)
     const at = new Date(year!, month! - 1, day!, schedule.hour, schedule.minute, 0, 0).getTime()

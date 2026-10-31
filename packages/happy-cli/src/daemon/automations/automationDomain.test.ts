@@ -216,6 +216,32 @@ describe('once and weekly wall-clock schedules', () => {
   })
 })
 
+// aplus-dev-studio-desktop specs/chat-scheduled-tasks T42 — the same slots in a named zone, whatever the PC clock is.
+describe('time-zoned wall-clock schedules', () => {
+  it('runs a daily slot at that zone\'s time rather than the machine clock', () => {
+    const schedule = { kind: 'daily-zoned' as const, hour: 9, minute: 0, timeZone: 'Asia/Seoul' }
+    // 2026-10-31 08:30 KST → today 09:00 KST; 09:30 KST → tomorrow.
+    expect(computeNextRunAt(schedule, Date.UTC(2026, 9, 30, 23, 30))).toBe(Date.UTC(2026, 9, 31, 0, 0))
+    expect(computeNextRunAt(schedule, Date.UTC(2026, 9, 31, 0, 0))).toBe(Date.UTC(2026, 10, 1, 0, 0))
+    expect(computeNextRunAt(schedule, Date.UTC(2026, 9, 31, 0, 30))).toBe(Date.UTC(2026, 10, 1, 0, 0))
+  })
+
+  it('picks weekdays and one-time dates in that zone', () => {
+    // Sunday 22:00 UTC is Monday 07:00 in Seoul.
+    expect(computeNextRunAt({ kind: 'weekly-zoned', days: [1], hour: 8, minute: 0, timeZone: 'Asia/Seoul' }, Date.UTC(2026, 10, 1, 22, 0)))
+      .toBe(Date.UTC(2026, 10, 1, 23, 0))
+    const once = { kind: 'once-zoned' as const, date: '2026-11-02', hour: 3, minute: 0, timeZone: 'UTC' }
+    expect(computeNextRunAt(once, Date.UTC(2026, 10, 2, 2, 59))).toBe(Date.UTC(2026, 10, 2, 3, 0))
+    expect(computeNextRunAt(once, Date.UTC(2026, 10, 2, 3, 0))).toBeNull()
+  })
+
+  it('follows the machine-clock DST rule: first of a repeated time, a missing time moves forward', () => {
+    const at = (date: string, hour: number, minute: number) => computeNextRunAt({ kind: 'once-zoned', date, hour, minute, timeZone: 'America/Los_Angeles' }, 0)
+    expect(at('2026-03-08', 2, 30)).toBe(Date.UTC(2026, 2, 8, 10, 30)) // 03:30 PDT
+    expect(at('2026-11-01', 1, 30)).toBe(Date.UTC(2026, 10, 1, 8, 30)) // first 01:30, PDT
+  })
+})
+
 describe('once and weekly schedules across a DST change (America/New_York)', () => {
   const previousTz = process.env.TZ
   beforeAll(() => { process.env.TZ = 'America/New_York' })

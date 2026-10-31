@@ -5,9 +5,10 @@ import type { AutomationProject, ServerAutomationItem } from './serverAutomation
  * Schedules this editor cannot represent. Editing them here would rewrite them as daily ones,
  * so they are listed read-only and managed in Desktop (Saycode specs/_archive/desktop-schedule-kinds).
  */
-export type DesktopOnlyScheduleKind = 'github' | 'once' | 'weekly';
+export type DesktopOnlyScheduleKind = 'github' | 'once' | 'weekly' | 'daily-zoned' | 'once-zoned' | 'weekly-zoned';
+const DESKTOP_ONLY_SCHEDULE_KINDS: ReadonlySet<string> = new Set<DesktopOnlyScheduleKind>(['github', 'once', 'weekly', 'daily-zoned', 'once-zoned', 'weekly-zoned']);
 export function isDesktopOnlySchedule(schedule: AutomationSchedule): schedule is Extract<AutomationSchedule, { kind: DesktopOnlyScheduleKind }> {
-    return schedule.kind === 'github' || schedule.kind === 'once' || schedule.kind === 'weekly';
+    return DESKTOP_ONLY_SCHEDULE_KINDS.has(schedule.kind);
 }
 
 export interface AutomationDraft {
@@ -30,7 +31,7 @@ export function automationDraftFor(project: AutomationProject, item: ServerAutom
     if (schedule && isDesktopOnlySchedule(schedule)) {
         throw new Error(schedule.kind === 'github'
             ? 'GitHub trigger automations must be edited in Desktop.'
-            : 'One-time and weekly schedules must be edited in Desktop.');
+            : 'One-time, weekly and time-zoned schedules must be edited in Desktop.');
     }
     return {
         projectId: project.id,

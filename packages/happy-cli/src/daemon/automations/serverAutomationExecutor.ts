@@ -7,6 +7,7 @@ import { buildScheduledRunPrompt } from '@/utils/scheduledRunPrompt'
 import {
   buildAutomationPrompt,
   computeNextRunAt,
+  isOnceSchedule,
   previousRunWaitingSessionId,
   shouldWakeFromScriptOutput,
   withInboxItemInstruction,
@@ -609,7 +610,7 @@ function firstScheduledAt(
   enabledAt: number,
   previous: ServerAutomationScheduleState | undefined,
 ): number {
-  if (schedule.kind !== 'once') return nextScheduledAt(schedule, Math.max(now, enabledAt))
+  if (!isOnceSchedule(schedule)) return nextScheduledAt(schedule, Math.max(now, enabledAt))
   const next = nextScheduledAt(schedule, Math.max(now - ONCE_FIRST_SIGHT_GRACE_MS, enabledAt))
   // 이미 실행한 회차는 유예로 되살리지 않는다 — 서버의 같은 회차 거절은 generation 단위라 두 번 돈다.
   return next === previous?.spentOnceAt ? NEVER_RUN_AT : next
@@ -622,7 +623,7 @@ function markOnceOccurrenceSpent(
   payload: ServerAutomationPayload,
   scheduledFor: number,
 ): void {
-  if (payload.schedule.kind !== 'once' || computeNextRunAt(payload.schedule, scheduledFor - 1) !== scheduledFor) return
+  if (!isOnceSchedule(payload.schedule) || computeNextRunAt(payload.schedule, scheduledFor - 1) !== scheduledFor) return
   const state = input.runtimeStore.read()
   input.runtimeStore.write({
     ...state,
