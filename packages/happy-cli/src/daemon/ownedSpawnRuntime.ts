@@ -16,6 +16,7 @@ import { readSetupTokenResumeSelection, isMachineSetupTokenBinding, parseAiAuthS
 import { buildReconnectSessionEnvironment, RECONNECT_FRESH_LAUNCH_ENV } from './reconnectSessionEnv';
 import type { TrackedSession } from './types';
 import type { OwnedSpawnRpc } from './ownedSpawnRpc';
+import { logger } from '@/ui/logger';
 import type { OwnedLaunchLineage } from './agentCallerLaunches';
 
 type Caller = z.infer<typeof OwnershipCallerBindingSchema>;
@@ -341,7 +342,16 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
         async launchLineage(sessionId) {
             if (!hostCallers()) return null;
             const reserved = lineages.get(sessionId); if (reserved) return { ...reserved };
-            for (const record of await journal.list()) {
+            let mayBeThis = false;
+            // One damaged file must not take the binding from every resume: skip it unless it may be this session.
+            for (const entry of await journal.entries()) {
+                if ('error' in entry) {
+                    const mine = entry.sessionId === null || entry.sessionId === sessionId;
+                    logger.debug(`[owned-spawn] unreadable journal entry skipped${mine ? '; it may be this session, no owner-contact binding' : ''}`);
+                    mayBeThis ||= mine;
+                    continue;
+                }
+                const record = entry.record;
                 if (record.created?.sessionId !== sessionId) continue;
                 // A daemon-custody session already has its binding; its host gets no second one.
                 if (!hostCustody(record)) return 'unknown';
@@ -349,7 +359,7 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
                 // An owned session whose lineage cannot be read is never launched as depth 0.
                 return lineageOf(record).catch(() => 'unknown' as const);
             }
-            return null;
+            return mayBeThis ? 'unknown' : null;
         },
         pipeOnlyLaunch: options => pipeLaunches.has(options),
         async callerBinding(raw) {

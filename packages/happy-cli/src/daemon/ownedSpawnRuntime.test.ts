@@ -363,3 +363,30 @@ describe('owned-spawn journal listing', () => {
         expect(entries.flatMap(e => 'error' in e ? [e.sessionId] : []).sort()).toEqual([null, 'other-session'].sort());
     });
 });
+describe('launch lineage beside a damaged journal file (PR #1027 review)', () => {
+    async function startedOwned() {
+        const f = await fixture(), hosts = hostCallers(), runtime = f.build({ launchCallers: hosts });
+        f.onStart(async () => { hosts.callers.set('session', hostCaller({ sessionId: 'session' })); });
+        expect(await runtime.start(await createdSession(f, runtime))).toMatchObject({ state: 'started' });
+        return { f, runtime };
+    }
+    it('a damaged entry naming another session does not affect this launch', async () => {
+        const { f, runtime } = await startedOwned();
+        await damage(f.home, 'claims-other', JSON.stringify({ version: 1, created: { sessionId: 'other-session' } }));
+        // An unrelated resume keeps its ordinary binding (no owned lineage); the owned session keeps its own.
+        expect(await runtime.launchLineage('unrelated')).toBeNull();
+        expect(await runtime.launchLineage('session')).toEqual({ sessionId: 'session', scope: '/project', depth: 0 });
+    });
+    it('this session\'s own damaged entry gives no binding', async () => {
+        const { f, runtime } = await startedOwned();
+        await damage(f.home, 'claims-resumed', JSON.stringify({ version: 1, created: { sessionId: 'resumed' } }));
+        expect(await runtime.launchLineage('resumed')).toBe('unknown');
+    });
+    it('an entry that names no legible session may be this one, so it gives no binding', async () => {
+        const { f, runtime } = await startedOwned();
+        await damage(f.home, 'garbage', '{not json');
+        expect(await runtime.launchLineage('unrelated')).toBe('unknown');
+        // A readable record of this session still decides it.
+        expect(await runtime.launchLineage('session')).toEqual({ sessionId: 'session', scope: '/project', depth: 0 });
+    });
+});

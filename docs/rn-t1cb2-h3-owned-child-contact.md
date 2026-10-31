@@ -89,6 +89,13 @@ daemon custody(스위치 OFF 포함)와 owned가 아닌 spawn의 tmux 동작은 
   이전 host가 끝난 resume은 새 binding으로 교체된다(H2와 같다).
 - **resume**: owned 세션의 resume launch도 journal에 기록된 depth/scope로 발급한다. depth≥1 세션이 resume으로
   depth 0이 되지 않는다. lineage를 읽을 수 없으면 `'unknown'`으로 binding을 주지 않는다(depth 0 대체 없음).
+- **손상된 journal 항목(PR #1027 리뷰)**: `launchLineage`는 읽지 못한 journal 파일을 건너뛰고 debug 로그만
+  남긴다. 파일 이름은 creationRequestId의 해시라 세션을 알 수 없으므로, 그 파일이 JSON으로 읽혀
+  `created.sessionId`를 명시할 때만 다른 세션의 것으로 판단한다. 다른 세션을 명시한 손상 항목은 이 launch에
+  영향이 없다. 이 세션을 명시했거나 세션을 전혀 읽을 수 없는 항목이 있으면, 이 세션의 읽을 수 있는 기록이 없을
+  때 `'unknown'`이다(depth 0으로 대체하지 않는다). 그래서 JSON조차 아닌 손상 파일이 하나 있으면 owned journal에
+  없는 세션의 resume/reconnect도 owner-contact binding을 받지 못한다(fail-closed). `journal.list()`를 쓰는 다른
+  복구 경로의 동작은 바꾸지 않았다.
 - **`agent-caller-binding`**: host custody의 owned 세션은 child host가 key를 가진 launch binding만 답한다.
   daemon이 대체 binding을 새로 만들지 않는다.
 - **capability**: `ownedChildOwnerContactV1`을 `ownedSpawnPrepareV1`과 따로 광고한다(host custody일 때만 키가
@@ -129,6 +136,9 @@ daemon custody(스위치 OFF 포함)와 owned가 아닌 spawn의 tmux 동작은 
   `TMUX_SESSION_NAME` owned start의 started, daemon custody의 기존 launch 선택, run.ts tmux 분기 고정).
   역검증 8건: caller 없는 adopt, custody 미기록, trust 기준 fallback, `agent-caller-binding` host 분기,
   daemon custody lineage, 낡은 receipt caller, pipe 표시, run.ts tmux 조건. 각각 되돌리면 테스트가 실패했다.
+- PR #1027 리뷰(low) 반영: 손상 항목이 다른 세션을 명시함·이 세션을 명시함·세션을 읽을 수 없음 3건과 journal
+  `entries()` 특성 1건. 역검증 5건(모든 손상을 unknown, 자기 손상 무시, 판독 불가 무시, `list()` 복귀, 세션
+  판독 제거)에서 각각 해당 테스트가 실패했다.
 - 교차 리뷰 R2 반영: 스위치 OFF·trust 미구성의 실제 journal 파일을 H3 이전 strict schema(현재 schema에서
   H3가 더한 `callerCustody`만 뺀 것, origin/main과 diff로 대조)로 파싱하는 테스트 2건. 기존 daemon custody 기대
   2건을 '필드 없음'으로 고쳤다. 수정 전 코드에서 이 4건이 실패하고 수정 후 통과했다.
