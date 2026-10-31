@@ -14,10 +14,11 @@ import { createServer, type Server } from 'node:http'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { randomUUID } from 'node:crypto'
+import { hkdfSync, randomBytes, randomUUID } from 'node:crypto'
+import { bindRpcRequest, terminalFrameKeyInfo } from '@slopus/happy-wire'
 import { WebSocket, type RawData } from 'ws'
 import { attachTerminalWsRoute, type TerminalWsRoute } from './controlServerTerminalWs'
-import { encrypt, decrypt, encodeBase64, decodeBase64, getRandomBytes } from '@/api/encryption'
+import { encrypt, decrypt, encodeBase64, decodeBase64, getRandomBytes, decryptWithDataKey, encryptWithDataKey } from '@/api/encryption'
 import {
   closeAllDaemonTerminalSessionsForRestart,
   getDaemonTerminalSession,
@@ -378,5 +379,148 @@ describe('/terminal WS reattach and replay (B2a)', () => {
     expect(getDaemonTerminalSession(sessionId)).not.toBeNull()
     expect(getDaemonTerminalSessionCount()).toBe(5)
     for (const client of [...clients, next]) client.ws.close()
+  })
+})
+
+/*
+ * aplus-dev-studio specs/e2ee-machine-control-boundary terminal-binding-strict-design.md §4-6 —
+ * the direct path speaks contract v2 too: a bound open with a terminal key, a proof, frames
+ * sealed with keys from it and the daemon's nonce, and an attach sealed with the in key.
+ */
+describe('/terminal WS contract v2 (F9 H4)', () => {
+  let dir: string
+  let httpServer: Server
+  let route: TerminalWsRoute
+  let port: number
+  const key = getRandomBytes(32)
+  const machine = { encryptionKey: key, encryptionVariant: 'legacy' as const, machineId: 'm1', strict: false }
+  const b64 = (n: number) => randomBytes(n).toString('base64')
+
+  beforeEach(async () => {
+    dir = mkdtempSync(path.join(tmpdir(), 'control-server-terminal-ws-v2-'))
+    machine.strict = false
+    httpServer = createServer()
+    route = attachTerminalWsRoute(httpServer, {
+      path: '/terminal',
+      controlSecret: SECRET,
+      allowedRoot: dir,
+      getMachineEncryption: () => machine,
+      detachGraceMs: GRACE_MS,
+    })
+    await new Promise<void>((resolve) => httpServer.listen(0, '127.0.0.1', () => resolve()))
+    port = (httpServer.address() as { port: number }).port
+  })
+
+  afterEach(async () => {
+    await route.close()
+    await new Promise<void>((resolve) => httpServer.close(() => resolve()))
+    _resetDaemonTerminalSessionsForTest()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  interface Client { ws: WebSocket; inbox: any[]; closed: Promise<number> }
+
+  function connect(): Promise<Client> {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/terminal?token=${SECRET}`)
+    const inbox: any[] = []
+    ws.on('message', (raw: RawData) => inbox.push(JSON.parse(raw.toString())))
+    const closed = new Promise<number>((resolve) => ws.on('close', (code) => resolve(code)))
+    return new Promise((resolve) => ws.on('open', () => resolve({ ws, inbox, closed })))
+  }
+
+  async function request(client: Client, event: string, data: unknown): Promise<any> {
+    const reqId = randomUUID()
+    client.ws.send(JSON.stringify({ reqId, event, data }))
+    await waitFor(() => client.inbox.some((m) => m.reqId === reqId), 5_000)
+    return client.inbox.find((m) => m.reqId === reqId)
+  }
+
+  /** A v2 client: opens bound, checks nothing itself (the proof is read by the test), seals in order. */
+  async function openV2(client: Client, script: string) {
+    const terminalKey = b64(32)
+    const terminalId = b64(16)
+    const nonce = b64(16)
+    const request_ = bindRpcRequest({
+      method: 'terminal-open', scope: 'm1', issuedAt: Date.now(), nonce,
+      params: { terminalBinding: 1, terminalKey, terminalId, userId: 'user-1', cols: 80, rows: 24, shell: process.execPath, args: ['-e', script] },
+    })
+    const ack = await request(client, 'terminal-open', { machineId: 'm1', params: encodeBase64(encrypt(key, 'legacy', request_)) })
+    const sessionId: string = ack.data.sessionId
+    const proof = decryptWithDataKey(decodeBase64(ack.data.caps.terminalBinding.proof), decodeBase64(terminalKey))
+    const frameKey = (dir: 'in' | 'out') => new Uint8Array(hkdfSync('sha256', decodeBase64(terminalKey), decodeBase64(proof.daemonNonce),
+      Buffer.from(terminalFrameKeyInfo(dir, sessionId, terminalId), 'utf8'), 32))
+    let seq = 0
+    return {
+      ack, sessionId, proof, nonce, terminalId,
+      seal: (frame: Record<string, unknown>) => encodeBase64(encryptWithDataKey({ v: 1, t: terminalId, dir: 'in', seq: ++seq, ...frame }, frameKey('in'))),
+      opened: (target: Client) => target.inbox
+        .filter((m) => m.data?.event === 'terminal-frame')
+        .map((m) => decryptWithDataKey(decodeBase64(m.data.data), frameKey('out'))),
+    }
+  }
+
+  it('opens a bound terminal with a proof and runs sealed input; frames carry no plaintext seq', async () => {
+    const client = await connect()
+    const terminal = await openV2(client, "process.stdin.on('data', (c) => process.stdout.write('echo:' + c))")
+    expect(terminal.ack.data.caps).toMatchObject({ local: true, attach: true, terminalBinding: { version: 1 } })
+    expect(terminal.proof).toMatchObject({ nonce: terminal.nonce, sessionId: terminal.sessionId, terminalId: terminal.terminalId, caps: { attach: true } })
+
+    client.ws.send(JSON.stringify({ event: 'terminal-frame', data: { sessionId: terminal.sessionId, data: terminal.seal({ kind: 'input', data: 'PING\n' }) } }))
+
+    await waitFor(() => terminal.opened(client).map((f: any) => f?.data ?? '').join('').includes('echo:PING'), 5_000)
+    expect(client.inbox.filter((m) => m.data?.event === 'terminal-frame').every((m) => m.data.seq === undefined)).toBe(true)
+    client.ws.close()
+  })
+
+  it('takes a dropped terminal back only with a sealed attach, and replays to its rid', async () => {
+    const TICKER = "let i = 0; setInterval(() => process.stdout.write('T' + (i++) + ';'), 20)"
+    const first = await connect()
+    const terminal = await openV2(first, TICKER)
+    await waitFor(() => terminal.opened(first).length >= 3, 5_000)
+    first.ws.terminate()
+    await first.closed
+    const lastSeen = Math.max(...terminal.opened(first).map((f: any) => f.seq))
+
+    // The machine key alone (the v1 attach) does not reach a v2 terminal.
+    const intruder = await connect()
+    const v1 = await request(intruder, 'terminal-attach', {
+      sessionId: terminal.sessionId,
+      params: encodeBase64(encrypt(key, 'legacy', { sessionId: terminal.sessionId, afterSeq: lastSeen, userId: 'user-1' })),
+    })
+    expect(v1.error).toBe('unknown-session')
+
+    const second = await connect()
+    const rid = b64(16)
+    const attachParams = terminal.seal({ kind: 'attach', rid, afterSeq: lastSeen })
+    const attach = await request(second, 'terminal-attach', { sessionId: terminal.sessionId, params: attachParams })
+    expect(attach.data).toMatchObject({ ok: true, sessionId: terminal.sessionId })
+    await waitFor(() => terminal.opened(second).some((f: any) => f?.rid === rid), 5_000)
+    expect(terminal.opened(second).find((f: any) => f?.rid === rid)).toMatchObject({ kind: 'output', seq: lastSeen + 1 })
+
+    // A replayed attach is refused.
+    const third = await connect()
+    expect((await request(third, 'terminal-attach', { sessionId: terminal.sessionId, params: attachParams })).error).toBe('unknown-session')
+    for (const client of [intruder, second, third]) client.ws.close()
+  })
+
+  it('refuses the v1 open under strict machine control', async () => {
+    machine.strict = true
+    const client = await connect()
+    const ack = await request(client, 'terminal-open', {
+      machineId: 'm1',
+      params: encodeBase64(encrypt(key, 'legacy', { userId: 'user-1', shell: process.execPath, args: ['-e', ''] })),
+    })
+    expect(ack.error).toMatch(/bound terminals/)
+    expect(getDaemonTerminalSessionCount()).toBe(0)
+    client.ws.close()
+  })
+
+  it('ends on a sealed close and says so sealed', async () => {
+    const client = await connect()
+    const terminal = await openV2(client, 'setInterval(() => {}, 1000)')
+    client.ws.send(JSON.stringify({ event: 'terminal-frame', data: { sessionId: terminal.sessionId, data: terminal.seal({ kind: 'close' }) } }))
+    await waitFor(() => terminal.opened(client).some((f: any) => f?.kind === 'closed'), 5_000)
+    expect(terminal.opened(client).find((f: any) => f?.kind === 'closed')).toMatchObject({ reason: 'client-closed' })
+    client.ws.close()
   })
 })

@@ -4121,7 +4121,7 @@ export async function startDaemon(): Promise<void> {
     // resolves, well after this server starts — a ref the terminal route
     // reads lazily, rather than reordering daemon startup around it.
     let deviceEnrollment: ReturnType<typeof createDeviceEnrollment> | null = null;
-    let machineEncryptionForTerminalWs: { encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey' } | null = null;
+    let machineEncryptionForTerminalWs: { encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey'; machineId: string; strict: boolean } | null = null;
 
     writeScopeRuntime = await createSessionWriteScopeRuntime({
       machineId, env: writeScopeHostEnvironment, managed: managedIdentity.status === 'active' || Boolean(standaloneWindows),
@@ -4305,7 +4305,13 @@ export async function startDaemon(): Promise<void> {
     // Local-direct terminal (/terminal) only needs the locally-derived
     // encryption key, not server registration — set it either way so an
     // offline-degraded daemon still serves same-machine desktop clients.
-    machineEncryptionForTerminalWs = { encryptionKey: machine.encryptionKey, encryptionVariant: machine.encryptionVariant };
+    machineEncryptionForTerminalWs = {
+      encryptionKey: machine.encryptionKey,
+      encryptionVariant: machine.encryptionVariant,
+      // terminal-binding-strict-design §4-6: the scope a bound direct open names, and whether a v1 open is refused.
+      machineId: machine.id,
+      strict: configuration.machineControl === 'strict',
+    };
     if (!standaloneWindows) startDifficultyRoutingElectionPoll({
       host: difficultyRoutingHost,
       machineId: machine.id,

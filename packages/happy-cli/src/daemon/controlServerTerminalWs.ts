@@ -59,6 +59,7 @@ import {
 import { createTerminalOutputCoalescer } from './terminalOutputCoalescer';
 import { replyToTerminalResume, resetPagedResume, sendExitAfterReplay } from './terminalResumeReply';
 import { machineKeyTerminalCipher, type MachineEncryption } from './terminalCipher';
+import { bindTerminal, createTerminalOpenNonceGuard, decideTerminalOpen, receiveBoundTerminalFrame, replyToBoundResume } from './terminalBindingSession';
 
 export interface TerminalWsRoute {
   wss: WebSocketServer;
@@ -70,6 +71,16 @@ export interface TerminalWsRoute {
 }
 
 export type { MachineEncryption };
+
+/**
+ * What the route needs to know about the machine. `machineId` is the scope a bound open names and
+ * `strict` refuses the v1 open (terminal-binding-strict-design §4-2); without an id no bound open
+ * can match, so only the v1 open works there.
+ */
+export interface TerminalRouteMachine extends MachineEncryption {
+  machineId?: string;
+  strict?: boolean;
+}
 
 /**
  * How long a direct terminal survives with no WebSocket attached. Same value
@@ -140,7 +151,7 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
   /** Null until the daemon's machine registration resolves — a connection
    *  attempted in that (brief, boot-time-only) window gets a clean error
    *  instead of crashing. */
-  getMachineEncryption: () => MachineEncryption | null;
+  getMachineEncryption: () => TerminalRouteMachine | null;
   /** Tests shorten this; production uses DIRECT_TERMINAL_DETACH_GRACE_MS. */
   detachGraceMs?: number;
 }): TerminalWsRoute {
@@ -165,6 +176,8 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
 
   const sockets = new Set<WebSocket>();
   const terminals = new Map<string, DirectTerminal>();
+  /** One recorded bound open opens one shell (terminalBindingSession.ts). */
+  const terminalOpenNonceGuard = createTerminalOpenNonceGuard();
 
   const sendOn = (ws: WebSocket | null, message: { reqId?: string; data?: unknown; error?: string }) => {
     if (!ws || ws.readyState !== ws.OPEN) return;
@@ -184,6 +197,14 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
     const exit = exitOf(terminal);
     if (!exit) return;
     const reason = terminal.entry.closeReason;
+    const binding = terminal.entry.binding;
+    if (binding) {
+      // The sealed close is the one a v2 client shows as the exit.
+      const sealedReason = binding.closeReason ?? reason;
+      sendOn(terminal.ws, { data: { event: 'terminal-frame', sessionId: terminal.sessionId, data: binding.sealOut({
+        kind: 'closed', code: exit.code, signal: exit.signal, lastSeq: terminal.entry.output.lastSeq(), ...(sealedReason ? { reason: sealedReason } : {}),
+      }) } });
+    }
     sendOn(terminal.ws, { data: { event: 'terminal-closed', sessionId: terminal.sessionId, code: exit.code, signal: exit.signal, ...(reason ? { reason } : {}) } });
     forget(terminal);
   };
@@ -278,6 +299,17 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
           if (reqId) send({ reqId, error: 'Failed to decrypt open params' });
           return;
         }
+        const decision = decideTerminalOpen(openParams, {
+          machineId: machineEncryption.machineId ?? '',
+          strict: machineEncryption.strict === true,
+          nonceGuard: terminalOpenNonceGuard,
+        });
+        if (decision.kind === 'refused') {
+          logger.debug(`[CONTROL SERVER] /terminal open refused: ${decision.code}`);
+          if (reqId) send({ reqId, error: decision.error });
+          return;
+        }
+        openParams = decision.params as OpenParams;
 
         const auditUserId = auditUserIdOf(openParams);
         let open = 0;
@@ -317,6 +349,10 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
 
         const sessionId = pty.id;
         const entry = addDaemonTerminalSession(sessionId, pty, { userId: auditUserId, machineId: null, route: 'direct' });
+        const opening = decision.kind === 'bound'
+          ? bindTerminal({ params: decision.params, nonce: decision.nonce, sessionId, caps: { ...DIRECT_TERMINAL_CAPS } })
+          : null;
+        if (opening) entry.binding = opening.terminal;
         const terminal: DirectTerminal = { sessionId, pty, entry, userId: auditUserId, ws, graceTimer: null, closing: false };
         terminals.set(sessionId, terminal);
         bound = terminal;
@@ -327,8 +363,10 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
         const emitFrame = (chunk: string) => {
           const seq = entry.output.push(chunk);
           try {
-            const encoded = machineKeyTerminalCipher(machineEncryption).seal(chunk);
-            sendOn(terminal.ws, { data: { event: 'terminal-frame', sessionId, seq, data: encoded } });
+            // A v2 frame carries its seq sealed.
+            sendOn(terminal.ws, { data: entry.binding
+              ? { event: 'terminal-frame', sessionId, data: entry.binding.sealOut({ kind: 'output', seq, data: chunk }) }
+              : { event: 'terminal-frame', sessionId, seq, data: machineKeyTerminalCipher(machineEncryption).seal(chunk) } });
           } catch (e) {
             logger.debug(`[CONTROL SERVER] /terminal frame encrypt failed: ${(e as Error).message}`);
           }
@@ -385,7 +423,9 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
         });
 
         logger.debug(`[LOCAL-DIRECT-TERMINAL] open session=${sessionId} user=${entry.userId} pid=${pty.pid}`);
-        if (reqId) send({ reqId, data: { ok: true, sessionId, caps: DIRECT_TERMINAL_CAPS } });
+        if (reqId) send({ reqId, data: { ok: true, sessionId, caps: opening
+          ? { ...DIRECT_TERMINAL_CAPS, terminalBinding: { version: 1, proof: opening.proof } }
+          : DIRECT_TERMINAL_CAPS } });
         return;
       }
 
@@ -395,6 +435,44 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
         const machineEncryption = opts.getMachineEncryption();
         if (!machineEncryption || typeof sessionId !== 'string' || !isRecord(data) || typeof data.params !== 'string') {
           refuseAttach(sessionId, reqId);
+          return;
+        }
+        const boundTerminal = terminals.get(sessionId);
+        const binding = boundTerminal?.entry.binding;
+        if (boundTerminal && binding) {
+          // terminal-binding-strict-design §4-6: a v2 terminal is taken back only with an attach
+          // sealed with its in key, in order — the machine key alone does not reach it.
+          const opened = binding.openIn(data.params);
+          if (opened.kind === 'gap' && exitOf(boundTerminal) === null) {
+            binding.closeReason ??= 'input-gap';
+            boundTerminal.closing = true;
+            void boundTerminal.pty.terminate();
+          }
+          if (opened.kind !== 'frame' || opened.frame.kind !== 'attach') {
+            logger.debug(`[LOCAL-DIRECT-TERMINAL] bound attach refused session=${sessionId} reason=${opened.kind}`);
+            refuseAttach(sessionId, reqId);
+            return;
+          }
+          const previous = boundTerminal.ws;
+          boundTerminal.ws = ws;
+          bound = boundTerminal;
+          if (boundTerminal.graceTimer) clearTimeout(boundTerminal.graceTimer);
+          boundTerminal.graceTimer = null;
+          if (previous && previous !== ws) previous.close(4000, 'terminal attached elsewhere');
+          resetPagedResume(boundTerminal.entry.output);
+          recordTerminalActivity(sessionId);
+          logger.debug(`[LOCAL-DIRECT-TERMINAL] bound attach session=${sessionId} exited=${exitOf(boundTerminal) !== null}`);
+          if (reqId) send({ reqId, data: { ok: true, sessionId, caps: DIRECT_TERMINAL_CAPS } });
+          // The attach names where its client stopped: the replay answers it right away.
+          replyToBoundResume({
+            sessionId,
+            entry: boundTerminal.entry,
+            binding,
+            rid: opened.frame.rid,
+            afterSeq: opened.frame.afterSeq,
+            sendSealed: (sealed) => sendOn(ws, { data: { event: 'terminal-frame', sessionId, data: sealed } }),
+            sendClosed: () => { if (boundTerminal.ws === ws) sendClosed(boundTerminal); },
+          });
           return;
         }
         let params: AttachParams | null = null;
@@ -428,6 +506,31 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
 
       const terminal = bound;
       if (terminal === null || terminal.ws !== ws) return; // before open/attach, or taken over — ignore.
+
+      const binding = terminal.entry.binding;
+      if (binding) {
+        // A v2 terminal takes its controls sealed; the plaintext resize and resume are not its client's.
+        if (event === 'terminal-frame' && isRecord(data) && typeof data.data === 'string') {
+          receiveBoundTerminalFrame({
+            sessionId: terminal.sessionId,
+            entry: terminal.entry,
+            binding,
+            data: data.data,
+            sendSealed: (sealed) => send({ data: { event: 'terminal-frame', sessionId: terminal.sessionId, data: sealed } }),
+            sendClosed: () => { if (terminal.ws === ws) sendClosed(terminal); },
+            end: () => {
+              terminal.closing = true;
+              void terminal.pty.terminate();
+            },
+          });
+        } else if (event === 'terminal-close' && exitOf(terminal) === null) {
+          // Only the local app holds the control secret, so its plaintext close is its own.
+          binding.closeReason ??= 'client-closed';
+          terminal.closing = true;
+          void terminal.pty.terminate();
+        }
+        return;
+      }
 
       if (event === 'terminal-resume') {
         if (!isRecord(data)) return;
