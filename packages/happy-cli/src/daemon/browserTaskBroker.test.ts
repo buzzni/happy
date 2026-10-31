@@ -377,9 +377,13 @@ describe('registration while the Runtime holds admission (start-up, reassignment
 
 describe('agent browser machine capability (Studio sends attestations only to daemons that report it)', () => {
     it('is reported on an execution machine only, with its tenancy', () => {
+        expect(agentBrowserMachineCapability({ HAPPY_BROWSER_TASK_RUNTIME_URL: 'http://127.0.0.1:38700', HAPPY_BROWSER_TASK_PROFILE_ID: 'personal' }))
+            .toEqual({ protocol: 2, tenancyMode: 'dedicated', hostMode: 'dedicated-host', profileId: 'personal' })
         expect(agentBrowserMachineCapability({})).toBeUndefined()
         expect(agentBrowserMachineCapability({ HAPPY_BROWSER_TASK_RUNTIME_URL: 'http://127.0.0.1:38700' })).toEqual({ protocol: 2, tenancyMode: 'dedicated', hostMode: 'dedicated-host' })
         expect(agentBrowserMachineCapability({ HAPPY_BROWSER_TASK_RUNTIME_URL: 'http://127.0.0.1:38700', HAPPY_BROWSER_TASK_TENANCY: 'shared', HAPPY_BROWSER_TASK_HOST_MODE: 'browser-only' })).toEqual({ protocol: 2, tenancyMode: 'shared', hostMode: 'browser-only' })
+        const personal = agentBrowserMachineCapability({ HAPPY_BROWSER_TASK_RUNTIME_URL: 'http://127.0.0.1:38700', HAPPY_BROWSER_TASK_PROFILE_ID: 'personal' })
+        expect(MachineMetadataSchema.parse({ host: 'h', platform: 'darwin', happyCliVersion: '1', homeDir: '/h', happyHomeDir: '/h/.happy', happyLibDir: '/l', agentBrowser: personal }).agentBrowser?.profileId).toBe('personal')
         const parsed = MachineMetadataSchema.safeParse({ host: 'h', platform: 'linux', happyCliVersion: '1', homeDir: '/h', happyHomeDir: '/h/.happy', happyLibDir: '/l', agentBrowser: { protocol: 2, tenancyMode: 'shared' } })
         expect(parsed.success && parsed.data.agentBrowser).toEqual({ protocol: 2, tenancyMode: 'shared' })
     })
