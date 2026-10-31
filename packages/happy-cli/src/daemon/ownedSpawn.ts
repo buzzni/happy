@@ -21,8 +21,9 @@ export const ownedSpawnRecordSchema = z.object({ version: z.literal(1), intent: 
     unprovenReason: z.string().optional(), proof: SessionOwnershipProofSchema.optional(),
     created: ownedCreatedSchema.optional(), confirmedReceipt: OwnershipConfirmedReceiptSchema.optional(),
     providerRuntimeId: ownershipId.optional(), caller: OwnershipCallerBindingSchema.optional(),
-    /** Who holds the caller key, fixed when the start is submitted (H3). Absent on earlier records: daemon. */
-    callerCustody: z.enum(['host', 'daemon']).optional(),
+    /** 'host': the child host holds the caller key, fixed when the start is submitted (H3). Absent means daemon
+     * custody, as on every earlier record, so a daemon from before H3 still reads those. */
+    callerCustody: z.literal('host').optional(),
 }).strict();
 export type OwnedSpawnRecord = z.infer<typeof ownedSpawnRecordSchema>;
 export type OwnedSpawnSnapshot = z.infer<typeof ownedSnapshotSchema>;
@@ -196,7 +197,7 @@ export function createOwnedSpawn(deps: OwnedSpawnDependencies) {
                 await deps.prepareStart?.(r);
                 await scope(r);
                 const caller = await deps.caller(r);
-                r.callerCustody = caller ? 'daemon' : 'host';
+                if (caller) delete r.callerCustody; else r.callerCustody = 'host';
                 if (caller) {
                     r.caller = OwnershipCallerBindingSchema.parse(caller);
                     if (r.caller.sessionId !== input.sessionId || r.caller.machineId !== r.intent.machineId || r.caller.happyAccountId !== r.intent.sessionAccountId) return refusal('caller-mismatch');

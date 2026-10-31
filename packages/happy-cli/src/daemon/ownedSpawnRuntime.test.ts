@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -10,6 +10,7 @@ import type { TrackedSession } from './types';
 import { createOwnedSpawnRuntime, createOwnedStartGuard } from './ownedSpawnRuntime';
 import { registerOwnedSpawnRpc } from './ownedSpawnRpc';
 import { createOwnedSpawnJournal } from './ownedSpawnJournal';
+import { ownedSpawnRecordSchema } from './ownedSpawn';
 const homes: string[] = [];
 afterEach(async () => { vi.restoreAllMocks(); await Promise.all(homes.splice(0).map(home => rm(home, { recursive: true, force: true }))); });
 async function fixture(options: { parent?: string; spawn?: Record<string, unknown> } = {}) {
@@ -52,7 +53,7 @@ async function fixture(options: { parent?: string; spawn?: Record<string, unknow
         },
         ...extra,
     });
-    return { spawn, intent, build, persist, onStart: (hook: () => Promise<void>) => { onStart = hook; },
+    return { home, spawn, intent, build, persist, onStart: (hook: () => Promise<void>) => { onStart = hook; },
         setAlive: (value: boolean) => { alive = value; }, lastStart: () => lastStart, journal: createOwnedSpawnJournal(home), clearAgentState: () => { raw!.agentState = null }, counts: () => ({ posts, starts }), lose: () => { lose = true }, logout: () => { current = false },
         proof: (p: { sessionCreateBodyHash: string; sessionTagHash: string }) => signOwnership({ ...signed, ...scope, type: 'saycode-session-ownership',
             nonce: Buffer.alloc(32, 1).toString('base64url'), createBodyHash: p.sessionCreateBodyHash, tagHash: p.sessionTagHash }, keys.secretKey) };
@@ -294,7 +295,7 @@ describe('custody fixed at start survives trust changes (H3-R1-01)', () => {
         expect(hosts.query).not.toHaveBeenCalled();
         // Its host may not take a second, host-held binding for the same session.
         expect(await restarted.launchLineage('session')).toBe('unknown');
-        expect((await f.journal.read('creation'))!.callerCustody).toBe('daemon');
+        expect(Object.keys((await f.journal.read('creation'))!)).not.toContain('callerCustody');
         expect(f.counts()).toEqual({ posts: 1, starts: 1 });
     });
 });
@@ -325,5 +326,22 @@ describe('host custody launches skip tmux (H3-R1-02)', () => {
         expect(source).toMatch(/if \(!tmuxAvailable \|\| tmuxSessionName === undefined \|\| ownerPipeRequired\)/);
         expect(source).toContain('const ownerPipeRequired = ownedPipeOnlyLaunch?.(options) === true;');
         expect(source).toContain('ownedPipeOnlyLaunch = options => ownedSpawn.pipeOnlyLaunch(options);');
+    });
+});
+
+describe('journal compatibility with a daemon from before H3 (H3-R2-01)', () => {
+    // origin/main's record schema is this one without the H3 callerCustody field (strict).
+    const preH3Schema = ownedSpawnRecordSchema.omit({ callerCustody: true }).strict();
+    it.each([
+        ['switch off', {}],
+        ['owner contact unconfigured', { launchCallers: hostCallers(false) }],
+    ])('writes daemon-custody records the pre-H3 schema still reads (%s)', async (_name, extra) => {
+        const f = await fixture(), runtime = f.build(extra);
+        expect(await runtime.start(await createdSession(f, runtime))).toMatchObject({ state: 'started' });
+        const directory = join(f.home, 'owned-spawns'), [name] = await readdir(directory);
+        // The raw file, as a daemon from before H3 would read it.
+        const raw = JSON.parse(await readFile(join(directory, name), 'utf8'));
+        expect(() => preH3Schema.parse(raw)).not.toThrow();
+        expect(raw).not.toHaveProperty('callerCustody');
     });
 });

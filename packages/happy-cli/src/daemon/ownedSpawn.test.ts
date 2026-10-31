@@ -171,7 +171,8 @@ it('fixes the caller custody in the journal when the start is submitted (H3-R1-0
     const f = await fixture(), r = f.runtime(), p = await f.prepare(r);
     await r.commit({ creationRequestId: 'creation', preparationId: p.preparationId, ownershipProof: f.proof });
     await r.start({ creationRequestId: 'creation', preparationId: p.preparationId, sessionId: 'session' });
-    expect((await f.journal.read('creation'))?.callerCustody).toBe('daemon');
+    // Daemon custody stays the pre-H3 record: no field, so a daemon from before H3 still reads it (H3-R2-01).
+    expect(Object.keys((await f.journal.read('creation'))!)).not.toContain('callerCustody');
     const g = await fixture(), q = g.runtime(), pg = await g.prepare(q);
     await q.commit({ creationRequestId: 'creation', preparationId: pg.preparationId, ownershipProof: g.proof });
     g.deps.caller = async () => null;

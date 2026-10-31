@@ -27,8 +27,8 @@ trial launch가 아닐 때(`agentCallerLaunches.available()` + run.ts의 `!stand
 
 ## custody는 start 때 journal에 고정한다 (교차 리뷰 R1-01)
 
-host/daemon 중 누가 caller key를 갖는지는 start를 제출할 때 정해 journal `callerCustody`에 `starting`과 함께
-쓴다. 그 뒤 status·start·commit·`agent-caller-binding`·resume lineage는 모두 **저장된 custody**를 따르며 그
+host/daemon 중 누가 caller key를 갖는지는 start를 제출할 때 정해 `starting`과 함께 journal에 쓴다. host
+custody만 `callerCustody: 'host'`로 저장하고, daemon custody는 H3 이전처럼 필드가 없다(교차 리뷰 R2-01). 그 뒤 status·start·commit·`agent-caller-binding`·resume lineage는 모두 **저장된 custody**를 따르며 그
 시점의 trust·스위치를 보지 않는다. 처음 구현은 `record.caller` 유무와 현재 trust로 경로를 골라, 재시작하며
 trust가 바뀌면 host custody 작업에 daemon key가 생기거나 receipt의 caller와 runtimeId가 어긋났다.
 
@@ -39,8 +39,11 @@ trust가 바뀌면 host custody 작업에 daemon key가 생기거나 receipt의 
   launch에는 `'unknown'` lineage를 줘서 host가 같은 세션에 두 번째(host 보유) binding을 받지 못하게 한다.
 - **`adopt`**: started는 시작된 runtime의 caller가 있고 그 runtimeId·세션·intent machine/account가 모두 맞을
   때만 기록한다. caller 없는 결과는 started가 될 수 없다(daemon custody도 binding을 함께 돌려준다).
-- `callerCustody`가 없는 H3 이전 기록은 daemon custody다. 새 필드가 있는 기록은 이 필드를 모르는 이전
-  daemon의 strict schema가 읽지 못한다(스위치 기본 OFF라 rollout 전에는 생기지 않는다).
+- 필드 부재 = daemon custody다(H3 이전 기록 포함). 그래서 스위치 OFF·trust 미구성에서 쓰는 기록은 H3 이전
+  기록과 같은 모양이고, H3 이전 daemon으로 롤백해도 그 strict schema가 읽는다.
+- **롤백 주의는 host custody 기록에만 해당한다**: `callerCustody: 'host'`가 있는 기록은 이 필드를 모르는 H3
+  이전 daemon의 strict schema가 거부한다. journal 목록을 순회하는 복구·`agent-caller-binding`도 그 daemon에서
+  막힌다. 이 기록은 스위치 ON·trust 있음일 때만 생긴다.
 - definite pre-dispatch 거절(`OwnedStartRefused`)은 custody도 지워 다음 start가 다시 정한다.
 
 ## host custody launch는 tmux를 쓰지 않는다 (교차 리뷰 R1-02)
@@ -126,6 +129,9 @@ daemon custody(스위치 OFF 포함)와 owned가 아닌 spawn의 tmux 동작은 
   `TMUX_SESSION_NAME` owned start의 started, daemon custody의 기존 launch 선택, run.ts tmux 분기 고정).
   역검증 8건: caller 없는 adopt, custody 미기록, trust 기준 fallback, `agent-caller-binding` host 분기,
   daemon custody lineage, 낡은 receipt caller, pipe 표시, run.ts tmux 조건. 각각 되돌리면 테스트가 실패했다.
+- 교차 리뷰 R2 반영: 스위치 OFF·trust 미구성의 실제 journal 파일을 H3 이전 strict schema(현재 schema에서
+  H3가 더한 `callerCustody`만 뺀 것, origin/main과 diff로 대조)로 파싱하는 테스트 2건. 기존 daemon custody 기대
+  2건을 '필드 없음'으로 고쳤다. 수정 전 코드에서 이 4건이 실패하고 수정 후 통과했다.
 - 역검증 11건: owned depth 적용, owned 세션 검사, key 재사용, 중복 live host, unknown lineage, lineage 대조,
   host custody 선택, `agent-caller-binding`의 daemon key 차단, capability 모양, 부모 binding 조회,
   `adopt`의 세션 검사. 각각 되돌리면 해당 테스트가 실패하고 복원하면 통과했다.
