@@ -107,6 +107,16 @@ describe('organization requirements store', () => {
         expect(readdirSync(dir)).toHaveLength(1);
     });
 
+    it('tells the daemon what a session enforces, keyed by the session alone', () => {
+        // The daemon owns the autonomous quality gate (R10.5) and holds neither the session's account nor its snapshot.
+        store().writeSessionSummary('s1', { companyId: 'c1', autopilotDisabled: true });
+        const daemon = store({ accountKey: 'daemon-account' });
+        expect(daemon.readSessionSummary('s1')).toEqual({ companyId: 'c1', autopilotDisabled: true });
+        expect(daemon.readSessionSummary('s2')).toBeNull();
+        store().writeSessionSummary('s1', null);
+        expect(daemon.readSessionSummary('s1')).toBeNull();
+    });
+
     it('never throws when the directory cannot be written', () => {
         const blocked = join(home, 'blocked');
         writeFileSync(blocked, 'a file, not a directory');

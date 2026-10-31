@@ -38,7 +38,7 @@ export function createToolPolicyRuntime(input: {
     terminalPrompt: () => boolean;
     /** The session's organization tool rules (codexcli-org-requirements R10.4); absent outside any organization. */
     orgRules?: () => OrgToolRules | null;
-    orgAudit?: (entry: { tool: string; reasonCode: string; ruleId: string }) => void;
+    orgAudit?: (entry: { tool: string; decision: string; reasonCode: string; ruleId: string }) => void;
     grantTtlMs: number | null;
     /** The session's RPC handlers; every adapter shares the one grant store these revoke from. */
     rpc: Parameters<typeof registerToolPolicyGrantRpcs>[0];

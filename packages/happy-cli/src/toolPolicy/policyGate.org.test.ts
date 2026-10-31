@@ -17,7 +17,7 @@ import { ABSENT_MACHINE_POLICY } from './rules';
 function setup(org: { current: OrgToolRules | null }, answer: PolicyApprovalAnswer = { approved: true, policyGrant: 'session' }) {
     const dir = mkdtempSync(join(tmpdir(), 'policy-org-'));
     const asked: Array<{ toolName: string; humanOnly: boolean; reasonCode: string }> = [];
-    const orgAudit: Array<{ tool: string; reasonCode: string; ruleId: string }> = [];
+    const orgAudit: Array<{ tool: string; decision: string; reasonCode: string; ruleId: string }> = [];
     const approver: PolicyApprover = {
         requestPolicyApproval: async (request) => {
             asked.push({ toolName: request.toolName, humanOnly: request.policy.humanOnly, reasonCode: request.policy.reasonCode });
@@ -47,7 +47,7 @@ describe('tool policy gate with organization rules', () => {
         const verdict = await call('mcp__gmail__get_message');
         expect(verdict).toMatchObject({ kind: 'deny', reasonCode: 'org_rule' });
         expect(asked).toEqual([]);
-        expect(orgAudit).toEqual([{ tool: 'mcp__gmail__get_message', reasonCode: 'org_rule', ruleId: 'org:no-mail' }]);
+        expect(orgAudit).toEqual([{ tool: 'mcp__gmail__get_message', decision: 'blocked', reasonCode: 'org_rule', ruleId: 'org:no-mail' }]);
         expect(readFileSync(auditFile, 'utf8')).toContain('"ruleId":"org:no-mail"');
     });
 

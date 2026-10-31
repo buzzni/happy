@@ -23,6 +23,12 @@ const SCOPE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
 export type OrgScopeKey = { kind: 'project' | 'session'; id: string };
 
+/** What one running session enforces, for the daemon's own writers (the autonomous quality gate, R10.5). */
+export interface OrgSessionSummary {
+    companyId: string;
+    autopilotDisabled: boolean;
+}
+
 export interface OrgRequirementsLkg {
     document: OrgRequirementsDocument;
     /** When this process (or an earlier one) last received it from Studio. */
@@ -36,6 +42,9 @@ export interface OrgRequirementsStore {
     readScope(scope: OrgScopeKey): string | null;
     writeScope(scope: OrgScopeKey, companyId: string): void;
     deleteScope(scope: OrgScopeKey): void;
+    /** Keyed by the server and session id only: the daemon reading it holds another account. `null` removes it. */
+    writeSessionSummary(sessionId: string, summary: OrgSessionSummary | null): void;
+    readSessionSummary(sessionId: string): OrgSessionSummary | null;
 }
 
 export function orgRequirementsDirectory(happyHomeDir: string): string {
@@ -54,6 +63,7 @@ export function createOrgRequirementsStore(options: {
     const hash = (part: string) => createHash('sha256').update(`${options.serverUrl}\n${options.accountKey}\n${part}`).digest('hex').slice(0, 16);
     const lkgFile = (companyId: string) => join(dir, `${hash(`company:${companyId}`)}.json`);
     const scopeFile = (scope: OrgScopeKey) => join(dir, `scope-${hash(`${scope.kind}:${scope.id}`)}.json`);
+    const sessionFile = (sessionId: string) => join(dir, `session-${createHash('sha256').update(`${options.serverUrl}\nsession:${sessionId}`).digest('hex').slice(0, 16)}.json`);
     let pruned = false;
 
     const write = (file: string, body: string) => {
@@ -82,7 +92,7 @@ export function createOrgRequirementsStore(options: {
         pruned = true;
         try {
             for (const name of readdirSync(dir)) {
-                if (!name.startsWith('scope-')) continue;
+                if (!name.startsWith('scope-') && !name.startsWith('session-')) continue;
                 const file = join(dir, name);
                 if (now() - statSync(file).mtimeMs > SCOPE_MAX_AGE_MS) remove(file);
             }
@@ -123,5 +133,18 @@ export function createOrgRequirementsStore(options: {
             } catch { /* a missing mapping only means "unknown" after a later failure */ }
         },
         deleteScope: (scope) => remove(scopeFile(scope)),
+        writeSessionSummary: (sessionId, summary) => {
+            if (!summary) return remove(sessionFile(sessionId));
+            try {
+                write(sessionFile(sessionId), JSON.stringify({ version: 1, ...summary, at: now() }));
+                prune();
+            } catch { /* the daemon then sees an older runtime: nothing enforced on its side */ }
+        },
+        readSessionSummary: (sessionId) => {
+            const stored = readJson(sessionFile(sessionId));
+            return stored && stored.version === 1 && typeof stored.companyId === 'string' && typeof stored.autopilotDisabled === 'boolean'
+                ? { companyId: stored.companyId, autopilotDisabled: stored.autopilotDisabled }
+                : null;
+        },
     };
 }

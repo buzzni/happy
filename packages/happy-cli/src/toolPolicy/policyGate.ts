@@ -123,7 +123,7 @@ export function createToolPolicyGate(deps: {
      */
     orgRules?: () => OrgToolRules | null;
     /** Organization verdicts, for the organization audit as well (R17). */
-    orgAudit?: (entry: { tool: string; reasonCode: string; ruleId: string }) => void;
+    orgAudit?: (entry: { tool: string; decision: string; reasonCode: string; ruleId: string }) => void;
     platform?: NodeJS.Platform;
     tables?: ToolPolicyTables;
     now?: () => number;
@@ -182,7 +182,7 @@ export function createToolPolicyGate(deps: {
                 verdict = evaluationErrorVerdict(call.toolName, tables);
             }
             if (verdict.decision !== 'allow' && (verdict.ruleId.startsWith('org:') || verdict.reasonCode === 'org_rule_revision')) {
-                deps.orgAudit?.({ tool: call.toolName, reasonCode: verdict.reasonCode, ruleId: verdict.ruleId });
+                deps.orgAudit?.({ tool: call.toolName, decision: verdict.decision, reasonCode: verdict.reasonCode, ruleId: verdict.ruleId });
             }
 
             if (verdict.decision === 'allow') {

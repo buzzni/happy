@@ -15,7 +15,7 @@ import { dirname } from 'node:path';
 import type { OrgRequirementReason } from '@slopus/happy-wire';
 
 /** Snapshot events that are not enforcements. */
-export type OrgRequirementsAuditEvent = 'state' | 'document_rejected' | 'document_issue' | 'lkg_too_large';
+export type OrgRequirementsAuditEvent = 'state' | 'document_rejected' | 'document_issue' | 'lkg_too_large' | 'tool_rule_ask';
 
 export interface OrgRequirementsAuditRecord {
     at: number;
