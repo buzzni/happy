@@ -35,7 +35,7 @@ import { REMOTE_TERMINAL_DISABLED_ERROR, resolveMachineLockdownPolicy } from '..
 import { homedir } from 'node:os';
 import { encodeBase64, decodeBase64, encrypt, decrypt, tryDecrypt } from './encryption';
 import { machineKeyTerminalCipher } from '@/daemon/terminalCipher';
-import { bindTerminal, createTerminalOpenNonceGuard, decideTerminalOpen, type BoundTerminal } from '@/daemon/terminalBindingSession';
+import { bindTerminal, createTerminalOpenNonceGuard, decideTerminalOpen, receiveBoundTerminalFrame, type BoundTerminal } from '@/daemon/terminalBindingSession';
 import { createTerminalOutputCoalescer } from '@/daemon/terminalOutputCoalescer';
 import {
     MACHINE_RESOURCE_METRICS_RPC,
@@ -3760,61 +3760,17 @@ export class ApiMachineClient {
         this.socket.emit('terminal-closed', { sessionId, code: exit.code, signal: exit.signal, ...(entry.closeReason ? { reason: entry.closeReason } : {}) });
     }
 
-    /**
-     * terminal-binding-strict-design §4-4·4-5 — every control of a v2 relay terminal arrives here,
-     * sealed with its in key and in order. A replay or anything unreadable is dropped; a hole in
-     * the input ends the terminal, since keystrokes with one can assemble another command.
-     */
+    /** A v2 relay terminal's sealed frame: shared rules, relay delivery. */
     private receiveBoundTerminalFrame(sessionId: string, entry: DaemonTerminalEntry, binding: BoundTerminal, data: string): void {
-        const opened = binding.openIn(data);
-        if (opened.kind === 'gap') {
-            logger.debug(`[REMOTE-TERMINAL] input gap session=${sessionId}; closing`);
-            if (!entry.exit) {
-                binding.closeReason ??= 'input-gap';
-                void entry.session.terminate();
-            }
-            return;
-        }
-        if (opened.kind !== 'frame') {
-            logger.debug(`[REMOTE-TERMINAL] bound frame dropped session=${sessionId} reason=${opened.kind}`);
-            return;
-        }
-        const frame = opened.frame;
-        if (frame.kind === 'resume') {
-            recordTerminalActivity(sessionId);
-            const send = (body: Parameters<BoundTerminal['sealOut']>[0]) => this.socket.emit('terminal-frame', { sessionId, data: binding.sealOut(body) });
-            const rid = frame.rid;
-            replyToTerminalResume({
-                sessionId,
-                output: entry.output,
-                exit: entry.exit,
-                closeReason: entry.closeReason,
-                afterSeq: frame.afterSeq,
-                maxChars: frame.maxChars,
-                // Each resume names itself: a newer one starts its own paged replay instead of merging into one its client stopped reading.
-                requester: rid,
-                seal: (plain) => plain,
-                emit: (event, payload) => {
-                    const page = (keys: readonly string[]) => Object.fromEntries(keys.filter((key) => payload[key] !== undefined).map((key) => [key, payload[key]]));
-                    if (event === 'terminal-frame') send({ kind: 'output', rid, seq: payload.seq as number, data: payload.data as string, ...page(['more', 'nextSeq']) });
-                    else if (event === 'terminal-snapshot') send({ kind: 'snapshot', rid, seq: payload.seq as number, data: payload.data as string, ...page(['more', 'nextSeq', 'droppedChars']) });
-                    else if (event === 'terminal-frame-gap') send({ kind: 'gap', rid, fromSeq: payload.fromSeq as number, ...page(['droppedChars']) });
-                    else if (entry.exit) this.emitTerminalClosed(sessionId, entry, entry.exit);
-                },
-            });
-            return;
-        }
-        if (entry.exit) return; // the PTY is gone; only a resume still means something.
-        if (frame.kind === 'input') {
-            entry.session.write(frame.data);
-            recordBytesIn(sessionId, frame.data.length);
-        } else if (frame.kind === 'resize') {
-            entry.session.resize(frame.cols, frame.rows);
-        } else if (frame.kind === 'close') {
-            binding.closeReason ??= 'client-closed';
-            void entry.session.terminate();
-        }
-        // `attach` belongs to the direct path; on the relay it is dropped.
+        receiveBoundTerminalFrame({
+            sessionId,
+            entry,
+            binding,
+            data,
+            sendSealed: (sealed) => this.socket.emit('terminal-frame', { sessionId, data: sealed }),
+            sendClosed: (exit) => this.emitTerminalClosed(sessionId, entry, exit),
+            end: () => { void entry.session.terminate(); },
+        });
     }
 
     connect() {

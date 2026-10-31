@@ -35,6 +35,9 @@ import {
 } from '@slopus/happy-wire';
 import { decodeBase64, decryptWithDataKey, encodeBase64, encryptWithDataKey } from '@/api/encryption';
 import { RpcNonceGuard } from '@/api/rpc/rpcNonceGuard';
+import { logger } from '@/ui/logger';
+import { recordBytesIn, recordTerminalActivity, type DaemonTerminalEntry, type TerminalExit } from './daemonTerminalSessions';
+import { replyToTerminalResume } from './terminalResumeReply';
 
 export function createTerminalOpenNonceGuard(options: { maxEntries?: number } = {}): RpcNonceGuard {
     return new RpcNonceGuard({ windowMs: RPC_BINDING_WINDOW_MS, maxEntries: options.maxEntries ?? 10_000, whenFull: 'refuse' });
@@ -134,4 +137,86 @@ export function bindTerminal(input: {
         caps: input.caps,
     }, terminalKey));
     return { terminal, proof };
+}
+
+/**
+ * terminal-binding-strict-design §4-4·4-5 — every control of a v2 terminal arrives as a sealed
+ * frame, in order, whichever path carries it. A replay or anything unreadable is dropped; a hole
+ * in the input ends the terminal, since keystrokes with one can assemble another command. The
+ * path delivers: `sendSealed` emits a `terminal-frame` with this data, `sendClosed` its exit,
+ * `end` ends the PTY with the path's own bookkeeping.
+ */
+export function receiveBoundTerminalFrame(input: {
+    sessionId: string;
+    entry: DaemonTerminalEntry;
+    binding: BoundTerminal;
+    data: string;
+    sendSealed: (data: string) => void;
+    sendClosed: (exit: TerminalExit) => void;
+    end: () => void;
+}): void {
+    const { sessionId, entry, binding } = input;
+    const opened = binding.openIn(input.data);
+    if (opened.kind === 'gap') {
+        logger.debug(`[REMOTE-TERMINAL] input gap session=${sessionId}; closing`);
+        if (!entry.exit) {
+            binding.closeReason ??= 'input-gap';
+            input.end();
+        }
+        return;
+    }
+    if (opened.kind !== 'frame') {
+        logger.debug(`[REMOTE-TERMINAL] bound frame dropped session=${sessionId} reason=${opened.kind}`);
+        return;
+    }
+    const frame = opened.frame;
+    if (frame.kind === 'resume') {
+        recordTerminalActivity(sessionId);
+        replyToBoundResume({ ...input, rid: frame.rid, afterSeq: frame.afterSeq, maxChars: frame.maxChars });
+        return;
+    }
+    if (entry.exit) return; // the PTY is gone; only a resume still means something.
+    if (frame.kind === 'input') {
+        entry.session.write(frame.data);
+        recordBytesIn(sessionId, frame.data.length);
+    } else if (frame.kind === 'resize') {
+        entry.session.resize(frame.cols, frame.rows);
+    } else if (frame.kind === 'close') {
+        binding.closeReason ??= 'client-closed';
+        input.end();
+    }
+    // `attach` takes a direct terminal over (controlServerTerminalWs.ts); as a frame it is dropped.
+}
+
+/** The answer to a sealed resume (or a direct attach): sealed frames that carry its `rid`. */
+export function replyToBoundResume(input: {
+    sessionId: string;
+    entry: DaemonTerminalEntry;
+    binding: BoundTerminal;
+    rid: string;
+    afterSeq: number;
+    maxChars?: number;
+    sendSealed: (data: string) => void;
+    sendClosed: (exit: TerminalExit) => void;
+}): void {
+    const { entry, binding, rid } = input;
+    const send = (body: TerminalOutBody) => input.sendSealed(binding.sealOut(body));
+    replyToTerminalResume({
+        sessionId: input.sessionId,
+        output: entry.output,
+        exit: entry.exit,
+        closeReason: entry.closeReason,
+        afterSeq: input.afterSeq,
+        maxChars: input.maxChars,
+        // Each resume names itself: a newer one starts its own paged replay instead of merging into one its client stopped reading.
+        requester: rid,
+        seal: (plain) => plain,
+        emit: (event, payload) => {
+            const page = (keys: readonly string[]) => Object.fromEntries(keys.filter((key) => payload[key] !== undefined).map((key) => [key, payload[key]]));
+            if (event === 'terminal-frame') send({ kind: 'output', rid, seq: payload.seq as number, data: payload.data as string, ...page(['more', 'nextSeq']) });
+            else if (event === 'terminal-snapshot') send({ kind: 'snapshot', rid, seq: payload.seq as number, data: payload.data as string, ...page(['more', 'nextSeq', 'droppedChars']) });
+            else if (event === 'terminal-frame-gap') send({ kind: 'gap', rid, fromSeq: payload.fromSeq as number, ...page(['droppedChars']) });
+            else if (entry.exit) input.sendClosed(entry.exit);
+        },
+    });
 }
