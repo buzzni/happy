@@ -48,7 +48,7 @@ function desktops(initial: string[], pinLimit?: number) {
             publicKey: Buffer.from(key.publicKey).toString('base64url'), issuedAt: now, expiresAt: now + 60000 }, server.secretKey);
     };
     const contacts = new Map(initial.map(id => [id, sign(id)])), revoked = new Set<string>(), stale = new Set<string>(), sent: string[] = [];
-    const journals = new Map<string, Map<string, 'pending' | 'started' | 'failed'>>(), stored = new Set<string>();
+    const journals = new Map<string, Map<string, 'pending' | 'started' | 'failed'>>(), stored = new Set<string>(), refused = new Set<string>();
     const port = createSessionOwnerContact({ enabled: true, binding, registry, now: () => now, pinLimit,
         trust: { issuer: fixture.contact.issuer, audience: fixture.contact.audience, publicKey: () => server.publicKey },
         lookup: async () => [...contacts.values()].filter(c => !revoked.has(c.desktopInstanceId)),
@@ -57,6 +57,10 @@ function desktops(initial: string[], pinLimit?: number) {
         exchange: async (contact, relay) => {
             sent.push(`${relay.operation}@${contact.desktopInstanceId}`);
             const desktopKey = keys.get(contact.desktopInstanceId)!.secretKey;
+            if (relay.operation === 'prompt-own-session' && refused.has(relay.localId)) {
+                const { entry, payload, callerSignature, targetSessionId, localId, ...bound } = relay;
+                return signOwnerRelayReply({ ...bound, responderSubject: contact.ownerSubject, checkedAt: now, result: 'not_owned' }, desktopKey);
+            }
             if (relay.operation === 'prompt-own-session' && stored.has(relay.localId)) {
                 const { entry, payload, callerSignature, targetSessionId, localId, ...bound } = relay;
                 return signOwnerRelayReply({ ...bound, responderSubject: contact.ownerSubject, checkedAt: now, result: 'allowed',
@@ -78,7 +82,7 @@ function desktops(initial: string[], pinLimit?: number) {
     const journal = (desktopInstanceId: string, operationId: string, state: 'pending' | 'started' | 'failed') => {
         journals.set(desktopInstanceId, (journals.get(desktopInstanceId) ?? new Map()).set(operationId, state));
     };
-    return { port, sent, journal, stored, add: (id: string) => { contacts.set(id, sign(id)); },
+    return { port, sent, journal, stored, refused, add: (id: string) => { contacts.set(id, sign(id)); },
         revoke: (id: string) => { revoked.add(id); }, restore: (id: string) => { revoked.delete(id); stale.delete(id); },
         /** Still listed by lookup but no longer current: chosen, then dropped before any send. */
         stale: (id: string) => { stale.add(id); }, hang: (on: boolean) => { hang = on; },
@@ -208,6 +212,34 @@ describe('host owner contact', () => {
         const again = await d.port.call(prompt);
         expect(d.sent.at(-1)).toBe('prompt-own-session@desktop-a');
         expect(again.result === 'allowed' && again.operation === 'prompt-own-session' && again.storage.messageId).toBe('message-local-1');
+    });
+    // A refused prompt and a status this host never sent a spawn for leave nothing on any Desktop to recover.
+    it('does not let refused prompts fill the table for new operations', async () => {
+        const d = desktops(['desktop-z'], LIMIT);
+        for (let i = 0; i < 2 * LIMIT; i++) {
+            d.refused.add(`refused-${i}`);
+            expect((await d.port.call({ ...prompt, localId: `refused-${i}` })).result).toBe('not_owned');
+        }
+        d.stored.add('local-1');
+        expect((await d.port.call(prompt)).result).toBe('allowed');
+        d.journal('desktop-z', 'operation-1', 'started');
+        expect((await d.port.call(spawn)).result).toBe('allowed');
+    });
+    it('does not let status lookups of operations never spawned here fill the table', async () => {
+        const d = desktops(['desktop-z'], LIMIT);
+        for (let i = 0; i < 2 * LIMIT; i++) await expect(d.port.call(child(status, `foreign-${i}`))).resolves.toMatchObject({ result: 'unknown' });
+        d.journal('desktop-z', 'operation-1', 'started');
+        expect((await d.port.call(spawn)).result).toBe('allowed');
+    });
+    it('keeps a child pinned once its spawn is sent after an unknown status', async () => {
+        const d = desktops(['desktop-z'], LIMIT);
+        await expect(d.port.call(status)).resolves.toMatchObject({ result: 'unknown' });
+        d.journal('desktop-z', 'operation-1', 'started');
+        expect((await d.port.call(spawn)).result).toBe('allowed');
+        d.add('desktop-a');
+        for (let i = 0; i < 2 * LIMIT; i++) { d.stored.add(`other-${i}`); await d.port.call({ ...prompt, localId: `other-${i}` }); }
+        await d.port.call(status);
+        expect(d.sent.at(-1)).toBe('owned-child-status@desktop-z');
     });
     // PIN-R1-02: a full table refuses only new operations; it never grows or evicts an unfinished one.
     it('refuses a new operation when every slot holds an unfinished one', async () => {

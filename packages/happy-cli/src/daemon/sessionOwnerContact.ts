@@ -35,18 +35,24 @@ function operationKey(request: OwnerContactRequest): string | null {
         default: return null;
     }
 }
-/** Only a verified stored-prompt receipt ends an operation's pin: the row is found again by localId on the
- * server, so a retry after a lost receipt gets the same receipt from any valid Desktop. An owned child never
- * ends here: a verified started/failed may not have reached the CLI or its lineage record, and only the
- * original Desktop's journal answers the status that recovers it, so its pin lasts the host's lifetime.
- * pending/parked/unknown/unavailable/not_owned, a timeout or a rejected reply end nothing. */
-function finished(reply: OwnerRelayReply): boolean {
-    return reply.result === 'allowed' && reply.operation === 'prompt-own-session';
+/** A verified stored-prompt receipt ends an operation's pin: the row is found again by localId on the
+ * server, so a retry after a lost receipt gets the same receipt from any valid Desktop. A verified not_owned
+ * prompt was refused before storage (P0a §5.1), and a non-allowed status of an operation this host never sent
+ * a spawn for has no journal here to recover, so neither holds anything on a Desktop. An owned child that was
+ * spawned never ends here: a verified started/failed may not have reached the CLI or its lineage record, and
+ * only the original Desktop's journal answers the status that recovers it, so its pin lasts the host's lifetime.
+ * pending/parked, any other unknown/unavailable, a timeout or a rejected reply end nothing. */
+function finished(reply: OwnerRelayReply, spawned: boolean): boolean {
+    switch (reply.operation) {
+        case 'prompt-own-session': return reply.result === 'allowed' || reply.result === 'not_owned';
+        case 'owned-child-status': return !spawned && reply.result !== 'allowed';
+        default: return false;
+    }
 }
 /** 512: the Desktop CLI spawn budget is at most 32 per 6 hours per host, so lifetime child pins alone take
  * four days at full budget to fill it; finished prompts are reclaimed. A full table refuses new operations. */
 const PIN_LIMIT = 512, PIN_TTL_MS = 24 * 60 * 60 * 1000;
-type Pin = { desktopInstanceId: string; usedAt: number; sent: boolean; finished: boolean; inflight: number };
+type Pin = { desktopInstanceId: string; usedAt: number; sent: boolean; spawned: boolean; finished: boolean; inflight: number };
 export function createSessionOwnerContact(deps: SessionOwnerContactDependencies): SessionOwnerContact {
     const binding = OwnershipCallerBindingSchema.parse(deps.binding);
     const enabled = deps.enabled === true;
@@ -62,7 +68,7 @@ export function createSessionOwnerContact(deps: SessionOwnerContactDependencies)
             if (first === undefined) return null;
             for (const [k, p] of pins) if (p.inflight === 0 && p.finished && (deps.now() - p.usedAt > PIN_TTL_MS || pins.size >= pinLimit)) pins.delete(k);
             if (pins.size >= pinLimit) throw new Error('contact-unavailable');
-            pin = { desktopInstanceId: first, usedAt: 0, sent: false, finished: false, inflight: 0 };
+            pin = { desktopInstanceId: first, usedAt: 0, sent: false, spawned: false, finished: false, inflight: 0 };
         }
         pins.delete(key); pins.set(key, pin);
         pin.usedAt = deps.now(); pin.inflight++;
@@ -121,6 +127,8 @@ export function createSessionOwnerContact(deps: SessionOwnerContactDependencies)
                     hostEpoch: binding.hostEpoch, sourceAuthority: contact.sourceAuthority, relayEpoch: contact.epoch });
                 await current(); signal.throwIfAborted();
                 if (pin) pin.sent = true;
+                // A spawn makes the child's pin lifetime-long, even after an earlier status ended it.
+                if (pin && local.operation === 'spawn-owned-child') { pin.spawned = true; pin.finished = false; }
                 const rawReply = JSON.parse(canonicalOwnerRelayJson(await deps.exchange(contact, request, signal)));
                 await current(); signal.throwIfAborted();
                 if (!valid(contact) || !await deps.currentContact(contact, signal)
@@ -128,7 +136,7 @@ export function createSessionOwnerContact(deps: SessionOwnerContactDependencies)
                 await current(); signal.throwIfAborted();
                 if (!valid(contact)) throw new Error('contact-unavailable');
                 const reply = OwnerRelayReplySchema.parse(rawReply);
-                if (pin && finished(reply)) pin.finished = true;
+                if (pin && finished(reply, pin.spawned)) pin.finished = true;
                 return reply;
             } finally { drop(); } };
             // Bound even an adapter that ignores AbortSignal; never expose its exception/credentials.

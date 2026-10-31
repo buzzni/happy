@@ -231,3 +231,13 @@ PIN-R2 반영 검증: fixture를 Desktop별 생성 journal로 나눴다. journal
 prompt receipt 테스트는 정리 뒤 다른 Desktop에서 같은 receipt를 받는지까지 확인한다. 공유 상태로 상한을 채우던 테스트는
 압박 키를 종결 prompt로 바꿨다. 구현 전 새 테스트 1건 실패. 역검증 3건: child 종결을 다시 정리 대상으로, prompt 종결을
 거짓으로, 정리의 종결 조건 제거를 각각 넣으면 해당 테스트가 실패했다. 관련 3파일 74건 통과, `tsc --noEmit` 통과.
+
+PIN-R3 반영(#1031 리뷰 `pin-table-filled-by-receipt-less-prompts`): Desktop에 아무것도 남기지 않는 응답도 종결로 본다.
+검증된 `not_owned` prompt는 저장 전에 거부된 것이고(p0a §5.1), 이 host가 spawn을 보낸 적 없는 operation의
+`owned-child-status`가 `allowed`가 아니면 회수할 journal이 없다. 이전에는 둘 다 기록을 남겨, 다른 소유자의 형제에게
+새 localId로 prompt가 512번 거부되면(prompt에는 예산이 없고 `--local-id` 생략 시 매번 새 UUID) 그 host의 새 spawn·prompt가
+재시작 전까지 unavailable이었다. 같은 operationId로 spawn을 보내면 그 기록은 다시 미종결이 되어 host 수명 동안 남는다.
+`unknown`·`unavailable` prompt와 timeout은 원래 Desktop의 시도 기록이 판단에 쓰이므로 그대로 남긴다. 검증: 3건 추가
+(거부 prompt로 상한의 두 배를 채운 뒤 prompt·spawn 허용, spawn 없는 status로 채운 뒤 spawn 허용, unknown status 뒤 spawn한
+child의 고정 유지). 구현 전 앞의 2건 실패. 역검증 2건: `not_owned` 종결 제거, spawn 송신 시 미종결 복원 제거가 각각 해당 테스트를
+실패시켰다.
