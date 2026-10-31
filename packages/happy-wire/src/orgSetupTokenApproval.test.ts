@@ -54,4 +54,32 @@ describe('approved org setup-token wire contract', () => {
     await expect(verifyOrgSetupTokenDocument(JSON.stringify({ body: vector.body, signature: vector.signature }), nacl.sign.keyPair().publicKey)).rejects.toThrow();
     await expect(signOrgSetupTokenDocument({ ...vector.body, signingKeyId: '0'.repeat(64) }, pair.secretKey)).rejects.toThrow();
   });
+
+  describe('company-data-key-generation (specs/e2ee-machine-control-boundary F8)', () => {
+    const dataPublicKey = Buffer.from(nacl.box.keyPair().publicKey).toString('base64url');
+    const declaration = async () => ({
+      version: 1, kind: 'company-data-key-generation', companyId: 'company-1', signingGeneration: 1,
+      signingKeyId: Buffer.from(await globalThis.crypto.subtle.digest('SHA-256', publicKey)).toString('hex'),
+      issuedAt: 1_700_000_000_000, generation: 2, dataPublicKey,
+    });
+
+    it('signs and verifies a new company key generation', async () => {
+      const body = await declaration();
+      const document = await signOrgSetupTokenDocument(body, pair.secretKey);
+      expect(new TextDecoder().decode(orgSetupTokenSigningBytes(body))).toMatch(/^saycode\/company-data-key-generation\/v1\n/);
+      expect((await verifyOrgSetupTokenDocument(JSON.stringify(document), publicKey)).body).toEqual(body);
+    });
+
+    it('rejects a changed key or generation, generation 0, a non-canonical key and unknown fields', async () => {
+      const body = await declaration();
+      const document = await signOrgSetupTokenDocument(body, pair.secretKey);
+      const other = Buffer.from(nacl.box.keyPair().publicKey).toString('base64url');
+      await expect(verifyOrgSetupTokenDocument(JSON.stringify({ ...document, body: { ...body, dataPublicKey: other } }), publicKey)).rejects.toThrow();
+      await expect(verifyOrgSetupTokenDocument(JSON.stringify({ ...document, body: { ...body, generation: 3 } }), publicKey)).rejects.toThrow();
+      for (const mutation of [{ generation: 0 }, { dataPublicKey: dataPublicKey + '=' }, { previousGeneration: 1 }]) {
+        expect(() => orgSetupTokenSigningBytes({ ...body, ...mutation })).toThrow();
+      }
+    });
+  });
 });
+

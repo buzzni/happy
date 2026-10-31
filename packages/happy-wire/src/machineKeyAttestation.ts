@@ -1,5 +1,6 @@
 import nacl from 'tweetnacl';
 import * as z from 'zod';
+import { formatKeyFingerprint } from './keyFingerprint';
 
 /**
  * aplus-dev-studio specs/e2ee-machine-control-boundary R20–R22 — a customer's
@@ -22,7 +23,6 @@ export const MACHINE_KEY_ATTESTATION_VERSION = 1;
 
 const DIGEST_DOMAIN = new TextEncoder().encode('happy machine key fingerprint v1');
 const HEADER_BYTES = 1 + nacl.box.publicKeyLength + nacl.box.nonceLength;
-const BASE32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
 const statementSchema = z.object({
   v: z.literal(MACHINE_KEY_ATTESTATION_VERSION),
@@ -43,19 +43,7 @@ export function machineKeyDigest(machineId: string, machineKey: Uint8Array): Uin
 
 /** What a person compares: the digest's first 100 bits, RFC 4648 base32, five groups of four. */
 export function machineKeyFingerprint(machineId: string, machineKey: Uint8Array): string {
-  const digest = machineKeyDigest(machineId, machineKey);
-  let bits = 0;
-  let value = 0;
-  let out = '';
-  for (const byte of digest.subarray(0, 13)) {
-    value = (value << 8) | byte;
-    bits += 8;
-    while (bits >= 5 && out.length < 20) {
-      out += BASE32[(value >>> (bits - 5)) & 31];
-      bits -= 5;
-    }
-  }
-  return out.match(/.{4}/g)!.join('-');
+  return formatKeyFingerprint(machineKeyDigest(machineId, machineKey));
 }
 
 function toBase64(bytes: Uint8Array): string {

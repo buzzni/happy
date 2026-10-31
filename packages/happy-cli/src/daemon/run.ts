@@ -46,7 +46,8 @@ import {
 } from '@/modules/common/registerCommonHandlers';
 import { logger } from '@/ui/logger';
 import { authAndSetupMachineIfNeeded } from '@/ui/auth';
-import { settleMachineControl } from '@/datakey/machineControl';
+import { reseedCompanyKey, settleMachineControl } from '@/datakey/machineControl';
+import { createCompanyKeyReseedHandler } from './companyKeyReseedHandler';
 import type { PayloadTrust } from '@/daemon/automations/payloadTrust';
 import { createMachineControlIo } from '@/datakey/machineControlIo';
 import { configuration } from '@/configuration';
@@ -528,6 +529,8 @@ export const DIFFICULTY_ROUTING_ELECTION_POLL_MS = 15_000;
 const DIFFICULTY_ROUTING_ELECTION_MAX_POLL_MS = 15 * 60_000;
 // 서버 자동화 tick 이 이 시간을 넘기면 멈춘 것으로 보고 버린다 (정상 tick 은 1분 안에 끝난다).
 const SERVER_AUTOMATION_TICK_STALL_MS = 10 * 60_000;
+/** F8: how long new sessions are told the daemon is restarting while it moves to a new company key. */
+const COMPANY_KEY_RESEED_RESTART_MS = 2 * 60_000;
 
 /**
  * Doubling delay while the route stays unreachable, capped at 15 minutes. A
@@ -5627,6 +5630,30 @@ export async function startDaemon(): Promise<void> {
       onError: (error) => logger.debug(`[checkpoint-retention] ${String(error)}`),
     });
     void checkpointRetentionSchedule.tick();
+
+    // aplus specs/e2ee-machine-control-boundary F8 — a strict machine moves to a new company key only on
+    // a declaration signed by the organization key it pinned through device approval.
+    if (configuration.machineControl === 'strict' && deviceEnrollment && !managedCredential?.ok) {
+      const enrollment = deviceEnrollment;
+      apiMachine.setCompanyKeyReseedHandler(createCompanyKeyReseedHandler({
+        machineId,
+        pins: { get: (companyId) => enrollment.orgPin(companyId) },
+        reseed: (target) => reseedCompanyKey({
+          credentials,
+          machineId,
+          serverPublicKey,
+          metadata: daemonMachineMetadata,
+          io: createMachineControlIo({ token: credentials.token, machineId }),
+          target,
+        }),
+        launches: {
+          close: () => launchReadiness.closeForRestart(Date.now() + COMPANY_KEY_RESEED_RESTART_MS),
+          reopen: () => launchReadiness.reopenAfterRestartDrain(),
+        },
+        // After the answer has gone out under the old key: everything read once at start still names it.
+        onChanged: () => { setTimeout(() => { void handOffToInstalledBundle(); }, 1_000); },
+      }));
+    }
 
     // All launch dependencies and RPC handlers now exist; early HTTP requests were refused.
     launchReadiness.markReady();

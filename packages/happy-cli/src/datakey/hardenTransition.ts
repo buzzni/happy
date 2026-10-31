@@ -25,6 +25,8 @@ export type HardenIo = {
   liveSessions(): Promise<Array<{ pid: number; command: string }>>
   dropNeverEscrowed(): Promise<void>
   discardPendingRotation(): Promise<void>
+  /** F8 4-6: the first strict start records the company key it holds then. */
+  discardCompanyKeyRecord(): Promise<void>
   /** 'absent' when the daemon has not made an automation key yet. */
   rotateAutomationKey(): Promise<'rotated' | 'absent'>
   setStrict(): Promise<void>
@@ -49,6 +51,7 @@ export async function runHarden(io: HardenIo): Promise<HardenOutcome> {
     if (!plan.ok) return plan
     if (plan.dropNeverEscrowed) await io.dropNeverEscrowed()
     if (plan.discardPending) await io.discardPendingRotation()
+    await io.discardCompanyKeyRecord()
     const automationKey = await io.rotateAutomationKey()
     await io.setStrict()
     return {

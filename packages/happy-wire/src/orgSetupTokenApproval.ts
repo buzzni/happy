@@ -114,7 +114,15 @@ const revocation = z.object({ ...common, kind: z.literal('device-revocation'), a
   machineId: id, recipientKeyId: digest }).strict();
 const rotation = z.object({ ...common, kind: z.literal('org-signing-rotation'), nextGeneration: positive,
   nextPublicKey: binary(32), nextKeyId: digest }).strict().refine(value => value.nextGeneration === value.signingGeneration + 1);
-const bodySchema = z.union([approval, assignment, revocation, rotation]);
+/**
+ * aplus-dev-studio specs/e2ee-machine-control-boundary F8: a security admin's
+ * statement that `dataPublicKey` is the company's key for `generation`, signed
+ * in the browser that made the key pair. A strict machine moves to a new
+ * company key only on such a statement under the org key it pinned.
+ */
+const dataKeyGeneration = z.object({ ...common, kind: z.literal('company-data-key-generation'),
+  generation: positive, dataPublicKey: binary(32) }).strict();
+const bodySchema = z.union([approval, assignment, revocation, rotation, dataKeyGeneration]);
 const documentSchema = z.object({ body: bodySchema, signature: binary(64) }).strict();
 const enrollmentSchema = z.object({ version: z.literal(1), companyId: id, ...ownership,
   deviceSigningPublicKey: binary(32), recipientPublicKey: binary(32), orgSigningPublicKey: binary(32),

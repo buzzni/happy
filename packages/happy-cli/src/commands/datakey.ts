@@ -27,11 +27,11 @@ import {
   describeDataKeyStatus,
   type ActivationGateFailure,
 } from '@/datakey/activation'
-import { describeMachineControl, describeMachineKeyFingerprint } from '@/datakey/machineControlStatus'
+import { describeCompanyKeyFingerprint, describeMachineControl, describeMachineKeyFingerprint } from '@/datakey/machineControlStatus'
 import { hardenBlockingSessions, runHarden } from '@/datakey/hardenTransition'
 import { findAllHappyProcesses } from '@/daemon/doctor'
 import { rotateMachineAutomationKey } from '@/daemon/automations/machineAutomationKey'
-import { pendingMachineKeyRotationFile } from '@/datakey/machineControlIo'
+import { companyKeyRecordFile, pendingMachineKeyRotationFile } from '@/datakey/machineControlIo'
 
 const backupFile = () => join(configuration.happyHomeDir, 'access.key.legacy-backup')
 
@@ -166,6 +166,11 @@ async function printMachineControlStatus(): Promise<void> {
     // aplus-dev-studio specs/e2ee-machine-control-boundary R20 — compared with the client before it attests the key.
     console.log(`key fingerprint: ${chalk.bold(fingerprint)} ${chalk.gray('(웹·데스크톱의 머신 키 확인에서 같은 값인지 비교하세요)')}`)
   }
+  const companyFingerprint = describeCompanyKeyFingerprint({ rawCredentials })
+  if (companyFingerprint) {
+    // aplus-dev-studio specs/e2ee-machine-control-boundary F8 — compared with the organization key screen.
+    console.log(`company key:     ${chalk.bold(companyFingerprint)} ${chalk.gray('(새 대화가 이 회사 키로 봉인됩니다. 조직 키 화면의 지문과 비교하세요)')}`)
+  }
   if (control.pending) {
     const when = control.pending.lastAttemptAt ? ` (${new Date(control.pending.lastAttemptAt).toLocaleString()})` : ''
     const why = control.pending.lastError ? ` — 마지막 실패: ${control.pending.lastError}${when}` : ''
@@ -218,6 +223,7 @@ async function handleHarden(): Promise<void> {
       })
     },
     discardPendingRotation: () => rm(pendingMachineKeyRotationFile(), { force: true }),
+    discardCompanyKeyRecord: () => rm(companyKeyRecordFile(), { force: true }),
     rotateAutomationKey: async () => rotateMachineAutomationKey(configuration.automationKeyFile),
     setStrict: async () => {
       await updateSettings((settings) => ({ ...settings, machineControl: 'strict' }))

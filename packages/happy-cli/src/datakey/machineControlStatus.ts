@@ -3,7 +3,7 @@
  * behind `happy datakey status`, `harden` and `compat`. Pure, like
  * activation.ts: the command reads the files and prints.
  */
-import { machineKeyFingerprint } from '@slopus/happy-wire'
+import { companyKeyFingerprint, machineKeyFingerprint } from '@slopus/happy-wire'
 import { parseCredentials } from '@/persistence'
 import { parsePendingMachineKeyRotation, type MachineControlMode } from './machineControl'
 
@@ -46,6 +46,16 @@ export function describeMachineKeyFingerprint(input: { rawCredentials: unknown |
   const credentials = input.rawCredentials === null ? null : parseCredentials(input.rawCredentials)
   if (!credentials || credentials.encryption.type !== 'dataKey') return null
   return machineKeyFingerprint(input.machineId, credentials.encryption.machineKey)
+}
+
+/**
+ * F8 — the company key this machine seals new sessions to, in the form the
+ * organization key screen shows. A legacy machine seals to no company key.
+ */
+export function describeCompanyKeyFingerprint(input: { rawCredentials: unknown | null }): string | null {
+  const credentials = input.rawCredentials === null ? null : parseCredentials(input.rawCredentials)
+  if (!credentials || credentials.encryption.type !== 'dataKey') return null
+  return companyKeyFingerprint(credentials.encryption.publicKey)
 }
 
 export type HardenPlan =

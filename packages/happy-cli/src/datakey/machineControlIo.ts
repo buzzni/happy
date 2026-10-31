@@ -13,13 +13,36 @@ import {
   readMachineIdentity,
   replaceCredentialsDataKey,
   replacePrivateFile,
+  updateSettings,
   writeMachineIdentity,
 } from '@/persistence'
+import { encodeBase64 } from '@/api/encryption'
 import { logger } from '@/ui/logger'
-import { MachineKeyRotationConflict, type MachineControlIo } from './machineControl'
+import { MachineKeyRotationConflict, parseCompanyKeyRecord, type MachineControlIo } from './machineControl'
 
 export function pendingMachineKeyRotationFile(): string {
   return `${configuration.privateKeyFile}.rotation`
+}
+
+/** F8 4-6: the company key this strict machine last moved to on purpose. */
+export function companyKeyRecordFile(): string {
+  return `${configuration.privateKeyFile}.company`
+}
+
+async function readJsonFile(file: string): Promise<unknown | null> {
+  let text: string
+  try {
+    text = await readFile(file, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
+  }
+  try {
+    return JSON.parse(text)
+  } catch {
+    // Unparseable is still a record; the planner discards it.
+    return {}
+  }
 }
 
 export function createMachineControlIo(input: { token: string; machineId: string }): MachineControlIo {
@@ -28,21 +51,7 @@ export function createMachineControlIo(input: { token: string; machineId: string
   const machineUrl = `${configuration.serverUrl}/v1/machines/${encodeURIComponent(input.machineId)}`
 
   return {
-    readPending: async () => {
-      let text: string
-      try {
-        text = await readFile(file, 'utf8')
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-        throw error
-      }
-      try {
-        return JSON.parse(text)
-      } catch {
-        // Unparseable is still a record; the planner discards it.
-        return {}
-      }
-    },
+    readPending: () => readJsonFile(file),
     writePending: (pending) => replacePrivateFile(file, JSON.stringify(pending, null, 2)),
     deletePending: () => rm(file, { force: true }),
     writeCredentials: async (credentials) => {
@@ -82,6 +91,21 @@ export function createMachineControlIo(input: { token: string; machineId: string
         throw error
       }
     },
+    commitCompanyKey: async ({ publicKey }) => {
+      const encoded = encodeBase64(publicKey)
+      await updateSettings((settings) => ({ ...settings, accountPublicKey: encoded }))
+      // The backup is what `datakey deactivate` restores; it must not bring the old company key back.
+      const backupFile = `${configuration.privateKeyFile}.legacy-backup`
+      const backup = await readJsonFile(backupFile) as { encryption?: { publicKey?: string } } | null
+      if (backup?.encryption && typeof backup.encryption === 'object') {
+        await replacePrivateFile(backupFile, JSON.stringify({ ...backup, encryption: { ...backup.encryption, publicKey: encoded } }, null, 2))
+      }
+    },
+    readCompanyKeyRecord: async () => {
+      const raw = await readJsonFile(companyKeyRecordFile())
+      return raw === null ? null : parseCompanyKeyRecord(raw)
+    },
+    writeCompanyKeyRecord: (record) => replacePrivateFile(companyKeyRecordFile(), JSON.stringify(record, null, 2)),
     randomKey: () => new Uint8Array(randomBytes(32)),
     now: () => Date.now(),
   }
