@@ -85,7 +85,7 @@ import { preflightDaemonControlServer, startDaemonControlServer } from './contro
 import { BrowserBridge } from './browserBridge';
 import { BrowserLocalSetup, shouldEnableBrowserLocalSetup } from './browserLocalSetup';
 import { fetchBrowserExtensionScope } from './browserExtensionScope';
-import { readBrowserSetupPolicy, writeBrowserSetupPolicy, localBrowserExtensionMetadata } from './browserLocalSetupStore';
+import { readBrowserSetupPolicy, writeBrowserSetupPolicy, localBrowserExtensionMetadata, readBrowserExtensionOffer, writeBrowserExtensionOffer } from './browserLocalSetupStore';
 import { BrowserSessionBrokerClient } from './browserSessionBrokerContract';
 import { getBusyDaemonTerminalCount, getDaemonTerminalSessionCount } from './daemonTerminalSessions';
 import { startBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './browserBridgeServer';
@@ -4040,6 +4040,8 @@ export async function startDaemon(): Promise<void> {
       ? new BrowserSessionBrokerClient(process.env.HAPPY_BROWSER_BROKER_SOCKET)
       : null;
     const browserSetupPolicyFile = join(configuration.happyHomeDir, 'browser-local-setup.v1.json');
+    const browserExtensionOfferFile = join(configuration.happyHomeDir, 'browser-extension-offer.v1.json');
+    const browserExtensionOffer = await readBrowserExtensionOffer(browserExtensionOfferFile);
     const browserSetupPolicy = await readBrowserSetupPolicy(browserSetupPolicyFile).catch(() => {
       logger.warn(`[DAEMON RUN] BROWSER_SETUP_POLICY_CORRUPT: ${browserSetupPolicyFile} could not be read; browser bridge disabled until it is repaired or removed`);
       return null;
@@ -4068,6 +4070,7 @@ export async function startDaemon(): Promise<void> {
         port: DEFAULT_BROWSER_BRIDGE_PORT, extension: localBrowserExtensionMetadata,
         persistPolicy: policy => writeBrowserSetupPolicy(browserSetupPolicyFile, policy),
         extensionScope: () => fetchBrowserExtensionScope({ origin: readTrustedStudioOrigin(process.env), machineId, token: credentials.token }),
+        offer: browserExtensionOffer, persistOffer: offer => writeBrowserExtensionOffer(browserExtensionOfferFile, offer),
       }) : undefined;
     let stopBrowserBridge: () => Promise<void> = async () => {};
     try {

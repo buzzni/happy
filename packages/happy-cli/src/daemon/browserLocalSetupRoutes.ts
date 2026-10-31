@@ -24,6 +24,9 @@ export function attachBrowserLocalSetupRoutes(app: FastifyInstance, setup: Brows
             try { return { ok: true, config: await setup.connect(request.body.profile) } }
             catch (error) { reply.code(409); return { ok: false, error: setupErrorCode(error) } }
         })
+    // Desktop arms its signed-in user's offer; `clear` withdraws it (sign-out).
+    typed.post('/browser/local-setup/arm', { schema: { body: z.union([z.object({ viewerKey: scope, account: z.string().min(1).max(200) }).strict(), z.object({ clear: z.literal(true) }).strict()]) } },
+        async request => { await setup.arm('clear' in request.body ? null : request.body); return { ok: true } })
     typed.post('/browser/local-setup/consume', { schema: { body: z.object({ operationId: z.string().regex(/^[A-Za-z0-9_-]{32}$/) }).strict() } },
         async (request, reply) => {
             try { return { ok: true, config: await setup.consume(request.body.operationId) } }

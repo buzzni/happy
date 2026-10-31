@@ -4,6 +4,7 @@ import { dirname } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { resolveExtensionDir, resolveExtensionId } from '@/commands/browser'
 import type { BrowserSetupPolicy } from './browserBridge'
+import type { BrowserExtensionOffer } from './browserLocalSetup'
 
 export async function readBrowserSetupPolicy(file: string): Promise<BrowserSetupPolicy> {
     let raw: string
@@ -22,6 +23,18 @@ export async function readBrowserSetupPolicy(file: string): Promise<BrowserSetup
 }
 export async function writeBrowserSetupPolicy(file: string, scopes: BrowserSetupPolicy): Promise<void> {
     await writePrivateJson(file, { version: 1, scopes })
+}
+/** A missing or unreadable offer is only absent: Desktop arms it again, so it never disables the bridge. */
+export async function readBrowserExtensionOffer(file: string): Promise<BrowserExtensionOffer | null> {
+    try {
+        const value = JSON.parse(await readFile(file, 'utf8'))
+        const offer = value?.version === 1 ? value.offer : null
+        return offer && /^bv1_[A-Za-z0-9_-]{32}$/.test(offer.viewerKey) && typeof offer.account === 'string' && offer.account.trim()
+            && offer.account.length <= 200 && !/[\x00-\x1f]/.test(offer.account) ? { viewerKey: offer.viewerKey, account: offer.account } : null
+    } catch { return null }
+}
+export async function writeBrowserExtensionOffer(file: string, offer: BrowserExtensionOffer | null): Promise<void> {
+    await writePrivateJson(file, { version: 1, offer })
 }
 async function writePrivateJson(file: string, value: unknown): Promise<void> {
     await mkdir(dirname(file), { recursive: true, mode: 0o700 })

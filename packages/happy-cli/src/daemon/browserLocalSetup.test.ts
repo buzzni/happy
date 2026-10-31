@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { BrowserBridge } from './browserBridge'
 import { BrowserLocalSetup, shouldEnableBrowserLocalSetup } from './browserLocalSetup'
 import { startDaemonControlServer } from './controlServer'
@@ -208,5 +208,64 @@ describe('extension-started connection', () => {
         const setup = new BrowserLocalSetup({ bridge, readToken: async () => baseToken, port: 41777,
             extension: () => ({ directory: '/test', id: 'emaponnolfbhnoaabgiebjmbdlmoifke', version: '0.1.0' }), persistPolicy: async () => {} })
         await expect(setup.offer()).rejects.toThrow('SCOPE_UNAVAILABLE')
+    })
+})
+
+describe('connection offer armed by Desktop', () => {
+    function armable(initial: { viewerKey: string; account: string } | null = null) {
+        const bridge = new BrowserBridge({ authToken: baseToken })
+        const saved: unknown[] = []
+        const serverScope = vi.fn(async () => ({ viewerKey: bob, account: 'daemon-owner@example.com' }))
+        const setup = new BrowserLocalSetup({ bridge, readToken: async () => baseToken, port: 41777,
+            extension: () => ({ directory: '/test', id: 'emaponnolfbhnoaabgiebjmbdlmoifke', version: '0.1.0' }), persistPolicy: async () => {},
+            extensionScope: serverScope, offer: initial, persistOffer: async offer => { saved.push(offer) } })
+        return { setup, bridge, saved, serverScope }
+    }
+    it("prefers the signed-in Desktop user's offer over the daemon's own lookup", async () => {
+        const { setup, bridge, saved, serverScope } = armable()
+        await setup.arm({ viewerKey: alice, account: 'alice@example.com' })
+        expect(saved).toEqual([{ viewerKey: alice, account: 'alice@example.com' }])
+        expect(await setup.offer()).toEqual({ account: 'alice@example.com' })
+        const config = await setup.connect('default-1f8b')
+        expect(config.viewerKey).toBe(alice)
+        expect(bridge.getSetupPolicy()[alice]).toMatchObject({ profile: 'default-1f8b' })
+        expect(serverScope).not.toHaveBeenCalled()
+    })
+    it('restores a saved offer after a restart and falls back to the daemon lookup once cleared', async () => {
+        const { setup, saved, serverScope } = armable({ viewerKey: alice, account: 'alice@example.com' })
+        expect(await setup.offer()).toEqual({ account: 'alice@example.com' })
+        await setup.arm(null)
+        expect(saved).toEqual([null])
+        expect(await setup.offer()).toEqual({ account: 'daemon-owner@example.com' })
+        expect(serverScope).toHaveBeenCalledOnce()
+    })
+    it.each([
+        [{ viewerKey: 'forged', account: 'a@example.com' }],
+        [{ viewerKey: alice, account: '' }],
+        [{ viewerKey: alice, account: 'a\u0000b' }],
+        [{ viewerKey: alice, account: 'x'.repeat(201) }],
+    ])('refuses a malformed offer %j and keeps the previous one', async offer => {
+        const { setup, saved } = armable({ viewerKey: alice, account: 'alice@example.com' })
+        await expect(setup.arm(offer)).rejects.toThrow('INVALID_OFFER')
+        expect(saved).toEqual([])
+        expect(await setup.offer()).toEqual({ account: 'alice@example.com' })
+    })
+    it('accepts an offer only over the authenticated control server', async () => {
+        const { setup, bridge } = armable()
+        const control = await startDaemonControlServer({ browserBridge: bridge, browserLocalSetup: setup,
+            getChildren: () => [], stopSession: () => ({ status: 'not-found' } as any),
+            spawnSession: async () => ({ type: 'error', errorMessage: 'unused' } as any), requestShutdown: () => {}, onHappySessionWebhook: () => {},
+            portRegistry: { allocate: async () => ({ port: 30000, reused: false }), release: async () => false, readAll: async () => ({}) },
+        })
+        const post = (body: unknown, authenticated = true) => fetch(`http://127.0.0.1:${control.port}/browser/local-setup/arm`, { method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...(authenticated ? { Authorization: `Bearer ${control.controlSecret}` } : {}) }, body: JSON.stringify(body) })
+        try {
+            expect((await post({ viewerKey: alice, account: 'alice@example.com' }, false)).status).toBe(401)
+            expect((await post({ viewerKey: 'forged', account: 'a' })).status).toBe(400)
+            expect(await (await post({ viewerKey: alice, account: 'alice@example.com' })).json()).toEqual({ ok: true })
+            expect(await setup.offer()).toEqual({ account: 'alice@example.com' })
+            expect(await (await post({ clear: true })).json()).toEqual({ ok: true })
+            expect(await setup.offer()).toEqual({ account: 'daemon-owner@example.com' })
+        } finally { await control.stop() }
     })
 })

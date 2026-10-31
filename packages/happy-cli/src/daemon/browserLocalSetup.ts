@@ -5,6 +5,7 @@ import { CHROME_WEB_STORE_EXTENSION_ID } from './browserNativeHostRegistration'
 const SCOPE = /^bv1_[A-Za-z0-9_-]{32}$/
 const TTL = 5 * 60 * 1000
 interface Operation { id: string; profile: string; expires: number; consumed: boolean }
+export interface BrowserExtensionOffer { viewerKey: string; account: string }
 export interface LocalBrowserSetupStatus {
     state: 'idle' | 'waiting' | 'connected' | 'revoked' | 'expired' | 'probe-failed'
     operationId?: string
@@ -36,7 +37,11 @@ export class BrowserLocalSetup {
         now?: () => number
         /** This daemon's own server lookup of its owner's key; the extension never supplies one. */
         extensionScope?(): Promise<{ viewerKey: string; account: string }>
-    }) {}
+        /** Offer last armed by Desktop for its signed-in user, restored from disk. */
+        offer?: BrowserExtensionOffer | null
+        persistOffer?(offer: BrowserExtensionOffer | null): Promise<void>
+    }) { this.armed = options.offer ?? null }
+    private armed: BrowserExtensionOffer | null
 
     private scope(key: string) { if (!SCOPE.test(key)) throw new Error('INVALID_SCOPE') }
     private now() { return this.options.now?.() ?? Date.now() }
@@ -79,6 +84,16 @@ export class BrowserLocalSetup {
             return { token, port: this.options.port, host: '127.0.0.1', viewerKey, pairingId: op.id, profile: op.profile }
         })
     }
+    /** Desktop's signed-in user for this PC, ahead of the daemon's own token (a company daemon token names no user). */
+    arm(offer: BrowserExtensionOffer | null): Promise<void> {
+        return this.exclusive(async () => {
+            if (offer && (!SCOPE.test(offer.viewerKey) || typeof offer.account !== 'string' || !offer.account.trim()
+                || offer.account.length > 200 || /[\x00-\x1f]/.test(offer.account))) throw new Error('INVALID_OFFER')
+            const next = offer && { viewerKey: offer.viewerKey, account: offer.account }
+            await this.options.persistOffer?.(next)
+            this.armed = next
+        })
+    }
     /** What the extension may show before the user approves; grants nothing. */
     async offer(): Promise<{ account: string }> {
         return { account: (await this.serverScope()).account }
@@ -89,6 +104,7 @@ export class BrowserLocalSetup {
         return this.consume((await this.begin(viewerKey, profile)).operationId)
     }
     private async serverScope(): Promise<{ viewerKey: string; account: string }> {
+        if (this.armed) return this.armed
         let scope: { viewerKey: string; account: string }
         try {
             if (!this.options.extensionScope) throw new Error('SCOPE_UNAVAILABLE')
