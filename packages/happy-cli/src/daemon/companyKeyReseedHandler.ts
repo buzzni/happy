@@ -22,7 +22,7 @@ import {
     type OrgSetupTokenDocument,
 } from '@slopus/happy-wire';
 import { encodeBase64 } from '@/api/encryption';
-import { CompanyKeyReseedError, type CompanyKeyTarget } from '@/datakey/machineControl';
+import { CompanyKeyReseedError, CompanyKeyReseedUnsettledError, type CompanyKeyTarget } from '@/datakey/machineControl';
 import { logger } from '@/ui/logger';
 
 type PinnedOrganization = { publicKey: string; approval: Pick<OrgSetupTokenDocument, 'body'> };
@@ -72,6 +72,13 @@ export function createCompanyKeyReseedHandler(deps: CompanyKeyReseedDeps) {
         try {
             outcome = await deps.reseed({ publicKey: new Uint8Array(Buffer.from(body.dataPublicKey, 'base64url')), generation: body.generation });
         } catch (error) {
+            if (error instanceof CompanyKeyReseedUnsettledError) {
+                // Clients may already unwrap the new machine key: stay closed and restart, so the
+                // next start's resume finishes the pending reseed one way or the other.
+                logger.debug('[COMPANY KEY RESEED] Unsettled, restarting to finish it', error);
+                deps.onChanged();
+                return refusal('RESEED_FAILED', error.message);
+            }
             busy = false;
             deps.launches.reopen();
             logger.debug('[COMPANY KEY RESEED] Not moved to the declared company key', error);

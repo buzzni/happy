@@ -144,6 +144,14 @@ export class CompanyKeyReseedError extends Error {
   }
 }
 
+/** The server may already hold the new envelope; only the next start's resume settles which key holds. */
+export class CompanyKeyReseedUnsettledError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options)
+    this.name = 'CompanyKeyReseedUnsettledError'
+  }
+}
+
 /** Attempts at the swap when the record keeps moving underneath it. */
 const ROTATION_ATTEMPTS = 3
 
@@ -364,10 +372,18 @@ export async function reseedCompanyKey(input: {
       await io.deletePending()
       throw error
     }
-    if (after === undefined) throw error
+    if (after === undefined) {
+      throw new CompanyKeyReseedUnsettledError(`Could not tell whether the server took the new machine key: ${errorMessage(error)}`, { cause: error })
+    }
   }
-  return { credentials: await commitReseed(io, credentials, pending), changed: true, machineKey }
+  try {
+    return { credentials: await commitReseed(io, credentials, pending), changed: true, machineKey }
+  } catch (error) {
+    throw new CompanyKeyReseedUnsettledError(`The server took the new machine key but this machine did not: ${errorMessage(error)}`, { cause: error })
+  }
 }
+
+const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error)
 
 /** Swaps only the envelope the reseed started from; a third value means someone else moved it. */
 async function swapReseed(

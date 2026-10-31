@@ -10,6 +10,7 @@ import type { MachineMetadata } from '@/api/types';
 import type { Credentials } from '@/persistence';
 import {
     CompanyKeyReseedError,
+    CompanyKeyReseedUnsettledError,
     StrictMachineControlError,
     reseedCompanyKey,
     settleMachineControl,
@@ -130,6 +131,26 @@ describe('reseedCompanyKey', () => {
         expect(h.state.serverEnvelope).toBe('old-envelope');
         expect(h.state.written).toBeNull();
         expect(h.state.pending).toBeNull();
+    });
+
+    it('reports an unsettled reseed and keeps its record when the server may have taken the new envelope', async () => {
+        const h = harness();
+        h.io.rotate = async (_machineId, request) => {
+            h.state.serverEnvelope = request.dataEncryptionKey;
+            h.io.fetchMachine = async () => { throw new Error('offline') };
+            throw new Error('socket hang up');
+        };
+        await expect(reseed(h)).rejects.toBeInstanceOf(CompanyKeyReseedUnsettledError);
+        expect(h.state.written).toBeNull();
+        expect(h.state.pending).toMatchObject({ version: 2 });
+    });
+
+    it('reports an unsettled reseed when the local commit fails after the server swap', async () => {
+        const h = harness();
+        h.io.writeCredentials = async () => { throw new Error('disk full') };
+        await expect(reseed(h)).rejects.toBeInstanceOf(CompanyKeyReseedUnsettledError);
+        expect(h.state.serverEnvelope).not.toBe('old-envelope');
+        expect(h.state.pending).toMatchObject({ version: 2 });
     });
 
     it('does not swap over an envelope it did not start from', async () => {
