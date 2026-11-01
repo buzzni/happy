@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager';
 import { configuration } from '@/configuration';
 import { registerCommonHandlers, type CommonHandlerOptions } from './registerCommonHandlers';
@@ -10,6 +10,14 @@ import { createManagedProjectWriteScopePolicy, createTrustedMachineRunProfileRes
 import { managedMachineToolPlatform } from './managedMachineTool';
 
 type Handler = (data: Record<string, unknown>) => Promise<Record<string, unknown>>;
+
+// Counts the handlers' stat calls, so a test can tell a walk that stopped from one that
+// only stopped counting.
+const statCalls = vi.hoisted(() => ({ count: 0 }));
+vi.mock('fs/promises', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('fs/promises')>();
+    return { ...actual, stat: (...args: Parameters<typeof actual.stat>) => { statCalls.count++; return actual.stat(...args); } };
+});
 
 const temporaryDirectories: string[] = [];
 
@@ -319,6 +327,53 @@ describe('registerCommonHandlers writeFile attempts', () => {
             path, content: b64('x'), expectedHash: null, attemptId: 'bad id/with spaces',
         })).resolves.toMatchObject({ success: false, errorCode: 'INVALID_ATTEMPT_ID' });
         await expect(readdir(workingDirectory)).resolves.toEqual([]);
+    });
+});
+
+/*
+ * A 151 MB tree of a repository root went over happy-server's 100 MB message
+ * limit, so the server closed the machine socket on every answer and the caller
+ * asked again after each reconnect (2026-10-31). A partial tree would hide files
+ * without saying so; an over-limit tree is refused instead.
+ */
+describe('registerCommonHandlers getDirectoryTree entry limit', () => {
+    async function createTree(entries: number) {
+        const { handlers, workingDirectory } = await createHandlers(undefined, { directoryTreeMaxEntries: 4 });
+        await mkdir(join(workingDirectory, 'src'));
+        for (let i = 0; i < entries - 2; i++) await writeFile(join(workingDirectory, 'src', `f${i}.ts`), '');
+        return { handler: handlers.get('getDirectoryTree'), workingDirectory };
+    }
+
+    it('returns the tree when it holds exactly the limit', async () => {
+        const { handler, workingDirectory } = await createTree(4);
+
+        const result = await handler?.({ path: workingDirectory, maxDepth: 8 }) as any;
+
+        expect(result.success).toBe(true);
+        expect(result.tree.children).toEqual([expect.objectContaining({ name: 'src' })]);
+        expect(result.tree.children[0].children).toHaveLength(2);
+    });
+
+    it('refuses a tree over the limit instead of returning part of it', async () => {
+        const { handler, workingDirectory } = await createTree(5);
+
+        const result = await handler?.({ path: workingDirectory, maxDepth: 8 });
+
+        expect(result).toEqual({
+            success: false,
+            errorCode: 'DIRECTORY_TREE_TOO_LARGE',
+            error: 'Directory tree has more than 4 entries; open a subdirectory or lower maxDepth',
+        });
+    });
+
+    it('stops reading the disk once the limit is passed', async () => {
+        const { handler, workingDirectory } = await createTree(50);
+        statCalls.count = 0;
+
+        await expect(handler?.({ path: workingDirectory, maxDepth: 8 })).resolves.toMatchObject({ success: false });
+
+        // One stat per node it kept, not one per entry on disk.
+        expect(statCalls.count).toBeLessThanOrEqual(4);
     });
 });
 
