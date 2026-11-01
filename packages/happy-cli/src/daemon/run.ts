@@ -5422,6 +5422,8 @@ export async function startDaemon(): Promise<void> {
     // A token's account never changes, so only a confirmed answer is remembered; registration is re-read every time.
     const accountByToken = new Map<string, string>();
     callerLaunches = createAgentCallerLaunches({ enabled: process.env[OWNER_CONTACT_SWITCH] === '1',
+      // Configured ownership trust opens bindings for the broker's same-account check alone (identity-adapter-plan D2).
+      identityOnly: readOwnerContactTrust(process.env, configuration.serverUrl) !== null,
       identity: async () => {
         try {
           const state = await ownedRegistration(), token = state.credentials.token;

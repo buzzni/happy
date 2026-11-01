@@ -45,6 +45,12 @@ import type { ClaudeOutputFormat } from '@/claude/structuredOutput';
 
 const execAsync = promisify(exec);
 const READ_FILE_CHUNK_MAX_BYTES = 3 * 1024 * 1024;
+/**
+ * A tree answer travels as one socket message, and happy-server closes the socket on
+ * a message over its 100 MB maxHttpBufferSize. A node costs a few hundred bytes once
+ * sealed and base64-encoded, so this keeps the answer well under that limit.
+ */
+const DIRECTORY_TREE_MAX_ENTRIES = 100_000;
 // A file entry is a few hundred bytes once sealed and base64-encoded, so even the
 // largest page stays far below happy-server's 100 MB socket message limit.
 const LIST_FILES_PAGE_DEFAULT_LIMIT = 5_000;
@@ -251,6 +257,7 @@ interface GetDirectoryTreeResponse {
     success: boolean;
     tree?: TreeNode;
     error?: string;
+    errorCode?: 'DIRECTORY_TREE_TOO_LARGE';
 }
 
 interface RipgrepRequest {
@@ -564,6 +571,8 @@ export interface CommonHandlerOptions {
         /** Only the machine scope downloads and installs managed tools. */
         allowToolInstall?: boolean;
     };
+    /** Tests lower it; production uses DIRECTORY_TREE_MAX_ENTRIES. */
+    directoryTreeMaxEntries?: number;
 }
 
 export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, workingDirectory: string, options: CommonHandlerOptions = {}) {
@@ -1153,6 +1162,11 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             return { success: false, error: validation.error };
         }
 
+        // Counted per node and checked as a flag: buildTree's own catch would
+        // swallow a throw and hand back a tree with holes in it.
+        const maxEntries = options.directoryTreeMaxEntries ?? DIRECTORY_TREE_MAX_ENTRIES;
+        let entryCount = 0;
+
         // Helper function to build tree recursively. parentIgnore carries
         // the preset baseline plus any .gitignore layers accumulated from
         // ancestor directories; relPath is the path relative to the walk
@@ -1164,6 +1178,8 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             parentIgnore: GitignoreContext,
             relPath: string,
         ): Promise<TreeNode | null> {
+            // Over the limit the answer is refused anyway; stop walking.
+            if (++entryCount > maxEntries) return null;
             try {
                 const stats = await stat(path);
 
@@ -1244,6 +1260,13 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             const baseName = rootPath === '/' ? '/' : rootPath.split('/').pop() || rootPath;
             const tree = await buildTree(rootPath, baseName, 0, baseDirectoryIgnoreContext, '');
 
+            if (entryCount > maxEntries) {
+                return {
+                    success: false,
+                    errorCode: 'DIRECTORY_TREE_TOO_LARGE',
+                    error: `Directory tree has more than ${maxEntries} entries; open a subdirectory or lower maxDepth`,
+                };
+            }
             if (!tree) {
                 return { success: false, error: 'Failed to access the specified path' };
             }

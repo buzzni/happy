@@ -262,3 +262,48 @@ describe('owner-contact trust configuration', () => {
         expect(readOwnerContactTrust({ ...env, ...override }, 'https://happy.example')).toBeNull();
     });
 });
+describe('identity-only caller bindings (Desktop identity-adapter-plan D2)', () => {
+    const build = (identityOnly: boolean) => {
+        let session: TrackedSession | undefined = { startedBy: 'daemon', pid: 42, directory: '/project', happySessionId: 'source' } as TrackedSession;
+        const launches = createAgentCallerLaunches({ enabled: false, identityOnly,
+            identity: async () => ({ machineId: 'machine', happyAccountId: 'account', epoch: 'e1' }), trust: () => trust,
+            trackedByPid: pid => pid === session?.pid ? session : undefined, live: () => true, realpath: path => path });
+        return { launches, end: () => { session = undefined; } };
+    };
+    it('issues a binding for the broker identity check while owner contact stays off', async () => {
+        const { launches, end } = build(true);
+        const host = await spawnHost(launches, 42);
+        const report = { sessionId: 'source', runtimeId: 'actual-runtime', hostPid: 42, callerPublicKey: key(), capability: host.capability! };
+        const issued = await launches.issue(report);
+        expect(issued.caller).toMatchObject({ sessionId: 'source', machineId: 'machine', happyAccountId: 'account', depth: 0 });
+        expect(issued.trust).toEqual(trust);
+        expect(await launches.current({ sessionId: 'source', callerBindingId: issued.caller.callerBindingId })).toEqual({ current: true });
+        // Owner contact itself stays off: no agent-caller-binding answer, no owned-start caller, not available.
+        await expect(launches.query({ sessionId: 'source', nonce })).rejects.toThrow('caller-unavailable');
+        expect(await launches.currentCaller('source')).toBeNull();
+        expect(launches.available()).toBe(false);
+        end();
+        expect(await launches.current({ sessionId: 'source', callerBindingId: issued.caller.callerBindingId })).toEqual({ current: false });
+    });
+    it('binds a broker host the daemon cannot place in a lineage, because the check reads no depth or scope', async () => {
+        // Every broker host runs with SAYCODE_AGENT_ENV=1, which the daemon cannot vouch a depth for.
+        const { launches } = build(true);
+        const host = await spawnHost(launches, 42, { agentEnvironment: { SAYCODE_AGENT_ENV: '1' } as TrackedSession['agentEnvironment'] });
+        const issued = await launches.issue({ sessionId: 'source', runtimeId: 'actual-runtime', hostPid: 42, callerPublicKey: key(), capability: host.capability! });
+        expect(issued.caller).toMatchObject({ machineId: 'machine', happyAccountId: 'account' });
+        await expect(launches.query({ sessionId: 'source', nonce })).rejects.toThrow('caller-unavailable');
+    });
+    it('keeps refusing an unplaceable lineage once owner contact itself is on', async () => {
+        const launches = createAgentCallerLaunches({ enabled: true, identityOnly: true,
+            identity: async () => ({ machineId: 'machine', happyAccountId: 'account', epoch: 'e1' }), trust: () => trust,
+            trackedByPid: pid => pid === 42 ? { startedBy: 'daemon', pid: 42, directory: '/project', happySessionId: 'source' } as TrackedSession : undefined,
+            live: () => true, realpath: path => path });
+        const host = await spawnHost(launches, 42, { agentEnvironment: { SAYCODE_AGENT_ENV: '1' } as TrackedSession['agentEnvironment'] });
+        await expect(launches.issue({ sessionId: 'source', runtimeId: 'actual-runtime', hostPid: 42, callerPublicKey: key(), capability: host.capability! }))
+            .rejects.toThrow('caller-lineage-unknown');
+    });
+    it('opens no launch pipe when neither switch is on', async () => {
+        const { launches } = build(false);
+        expect(launches.prepareLaunch({ cwd: '/project' })).toBeNull();
+    });
+});

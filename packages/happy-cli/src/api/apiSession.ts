@@ -54,6 +54,13 @@ import type { ObservedAiAuthSource } from '@/claude/aiAuthObservation';
 import { createTurnSequence, registerCleanBackgroundProcessesHandler, sessionBackgroundProcesses } from '@/utils/sessionBackgroundProcesses';
 
 const DAEMON_RUNTIME_REPORT_MAX_INTERVAL_MS = 30_000;
+/**
+ * Runtime reports sent to the daemon and not yet answered. Past it a report only marks
+ * that one is owed, and the latest state goes out when a slot frees: a burst of state
+ * changes (a fork replaying its whole transcript) used to fire one request per change
+ * and time the daemon's control server out, /session-started included.
+ */
+const DAEMON_RUNTIME_REPORTS_IN_FLIGHT_MAX = 4;
 /** Repairs a Desktop that restarted or reconnected while the meter was showing (Saycode specs/desktop-chat-context-window-meter R12). */
 const CONTEXT_USAGE_RESEND_INTERVAL_MS = 30_000;
 /** Ticks a take-down (reset, local mode) is repeated for: a lost one would leave old numbers on screen. */
@@ -604,6 +611,8 @@ export class ApiSessionClient extends EventEmitter {
         reportedAt: number;
     } | null = null;
     private daemonRuntimeReportSeq = 0;
+    private daemonRuntimeReportsInFlight = 0;
+    private daemonRuntimeReportOwed = false;
     private currentMode: 'local' | 'remote' = 'remote';
     private lastUserInteractionAt: number | undefined;
     private lastTurnEndAt: number | undefined;
@@ -2215,11 +2224,29 @@ export class ApiSessionClient extends EventEmitter {
             pendingUserInput,
             reportedAt: now
         };
+        this.sendDaemonRuntimeReport();
+    }
+
+    /** Sends the state lastDaemonRuntimeReport holds, or owes it while the in-flight slots are full. */
+    private sendDaemonRuntimeReport(): void {
+        const report = this.lastDaemonRuntimeReport;
+        if (!report) return;
+        if (this.daemonRuntimeReportsInFlight >= DAEMON_RUNTIME_REPORTS_IN_FLIGHT_MAX) {
+            this.daemonRuntimeReportOwed = true;
+            return;
+        }
+        this.daemonRuntimeReportsInFlight += 1;
+        const settled = () => {
+            this.daemonRuntimeReportsInFlight -= 1;
+            if (!this.daemonRuntimeReportOwed) return;
+            this.daemonRuntimeReportOwed = false;
+            this.sendDaemonRuntimeReport();
+        };
         void notifyDaemonSessionRuntime(this.sessionId, {
             reportSeq: ++this.daemonRuntimeReportSeq,
-            thinking: daemonThinking,
-            hasOpenToolCall,
-            pendingUserInput,
+            thinking: report.thinking,
+            hasOpenToolCall: report.hasOpenToolCall,
+            pendingUserInput: report.pendingUserInput,
             ...(this.lastUserInteractionAt !== undefined ? { lastUserInteractionAt: this.lastUserInteractionAt } : {}),
             ...(this.lastTurnEndAt !== undefined ? { lastTurnEndAt: this.lastTurnEndAt } : {}),
             ...(this.assistantTurns > 0 ? { assistantTurns: this.assistantTurns } : {}),
@@ -2230,7 +2257,7 @@ export class ApiSessionClient extends EventEmitter {
             // swallows messages that arrive while the session has no process.
             lastProcessedSeq: Math.min(this.runtimeProcessedSeqCap ?? this.lastSeq, this.shutdownReceiveSeq ?? Infinity),
             mode: this.currentMode,
-        });
+        }).then(settled, settled);
     }
 
     /**

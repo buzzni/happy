@@ -7,6 +7,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { createHmac, randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -688,6 +690,27 @@ describe('worktree:publish', () => {
     it('refuses without a remote', async () => {
         const path = await worktree();
         expect(await call('publish', publish(path))).toMatchObject({ success: false, errorCode: 'WORKTREE_PUBLISH_NO_REMOTE' });
+    });
+
+    // workspace-sync-strict-design.md §4-1: a redirect could take the push (and its credential) to
+    // another host than the repository checked above, so git does not follow one.
+    it('does not follow a redirect from the remote', async () => {
+        const requests: string[] = [];
+        const server = createServer((request, response) => {
+            requests.push(request.url ?? '');
+            response.writeHead(301, { Location: `http://127.0.0.1:${(server.address() as AddressInfo).port}/elsewhere${request.url}` });
+            response.end();
+        });
+        await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+        try {
+            const path = await worktree();
+            git(repo, 'remote', 'add', 'origin', `http://127.0.0.1:${(server.address() as AddressInfo).port}/acme/app.git`);
+            expect(await call('publish', publish(path))).toMatchObject({ success: false, errorCode: 'WORKTREE_FETCH_FAILED' });
+            expect(requests.length).toBeGreaterThan(0);
+            expect(requests.filter((url) => url.startsWith('/elsewhere'))).toEqual([]);
+        } finally {
+            await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+        }
     });
 
     // aplus-dev-studio strict-followup-plan F0-b (daemon 4): the address comes from the server, so it

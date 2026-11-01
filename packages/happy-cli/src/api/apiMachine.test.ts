@@ -2,7 +2,10 @@ import nacl from 'tweetnacl';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKTREE_OPS_CAPABILITY } from '@slopus/happy-wire';
 import { configuration } from '@/configuration';
-import { ApiMachineClient } from './apiMachine';
+import {
+    ApiMachineClient,
+    PREVIEW_BOUND_PROXY_EVENT,
+} from './apiMachine';
 import { addDaemonTerminalSession, getDaemonTerminalSession, markDaemonTerminalSessionExited, removeDaemonTerminalSession } from '@/daemon/daemonTerminalSessions';
 import { deriveServerRpcKey, decodeBase64, decrypt, encodeBase64, encrypt } from './encryption';
 import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_MAX_DELAY_MS, RECONNECT_NOT_READY_POLL_MS } from './reconnectCadence';
@@ -332,6 +335,61 @@ describe('ApiMachineClient socket reconnection', () => {
             expect(socketHandlers[event], event).toHaveLength(1);
         }
         expect(socketHandlers['proxy-ws-open']).toBeUndefined();
+    });
+
+    /*
+     * An acked event can arrive without its ack (seen in the burst delivered right
+     * after a reconnect). Calling the missing ack inside an async listener
+     * is an unhandled rejection, which shuts the whole daemon down (2026-11-01:
+     * a buffered terminal-open-fwd took the machine offline for 26 minutes).
+     */
+    describeUnix('acked events that arrive without an ack', () => {
+        const sessionId = 'term-no-ack-1';
+
+        afterEach(() => {
+            const entry = getDaemonTerminalSession(sessionId);
+            if (entry) void entry.session.terminate();
+            removeDaemonTerminalSession(sessionId);
+        });
+
+        it('settles terminal-open-fwd without opening a shell', async () => {
+            const machine = makeMachine();
+            const client = new ApiMachineClient('fake-token', machine);
+            client.connect();
+            const params = encodeBase64(encrypt(machine.encryptionKey, machine.encryptionVariant, { userId: 'u1', shell: '/bin/sh' }));
+
+            await expect(socketHandlers['terminal-open-fwd']![0]!({ sessionId, params })).resolves.toBeUndefined();
+
+            expect(getDaemonTerminalSession(sessionId)).toBeNull();
+        });
+
+        // Every listener that takes an ack, not a copied list: one added later without the
+        // guard is caught here (the first version of this fix missed three).
+        it('settles every acked listener it registers', async () => {
+            const client = new ApiMachineClient('fake-token', makeMachine());
+            client.connect();
+            const acked = Object.entries(socketHandlers)
+                .flatMap(([event, handlers]) => handlers.filter((handler) => handler.length >= 2).map((handler) => [event, handler] as const));
+
+            expect(acked.map(([event]) => event)).toEqual(expect.arrayContaining([
+                'proxy-http-request', PREVIEW_BOUND_PROXY_EVENT, 'preview-runtime-lease', 'proxy-ws-open', 'terminal-open-fwd',
+            ]));
+            for (const [event, handler] of acked) {
+                await expect(Promise.resolve(handler({ port: 3000 })), event).resolves.toBeUndefined();
+            }
+        });
+
+        it('logs a listener that fails instead of rejecting', async () => {
+            vi.spyOn(ApiMachineClient.prototype as any, 'relayPreviewHttp').mockRejectedValue(new Error('relay broke'));
+            const client = new ApiMachineClient('fake-token', makeMachine());
+            client.connect();
+            const ack = vi.fn();
+
+            await expect(socketHandlers['proxy-http-request']![0]!({ port: 3000 }, ack)).resolves.toBeUndefined();
+
+            expect(ack).not.toHaveBeenCalled();
+            expect(vi.mocked(logger.debug)).toHaveBeenCalledWith('[API MACHINE] proxy-http-request listener failed: relay broke');
+        });
     });
 
     /*

@@ -605,6 +605,9 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 await session.sendClaudeSessionMessageFromLocalTranscript(result.data as RawJSONLines);
                 backfilled += 1;
             }
+            // Only a later user line closes the mapper's turn, so a transcript that ends on the
+            // assistant's answer would leave the fork showing "responding" with nothing running.
+            session.closeClaudeSessionTurn('completed');
             logger.debug(`[FORK BACKFILL] Replayed ${backfilled} historical messages from ${jsonlPath}`);
             // Bind the new Happy session to the forked Claude UUID up
             // front so the metadata is consistent the moment the app
