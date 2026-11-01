@@ -173,7 +173,8 @@ import { DifficultyRoutingCommitter } from '@/difficultyRoutingCommit';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { createCodexUsageEvent } from '@/usage/providerUsageAdapters';
 import { AgentPlanLaunchError } from '@/launcher/agentPlanLaunch';
-import { consumeAgentPlanLaunch, reportAgentPlanApplied, startAgentPlanSession, type AgentPlanSession } from './agentPlanSession';
+import { assertNotAgentPlanThreadWithoutPlan, consumeAgentPlanLaunch, reportAgentPlanApplied, startAgentPlanSession, type AgentPlanSession } from './agentPlanSession';
+import { agentPlanThreadsDir, recordAgentPlanThread } from '@/launcher/agentPlanThreads';
 import {
     consumePendingInitialAppendSystemPrompt,
     consumePendingInitialEffort,
@@ -285,6 +286,11 @@ export async function runCodex(opts: {
     const automationRunOnceRequested = consumeAutomationRunOnce(process.env);
     const reconnectSession = consumeReconnectSessionEnvironment(process.env);
     const reconnectSessionId = reconnectSession?.id;
+    assertNotAgentPlanThreadWithoutPlan({
+        launch: agentPlanLaunch,
+        threadsDir: agentPlanThreadsDir(configuration.happyHomeDir),
+        threadIds: [opts.resumeThreadId, reconnectSession?.metadata?.codexThreadId, process.env.HAPPY_FORK_CODEX_THREAD_ID],
+    });
     const allowAutomationReconnectPrompt = process.env.HAPPY_AUTOMATION_RESUME_PROMPT === '1';
     delete process.env.HAPPY_AUTOMATION_RESUME_PROMPT;
     const preparedInitialPrompt = prepareCodexInitialPrompt({
@@ -2620,6 +2626,15 @@ export async function runCodex(opts: {
                         }));
                     }
 
+                    // §6.3-4: every thread a plan turn runs on is marked, however it was started, resumed or forked.
+                    // A failed write does not stop the turn (the Studio refuses an envelope-less continuation too),
+                    // but it is recorded: without the marker a local resume of this thread is not caught here.
+                    if (agentPlanSession && agentPlanLaunch?.threadsDir) {
+                        await recordAgentPlanThread(agentPlanLaunch.threadsDir, activeThreadId, {
+                            sessionId: session.sessionId,
+                            grantId: agentPlanLaunch.descriptor.grantId,
+                        }).catch((error) => logger.warn('[codex] Agent plan thread marker not written', error));
+                    }
                     const runtimeRecovery = await measure('mcp-recovery', () => mcpRuntimeRecovery.recoverBeforeTurn({
                         threadId: activeThreadId,
                         mcpServers: mcpSync.mcpServers,

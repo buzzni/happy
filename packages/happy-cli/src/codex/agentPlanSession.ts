@@ -23,6 +23,7 @@ import {
     type AgentPlanDescriptor,
 } from '@/launcher/agentPlanLaunch'
 import { HAPPY_AI_AUTH_CONNECTION_VERSION_ENV, HAPPY_AI_AUTH_SOURCE_ENV } from '@/usage/aiAuthSource'
+import { AGENT_PLAN_THREADS_DIR_ENV, isAgentPlanThread } from '@/launcher/agentPlanThreads'
 import { startAgentPlanProxy } from './agentPlanProxy'
 
 const SECRET = /^[A-Za-z0-9_-]{16,200}$/
@@ -31,7 +32,7 @@ const KEY_EXCHANGE_TIMEOUT_MS = 15_000
 const REFRESH_MARGIN_MS = 5 * 60_000
 const DEFAULT_RETRY_DELAYS_MS = [500, 1_500] as const
 
-export type AgentPlanLaunch = { descriptor: AgentPlanDescriptor; secret: string }
+export type AgentPlanLaunch = { descriptor: AgentPlanDescriptor; secret: string; threadsDir: string | null }
 
 export type AgentPlanSessionKey = { key: string; expiresAt: number }
 
@@ -50,13 +51,15 @@ export class AgentPlanKeyExchangeError extends Error {
 export function consumeAgentPlanLaunch(env: NodeJS.ProcessEnv): AgentPlanLaunch | null {
     const rawDescriptor = env[AGENT_PLAN_DESCRIPTOR_ENV]
     const secret = env[AGENT_PLAN_SECRET_ENV]
+    const threadsDir = env[AGENT_PLAN_THREADS_DIR_ENV]?.trim() || null
     delete env[AGENT_PLAN_DESCRIPTOR_ENV]
     delete env[AGENT_PLAN_SECRET_ENV]
+    delete env[AGENT_PLAN_THREADS_DIR_ENV]
     if (rawDescriptor === undefined && secret === undefined) return null
     if (rawDescriptor === undefined || secret === undefined || !SECRET.test(secret)) {
         throw new AgentPlanLaunchError('agent_plan_descriptor_invalid', 'incomplete plan launch')
     }
-    return { descriptor: readAgentPlanDescriptor(rawDescriptor, readTrustedStudioOrigin(env)), secret }
+    return { descriptor: readAgentPlanDescriptor(rawDescriptor, readTrustedStudioOrigin(env)), secret, threadsDir }
 }
 
 /** One `POST /api/agent-plan/session-keys`. */
@@ -211,3 +214,22 @@ export function reportAgentPlanApplied(env: NodeJS.ProcessEnv, applied: boolean)
     // Written empty, like the daemon does: no connection version belongs to the plan.
     env[HAPPY_AI_AUTH_CONNECTION_VERSION_ENV] = ''
 }
+
+/**
+ * spec §6.3-4, the runner's half: a launch without the plan must not resume a thread a plan session ran
+ * (`happy codex --resume`, a reconnect whose daemon lost the record). Checked against this runner's own home,
+ * where a terminal launch and its daemon keep markers; daemon spawns are checked by the daemon as well.
+ */
+export function assertNotAgentPlanThreadWithoutPlan(input: {
+    launch: AgentPlanLaunch | null
+    threadsDir: string
+    threadIds: Array<string | null | undefined>
+}): void {
+    if (input.launch) return
+    for (const threadId of input.threadIds) {
+        if (threadId && isAgentPlanThread(input.threadsDir, threadId)) {
+            throw new AgentPlanLaunchError('agent_plan_resume_requires_grant', `thread ${threadId} belongs to an agent plan session`)
+        }
+    }
+}
+

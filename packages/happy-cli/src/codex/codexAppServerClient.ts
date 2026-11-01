@@ -67,6 +67,7 @@ import type { CheckpointSessionComposition, CheckpointTurnPreparation } from '@/
 import { CheckpointWriterProcessTree } from '@/checkpoint/checkpointWriterProcessTree';
 import { CODEX_INACTIVITY_ABORT_REASON, type CodexInactivityAbortFields } from './codexAbortNotice';
 import { prepareCodexMultiAuthProxy, type PreparedCodexMultiAuthProxy } from './codexMultiAuthProxy';
+import { AGENT_PLAN_PROVIDER_ID } from '@/launcher/agentPlanLaunch';
 import { initializeSandbox, wrapForMcpTransport } from '@/sandbox/manager';
 import { MandatorySandboxError, resolveSandboxInitFailureAction, type SandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import { describeSandboxCapabilityFailure, verifySandboxExecutionCapability } from '@/sandbox/executionCapability';
@@ -493,6 +494,14 @@ export class CodexAppServerClient {
 
     get threadId(): string | null {
         return this._threadId;
+    }
+
+    /**
+     * The provider a thread start/resume/fork names. `null` lets Codex take the launch's configured provider;
+     * a plan session names the plan provider explicitly so a resumed plan thread cannot pick another one.
+     */
+    private get threadModelProvider(): string | null {
+        return this.agentPlanProviderArgs ? AGENT_PLAN_PROVIDER_ID : null;
     }
 
     /** True once a Codex process was started with the organization agent plan provider. */
@@ -1803,7 +1812,7 @@ export class CodexAppServerClient {
     }): Promise<{ threadId: string; model: string }> {
         const params: NewConversationParams = {
             model: opts.model ?? null,
-            modelProvider: null,
+            modelProvider: this.threadModelProvider,
             profile: null,
             cwd: opts.cwd ?? process.cwd(),
             approvalPolicy: opts.approvalPolicy ?? null,
@@ -1854,7 +1863,7 @@ export class CodexAppServerClient {
         const params: ResumeConversationParams = {
             threadId,
             model: opts?.model ?? defaults.model ?? null,
-            modelProvider: null,
+            modelProvider: this.threadModelProvider,
             cwd: opts?.cwd ?? defaults.cwd ?? process.cwd(),
             approvalPolicy: opts?.approvalPolicy ?? defaults.approvalPolicy ?? null,
             sandbox: opts?.sandbox ?? defaults.sandbox ?? null,
@@ -1906,7 +1915,7 @@ export class CodexAppServerClient {
             threadId: opts.threadId,
             ...(opts.path ? { path: opts.path } : {}),
             model: opts.model ?? defaults.model ?? null,
-            modelProvider: null,
+            modelProvider: this.threadModelProvider,
             cwd: opts.cwd ?? defaults.cwd ?? process.cwd(),
             approvalPolicy: opts.approvalPolicy ?? defaults.approvalPolicy ?? null,
             sandbox: opts.sandbox ?? defaults.sandbox ?? null,

@@ -31,6 +31,10 @@ function createMockProcess() {
                 if (message.method === 'initialize' && message.id != null) {
                     setTimeout(() => stdout.push(JSON.stringify({ id: message.id, result: { userAgent: 'test' } }) + '\n'), 1)
                 }
+                if (message.method) requests.push(message)
+                if ((message.method === 'thread/resume' || message.method === 'thread/start') && message.id != null) {
+                    setTimeout(() => stdout.push(JSON.stringify({ id: message.id, result: { thread: { id: 'plan-thread' }, model: 'gpt-6-luna' } }) + '\n'), 1)
+                }
             } catch { /* not JSON */ }
             callback()
         },
@@ -44,6 +48,8 @@ function createMockProcess() {
     })
     return proc
 }
+
+const requests: Array<{ method: string; params?: any }> = []
 
 const PLAN_ARGS = agentPlanCodexArgs(
     buildAgentPlanDescriptor({ origin: 'https://saycode.ai', grantId: '3f1c2a4e-1b2c-4d5e-8f90-123456789abc', model: 'gpt-6-luna' })!,
@@ -60,6 +66,7 @@ describe('CodexAppServerClient with the organization agent plan', () => {
 
     beforeEach(() => {
         vi.clearAllMocks()
+        requests.length = 0
         mockExecSync.mockReturnValue('codex-cli 0.162.1')
         mockPrepareCodexMultiAuthProxy.mockResolvedValue({
             args: ['-c', 'model_provider="codex-multi-auth-runtime-proxy"'],
@@ -127,4 +134,23 @@ describe('CodexAppServerClient with the organization agent plan', () => {
         expect(mockPrepareCodexMultiAuthProxy).toHaveBeenCalled()
         await client.disconnect()
     })
+
+    it('names the plan provider when it resumes a thread, instead of leaving the provider to config', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient')
+        const client = new CodexAppServerClient(undefined, undefined, undefined, undefined, null, undefined, false, undefined, PLAN_ARGS)
+        await client.connect()
+        await client.resumeThread({ threadId: 'plan-thread' })
+        expect(requests.find((request) => request.method === 'thread/resume')?.params?.modelProvider).toBe('saycode-plan')
+        await client.disconnect()
+    })
+
+    it('an ordinary resume still leaves the provider to config', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient')
+        const client = new CodexAppServerClient()
+        await client.connect()
+        await client.resumeThread({ threadId: 'plan-thread' })
+        expect(requests.find((request) => request.method === 'thread/resume')?.params?.modelProvider).toBeNull()
+        await client.disconnect()
+    })
 })
+

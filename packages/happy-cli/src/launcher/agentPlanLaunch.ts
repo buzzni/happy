@@ -59,6 +59,7 @@ export type AgentPlanErrorCode =
     | 'agent_plan_proxy_failed'
     | 'agent_plan_managed_conflict'
     | 'agent_plan_not_applied'
+    | 'agent_plan_resume_requires_grant'
 
 /** A plan launch that cannot go ahead. The runner exits with it; the session never runs on another credential. */
 export class AgentPlanLaunchError extends Error {

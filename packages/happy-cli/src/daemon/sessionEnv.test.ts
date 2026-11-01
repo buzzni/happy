@@ -909,3 +909,44 @@ it('does not accept personal descriptors or ownership through request environmen
         SAYCODE_AGENT_OWNER: 'someone', SAYCODE_AGENT_IDENTITY_DESCRIPTOR: 'forged',
     })).toEqual({ SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/repo' })
 })
+
+describe('organization agent plan resume record (aplus specs/org-agent-plan §6.3-4)', () => {
+    const seeds = {
+        HAPPY_INITIAL_AGENT_PLAN_DESCRIPTOR: '{"version":1,"origin":"https://saycode.ai","grantId":"g-1","model":"gpt-6-luna","contextWindow":128000,"autoCompactTokenLimit":100000}',
+        HAPPY_INITIAL_AGENT_PLAN_SECRET: 'c2VjcmV0LXZhbHVlLWZvci10aGUtZ3JhbnQtMzItYnl0ZXM',
+        HAPPY_INITIAL_AGENT_PLAN_THREADS_DIR: '/daemon-home/agent-plan-threads',
+    }
+
+    it('keeps a plan session\'s seeds with the session, and survives the persisted round trip', () => {
+        const captured = captureSaycodeAgentEnvironment({ PATH: '/usr/bin', ...seeds })
+        expect(captured).toEqual(seeds)
+        // hydrateTrackedSessionFromPersisted re-captures what sessions.json holds.
+        expect(captureSaycodeAgentEnvironment(captured as NodeJS.ProcessEnv)).toEqual(seeds)
+    })
+
+    it('keeps nothing of half a plan launch', () => {
+        expect(captureSaycodeAgentEnvironment({ HAPPY_INITIAL_AGENT_PLAN_DESCRIPTOR: seeds.HAPPY_INITIAL_AGENT_PLAN_DESCRIPTOR })).toBeUndefined()
+    })
+
+    it('re-applies the same seeds to a resumed child, which still never hands them to Codex', () => {
+        const resumed = buildResumedSessionSpawnEnvironment({
+            inherited: { PATH: '/usr/bin' },
+            explicit: { HAPPY_RECONNECT_SESSION_ID: 'happy-1' },
+            agentEnvironment: captureSaycodeAgentEnvironment(seeds),
+            sessionId: 'happy-1',
+        })
+        expect(resumed).toMatchObject(seeds)
+        expect(sanitizeChildEnv(resumed, { boundary: 'in-session' })).not.toHaveProperty('HAPPY_INITIAL_AGENT_PLAN_SECRET')
+    })
+
+    it('cannot be planted through a resume request\'s runtime environment', () => {
+        const resumed = buildResumedSessionSpawnEnvironment({
+            inherited: { PATH: '/usr/bin' },
+            explicit: {},
+            runtime: seeds,
+            sessionId: 'happy-1',
+        })
+        expect(resumed).not.toHaveProperty('HAPPY_INITIAL_AGENT_PLAN_SECRET')
+        expect(resumed).not.toHaveProperty('HAPPY_INITIAL_AGENT_PLAN_DESCRIPTOR')
+    })
+})

@@ -56,4 +56,12 @@ describe('spawn wiring', () => {
         expect(claim).toBeLessThan(tmuxLaunch)
         expect(claim).toBeLessThan(regularLaunch)
     })
+
+    it('refuses an envelope-less continuation of a plan thread, checked against the daemon home', async () => {
+        const text = await runSource()
+        expect(text).toContain("resumeCodexThreadId: options.agent === 'codex' ? options.resumeCodexThreadId : undefined,")
+        expect(text).toContain('isPlanThread: (threadId) => isAgentPlanThread(agentPlanThreadsDir(configuration.happyHomeDir), threadId),')
+        expect(text).toContain('threadsDir: agentPlanThreadsDir(configuration.happyHomeDir),')
+    })
 })
+

@@ -13,9 +13,14 @@ import {
     AgentPlanKeyExchangeError,
     consumeAgentPlanLaunch,
     createAgentPlanKeySource,
+    assertNotAgentPlanThreadWithoutPlan,
     reportAgentPlanApplied,
     startAgentPlanSession,
 } from './agentPlanSession'
+import { recordAgentPlanThread } from '@/launcher/agentPlanThreads'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { createCodexUsageEvent } from '@/usage/providerUsageAdapters'
 import { startAgentPlanProxy } from './agentPlanProxy'
 
@@ -87,7 +92,7 @@ describe('consumeAgentPlanLaunch', () => {
     it('reads the seeds and deletes them from the environment', () => {
         const env = launchEnv('https://saycode.ai')
         const launch = consumeAgentPlanLaunch(env)
-        expect(launch).toMatchObject({ secret: SECRET, descriptor: { grantId: GRANT, model: 'gpt-6-luna' } })
+        expect(launch).toMatchObject({ secret: SECRET, descriptor: { grantId: GRANT, model: 'gpt-6-luna' }, threadsDir: null })
         expect(env).not.toHaveProperty(AGENT_PLAN_DESCRIPTOR_ENV)
         expect(env).not.toHaveProperty(AGENT_PLAN_SECRET_ENV)
     })
@@ -282,6 +287,25 @@ describe('reportAgentPlanApplied (spec §6.3-3)', () => {
         const env: NodeJS.ProcessEnv = { HAPPY_AI_AUTH_SOURCE: 'unknown' }
         expect(() => reportAgentPlanApplied(env, false)).toThrow('agent_plan_not_applied')
         expect(env.HAPPY_AI_AUTH_SOURCE).toBe('unknown')
+    })
+})
+
+describe('assertNotAgentPlanThreadWithoutPlan (spec §6.3-4)', () => {
+    it('refuses to resume a plan thread without the plan, and allows it with one or for other threads', async () => {
+        const home = mkdtempSync(join(tmpdir(), 'agent-plan-resume-'))
+        closers.push(async () => rmSync(home, { recursive: true, force: true }))
+        await recordAgentPlanThread(home, 'plan-thread', { sessionId: 'happy-1', grantId: GRANT })
+        expect(() => assertNotAgentPlanThreadWithoutPlan({ launch: null, threadsDir: home, threadIds: [undefined, 'plan-thread'] }))
+            .toThrow('agent_plan_resume_requires_grant')
+        expect(() => assertNotAgentPlanThreadWithoutPlan({ launch: null, threadsDir: home, threadIds: ['other-thread', null] })).not.toThrow()
+        const launch = consumeAgentPlanLaunch(launchEnv('https://saycode.ai'))
+        expect(() => assertNotAgentPlanThreadWithoutPlan({ launch, threadsDir: home, threadIds: ['plan-thread'] })).not.toThrow()
+    })
+
+    it('reads and deletes the daemon\'s marker directory seed', () => {
+        const env = launchEnv('https://saycode.ai', { HAPPY_INITIAL_AGENT_PLAN_THREADS_DIR: '/daemon-home/agent-plan-threads' })
+        expect(consumeAgentPlanLaunch(env)?.threadsDir).toBe('/daemon-home/agent-plan-threads')
+        expect(env).not.toHaveProperty('HAPPY_INITIAL_AGENT_PLAN_THREADS_DIR')
     })
 })
 

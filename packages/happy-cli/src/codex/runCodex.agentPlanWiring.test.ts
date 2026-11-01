@@ -44,5 +44,17 @@ describe('runCodex plan branch wiring', () => {
         expect(text).toMatch(/await client\.connect\(\);\s*logger\.debug\('\[codex\]: client\.connect done'\);\s*if \(agentPlanSession\) reportAgentPlanApplied\(process\.env, client\.agentPlanApplied\);/)
         expect(text.match(/reportAgentPlanApplied\(/g)).toHaveLength(1)
     })
+
+    it('refuses a plan thread resume without the plan and marks every plan turn\'s thread', async () => {
+        const text = await source()
+        const reconnect = text.indexOf('const reconnectSession = consumeReconnectSessionEnvironment(process.env);')
+        const refusal = text.indexOf('assertNotAgentPlanThreadWithoutPlan({')
+        const createSession = text.indexOf('response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });')
+        expect(reconnect).toBeGreaterThan(0)
+        expect(refusal).toBeGreaterThan(reconnect)
+        expect(refusal).toBeLessThan(createSession)
+        expect(text).toContain('threadIds: [opts.resumeThreadId, reconnectSession?.metadata?.codexThreadId, process.env.HAPPY_FORK_CODEX_THREAD_ID],')
+        expect(text).toMatch(/if \(agentPlanSession && agentPlanLaunch\?\.threadsDir\) \{\s*await recordAgentPlanThread\(agentPlanLaunch\.threadsDir, activeThreadId,/)
+    })
 })
 

@@ -325,6 +325,7 @@ import {
   resolveResumeMcpGrantSource,
 } from './mcpCallerGrantEnvelope';
 import { AgentPlanGrantEnvelopeConsumer, agentPlanCapabilityForPlatform, prepareAgentPlanLaunch } from './agentPlanGrantEnvelope';
+import { agentPlanThreadsDir, isAgentPlanThread } from '@/launcher/agentPlanThreads';
 import { createSetupTokenBindingVerifier, readTrustedStudioOrigin } from './setupTokenBindingProof';
 import { createClaudeSwapSupervisor } from './claudeSwapSupervisor';
 import { createNodeAiCredentialRuntime } from './aiCredentialRuntime';
@@ -2095,6 +2096,9 @@ export async function startDaemon(): Promise<void> {
           aiAuthSelection: options.aiAuthSelection,
           platform: process.platform,
           studioOrigin: readTrustedStudioOrigin(process.env),
+          threadsDir: agentPlanThreadsDir(configuration.happyHomeDir),
+          resumeCodexThreadId: options.agent === 'codex' ? options.resumeCodexThreadId : undefined,
+          isPlanThread: (threadId) => isAgentPlanThread(agentPlanThreadsDir(configuration.happyHomeDir), threadId),
         }, agentPlanGrantConsumer);
         if (!agentPlanLaunch.ok) {
           return { type: 'error', errorMessage: `Agent plan grant rejected (${agentPlanLaunch.reason})` };

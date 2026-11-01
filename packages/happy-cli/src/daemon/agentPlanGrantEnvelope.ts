@@ -19,6 +19,7 @@ import {
     serializeAgentPlanDescriptor,
     type AgentPlanModel,
 } from '@/launcher/agentPlanLaunch'
+import { AGENT_PLAN_THREADS_DIR_ENV } from '@/launcher/agentPlanThreads'
 import { openSealedGrantEnvelope } from './mcpCallerGrantEnvelope'
 
 const MAX_ENVELOPE_CHARS = 16 * 1024
@@ -36,6 +37,7 @@ export type AgentPlanSpawnRefusal =
     | 'agent_plan_envelope_expired'
     | 'agent_plan_envelope_replayed'
     | 'agent_plan_capacity'
+    | 'agent_plan_resume_requires_grant'
 
 export type AgentPlanGrant = { grantId: string; secret: string; model: AgentPlanModel; expiresAt: number }
 
@@ -172,11 +174,22 @@ export function prepareAgentPlanLaunch(
         platform: NodeJS.Platform
         /** The daemon's trusted Studio origin; the runner exchanges the grant only there. */
         studioOrigin: string | null
+        /** Where the runner records plan thread markers (the daemon's own home). */
+        threadsDir: string
+        /** The Codex thread a fork or continuation resumes, if any. */
+        resumeCodexThreadId?: string
+        isPlanThread: (threadId: string) => boolean
     },
     consumer: Pick<AgentPlanGrantEnvelopeConsumer, 'open' | 'claim'>,
 ): { ok: true; environment: Record<string, string>; claim: () => AgentPlanSpawnRefusal | null }
     | { ok: false; reason: AgentPlanSpawnRefusal } {
-    if (!input.agentPlan) return { ok: true, environment: {}, claim: () => null }
+    if (!input.agentPlan) {
+        // §6.3-4: a plan thread continued without a fresh grant would run on this machine's own Codex login.
+        if (input.resumeCodexThreadId && input.isPlanThread(input.resumeCodexThreadId)) {
+            return { ok: false, reason: 'agent_plan_resume_requires_grant' }
+        }
+        return { ok: true, environment: {}, claim: () => null }
+    }
     if (input.agent !== 'codex') return { ok: false, reason: 'agent_plan_agent_unsupported' }
     if (input.aiAuthSelection !== undefined) return { ok: false, reason: 'agent_plan_conflicting_selection' }
     if (!agentPlanCapabilityForPlatform(input.platform) || !input.studioOrigin) return { ok: false, reason: 'agent_plan_unavailable' }
@@ -194,6 +207,7 @@ export function prepareAgentPlanLaunch(
         environment: {
             [AGENT_PLAN_DESCRIPTOR_ENV]: serializeAgentPlanDescriptor(descriptor),
             [AGENT_PLAN_SECRET_ENV]: grant.secret,
+            [AGENT_PLAN_THREADS_DIR_ENV]: input.threadsDir,
         },
         claim: () => consumer.claim(grant),
     }

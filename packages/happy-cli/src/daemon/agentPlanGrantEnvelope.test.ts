@@ -137,7 +137,7 @@ describe('AgentPlanGrantEnvelopeConsumer', () => {
 })
 
 describe('prepareAgentPlanLaunch', () => {
-    const base = { agent: 'codex', platform: 'darwin' as NodeJS.Platform, studioOrigin: ORIGIN }
+    const base = { agent: 'codex', platform: 'darwin' as NodeJS.Platform, studioOrigin: ORIGIN, threadsDir: '/daemon-home/agent-plan-threads', isPlanThread: (_threadId: string) => false }
 
     it('adds nothing when the spawn has no plan', () => {
         const { consumer } = setup()
@@ -150,7 +150,8 @@ describe('prepareAgentPlanLaunch', () => {
         const { keyPair, consumer } = setup()
         const result = prepareAgentPlanLaunch({ ...base, agentPlan: { grantEnvelope: seal(plaintext(), keyPair.publicKey) } }, consumer)
         if (!result.ok) throw new Error(result.reason)
-        expect(Object.keys(result.environment).sort()).toEqual([AGENT_PLAN_DESCRIPTOR_ENV, AGENT_PLAN_SECRET_ENV].sort())
+        expect(Object.keys(result.environment).sort()).toEqual([AGENT_PLAN_DESCRIPTOR_ENV, AGENT_PLAN_SECRET_ENV, 'HAPPY_INITIAL_AGENT_PLAN_THREADS_DIR'].sort())
+        expect(result.environment.HAPPY_INITIAL_AGENT_PLAN_THREADS_DIR).toBe('/daemon-home/agent-plan-threads')
         expect(result.environment[AGENT_PLAN_SECRET_ENV]).toBe(SECRET)
         // The runner's own canonical read accepts it.
         expect(readAgentPlanDescriptor(result.environment[AGENT_PLAN_DESCRIPTOR_ENV]!, ORIGIN)).toMatchObject({
@@ -211,6 +212,23 @@ describe('prepareAgentPlanLaunch', () => {
         if (!first.ok || !second.ok) throw new Error('both prepare')
         expect(first.claim()).toBeNull()
         expect(second.claim()).toBe('agent_plan_envelope_replayed')
+    })
+
+    it('refuses to continue a plan thread without a fresh grant (spec §6.3-4)', () => {
+        const { consumer } = setup()
+        const isPlanThread = (threadId: string) => threadId === 'plan-thread'
+        expect(prepareAgentPlanLaunch({ ...base, isPlanThread, resumeCodexThreadId: 'plan-thread' }, consumer))
+            .toEqual({ ok: false, reason: 'agent_plan_resume_requires_grant' })
+        expect(prepareAgentPlanLaunch({ ...base, isPlanThread, resumeCodexThreadId: 'subscription-thread' }, consumer).ok).toBe(true)
+    })
+
+    it('continues a plan thread with a fresh grant', () => {
+        const { keyPair, consumer } = setup()
+        const result = prepareAgentPlanLaunch({
+            ...base, isPlanThread: () => true, resumeCodexThreadId: 'plan-thread',
+            agentPlan: { grantEnvelope: seal(plaintext(), keyPair.publicKey) },
+        }, consumer)
+        expect(result.ok).toBe(true)
     })
 })
 
