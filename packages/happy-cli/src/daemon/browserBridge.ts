@@ -126,7 +126,8 @@ export class BrowserBridge {
     private readonly lastAuthFailureByScope = new Map<string, number>()
     private readonly lastViewerActivityByScope = new Map<string, number>()
     private setupPolicy: BrowserSetupPolicy
-    private heldPort: number | null = null
+    /** Set through setListenerUnavailable; read by local setup, which is refused while another process holds the port. */
+    heldPort: number | null = null
 
     constructor(opts: { authToken: string; requestTimeoutMs?: number; onViewerActivity?: (viewerKey: string) => void; setupPolicy?: BrowserSetupPolicy }) {
         this.authToken = opts.authToken
