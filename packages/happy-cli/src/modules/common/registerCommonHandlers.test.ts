@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager';
 import { configuration } from '@/configuration';
 import { registerCommonHandlers, type CommonHandlerOptions } from './registerCommonHandlers';
@@ -10,6 +10,14 @@ import { createManagedProjectWriteScopePolicy, createTrustedMachineRunProfileRes
 import { managedMachineToolPlatform } from './managedMachineTool';
 
 type Handler = (data: Record<string, unknown>) => Promise<Record<string, unknown>>;
+
+// Counts the handlers' stat calls, so a test can tell a walk that stopped from one that
+// only stopped counting.
+const statCalls = vi.hoisted(() => ({ count: 0 }));
+vi.mock('fs/promises', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('fs/promises')>();
+    return { ...actual, stat: (...args: Parameters<typeof actual.stat>) => { statCalls.count++; return actual.stat(...args); } };
+});
 
 const temporaryDirectories: string[] = [];
 
@@ -339,10 +347,11 @@ describe('registerCommonHandlers getDirectoryTree entry limit', () => {
     it('returns the tree when it holds exactly the limit', async () => {
         const { handler, workingDirectory } = await createTree(4);
 
-        await expect(handler?.({ path: workingDirectory, maxDepth: 8 })).resolves.toMatchObject({
-            success: true,
-            tree: { children: [expect.objectContaining({ name: 'src', children: expect.any(Array) })] },
-        });
+        const result = await handler?.({ path: workingDirectory, maxDepth: 8 }) as any;
+
+        expect(result.success).toBe(true);
+        expect(result.tree.children).toEqual([expect.objectContaining({ name: 'src' })]);
+        expect(result.tree.children[0].children).toHaveLength(2);
     });
 
     it('refuses a tree over the limit instead of returning part of it', async () => {
@@ -355,6 +364,16 @@ describe('registerCommonHandlers getDirectoryTree entry limit', () => {
             errorCode: 'DIRECTORY_TREE_TOO_LARGE',
             error: 'Directory tree has more than 4 entries; open a subdirectory or lower maxDepth',
         });
+    });
+
+    it('stops reading the disk once the limit is passed', async () => {
+        const { handler, workingDirectory } = await createTree(50);
+        statCalls.count = 0;
+
+        await expect(handler?.({ path: workingDirectory, maxDepth: 8 })).resolves.toMatchObject({ success: false });
+
+        // One stat per node it kept, not one per entry on disk.
+        expect(statCalls.count).toBeLessThanOrEqual(4);
     });
 });
 
