@@ -262,3 +262,31 @@ describe('owner-contact trust configuration', () => {
         expect(readOwnerContactTrust({ ...env, ...override }, 'https://happy.example')).toBeNull();
     });
 });
+describe('identity-only caller bindings (Desktop identity-adapter-plan D2)', () => {
+    const build = (identityOnly: boolean) => {
+        let session: TrackedSession | undefined = { startedBy: 'daemon', pid: 42, directory: '/project', happySessionId: 'source' } as TrackedSession;
+        const launches = createAgentCallerLaunches({ enabled: false, identityOnly,
+            identity: async () => ({ machineId: 'machine', happyAccountId: 'account', epoch: 'e1' }), trust: () => trust,
+            trackedByPid: pid => pid === session?.pid ? session : undefined, live: () => true, realpath: path => path });
+        return { launches, end: () => { session = undefined; } };
+    };
+    it('issues a binding for the broker identity check while owner contact stays off', async () => {
+        const { launches, end } = build(true);
+        const host = await spawnHost(launches, 42);
+        const report = { sessionId: 'source', runtimeId: 'actual-runtime', hostPid: 42, callerPublicKey: key(), capability: host.capability! };
+        const issued = await launches.issue(report);
+        expect(issued.caller).toMatchObject({ sessionId: 'source', machineId: 'machine', happyAccountId: 'account', depth: 0 });
+        expect(issued.trust).toEqual(trust);
+        expect(await launches.current({ sessionId: 'source', callerBindingId: issued.caller.callerBindingId })).toEqual({ current: true });
+        // Owner contact itself stays off: no agent-caller-binding answer, no owned-start caller, not available.
+        await expect(launches.query({ sessionId: 'source', nonce })).rejects.toThrow('caller-unavailable');
+        expect(await launches.currentCaller('source')).toBeNull();
+        expect(launches.available()).toBe(false);
+        end();
+        expect(await launches.current({ sessionId: 'source', callerBindingId: issued.caller.callerBindingId })).toEqual({ current: false });
+    });
+    it('opens no launch pipe when neither switch is on', async () => {
+        const { launches } = build(false);
+        expect(launches.prepareLaunch({ cwd: '/project' })).toBeNull();
+    });
+});

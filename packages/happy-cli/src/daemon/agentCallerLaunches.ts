@@ -46,6 +46,9 @@ const sameIdentity = (current: Identity | null, issued: Identity) => current?.ep
 export function createAgentCallerLaunches(deps: {
     /** Rollout switch (HAPPY_OWNER_CONTACT_V1). Default OFF; enabling grants no authority by itself. */
     enabled: boolean;
+    /** Issue bindings only for the broker's personal same-account check while owner contact stays off
+     * (Desktop identity-adapter-plan D2). The daemon sets it when its ownership trust is configured. */
+    identityOnly?: boolean;
     identity(): Promise<Identity | null>;
     trust(): OwnerContactTrust | null;
     /** The daemon's own launch record for a host process (pidToTrackedSession). */
@@ -57,6 +60,8 @@ export function createAgentCallerLaunches(deps: {
     /** In memory only: a daemon restart forgets them, so a recovered host gets no binding. */
     const launches = new Map<number, { capability: Buffer; cwd: string; depth: number | null; owned?: OwnedLaunchLineage }>();
     const realpath = deps.realpath ?? realpathSync;
+    // Launch pipe, issue and liveness serve both; owner contact's own answers (query, available) stay on `enabled`.
+    const issuing = deps.enabled || deps.identityOnly === true;
     /** Before the session-started webhook the launch may not know its session yet; it must never name another one. */
     function launch(sessionId: string, pid: number, confirmed: boolean) {
         const session = deps.trackedByPid(pid);
@@ -88,7 +93,7 @@ export function createAgentCallerLaunches(deps: {
     return {
         /** At spawn: one capability per launch, written once to an extra stdio pipe the host closes before its provider starts. */
         prepareLaunch(input: { cwd: string; agentEnvironment?: TrackedSession['agentEnvironment']; owned?: OwnedLaunchLineage | 'unknown' | null }) {
-            if (!deps.enabled) return null;
+            if (!issuing) return null;
             const capability = randomBytes(32);
             const owned = input.owned && input.owned !== 'unknown' ? input.owned : undefined;
             // An agent grant's scope and depth come from the spawn request; the daemon has no lineage for them.
@@ -114,7 +119,7 @@ export function createAgentCallerLaunches(deps: {
         },
         /** Host bootstrap before provider start. The capability is single-use and bound to its launch pid. */
         async issue(raw: unknown): Promise<{ caller: Caller; trust: OwnerContactTrust }> {
-            if (!deps.enabled) throw new Error('owner-contact-disabled');
+            if (!issuing) throw new Error('owner-contact-disabled');
             const report = reportSchema.parse(raw);
             const record = launches.get(report.hostPid), offered = Buffer.from(report.capability, 'base64url');
             if (!record || offered.length !== record.capability.length || !timingSafeEqual(offered, record.capability)) throw new Error('caller-capability-invalid');
@@ -141,7 +146,7 @@ export function createAgentCallerLaunches(deps: {
         async current(raw: unknown): Promise<{ current: boolean }> {
             const input = z.object({ sessionId: ownershipId, callerBindingId: ownershipId }).strict().parse(raw);
             const entry = bound.get(input.sessionId);
-            if (!deps.enabled || !entry || entry.caller.callerBindingId !== input.callerBindingId) return { current: false };
+            if (!issuing || !entry || entry.caller.callerBindingId !== input.callerBindingId) return { current: false };
             const session = deps.trackedByPid(entry.pid);
             if (!session || session.pid !== entry.pid || session.startedBy !== 'daemon' || !deps.live(session)
                 || (session.happySessionId !== undefined && session.happySessionId !== input.sessionId)) {

@@ -381,6 +381,41 @@ describe('host owner-contact wiring (startHappyServer)', () => {
         await started.close();
     });
 });
+describe('broker identity authority (Desktop identity-adapter-plan H-C, D2)', () => {
+    const wire = (h: ReturnType<typeof harness>, options: { switchOn: boolean; managed?: boolean }) => {
+        const env: NodeJS.ProcessEnv = options.switchOn ? { HAPPY_OWNER_CONTACT_V1: '1' } : {};
+        const startBroker = vi.fn(async (_contact: unknown, _identity?: unknown) => ({ ok: true }));
+        const session = { ...h.session, getManagedOrigin: () => options.managed ? 'https://managed.example' : null };
+        return { startBroker, start: () => startHostOwnerContact({ env, session, hostPid: 42, capability: async () => launchCapability(h.launches, h.pid()),
+            current: h.current, issue: async report => { h.issued.push(report); return h.issue(report); }, token: async () => 'happy-token',
+            fetch: h.fetcher, happyOrigin: fixture.contact.audience, startBroker }) };
+    };
+    it('gives the broker an identity authority from an identity-only binding while owner contact stays off', async () => {
+        const h = harness(), w = wire(h, { switchOn: false });
+        const started = await w.start();
+        expect(h.issued).toHaveLength(1);
+        const [contact, identity] = w.startBroker.mock.calls[0] as [unknown, { inspect(id: string): Promise<{ relation: string }> }];
+        expect(contact).toBeUndefined();
+        // It asks Studio for this machine's descriptor with the host token; the fixture answers no descriptor, so unknown.
+        expect((await identity.inspect('target')).relation).toBe('unknown');
+        expect(h.lookups[0]).toMatchObject({ url: 'https://studio.example/api/v2/machines/machine/agent-identity', auth: 'Bearer happy-token' });
+        await started.close();
+    });
+    it('gives the broker both owner contact and the identity authority with the switch on', async () => {
+        const h = harness(), w = wire(h, { switchOn: true });
+        const started = await w.start();
+        const [contact, identity] = w.startBroker.mock.calls[0] as [unknown, { inspect: unknown }];
+        expect(contact).toBeDefined();
+        expect(typeof identity.inspect).toBe('function');
+        await started.close();
+    });
+    it('issues nothing for a managed session', async () => {
+        const h = harness(), w = wire(h, { switchOn: false, managed: true });
+        await (await w.start()).close();
+        expect(h.issued).toEqual([]);
+        expect(w.startBroker).toHaveBeenCalledWith(undefined);
+    });
+});
 describe('launch capability pipe (host side) [H2-R-01]', () => {
     it('reads the capability once, removes the descriptor variable and closes the descriptor', async () => {
         const path = join(mkdtempSync(join(tmpdir(), 'oc-cap-')), 'pipe');
