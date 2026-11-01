@@ -38,4 +38,11 @@ describe('runCodex plan branch wiring', () => {
         expect(text).toMatch(/new CodexAppServerClient\([\s\S]*?recallHost !== null,\s*undefined,\s*agentPlanSession\?\.providerArgs \?\? null,\s*\);/)
         expect(text).toContain('await agentPlanSession?.close().catch(() => undefined);')
     })
+
+    it('reports the plan source only right after Codex connected with it', async () => {
+        const text = await source()
+        expect(text).toMatch(/await client\.connect\(\);\s*logger\.debug\('\[codex\]: client\.connect done'\);\s*if \(agentPlanSession\) reportAgentPlanApplied\(process\.env, client\.agentPlanApplied\);/)
+        expect(text.match(/reportAgentPlanApplied\(/g)).toHaveLength(1)
+    })
 })
+

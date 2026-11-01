@@ -22,6 +22,7 @@ import {
     readAgentPlanDescriptor,
     type AgentPlanDescriptor,
 } from '@/launcher/agentPlanLaunch'
+import { HAPPY_AI_AUTH_CONNECTION_VERSION_ENV, HAPPY_AI_AUTH_SOURCE_ENV } from '@/usage/aiAuthSource'
 import { startAgentPlanProxy } from './agentPlanProxy'
 
 const SECRET = /^[A-Za-z0-9_-]{16,200}$/
@@ -197,4 +198,16 @@ export async function startAgentPlanSession(input: {
         providerArgs: agentPlanCodexArgs(descriptor, `${proxy.baseUrl}/v1`),
         close: () => proxy.close(),
     }
+}
+
+/**
+ * spec §6.3-3: `platform-plan` is reported only once Codex was actually started with the plan provider. Until
+ * then the run carries what the daemon wrote (it never claims the plan). A plan session whose Codex came up
+ * without the provider must not run at all — it would be spending the machine's own login.
+ */
+export function reportAgentPlanApplied(env: NodeJS.ProcessEnv, applied: boolean): void {
+    if (!applied) throw new AgentPlanLaunchError('agent_plan_not_applied')
+    env[HAPPY_AI_AUTH_SOURCE_ENV] = 'platform-plan'
+    // Written empty, like the daemon does: no connection version belongs to the plan.
+    env[HAPPY_AI_AUTH_CONNECTION_VERSION_ENV] = ''
 }

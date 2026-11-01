@@ -173,7 +173,7 @@ import { DifficultyRoutingCommitter } from '@/difficultyRoutingCommit';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { createCodexUsageEvent } from '@/usage/providerUsageAdapters';
 import { AgentPlanLaunchError } from '@/launcher/agentPlanLaunch';
-import { consumeAgentPlanLaunch, startAgentPlanSession, type AgentPlanSession } from './agentPlanSession';
+import { consumeAgentPlanLaunch, reportAgentPlanApplied, startAgentPlanSession, type AgentPlanSession } from './agentPlanSession';
 import {
     consumePendingInitialAppendSystemPrompt,
     consumePendingInitialEffort,
@@ -2227,6 +2227,7 @@ export async function runCodex(opts: {
         try {
             await client.connect();
             logger.debug('[codex]: client.connect done');
+            if (agentPlanSession) reportAgentPlanApplied(process.env, client.agentPlanApplied);
 
             if (opts.resumeThreadId) {
                 await resumeExistingThread({

@@ -13,8 +13,10 @@ import {
     AgentPlanKeyExchangeError,
     consumeAgentPlanLaunch,
     createAgentPlanKeySource,
+    reportAgentPlanApplied,
     startAgentPlanSession,
 } from './agentPlanSession'
+import { createCodexUsageEvent } from '@/usage/providerUsageAdapters'
 import { startAgentPlanProxy } from './agentPlanProxy'
 
 const GRANT = '3f1c2a4e-1b2c-4d5e-8f90-123456789abc'
@@ -261,3 +263,25 @@ describe('startAgentPlanProxy', () => {
         expect(await response.json()).toMatchObject({ error: { code: 'agent_plan_grant_invalid' } })
     })
 })
+
+describe('reportAgentPlanApplied (spec §6.3-3)', () => {
+    const usage = { totalTokens: 3, inputTokens: 2, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 1, reasoningOutputTokens: 0 }
+
+    it('reports platform-plan on usage only after the provider reached Codex', () => {
+        // What the daemon wrote at spawn: it never claims the plan.
+        const env: NodeJS.ProcessEnv = { HAPPY_AI_AUTH_SOURCE: 'unknown', HAPPY_AI_AUTH_CONNECTION_VERSION: '' }
+        const before = createCodexUsageEvent({ sessionId: 's', responseId: 'r1', occurredAt: 1, model: 'gpt-6-luna', usage, env })
+        expect(before.aiAuth?.appliedSource ?? 'unknown').toBe('unknown')
+
+        reportAgentPlanApplied(env, true)
+        const after = createCodexUsageEvent({ sessionId: 's', responseId: 'r2', occurredAt: 2, model: 'gpt-6-luna', usage, env })
+        expect(after.aiAuth).toEqual({ appliedSource: 'platform-plan', connectionVersion: null })
+    })
+
+    it('stops the run instead of reporting when Codex came up without the plan provider', () => {
+        const env: NodeJS.ProcessEnv = { HAPPY_AI_AUTH_SOURCE: 'unknown' }
+        expect(() => reportAgentPlanApplied(env, false)).toThrow('agent_plan_not_applied')
+        expect(env.HAPPY_AI_AUTH_SOURCE).toBe('unknown')
+    })
+})
+
