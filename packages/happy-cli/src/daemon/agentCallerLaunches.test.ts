@@ -285,6 +285,23 @@ describe('identity-only caller bindings (Desktop identity-adapter-plan D2)', () 
         end();
         expect(await launches.current({ sessionId: 'source', callerBindingId: issued.caller.callerBindingId })).toEqual({ current: false });
     });
+    it('binds a broker host the daemon cannot place in a lineage, because the check reads no depth or scope', async () => {
+        // Every broker host runs with SAYCODE_AGENT_ENV=1, which the daemon cannot vouch a depth for.
+        const { launches } = build(true);
+        const host = await spawnHost(launches, 42, { agentEnvironment: { SAYCODE_AGENT_ENV: '1' } as TrackedSession['agentEnvironment'] });
+        const issued = await launches.issue({ sessionId: 'source', runtimeId: 'actual-runtime', hostPid: 42, callerPublicKey: key(), capability: host.capability! });
+        expect(issued.caller).toMatchObject({ machineId: 'machine', happyAccountId: 'account' });
+        await expect(launches.query({ sessionId: 'source', nonce })).rejects.toThrow('caller-unavailable');
+    });
+    it('keeps refusing an unplaceable lineage once owner contact itself is on', async () => {
+        const launches = createAgentCallerLaunches({ enabled: true, identityOnly: true,
+            identity: async () => ({ machineId: 'machine', happyAccountId: 'account', epoch: 'e1' }), trust: () => trust,
+            trackedByPid: pid => pid === 42 ? { startedBy: 'daemon', pid: 42, directory: '/project', happySessionId: 'source' } as TrackedSession : undefined,
+            live: () => true, realpath: path => path });
+        const host = await spawnHost(launches, 42, { agentEnvironment: { SAYCODE_AGENT_ENV: '1' } as TrackedSession['agentEnvironment'] });
+        await expect(launches.issue({ sessionId: 'source', runtimeId: 'actual-runtime', hostPid: 42, callerPublicKey: key(), capability: host.capability! }))
+            .rejects.toThrow('caller-lineage-unknown');
+    });
     it('opens no launch pipe when neither switch is on', async () => {
         const { launches } = build(false);
         expect(launches.prepareLaunch({ cwd: '/project' })).toBeNull();

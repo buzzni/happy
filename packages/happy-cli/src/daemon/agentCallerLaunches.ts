@@ -127,7 +127,11 @@ export function createAgentCallerLaunches(deps: {
             const trust = deps.trust();
             if (!trust) throw new Error('owner-contact-unconfigured');
             launch(report.sessionId, report.hostPid, false);
-            if (record.depth === null) throw new Error('caller-lineage-unknown');
+            // Owner contact grants lineage authority, so an unplaceable lineage gets no binding. An identity-only binding
+            // carries none: query, currentCaller and available never serve it (they stay on `enabled`), the broker's
+            // same-account check reads only machineId, happyAccountId and hostEpoch, and saycode-cli takes depth from
+            // its own host-fixed env. Every broker host runs with SAYCODE_AGENT_ENV=1, so this is the case it is for.
+            if (record.depth === null && deps.enabled) throw new Error('caller-lineage-unknown');
             // An owned child binds only itself, with its own key: never its parent's session or contact key.
             if (record.owned && report.sessionId !== record.owned.sessionId) throw new Error('caller-not-running');
             unique(report, record.owned);
@@ -137,7 +141,7 @@ export function createAgentCallerLaunches(deps: {
             unique(report, record.owned);
             const caller = OwnershipCallerBindingSchema.parse({ callerBindingId: randomUUID(), sessionId: report.sessionId,
                 runtimeId: report.runtimeId, machineId: identity.machineId, happyAccountId: identity.happyAccountId,
-                scope: realpath(record.cwd), depth: record.depth, hostEpoch: randomUUID(), callerPublicKey: report.callerPublicKey });
+                scope: realpath(record.cwd), depth: record.depth ?? 0, hostEpoch: randomUUID(), callerPublicKey: report.callerPublicKey });
             bound.set(report.sessionId, { pid: report.hostPid, caller, identity });
             return { caller: { ...caller }, trust };
         },
