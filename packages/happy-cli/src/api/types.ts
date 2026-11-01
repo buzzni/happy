@@ -2,7 +2,7 @@ export type SetupTokenRotationState = 'switching' | 'switched' | 'exhausted' | '
 import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { z } from 'zod'
 import type { OrgRequirementsAgentState, ProviderUsageEventV1, Update, UpdateMachineBody } from '@slopus/happy-wire';
-import { authenticatedEnvelopesCapabilitySchema, companyKeyReseedCapabilitySchema, OrgRequirementsCapabilitySchema, projectPurgeCapabilitySchema, rpcBindingCapabilitySchema, sealedSpawnEnvCapabilitySchema, worktreeOpsCapabilitySchema, type RpcBindingCapability } from '@slopus/happy-wire';
+import { authenticatedEnvelopesCapabilitySchema, companyKeyReseedCapabilitySchema, OrgRequirementsCapabilitySchema, projectPurgeCapabilitySchema, rpcBindingCapabilitySchema, sealedSpawnEnvCapabilitySchema, workspaceSyncCapabilitySchema, worktreeOpsCapabilitySchema, type RpcBindingCapability } from '@slopus/happy-wire';
 import { UsageSchema } from '@/claude/types'
 import { DifficultyRoutingCapabilitySchema, DifficultyRoutingIntentSchema } from '@/difficultyRouting'
 import type { SandboxConfig } from '@/persistence'
@@ -314,6 +314,8 @@ export const MachineMetadataSchema = z.object({
   worktreeOps: worktreeOpsCapabilitySchema.optional(),
   /** aplus-dev-studio strict-followup-plan F1 — runs `worktree:purge-project` (cleanup after a project delete). */
   projectPurge: projectPurgeCapabilitySchema.optional(),
+  /** aplus-dev-studio workspace-sync-strict-design.md (F6) — runs `workspace:*` (code save, pull, clone) and signs the results. */
+  workspaceSync: workspaceSyncCapabilitySchema.optional(),
   /** aplus specs/e2ee-machine-control-boundary F8: `datakey:reseed`, strict machines with an org pin only. */
   companyKeyReseed: companyKeyReseedCapabilitySchema.optional(),
   /**
