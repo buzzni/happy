@@ -35,6 +35,7 @@ import { resolveDaemonAllowedRoot } from '../modules/common/resolveAllowedRoot';
 import { REMOTE_TERMINAL_DISABLED_ERROR, resolveMachineLockdownPolicy } from '../daemon/machineLockdownPolicy';
 import { homedir } from 'node:os';
 import { encodeBase64, decodeBase64, encrypt, decrypt, tryDecrypt } from './encryption';
+import { machineKeyTerminalCipher } from '@/daemon/terminalCipher';
 import { createTerminalOutputCoalescer } from '@/daemon/terminalOutputCoalescer';
 import {
     MACHINE_RESOURCE_METRICS_RPC,
@@ -3928,6 +3929,7 @@ export class ApiMachineClient {
         const machineKey = this.machine.encryptionKey;
         const machineVariant = this.machine.encryptionVariant;
         const machineId = this.machine.id;
+        const terminalCipher = machineKeyTerminalCipher({ encryptionKey: machineKey, encryptionVariant: machineVariant });
         // Not attached on a managed runtime: the forwarded terminal opener reaches the host outside
         // the RPC dispatch gate, so the allowlist there would not see it. The Windows standalone
         // trial does attach it: its runtime roots every shell in the verified pty host and closes
@@ -4011,7 +4013,7 @@ export class ApiMachineClient {
                         // first real chunk would look like a duplicate.
                         const seq = entry.output.push(banner);
                         try {
-                            const data = encodeBase64(encrypt(machineKey, machineVariant, banner));
+                            const data = terminalCipher.seal(banner);
                             this.socket.emit('terminal-frame', { sessionId, seq, data });
                             recordBytesOut(sessionId, banner.length);
                         } catch (e) {
@@ -4040,7 +4042,7 @@ export class ApiMachineClient {
                          */
                         const seq = entry.output.push(chunk);
                         try {
-                            const data = encodeBase64(encrypt(machineKey, machineVariant, chunk));
+                            const data = terminalCipher.seal(chunk);
                             this.socket.emit('terminal-frame', { sessionId, seq, data });
                         } catch (e) {
                             logger.debug(`[API MACHINE] terminal-frame encrypt failed: ${(e as Error).message}`);
@@ -4102,7 +4104,7 @@ export class ApiMachineClient {
             const entry = getDaemonTerminalSession(sessionId);
             if (!entry || entry.exit || typeof data !== 'string') return;
             try {
-                const chunk = decrypt(machineKey, machineVariant, decodeBase64(data));
+                const chunk = terminalCipher.open(data);
                 if (typeof chunk === 'string') {
                     entry.session.write(chunk);
                     recordBytesIn(sessionId, chunk.length);
@@ -4147,7 +4149,7 @@ export class ApiMachineClient {
                     // The relay names the client socket that asked, so a reconnect
                     // mid-replay is answered afresh (the direct path resets on attach).
                     requester: typeof clientSocketId === 'string' ? clientSocketId : undefined,
-                    seal: (chunk) => encodeBase64(encrypt(machineKey, machineVariant, chunk)),
+                    seal: (chunk) => terminalCipher.seal(chunk),
                     emit: (event, payload) => this.socket.emit(event, payload as any),
                 });
             } catch (e) {
