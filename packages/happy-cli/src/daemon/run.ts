@@ -1,3 +1,4 @@
+import { createBrowserNativeDeviceProof, type BrowserNativeDeviceSigner } from './browserNativeDeviceProof';
 import { createManualPersonalSpawn, MANUAL_PERSONAL_ENV } from './manualPersonalClaude';
 import { createOwnedSpawnRuntime, createOwnedStartGuard } from './ownedSpawnRuntime';
 import { createAgentCallerLaunches, OWNER_CONTACT_SWITCH, readOwnerContactTrust, type OwnedLaunchLineage } from './agentCallerLaunches';
@@ -1873,7 +1874,12 @@ export async function startDaemon(): Promise<void> {
     let onPersonalBrowserActive: ((native: NativeBrokerRequestOptions) => void) | undefined;
     /** Set once the machine sync client exists; an activation before that is published with the first metadata check. */
     let publishAgentBrowserCapability: (() => void) | undefined;
+    let browserNativeDeviceSigner: BrowserNativeDeviceSigner | undefined;
     const personalBrowserWatch = browserTaskBroker || process.env.HAPPY_BROWSER_TASK_RUNTIME_URL ? undefined : watchPersonalBrowserRuntime({
+      deviceProof: async request => {
+        if (!browserNativeDeviceSigner) throw new Error('NATIVE_DEVICE_APPROVAL_REQUIRED');
+        return browserNativeDeviceSigner(request);
+      },
       machineId, studioOrigin: readTrustedStudioOrigin(process.env), token: () => credentials.token, log: (message) => logger.warn(message),
       activate: (runtime) => {
         let broker: BrowserTaskSessionBroker | undefined;
@@ -4333,6 +4339,10 @@ export async function startDaemon(): Promise<void> {
       marker: machineTypeMarker,
       ...(autoConfirmOrigin ? { autoConfirm: createSharedPcAutoConfirm({ marker: machineTypeMarker, machineId: machine.id,
         token: () => credentials.token, studioOrigin: autoConfirmOrigin, log: (message, details) => logger.debug(message, details) }) } : {}) });
+    if (deviceKeys && deviceEnrollment) {
+      const enrollment = deviceEnrollment;
+      browserNativeDeviceSigner = createBrowserNativeDeviceProof({ keys: deviceKeys, pin: companyId => enrollment.orgPin(companyId) });
+    }
     const apiMachine = api.machineSyncClient(machine, deviceKeys, deviceEnrollment ?? undefined, initialDaemonState);
     if (standaloneWindows) apiMachine.setWindowsStandaloneTrial();
     startDifficultyRoutingMetadataPoll({
