@@ -121,6 +121,9 @@ export async function walkWorkspace(opts: WalkWorkspaceOptions): Promise<void> {
     await walkDir(opts.root, '', rootCtx, opts, 0)
 }
 
+/** How many files of a directory walkDir stats ahead of the one it is visiting. */
+const STAT_AHEAD = 64
+
 /** Answers false once onFile asked the walk to stop. */
 async function walkDir(
     absDir: string,
@@ -150,11 +153,17 @@ async function walkDir(
         if (localCtx.ignores(entryRel, isDir)) return []
         return [{ entry, entryRel, entryAbs: join(absDir, entry.name), isDir }]
     })
-    // Stat a directory's files together and use them in order: one at a time,
-    // a large walk spends most of its time waiting on each stat in turn.
-    const fileStats = kept.map(({ entry, entryAbs }) => (
-        entry.isFile() && opts.onFile ? stat(entryAbs).catch(() => null) : null
-    ))
+    // Stat the next few files ahead of the one in use: one at a time, a large
+    // walk spends most of its time waiting on each stat in turn. Only a window
+    // ahead, because a walk that stops (a page of listFilesPage) throws away
+    // whatever it started, and the next page walks the same path again.
+    const fileStats: (Promise<Stats | null> | null)[] = []
+    const statAhead = (end: number) => {
+        for (let j = fileStats.length; j < Math.min(end, kept.length); j++) {
+            const { entry, entryAbs } = kept[j]
+            fileStats.push(entry.isFile() && opts.onFile ? stat(entryAbs).catch(() => null) : null)
+        }
+    }
 
     for (const [i, { entry, entryRel, entryAbs, isDir }] of kept.entries()) {
         if (isDir) {
@@ -163,6 +172,7 @@ async function walkDir(
                 if (!await walkDir(entryAbs, entryRel, localCtx, opts, depth + 1)) return false
             }
         } else if (entry.isFile() && opts.onFile) {
+            statAhead(i + STAT_AHEAD)
             const stats: Stats | null = await fileStats[i]
             if (!stats) continue
             if (await opts.onFile(entryAbs, entryRel, stats) === false) return false

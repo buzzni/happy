@@ -5,7 +5,14 @@
  * update both files together when a rule changes.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+
+const statCalls = vi.hoisted(() => ({ count: 0 }))
+vi.mock('fs/promises', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('fs/promises')>()
+    return { ...actual, stat: (...args: Parameters<typeof actual.stat>) => { statCalls.count++; return actual.stat(...args) } }
+})
+
 import { mkdtemp, rm, mkdir, writeFile, symlink } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join, dirname } from 'path'
@@ -192,6 +199,27 @@ describe('walkWorkspace', () => {
             await walkWorkspace({ root, presetMatcher, onFile: (_abs, rel) => { files.push(rel); return files.length < 2 } })
 
             expect(files).toEqual(['C.txt', 'a/b/c.txt'])
+        })
+
+        it('stats only the files near where it stops, not the rest of each directory', async () => {
+            // Each page of listFilesPage walks from the root and stops at its limit,
+            // so stat work beyond the stop point is repeated on every page.
+            for (let i = 0; i < 300; i++) await write(`a/f${String(i).padStart(3, '0')}.txt`)
+            for (let i = 0; i < 300; i++) await write(`z${String(i).padStart(3, '0')}.txt`)
+            statCalls.count = 0
+
+            const files: string[] = []
+            await walkWorkspace({ root, presetMatcher, onFile: (_abs, rel) => { files.push(rel); return false } })
+
+            expect(files).toEqual(['C.txt'])
+            expect(statCalls.count).toBeLessThan(100)
+
+            statCalls.count = 0
+            const resumed: string[] = []
+            await walkWorkspace({ root, presetMatcher, after: 'a/b/c.txt', onFile: (_abs, rel) => { resumed.push(rel); return resumed.length < 5 } })
+
+            expect(resumed).toEqual(['a/f000.txt', 'a/f001.txt', 'a/f002.txt', 'a/f003.txt', 'a/f004.txt'])
+            expect(statCalls.count).toBeLessThan(100)
         })
     })
 })
