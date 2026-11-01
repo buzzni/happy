@@ -13,7 +13,9 @@
  * `bindTerminal` picks a fresh daemon nonce, derives the per-direction frame
  * keys from it and the terminal key, and seals the proof the client checks.
  * A replayed open (after a restart forgot its nonce) therefore gets keys
- * nobody holds, and the input recorded for the first one opens nowhere.
+ * nobody holds, and the input recorded for the first one opens nowhere. The
+ * open itself still runs: a command it carries in `shell`/`args` runs again
+ * (the memory-only nonce guard, rpcNonceGuard.ts).
  */
 
 import { hkdfSync, randomBytes } from 'node:crypto';

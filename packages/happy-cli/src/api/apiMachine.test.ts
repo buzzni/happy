@@ -804,6 +804,26 @@ describe('ApiMachineClient socket reconnection', () => {
             expect(replay.every((frame: any) => frame.kind === 'output' && frame.rid === rid)).toBe(true);
             expect(replay.map((frame: any) => frame.data).join('')).toContain('resumed-here');
         });
+
+        // Codex CLI benchmark D4 B-R2 on v2: the daemon holds no keys for a terminal it forgot, so the plaintext unknown-session is the answer.
+        it('answers a sealed resume for a terminal this daemon no longer has with unknown-session', async () => {
+            const machine = makeMachine();
+            const client = new ApiMachineClient('fake-token', machine);
+            client.connect();
+            const sessionId = 'v2-gone-1';
+            const opener = boundOpen(machine);
+            const ack = await open(machine, sessionId, opener.params);
+            const terminal = clientOf(sessionId, opener.terminalKey, opener.terminalId, ack.caps.terminalBinding.proof);
+            await getDaemonTerminalSession(sessionId)!.session.terminate();
+            removeDaemonTerminalSession(sessionId);
+            mockSocket.emit.mockClear();
+
+            terminal.send({ kind: 'resume', rid: b64(16), afterSeq: 3 });
+
+            expect(mockSocket.emit.mock.calls).toEqual([
+                ['terminal-closed', { sessionId, reason: 'unknown-session' }],
+            ]);
+        });
     });
 
     // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 preview stage 2.
