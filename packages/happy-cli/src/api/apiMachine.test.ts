@@ -1,6 +1,6 @@
 import nacl from 'tweetnacl';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, TERMINAL_BINDING_CAPABILITY, WORKTREE_OPS_CAPABILITY, bindRpcRequest, terminalFrameKeyInfo } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, TERMINAL_BINDING_CAPABILITY, WORKSPACE_SYNC_CAPABILITY, WORKTREE_OPS_CAPABILITY, bindRpcRequest, terminalFrameKeyInfo } from '@slopus/happy-wire';
 import { configuration } from '@/configuration';
 import {
     ApiMachineClient,
@@ -1772,7 +1772,7 @@ describe('ApiMachineClient socket reconnection', () => {
     });
 
     // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 worktree — the result signature is keyed
-    // from the machine key, so only a dataKey machine advertises worktree operations.
+    // from the machine key, so only a dataKey machine advertises worktree operations (and `workspace:*`, F6).
     it.each([
         { variant: 'dataKey' as const, expected: WORKTREE_OPS_CAPABILITY },
         { variant: 'legacy' as const, expected: undefined },
@@ -1788,13 +1788,18 @@ describe('ApiMachineClient socket reconnection', () => {
             return { result: 'success' };
         });
         const machine = { ...makeMachine(), encryptionVariant: variant };
-        machine.metadata = { ...machine.metadata!, worktreeOps: variant === 'legacy' ? WORKTREE_OPS_CAPABILITY : undefined };
+        machine.metadata = {
+            ...machine.metadata!,
+            worktreeOps: variant === 'legacy' ? WORKTREE_OPS_CAPABILITY : undefined,
+            workspaceSync: variant === 'legacy' ? WORKSPACE_SYNC_CAPABILITY : undefined,
+        };
         const client = new ApiMachineClient('fake-token', machine);
         client.connect();
 
         socketHandlers.connect![0]!();
         await vi.waitFor(() => expect(machine.metadata?.rpcBinding).toEqual(RPC_BINDING_CAPABILITY));
         expect(machine.metadata?.worktreeOps).toEqual(expected);
+        expect(machine.metadata?.workspaceSync).toEqual(expected ? WORKSPACE_SYNC_CAPABILITY : undefined);
 
         client.shutdown();
     });

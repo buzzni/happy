@@ -816,7 +816,7 @@ describe('sealed git credentials', () => {
         const ask = (prompt: string) => execFileSync(askpass, [prompt], { env: { ...process.env, ...prepared.env }, encoding: 'utf8' }).trim();
         expect(ask("Username for 'https://github.com': ")).toBe('x-access-token');
         expect(ask("Password for 'https://x-access-token@github.com': ")).toBe('ghs_secret_value');
-        expect(prepared.config).toEqual(['-c', 'credential.helper=']);
+        expect(prepared.config).toEqual(['-c', 'credential.helper=', '-c', 'protocol.http.allow=never']);
         expect(readFileSync(askpass, 'utf8')).not.toContain('ghs_secret_value');
         await prepared.dispose();
         expect(existsSync(askpass)).toBe(false);

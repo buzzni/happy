@@ -147,7 +147,7 @@ import {
 import { PreviewWsProxy } from '@/daemon/previewWsProxy';
 import { startServerProcess, StartServerError } from '@/daemon/startServer';
 import packageJson from '../../package.json';
-import { AUTOMATION_PROTOCOL_VERSION, AUTOMATION_SCHEDULE_KINDS, COMPANY_KEY_RESEED_CAPABILITY, COMPANY_KEY_RESEED_METHOD, PROJECT_PURGE_CAPABILITY, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, TERMINAL_BINDING_CAPABILITY, WORKTREE_OPS_CAPABILITY, type AuthenticatedEnvelopesCapability } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, AUTOMATION_SCHEDULE_KINDS, COMPANY_KEY_RESEED_CAPABILITY, COMPANY_KEY_RESEED_METHOD, PROJECT_PURGE_CAPABILITY, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, TERMINAL_BINDING_CAPABILITY, WORKSPACE_SYNC_CAPABILITY, WORKTREE_OPS_CAPABILITY, type AuthenticatedEnvelopesCapability } from '@slopus/happy-wire';
 import { stopServerProcess, StopServerError } from '@/daemon/stopServer';
 import { createPtySession } from '@/daemon/remoteTerminal';
 import { decideTerminalCwd, formatCwdFallbackBanner } from '@/daemon/decideTerminalCwd';
@@ -4432,6 +4432,10 @@ export class ApiMachineClient {
             const advertisedProjectPurge = advertisedWorktreeOps ? PROJECT_PURGE_CAPABILITY : undefined;
             const projectPurgeStale = JSON.stringify(this.machine.metadata?.projectPurge)
                 !== JSON.stringify(advertisedProjectPurge);
+            // aplus workspace-sync-strict-design.md (F6): `workspace:*`, likewise.
+            const advertisedWorkspaceSync = advertisedWorktreeOps ? WORKSPACE_SYNC_CAPABILITY : undefined;
+            const workspaceSyncStale = JSON.stringify(this.machine.metadata?.workspaceSync)
+                !== JSON.stringify(advertisedWorkspaceSync);
             // F8: `datakey:reseed`, only where the handler was set (strict, org pin store).
             const advertisedCompanyKeyReseed = this.companyKeyReseedAvailable && advertisedWorktreeOps ? COMPANY_KEY_RESEED_CAPABILITY : undefined;
             const companyKeyReseedStale = JSON.stringify(this.machine.metadata?.companyKeyReseed)
@@ -4453,7 +4457,7 @@ export class ApiMachineClient {
             // Bounded: an acknowledgement that never comes must not block every later change.
             const awaitingServer = this.capabilityUpdateInFlight !== null
                 && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
-            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || companyKeyReseedStale || terminalBindingStale || writeFileAttemptStale || listFilesPageStale)) {
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || writeFileAttemptStale || listFilesPageStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -4494,6 +4498,7 @@ export class ApiMachineClient {
                     sealedSpawnEnv: advertisedSealedSpawnEnv,
                     worktreeOps: advertisedWorktreeOps,
                     projectPurge: advertisedProjectPurge,
+                    workspaceSync: advertisedWorkspaceSync,
                     companyKeyReseed: advertisedCompanyKeyReseed,
                     terminalBinding: advertisedTerminalBinding,
                     daemonSessionState: daemonSessionStateAvailable ? { version: 1 } : undefined,

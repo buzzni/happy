@@ -18,6 +18,9 @@ import {
   sanitizeWorktreeName,
   worktreeAttestationPayload,
   worktreeOpMethod,
+  isExcludedFromWorkspaceSnapshot,
+  workspaceSyncCapabilitySchema,
+  WORKSPACE_SYNC_CAPABILITY,
   worktreeOpResultSchemas,
   worktreeOpsCapabilitySchema,
     PROJECT_PURGE_CAPABILITY,
@@ -241,6 +244,107 @@ describe('sealed git credential', () => {
     expect(readSealedGitCredential(credential({ token: 'a\nb' }), { machineId: 'm1', opId }).ok).toBe(false);
     expect(readSealedGitCredential(credential({ extra: 1 }), { machineId: 'm1', opId }).ok).toBe(false);
     expect(readSealedGitCredential(credential({ purpose: 'spawn-env' }), { machineId: 'm1', opId }).ok).toBe(false);
+  });
+});
+
+// aplus-dev-studio workspace-sync-strict-design.md (F6) — the workspace's online repository.
+describe('workspace sync operations', () => {
+  const read = (op: string, params: Record<string, unknown>) => readWorktreeTicket(ticket({ op, params })).ok;
+  const ONLINE = 'https://github.com/o/r.git';
+  const head = 'a'.repeat(40);
+
+  it('reads the params of each operation', () => {
+    expect(read('remote-status', { workspaceDir: '/ws', remoteUrl: ONLINE, branch: 'main', baseBranch: null })).toBe(true);
+    expect(read('remote-status', { workspaceDir: '/ws', remoteUrl: null, branch: 'collab-x', baseBranch: 'main' })).toBe(true);
+    expect(read('pull-remote', {
+      workspaceDir: '/ws', remoteUrl: ONLINE, branch: 'collab-x', baseBranch: 'main', mode: 'ff-only', expectedHead: head, push: true,
+    })).toBe(true);
+    expect(read('pull-remote', {
+      workspaceDir: '/ws', remoteUrl: null, branch: 'main', baseBranch: null, mode: 'merge', expectedHead: null, push: false,
+    })).toBe(true);
+    expect(read('clone', { workspaceDir: '/ws', remoteUrl: ONLINE, branch: 'collab-x' })).toBe(true);
+  });
+
+  it('pushes only a fast-forward, never a merge it made', () => {
+    expect(read('pull-remote', {
+      workspaceDir: '/ws', remoteUrl: ONLINE, branch: 'main', baseBranch: null, mode: 'merge', expectedHead: head, push: true,
+    })).toBe(false);
+  });
+
+  it('has no overwrite mode', () => {
+    expect(read('pull-remote', {
+      workspaceDir: '/ws', remoteUrl: ONLINE, branch: 'main', baseBranch: null, mode: 'reset', expectedHead: head, push: false,
+    })).toBe(false);
+  });
+
+  it('clones only from an https address', () => {
+    expect(read('clone', { workspaceDir: '/ws', remoteUrl: null, branch: 'collab-x' })).toBe(false);
+    expect(read('clone', { workspaceDir: '/ws', remoteUrl: 'http://github.com/o/r.git', branch: 'collab-x' })).toBe(false);
+  });
+
+  it('names their daemon methods under workspace:', () => {
+    expect(worktreeOpMethod('remote-status')).toBe('workspace:remote-status');
+    expect(worktreeOpMethod('pull-remote')).toBe('workspace:pull-remote');
+    expect(worktreeOpMethod('clone')).toBe('workspace:clone');
+  });
+
+  it('reads their results strictly', () => {
+    const status = { isRepo: true, head, branch: 'main', dirtyCount: 0, ahead: 0, behind: 2, baseBehind: null };
+    expect(worktreeOpResultSchemas['remote-status'].parse(status)).toEqual(status);
+    expect(worktreeOpResultSchemas['pull-remote'].parse({ status: 'conflict', head, conflictCount: 3 })).toEqual({ status: 'conflict', head, conflictCount: 3 });
+    expect(worktreeOpResultSchemas['pull-remote'].safeParse({ status: 'reset', head, conflictCount: 0 }).success).toBe(false);
+    expect(worktreeOpResultSchemas.clone.parse({ changed: true, head, branch: 'collab-x' })).toEqual({ changed: true, head, branch: 'collab-x' });
+  });
+});
+
+// workspace-sync-strict-design.md §4-2 — the code save the daemon runs (`workspace:sync-remote`).
+describe('workspace:sync-remote', () => {
+  const read = (params: Record<string, unknown>) => readWorktreeTicket(ticket({ op: 'sync-remote', params })).ok;
+  const params = {
+    workspaceDir: '/ws', kind: 'workspace', remoteUrl: 'https://github.com/o/r.git', branch: 'main',
+    commitMessage: 'sync from owner workspace (trigger: owner-manual, actor: u1)', authorName: 'aplus-sync',
+    authorEmail: 'aplus-sync@buzzni.com', sizeCapBytes: 500 * 1024 * 1024, confirmFirstRemote: false, dryRun: false,
+  };
+
+  it('reads its params', () => {
+    expect(read(params)).toBe(true);
+    expect(read({ ...params, kind: 'deploy', confirmFirstRemote: true })).toBe(true);
+    expect(read({ ...params, kind: 'gitea' })).toBe(false);
+    expect(read({ ...params, remoteUrl: null })).toBe(false);
+    expect(read({ ...params, commitMessage: 'a\u0000b' })).toBe(false);
+    expect(read({ ...params, sizeCapBytes: 0 })).toBe(false);
+    expect(worktreeOpMethod('sync-remote')).toBe('workspace:sync-remote');
+  });
+
+  it('attests counts and a commit, nothing about the files', () => {
+    const pushed = { status: 'pushed', commitSha: 'a'.repeat(40), filesChanged: 3, sizeBytes: 1200, origin: null, pinned: null, dirtyCount: 0 };
+    expect(worktreeOpResultSchemas['sync-remote'].parse(pushed)).toEqual(pushed);
+    expect(worktreeOpResultSchemas['sync-remote'].safeParse({ ...pushed, files: ['a.ts'] }).success).toBe(false);
+    expect(worktreeOpResultSchemas['sync-remote'].safeParse({ ...pushed, status: 'remote-ahead' }).success).toBe(false);
+  });
+
+  it('is advertised on its own', () => {
+    expect(workspaceSyncCapabilitySchema.parse(WORKSPACE_SYNC_CAPABILITY)).toEqual({ version: 1 });
+  });
+});
+
+// The web's fork filter (`server/projectFork.ts` shouldSkipForFork / toForkTarExcludes), unchanged.
+describe('isExcludedFromWorkspaceSnapshot', () => {
+  it.each([
+    'node_modules', 'apps/web/node_modules/x.js', '.git', 'packages/a/.git/config',
+    'dist', 'dist/app.js', '.next/cache', '.cache', '.turbo', '.parcel-cache', '.vite', 'coverage', '.pnpm-store', '.omc', '.axstudio/preview.env',
+    '.aplus/worktrees', '.aplus/worktrees/p1/bright-fox/a.ts',
+    '.env', '.env.local', 'apps/web/.env.production', 'core.core', 'src/dump.core',
+    '.aplus/templates/personal-a/x.md', 'apps/x/.claude/skills/artifact-template-personal-b/SKILL.md', '.agents/skills/artifact-template-personal-c',
+  ])('leaves out %s', (path) => {
+    expect(isExcludedFromWorkspaceSnapshot(path)).toBe(true);
+  });
+
+  it.each([
+    'README.md', 'src/dist.ts', 'src/components/dist/index.ts', 'build/build.mjs', 'src/coverage/x.ts', '.envrc', '.gitignore',
+    '.aplus/agent/settings.json', '.aplus/templates/team-a/x.md', 'core/main.ts',
+  ])('keeps %s', (path) => {
+    expect(isExcludedFromWorkspaceSnapshot(path)).toBe(false);
   });
 });
 
