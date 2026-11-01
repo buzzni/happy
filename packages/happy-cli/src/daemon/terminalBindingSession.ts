@@ -88,6 +88,13 @@ export interface BoundTerminal {
     sealOut(body: TerminalOutBody): string;
     /** Opens `terminal-frame.data` from the client and admits it in order. */
     openIn(data: string): { kind: 'frame'; frame: TerminalInFrame } | { kind: 'replayed' } | { kind: 'gap' } | { kind: 'unreadable' };
+    /**
+     * Opens a direct-path `terminal-attach`: any seq after the last one counts. Each attempt of a
+     * reconnecting client takes a seq, and one that died with its socket never arrives; on loopback
+     * nobody can hold frames back selectively, so the hole is a lost attempt, not withheld input.
+     * A repeat is still a replay, and anything but an attach is unreadable here.
+     */
+    openAttach(data: string): { kind: 'frame'; frame: Extract<TerminalInFrame, { kind: 'attach' }> } | { kind: 'replayed' } | { kind: 'unreadable' };
 }
 
 export function bindTerminal(input: {
@@ -109,21 +116,31 @@ export function bindTerminal(input: {
     const inKey = frameKey('in');
     const outKey = frameKey('out');
     let lastInSeq = 0;
+    const readIn = (data: string) => {
+        let opened: unknown = null;
+        try {
+            opened = decryptWithDataKey(decodeBase64(data), inKey);
+        } catch {
+            opened = null;
+        }
+        return readTerminalFrame(opened, { terminalId: params.terminalId, dir: 'in' });
+    };
 
     const terminal: BoundTerminal = {
         terminalId: params.terminalId,
         sealOut: (body) => encodeBase64(encryptWithDataKey({ v: TERMINAL_BINDING_VERSION, t: params.terminalId, dir: 'out', ...body }, outKey)),
         openIn: (data) => {
-            let opened: unknown = null;
-            try {
-                opened = decryptWithDataKey(decodeBase64(data), inKey);
-            } catch {
-                opened = null;
-            }
-            const frame = readTerminalFrame(opened, { terminalId: params.terminalId, dir: 'in' });
+            const frame = readIn(data);
             if (!frame) return { kind: 'unreadable' };
             const admission = admitInboundSeq(lastInSeq, frame.seq);
             if (admission !== 'accept') return { kind: admission };
+            lastInSeq = frame.seq;
+            return { kind: 'frame', frame };
+        },
+        openAttach: (data) => {
+            const frame = readIn(data);
+            if (!frame || frame.kind !== 'attach') return { kind: 'unreadable' };
+            if (frame.seq <= lastInSeq) return { kind: 'replayed' };
             lastInSeq = frame.seq;
             return { kind: 'frame', frame };
         },

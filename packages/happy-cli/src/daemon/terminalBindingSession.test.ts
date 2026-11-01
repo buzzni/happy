@@ -113,6 +113,18 @@ describe('bindTerminal', () => {
         expect(terminal.openIn(frame(4))).toEqual({ kind: 'gap' });
     });
 
+    it('takes an attach past a hole, since a lost attempt used its seq, but never a repeat or another kind', () => {
+        const { params, terminal, opened } = bind();
+        const rid = b64(16);
+        const attach = (seq: number) => sealIn(params, opened.daemonNonce, { seq, kind: 'attach', rid, afterSeq: 0 });
+        expect(terminal.openAttach(attach(3))).toEqual({ kind: 'frame', frame: { v: 1, t: params.terminalId, dir: 'in', seq: 3, kind: 'attach', rid, afterSeq: 0 } });
+        expect(terminal.openAttach(attach(3))).toEqual({ kind: 'replayed' });
+        expect(terminal.openAttach(attach(2))).toEqual({ kind: 'replayed' });
+        expect(terminal.openAttach(sealIn(params, opened.daemonNonce, { seq: 9, kind: 'input', data: 'x' }))).toEqual({ kind: 'unreadable' });
+        // Input after it continues from the attach's seq.
+        expect(terminal.openIn(sealIn(params, opened.daemonNonce, { seq: 4, kind: 'input', data: 'x' })).kind).toBe('frame');
+    });
+
     it('does not open frames sealed for another direction, terminal or open', () => {
         const { params, terminal, opened } = bind();
         const outKeySealed = encodeBase64(encryptWithDataKey({ v: 1, t: params.terminalId, dir: 'in', seq: 1, kind: 'close' }, frameKey(params, opened.daemonNonce, 'out')));
