@@ -47,8 +47,8 @@ jobs:
             fail-fast: true
             matrix:
                 include:
-                    - { runner: macos-14, platform: darwin-arm64, arch: arm64 }
-                    - { runner: macos-14, platform: darwin-x64, arch: x86_64 }
+                    - { runner: macos-15, platform: darwin-arm64, arch: arm64 }
+                    - { runner: macos-15, platform: darwin-x64, arch: x86_64 }
                     - { runner: windows-latest, platform: win32-x64, arch: x64 }
         runs-on: ${{ matrix.runner }}
         timeout-minutes: 20
