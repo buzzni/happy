@@ -128,8 +128,8 @@ export async function startHostOwnerContact<Broker>(input: {
     const host = await startSessionOwnerContactHost({ enabled: true, session: input.session, hostPid: input.hostPid,
         live: () => !closed, capability, issue: input.issue, current: input.current, token: input.token, fetch: input.fetch });
     const identity = host ? identityAuthority(input, host.binding, host.trust) : undefined;
-    const broker = await startBroker(host && host.binding.depth > 0 ? brokerEntryPolicy(host, 'broker') : host?.contact, identity);
-    const socketContact = host && (broker ? brokerEntryPolicy(host, 'chat-socket') : host.contact);
+    const broker = await startBroker(host && host.binding.depth > 0 ? hostEntryPolicy(host, 'broker') : host?.contact, identity);
+    const socketContact = host && (broker ? hostEntryPolicy(host, 'chat-socket') : host.contact);
     const local = socketContact ? await startSessionOwnerContactLocal({ enabled: true, contact: socketContact }).catch(() => null) : null;
     const address = local?.environment.SAYCODE_OWNER_CONTACT_SOCKET;
     if (address) input.env.SAYCODE_OWNER_CONTACT_SOCKET = address;
@@ -169,7 +169,7 @@ const OWNED_CHILD_OPERATIONS = new Set(['spawn-owned-child', 'owned-child-status
  * naming exactly its own session (the owned-grandchild source check, D4 follow-up (a)) go to main.
  * The chat socket beside a broker takes only chat verbs: agent commands keep the broker IPC, owned
  * children stay a broker reservation. It never revokes the binding the broker still uses. */
-function brokerEntryPolicy(host: OwnerContactHost, via: 'broker' | 'chat-socket'): SessionOwnerContact {
+function hostEntryPolicy(host: OwnerContactHost, via: 'broker' | 'chat-socket'): SessionOwnerContact {
     const nested = host.binding.depth > 0;
     return { close: via === 'broker' ? () => host.contact.close() : () => {},
         call: async raw => {
