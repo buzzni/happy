@@ -281,6 +281,8 @@ export const MachineMetadataSchema = z.object({
    * 클라이언트는 이 필드를 보고 나서만 `attemptId` 를 보낸다.
    */
   writeFileAttempt: z.object({ version: z.literal(1) }).optional(),
+  /** This daemon serves `listFilesPage` (aplus-dev-studio specs/remote-file-list-pages). */
+  listFilesPage: z.object({ version: z.literal(1) }).optional(),
   /** Profile-based no-shell execution negotiated by Desktop extensions. */
   machineRun: z.object({
     protocolVersion: z.literal(1),
