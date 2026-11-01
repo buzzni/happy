@@ -4,10 +4,7 @@ import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_C
 import { configuration } from '@/configuration';
 import {
     ApiMachineClient,
-    PREVIEW_BOUND_WS_OPEN_EVENT,
-    PREVIEW_VIEWER_BOUND_PROXY_EVENT,
-    PREVIEW_VIEWER_BOUND_WS_OPEN_EVENT,
-    PREVIEW_VIEWER_RUNTIME_LEASE_EVENT,
+    PREVIEW_BOUND_PROXY_EVENT,
 } from './apiMachine';
 import { addDaemonTerminalSession, getDaemonTerminalSession, markDaemonTerminalSessionExited, removeDaemonTerminalSession } from '@/daemon/daemonTerminalSessions';
 import { deriveServerRpcKey, decodeBase64, decrypt, encodeBase64, encrypt } from './encryption';
@@ -365,17 +362,32 @@ describe('ApiMachineClient socket reconnection', () => {
             expect(getDaemonTerminalSession(sessionId)).toBeNull();
         });
 
-        it.each([
-            'proxy-ws-open',
-            PREVIEW_BOUND_WS_OPEN_EVENT,
-            PREVIEW_VIEWER_BOUND_PROXY_EVENT,
-            PREVIEW_VIEWER_BOUND_WS_OPEN_EVENT,
-            PREVIEW_VIEWER_RUNTIME_LEASE_EVENT,
-        ])('settles %s', async (event) => {
+        // Every listener that takes an ack, not a copied list: one added later without the
+        // guard is caught here (the first version of this fix missed three).
+        it('settles every acked listener it registers', async () => {
             const client = new ApiMachineClient('fake-token', makeMachine());
             client.connect();
+            const acked = Object.entries(socketHandlers)
+                .flatMap(([event, handlers]) => handlers.filter((handler) => handler.length >= 2).map((handler) => [event, handler] as const));
 
-            await expect(Promise.resolve(socketHandlers[event]![0]!({ port: 3000 }))).resolves.toBeUndefined();
+            expect(acked.map(([event]) => event)).toEqual(expect.arrayContaining([
+                'proxy-http-request', PREVIEW_BOUND_PROXY_EVENT, 'preview-runtime-lease', 'proxy-ws-open', 'terminal-open-fwd',
+            ]));
+            for (const [event, handler] of acked) {
+                await expect(Promise.resolve(handler({ port: 3000 })), event).resolves.toBeUndefined();
+            }
+        });
+
+        it('logs a listener that fails instead of rejecting', async () => {
+            vi.spyOn(ApiMachineClient.prototype as any, 'relayPreviewHttp').mockRejectedValue(new Error('relay broke'));
+            const client = new ApiMachineClient('fake-token', makeMachine());
+            client.connect();
+            const ack = vi.fn();
+
+            await expect(socketHandlers['proxy-http-request']![0]!({ port: 3000 }, ack)).resolves.toBeUndefined();
+
+            expect(ack).not.toHaveBeenCalled();
+            expect(vi.mocked(logger.debug)).toHaveBeenCalledWith('[API MACHINE] proxy-http-request listener failed: relay broke');
         });
     });
 
