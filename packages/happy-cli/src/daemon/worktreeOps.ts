@@ -146,7 +146,10 @@ function terminateProcessTree(child: ChildProcess): void {
 
 /** A sealed credential, opened: a private askpass that answers git's prompts from its env. */
 export type PreparedGitCredential = {
-    /** Turns off the machine's helpers so the sealed credential is the one git uses. */
+    /**
+     * Turns off the machine's helpers so the sealed credential is the one git uses, and plain http so
+     * it never goes out in the clear, whatever address `origin` holds (workspace-sync-strict-design.md §4-1).
+     */
     config: string[];
     env: NodeJS.ProcessEnv;
     dispose(): Promise<void>;
@@ -167,7 +170,7 @@ export async function prepareGitCredential(credential: { username: string; token
     const askpass = join(dir, 'askpass.sh');
     await writeFile(askpass, ASKPASS_SCRIPT, { mode: 0o700 });
     return {
-        config: ['-c', 'credential.helper='],
+        config: ['-c', 'credential.helper=', '-c', 'protocol.http.allow=never'],
         env: {
             GIT_ASKPASS: askpass,
             SSH_ASKPASS: askpass,
@@ -1254,6 +1257,9 @@ async function pullWorkspaceRemote(
         const head = await headCommit(dir);
         // The browser showed the user this head; anything since is the user's to look at first.
         if (head !== params.expectedHead) return { status: 'head-moved', head, conflictCount: 0 };
+        // A conflict an earlier pull left is the user's to resolve: committing it would save the markers.
+        const unresolved = await unmergedPaths(dir);
+        if (unresolved.length > 0) return { status: 'conflict', head, conflictCount: unresolved.length };
         const targets = [(await fetchBranch(dir, 'origin', params.branch, credential, false))!];
         if (params.baseBranch) targets.push((await fetchBranch(dir, 'origin', params.baseBranch, credential, false))!);
         return params.mode === 'ff-only'
