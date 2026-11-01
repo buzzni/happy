@@ -421,15 +421,27 @@ describe('host owner-contact wiring (startHappyServer)', () => {
             expect(h.lookups.length).toBeGreaterThan(0);
         } finally { await started.close(); }
     });
-    it.skipIf(process.platform === 'win32')('never takes steer on a direct host socket, at any depth or entry, and keeps its abort [T1s-S2]', async () => {
+    // An agent-entry abort is the sibling stop (Desktop amendment S1/S2): the same depth 0 broker range as steer.
+    it.skipIf(process.platform === 'win32')('never takes steer or an agent-entry abort on a direct host socket, and keeps the chat abort [T1s-S2]', async () => {
         const h = harness(), w = wiring(h);
         const started = await w.start();
         try {
             h.register((await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller);
             const socket = w.env.SAYCODE_OWNER_CONTACT_SOCKET!;
             for (const entry of ['agent', 'chat']) expect((await post(socket, { ...steer, entry })).status).toBe(503);
+            expect((await post(socket, abort)).status).toBe(503);
             expect(h.lookups).toEqual([]);
-            await post(socket, abort);
+            await post(socket, { ...abort, entry: 'chat' });
+            expect(h.lookups.length).toBeGreaterThan(0);
+        } finally { await started.close(); }
+    });
+    it.skipIf(process.platform === 'win32')('passes an agent-entry abort from a depth 0 broker only [T1s-S2]', async () => {
+        const h = harness(), w = wiring(h, { broker: true });
+        const started = await w.start();
+        try {
+            const contact = (w.startBroker.mock.calls[0] as unknown[])[0] as { call(raw: unknown): Promise<unknown> };
+            h.register((await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller);
+            await contact.call(abort).catch(() => undefined);
             expect(h.lookups.length).toBeGreaterThan(0);
         } finally { await started.close(); }
     });
