@@ -28,7 +28,7 @@ import * as tmp from 'tmp';
 import axios from 'axios';
 import * as z from 'zod';
 import { WRITE_FILE_ATTEMPT_CAPABILITY } from '@/modules/common/writeFileAttempts';
-import { AUTOMATION_PROTOCOL_VERSION, PROJECT_PURGE_CAPABILITY, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKTREE_OPS_CAPABILITY } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, PROJECT_PURGE_CAPABILITY, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKSPACE_SYNC_CAPABILITY, WORKTREE_OPS_CAPABILITY } from '@slopus/happy-wire';
 import { createHash, randomUUID } from 'node:crypto';
 import { createScriptAutomationWorker, ScriptRequestError } from './automations/scriptAutomationWorker';
 import { prepareManagedScriptRuntime, probeManagedScriptEngine, recoverManagedScriptContainers } from './automations/managedScriptRuntime';
@@ -447,6 +447,7 @@ export const initialMachineMetadata: MachineMetadata = {
   sealedSpawnEnv: SEALED_SPAWN_ENV_CAPABILITY,
   worktreeOps: WORKTREE_OPS_CAPABILITY,
   projectPurge: PROJECT_PURGE_CAPABILITY,
+  workspaceSync: WORKSPACE_SYNC_CAPABILITY,
   ...(agentBrowserMachineCapability() ? { agentBrowser: agentBrowserMachineCapability() } : {}),
   ...(toolPolicyMachineCapability(process.env) ? { toolPolicy: toolPolicyMachineCapability(process.env) } : {}),
   ...(orgRequirementsMachineCapability(process.env) ? { orgRequirements: orgRequirementsMachineCapability(process.env) } : {}),
