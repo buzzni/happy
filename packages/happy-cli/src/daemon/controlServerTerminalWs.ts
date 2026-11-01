@@ -443,12 +443,14 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
           // terminal-binding-strict-design §4-6: a v2 terminal is taken back only with an attach
           // sealed with its in key, in order — the machine key alone does not reach it.
           const opened = binding.openIn(data.params);
-          if (opened.kind === 'gap' && exitOf(boundTerminal) === null) {
+          // A connection of its own carries the attach, so nothing reorders it: one that is ahead is a hole.
+          if ((opened.kind === 'gap' || opened.kind === 'held') && exitOf(boundTerminal) === null) {
             binding.closeReason ??= 'input-gap';
             boundTerminal.closing = true;
             void boundTerminal.pty.terminate();
           }
-          if (opened.kind !== 'frame' || opened.frame.kind !== 'attach') {
+          const attach = opened.kind === 'frames' ? opened.frames[0] : null;
+          if (attach?.kind !== 'attach') {
             logger.debug(`[LOCAL-DIRECT-TERMINAL] bound attach refused session=${sessionId} reason=${opened.kind}`);
             refuseAttach(sessionId, reqId);
             return;
@@ -468,8 +470,8 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
             sessionId,
             entry: boundTerminal.entry,
             binding,
-            rid: opened.frame.rid,
-            afterSeq: opened.frame.afterSeq,
+            rid: attach.rid,
+            afterSeq: attach.afterSeq,
             sendSealed: (sealed) => sendOn(ws, { data: { event: 'terminal-frame', sessionId, data: sealed } }),
             sendClosed: () => { if (boundTerminal.ws === ws) sendClosed(boundTerminal); },
           });
