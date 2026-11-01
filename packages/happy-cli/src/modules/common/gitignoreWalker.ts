@@ -166,13 +166,15 @@ async function walkDir(
     }
 
     for (const [i, { entry, entryRel, entryAbs, isDir }] of kept.entries()) {
-        statAhead(i)
         if (isDir) {
             if (opts.onDirectory) await opts.onDirectory(entryAbs, entryRel)
             if (opts.maxDepth === undefined || depth < opts.maxDepth) {
                 if (!await walkDir(entryAbs, entryRel, localCtx, opts, depth + 1)) return false
             }
         } else if (entry.isFile() && opts.onFile) {
+            // Only from a file: a walk that stops inside a subdirectory never needs
+            // this directory's later files.
+            statAhead(i)
             const stats: Stats | null = await fileStats[i]
             if (!stats) continue
             if (await opts.onFile(entryAbs, entryRel, stats) === false) return false
