@@ -30,8 +30,8 @@ function post(socketPath: string, body: unknown) {
 }
 const b64 = (bytes: Uint8Array) => Buffer.from(bytes).toString('base64url');
 /** The daemon spawn path: returns the capability the host would read from its private pipe. */
-async function launchCapability(launches: ReturnType<typeof createAgentCallerLaunches>, pid: number) {
-    const prepared = launches.prepareLaunch({ cwd: '/project' });
+async function launchCapability(launches: ReturnType<typeof createAgentCallerLaunches>, pid: number, agentEnvironment?: TrackedSession['agentEnvironment']) {
+    const prepared = launches.prepareLaunch({ cwd: '/project', agentEnvironment });
     if (!prepared) return null;
     const { environment } = prepared.stdio(['ignore', 'ignore', 'ignore']);
     const pipe = new PassThrough(), chunks: Buffer[] = [];
@@ -41,14 +41,14 @@ async function launchCapability(launches: ReturnType<typeof createAgentCallerLau
     await new Promise(resolve => pipe.once('finish', resolve));
     return JSON.parse(Buffer.concat(chunks).toString()).capability as string;
 }
-function harness(options: { enabled?: boolean; daemonEnabled?: boolean; depth?: string } = {}) {
+function harness(options: { enabled?: boolean; daemonEnabled?: boolean; identityOnly?: boolean; depth?: string } = {}) {
     const server = nacl.sign.keyPair(), desktop = nacl.sign.keyPair();
     const now = Date.now();
     let pid = 42, alive = true, sessionLive = true;
     const issued: unknown[] = [], lookups: Array<{ url: string; body: unknown; auth: string | null }> = [], sends: unknown[] = [];
     let contact: OwnershipRelayContact | null = null;
     let identity: { machineId: string; happyAccountId: string; epoch: string } | null = { machineId: 'machine', happyAccountId: 'account', epoch: 'e1' };
-    const launches = createAgentCallerLaunches({ enabled: options.daemonEnabled ?? true,
+    const launches = createAgentCallerLaunches({ enabled: options.daemonEnabled ?? true, identityOnly: options.identityOnly,
         identity: async () => identity,
         trust: () => ({ issuer: fixture.contact.issuer, audience: fixture.contact.audience,
             publicKeys: { [fixture.contact.keyId]: b64(server.publicKey) }, lookupOrigin: 'https://studio.example' }),
@@ -382,11 +382,11 @@ describe('host owner-contact wiring (startHappyServer)', () => {
     });
 });
 describe('broker identity authority (Desktop identity-adapter-plan H-C, D2)', () => {
-    const wire = (h: ReturnType<typeof harness>, options: { switchOn: boolean; managed?: boolean }) => {
+    const wire = (h: ReturnType<typeof harness>, options: { switchOn: boolean; managed?: boolean; agentEnvironment?: TrackedSession['agentEnvironment'] }) => {
         const env: NodeJS.ProcessEnv = options.switchOn ? { HAPPY_OWNER_CONTACT_V1: '1' } : {};
         const startBroker = vi.fn(async (_contact: unknown, _identity?: unknown) => ({ ok: true }));
         const session = { ...h.session, getManagedOrigin: () => options.managed ? 'https://managed.example' : null };
-        return { startBroker, start: () => startHostOwnerContact({ env, session, hostPid: 42, capability: async () => launchCapability(h.launches, h.pid()),
+        return { startBroker, start: () => startHostOwnerContact({ env, session, hostPid: 42, capability: async () => launchCapability(h.launches, h.pid(), options.agentEnvironment),
             current: h.current, issue: async report => { h.issued.push(report); return h.issue(report); }, token: async () => 'happy-token',
             fetch: h.fetcher, happyOrigin: fixture.contact.audience, startBroker }) };
     };
@@ -398,6 +398,17 @@ describe('broker identity authority (Desktop identity-adapter-plan H-C, D2)', ()
         expect(contact).toBeUndefined();
         // It asks Studio for this machine's descriptor with the host token; the fixture answers no descriptor, so unknown.
         expect((await identity.inspect('target')).relation).toBe('unknown');
+        expect(h.lookups[0]).toMatchObject({ url: 'https://studio.example/api/v2/machines/machine/agent-identity', auth: 'Bearer happy-token' });
+        await started.close();
+    });
+    it('gives a root agent host, the host shape that runs a broker, the identity authority from a daemon in identity-only mode', async () => {
+        const h = harness({ daemonEnabled: false, identityOnly: true });
+        const w = wire(h, { switchOn: false, agentEnvironment: { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/project', SAYCODE_AGENT_DEPTH: '0' } });
+        const started = await w.start();
+        const [contact, identity] = w.startBroker.mock.calls[0] as [unknown, { inspect(id: string): Promise<{ relation: string }> } | undefined];
+        expect(contact).toBeUndefined();
+        expect(identity).toBeDefined();
+        await identity!.inspect('target');
         expect(h.lookups[0]).toMatchObject({ url: 'https://studio.example/api/v2/machines/machine/agent-identity', auth: 'Bearer happy-token' });
         await started.close();
     });

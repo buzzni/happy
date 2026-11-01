@@ -127,7 +127,9 @@ export function createAgentCallerLaunches(deps: {
             const trust = deps.trust();
             if (!trust) throw new Error('owner-contact-unconfigured');
             launch(report.sessionId, report.hostPid, false);
-            if (record.depth === null) throw new Error('caller-lineage-unknown');
+            // Owner contact needs a lineage the daemon can vouch for. An identity-only binding feeds only the broker's
+            // same-account check (machine, account, epoch), and a broker runs only in an agent-grant host, whose depth is unknown here.
+            if (record.depth === null && deps.enabled) throw new Error('caller-lineage-unknown');
             // An owned child binds only itself, with its own key: never its parent's session or contact key.
             if (record.owned && report.sessionId !== record.owned.sessionId) throw new Error('caller-not-running');
             unique(report, record.owned);
@@ -137,7 +139,8 @@ export function createAgentCallerLaunches(deps: {
             unique(report, record.owned);
             const caller = OwnershipCallerBindingSchema.parse({ callerBindingId: randomUUID(), sessionId: report.sessionId,
                 runtimeId: report.runtimeId, machineId: identity.machineId, happyAccountId: identity.happyAccountId,
-                scope: realpath(record.cwd), depth: record.depth, hostEpoch: randomUUID(), callerPublicKey: report.callerPublicKey });
+                // Null only for identity-only: query and currentCaller refuse while owner contact is off, so nothing reads it.
+                scope: realpath(record.cwd), depth: record.depth ?? 0, hostEpoch: randomUUID(), callerPublicKey: report.callerPublicKey });
             bound.set(report.sessionId, { pid: report.hostPid, caller, identity });
             return { caller: { ...caller }, trust };
         },

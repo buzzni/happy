@@ -285,6 +285,15 @@ describe('identity-only caller bindings (Desktop identity-adapter-plan D2)', () 
         end();
         expect(await launches.current({ sessionId: 'source', callerBindingId: issued.caller.callerBindingId })).toEqual({ current: false });
     });
+    it('issues the identity binding to a root agent host, the only host shape that runs a broker', async () => {
+        const rootAgent = { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/project', SAYCODE_AGENT_DEPTH: '0' };
+        const { launches } = build(true);
+        const host = await spawnHost(launches, 42, { agentEnvironment: rootAgent });
+        const issued = await launches.issue({ sessionId: 'source', runtimeId: 'actual-runtime', hostPid: 42, callerPublicKey: key(), capability: host.capability! });
+        expect(issued.caller).toMatchObject({ sessionId: 'source', machineId: 'machine', happyAccountId: 'account' });
+        await expect(launches.query({ sessionId: 'source', nonce })).rejects.toThrow('caller-unavailable');
+        expect(await launches.currentCaller('source')).toBeNull();
+    });
     it('opens no launch pipe when neither switch is on', async () => {
         const { launches } = build(false);
         expect(launches.prepareLaunch({ cwd: '/project' })).toBeNull();
