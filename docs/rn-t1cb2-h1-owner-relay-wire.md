@@ -23,6 +23,7 @@ operation별 strict union이다. 새로운 verb·RPC method·실행 파일·bear
 | abort-own-turn | sessionId, runtimeId | control |
 | spawn-owned-child | operationId, spawnId, childAgentId, spawnDigest, spawnOptions | childSpawn |
 | owned-child-status | operationId, spawnId, spawnDigest | childSpawn |
+| steer-own-session | sessionId, runtimeId, text (T1s 2단계, 추가 전용) | control |
 
 read/prompt/control의 targetSessionId, prompt의 localId는 필수다. 중복 sessionId와
 hubPrompt target은 외부 target과 일치해야 한다. 다른 operation의 payload/결과 필드,
@@ -219,3 +220,26 @@ UTF-16 정렬 JSON 생성기로 했고, 같은 생성기가 기존 8개 벡터�
 검증: 신규 `[D2pre-G]` 18건(schema 14, 서명 4). 구현 전 7건 실패(나머지는 strict 거부라 원래 통과). target refine을
 되돌리면 "다른 target 거부" 1건이 실패한다. 기존 receipt 결속 테스트(`another target/child (1)`)는 guard target도
 함께 옮겨 schema refine이 아니라 요청 결속 검사로 실패하는지 계속 확인한다. 관련 5파일 203건 통과, typecheck 통과.
+
+
+## T1s 2단계 — `steer-own-session` (2026-11-01)
+
+Desktop `specs/reason-network-adoption/sibling-steer-stop-amendment.md` S3 2단계(2026-10-31 승인). 회사 PC(confirmed owner)
+depth 0 broker 허브가 소유가 증명된 형제에게 방향 수정(steer)을 보낼 수 있게 owner-relay-v1에 operation 하나를 **추가만** 했다.
+기존 8개 operation의 payload·결과·서명 규칙은 바뀌지 않았다. 구 수신자는 strict union이라 이 operation을 모르는 값으로 거부한다
+(fail-closed). 형제 stop은 기존 `abort-own-turn`을 쓴다.
+
+- 요청 payload `{sessionId, runtimeId, text}`. 기존 session `steer` RPC가 받는 인자는 `{ text }` 하나다(Desktop
+  `cli/io/agentControlRuntime.ts`, `src/sync/sessionCreation.ts`). `sessionId`는 다른 control operation처럼 target과 같아야 하고,
+  `runtimeId`는 abort처럼 read로 관측한 runtime에 묶는다(main은 그 runtime이 아니면 보내지 않는다). `text`는 빈 문자열을 거부하고
+  크기는 prompt와 같은 기준(서명 필드 포함 canonical 요청 전체 65536 bytes)이다. localId·settings·mode 같은 추가 필드는 없다.
+- 응답 결과는 기존 control 모양 `{sessionId, runtimeId, state, reason?}`. accepted는 runtime이 있어야 하고, 응답 결속은 abort처럼
+  `control.sessionId === targetSessionId`와 `runtimeId`가 null이거나 요청 runtime과 같아야 한다. accepted는 RPC 수락이지 전달 확인이 아니다.
+- golden fixture: vectors[9](confirmed source, `entry:'agent'`, 한글 text, accepted)를 추가했다. 0–8번은 byte 그대로다. 생성은
+  happy-wire를 import하지 않는 Node crypto Ed25519/SHA-256 + UTF-16 정렬 JSON 생성기로 했고, 같은 생성기가 기존 9개 벡터를
+  byte 단위로 재현하는지 먼저 확인했다.
+
+검증: `[T1s-S2]` 신규 8건(schema 5: payload 필드·target 결속·빈 text/runtime·64KiB 경계·control 전용 결과, 서명 3: 다른 runtime
+receipt 거부·text의 intent 결속·abort receipt 거부)과 기존 vector 순회·receipt 결속·accepted runtime 표에 steer를 더했다. 구현 전
+11건 실패. 응답 결속에서 steer의 runtime 비교를 빼면 "다른 runtime receipt 거부"가 실패한다. 관련 2파일 163건, `pnpm run build`
+(tsc 포함) 통과.

@@ -161,3 +161,51 @@ describe('read snapshot promptGuard observation [D2pre-G]', () => {
       payload: { ...payload, hubPrompt: guard } }).success).toBe(true);
   });
 });
+
+// T1s stage 2: an additive operation. Old receivers refuse it as an unknown operation (strict union).
+describe('[T1s-S2] steer-own-session wire', () => {
+  const steer = () => copy(fixture.vectors[9]) as any;
+  it('carries only the steer RPC input bound to the read runtime', () => {
+    const v = steer();
+    expect(v.request.operation).toBe('steer-own-session');
+    expect(Object.keys(v.request.payload).sort()).toEqual(['runtimeId', 'sessionId', 'text']);
+    for (const key of ['sessionId', 'runtimeId', 'text']) {
+      const r = steer(); delete r.request.payload[key];
+      expect(OwnerRelayRequestSchema.safeParse(r.request).success).toBe(false);
+    }
+    for (const extra of [{ localId: 'l' }, { mode: 'force' }, { settings: {} }, { hubPrompt: null }]) {
+      expect(OwnerRelayRequestSchema.safeParse({ ...v.request, payload: { ...v.request.payload, ...extra } }).success).toBe(false);
+    }
+  });
+  it('requires a target that the payload session names', () => {
+    const v = steer();
+    const { targetSessionId, ...noTarget } = v.request;
+    expect(OwnerRelayRequestSchema.safeParse(noTarget).success).toBe(false);
+    expect(OwnerRelayRequestSchema.safeParse({ ...v.request, targetSessionId: 'another' }).success).toBe(false);
+  });
+  it('refuses empty text and a runtime the steer cannot be bound to', () => {
+    const v = steer();
+    expect(OwnerRelayRequestSchema.safeParse({ ...v.request, payload: { ...v.request.payload, text: '' } }).success).toBe(false);
+    expect(OwnerRelayRequestSchema.safeParse({ ...v.request, payload: { ...v.request.payload, runtimeId: null } }).success).toBe(false);
+    expect(OwnerRelayRequestSchema.safeParse({ ...v.request, payload: { ...v.request.payload, runtimeId: '' } }).success).toBe(false);
+  });
+  it.each(['a', '한'])('bounds the text by the same 64KiB complete request as prompt (%s)', character => {
+    const bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length;
+    const v = steer();
+    v.request.payload.text = '';
+    const room = 65536 - bytes({ ...v.request, payload: { ...v.request.payload, text: 'x' } }) + 1;
+    const unit = new TextEncoder().encode(character).length;
+    v.request.payload.text = character.repeat(Math.floor(room / unit));
+    expect(OwnerRelayRequestSchema.safeParse(v.request).success).toBe(true);
+    v.request.payload.text += 'x'.repeat(unit);
+    expect(OwnerRelayRequestSchema.safeParse(v.request).success).toBe(false);
+  });
+  it('answers with control only, never storage or another result field', () => {
+    const v = steer();
+    expect(OwnerRelayReplySchema.safeParse({ ...v.reply, storage: fixture.vectors[2].reply.storage }).success).toBe(false);
+    const { control, ...rest } = v.reply;
+    expect(OwnerRelayReplySchema.safeParse(rest).success).toBe(false);
+    expect(OwnerRelayReplySchema.safeParse({ ...v.reply, control: { ...control, permissionId: 'p' } }).success).toBe(false);
+    for (const result of ['not_owned', 'unavailable', 'unknown']) expect(OwnerRelayReplySchema.safeParse({ ...rest, result }).success).toBe(true);
+  });
+});

@@ -57,8 +57,8 @@ function resultMatches(r: OwnerRelayReply, q: OwnerRelayRequest): boolean {
         case 'lookup-readable-sessions': return q.operation === r.operation && r.owners.every(row => q.payload.sessionIds.includes(row.sessionId));
         case 'read-session': return q.operation === r.operation && r.sessionView.sessionId === q.targetSessionId && r.sessionView.events.length <= q.payload.limit;
         case 'prompt-own-session': return q.operation === r.operation && r.storage.localId === q.localId;
-        case 'resume-own-session': case 'abort-own-turn': return q.operation === r.operation && r.control.sessionId === q.targetSessionId
-            && (q.operation !== 'abort-own-turn' || r.control.runtimeId === null || r.control.runtimeId === q.payload.runtimeId);
+        case 'resume-own-session': case 'abort-own-turn': case 'steer-own-session': return q.operation === r.operation && r.control.sessionId === q.targetSessionId
+            && (q.operation === 'resume-own-session' || r.control.runtimeId === null || r.control.runtimeId === q.payload.runtimeId);
         case 'reply-own-permission': return q.operation === r.operation && r.control.sessionId === q.targetSessionId
             && (r.control.runtimeId === null || r.control.runtimeId === q.payload.runtimeId) && r.control.permissionId === q.payload.permissionId;
         case 'spawn-owned-child': case 'owned-child-status': return q.operation === r.operation
