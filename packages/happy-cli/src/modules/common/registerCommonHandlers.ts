@@ -218,8 +218,8 @@ interface GetDirectoryTreeRequest {
 interface ListFilesPageRequest {
     path: string;
     maxDepth: number;
-    /** relPath of the last entry of the previous page. */
-    cursor?: string;
+    /** relPath of the last entry of the previous page; null or absent for the first page. */
+    cursor?: string | null;
     limit?: number;
 }
 
@@ -1264,18 +1264,25 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         if (!validation.valid) {
             return { success: false, error: validation.error };
         }
-        if (data.maxDepth < 0) {
-            return { success: false, error: 'maxDepth must be non-negative' };
+        if (!Number.isSafeInteger(data.maxDepth) || data.maxDepth < 0) {
+            return { success: false, error: 'maxDepth must be a non-negative integer' };
         }
         const limit = data.limit ?? LIST_FILES_PAGE_DEFAULT_LIMIT;
         if (!Number.isSafeInteger(limit) || limit < 1 || limit > LIST_FILES_PAGE_MAX_LIMIT) {
             return { success: false, error: `limit must be an integer between 1 and ${LIST_FILES_PAGE_MAX_LIMIT}` };
         }
+        // The answer carries `nextCursor: null` on the last page; a client echoing it back
+        // means the first page.
+        const cursor = data.cursor ?? undefined;
+        if (cursor !== undefined && typeof cursor !== 'string') {
+            return { success: false, error: 'cursor must be a string' };
+        }
         const root = validation.resolvedPath!;
         try {
-            // Same answer as getDirectoryTree for a root it cannot read, which callers
-            // read as "the workspace is not on this machine".
-            await stat(root);
+            // Same answer as getDirectoryTree for a root it cannot read, which callers read as
+            // "the workspace is not on this machine". readdir rather than stat: the walk
+            // swallows a directory it cannot list, which at the root would be an empty success.
+            await readdir(root);
         } catch {
             return { success: false, error: 'Failed to access the specified path' };
         }
@@ -1291,7 +1298,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
                 root,
                 presetMatcher: directoryIgnoreMatcher,
                 maxDepth: data.maxDepth - 1,
-                after: data.cursor,
+                after: cursor,
                 // One past the page tells whether another page follows.
                 onFile: (absPath, relPath, stats) => {
                     entries.push({ relPath, absPath, size: stats.size, modified: stats.mtime.getTime() });
