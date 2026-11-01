@@ -8,9 +8,13 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { worktreeOpMethod, type WorktreeOp } from '@slopus/happy-wire';
+import { GIT_CREDENTIAL_SEAL_KEY_LABEL, worktreeOpMethod, type WorktreeOp } from '@slopus/happy-wire';
+import { deriveServerRpcKey } from '@/api/encryption';
+import { sealForMachine } from '@/modules/common/machineSeal';
 import { createWorktreeOpsHandlers } from './worktreeOps';
 
 const machine = { id: 'm1', encryptionKey: new Uint8Array(32).fill(7), encryptionVariant: 'dataKey' as const };
@@ -37,13 +41,16 @@ function commitAll(dir: string, message: string) {
     git(dir, 'commit', '--quiet', '-m', message);
 }
 
-async function call(op: WorktreeOp, params: Record<string, unknown>) {
+async function call(op: WorktreeOp, params: Record<string, unknown>, sealCredential = false) {
     const handlers = createWorktreeOpsHandlers({ machine: () => machine, allowedRoot: root, happyHomeDir: home, now: () => NOW });
     const ticket = {
         v: 1, opId: randomBytes(16).toString('base64'), op, projectId: 'p1', machineId: 'm1',
         issuedAt: NOW - 1000, expiresAt: NOW + 60_000, params,
     };
-    return (handlers as Record<string, (request: unknown) => Promise<any>>)[worktreeOpMethod(op)]!({ ticket });
+    const sealedCredential = sealCredential ? sealForMachine(deriveServerRpcKey(machine.encryptionKey), GIT_CREDENTIAL_SEAL_KEY_LABEL, {
+        v: 1, purpose: 'git-credential', machineId: 'm1', opId: ticket.opId, username: 'x-access-token', token: 'ghs_secret_value',
+    }) : undefined;
+    return (handlers as Record<string, (request: unknown) => Promise<any>>)[worktreeOpMethod(op)]!({ ticket, sealedCredential });
 }
 
 function pins(): unknown {
@@ -120,6 +127,28 @@ describe('workspace:remote-status', () => {
         expect(await call('remote-status', status())).toMatchObject({ success: false, errorCode: 'WORKSPACE_NO_REMOTE' });
     });
 
+    it('never sends a sealed credential to an http origin, even when the server named https', async () => {
+        const authorizations: string[] = [];
+        const server = createServer((request, response) => {
+            authorizations.push(request.headers.authorization ?? '');
+            response.writeHead(401, { 'WWW-Authenticate': 'Basic realm="git"' });
+            response.end();
+        });
+        await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+        try {
+            const address = `127.0.0.1:${(server.address() as AddressInfo).port}/acme/app.git`;
+            git(repo, 'remote', 'set-url', 'origin', `http://${address}`);
+            expect(await call('remote-status', status({ remoteUrl: `https://${address}` }), true)).toMatchObject({ success: false });
+            expect(await call('pull-remote', {
+                workspaceDir: repo, remoteUrl: `https://${address}`, branch: 'main', baseBranch: null, mode: 'ff-only',
+                expectedHead: git(repo, 'rev-parse', 'HEAD'), push: true,
+            }, true)).toMatchObject({ success: false });
+            expect(authorizations.filter(Boolean)).toEqual([]);
+        } finally {
+            await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+        }
+    });
+
     it('refuses once origin no longer names the repository first connected here', async () => {
         writeFileSync(join(home, 'workspace-remotes.json'), JSON.stringify({ v: 1, workspaces: { [repo]: { workspace: 'github.com/acme/first' } } }));
         expect(await call('remote-status', status())).toMatchObject({ success: false, errorCode: 'WORKSPACE_REMOTE_NOT_PINNED', pinned: 'github.com/acme/first' });
@@ -184,6 +213,18 @@ describe('workspace:pull-remote', () => {
         write(repo, 'README.md', 'mine\n');
         expect((await call('pull-remote', pull({ mode: 'merge' }))).result).toMatchObject({ status: 'conflict', conflictCount: 1 });
         expect(readFileSync(join(repo, 'README.md'), 'utf8')).toContain('<<<<<<<');
+    });
+
+    it('does not commit an unresolved conflict when pulled again', async () => {
+        pushOnline('README.md', 'theirs\n');
+        write(repo, 'README.md', 'mine\n');
+        await call('pull-remote', pull({ mode: 'merge' }));
+        const head = git(repo, 'rev-parse', 'HEAD');
+        for (const mode of ['merge', 'ff-only']) {
+            expect((await call('pull-remote', pull({ mode, expectedHead: head }))).result).toEqual({ status: 'conflict', head, conflictCount: 1 });
+        }
+        expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
+        expect(git(repo, 'show', 'HEAD:README.md')).toBe('mine');
     });
 
     it('answers a folder that is not a repository of its own', async () => {
