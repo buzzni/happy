@@ -15,6 +15,7 @@ import { createAiCredentialRuntime } from '@/daemon/aiCredentialRuntime';
 import { TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
 import { MOAI_MANAGED_TOOL } from '@/modules/common/moaiMachineRunProfiles';
 import { WRITE_FILE_ATTEMPT_CAPABILITY } from '@/modules/common/writeFileAttempts';
+import { LIST_FILES_PAGE_CAPABILITY } from '@/modules/common/listFilesPageCapability';
 import { McpCallerGrantEnvelopeConsumer } from '@/daemon/mcpCallerGrantEnvelope';
 import { join } from 'node:path';
 
@@ -1475,6 +1476,30 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
+    // aplus-dev-studio specs/remote-file-list-pages — the web picks listFilesPage only on a
+    // daemon that says it serves it; an older daemon answers only after the reconnect grace.
+    it('advertises listFilesPage on a machine registered before the advertisement existed', async () => {
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            if (event === 'machine-update-state') {
+                return { result: 'success', version: 1, daemonState: data.daemonState };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        expect(machine.metadata?.listFilesPage).toBeUndefined();
+        const client = new ApiMachineClient('fake-token', machine);
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.listFilesPage).toEqual(LIST_FILES_PAGE_CAPABILITY));
+
+        client.shutdown();
+    });
+
     // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 — the web starts a strict machine's
     // preview with a sealed env only on a daemon that says it opens one. An existing machine keeps
     // its first metadata, so the advertisement has to be republished; only a machine key opens it.
@@ -1630,6 +1655,7 @@ describe('ApiMachineClient socket reconnection', () => {
             channelSupport: CHANNEL_SUPPORT_CAPABILITY,
             aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
             writeFileAttempt: WRITE_FILE_ATTEMPT_CAPABILITY,
+            listFilesPage: LIST_FILES_PAGE_CAPABILITY,
         };
         const client = new ApiMachineClient('fake-token', machine);
         client.setRPCHandlers({
@@ -1645,6 +1671,7 @@ describe('ApiMachineClient socket reconnection', () => {
             expect(machine.metadata?.aiAuthSelection).toBeUndefined();
             // Managed runtimes do not serve `writeFile`, so nothing there answers an attempt.
             expect(machine.metadata?.writeFileAttempt).toBeUndefined();
+            expect(machine.metadata?.listFilesPage).toBeUndefined();
         });
         client.shutdown();
     });

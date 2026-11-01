@@ -44,6 +44,7 @@ import {
   type SpawnSessionOptions,
   type SpawnSessionResult,
 } from '@/modules/common/registerCommonHandlers';
+import { LIST_FILES_PAGE_CAPABILITY } from '@/modules/common/listFilesPageCapability';
 import { logger } from '@/ui/logger';
 import { authAndSetupMachineIfNeeded } from '@/ui/auth';
 import { reseedCompanyKey, settleMachineControl } from '@/datakey/machineControl';
@@ -434,6 +435,7 @@ export const initialMachineMetadata: MachineMetadata = {
   aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
   structuredOutput: STRUCTURED_OUTPUT_CAPABILITY,
   writeFileAttempt: WRITE_FILE_ATTEMPT_CAPABILITY,
+  listFilesPage: LIST_FILES_PAGE_CAPABILITY,
   machineRun: {
     protocolVersion: 1,
     // The machine-scope handler installs the managed write policy (apiMachine).
