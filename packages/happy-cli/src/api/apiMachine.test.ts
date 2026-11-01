@@ -1,6 +1,6 @@
 import nacl from 'tweetnacl';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKTREE_OPS_CAPABILITY, bindRpcRequest, terminalFrameKeyInfo } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, TERMINAL_BINDING_CAPABILITY, WORKTREE_OPS_CAPABILITY, bindRpcRequest, terminalFrameKeyInfo } from '@slopus/happy-wire';
 import { configuration } from '@/configuration';
 import { ApiMachineClient } from './apiMachine';
 import { addDaemonTerminalSession, getDaemonTerminalSession, markDaemonTerminalSessionExited, removeDaemonTerminalSession } from '@/daemon/daemonTerminalSessions';
@@ -1692,6 +1692,31 @@ describe('ApiMachineClient socket reconnection', () => {
         socketHandlers.connect![0]!();
         await vi.waitFor(() => expect(machine.metadata?.rpcBinding).toEqual(RPC_BINDING_CAPABILITY));
         expect(machine.metadata?.worktreeOps).toEqual(expected);
+
+        client.shutdown();
+    });
+
+    // aplus-dev-studio terminal-binding-strict-design §4-7 — the switch that turns clients to the
+    // terminal contract v2: a dataKey machine that is not a managed runtime advertises it.
+    it.each([
+        { variant: 'dataKey' as const, managed: false, expected: TERMINAL_BINDING_CAPABILITY },
+        { variant: 'legacy' as const, managed: false, expected: undefined },
+        { variant: 'dataKey' as const, managed: true, expected: undefined },
+    ])('advertises the terminal contract v2 on a $variant machine (managed: $managed)', async ({ variant, managed, expected }) => {
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
+            if (event === 'machine-update-state') return { result: 'success', version: 1, daemonState: data.daemonState };
+            return { result: 'success' };
+        });
+        const machine = { ...makeMachine(), encryptionVariant: variant };
+        machine.metadata = { ...machine.metadata!, terminalBinding: expected ? undefined : TERMINAL_BINDING_CAPABILITY };
+        const client = new ApiMachineClient('fake-token', machine);
+        if (managed) (client as any).managedHandlers = {};
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.terminalBinding).toEqual(expected));
 
         client.shutdown();
     });

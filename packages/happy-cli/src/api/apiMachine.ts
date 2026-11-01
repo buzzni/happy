@@ -146,7 +146,7 @@ import {
 import { PreviewWsProxy } from '@/daemon/previewWsProxy';
 import { startServerProcess, StartServerError } from '@/daemon/startServer';
 import packageJson from '../../package.json';
-import { AUTOMATION_PROTOCOL_VERSION, AUTOMATION_SCHEDULE_KINDS, COMPANY_KEY_RESEED_CAPABILITY, COMPANY_KEY_RESEED_METHOD, PROJECT_PURGE_CAPABILITY, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKTREE_OPS_CAPABILITY, type AuthenticatedEnvelopesCapability } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, AUTOMATION_SCHEDULE_KINDS, COMPANY_KEY_RESEED_CAPABILITY, COMPANY_KEY_RESEED_METHOD, PROJECT_PURGE_CAPABILITY, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, TERMINAL_BINDING_CAPABILITY, WORKTREE_OPS_CAPABILITY, type AuthenticatedEnvelopesCapability } from '@slopus/happy-wire';
 import { stopServerProcess, StopServerError } from '@/daemon/stopServer';
 import { createPtySession } from '@/daemon/remoteTerminal';
 import { decideTerminalCwd, formatCwdFallbackBanner } from '@/daemon/decideTerminalCwd';
@@ -4399,6 +4399,13 @@ export class ApiMachineClient {
             const advertisedCompanyKeyReseed = this.companyKeyReseedAvailable && advertisedWorktreeOps ? COMPANY_KEY_RESEED_CAPABILITY : undefined;
             const companyKeyReseedStale = JSON.stringify(this.machine.metadata?.companyKeyReseed)
                 !== JSON.stringify(advertisedCompanyKeyReseed);
+            // terminal-binding-strict-design §4-7: the switch that turns clients to the terminal contract v2.
+            // Only where the terminal opener is attached (not managed) and a machine key exists to bind the open.
+            const advertisedTerminalBinding = this.managedHandlers || this.machine.encryptionVariant !== 'dataKey'
+                ? undefined
+                : TERMINAL_BINDING_CAPABILITY;
+            const terminalBindingStale = JSON.stringify(this.machine.metadata?.terminalBinding)
+                !== JSON.stringify(advertisedTerminalBinding);
 
             this.syncResumeSessionRpcRegistration();
 
@@ -4409,7 +4416,7 @@ export class ApiMachineClient {
             // Bounded: an acknowledgement that never comes must not block every later change.
             const awaitingServer = this.capabilityUpdateInFlight !== null
                 && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
-            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || companyKeyReseedStale || writeFileAttemptStale)) {
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || companyKeyReseedStale || terminalBindingStale || writeFileAttemptStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -4450,6 +4457,7 @@ export class ApiMachineClient {
                     worktreeOps: advertisedWorktreeOps,
                     projectPurge: advertisedProjectPurge,
                     companyKeyReseed: advertisedCompanyKeyReseed,
+                    terminalBinding: advertisedTerminalBinding,
                     daemonSessionState: daemonSessionStateAvailable ? { version: 1 } : undefined,
                     happyCliVersion: newCliVersion,
                 })).catch((err) => {
