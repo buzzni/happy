@@ -1498,9 +1498,9 @@ async function syncWorkspaceRemote(
                 const clean = (await runGit(dir, ['diff', '--quiet'], { readOnly: true })).code === 0
                     && (await runGit(dir, ['diff', '--cached', '--quiet'], { readOnly: true })).code === 0;
                 if (clean && await currentBranch(dir) === params.branch) await runGit(dir, ['merge', '--ff-only', '--quiet', online]);
-                // The snapshot replaces the online tree: from behind, it would undo what only online has.
+                // The snapshot replaces the online tree: from behind or diverged, it would undo what only online has.
                 const head = (await headCommit(dir))!;
-                if (head !== online && (await runGit(dir, ['merge-base', '--is-ancestor', head, online], { readOnly: true })).code === 0) {
+                if (head !== online && (await runGit(dir, ['merge-base', '--is-ancestor', online, head], { readOnly: true })).code !== 0) {
                     throw new OpFailure('WORKSPACE_REMOTE_AHEAD', '온라인 저장소에 작업 공간에 없는 변경이 있습니다. 최신 코드를 먼저 받아 주세요.', {
                         branch: params.branch, workspaceSha: head, remoteSha: online,
                     });
