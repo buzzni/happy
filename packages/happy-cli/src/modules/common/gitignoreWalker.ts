@@ -92,58 +92,93 @@ export async function enterDirectory(
 export interface WalkWorkspaceOptions {
     root: string
     presetMatcher: IgnoreMatcher
-    /** Called per file that survived the filter. */
-    onFile?: (absPath: string, relPath: string, stats: Stats) => void | Promise<void>
+    /** Called per file that survived the filter. Returning `false` stops the walk. */
+    onFile?: (absPath: string, relPath: string, stats: Stats) => boolean | void | Promise<boolean | void>
     /** Called per directory that survived the filter (before descending). */
     onDirectory?: (absPath: string, relPath: string) => void | Promise<void>
     /** Max descent levels below root. 0 = only direct children. Unlimited if omitted. */
     maxDepth?: number
+    /** Visit only paths that sort after this relPath (compareRelPaths), to resume a walk. */
+    after?: string
 }
+
+/**
+ * The order walkWorkspace visits paths in: segment by segment, by UTF-16 code
+ * unit. Comparing segments rather than whole strings keeps a directory's
+ * contents together ('a/z' before 'a-b', although '/' sorts after '-').
+ */
+export function compareRelPaths(a: string, b: string): number {
+    const as = a.split('/')
+    const bs = b.split('/')
+    for (let i = 0; i < Math.min(as.length, bs.length); i++) {
+        if (as[i] !== bs[i]) return as[i] < bs[i] ? -1 : 1
+    }
+    return as.length - bs.length
+}
+
+/** How many of a directory's files walkDir stats ahead of the one it is on. */
+const STAT_AHEAD = 128
 
 export async function walkWorkspace(opts: WalkWorkspaceOptions): Promise<void> {
     const rootCtx = createGitignoreContext(opts.presetMatcher)
     await walkDir(opts.root, '', rootCtx, opts, 0)
 }
 
+/** Answers false once onFile asked the walk to stop. */
 async function walkDir(
     absDir: string,
     relDir: string,
     ctx: GitignoreContext,
     opts: WalkWorkspaceOptions,
     depth: number,
-): Promise<void> {
+): Promise<boolean> {
     const localCtx = await enterDirectory(ctx, absDir, relDir)
 
     let entries
     try {
         entries = await readdir(absDir, { withFileTypes: true })
     } catch {
-        return
+        return true
+    }
+    entries.sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0))
+
+    const kept = entries.flatMap((entry) => {
+        if (entry.isSymbolicLink()) return []
+        const entryRel = relDir ? `${relDir}/${entry.name}` : entry.name
+        const isDir = entry.isDirectory()
+        // A directory on the way to `after` is re-entered; anything else at or
+        // before it was already visited.
+        if (opts.after !== undefined && !(isDir && opts.after.startsWith(`${entryRel}/`))
+            && compareRelPaths(entryRel, opts.after) <= 0) return []
+        if (localCtx.ignores(entryRel, isDir)) return []
+        return [{ entry, entryRel, entryAbs: join(absDir, entry.name), isDir }]
+    })
+    // Keep a window of stats running ahead and use them in order: one at a time, a
+    // large walk spends most of its time waiting on each stat in turn. The window is
+    // bounded because a walk that stops early (one page of a listing) would otherwise
+    // stat the rest of every directory it was in, again on every page.
+    const fileStats: Array<Promise<Stats | null> | null> = []
+    const statAhead = (from: number) => {
+        for (let j = fileStats.length; j < Math.min(kept.length, from + STAT_AHEAD); j++) {
+            const { entry, entryAbs } = kept[j]
+            fileStats.push(entry.isFile() && opts.onFile ? stat(entryAbs).catch(() => null) : null)
+        }
     }
 
-    for (const entry of entries) {
-        if (entry.isSymbolicLink()) continue
-
-        const name = entry.name
-        const entryRel = relDir ? `${relDir}/${name}` : name
-        const entryAbs = join(absDir, name)
-        const isDir = entry.isDirectory()
-
-        if (localCtx.ignores(entryRel, isDir)) continue
-
+    for (const [i, { entry, entryRel, entryAbs, isDir }] of kept.entries()) {
         if (isDir) {
             if (opts.onDirectory) await opts.onDirectory(entryAbs, entryRel)
             if (opts.maxDepth === undefined || depth < opts.maxDepth) {
-                await walkDir(entryAbs, entryRel, localCtx, opts, depth + 1)
+                if (!await walkDir(entryAbs, entryRel, localCtx, opts, depth + 1)) return false
             }
         } else if (entry.isFile() && opts.onFile) {
-            let stats: Stats
-            try {
-                stats = await stat(entryAbs)
-            } catch {
-                continue
-            }
-            await opts.onFile(entryAbs, entryRel, stats)
+            // Only from a file: a walk that stops inside a subdirectory never needs
+            // this directory's later files.
+            statAhead(i)
+            const stats: Stats | null = await fileStats[i]
+            if (!stats) continue
+            if (await opts.onFile(entryAbs, entryRel, stats) === false) return false
         }
     }
+    return true
 }

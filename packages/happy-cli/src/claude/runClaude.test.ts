@@ -1,4 +1,7 @@
 /** Claude startup, reconnect, run-once context and lifecycle regression contracts. */
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { TITLE_INSTRUCTION } from '@/utils/titlePrompt';
 import * as axIntegration from '@/orchestrator/prompts/integrate';
@@ -166,6 +169,8 @@ async function startRemoteRunClaudeHarness(opts: {
             metadata = updater(metadata);
         }),
         setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(),
+        sendClaudeSessionMessageFromLocalTranscript: vi.fn(async () => {}),
+        closeClaudeSessionTurn: vi.fn(),
         sendSessionProtocolMessage: vi.fn(),
         hasTitle: vi.fn(() => false),
         onUserMessage: vi.fn(),
@@ -635,6 +640,35 @@ describe('runClaude remote JSONL scanner', () => {
         expect(process.env.HAPPY_RECONNECT_FRESH_LAUNCH).toBeUndefined();
 
         await harness.finish();
+    });
+
+    // The mapper opens a turn on an assistant line and only a later user line closes it. A copied
+    // transcript that ends on the assistant's answer would otherwise leave the fork "responding"
+    // with nothing running until the user sends something.
+    it('closes the turn left open by the last replayed line of a fork backfill', async () => {
+        const configDir = await mkdtemp(join(tmpdir(), 'fork-backfill-'));
+        process.env.CLAUDE_CONFIG_DIR = configDir;
+        process.env.HAPPY_FORK_CLAUDE_SESSION_ID = 'forked-claude-session';
+        const projectDir = join(configDir, 'projects', process.cwd().replace(/[^a-zA-Z0-9-]/g, '-'));
+        await mkdir(projectDir, { recursive: true });
+        await writeFile(join(projectDir, 'forked-claude-session.jsonl'), [
+            { type: 'user', uuid: 'u1', message: { role: 'user', content: 'question' } },
+            { type: 'assistant', uuid: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: 'answer' }] } },
+        ].map((line) => JSON.stringify(line)).join('\n'));
+
+        try {
+            const harness = await startRemoteRunClaudeHarness();
+            const { sendClaudeSessionMessageFromLocalTranscript, closeClaudeSessionTurn } = harness.sessionClient;
+
+            expect(sendClaudeSessionMessageFromLocalTranscript).toHaveBeenCalledTimes(2);
+            expect(closeClaudeSessionTurn).toHaveBeenCalledWith('completed');
+            expect(closeClaudeSessionTurn.mock.invocationCallOrder[0])
+                .toBeGreaterThan(sendClaudeSessionMessageFromLocalTranscript.mock.invocationCallOrder[1]);
+
+            await harness.finish();
+        } finally {
+            await rm(configDir, { recursive: true, force: true });
+        }
     });
 
     it('includes createdBy in fresh session metadata when the daemon supplies it', async () => {

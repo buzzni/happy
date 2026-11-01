@@ -185,9 +185,20 @@ type GitOptions = {
     readOnly?: boolean;
 };
 
+/**
+ * A remote call never follows a redirect: the repository was checked by its address, and a redirect
+ * would take the request (and a credential) to another (workspace-sync-strict-design.md §4-1).
+ */
+const NETWORK_CONFIG = ['-c', 'http.followRedirects=false'];
+
 function runGit(cwd: string, args: string[], options: GitOptions = {}): Promise<GitResult> {
     return new Promise((resolvePromise) => {
-        const child = spawn('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...(options.credential?.config ?? []), ...args], {
+        const child = spawn('git', [
+            '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
+            ...(options.network ? NETWORK_CONFIG : []),
+            ...(options.credential?.config ?? []),
+            ...args,
+        ], {
             cwd,
             env: {
                 ...(options.network ? networkGitEnv() : localGitEnv()),

@@ -199,9 +199,11 @@ describe('worktree operations that change, publish or switch work', () => {
     })).toBe(true);
   });
 
-  it('takes only a plain http(s) remote without credentials in it', () => {
+  it('takes only a plain https remote without credentials in it', () => {
     const publish = (remoteUrl: string) => read('publish', { worktreePath: path, branch: 'x', remoteUrl });
     expect(publish('https://gitlab.example.com:8443/group/project.git')).toBe(true);
+    // workspace-sync-strict-design.md §4-1: the sealed token never travels in the clear.
+    expect(publish('http://gitlab.example.com/group/project.git')).toBe(false);
     expect(publish('https://user:token@github.com/o/r.git')).toBe(false);
     expect(publish('file:///etc/passwd')).toBe(false);
     expect(publish('ext::sh -c touch% /tmp/x')).toBe(false);

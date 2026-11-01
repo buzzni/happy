@@ -50,4 +50,14 @@ export function sessionOwnershipRoutes(app: Fastify) {
         return reply.send({ machine: machine?.accountId === request.userId
             ? { machineId: machine.id, accountId: machine.accountId } : null });
     });
+    // The agent broker's personal same-account check (Desktop reason-network identity-adapter-plan H-S).
+    // Only Happy's own row decides; list visibility is not ownership. Another account's session and a
+    // missing one both read false, so the answer names no other account and is no existence oracle.
+    app.post('/v1/session-ownership/same-account', {
+        preHandler: app.authenticate, schema: { body: z.object({ sessionId: z.string().min(1).max(128) }).strict() },
+    }, async (request, reply) => {
+        if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
+        const session = await db.session.findFirst({ where: { id: request.body.sessionId, accountId: request.userId }, select: { id: true } });
+        return reply.send({ sameAccount: session !== null });
+    });
 }

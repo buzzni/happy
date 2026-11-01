@@ -1873,6 +1873,43 @@ describe('ApiSessionClient v3 messages API migration', () => {
         });
     });
 
+    // A forked Claude session replays its whole copied transcript at start (runClaude
+    // fork backfill). Every replayed tool call used to fire its own runtime report
+    // without waiting, 1,391 at once in the 2026-11-01 fork of a 16 MB conversation:
+    // the daemon's control server timed out on all of them, the session's
+    // /session-started report with them, and the daemon gave up on the spawn.
+    it('keeps at most a few runtime reports in flight and sends the latest state after a burst', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        const release: Array<() => void> = [];
+        mockNotifyDaemonSessionRuntime.mockImplementation(() => new Promise((resolve) => {
+            release.push(() => resolve({ status: 'ok' }));
+        }));
+        try {
+            client.keepAlive(true, 'remote');
+
+            for (let i = 0; i < 1000; i++) {
+                client.sendSessionProtocolMessage(createEnvelope('agent', {
+                    t: 'tool-call-start', call: `tool-${i}`, name: 'Bash', title: 'Bash', description: 'Run command', args: {},
+                }, { turn: 'turn-1' }));
+                client.sendSessionProtocolMessage(createEnvelope('agent', { t: 'tool-call-end', call: `tool-${i}` }, { turn: 'turn-1' }));
+            }
+
+            expect(mockNotifyDaemonSessionRuntime.mock.calls.length).toBeLessThanOrEqual(4);
+
+            while (release.length > 0) {
+                release.shift()!();
+                await new Promise((resolve) => setImmediate(resolve));
+            }
+
+            expect(mockNotifyDaemonSessionRuntime.mock.calls.length).toBeLessThanOrEqual(5);
+            expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', expect.objectContaining({
+                thinking: true, hasOpenToolCall: false,
+            }));
+        } finally {
+            mockNotifyDaemonSessionRuntime.mockImplementation(async () => ({ status: 'ok' }));
+        }
+    });
+
     it('stamps and reports lastTurnEndAt when the agent finishes a turn (busy → idle)', () => {
         const client = new ApiSessionClient('fake-token', session);
 
