@@ -40,6 +40,7 @@ import {
 import { deriveServerRpcKey } from '@/api/encryption';
 import { worktreeRemovalReservations } from './worktreeRemovalReservations';
 import { DurableTicketGuard } from './usedWorktreeTickets';
+import { workspaceRemotePins, type WorkspaceRemotePins } from './workspaceRemotePins';
 import { stopProjectNativeProcesses, type NativeStopResult } from './projectNativeProcesses';
 import { isWithinDirectory } from '@/modules/common/happyHomeGuard';
 import { openSealedForMachine } from '@/modules/common/machineSeal';
@@ -65,7 +66,7 @@ const NO_REMOTE_BRANCH = /couldn't find remote ref|remote ref does not exist/i;
 const PRIVATE_ENV_EXCLUDES = [':(exclude).env', ':(exclude).env.local', ':(exclude,glob)**/.env', ':(exclude,glob)**/.env.local'];
 const MAX_DIRTY_STATUS_CHARS = 64 * 1024;
 /** The operations that reach a remote, and so may bring a sealed credential. */
-const REMOTE_OPS: ReadonlySet<WorktreeOp> = new Set(['create', 'publish', 'reconcile', 'prepare-conversation']);
+const REMOTE_OPS: ReadonlySet<WorktreeOp> = new Set(['create', 'publish', 'reconcile', 'prepare-conversation', 'remote-status', 'pull-remote', 'clone']);
 
 type MachineKeyView = { id: string; encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey' };
 
@@ -1115,6 +1116,212 @@ async function purgeProject(guard: PathGuard, ticket: WorktreeTicket & { op: 'pu
     });
 }
 
+// ── The workspace's online repository (aplus-dev-studio workspace-sync-strict-design.md, F6) ─────
+
+/** The repository the workspace's `origin` names; with a server address, it must be that one. */
+async function workspaceOriginIdentity(dir: string, remoteUrl: string | null): Promise<string | null> {
+    const addresses = await originAddresses(dir);
+    if (addresses.length === 0) throw new OpFailure('WORKSPACE_NO_REMOTE', '연결된 온라인 저장소가 없습니다.');
+    if (remoteUrl) {
+        await requireSameRepository(dir, remoteUrl);
+        return repositoryIdentity(remoteUrl);
+    }
+    const identities = new Set(addresses.map((address) => repositoryIdentity(address)));
+    if (identities.size !== 1) throw new OpFailure('WORKTREE_REMOTE_MISMATCH', 'origin의 주소들이 서로 다른 저장소를 가리킵니다.');
+    // A path or another non-URL origin the user set up on this machine has nothing to pin.
+    return [...identities][0] ?? null;
+}
+
+/** A pin decides when there is one; otherwise this machine's own `origin` becomes the pin. */
+async function requirePinnedOrigin(pins: WorkspaceRemotePins, dir: string, remoteUrl: string | null): Promise<void> {
+    const identity = await workspaceOriginIdentity(dir, remoteUrl);
+    const pinned = await pins.pinned(slashed(dir), 'workspace');
+    if (pinned === null) {
+        if (identity) await pins.pin(slashed(dir), 'workspace', identity);
+        return;
+    }
+    if (identity !== pinned) {
+        throw new OpFailure('WORKSPACE_REMOTE_NOT_PINNED', '이 작업 공간이 처음 연결한 온라인 저장소와 다른 저장소입니다.', { pinned });
+    }
+}
+
+/** The folder is a repository's root, not a folder inside some repository around it. */
+async function isRepositoryRoot(dir: string): Promise<boolean> {
+    return await repositoryRoot(dir) === slashed(dir);
+}
+
+async function headCommit(dir: string): Promise<string | null> {
+    const head = await runGit(dir, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'], { readOnly: true });
+    return head.code === 0 ? head.stdout.trim() : null;
+}
+
+/** Changed and new files, private env files aside. */
+async function dirtyCount(dir: string): Promise<number> {
+    const status = await gitOk(dir, ['status', '--porcelain', '--untracked-files=all', '--', '.', ...PRIVATE_ENV_EXCLUDES], 'WORKSPACE_STATUS_FAILED', { readOnly: true });
+    return status.split('\n').filter(Boolean).length;
+}
+
+async function countCommits(dir: string, range: string): Promise<number> {
+    return Number((await gitOk(dir, ['rev-list', '--count', range], 'WORKSPACE_STATUS_FAILED', { readOnly: true })).trim());
+}
+
+async function workspaceRemoteStatus(
+    guard: PathGuard,
+    pins: WorkspaceRemotePins,
+    ticket: WorktreeTicket & { op: 'remote-status' },
+    credential: PreparedGitCredential | null,
+): Promise<WorktreeOpResult<'remote-status'>> {
+    const params: WorktreeOpParams<'remote-status'> = ticket.params;
+    const dir = await guard.directory(params.workspaceDir);
+    return serialized(dir, async () => {
+        if (!await isRepositoryRoot(dir)) return { isRepo: false, head: null, branch: null, dirtyCount: 0, ahead: null, behind: null, baseBehind: null };
+        await requirePinnedOrigin(pins, dir, params.remoteUrl);
+        const online = await fetchBranch(dir, 'origin', params.branch, credential, true);
+        const base = params.baseBranch ? await fetchBranch(dir, 'origin', params.baseBranch, credential, true) : null;
+        const head = await headCommit(dir);
+        const behind = (target: string | null) => target === null ? null : countCommits(dir, head ? `${head}..${target}` : target);
+        return {
+            isRepo: true,
+            head,
+            branch: await currentBranch(dir),
+            dirtyCount: await dirtyCount(dir),
+            ahead: online === null ? null : head ? await countCommits(dir, `${online}..${head}`) : 0,
+            behind: await behind(online),
+            baseBehind: await behind(base),
+        };
+    });
+}
+
+/** A clean workspace moves forward to each online commit in turn; anything else is the user's to decide. */
+async function fastForwardWorkspace(
+    dir: string,
+    params: WorktreeOpParams<'pull-remote'>,
+    targets: string[],
+    head: string | null,
+    credential: PreparedGitCredential | null,
+): Promise<WorktreeOpResult<'pull-remote'>> {
+    if (await dirtyCount(dir) > 0) return { status: 'dirty', head, conflictCount: 0 };
+    if (await currentBranch(dir) !== params.branch) {
+        const local = (await runGit(dir, ['show-ref', '--verify', '--quiet', `refs/heads/${params.branch}`], { readOnly: true })).code === 0;
+        await gitOk(dir, local ? ['checkout', params.branch] : ['checkout', '-b', params.branch, targets[0]!], 'WORKSPACE_CHECKOUT_FAILED');
+    }
+    for (const target of targets) {
+        if ((await runGit(dir, ['merge', '--ff-only', target])).code !== 0) return { status: 'diverged', head: await headCommit(dir), conflictCount: 0 };
+    }
+    if (params.push) {
+        const pushed = await runGit(dir, ['push', 'origin', `refs/heads/${params.branch}:refs/heads/${params.branch}`], {
+            network: true, credential, timeoutMs: NETWORK_TIMEOUT_MS,
+        });
+        if (pushed.code !== 0) {
+            const error = gitError(pushed);
+            throw new OpFailure(AUTH_FAILURE.test(error) ? 'WORKTREE_AUTH_REQUIRED' : 'WORKSPACE_PUSH_FAILED', error);
+        }
+    }
+    const after = await headCommit(dir);
+    return { status: after === head ? 'up-to-date' : 'fast-forwarded', head: after, conflictCount: 0 };
+}
+
+/** As the server's "최신 코드 받아오기": the current files become a commit, then the online code merges in. */
+async function mergeIntoWorkspace(dir: string, params: WorktreeOpParams<'pull-remote'>, targets: string[]): Promise<WorktreeOpResult<'pull-remote'>> {
+    if (await currentBranch(dir) !== params.branch) throw new OpFailure('WORKTREE_BRANCH_MISMATCH', `작업 공간이 ${params.branch} 브랜치가 아닙니다.`);
+    await checkpoint(dir, 'A+ Studio: 최신 코드 받아오기 전 저장');
+    const before = await headCommit(dir);
+    for (const target of targets) {
+        const merged = await runGit(dir, [...STUDIO_AUTHOR, 'merge', '--no-edit', target]);
+        if (merged.code === 0) continue;
+        const conflicts = await unmergedPaths(dir);
+        // Left in place, markers and all: undoing it would take away what the user has to resolve.
+        if (conflicts.length > 0) return { status: 'conflict', head: await headCommit(dir), conflictCount: conflicts.length };
+        await abortMerge(dir);
+        throw new OpFailure('WORKSPACE_MERGE_FAILED', gitError(merged));
+    }
+    const after = await headCommit(dir);
+    return { status: after === before ? 'up-to-date' : 'merged', head: after, conflictCount: 0 };
+}
+
+async function pullWorkspaceRemote(
+    guard: PathGuard,
+    pins: WorkspaceRemotePins,
+    ticket: WorktreeTicket & { op: 'pull-remote' },
+    credential: PreparedGitCredential | null,
+): Promise<WorktreeOpResult<'pull-remote'>> {
+    const params: WorktreeOpParams<'pull-remote'> = ticket.params;
+    const dir = await guard.directory(params.workspaceDir);
+    return serialized(dir, async () => {
+        if (!await isRepositoryRoot(dir)) return { status: 'not-a-repo', head: null, conflictCount: 0 };
+        await requirePinnedOrigin(pins, dir, params.remoteUrl);
+        const head = await headCommit(dir);
+        // The browser showed the user this head; anything since is the user's to look at first.
+        if (head !== params.expectedHead) return { status: 'head-moved', head, conflictCount: 0 };
+        const targets = [(await fetchBranch(dir, 'origin', params.branch, credential, false))!];
+        if (params.baseBranch) targets.push((await fetchBranch(dir, 'origin', params.baseBranch, credential, false))!);
+        return params.mode === 'ff-only'
+            ? fastForwardWorkspace(dir, params, targets, head, credential)
+            : mergeIntoWorkspace(dir, params, targets);
+    });
+}
+
+/** Each existing folder down to `path` is itself, not a link that would land the clone elsewhere. */
+async function requireUnlinkedPath(path: string): Promise<void> {
+    let current = path;
+    while (!await lstat(current).then(() => true, () => false)) {
+        const parent = dirname(current);
+        if (parent === current) return;
+        current = parent;
+    }
+    if (slashed(await realpath(current)) !== slashed(current)) throw new OpFailure('PATH_DENIED', 'A folder on the workspace path is a link');
+}
+
+async function cloneWorkspace(
+    guard: PathGuard,
+    pins: WorkspaceRemotePins,
+    ticket: WorktreeTicket & { op: 'clone' },
+    credential: PreparedGitCredential | null,
+): Promise<WorktreeOpResult<'clone'>> {
+    const params: WorktreeOpParams<'clone'> = ticket.params;
+    const path = resolve(params.workspaceDir);
+    if (!isManagedProjectFolder(path, ticket.projectId)) throw new OpFailure('PATH_DENIED', "Not this project's managed workspace folder");
+    const identity = repositoryIdentity(params.remoteUrl);
+    if (!identity) throw new OpFailure('WORKSPACE_REMOTE_INVALID', 'The repository address names no repository');
+    await requireUnlinkedPath(path);
+    let existing: string | null = null;
+    try {
+        existing = await guard.directory(path);
+    } catch (error) {
+        if (!(error instanceof OpFailure) || error.errorCode !== 'WORKSPACE_MISSING') throw error;
+        await guard.missing(path);
+        await mkdir(path, { recursive: true });
+    }
+    const dir = existing ?? await guard.directory(path);
+    const pinned = await pins.pinned(slashed(dir), 'workspace');
+    if (pinned !== null && pinned !== identity) {
+        throw new OpFailure('WORKSPACE_REMOTE_NOT_PINNED', '이 작업 공간이 처음 연결한 온라인 저장소와 다른 저장소입니다.', { pinned });
+    }
+    return serialized(dir, async () => {
+        if ((await readdir(dir)).length > 0) {
+            // A retry after the clone already landed: the same repository, nothing to do.
+            const configured = (await runGit(dir, ['config', '--get', 'remote.origin.url'], { readOnly: true })).stdout.trim();
+            const head = await headCommit(dir);
+            if (head && await isRepositoryRoot(dir) && repositoryIdentity(configured) === identity) {
+                await pins.pin(slashed(dir), 'workspace', identity);
+                return { changed: false, head, branch: await currentBranch(dir) ?? params.branch };
+            }
+            throw new OpFailure('WORKSPACE_NOT_EMPTY', '작업 공간 폴더에 이미 다른 파일이 있습니다.');
+        }
+        const cloned = await runGit(dir, ['clone', '--quiet', '--branch', params.branch, '--single-branch', '--', params.remoteUrl, '.'], {
+            network: true, credential, timeoutMs: CHECKOUT_TIMEOUT_MS,
+        });
+        if (cloned.code !== 0) {
+            // git takes back what it wrote; the empty folder stays for a retry.
+            const error = gitError(cloned);
+            if (AUTH_FAILURE.test(error)) throw new OpFailure('WORKTREE_AUTH_REQUIRED', error);
+            throw new OpFailure(/remote branch .* not found/i.test(error) ? 'WORKSPACE_CLONE_BRANCH_MISSING' : 'WORKSPACE_CLONE_FAILED', error);
+        }
+        await pins.pin(slashed(dir), 'workspace', identity);
+        return { changed: true, head: (await gitOk(dir, ['rev-parse', 'HEAD'], 'WORKSPACE_CLONE_FAILED')).trim(), branch: params.branch };
+    });
+}
+
 // ── Handlers ───────────────────────────────────────────────────────────────────────────────────
 
 // Process-wide, and on disk: a daemon that reconnects builds new handlers, one that restarts starts
@@ -1130,9 +1337,21 @@ function usedTickets(happyHomeDir: string): DurableTicketGuard {
     return guard;
 }
 
+const remotePinStores = new Map<string, WorkspaceRemotePins>();
+function remotePins(happyHomeDir: string): WorkspaceRemotePins {
+    const file = join(happyHomeDir, 'workspace-remotes.json');
+    let pins = remotePinStores.get(file);
+    if (!pins) {
+        pins = workspaceRemotePins(file);
+        remotePinStores.set(file, pins);
+    }
+    return pins;
+}
+
 export function createWorktreeOpsHandlers(deps: WorktreeOpsDeps): Record<WorktreeOpsMethod, (request: unknown) => Promise<WorktreeOpAnswer>> {
     const now = deps.now ?? Date.now;
     const guard = pathGuard(deps.allowedRoot, deps.happyHomeDir);
+    const pins = remotePins(deps.happyHomeDir);
 
     const run = (ticket: WorktreeTicket, credential: PreparedGitCredential | null): Promise<Record<string, unknown>> => {
         switch (ticket.op) {
@@ -1150,6 +1369,9 @@ export function createWorktreeOpsHandlers(deps: WorktreeOpsDeps): Record<Worktre
             case 'create-branch': return createBranch(guard, ticket);
             case 'prepare-conversation': return prepareConversation(guard, ticket, credential);
             case 'purge-project': return purgeProject(guard, ticket, deps.machine().id, deps.purge ?? {});
+            case 'remote-status': return workspaceRemoteStatus(guard, pins, ticket, credential);
+            case 'pull-remote': return pullWorkspaceRemote(guard, pins, ticket, credential);
+            case 'clone': return cloneWorkspace(guard, pins, ticket, credential);
         }
     };
 
@@ -1157,7 +1379,7 @@ export function createWorktreeOpsHandlers(deps: WorktreeOpsDeps): Record<Worktre
         const read = readWorktreeTicket(request && typeof request === 'object' ? (request as { ticket?: unknown }).ticket : undefined);
         if (!read.ok) return refused('TICKET_INVALID', read.error);
         const ticket = read.ticket;
-        if (ticket.op !== op) return refused('TICKET_WRONG_OPERATION', `This ticket is for worktree:${ticket.op}`);
+        if (ticket.op !== op) return refused('TICKET_WRONG_OPERATION', `This ticket is for ${worktreeOpMethod(ticket.op)}`);
         const machine = deps.machine();
         if (machine.encryptionVariant !== 'dataKey') return refused('WORKTREE_OPS_UNSUPPORTED', 'This machine has no machine key to sign results with');
         if (ticket.machineId !== machine.id) return refused('TICKET_WRONG_MACHINE', 'This ticket is for another machine');
@@ -1166,7 +1388,7 @@ export function createWorktreeOpsHandlers(deps: WorktreeOpsDeps): Record<Worktre
         const sealed = request && typeof request === 'object' ? (request as { sealedCredential?: unknown }).sealedCredential : undefined;
         let credential: { username: string; token: string } | null = null;
         if (sealed !== undefined && sealed !== null) {
-            if (!REMOTE_OPS.has(op)) return refused('GIT_CREDENTIAL_UNEXPECTED', `worktree:${op} does not reach a remote`);
+            if (!REMOTE_OPS.has(op)) return refused('GIT_CREDENTIAL_UNEXPECTED', `${worktreeOpMethod(op)} does not reach a remote`);
             const opened = typeof sealed === 'string' ? openSealedForMachine(machine.encryptionKey, GIT_CREDENTIAL_SEAL_KEY_LABEL, sealed) : null;
             const read = readSealedGitCredential(opened, { machineId: machine.id, opId: ticket.opId });
             if (!read.ok) return refused('GIT_CREDENTIAL_INVALID', 'The credential was not sealed for this machine and ticket');
