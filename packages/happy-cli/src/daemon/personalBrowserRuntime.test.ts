@@ -19,6 +19,29 @@ const base = (overrides: Record<string, unknown> = {}) => ({ platform: 'darwin' 
     token: () => 'user-token', log: vi.fn(), readConfig: (path: string) => { expect(path).toBe(paths.configFile); return config() }, ...overrides })
 
 describe('personal browser runtime (daemon side)', () => {
+    it('sends a device proof for organization runtime requests and never falls back without approval', async () => {
+        const proof = vi.fn(async () => 'signed-proof'), fetchImpl = vi.fn(async () => new Response(JSON.stringify({ token: 'native', expiresAtMs: 1000 })))
+        fetchImpl.mockResolvedValueOnce(new Response('{}', { status: 401 }))
+        const runtime = readPersonalBrowserRuntime(base({ readConfig: () => config({ workspaceId: 'co' }), deviceProof: proof, fetchImpl }))!
+        const command = { generation: 'g', method: 'POST' as const, path: '/v1/sessions/register', body: '{}' }
+        await runtime.native.issue(command)
+        expect(proof).toHaveBeenCalledWith(expect.objectContaining({ machineId: 'machine-1', workspaceId: 'co', body: JSON.stringify(command) }))
+        expect(fetchImpl).toHaveBeenCalledWith(expect.any(URL), expect.objectContaining({ headers: expect.objectContaining({ 'X-Saycode-Browser-Device-Proof': 'signed-proof' }) }))
+        fetchImpl.mockResolvedValueOnce(new Response('{}', { status: 401 }))
+        proof.mockRejectedValueOnce(new Error('NATIVE_DEVICE_APPROVAL_REQUIRED'))
+        await expect(runtime.native.issue(command)).rejects.toThrow('NATIVE_DEVICE_APPROVAL_REQUIRED')
+        expect(fetchImpl).toHaveBeenCalledTimes(3)
+    })
+
+    it('preserves personal bearer authentication even in an organization workspace without a device pin', async () => {
+        const proof = vi.fn(async () => { throw new Error('NATIVE_DEVICE_APPROVAL_REQUIRED') })
+        const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ token: 'native', expiresAtMs: 1000 })))
+        const runtime = readPersonalBrowserRuntime(base({ readConfig: () => config({ workspaceId: 'co' }), deviceProof: proof, fetchImpl }))!
+        await expect(runtime.native.issue({ generation: 'g', method: 'POST', path: '/v1/sessions/register', body: '{}' })).resolves.toEqual({ token: 'native', expiresAtMs: 1000 })
+        expect(proof).not.toHaveBeenCalled()
+        expect(fetchImpl).toHaveBeenCalledTimes(1)
+    })
+
     it('points sessions at the installed runtime and its broker socket', () => {
         // HOME decides the macOS user directory.
         const runtime = readPersonalBrowserRuntime(base())!
