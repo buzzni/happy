@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager';
 import { configuration } from '@/configuration';
 import { registerCommonHandlers, type CommonHandlerOptions } from './registerCommonHandlers';
@@ -10,6 +10,14 @@ import { createManagedProjectWriteScopePolicy, createTrustedMachineRunProfileRes
 import { managedMachineToolPlatform } from './managedMachineTool';
 
 type Handler = (data: Record<string, unknown>) => Promise<Record<string, unknown>>;
+
+// Counts the handlers' stat calls, so a test can tell a walk that stopped from one that
+// only stopped counting.
+const statCalls = vi.hoisted(() => ({ count: 0 }));
+vi.mock('fs/promises', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('fs/promises')>();
+    return { ...actual, stat: (...args: Parameters<typeof actual.stat>) => { statCalls.count++; return actual.stat(...args); } };
+});
 
 const temporaryDirectories: string[] = [];
 
@@ -319,6 +327,157 @@ describe('registerCommonHandlers writeFile attempts', () => {
             path, content: b64('x'), expectedHash: null, attemptId: 'bad id/with spaces',
         })).resolves.toMatchObject({ success: false, errorCode: 'INVALID_ATTEMPT_ID' });
         await expect(readdir(workingDirectory)).resolves.toEqual([]);
+    });
+});
+
+/*
+ * A 151 MB tree of a repository root went over happy-server's 100 MB message
+ * limit, so the server closed the machine socket on every answer and the caller
+ * asked again after each reconnect (2026-10-31). A partial tree would hide files
+ * without saying so; an over-limit tree is refused instead.
+ */
+describe('registerCommonHandlers getDirectoryTree entry limit', () => {
+    async function createTree(entries: number) {
+        const { handlers, workingDirectory } = await createHandlers(undefined, { directoryTreeMaxEntries: 4 });
+        await mkdir(join(workingDirectory, 'src'));
+        for (let i = 0; i < entries - 2; i++) await writeFile(join(workingDirectory, 'src', `f${i}.ts`), '');
+        return { handler: handlers.get('getDirectoryTree'), workingDirectory };
+    }
+
+    it('returns the tree when it holds exactly the limit', async () => {
+        const { handler, workingDirectory } = await createTree(4);
+
+        const result = await handler?.({ path: workingDirectory, maxDepth: 8 }) as any;
+
+        expect(result.success).toBe(true);
+        expect(result.tree.children).toEqual([expect.objectContaining({ name: 'src' })]);
+        expect(result.tree.children[0].children).toHaveLength(2);
+    });
+
+    it('refuses a tree over the limit instead of returning part of it', async () => {
+        const { handler, workingDirectory } = await createTree(5);
+
+        const result = await handler?.({ path: workingDirectory, maxDepth: 8 });
+
+        expect(result).toEqual({
+            success: false,
+            errorCode: 'DIRECTORY_TREE_TOO_LARGE',
+            error: 'Directory tree has more than 4 entries; open a subdirectory or lower maxDepth',
+        });
+    });
+
+    it('stops reading the disk once the limit is passed', async () => {
+        const { handler, workingDirectory } = await createTree(50);
+        statCalls.count = 0;
+
+        await expect(handler?.({ path: workingDirectory, maxDepth: 8 })).resolves.toMatchObject({ success: false });
+
+        // One stat per node it kept, not one per entry on disk.
+        expect(statCalls.count).toBeLessThanOrEqual(4);
+    });
+});
+
+// aplus-dev-studio specs/remote-file-list-pages — the file list of a workspace
+// too large for one getDirectoryTree answer, a page at a time.
+describe('registerCommonHandlers listFilesPage', () => {
+    async function createWorkspace() {
+        const { handlers, workingDirectory } = await createHandlers();
+        const files = ['.gitignore', 'a.txt', 'src/b.ts', 'src/deep/c.ts', 'src/deep/deeper/d.ts', 'out/e.js', 'node_modules/x/i.js'];
+        for (const rel of files) {
+            await mkdir(dirname(join(workingDirectory, rel)), { recursive: true });
+            await writeFile(join(workingDirectory, rel), rel === '.gitignore' ? 'out/\n' : 'x');
+        }
+        return { handlers, workingDirectory };
+    }
+
+    function treeFiles(node: any, root: string): string[] {
+        if (node.type === 'file') return [node.path.slice(root.length + 1)];
+        return (node.children ?? []).flatMap((child: any) => treeFiles(child, root));
+    }
+
+    async function allPages(list: Handler, params: Record<string, unknown>) {
+        const pages: any[] = [];
+        let cursor: string | undefined;
+        do {
+            const page = await list({ ...params, ...(cursor === undefined ? {} : { cursor }) });
+            pages.push(page);
+            cursor = page.nextCursor as string | undefined;
+        } while (cursor);
+        return pages;
+    }
+
+    it('pages through exactly the files getDirectoryTree would return', async () => {
+        const { handlers, workingDirectory } = await createWorkspace();
+        const tree = await handlers.get('getDirectoryTree')!({ path: workingDirectory, maxDepth: 3 });
+
+        const pages = await allPages(handlers.get('listFilesPage')!, { path: workingDirectory, maxDepth: 3, limit: 2 });
+
+        expect(pages.map((page) => page.entries.length)).toEqual([2, 2]);
+        expect(pages.at(-1).nextCursor).toBeNull();
+        const listed = pages.flatMap((page) => page.entries.map((entry: any) => entry.relPath));
+        expect(listed).toEqual(['.gitignore', 'a.txt', 'src/b.ts', 'src/deep/c.ts']);
+        expect([...listed].sort()).toEqual(treeFiles(tree.tree, workingDirectory).sort());
+        expect(pages[0].entries[1]).toEqual({
+            relPath: 'a.txt', absPath: join(workingDirectory, 'a.txt'), size: 1, modified: expect.any(Number),
+        });
+    });
+
+    it('lists nothing below maxDepth 1, as getDirectoryTree shows no children there', async () => {
+        const { handlers, workingDirectory } = await createWorkspace();
+
+        await expect(handlers.get('listFilesPage')!({ path: workingDirectory, maxDepth: 0 })).resolves.toEqual({
+            success: true, entries: [], nextCursor: null,
+        });
+    });
+
+    it('refuses a page size it cannot keep under the socket message limit, and paths outside the workspace', async () => {
+        const { handlers, workingDirectory } = await createWorkspace();
+        const list = handlers.get('listFilesPage')!;
+
+        await expect(list({ path: workingDirectory, maxDepth: 3, limit: 10_001 })).resolves.toEqual({
+            success: false, error: 'limit must be an integer between 1 and 10000',
+        });
+        await expect(list({ path: join(workingDirectory, '..'), maxDepth: 3 })).resolves.toMatchObject({ success: false });
+    });
+
+    it('treats a null cursor as the first page and refuses one that is not a string', async () => {
+        const { handlers, workingDirectory } = await createWorkspace();
+        const list = handlers.get('listFilesPage')!;
+
+        await expect(list({ path: workingDirectory, maxDepth: 3, cursor: null, limit: 1 })).resolves.toMatchObject({
+            success: true, entries: [expect.objectContaining({ relPath: '.gitignore' })],
+        });
+        await expect(list({ path: workingDirectory, maxDepth: 3, cursor: 5 })).resolves.toEqual({
+            success: false, error: 'cursor must be a string',
+        });
+    });
+
+    it('refuses a maxDepth that is not a non-negative integer', async () => {
+        const { handlers, workingDirectory } = await createWorkspace();
+        const list = handlers.get('listFilesPage')!;
+
+        for (const maxDepth of [undefined, 0.5, -1, Number.NaN]) {
+            await expect(list({ path: workingDirectory, maxDepth }), String(maxDepth)).resolves.toEqual({
+                success: false, error: 'maxDepth must be a non-negative integer',
+            });
+        }
+    });
+
+    // getDirectoryTree fails on a root it cannot read; an empty "success" here would let a
+    // move or a backup carry nothing without saying so.
+    it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('fails on a root it cannot read', async () => {
+        const { handlers, workingDirectory } = await createWorkspace();
+        const locked = join(workingDirectory, 'locked');
+        await mkdir(locked);
+        await writeFile(join(locked, 'a.txt'), 'x');
+        await chmod(locked, 0o000);
+        try {
+            await expect(handlers.get('listFilesPage')!({ path: locked, maxDepth: 3 })).resolves.toEqual({
+                success: false, error: 'Failed to access the specified path',
+            });
+        } finally {
+            await chmod(locked, 0o755);
+        }
     });
 });
 

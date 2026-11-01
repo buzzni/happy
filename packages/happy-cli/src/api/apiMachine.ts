@@ -28,6 +28,7 @@ import {
     type SpawnSessionOptions,
     type SpawnSessionResult,
 } from '../modules/common/registerCommonHandlers';
+import { LIST_FILES_PAGE_CAPABILITY } from '../modules/common/listFilesPageCapability';
 import { createManagedProjectWriteScopePolicy, TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '../modules/common/machineRunProfile';
 import { hostManagedMachineTools } from '../modules/common/moaiMachineRunProfiles';
 import { resolveDaemonAllowedRoot } from '../modules/common/resolveAllowedRoot';
@@ -146,7 +147,7 @@ import {
 import { PreviewWsProxy } from '@/daemon/previewWsProxy';
 import { startServerProcess, StartServerError } from '@/daemon/startServer';
 import packageJson from '../../package.json';
-import { AUTOMATION_PROTOCOL_VERSION, AUTOMATION_SCHEDULE_KINDS, COMPANY_KEY_RESEED_CAPABILITY, COMPANY_KEY_RESEED_METHOD, PROJECT_PURGE_CAPABILITY, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, TERMINAL_BINDING_CAPABILITY, WORKTREE_OPS_CAPABILITY, type AuthenticatedEnvelopesCapability } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, AUTOMATION_SCHEDULE_KINDS, COMPANY_KEY_RESEED_CAPABILITY, COMPANY_KEY_RESEED_METHOD, PROJECT_PURGE_CAPABILITY, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, TERMINAL_BINDING_CAPABILITY, WORKSPACE_SYNC_CAPABILITY, WORKTREE_OPS_CAPABILITY, type AuthenticatedEnvelopesCapability } from '@slopus/happy-wire';
 import { stopServerProcess, StopServerError } from '@/daemon/stopServer';
 import { createPtySession } from '@/daemon/remoteTerminal';
 import { decideTerminalCwd, formatCwdFallbackBanner } from '@/daemon/decideTerminalCwd';
@@ -759,6 +760,18 @@ function setupTokenAssignmentKillSwitchEnabled(): boolean {
     return ['1', 'true', 'on'].includes((process.env.APLUS_SETUP_TOKEN_ASSIGNMENT_KILL_SWITCH ?? '').toLowerCase());
 }
 
+/**
+ * An acked event can arrive without its ack (seen in the burst delivered right after a
+ * reconnect). Answering it would throw inside an async listener, an unhandled rejection
+ * that shuts the whole daemon down, so the event is dropped before any side effect:
+ * nobody is waiting for the shell or tunnel it would open.
+ */
+function hasAck(event: string, ack: unknown): ack is (response: any) => void {
+    if (typeof ack === 'function') return true;
+    logger.debug(`[API MACHINE] Dropping ${event} — no ack callback`);
+    return false;
+}
+
 export class ApiMachineClient {
     private socket!: Socket<ServerToDaemonEvents, DaemonToServerEvents>;
     /** Set when the managed credential ended; suppresses every reconnect. */
@@ -1077,6 +1090,24 @@ export class ApiMachineClient {
         );
     }
 
+    /**
+     * Registers a listener for an event the server sends with an ack. An event that
+     * arrives without one is dropped before any side effect (hasAck), and a listener
+     * that fails is logged instead of rejecting: socket.io does not await listeners,
+     * and the daemon shuts down on an unhandled rejection, so one failed request would
+     * otherwise take every session on the machine down with it.
+     */
+    private onAcked(event: string, listener: (params: any, ack: (response: any) => void) => unknown): void {
+        (this.socket as any).on(event, async (params: any, ack: unknown) => {
+            if (!hasAck(event, ack)) return;
+            try {
+                await listener(params, ack);
+            } catch (e) {
+                logger.debug(`[API MACHINE] ${event} listener failed: ${e instanceof Error ? e.message : String(e)}`);
+            }
+        });
+    }
+
     /** Internal opt-in trial policy; install before connecting the machine transport. */
     setWindowsStandaloneTrial(): void {
         this.windowsStandaloneTrial = true;
@@ -1084,8 +1115,8 @@ export class ApiMachineClient {
         // Session launch/resume use the daemon's native owner; recovery's preflight refuses separately.
         const allowed = new Set(['spawn-happy-session', 'resume-happy-session', 'recover-happy-session',
             'stop-session', 'daemon-session-state', 'readFile', 'readFileChunk', 'writeFile', 'listDirectory',
-            'renameFile', 'deleteFile', 'copyFile', 'ensureDirectory', 'getDirectoryTree', 'writeWorkspaceFile',
-            'allocate-port', 'get-port', 'release-port']);
+            'renameFile', 'deleteFile', 'copyFile', 'ensureDirectory', 'getDirectoryTree', 'listFilesPage',
+            'writeWorkspaceFile', 'allocate-port', 'get-port', 'release-port']);
         this.rpcHandlerManager.setMethodPolicy(method => allowed.has(method) ? null : {
             error: 'Method unavailable in the standalone Windows Codex trial', code: 'STANDALONE_WINDOWS_TRIAL_UNSUPPORTED',
         });
@@ -3861,12 +3892,9 @@ export class ApiMachineClient {
         // response bodies (HTML path rewriting) and has no access to the
         // machine encryption key anyway. Independent of the rpc-request
         // pipeline above.
-        this.socket.on(
-            'proxy-http-request',
-            async (params: any, ack: (response: any) => void) => {
-                ack(await this.relayPreviewHttp('proxy-http-request', params));
-            },
-        );
+        this.onAcked('proxy-http-request', async (params, ack) => {
+            ack(await this.relayPreviewHttp('proxy-http-request', params));
+        });
 
         // specs/runtime-isolation-hardening (H3, P1) — bound requests arrive
         // here instead. The separate event is what keeps a daemon that
@@ -3874,21 +3902,15 @@ export class ApiMachineClient {
         // so the request is never run rather than run and then refused by its
         // answer. Since this event exists only for bound requests, serving it
         // unbound would give the whole separation away.
-        this.socket.on(
-            PREVIEW_BOUND_PROXY_EVENT as any,
-            async (params: any, ack: (response: any) => void) => {
-                ack(await this.relayPreviewBoundHttp(params));
-            },
-        );
+        this.onAcked(PREVIEW_BOUND_PROXY_EVENT, async (params, ack) => {
+            ack(await this.relayPreviewBoundHttp(params));
+        });
 
         // Mint-time lease: happy-server asks which runtime owns the port
         // before signing a bound token. A daemon without this handler never
         // acks, and the server reports RUNTIME_BINDING_UNSUPPORTED rather than
         // quietly falling back to an unbound token.
-        this.socket.on(
-            'preview-runtime-lease',
-            (params: any, ack: (response: any) => void) => this.answerPreviewRuntimeLease(params, ack),
-        );
+        this.onAcked('preview-runtime-lease', (params, ack) => this.answerPreviewRuntimeLease(params, ack));
 
         // Preview WebSocket relay — raw byte tunnel for upgrades (noVNC /
         // websockify, ws, HMR). Bytes flow verbatim so the upstream performs the
@@ -3902,11 +3924,11 @@ export class ApiMachineClient {
         );
         // Not attached on a managed runtime: the preview WebSocket proxy reaches the host outside
         // the RPC dispatch gate, so the allowlist there would not see it.
-        if (!this.managedHandlers && !this.windowsStandaloneTrial) this.socket.on('proxy-ws-open', async (params, ack) => {
+        if (!this.managedHandlers && !this.windowsStandaloneTrial) this.onAcked('proxy-ws-open', async (params, ack) => {
             ack(await this.openPreviewWsTunnel(params));
         });
         // The bound variants reach the host the same way, so the same gate applies.
-        if (!this.managedHandlers && !this.windowsStandaloneTrial) this.socket.on(PREVIEW_BOUND_WS_OPEN_EVENT as any, async (params: any, ack: (response: any) => void) => {
+        if (!this.managedHandlers && !this.windowsStandaloneTrial) this.onAcked(PREVIEW_BOUND_WS_OPEN_EVENT, async (params, ack) => {
             ack(await this.openPreviewWsTunnelBound(params));
         });
         // specs/runtime-isolation-hardening (H3, P3) — viewer-bound relays and
@@ -3915,16 +3937,13 @@ export class ApiMachineClient {
         // upstream write, no ack. That silence is the server's signal, and it
         // is the only version of "old daemon refused" that happens *before*
         // anything reaches the port.
-        this.socket.on(PREVIEW_VIEWER_BOUND_PROXY_EVENT as any, async (params: any, ack: (response: any) => void) => {
+        this.onAcked(PREVIEW_VIEWER_BOUND_PROXY_EVENT, async (params, ack) => {
             ack(await this.relayPreviewViewerBoundHttp(params));
         });
-        if (!this.managedHandlers && !this.windowsStandaloneTrial) this.socket.on(PREVIEW_VIEWER_BOUND_WS_OPEN_EVENT as any, async (params: any, ack: (response: any) => void) => {
+        if (!this.managedHandlers && !this.windowsStandaloneTrial) this.onAcked(PREVIEW_VIEWER_BOUND_WS_OPEN_EVENT, async (params, ack) => {
             ack(await this.openPreviewViewerWsTunnelBound(params));
         });
-        this.socket.on(
-            PREVIEW_VIEWER_RUNTIME_LEASE_EVENT as any,
-            (params: any, ack: (response: any) => void) => this.answerPreviewViewerRuntimeLease(params, ack),
-        );
+        this.onAcked(PREVIEW_VIEWER_RUNTIME_LEASE_EVENT, (params, ack) => this.answerPreviewViewerRuntimeLease(params, ack));
         this.socket.on('proxy-ws-data', (payload) => {
             this.previewWsProxy?.data(payload);
         });
@@ -3949,7 +3968,7 @@ export class ApiMachineClient {
         // the RPC dispatch gate, so the allowlist there would not see it. The Windows standalone
         // trial does attach it: its runtime roots every shell in the verified pty host and closes
         // terminals on drain (Desktop specs/windows-build-support W0-5h).
-        if (!this.managedHandlers) this.socket.on('terminal-open-fwd', async (msg, ack) => {
+        if (!this.managedHandlers) this.onAcked('terminal-open-fwd', async (msg, ack) => {
             try {
                 const { sessionId, params } = msg || {};
                 if (!sessionId || typeof sessionId !== 'string') {
@@ -4143,7 +4162,13 @@ export class ApiMachineClient {
         if (!this.managedHandlers) this.socket.on('terminal-frame-fwd', (msg) => {
             const { sessionId, data } = msg || {};
             const entry = getDaemonTerminalSession(sessionId);
-            if (!entry || typeof data !== 'string') return;
+            if (typeof sessionId !== 'string' || typeof data !== 'string') return;
+            if (!entry) {
+                // A v2 resume arrives as a frame; with no keys left to seal an answer, the plaintext
+                // unknown-session of terminal-resume-fwd is it — silence left the client waiting forever.
+                this.socket.emit('terminal-closed', { sessionId, reason: 'unknown-session' });
+                return;
+            }
             if (entry.binding) {
                 this.receiveBoundTerminalFrame(sessionId, entry, entry.binding, data);
                 return;
@@ -4217,7 +4242,13 @@ export class ApiMachineClient {
             // A v2 terminal resizes through a sealed frame only.
             if (!entry || entry.exit || entry.binding) return;
             if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols <= 0 || rows <= 0) return;
-            entry.session.resize(cols, rows);
+            // A shell that just exited can fail the resize before onExit marks it; a throw
+            // here would reach the daemon's uncaught-exception handler.
+            try {
+                entry.session.resize(cols, rows);
+            } catch (e) {
+                logger.debug(`[REMOTE-TERMINAL] resize session=${sessionId} failed: ${e instanceof Error ? e.message : String(e)}`);
+            }
         });
 
         this.socket.on('terminal-close-fwd', (msg) => {
@@ -4243,6 +4274,8 @@ export class ApiMachineClient {
                 logger.debug(
                     `[REMOTE-TERMINAL] terminate session=${sessionId} pid=${entry.session.pid} outcome=${outcome}`,
                 );
+            }).catch((e) => {
+                logger.debug(`[REMOTE-TERMINAL] terminate session=${sessionId} failed: ${e instanceof Error ? e.message : String(e)}`);
             });
             // onExit handler clears the entry; remove explicitly in case
             // the teardown races with reconnect.
@@ -4372,6 +4405,10 @@ export class ApiMachineClient {
             const advertisedWriteFileAttempt = this.managedHandlers ? undefined : WRITE_FILE_ATTEMPT_CAPABILITY;
             const writeFileAttemptStale = JSON.stringify(this.machine.metadata?.writeFileAttempt)
                 !== JSON.stringify(advertisedWriteFileAttempt);
+            // Same gate as writeFile: a managed runtime does not serve the file RPCs.
+            const advertisedListFilesPage = this.managedHandlers ? undefined : LIST_FILES_PAGE_CAPABILITY;
+            const listFilesPageStale = JSON.stringify(this.machine.metadata?.listFilesPage)
+                !== JSON.stringify(advertisedListFilesPage);
             const advertisedChannelHost = this.managedHandlers ? undefined : this.channelHostAdvertisement;
             const channelHostStale = JSON.stringify(this.machine.metadata?.channelHost)
                 !== JSON.stringify(advertisedChannelHost);
@@ -4395,6 +4432,10 @@ export class ApiMachineClient {
             const advertisedProjectPurge = advertisedWorktreeOps ? PROJECT_PURGE_CAPABILITY : undefined;
             const projectPurgeStale = JSON.stringify(this.machine.metadata?.projectPurge)
                 !== JSON.stringify(advertisedProjectPurge);
+            // aplus workspace-sync-strict-design.md (F6): `workspace:*`, likewise.
+            const advertisedWorkspaceSync = advertisedWorktreeOps ? WORKSPACE_SYNC_CAPABILITY : undefined;
+            const workspaceSyncStale = JSON.stringify(this.machine.metadata?.workspaceSync)
+                !== JSON.stringify(advertisedWorkspaceSync);
             // F8: `datakey:reseed`, only where the handler was set (strict, org pin store).
             const advertisedCompanyKeyReseed = this.companyKeyReseedAvailable && advertisedWorktreeOps ? COMPANY_KEY_RESEED_CAPABILITY : undefined;
             const companyKeyReseedStale = JSON.stringify(this.machine.metadata?.companyKeyReseed)
@@ -4416,7 +4457,7 @@ export class ApiMachineClient {
             // Bounded: an acknowledgement that never comes must not block every later change.
             const awaitingServer = this.capabilityUpdateInFlight !== null
                 && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
-            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || companyKeyReseedStale || terminalBindingStale || writeFileAttemptStale)) {
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || writeFileAttemptStale || listFilesPageStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -4451,11 +4492,13 @@ export class ApiMachineClient {
                     aiAuthSelection: advertisedAiAuthSelection,
                     structuredOutput: advertisedStructuredOutput,
                     writeFileAttempt: advertisedWriteFileAttempt,
+                    listFilesPage: advertisedListFilesPage,
                     channelHost: advertisedChannelHost,
                     rpcBinding: advertisedRpcBinding,
                     sealedSpawnEnv: advertisedSealedSpawnEnv,
                     worktreeOps: advertisedWorktreeOps,
                     projectPurge: advertisedProjectPurge,
+                    workspaceSync: advertisedWorkspaceSync,
                     companyKeyReseed: advertisedCompanyKeyReseed,
                     terminalBinding: advertisedTerminalBinding,
                     daemonSessionState: daemonSessionStateAvailable ? { version: 1 } : undefined,

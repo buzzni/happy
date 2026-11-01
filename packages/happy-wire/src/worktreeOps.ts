@@ -33,6 +33,14 @@ export const projectPurgeCapabilitySchema = z.object({ version: z.literal(1) });
 export type ProjectPurgeCapability = z.infer<typeof projectPurgeCapabilitySchema>;
 export const PROJECT_PURGE_CAPABILITY: ProjectPurgeCapability = { version: 1 };
 
+/**
+ * aplus-dev-studio workspace-sync-strict-design.md (F6) — `workspace:*` (code save, pull, clone) is
+ * advertised on its own: the web uses the browser path only where all of it is there.
+ */
+export const workspaceSyncCapabilitySchema = z.object({ version: z.literal(1) });
+export type WorkspaceSyncCapability = z.infer<typeof workspaceSyncCapabilitySchema>;
+export const WORKSPACE_SYNC_CAPABILITY: WorkspaceSyncCapability = { version: 1 };
+
 // ── Names and managed paths (the server's rules, moved here unchanged) ──────────────────────────
 
 const WORKTREE_NAME_ADJECTIVES = [
@@ -122,6 +130,31 @@ export function isProjectWorktreePath(path: string, repoRoot: string, projectId:
   return name !== '' && sanitizeWorktreeName(name) === name && name.split('/').every((part) => part !== '' && part !== '.' && part !== '..');
 }
 
+// ── Workspace snapshot (the web's fork filter, `server/projectFork.ts`, unchanged) ───────────────
+
+/** Left out anywhere: their leak is bad enough that a name collision does not matter. */
+const SNAPSHOT_SKIP_ANYWHERE: ReadonlySet<string> = new Set(['node_modules', '.git']);
+/** Build and tool output at the root only; `build/` stays, it is as often source as output. */
+const SNAPSHOT_SKIP_AT_ROOT: ReadonlySet<string> = new Set([
+  'dist', '.next', '.cache', '.turbo', '.parcel-cache', '.vite', 'coverage', '.pnpm-store', '.omc', '.axstudio',
+]);
+const PERSONAL_TEMPLATE_PATH = /(^|\/)(?:\.aplus\/templates\/personal-[^/]+|\.(?:agents|claude)\/skills\/artifact-template-personal-[^/]+)(?:\/|$)/;
+
+/**
+ * Whether a workspace path ('/'-separated, relative to the workspace) stays out of a code save:
+ * secrets (`.env`, `.env.*`, not `.envrc`), git data, dependencies, build output, crash dumps, the
+ * local worktrees and personal templates.
+ */
+export function isExcludedFromWorkspaceSnapshot(relativePath: string): boolean {
+  if (relativePath === '.aplus/worktrees' || relativePath.startsWith('.aplus/worktrees/')) return true;
+  if (PERSONAL_TEMPLATE_PATH.test(relativePath)) return true;
+  return relativePath.split('/').some((segment, index) => SNAPSHOT_SKIP_ANYWHERE.has(segment)
+    || (index === 0 && SNAPSHOT_SKIP_AT_ROOT.has(segment))
+    || segment.endsWith('.core')
+    || segment === '.env'
+    || segment.startsWith('.env.'));
+}
+
 // ── Operation ticket ───────────────────────────────────────────────────────────────────────────
 
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/;
@@ -136,10 +169,11 @@ const worktreeNameSchema = z.string().min(1).max(60).refine((value) => sanitizeW
 // A ref the daemon passes to git as an argument: never read as an option, never empty.
 // The daemon still runs `git check-ref-format` on it.
 const refSchema = z.string().min(1).max(255).refine((value) => !value.startsWith('-') && !/\s/.test(value) && !CONTROL_CHARACTER.test(value), 'git ref');
-// The repository's own address: plain http(s), no credentials in it (those come sealed), nothing
-// git would read as another transport (`file://`, `ext::`).
+// The repository's own address: https only, so a sealed credential never travels in the clear
+// (workspace-sync-strict-design.md §4-1); no credentials in it (those come sealed), nothing git would
+// read as another transport (`file://`, `ext::`).
 const remoteUrlSchema = z.string().max(2048).refine(
-  (value) => /^https?:\/\/[^\s/@]+\/\S+$/.test(value) && !CONTROL_CHARACTER.test(value),
+  (value) => /^https:\/\/[^\s/@]+\/\S+$/.test(value) && !CONTROL_CHARACTER.test(value),
   'remote url',
 );
 const commitSchema = z.string().regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/);
@@ -200,6 +234,53 @@ export const worktreeOpParamsSchemas = {
     purgeFolder: z.boolean(),
     dryRun: z.boolean(),
   }).strict(),
+  // ── The workspace's online repository (aplus-dev-studio workspace-sync-strict-design.md, F6) ──
+  // `remoteUrl` null: the machine's own `origin` and login. With an address, `origin` must already
+  // name that repository; these operations never point `origin` anywhere new.
+  /** Fetches `branch` (and `baseBranch`) and tells how far the workspace is from them. */
+  'remote-status': z.object({
+    workspaceDir: absolutePath,
+    remoteUrl: remoteUrlSchema.nullable(),
+    branch: refSchema,
+    baseBranch: refSchema.nullable(),
+  }).strict(),
+  /**
+   * Brings `branch` (then `baseBranch`) into the workspace, which must still be at `expectedHead` —
+   * the head this browser just saw in `remote-status`. `ff-only` moves a clean workspace forward and
+   * may push `branch`; `merge` saves the current files first and leaves conflicts for the user.
+   * Nothing here overwrites work.
+   */
+  'pull-remote': z.object({
+    workspaceDir: absolutePath,
+    remoteUrl: remoteUrlSchema.nullable(),
+    branch: refSchema,
+    baseBranch: refSchema.nullable(),
+    mode: z.enum(['ff-only', 'merge']),
+    expectedHead: commitSchema.nullable(),
+    push: z.boolean(),
+  }).strict()
+    .refine((params) => !params.push || params.mode === 'ff-only', 'push after a merge'),
+  /** A collaboration's workspace: `branch` of the repository, into this project's empty managed folder. */
+  clone: z.object({ workspaceDir: absolutePath, remoteUrl: remoteUrlSchema, branch: refSchema }).strict(),
+  /**
+   * The code save: the workspace's files (the snapshot filter applied) as one commit on `branch`.
+   * `workspace` saves to the workspace's own repository and leaves its git pointing there; `deploy`
+   * saves to the deploy repository and leaves the workspace's git alone. A repository the machine has
+   * not connected this folder to before needs `confirmFirstRemote` (the user's confirmation).
+   * `dryRun` only reads what the confirmation needs.
+   */
+  'sync-remote': z.object({
+    workspaceDir: absolutePath,
+    kind: z.enum(['workspace', 'deploy']),
+    remoteUrl: remoteUrlSchema,
+    branch: refSchema,
+    commitMessage: z.string().min(1).max(2000).refine((value) => !CONTROL_CHARACTER.test(value), 'commit message'),
+    authorName: z.string().min(1).max(256).refine((value) => !CONTROL_CHARACTER.test(value), 'author name'),
+    authorEmail: z.string().min(3).max(256).refine((value) => value.includes('@') && !CONTROL_CHARACTER.test(value), 'author email'),
+    sizeCapBytes: z.number().int().positive(),
+    confirmFirstRemote: z.boolean(),
+    dryRun: z.boolean(),
+  }).strict(),
 } as const;
 
 export type WorktreeOp = keyof typeof worktreeOpParamsSchemas;
@@ -233,8 +314,15 @@ export function readWorktreeTicket(value: unknown): { ok: true; ticket: Worktree
   return { ok: true, ticket: { ...base.data, params: params.data } as WorktreeTicket };
 }
 
-export function worktreeOpMethod<Op extends WorktreeOp>(op: Op): `worktree:${Op}` {
-  return `worktree:${op}`;
+/** The workspace's online repository operations: the same ticket, a `workspace:` daemon method. */
+export const WORKSPACE_SYNC_OPS = ['remote-status', 'pull-remote', 'clone', 'sync-remote'] as const satisfies readonly WorktreeOp[];
+export type WorkspaceSyncOp = (typeof WORKSPACE_SYNC_OPS)[number];
+const WORKSPACE_SYNC_OP_SET: ReadonlySet<WorktreeOp> = new Set(WORKSPACE_SYNC_OPS);
+
+export type WorktreeOpMethod<Op extends WorktreeOp> = Op extends WorkspaceSyncOp ? `workspace:${Op}` : `worktree:${Op}`;
+
+export function worktreeOpMethod<Op extends WorktreeOp>(op: Op): WorktreeOpMethod<Op> {
+  return (WORKSPACE_SYNC_OP_SET.has(op) ? `workspace:${op}` : `worktree:${op}`) as WorktreeOpMethod<Op>;
 }
 
 // ── Operation results ──────────────────────────────────────────────────────────────────────────
@@ -292,6 +380,37 @@ export const worktreeOpResultSchemas = {
       containers: z.enum(['skipped', 'none', 'removed', 'failed']),
       folder: z.enum(['skipped', 'removed', 'missing', 'preserved', 'blocked', 'failed']),
     }).strict(),
+  }).strict(),
+  /** `ahead`/`behind` against `branch` online, `baseBehind` against `baseBranch`; null when that branch is not online. */
+  'remote-status': z.object({
+    isRepo: z.boolean(),
+    head: commitSchema.nullable(),
+    branch: z.string().nullable(),
+    dirtyCount: z.number().int().nonnegative(),
+    ahead: z.number().int().nonnegative().nullable(),
+    behind: z.number().int().nonnegative().nullable(),
+    baseBehind: z.number().int().nonnegative().nullable(),
+  }).strict(),
+  'pull-remote': z.object({
+    status: z.enum(['up-to-date', 'fast-forwarded', 'merged', 'conflict', 'dirty', 'diverged', 'not-a-repo', 'head-moved']),
+    head: commitSchema.nullable(),
+    conflictCount: z.number().int().nonnegative(),
+  }).strict(),
+  /** changed: false — it was already this repository's clone (a retry after it landed). */
+  clone: z.object({ changed: z.boolean(), head: commitSchema, branch: z.string().min(1) }).strict(),
+  /**
+   * checked: a dry run (`origin`/`pinned` are the repositories the confirmation shows). Every other
+   * outcome (online is ahead, too large, conflict markers, …) is a refusal, never attested. Counts and
+   * a commit only: no file name reaches the server.
+   */
+  'sync-remote': z.object({
+    status: z.enum(['checked', 'pushed', 'noop-up-to-date']),
+    commitSha: commitSchema.nullable(),
+    filesChanged: z.number().int().nonnegative(),
+    sizeBytes: z.number().int().nonnegative(),
+    origin: z.string().nullable(),
+    pinned: z.string().nullable(),
+    dirtyCount: z.number().int().nonnegative(),
   }).strict(),
 } as const satisfies Record<WorktreeOp, z.ZodType>;
 

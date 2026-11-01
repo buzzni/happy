@@ -2,7 +2,7 @@
  * Single-user PC (macOS/Windows): the daemon owns the personal browser runtime that the
  * Desktop installer configured in the user's Saycode directory. It starts the runtime as its
  * child (the runtime ends when this daemon's pipe closes), points new sessions at it, and has
- * Studio sign every broker command with the signed-in user's token. The runtime and the
+ * Studio sign every broker command with user authentication or an approved organization device proof. The runtime and the
  * browser never receive that token or any other daemon credential.
  */
 import { spawn, type ChildProcess } from 'node:child_process'
@@ -12,6 +12,7 @@ import type { NativeBrokerRequestOptions } from '@/browserRuntime/brokerGrantSou
 import { personalRuntimePaths } from '@/browserRuntime/personalDesktopRuntime'
 import { parseRuntimeConfig } from '@/browserRuntime/runtimeConfig'
 import { projectPath } from '@/projectPath'
+import type { BrowserNativeDeviceSigner } from './browserNativeDeviceProof'
 
 /** Variables the runtime process may see besides its own two; never credentials or HAPPY_*. */
 const RUNTIME_ENV = ['HOME', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'SystemRoot', 'windir', 'SystemDrive', 'USERPROFILE', 'LOCALAPPDATA',
@@ -36,8 +37,9 @@ export interface PersonalBrowserRuntimeOptions {
     home?: string
     machineId: string
     studioOrigin: string | null
-    /** The signed-in user's token, read per request (it may rotate). */
+    /** The daemon's user/company bearer, read per request (it may rotate). */
     token: () => string
+    deviceProof?: BrowserNativeDeviceSigner
     log: (message: string) => void
     fetchImpl?: typeof fetch
     spawnImpl?: typeof spawn
@@ -79,15 +81,27 @@ export function readPersonalBrowserRuntime(options: PersonalBrowserRuntimeOption
     const fetchImpl = options.fetchImpl ?? fetch
     const issue: NativeBrokerRequestOptions['issue'] = async (command) => {
         const url = new URL(`/api/machines/${encodeURIComponent(options.machineId)}/agent-browser/native-command`, studioOrigin)
-        let response: Response
-        try {
-            response = await fetchImpl(url, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10_000),
-                headers: { Authorization: `Bearer ${options.token()}`, 'Content-Type': 'application/json' }, body: JSON.stringify(command) })
-        } catch { throw new Error('NATIVE_AUTHORIZATION_UNAVAILABLE') }
+        const body = JSON.stringify(command)
+        const send = async (proof?: string): Promise<Response> => {
+            try {
+                return await fetchImpl(url, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10_000),
+                    headers: { Authorization: `Bearer ${options.token()}`, 'Content-Type': 'application/json',
+                        ...(proof ? { 'X-Saycode-Browser-Device-Proof': proof } : {}) }, body })
+            } catch { throw new Error('NATIVE_AUTHORIZATION_UNAVAILABLE') }
+        }
+        // A personal bearer remains valid even for a company workspace. Only an explicit
+        // authorization refusal tries machine/device authentication; no command was issued yet.
+        let response = await send()
+        if ((response.status === 401 || response.status === 403) && !config.workspaceId.startsWith('personal:')) {
+            if (!options.deviceProof) throw new Error('NATIVE_DEVICE_APPROVAL_REQUIRED')
+            const proof = await options.deviceProof({ studioOrigin, machineId: config.machineId,
+                workspaceId: config.workspaceId, path: url.pathname, body })
+            response = await send(proof)
+        }
         if (response.status !== 200) throw new Error(response.status === 403 || response.status === 401 ? 'NATIVE_AUTHORIZATION_DENIED' : 'NATIVE_AUTHORIZATION_UNAVAILABLE')
-        const body = await response.json().catch(() => undefined) as { token?: unknown; expiresAtMs?: unknown } | undefined
-        if (typeof body?.token !== 'string' || typeof body.expiresAtMs !== 'number') throw new Error('NATIVE_AUTHORIZATION_UNAVAILABLE')
-        return { token: body.token, expiresAtMs: body.expiresAtMs }
+        const result = await response.json().catch(() => undefined) as { token?: unknown; expiresAtMs?: unknown } | undefined
+        if (typeof result?.token !== 'string' || typeof result.expiresAtMs !== 'number') throw new Error('NATIVE_AUTHORIZATION_UNAVAILABLE')
+        return { token: result.token, expiresAtMs: result.expiresAtMs }
     }
     const runtimeEnv: Record<string, string> = {}
     for (const name of RUNTIME_ENV) { const value = env[name]; if (value) runtimeEnv[name] = value }

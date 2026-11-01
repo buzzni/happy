@@ -1,8 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { hkdfSync, randomBytes } from 'node:crypto';
 import { bindRpcRequest, terminalFrameKeyInfo, type TerminalOpenParams } from '@slopus/happy-wire';
 import { decodeBase64, decryptWithDataKey, encodeBase64, encryptWithDataKey } from '@/api/encryption';
-import { bindTerminal, createTerminalOpenNonceGuard, decideTerminalOpen } from './terminalBindingSession';
+import type { DaemonTerminalEntry } from './daemonTerminalSessions';
+import {
+    bindTerminal,
+    createTerminalOpenNonceGuard,
+    decideTerminalOpen,
+    receiveBoundTerminalFrame,
+    TERMINAL_IN_REORDER_MAX_HELD,
+    TERMINAL_IN_REORDER_WINDOW_MS,
+} from './terminalBindingSession';
 
 const b64 = (n: number) => randomBytes(n).toString('base64');
 const machineId = 'machine-1';
@@ -107,22 +115,21 @@ describe('bindTerminal', () => {
     it('takes inbound frames in order, drops a replay and reports a gap', () => {
         const { params, terminal, opened } = bind();
         const frame = (seq: number) => sealIn(params, opened.daemonNonce, { seq, kind: 'input', data: `k${seq}` });
-        expect(terminal.openIn(frame(1))).toEqual({ kind: 'frame', frame: { v: 1, t: params.terminalId, dir: 'in', seq: 1, kind: 'input', data: 'k1' } });
+        expect(terminal.openIn(frame(1))).toEqual({ kind: 'frames', frames: [{ v: 1, t: params.terminalId, dir: 'in', seq: 1, kind: 'input', data: 'k1' }] });
         expect(terminal.openIn(frame(1))).toEqual({ kind: 'replayed' });
-        expect(terminal.openIn(frame(2)).kind).toBe('frame');
-        expect(terminal.openIn(frame(4))).toEqual({ kind: 'gap' });
+        expect(terminal.openIn(frame(2)).kind).toBe('frames');
+        expect(terminal.openIn(frame(4 + TERMINAL_IN_REORDER_MAX_HELD))).toEqual({ kind: 'gap' });
     });
 
-    it('takes an attach past a hole, since a lost attempt used its seq, but never a repeat or another kind', () => {
+    it('holds a frame that arrives ahead of the one before it and releases both in order', () => {
         const { params, terminal, opened } = bind();
-        const rid = b64(16);
-        const attach = (seq: number) => sealIn(params, opened.daemonNonce, { seq, kind: 'attach', rid, afterSeq: 0 });
-        expect(terminal.openAttach(attach(3))).toEqual({ kind: 'frame', frame: { v: 1, t: params.terminalId, dir: 'in', seq: 3, kind: 'attach', rid, afterSeq: 0 } });
-        expect(terminal.openAttach(attach(3))).toEqual({ kind: 'replayed' });
-        expect(terminal.openAttach(attach(2))).toEqual({ kind: 'replayed' });
-        expect(terminal.openAttach(sealIn(params, opened.daemonNonce, { seq: 9, kind: 'input', data: 'x' }))).toEqual({ kind: 'unreadable' });
-        // Input after it continues from the attach's seq.
-        expect(terminal.openIn(sealIn(params, opened.daemonNonce, { seq: 4, kind: 'input', data: 'x' })).kind).toBe('frame');
+        const frame = (seq: number) => sealIn(params, opened.daemonNonce, { seq, kind: 'input', data: `k${seq}` });
+        expect(terminal.openIn(frame(1)).kind).toBe('frames');
+        expect(terminal.openIn(frame(3))).toEqual({ kind: 'held', awaiting: 2 });
+        expect(terminal.openIn(frame(3))).toEqual({ kind: 'replayed' });
+        const released = terminal.openIn(frame(2));
+        expect(released.kind === 'frames' && released.frames.map((f) => f.seq)).toEqual([2, 3]);
+        expect(terminal.abandonHole(2)).toBe(false);
     });
 
     it('does not open frames sealed for another direction, terminal or open', () => {
@@ -133,6 +140,68 @@ describe('bindTerminal', () => {
         expect(terminal.openIn(sealIn(params, b64(16), { seq: 1, kind: 'close' }))).toEqual({ kind: 'unreadable' });
         expect(terminal.openIn('not base64 at all')).toEqual({ kind: 'unreadable' });
         // Nothing unreadable moved the sequence.
-        expect(terminal.openIn(sealIn(params, opened.daemonNonce, { seq: 1, kind: 'close' })).kind).toBe('frame');
+        expect(terminal.openIn(sealIn(params, opened.daemonNonce, { seq: 1, kind: 'close' })).kind).toBe('frames');
+    });
+});
+
+describe('receiveBoundTerminalFrame', () => {
+    const sessionId = 'session-1';
+    afterEach(() => { vi.useRealTimers(); });
+
+    const setup = () => {
+        const params = openParams();
+        const { terminal, proof } = bindTerminal({ params, nonce: b64(16), sessionId, caps });
+        const daemonNonce = decryptWithDataKey(decodeBase64(proof), decodeBase64(params.terminalKey)).daemonNonce;
+        const inKey = new Uint8Array(hkdfSync(
+            'sha256', decodeBase64(params.terminalKey), decodeBase64(daemonNonce),
+            Buffer.from(terminalFrameKeyInfo('in', sessionId, params.terminalId), 'utf8'), 32,
+        ));
+        const writes: string[] = [];
+        const end = vi.fn();
+        const entry = { exit: null, session: { write: (data: string) => { writes.push(data); }, resize: () => {} } } as unknown as DaemonTerminalEntry;
+        const receive = (seq: number) => receiveBoundTerminalFrame({
+            sessionId,
+            entry,
+            binding: terminal,
+            data: encodeBase64(encryptWithDataKey({ v: 1, t: params.terminalId, dir: 'in', seq, kind: 'input', data: `k${seq}` }, inKey)),
+            sendSealed: () => {},
+            sendClosed: () => {},
+            end,
+        });
+        return { terminal, writes, end, receive };
+    };
+
+    it('writes frames a relay swapped in their order and keeps the terminal', () => {
+        vi.useFakeTimers();
+        const { terminal, writes, end, receive } = setup();
+        receive(1);
+        receive(3);
+        receive(2);
+        vi.advanceTimersByTime(TERMINAL_IN_REORDER_WINDOW_MS + 1);
+        expect(writes).toEqual(['k1', 'k2', 'k3']);
+        expect(end).not.toHaveBeenCalled();
+        expect(terminal.closeReason).toBeUndefined();
+    });
+
+    it('ends the terminal when a hole stays open past the reorder window, writing nothing behind it', () => {
+        vi.useFakeTimers();
+        const { terminal, writes, end, receive } = setup();
+        receive(1);
+        receive(3);
+        vi.advanceTimersByTime(TERMINAL_IN_REORDER_WINDOW_MS - 1);
+        expect(end).not.toHaveBeenCalled();
+        vi.advanceTimersByTime(1);
+        expect(end).toHaveBeenCalledTimes(1);
+        expect(terminal.closeReason).toBe('input-gap');
+        expect(writes).toEqual(['k1']);
+    });
+
+    it('ends the terminal at once when a frame is further ahead than the window holds', () => {
+        const { terminal, writes, end, receive } = setup();
+        receive(1);
+        receive(3 + TERMINAL_IN_REORDER_MAX_HELD);
+        expect(end).toHaveBeenCalledTimes(1);
+        expect(terminal.closeReason).toBe('input-gap');
+        expect(writes).toEqual(['k1']);
     });
 });

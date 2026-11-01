@@ -1,8 +1,11 @@
 import nacl from 'tweetnacl';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, TERMINAL_BINDING_CAPABILITY, WORKTREE_OPS_CAPABILITY, bindRpcRequest, terminalFrameKeyInfo } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, TERMINAL_BINDING_CAPABILITY, WORKSPACE_SYNC_CAPABILITY, WORKTREE_OPS_CAPABILITY, bindRpcRequest, terminalFrameKeyInfo } from '@slopus/happy-wire';
 import { configuration } from '@/configuration';
-import { ApiMachineClient } from './apiMachine';
+import {
+    ApiMachineClient,
+    PREVIEW_BOUND_PROXY_EVENT,
+} from './apiMachine';
 import { addDaemonTerminalSession, getDaemonTerminalSession, markDaemonTerminalSessionExited, removeDaemonTerminalSession } from '@/daemon/daemonTerminalSessions';
 import { deriveServerRpcKey, decodeBase64, decrypt, decryptWithDataKey, encodeBase64, encrypt, encryptWithDataKey } from './encryption';
 import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_MAX_DELAY_MS, RECONNECT_NOT_READY_POLL_MS } from './reconnectCadence';
@@ -15,6 +18,7 @@ import { createAiCredentialRuntime } from '@/daemon/aiCredentialRuntime';
 import { TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
 import { MOAI_MANAGED_TOOL } from '@/modules/common/moaiMachineRunProfiles';
 import { WRITE_FILE_ATTEMPT_CAPABILITY } from '@/modules/common/writeFileAttempts';
+import { LIST_FILES_PAGE_CAPABILITY } from '@/modules/common/listFilesPageCapability';
 import { McpCallerGrantEnvelopeConsumer } from '@/daemon/mcpCallerGrantEnvelope';
 import { join } from 'node:path';
 import { hkdfSync, randomBytes } from 'node:crypto';
@@ -332,6 +336,61 @@ describe('ApiMachineClient socket reconnection', () => {
             expect(socketHandlers[event], event).toHaveLength(1);
         }
         expect(socketHandlers['proxy-ws-open']).toBeUndefined();
+    });
+
+    /*
+     * An acked event can arrive without its ack (seen in the burst delivered right
+     * after a reconnect). Calling the missing ack inside an async listener
+     * is an unhandled rejection, which shuts the whole daemon down (2026-11-01:
+     * a buffered terminal-open-fwd took the machine offline for 26 minutes).
+     */
+    describeUnix('acked events that arrive without an ack', () => {
+        const sessionId = 'term-no-ack-1';
+
+        afterEach(() => {
+            const entry = getDaemonTerminalSession(sessionId);
+            if (entry) void entry.session.terminate();
+            removeDaemonTerminalSession(sessionId);
+        });
+
+        it('settles terminal-open-fwd without opening a shell', async () => {
+            const machine = makeMachine();
+            const client = new ApiMachineClient('fake-token', machine);
+            client.connect();
+            const params = encodeBase64(encrypt(machine.encryptionKey, machine.encryptionVariant, { userId: 'u1', shell: '/bin/sh' }));
+
+            await expect(socketHandlers['terminal-open-fwd']![0]!({ sessionId, params })).resolves.toBeUndefined();
+
+            expect(getDaemonTerminalSession(sessionId)).toBeNull();
+        });
+
+        // Every listener that takes an ack, not a copied list: one added later without the
+        // guard is caught here (the first version of this fix missed three).
+        it('settles every acked listener it registers', async () => {
+            const client = new ApiMachineClient('fake-token', makeMachine());
+            client.connect();
+            const acked = Object.entries(socketHandlers)
+                .flatMap(([event, handlers]) => handlers.filter((handler) => handler.length >= 2).map((handler) => [event, handler] as const));
+
+            expect(acked.map(([event]) => event)).toEqual(expect.arrayContaining([
+                'proxy-http-request', PREVIEW_BOUND_PROXY_EVENT, 'preview-runtime-lease', 'proxy-ws-open', 'terminal-open-fwd',
+            ]));
+            for (const [event, handler] of acked) {
+                await expect(Promise.resolve(handler({ port: 3000 })), event).resolves.toBeUndefined();
+            }
+        });
+
+        it('logs a listener that fails instead of rejecting', async () => {
+            vi.spyOn(ApiMachineClient.prototype as any, 'relayPreviewHttp').mockRejectedValue(new Error('relay broke'));
+            const client = new ApiMachineClient('fake-token', makeMachine());
+            client.connect();
+            const ack = vi.fn();
+
+            await expect(socketHandlers['proxy-http-request']![0]!({ port: 3000 }, ack)).resolves.toBeUndefined();
+
+            expect(ack).not.toHaveBeenCalled();
+            expect(vi.mocked(logger.debug)).toHaveBeenCalledWith('[API MACHINE] proxy-http-request listener failed: relay broke');
+        });
     });
 
     /*
@@ -803,6 +862,26 @@ describe('ApiMachineClient socket reconnection', () => {
             expect(replay.length).toBeGreaterThan(0);
             expect(replay.every((frame: any) => frame.kind === 'output' && frame.rid === rid)).toBe(true);
             expect(replay.map((frame: any) => frame.data).join('')).toContain('resumed-here');
+        });
+
+        // Codex CLI benchmark D4 B-R2 on v2: the daemon holds no keys for a terminal it forgot, so the plaintext unknown-session is the answer.
+        it('answers a sealed resume for a terminal this daemon no longer has with unknown-session', async () => {
+            const machine = makeMachine();
+            const client = new ApiMachineClient('fake-token', machine);
+            client.connect();
+            const sessionId = 'v2-gone-1';
+            const opener = boundOpen(machine);
+            const ack = await open(machine, sessionId, opener.params);
+            const terminal = clientOf(sessionId, opener.terminalKey, opener.terminalId, ack.caps.terminalBinding.proof);
+            await getDaemonTerminalSession(sessionId)!.session.terminate();
+            removeDaemonTerminalSession(sessionId);
+            mockSocket.emit.mockClear();
+
+            terminal.send({ kind: 'resume', rid: b64(16), afterSeq: 3 });
+
+            expect(mockSocket.emit.mock.calls).toEqual([
+                ['terminal-closed', { sessionId, reason: 'unknown-session' }],
+            ]);
         });
     });
 
@@ -1639,6 +1718,30 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
+    // aplus-dev-studio specs/remote-file-list-pages — the web picks listFilesPage only on a
+    // daemon that says it serves it; an older daemon answers only after the reconnect grace.
+    it('advertises listFilesPage on a machine registered before the advertisement existed', async () => {
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            if (event === 'machine-update-state') {
+                return { result: 'success', version: 1, daemonState: data.daemonState };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        expect(machine.metadata?.listFilesPage).toBeUndefined();
+        const client = new ApiMachineClient('fake-token', machine);
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.listFilesPage).toEqual(LIST_FILES_PAGE_CAPABILITY));
+
+        client.shutdown();
+    });
+
     // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 — the web starts a strict machine's
     // preview with a sealed env only on a daemon that says it opens one. An existing machine keeps
     // its first metadata, so the advertisement has to be republished; only a machine key opens it.
@@ -1669,7 +1772,7 @@ describe('ApiMachineClient socket reconnection', () => {
     });
 
     // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 worktree — the result signature is keyed
-    // from the machine key, so only a dataKey machine advertises worktree operations.
+    // from the machine key, so only a dataKey machine advertises worktree operations (and `workspace:*`, F6).
     it.each([
         { variant: 'dataKey' as const, expected: WORKTREE_OPS_CAPABILITY },
         { variant: 'legacy' as const, expected: undefined },
@@ -1685,13 +1788,18 @@ describe('ApiMachineClient socket reconnection', () => {
             return { result: 'success' };
         });
         const machine = { ...makeMachine(), encryptionVariant: variant };
-        machine.metadata = { ...machine.metadata!, worktreeOps: variant === 'legacy' ? WORKTREE_OPS_CAPABILITY : undefined };
+        machine.metadata = {
+            ...machine.metadata!,
+            worktreeOps: variant === 'legacy' ? WORKTREE_OPS_CAPABILITY : undefined,
+            workspaceSync: variant === 'legacy' ? WORKSPACE_SYNC_CAPABILITY : undefined,
+        };
         const client = new ApiMachineClient('fake-token', machine);
         client.connect();
 
         socketHandlers.connect![0]!();
         await vi.waitFor(() => expect(machine.metadata?.rpcBinding).toEqual(RPC_BINDING_CAPABILITY));
         expect(machine.metadata?.worktreeOps).toEqual(expected);
+        expect(machine.metadata?.workspaceSync).toEqual(expected ? WORKSPACE_SYNC_CAPABILITY : undefined);
 
         client.shutdown();
     });
@@ -1819,6 +1927,7 @@ describe('ApiMachineClient socket reconnection', () => {
             channelSupport: CHANNEL_SUPPORT_CAPABILITY,
             aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
             writeFileAttempt: WRITE_FILE_ATTEMPT_CAPABILITY,
+            listFilesPage: LIST_FILES_PAGE_CAPABILITY,
         };
         const client = new ApiMachineClient('fake-token', machine);
         client.setRPCHandlers({
@@ -1834,6 +1943,7 @@ describe('ApiMachineClient socket reconnection', () => {
             expect(machine.metadata?.aiAuthSelection).toBeUndefined();
             // Managed runtimes do not serve `writeFile`, so nothing there answers an attempt.
             expect(machine.metadata?.writeFileAttempt).toBeUndefined();
+            expect(machine.metadata?.listFilesPage).toBeUndefined();
         });
         client.shutdown();
     });

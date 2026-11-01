@@ -2,7 +2,7 @@ export type SetupTokenRotationState = 'switching' | 'switched' | 'exhausted' | '
 import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { z } from 'zod'
 import type { OrgRequirementsAgentState, ProviderUsageEventV1, Update, UpdateMachineBody } from '@slopus/happy-wire';
-import { authenticatedEnvelopesCapabilitySchema, companyKeyReseedCapabilitySchema, OrgRequirementsCapabilitySchema, projectPurgeCapabilitySchema, rpcBindingCapabilitySchema, sealedSpawnEnvCapabilitySchema, terminalBindingCapabilitySchema, worktreeOpsCapabilitySchema, type RpcBindingCapability } from '@slopus/happy-wire';
+import { authenticatedEnvelopesCapabilitySchema, companyKeyReseedCapabilitySchema, OrgRequirementsCapabilitySchema, projectPurgeCapabilitySchema, rpcBindingCapabilitySchema, sealedSpawnEnvCapabilitySchema, terminalBindingCapabilitySchema, workspaceSyncCapabilitySchema, worktreeOpsCapabilitySchema, type RpcBindingCapability } from '@slopus/happy-wire';
 import { UsageSchema } from '@/claude/types'
 import { DifficultyRoutingCapabilitySchema, DifficultyRoutingIntentSchema } from '@/difficultyRouting'
 import type { SandboxConfig } from '@/persistence'
@@ -281,6 +281,8 @@ export const MachineMetadataSchema = z.object({
    * 클라이언트는 이 필드를 보고 나서만 `attemptId` 를 보낸다.
    */
   writeFileAttempt: z.object({ version: z.literal(1) }).optional(),
+  /** This daemon serves `listFilesPage` (aplus-dev-studio specs/remote-file-list-pages). */
+  listFilesPage: z.object({ version: z.literal(1) }).optional(),
   /** Profile-based no-shell execution negotiated by Desktop extensions. */
   machineRun: z.object({
     protocolVersion: z.literal(1),
@@ -314,6 +316,8 @@ export const MachineMetadataSchema = z.object({
   worktreeOps: worktreeOpsCapabilitySchema.optional(),
   /** aplus-dev-studio strict-followup-plan F1 — runs `worktree:purge-project` (cleanup after a project delete). */
   projectPurge: projectPurgeCapabilitySchema.optional(),
+  /** aplus-dev-studio workspace-sync-strict-design.md (F6) — runs `workspace:*` (code save, pull, clone) and signs the results. */
+  workspaceSync: workspaceSyncCapabilitySchema.optional(),
   /** aplus specs/e2ee-machine-control-boundary F8: `datakey:reseed`, strict machines with an org pin only. */
   companyKeyReseed: companyKeyReseedCapabilitySchema.optional(),
   /** aplus terminal-binding-strict-design §4-7: opens remote terminals with their own key (contract v2), dataKey BYOS only. */

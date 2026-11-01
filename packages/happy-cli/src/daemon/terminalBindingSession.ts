@@ -13,7 +13,15 @@
  * `bindTerminal` picks a fresh daemon nonce, derives the per-direction frame
  * keys from it and the terminal key, and seals the proof the client checks.
  * A replayed open (after a restart forgot its nonce) therefore gets keys
- * nobody holds, and the input recorded for the first one opens nowhere.
+ * nobody holds, and the input recorded for the first one opens nowhere. The
+ * open itself still runs: a command it carries in `shell`/`args` runs again
+ * (the memory-only nonce guard, rpcNonceGuard.ts).
+ *
+ * Inbound frames are written strictly in order, but a frame that arrives ahead
+ * of the one before it waits for it: the relay swaps two frames of a client
+ * whose socket it is rebinding. A hole still ends the terminal — once it has
+ * stayed open for `TERMINAL_IN_REORDER_WINDOW_MS`, or at once when a frame is
+ * further ahead than `TERMINAL_IN_REORDER_MAX_HELD` frames can bridge.
  */
 
 import { hkdfSync, randomBytes } from 'node:crypto';
@@ -76,6 +84,11 @@ export function decideTerminalOpen(
     return { kind: 'bound', params, nonce: binding.nonce };
 }
 
+/** How long frames that arrived ahead of a missing one wait for it before the hole ends the terminal. */
+export const TERMINAL_IN_REORDER_WINDOW_MS = 2_000;
+/** How many frames may wait behind a missing one; a frame further ahead is a hole at once. */
+export const TERMINAL_IN_REORDER_MAX_HELD = 32;
+
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 export type TerminalOutBody = DistributiveOmit<TerminalOutFrame, 'v' | 't' | 'dir'>;
 export type BoundTerminalCloseReason = 'client-closed' | 'relay-closed' | 'input-gap';
@@ -86,15 +99,18 @@ export interface BoundTerminal {
     closeReason?: BoundTerminalCloseReason;
     /** Seals an outbound frame for `terminal-frame.data`. */
     sealOut(body: TerminalOutBody): string;
-    /** Opens `terminal-frame.data` from the client and admits it in order. */
-    openIn(data: string): { kind: 'frame'; frame: TerminalInFrame } | { kind: 'replayed' } | { kind: 'gap' } | { kind: 'unreadable' };
     /**
-     * Opens a direct-path `terminal-attach`: any seq after the last one counts. Each attempt of a
-     * reconnecting client takes a seq, and one that died with its socket never arrives; on loopback
-     * nobody can hold frames back selectively, so the hole is a lost attempt, not withheld input.
-     * A repeat is still a replay, and anything but an attach is unreadable here.
+     * Opens `terminal-frame.data` from the client and admits it in order: the frames it lets through
+     * (itself and any that waited for it), or `held` while the frame before it is missing.
      */
-    openAttach(data: string): { kind: 'frame'; frame: Extract<TerminalInFrame, { kind: 'attach' }> } | { kind: 'replayed' } | { kind: 'unreadable' };
+    openIn(data: string):
+        | { kind: 'frames'; frames: TerminalInFrame[] }
+        | { kind: 'held'; awaiting: number }
+        | { kind: 'replayed' }
+        | { kind: 'gap' }
+        | { kind: 'unreadable' };
+    /** True when `seq` is still missing behind held frames, which are then dropped: the hole stands. */
+    abandonHole(seq: number): boolean;
 }
 
 export function bindTerminal(input: {
@@ -116,33 +132,43 @@ export function bindTerminal(input: {
     const inKey = frameKey('in');
     const outKey = frameKey('out');
     let lastInSeq = 0;
-    const readIn = (data: string) => {
-        let opened: unknown = null;
-        try {
-            opened = decryptWithDataKey(decodeBase64(data), inKey);
-        } catch {
-            opened = null;
-        }
-        return readTerminalFrame(opened, { terminalId: params.terminalId, dir: 'in' });
-    };
+    const held = new Map<number, TerminalInFrame>();
 
     const terminal: BoundTerminal = {
         terminalId: params.terminalId,
         sealOut: (body) => encodeBase64(encryptWithDataKey({ v: TERMINAL_BINDING_VERSION, t: params.terminalId, dir: 'out', ...body }, outKey)),
         openIn: (data) => {
-            const frame = readIn(data);
+            let opened: unknown = null;
+            try {
+                opened = decryptWithDataKey(decodeBase64(data), inKey);
+            } catch {
+                opened = null;
+            }
+            const frame = readTerminalFrame(opened, { terminalId: params.terminalId, dir: 'in' });
             if (!frame) return { kind: 'unreadable' };
             const admission = admitInboundSeq(lastInSeq, frame.seq);
-            if (admission !== 'accept') return { kind: admission };
+            if (admission === 'replayed' || held.has(frame.seq)) return { kind: 'replayed' };
+            if (admission === 'gap') {
+                if (frame.seq > lastInSeq + 1 + TERMINAL_IN_REORDER_MAX_HELD) {
+                    held.clear();
+                    return { kind: 'gap' };
+                }
+                held.set(frame.seq, frame);
+                return { kind: 'held', awaiting: lastInSeq + 1 };
+            }
+            const frames = [frame];
             lastInSeq = frame.seq;
-            return { kind: 'frame', frame };
+            for (let next = held.get(lastInSeq + 1); next; next = held.get(lastInSeq + 1)) {
+                held.delete(next.seq);
+                frames.push(next);
+                lastInSeq = next.seq;
+            }
+            return { kind: 'frames', frames };
         },
-        openAttach: (data) => {
-            const frame = readIn(data);
-            if (!frame || frame.kind !== 'attach') return { kind: 'unreadable' };
-            if (frame.seq <= lastInSeq) return { kind: 'replayed' };
-            lastInSeq = frame.seq;
-            return { kind: 'frame', frame };
+        abandonHole: (seq) => {
+            if (held.size === 0 || seq !== lastInSeq + 1) return false;
+            held.clear();
+            return true;
         },
     };
     const proof = encodeBase64(encryptWithDataKey({
@@ -159,7 +185,8 @@ export function bindTerminal(input: {
 /**
  * terminal-binding-strict-design §4-4·4-5 — every control of a v2 terminal arrives as a sealed
  * frame, in order, whichever path carries it. A replay or anything unreadable is dropped; a hole
- * in the input ends the terminal, since keystrokes with one can assemble another command. The
+ * in the input ends the terminal, since keystrokes with one can assemble another command — after
+ * the reorder window, because the relay swaps frames it carries while rebinding a client. The
  * path delivers: `sendSealed` emits a `terminal-frame` with this data, `sendClosed` its exit,
  * `end` ends the PTY with the path's own bookkeeping.
  */
@@ -173,20 +200,31 @@ export function receiveBoundTerminalFrame(input: {
     end: () => void;
 }): void {
     const { sessionId, entry, binding } = input;
-    const opened = binding.openIn(input.data);
-    if (opened.kind === 'gap') {
+    const endOnGap = () => {
         logger.debug(`[REMOTE-TERMINAL] input gap session=${sessionId}; closing`);
         if (!entry.exit) {
             binding.closeReason ??= 'input-gap';
             input.end();
         }
+    };
+    const opened = binding.openIn(input.data);
+    if (opened.kind === 'held') {
+        setTimeout(() => { if (binding.abandonHole(opened.awaiting)) endOnGap(); }, TERMINAL_IN_REORDER_WINDOW_MS).unref();
         return;
     }
-    if (opened.kind !== 'frame') {
+    if (opened.kind === 'gap') {
+        endOnGap();
+        return;
+    }
+    if (opened.kind !== 'frames') {
         logger.debug(`[REMOTE-TERMINAL] bound frame dropped session=${sessionId} reason=${opened.kind}`);
         return;
     }
-    const frame = opened.frame;
+    for (const frame of opened.frames) applyBoundFrame(input, frame);
+}
+
+function applyBoundFrame(input: Parameters<typeof receiveBoundTerminalFrame>[0], frame: TerminalInFrame): void {
+    const { sessionId, entry, binding } = input;
     if (frame.kind === 'resume') {
         recordTerminalActivity(sessionId);
         replyToBoundResume({ ...input, rid: frame.rid, afterSeq: frame.afterSeq, maxChars: frame.maxChars });
