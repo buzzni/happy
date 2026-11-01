@@ -244,6 +244,56 @@ describe('sealed git credential', () => {
   });
 });
 
+// aplus-dev-studio workspace-sync-strict-design.md (F6) — the workspace's online repository.
+describe('workspace sync operations', () => {
+  const read = (op: string, params: Record<string, unknown>) => readWorktreeTicket(ticket({ op, params })).ok;
+  const ONLINE = 'https://github.com/o/r.git';
+  const head = 'a'.repeat(40);
+
+  it('reads the params of each operation', () => {
+    expect(read('remote-status', { workspaceDir: '/ws', remoteUrl: ONLINE, branch: 'main', baseBranch: null })).toBe(true);
+    expect(read('remote-status', { workspaceDir: '/ws', remoteUrl: null, branch: 'collab-x', baseBranch: 'main' })).toBe(true);
+    expect(read('pull-remote', {
+      workspaceDir: '/ws', remoteUrl: ONLINE, branch: 'collab-x', baseBranch: 'main', mode: 'ff-only', expectedHead: head, push: true,
+    })).toBe(true);
+    expect(read('pull-remote', {
+      workspaceDir: '/ws', remoteUrl: null, branch: 'main', baseBranch: null, mode: 'merge', expectedHead: null, push: false,
+    })).toBe(true);
+    expect(read('clone', { workspaceDir: '/ws', remoteUrl: ONLINE, branch: 'collab-x' })).toBe(true);
+  });
+
+  it('pushes only a fast-forward, never a merge it made', () => {
+    expect(read('pull-remote', {
+      workspaceDir: '/ws', remoteUrl: ONLINE, branch: 'main', baseBranch: null, mode: 'merge', expectedHead: head, push: true,
+    })).toBe(false);
+  });
+
+  it('has no overwrite mode', () => {
+    expect(read('pull-remote', {
+      workspaceDir: '/ws', remoteUrl: ONLINE, branch: 'main', baseBranch: null, mode: 'reset', expectedHead: head, push: false,
+    })).toBe(false);
+  });
+
+  it('clones only from an https address', () => {
+    expect(read('clone', { workspaceDir: '/ws', remoteUrl: null, branch: 'collab-x' })).toBe(false);
+    expect(read('clone', { workspaceDir: '/ws', remoteUrl: 'http://github.com/o/r.git', branch: 'collab-x' })).toBe(false);
+  });
+
+  it('names their daemon methods under workspace:', () => {
+    expect(worktreeOpMethod('remote-status')).toBe('workspace:remote-status');
+    expect(worktreeOpMethod('pull-remote')).toBe('workspace:pull-remote');
+    expect(worktreeOpMethod('clone')).toBe('workspace:clone');
+  });
+
+  it('reads their results strictly', () => {
+    const status = { isRepo: true, head, branch: 'main', dirtyCount: 0, ahead: 0, behind: 2, baseBehind: null };
+    expect(worktreeOpResultSchemas['remote-status'].parse(status)).toEqual(status);
+    expect(worktreeOpResultSchemas['pull-remote'].parse({ status: 'conflict', head, conflictCount: 3 })).toEqual({ status: 'conflict', head, conflictCount: 3 });
+    expect(worktreeOpResultSchemas['pull-remote'].safeParse({ status: 'reset', head, conflictCount: 0 }).success).toBe(false);
+    expect(worktreeOpResultSchemas.clone.parse({ changed: true, head, branch: 'collab-x' })).toEqual({ changed: true, head, branch: 'collab-x' });
+  });
+});
+
 describe('worktree operation results', () => {
   it('names each operation\'s daemon method', () => {
     expect(worktreeOpMethod('create')).toBe('worktree:create');

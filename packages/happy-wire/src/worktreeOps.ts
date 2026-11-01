@@ -201,6 +201,34 @@ export const worktreeOpParamsSchemas = {
     purgeFolder: z.boolean(),
     dryRun: z.boolean(),
   }).strict(),
+  // ── The workspace's online repository (aplus-dev-studio workspace-sync-strict-design.md, F6) ──
+  // `remoteUrl` null: the machine's own `origin` and login. With an address, `origin` must already
+  // name that repository; these operations never point `origin` anywhere new.
+  /** Fetches `branch` (and `baseBranch`) and tells how far the workspace is from them. */
+  'remote-status': z.object({
+    workspaceDir: absolutePath,
+    remoteUrl: remoteUrlSchema.nullable(),
+    branch: refSchema,
+    baseBranch: refSchema.nullable(),
+  }).strict(),
+  /**
+   * Brings `branch` (then `baseBranch`) into the workspace, which must still be at `expectedHead` —
+   * the head this browser just saw in `remote-status`. `ff-only` moves a clean workspace forward and
+   * may push `branch`; `merge` saves the current files first and leaves conflicts for the user.
+   * Nothing here overwrites work.
+   */
+  'pull-remote': z.object({
+    workspaceDir: absolutePath,
+    remoteUrl: remoteUrlSchema.nullable(),
+    branch: refSchema,
+    baseBranch: refSchema.nullable(),
+    mode: z.enum(['ff-only', 'merge']),
+    expectedHead: commitSchema.nullable(),
+    push: z.boolean(),
+  }).strict()
+    .refine((params) => !params.push || params.mode === 'ff-only', 'push after a merge'),
+  /** A collaboration's workspace: `branch` of the repository, into this project's empty managed folder. */
+  clone: z.object({ workspaceDir: absolutePath, remoteUrl: remoteUrlSchema, branch: refSchema }).strict(),
 } as const;
 
 export type WorktreeOp = keyof typeof worktreeOpParamsSchemas;
@@ -234,8 +262,15 @@ export function readWorktreeTicket(value: unknown): { ok: true; ticket: Worktree
   return { ok: true, ticket: { ...base.data, params: params.data } as WorktreeTicket };
 }
 
-export function worktreeOpMethod<Op extends WorktreeOp>(op: Op): `worktree:${Op}` {
-  return `worktree:${op}`;
+/** The workspace's online repository operations: the same ticket, a `workspace:` daemon method. */
+export const WORKSPACE_SYNC_OPS = ['remote-status', 'pull-remote', 'clone'] as const satisfies readonly WorktreeOp[];
+export type WorkspaceSyncOp = (typeof WORKSPACE_SYNC_OPS)[number];
+const WORKSPACE_SYNC_OP_SET: ReadonlySet<WorktreeOp> = new Set(WORKSPACE_SYNC_OPS);
+
+export type WorktreeOpMethod<Op extends WorktreeOp> = Op extends WorkspaceSyncOp ? `workspace:${Op}` : `worktree:${Op}`;
+
+export function worktreeOpMethod<Op extends WorktreeOp>(op: Op): WorktreeOpMethod<Op> {
+  return (WORKSPACE_SYNC_OP_SET.has(op) ? `workspace:${op}` : `worktree:${op}`) as WorktreeOpMethod<Op>;
 }
 
 // ── Operation results ──────────────────────────────────────────────────────────────────────────
@@ -294,6 +329,23 @@ export const worktreeOpResultSchemas = {
       folder: z.enum(['skipped', 'removed', 'missing', 'preserved', 'blocked', 'failed']),
     }).strict(),
   }).strict(),
+  /** `ahead`/`behind` against `branch` online, `baseBehind` against `baseBranch`; null when that branch is not online. */
+  'remote-status': z.object({
+    isRepo: z.boolean(),
+    head: commitSchema.nullable(),
+    branch: z.string().nullable(),
+    dirtyCount: z.number().int().nonnegative(),
+    ahead: z.number().int().nonnegative().nullable(),
+    behind: z.number().int().nonnegative().nullable(),
+    baseBehind: z.number().int().nonnegative().nullable(),
+  }).strict(),
+  'pull-remote': z.object({
+    status: z.enum(['up-to-date', 'fast-forwarded', 'merged', 'conflict', 'dirty', 'diverged', 'not-a-repo', 'head-moved']),
+    head: commitSchema.nullable(),
+    conflictCount: z.number().int().nonnegative(),
+  }).strict(),
+  /** changed: false — it was already this repository's clone (a retry after it landed). */
+  clone: z.object({ changed: z.boolean(), head: commitSchema, branch: z.string().min(1) }).strict(),
 } as const satisfies Record<WorktreeOp, z.ZodType>;
 
 export type WorktreeOpResult<Op extends WorktreeOp> = z.infer<(typeof worktreeOpResultSchemas)[Op]>;
