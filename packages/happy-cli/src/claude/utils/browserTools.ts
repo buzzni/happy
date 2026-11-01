@@ -45,6 +45,10 @@ function describeError(error: BrowserClientError): string {
     switch (error.code) {
         case 'NO_EXTENSION_CONNECTED':
             return PAIRING_HINT
+        case 'BRIDGE_PORT_IN_USE':
+            // The extension is paired — with another Saycode/happy daemon on this machine. Re-pairing
+            // cannot help; this daemon takes the port over by itself once that process exits.
+            return `${error.message}. Another Saycode or happy instance on this machine is running the browser bridge. Ask the user to quit it; this daemon takes over the port within seconds and the extension reconnects to it.`
         case 'BRIDGE_UNAVAILABLE':
         case 'DAEMON_UNREACHABLE':
             return `${error.message} (the daemon may need a restart on a build that includes browser support)`

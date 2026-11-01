@@ -91,7 +91,7 @@ import { fetchBrowserExtensionScope } from './browserExtensionScope';
 import { readBrowserSetupPolicy, writeBrowserSetupPolicy, localBrowserExtensionMetadata } from './browserLocalSetupStore';
 import { BrowserSessionBrokerClient } from './browserSessionBrokerContract';
 import { getBusyDaemonTerminalCount, getDaemonTerminalSessionCount } from './daemonTerminalSessions';
-import { startBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './browserBridgeServer';
+import { startBrowserBridgeServer, retryBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './browserBridgeServer';
 import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
 import { prepareBrowserNativeMessaging, registerBrowserNativeHost } from './browserNativeHostRegistration';
 import { resolveExtensionDir, resolveExtensionId } from '@/commands/browser';
@@ -4069,7 +4069,7 @@ export async function startDaemon(): Promise<void> {
     // Chrome extension bridge (specs/chrome-extension-bridge/). Listens on a
     // fixed loopback port because the extension cannot read daemon.state.json
     // to discover an ephemeral one. A bind failure (port taken) must not take
-    // the daemon down — browser control is simply unavailable until restart.
+    // the daemon down — browser control is unavailable until the port is released, then retried.
     const browserSessionBroker = !standaloneWindows && process.env.HAPPY_BROWSER_BROKER_SOCKET
       ? new BrowserSessionBrokerClient(process.env.HAPPY_BROWSER_BROKER_SOCKET)
       : null;
@@ -4120,8 +4120,18 @@ export async function startDaemon(): Promise<void> {
         }
       }
     } catch (err) {
-      browserLocalSetup = undefined;
       logger.debug(`[DAEMON RUN] Browser bridge failed to start on ${DEFAULT_BROWSER_BRIDGE_PORT}: ${err instanceof Error ? err.message : String(err)}`);
+      // Local setup follows port ownership: its routes refuse while another process holds the port
+      // and open once this daemon takes it over, so an owner that lost the port across a restart gets it back.
+      if ((err as NodeJS.ErrnoException)?.code === 'EADDRINUSE') {
+        const setupCandidate = browserLocalSetup;
+        stopBrowserBridge = retryBrowserBridgeServer({
+          bridge: browserBridge, port: DEFAULT_BROWSER_BRIDGE_PORT, host: resolveBrowserBridgeHost(process.env),
+          consumeSetup: setupCandidate ? id => setupCandidate.consume(id) : undefined,
+        }).stop;
+      } else {
+        browserLocalSetup = undefined;
+      }
     }
 
     // /terminal (local-direct) needs the machine's E2EE key to decrypt open

@@ -255,6 +255,13 @@ describe('BrowserBridge', () => {
             await expect(bridge.request('tabs_list', {})).rejects.toMatchObject({ code: 'NO_EXTENSION_CONNECTED' })
         })
 
+        it('names the held port instead of a missing extension while another process owns it', async () => {
+            bridge.setListenerUnavailable(41777)
+            await expect(bridge.request('tabs_list', {})).rejects.toMatchObject({ code: 'BRIDGE_PORT_IN_USE' })
+            bridge.setListenerUnavailable(null)
+            await expect(bridge.request('tabs_list', {})).rejects.toMatchObject({ code: 'NO_EXTENSION_CONNECTED' })
+        })
+
         it('rejects with TIMEOUT when the extension never responds', async () => {
             connect()
             const promise = bridge.request('tabs_list', {}, { timeoutMs: 5000 })

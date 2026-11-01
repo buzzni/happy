@@ -1,9 +1,10 @@
 import { EventEmitter } from 'node:events'
+import { createServer, type AddressInfo } from 'node:net'
 import { describe, expect, it } from 'vitest'
 import { BrowserBridge } from './browserBridge'
 import { BrowserLocalSetup, shouldEnableBrowserLocalSetup } from './browserLocalSetup'
 import { startDaemonControlServer } from './controlServer'
-import { startBrowserBridgeServer } from './browserBridgeServer'
+import { retryBrowserBridgeServer, startBrowserBridgeServer } from './browserBridgeServer'
 import { WebSocket } from 'ws'
 
 const alice = 'bv1_abcdefghijklmnopqrstuvwxyz012345'
@@ -64,6 +65,33 @@ describe('trusted local browser setup', () => {
             expect((await post('revoke', { viewerKey: alice })).ok).toBe(true)
             expect(await closed).toBe(4403)
         } finally { ws?.terminate(); await control.stop(); await listener.stop() }
+    })
+    it('offers local setup only while this daemon holds the bridge port, including after it takes the port over', async () => {
+        const { setup, bridge } = fixture()
+        const holder = createServer()
+        await new Promise<void>(resolve => holder.listen(0, '127.0.0.1', resolve))
+        const heldPort = (holder.address() as AddressInfo).port
+        const retry = retryBrowserBridgeServer({ bridge, port: heldPort, retryMs: 20, consumeSetup: id => setup.consume(id) })
+        const control = await startDaemonControlServer({ browserBridge: bridge, browserLocalSetup: setup,
+            getChildren: () => [], stopSession: () => ({ status: 'not-found' } as any),
+            spawnSession: async () => ({ type: 'error', errorMessage: 'unused' } as any), requestShutdown: () => {}, onHappySessionWebhook: () => {},
+            portRegistry: { allocate: async () => ({ port: 30000, reused: false }), release: async () => false, readAll: async () => ({}) },
+        })
+        const post = (path: string, body: unknown) => fetch(`http://127.0.0.1:${control.port}/browser/local-setup/${path}`, { method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${control.controlSecret}` }, body: JSON.stringify(body) })
+        try {
+            const refused = await post('begin', { viewerKey: alice, profile: 'My Chrome' })
+            expect(refused.status).toBe(503)
+            expect(await refused.json()).toEqual({ ok: false, error: 'BRIDGE_PORT_IN_USE' })
+            expect((await post('connect', { profile: 'default-1f8b' })).status).toBe(503)
+            await new Promise<void>(resolve => holder.close(() => resolve()))
+            await expect.poll(async () => (await post('status', { viewerKey: alice })).status, { timeout: 2000 }).toBe(200)
+            const started = await (await post('begin', { viewerKey: alice, profile: 'My Chrome' })).json() as { operationId: string }
+            const exchange = new WebSocket(`ws://127.0.0.1:${heldPort}/setup-pair?operationId=${started.operationId}`, { origin: 'chrome-extension://emaponnolfbhnoaabgiebjmbdlmoifke' })
+            const reply = await new Promise<string>((resolve, reject) => { exchange.on('message', raw => resolve(raw.toString())); exchange.on('close', code => reject(new Error(`closed ${code}`))) })
+            expect(JSON.parse(reply)).toMatchObject({ ok: true, config: { viewerKey: alice, profile: 'My Chrome' } })
+            exchange.close()
+        } finally { await control.stop(); await retry.stop(); holder.close() }
     })
     it('never exposes credentials in public progress or links, rejects wrong scope and legacy token, and probes the exact connection', async () => {
         const { setup, bridge } = fixture()

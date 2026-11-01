@@ -76,3 +76,44 @@ export function startBrowserBridgeServer({ bridge, port, host = '127.0.0.1', con
         })
     })
 }
+
+const DEFAULT_PORT_RETRY_MS = 10_000
+
+/**
+ * The port is fixed, so a daemon that starts while another process holds it would otherwise stay
+ * without browser control until restart. Retries while the port is taken and takes it over once
+ * that process exits; any other bind error ends the retries.
+ */
+export function retryBrowserBridgeServer({ bridge, port, host = '127.0.0.1', retryMs = DEFAULT_PORT_RETRY_MS, consumeSetup }: {
+    bridge: BrowserBridge
+    port: number
+    host?: string
+    retryMs?: number
+    consumeSetup?: (operationId: string) => Promise<unknown>
+}): { stop: () => Promise<void> } {
+    let stopped = false
+    let timer: NodeJS.Timeout | undefined
+    let stopServer: (() => Promise<void>) | undefined
+    bridge.setListenerUnavailable(port)
+    const attempt = () => {
+        startBrowserBridgeServer({ bridge, port, host, consumeSetup }).then(async (server) => {
+            if (stopped) { await server.stop(); return }
+            stopServer = server.stop
+            bridge.setListenerUnavailable(null)
+            logger.debug(`[BROWSER BRIDGE] Took over ${host}:${port} after it was released`)
+        }, (err: NodeJS.ErrnoException) => {
+            if (stopped) return
+            if (err.code === 'EADDRINUSE') { timer = setTimeout(attempt, retryMs); return }
+            bridge.setListenerUnavailable(null)
+            logger.debug(`[BROWSER BRIDGE] Gave up retrying ${host}:${port}: ${err.message}`)
+        })
+    }
+    timer = setTimeout(attempt, retryMs)
+    return {
+        stop: async () => {
+            stopped = true
+            clearTimeout(timer)
+            await stopServer?.()
+        },
+    }
+}

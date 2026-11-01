@@ -126,12 +126,22 @@ export class BrowserBridge {
     private readonly lastAuthFailureByScope = new Map<string, number>()
     private readonly lastViewerActivityByScope = new Map<string, number>()
     private setupPolicy: BrowserSetupPolicy
+    /** Set through setListenerUnavailable; read by local setup, which is refused while another process holds the port. */
+    heldPort: number | null = null
 
     constructor(opts: { authToken: string; requestTimeoutMs?: number; onViewerActivity?: (viewerKey: string) => void; setupPolicy?: BrowserSetupPolicy }) {
         this.authToken = opts.authToken
         this.requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
         this.onViewerActivity = opts.onViewerActivity
         this.setupPolicy = structuredClone(opts.setupPolicy ?? {})
+    }
+
+    /**
+     * Another process holds the fixed bridge port, so the extension is connected to it, not to this
+     * daemon. Without this, the caller is told to pair an extension that is already paired.
+     */
+    setListenerUnavailable(port: number | null): void {
+        this.heldPort = port
     }
 
     /**
@@ -268,6 +278,12 @@ export class BrowserBridge {
         const connection = opts.profile
             ? connections.find(({ profile }) => profile === opts.profile)
             : connections[0]
+        if (!connection && this.heldPort !== null) {
+            return Promise.reject(new BridgeRequestError(
+                'BRIDGE_PORT_IN_USE',
+                `another process holds browser bridge port ${this.heldPort}, so Chrome is connected to it instead of this daemon`
+            ))
+        }
         if (!connection) {
             // Naming what *is* connected turns "nothing is connected" (false,
             // and unactionable, when the caller simply named the wrong

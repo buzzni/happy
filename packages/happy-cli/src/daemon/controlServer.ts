@@ -1057,7 +1057,7 @@ export function startDaemonControlServer({
           if (e instanceof BridgeRequestError) {
             logger.debug(`[CONTROL SERVER] browser/request ${method} failed: ${e.code} ${e.message}`);
             reply.code(
-              e.code === 'NO_EXTENSION_CONNECTED' ? 503 :
+              e.code === 'NO_EXTENSION_CONNECTED' || e.code === 'BRIDGE_PORT_IN_USE' ? 503 :
               e.code === 'TIMEOUT' ? 504 :
               502
             );
@@ -1069,7 +1069,7 @@ export function startDaemonControlServer({
     }
 
     attachLocalToolAgentRelayRoutes(app);
-    if (browserLocalSetup) attachBrowserLocalSetupRoutes(app, browserLocalSetup);
+    if (browserLocalSetup && browserBridge) attachBrowserLocalSetupRoutes(app, browserLocalSetup, browserBridge);
     attachStandaloneDrain(app, managedRuntime ? undefined : standaloneDrain, requestShutdown);
     attachRestartDrainRoutes(app, managedRuntime ? undefined : restartDrain, { standaloneDrainActive: Boolean(standaloneDrain) });
 

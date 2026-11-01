@@ -94,6 +94,17 @@ describe('runBrowserTool', () => {
         expect(textOf(result)).toContain('browser-bridge.token')
     })
 
+    it('does not ask for pairing when another process holds the bridge port', async () => {
+        const result = await runBrowserTool({
+            request: fails('BRIDGE_PORT_IN_USE', 'another process holds browser bridge port 41777'),
+            method: 'tabs_list',
+            params: {},
+        })
+        expect(result.isError).toBe(true)
+        expect(textOf(result)).toContain('41777')
+        expect(textOf(result)).not.toContain('browser-bridge.token')
+    })
+
     it('explains that the daemon predates browser support', async () => {
         const result = await runBrowserTool({
             request: fails('BRIDGE_UNAVAILABLE', 'This daemon has no browser bridge'),
