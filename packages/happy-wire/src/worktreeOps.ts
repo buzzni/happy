@@ -136,10 +136,11 @@ const worktreeNameSchema = z.string().min(1).max(60).refine((value) => sanitizeW
 // A ref the daemon passes to git as an argument: never read as an option, never empty.
 // The daemon still runs `git check-ref-format` on it.
 const refSchema = z.string().min(1).max(255).refine((value) => !value.startsWith('-') && !/\s/.test(value) && !CONTROL_CHARACTER.test(value), 'git ref');
-// The repository's own address: plain http(s), no credentials in it (those come sealed), nothing
-// git would read as another transport (`file://`, `ext::`).
+// The repository's own address: https only, so a sealed credential never travels in the clear
+// (workspace-sync-strict-design.md §4-1); no credentials in it (those come sealed), nothing git would
+// read as another transport (`file://`, `ext::`).
 const remoteUrlSchema = z.string().max(2048).refine(
-  (value) => /^https?:\/\/[^\s/@]+\/\S+$/.test(value) && !CONTROL_CHARACTER.test(value),
+  (value) => /^https:\/\/[^\s/@]+\/\S+$/.test(value) && !CONTROL_CHARACTER.test(value),
   'remote url',
 );
 const commitSchema = z.string().regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/);
