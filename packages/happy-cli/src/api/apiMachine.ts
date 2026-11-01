@@ -43,6 +43,7 @@ import {
     createMachineResourceService,
 } from '@/daemon/machineResourceService';
 import { AI_AUTH_SELECTION_CAPABILITY, parseAiAuthSelection } from '@/daemon/sessionEnv';
+import { agentPlanCapabilityForPlatform, parseAgentPlanSpawnParam } from '@/daemon/agentPlanGrantEnvelope';
 import { parseResumeAuthRequirement, type ResumeAuthRequirement } from '@/daemon/resumeSetupTokenRebind';
 import { parseOutputFormat, STRUCTURED_OUTPUT_CAPABILITY } from '@/claude/structuredOutput';
 import { WRITE_FILE_ATTEMPT_CAPABILITY } from '@/modules/common/writeFileAttempts';
@@ -1347,6 +1348,7 @@ export class ApiMachineClient {
                 browserContinuation,
                 browserAttestation,
                 aiAuthSelection,
+                agentPlan,
                 outputFormat,
             } = params || {};
             logger.debug(`[API MACHINE] Spawning session: dir=${directory}, hasUserCreds=${!!(happyToken && happySecret)}`);
@@ -1367,6 +1369,11 @@ export class ApiMachineClient {
             // 닫힌 집합 밖의 선택은 거절한다. 조용히 무시하면 선택이 없는 것처럼
             // 돌아 사용자가 고르지 않은 자격으로 세션이 실행된다.
             const validAiAuthSelection = parseAiAuthSelection(aiAuthSelection);
+            // aplus specs/org-agent-plan: refused, never dropped — a dropped plan runs on this machine's Codex login.
+            const validAgentPlan = parseAgentPlanSpawnParam(agentPlan);
+            if (validAgentPlan && validAiAuthSelection) {
+                throw new Error('Agent plan grant rejected (agent_plan_conflicting_selection)');
+            }
             const validAdditionalDirectories = parseAdditionalDirectories(additionalDirectories);
             // Refused rather than dropped: a caller that asked for a machine-readable result must
             // not get a session that silently runs without one (specs/claude-cli-benchmark-followups R2).
@@ -1454,6 +1461,7 @@ export class ApiMachineClient {
                 ...(browserContinuation ? { browserContinuation: true } : {}),
                 ...(browserAttestation ? { browserAttestation } : {}),
                 aiAuthSelection: validAiAuthSelection,
+                ...(validAgentPlan ? { agentPlan: validAgentPlan } : {}),
                 ...(validOutputFormat ? { outputFormat: validOutputFormat } : {}),
             });
 
@@ -4401,6 +4409,10 @@ export class ApiMachineClient {
                 !== JSON.stringify(advertisedChannelSupport);
             const aiAuthSelectionStale = JSON.stringify(this.machine.metadata?.aiAuthSelection)
                 !== JSON.stringify(advertisedAiAuthSelection);
+            // aplus specs/org-agent-plan §6.3-1·§6.3-5: macOS/Linux only, and not on a managed runtime.
+            const advertisedAgentPlan = this.managedHandlers ? undefined : agentPlanCapabilityForPlatform(process.platform);
+            const agentPlanStale = JSON.stringify(this.machine.metadata?.agentPlan)
+                !== JSON.stringify(advertisedAgentPlan);
             // Managed runtimes do not serve `writeFile`, so nothing there would answer an attempt.
             const advertisedWriteFileAttempt = this.managedHandlers ? undefined : WRITE_FILE_ATTEMPT_CAPABILITY;
             const writeFileAttemptStale = JSON.stringify(this.machine.metadata?.writeFileAttempt)
@@ -4457,7 +4469,7 @@ export class ApiMachineClient {
             // Bounded: an acknowledgement that never comes must not block every later change.
             const awaitingServer = this.capabilityUpdateInFlight !== null
                 && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
-            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || writeFileAttemptStale || listFilesPageStale)) {
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || agentPlanStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || writeFileAttemptStale || listFilesPageStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -4490,6 +4502,7 @@ export class ApiMachineClient {
                     additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
                     channelSupport: advertisedChannelSupport,
                     aiAuthSelection: advertisedAiAuthSelection,
+                    agentPlan: advertisedAgentPlan,
                     structuredOutput: advertisedStructuredOutput,
                     writeFileAttempt: advertisedWriteFileAttempt,
                     listFilesPage: advertisedListFilesPage,

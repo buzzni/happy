@@ -324,6 +324,7 @@ import {
   prepareMcpChildEnvironment,
   resolveResumeMcpGrantSource,
 } from './mcpCallerGrantEnvelope';
+import { AgentPlanGrantEnvelopeConsumer, agentPlanCapabilityForPlatform, prepareAgentPlanLaunch } from './agentPlanGrantEnvelope';
 import { createSetupTokenBindingVerifier, readTrustedStudioOrigin } from './setupTokenBindingProof';
 import { createClaudeSwapSupervisor } from './claudeSwapSupervisor';
 import { createNodeAiCredentialRuntime } from './aiCredentialRuntime';
@@ -434,6 +435,7 @@ export const initialMachineMetadata: MachineMetadata = {
   additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
   channelSupport: CHANNEL_SUPPORT_CAPABILITY,
   aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
+  ...(agentPlanCapabilityForPlatform(process.platform) ? { agentPlan: agentPlanCapabilityForPlatform(process.platform) } : {}),
   structuredOutput: STRUCTURED_OUTPUT_CAPABILITY,
   writeFileAttempt: WRITE_FILE_ATTEMPT_CAPABILITY,
   listFilesPage: LIST_FILES_PAGE_CAPABILITY,
@@ -1173,6 +1175,11 @@ export async function startDaemon(): Promise<void> {
       },
     };
     const mcpCallerGrantConsumer = new McpCallerGrantEnvelopeConsumer({
+      machineId,
+      secretKey: mcpCallerGrantKeyPair.secretKey,
+    });
+    // aplus specs/org-agent-plan §6.3-2: the Studio seals plan grants to the same published key.
+    const agentPlanGrantConsumer = new AgentPlanGrantEnvelopeConsumer({
       machineId,
       secretKey: mcpCallerGrantKeyPair.secretKey,
     });
@@ -2081,6 +2088,17 @@ export async function startDaemon(): Promise<void> {
             errorMessage: 'MCP caller grant has conflicting trusted and envelope sources',
           };
         }
+        // After the directory approval round trip, so asking for approval does not burn the one-use grant.
+        const agentPlanLaunch = prepareAgentPlanLaunch({
+          agentPlan: options.agentPlan,
+          agent: options.agent,
+          aiAuthSelection: options.aiAuthSelection,
+          platform: process.platform,
+          studioOrigin: readTrustedStudioOrigin(process.env),
+        }, agentPlanGrantConsumer);
+        if (!agentPlanLaunch.ok) {
+          return { type: 'error', errorMessage: `Agent plan grant rejected (${agentPlanLaunch.reason})` };
+        }
         let mcpCallerGrant: string | undefined = trustedMcpContext?.mcpCallerGrant;
         let hasAuthoritativeProjectBinding = trustedMcpContext !== undefined;
         const mcpConfigProjectId = trustedMcpContext?.mcpConfigProjectId
@@ -2367,6 +2385,9 @@ export async function startDaemon(): Promise<void> {
         if (options.effort) {
           extraEnv.HAPPY_INITIAL_EFFORT = options.effort;
         }
+        // Plan descriptor and grant secret: after expansion, like every spawn seed, so the secret is never read
+        // as a ${VAR} reference. The runner reads and deletes them; HAPPY_INITIAL_ never reaches Codex.
+        Object.assign(extraEnv, agentPlanLaunch.environment);
         // Organization requirements: the project this spawn is for picks the last known good a runner
         // falls back to when Studio cannot answer (codexcli-org-requirements R16). A hint, never a grant.
         Object.assign(extraEnv, orgScopeHintEnvironment(mcpConfigProjectId));
@@ -2401,6 +2422,14 @@ export async function startDaemon(): Promise<void> {
         if (browserTaskRegistration) {
           // Session process only; it removes the secret from its env before spawning claude.
           extraEnv.HAPPY_BROWSER_TASK_SESSION_SECRET = browserTaskRegistration.sessionSecret;
+        }
+
+        // The plan grant is spent only now, once nothing else can refuse this spawn before a child is launched:
+        // web-ui and Desktop retry a refused spawn (an unreadable MCP envelope after a key rotation) with the
+        // same params, and that retry must not read as a replay.
+        const agentPlanClaimRefusal = agentPlanLaunch.claim();
+        if (agentPlanClaimRefusal) {
+          return finishSpawn(Promise.resolve({ type: 'error', errorMessage: `Agent plan grant rejected (${agentPlanClaimRefusal})` }));
         }
 
         // Isolated sessions must not inherit unrelated daemon credentials.
