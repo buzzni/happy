@@ -435,6 +435,26 @@ describe('host owner-contact wiring (startHappyServer)', () => {
             expect(h.lookups.length).toBeGreaterThan(0);
         } finally { await started.close(); }
     });
+    it.skipIf(process.platform === 'win32')('refuses an agent-entry abort on a nested direct socket, beside a broker and from a nested broker [T1s-S2]', async () => {
+        const direct = harness({ depth: '1' }), d = wiring(direct);
+        const directStarted = await d.start();
+        try {
+            direct.register({ ...(await direct.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller, depth: 1 });
+            expect((await post(d.env.SAYCODE_OWNER_CONTACT_SOCKET!, abort)).status).toBe(503);
+            expect(direct.lookups).toEqual([]); expect(direct.sends).toEqual([]);
+        } finally { await directStarted.close(); }
+        for (const depth of [0, 1]) {
+            const h = harness(depth ? { depth: String(depth) } : {}), w = wiring(h, { broker: true });
+            const started = await w.start();
+            try {
+                const contact = (w.startBroker.mock.calls[0] as unknown[])[0] as { call(raw: unknown): Promise<unknown> };
+                h.register({ ...(await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller, depth });
+                expect((await post(w.env.SAYCODE_OWNER_CONTACT_SOCKET!, abort)).status).toBe(503);
+                if (depth) await expect(contact.call(abort)).rejects.toThrow();
+                expect(h.lookups).toEqual([]); expect(h.sends).toEqual([]);
+            } finally { await started.close(); }
+        }
+    });
     it.skipIf(process.platform === 'win32')('passes an agent-entry abort from a depth 0 broker only [T1s-S2]', async () => {
         const h = harness(), w = wiring(h, { broker: true });
         const started = await w.start();
