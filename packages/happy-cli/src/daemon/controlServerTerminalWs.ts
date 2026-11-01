@@ -441,16 +441,11 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
         const binding = boundTerminal?.entry.binding;
         if (boundTerminal && binding) {
           // terminal-binding-strict-design §4-6: a v2 terminal is taken back only with an attach
-          // sealed with its in key, in order — the machine key alone does not reach it.
-          const opened = binding.openIn(data.params);
-          // A connection of its own carries the attach, so nothing reorders it: one that is ahead is a hole.
-          if ((opened.kind === 'gap' || opened.kind === 'held') && exitOf(boundTerminal) === null) {
-            binding.closeReason ??= 'input-gap';
-            boundTerminal.closing = true;
-            void boundTerminal.pty.terminate();
-          }
-          const attach = opened.kind === 'frames' ? opened.frames[0] : null;
-          if (attach?.kind !== 'attach') {
+          // sealed with its in key and newer than anything it took — the machine key alone does not
+          // reach it. A hole before it is a reconnect attempt that died with its socket (openAttach).
+          const opened = binding.openAttach(data.params);
+          const attach = opened.kind === 'frame' ? opened.frame : null;
+          if (!attach) {
             logger.debug(`[LOCAL-DIRECT-TERMINAL] bound attach refused session=${sessionId} reason=${opened.kind}`);
             refuseAttach(sessionId, reqId);
             return;

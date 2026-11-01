@@ -111,6 +111,13 @@ export interface BoundTerminal {
         | { kind: 'unreadable' };
     /** True when `seq` is still missing behind held frames, which are then dropped: the hole stands. */
     abandonHole(seq: number): boolean;
+    /**
+     * Opens a direct-path `terminal-attach`: any seq after the last one counts. Each attempt of a
+     * reconnecting client takes a seq, and one that died with its socket never arrives; on loopback
+     * nobody can hold frames back selectively, so the hole is a lost attempt, not withheld input.
+     * A repeat is still a replay, and anything but an attach is unreadable here.
+     */
+    openAttach(data: string): { kind: 'frame'; frame: Extract<TerminalInFrame, { kind: 'attach' }> } | { kind: 'replayed' } | { kind: 'unreadable' };
 }
 
 export function bindTerminal(input: {
@@ -133,18 +140,21 @@ export function bindTerminal(input: {
     const outKey = frameKey('out');
     let lastInSeq = 0;
     const held = new Map<number, TerminalInFrame>();
+    const readIn = (data: string) => {
+        let opened: unknown = null;
+        try {
+            opened = decryptWithDataKey(decodeBase64(data), inKey);
+        } catch {
+            opened = null;
+        }
+        return readTerminalFrame(opened, { terminalId: params.terminalId, dir: 'in' });
+    };
 
     const terminal: BoundTerminal = {
         terminalId: params.terminalId,
         sealOut: (body) => encodeBase64(encryptWithDataKey({ v: TERMINAL_BINDING_VERSION, t: params.terminalId, dir: 'out', ...body }, outKey)),
         openIn: (data) => {
-            let opened: unknown = null;
-            try {
-                opened = decryptWithDataKey(decodeBase64(data), inKey);
-            } catch {
-                opened = null;
-            }
-            const frame = readTerminalFrame(opened, { terminalId: params.terminalId, dir: 'in' });
+            const frame = readIn(data);
             if (!frame) return { kind: 'unreadable' };
             const admission = admitInboundSeq(lastInSeq, frame.seq);
             if (admission === 'replayed' || held.has(frame.seq)) return { kind: 'replayed' };
@@ -169,6 +179,15 @@ export function bindTerminal(input: {
             if (held.size === 0 || seq !== lastInSeq + 1) return false;
             held.clear();
             return true;
+        },
+        openAttach: (data) => {
+            const frame = readIn(data);
+            if (!frame || frame.kind !== 'attach') return { kind: 'unreadable' };
+            if (frame.seq <= lastInSeq || held.has(frame.seq)) return { kind: 'replayed' };
+            // Whatever waited behind a hole came over the connection that died; the attach supersedes it.
+            held.clear();
+            lastInSeq = frame.seq;
+            return { kind: 'frame', frame };
         },
     };
     const proof = encodeBase64(encryptWithDataKey({

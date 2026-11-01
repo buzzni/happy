@@ -503,6 +503,33 @@ describe('/terminal WS contract v2 (F9 H4)', () => {
     for (const client of [intruder, second, third]) client.ws.close()
   })
 
+  // A real PTY and three sockets: more than the unit default of 5 s on a loaded CI runner.
+  it('takes a terminal back after an attach attempt that never arrived, but not with an old attach', async () => {
+    const TICKER = "let i = 0; setInterval(() => process.stdout.write('T' + (i++) + ';'), 20)"
+    const first = await connect()
+    const terminal = await openV2(first, TICKER)
+    await waitFor(() => terminal.opened(first).length >= 1, 10_000)
+    first.ws.terminate()
+    await first.closed
+    const lastSeen = Math.max(...terminal.opened(first).map((f: any) => f.seq))
+    // The replay answers the attach only with output after lastSeen: wait until there is some.
+    await waitFor(() => (getDaemonTerminalSession(terminal.sessionId)?.output.lastSeq() ?? 0) > lastSeen, 10_000)
+
+    // An attempt sealed and lost on a socket that died: its seq is used up, the daemon never saw it.
+    terminal.seal({ kind: 'attach', rid: b64(16), afterSeq: lastSeen })
+    const second = await connect()
+    const rid = b64(16)
+    const attachParams = terminal.seal({ kind: 'attach', rid, afterSeq: lastSeen })
+    const attach = await request(second, 'terminal-attach', { sessionId: terminal.sessionId, params: attachParams })
+    expect(attach.data).toMatchObject({ ok: true, sessionId: terminal.sessionId })
+    await waitFor(() => terminal.opened(second).some((f: any) => f?.rid === rid), 10_000)
+    expect(getDaemonTerminalSession(terminal.sessionId)?.exit).toBeNull()
+
+    const third = await connect()
+    expect((await request(third, 'terminal-attach', { sessionId: terminal.sessionId, params: attachParams })).error).toBe('unknown-session')
+    for (const client of [second, third]) client.ws.close()
+  }, 20_000)
+
   it('refuses the v1 open under strict machine control', async () => {
     machine.strict = true
     const client = await connect()
