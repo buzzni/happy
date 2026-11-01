@@ -161,6 +161,19 @@ describe('workspace:sync-remote (code save)', () => {
         expect(readFileSync(join(ws, 'README.md'), 'utf8')).toBe('edited\n');
     });
 
+    it('stops when a clean workspace has its own commit and online has another (diverged)', async () => {
+        write(ws, 'local.txt', 'l');
+        commitAll(ws, 'local');
+        pushOnline('online.txt', 'o');
+        const before = git(bare, 'rev-parse', 'main');
+        const answer = await call(sync());
+        expect(answer).toMatchObject({
+            success: false, errorCode: 'WORKSPACE_REMOTE_AHEAD', workspaceSha: git(ws, 'rev-parse', 'HEAD'), remoteSha: before,
+        });
+        expect(git(bare, 'rev-parse', 'main')).toBe(before);
+        expect(onlineFiles()).toContain('online.txt');
+    });
+
     it('refuses a snapshot over the size cap', async () => {
         write(ws, 'big.bin', 'x'.repeat(4096));
         const answer = await call(sync({ sizeCapBytes: 1024 }));
