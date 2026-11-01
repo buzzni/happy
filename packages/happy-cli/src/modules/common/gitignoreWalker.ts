@@ -116,6 +116,9 @@ export function compareRelPaths(a: string, b: string): number {
     return as.length - bs.length
 }
 
+/** How many of a directory's files walkDir stats ahead of the one it is on. */
+const STAT_AHEAD = 128
+
 export async function walkWorkspace(opts: WalkWorkspaceOptions): Promise<void> {
     const rootCtx = createGitignoreContext(opts.presetMatcher)
     await walkDir(opts.root, '', rootCtx, opts, 0)
@@ -150,13 +153,20 @@ async function walkDir(
         if (localCtx.ignores(entryRel, isDir)) return []
         return [{ entry, entryRel, entryAbs: join(absDir, entry.name), isDir }]
     })
-    // Stat a directory's files together and use them in order: one at a time,
-    // a large walk spends most of its time waiting on each stat in turn.
-    const fileStats = kept.map(({ entry, entryAbs }) => (
-        entry.isFile() && opts.onFile ? stat(entryAbs).catch(() => null) : null
-    ))
+    // Keep a window of stats running ahead and use them in order: one at a time, a
+    // large walk spends most of its time waiting on each stat in turn. The window is
+    // bounded because a walk that stops early (one page of a listing) would otherwise
+    // stat the rest of every directory it was in, again on every page.
+    const fileStats: Array<Promise<Stats | null> | null> = []
+    const statAhead = (from: number) => {
+        for (let j = fileStats.length; j < Math.min(kept.length, from + STAT_AHEAD); j++) {
+            const { entry, entryAbs } = kept[j]
+            fileStats.push(entry.isFile() && opts.onFile ? stat(entryAbs).catch(() => null) : null)
+        }
+    }
 
     for (const [i, { entry, entryRel, entryAbs, isDir }] of kept.entries()) {
+        statAhead(i)
         if (isDir) {
             if (opts.onDirectory) await opts.onDirectory(entryAbs, entryRel)
             if (opts.maxDepth === undefined || depth < opts.maxDepth) {
