@@ -359,6 +359,22 @@ describe('host owner-contact wiring (startHappyServer)', () => {
             expect(h.lookups.length).toBeGreaterThan(0);
         } finally { await started.close(); }
     });
+    it('lets a depth >= 1 broker agent look up only its own session [D4 후속 (a)]', async () => {
+        const h = harness({ depth: '1' }), w = wiring(h, { broker: true });
+        const started = await w.start();
+        try {
+            const contact = (w.startBroker.mock.calls[0] as unknown[])[0] as { call(raw: unknown): Promise<unknown> };
+            h.register({ ...(await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller, depth: 1 });
+            // A sibling beside self, a repeated self, or the chat entry stays refused before reaching main.
+            for (const sessionIds of [['source', 'sibling'], ['sibling', 'source'], ['source', 'source'], []]) {
+                await expect(contact.call({ ...request, payload: { sessionIds } })).rejects.toThrow();
+            }
+            await expect(contact.call({ ...request, entry: 'chat', payload: { sessionIds: ['source'] } })).rejects.toThrow();
+            expect(h.lookups).toEqual([]);
+            await contact.call({ ...request, payload: { sessionIds: ['source'] } }).catch(() => undefined);
+            expect(h.lookups.length).toBeGreaterThan(0);
+        } finally { await started.close(); }
+    });
     it.skipIf(process.platform === 'win32')('keeps direct agent commands at every depth', async () => {
         const h = harness({ depth: '3' }), w = wiring(h);
         const started = await w.start();

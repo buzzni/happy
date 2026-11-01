@@ -76,7 +76,8 @@ ON이어도 trust 설정(`HAPPY_SESSION_OWNERSHIP_ENABLED/ISSUER/AUDIENCE/PUBLIC
 - **broker entry 정책(H2-R-04)**: main은 broker와 직접 경로를 구분할 수 없으므로 §2.3의 "broker agent
   형제 확장은 depth 0"을 host가 집행한다. depth≥1 binding의 broker IPC에서 `entry:'agent'`의 형제·부모
   조회·변경(lookup/read/prompt/resume/permission/abort)은 lookup 전에 거부한다. 자기 자식 연산
-  `spawn-owned-child`·`owned-child-status`는 형제 확장이 아니므로(§4.6) main 판정으로 보낸다. 직접 경로와
+  `spawn-owned-child`·`owned-child-status`는 형제 확장이 아니므로(§4.6) main 판정으로 보낸다. 자기 세션 ID
+  하나만 담은 `entry:'agent'` `lookup-readable-sessions`도 main으로 보낸다(아래 "D4 후속 (a)" 절). 직접 경로와
   `entry:'chat'`은 모든 depth를 main 판정에 맡긴다.
 - **직접 경로**: broker가 없으면 owner-only Unix socket(`sessionOwnerContactLocal`)을 열고 주소만
   `SAYCODE_OWNER_CONTACT_SOCKET`으로 provider env에 둔다. 상속된 주소는 먼저 지운다. 종료 시 binding 폐기,
@@ -241,3 +242,19 @@ PIN-R3 반영(#1031 리뷰 `pin-table-filled-by-receipt-less-prompts`): Desktop�
 (거부 prompt로 상한의 두 배를 채운 뒤 prompt·spawn 허용, spawn 없는 status로 채운 뒤 spawn 허용, unknown status 뒤 spawn한
 child의 고정 유지). 구현 전 앞의 2건 실패. 역검증 2건: `not_owned` 종결 제거, spawn 송신 시 미종결 복원 제거가 각각 해당 테스트를
 실패시켰다.
+
+## D4 후속 (a) — nested broker의 자기 세션 lookup (2026-11-01)
+
+사용자 결정(2026-10-31): depth≥1 broker 자식이 owned 손자를 만들려면 Desktop CLI가 spawn 전에 자기 세션을
+lookup해 `self` + confirmed-owner proof를 확인해야 하는데, 위 broker entry 정책이 depth≥1 agent lookup을 모두 거부해
+owned 경로에 들어갈 수 없었다. 방식 (a)로 broker entry 정책에 좁은 예외 하나를 둔다.
+
+- depth≥1 broker IPC의 `entry:'agent'` `lookup-readable-sessions`는 `payload.sessionIds`가 **정확히 한 개이고 그 값이
+  host binding의 sessionId**일 때만 main으로 보낸다. 형제·부모 ID가 하나라도 섞이거나, 자기 ID가 반복되거나, 비어
+  있으면 지금처럼 lookup 전에 거부한다. 형제 비노출(§2.3)은 그대로다.
+- `entry:'chat'` lookup(broker IPC·chat socket 모두), chat socket의 agent 거부, depth 0과 직접 경로는 바뀌지 않는다.
+- wire(`OwnerContactRequestSchema`·fixture)와 스위치 기본값(`HAPPY_OWNER_CONTACT_V1` off)은 바꾸지 않았다.
+
+검증: `sessionOwnerContactHost.test.ts`에 1건(자기 단독 lookup은 main 도달, `[self,sibling]`·`[sibling,self]`·
+`[self,self]`·`[]`·chat 자기 lookup은 lookup 전 거부). 구현 전 실패, 예외를 되돌리면 다시 실패. 같은 파일 43건 통과,
+`tsc --noEmit` 통과. 실제 host 왕복은 T2r 항목이다.

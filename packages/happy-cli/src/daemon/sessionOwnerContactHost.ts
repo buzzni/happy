@@ -165,7 +165,8 @@ async function issueIdentityAuthority(input: IdentityInput, capability: string):
 const OWNED_CHILD_OPERATIONS = new Set(['spawn-owned-child', 'owned-child-status']);
 /** Main cannot tell a broker caller from a direct one, so a broker host's fixed entry policy lives here.
  * Below depth 0 an agent command gets no sibling/parent exposure or mutation and chat gets no lookup
- * enumeration; explicit chat targets and the agent's own owned-child operations (§4.6) go to main.
+ * enumeration; explicit chat targets, the agent's own owned-child operations (§4.6) and an agent lookup
+ * naming exactly its own session (the owned-grandchild source check, D4 follow-up (a)) go to main.
  * The chat socket beside a broker takes only chat verbs: agent commands keep the broker IPC, owned
  * children stay a broker reservation. It never revokes the binding the broker still uses. */
 function brokerEntryPolicy(host: OwnerContactHost, via: 'broker' | 'chat-socket'): SessionOwnerContact {
@@ -174,8 +175,10 @@ function brokerEntryPolicy(host: OwnerContactHost, via: 'broker' | 'chat-socket'
         call: async raw => {
             const request = OwnerContactRequestSchema.parse(raw);
             const child = OWNED_CHILD_OPERATIONS.has(request.operation);
+            const selfLookup = request.operation === 'lookup-readable-sessions'
+                && request.payload.sessionIds.length === 1 && request.payload.sessionIds[0] === host.binding.sessionId;
             if ((via === 'chat-socket' && (request.entry !== 'chat' || child))
-                || (nested && request.entry === 'agent' && !child)
+                || (nested && request.entry === 'agent' && !child && !selfLookup)
                 || (nested && request.entry === 'chat' && request.operation === 'lookup-readable-sessions')) throw new Error('owner-contact-unavailable');
             return host.contact.call(request);
         } };
