@@ -203,23 +203,28 @@ export default function FeaturesSettingsScreen() {
                     }
                     showChevron={false}
                 />
+                {/* CLI-wire rows are read-only: happy-cli follows only the master. */}
                 {MOBILE_SAYCODE_PROMPT_BLOCKS.map((block) => (
                     <Item
                         key={block.id}
                         title={t(block.titleKey)}
                         subtitle={t(block.subtitleKey)}
                         rightElement={
-                            <Switch
-                                value={resolveSaycodePromptBlockEnabled({
-                                    blockId: block.id,
-                                    overrides: saycodePromptBlocks,
-                                    preference: saycodePromptPreference,
-                                    surface: saycodeSurface,
-                                })}
-                                onValueChange={(enabled) => setSaycodePromptBlocks({
-                                    [block.id]: enabled,
-                                })}
-                            />
+                            block.layer === 'cli-wire' ? (
+                                <Switch value={saycodeMasterEnabled} disabled />
+                            ) : (
+                                <Switch
+                                    value={resolveSaycodePromptBlockEnabled({
+                                        blockId: block.id,
+                                        overrides: saycodePromptBlocks,
+                                        preference: saycodePromptPreference,
+                                        surface: saycodeSurface,
+                                    })}
+                                    onValueChange={(enabled) => setSaycodePromptBlocks({
+                                        [block.id]: enabled,
+                                    })}
+                                />
+                            )
                         }
                         showChevron={false}
                     />

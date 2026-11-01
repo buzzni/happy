@@ -194,7 +194,7 @@ export const ca: TranslationStructure = {
 
     settingsFeatures: {
         saycodeGroupTitle: "Instruccions de Saycode",
-        saycodeGroupFooter: "Les crides a Agent fill i la delegació interna de tasques estan activades per defecte encara que les instruccions de Saycode estiguin desactivades. La generació del títol del xat està sempre activa.",
+        saycodeGroupFooter: "Les crides a Agent fill, la delegació interna de tasques, el flux de planificació i els crèdits de commit segueixen l'interruptor de les instruccions de Saycode. La generació del títol del xat està sempre activa.",
         saycodeMaster: "Utilitza les instruccions de Saycode",
         saycodeMasterSubtitle: "Instruccions de comportament que afegeix Saycode. Els teus prompts, instruccions de projecte i skills sempre es conserven.",
         saycodeBlockOptionsGuidance: "Opcions de resposta",

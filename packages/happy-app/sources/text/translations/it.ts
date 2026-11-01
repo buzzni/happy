@@ -192,7 +192,7 @@ export const it: TranslationStructure = {
 
     settingsFeatures: {
         saycodeGroupTitle: "Istruzioni Saycode",
-        saycodeGroupFooter: "Le chiamate ad Agent figlio e la delega interna delle attività sono attive per impostazione predefinita anche quando le istruzioni Saycode sono disattivate. La generazione del titolo della chat è sempre attiva.",
+        saycodeGroupFooter: "Le chiamate ad Agent figlio, la delega interna delle attività, il flusso di pianificazione e i crediti nei commit seguono l'interruttore delle istruzioni Saycode. La generazione del titolo della chat è sempre attiva.",
         saycodeMaster: "Usa le istruzioni Saycode",
         saycodeMasterSubtitle: "Istruzioni di comportamento aggiunte da Saycode. I tuoi prompt, le istruzioni di progetto e le skill restano sempre.",
         saycodeBlockOptionsGuidance: "Opzioni di risposta",

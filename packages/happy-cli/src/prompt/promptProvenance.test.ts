@@ -22,12 +22,13 @@ describe('prompt provenance inventory', () => {
       'claude:co-authored-credit': 'saycode',
       'claude:orchestrator': 'selected-feature',
       'claude:worker-delegation': 'saycode',
-      'claude:connector-guidance': 'operational',
+      'claude:connector-guidance': 'saycode',
       'claude:ax-base': 'saycode',
       'claude:ax-step-guide': 'selected-feature',
       'claude:ax-dynamic-context': 'selected-feature',
       'codex:title': 'always-on',
-      'codex:connector-guidance': 'operational',
+      'codex:connector-guidance': 'saycode',
+      'common:checkpoint-guidance': 'saycode',
       'gemini:title': 'always-on',
       'client:append-system-prompt': 'client-composed',
     });
@@ -160,33 +161,25 @@ describe('resolveInitialSaycodeAppendSystemPrompt', () => {
   });
 });
 
+// specs/saycode-security-hardening D1 — Saycode prompts are all on or all off.
 describe('isSaycodePromptBlockEnabled', () => {
-  it('keeps default-on delegation blocks enabled when the master is off', () => {
-    expect(isSaycodePromptBlockEnabled('agentOrchestration', undefined, false)).toBe(true);
-    expect(isSaycodePromptBlockEnabled('workerDelegation', undefined, false)).toBe(true);
+  const blocks = ['agentOrchestration', 'workerDelegation', 'coAuthoredCredit', 'axBase'] as const;
+
+  it('turns every Saycode block off when the master is off, delegation included', () => {
+    for (const block of blocks) expect(isSaycodePromptBlockEnabled(block, undefined, false)).toBe(false);
   });
 
-  it('allows an explicit override to disable a default-on delegation block', () => {
-    expect(isSaycodePromptBlockEnabled(
-      'agentOrchestration',
-      { agentOrchestration: false },
-      true,
-    )).toBe(false);
+  it('turns every Saycode block on when the master is on or absent', () => {
+    for (const block of blocks) {
+      expect(isSaycodePromptBlockEnabled(block, undefined, true)).toBe(true);
+      expect(isSaycodePromptBlockEnabled(block, undefined, undefined)).toBe(true);
+    }
   });
 
-  it('falls back to the legacy on/off value when no per-block override exists', () => {
-    expect(isSaycodePromptBlockEnabled('coAuthoredCredit', undefined, false)).toBe(false);
-    expect(isSaycodePromptBlockEnabled('coAuthoredCredit', undefined, true)).toBe(true);
-    expect(isSaycodePromptBlockEnabled('coAuthoredCredit', undefined, undefined)).toBe(true);
-  });
-
-  it('lets a per-block override win over the legacy value in either direction', () => {
-    expect(isSaycodePromptBlockEnabled('coAuthoredCredit', { coAuthoredCredit: true }, false)).toBe(true);
-    expect(isSaycodePromptBlockEnabled('axBase', { axBase: false }, true)).toBe(false);
-  });
-
-  it('ignores overrides for other blocks', () => {
-    expect(isSaycodePromptBlockEnabled('axBase', { workerDelegation: false }, true)).toBe(true);
+  it('ignores per-block overrides an older client still sends', () => {
+    expect(isSaycodePromptBlockEnabled('agentOrchestration', { agentOrchestration: true }, false)).toBe(false);
+    expect(isSaycodePromptBlockEnabled('coAuthoredCredit', { coAuthoredCredit: true }, false)).toBe(false);
+    expect(isSaycodePromptBlockEnabled('axBase', { axBase: false }, true)).toBe(true);
   });
 });
 

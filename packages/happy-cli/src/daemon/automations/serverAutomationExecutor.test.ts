@@ -333,7 +333,7 @@ describe('예약 자동화 커넥터 실제 HTTP 경로 (#3556)', () => {
     }
   })
 
-  it.each([undefined, false])('별도 Claude 시스템 지침 생성기는 연결된 서비스의 탐색 안내를 유지한다 (Saycode prompt=%s)', async (enabled) => {
+  it('별도 Claude 시스템 지침 생성기는 연결된 서비스의 탐색 안내를 유지한다 (Saycode prompt 기본값)', async () => {
     const { result } = await runWithConnectorGateway('ready')
     expect(result).toEqual([{ automationId: 'automation-1', outcome: 'WOKE' }])
     // claudeRemote.ts가 쓰는 실제 생성 함수 조합을 검사한다. LLM 실행 자체는 아니다.
@@ -342,13 +342,23 @@ describe('예약 자동화 커넥터 실제 HTTP 경로 (#3556)', () => {
     })
     expect(services).toEqual(['gmail', 'google-drive'])
     const options = buildClaudeSystemPromptOptions({
-      saycodeSystemPrompt: '', saycodeSystemPromptEnabled: enabled,
+      saycodeSystemPrompt: '',
       connectorGuidance: buildConnectorToolGuidance(services),
     })
     expect(options.appendSystemPrompt).toContain('gmail, google-drive')
     expect(options.appendSystemPrompt).toContain('perform deferred MCP tool discovery')
     expect(options.appendSystemPrompt).toContain('same-named claude.ai connector is a different integration')
     expect(options.appendSystemPrompt).toContain('Do not recommend claude.ai connector reauthorization')
+  })
+
+  // aplus-dev-studio specs/saycode-security-hardening D1-3 — Saycode prompts off drops the connector guidance too.
+  // The automation's own diagnostic initialPrompt (below) still carries the connector checks.
+  it('Saycode prompt=false 이면 시스템 지침의 커넥터 안내를 넣지 않는다', () => {
+    const options = buildClaudeSystemPromptOptions({
+      saycodeSystemPrompt: '', saycodeSystemPromptEnabled: false,
+      connectorGuidance: buildConnectorToolGuidance(['gmail']),
+    })
+    expect(options.appendSystemPrompt).toBeUndefined()
   })
 
   it.each(['claude', 'codex'] as const)('%s 예약 자동화 initialPrompt에 커넥터 진단·재연동 판단 지침을 전달한다 (#3556 재현)', async (agent) => {
