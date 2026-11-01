@@ -1,0 +1,29 @@
+{
+  "description": "HKDF-SHA256(ikm=terminalKey, salt=daemonNonce, info=terminalFrameKeyInfo(dir, sessionId, terminalId)), 32 bytes. Every implementation (daemon, web, desktop) checks its derivation against these.",
+  "frameKeys": [
+    {
+      "dir": "in",
+      "sessionId": "cmvw00session0001",
+      "terminalId": "oKGio6SlpqeoqaqrrK2urw==",
+      "terminalKey": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "daemonNonce": "8O/u7ezr6uno5+bl5OPi4Q==",
+      "frameKey": "MEHAwa6yHq0WIjoM87xKI3VufQxcEpdetfsfaZC3tZE="
+    },
+    {
+      "dir": "out",
+      "sessionId": "cmvw00session0001",
+      "terminalId": "oKGio6SlpqeoqaqrrK2urw==",
+      "terminalKey": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "daemonNonce": "8O/u7ezr6uno5+bl5OPi4Q==",
+      "frameKey": "6WKEE1C0sZQd8j2Ushv5yjX3omYnQn0zZqf6whQe58Q="
+    },
+    {
+      "dir": "in",
+      "sessionId": "11111111-2222-4333-8444-555555555555",
+      "terminalId": "oKGio6SlpqeoqaqrrK2urw==",
+      "terminalKey": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "daemonNonce": "8O/u7ezr6uno5+bl5OPi4Q==",
+      "frameKey": "SbYzzf+4ZfbL6B56qbEaK0fciWL5fryjEI+kkXAiH0E="
+    }
+  ]
+}

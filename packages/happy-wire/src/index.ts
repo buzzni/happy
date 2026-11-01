@@ -17,6 +17,7 @@ export * from './companyKeyFingerprint';
 export * from './companyKeyReseed';
 export * from './sealedSpawnEnv';
 export * from './worktreeOps';
+export * from './terminalBinding';
 
 export * from './orgSetupTokenApproval';
 export * from './orgRequirements';

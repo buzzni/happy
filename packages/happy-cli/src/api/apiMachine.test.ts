@@ -1,13 +1,13 @@
 import nacl from 'tweetnacl';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKSPACE_SYNC_CAPABILITY, WORKTREE_OPS_CAPABILITY } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, TERMINAL_BINDING_CAPABILITY, WORKSPACE_SYNC_CAPABILITY, WORKTREE_OPS_CAPABILITY, bindRpcRequest, terminalFrameKeyInfo } from '@slopus/happy-wire';
 import { configuration } from '@/configuration';
 import {
     ApiMachineClient,
     PREVIEW_BOUND_PROXY_EVENT,
 } from './apiMachine';
 import { addDaemonTerminalSession, getDaemonTerminalSession, markDaemonTerminalSessionExited, removeDaemonTerminalSession } from '@/daemon/daemonTerminalSessions';
-import { deriveServerRpcKey, decodeBase64, decrypt, encodeBase64, encrypt } from './encryption';
+import { deriveServerRpcKey, decodeBase64, decrypt, decryptWithDataKey, encodeBase64, encrypt, encryptWithDataKey } from './encryption';
 import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_MAX_DELAY_MS, RECONNECT_NOT_READY_POLL_MS } from './reconnectCadence';
 import { logger } from '@/ui/logger';
 import { MachineMetadataSchema, type Machine } from './types';
@@ -21,6 +21,7 @@ import { WRITE_FILE_ATTEMPT_CAPABILITY } from '@/modules/common/writeFileAttempt
 import { LIST_FILES_PAGE_CAPABILITY } from '@/modules/common/listFilesPageCapability';
 import { McpCallerGrantEnvelopeConsumer } from '@/daemon/mcpCallerGrantEnvelope';
 import { join } from 'node:path';
+import { hkdfSync, randomBytes } from 'node:crypto';
 
 const {
     mockIo,
@@ -698,6 +699,189 @@ describe('ApiMachineClient socket reconnection', () => {
             expect(replayed).toContain('ended-here');
             expect(emitsOf('terminal-closed')).toEqual([expect.objectContaining({ sessionId, code: 7 })]);
             expect(mockSocket.emit.mock.calls.at(-1)?.[0]).toBe('terminal-closed');
+        });
+    });
+
+    /*
+     * aplus-dev-studio specs/e2ee-machine-control-boundary terminal-binding-strict-design.md —
+     * a v2 relay terminal: bound open, proof, frames sealed with keys from the terminal key and
+     * the daemon's nonce, in order. Real shells, so Unix only.
+     */
+    describeUnix('terminal contract v2 on the relay path', () => {
+        const sessionIds: string[] = [];
+        const mode = configuration as { machineControl?: 'compat' | 'strict' };
+        const b64 = (n: number) => randomBytes(n).toString('base64');
+
+        const emitsOf = (event: string): any[] => mockSocket.emit.mock.calls
+            .filter(([name]: [string]) => name === event)
+            .map(([, payload]: [string, any]) => payload);
+
+        afterEach(() => {
+            for (const id of sessionIds.splice(0)) {
+                const entry = getDaemonTerminalSession(id);
+                if (entry && !entry.exit) void entry.session.terminate();
+                removeDaemonTerminalSession(id);
+            }
+            delete mode.machineControl;
+        });
+
+        /** What a v2 client does: a terminal key and id, a bound open sealed with the machine key. */
+        function boundOpen(machine: Machine, overrides: { nonce?: string; params?: Record<string, unknown> } = {}) {
+            const terminalKey = b64(32);
+            const terminalId = b64(16);
+            const nonce = overrides.nonce ?? b64(16);
+            const request = bindRpcRequest({
+                method: 'terminal-open', scope: machine.id, issuedAt: Date.now(), nonce,
+                params: { terminalBinding: 1, terminalKey, terminalId, shell: '/bin/sh', userId: 'u1', ...overrides.params },
+            });
+            return { terminalKey, terminalId, nonce, params: encodeBase64(encrypt(machine.encryptionKey, machine.encryptionVariant, request)) };
+        }
+
+        async function open(machine: Machine, sessionId: string, params: string) {
+            sessionIds.push(sessionId);
+            return new Promise<any>((resolve) => emitSocketEvent('terminal-open-fwd', { sessionId, params }, resolve));
+        }
+
+        function clientOf(sessionId: string, terminalKey: string, terminalId: string, proof: string) {
+            const opened = decryptWithDataKey(decodeBase64(proof), decodeBase64(terminalKey));
+            const key = (dir: 'in' | 'out') => new Uint8Array(hkdfSync('sha256', decodeBase64(terminalKey), decodeBase64(opened.daemonNonce),
+                Buffer.from(terminalFrameKeyInfo(dir, sessionId, terminalId), 'utf8'), 32));
+            let seq = 0;
+            return {
+                proof: opened,
+                send: (frame: Record<string, unknown>, at = seq + 1) => {
+                    seq = at;
+                    emitSocketEvent('terminal-frame-fwd', { sessionId, data: encodeBase64(encryptWithDataKey({ v: 1, t: terminalId, dir: 'in', seq: at, ...frame }, key('in'))) });
+                },
+                received: () => emitsOf('terminal-frame')
+                    .filter((frame) => frame.sessionId === sessionId)
+                    .map((frame) => decryptWithDataKey(decodeBase64(frame.data), key('out'))),
+            };
+        }
+
+        it('opens a bound terminal, proves it, and runs sealed input in order', async () => {
+            const machine = makeMachine();
+            const client = new ApiMachineClient('fake-token', machine);
+            client.connect();
+            const sessionId = 'v2-relay-1';
+            const opener = boundOpen(machine);
+            mockSocket.emit.mockClear();
+
+            const ack = await open(machine, sessionId, opener.params);
+
+            expect(ack).toMatchObject({ ok: true, caps: { resume: true, snapshot: true, pagedResume: true, terminalBinding: { version: 1 } } });
+            const terminal = clientOf(sessionId, opener.terminalKey, opener.terminalId, ack.caps.terminalBinding.proof);
+            expect(terminal.proof).toMatchObject({ nonce: opener.nonce, sessionId, terminalId: opener.terminalId, caps: { resume: true } });
+            terminal.send({ kind: 'input', data: 'echo F9-$((40+2))\n' });
+            await vi.waitFor(() => expect(terminal.received().map((f: any) => f?.data ?? '').join('')).toContain('F9-42'), { timeout: 5000 });
+            // The relay sees no seq: it travels sealed.
+            expect(emitsOf('terminal-frame').every((frame) => frame.seq === undefined)).toBe(true);
+            expect(terminal.received().every((frame: any) => frame?.dir === 'out' && frame.t === opener.terminalId)).toBe(true);
+        });
+
+        it('refuses a replay of the same open', async () => {
+            const machine = makeMachine();
+            const client = new ApiMachineClient('fake-token', machine);
+            client.connect();
+            const opener = boundOpen(machine);
+            expect((await open(machine, 'v2-replay-1', opener.params)).ok).toBe(true);
+
+            const replay = await open(machine, 'v2-replay-2', opener.params);
+
+            expect(replay).toMatchObject({ ok: false, code: 'RPC_REQUEST_REPLAYED' });
+            expect(getDaemonTerminalSession('v2-replay-2')).toBeNull();
+        });
+
+        it('refuses the v1 open under strict machine control without opening a shell', async () => {
+            mode.machineControl = 'strict';
+            const machine = makeMachine();
+            const client = new ApiMachineClient('fake-token', machine);
+            client.connect();
+            const params = encodeBase64(encrypt(machine.encryptionKey, machine.encryptionVariant, { userId: 'u1', shell: '/bin/sh' }));
+
+            const ack = await open(machine, 'v1-strict-1', params);
+
+            expect(ack).toMatchObject({ ok: false, code: 'TERMINAL_BINDING_REQUIRED' });
+            expect(getDaemonTerminalSession('v1-strict-1')).toBeNull();
+        });
+
+        it('ends the terminal on a hole in the input and says why, sealed', async () => {
+            const machine = makeMachine();
+            const client = new ApiMachineClient('fake-token', machine);
+            client.connect();
+            const sessionId = 'v2-gap-1';
+            const opener = boundOpen(machine);
+            const ack = await open(machine, sessionId, opener.params);
+            const terminal = clientOf(sessionId, opener.terminalKey, opener.terminalId, ack.caps.terminalBinding.proof);
+
+            terminal.send({ kind: 'input', data: 'true\n' }, 2);
+
+            await vi.waitFor(() => expect(terminal.received().find((f: any) => f?.kind === 'closed')).toMatchObject({ reason: 'input-gap' }), { timeout: 5000 });
+            expect(emitsOf('terminal-closed')).toEqual([expect.objectContaining({ sessionId })]);
+        });
+
+        it('closes on a sealed close, and ignores plaintext resize and resume for a v2 terminal', async () => {
+            const machine = makeMachine();
+            const client = new ApiMachineClient('fake-token', machine);
+            client.connect();
+            const sessionId = 'v2-close-1';
+            const opener = boundOpen(machine);
+            const ack = await open(machine, sessionId, opener.params);
+            const terminal = clientOf(sessionId, opener.terminalKey, opener.terminalId, ack.caps.terminalBinding.proof);
+            const entry = getDaemonTerminalSession(sessionId)!;
+            const resize = vi.spyOn(entry.session, 'resize');
+            mockSocket.emit.mockClear();
+
+            emitSocketEvent('terminal-resize-fwd', { sessionId, cols: 10, rows: 10 });
+            emitSocketEvent('terminal-resume-fwd', { sessionId, afterSeq: 0 });
+            expect(resize).not.toHaveBeenCalled();
+            expect(mockSocket.emit).not.toHaveBeenCalled();
+
+            terminal.send({ kind: 'resize', cols: 100, rows: 30 });
+            expect(resize).toHaveBeenCalledWith(100, 30);
+            terminal.send({ kind: 'close' });
+
+            await vi.waitFor(() => expect(terminal.received().find((f: any) => f?.kind === 'closed')).toMatchObject({ reason: 'client-closed' }), { timeout: 5000 });
+        });
+
+        it('answers a sealed resume with sealed frames naming the request', async () => {
+            const machine = makeMachine();
+            const client = new ApiMachineClient('fake-token', machine);
+            client.connect();
+            const sessionId = 'v2-resume-1';
+            const opener = boundOpen(machine, { params: { args: ['-c', 'printf resumed-here; sleep 5'] } });
+            const ack = await open(machine, sessionId, opener.params);
+            const terminal = clientOf(sessionId, opener.terminalKey, opener.terminalId, ack.caps.terminalBinding.proof);
+            await vi.waitFor(() => expect(getDaemonTerminalSession(sessionId)!.output.lastSeq()).toBeGreaterThan(0), { timeout: 5000 });
+            mockSocket.emit.mockClear();
+            const rid = b64(16);
+
+            terminal.send({ kind: 'resume', rid, afterSeq: 0 });
+
+            const replay = terminal.received();
+            expect(replay.length).toBeGreaterThan(0);
+            expect(replay.every((frame: any) => frame.kind === 'output' && frame.rid === rid)).toBe(true);
+            expect(replay.map((frame: any) => frame.data).join('')).toContain('resumed-here');
+        });
+
+        // Codex CLI benchmark D4 B-R2 on v2: the daemon holds no keys for a terminal it forgot, so the plaintext unknown-session is the answer.
+        it('answers a sealed resume for a terminal this daemon no longer has with unknown-session', async () => {
+            const machine = makeMachine();
+            const client = new ApiMachineClient('fake-token', machine);
+            client.connect();
+            const sessionId = 'v2-gone-1';
+            const opener = boundOpen(machine);
+            const ack = await open(machine, sessionId, opener.params);
+            const terminal = clientOf(sessionId, opener.terminalKey, opener.terminalId, ack.caps.terminalBinding.proof);
+            await getDaemonTerminalSession(sessionId)!.session.terminate();
+            removeDaemonTerminalSession(sessionId);
+            mockSocket.emit.mockClear();
+
+            terminal.send({ kind: 'resume', rid: b64(16), afterSeq: 3 });
+
+            expect(mockSocket.emit.mock.calls).toEqual([
+                ['terminal-closed', { sessionId, reason: 'unknown-session' }],
+            ]);
         });
     });
 
@@ -1616,6 +1800,31 @@ describe('ApiMachineClient socket reconnection', () => {
         await vi.waitFor(() => expect(machine.metadata?.rpcBinding).toEqual(RPC_BINDING_CAPABILITY));
         expect(machine.metadata?.worktreeOps).toEqual(expected);
         expect(machine.metadata?.workspaceSync).toEqual(expected ? WORKSPACE_SYNC_CAPABILITY : undefined);
+
+        client.shutdown();
+    });
+
+    // aplus-dev-studio terminal-binding-strict-design §4-7 — the switch that turns clients to the
+    // terminal contract v2: a dataKey machine that is not a managed runtime advertises it.
+    it.each([
+        { variant: 'dataKey' as const, managed: false, expected: TERMINAL_BINDING_CAPABILITY },
+        { variant: 'legacy' as const, managed: false, expected: undefined },
+        { variant: 'dataKey' as const, managed: true, expected: undefined },
+    ])('advertises the terminal contract v2 on a $variant machine (managed: $managed)', async ({ variant, managed, expected }) => {
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
+            if (event === 'machine-update-state') return { result: 'success', version: 1, daemonState: data.daemonState };
+            return { result: 'success' };
+        });
+        const machine = { ...makeMachine(), encryptionVariant: variant };
+        machine.metadata = { ...machine.metadata!, terminalBinding: expected ? undefined : TERMINAL_BINDING_CAPABILITY };
+        const client = new ApiMachineClient('fake-token', machine);
+        if (managed) (client as any).managedHandlers = {};
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.terminalBinding).toEqual(expected));
 
         client.shutdown();
     });

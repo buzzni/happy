@@ -12,6 +12,7 @@
 
 import { type PtySession, type TerminateOutcome } from './remoteTerminal'
 import { createTerminalOutputBuffer, type TerminalOutputBuffer } from './terminalOutputBuffer'
+import type { BoundTerminal } from './terminalBindingSession'
 
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60 * 1000
 
@@ -72,6 +73,12 @@ export interface DaemonTerminalEntry {
      * socket must not end it (specs/codexcli-daemon-stream-durability B2a).
      */
     readonly route: 'relay' | 'direct'
+    /**
+     * Set when the terminal was opened with its own key (contract v2,
+     * terminalBindingSession.ts): its frames and controls then travel sealed
+     * with that key, and the plaintext controls of the v1 contract are ignored.
+     */
+    binding?: BoundTerminal
 }
 
 interface InternalEntry extends DaemonTerminalEntry {

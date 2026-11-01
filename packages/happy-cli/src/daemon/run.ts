@@ -1,3 +1,4 @@
+import { createBrowserNativeDeviceProof, type BrowserNativeDeviceSigner } from './browserNativeDeviceProof';
 import { createManualPersonalSpawn, MANUAL_PERSONAL_ENV } from './manualPersonalClaude';
 import { createOwnedSpawnRuntime, createOwnedStartGuard } from './ownedSpawnRuntime';
 import { createAgentCallerLaunches, OWNER_CONTACT_SWITCH, readOwnerContactTrust, type OwnedLaunchLineage } from './agentCallerLaunches';
@@ -1876,7 +1877,12 @@ export async function startDaemon(): Promise<void> {
     let onPersonalBrowserActive: ((native: NativeBrokerRequestOptions) => void) | undefined;
     /** Set once the machine sync client exists; an activation before that is published with the first metadata check. */
     let publishAgentBrowserCapability: (() => void) | undefined;
+    let browserNativeDeviceSigner: BrowserNativeDeviceSigner | undefined;
     const personalBrowserWatch = browserTaskBroker || process.env.HAPPY_BROWSER_TASK_RUNTIME_URL ? undefined : watchPersonalBrowserRuntime({
+      deviceProof: async request => {
+        if (!browserNativeDeviceSigner) throw new Error('NATIVE_DEVICE_APPROVAL_REQUIRED');
+        return browserNativeDeviceSigner(request);
+      },
       machineId, studioOrigin: readTrustedStudioOrigin(process.env), token: () => credentials.token, log: (message) => logger.warn(message),
       activate: (runtime) => {
         let broker: BrowserTaskSessionBroker | undefined;
@@ -4124,7 +4130,7 @@ export async function startDaemon(): Promise<void> {
     // resolves, well after this server starts — a ref the terminal route
     // reads lazily, rather than reordering daemon startup around it.
     let deviceEnrollment: ReturnType<typeof createDeviceEnrollment> | null = null;
-    let machineEncryptionForTerminalWs: { encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey' } | null = null;
+    let machineEncryptionForTerminalWs: { encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey'; machineId: string; strict: boolean } | null = null;
 
     writeScopeRuntime = await createSessionWriteScopeRuntime({
       machineId, env: writeScopeHostEnvironment, managed: managedIdentity.status === 'active' || Boolean(standaloneWindows),
@@ -4308,7 +4314,13 @@ export async function startDaemon(): Promise<void> {
     // Local-direct terminal (/terminal) only needs the locally-derived
     // encryption key, not server registration — set it either way so an
     // offline-degraded daemon still serves same-machine desktop clients.
-    machineEncryptionForTerminalWs = { encryptionKey: machine.encryptionKey, encryptionVariant: machine.encryptionVariant };
+    machineEncryptionForTerminalWs = {
+      encryptionKey: machine.encryptionKey,
+      encryptionVariant: machine.encryptionVariant,
+      // terminal-binding-strict-design §4-6: the scope a bound direct open names, and whether a v1 open is refused.
+      machineId: machine.id,
+      strict: configuration.machineControl === 'strict',
+    };
     if (!standaloneWindows) startDifficultyRoutingElectionPoll({
       host: difficultyRoutingHost,
       machineId: machine.id,
@@ -4336,6 +4348,10 @@ export async function startDaemon(): Promise<void> {
       marker: machineTypeMarker,
       ...(autoConfirmOrigin ? { autoConfirm: createSharedPcAutoConfirm({ marker: machineTypeMarker, machineId: machine.id,
         token: () => credentials.token, studioOrigin: autoConfirmOrigin, log: (message, details) => logger.debug(message, details) }) } : {}) });
+    if (deviceKeys && deviceEnrollment) {
+      const enrollment = deviceEnrollment;
+      browserNativeDeviceSigner = createBrowserNativeDeviceProof({ keys: deviceKeys, pin: companyId => enrollment.orgPin(companyId) });
+    }
     const apiMachine = api.machineSyncClient(machine, deviceKeys, deviceEnrollment ?? undefined, initialDaemonState);
     if (standaloneWindows) apiMachine.setWindowsStandaloneTrial();
     startDifficultyRoutingMetadataPoll({

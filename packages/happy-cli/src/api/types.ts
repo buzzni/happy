@@ -2,7 +2,7 @@ export type SetupTokenRotationState = 'switching' | 'switched' | 'exhausted' | '
 import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { z } from 'zod'
 import type { OrgRequirementsAgentState, ProviderUsageEventV1, Update, UpdateMachineBody } from '@slopus/happy-wire';
-import { authenticatedEnvelopesCapabilitySchema, companyKeyReseedCapabilitySchema, OrgRequirementsCapabilitySchema, projectPurgeCapabilitySchema, rpcBindingCapabilitySchema, sealedSpawnEnvCapabilitySchema, workspaceSyncCapabilitySchema, worktreeOpsCapabilitySchema, type RpcBindingCapability } from '@slopus/happy-wire';
+import { authenticatedEnvelopesCapabilitySchema, companyKeyReseedCapabilitySchema, OrgRequirementsCapabilitySchema, projectPurgeCapabilitySchema, rpcBindingCapabilitySchema, sealedSpawnEnvCapabilitySchema, terminalBindingCapabilitySchema, workspaceSyncCapabilitySchema, worktreeOpsCapabilitySchema, type RpcBindingCapability } from '@slopus/happy-wire';
 import { UsageSchema } from '@/claude/types'
 import { DifficultyRoutingCapabilitySchema, DifficultyRoutingIntentSchema } from '@/difficultyRouting'
 import type { SandboxConfig } from '@/persistence'
@@ -320,6 +320,8 @@ export const MachineMetadataSchema = z.object({
   workspaceSync: workspaceSyncCapabilitySchema.optional(),
   /** aplus specs/e2ee-machine-control-boundary F8: `datakey:reseed`, strict machines with an org pin only. */
   companyKeyReseed: companyKeyReseedCapabilitySchema.optional(),
+  /** aplus terminal-binding-strict-design §4-7: opens remote terminals with their own key (contract v2), dataKey BYOS only. */
+  terminalBinding: terminalBindingCapabilitySchema.optional(),
   /**
    * Agent Browser execution machine. protocol 2: spawns accept `browserAttestation` (a session-user
    * attestation). Studio sends one only when this is reported, and treats the machine by `tenancyMode`.
