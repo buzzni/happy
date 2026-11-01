@@ -91,7 +91,7 @@ import { fetchBrowserExtensionScope } from './browserExtensionScope';
 import { readBrowserSetupPolicy, writeBrowserSetupPolicy, localBrowserExtensionMetadata } from './browserLocalSetupStore';
 import { BrowserSessionBrokerClient } from './browserSessionBrokerContract';
 import { getBusyDaemonTerminalCount, getDaemonTerminalSessionCount } from './daemonTerminalSessions';
-import { startBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './browserBridgeServer';
+import { startBrowserBridgeServer, retryBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './browserBridgeServer';
 import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
 import { prepareBrowserNativeMessaging, registerBrowserNativeHost } from './browserNativeHostRegistration';
 import { resolveExtensionDir, resolveExtensionId } from '@/commands/browser';
@@ -4069,7 +4069,7 @@ export async function startDaemon(): Promise<void> {
     // Chrome extension bridge (specs/chrome-extension-bridge/). Listens on a
     // fixed loopback port because the extension cannot read daemon.state.json
     // to discover an ephemeral one. A bind failure (port taken) must not take
-    // the daemon down — browser control is simply unavailable until restart.
+    // the daemon down — browser control is unavailable until the port is released, then retried.
     const browserSessionBroker = !standaloneWindows && process.env.HAPPY_BROWSER_BROKER_SOCKET
       ? new BrowserSessionBrokerClient(process.env.HAPPY_BROWSER_BROKER_SOCKET)
       : null;
@@ -4122,6 +4122,10 @@ export async function startDaemon(): Promise<void> {
     } catch (err) {
       browserLocalSetup = undefined;
       logger.debug(`[DAEMON RUN] Browser bridge failed to start on ${DEFAULT_BROWSER_BRIDGE_PORT}: ${err instanceof Error ? err.message : String(err)}`);
+      // Local setup stays off after a takeover: it is offered only by a daemon that owned the port from the start.
+      if ((err as NodeJS.ErrnoException)?.code === 'EADDRINUSE') {
+        stopBrowserBridge = retryBrowserBridgeServer({ bridge: browserBridge, port: DEFAULT_BROWSER_BRIDGE_PORT, host: resolveBrowserBridgeHost(process.env) }).stop;
+      }
     }
 
     // /terminal (local-direct) needs the machine's E2EE key to decrypt open

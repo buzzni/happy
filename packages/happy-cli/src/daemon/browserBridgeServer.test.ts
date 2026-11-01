@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { WebSocket } from 'ws'
+import { createServer, type AddressInfo } from 'node:net'
 import { BrowserBridge, deriveBrowserViewerBridgeToken } from './browserBridge'
-import { startBrowserBridgeServer } from './browserBridgeServer'
+import { retryBrowserBridgeServer, startBrowserBridgeServer } from './browserBridgeServer'
 import { startDaemonControlServer } from './controlServer'
 import type { PortRegistry } from './portRegistry'
 
@@ -46,6 +47,27 @@ describe('browserBridgeServer', () => {
             expect(JSON.parse(await new Promise<string>(resolve => store.on('message', raw => resolve(raw.toString()))))).toMatchObject({ ok: true })
             store.close()
         } finally { await server.stop() }
+    })
+    it('takes the port over once the process holding it exits', async () => {
+        const holder = createServer()
+        await new Promise<void>(resolve => holder.listen(0, '127.0.0.1', resolve))
+        const heldPort = (holder.address() as AddressInfo).port
+        const retryBridge = new BrowserBridge({ authToken: TOKEN })
+        const retry = retryBrowserBridgeServer({ bridge: retryBridge, port: heldPort, retryMs: 20 })
+        try {
+            await new Promise(resolve => setTimeout(resolve, 60))
+            await expect(retryBridge.request('tabs_list', {})).rejects.toMatchObject({ code: 'BRIDGE_PORT_IN_USE' })
+            await new Promise<void>(resolve => holder.close(() => resolve()))
+            await expect.poll(() => retryBridge.request('tabs_list', {}).catch((e: { code: string }) => e.code), { timeout: 2000 })
+                .toBe('NO_EXTENSION_CONNECTED')
+            const { ws, closedWith } = await connectExtension(heldPort, `token=${TOKEN}&profile=work`)
+            expect(closedWith).toBeUndefined()
+            await expect.poll(() => retryBridge.connections()).toEqual([{ profile: 'work' }])
+            ws.close()
+        } finally {
+            await retry.stop()
+            holder.close()
+        }
     })
     let bridge: BrowserBridge
     let port: number
@@ -235,6 +257,17 @@ describe('controlServer /browser routes', () => {
         expect(res.status).toBe(503)
         const body = await res.json() as { code: string }
         expect(body.code).toBe('NO_EXTENSION_CONNECTED')
+    })
+
+    it('POST /browser/request returns 503 while another process holds the bridge port', async () => {
+        bridge.setListenerUnavailable(41777)
+        const res = await fetch(`${baseUrl}/browser/request`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ method: 'ping' }),
+        })
+        expect(res.status).toBe(503)
+        expect((await res.json() as { code: string }).code).toBe('BRIDGE_PORT_IN_USE')
     })
 
     it('POST /browser/request returns 504 on extension timeout', async () => {
