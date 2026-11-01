@@ -16,6 +16,8 @@ import { startSessionAgentBroker } from '@/commands/sessionAgentBroker';
 const request = { v: 1, entry: 'agent', operation: 'lookup-readable-sessions', payload: { sessionIds: ['target'] } } as const;
 const chatRead = { v: 1, entry: 'chat', operation: 'read-session', targetSessionId: 'sibling', payload: { cursor: null, limit: 1, waitMs: 0 } } as const;
 const childStatus = { v: 1, entry: 'chat', operation: 'owned-child-status', payload: { operationId: 'operation', spawnId: 'spawn', spawnDigest: 'a'.repeat(64) } } as const;
+const steer = { v: 1, entry: 'agent', operation: 'steer-own-session', targetSessionId: 'sibling', payload: { sessionId: 'sibling', runtimeId: 'r', text: 'redirect' } } as const;
+const abort = { v: 1, entry: 'agent', operation: 'abort-own-turn', targetSessionId: 'sibling', payload: { sessionId: 'sibling', runtimeId: 'r' } } as const;
 /** What a provider-run `saycode chat -s` does: POST a local DTO to the owner-only socket. */
 function post(socketPath: string, body: unknown) {
     return new Promise<{ status: number; body: string }>((resolve, reject) => {
@@ -319,6 +321,7 @@ describe('host owner-contact wiring (startHappyServer)', () => {
         ['lookup-readable-sessions', request],
         ['read-session', { v: 1, entry: 'agent', operation: 'read-session', targetSessionId: 'sibling', payload: { cursor: null, limit: 1, waitMs: 0 } }],
         ['abort-own-turn', { v: 1, entry: 'agent', operation: 'abort-own-turn', targetSessionId: 'sibling', payload: { sessionId: 'sibling', runtimeId: 'r' } }],
+        ['steer-own-session', steer],
     ] as const)('refuses broker sibling/parent %s for an agent command at depth >= 1 (P0a §2.3)', async (_name, sibling) => {
         const h = harness({ depth: '1' }), w = wiring(h, { broker: true });
         const started = await w.start();
@@ -389,6 +392,78 @@ describe('host owner-contact wiring (startHappyServer)', () => {
         const socket = w.env.SAYCODE_OWNER_CONTACT_SOCKET!;
         for (const entry of ['agent', 'chat']) expect(JSON.parse((await post(socket, { ...request, entry })).body).result).toBe('allowed');
         await started.close();
+    });
+    // T1s stage 2 (sibling-steer-stop-amendment S1): main cannot tell a broker caller from a direct one and the direct
+    // depth is shell env, so steer reaches main only from a depth 0 broker agent command. Abort keeps its existing entries.
+    it.skipIf(process.platform === 'win32')('passes steer-own-session only for a depth 0 broker agent command [T1s-S2]', async () => {
+        const h = harness(), w = wiring(h, { broker: true });
+        const started = await w.start();
+        try {
+            const contact = (w.startBroker.mock.calls[0] as unknown[])[0] as { call(raw: unknown): Promise<unknown> };
+            h.register((await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller);
+            await contact.call(steer).catch(() => undefined);
+            const passed = h.lookups.length;
+            expect(passed).toBeGreaterThan(0);
+            await expect(contact.call({ ...steer, entry: 'chat' })).rejects.toThrow();
+            expect((await post(w.env.SAYCODE_OWNER_CONTACT_SOCKET!, { ...steer, entry: 'chat' })).status).toBe(503);
+            expect(h.lookups).toHaveLength(passed);
+        } finally { await started.close(); }
+    });
+    it.skipIf(process.platform === 'win32')('refuses steer for chat below depth 0 while leaving an explicit chat abort to main [T1s-S2]', async () => {
+        const h = harness({ depth: '1' }), w = wiring(h, { broker: true });
+        const started = await w.start();
+        try {
+            const contact = (w.startBroker.mock.calls[0] as unknown[])[0] as { call(raw: unknown): Promise<unknown> };
+            h.register({ ...(await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller, depth: 1 });
+            await expect(contact.call({ ...steer, entry: 'chat' })).rejects.toThrow();
+            expect(h.lookups).toEqual([]);
+            await contact.call({ ...abort, entry: 'chat' }).catch(() => undefined);
+            expect(h.lookups.length).toBeGreaterThan(0);
+        } finally { await started.close(); }
+    });
+    // An agent-entry abort is the sibling stop (Desktop amendment S1/S2): the same depth 0 broker range as steer.
+    it.skipIf(process.platform === 'win32')('never takes steer or an agent-entry abort on a direct host socket, and keeps the chat abort [T1s-S2]', async () => {
+        const h = harness(), w = wiring(h);
+        const started = await w.start();
+        try {
+            h.register((await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller);
+            const socket = w.env.SAYCODE_OWNER_CONTACT_SOCKET!;
+            for (const entry of ['agent', 'chat']) expect((await post(socket, { ...steer, entry })).status).toBe(503);
+            expect((await post(socket, abort)).status).toBe(503);
+            expect(h.lookups).toEqual([]);
+            await post(socket, { ...abort, entry: 'chat' });
+            expect(h.lookups.length).toBeGreaterThan(0);
+        } finally { await started.close(); }
+    });
+    it.skipIf(process.platform === 'win32')('refuses an agent-entry abort on a nested direct socket, beside a broker and from a nested broker [T1s-S2]', async () => {
+        const direct = harness({ depth: '1' }), d = wiring(direct);
+        const directStarted = await d.start();
+        try {
+            direct.register({ ...(await direct.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller, depth: 1 });
+            expect((await post(d.env.SAYCODE_OWNER_CONTACT_SOCKET!, abort)).status).toBe(503);
+            expect(direct.lookups).toEqual([]); expect(direct.sends).toEqual([]);
+        } finally { await directStarted.close(); }
+        for (const depth of [0, 1]) {
+            const h = harness(depth ? { depth: String(depth) } : {}), w = wiring(h, { broker: true });
+            const started = await w.start();
+            try {
+                const contact = (w.startBroker.mock.calls[0] as unknown[])[0] as { call(raw: unknown): Promise<unknown> };
+                h.register({ ...(await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller, depth });
+                expect((await post(w.env.SAYCODE_OWNER_CONTACT_SOCKET!, abort)).status).toBe(503);
+                if (depth) await expect(contact.call(abort)).rejects.toThrow();
+                expect(h.lookups).toEqual([]); expect(h.sends).toEqual([]);
+            } finally { await started.close(); }
+        }
+    });
+    it.skipIf(process.platform === 'win32')('passes an agent-entry abort from a depth 0 broker only [T1s-S2]', async () => {
+        const h = harness(), w = wiring(h, { broker: true });
+        const started = await w.start();
+        try {
+            const contact = (w.startBroker.mock.calls[0] as unknown[])[0] as { call(raw: unknown): Promise<unknown> };
+            h.register((await h.launches.query({ sessionId: 'source', nonce: 'n'.repeat(32) })).caller);
+            await contact.call(abort).catch(() => undefined);
+            expect(h.lookups.length).toBeGreaterThan(0);
+        } finally { await started.close(); }
     });
     it('starts without owner contact when the daemon refuses', async () => {
         const h = harness({ daemonEnabled: false }), w = wiring(h, { broker: true });

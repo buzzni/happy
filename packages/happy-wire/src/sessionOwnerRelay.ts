@@ -18,6 +18,8 @@ const operations = [
     { operation: z.literal('abort-own-turn'), targetSessionId: id, payload: z.object({ sessionId: id, runtimeId: persistedId }).strict() },
     { operation: z.literal('spawn-owned-child'), payload: OwnerRelayChildReferenceSchema.extend({ childAgentId: id, spawnOptions: OwnerRelaySpawnOptionsSchema }).strict() },
     { operation: z.literal('owned-child-status'), payload: OwnerRelayChildReferenceSchema },
+    // The existing session `steer` RPC's only input, bound to the runtime a read observed; size is the request envelope's (T1s stage 2).
+    { operation: z.literal('steer-own-session'), targetSessionId: id, payload: z.object({ sessionId: id, runtimeId: persistedId, text: z.string().min(1) }).strict() },
 ] as const;
 const local = { v: z.literal(1), entry: z.enum(['agent', 'chat']) };
 const binding = { v: z.literal(1), requestId: id, nonce: binary(32), sourceHubSessionId: id, sourceRuntimeId: id,
@@ -36,6 +38,7 @@ function requests<T extends z.ZodRawShape>(base: T) {
         z.object({ ...base, ...operations[5] }).strict(),
         z.object({ ...base, ...operations[6] }).strict(),
         z.object({ ...base, ...operations[7] }).strict(),
+        z.object({ ...base, ...operations[8] }).strict(),
     ] as const;
 }
 export const OwnerContactRequestSchema = jsonRequest.pipe(z.discriminatedUnion('operation', requests(local)).refine(targetsMatch));
@@ -68,6 +71,7 @@ const results = [
     { operation: z.literal('abort-own-turn'), control: z.object(control).strict().refine(confirmed) },
     { operation: z.literal('spawn-owned-child'), childSpawn: child },
     { operation: z.literal('owned-child-status'), childSpawn: child },
+    { operation: z.literal('steer-own-session'), control: z.object(control).strict().refine(confirmed) },
 ] as const;
 const reply = { ...binding, responderSubject: OwnershipSubjectSchema, checkedAt: relayCount,
     reason: z.string().optional(), signature: binary(64) };
@@ -80,6 +84,7 @@ const allowed = z.discriminatedUnion('operation', [
     z.object({ ...reply, result: z.literal('allowed'), ...results[5] }).strict(),
     z.object({ ...reply, result: z.literal('allowed'), ...results[6] }).strict(),
     z.object({ ...reply, result: z.literal('allowed'), ...results[7] }).strict(),
+    z.object({ ...reply, result: z.literal('allowed'), ...results[8] }).strict(),
 ]);
 export const OwnerRelayReplySchema = jsonReply.pipe(z.union([allowed, z.object({ ...reply,
     operation: z.enum(operations.map(op => op.operation.value)), result: z.enum(['not_owned', 'unavailable', 'unknown']) }).strict()]));

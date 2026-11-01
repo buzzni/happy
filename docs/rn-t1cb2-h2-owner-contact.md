@@ -139,7 +139,7 @@ Desktop D2 사전 연결 검토 2항: broker가 있으면 socket을 만들지 �
 - **socket은 chat verb만 받는다.** `entry:'agent'`는 503으로 거부한다(agent 명령은 기존처럼 broker IPC와 그 depth
   정책만 쓴다). `spawn-owned-child`·`owned-child-status`도 거부한다. owned child는 broker가 예약에서 ID를 고정하는
   연산이고(§4.5·§4.6), §5.1의 chat verb(조회·입력·resume·permission·abort)에 생성은 없다. steer/stop은 wire에 없으므로
-  넓어지지 않는다. 자기 대상 거부(self-target)는 main이 판정한다.
+  넓어지지 않는다(2026-11-01 이후 `steer-own-session`이 생겼지만 socket은 받지 않는다 — 아래 T1s 2단계). 자기 대상 거부(self-target)는 main이 판정한다.
 - **depth≥1 broker 모드의 chat lookup은 거부한다.** 판단: §2.3 chat 행은 "모든 경로"에서 read ACL 안 own 조회를
   허용하고 §4.5는 "agent 환경 chat의 own 허용은 모든 depth"라고 한다. 반면 §2.3 A3 문단은 "broker depth ≥1의 형제
   비노출 등 원래 read 제한은 유지한다"고 하고, §4.5 lookup 문단은 "broker 하위 agent 명령의 형제 비노출 같은 경로
@@ -209,7 +209,7 @@ contact를 골라, spawn은 desktop-z로, 뒤에 후보로 추가된 desktop-a�
   예산으로 spawn하는 host가 실제로 있으면 상한을 다시 본다. 영속 기록이나 Desktop 정보를
   wire·CLI journal에 싣는 일은 wire 변경이라 하지 않았다.
 - **고정하지 않는 operation**: `lookup-readable-sessions`·`read-session`은 instance별 journal 없이 현재 상태를 읽는
-  조회라 어느 유효 Desktop이 답해도 같다. `resume-own-session`·`reply-own-permission`·`abort-own-turn`은 wire에
+  조회라 어느 유효 Desktop이 답해도 같다. `resume-own-session`·`reply-own-permission`·`abort-own-turn`·`steer-own-session`은 wire에
   operation 식별자가 없어 호출 하나가 operation 하나이고, 결과 unknown 뒤에는 같은 요청을 다른 Desktop에 재송신하는
   대신 호출자가 read로 상태를 확인한다. target만으로 묶으면 무관한 operation까지 한 Desktop에 묶이므로 키로 쓰지 않는다.
 
@@ -258,3 +258,27 @@ owned 경로에 들어갈 수 없었다. 방식 (a)로 broker entry 정책에 �
 검증: `sessionOwnerContactHost.test.ts`에 1건(자기 단독 lookup은 main 도달, `[self,sibling]`·`[sibling,self]`·
 `[self,self]`·`[]`·chat 자기 lookup은 lookup 전 거부). 구현 전 실패, 예외를 되돌리면 다시 실패. 같은 파일 43건 통과,
 `tsc --noEmit` 통과. 실제 host 왕복은 T2r 항목이다.
+
+## T1s 2단계 — `steer-own-session` entry 정책 (2026-11-01)
+
+Desktop `specs/reason-network-adoption/sibling-steer-stop-amendment.md` S1·S3 2단계. 형제 steer는 사람이 시작한
+broker 허브(depth 0)의 agent 명령에만 연다. main은 broker와 직접 경로를 구분하지 못하고 직접 경로의 depth는 셸 env라
+판정 입력이 아니므로(S1) host가 집행한다.
+
+- `steer-own-session`은 **depth 0 broker IPC의 `entry:'agent'`만** main으로 보낸다. depth≥1 broker의 agent·chat,
+  depth 0 broker IPC의 `entry:'chat'`, broker 옆 chat socket, 직접 host socket(모든 depth·entry)은 lookup 전에 거부한다.
+  chat verb에는 steer가 없다(p0a §5.1).
+- 형제 stop은 기존 `abort-own-turn`의 **agent entry**다. Desktop PR #2787 리뷰 봇 관찰에 따라 steer와 같은 범위로 좁혔다: agent entry abort는 depth 0
+  broker IPC만 main으로 보내고 직접 host socket(모든 depth)·depth≥1 broker에서는 거부한다. chat entry abort(socket chat `/stop`)의 규칙은 그대로다
+  (chat의 명시 target은 main 판정, 직접 socket 허용). 확인: agent entry abort를 만드는 코드는 Desktop CLI 형제 stop(depth 0 broker로 제한)뿐이고 D3 `/stop`은
+  chat entry, happy에는 생산자가 없어 기존 의존이 없다. "같은 수준"을 abort와 똑같이 여는 것으로 읽으면 직접 경로·chat steer가 열려 S1과 충돌하므로 더 좁은 쪽을 택했다.
+- 이 규칙을 직접 socket에도 걸기 위해 depth 0 broker와 직접 socket도 entry 정책을 거친다(`hostEntryPolicy`). 그 밖의
+  operation은 이전과 같다(직접 socket은 depth와 무관하게 모든 entry를 그대로 받는다).
+- Desktop 고정: 하지 않는다. operation 식별자가 없어 호출 하나가 operation 하나이고, unknown 뒤 재송신하지 않는다(위 "고정하지 않는 operation").
+
+검증: `sessionOwnerContactHost.test.ts` 4건(depth≥1 broker agent steer 거부를 기존 표에 추가, depth 0 broker agent만 통과·chat
+entry와 chat socket 거부, depth≥1 chat steer 거부와 chat abort 유지, 직접 socket steer 거부와 abort 유지). 구현 전 새 3건 실패
+(depth≥1 agent는 기존 규칙으로 이미 거부). steer 규칙 줄을 되돌리면 3건이 실패한다. 관련 3파일 85건, `tsc --noEmit` 통과.
+
+리뷰 봇 반영(2026-11-01): `sessionOwnerContactHost.test.ts`에서 직접 socket의 agent entry abort 503·chat entry abort 유지, depth 0 broker agent abort 통과를
+고정했다. 구현 전 직접 socket 테스트 1건 실패(depth≥1 broker agent abort는 기존 규칙으로 이미 거부). 관련 3파일 86건, `tsc --noEmit` 통과.

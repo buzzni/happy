@@ -110,18 +110,18 @@ describe('codec snapshots across async digest', () => {
     });
 });
 
-it.each([3, 4, 5])('accepts an unknown control observation with unavailable runtime (%i)', async i => {
+it.each([3, 4, 5, 9])('accepts an unknown control observation with unavailable runtime (%i)', async i => {
     const { request, reply } = await pair(i);
     const changed = signOwnerRelayReply({ ...reply, control: { ...(reply as any).control, runtimeId: null, state: 'unknown' } }, desktop.secretKey);
     expect(await verifyOwnerRelayReply(changed, request, contact, now)).toBe(true);
 });
-it.each([0, 1, 3, 4, 5, 6, 7])('rejects a correctly signed receipt for another target/child (%i)', async i => {
+it.each([0, 1, 3, 4, 5, 6, 7, 9])('rejects a correctly signed receipt for another target/child (%i)', async i => {
     const { request, reply } = await pair(i);
     const changed: any = structuredClone(reply);
     if (i === 0) changed.owners[0].sessionId = 'another';
     // A consistent guard for the other session still fails the request binding, not just the guard refine.
     else if (i === 1) { changed.sessionView.sessionId = 'another'; changed.sessionView.snapshot.promptGuard.targetSessionId = 'another'; }
-    else if (i < 6) changed.control.sessionId = 'another';
+    else if (i < 6 || i === 9) changed.control.sessionId = 'another';
     else changed.childSpawn.parentSessionId = 'another';
     const c = i === 1 ? fixture.personalContact : contact;
     expect(await verifyOwnerRelayReply(signOwnerRelayReply(changed, desktop.secretKey), request, c, now)).toBe(false);
@@ -264,7 +264,7 @@ describe('H1-R-01 persisted message localId compatibility', () => {
         expect(await verifyOwnerRelayReply(decodeOwnerRelayReply(encodeOwnerRelayReply(signed)), request, fixture.personalContact, now)).toBe(true);
     });
     // H1-R-11: an accepted control names the runtime it ran on; an unconfirmed one is unknown, not accepted.
-    it.each(['resume-own-session', 'reply-own-permission', 'abort-own-turn'])('%s accepted needs a confirmed runtime', operation => {
+    it.each(['resume-own-session', 'reply-own-permission', 'abort-own-turn', 'steer-own-session'])('%s accepted needs a confirmed runtime', operation => {
         const vector = vectorFor(operation);
         const withControl = (patch: Record<string, unknown>) => ({ ...vector.reply, control: { ...vector.reply.control, ...patch } });
         expect(OwnerRelayReplySchema.safeParse(withControl({ state: 'accepted', runtimeId: null })).success).toBe(false);
@@ -297,5 +297,26 @@ describe('read promptGuard signing [D2pre-G]', () => {
         expect(await verifyOwnerRelayReply(signed, request, fixture.personalContact, now)).toBe(false);
         signed.sessionView.snapshot.promptGuard = null;
         expect(await verifyOwnerRelayReply(signed, request, fixture.personalContact, now)).toBe(false);
+    });
+});
+
+// T1s stage 2: steer-own-session is an additive operation bound to the read runtime, like abort-own-turn.
+describe('[T1s-S2] steer-own-session signing', () => {
+    it('rejects a correctly signed steer receipt naming another runtime', async () => {
+        const { request, reply } = await pair(9);
+        const changed = signOwnerRelayReply({ ...reply, control: { ...(reply as any).control, runtimeId: 'another-runtime' } }, desktop.secretKey);
+        expect(await verifyOwnerRelayReply(changed, request, contact, now)).toBe(false);
+    });
+    it('binds the steer text into the intent digest and the request signature', async () => {
+        const { request } = await pair(9);
+        const changed = structuredClone(request) as any;
+        changed.payload.text = '다른 지시';
+        expect(await ownerRelayIntentDigest(changed)).not.toEqual(request.intentDigest);
+        expect(await verifyOwnerRelayRequest(changed, contact, now)).toBe(false);
+    });
+    it('does not accept an abort receipt for a steer request', async () => {
+        const { request } = await pair(9);
+        const abort = signOwnerRelayReply({ ...fixture.vectors[5].reply, intentDigest: request.intentDigest, requestId: request.requestId }, desktop.secretKey);
+        expect(await verifyOwnerRelayReply(abort, request, contact, now)).toBe(false);
     });
 });

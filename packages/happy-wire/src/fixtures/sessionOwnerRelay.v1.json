@@ -649,6 +649,65 @@
       "replySigningInput": "saycode-owner-relay/v1\u0000reply\u0000{\"callerBindingId\":\"caller-1\",\"checkedAt\":1800000000000,\"hostEpoch\":\"host-1\",\"intentDigest\":\"e1a992f9e8045343519320218390044a64d1ec3d67004e2425237241ae110af3\",\"nonce\":\"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE\",\"operation\":\"read-session\",\"relayEpoch\":\"relay-1\",\"requestId\":\"request-read-session-unguarded\",\"responderSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"result\":\"allowed\",\"sessionView\":{\"cursor\":\"cursor-41\",\"events\":[],\"sessionId\":\"target-1\",\"snapshot\":{\"active\":null,\"promptGuard\":null,\"thinking\":null},\"truncated\":false},\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}",
       "requestWire": "{\"callerBindingId\":\"caller-1\",\"callerSignature\":\"rCmvu3VPXXPqSmnmETXLwiOX38djMHSA0ulIkk98-SKIF-If4f48jgQdfb5RxA5eg0l9oWAvPU_mTYagfiH8AQ\",\"entry\":\"chat\",\"hostEpoch\":\"host-1\",\"intentDigest\":\"e1a992f9e8045343519320218390044a64d1ec3d67004e2425237241ae110af3\",\"nonce\":\"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE\",\"operation\":\"read-session\",\"payload\":{\"cursor\":\"cursor-41\",\"limit\":1,\"waitMs\":0},\"relayEpoch\":\"relay-1\",\"requestId\":\"request-read-session-unguarded\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"targetSessionId\":\"target-1\",\"v\":1}",
       "replyWire": "{\"callerBindingId\":\"caller-1\",\"checkedAt\":1800000000000,\"hostEpoch\":\"host-1\",\"intentDigest\":\"e1a992f9e8045343519320218390044a64d1ec3d67004e2425237241ae110af3\",\"nonce\":\"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE\",\"operation\":\"read-session\",\"relayEpoch\":\"relay-1\",\"requestId\":\"request-read-session-unguarded\",\"responderSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"result\":\"allowed\",\"sessionView\":{\"cursor\":\"cursor-41\",\"events\":[],\"sessionId\":\"target-1\",\"snapshot\":{\"active\":null,\"promptGuard\":null,\"thinking\":null},\"truncated\":false},\"signature\":\"aIsjmT-W_jGbYWAkrvqIclPhUOvY5CbdQ8k_E6xV-CWrB0s9d5BWGBLv-bYCy0hPl18GJVphgvH4jGBwBYxhCQ\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}"
+    },
+    {
+      "request": {
+        "v": 1,
+        "requestId": "request-steer-own-session",
+        "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sourceHubSessionId": "source-1",
+        "sourceRuntimeId": "runtime-1",
+        "callerBindingId": "caller-1",
+        "hostEpoch": "host-1",
+        "sourceAuthority": {
+          "kind": "confirmed-owner",
+          "bindingId": "binding-1"
+        },
+        "relayEpoch": "relay-1",
+        "entry": "agent",
+        "operation": "steer-own-session",
+        "intentDigest": "cc586146edae9dc660c75010aa09117baa7c07e5190dbabaddd20fcaf5961790",
+        "payload": {
+          "sessionId": "target-1",
+          "runtimeId": "target-runtime",
+          "text": "방향을 바꿔 실패 테스트부터 고쳐 주세요"
+        },
+        "callerSignature": "vQ9DSsusLF8Kw6KNLkBAOgrmUZV-nCyfaxci_gQnvQynTCasA0JHsDs6toZgjU0Jo89T8xMiGxgaVyz2UhPkAA",
+        "targetSessionId": "target-1"
+      },
+      "reply": {
+        "v": 1,
+        "requestId": "request-steer-own-session",
+        "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sourceHubSessionId": "source-1",
+        "sourceRuntimeId": "runtime-1",
+        "callerBindingId": "caller-1",
+        "hostEpoch": "host-1",
+        "sourceAuthority": {
+          "kind": "confirmed-owner",
+          "bindingId": "binding-1"
+        },
+        "relayEpoch": "relay-1",
+        "intentDigest": "cc586146edae9dc660c75010aa09117baa7c07e5190dbabaddd20fcaf5961790",
+        "responderSubject": {
+          "issuer": "https://api.example.com",
+          "userId": "owner-1"
+        },
+        "checkedAt": 1800000000000,
+        "result": "allowed",
+        "operation": "steer-own-session",
+        "signature": "dF0JEQSFqi9_723EyzO_fQ5KeDc4cyHmbb54NuC-PlZS4iplyIqP1sqVDsdKrvo8AsmplX6gH0vODDdycARsAA",
+        "control": {
+          "sessionId": "target-1",
+          "runtimeId": "target-runtime",
+          "state": "accepted"
+        }
+      },
+      "intentInput": "saycode-owner-relay/v1\u0000intent\u0000{\"callerBindingId\":\"caller-1\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"operation\":\"steer-own-session\",\"payload\":{\"runtimeId\":\"target-runtime\",\"sessionId\":\"target-1\",\"text\":\"방향을 바꿔 실패 테스트부터 고쳐 주세요\"},\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"targetSessionId\":\"target-1\",\"v\":1}",
+      "requestSigningInput": "saycode-owner-relay/v1\u0000request\u0000{\"callerBindingId\":\"caller-1\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"intentDigest\":\"cc586146edae9dc660c75010aa09117baa7c07e5190dbabaddd20fcaf5961790\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"steer-own-session\",\"payload\":{\"runtimeId\":\"target-runtime\",\"sessionId\":\"target-1\",\"text\":\"방향을 바꿔 실패 테스트부터 고쳐 주세요\"},\"relayEpoch\":\"relay-1\",\"requestId\":\"request-steer-own-session\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"targetSessionId\":\"target-1\",\"v\":1}",
+      "replySigningInput": "saycode-owner-relay/v1\u0000reply\u0000{\"callerBindingId\":\"caller-1\",\"checkedAt\":1800000000000,\"control\":{\"runtimeId\":\"target-runtime\",\"sessionId\":\"target-1\",\"state\":\"accepted\"},\"hostEpoch\":\"host-1\",\"intentDigest\":\"cc586146edae9dc660c75010aa09117baa7c07e5190dbabaddd20fcaf5961790\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"steer-own-session\",\"relayEpoch\":\"relay-1\",\"requestId\":\"request-steer-own-session\",\"responderSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"result\":\"allowed\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}",
+      "requestWire": "{\"callerBindingId\":\"caller-1\",\"callerSignature\":\"vQ9DSsusLF8Kw6KNLkBAOgrmUZV-nCyfaxci_gQnvQynTCasA0JHsDs6toZgjU0Jo89T8xMiGxgaVyz2UhPkAA\",\"entry\":\"agent\",\"hostEpoch\":\"host-1\",\"intentDigest\":\"cc586146edae9dc660c75010aa09117baa7c07e5190dbabaddd20fcaf5961790\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"steer-own-session\",\"payload\":{\"runtimeId\":\"target-runtime\",\"sessionId\":\"target-1\",\"text\":\"방향을 바꿔 실패 테스트부터 고쳐 주세요\"},\"relayEpoch\":\"relay-1\",\"requestId\":\"request-steer-own-session\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"targetSessionId\":\"target-1\",\"v\":1}",
+      "replyWire": "{\"callerBindingId\":\"caller-1\",\"checkedAt\":1800000000000,\"control\":{\"runtimeId\":\"target-runtime\",\"sessionId\":\"target-1\",\"state\":\"accepted\"},\"hostEpoch\":\"host-1\",\"intentDigest\":\"cc586146edae9dc660c75010aa09117baa7c07e5190dbabaddd20fcaf5961790\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"operation\":\"steer-own-session\",\"relayEpoch\":\"relay-1\",\"requestId\":\"request-steer-own-session\",\"responderSubject\":{\"issuer\":\"https://api.example.com\",\"userId\":\"owner-1\"},\"result\":\"allowed\",\"signature\":\"dF0JEQSFqi9_723EyzO_fQ5KeDc4cyHmbb54NuC-PlZS4iplyIqP1sqVDsdKrvo8AsmplX6gH0vODDdycARsAA\",\"sourceAuthority\":{\"bindingId\":\"binding-1\",\"kind\":\"confirmed-owner\"},\"sourceHubSessionId\":\"source-1\",\"sourceRuntimeId\":\"runtime-1\",\"v\":1}"
     }
   ],
   "keys": {

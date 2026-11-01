@@ -128,8 +128,8 @@ export async function startHostOwnerContact<Broker>(input: {
     const host = await startSessionOwnerContactHost({ enabled: true, session: input.session, hostPid: input.hostPid,
         live: () => !closed, capability, issue: input.issue, current: input.current, token: input.token, fetch: input.fetch });
     const identity = host ? identityAuthority(input, host.binding, host.trust) : undefined;
-    const broker = await startBroker(host && host.binding.depth > 0 ? brokerEntryPolicy(host, 'broker') : host?.contact, identity);
-    const socketContact = host && (broker ? brokerEntryPolicy(host, 'chat-socket') : host.contact);
+    const broker = await startBroker(host ? hostEntryPolicy(host, 'broker') : undefined, identity);
+    const socketContact = host && hostEntryPolicy(host, broker ? 'chat-socket' : 'direct-socket');
     const local = socketContact ? await startSessionOwnerContactLocal({ enabled: true, contact: socketContact }).catch(() => null) : null;
     const address = local?.environment.SAYCODE_OWNER_CONTACT_SOCKET;
     if (address) input.env.SAYCODE_OWNER_CONTACT_SOCKET = address;
@@ -163,14 +163,20 @@ async function issueIdentityAuthority(input: IdentityInput, capability: string):
     } catch { return undefined; }
 }
 const OWNED_CHILD_OPERATIONS = new Set(['spawn-owned-child', 'owned-child-status']);
-/** Main cannot tell a broker caller from a direct one, so a broker host's fixed entry policy lives here.
+/** The sibling controls (Desktop amendment S1/S2) — steer, and an agent-entry abort (sibling stop) — reach main only as a depth 0
+ * broker agent command. A chat-entry abort is chat /stop and keeps its entry rules. */
+const siblingControl = (request: { operation: string; entry: string }) =>
+    request.operation === 'steer-own-session' || request.operation === 'abort-own-turn' && request.entry === 'agent';
+/** Main cannot tell a broker caller from a direct one, so a host's fixed entry policy lives here.
  * Below depth 0 an agent command gets no sibling/parent exposure or mutation and chat gets no lookup
  * enumeration; explicit chat targets, the agent's own owned-child operations (§4.6) and an agent lookup
  * naming exactly its own session (the owned-grandchild source check, D4 follow-up (a)) go to main.
  * The chat socket beside a broker takes only chat verbs: agent commands keep the broker IPC, owned
- * children stay a broker reservation. It never revokes the binding the broker still uses. */
-function brokerEntryPolicy(host: OwnerContactHost, via: 'broker' | 'chat-socket'): SessionOwnerContact {
-    const nested = host.binding.depth > 0;
+ * children stay a broker reservation. It never revokes the binding the broker still uses.
+ * Sibling steer and stop are only a depth 0 broker agent command (sibling-steer-stop-amendment S1): a direct host's
+ * depth is shell env, and no chat verb steers. The direct socket otherwise keeps every entry. */
+function hostEntryPolicy(host: OwnerContactHost, via: 'broker' | 'chat-socket' | 'direct-socket'): SessionOwnerContact {
+    const nested = host.binding.depth > 0, brokered = nested && via !== 'direct-socket';
     return { close: via === 'broker' ? () => host.contact.close() : () => {},
         call: async raw => {
             const request = OwnerContactRequestSchema.parse(raw);
@@ -178,8 +184,9 @@ function brokerEntryPolicy(host: OwnerContactHost, via: 'broker' | 'chat-socket'
             const selfLookup = request.operation === 'lookup-readable-sessions'
                 && request.payload.sessionIds.length === 1 && request.payload.sessionIds[0] === host.binding.sessionId;
             if ((via === 'chat-socket' && (request.entry !== 'chat' || child))
-                || (nested && request.entry === 'agent' && !child && !selfLookup)
-                || (nested && request.entry === 'chat' && request.operation === 'lookup-readable-sessions')) throw new Error('owner-contact-unavailable');
+                || (siblingControl(request) && (via !== 'broker' || nested || request.entry !== 'agent'))
+                || (brokered && request.entry === 'agent' && !child && !selfLookup)
+                || (brokered && request.entry === 'chat' && request.operation === 'lookup-readable-sessions')) throw new Error('owner-contact-unavailable');
             return host.contact.call(request);
         } };
 }
