@@ -28,6 +28,7 @@ import {
     type SpawnSessionOptions,
     type SpawnSessionResult,
 } from '../modules/common/registerCommonHandlers';
+import { LIST_FILES_PAGE_CAPABILITY } from '../modules/common/listFilesPageCapability';
 import { createManagedProjectWriteScopePolicy, TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '../modules/common/machineRunProfile';
 import { hostManagedMachineTools } from '../modules/common/moaiMachineRunProfiles';
 import { resolveDaemonAllowedRoot } from '../modules/common/resolveAllowedRoot';
@@ -1107,8 +1108,8 @@ export class ApiMachineClient {
         // Session launch/resume use the daemon's native owner; recovery's preflight refuses separately.
         const allowed = new Set(['spawn-happy-session', 'resume-happy-session', 'recover-happy-session',
             'stop-session', 'daemon-session-state', 'readFile', 'readFileChunk', 'writeFile', 'listDirectory',
-            'renameFile', 'deleteFile', 'copyFile', 'ensureDirectory', 'getDirectoryTree', 'writeWorkspaceFile',
-            'allocate-port', 'get-port', 'release-port']);
+            'renameFile', 'deleteFile', 'copyFile', 'ensureDirectory', 'getDirectoryTree', 'listFilesPage',
+            'writeWorkspaceFile', 'allocate-port', 'get-port', 'release-port']);
         this.rpcHandlerManager.setMethodPolicy(method => allowed.has(method) ? null : {
             error: 'Method unavailable in the standalone Windows Codex trial', code: 'STANDALONE_WINDOWS_TRIAL_UNSUPPORTED',
         });
@@ -4325,6 +4326,10 @@ export class ApiMachineClient {
             const advertisedWriteFileAttempt = this.managedHandlers ? undefined : WRITE_FILE_ATTEMPT_CAPABILITY;
             const writeFileAttemptStale = JSON.stringify(this.machine.metadata?.writeFileAttempt)
                 !== JSON.stringify(advertisedWriteFileAttempt);
+            // Same gate as writeFile: a managed runtime does not serve the file RPCs.
+            const advertisedListFilesPage = this.managedHandlers ? undefined : LIST_FILES_PAGE_CAPABILITY;
+            const listFilesPageStale = JSON.stringify(this.machine.metadata?.listFilesPage)
+                !== JSON.stringify(advertisedListFilesPage);
             const advertisedChannelHost = this.managedHandlers ? undefined : this.channelHostAdvertisement;
             const channelHostStale = JSON.stringify(this.machine.metadata?.channelHost)
                 !== JSON.stringify(advertisedChannelHost);
@@ -4362,7 +4367,7 @@ export class ApiMachineClient {
             // Bounded: an acknowledgement that never comes must not block every later change.
             const awaitingServer = this.capabilityUpdateInFlight !== null
                 && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
-            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || companyKeyReseedStale || writeFileAttemptStale)) {
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || companyKeyReseedStale || writeFileAttemptStale || listFilesPageStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -4397,6 +4402,7 @@ export class ApiMachineClient {
                     aiAuthSelection: advertisedAiAuthSelection,
                     structuredOutput: advertisedStructuredOutput,
                     writeFileAttempt: advertisedWriteFileAttempt,
+                    listFilesPage: advertisedListFilesPage,
                     channelHost: advertisedChannelHost,
                     rpcBinding: advertisedRpcBinding,
                     sealedSpawnEnv: advertisedSealedSpawnEnv,
