@@ -308,6 +308,9 @@ export class CodexAppServerClient {
     private sandboxCleanup: (() => Promise<void>) | null = null;
     private multiAuthProxy: PreparedCodexMultiAuthProxy | null = null;
     private readonly managedProviderArgs: string[] | null;
+    /** aplus specs/org-agent-plan §6.3-2 — the plan provider through the runner's local proxy, or null. */
+    private readonly agentPlanProviderArgs: string[] | null;
+    private agentPlanAppliedToLaunch = false;
     private multiAuthProxyCleanup: Promise<void> | null = null;
     public sandboxEnabled = false;
     /**
@@ -471,18 +474,30 @@ export class CodexAppServerClient {
         /** Host-only decision retained across reconnects; never a user/provider override. */
         private readonly recallHostPrepared = false,
         private readonly startupEnvironment?: { CODEX_SQLITE_HOME: string },
+        /**
+         * The organization agent plan's provider arguments (`agentPlanCodexArgs`). Like a managed run, they are
+         * the whole provider story: account rotation is not consulted and no side command runs on the machine's
+         * own login.
+         */
+        agentPlanProviderArgs?: string[] | null,
     ) {
         this.sandboxConfig = sandboxConfig;
         this.sandboxPolicyMode = sandboxPolicyMode;
         this.beforeTurn = beforeTurn;
         this.completeTurn = completeTurn;
         this.managedProviderArgs = managedProviderArgs ?? null;
+        this.agentPlanProviderArgs = agentPlanProviderArgs ?? null;
         this.markTurnDispatched = markTurnDispatched;
         this.protectedWriterTree = completeTurn ? new CheckpointWriterProcessTree() : null;
     }
 
     get threadId(): string | null {
         return this._threadId;
+    }
+
+    /** True once a Codex process was started with the organization agent plan provider. */
+    get agentPlanApplied(): boolean {
+        return this.agentPlanAppliedToLaunch;
     }
 
     get turnId(): string | null {
@@ -1193,7 +1208,7 @@ export class CodexAppServerClient {
         // The agent works inside this session: lineage and spawn seeds stop here.
         let env: Record<string, string> = sanitizeChildEnv(process.env, { boundary: 'in-session' });
         env = await resolveCodexStateEnvironment({ ...env, ...this.startupEnvironment });
-        if (!this.managedProviderArgs) {
+        if (!this.managedProviderArgs && !this.agentPlanProviderArgs) {
             // Account rotation swaps in another account's proxy, its own
             // client key and its own base URL. For a managed run that is a
             // different payer and a provider outside the approval, so the
@@ -1215,7 +1230,7 @@ export class CodexAppServerClient {
             '--listen',
             'stdio://',
             '-c', 'features.default_mode_request_user_input=true',
-            ...(this.managedProviderArgs ?? this.multiAuthProxy?.args ?? []),
+            ...(this.managedProviderArgs ?? this.agentPlanProviderArgs ?? this.multiAuthProxy?.args ?? []),
         ];
         this.sandboxEnabled = false;
         this.sandboxInitFailed = false;
@@ -1304,6 +1319,8 @@ export class CodexAppServerClient {
         }
         this.process = proc;
         this.protectedWriterTree?.track(proc);
+        // The only point that may say the plan reached Codex (spec §6.3-3): the process was started with it.
+        if (this.agentPlanProviderArgs) this.agentPlanAppliedToLaunch = true;
 
         proc.on('error', (err) => {
             logger.debug('[CodexAppServer] Process error:', err);
@@ -2090,7 +2107,7 @@ export class CodexAppServerClient {
      * sandboxes guard shared machines, so neither gets a second process.
      */
     get sideCommandAllowed(): boolean {
-        return !this.managedProviderArgs && this.sandboxPolicyMode !== 'mandatory';
+        return !this.managedProviderArgs && !this.agentPlanProviderArgs && this.sandboxPolicyMode !== 'mandatory';
     }
 
     /**
@@ -2115,7 +2132,7 @@ export class CodexAppServerClient {
     }
 
     get authRecoverySource(): CodexAuthSource {
-        if (this.managedProviderArgs || this.sandboxPolicyMode === 'mandatory') return 'managed';
+        if (this.managedProviderArgs || this.agentPlanProviderArgs || this.sandboxPolicyMode === 'mandatory') return 'managed';
         if (this.multiAuthProxy) return 'multi-auth';
         if (process.env.CODEX_ACCESS_TOKEN || process.env.OPENAI_API_KEY || process.env.OPENAI_BASE_URL) return 'unknown';
         return process.env.CODEX_HOME ? 'custom-home' : 'cli-login';

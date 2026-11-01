@@ -243,3 +243,11 @@ describe('organization agent plan seeds (aplus specs/org-agent-plan §6.3-2)', (
         expect(requested).toEqual({})
     })
 })
+
+describe('organization agent plan proxy key', () => {
+    it('reaches the agent CLI but not a process that hosts another session', () => {
+        const env = { PATH: '/usr/bin', HAPPY_AGENT_PLAN_PROXY_KEY: 'loopback-only' }
+        expect(sanitizeChildEnv(env, { boundary: 'in-session' })).toEqual(env)
+        expect(sanitizeChildEnv(env)).toEqual({ PATH: '/usr/bin' })
+    })
+})

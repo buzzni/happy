@@ -172,6 +172,8 @@ import {
 import { DifficultyRoutingCommitter } from '@/difficultyRoutingCommit';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { createCodexUsageEvent } from '@/usage/providerUsageAdapters';
+import { AgentPlanLaunchError } from '@/launcher/agentPlanLaunch';
+import { consumeAgentPlanLaunch, startAgentPlanSession, type AgentPlanSession } from './agentPlanSession';
 import {
     consumePendingInitialAppendSystemPrompt,
     consumePendingInitialEffort,
@@ -255,6 +257,8 @@ export async function runCodex(opts: {
     const recallHostEnvironment = { ...process.env };
     if (standaloneLaunch && (managedStartup || opts.startedBy !== 'daemon')) throw new Error('Standalone launch requires an unmanaged daemon session');
     const launchControl = standaloneLaunch ? await SessionLaunchControl.connect(standaloneLaunch) : undefined;
+    // aplus specs/org-agent-plan §6.3-2: the plan's local proxy, closed with the runner.
+    let agentPlanSession: AgentPlanSession | null = null;
     try {
     const accountToken = opts.principal?.kind === 'account' ? opts.principal.credentials.token : null;
     if (managedStartup) {
@@ -271,6 +275,10 @@ export async function runCodex(opts: {
         applyManagedGatewayEnvironment(process.env, managedStartup.envelope);
         applyManagedInitialPrompt(process.env, managedStartup.envelope);
     }
+    // Read and deleted before anything else reads the environment. A plan launch that cannot be honoured stops
+    // here; it never continues on the machine's own Codex login or the multi-auth proxy.
+    const agentPlanLaunch = consumeAgentPlanLaunch(process.env);
+    if (agentPlanLaunch && managedStartup) throw new AgentPlanLaunchError('agent_plan_managed_conflict');
 
     const deferredContinuation = createDeferredContinuationContextConsumer(process.env);
     installBroadKillShims();
@@ -414,6 +422,13 @@ export async function runCodex(opts: {
         prepared: preparedInitialPrompt,
     });
     if (standaloneLaunch && (!response || sandboxConfig?.checkpointProtection)) throw new Error('Standalone drain requires an online standard session');
+    if (agentPlanLaunch) {
+        // Bound now, before the daemon hears the session started: a refused binding fails the spawn instead of
+        // leaving a session that cannot answer. The server binds the Happy session id, so it must exist.
+        if (!response) throw new AgentPlanLaunchError('agent_plan_session_unavailable', 'the Happy server is unreachable');
+        agentPlanSession = await startAgentPlanSession({ launch: agentPlanLaunch, sessionId: response.id, env: process.env });
+        logger.debug(`[codex] Agent plan session bound (grant ${agentPlanLaunch.descriptor.grantId}, model ${agentPlanLaunch.descriptor.model})`);
+    }
     if (!response && sandboxConfig?.checkpointProtection) {
         throw new Error('checkpoint protection requires an authoritative server session');
     }
@@ -547,7 +562,8 @@ export async function runCodex(opts: {
     const reconnectPin = publishedSessionModelPin(reconnectSession?.metadata);
     // Consume even when --model wins, so child processes cannot inherit the seed.
     const pendingInitialModel = consumePendingInitialModel(process.env);
-    const explicitInitialModel = opts.initialModel ?? pendingInitialModel ?? reconnectPin.model;
+    // A plan session runs the grant's model; the gateway overwrites any other choice anyway.
+    const explicitInitialModel = agentPlanLaunch?.descriptor.model ?? opts.initialModel ?? pendingInitialModel ?? reconnectPin.model;
     const rawInitialEffortSeed = consumePendingInitialEffort(process.env) ?? reconnectPin.effort;
     if (rawInitialEffortSeed && !isSupportedCodexReasoningEffort(rawInitialEffortSeed)) {
         logger.debug(`[Codex] Ignoring invalid initial effort seed: ${rawInitialEffortSeed}`);
@@ -1390,6 +1406,8 @@ export async function runCodex(opts: {
         }),
         checkpointComposition.markTurnDispatched,
         recallHost !== null,
+        undefined,
+        agentPlanSession?.providerArgs ?? null,
     );
 
     let ingestThreadMetadata: { threadId: string; path: Promise<string | null> } | null = null;
@@ -3106,5 +3124,6 @@ export async function runCodex(opts: {
     }
     } finally {
         launchControl?.close();
+        await agentPlanSession?.close().catch(() => undefined);
     }
 }
