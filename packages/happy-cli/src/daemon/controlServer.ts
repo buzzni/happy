@@ -1069,7 +1069,7 @@ export function startDaemonControlServer({
     }
 
     attachLocalToolAgentRelayRoutes(app);
-    if (browserLocalSetup) attachBrowserLocalSetupRoutes(app, browserLocalSetup);
+    if (browserLocalSetup && browserBridge) attachBrowserLocalSetupRoutes(app, browserLocalSetup, browserBridge);
     attachStandaloneDrain(app, managedRuntime ? undefined : standaloneDrain, requestShutdown);
     attachRestartDrainRoutes(app, managedRuntime ? undefined : restartDrain, { standaloneDrainActive: Boolean(standaloneDrain) });
 

@@ -4120,11 +4120,17 @@ export async function startDaemon(): Promise<void> {
         }
       }
     } catch (err) {
-      browserLocalSetup = undefined;
       logger.debug(`[DAEMON RUN] Browser bridge failed to start on ${DEFAULT_BROWSER_BRIDGE_PORT}: ${err instanceof Error ? err.message : String(err)}`);
-      // Local setup stays off after a takeover: it is offered only by a daemon that owned the port from the start.
+      // Local setup follows port ownership: its routes refuse while another process holds the port
+      // and open once this daemon takes it over, so an owner that lost the port across a restart gets it back.
       if ((err as NodeJS.ErrnoException)?.code === 'EADDRINUSE') {
-        stopBrowserBridge = retryBrowserBridgeServer({ bridge: browserBridge, port: DEFAULT_BROWSER_BRIDGE_PORT, host: resolveBrowserBridgeHost(process.env) }).stop;
+        const setupCandidate = browserLocalSetup;
+        stopBrowserBridge = retryBrowserBridgeServer({
+          bridge: browserBridge, port: DEFAULT_BROWSER_BRIDGE_PORT, host: resolveBrowserBridgeHost(process.env),
+          consumeSetup: setupCandidate ? id => setupCandidate.consume(id) : undefined,
+        }).stop;
+      } else {
+        browserLocalSetup = undefined;
       }
     }
 
