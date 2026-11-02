@@ -43,7 +43,7 @@ import { spaceStyles, spaceMarkup, spaceScript } from './consoleSpaces'
  * actual-size screen pans the frame instead of being swallowed by the canvas. Activity and Advanced are
  * buttons on that line whose panels open under the screen, closed by default.
  */
-export function renderConsolePage(opts: { hostOrigins?: readonly string[] } = {}): string {
+export function renderConsolePage(opts: { hostOrigins?: readonly string[]; screenMode?: 'native-window' } = {}): string {
     // JSON in an inline script: escape '<' so an origin can never close the tag.
     const hostOrigins = JSON.stringify(opts.hostOrigins ?? []).replace(/</g, '\\u003c')
     return `<!doctype html>
@@ -208,6 +208,8 @@ padding:10px 12px;border-radius:var(--radius-md);line-height:1.35;font-weight:40
 #screenState{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;margin:0;font-size:12px;color:#A1A1AA;pointer-events:none}
 #screenState[hidden]{display:none}
 #screenEmpty{flex:1 1 auto;min-height:160px;display:flex;align-items:center;justify-content:center}
+.native-window #openScreen,.native-window #viewGroup{display:none}
+.native-window #screenEmpty{flex:0 0 auto;min-height:0}
 /* Folds: Activity and Advanced are buttons in the screen's head line; their panels open under the screen, closed by default. */
 button.fold{height:30px;padding:0 10px;font-size:12px;color:var(--muted-foreground);border-color:transparent;background:transparent}
 button.fold:hover{background:var(--surface-hover);color:var(--foreground);border-color:transparent}
@@ -297,6 +299,7 @@ ${spaceMarkup}
 <script>
 (function(){
 var $=function(i){return document.getElementById(i)};
+var NATIVE_SCREEN=${opts.screenMode === 'native-window'};
 var S={cursor:0,seen:{},task:null,tasks:[],pendingTasks:null,listSeq:0,gen:0,token:'',expiresAtMs:0,profileId:'',principalId:'',viewerSessionId:'',renewTimer:0,screenOpen:false,screenSeq:0,fit:true};
 var RENEW_BEFORE_MS=60000,RENEW_RETRY_MS=10000,HOST_ORIGINS=${hostOrigins};
 var Q=new URLSearchParams(location.search),THEME=Q.get('theme');
@@ -346,6 +349,11 @@ Object.assign(M.ko,{modeLabel:'승인 방식',manualMode:'수동',autoOff:'Auto 
 var modeBusy=false,modeDialogTask=null,modeTimer=null,modeTrigger='autoMode';
 var taskSession=new URLSearchParams(location.search).get('agentSessionId');
 var T=M[LANG];document.documentElement.lang=LANG;
+if(NATIVE_SCREEN){document.body.classList.add('native-window');$('openScreen').hidden=true;$('viewGroup').hidden=true;
+ Object.assign(T,LANG==='ko'?{screenHint:'직접 조작하기 전 제어권을 가져오세요.',screenEmptyTitle:'작업 PC의 Chrome 창에서 확인하세요',
+ screenEmptyBody:'에이전트가 페이지를 열면 Saycode가 연 전용 Chrome 창이 생겨요. 작업 PC에서 Chrome으로 전환해 해당 창을 선택하세요. 직접 조작하기 전 제어권을 가져오고, 마친 뒤 반납하고 계속 진행하세요.'}:
+ {screenHint:'Take over before using the page yourself.',screenEmptyTitle:'View in Chrome on the task PC',
+ screenEmptyBody:'When the agent opens a page, find the dedicated Chrome window opened by Saycode on the task PC. Switch to Chrome and select that window. Take over before using it yourself, then release control and resume when finished.'})}
 document.querySelectorAll('[data-t]').forEach(function(el){var v=T[el.getAttribute('data-t')];if(typeof v==='string')el.textContent=v});
 document.querySelectorAll('[data-tt]').forEach(function(el){var v=T[el.getAttribute('data-tt')];if(typeof v==='string'){el.title=v;el.setAttribute('aria-label',v)}});
 document.title=T.title;$('events').setAttribute('data-empty',T.noEvents);
@@ -620,7 +628,7 @@ $('resume').onclick=function(){if(S.task)act(op('resume',{taskId:S.task.taskId,e
 $('stop').onclick=function(){act(op('cancel',{taskId:$('taskId').value.trim(),requestId:rid()}))};
 /** A viewer connection is bound to the capability it was ticketed with: renewal reconnects it. */
 /** The screen counts as open from the click, so a renewal during the first ticket request reopens it; only the latest reply is shown. */
-function openScreen(){S.screenOpen=true;var n=++S.screenSeq;op('viewerTicket',{profileId:S.profileId}).then(function(r){if(n!==S.screenSeq)return;
+function openScreen(){if(NATIVE_SCREEN)return;S.screenOpen=true;var n=++S.screenSeq;op('viewerTicket',{profileId:S.profileId}).then(function(r){if(n!==S.screenSeq)return;
  var path='v1/viewer/websockify?ticket='+encodeURIComponent(r.ticket);window.__abpViewerPath=path;window.__abpViewerFit=S.fit;window.__abpViewerControl=holding();
  // scale=1 only as a fallback for a client without the Runtime's hook: the hook reads the choice from __abpViewerFit.
  $('screen').src='/viewer/vnc_lite.html?path='+encodeURIComponent(path)+(S.fit?'&scale=1':'');$('screenBox').hidden=false;$('screenEmpty').hidden=true
