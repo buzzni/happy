@@ -446,118 +446,123 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     } catch {}
   }
 
-  async function capture(input: { provider: AiCredentialProvider; codexRecovery?: boolean; refreshOwner?: boolean }) {
+  type CaptureInput = { provider: AiCredentialProvider; codexRecovery?: boolean; refreshOwner?: boolean }
+
+  async function capture(input: CaptureInput) {
     const selected = provider(input?.provider)
-    return serialize(() => withSafeErrors(`${selected.toUpperCase()}_CAPTURE_FAILED`, async () => {
-      if (selected === 'zai') {
-        throw new AiCredentialRuntimeError('ZAI_CAPTURE_UNSUPPORTED')
+    return serialize(() => withSafeErrors(`${selected.toUpperCase()}_CAPTURE_FAILED`, () => captureNow(selected, input)))
+  }
+
+  // Runs inside an operation already holding the credential queue; `capture` is the queued entry point.
+  async function captureNow(selected: AiCredentialProvider, input: CaptureInput) {
+    if (selected === 'zai') {
+      throw new AiCredentialRuntimeError('ZAI_CAPTURE_UNSUPPORTED')
+    }
+    let payload: string
+    if (selected === 'claude') {
+      const result = await deps.execFile('cswap', ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES })
+      payload = result.stdout
+    } else {
+      const packageVersion = await assertSupportedCodexMultiAuthInstalled()
+      let accounts: unknown
+      const accountsPath = join(codexMultiAuthDir(), 'openai-codex-accounts.json')
+      let accountsRaw: string
+      try {
+        accountsRaw = await deps.readFile(accountsPath)
+        accounts = JSON.parse(accountsRaw)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          warnCodexCaptureReadFailure('openai-codex-accounts.json', error)
+          throw error
+        }
+        throw new AiCredentialRuntimeError('CODEX_FILE_STORE_REQUIRED')
       }
-      let payload: string
-      if (selected === 'claude') {
-        const result = await deps.execFile('cswap', ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES })
-        payload = result.stdout
-      } else {
-        const packageVersion = await assertSupportedCodexMultiAuthInstalled()
-        let accounts: unknown
-        const accountsPath = join(codexMultiAuthDir(), 'openai-codex-accounts.json')
-        let accountsRaw: string
-        try {
-          accountsRaw = await deps.readFile(accountsPath)
-          accounts = JSON.parse(accountsRaw)
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-            warnCodexCaptureReadFailure('openai-codex-accounts.json', error)
-            throw error
-          }
-          throw new AiCredentialRuntimeError('CODEX_FILE_STORE_REQUIRED')
-        }
-        let settings: unknown = { version: 1, pluginConfig: {} }
-        try {
-          settings = JSON.parse(await deps.readFile(join(codexMultiAuthDir(), 'settings.json')))
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-            warnCodexCaptureReadFailure('settings.json', error)
-            throw error
-          }
-        }
-        payload = JSON.stringify({
-          version: 1,
-          kind: 'codex-multi-auth',
-          packageVersion,
-          accounts,
-          settings,
-        })
-        if (input.codexRecovery !== true) {
-          const bundle = parseCodexMultiAuthBundle(payload)
-          if (!bundle) throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
-          const livePath = deps.env.CODEX_CLI_AUTH_PATH || join(codexHome(), 'auth.json')
-          // The live login only refreshes a pool entry; an unusable auth.json (e.g. mid-rewrite) means none.
-          let liveRaw: string | null = null
-          let live: Record<string, unknown> | null = null
-          try {
-            liveRaw = await readOptionalText(deps, livePath)
-            live = parseOptionalCredentialJson(liveRaw)
-          } catch (error) {
-            warnCodexCaptureReadFailure('auth.json', error)
-          }
-          const tokens = isObject(live?.tokens) ? live.tokens : null
-          if (tokens && typeof tokens.account_id === 'string'
-            && typeof tokens.access_token === 'string' && typeof tokens.refresh_token === 'string' && tokens.refresh_token) {
-            const subject = tokenSubject(tokens.access_token)
-            const claims = tokenClaims(tokens.access_token)
-            const expiresAt = typeof claims.exp === 'number' && Number.isFinite(claims.exp) ? claims.exp * 1000 : 0
-            const matches = bundle.accounts.accounts.filter(account => account.accountId === tokens.account_id)
-            const account = matches.length === 1 ? matches[0] : undefined
-            const storedClaims = tokenClaims(account?.accessToken)
-            const storedExpiresAt = typeof storedClaims.exp === 'number' && Number.isFinite(storedClaims.exp) ? storedClaims.exp * 1000 : 0
-            // A re-login can leave the exported pool behind. Refresh only an existing, exact
-            // workspace AND user; never import a different live login or regress a newer pool.
-            if (account && subject !== null && subject === tokenSubject(account.accessToken)
-              && expiresAt > deps.now() && expiresAt > storedExpiresAt) {
-              account.accessToken = tokens.access_token
-              account.refreshToken = tokens.refresh_token
-              account.expiresAt = expiresAt
-              await assertCredentialsUnchanged(deps, [{ path: livePath, expected: liveRaw }, { path: accountsPath, expected: accountsRaw }])
-              payload = JSON.stringify(bundle)
-            }
-          }
+      let settings: unknown = { version: 1, pluginConfig: {} }
+      try {
+        settings = JSON.parse(await deps.readFile(join(codexMultiAuthDir(), 'settings.json')))
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          warnCodexCaptureReadFailure('settings.json', error)
+          throw error
         }
       }
-      if (selected === 'codex' && input.codexRecovery === true) {
+      payload = JSON.stringify({
+        version: 1,
+        kind: 'codex-multi-auth',
+        packageVersion,
+        accounts,
+        settings,
+      })
+      if (input.codexRecovery !== true) {
         const bundle = parseCodexMultiAuthBundle(payload)
         if (!bundle) throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
         const livePath = deps.env.CODEX_CLI_AUTH_PATH || join(codexHome(), 'auth.json')
-        const raw = await deps.readFile(livePath)
-        const live = JSON.parse(raw)
-        const tokens = live?.tokens
-        if (!isObject(tokens) || ['account_id', 'access_token', 'refresh_token', 'id_token'].some(key => typeof tokens[key] !== 'string' || !tokens[key])) {
-          throw new AiCredentialRuntimeError('CODEX_REAUTH_REQUIRED')
+        // The live login only refreshes a pool entry; an unusable auth.json (e.g. mid-rewrite) means none.
+        let liveRaw: string | null = null
+        let live: Record<string, unknown> | null = null
+        try {
+          liveRaw = await readOptionalText(deps, livePath)
+          live = parseOptionalCredentialJson(liveRaw)
+        } catch (error) {
+          warnCodexCaptureReadFailure('auth.json', error)
         }
-        const indexes = bundle.accounts.accounts.map((account, index) => ({ account, index }))
-          .filter(({ account }) => account.accountId === tokens.account_id)
-        const sameUser = bundle.accounts.accounts.map((account, index) => ({ account, index }))
-          .filter(({ account }) => tokenSubject(account.accessToken) !== null && tokenSubject(account.accessToken) === tokenSubject(tokens.access_token))
-        const match = indexes.length === 1 ? indexes[0] : sameUser.length === 1 ? sameUser[0] : undefined
-        if (!match) throw new AiCredentialRuntimeError('CODEX_ACTIVE_CREDENTIAL_MISMATCH')
-        const claims = JSON.parse(Buffer.from(String(tokens.access_token).split('.')[1] || '', 'base64url').toString())
-        const active: CodexMultiAuthAccount = { ...match.account, accountId: String(tokens.account_id), accessToken: String(tokens.access_token),
-          refreshToken: String(tokens.refresh_token), ...(typeof claims.exp === 'number' ? { expiresAt: claims.exp * 1000 } : {}),
-          accountIdSource: 'token', workspaces: undefined, currentWorkspaceIndex: undefined }
-        const verified = await verifyLocalAiAccounts(deps, 'codex', [{ accountId: tokens.account_id as string }], [active], { budgetMs: 60_000 })
-        if (!verified.accounts[0]?.ok) throw new AiCredentialRuntimeError(
-          verified.accounts[0]?.errorKind === 'AUTHENTICATION_FAILED' ? 'CODEX_AUTHENTICATION_FAILED' : 'CODEX_SOURCE_VERIFICATION_FAILED')
-        if (await deps.readFile(livePath) !== raw) throw new AiCredentialRuntimeError('ACTIVE_ACCOUNT_CHANGED')
-        bundle.accounts.accounts[match.index] = active
-        bundle.accounts.activeIndex = match.index
-        payload = JSON.stringify({ ...bundle, recoveryAuth: {
-          auth_mode: 'chatgpt', OPENAI_API_KEY: null, last_refresh: live.last_refresh,
-          tokens: { account_id: tokens.account_id, access_token: tokens.access_token, refresh_token: tokens.refresh_token, id_token: tokens.id_token },
-        } })
+        const tokens = isObject(live?.tokens) ? live.tokens : null
+        if (tokens && typeof tokens.account_id === 'string'
+          && typeof tokens.access_token === 'string' && typeof tokens.refresh_token === 'string' && tokens.refresh_token) {
+          const subject = tokenSubject(tokens.access_token)
+          const claims = tokenClaims(tokens.access_token)
+          const expiresAt = typeof claims.exp === 'number' && Number.isFinite(claims.exp) ? claims.exp * 1000 : 0
+          const matches = bundle.accounts.accounts.filter(account => account.accountId === tokens.account_id)
+          const account = matches.length === 1 ? matches[0] : undefined
+          const storedClaims = tokenClaims(account?.accessToken)
+          const storedExpiresAt = typeof storedClaims.exp === 'number' && Number.isFinite(storedClaims.exp) ? storedClaims.exp * 1000 : 0
+          // A re-login can leave the exported pool behind. Refresh only an existing, exact
+          // workspace AND user; never import a different live login or regress a newer pool.
+          if (account && subject !== null && subject === tokenSubject(account.accessToken)
+            && expiresAt > deps.now() && expiresAt > storedExpiresAt) {
+            account.accessToken = tokens.access_token
+            account.refreshToken = tokens.refresh_token
+            account.expiresAt = expiresAt
+            await assertCredentialsUnchanged(deps, [{ path: livePath, expected: liveRaw }, { path: accountsPath, expected: accountsRaw }])
+            payload = JSON.stringify(bundle)
+          }
+        }
       }
-      if (selected === 'codex' && input.refreshOwner === true) payload = withoutCodexRefreshTokens(payload)
-      assertPayloadSize(payload)
-      return { provider: selected, payload }
-    }))
+    }
+    if (selected === 'codex' && input.codexRecovery === true) {
+      const bundle = parseCodexMultiAuthBundle(payload)
+      if (!bundle) throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
+      const livePath = deps.env.CODEX_CLI_AUTH_PATH || join(codexHome(), 'auth.json')
+      const raw = await deps.readFile(livePath)
+      const live = JSON.parse(raw)
+      const tokens = live?.tokens
+      if (!isObject(tokens) || ['account_id', 'access_token', 'refresh_token', 'id_token'].some(key => typeof tokens[key] !== 'string' || !tokens[key])) {
+        throw new AiCredentialRuntimeError('CODEX_REAUTH_REQUIRED')
+      }
+      const indexes = bundle.accounts.accounts.map((account, index) => ({ account, index }))
+        .filter(({ account }) => account.accountId === tokens.account_id)
+      const sameUser = bundle.accounts.accounts.map((account, index) => ({ account, index }))
+        .filter(({ account }) => tokenSubject(account.accessToken) !== null && tokenSubject(account.accessToken) === tokenSubject(tokens.access_token))
+      const match = indexes.length === 1 ? indexes[0] : sameUser.length === 1 ? sameUser[0] : undefined
+      if (!match) throw new AiCredentialRuntimeError('CODEX_ACTIVE_CREDENTIAL_MISMATCH')
+      const claims = JSON.parse(Buffer.from(String(tokens.access_token).split('.')[1] || '', 'base64url').toString())
+      const active: CodexMultiAuthAccount = { ...match.account, accountId: String(tokens.account_id), accessToken: String(tokens.access_token),
+        refreshToken: String(tokens.refresh_token), ...(typeof claims.exp === 'number' ? { expiresAt: claims.exp * 1000 } : {}),
+        accountIdSource: 'token', workspaces: undefined, currentWorkspaceIndex: undefined }
+      const verified = await verifyLocalAiAccounts(deps, 'codex', [{ accountId: tokens.account_id as string }], [active], { budgetMs: 60_000 })
+      if (!verified.accounts[0]?.ok) throw new AiCredentialRuntimeError(
+        verified.accounts[0]?.errorKind === 'AUTHENTICATION_FAILED' ? 'CODEX_AUTHENTICATION_FAILED' : 'CODEX_SOURCE_VERIFICATION_FAILED')
+      if (await deps.readFile(livePath) !== raw) throw new AiCredentialRuntimeError('ACTIVE_ACCOUNT_CHANGED')
+      bundle.accounts.accounts[match.index] = active
+      bundle.accounts.activeIndex = match.index
+      payload = JSON.stringify({ ...bundle, recoveryAuth: {
+        auth_mode: 'chatgpt', OPENAI_API_KEY: null, last_refresh: live.last_refresh,
+        tokens: { account_id: tokens.account_id, access_token: tokens.access_token, refresh_token: tokens.refresh_token, id_token: tokens.id_token },
+      } })
+    }
+    if (selected === 'codex' && input.refreshOwner === true) payload = withoutCodexRefreshTokens(payload)
+    assertPayloadSize(payload)
+    return { provider: selected, payload }
   }
 
   function tokenSubject(token: unknown): string | null {
