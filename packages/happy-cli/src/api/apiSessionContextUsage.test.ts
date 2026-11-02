@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Metadata } from './types';
 import { decodeBase64, decrypt } from './encryption';
 import { ApiSessionClient } from './apiSession';
+import breakdownContract from '@/claude/__fixtures__/context-usage-breakdown.v1.json';
 
 const { mockIo } = vi.hoisted(() => ({ mockIo: vi.fn() }));
 
@@ -310,6 +311,80 @@ describe('ApiSessionClient context-usage frames', () => {
         ]);
         await first.close();
         await second.close();
+    });
+
+    it('asks the runtime for a summary breakdown and sends it as the additive breakdown field', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        client.sendClaudeSessionMessage(mainAssistant(124000));
+        client.applyClaudeTurnResult(result('result-1'));
+        const request = vi.fn(async () => breakdownContract.getContextUsageSummaryResponse);
+        client.refreshContextUsageBreakdown(request);
+
+        expect(request).toHaveBeenCalledWith({ subtype: 'get_context_usage', detail: 'summary' }, { signal: expect.any(AbortSignal) });
+        await vi.waitFor(() => expect(frames().at(-1)).toMatchObject({ seq: 3, used: 124000, window: 200000, breakdown: breakdownContract.frameWithBreakdown.breakdown }));
+        // The tokens object of usage-report stays as it was: the breakdown never goes there.
+        expect(Object.keys(usageReports()[0][1].tokens).sort()).toEqual(['cache_creation', 'cache_read', 'input', 'output', 'total']);
+        await client.close();
+    });
+
+    /** A request whose answer the test hands over; flushed so its handler has run before asserting. */
+    function deferredRequest() {
+        let answer!: (value: unknown) => void;
+        const request = vi.fn(() => new Promise<unknown>((resolve) => { answer = resolve; }));
+        return { request, answer: async (value: unknown) => { answer(value); await new Promise((resolve) => setTimeout(resolve, 0)); } };
+    }
+
+    async function clientWithShownWindow() {
+        const client = new ApiSessionClient('fake-token', session);
+        client.sendClaudeSessionMessage(mainAssistant(124000));
+        client.applyClaudeTurnResult(result('result-1'));
+        return client;
+    }
+
+    it('leaves the frame as it was when the runtime fails', async () => {
+        const client = await clientWithShownWindow();
+        client.refreshContextUsageBreakdown(async () => { throw new Error('control request aborted'); });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(frames().some((frame: any) => 'breakdown' in frame)).toBe(false);
+        await client.close();
+    });
+
+    it('drops an answer that arrives after a compaction', async () => {
+        const client = await clientWithShownWindow();
+        const pending = deferredRequest();
+        client.refreshContextUsageBreakdown(pending.request);
+        client.noteContextUsageSignal({ kind: 'compact-boundary' });
+        await pending.answer(breakdownContract.getContextUsageSummaryResponse);
+        expect(frames().some((frame: any) => 'breakdown' in frame)).toBe(false);
+        await client.close();
+    });
+
+    it('drops an answer that arrives after close', async () => {
+        const client = await clientWithShownWindow();
+        const pending = deferredRequest();
+        client.refreshContextUsageBreakdown(pending.request);
+        await client.close();
+        await pending.answer(breakdownContract.getContextUsageSummaryResponse);
+        expect(frames().some((frame: any) => 'breakdown' in frame)).toBe(false);
+    });
+
+    it('a breakdown request queued behind a compaction is asked after it and shown', async () => {
+        const client = await clientWithShownWindow();
+        const pending = deferredRequest();
+        client.noteContextUsageSignal({ kind: 'compact-boundary' });
+        client.noteContextUsageSignal({ kind: 'breakdown-request', request: pending.request });
+        await pending.answer(breakdownContract.getContextUsageSummaryResponse);
+        expect(frames().at(-1)).toMatchObject({ used: null, window: 200000, breakdown: { totalTokens: 124000 } });
+        await client.close();
+    });
+
+    it('asks nothing for a local terminal session', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        client.keepAlive(false, 'local');
+        const request = vi.fn(async () => breakdownContract.getContextUsageSummaryResponse);
+        client.refreshContextUsageBreakdown(request);
+        expect(request).not.toHaveBeenCalled();
+        await client.close();
     });
 
     it('sends nothing for a local terminal session, which has no turn result to name a window', async () => {

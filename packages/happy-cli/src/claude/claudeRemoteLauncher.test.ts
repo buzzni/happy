@@ -533,6 +533,8 @@ describe('/btw side question on the live provider', () => {
         expect(client.reportSideQuestionUsage).toHaveBeenCalledOnce();
         expect(client.reportSideQuestionUsage.mock.calls[0][0]).toMatchObject({ model: 'claude-opus-5-5', quality: 'estimated' });
         expect(client.sendClaudeSessionMessage.mock.calls.flat()).not.toContainEqual(expect.objectContaining({ subtype: 'control_request_progress' }));
+        // The same live control request asks for the context breakdown once the turn has its result.
+        expect(client.noteContextUsageSignal).toHaveBeenCalledWith({ kind: 'breakdown-request', request: expect.any(Function) });
         expect(await handlers.get('side-question')!({ question: 'after exit?' })).toEqual({ success: false, error: 'side-question:not-running' });
     });
 });

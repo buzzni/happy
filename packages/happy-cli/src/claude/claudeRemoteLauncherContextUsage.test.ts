@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { ApiSessionClient } from '@/api/apiSession';
+import breakdownContract from './__fixtures__/context-usage-breakdown.v1.json';
 import { decodeBase64, decrypt } from '@/api/encryption';
 import type { Metadata } from '@/api/types';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
@@ -91,8 +92,15 @@ describe('claudeRemoteLauncher context-usage delivery', () => {
         .map(([, payload]: [string, { data: string }]) => decrypt(encryptionKey, 'legacy', decodeBase64(payload.data)))
         .filter((frame: { type?: unknown }) => frame?.type === 'context-usage');
 
-    it('replays a recorded session with a subagent and a /compact into the expected frames', async () => {
-        const turns = readRecording();
+    /**
+     * Runs the recorded session through the launcher; `control` is merged into the mocked SDK `Query`.
+     * `labels` keeps only those turns; `delayMs: 0` delivers a turn as one burst, before the queue drains.
+     */
+    async function replayRecording(
+        control: Record<string, unknown> = {},
+        { labels, delayMs = 5 }: { labels?: string[]; delayMs?: number } = {},
+    ): Promise<ApiSessionClient> {
+        const turns = readRecording().filter((turn) => !labels || labels.includes(turn[0].label));
         const client = new ApiSessionClient('fake-token', {
             id: 'context-usage-launcher-test', seq: 0, metadataVersion: 0, agentState: null, agentStateVersion: 0,
             metadata: {
@@ -108,7 +116,7 @@ describe('claudeRemoteLauncher context-usage delivery', () => {
                 for await (const _message of prompt as AsyncIterable<SDKUserMessage>) {
                     for (const { label: _label, ...message } of turns[turn]) {
                         // A live provider streams over seconds, so the queue drains between messages.
-                        await new Promise((resolve) => setTimeout(resolve, 5));
+                        if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
                         // The recording keeps only what the meter reads; the launcher's status line wants these.
                         yield message.type === 'result' ? { duration_ms: 1, num_turns: 1, total_cost_usd: 0, ...message } : message;
                     }
@@ -120,7 +128,7 @@ describe('claudeRemoteLauncher context-usage delivery', () => {
                     queue.push(`turn-${turn}`, { permissionMode: 'default', model: 'claude-haiku-4-5' });
                 }
             })();
-            return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+            return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {}, ...control }) as unknown as ReturnType<typeof query>;
         });
         queue.push('turn-0', { permissionMode: 'default', model: 'claude-haiku-4-5' });
         const session = {
@@ -132,6 +140,11 @@ describe('claudeRemoteLauncher context-usage delivery', () => {
         } as unknown as Session;
 
         await claudeRemoteLauncher(session);
+        return client;
+    }
+
+    it('replays a recorded session with a subagent and a /compact into the expected frames', async () => {
+        const client = await replayRecording();
 
         expect(frames().map((frame: any) => [frame.seq, frame.used, frame.window, frame.model])).toEqual([
             // Main responses, keyed by the provider's init model: the subagent's own requests never
@@ -148,6 +161,35 @@ describe('claudeRemoteLauncher context-usage delivery', () => {
             [6, 28173, 200000, 'claude-haiku-4-5'],
             [6, 28173, 200000, 'claude-haiku-4-5'],
         ]);
+        await client.close();
+    });
+
+    it('asks the live query for a summary breakdown after each turn result and sends it on the frame', async () => {
+        const requests: Record<string, unknown>[] = [];
+        const client = await replayRecording({
+            request: async (body: Record<string, unknown>) => {
+                requests.push(body);
+                return { response: { ...breakdownContract.getContextUsageSummaryResponse, model: 'claude-haiku-4-5', totalTokens: 28173 } };
+            },
+        });
+
+        // One per turn result, and only this request: the breakdown never sends the provider a prompt.
+        expect(requests).toEqual(readRecording().map(() => ({ subtype: 'get_context_usage', detail: 'summary' })));
+        await vi.waitFor(() => expect(frames().at(-1)).toMatchObject({
+            used: 28173, window: 200000, model: 'claude-haiku-4-5',
+            breakdown: { detail: 'summary', model: 'claude-haiku-4-5', totalTokens: 28173, rawMaxTokens: 200000 },
+        }));
+        await client.close();
+    });
+
+    it('asks after a compaction that arrived in the same burst, so the boundary does not drop the answer', async () => {
+        const client = await replayRecording({
+            request: async () => ({ response: { ...breakdownContract.getContextUsageSummaryResponse, model: 'claude-haiku-4-5', totalTokens: 9000 } }),
+        }, { labels: ['compact'], delayMs: 0 });
+
+        // compact_boundary and the result reach the launcher before the queue drains: the request
+        // waits its turn behind the boundary, so the answer is the one shown.
+        await vi.waitFor(() => expect(frames().at(-1)).toMatchObject({ used: null, breakdown: { totalTokens: 9000 } }));
         await client.close();
     });
 });
