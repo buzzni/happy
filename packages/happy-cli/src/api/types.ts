@@ -611,6 +611,12 @@ export type Metadata = {
   codexThreadId?: string, // Codex app-server thread ID
   tools?: string[],
   slashCommands?: string[],
+  /**
+   * Claude Code's live background tasks (`background_tasks_changed`), REPLACE on every publish. A turn starts
+   * from `tasks: null` (no list yet; a reader that falls back to the transcript reads it from `startedAt`) unless
+   * the last list still names live work, which stays until Claude Code replaces it. `available: false` is the
+   * last list of a provider process that has ended.
+   */
   claudeBackgroundTasks?: {
     startedAt: number;
     available: boolean;
