@@ -4085,6 +4085,25 @@ describe('third-party credential file compare-and-swap (aplus D4 C3)', () => {
     expect(pool.accounts.find((account: { accountId: string }) => account.accountId === 'account-a')).toMatchObject({ refreshToken: 'owner-refresh' })
   })
 
+  it('never hands one email-only account another email-only account login in replace mode', async () => {
+    const configured = setup()
+    const local = { version: 3, activeIndex: 0, accounts: [
+      { email: 'owner@example.com', accessToken: 'owner-access', refreshToken: 'owner-refresh', expiresAt: 500, addedAt: 1, lastUsed: 1 },
+    ] }
+    configured.files.set(poolPath, JSON.stringify(local))
+    const incoming = codexMultiAuthBundle()
+    incoming.accounts.accounts = [
+      { email: 'other@example.com', accessToken: 'other-access', refreshToken: CODEX_OWNER_MANAGED_REFRESH_TOKEN, expiresAt: 200, addedAt: 1, lastUsed: 1 } as never,
+      { email: 'Owner@Example.com', accessToken: 'owner-access', refreshToken: CODEX_OWNER_MANAGED_REFRESH_TOKEN, expiresAt: 500, addedAt: 1, lastUsed: 1 } as never,
+    ]
+
+    await configured.runtime.apply({ provider: 'codex', payload: JSON.stringify(incoming) }).catch(() => undefined)
+
+    const pool = JSON.parse(configured.files.get(poolPath)!)
+    expect(pool.accounts.find((account: { email: string }) => account.email === 'other@example.com')).toMatchObject({ refreshToken: CODEX_OWNER_MANAGED_REFRESH_TOKEN, accessToken: 'other-access' })
+    expect(pool.accounts.find((account: { email: string }) => account.email === 'Owner@Example.com')).toMatchObject({ refreshToken: 'owner-refresh' })
+  })
+
   it('holds no credential lock while a network-bound verification runs', async () => {
     let held = 0
     let heldDuringForecast = -1

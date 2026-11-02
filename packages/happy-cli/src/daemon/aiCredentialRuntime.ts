@@ -80,6 +80,15 @@ function codexAccessTokenExpiry(token: unknown): number | undefined {
   } catch { return undefined }
 }
 
+/** Same account: by accountId when both have one, otherwise by email; two missing identities never match. */
+function sameCodexAccount(left: CodexMultiAuthAccount, right: CodexMultiAuthAccount): boolean {
+  if (typeof left.accountId === 'string' && left.accountId && typeof right.accountId === 'string' && right.accountId) {
+    return left.accountId === right.accountId
+  }
+  return typeof left.email === 'string' && !!left.email && typeof right.email === 'string'
+    && left.email.toLowerCase() === right.email.toLowerCase()
+}
+
 /** A pool entry's expiry: its recorded `expiresAt`, else its access token's own, else 0 (unknown sorts oldest). */
 function codexAccountExpiry(account: CodexMultiAuthAccount): number {
   return typeof account.expiresAt === 'number' ? account.expiresAt : codexAccessTokenExpiry(account.accessToken) ?? 0
@@ -1545,7 +1554,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     let localAccounts: CodexMultiAuthAccount[] = []
     try { if (localRaw) localAccounts = parseCodexMultiAuthBundle(JSON.stringify({ ...bundle, accounts: JSON.parse(localRaw) }))?.accounts.accounts ?? [] } catch { /* an unreadable pool owns nothing to keep */ }
     const replacement = { ...bundle.accounts, accounts: bundle.accounts.accounts.map(incoming => {
-      const own = incoming.refreshToken === CODEX_OWNER_MANAGED_REFRESH_TOKEN && localAccounts.find(local => local.accountId === incoming.accountId
+      const own = incoming.refreshToken === CODEX_OWNER_MANAGED_REFRESH_TOKEN && localAccounts.find(local => sameCodexAccount(local, incoming)
         && local.refreshToken !== CODEX_OWNER_MANAGED_REFRESH_TOKEN && codexAccountExpiry(local) >= codexAccountExpiry(incoming))
       return own ? { ...incoming, accessToken: own.accessToken, refreshToken: own.refreshToken, expiresAt: own.expiresAt } : incoming
     }) }
