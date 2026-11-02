@@ -48,7 +48,7 @@ import {
 } from '@slopus/happy-wire';
 import { ClaudeTurnUsageTracker } from '@/usage/claudeTurnUsage';
 import { ClaudeRuntimeAccountPublisher } from '@/claude/claudeRuntimeAccount';
-import { ClaudeContextUsageTracker, type ClaudeContextUsageSignal } from '@/claude/claudeContextUsage';
+import { ClaudeContextUsageTracker, type ClaudeContextUsageSignal, type ClaudeControlRequest } from '@/claude/claudeContextUsage';
 import { createClaudeTurnUsageEvent, createClaudeUsageEvent } from '@/usage/providerUsageAdapters';
 import type { ObservedAiAuthSource } from '@/claude/aiAuthObservation';
 import { createTurnSequence, registerCleanBackgroundProcessesHandler, sessionBackgroundProcesses } from '@/utils/sessionBackgroundProcesses';
@@ -65,6 +65,8 @@ const DAEMON_RUNTIME_REPORTS_IN_FLIGHT_MAX = 4;
 const CONTEXT_USAGE_RESEND_INTERVAL_MS = 30_000;
 /** Ticks a take-down (reset, local mode) is repeated for: a lost one would leave old numbers on screen. */
 const CONTEXT_USAGE_TAKE_DOWN_REPEATS = 2;
+/** A `summary` breakdown is computed locally by the runtime; one that takes longer is not coming. */
+const CONTEXT_USAGE_BREAKDOWN_TIMEOUT_MS = 10_000;
 
 /**
  * ACP (Agent Communication Protocol) message data types.
@@ -2066,6 +2068,19 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     /** `/clear` or another Claude session id: the new conversation may run under other settings. */
+    /**
+     * Asks the running Claude process what fills its window (`get_context_usage`, `detail: 'summary'`:
+     * local estimates, no token-count API calls) and adds the answer to the frame. Best effort: a
+     * runtime that fails, times out or answers in another shape leaves the frame as it was.
+     */
+    refreshContextUsageBreakdown(request: ClaudeControlRequest) {
+        if (this.currentMode !== 'remote' || this.closed) return;
+        const ticket = this.contextUsage.beginBreakdown();
+        request({ subtype: 'get_context_usage', detail: 'summary' }, { signal: AbortSignal.timeout(CONTEXT_USAGE_BREAKDOWN_TIMEOUT_MS) })
+            .then((response) => { if (!this.closed) this.contextUsage.noteBreakdown(ticket, response); })
+            .catch((error: unknown) => logger.debug('[context-usage] breakdown request failed', error));
+    }
+
     resetContextUsage() {
         this.contextUsage.reset();
     }

@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import contract from './__fixtures__/context-usage-snapshot.v1.json';
+import breakdownContract from './__fixtures__/context-usage-breakdown.v1.json';
 import {
     ClaudeContextUsageTracker,
     contextUsageSignalItem,
@@ -394,5 +395,110 @@ describe('ClaudeContextUsageTracker', () => {
         tracker.noteMainAssistant({ model: MODEL, usage: usage(100) });
         frames[0].used = 1;
         expect(tracker.snapshot().used).toBe(100);
+    });
+});
+
+describe('ClaudeContextUsageTracker context breakdown', () => {
+    /** The tracker after the contract's `assistantWithWindow` state, with a breakdown request open. */
+    function trackerWithWindow() {
+        const created = createTracker();
+        created.tracker.noteProviderModel(MODEL);
+        created.tracker.noteMainAssistant({ model: MODEL, usage: usage(4000, 100000, 20000) });
+        created.tracker.noteTurnResult({ [MODEL]: { contextWindow: 200000 } });
+        return created;
+    }
+
+    it('adds the get_context_usage categories to the frame as the additive `breakdown` field', () => {
+        const { tracker, frames } = trackerWithWindow();
+        const ticket = tracker.beginBreakdown();
+        expect(tracker.noteBreakdown(ticket, breakdownContract.getContextUsageSummaryResponse)).toBe(true);
+
+        expect(frames.at(-1)).toEqual({ ...breakdownContract.frameWithBreakdown, epoch: 'epoch-1' });
+        // Every v1 field is unchanged, so a consumer that knows only v1 reads the same frame.
+        const { breakdown: _breakdown, ...v1 } = frames.at(-1)!;
+        expect(v1).toEqual({ ...contract.assistantWithWindow, epoch: 'epoch-1' });
+    });
+
+    it('omits the field entirely until a breakdown arrives', () => {
+        const { frames } = trackerWithWindow();
+        expect(frames.every((frame) => !('breakdown' in frame))).toBe(true);
+    });
+
+    it('drops an answer that a compaction, a hide, a reset or a newer request made stale', () => {
+        const response = breakdownContract.getContextUsageSummaryResponse;
+        for (const invalidate of [
+            (tracker: ClaudeContextUsageTracker) => tracker.noteCompactBoundary(),
+            (tracker: ClaudeContextUsageTracker) => tracker.hide(),
+            (tracker: ClaudeContextUsageTracker) => tracker.reset(),
+            (tracker: ClaudeContextUsageTracker) => { tracker.beginBreakdown(); },
+        ]) {
+            const { tracker } = trackerWithWindow();
+            const ticket = tracker.beginBreakdown();
+            invalidate(tracker);
+            expect(tracker.noteBreakdown(ticket, response)).toBe(false);
+            expect(tracker.snapshot().breakdown).toBeUndefined();
+        }
+    });
+
+    it('clears a shown breakdown on compaction, hide and reset', () => {
+        const response = breakdownContract.getContextUsageSummaryResponse;
+        for (const clear of [
+            (tracker: ClaudeContextUsageTracker) => tracker.noteCompactBoundary(),
+            (tracker: ClaudeContextUsageTracker) => tracker.hide(),
+            (tracker: ClaudeContextUsageTracker) => tracker.reset(),
+        ]) {
+            const { tracker, frames } = trackerWithWindow();
+            tracker.noteBreakdown(tracker.beginBreakdown(), response);
+            clear(tracker);
+            expect('breakdown' in frames.at(-1)!).toBe(false);
+        }
+    });
+
+    it('keeps the breakdown across a new main response, and bumps seq only when it changes', () => {
+        const { tracker, frames } = trackerWithWindow();
+        const response = breakdownContract.getContextUsageSummaryResponse;
+        tracker.noteBreakdown(tracker.beginBreakdown(), response);
+        const seq = tracker.snapshot().seq;
+        // The same answer again is not a change.
+        expect(tracker.noteBreakdown(tracker.beginBreakdown(), response)).toBe(false);
+        expect(tracker.snapshot().seq).toBe(seq);
+
+        tracker.noteMainAssistant({ model: MODEL, usage: usage(130000) });
+        expect(frames.at(-1)).toMatchObject({ seq: seq + 1, used: 130000, breakdown: { totalTokens: 124000 } });
+    });
+
+    it('ignores an answer it cannot read and drops only the rows it cannot read', () => {
+        const { tracker, frames } = trackerWithWindow();
+        const sent = frames.length;
+        for (const unreadable of [null, 'text', {}, { ...breakdownContract.getContextUsageSummaryResponse, categories: [] },
+            { ...breakdownContract.getContextUsageSummaryResponse, totalTokens: -1 },
+            { ...breakdownContract.getContextUsageSummaryResponse, rawMaxTokens: 0 },
+            { ...breakdownContract.getContextUsageSummaryResponse, model: 7 }]) {
+            expect(tracker.noteBreakdown(tracker.beginBreakdown(), unreadable)).toBe(false);
+        }
+        expect(frames).toHaveLength(sent);
+
+        tracker.noteBreakdown(tracker.beginBreakdown(), {
+            ...breakdownContract.getContextUsageSummaryResponse,
+            categories: [
+                { name: 'Messages', tokens: 100, kind: 'used' },
+                { id: 'Not An Id!', name: 'Odd id', tokens: 5, kind: 'used' },
+                { id: 'messages', name: 'Bad tokens', tokens: 1.5, kind: 'used' },
+                { id: 'messages', name: 'Bad kind', tokens: 1, kind: 'other' },
+                { id: 'messages', name: '', tokens: 1, kind: 'used' },
+            ],
+        });
+        expect(tracker.snapshot().breakdown?.categories).toEqual([
+            // A CLI that predates row ids: the row is kept, classified by kind alone.
+            { id: null, name: 'Messages', tokens: 100, kind: 'used' },
+            { id: null, name: 'Odd id', tokens: 5, kind: 'used' },
+        ]);
+    });
+
+    it('returns a breakdown the caller cannot mutate into the tracker', () => {
+        const { tracker, frames } = trackerWithWindow();
+        tracker.noteBreakdown(tracker.beginBreakdown(), breakdownContract.getContextUsageSummaryResponse);
+        frames.at(-1)!.breakdown!.categories[0].tokens = 1;
+        expect(tracker.snapshot().breakdown!.categories[0].tokens).toBe(3100);
     });
 });

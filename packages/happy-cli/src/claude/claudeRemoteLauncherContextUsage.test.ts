@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { ApiSessionClient } from '@/api/apiSession';
+import breakdownContract from './__fixtures__/context-usage-breakdown.v1.json';
 import { decodeBase64, decrypt } from '@/api/encryption';
 import type { Metadata } from '@/api/types';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
@@ -91,7 +92,8 @@ describe('claudeRemoteLauncher context-usage delivery', () => {
         .map(([, payload]: [string, { data: string }]) => decrypt(encryptionKey, 'legacy', decodeBase64(payload.data)))
         .filter((frame: { type?: unknown }) => frame?.type === 'context-usage');
 
-    it('replays a recorded session with a subagent and a /compact into the expected frames', async () => {
+    /** Runs the recorded session through the launcher; `control` is merged into the mocked SDK `Query`. */
+    async function replayRecording(control: Record<string, unknown> = {}): Promise<ApiSessionClient> {
         const turns = readRecording();
         const client = new ApiSessionClient('fake-token', {
             id: 'context-usage-launcher-test', seq: 0, metadataVersion: 0, agentState: null, agentStateVersion: 0,
@@ -120,7 +122,7 @@ describe('claudeRemoteLauncher context-usage delivery', () => {
                     queue.push(`turn-${turn}`, { permissionMode: 'default', model: 'claude-haiku-4-5' });
                 }
             })();
-            return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+            return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {}, ...control }) as unknown as ReturnType<typeof query>;
         });
         queue.push('turn-0', { permissionMode: 'default', model: 'claude-haiku-4-5' });
         const session = {
@@ -132,6 +134,11 @@ describe('claudeRemoteLauncher context-usage delivery', () => {
         } as unknown as Session;
 
         await claudeRemoteLauncher(session);
+        return client;
+    }
+
+    it('replays a recorded session with a subagent and a /compact into the expected frames', async () => {
+        const client = await replayRecording();
 
         expect(frames().map((frame: any) => [frame.seq, frame.used, frame.window, frame.model])).toEqual([
             // Main responses, keyed by the provider's init model: the subagent's own requests never
@@ -148,6 +155,24 @@ describe('claudeRemoteLauncher context-usage delivery', () => {
             [6, 28173, 200000, 'claude-haiku-4-5'],
             [6, 28173, 200000, 'claude-haiku-4-5'],
         ]);
+        await client.close();
+    });
+
+    it('asks the live query for a summary breakdown after each turn result and sends it on the frame', async () => {
+        const requests: Record<string, unknown>[] = [];
+        const client = await replayRecording({
+            request: async (body: Record<string, unknown>) => {
+                requests.push(body);
+                return { response: { ...breakdownContract.getContextUsageSummaryResponse, model: 'claude-haiku-4-5', totalTokens: 28173 } };
+            },
+        });
+
+        // One per turn result, and only this request: the breakdown never sends the provider a prompt.
+        expect(requests).toEqual(readRecording().map(() => ({ subtype: 'get_context_usage', detail: 'summary' })));
+        await vi.waitFor(() => expect(frames().at(-1)).toMatchObject({
+            used: 28173, window: 200000, model: 'claude-haiku-4-5',
+            breakdown: { detail: 'summary', model: 'claude-haiku-4-5', totalTokens: 28173, rawMaxTokens: 200000 },
+        }));
         await client.close();
     });
 });

@@ -26,6 +26,13 @@
  *   settings, so the cached windows are still right.
  * - A reset (`/clear`, another Claude session id) clears occupancy and every cached window and
  *   starts a new epoch: a new session may run under different settings.
+ *
+ * The optional `breakdown` (Desktop specs/context-meter-compact) is what the runtime itself says
+ * fills the window: the `categories` of `Query.getContextUsage({ detail: 'summary' })`, asked once
+ * per remote turn result. It is additive within v1 — a consumer that knows only v1 ignores it — and
+ * is absent until an answer arrives. It carries its own totals because it is measured at the turn
+ * result, while `used` follows every later main response. Compaction, hide and reset clear it, and
+ * an answer to a request they overtook is dropped.
  */
 import { randomBytes } from 'node:crypto';
 
@@ -44,7 +51,82 @@ export type ClaudeContextUsageSnapshot = {
     used: number | null;
     window: number | null;
     model: string | null;
+    /** Absent until the runtime answers a breakdown request; see the header. Fixture: `__fixtures__/context-usage-breakdown.v1.json`. */
+    breakdown?: ClaudeContextBreakdown;
 };
+
+/** One `getContextUsage().categories` row, as the runtime classified it. Rows may carry zero tokens. */
+export type ClaudeContextBreakdownCategory = {
+    /**
+     * The runtime's stable row id (`system_prompt`, `system_tools`, `mcp_tools`, `memory_files`,
+     * `skills`, `messages`, `free_space`, …), or null from a CLI that predates ids. Match rows on
+     * this, never on `name`; a later CLI may add ids.
+     */
+    id: string | null;
+    /** The runtime's English display name. */
+    name: string;
+    tokens: number;
+    /** 'used' occupies the window, 'free' is what is left, 'buffer' the compaction reserve, 'deferred' tool schemas outside the window. */
+    kind: 'used' | 'free' | 'buffer' | 'deferred';
+};
+
+export type ClaudeContextBreakdown = {
+    /** `summary`: the runtime's local estimate per category, without token-count API calls. */
+    detail: 'summary';
+    /** The main-loop model the runtime measured for. */
+    model: string;
+    /** The runtime's estimate of the whole context; may exceed `rawMaxTokens` when over the limit. */
+    totalTokens: number;
+    /** The window the runtime measures against: its autocompact window, which can be smaller than `window`. */
+    rawMaxTokens: number;
+    categories: ClaudeContextBreakdownCategory[];
+};
+
+/** The SDK `Query` control request (`sideQuestionRequestOf`): resolves to the control_response body. */
+export type ClaudeControlRequest = (body: Record<string, unknown>, options: { signal: AbortSignal }) => Promise<unknown>;
+
+const BREAKDOWN_KINDS: ReadonlySet<unknown> = new Set(['used', 'free', 'buffer', 'deferred']);
+const BREAKDOWN_ID_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
+const MAX_BREAKDOWN_CATEGORIES = 32;
+const MAX_BREAKDOWN_TEXT_LENGTH = 128;
+
+function readSafeCount(value: unknown): number | null {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function readBreakdownCategory(value: unknown): ClaudeContextBreakdownCategory | null {
+    if (!value || typeof value !== 'object') return null;
+    const row = value as Record<string, unknown>;
+    const name = typeof row.name === 'string' ? row.name.trim().slice(0, MAX_BREAKDOWN_TEXT_LENGTH) : '';
+    const tokens = readSafeCount(row.tokens);
+    if (!name || tokens === null || !BREAKDOWN_KINDS.has(row.kind)) return null;
+    const id = typeof row.id === 'string' && BREAKDOWN_ID_PATTERN.test(row.id) ? row.id : null;
+    return { id, name, tokens, kind: row.kind as ClaudeContextBreakdownCategory['kind'] };
+}
+
+/** The breakdown in a `get_context_usage` answer, or null when it cannot be read as one. */
+function readBreakdown(response: unknown): ClaudeContextBreakdown | null {
+    if (!response || typeof response !== 'object') return null;
+    const answer = response as Record<string, unknown>;
+    const model = typeof answer.model === 'string' ? answer.model.trim().slice(0, MAX_BREAKDOWN_TEXT_LENGTH) : '';
+    const totalTokens = readSafeCount(answer.totalTokens);
+    const rawMaxTokens = readSafeCount(answer.rawMaxTokens);
+    if (!model || totalTokens === null || !rawMaxTokens || !Array.isArray(answer.categories)) return null;
+    const categories = answer.categories
+        .map(readBreakdownCategory)
+        .filter((row): row is ClaudeContextBreakdownCategory => row !== null)
+        .slice(0, MAX_BREAKDOWN_CATEGORIES);
+    if (categories.length === 0) return null;
+    return { detail: 'summary', model, totalTokens, rawMaxTokens, categories };
+}
+
+function sameBreakdown(a: ClaudeContextBreakdown | null, b: ClaudeContextBreakdown | null): boolean {
+    return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function copyBreakdown(breakdown: ClaudeContextBreakdown): ClaudeContextBreakdown {
+    return { ...breakdown, categories: breakdown.categories.map((row) => ({ ...row })) };
+}
 
 function readTokenCount(value: unknown): number | null {
     return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
@@ -143,6 +225,9 @@ export class ClaudeContextUsageTracker {
     private providerApiModel: string | null = null;
     /** Model names are runtime input: a Map keeps `__proto__` and friends as plain keys. */
     private readonly windows = new Map<string, number>();
+    private breakdown: ClaudeContextBreakdown | null = null;
+    /** Only the answer to the latest request counts; compaction, hide and reset also move it on. */
+    private breakdownTicket = 0;
 
     constructor(
         private readonly onChange: (snapshot: ClaudeContextUsageSnapshot) => void,
@@ -192,36 +277,59 @@ export class ClaudeContextUsageTracker {
         });
     }
 
+    /** Opens a breakdown request: pass the ticket back with its answer. */
+    beginBreakdown(): number {
+        this.breakdownTicket += 1;
+        return this.breakdownTicket;
+    }
+
+    /** The answer to `beginBreakdown`. Returns whether the shown snapshot changed (and was emitted). */
+    noteBreakdown(ticket: number, response: unknown): boolean {
+        if (ticket !== this.breakdownTicket) return false;
+        const breakdown = readBreakdown(response);
+        if (!breakdown) return false;
+        return this.commit(() => { this.breakdown = breakdown; });
+    }
+
     noteCompactBoundary(): void {
-        this.commit(() => { this.used = null; });
+        this.breakdownTicket += 1;
+        this.commit(() => {
+            this.used = null;
+            this.breakdown = null;
+        });
     }
 
     /** Nothing to show for now (local terminal mode), in the same conversation: windows stay cached. */
     hide(): void {
+        this.breakdownTicket += 1;
         this.commit(() => {
             this.used = null;
             this.model = null;
+            this.breakdown = null;
         });
     }
 
     reset(): void {
         this.windows.clear();
+        this.breakdownTicket += 1;
         // Nothing was ever shown in this epoch, so there is nothing to take back.
         if (!this.hasValue()) return;
         this.epoch = this.newEpoch();
         this.seq = 0;
         this.used = null;
         this.model = null;
+        this.breakdown = null;
         this.onChange(this.snapshot());
     }
 
     /**
      * Whether a consumer could be showing something from this epoch — what a resend repairs.
      * `used` is only ever set together with `model`, and a cached window with no main response
-     * yet is not shown, so `model` alone decides.
+     * yet is not shown, so `model` decides — or a breakdown that arrived before any readable
+     * main response (the Z.AI zeros).
      */
     hasValue(): boolean {
-        return this.model !== null;
+        return this.model !== null || this.breakdown !== null;
     }
 
     snapshot(): ClaudeContextUsageSnapshot {
@@ -233,14 +341,17 @@ export class ClaudeContextUsageTracker {
             used: this.used,
             window: this.model === null ? null : this.windows.get(this.model) ?? null,
             model: this.model,
+            ...(this.breakdown ? { breakdown: copyBreakdown(this.breakdown) } : {}),
         };
     }
 
     private commit(apply: () => void): boolean {
         const before = this.snapshot();
+        const breakdownBefore = this.breakdown;
         apply();
         const after = this.snapshot();
-        if (before.used === after.used && before.window === after.window && before.model === after.model) return false;
+        if (before.used === after.used && before.window === after.window && before.model === after.model
+            && sameBreakdown(breakdownBefore, this.breakdown)) return false;
         this.seq += 1;
         this.onChange(this.snapshot());
         return true;

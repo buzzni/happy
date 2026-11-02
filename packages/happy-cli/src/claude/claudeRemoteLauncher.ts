@@ -50,7 +50,7 @@ import type { McpRuntimeRecovery } from './mcpRuntimeRecovery';
 import { registerMcpReconnectHandler } from './registerMcpReconnectHandler';
 import { publishClaudePromptSuggestion } from './promptSuggestionMetadata';
 import { createStreamDeltaRelay } from './streamDeltaRelay';
-import { contextUsageSignalItem, withContextUsageSignals } from './claudeContextUsage';
+import { contextUsageSignalItem, withContextUsageSignals, type ClaudeControlRequest } from './claudeContextUsage';
 import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
 import { claudeNotSignedInNotice, isClaudeAuthenticationFailure, isClaudeRevokedTokenFailure, isClaudeTokenRefreshFailure, describeClaudeLaunchFailure } from './utils/launchFailureMessage';
 import { buildMandatoryRemoteDenyRules, resolveClaudeRemoteSandbox } from '@/sandbox/claudeSdkSandbox';
@@ -252,6 +252,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     });
     // `/btw`: one answer from the live conversation, outside the transcript and the turn queue.
     const sideQuestion = new ClaudeSideQuestionBridge();
+    // The live query's control request, for the context-usage breakdown after each turn result.
+    // Same channel and lifetime as `/btw`'s: absent for a managed run and between queries.
+    let contextUsageRequest: ClaudeControlRequest | null = null;
     session.client.rpcHandlerManager.registerHandler('side-question', createSideQuestionRpcHandler({
         bridge: sideQuestion,
         isManagedRun: () => session.managedRun === true,
@@ -651,6 +654,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 message as unknown as { uuid?: unknown; usage?: unknown; modelUsage?: unknown },
                 aiAuthObservation?.current(),
             );
+            if (contextUsageRequest) session.client.refreshContextUsageBreakdown(contextUsageRequest);
             /*
              * The SDK's own final answer (Saycode specs/desktop-messenger-channels — R14).
              *
@@ -1456,6 +1460,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     },
                     onSideQuestionChannelReady: (channel) => {
                         if (channel) sideQuestion.provide(channel); else sideQuestion.clear();
+                        contextUsageRequest = channel?.request ?? null;
                     },
                     onMcpStatus: (status: McpRuntimeServerStatus) => {
                         session.client.updateMetadata((currentMetadata) => ({

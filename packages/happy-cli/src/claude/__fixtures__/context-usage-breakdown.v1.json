@@ -1,0 +1,50 @@
+{
+  "getContextUsageSummaryResponse": {
+    "categories": [
+      { "id": "system_prompt", "name": "System prompt", "tokens": 3100, "color": "promptBorder", "kind": "used" },
+      { "id": "system_tools", "name": "System tools", "tokens": 11800, "color": "inactive", "kind": "used" },
+      { "id": "mcp_tools", "name": "MCP tools", "tokens": 4200, "color": "cyan_FOR_SUBAGENTS_ONLY", "kind": "used" },
+      { "id": "mcp_tools_deferred", "name": "MCP tools (deferred)", "tokens": 9000, "color": "inactive", "isDeferred": true, "kind": "deferred" },
+      { "id": "memory_files", "name": "Memory files", "tokens": 2600, "color": "claude", "kind": "used" },
+      { "id": "skills", "name": "Skills", "tokens": 900, "color": "warning", "kind": "used" },
+      { "id": "messages", "name": "Messages", "tokens": 101400, "color": "purple_FOR_SUBAGENTS_ONLY", "kind": "used" },
+      { "id": "autocompact_buffer", "name": "Autocompact buffer", "tokens": 33000, "color": "inactive", "kind": "buffer" },
+      { "id": "free_space", "name": "Free space", "tokens": 43000, "color": "promptBorder", "kind": "free" }
+    ],
+    "totalTokens": 124000,
+    "maxTokens": 167000,
+    "rawMaxTokens": 200000,
+    "percentage": 62,
+    "gridRows": [],
+    "model": "claude-sonnet-4-5-20250929",
+    "memoryFiles": [{ "path": "/home/user/project/CLAUDE.md", "type": "Project", "tokens": 2600 }],
+    "mcpTools": [{ "name": "mcp__linear__create_issue", "serverName": "linear", "tokens": 4200 }],
+    "agents": []
+  },
+  "frameWithBreakdown": {
+    "version": 1,
+    "type": "context-usage",
+    "epoch": "1792400000000-0b6f1c9e",
+    "seq": 3,
+    "used": 124000,
+    "window": 200000,
+    "model": "claude-sonnet-4-5-20250929",
+    "breakdown": {
+      "detail": "summary",
+      "model": "claude-sonnet-4-5-20250929",
+      "totalTokens": 124000,
+      "rawMaxTokens": 200000,
+      "categories": [
+        { "id": "system_prompt", "name": "System prompt", "tokens": 3100, "kind": "used" },
+        { "id": "system_tools", "name": "System tools", "tokens": 11800, "kind": "used" },
+        { "id": "mcp_tools", "name": "MCP tools", "tokens": 4200, "kind": "used" },
+        { "id": "mcp_tools_deferred", "name": "MCP tools (deferred)", "tokens": 9000, "kind": "deferred" },
+        { "id": "memory_files", "name": "Memory files", "tokens": 2600, "kind": "used" },
+        { "id": "skills", "name": "Skills", "tokens": 900, "kind": "used" },
+        { "id": "messages", "name": "Messages", "tokens": 101400, "kind": "used" },
+        { "id": "autocompact_buffer", "name": "Autocompact buffer", "tokens": 33000, "kind": "buffer" },
+        { "id": "free_space", "name": "Free space", "tokens": 43000, "kind": "free" }
+      ]
+    }
+  }
+}
