@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { APPLY_REQUIRED_NOTICE, createSetupTokenAccountSwitching, FORBIDDEN_NOTICE, NO_ACCOUNT_NOTICE, type SetupTokenAccountSwitchingDeps } from './setupTokenAccountSwitching'
+import { APPLY_REQUIRED_NOTICE, createSetupTokenAccountSwitching, FORBIDDEN_NOTICE, NO_ACCOUNT_NOTICE, START_BUDGET_SWITCHED_NOTICE, type SetupTokenAccountSwitchingDeps } from './setupTokenAccountSwitching'
 
 const NOW = 1_800_000_000_000
 const reset = Math.floor((NOW + 3_600_000) / 1000)
@@ -373,3 +373,32 @@ it('rotates a recoverable authentication failure without permanently rejecting i
  expect(await switching.switchIfWanted()).toEqual({ switched: true, continueAfter: true });
  expect(deps.rebind).toHaveBeenCalledWith('session-a', 'binding-a', undefined, expect.any(AbortSignal));
 });
+
+// Saycode specs/claude-setup-token-account-selection — start budget: another account may start this turn now.
+describe('switching for start budget', () => {
+  it('moves onto an account with start budget left without spending the usage-limit switch allowance', async () => {
+    const notifyState = vi.fn()
+    const { deps, switching } = setup({ notifyState })
+    for (let i = 0; i < 6; i++) expect(await switching.switchForStartBudget()).toBe(true)
+    expect(deps.rebind).toHaveBeenLastCalledWith('session-a', 'binding-a', undefined, expect.any(AbortSignal), { startBudget: true })
+    expect(deps.applyEnvironment).toHaveBeenCalledTimes(6)
+    expect(notifyState).toHaveBeenLastCalledWith(START_BUDGET_SWITCHED_NOTICE, 'switched')
+    expect(switching.canSwitch()).toBe(true)
+  })
+
+  it('stays quiet and keeps the account when none has start budget left', async () => {
+    const notifyState = vi.fn()
+    const { deps, switching } = setup({ notifyState, rebind: vi.fn(async () => ({ ok: false as const, reason: 'NO_ACCOUNT' })) })
+    expect(await switching.switchForStartBudget()).toBe(false)
+    expect(deps.applyEnvironment).not.toHaveBeenCalled()
+    expect(notifyState).not.toHaveBeenCalled()
+    expect(switching.lastFailure()).toBeNull()
+  })
+
+  it('does not move a stopped session', async () => {
+    const { deps, switching } = setup()
+    switching.dispose()
+    expect(await switching.switchForStartBudget()).toBe(false)
+    expect(deps.rebind).not.toHaveBeenCalled()
+  })
+})

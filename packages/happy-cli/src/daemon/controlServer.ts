@@ -534,11 +534,13 @@ export function startDaemonControlServer({
     });
     typed.post('/setup-token/rebind', {
       bodyLimit: 4096,
-      schema: { body: z.object({ sessionId: z.string().min(1).max(128), binding: z.string().min(1).max(8192), observation: setupTokenObservation.optional() }).strict() },
+      schema: { body: z.object({ sessionId: z.string().min(1).max(128), binding: z.string().min(1).max(8192), observation: setupTokenObservation.optional(), startBudget: z.literal(true).optional() }).strict() },
     }, async (request, reply) => {
       const signal = rotationSignal(reply.raw);
       const switcher = getSetupTokenAccountSwitch();
-      return switcher ? switcher.rebind(request.body.sessionId, request.body.binding, request.body.observation, signal) : { ok: false as const, reason: 'STUDIO_UNAVAILABLE' as const };
+      if (!switcher) return { ok: false as const, reason: 'STUDIO_UNAVAILABLE' as const };
+      const { sessionId, binding, observation, startBudget } = request.body;
+      return startBudget ? switcher.rebind(sessionId, binding, observation, signal, { startBudget }) : switcher.rebind(sessionId, binding, observation, signal);
     });
 
     // List all tracked sessions

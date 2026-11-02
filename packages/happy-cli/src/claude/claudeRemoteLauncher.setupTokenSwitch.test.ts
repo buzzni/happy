@@ -13,7 +13,7 @@ import type { EnhancedMode } from './loop';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
 import { requestSetupTokenStart, requestSetupTokenRebind, reportSetupTokenActivity, reportSetupTokenUsage, requestSetupTokenAvailability, returnFromPersonalClaude } from '@/daemon/controlClient';
-import { APPLY_REQUIRED_NOTICE, CONTINUE_PROMPT, RESUME_REBOUND_NOTICE, SWITCHED_NOTICE } from './setupTokenAccountSwitching';
+import { APPLY_REQUIRED_NOTICE, CONTINUE_PROMPT, RESUME_REBOUND_NOTICE, START_BUDGET_SWITCHED_NOTICE, SWITCHED_NOTICE } from './setupTokenAccountSwitching';
 import { PERSONAL_RECHECK_NOTICE } from './personalClaudeFallback';
 import { claudeCheckSession } from './utils/claudeCheckSession';
 import { describeClaudeLaunchFailure } from './utils/launchFailureMessage';
@@ -163,6 +163,95 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         admit({ state: 'allowed', validForMs: 15000 });
         await running;
         expect(inputs).toHaveBeenCalledTimes(1);
+    });
+    it('runs a start-budget-waiting input at once on another organization account that has start budget', async () => {
+        vi.mocked(requestSetupTokenStart)
+            .mockResolvedValueOnce({ state: 'wait', retryAfterMs: 600000, preferredAccountIds: ['second'] })
+            .mockResolvedValueOnce({ state: 'allowed', validForMs: 15000 });
+        const inputs: Array<string | undefined> = [];
+        const providers: Array<string | undefined> = [];
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const client = {
+            sessionId: 'happy-session-1',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        vi.mocked(query).mockImplementation(({ prompt }) => Object.assign((async function* () {
+            const token = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+            providers.push(token);
+            yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+            for await (const _message of prompt as AsyncIterable<SDKUserMessage>) {
+                inputs.push(token);
+                yield assistant('msg-1');
+                yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: 'result-1' };
+                void handlers.get('switch')!();
+                return;
+            }
+        })(), { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>);
+        queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 }, cancelLessonReview: vi.fn(),
+            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
+        };
+
+        await claudeRemoteLauncher(session as unknown as Session);
+
+        expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', '{"account":"first"}', undefined, expect.any(AbortSignal), { startBudget: true });
+        expect(vi.mocked(requestSetupTokenStart).mock.calls.map(call => call[1])).toEqual(['{"account":"first"}', '{"account":"second"}']);
+        // Admission precedes the provider: none starts on the used-up token, and the same input runs once on the second.
+        expect(providers).toEqual(['sk-ant-oat01-second']);
+        expect(inputs).toEqual(['sk-ant-oat01-second']);
+        const messages = client.sendSessionEvent.mock.calls.map(([event]) => event.message);
+        expect(messages).toContain(START_BUDGET_SWITCHED_NOTICE);
+        expect(messages.some(message => String(message).includes('기다리고 있습니다'))).toBe(false);
+    });
+    it('restarts a running provider on the account with start budget for the next message, keeping that message', async () => {
+        vi.mocked(requestSetupTokenStart)
+            .mockResolvedValueOnce({ state: 'allowed', validForMs: 15000 })
+            .mockResolvedValueOnce({ state: 'wait', retryAfterMs: 600000, preferredAccountIds: ['second'] })
+            .mockResolvedValueOnce({ state: 'allowed', validForMs: 15000 });
+        const inputs: Array<[string | undefined, string]> = [];
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const client = {
+            sessionId: 'happy-session-1',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        const text = (message: SDKUserMessage) => JSON.stringify(message);
+        vi.mocked(query).mockImplementation(({ prompt }) => Object.assign((async function* () {
+            const token = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+            yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+            for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                inputs.push([token, text(message)]);
+                yield assistant(`msg-${inputs.length}`);
+                yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: `result-${inputs.length}` };
+                if (inputs.length === 1) queue.push('second message', { permissionMode: 'default', model: 'claude-sonnet-5' });
+                else { void handlers.get('switch')!(); return; }
+            }
+        })(), { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>);
+        queue.push('first message', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 }, cancelLessonReview: vi.fn(),
+            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
+        };
+
+        await claudeRemoteLauncher(session as unknown as Session);
+
+        expect(inputs.map(([token]) => token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
+        expect(inputs[1][1]).toContain('second message');
+        expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1);
     });
     it.each(['abort', 'switch'])('handles a budget-waiting input without execution on %s', async action => {
         vi.mocked(requestSetupTokenStart).mockImplementationOnce((_session, _binding, _request, signal) => new Promise(resolve => {

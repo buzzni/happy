@@ -51,6 +51,9 @@ describe('setup-token control routes (specs/claude-setup-token-account-selection
       expect(switcher.returnFromPersonal).toHaveBeenCalledWith('session-a','{}',organizationFailure)
       expect(await (await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}' })).json()).toEqual({ ok: true, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next' } })
       const finalRefusal = { observedAt: 10, reason: 'rate-limited', retryAt: null, windows: [] };
+      expect((await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}', startBudget: true })).status).toBe(200);
+      expect(switcher.rebind).toHaveBeenLastCalledWith('session-a', '{}', undefined, expect.any(AbortSignal), { startBudget: true });
+      expect((await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}', startBudget: false })).status).toBe(400);
       expect((await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}', observation: finalRefusal })).status).toBe(200);
       expect(switcher.rebind).toHaveBeenLastCalledWith('session-a', '{}', finalRefusal, expect.any(AbortSignal));
       const authFailure = { ...finalRefusal, reason: 'authentication-failed' };
