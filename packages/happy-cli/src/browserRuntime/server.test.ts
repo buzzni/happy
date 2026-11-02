@@ -195,6 +195,13 @@ describe('runtime HTTP server', () => {
         expect(html).toContain('abp-capability-request')
     })
 
+    it('renders the configured personal screen mode without letting the URL override it', async () => {
+        server = await startRuntimeServer({ api: makeFake().api, verifyToken, port: 0, health: () => ({}),
+            consoleScreenMode: 'native-window' })
+        const html = await (await fetch(`${server.url}/console?screenMode=vnc`)).text()
+        expect(html).toContain('NATIVE_SCREEN=true')
+    })
+
     it('tells the console which Studio origins may hand it a capability', async () => {
         server = await startRuntimeServer({ api: makeFake().api, verifyToken, port: 0, health: () => ({}), consoleHostOrigins: ['https://studio.example'] })
         const html = await (await fetch(`${server.url}/console`)).text()
