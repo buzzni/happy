@@ -632,6 +632,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
         ...(viewer ? { viewer } : {}),
         ...(existsSync(viewerAssetsDir) ? { viewerAssetsDir } : {}),
         consoleHostOrigins: config?.consoleHostOrigins ?? (process.env.ABP_CONSOLE_HOST_ORIGINS ?? '').split(',').filter(Boolean),
+        ...(config?.personalDesktop ? { consoleScreenMode: 'native-window' as const } : {}),
     })
     const admin: AdminServer = await startAdminServer({
         runtime, drivers,
