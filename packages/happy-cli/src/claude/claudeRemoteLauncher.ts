@@ -941,6 +941,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         request: (requestId, signal) => requestSetupTokenStart(sessionId, binding, requestId, signal),
                         signal: AbortSignal.any([controller.signal, generationEnded.signal]),
                         notify: () => session.client.sendSessionEvent({ type: 'message', message: '계정의 작업 시작 한도에 도달해 기다리고 있습니다. 여유가 생기면 이어서 실행합니다.' }),
+                        // Moved: this provider holds the old token, so the input stays pending for the next one. A due
+                        // transient retry (no message) has nothing to keep pending, so it waits on this account.
+                        ...(message ? { moveToPreferred: async () => !!await setupTokenSwitching?.switchForStartBudget() } : {}),
                     });
                     return admitted && !providerOptionsStale();
                 } catch (error) {

@@ -5,6 +5,8 @@ export type StartDecision = { state: 'allowed'; validForMs: number } | { state: 
 export async function waitForSetupTokenStart(deps: {
     request(requestId: string, signal: AbortSignal): Promise<StartDecision>;
     notify(): void;
+    /** Another account has start budget left: true when the session moved there, so this account's wait ends unadmitted. */
+    moveToPreferred?(): Promise<boolean>;
     signal: AbortSignal;
 }): Promise<boolean> {
     const requestId = randomUUID();
@@ -18,6 +20,8 @@ export async function waitForSetupTokenStart(deps: {
                 if (!Number.isFinite(decision.validForMs) || decision.validForMs <= performance.now() - sentAt) throw new Error('SETUP_TOKEN_START_EXPIRED');
                 return true;
             }
+            if (decision.preferredAccountIds.length && deps.moveToPreferred && await deps.moveToPreferred()) return false;
+            if (deps.signal.aborted) return false;
             if (!notified) { notified = true; deps.notify(); }
             if (deps.signal.aborted) return false;
             if (!Number.isFinite(decision.retryAfterMs) || decision.retryAfterMs <= 0) throw new Error('SETUP_TOKEN_START_INVALID_WAIT');

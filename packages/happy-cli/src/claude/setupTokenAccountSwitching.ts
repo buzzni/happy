@@ -22,7 +22,7 @@ export type SetupTokenAccountSwitchingDeps = {
   /** The binding record the running provider started with; the daemon books usage and switches against exactly it. */
   binding(): string | undefined
   report(sessionId: string, binding: string, observation: SetupTokenUsageObservation, signal?: AbortSignal): Promise<Outcome>
-  rebind(sessionId: string, binding: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string; retryAfterMs?: number }>
+  rebind(sessionId: string, binding: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal, options?: { startBudget: true }): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string; retryAfterMs?: number }>
   applyEnvironment(environment: Record<string, string>): void
   notify(message: string): void
   notifyState?(message: string, state: SetupTokenRotationState): void
@@ -49,6 +49,7 @@ export const APPLY_REQUIRED_NOTICE = 'This organization Claude account reached i
 export const FORBIDDEN_NOTICE = 'Saycode can no longer manage this session\'s organization Claude account, so it will not switch accounts. Start a new conversation to use the organization accounts assigned to you now.'
 /** Saycode specs/managed-account-session-continuation — the account this conversation ran on left the PC; it resumed on another. */
 export const RESUME_REBOUND_NOTICE = 'The organization Claude account this conversation used is no longer assigned to this PC, so it continues on another organization account.'
+export const START_BUDGET_SWITCHED_NOTICE = '계정의 작업 시작 한도에 도달해 여유가 있는 다른 조직 계정으로 옮겨 바로 실행합니다.'
 export const CONTINUE_PROMPT = 'The previous request stopped because the organization Claude account was unavailable. The session now uses another account — continue from where you stopped.'
 
 export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchingDeps) {
@@ -94,12 +95,18 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
     emit(FORBIDDEN_NOTICE, 'forbidden')
   }
 
-  async function switchOnce(sessionId: string, binding: string) {
+  /** `startBudget`: the bound account only ran out of start budget; a failed move changes nothing and the turn keeps waiting. */
+  async function switchOnce(sessionId: string, binding: string, startBudget = false) {
     const epoch = cancelEpoch, user = userEpoch
-    if (refused) retryDeadline ??= now() + retryWindowMs
-    if (deps.notifyState) tell('The session is switching organization Claude accounts.', 'switching')
-    const result = await deps.rebind(sessionId, binding, latestObservation, cancellation.signal).catch(() => ({ ok: false as const, reason: 'REQUEST_FAILED' }))
+    if (refused && !startBudget) retryDeadline ??= now() + retryWindowMs
+    if (deps.notifyState && !startBudget) tell('The session is switching organization Claude accounts.', 'switching')
+    const result = await (startBudget ? deps.rebind(sessionId, binding, undefined, cancellation.signal, { startBudget: true }) : deps.rebind(sessionId, binding, latestObservation, cancellation.signal))
+      .catch(() => ({ ok: false as const, reason: 'REQUEST_FAILED' }))
     if (disposed || paused || epoch !== cancelEpoch) return { switched: false, continueAfter: false }
+    if (!result.ok && startBudget) {
+      logger.debug(`[setup-token-switch] session ${sessionId} found no account with start budget: ${result.reason}`)
+      return { switched: false, continueAfter: false }
+    }
     if (!result.ok) {
       logger.debug(`[setup-token-switch] session ${sessionId} could not switch accounts: ${result.reason}`)
       studioBudget = result.reason === 'STUDIO_BUDGET'
@@ -128,17 +135,19 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
     const switchedAfterAuthenticationFailure = authenticationFailed
     deps.applyEnvironment(result.environment)
     tracker.reset()
-    switches++; told.clear(); lastReportAt = -Infinity; lastReportedExhausted = false
-    logger.debug(`[setup-token-switch] session ${sessionId} moved to another organization account (${switches} of ${MAX_SWITCHES})`)
-    const continueAfter = refused && user === userEpoch
+    // Start budget returns within minutes: those moves are not the used-up accounts the allowance guards against cycling through.
+    if (!startBudget) switches++
+    told.clear(); lastReportAt = -Infinity; lastReportedExhausted = false
+    logger.debug(`[setup-token-switch] session ${sessionId} moved to another organization account (${startBudget ? 'start budget' : `${switches} of ${MAX_SWITCHES}`})`)
+    const continueAfter = !startBudget && refused && user === userEpoch
     refused = false; authenticationFailed = false; lastFailure = null; latestObservation = undefined; retryDeadline = null; retryAfterMs = 0
-    emit(switchedAfterAuthenticationFailure ? 'This organization Claude account could not authenticate, so the session moved to another organization account.' : SWITCHED_NOTICE, 'switched')
+    emit(startBudget ? START_BUDGET_SWITCHED_NOTICE : switchedAfterAuthenticationFailure ? 'This organization Claude account could not authenticate, so the session moved to another organization account.' : SWITCHED_NOTICE, 'switched')
     return { switched: true, continueAfter }
   }
 
   /** One switch per session at a time: a turn boundary and a background attempt share it. */
-  function attempt(sessionId: string, binding: string) {
-    inFlight ??= switchOnce(sessionId, binding).finally(() => { inFlight = null })
+  function attempt(sessionId: string, binding: string, startBudget = false) {
+    inFlight ??= switchOnce(sessionId, binding, startBudget).finally(() => { inFlight = null })
     return inFlight
   }
 
@@ -235,6 +244,19 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
       })
     },
     canSwitch,
+    /**
+     * The bound account has no start budget left for the next turn while another has (Saycode
+     * specs/claude-setup-token-account-selection). True when the session now runs on that account; a switch already
+     * running answers instead.
+     */
+    switchForStartBudget(): Promise<boolean> {
+      const sessionId = deps.sessionId(), binding = deps.binding()
+      if (disposed || paused || stopped || !sessionId || !binding) return Promise.resolve(false)
+      return attempt(sessionId, binding, true).then(result => {
+        if (result.switched) endBackground()
+        return result.switched
+      })
+    },
     /** Why the latest attempt bound nothing (`NO_ACCOUNT`: none is left), or null. */
     lastFailure: () => lastFailure,
     /** The latest attempt bound nothing, yet asking again may: not when none is left or this binding cannot rotate. */
