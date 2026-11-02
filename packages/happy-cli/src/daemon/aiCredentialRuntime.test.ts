@@ -281,7 +281,7 @@ describe('AI credential machine runtime', () => {
     const livePath = '/home/operator/.codex/auth.json'
     const tempHome = '/tmp/happy-ai-credential-fixed'
 
-    function owner({ rotates = true }: { rotates?: boolean } = {}) {
+    function owner({ rotates = true, failsAfterRotating = false }: { rotates?: boolean; failsAfterRotating?: boolean } = {}) {
       const configured = setup({ now: () => NOW })
       const pool = codexMultiAuthBundle().accounts
       Object.assign(pool.accounts[0]!, { accessToken: jwt(NOW + DAY), expiresAt: NOW + DAY })
@@ -299,6 +299,7 @@ describe('AI credential machine runtime', () => {
             auth.tokens = { ...auth.tokens, refresh_token: `rotated-${auth.tokens.account_id}`, access_token: jwt(NOW + 10 * DAY) }
             configured.files.set(`${home}/auth.json`, JSON.stringify(auth))
           }
+          if (failsAfterRotating) throw new AiCredentialRuntimeError('COMMAND_TIMEOUT')
           return { stdout: '', stderr: '' }
         }
         return original(command, args, options)
@@ -331,6 +332,25 @@ describe('AI credential machine runtime', () => {
       expect(homes).toEqual(['/home/operator/.codex'])
       expect(JSON.parse(files.get(livePath)!).tokens.refresh_token).toBe('rotated-account-a')
       expect(JSON.parse(files.get(poolPath)!).accounts[0].refreshToken).toBe('rotated-account-a')
+    })
+
+    it('keeps a login Codex already rotated even when the driver then fails', async () => {
+      const { runtime, files } = owner({ failsAfterRotating: true })
+
+      const result = await runtime.refreshCodexOwner({ provider: 'codex', thresholdMs: 3 * DAY })
+
+      expect(JSON.parse(files.get(poolPath)!).accounts[0].refreshToken).toBe('rotated-account-a')
+      expect(result).toMatchObject({ refreshedAccountIds: ['account-a'], failedAccounts: [] })
+    })
+
+    it('reports the driver failure when the login did not rotate', async () => {
+      const { runtime, files } = owner({ rotates: false, failsAfterRotating: true })
+      const before = files.get(poolPath)
+
+      const result = await runtime.refreshCodexOwner({ provider: 'codex', thresholdMs: 3 * DAY })
+
+      expect(result).toMatchObject({ refreshedAccountIds: [], failedAccounts: [{ accountId: 'account-a', errorKind: 'COMMAND_TIMEOUT' }] })
+      expect(files.get(poolPath)).toBe(before)
     })
 
     it('reports an answered refresh that did not rotate the login and leaves the pool unchanged', async () => {
@@ -4048,6 +4068,40 @@ describe('third-party credential file compare-and-swap (aplus D4 C3)', () => {
     await configured.runtime.apply({ provider: 'codex', payload: JSON.stringify(codexMultiAuthBundle()) })
     const pool = JSON.parse(configured.files.get(poolPath)!)
     expect(pool.accounts.map((account: { refreshToken: string }) => account.refreshToken)).toContain('refreshed-by-forecast')
+  })
+
+  it('keeps the owner refresh token when its own owner-managed bundle is applied in replace mode', async () => {
+    const configured = setup()
+    const local = codexMultiAuthBundle().accounts
+    Object.assign(local.accounts[0]!, { accessToken: 'owner-access', refreshToken: 'owner-refresh', expiresAt: 200 })
+    configured.files.set(poolPath, JSON.stringify(local))
+    const incoming = codexMultiAuthBundle()
+    incoming.accounts.accounts = incoming.accounts.accounts.map((account, index) => Object.assign({ ...account },
+      { refreshToken: CODEX_OWNER_MANAGED_REFRESH_TOKEN, ...(index === 0 ? { accessToken: 'owner-access', expiresAt: 200 } : {}) }))
+
+    await configured.runtime.apply({ provider: 'codex', payload: JSON.stringify(incoming) }).catch(() => undefined)
+
+    const pool = JSON.parse(configured.files.get(poolPath)!)
+    expect(pool.accounts.find((account: { accountId: string }) => account.accountId === 'account-a')).toMatchObject({ refreshToken: 'owner-refresh' })
+  })
+
+  it('never hands one email-only account another email-only account login in replace mode', async () => {
+    const configured = setup()
+    const local = { version: 3, activeIndex: 0, accounts: [
+      { email: 'owner@example.com', accessToken: 'owner-access', refreshToken: 'owner-refresh', expiresAt: 500, addedAt: 1, lastUsed: 1 },
+    ] }
+    configured.files.set(poolPath, JSON.stringify(local))
+    const incoming = codexMultiAuthBundle()
+    incoming.accounts.accounts = [
+      { email: 'other@example.com', accessToken: 'other-access', refreshToken: CODEX_OWNER_MANAGED_REFRESH_TOKEN, expiresAt: 200, addedAt: 1, lastUsed: 1 } as never,
+      { email: 'Owner@Example.com', accessToken: 'owner-access', refreshToken: CODEX_OWNER_MANAGED_REFRESH_TOKEN, expiresAt: 500, addedAt: 1, lastUsed: 1 } as never,
+    ]
+
+    await configured.runtime.apply({ provider: 'codex', payload: JSON.stringify(incoming) }).catch(() => undefined)
+
+    const pool = JSON.parse(configured.files.get(poolPath)!)
+    expect(pool.accounts.find((account: { email: string }) => account.email === 'other@example.com')).toMatchObject({ refreshToken: CODEX_OWNER_MANAGED_REFRESH_TOKEN, accessToken: 'other-access' })
+    expect(pool.accounts.find((account: { email: string }) => account.email === 'Owner@Example.com')).toMatchObject({ refreshToken: 'owner-refresh' })
   })
 
   it('holds no credential lock while a network-bound verification runs', async () => {

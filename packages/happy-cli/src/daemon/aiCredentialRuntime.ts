@@ -80,6 +80,15 @@ function codexAccessTokenExpiry(token: unknown): number | undefined {
   } catch { return undefined }
 }
 
+/** Same account: by accountId when both have one, otherwise by email; two missing identities never match. */
+function sameCodexAccount(left: CodexMultiAuthAccount, right: CodexMultiAuthAccount): boolean {
+  if (typeof left.accountId === 'string' && left.accountId && typeof right.accountId === 'string' && right.accountId) {
+    return left.accountId === right.accountId
+  }
+  return typeof left.email === 'string' && !!left.email && typeof right.email === 'string'
+    && left.email.toLowerCase() === right.email.toLowerCase()
+}
+
 /** A pool entry's expiry: its recorded `expiresAt`, else its access token's own, else 0 (unknown sorts oldest). */
 function codexAccountExpiry(account: CodexMultiAuthAccount): number {
   return typeof account.expiresAt === 'number' ? account.expiresAt : codexAccessTokenExpiry(account.accessToken) ?? 0
@@ -639,24 +648,30 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         const inLiveHome = liveTokens?.account_id === accountId
         const home = inLiveHome ? dirname(livePath) : await deps.makeTempDir()
         const before = inLiveHome ? String(liveTokens!.refresh_token) : account.refreshToken
+        const failureKind = (error: unknown) => error instanceof AiCredentialRuntimeError ? error.kind : 'CODEX_OWNER_REFRESH_FAILED'
         try {
-          if (!inLiveHome) {
-            await deps.writeFile(join(home, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', OPENAI_API_KEY: null,
-              last_refresh: new Date(deps.now()).toISOString(), tokens: { id_token: account.idToken ?? account.accessToken,
-                access_token: account.accessToken, refresh_token: account.refreshToken, account_id: accountId } }), { mode: 0o600 })
-          }
-          await deps.execFile(process.execPath, ['-e', CODEX_LOGIN_REFRESH_DRIVER], {
-            environment: { ...deps.env, CODEX_HOME: home }, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS, terminateProcessTree: true })
+          let driverFailure: string | null = null
+          try {
+            if (!inLiveHome) {
+              await deps.writeFile(join(home, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', OPENAI_API_KEY: null,
+                last_refresh: new Date(deps.now()).toISOString(), tokens: { id_token: account.idToken ?? account.accessToken,
+                  access_token: account.accessToken, refresh_token: account.refreshToken, account_id: accountId } }), { mode: 0o600 })
+            }
+            await deps.execFile(process.execPath, ['-e', CODEX_LOGIN_REFRESH_DRIVER], {
+              environment: { ...deps.env, CODEX_HOME: home }, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS, terminateProcessTree: true })
+          } catch (error) { driverFailure = failureKind(error) }
+          // Codex may rotate the login and the driver still fail (a timeout after the answer). The rotated token is the
+          // only valid one left, so read the file in both outcomes before the temporary home is removed.
           const after = await readTokens(join(home, 'auth.json'))
           if (!after || typeof after.refresh_token !== 'string' || !after.refresh_token || after.refresh_token === before) {
-            failedAccounts.push({ accountId, errorKind: 'CODEX_OWNER_REFRESH_NOT_ROTATED' })
+            failedAccounts.push({ accountId, errorKind: driverFailure ?? 'CODEX_OWNER_REFRESH_NOT_ROTATED' })
           } else if (await adopt(accountId, [account.refreshToken, before], after)) {
             refreshedAccountIds.push(accountId)
           } else {
             failedAccounts.push({ accountId, errorKind: 'CODEX_OWNER_REFRESH_RACED' })
           }
         } catch (error) {
-          failedAccounts.push({ accountId, errorKind: error instanceof AiCredentialRuntimeError ? error.kind : 'CODEX_OWNER_REFRESH_FAILED' })
+          failedAccounts.push({ accountId, errorKind: failureKind(error) })
         } finally {
           if (!inLiveHome) await deps.rm(home, { recursive: true, force: true })
         }
@@ -1533,8 +1548,18 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       }
       return { provider: 'codex' as const, configured: true, accountCount: merged.accounts.length }
     }
+    // A replace must not take the refresh token from a machine that owns it either: an owner-managed delivery that is
+    // not strictly newer keeps this machine's own login for that account (specs/codex-oauth-refresh-owner).
+    const localRaw = await readOptionalText(deps, accountsPath)
+    let localAccounts: CodexMultiAuthAccount[] = []
+    try { if (localRaw) localAccounts = parseCodexMultiAuthBundle(JSON.stringify({ ...bundle, accounts: JSON.parse(localRaw) }))?.accounts.accounts ?? [] } catch { /* an unreadable pool owns nothing to keep */ }
+    const replacement = { ...bundle.accounts, accounts: bundle.accounts.accounts.map(incoming => {
+      const own = incoming.refreshToken === CODEX_OWNER_MANAGED_REFRESH_TOKEN && localAccounts.find(local => sameCodexAccount(local, incoming)
+        && local.refreshToken !== CODEX_OWNER_MANAGED_REFRESH_TOKEN && codexAccountExpiry(local) >= codexAccountExpiry(incoming))
+      return own ? { ...incoming, accessToken: own.accessToken, refreshToken: own.refreshToken, expiresAt: own.expiresAt } : incoming
+    }) }
     const applied = await replaceCodexMultiAuthFiles(deps, [
-      { path: accountsPath, content: JSON.stringify(bundle.accounts) },
+      { path: accountsPath, content: JSON.stringify(replacement) },
       { path: settingsPath, content: JSON.stringify(settings) },
     ], async (ownWrite) => {
       await deps.execFile('codex-multi-auth', ['forecast', '--live', '--json'], {
