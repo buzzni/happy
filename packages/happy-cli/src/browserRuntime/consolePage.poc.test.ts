@@ -165,7 +165,7 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
             const first = token(`native-${lang}`, Date.now() + 600_000)
             const target = await harness.openFrontTab(`${origin}/console?native=1&lang=${lang}#abp-cap=${first}&abp-exp=${Date.now() + 600_000}`)
             try {
-                await eventually(() => ops.some(entry => entry.op === 'getTask'), Boolean)
+                expect(await eventually(() => harness.evaluate(target, `document.getElementById('detailId').textContent`), id => id === 'task-1')).toBe('task-1')
                 const state = JSON.parse(await harness.evaluate(target, `JSON.stringify({
                     title: document.querySelector('#screenEmpty b').textContent,
                     body: document.querySelector('#screenEmpty span').textContent,
