@@ -166,6 +166,8 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
             const target = await harness.openFrontTab(`${origin}/console?native=1&lang=${lang}#abp-cap=${first}&abp-exp=${Date.now() + 600_000}`)
             try {
                 await eventually(() => ops.some(entry => entry.op === 'getTask'), Boolean)
+                // The getTask op is logged before its answer renders the task controls.
+                await eventually(() => harness.evaluate(target, `!document.getElementById('detail').hidden`), Boolean)
                 const state = JSON.parse(await harness.evaluate(target, `JSON.stringify({
                     title: document.querySelector('#screenEmpty b').textContent,
                     body: document.querySelector('#screenEmpty span').textContent,
@@ -184,6 +186,8 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
                 expect(await harness.evaluate(target, `document.getElementById('screen').getAttribute('src')`)).toBeNull()
             } finally { await harness.closeTarget(target) }
         }
+        // The next test reads the first listTasks op it finds.
+        ops.length = 0
     })
 
     it('uses the fragment capability, strips it, stores nothing, and lists tasks', async () => {
