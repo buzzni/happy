@@ -62,9 +62,11 @@ export const DaemonRotationRequestBodySchema = z.discriminatedUnion('action', [
   z.object({ ...requestCommon, action: z.literal('commit'), path: z.literal(DAEMON_ROTATION_PATHS.commit), ...claim, bindingDigest: hash }).strict(),
   z.object({ ...requestCommon, action: z.literal('start'), path: z.literal(DAEMON_ROTATION_PATHS.start), ...claim, requestId: id }).strict(),
   z.object({ ...requestCommon, action: z.literal('usage'), path: z.literal(DAEMON_ROTATION_PATHS.usage), ...claim, observation: RotationObservationSchema.optional(), activity: SetupTokenActivitySchema.optional() }).strict(),
-  z.object({ ...requestCommon, action: z.literal('rebind'), path: z.literal(DAEMON_ROTATION_PATHS.rebind), ...claim, observation: RotationObservationSchema }).strict(),
+  // A rebind carries the usage evidence that used the account up, or asks for an account with start budget left.
+  z.object({ ...requestCommon, action: z.literal('rebind'), path: z.literal(DAEMON_ROTATION_PATHS.rebind), ...claim, observation: RotationObservationSchema.optional(), startBudget: z.literal(true).optional() }).strict(),
   z.object({ ...requestCommon, action: z.literal('operation'), path: z.literal(DAEMON_ROTATION_PATHS.operation), targetOperationId: id }).strict(),
-]).refine(lifetime).refine(v => v.action !== 'usage' || !!v.observation !== !!v.activity);
+]).refine(lifetime).refine(v => v.action !== 'usage' || !!v.observation !== !!v.activity)
+  .refine(v => v.action !== 'rebind' || !!v.observation !== !!v.startBudget);
 export type DaemonRotationRequestBody = z.infer<typeof DaemonRotationRequestBodySchema>;
 
 export const SessionExecutionTicketBodySchema = z.object({
