@@ -273,6 +273,88 @@ describe('AI credential machine runtime', () => {
     expect(configured.files.get('/home/operator/.codex/multi-auth/openai-codex-accounts.json')).toBe(JSON.stringify(current.accounts))
   })
 
+  describe('owner refresh of a refresh-owner Codex bundle', () => {
+    const DAY = 86_400_000
+    const NOW = 1_800_000_000_000
+    const jwt = (expMs: number) => `header.${Buffer.from(JSON.stringify({ sub: 'user', exp: Math.floor(expMs / 1000) })).toString('base64url')}.signature`
+    const poolPath = '/home/operator/.codex/multi-auth/openai-codex-accounts.json'
+    const livePath = '/home/operator/.codex/auth.json'
+    const tempHome = '/tmp/happy-ai-credential-fixed'
+
+    function owner({ rotates = true }: { rotates?: boolean } = {}) {
+      const configured = setup({ now: () => NOW })
+      const pool = codexMultiAuthBundle().accounts
+      Object.assign(pool.accounts[0]!, { accessToken: jwt(NOW + DAY), expiresAt: NOW + DAY })
+      Object.assign(pool.accounts[1]!, { accessToken: jwt(NOW + 9 * DAY), expiresAt: NOW + 9 * DAY })
+      Object.assign(pool.accounts[2]!, { accessToken: jwt(NOW + DAY), expiresAt: NOW + DAY, refreshToken: CODEX_OWNER_MANAGED_REFRESH_TOKEN })
+      configured.files.set(poolPath, JSON.stringify(pool))
+      const homes: string[] = []
+      const original = configured.execFile.getMockImplementation()!
+      configured.execFile.mockImplementation(async (command, args, options) => {
+        if (command === process.execPath && args[0] === '-e') {
+          const home = options!.environment!.CODEX_HOME!
+          homes.push(home)
+          const auth = JSON.parse(configured.files.get(`${home}/auth.json`)!)
+          if (rotates) {
+            auth.tokens = { ...auth.tokens, refresh_token: `rotated-${auth.tokens.account_id}`, access_token: jwt(NOW + 10 * DAY) }
+            configured.files.set(`${home}/auth.json`, JSON.stringify(auth))
+          }
+          return { stdout: '', stderr: '' }
+        }
+        return original(command, args, options)
+      })
+      return { ...configured, pool, homes }
+    }
+
+    it('rotates only an expiring owned account through Codex in a temporary home and keeps the refresh token on this machine', async () => {
+      const { runtime, files, homes } = owner()
+
+      const result = await runtime.refreshCodexOwner({ provider: 'codex', thresholdMs: 3 * DAY })
+
+      expect(homes).toEqual([tempHome])
+      const pool = JSON.parse(files.get(poolPath)!)
+      expect(pool.accounts[0]).toMatchObject({ accountId: 'account-a', refreshToken: 'rotated-account-a', accessToken: jwt(NOW + 10 * DAY), expiresAt: Math.floor((NOW + 10 * DAY) / 1000) * 1000 })
+      expect(pool.accounts[1].refreshToken).toBe('refresh-b')
+      expect(result).toMatchObject({ provider: 'codex', refreshedAccountIds: ['account-a'], failedAccounts: [] })
+      const delivered = JSON.parse(result.payload)
+      expect(delivered.accounts.accounts[0]).toMatchObject({ accessToken: jwt(NOW + 10 * DAY), refreshToken: CODEX_OWNER_MANAGED_REFRESH_TOKEN })
+      expect(result.payload).not.toContain('rotated-account-a')
+      expect([...files.keys()].some(path => path.startsWith(`${tempHome}/`))).toBe(false)
+    })
+
+    it('rotates the active account in the live Codex home so running sessions read the new login', async () => {
+      const { runtime, files, homes, pool } = owner()
+      files.set(livePath, JSON.stringify({ auth_mode: 'chatgpt', tokens: { account_id: 'account-a', access_token: pool.accounts[0]!.accessToken, refresh_token: 'refresh-a', id_token: 'id' } }))
+
+      await runtime.refreshCodexOwner({ provider: 'codex', thresholdMs: 3 * DAY })
+
+      expect(homes).toEqual(['/home/operator/.codex'])
+      expect(JSON.parse(files.get(livePath)!).tokens.refresh_token).toBe('rotated-account-a')
+      expect(JSON.parse(files.get(poolPath)!).accounts[0].refreshToken).toBe('rotated-account-a')
+    })
+
+    it('reports an answered refresh that did not rotate the login and leaves the pool unchanged', async () => {
+      const { runtime, files } = owner({ rotates: false })
+      const before = files.get(poolPath)
+
+      const result = await runtime.refreshCodexOwner({ provider: 'codex', thresholdMs: 3 * DAY })
+
+      expect(result).toMatchObject({ refreshedAccountIds: [], failedAccounts: [{ accountId: 'account-a', errorKind: 'CODEX_OWNER_REFRESH_NOT_ROTATED' }] })
+      expect(files.get(poolPath)).toBe(before)
+    })
+
+    it('first adopts a newer live login into the pool so a later switch cannot restore the stale copy', async () => {
+      const { runtime, files, homes } = owner()
+      files.set(livePath, JSON.stringify({ auth_mode: 'chatgpt', tokens: { account_id: 'account-a', access_token: jwt(NOW + 9 * DAY), refresh_token: 'live-newer', id_token: 'id' } }))
+
+      const result = await runtime.refreshCodexOwner({ provider: 'codex', thresholdMs: 3 * DAY })
+
+      expect(homes).toEqual([])
+      expect(JSON.parse(files.get(poolPath)!).accounts[0]).toMatchObject({ refreshToken: 'live-newer', accessToken: jwt(NOW + 9 * DAY) })
+      expect(result.refreshedAccountIds).toEqual([])
+    })
+  })
+
   it('advertises refresh-owner Codex capture', async () => {
     expect(await setup().runtime.capabilities('m')).toMatchObject({ codexRefreshOwnerVersion: 1 })
   })
