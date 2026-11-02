@@ -9,6 +9,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { NativeBrokerRequestOptions } from '@/browserRuntime/brokerGrantSource'
+import { openServerEnvelope } from '@/browserRuntime/auth'
 import { personalRuntimePaths } from '@/browserRuntime/personalDesktopRuntime'
 import { parseRuntimeConfig } from '@/browserRuntime/runtimeConfig'
 import { projectPath } from '@/projectPath'
@@ -21,6 +22,8 @@ const RESTART_DELAYS_MS = [1_000, 5_000, 30_000, 60_000, 120_000]
 /** A run this long counts as healthy and resets the restart backoff. */
 const HEALTHY_RUN_MS = 5 * 60_000
 const STOP_TIMEOUT_MS = 15_000
+/** Same bound as browser credentials; this schedules dispatch, never relaxes broker admission. */
+const MAX_NATIVE_CLOCK_WAIT_MS = 30_000
 
 export interface PersonalBrowserRuntime {
     /** Session environment: where the runtime and its broker are. */
@@ -79,15 +82,18 @@ export function readPersonalBrowserRuntime(options: PersonalBrowserRuntimeOption
         return undefined
     }
     const fetchImpl = options.fetchImpl ?? fetch
-    const issue: NativeBrokerRequestOptions['issue'] = async (command) => {
+    const issue: NativeBrokerRequestOptions['issue'] = async (command, signal) => {
+        signal?.throwIfAborted()
         const url = new URL(`/api/machines/${encodeURIComponent(options.machineId)}/agent-browser/native-command`, studioOrigin)
         const body = JSON.stringify(command)
         const send = async (proof?: string): Promise<Response> => {
             try {
-                return await fetchImpl(url, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10_000),
+                signal?.throwIfAborted()
+                const timeout = AbortSignal.timeout(10_000)
+                return await fetchImpl(url, { method: 'POST', redirect: 'error', signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
                     headers: { Authorization: `Bearer ${options.token()}`, 'Content-Type': 'application/json',
                         ...(proof ? { 'X-Saycode-Browser-Device-Proof': proof } : {}) }, body })
-            } catch { throw new Error('NATIVE_AUTHORIZATION_UNAVAILABLE') }
+            } catch { signal?.throwIfAborted(); throw new Error('NATIVE_AUTHORIZATION_UNAVAILABLE') }
         }
         // A personal bearer remains valid even for a company workspace. Only an explicit
         // authorization refusal tries machine/device authentication; no command was issued yet.
@@ -101,6 +107,24 @@ export function readPersonalBrowserRuntime(options: PersonalBrowserRuntimeOption
         if (response.status !== 200) throw new Error(response.status === 403 || response.status === 401 ? 'NATIVE_AUTHORIZATION_DENIED' : 'NATIVE_AUTHORIZATION_UNAVAILABLE')
         const result = await response.json().catch(() => undefined) as { token?: unknown; expiresAtMs?: unknown } | undefined
         if (typeof result?.token !== 'string' || typeof result.expiresAtMs !== 'number') throw new Error('NATIVE_AUTHORIZATION_UNAVAILABLE')
+        let claims: { issuedAtMs?: unknown; expiresAtMs?: unknown }
+        try { claims = openServerEnvelope(result.token.split('.'), 'abp-native-command', config.trustedIssuers) }
+        catch { throw new Error('NATIVE_AUTHORIZATION_UNAVAILABLE') }
+        if (!claims || typeof claims.issuedAtMs !== 'number' || !Number.isSafeInteger(claims.issuedAtMs) || claims.issuedAtMs < 0 ||
+            claims.expiresAtMs !== result.expiresAtMs) throw new Error('NATIVE_AUTHORIZATION_UNAVAILABLE')
+        const now = options.now ?? Date.now
+        const waitMs = claims.issuedAtMs - now()
+        if (waitMs > MAX_NATIVE_CLOCK_WAIT_MS) throw new Error('NATIVE_AUTHORIZATION_UNAVAILABLE')
+        // An issuer a few milliseconds ahead otherwise produces an immediate local 401.
+        // Wait before the first dispatch: the signed bytes and one-use authorization stay unchanged.
+        signal?.throwIfAborted()
+        if (waitMs > 0) await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(() => { signal?.removeEventListener('abort', cancel); resolve() }, waitMs + 1)
+            const cancel = () => { clearTimeout(timer); reject(signal?.reason) }
+            signal?.addEventListener('abort', cancel, { once: true })
+        })
+        signal?.throwIfAborted()
+        if (claims.issuedAtMs > now()) throw new Error('NATIVE_AUTHORIZATION_UNAVAILABLE')
         return { token: result.token, expiresAtMs: result.expiresAtMs }
     }
     const runtimeEnv: Record<string, string> = {}

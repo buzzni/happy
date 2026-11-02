@@ -40,14 +40,15 @@ export interface NativeBrokerRequestOptions {
     machineId: string
     workspaceId: string
     /** Authenticated Core issuer. Never derived from a session-user attestation. */
-    issue(command: { generation: string; method: 'GET' | 'POST'; path: string; body: string }): Promise<{ token: string; expiresAtMs: number }>
+    issue(command: { generation: string; method: 'GET' | 'POST'; path: string; body: string }, signal?: AbortSignal): Promise<{ token: string; expiresAtMs: number }>
 }
 
 /** Each attempt gets a new one-use signature. No token is cached or replayed,
  * and no uncertain mutation is retried by this transport. */
-export function createNativeBrokerRequest(options: NativeBrokerRequestOptions, transport: typeof brokerRequest = brokerRequest): typeof brokerRequest {
+export function createNativeBrokerRequest(options: NativeBrokerRequestOptions, transport: typeof brokerRequest = brokerRequest, signal?: AbortSignal): typeof brokerRequest {
     const { socketPath, machineId, workspaceId, issue } = options
     return async (socket, method, path, headers, body) => {
+        signal?.throwIfAborted()
         if (socket !== socketPath || Object.keys(headers).length) throw new Error('NATIVE_SCOPE_CHANGED')
         // Snapshot before the asynchronous challenge/issuer calls; the bytes that
         // are signed must also be the bytes eventually sent to the service.
@@ -60,7 +61,9 @@ export function createNativeBrokerRequest(options: NativeBrokerRequestOptions, t
             Object.keys(challenge).sort().join(',') !== 'generation,machineId,schemaVersion,workspaceId' ||
             challenge.schemaVersion !== 1 || challenge.machineId !== machineId || challenge.workspaceId !== workspaceId ||
             typeof challenge.generation !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(challenge.generation)) throw new Error('NATIVE_SCOPE_CHANGED')
-        const signed = await issue({ generation: challenge.generation, method, path, body: raw })
+        signal?.throwIfAborted()
+        const signed = await issue({ generation: challenge.generation, method, path, body: raw }, signal)
+        signal?.throwIfAborted()
         if (!signed || typeof signed.token !== 'string' || !signed.token || signed.token.length > 8192 ||
             !Number.isSafeInteger(signed.expiresAtMs) || signed.expiresAtMs <= Date.now()) throw new Error('NATIVE_AUTHORIZATION_UNAVAILABLE')
         return transport(socketPath, method, path, { 'x-abp-native-command': signed.token }, immutableBody)

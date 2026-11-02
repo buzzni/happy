@@ -4,6 +4,7 @@ import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { afterEach, describe, expect, it } from 'vitest'
 import { decodeBase64, decrypt } from '@/api/encryption'
 import { AttentionOutbox } from '@/browserRuntime/attention'
@@ -12,7 +13,7 @@ import type { AttentionEvent } from '@/browserRuntime/contracts'
 import { TaskStore, type StoredTask } from '@/browserRuntime/taskStore'
 import { readDaemonState, writeDaemonState } from '@/persistence'
 import { BrowserAttentionWatcher, createAttentionCursorStore } from './browserAttentionWatcher'
-import { createHeldBrowserAttentions, deliverBrowserAttention, findBrowserAttentionSession, pollBrowserAttention, startBrowserAttentionWatcher } from './browserAttentionDelivery'
+import { createHeldBrowserAttentions, deliverBrowserAttention, findBrowserAttentionSession, pollBrowserAttention, pollNativeBrowserAttention, startBrowserAttentionWatcher } from './browserAttentionDelivery'
 import { mergeTrackedSessionWebhook } from './persistedSessionHydration'
 import type { TrackedSession } from './types'
 
@@ -341,6 +342,33 @@ describe('attention delivery over the existing encrypted server path', () => {
         expect(seen.map(entry => entry.url)).toEqual(['/v1/native/challenge', '/v1/attention?afterSeq=0&waitMs=30000'])
         expect(seen[1].command).toBe('signed-once')
         expect(seen.every(entry => entry.daemonToken === undefined)).toBe(true)
+    })
+
+    it('cancels a personal attention poll while its signed command is still waiting', async () => {
+        const dir = await tempDir(); const socketPath = join(dir, 'native-cancel.sock')
+        const seen: string[] = []
+        const server = createServer((req, res) => {
+            seen.push(req.url!)
+            res.end(JSON.stringify({ ok: true, result: { schemaVersion: 1, machineId: 'machine-1', workspaceId: 'personal:u', generation: 'G'.repeat(43) } }))
+        })
+        await new Promise<void>(resolve => server.listen(socketPath, resolve))
+        cleanup.push(() => new Promise<void>(resolve => { server.closeAllConnections(); server.close(() => resolve()) }))
+        const lifetime = new AbortController(), controller = new AbortController()
+        let arrived!: () => void
+        const issuing = new Promise<void>(resolve => { arrived = resolve })
+        const native = { socketPath, machineId: 'machine-1', workspaceId: 'personal:u',
+            issue: async (_command: unknown, signal?: AbortSignal) => {
+                arrived()
+                await delay(30_000, undefined, { signal: signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal })
+                return { token: 'signed-once', expiresAtMs: Date.now() + 60_000 }
+            } }
+        const pending = pollNativeBrowserAttention(native, 0, controller.signal).then(() => false, () => true)
+        try {
+            await issuing
+            controller.abort()
+            expect(await Promise.race([pending, delay(1_000, false, { signal: lifetime.signal })])).toBe(true)
+            expect(seen).toEqual(['/v1/native/challenge'])
+        } finally { lifetime.abort(); await pending }
     })
 
     it('rejects oversized broker replies and cancels a hanging poll promptly', async () => {

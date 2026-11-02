@@ -1,11 +1,21 @@
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import { describe, expect, it, vi } from 'vitest'
-import { generateKeyPairSync } from 'node:crypto'
+import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { personalRuntimePaths } from '@/browserRuntime/personalDesktopRuntime'
 import { readPersonalBrowserRuntime, watchPersonalBrowserRuntime } from './personalBrowserRuntime'
 
-const publicKeyPem = generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'pem' }).toString()
+const issuer = generateKeyPairSync('ed25519')
+const publicKeyPem = issuer.publicKey.export({ type: 'spki', format: 'pem' }).toString()
+function signedCommand(expiresAtMs: number, issuedAtMs = 0, signingKey = issuer.privateKey) {
+    const header = Buffer.from(JSON.stringify({ alg: 'EdDSA', kid: 'k', typ: 'abp-native-command' })).toString('base64url')
+    const payload = Buffer.from(JSON.stringify({ kind: 'native-command', iss: 'saycode-server',
+        aud: 'machine-1', machineId: 'machine-1', workspaceId: 'personal:user-1', principalId: 'user-1',
+        generation: 'g'.repeat(43), requestId: randomUUID(), method: 'POST', path: '/v1/sessions/register',
+        bodySha256: createHash('sha256').update('{}').digest('hex'), issuedAtMs, expiresAtMs })).toString('base64url')
+    const content = `abp2.${header}.${payload}`
+    return `${content}.${sign(null, Buffer.from(content), signingKey).toString('base64url')}`
+}
 const env = { HOME: '/Users/u', TMPDIR: '/tmp/u', HAPPY_SERVER_URL: 'https://s', HAPPY_ACCESS_KEY: 'secret', ANTHROPIC_API_KEY: 'secret' }
 const paths = personalRuntimePaths('darwin', env, '/Users/u')
 const config = (overrides: Record<string, unknown> = {}) => JSON.stringify({ schemaVersion: 2, authMode: 'production', machineId: 'machine-1', workspaceId: 'personal:user-1',
@@ -20,7 +30,7 @@ const base = (overrides: Record<string, unknown> = {}) => ({ platform: 'darwin' 
 
 describe('personal browser runtime (daemon side)', () => {
     it('sends a device proof for organization runtime requests and never falls back without approval', async () => {
-        const proof = vi.fn(async () => 'signed-proof'), fetchImpl = vi.fn(async () => new Response(JSON.stringify({ token: 'native', expiresAtMs: 1000 })))
+        const proof = vi.fn(async () => 'signed-proof'), fetchImpl = vi.fn(async () => new Response(JSON.stringify({ token: signedCommand(1000), expiresAtMs: 1000 })))
         fetchImpl.mockResolvedValueOnce(new Response('{}', { status: 401 }))
         const runtime = readPersonalBrowserRuntime(base({ readConfig: () => config({ workspaceId: 'co' }), deviceProof: proof, fetchImpl }))!
         const command = { generation: 'g', method: 'POST' as const, path: '/v1/sessions/register', body: '{}' }
@@ -35,9 +45,10 @@ describe('personal browser runtime (daemon side)', () => {
 
     it('preserves personal bearer authentication even in an organization workspace without a device pin', async () => {
         const proof = vi.fn(async () => { throw new Error('NATIVE_DEVICE_APPROVAL_REQUIRED') })
-        const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ token: 'native', expiresAtMs: 1000 })))
+        const token = signedCommand(1000)
+        const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ token, expiresAtMs: 1000 })))
         const runtime = readPersonalBrowserRuntime(base({ readConfig: () => config({ workspaceId: 'co' }), deviceProof: proof, fetchImpl }))!
-        await expect(runtime.native.issue({ generation: 'g', method: 'POST', path: '/v1/sessions/register', body: '{}' })).resolves.toEqual({ token: 'native', expiresAtMs: 1000 })
+        await expect(runtime.native.issue({ generation: 'g', method: 'POST', path: '/v1/sessions/register', body: '{}' })).resolves.toEqual({ token, expiresAtMs: 1000 })
         expect(proof).not.toHaveBeenCalled()
         expect(fetchImpl).toHaveBeenCalledTimes(1)
     })
@@ -61,10 +72,11 @@ describe('personal browser runtime (daemon side)', () => {
     })
 
     it('has Studio sign each exact command with the user token and reports a refusal as denied', async () => {
-        const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ token: 'signed', expiresAtMs: 123 }), { status: 200 }))
+        const token = signedCommand(123)
+        const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ token, expiresAtMs: 123 }), { status: 200 }))
         const runtime = readPersonalBrowserRuntime(base({ fetchImpl }))!
         const command = { generation: 'g'.repeat(43), method: 'POST' as const, path: '/v1/sessions/register', body: '{"schemaVersion":1}' }
-        expect(await runtime.native.issue(command)).toEqual({ token: 'signed', expiresAtMs: 123 })
+        expect(await runtime.native.issue(command)).toEqual({ token, expiresAtMs: 123 })
         const [url, init] = fetchImpl.mock.calls[0] as unknown as [URL, RequestInit]
         expect(url.toString()).toBe('https://studio.example/api/machines/machine-1/agent-browser/native-command')
         expect(init).toMatchObject({ method: 'POST', redirect: 'error', headers: { Authorization: 'Bearer user-token' } })
@@ -73,6 +85,77 @@ describe('personal browser runtime (daemon side)', () => {
         await expect(denied.native.issue(command)).rejects.toThrow('NATIVE_AUTHORIZATION_DENIED')
         const malformed = readPersonalBrowserRuntime(base({ fetchImpl: async () => new Response('{"token":1}', { status: 200 }) }))!
         await expect(malformed.native.issue(command)).rejects.toThrow('NATIVE_AUTHORIZATION_UNAVAILABLE')
+    })
+
+    it.each([17, 30000])('waits for a trusted native command with an issuer clock %ims ahead', async aheadMs => {
+        vi.useFakeTimers()
+        try {
+            vi.setSystemTime(100000)
+            const token = signedCommand(160000, 100000 + aheadMs)
+            const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ token, expiresAtMs: 160000 })))
+            const runtime = readPersonalBrowserRuntime(base({ fetchImpl }))!
+            const ready = vi.fn()
+            const pending = runtime.native.issue({ generation: 'g', method: 'GET', path: '/v1/sessions', body: '' }).then(ready)
+            await vi.advanceTimersByTimeAsync(0)
+            expect(ready).not.toHaveBeenCalled()
+            await vi.advanceTimersByTimeAsync(aheadMs - 1)
+            expect(ready).not.toHaveBeenCalled()
+            await vi.advanceTimersByTimeAsync(2)
+            await pending
+            expect(ready).toHaveBeenCalledWith({ token, expiresAtMs: 160000 })
+            expect(fetchImpl).toHaveBeenCalledTimes(1)
+        } finally { vi.useRealTimers() }
+    })
+
+    it('refuses untrusted commands and clock differences beyond the bounded wait', async () => {
+        const command = { generation: 'g', method: 'GET' as const, path: '/v1/sessions', body: '' }
+        for (const token of [signedCommand(160000, 130001), signedCommand(160000, -1), signedCommand(160000, 100000.5),
+            signedCommand(160001, 100000), signedCommand(160000, 100017, generateKeyPairSync('ed25519').privateKey), 'malformed']) {
+            const runtime = readPersonalBrowserRuntime(base({ now: () => 100000,
+                fetchImpl: async () => new Response(JSON.stringify({ token, expiresAtMs: 160000 })) }))!
+            await expect(runtime.native.issue(command)).rejects.toThrow('NATIVE_AUTHORIZATION_UNAVAILABLE')
+        }
+    })
+
+    it('refuses dispatch when the local clock moves backwards during the bounded wait', async () => {
+        vi.useFakeTimers()
+        try {
+            vi.setSystemTime(100000)
+            const token = signedCommand(160000, 100017)
+            const runtime = readPersonalBrowserRuntime(base({
+                fetchImpl: async () => new Response(JSON.stringify({ token, expiresAtMs: 160000 })) }))!
+            const pending = expect(runtime.native.issue({ generation: 'g', method: 'GET', path: '/v1/sessions', body: '' }))
+                .rejects.toThrow('NATIVE_AUTHORIZATION_UNAVAILABLE')
+            await vi.advanceTimersByTimeAsync(0)
+            vi.setSystemTime(99900)
+            await vi.advanceTimersByTimeAsync(18)
+            await pending
+        } finally { vi.useRealTimers() }
+    })
+
+    it.each(['issuance', 'clock-wait'])('cancels a native command promptly during %s', async stage => {
+        vi.useFakeTimers()
+        try {
+            vi.setSystemTime(100000)
+            const token = signedCommand(160000, 130000)
+            const fetchImpl = vi.fn(async (_url: unknown, init?: RequestInit) => {
+                if (stage === 'issuance') await new Promise<void>((_resolve, reject) => {
+                    init?.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true })
+                })
+                return new Response(JSON.stringify({ token, expiresAtMs: 160000 }))
+            })
+            const runtime = readPersonalBrowserRuntime(base({ fetchImpl }))!
+            const controller = new AbortController()
+            let rejected = false
+            const pending = runtime.native.issue({ generation: 'g', method: 'GET', path: '/v1/sessions', body: '' }, controller.signal)
+                .catch(() => { rejected = true })
+            await vi.advanceTimersByTimeAsync(0)
+            controller.abort()
+            await vi.advanceTimersByTimeAsync(1)
+            expect(rejected).toBe(true)
+            await pending
+            expect(fetchImpl).toHaveBeenCalledTimes(1)
+        } finally { vi.useRealTimers() }
     })
 
     it('starts the runtime with its own two variables and OS basics only, never daemon credentials', () => {
