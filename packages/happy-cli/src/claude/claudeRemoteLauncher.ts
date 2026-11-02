@@ -618,9 +618,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             if (personalFallback && initialPersonalAuthority) session.client.setPersonalClaudeFallback({ companyId: initialPersonalAuthority.companyId,
                 machineId: initialPersonalAuthority.machineId, generation: personalFallback.generation(), personal: personalFallback.identity() });
             session.client.setClaudeRuntimeAccount(process.env[SETUP_TOKEN_BINDING_ENV]);
-            // The level signal is per provider process. Until its first full
-            // snapshot, older CLIs still use this generation's transcript.
-            publishBackgroundTasks({ startedAt: Date.now(), available: true, tasks: null });
+            // The level signal is per provider process and comes only when its set
+            // changes, but `init` opens every turn: a list naming live work is kept,
+            // or that work would vanish until it ends (`finally` drops it with the
+            // process). Until its first full snapshot, older CLIs still use this
+            // generation's transcript.
+            if (!backgroundTasks?.tasks?.length) publishBackgroundTasks({ startedAt: Date.now(), available: true, tasks: null });
         }
         if (message.type === 'system' && message.subtype === 'background_tasks_changed') {
             publishBackgroundTasks({
