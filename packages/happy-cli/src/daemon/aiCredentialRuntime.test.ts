@@ -7,6 +7,7 @@ import { homedir } from 'node:os'
 import { describe, expect, it, vi } from 'vitest'
 import {
   AiCredentialRuntimeError,
+  CODEX_OWNER_MANAGED_REFRESH_TOKEN,
   createAiCredentialRuntime,
   runAiCredentialCommand,
   selectLeastRemainingCodexAccounts,
@@ -255,6 +256,25 @@ describe('AI credential machine runtime', () => {
     expect(configured.writeFile).not.toHaveBeenCalled()
     expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining('could not read auth.json'))
     expect(warn.mock.calls.flat().join(' ')).not.toContain('fixture-secret')
+  })
+
+  it('keeps every Codex refresh token on the owner machine when capturing a refresh-owner bundle', async () => {
+    const current = codexMultiAuthBundle()
+    const configured = setup()
+    configured.files.set('/home/operator/.codex/multi-auth/openai-codex-accounts.json', JSON.stringify(current.accounts))
+
+    const { payload } = await configured.runtime.capture({ provider: 'codex', refreshOwner: true })
+
+    const captured = JSON.parse(payload)
+    expect(captured.accounts.accounts.map((account: { refreshToken: string }) => account.refreshToken))
+      .toEqual([CODEX_OWNER_MANAGED_REFRESH_TOKEN, CODEX_OWNER_MANAGED_REFRESH_TOKEN, CODEX_OWNER_MANAGED_REFRESH_TOKEN])
+    expect(captured.accounts.accounts.map((account: { accessToken: string }) => account.accessToken)).toEqual(['access-a', 'access-b', 'access-c'])
+    for (const secret of ['refresh-a', 'refresh-b', 'refresh-c']) expect(payload).not.toContain(secret)
+    expect(configured.files.get('/home/operator/.codex/multi-auth/openai-codex-accounts.json')).toBe(JSON.stringify(current.accounts))
+  })
+
+  it('advertises refresh-owner Codex capture', async () => {
+    expect(await setup().runtime.capabilities('m')).toMatchObject({ codexRefreshOwnerVersion: 1 })
   })
 
   it('captures the working live Codex login into a recovery snapshot without changing the source files', async () => {

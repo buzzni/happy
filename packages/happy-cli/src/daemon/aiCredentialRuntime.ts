@@ -64,6 +64,24 @@ function isReadableCodexMultiAuthBundleVersion(version: string): boolean {
   return READABLE_HISTORICAL_CODEX_MULTI_AUTH_BUNDLE_VERSIONS.has(version) || isSupportedCodexMultiAuthVersion(version)
 }
 const CODEX_MULTI_AUTH_THRESHOLD = 5
+/**
+ * Stands in for every refresh token of a refresh-owner bundle (specs/codex-oauth-refresh-owner): only the
+ * source machine may rotate a ChatGPT refresh token, since a copy rotated elsewhere fails the owner with
+ * "refresh token was already used". Not a secret; long enough to pass codex-multi-auth's non-empty schema,
+ * which silently drops accounts with an empty one, and refused by the token endpoint if a target tries it.
+ */
+export const CODEX_OWNER_MANAGED_REFRESH_TOKEN = 'saycode-owner-managed-refresh-v1'
+
+function withoutCodexRefreshTokens(payload: string): string {
+  const bundle = parseCodexMultiAuthBundle(payload)
+  if (!bundle) throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
+  const recovery = (JSON.parse(payload) as { recoveryAuth?: { tokens?: Record<string, unknown> } }).recoveryAuth
+  return JSON.stringify({
+    ...JSON.parse(payload),
+    accounts: { ...bundle.accounts, accounts: bundle.accounts.accounts.map(account => ({ ...account, refreshToken: CODEX_OWNER_MANAGED_REFRESH_TOKEN })) },
+    ...(recovery?.tokens ? { recoveryAuth: { ...recovery, tokens: { ...recovery.tokens, refresh_token: CODEX_OWNER_MANAGED_REFRESH_TOKEN } } } : {}),
+  })
+}
 
 export type AiCredentialProvider = 'claude' | 'codex' | 'zai'
 
@@ -428,7 +446,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     } catch {}
   }
 
-  async function capture(input: { provider: AiCredentialProvider; codexRecovery?: boolean }) {
+  async function capture(input: { provider: AiCredentialProvider; codexRecovery?: boolean; refreshOwner?: boolean }) {
     const selected = provider(input?.provider)
     return serialize(() => withSafeErrors(`${selected.toUpperCase()}_CAPTURE_FAILED`, async () => {
       if (selected === 'zai') {
@@ -536,6 +554,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
           tokens: { account_id: tokens.account_id, access_token: tokens.access_token, refresh_token: tokens.refresh_token, id_token: tokens.id_token },
         } })
       }
+      if (selected === 'codex' && input.refreshOwner === true) payload = withoutCodexRefreshTokens(payload)
       assertPayloadSize(payload)
       return { provider: selected, payload }
     }))
@@ -2664,7 +2683,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (machineId && origin && metadata.artifact === 'saycode-setup-token-runtime-v1' && metadata.organizationCollectorVersion === 1) {
       try { collector = await collectorVerificationReady(origin) } catch {}
     }
-    return { version: 1, codexRecoveryVersion: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1, collectorMachinePrincipalVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, setupTokenResumeRequirementVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
+    return { version: 1, codexRecoveryVersion: 1, codexRefreshOwnerVersion: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1, collectorMachinePrincipalVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, setupTokenResumeRequirementVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
     // Managed setup-token import with metadata verification, only on the marked cswap token runtime.
     ...(setupToken ? { setupTokenVersion: 1, setupTokenStatusVersion: 1 } : {}),
     // Advertised only when a server-signed binding proof can actually be verified here.
