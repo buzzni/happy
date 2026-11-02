@@ -15,7 +15,7 @@ import { createClaudeSwapPythonResolver, findClaudeSwapPython, routeClaudeSwapTh
 import { spawn } from 'node:child_process'
 import { chmod, mkdir, mkdtemp, open, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { delimiter, join } from 'node:path'
+import { delimiter, dirname, join } from 'node:path'
 import { logger } from '@/ui/logger'
 import { credentialFileLockPath, withCredentialLock } from '@/utils/credentialLock'
 import {
@@ -40,6 +40,10 @@ import { readTrustedStudioOrigin, setupTokenCredentialMatches, type SetupTokenBi
 import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS } from '@/claude/utils/claudeAuthOverrideEnv'
 import { openSetupTokenAssignment, type SetupTokenAssignmentRecipient } from './setupTokenAssignmentWire'
 import { HAPPY_AI_AUTH_SOURCE_ENV } from '@/usage/aiAuthSource'
+import { CODEX_LOGIN_REFRESH_DRIVER } from './codexLoginRefreshDriver'
+import { CODEX_OWNER_MANAGED_REFRESH_TOKEN } from '@/codex/codexOwnerManagedLogin'
+
+export { CODEX_OWNER_MANAGED_REFRESH_TOKEN }
 import type { SetupTokenUsageObservation } from './setupTokenAccountSwitch'
 import {
   cswapAtLeastPinned, isManagedSetupTokenAccount, managedSetupTokenEmail, managedSetupTokenId, parseCswapVersion, sameManagedSetupToken,
@@ -64,6 +68,33 @@ function isReadableCodexMultiAuthBundleVersion(version: string): boolean {
   return READABLE_HISTORICAL_CODEX_MULTI_AUTH_BUNDLE_VERSIONS.has(version) || isSupportedCodexMultiAuthVersion(version)
 }
 const CODEX_MULTI_AUTH_THRESHOLD = 5
+
+const CODEX_OWNER_REFRESH_DEFAULT_THRESHOLD_MS = 3 * 86_400_000
+const CODEX_OWNER_REFRESH_MAX_THRESHOLD_MS = 9 * 86_400_000
+
+/** Expiry in ms from a ChatGPT access token's `exp` claim; undefined when it is not a readable JWT. */
+function codexAccessTokenExpiry(token: unknown): number | undefined {
+  try {
+    const claims: unknown = JSON.parse(Buffer.from(String(token).split('.')[1] || '', 'base64url').toString())
+    return isObject(claims) && typeof claims.exp === 'number' ? claims.exp * 1000 : undefined
+  } catch { return undefined }
+}
+
+/** A pool entry's expiry: its recorded `expiresAt`, else its access token's own, else 0 (unknown sorts oldest). */
+function codexAccountExpiry(account: CodexMultiAuthAccount): number {
+  return typeof account.expiresAt === 'number' ? account.expiresAt : codexAccessTokenExpiry(account.accessToken) ?? 0
+}
+
+function withoutCodexRefreshTokens(payload: string): string {
+  const bundle = parseCodexMultiAuthBundle(payload)
+  if (!bundle) throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
+  const recovery = (JSON.parse(payload) as { recoveryAuth?: { tokens?: Record<string, unknown> } }).recoveryAuth
+  return JSON.stringify({
+    ...JSON.parse(payload),
+    accounts: { ...bundle.accounts, accounts: bundle.accounts.accounts.map(account => ({ ...account, refreshToken: CODEX_OWNER_MANAGED_REFRESH_TOKEN })) },
+    ...(recovery?.tokens ? { recoveryAuth: { ...recovery, tokens: { ...recovery.tokens, refresh_token: CODEX_OWNER_MANAGED_REFRESH_TOKEN } } } : {}),
+  })
+}
 
 export type AiCredentialProvider = 'claude' | 'codex' | 'zai'
 
@@ -414,7 +445,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   }
 
   function warnCodexCaptureReadFailure(
-    fileName: 'openai-codex-accounts.json' | 'settings.json',
+    fileName: 'openai-codex-accounts.json' | 'settings.json' | 'auth.json',
     error: unknown,
   ): void {
     const errorCode = (error as NodeJS.ErrnoException | undefined)?.code
@@ -428,86 +459,211 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     } catch {}
   }
 
-  async function capture(input: { provider: AiCredentialProvider; codexRecovery?: boolean }) {
+  type CaptureInput = { provider: AiCredentialProvider; codexRecovery?: boolean; refreshOwner?: boolean }
+
+  async function capture(input: CaptureInput) {
     const selected = provider(input?.provider)
-    return serialize(() => withSafeErrors(`${selected.toUpperCase()}_CAPTURE_FAILED`, async () => {
-      if (selected === 'zai') {
-        throw new AiCredentialRuntimeError('ZAI_CAPTURE_UNSUPPORTED')
-      }
-      let payload: string
-      if (selected === 'claude') {
-        const result = await deps.execFile('cswap', ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES })
-        payload = result.stdout
-      } else {
-        const packageVersion = await assertSupportedCodexMultiAuthInstalled()
-        let accounts: unknown
-        try {
-          accounts = JSON.parse(await deps.readFile(join(codexMultiAuthDir(), 'openai-codex-accounts.json')))
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-            warnCodexCaptureReadFailure('openai-codex-accounts.json', error)
-            throw error
-          }
-          throw new AiCredentialRuntimeError('CODEX_FILE_STORE_REQUIRED')
+    return serialize(() => withSafeErrors(`${selected.toUpperCase()}_CAPTURE_FAILED`, () => captureNow(selected, input)))
+  }
+
+  // Runs inside an operation already holding the credential queue; `capture` is the queued entry point.
+  async function captureNow(selected: AiCredentialProvider, input: CaptureInput) {
+    if (selected === 'zai') {
+      throw new AiCredentialRuntimeError('ZAI_CAPTURE_UNSUPPORTED')
+    }
+    let payload: string
+    if (selected === 'claude') {
+      const result = await deps.execFile('cswap', ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES })
+      payload = result.stdout
+    } else {
+      const packageVersion = await assertSupportedCodexMultiAuthInstalled()
+      let accounts: unknown
+      const accountsPath = join(codexMultiAuthDir(), 'openai-codex-accounts.json')
+      let accountsRaw: string
+      try {
+        accountsRaw = await deps.readFile(accountsPath)
+        accounts = JSON.parse(accountsRaw)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          warnCodexCaptureReadFailure('openai-codex-accounts.json', error)
+          throw error
         }
-        let settings: unknown = { version: 1, pluginConfig: {} }
-        try {
-          settings = JSON.parse(await deps.readFile(join(codexMultiAuthDir(), 'settings.json')))
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-            warnCodexCaptureReadFailure('settings.json', error)
-            throw error
-          }
-        }
-        payload = JSON.stringify({
-          version: 1,
-          kind: 'codex-multi-auth',
-          packageVersion,
-          accounts,
-          settings,
-        })
+        throw new AiCredentialRuntimeError('CODEX_FILE_STORE_REQUIRED')
       }
-      if (selected === 'codex' && input.codexRecovery === true) {
+      let settings: unknown = { version: 1, pluginConfig: {} }
+      try {
+        settings = JSON.parse(await deps.readFile(join(codexMultiAuthDir(), 'settings.json')))
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          warnCodexCaptureReadFailure('settings.json', error)
+          throw error
+        }
+      }
+      payload = JSON.stringify({
+        version: 1,
+        kind: 'codex-multi-auth',
+        packageVersion,
+        accounts,
+        settings,
+      })
+      if (input.codexRecovery !== true) {
         const bundle = parseCodexMultiAuthBundle(payload)
         if (!bundle) throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
         const livePath = deps.env.CODEX_CLI_AUTH_PATH || join(codexHome(), 'auth.json')
-        const raw = await deps.readFile(livePath)
-        const live = JSON.parse(raw)
-        const tokens = live?.tokens
-        if (!isObject(tokens) || ['account_id', 'access_token', 'refresh_token', 'id_token'].some(key => typeof tokens[key] !== 'string' || !tokens[key])) {
-          throw new AiCredentialRuntimeError('CODEX_REAUTH_REQUIRED')
+        // The live login only refreshes a pool entry; an unusable auth.json (e.g. mid-rewrite) means none.
+        let liveRaw: string | null = null
+        let live: Record<string, unknown> | null = null
+        try {
+          liveRaw = await readOptionalText(deps, livePath)
+          live = parseOptionalCredentialJson(liveRaw)
+        } catch (error) {
+          warnCodexCaptureReadFailure('auth.json', error)
         }
-        const indexes = bundle.accounts.accounts.map((account, index) => ({ account, index }))
-          .filter(({ account }) => account.accountId === tokens.account_id)
-        const sameUser = bundle.accounts.accounts.map((account, index) => ({ account, index }))
-          .filter(({ account }) => tokenSubject(account.accessToken) !== null && tokenSubject(account.accessToken) === tokenSubject(tokens.access_token))
-        const match = indexes.length === 1 ? indexes[0] : sameUser.length === 1 ? sameUser[0] : undefined
-        if (!match) throw new AiCredentialRuntimeError('CODEX_ACTIVE_CREDENTIAL_MISMATCH')
-        const claims = JSON.parse(Buffer.from(String(tokens.access_token).split('.')[1] || '', 'base64url').toString())
-        const active: CodexMultiAuthAccount = { ...match.account, accountId: String(tokens.account_id), accessToken: String(tokens.access_token),
-          refreshToken: String(tokens.refresh_token), ...(typeof claims.exp === 'number' ? { expiresAt: claims.exp * 1000 } : {}),
-          accountIdSource: 'token', workspaces: undefined, currentWorkspaceIndex: undefined }
-        const verified = await verifyLocalAiAccounts(deps, 'codex', [{ accountId: tokens.account_id as string }], [active], { budgetMs: 60_000 })
-        if (!verified.accounts[0]?.ok) throw new AiCredentialRuntimeError(
-          verified.accounts[0]?.errorKind === 'AUTHENTICATION_FAILED' ? 'CODEX_AUTHENTICATION_FAILED' : 'CODEX_SOURCE_VERIFICATION_FAILED')
-        if (await deps.readFile(livePath) !== raw) throw new AiCredentialRuntimeError('ACTIVE_ACCOUNT_CHANGED')
-        bundle.accounts.accounts[match.index] = active
-        bundle.accounts.activeIndex = match.index
-        payload = JSON.stringify({ ...bundle, recoveryAuth: {
-          auth_mode: 'chatgpt', OPENAI_API_KEY: null, last_refresh: live.last_refresh,
-          tokens: { account_id: tokens.account_id, access_token: tokens.access_token, refresh_token: tokens.refresh_token, id_token: tokens.id_token },
-        } })
+        const tokens = isObject(live?.tokens) ? live.tokens : null
+        if (tokens && typeof tokens.account_id === 'string'
+          && typeof tokens.access_token === 'string' && typeof tokens.refresh_token === 'string' && tokens.refresh_token) {
+          const subject = tokenSubject(tokens.access_token)
+          const claims = tokenClaims(tokens.access_token)
+          const expiresAt = typeof claims.exp === 'number' && Number.isFinite(claims.exp) ? claims.exp * 1000 : 0
+          const matches = bundle.accounts.accounts.filter(account => account.accountId === tokens.account_id)
+          const account = matches.length === 1 ? matches[0] : undefined
+          const storedClaims = tokenClaims(account?.accessToken)
+          const storedExpiresAt = typeof storedClaims.exp === 'number' && Number.isFinite(storedClaims.exp) ? storedClaims.exp * 1000 : 0
+          // A re-login can leave the exported pool behind. Refresh only an existing, exact
+          // workspace AND user; never import a different live login or regress a newer pool.
+          if (account && subject !== null && subject === tokenSubject(account.accessToken)
+            && expiresAt > deps.now() && expiresAt > storedExpiresAt) {
+            account.accessToken = tokens.access_token
+            account.refreshToken = tokens.refresh_token
+            account.expiresAt = expiresAt
+            await assertCredentialsUnchanged(deps, [{ path: livePath, expected: liveRaw }, { path: accountsPath, expected: accountsRaw }])
+            payload = JSON.stringify(bundle)
+          }
+        }
       }
-      assertPayloadSize(payload)
-      return { provider: selected, payload }
-    }))
+    }
+    if (selected === 'codex' && input.codexRecovery === true) {
+      const bundle = parseCodexMultiAuthBundle(payload)
+      if (!bundle) throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
+      const livePath = deps.env.CODEX_CLI_AUTH_PATH || join(codexHome(), 'auth.json')
+      const raw = await deps.readFile(livePath)
+      const live = JSON.parse(raw)
+      const tokens = live?.tokens
+      if (!isObject(tokens) || ['account_id', 'access_token', 'refresh_token', 'id_token'].some(key => typeof tokens[key] !== 'string' || !tokens[key])) {
+        throw new AiCredentialRuntimeError('CODEX_REAUTH_REQUIRED')
+      }
+      const indexes = bundle.accounts.accounts.map((account, index) => ({ account, index }))
+        .filter(({ account }) => account.accountId === tokens.account_id)
+      const sameUser = bundle.accounts.accounts.map((account, index) => ({ account, index }))
+        .filter(({ account }) => tokenSubject(account.accessToken) !== null && tokenSubject(account.accessToken) === tokenSubject(tokens.access_token))
+      const match = indexes.length === 1 ? indexes[0] : sameUser.length === 1 ? sameUser[0] : undefined
+      if (!match) throw new AiCredentialRuntimeError('CODEX_ACTIVE_CREDENTIAL_MISMATCH')
+      const claims = JSON.parse(Buffer.from(String(tokens.access_token).split('.')[1] || '', 'base64url').toString())
+      const active: CodexMultiAuthAccount = { ...match.account, accountId: String(tokens.account_id), accessToken: String(tokens.access_token),
+        refreshToken: String(tokens.refresh_token), ...(typeof claims.exp === 'number' ? { expiresAt: claims.exp * 1000 } : {}),
+        accountIdSource: 'token', workspaces: undefined, currentWorkspaceIndex: undefined }
+      const verified = await verifyLocalAiAccounts(deps, 'codex', [{ accountId: tokens.account_id as string }], [active], { budgetMs: 60_000 })
+      if (!verified.accounts[0]?.ok) throw new AiCredentialRuntimeError(
+        verified.accounts[0]?.errorKind === 'AUTHENTICATION_FAILED' ? 'CODEX_AUTHENTICATION_FAILED' : 'CODEX_SOURCE_VERIFICATION_FAILED')
+      if (await deps.readFile(livePath) !== raw) throw new AiCredentialRuntimeError('ACTIVE_ACCOUNT_CHANGED')
+      bundle.accounts.accounts[match.index] = active
+      bundle.accounts.activeIndex = match.index
+      payload = JSON.stringify({ ...bundle, recoveryAuth: {
+        auth_mode: 'chatgpt', OPENAI_API_KEY: null, last_refresh: live.last_refresh,
+        tokens: { account_id: tokens.account_id, access_token: tokens.access_token, refresh_token: tokens.refresh_token, id_token: tokens.id_token },
+      } })
+    }
+    if (selected === 'codex' && input.refreshOwner === true) payload = withoutCodexRefreshTokens(payload)
+    assertPayloadSize(payload)
+    return { provider: selected, payload }
   }
 
   function tokenSubject(token: unknown): string | null {
+    const claims = tokenClaims(token)
+    return typeof claims.sub === 'string' && claims.sub ? claims.sub : null
+  }
+
+  function tokenClaims(token: unknown): Record<string, unknown> {
     try {
       const claims = JSON.parse(Buffer.from(String(token).split('.')[1] || '', 'base64url').toString())
-      return typeof claims.sub === 'string' && claims.sub ? claims.sub : null
-    } catch { return null }
+      return isObject(claims) ? claims : {}
+    } catch { return {} }
+  }
+
+  /**
+   * Source side of a refresh-owner bundle (specs/codex-oauth-refresh-owner T6): this machine alone rotates the
+   * refresh tokens. A live login newer than its pool copy is adopted first, so a later switch cannot write the
+   * stale copy back; accounts close to expiry are rotated by Codex itself (the active one in the live home, so
+   * running sessions read it on their next 401); the result is the access-only bundle to deliver.
+   */
+  async function refreshCodexOwner(input: { provider: 'codex'; thresholdMs?: number }) {
+    if (provider(input?.provider) !== 'codex') throw new AiCredentialRuntimeError('CODEX_OWNER_REFRESH_UNSUPPORTED')
+    const thresholdMs = typeof input.thresholdMs === 'number' && Number.isFinite(input.thresholdMs) && input.thresholdMs > 0
+      ? Math.min(input.thresholdMs, CODEX_OWNER_REFRESH_MAX_THRESHOLD_MS) : CODEX_OWNER_REFRESH_DEFAULT_THRESHOLD_MS
+    return serialize(() => withSafeErrors('CODEX_OWNER_REFRESH_FAILED', async () => {
+      await assertSupportedCodexMultiAuthInstalled()
+      const accountsPath = join(codexMultiAuthDir(), 'openai-codex-accounts.json')
+      const livePath = deps.env.CODEX_CLI_AUTH_PATH || join(codexHome(), 'auth.json')
+      const readPool = async () => JSON.parse(await deps.readFile(accountsPath)) as CodexMultiAuthBundle['accounts']
+      const readTokens = async (path: string) => {
+        const auth = parseOptionalCredentialJson(await readOptionalText(deps, path))
+        return auth && isObject(auth.tokens) ? auth.tokens : null
+      }
+      // Writes rotated tokens into the pool entry, unless another writer replaced that entry's refresh token meanwhile.
+      const adopt = (accountId: string, expected: readonly string[], tokens: Record<string, unknown>) => deps.lockCredentialFile(accountsPath, async () => {
+        const pool = await readPool()
+        const entry = pool.accounts.find(account => account.accountId === accountId)
+        if (!entry || !expected.includes(entry.refreshToken)) return false
+        Object.assign(entry, { accessToken: tokens.access_token, refreshToken: tokens.refresh_token,
+          ...(codexAccessTokenExpiry(tokens.access_token) ? { expiresAt: codexAccessTokenExpiry(tokens.access_token) } : {}) })
+        await writeAtomicFile(deps, accountsPath, JSON.stringify(pool))
+        return true
+      })
+
+      const live = await readTokens(livePath)
+      if (live && typeof live.account_id === 'string' && typeof live.refresh_token === 'string' && live.refresh_token
+        && live.refresh_token !== CODEX_OWNER_MANAGED_REFRESH_TOKEN) {
+        const entry = (await readPool()).accounts.find(account => account.accountId === live.account_id)
+        if (entry && entry.refreshToken !== live.refresh_token && (codexAccessTokenExpiry(live.access_token) ?? 0) > codexAccountExpiry(entry)) {
+          await adopt(entry.accountId as string, [entry.refreshToken], live)
+        }
+      }
+
+      const refreshedAccountIds: string[] = []
+      const failedAccounts: Array<{ accountId: string; errorKind: string }> = []
+      for (const account of (await readPool()).accounts) {
+        const accountId = account.accountId
+        if (typeof accountId !== 'string' || account.enabled === false || !account.refreshToken
+          || account.refreshToken === CODEX_OWNER_MANAGED_REFRESH_TOKEN || codexAccountExpiry(account) - deps.now() > thresholdMs) continue
+        const liveTokens = await readTokens(livePath)
+        const inLiveHome = liveTokens?.account_id === accountId
+        const home = inLiveHome ? dirname(livePath) : await deps.makeTempDir()
+        const before = inLiveHome ? String(liveTokens!.refresh_token) : account.refreshToken
+        try {
+          if (!inLiveHome) {
+            await deps.writeFile(join(home, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', OPENAI_API_KEY: null,
+              last_refresh: new Date(deps.now()).toISOString(), tokens: { id_token: account.idToken ?? account.accessToken,
+                access_token: account.accessToken, refresh_token: account.refreshToken, account_id: accountId } }), { mode: 0o600 })
+          }
+          await deps.execFile(process.execPath, ['-e', CODEX_LOGIN_REFRESH_DRIVER], {
+            environment: { ...deps.env, CODEX_HOME: home }, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS, terminateProcessTree: true })
+          const after = await readTokens(join(home, 'auth.json'))
+          if (!after || typeof after.refresh_token !== 'string' || !after.refresh_token || after.refresh_token === before) {
+            failedAccounts.push({ accountId, errorKind: 'CODEX_OWNER_REFRESH_NOT_ROTATED' })
+          } else if (await adopt(accountId, [account.refreshToken, before], after)) {
+            refreshedAccountIds.push(accountId)
+          } else {
+            failedAccounts.push({ accountId, errorKind: 'CODEX_OWNER_REFRESH_RACED' })
+          }
+        } catch (error) {
+          failedAccounts.push({ accountId, errorKind: error instanceof AiCredentialRuntimeError ? error.kind : 'CODEX_OWNER_REFRESH_FAILED' })
+        } finally {
+          if (!inLiveHome) await deps.rm(home, { recursive: true, force: true })
+        }
+      }
+      const { payload } = await captureNow('codex', { provider: 'codex', refreshOwner: true })
+      return { provider: 'codex' as const, refreshedAccountIds, failedAccounts, payload }
+    }))
   }
 
   async function repairCodex(input: { provider: 'codex'; payload: string }) {
@@ -1330,20 +1486,28 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         ? { accountId: account.accountId } : { email: typeof account.email === 'string' ? account.email : undefined }
       const matching = (account: CodexMultiAuthAccount, other: CodexMultiAuthAccount) => account.accountId
         ? account.accountId === other.accountId : account.email === other.email
-      const duplicates = bundle.accounts.accounts.filter(incoming => current.accounts.accounts.some(local => matching(local, incoming)
+      // An owner-managed account is rotated only on its source machine: a strictly newer delivery replaces any copied
+      // refresh token here, and nothing older or equal replaces anything — so the owner, whose own login is always at
+      // least as new as what it delivered, never loses its refresh token (specs/codex-oauth-refresh-owner R4, R7).
+      const ownerManaged = (account: CodexMultiAuthAccount) => account.refreshToken === CODEX_OWNER_MANAGED_REFRESH_TOKEN
+      const takesOver = (local: CodexMultiAuthAccount, incoming: CodexMultiAuthAccount) => matching(local, incoming)
+        && codexAccountExpiry(incoming) > codexAccountExpiry(local)
+      const deliveries = bundle.accounts.accounts.filter(ownerManaged)
+      const duplicates = bundle.accounts.accounts.filter(incoming => !ownerManaged(incoming) && current.accounts.accounts.some(local => matching(local, incoming)
         && local.enabled !== false && (local.accessToken !== incoming.accessToken || local.refreshToken !== incoming.refreshToken)))
       const localCheck = await verifyLocalAiAccounts(deps, 'codex', duplicates.map(identity), current.accounts.accounts, { budgetMs: 60_000 })
       const invalid = duplicates.filter((_account, index) => localCheck.accounts[index]?.errorKind === 'AUTHENTICATION_FAILED')
       const sharedCheck = await verifyLocalAiAccounts(deps, 'codex', invalid.map(identity), invalid, { budgetMs: 60_000 })
       const accepted = invalid.filter((_account, index) => sharedCheck.accounts[index]?.ok)
       const refreshed = { ...current.accounts, accounts: current.accounts.accounts.map(local => {
-        const incoming = accepted.find(account => matching(local, account))
+        const incoming = accepted.find(account => matching(local, account)) ?? deliveries.find(account => takesOver(local, account))
         return incoming ? { ...local, refreshToken: incoming.refreshToken, accessToken: incoming.accessToken,
           expiresAt: incoming.expiresAt } : local
       }) }
-      const repairedActive = accepted.some(account => {
+      const repairedActive = [...accepted, ...deliveries].some(account => {
         const active = current.accounts.accounts[current.accounts.activeIndex]
-        return active && matching(active, account) && !!live && isObject(live.tokens) && live.tokens.account_id === active.accountId
+        return active && (accepted.includes(account) ? matching(active, account) : takesOver(active, account))
+          && !!live && isObject(live.tokens) && live.tokens.account_id === active.accountId
       })
       const merged = mergeCodexAccounts(refreshed, bundle.accounts)
       // A refresh/login performed while probing wins over our older snapshot: the write below compares the pool
@@ -2610,7 +2774,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (entries.length !== 1 || entries[0].pending) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_ASSIGNMENT_UNRESOLVED')
     return entries[0].scope
   })
-  return { sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, sharedMachineAccountEnvironment, measureWithPermit, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
+  return { sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, sharedMachineAccountEnvironment, measureWithPermit, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, refreshCodexOwner, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
     // One fresh runtime observation per RPC: launching cswap repeatedly can block a secured Windows host.
     let stdout = ''
     try { stdout = (await deps.execFile('cswap', ['token-runtime', 'capabilities'], { maxOutputBytes: 64 * 1024, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })).stdout } catch {}
@@ -2621,7 +2785,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (machineId && origin && metadata.artifact === 'saycode-setup-token-runtime-v1' && metadata.organizationCollectorVersion === 1) {
       try { collector = await collectorVerificationReady(origin) } catch {}
     }
-    return { version: 1, codexRecoveryVersion: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1, collectorMachinePrincipalVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, setupTokenResumeRequirementVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
+    return { version: 1, codexRecoveryVersion: 1, codexRefreshOwnerVersion: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1, collectorMachinePrincipalVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, setupTokenResumeRequirementVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
     // Managed setup-token import with metadata verification, only on the marked cswap token runtime.
     ...(setupToken ? { setupTokenVersion: 1, setupTokenStatusVersion: 1 } : {}),
     // Advertised only when a server-signed binding proof can actually be verified here.

@@ -55,6 +55,7 @@ import { ChannelPromptAcceptance, CHANNEL_ACK_DEADLINE_MS } from '@/channel/chan
 import { enqueueChannelTurn } from '@/channel/channelTurnEnqueue';
 import { projectPath } from '@/projectPath';
 import { join } from 'node:path';
+import { readCodexLogin, withCodexOwnerRefreshNotice } from './codexOwnerManagedLogin';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { takeSessionSourceFromEnv } from '@/utils/sessionSource';
 import { createChangeTitleHandler, startHappyServer } from '@/claude/utils/startHappyServer';
@@ -1922,7 +1923,7 @@ export async function runCodex(opts: {
                 session.sendSessionEvent({ type: 'message', message });
             } else if (failure) {
                 messageBuffer.addMessage(`Task failed: ${failure}`, 'status');
-                session.sendSessionEvent({ type: 'message', message: `Codex error: ${failure}` });
+                session.sendSessionEvent({ type: 'message', message: `Codex error: ${withCodexOwnerRefreshNotice(failure, readCodexLogin())}` });
             } else {
                 messageBuffer.addMessage('Task completed', 'status');
             }
@@ -1938,7 +1939,7 @@ export async function runCodex(opts: {
                 session.sendSessionEvent({ type: 'message', message });
             } else if (failure) {
                 messageBuffer.addMessage(`Turn aborted: ${failure}`, 'status');
-                session.sendSessionEvent({ type: 'message', message: `Codex error: ${failure}` });
+                session.sendSessionEvent({ type: 'message', message: `Codex error: ${withCodexOwnerRefreshNotice(failure, readCodexLogin())}` });
             } else {
                 messageBuffer.addMessage('Turn aborted', 'status');
             }

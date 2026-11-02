@@ -1276,6 +1276,9 @@ export class ApiMachineClient {
         this.rpcHandlerManager.registerHandler('ai-credential:repair-codex', (params) => (
             aiCredentialRuntime.repairCodex(params)
         ));
+        this.rpcHandlerManager.registerHandler('ai-credential:refresh-codex-owner', (params) => (
+            aiCredentialRuntime.refreshCodexOwner(params)
+        ));
         this.rpcHandlerManager.registerHandler('ai-credential:group-sync', (params) => {
             if (isLegacyManagedSetupTokenPayload(params)) throw new Error('AI_GROUP_SETUP_TOKEN_REQUIRES_SEALED_RPC');
             return aiCredentialRuntime.groupSync(params);

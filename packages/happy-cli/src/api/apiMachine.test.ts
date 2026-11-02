@@ -1099,7 +1099,8 @@ describe('ApiMachineClient socket reconnection', () => {
             version: 1, kind: 'codex-multi-auth', packageVersion: '2.16.0', accounts,
             settings: { version: 1, pluginConfig: {} },
         });
-        expect(readFile).not.toHaveBeenCalledWith(join('/fixed/codex', 'auth.json'));
+        // Optional live-login freshness is checked; a missing auth file leaves the pool unchanged.
+        expect(readFile).toHaveBeenCalledWith(join('/fixed/codex', 'auth.json'));
         expect(writeFile).not.toHaveBeenCalled();
     });
 
@@ -1150,6 +1151,21 @@ describe('ApiMachineClient socket reconnection', () => {
         await expect(handler(input)).resolves.toEqual({ provider: 'codex', configured: true });
         expect(repairCodex).toHaveBeenCalledExactlyOnceWith(input);
         expect(JSON.stringify([vi.mocked(logger.debug).mock.calls, vi.mocked(logger.debugLargeJson).mock.calls])).not.toContain(input.payload);
+    });
+
+    it('routes the Codex owner refresh through the credential runtime without logging its payload', async () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        const result = { provider: 'codex', refreshedAccountIds: ['account-a'], failedAccounts: [], payload: 'access-only-bundle-secret' };
+        const refreshCodexOwner = vi.fn(async () => result);
+        client.setRPCHandlers({ spawnSession: vi.fn(), stopSession: vi.fn(), requestShutdown: vi.fn(),
+            portRegistry: {} as any, aiCredentialRuntime: { refreshCodexOwner } as any });
+        const handler = (client as any).rpcHandlerManager.registerHandler.mock.calls
+            .find(([method]: [string]) => method === 'ai-credential:refresh-codex-owner')?.[1];
+        expect(handler).toBeTypeOf('function');
+        const input = { provider: 'codex', thresholdMs: 1000 };
+        await expect(handler(input)).resolves.toEqual(result);
+        expect(refreshCodexOwner).toHaveBeenCalledExactlyOnceWith(input);
+        expect(JSON.stringify([vi.mocked(logger.debug).mock.calls, vi.mocked(logger.debugLargeJson).mock.calls])).not.toContain(result.payload);
     });
 
     it('exposes additive credential capability without receiving credentials', async () => {
