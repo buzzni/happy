@@ -2068,7 +2068,6 @@ export class ApiSessionClient extends EventEmitter {
         else this.contextUsage.noteCompactBoundary();
     }
 
-    /** `/clear` or another Claude session id: the new conversation may run under other settings. */
     /**
      * Asks the running Claude process what fills its window (`get_context_usage`, `detail: 'summary'`:
      * local estimates, no token-count API calls) and adds the answer to the frame. Best effort: a
@@ -2082,6 +2081,7 @@ export class ApiSessionClient extends EventEmitter {
             .catch((error: unknown) => logger.debug('[context-usage] breakdown request failed', error));
     }
 
+    /** `/clear` or another Claude session id: the new conversation may run under other settings. */
     resetContextUsage() {
         this.contextUsage.reset();
     }
