@@ -55,6 +55,17 @@ export function createMachineSetupTokenRuntime(deps: {
     try { await protocol.post(await protocol.query(request.launchId, request.operationId), true, signal); return false }
     catch (error) { return error instanceof MachineRotationError && error.reason === 'OPERATION_NOT_FOUND' }
   }
+  /**
+   * A pending start-budget ask Studio never recorded issued nothing, and retrying it later is pointless (a Studio
+   * before the field refuses it every time): settle it so it cannot stand in front of later switches.
+   */
+  async function dropUnrecordedStartBudgetAsk(state: MachineRotationJournalRecord, signal?: AbortSignal) {
+    const request = state.pending?.request
+    if (!request || request.action !== 'rebind' || !request.startBudget || !await unrecorded(request, signal)) return false
+    await journal.write({ version: 1, launchId: state.launchId, current: state.current, currentOperationId: state.currentOperationId, startSubmitted: state.startSubmitted, ...settledMoves(state) })
+    delete state.pending
+    return true
+  }
   async function queryOrRetry(request: DaemonRotationRequestBody, signal?: AbortSignal, allowSelection = true): Promise<MachineRotationResult> {
     try { return await protocol.post(await protocol.query(request.launchId, request.operationId), true, signal) }
     catch (error) { if (!(error instanceof MachineRotationError) || error.reason !== 'OPERATION_NOT_FOUND') throw error }
@@ -94,6 +105,7 @@ export function createMachineSetupTokenRuntime(deps: {
     signal?.throwIfAborted();
     const state = await journal.read(binding.launchId)
     if (!state) throw new MachineRotationError('PERSISTENCE_FAILED')
+    await dropUnrecordedStartBudgetAsk(state, signal)
     const current = journalCurrent(state)
     if (current && ((!state.pending && current.bindingRevision < binding.bindingRevision) || current.execution.sessionId !== binding.execution.sessionId)) throw new MachineRotationError('STALE')
     if (state.pending) {
@@ -304,6 +316,8 @@ export function createMachineSetupTokenRuntime(deps: {
         if (!session || binding.execution.sessionId !== sessionId) throw new MachineRotationError('NOT_BOUND')
         const state = await journal.read(binding.launchId)
         if (!state) throw new MachineRotationError('PERSISTENCE_FAILED')
+        // A stale start-budget ask left by a lost answer or a crash gives way to this switch.
+        await dropUnrecordedStartBudgetAsk(state, signal)
         if (state.pending) return recover(binding, session, true, signal)
         const current = journalCurrent(state)
         if (!current || current.bindingRevision < binding.bindingRevision) throw new MachineRotationError('STALE')
@@ -320,11 +334,8 @@ export function createMachineSetupTokenRuntime(deps: {
         let result: MachineRotationResult
         try { result = await protocol.post(request, false, signal) }
         catch (error) {
-          // An ask Studio never recorded issued nothing (it records the operation with any binding it issues). A refused
-          // start-budget ask, as from a Studio before the field, must not stay pending in front of later switches.
-          if (options.startBudget && await unrecorded(request, signal)) {
-            await journal.write({ version: 1, launchId: state.launchId, current: state.current, currentOperationId: state.currentOperationId, startSubmitted: state.startSubmitted, ...settledMoves(state) })
-          }
+          // Studio records the operation with any binding it issues: an ask it never recorded is settled now.
+          await dropUnrecordedStartBudgetAsk(state, signal)
           throw error
         }
         if (deps.findSession(sessionId) !== session) throw new MachineRotationError('NOT_BOUND')
