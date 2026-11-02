@@ -29,6 +29,16 @@ describe('portable rotation contract', () => {
     expect(DaemonRotationRequestBodySchema.safeParse({ ...issue, path: '/api/claude-setup-token/daemon/v2/claim' }).success).toBe(false);
     expect(() => rotationSigningBytes({ ...issue, surprise: true })).toThrow();
   });
+  it('asks a rebind either with usage evidence or for start budget, never both or neither', () => {
+    const rebind = fixture.vectors.find(v => 'action' in v.document.body && v.document.body.action === 'rebind')!.document.body as Record<string, unknown>;
+    const { observation, ...bare } = rebind;
+    expect(DaemonRotationRequestBodySchema.safeParse(rebind).success).toBe(true);
+    expect(DaemonRotationRequestBodySchema.safeParse({ ...bare, startBudget: true }).success).toBe(true);
+    expect(DaemonRotationRequestBodySchema.safeParse({ ...rebind, startBudget: true }).success).toBe(false);
+    expect(DaemonRotationRequestBodySchema.safeParse(bare).success).toBe(false);
+    expect(DaemonRotationRequestBodySchema.safeParse({ ...bare, startBudget: false }).success).toBe(false);
+    expect(observation).toBeTruthy();
+  });
   it('limits TTL to 60 seconds, accepts bounded future issue skew, never accepts expiry', () => {
     expect(rotationIsFresh({ issuedAt: 100000, expiresAt: 160000 }, 100000)).toBe(true);
     expect(rotationIsFresh({ issuedAt: 100000, expiresAt: 160000 }, 40000)).toBe(true);

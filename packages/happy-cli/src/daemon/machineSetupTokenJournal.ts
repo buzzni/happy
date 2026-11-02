@@ -13,7 +13,9 @@ const bindingRecord = z.string().max(8192).refine(raw => {
   try { const parsed = readSetupTokenResumeSelection({ HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: raw }); return !!parsed && isMachineSetupTokenBinding(parsed.binding) } catch { return false }
 })
 const schema = z.object({ version: z.literal(1), launchId: z.string().min(1).max(128),
-  abandoned: z.boolean().optional(), startSubmitted: z.boolean().optional(), current: bindingRecord.optional(), currentOperationId: z.string().min(1).max(128).optional(), pending: z.object({ request: DaemonRotationRequestBodySchema,
+  abandoned: z.boolean().optional(), startSubmitted: z.boolean().optional(),
+  /** Committed start-budget moves of this launch: they do not count toward the five usage-limit switches. */
+  startBudgetMoves: z.number().int().nonnegative().optional(), current: bindingRecord.optional(), currentOperationId: z.string().min(1).max(128).optional(), pending: z.object({ request: DaemonRotationRequestBodySchema,
     ownershipManaged: z.boolean().optional(), createBody: SessionExecutionCreateBodySchema.optional(), createProofBody: HappySessionCreateProofBodySchema.optional(), machineOwnerAccountId: z.string().min(1).max(128).optional(),
     binding: MachineSetupTokenBindingV2Schema.optional(), bindingDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
     record: bindingRecord.optional(), claimOperationId: z.string(), commitOperationId: z.string(),

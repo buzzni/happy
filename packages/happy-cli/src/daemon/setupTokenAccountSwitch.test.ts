@@ -367,11 +367,11 @@ describe('machine-rotation bindings', () => {
     expect(machineRuntime.mock.calls).toEqual([['org-m'], ['org-m']])
   })
 
-  it('does not move a shared-PC binding for start budget: its signed switch carries no such request', async () => {
+  it('moves a shared-PC binding for start budget through the runtime of its company', async () => {
     const runtime = { reportUsage: vi.fn(), rebind: vi.fn(async () => ({ NEXT: '1' })) }
     const { switcher } = setup({ machineRuntime: async () => runtime as never })
-    await expect(switcher.rebind('session-a', running, undefined, undefined, { startBudget: true })).resolves.toEqual({ ok: false, reason: 'UNSUPPORTED' })
-    expect(runtime.rebind).not.toHaveBeenCalled()
+    await expect(switcher.rebind('session-a', running, undefined, undefined, { startBudget: true })).resolves.toEqual({ ok: true, environment: { NEXT: '1' } })
+    expect(runtime.rebind).toHaveBeenCalledWith('session-a', running, undefined, undefined, { startBudget: true })
   })
 
   it('reports Studio unavailable when that company has no runtime', async () => {

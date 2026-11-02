@@ -50,6 +50,22 @@ export function createMachineSetupTokenRuntime(deps: {
     return deps.sessionEnvironment('claude', { kind: 'claude-setup-token', managedAccountId: binding.managedAccountId,
       credentialGeneration: binding.credentialGeneration, groupScope: binding.groupScope }, binding)
   }
+  /** Studio answers that it holds no record of this operation; any other answer, or none, leaves it possibly issued. */
+  async function unrecorded(request: DaemonRotationRequestBody, signal?: AbortSignal) {
+    try { await protocol.post(await protocol.query(request.launchId, request.operationId), true, signal); return false }
+    catch (error) { return error instanceof MachineRotationError && error.reason === 'OPERATION_NOT_FOUND' }
+  }
+  /**
+   * A pending start-budget ask Studio never recorded issued nothing, and retrying it later is pointless (a Studio
+   * before the field refuses it every time): settle it so it cannot stand in front of later switches.
+   */
+  async function dropUnrecordedStartBudgetAsk(state: MachineRotationJournalRecord, signal?: AbortSignal) {
+    const request = state.pending?.request
+    if (!request || request.action !== 'rebind' || !request.startBudget || !await unrecorded(request, signal)) return false
+    await journal.write({ version: 1, launchId: state.launchId, current: state.current, currentOperationId: state.currentOperationId, startSubmitted: state.startSubmitted, ...settledMoves(state) })
+    delete state.pending
+    return true
+  }
   async function queryOrRetry(request: DaemonRotationRequestBody, signal?: AbortSignal, allowSelection = true): Promise<MachineRotationResult> {
     try { return await protocol.post(await protocol.query(request.launchId, request.operationId), true, signal) }
     catch (error) { if (!(error instanceof MachineRotationError) || error.reason !== 'OPERATION_NOT_FOUND') throw error }
@@ -77,7 +93,9 @@ export function createMachineSetupTokenRuntime(deps: {
     const commit = await protocol.request({ action: 'commit', operationId: pending.commitOperationId, ...fields, bindingDigest: pending.bindingDigest })
     const committed = recovering ? await queryOrRetry(commit, signal) : await protocol.post(commit, false, signal)
     if (committed.state !== 'committed') throw new MachineRotationError('REQUEST_FAILED')
-    await journal.write({ version: 1, launchId: state.launchId, current: pending.record, currentOperationId: pending.request.operationId, startSubmitted: state.startSubmitted })
+    const moved = pending.request.action === 'rebind' && pending.request.startBudget === true
+    await journal.write({ version: 1, launchId: state.launchId, current: pending.record, currentOperationId: pending.request.operationId, startSubmitted: state.startSubmitted,
+      ...settledMoves(state, moved ? 1 : 0) })
     if (deps.findSession(sessionId) && deps.findSession(sessionId) !== session) throw new MachineRotationError('NOT_BOUND')
     live()
     if (!returnToken) return {};
@@ -87,13 +105,14 @@ export function createMachineSetupTokenRuntime(deps: {
     signal?.throwIfAborted();
     const state = await journal.read(binding.launchId)
     if (!state) throw new MachineRotationError('PERSISTENCE_FAILED')
+    await dropUnrecordedStartBudgetAsk(state, signal)
     const current = journalCurrent(state)
     if (current && ((!state.pending && current.bindingRevision < binding.bindingRevision) || current.execution.sessionId !== binding.execution.sessionId)) throw new MachineRotationError('STALE')
     if (state.pending) {
       const result = await queryOrRetry(state.pending.request, signal)
       if (result.state === 'exhausted') {
         if (!current) throw new MachineRotationError('NO_ACCOUNT')
-        await journal.write({ version: 1, launchId: state.launchId, current: state.current, currentOperationId: state.currentOperationId, startSubmitted: state.startSubmitted });
+        await journal.write({ version: 1, launchId: state.launchId, current: state.current, currentOperationId: state.currentOperationId, startSubmitted: state.startSubmitted, ...settledMoves(state) });
         throw new MachineRotationError('NO_ACCOUNT')
       }
       if (!result.binding) throw new MachineRotationError('BINDING_REJECTED')
@@ -288,7 +307,8 @@ export function createMachineSetupTokenRuntime(deps: {
       if (result.state !== 'recorded') throw new MachineRotationError('REQUEST_FAILED')
       return { ok: true as const }
     },
-    rebind(sessionId: string, running: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal) {
+    /** `startBudget`: ask for an account with start budget left; such a move carries no usage evidence. */
+    rebind(sessionId: string, running: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal, options: { startBudget?: true } = {}) {
       const binding = bindingOf(running)
       return serial(binding.launchId, async () => {
         signal?.throwIfAborted();
@@ -296,20 +316,30 @@ export function createMachineSetupTokenRuntime(deps: {
         if (!session || binding.execution.sessionId !== sessionId) throw new MachineRotationError('NOT_BOUND')
         const state = await journal.read(binding.launchId)
         if (!state) throw new MachineRotationError('PERSISTENCE_FAILED')
+        // A stale start-budget ask left by a lost answer or a crash gives way to this switch.
+        await dropUnrecordedStartBudgetAsk(state, signal)
         if (state.pending) return recover(binding, session, true, signal)
         const current = journalCurrent(state)
         if (!current || current.bindingRevision < binding.bindingRevision) throw new MachineRotationError('STALE')
         if (current.bindingRevision > binding.bindingRevision) return recover(binding, session, true, signal)
         if (formatSetupTokenBinding(current) !== running || session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV] !== running) throw new MachineRotationError('STALE')
-        if (!observation) throw new MachineRotationError('REQUEST_FAILED')
-        if (current.bindingRevision >= 6) throw new MachineRotationError('ROTATION_LIMIT')
+        if (!options.startBudget && !observation) throw new MachineRotationError('REQUEST_FAILED')
+        // Studio counts the same way: start-budget moves are outside the five usage-limit switches.
+        if (!options.startBudget && current.bindingRevision - (state.startBudgetMoves ?? 0) >= 6) throw new MachineRotationError('ROTATION_LIMIT')
         const request = await protocol.request({ action: 'rebind', operationId: randomUUID(), launchId: binding.launchId, sessionId,
-          nonce: binding.nonce, bindingRevision: binding.bindingRevision, observation: toRotationObservation(binding, observation) })
+          nonce: binding.nonce, bindingRevision: binding.bindingRevision,
+          ...(options.startBudget ? { startBudget: true as const } : { observation: toRotationObservation(binding, observation!) }) })
         state.pending = { request, claimOperationId: randomUUID(), commitOperationId: randomUUID() }
         await journal.write(state)
-        const result = await protocol.post(request, false, signal)
+        let result: MachineRotationResult
+        try { result = await protocol.post(request, false, signal) }
+        catch (error) {
+          // Studio records the operation with any binding it issues: an ask it never recorded is settled now.
+          await dropUnrecordedStartBudgetAsk(state, signal)
+          throw error
+        }
         if (deps.findSession(sessionId) !== session) throw new MachineRotationError('NOT_BOUND')
-        if (result.state === 'exhausted') { await journal.write({ version: 1, launchId: state.launchId, current: state.current, currentOperationId: state.currentOperationId, startSubmitted: state.startSubmitted }); throw new MachineRotationError('NO_ACCOUNT') }
+        if (result.state === 'exhausted') { await journal.write({ version: 1, launchId: state.launchId, current: state.current, currentOperationId: state.currentOperationId, startSubmitted: state.startSubmitted, ...settledMoves(state) }); throw new MachineRotationError('NO_ACCOUNT') }
         if (!result.binding || result.state !== 'pending') throw new MachineRotationError('BINDING_REJECTED')
         const body = await protocol.verifyBinding(result.binding, binding.launchId)
         const next = { ...body, execution: current.execution }; assertMachineRevision(current, next)
@@ -319,6 +349,11 @@ export function createMachineSetupTokenRuntime(deps: {
       })
     },
   }
+}
+/** A settled record keeps the launch's start-budget move count; `added` counts a move that just committed. */
+function settledMoves(state: MachineRotationJournalRecord, added = 0) {
+  const moves = (state.startBudgetMoves ?? 0) + added
+  return moves ? { startBudgetMoves: moves } : {}
 }
 function toRotationObservation(binding: MachineSetupTokenBindingRecord, observation: SetupTokenUsageObservation): RotationObservation {
   return { observationId: observation.observationId ?? createHash('sha256').update(JSON.stringify([binding.nonce, observation])).digest('hex'), observedAt: observation.observedAt,
