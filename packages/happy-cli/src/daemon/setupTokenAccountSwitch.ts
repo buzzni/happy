@@ -412,12 +412,13 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       const shared = sharedSession(sessionId, running)
       if (shared === undefined) return Promise.resolve(failure('NOT_BOUND', `rebind: session ${sessionId} is not an unbound shared-PC session`))
       const parsed = parseBinding(running)
-      // Only a member binding's switch can ask Studio for start budget; a shared-PC switch keeps waiting.
-      if (options.startBudget && (shared || !parsed || isMachineSetupTokenBinding(parsed.binding))) return Promise.resolve({ ok: false as const, reason: 'UNSUPPORTED' as const })
+      // An unbound shared-PC session moves without Studio, which alone knows start budget: it keeps waiting.
+      if (options.startBudget && (shared || !parsed)) return Promise.resolve({ ok: false as const, reason: 'UNSUPPORTED' as const })
       if (parsed && isMachineSetupTokenBinding(parsed.binding)) {
         const binding = parsed.binding
         return Promise.resolve(deps.machineRuntime?.(binding.companyId)).then(runtime => runtime
-          ? runtime.rebind(sessionId, running, observation, signal).then(environment => ({ ok: true as const, environment }), machineFailure)
+          ? (options.startBudget ? runtime.rebind(sessionId, running, observation, signal, options) : runtime.rebind(sessionId, running, observation, signal))
+            .then(environment => ({ ok: true as const, environment }), machineFailure)
           : failure('STUDIO_UNAVAILABLE', 'machine runtime absent'), machineFailure)
       }
       const pending = inFlight.get(sessionId)

@@ -35,7 +35,7 @@ async function setup(expectedRefusal: 'account_limit' | 'authentication_failed' 
   const relations = new Map<string, string>(), sessions = new Map<string, TrackedSession>(), acknowledged = new Map<string, string>()
   let invalidTicket: 'owner' | 'device' | 'body' | undefined
   let loseCreate = false, loseIssue = false, issueBeforeSend = false
-  let denyInitialQuery = false;
+  let denyInitialQuery = false, refuseStartBudget = false;
   let deny = false, saveFailure = false, crashAfterRebind = false, commitTimeout = false, claimTimeout = false, count = 0
   const journal = { read: async (id: string) => structuredClone(disk.get(id) ?? null), write: vi.fn(async (record: MachineRotationJournalRecord) => {
     if (crashAfterRebind && record.pending?.binding?.bindingRevision === 2) { crashAfterRebind = false; throw new MachineRotationError('PERSISTENCE_FAILED') }
@@ -53,12 +53,14 @@ async function setup(expectedRefusal: 'account_limit' | 'authentication_failed' 
       const op = operations.get(body.targetOperationId)
       return op ? Response.json(op) : Response.json({ error: 'SETUP_TOKEN_DAEMON_OPERATION_NOT_FOUND' }, { status: 404 })
     }
+    // A Studio from before start-budget switches refuses the field without recording anything.
+    if (refuseStartBudget && body.action === 'rebind' && body.startBudget) return Response.json({ error: 'SETUP_TOKEN_DAEMON_INVALID_INPUT' }, { status: 400 })
     const prior = operations.get(body.operationId); if (prior) return Response.json(prior)
     if (body.action === 'issue' || body.action === 'rebind') {
       const pending = disk.get(body.launchId)?.pending
       expect(pending?.request.operationId).toBe(body.operationId) // Intent ACK BEFORE mutation.
       const previous = body.action === 'rebind' ? bindings.get(body.nonce)! : undefined
-      if (body.action === 'rebind') {
+      if (body.action === 'rebind' && !body.startBudget) {
         expect(body.observation).toMatchObject({ managedAccountId: previous!.managedAccountId, credentialGeneration: 1, accountWideRefusal: expectedRefusal, windows: [] })
       }
       const binding: MachineSetupTokenBindingV2 = { version: 2, type: 'claude-setup-token-binding', audience: 'saycode-daemon', principalType: 'machine', companyId, machineId,
@@ -134,7 +136,7 @@ async function setup(expectedRefusal: 'account_limit' | 'authentication_failed' 
     sessions.set(binding.execution.sessionId, tracked)
     return { tracked, binding }
   }
-  return { denyInitialQuery: () => { denyInitialQuery = true }, advance: (ms: number) => { clock += ms }, build, input, attach, requests, steps, disk, sessions, operations, persist, sessionEnvironment, journal,
+  return { denyInitialQuery: () => { denyInitialQuery = true }, refuseStartBudget: () => { refuseStartBudget = true }, advance: (ms: number) => { clock += ms }, build, input, attach, requests, steps, disk, sessions, operations, persist, sessionEnvironment, journal,
     invalidTicket: (value: typeof invalidTicket) => { invalidTicket = value },
     loseCreate: () => { loseCreate = true }, loseIssue: (before = false) => { if (before) issueBeforeSend = true; else loseIssue = true }, drafts,
     failSave: (value: boolean) => { saveFailure = value }, deny: () => { deny = true }, crashRebind: () => { crashAfterRebind = true }, loseCommit: () => { commitTimeout = true }, loseClaim: () => { claimTimeout = true } }
@@ -217,6 +219,33 @@ describe('machine-v2 actual launch and control consumer transaction', () => {
     await runtime.prepareLaunch(t.input);
     expect(t.sessionEnvironment).toHaveBeenCalledTimes(1);
   });
+  it('moves for start budget without usage evidence, outside the five usage-limit switches', async () => {
+    const t = await setup(), runtime = t.build(), launch = await runtime.prepareLaunch(t.input); t.attach(launch.environment)
+    const id = launch.session.id, running = () => t.sessions.get(id)!.agentEnvironment![SETUP_TOKEN_BINDING_ENV]!
+    const revision = () => (readSetupTokenResumeSelection({ [SETUP_TOKEN_BINDING_ENV]: running() })!.binding as MachineSetupTokenBindingV2).bindingRevision
+    for (let i = 0; i < 6; i++) await runtime.rebind(id, running(), undefined, undefined, { startBudget: true })
+    const moves = t.requests.filter(r => r.action === 'rebind')
+    expect(moves).toHaveLength(6)
+    expect(moves.every(r => r.action === 'rebind' && r.startBudget === true && r.observation === undefined)).toBe(true)
+    expect(revision()).toBe(7)
+    // A replaced daemon reads the count back from its journal.
+    expect([...t.disk.values()][0].startBudgetMoves).toBe(6)
+    const replaced = t.build()
+    for (let i = 0; i < 5; i++) await replaced.rebind(id, running(), refusal)
+    expect(revision()).toBe(12)
+    await expect(replaced.rebind(id, running(), refusal)).rejects.toThrow('ROTATION_LIMIT')
+  })
+  it('does not let a start-budget ask Studio refused hold back a later usage-limit switch', async () => {
+    const t = await setup(), runtime = t.build(), launch = await runtime.prepareLaunch(t.input); t.attach(launch.environment)
+    const id = launch.session.id, running = launch.environment[SETUP_TOKEN_BINDING_ENV]
+    t.refuseStartBudget()
+    await expect(runtime.rebind(id, running, undefined, undefined, { startBudget: true })).rejects.toThrow('REQUEST_FAILED')
+    expect([...t.disk.values()][0].pending).toBeUndefined()
+    await runtime.rebind(id, running, refusal)
+    const rebinds = t.requests.filter(r => r.action === 'rebind')
+    expect(rebinds).toHaveLength(2)
+    expect(rebinds[1]).toMatchObject({ observation: expect.objectContaining({ accountWideRefusal: 'account_limit' }) })
+  })
   it('coalesces concurrent rebind consumers and catches a stale provider up without another selection', async () => {
     const t = await setup(), runtime = t.build(), launch = await runtime.prepareLaunch(t.input); t.attach(launch.environment)
     const id = launch.session.id, running = launch.environment[SETUP_TOKEN_BINDING_ENV]
