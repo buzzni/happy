@@ -270,6 +270,19 @@ describe('controlServer /browser routes', () => {
         expect((await res.json() as { code: string }).code).toBe('BRIDGE_PORT_IN_USE')
     })
 
+    it('POST /browser/request returns 503 when Chrome is paired only with the machine token', async () => {
+        const { ws } = await connectExtension(bridgePort, `token=${TOKEN}&profile=justin`)
+        await expect.poll(() => bridge.connections()).toEqual([{ profile: 'justin' }])
+        const res = await fetch(`${baseUrl}/browser/request`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ method: 'ping', viewerKey: 'bv1_abcdefghijklmnopqrstuvwxyz012345' }),
+        })
+        expect(res.status).toBe(503)
+        expect((await res.json() as { code: string }).code).toBe('VIEWER_NOT_CONNECTED')
+        ws.close()
+    })
+
     it('POST /browser/request returns 504 on extension timeout', async () => {
         const { ws } = await connectExtension(bridgePort, `token=${TOKEN}`)
         // extension never answers
