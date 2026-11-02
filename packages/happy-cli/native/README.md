@@ -51,6 +51,15 @@ Windows의 Chrome transport, pipe ACL, 서비스 수락은 이 테스트에 포�
 
 ## 남은 production 경계
 
+개인 PC의 `personalDesktop`은 VNC 없이 사용자 영역의 전용 Chrome 창을 실행한다.
+콘솔은 런타임 설정에서 이 모드를 받아 작업 PC의 Chrome 창을 선택하도록 안내하고,
+VNC 화면 보기·크기 조절·ticket 발급을 시도하지 않는다. 페이지를 열기 전에는 창이
+없으며, 페이지 창이 백그라운드에 있을 수 있다. 직접 조작할 때는 콘솔에서 제어권을
+가져온 뒤 작업 PC에서 해당 Chrome 창을 선택하고, 마친 뒤 반납·계속 진행한다.
+OS의 직접 입력은 VNC 입력 lease로 차단되지 않는다. 원격 콘솔 안에 개인 PC 화면을
+전송하거나 입력하는 기능은 제공하지 않으며, 필요해지면 별도 권한·조회/입력 경계를
+설계한다. 기존 Linux VNC viewer와 nativeService 보호 설정은 이 분기에 포함하지 않는다.
+
 - 전용 서비스 신원, 보호 디렉터리와 IPC ACL, 원격 요청의 대상·권한 검증.
 - 별도 OS 신원의 에이전트가 broker/admin secret·프로필·raw CDP에 접근하지 못하는 실측.
 - CDP 단절 이후에도 유지되는 독립 네트워크 정책. 기존 Mac pf 실험만으로
