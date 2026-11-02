@@ -112,9 +112,8 @@ Auth flows:
 - `GET /v1/friends`
 - `GET /v1/feed`
 
-### Version and voice
+### Version
 - `POST /v1/version`
-- `POST /v1/voice/token`
 
 ### Dev-only
 - `POST /logs-combined-from-cli-and-mobile-for-simple-ai-debugging` (only if enabled)
