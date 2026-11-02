@@ -1038,6 +1038,20 @@ describe('AI credential machine runtime', () => {
     expect(files.get(path)).not.toContain('copied-owner-refresh')
   })
 
+  it('keeps the owner machine refresh token when its own bundle is delivered back to it', async () => {
+    const { runtime, files } = setup()
+    const path = '/home/operator/.codex/multi-auth/openai-codex-accounts.json'
+    const local = codexMultiAuthBundle().accounts
+    Object.assign(local.accounts[0]!, { accessToken: 'owner-access', refreshToken: 'owner-refresh', expiresAt: 200 })
+    files.set(path, JSON.stringify(local))
+    const incoming = codexMultiAuthBundle()
+    incoming.accounts.accounts = [Object.assign({ ...incoming.accounts.accounts[0]! }, { accessToken: 'owner-access', refreshToken: CODEX_OWNER_MANAGED_REFRESH_TOKEN, expiresAt: 200 })]
+
+    await runtime.apply({ provider: 'codex', payload: JSON.stringify(incoming), applyMode: 'merge' })
+
+    expect(JSON.parse(files.get(path)!).accounts[0]).toMatchObject({ refreshToken: 'owner-refresh', expiresAt: 200 })
+  })
+
   it('never rolls an owner-managed Codex account back to an older delivery', async () => {
     const { runtime, files } = setup()
     const path = '/home/operator/.codex/multi-auth/openai-codex-accounts.json'

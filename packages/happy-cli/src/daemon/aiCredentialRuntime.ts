@@ -80,6 +80,11 @@ function codexAccessTokenExpiry(token: unknown): number | undefined {
   } catch { return undefined }
 }
 
+/** A pool entry's expiry: its recorded `expiresAt`, else its access token's own, else 0 (unknown sorts oldest). */
+function codexAccountExpiry(account: CodexMultiAuthAccount): number {
+  return typeof account.expiresAt === 'number' ? account.expiresAt : codexAccessTokenExpiry(account.accessToken) ?? 0
+}
+
 function withoutCodexRefreshTokens(payload: string): string {
   const bundle = parseCodexMultiAuthBundle(payload)
   if (!bundle) throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
@@ -604,7 +609,6 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         const auth = parseOptionalCredentialJson(await readOptionalText(deps, path))
         return auth && isObject(auth.tokens) ? auth.tokens : null
       }
-      const expiryOf = (account: CodexMultiAuthAccount) => typeof account.expiresAt === 'number' ? account.expiresAt : codexAccessTokenExpiry(account.accessToken) ?? 0
       // Writes rotated tokens into the pool entry, unless another writer replaced that entry's refresh token meanwhile.
       const adopt = (accountId: string, expected: readonly string[], tokens: Record<string, unknown>) => deps.lockCredentialFile(accountsPath, async () => {
         const pool = await readPool()
@@ -620,7 +624,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       if (live && typeof live.account_id === 'string' && typeof live.refresh_token === 'string' && live.refresh_token
         && live.refresh_token !== CODEX_OWNER_MANAGED_REFRESH_TOKEN) {
         const entry = (await readPool()).accounts.find(account => account.accountId === live.account_id)
-        if (entry && entry.refreshToken !== live.refresh_token && (codexAccessTokenExpiry(live.access_token) ?? 0) > expiryOf(entry)) {
+        if (entry && entry.refreshToken !== live.refresh_token && (codexAccessTokenExpiry(live.access_token) ?? 0) > codexAccountExpiry(entry)) {
           await adopt(entry.accountId as string, [entry.refreshToken], live)
         }
       }
@@ -630,7 +634,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       for (const account of (await readPool()).accounts) {
         const accountId = account.accountId
         if (typeof accountId !== 'string' || account.enabled === false || !account.refreshToken
-          || account.refreshToken === CODEX_OWNER_MANAGED_REFRESH_TOKEN || expiryOf(account) - deps.now() > thresholdMs) continue
+          || account.refreshToken === CODEX_OWNER_MANAGED_REFRESH_TOKEN || codexAccountExpiry(account) - deps.now() > thresholdMs) continue
         const liveTokens = await readTokens(livePath)
         const inLiveHome = liveTokens?.account_id === accountId
         const home = inLiveHome ? dirname(livePath) : await deps.makeTempDir()
@@ -1482,11 +1486,12 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         ? { accountId: account.accountId } : { email: typeof account.email === 'string' ? account.email : undefined }
       const matching = (account: CodexMultiAuthAccount, other: CodexMultiAuthAccount) => account.accountId
         ? account.accountId === other.accountId : account.email === other.email
-      // An owner-managed account is rotated only on its source machine: the delivery replaces any copied refresh
-      // token here, and never rolls back a newer delivery (specs/codex-oauth-refresh-owner R4, R7).
+      // An owner-managed account is rotated only on its source machine: a strictly newer delivery replaces any copied
+      // refresh token here, and nothing older or equal replaces anything — so the owner, whose own login is always at
+      // least as new as what it delivered, never loses its refresh token (specs/codex-oauth-refresh-owner R4, R7).
       const ownerManaged = (account: CodexMultiAuthAccount) => account.refreshToken === CODEX_OWNER_MANAGED_REFRESH_TOKEN
       const takesOver = (local: CodexMultiAuthAccount, incoming: CodexMultiAuthAccount) => matching(local, incoming)
-        && (!ownerManaged(local) || (incoming.expiresAt ?? 0) > (local.expiresAt ?? 0))
+        && codexAccountExpiry(incoming) > codexAccountExpiry(local)
       const deliveries = bundle.accounts.accounts.filter(ownerManaged)
       const duplicates = bundle.accounts.accounts.filter(incoming => !ownerManaged(incoming) && current.accounts.accounts.some(local => matching(local, incoming)
         && local.enabled !== false && (local.accessToken !== incoming.accessToken || local.refreshToken !== incoming.refreshToken)))
