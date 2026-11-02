@@ -172,6 +172,9 @@ import {
 import { DifficultyRoutingCommitter } from '@/difficultyRoutingCommit';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { createCodexUsageEvent } from '@/usage/providerUsageAdapters';
+import { AgentPlanLaunchError } from '@/launcher/agentPlanLaunch';
+import { assertNotAgentPlanThreadWithoutPlan, consumeAgentPlanLaunch, reportAgentPlanApplied, startAgentPlanSession, type AgentPlanSession } from './agentPlanSession';
+import { agentPlanThreadsDir, recordAgentPlanThread } from '@/launcher/agentPlanThreads';
 import {
     consumePendingInitialAppendSystemPrompt,
     consumePendingInitialEffort,
@@ -255,6 +258,8 @@ export async function runCodex(opts: {
     const recallHostEnvironment = { ...process.env };
     if (standaloneLaunch && (managedStartup || opts.startedBy !== 'daemon')) throw new Error('Standalone launch requires an unmanaged daemon session');
     const launchControl = standaloneLaunch ? await SessionLaunchControl.connect(standaloneLaunch) : undefined;
+    // aplus specs/org-agent-plan §6.3-2: the plan's local proxy, closed with the runner.
+    let agentPlanSession: AgentPlanSession | null = null;
     try {
     const accountToken = opts.principal?.kind === 'account' ? opts.principal.credentials.token : null;
     if (managedStartup) {
@@ -271,12 +276,21 @@ export async function runCodex(opts: {
         applyManagedGatewayEnvironment(process.env, managedStartup.envelope);
         applyManagedInitialPrompt(process.env, managedStartup.envelope);
     }
+    // Read and deleted before anything else reads the environment. A plan launch that cannot be honoured stops
+    // here; it never continues on the machine's own Codex login or the multi-auth proxy.
+    const agentPlanLaunch = consumeAgentPlanLaunch(process.env);
+    if (agentPlanLaunch && managedStartup) throw new AgentPlanLaunchError('agent_plan_managed_conflict');
 
     const deferredContinuation = createDeferredContinuationContextConsumer(process.env);
     installBroadKillShims();
     const automationRunOnceRequested = consumeAutomationRunOnce(process.env);
     const reconnectSession = consumeReconnectSessionEnvironment(process.env);
     const reconnectSessionId = reconnectSession?.id;
+    assertNotAgentPlanThreadWithoutPlan({
+        launch: agentPlanLaunch,
+        threadsDir: agentPlanThreadsDir(configuration.happyHomeDir),
+        threadIds: [opts.resumeThreadId, reconnectSession?.metadata?.codexThreadId, process.env.HAPPY_FORK_CODEX_THREAD_ID],
+    });
     const allowAutomationReconnectPrompt = process.env.HAPPY_AUTOMATION_RESUME_PROMPT === '1';
     delete process.env.HAPPY_AUTOMATION_RESUME_PROMPT;
     const preparedInitialPrompt = prepareCodexInitialPrompt({
@@ -414,6 +428,13 @@ export async function runCodex(opts: {
         prepared: preparedInitialPrompt,
     });
     if (standaloneLaunch && (!response || sandboxConfig?.checkpointProtection)) throw new Error('Standalone drain requires an online standard session');
+    if (agentPlanLaunch) {
+        // Bound now, before the daemon hears the session started: a refused binding fails the spawn instead of
+        // leaving a session that cannot answer. The server binds the Happy session id, so it must exist.
+        if (!response) throw new AgentPlanLaunchError('agent_plan_session_unavailable', 'the Happy server is unreachable');
+        agentPlanSession = await startAgentPlanSession({ launch: agentPlanLaunch, sessionId: response.id, env: process.env });
+        logger.debug(`[codex] Agent plan session bound (grant ${agentPlanLaunch.descriptor.grantId}, model ${agentPlanLaunch.descriptor.model})`);
+    }
     if (!response && sandboxConfig?.checkpointProtection) {
         throw new Error('checkpoint protection requires an authoritative server session');
     }
@@ -547,7 +568,8 @@ export async function runCodex(opts: {
     const reconnectPin = publishedSessionModelPin(reconnectSession?.metadata);
     // Consume even when --model wins, so child processes cannot inherit the seed.
     const pendingInitialModel = consumePendingInitialModel(process.env);
-    const explicitInitialModel = opts.initialModel ?? pendingInitialModel ?? reconnectPin.model;
+    // A plan session runs the grant's model; the gateway overwrites any other choice anyway.
+    const explicitInitialModel = agentPlanLaunch?.descriptor.model ?? opts.initialModel ?? pendingInitialModel ?? reconnectPin.model;
     const rawInitialEffortSeed = consumePendingInitialEffort(process.env) ?? reconnectPin.effort;
     if (rawInitialEffortSeed && !isSupportedCodexReasoningEffort(rawInitialEffortSeed)) {
         logger.debug(`[Codex] Ignoring invalid initial effort seed: ${rawInitialEffortSeed}`);
@@ -1390,6 +1412,8 @@ export async function runCodex(opts: {
         }),
         checkpointComposition.markTurnDispatched,
         recallHost !== null,
+        undefined,
+        agentPlanSession?.providerArgs ?? null,
     );
 
     let ingestThreadMetadata: { threadId: string; path: Promise<string | null> } | null = null;
@@ -2209,6 +2233,7 @@ export async function runCodex(opts: {
         try {
             await client.connect();
             logger.debug('[codex]: client.connect done');
+            if (agentPlanSession) reportAgentPlanApplied(process.env, client.agentPlanApplied);
 
             if (opts.resumeThreadId) {
                 await resumeExistingThread({
@@ -2601,6 +2626,15 @@ export async function runCodex(opts: {
                         }));
                     }
 
+                    // §6.3-4: every thread a plan turn runs on is marked, however it was started, resumed or forked.
+                    // A failed write does not stop the turn (the Studio refuses an envelope-less continuation too),
+                    // but it is recorded: without the marker a local resume of this thread is not caught here.
+                    if (agentPlanSession && agentPlanLaunch?.threadsDir) {
+                        await recordAgentPlanThread(agentPlanLaunch.threadsDir, activeThreadId, {
+                            sessionId: session.sessionId,
+                            grantId: agentPlanLaunch.descriptor.grantId,
+                        }).catch((error) => logger.warn('[codex] Agent plan thread marker not written', error));
+                    }
                     const runtimeRecovery = await measure('mcp-recovery', () => mcpRuntimeRecovery.recoverBeforeTurn({
                         threadId: activeThreadId,
                         mcpServers: mcpSync.mcpServers,
@@ -3106,5 +3140,6 @@ export async function runCodex(opts: {
     }
     } finally {
         launchControl?.close();
+        await agentPlanSession?.close().catch(() => undefined);
     }
 }

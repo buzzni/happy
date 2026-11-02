@@ -47,6 +47,11 @@ export const AI_AUTH_SOURCES = [
     'platform-glm',
     /** A Cloud gateway capability. */
     'platform-gateway',
+    /**
+     * The organization agent plan gateway (aplus specs/org-agent-plan §6.1). Written only by the Codex runner,
+     * after the plan provider actually reached the Codex launch — never by the daemon (§6.3-3).
+     */
+    'platform-plan',
     /** Not established. Never inferred. */
     'unknown',
     // `org-bundle-observed` is deliberately absent: it is an in-process

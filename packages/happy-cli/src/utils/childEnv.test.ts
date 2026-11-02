@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildManagedSessionSpawnEnvironment } from '../daemon/sessionEnv'
+import { buildManagedSessionSpawnEnvironment, buildSpawnRequestEnvironment } from '../daemon/sessionEnv'
 import { clearInheritedSessionLineage, NON_INHERITABLE_ENV, nonInheritableEnvEntry, sanitizeChildEnv } from './childEnv'
 
 describe('sanitizeChildEnv', () => {
@@ -211,5 +211,43 @@ describe('clearInheritedSessionLineage', () => {
         }
         clearInheritedSessionLineage(env)
         expect(env).toEqual({ PATH: '/usr/bin', HAPPY_INITIAL_PROMPT: 'this run', APLUS_SESSION_ID: 'self' })
+    })
+})
+
+describe('organization agent plan seeds (aplus specs/org-agent-plan §6.3-2)', () => {
+    it('drop the descriptor and grant secret before the agent CLI and its shells', () => {
+        const env = {
+            PATH: '/usr/bin',
+            HAPPY_INITIAL_AGENT_PLAN_DESCRIPTOR: '{"version":1}',
+            HAPPY_INITIAL_AGENT_PLAN_SECRET: 'grant-secret',
+            HAPPY_AI_AUTH_SOURCE: 'unknown',
+        }
+        const inSession = sanitizeChildEnv(env, { boundary: 'in-session' })
+        expect(inSession).toEqual({ PATH: '/usr/bin', HAPPY_AI_AUTH_SOURCE: 'unknown' })
+        expect(Object.values(inSession)).not.toContain('grant-secret')
+        expect(sanitizeChildEnv(env)).toEqual({ PATH: '/usr/bin' })
+        expect(nonInheritableEnvEntry('HAPPY_INITIAL_AGENT_PLAN_SECRET')?.kind).toBe('spawn-seed')
+    })
+
+    it('are neither inherited from the daemon nor accepted from the spawn request environment', () => {
+        const inherited = buildManagedSessionSpawnEnvironment(
+            { PATH: '/usr/bin', HAPPY_INITIAL_AGENT_PLAN_SECRET: 'inherited-from-a-restarted-daemon' },
+            {},
+            {},
+        )
+        expect(inherited).not.toHaveProperty('HAPPY_INITIAL_AGENT_PLAN_SECRET')
+        const requested = buildSpawnRequestEnvironment({}, {
+            HAPPY_INITIAL_AGENT_PLAN_DESCRIPTOR: '{"version":1}',
+            HAPPY_INITIAL_AGENT_PLAN_SECRET: 'caller-made-up',
+        })
+        expect(requested).toEqual({})
+    })
+})
+
+describe('organization agent plan proxy key', () => {
+    it('reaches the agent CLI but not a process that hosts another session', () => {
+        const env = { PATH: '/usr/bin', HAPPY_AGENT_PLAN_PROXY_KEY: 'loopback-only' }
+        expect(sanitizeChildEnv(env, { boundary: 'in-session' })).toEqual(env)
+        expect(sanitizeChildEnv(env)).toEqual({ PATH: '/usr/bin' })
     })
 })

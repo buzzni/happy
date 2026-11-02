@@ -265,6 +265,12 @@ export const MachineMetadataSchema = z.object({
    */
   aiAuthSelection: z.object({ version: z.literal(1) }).optional(),
   /**
+   * aplus specs/org-agent-plan §6.3-1 — `spawn-happy-session` accepts `agentPlan: { grantEnvelope }` for Codex.
+   * A separate field rather than a v2 of `aiAuthSelection`, which clients support at exactly version 1.
+   * Windows daemons do not publish it (§6.3-5).
+   */
+  agentPlan: z.object({ version: z.literal(1) }).optional(),
+  /**
    * Saycode specs/claude-cli-benchmark-followups R2 — `spawn-happy-session` accepts `outputFormat`
    * for these agents. Absent on an older daemon, which would drop the field and run the session
    * without it, so a client must not send one. `agents` is a plain string array so a newer value

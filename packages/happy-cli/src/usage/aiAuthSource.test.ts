@@ -29,6 +29,10 @@ describe('normalizeAiAuthSource', () => {
         expect(normalizeAiAuthSource('org-bundle')).toBe('org-bundle')
     })
 
+    it('knows the organization agent plan source the Studio ledger accepts', () => {
+        expect(normalizeAiAuthSource('platform-plan')).toBe('platform-plan')
+    })
+
     it.each([
         ['a missing value', undefined],
         ['an empty string', ''],

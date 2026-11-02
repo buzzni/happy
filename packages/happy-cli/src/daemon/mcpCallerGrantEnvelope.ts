@@ -92,6 +92,20 @@ export function injectMcpCallerGrant(
     return sanitized;
 }
 
+/**
+ * Opens a daemon-addressed sealed box: base64 of `ephemeralPublicKey(32) | nonce(24) | nacl.box`, the
+ * layout the Studio and browsers produce with the daemon's grant public key. `null` for anything that is
+ * not such an envelope or does not open with `secretKey`.
+ */
+export function openSealedGrantEnvelope(envelope: string, secretKey: Uint8Array): Uint8Array | null {
+    const bundle = decodeEnvelope(envelope);
+    if (!bundle) return null;
+    const ephemeralPublicKey = bundle.slice(0, EPHEMERAL_PUBLIC_KEY_BYTES);
+    const nonce = bundle.slice(EPHEMERAL_PUBLIC_KEY_BYTES, EPHEMERAL_PUBLIC_KEY_BYTES + NONCE_BYTES);
+    const ciphertext = bundle.slice(EPHEMERAL_PUBLIC_KEY_BYTES + NONCE_BYTES);
+    return tweetnacl.box.open(ciphertext, nonce, ephemeralPublicKey, secretKey);
+}
+
 function decodeEnvelope(value: string): Uint8Array | null {
     if (!value || value.length > 16 * 1024 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
         return null;
@@ -158,18 +172,7 @@ export class McpCallerGrantEnvelopeConsumer {
         envelope: string,
         context: { projectId: string | null },
     ): McpCallerGrantEnvelopeResult {
-        const bundle = decodeEnvelope(envelope);
-        if (!bundle) return { ok: false, reason: 'invalid-envelope' };
-
-        const ephemeralPublicKey = bundle.slice(0, EPHEMERAL_PUBLIC_KEY_BYTES);
-        const nonce = bundle.slice(EPHEMERAL_PUBLIC_KEY_BYTES, EPHEMERAL_PUBLIC_KEY_BYTES + NONCE_BYTES);
-        const ciphertext = bundle.slice(EPHEMERAL_PUBLIC_KEY_BYTES + NONCE_BYTES);
-        const plaintext = tweetnacl.box.open(
-            ciphertext,
-            nonce,
-            ephemeralPublicKey,
-            this.options.secretKey,
-        );
+        const plaintext = openSealedGrantEnvelope(envelope, this.options.secretKey);
         if (!plaintext) return { ok: false, reason: 'invalid-envelope' };
 
         let grant: string;

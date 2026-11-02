@@ -13,6 +13,7 @@ import { RpcHandlerManager } from '../../api/rpc/RpcHandlerManager';
 import type { AiAuthSelection } from '@/daemon/sessionEnv';
 import type { ReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
 import type { AiAuthSource } from '@/usage/aiAuthSource';
+import type { AgentPlanSpawnParam } from '@/daemon/agentPlanGrantEnvelope';
 import { validatePath } from './pathSecurity';
 import { isStrictlyGuardedPath } from './happyHomeGuard';
 import { ensureDirectory } from './ensureDirectory';
@@ -455,6 +456,11 @@ export interface SpawnSessionOptions {
      * would have used", which is the behaviour that predates the choice.
      */
     aiAuthSelection?: AiAuthSelection;
+    /**
+     * aplus specs/org-agent-plan §6.3-2 — the organization agent plan grant, sealed to this machine. Only sent
+     * to a daemon advertising `MachineMetadata.agentPlan`, for Codex, never together with `aiAuthSelection`.
+     */
+    agentPlan?: AgentPlanSpawnParam;
     /** Session-scoped Claude structured output, validated at the RPC boundary (specs/claude-cli-benchmark-followups R2). */
     outputFormat?: ClaudeOutputFormat;
 }

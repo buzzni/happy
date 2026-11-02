@@ -25,6 +25,8 @@ import { DELEGATED_ATTENDANCE_ENV, parseDelegatedAttendance } from '@/api/turnAt
 import { sanitizeChildEnv, SETUP_TOKEN_BINDING_ENV } from '@/utils/childEnv'
 import { OUTPUT_FORMAT_ENV, parseOutputFormat } from '@/claude/structuredOutput'
 import { INPUT_EVIDENCE_ENV, requestedInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings'
+import { AGENT_PLAN_DESCRIPTOR_ENV, AGENT_PLAN_SECRET_ENV } from '@/launcher/agentPlanLaunch'
+import { AGENT_PLAN_THREADS_DIR_ENV } from '@/launcher/agentPlanThreads'
 
 function isValidOutputFormatSeed(raw: string): boolean {
     try {
@@ -51,7 +53,15 @@ type SaycodeAgentEnvironmentKey = typeof SAYCODE_AGENT_ENV_KEYS[number]
 const CHECKPOINT_CONTEXT_KEY = CHECKPOINT_SPAWN_CONTEXT_ENV_KEY
 /** Set from the spawn option `browserContinuation` only (request environment cannot carry HAPPY_AUTOMATION_*). */
 export const BROWSER_CONTINUATION_ENV = 'HAPPY_AUTOMATION_BROWSER_CONTINUATION'
-type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV
+/**
+ * aplus specs/org-agent-plan §6.3-4 — a plan session's spawn seeds, kept with the session so every resume
+ * re-applies the same descriptor and grant (the server accepts the same session id again). They stay spawn
+ * seeds in the child: the runner reads and deletes them and `HAPPY_INITIAL_` never reaches Codex. The record
+ * lives in owner-only sessions.json beside the session's data key.
+ */
+const AGENT_PLAN_SEED_KEYS = [AGENT_PLAN_DESCRIPTOR_ENV, AGENT_PLAN_SECRET_ENV, AGENT_PLAN_THREADS_DIR_ENV] as const
+type AgentPlanSeedKey = typeof AGENT_PLAN_SEED_KEYS[number]
+type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV | AgentPlanSeedKey
 
 export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey, string>>
 
@@ -265,6 +275,9 @@ export function captureSaycodeAgentEnvironment(
     // A malformed record must stay bound-but-invalid through every capture/persistence
     // path. Keep no corrupt bytes; the resume guard rejects this bounded marker.
     if (binding !== undefined) captured[SETUP_TOKEN_BINDING_ENV] = parseSetupTokenBinding(binding) ? binding : ''
+    if (env[AGENT_PLAN_DESCRIPTOR_ENV] && env[AGENT_PLAN_SECRET_ENV]) {
+        for (const key of AGENT_PLAN_SEED_KEYS) if (env[key]) captured[key] = env[key]
+    }
     const encodedCheckpointContext = env[CHECKPOINT_CONTEXT_KEY]
     if (encodedCheckpointContext && readCheckpointSpawnContext(env)) {
         captured[CHECKPOINT_CONTEXT_KEY] = encodedCheckpointContext

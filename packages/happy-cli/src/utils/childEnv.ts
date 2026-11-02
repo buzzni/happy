@@ -65,6 +65,9 @@ export const NON_INHERITABLE_ENV: readonly NonInheritableEnvEntry[] = [
     { prefix: 'HAPPY_INPUT_EVIDENCE', kind: 'session-scope' },
     { prefix: 'HAPPY_CHECKPOINT_', kind: 'session-scope' },
     { prefix: 'HAPPY_AI_AUTH_', kind: 'session-scope' },
+    // The organization agent plan's local proxy client key (aplus specs/org-agent-plan §6.3-2): Codex needs it,
+    // a process that hosts another session must not carry it. The plan's spawn seeds are HAPPY_INITIAL_.
+    { prefix: 'HAPPY_AGENT_PLAN_', kind: 'session-scope' },
     { prefix: 'APLUS_SESSION_', kind: 'session-scope' },
     { prefix: 'SAYCODE_AGENT_', kind: 'session-scope' },
     // Per-session connector inputs the runner keeps in its own env
