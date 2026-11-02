@@ -334,6 +334,28 @@ describe('AI credential machine runtime', () => {
       expect(JSON.parse(files.get(poolPath)!).accounts[0].refreshToken).toBe('rotated-account-a')
     })
 
+    it.each([
+      { name: 'another account', accountId: 'account-b', sub: 'user' },
+      { name: 'another user of the same workspace', accountId: 'account-a', sub: 'other-user' },
+    ])('does not store the login of $name when the live Codex home switches during the refresh', async ({ accountId, sub }) => {
+      const { runtime, files, pool, execFile } = owner()
+      const other = `header.${Buffer.from(JSON.stringify({ sub, exp: Math.floor((NOW + 10 * DAY) / 1000) })).toString('base64url')}.signature`
+      files.set(livePath, JSON.stringify({ auth_mode: 'chatgpt', tokens: { account_id: 'account-a', access_token: pool.accounts[0]!.accessToken, refresh_token: 'refresh-a', id_token: 'id' } }))
+      const driver = execFile.getMockImplementation()!
+      execFile.mockImplementation(async (command, args, options) => {
+        if (command === process.execPath && args[0] === '-e') {
+          files.set(livePath, JSON.stringify({ auth_mode: 'chatgpt', tokens: { account_id: accountId, access_token: other, refresh_token: 'other-login', id_token: 'id' } }))
+          return { stdout: '', stderr: '' }
+        }
+        return driver(command, args, options)
+      })
+
+      const result = await runtime.refreshCodexOwner({ provider: 'codex', thresholdMs: 3 * DAY })
+
+      expect(JSON.parse(files.get(poolPath)!).accounts[0]).toMatchObject({ accountId: 'account-a', refreshToken: 'refresh-a', accessToken: pool.accounts[0]!.accessToken })
+      expect(result).toMatchObject({ refreshedAccountIds: [], failedAccounts: [{ accountId: 'account-a', errorKind: 'CODEX_OWNER_REFRESH_RACED' }] })
+    })
+
     it('keeps a login Codex already rotated even when the driver then fails', async () => {
       const { runtime, files } = owner({ failsAfterRotating: true })
 
