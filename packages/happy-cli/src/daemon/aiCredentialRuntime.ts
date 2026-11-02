@@ -41,6 +41,9 @@ import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS } from '@/claude/utils/claudeAuthOverride
 import { openSetupTokenAssignment, type SetupTokenAssignmentRecipient } from './setupTokenAssignmentWire'
 import { HAPPY_AI_AUTH_SOURCE_ENV } from '@/usage/aiAuthSource'
 import { CODEX_LOGIN_REFRESH_DRIVER } from './codexLoginRefreshDriver'
+import { CODEX_OWNER_MANAGED_REFRESH_TOKEN } from '@/codex/codexOwnerManagedLogin'
+
+export { CODEX_OWNER_MANAGED_REFRESH_TOKEN }
 import type { SetupTokenUsageObservation } from './setupTokenAccountSwitch'
 import {
   cswapAtLeastPinned, isManagedSetupTokenAccount, managedSetupTokenEmail, managedSetupTokenId, parseCswapVersion, sameManagedSetupToken,
@@ -65,13 +68,6 @@ function isReadableCodexMultiAuthBundleVersion(version: string): boolean {
   return READABLE_HISTORICAL_CODEX_MULTI_AUTH_BUNDLE_VERSIONS.has(version) || isSupportedCodexMultiAuthVersion(version)
 }
 const CODEX_MULTI_AUTH_THRESHOLD = 5
-/**
- * Stands in for every refresh token of a refresh-owner bundle (specs/codex-oauth-refresh-owner): only the
- * source machine may rotate a ChatGPT refresh token, since a copy rotated elsewhere fails the owner with
- * "refresh token was already used". Not a secret; long enough to pass codex-multi-auth's non-empty schema,
- * which silently drops accounts with an empty one, and refused by the token endpoint if a target tries it.
- */
-export const CODEX_OWNER_MANAGED_REFRESH_TOKEN = 'saycode-owner-managed-refresh-v1'
 
 const CODEX_OWNER_REFRESH_DEFAULT_THRESHOLD_MS = 3 * 86_400_000
 const CODEX_OWNER_REFRESH_MAX_THRESHOLD_MS = 9 * 86_400_000
