@@ -939,6 +939,62 @@ describe('AI credential machine runtime', () => {
     expect(calls.some(call => call.command === 'codex-multi-auth' && ['forecast', 'check', 'switch'].includes(call.args[0]!))).toBe(false)
   })
 
+  it('replaces a copied Codex refresh token with the owner-managed placeholder and keeps other accounts', async () => {
+    const { runtime, files } = setup()
+    const path = '/home/operator/.codex/multi-auth/openai-codex-accounts.json'
+    const local = codexMultiAuthBundle().accounts
+    Object.assign(local.accounts[0]!, { accessToken: 'copied-access', refreshToken: 'copied-owner-refresh', expiresAt: 100 })
+    files.set(path, JSON.stringify(local))
+    const incoming = codexMultiAuthBundle()
+    incoming.accounts.accounts = [Object.assign({ ...incoming.accounts.accounts[0]! }, { accessToken: 'owner-access', refreshToken: CODEX_OWNER_MANAGED_REFRESH_TOKEN, expiresAt: 200 })]
+
+    await runtime.apply({ provider: 'codex', payload: JSON.stringify(incoming), applyMode: 'merge' })
+
+    const pool = JSON.parse(files.get(path)!)
+    expect(pool.accounts[0]).toMatchObject({ accountId: 'account-a', accessToken: 'owner-access', refreshToken: CODEX_OWNER_MANAGED_REFRESH_TOKEN, expiresAt: 200 })
+    expect(pool.accounts.slice(1)).toEqual(local.accounts.slice(1))
+    expect(files.get(path)).not.toContain('copied-owner-refresh')
+  })
+
+  it('never rolls an owner-managed Codex account back to an older delivery', async () => {
+    const { runtime, files } = setup()
+    const path = '/home/operator/.codex/multi-auth/openai-codex-accounts.json'
+    const local = codexMultiAuthBundle().accounts
+    Object.assign(local.accounts[0]!, { accessToken: 'newer-owner-access', refreshToken: CODEX_OWNER_MANAGED_REFRESH_TOKEN, expiresAt: 300 })
+    files.set(path, JSON.stringify(local))
+    const incoming = codexMultiAuthBundle()
+    incoming.accounts.accounts = [Object.assign({ ...incoming.accounts.accounts[0]! }, { accessToken: 'older-owner-access', refreshToken: CODEX_OWNER_MANAGED_REFRESH_TOKEN, expiresAt: 200 })]
+
+    await runtime.apply({ provider: 'codex', payload: JSON.stringify(incoming), applyMode: 'merge' })
+
+    expect(JSON.parse(files.get(path)!).accounts[0]).toMatchObject({ accessToken: 'newer-owner-access', expiresAt: 300 })
+  })
+
+  it('writes a newer owner-managed access token into the live Codex login of the active account', async () => {
+    const { runtime, files, calls, execFile } = setup()
+    const path = '/home/operator/.codex/multi-auth/openai-codex-accounts.json'
+    const livePath = '/home/operator/.codex/auth.json'
+    const local = codexMultiAuthBundle().accounts
+    Object.assign(local.accounts[0]!, { accessToken: 'old-owner-access', refreshToken: CODEX_OWNER_MANAGED_REFRESH_TOKEN, expiresAt: 100 })
+    files.set(path, JSON.stringify(local))
+    files.set(livePath, JSON.stringify({ tokens: { account_id: 'account-a', access_token: 'old-owner-access', refresh_token: CODEX_OWNER_MANAGED_REFRESH_TOKEN } }))
+    const original = execFile.getMockImplementation()!
+    execFile.mockImplementation(async (command, args, options) => {
+      if (command === 'codex-multi-auth' && args[0] === 'switch') {
+        const pool = JSON.parse(files.get(path)!); const active = pool.accounts[Number(args[1]) - 1]
+        files.set(livePath, JSON.stringify({ tokens: { account_id: active.accountId, access_token: active.accessToken, refresh_token: active.refreshToken } }))
+      }
+      return original(command, args, options)
+    })
+    const incoming = codexMultiAuthBundle()
+    incoming.accounts.accounts = [Object.assign({ ...incoming.accounts.accounts[0]! }, { accessToken: 'new-owner-access', refreshToken: CODEX_OWNER_MANAGED_REFRESH_TOKEN, expiresAt: 200 })]
+
+    await runtime.apply({ provider: 'codex', payload: JSON.stringify(incoming), applyMode: 'merge' })
+
+    expect(calls).toContainEqual({ command: 'codex-multi-auth', args: ['switch', '1'] })
+    expect(JSON.parse(files.get(livePath)!).tokens).toMatchObject({ account_id: 'account-a', access_token: 'new-owner-access', refresh_token: CODEX_OWNER_MANAGED_REFRESH_TOKEN })
+  })
+
   it('preserves existing Codex tokens when the same identity is sent again', async () => {
     const { runtime, files } = setup()
     const bundle = codexMultiAuthBundle()

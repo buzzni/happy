@@ -1392,20 +1392,27 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         ? { accountId: account.accountId } : { email: typeof account.email === 'string' ? account.email : undefined }
       const matching = (account: CodexMultiAuthAccount, other: CodexMultiAuthAccount) => account.accountId
         ? account.accountId === other.accountId : account.email === other.email
-      const duplicates = bundle.accounts.accounts.filter(incoming => current.accounts.accounts.some(local => matching(local, incoming)
+      // An owner-managed account is rotated only on its source machine: the delivery replaces any copied refresh
+      // token here, and never rolls back a newer delivery (specs/codex-oauth-refresh-owner R4, R7).
+      const ownerManaged = (account: CodexMultiAuthAccount) => account.refreshToken === CODEX_OWNER_MANAGED_REFRESH_TOKEN
+      const takesOver = (local: CodexMultiAuthAccount, incoming: CodexMultiAuthAccount) => matching(local, incoming)
+        && (!ownerManaged(local) || (incoming.expiresAt ?? 0) > (local.expiresAt ?? 0))
+      const deliveries = bundle.accounts.accounts.filter(ownerManaged)
+      const duplicates = bundle.accounts.accounts.filter(incoming => !ownerManaged(incoming) && current.accounts.accounts.some(local => matching(local, incoming)
         && local.enabled !== false && (local.accessToken !== incoming.accessToken || local.refreshToken !== incoming.refreshToken)))
       const localCheck = await verifyLocalAiAccounts(deps, 'codex', duplicates.map(identity), current.accounts.accounts, { budgetMs: 60_000 })
       const invalid = duplicates.filter((_account, index) => localCheck.accounts[index]?.errorKind === 'AUTHENTICATION_FAILED')
       const sharedCheck = await verifyLocalAiAccounts(deps, 'codex', invalid.map(identity), invalid, { budgetMs: 60_000 })
       const accepted = invalid.filter((_account, index) => sharedCheck.accounts[index]?.ok)
       const refreshed = { ...current.accounts, accounts: current.accounts.accounts.map(local => {
-        const incoming = accepted.find(account => matching(local, account))
+        const incoming = accepted.find(account => matching(local, account)) ?? deliveries.find(account => takesOver(local, account))
         return incoming ? { ...local, refreshToken: incoming.refreshToken, accessToken: incoming.accessToken,
           expiresAt: incoming.expiresAt } : local
       }) }
-      const repairedActive = accepted.some(account => {
+      const repairedActive = [...accepted, ...deliveries].some(account => {
         const active = current.accounts.accounts[current.accounts.activeIndex]
-        return active && matching(active, account) && !!live && isObject(live.tokens) && live.tokens.account_id === active.accountId
+        return active && (accepted.includes(account) ? matching(active, account) : takesOver(active, account))
+          && !!live && isObject(live.tokens) && live.tokens.account_id === active.accountId
       })
       const merged = mergeCodexAccounts(refreshed, bundle.accounts)
       // A refresh/login performed while probing wins over our older snapshot: the write below compares the pool
