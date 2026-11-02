@@ -160,7 +160,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
   }
 
   const selectionRequests = new Map<string, {id:string; expiresAt:number}>()
-  async function rebindOnce(sessionId: string, running: string, confirmedOnly = false, organizationFailure?: { kind: 'authentication'; observedAt: number }): Promise<RebindResult> {
+  async function rebindOnce(sessionId: string, running: string, confirmedOnly = false, organizationFailure?: { kind: 'authentication'; observedAt: number }, startBudget = false): Promise<RebindResult> {
     const bound = boundSession(deps, sessionId, running)
     if (!bound) return failure('NOT_BOUND', `rebind: no binding recorded for session ${sessionId}`)
     const { session, recorded } = bound
@@ -186,8 +186,9 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     if (!deps.studioOrigin) return failure('STUDIO_UNAVAILABLE', 'rebind: Studio origin is not configured')
     const binding = recorded.binding
     const requestKey = `${sessionId}-${binding.nonce}-${confirmedOnly}`
-    let selectionRequest = selectionRequests.get(requestKey)
-    if (!selectionRequest || selectionRequest.expiresAt <= Date.now()) {
+    // Which accounts have start budget changes between asks: each start-budget switch is its own selection.
+    let selectionRequest = startBudget ? { id: randomUUID(), expiresAt: 0 } : selectionRequests.get(requestKey)
+    if (!selectionRequest || (!startBudget && selectionRequest.expiresAt <= Date.now())) {
       for (const [key, value] of selectionRequests) if (value.expiresAt <= Date.now()) selectionRequests.delete(key)
       selectionRequest = {id:randomUUID(), expiresAt:Date.now()+120_000}; selectionRequests.set(requestKey, selectionRequest)
     }
@@ -201,7 +202,8 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       let response: Response, body: Record<string, unknown> | null
       while (true) {
         response = await post(confirmedOnly ? 'return' : 'rebind', { ...proof, ...(selectionRequestId ? { selectionRequestId } : {}),
-          ...(tokenProof ? { credentialProofVersion: 1 } : {}), ...(organizationFailure ? { organizationFailure } : {}), ...(measured ? { measureVersion: 1, measured: [...measured] } : {}) })
+          ...(tokenProof ? { credentialProofVersion: 1 } : {}), ...(organizationFailure ? { organizationFailure } : {}), ...(measured ? { measureVersion: 1, measured: [...measured] } : {}),
+          ...(startBudget ? { startBudget: true } : {}) })
         body = await response.json().catch(() => null) as Record<string, unknown> | null
         // A Studio from before candidate checks refuses the fields it does not know: ask again as before, once.
         if (response.status === 400 && (measured || selectionRequestId)) {
@@ -406,10 +408,12 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       }
     },
     /** One switch per session at a time; a second request while one runs gets that one's answer. */
-    rebind(sessionId: string, running: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal): Promise<RebindResult> {
+    rebind(sessionId: string, running: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal, options: { startBudget?: true } = {}): Promise<RebindResult> {
       const shared = sharedSession(sessionId, running)
       if (shared === undefined) return Promise.resolve(failure('NOT_BOUND', `rebind: session ${sessionId} is not an unbound shared-PC session`))
       const parsed = parseBinding(running)
+      // Only a member binding's switch can ask Studio for start budget; a shared-PC switch keeps waiting.
+      if (options.startBudget && (shared || !parsed || isMachineSetupTokenBinding(parsed.binding))) return Promise.resolve({ ok: false as const, reason: 'UNSUPPORTED' as const })
       if (parsed && isMachineSetupTokenBinding(parsed.binding)) {
         const binding = parsed.binding
         return Promise.resolve(deps.machineRuntime?.(binding.companyId)).then(runtime => runtime
@@ -418,7 +422,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       }
       const pending = inFlight.get(sessionId)
       if (pending) return pending
-      const started = (shared ? sharedRebindOnce(sessionId, shared, observation) : rebindOnce(sessionId, running, false, observation?.reason === 'authentication-failed' ? { kind: 'authentication', observedAt: observation.observedAt } : undefined)).finally(() => inFlight.delete(sessionId))
+      const started = (shared ? sharedRebindOnce(sessionId, shared, observation) : rebindOnce(sessionId, running, false, observation?.reason === 'authentication-failed' ? { kind: 'authentication', observedAt: observation.observedAt } : undefined, !!options.startBudget)).finally(() => inFlight.delete(sessionId))
       inFlight.set(sessionId, started)
       return started
     },

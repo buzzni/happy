@@ -69,6 +69,20 @@ describe('setup-token account switch (specs/claude-setup-token-account-selection
     expect(deps.recordAgentEnvironment).toHaveBeenCalledWith(session, formatSetupTokenBinding(binding(B)), undefined)
   })
 
+  it('asks Studio for an account with start budget left, as a new selection each time', async () => {
+    const { switcher, requests } = setup()
+    expect(await switcher.rebind('session-a', RUNNING_A, undefined, undefined, { startBudget: true })).toHaveProperty('ok', true)
+    expect(requests[0].body).toMatchObject({ bindingNonce: NONCE_A, startBudget: true, selectionRequestId: expect.any(String) })
+    const again = setup()
+    await again.switcher.rebind('session-a', RUNNING_A, undefined, undefined, { startBudget: true })
+    await again.switcher.rebind('session-a', RUNNING_A, undefined, undefined, { startBudget: true })
+    // Which accounts have start budget changes between asks: a retained selection would replay a stale choice.
+    expect(again.requests[0].body.selectionRequestId).not.toBe(again.requests[1].body.selectionRequestId)
+    const plain = setup()
+    await plain.switcher.rebind('session-a', RUNNING_A)
+    expect(plain.requests[0].body).not.toHaveProperty('startBudget')
+  })
+
   it('treats a missing durable ACK as indeterminate and never returns a token', async () => {
     const { switcher, session } = setup({ recordAgentEnvironment: vi.fn(() => undefined) as unknown as SetupTokenAccountSwitchDeps['recordAgentEnvironment'] })
     expect(await switcher.rebind('session-a', RUNNING_A)).toEqual({ ok: false, reason: 'PERSISTENCE_INDETERMINATE' })
@@ -351,6 +365,13 @@ describe('machine-rotation bindings', () => {
     await expect(switcher.reportUsage('session-a', running, observation)).resolves.toEqual({ ok: true })
     await expect(switcher.rebind('session-a', running, observation)).resolves.toEqual({ ok: true, environment: { NEXT: '1' } })
     expect(machineRuntime.mock.calls).toEqual([['org-m'], ['org-m']])
+  })
+
+  it('does not move a shared-PC binding for start budget: its signed switch carries no such request', async () => {
+    const runtime = { reportUsage: vi.fn(), rebind: vi.fn(async () => ({ NEXT: '1' })) }
+    const { switcher } = setup({ machineRuntime: async () => runtime as never })
+    await expect(switcher.rebind('session-a', running, undefined, undefined, { startBudget: true })).resolves.toEqual({ ok: false, reason: 'UNSUPPORTED' })
+    expect(runtime.rebind).not.toHaveBeenCalled()
   })
 
   it('reports Studio unavailable when that company has no runtime', async () => {
