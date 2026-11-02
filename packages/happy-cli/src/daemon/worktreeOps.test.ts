@@ -694,7 +694,9 @@ describe('worktree:publish', () => {
 
     // workspace-sync-strict-design.md §4-1: a redirect could take the push (and its credential) to
     // another host than the repository checked above, so git does not follow one.
-    it('does not follow a redirect from the remote', async () => {
+    // A plain http remote now gets no request at all, so neither can its redirect be followed. A redirect
+    // from an https remote is refused by `http.followRedirects=false`; there is no TLS server here to show it.
+    it('does not reach a plain http remote, nor follow its redirect', async () => {
         const requests: string[] = [];
         const server = createServer((request, response) => {
             requests.push(request.url ?? '');
@@ -706,8 +708,7 @@ describe('worktree:publish', () => {
             const path = await worktree();
             git(repo, 'remote', 'add', 'origin', `http://127.0.0.1:${(server.address() as AddressInfo).port}/acme/app.git`);
             expect(await call('publish', publish(path))).toMatchObject({ success: false, errorCode: 'WORKTREE_FETCH_FAILED' });
-            expect(requests.length).toBeGreaterThan(0);
-            expect(requests.filter((url) => url.startsWith('/elsewhere'))).toEqual([]);
+            expect(requests).toEqual([]);
         } finally {
             await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
         }
