@@ -133,6 +133,31 @@ describe('personal browser runtime (daemon side)', () => {
         } finally { vi.useRealTimers() }
     })
 
+    it.each(['issuance', 'clock-wait'])('cancels a native command promptly during %s', async stage => {
+        vi.useFakeTimers()
+        try {
+            vi.setSystemTime(100000)
+            const token = signedCommand(160000, 130000)
+            const fetchImpl = vi.fn(async (_url: unknown, init?: RequestInit) => {
+                if (stage === 'issuance') await new Promise<void>((_resolve, reject) => {
+                    init?.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true })
+                })
+                return new Response(JSON.stringify({ token, expiresAtMs: 160000 }))
+            })
+            const runtime = readPersonalBrowserRuntime(base({ fetchImpl }))!
+            const controller = new AbortController()
+            let rejected = false
+            const pending = runtime.native.issue({ generation: 'g', method: 'GET', path: '/v1/sessions', body: '' }, controller.signal)
+                .catch(() => { rejected = true })
+            await vi.advanceTimersByTimeAsync(0)
+            controller.abort()
+            await vi.advanceTimersByTimeAsync(1)
+            expect(rejected).toBe(true)
+            await pending
+            expect(fetchImpl).toHaveBeenCalledTimes(1)
+        } finally { vi.useRealTimers() }
+    })
+
     it('starts the runtime with its own two variables and OS basics only, never daemon credentials', () => {
         const child = fakeChild()
         const spawnImpl = vi.fn(() => child)

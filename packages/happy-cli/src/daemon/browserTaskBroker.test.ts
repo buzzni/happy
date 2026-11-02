@@ -411,6 +411,6 @@ it('native daemon registration uses the supplied scoped issuer without reading a
     const issue = vi.fn(async () => ({ token: 'one-use', expiresAtMs: Date.now() + 60000 }))
     const broker = createBrowserTaskSessionBroker({}, request, { procRoot: await procRoot(), native: { socketPath: '/native/broker.sock', machineId: 'm', workspaceId: 'w', issue } })!
     expect(await broker.register()).toEqual({ registrationId: 'r', sessionSecret: 's' })
-    expect(issue).toHaveBeenCalledWith({ generation: 'a'.repeat(43), method: 'POST', path: '/v1/sessions/register', body: '{"schemaVersion":1,"bootId":"boot-fixture"}' })
+    expect(issue).toHaveBeenCalledWith({ generation: 'a'.repeat(43), method: 'POST', path: '/v1/sessions/register', body: '{"schemaVersion":1,"bootId":"boot-fixture"}' }, undefined)
     expect(calls[1].headers).toEqual({ 'x-abp-native-command': 'one-use' })
 })

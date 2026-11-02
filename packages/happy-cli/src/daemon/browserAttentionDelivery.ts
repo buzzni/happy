@@ -24,7 +24,7 @@ export async function pollNativeBrowserAttention(native: NativeBrokerRequestOpti
     const send = createNativeBrokerRequest(native, (socketPath, method, path, headers) => {
         if (method !== 'GET') throw new Error('Attention polling only reads')
         return attentionBrokerGet(socketPath, path, headers, signal)
-    })
+    }, signal)
     const reply = await send(native.socketPath, 'GET', `/v1/attention?afterSeq=${afterSeq}&waitMs=30000`, {})
     if (reply.status !== 200 || reply.body.ok !== true || !reply.body.result) throw new Error('Invalid attention broker reply')
     return reply.body.result as AttentionFeed
