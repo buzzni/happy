@@ -2064,6 +2064,7 @@ export class ApiSessionClient extends EventEmitter {
     noteContextUsageSignal(signal: ClaudeContextUsageSignal) {
         if (this.currentMode !== 'remote') return;
         if (signal.kind === 'provider-model') this.contextUsage.noteProviderModel(signal.model);
+        else if (signal.kind === 'breakdown-request') this.refreshContextUsageBreakdown(signal.request);
         else this.contextUsage.noteCompactBoundary();
     }
 

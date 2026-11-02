@@ -327,24 +327,55 @@ describe('ApiSessionClient context-usage frames', () => {
         await client.close();
     });
 
-    it('leaves the frame as it was when the runtime fails, or answers after a compaction or a close', async () => {
+    /** A request whose answer the test hands over; flushed so its handler has run before asserting. */
+    function deferredRequest() {
+        let answer!: (value: unknown) => void;
+        const request = vi.fn(() => new Promise<unknown>((resolve) => { answer = resolve; }));
+        return { request, answer: async (value: unknown) => { answer(value); await new Promise((resolve) => setTimeout(resolve, 0)); } };
+    }
+
+    async function clientWithShownWindow() {
         const client = new ApiSessionClient('fake-token', session);
         client.sendClaudeSessionMessage(mainAssistant(124000));
         client.applyClaudeTurnResult(result('result-1'));
+        return client;
+    }
+
+    it('leaves the frame as it was when the runtime fails', async () => {
+        const client = await clientWithShownWindow();
         client.refreshContextUsageBreakdown(async () => { throw new Error('control request aborted'); });
-
-        let answer!: (value: unknown) => void;
-        client.refreshContextUsageBreakdown(() => new Promise((resolve) => { answer = resolve; }));
-        client.noteContextUsageSignal({ kind: 'compact-boundary' });
-        answer(breakdownContract.getContextUsageSummaryResponse);
-
-        let late!: (value: unknown) => void;
-        client.refreshContextUsageBreakdown(() => new Promise((resolve) => { late = resolve; }));
-        await client.close();
-        late(breakdownContract.getContextUsageSummaryResponse);
         await new Promise((resolve) => setTimeout(resolve, 0));
-
         expect(frames().some((frame: any) => 'breakdown' in frame)).toBe(false);
+        await client.close();
+    });
+
+    it('drops an answer that arrives after a compaction', async () => {
+        const client = await clientWithShownWindow();
+        const pending = deferredRequest();
+        client.refreshContextUsageBreakdown(pending.request);
+        client.noteContextUsageSignal({ kind: 'compact-boundary' });
+        await pending.answer(breakdownContract.getContextUsageSummaryResponse);
+        expect(frames().some((frame: any) => 'breakdown' in frame)).toBe(false);
+        await client.close();
+    });
+
+    it('drops an answer that arrives after close', async () => {
+        const client = await clientWithShownWindow();
+        const pending = deferredRequest();
+        client.refreshContextUsageBreakdown(pending.request);
+        await client.close();
+        await pending.answer(breakdownContract.getContextUsageSummaryResponse);
+        expect(frames().some((frame: any) => 'breakdown' in frame)).toBe(false);
+    });
+
+    it('a breakdown request queued behind a compaction is asked after it and shown', async () => {
+        const client = await clientWithShownWindow();
+        const pending = deferredRequest();
+        client.noteContextUsageSignal({ kind: 'compact-boundary' });
+        client.noteContextUsageSignal({ kind: 'breakdown-request', request: pending.request });
+        await pending.answer(breakdownContract.getContextUsageSummaryResponse);
+        expect(frames().at(-1)).toMatchObject({ used: null, window: 200000, breakdown: { totalTokens: 124000 } });
+        await client.close();
     });
 
     it('asks nothing for a local terminal session', async () => {

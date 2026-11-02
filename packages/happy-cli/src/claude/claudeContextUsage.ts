@@ -178,12 +178,15 @@ function isProviderModelApiId(providerModel: string, apiModel: string): boolean 
 }
 
 /**
- * The two transcript signals the tracker needs, as an `OutgoingMessageQueue` item: the queue drops
+ * The transcript signals the tracker needs, as an `OutgoingMessageQueue` item: the queue drops
  * every `system` log message, and these must still land after the responses queued before them.
+ * A turn result's breakdown request rides it too: a `compact_boundary` still waiting in the queue
+ * would otherwise clear the answer to a request made after it.
  */
 export type ClaudeContextUsageSignal =
     | { kind: 'provider-model'; model: unknown }
-    | { kind: 'compact-boundary' };
+    | { kind: 'compact-boundary' }
+    | { kind: 'breakdown-request'; request: ClaudeControlRequest };
 
 export interface ClaudeContextUsageSignalItem {
     __claudeContextUsageSignal: true;
@@ -197,6 +200,11 @@ export function contextUsageSignalItem(message: unknown): ClaudeContextUsageSign
     if (system.subtype === 'init') return { __claudeContextUsageSignal: true, signal: { kind: 'provider-model', model: system.model } };
     if (system.subtype === 'compact_boundary') return { __claudeContextUsageSignal: true, signal: { kind: 'compact-boundary' } };
     return null;
+}
+
+/** The queue item that asks for a breakdown once everything queued before it has been applied. */
+export function contextUsageBreakdownRequestItem(request: ClaudeControlRequest): ClaudeContextUsageSignalItem {
+    return { __claudeContextUsageSignal: true, signal: { kind: 'breakdown-request', request } };
 }
 
 /** Wraps the queue's send function so the signal items reach `apply` in their queued position. */

@@ -50,7 +50,7 @@ import type { McpRuntimeRecovery } from './mcpRuntimeRecovery';
 import { registerMcpReconnectHandler } from './registerMcpReconnectHandler';
 import { publishClaudePromptSuggestion } from './promptSuggestionMetadata';
 import { createStreamDeltaRelay } from './streamDeltaRelay';
-import { contextUsageSignalItem, withContextUsageSignals, type ClaudeControlRequest } from './claudeContextUsage';
+import { contextUsageBreakdownRequestItem, contextUsageSignalItem, withContextUsageSignals, type ClaudeControlRequest } from './claudeContextUsage';
 import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
 import { claudeNotSignedInNotice, isClaudeAuthenticationFailure, isClaudeRevokedTokenFailure, isClaudeTokenRefreshFailure, describeClaudeLaunchFailure } from './utils/launchFailureMessage';
 import { buildMandatoryRemoteDenyRules, resolveClaudeRemoteSandbox } from '@/sandbox/claudeSdkSandbox';
@@ -654,7 +654,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 message as unknown as { uuid?: unknown; usage?: unknown; modelUsage?: unknown },
                 aiAuthObservation?.current(),
             );
-            if (contextUsageRequest) session.client.refreshContextUsageBreakdown(contextUsageRequest);
+            if (contextUsageRequest) messageQueue.enqueue(contextUsageBreakdownRequestItem(contextUsageRequest));
             /*
              * The SDK's own final answer (Saycode specs/desktop-messenger-channels — R14).
              *
