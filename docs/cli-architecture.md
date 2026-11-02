@@ -1,5 +1,16 @@
 # CLI Architecture
 
+## Personal browser native-command dispatch
+
+`daemon/personalBrowserRuntime` verifies the issuer envelope against the installed
+runtime's public trust and waits until its signed issuance time before returning
+the command for dispatch. This tolerates an issuer slightly ahead of the local
+clock without changing the broker's strict admission checks. The wait is bounded
+to 30 seconds; untrusted envelopes and larger differences fail closed. The broker
+still owns scope, generation, exact request bytes, expiry and single-use checks.
+There is no automatic issuance/dispatch retry. Revisit this scheduling boundary if
+the issuer exposes a separate not-before contract or other runtime modes adopt it.
+
 ## GitHub automation artifact lifecycle
 
 The journal-driven worktree discard path retains dirty source while
