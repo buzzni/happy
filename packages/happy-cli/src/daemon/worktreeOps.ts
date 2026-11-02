@@ -192,9 +192,11 @@ type GitOptions = {
 
 /**
  * A remote call never follows a redirect: the repository was checked by its address, and a redirect
- * would take the request (and a credential) to another (workspace-sync-strict-design.md §4-1).
+ * would take the request (and a credential) to another. Nor does it use plain http, whatever address
+ * `origin` holds and whichever login answers (workspace-sync-strict-design.md §4-1). ssh stays: a
+ * machine's own login may be its ssh key, and the repository check covers ssh addresses too.
  */
-const NETWORK_CONFIG = ['-c', 'http.followRedirects=false'];
+const NETWORK_CONFIG = ['-c', 'http.followRedirects=false', '-c', 'protocol.http.allow=never'];
 
 function runGit(cwd: string, args: string[], options: GitOptions = {}): Promise<GitResult> {
     return new Promise((resolvePromise) => {

@@ -149,6 +149,29 @@ describe('workspace:remote-status', () => {
         }
     });
 
+    // workspace-sync-strict-design.md §4-1: with the machine's own login too, nothing goes out over plain http.
+    it('never reaches an http origin with the machine\'s own login', async () => {
+        let requests = 0;
+        const server = createServer((_request, response) => {
+            requests++;
+            response.writeHead(401, { 'WWW-Authenticate': 'Basic realm="git"' });
+            response.end();
+        });
+        await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+        try {
+            const address = `127.0.0.1:${(server.address() as AddressInfo).port}/acme/app.git`;
+            git(repo, 'remote', 'set-url', 'origin', `http://${address}`);
+            expect(await call('remote-status', status({ remoteUrl: null }))).toMatchObject({ success: false });
+            expect(await call('pull-remote', {
+                workspaceDir: repo, remoteUrl: null, branch: 'main', baseBranch: null, mode: 'ff-only',
+                expectedHead: git(repo, 'rev-parse', 'HEAD'), push: true,
+            })).toMatchObject({ success: false });
+            expect(requests).toBe(0);
+        } finally {
+            await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+        }
+    });
+
     it('refuses once origin no longer names the repository first connected here', async () => {
         writeFileSync(join(home, 'workspace-remotes.json'), JSON.stringify({ v: 1, workspaces: { [repo]: { workspace: 'github.com/acme/first' } } }));
         expect(await call('remote-status', status())).toMatchObject({ success: false, errorCode: 'WORKSPACE_REMOTE_NOT_PINNED', pinned: 'github.com/acme/first' });
