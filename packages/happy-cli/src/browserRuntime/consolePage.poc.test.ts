@@ -76,7 +76,9 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
     beforeAll(async () => {
         server = http.createServer((req, res) => {
             const url = new URL(req.url ?? '/', 'http://localhost')
-            if (url.pathname === '/console') { res.writeHead(200, { 'content-type': 'text/html' }); res.end(renderConsolePage()); return }
+            if (url.pathname === '/console') { res.writeHead(200, { 'content-type': 'text/html' }); res.end(renderConsolePage(
+                { screenMode: url.searchParams.get('native') === '1' ? 'native-window' : undefined },
+            )); return }
             if (url.pathname.startsWith(VIEWER_ASSET_PREFIX)) {
                 // Keep the real noVNC client for the fit/input tests; close-code tests use the small socket fixture.
                 serveViewerAsset(useFixtureViewer ? viewerRoot : novncDir ?? '/nonexistent', url.pathname, res).then((served) => { if (!served) { res.writeHead(404); res.end() } })
@@ -155,6 +157,33 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         viewer?.close()
         await new Promise<void>((resolve) => server?.close(() => resolve()))
         rmSync(viewerRoot, { recursive: true, force: true })
+    })
+
+    it('uses the personal PC Chrome window without requesting a VNC ticket, and keeps task controls', async () => {
+        for (const lang of ['ko', 'en']) {
+            ops.length = 0
+            const first = token(`native-${lang}`, Date.now() + 600_000)
+            const target = await harness.openFrontTab(`${origin}/console?native=1&lang=${lang}#abp-cap=${first}&abp-exp=${Date.now() + 600_000}`)
+            try {
+                await eventually(() => ops.some(entry => entry.op === 'getTask'), Boolean)
+                const state = JSON.parse(await harness.evaluate(target, `JSON.stringify({
+                    title: document.querySelector('#screenEmpty b').textContent,
+                    body: document.querySelector('#screenEmpty span').textContent,
+                    screenButtonVisible: !!document.getElementById('openScreen').getClientRects().length,
+                    fitVisible: !!document.getElementById('viewGroup').getClientRects().length,
+                    taskControls: ['takeOver','release','resume'].every(id => !!document.getElementById(id).getClientRects().length)
+                })`))
+                expect(state.title).toBe(lang === 'ko' ? '작업 PC의 Chrome 창에서 확인하세요' : 'View in Chrome on the task PC')
+                expect(state.body).toContain(lang === 'ko' ? 'Saycode가 연 전용 Chrome 창' : 'dedicated Chrome window opened by Saycode')
+                expect(state).toMatchObject({ screenButtonVisible: false, fitVisible: false, taskControls: true })
+                // Renewal or a programmatic click must not revive the unsupported viewer path.
+                await harness.evaluate(target, `document.getElementById('openScreen').click();window.postMessage({
+                    type:'abp-capability',token:${JSON.stringify(token(`native-renew-${lang}`, Date.now() + 600_000))},expiresAtMs:${Date.now() + 600_000}},location.origin)`)
+                await harness.evaluate(target, `new Promise(resolve => setTimeout(resolve, 500))`)
+                expect(ops.filter(entry => entry.op === 'viewerTicket')).toEqual([])
+                expect(await harness.evaluate(target, `document.getElementById('screen').getAttribute('src')`)).toBeNull()
+            } finally { await harness.closeTarget(target) }
+        }
     })
 
     it('uses the fragment capability, strips it, stores nothing, and lists tasks', async () => {
