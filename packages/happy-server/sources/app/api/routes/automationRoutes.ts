@@ -235,14 +235,26 @@ export function automationRoutes(app: Fastify) {
     app.post('/v1/automations/page', {
         preHandler: app.authenticate,
         schema: { body: z.object({ projectIds: z.array(z.string().min(1).max(256)).max(10000),
-            limit: z.number().int().min(1).max(50).default(20), cursor: z.string().min(1).max(1024).nullable().default(null), reservationExtensions: z.boolean().optional() }) },
+            limit: z.number().int().min(1).max(50).default(20), cursor: z.string().min(1).max(1024).nullable().default(null),
+            reservationExtensions: z.boolean().optional() }) },
     }, async (request, reply) => {
         if (rejectWhenDisabled(reply)) return;
         try {
             const page = await listAutomationPage(db, request.userId, request.body);
-            return reply.send({ ...(request.body.reservationExtensions ? { reservationVersion: 1 } : {}), automations: page.automations.map(row => row.payloadVersion === 3
-                ? { kind: 'script', script: serializeScriptAutomation(row), id: row.id, projectId: row.projectId, createdAt: row.createdAt.getTime() }
-                : { ...serializeAutomation(row), runs: row.runs.map(serializeRun) }), nextCursor: page.nextCursor });
+            return reply.send({
+                ...(request.body.reservationExtensions ? { reservationVersion: 1 } : {}),
+                automations: page.automations.map(row => {
+                    const serialize = () => row.payloadVersion === 3 && request.body.reservationExtensions
+                        ? { kind: 'script', script: serializeScriptAutomation(row), id: row.id, projectId: row.projectId, createdAt: row.createdAt.getTime() }
+                        : { ...serializeAutomation(row), runs: row.runs.map(serializeRun) };
+                    if (!request.body.reservationExtensions) return serialize();
+                    try { return serialize(); } catch {
+                        return { kind: 'unavailable', id: row.id, projectId: row.projectId,
+                            createdAt: row.createdAt.getTime(), failureCode: 'RESERVATION_ROW_INVALID' };
+                    }
+                }),
+                nextCursor: page.nextCursor,
+            });
         } catch (error) {
             if (error instanceof Error && error.message === 'invalid-automation-cursor') return reply.code(400).send({ error: error.message });
             throw error;

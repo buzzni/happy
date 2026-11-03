@@ -14,7 +14,6 @@ import { startSocket } from "./socket";
 import { machinesRoutes } from "./routes/machinesRoutes";
 import { devRoutes } from "./routes/devRoutes";
 import { versionRoutes } from "./routes/versionRoutes";
-import { voiceRoutes } from "./routes/voiceRoutes";
 import { artifactsRoutes } from "./routes/artifactsRoutes";
 import { accessKeysRoutes } from "./routes/accessKeysRoutes";
 import { machineSessionOwnerRoutes } from "./routes/machineSessionOwnerRoutes";
@@ -187,7 +186,6 @@ export async function startApi(opts: StartApiOptions = {}) {
     machineSessionOwnerRoutes(typed);
     devRoutes(typed);
     versionRoutes(typed);
-    voiceRoutes(typed);
     userRoutes(typed);
     feedRoutes(typed);
     internalFeedRoutes(typed);
