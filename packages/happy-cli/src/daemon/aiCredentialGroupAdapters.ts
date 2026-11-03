@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import type { AiCredentialRuntimeDependencies } from './aiCredentialRuntime'
+import { withNpmGlobalBinOnPath } from './npmGlobalBin'
 import type { GroupProvider } from './aiCredentialGroups'
 import { managedSetupTokenId, setupTokenGroupIdentity } from './claudeSetupToken'
 type Account = Record<string,unknown>
@@ -109,7 +110,7 @@ await s.withAccountStorageTransaction(async(current,persist)=>{if(!current)retur
     const accountId=liveCodexAccountId(live)
     if(accountId&&unwanted.has(groupAccountIdentity(provider,{accountId}))){
       const pool=await optional(poolPath)
-      if(pool?.accounts?.length)await deps.execFile('codex-multi-auth',['switch',String(pool.activeIndex+1)],{timeoutMs:120_000})
+      if(pool?.accounts?.length)await deps.execFile('codex-multi-auth',['switch',String(pool.activeIndex+1)],{timeoutMs:120_000,...(globalRoot?{environment:withNpmGlobalBinOnPath(deps.env,globalRoot,deps.platform)}:{})})
       else await deps.rm(livePath,{force:true})
     }
   }
