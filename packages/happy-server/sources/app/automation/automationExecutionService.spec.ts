@@ -680,3 +680,11 @@ it('returns ordinary schedules only to daemons that explicitly negotiate payload
   const current = await syncAutomations(tx as never, 'account-1', 'machine-1', { afterSeq: 0n, limit: 100, payloadVersions: [1, 4] });
   expect(current).toMatchObject({ ok: true, value: { changes: [expect.objectContaining({ kind: 'UPSERT', payloadVersion: 4 })] } });
 });
+
+it.each([5, 6, 99])('never syncs unsupported persisted payload %s even if a caller advertises it', async payloadVersion => {
+  const tx = makeTx(); tx.automation.findFirst.mockResolvedValue(automation({ payloadVersion }));
+  for (const payloadVersions of [[1, 4], [1, 4, payloadVersion]]) {
+    const result = await syncAutomations(tx as never, 'account-1', 'machine-1', { afterSeq: 0n, limit: 100, payloadVersions });
+    expect(result).toMatchObject({ ok: true, value: { changes: [expect.objectContaining({ kind: 'TOMBSTONE' })] } });
+  }
+});

@@ -226,7 +226,7 @@ export type AutomationTarget = z.infer<typeof automationTargetSchema>;
 export const automationRunStatusSchema = z.enum([
   'CLAIMED', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED', 'EXPIRED', 'ABANDONED',
 ]);
-export const automationRunOutcomeSchema = z.enum(['WOKE', 'SILENT', 'SKIPPED_GATE', 'ERROR']);
+export const automationRunOutcomeSchema = z.enum(['WOKE', 'SILENT', 'SKIPPED_GATE', 'ERROR', 'NO_CHANGE']);
 export const automationRunSchema = z.object({
   id: z.string().min(1),
   automationId: z.string().min(1),

@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
 import { resolve } from 'node:path';
 import { createHash } from 'node:crypto';
+import { listAutomations } from './automationService';
 import { deliverAutomationConversationMessage } from './automationConversationDelivery';
 let sql: string, db: PGlite, client: PrismaClient;
 const now = new Date('2026-10-14T00:00:00Z');
@@ -66,4 +67,12 @@ it('reports an inactive resumed target separately and delivers after its heartbe
   await client.session.update({ where: { id: 's1' }, data: { active: true } });
   expect(await deliver()).toMatchObject({ ok: true, value: { message: { seq: 1 } } });
   expect(await client.sessionMessage.count()).toBe(1);
+});
+
+it('keeps supported reservations visible while retaining unsupported v5 ciphertext in storage', async () => {
+  await client.automation.create({ data: { id: 'native', projectId: 'chat:c1', ownerAccountId: 'owner', machineAccountId: 'owner', machineId: 'm1', payloadVersion: 5, payloadCiphertext: new Uint8Array([1]), viewerKeyId: 'k', viewerKeyVersion: 1, viewerKeyEnvelope: new Uint8Array([1]), machineKeyVersion: 1, machineKeyEnvelope: new Uint8Array([1]) } });
+  const result = await client.$transaction(tx => listAutomations(tx, 'owner', 'chat:c1'));
+  expect(result).toMatchObject({ ok: true, value: [expect.objectContaining({ id: 'a1' })] });
+  if (result.ok) expect(result.value).toHaveLength(1);
+  expect(await client.automation.count()).toBe(2);
 });

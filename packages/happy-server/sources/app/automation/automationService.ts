@@ -263,7 +263,7 @@ export async function listAutomations(
     const access = await projectAccess(tx, actorId, projectId);
     if (!access) return { ok: false, error: 'not-found' };
     const rows = await tx.automation.findMany({
-        where: { projectId, deletedAt: null, payloadVersion: { not: 3 } },
+        where: { projectId, deletedAt: null, payloadVersion: { in: [1, 4] } },
         orderBy: { createdAt: 'desc' },
     });
     return { ok: true, value: rows };
@@ -323,7 +323,7 @@ export async function requestAutomationRun(
         },
     });
     if (!current) return { ok: false, error: 'not-found' };
-    if (current.payloadVersion === 3) return { ok: false, error: 'automation-run-unsupported' };
+    if (![1, 4].includes(current.payloadVersion)) return { ok: false, error: 'automation-run-unsupported' };
     if (current.revision !== expectedRevision) {
         return { ok: false, error: 'revision-conflict', latest: current };
     }

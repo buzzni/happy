@@ -548,3 +548,8 @@ describe('automationService', () => {
         expect(tx.automationChange.create).not.toHaveBeenCalled();
     });
 });
+
+it('refuses a previously persisted native v5 run request after rollback', async () => {
+  const { tx } = makeTx({ automation: automationRecord({ payloadVersion: 5 }) });
+  expect(await requestAutomationRun(tx as never, 'editor-1', 'project-1', 'automation-1', 1)).toEqual({ ok: false, error: 'automation-run-unsupported' });
+});

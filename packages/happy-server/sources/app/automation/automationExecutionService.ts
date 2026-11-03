@@ -106,7 +106,7 @@ export async function syncAutomations(
     for (const change of rows) {
         if (change.kind === 'TOMBSTONE') {
             const deleted = await tx.automation.findFirst({ where: { id: change.automationId, machineAccountId: accountId, machineId }, include: { project: true } });
-            const cancelled = deleted?.projectId.startsWith('chat:') && deleted.deletedAt && deleted.payloadVersion !== 3
+            const cancelled = deleted?.projectId.startsWith('chat:') && deleted.deletedAt && (deleted.payloadVersion === 1 || deleted.payloadVersion === 4)
                 && (deleted.project?.config as { chatAutomationState?: unknown } | null)?.chatAutomationState === 'deleted'
                 && (deleted.payloadVersion === 1 || input.payloadVersions?.includes(deleted.payloadVersion));
             changes.push({ seq: change.seq, automationId: change.automationId, revision: change.revision, generation: change.generation, kind: 'TOMBSTONE',
@@ -123,7 +123,7 @@ export async function syncAutomations(
                 revision: { gte: change.revision },
             },
         });
-        if (!automation || automation.payloadVersion === 3 || (automation.payloadVersion === 4 && !input.payloadVersions?.includes(4))) {
+        if (!automation || ![1, 4].includes(automation.payloadVersion) || (automation.payloadVersion !== 1 && !input.payloadVersions?.includes(automation.payloadVersion))) {
             changes.push({ seq: change.seq, automationId: change.automationId, revision: change.revision, generation: change.generation, kind: 'TOMBSTONE' });
             continue;
         }
@@ -200,7 +200,7 @@ export async function ackAutomationSync(
 
 function executable(automation: any, accountId: string, machineId: string, generation: number): boolean {
     return automation
-        && automation.payloadVersion !== 3
+        && [1, 4].includes(automation.payloadVersion)
         && automation.machineAccountId === accountId
         && automation.machineId === machineId
         && automation.generation === generation
