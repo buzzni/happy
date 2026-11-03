@@ -1419,24 +1419,28 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
 
   // codex-multi-auth runs from npm's global bin, beside the package the proxy and group adapters load.
   // 2026-11-03 Mac: that bin was not on PATH, so every pinned install missed the CLI found first.
-  let npmGlobalRoot: string | undefined
-  async function runCodexMultiAuth(args: string[], options: CommandOptions = {}): Promise<AiCredentialCommandResult> {
-    npmGlobalRoot ??= await deps.execFile('npm', ['root', '--global']).then((result) => nonEmptyTrimmed(result.stdout) ?? undefined, () => undefined)
-    return deps.execFile('codex-multi-auth', args, npmGlobalRoot
-      ? { ...options, environment: withNpmGlobalBinOnPath(options.environment ?? deps.env, npmGlobalRoot, deps.platform) }
+  async function resolveNpmGlobalRoot(): Promise<string | null> {
+    return deps.execFile('npm', ['root', '--global']).then((result) => nonEmptyTrimmed(result.stdout), () => null)
+  }
+
+  async function runCodexMultiAuth(args: string[], options: CommandOptions = {}, globalRoot?: string | null): Promise<AiCredentialCommandResult> {
+    const root = globalRoot === undefined ? await resolveNpmGlobalRoot() : globalRoot
+    return deps.execFile('codex-multi-auth', args, root
+      ? { ...options, environment: withNpmGlobalBinOnPath(options.environment ?? deps.env, root, deps.platform) }
       : options)
   }
 
   async function inspectCodexMultiAuthInstallation(): Promise<{ cli: string; global: string }> {
+    // Resolve once per inspection so CLI selection and metadata use the same current prefix.
+    const root = await resolveNpmGlobalRoot()
     const installed = { cli: 'unknown', global: 'unknown' }
     const safeVersion = (value: unknown): string => typeof value === 'string' && /^\d{1,6}\.\d{1,6}\.\d{1,6}$/.test(value) ? value : 'unknown'
     try {
-      installed.cli = safeVersion((await runCodexMultiAuth(['--version'])).stdout.trim())
+      installed.cli = safeVersion((await runCodexMultiAuth(['--version'], {}, root)).stdout.trim())
     } catch {
       // Preserve unknown for the diagnostic; never include command output or secrets.
     }
     try {
-      const root = nonEmptyTrimmed((await deps.execFile('npm', ['root', '--global'])).stdout)
       if (root) {
         const packageJson = JSON.parse(await deps.readFile(join(root, 'codex-multi-auth', 'package.json'))) as unknown
         installed.global = isObject(packageJson) ? safeVersion(packageJson.version) : 'unknown'
