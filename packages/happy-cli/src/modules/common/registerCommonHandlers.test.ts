@@ -156,6 +156,53 @@ describe('registerCommonHandlers machine.run capability', () => {
     });
 });
 
+describe('registerCommonHandlers workspace downloads', () => {
+    it('continues an opaque listing cursor and exposes explicit cleanup', async () => {
+        const { handlers, workingDirectory } = await createHandlers();
+        await Promise.all(Array.from({ length: 1001 }, (_, i) => mkdir(join(workingDirectory, `entry-${i}`))));
+        const list = handlers.get('listWorkspaceDownloadDirectory')!;
+        const first = await list({ workspaceRoot: workingDirectory, path: workingDirectory, offset: 0 });
+        expect(first).toMatchObject({ success: true, nextOffset: 1000, listingId: expect.any(String) });
+        await expect(handlers.get('closeWorkspaceDownloadDirectory')!({ workspaceRoot: workingDirectory, path: workingDirectory, listingId: first.listingId })).resolves.toMatchObject({ success: true });
+        await expect(list({ workspaceRoot: workingDirectory, path: workingDirectory, offset: first.nextOffset, expectedIdentity: first.identity, listingId: first.listingId })).resolves.toMatchObject({ success: false, errorCode: 'WORKSPACE_PATH_DENIED' });
+    });
+
+    it('uses separate safe capabilities and refuses a listed file replaced by an outside link', async () => {
+        const { handlers, workingDirectory } = await createHandlers();
+        const root = join(workingDirectory, 'project');
+        await mkdir(root);
+        const path = join(root, 'listed.bin');
+        const outside = join(workingDirectory, 'outside.bin');
+        await writeFile(path, 'inside');
+        await writeFile(outside, 'secret');
+        const list = handlers.get('listWorkspaceDownloadDirectory');
+        const read = handlers.get('readWorkspaceFileChunk');
+        expect(list).toBeTypeOf('function');
+        expect(read).toBeTypeOf('function');
+        await expect(list!({ workspaceRoot: root, path: root, offset: 0 })).resolves.toMatchObject({
+            success: true, entries: [expect.objectContaining({ name: 'listed.bin' })], nextOffset: null, identity: expect.any(String),
+        });
+        await rm(path);
+        await symlink(outside, path, 'file');
+        await expect(read!({ workspaceRoot: root, path, offset: 0, length: 1 })).resolves.toMatchObject({ success: false, errorCode: 'WORKSPACE_PATH_DENIED' });
+    });
+
+    it('returns stable identity and rejects a project sibling and invalid chunk range', async () => {
+        const { handlers, workingDirectory } = await createHandlers();
+        const root = join(workingDirectory, 'project');
+        await mkdir(root);
+        const path = join(root, 'inside.bin');
+        await writeFile(path, 'inside');
+        const read = handlers.get('readWorkspaceFileChunk');
+        expect(read).toBeTypeOf('function');
+        const first = await read!({ workspaceRoot: root, path, offset: 0, length: 1 });
+        expect(first).toMatchObject({ success: true, identity: expect.any(String), totalBytes: 6 });
+        await expect(read!({ workspaceRoot: root, path, offset: 1, length: 2, expectedIdentity: first.identity })).resolves.toMatchObject({ success: true, identity: first.identity });
+        await expect(read!({ workspaceRoot: root, path: join(workingDirectory, 'outside'), offset: 0, length: 1 })).resolves.toMatchObject({ success: false, errorCode: 'WORKSPACE_PATH_DENIED' });
+        await expect(read!({ workspaceRoot: root, path, offset: 0, length: 3 * 1024 ** 2 + 1 })).resolves.toMatchObject({ success: false, errorCode: 'WORKSPACE_RANGE_INVALID' });
+    });
+});
+
 describe('registerCommonHandlers readFileChunk', () => {
     it('returns the requested bytes with stable file metadata and EOF state', async () => {
         const { handlers, workingDirectory } = await createHandlers();
