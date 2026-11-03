@@ -759,36 +759,6 @@ describe('ApiSessionClient v3 messages API migration', () => {
         await client.close();
     });
 
-    it('binds reservation authorization to the exact session before opening a socket', async () => {
-        const authorization = 'epoch.' + 'a'.repeat(43);
-        expect(() => new ApiSessionClient('fake-token', session, undefined, { reservation: { sessionId: 'other', authorization } })).toThrow('Reservation session mismatch');
-        expect(mockIo).not.toHaveBeenCalled();
-        const client = new ApiSessionClient('fake-token', session, undefined, { reservation: { sessionId: session.id, authorization } });
-        expect(mockIo).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ auth: expect.objectContaining({ reservationAuthorization: authorization, sessionId: session.id }) }));
-        expect((client as any).authHeaders()['X-Happy-Reservation-Authorization']).toBe(authorization);
-        expect(registeredCommonHandlers).not.toHaveBeenCalled();
-        await client.close();
-    });
-    it.each([true, false])('reconciles a stored reservation output only by exact localId and ciphertext (match %s)', async matching => {
-        mockAxiosPost.mockResolvedValue({ data: { messages: [] } });
-        const client = new ApiSessionClient('fake-token', session, undefined, { trackShutdownStorage: true,
-            reservation: { sessionId: session.id, authorization: 'epoch.' + 'a'.repeat(43) } });
-        client.sendSessionEvent({ type: 'message', message: 'native output' }, 'output-receipt');
-        await waitForCheck(() => expect((client as any).unconfirmedOutbox).toHaveLength(1));
-        const queued = (client as any).unconfirmedOutbox[0];
-        mockAxiosGet.mockResolvedValue({ data: { messages: [{ id: 'stored', seq: 8, localId: queued.localId,
-            content: { t: 'encrypted', c: matching ? queued.content : 'different-ciphertext' } }], hasMore: false } });
-        const writes = mockAxiosPost.mock.calls.length;
-        expect((await client.readReservationStoredOutput(7)).stored).toBe(matching);
-        expect(mockAxiosPost).toHaveBeenCalledTimes(writes);
-        expect((client as any).unconfirmedOutbox).toHaveLength(matching ? 0 : 1);
-        await client.close();
-    });
-    it('refuses malformed reservation authorization before opening a socket', () => {
-        expect(() => new ApiSessionClient('fake-token', session, undefined, { reservation: { sessionId: session.id, authorization: 'invalid' } })).toThrow('Invalid reservation authorization');
-        expect(mockIo).not.toHaveBeenCalled();
-    });
-
     it('registers machine.run with the daemon-owned trusted profile registry', () => {
         registeredCommonHandlers.mockClear();
         new ApiSessionClient('fake-token', session);

@@ -2272,10 +2272,9 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
-    it.each([false, true])('negotiates native codec only when ready and acknowledges after cache apply (native %s)', async native => {
+    it('syncs encrypted automation deltas after key registration and acknowledges only after cache apply', async () => {
         let cursor = 0n;
         const cache = {
-            negotiateReservationCodec: vi.fn(),
             read: vi.fn(() => ({ cursor, serverTime: 0, automations: [], pendingAcknowledgements: [] })),
             applySync: vi.fn(() => {
                 cursor = 1n;
@@ -2293,8 +2292,7 @@ describe('ApiMachineClient socket reconnection', () => {
             if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
             return { result: 'success' };
         });
-        const machine = makeMachine();
-        const client = new ApiMachineClient('fake-token', machine);
+        const client = new ApiMachineClient('fake-token', makeMachine());
         (client as any).setAutomationKey({
             version: 1,
             publicKey: new Uint8Array(32).fill(7),
@@ -2302,12 +2300,11 @@ describe('ApiMachineClient socket reconnection', () => {
             registeredKeyVersion: 1,
         }, vi.fn());
         (client as any).setServerAutomationCache(cache);
-        await client.setReservationNativeSupported(native);
         client.connect();
 
         socketHandlers.connect![0]!();
         await vi.waitFor(() => expect(cache.markAcknowledged).toHaveBeenCalled());
-        expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-sync', { afterSeq: '0', limit: 500, payloadVersions: native ? [1, 4, 5] : [1, 4] });
+        expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-sync', { afterSeq: '0', limit: 500, payloadVersions: [1, 4] });
         expect(cache.applySync.mock.invocationCallOrder[0]).toBeLessThan(cache.markAcknowledged.mock.invocationCallOrder[0]!);
         expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-sync-ack', {
             items: [{ automationId: 'automation-1', revision: 1 }],
@@ -2318,8 +2315,6 @@ describe('ApiMachineClient socket reconnection', () => {
         expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-claim', {
             automationId: 'automation-1', generation: 2, scheduledFor: 10,
         });
-        expect(cache.negotiateReservationCodec).toHaveBeenCalledWith(native);
-        expect(MachineMetadataSchema.parse(machine.metadata).automationSupport?.reservation).toEqual(native ? { version: 1, agents: ['claude', 'codex'], github: true, commands: true } : undefined);
         client.shutdown();
     });
 

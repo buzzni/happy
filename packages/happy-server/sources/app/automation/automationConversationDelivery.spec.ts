@@ -7,8 +7,6 @@ import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
 import { resolve } from 'node:path';
 import { createHash } from 'node:crypto';
-import { manageReservationConversationLease } from './reservationConversationLease';
-import type { AutomationConversationDeliverRequest } from '@slopus/happy-wire';
 import { deliverAutomationConversationMessage } from './automationConversationDelivery';
 let sql: string, db: PGlite, client: PrismaClient;
 const now = new Date('2026-10-14T00:00:00Z');
@@ -30,7 +28,7 @@ beforeEach(async () => {
 });
 afterEach(async () => { await client?.$disconnect(); await db?.close(); });
 async function run(id: string) { await client.automationRun.create({ data: { id, automationId: 'a1', generation: 1, scheduledFor: new Date(now.getTime() + Number(id.slice(1)) * 1000), machineAccountId: 'owner', machineId: 'm1', status: 'RUNNING', claimTokenHash: new Uint8Array(createHash('sha256').update(`token-${id}`).digest()), claimExpiresAt: new Date(now.getTime() + 60000), runLeaseExpiresAt: new Date(now.getTime() + 60000) } }); }
-const deliver = (patch: Partial<AutomationConversationDeliverRequest> = {}) => client.$transaction(tx => deliverAutomationConversationMessage(tx, 'owner', 'm1', { ...request, ...patch }, now));
+const deliver = (patch: Partial<typeof request> = {}) => client.$transaction(tx => deliverAutomationConversationMessage(tx, 'owner', 'm1', { ...request, ...patch }, now));
 it('stores two scheduled questions, a manual follow-up and a third schedule in the ordinary session', async () => {
   expect(await deliver()).toMatchObject({ ok: true, value: { message: { seq: 1, sessionId: 's1' } } });
   await run('r2'); expect(await deliver({ runId: 'r2', claimToken: 'token-r2', expectedSeq: 1 })).toMatchObject({ ok: true });
@@ -68,27 +66,4 @@ it('reports an inactive resumed target separately and delivers after its heartbe
   await client.session.update({ where: { id: 's1' }, data: { active: true } });
   expect(await deliver()).toMatchObject({ ok: true, value: { message: { seq: 1 } } });
   expect(await client.sessionMessage.count()).toBe(1);
-});
-
-it('requires the current RUNNING reservation epoch for v5 and recovers a lost delivery ACK', async () => {
-  await client.automation.update({ where: { id: 'a1' }, data: { payloadVersion: 5 } });
-  const descriptorHash = 'a'.repeat(64), base = { wireVersion: 1 as const, runId: 'r1', claimToken: 'token-r1', sessionId: 's1' };
-  const acquired = await client.$transaction(tx => manageReservationConversationLease(tx, 'owner', 'm1', { ...base, operation: 'acquire', expectedSeq: 0, descriptorHash }, now));
-  if (!acquired.ok) throw new Error('admission failed');
-  const epoch = acquired.value.epoch;
-  expect(await deliver({ reservationEpoch: epoch })).toMatchObject({ ok: false });
-  await client.$transaction(tx => manageReservationConversationLease(tx, 'owner', 'm1', { ...base, operation: 'activate', runtime: { launchId: 'launch', processGroupId: 1, processStartId: 'start' }, epoch, descriptorHash }, now));
-  expect(await deliver()).toMatchObject({ ok: false });
-  expect(await deliver({ reservationEpoch: 'stale' })).toMatchObject({ ok: false });
-  expect(await deliver({ reservationEpoch: epoch })).toMatchObject({ ok: true, value: { idempotent: false, message: { sessionId: 's1', seq: 1 } } });
-  expect(await deliver({ reservationEpoch: epoch })).toMatchObject({ ok: true, value: { idempotent: true } });
-  expect(await client.session.count()).toBe(1);
-  expect(await client.sessionMessage.count()).toBe(1);
-});
-it('does not let a legacy reservation enter a conversation owned by another v5 run', async () => {
-  await client.automation.update({ where: { id: 'a1' }, data: { payloadVersion: 5 } });
-  await client.$transaction(tx => manageReservationConversationLease(tx, 'owner', 'm1', { wireVersion: 1, operation: 'acquire', runId: 'r1', claimToken: 'token-r1', sessionId: 's1', expectedSeq: 0, descriptorHash: 'a'.repeat(64) }, now));
-  await client.automation.update({ where: { id: 'a1' }, data: { payloadVersion: 4 } });
-  expect(await deliver()).toMatchObject({ ok: false, error: 'reservation-busy' });
-  expect(await client.sessionMessage.count()).toBe(0);
 });

@@ -25,9 +25,7 @@ export type AutomationServiceError =
     | 'automation-run-unsupported'
     | 'invalid-payload-update'
     | 'revision-conflict'
-    | 'registration-conflict'
-    | 'conversion-requires-pause'
-    | 'conversion-active-run';
+    | 'registration-conflict';
 
 export type AutomationServiceResult<T> =
     | { ok: true; value: T }
@@ -414,7 +412,7 @@ export async function createRegisteredAutomation(tx: Tx, actorId: string, projec
     const access = await projectAccess(tx, actorId, projectId);
     if (!access) return { ok: false, error: 'not-found' };
     if (!access.canEdit) return { ok: false, error: 'forbidden' };
-    if (![4, 5].includes(input.payloadVersion) || input.paused !== true || !/^[A-Za-z0-9_-]{16,128}$/.test(registrationKey)) return { ok: false, error: 'invalid-payload-update' };
+    if (input.payloadVersion !== 4 || input.paused !== true || !/^[A-Za-z0-9_-]{16,128}$/.test(registrationKey)) return { ok: false, error: 'invalid-payload-update' };
     const target = await targetForProject(tx, access.project);
     if (!target) return { ok: false, error: 'automation-target-unavailable' };
     const keyError = validateKeyVersions(access.project, target, input);
@@ -423,7 +421,7 @@ export async function createRegisteredAutomation(tx: Tx, actorId: string, projec
     const created = await tx.automation.createMany({ data: [{ id, projectId, ownerAccountId: actorId,
         machineAccountId: target.machineAccountId, machineId: target.machineId, ...input }], skipDuplicates: true });
     const row = await tx.automation.findUnique({ where: { id } });
-    if (!row || row.projectId !== projectId || row.ownerAccountId !== actorId || row.deletedAt || row.payloadVersion !== input.payloadVersion
+    if (!row || row.projectId !== projectId || row.ownerAccountId !== actorId || row.deletedAt || row.payloadVersion !== 4
         || row.machineAccountId !== target.machineAccountId || row.machineId !== target.machineId) return { ok: false, error: 'registration-conflict' };
     if (created.count === 1) await appendChange(tx, row, target, 'UPSERT');
     // Existing ciphertext/state is returned unchanged. Only the viewer can compare decrypted retry intent.
@@ -563,12 +561,6 @@ export async function updateAutomation(
 
     if (current.payloadVersion === 3) return { ok: false, error: 'invalid-payload-update' };
 
-    // A project legacy worker must relinquish its lease before the same definition binds a fixed conversation.
-    if (!projectId.startsWith('chat:') && current.payloadVersion !== input.payloadVersion && (input.payloadVersion === 4 || input.payloadVersion === 5)) {
-        if (!current.paused || input.paused !== true) return { ok: false, error: 'conversion-requires-pause' };
-        const active = await tx.automationRun.findFirst({ where: { automationId, status: { in: ['CLAIMED', 'RUNNING'] }, OR: [{ status: 'CLAIMED', claimExpiresAt: { gte: new Date() } }, { status: 'RUNNING', runLeaseExpiresAt: { gte: new Date() } }] }, select: { id: true } });
-        if (active) return { ok: false, error: 'conversion-active-run' };
-    }
     const payloadUpdate = hasPayloadUpdate(input);
     if (!payloadUpdate && input.paused === undefined) {
         return { ok: false, error: 'invalid-payload-update' };

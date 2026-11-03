@@ -19,8 +19,6 @@ vi.mock('@/app/events/eventRouter', () => ({
     buildNewMessageUpdate: (message: unknown, sessionId: string, seq: number) => ({ seq, body: { sid: sessionId, message } }),
 }));
 
-import { manageReservationConversationLease } from '@/app/automation/reservationConversationLease';
-import { createHash } from 'node:crypto';
 import { v3SessionRoutes } from './v3SessionRoutes';
 
 let sql: string;
@@ -43,7 +41,7 @@ beforeEach(async () => {
 });
 afterEach(async () => { await client?.$disconnect(); await pg?.close(); });
 
-async function send(messages: Array<{ localId: string; content: string }>, authorization?: string) {
+async function send(messages: Array<{ localId: string; content: string }>) {
     const app = fastify();
     app.setValidatorCompiler(validatorCompiler);
     app.setSerializerCompiler(serializerCompiler);
@@ -53,7 +51,7 @@ async function send(messages: Array<{ localId: string; content: string }>, autho
     typed.decorate('authenticateSessionScope', authenticate);
     v3SessionRoutes(typed);
     await typed.ready();
-    const response = await typed.inject({ method: 'POST', url: '/v3/sessions/session-1/messages', payload: { messages }, headers: authorization ? { 'x-happy-reservation-authorization': authorization } : {} });
+    const response = await typed.inject({ method: 'POST', url: '/v3/sessions/session-1/messages', payload: { messages } });
     await typed.close();
     return response;
 }
@@ -87,23 +85,4 @@ describe('message batch writes against the stored rows', () => {
         expect(await client.sessionMessage.count({ where: { sessionId: 'session-1' } })).toBe(3);
         expect(state.emitted).toHaveLength(2);
     });
-});
-
-it('holds manual messages without consuming seqs while a reservation owns the conversation, but replays old ACKs', async () => {
-    const now = new Date();
-    await client.project.create({ data: { id: 'p', accountId: 'account-1', name: 'P', config: { machineId: 'm' }, automationViewerKeyVersion: 1 } });
-    await client.machine.create({ data: { id: 'm', accountId: 'account-1', metadata: '', automationKeyVersion: 1 } });
-    await client.automation.create({ data: { id: 'a', projectId: 'p', ownerAccountId: 'account-1', machineAccountId: 'account-1', machineId: 'm', payloadVersion: 5, payloadCiphertext: new Uint8Array([1]), viewerKeyId: 'k', viewerKeyVersion: 1, viewerKeyEnvelope: new Uint8Array([1]), machineKeyVersion: 1, machineKeyEnvelope: new Uint8Array([1]) } });
-    await client.automationRun.create({ data: { id: 'r', automationId: 'a', generation: 1, scheduledFor: now, machineAccountId: 'account-1', machineId: 'm', status: 'RUNNING', claimTokenHash: new Uint8Array(createHash('sha256').update('claim').digest()), claimExpiresAt: new Date(now.getTime() + 600000), runLeaseExpiresAt: new Date(now.getTime() + 600000) } });
-    const base = { wireVersion: 1 as const, runId: 'r', claimToken: 'claim', sessionId: 'session-1' }, descriptorHash = 'a'.repeat(64);
-    const admitted = await client.$transaction(tx => manageReservationConversationLease(tx, 'account-1', 'm', { ...base, operation: 'acquire', expectedSeq: 1, descriptorHash }, now));
-    if (!admitted.ok) throw new Error('admission failed');
-    const blocked = await send([{ localId: 'manual-new', content: 'manual' }]);
-    expect(blocked.statusCode).toBe(409); expect(blocked.json()).toMatchObject({ error: 'reservation-busy' });
-    expect((await client.session.findUniqueOrThrow({ where: { id: 'session-1' } })).seq).toBe(1);
-    expect(state.emitted).toHaveLength(0);
-    expect((await send([{ localId: 'existing', content: 'retry' }])).statusCode).toBe(200);
-    await client.$transaction(tx => manageReservationConversationLease(tx, 'account-1', 'm', { ...base, operation: 'activate', runtime: { launchId: 'launch', processGroupId: 1, processStartId: 'start' }, epoch: admitted.value.epoch, descriptorHash }, now));
-    expect((await send([{ localId: 'runtime-output', content: 'answer' }], admitted.value.messageAuthorization)).statusCode).toBe(200);
-    expect(await client.session.count()).toBe(1);
 });

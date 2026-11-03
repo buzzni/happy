@@ -1,6 +1,5 @@
 import { HubInputGate, TurnInputEvidence, type QueueInputEvidence, type EvidenceBatch } from './turnInputEvidence';
 import type { MessageQueue2 } from '@/utils/MessageQueue2';
-import { assertReservationMetadata } from '@/daemon/automations/reservationTurnBootstrap';
 import type { SetupTokenRotationState } from './types';
 import { logger } from '@/ui/logger'
 import { buildScheduledRunPrompt } from '@/utils/scheduledRunPrompt'
@@ -683,15 +682,10 @@ export class ApiSessionClient extends EventEmitter {
         return reply.result;
     }
 
-    constructor(token: string, session: Session, managed?: ManagedCredentialMode, private readonly options: { trackShutdownStorage?: boolean; storageHighWaterBytes?: number; storageHighWaterWrites?: number; reservation?: { sessionId: string; authorization: string } } = {}) {
+    constructor(token: string, session: Session, managed?: ManagedCredentialMode, private readonly options: { trackShutdownStorage?: boolean; storageHighWaterBytes?: number; storageHighWaterWrites?: number } = {}) {
         super()
         for (const value of [options.storageHighWaterBytes, options.storageHighWaterWrites]) {
             if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) throw new Error('Invalid storage high water mark');
-        }
-        if (options.reservation) {
-            if (options.reservation.sessionId !== session.id) throw new Error('Reservation session mismatch');
-            if (!/^[A-Za-z0-9_-]{1,200}\.[A-Za-z0-9_-]{43}$/.test(options.reservation.authorization)) throw new Error('Invalid reservation authorization');
-            if (managed) throw new Error('Managed reservation adapter unavailable');
         }
         const storage = options.trackShutdownStorage ? this.storageBarrier : null;
         this.metadataWrites = new SessionStateWrites(storage, () => logger.warn('[API] Metadata storage could not be confirmed'), () => this.canWriteSessionState(), () => this.scheduleStateRetry());
@@ -733,14 +727,12 @@ export class ApiSessionClient extends EventEmitter {
             requireBoundRequests: configuration.machineControl === 'strict',
             logger: (msg, data) => logger.debug(msg, data)
         });
-        if (!options.reservation) {
         registerCommonHandlers(this.rpcHandlerManager, this.metadata.path, {
             childEnvBoundary: 'in-session',
             machineRun: { profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY, managedTools: hostManagedMachineTools(configuration.happyHomeDir) },
         });
         // aplus-dev-studio-desktop#2111 — stops only what this session's runtime recorded at spawn.
         registerCleanBackgroundProcessesHandler(this.rpcHandlerManager, this.sessionId);
-        }
 
         //
         // Create socket
@@ -755,7 +747,6 @@ export class ApiSessionClient extends EventEmitter {
                 token: this.token,
                 clientType: 'session-scoped' as const,
                 sessionId: this.sessionId,
-                ...(options.reservation ? { reservationAuthorization: options.reservation.authorization } : {}),
                 happyClient: `cli-coding-session/${configuration.currentCliVersion}`
             },
             /*
@@ -1157,8 +1148,7 @@ export class ApiSessionClient extends EventEmitter {
         return {
             'Authorization': `Bearer ${this.token}`,
             'Content-Type': 'application/json',
-            'X-Happy-Client': `cli-coding-session/${configuration.currentCliVersion}`,
-            ...(this.options.reservation ? { 'X-Happy-Reservation-Authorization': this.options.reservation.authorization } : {}),
+            'X-Happy-Client': `cli-coding-session/${configuration.currentCliVersion}`
         };
     }
 
@@ -1642,7 +1632,7 @@ export class ApiSessionClient extends EventEmitter {
         }
 
         // Update metadata with summary if this is a summary message
-        if (!this.options.reservation && body.type === 'summary' && 'summary' in body && 'leafUuid' in body) {
+        if (body.type === 'summary' && 'summary' in body && 'leafUuid' in body) {
             this.summarySent = true;
             this.updateMetadata((metadata) => ({
                 ...metadata,
@@ -1734,7 +1724,6 @@ export class ApiSessionClient extends EventEmitter {
      * result without checking first.
      */
     private reportAutomationTurn(result: AutomationTurnResult): void {
-        if (this.options.reservation) return; // The daemon's fixed-turn coordinator owns this report.
         void notifyDaemonAutomationTurnResult(this.sessionId, result).catch((error) => {
             logger.debug('[API] Scheduled turn result not reported', { error: String(error) });
         });
@@ -2526,7 +2515,6 @@ export class ApiSessionClient extends EventEmitter {
             if (!attempt || !this.options.trackShutdownStorage) {
                 try {
                     const updated = handler(this.metadata!);
-                    assertReservationMetadata(updated);
                     attempt = { expectedVersion: this.metadataVersion, encrypted: encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, updated)), uncertain: false };
                 } catch (error) {
                     if (this.options.trackShutdownStorage) throw new SessionStateWriteRefused('Invalid local metadata transform');
@@ -2637,40 +2625,6 @@ export class ApiSessionClient extends EventEmitter {
                 this.socket.emit('ping', () => { clearTimeout(timer); resolve(); });
             } catch (error) { clearTimeout(timer); reject(error); }
         });
-    }
-
-    /** Cleanup-only receipt reconciliation: never appends after reservation authority was withdrawn. */
-    async readReservationStoredOutput(afterSeq: number): Promise<StorageConfirmation> {
-        if (!this.options.reservation || !this.options.trackShutdownStorage || this.closed || this.shutdownStorageFlush
-            || this.outboxInFlightCount || !Number.isSafeInteger(afterSeq) || afterSeq < 0) return { stored: false, reason: 'unsupported' };
-        this.clearOutboxRetry(); this.outboxPaused = true;
-        const expected = [...this.pendingOutbox, ...this.unconfirmedOutbox];
-        const found = new Set<string>(); let cursor = afterSeq; const deadline = performance.now() + 10000;
-        try {
-            for (let page = 0; expected.length && page < 100 && performance.now() < deadline; page++) {
-                const response = await axios.get<V3GetSessionMessagesResponse>(
-                    `${configuration.serverUrl}/v3/sessions/${encodeURIComponent(this.sessionId)}/messages`,
-                    { params: { after_seq: cursor, limit: 100 }, headers: this.authHeaders(), timeout: Math.max(1, Math.floor(deadline - performance.now())) },
-                );
-                const rows = response.data.messages;
-                if (!Array.isArray(rows)) return { stored: false, reason: 'unconfirmed-write' };
-                let maximum = cursor;
-                for (const row of rows) {
-                    if (!Number.isSafeInteger(row.seq) || row.seq <= cursor) continue;
-                    maximum = Math.max(maximum, row.seq);
-                    const item = expected.find(item => item.localId === row.localId);
-                    if (item && row.content?.t === 'encrypted' && row.content.c === item.content) found.add(item.localId);
-                }
-                if (found.size === expected.length || !response.data.hasMore) break;
-                if (maximum <= cursor) return { stored: false, reason: 'unconfirmed-write' };
-                cursor = maximum;
-            }
-        } catch { return { stored: false, reason: 'unconfirmed-write' }; }
-        const current = [...this.pendingOutbox, ...this.unconfirmedOutbox];
-        if (found.size !== expected.length || current.length !== expected.length || current.some((item, index) => item !== expected[index])) return { stored: false, reason: 'unconfirmed-write' };
-        this.pendingOutbox = []; this.unconfirmedOutbox = [];
-        for (const item of expected) item.confirmStorage(true);
-        return this.storageBarrier.wait(1000);
     }
 
     /** Call only after input dispatch and provider output/resume producers have quiesced. */

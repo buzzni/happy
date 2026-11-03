@@ -16,7 +16,6 @@ export function consumeStandaloneLaunchBootstrap(env: NodeJS.ProcessEnv): Standa
   } catch { throw new Error('Invalid standalone launch bootstrap'); }
 }
 export const launchCommandSchema = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('reservation-renew'), nonce: id, epoch: id, deadlineMonotonicMs: z.number().int().positive() }).strict(),
   z.object({ type: z.literal('drain'), nonce: id, sessionBudgetMs: z.number().finite().positive().max(30000),
     releaseBudgetMs: z.number().finite().positive().max(10000) }).strict(),
   z.object({ type: z.literal('release'), nonce: id }).strict(),
@@ -24,7 +23,6 @@ export const launchCommandSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('abandon'), nonce: id }).strict(),
 ]);
 export const launchReplySchema = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('reservation-renewed'), nonce: id, launchId: id, epoch: id, accepted: z.boolean() }).strict(),
   z.object({ type: z.literal('ready'), instanceId: id, launchId: id }).strict(),
   z.object({ type: z.literal('receipt'), nonce: id, launchId: id, stored: z.boolean(),
     ownership: z.enum(['none', 'held', 'unknown']), reason: z.string().max(128).nullable() }).strict(),

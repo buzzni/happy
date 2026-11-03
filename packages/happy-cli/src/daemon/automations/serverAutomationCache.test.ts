@@ -89,20 +89,6 @@ describe('serverAutomationCache', () => {
     })
   })
 
-  it('resets the sync cursor when native reservation support changes without losing encrypted rows', () => {
-    const keyPair = tweetnacl.box.keyPair(), encrypted = bundle({ name: 'task' }, keyPair.publicKey)
-    const cache = createServerAutomationCache({ filePath: file })
-    cache.applySync({ serverTime: 1, nextSeq: '7', changes: [{ seq: '7', automationId: 'native', revision: 1, generation: 1, kind: 'UPSERT', payloadVersion: 5, ...encrypted, machineKeyVersion: 1, paused: false, enabledAt: 1 }] })
-    cache.negotiateReservationCodec!(true)
-    expect(cache.read()).toMatchObject({ cursor: 0n, automations: [{ payloadVersion: 5 }] })
-    cache.applySync({ serverTime: 2, nextSeq: '8', changes: [] })
-    createServerAutomationCache({ filePath: file }).negotiateReservationCodec!(true)
-    expect(cache.read().cursor).toBe(8n)
-    cache.negotiateReservationCodec!(false)
-    expect(cache.read().cursor).toBe(0n)
-    expect(cache.read().pendingAcknowledgements).toHaveLength(1)
-  })
-
   it('durably keeps the sealed deletion target until its session stop is acknowledged', () => {
     const keyPair = tweetnacl.box.keyPair(); const encrypted = bundle({ name: 'task', prompt: 'work', directory: '/chat', schedule: { kind: 'interval', minutes: 15 }, conversation: { sessionId: 's' } }, keyPair.publicKey)
     const cache = createServerAutomationCache({ filePath: file })

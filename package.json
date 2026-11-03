@@ -39,8 +39,7 @@
         "overrides": {
             "whatwg-url": "14.2.0",
             "parse-path": "7.0.3",
-            "@types/parse-path": "7.0.3",
-            "pglite-prisma-adapter>@prisma/driver-adapter-utils": "6.19.2"
+            "@types/parse-path": "7.0.3"
         },
         "onlyBuiltDependencies": [
             "@more-tech/react-native-libsodium",

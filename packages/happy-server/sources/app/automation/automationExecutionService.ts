@@ -1,4 +1,3 @@
-import { lockReservationSession, readReservationLease } from './reservationConversationLease';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { Prisma, type AutomationRunOutcome, type Prisma as PrismaTypes } from '@prisma/client';
 import { AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION } from '@slopus/happy-wire';
@@ -17,8 +16,7 @@ export type AutomationExecutionError =
     | 'claim-cancelled'
     | 'claim-expired'
     | 'run-not-running'
-    | 'report-conflict'
-    | 'reservation-unsettled';
+    | 'report-conflict';
 
 type Result<T> = { ok: true; value: T } | { ok: false; error: AutomationExecutionError };
 
@@ -125,7 +123,7 @@ export async function syncAutomations(
                 revision: { gte: change.revision },
             },
         });
-        if (!automation || automation.payloadVersion === 3 || (automation.payloadVersion !== 1 && !input.payloadVersions?.includes(automation.payloadVersion))) {
+        if (!automation || automation.payloadVersion === 3 || (automation.payloadVersion === 4 && !input.payloadVersions?.includes(4))) {
             changes.push({ seq: change.seq, automationId: change.automationId, revision: change.revision, generation: change.generation, kind: 'TOMBSTONE' });
             continue;
         }
@@ -427,14 +425,6 @@ export async function reportAutomationRun(
             }
             : { ok: false, error: 'report-conflict' };
     }
-    // A terminal report must not revoke a still-running reservation's message
-    // authority before its output is drained and the native process tree exits.
-    if (run.sessionId && run.automation.payloadVersion === 5 && input.sessionId && input.sessionId !== run.sessionId) return { ok: false, error: 'report-conflict' };
-    if (run.sessionId && run.automation.payloadVersion === 5) {
-        await lockReservationSession(tx, accountId, run.sessionId);
-        const lease = await readReservationLease(tx, run.sessionId);
-        if (lease?.runId === run.id) return { ok: false, error: 'reservation-unsettled' };
-    }
     if (run.status !== 'RUNNING' && run.status !== 'ABANDONED') {
         return { ok: false, error: 'run-not-running' };
     }
@@ -480,7 +470,7 @@ export async function reportAutomationRun(
                 reportId: input.reportId,
                 status: input.status,
                 outcome: input.outcome,
-                sessionId: run.automation.payloadVersion === 5 ? run.sessionId : input.sessionId,
+                sessionId: input.sessionId,
                 detailCiphertext: input.detailCiphertext,
                 failureCode: input.failureCode,
                 degradedCode,

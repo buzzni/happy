@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const services = vi.hoisted(() => ({
-    manageReservationConversationLease: vi.fn(),
     ackAutomationSync: vi.fn(),
     claimAutomationRun: vi.fn(),
     heartbeatAutomationRun: vi.fn(),
@@ -18,7 +17,6 @@ const services = vi.hoisted(() => ({
     emitSessionFollowupMessageUpdate: vi.fn(),
 }));
 vi.mock('@/app/automation/automationExecutionService', () => services);
-vi.mock('@/app/automation/reservationConversationLease', () => services);
 vi.mock('@/app/automation/sessionFollowupExecutionService', () => services);
 vi.mock('@/app/automation/automationUpdate', () => ({
     emitAutomationUpdate: services.emitAutomationUpdate,
@@ -62,7 +60,7 @@ describe('automationSocketHandler', () => {
         automationSocketHandler('account-1', 'machine-1', socket as never);
 
         expect([...handlers.keys()].sort()).toEqual([
-            'automation-claim', 'automation-conversation-deliver', 'automation-conversation-lease', 'automation-key-register', 'automation-reservation-checkpoint', 'automation-run-heartbeat',
+            'automation-claim', 'automation-conversation-deliver', 'automation-key-register', 'automation-run-heartbeat',
             'automation-run-report', 'automation-run-start', 'automation-sync', 'automation-sync-ack',
             'session-followup-claim', 'session-followup-deliver', 'session-followup-evaluate',
             'session-followup-sync',
@@ -435,33 +433,4 @@ describe('automationSocketHandler', () => {
         );
     });
 
-});
-
-it('binds conversation lease control to the machine socket and refuses unexpected authority fields', async () => {
-    process.env.SAYCODE_AUTOMATION_ENABLED = 'true';
-    const handlers = new Map<string, Function>();
-    automationSocketHandler('owner', 'machine', { on: (event: string, handler: Function) => handlers.set(event, handler) } as never);
-    const input = { wireVersion: 1, operation: 'acquire', runId: 'run', claimToken: 'claim', sessionId: 'session', expectedSeq: 0, descriptorHash: 'a'.repeat(64) };
-    services.manageReservationConversationLease.mockResolvedValue({ ok: false, error: 'reservation-busy' });
-    const ack = vi.fn();
-    await handlers.get('automation-conversation-lease')!(input, ack);
-    expect(services.manageReservationConversationLease).toHaveBeenCalledWith({}, 'owner', 'machine', input);
-    expect(ack).toHaveBeenCalledWith({ ok: false, error: 'reservation-busy' });
-    services.manageReservationConversationLease.mockClear();
-    await handlers.get('automation-conversation-lease')!({ ...input, machineId: 'foreign' }, ack);
-    expect(services.manageReservationConversationLease).not.toHaveBeenCalled();
-    expect(ack).toHaveBeenLastCalledWith({ ok: false, error: 'invalid-input' });
-    delete process.env.SAYCODE_AUTOMATION_ENABLED;
-});
-
-it('accepts explicit native codec negotiation and rejects unknown codecs', async () => {
-  process.env.SAYCODE_AUTOMATION_ENABLED = 'true';
-  const handlers = new Map<string, Function>(), socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
-  services.syncAutomations.mockResolvedValue({ ok: true, value: { serverTime: new Date(10), nextSeq: 0n, changes: [] } });
-  automationSocketHandler('account-1', 'machine-1', socket as never);
-  const callback = vi.fn(); await handlers.get('automation-sync')!({ afterSeq: '0', limit: 100, payloadVersions: [1, 4, 5] }, callback);
-  expect(services.syncAutomations).toHaveBeenCalledWith({}, 'account-1', 'machine-1', { afterSeq: 0n, limit: 100, payloadVersions: [1, 4, 5] });
-  services.syncAutomations.mockClear(); await handlers.get('automation-sync')!({ afterSeq: '0', limit: 100, payloadVersions: [1, 4, 6] }, callback);
-  expect(services.syncAutomations).not.toHaveBeenCalled();
-  delete process.env.SAYCODE_AUTOMATION_ENABLED;
 });

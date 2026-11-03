@@ -2,14 +2,6 @@ import { createBrowserNativeDeviceProof, type BrowserNativeDeviceSigner } from '
 import { createManualPersonalSpawn, MANUAL_PERSONAL_ENV } from './manualPersonalClaude';
 import { createOwnedSpawnRuntime, createOwnedStartGuard } from './ownedSpawnRuntime';
 import { createAgentCallerLaunches, OWNER_CONTACT_SWITCH, readOwnerContactTrust, type OwnedLaunchLineage } from './agentCallerLaunches';
-import { createToolPolicyGate } from '@/toolPolicy/policyGate';
-import { createMachinePolicyLoader } from '@/toolPolicy/rules';
-import { createPolicyGrantStore } from '@/toolPolicy/grants';
-import { createToolPolicyAuditLog } from '@/toolPolicy/audit';
-import { createTargetResolver } from '@/toolPolicy/targetResolver';
-import { isToolPolicyEnabled, toolPolicyFilePath } from '@/toolPolicy/claudeHook';
-import { createReservationNativeAdapter, verifyReservationNativeImage } from './automations/reservationNativeAdapter';
-import { fetchAplusMcpConfigSnapshot } from '@/aplus/fetchAplusMcpServers';
 import { drainWorktreeOperations } from './worktreeOps';
 import { createMachineSetupTokenProtocol, MachineRotationError } from './machineSetupTokenProtocol';
 import { chooseLaunchRotation, createMachineRotationResolver } from './machineRotationResolver';
@@ -37,7 +29,7 @@ import * as tmp from 'tmp';
 import axios from 'axios';
 import * as z from 'zod';
 import { WRITE_FILE_ATTEMPT_CAPABILITY } from '@/modules/common/writeFileAttempts';
-import { reservationLeaseViewSchema, AUTOMATION_PROTOCOL_VERSION, PROJECT_PURGE_CAPABILITY, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKSPACE_SYNC_CAPABILITY, WORKTREE_OPS_CAPABILITY } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, PROJECT_PURGE_CAPABILITY, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKSPACE_SYNC_CAPABILITY, WORKTREE_OPS_CAPABILITY } from '@slopus/happy-wire';
 import { createHash, randomUUID } from 'node:crypto';
 import { createScriptAutomationWorker, ScriptRequestError } from './automations/scriptAutomationWorker';
 import { prepareManagedScriptRuntime, probeManagedScriptEngine, recoverManagedScriptContainers } from './automations/managedScriptRuntime';
@@ -215,7 +207,6 @@ import {
   createProcFs,
   createProcProcessProbe,
   stopSessionWithVerifiedExit,
-  unavailableVerification,
 } from './sessionExitVerification';
 import {
   resolveOrphanAdoption,
@@ -299,8 +290,6 @@ import {
   trustedSessionFollowupPayload,
   trustedServerAutomationPayload,
 } from './automations/serverAutomationCache';
-import { ReservationRunJournal } from './automations/reservationRunJournal';
-import { ReservationBackgroundRuns } from './automations/reservationBackgroundRuns';
 import { createServerAutomationRuntimeStore } from './automations/serverAutomationRuntimeStore';
 import { createAutomationDeliveryCoordinator, type AutomationDeliveryOutcome, type AutomationDeliveryRequest } from './automations/automationDelivery';
 import { createAutomationDeliveryStore } from './automations/automationDeliveryStore';
@@ -2975,11 +2964,7 @@ export async function startDaemon(): Promise<void> {
 
     /** Sessions being resumed: an account switch at resume finds their record here, as it finds a live child's. */
     const resumingSetupTokenSessions = new Map<string, TrackedSession>();
-    const reservationResumePreparations = new Map<string, number>();
-    let cancelReservationSession = (_sessionId: string): boolean => false;
-    let isReservationSessionBlocked = (_sessionId: string): boolean => false;
     const spawnResumedSession = async (happySessionId: string, options?: ResumeSessionOptions): Promise<ResumeSessionResult> => {
-      if (isReservationSessionBlocked(happySessionId)) return { type: 'error', code: 'SESSION_LIVE', errorMessage: 'The reservation still owns this chat; wait for verified cleanup.' };
       if (writeScopeRuntime?.isApplying(happySessionId) && !options?.writeScopeEnvironment) return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: 'Session folder permissions are being replaced' };
 
       if (!launchReadiness.isReady()) return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: 'Daemon is initializing; retry the resume shortly' };
@@ -2991,7 +2976,6 @@ export async function startDaemon(): Promise<void> {
       const organizationRefusal = organizationResumeRefusal(options?.aiAuthRequirement, resumeSource, restoreManualToOrganization);
       if (organizationRefusal) return { type: 'error', code: 'CLAUDE_ORGANIZATION_RESUME_REQUIRED', errorMessage: `Session ${happySessionId} has no record of the required organization account.` };
       let endResumeLaunch: (() => void) | undefined;
-      reservationResumePreparations.set(happySessionId, (reservationResumePreparations.get(happySessionId) ?? 0) + 1);
       try {
         if (hasLiveDaemonChild(happySessionId, pidToTrackedSession.values(), isPidAlive, ownsUnresolvedJob)) {
           // The record vouches only for a process this resume starts: a live child may be on a consented personal fallback.
@@ -3383,8 +3367,6 @@ export async function startDaemon(): Promise<void> {
           errorMessage: `Failed to resume session: ${errorMessage}`,
         };
       } finally {
-        const remaining = (reservationResumePreparations.get(happySessionId) ?? 1) - 1;
-        if (remaining) reservationResumePreparations.set(happySessionId, remaining); else reservationResumePreparations.delete(happySessionId);
         endResumeLaunch?.();
       }
     };
@@ -3732,7 +3714,6 @@ export async function startDaemon(): Promise<void> {
     // source — first re-validates against the session's locally-observed activity
     // so a stale or wrong policy decision cannot kill a session the user is using.
     const stopSession = (sessionId: string, context?: StopSessionContext): StopSessionResult => {
-      if (isReservationSessionBlocked(sessionId)) { if (resolveStopSessionMode(context) === 'force') cancelReservationSession(sessionId); return { stopped: false, reason: 'managed-generation', detail: 'native-reservation-cleanup-pending' }; }
       const mode = resolveStopSessionMode(context);
       logger.debug(`[DAEMON RUN] Attempting to stop session ${sessionId}`, {
         source: context?.source,
@@ -3882,13 +3863,8 @@ export async function startDaemon(): Promise<void> {
     // processes exit.
     // It sends no signal of its own and never answers 'exited' without evidence.
     const sessionExitProbe = createProcProcessProbe(createProcFs());
-    const stopSessionWithExitVerification = async (sessionId: string, context?: StopSessionContext) => {
-      if (isReservationSessionBlocked(sessionId)) {
-        if (resolveStopSessionMode(context) === 'force') cancelReservationSession(sessionId);
-        return { result: { stopped: false, reason: 'managed-generation', detail: 'native-reservation-cleanup-pending' } as StopSessionResult,
-          exitVerification: unavailableVerification('verification-unsupported') };
-      }
-      return stopSessionWithVerifiedExit({
+    const stopSessionWithExitVerification = (sessionId: string, context?: StopSessionContext) =>
+      stopSessionWithVerifiedExit({
         findTarget: () => {
           const target = findStopTarget(sessionId);
           return target ? { pid: target.pid, token: target.session } : undefined;
@@ -3896,7 +3872,6 @@ export async function startDaemon(): Promise<void> {
         stop: () => stopSession(sessionId, context),
         probe: sessionExitProbe,
       });
-    };
 
     // Handle child process exit — preserve session data for resume
     const resumeForBrowserAttention = async ({ sessionId, directory, text, localId }: HeldBrowserAttention): Promise<boolean> => {
@@ -3989,16 +3964,6 @@ export async function startDaemon(): Promise<void> {
     const serverAutomationRuntimeStore = createServerAutomationRuntimeStore({
       filePath: configuration.serverAutomationsRuntimeFile,
     });
-    const reservationJournal = new ReservationRunJournal(join(configuration.happyHomeDir, 'reservation-turns.v1.json'));
-    const reservationRuns = new ReservationBackgroundRuns(reservationJournal, message => logger.debug(message));
-    let reservationRecovery: Promise<void> | null = null;
-    let reservationNative: ReturnType<typeof createReservationNativeAdapter> | undefined;
-    cancelReservationSession = sessionId => reservationNative?.cancel(sessionId) ?? false;
-    isReservationSessionBlocked = sessionId => {
-      if (reservationRuns.hasSession(sessionId)) return true;
-      try { return reservationJournal.pending().some(row => row.sessionId === sessionId); }
-      catch { return false; } // Native admission itself fails closed; unrelated legacy chats stay available.
-    };
     // Saycode specs/_archive/automation-result-delivery — results and failure alerts for a paired messenger
     // conversation. The channel host started further down sends them; until then nothing can.
     let automationDeliverySend: ((request: AutomationDeliveryRequest) => Promise<AutomationDeliveryOutcome>) | null = null;
@@ -4034,7 +3999,6 @@ export async function startDaemon(): Promise<void> {
     const automationAllowedRoot = resolveDaemonAllowedRoot(process.env, os.homedir());
     // 겹침 가드(R5)용: 데몬이 추적 중인 자식 세션의 프로세스 생존 여부.
     const isAutomationSessionRunning = (sessionId: string): boolean => {
-      if (isReservationSessionBlocked(sessionId)) return true;
       for (const [pid, session] of pidToTrackedSession.entries()) {
         if (session.happySessionId === sessionId) return ownsUnresolvedJob(pid) || isPidAlive(pid);
       }
@@ -4049,7 +4013,6 @@ export async function startDaemon(): Promise<void> {
       return false;
     };
     const isAutomationDirectoryInUse = (directory: string): boolean => {
-      if ((serverAutomationRuntimeStore.read().githubWorktrees ?? []).some(row => row.directory === directory && (row.sessionId && isReservationSessionBlocked(row.sessionId) || (() => { try { return reservationJournal.pending().some(pending => pending.runId === row.runId); } catch { return true; } })()))) return true;
       return isGithubTriggerWorktreeDirectoryInUse({
         directory,
         sessions: pidToTrackedSession,
@@ -5124,90 +5087,15 @@ export async function startDaemon(): Promise<void> {
     });
     if (!standaloneWindows) await apiMachine.setLessonHosts(lessonHosts);
     apiMachine.setServerAutomationCache(serverAutomationCache);
-    // Opt-in, cached and immutable. Failed probes never change the existing scheduler.
-    const nativeImage = process.env.HAPPY_NATIVE_RESERVATION_IMAGE;
-    if (!standaloneWindows && nativeImage) void (async () => {
-      await verifyReservationNativeImage(nativeImage);
-      const accountId = await authenticatedAccountId(credentials.token);
-      reservationNative = createReservationNativeAdapter({ accountId, machineId, token: credentials.token,
-        serverUrl: configuration.serverUrl, image: nativeImage, directory: join(configuration.happyHomeDir, 'reservation-native'),
-        resolve: async sessionId => {
-          const tracked = findTrackedSessionById(sessionId);
-          if (!tracked?.encryption || !tracked.happySessionMetadataFromLocalWebhook) return null;
-          const decision = decideResumeCredentials({ trackedUserHomeDir: tracked.userHomeDir,
-            stagedToken: tracked.userHomeDir ? await readStagedTokenFromHomeDir(tracked.userHomeDir) : null,
-            daemonToken: credentials.token, diskToken: (await readCredentials())?.token ?? null });
-          if (decision.kind === 'refuse' || !tokensShareIdentity(decision.token, credentials.token)) return null;
-          const snapshot = await fetchServerSessionSnapshot(sessionId, tracked.encryption, decision.token);
-          if (!snapshot || snapshot.seq === undefined || !hasReliableResumeBaseline({ reportedSeq: tracked.runtime?.lastProcessedSeq, persistedSeq: tracked.persistedLastProcessedSeq })) return null;
-          const running = reservationResumePreparations.has(sessionId) || pendingMachineStarts.has(sessionId) || hasLiveDaemonChild(sessionId, pidToTrackedSession.values(), isPidAlive, ownsUnresolvedJob)
-            || tracked.runtime?.thinking === true || tracked.runtime?.hasOpenToolCall === true || tracked.runtime?.pendingUserInput === true;
-          return { session: { id: sessionId, ...tracked.encryption, seq: snapshot.seq!, metadata: snapshot.metadata,
-              metadataVersion: snapshot.metadataVersion ?? tracked.encryption.metadataVersion, agentState: null, agentStateVersion: tracked.encryption.agentStateVersion },
-            home: tracked.userHomeDir ?? os.homedir(), environment: tracked.agentEnvironment ?? {}, running,
-            processedSeq: resolveResumeBaselineSeq({ reportedSeq: tracked.runtime?.lastProcessedSeq, persistedSeq: tracked.persistedLastProcessedSeq,
-              webhookSeq: tracked.encryption.seq, serverSeq: snapshot.seq }) };
-        },
-        aiEnvironment: async sessionId => {
-          const tracked = findTrackedSessionById(sessionId), selected = readSetupTokenResumeSelection(tracked?.agentEnvironment);
-          return resolveManagedAiCredentialEnvironment(tracked?.happySessionMetadataFromLocalWebhook?.flavor, selected?.selection, selected?.binding);
-        },
-        connectors: async (context, sessionId) => {
-          if (!context || context.connectorPolicy === 'none') return {};
-          if (context.connectorPolicy === 'unspecified' || !context.mcpCallerGrant) throw new Error('RESERVATION_CONNECTOR_POLICY_UNCONFIRMED');
-          const snapshot = await fetchAplusMcpConfigSnapshot(credentials.token, machineId, {
-            configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL, projectId: context.mcpConfigProjectId, callerGrant: context.mcpCallerGrant,
-            expectedConnectors: context.requiredConnectors, sessionId, lifecycle: 'resume' });
-          if (!snapshot.result.ok) throw new Error('RESERVATION_CONNECTOR_CONFIG_UNAVAILABLE');
-          return snapshot.servers;
-        },
-        lease: request => apiMachine.manageReservationConversation(request), transport: apiMachine.serverAutomationTransport(),
-        deliver: request => apiMachine.deliverAutomationConversation(request), checkpoint: request => apiMachine.reservationCheckpoint(request),
-        policy: sessionId => isToolPolicyEnabled(process.env) ? createToolPolicyGate({
-          loadMachinePolicy: createMachinePolicyLoader(toolPolicyFilePath(configuration.happyHomeDir)), resolver: createTargetResolver(),
-          grants: createPolicyGrantStore({ grantTtlMs: null }),
-          audit: createToolPolicyAuditLog({ path: join(configuration.happyHomeDir, 'logs', 'tool-policy.jsonl'), sessionId: () => sessionId, publishRecent: () => {} }),
-          approver: () => null, unattended: () => true, terminalPrompt: () => false,
-        }) : undefined,
-        recordExit: (runId, proof) => reservationJournal.cleaned(runId, { stored: false, proof }),
-        commitCursor: async sessionId => {
-          const tracked = findTrackedSessionById(sessionId);
-          if (!tracked?.encryption) throw new Error('RESERVATION_TARGET_UNAVAILABLE');
-          const snapshot = await fetchServerSessionSnapshot(sessionId, tracked.encryption);
-          if (!snapshot || snapshot.seq === undefined) throw new Error('RESERVATION_STORAGE_UNCONFIRMED');
-          applyServerSessionSnapshot(tracked, snapshot);
-          tracked.runtime = { ...tracked.runtime, updatedAt: Date.now(), lastProcessedSeq: snapshot.seq, thinking: false, hasOpenToolCall: false, pendingUserInput: false };
-          persistResumeCursorIfDue(tracked); persistTrackedSessions();
-        },
-      });
-      await apiMachine.setReservationNativeSupported(true);
-    })().catch(() => { reservationNative = undefined; logger.debug('[reservation] native image unavailable; capability not advertised'); });
-    else void apiMachine.setReservationNativeSupported(false).catch(() => logger.debug('[reservation] codec reset unavailable'));
-
     const serverAutomationTickRunner = createAutomationTickRunner({
       // Windows standalone: sessions launch through the verified Job owner, so scheduled
       // sessions run; script gates and GitHub triggers would spawn unfenced cmd/gh/git.
-      runTick: async (signal) => {
-        if (reservationRuns.count === 0 && !reservationRecovery) reservationRecovery = reservationJournal.recover({
-          now: Date.now,
-          lease: async request => {
-            const result = await apiMachine.manageReservationConversation(request);
-            if (!result.ok) return { ok: false, error: result.error };
-            const value = reservationLeaseViewSchema.safeParse(result.value);
-            return value.success ? { ok: true, value: value.data } : { ok: false };
-          },
-          // A restarted daemon without its native backend cannot prove a process exited.
-          finish: async row => reservationNative ? reservationNative.recover(row) : ({ stored: false, proof: null }),
-        }).catch(() => logger.debug('[reservation] cleanup journal unavailable; existing reservations remain independent'))
-          .finally(() => { reservationRecovery = null; });
-        return runServerAutomationTick({
+      runTick: (signal) => runServerAutomationTick({
         hostCommandsAllowed: !standaloneWindows,
         signal,
         delivery: automationDelivery,
         cache: serverAutomationCache,
         runtimeStore: serverAutomationRuntimeStore,
-        reservationJournal, reservationRuns,
-        reservationConversation: reservationNative,
         machineSecretKey: machineAutomationKey.secretKey,
         now: Date.now(),
         transport: apiMachine.serverAutomationTransport(),
@@ -5262,7 +5150,7 @@ export async function startDaemon(): Promise<void> {
         // task that already started (aplus codexcli-daemon-restart-drain T8).
         maintainAgentTaskLease: (dispatch) => {
           activeServerAutomationLeaseCount += 1;
-          return maintainAutomationAgentTaskLease({
+          maintainAutomationAgentTaskLease({
             dispatch,
             onStop: () => {
               activeServerAutomationLeaseCount = Math.max(0, activeServerAutomationLeaseCount - 1);
@@ -5358,8 +5246,7 @@ export async function startDaemon(): Promise<void> {
         },
         isDirectoryInUse: isAutomationDirectoryInUse,
         logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
-      });
-      },
+      }),
       logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
       // 정상 tick 은 1분 하트비트 안에 끝난다 (spawn webhook 대기 최대 60초, gh·git 호출은
       // 각자 상한이 있다). 이를 10배 넘기면 끝나지 않는 await 다 — 버리고 새로 시작한다.
@@ -5724,7 +5611,7 @@ export async function startDaemon(): Promise<void> {
         + Number(serverAutomationTickRunner.isRunning())
         + Number(scriptAutomationTickRunner.isRunning())
         + Number(sessionFollowupTickRunner.isRunning())
-        + activeServerAutomationLeaseCount + reservationRuns.count,
+        + activeServerAutomationLeaseCount,
     });
     const getRestartDrainActivity = (): RestartDrainActivity => {
       const now = Date.now();
