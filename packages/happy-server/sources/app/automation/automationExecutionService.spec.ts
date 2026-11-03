@@ -70,11 +70,13 @@ describe('automationExecutionService', () => {
         }
     });
 
-    it('keeps syncing legacy monitor v2 rows as before the rollback', async () => {
+    it('tombstones legacy monitor v2 rows for daemons that cannot parse them', async () => {
+        // An UPSERT the daemon cache rejects would stall that machine's whole sync cursor.
         const tx = makeTx();
         tx.automation.findFirst.mockResolvedValue(automation({ payloadVersion: 2 }));
         const result = await syncAutomations(tx as never, 'account-1', 'machine-1', { afterSeq: 0n, limit: 100, payloadVersions: [1, 4] });
-        expect(result).toMatchObject({ ok: true, value: { changes: [{ kind: 'UPSERT', payloadVersion: 2 }] } });
+        expect(result).toMatchObject({ ok: true, value: { changes: [{ kind: 'TOMBSTONE' }] } });
+        expect((result as any).value.changes[0]).not.toHaveProperty('payloadVersion');
     });
 
     it('keeps legacy monitor v2 runs claimable as before the rollback', async () => {
