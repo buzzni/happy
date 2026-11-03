@@ -58,6 +58,41 @@ describe('automation reads without interactive transaction expiry', () => {
         expect(db.automation.findMany).not.toHaveBeenCalled();
     });
 
+    it('marks the opt-in reservation index and rejects malformed feature input', async () => {
+        const response = await app.inject({ method: 'POST', url: '/v1/automations/page', payload: {
+            projectIds: ['chat:c', 'project-p'], limit: 20, reservationExtensions: true,
+        } });
+        expect(response.statusCode).toBe(200);
+        expect(response.json()).toEqual({ reservationVersion: 1, automations: [], nextCursor: null });
+        db.automation.findMany.mockClear();
+        expect((await app.inject({ method: 'POST', url: '/v1/automations/page', payload: {
+            projectIds: ['chat:c'], reservationExtensions: 'true',
+        } })).statusCode).toBe(400);
+        expect(db.automation.findMany).not.toHaveBeenCalled();
+    });
+
+    it('keeps healthy script rows and the cursor when one reservation cannot be serialized', async () => {
+        const now = new Date(1000);
+        const base = { projectId: 'project-1', payloadVersion: 3, revision: 1, generation: 1, paused: false,
+            machineId: 'm', machineAccountId: 'reader', machineKeyVersion: 1, viewerKeyVersion: 1,
+            createdAt: now, updatedAt: now, targetMachine: null, project: { automationViewerPublicKey: null }, runs: [] };
+        const encrypted = { version: 2, ciphertext: 'YQ==', viewerKeyEnvelope: 'YQ==', machineKeyEnvelope: 'YQ==' };
+        db.automation.findMany.mockResolvedValue([
+            { ...base, id: 'z', scriptRevisions: [{ revision: 1, admission: { schedule: null, externalEnabled: false,
+                inputSchema: {}, artifactId: 'artifact', digest: 'a'.repeat(64) }, payloadCiphertext: JSON.stringify(encrypted), ready: false, nextRunAt: null, validationFailure: null }] },
+            { ...base, id: 'y', scriptRevisions: [] },
+            { ...base, id: 'x', scriptRevisions: [] },
+        ]);
+        const response = await app.inject({ method: 'POST', url: '/v1/automations/page', payload: {
+            projectIds: ['project-1'], limit: 2, reservationExtensions: true,
+        } });
+        expect(response.statusCode).toBe(200);
+        const page = response.json();
+        expect(page.automations[0]).toMatchObject({ kind: 'script', id: 'z', script: { id: 'z', encrypted } });
+        expect(page.automations[1]).toEqual({ kind: 'unavailable', id: 'y', projectId: 'project-1', createdAt: 1000, failureCode: 'RESERVATION_ROW_INVALID' });
+        expect(page.nextCursor).toBe(Buffer.from(JSON.stringify([1000, 'y'])).toString('base64url'));
+    });
+
     it.each(paths)('serves %s for accepted viewers when interactive transactions expire', async (path) => {
         const response = await app.inject({ method: 'GET', url: `/v1/projects/project-1/${path}` });
         expect(response.statusCode).toBe(200);
