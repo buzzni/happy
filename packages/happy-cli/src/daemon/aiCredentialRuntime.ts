@@ -16,6 +16,7 @@ import { spawn } from 'node:child_process'
 import { chmod, mkdir, mkdtemp, open, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
+import { withNpmGlobalBinOnPath } from './npmGlobalBin'
 import { logger } from '@/ui/logger'
 import { credentialFileLockPath, withCredentialLock } from '@/utils/credentialLock'
 import {
@@ -1419,16 +1420,30 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     return isSupportedCodexMultiAuthVersion(installed.cli) && installed.cli === installed.global ? installed.cli : null
   }
 
+  // codex-multi-auth runs from npm's global bin, beside the package the proxy and group adapters load.
+  // 2026-11-03 Mac: that bin was not on PATH, so every pinned install missed the CLI found first.
+  async function resolveNpmGlobalRoot(): Promise<string | null> {
+    return deps.execFile('npm', ['root', '--global']).then((result) => nonEmptyTrimmed(result.stdout), () => null)
+  }
+
+  async function runCodexMultiAuth(args: string[], options: CommandOptions = {}, globalRoot?: string | null): Promise<AiCredentialCommandResult> {
+    const root = globalRoot === undefined ? await resolveNpmGlobalRoot() : globalRoot
+    return deps.execFile('codex-multi-auth', args, root
+      ? { ...options, environment: withNpmGlobalBinOnPath(options.environment ?? deps.env, root, deps.platform) }
+      : options)
+  }
+
   async function inspectCodexMultiAuthInstallation(): Promise<{ cli: string; global: string }> {
+    // Resolve once per inspection so CLI selection and metadata use the same current prefix.
+    const root = await resolveNpmGlobalRoot()
     const installed = { cli: 'unknown', global: 'unknown' }
     const safeVersion = (value: unknown): string => typeof value === 'string' && /^\d{1,6}\.\d{1,6}\.\d{1,6}$/.test(value) ? value : 'unknown'
     try {
-      installed.cli = safeVersion((await deps.execFile('codex-multi-auth', ['--version'])).stdout.trim())
+      installed.cli = safeVersion((await runCodexMultiAuth(['--version'], {}, root)).stdout.trim())
     } catch {
       // Preserve unknown for the diagnostic; never include command output or secrets.
     }
     try {
-      const root = nonEmptyTrimmed((await deps.execFile('npm', ['root', '--global'])).stdout)
       if (root) {
         const packageJson = JSON.parse(await deps.readFile(join(root, 'codex-multi-auth', 'package.json'))) as unknown
         installed.global = isObject(packageJson) ? safeVersion(packageJson.version) : 'unknown'
@@ -1541,7 +1556,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       })
       if (repairedActive) {
         // Refresh the same live identity, never switch a valid personal login to another account.
-        await deps.execFile('codex-multi-auth', ['switch', String(merged.activeIndex + 1)], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
+        await runCodexMultiAuth(['switch', String(merged.activeIndex + 1)], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
         // Read what the switch left and write it back under one lock hold, so nothing lands in between.
         await deps.lockCredentialFile(accountsPath, async () => {
           const selected = JSON.parse(await deps.readFile(accountsPath)) as CodexMultiAuthBundle['accounts']
@@ -1565,7 +1580,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       { path: accountsPath, content: JSON.stringify(replacement) },
       { path: settingsPath, content: JSON.stringify(settings) },
     ], async (ownWrite) => {
-      await deps.execFile('codex-multi-auth', ['forecast', '--live', '--json'], {
+      await runCodexMultiAuth(['forecast', '--live', '--json'], {
         maxOutputBytes: MAX_PAYLOAD_BYTES,
         timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
       })
@@ -1600,7 +1615,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         await writeAtomicFile(deps, accountsPath, sortedContent)
         return { selection, accountCount: currentBundle.accounts.accounts.length }
       })
-      await deps.execFile('codex-multi-auth', ['check'], {
+      await runCodexMultiAuth(['check'], {
         maxOutputBytes: MAX_PAYLOAD_BYTES,
         timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
       })
@@ -1792,12 +1807,12 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       const verified = await verifyLocalAiAccounts(deps, selected, [identity], before.accounts, { budgetMs: 60_000 })
       if (!verified.accounts[0]?.ok) throw new AiCredentialRuntimeError('AI_CREDENTIAL_ACTIVE_INVALID')
       try {
-        await deps.execFile('codex-multi-auth', ['switch', String(index + 1)], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
+        await runCodexMultiAuth(['switch', String(index + 1)], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
         const after = JSON.parse(await deps.readFile(path))
         if (after.activeIndex !== index) throw new AiCredentialRuntimeError('AI_CREDENTIAL_ACTIVE_INVALID')
         await assertCodexLiveAccount(after.accounts[index])
       } catch (error) {
-        await deps.execFile('codex-multi-auth', ['switch', String(before.activeIndex + 1)], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS }).catch(() => undefined)
+        await runCodexMultiAuth(['switch', String(before.activeIndex + 1)], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS }).catch(() => undefined)
         await writeAtomicFile(deps, path, JSON.stringify(before))
         if (previousLive !== null) await writeAtomicFile(deps, livePath, previousLive)
         else await deps.rm(livePath, { force: true })
@@ -2169,7 +2184,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         }))
         if (!bundle) throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
         await assertSupportedCodexMultiAuthInstalled()
-        await deps.execFile('codex-multi-auth', ['check'], {
+        await runCodexMultiAuth(['check'], {
           maxOutputBytes: MAX_PAYLOAD_BYTES,
           timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
         })
