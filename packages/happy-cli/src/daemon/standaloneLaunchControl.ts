@@ -104,7 +104,7 @@ export class StandaloneLaunchControl {
         try {
           if (binary) throw new Error();
           const reply = launchReplySchema.parse(JSON.parse(raw.toString()));
-          if (reply.type === 'ready' || reply.nonce === entry.retiredNonce) return;
+          if (reply.type === 'ready' || reply.type === 'reservation-renewed' || reply.nonce === entry.retiredNonce) return;
           if (reply.launchId !== entry.bootstrap.launchId || reply.nonce !== nonce) throw new Error();
           if (reply.type === 'receipt') {
             if (releasing || !reply.stored || reply.ownership !== 'held') {
@@ -142,6 +142,30 @@ export class StandaloneLaunchControl {
         socket.on('message', message); socket.once('close', closed);
         socket.send(JSON.stringify({ type: 'drain', nonce, sessionBudgetMs, releaseBudgetMs }), error => { if (error) done({ ...blocked }); });
       }).catch(() => done({ ...blocked }));
+    });
+  }
+  /** A renewal is complete only when the authenticated child confirms its same epoch. */
+  async renewReservation(launchId: string, epoch: string, deadlineMonotonicMs: number): Promise<boolean> {
+    const entry = this.entries.get(launchId);
+    if (!entry || this.closing || !/^[a-zA-Z0-9._-]{1,128}$/.test(epoch) || !Number.isSafeInteger(deadlineMonotonicMs) || deadlineMonotonicMs <= 0) return false;
+    const nonce = randomUUID();
+    return new Promise<boolean>(resolve => {
+      let done = false, socket: WebSocket | undefined;
+      const finish = (accepted: boolean) => { if (done) return; done = true; clearTimeout(timer); socket?.removeListener('message', reply); socket?.removeListener('close', closed); resolve(accepted); };
+      const reply = (raw: Buffer, binary: boolean) => {
+        try {
+          if (binary) return;
+          const answer = launchReplySchema.parse(JSON.parse(raw.toString()));
+          if (answer.type === 'reservation-renewed' && answer.launchId === launchId && answer.epoch === epoch && answer.nonce === nonce) finish(answer.accepted);
+        } catch { finish(false); }
+      };
+      const closed = () => finish(false), timer = setTimeout(closed, 5000); timer.unref?.();
+      void entry.ready.then(ready => {
+        if (done) return;
+        if (!ready || this.closing || entry.socket?.readyState !== WebSocket.OPEN) { finish(false); return; }
+        socket = entry.socket; socket.on('message', reply); socket.once('close', closed);
+        socket.send(JSON.stringify({ type: 'reservation-renew', nonce, epoch, deadlineMonotonicMs }), error => { if (error) finish(false); });
+      }).catch(() => finish(false));
     });
   }
   canRetry(launchId: string): boolean {

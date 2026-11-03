@@ -185,3 +185,25 @@ it('refuses pre-bind drain without mutation and accepts a retry after binding th
     .toEqual({ stored: true, releaseAcknowledged: true });
   expect(await f.gate.waitForShutdownDecision()).toBe('confirmed');
 });
+
+it('confirms reservation renewal through the authenticated launch and returns the child refusal', async () => {
+  const f = await fixture();
+  const reservation = await import('./automations/reservationTurnBootstrap');
+  const renew = vi.spyOn(reservation, 'renewReservationTurnAuthority').mockReturnValue(true);
+  const child = new SessionLaunchControl(f.bootstrap, f.provider, f.storage, f.gate);
+  cleanup.push(() => child.close()); await child.ready();
+  try {
+    const deadline = Number(process.hrtime.bigint() / 1000000n) + 60000;
+    expect(await f.parent.renewReservation('launch-1', 'epoch', deadline)).toBe(true);
+    expect(renew).toHaveBeenLastCalledWith('epoch', deadline);
+    renew.mockReturnValue(false);
+    expect(await f.parent.renewReservation('launch-1', 'stale', deadline)).toBe(false);
+  } finally { renew.mockRestore(); }
+});
+
+it('bounds renewal even when a reserved child never connects', async () => {
+  const f = await fixture(); vi.useFakeTimers();
+  const pending = f.parent.renewReservation('launch-1', 'epoch', 60000);
+  await vi.advanceTimersByTimeAsync(5001);
+  expect(await pending).toBe(false);
+});

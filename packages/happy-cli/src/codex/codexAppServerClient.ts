@@ -1,3 +1,4 @@
+import { assertReservationProviderResume, assertReservationSessionCreationAllowed, reservationTurnAuthoritySignal } from '@/daemon/automations/reservationTurnBootstrap';
 import { takeScopeConfirmation, confirmSessionWriteScope } from '@/daemon/sessionWriteScopeConfirmation';
 /**
  * Codex App Server Client — drives Codex via the v2 JSON-RPC protocol
@@ -482,6 +483,7 @@ export class CodexAppServerClient {
          */
         agentPlanProviderArgs?: string[] | null,
     ) {
+        reservationTurnAuthoritySignal()?.addEventListener('abort', () => { void this.disconnect().catch(() => {}); }, { once: true });
         this.sandboxConfig = sandboxConfig;
         this.sandboxPolicyMode = sandboxPolicyMode;
         this.beforeTurn = beforeTurn;
@@ -1810,6 +1812,7 @@ export class CodexAppServerClient {
         mcpServers?: Record<string, unknown>;
         developerInstructions?: string | null;
     }): Promise<{ threadId: string; model: string }> {
+        assertReservationSessionCreationAllowed();
         const params: NewConversationParams = {
             model: opts.model ?? null,
             modelProvider: this.threadModelProvider,
@@ -1856,6 +1859,7 @@ export class CodexAppServerClient {
             throw new Error('No thread available to resume.');
         }
 
+        assertReservationProviderResume('codex', threadId);
         const defaults = this.threadDefaults ?? {};
         const developerInstructions = opts && Object.hasOwn(opts, 'developerInstructions')
             ? opts.developerInstructions ?? null
@@ -1878,6 +1882,7 @@ export class CodexAppServerClient {
         };
 
         const result = await this.request('thread/resume', params) as ResumeConversationResponse;
+        assertReservationProviderResume('codex', result.thread.id);
         this._threadId = result.thread.id;
         this.pointSubagentsAtMainThread();
         this.rememberNativeThreadMetadata(result.thread);
@@ -1911,6 +1916,7 @@ export class CodexAppServerClient {
         const developerInstructions = Object.hasOwn(opts, 'developerInstructions')
             ? opts.developerInstructions ?? null
             : defaults.developerInstructions ?? null;
+        assertReservationSessionCreationAllowed();
         const params: ForkConversationParams = {
             threadId: opts.threadId,
             ...(opts.path ? { path: opts.path } : {}),
@@ -2004,6 +2010,7 @@ export class CodexAppServerClient {
         threadId: string;
         includeTurns?: boolean;
     }): Promise<ReadConversationResponse> {
+        assertReservationProviderResume('codex', opts.threadId);
         const params: ReadConversationParams = {
             threadId: opts.threadId,
             includeTurns: opts.includeTurns ?? true,
@@ -2116,7 +2123,7 @@ export class CodexAppServerClient {
      * sandboxes guard shared machines, so neither gets a second process.
      */
     get sideCommandAllowed(): boolean {
-        return !this.managedProviderArgs && !this.agentPlanProviderArgs && this.sandboxPolicyMode !== 'mandatory';
+        return !reservationTurnAuthoritySignal() && !this.managedProviderArgs && !this.agentPlanProviderArgs && this.sandboxPolicyMode !== 'mandatory';
     }
 
     /**
@@ -2772,6 +2779,7 @@ export class CodexAppServerClient {
 
     private request(method: string, params?: unknown, timeoutMs?: number,
         dispatch?: { beforeDispatch?: () => void; onDispatched?: () => void }): Promise<unknown> {
+        if (reservationTurnAuthoritySignal()?.aborted && method !== 'turn/interrupt') return Promise.reject(new Error('RESERVATION_AUTHORITY_EXPIRED'));
         if (this.shutdownInputFrozen && method !== 'turn/interrupt') return Promise.reject(new Error('Codex input is frozen for shutdown'));
         const timeout = timeoutMs ?? CodexAppServerClient.REQUEST_TIMEOUT_MS;
         return new Promise((resolve, reject) => {
@@ -2813,7 +2821,7 @@ export class CodexAppServerClient {
     }
 
     private notify(method: string, params?: unknown): void {
-        if (this.shutdownInputFrozen) return;
+        if (this.shutdownInputFrozen || reservationTurnAuthoritySignal()?.aborted) return;
         if (!this.process?.stdin?.writable) return;
         const msg: JsonRpcRequest = { jsonrpc: '2.0', method, params };
         this.process.stdin.write(JSON.stringify(msg) + '\n');

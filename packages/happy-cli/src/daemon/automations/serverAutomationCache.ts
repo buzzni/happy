@@ -23,7 +23,7 @@ export interface EncryptedServerAutomation {
   automationId: string
   revision: number
   generation: number
-  payloadVersion: 1 | 4
+  payloadVersion: 1 | 4 | 5
   payloadCiphertext: string
   machineKeyVersion: number
   machineKeyEnvelope: string
@@ -45,6 +45,7 @@ export interface ServerAutomationCacheState {
 export type ServerAutomationPayload = AutomationPayload
 
 export interface ServerAutomationCache {
+  negotiateReservationCodec?(supported: boolean): void
   read(): ServerAutomationCacheState
   applySync(value: unknown): { nextSeq: bigint; acknowledgements: Array<{ automationId: string; revision: number }> }
   markAcknowledged(items: Array<{ automationId: string; revision: number }>): void
@@ -89,7 +90,7 @@ function base64(value: unknown, maxBytes: number, exactBytes?: number): string {
 }
 
 function parseUpsert(row: Record<string, unknown>): EncryptedServerAutomation {
-  if (row.kind !== 'UPSERT' || (row.payloadVersion !== 1 && row.payloadVersion !== 4) || typeof row.paused !== 'boolean') fail()
+  if (row.kind !== 'UPSERT' || (row.payloadVersion !== 1 && row.payloadVersion !== 4 && row.payloadVersion !== 5) || typeof row.paused !== 'boolean') fail()
   const payloadCiphertext = base64(row.payloadCiphertext, PAYLOAD_MAX_BYTES)
   const machineKeyEnvelope = base64(row.machineKeyEnvelope, AUTHENTICATED_ENVELOPE_BYTES)
   const envelope = Buffer.from(machineKeyEnvelope, 'base64')
@@ -147,13 +148,18 @@ function readState(filePath: string): ServerAutomationCacheState {
   }
 }
 
-function persist(filePath: string, state: ServerAutomationCacheState): void {
+function persist(filePath: string, state: ServerAutomationCacheState, reservationSync?: boolean): void {
+  if (reservationSync === undefined) {
+    try { reservationSync = JSON.parse(readFileSync(filePath, 'utf8')).reservationSync === true }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+  }
   mkdirSync(path.dirname(filePath), { recursive: true })
   const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`
   writeFileSync(tmp, JSON.stringify({
     version: 1,
     conversationSync: true,
     chatLifecycleSync: true,
+    reservationSync: reservationSync === true,
     cursor: state.cursor.toString(),
     serverTime: state.serverTime,
     syncedAt: state.syncedAt,
@@ -167,6 +173,13 @@ function persist(filePath: string, state: ServerAutomationCacheState): void {
 
 export function createServerAutomationCache(options: { filePath: string; now?: () => number }): ServerAutomationCache {
   return {
+    negotiateReservationCodec(supported) {
+      const state = readState(options.filePath)
+      let previous = false
+      try { previous = JSON.parse(readFileSync(options.filePath, 'utf8')).reservationSync === true }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+      if (previous !== supported) persist(options.filePath, { ...state, cursor: 0n }, supported)
+    },
     read: () => readState(options.filePath),
     applySync(value) {
       const response = object(value)

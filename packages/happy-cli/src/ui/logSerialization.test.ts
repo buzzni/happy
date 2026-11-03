@@ -50,3 +50,15 @@ describe('formatLogLine', () => {
       .toBe('Bearer daemon-secret')
   })
 })
+
+it('redacts reservation message capabilities in socket and HTTP request diagnostics', () => {
+  const line = formatLogLine('[time]', 'request', [{ auth: { reservationAuthorization: 'epoch.secret-socket' }, headers: { 'X-Happy-Reservation-Authorization': 'epoch.secret-http' } }]);
+  expect(line).not.toContain('secret-socket'); expect(line).not.toContain('secret-http');
+  expect(line.match(/REDACTED/g)).toHaveLength(2);
+});
+
+it('redacts a reservation bootstrap and encrypted-checkpoint key before provider startup', () => {
+  const line = formatLogLine('[time]', 'spawn', [{ env: { HAPPY_RESERVATION_BOOTSTRAP_V1: '{"messageAuthorization":"private-bootstrap-capability"}' }, reservation: { stateKey: 'private-checkpoint-key' } }]);
+  expect(line).not.toContain('private-bootstrap-capability'); expect(line).not.toContain('private-checkpoint-key');
+  expect(line.match(/REDACTED/g)).toHaveLength(2);
+});

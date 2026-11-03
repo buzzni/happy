@@ -6,7 +6,7 @@
 
 import { inspect } from 'node:util'
 
-const SENSITIVE_LOG_KEY = /(^|_)(authorization|token|secret|password|passphrase|api_key|private_key|encryption_key|access_key)($|_)/i
+const SENSITIVE_LOG_KEY = /(^|_)(authorization|token|secret|password|passphrase|api_key|private_key|encryption_key|access_key|state_key|reservation_bootstrap)($|_)/i
 
 function normalizeLogKey(key: string): string {
   return key.replace(/([a-z0-9])([A-Z])/g, '$1_$2').replace(/[^a-zA-Z0-9]+/g, '_')

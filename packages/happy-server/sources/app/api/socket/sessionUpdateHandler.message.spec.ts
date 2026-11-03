@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
+    assertReservationWrite: vi.fn(),
+    socketEmit: vi.fn(),
     sessionFindUnique: vi.fn(),
     messageFindFirst: vi.fn(),
     messageCreate: vi.fn(),
@@ -10,17 +12,20 @@ const mocks = vi.hoisted(() => ({
     log: vi.fn(),
 }));
 
+vi.mock('@/app/automation/reservationConversationLease', async importOriginal => ({ ...await importOriginal<typeof import('@/app/automation/reservationConversationLease')>(), assertReservationWrite: mocks.assertReservationWrite }));
+
 vi.mock('@/utils/log', () => ({ log: mocks.log }));
 
 vi.mock('@/storage/db', () => ({
     db: {
+        $transaction: async (fn: Function) => fn({ sessionMessage: { findFirst: mocks.messageFindFirst, create: mocks.messageCreate } }),
         session: { findUnique: mocks.sessionFindUnique },
         sessionMessage: { findFirst: mocks.messageFindFirst, create: mocks.messageCreate },
     },
 }));
 vi.mock('@/storage/seq', () => ({
     allocateUserSeq: mocks.allocateUserSeq,
-    allocateSessionSeq: mocks.allocateSessionSeq,
+    allocateSessionSeqBatch: mocks.allocateSessionSeq,
 }));
 vi.mock('@/app/presence/sessionCache', () => ({
     activityCache: { isSessionValid: vi.fn(), queueSessionUpdate: vi.fn() },
@@ -39,13 +44,14 @@ vi.mock('@/app/monitoring/metrics2', () => ({
 vi.mock('@/app/events/persistSessionEvent', () => ({ persistSessionEvent: vi.fn() }));
 vi.mock('@/app/events/sessionStreamRateLimiter', () => ({ sessionStreamRateLimiter: { admit: vi.fn(() => true) } }));
 
+import { ReservationWriteDenied } from '@/app/automation/reservationConversationLease';
 import { sessionUpdateHandler } from './sessionUpdateHandler';
 
 type Handler = (...args: any[]) => Promise<void> | void;
 
 function messageHandler() {
     const handlers = new Map<string, Handler>();
-    const socket = { on: (event: string, handler: Handler) => { handlers.set(event, handler); } } as any;
+    const socket = { emit: mocks.socketEmit, handshake: { auth: {} }, on: (event: string, handler: Handler) => { handlers.set(event, handler); } } as any;
     sessionUpdateHandler('user-1', socket, { connectionType: 'session-scoped', socket } as any);
     return handlers.get('message')!;
 }
@@ -56,7 +62,8 @@ describe('socket message persistence', () => {
         mocks.sessionFindUnique.mockResolvedValue({ id: 'session-1', accountId: 'user-1' });
         mocks.messageFindFirst.mockResolvedValue(null);
         mocks.allocateUserSeq.mockResolvedValue(5);
-        mocks.allocateSessionSeq.mockResolvedValue(9);
+        mocks.allocateSessionSeq.mockResolvedValue([9]);
+        mocks.assertReservationWrite.mockResolvedValue(undefined);
         mocks.messageCreate.mockImplementation(async (args: any) => ({ id: 'msg-1', ...args.data }));
     });
 
@@ -121,4 +128,19 @@ describe('socket message persistence', () => {
         });
         expect(mocks.emitUpdate).toHaveBeenCalledTimes(1);
     });
+});
+
+it('keeps a busy message unpersisted and tells the sender to retain it', async () => {
+    vi.clearAllMocks();
+    mocks.sessionFindUnique.mockResolvedValue({ id: 'session-1', accountId: 'user-1' });
+    mocks.messageFindFirst.mockResolvedValue(null);
+    mocks.assertReservationWrite.mockRejectedValueOnce(new ReservationWriteDenied('reservation-busy'));
+    const ack = vi.fn();
+    await messageHandler()({ sid: 'session-1', message: 'ciphertext', localId: 'local-busy' }, ack);
+    expect(ack).toHaveBeenCalledWith({ ok: false, error: 'reservation-busy' });
+    expect(mocks.socketEmit).toHaveBeenCalledWith('message-error', { sid: 'session-1', localId: 'local-busy', error: 'reservation-busy' });
+    expect(mocks.messageCreate).not.toHaveBeenCalled();
+    expect(mocks.allocateUserSeq).not.toHaveBeenCalled();
+    expect(mocks.allocateSessionSeq).not.toHaveBeenCalled();
+    expect(mocks.emitUpdate).not.toHaveBeenCalled();
 });

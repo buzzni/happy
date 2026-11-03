@@ -28,6 +28,7 @@ import {
     type AutomationServiceError,
 } from '@/app/automation/automationService';
 import { resolveAutomationRunMcpContext } from '@/app/automation/automationExecutionService';
+import { serializeScriptAutomation } from './scriptAutomationRoutes';
 import { listAutomationPage } from '@/app/automation/automationPageService';
 import { readChatAutomationImpact, transitionChatAutomations } from '@/app/automation/automationChatLifecycle';
 import { verifyChatAutomationLifecycle } from '@slopus/happy-wire/chatAutomationLifecycleToken';
@@ -234,12 +235,14 @@ export function automationRoutes(app: Fastify) {
     app.post('/v1/automations/page', {
         preHandler: app.authenticate,
         schema: { body: z.object({ projectIds: z.array(z.string().min(1).max(256)).max(10000),
-            limit: z.number().int().min(1).max(50).default(20), cursor: z.string().min(1).max(1024).nullable().default(null) }) },
+            limit: z.number().int().min(1).max(50).default(20), cursor: z.string().min(1).max(1024).nullable().default(null), reservationExtensions: z.boolean().optional() }) },
     }, async (request, reply) => {
         if (rejectWhenDisabled(reply)) return;
         try {
             const page = await listAutomationPage(db, request.userId, request.body);
-            return reply.send({ automations: page.automations.map(row => ({ ...serializeAutomation(row), runs: row.runs.map(serializeRun) })), nextCursor: page.nextCursor });
+            return reply.send({ ...(request.body.reservationExtensions ? { reservationVersion: 1 } : {}), automations: page.automations.map(row => row.payloadVersion === 3
+                ? { kind: 'script', script: serializeScriptAutomation(row), id: row.id, projectId: row.projectId, createdAt: row.createdAt.getTime() }
+                : { ...serializeAutomation(row), runs: row.runs.map(serializeRun) }), nextCursor: page.nextCursor });
         } catch (error) {
             if (error instanceof Error && error.message === 'invalid-automation-cursor') return reply.code(400).send({ error: error.message });
             throw error;
@@ -305,7 +308,7 @@ export function automationRoutes(app: Fastify) {
         return reply.send({ automation: result.value ? serializeAutomation(result.value) : null });
     });
     app.put('/v1/projects/:projectId/automations/registrations/:registrationKey', {
-        preHandler: app.authenticate, schema: { params: registrationParams, body: createSchema.extend({ payloadVersion: z.literal(4), paused: z.literal(true) }).strict() },
+        preHandler: app.authenticate, schema: { params: registrationParams, body: createSchema.extend({ payloadVersion: z.union([z.literal(4), z.literal(5)]), paused: z.literal(true) }).strict() },
     }, async (request, reply) => {
         if (rejectWhenDisabled(reply)) return;
         const body = request.body;

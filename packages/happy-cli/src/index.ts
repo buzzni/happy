@@ -4,12 +4,15 @@
  * Lightweight CLI bootstrap. Agent commands must be dispatched before loading
  * the Happy runtime because provider modules have import-time side effects.
  */
+import { captureReservationTurnBootstrap } from './daemon/automations/reservationTurnBootstrap'
 import { captureStandaloneLaunchBootstrap } from './daemon/standaloneLaunchProtocol'
 import { handleAgentCommand } from './commands/agentCommand'
 import { loadBrowserTaskEnv } from './daemon/browserTaskEnv'
 
 const args = process.argv.slice(2)
 if (args[0] === 'daemon' && args[1] === 'start-sync') loadBrowserTaskEnv(process.env)
+try { captureReservationTurnBootstrap(process.env, args) }
+catch { console.error('RESERVATION_BOOTSTRAP_INVALID'); process.exit(1) }
 try { captureStandaloneLaunchBootstrap(process.env, args) }
 catch { console.error('Invalid standalone launch bootstrap'); process.exit(1) }
 

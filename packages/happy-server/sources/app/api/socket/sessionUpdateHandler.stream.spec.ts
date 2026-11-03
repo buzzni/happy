@@ -1,11 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
+    reservationMessageAccess: vi.fn(),
     isSessionValid: vi.fn(),
     emitEphemeral: vi.fn(),
     admit: vi.fn(),
 }));
 
+vi.mock('@/app/automation/reservationConversationLease', async importOriginal => ({ ...await importOriginal<typeof import('@/app/automation/reservationConversationLease')>(), reservationMessageAccess: mocks.reservationMessageAccess }));
 vi.mock('@/storage/db', () => ({ db: {} }));
 vi.mock('@/app/presence/sessionCache', () => ({
     activityCache: { isSessionValid: mocks.isSessionValid, queueSessionUpdate: vi.fn() },
@@ -39,10 +41,11 @@ describe('session-stream relay', () => {
     beforeEach(() => {
         vi.clearAllMocks();
         mocks.isSessionValid.mockResolvedValue(true);
+        mocks.reservationMessageAccess.mockResolvedValue({ ok: true });
         mocks.admit.mockReturnValue(true);
     });
 
-    it('fans a valid frame out as a user-scoped stream ephemeral without touching the database', async () => {
+    it('fans a valid frame out as a user-scoped stream ephemeral without allocating a persisted message', async () => {
         const handlers = registerHandlers();
         const now = Date.now();
 
@@ -90,4 +93,11 @@ describe('session-stream relay', () => {
         expect(mocks.isSessionValid).not.toHaveBeenCalled();
         expect(mocks.emitEphemeral).not.toHaveBeenCalled();
     });
+});
+
+it('drops previews from a stale reservation runtime', async () => {
+    vi.clearAllMocks(); mocks.admit.mockReturnValue(true); mocks.isSessionValid.mockResolvedValue(true);
+    mocks.reservationMessageAccess.mockResolvedValue({ ok: false, error: 'reservation-busy' });
+    await registerHandlers().get('session-stream')!({ sid: 'session-1', time: Date.now(), data: 'stale-output' });
+    expect(mocks.emitEphemeral).not.toHaveBeenCalled();
 });

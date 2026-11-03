@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { SessionOwnershipProofSchema, sessionCreateBodyHash, sessionTagHash, type SessionOwnershipProof } from '@slopus/happy-wire';
+import { assertReservationMetadata, assertReservationSessionCreationAllowed, reservationSessionOptions } from '@/daemon/automations/reservationTurnBootstrap';
 import { HappySessionExecutionProofSchema, type HappySessionExecutionProof, type SessionExecutionCreateBody } from '@slopus/happy-wire';
 import type { createDeviceEnrollment } from '@/daemon/deviceEnrollment';
 import type { DeviceKeys } from '@/daemon/deviceKeys';
@@ -208,6 +209,7 @@ export class ApiClient {
   /** Prepare once without sending a request. The daemon persists this private snapshot before commit. */
   prepareSessionCreation(opts: { tag: string; metadata: Metadata; state: AgentState | null;
     dataKey?: { key: Uint8Array; wrapped: Uint8Array } }) {
+    assertReservationSessionCreationAllowed();
     // Resolve encryption key
     let dataEncryptionKey: Uint8Array | null = null;
     let encryptionKey: Uint8Array;
@@ -692,7 +694,10 @@ export class ApiClient {
   }
 
   sessionSyncClient(session: Session, options: { trackShutdownStorage?: boolean } = {}): ApiSessionClient {
+    assertReservationMetadata(session.metadata);
+    const reservationOptions = reservationSessionOptions(session.id);
     if (this.principal.kind === 'managed-session') {
+      if (reservationOptions.reservation) throw new Error('Managed reservation adapter unavailable');
       if (options.trackShutdownStorage) throw new Error('Standalone storage tracking is not a managed runtime capability');
       applySessionUrlEnv(process.env, session.id, configuration.webappUrl);
       // The explicit mode, never inferred: it decides whether redirects are
@@ -708,7 +713,7 @@ export class ApiClient {
     // (specs/desktop-issue-pr-session-link R2). The confirmed current id wins
     // over stale values inherited from a parent or an earlier resume process.
     applySessionUrlEnv(process.env, session.id, configuration.webappUrl);
-    return new ApiSessionClient(this.bearer(), session, undefined, options);
+    return new ApiSessionClient(this.bearer(), session, undefined, { ...options, ...reservationOptions });
   }
 
   machineSyncClient(machine: Machine, deviceKeys?: DeviceKeys, deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>, processState?: DaemonState): ApiMachineClient {

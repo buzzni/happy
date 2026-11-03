@@ -20,3 +20,12 @@ it('rejects malformed cursors before reading storage', async () => {
     await expect(listAutomationPage({ automation: { findMany } } as unknown as Prisma.TransactionClient, 'actor', { projectIds: ['chat:c'], limit: 20, cursor: 'invalid' })).rejects.toThrow('invalid-automation-cursor');
     expect(findMany).not.toHaveBeenCalled();
 });
+
+it('adds project AI, GitHub and script rows without changing existing Chat pages', async () => {
+    const findMany = vi.fn().mockResolvedValue([]);
+    const tx = { automation: { findMany } } as unknown as Prisma.TransactionClient;
+    await listAutomationPage(tx, 'actor', { projectIds: ['p', 'chat:c'], limit: 20, cursor: null, reservationExtensions: true });
+    expect(findMany.mock.calls[0][0].where).not.toHaveProperty('payloadVersion');
+    expect(findMany.mock.calls[0][0].where.AND).toContainEqual({ OR: [{ projectId: { not: { startsWith: 'chat:' } } }, { payloadVersion: 3 }] });
+    expect(findMany.mock.calls[0][0].include).toMatchObject({ scriptRevisions: { take: 1 }, targetMachine: true, project: true });
+});

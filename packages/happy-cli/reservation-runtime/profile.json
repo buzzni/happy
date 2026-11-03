@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "baseImage": "node:24.16.0-bookworm@sha256:40ad9f3064e67d6860b4bc3fe1880b2953934fd6320ada990e45fe0efa6badd7",
+  "nodeVersion": "24.16.0",
+  "claudeVersion": "2.1.143",
+  "codexVersion": "0.153.0",
+  "artifacts": {
+    "arm64": {
+      "claude": {
+        "package": "@anthropic-ai/claude-code-linux-arm64",
+        "version": "2.1.143",
+        "integrity": "sha512-JhmzqVYAJGRe/5TRrvIQMo3d8YL2FGZS5V7/mrEPkYYt9yQzCa47vKP0Pty5+jJ6cWZZNU+dqUwQlPlT8FF2XA=="
+      },
+      "codex": {
+        "package": "@openai/codex",
+        "version": "0.153.0-linux-arm64",
+        "integrity": "sha512-N2zLgmuslhMoC2RFC2aDkcCWk3iapZmBlSiESpjXFF+UMNxIpNxWJ5qQtQrCp5Md7kYbF4/EFy8RqJ8tL8UTeA=="
+      }
+    },
+    "amd64": {
+      "claude": {
+        "package": "@anthropic-ai/claude-code-linux-x64",
+        "version": "2.1.143",
+        "integrity": "sha512-gnlVMesO1nHh8DDyZpbmBIkIUN3rdap5SVxccZ8GRey1ZG25BByyy9I0MA0trmPRtB1/6vRW7yM4Er2JjzdUHQ=="
+      },
+      "codex": {
+        "package": "@openai/codex",
+        "version": "0.153.0-linux-x64",
+        "integrity": "sha512-sFF+g7p1o6sZVL6PHd9JTYrP2j3xao3Qeu5AngcrD5brWrCc+w9ifBJCJuRSM728WfgjXML9PQPdHPaZSeHAEA=="
+      }
+    }
+  }
+}

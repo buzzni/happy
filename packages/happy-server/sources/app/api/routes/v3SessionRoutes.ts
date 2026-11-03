@@ -1,3 +1,4 @@
+import { assertReservationWrite, lockReservationSession, ReservationWriteDenied } from '@/app/automation/reservationConversationLease';
 import { buildNewMessageUpdate, eventRouter } from "@/app/events/eventRouter";
 import { db } from "@/storage/db";
 import { allocateSessionSeqBatch, allocateUserSeqBatch } from "@/storage/seq";
@@ -159,6 +160,9 @@ export function v3SessionRoutes(app: Fastify) {
         const contentByLocalId = new Map(uniqueMessages.map((message) => [message.localId, message.content]));
 
         const txResult = await db.$transaction(async (tx) => {
+            // Deduplicate after locking: concurrent REST/socket retries cannot both
+            // decide to allocate a sequence for the same localId.
+            if (!await lockReservationSession(tx, userId, sessionId)) throw new ReservationWriteDenied('target-mismatch');
             const localIds = uniqueMessages.map((message) => message.localId);
             const existing = await tx.sessionMessage.findMany({
                 where: {
@@ -182,6 +186,7 @@ export function v3SessionRoutes(app: Fastify) {
             }
 
             const newMessages = uniqueMessages.filter((message) => !existingByLocalId.has(message.localId));
+            if (newMessages.length) await assertReservationWrite(tx, userId, sessionId, request.headers['x-happy-reservation-authorization']);
             const seqs = await allocateSessionSeqBatch(sessionId, newMessages.length, tx);
 
             // One INSERT for the whole batch: the seq allocation above holds the
@@ -218,7 +223,8 @@ export function v3SessionRoutes(app: Fastify) {
             // Prisma's 5s default failed requests under DB slowness; match the
             // 10s `inTx` budget used by the server's other write transactions.
             timeout: 10000
-        });
+        }).catch(error => { if (error instanceof ReservationWriteDenied) return { reservationDenied: error.reason }; throw error; });
+        if ('reservationDenied' in txResult) return reply.code(409).send({ error: txResult.reservationDenied });
 
         // Announce outside the transaction, and take the whole block of update
         // seqs in one `Account.seq` increment: every writer for this account

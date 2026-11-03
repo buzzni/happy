@@ -1,6 +1,6 @@
 {
   "name": "@buzzni/happy-cli",
-  "version": "1.1.10-aplus.381",
+  "version": "1.1.10-aplus.383",
   "description": "A+ Dev Studio fork of slopus/happy. Mobile and Web client for Claude Code and Codex.",
   "author": "Kirill Dubovitskiy (upstream), justinbuzzni (aplus fork)",
   "license": "MIT",
@@ -92,7 +92,8 @@
     "browser-session-image",
     "tools/archives",
     "tools/licenses",
-    "package.json"
+    "package.json",
+    "reservation-runtime"
   ],
   "scripts": {
     "cli": "tsx src/index.ts",
@@ -116,7 +117,8 @@
     "build:mac-browser-guardian": "node scripts/build-mac-browser-guardian.cjs",
     "bundle:browser-native-runtime": "node scripts/build-native-browser-runtime.mjs",
     "build:browser-native-host": "node scripts/build-browser-host.cjs",
-    "test:browser-native-host": "vitest run --project browser-native-host"
+    "test:browser-native-host": "vitest run --project browser-native-host",
+    "reservation:image": "node scripts/build-reservation-runtime-image.mjs"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.14.1",
