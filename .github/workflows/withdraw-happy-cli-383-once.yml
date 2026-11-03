@@ -1,0 +1,50 @@
+name: Withdraw Happy CLI .383 once
+on:
+  push:
+    branches: [oskar/withdraw-happy-cli-383]
+    paths: [.github/workflows/withdraw-happy-cli-383-once.yml]
+permissions:
+  contents: read
+concurrency:
+  group: withdraw-happy-cli-383-once
+  cancel-in-progress: false
+jobs:
+  withdraw:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Verify exact published versions and current latest
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(npm view @buzzni/happy-cli@1.1.10-aplus.382 version --registry=https://registry.npmjs.org)" = '1.1.10-aplus.382'
+          test "$(npm view @buzzni/happy-cli@1.1.10-aplus.383 version --registry=https://registry.npmjs.org)" = '1.1.10-aplus.383'
+          current=$(npm view @buzzni/happy-cli dist-tags.latest --registry=https://registry.npmjs.org)
+          case "$current" in 1.1.10-aplus.382|1.1.10-aplus.383) ;; *) exit 1 ;; esac
+      - name: Restore latest and mark .383 withdrawn
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          current=$(npm view @buzzni/happy-cli dist-tags.latest --registry=https://registry.npmjs.org)
+          case "$current" in
+            1.1.10-aplus.383) npm dist-tag add @buzzni/happy-cli@1.1.10-aplus.382 latest --registry=https://registry.npmjs.org ;;
+            1.1.10-aplus.382) ;;
+            *) exit 1 ;;
+          esac
+          npm deprecate @buzzni/happy-cli@1.1.10-aplus.383 "Withdrawn pending review of reservation context isolation. Use 1.1.10-aplus.382." --registry=https://registry.npmjs.org
+      - name: Verify registry metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 20); do
+            latest=$(npm view @buzzni/happy-cli dist-tags.latest --registry=https://registry.npmjs.org)
+            deprecated=$(npm view @buzzni/happy-cli@1.1.10-aplus.383 deprecated --registry=https://registry.npmjs.org)
+            if test "$latest" = '1.1.10-aplus.382' && test "$deprecated" = 'Withdrawn pending review of reservation context isolation. Use 1.1.10-aplus.382.'; then exit 0; fi
+            sleep 15
+          done
+          exit 1
