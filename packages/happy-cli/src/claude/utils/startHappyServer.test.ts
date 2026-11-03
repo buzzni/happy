@@ -880,4 +880,64 @@ describe('approved Desktop computer tools in the session MCP', () => {
             vi.mocked(requestLocalToolAgent).mockReset().mockImplementation(actual.requestLocalToolAgent);
         }
     });
+
+    async function listTools(server: McpServerHandle): Promise<Array<{ name: string; description?: string }>> {
+        const response = await mcpFetch(server)(server.url, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
+            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+        });
+        const raw = await response.text();
+        return JSON.parse(raw.startsWith('event:') ? raw.slice(raw.indexOf('data: ') + 6) : raw).result.tools;
+    }
+
+    // A Desktop session with the bundled AI browser has a browser task runtime too; both stay available.
+    it('offers approved computer control beside the browser task tools and points web pages to browser_task', async () => {
+        const context = { serverUrl: 'https://saycode.test', machineId: 'M1', sessionId: 'S1', projectId: 'P1', callerGrant: 'signed-caller' };
+        const client = { ...makeFakeClient(false), sessionId: 'S1', getMetadata: () => ({ machineId: 'M1' }) } as unknown as ApiSessionClient;
+        vi.mocked(localToolAgentContext).mockResolvedValue(context);
+        vi.mocked(requestLocalToolAgent).mockResolvedValue({ version: 1, tools: [{ extensionId: 'buzzni.test' }] });
+        vi.stubEnv('HAPPY_BROWSER_TASK_RUNTIME_URL', 'http://127.0.0.1:1');
+        vi.stubEnv('HAPPY_BROWSER_TASK_GRANT_FILE', '/nonexistent/grant');
+        const server = await startHappyServer(client);
+        try {
+            const tools = await listTools(server);
+            const names = tools.map(tool => tool.name);
+            expect(names).toEqual(expect.arrayContaining(['browser_task_submit_batch', 'local_tool_capabilities', 'local_tool_control']));
+            expect(server.toolNames).toEqual(expect.arrayContaining(['browser_task_submit_batch', 'local_tool_capabilities', 'local_tool_control']));
+            expect(tools.find(tool => tool.name === 'local_tool_capabilities')?.description).toMatch(/browser_task_\*.*web pages/);
+        } finally {
+            server.stop();
+            vi.unstubAllEnvs();
+            const actual = await vi.importActual<typeof import('@/daemon/localToolAgentRelay')>('@/daemon/localToolAgentRelay');
+            vi.mocked(localToolAgentContext).mockReset().mockImplementation(actual.localToolAgentContext);
+            vi.mocked(requestLocalToolAgent).mockReset().mockImplementation(actual.requestLocalToolAgent);
+        }
+    });
+
+    it('keeps computer control out of a mandatory sandbox session even with a browser task runtime', async () => {
+        const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+        const context = { serverUrl: 'https://saycode.test', machineId: 'M1', sessionId: 'S1', projectId: 'P1', callerGrant: 'signed-caller' };
+        const client = { ...makeFakeClient(false), sessionId: 'S1', getMetadata: () => ({ machineId: 'M1' }) } as unknown as ApiSessionClient;
+        vi.mocked(localToolAgentContext).mockResolvedValue(context);
+        vi.mocked(requestLocalToolAgent).mockResolvedValue({ version: 1, tools: [{ extensionId: 'buzzni.test' }] });
+        vi.stubEnv('HAPPY_BROWSER_TASK_RUNTIME_URL', 'http://127.0.0.1:1');
+        vi.stubEnv('HAPPY_BROWSER_TASK_GRANT_FILE', '/nonexistent/grant');
+        let server: Awaited<ReturnType<typeof startHappyServer>> | undefined;
+        try {
+            Object.defineProperty(process, 'platform', { ...descriptor, value: 'darwin' });
+            server = await startHappyServer(client, { mandatorySandbox: true, sameUidSandbox: true });
+            const names = (await listTools(server)).map(tool => tool.name);
+            expect(names).toContain('browser_task_submit_batch');
+            expect(names.filter(name => name.startsWith('local_tool_'))).toEqual([]);
+            expect(server.toolNames.filter(name => name.startsWith('local_tool_'))).toEqual([]);
+            expect(requestLocalToolAgent).not.toHaveBeenCalled();
+        } finally {
+            server?.stop();
+            Object.defineProperty(process, 'platform', descriptor);
+            vi.unstubAllEnvs();
+            const actual = await vi.importActual<typeof import('@/daemon/localToolAgentRelay')>('@/daemon/localToolAgentRelay');
+            vi.mocked(localToolAgentContext).mockReset().mockImplementation(actual.localToolAgentContext);
+            vi.mocked(requestLocalToolAgent).mockReset().mockImplementation(actual.requestLocalToolAgent);
+        }
+    });
 });

@@ -336,7 +336,7 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
         registerBrowserTools(mcp, runTool);
     }
 
-    if (handlers.localToolAvailable && !handlers.mandatorySandbox && !handlers.browserTaskRuntime) {
+    if (handlers.localToolAvailable && !handlers.mandatorySandbox) {
         const invoke = async (operation: Record<string, unknown>, signal?: AbortSignal) => runTool(async () => {
             try {
                 const context = await localToolAgentContext(handlers.client.sessionId, handlers.client.getMetadata()?.machineId);
@@ -349,7 +349,8 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
             }
         });
         mcp.registerTool('local_tool_capabilities', {
-            title: 'Inspect approved computer tools', description: 'List currently approved local computer tool operations and their bounded input schemas. Inspect before controlling the computer. Native permission prompts and denied/ambiguous input require the user.', inputSchema: {},
+            title: 'Inspect approved computer tools', description: 'List currently approved local computer tool operations and their bounded input schemas. Inspect before controlling the computer. Native permission prompts and denied/ambiguous input require the user.'
+                + (handlers.browserTaskRuntime ? ' Prefer the browser_task_* tools for web pages; use computer control for other desktop apps.' : ''), inputSchema: {},
         }, (_input, extra) => invoke({ action: 'describe' }, extra.signal));
         mcp.registerTool('local_tool_control', {
             title: 'Control this computer', description: 'Run a currently approved operation from local_tool_capabilities. Use fresh window/element references; do not bypass native permission prompts. Requires the same authenticated user, machine and conversation on a running Desktop. Cancel releases only this conversation; remote work may remain unconfirmed.',
@@ -599,7 +600,7 @@ export async function startHappyServer(
     }
 
     const computerAvailable = async () => {
-        if (options.mandatorySandbox || browserTaskRuntime) return false;
+        if (options.mandatorySandbox) return false;
         try {
             const context = await localToolAgentContext(client.sessionId, client.getMetadata()?.machineId);
             if (!context) return false;
