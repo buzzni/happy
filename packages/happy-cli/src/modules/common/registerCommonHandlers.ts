@@ -1,4 +1,4 @@
-import { listWorkspaceDirectory, readWorkspaceFile, writeWorkspaceFile } from './workspaceFileBoundary';
+import { listWorkspaceDirectory, readWorkspaceFile, writeWorkspaceFile, listWorkspaceDownloadDirectory, readWorkspaceFileChunk } from './workspaceFileBoundary';
 import { fileDiscovery } from './fileDiscovery';
 import type { SessionSource } from '@/utils/sessionSource';
 import { logger } from '@/ui/logger';
@@ -851,8 +851,8 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
     // List directory handler
     // Separate method names are the capability gate: old daemons must not
     // silently ignore workspaceRoot and execute a machine-wide read.
-    for (const operation of ['listWorkspaceDirectory', 'readWorkspaceFile'] as const) {
-        rpcHandlerManager.registerHandler<{ workspaceRoot: string; path: string }, object>(operation, async (data) => {
+    for (const operation of ['listWorkspaceDirectory', 'readWorkspaceFile', 'listWorkspaceDownloadDirectory', 'readWorkspaceFileChunk'] as const) {
+        rpcHandlerManager.registerHandler<{ workspaceRoot: string; path: string; offset?: number; length?: number; expectedIdentity?: string }, object>(operation, async (data) => {
             // aplus-dev-studio specs/e2ee-machine-control-boundary R11. Checked here
             // rather than in workspaceFileBoundary, which also runs outside the CLI.
             if ([data?.workspaceRoot, data?.path].some((path) => typeof path === 'string' && isStrictlyGuardedPath(path))) {
@@ -863,6 +863,12 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
                 };
             }
             try {
+                if (operation === 'listWorkspaceDownloadDirectory') {
+                    return { success: true, ...await listWorkspaceDownloadDirectory(workingDirectory, data.workspaceRoot, data.path, data.offset!, data.expectedIdentity) };
+                }
+                if (operation === 'readWorkspaceFileChunk') {
+                    return { success: true, ...await readWorkspaceFileChunk(workingDirectory, data.workspaceRoot, data.path, data.offset!, data.length!, data.expectedIdentity) };
+                }
                 if (operation === 'listWorkspaceDirectory') {
                     return { success: true, entries: await listWorkspaceDirectory(workingDirectory, data.workspaceRoot, data.path) };
                 }

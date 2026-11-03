@@ -74,6 +74,55 @@ export async function listWorkspaceDirectory(allowedRoot: string, workspaceRoot:
     return entries;
 }
 
+function pathIdentity(info: BigIntStats): string {
+    return `${info.dev}:${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`;
+}
+
+/** Separate capability for bounded export pages; existing readers retain their 10k cap. */
+export async function listWorkspaceDownloadDirectory(allowedRoot: string, workspaceRoot: string, path: string, offset: number, expectedIdentity?: string) {
+    if (!Number.isSafeInteger(offset) || offset < 0) throw denied();
+    const snapshot = await captureWorkspacePath(allowedRoot, workspaceRoot, path);
+    if (!snapshot.info.isDirectory()) throw denied();
+    const identity = pathIdentity(snapshot.info);
+    if (expectedIdentity !== undefined && expectedIdentity !== identity) throw denied();
+    const names = (await readdir(snapshot.path)).sort();
+    if (offset > names.length) throw denied();
+    const entries = [];
+    for (const name of names.slice(offset, offset + 1000)) {
+        const info = await lstat(join(snapshot.path, name));
+        entries.push({ name, type: info.isSymbolicLink() ? 'other' : info.isDirectory() ? 'directory' : info.isFile() ? 'file' : 'other', size: info.size, modified: info.mtimeMs });
+    }
+    await snapshot.verify();
+    return { entries, identity, nextOffset: offset + entries.length < names.length ? offset + entries.length : null };
+}
+
+/** Each range verifies both the path and opened descriptor, including across requests. */
+export async function readWorkspaceFileChunk(allowedRoot: string, workspaceRoot: string, path: string, offset: number, length: number, expectedIdentity?: string) {
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 1 || length > 3 * 1024 * 1024) {
+        throw Object.assign(new Error('Invalid workspace chunk range'), { code: 'WORKSPACE_RANGE_INVALID' });
+    }
+    const snapshot = await captureWorkspacePath(allowedRoot, workspaceRoot, path);
+    if (!snapshot.info.isFile()) throw denied();
+    const file = await open(snapshot.path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+    try {
+        const info = await file.stat({ bigint: true });
+        const identity = pathIdentity(info);
+        if (!info.isFile() || identity !== pathIdentity(snapshot.info) || (expectedIdentity !== undefined && identity !== expectedIdentity)) throw denied();
+        if (info.size > BigInt(Number.MAX_SAFE_INTEGER)) throw Object.assign(new Error('Workspace file size is not representable'), { code: 'WORKSPACE_LIMIT' });
+        const size = Number(info.size);
+        const buffer = Buffer.alloc(Math.min(length, Math.max(0, size - offset)));
+        let bytesRead = 0;
+        while (bytesRead < buffer.length) {
+            const result = await file.read(buffer, bytesRead, buffer.length - bytesRead, offset + bytesRead);
+            if (!result.bytesRead) break;
+            bytesRead += result.bytesRead;
+        }
+        if (pathIdentity(await file.stat({ bigint: true })) !== identity) throw denied();
+        await snapshot.verify();
+        return { content: buffer.subarray(0, bytesRead).toString('base64'), offset, bytesRead, totalBytes: size, modified: Number(info.mtimeNs) / 1e6, eof: offset + bytesRead >= size, identity };
+    } finally { await file.close(); }
+}
+
 export async function readWorkspaceFile(allowedRoot: string, workspaceRoot: string, path: string): Promise<Buffer> {
     const snapshot = await captureWorkspacePath(allowedRoot, workspaceRoot, path);
     if (!snapshot.info.isFile()) throw denied();

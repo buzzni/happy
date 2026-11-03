@@ -4,6 +4,77 @@ import { mkdtemp, mkdir, writeFile, symlink, rm, rename, realpath, readFile, rea
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { listWorkspaceDirectory, readWorkspaceFile, captureWorkspacePath, writeWorkspaceFile } from './workspaceFileBoundary.ts';
+import * as boundary from './workspaceFileBoundary.ts';
+
+test('download chunks read bounded ranges of large files and reject identity replacement', async (t) => {
+  const { base, root } = await fixture(t);
+  const path = join(root, 'large.bin');
+  const { open, utimes } = await import('node:fs/promises');
+  const file = await open(path, 'w');
+  await file.write(Buffer.from('original'));
+  await file.truncate(5 * 1024 ** 3);
+  await file.close();
+  const first = await boundary.readWorkspaceFileChunk(base, root, path, 0, 3);
+  assert.equal(first.content, Buffer.from('ori').toString('base64'));
+  assert.equal(first.totalBytes, 5 * 1024 ** 3);
+  assert.ok(first.identity);
+  const { stat } = await import('node:fs/promises');
+  const info = await stat(path);
+  await rename(path, `${path}-old`);
+  const replacement = await open(path, 'w');
+  await replacement.truncate(info.size);
+  await replacement.close();
+  await utimes(path, info.atime, info.mtime);
+  await assert.rejects(boundary.readWorkspaceFileChunk(base, root, path, 3, 3, first.identity), { code: 'WORKSPACE_PATH_DENIED' });
+});
+
+test('download reads refuse files and directories replaced by outside links after listing', async (t) => {
+  const { base, root, outside } = await fixture(t);
+  const path = join(root, 'listed.md');
+  await writeFile(path, 'listed');
+  await boundary.listWorkspaceDownloadDirectory(base, root, root, 0);
+  await rename(path, `${path}-old`);
+  await symlink(join(outside, 'secret.md'), path, 'file');
+  await assert.rejects(boundary.readWorkspaceFileChunk(base, root, path, 0, 1), { code: 'WORKSPACE_PATH_DENIED' });
+  const directory = join(root, 'docs');
+  await mkdir(directory);
+  await boundary.listWorkspaceDownloadDirectory(base, root, directory, 0);
+  await rename(directory, `${directory}-old`);
+  await symlink(outside, directory, process.platform === 'win32' ? 'junction' : 'dir');
+  await assert.rejects(boundary.listWorkspaceDownloadDirectory(base, root, directory, 0), { code: 'WORKSPACE_PATH_DENIED' });
+  await assert.rejects(boundary.readWorkspaceFileChunk(base, root, join(directory, 'secret.md'), 0, 1), { code: 'WORKSPACE_PATH_DENIED' });
+});
+
+test('download listings page beyond ten thousand items and reject changed directory identity', async (t) => {
+  const { base, root } = await fixture(t);
+  await Promise.all(Array.from({ length: 10_001 }, (_, i) => mkdir(join(root, `item-${String(i).padStart(5, '0')}`))));
+  await assert.rejects(listWorkspaceDirectory(base, root, root), { code: 'WORKSPACE_LIMIT' });
+  const paths = [];
+  let offset = 0;
+  let identity;
+  do {
+    const page = await boundary.listWorkspaceDownloadDirectory(base, root, root, offset, identity);
+    assert.ok(page.entries.length <= 1000);
+    identity ??= page.identity;
+    assert.equal(page.identity, identity);
+    paths.push(...page.entries.map(entry => entry.name));
+    offset = page.nextOffset;
+  } while (offset !== null);
+  assert.equal(new Set(paths).size, 10_002);
+  await writeFile(join(root, 'changed.md'), 'changed');
+  await assert.rejects(boundary.listWorkspaceDownloadDirectory(base, root, root, 1000, identity), { code: 'WORKSPACE_PATH_DENIED' });
+});
+
+test('download chunks reject invalid ranges and preserve empty-file EOF', async (t) => {
+  const { base, root } = await fixture(t);
+  const path = join(root, 'empty.bin');
+  await writeFile(path, '');
+  const chunk = await boundary.readWorkspaceFileChunk(base, root, path, 0, 1);
+  assert.equal(chunk.bytesRead, 0);
+  assert.equal(chunk.eof, true);
+  await assert.rejects(boundary.readWorkspaceFileChunk(base, root, path, -1, 1));
+  await assert.rejects(boundary.readWorkspaceFileChunk(base, root, path, 0, 3 * 1024 ** 2 + 1));
+});
 
 async function fixture(t) {
   const base = await mkdtemp(join(tmpdir(), 'workspace-boundary-'));
