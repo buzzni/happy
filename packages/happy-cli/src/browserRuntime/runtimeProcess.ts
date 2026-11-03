@@ -413,6 +413,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     // Harness keeps the PoC space quota and no idle reclamation unless asked.
     const harnessIdleMs = process.env.ABP_SPACE_IDLE_RECLAIM_MS ? Number(process.env.ABP_SPACE_IDLE_RECLAIM_MS) : undefined
     const runtime = new BrowserRuntime({ store, drivers, sites,
+        pageViewEnabled: process.platform === 'darwin' && !!config?.personalDesktop,
         ...(config ? { profilePrincipals: config.profilePrincipals } : {}),
         ...(config?.profileAssignments ? { profileAssignments: config.profileAssignments } : {}),
         maxSpacesPerProfile: config?.maxSpacesPerProfile,
@@ -643,6 +644,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
         // Viewers of the capability stop synchronously, before the revocation is persisted (D2).
         revokeCapability: (capabilityId) => {
             viewer?.revokeCapability(capabilityId)
+            runtime.pageViews.revoke(capabilityId)
             return store.revoke(capabilityId)
         },
         ...(broker && config?.tenancyMode === 'shared' ? { profileRequests: {

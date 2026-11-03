@@ -40,6 +40,7 @@ import {
     type WaitPredicate,
 } from '../contracts'
 import { formDigest, originAllowed } from '../policy'
+import { CdpPageViewDriver } from './pageViewDriver'
 import { CdpConnection, CdpProtocolError, connectionClosedError } from './cdpConnection'
 import { verifySubmissionRequest } from './submissionCheck'
 import { CHECK_ELEMENT, CLIMB_FRAMES, COLLECT_FRAME, DESCRIBE_ELEMENT, FRAME_HAS_TEXT, HIT_TEST, IN_THIS_DOCUMENT, LABEL_OF, SELECT_CONTENT, SUBMIT_GUARD, type CollectedFrame, type ElementState } from './pageScripts'
@@ -318,6 +319,14 @@ function newId(prefix: string): string {
 }
 
 export class CdpDriver implements BrowserDriver {
+    readonly pageView = new CdpPageViewDriver({ connection: () => this.requireConn(), tab: id => this.requireTab(id),
+        checkFrames: async (id, conn) => {
+            const tab = this.requireTab(id)
+            const frames = await this.collectFrames(conn, tab)
+            for (const frame of frames) if (!frame.origin || !originAllowed(tab.allowedOrigins, frame.origin))
+                throw originDenied('page contains a frame whose origin is not allowed or cannot be determined')
+            return JSON.stringify(frames.map(f => [f.frameId, f.loaderId, f.origin]))
+        } })
     /** navigate/click/fill send their input only through OpContext.markDispatch(opts.validateDispatch). */
     readonly gatesInputOnValidateDispatch = true
     private conn?: CdpConnection

@@ -6,6 +6,8 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { AddressInfo } from 'node:net'
 import { z } from 'zod'
 import { BrowserRuntimeError, type AuthContext, type BrowserRuntimeApi, type ErrorCode, type Operation, type ProfileId, type RuntimeErrorBody, type TaskId } from './contracts'
+import { pageViewSchemas } from './pageViewContracts'
+import { renderRemoteConsolePage } from './remoteConsolePage'
 import { renderConsolePage } from './consolePage'
 import { VIEWER_ASSET_PREFIX, VIEWER_WEBSOCKET_PATH, serveViewerAsset, type ViewerProxy } from './viewerProxy'
 
@@ -29,6 +31,7 @@ const batchStep = z.object({
 const version = z.number().int().nonnegative()
 
 export const REQUEST_SCHEMAS: Record<Operation, z.ZodType> = {
+    ...pageViewSchemas,
     createSpace: z.object({ profileId: id, requestId: id }).strict(),
     setSpaceQuota: z.object({ profileId: id, ceiling: z.number().int().min(1).max(16).nullable(), expectedRevision: z.number().int().nonnegative() }).strict(),
     listSpaces: z.object({ profileId: id }).strict(),
@@ -199,7 +202,8 @@ export async function startRuntimeServer(opts: RuntimeServerOptions): Promise<Ru
                     'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
                     'content-security-policy': "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:",
                 })
-                return res.end(renderConsolePage({ hostOrigins: opts.consoleHostOrigins ?? [], screenMode: opts.consoleScreenMode }))
+                return res.end(url.searchParams.get('remotePage') === '1' && opts.consoleScreenMode === 'native-window'
+                    ? renderRemoteConsolePage() : renderConsolePage({ hostOrigins: opts.consoleHostOrigins ?? [], screenMode: opts.consoleScreenMode }))
             }
             if (req.method === 'GET' && url.pathname.startsWith(VIEWER_ASSET_PREFIX) && opts.viewerAssetsDir
                 && await serveViewerAsset(opts.viewerAssetsDir, url.pathname, res)) return
