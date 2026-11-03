@@ -25,18 +25,20 @@ export const reservationDocker: ReservationDocker = {
 // PID 1 is a trusted root-owned lease gate. Native programs run under a different
 // uid and cannot rewrite the gate. When PID 1 exits, the kernel tears down its
 // PID namespace, including setsid/background descendants of docker exec.
+const clockProbe = `process.stdout.write(String(Number(require('node:fs').readFileSync('/proc/uptime','utf8').split(' ')[0])*1000))`;
 const gate = `const fs=require('node:fs');
 const root='/run/reservation-authority';fs.mkdirSync(root,{mode:448});
 const boot=()=>Number(fs.readFileSync('/proc/uptime','utf8').split(' ')[0])*1000;
 const epoch=process.argv[1],hash=process.argv[2];
-fs.writeFileSync(root+'/lease',JSON.stringify({epoch,hash,deadline:boot()+Number(process.argv[3])}),{mode:384});
+const deadline=Number(process.argv[3]);if(!Number.isFinite(deadline)||boot()>=deadline)process.exit(70);
+fs.writeFileSync(root+'/lease',JSON.stringify({epoch,hash,deadline}),{mode:384});
 setInterval(()=>{try{const v=JSON.parse(fs.readFileSync(root+'/lease','utf8'));
 if(v.epoch!==epoch||v.hash!==hash||!Number.isFinite(v.deadline)||boot()>=v.deadline)process.exit(70)}catch{process.exit(71)}},100);
 process.on('SIGTERM',()=>process.exit(72));`;
 const renewal = `const fs=require('node:fs'),p='/run/reservation-authority/lease';
 const v=JSON.parse(fs.readFileSync(p,'utf8')),now=Number(fs.readFileSync('/proc/uptime','utf8').split(' ')[0])*1000;
-const duration=Number(process.argv[3]);if(v.epoch!==process.argv[1]||v.hash!==process.argv[2]||now>=v.deadline||duration<=0||duration>90000)process.exit(73);
-fs.writeFileSync(p,JSON.stringify({...v,deadline:now+duration}),{mode:384});`;
+const deadline=Number(process.argv[3]);if(v.epoch!==process.argv[1]||v.hash!==process.argv[2]||now>=v.deadline||!Number.isFinite(deadline)||deadline<=now||deadline>now+90000)process.exit(73);
+fs.writeFileSync(p,JSON.stringify({...v,deadline}),{mode:384});`;
 
 function validateScope(scope: ReservationContainerScope) {
   if (!/^[a-f0-9]{64}$/.test(scope.owner) || !/^[a-f0-9]{64}$/.test(scope.descriptorHash)
@@ -54,6 +56,15 @@ const identity = (row: any, engine: string, scope: ReservationContainerScope): R
 /** Concrete Linux-container boundary, shared by provider and tool execution adapters. */
 export class ReservationNativeContainers {
   constructor(private readonly docker: ReservationDocker = reservationDocker) {}
+  private async kernelDeadline(deadline: number, probe: string[]): Promise<number> {
+    let remaining = deadline - reservationMonotonicNow();
+    if (remaining <= 100 || remaining > 90000) throw new Error('RESERVATION_AUTHORITY_EXPIRED');
+    const boot = Number(await this.docker.command(probe));
+    // The sample predates this receipt. Subtract the entire probe ACK latency and a clock-resolution margin.
+    remaining = Math.floor(deadline - reservationMonotonicNow() - 100);
+    if (!Number.isFinite(boot) || boot <= 0 || remaining <= 0) throw new Error('RESERVATION_AUTHORITY_EXPIRED');
+    return Math.floor(boot + remaining);
+  }
   async engine(): Promise<string> {
     const value = JSON.parse(await this.docker.command(['info', '--format', '{{json .}}']));
     if (value.OSType !== 'linux' || typeof value.ID !== 'string' || !value.ID) throw new Error('RESERVATION_LINUX_ENGINE_REQUIRED');
@@ -78,12 +89,13 @@ export class ReservationNativeContainers {
       const rows = JSON.parse(await this.docker.command(['network', 'inspect', input.network]));
       if (rows.length !== 1 || rows[0].Internal !== true || Object.entries(reservationContainerLabels(input.scope, 'network')).some(([key, value]) => rows[0].Labels?.[key] !== value)) throw new Error('RESERVATION_NETWORK_INVALID');
     }
+    const deadline = await this.kernelDeadline(input.deadlineMonotonicMs, ['run', '--rm', '--pull=never', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '65534:65534', '--pids-limit', '16', '--memory', '128m', '--entrypoint', 'node', input.image, '-e', clockProbe]);
     const name = `happy-reservation-${digest(input.scope).slice(0, 32)}`;
     const id = (await this.docker.command(['create', '--name', name, '--pull=never', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
       '--user', '0:0', '--pids-limit', '256', '--memory', '2g', '--cpus', '2', '--network', input.network ?? 'none',
       '--tmpfs', '/tmp:rw,nosuid,nodev,size=128m', '--tmpfs', '/run:rw,nosuid,nodev,noexec,size=1m',
       ...Object.entries(reservationContainerLabels(input.scope)).flatMap(([key, value]) => ['--label', `${key}=${value}`]), ...mounts,
-      '--entrypoint', 'node', input.image, '-e', gate, input.scope.epoch, input.scope.descriptorHash, String(remaining)])).trim();
+      '--entrypoint', 'node', input.image, '-e', gate, input.scope.epoch, input.scope.descriptorHash, String(deadline)])).trim();
     // A create/start ACK may be lost. The deterministic name and scope labels
     // remain discoverable; no failure here asserts that nothing started.
     await this.docker.command(['start', id]);
@@ -92,9 +104,8 @@ export class ReservationNativeContainers {
   }
   async renew(handle: ReservationContainer, deadlineMonotonicMs: number): Promise<void> {
     await this.verify(handle);
-    const duration = Math.floor(deadlineMonotonicMs - reservationMonotonicNow());
-    if (duration <= 0 || duration > 90000) throw new Error('RESERVATION_AUTHORITY_EXPIRED');
-    await this.docker.command(['exec', '--user', '0:0', handle.id, 'node', '-e', renewal, handle.scope.epoch, handle.scope.descriptorHash, String(duration)]);
+    const deadline = await this.kernelDeadline(deadlineMonotonicMs, ['exec', handle.id, 'node', '-e', clockProbe]);
+    await this.docker.command(['exec', '--user', '0:0', handle.id, 'node', '-e', renewal, handle.scope.epoch, handle.scope.descriptorHash, String(deadline)]);
   }
   async verify(handle: ReservationContainer): Promise<void> {
     if (await this.engine() !== handle.engine) throw new Error('RESERVATION_ENGINE_CHANGED');

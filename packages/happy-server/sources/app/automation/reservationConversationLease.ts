@@ -72,6 +72,8 @@ export async function manageReservationConversationLease(tx: Tx, accountId: stri
   }
   const state = input.operation === 'activate' ? 'RUNNING' : lease.state, expiresAt = new Date(Math.min(now.getTime() + 90_000, run.runLeaseExpiresAt!.getTime()));
   await tx.$executeRaw`UPDATE "ReservationConversationLease" SET "state" = ${state}::"ReservationConversationLeaseState", "activatedAt" = CASE WHEN ${input.operation} = 'activate' THEN COALESCE("activatedAt", ${now}) ELSE "activatedAt" END, "expiresAt" = ${expiresAt}, "updatedAt" = ${now} WHERE "sessionId" = ${session.id} AND "epoch" = ${lease.epoch}`;
+  // Delivery requires an active chat. Confirm activation under the same owned lease lock, before its ACK.
+  if (state === 'RUNNING') await tx.session.update({ where: { id: session.id }, data: { active: true, lastActiveAt: now } });
   return { ok: true, value: { ...view(lease, input.claimToken, now), state, expiresAt: expiresAt.getTime(), leaseDurationMs: Math.max(0, expiresAt.getTime() - now.getTime()) } };
 }
 /** Called inside the message transaction, before allocating seqs. Runtime output needs the same epoch too. */

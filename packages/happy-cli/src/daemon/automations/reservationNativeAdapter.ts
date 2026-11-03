@@ -34,7 +34,7 @@ export type ReservationNativeHost = {
 type Turn = { monitor?: ReservationNativeMonitor; recovering?: boolean; controller: AbortController; cleanup?: () => Promise<{ stored: boolean; proof: ReservationExitProof | null }>; definition: Definition; descriptor: ReservationTurnDescriptor; target: ReservationNativeSession; model: string; nativeId: string; transcript: string;
   handle?: ReservationContainer; scope?: ReservationContainer['scope']; workspace?: Awaited<ReturnType<typeof prepareReservationNativeWorkspace>>;
   network?: Awaited<ReturnType<typeof prepareReservationNativeNetwork>>; broker?: Awaited<ReturnType<typeof createReservationNativeBroker>>;
-  auth?: Awaited<ReturnType<typeof resolveReservationNativeAuth>>; output?: ApiSessionClient; containerAttempted?: boolean; exit?: { exited: boolean; runtime?: ReservationRuntimeIdentity }; answer: string; outcome?: 'WOKE' | 'SILENT'; deliveryAttempted?: boolean; failed?: boolean; claimToken?: string;
+  auth?: Awaited<ReturnType<typeof resolveReservationNativeAuth>>; output?: ApiSessionClient; containerAttempted?: boolean; exit?: { exited: boolean; runtime?: ReservationRuntimeIdentity }; answer: string; outcome?: 'WOKE' | 'SILENT'; deliveryAttempted?: boolean; deliveryUncertain?: boolean; activity?: NodeJS.Timeout; failed?: boolean; claimToken?: string;
 };
 
 /** Only immutable, explicitly configured images that contain both native CLIs are advertised. Never installs or pulls an image. */
@@ -173,7 +173,20 @@ export function createReservationNativeAdapter(host: ReservationNativeHost): Ada
           return turn.handle;
         },
         renew: async value => { turn.controller.signal.throwIfAborted(); if (!turn.handle || value.handle.launchId !== turn.handle.launchId) throw new Error('RESERVATION_CONTEXT_MISMATCH'); await containers.renew(turn.handle, value.deadlineMonotonicMs); },
-        deliver: request => { turn.controller.signal.throwIfAborted(); turn.deliveryAttempted = true; return host.deliver(request); },
+        async deliver(request) {
+          turn.controller.signal.throwIfAborted();
+          if (!turn.output) throw new Error('RESERVATION_SCOPE_UNAVAILABLE');
+          // The activated lease has already confirmed active=true in the server transaction.
+          if (!turn.activity) {
+            turn.output.keepAlive(true, 'remote');
+            turn.activity = setInterval(() => turn.output?.keepAlive(true, 'remote'), 5000); turn.activity.unref?.();
+          }
+          try {
+            const ack = await host.deliver(request);
+            turn.deliveryAttempted = ack.ok || turn.deliveryUncertain === true;
+            return ack;
+          } catch (error) { turn.deliveryAttempted = turn.deliveryUncertain = true; throw error; }
+        },
         async wait({ signal }) {
           if (!turn.handle || !turn.workspace || !turn.output) throw new Error('RESERVATION_SCOPE_UNAVAILABLE');
           const output = turn.output; output.keepAlive(true, 'remote');
@@ -192,6 +205,8 @@ export function createReservationNativeAdapter(host: ReservationNativeHost): Ada
           finally { output.keepAlive(false, 'remote'); }
         },
         async finish(input) {
+          if (turn.activity) { clearInterval(turn.activity); turn.activity = undefined; }
+          turn.output?.keepAlive(false, 'remote');
           await turn.broker?.close();
           await turn.monitor?.close();
           if (!turn.containerAttempted) {

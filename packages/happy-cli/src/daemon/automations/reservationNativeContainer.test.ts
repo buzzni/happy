@@ -5,9 +5,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ReservationNativeContainers, reservationDocker, type ReservationContainer, type ReservationContainerScope } from './reservationNativeContainer';
 import { reservationMonotonicNow } from './reservationMonotonicClock';
+import * as clock from './reservationMonotonicClock';
+import { runInNewContext } from 'node:vm';
+import { reservationContainerLabels } from './reservationNativeContainer';
 const scopes: Array<{ scope: ReservationContainerScope; handle?: ReservationContainer }> = [], roots: string[] = [];
 const scope = (): ReservationContainerScope => ({ owner: 'a'.repeat(64), descriptorHash: 'b'.repeat(64), runId: randomUUID(), sessionId: 'same-chat', epoch: randomUUID() });
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const value of scopes.splice(0)) await new ReservationNativeContainers().stop(value.scope, value.handle).catch(() => {});
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
@@ -51,3 +55,27 @@ it.skipIf(!process.env.RESERVATION_NATIVE_TEST_IMAGE)('contains detached descend
   expect((await reservationDocker.command(['ps', '-aq', '--filter', `id=${handle.id}`])).trim()).toBe('');
   await expect(readFile(join(root, 'escape'))).rejects.toMatchObject({ code: 'ENOENT' });
 }, 30000);
+
+it('does not extend kernel deadlines when Docker clock, create, start or renew commands are delayed', async () => {
+  let hostNow = 1000, bootNow = 101000, lease: any;
+  vi.spyOn(clock, 'reservationMonotonicNow').mockImplementation(() => hostNow);
+  const advance = (ms: number) => { hostNow += ms; bootNow += ms; };
+  const value = scope(), id = 'f'.repeat(64);
+  const fs = { mkdirSync() {}, readFileSync: (path: string) => path === '/proc/uptime' ? String(bootNow / 1000) : JSON.stringify(lease), writeFileSync: (_: string, text: string) => { lease = JSON.parse(text); } };
+  const evaluate = (script: string, args: string[]) => runInNewContext(script, { require: () => fs, process: { argv: ['node', ...args], on() {}, exit: (code: number) => { throw new Error('gate exit ' + code); } }, setInterval() {} });
+  const runtime = new ReservationNativeContainers({ attach: vi.fn(), command: vi.fn(async args => {
+    if (args[0] === 'info') return JSON.stringify({ OSType: 'linux', ID: 'engine' });
+    if (args[0] === 'run' || args[0] === 'exec' && !args.includes('--user')) { const sample = bootNow; advance(700); return String(sample); }
+    if (args[0] === 'create') { advance(800); const index = args.indexOf('-e'); evaluate(args[index + 1], args.slice(index + 2)); return id; }
+    if (args[0] === 'start') { advance(900); return ''; }
+    if (args[0] === 'inspect') return JSON.stringify([{ Id: id, State: { Running: true, Pid: 2, StartedAt: 'start' }, Config: { Labels: reservationContainerLabels(value) } }]);
+    if (args[0] === 'exec') { advance(600); const index = args.indexOf('-e'); evaluate(args[index + 1], args.slice(index + 2)); return ''; }
+    throw new Error('Unexpected Docker command');
+  }) });
+  const grant = hostNow + 10000;
+  const handle = await runtime.prepare({ scope: value, image: 'sha256:' + 'a'.repeat(64), mounts: [], uid: 65534, gid: 65534, deadlineMonotonicMs: grant });
+  expect(lease.deadline).toBeLessThanOrEqual(grant + 100000);
+  advance(1000); const renewed = hostNow + 10000;
+  await runtime.renew(handle, renewed);
+  expect(lease.deadline).toBeLessThanOrEqual(renewed + 100000);
+});

@@ -8,6 +8,7 @@ import { createRequire } from 'node:module';
 import { resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { manageReservationCheckpoint } from './reservationCheckpoint';
+import { deliverAutomationConversationMessage } from './automationConversationDelivery';
 import { reportAutomationRun } from './automationExecutionService';
 import { manageReservationConversationLease, reservationMessageAccess } from './reservationConversationLease';
 let sql: string, db: PGlite, client: PrismaClient;
@@ -119,4 +120,17 @@ it('recovers an unknown acquire ACK after pause without returning a message capa
   if (recovered.ok) expect(recovered.value).not.toHaveProperty('messageAuthorization');
   expect(await manage({ operation: 'heartbeat', epoch: admitted.value.epoch })).toMatchObject({ ok: false });
   expect(await client.session.count()).toBe(1);
+});
+
+it('confirms an idle chat active before delivery and maintains activity on the running lease', async () => {
+  await client.session.update({ where: { id: 's1' }, data: { active: false, lastActiveAt: new Date(0) } });
+  const grant = await acquire(); if (!grant.ok) throw new Error('acquire failed');
+  expect(await manage({ operation: 'activate', epoch: grant.value.epoch, descriptorHash, runtime: { launchId: 'launch', processGroupId: 1, processStartId: 'start' } })).toMatchObject({ ok: true });
+  expect(await client.session.findUniqueOrThrow({ where: { id: 's1' } })).toMatchObject({ active: true, lastActiveAt: now });
+  expect(await client.$transaction(tx => deliverAutomationConversationMessage(tx, 'owner', 'm', { ...base, expectedSeq: 0, reservationEpoch: grant.value.epoch, contentCiphertext: 'ZW5jcnlwdGVk' }, now))).toMatchObject({ ok: true });
+  expect(await client.session.count()).toBe(1);
+  await client.session.update({ where: { id: 's1' }, data: { active: false } });
+  const next = new Date(now.getTime() + 20000);
+  expect(await manage({ operation: 'heartbeat', epoch: grant.value.epoch }, next)).toMatchObject({ ok: true });
+  expect(await client.session.findUniqueOrThrow({ where: { id: 's1' } })).toMatchObject({ active: true, lastActiveAt: next });
 });

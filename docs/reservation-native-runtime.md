@@ -31,3 +31,9 @@ The standalone server currently uses Prisma 6.19.2. Pin `pglite-prisma-adapter` 
 Use an isolated app root, user data, Happy home and PGlite directory. The runtime result must show the prepared CLI version, actual daemon version and native capability from a real server read. Do not copy the real account/credential files. Local standalone retains the existing cloud-only Chat reservation management policy; successful daemon/image advertisement is not a scheduled provider-turn acceptance.
 
 Run the actual kernel tests against the built image and inspect Electron recordings. Leave live provider, GitHub, messenger and Windows acceptance explicitly separate. Do not run GitHub review/fix QA when the user has excluded it. Rollback stops only the isolated runtime and removes no production reservations or pending lease journal. Do not relabel a dirty or unpublished candidate as the official Desktop pin.
+
+## Release review corrections (.383)
+
+Lease activation and RUNNING heartbeats confirm the existing chat active in the same transaction before delivery. The native output client reports activity before delivery and every five seconds until cleanup. A definitive rejection can release a never-started provider's scope; a lost delivery ACK remains uncertain across later rejection and must retain its journal.
+
+Native PR reviews retain the explicitly selected GitHub credential only in the trusted host broker. Legacy read-only workers and container tool environments still receive no repository token. Docker gate expiry uses an absolute Linux boot-clock deadline, conservatively mapped from the host grant after each clock-probe ACK. Create/start/renew latency never adds time to the grant; an expired gate cannot be resurrected. Delayed-command tests execute the actual gate scripts, and the immutable-image OS suite verifies the real boundary separately.

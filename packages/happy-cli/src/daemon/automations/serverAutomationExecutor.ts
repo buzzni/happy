@@ -1648,7 +1648,8 @@ async function executeStartedRun(
         // 커넥터를 쓰지 않으므로 여기서 명시적으로 비운다.
         HAPPY_APLUS_EXPECTED_CONNECTORS: '[]',
         HAPPY_APLUS_EXPECTED_MCP_SERVICES: '[]',
-        ...(bridged.dispatch.type === 'review_apply.v1' ? query.githubEnvironment ?? {} : {}),
+        // Native reviews keep the selected credential in the trusted host broker, never in worker/tool environments.
+        ...(bridged.dispatch.type === 'review_apply.v1' || payload.reservation && bridged.dispatch.type === 'pr_review.v1' ? query.githubEnvironment ?? {} : {}),
         ...(bridged.dispatch.type === 'pr_review.v1'
           ? { HAPPY_PROJECT_SANDBOX_CONFIG: PR_REVIEW_SANDBOX_CONFIG }
           : {}),

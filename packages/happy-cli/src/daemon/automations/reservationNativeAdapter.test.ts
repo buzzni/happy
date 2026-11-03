@@ -44,7 +44,7 @@ beforeEach(async () => {
   f.flush.mockImplementation(async () => { f.events.push('output-stored'); return { stored: true }; });
   f.provider.mockImplementation(async (_containers: unknown, _handle: unknown, input: any) => { f.events.push('native-resume:' + input.nativeId); await input.output({ provider: 'codex', raw: {}, text: 'Final answer', final: true }); return { outcome: 'WOKE' }; });
 });
-afterEach(async () => { await rm(root, { recursive: true, force: true }); });
+afterEach(async () => { vi.useRealTimers(); await rm(root, { recursive: true, force: true }); });
 async function fixture(payload: Record<string, unknown> = {}) {
   const journal = new ReservationRunJournal(join(root, 'journal.json'));
   let state: 'PREPARING' | 'RUNNING' | 'SETTLING' | 'RELEASED' = 'PREPARING', descriptorHash = '';
@@ -161,4 +161,40 @@ it('recovers a journaled preparation launch without resuming the native chat', a
   expect(proof).toMatchObject({ stored: true, proof: { status: 'not-started', epoch: 'epoch', descriptorHash: 'b'.repeat(64) } });
   expect(f.cleanup).toHaveBeenCalledWith(expect.objectContaining({ role: 'preparation', runId: 'run', sessionId: 'same' }), 'engine');
   expect(f.ai).not.toHaveBeenCalled(); expect(f.provider).not.toHaveBeenCalled();
+});
+
+it('cleans a definitive delivery rejection without retaining an unknown-delivery journal', async () => {
+  const { host, run, journal } = await fixture();
+  host.deliver = async () => ({ ok: false, error: 'session-inactive' });
+  expect(await run()).toEqual({ ok: false, error: 'RESERVATION_DELIVERY_REJECTED' });
+  expect(f.provider).not.toHaveBeenCalled();
+  expect(journal.pending()).toEqual([]);
+  expect(f.events).not.toContain('native-state-stored');
+});
+it('preserves uncertainty after a lost delivery ACK and never starts the provider', async () => {
+  const { host, run, journal } = await fixture();
+  host.deliver = async () => { throw new Error('ack timeout'); };
+  expect(await run()).toEqual({ ok: false, error: 'RESERVATION_CLEANUP_UNCONFIRMED' });
+  expect(f.provider).not.toHaveBeenCalled(); expect(journal.pending()).toHaveLength(1);
+});
+it('reports activity before delivery and throughout a long native turn', async () => {
+  const { run, host } = await fixture();
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+  host.deliver = async () => { expect(f.events).toContain('thinking:true'); return { ok: true }; };
+  f.provider.mockImplementationOnce(async () => {
+    const before = f.events.filter(value => value === 'thinking:true').length;
+    await vi.advanceTimersByTimeAsync(5001);
+    expect(f.events.filter(value => value === 'thinking:true').length).toBeGreaterThan(before);
+    return { outcome: 'WOKE' };
+  });
+  expect(await run()).toMatchObject({ ok: true });
+  const after = f.events.length; await vi.advanceTimersByTimeAsync(5001); expect(f.events).toHaveLength(after);
+});
+
+it('does not erase a lost ACK when a later delivery attempt is rejected', async () => {
+  const { host, run, journal } = await fixture();
+  let attempts = 0;
+  host.deliver = async () => { if (++attempts === 1) throw new Error('ack timeout'); return { ok: false }; };
+  expect(await run()).toEqual({ ok: false, error: 'RESERVATION_CLEANUP_UNCONFIRMED' });
+  expect(f.provider).not.toHaveBeenCalled(); expect(journal.pending()).toHaveLength(1);
 });

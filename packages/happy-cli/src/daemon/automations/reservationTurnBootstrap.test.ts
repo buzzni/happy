@@ -45,7 +45,7 @@ it('keeps normal reservations and ordinary sessions unchanged without a bootstra
 it('blocks the real create and fork boundaries and preserves the saved metadata directory', async () => {
   const f = await fixture(); f.module.captureReservationTurnBootstrap(f.env, ['claude'], f.value.executionDirectory);
   const { ApiClient } = await import('@/api/api');
-  const api = Object.create(ApiClient.prototype) as typeof ApiClient.prototype;
+  const api = await ApiClient.create({ token: 'fixture-account', encryption: { type: 'legacy', secret: new Uint8Array(32) } });
   await expect(api.getOrCreateSession({} as never)).rejects.toThrow('RESERVATION_NEW_CONVERSATION_FORBIDDEN');
   const { CodexAppServerClient } = await import('@/codex/codexAppServerClient');
   const codex = Object.create(CodexAppServerClient.prototype) as InstanceType<typeof CodexAppServerClient>;

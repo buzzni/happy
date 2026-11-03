@@ -5208,3 +5208,16 @@ it.each(['NO_CHANGE', 'SKIPPED_GATE', 'WOKE'] as const)('routes a native monitor
   expect(installed.dependencies.start).toHaveBeenCalledTimes(outcome === 'WOKE' ? 1 : 0);
   expect(installed.dependencies.deliver).toHaveBeenCalledTimes(outcome === 'WOKE' ? 1 : 0);
 });
+
+it('keeps the selected PR-review credential in the native host without creating a worker', async () => {
+  const f = setup({ claim: { ok: true, value: { runId: 'r', claimToken: 't' } } });
+  f.input.decryptPayload = () => ({ name: 'Native review', prompt: 'review', directory: '/repo', agent: 'claude', scriptCommand: null, suppressSilent: false,
+    schedule: { kind: 'github', minutes: 15 }, conversation: { sessionId: 'ordinary' }, reservation: { version: 1, stateKey: Buffer.alloc(32).toString('base64') },
+    githubTrigger: { event: 'opened', action: 'agent-task-review', githubCredentialId: 'selected', filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] } } });
+  f.queryGithubPullRequests.mockResolvedValue({ ok: true, githubEnvironment: { GH_TOKEN: 'selected-host-only', GH_REPO: 'acme/app' }, pullRequests: [] });
+  f.dispatchAgentTask.mockResolvedValue({ ok: true, dispatch: { taskId: 'review', type: 'pr_review.v1', agentRunId: 'automation:r', claimToken: 'task-token', completeToken: 'complete-token', controlUrl: 'https://studio.test/api/agent-tasks', input: { headSha: 'c'.repeat(40), prNumber: 42 }, context: [] } });
+  const native = installReservationAdapter(f, 'WOKE');
+  expect(await runServerAutomationTick(f.input)).toEqual([{ automationId: 'automation-1', outcome: 'WOKE' }]);
+  expect(native.descriptor).toHaveBeenCalledWith(expect.objectContaining({ environmentVariables: expect.objectContaining({ GH_TOKEN: 'selected-host-only', GH_REPO: 'acme/app' }) }));
+  expect(f.spawnSession).not.toHaveBeenCalled(); expect(f.resumeSession).not.toHaveBeenCalled();
+});
