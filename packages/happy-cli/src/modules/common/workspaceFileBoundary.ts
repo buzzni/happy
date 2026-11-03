@@ -3,8 +3,9 @@
  * portable openat API. Reject links, validate real paths, and withhold results
  * (or report failure after a write) if path identity changes.
  */
-import { constants, type BigIntStats } from 'node:fs';
-import { lstat, mkdir, open, readdir, realpath, unlink } from 'node:fs/promises';
+import { constants, type BigIntStats, type Dir, type Dirent } from 'node:fs';
+import { lstat, mkdir, open, opendir, readdir, realpath, unlink } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 function denied(): Error & { code: string } {
@@ -78,25 +79,102 @@ function pathIdentity(info: BigIntStats): string {
     return `${info.dev}:${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`;
 }
 
-/** Separate capability for bounded export pages; existing readers retain their 10k cap. */
-export async function listWorkspaceDownloadDirectory(allowedRoot: string, workspaceRoot: string, path: string, offset: number, expectedIdentity?: string) {
-    if (!Number.isSafeInteger(offset) || offset < 0) throw denied();
-    const snapshot = await captureWorkspacePath(allowedRoot, workspaceRoot, path);
-    if (!snapshot.info.isDirectory()) throw denied();
-    const identity = pathIdentity(snapshot.info);
-    if (expectedIdentity !== undefined && expectedIdentity !== identity) throw denied();
-    const names = (await readdir(snapshot.path, { withFileTypes: true })).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
-    if (offset > names.length) throw denied();
-    const entries = [];
-    for (const entry of names.slice(offset, offset + 1000)) {
-        // Retain failed stats: export applies ignore/subtree rules before requiring metadata.
-        // Dirent preserves the entry type without following links or silently dropping files.
-        const info = await lstat(join(snapshot.path, entry.name)).catch(() => undefined);
-        const kind = info ?? entry;
-        entries.push({ name: entry.name, type: kind.isSymbolicLink() ? 'other' : kind.isDirectory() ? 'directory' : kind.isFile() ? 'file' : 'other', size: info?.size, modified: info?.mtimeMs });
-    }
-    await snapshot.verify();
-    return { entries, identity, nextOffset: offset + entries.length < names.length ? offset + entries.length : null };
+/** At most 32 open iterators, one lookahead entry each; abandoned cursors expire after two minutes. */
+export function createWorkspaceDownloadDirectoryReader(openDirectory: (path: string) => Promise<Dir> = opendir, now: () => number = Date.now) {
+    type Listing = {
+        allowedRoot: string; workspaceRoot: string; path: string;
+        snapshot: Awaited<ReturnType<typeof captureWorkspacePath>>; directory: Dir;
+        offset: number; pending?: Dirent | null; lastUsed: number; busy: boolean; cancelled: boolean; closing?: Promise<void>;
+    };
+    const listings = new Map<string, Listing>();
+    let opening = 0;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const stopTimer = () => { if (!listings.size && !opening && timer) { clearInterval(timer); timer = undefined; } };
+    const remove = async (id: string) => {
+        const listing = listings.get(id);
+        if (!listing) return;
+        // Retain the slot while close is pending, including overlapping cleanup calls.
+        const closing = listing.closing ??= listing.directory.close();
+        try { await closing; }
+        catch (error) {
+            listing.closing = undefined;
+            if (errorCode(error) !== 'ERR_DIR_CLOSED') throw error;
+        }
+        listings.delete(id);
+        stopTimer();
+    };
+    const expire = async () => {
+        for (const [id, listing] of listings) {
+            if (!listing.busy && now() - listing.lastUsed >= 120_000) await remove(id);
+        }
+    };
+    const matches = (listing: Listing, allowedRoot: string, workspaceRoot: string, path: string) => (
+        [allowedRoot, workspaceRoot, path].every(validPath) && listing.allowedRoot === resolve(allowedRoot)
+        && listing.workspaceRoot === resolve(workspaceRoot) && listing.path === resolve(path)
+    );
+    return {
+        async list(allowedRoot: string, workspaceRoot: string, path: string, offset: number, expectedIdentity?: string, listingId?: string) {
+            if (!Number.isSafeInteger(offset) || offset < 0) throw denied();
+            await expire();
+            if (listingId === undefined) {
+                if (offset !== 0) throw denied();
+                if (listings.size + opening >= 32) throw Object.assign(new Error('Too many active workspace listings'), { code: 'WORKSPACE_LISTING_BUSY' });
+                opening++;
+                try {
+                    const snapshot = await captureWorkspacePath(allowedRoot, workspaceRoot, path);
+                    if (!snapshot.info.isDirectory()) throw denied();
+                    const directory = await openDirectory(snapshot.path);
+                    listingId = randomUUID();
+                    listings.set(listingId, { allowedRoot: resolve(allowedRoot), workspaceRoot: resolve(workspaceRoot), path: resolve(path), snapshot, directory, offset: 0, lastUsed: now(), busy: false, cancelled: false });
+                    if (!timer) timer = setInterval(() => { void expire().catch(error => console.warn('Workspace listing expiry failed', error)); }, 10_000).unref();
+                } finally { opening--; stopTimer(); }
+            }
+            const listing = listings.get(listingId);
+            if (!listing || listing.busy || listing.closing || !matches(listing, allowedRoot, workspaceRoot, path) || listing.offset !== offset) throw denied();
+            listing.busy = true;
+            try {
+                const identity = pathIdentity(listing.snapshot.info);
+                if (listing.cancelled || (expectedIdentity !== undefined && expectedIdentity !== identity)) throw denied();
+                await listing.snapshot.verify();
+                const entries = [];
+                let ended = false;
+                while (entries.length < 1000) {
+                    if (listing.cancelled) throw denied();
+                    const entry = listing.pending === undefined ? await listing.directory.read() : listing.pending;
+                    listing.pending = undefined;
+                    if (!entry) { ended = true; break; }
+                    // Keep denied stats for the client's subtree/ignore filtering; never drop an entry.
+                    const info = await lstat(join(listing.path, entry.name)).catch(() => undefined);
+                    const kind = info ?? entry;
+                    entries.push({ name: entry.name, type: kind.isSymbolicLink() ? 'other' : kind.isDirectory() ? 'directory' : kind.isFile() ? 'file' : 'other', size: info?.size, modified: info?.mtimeMs });
+                }
+                if (!ended) listing.pending = await listing.directory.read();
+                if (listing.cancelled) throw denied();
+                await listing.snapshot.verify();
+                listing.offset += entries.length;
+                listing.lastUsed = now();
+                const done = ended || listing.pending === null;
+                if (done) await remove(listingId);
+                return { entries, identity, listingId, nextOffset: done ? null : listing.offset };
+            } catch (error) {
+                try { await remove(listingId); } catch (cleanupError) { console.warn('Workspace listing cleanup failed', cleanupError); }
+                throw error;
+            } finally { listing.busy = false; }
+        },
+        async close(allowedRoot: string, workspaceRoot: string, path: string, listingId: string) {
+            const listing = listings.get(listingId);
+            if (!listing) return;
+            if (!matches(listing, allowedRoot, workspaceRoot, path)) throw denied();
+            if (listing.busy) listing.cancelled = true;
+            else await remove(listingId);
+        },
+        async dispose() {
+            for (const [id, listing] of listings) {
+                if (listing.busy) listing.cancelled = true;
+                else await remove(id);
+            }
+        },
+    };
 }
 
 /** Each range verifies both the path and opened descriptor, including across requests. */

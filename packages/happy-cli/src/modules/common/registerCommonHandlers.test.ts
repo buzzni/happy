@@ -157,6 +157,16 @@ describe('registerCommonHandlers machine.run capability', () => {
 });
 
 describe('registerCommonHandlers workspace downloads', () => {
+    it('continues an opaque listing cursor and exposes explicit cleanup', async () => {
+        const { handlers, workingDirectory } = await createHandlers();
+        await Promise.all(Array.from({ length: 1001 }, (_, i) => mkdir(join(workingDirectory, `entry-${i}`))));
+        const list = handlers.get('listWorkspaceDownloadDirectory')!;
+        const first = await list({ workspaceRoot: workingDirectory, path: workingDirectory, offset: 0 });
+        expect(first).toMatchObject({ success: true, nextOffset: 1000, listingId: expect.any(String) });
+        await expect(handlers.get('closeWorkspaceDownloadDirectory')!({ workspaceRoot: workingDirectory, path: workingDirectory, listingId: first.listingId })).resolves.toMatchObject({ success: true });
+        await expect(list({ workspaceRoot: workingDirectory, path: workingDirectory, offset: first.nextOffset, expectedIdentity: first.identity, listingId: first.listingId })).resolves.toMatchObject({ success: false, errorCode: 'WORKSPACE_PATH_DENIED' });
+    });
+
     it('uses separate safe capabilities and refuses a listed file replaced by an outside link', async () => {
         const { handlers, workingDirectory } = await createHandlers();
         const root = join(workingDirectory, 'project');

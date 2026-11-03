@@ -6,8 +6,92 @@ import { join } from 'node:path';
 import { listWorkspaceDirectory, readWorkspaceFile, captureWorkspacePath, writeWorkspaceFile } from './workspaceFileBoundary.ts';
 import * as boundary from './workspaceFileBoundary.ts';
 
-test('download listing retains denied metadata for client subtree and ignore filtering', { skip: process.platform !== 'darwin' }, async (t) => {
+test('multipage downloads open one bounded iterator and close it at EOF or explicit cancellation', async (t) => {
   const { base, root } = await fixture(t);
+  await Promise.all(Array.from({ length: 2100 }, (_, i) => mkdir(join(root, `entry-${i}`))));
+  const { opendir } = await import('node:fs/promises');
+  let enumerations = 0, closes = 0;
+  const reader = boundary.createWorkspaceDownloadDirectoryReader(async path => {
+    enumerations++;
+    const dir = await opendir(path);
+    const close = dir.close.bind(dir);
+    dir.close = async () => { closes++; await close(); };
+    return dir;
+  });
+  t.after(() => reader.dispose());
+  let offset = 0, identity, listingId;
+  const names = [];
+  do {
+    const page = await reader.list(base, root, root, offset, identity, listingId);
+    assert.ok(page.entries.length <= 1000);
+    identity = page.identity; listingId = page.listingId; offset = page.nextOffset;
+    names.push(...page.entries.map(entry => entry.name));
+  } while (offset !== null);
+  assert.equal(new Set(names).size, 2101);
+  assert.equal(enumerations, 1);
+  assert.equal(closes, 1);
+  const page = await reader.list(base, root, root, 0);
+  await reader.close(base, root, root, page.listingId);
+  assert.equal(closes, 2);
+  await assert.rejects(reader.list(base, root, root, page.nextOffset, page.identity, page.listingId), { code: 'WORKSPACE_PATH_DENIED' });
+});
+
+test('abandoned iterators expire and cannot resume after two idle minutes', async (t) => {
+  const { base, root } = await fixture(t);
+  await Promise.all(Array.from({ length: 1001 }, (_, i) => mkdir(join(root, `entry-${i}`))));
+  const { opendir } = await import('node:fs/promises');
+  let clock = 0, closes = 0;
+  const reader = boundary.createWorkspaceDownloadDirectoryReader(async path => {
+    const dir = await opendir(path), close = dir.close.bind(dir);
+    dir.close = async () => { closes++; await close(); };
+    return dir;
+  }, () => clock);
+  t.after(() => reader.dispose());
+  const page = await reader.list(base, root, root, 0);
+  clock = 120_001;
+  await assert.rejects(reader.list(base, root, root, page.nextOffset, page.identity, page.listingId), { code: 'WORKSPACE_PATH_DENIED' });
+  assert.equal(closes, 1);
+});
+
+test('concurrent listings cannot exceed 32 open or opening iterators', async (t) => {
+  const { base, root } = await fixture(t);
+  let release, ready, reading = 0, closes = 0;
+  const gate = new Promise(resolve => { release = resolve; });
+  const opened = new Promise(resolve => { ready = resolve; });
+  const reader = boundary.createWorkspaceDownloadDirectoryReader(async () => ({
+    async read() { if (++reading === 32) ready(); await gate; return null; },
+    async close() { closes++; },
+  }));
+  t.after(() => reader.dispose());
+  const pending = Array.from({ length: 32 }, () => reader.list(base, root, root, 0));
+  await opened;
+  try {
+    await assert.rejects(reader.list(base, root, root, 0), { code: 'WORKSPACE_LISTING_BUSY' });
+  } finally { release(); }
+  await Promise.all(pending);
+  assert.equal(closes, 32);
+});
+
+test('closing iterators keep their capacity slot until the handles are closed', async (t) => {
+  const { base, root } = await fixture(t);
+  let release, ready, opened = 0, closing = 0;
+  const gate = new Promise(resolve => { release = resolve; });
+  const allClosing = new Promise(resolve => { ready = resolve; });
+  const reader = boundary.createWorkspaceDownloadDirectoryReader(async () => {
+    if (++opened > 32) throw new Error('A 33rd iterator was opened before any close completed');
+    return { async read() { return null; }, async close() { if (++closing === 32) ready(); await gate; } };
+  });
+  t.after(() => reader.dispose());
+  const pending = Array.from({ length: 32 }, () => reader.list(base, root, root, 0));
+  await allClosing;
+  try { await assert.rejects(reader.list(base, root, root, 0), { code: 'WORKSPACE_LISTING_BUSY' }); }
+  finally { release(); }
+  await Promise.all(pending);
+  assert.equal(opened, 32);
+});
+
+test('download listing retains denied metadata for client subtree and ignore filtering', { skip: process.platform !== 'darwin' }, async (t) => {
+  const { base, root, download } = await fixture(t);
   const { execFileSync } = await import('node:child_process');
   const { userInfo } = await import('node:os');
   const blocked = join(root, 'unrelated.tmp');
@@ -15,7 +99,7 @@ test('download listing retains denied metadata for client subtree and ignore fil
   await mkdir(join(root, 'selected'));
   execFileSync('chmod', ['+a', `user:${userInfo().username} deny readattr`, blocked]);
   try {
-    const page = await boundary.listWorkspaceDownloadDirectory(base, root, root, 0);
+    const page = await download.list(base, root, root, 0);
     assert.deepEqual(page.entries.find(entry => entry.name === 'unrelated.tmp'), { name: 'unrelated.tmp', type: 'file', size: undefined, modified: undefined });
     assert.equal(page.entries.find(entry => entry.name === 'selected').type, 'directory');
   } finally { execFileSync('chmod', ['-N', blocked]); }
@@ -44,40 +128,41 @@ test('download chunks read bounded ranges of large files and reject identity rep
 });
 
 test('download reads refuse files and directories replaced by outside links after listing', async (t) => {
-  const { base, root, outside } = await fixture(t);
+  const { base, root, outside, download } = await fixture(t);
   const path = join(root, 'listed.md');
   await writeFile(path, 'listed');
-  await boundary.listWorkspaceDownloadDirectory(base, root, root, 0);
+  await download.list(base, root, root, 0);
   await rename(path, `${path}-old`);
   await symlink(join(outside, 'secret.md'), path, 'file');
   await assert.rejects(boundary.readWorkspaceFileChunk(base, root, path, 0, 1), { code: 'WORKSPACE_PATH_DENIED' });
   const directory = join(root, 'docs');
   await mkdir(directory);
-  await boundary.listWorkspaceDownloadDirectory(base, root, directory, 0);
+  await download.list(base, root, directory, 0);
   await rename(directory, `${directory}-old`);
   await symlink(outside, directory, process.platform === 'win32' ? 'junction' : 'dir');
-  await assert.rejects(boundary.listWorkspaceDownloadDirectory(base, root, directory, 0), { code: 'WORKSPACE_PATH_DENIED' });
+  await assert.rejects(download.list(base, root, directory, 0), { code: 'WORKSPACE_PATH_DENIED' });
   await assert.rejects(boundary.readWorkspaceFileChunk(base, root, join(directory, 'secret.md'), 0, 1), { code: 'WORKSPACE_PATH_DENIED' });
 });
 
 test('download listings page beyond ten thousand items and reject changed directory identity', async (t) => {
-  const { base, root } = await fixture(t);
+  const { base, root, download } = await fixture(t);
   await Promise.all(Array.from({ length: 10_001 }, (_, i) => mkdir(join(root, `item-${String(i).padStart(5, '0')}`))));
   await assert.rejects(listWorkspaceDirectory(base, root, root), { code: 'WORKSPACE_LIMIT' });
   const paths = [];
   let offset = 0;
-  let identity;
+  let identity, listingId;
   do {
-    const page = await boundary.listWorkspaceDownloadDirectory(base, root, root, offset, identity);
+    const page = await download.list(base, root, root, offset, identity, listingId);
     assert.ok(page.entries.length <= 1000);
-    identity ??= page.identity;
+    identity ??= page.identity; listingId = page.listingId;
     assert.equal(page.identity, identity);
     paths.push(...page.entries.map(entry => entry.name));
     offset = page.nextOffset;
   } while (offset !== null);
   assert.equal(new Set(paths).size, 10_002);
+  const first = await download.list(base, root, root, 0);
   await writeFile(join(root, 'changed.md'), 'changed');
-  await assert.rejects(boundary.listWorkspaceDownloadDirectory(base, root, root, 1000, identity), { code: 'WORKSPACE_PATH_DENIED' });
+  await assert.rejects(download.list(base, root, root, first.nextOffset, first.identity, first.listingId), { code: 'WORKSPACE_PATH_DENIED' });
 });
 
 test('download chunks reject invalid ranges and preserve empty-file EOF', async (t) => {
@@ -93,13 +178,14 @@ test('download chunks reject invalid ranges and preserve empty-file EOF', async 
 
 async function fixture(t) {
   const base = await mkdtemp(join(tmpdir(), 'workspace-boundary-'));
-  t.after(() => rm(base, { recursive: true, force: true }));
+  const download = boundary.createWorkspaceDownloadDirectoryReader();
+  t.after(async () => { await download.dispose(); await rm(base, { recursive: true, force: true }); });
   const root = join(base, '한 글 project');
   const outside = join(base, 'outside');
   await mkdir(root); await mkdir(outside);
   await writeFile(join(root, '기획.md'), '# 정상');
   await writeFile(join(outside, 'secret.md'), 'outside');
-  return { base, root, outside };
+  return { base, root, outside, download };
 }
 
 test('reads Unicode file content and complete metadata inside the project', async (t) => {
