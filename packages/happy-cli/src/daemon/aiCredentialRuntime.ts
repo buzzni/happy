@@ -618,11 +618,14 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         const auth = parseOptionalCredentialJson(await readOptionalText(deps, path))
         return auth && isObject(auth.tokens) ? auth.tokens : null
       }
-      // Writes rotated tokens into the pool entry, unless another writer replaced that entry's refresh token meanwhile.
+      // Writes rotated tokens into the pool entry, unless another writer replaced that entry's refresh token meanwhile
+      // or the tokens belong to another login (the live home can switch accounts while the driver runs).
       const adopt = (accountId: string, expected: readonly string[], tokens: Record<string, unknown>) => deps.lockCredentialFile(accountsPath, async () => {
         const pool = await readPool()
         const entry = pool.accounts.find(account => account.accountId === accountId)
-        if (!entry || !expected.includes(entry.refreshToken)) return false
+        if (!entry || !expected.includes(entry.refreshToken) || tokens.account_id !== accountId) return false
+        const subject = tokenSubject(entry.accessToken)
+        if (subject !== null && tokenSubject(tokens.access_token) !== subject) return false
         Object.assign(entry, { accessToken: tokens.access_token, refreshToken: tokens.refresh_token,
           ...(codexAccessTokenExpiry(tokens.access_token) ? { expiresAt: codexAccessTokenExpiry(tokens.access_token) } : {}) })
         await writeAtomicFile(deps, accountsPath, JSON.stringify(pool))
