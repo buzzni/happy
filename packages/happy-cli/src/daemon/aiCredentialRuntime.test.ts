@@ -2215,6 +2215,28 @@ describe('AI credential machine runtime', () => {
     ], expect.anything())
   })
 
+  // 2026-11-03 Mac: npm's global bin was not on PATH, so every install missed the 2.25.0 CLI found first and apply never converged.
+  it('runs codex-multi-auth from npm\'s global bin, so the pinned install reaches the CLI it checks', async () => {
+    let files!: Map<string, string>
+    const cliOnPath = (environment?: NodeJS.ProcessEnv) => environment?.PATH?.split(':')[0] === '/global/bin' && files.has('/global/lib/node_modules/codex-multi-auth/package.json') ? '2.16.0' : '2.25.0'
+    const execFile = vi.fn(async (command: string, args: string[], options?: { environment?: NodeJS.ProcessEnv }) => {
+      if (command === 'codex-multi-auth' && args[0] === '--version') return { stdout: `${cliOnPath(options?.environment)}\n`, stderr: '' }
+      if (command === 'npm' && args[0] === 'root') return { stdout: '/global/lib/node_modules\n', stderr: '' }
+      if (command === 'npm' && args[0] === 'install') files.set('/global/lib/node_modules/codex-multi-auth/package.json', JSON.stringify({ version: '2.16.0' }))
+      return { stdout: '', stderr: '' }
+    })
+    const configured = setup({ execFile, env: { PATH: '/tools/bin:/usr/bin' } })
+    files = configured.files
+    files.delete('/global/node_modules/codex-multi-auth/package.json')
+
+    await expect(configured.runtime.apply({
+      provider: 'codex', payload: JSON.stringify(codexMultiAuthBundle()),
+    })).resolves.toMatchObject({ configured: true })
+    const cliCalls = execFile.mock.calls.filter(([command]) => command === 'codex-multi-auth')
+    expect(cliCalls.length).toBeGreaterThan(0)
+    for (const [, , options] of cliCalls) expect(options?.environment?.PATH).toBe('/global/bin:/tools/bin:/usr/bin')
+  })
+
   it('preserves untouched Codex multi-auth files when a later backup fails', async () => {
     let files!: Map<string, string>
     let failedSettingsBackup = false
