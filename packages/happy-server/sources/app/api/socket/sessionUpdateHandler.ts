@@ -2,7 +2,7 @@ import { getMetricsLabelsFromSocket, sessionAliveEventsCounter, websocketEventsC
 import { activityCache } from "@/app/presence/sessionCache";
 import { buildNewMessageUpdate, buildSessionActivityEphemeral, buildUpdateSessionUpdate, ClientConnection, eventRouter } from "@/app/events/eventRouter";
 import { db } from "@/storage/db";
-import { allocateSessionSeq, allocateUserSeq } from "@/storage/seq";
+import { allocateSessionSeqBatch, allocateUserSeq } from "@/storage/seq";
 import { AsyncLock } from "@/utils/lock";
 import { log } from "@/utils/log";
 import { randomKeyNaked } from "@/utils/randomKeyNaked";
@@ -271,19 +271,26 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                     }
                 }
 
-                // Resolve seq
-                const updSeq = await allocateUserSeq(userId);
-                const msgSeq = await allocateSessionSeq(sid);
-
-                // Create message
-                const msg = await db.sessionMessage.create({
-                    data: {
-                        sessionId: sid,
-                        seq: msgSeq,
-                        content: msgContent,
-                        localId: useLocalId
-                    }
+                // Allocate and insert under the Session row lock REST batches also take,
+                // so no reader can advance past a seq whose message is not stored yet.
+                const msg = await db.$transaction(async (tx) => {
+                    const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT "id" FROM "Session" WHERE "id" = ${sid} AND "accountId" = ${userId} FOR UPDATE`;
+                    if (!locked.length) return null;
+                    // A concurrent retry may have committed while this one waited for the lock.
+                    if (useLocalId && await tx.sessionMessage.findFirst({ where: { sessionId: sid, localId: useLocalId } })) return null;
+                    const [msgSeq] = await allocateSessionSeqBatch(sid, 1, tx);
+                    return tx.sessionMessage.create({
+                        data: {
+                            sessionId: sid,
+                            seq: msgSeq!,
+                            content: msgContent,
+                            localId: useLocalId
+                        }
+                    });
                 });
+                if (!msg) return;
+                // Account.seq uses its own transaction, after releasing Session.
+                const updSeq = await allocateUserSeq(userId);
 
                 // Emit new message update to relevant clients
                 const updatePayload = buildNewMessageUpdate(msg, sid, updSeq, randomKeyNaked(12));
