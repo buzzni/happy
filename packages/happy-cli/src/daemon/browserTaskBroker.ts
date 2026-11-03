@@ -104,6 +104,8 @@ export interface BrowserTaskSessionBroker {
     retryPendingRevocations(): Promise<number>
     /** Whether a revocation of this target is still unconfirmed (queued for retry). */
     isRevocationPending(target: RevokeTarget): boolean
+    /** The native refusal code (NATIVE_*) that left this revocation unconfirmed, if that was the cause. */
+    revocationRefusal?(target: RevokeTarget): string | undefined
     /** Whether a task of the session waits for the user; throws when the Runtime gives no answer. */
     waiting(agentSessionId: string): Promise<boolean>
 }
@@ -270,9 +272,11 @@ export function createBrowserTaskSessionBroker(
         }
     }
     /** Confirmed (200) and invalid requests (400, never retryable) leave the queue. */
+    const refusals = new Map<string, string>()
     const attempt = async (target: RevokeTarget): Promise<void> => {
         // Explicitly preserve logical tasks on exits, reconciliation, and replacement registration.
-        const { status } = await send('/v1/sessions/revoke', { ...target, endSession: false })
+        const { status, unavailableReason } = await send('/v1/sessions/revoke', { ...target, endSession: false })
+        if (unavailableReason) refusals.set(key(target), unavailableReason); else refusals.delete(key(target))
         if (status !== 200 && status !== 400) return
         pending = pending.filter((entry) => key(entry) !== key(target))
         savePending()
@@ -420,6 +424,7 @@ export function createBrowserTaskSessionBroker(
         },
         retryPendingRevocations,
         isRevocationPending: (target) => pending.some((entry) => key(entry) === key(target)),
+        revocationRefusal: (target) => pending.some((entry) => key(entry) === key(target)) ? refusals.get(key(target)) : undefined,
     }
     return broker
 }
@@ -433,7 +438,11 @@ export function createBrowserTaskSessionBroker(
 export async function registerResumedBrowserSession(broker: BrowserTaskSessionBroker | undefined, agentSessionId: string): Promise<BrowserTaskRegistrationResult> {
     if (!broker) return undefined
     await broker.revoke({ agentSessionId }).catch(() => undefined)
-    if (broker.isRevocationPending({ agentSessionId })) return undefined
+    if (broker.isRevocationPending({ agentSessionId })) {
+        // Still registers nothing; a native refusal (an organization PC without device approval) still reaches the agent.
+        const unavailableReason = broker.revocationRefusal?.({ agentSessionId })
+        return unavailableReason ? { unavailableReason } : undefined
+    }
     // The session itself is the lineage: only a session bound in the current assignment gets a grant again.
     return broker.register({ parentSessionIds: [agentSessionId] })
 }

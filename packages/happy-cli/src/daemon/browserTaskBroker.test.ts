@@ -103,6 +103,17 @@ describe('daemon browser task broker hook', () => {
         expect(calls.map((call) => call.path)).toEqual(['/v1/sessions/revoke'])
     })
 
+    it('on resume, keeps the native refusal that left the revocation unconfirmed so the agent still learns why', async () => {
+        const paths: string[] = []
+        const dir = await mkdtemp(join(tmpdir(), 'abp-daemon-queue-')); dirs.push(dir)
+        const broker = createBrowserTaskSessionBroker({ HAPPY_BROWSER_TASK_BROKER_SOCKET: '/run/abp/broker.sock', HAPPY_BROWSER_TASK_DAEMON_TOKEN_FILE: await tokenFile() },
+            async (_socket, _method, path) => { paths.push(path); throw new Error('NATIVE_DEVICE_APPROVAL_REQUIRED') },
+            { procRoot: await procRoot(), pendingRevocationsFile: join(dir, 'pending.json'), retryBaseMs: 3_600_000 })!
+        expect(await registerResumedBrowserSession(broker, 'session-1')).toEqual({ unavailableReason: 'NATIVE_DEVICE_APPROVAL_REQUIRED' })
+        // Still never registers while the revocation is unconfirmed.
+        expect(paths).toEqual(['/v1/sessions/revoke'])
+    })
+
     it('spawns without browser grants when registration fails, instead of failing the spawn', async () => {
         const broker = createBrowserTaskSessionBroker({ HAPPY_BROWSER_TASK_BROKER_SOCKET: '/run/abp/broker.sock', HAPPY_BROWSER_TASK_DAEMON_TOKEN_FILE: await tokenFile() },
             async () => { throw new Error('ECONNREFUSED') })!
