@@ -118,13 +118,14 @@ export function automationSocketHandler(accountId: string, machineId: string, so
         ));
     }));
 
+    // Accept the withdrawn client's advertisement; syncAutomations tombstones v5 rows.
     on('automation-sync', async (data, callback) => answer(callback, () => {
         const afterSeq = BigInt(requiredString(data?.afterSeq));
         if (afterSeq < 0n) throw new Error('invalid-input');
         return inTx((tx) => syncAutomations(tx, accountId, machineId, {
             afterSeq,
             limit: integer(data?.limit, 1, 500),
-            ...(data?.payloadVersions !== undefined ? { payloadVersions: Array.isArray(data.payloadVersions) && data.payloadVersions.length <= 2 && data.payloadVersions.every((version: unknown) => version === 1 || version === 4) ? data.payloadVersions : (() => { throw new Error('invalid-input'); })() } : {}),
+            ...(data?.payloadVersions !== undefined ? { payloadVersions: Array.isArray(data.payloadVersions) && data.payloadVersions.length <= 3 && data.payloadVersions.every((version: unknown) => version === 1 || version === 4 || version === 5) ? data.payloadVersions : (() => { throw new Error('invalid-input'); })() } : {}),
         }));
     }));
 
