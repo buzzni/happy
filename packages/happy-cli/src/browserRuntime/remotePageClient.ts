@@ -57,6 +57,7 @@ function remotePageClient() {
     let token = '', expiry = 0, binding = '', task = null, view = null, frame = null;
     let generation = 0, sequence = 0, busy = false, polling = false, inputBusy = false, lost = false, composing = false, fitted = true;
     let confirmedAt = -Infinity, captureAge = 0, lastList = -Infinity, keyModifiers = 0;
+    let wheelRefresh = false;
     const queue = [];
     const keys = new Set();
     const status = (value, error = false) => { $('status').textContent = value; $('status').dataset.error = String(error); };
@@ -124,6 +125,7 @@ function remotePageClient() {
     async function close() {
         const old = view;
         view = null;
+        wheelRefresh = false;
         queue.length = 0;
         keys.clear();
         keyModifiers = 0;
@@ -234,6 +236,7 @@ function remotePageClient() {
         if (!claims().pageViewScope)
             return;
         polling = true;
+        let owner = view, gen = generation;
         try {
             if (lost) {
                 await receipt();
@@ -248,9 +251,10 @@ function remotePageClient() {
             }
             if (!view || busy)
                 return;
-            const owner = view, gen = generation, started = performance.now();
+            owner = view; gen = generation;
+            const started = performance.now();
             const result = await request('getPageFrame', { schemaVersion: 1, viewId: owner.viewId });
-            if (view !== owner || gen !== generation || document.hidden)
+            if (view !== owner || owner.closed || gen !== generation || document.hidden)
                 return;
             if (result.status.unknown) {
                 lost = true;
@@ -271,11 +275,20 @@ function remotePageClient() {
                 const decoded = new Image();
                 decoded.src = 'data:image/jpeg;base64,' + next.data;
                 await decoded.decode();
-                if (view !== owner || gen !== generation || document.hidden)
+                if (view !== owner || owner.closed || gen !== generation || document.hidden)
                     return;
-                if (queue.length && frame && (frame.documentGeneration !== next.documentGeneration || JSON.stringify(frame.viewport) !== JSON.stringify(next.viewport))) {
+                // Only unsent wheel gestures may follow our scroll across page offsets. Other
+                // input still belongs to the old image; navigation/resize/zoom never rebase it.
+                const scrollOnly = wheelRefresh && frame?.documentGeneration === next.documentGeneration
+                    && ['width', 'height', 'scale'].every(k => frame.viewport[k] === next.viewport[k])
+                    && queue.every(e => e.kind === 'wheel' || e.kind === 'pointer' && e.type === 'mouseMoved');
+                if (scrollOnly) {
+                    for (let i = queue.length - 1; i >= 0; --i) if (queue[i].kind === 'pointer') queue.splice(i, 1);
+                }
+                if (queue.length && frame && !scrollOnly && (frame.documentGeneration !== next.documentGeneration || JSON.stringify(frame.viewport) !== JSON.stringify(next.viewport))) {
                     lost = true; queue.length = 0; status(text.confirmed, true); await close(); render(); return;
                 }
+                wheelRefresh = false;
                 frame = next;
                 confirmedAt = performance.now();
                 captureAge = next.ageMs + performance.now() - started;
@@ -289,7 +302,8 @@ function remotePageClient() {
             }
         }
         catch (e) {
-            if (e?.code !== 'QUOTA_EXCEEDED' && e?.code !== 'CONFLICT')
+            if (view === owner && !owner?.closed && gen === generation
+                && e?.code !== 'QUOTA_EXCEEDED' && e?.code !== 'CONFLICT' && e?.code !== 'STALE_REF')
                 fail(e);
         }
         finally {
@@ -298,7 +312,7 @@ function remotePageClient() {
         }
     }
     async function flush() {
-        if (polling || inputBusy || !queue.length || !canInput())
+        if (wheelRefresh || polling || inputBusy || !queue.length || !canInput())
             return;
         const event = queue.shift(), owner = view, lease = own(), gen = generation;
         const current = frame;
@@ -314,6 +328,7 @@ function remotePageClient() {
                 status(result.state === 'unknown' ? text.unresolved : text.confirmed, true);
                 render();
             }
+            else if (event.kind === 'wheel') wheelRefresh = true;
         }
         catch (e) {
             queue.length = 0;
@@ -442,8 +457,10 @@ function remotePageClient() {
         render();
         const id = task.taskId;
         try {
-            if (op === 'releaseControl')
+            if (op === 'releaseControl') {
+                if (view) view.closed = true; // invalidate in-flight reads before the release request
                 status(text.returning);
+            }
             const result = await request(op, { taskId: id, requestId: crypto.randomUUID(), ...extra });
             if (task?.taskId !== id)
                 return;
