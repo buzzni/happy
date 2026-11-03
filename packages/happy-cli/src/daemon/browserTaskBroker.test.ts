@@ -106,7 +106,8 @@ describe('daemon browser task broker hook', () => {
     it('spawns without browser grants when registration fails, instead of failing the spawn', async () => {
         const broker = createBrowserTaskSessionBroker({ HAPPY_BROWSER_TASK_BROKER_SOCKET: '/run/abp/broker.sock', HAPPY_BROWSER_TASK_DAEMON_TOKEN_FILE: await tokenFile() },
             async () => { throw new Error('ECONNREFUSED') })!
-        expect(await broker.register()).toEqual({ unavailableReason: 'ECONNREFUSED' })
+        // Only the native issuer's own refusal codes reach the agent; any other failure stays in the log.
+        expect(await broker.register()).toBeUndefined()
         expect(await broker.bind('reg-1', 'session-1')).toBe(false)
         await expect(broker.revoke({ registrationId: 'reg-1' })).resolves.toBeUndefined()
     })

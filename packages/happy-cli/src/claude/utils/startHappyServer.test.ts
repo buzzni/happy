@@ -934,6 +934,48 @@ describe('approved Desktop computer tools in the session MCP', () => {
         }
     });
 
+    // An installer-managed browser host (shared tenancy or browser-only) is not the person's own PC.
+    it.each([['HAPPY_BROWSER_TASK_TENANCY', 'shared'], ['HAPPY_BROWSER_TASK_HOST_MODE', 'browser-only']])('keeps computer control out of an installer-managed browser host (%s=%s)', async (name, value) => {
+        const context = { serverUrl: 'https://saycode.test', machineId: 'M1', sessionId: 'S1', projectId: 'P1', callerGrant: 'signed-caller' };
+        const client = { ...makeFakeClient(false), sessionId: 'S1', getMetadata: () => ({ machineId: 'M1' }) } as unknown as ApiSessionClient;
+        vi.mocked(localToolAgentContext).mockResolvedValue(context);
+        vi.mocked(requestLocalToolAgent).mockResolvedValue({ version: 1, tools: [{ extensionId: 'buzzni.test' }] });
+        vi.stubEnv('HAPPY_BROWSER_TASK_RUNTIME_URL', 'http://127.0.0.1:1');
+        vi.stubEnv('HAPPY_BROWSER_TASK_GRANT_FILE', '/nonexistent/grant');
+        vi.stubEnv(name, value);
+        const server = await startHappyServer(client);
+        try {
+            const names = (await listTools(server)).map(tool => tool.name);
+            expect(names).toContain('browser_task_submit_batch');
+            expect(names.filter(tool => tool.startsWith('local_tool_'))).toEqual([]);
+            expect(requestLocalToolAgent).not.toHaveBeenCalled();
+        } finally {
+            server.stop();
+            vi.unstubAllEnvs();
+            const actual = await vi.importActual<typeof import('@/daemon/localToolAgentRelay')>('@/daemon/localToolAgentRelay');
+            vi.mocked(localToolAgentContext).mockReset().mockImplementation(actual.localToolAgentContext);
+            vi.mocked(requestLocalToolAgent).mockReset().mockImplementation(actual.requestLocalToolAgent);
+        }
+    });
+
+    it('does not add the browser guidance to computer control when there is no browser task runtime', async () => {
+        const context = { serverUrl: 'https://saycode.test', machineId: 'M1', sessionId: 'S1', projectId: 'P1', callerGrant: 'signed-caller' };
+        const client = { ...makeFakeClient(false), sessionId: 'S1', getMetadata: () => ({ machineId: 'M1' }) } as unknown as ApiSessionClient;
+        vi.mocked(localToolAgentContext).mockResolvedValue(context);
+        vi.mocked(requestLocalToolAgent).mockResolvedValue({ version: 1, tools: [{ extensionId: 'buzzni.test' }] });
+        const server = await startHappyServer(client);
+        try {
+            const description = (await listTools(server)).find(tool => tool.name === 'local_tool_capabilities')?.description;
+            expect(description).toBeTruthy();
+            expect(description).not.toMatch(/browser_task/);
+        } finally {
+            server.stop();
+            const actual = await vi.importActual<typeof import('@/daemon/localToolAgentRelay')>('@/daemon/localToolAgentRelay');
+            vi.mocked(localToolAgentContext).mockReset().mockImplementation(actual.localToolAgentContext);
+            vi.mocked(requestLocalToolAgent).mockReset().mockImplementation(actual.requestLocalToolAgent);
+        }
+    });
+
     it('keeps computer control out of a mandatory sandbox session even with a browser task runtime', async () => {
         const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
         const context = { serverUrl: 'https://saycode.test', machineId: 'M1', sessionId: 'S1', projectId: 'P1', callerGrant: 'signed-caller' };

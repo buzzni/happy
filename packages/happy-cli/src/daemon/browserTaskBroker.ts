@@ -72,7 +72,8 @@ export type BrowserTaskRegistrationResult = BrowserTaskRegistration | BrowserTas
 
 /** Why a session process got no browser task secret; read once by its MCP server, like the secret. */
 export const BROWSER_TASK_UNAVAILABLE_REASON_ENV = 'HAPPY_BROWSER_TASK_UNAVAILABLE_REASON'
-export const BROWSER_TASK_UNAVAILABLE_REASON_PATTERN = /^[A-Z][A-Z_]{1,79}$/
+/** The native issuer's own refusal codes only (NATIVE_DEVICE_APPROVAL_REQUIRED, ...); other errors stay in the log. */
+export const BROWSER_TASK_UNAVAILABLE_REASON_PATTERN = /^NATIVE_[A-Z_]{1,72}$/
 
 /** What a registration result hands the session process: its secret, or the refusal code, and the registration to bind. */
 export function browserTaskSpawnSeed(result: BrowserTaskRegistrationResult): { registration?: BrowserTaskRegistration; environment: Record<string, string> } {

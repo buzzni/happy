@@ -618,8 +618,10 @@ export async function startHappyServer(
         logger.debug('[happyMCP] legacy browser_* tools disabled by HAPPY_BROWSER_TASK_RUNTIME_URL (agent browser PoC)');
     }
 
+    // An installer-managed browser host (shared tenancy or browser-only) is not the signed-in person's own PC.
+    const managedBrowserHost = !!browserTaskRuntime && (process.env.HAPPY_BROWSER_TASK_TENANCY === 'shared' || process.env.HAPPY_BROWSER_TASK_HOST_MODE === 'browser-only');
     const computerAvailable = async () => {
-        if (options.mandatorySandbox) return false;
+        if (options.mandatorySandbox || managedBrowserHost) return false;
         try {
             const context = await localToolAgentContext(client.sessionId, client.getMetadata()?.machineId);
             if (!context) return false;
