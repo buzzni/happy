@@ -126,21 +126,37 @@ function readState(filePath: string): ServerAutomationCacheState {
   try {
     const disk = object(JSON.parse(raw))
     if (disk.version !== 1 || !Array.isArray(disk.automations) || !Array.isArray(disk.pendingAcknowledgements)) throw new Error()
+    // Downgrading from the removed reservation codec must not strand ordinary
+    // automations. Validate retired rows before dropping them, then resync once.
+    let migrated = disk.reservationSync === true
+    const parseCachedRows = (entries: unknown[]) => entries.flatMap(entry => {
+      const row = object(entry)
+      if (row.payloadVersion === 5) {
+        parseUpsert({ ...row, kind: 'UPSERT', payloadVersion: 4 })
+        migrated = true
+        return []
+      }
+      return [parseUpsert({ ...row, kind: 'UPSERT' })]
+    })
     const state = {
       cursor: disk.conversationSync === true && disk.chatLifecycleSync === true ? sequence(disk.cursor) : 0n,
       serverTime: timestamp(disk.serverTime),
       syncedAt: timestamp(disk.syncedAt),
-      automations: disk.automations.map((entry) => parseUpsert({ ...object(entry), kind: 'UPSERT' })),
+      automations: parseCachedRows(disk.automations),
       pendingAcknowledgements: disk.pendingAcknowledgements.map((entry) => {
         const row = object(entry)
         return { automationId: nonEmptyString(row.automationId), revision: positiveInteger(row.revision) }
       }),
       pendingCancellations: disk.pendingCancellations === undefined ? [] : (() => {
         if (!Array.isArray(disk.pendingCancellations)) fail()
-        return disk.pendingCancellations.map(entry => parseUpsert({ ...object(entry), kind: 'UPSERT' }))
+        return parseCachedRows(disk.pendingCancellations)
       })(),
     }
     chmodSync(filePath, 0o600)
+    if (migrated) {
+      state.cursor = 0n
+      persist(filePath, state)
+    }
     return state
   } catch {
     throw new Error('automation-cache-invalid')

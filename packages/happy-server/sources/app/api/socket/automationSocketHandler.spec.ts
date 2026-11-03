@@ -36,6 +36,19 @@ describe('automationSocketHandler', () => {
     });
     afterEach(() => delete process.env.SAYCODE_AUTOMATION_ENABLED);
 
+    it('accepts a pending NO_CHANGE completion from a previous daemon version', async () => {
+        services.reportAutomationRun.mockResolvedValue({ ok: true, value: { idempotent: false, projectId: 'project-1' } });
+        const handlers = new Map<string, Function>();
+        automationSocketHandler('account-1', 'machine-1', { on: (event: string, handler: Function) => handlers.set(event, handler) } as never);
+        const callback = vi.fn();
+        await handlers.get('automation-run-report')!({
+            runId: 'run-1', claimToken: 'claim', reportId: 'report-1', status: 'COMPLETED',
+            outcome: 'NO_CHANGE', sessionId: null, detailCiphertext: null,
+        }, callback);
+        expect(services.reportAutomationRun).toHaveBeenCalledWith({}, 'account-1', 'machine-1', expect.objectContaining({ outcome: 'NO_CHANGE', sessionId: null }));
+        expect(callback).toHaveBeenCalledWith({ ok: true, value: expect.any(Object) });
+    });
+
     it('fails closed when the global rollout flag is disabled', async () => {
         process.env.SAYCODE_AUTOMATION_ENABLED = 'false';
         const handlers = new Map<string, Function>();

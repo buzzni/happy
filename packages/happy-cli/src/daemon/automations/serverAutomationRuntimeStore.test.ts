@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -14,6 +14,19 @@ describe('serverAutomationRuntimeStore', () => {
     file = path.join(dir, 'server-automation-runtime.v1.json')
   })
   afterEach(() => rmSync(dir, { recursive: true, force: true }))
+
+  it('reads and drains a previous-version NO_CHANGE report alongside unrelated schedules', () => {
+    const schedules = [{ automationId: 'ordinary', generation: 2, nextRunAt: 100, lastSessionId: null }]
+    const report = {
+      runId: 'run-old', claimToken: 'claim-old', reportId: 'report-old', status: 'COMPLETED',
+      outcome: 'NO_CHANGE', sessionId: null, detailCiphertext: null,
+    }
+    writeFileSync(file, JSON.stringify({ version: 1, schedules, pendingReports: [report] }))
+    const store = createServerAutomationRuntimeStore({ filePath: file })
+    expect(store.read()).toMatchObject({ schedules, pendingReports: [report] })
+    store.write({ ...store.read(), pendingReports: [] })
+    expect(store.read()).toMatchObject({ schedules, pendingReports: [] })
+  })
 
   it('keeps a spent one-time occurrence across a reload', () => {
     // 소진 기록을 파서가 버리면 재기동 뒤 편집·재개가 같은 회차를 두 번 실행한다.

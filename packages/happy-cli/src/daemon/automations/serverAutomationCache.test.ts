@@ -142,6 +142,36 @@ describe('serverAutomationCache', () => {
       .toThrow('automation-cache-invalid')
     expect(readFileSync(file, 'utf8')).toBe('{ corrupt')
   })
+
+  it('migrates a mixed previous-version reservation cache without losing supported entries or acknowledgements', () => {
+    const encrypted = bundle({ prompt: 'encrypted' }, tweetnacl.box.keyPair().publicKey)
+    const row = (automationId: string, payloadVersion: number) => ({
+      automationId, payloadVersion, revision: 2, generation: 3,
+      ...encrypted, machineKeyVersion: 1, paused: false, enabledAt: 1,
+    })
+    const pendingAcknowledgements = [{ automationId: 'ordinary', revision: 2 }, { automationId: 'retired', revision: 2 }]
+    writeFileSync(file, JSON.stringify({
+      version: 1, conversationSync: true, chatLifecycleSync: true, reservationSync: true,
+      cursor: '9', serverTime: 1000, syncedAt: 1000,
+      automations: [row('ordinary', 1), row('conversation', 4), row('retired', 5)],
+      pendingAcknowledgements,
+      pendingCancellations: [row('deleted-conversation', 4), row('deleted-reservation', 5)],
+    }))
+
+    const cache = createServerAutomationCache({ filePath: file })
+    expect(cache.read()).toMatchObject({
+      cursor: 0n,
+      automations: [expect.objectContaining({ automationId: 'ordinary' }), expect.objectContaining({ automationId: 'conversation' })],
+      pendingAcknowledgements,
+      pendingCancellations: [expect.objectContaining({ automationId: 'deleted-conversation' })],
+    })
+    expect(JSON.parse(readFileSync(file, 'utf8')).automations).toHaveLength(2)
+    cache.applySync({ serverTime: 2000, nextSeq: '10', changes: [] })
+    expect(createServerAutomationCache({ filePath: file }).read().cursor).toBe(10n)
+    expect(() => cache.applySync({ serverTime: 2000, nextSeq: '11', changes: [{
+      ...row('retired', 5), kind: 'UPSERT', seq: '11',
+    }] })).toThrow('automation-sync-invalid')
+  })
 })
 
 /*

@@ -9,7 +9,8 @@ import type {
   GithubTriggerRuntimeState,
 } from './githubTriggerDomain'
 
-export type ServerAutomationReportOutcome = 'WOKE' | 'SILENT' | 'SKIPPED_GATE' | 'ERROR'
+// NO_CHANGE is retained only for draining reports persisted by older daemons.
+export type ServerAutomationReportOutcome = 'WOKE' | 'SILENT' | 'SKIPPED_GATE' | 'ERROR' | 'NO_CHANGE'
 
 export interface ServerAutomationScheduleState {
   automationId: string
@@ -214,7 +215,7 @@ function parseGithubState(value: unknown): GithubTriggerRuntimeState {
   }
 }
 
-const REPORT_OUTCOMES = new Set<ServerAutomationReportOutcome>(['WOKE', 'SILENT', 'SKIPPED_GATE', 'ERROR'])
+const REPORT_OUTCOMES = new Set<ServerAutomationReportOutcome>(['WOKE', 'SILENT', 'SKIPPED_GATE', 'ERROR', 'NO_CHANGE'])
 
 function parsePendingReport(value: unknown): PendingAutomationReport {
   const row = record(value)

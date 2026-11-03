@@ -656,7 +656,7 @@ function reconcileSchedules(
       automationId: automation.automationId,
       generation: automation.generation,
       nextRunAt: automation.runRequestedAt ?? firstScheduledAt(payload.schedule, now, automation.enabledAt, current),
-      lastSessionId: null,
+      lastSessionId: current?.lastSessionId ?? null,
       ...(current?.spentOnceAt !== undefined ? { spentOnceAt: current.spentOnceAt } : {}),
       ...(automation.runRequestedAt == null ? {} : { runRequestRevision: automation.revision }),
     })

@@ -554,6 +554,8 @@ enum AutomationRunOutcome {
     SILENT
     SKIPPED_GATE
     ERROR
+    // Deprecated: retained for historical rows and reports from older daemons.
+    NO_CHANGE
 }
 
 model Automation {

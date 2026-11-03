@@ -4983,6 +4983,37 @@ describe('scheduled run waiting gate', () => {
     fixture.input.resolveMcpSpawnContext = async () => ({ ok: true, value: { mcpCallerGrant: 'grant', mcpConfigProjectId: 'chat:c', bindingStatus: 'BOUND', connectorPolicy: 'optional', requiredConnectors: [] } })
   }
 
+  it('keeps a live ordinary worker across a generation change before claiming a run-now request', async () => {
+    const f = setup({ ...claimed, generation: 3 })
+    withLastSession(f, 'session-old')
+    f.input.cache = { read: () => ({
+      cursor: 1n, serverTime: f.now, syncedAt: f.now, pendingAcknowledgements: [],
+      automations: [{ ...cacheRecord(3), runRequestedAt: f.now }],
+    }) }
+    f.input.isSessionRunning = vi.fn((id) => id === 'session-old')
+
+    expect(await runServerAutomationTick(f.input)).toEqual([])
+    expect(f.input.isSessionRunning).toHaveBeenCalledWith('session-old')
+    expect(f.transport.claim).not.toHaveBeenCalled()
+    expect(f.spawnSession).not.toHaveBeenCalled()
+    expect(f.store.state().schedules[0]).toMatchObject({ generation: 3, lastSessionId: 'session-old' })
+  })
+
+  it('keeps the previous waiting conversation across an edit or pause/resume', async () => {
+    const f = setup({ ...claimed, generation: 3 })
+    withLastSession(f, 'session-old')
+    f.input.cache = { read: () => ({
+      cursor: 1n, serverTime: f.now, syncedAt: f.now, pendingAcknowledgements: [],
+      automations: [{ ...cacheRecord(3), runRequestedAt: f.now }],
+    }) }
+    f.input.isSessionRunning = vi.fn(() => true)
+    f.input.isSessionWaitingForUser = vi.fn((id) => id === 'session-old')
+
+    expect(await runServerAutomationTick(f.input)).toEqual([{ automationId: 'automation-1', outcome: 'SKIPPED_GATE' }])
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'SKIPPED_GATE', sessionId: 'session-old' }))
+    expect(f.spawnSession).not.toHaveBeenCalled()
+  })
+
   it('reports a skipped run naming the waiting previous conversation instead of holding it as an overlap', async () => {
     const f = setup(claimed)
     withLastSession(f, 'session-old')

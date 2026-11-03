@@ -182,7 +182,7 @@ export function automationSocketHandler(accountId: string, machineId: string, so
 
     on('automation-run-report', async (data, callback) => answer(callback, () => {
         const status = data?.status === 'COMPLETED' || data?.status === 'FAILED' ? data.status : null;
-        const outcomes = ['WOKE', 'SILENT', 'SKIPPED_GATE', 'ERROR'] as const;
+        const outcomes = ['WOKE', 'SILENT', 'SKIPPED_GATE', 'ERROR', 'NO_CHANGE'] as const;
         const outcome = outcomes.find((candidate) => candidate === data?.outcome);
         if (!status || !outcome) throw new Error('invalid-input');
         const failureCode = data?.failureCode === null || data?.failureCode === undefined

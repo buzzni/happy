@@ -6,6 +6,7 @@ import {
   automationPayloadSchema,
   githubTriggerSchema,
   automationRunSchema,
+  automationRunOutcomeSchema,
   automationTargetSchema,
   createAutomationApiClient,
   decryptAutomationPayload,
@@ -13,6 +14,11 @@ import {
   type AutomationCryptoAdapter,
   type AutomationPublic,
 } from './automation';
+
+it('continues to parse historical NO_CHANGE outcomes while rejecting unknown outcomes', () => {
+  expect(automationRunOutcomeSchema.parse('NO_CHANGE')).toBe('NO_CHANGE');
+  expect(automationRunOutcomeSchema.safeParse('UNKNOWN').success).toBe(false);
+});
 
 describe('github trigger automation payload', () => {
   it('accepts a server-backed PR trigger without changing legacy scheduled payloads', () => {

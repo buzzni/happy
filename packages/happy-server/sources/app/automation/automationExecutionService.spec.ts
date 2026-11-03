@@ -61,6 +61,43 @@ function makeTx() {
 }
 
 describe('automationExecutionService', () => {
+    it.each([3, 5, 6])('tombstones removed or unknown payload %s even when advertised', async (payloadVersion) => {
+        const tx = makeTx();
+        tx.automation.findFirst.mockResolvedValue(automation({ payloadVersion }));
+        for (const payloadVersions of [[1, 4], [1, 3, 4, 5, 6]]) {
+            const result = await syncAutomations(tx as never, 'account-1', 'machine-1', { afterSeq: 0n, limit: 100, payloadVersions });
+            expect(result).toMatchObject({ ok: true, value: { nextSeq: 9n, changes: [{ kind: 'TOMBSTONE' }] } });
+        }
+    });
+
+    it('does not attach an unsupported sealed cancellation payload to a tombstone', async () => {
+        const tx = makeTx();
+        tx.automationChange.findMany.mockResolvedValue([{ seq: 9n, automationId: 'automation-1', revision: 2, generation: 3,
+            kind: 'TOMBSTONE', machineAccountId: 'account-1', machineId: 'machine-1', createdAt: now }]);
+        tx.automation.findFirst.mockResolvedValue(automation({ payloadVersion: 5, projectId: 'chat:old', deletedAt: now,
+            project: { chatAutomationState: 'deleted', config: { chatAutomationState: 'deleted' } } }));
+        const result = await syncAutomations(tx as never, 'account-1', 'machine-1', { afterSeq: 0n, limit: 100, payloadVersions: [1, 4, 5] });
+        expect(result).toMatchObject({ ok: true, value: { changes: [{ kind: 'TOMBSTONE' }] } });
+        expect((result as any).value.changes[0]).not.toHaveProperty('chatDeleted');
+    });
+
+    it('keeps supported automations advancing past a retired v5 row in the same sync page', async () => {
+        const tx = makeTx();
+        tx.automationChange.findMany.mockResolvedValue([5, 1, 4].map((payloadVersion, i) => ({
+            seq: BigInt(i + 1), automationId: `automation-${payloadVersion}`, revision: 2, generation: 3,
+            kind: 'UPSERT', machineAccountId: 'account-1', machineId: 'machine-1', createdAt: now,
+        })));
+        tx.automation.findFirst
+            .mockResolvedValueOnce(automation({ id: 'automation-5', payloadVersion: 5 }))
+            .mockResolvedValueOnce(automation({ id: 'automation-1', payloadVersion: 1 }))
+            .mockResolvedValueOnce(automation({ id: 'automation-4', payloadVersion: 4 }));
+        const result = await syncAutomations(tx as never, 'account-1', 'machine-1', { afterSeq: 0n, limit: 100, payloadVersions: [1, 4] });
+        expect(result).toMatchObject({ ok: true, value: { nextSeq: 3n, changes: [
+            { automationId: 'automation-5', kind: 'TOMBSTONE' },
+            { automationId: 'automation-1', kind: 'UPSERT', payloadVersion: 1 },
+            { automationId: 'automation-4', kind: 'UPSERT', payloadVersion: 4 },
+        ] } });
+    });
     it('registers a persistent public key with account, machine, and version CAS', async () => {
         const tx = makeTx();
         await expect(registerAutomationMachineKey(tx as never, 'account-1', 'machine-1', {
@@ -397,6 +434,26 @@ describe('automationExecutionService', () => {
             runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
             outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null, failureCode: null,
         }, now)).resolves.toEqual({ ok: true, value: expect.objectContaining({ idempotent: true }) });
+        expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('persists and idempotently replays a legacy NO_CHANGE completion without a spawned session', async () => {
+        const tx = makeTx();
+        const run = { id: 'run-1', status: 'RUNNING', reportId: null, automation: automation(), runLeaseExpiresAt: now };
+        tx.automationRun.findFirst.mockResolvedValue(run);
+        const report = {
+            runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED' as const,
+            outcome: 'NO_CHANGE' as const, sessionId: null, detailCiphertext: null, failureCode: null,
+        };
+        await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', report, now))
+            .resolves.toMatchObject({ ok: true, value: { idempotent: false } });
+        expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ status: 'COMPLETED', outcome: 'NO_CHANGE', sessionId: null }),
+        }));
+        tx.automationRun.findFirst.mockResolvedValue({ ...run, status: 'COMPLETED', reportId: report.reportId, outcome: 'NO_CHANGE' });
+        tx.automationRun.updateMany.mockClear();
+        await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', report, now))
+            .resolves.toMatchObject({ ok: true, value: { idempotent: true, outcome: 'NO_CHANGE' } });
         expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
     });
 
