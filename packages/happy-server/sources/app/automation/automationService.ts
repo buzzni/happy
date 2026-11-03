@@ -263,7 +263,8 @@ export async function listAutomations(
     const access = await projectAccess(tx, actorId, projectId);
     if (!access) return { ok: false, error: 'not-found' };
     const rows = await tx.automation.findMany({
-        where: { projectId, deletedAt: null, payloadVersion: { in: [1, 4] } },
+        // Script v3 and retired native v5 stay hidden; reserved monitor v2 remains legacy inventory.
+        where: { projectId, deletedAt: null, payloadVersion: { in: [1, 2, 4] } },
         orderBy: { createdAt: 'desc' },
     });
     return { ok: true, value: rows };
@@ -323,7 +324,7 @@ export async function requestAutomationRun(
         },
     });
     if (!current) return { ok: false, error: 'not-found' };
-    if (![1, 4].includes(current.payloadVersion)) return { ok: false, error: 'automation-run-unsupported' };
+    if (![1, 2, 4].includes(current.payloadVersion)) return { ok: false, error: 'automation-run-unsupported' };
     if (current.revision !== expectedRevision) {
         return { ok: false, error: 'revision-conflict', latest: current };
     }
@@ -404,7 +405,8 @@ function registrationId(projectId: string, registrationKey: string): string {
 export async function getRegisteredAutomation(tx: Tx, actorId: string, projectId: string, registrationKey: string): Promise<AutomationServiceResult<Automation | null>> {
     if (!await projectAccess(tx, actorId, projectId)) return { ok: false, error: 'not-found' };
     const row = await tx.automation.findUnique({ where: { id: registrationId(projectId, registrationKey) } });
-    if (row && (row.projectId !== projectId || row.ownerAccountId !== actorId || row.deletedAt)) return { ok: false, error: 'registration-conflict' };
+    // A retired native v5 row cannot be parsed by v4 clients; report it like any other unusable registration.
+    if (row && (row.projectId !== projectId || row.ownerAccountId !== actorId || row.deletedAt || row.payloadVersion === 5)) return { ok: false, error: 'registration-conflict' };
     return { ok: true, value: row };
 }
 

@@ -70,6 +70,21 @@ describe('automationExecutionService', () => {
         }
     });
 
+    it('keeps syncing legacy monitor v2 rows as before the rollback', async () => {
+        const tx = makeTx();
+        tx.automation.findFirst.mockResolvedValue(automation({ payloadVersion: 2 }));
+        const result = await syncAutomations(tx as never, 'account-1', 'machine-1', { afterSeq: 0n, limit: 100, payloadVersions: [1, 4] });
+        expect(result).toMatchObject({ ok: true, value: { changes: [{ kind: 'UPSERT', payloadVersion: 2 }] } });
+    });
+
+    it('keeps legacy monitor v2 runs claimable as before the rollback', async () => {
+        const tx = makeTx();
+        tx.automation.findFirst.mockResolvedValue(automation({ payloadVersion: 2 }));
+        await expect(claimAutomationRun(tx as never, 'account-1', 'machine-1', {
+            automationId: 'automation-1', generation: 3, scheduledFor: new Date(now.getTime() - 30_000),
+        }, now)).resolves.toMatchObject({ ok: true });
+    });
+
     it('does not attach an unsupported sealed cancellation payload to a tombstone', async () => {
         const tx = makeTx();
         tx.automationChange.findMany.mockResolvedValue([{ seq: 9n, automationId: 'automation-1', revision: 2, generation: 3,

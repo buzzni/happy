@@ -474,6 +474,11 @@ it('keeps reserved monitor v2 records in legacy inventory while isolating script
   const paused = await client.$transaction((tx) => updateAutomation(tx, 'owner', 'p1', 'existing-monitor', { expectedRevision: 1, paused: true }));
   expect(paused).toMatchObject({ ok: true });
 });
+it('keeps retired native v5 rows out of the legacy inventory', async () => {
+  const script = await client.$transaction((tx) => saveScriptAutomation(tx, 'owner', 'p1', registration));
+  await client.automation.create({ data: { ...script, id: 'retired-native', payloadVersion: 5, scriptRegistrationKey: null } });
+  expect(await client.$transaction((tx) => listAutomations(tx, 'owner', 'p1'))).toEqual({ ok: true, value: [] });
+});
 it('exposes revision validation failures and clears them only after the current target verifies code', async () => {
   const { markScriptValidationFailed } = await import('./scriptExecutionService');
   const { serializeScriptAutomation } = await import('../api/routes/scriptAutomationRoutes');
