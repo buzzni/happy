@@ -85,12 +85,15 @@ export async function listWorkspaceDownloadDirectory(allowedRoot: string, worksp
     if (!snapshot.info.isDirectory()) throw denied();
     const identity = pathIdentity(snapshot.info);
     if (expectedIdentity !== undefined && expectedIdentity !== identity) throw denied();
-    const names = (await readdir(snapshot.path)).sort();
+    const names = (await readdir(snapshot.path, { withFileTypes: true })).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
     if (offset > names.length) throw denied();
     const entries = [];
-    for (const name of names.slice(offset, offset + 1000)) {
-        const info = await lstat(join(snapshot.path, name));
-        entries.push({ name, type: info.isSymbolicLink() ? 'other' : info.isDirectory() ? 'directory' : info.isFile() ? 'file' : 'other', size: info.size, modified: info.mtimeMs });
+    for (const entry of names.slice(offset, offset + 1000)) {
+        // Retain failed stats: export applies ignore/subtree rules before requiring metadata.
+        // Dirent preserves the entry type without following links or silently dropping files.
+        const info = await lstat(join(snapshot.path, entry.name)).catch(() => undefined);
+        const kind = info ?? entry;
+        entries.push({ name: entry.name, type: kind.isSymbolicLink() ? 'other' : kind.isDirectory() ? 'directory' : kind.isFile() ? 'file' : 'other', size: info?.size, modified: info?.mtimeMs });
     }
     await snapshot.verify();
     return { entries, identity, nextOffset: offset + entries.length < names.length ? offset + entries.length : null };

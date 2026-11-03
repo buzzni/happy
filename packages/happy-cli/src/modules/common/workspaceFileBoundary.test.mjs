@@ -6,6 +6,21 @@ import { join } from 'node:path';
 import { listWorkspaceDirectory, readWorkspaceFile, captureWorkspacePath, writeWorkspaceFile } from './workspaceFileBoundary.ts';
 import * as boundary from './workspaceFileBoundary.ts';
 
+test('download listing retains denied metadata for client subtree and ignore filtering', { skip: process.platform !== 'darwin' }, async (t) => {
+  const { base, root } = await fixture(t);
+  const { execFileSync } = await import('node:child_process');
+  const { userInfo } = await import('node:os');
+  const blocked = join(root, 'unrelated.tmp');
+  await writeFile(blocked, 'unrelated');
+  await mkdir(join(root, 'selected'));
+  execFileSync('chmod', ['+a', `user:${userInfo().username} deny readattr`, blocked]);
+  try {
+    const page = await boundary.listWorkspaceDownloadDirectory(base, root, root, 0);
+    assert.deepEqual(page.entries.find(entry => entry.name === 'unrelated.tmp'), { name: 'unrelated.tmp', type: 'file', size: undefined, modified: undefined });
+    assert.equal(page.entries.find(entry => entry.name === 'selected').type, 'directory');
+  } finally { execFileSync('chmod', ['-N', blocked]); }
+});
+
 test('download chunks read bounded ranges of large files and reject identity replacement', async (t) => {
   const { base, root } = await fixture(t);
   const path = join(root, 'large.bin');
