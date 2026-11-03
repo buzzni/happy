@@ -680,3 +680,16 @@ it('returns ordinary schedules only to daemons that explicitly negotiate payload
   const current = await syncAutomations(tx as never, 'account-1', 'machine-1', { afterSeq: 0n, limit: 100, payloadVersions: [1, 4] });
   expect(current).toMatchObject({ ok: true, value: { changes: [expect.objectContaining({ kind: 'UPSERT', payloadVersion: 4 })] } });
 });
+
+it('keeps versioned reservations out of a daemon sync that only advertises the old codecs', async () => {
+    const tx = makeTx(); tx.automation.findFirst.mockResolvedValue(automation({ payloadVersion: 5 }));
+    const result = await syncAutomations(tx as never, 'account-1', 'machine-1', { afterSeq: 0n, limit: 100, payloadVersions: [1, 4] });
+    expect(result).toMatchObject({ ok: true, value: { changes: [expect.objectContaining({ kind: 'TOMBSTONE' })] } });
+    if (result.ok) expect(result.value.changes[0]).not.toHaveProperty('payloadCiphertext');
+});
+
+it('returns native reservations only after explicit codec 5 negotiation', async () => {
+  const tx = makeTx(); tx.automation.findFirst.mockResolvedValue(automation({ payloadVersion: 5 }));
+  expect(await syncAutomations(tx as never, 'account-1', 'machine-1', { afterSeq: 0n, limit: 100, payloadVersions: [1, 4, 5] }))
+    .toMatchObject({ ok: true, value: { changes: [expect.objectContaining({ kind: 'UPSERT', payloadVersion: 5 })] } });
+});

@@ -3,7 +3,7 @@ import { registerOwnedSpawnRpc, type OwnedSpawnRpc } from '@/daemon/ownedSpawnRp
 import { z } from 'zod';
 import type { createDeviceEnrollment } from '@/daemon/deviceEnrollment';
 import type { DeviceKeys } from '@/daemon/deviceKeys';
-import type { AutomationConversationDeliverRequest } from '@slopus/happy-wire';
+import type { AutomationConversationDeliverRequest, ReservationLeaseRequest, ReservationLeaseView, ReservationCheckpointRequest, ReservationCheckpointView } from '@slopus/happy-wire';
 import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { createWorktreeReclaimHandler } from '@/daemon/worktreeDependencyReclaimRpc';
 import { createSealedSpawnEnvHandler } from '@/modules/common/sealedSpawnEnv';
@@ -440,6 +440,8 @@ interface DaemonToServerEvents {
         runId: string;
         claimToken: string;
     }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
+    'automation-reservation-checkpoint': (data: ReservationCheckpointRequest, cb: (answer: { ok: boolean; value?: ReservationCheckpointView; error?: string }) => void) => void;
+    'automation-conversation-lease': (data: ReservationLeaseRequest, cb: (answer: { ok: boolean; value?: ReservationLeaseView; error?: string }) => void) => void;
     'automation-conversation-deliver': (data: AutomationConversationDeliverRequest, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
     'automation-run-report': (data: PendingAutomationReport, cb: (answer: {
         ok: boolean;
@@ -818,6 +820,7 @@ export class ApiMachineClient {
     private automationLegacyFallbackEnabled = false;
     private lastKnownAutomationServerKeyVersion: number | null = null;
     private serverAutomationCache: ServerAutomationCache | null = null;
+    private reservationNativeSupported = false;
     private serverAutomationSyncInFlight: Promise<void> | null = null;
     private rpcHandlerManager: RpcHandlerManager;
     /** General daemons reuse the protected device key; managed runtimes keep their existing ephemeral recipient. */
@@ -2578,6 +2581,17 @@ export class ApiMachineClient {
         }
     }
 
+    async setReservationNativeSupported(supported: boolean): Promise<void> {
+        await this.serverAutomationSyncInFlight;
+        this.serverAutomationCache?.negotiateReservationCodec?.(supported);
+        this.reservationNativeSupported = supported;
+        if (this.automationKey && this.socket?.connected) await this.registerAutomationKey();
+    }
+
+    private reservationNativeField() {
+        return this.reservationNativeSupported ? { reservation: { version: 1 as const, agents: ['claude', 'codex'] as Array<'claude' | 'codex'>, github: true as const, commands: true as const } } : {};
+    }
+
     private scriptRuntimeField(): { scriptRuntime?: ScriptRuntimeReadiness } {
         return this.scriptRuntimeReadiness ? { scriptRuntime: this.scriptRuntimeReadiness } : {};
     }
@@ -2646,6 +2660,14 @@ export class ApiMachineClient {
             logger.debug(`[API MACHINE] ${event} ack timed out after ${AUTOMATION_ACK_TIMEOUT_MS}ms: ${error instanceof Error ? error.message : String(error)}`);
             return { ok: false, error: 'ack-timeout' };
         });
+    }
+
+    reservationCheckpoint(input: ReservationCheckpointRequest): Promise<{ ok: boolean; value?: unknown; error?: string }> {
+        return this.automationAck('automation-reservation-checkpoint', this.socket.timeout(AUTOMATION_ACK_TIMEOUT_MS).emitWithAck('automation-reservation-checkpoint', input));
+    }
+
+    manageReservationConversation(input: ReservationLeaseRequest): Promise<{ ok: boolean; value?: unknown; error?: string }> {
+        return this.automationAck('automation-conversation-lease', this.socket.timeout(AUTOMATION_ACK_TIMEOUT_MS).emitWithAck('automation-conversation-lease', input));
     }
 
     deliverAutomationConversation(input: AutomationConversationDeliverRequest): Promise<{ ok: boolean; value?: unknown; error?: string }> {
@@ -3410,7 +3432,7 @@ export class ApiMachineClient {
         if (!this.serverAutomationCache || this.serverAutomationSyncInFlight) return;
         const sync = syncServerAutomationDeltas({
             cache: this.serverAutomationCache,
-            sync: (request) => this.socket.emitWithAck('automation-sync', { ...request, payloadVersions: [1, 4] }),
+            sync: (request) => this.socket.emitWithAck('automation-sync', { ...request, payloadVersions: this.reservationNativeSupported ? [1, 4, 5] : [1, 4] }),
             ack: (request) => this.socket.emitWithAck('automation-sync-ack', request),
         }).then((result) => {
             if (result.changed > 0) logger.debug(`[API MACHINE] Applied ${result.changed} automation delta(s)`);
@@ -3465,6 +3487,7 @@ export class ApiMachineClient {
                 ...this.automationHostCommandsField(),
                 ...this.authenticatedEnvelopesField(),
                 ...this.scriptRuntimeField(),
+                ...this.reservationNativeField(),
             },
         }));
     }
@@ -4390,7 +4413,8 @@ export class ApiMachineClient {
             const cliVersionChanged = prevCliVersion !== newCliVersion;
             const scriptRuntimeKey = this.scriptRuntimeReadiness ? scriptRuntimeReadinessKey(this.scriptRuntimeReadiness) : null;
             const automationSupportChanged = this.lastKnownAutomationRpcAvailable !== this.automationRpcAvailable
-                || this.lastKnownScriptRuntimeKey !== scriptRuntimeKey;
+                || this.lastKnownScriptRuntimeKey !== scriptRuntimeKey
+                || JSON.stringify(this.machine.metadata?.automationSupport?.reservation) !== JSON.stringify(this.reservationNativeField().reservation);
             const autonomousQualityGateSupportChanged = this.lastKnownAutonomousQualityGateRpcAvailable !== this.autonomousQualityGateRpcAvailable;
             const automationServerKeyChanged = this.lastKnownAutomationServerKeyVersion !== this.automationServerKeyVersion;
             const daemonSessionStateAvailable = this.daemonSessionStateRpcAvailable && !this.managedHandlers;
@@ -4497,6 +4521,7 @@ export class ApiMachineClient {
                         ...this.automationHostCommandsField(),
                         ...this.authenticatedEnvelopesField(),
                         ...this.scriptRuntimeField(),
+                ...this.reservationNativeField(),
                     },
                     autonomousQualityGateSupport: {
                         apiVersion: 1,

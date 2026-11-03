@@ -1,3 +1,4 @@
+import { assertReservationProviderResume } from '@/daemon/automations/reservationTurnBootstrap';
 import type { ScopeClaudeSandbox } from '@/daemon/sessionWriteScopeClaude';
 import { prepareClaudeProcessSandbox, type ClaudeProcessSandbox } from '@/sandbox/claudeProcessSandbox';
 import type { SandboxConfig } from '@/persistence';
@@ -280,6 +281,8 @@ async function runClaudeRemote(
         startFrom = null;
     }
     
+    assertReservationProviderResume('claude', startFrom);
+
     // Extract --resume from claudeArgs if present (for first spawn)
     if (!startFrom && opts.claudeArgs) {
         for (let i = 0; i < opts.claudeArgs.length; i++) {
@@ -961,6 +964,7 @@ function readTurnText(content: unknown): string {
                 updateThinking(true);
 
                 const systemInit = message as SDKSystemMessage;
+                assertReservationProviderResume('claude', systemInit.session_id);
                 aiAuthObservation?.noteTurnApiKeySource(systemInit.apiKeySource);
                 // Provider executable start until it is ready to work (first run pays any endpoint scan).
                 logger.debug(`[timing] claude system-init ${Date.now() - queryStartedAt}ms`);

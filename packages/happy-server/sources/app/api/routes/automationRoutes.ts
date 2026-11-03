@@ -28,8 +28,8 @@ import {
     type AutomationServiceError,
 } from '@/app/automation/automationService';
 import { resolveAutomationRunMcpContext } from '@/app/automation/automationExecutionService';
-import { listAutomationPage } from '@/app/automation/automationPageService';
 import { serializeScriptAutomation } from './scriptAutomationRoutes';
+import { listAutomationPage } from '@/app/automation/automationPageService';
 import { readChatAutomationImpact, transitionChatAutomations } from '@/app/automation/automationChatLifecycle';
 import { verifyChatAutomationLifecycle } from '@slopus/happy-wire/chatAutomationLifecycleToken';
 import { inTx } from '@/storage/inTx';
@@ -320,7 +320,7 @@ export function automationRoutes(app: Fastify) {
         return reply.send({ automation: result.value ? serializeAutomation(result.value) : null });
     });
     app.put('/v1/projects/:projectId/automations/registrations/:registrationKey', {
-        preHandler: app.authenticate, schema: { params: registrationParams, body: createSchema.extend({ payloadVersion: z.literal(4), paused: z.literal(true) }).strict() },
+        preHandler: app.authenticate, schema: { params: registrationParams, body: createSchema.extend({ payloadVersion: z.union([z.literal(4), z.literal(5)]), paused: z.literal(true) }).strict() },
     }, async (request, reply) => {
         if (rejectWhenDisabled(reply)) return;
         const body = request.body;

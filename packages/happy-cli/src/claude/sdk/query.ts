@@ -1,3 +1,4 @@
+import { reservationTurnAuthoritySignal } from '@/daemon/automations/reservationTurnBootstrap'
 /**
  * Query wrapper around official @anthropic-ai/claude-agent-sdk
  * Maps internal QueryOptions to official SDK Options
@@ -67,9 +68,13 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
     }
 
     // Map abort signal -> AbortController
-    if (opts?.abort) {
+    const reservationSignal = reservationTurnAuthoritySignal()
+    const signals = [opts?.abort, reservationSignal].filter((value): value is AbortSignal => value !== undefined)
+    const abort = signals.length ? AbortSignal.any(signals) : undefined
+    if (abort) {
         const controller = new AbortController()
-        opts.abort.addEventListener('abort', () => controller.abort(), { once: true })
+        if (abort.aborted) controller.abort()
+        abort.addEventListener('abort', () => controller.abort(), { once: true })
         sdkOptions.abortController = controller
     }
 
@@ -89,10 +94,11 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
     sdkOptions.env = env
 
     // Map canCallTool -> canUseTool
-    if (opts?.canCallTool) {
-        const callback = opts.canCallTool
+    if (opts?.canCallTool || reservationSignal) {
+        const callback = opts?.canCallTool
         sdkOptions.canUseTool = async (toolName, input, options) => {
-            return callback(toolName, input, options)
+            if (reservationTurnAuthoritySignal()?.aborted) return { behavior: 'deny', message: 'RESERVATION_AUTHORITY_EXPIRED' }
+            return callback ? callback(toolName, input, options) : { behavior: 'allow', updatedInput: input }
         }
     }
 

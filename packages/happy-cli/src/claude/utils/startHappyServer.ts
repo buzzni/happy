@@ -1,3 +1,4 @@
+import { reservationTurnAuthoritySignal } from '@/daemon/automations/reservationTurnBootstrap';
 import { createLocalClientSession, registerLocalClientTools, LOCAL_CLIENT_TOOL_NAMES, type LocalClientSession } from '@/browserRuntime/localClientSession';
 import type { PolicyApprover } from '@/toolPolicy/policyGate';
 import { startSessionAgentBroker } from '@/commands/sessionAgentBroker';
@@ -581,6 +582,8 @@ export async function startHappyServer(
         currentTurnId?: () => number | null;
     } = {},
 ) {
+    // The legacy server can delegate and execute outside a reservation's descriptor.
+    if (reservationTurnAuthoritySignal()) throw new Error('RESERVATION_SCOPED_TOOL_BROKER_REQUIRED');
     logger.debug(`[happyMCP] server:start sessionId=${client.sessionId}`);
 
     const browserTask = createBrowserTaskRuntimeClient(client, process.env.HAPPY_BROWSER_TASK_PROFILE_ID || 'default', options.browserClientApprover);

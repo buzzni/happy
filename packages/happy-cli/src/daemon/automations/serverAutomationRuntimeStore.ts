@@ -9,7 +9,7 @@ import type {
   GithubTriggerRuntimeState,
 } from './githubTriggerDomain'
 
-export type ServerAutomationReportOutcome = 'WOKE' | 'SILENT' | 'SKIPPED_GATE' | 'ERROR'
+export type ServerAutomationReportOutcome = 'WOKE' | 'SILENT' | 'SKIPPED_GATE' | 'NO_CHANGE' | 'ERROR'
 
 export interface ServerAutomationScheduleState {
   automationId: string
@@ -214,7 +214,7 @@ function parseGithubState(value: unknown): GithubTriggerRuntimeState {
   }
 }
 
-const REPORT_OUTCOMES = new Set<ServerAutomationReportOutcome>(['WOKE', 'SILENT', 'SKIPPED_GATE', 'ERROR'])
+const REPORT_OUTCOMES = new Set<ServerAutomationReportOutcome>(['WOKE', 'SILENT', 'SKIPPED_GATE', 'NO_CHANGE', 'ERROR'])
 
 function parsePendingReport(value: unknown): PendingAutomationReport {
   const row = record(value)

@@ -1,3 +1,4 @@
+import { renewReservationTurnAuthority, revokeReservationTurnAuthority } from '../daemon/automations/reservationTurnBootstrap';
 import { randomBytes } from 'node:crypto';
 import { WebSocket } from 'ws';
 import type { Socket } from 'node:net';
@@ -66,6 +67,11 @@ export class SessionLaunchControl {
           return;
         }
         const command = launchCommandSchema.parse(JSON.parse(raw.toString()));
+        if (command.type === 'reservation-renew') {
+          const accepted = renewReservationTurnAuthority(command.epoch, command.deadlineMonotonicMs);
+          this.send({ type: 'reservation-renewed', nonce: command.nonce, launchId: config.launchId, epoch: command.epoch, accepted });
+          return;
+        }
         if (command.type === 'drain') {
           if (!this.drain) {
             this.send({ type: 'receipt', nonce: command.nonce, launchId: config.launchId,
@@ -129,6 +135,7 @@ export class SessionLaunchControl {
     this.socket.send(JSON.stringify(message), error => { if (error) this.lost(); });
   }
   private lost(): void {
+    revokeReservationTurnAuthority();
     this.current?.controller.abort();
     if (this.runtime?.isFrozen()) {
       try { this.runtime.blockShutdownStorage(); } catch { /* A received ACK may already have confirmed the decision. */ }

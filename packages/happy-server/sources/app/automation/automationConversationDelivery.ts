@@ -1,3 +1,4 @@
+import { lockReservationSession, readReservationLease } from './reservationConversationLease';
 import { createHash } from 'node:crypto';
 import type { Prisma } from '@prisma/client';
 import type { AutomationConversationDeliverRequest } from '@slopus/happy-wire';
@@ -8,7 +9,7 @@ export async function deliverAutomationConversationMessage(tx: Prisma.Transactio
         where: { id: input.runId, machineAccountId: accountId, machineId, claimTokenHash },
         include: { automation: { include: { project: true, targetMachine: true } } },
     });
-    if (!run || run.automation.payloadVersion !== 4) return denied('claim-not-found');
+    if (!run || ![4, 5].includes(run.automation.payloadVersion)) return denied('claim-not-found');
     const localId = `happy-automation:${run.id}`;
     // The run owns one target, even after its report or the transport ACK is lost.
     if (run.sessionId && run.sessionId !== input.sessionId) return denied('target-mismatch');
@@ -36,6 +37,13 @@ export async function deliverAutomationConversationMessage(tx: Prisma.Transactio
     // A concurrent replay may have waited on either lock above.
     const replay = await tx.sessionMessage.findUnique({ where: { sessionId_localId: { sessionId: input.sessionId, localId } } });
     if (replay) return { ok: true as const, value: { idempotent: true, message: replay } };
+    // Serialize admission with manual append and lease acquisition. v4 keeps its
+    // original path unless this exact conversation is owned by a new reservation.
+    if (!await lockReservationSession(tx, accountId, input.sessionId)) return denied('target-mismatch');
+    const lease = await readReservationLease(tx, input.sessionId);
+    if (a.payloadVersion === 5) {
+        if (!lease || lease.runId !== run.id || lease.machineId !== machineId || lease.epoch !== input.reservationEpoch || lease.state !== 'RUNNING' || lease.expiresAt <= now) return denied('reservation-context-mismatch');
+    } else if (lease) return denied('reservation-busy');
     const updated = await tx.session.updateMany({ where: { id: input.sessionId, accountId, active: true, seq: input.expectedSeq }, data: { seq: { increment: 1 }, lastActiveAt: now } });
     if (updated.count !== 1) {
         // Local resume readiness precedes the batched server activity update.
