@@ -127,7 +127,7 @@ graph LR
             R7[accountRoutes]
             R8[userRoutes / feedRoutes]
             R9[pushRoutes]
-            R10[connectRoutes / voiceRoutes]
+            R10[connectRoutes]
         end
     end
 
@@ -147,7 +147,7 @@ HTTP routes are organized by domain:
 - Account + usage (`accountRoutes`)
 - Social + feed (`userRoutes`, `feedRoutes`)
 - Push tokens (`pushRoutes`)
-- Integrations (`connectRoutes`, `voiceRoutes`)
+- Integrations (`connectRoutes`)
 - Version checks (`versionRoutes`)
 - Dev-only logging (`devRoutes`)
 
@@ -398,7 +398,7 @@ graph TB
 ## Integrations
 - **GitHub**: OAuth connect + webhook verification, optional if env vars are set.
 - **AI vendors**: encrypted token storage for `openai`, `anthropic`, `gemini`.
-- **Voice**: RevenueCat subscription check + ElevenLabs token minting.
+- **Voice**: removed in this fork — the server registers no `/v1/voice` routes (Saycode voice input runs through web-ui).
 - **Push tokens**: stored for later notification delivery.
 
 ## Observability

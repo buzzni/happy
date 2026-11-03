@@ -20,3 +20,13 @@ it('rejects malformed cursors before reading storage', async () => {
     await expect(listAutomationPage({ automation: { findMany } } as unknown as Prisma.TransactionClient, 'actor', { projectIds: ['chat:c'], limit: 20, cursor: 'invalid' })).rejects.toThrow('invalid-automation-cursor');
     expect(findMany).not.toHaveBeenCalled();
 });
+it('includes project AI and Chat/project scripts only when the reservation extension is requested', async () => {
+    const findMany = vi.fn(async () => []);
+    const input = { projectIds: ['chat:c', 'project-p'], limit: 20, cursor: null, reservationExtensions: true };
+    await listAutomationPage({ automation: { findMany } } as unknown as Prisma.TransactionClient, 'actor', input);
+    expect(findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 21, where: {
+        projectId: { in: ['chat:c', 'project-p'] }, deletedAt: null,
+        AND: [{ OR: [{ projectId: { not: { startsWith: 'chat:' } } }, { payloadVersion: 3 }] }],
+        project: { OR: [{ accountId: 'actor' }, { members: { some: { accountId: 'actor', status: 'accepted' } } }] },
+    }, include: expect.objectContaining({ scriptRevisions: { orderBy: { revision: 'desc' }, take: 1 }, targetMachine: true, project: true }) }));
+});

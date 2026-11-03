@@ -1,7 +1,7 @@
 import type { Prisma } from '@prisma/client';
 
 export async function listAutomationPage(tx: Prisma.TransactionClient, actorId: string,
-    input: { projectIds: string[]; limit: number; cursor: string | null }) {
+    input: { projectIds: string[]; limit: number; cursor: string | null; reservationExtensions?: boolean }) {
     let after: { createdAt: Date; id: string } | null = null;
     if (input.cursor !== null) {
         try {
@@ -13,12 +13,13 @@ export async function listAutomationPage(tx: Prisma.TransactionClient, actorId: 
     }
     const rows = await tx.automation.findMany({
         where: {
-            projectId: { in: input.projectIds }, deletedAt: null, payloadVersion: { not: 3 },
+            projectId: { in: input.projectIds }, deletedAt: null,
+            ...(input.reservationExtensions ? { AND: [{ OR: [{ projectId: { not: { startsWith: 'chat:' } } }, { payloadVersion: 3 }] }] } : { payloadVersion: { not: 3 } }),
             project: { OR: [{ accountId: actorId }, { members: { some: { accountId: actorId, status: 'accepted' } } }] },
             ...(after ? { OR: [{ createdAt: { lt: after.createdAt } }, { createdAt: after.createdAt, id: { lt: after.id } }] } : {}),
         },
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take: input.limit + 1,
-        include: { runs: { orderBy: [{ claimedAt: 'desc' }, { scheduledFor: 'desc' }], take: 20 } },
+        include: { scriptRevisions: { orderBy: { revision: 'desc' as const }, take: 1 }, targetMachine: true, project: true, runs: { orderBy: [{ claimedAt: 'desc' }, { scheduledFor: 'desc' }], take: 20 } },
     });
     const automations = rows.slice(0, input.limit), last = automations.at(-1);
     return { automations, nextCursor: rows.length > input.limit && last
