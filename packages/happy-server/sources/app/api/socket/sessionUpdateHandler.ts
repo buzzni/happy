@@ -287,6 +287,9 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                             localId: useLocalId
                         }
                     });
+                }, {
+                    // Same budget as REST batches, which wait on this lock too; Prisma's 5s default is shorter.
+                    timeout: 10000
                 });
                 if (!msg) return;
                 // Account.seq uses its own transaction, after releasing Session.

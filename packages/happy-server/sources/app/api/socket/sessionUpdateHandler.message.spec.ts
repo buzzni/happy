@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
     messageFindFirst: vi.fn(),
     messageCreate: vi.fn(),
     lockSession: vi.fn(),
+    transactionOptions: vi.fn(),
     allocateUserSeq: vi.fn(),
     allocateSessionSeq: vi.fn(),
     emitUpdate: vi.fn(),
@@ -17,7 +18,7 @@ vi.mock('@/utils/log', () => ({ log: mocks.log }));
 
 vi.mock('@/storage/db', () => ({
     db: {
-        $transaction: async (fn: Function) => fn(mocks.tx),
+        $transaction: async (fn: Function, options?: unknown) => { mocks.transactionOptions(options); return fn(mocks.tx); },
         session: { findUnique: mocks.sessionFindUnique },
         sessionMessage: { findFirst: mocks.messageFindFirst, create: mocks.messageCreate },
     },
@@ -99,6 +100,8 @@ describe('socket message persistence', () => {
 
         expect(order).toEqual(['dedup', 'lock', 'dedup', 'seq', 'insert']);
         expect(mocks.allocateSessionSeq).toHaveBeenCalledWith('session-1', 1, mocks.tx);
+        // Waiting behind a REST batch on the same lock must not hit Prisma's 5s default first.
+        expect(mocks.transactionOptions).toHaveBeenCalledWith({ timeout: 10000 });
     });
 
     it('drops a retry that a concurrent writer committed while this one waited for the lock', async () => {
