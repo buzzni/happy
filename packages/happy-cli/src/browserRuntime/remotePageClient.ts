@@ -223,7 +223,7 @@ function remotePageClient() {
             status(text.confirmed);
     }
     async function poll() {
-        if (polling || busy || !token || document.hidden)
+        if (polling || inputBusy || busy || !token || document.hidden)
             return;
         if (Date.now() >= expiry - 30000)
             askHost();
@@ -273,6 +273,9 @@ function remotePageClient() {
                 await decoded.decode();
                 if (view !== owner || gen !== generation || document.hidden)
                     return;
+                if (queue.length && frame && (frame.documentGeneration !== next.documentGeneration || JSON.stringify(frame.viewport) !== JSON.stringify(next.viewport))) {
+                    lost = true; queue.length = 0; status(text.confirmed, true); await close(); render(); return;
+                }
                 frame = next;
                 confirmedAt = performance.now();
                 captureAge = next.ageMs + performance.now() - started;
@@ -291,10 +294,11 @@ function remotePageClient() {
         }
         finally {
             polling = false;
+            void flush();
         }
     }
     async function flush() {
-        if (inputBusy || !queue.length || !canInput())
+        if (polling || inputBusy || !queue.length || !canInput())
             return;
         const event = queue.shift(), owner = view, lease = own(), gen = generation;
         const current = frame;
