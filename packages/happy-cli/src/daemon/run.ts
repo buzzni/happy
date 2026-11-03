@@ -199,7 +199,7 @@ import {
 } from './sessionIdleReaper';
 import { machineIdentityMetadataUpdate } from './machineIdentityMetadata';
 import { listMachineIdTwins } from './machineIdTwins';
-import { agentBrowserMachineCapability, agentBrowserMetadataUpdate, browserTaskLineage, createBrowserTaskSessionBroker, spawnResumedWithBrowserTaskRegistration, startBrowserTaskReconciliation, type BrowserTaskSessionBroker } from './browserTaskBroker';
+import { agentBrowserMachineCapability, agentBrowserMetadataUpdate, browserTaskLineage, browserTaskSpawnSeed, createBrowserTaskSessionBroker, spawnResumedWithBrowserTaskRegistration, startBrowserTaskReconciliation, type BrowserTaskRegistration, type BrowserTaskSessionBroker } from './browserTaskBroker';
 import { watchPersonalBrowserRuntime } from './personalBrowserRuntime';
 import type { NativeBrokerRequestOptions } from '@/browserRuntime/brokerGrantSource';
 import { createHeldBrowserAttentions, findBrowserAttentionSession, startBrowserAttentionWatcher, type HeldBrowserAttention } from './browserAttentionDelivery';
@@ -2028,7 +2028,7 @@ export async function startDaemon(): Promise<void> {
 
       let preparedMachineSessionId: string | undefined;
       let stagedDeferredContinuationContextFile: string | undefined;
-      let browserTaskRegistration: { registrationId: string; sessionSecret: string } | undefined;
+      let browserTaskRegistration: BrowserTaskRegistration | undefined;
       const releaseBrowserTaskRegistration = async (): Promise<void> => {
         const registration = browserTaskRegistration;
         browserTaskRegistration = undefined;
@@ -2422,11 +2422,10 @@ export async function startDaemon(): Promise<void> {
         // A fork or recovery continues an existing conversation under a new session id: say which, so the
         // Runtime refuses a conversation of an earlier profile assignment.
         // Studio's session-user attestation (a new chat on a shared machine) goes to the broker only.
-        browserTaskRegistration = await browserTaskBroker?.register(browserTaskLineage(options), options.browserAttestation);
-        if (browserTaskRegistration) {
-          // Session process only; it removes the secret from its env before spawning claude.
-          extraEnv.HAPPY_BROWSER_TASK_SESSION_SECRET = browserTaskRegistration.sessionSecret;
-        }
+        const browserTaskSeed = browserTaskSpawnSeed(await browserTaskBroker?.register(browserTaskLineage(options), options.browserAttestation));
+        browserTaskRegistration = browserTaskSeed.registration;
+        // Session process only: the secret, or why there is none. It removes both from its env before spawning claude.
+        Object.assign(extraEnv, browserTaskSeed.environment);
 
         // The plan grant is spent only now, once nothing else can refuse this spawn before a child is launched:
         // web-ui and Desktop retry a refused spawn (an unreadable MCP envelope after a key rotation) with the

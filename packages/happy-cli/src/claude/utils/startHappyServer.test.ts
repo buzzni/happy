@@ -698,6 +698,26 @@ describe('browser task runtime PoC flag', () => {
         }
     });
 
+    it('tells the agent why the browser grant is unavailable and what the user can do, never echoing free text', async () => {
+        const unavailable = async (reason: string) => {
+            vi.stubEnv('HAPPY_BROWSER_TASK_RUNTIME_URL', 'http://127.0.0.1:1');
+            vi.stubEnv('HAPPY_BROWSER_TASK_UNAVAILABLE_REASON', reason);
+            const server = await startHappyServer(client());
+            try {
+                expect(process.env.HAPPY_BROWSER_TASK_UNAVAILABLE_REASON).toBeUndefined();
+                const result = await callTool(server, 1, 'browser_task_open_page', { taskId: 't1', url: 'https://example.com' });
+                expect(result.result.isError).toBe(true);
+                return JSON.parse(result.result.content[0].text).error;
+            } finally {
+                server.stop();
+                vi.unstubAllEnvs();
+            }
+        };
+        expect(await unavailable('connect ECONNREFUSED /secret/path')).toMatchObject({ code: 'UNAUTHORIZED', retryable: false, message: 'browser task grant is unavailable' });
+        expect(await unavailable('NATIVE_DEVICE_APPROVAL_REQUIRED')).toMatchObject({ code: 'UNAUTHORIZED', retryable: false,
+            message: 'browser task grant is unavailable (NATIVE_DEVICE_APPROVAL_REQUIRED): this organization PC needs device approval. Ask the user to have an organization admin start device registration for this PC, then confirm it in Saycode My settings → Develop → Machines → Details of this computer.' });
+    });
+
     // specs/browser-site-hints R4: the per-request MCP server must not reset which skills a task was told about.
     it('points out a site skill once per task across requests', async () => {
         const project = await mkdtemp(join(tmpdir(), 'happy-site-hints-'));
