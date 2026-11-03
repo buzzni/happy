@@ -551,6 +551,7 @@ enum AutomationRunStatus {
 }
 
 enum AutomationRunOutcome {
+    // Deprecated: readable and reportable for historical runs only.
     NO_CHANGE
     WOKE
     SILENT
