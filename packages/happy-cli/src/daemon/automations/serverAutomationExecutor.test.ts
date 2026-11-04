@@ -4291,6 +4291,56 @@ describe('host commands disallowed (Windows standalone runtime)', () => {
 
 
 describe('isolated scheduled conversation admission', () => {
+  function isolatedSetup() {
+    const f = setup({ claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-1' } } })
+    const cache = f.input.cache.read()
+    f.input.cache.read = () => ({ ...cache, automations: [{ ...cache.automations[0], payloadVersion: 6 }] })
+    const payload = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
+    f.input.decryptPayload = () => ({ ...payload, conversation: { sessionId: 'manual' }, contextPolicy: { kind: 'isolated', reference: null } })
+    f.input.resolveMcpSpawnContext = async () => ({ ok: true, value: { mcpCallerGrant: 'grant',
+      mcpConfigProjectId: 'chat:c', bindingStatus: 'BOUND', connectorPolicy: 'optional', requiredConnectors: [] } })
+    return f
+  }
+
+  it('dispatches an authorized immutable v6 run without touching manual delivery, resume or project links', async () => {
+    const f = isolatedSetup()
+    f.input.isSessionWaitingForUser = () => true
+    const deliver = vi.fn(async () => ({ ok: true as const, sessionId: 'manual' })); f.input.deliverConversation = deliver
+    const dispatch = vi.fn(async () => ({ state: 'started' as const, sessionId: 'automation-run:run-1' }))
+    f.input.dispatchIsolatedContext = dispatch
+    expect(await runServerAutomationTick(f.input)).toEqual([{ automationId: 'automation-1', outcome: 'WOKE' }])
+    expect(dispatch).toHaveBeenCalledWith({ automationId: 'automation-1', generation: 2, revision: 2,
+      runId: 'run-1', claimToken: 'claim-1', payload: f.input.decryptPayload(cacheRecord(), new Uint8Array(32)),
+      environmentVariables: { PROJECT_SECRET: 'project-value', GROUP_ONLY: 'group-value' },
+      mcpSpawnContext: expect.objectContaining({ mcpCallerGrant: 'grant', mcpConfigProjectId: 'chat:c' }) })
+    expect(f.input.resolveProjectEnvironment).toHaveBeenCalledWith({ runId: 'run-1', claimToken: 'claim-1', conversationSessionId: 'manual',
+      conversationDirectory: f.input.decryptPayload(cacheRecord(), new Uint8Array(32)).directory })
+    expect(deliver).not.toHaveBeenCalled(); expect(f.spawnSession).not.toHaveBeenCalled(); expect(f.resumeSession).not.toHaveBeenCalled()
+    expect(f.linkSession).not.toHaveBeenCalled()
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'WOKE', sessionId: 'automation-run:run-1' }))
+  })
+
+  it.each(['waiting', 'needs-attention', 'wrong-session'] as const)('reports %s without falling back to the manual context', async state => {
+    const f = isolatedSetup()
+    f.input.dispatchIsolatedContext = async () => ({ state: state === 'wrong-session' ? 'started' : state,
+      sessionId: state === 'wrong-session' ? 'manual' : 'automation-run:run-1', reason: 'workspace-busy' })
+    await runServerAutomationTick(f.input)
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: state === 'waiting' ? 'SKIPPED_GATE' : 'ERROR',
+      failureCode: state === 'waiting' ? 'AUTOMATION_WORKSPACE_BUSY' : state === 'needs-attention' ? 'AUTOMATION_START_UNCONFIRMED' : 'AUTOMATION_EXECUTION_IDENTITY_CONFLICT',
+    }))
+    expect(f.spawnSession).not.toHaveBeenCalled(); expect(f.resumeSession).not.toHaveBeenCalled()
+  })
+
+  it('refuses revoked target access before invoking the isolated runtime', async () => {
+    const f = isolatedSetup(), dispatch = vi.fn()
+    f.input.dispatchIsolatedContext = dispatch
+    f.input.resolveProjectEnvironment = async () => ({ ok: false, error: 'revoked' })
+    await runServerAutomationTick(f.input)
+    expect(dispatch).not.toHaveBeenCalled()
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ failureCode: 'CONVERSATION_TARGET_UNAVAILABLE' }))
+  })
+
   it('refuses an isolated policy without an isolated launcher instead of delivering into the manual session', async () => {
     const f = setup({ claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-1' } } });
     const base = f.input.decryptPayload(cacheRecord(), new Uint8Array(32));

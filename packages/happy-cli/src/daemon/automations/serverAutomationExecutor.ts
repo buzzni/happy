@@ -3,7 +3,7 @@ import type { AutomationProjectEnvironmentResult } from './automationProjectEnvi
 import { mergePullRequestFiles, type PullRequestFiles } from './queryGithubPullRequests'
 import { randomUUID } from 'node:crypto'
 import { buildScheduledRunPrompt } from '@/utils/scheduledRunPrompt'
-import { isAutomationExecutionSessionId } from '@slopus/happy-wire'
+import { automationExecutionSessionId, isAutomationExecutionSessionId } from '@slopus/happy-wire'
 
 import {
   buildAutomationPrompt,
@@ -201,6 +201,11 @@ export interface ServerAutomationExecutorInput {
     sessionId: string
   }) => Promise<{ ok: boolean; error?: string; skipped?: boolean }>
   deliverConversation?: (input: { runId: string; claimToken: string; sessionId: string; directory: string; prompt: string; mcpSpawnContext?: AutomationMcpSpawnContext }) => Promise<{ ok: true; sessionId: string } | { ok: false; error: string }>
+  /** Private run-owned runtime. The payload is the authored snapshot, never an assembled legacy conversation prompt. */
+  dispatchIsolatedContext?: (input: { automationId: string; generation: number; revision: number; runId: string; claimToken: string;
+    payload: ServerAutomationPayload; environmentVariables: Record<string, string>; mcpSpawnContext?: AutomationMcpSpawnContext }) => Promise<{
+      state: 'started' | 'waiting' | 'needs-attention'; sessionId: string; reason?: string
+    }>
   resumeSession: (input: {
     sessionId: string
     directory: string
@@ -1287,7 +1292,9 @@ async function executeStartedRun(
     if (input.signal?.aborted) throw new TickAbandonedError(name)
   }
   // Never reinterpret a run-owned context policy as legacy conversation delivery.
-  if (payload.contextPolicy) {
+  if (payload.contextPolicy && (!input.dispatchIsolatedContext || automation.payloadVersion !== 6 || !payload.conversation
+    || payload.githubTrigger || payload.scriptCommand !== null || !['claude', 'codex'].includes(payload.agent ?? ''))
+    || automation.payloadVersion === 6 && !payload.contextPolicy) {
     return { outcome: 'ERROR', sessionId: null, failureCode: 'ISOLATED_CONTEXT_UNSUPPORTED' }
   }
   if (input.hostCommandsAllowed === false && (payload.scriptCommand || payload.githubTrigger)) {
@@ -1715,6 +1722,8 @@ async function executeStartedRun(
       }
     }
     if (payload.conversation && (context.connectorPolicy !== 'optional' || context.requiredConnectors.length > 0)) return { outcome: 'ERROR', sessionId: null, failureCode: 'CONVERSATION_POLICY_UNSUPPORTED' }
+    // Optional connector failure must not erase the authenticated run principal on a fresh execution.
+    if (payload.contextPolicy) spawnMcpContext = context
     expectedConnectors = context.requiredConnectors
     if (context.connectorPolicy !== 'none') {
       step('preflight-mcp-connectors')
@@ -1808,12 +1817,29 @@ async function executeStartedRun(
   if (payload.conversation) {
     step('resolve-project-environment')
     const authority = await input.resolveProjectEnvironment({ ...run, conversationSessionId: payload.conversation.sessionId,
-      ...(!mcpContext.value?.mcpConfigProjectId.startsWith('chat:') ? { conversationDirectory: payload.directory } : {}) })
+      ...(payload.contextPolicy || !mcpContext.value?.mcpConfigProjectId.startsWith('chat:') ? { conversationDirectory: payload.directory } : {}) })
     if (!authority.ok) {
       return {
         outcome: 'ERROR', sessionId: null, failureCode: authority.code ?? 'CONVERSATION_TARGET_UNAVAILABLE',
         ...(authority.unreachable ? { unreachable: authority.unreachable } : {}),
       }
+    }
+    if (payload.contextPolicy) {
+      step('dispatch-isolated-context')
+      const dispatched = await input.dispatchIsolatedContext!({ automationId: automation.automationId, generation: automation.generation,
+        revision: automation.revision, ...run, payload, environmentVariables: authority.environmentVariables,
+        ...(spawnMcpContext ? { mcpSpawnContext: spawnMcpContext } : {}) })
+      const degraded = degradedCode ? { degradedCode } : {}
+      if (dispatched.sessionId !== automationExecutionSessionId(run.runId)) return {
+        outcome: 'ERROR', sessionId: null, failureCode: 'AUTOMATION_EXECUTION_IDENTITY_CONFLICT', ...degraded,
+      }
+      if (dispatched.state === 'waiting') return {
+        outcome: 'SKIPPED_GATE', sessionId: dispatched.sessionId, failureCode: 'AUTOMATION_WORKSPACE_BUSY', ...degraded,
+      }
+      if (dispatched.state !== 'started') return {
+        outcome: 'ERROR', sessionId: dispatched.sessionId, failureCode: 'AUTOMATION_START_UNCONFIRMED', ...degraded,
+      }
+      return { outcome: 'WOKE', sessionId: dispatched.sessionId, ...degraded }
     }
   }
   const builtPrompt = buildAutomationPrompt(payload.conversation ? payload.prompt : prompt, scriptOutput)
@@ -2049,7 +2075,7 @@ export async function runServerAutomationTick(
     // 대기 게이트(aplus-dev-studio-desktop #2196): 대상 대화(이어 쓰는 대화, 아니면 직전 회차 대화)가 사용자 답을
     // 기다리면 회차를 claim 해 SKIPPED_GATE + 그 대화 id 로 보고한다 — 실행하지 않은 회차가 이력에 남고,
     // 겹침처럼 매 틱 조용히 미루지 않는다. 보류한 재시도는 이미 시작한 회차라 게이트를 다시 보지 않는다.
-    const waitingSessionId = payload.githubTrigger || retryDue
+    const waitingSessionId = payload.githubTrigger || payload.contextPolicy || retryDue
       ? null
       : previousRunWaitingSessionId(payload.conversation?.sessionId ?? schedule.lastSessionId, input)
     if (!waitingSessionId && !payload.githubTrigger && !payload.conversation
