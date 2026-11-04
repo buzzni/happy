@@ -48,12 +48,14 @@ describe('browserBridgeServer', () => {
             store.close()
         } finally { await server.stop() }
     })
-    it('takes the port over once the process holding it exits', async () => {
+    it.each([false, true])('takes the port over once the process holding it exits (owner recording fails: %s)', async (failOwnerRecording) => {
         const holder = createServer()
         await new Promise<void>(resolve => holder.listen(0, '127.0.0.1', resolve))
         const heldPort = (holder.address() as AddressInfo).port
         const retryBridge = new BrowserBridge({ authToken: TOKEN })
-        const retry = retryBrowserBridgeServer({ bridge: retryBridge, port: heldPort, retryMs: 20 })
+        const retry = retryBrowserBridgeServer({ bridge: retryBridge, port: heldPort, retryMs: 20,
+            onListening: failOwnerRecording ? async () => { throw new Error('owner record is read-only') } : undefined,
+        })
         try {
             await new Promise(resolve => setTimeout(resolve, 60))
             await expect(retryBridge.request('tabs_list', {})).rejects.toMatchObject({ code: 'BRIDGE_PORT_IN_USE' })
