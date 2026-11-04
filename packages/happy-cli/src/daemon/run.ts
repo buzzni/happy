@@ -2791,7 +2791,7 @@ export async function startDaemon(): Promise<void> {
       // Protected/other providers keep their existing path; unknown writers retain custody.
       let standardWorkspace = false;
       try { standardWorkspace = !JSON.parse(env.HAPPY_PROJECT_SANDBOX_CONFIG ?? '{}').checkpointProtection; } catch { /* Existing startup validates malformed config. */ }
-      const workspaceControlId = workspaceReservation?.acquired && !prepared && !scopeReports && args[0] === 'codex' && standardWorkspace
+      const workspaceControlId = workspaceReservation?.acquired && !prepared && !scopeReports && (args[0] === 'codex' || args[0] === 'claude') && standardWorkspace
         ? randomUUID() : null;
       // Owner contact (default OFF): a one-time capability on one more private pipe; null leaves the launch unchanged.
       const ownedSessionId = resumeTargetSessionId ?? env.HAPPY_RECONNECT_SESSION_ID;

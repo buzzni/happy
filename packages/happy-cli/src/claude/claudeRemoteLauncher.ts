@@ -81,6 +81,7 @@ const AUTHENTICATION_RETRY_PROMPT = 'The previous request stopped because the or
 export async function claudeRemoteLauncher(session: Session): Promise<'switch' | 'exit'> {
     logger.debug('[claudeRemoteLauncher] Starting remote launcher');
     const isolatedAutomation = isAutomationExecutionSessionId(session.client.sessionId);
+    const observeWorkspaceExit = isolatedAutomation || session.standaloneDrain?.workspaceExitObservation === true;
 
     // Survives generation restarts within this session; see the call below.
     const lessonObservations = createLessonTurnObservations();
@@ -1008,6 +1009,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     managedSettingsLockdown: session.managedSettingsLockdown,
                     personalClaudeAuth: personalFallback?.identity() ? { oauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? '' } : undefined,
                     managedRun: session.managedRun,
+                    workspaceExitObservation: session.standaloneDrain?.workspaceExitObservation,
+                    onWorkspaceReadinessReady: reader => session.standaloneDrain?.setWorkspaceReadiness(reader),
                     /*
                      * A fresh observer for **this** generation.
                      *
@@ -1017,7 +1020,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                      * process and gets a different observer.
                      */
                     ...(sdkExit ? { providerExitObserver: sdkExit } : {}),
-                    ...(isolatedAutomation ? { onAutomationContextExit: (evidence: NonNullable<Session['automationContextExitEvidence']>) => {
+                    ...(observeWorkspaceExit ? { onAutomationContextExit: (evidence: NonNullable<Session['automationContextExitEvidence']>) => {
                         const previous = session.automationContextExitEvidence;
                         session.automationContextExitEvidence = {
                             foregroundDrained: (previous?.foregroundDrained ?? true) && evidence.foregroundDrained,

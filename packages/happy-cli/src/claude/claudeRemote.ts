@@ -160,6 +160,7 @@ export async function claudeRemote(opts: {
     onAutomationContextExit?: (evidence: NativeAutomationContextExitEvidence) => void,
     /** Observe a manual workspace without changing its memory, hooks, or resume policy. */
     workspaceExitObservation?: boolean,
+    onWorkspaceReadinessReady?: (reader: (() => boolean) | null) => void,
     /** How long the provider gets to leave on its own after its input ends. */
     turnEndInputBudgetMs?: number,
     providerExitObserver?: {
@@ -522,10 +523,12 @@ async function runClaudeRemote(
     let automationResultReceived = false, automationInputExhausted = false;
     let automationExitDeadline: number | null = null;
     const awaitAutomationGroups = async () => {
-        if (!automationExitDeadline || !automationProcesses.length || !opts.providerExitObserver?.exitedCleanly()) return false;
+        if (!automationExitDeadline || !automationProcesses.length || !opts.providerExitObserver) return false;
         while (true) {
-            if (automationProcesses.some(child => child.exitCode !== 0 || child.signalCode !== null || child.killed)) return false;
-            if (automationProcesses.every(child => child.pid && probeProcessGroup(child.pid).kind === 'no-local-trace')) return true;
+            if (automationProcesses.some(child => child.exitCode !== null && child.exitCode !== 0 || child.signalCode !== null || child.killed)) return false;
+            const allExited = automationProcesses.every(child => child.exitCode === 0);
+            if (allExited && !opts.providerExitObserver.exitedCleanly()) return false;
+            if (allExited && automationProcesses.every(child => child.pid && probeProcessGroup(child.pid).kind === 'no-local-trace')) return true;
             if (performance.now() >= automationExitDeadline || opts.signal?.aborted) return false;
             await new Promise(resolve => setTimeout(resolve, 20));
         }
@@ -879,6 +882,9 @@ function readTurnText(content: unknown): string {
      */
     let providerIdle: boolean | null = null;
     let backgroundWaitTimer: ReturnType<typeof setTimeout> | undefined;
+    opts.onWorkspaceReadinessReady?.(observeWorkspaceExit ? () => !queryClosed && automationProcesses.length > 0
+        && automationResultReceived && !thinking && !acceptsActiveInput && providerIdle === true
+        && automationBackgroundTasks?.size === 0 : null);
     const aiAuthObservation = opts.onAiAuthObservationReady && opts.managedRun !== true
         ? observeClaudeQueryAuth(response)
         : null;
@@ -1236,6 +1242,11 @@ function readTurnText(content: unknown): string {
                 opts.nextMessage().then(async (next) => {
                     if (queryClosed) return;
                     if (!next) {
+                        if (observeWorkspaceExit) {
+                            automationInputExhausted = true;
+                            automationExitDeadline = performance.now() + (opts.turnEndInputBudgetMs ?? MANAGED_TURN_END_INPUT_BUDGET_MS);
+                            opts.onInputExhausted?.();
+                        }
                         messages.end();
                     } else {
                         preemptReview();
@@ -1344,6 +1355,7 @@ function readTurnText(content: unknown): string {
         opts.lessonProposalTurn?.cancel();
         opts.signal?.removeEventListener('abort', cancelProposal);
         queryClosed = true;
+        opts.onWorkspaceReadinessReady?.(null);
         acceptsActiveInput = false;
         opts.onActiveInputReady?.(null);
         opts.onSideQuestionChannelReady?.(null);

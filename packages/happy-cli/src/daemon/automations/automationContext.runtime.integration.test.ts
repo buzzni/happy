@@ -39,7 +39,8 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
   { state: 'active', provider: 'codex', encryptionVariant: 'legacy' },
   { state: 'active', provider: 'claude', encryptionVariant: 'dataKey' },
   { state: 'active', provider: 'codex', encryptionVariant: 'dataKey' },
-  { state: 'manual', provider: 'codex', encryptionVariant: 'legacy' }] as const)(
+  { state: 'manual', provider: 'codex', encryptionVariant: 'legacy' },
+  { state: 'manual', provider: 'claude', encryptionVariant: 'legacy' }] as const)(
   'restores a durable $state $provider $encryptionVariant occurrence through the real daemon without replaying or ignoring a stop', async ({ state, provider, encryptionVariant }) => {
   const shouldRun = state !== 'paused'
   vi.stubEnv('HAPPY_SCOPE_FRESH_PROVIDER_STATE', '1')
