@@ -34,7 +34,7 @@ async function seedRun(fixture: SessionWriteScopeFixture, input: Record<string, 
   }, 'registered machine and claimed fixture run')
 }
 
-it('restores a durable deferred occurrence through the real daemon without replaying it', async () => {
+it.each(['active', 'paused'] as const)('restores a durable %s deferred occurrence through the real daemon without replaying or ignoring a stop', async state => {
   vi.stubEnv('HAPPY_SCOPE_FRESH_PROVIDER_STATE', '1')
   vi.stubEnv('HAPPY_SCOPE_PACKAGED_SERVER', undefined)
   vi.stubEnv('HAPPY_SCOPE_INSTALLED_CLI', undefined)
@@ -60,8 +60,12 @@ it('restores a durable deferred occurrence through the real daemon without repla
         reply(200, { projectId: run.projectId, grant: null, bindingStatus: 'DIRECT_OWNER', connectorPolicy: 'optional', requiredConnectors: [] }); return
       }
       if (request.url === '/api/automation/execution-target') {
-        const admission = await fixture.http(`/v1/automation-runs/${runId}/mcp-context`, { machineId: run.machineId, claimToken, executionAdmission: true })
-        if (admission.status !== 200 || admission.body.executionAdmission?.payloadVersion !== 6
+        const admission = await fetch(`${fixture.serverUrl}/v1/automation-runs/${runId}/mcp-context`, { method: 'POST',
+          headers: { Authorization: `Bearer ${fixture.token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ machineId: run.machineId, claimToken, executionAdmission: true }), signal: AbortSignal.timeout(10_000) })
+        if (!admission.ok) { await admission.body?.cancel(); reply(admission.status >= 500 ? 503 : 403, {}); return }
+        const admitted = await admission.json() as any
+        if (admitted.executionAdmission?.payloadVersion !== 6
           || body.conversationSessionId !== run.displaySessionId || body.conversationDirectory !== fixture.project) { reply(403, {}); return }
         reply(200, { executionBindingRequired: false, targetProof: signAutomationExecutionTarget({ automationId: run.automationId,
           projectId: run.projectId, generation: run.generation, revision: run.revision, machineId: run.machineId,
@@ -106,22 +110,35 @@ it('restores a durable deferred occurrence through the real daemon without repla
           conversation: { sessionId: displaySessionId }, contextPolicy: { kind: 'isolated', reference: null } } }))
         .toMatchObject({ state: 'waiting', deferred: true })
       expect(await journal.read(runId)).toMatchObject({ phase: 'registered', deferredDispatch: 'queued' })
+      if (state === 'paused') {
+        const response = await fetch(`${fixture.serverUrl}/v1/projects/${encodeURIComponent(run.projectId)}/automations/${encodeURIComponent(run.automationId)}`, {
+          method: 'PATCH', headers: { Authorization: `Bearer ${fixture.token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ expectedRevision: run.revision, paused: true }), signal: AbortSignal.timeout(10_000) })
+        expect(response.status).toBe(200)
+        expect((await response.json() as any).automation).toMatchObject({ paused: true, generation: run.generation + 1 })
+      }
       await fixture.stopDaemon()
       await fixture.startDaemon()
     } finally { expect(await manual.finish({ submitted: false, tracked: false })).toBe(true) }
     await eventually(async () => {
       await fixture.children()
-      return (await journal.read(runId))?.exitReceipt ? true : undefined
-    }, 'daemon restores, submits and drains the saved automatic occurrence', 45_000)
-    await eventually(async () => {
+      const saved = await journal.read(runId)
+      return state === 'active' ? saved?.exitReceipt ? true : undefined : saved?.cancelledBeforeSubmit ? true : undefined
+    }, 'daemon restores the original execution or preserves the stop before submission', 45_000)
+    const report = await eventually(async () => {
       const feed = await fixture.http(`/v1/sessions/${displaySessionId}/automation-runs`)
-      return feed.body.runs?.[0]?.schedulerStatus === 'COMPLETED' ? feed.body.runs[0] : undefined
+      return feed.body.runs?.[0]?.schedulerStatus === (state === 'active' ? 'COMPLETED' : 'FAILED') ? feed.body.runs[0] : undefined
     }, 'daemon flushes the original run report')
-    expect(await journal.read(runId)).toMatchObject({ phase: 'started', deferredDispatch: 'settled', exitReceipt: { provider: 'claude' } })
+    expect(report).toMatchObject({ id: runId, outcome: state === 'active' ? 'WOKE' : 'ERROR' })
+    if (state === 'active') expect(await journal.read(runId)).toMatchObject({ phase: 'started', deferredDispatch: 'settled', exitReceipt: { provider: 'claude' } })
+    else {
+      expect(await journal.read(runId)).toMatchObject({ phase: 'registered', deferredDispatch: 'settled', cancelledBeforeSubmit: true })
+      expect(await journal.read(runId)).not.toHaveProperty('exitReceipt')
+    }
     expect(calls).toContain('/api/automation/project-environment')
     expect(calls).toContain('/api/automation/mcp-caller-grant')
-    expect(fixture.modelRequests).toHaveLength(1)
-    expect(fixture.modelRequests[0]).toContain(marker)
+    expect(fixture.modelRequests).toHaveLength(state === 'active' ? 1 : 0)
+    if (state === 'active') expect(fixture.modelRequests[0]).toContain(marker)
     const manualAfter = (await fixture.http('/v2/sessions/lookup', { ids: [displaySessionId] })).body.sessions[0]
     expect(decrypt(prepared.encryptionKey, prepared.encryptionVariant, decodeBase64(manualAfter.metadata))).toMatchObject({ claudeSessionId: 'manual-native-keep' })
     const admission = await workspace.beginManualLaunch([fixture.project])
