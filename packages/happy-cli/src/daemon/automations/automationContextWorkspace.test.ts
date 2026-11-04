@@ -68,3 +68,15 @@ test('keeps an unknown automatic owner across coordinator restart and permits an
   const other = join(home, 'other'); await mkdir(other)
   expect(await setup().beginManualLaunch([other])).toMatchObject({ acquired: true })
 })
+
+test('releases the original saved automatic ownership after restart only with all positive exit evidence', async () => {
+  const ownerToken = '62a6d741-550e-465e-b4df-876619327418'
+  expect(await setup().acquireAutomation({ runId: 'r1', roots: [directory], ownerToken })).toMatchObject({ acquired: true })
+  const restarted = setup()
+  for (const field of Object.keys(finished) as Array<keyof typeof finished>) {
+    expect(await restarted.recoverAutomationExit({ runId: 'r1', roots: [directory], ownerToken, evidence: { ...finished, [field]: false } })).toBe(false)
+    expect(await restarted.beginManualLaunch([directory])).toMatchObject({ acquired: false })
+  }
+  expect(await restarted.recoverAutomationExit({ runId: 'r1', roots: [directory], ownerToken, evidence: finished })).toBe(true)
+  expect(await restarted.beginManualLaunch([directory])).toMatchObject({ acquired: true })
+})

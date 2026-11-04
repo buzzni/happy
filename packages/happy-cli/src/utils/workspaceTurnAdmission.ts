@@ -8,6 +8,7 @@ import { readCurrentBootIdSync } from './bootIdentity';
 
 const ownerSchema = z.strictObject({
   token: z.string().uuid(), sessionId: z.string().min(1).max(200), kind: z.enum(['manual', 'manual-launch', 'automation']),
+  controller: z.string().uuid().optional(),
   pid: z.number().int().positive(), bootId: z.string().min(1).nullable(), acquiredAt: z.number().int().nonnegative(),
   roots: z.array(z.string().min(1).refine(isAbsolute)).min(1).max(256),
 });
@@ -35,8 +36,10 @@ export function createWorkspaceTurnAdmission(input: {
   home: string; sessionId: string; kind: 'manual' | 'manual-launch' | 'automation'; roots: readonly string[];
   /** Test seam. Null is unknown, not permission to reclaim. */
   bootId?: string | null;
+  /** Persist before acquiring for an automatic run. Restoring this token permits proven release, never takeover. */
+  ownerToken?: string;
 }) {
-  const token = randomUUID(), roots = [...input.roots];
+  const token = z.string().uuid().parse(input.ownerToken ?? randomUUID()), controller = randomUUID(), roots = [...input.roots];
   const bootId = input.bootId === undefined ? readCurrentBootIdSync() ?? null : input.bootId;
   const directory = join(input.home, 'workspace-turn-admission.v1'), file = join(directory, 'owners.json');
   async function prepare() {
@@ -90,6 +93,7 @@ export function createWorkspaceTurnAdmission(input: {
     return paths;
   }
   return {
+    ownerToken: token,
     async tryAcquire(): Promise<WorkspaceTurnAdmissionResult> {
       await prepare();
       const paths = await canonicalRoots();
@@ -97,21 +101,21 @@ export function createWorkspaceTurnAdmission(input: {
         return await withOwnedFileLock(file + '.lock', async () => {
           const previous = await read();
           const owners = previous.filter(owner => !bootId || !owner.bootId || owner.bootId === bootId);
-          const own = owners.find(owner => owner.token === token);
+          const own = owners.find(owner => owner.token === token && owner.controller === controller);
           if (own) {
             if (JSON.stringify(own.roots) !== JSON.stringify(paths) || own.sessionId !== input.sessionId || own.kind !== input.kind) {
               throw new Error('WORKSPACE_ADMISSION_IDENTITY_CONFLICT');
             }
             return { acquired: true } as const;
           }
-          const blockers = owners.filter(owner => owner.sessionId === input.sessionId ||
+          const blockers = owners.filter(owner => owner.token === token || owner.sessionId === input.sessionId ||
             (owner.kind === 'automation' || input.kind === 'automation') && owner.roots.some(a => paths.some(b => overlaps(a, b))));
           if (blockers.length) {
             const confirmedAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
             return { acquired: false, reason: blockers.some(owner => !confirmedAlive(owner.pid))
               ? 'workspace-owner-unconfirmed' : 'workspace-busy', sessions: [...new Set(blockers.map(owner => owner.sessionId))] } as const;
           }
-          owners.push(ownerSchema.parse({ token, sessionId: input.sessionId, kind: input.kind, pid: process.pid,
+          owners.push(ownerSchema.parse({ token, controller, sessionId: input.sessionId, kind: input.kind, pid: process.pid,
             bootId, roots: paths, acquiredAt: Date.now() }));
           await write(owners);
           return { acquired: true } as const;
@@ -128,7 +132,9 @@ export function createWorkspaceTurnAdmission(input: {
       await prepare();
       return withOwnedFileLock(file + '.lock', async () => {
         const owners = await read();
-        if (!owners.some(owner => owner.token === token)) return false;
+        const own = owners.find(owner => owner.token === token);
+        if (!own) return false;
+        if (own.sessionId !== input.sessionId || own.kind !== input.kind) throw new Error('WORKSPACE_ADMISSION_IDENTITY_CONFLICT');
         await write(owners.filter(owner => owner.token !== token));
         return true;
       });

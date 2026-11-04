@@ -95,3 +95,23 @@ test('refuses a registry with relative roots instead of skipping its claimed wor
   await writeFile(file, JSON.stringify(state), { mode: 0o600 });
   await expect(admission('automation-run:r1', 'automation').tryAcquire()).rejects.toThrow();
 });
+
+test('recovers only release authority from a saved owner token, never permission to start another provider', async () => {
+  const owner = admission('automation-run:r1', 'automation');
+  await owner.tryAcquire();
+  const recovered = createWorkspaceTurnAdmission({ home, sessionId: 'automation-run:r1', kind: 'automation', roots: [workspace],
+    bootId: 'boot-A', ownerToken: owner.ownerToken });
+  expect(await recovered.tryAcquire()).toMatchObject({ acquired: false });
+  expect(await recovered.release(false)).toBe(false);
+  expect((await admission('manual', 'manual').tryAcquire()).acquired).toBe(false);
+  expect(await recovered.release(true)).toBe(true);
+  expect((await admission('manual', 'manual').tryAcquire()).acquired).toBe(true);
+});
+
+test('cannot use a saved token to release another session identity', async () => {
+  const owner = admission('automation-run:r1', 'automation'); await owner.tryAcquire();
+  const other = createWorkspaceTurnAdmission({ home, sessionId: 'automation-run:other', kind: 'automation', roots: [workspace],
+    bootId: 'boot-A', ownerToken: owner.ownerToken });
+  await expect(other.release(true)).rejects.toThrow('WORKSPACE_ADMISSION_IDENTITY_CONFLICT');
+  expect((await admission('manual', 'manual').tryAcquire()).acquired).toBe(false);
+});

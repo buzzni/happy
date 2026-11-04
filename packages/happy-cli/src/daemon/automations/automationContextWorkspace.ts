@@ -3,6 +3,8 @@ import { automationExecutionSessionId } from '@slopus/happy-wire'
 import { createWorkspaceTurnAdmission } from '@/utils/workspaceTurnAdmission'
 
 type ExitEvidence = { providerExitedCleanly: boolean; foregroundDrained: boolean; backgroundDrained: boolean; writeProducersDrained: boolean }
+const drained = (evidence: ExitEvidence) => evidence.providerExitedCleanly && evidence.foregroundDrained
+  && evidence.backgroundDrained && evidence.writeProducersDrained
 
 /** Private daemon host only. A live manual process remains busy even when its last answer looks idle.
  * Preparation reservations cover spawn->tracking. Runtime owners survive process/daemon loss until
@@ -21,10 +23,10 @@ export function createAutomationContextWorkspace(input: {
           return owner.release(!observed.submitted || observed.tracked)
         } }
     },
-    async acquireAutomation(request: { runId: string; roots: readonly string[] }) {
+    async acquireAutomation(request: { runId: string; roots: readonly string[]; ownerToken?: string }) {
       const busy = { acquired: false as const, reason: 'tracked-session-busy' as const }
       if (await input.isTracked(request.roots) !== false) return busy
-      const owner = createWorkspaceTurnAdmission({ home: input.home, sessionId: automationExecutionSessionId(request.runId), kind: 'automation', roots: request.roots })
+      const owner = createWorkspaceTurnAdmission({ home: input.home, sessionId: automationExecutionSessionId(request.runId), kind: 'automation', roots: request.roots, ownerToken: request.ownerToken })
       const admitted = await owner.tryAcquire()
       if (!admitted.acquired) return admitted
       // A manual launch can finish transferring its reservation after the first check but before acquisition.
@@ -38,10 +40,16 @@ export function createAutomationContextWorkspace(input: {
         throw error
       }
       return { acquired: true as const,
+        ownerToken: owner.ownerToken,
         async releaseAfterObservedExit(evidence: ExitEvidence) {
-          return owner.release(evidence.providerExitedCleanly && evidence.foregroundDrained
-            && evidence.backgroundDrained && evidence.writeProducersDrained)
+          return owner.release(drained(evidence))
         } }
+    },
+    /** Only the immutable launch journal plus its owned native/root exit receipt supplies these fields. */
+    async recoverAutomationExit(request: { runId: string; roots: readonly string[]; ownerToken: string; evidence: ExitEvidence }) {
+      const owner = createWorkspaceTurnAdmission({ home: input.home, sessionId: automationExecutionSessionId(request.runId),
+        kind: 'automation', roots: request.roots, ownerToken: request.ownerToken })
+      return owner.release(drained(request.evidence))
     },
   }
 }
