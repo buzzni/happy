@@ -23,9 +23,9 @@ export interface SessionOrgRequirements {
     lookup(): Promise<void>;
 }
 
-/** The organization gate's name for an ACP agent; one Studio has no key for judges as `opencode` does. */
+/** The organization gate's name for an ACP agent; one Studio has no key for is `acp`. */
 export function liteRuntimeAgent(agentName: string): OrgAgent {
-    return agentName === 'gemini' || agentName === 'grok' || agentName === 'openclaw' || agentName === 'opencode' ? agentName : 'opencode';
+    return agentName === 'gemini' || agentName === 'grok' || agentName === 'openclaw' || agentName === 'opencode' ? agentName : 'acp';
 }
 
 export type LiteRuntimeTurn = { kind: 'run'; substituteModel?: string } | { kind: 'refuse'; message: string };
