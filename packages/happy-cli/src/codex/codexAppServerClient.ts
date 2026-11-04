@@ -1540,6 +1540,13 @@ export class CodexAppServerClient {
         return this.finishObservedNativeWriters(budgetMs);
     }
 
+    private workspaceForegroundIdle(proc: ChildProcess | null, threadId: string | null): boolean {
+        return this.connected && !!proc && !!threadId && !this._turnId && !this.pendingTurnCompletion
+            && !this.deferredRawTurnCompletion && this.openCommandExecutionTurns.size === 0
+            && this.outstandingServerRequests === 0 && this.userInputRequests.size === 0 && this.serverRequestTasks.size === 0
+            && this.pending.size === 0 && this.workspaceTurnOperations === 0;
+    }
+
     async finishWorkspaceContext(budgetMs: number): Promise<{
         foregroundDrained: boolean; backgroundDrained: boolean; providerExitedCleanly: boolean;
     }> {
@@ -1547,10 +1554,7 @@ export class CodexAppServerClient {
         if (!Number.isFinite(budgetMs) || budgetMs <= 0 || budgetMs > 30_000) throw new Error('Invalid exit observation budget');
         if (this.automationExitEvidence) return { ...this.automationExitEvidence };
         const deadline = performance.now() + budgetMs, proc = this.process, threadId = this._threadId, epoch = this.processEpoch;
-        const idle = () => this.connected && !!proc && !!threadId && !this._turnId && !this.pendingTurnCompletion
-            && !this.deferredRawTurnCompletion && this.openCommandExecutionTurns.size === 0
-            && this.outstandingServerRequests === 0 && this.userInputRequests.size === 0 && this.serverRequestTasks.size === 0
-            && this.pending.size === 0 && this.workspaceTurnOperations === 0;
+        const idle = () => this.workspaceForegroundIdle(proc, threadId);
         // Unlike an isolated automatic run, a busy manual context must remain usable. Read before sealing.
         if (!idle() || !threadId) return { foregroundDrained: false, backgroundDrained: false, providerExitedCleanly: false };
         await this.backgroundTasks.refresh(threadId);
