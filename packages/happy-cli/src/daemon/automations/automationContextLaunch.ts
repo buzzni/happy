@@ -36,12 +36,36 @@ export interface AutomationContextLaunchDependencies {
   register(request: AutomationContextLaunchRequest, prepared: AutomationContextLaunchRecord['prepared']): Promise<Session>
   /** Must use the daemon's submission guard. Only OwnedStartRefused proves a pre-submit refusal. */
   start(options: SpawnSessionOptions): Promise<SpawnSessionResult>
+  /** 'ended' requires an owned exit receipt, never just PID absence or a disconnected socket. */
   discover(sessionId: string): Promise<'running' | 'ended' | 'unconfirmed'>
 }
 export function createAutomationContextLauncher(deps: AutomationContextLaunchDependencies) {
   const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
   const scope = digest([deps.happyOrigin, deps.accountId, deps.machineId])
-  return { async launch(input: AutomationContextLaunchRequest): Promise<{
+  return {
+    /** Reconcile the immutable old run even after edit/pause/delete; this method never dispatches. */
+    async recover(runId: string): Promise<null | {
+      state: 'not-started' | 'running' | 'ended' | 'needs-attention'; sessionId: string; displaySessionId: string;
+      automationId: string; generation: number; revision: number
+    }> {
+      const sessionId = automationExecutionSessionId(runId)
+      return deps.journal.exclusive(runId, async () => {
+        const record = await deps.journal.read(runId)
+        if (!record) return null
+        if (record.scope !== scope || record.runId !== runId || record.sessionId !== sessionId
+          || record.prepared.body.tag !== sessionId || isAutomationExecutionSessionId(record.displaySessionId)) {
+          throw new Error('AUTOMATION_LAUNCH_IDENTITY_CONFLICT')
+        }
+        const identity = { sessionId, displaySessionId: record.displaySessionId, automationId: record.automationId,
+          generation: record.generation, revision: record.revision }
+        if (record.phase === 'prepared' || record.phase === 'registered') return { ...identity, state: 'not-started' }
+        const observed = await deps.discover(sessionId)
+        if (observed === 'unconfirmed') return { ...identity, state: 'needs-attention' }
+        if (record.phase !== 'started') await deps.journal.write({ ...record, phase: 'started' })
+        return { ...identity, state: observed }
+      })
+    },
+    async launch(input: AutomationContextLaunchRequest): Promise<{
     state: 'started' | 'needs-attention'; sessionId: string; displaySessionId: string
   }> {
     const seed = buildAutomationContextInput(input)

@@ -105,6 +105,47 @@ it('keeps an unknown start pending instead of guessing that absence means it nev
   expect((await f.deps.journal.read('r1'))!.phase).toBe('submitted')
 })
 
+it.each(['running', 'ended', 'unconfirmed'] as const)('recovers the original %s execution after the definition changed without launching again', async observed => {
+  const f = await setup()
+  f.start.mockRejectedValueOnce(new Error('lost-provider-ACK'))
+  await expect(f.launcher.launch(request())).rejects.toThrow('lost-provider-ACK')
+  const edited = request(); edited.revision = 2; edited.generation = 2; edited.payload.prompt = 'new definition'
+  await expect(f.launcher.launch(edited)).rejects.toThrow('AUTOMATION_LAUNCH_IDENTITY_CONFLICT')
+  f.discover.mockResolvedValue(observed)
+  const recovered = await createAutomationContextLauncher(f.deps).recover('r1')
+  expect(recovered).toEqual({ state: observed === 'unconfirmed' ? 'needs-attention' : observed,
+    sessionId: 'automation-run:r1', displaySessionId: 'manual', automationId: 'a1', generation: 1, revision: 1 })
+  expect(f.discover).toHaveBeenCalledExactlyOnceWith('automation-run:r1')
+  expect(f.start).toHaveBeenCalledTimes(1)
+  expect(f.register).toHaveBeenCalledTimes(1)
+})
+
+it('recovers a prepared receipt without claiming that a provider started or retrying registration', async () => {
+  const f = await setup()
+  expect(await f.launcher.recover('missing')).toBeNull()
+  f.register.mockRejectedValueOnce(new Error('registration-ACK-lost'))
+  await expect(f.launcher.launch(request())).rejects.toThrow('registration-ACK-lost')
+  expect(await createAutomationContextLauncher(f.deps).recover('r1')).toMatchObject({
+    state: 'not-started', sessionId: 'automation-run:r1', displaySessionId: 'manual',
+  })
+  expect(f.discover).not.toHaveBeenCalled()
+  expect(f.start).not.toHaveBeenCalled()
+  expect(f.register).toHaveBeenCalledTimes(1)
+})
+
+it('refuses recovery under another account or with a forged execution identity before discovery', async () => {
+  const f = await setup()
+  f.start.mockRejectedValueOnce(new Error('lost-provider-ACK'))
+  await expect(f.launcher.launch(request())).rejects.toThrow()
+  await expect(createAutomationContextLauncher({ ...f.deps, accountId: 'other' }).recover('r1'))
+    .rejects.toThrow('AUTOMATION_LAUNCH_IDENTITY_CONFLICT')
+  const receipt = (await f.deps.journal.read('r1'))!
+  await f.deps.journal.write({ ...receipt, sessionId: 'manual' })
+  await expect(createAutomationContextLauncher(f.deps).recover('r1')).rejects.toThrow('AUTOMATION_LAUNCH_IDENTITY_CONFLICT')
+  expect(f.discover).not.toHaveBeenCalled()
+  expect(f.start).toHaveBeenCalledTimes(1)
+})
+
 it('only retries a start that the trusted dispatch guard proves was refused before submission', async () => {
   const f = await setup()
   f.start.mockRejectedValueOnce(new OwnedStartRefused('daemon-restarting'))
