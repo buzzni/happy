@@ -37,8 +37,8 @@ async function git(root: string, ...args: string[]) {
 /**
  * Open paths in `lsof -Fpn` output. Names that are not paths (pipes, sockets, `anon_inode:[io_uring]`) cannot be
  * inside a worktree. A path lsof could not stat is still compared by its printed name. A process whose own /proc
- * links were denied is returned in `deniedPids` for the caller to confirm; any other unreadable link makes the
- * inventory incomplete.
+ * links were denied is returned in `deniedPids` for the caller to confirm it has exited;
+ * any other unreadable link makes the inventory incomplete.
  */
 export function parseLsofInventory(stdout: string): { paths: string[]; deniedPids: string[] } {
   const paths: string[] = []
@@ -63,13 +63,12 @@ export function parseLsofInventory(stdout: string): { paths: string[]; deniedPid
 }
 
 /**
- * Linux hands the /proc entries of a non-dumpable process (one that changed credentials, like `sshd: user@pts`)
- * to root, so it is as invisible to this user as other users' processes, which `-u` never lists. A denied entry
- * this user still owns was refused by something else (an LSM, for example) and proves nothing about the process.
+ * A live non-dumpable process can still use a worktree even though its /proc links belong to root.
+ * Only ESRCH from a signal-0 existence check confirms that a denied process is gone.
  */
-export async function isUninspectableProcess(pid: string, uid: number): Promise<boolean> {
-  try { return (await lstat(`/proc/${pid}/cwd`)).uid !== uid }
-  catch (error) { return (error as NodeJS.ErrnoException).code === 'ENOENT' }
+export async function hasProcessExited(pid: string): Promise<boolean> {
+  try { process.kill(Number(pid), 0); return false }
+  catch (error) { return (error as NodeJS.ErrnoException).code === 'ESRCH' }
 }
 
 async function livePaths(): Promise<string[]> {
@@ -83,7 +82,7 @@ async function livePaths(): Promise<string[]> {
     .catch(() => { throw new Error('process inventory unavailable') })
   const { paths, deniedPids } = parseLsofInventory(stdout)
   for (const pid of deniedPids) {
-    if (!await isUninspectableProcess(pid, uid)) throw new Error('incomplete process inventory')
+    if (!await hasProcessExited(pid)) throw new Error('incomplete process inventory')
   }
   return paths
 }
