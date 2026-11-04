@@ -1738,7 +1738,9 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             throw new BrowserRuntimeError('STALE_LEASE', 'User lease changed')
         await this.pageViews.drainTask(task.taskId)
         const drainedTask = this.requireTask(task.taskId)
-        if (drainedTask.uncertainActions.length || this.leases.userControl(task.profileId).settling)
+        // Only human page input holds the release. An agent write left uncertain by a takeover is never
+        // cleared, and refusing on it would keep this lease fencing the profile for good.
+        if (drainedTask.uncertainActions.some(id => id.startsWith('page-input-')) || this.leases.userControl(task.profileId).settling)
             throw new BrowserRuntimeError('OUTCOME_UNKNOWN', 'Human input has not safely drained', false, true)
         const stillOwned = this.leases.owner(req.tabId, task.profileId)
         if (stillOwned.leaseEpoch !== req.expectedEpoch || stillOwned.owner.kind !== 'user'
