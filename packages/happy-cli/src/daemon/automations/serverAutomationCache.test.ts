@@ -52,6 +52,48 @@ describe('serverAutomationCache', () => {
   })
   afterEach(() => rmSync(dir, { recursive: true, force: true }))
 
+  it('keeps isolated v6 deltas in a separate cache format without reinterpreting or overwriting the legacy cache', () => {
+    const key = tweetnacl.box.keyPair()
+    const payload = { name: 'Task', prompt: 'Independent occurrence', directory: '/work', agent: 'codex',
+      scriptCommand: null, suppressSilent: false, schedule: { kind: 'interval', minutes: 60 }, conversation: { sessionId: 'manual' },
+      contextPolicy: { kind: 'isolated', reference: null } }
+    const encrypted = bundle(payload, key.publicKey)
+    const delta = (payloadVersion: number, seq: string) => ({ serverTime: 1000, nextSeq: seq, changes: [{
+      seq, automationId: 'a1', revision: 2, generation: 2, kind: 'UPSERT', payloadVersion, ...encrypted,
+      machineKeyVersion: 1, paused: false, enabledAt: 1,
+    }] })
+    const legacy = createServerAutomationCache({ filePath: file })
+    legacy.applySync(delta(4, '1'))
+    const beforeLegacy = readFileSync(file, 'utf8')
+    expect(() => legacy.applySync(delta(6, '2'))).toThrow('automation-sync-invalid')
+    const contextFile = path.join(dir, 'server-automations.context-v6.json')
+    const isolated = createServerAutomationCache({ filePath: contextFile, format: 'isolated-v6' })
+    expect(isolated.read().cursor).toBe(0n)
+    isolated.applySync(delta(6, '2'))
+    isolated.markAcknowledged([{ automationId: 'a1', revision: 2 }])
+    const afterContext = readFileSync(contextFile, 'utf8')
+    const restored = createServerAutomationCache({ filePath: contextFile, format: 'isolated-v6' }).read()
+    expect(restored.automations[0]).toHaveProperty('payloadVersion', 6)
+    expect(openServerAutomationPayload(restored.automations[0], key.secretKey)).toMatchObject({ ok: true, payload })
+    expect(restored.pendingAcknowledgements).toEqual([])
+    expect(() => createServerAutomationCache({ filePath: contextFile }).read()).toThrow('automation-cache-invalid')
+    expect(() => createServerAutomationCache({ filePath: file, format: 'isolated-v6' }).applySync(delta(6, '2'))).toThrow('automation-cache-invalid')
+    expect(readFileSync(file, 'utf8')).toBe(beforeLegacy)
+    expect(readFileSync(contextFile, 'utf8')).toBe(afterContext)
+    expect(afterContext).not.toContain(payload.prompt)
+  })
+
+  it('retains isolated deletion targets until the original cancellation is acknowledged', () => {
+    const key = tweetnacl.box.keyPair(), encrypted = bundle({ name: 'sealed target' }, key.publicKey)
+    const cache = createServerAutomationCache({ filePath: file, format: 'isolated-v6' })
+    cache.applySync({ serverTime: 1000, nextSeq: '1', changes: [{ seq: '1', automationId: 'a1', revision: 2,
+      generation: 2, kind: 'TOMBSTONE', chatDeleted: true, payloadVersion: 6, ...encrypted, machineKeyVersion: 1, paused: true, enabledAt: 1 }] })
+    expect(createServerAutomationCache({ filePath: file, format: 'isolated-v6' }).read().pendingCancellations)
+      .toEqual([expect.objectContaining({ automationId: 'a1', payloadVersion: 6 })])
+    cache.markCancelled!([{ automationId: 'a1', revision: 1 }]); expect(cache.read().pendingCancellations).toHaveLength(1)
+    cache.markCancelled!([{ automationId: 'a1', revision: 2 }]); expect(cache.read().pendingCancellations).toEqual([])
+  })
+
   it('atomically stores only encrypted deltas and advances the durable cursor', () => {
     const keyPair = tweetnacl.box.keyPair()
     const encrypted = bundle({

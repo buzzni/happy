@@ -23,7 +23,7 @@ export interface EncryptedServerAutomation {
   automationId: string
   revision: number
   generation: number
-  payloadVersion: 1 | 4
+  payloadVersion: 1 | 4 | 6
   payloadCiphertext: string
   machineKeyVersion: number
   machineKeyEnvelope: string
@@ -88,8 +88,8 @@ function base64(value: unknown, maxBytes: number, exactBytes?: number): string {
   return encoded
 }
 
-function parseUpsert(row: Record<string, unknown>): EncryptedServerAutomation {
-  if (row.kind !== 'UPSERT' || (row.payloadVersion !== 1 && row.payloadVersion !== 4) || typeof row.paused !== 'boolean') fail()
+function parseUpsert(row: Record<string, unknown>, isolated = false): EncryptedServerAutomation {
+  if (row.kind !== 'UPSERT' || (row.payloadVersion !== 1 && row.payloadVersion !== 4 && !(isolated && row.payloadVersion === 6)) || typeof row.paused !== 'boolean') fail()
   const payloadCiphertext = base64(row.payloadCiphertext, PAYLOAD_MAX_BYTES)
   const machineKeyEnvelope = base64(row.machineKeyEnvelope, AUTHENTICATED_ENVELOPE_BYTES)
   const envelope = Buffer.from(machineKeyEnvelope, 'base64')
@@ -113,7 +113,7 @@ function parseUpsert(row: Record<string, unknown>): EncryptedServerAutomation {
   }
 }
 
-function readState(filePath: string): ServerAutomationCacheState {
+function readState(filePath: string, isolated = false): ServerAutomationCacheState {
   let raw: string
   try {
     raw = readFileSync(filePath, 'utf8')
@@ -125,11 +125,12 @@ function readState(filePath: string): ServerAutomationCacheState {
   }
   try {
     const disk = object(JSON.parse(raw))
-    if (disk.version !== 1 || !Array.isArray(disk.automations) || !Array.isArray(disk.pendingAcknowledgements)) throw new Error()
+    if (disk.version !== (isolated ? 2 : 1) || isolated && disk.isolatedContext !== true
+      || !Array.isArray(disk.automations) || !Array.isArray(disk.pendingAcknowledgements)) throw new Error()
     const unsupportedIds = new Set<string>()
     const supportedEntries = (entries: unknown[]): EncryptedServerAutomation[] => entries.flatMap(entry => {
       const row = object(entry)
-      if (row.payloadVersion !== 5) return [parseUpsert({ ...row, kind: 'UPSERT' })]
+      if (row.payloadVersion !== 5) return [parseUpsert({ ...row, kind: 'UPSERT' }, isolated)]
       const retired = parseUpsert({ ...row, payloadVersion: 4, kind: 'UPSERT' })
       unsupportedIds.add(retired.automationId)
       return []
@@ -163,7 +164,7 @@ function readState(filePath: string): ServerAutomationCacheState {
       }
       state.cursor = 0n
       state.pendingAcknowledgements = state.pendingAcknowledgements.filter(row => !unsupportedIds.has(row.automationId))
-      persist(filePath, state)
+      persist(filePath, state, isolated)
     }
     chmodSync(filePath, 0o600)
     return state
@@ -172,11 +173,12 @@ function readState(filePath: string): ServerAutomationCacheState {
   }
 }
 
-function persist(filePath: string, state: ServerAutomationCacheState): void {
+function persist(filePath: string, state: ServerAutomationCacheState, isolated = false): void {
   mkdirSync(path.dirname(filePath), { recursive: true })
   const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`
   writeFileSync(tmp, JSON.stringify({
-    version: 1,
+    version: isolated ? 2 : 1,
+    ...(isolated ? { isolatedContext: true } : {}),
     conversationSync: true,
     chatLifecycleSync: true,
     cursor: state.cursor.toString(),
@@ -190,15 +192,17 @@ function persist(filePath: string, state: ServerAutomationCacheState): void {
   chmodSync(filePath, 0o600)
 }
 
-export function createServerAutomationCache(options: { filePath: string; now?: () => number }): ServerAutomationCache {
+/** A different on-disk format is required for v6. Use a separate file; neither format migrates or overwrites the other. */
+export function createServerAutomationCache(options: { filePath: string; now?: () => number; format?: 'isolated-v6' }): ServerAutomationCache {
+  const isolated = options.format === 'isolated-v6'
   return {
-    read: () => readState(options.filePath),
+    read: () => readState(options.filePath, isolated),
     applySync(value) {
       const response = object(value)
       const serverTime = timestamp(response.serverTime)
       const nextSeq = sequence(response.nextSeq)
       if (!Array.isArray(response.changes)) fail()
-      const current = readState(options.filePath)
+      const current = readState(options.filePath, isolated)
       if (nextSeq < current.cursor) fail()
 
       const byId = new Map(current.automations.map((automation) => [automation.automationId, automation]))
@@ -216,13 +220,13 @@ export function createServerAutomationCache(options: { filePath: string; now?: (
         const existing = byId.get(automationId)
         if (row.kind === 'TOMBSTONE') {
           if (row.chatDeleted === true) {
-            const cancelled = parseUpsert({ ...row, kind: 'UPSERT' })
+            const cancelled = parseUpsert({ ...row, kind: 'UPSERT' }, isolated)
             if ((cancellations.get(automationId)?.revision ?? 0) <= revision) cancellations.set(automationId, cancelled)
           }
           if (!existing || revision >= existing.revision) byId.delete(automationId)
           continue
         }
-        const upsert = parseUpsert(row)
+        const upsert = parseUpsert(row, isolated)
         if (!existing || upsert.revision > existing.revision) byId.set(automationId, upsert)
         acknowledgements.set(automationId, Math.max(acknowledgements.get(automationId) ?? 0, revision))
       }
@@ -236,25 +240,25 @@ export function createServerAutomationCache(options: { filePath: string; now?: (
         automations: [...byId.values()],
         pendingAcknowledgements,
         pendingCancellations: [...cancellations.values()],
-      })
+      }, isolated)
       return {
         nextSeq,
         acknowledgements: pendingAcknowledgements,
       }
     },
     markCancelled(items) {
-      const state = readState(options.filePath)
+      const state = readState(options.filePath, isolated)
       const completed = new Map(items.map(row => [row.automationId, row.revision]))
-      persist(options.filePath, { ...state, pendingCancellations: (state.pendingCancellations ?? []).filter(row => (completed.get(row.automationId) ?? 0) < row.revision) })
+      persist(options.filePath, { ...state, pendingCancellations: (state.pendingCancellations ?? []).filter(row => (completed.get(row.automationId) ?? 0) < row.revision) }, isolated)
     },
     markAcknowledged(items) {
-      const state = readState(options.filePath)
+      const state = readState(options.filePath, isolated)
       const acknowledged = new Map(items.map((item) => [item.automationId, item.revision]))
       const pendingAcknowledgements = state.pendingAcknowledgements.filter((item) => (
         (acknowledged.get(item.automationId) ?? 0) < item.revision
       ))
       if (pendingAcknowledgements.length === state.pendingAcknowledgements.length) return
-      persist(options.filePath, { ...state, pendingAcknowledgements })
+      persist(options.filePath, { ...state, pendingAcknowledgements }, isolated)
     },
   }
 }
