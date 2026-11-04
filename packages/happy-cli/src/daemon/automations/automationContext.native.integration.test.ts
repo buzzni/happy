@@ -116,6 +116,7 @@ it.each(['claude', 'codex'] as const)('keeps 30 real %s native contexts independ
         const created = await client.startThread({ model: 'gpt-5.1-codex', cwd: workspace, approvalPolicy: 'never', sandbox: 'read-only', mcpServers: {} })
         ids.add(created.threadId)
         expect(await client.sendTurnAndWait(seed.initialPrompt, { turnTimeoutMs: 10_000 })).toEqual({ aborted: false })
+        expect(await client.finishAutomationContext(5_000)).toEqual({ foregroundDrained: true, backgroundDrained: true, providerExitedCleanly: true })
       } finally { await client.disconnect() }
     }
     const captured = requests.filter(request => request.provider === provider)
