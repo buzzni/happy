@@ -20,6 +20,7 @@ import { machineSessionOwnerRoutes } from "./routes/machineSessionOwnerRoutes";
 import { enableMonitoring } from "./utils/enableMonitoring";
 import { enableErrorHandlers } from "./utils/enableErrorHandlers";
 import { enableAuthentication, enableSessionScopeAuthentication } from "./utils/enableAuthentication";
+import { enableNoStoreApiResponses } from "./utils/enableNoStoreApiResponses";
 import { userRoutes } from "./routes/userRoutes";
 import { feedRoutes } from "./routes/feedRoutes";
 import { internalFeedRoutes } from "./routes/internalFeedRoutes";
@@ -130,6 +131,7 @@ export async function startApi(opts: StartApiOptions = {}) {
     enableMonitoring(typed);
     enableErrorHandlers(typed, { skipNotFoundHandler: !!opts.staticDir });
     enableAuthentication(typed);
+    enableNoStoreApiResponses(typed);
 
     // Serve local files when using local storage
     if (isLocalStorage()) {
