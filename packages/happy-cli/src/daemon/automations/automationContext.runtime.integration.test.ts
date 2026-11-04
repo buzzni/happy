@@ -7,6 +7,7 @@ import type { ChildProcess } from 'node:child_process'
 import { readAutomationExecutionRecord,
   sessionCreateBodyHash, type AutomationPayload } from '@slopus/happy-wire'
 import { signAutomationExecutionTarget } from '@slopus/happy-wire/automationExecutionToken'
+import { signChatAutomationLifecycle } from '@slopus/happy-wire/chatAutomationLifecycleToken'
 import { ApiClient } from '@/api/api'
 import { decrypt, decodeBase64 } from '@/api/encryption'
 import { SessionWriteScopeFixture, eventually, type StoredMessage } from '@/testing/sessionWriteScopeFixture'
@@ -42,9 +43,12 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
   { state: 'manual', provider: 'codex', encryptionVariant: 'legacy' },
   { state: 'manual', provider: 'claude', encryptionVariant: 'legacy' },
   { state: 'queued', provider: 'codex', encryptionVariant: 'legacy' },
-  { state: 'queued', provider: 'claude', encryptionVariant: 'legacy' }] as const)(
+  { state: 'queued', provider: 'claude', encryptionVariant: 'legacy' },
+  { state: 'archived', provider: 'codex', encryptionVariant: 'legacy' },
+  { state: 'deleted', provider: 'claude', encryptionVariant: 'legacy' }] as const)(
   'restores a durable $state $provider $encryptionVariant occurrence through the real daemon without replaying or ignoring a stop', async ({ state, provider, encryptionVariant }) => {
-  const shouldRun = state !== 'paused'
+  const chatStopped = state === 'archived' || state === 'deleted'
+  const shouldRun = state !== 'paused' && !chatStopped
   const isManual = state === 'manual' || state === 'queued'
   vi.stubEnv('HAPPY_SCOPE_FRESH_PROVIDER_STATE', '1')
   vi.stubEnv('HAPPY_SCOPE_PACKAGED_SERVER', undefined)
@@ -119,7 +123,8 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
       host: 'fixture', flavor: provider, [fixture.providerIdentityField]: 'manual-native-keep', homeDir: fixture.home, happyHomeDir: fixture.happyHome,
       happyLibDir: fixture.cli, happyToolsDir: fixture.tools }, state: { controlledByUser: false } })
     const displaySessionId = manualSessionId ?? (await fixture.http('/v1/sessions', prepared.body)).body.session.id
-    run = { ...await seedRun(fixture, { accountId: fixture.accountId, displaySessionId, runId, claimToken, directory: fixture.project, secret }), displaySessionId }
+    run = { ...await seedRun(fixture, { accountId: fixture.accountId, displaySessionId, runId, claimToken, directory: fixture.project, secret,
+      ...(chatStopped ? { chat: true } : {}) }), displaySessionId }
     const journal = createAutomationContextLaunchJournal(fixture.happyHome)
     const workspace = createAutomationContextWorkspace({ home: fixture.happyHome, isTracked: async () => false })
     const manual = isManual ? null : await workspace.beginManualLaunch([fixture.project])
@@ -151,6 +156,13 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
         expect(response.status).toBe(200)
         expect((await response.json() as any).automation).toMatchObject({ paused: true, generation: run.generation + 1 })
       }
+      if (chatStopped) {
+        const response = await fetch(`${fixture.serverUrl}/v1/projects/${encodeURIComponent(run.projectId)}/automation-lifecycle`, {
+          method: 'POST', headers: { Authorization: `Bearer ${fixture.token}`, 'Content-Type': 'application/json',
+            'x-chat-automation-proof': signChatAutomationLifecycle({ projectId: run.projectId, actorUserId: 'fixture-owner',
+              bearer: fixture.token, state, secret, now: Date.now() }) }, body: JSON.stringify({ state }), signal: AbortSignal.timeout(10_000) })
+        expect(response.status).toBe(200)
+      }
       if (state === 'queued') {
         const grantCalls = () => calls.filter(path => path === '/api/automation/mcp-caller-grant').length
         await eventually(async () => grantCalls() > 0 ? true : undefined, 'daemon attempts the waiting occurrence during the first manual turn')
@@ -169,15 +181,17 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
     await eventually(async () => {
       await fixture.children()
       const saved = await journal.read(runId)
-      return shouldRun ? saved?.exitReceipt ? true : undefined : saved?.cancelledBeforeSubmit ? true : undefined
+      return shouldRun ? saved?.exitReceipt ? true : undefined
+        : saved?.cancelledBeforeSubmit && saved.deferredDispatch === 'settled' ? true : undefined
     }, 'daemon restores the original execution or preserves the stop before submission', 45_000)
     const report = await eventually(async () => {
       const feed = await fixture.http(`/v1/sessions/${displaySessionId}/automation-runs`)
       const result = feed.body.runs?.[0]
-      return result?.schedulerStatus === (shouldRun ? 'COMPLETED' : 'FAILED')
-        && (state === 'paused' || result.executionExitReceipt) ? result : undefined
+      return result?.schedulerStatus === (shouldRun ? 'COMPLETED' : chatStopped ? 'CANCELLED' : 'FAILED')
+        && (!shouldRun || result.executionExitReceipt) ? result : undefined
     }, 'daemon flushes the original run report')
-    expect(report).toMatchObject({ id: runId, outcome: shouldRun ? 'WOKE' : 'ERROR' })
+    expect(report).toMatchObject({ id: runId, outcome: shouldRun ? 'WOKE' : chatStopped ? null : 'ERROR' })
+    if (chatStopped) expect(report.failureCode).toBe(state === 'archived' ? 'CHAT_ARCHIVED' : 'CHAT_DELETED')
     expect(report.executionExitError).toBeNull()
     if (shouldRun) {
       await eventually(async () => (await journal.read(runId))?.exitReceiptAcknowledged ? true : undefined, 'durable server exit ACK')
@@ -191,8 +205,10 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
       expect(await journal.read(runId)).not.toHaveProperty('exitReceipt')
       expect(report.executionExitReceipt).toBeNull()
     }
-    expect(calls).toContain('/api/automation/project-environment')
-    expect(calls).toContain('/api/automation/mcp-caller-grant')
+    if (!chatStopped) {
+      expect(calls).toContain('/api/automation/project-environment')
+      expect(calls).toContain('/api/automation/mcp-caller-grant')
+    }
     if (!manualSessionId) expect(fixture.modelRequests).toHaveLength(shouldRun ? 1 : 0)
     if (shouldRun) {
       const automaticInputs = fixture.modelRequests.filter(body => body.includes(marker))

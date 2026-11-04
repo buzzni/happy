@@ -8,7 +8,7 @@ if (!process.send || process.argv[2] !== 'serve' || process.env.HOST !== '127.0.
 process.env.SAYCODE_AUTOMATION_ENABLED = 'true';
 const seedSchema = z.discriminatedUnion('action', [z.strictObject({ id: z.string().uuid(), action: z.literal('seed-context'),
   accountId: z.string().min(1), displaySessionId: z.string().min(1), runId: z.string().regex(/^[A-Za-z0-9_-]{1,160}$/),
-  claimToken: z.string().min(1), directory: z.string().min(1), secret: z.string().min(32) }),
+  claimToken: z.string().min(1), directory: z.string().min(1), secret: z.string().min(32), chat: z.boolean().optional() }),
   z.strictObject({ id: z.string().uuid(), action: z.literal('complete-context'), accountId: z.string().min(1),
     machineId: z.string().min(1), runId: z.string().min(1), claimToken: z.string().min(1), reportId: z.string().uuid(), sessionId: z.string().min(1) })]);
 
@@ -31,7 +31,7 @@ process.on('message', async raw => {
     if (!machine) { process.send!({ id: input.id, retry: true }); return; }
     if (!await db.session.findFirst({ where: { id: input.displaySessionId, accountId: input.accountId } })) throw new Error('Fixture display missing');
     process.env.SCRIPT_AUTOMATION_ADMISSION_SECRET = input.secret;
-    const projectId = `context-fixture:${input.accountId}`, automationId = `context-fixture-${input.accountId}`;
+    const projectId = `${input.chat ? 'chat:context-fixture' : 'context-fixture'}:${input.accountId}`, automationId = `context-fixture-${input.accountId}`;
     await db.project.upsert({ where: { id: projectId }, update: {}, create: { id: projectId, accountId: input.accountId,
       name: 'Disposable context fixture', config: { machineId: machine.id }, automationViewerKeyVersion: 1 } });
     const automation = await db.automation.upsert({ where: { id: automationId }, update: {}, create: { id: automationId, projectId,
