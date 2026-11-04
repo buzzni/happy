@@ -7,7 +7,7 @@ import { PassThrough } from 'node:stream'
 import { describe, expect, it, vi } from 'vitest'
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { personalRuntimePaths } from '@/browserRuntime/personalDesktopRuntime'
-import { readPersonalBrowserRuntime, watchPersonalBrowserRuntime } from './personalBrowserRuntime'
+import { forgetInheritedPersonalBrowserEnv, readPersonalBrowserRuntime, watchPersonalBrowserRuntime } from './personalBrowserRuntime'
 
 const issuer = generateKeyPairSync('ed25519')
 const publicKeyPem = issuer.publicKey.export({ type: 'spki', format: 'pem' }).toString()
@@ -279,5 +279,26 @@ describe('watching for the personal runtime installation', () => {
             expect(spawnImpl).toHaveBeenCalledTimes(1)
             void watch.stop()
         } finally { vi.useRealTimers() }
+    })
+})
+
+describe('environment inherited by a restarted daemon', () => {
+    const sessionEnv = (socket: string) => ({ HAPPY_BROWSER_TASK_DESKTOP_LOGIN: '1', HAPPY_BROWSER_TASK_RUNTIME_URL: 'http://127.0.0.1:38787',
+        HAPPY_BROWSER_TASK_BROKER_SOCKET: socket, HAPPY_BROWSER_TASK_PROFILE_ID: 'profile-1', HAPPY_BROWSER_TASK_TENANCY: 'dedicated',
+        HAPPY_BROWSER_TASK_HOST_MODE: 'dedicated-host' })
+
+    it('forgets the personal runtime session variables a previous daemon or its session passed on', () => {
+        const inherited: NodeJS.ProcessEnv = { ...env, ...sessionEnv(paths.brokerSocket) }
+        expect(forgetInheritedPersonalBrowserEnv(inherited, 'darwin', '/Users/u')).toBe(true)
+        expect(inherited).toEqual(env)
+    })
+
+    it('keeps an installer-managed host configuration and every platform without a personal runtime', () => {
+        const managed: NodeJS.ProcessEnv = { ...env, ...sessionEnv('/run/abp/broker.sock') }
+        expect(forgetInheritedPersonalBrowserEnv(managed, 'darwin', '/Users/u')).toBe(false)
+        expect(managed.HAPPY_BROWSER_TASK_RUNTIME_URL).toBe('http://127.0.0.1:38787')
+        const linux: NodeJS.ProcessEnv = { ...env, ...sessionEnv(paths.brokerSocket) }
+        expect(forgetInheritedPersonalBrowserEnv(linux, 'linux', '/Users/u')).toBe(false)
+        expect(linux.HAPPY_BROWSER_TASK_BROKER_SOCKET).toBe(paths.brokerSocket)
     })
 })
