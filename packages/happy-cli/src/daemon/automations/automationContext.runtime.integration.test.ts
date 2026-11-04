@@ -470,3 +470,87 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
     finally { vi.unstubAllEnvs() }
   }
 }, 180_000)
+
+it.each(['claude', 'codex'] as const)('keeps a deleted active %s occurrence unreplayed and does not release custody from a stop ACK', async provider => {
+  vi.stubEnv('HAPPY_SCOPE_FRESH_PROVIDER_STATE', '1')
+  vi.stubEnv('HAPPY_SCOPE_PACKAGED_SERVER', undefined)
+  vi.stubEnv('HAPPY_SCOPE_INSTALLED_CLI', undefined)
+  let release!: () => void
+  const responseGate = new Promise<void>(resolve => { release = resolve })
+  const fixture = new SessionWriteScopeFixture({ provider, encryptionVariant: 'legacy', automationContextHost: true,
+    serverEntry: 'sources/testing/automationContextFixture.ts', browserBridgeHost: '::1', beforeModelResponse: () => responseGate })
+  let failure: unknown
+  try {
+    await fixture.start()
+    const api = await ApiClient.create({ token: fixture.token, encryption: { type: 'legacy', secret: fixture.seed } })
+    const manualMetadata = { path: fixture.project, host: 'fixture',
+      flavor: provider, [fixture.providerIdentityField]: 'manual-native-keep', homeDir: fixture.home, happyHomeDir: fixture.happyHome,
+      happyLibDir: fixture.cli, happyToolsDir: fixture.tools, manualGoal: 'keep-original-goal' }
+    const display = api.prepareSessionCreation({ tag: `display-${randomUUID()}`, metadata: manualMetadata, state: { controlledByUser: false } })
+    const displaySessionId = (await fixture.http('/v1/sessions', display.body)).body.session.id as string
+    await fixture.session(displaySessionId)
+    const manualMarker = `scope-marker-manual-${randomUUID()}`
+    await fixture.send(displaySessionId, manualMarker)
+    const before = (await fixture.http('/v2/sessions/lookup', { ids: [displaySessionId] })).body.sessions[0]
+    const pendingBefore = await fixture.messages(displaySessionId)
+    const runId = `cancel-${randomUUID()}`, claimToken = randomBytes(24).toString('hex'), secret = randomBytes(32).toString('hex')
+    const info = await seedRun(fixture, { accountId: fixture.accountId, displaySessionId, runId, claimToken, secret, directory: fixture.project, chat: true })
+    const journal = createAutomationContextLaunchJournal(fixture.happyHome)
+    const workspace = createAutomationContextWorkspace({ home: fixture.happyHome, isTracked: async () => false })
+    let child: ChildProcess | undefined, starts = 0
+    const host = createAutomationContextHost({ accountId: fixture.accountId, machineId: info.machineId, happyOrigin: fixture.serverUrl, api, journal, workspace,
+      runtimeStore: createServerAutomationRuntimeStore({ filePath: join(fixture.happyHome, 'active-cancel.test.json') }),
+      reportExit: async () => { throw new Error('Forced stop must not report a positive exit') }, heartbeat: async () => ({ ok: true }),
+      log: message => fixture.logs.push(message), resolveContext: async () => ({ environmentVariables: {} }),
+      transportForRun: async () => createAutomationContextTransport({ serverUrl: fixture.serverUrl, token: fixture.token, machineId: info.machineId, runId, claimToken,
+        authorize: async target => {
+          const admitted = await fixture.http(`/v1/automation-runs/${runId}/mcp-context`, { machineId: info.machineId, claimToken, executionAdmission: true })
+          expect(admitted.body.executionAdmission).toMatchObject({ payloadVersion: 6, generation: info.generation, revision: info.revision })
+          return { executionBindingRequired: false, targetProof: signAutomationExecutionTarget({ automationId: info.automationId, projectId: info.projectId,
+            runId, generation: info.generation, revision: info.revision, machineId: info.machineId, machineAccountId: fixture.accountId,
+            displaySessionId, createBodyHash: await sessionCreateBodyHash(target.body), executionBindingRequired: false, bearer: fixture.token, secret, now: Date.now() }) }
+        } }),
+      start: async (options, _context, observeChild) => {
+        starts++; child = fixture.launchContextSession(options); observeChild(child)
+        return { type: 'success', sessionId: options.reconnectEnvironment!.HAPPY_RECONNECT_SESSION_ID }
+      },
+      stopExecution: async target => {
+        expect(target).toEqual({ sessionId: `automation-run:${runId}`, directory: fixture.project })
+        const stopped = await fixture.control('/stop-session', { sessionId: target.sessionId })
+        expect(stopped.body.stopped).toBe(true)
+        await eventually(async () => child!.exitCode !== null || child!.signalCode !== null ? true : undefined, 'owned active root exits after Chat deletion', 15_000)
+      },
+      discover: async () => child?.exitCode === null && child.signalCode === null ? 'running' : 'unconfirmed' })
+    const marker = `scope-marker-active-${randomUUID()}`
+    const input = { automationId: info.automationId, generation: info.generation, revision: info.revision, runId, claimToken, environmentVariables: {},
+      payload: { name: 'Active cancellation', agent: provider, directory: fixture.project, model: fixture.modelName, prompt: `Return ${marker} only.`,
+        scriptCommand: null, suppressSilent: false, schedule: { kind: 'interval' as const, minutes: 60 }, conversation: { sessionId: displaySessionId },
+        contextPolicy: { kind: 'isolated' as const, reference: null } } }
+    expect(await host.dispatch(input)).toHaveProperty('state', 'started')
+    await eventually(async () => fixture.modelRequests.some(body => body.includes(marker)) ? true : undefined, 'real native turn awaits its model response')
+    const deleted = await fetch(`${fixture.serverUrl}/v1/projects/${encodeURIComponent(info.projectId)}/automation-lifecycle`, {
+      method: 'POST', headers: { Authorization: `Bearer ${fixture.token}`, 'Content-Type': 'application/json',
+        'x-chat-automation-proof': signChatAutomationLifecycle({ projectId: info.projectId, actorUserId: 'fixture-owner', state: 'deleted',
+          bearer: fixture.token, secret, now: Date.now() }) }, body: JSON.stringify({ state: 'deleted' }), signal: AbortSignal.timeout(10_000) })
+    expect(deleted.status).toBe(200); await deleted.body?.cancel()
+    expect(await host.cancelAutomation({ automationId: info.automationId, generation: info.generation + 1, revision: info.revision + 1 })).toBe(false)
+    expect(child!.killed).toBe(false)
+    expect(await host.recover(runId)).toHaveProperty('state', 'needs-attention')
+    expect(await journal.read(runId)).not.toHaveProperty('exitReceipt')
+    expect(await workspace.beginManualLaunch([fixture.project])).toHaveProperty('acquired', false)
+    expect(await host.dispatch(input)).toHaveProperty('sessionId', `automation-run:${runId}`)
+    expect(starts).toBe(1); expect(fixture.modelRequests).toHaveLength(1)
+    expect(fixture.modelRequests[0]).not.toContain(manualMarker)
+    expect((await fixture.http('/v2/sessions/lookup', { ids: [displaySessionId] })).body.sessions[0]).toEqual(before)
+    expect(await fixture.messages(displaySessionId)).toEqual(pendingBefore)
+    const feed = await fixture.http(`/v1/sessions/${displaySessionId}/automation-runs`)
+    expect(feed.body.runs[0]).toMatchObject({ id: runId, schedulerStatus: 'CANCELLED', executionExitReceipt: null })
+  } catch (error) {
+    failure = new Error(`Active cancellation failed (${provider}):\n${await fixture.diagnostics().catch(() => 'Diagnostics unavailable')}`, { cause: error })
+  } finally {
+    release()
+    try { await fixture.close() } catch (error) { failure = failure ? new AggregateError([failure, error]) : error }
+    vi.unstubAllEnvs()
+  }
+  if (failure) throw failure
+}, 180_000)
