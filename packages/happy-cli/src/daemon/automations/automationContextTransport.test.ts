@@ -112,16 +112,24 @@ it('does not confirm an unobserved child or replay it after a spawn ACK without 
   const f = await setup(), directory = join(home, 'workspace'); await mkdir(directory)
   f.input.payload.directory = directory
   const workspace = createAutomationContextWorkspace({ home, isTracked: async () => false })
+  const resolveContext = vi.fn(async () => {
+    expect(await workspace.beginManualLaunch([directory])).toHaveProperty('acquired', false)
+    return { environmentVariables: { CURRENT_AUTHORITY: 'renewed' } }
+  })
   const host = createAutomationContextHost({ ...f.deps, workspace,
     reportExit: async () => { throw new Error('Unexpected unobserved exit report') },
     runtimeStore: createServerAutomationRuntimeStore({ filePath: join(home, 'runtime.json') }),
     transportForRun: async () => f.transport,
-    resolveContext: async () => ({ environmentVariables: {} }), heartbeat: async () => ({ ok: true }), log: vi.fn(),
+    resolveContext, heartbeat: async () => ({ ok: true }), log: vi.fn(),
     start: f.start })
-  await expect(host.dispatch({ ...f.input, environmentVariables: {} })).rejects.toThrow('AUTOMATION_CHILD_OBSERVATION_UNCONFIRMED')
+  await expect(host.dispatch({ ...f.input, environmentVariables: { EXPIRED_AUTHORITY: 'old' } })).rejects.toThrow('AUTOMATION_CHILD_OBSERVATION_UNCONFIRMED')
+  expect(resolveContext).toHaveBeenCalledExactlyOnceWith(f.input)
+  expect(f.start).toHaveBeenCalledWith(expect.objectContaining({ environmentVariables: { CURRENT_AUTHORITY: 'renewed' } }),
+    { environmentVariables: { CURRENT_AUTHORITY: 'renewed' } }, expect.any(Function))
   expect(await f.deps.journal.read('r1')).toHaveProperty('phase', 'submitted')
   expect(await host.dispatch({ ...f.input, environmentVariables: {} })).toHaveProperty('state', 'needs-attention')
   expect(f.start).toHaveBeenCalledOnce()
+  expect(resolveContext).toHaveBeenCalledOnce()
   expect(await workspace.beginManualLaunch([directory])).toHaveProperty('acquired', false)
 })
 

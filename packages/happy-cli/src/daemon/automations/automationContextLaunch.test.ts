@@ -70,6 +70,38 @@ it('keeps a workspace-busy run unsubmitted and retries its original preparation 
   expect(await f.workspace.beginManualLaunch([f.directory])).toMatchObject({ acquired: false })
 })
 
+it.each(['AUTOMATION_AUTHORITY_REVOKED', 'AUTOMATION_CONTEXT_REQUEST_UNCONFIRMED'])('rechecks authority after workspace admission without submitting on %s', async code => {
+  const f = await workspaceSetup()
+  let authorized = true
+  const acquire = f.workspace.acquireAutomation.bind(f.workspace)
+  vi.spyOn(f.workspace, 'acquireAutomation').mockImplementationOnce(async input => {
+    const result = await acquire(input)
+    authorized = false
+    return result
+  })
+  const beforeStart = vi.fn(async (input: AutomationContextLaunchRequest) => {
+    expect(input).toEqual(f.input)
+    if (!authorized) throw new Error(code)
+  })
+  const deps = { ...f.deps, beforeStart }
+  const launcher = createAutomationContextLauncher(deps)
+  await expect(launcher.launch(f.input)).rejects.toThrow(code)
+  expect(beforeStart).toHaveBeenCalledOnce()
+  expect(f.start).not.toHaveBeenCalled()
+  const original = (await f.deps.journal.read('r1'))!
+  expect(original.phase).toBe('registered')
+  const manual = await f.workspace.beginManualLaunch([f.directory])
+  expect(manual.acquired).toBe(true)
+  if (!manual.acquired) throw new Error('workspace was not released')
+  await manual.finish({ submitted: false, tracked: false })
+  authorized = true
+  expect(await launcher.launch(f.input)).toHaveProperty('state', 'started')
+  expect(f.prepare).toHaveBeenCalledOnce()
+  expect((await f.deps.journal.read('r1'))!.prepared).toEqual(original.prepared)
+  expect(f.start).toHaveBeenCalledOnce()
+  expect(beforeStart).toHaveBeenCalledTimes(2)
+})
+
 it('holds an unknown native start across restart and releases only after a durable owned exit', async () => {
   const f = await workspaceSetup()
   f.start.mockRejectedValueOnce(new Error('lost-start-ACK'))

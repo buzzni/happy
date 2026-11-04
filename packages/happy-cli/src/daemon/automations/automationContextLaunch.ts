@@ -49,6 +49,8 @@ export interface AutomationContextLaunchDependencies {
   register(request: AutomationContextLaunchRequest, prepared: AutomationContextLaunchRecord['prepared']): Promise<Session>
   /** Append with the stable localId and return the stored ciphertext, including on an idempotent replay. */
   persistSeed(session: Session, message: AutomationContextLaunchRecord['prepared']['seedMessage']): Promise<{ seq: number; localId: string; content: string }>
+  /** Refresh authority after workspace waiting, while failure still proves no provider submission. */
+  beforeStart?(request: AutomationContextLaunchRequest): Promise<void>
   /** Must use the daemon's submission guard. Only OwnedStartRefused proves a pre-submit refusal. */
   start(options: SpawnSessionOptions): Promise<SpawnSessionResult>
   /** Only positively tracked runtime liveness; termination comes from the durable private exit receipt. */
@@ -275,6 +277,8 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
       const options: SpawnSessionOptions = { directory, agent, model: model ?? undefined, effort: effort ?? undefined,
         initialPrompt: seed.initialPrompt, initialPromptLocalId: `happy-automation:${runId}`, exitAfterFirstTurn: true,
         reconnectEnvironment }
+      try { await deps.beforeStart?.(structuredClone(input)) }
+      catch (error) { await releaseWorkspace(record, true); throw error }
       record = { ...record, phase: 'submitted' }
       try { await deps.journal.write(record) }
       catch (error) { await releaseWorkspace(record, true); throw error }

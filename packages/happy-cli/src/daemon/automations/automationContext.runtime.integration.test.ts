@@ -289,7 +289,13 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
         api, journal, workspace,
         runtimeStore: createServerAutomationRuntimeStore({ filePath: join(fixture.happyHome, 'context-runtime.test.json') }),
         heartbeat: async () => { throw new Error('Unexpected fixture deferred renewal') },
-        resolveContext: async () => { throw new Error('Unexpected fixture authority recovery') },
+        resolveContext: async () => {
+          const context = await fixture.http(`/v1/automation-runs/${runId}/mcp-context`, { machineId, claimToken, executionAdmission: true })
+          expect(context.status).toBe(200)
+          expect(context.body.executionAdmission).toMatchObject({ generation: info.generation, revision: info.revision,
+            machineAccountId: fixture.accountId, payloadVersion: 6 })
+          return { environmentVariables: {} }
+        },
         log: message => fixture.failures.push(message), transportForRun: async () => createAutomationContextTransport({
           serverUrl: fixture.serverUrl, token: fixture.token, machineId, runId, claimToken, authorize: async target => {
           const context = await fixture.http(`/v1/automation-runs/${runId}/mcp-context`, { machineId, claimToken, executionAdmission: true })

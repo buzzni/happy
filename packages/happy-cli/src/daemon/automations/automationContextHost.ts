@@ -46,6 +46,7 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
         try { return await current.persistSeed(session, message) }
         finally { transport = null }
       },
+      beforeStart: async run => { context = await deps.resolveContext(run) },
       start: async options => {
         if (!context || options.agent !== 'claude' && options.agent !== 'codex') throw new OwnedStartRefused('validation-error')
         const provider = options.agent
