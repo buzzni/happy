@@ -1,6 +1,6 @@
 import { expect, it, vi } from 'vitest'
 import { randomBytes, randomUUID } from 'node:crypto'
-import { resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { ChildProcess } from 'node:child_process'
 import { readAutomationExecutionRecord,
   sessionCreateBodyHash, type AutomationPayload } from '@slopus/happy-wire'
@@ -9,9 +9,9 @@ import { ApiClient } from '@/api/api'
 import { decrypt, decodeBase64 } from '@/api/encryption'
 import { SessionWriteScopeFixture, eventually, type StoredMessage } from '@/testing/sessionWriteScopeFixture'
 import { createAutomationContextLaunchJournal } from './automationContextLaunchJournal'
-import { createAutomationContextLauncher } from './automationContextLaunch'
-import { observeAutomationContextChild } from '@/utils/automationContextExit'
+import { createAutomationContextHost } from './automationContextHost'
 import { createAutomationContextTransport } from './automationContextTransport'
+import { createServerAutomationRuntimeStore } from './serverAutomationRuntimeStore'
 import { createAutomationContextWorkspace } from './automationContextWorkspace'
 
 async function seedRun(fixture: SessionWriteScopeFixture, input: Record<string, unknown>): Promise<any> {
@@ -76,10 +76,14 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
         schedule: { kind: 'interval', minutes: 60 }, conversation: { sessionId: displaySessionId },
         contextPolicy: { kind: 'isolated', reference: null } }
       let child: ChildProcess | undefined
-      let observedExit: Promise<boolean> | undefined
       const exitEvidence: unknown[] = []
-      const transport = createAutomationContextTransport({ serverUrl: fixture.serverUrl, token: fixture.token, machineId,
-        runId, claimToken, authorize: async target => {
+      const host = createAutomationContextHost({ accountId: fixture.accountId, machineId, happyOrigin: fixture.serverUrl,
+        api, journal, workspace,
+        runtimeStore: createServerAutomationRuntimeStore({ filePath: join(fixture.happyHome, 'context-runtime.test.json') }),
+        heartbeat: async () => { throw new Error('Unexpected fixture deferred renewal') },
+        resolveContext: async () => { throw new Error('Unexpected fixture authority recovery') },
+        log: message => fixture.failures.push(message), transportForRun: async () => createAutomationContextTransport({
+          serverUrl: fixture.serverUrl, token: fixture.token, machineId, runId, claimToken, authorize: async target => {
           const context = await fixture.http(`/v1/automation-runs/${runId}/mcp-context`, { machineId, claimToken, executionAdmission: true })
           expect(context.status).toBe(200)
           expect(context.body.executionAdmission).toMatchObject({ generation: info.generation, revision: info.revision, machineAccountId: fixture.accountId, payloadVersion: 6 })
@@ -87,13 +91,10 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
             projectId: info.projectId, runId, generation: info.generation, revision: info.revision, machineId, machineAccountId: fixture.accountId,
             displaySessionId, createBodyHash: await sessionCreateBodyHash(target.body), executionBindingRequired: false,
             bearer: fixture.token, secret, now: Date.now() }) }
-        } })
-      const launcher = createAutomationContextLauncher({ accountId: fixture.accountId, machineId, happyOrigin: fixture.serverUrl,
-        api, journal, workspace, ...transport, start: async options => {
+        } }), start: async (options, _context, observeChild) => {
           expect(await workspace.beginManualLaunch([fixture.project])).toHaveProperty('acquired', false)
           child = fixture.launchContextSession(options)
-          observedExit = observeAutomationContextChild({ child, sessionId: options.reconnectEnvironment!.HAPPY_RECONNECT_SESSION_ID, provider,
-            persist: () => launcher.recordOwnedExit({ runId, sessionId: options.reconnectEnvironment!.HAPPY_RECONNECT_SESSION_ID, provider }) })
+          observeChild(child)
           child.on('message', message => { if ((message as { type?: unknown })?.type === 'automation-context-exit') exitEvidence.push(message) })
           await eventually(async () => {
             if (child!.exitCode !== null && child!.exitCode !== 0) throw new Error('Native fixture CLI failed')
@@ -106,12 +107,12 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
           }, 'real native identity', 60_000)
           return { type: 'success', sessionId: options.reconnectEnvironment!.HAPPY_RECONNECT_SESSION_ID }
         }, discover: async () => child?.exitCode === null ? 'running' : 'unconfirmed' })
-      expect(await launcher.launch({ automationId: info.automationId, generation: info.generation, revision: info.revision, runId, claimToken, payload }))
+      expect(await host.dispatch({ automationId: info.automationId, generation: info.generation, revision: info.revision, runId, claimToken, payload, environmentVariables: {} }))
         .toMatchObject({ state: 'started', displaySessionId })
       await eventually(async () => child!.exitCode === 0 ? true : child!.exitCode === null ? undefined : Promise.reject(new Error('Native CLI exit failed')),
         'native CLI natural exit and message flush', 60_000)
-      expect(await observedExit).toBe(true)
-      expect(await launcher.recover(runId)).toHaveProperty('state', 'ended')
+      await eventually(async () => (await journal.read(runId))?.exitReceipt ? true : undefined, 'durable owned native exit receipt')
+      expect(await host.recover(runId)).toHaveProperty('state', 'ended')
       const manualAdmission = await workspace.beginManualLaunch([fixture.project])
       expect(manualAdmission.acquired).toBe(true)
       if (!manualAdmission.acquired) throw new Error('Owned native exit did not release the workspace')

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { createServer, type Server } from 'node:http'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AutomationPayload } from '@slopus/happy-wire'
@@ -8,6 +8,9 @@ import { ApiClient } from '@/api/api'
 import { createAutomationContextLaunchJournal } from './automationContextLaunchJournal'
 import { createAutomationContextLauncher } from './automationContextLaunch'
 import { createAutomationContextAuthorizer, createAutomationContextTransport } from './automationContextTransport'
+import { createAutomationContextHost } from './automationContextHost'
+import { createAutomationContextWorkspace } from './automationContextWorkspace'
+import { createServerAutomationRuntimeStore } from './serverAutomationRuntimeStore'
 
 let home: string, server: Server, origin: string
 let seed: { localId: string; content: string } | null, stored: Record<string, unknown> | null
@@ -87,6 +90,22 @@ it('registers and stores the exact E2EE seed over authenticated HTTP before subm
   expect(seed?.localId).toBe('automation-seed:r1')
   expect(seed?.content).not.toContain(f.input.payload.prompt)
   expect(f.start).toHaveBeenCalledOnce()
+})
+
+it('does not confirm an unobserved child or replay it after a spawn ACK without the owned observation pipe', async () => {
+  const f = await setup(), directory = join(home, 'workspace'); await mkdir(directory)
+  f.input.payload.directory = directory
+  const workspace = createAutomationContextWorkspace({ home, isTracked: async () => false })
+  const host = createAutomationContextHost({ ...f.deps, workspace,
+    runtimeStore: createServerAutomationRuntimeStore({ filePath: join(home, 'runtime.json') }),
+    transportForRun: async () => f.transport,
+    resolveContext: async () => ({ environmentVariables: {} }), heartbeat: async () => ({ ok: true }), log: vi.fn(),
+    start: f.start })
+  await expect(host.dispatch({ ...f.input, environmentVariables: {} })).rejects.toThrow('AUTOMATION_CHILD_OBSERVATION_UNCONFIRMED')
+  expect(await f.deps.journal.read('r1')).toHaveProperty('phase', 'submitted')
+  expect(await host.dispatch({ ...f.input, environmentVariables: {} })).toHaveProperty('state', 'needs-attention')
+  expect(f.start).toHaveBeenCalledOnce()
+  expect(await workspace.beginManualLaunch([directory])).toHaveProperty('acquired', false)
 })
 
 it('refuses a different claim before issuing a proof or performing a registration request', async () => {
