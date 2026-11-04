@@ -143,7 +143,7 @@ it('reads run records from the original display chat with stable pagination and 
     expect(page.runs).toEqual([expect.objectContaining({ id: 'r2', displaySessionId: 'manual', executionSessionId: 'automation-run:r2',
       schedulerStatus: 'RUNNING' })]);
     expect(page.nextCursor).toEqual(expect.any(String));
-    for (const secret of ['claimTokenHash', 'claim-r2', 'executionCreateBodyHash', 'payloadCiphertext']) expect(first.body).not.toContain(secret);
+    for (const secret of ['claimTokenHash', 'claim-r2', 'executionCreateBodyHash', 'payloadCiphertext', 'encrypted-new-context-r2']) expect(first.body).not.toContain(secret);
     const second = await app.inject({ method: 'GET', url: `/v1/sessions/manual/automation-runs?limit=1&cursor=${encodeURIComponent(page.nextCursor)}`,
       headers: { authorization: `Bearer ${bearer}` } });
     expect(second.statusCode, second.body).toBe(200);
@@ -245,12 +245,13 @@ it('reads only run-owned encrypted evidence with a fixed sequence ceiling and im
   const registered = await register();
   const execution = registered.session.id;
   await client.sessionMessage.createMany({ data: [
-    { sessionId: execution, seq: 1, localId: 'automation-evidence:r1:start', content: { t: 'encrypted', c: 'start-ciphertext' } },
-    { sessionId: execution, seq: 2, localId: 'tool-output', content: { t: 'encrypted', c: 'PRIVATE_TOOL_HISTORY' } },
-    { sessionId: execution, seq: 3, localId: 'automation-evidence:r1:final', content: { t: 'encrypted', c: 'final-ciphertext' } },
-    { sessionId: execution, seq: 4, localId: 'automation-evidence:r1:end', content: { t: 'encrypted', c: 'end-ciphertext' } },
+    { sessionId: execution, seq: 1, localId: 'automation-seed:r1', content: { t: 'encrypted', c: 'question-ciphertext' } },
+    { sessionId: execution, seq: 2, localId: 'automation-evidence:r1:start', content: { t: 'encrypted', c: 'start-ciphertext' } },
+    { sessionId: execution, seq: 3, localId: 'tool-output', content: { t: 'encrypted', c: 'PRIVATE_TOOL_HISTORY' } },
+    { sessionId: execution, seq: 4, localId: 'automation-evidence:r1:final', content: { t: 'encrypted', c: 'final-ciphertext' } },
+    { sessionId: execution, seq: 5, localId: 'automation-evidence:r1:end', content: { t: 'encrypted', c: 'end-ciphertext' } },
   ] });
-  await client.session.update({ where: { id: execution }, data: { seq: 4, metadata: 'mutable-native-id' } });
+  await client.session.update({ where: { id: execution }, data: { seq: 5, metadata: 'mutable-native-id' } });
   const app = await api();
   try {
     const get = (query = '') => app.inject({ method: 'GET', url: `/v1/sessions/manual/automation-runs/r1/evidence${query}`,
@@ -258,13 +259,14 @@ it('reads only run-owned encrypted evidence with a fixed sequence ceiling and im
     const first = await get('?limit=1'); expect(first.statusCode, first.body).toBe(200);
     expect(first.headers['cache-control']).toBe('no-store');
     expect(first.json()).toMatchObject({ runId: 'r1', executionSessionId: execution, displaySessionId: 'manual',
-      seedMetadataCiphertext: registered.session.metadata, dataEncryptionKey: Buffer.alloc(105, 1).toString('base64'),
-      throughSeq: 4, nextAfterSeq: 1, messages: [{ seq: 1, localId: 'automation-evidence:r1:start' }] });
-    await client.sessionMessage.create({ data: { sessionId: execution, seq: 5, localId: 'automation-evidence:r1:later',
+      seedManifestCiphertext: registered.session.metadata, dataEncryptionKey: Buffer.alloc(105, 1).toString('base64'),
+      seedMessage: { seq: 1, localId: 'automation-seed:r1', content: { c: 'question-ciphertext' } },
+      throughSeq: 5, nextAfterSeq: 2, messages: [{ seq: 2, localId: 'automation-evidence:r1:start' }] });
+    await client.sessionMessage.create({ data: { sessionId: execution, seq: 6, localId: 'automation-evidence:r1:later',
       content: { t: 'encrypted', c: 'later-turn-ciphertext' } } });
-    await client.session.update({ where: { id: execution }, data: { seq: 5 } });
-    const rest = await get('?after_seq=1&through_seq=4&limit=2'); expect(rest.statusCode, rest.body).toBe(200);
-    expect(rest.json()).toMatchObject({ throughSeq: 4, nextAfterSeq: null, messages: [{ seq: 3 }, { seq: 4 }] });
+    await client.session.update({ where: { id: execution }, data: { seq: 6 } });
+    const rest = await get('?after_seq=2&through_seq=5&limit=2'); expect(rest.statusCode, rest.body).toBe(200);
+    expect(rest.json()).toMatchObject({ throughSeq: 5, nextAfterSeq: null, seedMessage: null, messages: [{ seq: 4 }, { seq: 5 }] });
     for (const text of ['PRIVATE_TOOL_HISTORY', 'later-turn-ciphertext', 'mutable-native-id', 'claim-r1']) {
       expect(first.body + rest.body).not.toContain(text);
     }

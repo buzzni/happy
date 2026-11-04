@@ -8,8 +8,7 @@ const eventIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,200}$/);
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 const bytes = (text: string) => new TextEncoder().encode(text).byteLength;
 
-/** Stored inside the original E2EE creation metadata, separately from mutable native IDs. */
-export const automationExecutionSeedSchema = z.strictObject({
+const automationExecutionSeedBaseSchema = z.strictObject({
   version: z.literal(1), automationId: z.string().min(1).max(200), runId: runIdSchema,
   generation: z.number().int().positive(), revision: z.number().int().positive(),
   displaySessionId: z.string().min(1).max(200).refine(id => !isAutomationExecutionSessionId(id)),
@@ -21,14 +20,26 @@ export const automationExecutionSeedSchema = z.strictObject({
     runId: runIdSchema, revision: z.number().int().positive(),
     bytes: z.number().int().min(1).max(AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES), sha256: sha256Schema })).max(1),
   wholeContextTokens: z.literal('unknown'),
-}).superRefine((value, ctx) => {
+});
+function validateSeed(value: Omit<z.infer<typeof automationExecutionSeedBaseSchema>, 'question'>, questionBytes: number, ctx: z.RefinementCtx) {
   if (value.referenceBytes !== value.references.reduce((sum, ref) => sum + ref.bytes, 0)
-    || value.inputBytes < bytes(value.question) + value.referenceBytes
+    || value.inputBytes < questionBytes + value.referenceBytes
     || value.references.some(ref => ref.automationId !== value.automationId || ref.runId === value.runId)) {
     ctx.addIssue({ code: 'custom', message: 'Invalid automation input provenance or byte accounting' });
   }
-});
+}
+/** Full authored question lives in a run-owned E2EE artifact, never the bounded signed creation envelope. */
+export const automationExecutionSeedSchema = automationExecutionSeedBaseSchema.superRefine((value, ctx) => validateSeed(value, bytes(value.question), ctx));
 export type AutomationExecutionSeed = z.infer<typeof automationExecutionSeedSchema>;
+export const automationExecutionSeedManifestSchema = automationExecutionSeedBaseSchema.omit({ question: true }).extend({
+  questionBytes: z.number().int().min(1).max(AUTOMATION_CONTEXT_INPUT_MAX_BYTES), seedSha256: sha256Schema,
+}).superRefine((value, ctx) => validateSeed(value, value.questionBytes, ctx));
+export type AutomationExecutionSeedManifest = z.infer<typeof automationExecutionSeedManifestSchema>;
+export const automationExecutionSeedArtifactSchema = z.strictObject({ type: z.literal('automation-execution-seed'), seed: automationExecutionSeedSchema });
+export function automationExecutionSeedLocalId(runId: string): string {
+  automationExecutionSessionId(runId);
+  return `automation-seed:${runId}`;
+}
 
 export function automationExecutionEvidenceLocalId(runId: string, eventId: string): string {
   automationExecutionSessionId(runId);

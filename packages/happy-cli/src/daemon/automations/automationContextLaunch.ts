@@ -1,10 +1,11 @@
 import { z } from 'zod'
 import { createHash } from 'node:crypto'
-import { SessionExecutionCreateBodySchema, automationExecutionSeedSchema, automationExecutionSessionId, isAutomationExecutionSessionId, type AutomationPayload } from '@slopus/happy-wire'
+import { SessionExecutionCreateBodySchema, automationExecutionSeedSchema, automationExecutionSeedManifestSchema,
+  automationExecutionSeedArtifactSchema, automationExecutionSeedLocalId, automationExecutionSessionId, isAutomationExecutionSessionId, type AutomationPayload } from '@slopus/happy-wire'
 import type { ApiClient } from '@/api/api'
 import type { Metadata, Session } from '@/api/types'
 import type { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/registerCommonHandlers'
-import { decodeBase64, decrypt, encodeBase64 } from '@/api/encryption'
+import { decodeBase64, decrypt, encrypt, encodeBase64 } from '@/api/encryption'
 import { createSessionMetadata } from '@/utils/createSessionMetadata'
 import { buildReconnectSessionEnvironment, RECONNECT_FRESH_LAUNCH_ENV } from '../reconnectSessionEnv'
 import { OwnedStartRefused } from '../ownedSpawn'
@@ -15,7 +16,8 @@ export const automationContextLaunchRecordSchema = z.strictObject({
   automationId: z.string().min(1).max(200), generation: z.number().int().positive(), revision: z.number().int().positive(),
   runId: z.string().min(1).max(160), displaySessionId: z.string().min(1).max(200),
   phase: z.enum(['prepared', 'registered', 'submitted', 'started']),
-  prepared: z.strictObject({ body: SessionExecutionCreateBodySchema, encryptionKey: z.string().length(44), encryptionVariant: z.enum(['legacy', 'dataKey']) }),
+  prepared: z.strictObject({ body: SessionExecutionCreateBodySchema, encryptionKey: z.string().length(44), encryptionVariant: z.enum(['legacy', 'dataKey']),
+    seedMessage: z.strictObject({ localId: z.string().min(1).max(200), content: z.string().min(1).max(1024 * 1024) }) }),
   sessionId: z.string().min(1).max(200),
 })
 export type AutomationContextLaunchRecord = z.infer<typeof automationContextLaunchRecordSchema>
@@ -34,6 +36,8 @@ export interface AutomationContextLaunchDependencies {
   api: Pick<ApiClient, 'prepareSessionCreation'>
   journal: AutomationContextLaunchJournal
   register(request: AutomationContextLaunchRequest, prepared: AutomationContextLaunchRecord['prepared']): Promise<Session>
+  /** Append with the stable localId and return the stored ciphertext, including on an idempotent replay. */
+  persistSeed(session: Session, message: AutomationContextLaunchRecord['prepared']['seedMessage']): Promise<{ seq: number; localId: string; content: string }>
   /** Must use the daemon's submission guard. Only OwnedStartRefused proves a pre-submit refusal. */
   start(options: SpawnSessionOptions): Promise<SpawnSessionResult>
   /** 'ended' requires an owned exit receipt, never just PID absence or a disconnected socket. */
@@ -76,6 +80,9 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
     const executionSeed = automationExecutionSeedSchema.parse({ version: 1, automationId, generation, revision, runId, displaySessionId,
       question: input.payload.prompt, inputBytes: seed.inputBytes, referenceBytes: seed.referenceBytes, references: seed.references,
       inputSha256: createHash('sha256').update(seed.initialPrompt).digest('hex'), wholeContextTokens: 'unknown' })
+    const { question, ...seedFields } = executionSeed
+    const seedManifest = automationExecutionSeedManifestSchema.parse({ ...seedFields,
+      questionBytes: Buffer.byteLength(question, 'utf8'), seedSha256: digest(executionSeed) })
     const requestHash = digest({ automationId, generation, revision, runId, displaySessionId, directory, agent,
       model: model ?? null, effort: effort ?? null, seed })
     const publicResult = (state: 'started' | 'needs-attention') => ({ state, sessionId, displaySessionId })
@@ -94,28 +101,36 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
       if (!record) {
         const { metadata, state } = createSessionMetadata({ flavor: agent, machineId: deps.machineId, startedBy: 'daemon', source: 'schedule' })
         metadata.path = directory
-        metadata.automationExecutionSeed = executionSeed
+        metadata.automationExecutionSeedManifest = seedManifest
         const prepared = deps.api.prepareSessionCreation({ tag: sessionId, metadata, state })
         record = { version: 1, scope, requestHash, automationId, generation, revision, runId, displaySessionId, sessionId, phase: 'prepared',
-          prepared: { ...prepared, encryptionKey: encodeBase64(prepared.encryptionKey) } }
+          prepared: { ...prepared, encryptionKey: encodeBase64(prepared.encryptionKey), seedMessage: {
+            localId: automationExecutionSeedLocalId(runId), content: encodeBase64(encrypt(prepared.encryptionKey, prepared.encryptionVariant,
+              automationExecutionSeedArtifactSchema.parse({ type: 'automation-execution-seed', seed: executionSeed }))) } } }
         // No provider or server side effect precedes this durable, immutable encrypted creation body.
         await deps.journal.write(record)
       }
       const prepared = record.prepared, encryptionKey = decodeBase64(prepared.encryptionKey)
       const metadata = decrypt(encryptionKey, prepared.encryptionVariant, decodeBase64(prepared.body.metadata)) as Metadata
       const state = prepared.body.agentState ? decrypt(encryptionKey, prepared.encryptionVariant, decodeBase64(prepared.body.agentState)) : null
+      const artifact = automationExecutionSeedArtifactSchema.parse(decrypt(encryptionKey, prepared.encryptionVariant, decodeBase64(prepared.seedMessage.content)))
       if (encryptionKey.length !== 32 || prepared.body.tag !== sessionId || metadata?.path !== directory || metadata.machineId !== deps.machineId
         || metadata.flavor !== agent || metadata.claudeSessionId || metadata.codexThreadId || metadata.parentSessionId || metadata.forkedFromMessageId
-        || digest(metadata.automationExecutionSeed) !== digest(executionSeed)
+        || digest(metadata.automationExecutionSeedManifest) !== digest(seedManifest)
+        || prepared.seedMessage.localId !== automationExecutionSeedLocalId(runId) || digest(artifact.seed) !== seedManifest.seedSha256
         || !z.strictObject({ controlledByUser: z.literal(false) }).safeParse(state).success) throw new Error('AUTOMATION_LAUNCH_SNAPSHOT_INVALID')
       const registered = await deps.register(structuredClone(input), structuredClone(prepared))
-      if (registered.id !== sessionId || registered.seq !== 0 || registered.encryptionVariant !== prepared.encryptionVariant
+      if (registered.id !== sessionId || (registered.seq !== 0 && registered.seq !== 1) || registered.encryptionVariant !== prepared.encryptionVariant
         || !Buffer.from(registered.encryptionKey).equals(Buffer.from(encryptionKey))
         || registered.metadata?.claudeSessionId || registered.metadata?.codexThreadId) throw new Error('AUTOMATION_LAUNCH_RECEIPT_CONFLICT')
       record = { ...record, phase: 'registered' }
       await deps.journal.write(record)
+      const seedReceipt = await deps.persistSeed(registered, structuredClone(prepared.seedMessage))
+      if (seedReceipt.seq !== 1 || seedReceipt.localId !== prepared.seedMessage.localId || seedReceipt.content !== prepared.seedMessage.content) {
+        throw new Error('AUTOMATION_SEED_RECEIPT_CONFLICT')
+      }
       const reconnectEnvironment = { ...buildReconnectSessionEnvironment({ sessionId, encryption: registered,
-        serverSnapshot: { ...registered, metadata }, baselineSeq: 0 }), [RECONNECT_FRESH_LAUNCH_ENV]: '1' }
+        serverSnapshot: { ...registered, metadata, seq: 1 }, baselineSeq: 1 }), [RECONNECT_FRESH_LAUNCH_ENV]: '1' }
       const options: SpawnSessionOptions = { directory, agent, model: model ?? undefined, effort: effort ?? undefined,
         initialPrompt: seed.initialPrompt, initialPromptLocalId: `happy-automation:${runId}`, exitAfterFirstTurn: true,
         reconnectEnvironment }

@@ -581,7 +581,7 @@ export type Metadata = {
   /** Captured session opt-in, retained only when ON for resume/recovery. */
   inputEvidenceEnabled?: boolean,
   /** Immutable initial copy is retained on the automation run, outside mutable native metadata. */
-  automationExecutionSeed?: import('@slopus/happy-wire').AutomationExecutionSeed,
+  automationExecutionSeedManifest?: import('@slopus/happy-wire').AutomationExecutionSeedManifest,
   runtimeCapabilities?: {
     agentContact?: { v: 1; runtimeId: string; principal: 'account' | 'managed'; prompt: boolean; steer: boolean;
       inputEvidence: 1 | null; guardedPrompt: 1 | null; mode: 'remote' | 'local' | 'transitioning'; modeEpoch: number },

@@ -1,5 +1,5 @@
 import type { Prisma } from '@prisma/client';
-import { automationExecutionSessionId, isAutomationExecutionSessionId } from '@slopus/happy-wire';
+import { automationExecutionSeedLocalId, automationExecutionSessionId, isAutomationExecutionSessionId } from '@slopus/happy-wire';
 
 /** Display projection only. Reading it never appends messages to the manual provider input. */
 export async function listAutomationExecutionPage(tx: Prisma.TransactionClient, accountId: string,
@@ -20,7 +20,7 @@ export async function listAutomationExecutionPage(tx: Prisma.TransactionClient, 
       automation: { project: { OR: [{ accountId }, { members: { some: { accountId, status: 'accepted' } } }] } },
       ...(after ? { OR: [{ createdAt: { lt: after.createdAt } }, { createdAt: after.createdAt, id: { lt: after.id } }] } : {}),
     },
-    select: { id: true, automationId: true, generation: true, displaySessionId: true, sessionId: true, executionSeedMetadata: true,
+    select: { id: true, automationId: true, generation: true, displaySessionId: true, sessionId: true,
       createdAt: true, scheduledFor: true, status: true, outcome: true, failureCode: true, startedAt: true, completedAt: true,
       automation: { select: { projectId: true } } },
     orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take: input.limit + 1,
@@ -28,7 +28,6 @@ export async function listAutomationExecutionPage(tx: Prisma.TransactionClient, 
   const page = rows.slice(0, input.limit), last = page.at(-1);
   return { runs: page.map(row => ({ id: row.id, automationId: row.automationId, projectId: row.automation.projectId,
     generation: row.generation, displaySessionId: row.displaySessionId, executionSessionId: row.sessionId,
-    seedMetadataCiphertext: row.executionSeedMetadata,
     // COMPLETED/WOKE means dispatch accepted, not proof that the native model finished its answer.
     schedulerStatus: row.status, outcome: row.outcome, failureCode: row.failureCode,
     scheduledFor: row.scheduledFor.getTime(), dispatchedAt: row.startedAt?.getTime() ?? null,
@@ -59,8 +58,13 @@ export async function readAutomationExecutionEvidencePage(tx: Prisma.Transaction
     orderBy: { seq: 'asc' }, take: input.limit + 1,
     select: { id: true, seq: true, localId: true, content: true, createdAt: true } });
   const messages = rows.slice(0, input.limit);
+  const seedMessage = input.after_seq === 0 ? await tx.sessionMessage.findFirst({
+    where: { sessionId: run.sessionId, localId: automationExecutionSeedLocalId(runId), seq: { lte: throughSeq } },
+    select: { id: true, seq: true, localId: true, content: true, createdAt: true },
+  }) : null;
   return { runId, automationId: run.automationId, generation: run.generation, displaySessionId, executionSessionId: run.sessionId,
-    seedMetadataCiphertext: run.executionSeedMetadata,
+    seedManifestCiphertext: run.executionSeedMetadata,
+    seedMessage: seedMessage ? { ...seedMessage, createdAt: seedMessage.createdAt.getTime() } : null,
     dataEncryptionKey: session.dataEncryptionKey ? Buffer.from(session.dataEncryptionKey).toString('base64') : null,
     throughSeq, messages: messages.map(row => ({ ...row, createdAt: row.createdAt.getTime() })),
     nextAfterSeq: rows.length > input.limit ? messages.at(-1)!.seq : null };

@@ -1,6 +1,7 @@
 import { expect, it } from 'vitest';
 import { createEnvelope, type SessionEnvelope } from './sessionProtocol';
-import { automationExecutionSeedSchema, readAutomationExecutionAnswer } from './automationExecutionRecord';
+import { automationExecutionSeedSchema, automationExecutionSeedManifestSchema, automationExecutionSeedArtifactSchema,
+  readAutomationExecutionAnswer } from './automationExecutionRecord';
 
 const seed = () => ({ version: 1, automationId: 'a1', runId: 'r1', generation: 1, revision: 1,
   displaySessionId: 'manual', question: '원래 질문', inputBytes: 100, referenceBytes: 0,
@@ -27,6 +28,16 @@ it('validates reference provenance and exact byte accounting', () => {
     [{ ...reference, bytes: 19 }], [{ ...reference, sha256: '' }]]) {
     expect(automationExecutionSeedSchema.safeParse({ ...value, references }).success).toBe(false);
   }
+});
+
+it('keeps the raw question in a separate bounded artifact and only its digest in creation metadata', () => {
+  const full = automationExecutionSeedSchema.parse(seed());
+  const { question, ...fields } = full;
+  const manifest = { ...fields, questionBytes: new TextEncoder().encode(question).length, seedSha256: 'c'.repeat(64) };
+  expect(automationExecutionSeedManifestSchema.parse(manifest)).toEqual(manifest);
+  expect(automationExecutionSeedManifestSchema.safeParse({ ...manifest, question }).success).toBe(false);
+  expect(automationExecutionSeedArtifactSchema.parse({ type: 'automation-execution-seed', seed: full })).toHaveProperty('seed.question', question);
+  expect(automationExecutionSeedArtifactSchema.safeParse({ type: 'automation-execution-seed', seed: { ...full, assembledPrompt: 'recursive history' } }).success).toBe(false);
 });
 
 it('requires a matching completed turn and keeps the full final answer', () => {

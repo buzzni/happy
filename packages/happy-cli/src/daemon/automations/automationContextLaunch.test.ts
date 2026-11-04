@@ -3,7 +3,8 @@ import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promise
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
-import type { AutomationPayload } from '@slopus/happy-wire'
+import { readReconnectSessionEnvironment } from '../reconnectSessionEnv'
+import { automationExecutionSeedArtifactSchema, type AutomationPayload } from '@slopus/happy-wire'
 import { ApiClient } from '@/api/api'
 import { decodeBase64, decrypt } from '@/api/encryption'
 import type { Session } from '@/api/types'
@@ -25,6 +26,7 @@ async function setup() {
   const api = await ApiClient.create({ token: 'fixture-bearer', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) } })
   const prepare = vi.spyOn(api, 'prepareSessionCreation')
   const sessions = new Map<string, Session>()
+  const seedMessages = new Map<string, { localId: string; content: string }>()
   const register = vi.fn<AutomationContextLaunchDependencies['register']>(async (_request, snapshot) => {
     const id = snapshot.body.tag
     if (!sessions.has(id)) sessions.set(id, { id, seq: 0, metadataVersion: 0, agentStateVersion: 0,
@@ -35,9 +37,15 @@ async function setup() {
   })
   const start = vi.fn<AutomationContextLaunchDependencies['start']>(async options => ({ type: 'success', sessionId: options.reconnectEnvironment!.HAPPY_RECONNECT_SESSION_ID }))
   const discover = vi.fn<AutomationContextLaunchDependencies['discover']>(async () => 'unconfirmed')
+  const persistSeed = vi.fn(async (session: Session, message: { localId: string; content: string }) => {
+    const previous = seedMessages.get(session.id)
+    if (previous && JSON.stringify(previous) !== JSON.stringify(message)) throw new Error('seed-conflict')
+    seedMessages.set(session.id, structuredClone(message)); session.seq = 1
+    return { ...message, seq: 1 }
+  })
   const deps: AutomationContextLaunchDependencies = { accountId: 'owner', machineId: 'm1', happyOrigin: 'https://happy.example',
-    api, journal: createAutomationContextLaunchJournal(home), register, start, discover }
-  return { deps, prepare, register, start, discover, sessions, launcher: createAutomationContextLauncher(deps) }
+    api, journal: createAutomationContextLaunchJournal(home), register, start, discover, persistSeed }
+  return { deps, prepare, register, start, discover, persistSeed, seedMessages, sessions, launcher: createAutomationContextLauncher(deps) }
 }
 
 it('prepares two fresh contexts for the same display chat with no native resume or copied input state', async () => {
@@ -54,12 +62,17 @@ it('prepares two fresh contexts for the same display chat with no native resume 
     expect(options.reconnectEnvironment).toMatchObject({ HAPPY_RECONNECT_FRESH_LAUNCH: '1' })
     const session = f.sessions.get(options.reconnectEnvironment!.HAPPY_RECONNECT_SESSION_ID)!
     expect(session.metadata).toMatchObject({ path: '/work', source: 'schedule', machineId: 'm1' })
-    expect(session.metadata).toHaveProperty('automationExecutionSeed', {
+    const rawSeed = automationExecutionSeedArtifactSchema.parse(decrypt(session.encryptionKey, session.encryptionVariant, decodeBase64(f.seedMessages.get(session.id)!.content)))
+    expect(rawSeed).toHaveProperty('seed.question', 'Current occurrence only')
+    expect(session.metadata).toHaveProperty('automationExecutionSeedManifest', {
       version: 1, automationId: 'a1', runId: options.agent, generation: 1, revision: 1, displaySessionId: 'manual',
-      question: 'Current occurrence only', inputBytes: Buffer.byteLength(options.initialPrompt!, 'utf8'),
+      inputBytes: Buffer.byteLength(options.initialPrompt!, 'utf8'),
       referenceBytes: 0, references: [], inputSha256: createHash('sha256').update(options.initialPrompt!).digest('hex'),
       wholeContextTokens: 'unknown',
+      questionBytes: Buffer.byteLength('Current occurrence only'), seedSha256: createHash('sha256').update(JSON.stringify(rawSeed.seed)).digest('hex'),
     })
+    expect(session.metadata).not.toHaveProperty('automationExecutionSeed')
+    expect(readReconnectSessionEnvironment({ ...options.reconnectEnvironment! })?.seq).toBe(1)
     expect(session.metadata).not.toHaveProperty('claudeSessionId')
     expect(session.metadata).not.toHaveProperty('codexThreadId')
     expect(session.metadata).not.toHaveProperty('parentSessionId')
@@ -80,6 +93,36 @@ it('persists exact encrypted preparation before registration and reuses it after
   expect(f.prepare).toHaveBeenCalledTimes(1)
   expect(f.register.mock.calls[1]![1]).toEqual(f.register.mock.calls[0]![1])
   expect(f.start).toHaveBeenCalledTimes(1)
+})
+
+it.each(['a', '가', '\\', '\u0001'])('preserves a budget-valid large authored question through encrypted creation (%j)', async character => {
+  const f = await setup(), input = request()
+  input.payload.prompt = character.repeat(Math.floor(60_000 / Buffer.byteLength(character, 'utf8')))
+  expect(await f.launcher.launch(input)).toMatchObject({ state: 'started' })
+  expect(f.prepare.mock.results[0].value.body.metadata.length).toBeLessThan(60_000)
+  const session = f.sessions.get('automation-run:r1')!, message = f.seedMessages.get(session.id)!
+  expect(message.content.length).toBeGreaterThan(60_000)
+  expect(decrypt(session.encryptionKey, session.encryptionVariant, decodeBase64(message.content))).toHaveProperty('seed.question', input.payload.prompt)
+  expect(Buffer.byteLength(f.start.mock.calls[0][0].initialPrompt!, 'utf8')).toBeLessThanOrEqual(65_536)
+})
+
+it('reuses the exact immutable seed after its storage ACK was lost without dispatching early', async () => {
+  const f = await setup(), persist = f.persistSeed.getMockImplementation()!
+  f.persistSeed.mockImplementationOnce(async (session, message) => { await persist(session, message); throw new Error('seed-ACK-lost') })
+  await expect(f.launcher.launch(request())).rejects.toThrow('seed-ACK-lost')
+  expect(f.start).not.toHaveBeenCalled()
+  expect(await createAutomationContextLauncher(f.deps).launch(request())).toMatchObject({ state: 'started' })
+  expect(f.prepare).toHaveBeenCalledTimes(1)
+  expect(f.persistSeed.mock.calls[0][1]).toEqual(f.persistSeed.mock.calls[1][1])
+  expect(f.start).toHaveBeenCalledTimes(1)
+})
+
+it.each(['sequence', 'identity', 'content'])('refuses a mismatched seed-storage %s receipt before starting the provider', async reason => {
+  const f = await setup()
+  f.persistSeed.mockImplementationOnce(async (_session, message) => ({ ...message, seq: reason === 'sequence' ? 2 : 1,
+    ...(reason === 'identity' ? { localId: 'another-run' } : {}), ...(reason === 'content' ? { content: 'another-question' } : {}) }))
+  await expect(f.launcher.launch(request())).rejects.toThrow('AUTOMATION_SEED_RECEIPT_CONFLICT')
+  expect(f.start).not.toHaveBeenCalled()
 })
 
 it('reconciles a lost provider-start ACK after restart without launching a second process', async () => {
