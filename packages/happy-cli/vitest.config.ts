@@ -10,6 +10,18 @@ export default defineConfig({
             {
                 extends: true,
                 test: {
+                    name: 'integration-automation-context',
+                    include: ['src/daemon/automations/automationContext.native.integration.test.ts'],
+                    setupFiles: ['./src/testing/unit.setup.ts'],
+                    fileParallelism: false,
+                    maxWorkers: 1,
+                    testTimeout: 180_000,
+                    hookTimeout: 30_000,
+                },
+            },
+            {
+                extends: true,
+                test: {
                     name: 'browser-native-host',
                     include: ['src/browserRuntime/**/*.native.test.ts'],
                     setupFiles: ['./src/testing/unit.setup.ts'],
