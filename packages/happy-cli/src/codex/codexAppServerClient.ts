@@ -1547,6 +1547,16 @@ export class CodexAppServerClient {
             && this.pending.size === 0 && this.workspaceTurnOperations === 0;
     }
 
+    /** Read-only preflight; the root must recheck its own input/writer gate before freezing. */
+    async canDrainWorkspace(): Promise<boolean> {
+        if (!this.workspaceExitObservation || this.automationInputClosed || this.shutdownInputFrozen) return false;
+        const proc = this.process, threadId = this._threadId, epoch = this.processEpoch;
+        if (!this.workspaceForegroundIdle(proc, threadId) || !threadId) return false;
+        await this.backgroundTasks.refresh(threadId);
+        return proc === this.process && epoch === this.processEpoch && threadId === this._threadId
+            && this.workspaceForegroundIdle(proc, threadId) && this.backgroundTasks.confirmedEmpty && this.subagents.confirmedIdle;
+    }
+
     async finishWorkspaceContext(budgetMs: number): Promise<{
         foregroundDrained: boolean; backgroundDrained: boolean; providerExitedCleanly: boolean;
     }> {

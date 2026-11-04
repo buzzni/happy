@@ -371,6 +371,8 @@ describe('CodexAppServerClient sandbox integration', () => {
                         : client.sendTurnAndWait('Prepared manual task', opts)).then(() => undefined, error => { errors.push(error); });
                     await waitFor(() => !!allowPreparation);
                 }
+                expect(await client.canDrainWorkspace()).toBe(state === 'clean');
+                expect(proc.stdin.writableEnded).toBe(false);
                 const proof = await client.finishWorkspaceContext(500);
                 expect(proof).toMatchObject({ foregroundDrained: !['foreground', 'unacknowledged', 'preparation', 'waiting-preparation'].includes(state), backgroundDrained: state === 'clean', providerExitedCleanly: state === 'clean' });
                 expect(client.threadId).toBe('manual-native-keep');
