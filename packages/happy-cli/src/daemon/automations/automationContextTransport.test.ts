@@ -7,21 +7,28 @@ import type { AutomationPayload } from '@slopus/happy-wire'
 import { ApiClient } from '@/api/api'
 import { createAutomationContextLaunchJournal } from './automationContextLaunchJournal'
 import { createAutomationContextLauncher } from './automationContextLaunch'
-import { createAutomationContextTransport } from './automationContextTransport'
+import { createAutomationContextAuthorizer, createAutomationContextTransport } from './automationContextTransport'
 
 let home: string, server: Server, origin: string
 let seed: { localId: string; content: string } | null, stored: Record<string, unknown> | null
 let loseSeedAck: boolean, redirectLookup: boolean, wrongKey: boolean
+let issuerMode: 'personal' | 'company' | 'redirect' | 'malformed' | 'denied'
 const requests: Array<{ path: string; authorization: string; body: any }> = []
 beforeEach(async () => {
   home = await mkdtemp(join(tmpdir(), 'automation-context-http-'))
   requests.length = 0; seed = null; stored = null; loseSeedAck = false; redirectLookup = false; wrongKey = false
+  issuerMode = 'personal'
   server = createServer(async (req, res) => {
     let text = ''; for await (const chunk of req) text += chunk
     const body = text ? JSON.parse(text) : null
     requests.push({ path: req.url!, authorization: req.headers.authorization ?? '', body })
     if (req.headers.authorization !== 'Bearer fixture-account-token') { res.writeHead(401).end(); return }
     res.setHeader('Content-Type', 'application/json')
+    if (req.url === '/api/automation/execution-target') {
+      if (issuerMode === 'redirect') { res.writeHead(307, { Location: '/unexpected-redirect' }).end(); return }
+      if (issuerMode === 'denied') { res.writeHead(403).end('{}'); return }
+      res.end(JSON.stringify({ targetProof: 'fixture-target-proof', executionBindingRequired: issuerMode === 'malformed' ? 'false' : issuerMode === 'company' })); return
+    }
     if (req.url === '/v1/automation-runs/r1/execution-session') {
       if (body.claimToken !== 'fixture-claim' || body.machineId !== 'm1' || body.targetProof !== 'fixture-target-proof') { res.writeHead(403).end('{}'); return }
       stored ??= { id: body.body.tag, seq: 0, metadata: body.body.metadata, metadataVersion: 0,
@@ -116,3 +123,31 @@ it.each(['key', 'redirect'])('refuses a mismatched session %s without legacy cre
   expect(f.start).not.toHaveBeenCalled()
   expect(requests.some(req => req.path === '/v1/sessions' || req.path === '/unexpected-redirect')).toBe(false)
 })
+
+it('requests scoped admission only from the configured Studio origin without sending private input or keys', async () => {
+  const f = await setup()
+  const authorize = createAutomationContextAuthorizer({ studioOrigin: origin, token: 'fixture-account-token', machineId: 'm1', runId: 'r1', claimToken: 'fixture-claim' })
+  const transport = createAutomationContextTransport({ serverUrl: origin, token: 'fixture-account-token', machineId: 'm1', runId: 'r1', claimToken: 'fixture-claim', authorize })
+  expect(await createAutomationContextLauncher({ ...f.deps, ...transport }).launch(f.input)).toHaveProperty('state', 'started')
+  expect(requests[0]).toEqual({ path: '/api/automation/execution-target', authorization: 'Bearer fixture-account-token', body: {
+    machineId: 'm1', runId: 'r1', claimToken: 'fixture-claim', generation: 1, revision: 1,
+    conversationSessionId: 'manual', conversationDirectory: '/work', agent: 'codex', createBody: f.prepare.mock.results[0].value.body,
+  } })
+  for (const secret of [f.input.payload.prompt, 'encryptionKey', 'seedMessage']) expect(JSON.stringify(requests[0])).not.toContain(secret)
+  expect(f.start).toHaveBeenCalledOnce()
+})
+
+it.each(['company', 'redirect', 'malformed', 'denied'] as const)('never falls back to legacy admission after a %s response', async mode => {
+  const f = await setup(); issuerMode = mode
+  const authorize = createAutomationContextAuthorizer({ studioOrigin: origin, token: 'fixture-account-token', machineId: 'm1', runId: 'r1', claimToken: 'fixture-claim' })
+  const transport = createAutomationContextTransport({ serverUrl: origin, token: 'fixture-account-token', machineId: 'm1', runId: 'r1', claimToken: 'fixture-claim', authorize })
+  await expect(createAutomationContextLauncher({ ...f.deps, ...transport }).launch(f.input)).rejects.toThrow()
+  expect(requests.map(row => row.path)).toEqual(['/api/automation/execution-target'])
+  expect(f.start).not.toHaveBeenCalled()
+})
+
+it.each([null, 'http://untrusted.example', 'https://studio.example/path', 'https://user:secret@studio.example', 'https://studio.example/?other=1'])(
+  'rejects an absent or invalid trusted origin (%s)', studioOrigin => {
+    expect(() => createAutomationContextAuthorizer({ studioOrigin, token: 'fixture-account-token', machineId: 'm1', runId: 'r1', claimToken: 'fixture-claim' })).toThrow()
+    expect(requests).toHaveLength(0)
+  })

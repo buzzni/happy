@@ -3,6 +3,7 @@ import { HappySessionExecutionProofSchema, automationExecutionSessionId, type Se
 import type { Metadata, AgentState } from '@/api/types'
 import { decodeBase64, decrypt } from '@/api/encryption'
 import type { AutomationContextLaunchDependencies } from './automationContextLaunch'
+import { readTrustedStudioOrigin } from '../setupTokenBindingProof'
 
 const admissionSchema = z.strictObject({ targetProof: z.string().min(1).max(8192), executionBindingRequired: z.boolean(),
   executionProof: HappySessionExecutionProofSchema.optional() })
@@ -13,6 +14,41 @@ const sessionSchema = z.object({ id: z.string(), seq: z.number().int().nonnegati
 export type AutomationContextTargetRequest = {
   automationId: string; runId: string; generation: number; revision: number; machineId: string;
   displaySessionId: string; conversationDirectory: string; agent: 'claude' | 'codex'; body: Readonly<SessionExecutionCreateBody>
+}
+
+/** The daemon's explicit trust configuration is the only destination. Payloads supply no URLs or downgrade flags. */
+export function createAutomationContextAuthorizer(input: {
+  studioOrigin: string | null; token: string; machineId: string; runId: string; claimToken: string
+}): (target: AutomationContextTargetRequest) => Promise<z.infer<typeof admissionSchema>> {
+  const origin = readTrustedStudioOrigin({ HAPPY_APLUS_STUDIO_ORIGIN: input.studioOrigin ?? undefined })
+  if (!origin || !input.token || !input.machineId || !input.claimToken || input.claimToken.length > 256) throw new Error('AUTOMATION_STUDIO_ADMISSION_UNCONFIGURED')
+  automationExecutionSessionId(input.runId)
+  return async target => {
+    if (target.machineId !== input.machineId || target.runId !== input.runId) throw new Error('AUTOMATION_CONTEXT_IDENTITY_CONFLICT')
+    let response: Response
+    try {
+      response = await fetch(new URL('/api/automation/execution-target', origin), { method: 'POST', redirect: 'error',
+        signal: AbortSignal.timeout(10_000), headers: { Authorization: `Bearer ${input.token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ machineId: input.machineId, runId: input.runId, claimToken: input.claimToken,
+          generation: target.generation, revision: target.revision, conversationSessionId: target.displaySessionId,
+          conversationDirectory: target.conversationDirectory, agent: target.agent, createBody: target.body }) })
+    } catch { throw new Error('AUTOMATION_STUDIO_ADMISSION_UNCONFIRMED') }
+    if (!response.ok) { await response.body?.cancel(); throw new Error(`AUTOMATION_STUDIO_ADMISSION_HTTP_${response.status}`) }
+    const reader = response.body?.getReader()
+    if (!reader) throw new Error('AUTOMATION_STUDIO_ADMISSION_INVALID')
+    const chunks: Uint8Array[] = []; let bytes = 0
+    try {
+      while (true) {
+        const next = await reader.read()
+        if (next.done) break
+        bytes += next.value.byteLength
+        if (bytes > 16 * 1024) throw new Error('AUTOMATION_STUDIO_ADMISSION_INVALID')
+        chunks.push(next.value)
+      }
+      return admissionSchema.omit({ executionProof: true }).parse(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))))
+    } catch { throw new Error('AUTOMATION_STUDIO_ADMISSION_INVALID') }
+    finally { await reader.cancel().catch(() => undefined); reader.releaseLock() }
+  }
 }
 
 /** Network operations only. The trusted issuer decides proof requirements; this adapter never downgrades them. */
