@@ -22,6 +22,7 @@ export const automationContextLaunchRecordSchema = z.strictObject({
     seedMessage: z.strictObject({ localId: z.string().min(1).max(200), content: z.string().min(1).max(1024 * 1024) }) }),
   sessionId: z.string().min(1).max(200),
   exitReceipt: z.strictObject({ provider: z.enum(['claude', 'codex']), observedAt: z.number().int().nonnegative() }).optional(),
+  exitReceiptAcknowledged: z.literal(true).optional(),
   workspaceOwnerToken: z.string().uuid().optional(),
   deferredDispatch: z.enum(['queued', 'settled']).optional(),
   cancelledBeforeSubmit: z.literal(true).optional(),
@@ -131,6 +132,16 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
           || record.phase !== 'submitted' && record.phase !== 'started') throw new Error('AUTOMATION_EXIT_RECEIPT_CONFLICT')
         if (!record.exitReceipt) await deps.journal.write({ ...record, exitReceipt: { provider: input.provider, observedAt: Date.now() } })
         await releaseWorkspace(record, false)
+      })
+    },
+    async acknowledgeOwnedExit(input: { runId: string; sessionId: string; provider: 'claude' | 'codex'; observedAt: number }): Promise<void> {
+      await exclusive(input.runId, async () => {
+        const record = await deps.journal.read(input.runId)
+        if (!record) throw new Error('AUTOMATION_EXIT_RECEIPT_CONFLICT')
+        assertIdentity(record, input.runId)
+        if (record.sessionId !== input.sessionId || record.exitReceipt?.provider !== input.provider
+          || record.exitReceipt.observedAt !== input.observedAt) throw new Error('AUTOMATION_EXIT_RECEIPT_CONFLICT')
+        if (!record.exitReceiptAcknowledged) await deps.journal.write({ ...record, exitReceiptAcknowledged: true })
       })
     },
     /** Private daemon input only. Never return this snapshot through browser RPC or logs. */

@@ -3,7 +3,7 @@ import { createServer, type Server } from 'node:http'
 import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { AutomationPayload } from '@slopus/happy-wire'
+import { sessionCreateBodyHash, type AutomationPayload } from '@slopus/happy-wire'
 import { ApiClient } from '@/api/api'
 import { createAutomationContextLaunchJournal } from './automationContextLaunchJournal'
 import { createAutomationContextLauncher } from './automationContextLaunch'
@@ -16,11 +16,14 @@ let home: string, server: Server, origin: string
 let seed: { localId: string; content: string } | null, stored: Record<string, unknown> | null
 let loseSeedAck: boolean, redirectLookup: boolean, wrongKey: boolean
 let issuerMode: 'personal' | 'company' | 'redirect' | 'malformed' | 'denied'
+let exitMode: 'valid' | 'lost' | 'run' | 'session' | 'provider' | 'time' | 'partial' | 'missing'
+let exitAck: any
 const requests: Array<{ path: string; authorization: string; body: any }> = []
 beforeEach(async () => {
   home = await mkdtemp(join(tmpdir(), 'automation-context-http-'))
   requests.length = 0; seed = null; stored = null; loseSeedAck = false; redirectLookup = false; wrongKey = false
   issuerMode = 'personal'
+  exitMode = 'valid'; exitAck = null
   server = createServer(async (req, res) => {
     let text = ''; for await (const chunk of req) text += chunk
     const body = text ? JSON.parse(text) : null
@@ -31,6 +34,19 @@ beforeEach(async () => {
       if (issuerMode === 'redirect') { res.writeHead(307, { Location: '/unexpected-redirect' }).end(); return }
       if (issuerMode === 'denied') { res.writeHead(403).end('{}'); return }
       res.end(JSON.stringify({ targetProof: 'fixture-target-proof', executionBindingRequired: issuerMode === 'malformed' ? 'false' : issuerMode === 'company' })); return
+    }
+    if (req.url === '/v1/automation-runs/r1/execution-exit') {
+      if (body.claimToken !== 'fixture-claim' || body.machineId !== 'm1') { res.writeHead(403).end('{}'); return }
+      exitAck ??= { runId: 'r1', sessionId: 'automation-run:r1', receipt: { ...body.receipt, receivedAt: 123 } }
+      if (exitMode === 'lost') { exitMode = 'valid'; req.socket.destroy(); return }
+      const ack = structuredClone(exitAck)
+      if (exitMode === 'run') ack.runId = 'another-run'
+      if (exitMode === 'session') ack.sessionId = 'manual'
+      if (exitMode === 'provider') ack.receipt.provider = 'claude'
+      if (exitMode === 'time') ack.receipt.observedAt += 1
+      if (exitMode === 'partial') ack.receipt.backgroundDrained = false
+      if (exitMode === 'missing') delete ack.receipt
+      res.end(JSON.stringify(ack)); return
     }
     if (req.url === '/v1/automation-runs/r1/execution-session') {
       if (body.claimToken !== 'fixture-claim' || body.machineId !== 'm1' || body.targetProof !== 'fixture-target-proof') { res.writeHead(403).end('{}'); return }
@@ -97,6 +113,7 @@ it('does not confirm an unobserved child or replay it after a spawn ACK without 
   f.input.payload.directory = directory
   const workspace = createAutomationContextWorkspace({ home, isTracked: async () => false })
   const host = createAutomationContextHost({ ...f.deps, workspace,
+    reportExit: async () => { throw new Error('Unexpected unobserved exit report') },
     runtimeStore: createServerAutomationRuntimeStore({ filePath: join(home, 'runtime.json') }),
     transportForRun: async () => f.transport,
     resolveContext: async () => ({ environmentVariables: {} }), heartbeat: async () => ({ ok: true }), log: vi.fn(),
@@ -106,6 +123,62 @@ it('does not confirm an unobserved child or replay it after a spawn ACK without 
   expect(await host.dispatch({ ...f.input, environmentVariables: {} })).toHaveProperty('state', 'needs-attention')
   expect(f.start).toHaveBeenCalledOnce()
   expect(await workspace.beginManualLaunch([directory])).toHaveProperty('acquired', false)
+})
+
+it('retries the same durable exit receipt after a lost server ACK without replaying the provider', async () => {
+  const f = await setup(), directory = join(home, 'workspace'); await mkdir(directory)
+  f.input.payload.directory = directory
+  await f.launcher.launch(f.input)
+  await f.launcher.recordOwnedExit({ runId: 'r1', sessionId: 'automation-run:r1', provider: 'codex' })
+  const saved = (await f.deps.journal.read('r1'))!
+  const reportExit = vi.fn(async () => undefined)
+  reportExit.mockRejectedValueOnce(new Error('AUTOMATION_CONTEXT_REQUEST_UNCONFIRMED'))
+  const log = vi.fn()
+  const deps = { ...f.deps, reportExit, workspace: createAutomationContextWorkspace({ home, isTracked: async () => false }),
+    runtimeStore: createServerAutomationRuntimeStore({ filePath: join(home, 'runtime.json') }),
+    transportForRun: async () => f.transport, resolveContext: async () => ({ environmentVariables: {} }),
+    heartbeat: async () => ({ ok: true }), log }
+  await createAutomationContextHost(deps).maintain()
+  expect(reportExit).toHaveBeenCalledOnce()
+  expect(await f.deps.journal.read('r1')).not.toHaveProperty('exitReceiptAcknowledged')
+  await createAutomationContextHost(deps).maintain()
+  expect(reportExit).toHaveBeenCalledTimes(2)
+  expect(reportExit.mock.calls[0]).toEqual([f.input, saved])
+  expect(reportExit.mock.calls[1]).toEqual(reportExit.mock.calls[0])
+  expect(await f.deps.journal.read('r1')).toHaveProperty('exitReceiptAcknowledged', true)
+  await createAutomationContextHost(deps).maintain()
+  expect(reportExit).toHaveBeenCalledTimes(2)
+  expect(f.start).toHaveBeenCalledOnce()
+  expect(log).toHaveBeenCalledOnce()
+})
+
+it('posts only the original private claim, creation hash and positive exit receipt and reconciles a lost HTTP ACK', async () => {
+  const f = await setup(); await f.launcher.launch(f.input)
+  await f.launcher.recordOwnedExit({ runId: 'r1', sessionId: 'automation-run:r1', provider: 'codex' })
+  const record = (await f.deps.journal.read('r1'))!
+  exitMode = 'lost'
+  await expect(f.transport.reportExit(record)).rejects.toThrow('AUTOMATION_CONTEXT_REQUEST_UNCONFIRMED')
+  await expect(f.transport.reportExit(record)).resolves.toBeUndefined()
+  const sent = requests.filter(row => row.path.endsWith('/execution-exit'))
+  expect(sent).toHaveLength(2)
+  expect(sent[0]).toEqual(sent[1])
+  expect(sent[0].body).toEqual({ machineId: 'm1', claimToken: 'fixture-claim',
+    createBodyHash: await sessionCreateBodyHash(record.prepared.body), receipt: { version: 1, ...record.exitReceipt,
+      providerExitedCleanly: true, foregroundDrained: true, backgroundDrained: true, writeProducersDrained: true } })
+  for (const secret of [f.input.payload.prompt, record.prepared.encryptionKey, record.prepared.body.metadata, record.prepared.seedMessage.content]) {
+    expect(JSON.stringify(sent)).not.toContain(secret)
+  }
+  expect(f.authorize).toHaveBeenCalledOnce()
+  expect(f.start).toHaveBeenCalledOnce()
+})
+
+it.each(['run', 'session', 'provider', 'time', 'partial', 'missing'] as const)('refuses a mismatched exit HTTP ACK: %s', async mode => {
+  const f = await setup(); await f.launcher.launch(f.input)
+  await f.launcher.recordOwnedExit({ runId: 'r1', sessionId: 'automation-run:r1', provider: 'codex' })
+  exitMode = mode
+  await expect(f.transport.reportExit((await f.deps.journal.read('r1'))!)).rejects.toThrow()
+  expect(await f.deps.journal.read('r1')).not.toHaveProperty('exitReceiptAcknowledged')
+  expect(f.start).toHaveBeenCalledOnce()
 })
 
 it('refuses a different claim before issuing a proof or performing a registration request', async () => {

@@ -34,7 +34,12 @@ async function seedRun(fixture: SessionWriteScopeFixture, input: Record<string, 
   }, 'registered machine and claimed fixture run')
 }
 
-it.each(['active', 'paused'] as const)('restores a durable %s deferred occurrence through the real daemon without replaying or ignoring a stop', async state => {
+it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
+  { state: 'paused', provider: 'claude', encryptionVariant: 'legacy' },
+  { state: 'active', provider: 'codex', encryptionVariant: 'legacy' },
+  { state: 'active', provider: 'claude', encryptionVariant: 'dataKey' },
+  { state: 'active', provider: 'codex', encryptionVariant: 'dataKey' }] as const)(
+  'restores a durable $state $provider $encryptionVariant occurrence through the real daemon without replaying or ignoring a stop', async ({ state, provider, encryptionVariant }) => {
   vi.stubEnv('HAPPY_SCOPE_FRESH_PROVIDER_STATE', '1')
   vi.stubEnv('HAPPY_SCOPE_PACKAGED_SERVER', undefined)
   vi.stubEnv('HAPPY_SCOPE_INSTALLED_CLI', undefined)
@@ -78,14 +83,15 @@ it.each(['active', 'paused'] as const)('restores a durable %s deferred occurrenc
   })
   await new Promise<void>(resolve => studio.listen(0, '127.0.0.1', resolve))
   const origin = `http://127.0.0.1:${(studio.address() as { port: number }).port}`
-  fixture = new SessionWriteScopeFixture({ provider: 'claude', encryptionVariant: 'legacy',
+  fixture = new SessionWriteScopeFixture({ provider, encryptionVariant,
     serverEntry: 'sources/testing/automationContextFixture.ts', browserBridgeHost: '::1', automationContextHost: true, automationStudioUrl: origin })
   let failure: unknown
   try {
     await fixture.start()
-    const api = await ApiClient.create({ token: fixture.token, encryption: { type: 'legacy', secret: fixture.seed } })
+    const api = await ApiClient.create({ token: fixture.token, encryption: encryptionVariant === 'legacy'
+      ? { type: 'legacy', secret: fixture.seed } : { type: 'dataKey', publicKey: fixture.accountBox.publicKey, machineKey: fixture.machineKey } })
     const prepared = api.prepareSessionCreation({ tag: `manual-${randomUUID()}`, metadata: { path: fixture.project,
-      host: 'fixture', flavor: 'claude', claudeSessionId: 'manual-native-keep', homeDir: fixture.home, happyHomeDir: fixture.happyHome,
+      host: 'fixture', flavor: provider, [fixture.providerIdentityField]: 'manual-native-keep', homeDir: fixture.home, happyHomeDir: fixture.happyHome,
       happyLibDir: fixture.cli, happyToolsDir: fixture.tools }, state: { controlledByUser: false } })
     const displaySessionId = (await fixture.http('/v1/sessions', prepared.body)).body.session.id
     run = { ...await seedRun(fixture, { accountId: fixture.accountId, displaySessionId, runId, claimToken, directory: fixture.project, secret }), displaySessionId }
@@ -94,6 +100,7 @@ it.each(['active', 'paused'] as const)('restores a durable %s deferred occurrenc
     const manual = await workspace.beginManualLaunch([fixture.project])
     if (!manual.acquired) throw new Error('Manual preparation refused')
     const host = createAutomationContextHost({ accountId: fixture.accountId, machineId: run.machineId, happyOrigin: fixture.serverUrl,
+      reportExit: async () => { throw new Error('Only the daemon reports a deferred exit') },
       api, journal, workspace, runtimeStore: createServerAutomationRuntimeStore({ filePath: join(fixture.happyHome, 'preparation-runtime.test.json') }),
       heartbeat: async () => { throw new Error('Only the daemon maintains the saved occurrence') },
       resolveContext: async () => { throw new Error('Only the daemon resolves renewed authority') },
@@ -104,12 +111,14 @@ it.each(['active', 'paused'] as const)('restores a durable %s deferred occurrenc
     const marker = `scope-marker-deferred-${randomUUID()}`
     try {
       expect(await host.dispatch({ automationId: run.automationId, generation: run.generation, revision: run.revision, runId, claimToken,
-        environmentVariables: {}, payload: { name: 'Deferred isolated occurrence', directory: fixture.project, agent: 'claude',
+        environmentVariables: {}, payload: { name: 'Deferred isolated occurrence', directory: fixture.project, agent: provider,
           model: fixture.modelName, prompt: `Return ${marker} only.`, scriptCommand: null, suppressSilent: false,
           schedule: { kind: 'once-zoned', date: '2026-11-05', hour: 9, minute: 0, timeZone: 'UTC' },
           conversation: { sessionId: displaySessionId }, contextPolicy: { kind: 'isolated', reference: null } } }))
         .toMatchObject({ state: 'waiting', deferred: true })
       expect(await journal.read(runId)).toMatchObject({ phase: 'registered', deferredDispatch: 'queued' })
+      expect((await journal.read(runId))!.prepared.encryptionVariant).toBe(encryptionVariant)
+      expect((await journal.read(runId))!.prepared.body.dataEncryptionKey == null).toBe(encryptionVariant === 'legacy')
       if (state === 'paused') {
         const response = await fetch(`${fixture.serverUrl}/v1/projects/${encodeURIComponent(run.projectId)}/automations/${encodeURIComponent(run.automationId)}`, {
           method: 'PATCH', headers: { Authorization: `Bearer ${fixture.token}`, 'Content-Type': 'application/json' },
@@ -127,20 +136,30 @@ it.each(['active', 'paused'] as const)('restores a durable %s deferred occurrenc
     }, 'daemon restores the original execution or preserves the stop before submission', 45_000)
     const report = await eventually(async () => {
       const feed = await fixture.http(`/v1/sessions/${displaySessionId}/automation-runs`)
-      return feed.body.runs?.[0]?.schedulerStatus === (state === 'active' ? 'COMPLETED' : 'FAILED') ? feed.body.runs[0] : undefined
+      const result = feed.body.runs?.[0]
+      return result?.schedulerStatus === (state === 'active' ? 'COMPLETED' : 'FAILED')
+        && (state === 'paused' || result.executionExitReceipt) ? result : undefined
     }, 'daemon flushes the original run report')
     expect(report).toMatchObject({ id: runId, outcome: state === 'active' ? 'WOKE' : 'ERROR' })
-    if (state === 'active') expect(await journal.read(runId)).toMatchObject({ phase: 'started', deferredDispatch: 'settled', exitReceipt: { provider: 'claude' } })
+    expect(report.executionExitError).toBeNull()
+    if (state === 'active') {
+      await eventually(async () => (await journal.read(runId))?.exitReceiptAcknowledged ? true : undefined, 'durable server exit ACK')
+      const saved = (await journal.read(runId))!
+      expect(saved).toMatchObject({ phase: 'started', deferredDispatch: 'settled', exitReceipt: { provider }, exitReceiptAcknowledged: true })
+      expect(report.executionExitReceipt).toMatchObject({ version: 1, ...saved.exitReceipt, providerExitedCleanly: true,
+        foregroundDrained: true, backgroundDrained: true, writeProducersDrained: true })
+    }
     else {
       expect(await journal.read(runId)).toMatchObject({ phase: 'registered', deferredDispatch: 'settled', cancelledBeforeSubmit: true })
       expect(await journal.read(runId)).not.toHaveProperty('exitReceipt')
+      expect(report.executionExitReceipt).toBeNull()
     }
     expect(calls).toContain('/api/automation/project-environment')
     expect(calls).toContain('/api/automation/mcp-caller-grant')
     expect(fixture.modelRequests).toHaveLength(state === 'active' ? 1 : 0)
     if (state === 'active') expect(fixture.modelRequests[0]).toContain(marker)
     const manualAfter = (await fixture.http('/v2/sessions/lookup', { ids: [displaySessionId] })).body.sessions[0]
-    expect(decrypt(prepared.encryptionKey, prepared.encryptionVariant, decodeBase64(manualAfter.metadata))).toMatchObject({ claudeSessionId: 'manual-native-keep' })
+    expect(decrypt(prepared.encryptionKey, prepared.encryptionVariant, decodeBase64(manualAfter.metadata))).toMatchObject({ [fixture.providerIdentityField]: 'manual-native-keep' })
     const admission = await workspace.beginManualLaunch([fixture.project])
     expect(admission.acquired).toBe(true)
     if (admission.acquired) expect(await admission.finish({ submitted: false, tracked: false })).toBe(true)
@@ -244,6 +263,7 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
       let child: ChildProcess | undefined
       const exitEvidence: unknown[] = []
       const host = createAutomationContextHost({ accountId: fixture.accountId, machineId, happyOrigin: fixture.serverUrl,
+        reportExit: async () => { throw new Error('Unexpected fixture-only maintenance') },
         api, journal, workspace,
         runtimeStore: createServerAutomationRuntimeStore({ filePath: join(fixture.happyHome, 'context-runtime.test.json') }),
         heartbeat: async () => { throw new Error('Unexpected fixture deferred renewal') },

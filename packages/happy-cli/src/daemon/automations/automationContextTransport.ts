@@ -1,8 +1,8 @@
 import { z } from 'zod'
-import { HappySessionExecutionProofSchema, automationExecutionSessionId, type SessionExecutionCreateBody } from '@slopus/happy-wire'
+import { HappySessionExecutionProofSchema, automationExecutionSessionId, sessionCreateBodyHash, type SessionExecutionCreateBody } from '@slopus/happy-wire'
 import type { Metadata, AgentState } from '@/api/types'
 import { decodeBase64, decrypt } from '@/api/encryption'
-import type { AutomationContextLaunchDependencies } from './automationContextLaunch'
+import type { AutomationContextLaunchDependencies, AutomationContextLaunchRecord } from './automationContextLaunch'
 import { readTrustedStudioOrigin } from '../setupTokenBindingProof'
 
 const admissionSchema = z.strictObject({ targetProof: z.string().min(1).max(8192), executionBindingRequired: z.boolean(),
@@ -55,7 +55,7 @@ export function createAutomationContextAuthorizer(input: {
 export function createAutomationContextTransport(input: {
   serverUrl: string; token: string; machineId: string; runId: string; claimToken: string;
   authorize(target: AutomationContextTargetRequest): Promise<z.infer<typeof admissionSchema>>
-}): Pick<AutomationContextLaunchDependencies, 'register' | 'persistSeed'> {
+}): Pick<AutomationContextLaunchDependencies, 'register' | 'persistSeed'> & { reportExit(record: AutomationContextLaunchRecord): Promise<void> } {
   const url = new URL(input.serverUrl)
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash
     || !input.token || !input.machineId || !input.claimToken || input.claimToken.length > 256) throw new Error('AUTOMATION_CONTEXT_TRANSPORT_INVALID')
@@ -70,6 +70,20 @@ export function createAutomationContextTransport(input: {
     try { return await response.json() } catch { throw new Error('AUTOMATION_CONTEXT_RESPONSE_INVALID') }
   }
   return {
+    async reportExit(record) {
+      if (record.runId !== input.runId || record.sessionId !== sessionId || record.prepared.body.tag !== sessionId || !record.exitReceipt) {
+        throw new Error('AUTOMATION_EXIT_RECEIPT_CONFLICT')
+      }
+      const receipt = { version: 1 as const, ...record.exitReceipt, providerExitedCleanly: true as const,
+        foregroundDrained: true as const, backgroundDrained: true as const, writeProducersDrained: true as const }
+      const ack = z.object({ runId: z.literal(input.runId), sessionId: z.literal(sessionId), receipt: z.object({
+        version: z.literal(1), provider: z.enum(['claude', 'codex']), observedAt: z.number().int().nonnegative(), receivedAt: z.number().int().nonnegative(),
+        providerExitedCleanly: z.literal(true), foregroundDrained: z.literal(true), backgroundDrained: z.literal(true), writeProducersDrained: z.literal(true),
+      }) }).parse(await request(`/v1/automation-runs/${encodeURIComponent(input.runId)}/execution-exit`, {
+        machineId: input.machineId, claimToken: input.claimToken, createBodyHash: await sessionCreateBodyHash(record.prepared.body), receipt,
+      }))
+      if (ack.receipt.provider !== receipt.provider || ack.receipt.observedAt !== receipt.observedAt) throw new Error('AUTOMATION_EXIT_RECEIPT_CONFLICT')
+    },
     async register(run, prepared) {
       const displaySessionId = run.payload.conversation?.sessionId
       if (run.runId !== input.runId || run.claimToken !== input.claimToken || prepared.body.tag !== sessionId || !displaySessionId

@@ -349,6 +349,7 @@ import { mergeAdditionalDirectoriesIntoSandboxEnvironment, readAdditionalDirecto
 import { createAutomationContextWorkspace } from './automations/automationContextWorkspace';
 import { createAutomationContextHost } from './automations/automationContextHost';
 import { createAutomationContextLaunchJournal } from './automations/automationContextLaunchJournal';
+import type { AutomationContextLaunchRequest } from './automations/automationContextLaunch';
 import { createAutomationContextAuthorizer, createAutomationContextTransport } from './automations/automationContextTransport';
 import { readClaudeTranscriptBranch, restoreMissingManagedWorktree } from './missingWorktreeRestore';
 import { getProjectPath } from '@/claude/utils/path';
@@ -5192,6 +5193,10 @@ export async function startDaemon(): Promise<void> {
     });
     if (!standaloneWindows) await apiMachine.setLessonHosts(lessonHosts);
     apiMachine.setServerAutomationCache(serverAutomationCache);
+    const contextTransportForRun = (run: AutomationContextLaunchRequest) => createAutomationContextTransport({ serverUrl: configuration.serverUrl,
+      token: credentials.token, machineId, runId: run.runId, claimToken: run.claimToken,
+      authorize: createAutomationContextAuthorizer({ studioOrigin: trustedStudioOrigin, token: credentials.token,
+        machineId, runId: run.runId, claimToken: run.claimToken }) });
     const contextHost = contextWorkspace && trustedStudioOrigin ? createAutomationContextHost({
       accountId: await authenticatedAccountId(credentials.token), machineId, happyOrigin: configuration.serverUrl,
       api, workspace: contextWorkspace, journal: createAutomationContextLaunchJournal(configuration.happyHomeDir),
@@ -5199,10 +5204,8 @@ export async function startDaemon(): Promise<void> {
       discover: async sessionId => isAutomationSessionRunning(sessionId) ? 'running' : 'unconfirmed',
       heartbeat: run => apiMachine.serverAutomationTransport().heartbeat(run),
       log: message => logger.warn(message),
-      transportForRun: async run => createAutomationContextTransport({ serverUrl: configuration.serverUrl,
-        token: credentials.token, machineId, runId: run.runId, claimToken: run.claimToken,
-        authorize: createAutomationContextAuthorizer({ studioOrigin: trustedStudioOrigin, token: credentials.token,
-          machineId, runId: run.runId, claimToken: run.claimToken }) }),
+      transportForRun: async run => contextTransportForRun(run),
+      reportExit: async (run, record) => { await contextTransportForRun(run).reportExit(record); },
       resolveContext: async run => {
         // Deferred work obtains a new principal/environment; persisted bearer grants and credentials are never reused.
         const common = { configUrl: `${trustedStudioOrigin}/api/me/mcp-config`, machineToken: credentials.token, machineId,

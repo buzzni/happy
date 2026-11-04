@@ -24,9 +24,12 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
   start: (options: Parameters<AutomationContextLaunchDependencies['start']>[0], context: Context,
     observeChild: (child: ChildProcess) => void) => ReturnType<AutomationContextLaunchDependencies['start']>
   heartbeat: Parameters<typeof createAutomationContextDeferred>[0]['heartbeat']
+  /** Resolves only after the server acknowledges this exact durable positive receipt. */
+  reportExit(run: AutomationContextLaunchRequest, record: AutomationContextLaunchRecord): Promise<void>
   log(message: string): void
 }) {
   const entries = new Map<string, ReturnType<typeof createEntry>>()
+  const maintain = createSerialLock()
   function createEntry(runId: string) {
     const lock = createSerialLock()
     let context: Context | null = null, transport: Transport | null = null
@@ -96,6 +99,25 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
   return {
     dispatch(input: DispatchInput) { return entry(input.runId).dispatch(input) },
     recover(runId: string) { return entry(runId).launcher.recover(runId) },
-    maintain: supervisor.maintain,
+    maintain(signal?: AbortSignal) {
+      return maintain(async () => {
+        await supervisor.maintain(signal)
+        for (const runId of await deps.journal.listRunIds()) {
+          if (signal?.aborted) return
+          const record = await deps.journal.read(runId)
+          if (!record?.exitReceipt || record.exitReceiptAcknowledged) continue
+          try {
+            const launcher = entry(runId).launcher, run = await launcher.restoreRequest(runId)
+            if (!run) throw new Error('AUTOMATION_LAUNCH_SNAPSHOT_INVALID')
+            await deps.reportExit(run, record)
+            await launcher.acknowledgeOwnedExit({ runId, sessionId: record.sessionId, ...record.exitReceipt })
+          } catch (error) {
+            const code = error instanceof Error && /^AUTOMATION_[A-Z0-9_]{1,100}$/.test(error.message)
+              ? error.message : 'AUTOMATION_EXIT_REPORT_UNCONFIRMED'
+            deps.log(`[automation-context] Owned exit report unconfirmed run=${runId} code=${code}`)
+          }
+        }
+      })
+    },
   }
 }
