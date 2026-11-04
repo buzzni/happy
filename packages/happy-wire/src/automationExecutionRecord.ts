@@ -11,7 +11,7 @@ const bytes = (text: string) => new TextEncoder().encode(text).byteLength;
 const automationExecutionSeedBaseSchema = z.strictObject({
   version: z.literal(1), automationId: z.string().min(1).max(200), runId: runIdSchema,
   generation: z.number().int().positive(), revision: z.number().int().positive(),
-  displaySessionId: z.string().min(1).max(200).refine(id => !isAutomationExecutionSessionId(id)),
+  displaySessionId: z.string().min(1).max(200).refine((id): boolean => !isAutomationExecutionSessionId(id)),
   question: z.string().min(1).refine(text => bytes(text) <= AUTOMATION_CONTEXT_INPUT_MAX_BYTES),
   inputBytes: z.number().int().min(1).max(AUTOMATION_CONTEXT_INPUT_MAX_BYTES),
   referenceBytes: z.number().int().min(0).max(AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES),
@@ -50,6 +50,37 @@ export type AutomationExecutionAnswer =
   | { status: 'pending' | 'failed' | 'cancelled' }
   | { status: 'unconfirmed'; reason: string }
   | { status: 'completed'; answer: string; turnId: string; sourceEventId: string };
+
+/** Validate after owner-authorized retrieval and E2EE decryption, using the original creation manifest. */
+export async function readAutomationExecutionRecord(input: {
+  identity: Pick<AutomationExecutionSeed, 'automationId' | 'runId' | 'generation' | 'revision' | 'displaySessionId'>;
+  metadata: unknown;
+  seedMessage: { seq: number; localId: string | null; content: unknown } | null;
+  messages: Array<{ seq: number; localId: string | null; content: unknown }>;
+  complete: boolean;
+}): Promise<{ status: 'unconfirmed'; reason: string } | {
+  status: 'verified'; seed: AutomationExecutionSeed; answer: AutomationExecutionAnswer;
+}> {
+  if (!input.complete) return { status: 'unconfirmed', reason: 'incomplete-pages' };
+  const metadata = z.object({ automationExecutionSeedManifest: automationExecutionSeedManifestSchema }).safeParse(input.metadata);
+  const artifact = automationExecutionSeedArtifactSchema.safeParse(input.seedMessage?.content);
+  if (!metadata.success || !artifact.success || input.seedMessage?.seq !== 1
+    || input.seedMessage.localId !== automationExecutionSeedLocalId(input.identity.runId)) {
+    return { status: 'unconfirmed', reason: 'invalid-seed-artifact' };
+  }
+  const seed = artifact.data.seed, manifest = metadata.data.automationExecutionSeedManifest;
+  for (const key of ['automationId', 'runId', 'generation', 'revision', 'displaySessionId'] as const) {
+    if (seed[key] !== input.identity[key]) return { status: 'unconfirmed', reason: 'seed-identity-conflict' };
+  }
+  const { question, ...seedFields } = seed;
+  const { questionBytes, seedSha256, ...manifestFields } = manifest;
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(seed)));
+  const hash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+  if (bytes(question) !== questionBytes || hash !== seedSha256 || JSON.stringify(seedFields) !== JSON.stringify(manifestFields)) {
+    return { status: 'unconfirmed', reason: 'seed-manifest-conflict' };
+  }
+  return { status: 'verified', seed, answer: readAutomationExecutionAnswer({ ...input, runId: input.identity.runId }) };
+}
 
 /** Reads owned, decrypted evidence pages only; it neither grants access nor proves process quiescence. */
 export function readAutomationExecutionAnswer(input: { runId: string; complete: boolean;

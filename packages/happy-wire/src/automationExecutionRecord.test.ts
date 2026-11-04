@@ -1,7 +1,8 @@
 import { expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
 import { createEnvelope, type SessionEnvelope } from './sessionProtocol';
 import { automationExecutionSeedSchema, automationExecutionSeedManifestSchema, automationExecutionSeedArtifactSchema,
-  readAutomationExecutionAnswer } from './automationExecutionRecord';
+  readAutomationExecutionAnswer, readAutomationExecutionRecord } from './automationExecutionRecord';
 
 const seed = () => ({ version: 1, automationId: 'a1', runId: 'r1', generation: 1, revision: 1,
   displaySessionId: 'manual', question: '원래 질문', inputBytes: 100, referenceBytes: 0,
@@ -11,6 +12,45 @@ const row = (seq: number, ev: SessionEnvelope['ev'], turn = 'turn-A') => {
   return { seq, localId: `automation-evidence:r1:${envelope.id}`, content: { role: 'session', content: envelope } };
 };
 const read = (messages: ReturnType<typeof row>[], complete = true) => readAutomationExecutionAnswer({ runId: 'r1', messages, complete });
+
+function record() {
+  const full = automationExecutionSeedSchema.parse(seed());
+  const { question, ...fields } = full;
+  return { identity: { automationId: 'a1', runId: 'r1', generation: 1, revision: 1, displaySessionId: 'manual' },
+    metadata: { automationExecutionSeedManifest: { ...fields, questionBytes: new TextEncoder().encode(question).length,
+      seedSha256: createHash('sha256').update(JSON.stringify(full)).digest('hex') } },
+    seedMessage: { seq: 1, localId: 'automation-seed:r1', content: { type: 'automation-execution-seed', seed: full } },
+    messages: [row(2, { t: 'turn-start' }), row(3, { t: 'final-answer', text: 'full answer' }), row(4, { t: 'turn-end', status: 'completed' })], complete: true };
+}
+
+it('verifies the immutable question and provenance before returning the full completed answer', async () => {
+  const input = record();
+  expect(await readAutomationExecutionRecord(input)).toMatchObject({ status: 'verified', seed: seed(), answer: { status: 'completed', answer: 'full answer' } });
+  input.messages = [];
+  expect(await readAutomationExecutionRecord(input)).toMatchObject({ status: 'verified', answer: { status: 'pending' } });
+});
+
+it('refuses changed question bytes, manifest fields or source identity even when individual schemas are valid', async () => {
+  for (const edit of [
+    (value: ReturnType<typeof record>) => { value.seedMessage.content.seed.question = 'changed question'; },
+    (value: ReturnType<typeof record>) => { value.metadata.automationExecutionSeedManifest.questionBytes++; },
+    (value: ReturnType<typeof record>) => { value.metadata.automationExecutionSeedManifest.inputBytes++; },
+    (value: ReturnType<typeof record>) => { value.identity.revision++; },
+    (value: ReturnType<typeof record>) => { value.identity.automationId = 'different-automation'; },
+    (value: ReturnType<typeof record>) => { value.identity.displaySessionId = 'different-display'; },
+  ]) {
+    const input = record(); edit(input);
+    expect(await readAutomationExecutionRecord(input)).toMatchObject({ status: 'unconfirmed' });
+  }
+});
+
+it('refuses missing, malformed or misattributed seed artifacts and incomplete evidence pages', async () => {
+  for (const seedMessage of [null, { ...record().seedMessage, seq: 2 }, { ...record().seedMessage, localId: 'automation-seed:r2' },
+    { ...record().seedMessage, content: { ...record().seedMessage.content, assembledPrompt: 'recursive input' } }]) {
+    expect(await readAutomationExecutionRecord({ ...record(), seedMessage })).toMatchObject({ status: 'unconfirmed' });
+  }
+  expect(await readAutomationExecutionRecord({ ...record(), complete: false })).toEqual({ status: 'unconfirmed', reason: 'incomplete-pages' });
+});
 
 it('validates the bounded authored question without claiming whole native token measurement', () => {
   expect(automationExecutionSeedSchema.parse(seed())).toEqual(seed());

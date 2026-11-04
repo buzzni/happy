@@ -1,8 +1,8 @@
 import { expect, it, vi } from 'vitest'
-import { randomBytes, randomUUID, createHash } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 import type { ChildProcess } from 'node:child_process'
-import { automationExecutionSeedArtifactSchema, automationExecutionSeedManifestSchema, readAutomationExecutionAnswer,
+import { readAutomationExecutionRecord,
   sessionCreateBodyHash, type AutomationPayload } from '@slopus/happy-wire'
 import { signAutomationExecutionTarget } from '@slopus/happy-wire/automationExecutionToken'
 import { ApiClient } from '@/api/api'
@@ -109,15 +109,14 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
       const evidence = await fixture.http(`/v1/sessions/${displaySessionId}/automation-runs/${runId}/evidence`)
       expect(evidence.status).toBe(200); expect(evidence.body.nextAfterSeq).toBeNull()
       const original = decrypt(key, receipt.prepared.encryptionVariant, decodeBase64(evidence.body.seedManifestCiphertext)) as any
-      const manifest = automationExecutionSeedManifestSchema.parse(original.automationExecutionSeedManifest)
-      const artifact = automationExecutionSeedArtifactSchema.parse(decrypt(key, receipt.prepared.encryptionVariant,
-        decodeBase64(evidence.body.seedMessage.content.c)))
-      expect(artifact.seed.question).toBe(payload.prompt)
-      expect(manifest.seedSha256).toBe(createHash('sha256').update(JSON.stringify(artifact.seed)).digest('hex'))
-      const answer = readAutomationExecutionAnswer({ runId, complete: true, messages: evidence.body.messages.map((message: StoredMessage) => ({
+      const result = await readAutomationExecutionRecord({ identity: { runId, automationId: info.automationId, generation: info.generation,
+        revision: info.revision, displaySessionId }, metadata: original, complete: true,
+        seedMessage: { ...evidence.body.seedMessage, content: decrypt(key, receipt.prepared.encryptionVariant, decodeBase64(evidence.body.seedMessage.content.c)) },
+        messages: evidence.body.messages.map((message: StoredMessage) => ({
         ...message, content: decrypt(key, receipt.prepared.encryptionVariant, decodeBase64(message.content.c)),
       })) })
-      expect(answer).toMatchObject({ status: 'completed', answer: `fixture reply ${marker}` })
+      expect(result).toMatchObject({ status: 'verified', seed: { question: payload.prompt },
+        answer: { status: 'completed', answer: `fixture reply ${marker}` } })
       expect(await seedRun(fixture, { action: 'complete-context', accountId: fixture.accountId, machineId, claimToken,
         reportId: randomUUID(), runId, sessionId: receipt.sessionId })).toMatchObject({ ok: true })
     }
