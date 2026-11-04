@@ -1182,8 +1182,9 @@ async function workspaceRemoteStatus(
     return serialized(dir, async () => {
         if (!await isRepositoryRoot(dir)) return { isRepo: false, head: null, branch: null, dirtyCount: 0, ahead: null, behind: null, baseBehind: null };
         await requirePinnedOrigin(pins, dir, params.remoteUrl);
-        const online = await fetchBranch(dir, 'origin', params.branch, credential, true);
-        const base = params.baseBranch ? await fetchBranch(dir, 'origin', params.baseBranch, credential, true) : null;
+        const remote = credential && params.remoteUrl ? params.remoteUrl : 'origin';
+        const online = await fetchBranch(dir, remote, params.branch, credential, true);
+        const base = params.baseBranch ? await fetchBranch(dir, remote, params.baseBranch, credential, true) : null;
         const head = await headCommit(dir);
         const behind = (target: string | null) => target === null ? null : countCommits(dir, head ? `${head}..${target}` : target);
         return {
@@ -1262,8 +1263,9 @@ async function pullWorkspaceRemote(
         // A conflict an earlier pull left is the user's to resolve: committing it would save the markers.
         const unresolved = await unmergedPaths(dir);
         if (unresolved.length > 0) return { status: 'conflict', head, conflictCount: unresolved.length };
-        const targets = [(await fetchBranch(dir, 'origin', params.branch, credential, false))!];
-        if (params.baseBranch) targets.push((await fetchBranch(dir, 'origin', params.baseBranch, credential, false))!);
+        const remote = credential && params.remoteUrl ? params.remoteUrl : 'origin';
+        const targets = [(await fetchBranch(dir, remote, params.branch, credential, false))!];
+        if (params.baseBranch) targets.push((await fetchBranch(dir, remote, params.baseBranch, credential, false))!);
         return params.mode === 'ff-only'
             ? fastForwardWorkspace(dir, params, targets, head, credential)
             : mergeIntoWorkspace(dir, params, targets);
