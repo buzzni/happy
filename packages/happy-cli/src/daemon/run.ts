@@ -90,6 +90,7 @@ import { preflightDaemonControlServer, startDaemonControlServer } from './contro
 import { BrowserBridge } from './browserBridge';
 import { BrowserLocalSetup, shouldEnableBrowserLocalSetup } from './browserLocalSetup';
 import { fetchBrowserExtensionScope } from './browserExtensionScope';
+import { writeBrowserBridgeOwnerHome } from './browserBridgeOwner';
 import { readBrowserSetupPolicy, writeBrowserSetupPolicy, localBrowserExtensionMetadata } from './browserLocalSetupStore';
 import { BrowserSessionBrokerClient } from './browserSessionBrokerContract';
 import { getBusyDaemonTerminalCount, getDaemonTerminalSessionCount } from './daemonTerminalSessions';
@@ -4155,6 +4156,9 @@ export async function startDaemon(): Promise<void> {
           ,consumeSetup: setupCandidate ? id => setupCandidate.consume(id) : undefined
         });
         stopBrowserBridge = bridgeServer.stop;
+        // Chrome's native host finds this daemon through this record when its home is not a documented one.
+        if (setupCandidate) await writeBrowserBridgeOwnerHome(os.homedir(), configuration.happyHomeDir)
+          .catch(error => logger.warn(`[DAEMON RUN] Browser bridge owner not recorded; extension connection may not find this daemon: ${error instanceof Error ? error.message : String(error)}`));
         if (bridgeHost !== '127.0.0.1') {
           logger.debug(`[DAEMON RUN] Browser bridge bound to ${bridgeHost} (HAPPY_BROWSER_BRIDGE_HOST) — not loopback-only`);
         }
