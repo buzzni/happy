@@ -1204,6 +1204,7 @@ export async function runCodex(opts: {
         hasTitle: () => session.hasTitle(),
         log: (message, detail) => logger.warn(message, detail),
     });
+    let workspaceTitleObserved = false;
 
     /**
      * Handles session termination and process exit.
@@ -2776,6 +2777,10 @@ export async function runCodex(opts: {
                         ...(lessonRecall?.outcome === 'selected' ? { lessonBlock: lessonRecall.block } : {}),
                         ...(memoryRecall?.reason === 'context_returned' ? { memoryBlock: buildCodexMemoryReferenceBlock(memoryRecall.context) } : {}),
                     });
+                    if (workspaceControl && runtimeGate && !workspaceTitleObserved && offTurnTitle.covers()) {
+                        workspaceTitleObserved = true;
+                        void runtimeGate.admit(() => offTurnTitle.settled(), 'writer').catch(() => logger.warn('[workspace-context] Title writer unconfirmed'));
+                    }
                     // The worker awaited after the permit was granted. Keep consumption at
                     // the synchronous dispatch boundary so channel cancellation still wins.
                     if (!isCurrentCapacityContinuation(message.mode)) { lessonProposalTurn.cancel(); continue; }

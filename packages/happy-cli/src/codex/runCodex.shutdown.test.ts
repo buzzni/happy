@@ -41,7 +41,7 @@ const fixture = vi.hoisted(() => ({
         inputEvidence: { attempt: vi.fn(() => ({ settle: vi.fn() })), cancelContinuation: vi.fn(), continuePending: vi.fn(), takeContinuation: vi.fn() },
         sessionId: 'lesson-session', getMetadata: () => ({ path: '/tmp/lesson-test', mcpServers: [{ name: 'cached-server', status: 'connected' }] }),
         drainAttachmentsForUserMessage: vi.fn(async () => []),
-        onUserMessage: vi.fn(), onFileEvent: vi.fn(), on: vi.fn(), hasTitle: () => true,
+        onUserMessage: vi.fn(), onFileEvent: vi.fn(), on: vi.fn(), hasTitle: (): boolean => true,
         sendSessionEvent: vi.fn(), sendSessionProtocolMessage: vi.fn(), sendSessionMessage: vi.fn(),
         updateMetadata: vi.fn(), updateAgentState: vi.fn(), keepAlive: vi.fn(() => { fixture.events.push('keepAlive'); }),
         sendSessionDeath: vi.fn(), flush: vi.fn(async () => {}), close: vi.fn(async () => {}),
@@ -70,7 +70,7 @@ vi.mock('@/codex/codexSkills', () => ({ discoverCodexSkillCommands: vi.fn(async 
 vi.mock('@/aplus/fetchAplusMcpServers', async (original) => ({ ...await original<typeof import('@/aplus/fetchAplusMcpServers')>(), fetchAplusMcpConfigSnapshot: vi.fn(async () => null) }));
 vi.mock('@/codex/codexMcpConfigSynchronizer', () => ({ CodexMcpConfigSynchronizer: class { mcpServers = {}; sync = async () => ({ mcpServers: this.mcpServers }); } }));
 vi.mock('@/codex/codexMcpRuntimeRecovery', () => ({ CodexMcpRuntimeRecovery: class { recoverBeforeTurn = fixture.recoverMcp; readStatuses = fixture.readMcpStatuses; } }));
-vi.mock('@/claude/utils/startHappyServer', () => ({ startHappyServer: vi.fn(async (_session, options) => {
+vi.mock('@/claude/utils/startHappyServer', () => ({ createChangeTitleHandler: vi.fn(), startHappyServer: vi.fn(async (_session, options) => {
     fixture.submit = options.proposeLesson;
     fixture.admitTool = options.admitTool;
     return { url: 'http://127.0.0.1:1', toolNames: ['propose_lesson'], stop: vi.fn(() => { fixture.events.push('mcpStopped'); }) };
@@ -86,6 +86,9 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     waitForOutputDrain = async () => {};
     cancelOutputDrain = () => {};
     finishShutdownObservation = () => {};
+    finishWorkspaceContext = async () => ({ foregroundDrained: true, backgroundDrained: true, providerExitedCleanly: true });
+    canDrainWorkspace = async () => true;
+    sideCommandAllowed = true;
     clearThreadState = vi.fn(() => { fixture.onClearThreadState?.(); });
     authRecoverySource = 'cli-login';
     authRecoveryBusy = false;
@@ -145,7 +148,7 @@ afterEach(() => {
 });
 afterEach(() => { process.exitCode = originalExitCode; vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.clearAllMocks(); fixture.onSend = null; fixture.onInterrupt = null; fixture.onSteer = null; fixture.onConnect = null; fixture.onResumeThread = null; fixture.steerText = ''; fixture.omitCompletionObservers = false; fixture.completionThread = { id: 'thread', path: '/tmp/native-rollout.jsonl' }; fixture.readThread.mockReset().mockResolvedValue({ thread: { id: 'thread', path: '/tmp/native-rollout.jsonl' } }); fixture.gate = null; fixture.events = []; fixture.session.freezeInboundMessagesForShutdown.mockReturnValue(true); });
 afterEach(() => { fixture.recoverMcp.mockReset().mockResolvedValue({ status: 'ready', affectedServers: [] }); fixture.readMcpStatuses.mockReset().mockResolvedValue([]); });
-async function start(prompt = 'Test input', confirmed = false, review?: import('@/memory/lessonReviewWorker').LessonReviewWorker, standaloneLaunch?: StandaloneLaunchBootstrap, resumeThreadId?: string, reconnect?: import('@/daemon/reconnectSessionEnv').ReconnectSessionClientSnapshot, launch?: { args?: string[]; modelSeed?: string }) {
+async function start(prompt = 'Test input', confirmed = false, review?: import('@/memory/lessonReviewWorker').LessonReviewWorker, standaloneLaunch?: StandaloneLaunchBootstrap, resumeThreadId?: string, reconnect?: import('@/daemon/reconnectSessionEnv').ReconnectSessionClientSnapshot, launch?: { args?: string[]; modelSeed?: string; keepOpen?: boolean }) {
     for (const key of Object.keys(process.env)) {
         if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_)/.test(key)) vi.stubEnv(key, undefined);
     }
@@ -156,13 +159,13 @@ async function start(prompt = 'Test input', confirmed = false, review?: import('
         vi.stubEnv('HAPPY_AUTOMATION_RESUME_PROMPT', '1');
     }
     if (confirmed) { vi.stubEnv('HAPPY_MANAGED_REQUIRE_PROMPT_ACK', '1'); vi.stubEnv('HAPPY_INITIAL_PROMPT_LOCAL_ID', 'test-ack'); }
-    vi.stubEnv('HAPPY_AUTOMATION_RUN_ONCE', '1');
+    vi.stubEnv('HAPPY_AUTOMATION_RUN_ONCE', launch?.keepOpen ? undefined : '1');
     if (launch?.args) {
         const { handleCodexCommand } = await import('@/commands/codexCommand');
         return handleCodexCommand(['--started-by', 'daemon', '--no-sandbox', ...(resumeThreadId ? ['--resume', resumeThreadId] : []), ...launch.args]);
     }
     const { runCodex } = await import('./runCodex');
-    return runCodex({ principal: { kind: 'account', credentials: { token: 'test-token' } as never }, noSandbox: true, ...(resumeThreadId ? { resumeThreadId } : {}), ...(standaloneLaunch ? { standaloneLaunch, startedBy: 'daemon' as const } : {}), ...(review ? { lessons: { turn: null, review, sessionKind: 'foreground' as const } } : {}) });
+    return runCodex({ principal: { kind: 'account', credentials: { token: 'test-token' } as never }, noSandbox: true, ...(resumeThreadId ? { resumeThreadId } : {}), ...(standaloneLaunch ? { standaloneLaunch, startedBy: 'daemon' as const } : {}), ...(launch?.keepOpen ? { startedBy: 'daemon' as const } : {}), ...(review ? { lessons: { turn: null, review, sessionKind: 'foreground' as const } } : {}) });
 }
 async function finishFrozenFixture(running: Promise<void>) {
     await vi.waitFor(() => expect(fixture.events).toContain('loopExited'));
@@ -172,6 +175,26 @@ async function finishFrozenFixture(running: Promise<void>) {
     await running;
 }
 describe('Codex runtime producer bookkeeping', () => {
+    it('retains workspace ownership through a title write after the foreground turn has ended', async () => {
+        const control = { bind: vi.fn(), close: vi.fn(), reportExit: vi.fn(async () => true) };
+        vi.spyOn(await import('@/utils/workspaceContextControl'), 'takeWorkspaceContextControl').mockReturnValue(control);
+        vi.spyOn(fixture.session, 'hasTitle').mockReturnValue(false);
+        vi.spyOn(await import('./codexOffTurnTitle'), 'createCodexExecTitleRunner').mockReturnValue(async () => JSON.stringify({ title: 'A title', branchSlug: 'a-title' }));
+        let release!: () => void;
+        const titleWrite = vi.fn(() => new Promise<{ success: boolean }>(resolve => { release = () => resolve({ success: true }); }));
+        vi.mocked((await import('@/claude/utils/startHappyServer')).createChangeTitleHandler).mockReturnValue(titleWrite);
+        const running = start('Title this manual conversation', false, undefined, undefined, undefined, undefined, { keepOpen: true });
+        try {
+            await vi.waitFor(() => expect(titleWrite).toHaveBeenCalledOnce(), { timeout: 5000 });
+            await vi.waitFor(() => expect(fixture.events).toContain('endTurn'));
+            expect(fixture.gate!.isWorkspaceIdle()).toBe(false);
+            expect(fixture.gate!.hasLiveProducers()).toBe(true);
+            release();
+            await vi.waitFor(() => expect(fixture.gate!.isWorkspaceIdle()).toBe(true));
+        } finally {
+            release?.(); fixture.closeQueue?.(); await running;
+        }
+    });
     it('lets Codex resolve the native model for a fresh Default launch', async () => {
         await start('Default first prompt');
         expect(fixture.startThread).toHaveBeenCalledWith(expect.objectContaining({ model: undefined }));
