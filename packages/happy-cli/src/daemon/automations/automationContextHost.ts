@@ -10,8 +10,11 @@ import type { ServerAutomationRuntimeStore } from './serverAutomationRuntimeStor
 
 type Dispatch = NonNullable<ServerAutomationExecutorInput['dispatchIsolatedContext']>
 type DispatchInput = Parameters<Dispatch>[0]
+type Cancellation = NonNullable<ServerAutomationExecutorInput['cancelIsolatedContext']>
 type Context = Pick<DispatchInput, 'environmentVariables' | 'mcpSpawnContext'>
-type Transport = Pick<AutomationContextLaunchDependencies, 'register' | 'persistSeed'>
+type Transport = Pick<AutomationContextLaunchDependencies, 'register' | 'persistSeed'> & {
+  verifyStart: NonNullable<AutomationContextLaunchDependencies['beforeStart']>
+}
 
 /** Daemon composition only. Encrypted creation/claim material never crosses a browser RPC. The host must
  * attach observeChild synchronously at the owned spawn, and run maintain before its regular report flush. */
@@ -26,6 +29,8 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
   heartbeat: Parameters<typeof createAutomationContextDeferred>[0]['heartbeat']
   /** Resolves only after the server acknowledges this exact durable positive receipt. */
   reportExit(run: AutomationContextLaunchRequest, record: AutomationContextLaunchRecord): Promise<void>
+  /** Requests termination only. Neither the ACK nor PID absence proves writer release. */
+  stopExecution?(input: { sessionId: string; directory: string }): Promise<void>
   log(message: string): void
 }) {
   const entries = new Map<string, ReturnType<typeof createEntry>>()
@@ -46,7 +51,10 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
         try { return await current.persistSeed(session, message) }
         finally { transport = null }
       },
-      beforeStart: async run => { context = await deps.resolveContext(run) },
+      beforeStart: async (run, prepared) => {
+        context = await deps.resolveContext(run)
+        await (await deps.transportForRun(run, prepared)).verifyStart(run, prepared)
+      },
       start: async options => {
         if (!context || options.agent !== 'claude' && options.agent !== 'codex') throw new OwnedStartRefused('validation-error')
         const provider = options.agent
@@ -66,7 +74,23 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
         return started
       },
     })
-    return { launcher, dispatch(input: DispatchInput) {
+    return { launcher,
+      cancel(request: Parameters<Cancellation>[0]) {
+        return lock(async () => {
+          const record = await deps.journal.read(runId)
+          if (!record) throw new Error('AUTOMATION_LAUNCH_SNAPSHOT_INVALID')
+          if (record.automationId !== request.automationId || record.generation > request.generation || record.revision > request.revision) return true
+          const run = await launcher.restoreRequest(runId)
+          if (!run) throw new Error('AUTOMATION_LAUNCH_SNAPSHOT_INVALID')
+          if (await launcher.cancelUnsubmitted(runId)) return true
+          if ((await launcher.recover(runId))?.state === 'ended') return true
+          if (!deps.stopExecution) return false
+          await deps.stopExecution({ sessionId: record.sessionId, directory: run.payload.directory })
+          const confirmed = (await launcher.recover(runId))?.state === 'ended'
+          if (!confirmed) deps.log(`[automation-context] Owned cancellation exit remains unconfirmed run=${runId}`)
+          return confirmed
+        })
+      }, dispatch(input: DispatchInput) {
       return lock(async () => {
         context = { environmentVariables: input.environmentVariables, mcpSpawnContext: input.mcpSpawnContext }
         try {
@@ -98,6 +122,16 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
       deps.runtimeStore.write({ ...state, pendingReports: [...state.pendingReports, report] })
     }, log: deps.log })
   return {
+    async cancelAutomation(request: Parameters<Cancellation>[0]): Promise<boolean> {
+      let confirmed = true
+      for (const runId of await deps.journal.listRunIds()) {
+        const record = await deps.journal.read(runId)
+        if (record?.automationId === request.automationId && record.generation <= request.generation && record.revision <= request.revision) {
+          if (!await entry(runId).cancel(request)) confirmed = false
+        }
+      }
+      return confirmed
+    },
     dispatch(input: DispatchInput) { return entry(input.runId).dispatch(input) },
     recover(runId: string) { return entry(runId).launcher.recover(runId) },
     maintain(signal?: AbortSignal) {
@@ -125,8 +159,9 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
 
 
 /** Prepare the new execution path without making it a prerequisite of legacy ticking. */
-export async function prepareAutomationContextTick(host: Pick<ReturnType<typeof createAutomationContextHost>, 'maintain' | 'dispatch'> | null,
-  signal: AbortSignal, log: (message: string) => void): Promise<{ isolatedContextReady: boolean; dispatchIsolatedContext?: Dispatch }> {
+export async function prepareAutomationContextTick(host: (Pick<ReturnType<typeof createAutomationContextHost>, 'maintain' | 'dispatch'>
+  & Partial<Pick<ReturnType<typeof createAutomationContextHost>, 'cancelAutomation'>>) | null,
+  signal: AbortSignal, log: (message: string) => void): Promise<{ isolatedContextReady: boolean; dispatchIsolatedContext?: Dispatch; cancelIsolatedContext?: Cancellation }> {
   if (!host || signal.aborted) return { isolatedContextReady: false }
   try { await host.maintain(signal) }
   catch {
@@ -134,5 +169,6 @@ export async function prepareAutomationContextTick(host: Pick<ReturnType<typeof 
     log('[automation-context] Recovery unconfirmed; isolated admission paused for this tick')
     return { isolatedContextReady: false }
   }
-  return signal.aborted ? { isolatedContextReady: false } : { isolatedContextReady: true, dispatchIsolatedContext: host.dispatch }
+  return signal.aborted ? { isolatedContextReady: false } : { isolatedContextReady: true,
+    dispatchIsolatedContext: host.dispatch, ...(host.cancelAutomation ? { cancelIsolatedContext: host.cancelAutomation } : {}) }
 }

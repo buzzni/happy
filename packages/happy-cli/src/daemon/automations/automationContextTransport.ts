@@ -55,7 +55,10 @@ export function createAutomationContextAuthorizer(input: {
 export function createAutomationContextTransport(input: {
   serverUrl: string; token: string; machineId: string; runId: string; claimToken: string;
   authorize(target: AutomationContextTargetRequest): Promise<z.infer<typeof admissionSchema>>
-}): Pick<AutomationContextLaunchDependencies, 'register' | 'persistSeed'> & { reportExit(record: AutomationContextLaunchRecord): Promise<void> } {
+}): Pick<AutomationContextLaunchDependencies, 'register' | 'persistSeed'> & {
+  verifyStart: NonNullable<AutomationContextLaunchDependencies['beforeStart']>
+  reportExit(record: AutomationContextLaunchRecord): Promise<void>
+} {
   const url = new URL(input.serverUrl)
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash
     || !input.token || !input.machineId || !input.claimToken || input.claimToken.length > 256) throw new Error('AUTOMATION_CONTEXT_TRANSPORT_INVALID')
@@ -70,6 +73,16 @@ export function createAutomationContextTransport(input: {
     try { return await response.json() } catch { throw new Error('AUTOMATION_CONTEXT_RESPONSE_INVALID') }
   }
   return {
+    async verifyStart(run, prepared) {
+      const displaySessionId = run.payload.conversation?.sessionId
+      if (run.runId !== input.runId || run.claimToken !== input.claimToken || prepared.body.tag !== sessionId || !displaySessionId
+        || (run.payload.agent !== 'claude' && run.payload.agent !== 'codex')) throw new Error('AUTOMATION_CONTEXT_IDENTITY_CONFLICT')
+      // Recheck the strict issuer after waiting without creating another session or seed.
+      const admission = admissionSchema.parse(await input.authorize({ automationId: run.automationId, runId: run.runId,
+        generation: run.generation, revision: run.revision, machineId: input.machineId, displaySessionId,
+        conversationDirectory: run.payload.directory, agent: run.payload.agent, body: structuredClone(prepared.body) }))
+      if (admission.executionBindingRequired && !admission.executionProof) throw new Error('AUTOMATION_EXECUTION_PROOF_REQUIRED')
+    },
     async reportExit(record) {
       if (record.runId !== input.runId || record.sessionId !== sessionId || record.prepared.body.tag !== sessionId || !record.exitReceipt) {
         throw new Error('AUTOMATION_EXIT_RECEIPT_CONFLICT')

@@ -4411,6 +4411,21 @@ describe('isolated scheduled conversation admission', () => {
     expect(cancel).not.toHaveBeenCalled();
     expect(markCancelled).not.toHaveBeenCalled();
   });
+
+  it.each([false, true])('routes isolated cancellation only through the original run-owned adapter (confirmed=%s)', async confirmed => {
+    const f = setup(), record = { ...cacheRecord(), payloadVersion: 6 as const };
+    const base = f.input.decryptPayload(cacheRecord(), new Uint8Array(32));
+    f.input.decryptPayload = () => ({ ...base, conversation: { sessionId: 'manual' }, contextPolicy: { kind: 'isolated', reference: null } });
+    const cache = f.input.cache.read();
+    f.input.cache.read = () => ({ ...cache, automations: [], pendingCancellations: [record] });
+    const cancel = vi.fn(async () => confirmed), manualCancel = vi.fn(async () => true), markCancelled = vi.fn();
+    f.input.cancelScheduledSession = manualCancel; f.input.cache.markCancelled = markCancelled;
+    const input = { ...f.input, cancelIsolatedContext: cancel };
+    await runServerAutomationTick(input);
+    expect(cancel).toHaveBeenCalledExactlyOnceWith({ automationId: record.automationId, revision: record.revision, generation: record.generation });
+    expect(manualCancel).not.toHaveBeenCalled(); expect(f.spawnSession).not.toHaveBeenCalled(); expect(f.resumeSession).not.toHaveBeenCalled();
+    expect(markCancelled.mock.calls).toEqual(confirmed ? [[[{ automationId: record.automationId, revision: record.revision }]]] : []);
+  });
 });
 
 describe('ordinary scheduled conversation execution', () => {

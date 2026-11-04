@@ -37,6 +37,7 @@ async function seedRun(fixture: SessionWriteScopeFixture, input: Record<string, 
 
 it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
   { state: 'paused', provider: 'claude', encryptionVariant: 'legacy' },
+  { state: 'paused-after-wait', provider: 'claude', encryptionVariant: 'legacy' },
   { state: 'active', provider: 'codex', encryptionVariant: 'legacy' },
   { state: 'active', provider: 'claude', encryptionVariant: 'dataKey' },
   { state: 'active', provider: 'codex', encryptionVariant: 'dataKey' },
@@ -50,7 +51,7 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
   { state: 'background', provider: 'claude', encryptionVariant: 'legacy' }] as const)(
   'restores a durable $state $provider $encryptionVariant occurrence through the real daemon without replaying or ignoring a stop', async ({ state, provider, encryptionVariant }) => {
   const chatStopped = state === 'archived' || state === 'deleted'
-  const shouldRun = state !== 'paused' && !chatStopped
+  const shouldRun = state !== 'paused' && state !== 'paused-after-wait' && !chatStopped
   const isManual = state === 'manual' || state === 'queued' || state === 'background'
   vi.stubEnv('HAPPY_SCOPE_FRESH_PROVIDER_STATE', '1')
   vi.stubEnv('HAPPY_SCOPE_PACKAGED_SERVER', undefined)
@@ -65,6 +66,7 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
     responseGates.set(queuedMarker, new Promise<void>(resolve => { releaseSecond = resolve }))
   }
   const calls: string[] = []
+  let pausedAfterAdmission = false
   let backgroundIssued = false
   const backgroundPath = (name: string) => join(fixture.project, `context-background-${name}`)
   const backgroundFile = async (name: string, expected: string) => {
@@ -83,6 +85,16 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
       calls.push(request.url)
       if (request.url === '/api/automation/project-environment') {
         if (body.conversationSessionId !== run.displaySessionId || body.conversationDirectory !== fixture.project) { reply(403, {}); return }
+        if (state === 'paused-after-wait' && !pausedAfterAdmission) {
+          const registry = JSON.parse(await readFile(join(fixture.happyHome, 'workspace-turn-admission.v1', 'owners.json'), 'utf8'))
+          if (registry.owners.some((owner: { sessionId: string; kind: string }) => owner.sessionId === `automation-run:${runId}` && owner.kind === 'automation')) {
+            const changed = await fetch(`${fixture.serverUrl}/v1/projects/${encodeURIComponent(run.projectId)}/automations/${encodeURIComponent(run.automationId)}`, {
+              method: 'PATCH', headers: { Authorization: `Bearer ${fixture.token}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ expectedRevision: run.revision, paused: true }), signal: AbortSignal.timeout(10_000) })
+            if (changed.status !== 200) throw new Error('Pause after admission failed')
+            await changed.body?.cancel(); pausedAfterAdmission = true
+          }
+        }
         reply(200, { projectId: run.projectId, conversationSessionId: run.displaySessionId,
           conversationDirectory: fixture.project, environmentVariables: {} }); return
       }
@@ -243,6 +255,7 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
       expect(calls).toContain('/api/automation/mcp-caller-grant')
     }
     if (!manualSessionId) expect(fixture.modelRequests).toHaveLength(shouldRun ? 1 : 0)
+    if (state === 'paused-after-wait') expect(pausedAfterAdmission).toBe(true)
     if (shouldRun) {
       const automaticInputs = fixture.modelRequests.filter(body => body.includes(marker))
       expect(automaticInputs).toHaveLength(1)

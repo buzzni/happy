@@ -204,6 +204,8 @@ export interface ServerAutomationExecutorInput {
   /** Private run-owned runtime. The payload is the authored snapshot, never an assembled legacy conversation prompt. */
   /** A failed host recovery holds isolated occurrences before claim, preserving once schedules. */
   isolatedContextReady?: boolean
+  /** Acknowledges only original run-owned cancellation, never a manual display session. */
+  cancelIsolatedContext?: (input: { automationId: string; revision: number; generation: number }) => Promise<boolean>
   dispatchIsolatedContext?: (input: { automationId: string; generation: number; revision: number; runId: string; claimToken: string;
     payload: ServerAutomationPayload; environmentVariables: Record<string, string>; mcpSpawnContext?: AutomationMcpSpawnContext }) => Promise<{
       state: 'started' | 'waiting' | 'needs-attention'; sessionId: string; reason?: string;
@@ -1993,7 +1995,10 @@ export async function runServerAutomationTick(
     try {
       const payload = input.decryptPayload(cancelled, input.machineSecretKey)
       if (payload.contextPolicy) {
-        input.logDebug?.(`[server-automation] ${cancelled.automationId} isolated cancellation pending: run-owned execution adapter unavailable`)
+        if (cancelled.payloadVersion === 6 && await input.cancelIsolatedContext?.({ automationId: cancelled.automationId,
+          revision: cancelled.revision, generation: cancelled.generation })) {
+          input.cache.markCancelled?.([{ automationId: cancelled.automationId, revision: cancelled.revision }])
+        } else input.logDebug?.(`[server-automation] ${cancelled.automationId} isolated cancellation pending: run-owned exit unconfirmed`)
         continue
       }
       const sessionId = payload.conversation?.sessionId ?? input.runtimeStore.read().schedules.find(row => row.automationId === cancelled.automationId)?.lastSessionId

@@ -108,6 +108,19 @@ it('registers and stores the exact E2EE seed over authenticated HTTP before subm
   expect(f.start).toHaveBeenCalledOnce()
 })
 
+it('rechecks strict admission against the immutable body without re-registering a session or seed', async () => {
+  const f = await setup(); await f.launcher.launch(f.input)
+  const record = (await f.deps.journal.read('r1'))!
+  requests.length = 0
+  await f.transport.verifyStart(f.input, record.prepared)
+  expect(f.authorize).toHaveBeenCalledTimes(2)
+  expect(f.authorize.mock.calls[1]).toEqual(f.authorize.mock.calls[0])
+  f.authorize.mockRejectedValueOnce(new Error('AUTOMATION_CONTEXT_AUTHORITY_DENIED'))
+  await expect(f.transport.verifyStart(f.input, record.prepared)).rejects.toThrow('AUTOMATION_CONTEXT_AUTHORITY_DENIED')
+  expect(requests).toHaveLength(0)
+  expect(f.prepare).toHaveBeenCalledOnce(); expect(f.start).toHaveBeenCalledOnce()
+})
+
 it('does not confirm an unobserved child or replay it after a spawn ACK without the owned observation pipe', async () => {
   const f = await setup(), directory = join(home, 'workspace'); await mkdir(directory)
   f.input.payload.directory = directory
@@ -131,6 +144,42 @@ it('does not confirm an unobserved child or replay it after a spawn ACK without 
   expect(f.start).toHaveBeenCalledOnce()
   expect(resolveContext).toHaveBeenCalledOnce()
   expect(await workspace.beginManualLaunch([directory])).toHaveProperty('acquired', false)
+})
+
+it.each(['waiting', 'unconfirmed'] as const)('cancels only original isolated executions and preserves uncertain custody (%s)', async state => {
+  const f = await setup(), directory = join(home, 'workspace'); await mkdir(directory)
+  f.input.payload.directory = directory; f.input.generation = 2; f.input.revision = 2
+  const workspace = createAutomationContextWorkspace({ home, isTracked: async () => false })
+  const manual = state === 'waiting' ? await workspace.beginManualLaunch([directory]) : null
+  const stopExecution = vi.fn(async () => {})
+  const deps = { ...f.deps, workspace, stopExecution,
+    reportExit: async () => { throw new Error('No exit reporting in cancellation fixture') },
+    runtimeStore: createServerAutomationRuntimeStore({ filePath: join(home, 'runtime.json') }),
+    transportForRun: async () => f.transport, resolveContext: async () => ({ environmentVariables: {} }),
+    heartbeat: async () => ({ ok: true }), log: vi.fn(), start: f.start }
+  const host = createAutomationContextHost(deps)
+  if (state === 'waiting') expect(await host.dispatch({ ...f.input, environmentVariables: {} })).toHaveProperty('state', 'waiting')
+  else await expect(host.dispatch({ ...f.input, environmentVariables: {} })).rejects.toThrow('AUTOMATION_CHILD_OBSERVATION_UNCONFIRMED')
+  const cancel = host.cancelAutomation
+  expect(await cancel({ automationId: 'another-automation', generation: 2, revision: 2 })).toBe(true)
+  expect(await cancel({ automationId: f.input.automationId, generation: 1, revision: 1 })).toBe(true)
+  expect(stopExecution).not.toHaveBeenCalled()
+  expect(await f.deps.journal.read('r1')).not.toHaveProperty('cancelledBeforeSubmit')
+  const identity = { automationId: f.input.automationId, generation: 2, revision: 2 }
+  expect(await cancel(identity)).toBe(state === 'waiting')
+  if (manual?.acquired) {
+    expect(await f.deps.journal.read('r1')).toHaveProperty('cancelledBeforeSubmit', true)
+    expect(stopExecution).not.toHaveBeenCalled(); expect(f.start).not.toHaveBeenCalled()
+    expect(await manual.finish({ submitted: false, tracked: false })).toBe(true)
+  } else {
+    expect(stopExecution).toHaveBeenCalledExactlyOnceWith({ sessionId: 'automation-run:r1', directory })
+    expect(await workspace.beginManualLaunch([directory])).toHaveProperty('acquired', false)
+    // The owned observer, not stop ACK/PID disappearance, supplies a positive durable exit.
+    await createAutomationContextLauncher({ ...f.deps, workspace }).recordOwnedExit({ runId: 'r1', sessionId: 'automation-run:r1', provider: 'codex' })
+    expect(await cancel(identity)).toBe(true)
+    expect(stopExecution).toHaveBeenCalledOnce(); expect(f.start).toHaveBeenCalledOnce()
+    expect(await workspace.beginManualLaunch([directory])).toHaveProperty('acquired', true)
+  }
 })
 
 it('retries the same durable exit receipt after a lost server ACK without replaying the provider', async () => {
@@ -254,14 +303,15 @@ it.each([null, 'http://untrusted.example', 'https://studio.example/path', 'https
 
 
 it.each(['ready', 'broken', 'missing', 'aborted'] as const)('prepares legacy ticking without admitting isolated work after failed recovery (%s)', async state => {
-  const controller = new AbortController(), dispatch = vi.fn(), log = vi.fn()
+  const controller = new AbortController(), dispatch = vi.fn(), cancelAutomation = vi.fn(), log = vi.fn()
   const maintain = vi.fn(async () => {
     if (state === 'broken') throw new Error('SENSITIVE_JOURNAL_VALUE_MUST_NOT_BE_LOGGED')
     if (state === 'aborted') controller.abort()
   })
-  const admission = await prepareAutomationContextTick(state === 'missing' ? null : { maintain, dispatch }, controller.signal, log)
+  const admission = await prepareAutomationContextTick(state === 'missing' ? null : { maintain, dispatch, cancelAutomation }, controller.signal, log)
   expect(admission.isolatedContextReady).toBe(state === 'ready')
   expect(admission.dispatchIsolatedContext).toBe(state === 'ready' ? dispatch : undefined)
+  expect(admission.cancelIsolatedContext).toBe(state === 'ready' ? cancelAutomation : undefined)
   expect(maintain).toHaveBeenCalledTimes(state === 'missing' ? 0 : 1)
   expect(log).toHaveBeenCalledTimes(state === 'broken' ? 1 : 0)
   expect(JSON.stringify(log.mock.calls)).not.toContain('SENSITIVE_JOURNAL_VALUE')

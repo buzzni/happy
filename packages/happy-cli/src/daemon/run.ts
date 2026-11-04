@@ -5245,6 +5245,15 @@ export async function startDaemon(): Promise<void> {
       log: message => logger.warn(message),
       transportForRun: async run => contextTransportForRun(run),
       reportExit: async (run, record) => { await contextTransportForRun(run).reportExit(record); },
+      stopExecution: async ({ sessionId, directory }) => {
+        if (!launchReadiness.isReady()) throw new Error('AUTOMATION_STOP_TARGET_UNCONFIRMED');
+        const tracked = findTrackedSessionById(sessionId);
+        const localDirectory = tracked?.happySessionMetadataFromLocalWebhook?.path ?? tracked?.directory;
+        if (!tracked?.encryption || !localDirectory || await resolveAutomationDirectoryMatch(localDirectory, directory) !== true) {
+          throw new Error('AUTOMATION_STOP_TARGET_UNCONFIRMED');
+        }
+        await stopSessionWithExitVerification(sessionId, { source: 'server-automation', reason: 'Owning Chat was deleted' });
+      },
       resolveContext: async run => {
         // Deferred work obtains a new principal/environment; persisted bearer grants and credentials are never reused.
         const common = { configUrl: `${trustedStudioOrigin}/api/me/mcp-config`, machineToken: credentials.token, machineId,
