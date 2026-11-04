@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, link, mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -388,3 +388,91 @@ it('keeps private key material on a private journal and refuses corruption witho
   expect(f.prepare).toHaveBeenCalledTimes(1)
   expect(f.start).toHaveBeenCalledTimes(1)
 })
+
+
+it.skipIf(process.platform === 'win32').each(['read', 'list'] as const)(
+  'reads the owned replacement when an atomic journal write unlinks the opened snapshot (%s)', async operation => {
+    const f = await setup(); await f.launcher.launch(request())
+    const file = join(home, 'automation-context-launches.v1', createHash('sha256').update('r1').digest('hex') + '.json')
+    const before = await stat(file), saved = (await f.deps.journal.read('r1'))!
+    const next = { ...saved, exitReceipt: { provider: 'codex' as const, observedAt: 1234 } }
+    const probe = await open(file, 'r'), prototype = Object.getPrototypeOf(probe), original = prototype.stat
+    await probe.close()
+    let replaced = false
+    const observe = vi.spyOn(prototype, 'stat').mockImplementation(async function (this: any, ...args: any[]) {
+      const observed = await original.apply(this, args)
+      if (!replaced && observed.dev === before.dev && observed.ino === before.ino) {
+        replaced = true
+        await f.deps.journal.exclusive('r1', () => f.deps.journal.write(next))
+        const detached = await original.apply(this, args)
+        expect(detached.nlink).toBe(0)
+        return detached
+      }
+      return observed
+    })
+    try {
+      if (operation === 'read') expect(await f.deps.journal.read('r1')).toEqual(next)
+      else expect(await f.deps.journal.listRunIds()).toEqual(['r1'])
+      expect(replaced).toBe(true)
+      expect(await f.deps.journal.read('r1')).toEqual(next)
+      expect(f.start).toHaveBeenCalledOnce()
+    } finally { observe.mockRestore() }
+  })
+
+it.skipIf(process.platform === 'win32').each(['hardlink', 'symlink', 'permissions'] as const)(
+  'never treats an unsafe journal as a harmless replacement (%s)', async changed => {
+    const f = await setup(); await f.launcher.launch(request())
+    const file = join(home, 'automation-context-launches.v1', createHash('sha256').update('r1').digest('hex') + '.json')
+    if (changed === 'hardlink') await link(file, file + '.other')
+    if (changed === 'symlink') { await rename(file, file + '.other'); await symlink(file + '.other', file) }
+    if (changed === 'permissions') await chmod(file, 0o644)
+    await expect(f.deps.journal.read('r1')).rejects.toThrow()
+    await expect(f.deps.journal.listRunIds()).rejects.toThrow()
+    expect(f.start).toHaveBeenCalledOnce()
+  })
+
+
+it.skipIf(process.platform === 'win32')('bounds repeated owned replacement without dropping the persisted execution identity', async () => {
+  const f = await setup(); await f.launcher.launch(request())
+  const file = join(home, 'automation-context-launches.v1', createHash('sha256').update('r1').digest('hex') + '.json')
+  const saved = (await f.deps.journal.read('r1'))!
+  let current = await stat(file), replacements = 0
+  const probe = await open(file, 'r'), prototype = Object.getPrototypeOf(probe), original = prototype.stat
+  await probe.close()
+  const observe = vi.spyOn(prototype, 'stat').mockImplementation(async function (this: any, ...args: any[]) {
+    const observed = await original.apply(this, args)
+    if (observed.dev === current.dev && observed.ino === current.ino) {
+      if (++replacements > 5) throw new Error('Unbounded journal replacement retry')
+      await f.deps.journal.exclusive('r1', () => f.deps.journal.write({ ...saved, exitReceipt: { provider: 'codex', observedAt: replacements } }))
+      current = await stat(file)
+      return original.apply(this, args)
+    }
+    return observed
+  })
+  try {
+    await expect(f.deps.journal.read('r1')).rejects.toThrow('AUTOMATION_LAUNCH_JOURNAL_BUSY')
+    expect(replacements).toBeGreaterThan(0); expect(replacements).toBeLessThanOrEqual(5)
+    expect(f.start).toHaveBeenCalledOnce()
+  } finally { observe.mockRestore() }
+  expect(await f.deps.journal.read('r1')).toMatchObject({ phase: 'started', requestHash: saved.requestHash })
+})
+
+it.skipIf(process.platform === 'win32').each(['read', 'list'] as const)(
+  'refuses an opened journal disappearing without a safe replacement instead of returning no identity (%s)', async operation => {
+    const f = await setup(); await f.launcher.launch(request())
+    const file = join(home, 'automation-context-launches.v1', createHash('sha256').update('r1').digest('hex') + '.json')
+    const before = await stat(file), probe = await open(file, 'r'), prototype = Object.getPrototypeOf(probe), original = prototype.stat
+    await probe.close()
+    let removed = false
+    const observe = vi.spyOn(prototype, 'stat').mockImplementation(async function (this: any, ...args: any[]) {
+      const observed = await original.apply(this, args)
+      if (!removed && observed.dev === before.dev && observed.ino === before.ino) {
+        removed = true; await unlink(file); return original.apply(this, args)
+      }
+      return observed
+    })
+    try {
+      await expect(operation === 'read' ? f.deps.journal.read('r1') : f.deps.journal.listRunIds()).rejects.toThrow('AUTOMATION_LAUNCH_JOURNAL_UNSAFE')
+      expect(removed).toBe(true); expect(f.start).toHaveBeenCalledOnce()
+    } finally { observe.mockRestore() }
+  })

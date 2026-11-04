@@ -1,5 +1,5 @@
-import { constants } from 'node:fs'
-import { mkdir, open, readdir, rename, unlink } from 'node:fs/promises'
+import { constants, type Stats } from 'node:fs'
+import { lstat, mkdir, open, readdir, rename, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { withOwnedFileLock } from '@/utils/ownedFileLock'
@@ -21,14 +21,27 @@ export function createAutomationContextLaunchJournal(home: string): AutomationCo
       try { await handle.sync() } finally { await handle.close() }
     }
   }
+  const privateRecord = (stat: Stats) => stat.isFile() && stat.size <= 1024 * 1024
+    && (process.platform === 'win32' || stat.uid === process.getuid?.() && (stat.mode & 0o777) === 0o600)
   async function openSnapshot(file: string) {
-    const handle = await open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0))
-    try {
-      const stat = await handle.stat()
-      if (!stat.isFile() || stat.nlink !== 1 || stat.size > 1024 * 1024
-        || process.platform !== 'win32' && (stat.uid !== process.getuid?.() || (stat.mode & 0o777) !== 0o600)) throw new Error('AUTOMATION_LAUNCH_JOURNAL_UNSAFE')
-      return handle
-    } catch (error) { await handle.close(); throw error }
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const handle = await open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0))
+      try {
+        const stat = await handle.stat()
+        if (process.platform !== 'win32' && stat.nlink === 0 && privateRecord(stat)) {
+          // A protected atomic rename can unlink this opened inode before fstat. Require a distinct
+          // owned regular replacement at the same name; never relax the hardlink/symlink guards.
+          let replacement: Stats
+          try { replacement = await lstat(file) } catch { throw new Error('AUTOMATION_LAUNCH_JOURNAL_UNSAFE') }
+          if (privateRecord(replacement) && replacement.nlink === 1 && replacement.dev === stat.dev && replacement.ino !== stat.ino) {
+            await handle.close(); continue
+          }
+        }
+        if (!privateRecord(stat) || stat.nlink !== 1) throw new Error('AUTOMATION_LAUNCH_JOURNAL_UNSAFE')
+        return handle
+      } catch (error) { await handle.close(); throw error }
+    }
+    throw new Error('AUTOMATION_LAUNCH_JOURNAL_BUSY')
   }
   return {
     async exclusive(runId, work) { await prepare(); return withOwnedFileLock(path(runId) + '.lock', work) },
