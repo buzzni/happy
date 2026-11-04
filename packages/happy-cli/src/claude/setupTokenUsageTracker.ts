@@ -9,10 +9,10 @@
  */
 import type { SetupTokenUsageObservation } from '@/daemon/setupTokenAccountSwitch'
 
-/** Either window at or above this share means the account is used up; matches Studio's rule. */
-const EXHAUSTED_PCT = 95
-
 type Kind = 'unified5h' | 'unified7d'
+/** A window at or above its share means the account is used up; matches Studio's rule. */
+const EXHAUSTED_PCT: Record<Kind, number> = { unified5h: 95, unified7d: 95 }
+export const setupTokenWindowUsedUp = (kind: Kind, pct: number | null) => pct !== null && pct >= EXHAUSTED_PCT[kind]
 type RawWindow = { utilization?: unknown; resetsAt?: unknown }
 type RateLimitInfo = { status?: unknown; rateLimitType?: unknown; utilization?: unknown; resetsAt?: unknown; unifiedWindows?: { five_hour?: RawWindow; seven_day?: RawWindow } } | null | undefined
 
@@ -59,7 +59,7 @@ export function createSetupTokenUsageTracker(now: () => number = Date.now) {
       const current = (['unified5h', 'unified7d'] as const).filter(kind => windows.has(kind))
       if (!current.length && !rejected) return null
       return {
-        exhausted: rejected || current.some(kind => windows.get(kind)!.pct >= EXHAUSTED_PCT),
+        exhausted: rejected || current.some(kind => setupTokenWindowUsedUp(kind, windows.get(kind)!.pct)),
         observation: {
           observedAt, reason: rejected ? 'rate-limited' : 'ok', retryAt: retryAt !== null && retryAt > observedAt ? retryAt : null,
           windows: current.map(kind => ({ kind, pct: windows.get(kind)!.pct, resetsAt: windows.get(kind)!.resetsAt })),
