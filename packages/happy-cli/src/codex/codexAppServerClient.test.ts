@@ -331,8 +331,11 @@ describe('CodexAppServerClient sandbox integration', () => {
         } finally { await client.disconnect(); }
     });
 
-    it.each(['clean', 'foreground', 'unacknowledged', 'preparation', 'waiting-preparation', 'background', 'unavailable'])(
+    it.each(['clean', 'frozen', 'frozen-background-changed', 'foreground', 'unacknowledged', 'preparation', 'waiting-preparation', 'background', 'unavailable'])(
         'observes a manual workspace without changing its native thread or memory policy (%s)', async state => {
+            const frozen = state.startsWith('frozen');
+            let backgroundChanged = false;
+            const clean = state === 'clean' || state === 'frozen';
             const { CodexAppServerClient } = await import('./codexAppServerClient');
             mockExecSync.mockReturnValue('codex-cli 0.166.0');
             const requests: MockRpcMessage[] = [];
@@ -353,11 +356,12 @@ describe('CodexAppServerClient sandbox integration', () => {
                 }
                 if (message.method === 'thread/backgroundTerminals/list') pushJsonLine(stdout, state === 'unavailable'
                     ? { id: message.id, error: { code: -32601, message: 'unsupported' } }
-                    : { id: message.id, result: { data: state === 'background' ? [{ itemId: 'background', command: 'writer', processId: '42' }] : [], nextCursor: null } });
+                    : { id: message.id, result: { data: state === 'background' || backgroundChanged ? [{ itemId: 'background', command: 'writer', processId: '42' }] : [], nextCursor: null } });
             } });
             proc.stdin.once('finish', () => { proc.exitCode = 0; proc.emit('exit', 0, null); proc.stdout.push(null); });
             mockSpawn.mockReturnValue(proc);
             const client = new CodexAppServerClient(undefined, undefined, undefined, 'owner-choice', undefined, undefined, false, undefined, undefined, false, true);
+            if (frozen) client.setOutputStorageGate({ wait: async () => {}, onFailure: vi.fn() });
             try {
                 await client.connect(); await client.resumeThread({ threadId: 'manual-native-keep', cwd: '/work' });
                 if (state === 'foreground') await client.sendTurn('Current manual task');
@@ -371,18 +375,24 @@ describe('CodexAppServerClient sandbox integration', () => {
                         : client.sendTurnAndWait('Prepared manual task', opts)).then(() => undefined, error => { errors.push(error); });
                     await waitFor(() => !!allowPreparation);
                 }
-                expect(await client.canDrainWorkspace()).toBe(state === 'clean');
+                expect(await client.canDrainWorkspace()).toBe(clean || frozen);
+                if (frozen) expect(client.freezeInputForShutdown()).toBe(true);
+                backgroundChanged = state === 'frozen-background-changed';
                 expect(proc.stdin.writableEnded).toBe(false);
                 const proof = await client.finishWorkspaceContext(500);
-                expect(proof).toMatchObject({ foregroundDrained: !['foreground', 'unacknowledged', 'preparation', 'waiting-preparation'].includes(state), backgroundDrained: state === 'clean', providerExitedCleanly: state === 'clean' });
+                expect(proof).toMatchObject({ foregroundDrained: !['foreground', 'unacknowledged', 'preparation', 'waiting-preparation'].includes(state), backgroundDrained: clean, providerExitedCleanly: clean });
                 expect(client.threadId).toBe('manual-native-keep');
                 expect(requests.some(row => row.method === 'thread/start')).toBe(false);
                 expect(requests.some(row => row.method === 'config/read')).toBe(false);
                 const args = mockSpawn.mock.calls[0][1];
                 for (const override of ['memories.use_memories=false', 'memories.generate_memories=false', 'features.memories=false', 'features.hooks=false']) expect(args).not.toContain(override);
                 expect(proc.kill).not.toHaveBeenCalled();
-                if (state === 'clean') await expect(client.connect()).rejects.toThrow('AUTOMATION_CONTEXT_INPUT_CLOSED');
-                else { expect(proc.stdin.writableEnded).toBe(false); await expect(client.connect()).resolves.toBeUndefined(); }
+                if (clean) await expect(client.connect()).rejects.toThrow('AUTOMATION_CONTEXT_INPUT_CLOSED');
+                else {
+                    expect(proc.stdin.writableEnded).toBe(false);
+                    if (frozen) await expect(client.connect()).rejects.toThrow('frozen for shutdown');
+                    else await expect(client.connect()).resolves.toBeUndefined();
+                }
                 expect(mockSpawn).toHaveBeenCalledTimes(1);
                 if (withheld) {
                     pushJsonLine(proc.stdout, { id: withheld.id, result: { turn: { id: 'active-manual-turn', status: 'inProgress', items: [] } } });
@@ -396,6 +406,11 @@ describe('CodexAppServerClient sandbox integration', () => {
                 if (withheld && !proc.stdin.writableEnded) pushJsonLine(proc.stdout, { id: withheld.id,
                     result: { turn: { id: 'active-manual-turn', status: 'inProgress', items: [] } } });
                 await pendingTurn;
+                if (frozen) {
+                    client.finishShutdownObservation();
+                    await client.endInputAndAwaitExit(500);
+                    await client.waitForOutputDrain();
+                }
                 await client.disconnect();
             }
         });

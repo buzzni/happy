@@ -2933,7 +2933,9 @@ export class CodexAppServerClient {
         if (this.automationInputClosed && !['thread/backgroundTerminals/list', 'turn/interrupt'].includes(method)) {
             return Promise.reject(new Error('AUTOMATION_CONTEXT_INPUT_CLOSED'));
         }
-        if (this.shutdownInputFrozen && method !== 'turn/interrupt') return Promise.reject(new Error('Codex input is frozen for shutdown'));
+        // The private workspace drain still needs a fresh read-only background snapshot after input freeze.
+        const workspaceBackgroundRead = this.workspaceExitObservation && method === 'thread/backgroundTerminals/list';
+        if (this.shutdownInputFrozen && method !== 'turn/interrupt' && !workspaceBackgroundRead) return Promise.reject(new Error('Codex input is frozen for shutdown'));
         const timeout = timeoutMs ?? CodexAppServerClient.REQUEST_TIMEOUT_MS;
         return new Promise((resolve, reject) => {
             if (!this.process?.stdin?.writable) {
