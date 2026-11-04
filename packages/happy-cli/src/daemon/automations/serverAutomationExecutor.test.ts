@@ -4326,10 +4326,25 @@ describe('isolated scheduled conversation admission', () => {
       sessionId: state === 'wrong-session' ? 'manual' : 'automation-run:run-1', reason: 'workspace-busy' })
     await runServerAutomationTick(f.input)
     expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({
-      outcome: state === 'waiting' ? 'SKIPPED_GATE' : 'ERROR',
-      failureCode: state === 'waiting' ? 'AUTOMATION_WORKSPACE_BUSY' : state === 'needs-attention' ? 'AUTOMATION_START_UNCONFIRMED' : 'AUTOMATION_EXECUTION_IDENTITY_CONFLICT',
+      outcome: 'ERROR',
+      failureCode: state === 'waiting' ? 'AUTOMATION_DEFERRED_OWNER_UNCONFIRMED' : state === 'needs-attention' ? 'AUTOMATION_START_UNCONFIRMED' : 'AUTOMATION_EXECUTION_IDENTITY_CONFLICT',
     }))
     expect(f.spawnSession).not.toHaveBeenCalled(); expect(f.resumeSession).not.toHaveBeenCalled()
+  })
+
+  it('keeps a deferred one-time run active under its durable runtime owner instead of reporting completion or claiming another occurrence', async () => {
+    const f = isolatedSetup(), original = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
+    f.input.decryptPayload = () => ({ ...original, schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } })
+    const dispatch = vi.fn(async () => ({ state: 'waiting' as const, sessionId: 'automation-run:run-1', deferred: true as const }))
+    f.input.dispatchIsolatedContext = dispatch
+    expect(await runServerAutomationTick(f.input)).toEqual([{ automationId: 'automation-1', outcome: 'SKIPPED_GATE' }])
+    expect(f.transport.start).toHaveBeenCalledOnce()
+    expect(f.transport.report).not.toHaveBeenCalled()
+    expect(f.store.read().pendingReports).toEqual([])
+    expect(f.store.read().schedules[0].nextRunAt).toBe(NEVER_RUN_AT)
+    await runServerAutomationTick(f.input)
+    expect(f.transport.claim).toHaveBeenCalledOnce()
+    expect(dispatch).toHaveBeenCalledOnce()
   })
 
   it('refuses revoked target access before invoking the isolated runtime', async () => {

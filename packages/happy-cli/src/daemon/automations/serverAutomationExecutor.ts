@@ -204,7 +204,9 @@ export interface ServerAutomationExecutorInput {
   /** Private run-owned runtime. The payload is the authored snapshot, never an assembled legacy conversation prompt. */
   dispatchIsolatedContext?: (input: { automationId: string; generation: number; revision: number; runId: string; claimToken: string;
     payload: ServerAutomationPayload; environmentVariables: Record<string, string>; mcpSpawnContext?: AutomationMcpSpawnContext }) => Promise<{
-      state: 'started' | 'waiting' | 'needs-attention'; sessionId: string; reason?: string
+      state: 'started' | 'waiting' | 'needs-attention'; sessionId: string; reason?: string;
+      /** True only after an active daemon supervisor durably owns this original claim and its eventual report. */
+      deferred?: true
     }>
   resumeSession: (input: {
     sessionId: string
@@ -1286,6 +1288,7 @@ async function executeStartedRun(
   queueDepth?: number
   /** 프롬프트를 세션에 전달하기 전 단계가 상대에 닿지 못해 실패한 코드 (automationUnreachableRetry). */
   unreachable?: string
+  deferred?: true
 }> {
   const step = (name: string): void => {
     trace.step = name
@@ -1833,9 +1836,9 @@ async function executeStartedRun(
       if (dispatched.sessionId !== automationExecutionSessionId(run.runId)) return {
         outcome: 'ERROR', sessionId: null, failureCode: 'AUTOMATION_EXECUTION_IDENTITY_CONFLICT', ...degraded,
       }
-      if (dispatched.state === 'waiting') return {
-        outcome: 'SKIPPED_GATE', sessionId: dispatched.sessionId, failureCode: 'AUTOMATION_WORKSPACE_BUSY', ...degraded,
-      }
+      if (dispatched.state === 'waiting') return dispatched.deferred === true
+        ? { outcome: 'SKIPPED_GATE', sessionId: dispatched.sessionId, deferred: true, ...degraded }
+        : { outcome: 'ERROR', sessionId: dispatched.sessionId, failureCode: 'AUTOMATION_DEFERRED_OWNER_UNCONFIRMED', ...degraded }
       if (dispatched.state !== 'started') return {
         outcome: 'ERROR', sessionId: dispatched.sessionId, failureCode: 'AUTOMATION_START_UNCONFIRMED', ...degraded,
       }
@@ -2171,6 +2174,7 @@ export async function runServerAutomationTick(
       degradedCode?: string
       queueDepth?: number
       unreachable?: string
+      deferred?: true
     }
     try {
       result = waitingSessionId
@@ -2215,6 +2219,12 @@ export async function runServerAutomationTick(
       }
       if (retry) rememberRetrySession(input.runtimeStore, automation.automationId, result.sessionId)
       else advanceSchedule(input, automation.automationId, payload, now, result.sessionId)
+    }
+    if (result.deferred === true) {
+      // The runtime owns the same RUNNING claim. In particular a one-time schedule must
+      // not be terminally skipped here or claimed again while its workspace is busy.
+      outcomes.push({ automationId: automation.automationId, outcome: result.outcome })
+      continue
     }
     // AgentTask의 서버 큐는 로컬 GitHub 이벤트 queueDepth에 포함되지 않는다.
     // worker를 시작했으면 같은 tick의 남은 예산으로 다시 조회하고, 초과분은 다음 tick에 실행한다.
