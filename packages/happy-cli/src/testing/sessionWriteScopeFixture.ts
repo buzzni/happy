@@ -11,6 +11,7 @@ import tweetnacl from 'tweetnacl';
 import { bindRpcRequest, readBoundRpcResponse } from '@slopus/happy-wire';
 import { decrypt, encrypt } from '@/api/encryption';
 import { decisionBytes, type ScopeDecision, type ScopeRequest } from '@/daemon/sessionWriteScope';
+import type { SpawnSessionOptions } from '@/modules/common/registerCommonHandlers';
 
 export async function eventually<T>(read: () => Promise<T | undefined>, label: string, timeout = 30_000): Promise<T> {
     const deadline = Date.now() + timeout;
@@ -58,7 +59,8 @@ export class SessionWriteScopeFixture {
     private readonly ownedPids = new Set<number>();
     private readonly processes = new Set<ChildProcess>();
 
-    constructor(readonly options: { provider: 'codex' | 'claude'; encryptionVariant: 'legacy' | 'dataKey'; automationStudioUrl?: string; databaseUrl?: string } = { provider: 'codex', encryptionVariant: 'legacy' }) {}
+    constructor(readonly options: { provider: 'codex' | 'claude'; encryptionVariant: 'legacy' | 'dataKey'; automationStudioUrl?: string; databaseUrl?: string;
+        serverEntry?: string; browserBridgeHost?: string } = { provider: 'codex', encryptionVariant: 'legacy' }) {}
     get modelHost() { return process.platform === 'linux' ? 'scope-model.test' : '127.0.0.1'; }
     get modelName() { return this.options.provider === 'codex' ? 'gpt-5.1-codex' : 'claude-sonnet-4-6'; }
     get providerIdentityField() { return this.options.provider === 'codex' ? 'codexThreadId' : 'claudeSessionId'; }
@@ -105,7 +107,7 @@ export class SessionWriteScopeFixture {
             // Select only the latest input's marker, not markers in prior conversation history.
             const markers = [...body.matchAll(/scope-marker-[a-z0-9-]+/g)];
             const text = `fixture reply ${markers.at(-1)?.[0] ?? 'no-marker'}`;
-            const item = { id: itemId, type: 'message', status: 'completed', role: 'assistant',
+            const item = { id: itemId, type: 'message', status: 'completed', role: 'assistant', phase: 'final_answer',
                 content: [{ type: 'output_text', text, annotations: [] }] };
             const result = { id, object: 'response', created_at: Math.floor(Date.now() / 1000), model: 'gpt-5.1-codex',
                 status: 'completed', output: [item], usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 } };
@@ -149,7 +151,7 @@ export class SessionWriteScopeFixture {
             HAPPY_DAEMON_HEARTBEAT_INTERVAL: '500',
             ...(this.options.automationStudioUrl ? { HAPPY_APLUS_MCP_CONFIG_URL: `${this.options.automationStudioUrl}/api/me/mcp-config` } : {}),
             CODEX_HOME: codexHome, OPENAI_API_KEY: 'fixture-local-only', NO_PROXY: process.platform === 'linux' ? '' : '127.0.0.1,localhost',
-            HAPPY_BROWSER_BRIDGE_HOST: '127.0.0.1',
+            HAPPY_BROWSER_BRIDGE_HOST: this.options.browserBridgeHost ?? '127.0.0.1',
             ANTHROPIC_API_KEY: 'fixture-local-only', ANTHROPIC_BASE_URL: `http://${this.modelHost}:${modelPort}`,
             CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
             ...(process.env.HAPPY_CLAUDE_PATH ? { HAPPY_CLAUDE_PATH: process.env.HAPPY_CLAUDE_PATH } : {}) };
@@ -178,8 +180,8 @@ export class SessionWriteScopeFixture {
         await writeFile(join(this.happyHome, 'settings.json'), JSON.stringify({ serverUrl: this.serverUrl }), { mode: 0o600 });
         await this.startDaemon();
     }
-    private launch(args: string[], cwd: string, env: NodeJS.ProcessEnv, executable = process.execPath) {
-        const child = spawn(executable, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
+    private launch(args: string[], cwd: string, env: NodeJS.ProcessEnv, executable = process.execPath, ipc = false) {
+        const child = spawn(executable, args, { cwd, env, stdio: ipc ? ['pipe', 'pipe', 'pipe', 'ipc'] : ['pipe', 'pipe', 'pipe'] });
         this.processes.add(child);
         child.on('error', error => this.failures.push(error.message));
         for (const stream of [child.stdout, child.stderr]) stream!.on('data', data => {
@@ -190,7 +192,19 @@ export class SessionWriteScopeFixture {
     private launchServer(command: 'migrate' | 'serve') {
         return this.serverBinary
             ? this.launch([command], dirname(this.serverBinary), this.serverEnvironment, this.serverBinary)
-            : this.launch(['--import', 'tsx', 'sources/standalone.ts', command], this.serverDirectory, this.serverEnvironment);
+            : this.launch(['--import', 'tsx', command === 'serve' ? this.options.serverEntry ?? 'sources/standalone.ts' : 'sources/standalone.ts', command],
+                this.serverDirectory, this.serverEnvironment, process.execPath, command === 'serve' && !!this.options.serverEntry);
+    }
+    /** Internal launch fixture: no extra production control endpoint or managed-runtime bypass. */
+    launchContextSession(options: SpawnSessionOptions): ChildProcess {
+        if (!options.reconnectEnvironment || !options.initialPrompt || !options.exitAfterFirstTurn || options.directory !== this.project) {
+            throw new Error('A disposable prepared context launch is required');
+        }
+        return this.launch(['--no-warnings', '--no-deprecation', join(this.cli, 'bin/happy.mjs'), options.agent ?? 'claude',
+            '--happy-starting-mode', 'remote', '--started-by', 'daemon', '--dangerously-skip-permissions'], this.project,
+            { ...this.environment, ...options.reconnectEnvironment, HAPPY_INITIAL_PROMPT: options.initialPrompt,
+                HAPPY_INITIAL_PROMPT_LOCAL_ID: options.initialPromptLocalId, HAPPY_INITIAL_MODEL: options.model ?? this.modelName,
+                HAPPY_AUTOMATION_RUN_ONCE: '1' });
     }
     async startServer() {
         this.server = this.launchServer('serve');

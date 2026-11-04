@@ -11,7 +11,8 @@ export default defineConfig({
                 extends: true,
                 test: {
                     name: 'integration-automation-context',
-                    include: ['src/daemon/automations/automationContext.native.integration.test.ts'],
+                    include: ['src/daemon/automations/automationContext.native.integration.test.ts',
+                        'src/daemon/automations/automationContext.runtime.integration.test.ts'],
                     setupFiles: ['./src/testing/unit.setup.ts'],
                     fileParallelism: false,
                     maxWorkers: 1,
