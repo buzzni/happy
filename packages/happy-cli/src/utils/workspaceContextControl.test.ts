@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { afterEach, expect, it, vi } from 'vitest'
 import { RuntimeProducerGate } from '@/sessionDrain/runtimeProducerGate'
-import { createWorkspaceContextControl, observeWorkspaceContextChild } from './workspaceContextControl'
+import { createWorkspaceContextControl, observeWorkspaceContextChild, takeWorkspaceContextControl } from './workspaceContextControl'
 
 vi.mock('@/ui/logger', () => ({ logger: { warn: vi.fn() } }))
 afterEach(() => vi.useRealTimers())
@@ -127,4 +127,18 @@ it('does not allow a later positive packet to override a blocked storage release
   expect(await operation).toBe(false)
   await f.close()
   expect(await f.parent.closed).toBe(false); expect(f.persist).not.toHaveBeenCalled()
+})
+
+
+it.each(['owned', 'disconnected', 'malformed', 'oversized', 'absent'] as const)('consumes one owned workspace channel without forwarding its identity (%s)', state => {
+  const value = state === 'malformed' ? '../PRIVATE_VALUE_MUST_NOT_LEAK' : state === 'oversized' ? 'x'.repeat(129) : launchId
+  const env: NodeJS.ProcessEnv = { SAFE: 'kept', ...(state === 'absent' ? {} : { HAPPY_WORKSPACE_CONTEXT_CONTROL_V1: value }) }
+  const transport = Object.assign(new EventEmitter(), { connected: state !== 'disconnected', send: vi.fn() })
+  if (['malformed', 'oversized', 'disconnected'].includes(state)) {
+    expect(() => takeWorkspaceContextControl(env, transport)).toThrow('WORKSPACE_CONTROL_UNAVAILABLE')
+  } else {
+    const control = takeWorkspaceContextControl(env, transport)
+    expect(!!control).toBe(state === 'owned'); control?.close()
+  }
+  expect(env).toEqual({ SAFE: 'kept' }); expect(transport.send).not.toHaveBeenCalled()
 })

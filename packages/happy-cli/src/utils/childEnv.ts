@@ -60,6 +60,7 @@ export const NON_INHERITABLE_ENV: readonly NonInheritableEnvEntry[] = [
     { prefix: 'HAPPY_BROWSER_TASK_SESSION_SECRET', kind: 'spawn-seed' },
     { prefix: 'HAPPY_BROWSER_TASK_UNAVAILABLE_REASON', kind: 'spawn-seed' },
     // Run-once, resume prompt, browser continuation: read by the runner before agent code runs (lessonSessionHost).
+    { prefix: 'HAPPY_WORKSPACE_CONTEXT_CONTROL_', kind: 'spawn-seed' },
     { prefix: 'HAPPY_AUTOMATION_', kind: 'spawn-seed' },
     { prefix: 'HAPPY_SCOPE_REPORT_', kind: 'session-scope' },
     { prefix: 'HAPPY_WRITE_SCOPE_', kind: 'session-scope' },

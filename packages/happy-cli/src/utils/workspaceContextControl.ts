@@ -19,7 +19,24 @@ type Transport = {
   send?: (value: any, done: (error: Error | null) => void) => unknown
   on(event: 'message' | 'disconnect', listener: (...args: any[]) => void): unknown
   off(event: 'message' | 'disconnect', listener: (...args: any[]) => void): unknown
+  unref?(): void
 }
+export const WORKSPACE_CONTEXT_CONTROL_ENV = 'HAPPY_WORKSPACE_CONTEXT_CONTROL_V1'
+
+/** Consume before creating native/tool children. An env value without the owned IPC channel grants nothing. */
+export function takeWorkspaceContextControl(env: NodeJS.ProcessEnv = process.env, transport: Transport = {
+  get connected() { return process.connected === true },
+  send: process.send ? (value, done) => process.send!(value, done) : undefined,
+  on: (event, listener) => process.on(event, listener), off: (event, listener) => process.off(event, listener),
+  unref: () => process.channel?.unref(),
+}) {
+  const raw = env[WORKSPACE_CONTEXT_CONTROL_ENV]; delete env[WORKSPACE_CONTEXT_CONTROL_ENV]
+  if (raw === undefined) return undefined
+  const parsed = identity.safeParse(raw)
+  if (!parsed.success || !transport.connected || !transport.send) throw new Error('WORKSPACE_CONTROL_UNAVAILABLE')
+  return createWorkspaceContextControl({ launchId: parsed.data, transport })
+}
+
 const ownedType = (value: unknown, type: string) => (value as { type?: unknown } | null)?.type === type
 const isPositive = (value: AutomationContextExitEvidence) => Object.values(value).every(flag => flag === true)
 
@@ -107,7 +124,7 @@ export function createWorkspaceContextControl(input: { launchId: string; transpo
     },
     close() {
       if (closed) return
-      closed = true; lost(); transport.off('message', onMessage); transport.off('disconnect', lost)
+      closed = true; lost(); transport.off('message', onMessage); transport.off('disconnect', lost); transport.unref?.()
     },
   }
 }

@@ -257,3 +257,11 @@ describe('organization agent plan proxy key', () => {
         expect(sanitizeChildEnv(env)).toEqual({ PATH: '/usr/bin' })
     })
 })
+
+
+it('never inherits a private workspace control identity into another session or a native tool child', () => {
+    const env = { HAPPY_WORKSPACE_CONTEXT_CONTROL_V1: 'owned-root', SAFE: 'kept' }
+    expect(sanitizeChildEnv(env)).toEqual({ SAFE: 'kept' })
+    expect(sanitizeChildEnv(env, { boundary: 'in-session' })).toEqual({ SAFE: 'kept' })
+    expect(env.HAPPY_WORKSPACE_CONTEXT_CONTROL_V1).toBe('owned-root')
+})
