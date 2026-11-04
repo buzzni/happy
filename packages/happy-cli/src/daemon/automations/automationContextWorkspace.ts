@@ -7,7 +7,7 @@ const drained = (evidence: ExitEvidence) => evidence.providerExitedCleanly && ev
   && evidence.backgroundDrained && evidence.writeProducersDrained
 
 /** Private daemon host only. A live manual process remains busy even when its last answer looks idle.
- * Preparation reservations cover spawn->tracking. Runtime owners survive process/daemon loss until
+ * Manual ownership covers submission and tracking. Runtime owners survive process/daemon loss until
  * positive provider evidence (or a different kernel boot); neither PID disappearance nor time is proof. */
 export function createAutomationContextWorkspace(input: {
   home: string; isTracked(roots: readonly string[]): Promise<boolean | 'unconfirmed'>
@@ -18,9 +18,9 @@ export function createAutomationContextWorkspace(input: {
       const admitted = await owner.tryAcquire()
       if (!admitted.acquired) return admitted
       return { acquired: true as const,
-        async finish(observed: { submitted: boolean; tracked: boolean }) {
-          // A lost spawn ACK can leave a child alive. Keep that reservation until tracking is confirmed.
-          return owner.release(!observed.submitted || observed.tracked)
+        async finish(observed: { submitted: boolean; tracked: boolean }, evidence?: ExitEvidence) {
+          // Tracking (or later PID disappearance) cannot prove the native/background writers drained.
+          return owner.release(!observed.submitted || observed.tracked && !!evidence && drained(evidence))
         } }
     },
     async acquireAutomation(request: { runId: string; roots: readonly string[]; ownerToken?: string }) {

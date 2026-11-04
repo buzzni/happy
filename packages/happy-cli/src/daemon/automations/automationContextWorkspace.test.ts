@@ -41,7 +41,7 @@ test('holds new manual launches until the owned automatic provider, background a
   expect(await workspace.beginManualLaunch([directory])).toMatchObject({ acquired: true })
 })
 
-test('holds automatic admission while a manual spawn is pending and transfers it only after tracking or proven non-submission', async () => {
+test('holds automatic admission through manual tracking until a positive runtime drain is supplied', async () => {
   const workspace = setup(), manual = await workspace.beginManualLaunch([directory])
   if (!manual.acquired) throw new Error('Expected preparation reservation')
   expect(await workspace.acquireAutomation({ runId: 'r1', roots: [directory] })).toMatchObject({ acquired: false })
@@ -49,16 +49,41 @@ test('holds automatic admission while a manual spawn is pending and transfers it
   expect(await setup().acquireAutomation({ runId: 'r2', roots: [directory] })).toMatchObject({ acquired: false })
   // Uncertainty must only hold automation; the previous manual/manual behavior is preserved.
   expect(await workspace.beginManualLaunch([directory])).toMatchObject({ acquired: true })
-  expect(await manual.finish({ submitted: true, tracked: true })).toBe(true)
+  expect(await manual.finish({ submitted: true, tracked: true }, finished)).toBe(true)
 })
 
-test('hands a tracked manual session to the directory gate rather than treating the released preparation as idle', async () => {
+test('retains manual ownership while a tracked process still owns the directory', async () => {
   let tracked = false
   const workspace = setup(vi.fn(async () => tracked)), manual = await workspace.beginManualLaunch([directory])
   if (!manual.acquired) throw new Error('Expected preparation reservation')
   tracked = true
-  expect(await manual.finish({ submitted: true, tracked: true })).toBe(true)
+  expect(await manual.finish({ submitted: true, tracked: true })).toBe(false)
   expect(await workspace.acquireAutomation({ runId: 'r1', roots: [directory] })).toEqual({ acquired: false, reason: 'tracked-session-busy' })
+})
+
+test('retains submitted manual custody after root tracking disappears and a coordinator restarts without positive drain evidence', async () => {
+  let tracked = true
+  const workspace = setup(vi.fn(async () => tracked)), manual = await workspace.beginManualLaunch([directory])
+  if (!manual.acquired) throw new Error('Expected manual ownership')
+  expect(await manual.finish({ submitted: true, tracked: true })).toBe(false)
+  tracked = false
+  expect(await workspace.acquireAutomation({ runId: 'r1', roots: [directory] })).toMatchObject({ acquired: false })
+  expect(await setup().acquireAutomation({ runId: 'r2', roots: [directory] })).toMatchObject({ acquired: false })
+  const otherManual = await setup().beginManualLaunch([directory])
+  expect(otherManual.acquired).toBe(true)
+  if (otherManual.acquired) expect(await otherManual.finish({ submitted: false, tracked: false })).toBe(true)
+})
+
+test('releases a submitted manual owner only with tracking and all positive drain evidence', async () => {
+  const workspace = setup(), manual = await workspace.beginManualLaunch([directory])
+  if (!manual.acquired) throw new Error('Expected manual ownership')
+  expect(await manual.finish({ submitted: true, tracked: false }, finished)).toBe(false)
+  for (const field of Object.keys(finished) as Array<keyof typeof finished>) {
+    expect(await manual.finish({ submitted: true, tracked: true }, { ...finished, [field]: false })).toBe(false)
+    expect(await setup().acquireAutomation({ runId: 'r1', roots: [directory] })).toMatchObject({ acquired: false })
+  }
+  expect(await manual.finish({ submitted: true, tracked: true }, finished)).toBe(true)
+  expect(await setup().acquireAutomation({ runId: 'r1', roots: [directory] })).toMatchObject({ acquired: true })
 })
 
 test('keeps an unknown automatic owner across coordinator restart and permits an unrelated workspace', async () => {
