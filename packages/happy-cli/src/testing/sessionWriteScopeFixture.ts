@@ -60,7 +60,8 @@ export class SessionWriteScopeFixture {
     private readonly processes = new Set<ChildProcess>();
 
     constructor(readonly options: { provider: 'codex' | 'claude'; encryptionVariant: 'legacy' | 'dataKey'; automationStudioUrl?: string; databaseUrl?: string;
-        serverEntry?: string; browserBridgeHost?: string; automationContextHost?: boolean } = { provider: 'codex', encryptionVariant: 'legacy' }) {}
+        serverEntry?: string; browserBridgeHost?: string; automationContextHost?: boolean;
+        beforeModelResponse?(body: string): Promise<void> } = { provider: 'codex', encryptionVariant: 'legacy' }) {}
     get modelHost() { return process.platform === 'linux' ? 'scope-model.test' : '127.0.0.1'; }
     get modelName() { return this.options.provider === 'codex' ? 'gpt-5.1-codex' : 'claude-sonnet-4-6'; }
     get providerIdentityField() { return this.options.provider === 'codex' ? 'codexThreadId' : 'claudeSessionId'; }
@@ -103,6 +104,7 @@ export class SessionWriteScopeFixture {
                 this.failures.push(`Unexpected local model route ${request.url}`); response.writeHead(404).end(); return;
             }
             this.modelRequests.push(body);
+            await this.options.beforeModelResponse?.(body);
             const id = `resp_${randomUUID()}`, itemId = `msg_${randomUUID()}`;
             // Select only the latest input's marker, not markers in prior conversation history.
             const markers = [...body.matchAll(/scope-marker-[a-z0-9-]+/g)];

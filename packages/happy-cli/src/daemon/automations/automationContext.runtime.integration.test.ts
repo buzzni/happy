@@ -40,14 +40,24 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
   { state: 'active', provider: 'claude', encryptionVariant: 'dataKey' },
   { state: 'active', provider: 'codex', encryptionVariant: 'dataKey' },
   { state: 'manual', provider: 'codex', encryptionVariant: 'legacy' },
-  { state: 'manual', provider: 'claude', encryptionVariant: 'legacy' }] as const)(
+  { state: 'manual', provider: 'claude', encryptionVariant: 'legacy' },
+  { state: 'queued', provider: 'codex', encryptionVariant: 'legacy' },
+  { state: 'queued', provider: 'claude', encryptionVariant: 'legacy' }] as const)(
   'restores a durable $state $provider $encryptionVariant occurrence through the real daemon without replaying or ignoring a stop', async ({ state, provider, encryptionVariant }) => {
   const shouldRun = state !== 'paused'
+  const isManual = state === 'manual' || state === 'queued'
   vi.stubEnv('HAPPY_SCOPE_FRESH_PROVIDER_STATE', '1')
   vi.stubEnv('HAPPY_SCOPE_PACKAGED_SERVER', undefined)
   vi.stubEnv('HAPPY_SCOPE_INSTALLED_CLI', undefined)
   let fixture: SessionWriteScopeFixture, run: any
   const secret = randomBytes(32).toString('hex'), runId = `deferred-${randomUUID()}`, claimToken = randomBytes(24).toString('hex')
+  const manualMarker = `scope-marker-manual-${randomUUID()}`, queuedMarker = `scope-marker-queued-${randomUUID()}`
+  let releaseFirst = () => {}, releaseSecond = () => {}
+  const responseGates = new Map<string, Promise<void>>()
+  if (state === 'queued') {
+    responseGates.set(manualMarker, new Promise<void>(resolve => { releaseFirst = resolve }))
+    responseGates.set(queuedMarker, new Promise<void>(resolve => { releaseSecond = resolve }))
+  }
   const calls: string[] = []
   // Scoped Studio facade: real Happy admission is still checked on every target proof.
   const studio = createServer(async (request, response) => {
@@ -87,17 +97,21 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
   await new Promise<void>(resolve => studio.listen(0, '127.0.0.1', resolve))
   const origin = `http://127.0.0.1:${(studio.address() as { port: number }).port}`
   fixture = new SessionWriteScopeFixture({ provider, encryptionVariant,
-    serverEntry: 'sources/testing/automationContextFixture.ts', browserBridgeHost: '::1', automationContextHost: true, automationStudioUrl: origin })
+    serverEntry: 'sources/testing/automationContextFixture.ts', browserBridgeHost: '::1', automationContextHost: true, automationStudioUrl: origin,
+    beforeModelResponse: async body => { await responseGates.get([...body.matchAll(/scope-marker-[a-z0-9-]+/g)].at(-1)?.[0] ?? '') } })
   let failure: unknown
   try {
     await fixture.start()
     const api = await ApiClient.create({ token: fixture.token, encryption: encryptionVariant === 'legacy'
       ? { type: 'legacy', secret: fixture.seed } : { type: 'dataKey', publicKey: fixture.accountBox.publicKey, machineKey: fixture.machineKey } })
-    const manualMarker = `scope-marker-manual-${randomUUID()}`
-    const manualSessionId = state === 'manual' ? await fixture.spawnSession(fixture.project, { enabled: false }) : null
+    const manualSessionId = isManual ? await fixture.spawnSession(fixture.project, { enabled: false }) : null
     let originalNativeId = 'manual-native-keep'
     if (manualSessionId) {
-      await fixture.send(manualSessionId, manualMarker); await fixture.waitReply(manualSessionId, manualMarker)
+      await fixture.send(manualSessionId, manualMarker)
+      if (state === 'queued') {
+        await eventually(async () => fixture.modelRequests.some(body => body.includes(manualMarker)) ? true : undefined, 'manual input reaches the native model')
+        await fixture.send(manualSessionId, queuedMarker)
+      } else await fixture.waitReply(manualSessionId, manualMarker)
       originalNativeId = (await fixture.session(manualSessionId)).metadata[fixture.providerIdentityField]
       expect(originalNativeId).toBeTruthy()
     }
@@ -108,7 +122,7 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
     run = { ...await seedRun(fixture, { accountId: fixture.accountId, displaySessionId, runId, claimToken, directory: fixture.project, secret }), displaySessionId }
     const journal = createAutomationContextLaunchJournal(fixture.happyHome)
     const workspace = createAutomationContextWorkspace({ home: fixture.happyHome, isTracked: async () => false })
-    const manual = state === 'manual' ? null : await workspace.beginManualLaunch([fixture.project])
+    const manual = isManual ? null : await workspace.beginManualLaunch([fixture.project])
     if (manual && !manual.acquired) throw new Error('Manual preparation refused')
     const host = createAutomationContextHost({ accountId: fixture.accountId, machineId: run.machineId, happyOrigin: fixture.serverUrl,
       reportExit: async () => { throw new Error('Only the daemon reports a deferred exit') },
@@ -137,7 +151,20 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
         expect(response.status).toBe(200)
         expect((await response.json() as any).automation).toMatchObject({ paused: true, generation: run.generation + 1 })
       }
-      if (state !== 'manual') { await fixture.stopDaemon(); await fixture.startDaemon() }
+      if (state === 'queued') {
+        const grantCalls = () => calls.filter(path => path === '/api/automation/mcp-caller-grant').length
+        await eventually(async () => grantCalls() > 0 ? true : undefined, 'daemon attempts the waiting occurrence during the first manual turn')
+        expect(await journal.read(runId)).toMatchObject({ phase: 'registered', deferredDispatch: 'queued' })
+        expect(fixture.modelRequests.some(body => body.includes(marker))).toBe(false)
+        releaseFirst(); await fixture.waitReply(manualSessionId!, manualMarker)
+        await eventually(async () => fixture.modelRequests.some(body => body.includes(queuedMarker)) ? true : undefined, 'queued manual turn reaches the native model')
+        const previousCalls = grantCalls()
+        await eventually(async () => grantCalls() > previousCalls ? true : undefined, 'daemon retries while the queued manual turn runs')
+        expect(await journal.read(runId)).toMatchObject({ phase: 'registered', deferredDispatch: 'queued' })
+        expect(fixture.modelRequests.some(body => body.includes(marker))).toBe(false)
+        releaseSecond(); await fixture.waitReply(manualSessionId!, queuedMarker)
+      }
+      if (!isManual) { await fixture.stopDaemon(); await fixture.startDaemon() }
     } finally { if (manual?.acquired) expect(await manual.finish({ submitted: false, tracked: false })).toBe(true) }
     await eventually(async () => {
       await fixture.children()
@@ -171,6 +198,7 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
       const automaticInputs = fixture.modelRequests.filter(body => body.includes(marker))
       expect(automaticInputs).toHaveLength(1)
       expect(automaticInputs[0]).not.toContain(manualMarker)
+      expect(automaticInputs[0]).not.toContain(queuedMarker)
     }
     const manualAfter = (await fixture.http('/v2/sessions/lookup', { ids: [displaySessionId] })).body.sessions[0]
     expect(decrypt(prepared.encryptionKey, prepared.encryptionVariant, decodeBase64(manualAfter.metadata))).toMatchObject({ [fixture.providerIdentityField]: originalNativeId })
@@ -187,6 +215,7 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
     if (admission.acquired) expect(await admission.finish({ submitted: false, tracked: false })).toBe(true)
   } catch (error) { failure = new Error(`Deferred daemon failed:\n${await fixture.diagnostics().catch(() => 'Diagnostics unavailable')}`, { cause: error }) }
   finally {
+    releaseFirst(); releaseSecond()
     try { await fixture.close() } catch (error) { failure = failure ? new AggregateError([failure, error]) : error }
     studio.closeAllConnections(); await new Promise<void>(resolve => studio.close(() => resolve()))
     vi.unstubAllEnvs()
