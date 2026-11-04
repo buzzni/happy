@@ -94,6 +94,37 @@ afterEach(() => {
     rmSync(home, { recursive: true, force: true });
 });
 
+describe('workspace operations with an SSH origin and a sealed HTTPS credential', () => {
+    it.each(['remote-status', 'pull-remote'] as const)('%s uses the signed address for both branches without an SSH login', async (op) => {
+        git(repo, 'push', '--quiet', bare, 'main:collab-x');
+        git(repo, 'switch', '--quiet', '-c', 'collab-x');
+        pushOnline('online.txt', 'o');
+        git(repo, 'remote', 'set-url', 'origin', 'git@github.com:acme/app.git');
+        const sshCalls = join(root, 'ssh-called');
+        const ssh = join(root, 'ssh.sh');
+        writeFileSync(ssh, `#!/bin/sh\necho called >> '${sshCalls}'\necho 'Permission denied (publickey)' >&2\nexit 255\n`, { mode: 0o700 });
+        git(repo, 'config', 'core.sshCommand', `sh '${ssh}'`);
+
+        const head = git(repo, 'rev-parse', 'HEAD');
+        const answer = await call(op, {
+            workspaceDir: repo, remoteUrl: ONLINE, branch: 'collab-x', baseBranch: 'main',
+            ...(op === 'pull-remote' ? { mode: 'merge', expectedHead: head, push: false } : {}),
+        }, true);
+
+        expect(answer, JSON.stringify(answer)).toMatchObject({ success: true });
+        if (op === 'remote-status') {
+            expect(answer.result).toMatchObject({ head, ahead: 0, behind: 0, baseBehind: 1 });
+            expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
+        } else {
+            expect(answer.result).toMatchObject({ status: 'merged', head: git(bare, 'rev-parse', 'main'), conflictCount: 0 });
+            expect(readFileSync(join(repo, 'online.txt'), 'utf8')).toBe('o');
+        }
+        expect(existsSync(sshCalls)).toBe(false);
+        expect(git(repo, 'config', '--get', 'remote.origin.url')).toBe('git@github.com:acme/app.git');
+        expect(pins()).toEqual({ v: 1, workspaces: { [repo]: { workspace: 'github.com/acme/app' } } });
+    });
+});
+
 describe('workspace:remote-status', () => {
     const status = (over: Record<string, unknown> = {}) => ({ workspaceDir: repo, remoteUrl: ONLINE, branch: 'main', baseBranch: null, ...over });
 
