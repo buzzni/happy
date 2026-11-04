@@ -9,7 +9,7 @@ afterEach(() => vi.useRealTimers())
 const evidence = () => ({ foregroundDrained: true, backgroundDrained: true, providerExitedCleanly: true, writeProducersDrained: true })
 const launchId = 'owned-manual-launch'
 
-function fixture() {
+function fixture(bindNow = true) {
   const child = Object.assign(new EventEmitter(), { connected: true, killed: false, exitCode: null as number | null, signalCode: null as string | null,
     send: vi.fn((value: unknown, done: (error: Error | null) => void) => { queueMicrotask(() => { incoming.emit('message', value); done(null) }); return true }) })
   const incoming = Object.assign(new EventEmitter(), { connected: true,
@@ -25,12 +25,13 @@ function fixture() {
   const prepare = vi.fn(async () => true), persist = vi.fn(async () => {})
   const parent = observeWorkspaceContextChild({ child: child as unknown as ChildProcess, launchId, persist })
   const control = createWorkspaceContextControl({ launchId, transport: incoming })
-  control.bind({ provider, storage, runtime, prepareWorkspaceDrain: prepare })
+  const bind = () => control.bind({ provider, storage, runtime, prepareWorkspaceDrain: prepare })
+  if (bindNow) bind()
   const close = async (flags = evidence(), code = 0) => {
     await control.reportExit(flags); control.close()
     child.exitCode = code; child.emit('close', code, null)
   }
-  return { child, incoming, parent, control, prepare, provider, persist, storage, runtime, close,
+  return { child, incoming, parent, control, bind, prepare, provider, persist, storage, runtime, close,
     queue: () => { queued = true }, frozen: () => frozen }
 }
 
@@ -76,6 +77,24 @@ it('does not freeze a manual turn after its preflight loses the parent channel',
   await new Promise(resolve => setTimeout(resolve, 0))
   expect(f.frozen()).toBe(false); expect(f.provider.endInputAndAwaitExit).not.toHaveBeenCalled()
   f.control.close(); f.child.emit('close', 1, null); expect(await f.parent.closed).toBe(false)
+})
+
+it('keeps manual input available when the owned parent disconnects before late provider binding', async () => {
+  const f = fixture(false)
+  try {
+    f.incoming.connected = false; f.incoming.emit('disconnect')
+    f.child.connected = false; f.child.emit('disconnect')
+    expect(f.bind).not.toThrow()
+    f.incoming.emit('message', { type: 'workspace-context-command', version: 1, launchId,
+      command: { type: 'drain', nonce: 'queued-before-disconnect', sessionBudgetMs: 1000, releaseBudgetMs: 1000 } })
+    await Promise.resolve()
+    expect(f.runtime.isWorkspaceIdle()).toBe(true)
+    expect(await f.runtime.admit(async () => 'manual input accepted')).toBe('manual input accepted')
+    expect(await f.parent.drain(new AbortController().signal, 1000)).toBe(false)
+    expect(f.frozen()).toBe(false); expect(f.prepare).not.toHaveBeenCalled(); expect(f.provider.endInputAndAwaitExit).not.toHaveBeenCalled()
+    expect(await f.control.reportExit(evidence())).toBe(false)
+  } finally { f.control.close(); f.child.emit('close', 0, null) }
+  expect(await f.parent.closed).toBe(false); expect(f.persist).not.toHaveBeenCalled()
 })
 
 it.each(['clean', 'missing', 'foreign', 'partial', 'truthy', 'extra', 'killed', 'nonzero', 'persist-failed'] as const)(

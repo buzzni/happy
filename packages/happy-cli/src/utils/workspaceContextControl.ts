@@ -68,7 +68,7 @@ export function createWorkspaceContextControl(input: { launchId: string; transpo
     try { ready = bound.runtime.isWorkspaceIdle() && await bound.prepareWorkspaceDrain(operation.controller.signal) }
     catch { logger.warn('[workspace-context] Manual preflight unconfirmed') }
     const remaining = command.sessionBudgetMs - (performance.now() - started)
-    if (closed || operation.controller.signal.aborted || current !== operation) return
+    if (closed || !transport.connected || operation.controller.signal.aborted || current !== operation) return
     if (!ready || !bound.runtime.isWorkspaceIdle() || remaining <= 0) {
       await send({ type: 'receipt', nonce: operation.nonce, launchId, stored: false, ownership: 'none', reason: 'workspace-busy' })
       if (current === operation) current = null
@@ -84,6 +84,7 @@ export function createWorkspaceContextControl(input: { launchId: string; transpo
     } catch { lost(); logger.warn('[workspace-context] Manual drain unconfirmed') }
   }
   const onMessage = (raw: unknown) => {
+    if (closed || !transport.connected) return
     if (!ownedType(raw, 'workspace-context-command')) return
     const parsed = commandSchema.safeParse(raw)
     if (!parsed.success || parsed.data.launchId !== launchId) { lost(); return }
@@ -113,9 +114,10 @@ export function createWorkspaceContextControl(input: { launchId: string; transpo
   return {
     bind(ports: { provider: ConstructorParameters<typeof SessionDrain>[1]; storage: ConstructorParameters<typeof SessionDrain>[2];
       runtime: RuntimeProducerGate; prepareWorkspaceDrain(signal: AbortSignal): Promise<boolean> }) {
-      if (closed || binding || !transport.connected) throw new Error('WORKSPACE_CONTROL_UNAVAILABLE')
+      if (closed || binding) throw new Error('WORKSPACE_CONTROL_UNAVAILABLE')
       binding = { drain: new SessionDrain(launchId, ports.provider, ports.storage, async () => {}, ports.runtime),
         runtime: ports.runtime, prepareWorkspaceDrain: ports.prepareWorkspaceDrain }
+      if (!transport.connected) logger.warn('[workspace-context] Parent channel lost before provider binding; manual input retained')
       void send({ type: 'ready', launchId, instanceId: launchId }).then(ok => { if (!ok) lost() })
     },
     async reportExit(evidence: AutomationContextExitEvidence) {
