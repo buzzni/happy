@@ -8,7 +8,7 @@ import { ApiClient } from '@/api/api'
 import { createAutomationContextLaunchJournal } from './automationContextLaunchJournal'
 import { createAutomationContextLauncher } from './automationContextLaunch'
 import { createAutomationContextAuthorizer, createAutomationContextTransport } from './automationContextTransport'
-import { createAutomationContextHost } from './automationContextHost'
+import { createAutomationContextHost, prepareAutomationContextTick } from './automationContextHost'
 import { createAutomationContextWorkspace } from './automationContextWorkspace'
 import { createServerAutomationRuntimeStore } from './serverAutomationRuntimeStore'
 
@@ -243,3 +243,18 @@ it.each([null, 'http://untrusted.example', 'https://studio.example/path', 'https
     expect(() => createAutomationContextAuthorizer({ studioOrigin, token: 'fixture-account-token', machineId: 'm1', runId: 'r1', claimToken: 'fixture-claim' })).toThrow()
     expect(requests).toHaveLength(0)
   })
+
+
+it.each(['ready', 'broken', 'missing', 'aborted'] as const)('prepares legacy ticking without admitting isolated work after failed recovery (%s)', async state => {
+  const controller = new AbortController(), dispatch = vi.fn(), log = vi.fn()
+  const maintain = vi.fn(async () => {
+    if (state === 'broken') throw new Error('SENSITIVE_JOURNAL_VALUE_MUST_NOT_BE_LOGGED')
+    if (state === 'aborted') controller.abort()
+  })
+  const admission = await prepareAutomationContextTick(state === 'missing' ? null : { maintain, dispatch }, controller.signal, log)
+  expect(admission.isolatedContextReady).toBe(state === 'ready')
+  expect(admission.dispatchIsolatedContext).toBe(state === 'ready' ? dispatch : undefined)
+  expect(maintain).toHaveBeenCalledTimes(state === 'missing' ? 0 : 1)
+  expect(log).toHaveBeenCalledTimes(state === 'broken' ? 1 : 0)
+  expect(JSON.stringify(log.mock.calls)).not.toContain('SENSITIVE_JOURNAL_VALUE')
+})

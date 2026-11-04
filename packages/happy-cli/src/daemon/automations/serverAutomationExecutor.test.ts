@@ -4332,6 +4332,31 @@ describe('isolated scheduled conversation admission', () => {
     expect(f.spawnSession).not.toHaveBeenCalled(); expect(f.resumeSession).not.toHaveBeenCalled()
   })
 
+  it('holds an unready isolated once occurrence while continuing legacy work and later claims the original occurrence', async () => {
+    const f = isolatedSetup(), isolated = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
+    const cache = f.input.cache.read(), legacy = { ...cache.automations[0], automationId: 'legacy', payloadVersion: 1 as const }
+    f.input.cache.read = () => ({ ...cache, automations: [...cache.automations, legacy] })
+    const state = f.store.read()
+    f.store.write({ ...state, schedules: [...state.schedules, { ...state.schedules[0], automationId: 'legacy' }] })
+    f.input.decryptPayload = row => row.automationId === 'legacy' ? { ...isolated, conversation: undefined, contextPolicy: undefined }
+      : { ...isolated, schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } }
+    const dispatch = vi.fn(async () => ({ state: 'started' as const, sessionId: 'automation-run:run-1' }))
+    f.input.dispatchIsolatedContext = dispatch
+    f.input.isolatedContextReady = false
+    expect(await runServerAutomationTick(f.input)).toEqual([{ automationId: 'legacy', outcome: 'WOKE' }])
+    expect(f.transport.claim.mock.calls.map(([row]) => row.automationId)).toEqual(['legacy'])
+    expect(f.spawnSession).toHaveBeenCalledOnce(); expect(dispatch).not.toHaveBeenCalled()
+    const held = f.store.state().schedules.find(row => row.automationId === 'automation-1')!
+    expect(held.nextRunAt).toBeLessThanOrEqual(f.now)
+    expect(f.transport.report).not.toHaveBeenCalledWith(expect.objectContaining({ automationId: 'automation-1' }))
+    f.transport.claim.mockClear()
+    f.input.isolatedContextReady = true
+    expect(await runServerAutomationTick(f.input)).toEqual([{ automationId: 'automation-1', outcome: 'WOKE' }])
+    expect(f.transport.claim.mock.calls.map(([row]) => row.automationId)).toEqual(['automation-1'])
+    expect(dispatch).toHaveBeenCalledOnce()
+    expect(f.transport.claim).toHaveBeenCalledWith(expect.objectContaining({ scheduledFor: held.nextRunAt }))
+  })
+
   it('keeps a deferred one-time run active under its durable runtime owner instead of reporting completion or claiming another occurrence', async () => {
     const f = isolatedSetup(), original = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
     f.input.decryptPayload = () => ({ ...original, schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } })

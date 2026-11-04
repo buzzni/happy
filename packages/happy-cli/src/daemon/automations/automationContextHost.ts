@@ -121,3 +121,17 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
     },
   }
 }
+
+
+/** Prepare the new execution path without making it a prerequisite of legacy ticking. */
+export async function prepareAutomationContextTick(host: Pick<ReturnType<typeof createAutomationContextHost>, 'maintain' | 'dispatch'> | null,
+  signal: AbortSignal, log: (message: string) => void): Promise<{ isolatedContextReady: boolean; dispatchIsolatedContext?: Dispatch }> {
+  if (!host || signal.aborted) return { isolatedContextReady: false }
+  try { await host.maintain(signal) }
+  catch {
+    // Journal integrity is a prerequisite of isolated work, not of existing v1/v4 automations.
+    log('[automation-context] Recovery unconfirmed; isolated admission paused for this tick')
+    return { isolatedContextReady: false }
+  }
+  return signal.aborted ? { isolatedContextReady: false } : { isolatedContextReady: true, dispatchIsolatedContext: host.dispatch }
+}

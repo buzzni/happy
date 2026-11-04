@@ -202,6 +202,8 @@ export interface ServerAutomationExecutorInput {
   }) => Promise<{ ok: boolean; error?: string; skipped?: boolean }>
   deliverConversation?: (input: { runId: string; claimToken: string; sessionId: string; directory: string; prompt: string; mcpSpawnContext?: AutomationMcpSpawnContext }) => Promise<{ ok: true; sessionId: string } | { ok: false; error: string }>
   /** Private run-owned runtime. The payload is the authored snapshot, never an assembled legacy conversation prompt. */
+  /** A failed host recovery holds isolated occurrences before claim, preserving once schedules. */
+  isolatedContextReady?: boolean
   dispatchIsolatedContext?: (input: { automationId: string; generation: number; revision: number; runId: string; claimToken: string;
     payload: ServerAutomationPayload; environmentVariables: Record<string, string>; mcpSpawnContext?: AutomationMcpSpawnContext }) => Promise<{
       state: 'started' | 'waiting' | 'needs-attention'; sessionId: string; reason?: string;
@@ -2073,6 +2075,10 @@ export async function runServerAutomationTick(
     const retryDue = hasDueUnreachableRetry(runtimeState, automation, now)
     if (schedule.nextRunAt > now && !immediateWorker && !retryDue) continue
     const payload = payloads.get(automation.automationId)!
+    if (payload.contextPolicy && input.isolatedContextReady === false) {
+      input.logDebug?.(`[server-automation] ${automation.automationId} isolated host unready; holding the original occurrence before claim`)
+      continue
+    }
     const queuedGithubEvents = payload.githubTrigger ? githubQueueDepth(input, automation) : 0
     const githubMode = payload.githubTrigger && queuedGithubEvents === 0 ? 'poll' : 'work'
     // 대기 게이트(aplus-dev-studio-desktop #2196): 대상 대화(이어 쓰는 대화, 아니면 직전 회차 대화)가 사용자 답을

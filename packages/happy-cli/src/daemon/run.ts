@@ -347,7 +347,7 @@ import {
 } from './additionalDirectories';
 import { mergeAdditionalDirectoriesIntoSandboxEnvironment, readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv';
 import { createAutomationContextWorkspace } from './automations/automationContextWorkspace';
-import { createAutomationContextHost } from './automations/automationContextHost';
+import { createAutomationContextHost, prepareAutomationContextTick } from './automations/automationContextHost';
 import { createAutomationContextLaunchJournal } from './automations/automationContextLaunchJournal';
 import type { AutomationContextLaunchRequest } from './automations/automationContextLaunch';
 import { createAutomationContextAuthorizer, createAutomationContextTransport } from './automations/automationContextTransport';
@@ -5231,9 +5231,10 @@ export async function startDaemon(): Promise<void> {
       // Windows standalone: sessions launch through the verified Job owner, so scheduled
       // sessions run; script gates and GitHub triggers would spawn unfenced cmd/gh/git.
       runTick: async (signal) => {
-        await contextHost?.maintain(signal);
+        const contextAdmission = await prepareAutomationContextTick(contextHost, signal, message => logger.warn(message));
+        if (signal.aborted) return;
         await runServerAutomationTick({
-        ...(contextHost ? { dispatchIsolatedContext: contextHost.dispatch } : {}),
+        ...contextAdmission,
         hostCommandsAllowed: !standaloneWindows,
         signal,
         delivery: automationDelivery,
