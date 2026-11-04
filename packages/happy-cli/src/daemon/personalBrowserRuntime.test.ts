@@ -1,5 +1,6 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { createServer } from 'node:http'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
@@ -33,9 +34,9 @@ const base = (overrides: Record<string, unknown> = {}) => ({ platform: 'darwin' 
 
 describe('personal browser runtime (daemon side)', () => {
     it('uses only Desktop signatures and fd3, never a daemon bearer or device fallback', async () => {
-        const root = await mkdtemp('/tmp/pbr-login-')
+        const root = await mkdtemp(join(tmpdir(), 'pbr-login-'))
         const descriptor = { protocol: 1, machineId: 'machine-1', workspaceId: 'personal:user-1', principalId: 'user-1', profileId: 'profile-1',
-            socketPath: join(root, 'issuer.sock'), secret: 's'.repeat(43), loginId: 'l'.repeat(43) }
+            socketPath: process.platform === 'win32' ? '\\\\.\\pipe\\saycode-browser-login-' + createHash('sha256').update(randomUUID()).digest('hex') : join(root, 'issuer.sock'), secret: 's'.repeat(43), loginId: 'l'.repeat(43) }
         let permitted = true
         const server = createServer((req, res) => {
             expect(req.headers['x-saycode-browser-login']).toBe(descriptor.secret)
