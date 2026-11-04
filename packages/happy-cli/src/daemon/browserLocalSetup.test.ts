@@ -1,11 +1,18 @@
 import { EventEmitter } from 'node:events'
 import { createServer, type AddressInfo } from 'node:net'
+import { execFile } from 'node:child_process'
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { promisify } from 'node:util'
 import { describe, expect, it } from 'vitest'
 import { BrowserBridge } from './browserBridge'
 import { BrowserLocalSetup, shouldEnableBrowserLocalSetup } from './browserLocalSetup'
 import { startDaemonControlServer } from './controlServer'
 import { retryBrowserBridgeServer, startBrowserBridgeServer } from './browserBridgeServer'
 import { WebSocket } from 'ws'
+import { readBrowserBridgeOwnerHome, writeBrowserBridgeOwnerHome } from './browserBridgeOwner'
+import { decodeNativeMessage, encodeNativeMessage } from './browserNativeMessaging'
 
 const alice = 'bv1_abcdefghijklmnopqrstuvwxyz012345'
 const bob = 'bv1_abcdefghijklmnopqrstuvwxyz012346'
@@ -68,10 +75,17 @@ describe('trusted local browser setup', () => {
     })
     it('offers local setup only while this daemon holds the bridge port, including after it takes the port over', async () => {
         const { setup, bridge } = fixture()
+        const userHome = await mkdtemp(join(tmpdir(), 'bridge-owner-takeover-'))
+        const oldHome = join(userHome, 'machine-links', 'old')
+        const newHome = join(userHome, 'machine-links', 'new')
+        await writeBrowserBridgeOwnerHome(userHome, oldHome)
         const holder = createServer()
         await new Promise<void>(resolve => holder.listen(0, '127.0.0.1', resolve))
         const heldPort = (holder.address() as AddressInfo).port
-        const retry = retryBrowserBridgeServer({ bridge, port: heldPort, retryMs: 20, consumeSetup: id => setup.consume(id) })
+        const retryOptions = { bridge, port: heldPort, retryMs: 20, consumeSetup: (id: string) => setup.consume(id),
+            onListening: () => writeBrowserBridgeOwnerHome(userHome, newHome),
+        }
+        const retry = retryBrowserBridgeServer(retryOptions)
         const control = await startDaemonControlServer({ browserBridge: bridge, browserLocalSetup: setup,
             getChildren: () => [], stopSession: () => ({ status: 'not-found' } as any),
             spawnSession: async () => ({ type: 'error', errorMessage: 'unused' } as any), requestShutdown: () => {}, onHappySessionWebhook: () => {},
@@ -80,18 +94,31 @@ describe('trusted local browser setup', () => {
         const post = (path: string, body: unknown) => fetch(`http://127.0.0.1:${control.port}/browser/local-setup/${path}`, { method: 'POST',
             headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${control.controlSecret}` }, body: JSON.stringify(body) })
         try {
+            await mkdir(newHome, { recursive: true })
+            await writeFile(join(newHome, 'daemon.state.json'), JSON.stringify({ httpPort: control.port, controlSecret: control.controlSecret }))
             const refused = await post('begin', { viewerKey: alice, profile: 'My Chrome' })
             expect(refused.status).toBe(503)
             expect(await refused.json()).toEqual({ ok: false, error: 'BRIDGE_PORT_IN_USE' })
             expect((await post('connect', { profile: 'default-1f8b' })).status).toBe(503)
+            expect(await readBrowserBridgeOwnerHome(userHome)).toBe(oldHome)
             await new Promise<void>(resolve => holder.close(() => resolve()))
             await expect.poll(async () => (await post('status', { viewerKey: alice })).status, { timeout: 2000 }).toBe(200)
+            // Chrome does not inherit the new daemon's nonstandard HAPPY_HOME_DIR.
+            const nativeHost = promisify(execFile)(process.execPath, [join(process.cwd(), 'bin', 'happy-browser-native-host.mjs')], {
+                env: { ...process.env, HOME: userHome, USERPROFILE: userHome, HAPPY_HOME_DIR: join(userHome, '.happy') },
+                encoding: 'buffer', timeout: 5000,
+            })
+            nativeHost.child.stdin!.end(encodeNativeMessage({ type: 'connect-offer' }))
+            const nativeReply = await nativeHost
+            expect(nativeReply.stderr.toString()).toBe('')
+            expect(decodeNativeMessage(nativeReply.stdout)).toEqual({ ok: true, account: 'alice@example.com' })
+            expect(await readBrowserBridgeOwnerHome(userHome)).toBe(newHome)
             const started = await (await post('begin', { viewerKey: alice, profile: 'My Chrome' })).json() as { operationId: string }
             const exchange = new WebSocket(`ws://127.0.0.1:${heldPort}/setup-pair?operationId=${started.operationId}`, { origin: 'chrome-extension://emaponnolfbhnoaabgiebjmbdlmoifke' })
             const reply = await new Promise<string>((resolve, reject) => { exchange.on('message', raw => resolve(raw.toString())); exchange.on('close', code => reject(new Error(`closed ${code}`))) })
             expect(JSON.parse(reply)).toMatchObject({ ok: true, config: { viewerKey: alice, profile: 'My Chrome' } })
             exchange.close()
-        } finally { await control.stop(); await retry.stop(); holder.close() }
+        } finally { await control.stop(); await retry.stop(); holder.close(); await rm(userHome, { recursive: true, force: true }) }
     })
     it('never exposes credentials in public progress or links, rejects wrong scope and legacy token, and probes the exact connection', async () => {
         const { setup, bridge } = fixture()
