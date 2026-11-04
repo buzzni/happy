@@ -36,7 +36,7 @@ export function createAutomationContextTransport(input: {
   return {
     async register(run, prepared) {
       const displaySessionId = run.payload.conversation?.sessionId
-      if (run.runId !== input.runId || prepared.body.tag !== sessionId || !displaySessionId
+      if (run.runId !== input.runId || run.claimToken !== input.claimToken || prepared.body.tag !== sessionId || !displaySessionId
         || (run.payload.agent !== 'claude' && run.payload.agent !== 'codex')) throw new Error('AUTOMATION_CONTEXT_IDENTITY_CONFLICT')
       // No authored prompt, seed ciphertext or private key is sent to the issuer.
       const admission = admissionSchema.parse(await input.authorize({ automationId: run.automationId, runId: run.runId,

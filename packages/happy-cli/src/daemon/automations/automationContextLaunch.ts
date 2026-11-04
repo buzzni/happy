@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import { createHash } from 'node:crypto'
 import { SessionExecutionCreateBodySchema, automationExecutionSeedSchema, automationExecutionSeedManifestSchema,
-  automationExecutionSeedArtifactSchema, automationExecutionSeedLocalId, automationExecutionSessionId, isAutomationExecutionSessionId, type AutomationPayload } from '@slopus/happy-wire'
+  automationExecutionSeedArtifactSchema, automationExecutionSeedLocalId, automationExecutionSessionId, isAutomationExecutionSessionId, automationPayloadSchema } from '@slopus/happy-wire'
 import type { ApiClient } from '@/api/api'
 import type { Metadata, Session } from '@/api/types'
 import type { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/registerCommonHandlers'
@@ -17,6 +17,7 @@ export const automationContextLaunchRecordSchema = z.strictObject({
   runId: z.string().min(1).max(160), displaySessionId: z.string().min(1).max(200),
   phase: z.enum(['prepared', 'registered', 'submitted', 'started']),
   prepared: z.strictObject({ body: SessionExecutionCreateBodySchema, encryptionKey: z.string().length(44), encryptionVariant: z.enum(['legacy', 'dataKey']),
+    requestCiphertext: z.string().min(1).max(1024 * 1024).optional(),
     seedMessage: z.strictObject({ localId: z.string().min(1).max(200), content: z.string().min(1).max(1024 * 1024) }) }),
   sessionId: z.string().min(1).max(200),
 })
@@ -25,12 +26,15 @@ export type AutomationContextLaunchRecord = z.infer<typeof automationContextLaun
 export interface AutomationContextLaunchJournal {
   exclusive<T>(runId: string, work: () => Promise<T>): Promise<T>
   read(runId: string): Promise<AutomationContextLaunchRecord | null>
+  listRunIds(): Promise<string[]>
   write(record: AutomationContextLaunchRecord): Promise<void>
 }
 
-export interface AutomationContextLaunchRequest {
-  automationId: string; generation: number; revision: number; runId: string; payload: AutomationPayload; previousResult?: unknown
-}
+const launchRequestSchema = z.strictObject({ automationId: z.string().min(1).max(200), generation: z.number().int().positive(), revision: z.number().int().positive(),
+  runId: z.string().regex(/^[A-Za-z0-9_-]{1,160}$/), claimToken: z.string().min(1).max(256), payload: automationPayloadSchema, previousResult: z.unknown().optional() })
+export type AutomationContextLaunchRequest = z.infer<typeof launchRequestSchema>
+type AutomationContextRecovery = { state: 'not-started' | 'running' | 'ended' | 'needs-attention'; sessionId: string; displaySessionId: string;
+  automationId: string; generation: number; revision: number }
 export interface AutomationContextLaunchDependencies {
   accountId: string; machineId: string; happyOrigin: string
   api: Pick<ApiClient, 'prepareSessionCreation'>
@@ -46,20 +50,52 @@ export interface AutomationContextLaunchDependencies {
 export function createAutomationContextLauncher(deps: AutomationContextLaunchDependencies) {
   const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
   const scope = digest([deps.happyOrigin, deps.accountId, deps.machineId])
+  const normalizeRequest = (input: AutomationContextLaunchRequest) => launchRequestSchema.parse({ ...input,
+    previousResult: input.payload.contextPolicy?.reference ? input.previousResult : undefined })
+  const hashRequest = (input: AutomationContextLaunchRequest) => digest({ request: input, seed: buildAutomationContextInput(input) })
+  function assertIdentity(record: AutomationContextLaunchRecord, runId: string) {
+    const sessionId = automationExecutionSessionId(runId)
+    if (record.scope !== scope || record.runId !== runId || record.sessionId !== sessionId
+      || record.prepared.body.tag !== sessionId || isAutomationExecutionSessionId(record.displaySessionId)) {
+      throw new Error('AUTOMATION_LAUNCH_IDENTITY_CONFLICT')
+    }
+  }
   return {
+    /** Private daemon input only. Never return this snapshot through browser RPC or logs. */
+    async restoreRequest(runId: string): Promise<AutomationContextLaunchRequest | null> {
+      return deps.journal.exclusive(runId, async () => {
+        const record = await deps.journal.read(runId)
+        if (!record) return null
+        assertIdentity(record, runId)
+        const invalid = () => { throw new Error('AUTOMATION_LAUNCH_SNAPSHOT_INVALID') }
+        if (!record.prepared.requestCiphertext) return invalid()
+        let decrypted: unknown
+        try { decrypted = decrypt(decodeBase64(record.prepared.encryptionKey), record.prepared.encryptionVariant, decodeBase64(record.prepared.requestCiphertext)) }
+        catch { return invalid() }
+        const value = launchRequestSchema.safeParse(decrypted)
+        if (!value.success) return invalid()
+        const saved = normalizeRequest(value.data)
+        if (saved.automationId !== record.automationId || saved.generation !== record.generation || saved.revision !== record.revision
+          || saved.runId !== runId || saved.payload.conversation?.sessionId !== record.displaySessionId || hashRequest(saved) !== record.requestHash) return invalid()
+        return saved
+      })
+    },
+    async recoverAll(): Promise<Array<AutomationContextRecovery & { runId: string }>> {
+      const recovered: Array<AutomationContextRecovery & { runId: string }> = []
+      for (const runId of await deps.journal.listRunIds()) {
+        const result = await this.recover(runId)
+        if (!result) throw new Error('AUTOMATION_LAUNCH_JOURNAL_INVALID')
+        recovered.push({ runId, ...result })
+      }
+      return recovered
+    },
     /** Reconcile the immutable old run even after edit/pause/delete; this method never dispatches. */
-    async recover(runId: string): Promise<null | {
-      state: 'not-started' | 'running' | 'ended' | 'needs-attention'; sessionId: string; displaySessionId: string;
-      automationId: string; generation: number; revision: number
-    }> {
+    async recover(runId: string): Promise<AutomationContextRecovery | null> {
       const sessionId = automationExecutionSessionId(runId)
       return deps.journal.exclusive(runId, async () => {
         const record = await deps.journal.read(runId)
         if (!record) return null
-        if (record.scope !== scope || record.runId !== runId || record.sessionId !== sessionId
-          || record.prepared.body.tag !== sessionId || isAutomationExecutionSessionId(record.displaySessionId)) {
-          throw new Error('AUTOMATION_LAUNCH_IDENTITY_CONFLICT')
-        }
+        assertIdentity(record, runId)
         const identity = { sessionId, displaySessionId: record.displaySessionId, automationId: record.automationId,
           generation: record.generation, revision: record.revision }
         if (record.phase === 'prepared' || record.phase === 'registered') return { ...identity, state: 'not-started' }
@@ -72,6 +108,7 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
     async launch(input: AutomationContextLaunchRequest): Promise<{
     state: 'started' | 'needs-attention'; sessionId: string; displaySessionId: string
   }> {
+    input = normalizeRequest(input)
     const seed = buildAutomationContextInput(input)
     const { automationId, generation, revision, runId } = input
     const { directory, model, effort } = input.payload, agent = input.payload.agent as 'claude' | 'codex'
@@ -83,8 +120,7 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
     const { question, ...seedFields } = executionSeed
     const seedManifest = automationExecutionSeedManifestSchema.parse({ ...seedFields,
       questionBytes: Buffer.byteLength(question, 'utf8'), seedSha256: digest(executionSeed) })
-    const requestHash = digest({ automationId, generation, revision, runId, displaySessionId, directory, agent,
-      model: model ?? null, effort: effort ?? null, seed })
+    const requestHash = hashRequest(input)
     const publicResult = (state: 'started' | 'needs-attention') => ({ state, sessionId, displaySessionId })
     return deps.journal.exclusive(runId, async () => {
       let record = await deps.journal.read(runId)
@@ -104,7 +140,8 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
         metadata.automationExecutionSeedManifest = seedManifest
         const prepared = deps.api.prepareSessionCreation({ tag: sessionId, metadata, state })
         record = { version: 1, scope, requestHash, automationId, generation, revision, runId, displaySessionId, sessionId, phase: 'prepared',
-          prepared: { ...prepared, encryptionKey: encodeBase64(prepared.encryptionKey), seedMessage: {
+          prepared: { ...prepared, encryptionKey: encodeBase64(prepared.encryptionKey),
+            requestCiphertext: encodeBase64(encrypt(prepared.encryptionKey, prepared.encryptionVariant, input)), seedMessage: {
             localId: automationExecutionSeedLocalId(runId), content: encodeBase64(encrypt(prepared.encryptionKey, prepared.encryptionVariant,
               automationExecutionSeedArtifactSchema.parse({ type: 'automation-execution-seed', seed: executionSeed }))) } } }
         // No provider or server side effect precedes this durable, immutable encrypted creation body.
@@ -119,6 +156,9 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
         || digest(metadata.automationExecutionSeedManifest) !== digest(seedManifest)
         || prepared.seedMessage.localId !== automationExecutionSeedLocalId(runId) || digest(artifact.seed) !== seedManifest.seedSha256
         || !z.strictObject({ controlledByUser: z.literal(false) }).safeParse(state).success) throw new Error('AUTOMATION_LAUNCH_SNAPSHOT_INVALID')
+      if (!prepared.requestCiphertext || digest(decrypt(encryptionKey, prepared.encryptionVariant, decodeBase64(prepared.requestCiphertext))) !== digest(input)) {
+        throw new Error('AUTOMATION_LAUNCH_SNAPSHOT_INVALID')
+      }
       const registered = await deps.register(structuredClone(input), structuredClone(prepared))
       if (registered.id !== sessionId || (registered.seq !== 0 && registered.seq !== 1) || registered.encryptionVariant !== prepared.encryptionVariant
         || !Buffer.from(registered.encryptionKey).equals(Buffer.from(encryptionKey))

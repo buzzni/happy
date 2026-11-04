@@ -20,7 +20,7 @@ function request(runId = 'r1'): AutomationContextLaunchRequest {
   const payload: AutomationPayload = { name: 'Task', prompt: 'Current occurrence only', directory: '/work',
     agent: 'codex', scriptCommand: null, suppressSilent: false, schedule: { kind: 'interval', minutes: 60 },
     conversation: { sessionId: 'manual' }, contextPolicy: { kind: 'isolated', reference: null } }
-  return { automationId: 'a1', generation: 1, revision: 1, runId, payload }
+  return { automationId: 'a1', generation: 1, revision: 1, runId, claimToken: 'immutable-private-claim', payload }
 }
 async function setup() {
   const api = await ApiClient.create({ token: 'fixture-bearer', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) } })
@@ -174,6 +174,53 @@ it('recovers a prepared receipt without claiming that a provider started or retr
   expect(f.discover).not.toHaveBeenCalled()
   expect(f.start).not.toHaveBeenCalled()
   expect(f.register).toHaveBeenCalledTimes(1)
+})
+
+it('restores the exact encrypted run input and selected result independently of an edited or removed definition', async () => {
+  const f = await setup(), input = request()
+  input.payload.contextPolicy = { kind: 'isolated', reference: { kind: 'previous-result', maxBytes: 16_384 } }
+  input.previousResult = { automationId: 'a1', runId: 'r0', revision: 1, status: 'COMPLETED', question: 'prior authored question', answer: 'private completed result' }
+  const expected = structuredClone(input)
+  f.register.mockRejectedValueOnce(new Error('offline'))
+  await expect(f.launcher.launch(input)).rejects.toThrow('offline')
+  input.payload.prompt = 'edited task'; input.claimToken = 'changed claim'; input.previousResult = undefined
+  const restarted = createAutomationContextLauncher(f.deps)
+  expect(await restarted.restoreRequest('r1')).toEqual(expected)
+  expect(await restarted.restoreRequest('missing')).toBeNull()
+  const name = (await readdir(join(home, 'automation-context-launches.v1'))).find(file => file.endsWith('.json'))!
+  const disk = await readFile(join(home, 'automation-context-launches.v1', name), 'utf8')
+  for (const secret of [expected.claimToken, expected.payload.prompt, 'private completed result']) expect(disk).not.toContain(secret)
+  expect(f.register).toHaveBeenCalledTimes(1); expect(f.start).not.toHaveBeenCalled()
+})
+
+it('enumerates immutable old runs and reconciles them without dispatch or current definition lookup', async () => {
+  const f = await setup()
+  f.start.mockRejectedValueOnce(new Error('lost-start-ACK'))
+  await expect(f.launcher.launch(request('submitted'))).rejects.toThrow('lost-start-ACK')
+  f.register.mockRejectedValueOnce(new Error('lost-register-ACK'))
+  await expect(f.launcher.launch(request('prepared'))).rejects.toThrow('lost-register-ACK')
+  const restarted = createAutomationContextLauncher(f.deps)
+  expect((await restarted.recoverAll()).sort((a, b) => a.runId.localeCompare(b.runId))).toEqual([
+    { runId: 'prepared', state: 'not-started', automationId: 'a1', generation: 1, revision: 1, sessionId: 'automation-run:prepared', displaySessionId: 'manual' },
+    { runId: 'submitted', state: 'needs-attention', automationId: 'a1', generation: 1, revision: 1, sessionId: 'automation-run:submitted', displaySessionId: 'manual' },
+  ])
+  expect(f.start).toHaveBeenCalledTimes(1); expect(f.register).toHaveBeenCalledTimes(2)
+  const directory = join(home, 'automation-context-launches.v1'), name = (await readdir(directory)).find(file => file.endsWith('.json'))!
+  await writeFile(join(directory, name), '{broken', { mode: 0o600 })
+  await expect(restarted.recoverAll()).rejects.toThrow()
+  expect(f.start).toHaveBeenCalledTimes(1)
+})
+
+it('refuses a missing or changed immutable input snapshot instead of reconstructing from a new definition', async () => {
+  const f = await setup()
+  f.register.mockRejectedValueOnce(new Error('offline'))
+  await expect(f.launcher.launch(request())).rejects.toThrow('offline')
+  const original = (await f.deps.journal.read('r1'))!
+  for (const requestCiphertext of [undefined, 'invalid-ciphertext']) {
+    await f.deps.journal.write({ ...original, prepared: { ...original.prepared, requestCiphertext } })
+    await expect(createAutomationContextLauncher(f.deps).restoreRequest('r1')).rejects.toThrow('AUTOMATION_LAUNCH_SNAPSHOT_INVALID')
+  }
+  expect(f.start).not.toHaveBeenCalled(); expect(f.discover).not.toHaveBeenCalled()
 })
 
 it('refuses recovery under another account or with a forged execution identity before discovery', async () => {

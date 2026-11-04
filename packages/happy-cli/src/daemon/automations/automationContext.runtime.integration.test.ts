@@ -97,7 +97,7 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
           }, 'real native identity', 60_000)
           return { type: 'success', sessionId: options.reconnectEnvironment!.HAPPY_RECONNECT_SESSION_ID }
         }, discover: async () => child?.exitCode === 0 ? 'ended' : child?.exitCode === null ? 'running' : 'unconfirmed' })
-      expect(await launcher.launch({ automationId: info.automationId, generation: info.generation, revision: info.revision, runId, payload }))
+      expect(await launcher.launch({ automationId: info.automationId, generation: info.generation, revision: info.revision, runId, claimToken, payload }))
         .toMatchObject({ state: 'started', displaySessionId })
       await eventually(async () => child!.exitCode === 0 ? true : child!.exitCode === null ? undefined : Promise.reject(new Error('Native CLI exit failed')),
         'native CLI natural exit and message flush', 60_000)

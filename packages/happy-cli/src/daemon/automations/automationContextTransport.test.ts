@@ -57,7 +57,7 @@ async function setup() {
   const payload: AutomationPayload = { name: 'Task', prompt: 'Current occurrence only', directory: '/work', agent: 'codex',
     scriptCommand: null, suppressSilent: false, schedule: { kind: 'interval', minutes: 60 },
     conversation: { sessionId: 'manual' }, contextPolicy: { kind: 'isolated', reference: null } }
-  const input = { automationId: 'a1', generation: 1, revision: 1, runId: 'r1', payload }
+  const input = { automationId: 'a1', generation: 1, revision: 1, runId: 'r1', claimToken: 'fixture-claim', payload }
   const authorize = vi.fn(async (_target: unknown) => ({ targetProof: 'fixture-target-proof', executionBindingRequired: false }))
   const transport = createAutomationContextTransport({ serverUrl: origin, token: 'fixture-account-token', machineId: 'm1',
     runId: 'r1', claimToken: 'fixture-claim', authorize })
@@ -80,6 +80,12 @@ it('registers and stores the exact E2EE seed over authenticated HTTP before subm
   expect(seed?.localId).toBe('automation-seed:r1')
   expect(seed?.content).not.toContain(f.input.payload.prompt)
   expect(f.start).toHaveBeenCalledOnce()
+})
+
+it('refuses a different claim before issuing a proof or performing a registration request', async () => {
+  const f = await setup()
+  await expect(f.launcher.launch({ ...f.input, claimToken: 'changed-claim' })).rejects.toThrow('AUTOMATION_CONTEXT_IDENTITY_CONFLICT')
+  expect(f.authorize).not.toHaveBeenCalled(); expect(f.start).not.toHaveBeenCalled()
 })
 
 it('recovers a lost HTTP storage ACK with the same ciphertext and no early or duplicate provider', async () => {
