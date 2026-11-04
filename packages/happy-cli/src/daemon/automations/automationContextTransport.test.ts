@@ -36,8 +36,11 @@ beforeEach(async () => {
       seed ??= body.messages[0]
       if (stored) stored.seq = 1
       if (loseSeedAck) { loseSeedAck = false; req.socket.destroy(); return }
-      res.end(JSON.stringify({ messages: [{ id: 'stored-seed', localId: seed!.localId, seq: 1,
-        content: { t: 'encrypted', c: seed!.content } }] })); return
+      res.end(JSON.stringify({ messages: [{ id: 'stored-seed', localId: seed!.localId, seq: 1 }] })); return
+    }
+    if (req.url === '/v3/sessions/automation-run%3Ar1/messages?after_seq=0&limit=1') {
+      res.end(JSON.stringify({ messages: seed ? [{ id: 'stored-seed', localId: seed.localId, seq: 1,
+        content: { t: 'encrypted', c: seed.content } }] : [], hasMore: false })); return
     }
     res.writeHead(404).end('{}')
   })
@@ -68,7 +71,7 @@ it('registers and stores the exact E2EE seed over authenticated HTTP before subm
   const f = await setup()
   expect(await f.launcher.launch(f.input)).toMatchObject({ state: 'started', sessionId: 'automation-run:r1', displaySessionId: 'manual' })
   expect(requests.map(req => req.path)).toEqual(['/v1/automation-runs/r1/execution-session', '/v2/sessions/lookup',
-    '/v3/sessions/automation-run%3Ar1/messages'])
+    '/v3/sessions/automation-run%3Ar1/messages', '/v3/sessions/automation-run%3Ar1/messages?after_seq=0&limit=1'])
   expect(requests.every(req => req.authorization === 'Bearer fixture-account-token')).toBe(true)
   expect(requests[0].body).toMatchObject({ machineId: 'm1', claimToken: 'fixture-claim', displaySessionId: 'manual', executionBindingRequired: false })
   expect(f.authorize.mock.calls[0][0]).toMatchObject({ automationId: 'a1', runId: 'r1', generation: 1, revision: 1,
@@ -86,7 +89,7 @@ it('recovers a lost HTTP storage ACK with the same ciphertext and no early or du
   const first = structuredClone(seed)
   expect(await createAutomationContextLauncher(f.deps).launch(f.input)).toMatchObject({ state: 'started' })
   expect(seed).toEqual(first)
-  const writes = requests.filter(req => req.path.includes('/messages'))
+  const writes = requests.filter(req => req.path.includes('/messages') && req.body?.messages)
   expect(writes).toHaveLength(2)
   expect(writes[0].body).toEqual(writes[1].body)
   expect(f.prepare).toHaveBeenCalledOnce()

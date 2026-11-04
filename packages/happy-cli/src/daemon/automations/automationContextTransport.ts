@@ -24,10 +24,10 @@ export function createAutomationContextTransport(input: {
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash
     || !input.token || !input.machineId || !input.claimToken || input.claimToken.length > 256) throw new Error('AUTOMATION_CONTEXT_TRANSPORT_INVALID')
   const base = url.toString().replace(/\/+$/, ''), sessionId = automationExecutionSessionId(input.runId)
-  async function request(path: string, body: unknown): Promise<unknown> {
+  async function request(path: string, body?: unknown): Promise<unknown> {
     let response: Response
     try {
-      response = await fetch(base + path, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10_000),
+      response = await fetch(base + path, { method: body === undefined ? 'GET' : 'POST', redirect: 'error', signal: AbortSignal.timeout(10_000),
         headers: { Authorization: `Bearer ${input.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
     } catch { throw new Error('AUTOMATION_CONTEXT_REQUEST_UNCONFIRMED') }
     if (!response.ok) throw new Error(`AUTOMATION_CONTEXT_HTTP_${response.status}`)
@@ -61,10 +61,16 @@ export function createAutomationContextTransport(input: {
     },
     async persistSeed(session, message) {
       if (session.id !== sessionId) throw new Error('AUTOMATION_CONTEXT_IDENTITY_CONFLICT')
-      const result = z.object({ messages: z.array(z.object({ seq: z.number().int().positive(), localId: z.string(),
-        content: z.object({ t: z.literal('encrypted'), c: z.string() }) })).length(1) }).parse(
+      const result = z.object({ messages: z.array(z.object({ id: z.string().min(1), seq: z.number().int().positive(), localId: z.string() })).length(1) }).parse(
         await request(`/v3/sessions/${encodeURIComponent(sessionId)}/messages`, { messages: [message] }))
-      const stored = result.messages[0]
+      const ack = result.messages[0]
+      if (ack.seq !== 1 || ack.localId !== message.localId) throw new Error('AUTOMATION_SEED_RECEIPT_CONFLICT')
+      // Append ACKs intentionally omit content. Read the owned first row to verify what actually won localId deduplication.
+      const page = z.object({ messages: z.array(z.object({ id: z.string().min(1), seq: z.number().int().positive(), localId: z.string(),
+        content: z.object({ t: z.literal('encrypted'), c: z.string() }) })).length(1) }).parse(
+        await request(`/v3/sessions/${encodeURIComponent(sessionId)}/messages?after_seq=0&limit=1`))
+      const stored = page.messages[0]
+      if (stored.id !== ack.id || stored.seq !== ack.seq || stored.localId !== ack.localId) throw new Error('AUTOMATION_SEED_RECEIPT_CONFLICT')
       return { seq: stored.seq, localId: stored.localId, content: stored.content.c }
     },
   }
