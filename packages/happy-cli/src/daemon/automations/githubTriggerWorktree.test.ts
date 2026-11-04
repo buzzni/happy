@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -294,7 +294,7 @@ describe('prepareGithubTriggerWorktree', () => {
 
 describe('removeGithubTriggerWorktree', () => {
   it.each([false, true])('preserves an intentional lockfile-only update in a real worktree (staged=%s)', async (staged) => {
-    const fixtureRoot = await mkdtemp(join(tmpdir(), 'happy-worktree-lockfile-'))
+    const fixtureRoot = await realpath(await mkdtemp(join(tmpdir(), 'happy-worktree-lockfile-')))
     const repositoryRoot = join(fixtureRoot, 'repo')
     const worktreePath = join(fixtureRoot, 'worktree')
     const git = async (args: string[], cwd = repositoryRoot) => {
