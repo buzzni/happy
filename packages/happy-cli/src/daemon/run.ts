@@ -202,7 +202,7 @@ import {
 import { machineIdentityMetadataUpdate } from './machineIdentityMetadata';
 import { listMachineIdTwins } from './machineIdTwins';
 import { agentBrowserMachineCapability, agentBrowserMetadataUpdate, browserTaskLineage, browserTaskSpawnSeed, createBrowserTaskSessionBroker, spawnResumedWithBrowserTaskRegistration, startBrowserTaskReconciliation, type BrowserTaskRegistration, type BrowserTaskSessionBroker } from './browserTaskBroker';
-import { readPersonalBrowserRuntime, watchPersonalBrowserRuntime } from './personalBrowserRuntime';
+import { forgetInheritedPersonalBrowserEnv, readPersonalBrowserRuntime, watchPersonalBrowserRuntime } from './personalBrowserRuntime';
 import { checkDesktopBrowserLoginSocket, createDesktopBrowserLoginClient, desktopBrowserLoginDescriptor, type DesktopBrowserLoginDescriptor } from '@/browserRuntime/desktopBrowserLogin';
 import { brokerRequest, createNativeBrokerRequest, type NativeBrokerRequestOptions } from '@/browserRuntime/brokerGrantSource';
 import { createHeldBrowserAttentions, findBrowserAttentionSession, startBrowserAttentionWatcher, type HeldBrowserAttention } from './browserAttentionDelivery';
@@ -701,6 +701,9 @@ export async function startDaemon(): Promise<void> {
       logger.debug(`[DAEMON RUN] Scrubbing inherited session lineage env: ${key}`);
       delete process.env[key];
     }
+  }
+  if (forgetInheritedPersonalBrowserEnv(process.env)) {
+    logger.debug('[DAEMON RUN] Forgot the personal browser runtime environment inherited from a previous daemon or session');
   }
 
   // 이 머신이 샌드박스를 쓸 수 있는지 기동 시점에 한 번 확인한다. checkDependencies()
