@@ -3,6 +3,44 @@ import { MessageQueue2 } from './MessageQueue2';
 import { hashObject } from './deterministicJson';
 
 describe('MessageQueue2', () => {
+    it.each([false, true])('waits for asynchronous workspace admission before consuming any input (waiting=%s)', async waiting => {
+        const queue = new MessageQueue2<string>(mode => mode);
+        const attachments = [{ data: new Uint8Array([1, 2, 3]), mimeType: 'image/png', name: 'draft.png' }];
+        let release!: (allowed: boolean) => void;
+        const gate = vi.fn(() => new Promise<boolean>(resolve => { release = resolve; }));
+        const claim = vi.fn(() => true);
+        if (!waiting) queue.push('draft', 'remote', attachments, ['request-A']);
+        const pending = Reflect.apply(queue.waitForMessagesAndGetAsString, queue, [undefined, claim, gate]);
+        if (waiting) queue.push('draft', 'remote', attachments, ['request-A']);
+        await Promise.resolve();
+        try {
+            expect(gate).toHaveBeenCalledOnce();
+            expect(queue.size()).toBe(1);
+            expect(claim).not.toHaveBeenCalled();
+        } finally { release?.(true); }
+        expect(await pending).toMatchObject({ message: 'draft', attachments, requestIds: ['request-A'] });
+        expect(claim).toHaveBeenCalledOnce();
+    });
+
+    it.each(['refuse', 'abort', 'error'])('preserves the original queued attachment and identity after admission %s', async reason => {
+        const queue = new MessageQueue2<string>(mode => mode);
+        const attachments = [{ data: new Uint8Array([7]), mimeType: 'image/png', name: 'draft.png' }];
+        queue.pushIsolated('draft', 'remote', attachments, ['request-A']);
+        const abort = new AbortController();
+        const claim = vi.fn(() => true);
+        const gate = async () => {
+            if (reason === 'error') throw new Error('admission unavailable');
+            if (reason === 'abort') abort.abort();
+            return reason !== 'refuse';
+        };
+        const pending = Reflect.apply(queue.waitForMessagesAndGetAsString, queue, [abort.signal, claim, gate]);
+        if (reason === 'error') await expect(pending).rejects.toThrow('admission unavailable');
+        else expect(await pending).toBeNull();
+        expect(claim).not.toHaveBeenCalled();
+        expect(queue.size()).toBe(1);
+        expect(await queue.waitForMessagesAndGetAsString()).toMatchObject({ message: 'draft', attachments, requestIds: ['request-A'], isolate: true });
+    });
+
     it.each([false, true])('claims synchronously before removing a batch (waiting=%s)', async (waiting) => {
         const queue = new MessageQueue2<string>(mode => mode);
         const claim = vi.fn(() => { expect(queue.size()).toBe(1); return true; });
