@@ -626,6 +626,7 @@ type MachineRpcHandlers = {
      * Chat(beta)) keeps the session instead of deleting it, so the attention after an approval or a login
      * can resume it. Absent on a machine without the browser runtime.
      */
+    browserSessionPrepare?: (sessionId: string) => Promise<{ supported: boolean; reconnect?: boolean }>;
     browserSessionWaiting?: (sessionId: string) => Promise<boolean>;
     aiCredentialRuntime: AiCredentialRuntime;
     autonomousQualityGate?: AutonomousQualityGateRpcHandlers;
@@ -1167,6 +1168,7 @@ export class ApiMachineClient {
         linkSpawnedSession,
         difficultyRouting,
         browserSessionWaiting,
+        browserSessionPrepare,
         channelHostCall,
         ownedSpawn,
     }: MachineRpcHandlers) {
@@ -1174,6 +1176,13 @@ export class ApiMachineClient {
         this.daemonSessionStateRpcAvailable = !!daemonSessionState;
         if (daemonSessionState) {
             this.rpcHandlerManager.registerHandler('daemon-session-state', daemonSessionState);
+        }
+        if (browserSessionPrepare) {
+            this.rpcHandlerManager.registerHandler('browser-session-prepare', async (params: unknown) => {
+                const row = params as { sessionId?: unknown } | null;
+                if (!row || Object.keys(row).join(',') !== 'sessionId' || typeof row.sessionId !== 'string' || !row.sessionId || row.sessionId.length > 256) throw Error('Invalid browser session');
+                return browserSessionPrepare(row.sessionId);
+            });
         }
         if (browserSessionWaiting) {
             this.rpcHandlerManager.registerHandler('browser-session-waiting', async (params: unknown) => {

@@ -15,7 +15,9 @@ export async function setup() {
     // test that needs a state root sets its own.
     delete process.env.HAPPY_LESSON_DAEMON_HOME
 
-    const buildResult = spawnSync('pnpm', ['build'], { stdio: 'pipe' })
+    // Windows resolves the installed pnpm.cmd through its command shell.
+    // This is a fixed build command, never test or caller input.
+    const buildResult = spawnSync('pnpm', ['build'], { stdio: 'pipe', shell: process.platform === 'win32' })
     const buildStdout = buildResult.stdout ? buildResult.stdout.toString() : ''
     const buildStderr = buildResult.stderr ? buildResult.stderr.toString() : ''
     // The exit code is the only reliable signal. `tsc` writes its diagnostics

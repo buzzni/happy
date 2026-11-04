@@ -1,5 +1,22 @@
 # CLI Architecture
 
+## Existing Desktop login for a personal browser
+
+A compatible Desktop main can attach an execution-scoped login relay to its local
+personal/dedicated daemon. The personal bearer stays in Desktop main; the runtime
+receives only the scoped descriptor through inherited fd3. Each API admission
+checks the current login, and changed login epochs retire their registrations.
+Shared/protected runtimes and Linux retain the existing authentication path.
+The authenticated `browser-session-prepare` RPC reconnects only an idle child owned
+by this daemon, proves its exit, and relies on normal resume for new session grants;
+it never replays a prompt. A daemon-owned per-session coordinator serializes
+concurrent prepares and retains the stopped PID/start identity after timeouts or
+tracking removal until exit is proven; a retry cannot assume the process ended.
+Windows relay pipes use Desktop's same-user/SYSTEM DACL.
+Revisit this boundary if the relay moves outside Desktop main or the supported
+runtime tenancy changes. Formal release and install acceptance remain separate
+from a source build or synthetic issuer test.
+
 ## Personal browser native-command dispatch
 
 `daemon/personalBrowserRuntime` verifies the issuer envelope against the installed

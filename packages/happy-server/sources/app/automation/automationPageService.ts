@@ -14,7 +14,8 @@ export async function listAutomationPage(tx: Prisma.TransactionClient, actorId: 
     const rows = await tx.automation.findMany({
         where: {
             projectId: { in: input.projectIds }, deletedAt: null,
-            ...(input.reservationExtensions ? { AND: [{ OR: [{ projectId: { not: { startsWith: 'chat:' } } }, { payloadVersion: 3 }] }] } : { payloadVersion: { not: 3 } }),
+            // Retired native v5 rows stay hidden on both paths.
+            ...(input.reservationExtensions ? { payloadVersion: { not: 5 }, AND: [{ OR: [{ projectId: { not: { startsWith: 'chat:' } } }, { payloadVersion: 3 }] }] } : { payloadVersion: { notIn: [3, 5] } }),
             project: { OR: [{ accountId: actorId }, { members: { some: { accountId: actorId, status: 'accepted' } } }] },
             ...(after ? { OR: [{ createdAt: { lt: after.createdAt } }, { createdAt: after.createdAt, id: { lt: after.id } }] } : {}),
         },

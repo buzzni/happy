@@ -140,6 +140,7 @@ model Session {
 
     executionBinding SessionExecutionBinding?
     ownershipBinding SessionOwnershipBinding?
+    reservationLease ReservationConversationLease?
 
     @@unique([id, accountId])
     @@unique([accountId, tag])
@@ -550,6 +551,8 @@ enum AutomationRunStatus {
 }
 
 enum AutomationRunOutcome {
+    // Deprecated: readable and reportable for historical runs only.
+    NO_CHANGE
     WOKE
     SILENT
     SKIPPED_GATE
@@ -557,6 +560,7 @@ enum AutomationRunOutcome {
 }
 
 model Automation {
+    reservationCheckpoint ReservationCheckpoint?
     id                 String    @id @default(cuid())
     projectId          String
     project            Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
@@ -1198,4 +1202,44 @@ model SessionOwnershipBinding {
     @@unique([subjectIssuer, intentId])
     @@unique([subjectIssuer, operationId])
     @@unique([subjectIssuer, nonce])
+}
+
+// Retired v5 persistence only. Kept with the published additive migration to preserve data; no executor uses it after rollback.
+enum ReservationConversationLeaseState {
+    PREPARING
+    RUNNING
+    SETTLING
+}
+model ReservationConversationLease {
+    sessionId       String @id
+    session         Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+    runId           String @unique
+    automationId    String
+    generation      Int
+    accountId       String
+    machineId       String
+    claimTokenHash  Bytes
+    epoch           String @unique
+    state           ReservationConversationLeaseState
+    descriptorHash  String
+    messageCapabilityHash Bytes
+    launchId String?
+  processGroupId Int?
+  processStartId String?
+  activatedAt DateTime?
+  expectedSeq     Int
+    expiresAt       DateTime
+    createdAt       DateTime @default(now())
+    updatedAt       DateTime @updatedAt
+    @@index([accountId, machineId])
+}
+
+
+// Independent from an execution lease: a new turn must recover its pending delivery.
+model ReservationCheckpoint {
+    automationId String @id
+    automation Automation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+    revision Int
+    ciphertext Bytes
+    updatedAt DateTime @updatedAt
 }

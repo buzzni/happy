@@ -114,6 +114,7 @@ export function startDaemonControlServer({
   restartDrain,
   writeScopeRuntime,
   browserLocalSetup,
+  desktopBrowserLogin,
   getDeviceEnrollment = () => null,
   getSetupTokenAccountSwitch = () => null,
   getCallerLaunches = () => null,
@@ -128,6 +129,7 @@ export function startDaemonControlServer({
   /** aplus codexcli-daemon-restart-drain — absent on preflight and in tests that do not drain. */
   restartDrain?: RestartDrainControlPort;
   browserLocalSetup?: BrowserLocalSetup;
+  desktopBrowserLogin?: { status(): unknown; attach(input: unknown): Promise<void> };
   getChildren: () => TrackedSession[];
   stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
   spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
@@ -1070,6 +1072,13 @@ export function startDaemonControlServer({
       });
     }
 
+    if (desktopBrowserLogin && !managedRuntime && !standaloneDrain) {
+      typed.post('/browser/desktop-login/capability', { schema: { body: z.object({}).strict() } }, async () => desktopBrowserLogin.status());
+      typed.post('/browser/desktop-login/attach', async (request, reply) => {
+        try { await desktopBrowserLogin.attach(request.body); return { protocol: 1, attached: true }; }
+        catch { return reply.code(403).send({ error: 'DESKTOP_BROWSER_LOGIN_REQUIRED' }); }
+      });
+    }
     attachLocalToolAgentRelayRoutes(app);
     if (browserLocalSetup && browserBridge) attachBrowserLocalSetupRoutes(app, browserLocalSetup, browserBridge);
     attachStandaloneDrain(app, managedRuntime ? undefined : standaloneDrain, requestShutdown);

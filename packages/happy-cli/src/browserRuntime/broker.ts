@@ -64,6 +64,8 @@ const REGISTRY_FILE = 'broker-sessions.json'
 const MAX_BODY_BYTES = 16 * 1024
 
 export interface BrokerOptions {
+    /** Optional Desktop-bound epoch. Registrations from withdrawn epochs are revoked before admission. */
+    desktopLoginId?: string
     socketPath: string
     /** Already listening on `socketPath` (bound before the Runtime dropped root); otherwise the broker binds it. */
     server?: Server
@@ -293,7 +295,14 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
 
     // A registration of another assignment is revoked for good (its session ended) before anything is served:
     // marked here, so its grants are denied from the first request, then replayed like any revocation.
-    const stale = ledger.retireStale(Object.values(registry.registrations)) + (adopted ?? 0)
+    let retiredLogins = 0
+    for (const registration of Object.values(registry.registrations)) {
+        if (registration.desktopLoginId && registration.desktopLoginId !== options.desktopLoginId) {
+            registration.revoking = true
+            retiredLogins++
+        }
+    }
+    const stale = retiredLogins + ledger.retireStale(Object.values(registry.registrations)) + (adopted ?? 0)
     if (stale || adopted !== undefined) {
         await persist().catch(() => { throw new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'Broker registry could not be written') })
         log(`broker: ${stale} registration(s) of an earlier profile assignment revoked`)
@@ -335,6 +344,7 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
                 const sessionSecret = randomBytes(32).toString('base64url')
                 registry.registrations[registrationId] = { secretSha256: sha256(sessionSecret).toString('hex'), createdAtMs: now(), grantIds: [],
                     ...assigned,
+                    ...(options.desktopLoginId ? { desktopLoginId: options.desktopLoginId } : {}),
                     ...(body.owner ? { owner: body.owner } : {}), ...(body.bootId ? { bootId: body.bootId } : {}), ...(body.lineage ? { lineage: body.lineage } : {}) }
                 await persist()
                 return { registrationId, sessionSecret }
