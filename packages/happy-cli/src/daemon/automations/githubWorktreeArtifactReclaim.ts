@@ -34,18 +34,58 @@ async function git(root: string, ...args: string[]) {
   return (await exec('git', ['-C', root, '-c', 'core.quotePath=false', '-c', 'core.fsmonitor=', ...args], commandOptions)).stdout
 }
 
+/**
+ * Open paths in `lsof -Fpn` output. Names that are not paths (pipes, sockets, `anon_inode:[io_uring]`) cannot be
+ * inside a worktree. A path lsof could not stat is still compared by its printed name. A process whose own /proc
+ * links were denied is returned in `deniedPids` for the caller to confirm; any other unreadable link makes the
+ * inventory incomplete.
+ */
+export function parseLsofInventory(stdout: string): { paths: string[]; deniedPids: string[] } {
+  const paths: string[] = []
+  const deniedPids = new Set<string>()
+  let pid: string | null = null
+  for (const line of stdout.split('\n')) {
+    if (/^p\d+$/.test(line)) { pid = line.slice(1); continue }
+    if (!line.startsWith('n')) continue
+    if (pid === null || line === 'nunknown') throw new Error('incomplete process inventory')
+    if (!line.startsWith('n/')) continue
+    const [, path, failure] = /^n(.*?)(?: \((\w+: [^()]*)\))?$/.exec(line)!
+    const link = /^\/proc\/(\d+)\/(?:cwd|root|exe|fd)$/.exec(path)
+    if (link && failure) {
+      if (link[1] !== pid || !failure.endsWith(': Permission denied')) throw new Error('incomplete process inventory')
+      deniedPids.add(pid)
+      continue
+    }
+    paths.push(path.replace(/ \(deleted\)$/, ''))
+  }
+  if (pid === null) throw new Error('incomplete process inventory')
+  return { paths, deniedPids: [...deniedPids] }
+}
+
+/**
+ * Linux hands the /proc entries of a non-dumpable process (one that changed credentials, like `sshd: user@pts`)
+ * to root, so it is as invisible to this user as other users' processes, which `-u` never lists. A denied entry
+ * this user still owns was refused by something else (an LSM, for example) and proves nothing about the process.
+ */
+export async function isUninspectableProcess(pid: string, uid: number): Promise<boolean> {
+  try { return (await lstat(`/proc/${pid}/cwd`)).uid !== uid }
+  catch (error) { return (error as NodeJS.ErrnoException).code === 'ENOENT' }
+}
+
 async function livePaths(): Promise<string[]> {
   if (process.platform === 'win32' || !process.getuid) throw new Error('process inventory unavailable')
+  const uid = process.getuid()
   // Full user-owned handles include detached build processes whose cwd moved elsewhere.
   // Failed or incomplete inventories must never be interpreted as an idle machine.
-  const { stdout } = await exec('lsof', ['-nP', '-a', '-u', String(process.getuid()), '-Fpn'], commandOptions)
+  // The C locale keeps lsof's strerror text ("Permission denied") untranslated.
+  const { stdout } = await exec('lsof', ['-nP', '-a', '-u', String(uid), '-Fpn'],
+    { ...commandOptions, env: { ...commandOptions.env, LC_ALL: 'C' } })
     .catch(() => { throw new Error('process inventory unavailable') })
-  const lines = stdout.split('\n')
-  if (!lines.some(line => /^p\d+$/.test(line)) || lines.includes('nunknown')
-    || /\((?:readlink|stat|read):/.test(stdout)) {
-    throw new Error('incomplete process inventory')
+  const { paths, deniedPids } = parseLsofInventory(stdout)
+  for (const pid of deniedPids) {
+    if (!await isUninspectableProcess(pid, uid)) throw new Error('incomplete process inventory')
   }
-  return lines.filter(line => line.startsWith('n/')).map(line => line.slice(1).replace(/ \(deleted\)$/, ''))
+  return paths
 }
 
 async function available(path: string) {

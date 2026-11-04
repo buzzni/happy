@@ -1,11 +1,11 @@
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { createGithubArtifactReclaimer } from './githubWorktreeArtifactReclaim'
+import { createGithubArtifactReclaimer, isUninspectableProcess, parseLsofInventory } from './githubWorktreeArtifactReclaim'
 import { removeGithubTriggerWorktree } from './githubTriggerWorktree'
 
 const exec = promisify(execFile)
@@ -221,6 +221,56 @@ describe('GitHub automation generated artifact reclamation', () => {
     const result = await reclaimer({ readLivePaths })({ repositoryRoot: repo, worktreePath })
     expect(result.status).toBe('deferred')
     expect(readLivePaths).not.toHaveBeenCalled()
+  })
+
+  // `lsof -nP -a -u <uid> -Fpn` on a Linux PC running Node 20+ (libuv io_uring), a container and an SSH login.
+  const linuxInventory = (...extra: string[]) => [
+    'p4100', 'fcwd', 'n/home/user', 'f12', 'nanon_inode:[io_uring] (stat: No such file or directory)', 'f13', 'npipe',
+    'f14', 'ntype=STREAM', 'p4200', 'fmem', 'n/usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.30 (stat: No such file or directory)',
+    'p4300', 'fcwd', 'n/proc/4300/cwd (readlink: Permission denied)', 'frtd', 'n/proc/4300/root (readlink: Permission denied)',
+    'ftxt', 'n/proc/4300/exe (readlink: Permission denied)', 'fNOFD', 'n/proc/4300/fd (opendir: Permission denied)',
+    ...extra, '',
+  ].join('\n')
+
+  it('reclaims when the inventory has io_uring handles, unresolvable outside paths and uninspectable processes', async () => {
+    const { paths, deniedPids } = parseLsofInventory(linuxInventory())
+    expect(paths).toEqual(['/home/user', '/usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.30'])
+    expect(deniedPids).toEqual(['4300'])
+    const result = await reclaimer({ readLivePaths: async () => paths })({ repositoryRoot: repo, worktreePath })
+    expect(result.errors).toEqual([])
+    expect(result.deletedPaths).toEqual([target])
+  })
+
+  it('protects a worktree file named by a handle whose stat failed', async () => {
+    const { paths } = parseLsofInventory(linuxInventory('p4400', 'fmem', `n${join(target, 'addon.node')} (stat: No such file or directory)`))
+    const result = await reclaimer({ readLivePaths: async () => paths })({ repositoryRoot: repo, worktreePath })
+    expect(result.deletedPaths).toEqual([])
+    expect(result.skips['live-process']).toBeGreaterThan(0)
+  })
+
+  it.each([
+    ['an unknown name', ['p4500', 'fcwd', 'nunknown']],
+    ['a cwd that could not be read for another reason', ['p4500', 'fcwd', 'n/proc/4500/cwd (readlink: Input/output error)']],
+    ['a denied link of a different process', ['p4500', 'fcwd', 'n/proc/4501/cwd (readlink: Permission denied)']],
+  ])('treats an inventory with %s as incomplete', (_, extra) => {
+    expect(() => parseLsofInventory(linuxInventory(...extra))).toThrow('incomplete process inventory')
+  })
+
+  it('treats an inventory without any process record as incomplete', () => {
+    expect(() => parseLsofInventory('')).toThrow('incomplete process inventory')
+  })
+
+  it.skipIf(process.platform !== 'linux')('confirms a denied process only when the kernel hid its /proc entries', async () => {
+    // PR_SET_DUMPABLE(0) is what setuid programs and sshd sessions end up with.
+    const child = spawn('python3', ['-c', 'import ctypes,time; ctypes.CDLL(None).prctl(4, 0); print(1, flush=True); time.sleep(30)'],
+      { stdio: ['ignore', 'pipe', 'inherit'] })
+    try {
+      await new Promise((done, fail) => { child.stdout.once('data', done); child.once('error', fail) })
+      expect(await isUninspectableProcess(String(child.pid), process.getuid!())).toBe(true)
+      // Our own, readable process: a denial for it would have come from elsewhere, so it is not confirmed.
+      expect(await isUninspectableProcess(String(process.pid), process.getuid!())).toBe(false)
+      expect(await isUninspectableProcess('999999999', process.getuid!())).toBe(true)
+    } finally { child.kill() }
   })
 
   it('shares simultaneous cleanup requests for the same worktree', async () => {
