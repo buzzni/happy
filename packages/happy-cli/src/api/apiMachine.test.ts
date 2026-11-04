@@ -2356,6 +2356,19 @@ describe('stop-session verifyExit contract', () => {
     const stopHandler = (client: ApiMachineClient) => (client as any).rpcHandlerManager
         .registerHandler.mock.calls.find(([method]: [string]) => method === 'stop-session')?.[1];
 
+    it('validates the reconnect request and leaves it outside the server RPC lane', async () => {
+        const client = new ApiMachineClient('fake-token', { ...makeMachine(), encryptionVariant: 'dataKey' })
+        const browserSessionPrepare = vi.fn(async () => ({ supported: true, reconnect: false }))
+        client.setRPCHandlers(handlers({ browserSessionPrepare }) as any)
+        const manager = (client as any).rpcHandlerManager
+        const handle = manager.registerHandler.mock.calls.find(([method]: [string]) => method === 'browser-session-prepare')[1]
+        for (const raw of [null, {}, { sessionId: '' }, { sessionId: 's', token: 'untrusted' }]) await expect(handle(raw)).rejects.toThrow('Invalid browser session')
+        expect(browserSessionPrepare).not.toHaveBeenCalled()
+        await expect(handle({ sessionId: 's' })).resolves.toMatchObject({ supported: true })
+        expect(rpcManagerConfigs.at(-1)?.serverLane?.allows('daemon-session-state')).toBe(true)
+        expect(rpcManagerConfigs.at(-1)?.serverLane?.allows('browser-session-prepare')).toBe(false)
+    })
+
     it.each(['standalone-unowned', 'standalone-blocked'])('returns an actionable refusal for %s without claiming a stop request', async reason => {
         const client = new ApiMachineClient('fake-token', makeMachine());
         client.setRPCHandlers(handlers({ stopSession: vi.fn(() => ({ stopped: false, reason, detail: 'unavailable' })) }) as any);

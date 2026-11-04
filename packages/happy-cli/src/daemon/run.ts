@@ -1,3 +1,5 @@
+import { prepareBrowserSessionReconnect } from './browserSessionReconnect';
+import { readBrowserTaskPidStartTime } from './browserTaskSessionOwner';
 import { createBrowserNativeDeviceProof, type BrowserNativeDeviceSigner } from './browserNativeDeviceProof';
 import { createManualPersonalSpawn, MANUAL_PERSONAL_ENV } from './manualPersonalClaude';
 import { createOwnedSpawnRuntime, createOwnedStartGuard } from './ownedSpawnRuntime';
@@ -200,8 +202,9 @@ import {
 import { machineIdentityMetadataUpdate } from './machineIdentityMetadata';
 import { listMachineIdTwins } from './machineIdTwins';
 import { agentBrowserMachineCapability, agentBrowserMetadataUpdate, browserTaskLineage, createBrowserTaskSessionBroker, spawnResumedWithBrowserTaskRegistration, startBrowserTaskReconciliation, type BrowserTaskSessionBroker } from './browserTaskBroker';
-import { watchPersonalBrowserRuntime } from './personalBrowserRuntime';
-import type { NativeBrokerRequestOptions } from '@/browserRuntime/brokerGrantSource';
+import { readPersonalBrowserRuntime, watchPersonalBrowserRuntime } from './personalBrowserRuntime';
+import { checkDesktopBrowserLoginSocket, createDesktopBrowserLoginClient, desktopBrowserLoginDescriptor, type DesktopBrowserLoginDescriptor } from '@/browserRuntime/desktopBrowserLogin';
+import { brokerRequest, createNativeBrokerRequest, type NativeBrokerRequestOptions } from '@/browserRuntime/brokerGrantSource';
 import { createHeldBrowserAttentions, findBrowserAttentionSession, startBrowserAttentionWatcher, type HeldBrowserAttention } from './browserAttentionDelivery';
 import {
   createProcFs,
@@ -1886,7 +1889,9 @@ export async function startDaemon(): Promise<void> {
     /** Set once the machine sync client exists; an activation before that is published with the first metadata check. */
     let publishAgentBrowserCapability: (() => void) | undefined;
     let browserNativeDeviceSigner: BrowserNativeDeviceSigner | undefined;
+    let personalDesktopLogin: DesktopBrowserLoginDescriptor | undefined;
     const personalBrowserWatch = browserTaskBroker || process.env.HAPPY_BROWSER_TASK_RUNTIME_URL ? undefined : watchPersonalBrowserRuntime({
+      desktopLogin: () => personalDesktopLogin,
       deviceProof: async request => {
         if (!browserNativeDeviceSigner) throw new Error('NATIVE_DEVICE_APPROVAL_REQUIRED');
         return browserNativeDeviceSigner(request);
@@ -4218,6 +4223,19 @@ export async function startDaemon(): Promise<void> {
       portRegistry,
       browserBridge,
       browserLocalSetup,
+      ...(personalBrowserWatch ? { desktopBrowserLogin: {
+        status: () => ({ protocol: 1, machineId, loginId: personalDesktopLogin?.loginId ?? null }),
+        attach: async (input: unknown) => {
+          const descriptor = desktopBrowserLoginDescriptor.parse(input);
+          const runtime = readPersonalBrowserRuntime({ machineId, studioOrigin: readTrustedStudioOrigin(process.env), token: () => credentials.token, log: () => {} });
+          if (!runtime) throw new Error('DESKTOP_BROWSER_LOGIN_UNAVAILABLE');
+          await checkDesktopBrowserLoginSocket(descriptor);
+          await createDesktopBrowserLoginClient(descriptor, runtime.loginScope).check();
+          if (personalDesktopLogin?.loginId === descriptor.loginId) return;
+          personalDesktopLogin = descriptor;
+          await personalBrowserWatch.refresh();
+        },
+      } } : {}),
       // 제어 서버의 파일 접근도 같은 잠금 정책을 따른다(HAPPY_RPC_ALLOWED_ROOT).
       allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
       standaloneDrain: standaloneWindows?.drain,
@@ -5546,6 +5564,32 @@ export async function startDaemon(): Promise<void> {
       portRegistry,
       automationStore,
       aiCredentialRuntime,
+      ...(personalBrowserWatch ? { browserSessionPrepare: async (sessionId: string) => {
+        if (!personalDesktopLogin || !personalBrowserNative) return { supported: false };
+        const login = personalDesktopLogin, native = personalBrowserNative;
+        return prepareBrowserSessionReconnect({
+          current: async () => {
+            if (personalDesktopLogin !== login) return false;
+            await createDesktopBrowserLoginClient(login, login).check();
+            return personalDesktopLogin === login;
+          },
+          registered: async () => {
+            const reply = await createNativeBrokerRequest(native)(native.socketPath, 'GET', '/v1/sessions', {});
+            if (reply.status !== 200 || !reply.body.ok || !Array.isArray(reply.body.result)) throw Error('DESKTOP_BROWSER_LOGIN_REQUIRED');
+            return reply.body.result.some((row: { agentSessionId?: string; revoking?: boolean }) => row.agentSessionId === sessionId && row.revoking === false);
+          },
+          target: () => {
+            if (sessionId.startsWith('PID-')) throw Error('Invalid browser session');
+            const target = findStopTarget(sessionId);
+            if (!target || target.session.happySessionId !== sessionId) return undefined;
+            const child = target.session.childProcess;
+            return { pid: target.pid, token: target.session, owned: target.session.startedBy === 'daemon' && child?.pid === target.pid && child.exitCode === null && child.signalCode === null && !child.killed };
+          },
+          startTime: readBrowserTaskPidStartTime,
+          alive: isPidAlive,
+          stop: () => stopSession(sessionId, { mode: 'if-not-busy', source: 'desktop-browser-reconnect', reason: 'browser-login-ready' }),
+        });
+      } } : {}),
       // A personal runtime may activate after this registration: resolve the broker per call.
       ...(browserTaskBroker || personalBrowserWatch ? {
         browserSessionWaiting: async (sessionId: string) => heldBrowserAttentions.answerWaiting(sessionId)
@@ -6087,13 +6131,16 @@ export async function startDaemon(): Promise<void> {
     };
     stopBrowserAttention = startBrowserAttentionWatcher(browserAttentionOptions);
     // The personal runtime may become active later; its attention feed then starts too.
+    let stopPersonalAttention: (() => Promise<void>) | undefined;
+    const stopBaseAttention = stopBrowserAttention;
     const startPersonalBrowserAttention = (native: NativeBrokerRequestOptions) => {
+      void stopPersonalAttention?.();
       const stopPersonal = startBrowserAttentionWatcher({ ...browserAttentionOptions, native });
-      const stopPrevious = stopBrowserAttention;
-      stopBrowserAttention = async () => { await stopPrevious(); await stopPersonal(); };
+      stopPersonalAttention = stopPersonal;
+      stopBrowserAttention = async () => { await stopBaseAttention(); await stopPersonalAttention?.(); };
     };
     if (personalBrowserNative) startPersonalBrowserAttention(personalBrowserNative);
-    else onPersonalBrowserActive = startPersonalBrowserAttention;
+    onPersonalBrowserActive = startPersonalBrowserAttention;
 
     logger.debug('[DAEMON RUN] Daemon started successfully, waiting for shutdown request');
 
