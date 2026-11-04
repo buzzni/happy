@@ -2616,13 +2616,16 @@ export class CodexAppServerClient {
                 observation.earlyCompletions.clear();
                 if (observation.successful === false) this.settleNativeCompletionObservation(observation, false);
             }
-            this._turnId = turnId;
-            if (this.pendingTurnCompletion) {
-                if (this.pendingTurnCompletion.startedTurnId !== turnId) {
-                    this.pendingTurnCompletion.startedTurnId = null;
+            // A terminal can be consumed in the same stdout chunk as the ACK, before this continuation.
+            if (!this.completedTurnIds.has(turnId)) {
+                this._turnId = turnId;
+                if (this.pendingTurnCompletion) {
+                    if (this.pendingTurnCompletion.startedTurnId !== turnId) {
+                        this.pendingTurnCompletion.startedTurnId = null;
+                    }
+                    this.pendingTurnCompletion.turnId = turnId;
+                    this.pendingTurnCompletion.turnIdConfirmed = true;
                 }
-                this.pendingTurnCompletion.turnId = turnId;
-                this.pendingTurnCompletion.turnIdConfirmed = true;
             }
         }
     }
@@ -2733,6 +2736,12 @@ export class CodexAppServerClient {
                 const applyResult = await this.completeTurn(async () => {
                     if (!this.protectedWriterTree) {
                         throw new Error('checkpoint writer process tree is unavailable');
+                    }
+                    if (this.isolatedAutomationContext) {
+                        const exit = await this.finishAutomationContext(10_000);
+                        if (!exit.providerExitedCleanly || !exit.foregroundDrained || !exit.backgroundDrained) {
+                            throw new Error('AUTOMATION_WORKSPACE_EXIT_UNCONFIRMED');
+                        }
                     }
                     await this.protectedWriterTree.quiesce(() => this.disconnectInternal({
                         preserveThreadState: true,

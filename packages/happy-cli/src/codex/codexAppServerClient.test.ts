@@ -1884,12 +1884,36 @@ describe('CodexAppServerClient sandbox integration', () => {
         expect(beforeTurn).not.toHaveBeenCalled();
     });
 
-    it('runs the checkpoint gate exactly once before dispatching a protected turn', async () => {
+    it('keeps a completed turn idle when its terminal arrives before the turn-start ACK continuation runs', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        mockSpawn.mockImplementation(() => createMockProcess({ onRequest: (message, stdout) => {
+            if (message.method === 'thread/start') pushJsonLine(stdout, { id: message.id, result: { thread: { id: 'fast-thread' }, model: 'test' } });
+            if (message.method === 'turn/start') {
+                pushJsonLine(stdout, { id: message.id, result: { turn: { id: 'fast-turn' } } });
+                pushJsonLine(stdout, { method: 'turn/completed', params: { threadId: 'fast-thread', turn: { id: 'fast-turn', status: 'completed' } } });
+            }
+        } }));
+        const client = new CodexAppServerClient();
+        try {
+            await client.connect(); await client.startThread({ cwd: '/work' });
+            expect(await client.sendTurnAndWait('current task')).toEqual({ aborted: false });
+            expect(client.turnId).toBeNull();
+        } finally { await client.disconnect(); }
+    });
+
+    it.each([false, true])('runs the checkpoint gate exactly once before dispatching a protected turn (isolated=%s)', async isolated => {
         const order: string[] = [];
         const requests: MockRpcMessage[] = [];
-        mockSpawn.mockImplementation(() => createMockProcess({
+        mockExecSync.mockReturnValue('codex-cli 0.166.0');
+        let process!: ReturnType<typeof createMockProcess>;
+        mockSpawn.mockImplementation(() => {
+          process = createMockProcess({
             onRequest: (msg, stdout) => {
                 requests.push(msg);
+                if (msg.method === 'config/read') pushJsonLine(stdout, { id: msg.id, result: { config: {
+                    memories: { use_memories: false, generate_memories: false }, features: { memories: false, hooks: false },
+                } } });
+                if (msg.method === 'thread/backgroundTerminals/list') pushJsonLine(stdout, { id: msg.id, result: { data: [], nextCursor: null } });
                 if (msg.method === 'thread/start' && msg.id != null) {
                     setTimeout(() => pushJsonLine(stdout, {
                         id: msg.id,
@@ -1914,7 +1938,10 @@ describe('CodexAppServerClient sandbox integration', () => {
                     }, 0);
                 }
             },
-        }));
+          });
+          if (isolated) process.stdin.once('finish', () => { process.exitCode = 0; process.emit('exit', 0, null); process.stdout.push(null); });
+          return process;
+        });
         const beforeTurn = vi.fn(async () => {
             order.push('gate');
             return {
@@ -1924,12 +1951,13 @@ describe('CodexAppServerClient sandbox integration', () => {
             };
         });
         const completeTurn = vi.fn(async (quiesceWriters: () => Promise<void>) => {
+            expect(client.turnId).toBeNull();
             await quiesceWriters();
             order.push('apply');
             return { status: 'completed' as const, entries: [] };
         });
         const { CodexAppServerClient } = await import('./codexAppServerClient');
-        const client = new CodexAppServerClient(undefined, beforeTurn, completeTurn);
+        const client = new CodexAppServerClient(undefined, beforeTurn, completeTurn, 'owner-choice', undefined, undefined, false, undefined, undefined, isolated);
         await client.connect();
         await client.startThread({ cwd: '/tmp/project', sandbox: 'workspace-write' });
 
@@ -1948,6 +1976,10 @@ describe('CodexAppServerClient sandbox integration', () => {
         expect(order).toEqual(['gate', 'provider', 'apply', 'memory']);
         expect(requests.find(({ method }) => method === 'turn/start')?.params.cwd)
             .toBe('/private/checkpoints/codex-turn-1');
+        if (isolated) {
+            expect(await client.finishAutomationContext(500)).toEqual({ foregroundDrained: true, backgroundDrained: true, providerExitedCleanly: true });
+            expect(process.kill).not.toHaveBeenCalled();
+        }
         await client.disconnect();
     });
 
