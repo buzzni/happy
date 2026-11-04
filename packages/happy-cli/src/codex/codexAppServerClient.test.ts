@@ -331,7 +331,7 @@ describe('CodexAppServerClient sandbox integration', () => {
         } finally { await client.disconnect(); }
     });
 
-    it.each(['clean', 'background-unavailable', 'background-active', 'forced', 'group-alive'])(
+    it.each(['clean', 'background-unavailable', 'background-active', 'forced', 'group-alive', 'group-draining'])(
         'observes isolated provider EOF and background drain without using a kill as proof (%s)', async outcome => {
             const { CodexAppServerClient } = await import('./codexAppServerClient');
             mockExecSync.mockReturnValue('codex-cli 0.166.0');
@@ -347,13 +347,14 @@ describe('CodexAppServerClient sandbox integration', () => {
             proc.stdin.once('finish', () => { proc.killed = outcome === 'forced'; proc.exitCode = 0; proc.emit('exit', 0, null); proc.stdout.push(null); });
             mockSpawn.mockReturnValue(proc);
             if (outcome === 'group-alive') mockProbeProcessGroup.mockReturnValue({ kind: 'alive' });
+            if (outcome === 'group-draining') mockProbeProcessGroup.mockReturnValueOnce({ kind: 'alive' }).mockReturnValue({ kind: 'no-local-trace' });
             const client = new CodexAppServerClient(undefined, undefined, undefined, 'owner-choice', undefined, undefined, false, undefined, undefined, true);
             try {
                 await client.connect(); await client.startThread({ cwd: '/work' });
                 const proof = await client.finishAutomationContext(500);
                 expect(proof).toMatchObject({ foregroundDrained: true,
                     backgroundDrained: !['background-unavailable', 'background-active'].includes(outcome),
-                    providerExitedCleanly: outcome === 'clean' });
+                    providerExitedCleanly: ['clean', 'group-draining'].includes(outcome) });
                 expect(proc.kill).not.toHaveBeenCalled();
                 if (outcome === 'clean') expect(await client.finishAutomationContext(500)).toEqual(proof);
                 if (outcome.startsWith('background-')) expect(proc.stdin.writableEnded).toBe(false);

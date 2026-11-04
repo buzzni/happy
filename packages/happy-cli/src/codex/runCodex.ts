@@ -6,6 +6,7 @@ import { SessionLaunchControl } from '../sessionDrain/sessionLaunchControl';
 import type { StandaloneLaunchBootstrap } from '../daemon/standaloneLaunchProtocol';
 import { RuntimeProducerGate } from '../sessionDrain/runtimeProducerGate';
 import { createLessonProposalTurn } from '@/utils/lessonProposalTurn';
+import { reportAutomationContextExit } from '@/utils/automationContextExit';
 import { CodexAuthRecovery } from './codexAuthRecovery';
 import { render } from "ink";
 import {
@@ -261,6 +262,7 @@ export async function runCodex(opts: {
     const launchControl = standaloneLaunch ? await SessionLaunchControl.connect(standaloneLaunch) : undefined;
     // aplus specs/org-agent-plan §6.3-2: the plan's local proxy, closed with the runner.
     let agentPlanSession: AgentPlanSession | null = null;
+    let automationExit: Parameters<typeof reportAutomationContextExit>[0] | null = null;
     try {
     const accountToken = opts.principal?.kind === 'account' ? opts.principal.credentials.token : null;
     if (managedStartup) {
@@ -3071,6 +3073,12 @@ export async function runCodex(opts: {
             await Promise.all([...pendingMemoryIngest]);
             await closeMemoryIngest();
             await reportManagedStop();
+            if (isAutomationExecutionSessionId(session.sessionId)) {
+                let native = { foregroundDrained: false, backgroundDrained: false, providerExitedCleanly: false };
+                try { native = await client.finishAutomationContext(10_000); }
+                catch { logger.warn('[automation-context] Native writer exit unconfirmed'); }
+                automationExit = { sessionId: session.sessionId, provider: 'codex', evidence: { ...native, writeProducersDrained: false } };
+            }
             /*
              * The bridge points at this run's loop. Left registered, a stop
              * arriving later would be applied to a loop that has ended, or handed
@@ -3104,7 +3112,8 @@ export async function runCodex(opts: {
             await client.disconnect();
             // Closes the project store this session opened. Its own catch: memory
             // cleanup must not be the thing that fails a shutdown.
-            await lessonSession?.close().catch(() => undefined);
+            let lessonClosed = true;
+            await lessonSession?.close().catch(() => { lessonClosed = false; });
             await checkpointComposition.dispose?.();
             logger.debug('[codex]: client.disconnect done');
             // Stop Happy MCP server
@@ -3132,6 +3141,7 @@ export async function runCodex(opts: {
             messageBuffer.clear();
 
             logActiveHandles('cleanup-end');
+            if (automationExit) automationExit.evidence.writeProducersDrained = lessonClosed;
             logger.debug('[codex]: Final cleanup completed');
         } finally {
             clearInterval(keepAliveInterval);
@@ -3142,6 +3152,7 @@ export async function runCodex(opts: {
     }
     } finally {
         launchControl?.close();
-        await agentPlanSession?.close().catch(() => undefined);
+        await agentPlanSession?.close().catch(() => { if (automationExit) automationExit.evidence.writeProducersDrained = false; });
+        if (automationExit) await reportAutomationContextExit(automationExit);
     }
 }

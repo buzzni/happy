@@ -1533,7 +1533,9 @@ export class CodexAppServerClient {
         foregroundDrained: boolean; backgroundDrained: boolean; providerExitedCleanly: boolean;
     }> {
         if (!this.isolatedAutomationContext) throw new Error('AUTOMATION_CONTEXT_POLICY_UNSUPPORTED');
+        if (!Number.isFinite(budgetMs) || budgetMs <= 0 || budgetMs > 30_000) throw new Error('Invalid exit observation budget');
         if (this.automationExitEvidence) return { ...this.automationExitEvidence };
+        const deadline = performance.now() + budgetMs;
         const proc = this.process, threadId = this._threadId, epoch = this.processEpoch;
         // Seal before the first await; a late reconnect or queued turn must not invalidate this exit observation.
         this.automationInputClosed = true;
@@ -1551,11 +1553,21 @@ export class CodexAppServerClient {
         const backgroundDrained = this.backgroundTasks.confirmedEmpty && this.subagents.confirmedIdle;
         if (!backgroundDrained) return { foregroundDrained, backgroundDrained, providerExitedCleanly: false };
         // EOF alone asks for natural shutdown. This method never delivers a termination signal.
-        const ended = await this.endInputAndAwaitExit(budgetMs);
+        const remaining = Math.ceil(deadline - performance.now());
+        if (remaining <= 0) return { foregroundDrained, backgroundDrained, providerExitedCleanly: false };
+        const ended = await this.endInputAndAwaitExit(remaining);
         if (ended.exited) await this.waitForOutputDrain();
+        const readProcesses = () => this.automationProcesses.map(child => ({ observed: child.observer.observed(), clean: child.observer.exitedCleanly(),
+            group: child.process.pid ? probeProcessGroup(child.process.pid).kind : 'indeterminate' }));
+        let processes = readProcesses();
+        while (ended.exited && ended.code === 0 && ended.signal === null && processes.length > 0
+            && processes.every(child => child.clean) && processes.some(child => child.group !== 'no-local-trace') && performance.now() < deadline) {
+            await new Promise(resolve => setTimeout(resolve, 20));
+            processes = readProcesses();
+        }
         const providerExitedCleanly = ended.exited && ended.code === 0 && ended.signal === null
-            && this.automationProcesses.length > 0 && this.automationProcesses.every(child =>
-                child.observer.exitedCleanly() && !!child.process.pid && probeProcessGroup(child.process.pid).kind === 'no-local-trace');
+            && processes.length > 0 && processes.every(child => child.clean && child.group === 'no-local-trace');
+        if (!providerExitedCleanly) logger.debug('[automation-context] EOF exit unconfirmed ' + JSON.stringify({ ended, processes }));
         const result = { foregroundDrained, backgroundDrained, providerExitedCleanly };
         if (providerExitedCleanly) this.automationExitEvidence = result;
         return result;
