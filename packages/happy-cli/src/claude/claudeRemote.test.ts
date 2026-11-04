@@ -23,25 +23,25 @@ describe('claudeRemote', () => {
         vi.mocked(query).mockReset();
     });
 
-    it.each(['automation-run:r1', 'ordinary'])('never claims a clean native exit from a result without an observed process (%s)', async happySessionId => {
+    it.each([['automation-run:r1', false], ['ordinary', false], ['ordinary', true]] as const)('never claims a clean native exit from a result without an observed process (%s, observation=%s)', async (happySessionId, workspaceExitObservation) => {
         const exit = vi.fn();
         vi.mocked(query).mockReturnValue({ async *[Symbol.asyncIterator]() { yield { type: 'result', subtype: 'success' }; } } as any);
         let count = 0;
-        await claudeRemote({ sessionId: null, path: process.cwd(), allowedTools: [], hookSettingsPath: '/tmp/synthetic-settings.json',
+        await claudeRemote({ sessionId: happySessionId === 'ordinary' ? 'manual-native-keep' : null, workspaceExitObservation, path: process.cwd(), allowedTools: [], hookSettingsPath: '/tmp/synthetic-settings.json',
             lessons: { sessionId: happySessionId, sessionKind: 'automation', turn: null, review: null, observations: createLessonTurnObservations() },
             nextMessage: async () => count++ === 0 ? { message: 'current occurrence', mode } : null,
             onReady: vi.fn(), canCallTool: async () => ({ behavior: 'allow' }) as any, isAborted: () => false,
             onSessionFound: vi.fn(), onThinkingChange: vi.fn(), onMessage: vi.fn(), exitAfterFirstTurn: true, onAutomationContextExit: exit });
-        if (happySessionId === 'ordinary') expect(exit).not.toHaveBeenCalled();
+        if (happySessionId === 'ordinary' && !workspaceExitObservation) expect(exit).not.toHaveBeenCalled();
         else expect(exit).toHaveBeenCalledWith({ providerExitedCleanly: false, foregroundDrained: false, backgroundDrained: false });
     });
 
     it('derives native memory isolation from the Happy run identity while keeping ordinary sessions unchanged', async () => {
-        for (const happySessionId of ['automation-run:r1', 'ordinary']) {
+        for (const [happySessionId, workspaceExitObservation] of [['automation-run:r1', false], ['ordinary', false], ['ordinary', true]] as const) {
             vi.mocked(query).mockReset();
             vi.mocked(query).mockReturnValue({ async *[Symbol.asyncIterator]() { yield { type: 'result', subtype: 'success' }; } } as any);
             let count = 0;
-            await claudeRemote({ sessionId: null, path: process.cwd(), allowedTools: [], hookSettingsPath: '/tmp/synthetic-settings.json',
+            await claudeRemote({ sessionId: happySessionId === 'ordinary' ? 'manual-native-keep' : null, workspaceExitObservation, sandboxPolicyMode: 'mandatory', scopeProcessSandbox: { spawn: vi.fn(), close: vi.fn() }, path: process.cwd(), allowedTools: [], hookSettingsPath: '/tmp/synthetic-settings.json',
                 lessons: { sessionId: happySessionId, sessionKind: 'automation', turn: null, review: null,
                     observations: createLessonTurnObservations() },
                 nextMessage: async () => count++ === 0 ? { message: 'current occurrence', mode } : null,
@@ -49,6 +49,7 @@ describe('claudeRemote', () => {
                 onSessionFound: vi.fn(), onThinkingChange: vi.fn(), onMessage: vi.fn(), exitAfterFirstTurn: true });
             expect(vi.mocked(query).mock.calls[0][0].options?.isolatedAutomationContext)
                 .toBe(happySessionId === 'ordinary' ? undefined : true);
+            expect(vi.mocked(query).mock.calls[0][0].options?.resume).toBe(happySessionId === 'ordinary' ? 'manual-native-keep' : undefined);
         }
     });
 

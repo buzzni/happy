@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, it, vi } from 'vitest'
 import { createServer, type Server } from 'node:http'
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -15,7 +15,7 @@ const memoryCanary = 'PRIVATE_AUTOMATIC_MEMORY_MUST_NOT_APPEAR'
 let root: string, workspace: string, codexHome: string, claudeHome: string, modelUrl: string, marker: string, server: Server
 
 beforeAll(async () => {
-  root = await mkdtemp(join(tmpdir(), 'automation-native-context-'))
+  root = await realpath(await mkdtemp(join(tmpdir(), 'automation-native-context-')))
   workspace = join(root, 'workspace'); codexHome = join(root, 'codex'); claudeHome = join(root, 'claude'); marker = join(root, 'inherited-started')
   await Promise.all([workspace, codexHome, claudeHome].map(path => mkdir(path, { mode: 0o700 })))
   for (const key of Object.keys(process.env)) {
@@ -137,3 +137,65 @@ it.each(['claude', 'codex'] as const)('keeps 30 real %s native contexts independ
     first5RequestBytes: average(bytes.slice(0, 5)), last5RequestBytes: average(bytes.slice(-5)), elapsedMs: Date.now() - startedAt,
     usage: 'fixture-reported; not real token or billing evidence' }))
 }, 180_000)
+
+it.each(['claude', 'codex'] as const)('observes an existing manual %s context without resetting its history', async provider => {
+  const home = join(root, `manual-${provider}`)
+  await mkdir(home, { mode: 0o700 })
+  if (provider === 'claude') await writeFile(join(home, 'unused-hook.json'), '{}')
+  vi.stubEnv(provider === 'claude' ? 'CLAUDE_CONFIG_DIR' : 'CODEX_HOME', home)
+  const ids: string[] = [], authoredRequests: string[] = []
+  try {
+    for (let turn = 0; turn < 2; turn++) {
+      const capturedBefore = requests.length
+      const prompt = turn === 0 ? 'Return PRIVATE_OCCURRENCE_A for this manual conversation.' : 'Answer a manual follow-up using the existing conversation.'
+      if (provider === 'claude') {
+        const { claudeRemote } = await import('@/claude/claudeRemote')
+        const { createProviderExitObserver } = await import('@/managed/managedProviderExitObserver')
+        const { createLessonTurnObservations } = await import('@/memory/lessonTurnObservations')
+        const observer = createProviderExitObserver(), evidence: unknown[] = []
+        let admitted = false, id: string | null = null
+        await claudeRemote({ sessionId: ids[0] ?? null, path: workspace, allowedTools: [],
+          hookSettingsPath: join(home, 'unused-hook.json'), workspaceExitObservation: true, providerExitObserver: observer,
+          lessons: { sessionId: 'ordinary-manual-session', sessionKind: 'automation', turn: null, review: null,
+            observations: createLessonTurnObservations() },
+          nextMessage: async () => admitted ? null : (admitted = true, { message: prompt, mode: { permissionMode: 'default', model: 'claude-sonnet-4-6' } }),
+          onReady: () => {}, canCallTool: async () => ({ behavior: 'deny', message: 'No tools in this fixture' }),
+          isAborted: () => false, onSessionFound: value => { id = value }, onThinkingChange: () => {}, onMessage: () => {},
+          exitAfterFirstTurn: true, onAutomationContextExit: value => { evidence.push(value) } })
+        expect(id).toBeTruthy(); ids.push(id!)
+        expect(evidence).toEqual([{ providerExitedCleanly: true, foregroundDrained: true, backgroundDrained: true }])
+      } else {
+        const { CodexAppServerClient } = await import('@/codex/codexAppServerClient')
+        const args = ['-c', 'model_provider="context_fixture"', '-c', 'model_providers.context_fixture.name="Local context fixture"',
+          '-c', `model_providers.context_fixture.base_url=${JSON.stringify(modelUrl + '/v1')}`,
+          '-c', 'model_providers.context_fixture.wire_api="responses"', '-c', 'model_providers.context_fixture.requires_openai_auth=false',
+          '-c', 'web_search="disabled"']
+        const client = new CodexAppServerClient(undefined, undefined, undefined, 'owner-choice', args, undefined, false, undefined, undefined, false, true)
+        try {
+          await client.connect()
+          if (ids[0]) await client.resumeThread({ threadId: ids[0], cwd: workspace })
+          else await client.startThread({ model: 'gpt-5.1-codex', cwd: workspace, approvalPolicy: 'never', sandbox: 'read-only', mcpServers: {} })
+          ids.push(client.threadId!)
+          expect(await client.sendTurnAndWait(prompt, { turnTimeoutMs: 10_000 })).toEqual({ aborted: false })
+          expect(await client.finishWorkspaceContext(5_000)).toEqual({ foregroundDrained: true, backgroundDrained: true, providerExitedCleanly: true })
+        } finally { await client.disconnect() }
+      }
+      // Ordinary Claude retains its prompt-suggestion/memory calls. Select the authored turn, not those auxiliary calls.
+      const authored = requests.slice(capturedBefore).filter(request => request.provider === provider).filter(request => {
+        const body = JSON.parse(request.body)
+        const lastUser = [...(body.messages ?? body.input ?? [])].reverse().find(row => row.role === 'user')
+        return typeof lastUser?.content === 'string' ? lastUser.content === prompt
+          : Array.isArray(lastUser?.content) && lastUser.content.some((block: { text?: string }) => block.text === prompt)
+      })
+      expect(authored).toHaveLength(1)
+      authoredRequests.push(authored[0].body)
+    }
+    expect(ids[1]).toBe(ids[0])
+    expect(authoredRequests[1]).toContain('PRIVATE_OCCURRENCE_A')
+    expect(authoredRequests[1]).toContain('PRIVATE_RESULT_A')
+    expect(authoredRequests[1]).toContain('Answer a manual follow-up')
+    expect(failures).toEqual([])
+  } finally {
+    vi.stubEnv(provider === 'claude' ? 'CLAUDE_CONFIG_DIR' : 'CODEX_HOME', provider === 'claude' ? claudeHome : codexHome)
+  }
+}, 60_000)
