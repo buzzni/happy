@@ -1,4 +1,5 @@
 import { readCheckpointSpawnContext } from '@/checkpoint/checkpointSpawnContext';
+import { isAutomationExecutionSessionId } from '@slopus/happy-wire';
 
 /**
  * The durable memory boundary for a provider session.
@@ -17,6 +18,7 @@ export function resolveSessionMemoryScope(input: {
     projectPath: string;
     sessionId: string;
 }): SessionMemoryScope {
+    if (isAutomationExecutionSessionId(input.sessionId)) return { kind: 'session', scopeId: input.sessionId };
     const projectId = readCheckpointSpawnContext(input.env)?.projectId;
     if (projectId && input.projectPath.trim()) {
         return { kind: 'project', scopeId: projectId, projectPath: input.projectPath };

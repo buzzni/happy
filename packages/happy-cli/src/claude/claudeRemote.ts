@@ -42,6 +42,7 @@ import { ORCHESTRATOR_SYSTEM_PROMPT } from "@/orchestrator/workerMcp";
 import { McpRuntimeRecovery } from './mcpRuntimeRecovery';
 import { McpConfigSynchronizer, type McpConfigSource } from './mcpConfigSynchronizer';
 import type { McpRuntimeServerStatus } from '@slopus/happy-wire';
+import { isAutomationExecutionSessionId } from '@slopus/happy-wire';
 import { buildWorkerAgents, readWorkerConfigFromEnv } from "@/orchestrator/workerAgents";
 import { buildSkillGovernanceOptions, readSkillGovernanceConfigFromEnv } from "@/orchestrator/skillGovernance";
 import { isConnectorPlatformConfigured, readExpectedConnectors, readExpectedMcpServices } from '@/aplus/fetchAplusMcpServers';
@@ -510,6 +511,7 @@ async function runClaudeRemote(
     const hasMcpServers = Object.keys(mergedMcpServers).length > 0;
     const writerProcessTree = opts.completeTurn ? new CheckpointWriterProcessTree() : null;
     const assembledOptions: QueryOptions = {
+        isolatedAutomationContext: isAutomationExecutionSessionId(opts.lessons?.sessionId) || undefined,
         personalClaudeAuth: opts.personalClaudeAuth,
         cwd: providerPath,
         additionalDirectories: readAdditionalDirectoriesEnvironment(process.env),

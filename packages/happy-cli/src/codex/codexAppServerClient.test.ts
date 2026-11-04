@@ -296,6 +296,53 @@ describe('CodexAppServerClient sandbox integration', () => {
         }
     });
 
+    it('checks effective native memory and hook isolation before starting a run thread', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const requests: MockRpcMessage[] = [];
+        const nativeConfig = { memories: { use_memories: false, generate_memories: false },
+            features: { memories: false, hooks: false }, mcp_servers: {
+                oldMemory: { command: 'npx', args: ['custom-memory-hook'], env: { PRIVATE_NATIVE_KEY: 'do-not-copy' } },
+            } };
+        mockSpawn.mockImplementation(() => createMockProcess({ onRequest: (message, stdout) => {
+            requests.push(message);
+            if (message.method === 'config/read') pushJsonLine(stdout, { id: message.id, result: { config: nativeConfig } });
+            if (message.method === 'thread/start') pushJsonLine(stdout, { id: message.id, result: { thread: { id: 'fresh-run' }, model: 'test' } });
+        } }));
+        const client = new CodexAppServerClient(undefined, undefined, undefined, 'owner-choice', undefined, undefined, false, undefined, undefined, true);
+        try {
+            await client.connect();
+            const args = mockSpawn.mock.calls[0][1];
+            for (const override of ['memories.use_memories=false', 'memories.generate_memories=false', 'features.memories=false', 'features.hooks=false']) {
+                expect(args).toContain(override);
+            }
+            await client.startThread({ cwd: '/work', mcpServers: { approved: { command: 'approved-mcp' } } });
+            const start = requests.find(row => row.method === 'thread/start')!;
+            expect(start.params.config).toMatchObject({ memories: { use_memories: false, generate_memories: false },
+                features: { memories: false, hooks: false }, mcp_servers: {
+                    approved: { command: 'approved-mcp' }, oldMemory: { enabled: false },
+                } });
+            expect(JSON.stringify(start.params.config)).not.toContain('do-not-copy');
+            expect(requests.findIndex(row => row.method === 'config/read')).toBeLessThan(requests.findIndex(row => row.method === 'thread/start'));
+        } finally { await client.disconnect(); }
+    });
+
+    it.each(['unreported', 'still-enabled'])(
+        'refuses an isolated native run with %s memory settings before a thread or turn exists', async mode => {
+            const { CodexAppServerClient } = await import('./codexAppServerClient');
+            const requests: MockRpcMessage[] = [];
+            mockSpawn.mockImplementation(() => createMockProcess({ onRequest: (message, stdout) => {
+                requests.push(message);
+                if (message.method === 'config/read') pushJsonLine(stdout, { id: message.id, result: { config: mode === 'unreported' ? {} : {
+                    memories: { use_memories: true, generate_memories: false }, features: { memories: false, hooks: false },
+                } } });
+            } }));
+            const client = new CodexAppServerClient(undefined, undefined, undefined, 'owner-choice', undefined, undefined, false, undefined, undefined, true);
+            try {
+                await expect(client.connect()).rejects.toThrow('AUTOMATION_NATIVE_MEMORY_UNSUPPORTED');
+                expect(requests.some(row => row.method === 'thread/start' || row.method === 'turn/start')).toBe(false);
+            } finally { await client.disconnect(); }
+        });
+
     it('forwards ownership to native MCP at start, resume, fork, and reconnect with the resolved cwd', async () => {
         const { CodexAppServerClient } = await import('./codexAppServerClient');
         const client = new CodexAppServerClient(undefined, undefined, undefined, 'owner-choice', undefined, undefined, true);

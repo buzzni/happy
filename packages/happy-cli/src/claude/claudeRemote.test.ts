@@ -23,6 +23,22 @@ describe('claudeRemote', () => {
         vi.mocked(query).mockReset();
     });
 
+    it('derives native memory isolation from the Happy run identity while keeping ordinary sessions unchanged', async () => {
+        for (const happySessionId of ['automation-run:r1', 'ordinary']) {
+            vi.mocked(query).mockReset();
+            vi.mocked(query).mockReturnValue({ async *[Symbol.asyncIterator]() { yield { type: 'result', subtype: 'success' }; } } as any);
+            let count = 0;
+            await claudeRemote({ sessionId: null, path: process.cwd(), allowedTools: [], hookSettingsPath: '/tmp/synthetic-settings.json',
+                lessons: { sessionId: happySessionId, sessionKind: 'automation', turn: null, review: null,
+                    observations: createLessonTurnObservations() },
+                nextMessage: async () => count++ === 0 ? { message: 'current occurrence', mode } : null,
+                onReady: vi.fn(), canCallTool: async () => ({ behavior: 'allow' }) as any, isAborted: () => false,
+                onSessionFound: vi.fn(), onThinkingChange: vi.fn(), onMessage: vi.fn(), exitAfterFirstTurn: true });
+            expect(vi.mocked(query).mock.calls[0][0].options?.isolatedAutomationContext)
+                .toBe(happySessionId === 'ordinary' ? undefined : true);
+        }
+    });
+
     it('refuses a mandatory session without config before starting the SDK', async () => {
         await expect(claudeRemote({
             sessionId: null, path: process.cwd(), allowedTools: [],

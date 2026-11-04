@@ -13,6 +13,12 @@ import { ensureLocalProxyBypass } from '../utils/proxyBypass'
 import { resolveHappyEntrypoint } from './happyEntrypoint'
 import { queryWithPinnedCredential } from './credentialPin'
 import { sanitizeChildEnv } from '@/utils/childEnv'
+import { RECALL_OWNER_ENV } from '@/memory/recallOwnerMarker'
+import { LESSON_OWNER_ENV } from '@/memory/lessonOwnerMarker'
+
+const isolatedMemoryEnvironment = Object.freeze({
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', [RECALL_OWNER_ENV]: 'host', [LESSON_OWNER_ENV]: 'host',
+})
 
 /**
  * Wraps the official SDK query() with our QueryOptions adapter
@@ -52,11 +58,11 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
         mcpServers: opts?.mcpServers as Options['mcpServers'],
         systemPrompt,
         settings,
-        strictMcpConfig: opts?.strictMcpConfig,
+        strictMcpConfig: opts?.isolatedAutomationContext ? true : opts?.strictMcpConfig,
         sessionId: undefined,
         effort: opts?.effort,
         agents: opts?.agents,
-        settingSources: opts?.settingSources,
+        settingSources: opts?.isolatedAutomationContext ? [] : opts?.settingSources,
         skills: opts?.skills,
         sandbox: opts?.sandbox,
         spawnClaudeCodeProcess: opts?.spawnClaudeCodeProcess,
@@ -82,6 +88,7 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
     // The agent works inside this session: lineage and spawn seeds stop here.
     const env: Record<string, string> = sanitizeChildEnv(process.env, { boundary: 'in-session' })
     env.CLAUDE_CODE_ENTRYPOINT = resolveHappyEntrypoint(process.env.CLAUDE_CODE_ENTRYPOINT)
+    if (opts?.isolatedAutomationContext) Object.assign(env, isolatedMemoryEnvironment)
     if (opts?.emitSessionStateEvents) env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS = '1'
     if (opts?.mcpServers && Object.keys(opts.mcpServers).length > 0) {
         ensureLocalProxyBypass(env)
@@ -119,7 +126,7 @@ function resolveSettings(opts: QueryOptions | undefined): string | undefined {
     // SDK 는 settings 파일 경로와 sandbox 옵션의 동시 사용을 거부한다. 우리 규칙을
     // 경로로 넘기면 CLI 가 그 파일만 읽고 여기서 더한 것은 사라지므로, 합쳐야 할
     // 것이 하나라도 있으면 인라인한다.
-    if (emptyPluginServers.length === 0 && (!opts?.settingsPath || (!opts.sandbox && denyRules.length === 0))) return opts?.settingsPath
+    if (!opts?.isolatedAutomationContext && emptyPluginServers.length === 0 && (!opts?.settingsPath || (!opts.sandbox && denyRules.length === 0))) return opts?.settingsPath
     const rawSettings = opts?.settingsPath ? readFileSync(opts.settingsPath, 'utf8') : '{}'
     let parsedSettings: unknown
     try {
@@ -129,6 +136,13 @@ function resolveSettings(opts: QueryOptions | undefined): string | undefined {
     }
     if (!parsedSettings || typeof parsedSettings !== 'object' || Array.isArray(parsedSettings)) {
         throw new Error('Claude hook settings must be a JSON object before sandbox merge')
+    }
+    if (opts?.isolatedAutomationContext) {
+        const settings = parsedSettings as Record<string, unknown>
+        const settingsEnv = settings.env ?? {}
+        if (typeof settingsEnv !== 'object' || Array.isArray(settingsEnv)) throw new Error('Claude hook environment must be a JSON object')
+        settings.autoMemoryEnabled = false
+        settings.env = { ...settingsEnv, ...isolatedMemoryEnvironment }
     }
     if (emptyPluginServers.length > 0) {
         const settings = parsedSettings as { deniedMcpServers?: { serverName?: string }[] }

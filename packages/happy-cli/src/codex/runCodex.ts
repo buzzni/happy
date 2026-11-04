@@ -112,7 +112,7 @@ import {
 import { emitReadyIfIdle } from './emitReadyIfIdle';
 import { reportAgentTaskCapacityFailure } from './reportAgentTaskCapacityFailure';
 import { enqueueCodexUserText, isCodexClearText, shouldHandleCodexClear } from './codexClearCommand';
-import { createEnvelope, type McpRuntimeServerStatus } from '@slopus/happy-wire';
+import { createEnvelope, isAutomationExecutionSessionId, type McpRuntimeServerStatus } from '@slopus/happy-wire';
 import { createManagedFollowUpHandler } from '@/managed/managedFollowUp';
 import { downloadCodexFileEventAttachment } from './utils/attachmentEvents';
 import { prepareCodexImageInputItems } from './utils/imageInput';
@@ -1415,6 +1415,7 @@ export async function runCodex(opts: {
         recallHost !== null,
         undefined,
         agentPlanSession?.providerArgs ?? null,
+        isAutomationExecutionSessionId(session.sessionId),
     );
 
     let ingestThreadMetadata: { threadId: string; path: Promise<string | null> } | null = null;

@@ -481,6 +481,8 @@ export class CodexAppServerClient {
          * own login.
          */
         agentPlanProviderArgs?: string[] | null,
+        /** Fixed from the Happy run identity before the first native process starts. */
+        private readonly isolatedAutomationContext = false,
     ) {
         this.sandboxConfig = sandboxConfig;
         this.sandboxPolicyMode = sandboxPolicyMode;
@@ -1240,6 +1242,8 @@ export class CodexAppServerClient {
             'stdio://',
             '-c', 'features.default_mode_request_user_input=true',
             ...(this.managedProviderArgs ?? this.agentPlanProviderArgs ?? this.multiAuthProxy?.args ?? []),
+            ...(this.isolatedAutomationContext ? ['-c', 'memories.use_memories=false', '-c', 'memories.generate_memories=false',
+                '-c', 'features.memories=false', '-c', 'features.hooks=false'] : []),
         ];
         this.sandboxEnabled = false;
         this.sandboxInitFailed = false;
@@ -1433,6 +1437,16 @@ export class CodexAppServerClient {
             this.connected = true;
             this.subagentTrackingAvailable = isSubagentTrackingAvailable(codexVersion);
             this.subagents.setAvailable(this.subagentTrackingAvailable);
+            if (this.isolatedAutomationContext) {
+                const effective = await this.request('config/read', { cwd: process.cwd(), includeLayers: false }, 3000) as {
+                    config?: { memories?: { use_memories?: unknown; generate_memories?: unknown }; features?: { memories?: unknown; hooks?: unknown } };
+                };
+                const config = effective.config;
+                if (config?.memories?.use_memories !== false || config.memories.generate_memories !== false
+                    || config.features?.memories !== false || config.features.hooks !== false) {
+                    throw new Error('AUTOMATION_NATIVE_MEMORY_UNSUPPORTED');
+                }
+            }
             await confirmSessionWriteScope(scopeConfirmation, this.sandboxEnabled, this.sandboxConfig ?? undefined);
             logger.debug('[CodexAppServer] Connected and initialized');
         } catch (error) {
@@ -1745,7 +1759,26 @@ export class CodexAppServerClient {
         const readNativeServers = () => nativeRead ??= (this.request('config/read', { cwd, includeLayers: false }, 3000) as Promise<{
             config?: { mcp_servers?: unknown };
         }>).then((effective) => effective.config?.mcp_servers);
-        if (this.recallHostPrepared && !this.managedProviderArgs && this.sandboxPolicyMode === 'owner-choice') {
+        if (this.isolatedAutomationContext) {
+            const native = await readNativeServers();
+            if (native !== undefined && native !== null && (typeof native !== 'object' || Array.isArray(native))) {
+                throw new Error('AUTOMATION_NATIVE_MEMORY_UNSUPPORTED');
+            }
+            // Native config deep-merges. Explicitly turn off every inherited server not supplied by this run.
+            // Valid inert transports avoid copying native commands, arguments or credentials into the override.
+            const disabled: Record<string, unknown> = Object.create(null);
+            for (const [name, value] of Object.entries(native ?? {})) {
+                if (mcpServers && Object.hasOwn(mcpServers, name)) continue;
+                const entry = value !== null && typeof value === 'object' ? value as Record<string, unknown> : {};
+                disabled[name] = typeof entry.url === 'string'
+                    ? { url: 'http://127.0.0.1:9/disabled', enabled: false }
+                    : { command: process.execPath, args: ['-e', 'process.exit(0)'], enabled: false };
+            }
+            config.mcp_servers = { ...disabled, ...mcpServers };
+            config.memories = { use_memories: false, generate_memories: false };
+            config.features = { memories: false, hooks: false };
+        }
+        if (this.recallHostPrepared && !this.isolatedAutomationContext && !this.managedProviderArgs && this.sandboxPolicyMode === 'owner-choice') {
             let nativeServers: unknown;
             try {
                 // MCP stdio children filter their environment. Mark the existing native
