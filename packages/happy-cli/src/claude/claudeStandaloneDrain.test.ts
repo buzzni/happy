@@ -89,3 +89,20 @@ describe('Claude standalone drain hooks', () => {
     });
 });
 
+
+it.each([false, true])('observes workspace readiness only for an owned idle native generation (observation=%s)', enabled => {
+    const g = gate(), drain = new ClaudeStandaloneDrain(g, enabled), running = launcher()
+    let idle = true
+    drain.setWorkspaceReadiness(() => idle)
+    expect(drain.canDrainWorkspace()).toBe(false)
+    drain.attachLauncher(running.port)
+    expect(drain.canDrainWorkspace()).toBe(enabled)
+    idle = false; expect(drain.canDrainWorkspace()).toBe(false)
+    idle = true; running.hold(true); expect(drain.canDrainWorkspace()).toBe(false)
+    running.hold(false); expect(drain.canDrainWorkspace()).toBe(enabled)
+    expect(drain.claimTurn()).toBe(true); expect(drain.canDrainWorkspace()).toBe(false)
+    drain.dispatched(); expect(drain.canDrainWorkspace()).toBe(false)
+    drain.turnEnded(); expect(drain.canDrainWorkspace()).toBe(enabled)
+    drain.setWorkspaceReadiness(null); expect(drain.canDrainWorkspace()).toBe(false)
+    drain.setWorkspaceReadiness(() => true); drain.markLoopFinished(); expect(drain.canDrainWorkspace()).toBe(false)
+})
