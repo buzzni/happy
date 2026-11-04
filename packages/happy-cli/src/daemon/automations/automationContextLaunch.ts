@@ -23,6 +23,8 @@ export const automationContextLaunchRecordSchema = z.strictObject({
   sessionId: z.string().min(1).max(200),
   exitReceipt: z.strictObject({ provider: z.enum(['claude', 'codex']), observedAt: z.number().int().nonnegative() }).optional(),
   workspaceOwnerToken: z.string().uuid().optional(),
+  deferredDispatch: z.enum(['queued', 'settled']).optional(),
+  cancelledBeforeSubmit: z.literal(true).optional(),
 })
 export type AutomationContextLaunchRecord = z.infer<typeof automationContextLaunchRecordSchema>
 
@@ -87,6 +89,36 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
       evidence: { providerExitedCleanly: true, foregroundDrained: true, backgroundDrained: true, writeProducersDrained: true } })
   }
   return {
+    async markDeferred(runId: string): Promise<boolean> {
+      return exclusive(runId, async () => {
+        const record = await deps.journal.read(runId)
+        if (!record) throw new Error('AUTOMATION_DEFERRED_STATE_CONFLICT')
+        assertIdentity(record, runId)
+        if (record.cancelledBeforeSubmit || record.deferredDispatch === 'settled'
+          || record.phase !== 'prepared' && record.phase !== 'registered') throw new Error('AUTOMATION_DEFERRED_STATE_CONFLICT')
+        if (!record.deferredDispatch) await deps.journal.write({ ...record, deferredDispatch: 'queued' })
+        return true
+      })
+    },
+    async finishDeferred(runId: string): Promise<void> {
+      await exclusive(runId, async () => {
+        const record = await deps.journal.read(runId)
+        if (!record?.deferredDispatch) throw new Error('AUTOMATION_DEFERRED_STATE_CONFLICT')
+        assertIdentity(record, runId)
+        if (record.deferredDispatch !== 'settled') await deps.journal.write({ ...record, deferredDispatch: 'settled' })
+      })
+    },
+    async cancelUnsubmitted(runId: string): Promise<boolean> {
+      return exclusive(runId, async () => {
+        const record = await deps.journal.read(runId)
+        if (!record) throw new Error('AUTOMATION_DEFERRED_STATE_CONFLICT')
+        assertIdentity(record, runId)
+        if (record.phase !== 'prepared' && record.phase !== 'registered') return false
+        if (!record.cancelledBeforeSubmit) await deps.journal.write({ ...record, cancelledBeforeSubmit: true })
+        await releaseWorkspace(record, true)
+        return true
+      })
+    },
     /** Private owned-child observer only, after matching native evidence AND actual root close(0, null). */
     async recordOwnedExit(input: { runId: string; sessionId: string; provider: 'claude' | 'codex' }): Promise<void> {
       await exclusive(input.runId, async () => {
@@ -171,6 +203,7 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
       if (record && (record.scope !== scope || record.requestHash !== requestHash || record.sessionId !== sessionId
         || record.displaySessionId !== displaySessionId || record.automationId !== automationId
         || record.generation !== generation || record.revision !== revision)) throw new Error('AUTOMATION_LAUNCH_IDENTITY_CONFLICT')
+      if (record?.cancelledBeforeSubmit) return { ...publicResult('needs-attention'), reason: 'cancelled-before-submit' }
       if (record?.exitReceipt) { await releaseWorkspace(record, false); return publicResult('started') }
       if (record?.phase === 'started') return publicResult('started')
       if (record?.phase === 'submitted') {
