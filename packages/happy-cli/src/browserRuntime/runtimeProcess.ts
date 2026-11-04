@@ -1,3 +1,4 @@
+import { createDesktopBrowserLoginClient, readDesktopBrowserLoginPipe } from './desktopBrowserLogin'
 import { ResourceQuota, resourceAdmissionLimit } from './resourceQuota'
 /**
  * Browser Runtime process (Agent Browser); `runtimeMain.ts` is the entry that runs it.
@@ -316,6 +317,13 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     const log = (line: string) => process.stderr.write(`[abp-runtime] ${new Date().toISOString()} ${line}\n`)
     const stateDir = requiredEnv('ABP_STATE_DIR')
     const config = process.env.ABP_CONFIG_FILE ? loadRuntimeConfig(process.env.ABP_CONFIG_FILE) : undefined
+    const desktopLogin = process.env.ABP_DESKTOP_BROWSER_LOGIN_FD === '3' && config?.personalDesktop
+        ? createDesktopBrowserLoginClient(await readDesktopBrowserLoginPipe(), {
+            machineId: config.machineId, workspaceId: config.workspaceId,
+            principalId: config.profiles[0].principalId, profileId: config.profiles[0].profileId,
+        }) : undefined
+    if (process.env.ABP_DESKTOP_BROWSER_LOGIN_FD && !desktopLogin) throw Error('DESKTOP_BROWSER_LOGIN_INVALID')
+    await desktopLogin?.check()
     const production = config?.authMode === 'production'
     const native: NativeRuntime | undefined = config?.nativeService ? await bootstrapMacNativeRuntime(config, stateDir)
         : config?.personalDesktop ? await bootstrapPersonalDesktopRuntime(config, stateDir) : undefined
@@ -413,6 +421,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     // Harness keeps the PoC space quota and no idle reclamation unless asked.
     const harnessIdleMs = process.env.ABP_SPACE_IDLE_RECLAIM_MS ? Number(process.env.ABP_SPACE_IDLE_RECLAIM_MS) : undefined
     const runtime = new BrowserRuntime({ store, drivers, sites,
+        pageViewEnabled: process.platform === 'darwin' && !!config?.personalDesktop,
         ...(config ? { profilePrincipals: config.profilePrincipals } : {}),
         ...(config?.profileAssignments ? { profileAssignments: config.profileAssignments } : {}),
         maxSpacesPerProfile: config?.maxSpacesPerProfile,
@@ -546,6 +555,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     let admissionOpen = !config?.admissionHold
     if (!admissionOpen) log('admission on hold: a profile reassignment awaits verification (abp-stack)')
     const admit = async (): Promise<void> => {
+        await desktopLogin?.check()
         await native?.session.check()
         // Only the cleanup, not the whole task recovery: the daemon's broker calls time out after 10 s.
         await runtime.assignmentsSettled()
@@ -559,6 +569,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     let broker: Broker | undefined
     if (config && (config.daemonTokenSha256 || native)) {
         broker = await startBroker({
+            desktopLoginId: desktopLogin?.descriptor.loginId,
             socketPath: nativeSockets?.broker ?? config.brokerSocketPath, socketGid: config.brokerSocketGid, server: boundBroker, stateDir,
             ...(native ? { nativeAuthorization: true as const } : { daemonTokenSha256: config.daemonTokenSha256 }),
             orphanTtlMs: config.brokerOrphanTtlMs,
@@ -643,6 +654,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
         // Viewers of the capability stop synchronously, before the revocation is persisted (D2).
         revokeCapability: (capabilityId) => {
             viewer?.revokeCapability(capabilityId)
+            runtime.pageViews.revoke(capabilityId)
             return store.revoke(capabilityId)
         },
         ...(broker && config?.tenancyMode === 'shared' ? { profileRequests: {
@@ -688,6 +700,15 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
         await store.close()
         process.exit(0)
     }
+    // Cached agent/interactive grants still pass admission. App loss also closes the dedicated browser.
+    let checkingLogin = false
+    const loginTimer = desktopLogin ? setInterval(() => {
+        if (checkingLogin || shuttingDown) return
+        checkingLogin = true
+        void desktopLogin.check().catch(() => { admissionOpen = false; void shutdown() }).finally(() => { checkingLogin = false })
+    }, 1000) : undefined
+    loginTimer?.unref()
+    process.once('exit', () => { if (loginTimer) clearInterval(loginTimer) })
     process.once('SIGTERM', () => void shutdown())
     process.once('SIGINT', () => void shutdown())
     // A personal runtime belongs to the daemon that started it.

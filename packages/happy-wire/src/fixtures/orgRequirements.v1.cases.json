@@ -1206,10 +1206,16 @@
         "expect": "openclaw:*"
       },
       {
-        "name": "opencode keeps its provider slug (Studio has no opencode keys)",
+        "name": "opencode is a wildcard agent",
         "agent": "opencode",
         "model": "opencode/glm-5.3-flash-free",
-        "expect": "opencode:opencode/glm-5.3-flash-free"
+        "expect": "opencode:*"
+      },
+      {
+        "name": "an ACP agent Studio has no key for keeps its model",
+        "agent": "acp",
+        "model": "some/model",
+        "expect": "acp:some/model"
       },
       {
         "name": "no model chosen resolves later by R10.2a",
@@ -1455,7 +1461,7 @@
         }
       },
       {
-        "name": "opencode is never allowed under a restriction",
+        "name": "opencode outside the set is denied",
         "agent": "opencode",
         "model": null,
         "origin": "none",
@@ -1464,6 +1470,37 @@
             "claude:claude-sonnet-5-5"
           ],
           "default": null
+        },
+        "expect": {
+          "kind": "deny",
+          "reason": "requirement_model_denied"
+        }
+      },
+      {
+        "name": "opencode is allowed by its wildcard key with any model",
+        "agent": "opencode",
+        "model": "opencode/glm-5.3-flash-free",
+        "origin": "explicit",
+        "allowed": {
+          "values": [
+            "opencode:*"
+          ],
+          "default": "opencode:*"
+        },
+        "expect": {
+          "kind": "allow"
+        }
+      },
+      {
+        "name": "an ACP agent Studio has no key for is never allowed under a restriction",
+        "agent": "acp",
+        "model": null,
+        "origin": "none",
+        "allowed": {
+          "values": [
+            "opencode:*"
+          ],
+          "default": "opencode:*"
         },
         "expect": {
           "kind": "deny",

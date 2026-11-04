@@ -39,6 +39,7 @@ import {
 import { SETUP_TOKEN_BINDING_ENV, SETUP_TOKEN_SHARED_ACCOUNT_ENV, formatSetupTokenBinding, overlayManagedCredentialEnvironment, type AiAuthSelection, type SetupTokenBinding, type MachineSetupTokenBindingRecord, isMachineSetupTokenBinding } from './sessionEnv'
 import { readTrustedStudioOrigin, setupTokenCredentialMatches, type SetupTokenBindingVerifier } from './setupTokenBindingProof'
 import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS } from '@/claude/utils/claudeAuthOverrideEnv'
+import { setupTokenWindowUsedUp } from '@/claude/setupTokenUsageTracker'
 import { openSetupTokenAssignment, type SetupTokenAssignmentRecipient } from './setupTokenAssignmentWire'
 import { HAPPY_AI_AUTH_SOURCE_ENV } from '@/usage/aiAuthSource'
 import { CODEX_LOGIN_REFRESH_DRIVER } from './codexLoginRefreshDriver'
@@ -57,8 +58,6 @@ const CLAUDE_SWAP_VERSION = '0.27.0b3'
 /** Windows: the daemon's claude-swap calls and `cswap auto` run through this verified base Python (RE8). */
 export const claudeSwapPython = createClaudeSwapPythonResolver({ platform: process.platform, find: () => findClaudeSwapPython(CLAUDE_SWAP_PACKAGE, process.env), verify: verifyClaudeSwapPython })
 const CLAUDE_STATUS_TIMEOUT_MS = 120_000
-/** Either window at this share means the account is used up; the session tracker's and Studio's rule. */
-const SHARED_ACCOUNT_USED_UP_PCT = 95
 /** A used-up shared account without a known reset is skipped for one 5-hour window. */
 const SHARED_ACCOUNT_UNKNOWN_RESET_MS = 5 * 60 * 60_000
 // Keep readable historical bundles separate from supported installed runtimes.
@@ -2580,7 +2579,8 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     sharedAccountUsage.set(managedAccountId, usage)
     let full = false
     for (const window of observation.windows) {
-      const usedUp = window.pct !== null && window.pct >= SHARED_ACCOUNT_USED_UP_PCT
+      // The session tracker's and Studio's rule.
+      const usedUp = setupTokenWindowUsedUp(window.kind, window.pct)
       full ||= usedUp
       if ((usage.windows.get(window.kind)?.observedAt ?? -Infinity) > observation.observedAt) continue
       usage.windows.set(window.kind, { observedAt: observation.observedAt,

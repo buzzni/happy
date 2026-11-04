@@ -3,8 +3,8 @@ import type { SetupTokenRotationState } from '@/api/types'
  * Moves a setup-token-bound Claude session off a used-up organization account (Saycode
  * specs/claude-setup-token-account-selection, stage 3).
  *
- * The provider's own `rate_limit_event`s say how full the bound account is. Once a window reaches
- * 95% or a request is refused, the next turn boundary asks the daemon for another account; Studio
+ * The provider's own `rate_limit_event`s say how full the bound account is. Once a window reaches its
+ * used-up share (five-hour 95%, weekly 98%) or a request is refused, the next turn boundary asks the daemon for another account; Studio
  * chooses it and the daemon verifies the grant like a launch. The launcher then restarts the provider
  * on the same Claude conversation with the new token. A refused turn is continued automatically.
  *

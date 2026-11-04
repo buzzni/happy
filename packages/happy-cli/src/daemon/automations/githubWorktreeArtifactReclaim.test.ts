@@ -1,11 +1,11 @@
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { createGithubArtifactReclaimer } from './githubWorktreeArtifactReclaim'
+import { createGithubArtifactReclaimer, hasProcessExited, parseLsofInventory } from './githubWorktreeArtifactReclaim'
 import { removeGithubTriggerWorktree } from './githubTriggerWorktree'
 
 const exec = promisify(execFile)
@@ -98,6 +98,42 @@ describe('GitHub automation generated artifact reclamation', () => {
     expect(result.deletedPaths).toEqual([])
     expect(result.skips['live-process']).toBeGreaterThan(0)
   })
+
+  it.skipIf(process.platform !== 'linux' || process.getuid?.() === 0)(
+    'preserves dependencies held by a non-dumpable same-user process using the default OS probe', async () => {
+      const child = spawn('python3', ['-c', [
+        'import ctypes, time',
+        'dependency = open("downloaded.js")',
+        'assert ctypes.CDLL(None).prctl(4, 0) == 0',
+        'print("ready", flush=True)',
+        'time.sleep(60)',
+      ].join('\n')], { cwd: target, stdio: ['ignore', 'pipe', 'inherit'] })
+      try {
+        await new Promise((done, fail) => {
+          const timer = setTimeout(() => fail(new Error('child did not become ready')), 5_000)
+          child.stdout.once('data', value => { clearTimeout(timer); done(value) })
+          child.once('error', error => { clearTimeout(timer); fail(error) })
+          child.once('exit', () => { clearTimeout(timer); fail(new Error('child exited before inspection')) })
+        })
+        const { stdout } = await exec('lsof', ['-nP', '-a', '-u', String(process.getuid!()), '-p', String(child.pid), '-Fpn'],
+          { env: { ...process.env, LC_ALL: 'C' }, timeout: 10_000 })
+        expect(parseLsofInventory(stdout).deniedPids).toContain(String(child.pid))
+        expect(await hasProcessExited(String(child.pid))).toBe(false)
+        const result = await reclaimer({ readLivePaths: undefined })({ repositoryRoot: repo, worktreePath })
+        expect(child.exitCode).toBeNull()
+        expect(result.deletedPaths).toEqual([])
+        expect(result.status).toBe('failed')
+        expect(result.errors).toContain('incomplete process inventory')
+        expect(await readFile(join(target, 'downloaded.js'), 'utf8')).toContain('dependency')
+      } finally {
+        const exited = new Promise<void>(done => child.once('exit', () => done()))
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill('SIGKILL')
+          await exited
+        }
+      }
+    }, 45_000,
+  )
 
   it('does not accept an unreadable OS path as a valid inventory entry', async () => {
     const result = await reclaimer({ readLivePaths: async () => ['/proc/123/fd (stat: Permission denied)'] })({ repositoryRoot: repo, worktreePath })
@@ -221,6 +257,55 @@ describe('GitHub automation generated artifact reclamation', () => {
     const result = await reclaimer({ readLivePaths })({ repositoryRoot: repo, worktreePath })
     expect(result.status).toBe('deferred')
     expect(readLivePaths).not.toHaveBeenCalled()
+  })
+
+  // `lsof -nP -a -u <uid> -Fpn` on a Linux PC running Node 20+ (libuv io_uring), a container and an SSH login.
+  const linuxInventory = (...extra: string[]) => [
+    'p4100', 'fcwd', 'n/home/user', 'f12', 'nanon_inode:[io_uring] (stat: No such file or directory)', 'f13', 'npipe',
+    'f14', 'ntype=STREAM', 'p4200', 'fmem', 'n/usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.30 (stat: No such file or directory)',
+    ...extra, '',
+  ].join('\n')
+
+  it('reclaims when the inventory has io_uring handles and unresolvable outside paths', async () => {
+    const { paths, deniedPids } = parseLsofInventory(linuxInventory())
+    expect(paths).toEqual(['/home/user', '/usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.30'])
+    expect(deniedPids).toEqual([])
+    const result = await reclaimer({ readLivePaths: async () => paths })({ repositoryRoot: repo, worktreePath })
+    expect(result.errors).toEqual([])
+    expect(result.deletedPaths).toEqual([target])
+  })
+
+  it('reports denied process links separately so the OS probe can check for process exit', () => {
+    const { paths, deniedPids } = parseLsofInventory(linuxInventory(
+      'p4300', 'fcwd', 'n/proc/4300/cwd (readlink: Permission denied)', 'frtd', 'n/proc/4300/root (readlink: Permission denied)',
+      'ftxt', 'n/proc/4300/exe (readlink: Permission denied)', 'fNOFD', 'n/proc/4300/fd (opendir: Permission denied)',
+    ))
+    expect(paths).toEqual(['/home/user', '/usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.30'])
+    expect(deniedPids).toEqual(['4300'])
+  })
+
+  it('protects a worktree file named by a handle whose stat failed', async () => {
+    const { paths } = parseLsofInventory(linuxInventory('p4400', 'fmem', `n${join(target, 'addon.node')} (stat: No such file or directory)`))
+    const result = await reclaimer({ readLivePaths: async () => paths })({ repositoryRoot: repo, worktreePath })
+    expect(result.deletedPaths).toEqual([])
+    expect(result.skips['live-process']).toBeGreaterThan(0)
+  })
+
+  it.each([
+    ['an unknown name', ['p4500', 'fcwd', 'nunknown']],
+    ['a cwd that could not be read for another reason', ['p4500', 'fcwd', 'n/proc/4500/cwd (readlink: Input/output error)']],
+    ['a denied link of a different process', ['p4500', 'fcwd', 'n/proc/4501/cwd (readlink: Permission denied)']],
+  ])('treats an inventory with %s as incomplete', (_, extra) => {
+    expect(() => parseLsofInventory(linuxInventory(...extra))).toThrow('incomplete process inventory')
+  })
+
+  it('treats an inventory without any process record as incomplete', () => {
+    expect(() => parseLsofInventory('')).toThrow('incomplete process inventory')
+  })
+
+  it.skipIf(process.platform !== 'linux')('only confirms process exit when the kernel reports no such process', async () => {
+    expect(await hasProcessExited(String(process.pid))).toBe(false)
+    expect(await hasProcessExited('999999999')).toBe(true)
   })
 
   it('shares simultaneous cleanup requests for the same worktree', async () => {

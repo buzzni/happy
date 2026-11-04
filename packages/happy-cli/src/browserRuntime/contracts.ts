@@ -1,3 +1,4 @@
+import type { PageViewApi, PageViewDriver } from './pageViewContracts'
 /**
  * Agent Browser PoC — shared contract v1.
  *
@@ -101,6 +102,7 @@ export type Operation =
     | 'createSpace' | 'createTask' | 'openPage' | 'closePage' | 'observe' | 'screenshot'
     | 'submitBatch' | 'finishTask' | 'getTask' | 'subscribe' | 'approve' | 'takeOver'
     | 'setSpaceQuota' | 'releaseControl' | 'resume' | 'cancel' | 'closeSpace' | 'viewerTicket' | 'listTasks' | 'listSpaces' | 'joinSpace'
+    | 'pageViewInfo' | 'openPageView' | 'getPageFrame' | 'dispatchPageInput' | 'closePageView'
 
 /** Operations an agent task grant may carry. approve/takeOver/releaseControl never. */
 export const AGENT_OPERATIONS: readonly Operation[] = [
@@ -108,7 +110,8 @@ export const AGENT_OPERATIONS: readonly Operation[] = [
     'submitBatch', 'finishTask', 'getTask', 'resume', 'cancel', 'closeSpace', 'listSpaces', 'joinSpace',
 ]
 /** Operations that require an interactive (human UI) capability. */
-export const INTERACTIVE_OPERATIONS: readonly Operation[] = ['approve', 'takeOver', 'releaseControl', 'viewerTicket', 'setSpaceQuota']
+export const INTERACTIVE_OPERATIONS: readonly Operation[] = ['approve', 'takeOver', 'releaseControl', 'viewerTicket', 'setSpaceQuota',
+    'pageViewInfo', 'openPageView', 'getPageFrame', 'dispatchPageInput', 'closePageView']
 
 export interface AgentGrant {
     kind: 'agent-grant'
@@ -143,6 +146,8 @@ export interface InteractiveCapability {
     operations: Operation[]
     issuedAtMs: number
     expiresAtMs: number
+    /** Signed restriction, never evidence of task ownership. */
+    pageViewScope?: { schemaVersion: 1; agentSessionId: string; runtimeBindingId: string }
     /** abp2 only: the Happy machineId the capability is for (must equal the Runtime's configured machineId). */
     aud?: string
     /** abp2 only: always INTERACTIVE_CAPABILITY_ISSUER. */
@@ -515,6 +520,7 @@ export interface DriverOptions {
 }
 
 export interface BrowserDriver {
+    readonly pageView?: PageViewDriver
     /**
      * True only for a driver whose navigate/click/fill send none of the write's input (pointer press
      * and release, typed text or keys, the navigation) before `validateDispatch` has returned, and
@@ -627,7 +633,7 @@ export interface SpaceListResult {
         tasks?: Array<{taskId:TaskId; status:TaskStatus; pauseReason?:string; pendingApproval:boolean; uncertain:boolean; inFlight:boolean}> }>
 }
 
-export interface BrowserRuntimeApi {
+export interface BrowserRuntimeApi extends PageViewApi {
     listSpaces(auth: AuthContext, req: { profileId: ProfileId }): Promise<SpaceListResult>
     setSpaceQuota(auth: AuthContext, req: { profileId: ProfileId; ceiling: number | null; expectedRevision: number }): Promise<SpaceQuotaPreference>
     joinSpace(auth: AuthContext, req: { taskSpaceId: TaskSpaceId; requestId: RequestId }): Promise<{ taskSpaceId: TaskSpaceId; memberSessionIds: string[] }>
