@@ -6,7 +6,8 @@ import { SessionLaunchControl } from '../sessionDrain/sessionLaunchControl';
 import type { StandaloneLaunchBootstrap } from '../daemon/standaloneLaunchProtocol';
 import { RuntimeProducerGate } from '../sessionDrain/runtimeProducerGate';
 import { createLessonProposalTurn } from '@/utils/lessonProposalTurn';
-import { reportAutomationContextExit } from '@/utils/automationContextExit';
+import { reportAutomationContextExit, type AutomationContextExitEvidence } from '@/utils/automationContextExit';
+import { takeWorkspaceContextControl } from '@/utils/workspaceContextControl';
 import { CodexAuthRecovery } from './codexAuthRecovery';
 import { render } from "ink";
 import {
@@ -259,10 +260,16 @@ export async function runCodex(opts: {
     const recallProjectPath = process.cwd();
     const recallHostEnvironment = { ...process.env };
     if (standaloneLaunch && (managedStartup || opts.startedBy !== 'daemon')) throw new Error('Standalone launch requires an unmanaged daemon session');
+    const workspaceControl = takeWorkspaceContextControl();
+    if (workspaceControl && (standaloneLaunch || managedStartup || opts.startedBy !== 'daemon')) {
+        workspaceControl.close(); throw new Error('WORKSPACE_CONTROL_UNAVAILABLE');
+    }
     const launchControl = standaloneLaunch ? await SessionLaunchControl.connect(standaloneLaunch) : undefined;
     // aplus specs/org-agent-plan §6.3-2: the plan's local proxy, closed with the runner.
     let agentPlanSession: AgentPlanSession | null = null;
     let automationExit: Parameters<typeof reportAutomationContextExit>[0] | null = null;
+    let workspaceExit: AutomationContextExitEvidence | null = null;
+    let workspaceStorageClosed = false;
     try {
     const accountToken = opts.principal?.kind === 'account' ? opts.principal.credentials.token : null;
     if (managedStartup) {
@@ -485,7 +492,7 @@ export async function runCodex(opts: {
         metadata,
         state,
         response,
-        sessionOptions: standaloneLaunch ? { trackShutdownStorage: true } : undefined,
+        sessionOptions: standaloneLaunch || workspaceControl ? { trackShutdownStorage: true } : undefined,
         onSessionSwap: (newSession) => {
             session = newSession;
             newSession.configureInputQueue(messageQueue, 'remote', inputEvidenceEnabled);
@@ -1418,6 +1425,7 @@ export async function runCodex(opts: {
         undefined,
         agentPlanSession?.providerArgs ?? null,
         isAutomationExecutionSessionId(session.sessionId),
+        workspaceControl !== undefined,
     );
 
     let ingestThreadMetadata: { threadId: string; path: Promise<string | null> } | null = null;
@@ -2334,16 +2342,22 @@ export async function runCodex(opts: {
             );
         };
 
-        if (standaloneLaunch) {
+        if (standaloneLaunch || workspaceControl) {
             if (!runtimeGate) throw new Error('Standalone runtime storage gate unavailable');
-            const provider = scopeLaunch ? {
+            const provider = scopeLaunch || workspaceControl ? {
                 freezeInputForShutdown: () => !thinking && !pending && messageQueue.size() === 0 && client.freezeInputForShutdown(),
                 interruptTurn: () => client.interruptTurn(),
-                endInputAndAwaitExit: (budget: number, signal?: AbortSignal) => client.endInputAndAwaitExit(budget, signal),
+                endInputAndAwaitExit: async (budget: number, signal?: AbortSignal) => {
+                    if (!workspaceControl) return client.endInputAndAwaitExit(budget, signal);
+                    const native = await client.finishWorkspaceContext(budget);
+                    workspaceExit = { ...native, writeProducersDrained: false };
+                    return native.foregroundDrained && native.backgroundDrained && native.providerExitedCleanly
+                        ? { exited: true, code: 0, signal: null } : { exited: false, code: null, signal: null };
+                },
                 waitForOutputDrain: () => client.waitForOutputDrain(), cancelOutputDrain: () => client.cancelOutputDrain(),
                 finishShutdownObservation: () => client.finishShutdownObservation(),
             } : client;
-            const storage = scopeLaunch ? {
+            const storage = scopeLaunch || workspaceControl ? {
                 tracksShutdownStorage: session.tracksShutdownStorage,
                 flushForShutdown: async (budget: number, signal?: AbortSignal) => {
                     const proof = await session.flushForShutdown(budget, signal);
@@ -2352,7 +2366,9 @@ export async function runCodex(opts: {
                 },
                 isStorageConfirmationCurrent: (proof: Parameters<typeof session.isStorageConfirmationCurrent>[0]) => session.isStorageConfirmationCurrent(proof),
             } : session;
-            launchControl!.bind(provider, storage, runtimeGate);
+            if (workspaceControl) workspaceControl.bind({ provider, storage, runtime: runtimeGate,
+                prepareWorkspaceDrain: async signal => !signal.aborted && await client.canDrainWorkspace() });
+            else launchControl!.bind(provider, storage, runtimeGate);
         }
 
         while (!shouldExit) {
@@ -3079,6 +3095,12 @@ export async function runCodex(opts: {
                 catch { logger.warn('[automation-context] Native writer exit unconfirmed'); }
                 automationExit = { sessionId: session.sessionId, provider: 'codex', evidence: { ...native, writeProducersDrained: false } };
             }
+            if (workspaceControl && !workspaceExit) {
+                let native = { foregroundDrained: false, backgroundDrained: false, providerExitedCleanly: false };
+                try { native = await client.finishWorkspaceContext(10_000); }
+                catch { logger.warn('[workspace-context] Native writer exit unconfirmed'); }
+                workspaceExit = { ...native, writeProducersDrained: false };
+            }
             /*
              * The bridge points at this run's loop. Left registered, a stop
              * arriving later would be applied to a loop that has ended, or handed
@@ -3104,6 +3126,7 @@ export async function runCodex(opts: {
                 logger.debug('[codex]: session.close begin');
                 await session.close();
                 logger.debug('[codex]: session.close done');
+                workspaceStorageClosed = true;
             } catch (e) {
                 logger.debug('[codex]: Error while closing session', e);
             }
@@ -3142,6 +3165,8 @@ export async function runCodex(opts: {
 
             logActiveHandles('cleanup-end');
             if (automationExit) automationExit.evidence.writeProducersDrained = lessonClosed;
+            if (workspaceExit) workspaceExit.writeProducersDrained = lessonClosed && workspaceStorageClosed
+                && !!runtimeGate && !runtimeGate.hasLiveProducers() && !runtimeGate.isShutdownBlocked();
             logger.debug('[codex]: Final cleanup completed');
         } finally {
             clearInterval(keepAliveInterval);
@@ -3152,7 +3177,15 @@ export async function runCodex(opts: {
     }
     } finally {
         launchControl?.close();
-        await agentPlanSession?.close().catch(() => { if (automationExit) automationExit.evidence.writeProducersDrained = false; });
+        await agentPlanSession?.close().catch(() => {
+            if (automationExit) automationExit.evidence.writeProducersDrained = false;
+            if (workspaceExit) workspaceExit.writeProducersDrained = false;
+        });
         if (automationExit) await reportAutomationContextExit(automationExit);
+        if (workspaceControl) {
+            try { await workspaceControl.reportExit(workspaceExit ?? { foregroundDrained: false, backgroundDrained: false,
+                providerExitedCleanly: false, writeProducersDrained: false }); }
+            finally { workspaceControl.close(); }
+        }
     }
 }

@@ -35,7 +35,7 @@ describe('runCodex plan branch wiring', () => {
 
     it('hands the client the plan provider arguments and closes the proxy with the runner', async () => {
         const text = await source()
-        expect(text).toMatch(/new CodexAppServerClient\([\s\S]*?recallHost !== null,\s*undefined,\s*agentPlanSession\?\.providerArgs \?\? null,\s*isAutomationExecutionSessionId\(session.sessionId\),\s*\);/)
+        expect(text).toMatch(/new CodexAppServerClient\([\s\S]*?recallHost !== null,\s*undefined,\s*agentPlanSession\?\.providerArgs \?\? null,\s*isAutomationExecutionSessionId\(session.sessionId\),\s*workspaceControl !== undefined,\s*\);/)
         expect(text).toContain('await agentPlanSession?.close().catch(')
     })
 

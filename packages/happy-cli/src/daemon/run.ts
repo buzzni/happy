@@ -348,6 +348,8 @@ import {
 import { mergeAdditionalDirectoriesIntoSandboxEnvironment, readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv';
 import { createAutomationContextWorkspace } from './automations/automationContextWorkspace';
 import { createAutomationContextHost, prepareAutomationContextTick } from './automations/automationContextHost';
+import { observeWorkspaceContextChild, WORKSPACE_CONTEXT_CONTROL_ENV } from '@/utils/workspaceContextControl';
+import { probeProcessGroup } from './managedProcessGroup';
 import { createAutomationContextLaunchJournal } from './automations/automationContextLaunchJournal';
 import type { AutomationContextLaunchRequest } from './automations/automationContextLaunch';
 import { createAutomationContextAuthorizer, createAutomationContextTransport } from './automations/automationContextTransport';
@@ -1936,6 +1938,8 @@ export async function startDaemon(): Promise<void> {
     const ownedStartGuard = createOwnedStartGuard();
     // Only the journal-backed host can mark this exact options object; RPC/env cannot bypass manual admission.
     const contextOwnedChildren = new WeakMap<SpawnSessionOptions, (child: import('node:child_process').ChildProcess) => void>();
+    const manualWorkspaceChildren = new Map<number, ReturnType<typeof observeWorkspaceContextChild>>();
+    const observedWorkspaceExit = { foregroundDrained: true, backgroundDrained: true, providerExitedCleanly: true, writeProducersDrained: true };
     // Private rollout only: capability remains unadvertised until the full producer/recovery contract is ready.
     const contextWorkspace = process.env.HAPPY_CONTEXT_ISOLATION_HOST === '1' && process.platform !== 'win32'
       ? createAutomationContextWorkspace({ home: configuration.happyHomeDir, isTracked: async roots => {
@@ -1951,7 +1955,10 @@ export async function startDaemon(): Promise<void> {
             if (!directories.length) return 'unconfirmed';
             directories.push(...readAdditionalDirectoriesEnvironment(tracked.agentEnvironment ?? {}));
             for (const directory of await Promise.all(directories.map(value => fs.realpath(value)))) {
-              if (requested.some(root => contains(root, directory) || contains(directory, root))) return true;
+              if (requested.some(root => contains(root, directory) || contains(directory, root))) {
+                const owner = manualWorkspaceChildren.get(tracked.pid);
+                if (!owner || !await owner.drain(new AbortController().signal)) return true;
+              }
             }
           }
           return false;
@@ -2014,10 +2021,11 @@ export async function startDaemon(): Promise<void> {
     };
 
     const applyManualPersonal = createManualPersonalSpawn(readTrustedStudioOrigin(process.env), machineId);
+    type WorkspaceLaunchObservation = { submitted: boolean; tracked: boolean; onObservedExit?: () => Promise<void> };
     const spawnSessionUnchecked = async (
       options: SpawnSessionOptions,
       trustedMcpContext?: AutomationMcpSpawnContext,
-      workspaceLaunch?: { submitted: boolean; tracked: boolean },
+      workspaceLaunch?: WorkspaceLaunchObservation,
     ): Promise<SpawnSessionResult> => {
       if (!launchReadiness.isReady()) return { type: 'error', errorMessage: 'Daemon is initializing; retry the launch shortly' };
       if (standaloneWindows && (!standaloneWindows.owner.acceptingLaunches || !acceptsStandaloneWindowsProvider(options.agent))) {
@@ -2701,6 +2709,7 @@ export async function startDaemon(): Promise<void> {
               ownedStartGuard.submitted(options);
             },
             onTracked: () => { if (workspaceLaunch) workspaceLaunch.tracked = true; },
+            onWorkspaceExit: workspaceLaunch?.onObservedExit,
             args,
             cwd: directory,
             env: spawnEnvironment,
@@ -2734,6 +2743,7 @@ export async function startDaemon(): Promise<void> {
       onOwnedChild,
       onProcessSubmission,
       onTracked,
+      onWorkspaceExit,
       args,
       cwd,
       env,
@@ -2748,6 +2758,7 @@ export async function startDaemon(): Promise<void> {
       onOwnedChild?: (child: import('node:child_process').ChildProcess) => void;
       onProcessSubmission?: () => void;
       onTracked?: () => void;
+      onWorkspaceExit?: () => Promise<void>;
       args: string[];
       cwd: string;
       env: NodeJS.ProcessEnv;
@@ -2777,6 +2788,11 @@ export async function startDaemon(): Promise<void> {
       const prepared = standaloneWindows ? await standaloneWindows.owner.prepare({ args, cwd, env }) : undefined;
       if (prepared) logger.debug(`[timing] spawn windows-prepare ${Date.now() - prepareStartedAt}ms`);
       const scopeReports = env.HAPPY_WRITE_SCOPE_SESSION === '1' ? writeScopeRuntime?.prepareReports(resumeTargetSessionId) : undefined;
+      // Protected/other providers keep their existing path; unknown writers retain custody.
+      let standardWorkspace = false;
+      try { standardWorkspace = !JSON.parse(env.HAPPY_PROJECT_SANDBOX_CONFIG ?? '{}').checkpointProtection; } catch { /* Existing startup validates malformed config. */ }
+      const workspaceControlId = workspaceReservation?.acquired && !prepared && !scopeReports && args[0] === 'codex' && standardWorkspace
+        ? randomUUID() : null;
       // Owner contact (default OFF): a one-time capability on one more private pipe; null leaves the launch unchanged.
       const ownedSessionId = resumeTargetSessionId ?? env.HAPPY_RECONNECT_SESSION_ID;
       const owned = prepared || !ownedSessionId || !ownedLaunchLineage ? null
@@ -2791,9 +2807,28 @@ export async function startDaemon(): Promise<void> {
             : captureSpawnOutputStdio(startupLogFileName, `session ${resumeTargetSessionId ?? 'new'} from ${cwd}`));
           try {
             workspaceLaunch.submitted = true; onProcessSubmission?.();
-            const childStdio: import('node:child_process').SpawnOptions['stdio'] = onOwnedChild
+            const childStdio: import('node:child_process').SpawnOptions['stdio'] = onOwnedChild || workspaceControlId
               ? [...(Array.isArray(stdio) ? stdio : [stdio ?? 'ignore', stdio ?? 'ignore', stdio ?? 'ignore']), 'ipc'] : stdio;
-            const child = spawnHappyCLI(args, { cwd, detached: true, stdio: childStdio, env: { ...env, ...scopeReports?.environment, ...ownerEnvironment } });
+            const child = spawnHappyCLI(args, { cwd, detached: true, stdio: childStdio, env: { ...env, ...scopeReports?.environment, ...ownerEnvironment,
+              ...(workspaceControlId ? { [WORKSPACE_CONTEXT_CONTROL_ENV]: workspaceControlId } : {}) } });
+            if (workspaceControlId && workspaceReservation?.acquired && child.pid) {
+              const reservation = workspaceReservation, pid = child.pid;
+              const owned = observeWorkspaceContextChild({ child, launchId: workspaceControlId, persist: async () => {
+                // This spawn is detached: its root group also covers non-native helper children.
+                const deadline = performance.now() + 5000;
+                while (probeProcessGroup(pid).kind !== 'no-local-trace' && performance.now() < deadline) {
+                  await new Promise(resolve => setTimeout(resolve, 20));
+                }
+                if (probeProcessGroup(pid).kind !== 'no-local-trace') throw new Error('WORKSPACE_ROOT_EXIT_UNCONFIRMED');
+                if (!await reservation.finish({ submitted: true, tracked: true }, observedWorkspaceExit)) throw new Error('WORKSPACE_CUSTODY_UNCONFIRMED');
+                await onWorkspaceExit?.();
+              } });
+              manualWorkspaceChildren.set(pid, owned);
+              void owned.closed.then(confirmed => {
+                if (manualWorkspaceChildren.get(pid) === owned) manualWorkspaceChildren.delete(pid);
+                if (!confirmed) logger.warn('[workspace-context] Owned manual exit remains unconfirmed');
+              });
+            }
             onOwnedChild?.(child);
             return child;
           }
@@ -3470,7 +3505,7 @@ export async function startDaemon(): Promise<void> {
     ): Promise<SpawnSessionResult> => {
       const endLaunch = await worktreeRemovalReservations.beginLaunch(options.directory);
       let workspaceReservation: Awaited<ReturnType<NonNullable<typeof contextWorkspace>['beginManualLaunch']>> | null = null;
-      const workspaceLaunch = { submitted: false, tracked: false };
+      const workspaceLaunch: WorkspaceLaunchObservation = { submitted: false, tracked: false };
       let stopSubmissionObservation: (() => void) | undefined;
       try {
         const removalRefusal = await spawnRefusalForRemoval(options.directory);
@@ -3478,6 +3513,10 @@ export async function startDaemon(): Promise<void> {
         if (contextWorkspace && !contextOwnedChildren.has(options)) {
           workspaceReservation = await contextWorkspace.beginManualLaunch(await manualPreparationRoots([options.directory, ...options.additionalDirectories ?? []]));
           if (!workspaceReservation.acquired) return workspaceBusy();
+          const reservation = workspaceReservation;
+          workspaceLaunch.onObservedExit = async () => {
+            if (!await reservation.finish({ submitted: true, tracked: true }, observedWorkspaceExit)) throw new Error('WORKSPACE_CUSTODY_UNCONFIRMED');
+          };
           stopSubmissionObservation = ownedStartGuard.observeSubmission(options);
         }
         return await spawnSessionUnchecked(options, trustedMcpContext, workspaceLaunch);
