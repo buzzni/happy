@@ -1,11 +1,13 @@
 /** Durable browser task execution, logical-session continuity, approval validation and dispatch fences. */
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { BrowserRuntimeError, POC_LIMITS, SCHEMA_VERSION, TERMINAL_STATUSES, type ActionId, type AgentGrant, type AuthContext, type BatchId,
     type BatchResult, type BatchStep, type BrowserDriver, type BrowserInstanceId, type BrowserRuntimeApi, type GrantId,
         type ApproveResult, type ControlResult, type RuntimeErrorBody, type SnapshotId, type InputOwner, type Operation,
             type PrincipalId, type ProfileId, type RequestId, type TaskEvent, type TaskId, type TaskSpaceId, type TaskView, type TaskStatus,
                 type TabId, type ApprovalId, type ActionObservations, type ActionReceipt, type HandoffDetail, type HandoffReason,
                 type DispatchExpectation, type ElementDescription, type ElementRef, type Observation, type ScreenshotResult, type SubscribeResult } from './contracts'
+import { PageViews } from './pageViews'
+import type { PageViewOpen, PageViewRequest, PageInputRequest } from './pageViewContracts'
 import { assertOperation } from './auth'
 import { quotaPreferenceKey, resourceAdmissionLimit, type QuotaReading } from './resourceQuota'
 import { approvalPayloadHash, createApproval } from './approvals'
@@ -19,6 +21,8 @@ import { transitionTask } from './stateMachine'
 /** Operations that only read a task's record: allowed on an earlier assignment's records for their owner. */
 const HISTORY_READ_OPERATIONS: ReadonlySet<Operation> = new Set<Operation>(['getTask', 'subscribe', 'listTasks'])
 export interface BrowserRuntimeOptions {
+    /** Enabled only by the personal macOS GUI runtime wrapper. */
+    pageViewEnabled?: boolean
     store: TaskStore
     drivers: Map<ProfileId, BrowserDriver> | Record<string, BrowserDriver>
     clock?: RuntimeClock
@@ -115,6 +119,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     private localClientValidator: ((id: string) => boolean) | undefined
     setLocalClientValidator(check: (id: string) => boolean): void { this.localClientValidator = check }
     readonly leases = new InputLeaseManager()
+    readonly pageViews: PageViews
+    private readonly pageViewBoot = randomUUID()
     private readonly drivers: Map<ProfileId, BrowserDriver>
     private readonly clock: RuntimeClock
     private readonly controllers = new Map<TaskId, AbortController>()
@@ -149,11 +155,57 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             BrowserDriver
         ][])
         this.clock = options.clock ?? systemClock
+        this.pageViews = new PageViews({ now: () => this.clock.now(), binding: id => this.pageViewBinding(id),
+            authorize: async (auth, op, id) => { await this.recovery; await this.authorizeTask(auth, op, this.requireTask(id)) },
+            validate: (auth, op, id) => this.validatePageViewTask(auth, op, this.requireTask(id)),
+            task: id => this.requireTask(id), driver: id => options.pageViewEnabled ? this.drivers.get(id)?.pageView : undefined,
+            leases: this.leases, journal: (id, action, state) => this.journalPageInput(id, action, state) })
         // Both reject (every API call then fails RUNTIME_UNAVAILABLE) when another assignment's state could not be ended.
         this.cleanup = this.settleAssignments()
         this.cleanup.catch(() => undefined)
         this.recovery = this.cleanup.then(() => this.recoverExistingTasks().catch(() => undefined))
         this.recovery.catch(() => undefined)
+    }
+    async pageViewInfo(auth: AuthContext, req: { schemaVersion: 1; profileId: ProfileId }) {
+        await this.recovery
+        if (auth.credential.kind !== 'interactive') throw new BrowserRuntimeError('SCOPE_DENIED', 'Page views require interactive authority')
+        this.checkCredential(auth, 'pageViewInfo', req.profileId)
+        const supported = !!this.options.pageViewEnabled && !!this.drivers.get(req.profileId)?.pageView
+        return { schemaVersion: 1 as const, supported, input: supported, runtimeBindingId: this.pageViewBinding(req.profileId) }
+    }
+    openPageView(auth: AuthContext, req: PageViewOpen) { return this.pageViews.open(auth, req) }
+    getPageFrame(auth: AuthContext, req: PageViewRequest & { statusOnly?: boolean; afterFrameId?: string }) { return this.pageViews.frame(auth, req) }
+    dispatchPageInput(auth: AuthContext, req: PageInputRequest) { return this.pageViews.input(auth, req) }
+    closePageView(auth: AuthContext, req: PageViewRequest) { return this.pageViews.close(auth, req) }
+    private pageViewBinding(profileId: ProfileId): string {
+        const driver = this.drivers.get(profileId)
+        return createHash('sha256').update(JSON.stringify([this.pageViewBoot, profileId,
+            driver?.browserInstanceId(), this.options.profileAssignments?.get(profileId) ?? null])).digest('base64url')
+    }
+    private validatePageViewTask(auth: AuthContext, op: Operation, task: StoredTask): void {
+        const c = auth.credential
+        if (c.kind !== 'interactive' || !c.pageViewScope) return
+        this.checkCredential(auth, op, task.profileId, task.taskSpaceId)
+        assertOperation(auth, op, { ...task.owner, profileId: task.profileId, agentSessionId: task.agentSessionId })
+        if (c.pageViewScope.runtimeBindingId !== this.pageViewBinding(task.profileId)
+            || this.options.profileAssignments && task.assignmentId !== this.options.profileAssignments.get(task.profileId))
+            throw new BrowserRuntimeError('SCOPE_DENIED', 'Page view assignment or browser binding changed')
+    }
+    private async journalPageInput(taskId: TaskId, actionId: string, state: 'intent' | 'applied' | 'rejected' | 'unknown' | 'drained'): Promise<void> {
+        await this.options.store.mutate(taskId, current => {
+            if (state === 'intent' && (current.uncertainActions.length || current.cancelRequested))
+                throw new BrowserRuntimeError('CONFLICT', 'Task cannot receive human input')
+            const actions = { ...current.actions }
+            // A human input is a write; the existing write-recovery journal owns its crash safety.
+            if (state !== 'drained') actions[actionId] = { ...actions[actionId], kind: 'click',
+                state: state === 'intent' ? 'intent-committed' : state === 'applied' ? 'confirmed' : state === 'rejected' ? 'skipped' : 'uncertain' }
+            return { patch: { actions, pageViewInputOpen: state === 'drained' ? false : state === 'intent' ? true : current.pageViewInputOpen,
+                ...(state === 'unknown' ? { status: TERMINAL_STATUSES.includes(current.status) ? current.status : 'paused',
+                    pauseReason: TERMINAL_STATUSES.includes(current.status) ? current.pauseReason : 'outcome-unknown',
+                    uncertainActions: [...new Set([...current.uncertainActions, actionId as ActionId])] } : {}) },
+                event: this.event(state === 'unknown' ? 'action-uncertain' : state === 'intent' ? 'action-intent' : 'state-changed',
+                    { humanPageInput: true, actionId, state }, current.stateVersion + 1) }
+        })
     }
     /** Broker-only enrollment: existing owner membership authorizes a separate, narrowly scoped client. */
     async attachLocalClient(owner: AuthContext, client: AgentGrant, expiresAtMs: number): Promise<void> {
@@ -801,10 +853,13 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         await this.recovery
         if (auth.credential.kind !== 'interactive') throw new BrowserRuntimeError('SCOPE_DENIED', 'Task listing needs an interactive capability')
         this.checkCredential(auth, 'listTasks', req.profileId)
-        const { principalId, workspaceId, machineId } = auth.credential
+        const { principalId, workspaceId, machineId, pageViewScope } = auth.credential
+        if (pageViewScope && pageViewScope.runtimeBindingId !== this.pageViewBinding(req.profileId))
+            throw new BrowserRuntimeError('SCOPE_DENIED', 'Page view binding changed')
         const tasks = this.options.store.listTasks()
             .filter((task) => task.profileId === req.profileId && task.owner.principalId === principalId
-                && task.owner.workspaceId === workspaceId && task.owner.machineId === machineId && !FINISHED_STATUSES.has(task.status))
+                && task.owner.workspaceId === workspaceId && task.owner.machineId === machineId && !FINISHED_STATUSES.has(task.status)
+                && (!pageViewScope || task.agentSessionId === pageViewScope.agentSessionId))
             .sort((a, b) => b.createdAtMs - a.createdAtMs || (a.taskId < b.taskId ? -1 : 1))
             .slice(0, LIST_TASKS_LIMIT)
         return { tasks: tasks.map((task) => this.view(task)) }
@@ -870,6 +925,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         return { uncertain: candidates.filter((id) => !unsent.includes(id)), unsent, actions }
     }
     async onDriverDisconnected(profileId: ProfileId): Promise<void> {
+        for (const task of this.options.store.listTasks().filter(t => t.profileId === profileId))
+            void this.pageViews.drainTask(task.taskId).catch(() => {})
         this.reconnecting.add(profileId)
         this.connectionEpochs.set(profileId, (this.connectionEpochs.get(profileId) ?? 0) + 1)
         await this.recovery
@@ -1285,6 +1342,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     }
     async sweep(nowMs: number): Promise<void> {
         await this.recovery
+        this.pageViews.sweep()
         for (const task of this.options.store.listTasks()) {
             let fenceReason: string | undefined
             const changed = await this.options.store.mutate(task.taskId, (current) => {
@@ -1678,6 +1736,14 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         if (current.leaseEpoch !== req.expectedEpoch || current.owner.kind !== 'user'
             || current.owner.principalId !== interactive.principalId || current.owner.viewerSessionId !== interactive.viewerSessionId)
             throw new BrowserRuntimeError('STALE_LEASE', 'User lease changed')
+        await this.pageViews.drainTask(task.taskId)
+        const drainedTask = this.requireTask(task.taskId)
+        if (drainedTask.uncertainActions.length || this.leases.userControl(task.profileId).settling)
+            throw new BrowserRuntimeError('OUTCOME_UNKNOWN', 'Human input has not safely drained', false, true)
+        const stillOwned = this.leases.owner(req.tabId, task.profileId)
+        if (stillOwned.leaseEpoch !== req.expectedEpoch || stillOwned.owner.kind !== 'user'
+            || stillOwned.owner.viewerSessionId !== interactive.viewerSessionId)
+            throw new BrowserRuntimeError('STALE_LEASE', 'User lease changed during input drain')
         const epoch = this.leases.release(req.tabId, task.profileId)
         await this.persistTabLease(task.taskId, task.taskSpaceId, req.tabId, epoch, null)
         await this.persistProfileUserOwner(task.profileId, null)
@@ -1856,6 +1922,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
      * uncertain writes, cancel requests and browser replacement are never released here.
      */
     private async userResume(task: StoredTask): Promise<TaskView> {
+        if (this.leases.isUserFenced(task.profileId) || task.pageViewInputOpen)
+            throw new BrowserRuntimeError('CONFLICT', 'Human page input is still draining')
         if (task.status === 'paused' && task.pauseReason === 'awaiting-agent')
             return this.view(task)
         if (task.cancelRequested || task.uncertainActions.length || task.status !== 'paused'
@@ -1869,6 +1937,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const unchanged = (current: StoredTask) => {
             if (current.stateVersion !== task.stateVersion || current.status !== task.status || current.pauseReason !== task.pauseReason
                 || current.cancelRequested || current.uncertainActions.length || current.pendingApproval
+                || this.leases.isUserFenced(current.profileId) || current.pageViewInputOpen
                 || current.tabs.some((tabId) => this.leases.owner(tabId, current.profileId).owner.kind === 'user'))
                 throw new BrowserRuntimeError('CONFLICT', 'Task changed during resume')
             const currentGrant = current.agentGrant as AgentGrant | undefined
@@ -2419,6 +2488,11 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         }
     }
     private async recoverExistingTasks(): Promise<void> {
+        // A runtime crash cannot prove that a previously held key/button was released.
+        for (const task of this.options.store.listTasks()) if (task.pageViewInputOpen) {
+            this.leases.fenceProfile(task.profileId)
+            await this.journalPageInput(task.taskId, 'page-input-recovery', 'unknown')
+        }
         await this.restorePersistedTabs().catch(() => undefined)
         for (const task of this.options.store.listTasks()) {
             if (['succeeded', 'failed', 'cancelled'].includes(task.status))
@@ -3200,6 +3274,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     private event(type: TaskEvent['type'], data: Record<string, unknown>, stateVersion: number,
         leaseEpoch = 0): StoreEventInput { return { type, atMs: this.clock.now(), stateVersion, leaseEpoch, data }; }
     private async authorizeTask(auth: AuthContext, operation: Operation, task: StoredTask): Promise<void> {
+        this.validatePageViewTask(auth, operation, task)
         this.checkCredential(auth, operation, task.profileId, task.taskSpaceId)
         if (this.options.profileAssignments && !HISTORY_READ_OPERATIONS.has(operation)
             && task.assignmentId !== this.options.profileAssignments.get(task.profileId))
@@ -3295,7 +3370,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     }
     private allocateTabId(): TabId { return `lease-reservation-${randomUUID()}` as TabId; }
     private view(task: StoredTask): TaskView { const { owner: _owner, agentGrant: _grant, actions: _actions, approvals: _approvals,
-        batches: _batches, dedupe: _dedupe, tabTargets: _tabTargets, tabLeaseEpochs: _tabLeaseEpochs,
+        pageViewInputOpen: _pageViewInputOpen, batches: _batches, dedupe: _dedupe, tabTargets: _tabTargets, tabLeaseEpochs: _tabLeaseEpochs,
         __events: _events, lastSeq: _lastSeq, handoff, ...view } = task;
         const auto = this.autoApprovalFor(task)
         return structuredClone({ ...view, ...(handoff && handoffLasts(task) ? { handoff } : {}),

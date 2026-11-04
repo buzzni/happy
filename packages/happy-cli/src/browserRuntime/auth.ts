@@ -50,6 +50,17 @@ function validateCredential(credential: Credential, nowMs: number): void {
     if (credential.kind === 'interactive' && credential.operations.some((operation) => !interactiveCapabilityOperations.has(operation))) {
         throw new BrowserRuntimeError('UNAUTHORIZED', 'Interactive capability contains a non-interactive operation')
     }
+    if (credential.kind === 'interactive') {
+        const scope = credential.pageViewScope
+        if (scope && (scope.schemaVersion !== 1 || typeof scope.agentSessionId !== 'string' || !scope.agentSessionId.trim()
+            || scope.agentSessionId.length > 256 || typeof scope.runtimeBindingId !== 'string' || !scope.runtimeBindingId.trim()
+            || scope.runtimeBindingId.length > 256 || Object.keys(scope).length !== 3))
+            throw new BrowserRuntimeError('UNAUTHORIZED', 'Invalid page view scope')
+        if (scope && credential.operations.some(op => ['viewerTicket', 'listSpaces', 'closeSpace', 'setSpaceQuota'].includes(op)))
+            throw new BrowserRuntimeError('SCOPE_DENIED', 'Page view scope cannot include profile operations')
+        if (!scope && credential.operations.some(op => ['openPageView', 'getPageFrame', 'dispatchPageInput', 'closePageView'].includes(op)))
+            throw new BrowserRuntimeError('SCOPE_DENIED', 'Page view operations require signed scope')
+    }
 }
 
 function mint(credential: Credential, key: string | Buffer, nowMs: number): string {
@@ -195,6 +206,9 @@ export function verifyToken(token: string, keys: AuthKeys, nowMs: number, revoke
 
 export function assertOperation(auth: AuthContext, operation: Operation, expected: { principalId?: string; workspaceId?: string; machineId?: string; profileId?: string; agentSessionId?: string; taskSpaceId?: TaskSpaceId }): void {
     const credential = auth.credential
+    if (credential.kind === 'interactive' && credential.pageViewScope && expected.agentSessionId !== undefined
+        && credential.pageViewScope.agentSessionId !== expected.agentSessionId)
+        throw new BrowserRuntimeError('SCOPE_DENIED', 'Page view session does not own task')
     if (!credential.operations.includes(operation)) throw new BrowserRuntimeError('SCOPE_DENIED', 'Operation is outside credential scope')
     for (const key of ['principalId', 'workspaceId', 'machineId', 'profileId'] as const) {
         if (expected[key] !== undefined && credential[key] !== expected[key]) throw new BrowserRuntimeError('SCOPE_DENIED', 'Credential scope does not match resource')
