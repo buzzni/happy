@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { MachineMetadataSchema } from '@/api/types'
-import { PendingRevocationQueueError, agentBrowserMachineCapability, agentBrowserMetadataUpdate, browserTaskLineage, createBrowserTaskSessionBroker, registerResumedBrowserSession, spawnResumedWithBrowserTaskRegistration } from './browserTaskBroker'
+import { PendingRevocationQueueError, agentBrowserMachineCapability, agentBrowserMetadataUpdate, browserTaskLineage, browserTaskSpawnSeed, createBrowserTaskSessionBroker, registerResumedBrowserSession, spawnResumedWithBrowserTaskRegistration } from './browserTaskBroker'
 
 const dirs: string[] = []
 afterEach(async () => { await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))) })
@@ -103,9 +103,21 @@ describe('daemon browser task broker hook', () => {
         expect(calls.map((call) => call.path)).toEqual(['/v1/sessions/revoke'])
     })
 
+    it('on resume, keeps the native refusal that left the revocation unconfirmed so the agent still learns why', async () => {
+        const paths: string[] = []
+        const dir = await mkdtemp(join(tmpdir(), 'abp-daemon-queue-')); dirs.push(dir)
+        const broker = createBrowserTaskSessionBroker({ HAPPY_BROWSER_TASK_BROKER_SOCKET: '/run/abp/broker.sock', HAPPY_BROWSER_TASK_DAEMON_TOKEN_FILE: await tokenFile() },
+            async (_socket, _method, path) => { paths.push(path); throw new Error('NATIVE_DEVICE_APPROVAL_REQUIRED') },
+            { procRoot: await procRoot(), pendingRevocationsFile: join(dir, 'pending.json'), retryBaseMs: 3_600_000 })!
+        expect(await registerResumedBrowserSession(broker, 'session-1')).toEqual({ unavailableReason: 'NATIVE_DEVICE_APPROVAL_REQUIRED' })
+        // Still never registers while the revocation is unconfirmed.
+        expect(paths).toEqual(['/v1/sessions/revoke'])
+    })
+
     it('spawns without browser grants when registration fails, instead of failing the spawn', async () => {
         const broker = createBrowserTaskSessionBroker({ HAPPY_BROWSER_TASK_BROKER_SOCKET: '/run/abp/broker.sock', HAPPY_BROWSER_TASK_DAEMON_TOKEN_FILE: await tokenFile() },
             async () => { throw new Error('ECONNREFUSED') })!
+        // Only the native issuer's own refusal codes reach the agent; any other failure stays in the log.
         expect(await broker.register()).toBeUndefined()
         expect(await broker.bind('reg-1', 'session-1')).toBe(false)
         await expect(broker.revoke({ registrationId: 'reg-1' })).resolves.toBeUndefined()
@@ -256,6 +268,26 @@ describe('resumed session browser task registration', () => {
         })
         expect(spawned).toEqual([{ APLUS_SESSION_ID: 'session-1' }])
         expect(calls.map((call) => call.path)).toEqual(['/v1/sessions/revoke'])
+    })
+
+    it('resumes with the refusal code instead of a secret when registration is refused with one', async () => {
+        const { request } = recorder({
+            '/v1/native/challenge': { status: 200, body: { ok: true, result: { schemaVersion: 1, machineId: 'm', workspaceId: 'w', generation: 'a'.repeat(43) } } },
+            '/v1/sessions/revoke': replies['/v1/sessions/revoke'],
+        })
+        // The earlier registration's revocation goes through; only signing a new registration is refused.
+        const issue = async (command: { path: string }) => {
+            if (command.path === '/v1/sessions/register') throw new Error('NATIVE_DEVICE_APPROVAL_REQUIRED')
+            return { token: 'one-use', expiresAtMs: Date.now() + 60_000 }
+        }
+        const broker = createBrowserTaskSessionBroker({}, request, { procRoot: await procRoot(), native: { socketPath: '/native/broker.sock', machineId: 'm', workspaceId: 'w', issue } })!
+        const spawned: Record<string, string>[] = []
+        await spawnResumedWithBrowserTaskRegistration({
+            broker, agentSessionId: 'session-1', env: { APLUS_SESSION_ID: 'session-1' },
+            spawn: async (env) => { spawned.push(env); return { type: 'success', sessionId: 'session-1' } },
+            ownerPid: () => undefined, onRevokeFailure: () => {},
+        })
+        expect(spawned).toEqual([{ APLUS_SESSION_ID: 'session-1', HAPPY_BROWSER_TASK_UNAVAILABLE_REASON: 'NATIVE_DEVICE_APPROVAL_REQUIRED' }])
     })
 
     it('resumes without a secret when the machine has no broker', async () => {
@@ -413,4 +445,30 @@ it('native daemon registration uses the supplied scoped issuer without reading a
     expect(await broker.register()).toEqual({ registrationId: 'r', sessionSecret: 's' })
     expect(issue).toHaveBeenCalledWith({ generation: 'a'.repeat(43), method: 'POST', path: '/v1/sessions/register', body: '{"schemaVersion":1,"bootId":"boot-fixture"}' }, undefined)
     expect(calls[1].headers).toEqual({ 'x-abp-native-command': 'one-use' })
+})
+
+describe('why a session got no browser task grant', () => {
+    /** The Desktop-owned native broker answers the challenge, but this daemon's issuer refuses to sign. */
+    async function nativeBrokerThrowing(message: string) {
+        const { request } = recorder({ '/v1/native/challenge': { status: 200, body: { ok: true, result: { schemaVersion: 1, machineId: 'm', workspaceId: 'w', generation: 'a'.repeat(43) } } } })
+        const issue = async () => { throw new Error(message) }
+        return createBrowserTaskSessionBroker({}, request, { procRoot: await procRoot(), native: { socketPath: '/native/broker.sock', machineId: 'm', workspaceId: 'w', issue } })!
+    }
+
+    it('reports a refusal code from the native issuer (an organization PC without device approval)', async () => {
+        expect(await (await nativeBrokerThrowing('NATIVE_DEVICE_APPROVAL_REQUIRED')).register()).toEqual({ unavailableReason: 'NATIVE_DEVICE_APPROVAL_REQUIRED' })
+        expect(await (await nativeBrokerThrowing('NATIVE_AUTHORIZATION_DENIED')).register()).toEqual({ unavailableReason: 'NATIVE_AUTHORIZATION_DENIED' })
+    })
+
+    it('never reports free text as a reason', async () => {
+        expect(await (await nativeBrokerThrowing('connect ENOENT /native/broker.sock')).register()).toBeUndefined()
+        expect(await (await nativeBrokerThrowing('NATIVE_DEVICE_APPROVAL_REQUIRED for /Users/someone')).register()).toBeUndefined()
+    })
+
+    it('hands the session process its secret, or the refusal code, and nothing otherwise', () => {
+        const registration = { registrationId: 'reg-1', sessionSecret: 'secret-1' }
+        expect(browserTaskSpawnSeed(registration)).toEqual({ registration, environment: { HAPPY_BROWSER_TASK_SESSION_SECRET: 'secret-1' } })
+        expect(browserTaskSpawnSeed({ unavailableReason: 'NATIVE_DEVICE_APPROVAL_REQUIRED' })).toEqual({ environment: { HAPPY_BROWSER_TASK_UNAVAILABLE_REASON: 'NATIVE_DEVICE_APPROVAL_REQUIRED' } })
+        expect(browserTaskSpawnSeed(undefined)).toEqual({ environment: {} })
+    })
 })
