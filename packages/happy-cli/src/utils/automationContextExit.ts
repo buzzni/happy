@@ -54,7 +54,7 @@ export function observeAutomationContextChild(input: {
     child.once('close', (code, signal) => {
       child.off('message', onMessage); child.off('error', onError)
       if (!received || conflicted || code !== 0 || signal !== null || child.killed) { resolve(false); return }
-      void input.persist().then(() => resolve(true), () => {
+      void Promise.resolve().then(() => input.persist()).then(() => resolve(true), () => {
         logger.warn('[automation-context] Owned exit receipt persistence unconfirmed')
         resolve(false)
       })

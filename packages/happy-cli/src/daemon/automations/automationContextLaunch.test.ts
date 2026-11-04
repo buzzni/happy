@@ -84,6 +84,20 @@ it('holds an unknown native start across restart and releases only after a durab
   expect(f.start).toHaveBeenCalledOnce()
 })
 
+it('queues an early owned exit behind submission persistence instead of losing it to its own journal lock', async () => {
+  const f = await workspaceSetup()
+  let exit: Promise<unknown> | undefined
+  f.start.mockImplementationOnce(async options => {
+    exit = f.launcher.recordOwnedExit({ runId: 'r1', sessionId: 'automation-run:r1', provider: 'codex' })
+      .then(() => ({ durable: true }), error => ({ durable: false, error }))
+    return { type: 'success', sessionId: options.reconnectEnvironment!.HAPPY_RECONNECT_SESSION_ID }
+  })
+  expect(await f.launcher.launch(f.input)).toHaveProperty('state', 'started')
+  expect(await exit).toEqual({ durable: true })
+  expect(await f.launcher.recover('r1')).toHaveProperty('state', 'ended')
+  expect(await f.workspace.beginManualLaunch([f.directory])).toHaveProperty('acquired', true)
+})
+
 it.each(['refused', 'journal-failed'])('releases workspace only on proven pre-submission failure (%s)', async kind => {
   const f = await workspaceSetup()
   if (kind === 'refused') f.start.mockRejectedValueOnce(new OwnedStartRefused('daemon-restarting'))

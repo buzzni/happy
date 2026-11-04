@@ -42,7 +42,7 @@ it('rejects malformed or unbounded evidence instead of sending permissive truthy
   expect(send).not.toHaveBeenCalled()
 })
 
-it.each(['clean', 'missing', 'wrong-session', 'wrong-provider', 'partial', 'conflict', 'nonzero'])(
+it.each(['clean', 'missing', 'wrong-session', 'wrong-provider', 'partial', 'conflict', 'nonzero', 'persistence-failure'])(
   'accepts only matching private IPC plus owned clean child close (%s)', async kind => {
     const message = { type: 'automation-context-exit', version: 1, ...input() }
     if (kind === 'wrong-session') message.sessionId = 'automation-run:other'
@@ -57,7 +57,7 @@ it.each(['clean', 'missing', 'wrong-session', 'wrong-provider', 'partial', 'conf
     `], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] })
     let release!: () => void
     const durable = new Promise<void>(resolve => { release = resolve })
-    const persist = vi.fn(async () => durable)
+    const persist = vi.fn(() => { if (kind === 'persistence-failure') throw new Error('fsync failed'); return durable })
     const result = observeAutomationContextChild({ child, sessionId: input().sessionId, provider: input().provider, persist })
     let settled = false
     void result.then(() => { settled = true })
@@ -69,5 +69,5 @@ it.each(['clean', 'missing', 'wrong-session', 'wrong-provider', 'partial', 'conf
       }
     } finally { release() }
     expect(await result).toBe(kind === 'clean')
-    expect(persist).toHaveBeenCalledTimes(kind === 'clean' ? 1 : 0)
+    expect(persist).toHaveBeenCalledTimes(kind === 'clean' || kind === 'persistence-failure' ? 1 : 0)
   })

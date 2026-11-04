@@ -52,6 +52,16 @@ export interface AutomationContextLaunchDependencies {
   discover(sessionId: string): Promise<'running' | 'unconfirmed'>
 }
 export function createAutomationContextLauncher(deps: AutomationContextLaunchDependencies) {
+  const operations = new Map<string, Promise<unknown>>()
+  function exclusive<T>(runId: string, work: () => Promise<T>): Promise<T> {
+    const previous = operations.get(runId) ?? Promise.resolve()
+    const perform = () => deps.journal.exclusive(runId, work)
+    const current = previous.then(perform, perform)
+    operations.set(runId, current)
+    const settled = () => { if (operations.get(runId) === current) operations.delete(runId) }
+    void current.then(settled, settled)
+    return current
+  }
   const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
   const scope = digest([deps.happyOrigin, deps.accountId, deps.machineId])
   const normalizeRequest = (input: AutomationContextLaunchRequest) => launchRequestSchema.parse({ ...input,
@@ -79,7 +89,7 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
   return {
     /** Private owned-child observer only, after matching native evidence AND actual root close(0, null). */
     async recordOwnedExit(input: { runId: string; sessionId: string; provider: 'claude' | 'codex' }): Promise<void> {
-      await deps.journal.exclusive(input.runId, async () => {
+      await exclusive(input.runId, async () => {
         const record = await deps.journal.read(input.runId)
         if (!record) throw new Error('AUTOMATION_EXIT_RECEIPT_CONFLICT')
         assertIdentity(record, input.runId)
@@ -93,7 +103,7 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
     },
     /** Private daemon input only. Never return this snapshot through browser RPC or logs. */
     async restoreRequest(runId: string): Promise<AutomationContextLaunchRequest | null> {
-      return deps.journal.exclusive(runId, async () => {
+      return exclusive(runId, async () => {
         const record = await deps.journal.read(runId)
         if (!record) return null
         assertIdentity(record, runId)
@@ -122,7 +132,7 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
     /** Reconcile the immutable old run even after edit/pause/delete; this method never dispatches. */
     async recover(runId: string): Promise<AutomationContextRecovery | null> {
       const sessionId = automationExecutionSessionId(runId)
-      return deps.journal.exclusive(runId, async () => {
+      return exclusive(runId, async () => {
         const record = await deps.journal.read(runId)
         if (!record) return null
         assertIdentity(record, runId)
@@ -156,7 +166,7 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
       questionBytes: Buffer.byteLength(question, 'utf8'), seedSha256: digest(executionSeed) })
     const requestHash = hashRequest(input)
     const publicResult = (state: 'started' | 'needs-attention') => ({ state, sessionId, displaySessionId })
-    return deps.journal.exclusive(runId, async () => {
+    return exclusive(runId, async () => {
       let record = await deps.journal.read(runId)
       if (record && (record.scope !== scope || record.requestHash !== requestHash || record.sessionId !== sessionId
         || record.displaySessionId !== displaySessionId || record.automationId !== automationId
