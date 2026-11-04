@@ -26,6 +26,7 @@ import { db } from "@/storage/db";
 import { isUserActive } from "@/app/push/focusTracker";
 import { sendPushNotifications } from "@/app/push/pushSend";
 import { log } from "@/utils/log";
+import { isAutomationExecutionSessionId } from '@slopus/happy-wire';
 
 async function fetchTokensAndSend(params: {
     userId: string;
@@ -86,9 +87,27 @@ export async function dispatchSessionEventPush(params: {
     body: string;
     data?: Record<string, unknown>;
 }): Promise<void> {
-    const { userId, sessionId, title, body, data } = params;
+    const { userId, title, body, data } = params;
+    let sessionId = params.sessionId;
+    let runId: string | undefined;
 
     try {
+        if (isAutomationExecutionSessionId(sessionId)) {
+            const run = await db.automationRun.findFirst({
+                where: { sessionId, machineAccountId: userId, displaySessionId: { not: null } },
+                select: { id: true, displaySessionId: true },
+            });
+            const display = run?.displaySessionId && !isAutomationExecutionSessionId(run.displaySessionId)
+                ? await db.session.findFirst({ where: { id: run.displaySessionId, accountId: userId }, select: { id: true } })
+                : null;
+            if (!display || !run) {
+                log({ module: 'push', level: 'warn' }, `Automation attention target unavailable for user ${userId} execution ${sessionId}`);
+                return;
+            }
+            // Attention belongs to the registered display chat, never a separate internal chat.
+            sessionId = display.id;
+            runId = run.id;
+        }
         try {
             if (await isUserActive(userId)) {
                 log({ module: 'push' }, `Suppressed session-event push for user ${userId} session ${sessionId}: user active`);
@@ -103,7 +122,7 @@ export async function dispatchSessionEventPush(params: {
             sessionId,
             title,
             body,
-            data: { sessionId, ...(data ?? {}) },
+            data: runId ? { ...(data ?? {}), sessionId, runId } : { sessionId, ...(data ?? {}) },
             channelId: 'messages'
         });
     } catch (error) {

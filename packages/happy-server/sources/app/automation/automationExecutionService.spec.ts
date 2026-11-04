@@ -476,7 +476,7 @@ describe('automationExecutionService', () => {
 
     it('rejects a first completion report linked to a foreign session', async () => {
         const tx = makeTx();
-        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null });
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null, automation: automation() });
         await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
             outcome: 'WOKE', sessionId: 'foreign-session', detailCiphertext: null, failureCode: null,
@@ -489,7 +489,7 @@ describe('automationExecutionService', () => {
 
     it.each(['WOKE', 'SILENT'] as const)('rejects a %s report without a session link', async (outcome) => {
         const tx = makeTx();
-        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null });
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null, automation: automation() });
 
         await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
@@ -541,7 +541,7 @@ describe('automationExecutionService', () => {
     });
     it('rejects inconsistent GitHub queue progress', async () => {
         const tx = makeTx();
-        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null });
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null, automation: automation() });
 
         await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
@@ -553,7 +553,7 @@ describe('automationExecutionService', () => {
 
     it('maps a cross-run report id uniqueness conflict to report-conflict', async () => {
         const tx = makeTx();
-        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null });
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null, automation: automation() });
         tx.automationRun.updateMany.mockRejectedValue(new Prisma.PrismaClientKnownRequestError('duplicate report', {
             code: 'P2002',
             clientVersion: 'test',
@@ -622,7 +622,7 @@ describe('automationExecutionService', () => {
 
     it('rejects a degraded code on a non-WOKE run', async () => {
         const tx = makeTx();
-        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null });
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null, automation: automation() });
 
         await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'FAILED',
@@ -637,7 +637,7 @@ describe('automationExecutionService', () => {
         { status: 'FAILED', outcome: 'WOKE' },
     ] as const)('rejects an invalid $status and $outcome report pair', async ({ status, outcome }) => {
         const tx = makeTx();
-        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null });
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null, automation: automation() });
         await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token', reportId: 'report-1', status,
             outcome, sessionId: null, detailCiphertext: null, failureCode: null,

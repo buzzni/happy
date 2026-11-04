@@ -1,5 +1,5 @@
 import { Readable } from "node:stream";
-import { parseCanonicalOrgSetupTokenJson } from "@slopus/happy-wire";
+import { AUTOMATION_EXECUTION_SESSION_PREFIX, isAutomationExecutionSessionId, parseCanonicalOrgSetupTokenJson } from "@slopus/happy-wire";
 import { eventRouter, buildNewSessionUpdate } from "@/app/events/eventRouter";
 import { type Fastify } from "../types";
 import { db } from "@/storage/db";
@@ -14,6 +14,10 @@ import { requireSessionScopeAuth, requireAccountPrincipal } from "@/app/api/util
 import { createExecutionBoundSession, ExecutionBindingError } from "@/app/session/sessionExecutionBinding";
 import { createOwnershipBoundSession, OwnershipError } from "@/app/session/sessionOwnershipBinding";
 
+function visibleSessionScope(accountId: string): Prisma.SessionWhereInput {
+    return { accountId, NOT: { id: { startsWith: AUTOMATION_EXECUTION_SESSION_PREFIX } } };
+}
+
 export function sessionRoutes(app: Fastify) {
 
     // Sessions API
@@ -23,7 +27,7 @@ export function sessionRoutes(app: Fastify) {
         const userId = request.userId;
 
         const sessions = await db.session.findMany({
-            where: { accountId: userId },
+            where: visibleSessionScope(userId),
             orderBy: { updatedAt: 'desc' },
             take: 150,
             select: {
@@ -90,7 +94,7 @@ export function sessionRoutes(app: Fastify) {
 
         const sessions = await db.session.findMany({
             where: {
-                accountId: userId,
+                ...visibleSessionScope(userId),
                 active: true,
                 lastActiveAt: { gt: new Date(Date.now() - 1000 * 60 * 15) /* 15 minutes */ }
             },
@@ -292,7 +296,7 @@ export function sessionRoutes(app: Fastify) {
         }
 
         // Build where clause
-        const where: Prisma.SessionWhereInput = { accountId: userId };
+        const where: Prisma.SessionWhereInput = visibleSessionScope(userId);
 
         // Add changedSince filter (just a filter, doesn't affect pagination)
         if (changedSince) {
@@ -401,7 +405,7 @@ export function sessionRoutes(app: Fastify) {
             }
         }
 
-        const where: Prisma.SessionWhereInput = { accountId: userId };
+        const where: Prisma.SessionWhereInput = visibleSessionScope(userId);
         const and: Prisma.SessionWhereInput[] = [];
         if (since !== undefined) {
             and.push({ updatedAt: { gte: new Date(since) } });
@@ -501,6 +505,9 @@ export function sessionRoutes(app: Fastify) {
     }, async (request, reply) => {
         const userId = request.userId;
         const { tag, metadata, dataEncryptionKey } = request.body;
+        if (isAutomationExecutionSessionId(tag)) {
+            return reply.code(400).send({ error: 'Run-owned sessions require automation admission' });
+        }
 
         const hasOwnership = Object.prototype.hasOwnProperty.call(request.body, 'ownershipProof');
         if (hasOwnership || Object.prototype.hasOwnProperty.call(request.body, 'executionProof')) {

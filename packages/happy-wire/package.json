@@ -32,6 +32,16 @@
         "default": "./dist/scriptServiceToken.mjs"
       }
     },
+    "./automationExecutionToken": {
+      "require": {
+        "types": "./dist/automationExecutionToken.d.cts",
+        "default": "./dist/automationExecutionToken.cjs"
+      },
+      "import": {
+        "types": "./dist/automationExecutionToken.d.mts",
+        "default": "./dist/automationExecutionToken.mjs"
+      }
+    },
     "./chatAutomationLifecycleToken": {
       "require": {
         "types": "./dist/chatAutomationLifecycleToken.d.cts",
@@ -77,6 +87,9 @@
     "*": {
       "scriptServiceToken": [
         "dist/scriptServiceToken.d.cts"
+      ],
+      "automationExecutionToken": [
+        "dist/automationExecutionToken.d.cts"
       ],
       "chatAutomationLifecycleToken": [
         "dist/chatAutomationLifecycleToken.d.cts"

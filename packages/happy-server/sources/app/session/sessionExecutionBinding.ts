@@ -3,6 +3,7 @@ import {
   HappySessionExecutionProofSchema, RotationOriginSchema, SessionExecutionCreateBodySchema,
   rotationDecodeBinary, rotationDigest, rotationIsFresh, rotationSha256,
   sessionCreateBodyHash, sessionTagHash, verifyRotationDocument,
+  automationExecutionSessionId,
   type HappySessionExecutionProof,
 } from '@slopus/happy-wire';
 import { inTx, afterTx } from '@/storage/inTx';
@@ -55,10 +56,14 @@ function fresh(proof: HappySessionExecutionProof) {
 /** Only a new session can acquire this immutable relation. Existing rows require exact replay. */
 export async function createExecutionBoundSession(ownerAccountId: string, rawBody: unknown, rawProof: unknown,
   participate?: (tx: Prisma.TransactionClient, session: { id: string }, created: boolean) => Promise<void>,
-  checkParticipation?: () => void) {
+  checkParticipation?: () => void,
+  /** Server-only admission: never taken from the ordinary create request body. */
+  automationRunId?: string) {
   const verified = await verifySessionExecutionCreate(ownerAccountId, rawBody, rawProof);
   const { body, proof, ticketDigest, createProofDigest } = verified;
   const ticket = proof.ticket.body;
+  const reservedId = automationRunId === undefined ? undefined : automationExecutionSessionId(automationRunId);
+  if (reservedId && body.tag !== reservedId) conflict();
   for (let attempt = 0; ; attempt++) {
     try {
       return await inTx(async tx => {
@@ -72,7 +77,7 @@ export async function createExecutionBoundSession(ownerAccountId: string, rawBod
           { companyId: ticket.companyId, machineId: ticket.machineId, operationId: ticket.operationId },
         ] } });
         if (existing || binding) {
-          if (existing && binding && binding.sessionId === existing.id && binding.sessionRowId === existing.id &&
+          if (existing && binding && (!reservedId || existing.id === reservedId) && binding.sessionId === existing.id && binding.sessionRowId === existing.id &&
             binding.sessionOwnerAccountId === ownerAccountId && binding.machineRowId === machine.id &&
             binding.machineOwnerAccountId === machine.accountId && binding.companyId === ticket.companyId &&
             binding.machineId === ticket.machineId && binding.launchId === ticket.launchId &&
@@ -85,6 +90,7 @@ export async function createExecutionBoundSession(ownerAccountId: string, rawBod
           conflict();
         }
         const session = await tx.session.create({ data: {
+          ...(reservedId ? { id: reservedId } : {}),
           accountId: ownerAccountId, tag: body.tag, metadata: body.metadata, agentState: body.agentState,
           dataEncryptionKey: body.dataEncryptionKey ? new Uint8Array(Buffer.from(body.dataEncryptionKey, 'base64')) : undefined,
         } });

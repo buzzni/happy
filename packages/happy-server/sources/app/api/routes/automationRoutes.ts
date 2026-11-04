@@ -28,6 +28,7 @@ import {
     type AutomationServiceError,
 } from '@/app/automation/automationService';
 import { resolveAutomationRunMcpContext } from '@/app/automation/automationExecutionService';
+import { automationExecutionRoutes } from './automationExecutionRoutes';
 import { listAutomationPage } from '@/app/automation/automationPageService';
 import { serializeScriptAutomation } from './scriptAutomationRoutes';
 import { readChatAutomationImpact, transitionChatAutomations } from '@/app/automation/automationChatLifecycle';
@@ -124,6 +125,7 @@ function rejectWhenDisabled(reply: FastifyReply): boolean {
 }
 
 export function automationRoutes(app: Fastify) {
+    automationExecutionRoutes(app);
     const lifecycleProof = (authorization: unknown, proof: unknown, projectId: string, state: 'impact' | 'active' | 'archived' | 'deleted') => typeof authorization === 'string' && typeof proof === 'string' && verifyChatAutomationLifecycle({
         token: proof, bearer: authorization.replace(/^Bearer /i, ''), projectId, state, now: Date.now(),
         secret: process.env.SCRIPT_AUTOMATION_ADMISSION_SECRET || (process.env.HAPPY_STANDALONE_CONTROL === 'stdin-v1' ? process.env.HANDY_MASTER_SECRET : '') || '',

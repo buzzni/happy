@@ -635,6 +635,9 @@ model AutomationRun {
     runLeaseExpiresAt DateTime?
     reportId          String?               @unique
     sessionId         String?
+    /// Immutable result destination for isolated execution; sessionId owns the provider run.
+    displaySessionId  String?
+    executionCreateBodyHash String?
     outcome           AutomationRunOutcome?
     detailCiphertext  Bytes?
     failureCode       String?
@@ -653,6 +656,7 @@ model AutomationRun {
     @@unique([automationId, generation, scheduledFor])
     @@index([automationId, status])
     @@index([machineAccountId, machineId, status])
+    @@index([displaySessionId, createdAt])
 }
 
 model ScriptArtifact {

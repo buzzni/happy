@@ -134,6 +134,26 @@ const createInput = {
 };
 
 describe('automationService', () => {
+    it.each([4, 6, 99])('does not enable isolated payloads from protocol number %s before the execution capability is ready', async protocolVersion => {
+        const { tx } = makeTx({ automationProtocolVersion: protocolVersion });
+        await expect(createAutomation(tx as never, 'editor-1', 'project-1', { ...createInput, payloadVersion: 6 }))
+            .resolves.toEqual({ ok: false, error: 'automation-run-unsupported' });
+        expect(tx.automation.create).not.toHaveBeenCalled();
+        expect(tx.automationChange.create).not.toHaveBeenCalled();
+    });
+
+    it('keeps an isolated definition stoppable but refuses resume or a legacy downgrade during preparation', async () => {
+        const { tx } = makeTx({ automation: automationRecord({ payloadVersion: 6 }), automationProtocolVersion: 6 });
+        await expect(updateAutomation(tx as never, 'editor-1', 'project-1', 'automation-1', { expectedRevision: 1, paused: false }))
+            .resolves.toEqual({ ok: false, error: 'automation-run-unsupported' });
+        await expect(updateAutomation(tx as never, 'editor-1', 'project-1', 'automation-1', { expectedRevision: 1, ...createInput, payloadVersion: 4 }))
+            .resolves.toEqual({ ok: false, error: 'automation-run-unsupported' });
+        expect(tx.automation.updateMany).not.toHaveBeenCalled();
+        await expect(updateAutomation(tx as never, 'editor-1', 'project-1', 'automation-1', { expectedRevision: 1, paused: true }))
+            .resolves.toMatchObject({ ok: true });
+        expect(tx.automation.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ paused: true }) }));
+    });
+
     it('registers one paused ordinary reservation and recovers the same row on concurrent retries', async () => {
         const { tx } = makeTx({ automation: null });
         let stored: ReturnType<typeof automationRecord> | null = null;

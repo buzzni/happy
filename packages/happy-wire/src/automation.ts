@@ -157,6 +157,26 @@ export const automationDeliverySchema = z.object({
 });
 export type AutomationDelivery = z.infer<typeof automationDeliverySchema>;
 
+export const AUTOMATION_CONTEXT_INPUT_MAX_BYTES = 64 * 1024;
+export const AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES = 16 * 1024;
+export const AUTOMATION_EXECUTION_SESSION_PREFIX = 'automation-run:';
+export function automationExecutionSessionId(runId: string): string {
+  return AUTOMATION_EXECUTION_SESSION_PREFIX + z.string().regex(/^[A-Za-z0-9_-]{1,160}$/).parse(runId);
+}
+/** A visibility namespace, never an authorization check. Only the server mints these IDs. */
+export function isAutomationExecutionSessionId(sessionId: unknown): sessionId is string {
+  return typeof sessionId === 'string' && sessionId.startsWith(AUTOMATION_EXECUTION_SESSION_PREFIX);
+}
+
+export const automationContextPolicySchema = z.object({
+  kind: z.literal('isolated'),
+  reference: z.object({
+    kind: z.literal('previous-result'),
+    maxBytes: z.number().int().min(1).max(AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES),
+  }).strict().nullable(),
+}).strict();
+export type AutomationContextPolicy = z.infer<typeof automationContextPolicySchema>;
+
 export const automationPayloadSchema = z.object({
   name: z.string().trim().min(1).max(200),
   schedule: automationScheduleSchema,
@@ -171,10 +191,18 @@ export const automationPayloadSchema = z.object({
   effort: z.string().nullable().optional(),
   githubTrigger: githubTriggerSchema.optional(),
   conversation: z.object({ sessionId: z.string().trim().min(1).max(200) }).optional(),
+  contextPolicy: automationContextPolicySchema.optional(),
   // A delivery this daemon cannot read is dropped, never a reason to skip the run itself.
   delivery: automationDeliverySchema.optional().catch(undefined),
   seal: automationSealSchema.optional(),
 }).superRefine((payload, context) => {
+  if (payload.contextPolicy && new TextEncoder().encode(payload.prompt).byteLength > AUTOMATION_CONTEXT_INPUT_MAX_BYTES) {
+    context.addIssue({ code: 'custom', path: ['prompt'], message: 'isolated context input exceeds its byte budget' });
+  }
+  if (payload.contextPolicy && (!payload.conversation || payload.githubTrigger || payload.scriptCommand !== null
+    || (payload.agent !== 'claude' && payload.agent !== 'codex'))) {
+    context.addIssue({ code: 'custom', path: ['contextPolicy'], message: 'isolated context requires a Claude/Codex conversation without code or GitHub execution' });
+  }
   if (payload.conversation && payload.githubTrigger) context.addIssue({ code: 'custom', path: ['conversation'], message: 'conversation delivery cannot use GitHub triggers' });
   const isGithubSchedule = payload.schedule.kind === 'github';
   if (isGithubSchedule !== (payload.githubTrigger !== undefined)) {
@@ -195,7 +223,7 @@ export const automationPublicSchema = z.object({
   machineId: z.string().min(1).nullable(),
   revision: positiveInteger,
   generation: positiveInteger,
-  payloadVersion: z.union([z.literal(1), z.literal(4)]),
+  payloadVersion: z.union([z.literal(1), z.literal(4), z.literal(6)]),
   payloadCiphertext: payloadCiphertextSchema,
   viewerKeyId: z.string().min(1).max(128),
   viewerKeyVersion: positiveInteger,
@@ -251,7 +279,7 @@ export const automationRunSchema = z.object({
 export type AutomationRun = z.infer<typeof automationRunSchema>;
 
 export const automationEncryptedFieldsSchema = z.object({
-  payloadVersion: z.union([z.literal(1), z.literal(4)]),
+  payloadVersion: z.union([z.literal(1), z.literal(4), z.literal(6)]),
   payloadCiphertext: payloadCiphertextSchema,
   viewerKeyId: z.string().min(1).max(128),
   viewerKeyVersion: positiveInteger,
@@ -280,7 +308,7 @@ export interface AutomationAdoption {
 export const automationUpdateRequestSchema = z.object({
   expectedRevision: positiveInteger,
   paused: z.boolean().optional(),
-  payloadVersion: z.union([z.literal(1), z.literal(4)]).optional(),
+  payloadVersion: z.union([z.literal(1), z.literal(4), z.literal(6)]).optional(),
   payloadCiphertext: payloadCiphertextSchema.optional(),
   viewerKeyId: z.string().min(1).max(128).optional(),
   viewerKeyVersion: positiveInteger.optional(),
@@ -358,7 +386,7 @@ export async function encryptAutomationPayload(input: {
   const plaintext = new TextEncoder().encode(JSON.stringify(payload));
   const ciphertext = versioned(input.crypto.secretBoxSeal(plaintext, dek));
   const result = {
-    payloadVersion: payload.conversation ? 4 as const : 1 as const,
+    payloadVersion: payload.contextPolicy ? 6 as const : payload.conversation ? 4 as const : 1 as const,
     payloadCiphertext: input.crypto.encodeBase64(ciphertext),
     viewerKeyId: input.crypto.encodeBase64(await input.crypto.sha256(input.viewer.publicKey), true),
     viewerKeyVersion: input.viewer.keyVersion,
@@ -394,7 +422,7 @@ function sealMachineKey(input: {
  * Whether to trust the sender, and what to check in `seal`, is the caller's.
  */
 export function openAutomationPayloadForMachine(input: {
-  payloadVersion: 1 | 4;
+  payloadVersion: 1 | 4 | 6;
   payloadCiphertext: string;
   machineKeyEnvelope: string;
   recipientSecretKey: Uint8Array;
@@ -403,7 +431,7 @@ export function openAutomationPayloadForMachine(input: {
   let ciphertext: Uint8Array;
   let envelope: Uint8Array;
   try {
-    if ((input.payloadVersion !== 1 && input.payloadVersion !== 4) || input.recipientSecretKey.length !== 32) return { ok: false, reason: 'malformed' };
+    if (![1, 4, 6].includes(input.payloadVersion) || input.recipientSecretKey.length !== 32) return { ok: false, reason: 'malformed' };
     ciphertext = input.crypto.decodeBase64(input.payloadCiphertext);
     envelope = input.crypto.decodeBase64(input.machineKeyEnvelope);
   } catch {
@@ -424,7 +452,7 @@ export function openAutomationPayloadForMachine(input: {
     const plaintext = input.crypto.secretBoxOpen(ciphertext.slice(1), opened.key);
     if (!plaintext) return { ok: false, reason: 'malformed' };
     const payload = automationPayloadSchema.safeParse(JSON.parse(new TextDecoder().decode(plaintext)));
-    if (!payload.success || (input.payloadVersion === 4) !== !!payload.data.conversation) return { ok: false, reason: 'malformed' };
+    if (!payload.success || input.payloadVersion !== (payload.data.contextPolicy ? 6 : payload.data.conversation ? 4 : 1)) return { ok: false, reason: 'malformed' };
     return { ok: true, payload: payload.data, authentication: opened.authentication };
   } catch {
     return { ok: false, reason: 'malformed' };
@@ -434,14 +462,14 @@ export function openAutomationPayloadForMachine(input: {
 }
 
 export async function decryptAutomationPayload(input: {
-  payloadVersion: 1 | 4;
+  payloadVersion: 1 | 4 | 6;
   payloadCiphertext: string;
   keyEnvelope: string;
   recipientSecretKey: Uint8Array;
   crypto: AutomationCryptoAdapter;
 }): Promise<AutomationPayload> {
   try {
-    if ((input.payloadVersion !== 1 && input.payloadVersion !== 4) || input.recipientSecretKey.length !== 32) throw new Error();
+    if (![1, 4, 6].includes(input.payloadVersion) || input.recipientSecretKey.length !== 32) throw new Error();
     const encryptedDek = openVersioned(input.keyEnvelope, input.crypto, ENVELOPE_BYTES);
     const dek = input.crypto.boxOpen(encryptedDek, input.recipientSecretKey);
     if (!dek || dek.length !== 32) throw new Error();
@@ -449,7 +477,7 @@ export async function decryptAutomationPayload(input: {
     const plaintext = input.crypto.secretBoxOpen(encryptedPayload, dek);
     if (!plaintext) throw new Error();
     const payload = automationPayloadSchema.parse(JSON.parse(new TextDecoder().decode(plaintext)));
-    if ((input.payloadVersion === 4) !== !!payload.conversation) throw new Error();
+    if (input.payloadVersion !== (payload.contextPolicy ? 6 : payload.conversation ? 4 : 1)) throw new Error();
     return payload;
   } catch {
     throw new Error('automation-decrypt-failed');

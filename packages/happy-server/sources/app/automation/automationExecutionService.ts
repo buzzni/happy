@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { Prisma, type AutomationRunOutcome, type Prisma as PrismaTypes } from '@prisma/client';
-import { AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION } from '@slopus/happy-wire';
+import { AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION, automationExecutionSessionId, isAutomationExecutionSessionId } from '@slopus/happy-wire';
 import { invalidateSessionFollowups } from './sessionFollowupInvalidationService';
 
 type Tx = PrismaTypes.TransactionClient;
@@ -416,6 +416,19 @@ export async function reportAutomationRun(
 ): Promise<Result<{ idempotent: boolean; status: string; outcome: AutomationRunOutcome | null; projectId: string }>> {
     const run = await claimedRun(tx, accountId, machineId, input.runId, input.claimToken);
     if (!run) return { ok: false, error: 'claim-not-found' };
+    const isolatedRun = run.automation.payloadVersion === 6 || !!run.displaySessionId
+        || !!run.executionCreateBodyHash || isAutomationExecutionSessionId(run.sessionId);
+    if (isolatedRun) {
+        // Registration, not a completion report, fixes the run's execution identity.
+        // Keep this check before ACK replay and after subsequent definition edits.
+        if (input.sessionId !== run.sessionId || (input.sessionId !== null
+            && (input.sessionId !== automationExecutionSessionId(run.id)
+                || !run.displaySessionId || !run.executionCreateBodyHash))) {
+            return { ok: false, error: 'report-conflict' };
+        }
+    } else if (isAutomationExecutionSessionId(input.sessionId)) {
+        return { ok: false, error: 'report-conflict' };
+    }
     if (run.reportId) {
         return run.reportId === input.reportId
             ? {
@@ -467,7 +480,11 @@ export async function reportAutomationRun(
     let changed;
     try {
         changed = await tx.automationRun.updateMany({
-            where: { id: run.id, reportId: null, status: { in: ['RUNNING', 'ABANDONED'] } },
+            where: { id: run.id, reportId: null, status: { in: ['RUNNING', 'ABANDONED'] },
+                displaySessionId: run.displaySessionId ?? null,
+                executionCreateBodyHash: run.executionCreateBodyHash ?? null,
+                ...(isolatedRun ? { sessionId: run.sessionId } : {}),
+            },
             data: {
                 reportId: input.reportId,
                 status: input.status,

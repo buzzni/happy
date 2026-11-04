@@ -223,8 +223,10 @@ export async function replaceAutomationViewerKeyIfUnused(
 function validateKeyVersions(
     project: ProjectAccess['project'],
     target: AutomationTarget,
-    input: Pick<AutomationPayloadInput, 'viewerKeyVersion' | 'machineKeyVersion'>,
+    input: Pick<AutomationPayloadInput, 'payloadVersion' | 'viewerKeyVersion' | 'machineKeyVersion'>,
 ): AutomationServiceError | null {
+    // The v6 contract is preparatory: a protocol number alone is not a verified execution capability.
+    if (input.payloadVersion === 6) return 'automation-run-unsupported';
     if (!project.automationViewerPublicKey || project.automationViewerKeyVersion < 1) {
         return 'viewer-key-unavailable';
     }
@@ -564,6 +566,9 @@ export async function updateAutomation(
     if (current.payloadVersion === 3) return { ok: false, error: 'invalid-payload-update' };
 
     const payloadUpdate = hasPayloadUpdate(input);
+    if (current.payloadVersion === 6 && (payloadUpdate || input.paused === false)) {
+        return { ok: false, error: 'automation-run-unsupported' };
+    }
     if (!payloadUpdate && input.paused === undefined) {
         return { ok: false, error: 'invalid-payload-update' };
     }

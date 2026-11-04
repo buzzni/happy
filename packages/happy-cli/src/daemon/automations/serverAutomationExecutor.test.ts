@@ -4290,6 +4290,39 @@ describe('host commands disallowed (Windows standalone runtime)', () => {
 })
 
 
+describe('isolated scheduled conversation admission', () => {
+  it('refuses an isolated policy without an isolated launcher instead of delivering into the manual session', async () => {
+    const f = setup({ claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-1' } } });
+    const base = f.input.decryptPayload(cacheRecord(), new Uint8Array(32));
+    f.input.decryptPayload = () => ({ ...base, conversation: { sessionId: 'manual' },
+      contextPolicy: { kind: 'isolated', reference: null } });
+    f.input.resolveMcpSpawnContext = async () => ({ ok: true, value: { mcpCallerGrant: 'grant',
+      mcpConfigProjectId: 'chat:c', bindingStatus: 'BOUND', connectorPolicy: 'optional', requiredConnectors: [] } });
+    const deliver = vi.fn(async () => ({ ok: true as const, sessionId: 'manual' }));
+    f.input.deliverConversation = deliver;
+    expect(await runServerAutomationTick(f.input)).toEqual([{ automationId: 'automation-1', outcome: 'ERROR' }]);
+    expect(deliver).not.toHaveBeenCalled();
+    expect(f.spawnSession).not.toHaveBeenCalled();
+    expect(f.resumeSession).not.toHaveBeenCalled();
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ failureCode: 'ISOLATED_CONTEXT_UNSUPPORTED' }));
+  });
+
+  it('keeps isolated cancellation pending without touching a manual or legacy session', async () => {
+    const f = setup();
+    const base = f.input.decryptPayload(cacheRecord(), new Uint8Array(32));
+    f.input.decryptPayload = () => ({ ...base, conversation: { sessionId: 'manual' },
+      contextPolicy: { kind: 'isolated', reference: null } });
+    const cache = f.input.cache.read();
+    f.input.cache.read = () => ({ ...cache, automations: [], pendingCancellations: [cacheRecord()] });
+    const state = f.store.read(); state.schedules[0].lastSessionId = 'previous-legacy-run'; f.store.write(state);
+    const cancel = vi.fn(async () => true); f.input.cancelScheduledSession = cancel;
+    const markCancelled = vi.fn(); f.input.cache.markCancelled = markCancelled;
+    await runServerAutomationTick(f.input);
+    expect(cancel).not.toHaveBeenCalled();
+    expect(markCancelled).not.toHaveBeenCalled();
+  });
+});
+
 describe('ordinary scheduled conversation execution', () => {
   it('keeps deletion pending until the sealed ordinary target is stopped, without resuming it', async () => {
     const f = setup(); const cache = f.input.cache.read(); const record = cacheRecord();
@@ -4751,6 +4784,18 @@ describe('unreachable pre-model retry', () => {
 })
 
 describe('pending report queue', () => {
+  it('replays an internal execution report without replacing the display chat session mapping', async () => {
+    const f = setup()
+    f.store.write({ ...f.store.read(), pendingReports: [{
+      runId: 'run-isolated', claimToken: 'claim', reportId: 'receipt-isolated', status: 'COMPLETED',
+      outcome: 'WOKE', sessionId: 'automation-run:run-isolated', detailCiphertext: null,
+    }] })
+    await runServerAutomationTick(f.input)
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-isolated' }))
+    expect(f.linkSession).not.toHaveBeenCalled()
+    expect(f.store.state().pendingReports).toEqual([])
+  })
+
   it('drops a report the server refuses for good and still sends the reports queued behind it', async () => {
     const f = setup()
     const state = f.store.read()

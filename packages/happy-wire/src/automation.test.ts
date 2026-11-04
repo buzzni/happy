@@ -231,6 +231,19 @@ describe('automation wire contract', () => {
       crypto,
     })).rejects.toThrow('automation-decrypt-failed');
   });
+
+  it('keeps existing payload versions and refuses relabeling them as isolated execution', async () => {
+    const crypto = fakeCrypto();
+    for (const original of [payload, { ...payload, conversation: { sessionId: 'manual-session' } }]) {
+      const encrypted = await encryptAutomationPayload({ payload: original,
+        viewer: { publicKey: bytes(32, 11), keyVersion: 2 },
+        machine: { publicKey: bytes(32, 13), keyVersion: 4 }, crypto });
+      expect(encrypted.payloadVersion).toBe('conversation' in original ? 4 : 1);
+      await expect(decryptAutomationPayload({ ...encrypted, payloadVersion: 6,
+        keyEnvelope: encrypted.viewerKeyEnvelope, recipientSecretKey: bytes(32, 11), crypto }))
+        .rejects.toThrow('automation-decrypt-failed');
+    }
+  });
 });
 
 describe('createAutomationApiClient', () => {

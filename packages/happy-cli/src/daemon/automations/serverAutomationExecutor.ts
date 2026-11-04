@@ -3,6 +3,7 @@ import type { AutomationProjectEnvironmentResult } from './automationProjectEnvi
 import { mergePullRequestFiles, type PullRequestFiles } from './queryGithubPullRequests'
 import { randomUUID } from 'node:crypto'
 import { buildScheduledRunPrompt } from '@/utils/scheduledRunPrompt'
+import { isAutomationExecutionSessionId } from '@slopus/happy-wire'
 
 import {
   buildAutomationPrompt,
@@ -476,7 +477,7 @@ const LINK_RETRY_GIVEUP_MS = 24 * 60 * 60 * 1000
  * 앞 대화다(대기 게이트) — 그 대화는 이미 연결됐으므로 건너뛴 회차가 다시 연결하지 않는다.
  */
 function reportLinksSession(report: PendingAutomationReport): report is PendingAutomationReport & { sessionId: string } {
-  return report.sessionId !== null && report.outcome !== 'SKIPPED_GATE'
+  return report.sessionId !== null && !isAutomationExecutionSessionId(report.sessionId) && report.outcome !== 'SKIPPED_GATE'
 }
 
 function isLinkStillRetryable(
@@ -1285,6 +1286,10 @@ async function executeStartedRun(
     trace.step = name
     if (input.signal?.aborted) throw new TickAbandonedError(name)
   }
+  // Never reinterpret a run-owned context policy as legacy conversation delivery.
+  if (payload.contextPolicy) {
+    return { outcome: 'ERROR', sessionId: null, failureCode: 'ISOLATED_CONTEXT_UNSUPPORTED' }
+  }
   if (input.hostCommandsAllowed === false && (payload.scriptCommand || payload.githubTrigger)) {
     input.logDebug?.(`[server-automation] ${automation.automationId} needs host commands, which this runtime does not allow`)
     return { outcome: 'ERROR', sessionId: null, failureCode: 'HOST_COMMANDS_UNSUPPORTED' }
@@ -1956,6 +1961,10 @@ export async function runServerAutomationTick(
   for (const cancelled of input.cache.read().pendingCancellations ?? []) {
     try {
       const payload = input.decryptPayload(cancelled, input.machineSecretKey)
+      if (payload.contextPolicy) {
+        input.logDebug?.(`[server-automation] ${cancelled.automationId} isolated cancellation pending: run-owned execution adapter unavailable`)
+        continue
+      }
       const sessionId = payload.conversation?.sessionId ?? input.runtimeStore.read().schedules.find(row => row.automationId === cancelled.automationId)?.lastSessionId
       if (sessionId && await input.cancelScheduledSession?.({ sessionId, directory: payload.directory })) {
         input.cache.markCancelled?.([{ automationId: cancelled.automationId, revision: cancelled.revision }])
