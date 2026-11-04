@@ -61,7 +61,7 @@ export class SessionWriteScopeFixture {
 
     constructor(readonly options: { provider: 'codex' | 'claude'; encryptionVariant: 'legacy' | 'dataKey'; automationStudioUrl?: string; databaseUrl?: string;
         serverEntry?: string; browserBridgeHost?: string; automationContextHost?: boolean;
-        beforeModelResponse?(body: string): Promise<void> } = { provider: 'codex', encryptionVariant: 'legacy' }) {}
+        beforeModelResponse?(body: string): Promise<void | { name: string; arguments: Record<string, unknown> }> } = { provider: 'codex', encryptionVariant: 'legacy' }) {}
     get modelHost() { return process.platform === 'linux' ? 'scope-model.test' : '127.0.0.1'; }
     get modelName() { return this.options.provider === 'codex' ? 'gpt-5.1-codex' : 'claude-sonnet-4-6'; }
     get providerIdentityField() { return this.options.provider === 'codex' ? 'codexThreadId' : 'claudeSessionId'; }
@@ -104,7 +104,7 @@ export class SessionWriteScopeFixture {
                 this.failures.push(`Unexpected local model route ${request.url}`); response.writeHead(404).end(); return;
             }
             this.modelRequests.push(body);
-            await this.options.beforeModelResponse?.(body);
+            const tool = await this.options.beforeModelResponse?.(body);
             const id = `resp_${randomUUID()}`, itemId = `msg_${randomUUID()}`;
             // Select only the latest input's marker, not markers in prior conversation history.
             const markers = [...body.matchAll(/scope-marker-[a-z0-9-]+/g)];
@@ -115,6 +115,28 @@ export class SessionWriteScopeFixture {
                 status: 'completed', output: [item], usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 } };
             response.writeHead(200, { 'Content-Type': 'text/event-stream' });
             const emit = (type: string, payload: Record<string, unknown>) => response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`);
+            if (tool) {
+                const argumentsJson = JSON.stringify(tool.arguments);
+                if (claude) {
+                    emit('message_start', { message: { id: itemId, type: 'message', role: 'assistant', model: 'claude-sonnet-4-6',
+                        content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 0 } } });
+                    emit('content_block_start', { index: 0, content_block: { type: 'tool_use', id, name: tool.name, input: {} } });
+                    emit('content_block_delta', { index: 0, delta: { type: 'input_json_delta', partial_json: argumentsJson } });
+                    emit('content_block_stop', { index: 0 });
+                    emit('message_delta', { delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: { output_tokens: 5 } });
+                    emit('message_stop', {});
+                } else {
+                    const call = { id: itemId, type: 'function_call', call_id: id, name: tool.name, arguments: argumentsJson, status: 'completed' };
+                    const toolResult = { ...result, output: [call] };
+                    emit('response.created', { response: { ...toolResult, status: 'in_progress', output: [] } });
+                    emit('response.output_item.added', { output_index: 0, item: { ...call, arguments: '', status: 'in_progress' } });
+                    emit('response.function_call_arguments.delta', { item_id: itemId, output_index: 0, delta: argumentsJson });
+                    emit('response.function_call_arguments.done', { item_id: itemId, output_index: 0, arguments: argumentsJson });
+                    emit('response.output_item.done', { output_index: 0, item: call });
+                    emit('response.completed', { response: toolResult });
+                }
+                response.end(); return;
+            }
             if (claude) {
                 const message = { id: itemId, type: 'message', role: 'assistant', model: 'claude-sonnet-4-6',
                     content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 0 } };

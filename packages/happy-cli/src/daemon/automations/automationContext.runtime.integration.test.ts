@@ -1,6 +1,6 @@
 import { expect, it, vi } from 'vitest'
 import { randomBytes, randomUUID } from 'node:crypto'
-import { mkdir, symlink } from 'node:fs/promises'
+import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { createServer } from 'node:http'
 import type { ChildProcess } from 'node:child_process'
@@ -45,11 +45,13 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
   { state: 'queued', provider: 'codex', encryptionVariant: 'legacy' },
   { state: 'queued', provider: 'claude', encryptionVariant: 'legacy' },
   { state: 'archived', provider: 'codex', encryptionVariant: 'legacy' },
-  { state: 'deleted', provider: 'claude', encryptionVariant: 'legacy' }] as const)(
+  { state: 'deleted', provider: 'claude', encryptionVariant: 'legacy' },
+  { state: 'background', provider: 'codex', encryptionVariant: 'legacy' },
+  { state: 'background', provider: 'claude', encryptionVariant: 'legacy' }] as const)(
   'restores a durable $state $provider $encryptionVariant occurrence through the real daemon without replaying or ignoring a stop', async ({ state, provider, encryptionVariant }) => {
   const chatStopped = state === 'archived' || state === 'deleted'
   const shouldRun = state !== 'paused' && !chatStopped
-  const isManual = state === 'manual' || state === 'queued'
+  const isManual = state === 'manual' || state === 'queued' || state === 'background'
   vi.stubEnv('HAPPY_SCOPE_FRESH_PROVIDER_STATE', '1')
   vi.stubEnv('HAPPY_SCOPE_PACKAGED_SERVER', undefined)
   vi.stubEnv('HAPPY_SCOPE_INSTALLED_CLI', undefined)
@@ -63,6 +65,12 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
     responseGates.set(queuedMarker, new Promise<void>(resolve => { releaseSecond = resolve }))
   }
   const calls: string[] = []
+  let backgroundIssued = false
+  const backgroundPath = (name: string) => join(fixture.project, `context-background-${name}`)
+  const backgroundFile = async (name: string, expected: string) => {
+    try { return await readFile(backgroundPath(name), 'utf8') === expected ? true : undefined }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
+  }
   // Scoped Studio facade: real Happy admission is still checked on every target proof.
   const studio = createServer(async (request, response) => {
     const reply = (status: number, value: unknown) => response.writeHead(status, { 'Content-Type': 'application/json' }).end(JSON.stringify(value))
@@ -102,7 +110,19 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
   const origin = `http://127.0.0.1:${(studio.address() as { port: number }).port}`
   fixture = new SessionWriteScopeFixture({ provider, encryptionVariant,
     serverEntry: 'sources/testing/automationContextFixture.ts', browserBridgeHost: '::1', automationContextHost: true, automationStudioUrl: origin,
-    beforeModelResponse: async body => { await responseGates.get([...body.matchAll(/scope-marker-[a-z0-9-]+/g)].at(-1)?.[0] ?? '') } })
+    beforeModelResponse: async body => {
+      await responseGates.get([...body.matchAll(/scope-marker-[a-z0-9-]+/g)].at(-1)?.[0] ?? '')
+      if (state !== 'background' || backgroundIssued || !body.includes(manualMarker)) return
+      const tools = JSON.parse(body).tools as Array<{ name?: string }>
+      const name = tools?.find(tool => tool.name === (provider === 'claude' ? 'Bash' : 'exec_command'))?.name
+      // Auxiliary title requests have no native tools; only the authored turn starts this command.
+      if (!name) return
+      backgroundIssued = true
+      const quote = (value: string) => "'" + value.replace(/'/g, "'\\''") + "'"
+      const command = `printf started > ${quote(backgroundPath('started'))}; while [ -d ${quote(fixture.project)} ] && [ ! -f ${quote(backgroundPath('release'))} ]; do sleep 0.05; done; printf done > ${quote(backgroundPath('done'))}`
+      return { name, arguments: provider === 'claude' ? { command, run_in_background: true }
+        : { cmd: command, yield_time_ms: 1000, max_output_tokens: 1000 } }
+    } })
   let failure: unknown
   try {
     await fixture.start()
@@ -116,6 +136,11 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
         await eventually(async () => fixture.modelRequests.some(body => body.includes(manualMarker)) ? true : undefined, 'manual input reaches the native model')
         await fixture.send(manualSessionId, queuedMarker)
       } else await fixture.waitReply(manualSessionId, manualMarker)
+      if (state === 'background') {
+        expect(backgroundIssued).toBe(true)
+        await eventually(() => backgroundFile('started', 'started'), 'actual native background command starts')
+        expect(await backgroundFile('done', 'done')).toBeUndefined()
+      }
       originalNativeId = (await fixture.session(manualSessionId)).metadata[fixture.providerIdentityField]
       expect(originalNativeId).toBeTruthy()
     }
@@ -162,6 +187,14 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
             'x-chat-automation-proof': signChatAutomationLifecycle({ projectId: run.projectId, actorUserId: 'fixture-owner',
               bearer: fixture.token, state, secret, now: Date.now() }) }, body: JSON.stringify({ state }), signal: AbortSignal.timeout(10_000) })
         expect(response.status).toBe(200)
+      }
+      if (state === 'background') {
+        await eventually(async () => calls.includes('/api/automation/mcp-caller-grant') ? true : undefined, 'daemon attempts admission after the manual answer while background work is live')
+        expect(await backgroundFile('done', 'done')).toBeUndefined()
+        expect(await journal.read(runId)).toMatchObject({ phase: 'registered', deferredDispatch: 'queued' })
+        expect(fixture.modelRequests.some(body => body.includes(marker))).toBe(false)
+        await writeFile(backgroundPath('release'), 'release')
+        await eventually(() => backgroundFile('done', 'done'), 'actual native background command completes')
       }
       if (state === 'queued') {
         const grantCalls = () => calls.filter(path => path === '/api/automation/mcp-caller-grant').length
@@ -232,6 +265,9 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
   } catch (error) { failure = new Error(`Deferred daemon failed:\n${await fixture.diagnostics().catch(() => 'Diagnostics unavailable')}`, { cause: error }) }
   finally {
     releaseFirst(); releaseSecond()
+    if (state === 'background' && fixture.project) await writeFile(backgroundPath('release'), 'release').catch(() => {
+      fixture.failures.push('Disposable background release failed before owned fixture cleanup')
+    })
     try { await fixture.close() } catch (error) { failure = failure ? new AggregateError([failure, error]) : error }
     studio.closeAllConnections(); await new Promise<void>(resolve => studio.close(() => resolve()))
     vi.unstubAllEnvs()
