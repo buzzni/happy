@@ -7,7 +7,7 @@ import { withOwnedFileLock, FileLockHeldError } from './ownedFileLock';
 import { readCurrentBootIdSync } from './bootIdentity';
 
 const ownerSchema = z.strictObject({
-  token: z.string().uuid(), sessionId: z.string().min(1).max(200), kind: z.enum(['manual', 'automation']),
+  token: z.string().uuid(), sessionId: z.string().min(1).max(200), kind: z.enum(['manual', 'manual-launch', 'automation']),
   pid: z.number().int().positive(), bootId: z.string().min(1).nullable(), acquiredAt: z.number().int().nonnegative(),
   roots: z.array(z.string().min(1).refine(isAbsolute)).min(1).max(256),
 });
@@ -32,7 +32,7 @@ const overlaps = (a: string, b: string) => {
  * boot can release one. Hosts must leave uncertain ownership visible and keep pending inputs queued.
  */
 export function createWorkspaceTurnAdmission(input: {
-  home: string; sessionId: string; kind: 'manual' | 'automation'; roots: readonly string[];
+  home: string; sessionId: string; kind: 'manual' | 'manual-launch' | 'automation'; roots: readonly string[];
   /** Test seam. Null is unknown, not permission to reclaim. */
   bootId?: string | null;
 }) {
@@ -121,7 +121,8 @@ export function createWorkspaceTurnAdmission(input: {
         throw error;
       }
     },
-    /** False retains ownership. Only provider-owned foreground AND background observations may pass true. */
+    /** Runtime owners need foreground AND background quiescence. A manual-launch reservation instead
+     * needs proven non-submission or handoff to the tracked-session gate, which automation checks again. */
     async release(quiescent: boolean): Promise<boolean> {
       if (!quiescent) return false;
       await prepare();
