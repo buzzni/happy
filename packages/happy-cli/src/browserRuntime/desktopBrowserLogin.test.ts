@@ -1,4 +1,5 @@
 import { createServer } from 'node:http'
+import { randomBytes } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -9,7 +10,7 @@ const cleanup: Array<() => Promise<void>> = []
 afterEach(async () => { for (const close of cleanup.splice(0)) await close() })
 it('checks a live scoped login on every admission and denies cached credentials after app loss', async () => {
     const root = await mkdtemp(join(tmpdir(), 'bcl-'))
-    const descriptor = { ...scope, protocol: 1, socketPath: join(root, 'relay.sock'), secret: 's'.repeat(43), loginId: 'l'.repeat(43) }
+    const descriptor = { ...scope, protocol: 1, socketPath: process.platform === 'win32' ? '\\\\.\\pipe\\saycode-browser-login-' + randomBytes(32).toString('hex') : join(root, 'relay.sock'), secret: 's'.repeat(43), loginId: 'l'.repeat(43) }
     let loggedIn = true, denied = false
     const server = createServer((req, res) => {
         res.writeHead(loggedIn && !denied && req.headers['x-saycode-browser-login'] === descriptor.secret ? 200 : 403)
