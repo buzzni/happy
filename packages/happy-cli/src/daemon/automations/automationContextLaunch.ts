@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import { createHash } from 'node:crypto'
-import { SessionExecutionCreateBodySchema, automationExecutionSessionId, isAutomationExecutionSessionId, type AutomationPayload } from '@slopus/happy-wire'
+import { SessionExecutionCreateBodySchema, automationExecutionSeedSchema, automationExecutionSessionId, isAutomationExecutionSessionId, type AutomationPayload } from '@slopus/happy-wire'
 import type { ApiClient } from '@/api/api'
 import type { Metadata, Session } from '@/api/types'
 import type { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/registerCommonHandlers'
@@ -49,6 +49,9 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
     const { directory, model, effort } = input.payload, agent = input.payload.agent as 'claude' | 'codex'
     const sessionId = automationExecutionSessionId(runId), displaySessionId = input.payload.conversation!.sessionId
     if (isAutomationExecutionSessionId(displaySessionId)) throw new Error('AUTOMATION_LAUNCH_IDENTITY_CONFLICT')
+    const executionSeed = automationExecutionSeedSchema.parse({ version: 1, automationId, generation, revision, runId, displaySessionId,
+      question: input.payload.prompt, inputBytes: seed.inputBytes, referenceBytes: seed.referenceBytes, references: seed.references,
+      inputSha256: createHash('sha256').update(seed.initialPrompt).digest('hex'), wholeContextTokens: 'unknown' })
     const requestHash = digest({ automationId, generation, revision, runId, displaySessionId, directory, agent,
       model: model ?? null, effort: effort ?? null, seed })
     const publicResult = (state: 'started' | 'needs-attention') => ({ state, sessionId, displaySessionId })
@@ -67,6 +70,7 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
       if (!record) {
         const { metadata, state } = createSessionMetadata({ flavor: agent, machineId: deps.machineId, startedBy: 'daemon', source: 'schedule' })
         metadata.path = directory
+        metadata.automationExecutionSeed = executionSeed
         const prepared = deps.api.prepareSessionCreation({ tag: sessionId, metadata, state })
         record = { version: 1, scope, requestHash, automationId, generation, revision, runId, displaySessionId, sessionId, phase: 'prepared',
           prepared: { ...prepared, encryptionKey: encodeBase64(prepared.encryptionKey) } }
@@ -78,6 +82,7 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
       const state = prepared.body.agentState ? decrypt(encryptionKey, prepared.encryptionVariant, decodeBase64(prepared.body.agentState)) : null
       if (encryptionKey.length !== 32 || prepared.body.tag !== sessionId || metadata?.path !== directory || metadata.machineId !== deps.machineId
         || metadata.flavor !== agent || metadata.claudeSessionId || metadata.codexThreadId || metadata.parentSessionId || metadata.forkedFromMessageId
+        || digest(metadata.automationExecutionSeed) !== digest(executionSeed)
         || !z.strictObject({ controlledByUser: z.literal(false) }).safeParse(state).success) throw new Error('AUTOMATION_LAUNCH_SNAPSHOT_INVALID')
       const registered = await deps.register(structuredClone(input), structuredClone(prepared))
       if (registered.id !== sessionId || registered.seq !== 0 || registered.encryptionVariant !== prepared.encryptionVariant

@@ -3,6 +3,7 @@ export * from './legacyProtocol';
 export * from './sessionProtocol';
 export * from './voice';
 export * from './automation';
+export * from './automationExecutionRecord';
 export * from './scriptAutomation';
 export * from './scriptSchedule';
 export * from './scriptCrypto';

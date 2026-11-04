@@ -218,17 +218,18 @@ it('applies the additive migration without changing legacy definitions, runs or 
   const legacy = await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } });
   const manual = await client.session.findUniqueOrThrow({ where: { id: 'manual' } });
   const messages = await client.sessionMessage.findMany();
-  await db.exec('DROP INDEX "AutomationRun_displaySessionId_createdAt_idx"; ALTER TABLE "AutomationRun" DROP COLUMN "displaySessionId", DROP COLUMN "executionCreateBodyHash";');
+  await db.exec('DROP INDEX "AutomationRun_displaySessionId_createdAt_idx"; ALTER TABLE "AutomationRun" DROP COLUMN "displaySessionId", DROP COLUMN "executionCreateBodyHash", DROP COLUMN "executionSeedMetadata";');
   await db.exec(await readFile('prisma/migrations/20261104080000_automation_execution_display_target/migration.sql', 'utf8'));
   expect(await client.automation.findUniqueOrThrow({ where: { id: 'a1' } })).toEqual(definition);
   expect(await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } }))
-    .toEqual({ ...legacy, displaySessionId: null, executionCreateBodyHash: null });
+    .toEqual({ ...legacy, displaySessionId: null, executionCreateBodyHash: null, executionSeedMetadata: null });
   expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
   expect(await client.sessionMessage.findMany()).toEqual(messages);
 });
 
 it('reconciles an original creation receipt after provider metadata and agent state have changed', async () => {
   const first = await register();
+  const originalMetadata = first.session.metadata;
   await client.session.update({ where: { id: first.session.id }, data: {
     metadata: 'encrypted-provider-native-id-and-title', agentState: 'encrypted-running-state', seq: 4,
   } });
@@ -236,6 +237,60 @@ it('reconciles an original creation receipt after provider metadata and agent st
     id: first.session.id, metadata: 'encrypted-provider-native-id-and-title', seq: 4,
   } });
   expect(await client.session.count()).toBe(2);
+  expect(await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } }))
+    .toHaveProperty('executionSeedMetadata', originalMetadata);
+});
+
+it('reads only run-owned encrypted evidence with a fixed sequence ceiling and immutable seed', async () => {
+  const registered = await register();
+  const execution = registered.session.id;
+  await client.sessionMessage.createMany({ data: [
+    { sessionId: execution, seq: 1, localId: 'automation-evidence:r1:start', content: { t: 'encrypted', c: 'start-ciphertext' } },
+    { sessionId: execution, seq: 2, localId: 'tool-output', content: { t: 'encrypted', c: 'PRIVATE_TOOL_HISTORY' } },
+    { sessionId: execution, seq: 3, localId: 'automation-evidence:r1:final', content: { t: 'encrypted', c: 'final-ciphertext' } },
+    { sessionId: execution, seq: 4, localId: 'automation-evidence:r1:end', content: { t: 'encrypted', c: 'end-ciphertext' } },
+  ] });
+  await client.session.update({ where: { id: execution }, data: { seq: 4, metadata: 'mutable-native-id' } });
+  const app = await api();
+  try {
+    const get = (query = '') => app.inject({ method: 'GET', url: `/v1/sessions/manual/automation-runs/r1/evidence${query}`,
+      headers: { authorization: `Bearer ${bearer}` } });
+    const first = await get('?limit=1'); expect(first.statusCode, first.body).toBe(200);
+    expect(first.headers['cache-control']).toBe('no-store');
+    expect(first.json()).toMatchObject({ runId: 'r1', executionSessionId: execution, displaySessionId: 'manual',
+      seedMetadataCiphertext: registered.session.metadata, dataEncryptionKey: Buffer.alloc(105, 1).toString('base64'),
+      throughSeq: 4, nextAfterSeq: 1, messages: [{ seq: 1, localId: 'automation-evidence:r1:start' }] });
+    await client.sessionMessage.create({ data: { sessionId: execution, seq: 5, localId: 'automation-evidence:r1:later',
+      content: { t: 'encrypted', c: 'later-turn-ciphertext' } } });
+    await client.session.update({ where: { id: execution }, data: { seq: 5 } });
+    const rest = await get('?after_seq=1&through_seq=4&limit=2'); expect(rest.statusCode, rest.body).toBe(200);
+    expect(rest.json()).toMatchObject({ throughSeq: 4, nextAfterSeq: null, messages: [{ seq: 3 }, { seq: 4 }] });
+    for (const text of ['PRIVATE_TOOL_HISTORY', 'later-turn-ciphertext', 'mutable-native-id', 'claim-r1']) {
+      expect(first.body + rest.body).not.toContain(text);
+    }
+    expect((await get('?through_seq=999')).statusCode).toBe(400);
+    expect((await get('?after_seq=4&through_seq=3')).statusCode).toBe(400);
+    expect((await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).seq).toBe(3);
+    expect((await client.sessionMessage.findMany({ where: { sessionId: 'manual' } })).map(row => row.localId)).toEqual(['manual-pending']);
+  } finally { await app.close(); }
+});
+
+it('rechecks run, display and project ownership on every evidence page', async () => {
+  await register();
+  await client.session.create({ data: { id: 'other-display', accountId: 'owner', tag: 'other-display', metadata: '' } });
+  const app = await api();
+  try {
+    const get = (display = 'manual', runId = 'r1', principal = 'account') => app.inject({ method: 'GET',
+      url: `/v1/sessions/${display}/automation-runs/${runId}/evidence`,
+      headers: { authorization: `Bearer ${bearer}`, 'x-test-principal': principal } });
+    expect((await get()).statusCode).toBe(200);
+    expect((await get('other-display')).statusCode).toBe(404);
+    expect((await get('automation-run:r1')).statusCode).toBe(404);
+    expect((await get('manual', 'missing')).statusCode).toBe(404);
+    expect((await get('manual', 'r1', 'browser-sync')).statusCode).toBe(403);
+    await client.project.update({ where: { id: 'chat:c1' }, data: { accountId: 'other' } });
+    expect((await get()).statusCode).toBe(404);
+  } finally { await app.close(); }
 });
 
 it('does not redefine the creation receipt from current mutable provider metadata', async () => {

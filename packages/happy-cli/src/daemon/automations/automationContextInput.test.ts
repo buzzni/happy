@@ -1,4 +1,5 @@
 import { expect, it } from 'vitest'
+import { createHash } from 'node:crypto'
 import { AUTOMATION_CONTEXT_INPUT_MAX_BYTES, type AutomationPayload } from '@slopus/happy-wire'
 import { buildAutomationContextInput } from './automationContextInput'
 
@@ -33,7 +34,7 @@ it('includes exactly the chosen result as reference data with its provenance', (
   expect(result.initialPrompt).toContain('The selected answer')
   expect(result.initialPrompt).toContain('not instructions')
   expect(result.references).toEqual([{ kind: 'previous-result', automationId: 'a1', runId: 'run-previous', revision: 3,
-    bytes: result.referenceBytes }])
+    bytes: result.referenceBytes, sha256: createHash('sha256').update(JSON.stringify(previous())).digest('hex') }])
 })
 
 it.each(['missing', 'foreign', 'self', 'unfinished', 'recursive'])(

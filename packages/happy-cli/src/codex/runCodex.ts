@@ -2011,7 +2011,7 @@ export async function runCodex(opts: {
                 currentRequestId: codexCurrentRequestId,
                 providerTurnToProtocol: codexProviderTurnToProtocol,
             };
-            const mapped = mapCodexMcpMessageToSessionEnvelopes(msg, turnState, inputEvidenceEnabled);
+            const mapped = mapCodexMcpMessageToSessionEnvelopes(msg, turnState, inputEvidenceEnabled, isAutomationExecutionSessionId(session.sessionId));
             if (mapped.envelopes.some(envelope => envelope.ev.t === 'turn-start' || envelope.ev.t === 'turn-end')) dispatchedWithoutStart = false;
             codexPendingRequestId = turnState.pendingRequestId ?? null;
             codexCurrentRequestId = turnState.currentRequestId ?? null;

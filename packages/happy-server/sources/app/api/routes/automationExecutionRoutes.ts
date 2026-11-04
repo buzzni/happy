@@ -7,11 +7,33 @@ import { isServerBackedAutomationEnabled } from '@/app/automation/automationRoll
 import { createAutomationExecutionSession, automationExecutionSessionRequestSchema,
   AutomationExecutionSessionError } from '@/app/automation/automationExecutionSession';
 import { ExecutionBindingError } from '@/app/session/sessionExecutionBinding';
-import { listAutomationExecutionPage } from '@/app/automation/automationExecutionPage';
+import { listAutomationExecutionPage, readAutomationExecutionEvidencePage } from '@/app/automation/automationExecutionPage';
 import { db } from '@/storage/db';
 
 /** Registers a run-owned session; provider start remains a separate, journaled operation. */
 export function automationExecutionRoutes(app: Fastify) {
+  app.get('/v1/sessions/:displaySessionId/automation-runs/:runId/evidence', {
+    preHandler: app.authenticate,
+    schema: { params: z.strictObject({ displaySessionId: z.string().min(1).max(200), runId: z.string().regex(/^[A-Za-z0-9_-]{1,160}$/) }),
+      querystring: z.strictObject({ limit: z.coerce.number().int().min(1).max(100).default(50),
+        after_seq: z.coerce.number().int().min(0).max(2_147_483_647).default(0),
+        through_seq: z.coerce.number().int().min(0).max(2_147_483_647).optional() }) },
+  }, async (request, reply) => {
+    if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
+    if (!isServerBackedAutomationEnabled()) return reply.code(404).send({ error: 'feature-disabled' });
+    try {
+      const page = await readAutomationExecutionEvidencePage(db, request.userId, request.params.displaySessionId,
+        request.params.runId, request.query);
+      if (!page) return reply.code(404).send({ error: 'not-found' });
+      return reply.header('Cache-Control', 'no-store').send(page);
+    } catch (error) {
+      if (error instanceof Error && error.message === 'invalid-automation-evidence-cursor') {
+        return reply.code(400).send({ error: error.message });
+      }
+      throw error;
+    }
+  });
+
   app.get('/v1/sessions/:displaySessionId/automation-runs', {
     preHandler: app.authenticate,
     schema: { params: z.strictObject({ displaySessionId: z.string().min(1).max(200) }),

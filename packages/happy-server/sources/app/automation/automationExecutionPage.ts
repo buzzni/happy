@@ -1,5 +1,5 @@
 import type { Prisma } from '@prisma/client';
-import { isAutomationExecutionSessionId } from '@slopus/happy-wire';
+import { automationExecutionSessionId, isAutomationExecutionSessionId } from '@slopus/happy-wire';
 
 /** Display projection only. Reading it never appends messages to the manual provider input. */
 export async function listAutomationExecutionPage(tx: Prisma.TransactionClient, accountId: string,
@@ -20,7 +20,7 @@ export async function listAutomationExecutionPage(tx: Prisma.TransactionClient, 
       automation: { project: { OR: [{ accountId }, { members: { some: { accountId, status: 'accepted' } } }] } },
       ...(after ? { OR: [{ createdAt: { lt: after.createdAt } }, { createdAt: after.createdAt, id: { lt: after.id } }] } : {}),
     },
-    select: { id: true, automationId: true, generation: true, displaySessionId: true, sessionId: true,
+    select: { id: true, automationId: true, generation: true, displaySessionId: true, sessionId: true, executionSeedMetadata: true,
       createdAt: true, scheduledFor: true, status: true, outcome: true, failureCode: true, startedAt: true, completedAt: true,
       automation: { select: { projectId: true } } },
     orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take: input.limit + 1,
@@ -28,10 +28,40 @@ export async function listAutomationExecutionPage(tx: Prisma.TransactionClient, 
   const page = rows.slice(0, input.limit), last = page.at(-1);
   return { runs: page.map(row => ({ id: row.id, automationId: row.automationId, projectId: row.automation.projectId,
     generation: row.generation, displaySessionId: row.displaySessionId, executionSessionId: row.sessionId,
+    seedMetadataCiphertext: row.executionSeedMetadata,
     // COMPLETED/WOKE means dispatch accepted, not proof that the native model finished its answer.
     schedulerStatus: row.status, outcome: row.outcome, failureCode: row.failureCode,
     scheduledFor: row.scheduledFor.getTime(), dispatchedAt: row.startedAt?.getTime() ?? null,
     dispatchReportedAt: row.completedAt?.getTime() ?? null,
   })), nextCursor: rows.length > input.limit && last
     ? Buffer.from(JSON.stringify([last.createdAt.getTime(), last.id])).toString('base64url') : null };
+}
+
+/** The server selects opaque boundary receipts, never decrypting or inferring a model answer. */
+export async function readAutomationExecutionEvidencePage(tx: Prisma.TransactionClient, accountId: string,
+  displaySessionId: string, runId: string, input: { limit: number; after_seq: number; through_seq?: number }) {
+  if (isAutomationExecutionSessionId(displaySessionId)
+    || !await tx.session.findFirst({ where: { id: displaySessionId, accountId }, select: { id: true } })) return null;
+  const run = await tx.automationRun.findFirst({
+    where: { id: runId, displaySessionId, machineAccountId: accountId, executionCreateBodyHash: { not: null },
+      executionSeedMetadata: { not: null },
+      automation: { project: { OR: [{ accountId }, { members: { some: { accountId, status: 'accepted' } } }] } } },
+    select: { id: true, automationId: true, generation: true, sessionId: true, executionSeedMetadata: true },
+  });
+  if (!run || run.sessionId !== automationExecutionSessionId(runId)) return null;
+  const session = await tx.session.findFirst({ where: { id: run.sessionId, accountId },
+    select: { seq: true, dataEncryptionKey: true } });
+  if (!session) return null;
+  const throughSeq = input.through_seq ?? session.seq;
+  if (throughSeq > session.seq || input.after_seq > throughSeq) throw new Error('invalid-automation-evidence-cursor');
+  const rows = await tx.sessionMessage.findMany({ where: { sessionId: run.sessionId,
+    seq: { gt: input.after_seq, lte: throughSeq }, localId: { startsWith: `automation-evidence:${runId}:` } },
+    orderBy: { seq: 'asc' }, take: input.limit + 1,
+    select: { id: true, seq: true, localId: true, content: true, createdAt: true } });
+  const messages = rows.slice(0, input.limit);
+  return { runId, automationId: run.automationId, generation: run.generation, displaySessionId, executionSessionId: run.sessionId,
+    seedMetadataCiphertext: run.executionSeedMetadata,
+    dataEncryptionKey: session.dataEncryptionKey ? Buffer.from(session.dataEncryptionKey).toString('base64') : null,
+    throughSeq, messages: messages.map(row => ({ ...row, createdAt: row.createdAt.getTime() })),
+    nextAfterSeq: rows.length > input.limit ? messages.at(-1)!.seq : null };
 }

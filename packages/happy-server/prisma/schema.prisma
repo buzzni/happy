@@ -638,6 +638,7 @@ model AutomationRun {
     /// Immutable result destination for isolated execution; sessionId owns the provider run.
     displaySessionId  String?
     executionCreateBodyHash String?
+    executionSeedMetadata String?
     outcome           AutomationRunOutcome?
     detailCiphertext  Bytes?
     failureCode       String?

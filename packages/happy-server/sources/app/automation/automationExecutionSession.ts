@@ -70,7 +70,8 @@ export async function createAutomationExecutionSession(accountId: string, bearer
     if (!display) return refuse();
     if ((run.sessionId && run.sessionId !== sessionId)
       || (run.displaySessionId && run.displaySessionId !== input.displaySessionId)
-      || (run.executionCreateBodyHash && run.executionCreateBodyHash !== bodyHash)) return conflict();
+      || (run.executionCreateBodyHash && run.executionCreateBodyHash !== bodyHash)
+      || (run.executionSeedMetadata && run.executionSeedMetadata !== input.body.metadata)) return conflict();
     return { run, target };
   }
 
@@ -89,8 +90,10 @@ export async function createAutomationExecutionSession(accountId: string, bearer
       id: run.id, claimTokenHash, status: 'RUNNING', runLeaseExpiresAt: { gte: clock() },
       AND: [{ OR: [{ sessionId: null }, { sessionId }] },
         { OR: [{ displaySessionId: null }, { displaySessionId: input.displaySessionId }] },
-        { OR: [{ executionCreateBodyHash: null }, { executionCreateBodyHash: bodyHash }] }],
-    }, data: { sessionId, displaySessionId: input.displaySessionId, executionCreateBodyHash: bodyHash } });
+        { OR: [{ executionCreateBodyHash: null }, { executionCreateBodyHash: bodyHash }] },
+        { OR: [{ executionSeedMetadata: null }, { executionSeedMetadata: input.body.metadata }] }],
+    }, data: { sessionId, displaySessionId: input.displaySessionId, executionCreateBodyHash: bodyHash,
+      executionSeedMetadata: input.body.metadata } });
     if (changed.count !== 1) return conflict();
     return run;
   }

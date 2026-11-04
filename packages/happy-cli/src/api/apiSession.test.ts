@@ -249,6 +249,48 @@ describe('ApiSessionClient v3 messages API migration', () => {
         mockIo.mockReturnValue(mockSocket);
     });
 
+    it.each([false, true])('isolated run rejects external text and attachments before queue admission (buffered=%s)', async buffered => {
+        session.id = 'automation-run:run-A';
+        const client = new ApiSessionClient('fake-token', session);
+        const onUser = vi.fn(), onFile = vi.fn();
+        const queueInput = vi.spyOn(client as any, 'queueInput');
+        if (!buffered) { client.onUserMessage(onUser); client.onFileEvent(onFile); }
+        try {
+            (client as any).routeIncomingMessage({ role: 'user', content: { type: 'text', text: 'injected manual input' } });
+            (client as any).routeIncomingMessage({ role: 'session', content: { type: 'session', data: { id: 'file-A', time: 1, role: 'user', ev: {
+                t: 'file', ref: 'private-blob', size: 3, name: 'private.txt',
+            } } } });
+            if (buffered) { client.onUserMessage(onUser); client.onFileEvent(onFile); }
+            expect(onUser).not.toHaveBeenCalled();
+            expect(onFile).not.toHaveBeenCalled();
+            expect(queueInput).not.toHaveBeenCalled();
+            expect(logger.warn).toHaveBeenCalled();
+        } finally { await client.close(); }
+    });
+
+    it.each([false, true])('persists full isolated final evidence without changing ordinary opt-in (isolated=%s)', async isolated => {
+        if (isolated) session.id = 'automation-run:run-A';
+        const client = new ApiSessionClient('fake-token', session);
+        const enqueue = vi.spyOn(client as any, 'enqueueMessage').mockImplementation(() => undefined);
+        const fullAnswer = 'answer '.repeat(500);
+        try {
+            client.sendClaudeSessionMessage({ type: 'assistant', uuid: 'assistant-A', message: { role: 'assistant',
+                content: [{ type: 'text', text: 'checking' }] } } as any);
+            client.sendFinalAnswerForChannelTurn(fullAnswer);
+            client.closeClaudeSessionTurn('completed');
+            const messages = enqueue.mock.calls.map(([message, , localId]) => ({ message: message as any, localId }));
+            const final = messages.find(({ message }) => message.content?.ev.t === 'final-answer');
+            if (!isolated) { expect(final).toBeUndefined(); return; }
+            expect(final?.message.content.ev).toEqual({ t: 'final-answer', text: fullAnswer });
+            const boundaries = messages.filter(({ message }) => ['turn-start', 'final-answer', 'turn-end'].includes(message.content?.ev.t));
+            expect(boundaries.map(({ message }) => message.content.ev.t)).toEqual(['turn-start', 'final-answer', 'turn-end']);
+            expect(new Set(boundaries.map(({ message }) => message.content.turn)).size).toBe(1);
+            for (const { message, localId } of boundaries) {
+                expect(localId).toBe(`automation-evidence:run-A:${message.content.id}`);
+            }
+        } finally { await client.close(); }
+    });
+
     async function evidenceMetadataHost(enabled = true, flavor = 'claude') {
         session.metadata = inputEvidenceMetadata({ ...session.metadata, flavor }, enabled);
         let server: Metadata = session.metadata;

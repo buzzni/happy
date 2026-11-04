@@ -26,7 +26,7 @@ import { hostManagedMachineTools } from '../modules/common/moaiMachineRunProfile
 import { calculateCost } from '@/utils/pricing';
 import { shouldReconnect } from '@/utils/lidState';
 import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_NOT_READY_POLL_MS, reconnectDelayMs } from '@/api/reconnectCadence';
-import { bindRpcRequest, createEnvelope, readBoundRpcResponse, type CreateEnvelopeOptions, type SessionEnvelope, type SessionTurnEndStatus } from '@slopus/happy-wire';
+import { AUTOMATION_EXECUTION_SESSION_PREFIX, automationExecutionEvidenceLocalId, isAutomationExecutionSessionId, bindRpcRequest, createEnvelope, readBoundRpcResponse, type CreateEnvelopeOptions, type SessionEnvelope, type SessionTurnEndStatus } from '@slopus/happy-wire';
 import {
     closeClaudeTurnWithStatus,
     observeClaudeBackgroundInput,
@@ -1155,6 +1155,10 @@ export class ApiSessionClient extends EventEmitter {
     private routeIncomingMessage(message: unknown, serverMessageId?: string, serverSeq?: number) {
         const userResult = UserMessageSchema.safeParse(message);
         if (userResult.success) {
+            if (isAutomationExecutionSessionId(this.sessionId)) {
+                logger.warn('[API] Rejected external text for an isolated automation execution');
+                return;
+            }
             const incoming: UserMessage = serverMessageId
                 ? { ...userResult.data, serverMessageId, serverSeq }
                 : userResult.data;
@@ -1184,6 +1188,10 @@ export class ApiSessionClient extends EventEmitter {
         // Check for file events (image attachments from app)
         const fileResult = FileEventMessageSchema.safeParse(message);
         if (fileResult.success) {
+            if (isAutomationExecutionSessionId(this.sessionId)) {
+                logger.warn('[API] Rejected external attachment for an isolated automation execution');
+                return;
+            }
             const ev = fileResult.data.content.data.ev;
             logger.debug('[API] Received file event', {
                 size: ev.size,
@@ -1765,10 +1773,11 @@ export class ApiSessionClient extends EventEmitter {
         this.automationTurns.noteFinalAnswer(text);
         const mapped = mapClaudeChannelFinalAnswer(this.claudeSessionProtocolState, text);
         const turn = this.claudeSessionProtocolState.currentTurnId;
-        const envelopes = mapped.envelopes.length || !this.inputEvidenceSupported || typeof text !== 'string' || !text.trim()
+        const recordFinal = this.inputEvidenceSupported || isAutomationExecutionSessionId(this.sessionId);
+        const envelopes = mapped.envelopes.length || !recordFinal || typeof text !== 'string' || !text.trim()
             ? mapped.envelopes : turn
                 ? [createEnvelope('agent', { t: 'final-answer', text }, { turn })]
-                : [this.inputEvidence.unmappedFinalEvidence()];
+                : this.inputEvidenceSupported ? [this.inputEvidence.unmappedFinalEvidence()] : [];
         this.enqueueSessionProtocolEnvelopes(envelopes, false);
     }
 
@@ -1921,7 +1930,10 @@ export class ApiSessionClient extends EventEmitter {
             }
         };
 
-        this.enqueueMessage(content, invalidate, localId);
+        const evidenceLocalId = isAutomationExecutionSessionId(this.sessionId) && envelope.role === 'agent' && !envelope.subagent
+            && ['turn-start', 'final-answer', 'turn-end'].includes(envelope.ev.t)
+            ? automationExecutionEvidenceLocalId(this.sessionId.slice(AUTOMATION_EXECUTION_SESSION_PREFIX.length), envelope.id) : undefined;
+        this.enqueueMessage(content, invalidate, localId ?? evidenceLocalId);
     }
 
     private applySessionProtocolRuntimeSideEffects(envelope: SessionEnvelope) {

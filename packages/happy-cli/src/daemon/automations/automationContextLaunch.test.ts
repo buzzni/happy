@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createHash } from 'node:crypto'
 import type { AutomationPayload } from '@slopus/happy-wire'
 import { ApiClient } from '@/api/api'
 import { decodeBase64, decrypt } from '@/api/encryption'
@@ -53,6 +54,12 @@ it('prepares two fresh contexts for the same display chat with no native resume 
     expect(options.reconnectEnvironment).toMatchObject({ HAPPY_RECONNECT_FRESH_LAUNCH: '1' })
     const session = f.sessions.get(options.reconnectEnvironment!.HAPPY_RECONNECT_SESSION_ID)!
     expect(session.metadata).toMatchObject({ path: '/work', source: 'schedule', machineId: 'm1' })
+    expect(session.metadata).toHaveProperty('automationExecutionSeed', {
+      version: 1, automationId: 'a1', runId: options.agent, generation: 1, revision: 1, displaySessionId: 'manual',
+      question: 'Current occurrence only', inputBytes: Buffer.byteLength(options.initialPrompt!, 'utf8'),
+      referenceBytes: 0, references: [], inputSha256: createHash('sha256').update(options.initialPrompt!).digest('hex'),
+      wholeContextTokens: 'unknown',
+    })
     expect(session.metadata).not.toHaveProperty('claudeSessionId')
     expect(session.metadata).not.toHaveProperty('codexThreadId')
     expect(session.metadata).not.toHaveProperty('parentSessionId')
