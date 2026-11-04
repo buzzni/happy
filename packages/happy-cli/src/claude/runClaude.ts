@@ -4,6 +4,7 @@ import { takeScopeConfirmation } from '@/daemon/sessionWriteScopeConfirmation';
 import { prepareSessionWriteScopeClaude } from '@/daemon/sessionWriteScopeClaude';
 /** Orchestrates Claude sessions, initial prompts, MCP tools and session lifecycle. */
 import { createLessonProposalTurn } from '@/utils/lessonProposalTurn';
+import { reportAutomationContextExit } from '@/utils/automationContextExit';
 import { createTurnCardSwitch } from './utils/turnCardTools';
 import { randomUUID } from 'node:crypto';
 
@@ -100,7 +101,7 @@ import {
     type SessionModelPin,
 } from '@/utils/sessionModelPin';
 import { createSessionPermissionModePublisher, publishedSessionPermissionMode } from '@/utils/sessionPermissionMode';
-import { createEnvelope } from '@slopus/happy-wire';
+import { createEnvelope, isAutomationExecutionSessionId } from '@slopus/happy-wire';
 import {
     resolveInitialSaycodeAppendSystemPrompt,
     resolveSaycodeAppendSystemPromptForMessage,
@@ -2244,6 +2245,10 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // Note: currentSession is set by onSessionReady callback during loop()
     (currentSession as Session | null)?.cleanup();
 
+    // Join the last transcript read while storage is still open. Process exit
+    // alone would discard an in-flight callback after claiming writers drained.
+    if (isAutomationExecutionSessionId(session.sessionId)) await remoteScanner.cleanup();
+
     // Send session death message
     session.sendSessionDeath();
 
@@ -2268,6 +2273,11 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     logger.debug('Stopped Hook server and cleaned up settings file');
 
     launchControl?.close();
+    await reportAutomationContextExit({ sessionId: session.sessionId, provider: 'claude', evidence: {
+        ...((currentSession as Session | null)?.automationContextExitEvidence
+            ?? { providerExitedCleanly: false, foregroundDrained: false, backgroundDrained: false }),
+        writeProducersDrained: true,
+    } });
     // Exit with the code from Claude
     process.exit(exitCode);
 }

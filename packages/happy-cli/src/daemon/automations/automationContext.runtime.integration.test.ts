@@ -10,6 +10,7 @@ import { decrypt, decodeBase64 } from '@/api/encryption'
 import { SessionWriteScopeFixture, eventually, type StoredMessage } from '@/testing/sessionWriteScopeFixture'
 import { createAutomationContextLaunchJournal } from './automationContextLaunchJournal'
 import { createAutomationContextLauncher } from './automationContextLaunch'
+import { observeAutomationContextChild } from '@/utils/automationContextExit'
 import { createAutomationContextTransport } from './automationContextTransport'
 
 async function seedRun(fixture: SessionWriteScopeFixture, input: Record<string, unknown>): Promise<any> {
@@ -73,6 +74,8 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
         schedule: { kind: 'interval', minutes: 60 }, conversation: { sessionId: displaySessionId },
         contextPolicy: { kind: 'isolated', reference: null } }
       let child: ChildProcess | undefined
+      let observedExit: Promise<boolean> | undefined
+      const exitEvidence: unknown[] = []
       const transport = createAutomationContextTransport({ serverUrl: fixture.serverUrl, token: fixture.token, machineId,
         runId, claimToken, authorize: async target => {
           const context = await fixture.http(`/v1/automation-runs/${runId}/mcp-context`, { machineId, claimToken, executionAdmission: true })
@@ -86,6 +89,9 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
       const launcher = createAutomationContextLauncher({ accountId: fixture.accountId, machineId, happyOrigin: fixture.serverUrl,
         api, journal, ...transport, start: async options => {
           child = fixture.launchContextSession(options)
+          observedExit = observeAutomationContextChild({ child, sessionId: options.reconnectEnvironment!.HAPPY_RECONNECT_SESSION_ID, provider,
+            persist: () => launcher.recordOwnedExit({ runId, sessionId: options.reconnectEnvironment!.HAPPY_RECONNECT_SESSION_ID, provider }) })
+          child.on('message', message => { if ((message as { type?: unknown })?.type === 'automation-context-exit') exitEvidence.push(message) })
           await eventually(async () => {
             if (child!.exitCode !== null && child!.exitCode !== 0) throw new Error('Native fixture CLI failed')
             const receipt = await journal.read(runId)
@@ -96,12 +102,16 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
             return typeof metadata[fixture.providerIdentityField] === 'string' ? true : undefined
           }, 'real native identity', 60_000)
           return { type: 'success', sessionId: options.reconnectEnvironment!.HAPPY_RECONNECT_SESSION_ID }
-        }, discover: async () => child?.exitCode === 0 ? 'ended' : child?.exitCode === null ? 'running' : 'unconfirmed' })
+        }, discover: async () => child?.exitCode === null ? 'running' : 'unconfirmed' })
       expect(await launcher.launch({ automationId: info.automationId, generation: info.generation, revision: info.revision, runId, claimToken, payload }))
         .toMatchObject({ state: 'started', displaySessionId })
       await eventually(async () => child!.exitCode === 0 ? true : child!.exitCode === null ? undefined : Promise.reject(new Error('Native CLI exit failed')),
         'native CLI natural exit and message flush', 60_000)
+      expect(await observedExit).toBe(true)
+      expect(await launcher.recover(runId)).toHaveProperty('state', 'ended')
       const receipt = (await journal.read(runId))!, key = decodeBase64(receipt.prepared.encryptionKey)
+      expect(exitEvidence).toEqual([{ type: 'automation-context-exit', version: 1, provider, sessionId: receipt.sessionId,
+        evidence: { providerExitedCleanly: true, foregroundDrained: true, backgroundDrained: true, writeProducersDrained: true } }])
       const raw = (await fixture.http('/v2/sessions/lookup', { ids: [receipt.sessionId] })).body.sessions[0]
       const metadata = decrypt(key, receipt.prepared.encryptionVariant, decodeBase64(raw.metadata)) as any
       const nativeId = metadata[fixture.providerIdentityField]
@@ -134,10 +144,13 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
     console.log(JSON.stringify({ provider, nativeContexts: nativeIds.size, visibleSessions: visible.length,
       runsOnOriginalTarget: history.body.runs.length, manualRows: pendingBefore.length, model: 'local fixture; no external inference' }))
   } catch (error) {
-    failure = error
-    throw new Error(`Private context flow failed (${provider}):\n${await fixture.diagnostics().catch(() => 'Diagnostics unavailable')}`, { cause: error })
+    failure = new Error(`Private context flow failed (${provider}):\n${await fixture.diagnostics().catch(() => 'Diagnostics unavailable')}`, { cause: error })
+    throw failure
   } finally {
-    try { await fixture.close() } catch (error) { if (failure) throw new AggregateError([failure, error], 'Native fixture and cleanup failed'); throw error }
+    try { await fixture.close() } catch (error) {
+      if (failure) throw new AggregateError([failure, error], `${(failure as Error).message}\nFixture cleanup: ${String(error)}`)
+      throw error
+    }
     finally { vi.unstubAllEnvs() }
   }
 }, 180_000)

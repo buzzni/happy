@@ -20,6 +20,7 @@ export const automationContextLaunchRecordSchema = z.strictObject({
     requestCiphertext: z.string().min(1).max(1024 * 1024).optional(),
     seedMessage: z.strictObject({ localId: z.string().min(1).max(200), content: z.string().min(1).max(1024 * 1024) }) }),
   sessionId: z.string().min(1).max(200),
+  exitReceipt: z.strictObject({ provider: z.enum(['claude', 'codex']), observedAt: z.number().int().nonnegative() }).optional(),
 })
 export type AutomationContextLaunchRecord = z.infer<typeof automationContextLaunchRecordSchema>
 
@@ -44,8 +45,8 @@ export interface AutomationContextLaunchDependencies {
   persistSeed(session: Session, message: AutomationContextLaunchRecord['prepared']['seedMessage']): Promise<{ seq: number; localId: string; content: string }>
   /** Must use the daemon's submission guard. Only OwnedStartRefused proves a pre-submit refusal. */
   start(options: SpawnSessionOptions): Promise<SpawnSessionResult>
-  /** 'ended' requires an owned exit receipt, never just PID absence or a disconnected socket. */
-  discover(sessionId: string): Promise<'running' | 'ended' | 'unconfirmed'>
+  /** Only positively tracked runtime liveness; termination comes from the durable private exit receipt. */
+  discover(sessionId: string): Promise<'running' | 'unconfirmed'>
 }
 export function createAutomationContextLauncher(deps: AutomationContextLaunchDependencies) {
   const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
@@ -61,6 +62,19 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
     }
   }
   return {
+    /** Private owned-child observer only, after matching native evidence AND actual root close(0, null). */
+    async recordOwnedExit(input: { runId: string; sessionId: string; provider: 'claude' | 'codex' }): Promise<void> {
+      await deps.journal.exclusive(input.runId, async () => {
+        const record = await deps.journal.read(input.runId)
+        if (!record) throw new Error('AUTOMATION_EXIT_RECEIPT_CONFLICT')
+        assertIdentity(record, input.runId)
+        const metadata = decrypt(decodeBase64(record.prepared.encryptionKey), record.prepared.encryptionVariant,
+          decodeBase64(record.prepared.body.metadata)) as Metadata
+        if (record.sessionId !== input.sessionId || metadata.flavor !== input.provider
+          || record.phase !== 'submitted' && record.phase !== 'started') throw new Error('AUTOMATION_EXIT_RECEIPT_CONFLICT')
+        if (!record.exitReceipt) await deps.journal.write({ ...record, exitReceipt: { provider: input.provider, observedAt: Date.now() } })
+      })
+    },
     /** Private daemon input only. Never return this snapshot through browser RPC or logs. */
     async restoreRequest(runId: string): Promise<AutomationContextLaunchRequest | null> {
       return deps.journal.exclusive(runId, async () => {
@@ -99,6 +113,7 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
         const identity = { sessionId, displaySessionId: record.displaySessionId, automationId: record.automationId,
           generation: record.generation, revision: record.revision }
         if (record.phase === 'prepared' || record.phase === 'registered') return { ...identity, state: 'not-started' }
+        if (record.exitReceipt) return { ...identity, state: 'ended' }
         const observed = await deps.discover(sessionId)
         if (observed === 'unconfirmed') return { ...identity, state: 'needs-attention' }
         if (record.phase !== 'started') await deps.journal.write({ ...record, phase: 'started' })

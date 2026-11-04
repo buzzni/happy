@@ -204,7 +204,7 @@ export class SessionWriteScopeFixture {
             '--happy-starting-mode', 'remote', '--started-by', 'daemon', '--dangerously-skip-permissions'], this.project,
             { ...this.environment, ...options.reconnectEnvironment, HAPPY_INITIAL_PROMPT: options.initialPrompt,
                 HAPPY_INITIAL_PROMPT_LOCAL_ID: options.initialPromptLocalId, HAPPY_INITIAL_MODEL: options.model ?? this.modelName,
-                HAPPY_AUTOMATION_RUN_ONCE: '1' });
+                HAPPY_AUTOMATION_RUN_ONCE: '1' }, process.execPath, true);
     }
     async startServer() {
         this.server = this.launchServer('serve');

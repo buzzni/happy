@@ -148,7 +148,7 @@ it('keeps an unknown start pending instead of guessing that absence means it nev
   expect((await f.deps.journal.read('r1'))!.phase).toBe('submitted')
 })
 
-it.each(['running', 'ended', 'unconfirmed'] as const)('recovers the original %s execution after the definition changed without launching again', async observed => {
+it.each(['running', 'unconfirmed'] as const)('recovers the original %s execution after the definition changed without launching again', async observed => {
   const f = await setup()
   f.start.mockRejectedValueOnce(new Error('lost-provider-ACK'))
   await expect(f.launcher.launch(request())).rejects.toThrow('lost-provider-ACK')
@@ -161,6 +161,27 @@ it.each(['running', 'ended', 'unconfirmed'] as const)('recovers the original %s 
   expect(f.discover).toHaveBeenCalledExactlyOnceWith('automation-run:r1')
   expect(f.start).toHaveBeenCalledTimes(1)
   expect(f.register).toHaveBeenCalledTimes(1)
+})
+
+it('recovers an owned exit receipt durably without inferring completion from PID absence', async () => {
+  const f = await setup()
+  await f.launcher.launch(request())
+  expect(await f.launcher.recover('r1')).toHaveProperty('state', 'needs-attention')
+  await f.launcher.recordOwnedExit({ runId: 'r1', sessionId: 'automation-run:r1', provider: 'codex' })
+  f.discover.mockClear()
+  expect(await createAutomationContextLauncher({ ...f.deps, journal: createAutomationContextLaunchJournal(home) }).recover('r1'))
+    .toHaveProperty('state', 'ended')
+  expect(f.discover).not.toHaveBeenCalled()
+  expect(f.start).toHaveBeenCalledOnce()
+})
+
+it.each(['wrong-session', 'wrong-provider', 'not-submitted'])('rejects an exit receipt with %s', async kind => {
+  const f = await setup()
+  if (kind === 'not-submitted') f.register.mockRejectedValueOnce(new Error('not-submitted'))
+  await f.launcher.launch(request()).catch(() => undefined)
+  await expect(f.launcher.recordOwnedExit({ runId: 'r1', sessionId: kind === 'wrong-session' ? 'automation-run:other' : 'automation-run:r1',
+    provider: kind === 'wrong-provider' ? 'claude' : 'codex' })).rejects.toThrow('AUTOMATION_EXIT_RECEIPT_CONFLICT')
+  expect(await f.deps.journal.read('r1')).not.toHaveProperty('exitReceipt')
 })
 
 it('recovers a prepared receipt without claiming that a provider started or retrying registration', async () => {

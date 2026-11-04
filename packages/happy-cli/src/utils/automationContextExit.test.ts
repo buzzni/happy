@@ -1,5 +1,6 @@
 import { afterEach, expect, it, vi } from 'vitest'
-import { reportAutomationContextExit } from './automationContextExit'
+import { spawn } from 'node:child_process'
+import { observeAutomationContextChild, reportAutomationContextExit } from './automationContextExit'
 
 vi.mock('@/ui/logger', () => ({ logger: { warn: vi.fn() } }))
 afterEach(() => vi.useRealTimers())
@@ -40,3 +41,33 @@ it('rejects malformed or unbounded evidence instead of sending permissive truthy
   }
   expect(send).not.toHaveBeenCalled()
 })
+
+it.each(['clean', 'missing', 'wrong-session', 'wrong-provider', 'partial', 'conflict', 'nonzero'])(
+  'accepts only matching private IPC plus owned clean child close (%s)', async kind => {
+    const message = { type: 'automation-context-exit', version: 1, ...input() }
+    if (kind === 'wrong-session') message.sessionId = 'automation-run:other'
+    if (kind === 'wrong-provider') (message as { provider: string }).provider = 'claude'
+    if (kind === 'partial') message.evidence.backgroundDrained = false
+    const messages = kind === 'missing' ? [] : [message]
+    if (kind === 'conflict') messages.push({ ...message, evidence: { ...message.evidence, writeProducersDrained: false } })
+    const child = spawn(process.execPath, ['-e', `
+      for (const message of ${JSON.stringify(messages)}) process.send(message);
+      process.exitCode = ${kind === 'nonzero' ? 1 : 0};
+      process.disconnect();
+    `], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] })
+    let release!: () => void
+    const durable = new Promise<void>(resolve => { release = resolve })
+    const persist = vi.fn(async () => durable)
+    const result = observeAutomationContextChild({ child, sessionId: input().sessionId, provider: input().provider, persist })
+    let settled = false
+    void result.then(() => { settled = true })
+    try {
+      if (kind === 'clean') {
+        await vi.waitFor(() => expect(persist).toHaveBeenCalledOnce())
+        expect(child.exitCode).toBe(0)
+        expect(settled).toBe(false)
+      }
+    } finally { release() }
+    expect(await result).toBe(kind === 'clean')
+    expect(persist).toHaveBeenCalledTimes(kind === 'clean' ? 1 : 0)
+  })

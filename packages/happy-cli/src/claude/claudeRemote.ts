@@ -21,7 +21,9 @@ const MANAGED_TURN_END_INPUT_BUDGET_MS = 30_000;
  * that never ends also keeps its automation from ever running again.
  */
 const RUN_ONCE_BACKGROUND_WAIT_BUDGET_MS = 60 * 60_000;
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { probeProcessGroup } from '@/daemon/managedProcessGroup';
+import type { NativeAutomationContextExitEvidence } from '@/utils/automationContextExit';
 import { bindManagedQueryOptions } from '@/launcher/managedClaudeOptions'
 import type { ClaudeTitleBridge } from './claudeOffTurnTitle'
 import { sideQuestionRequestOf, type ClaudeSideQuestionChannel } from './claudeSideQuestion'
@@ -155,6 +157,7 @@ export async function claudeRemote(opts: {
      */
     /** Called when this turn's input ended by exhaustion rather than a kill. */
     onInputExhausted?: () => void,
+    onAutomationContextExit?: (evidence: NativeAutomationContextExitEvidence) => void,
     /** How long the provider gets to leave on its own after its input ends. */
     turnEndInputBudgetMs?: number,
     providerExitObserver?: {
@@ -509,9 +512,24 @@ async function runClaudeRemote(
     });
 
     const hasMcpServers = Object.keys(mergedMcpServers).length > 0;
+    const isolatedAutomation = isAutomationExecutionSessionId(opts.lessons?.sessionId);
+    const automationProcesses: ChildProcess[] = [];
+    let automationBackgroundTasks: Set<string> | null = null;
+    let automationBackgroundLevelSeen = false;
+    let automationResultReceived = false, automationInputExhausted = false;
+    let automationExitDeadline: number | null = null;
+    const awaitAutomationGroups = async () => {
+        if (!automationExitDeadline || !automationProcesses.length || !opts.providerExitObserver?.exitedCleanly()) return false;
+        while (true) {
+            if (automationProcesses.some(child => child.exitCode !== 0 || child.signalCode !== null || child.killed)) return false;
+            if (automationProcesses.every(child => child.pid && probeProcessGroup(child.pid).kind === 'no-local-trace')) return true;
+            if (performance.now() >= automationExitDeadline || opts.signal?.aborted) return false;
+            await new Promise(resolve => setTimeout(resolve, 20));
+        }
+    };
     const writerProcessTree = opts.completeTurn ? new CheckpointWriterProcessTree() : null;
     const assembledOptions: QueryOptions = {
-        isolatedAutomationContext: isAutomationExecutionSessionId(opts.lessons?.sessionId) || undefined,
+        isolatedAutomationContext: isolatedAutomation || undefined,
         personalClaudeAuth: opts.personalClaudeAuth,
         cwd: providerPath,
         additionalDirectories: readAdditionalDirectoriesEnvironment(process.env),
@@ -556,6 +574,11 @@ async function runClaudeRemote(
                     stdio: ['pipe', 'pipe', 'inherit'],
                 });
                 writerProcessTree?.track(child);
+                if (isolatedAutomation) {
+                    automationProcesses.push(child);
+                    // The bundled native contract starts a new process with no background tasks; subsequent full levels replace this set.
+                    automationBackgroundTasks ??= new Set();
+                }
                 // Per process, not per session: a restart is a different
                 // process, and the exit that matters is the one this run's
                 // provider actually had.
@@ -860,6 +883,16 @@ function readTurnText(content: unknown): string {
         logger.debug(`[claudeRemote] Starting to iterate over response`);
 
         for await (const message of releasableMessages(response, () => backgroundWaitExpiry)) {
+            if (isolatedAutomation && message.type === 'system') {
+                if (message.subtype === 'background_tasks_changed') {
+                    automationBackgroundLevelSeen = true;
+                    automationBackgroundTasks = new Set(message.tasks.map(task => task.task_id));
+                } else if (!automationBackgroundLevelSeen && message.subtype === 'task_started') {
+                    automationBackgroundTasks?.add(message.task_id);
+                } else if (!automationBackgroundLevelSeen && message.subtype === 'task_notification') {
+                    automationBackgroundTasks?.delete(message.task_id);
+                }
+            }
             // The held result again, its wait over: already forwarded once.
             const released = message === heldResult;
             if (released) backgroundWaitExpiry = null;
@@ -1007,6 +1040,7 @@ function readTurnText(content: unknown): string {
 
             // Handle result messages
             if (message.type === 'result') {
+                automationResultReceived = true;
                 finishTurnLatency('no-text');
                 const awaitsProvider = providerIdle === null
                     ? awaitedBackgroundTaskIds.size > 0
@@ -1097,6 +1131,7 @@ function readTurnText(content: unknown): string {
                          */
                         const observer = opts.providerExitObserver;
                         if (!observer) {
+                            if (isolatedAutomation) throw new Error('AUTOMATION_WORKSPACE_EXIT_UNCONFIRMED');
                             /*
                              * Ordinary checkpoint protection, unchanged: end
                              * the input and close. Waiting for an exit here
@@ -1107,10 +1142,12 @@ function readTurnText(content: unknown): string {
                             await writerProcessTree.quiesce(() => response.close());
                             return;
                         }
+                        if (isolatedAutomation) automationExitDeadline = performance.now() + (opts.turnEndInputBudgetMs ?? MANAGED_TURN_END_INPUT_BUDGET_MS);
                         const ended = await endManagedTurnInput({
                             endInput: () => { messages.end(); },
                             exitedCleanly: () => observer.exitedCleanly(),
                             forceClose: async () => {
+                                if (isolatedAutomation) throw new Error('AUTOMATION_WORKSPACE_EXIT_UNCONFIRMED');
                                 // Recorded before the kill, not after.
                                 observer.markForced();
                                 await writerProcessTree.quiesce(() => response.close());
@@ -1118,7 +1155,12 @@ function readTurnText(content: unknown): string {
                             budgetMs: opts.turnEndInputBudgetMs ?? MANAGED_TURN_END_INPUT_BUDGET_MS,
                         });
                         if (ended.exhausted) opts.onInputExhausted?.();
+                        automationInputExhausted = ended.exhausted;
                         if (ended.forced) return;
+                        if (isolatedAutomation) {
+                            if (!await awaitAutomationGroups() || automationBackgroundTasks?.size !== 0) throw new Error('AUTOMATION_WORKSPACE_EXIT_UNCONFIRMED');
+                            return;
+                        }
                         /*
                          * The provider left on its own, but its descendants
                          * may not have. The writers still have to be
@@ -1168,6 +1210,7 @@ function readTurnText(content: unknown): string {
                      * proven.
                      */
                     if (opts.providerExitObserver) {
+                        if (isolatedAutomation) automationExitDeadline = performance.now() + (opts.turnEndInputBudgetMs ?? MANAGED_TURN_END_INPUT_BUDGET_MS);
                         const ended = await endManagedTurnInput({
                             endInput: () => { messages.end(); },
                             exitedCleanly: () => opts.providerExitObserver?.exitedCleanly() ?? false,
@@ -1178,6 +1221,7 @@ function readTurnText(content: unknown): string {
                             budgetMs: opts.turnEndInputBudgetMs ?? MANAGED_TURN_END_INPUT_BUDGET_MS,
                         });
                         if (ended.exhausted) opts.onInputExhausted?.();
+                        automationInputExhausted = ended.exhausted;
                     }
                     return 'turn-complete' as const;
                 }
@@ -1304,6 +1348,11 @@ function readTurnText(content: unknown): string {
         updateThinking(false);
         claudeTurnObservations.take();
         proposalToolCallIds.clear();
+        if (isolatedAutomation && (automationProcesses.length || automationResultReceived)) {
+            opts.onAutomationContextExit?.({ foregroundDrained: automationProcesses.length > 0 && automationResultReceived && automationInputExhausted,
+                backgroundDrained: automationProcesses.length > 0 && automationBackgroundTasks?.size === 0,
+                providerExitedCleanly: await awaitAutomationGroups() });
+        }
     }
     return undefined;
 }

@@ -19,6 +19,7 @@ const {
     mockCreateCheckpointEventPublisher,
     mockScopeBootstrap,
     mockPrepareScopeClaude,
+    mockReportAutomationContextExit,
 } = vi.hoisted(() => ({
     mockApiClientCreate: vi.fn(),
     mockCreateSessionScanner: vi.fn(),
@@ -32,6 +33,11 @@ const {
     mockCreateCheckpointEventPublisher: vi.fn(),
     mockScopeBootstrap: vi.fn(),
     mockPrepareScopeClaude: vi.fn(),
+    mockReportAutomationContextExit: vi.fn(async () => true),
+}));
+
+vi.mock('@/utils/automationContextExit', () => ({
+    reportAutomationContextExit: mockReportAutomationContextExit,
 }));
 
 vi.mock('@/daemon/sessionWriteScopeReports', () => ({ initializeScopeReportSigner: vi.fn(async () => null), takeScopeLaunchBootstrap: mockScopeBootstrap }));
@@ -414,6 +420,29 @@ describe('runClaude remote JSONL scanner', () => {
             }
         }
         originalListeners.clear();
+    });
+
+    it('joins the isolated scanner before flushing storage and reporting drained writers', async () => {
+        const drained = createDeferred<void>();
+        const cleanup = vi.fn(async () => drained.promise);
+        mockCreateSessionScanner.mockResolvedValueOnce({ onNewSession: vi.fn(), cleanup });
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.sessionId = 'automation-run:scanner-drain';
+        const finish = harness.finish();
+        try {
+            await vi.waitFor(() => expect(cleanup).toHaveBeenCalledOnce());
+            expect(harness.sessionClient.flush).not.toHaveBeenCalled();
+            expect(harness.sessionClient.close).not.toHaveBeenCalled();
+            expect(mockReportAutomationContextExit).not.toHaveBeenCalled();
+        } finally {
+            drained.resolve();
+            await finish;
+        }
+        expect(harness.sessionClient.flush).toHaveBeenCalledOnce();
+        expect(mockReportAutomationContextExit).toHaveBeenCalledWith(expect.objectContaining({
+            sessionId: 'automation-run:scanner-drain',
+            evidence: expect.objectContaining({ writeProducersDrained: true }),
+        }));
     });
 
     it.each([undefined, '0', 'true', '1'])('T2RT-23 requires explicit evidence opt-in (%s)', async optIn => {
