@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -12,6 +12,7 @@ import { OwnedStartRefused } from '../ownedSpawn'
 import { FileLockHeldError } from '@/utils/ownedFileLock'
 import { createAutomationContextLaunchJournal } from './automationContextLaunchJournal'
 import { createAutomationContextLauncher, type AutomationContextLaunchDependencies, type AutomationContextLaunchRequest } from './automationContextLaunch'
+import { createAutomationContextWorkspace } from './automationContextWorkspace'
 
 let home: string
 beforeEach(async () => { home = await mkdtemp(join(tmpdir(), 'automation-context-launch-')) })
@@ -47,6 +48,70 @@ async function setup() {
     api, journal: createAutomationContextLaunchJournal(home), register, start, discover, persistSeed }
   return { deps, prepare, register, start, discover, persistSeed, seedMessages, sessions, launcher: createAutomationContextLauncher(deps) }
 }
+
+async function workspaceSetup() {
+  const f = await setup(), directory = join(home, 'workspace')
+  await mkdir(directory)
+  const workspace = createAutomationContextWorkspace({ home, isTracked: async () => false })
+  f.deps.workspace = workspace
+  const input = request(); input.payload.directory = directory
+  return { ...f, directory, workspace, input }
+}
+
+it('keeps a workspace-busy run unsubmitted and retries its original preparation after manual work releases', async () => {
+  const f = await workspaceSetup(), manual = await f.workspace.beginManualLaunch([f.directory])
+  if (!manual.acquired) throw new Error('manual preparation refused')
+  expect(await f.launcher.launch(f.input)).toMatchObject({ state: 'waiting', reason: 'workspace-busy' })
+  expect(f.start).not.toHaveBeenCalled()
+  expect(await f.deps.journal.read('r1')).toHaveProperty('phase', 'registered')
+  await manual.finish({ submitted: false, tracked: false })
+  expect(await f.launcher.launch(f.input)).toHaveProperty('state', 'started')
+  expect(f.prepare).toHaveBeenCalledOnce(); expect(f.start).toHaveBeenCalledOnce()
+  expect(await f.workspace.beginManualLaunch([f.directory])).toMatchObject({ acquired: false })
+})
+
+it('holds an unknown native start across restart and releases only after a durable owned exit', async () => {
+  const f = await workspaceSetup()
+  f.start.mockRejectedValueOnce(new Error('lost-start-ACK'))
+  await expect(f.launcher.launch(f.input)).rejects.toThrow('lost-start-ACK')
+  const restarted = createAutomationContextLauncher({ ...f.deps, workspace: createAutomationContextWorkspace({ home, isTracked: async () => false }) })
+  expect(await restarted.recover('r1')).toHaveProperty('state', 'needs-attention')
+  expect(await restarted.launch(f.input)).toHaveProperty('state', 'needs-attention')
+  expect(await f.workspace.beginManualLaunch([f.directory])).toMatchObject({ acquired: false })
+  await restarted.recordOwnedExit({ runId: 'r1', sessionId: 'automation-run:r1', provider: 'codex' })
+  expect(await restarted.recover('r1')).toHaveProperty('state', 'ended')
+  expect(await f.workspace.beginManualLaunch([f.directory])).toMatchObject({ acquired: true })
+  expect(f.start).toHaveBeenCalledOnce()
+})
+
+it.each(['refused', 'journal-failed'])('releases workspace only on proven pre-submission failure (%s)', async kind => {
+  const f = await workspaceSetup()
+  if (kind === 'refused') f.start.mockRejectedValueOnce(new OwnedStartRefused('daemon-restarting'))
+  else {
+    const write = f.deps.journal.write.bind(f.deps.journal)
+    vi.spyOn(f.deps.journal, 'write').mockImplementation(async record => {
+      if (record.phase === 'submitted') throw new Error('journal-failed')
+      await write(record)
+    })
+  }
+  await expect(f.launcher.launch(f.input)).rejects.toThrow()
+  expect(await f.deps.journal.read('r1')).toHaveProperty('phase', 'registered')
+  expect(await f.workspace.beginManualLaunch([f.directory])).toMatchObject({ acquired: true })
+  expect(f.start).toHaveBeenCalledTimes(kind === 'refused' ? 1 : 0)
+})
+
+it('recovers an acquired preparation after a pre-submission crash without launching a provider', async () => {
+  const f = await workspaceSetup()
+  f.register.mockRejectedValueOnce(new Error('preparation-only'))
+  await expect(f.launcher.launch(f.input)).rejects.toThrow('preparation-only')
+  const record = (await f.deps.journal.read('r1'))!
+  expect(record.workspaceOwnerToken).toMatch(/^[a-f0-9-]{36}$/)
+  expect(await f.workspace.acquireAutomation({ runId: 'r1', roots: [f.directory], ownerToken: record.workspaceOwnerToken })).toHaveProperty('acquired', true)
+  const restarted = createAutomationContextLauncher(f.deps)
+  expect(await restarted.recover('r1')).toHaveProperty('state', 'not-started')
+  expect(await f.workspace.beginManualLaunch([f.directory])).toMatchObject({ acquired: true })
+  expect(f.start).not.toHaveBeenCalled()
+})
 
 it('prepares two fresh contexts for the same display chat with no native resume or copied input state', async () => {
   const f = await setup()

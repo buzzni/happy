@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { SessionExecutionCreateBodySchema, automationExecutionSeedSchema, automationExecutionSeedManifestSchema,
   automationExecutionSeedArtifactSchema, automationExecutionSeedLocalId, automationExecutionSessionId, isAutomationExecutionSessionId, automationPayloadSchema } from '@slopus/happy-wire'
 import type { ApiClient } from '@/api/api'
@@ -10,6 +10,7 @@ import { createSessionMetadata } from '@/utils/createSessionMetadata'
 import { buildReconnectSessionEnvironment, RECONNECT_FRESH_LAUNCH_ENV } from '../reconnectSessionEnv'
 import { OwnedStartRefused } from '../ownedSpawn'
 import { buildAutomationContextInput } from './automationContextInput'
+import type { createAutomationContextWorkspace } from './automationContextWorkspace'
 
 export const automationContextLaunchRecordSchema = z.strictObject({
   version: z.literal(1), scope: z.string().regex(/^[a-f0-9]{64}$/), requestHash: z.string().regex(/^[a-f0-9]{64}$/),
@@ -21,6 +22,7 @@ export const automationContextLaunchRecordSchema = z.strictObject({
     seedMessage: z.strictObject({ localId: z.string().min(1).max(200), content: z.string().min(1).max(1024 * 1024) }) }),
   sessionId: z.string().min(1).max(200),
   exitReceipt: z.strictObject({ provider: z.enum(['claude', 'codex']), observedAt: z.number().int().nonnegative() }).optional(),
+  workspaceOwnerToken: z.string().uuid().optional(),
 })
 export type AutomationContextLaunchRecord = z.infer<typeof automationContextLaunchRecordSchema>
 
@@ -40,6 +42,7 @@ export interface AutomationContextLaunchDependencies {
   accountId: string; machineId: string; happyOrigin: string
   api: Pick<ApiClient, 'prepareSessionCreation'>
   journal: AutomationContextLaunchJournal
+  workspace?: Pick<ReturnType<typeof createAutomationContextWorkspace>, 'acquireAutomation' | 'recoverAutomationExit' | 'releaseUnsubmitted'>
   register(request: AutomationContextLaunchRequest, prepared: AutomationContextLaunchRecord['prepared']): Promise<Session>
   /** Append with the stable localId and return the stored ciphertext, including on an idempotent replay. */
   persistSeed(session: Session, message: AutomationContextLaunchRecord['prepared']['seedMessage']): Promise<{ seq: number; localId: string; content: string }>
@@ -61,6 +64,18 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
       throw new Error('AUTOMATION_LAUNCH_IDENTITY_CONFLICT')
     }
   }
+  function workspaceIdentity(record: AutomationContextLaunchRecord) {
+    const metadata = decrypt(decodeBase64(record.prepared.encryptionKey), record.prepared.encryptionVariant,
+      decodeBase64(record.prepared.body.metadata)) as Metadata
+    return { runId: record.runId, roots: [metadata.path], ownerToken: record.workspaceOwnerToken! }
+  }
+  async function releaseWorkspace(record: AutomationContextLaunchRecord, unsubmitted: boolean) {
+    if (!deps.workspace || !record.workspaceOwnerToken) return
+    const identity = workspaceIdentity(record)
+    if (unsubmitted) await deps.workspace.releaseUnsubmitted(identity)
+    else await deps.workspace.recoverAutomationExit({ ...identity,
+      evidence: { providerExitedCleanly: true, foregroundDrained: true, backgroundDrained: true, writeProducersDrained: true } })
+  }
   return {
     /** Private owned-child observer only, after matching native evidence AND actual root close(0, null). */
     async recordOwnedExit(input: { runId: string; sessionId: string; provider: 'claude' | 'codex' }): Promise<void> {
@@ -73,6 +88,7 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
         if (record.sessionId !== input.sessionId || metadata.flavor !== input.provider
           || record.phase !== 'submitted' && record.phase !== 'started') throw new Error('AUTOMATION_EXIT_RECEIPT_CONFLICT')
         if (!record.exitReceipt) await deps.journal.write({ ...record, exitReceipt: { provider: input.provider, observedAt: Date.now() } })
+        await releaseWorkspace(record, false)
       })
     },
     /** Private daemon input only. Never return this snapshot through browser RPC or logs. */
@@ -112,8 +128,11 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
         assertIdentity(record, runId)
         const identity = { sessionId, displaySessionId: record.displaySessionId, automationId: record.automationId,
           generation: record.generation, revision: record.revision }
-        if (record.phase === 'prepared' || record.phase === 'registered') return { ...identity, state: 'not-started' }
-        if (record.exitReceipt) return { ...identity, state: 'ended' }
+        if (record.phase === 'prepared' || record.phase === 'registered') {
+          await releaseWorkspace(record, true)
+          return { ...identity, state: 'not-started' }
+        }
+        if (record.exitReceipt) { await releaseWorkspace(record, false); return { ...identity, state: 'ended' } }
         const observed = await deps.discover(sessionId)
         if (observed === 'unconfirmed') return { ...identity, state: 'needs-attention' }
         if (record.phase !== 'started') await deps.journal.write({ ...record, phase: 'started' })
@@ -121,7 +140,7 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
       })
     },
     async launch(input: AutomationContextLaunchRequest): Promise<{
-    state: 'started' | 'needs-attention'; sessionId: string; displaySessionId: string
+    state: 'started' | 'needs-attention' | 'waiting'; sessionId: string; displaySessionId: string; reason?: string
   }> {
     input = normalizeRequest(input)
     const seed = buildAutomationContextInput(input)
@@ -142,6 +161,7 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
       if (record && (record.scope !== scope || record.requestHash !== requestHash || record.sessionId !== sessionId
         || record.displaySessionId !== displaySessionId || record.automationId !== automationId
         || record.generation !== generation || record.revision !== revision)) throw new Error('AUTOMATION_LAUNCH_IDENTITY_CONFLICT')
+      if (record?.exitReceipt) { await releaseWorkspace(record, false); return publicResult('started') }
       if (record?.phase === 'started') return publicResult('started')
       if (record?.phase === 'submitted') {
         const receipt = await deps.discover(sessionId)
@@ -155,6 +175,7 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
         metadata.automationExecutionSeedManifest = seedManifest
         const prepared = deps.api.prepareSessionCreation({ tag: sessionId, metadata, state })
         record = { version: 1, scope, requestHash, automationId, generation, revision, runId, displaySessionId, sessionId, phase: 'prepared',
+          ...(deps.workspace ? { workspaceOwnerToken: randomUUID() } : {}),
           prepared: { ...prepared, encryptionKey: encodeBase64(prepared.encryptionKey),
             requestCiphertext: encodeBase64(encrypt(prepared.encryptionKey, prepared.encryptionVariant, input)), seedMessage: {
             localId: automationExecutionSeedLocalId(runId), content: encodeBase64(encrypt(prepared.encryptionKey, prepared.encryptionVariant,
@@ -184,18 +205,33 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
       if (seedReceipt.seq !== 1 || seedReceipt.localId !== prepared.seedMessage.localId || seedReceipt.content !== prepared.seedMessage.content) {
         throw new Error('AUTOMATION_SEED_RECEIPT_CONFLICT')
       }
+      if (deps.workspace) {
+        if (!record.workspaceOwnerToken) {
+          record = { ...record, workspaceOwnerToken: randomUUID() }
+          await deps.journal.write(record)
+        }
+        // This durable phase proves no provider dispatch occurred. A previous daemon may have
+        // acquired preparation ownership and died before advancing to submitted.
+        await releaseWorkspace(record, true)
+        const admitted = await deps.workspace.acquireAutomation(workspaceIdentity(record))
+        if (!admitted.acquired) return { state: 'waiting', sessionId, displaySessionId, reason: admitted.reason }
+      }
       const reconnectEnvironment = { ...buildReconnectSessionEnvironment({ sessionId, encryption: registered,
         serverSnapshot: { ...registered, metadata, seq: 1 }, baselineSeq: 1 }), [RECONNECT_FRESH_LAUNCH_ENV]: '1' }
       const options: SpawnSessionOptions = { directory, agent, model: model ?? undefined, effort: effort ?? undefined,
         initialPrompt: seed.initialPrompt, initialPromptLocalId: `happy-automation:${runId}`, exitAfterFirstTurn: true,
         reconnectEnvironment }
       record = { ...record, phase: 'submitted' }
-      await deps.journal.write(record)
+      try { await deps.journal.write(record) }
+      catch (error) { await releaseWorkspace(record, true); throw error }
       try {
         const started = await deps.start(options)
         if (started.type !== 'success' || started.sessionId !== sessionId) throw new Error('AUTOMATION_START_UNCONFIRMED')
       } catch (error) {
-        if (error instanceof OwnedStartRefused) await deps.journal.write({ ...record, phase: 'registered' })
+        if (error instanceof OwnedStartRefused) {
+          try { await deps.journal.write({ ...record, phase: 'registered' }) }
+          finally { await releaseWorkspace(record, true) }
+        }
         throw error
       }
       await deps.journal.write({ ...record, phase: 'started' })

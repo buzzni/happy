@@ -51,5 +51,10 @@ export function createAutomationContextWorkspace(input: {
         kind: 'automation', roots: request.roots, ownerToken: request.ownerToken })
       return owner.release(drained(request.evidence))
     },
+    /** The launch journal must still be prepared/registered, or dispatch must have explicitly refused before submission. */
+    async releaseUnsubmitted(request: { runId: string; roots: readonly string[]; ownerToken: string }) {
+      return createWorkspaceTurnAdmission({ home: input.home, sessionId: automationExecutionSessionId(request.runId),
+        kind: 'automation', roots: request.roots, ownerToken: request.ownerToken }).release(true)
+    },
   }
 }

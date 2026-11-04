@@ -12,6 +12,7 @@ import { createAutomationContextLaunchJournal } from './automationContextLaunchJ
 import { createAutomationContextLauncher } from './automationContextLaunch'
 import { observeAutomationContextChild } from '@/utils/automationContextExit'
 import { createAutomationContextTransport } from './automationContextTransport'
+import { createAutomationContextWorkspace } from './automationContextWorkspace'
 
 async function seedRun(fixture: SessionWriteScopeFixture, input: Record<string, unknown>): Promise<any> {
   return eventually(async () => {
@@ -63,6 +64,7 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
     const pendingBefore = await fixture.messages(displaySessionId)
     const nativeIds = new Set<string>(), markers: string[] = [], secret = randomBytes(32).toString('hex')
     const journal = createAutomationContextLaunchJournal(journalHome)
+    const workspace = createAutomationContextWorkspace({ home: fixture.happyHome, isTracked: async () => false })
     for (let index = 0; index < 2; index++) {
       const runId = `context-${provider}-${index}-${randomUUID()}`, claimToken = randomBytes(24).toString('hex')
       const info = await seedRun(fixture, { accountId: fixture.accountId, displaySessionId, runId, claimToken,
@@ -87,7 +89,8 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
             bearer: fixture.token, secret, now: Date.now() }) }
         } })
       const launcher = createAutomationContextLauncher({ accountId: fixture.accountId, machineId, happyOrigin: fixture.serverUrl,
-        api, journal, ...transport, start: async options => {
+        api, journal, workspace, ...transport, start: async options => {
+          expect(await workspace.beginManualLaunch([fixture.project])).toHaveProperty('acquired', false)
           child = fixture.launchContextSession(options)
           observedExit = observeAutomationContextChild({ child, sessionId: options.reconnectEnvironment!.HAPPY_RECONNECT_SESSION_ID, provider,
             persist: () => launcher.recordOwnedExit({ runId, sessionId: options.reconnectEnvironment!.HAPPY_RECONNECT_SESSION_ID, provider }) })
@@ -109,6 +112,10 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
         'native CLI natural exit and message flush', 60_000)
       expect(await observedExit).toBe(true)
       expect(await launcher.recover(runId)).toHaveProperty('state', 'ended')
+      const manualAdmission = await workspace.beginManualLaunch([fixture.project])
+      expect(manualAdmission.acquired).toBe(true)
+      if (!manualAdmission.acquired) throw new Error('Owned native exit did not release the workspace')
+      expect(await manualAdmission.finish({ submitted: false, tracked: false })).toBe(true)
       const receipt = (await journal.read(runId))!, key = decodeBase64(receipt.prepared.encryptionKey)
       expect(exitEvidence).toEqual([{ type: 'automation-context-exit', version: 1, provider, sessionId: receipt.sessionId,
         evidence: { providerExitedCleanly: true, foregroundDrained: true, backgroundDrained: true, writeProducersDrained: true } }])
