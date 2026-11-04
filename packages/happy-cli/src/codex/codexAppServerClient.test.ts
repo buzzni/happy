@@ -12,6 +12,7 @@ const {
     mockPrepareCodexMultiAuthProxy,
     mockProxyCleanup,
     mockResolveCodexStateEnvironment,
+    mockProbeProcessGroup,
 } = vi.hoisted(() => ({
     mockExecSync: vi.fn(),
     mockInitializeSandbox: vi.fn(),
@@ -22,7 +23,10 @@ const {
     mockPrepareCodexMultiAuthProxy: vi.fn(),
     mockProxyCleanup: vi.fn(),
     mockResolveCodexStateEnvironment: vi.fn(async env => env),
+    mockProbeProcessGroup: vi.fn(() => ({ kind: 'no-local-trace' })),
 }));
+
+vi.mock('@/daemon/managedProcessGroup', () => ({ probeProcessGroup: mockProbeProcessGroup }));
 
 vi.mock('./codexStateRecovery', () => ({ resolveCodexStateEnvironment: mockResolveCodexStateEnvironment }));
 
@@ -160,6 +164,7 @@ describe('CodexAppServerClient sandbox integration', () => {
         mockPrepareCodexMultiAuthProxy.mockResolvedValue(null);
         mockProxyCleanup.mockResolvedValue(undefined);
         mockSpawn.mockImplementation(() => createMockProcess());
+        mockProbeProcessGroup.mockReturnValue({ kind: 'no-local-trace' });
     });
 
     afterAll(() => {
@@ -325,6 +330,37 @@ describe('CodexAppServerClient sandbox integration', () => {
             expect(requests.findIndex(row => row.method === 'config/read')).toBeLessThan(requests.findIndex(row => row.method === 'thread/start'));
         } finally { await client.disconnect(); }
     });
+
+    it.each(['clean', 'background-unavailable', 'background-active', 'forced', 'group-alive'])(
+        'observes isolated provider EOF and background drain without using a kill as proof (%s)', async outcome => {
+            const { CodexAppServerClient } = await import('./codexAppServerClient');
+            mockExecSync.mockReturnValue('codex-cli 0.166.0');
+            const proc = createMockProcess({ onRequest: (message, stdout) => {
+                if (message.method === 'config/read') pushJsonLine(stdout, { id: message.id, result: { config: {
+                    memories: { use_memories: false, generate_memories: false }, features: { memories: false, hooks: false },
+                } } });
+                if (message.method === 'thread/start') pushJsonLine(stdout, { id: message.id, result: { thread: { id: 'fresh-exit' }, model: 'test' } });
+                if (message.method === 'thread/backgroundTerminals/list') pushJsonLine(stdout, outcome === 'background-unavailable'
+                    ? { id: message.id, error: { code: -32601, message: 'unsupported' } }
+                    : { id: message.id, result: { data: outcome === 'background-active' ? [{ itemId: 'background', command: 'writer', processId: '42' }] : [], nextCursor: null } });
+            } });
+            proc.stdin.once('finish', () => { proc.killed = outcome === 'forced'; proc.exitCode = 0; proc.emit('exit', 0, null); proc.stdout.push(null); });
+            mockSpawn.mockReturnValue(proc);
+            if (outcome === 'group-alive') mockProbeProcessGroup.mockReturnValue({ kind: 'alive' });
+            const client = new CodexAppServerClient(undefined, undefined, undefined, 'owner-choice', undefined, undefined, false, undefined, undefined, true);
+            try {
+                await client.connect(); await client.startThread({ cwd: '/work' });
+                const proof = await client.finishAutomationContext(500);
+                expect(proof).toMatchObject({ foregroundDrained: true,
+                    backgroundDrained: !['background-unavailable', 'background-active'].includes(outcome),
+                    providerExitedCleanly: outcome === 'clean' });
+                expect(proc.kill).not.toHaveBeenCalled();
+                if (outcome === 'clean') expect(await client.finishAutomationContext(500)).toEqual(proof);
+                if (outcome.startsWith('background-')) expect(proc.stdin.writableEnded).toBe(false);
+                await expect(client.connect()).rejects.toThrow('AUTOMATION_CONTEXT_INPUT_CLOSED');
+                expect(mockSpawn).toHaveBeenCalledTimes(1);
+            } finally { await client.disconnect(); }
+        });
 
     it.each(['unreported', 'still-enabled'])(
         'refuses an isolated native run with %s memory settings before a thread or turn exists', async mode => {

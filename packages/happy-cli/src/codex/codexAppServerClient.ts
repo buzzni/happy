@@ -18,6 +18,8 @@ import { execSync, type ChildProcess } from 'node:child_process';
 import { spawn as crossSpawn } from 'cross-spawn';
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
 import { logger } from '@/ui/logger';
+import { createProviderExitObserver, type ProviderExitObserver } from '@/managed/managedProviderExitObserver';
+import { probeProcessGroup } from '@/daemon/managedProcessGroup';
 import { withCodexRecallOwnership } from '@/memory/recallOwnerMarker';
 import { nativeCodexRecallOwnershipOverrides } from '@/memory/nativeCodexRecallOwnership';
 import { CODEX_CONFIG_UNREADABLE, CUA_DRIVER_SERVER } from '@/toolPolicy/cuaShadow';
@@ -306,6 +308,9 @@ export class CodexAppServerClient {
     private readonly markTurnDispatched?: () => void;
     private onTurnDispatch?: () => void;
     private readonly protectedWriterTree: CheckpointWriterProcessTree | null;
+    private readonly automationProcesses: Array<{ process: ChildProcess; observer: ProviderExitObserver }> = [];
+    private automationExitEvidence: { foregroundDrained: boolean; backgroundDrained: boolean; providerExitedCleanly: boolean } | null = null;
+    private automationInputClosed = false;
     private sandboxCleanup: (() => Promise<void>) | null = null;
     private multiAuthProxy: PreparedCodexMultiAuthProxy | null = null;
     private readonly managedProviderArgs: string[] | null;
@@ -570,6 +575,7 @@ export class CodexAppServerClient {
     }
 
     private assertInputOpen(): void {
+        if (this.automationInputClosed) throw new Error('AUTOMATION_CONTEXT_INPUT_CLOSED');
         if (this.shutdownInputFrozen) throw new Error('Codex input is frozen for shutdown');
     }
 
@@ -1324,13 +1330,17 @@ export class CodexAppServerClient {
                 stdio: ['pipe', 'pipe', 'pipe'],
                 env,
                 windowsHide: true,
-                detached: Boolean(this.protectedWriterTree),
+                detached: Boolean(this.protectedWriterTree) || this.isolatedAutomationContext,
             });
         } catch (error) {
             await this.disconnectInternal();
             throw error;
         }
         this.process = proc;
+        if (this.isolatedAutomationContext) {
+            const observer = createProviderExitObserver(); observer.watch(proc);
+            this.automationProcesses.push({ process: proc, observer });
+        }
         this.protectedWriterTree?.track(proc);
         // The only point that may say the plan reached Codex (spec §6.3-3): the process was started with it.
         if (this.agentPlanProviderArgs) this.agentPlanAppliedToLaunch = true;
@@ -1517,6 +1527,40 @@ export class CodexAppServerClient {
         });
     }
 
+    /** Cooperative native writer proof for a private run, distinct from model answer completion.
+     * A failed background read, active/unknown child, signal or surviving group never counts as natural exit. */
+    async finishAutomationContext(budgetMs: number): Promise<{
+        foregroundDrained: boolean; backgroundDrained: boolean; providerExitedCleanly: boolean;
+    }> {
+        if (!this.isolatedAutomationContext) throw new Error('AUTOMATION_CONTEXT_POLICY_UNSUPPORTED');
+        if (this.automationExitEvidence) return { ...this.automationExitEvidence };
+        const proc = this.process, threadId = this._threadId, epoch = this.processEpoch;
+        // Seal before the first await; a late reconnect or queued turn must not invalidate this exit observation.
+        this.automationInputClosed = true;
+        const foregroundIdle = () => this.connected && !!proc && !!threadId && !this._turnId && !this.pendingTurnCompletion
+            && !this.deferredRawTurnCompletion && this.openCommandExecutionTurns.size === 0
+            && this.outstandingServerRequests === 0 && this.userInputRequests.size === 0 && this.serverRequestTasks.size === 0;
+        const foregroundDrained = foregroundIdle();
+        if (!foregroundDrained || !threadId) return { foregroundDrained: false, backgroundDrained: false, providerExitedCleanly: false };
+        if (this.backgroundTimer) clearTimeout(this.backgroundTimer);
+        this.backgroundTimer = null;
+        await this.backgroundTasks.refresh(threadId);
+        if (proc !== this.process || epoch !== this.processEpoch || !foregroundIdle()) {
+            return { foregroundDrained: false, backgroundDrained: false, providerExitedCleanly: false };
+        }
+        const backgroundDrained = this.backgroundTasks.confirmedEmpty && this.subagents.confirmedIdle;
+        if (!backgroundDrained) return { foregroundDrained, backgroundDrained, providerExitedCleanly: false };
+        // EOF alone asks for natural shutdown. This method never delivers a termination signal.
+        const ended = await this.endInputAndAwaitExit(budgetMs);
+        if (ended.exited) await this.waitForOutputDrain();
+        const providerExitedCleanly = ended.exited && ended.code === 0 && ended.signal === null
+            && this.automationProcesses.length > 0 && this.automationProcesses.every(child =>
+                child.observer.exitedCleanly() && !!child.process.pid && probeProcessGroup(child.process.pid).kind === 'no-local-trace');
+        const result = { foregroundDrained, backgroundDrained, providerExitedCleanly };
+        if (providerExitedCleanly) this.automationExitEvidence = result;
+        return result;
+    }
+
     private disconnectInternal(opts?: Parameters<CodexAppServerClient['performDisconnectInternal']>[0]): Promise<void> {
         const key = JSON.stringify([!!opts?.preserveThreadState, !!opts?.preservePendingTurnCompletion, !!opts?.awaitProcessExit]);
         if (this.disconnectOperation) {
@@ -1591,7 +1635,10 @@ export class CodexAppServerClient {
             const alive = proc && proc.exitCode == null && proc.signalCode == null;
             try {
                 proc?.stdin?.end();
-                if (alive) proc?.kill('SIGTERM');
+                if (alive) {
+                    this.automationProcesses.find(child => child.process === proc)?.observer.markForced();
+                    proc?.kill('SIGTERM');
+                }
             } catch { /* ignore */ }
 
             // Force kill after 2s (unref so timer doesn't block process exit)
@@ -2805,6 +2852,9 @@ export class CodexAppServerClient {
 
     private request(method: string, params?: unknown, timeoutMs?: number,
         dispatch?: { beforeDispatch?: () => void; onDispatched?: () => void }): Promise<unknown> {
+        if (this.automationInputClosed && !['thread/backgroundTerminals/list', 'turn/interrupt'].includes(method)) {
+            return Promise.reject(new Error('AUTOMATION_CONTEXT_INPUT_CLOSED'));
+        }
         if (this.shutdownInputFrozen && method !== 'turn/interrupt') return Promise.reject(new Error('Codex input is frozen for shutdown'));
         const timeout = timeoutMs ?? CodexAppServerClient.REQUEST_TIMEOUT_MS;
         return new Promise((resolve, reject) => {
