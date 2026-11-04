@@ -184,6 +184,8 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
                 expect(await harness.evaluate(target, `document.getElementById('screen').getAttribute('src')`)).toBeNull()
             } finally { await harness.closeTarget(target) }
         }
+        // The next test reads the first listTasks op it finds.
+        ops.length = 0
     })
 
     it('uses the fragment capability, strips it, stores nothing, and lists tasks', async () => {
