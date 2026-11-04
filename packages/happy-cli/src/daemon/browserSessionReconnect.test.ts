@@ -1,7 +1,9 @@
 import { expect, it, vi } from 'vitest'
-import { prepareBrowserSessionReconnect } from './browserSessionReconnect'
+import { createBrowserSessionReconnect } from './browserSessionReconnect'
+const prepareBrowserSessionReconnect = createBrowserSessionReconnect()
+let sequence = 0
 const target = { pid: 123, token: {}, owned: true }
-const fixture = () => ({ current: () => true, registered: async () => false, target: () => target,
+const fixture = () => ({ sessionId: `session-${++sequence}`, current: () => true, registered: async () => false, target: () => target,
     alive: () => false, startTime: vi.fn<() => Promise<string | undefined>>().mockResolvedValueOnce('start').mockResolvedValue(undefined), stop: vi.fn(() => ({ stopped: true })) })
 it('stops only missing browser bindings and proves the exact process ended before normal resume', async () => {
     const f = fixture()
@@ -45,4 +47,40 @@ it('preserves live recovered and external processes without a daemon-owned child
     f.startTime.mockReset().mockResolvedValue(undefined)
     expect(await prepareBrowserSessionReconnect(f)).toEqual({ supported: true, reconnect: true })
     expect(f.stop).not.toHaveBeenCalled()
+})
+
+it('keeps an unconfirmed stopped process pending when tracking disappears and the caller retries', async () => {
+    const f = fixture()
+    let tracked: typeof target | undefined = target
+    let running = true
+    f.target = () => tracked!
+    f.alive = () => running
+    f.startTime.mockReset().mockImplementation(async () => running ? 'original-start' : undefined)
+    f.stop.mockImplementation(() => { tracked = undefined; return { stopped: true } })
+    const options = { ...f, deadlineMs: 1 }
+    await expect(prepareBrowserSessionReconnect(options)).rejects.toThrow('UNCONFIRMED')
+    await expect(prepareBrowserSessionReconnect(options)).rejects.toThrow('UNCONFIRMED')
+    expect(f.stop).toHaveBeenCalledOnce()
+    running = false
+    expect(await prepareBrowserSessionReconnect(options)).toEqual({ supported: true, reconnect: true })
+})
+
+it('serializes concurrent retries and keeps pending exits ahead of new registration reports', async () => {
+    const f = fixture()
+    let tracked: typeof target | undefined = target
+    f.target = () => tracked!
+    f.alive = () => true
+    f.startTime.mockReset().mockResolvedValue('original-start')
+    f.stop.mockImplementation(() => { tracked = undefined; return { stopped: true } })
+    const options = { ...f, deadlineMs: 1 }
+    const results = await Promise.allSettled([
+        prepareBrowserSessionReconnect(options), prepareBrowserSessionReconnect(options),
+    ])
+    for (const result of results) {
+        expect(result.status).toBe('rejected')
+        if (result.status === 'rejected') expect(result.reason.message).toContain('UNCONFIRMED')
+    }
+    f.registered = async () => true
+    await expect(prepareBrowserSessionReconnect({ ...f, deadlineMs: 1 })).rejects.toThrow('UNCONFIRMED')
+    expect(f.stop).toHaveBeenCalledOnce()
 })

@@ -1,4 +1,4 @@
-import { prepareBrowserSessionReconnect } from './browserSessionReconnect';
+import { createBrowserSessionReconnect } from './browserSessionReconnect';
 import { readBrowserTaskPidStartTime } from './browserTaskSessionOwner';
 import { createBrowserNativeDeviceProof, type BrowserNativeDeviceSigner } from './browserNativeDeviceProof';
 import { createManualPersonalSpawn, MANUAL_PERSONAL_ENV } from './manualPersonalClaude';
@@ -5533,6 +5533,7 @@ export async function startDaemon(): Promise<void> {
     // Switch off: no lookup, so every launch is exactly the existing one.
     if (process.env[OWNER_CONTACT_SWITCH] === '1') ownedLaunchLineage = sessionId => ownedSpawn.launchLineage(sessionId);
     ownedPipeOnlyLaunch = options => ownedSpawn.pipeOnlyLaunch(options);
+    const prepareBrowserSessionReconnect = createBrowserSessionReconnect();
     // Set RPC handlers
     apiMachine.setRPCHandlers({
       ownedSpawn,
@@ -5568,6 +5569,7 @@ export async function startDaemon(): Promise<void> {
         if (!personalDesktopLogin || !personalBrowserNative) return { supported: false };
         const login = personalDesktopLogin, native = personalBrowserNative;
         return prepareBrowserSessionReconnect({
+          sessionId,
           current: async () => {
             if (personalDesktopLogin !== login) return false;
             await createDesktopBrowserLoginClient(login, login).check();
