@@ -1,5 +1,3 @@
-import { manageReservationCheckpoint } from '@/app/automation/reservationCheckpoint';
-import { manageReservationConversationLease } from '@/app/automation/reservationConversationLease';
 import { deliverAutomationConversationMessage } from '@/app/automation/automationConversationDelivery';
 import type { Socket } from 'socket.io';
 import {
@@ -24,8 +22,6 @@ import {
 import { emitSessionFollowupMessageUpdate } from '@/app/automation/sessionFollowupUpdate';
 import {
     automationConversationDeliverRequestSchema,
-    reservationLeaseRequestSchema,
-    reservationCheckpointRequestSchema,
     sessionFollowupClaimRequestSchema,
     sessionFollowupDeliverRequestSchema,
     sessionFollowupEvaluationRequestSchema,
@@ -122,6 +118,7 @@ export function automationSocketHandler(accountId: string, machineId: string, so
         ));
     }));
 
+    // Accept the withdrawn client's advertisement; syncAutomations tombstones v5 rows.
     on('automation-sync', async (data, callback) => answer(callback, () => {
         const afterSeq = BigInt(requiredString(data?.afterSeq));
         if (afterSeq < 0n) throw new Error('invalid-input');
@@ -176,16 +173,6 @@ export function automationSocketHandler(accountId: string, machineId: string, so
         runId: requiredString(data?.runId), claimToken: requiredString(data?.claimToken),
     }))));
 
-    on('automation-reservation-checkpoint', async (data, callback) => answer(callback, () => {
-        const input = reservationCheckpointRequestSchema.parse(data);
-        return inTx(tx => manageReservationCheckpoint(tx, accountId, machineId, input));
-    }));
-
-    on('automation-conversation-lease', async (data, callback) => answer(callback, () => {
-        const input = reservationLeaseRequestSchema.parse(data);
-        return inTx(tx => manageReservationConversationLease(tx, accountId, machineId, input));
-    }));
-
     on('automation-conversation-deliver', async (data, callback) => answer(callback, () => {
         const input = automationConversationDeliverRequestSchema.parse(data);
         return inTx((tx) => deliverAutomationConversationMessage(tx, accountId, machineId, input));
@@ -196,7 +183,7 @@ export function automationSocketHandler(accountId: string, machineId: string, so
 
     on('automation-run-report', async (data, callback) => answer(callback, () => {
         const status = data?.status === 'COMPLETED' || data?.status === 'FAILED' ? data.status : null;
-        const outcomes = ['WOKE', 'SILENT', 'SKIPPED_GATE', 'NO_CHANGE', 'ERROR'] as const;
+        const outcomes = ['WOKE', 'SILENT', 'SKIPPED_GATE', 'ERROR', 'NO_CHANGE'] as const;
         const outcome = outcomes.find((candidate) => candidate === data?.outcome);
         if (!status || !outcome) throw new Error('invalid-input');
         const failureCode = data?.failureCode === null || data?.failureCode === undefined

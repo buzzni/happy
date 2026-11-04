@@ -198,6 +198,7 @@ const {
             return result;
         };
         return fn({
+            $queryRaw: timed(async () => [{ id: 'locked-session' }]),
             session: {
                 update: timed(sessionUpdate)
             },

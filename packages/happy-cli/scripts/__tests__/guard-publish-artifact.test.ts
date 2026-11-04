@@ -29,7 +29,6 @@ function createPublishTarball(
         omitBrowserHost?: string
         stubBrowserHost?: string
         withoutBrowserHosts?: boolean
-        omitReservationRuntime?: string
     } = {}
 ): string {
     const fixtureRoot = mkdtempSync(join(tmpdir(), 'happy-cli-guard-test-'))
@@ -63,9 +62,6 @@ function createPublishTarball(
             ? { scripts: { postinstall: 'node scripts/companion-tools-sentinel.mjs' } }
             : {})
     }))
-    for (const file of ['reservation-runtime/profile.json', 'reservation-runtime/Dockerfile', 'scripts/build-reservation-runtime-image.mjs']) {
-        if (options.omitReservationRuntime !== file) writeFixtureFile(packageRoot, file, file.endsWith('.json') ? '{}' : '# runtime fixture')
-    }
     writeFixtureFile(
         packageRoot,
         'bin/happy.mjs',
@@ -335,13 +331,4 @@ describe('guard-publish-artifact', () => {
         expect(result.status).toBe(1)
         expect(result.stderr).toContain('nativeMessaging permission')
     }, 40_000)
-})
-
-describe('native reservation release inputs', () => {
-    it.each(['reservation-runtime/profile.json', 'reservation-runtime/Dockerfile', 'scripts/build-reservation-runtime-image.mjs'])('rejects a package missing %s', file => {
-        const tarball = createPublishTarball('1.1.10-aplus.383', '1.1.10-aplus.383', { omitReservationRuntime: file })
-        const result = spawnSync(process.execPath, [GUARD_SCRIPT, tarball], { encoding: 'utf8', timeout: 30_000 })
-        expect(result.status, result.stderr).toBe(1)
-        expect(result.stderr).toContain(file)
-    })
 })

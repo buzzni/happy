@@ -1,4 +1,3 @@
-import { lockReservationSession, readReservationLease } from './reservationConversationLease';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { Prisma, type AutomationRunOutcome, type Prisma as PrismaTypes } from '@prisma/client';
 import { AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION } from '@slopus/happy-wire';
@@ -17,8 +16,7 @@ export type AutomationExecutionError =
     | 'claim-cancelled'
     | 'claim-expired'
     | 'run-not-running'
-    | 'report-conflict'
-    | 'reservation-unsettled';
+    | 'report-conflict';
 
 type Result<T> = { ok: true; value: T } | { ok: false; error: AutomationExecutionError };
 
@@ -105,12 +103,14 @@ export async function syncAutomations(
         take: input.limit,
     });
     const changes: Array<Record<string, unknown>> = [];
+    // Only codecs the daemon advertises (v1 always). Legacy monitor v2, retired native v5 and unknown versions
+    // are tombstoned: an UPSERT the daemon cache rejects would stall that machine's sync cursor.
+    const supportsPayload = (version: number) => version === 1 || ((version === 2 || version === 4) && !!input.payloadVersions?.includes(version));
     for (const change of rows) {
         if (change.kind === 'TOMBSTONE') {
             const deleted = await tx.automation.findFirst({ where: { id: change.automationId, machineAccountId: accountId, machineId }, include: { project: true } });
-            const cancelled = deleted?.projectId.startsWith('chat:') && deleted.deletedAt && deleted.payloadVersion !== 3
-                && (deleted.project?.config as { chatAutomationState?: unknown } | null)?.chatAutomationState === 'deleted'
-                && (deleted.payloadVersion === 1 || input.payloadVersions?.includes(deleted.payloadVersion));
+            const cancelled = deleted?.projectId.startsWith('chat:') && deleted.deletedAt && supportsPayload(deleted.payloadVersion)
+                && (deleted.project?.config as { chatAutomationState?: unknown } | null)?.chatAutomationState === 'deleted';
             changes.push({ seq: change.seq, automationId: change.automationId, revision: change.revision, generation: change.generation, kind: 'TOMBSTONE',
                 ...(cancelled && deleted ? { chatDeleted: true, payloadVersion: deleted.payloadVersion, payloadCiphertext: deleted.payloadCiphertext, machineKeyEnvelope: deleted.machineKeyEnvelope, machineKeyVersion: deleted.machineKeyVersion, paused: true, enabledAt: deleted.enabledAt } : {}),
             });
@@ -125,7 +125,7 @@ export async function syncAutomations(
                 revision: { gte: change.revision },
             },
         });
-        if (!automation || automation.payloadVersion === 3 || (automation.payloadVersion !== 1 && !input.payloadVersions?.includes(automation.payloadVersion))) {
+        if (!automation || !supportsPayload(automation.payloadVersion)) {
             changes.push({ seq: change.seq, automationId: change.automationId, revision: change.revision, generation: change.generation, kind: 'TOMBSTONE' });
             continue;
         }
@@ -202,7 +202,7 @@ export async function ackAutomationSync(
 
 function executable(automation: any, accountId: string, machineId: string, generation: number): boolean {
     return automation
-        && automation.payloadVersion !== 3
+        && [1, 2, 4].includes(automation.payloadVersion)
         && automation.machineAccountId === accountId
         && automation.machineId === machineId
         && automation.generation === generation
@@ -427,14 +427,6 @@ export async function reportAutomationRun(
             }
             : { ok: false, error: 'report-conflict' };
     }
-    // A terminal report must not revoke a still-running reservation's message
-    // authority before its output is drained and the native process tree exits.
-    if (run.sessionId && run.automation.payloadVersion === 5 && input.sessionId && input.sessionId !== run.sessionId) return { ok: false, error: 'report-conflict' };
-    if (run.sessionId && run.automation.payloadVersion === 5) {
-        await lockReservationSession(tx, accountId, run.sessionId);
-        const lease = await readReservationLease(tx, run.sessionId);
-        if (lease?.runId === run.id) return { ok: false, error: 'reservation-unsettled' };
-    }
     if (run.status !== 'RUNNING' && run.status !== 'ABANDONED') {
         return { ok: false, error: 'run-not-running' };
     }
@@ -480,7 +472,7 @@ export async function reportAutomationRun(
                 reportId: input.reportId,
                 status: input.status,
                 outcome: input.outcome,
-                sessionId: run.automation.payloadVersion === 5 ? run.sessionId : input.sessionId,
+                sessionId: input.sessionId,
                 detailCiphertext: input.detailCiphertext,
                 failureCode: input.failureCode,
                 degradedCode,

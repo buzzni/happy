@@ -2,7 +2,6 @@ import { getMetricsLabelsFromSocket, sessionAliveEventsCounter, websocketEventsC
 import { activityCache } from "@/app/presence/sessionCache";
 import { buildNewMessageUpdate, buildSessionActivityEphemeral, buildUpdateSessionUpdate, ClientConnection, eventRouter } from "@/app/events/eventRouter";
 import { db } from "@/storage/db";
-import { assertReservationWrite, reservationMessageAccess, ReservationWriteDenied } from "@/app/automation/reservationConversationLease";
 import { allocateSessionSeqBatch, allocateUserSeq } from "@/storage/seq";
 import { AsyncLock } from "@/utils/lock";
 import { log } from "@/utils/log";
@@ -51,15 +50,12 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
             }
 
             // Update metadata
-            const { count } = await db.$transaction(async tx => {
-                await assertReservationWrite(tx, userId, sid, socket.handshake?.auth?.reservationAuthorization, true);
-                return tx.session.updateMany({
+            const { count } = await db.session.updateMany({
                 where: { id: sid, metadataVersion: expectedVersion },
                 data: {
                     metadata: metadata,
                     metadataVersion: expectedVersion + 1
                 }
-            });
             });
             if (count === 0) {
                 callback({ result: 'version-mismatch', version: session.metadataVersion, metadata: session.metadata });
@@ -82,7 +78,6 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
             // Send success response with new version via callback
             callback({ result: 'success', version: expectedVersion + 1, metadata: metadata });
         } catch (error) {
-            if (error instanceof ReservationWriteDenied) { callback?.({ result: 'error', error: error.reason }); return; }
             log({ module: 'websocket', level: 'error' }, `Error in update-metadata: ${error}`);
             if (callback) {
                 callback({ result: 'error' });
@@ -121,15 +116,12 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
             }
 
             // Update agent state
-            const { count } = await db.$transaction(async tx => {
-                await assertReservationWrite(tx, userId, sid, socket.handshake?.auth?.reservationAuthorization, true);
-                return tx.session.updateMany({
+            const { count } = await db.session.updateMany({
                 where: { id: sid, agentStateVersion: expectedVersion },
                 data: {
                     agentState: agentState,
                     agentStateVersion: expectedVersion + 1
                 }
-            });
             });
             if (count === 0) {
                 callback({ result: 'version-mismatch', version: session.agentStateVersion, agentState: session.agentState });
@@ -152,7 +144,6 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
             // Send success response with new version via callback
             callback({ result: 'success', version: expectedVersion + 1, agentState: agentState });
         } catch (error) {
-            if (error instanceof ReservationWriteDenied) { callback?.({ result: 'error', error: error.reason }); return; }
             log({ module: 'websocket', level: 'error' }, `Error in update-state: ${error}`);
             if (callback) {
                 callback({ result: 'error' });
@@ -232,9 +223,6 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
             if (!isValid) {
                 return;
             }
-            // Preview is ephemeral: validate the current epoch without holding
-            // the conversation row lock for each streamed token.
-            if (!(await reservationMessageAccess(db, userId, data.sid, socket.handshake?.auth?.reservationAuthorization, new Date(), false, false)).ok) return;
             eventRouter.emitEphemeral({
                 userId,
                 payload: { type: 'stream', id: data.sid, time: data.time, data: data.data },
@@ -246,8 +234,7 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
     });
 
     const receiveMessageLock = new AsyncLock();
-    socket.on('message', async (data: any, callback?: (response: any) => void) => {
-        const acknowledge = typeof callback === 'function' ? callback : undefined;
+    socket.on('message', async (data: any) => {
         await receiveMessageLock.inLock(async () => {
             try {
                 websocketEventsCounter.inc({ event_type: 'message', ...labels });
@@ -280,24 +267,31 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                         where: { sessionId: sid, localId: useLocalId }
                     });
                     if (existing) {
-                        acknowledge?.({ ok: true, messageId: existing.id });
                         return { msg: existing, update: null };
                     }
                 }
 
-                const stored = await db.$transaction(async tx => {
-                    await assertReservationWrite(tx, userId, sid, socket.handshake?.auth?.reservationAuthorization);
-                    // Recheck after the session lock: concurrent REST/socket retries
-                    // can have committed while this handler waited for admission.
-                    const replay = useLocalId ? await tx.sessionMessage.findFirst({ where: { sessionId: sid, localId: useLocalId } }) : null;
-                    if (replay) return { msg: replay, inserted: false };
+                // Allocate and insert under the Session row lock REST batches also take,
+                // so no reader can advance past a seq whose message is not stored yet.
+                const msg = await db.$transaction(async (tx) => {
+                    const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT "id" FROM "Session" WHERE "id" = ${sid} AND "accountId" = ${userId} FOR UPDATE`;
+                    if (!locked.length) return null;
+                    // A concurrent retry may have committed while this one waited for the lock.
+                    if (useLocalId && await tx.sessionMessage.findFirst({ where: { sessionId: sid, localId: useLocalId } })) return null;
                     const [msgSeq] = await allocateSessionSeqBatch(sid, 1, tx);
-                    const msg = await tx.sessionMessage.create({ data: { sessionId: sid, seq: msgSeq!, content: msgContent, localId: useLocalId } });
-                    return { msg, inserted: true };
+                    return tx.sessionMessage.create({
+                        data: {
+                            sessionId: sid,
+                            seq: msgSeq!,
+                            content: msgContent,
+                            localId: useLocalId
+                        }
+                    });
+                }, {
+                    // Same budget as REST batches, which wait on this lock too; Prisma's 5s default is shorter.
+                    timeout: 10000
                 });
-                acknowledge?.({ ok: true, messageId: stored.msg.id });
-                if (!stored.inserted) return;
-                const msg = stored.msg;
+                if (!msg) return;
                 // Account.seq uses its own transaction, after releasing Session.
                 const updSeq = await allocateUserSeq(userId);
 
@@ -310,13 +304,6 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                     skipSenderConnection: connection
                 });
             } catch (error) {
-                if (error instanceof ReservationWriteDenied) {
-                    const failure = { sid: data?.sid, localId: data?.localId ?? null, error: error.reason };
-                    acknowledge?.({ ok: false, error: error.reason });
-                    socket.emit('message-error', failure);
-                    return;
-                }
-                acknowledge?.({ ok: false, error: 'write-failed' });
                 log({ module: 'websocket', level: 'error' }, `Error in message handler: ${error}`);
             }
         });
@@ -348,9 +335,9 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
             }
 
             // Update last active at
-            await db.$transaction(async tx => {
-                await assertReservationWrite(tx, userId, sid, socket.handshake?.auth?.reservationAuthorization, true);
-                await tx.session.update({ where: { id: sid }, data: { lastActiveAt: new Date(t), active: false } });
+            await db.session.update({
+                where: { id: sid },
+                data: { lastActiveAt: new Date(t), active: false }
             });
 
             // Emit session activity update

@@ -171,18 +171,11 @@ export const automationPayloadSchema = z.object({
   effort: z.string().nullable().optional(),
   githubTrigger: githubTriggerSchema.optional(),
   conversation: z.object({ sessionId: z.string().trim().min(1).max(200) }).optional(),
-  reservation: z.strictObject({ version: z.literal(1), stateKey: z.string().regex(/^[A-Za-z0-9+/]{43}=$/),
-    commands: z.strictObject({ allowedOrigins: z.array(z.string().url().refine(value => { try { const url = new URL(value); return ['http:', 'https:'].includes(url.protocol) && url.origin === value && !url.username && !url.password; } catch { return false; } })).max(100), privateOrigins: z.array(z.string()).max(100) }).refine(value => value.privateOrigins.every(origin => value.allowedOrigins.includes(origin))).optional(),
-    monitorSeed: z.strictObject({ monitorIdentity: z.string().regex(/^[a-f0-9]{64}$/).nullable(), lastHash: z.string().regex(/^[a-f0-9]{64}$/).nullable(), lastOutput: z.string().max(32768), lastChangedAt: z.number().int().nonnegative().nullable(), notepad: z.record(z.string(), z.string()).refine(value => new TextEncoder().encode(JSON.stringify(value)).length <= 65536) }).optional(),
-  }).optional(),
-  monitorCommand: z.string().trim().min(1).max(8000).optional(),
   // A delivery this daemon cannot read is dropped, never a reason to skip the run itself.
   delivery: automationDeliverySchema.optional().catch(undefined),
   seal: automationSealSchema.optional(),
 }).superRefine((payload, context) => {
-  if (payload.conversation && payload.githubTrigger && !payload.reservation) context.addIssue({ code: 'custom', path: ['conversation'], message: 'conversation delivery cannot use GitHub triggers' });
-  if (payload.reservation && !payload.conversation) context.addIssue({ code: 'custom', path: ['reservation'], message: 'reservation requires a fixed conversation' });
-  if (payload.monitorCommand && (!payload.reservation || payload.githubTrigger)) context.addIssue({ code: 'custom', path: ['monitorCommand'], message: 'monitor requires a versioned time reservation' });
+  if (payload.conversation && payload.githubTrigger) context.addIssue({ code: 'custom', path: ['conversation'], message: 'conversation delivery cannot use GitHub triggers' });
   const isGithubSchedule = payload.schedule.kind === 'github';
   if (isGithubSchedule !== (payload.githubTrigger !== undefined)) {
     context.addIssue({
@@ -202,7 +195,7 @@ export const automationPublicSchema = z.object({
   machineId: z.string().min(1).nullable(),
   revision: positiveInteger,
   generation: positiveInteger,
-  payloadVersion: z.union([z.literal(1), z.literal(4), z.literal(5)]),
+  payloadVersion: z.union([z.literal(1), z.literal(4)]),
   payloadCiphertext: payloadCiphertextSchema,
   viewerKeyId: z.string().min(1).max(128),
   viewerKeyVersion: positiveInteger,
@@ -233,7 +226,7 @@ export type AutomationTarget = z.infer<typeof automationTargetSchema>;
 export const automationRunStatusSchema = z.enum([
   'CLAIMED', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED', 'EXPIRED', 'ABANDONED',
 ]);
-export const automationRunOutcomeSchema = z.enum(['WOKE', 'SILENT', 'SKIPPED_GATE', 'NO_CHANGE', 'ERROR']);
+export const automationRunOutcomeSchema = z.enum(['WOKE', 'SILENT', 'SKIPPED_GATE', 'ERROR', 'NO_CHANGE']);
 export const automationRunSchema = z.object({
   id: z.string().min(1),
   automationId: z.string().min(1),
@@ -258,7 +251,7 @@ export const automationRunSchema = z.object({
 export type AutomationRun = z.infer<typeof automationRunSchema>;
 
 export const automationEncryptedFieldsSchema = z.object({
-  payloadVersion: z.union([z.literal(1), z.literal(4), z.literal(5)]),
+  payloadVersion: z.union([z.literal(1), z.literal(4)]),
   payloadCiphertext: payloadCiphertextSchema,
   viewerKeyId: z.string().min(1).max(128),
   viewerKeyVersion: positiveInteger,
@@ -287,7 +280,7 @@ export interface AutomationAdoption {
 export const automationUpdateRequestSchema = z.object({
   expectedRevision: positiveInteger,
   paused: z.boolean().optional(),
-  payloadVersion: z.union([z.literal(1), z.literal(4), z.literal(5)]).optional(),
+  payloadVersion: z.union([z.literal(1), z.literal(4)]).optional(),
   payloadCiphertext: payloadCiphertextSchema.optional(),
   viewerKeyId: z.string().min(1).max(128).optional(),
   viewerKeyVersion: positiveInteger.optional(),
@@ -365,7 +358,7 @@ export async function encryptAutomationPayload(input: {
   const plaintext = new TextEncoder().encode(JSON.stringify(payload));
   const ciphertext = versioned(input.crypto.secretBoxSeal(plaintext, dek));
   const result = {
-    payloadVersion: payload.reservation ? 5 as const : payload.conversation ? 4 as const : 1 as const,
+    payloadVersion: payload.conversation ? 4 as const : 1 as const,
     payloadCiphertext: input.crypto.encodeBase64(ciphertext),
     viewerKeyId: input.crypto.encodeBase64(await input.crypto.sha256(input.viewer.publicKey), true),
     viewerKeyVersion: input.viewer.keyVersion,
@@ -401,7 +394,7 @@ function sealMachineKey(input: {
  * Whether to trust the sender, and what to check in `seal`, is the caller's.
  */
 export function openAutomationPayloadForMachine(input: {
-  payloadVersion: 1 | 4 | 5;
+  payloadVersion: 1 | 4;
   payloadCiphertext: string;
   machineKeyEnvelope: string;
   recipientSecretKey: Uint8Array;
@@ -410,7 +403,7 @@ export function openAutomationPayloadForMachine(input: {
   let ciphertext: Uint8Array;
   let envelope: Uint8Array;
   try {
-    if ((input.payloadVersion !== 1 && input.payloadVersion !== 4 && input.payloadVersion !== 5) || input.recipientSecretKey.length !== 32) return { ok: false, reason: 'malformed' };
+    if ((input.payloadVersion !== 1 && input.payloadVersion !== 4) || input.recipientSecretKey.length !== 32) return { ok: false, reason: 'malformed' };
     ciphertext = input.crypto.decodeBase64(input.payloadCiphertext);
     envelope = input.crypto.decodeBase64(input.machineKeyEnvelope);
   } catch {
@@ -431,7 +424,7 @@ export function openAutomationPayloadForMachine(input: {
     const plaintext = input.crypto.secretBoxOpen(ciphertext.slice(1), opened.key);
     if (!plaintext) return { ok: false, reason: 'malformed' };
     const payload = automationPayloadSchema.safeParse(JSON.parse(new TextDecoder().decode(plaintext)));
-    if (!payload.success || (input.payloadVersion === 5) !== !!payload.data.reservation || ((input.payloadVersion === 4 || input.payloadVersion === 5) !== !!payload.data.conversation)) return { ok: false, reason: 'malformed' };
+    if (!payload.success || (input.payloadVersion === 4) !== !!payload.data.conversation) return { ok: false, reason: 'malformed' };
     return { ok: true, payload: payload.data, authentication: opened.authentication };
   } catch {
     return { ok: false, reason: 'malformed' };
@@ -441,14 +434,14 @@ export function openAutomationPayloadForMachine(input: {
 }
 
 export async function decryptAutomationPayload(input: {
-  payloadVersion: 1 | 4 | 5;
+  payloadVersion: 1 | 4;
   payloadCiphertext: string;
   keyEnvelope: string;
   recipientSecretKey: Uint8Array;
   crypto: AutomationCryptoAdapter;
 }): Promise<AutomationPayload> {
   try {
-    if ((input.payloadVersion !== 1 && input.payloadVersion !== 4 && input.payloadVersion !== 5) || input.recipientSecretKey.length !== 32) throw new Error();
+    if ((input.payloadVersion !== 1 && input.payloadVersion !== 4) || input.recipientSecretKey.length !== 32) throw new Error();
     const encryptedDek = openVersioned(input.keyEnvelope, input.crypto, ENVELOPE_BYTES);
     const dek = input.crypto.boxOpen(encryptedDek, input.recipientSecretKey);
     if (!dek || dek.length !== 32) throw new Error();
@@ -456,7 +449,7 @@ export async function decryptAutomationPayload(input: {
     const plaintext = input.crypto.secretBoxOpen(encryptedPayload, dek);
     if (!plaintext) throw new Error();
     const payload = automationPayloadSchema.parse(JSON.parse(new TextDecoder().decode(plaintext)));
-    if ((input.payloadVersion === 5) !== !!payload.reservation || ((input.payloadVersion === 4 || input.payloadVersion === 5) !== !!payload.conversation)) throw new Error();
+    if ((input.payloadVersion === 4) !== !!payload.conversation) throw new Error();
     return payload;
   } catch {
     throw new Error('automation-decrypt-failed');
@@ -643,7 +636,6 @@ export const automationConversationDeliverRequestSchema = z.object({
   runId: z.string().min(1).max(200),
   claimToken: z.string().min(1).max(256),
   sessionId: z.string().min(1).max(200),
-  reservationEpoch: z.string().min(1).max(200).optional(),
   expectedSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER - 1),
   contentCiphertext: base64Schema(128 * 1024),
 });

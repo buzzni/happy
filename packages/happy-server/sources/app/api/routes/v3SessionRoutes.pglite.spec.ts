@@ -5,7 +5,10 @@ import { PrismaClient } from '@prisma/client';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
-import { resolve } from 'node:path';
+import { resolve, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import fastify from 'fastify';
 import { serializerCompiler, validatorCompiler, type ZodTypeProvider } from 'fastify-type-provider-zod';
 import type { Fastify } from '../types';
@@ -19,13 +22,20 @@ vi.mock('@/app/events/eventRouter', () => ({
     buildNewMessageUpdate: (message: unknown, sessionId: string, seq: number) => ({ seq, body: { sid: sessionId, message } }),
 }));
 
-import { manageReservationConversationLease } from '@/app/automation/reservationConversationLease';
-import { createHash } from 'node:crypto';
 import { v3SessionRoutes } from './v3SessionRoutes';
 
 let sql: string;
 let pg: PGlite;
 let client: PrismaClient;
+let admin: PrismaClient | undefined;
+let schema: string | undefined;
+const postgresUrl = process.env.HAPPY_MESSAGE_BATCH_TEST_DATABASE_URL;
+if (postgresUrl) {
+    const target = new URL(postgresUrl);
+    if (!['localhost', '127.0.0.1'].includes(target.hostname) || target.pathname !== '/happy_rollback') {
+        throw new Error('Message batch test requires a dedicated loopback happy_rollback database');
+    }
+}
 
 beforeAll(async () => {
     const require = createRequire(resolve('package.json'));
@@ -33,17 +43,35 @@ beforeAll(async () => {
         { env: { ...process.env, DATABASE_URL: 'postgresql://unused:unused@localhost:5432/unused' }, maxBuffer: 1024 * 1024 })).stdout;
 });
 beforeEach(async () => {
-    pg = new PGlite(); await pg.exec(sql);
-    client = new PrismaClient({ adapter: new PrismaPGlite(pg) });
+    if (postgresUrl) {
+        schema = `message_batch_${randomUUID().replace(/-/g, '')}`;
+        admin = new PrismaClient({ datasourceUrl: postgresUrl });
+        await admin.$executeRawUnsafe(`CREATE SCHEMA "${schema}"`);
+        const target = new URL(postgresUrl); target.searchParams.set('schema', schema);
+        const dir = await mkdtemp(join(tmpdir(), 'message-batch-schema-'));
+        try {
+            const file = join(dir, 'schema.sql'); await writeFile(file, sql);
+            const require = createRequire(resolve('package.json'));
+            await promisify(execFile)(process.execPath, [require.resolve('prisma/build/index.js'), 'db', 'execute', '--url', target.toString(), '--file', file]);
+        } finally { await rm(dir, { recursive: true, force: true }); }
+        client = new PrismaClient({ datasourceUrl: target.toString() });
+    } else {
+        pg = new PGlite(); await pg.exec(sql);
+        client = new PrismaClient({ adapter: new PrismaPGlite(pg) });
+    }
     state.client = client;
     state.emitted = [];
     await client.account.create({ data: { id: 'account-1', publicKey: 'account-1' } });
     await client.session.create({ data: { id: 'session-1', tag: 'tag', accountId: 'account-1', metadata: '', seq: 1 } });
     await client.sessionMessage.create({ data: { sessionId: 'session-1', seq: 1, localId: 'existing', content: { t: 'encrypted', c: 'old' } } });
 });
-afterEach(async () => { await client?.$disconnect(); await pg?.close(); });
+afterEach(async () => {
+    await client?.$disconnect();
+    if (admin && schema) { await admin.$executeRawUnsafe(`DROP SCHEMA "${schema}" CASCADE`); await admin.$disconnect(); admin = undefined; schema = undefined; }
+    await pg?.close();
+});
 
-async function send(messages: Array<{ localId: string; content: string }>, authorization?: string) {
+async function send(messages: Array<{ localId: string; content: string }>) {
     const app = fastify();
     app.setValidatorCompiler(validatorCompiler);
     app.setSerializerCompiler(serializerCompiler);
@@ -53,12 +81,56 @@ async function send(messages: Array<{ localId: string; content: string }>, autho
     typed.decorate('authenticateSessionScope', authenticate);
     v3SessionRoutes(typed);
     await typed.ready();
-    const response = await typed.inject({ method: 'POST', url: '/v3/sessions/session-1/messages', payload: { messages }, headers: authorization ? { 'x-happy-reservation-authorization': authorization } : {} });
+    const response = await typed.inject({ method: 'POST', url: '/v3/sessions/session-1/messages', payload: { messages } });
     await typed.close();
     return response;
 }
 
 describe('message batch writes against the stored rows', () => {
+    it('rechecks ownership under the transaction lock before appending', async () => {
+        await client.account.create({ data: { id: 'account-2', publicKey: 'account-2' } });
+        let transferred = false;
+        state.client = client.$extends({ query: { session: { async findFirst({ args, query }) {
+            const result = await query(args);
+            if (result && !transferred) {
+                transferred = true;
+                await client.session.update({ where: { id: 'session-1' }, data: { accountId: 'account-2' } });
+            }
+            return result;
+        } } } });
+        const response = await send([{ localId: 'late-write', content: 'late' }]);
+        expect(response.statusCode).toBe(404);
+        expect(await client.sessionMessage.count()).toBe(1);
+        expect(state.emitted).toEqual([]);
+    });
+
+    it.skipIf(!postgresUrl)('serializes overlapping REST batches before deduplication on PostgreSQL', async () => {
+        let reads = 0;
+        let secondRead: () => void = () => {};
+        const bothRead = new Promise<void>(resolve => { secondRead = resolve; });
+        state.client = client.$extends({ query: { sessionMessage: { async findMany({ args, query }) {
+            const result = await query(args);
+            if (++reads === 1) {
+                let timer: ReturnType<typeof setTimeout>;
+                await Promise.race([bothRead, new Promise<void>(resolve => { timer = setTimeout(resolve, 250); })]);
+                clearTimeout(timer!);
+            } else if (reads === 2) secondRead();
+            return result;
+        } } } });
+        const [left, right] = await Promise.all([
+            send([{ localId: 'shared', content: 'shared' }, { localId: 'left', content: 'left' }]),
+            send([{ localId: 'shared', content: 'shared' }, { localId: 'right', content: 'right' }]),
+        ]);
+        expect([left.statusCode, right.statusCode]).toEqual([200, 200]);
+        const shared = (response: typeof left) => response.json().messages.find((row: { localId: string }) => row.localId === 'shared');
+        expect(shared(left)).toEqual(shared(right));
+        const rows = await client.sessionMessage.findMany({ where: { sessionId: 'session-1' }, orderBy: { seq: 'asc' } });
+        expect(rows.map(row => row.seq)).toEqual([1, 2, 3, 4]);
+        expect(new Set(rows.map(row => row.localId)).size).toBe(4);
+        expect((await client.session.findUniqueOrThrow({ where: { id: 'session-1' } })).seq).toBe(4);
+        expect(state.emitted).toHaveLength(3);
+    });
+
     it('inserts only new localIds in one batch and a retry of the same batch adds nothing', async () => {
         const batch = [
             { localId: 'existing', content: 'ignored' },
@@ -87,23 +159,4 @@ describe('message batch writes against the stored rows', () => {
         expect(await client.sessionMessage.count({ where: { sessionId: 'session-1' } })).toBe(3);
         expect(state.emitted).toHaveLength(2);
     });
-});
-
-it('holds manual messages without consuming seqs while a reservation owns the conversation, but replays old ACKs', async () => {
-    const now = new Date();
-    await client.project.create({ data: { id: 'p', accountId: 'account-1', name: 'P', config: { machineId: 'm' }, automationViewerKeyVersion: 1 } });
-    await client.machine.create({ data: { id: 'm', accountId: 'account-1', metadata: '', automationKeyVersion: 1 } });
-    await client.automation.create({ data: { id: 'a', projectId: 'p', ownerAccountId: 'account-1', machineAccountId: 'account-1', machineId: 'm', payloadVersion: 5, payloadCiphertext: new Uint8Array([1]), viewerKeyId: 'k', viewerKeyVersion: 1, viewerKeyEnvelope: new Uint8Array([1]), machineKeyVersion: 1, machineKeyEnvelope: new Uint8Array([1]) } });
-    await client.automationRun.create({ data: { id: 'r', automationId: 'a', generation: 1, scheduledFor: now, machineAccountId: 'account-1', machineId: 'm', status: 'RUNNING', claimTokenHash: new Uint8Array(createHash('sha256').update('claim').digest()), claimExpiresAt: new Date(now.getTime() + 600000), runLeaseExpiresAt: new Date(now.getTime() + 600000) } });
-    const base = { wireVersion: 1 as const, runId: 'r', claimToken: 'claim', sessionId: 'session-1' }, descriptorHash = 'a'.repeat(64);
-    const admitted = await client.$transaction(tx => manageReservationConversationLease(tx, 'account-1', 'm', { ...base, operation: 'acquire', expectedSeq: 1, descriptorHash }, now));
-    if (!admitted.ok) throw new Error('admission failed');
-    const blocked = await send([{ localId: 'manual-new', content: 'manual' }]);
-    expect(blocked.statusCode).toBe(409); expect(blocked.json()).toMatchObject({ error: 'reservation-busy' });
-    expect((await client.session.findUniqueOrThrow({ where: { id: 'session-1' } })).seq).toBe(1);
-    expect(state.emitted).toHaveLength(0);
-    expect((await send([{ localId: 'existing', content: 'retry' }])).statusCode).toBe(200);
-    await client.$transaction(tx => manageReservationConversationLease(tx, 'account-1', 'm', { ...base, operation: 'activate', runtime: { launchId: 'launch', processGroupId: 1, processStartId: 'start' }, epoch: admitted.value.epoch, descriptorHash }, now));
-    expect((await send([{ localId: 'runtime-output', content: 'answer' }], admitted.value.messageAuthorization)).statusCode).toBe(200);
-    expect(await client.session.count()).toBe(1);
 });

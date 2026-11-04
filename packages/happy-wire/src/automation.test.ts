@@ -176,6 +176,7 @@ describe('automation wire contract', () => {
       claimedAt: 1, startedAt: 2, completedAt: 3, lateReport: false,
     };
     expect(automationRunSchema.parse(run)).toEqual(run);
+    expect(automationRunSchema.parse({ ...run, outcome: 'NO_CHANGE' }).outcome).toBe('NO_CHANGE');
     expect(automationRunSchema.safeParse({ ...run, degradedCode: 'secret: do not expose' }).success).toBe(false);
   });
 
@@ -471,45 +472,4 @@ describe('messenger delivery settings (Saycode specs/_archive/automation-result-
   it('leaves payloads without a delivery choice exactly as they were', () => {
     expect(automationPayloadSchema.parse(ordinary)).toEqual(ordinary);
   });
-});
-
-
-describe('reservation conversation v5', () => {
-  const reservation = { version: 1, stateKey: Buffer.alloc(32, 9).toString('base64') };
-  const task = { name: 'Watch', prompt: 'Report changes', directory: '/project', schedule: { kind: 'interval', minutes: 15 }, scriptCommand: null, suppressSilent: false, agent: 'codex', conversation: { sessionId: 'fixed' }, reservation };
-  it('retains the reservation marker and bounded monitor command instead of stripping either', () => {
-    expect(automationPayloadSchema.parse({ ...task, monitorCommand: 'node monitor.mjs' })).toMatchObject({ reservation, conversation: { sessionId: 'fixed' }, monitorCommand: 'node monitor.mjs' });
-  });
-  it('encrypts new semantics as v5 and rejects relabeling the ciphertext as an existing reservation', async () => {
-    const crypto = fakeCrypto(), key = new Uint8Array(32).fill(1);
-    const encrypted = await encryptAutomationPayload({ payload: automationPayloadSchema.parse(task), viewer: { publicKey: key, keyVersion: 1 }, machine: { publicKey: key, keyVersion: 1 }, crypto });
-    expect(encrypted.payloadVersion).toBe(5);
-    const read = { ...encrypted, keyEnvelope: encrypted.viewerKeyEnvelope, recipientSecretKey: key, crypto };
-    expect(await decryptAutomationPayload(read)).toMatchObject({ reservation, conversation: { sessionId: 'fixed' } });
-    await expect(decryptAutomationPayload({ ...read, payloadVersion: 4 })).rejects.toThrow('automation-decrypt-failed');
-  });
-  it('requires a valid state key and fixed target', () => {
-    expect(automationPayloadSchema.safeParse({ ...task, conversation: undefined }).success).toBe(false);
-    expect(automationPayloadSchema.safeParse({ ...task, reservation: { version: 1, stateKey: 'invalid' } }).success).toBe(false);
-    expect(automationPayloadSchema.safeParse({ ...task, reservation: undefined, monitorCommand: 'node monitor.mjs' }).success).toBe(false);
-  });
-  it('permits GitHub event binding only for the versioned reservation contract', () => {
-    const githubTrigger = { event: 'opened', action: 'start-session', githubCredentialId: null, filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] } };
-    expect(automationPayloadSchema.safeParse({ ...task, schedule: { kind: 'github', minutes: 15 }, githubTrigger }).success).toBe(true);
-    expect(automationPayloadSchema.safeParse({ ...task, reservation: undefined, schedule: { kind: 'github', minutes: 15 }, githubTrigger }).success).toBe(false);
-  });
-});
-
-it('preserves the sealed native monitor scope and refuses broad or credential-bearing destinations', () => {
-  const value = { name: 'Monitor', schedule: { kind: 'interval', minutes: 15 }, prompt: 'Explain changes', directory: '/project', scriptCommand: 'check-gate', suppressSilent: false, agent: 'codex',
-    conversation: { sessionId: 'same-chat' }, monitorCommand: 'check-status', reservation: { version: 1, stateKey: 'A'.repeat(43) + '=',
-      commands: { allowedOrigins: ['https://example.com', 'http://10.0.0.2'], privateOrigins: ['http://10.0.0.2'] },
-      monitorSeed: { monitorIdentity: 'a'.repeat(64), lastHash: 'b'.repeat(64), lastOutput: 'baseline', lastChangedAt: 1, notepad: { cursor: '17' } } } };
-  expect(automationPayloadSchema.parse(value)).toEqual(value);
-  for (const commands of [
-    { allowedOrigins: ['https://example.com/path'], privateOrigins: [] },
-    { allowedOrigins: ['https://user:secret@example.com'], privateOrigins: [] },
-    { allowedOrigins: ['https://example.com'], privateOrigins: ['http://10.0.0.2'] },
-    { allowedOrigins: ['*'], privateOrigins: [] },
-  ]) expect(automationPayloadSchema.safeParse({ ...value, reservation: { ...value.reservation, commands } }).success).toBe(false);
 });

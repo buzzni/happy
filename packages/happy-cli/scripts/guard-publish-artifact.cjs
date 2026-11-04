@@ -13,9 +13,6 @@ const DEPENDENCY_FIELDS = [
 ];
 
 const EXPECTED_BUNDLED_FILES = [
-    'package/reservation-runtime/profile.json',
-    'package/reservation-runtime/Dockerfile',
-    'package/scripts/build-reservation-runtime-image.mjs',
     'package/bin/happy-browser-native-host.mjs',
     'package/bin/happy-agent-task.mjs',
     'package/dist/browserNativeMessagingHost.mjs',

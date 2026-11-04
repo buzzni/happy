@@ -15,6 +15,13 @@ describe('serverAutomationRuntimeStore', () => {
   })
   afterEach(() => rmSync(dir, { recursive: true, force: true }))
 
+  it('reloads an already pending NO_CHANGE report after rollback', () => {
+    const store = createServerAutomationRuntimeStore({ filePath: file })
+    const report = { runId: 'native-run', claimToken: 'claim', reportId: 'report', status: 'COMPLETED' as const, outcome: 'NO_CHANGE' as const, sessionId: null, detailCiphertext: null }
+    store.write({ schedules: [], pendingReports: [report] })
+    expect(createServerAutomationRuntimeStore({ filePath: file }).read().pendingReports).toEqual([report])
+  })
+
   it('keeps a spent one-time occurrence across a reload', () => {
     // 소진 기록을 파서가 버리면 재기동 뒤 편집·재개가 같은 회차를 두 번 실행한다.
     const store = createServerAutomationRuntimeStore({ filePath: file })

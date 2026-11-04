@@ -110,7 +110,6 @@ function makeTx(options: {
             create: vi.fn(async () => ({})),
         },
         automationRun: {
-            findFirst: vi.fn(async (): Promise<null | { id: string }> => null),
             findMany: vi.fn(async () => [{ id: 'run-1', automationId: 'automation-1' }]),
         },
         sessionFollowup: {
@@ -135,7 +134,7 @@ const createInput = {
 };
 
 describe('automationService', () => {
-    it.each([4, 5])('registers one paused reservation and recovers the same row on concurrent retries (codec %s)', async payloadVersion => {
+    it('registers one paused ordinary reservation and recovers the same row on concurrent retries', async () => {
         const { tx } = makeTx({ automation: null });
         let stored: ReturnType<typeof automationRecord> | null = null;
         tx.automation.createMany = vi.fn(async ({ data }: any) => {
@@ -143,14 +142,14 @@ describe('automationService', () => {
             stored = automationRecord(data[0]); return { count: 1 };
         });
         tx.automation.findUnique = vi.fn(async () => stored);
-        const input = { ...createInput, payloadVersion, paused: true };
+        const input = { ...createInput, payloadVersion: 4, paused: true };
         const results = await Promise.all(Array.from({ length: 3 }, () =>
             createRegisteredAutomation(tx as never, 'editor-1', 'project-1', 'registration-key-1', input)));
         expect(results.every(result => result.ok)).toBe(true);
         expect(new Set(results.map(result => result.ok && result.value.id)).size).toBe(1);
         expect(tx.automation.createMany).toHaveBeenCalledWith(expect.objectContaining({ skipDuplicates: true }));
         expect(tx.automationChange.create).toHaveBeenCalledTimes(1);
-        expect(stored).toMatchObject({ paused: true, payloadVersion, ownerAccountId: 'editor-1' });
+        expect(stored).toMatchObject({ paused: true, payloadVersion: 4, ownerAccountId: 'editor-1' });
         await expect(getRegisteredAutomation(tx as never, 'editor-1', 'project-1', 'registration-key-1')).resolves.toEqual({ ok: true, value: stored });
     });
 
@@ -550,23 +549,18 @@ describe('automationService', () => {
     });
 });
 
- describe('project reservation conversion fence', () => {
-    it.each([4, 5])('rejects converting an enabled legacy project automation to a conversation (codec %s)', async payloadVersion => {
-        const { tx } = makeTx();
-        await expect(updateAutomation(tx as never, 'editor-1', 'project-1', 'automation-1', { ...createInput, expectedRevision: 1, payloadVersion, paused: true }))
-            .resolves.toEqual({ ok: false, error: 'conversion-requires-pause' });
-        expect(tx.automation.updateMany).not.toHaveBeenCalled();
-    });
-    it.each([4, 5])('rejects conversion while a claimed or running old generation still owns a lease (codec %s)', async payloadVersion => {
-        const { tx } = makeTx({ automation: automationRecord({ paused: true }) });
-        tx.automationRun.findFirst.mockResolvedValue({ id: 'old-run' });
-        await expect(updateAutomation(tx as never, 'editor-1', 'project-1', 'automation-1', { ...createInput, expectedRevision: 1, payloadVersion, paused: true }))
-            .resolves.toEqual({ ok: false, error: 'conversion-active-run' });
-        expect(tx.automationChange.create).not.toHaveBeenCalled();
-    });
-    it.each([4, 5])('saves a drained conversion paused with its same id and run history (codec %s)', async payloadVersion => {
-        const { tx } = makeTx({ automation: automationRecord({ paused: true }) });
-        expect((await updateAutomation(tx as never, 'editor-1', 'project-1', 'automation-1', { ...createInput, expectedRevision: 1, payloadVersion, paused: true })).ok).toBe(true);
-        expect(tx.automationRun.findFirst).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ automationId: 'automation-1', status: { in: ['CLAIMED', 'RUNNING'] } }) }));
-    });
- });
+it('refuses a previously persisted native v5 run request after rollback', async () => {
+  const { tx } = makeTx({ automation: automationRecord({ payloadVersion: 5 }) });
+  expect(await requestAutomationRun(tx as never, 'editor-1', 'project-1', 'automation-1', 1)).toEqual({ ok: false, error: 'automation-run-unsupported' });
+});
+
+it('keeps legacy monitor v2 run requests accepted as before the rollback', async () => {
+  const { tx } = makeTx({ automation: automationRecord({ payloadVersion: 2 }) });
+  expect(await requestAutomationRun(tx as never, 'editor-1', 'project-1', 'automation-1', 1)).toMatchObject({ ok: true });
+});
+
+it('reports a retired native v5 registration as a conflict instead of returning a row clients cannot parse', async () => {
+  const { tx } = makeTx();
+  tx.automation.findUnique = vi.fn(async () => automationRecord({ payloadVersion: 5 }));
+  await expect(getRegisteredAutomation(tx as never, 'editor-1', 'project-1', 'registration-key-1')).resolves.toEqual({ ok: false, error: 'registration-conflict' });
+});

@@ -551,6 +551,7 @@ enum AutomationRunStatus {
 }
 
 enum AutomationRunOutcome {
+    // Deprecated: readable and reportable for historical runs only.
     NO_CHANGE
     WOKE
     SILENT
@@ -1203,7 +1204,7 @@ model SessionOwnershipBinding {
     @@unique([subjectIssuer, nonce])
 }
 
-// Remains after an automation/run is deleted: only a bound exit receipt may release a conversation.
+// Retired v5 persistence only. Kept with the published additive migration to preserve data; no executor uses it after rollback.
 enum ReservationConversationLeaseState {
     PREPARING
     RUNNING

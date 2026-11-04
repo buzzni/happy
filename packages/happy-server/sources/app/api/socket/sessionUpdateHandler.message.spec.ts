@@ -1,24 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
-    assertReservationWrite: vi.fn(),
-    socketEmit: vi.fn(),
     sessionFindUnique: vi.fn(),
     messageFindFirst: vi.fn(),
     messageCreate: vi.fn(),
+    lockSession: vi.fn(),
+    transactionOptions: vi.fn(),
     allocateUserSeq: vi.fn(),
     allocateSessionSeq: vi.fn(),
     emitUpdate: vi.fn(),
     log: vi.fn(),
+    tx: {} as Record<string, unknown>,
 }));
-
-vi.mock('@/app/automation/reservationConversationLease', async importOriginal => ({ ...await importOriginal<typeof import('@/app/automation/reservationConversationLease')>(), assertReservationWrite: mocks.assertReservationWrite }));
+mocks.tx = { $queryRaw: mocks.lockSession, sessionMessage: { findFirst: mocks.messageFindFirst, create: mocks.messageCreate } };
 
 vi.mock('@/utils/log', () => ({ log: mocks.log }));
 
 vi.mock('@/storage/db', () => ({
     db: {
-        $transaction: async (fn: Function) => fn({ sessionMessage: { findFirst: mocks.messageFindFirst, create: mocks.messageCreate } }),
+        $transaction: async (fn: Function, options?: unknown) => { mocks.transactionOptions(options); return fn(mocks.tx); },
         session: { findUnique: mocks.sessionFindUnique },
         sessionMessage: { findFirst: mocks.messageFindFirst, create: mocks.messageCreate },
     },
@@ -44,14 +44,13 @@ vi.mock('@/app/monitoring/metrics2', () => ({
 vi.mock('@/app/events/persistSessionEvent', () => ({ persistSessionEvent: vi.fn() }));
 vi.mock('@/app/events/sessionStreamRateLimiter', () => ({ sessionStreamRateLimiter: { admit: vi.fn(() => true) } }));
 
-import { ReservationWriteDenied } from '@/app/automation/reservationConversationLease';
 import { sessionUpdateHandler } from './sessionUpdateHandler';
 
 type Handler = (...args: any[]) => Promise<void> | void;
 
 function messageHandler() {
     const handlers = new Map<string, Handler>();
-    const socket = { emit: mocks.socketEmit, handshake: { auth: {} }, on: (event: string, handler: Handler) => { handlers.set(event, handler); } } as any;
+    const socket = { on: (event: string, handler: Handler) => { handlers.set(event, handler); } } as any;
     sessionUpdateHandler('user-1', socket, { connectionType: 'session-scoped', socket } as any);
     return handlers.get('message')!;
 }
@@ -63,7 +62,7 @@ describe('socket message persistence', () => {
         mocks.messageFindFirst.mockResolvedValue(null);
         mocks.allocateUserSeq.mockResolvedValue(5);
         mocks.allocateSessionSeq.mockResolvedValue([9]);
-        mocks.assertReservationWrite.mockResolvedValue(undefined);
+        mocks.lockSession.mockResolvedValue([{ id: 'session-1' }]);
         mocks.messageCreate.mockImplementation(async (args: any) => ({ id: 'msg-1', ...args.data }));
     });
 
@@ -86,6 +85,34 @@ describe('socket message persistence', () => {
         });
         expect(mocks.emitUpdate).toHaveBeenCalledTimes(1);
         expect(mocks.emitUpdate.mock.calls[0][0].payload.seq).toBe(5);
+    });
+
+    it('locks the session row and rechecks the localId before allocating the seq it inserts in the same transaction', async () => {
+        // REST batches take the same row lock. Allocating outside it would let a
+        // concurrent REST write commit a higher seq and a reader advance past ours.
+        const order: string[] = [];
+        mocks.lockSession.mockImplementation(async () => { order.push('lock'); return [{ id: 'session-1' }]; });
+        mocks.messageFindFirst.mockImplementation(async () => { order.push('dedup'); return null; });
+        mocks.allocateSessionSeq.mockImplementation(async () => { order.push('seq'); return [9]; });
+        mocks.messageCreate.mockImplementation(async (args: any) => { order.push('insert'); return { id: 'msg-1', ...args.data }; });
+
+        await messageHandler()({ sid: 'session-1', message: 'ciphertext', localId: 'local-1' });
+
+        expect(order).toEqual(['dedup', 'lock', 'dedup', 'seq', 'insert']);
+        expect(mocks.allocateSessionSeq).toHaveBeenCalledWith('session-1', 1, mocks.tx);
+        // Waiting behind a REST batch on the same lock must not hit Prisma's 5s default first.
+        expect(mocks.transactionOptions).toHaveBeenCalledWith({ timeout: 10000 });
+    });
+
+    it('drops a retry that a concurrent writer committed while this one waited for the lock', async () => {
+        mocks.messageFindFirst.mockResolvedValueOnce(null).mockResolvedValueOnce({ id: 'msg-concurrent', seq: 4 });
+
+        await messageHandler()({ sid: 'session-1', message: 'ciphertext', localId: 'local-1' });
+
+        expect(mocks.allocateSessionSeq).not.toHaveBeenCalled();
+        expect(mocks.messageCreate).not.toHaveBeenCalled();
+        expect(mocks.allocateUserSeq).not.toHaveBeenCalled();
+        expect(mocks.emitUpdate).not.toHaveBeenCalled();
     });
 
     it('burns no seq when the localId was already persisted', async () => {
@@ -128,19 +155,4 @@ describe('socket message persistence', () => {
         });
         expect(mocks.emitUpdate).toHaveBeenCalledTimes(1);
     });
-});
-
-it('keeps a busy message unpersisted and tells the sender to retain it', async () => {
-    vi.clearAllMocks();
-    mocks.sessionFindUnique.mockResolvedValue({ id: 'session-1', accountId: 'user-1' });
-    mocks.messageFindFirst.mockResolvedValue(null);
-    mocks.assertReservationWrite.mockRejectedValueOnce(new ReservationWriteDenied('reservation-busy'));
-    const ack = vi.fn();
-    await messageHandler()({ sid: 'session-1', message: 'ciphertext', localId: 'local-busy' }, ack);
-    expect(ack).toHaveBeenCalledWith({ ok: false, error: 'reservation-busy' });
-    expect(mocks.socketEmit).toHaveBeenCalledWith('message-error', { sid: 'session-1', localId: 'local-busy', error: 'reservation-busy' });
-    expect(mocks.messageCreate).not.toHaveBeenCalled();
-    expect(mocks.allocateUserSeq).not.toHaveBeenCalled();
-    expect(mocks.allocateSessionSeq).not.toHaveBeenCalled();
-    expect(mocks.emitUpdate).not.toHaveBeenCalled();
 });

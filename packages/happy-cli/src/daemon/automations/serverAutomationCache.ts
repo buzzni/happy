@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import tweetnacl from 'tweetnacl'
 import {
@@ -23,7 +23,7 @@ export interface EncryptedServerAutomation {
   automationId: string
   revision: number
   generation: number
-  payloadVersion: 1 | 4 | 5
+  payloadVersion: 1 | 4
   payloadCiphertext: string
   machineKeyVersion: number
   machineKeyEnvelope: string
@@ -45,7 +45,6 @@ export interface ServerAutomationCacheState {
 export type ServerAutomationPayload = AutomationPayload
 
 export interface ServerAutomationCache {
-  negotiateReservationCodec?(supported: boolean): void
   read(): ServerAutomationCacheState
   applySync(value: unknown): { nextSeq: bigint; acknowledgements: Array<{ automationId: string; revision: number }> }
   markAcknowledged(items: Array<{ automationId: string; revision: number }>): void
@@ -90,7 +89,7 @@ function base64(value: unknown, maxBytes: number, exactBytes?: number): string {
 }
 
 function parseUpsert(row: Record<string, unknown>): EncryptedServerAutomation {
-  if (row.kind !== 'UPSERT' || (row.payloadVersion !== 1 && row.payloadVersion !== 4 && row.payloadVersion !== 5) || typeof row.paused !== 'boolean') fail()
+  if (row.kind !== 'UPSERT' || (row.payloadVersion !== 1 && row.payloadVersion !== 4) || typeof row.paused !== 'boolean') fail()
   const payloadCiphertext = base64(row.payloadCiphertext, PAYLOAD_MAX_BYTES)
   const machineKeyEnvelope = base64(row.machineKeyEnvelope, AUTHENTICATED_ENVELOPE_BYTES)
   const envelope = Buffer.from(machineKeyEnvelope, 'base64')
@@ -127,19 +126,44 @@ function readState(filePath: string): ServerAutomationCacheState {
   try {
     const disk = object(JSON.parse(raw))
     if (disk.version !== 1 || !Array.isArray(disk.automations) || !Array.isArray(disk.pendingAcknowledgements)) throw new Error()
+    const unsupportedIds = new Set<string>()
+    const supportedEntries = (entries: unknown[]): EncryptedServerAutomation[] => entries.flatMap(entry => {
+      const row = object(entry)
+      if (row.payloadVersion !== 5) return [parseUpsert({ ...row, kind: 'UPSERT' })]
+      const retired = parseUpsert({ ...row, payloadVersion: 4, kind: 'UPSERT' })
+      unsupportedIds.add(retired.automationId)
+      return []
+    })
     const state = {
       cursor: disk.conversationSync === true && disk.chatLifecycleSync === true ? sequence(disk.cursor) : 0n,
       serverTime: timestamp(disk.serverTime),
       syncedAt: timestamp(disk.syncedAt),
-      automations: disk.automations.map((entry) => parseUpsert({ ...object(entry), kind: 'UPSERT' })),
+      automations: supportedEntries(disk.automations),
       pendingAcknowledgements: disk.pendingAcknowledgements.map((entry) => {
         const row = object(entry)
         return { automationId: nonEmptyString(row.automationId), revision: positiveInteger(row.revision) }
       }),
       pendingCancellations: disk.pendingCancellations === undefined ? [] : (() => {
         if (!Array.isArray(disk.pendingCancellations)) fail()
-        return disk.pendingCancellations.map(entry => parseUpsert({ ...object(entry), kind: 'UPSERT' }))
+        return supportedEntries(disk.pendingCancellations)
       })(),
+    }
+    if (unsupportedIds.size || disk.reservationSync === true) {
+      const backup = `${filePath}.unsupported-v5.${createHash('sha256').update(raw).digest('hex').slice(0, 16)}.json`
+      try { writeFileSync(backup, raw, { encoding: 'utf8', mode: 0o600, flag: 'wx' }) }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || readFileSync(backup, 'utf8') !== raw) throw error
+      }
+      chmodSync(backup, 0o600)
+      const backupFd = openSync(backup, 'r+')
+      try { fsyncSync(backupFd) } finally { closeSync(backupFd) }
+      if (process.platform !== 'win32') {
+        const directoryFd = openSync(path.dirname(backup), 'r')
+        try { fsyncSync(directoryFd) } finally { closeSync(directoryFd) }
+      }
+      state.cursor = 0n
+      state.pendingAcknowledgements = state.pendingAcknowledgements.filter(row => !unsupportedIds.has(row.automationId))
+      persist(filePath, state)
     }
     chmodSync(filePath, 0o600)
     return state
@@ -148,18 +172,13 @@ function readState(filePath: string): ServerAutomationCacheState {
   }
 }
 
-function persist(filePath: string, state: ServerAutomationCacheState, reservationSync?: boolean): void {
-  if (reservationSync === undefined) {
-    try { reservationSync = JSON.parse(readFileSync(filePath, 'utf8')).reservationSync === true }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
-  }
+function persist(filePath: string, state: ServerAutomationCacheState): void {
   mkdirSync(path.dirname(filePath), { recursive: true })
   const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`
   writeFileSync(tmp, JSON.stringify({
     version: 1,
     conversationSync: true,
     chatLifecycleSync: true,
-    reservationSync: reservationSync === true,
     cursor: state.cursor.toString(),
     serverTime: state.serverTime,
     syncedAt: state.syncedAt,
@@ -173,13 +192,6 @@ function persist(filePath: string, state: ServerAutomationCacheState, reservatio
 
 export function createServerAutomationCache(options: { filePath: string; now?: () => number }): ServerAutomationCache {
   return {
-    negotiateReservationCodec(supported) {
-      const state = readState(options.filePath)
-      let previous = false
-      try { previous = JSON.parse(readFileSync(options.filePath, 'utf8')).reservationSync === true }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
-      if (previous !== supported) persist(options.filePath, { ...state, cursor: 0n }, supported)
-    },
     read: () => readState(options.filePath),
     applySync(value) {
       const response = object(value)

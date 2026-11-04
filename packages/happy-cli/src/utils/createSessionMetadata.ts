@@ -1,4 +1,3 @@
-import { reservationBaseDirectory } from '@/daemon/automations/reservationTurnBootstrap';
 /**
  * Session Metadata Factory
  *
@@ -86,7 +85,7 @@ export function createSessionMetadata(opts: CreateSessionMetadataOptions): Sessi
     };
 
     const metadata: Metadata = {
-        path: reservationBaseDirectory() ?? process.cwd(),
+        path: process.cwd(),
         host: os.hostname(),
         version: packageJson.version,
         runtimeCapabilities: {
