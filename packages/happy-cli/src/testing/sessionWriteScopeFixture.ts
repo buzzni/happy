@@ -60,7 +60,7 @@ export class SessionWriteScopeFixture {
     private readonly processes = new Set<ChildProcess>();
 
     constructor(readonly options: { provider: 'codex' | 'claude'; encryptionVariant: 'legacy' | 'dataKey'; automationStudioUrl?: string; databaseUrl?: string;
-        serverEntry?: string; browserBridgeHost?: string } = { provider: 'codex', encryptionVariant: 'legacy' }) {}
+        serverEntry?: string; browserBridgeHost?: string; automationContextHost?: boolean } = { provider: 'codex', encryptionVariant: 'legacy' }) {}
     get modelHost() { return process.platform === 'linux' ? 'scope-model.test' : '127.0.0.1'; }
     get modelName() { return this.options.provider === 'codex' ? 'gpt-5.1-codex' : 'claude-sonnet-4-6'; }
     get providerIdentityField() { return this.options.provider === 'codex' ? 'codexThreadId' : 'claudeSessionId'; }
@@ -149,6 +149,7 @@ export class SessionWriteScopeFixture {
             TMPDIR: this.temporaryDirectory, LANG: 'en_US.UTF-8', HAPPY_HOME_DIR: this.happyHome,
             HAPPY_SERVER_URL: this.serverUrl, HAPPY_WEBAPP_URL: this.serverUrl, HAPPY_DISABLE_CAFFEINATE: '1',
             HAPPY_DAEMON_HEARTBEAT_INTERVAL: '500',
+            ...(this.options.automationContextHost ? { HAPPY_CONTEXT_ISOLATION_HOST: '1' } : {}),
             ...(this.options.automationStudioUrl ? { HAPPY_APLUS_MCP_CONFIG_URL: `${this.options.automationStudioUrl}/api/me/mcp-config` } : {}),
             CODEX_HOME: codexHome, OPENAI_API_KEY: 'fixture-local-only', NO_PROXY: process.platform === 'linux' ? '' : '127.0.0.1,localhost',
             HAPPY_BROWSER_BRIDGE_HOST: this.options.browserBridgeHost ?? '127.0.0.1',

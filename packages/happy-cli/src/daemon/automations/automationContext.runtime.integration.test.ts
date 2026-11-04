@@ -1,5 +1,6 @@
 import { expect, it, vi } from 'vitest'
 import { randomBytes, randomUUID } from 'node:crypto'
+import { mkdir, symlink } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import type { ChildProcess } from 'node:child_process'
 import { readAutomationExecutionRecord,
@@ -31,6 +32,51 @@ async function seedRun(fixture: SessionWriteScopeFixture, input: Record<string, 
     return response
   }, 'registered machine and claimed fixture run')
 }
+
+it('refuses a real daemon manual spawn while automatic ownership exists and permits it after proven release', async () => {
+  vi.stubEnv('HAPPY_SCOPE_FRESH_PROVIDER_STATE', '1')
+  vi.stubEnv('HAPPY_SCOPE_PACKAGED_SERVER', undefined)
+  vi.stubEnv('HAPPY_SCOPE_INSTALLED_CLI', undefined)
+  const fixture = new SessionWriteScopeFixture({ provider: 'claude', encryptionVariant: 'legacy',
+    browserBridgeHost: '::1', automationContextHost: true })
+  try {
+    await fixture.start()
+    const nested = join(fixture.project, 'nested'), alias = join(fixture.root, 'project-alias')
+    await mkdir(nested); await symlink(fixture.project, alias)
+    const workspace = createAutomationContextWorkspace({ home: fixture.happyHome, isTracked: async () => false })
+    const runId = `manual-admission-${randomUUID()}`
+    const owned = await workspace.acquireAutomation({ runId, roots: [fixture.project] })
+    if (!owned.acquired) throw new Error('Automatic preparation refused')
+    try {
+      const before = (await fixture.http('/v1/sessions')).body.sessions
+      const blocked = await eventually(async () => {
+        const result = await fixture.control('/spawn-session', { directory: fixture.project, agent: 'claude' })
+        if (result.body.error === 'Daemon is initializing; retry the launch shortly') return undefined
+        return result
+      }, 'daemon manual launch admission')
+      await fixture.children()
+      expect(blocked.body.success).toBe(false)
+      expect(blocked.body.code).toBe('workspace-automation-busy')
+      for (const directory of [nested, alias]) {
+        const blockedAlias = await fixture.control('/spawn-session', { directory, agent: 'claude' })
+        expect(blockedAlias.body).toMatchObject({ success: false, code: 'workspace-automation-busy' })
+      }
+      expect((await fixture.http('/v1/sessions')).body.sessions).toEqual(before)
+    } finally {
+      // This test reserved the workspace but never submitted an automatic provider.
+      expect(await workspace.releaseUnsubmitted({ runId, roots: [fixture.project], ownerToken: owned.ownerToken })).toBe(true)
+    }
+    const resumed = await fixture.control('/spawn-session', { directory: fixture.project, agent: 'claude' })
+    await fixture.children()
+    expect(resumed.body.success).toBe(true)
+    expect(resumed.body.sessionId).not.toMatch(/^automation-run:/)
+    const createdDirectory = await fixture.control('/spawn-session', { directory: join(fixture.root, 'new-workspace'), agent: 'claude' })
+    await fixture.children()
+    expect(createdDirectory.body.success).toBe(true)
+  } catch (error) {
+    throw new Error(`Daemon admission failed:\n${await fixture.diagnostics().catch(() => 'Diagnostics unavailable')}`, { cause: error })
+  } finally { await fixture.close() }
+})
 
 it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display target with private history and unchanged manual state', async provider => {
   vi.stubEnv('HAPPY_SCOPE_FRESH_PROVIDER_STATE', '1')

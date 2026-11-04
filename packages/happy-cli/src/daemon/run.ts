@@ -105,7 +105,7 @@ import { resolveDaemonStateOwnership } from './daemonStateOwnership';
 import { createPortRegistry } from './portRegistry';
 import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs } from './stageUserCredentials';
 import { existsSync } from 'fs';
-import { basename, join } from 'path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path';
 import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
@@ -342,7 +342,8 @@ import {
   prepareAdditionalDirectories,
   reapplyAdditionalDirectoriesOnResume,
 } from './additionalDirectories';
-import { mergeAdditionalDirectoriesIntoSandboxEnvironment } from '@/utils/additionalDirectoriesEnv';
+import { mergeAdditionalDirectoriesIntoSandboxEnvironment, readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv';
+import { createAutomationContextWorkspace } from './automations/automationContextWorkspace';
 import { readClaudeTranscriptBranch, restoreMissingManagedWorktree } from './missingWorktreeRestore';
 import { getProjectPath } from '@/claude/utils/path';
 import { CHANNEL_SUPPORT_CAPABILITY } from '@/channel/channelSupportCapability';
@@ -1921,6 +1922,43 @@ export async function startDaemon(): Promise<void> {
     let sharedMachineScope = async (): Promise<string | null> => null;
     const pendingMachineStarts = new Set<string>();
     const ownedStartGuard = createOwnedStartGuard();
+    // Private rollout only: capability remains unadvertised until the full producer/recovery contract is ready.
+    const contextWorkspace = process.env.HAPPY_CONTEXT_ISOLATION_HOST === '1' && process.platform !== 'win32'
+      ? createAutomationContextWorkspace({ home: configuration.happyHomeDir, isTracked: async roots => {
+        try {
+          const requested = await Promise.all(roots.map(root => fs.realpath(root)));
+          const contains = (parent: string, child: string) => {
+            const tail = relative(parent, child);
+            return tail === '' || tail !== '..' && !tail.startsWith('..' + sep) && !isAbsolute(tail);
+          };
+          for (const tracked of pidToTrackedSession.values()) {
+            const directories = [tracked.directory, tracked.happySessionMetadataFromLocalWebhook?.path]
+              .filter((directory): directory is string => !!directory);
+            if (!directories.length) return 'unconfirmed';
+            directories.push(...readAdditionalDirectoriesEnvironment(tracked.agentEnvironment ?? {}));
+            for (const directory of await Promise.all(directories.map(value => fs.realpath(value)))) {
+              if (requested.some(root => contains(root, directory) || contains(directory, root))) return true;
+            }
+          }
+          return false;
+        } catch {
+          logger.warn('[automation-context] Tracked workspace identity unconfirmed');
+          return 'unconfirmed';
+        }
+      } }) : null;
+    const workspaceBusy = (): SpawnSessionResult => ({ type: 'error', code: 'workspace-automation-busy',
+      errorMessage: 'This workspace is running a scheduled task. Retry after it finishes.' });
+    const manualPreparationRoots = async (roots: string[]) => Promise.all(roots.map(async root => {
+      let candidate = resolve(root);
+      while (true) {
+        try { return await fs.realpath(candidate); }
+        catch (error) {
+          const parent = dirname(candidate);
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || parent === candidate) throw error;
+          candidate = parent;
+        }
+      }
+    }));
     const ownedMachineLaunches = new WeakMap<SpawnSessionOptions, Awaited<ReturnType<MachineSetupTokenRuntime['prepareLaunch']>>>();
     const channelSessionKeys = new WeakMap<SpawnSessionOptions, { key: Uint8Array; wrapped: Uint8Array }>();
     /** The runtime of an existing machine-rotation launch; recovery never depends on new issuance being accepted. */
@@ -1965,6 +2003,7 @@ export async function startDaemon(): Promise<void> {
     const spawnSessionUnchecked = async (
       options: SpawnSessionOptions,
       trustedMcpContext?: AutomationMcpSpawnContext,
+      workspaceLaunch?: { submitted: boolean; tracked: boolean },
     ): Promise<SpawnSessionResult> => {
       if (!launchReadiness.isReady()) return { type: 'error', errorMessage: 'Daemon is initializing; retry the launch shortly' };
       if (standaloneWindows && (!standaloneWindows.owner.acceptingLaunches || !acceptsStandaloneWindowsProvider(options.agent))) {
@@ -2527,6 +2566,7 @@ export async function startDaemon(): Promise<void> {
             windowName: windowName,
             cwd: directory
           }, tmuxEnv, start => launchManagedAiCredentialSession(launchAuthorityEnvironment, () => {
+            if (workspaceLaunch) workspaceLaunch.submitted = true;
             ownedStartGuard.submitted(options); return start();
           }));
 
@@ -2563,6 +2603,8 @@ export async function startDaemon(): Promise<void> {
             sessionStartTimes.set(tmuxResult.pid, Date.now());
             persistTrackedSessions();
 
+            if (workspaceLaunch) workspaceLaunch.tracked = true;
+
             return finishSpawn(waitForSessionWebhook({
               pid: tmuxResult.pid,
               pidToAwaiter,
@@ -2573,6 +2615,7 @@ export async function startDaemon(): Promise<void> {
             // An owned tmux dispatch may have succeeded despite a missing PID/ACK. Never launch a second child.
             if (ownedStartGuard.wasSubmitted(options)) return finishSpawn(Promise.resolve({
               type: 'error', errorMessage: 'Owned tmux start outcome is unknown',
+              ...(contextWorkspace ? { code: 'workspace-start-unconfirmed' } : {}),
             }));
             logger.debug(`[DAEMON RUN] Failed to spawn in tmux: ${tmuxResult.error}, falling back to regular spawning`);
             useTmux = false;
@@ -2639,7 +2682,11 @@ export async function startDaemon(): Promise<void> {
             spawnEnvironment.HAPPY_SANDBOX_POLICY_MODE = 'mandatory';
           }
           return finishSpawn(spawnTrackedHappyProcess({
-            onProcessSubmission: () => ownedStartGuard.submitted(options),
+            onProcessSubmission: () => {
+              if (workspaceLaunch) workspaceLaunch.submitted = true;
+              ownedStartGuard.submitted(options);
+            },
+            onTracked: () => { if (workspaceLaunch) workspaceLaunch.tracked = true; },
             args,
             cwd: directory,
             env: spawnEnvironment,
@@ -2671,6 +2718,7 @@ export async function startDaemon(): Promise<void> {
 
     const spawnTrackedHappyProcess = async ({
       onProcessSubmission,
+      onTracked,
       args,
       cwd,
       env,
@@ -2683,6 +2731,7 @@ export async function startDaemon(): Promise<void> {
     }: {
       /** Internal dispatch evidence; never transported in provider env or RPC options. */
       onProcessSubmission?: () => void;
+      onTracked?: () => void;
       args: string[];
       cwd: string;
       env: NodeJS.ProcessEnv;
@@ -2701,9 +2750,14 @@ export async function startDaemon(): Promise<void> {
       if (standaloneWindows && (!standaloneWindows.owner.acceptingLaunches || !acceptsStandaloneWindowsLaunch(args))) {
         return { type: 'error', errorMessage: 'Windows trial launch is closed or this provider is unsupported' };
       }
+      const workspaceReservation = contextWorkspace
+        ? await contextWorkspace.beginManualLaunch([cwd, ...readAdditionalDirectoriesEnvironment(env)]) : null;
+      if (workspaceReservation && !workspaceReservation.acquired) return workspaceBusy();
+      const workspaceLaunch = { submitted: false, tracked: false };
+      try {
       // Native preparation creates a suspended root; authorize execution at resume below.
       const prepareStartedAt = Date.now();
-      if (standaloneWindows) onProcessSubmission?.();
+      if (standaloneWindows) { workspaceLaunch.submitted = true; onProcessSubmission?.(); }
       const prepared = standaloneWindows ? await standaloneWindows.owner.prepare({ args, cwd, env }) : undefined;
       if (prepared) logger.debug(`[timing] spawn windows-prepare ${Date.now() - prepareStartedAt}ms`);
       const scopeReports = env.HAPPY_WRITE_SCOPE_SESSION === '1' ? writeScopeRuntime?.prepareReports(resumeTargetSessionId) : undefined;
@@ -2719,7 +2773,7 @@ export async function startDaemon(): Promise<void> {
         () => {
           const { stdio, environment: ownerEnvironment } = withOwnerPipe(scopeReports ? ['ignore', 'ignore', 'ignore', 'pipe']
             : captureSpawnOutputStdio(startupLogFileName, `session ${resumeTargetSessionId ?? 'new'} from ${cwd}`));
-          try { onProcessSubmission?.(); return spawnHappyCLI(args, { cwd, detached: true, stdio, env: { ...env, ...scopeReports?.environment, ...ownerEnvironment } }); }
+          try { workspaceLaunch.submitted = true; onProcessSubmission?.(); return spawnHappyCLI(args, { cwd, detached: true, stdio, env: { ...env, ...scopeReports?.environment, ...ownerEnvironment } }); }
           finally { closeCapturedSpawnOutputStdio(stdio); }
         });
       scopeReports?.attach(happyProcess);
@@ -2752,6 +2806,9 @@ export async function startDaemon(): Promise<void> {
       sessionStartTimes.set(rootPid, Date.now());
       persistTrackedSessions();
 
+      workspaceLaunch.tracked = true;
+      onTracked?.();
+
       if (prepared) {
         // Helper exit by itself is not root/Job proof. Preserve tracking on unknown evidence.
         void prepared.exit.catch(() => {
@@ -2775,6 +2832,10 @@ export async function startDaemon(): Promise<void> {
       }
       return webhook;
       } finally { if (prepared && !resumed) prepared.cancelBeforeResume?.(); }
+
+      } finally {
+        if (workspaceReservation?.acquired) await workspaceReservation.finish(workspaceLaunch);
+      }
 
     };
 
@@ -3385,12 +3446,21 @@ export async function startDaemon(): Promise<void> {
       trustedMcpContext?: AutomationMcpSpawnContext,
     ): Promise<SpawnSessionResult> => {
       const endLaunch = await worktreeRemovalReservations.beginLaunch(options.directory);
+      let workspaceReservation: Awaited<ReturnType<NonNullable<typeof contextWorkspace>['beginManualLaunch']>> | null = null;
+      const workspaceLaunch = { submitted: false, tracked: false };
+      let stopSubmissionObservation: (() => void) | undefined;
       try {
         const removalRefusal = await spawnRefusalForRemoval(options.directory);
         if (removalRefusal) return { type: 'error', errorMessage: removalRefusal };
-        return await spawnSessionUnchecked(options, trustedMcpContext);
+        if (contextWorkspace) {
+          workspaceReservation = await contextWorkspace.beginManualLaunch(await manualPreparationRoots([options.directory, ...options.additionalDirectories ?? []]));
+          if (!workspaceReservation.acquired) return workspaceBusy();
+          stopSubmissionObservation = ownedStartGuard.observeSubmission(options);
+        }
+        return await spawnSessionUnchecked(options, trustedMcpContext, workspaceLaunch);
       } finally {
-        endLaunch();
+        try { if (workspaceReservation?.acquired) await workspaceReservation.finish(workspaceLaunch); }
+        finally { stopSubmissionObservation?.(); endLaunch(); }
       }
     };
 

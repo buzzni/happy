@@ -148,6 +148,28 @@ it.each([
     await expect(guard.start(options, async () => { throw new Error('uncertain'); })).rejects.toThrow('uncertain');
 });
 
+it('observes a manual submission without converting its original result or forgetting an uncertain dispatch', () => {
+    const guard = createOwnedStartGuard(), options = { directory: '/project', agent: 'codex' as const };
+    const stop = guard.observeSubmission(options);
+    guard.submitted(options);
+    expect(guard.wasSubmitted(options)).toBe(true);
+    expect(guard.wasSubmitted({ directory: '/other', agent: 'codex' })).toBe(false);
+    stop(); stop();
+    expect(guard.wasSubmitted(options)).toBe(false);
+});
+
+it('retains an outer start receipt when its nested manual observation has finished', async () => {
+    const guard = createOwnedStartGuard(), options = { directory: '/project', agent: 'codex' as const };
+    const unknown = { type: 'error' as const, errorMessage: 'tmux ACK unavailable' };
+    expect(await guard.start(options, async () => {
+        const stop = guard.observeSubmission(options);
+        guard.submitted(options); stop();
+        expect(guard.wasSubmitted(options)).toBe(true);
+        return unknown;
+    })).toBe(unknown);
+    expect(guard.wasSubmitted(options)).toBe(false);
+});
+
 type Caller = z.infer<typeof OwnershipCallerBindingSchema>;
 const callerKey = () => Buffer.from(nacl.sign.keyPair().publicKey).toString('base64url');
 const hostCaller = (fields: Partial<Caller> & { sessionId: string }): Caller => ({ callerBindingId: `${fields.sessionId}-binding`, runtimeId: `${fields.sessionId}-runtime`,
