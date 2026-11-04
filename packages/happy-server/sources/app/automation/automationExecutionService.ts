@@ -327,7 +327,7 @@ export async function resolveAutomationRunMcpContext(
     tx: Tx,
     accountId: string,
     machineId: string,
-    input: { runId: string; claimToken: string; sessionId?: string },
+    input: { runId: string; claimToken: string; sessionId?: string; executionAdmission?: true },
     now: Date = new Date(),
 ): Promise<Result<{
     automationId: string;
@@ -335,12 +335,21 @@ export async function resolveAutomationRunMcpContext(
     projectId: string;
     machineId: string;
     runLeaseExpiresAt: number | null;
+    executionAdmission?: { payloadVersion: 6; generation: number; revision: number; machineAccountId: string };
 }>> {
     const run = await claimedRun(tx, accountId, machineId, input.runId, input.claimToken);
     if (!run) return { ok: false, error: 'claim-not-found' };
     const activelyRunning = run.status === 'RUNNING'
         && run.runLeaseExpiresAt !== null
         && run.runLeaseExpiresAt >= now;
+    const a = run.automation;
+    if (input.executionAdmission && (!activelyRunning || input.sessionId || a.payloadVersion !== 6
+        || a.generation !== run.generation || a.paused || a.deletedAt || a.legacyMigrationPending
+        || a.machineAccountId !== accountId || a.machineId !== machineId
+        || a.machineKeyVersion !== a.targetMachine?.automationKeyVersion
+        || a.viewerKeyVersion !== a.project.automationViewerKeyVersion)) {
+        return { ok: false, error: 'claim-cancelled' };
+    }
     if (input.sessionId) {
         const terminalSessionMatch = run.status === 'COMPLETED'
             && run.reportId !== null
@@ -364,6 +373,8 @@ export async function resolveAutomationRunMcpContext(
             projectId: run.automation.projectId,
             machineId: run.machineId,
             runLeaseExpiresAt: activelyRunning ? run.runLeaseExpiresAt!.getTime() : null,
+            ...(input.executionAdmission ? { executionAdmission: { payloadVersion: 6 as const,
+                generation: run.generation, revision: a.revision, machineAccountId: run.machineAccountId } } : {}),
         },
     };
 }

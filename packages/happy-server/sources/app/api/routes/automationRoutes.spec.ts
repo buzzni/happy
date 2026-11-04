@@ -309,6 +309,28 @@ describe('automationRoutes', () => {
         expect(mocks.resolveAutomationRunMcpContext).not.toHaveBeenCalled();
     });
 
+    it('forwards an explicit execution admission request without inferring it from a legacy caller', async () => {
+        const value = { automationId: 'automation-1', ownerAccountId: 'owner', projectId: 'project-1', machineId: 'machine-1',
+            runLeaseExpiresAt: 1_000_060_000, executionAdmission: { payloadVersion: 6, generation: 3, revision: 2, machineAccountId: 'user-1' } };
+        mocks.resolveAutomationRunMcpContext.mockResolvedValue({ ok: true, value });
+        const app = await makeApp();
+        const response = await app.inject({ method: 'POST', url: '/v1/automation-runs/run-1/mcp-context',
+            headers: { authorization: 'Bearer test' }, payload: { machineId: 'machine-1', claimToken: 'token', executionAdmission: true } });
+        expect(response.statusCode, response.body).toBe(200);
+        expect(response.json()).toEqual(value);
+        expect(mocks.resolveAutomationRunMcpContext).toHaveBeenCalledWith({}, 'user-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', executionAdmission: true,
+        });
+    });
+
+    it.each([false, 'true', 1])('rejects a malformed execution admission flag %s', async executionAdmission => {
+        const app = await makeApp();
+        const response = await app.inject({ method: 'POST', url: '/v1/automation-runs/run-1/mcp-context',
+            headers: { authorization: 'Bearer test' }, payload: { machineId: 'machine-1', claimToken: 'token', executionAdmission } });
+        expect(response.statusCode).toBe(400);
+        expect(mocks.resolveAutomationRunMcpContext).not.toHaveBeenCalled();
+    });
+
     it('forwards a spawned session id for machine ownership verification', async () => {
         mocks.resolveAutomationRunMcpContext.mockResolvedValue({
             ok: true,

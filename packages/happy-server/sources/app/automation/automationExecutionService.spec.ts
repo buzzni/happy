@@ -386,6 +386,41 @@ describe('automationExecutionService', () => {
         expect(tx.session.findFirst).not.toHaveBeenCalled();
     });
 
+    it('attests the current isolated definition generation and revision only for a running machine claim', async () => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', automationId: 'automation-1', generation: 3,
+            machineId: 'machine-1', machineAccountId: 'account-1', status: 'RUNNING',
+            runLeaseExpiresAt: new Date(now.getTime() + 60_000), automation: automation({ payloadVersion: 6 }) });
+        await expect(resolveAutomationRunMcpContext(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', executionAdmission: true,
+        }, now)).resolves.toMatchObject({ ok: true, value: { executionAdmission: {
+            payloadVersion: 6, generation: 3, revision: 2, machineAccountId: 'account-1',
+        } } });
+    });
+
+    it.each(['paused', 'deleted', 'migration', 'generation', 'machine', 'account', 'machine-key', 'viewer-key', 'legacy', 'terminal', 'session-link'])(
+        'refuses isolated target admission after %s changes without changing legacy MCP context semantics', async reason => {
+            const tx = makeTx(), a = automation({ payloadVersion: 6 });
+            const row = { id: 'run-1', automationId: a.id, generation: 3, machineId: 'machine-1', machineAccountId: 'account-1',
+                status: 'RUNNING', runLeaseExpiresAt: new Date(now.getTime() + 60_000), automation: a };
+            if (reason === 'paused') a.paused = true;
+            if (reason === 'deleted') a.deletedAt = new Date(0) as any;
+            if (reason === 'migration') a.legacyMigrationPending = true;
+            if (reason === 'generation') a.generation++;
+            if (reason === 'machine') a.machineId = 'other';
+            if (reason === 'account') a.machineAccountId = 'other';
+            if (reason === 'machine-key') a.targetMachine.automationKeyVersion++;
+            if (reason === 'viewer-key') a.project.automationViewerKeyVersion++;
+            if (reason === 'legacy') a.payloadVersion = 4;
+            if (reason === 'terminal') row.status = 'COMPLETED';
+            tx.automationRun.findFirst.mockResolvedValue(row);
+            const result = await resolveAutomationRunMcpContext(tx as never, 'account-1', 'machine-1', {
+                runId: 'run-1', claimToken: 'token', executionAdmission: true,
+                ...(reason === 'session-link' ? { sessionId: 'session-1' } : {}),
+            }, now);
+            expect(result).toEqual({ ok: false, error: 'claim-cancelled' });
+        });
+
     it('allows a durable project link retry after the matching run report is terminal', async () => {
         const tx = makeTx();
         tx.automationRun.findFirst.mockResolvedValue({
