@@ -331,6 +331,73 @@ describe('CodexAppServerClient sandbox integration', () => {
         } finally { await client.disconnect(); }
     });
 
+    it.each(['clean', 'foreground', 'unacknowledged', 'preparation', 'waiting-preparation', 'background', 'unavailable'])(
+        'observes a manual workspace without changing its native thread or memory policy (%s)', async state => {
+            const { CodexAppServerClient } = await import('./codexAppServerClient');
+            mockExecSync.mockReturnValue('codex-cli 0.166.0');
+            const requests: MockRpcMessage[] = [];
+            let withheld: MockRpcMessage | undefined, pendingTurn: Promise<void> | undefined;
+            let allowPreparation: (() => void) | undefined;
+            const errors: unknown[] = [];
+            const proc = createMockProcess({ onRequest: (message, stdout) => {
+                requests.push(message);
+                if (message.method === 'thread/resume') pushJsonLine(stdout, { id: message.id,
+                    result: { thread: { id: 'manual-native-keep', turns: [] }, model: 'test' } });
+                if (message.method === 'turn/start') {
+                    if (state === 'unacknowledged') withheld = message;
+                    else {
+                        pushJsonLine(stdout, { id: message.id, result: { turn: { id: 'active-manual-turn', status: 'inProgress', items: [] } } });
+                        if (state === 'waiting-preparation') pushJsonLine(stdout, { method: 'turn/completed', params: {
+                            threadId: 'manual-native-keep', turn: { id: 'active-manual-turn', status: 'completed', items: [] } } });
+                    }
+                }
+                if (message.method === 'thread/backgroundTerminals/list') pushJsonLine(stdout, state === 'unavailable'
+                    ? { id: message.id, error: { code: -32601, message: 'unsupported' } }
+                    : { id: message.id, result: { data: state === 'background' ? [{ itemId: 'background', command: 'writer', processId: '42' }] : [], nextCursor: null } });
+            } });
+            proc.stdin.once('finish', () => { proc.exitCode = 0; proc.emit('exit', 0, null); proc.stdout.push(null); });
+            mockSpawn.mockReturnValue(proc);
+            const client = new CodexAppServerClient(undefined, undefined, undefined, 'owner-choice', undefined, undefined, false, undefined, undefined, false, true);
+            try {
+                await client.connect(); await client.resumeThread({ threadId: 'manual-native-keep', cwd: '/work' });
+                if (state === 'foreground') await client.sendTurn('Current manual task');
+                if (state === 'unacknowledged') {
+                    pendingTurn = client.sendTurn('Already submitted manual task').catch(error => { errors.push(error); });
+                    await waitFor(() => !!withheld);
+                }
+                if (state === 'preparation' || state === 'waiting-preparation') {
+                    const opts = { beforeTurn: async () => { await new Promise<void>(resolve => { allowPreparation = resolve; }); } };
+                    pendingTurn = (state === 'preparation' ? client.sendTurn('Prepared manual task', opts)
+                        : client.sendTurnAndWait('Prepared manual task', opts)).then(() => undefined, error => { errors.push(error); });
+                    await waitFor(() => !!allowPreparation);
+                }
+                const proof = await client.finishWorkspaceContext(500);
+                expect(proof).toMatchObject({ foregroundDrained: !['foreground', 'unacknowledged', 'preparation', 'waiting-preparation'].includes(state), backgroundDrained: state === 'clean', providerExitedCleanly: state === 'clean' });
+                expect(client.threadId).toBe('manual-native-keep');
+                expect(requests.some(row => row.method === 'thread/start')).toBe(false);
+                expect(requests.some(row => row.method === 'config/read')).toBe(false);
+                const args = mockSpawn.mock.calls[0][1];
+                for (const override of ['memories.use_memories=false', 'memories.generate_memories=false', 'features.memories=false', 'features.hooks=false']) expect(args).not.toContain(override);
+                expect(proc.kill).not.toHaveBeenCalled();
+                if (state === 'clean') await expect(client.connect()).rejects.toThrow('AUTOMATION_CONTEXT_INPUT_CLOSED');
+                else { expect(proc.stdin.writableEnded).toBe(false); await expect(client.connect()).resolves.toBeUndefined(); }
+                expect(mockSpawn).toHaveBeenCalledTimes(1);
+                if (withheld) {
+                    pushJsonLine(proc.stdout, { id: withheld.id, result: { turn: { id: 'active-manual-turn', status: 'inProgress', items: [] } } });
+                    withheld = undefined; await pendingTurn; expect(errors).toEqual([]);
+                }
+                if (allowPreparation) {
+                    allowPreparation(); allowPreparation = undefined; await pendingTurn; expect(errors).toEqual([]);
+                }
+            } finally {
+                allowPreparation?.();
+                if (withheld && !proc.stdin.writableEnded) pushJsonLine(proc.stdout, { id: withheld.id,
+                    result: { turn: { id: 'active-manual-turn', status: 'inProgress', items: [] } } });
+                await pendingTurn;
+                await client.disconnect();
+            }
+        });
+
     it.each(['clean', 'background-unavailable', 'background-active', 'forced', 'group-alive', 'group-draining'])(
         'observes isolated provider EOF and background drain without using a kill as proof (%s)', async outcome => {
             const { CodexAppServerClient } = await import('./codexAppServerClient');
