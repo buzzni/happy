@@ -112,19 +112,20 @@ describe('하위 디렉터리의 도구 산출물', () => {
   });
 });
 
-// 2026-11-04 개발 PC — 정리 실패 55건 중 26건(5.0G)의 사유가 lockfile 하나뿐이었다
-// (`worktree is dirty (yarn.lock)`). package.json 은 그대로였다. 워커가 의존성을
-// 설치하면서 lockfile 을 다시 쓴 것이라, 설치를 한 번이라도 한 worktree 는 영영
-// 지워지지 않았다.
-describe('의존성 설치가 다시 쓴 lockfile', () => {
+// Lockfile-only resolution updates are intentional work too. Porcelain status
+// cannot distinguish those updates from dependency installation rewrites.
+describe('lockfile change preservation', () => {
   it.each([
-    ' M yarn.lock',
-    'M  pnpm-lock.yaml',
-    ' M package-lock.json',
-    ' M packages/web-ui/yarn.lock',
-  ])('does not hold a worktree for %s when no manifest changed', (line) => {
-    expect(hasUnsavedWorktreeChanges(`${line}\n`)).toBe(false);
-  });
+    'yarn.lock',
+    'pnpm-lock.yaml',
+    'package-lock.json',
+    'packages/web-ui/yarn.lock',
+  ].flatMap((path) => [' M', 'M ', 'MM'].map((status) => ({ path, line: `${status} ${path}` }))))(
+    'preserves $line when no manifest changed', ({ path, line }) => {
+      expect(hasUnsavedWorktreeChanges(`${line}\n`)).toBe(true);
+      expect(describeUnsavedWorktreeChanges(`${line}\n`)).toEqual([path]);
+    },
+  );
 
   // 매니페스트가 함께 바뀌었으면 의도한 의존성 변경일 수 있다 — lockfile 도 작업물이다.
   it.each([
@@ -142,10 +143,10 @@ describe('의존성 설치가 다시 쓴 lockfile', () => {
     const status = ' M pnpm-lock.yaml\n M src/app.ts\n';
 
     expect(hasUnsavedWorktreeChanges(status)).toBe(true);
-    expect(describeUnsavedWorktreeChanges(status)).toEqual(['src/app.ts']);
+    expect(describeUnsavedWorktreeChanges(status)).toEqual(['pnpm-lock.yaml', 'src/app.ts']);
   });
 
-  // 설치가 남긴 "수정" 만 다시 만들 수 있다. 새로 생기거나 지워진 lockfile 은 다른 일이다.
+  // New and deleted lockfiles must also be preserved.
   it.each([
     '?? yarn.lock',
     'D  pnpm-lock.yaml',
