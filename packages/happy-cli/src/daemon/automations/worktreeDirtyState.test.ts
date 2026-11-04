@@ -112,3 +112,48 @@ describe('하위 디렉터리의 도구 산출물', () => {
   });
 });
 
+// Lockfile-only resolution updates are intentional work too. Porcelain status
+// cannot distinguish those updates from dependency installation rewrites.
+describe('lockfile change preservation', () => {
+  it.each([
+    'yarn.lock',
+    'pnpm-lock.yaml',
+    'package-lock.json',
+    'packages/web-ui/yarn.lock',
+  ].flatMap((path) => [' M', 'M ', 'MM'].map((status) => ({ path, line: `${status} ${path}` }))))(
+    'preserves $line when no manifest changed', ({ path, line }) => {
+      expect(hasUnsavedWorktreeChanges(`${line}\n`)).toBe(true);
+      expect(describeUnsavedWorktreeChanges(`${line}\n`)).toEqual([path]);
+    },
+  );
+
+  // 매니페스트가 함께 바뀌었으면 의도한 의존성 변경일 수 있다 — lockfile 도 작업물이다.
+  it.each([
+    ' M yarn.lock\n M package.json\n',
+    ' M pnpm-lock.yaml\n M packages/happy-cli/package.json\n',
+    '?? packages/new-app/package.json\nM  pnpm-lock.yaml\n',
+  ])('keeps the lockfile when a manifest changed with it: %j', (status) => {
+    expect(hasUnsavedWorktreeChanges(status)).toBe(true);
+    expect(describeUnsavedWorktreeChanges(status)).toEqual(
+      expect.arrayContaining([expect.stringMatching(/(yarn\.lock|pnpm-lock\.yaml)$/)]),
+    );
+  });
+
+  it('keeps a worktree whose lockfile changed next to real source changes', () => {
+    const status = ' M pnpm-lock.yaml\n M src/app.ts\n';
+
+    expect(hasUnsavedWorktreeChanges(status)).toBe(true);
+    expect(describeUnsavedWorktreeChanges(status)).toEqual(['pnpm-lock.yaml', 'src/app.ts']);
+  });
+
+  // New and deleted lockfiles must also be preserved.
+  it.each([
+    '?? yarn.lock',
+    'D  pnpm-lock.yaml',
+    ' D package-lock.json',
+    ' M src/yarn.lock.ts',
+  ])('still protects %s', (line) => {
+    expect(hasUnsavedWorktreeChanges(`${line}\n`)).toBe(true);
+  });
+});
+

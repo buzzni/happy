@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -293,6 +293,52 @@ describe('prepareGithubTriggerWorktree', () => {
   })
 
 describe('removeGithubTriggerWorktree', () => {
+  it.each([false, true])('preserves an intentional lockfile-only update in a real worktree (staged=%s)', async (staged) => {
+    const fixtureRoot = await realpath(await mkdtemp(join(tmpdir(), 'happy-worktree-lockfile-')))
+    const repositoryRoot = join(fixtureRoot, 'repo')
+    const worktreePath = join(fixtureRoot, 'worktree')
+    const git = async (args: string[], cwd = repositoryRoot) => {
+      const result = await execFileAsync('git', args, { cwd, encoding: 'utf8' })
+      return result.stdout
+    }
+    const lockfile = (version: string) => JSON.stringify({
+      name: 'fixture', lockfileVersion: 3,
+      packages: {
+        '': { dependencies: { lodash: '^4.17.20' } },
+        'node_modules/lodash': { version },
+      },
+    }) + '\n'
+
+    try {
+      await mkdir(repositoryRoot)
+      await git(['init'])
+      await git(['config', 'user.name', 'Test'])
+      await git(['config', 'user.email', 'test@example.com'])
+      await writeFile(join(repositoryRoot, 'package.json'), '{"dependencies":{"lodash":"^4.17.20"}}\n')
+      await writeFile(join(repositoryRoot, 'package-lock.json'), lockfile('4.17.20'))
+      await git(['add', '.'])
+      await git(['commit', '-m', 'base'])
+      await git(['worktree', 'add', '--detach', worktreePath, 'HEAD'])
+      const updatedLockfile = lockfile('4.17.21')
+      await writeFile(join(worktreePath, 'package-lock.json'), updatedLockfile)
+      if (staged) await git(['add', 'package-lock.json'], worktreePath)
+      const expectedStatus = staged ? 'M  package-lock.json\n' : ' M package-lock.json\n'
+      expect(await git(['status', '--porcelain'], worktreePath)).toBe(expectedStatus)
+
+      const result = await removeGithubTriggerWorktree({ repositoryRoot, worktreePath })
+
+      expect(result).toEqual({
+        ok: false, dirty: true,
+        error: 'GitHub automation worktree is dirty (package-lock.json)',
+      })
+      expect(await readFile(join(worktreePath, 'package-lock.json'), 'utf8')).toBe(updatedLockfile)
+      expect(await git(['status', '--porcelain'], worktreePath)).toBe(expectedStatus)
+      expect(await git(['worktree', 'list', '--porcelain'])).toContain(`worktree ${worktreePath}\n`)
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true })
+    }
+  })
+
   it('releases dangling submodule worktree pointers after removing the worktree', async () => {
     const runCommand = vi.fn(async () => ({ ok: true as const, stdout: '' }))
     const releaseSubmodulePointers = vi.fn(async () => ({ released: [] }))
