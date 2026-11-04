@@ -13,8 +13,17 @@ const PASSTHROUGH_PATH = /^\/v1\/(preview|updates|managed-updates)(\/|\?|$)/;
  */
 export function enableNoStoreApiResponses(app: Fastify) {
     app.addHook('onRequest', (request, reply, done) => {
-        const url = request.url;
-        if (API_PATH.test(url) && !PASSTHROUGH_PATH.test(url)) {
+        // The router decodes static path segments before onRequest runs.
+        let path = request.routeOptions.url;
+        if (!path) {
+            const pathname = request.url.split('?', 1)[0];
+            try {
+                path = decodeURI(pathname);
+            } catch {
+                path = pathname;
+            }
+        }
+        if (API_PATH.test(path) && !PASSTHROUGH_PATH.test(path)) {
             reply.header('Cache-Control', 'no-store');
         }
         done();
