@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 import { automationExecutionSessionId, isAutomationExecutionSessionId,
   SessionExecutionCreateBodySchema, sessionCreateBodyHash } from '@slopus/happy-wire';
@@ -21,6 +21,43 @@ export class AutomationExecutionSessionError extends Error {
 }
 const refuse = () => { throw new AutomationExecutionSessionError(403, 'Invalid automation execution admission'); };
 const conflict = () => { throw new AutomationExecutionSessionError(409, 'Automation execution identity conflict'); };
+
+const ownedExitEvidenceSchema = z.strictObject({ version: z.literal(1), provider: z.enum(['claude', 'codex']),
+  observedAt: z.number().int().min(0).max(8_640_000_000_000_000),
+  providerExitedCleanly: z.literal(true), foregroundDrained: z.literal(true),
+  backgroundDrained: z.literal(true), writeProducersDrained: z.literal(true) });
+export const automationExecutionExitReceiptSchema = ownedExitEvidenceSchema.extend({ receivedAt: z.number().int().nonnegative() });
+export const automationExecutionExitRequestSchema = z.strictObject({ runId: z.string().regex(/^[A-Za-z0-9_-]{1,160}$/),
+  machineId: z.string().min(1).max(200), claimToken: z.string().min(1).max(256),
+  createBodyHash: z.string().regex(/^[a-f0-9]{64}$/), receipt: ownedExitEvidenceSchema });
+
+/** A private claim proves the reporting machine's original run, even after dispatch/lease expiry.
+ * This records cleanup only: it never renews authority, starts a provider or changes a manual session. */
+export async function recordAutomationExecutionExit(accountId: string, raw: unknown) {
+  const input = automationExecutionExitRequestSchema.parse(raw), sessionId = automationExecutionSessionId(input.runId);
+  const where = { id: input.runId, machineAccountId: accountId, machineId: input.machineId,
+    claimTokenHash: new Uint8Array(createHash('sha256').update(input.claimToken).digest()) };
+  return inTx(async tx => {
+    const run = await tx.automationRun.findFirst({ where });
+    if (!run) return refuse();
+    if (run.sessionId !== sessionId || !run.displaySessionId || run.executionCreateBodyHash !== input.createBodyHash) return conflict();
+    const reconcile = (rawReceipt: unknown) => {
+      const stored = automationExecutionExitReceiptSchema.safeParse(rawReceipt);
+      if (!stored.success || (Object.keys(input.receipt) as Array<keyof typeof input.receipt>)
+        .some(key => input.receipt[key] !== stored.data[key])) return conflict();
+      return { runId: input.runId, sessionId, receipt: stored.data };
+    };
+    if (run.executionExitReceipt !== null) return reconcile(run.executionExitReceipt);
+    const receipt = { ...input.receipt, receivedAt: Date.now() };
+    const changed = await tx.automationRun.updateMany({ where: { ...where, sessionId,
+      executionCreateBodyHash: input.createBodyHash, executionExitReceipt: { equals: Prisma.DbNull } }, data: { executionExitReceipt: receipt } });
+    if (changed.count !== 1) {
+      const stored = await tx.automationRun.findFirst({ where, select: { executionExitReceipt: true } });
+      return reconcile(stored?.executionExitReceipt);
+    }
+    return { runId: input.runId, sessionId, receipt };
+  });
+}
 
 /** Registration does not start a provider. The caller must reconcile its durable launch receipt. */
 export async function createAutomationExecutionSession(accountId: string, bearer: string, raw: unknown,

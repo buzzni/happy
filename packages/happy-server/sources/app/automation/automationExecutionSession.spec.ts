@@ -19,7 +19,7 @@ vi.mock('@/storage/db', () => ({ db: new Proxy({}, { get: (_target, key) => {
   const value = state.client[key];
   return typeof value === 'function' ? value.bind(state.client) : value;
 } }) }));
-import { createAutomationExecutionSession } from './automationExecutionSession';
+import { createAutomationExecutionSession, recordAutomationExecutionExit } from './automationExecutionSession';
 import { reportAutomationRun } from './automationExecutionService';
 import { automationExecutionRoutes } from '@/app/api/routes/automationExecutionRoutes';
 
@@ -88,6 +88,97 @@ async function api() {
   });
   automationExecutionRoutes(app); await app.ready(); return app;
 }
+
+async function exitRequest() {
+  return { machineId: 'm1', claimToken: 'claim-r1', createBodyHash: await sessionCreateBodyHash((await request()).body),
+    receipt: { version: 1, provider: 'codex', observedAt: now.getTime(), providerExitedCleanly: true,
+      foregroundDrained: true, backgroundDrained: true, writeProducersDrained: true } };
+}
+
+it('records a private owned exit after dispatch completion and reconciles a lost ACK without changing the manual chat', async () => {
+  await register();
+  await reportAutomationRun(client as never, 'owner', 'm1', report('automation-run:r1'), now);
+  const app = await api(), payload = await exitRequest();
+  const send = () => app.inject({ method: 'POST', url: '/v1/automation-runs/r1/execution-exit',
+    headers: { authorization: `Bearer ${bearer}` }, payload });
+  try {
+    const first = await send(); expect(first.statusCode, first.body).toBe(200);
+    expect(first.json()).toMatchObject({ runId: 'r1', sessionId: 'automation-run:r1', receipt: payload.receipt });
+    // Cleanup evidence remains reportable after a definition edit/revocation; it authorizes no new execution.
+    await client.automation.update({ where: { id: 'a1' }, data: { generation: 2, revision: 2, paused: true, deletedAt: now, payloadVersion: 4 } });
+    await client.automationRun.update({ where: { id: 'r1' }, data: { runLeaseExpiresAt: new Date(0) } });
+    const replay = await send(); expect(replay.statusCode, replay.body).toBe(200);
+    expect(replay.json()).toEqual(first.json());
+    const feed = await app.inject({ method: 'GET', url: '/v1/sessions/manual/automation-runs', headers: { authorization: `Bearer ${bearer}` } });
+    expect(feed.json().runs[0]).toMatchObject({ schedulerStatus: 'COMPLETED', executionExitReceipt: first.json().receipt });
+    expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toMatchObject({
+      seq: 3, metadata: 'existing-manual-provider-and-title', agentState: 'existing-user-queue' });
+  } finally { await app.close(); }
+});
+
+it('rejects conflicting owned exit evidence instead of overwriting the first receipt', async () => {
+  await register(); const app = await api(), payload = await exitRequest();
+  try {
+    const send = (value: unknown) => app.inject({ method: 'POST', url: '/v1/automation-runs/r1/execution-exit',
+      headers: { authorization: `Bearer ${bearer}` }, payload: value as any });
+    expect((await send(payload)).statusCode).toBe(200);
+    const conflict = await send({ ...payload, receipt: { ...payload.receipt, observedAt: payload.receipt.observedAt + 1 } });
+    expect(conflict.statusCode).toBe(409);
+    expect((await send(payload)).json().receipt).toMatchObject(payload.receipt);
+  } finally { await app.close(); }
+});
+
+it.each(['claim', 'machine', 'body-hash', 'unregistered', 'partial', 'provider', 'extra', 'browser-principal', 'disabled'])(
+  'refuses invalid owned exit admission: %s', async reason => {
+    if (reason !== 'unregistered') await register();
+    const payload: any = await exitRequest(), headers: Record<string, string> = { authorization: `Bearer ${bearer}` };
+    const status: Record<string, number> = { claim: 403, machine: 403, 'body-hash': 409, unregistered: 409,
+      partial: 400, provider: 400, extra: 400, 'browser-principal': 403, disabled: 404 };
+    if (reason === 'claim') payload.claimToken = 'another-private-claim';
+    if (reason === 'machine') payload.machineId = 'another-machine';
+    if (reason === 'body-hash') payload.createBodyHash = '0'.repeat(64);
+    if (reason === 'partial') payload.receipt.backgroundDrained = false;
+    if (reason === 'provider') payload.receipt.provider = 'gemini';
+    if (reason === 'extra') payload.receipt.assumeExited = true;
+    if (reason === 'browser-principal') headers['x-test-principal'] = 'browser-sync';
+    if (reason === 'disabled') vi.stubEnv('SAYCODE_AUTOMATION_ENABLED', 'false');
+    const app = await api();
+    try {
+      const response = await app.inject({ method: 'POST', url: '/v1/automation-runs/r1/execution-exit', headers, payload });
+      expect(response.statusCode, response.body).toBe(status[reason]);
+      expect((await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } })).executionExitReceipt).toBeNull();
+    } finally { await app.close(); }
+  });
+
+it('keeps exit evidence scoped to the original machine account at the service boundary', async () => {
+  await register();
+  await expect(recordAutomationExecutionExit('other', { ...await exitRequest(), runId: 'r1' }))
+    .rejects.toMatchObject({ statusCode: 403 });
+  expect((await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } })).executionExitReceipt).toBeNull();
+});
+
+it('exposes corrupt stored exit evidence as unconfirmed with a reason instead of asserting a clean exit', async () => {
+  await register();
+  await client.automationRun.update({ where: { id: 'r1' }, data: { executionExitReceipt: { version: 1, provider: 'codex' } } });
+  const app = await api();
+  try {
+    const feed = await app.inject({ method: 'GET', url: '/v1/sessions/manual/automation-runs', headers: { authorization: `Bearer ${bearer}` } });
+    expect(feed.statusCode).toBe(200);
+    expect(feed.json().runs[0]).toMatchObject({ executionExitReceipt: null, executionExitError: 'INVALID_EXECUTION_EXIT_RECEIPT' });
+  } finally { await app.close(); }
+});
+
+it('accepts one concurrent owned exit and rejects a conflicting receipt atomically', async () => {
+  await register(); const app = await api(), payload = await exitRequest();
+  try {
+    const send = (value: unknown) => app.inject({ method: 'POST', url: '/v1/automation-runs/r1/execution-exit',
+      headers: { authorization: `Bearer ${bearer}` }, payload: value as any });
+    const results = await Promise.all([send(payload), send({ ...payload, receipt: { ...payload.receipt, observedAt: payload.receipt.observedAt + 1 } })]);
+    expect(results.map(row => row.statusCode).sort()).toEqual([200, 409]);
+    expect((await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } })).executionExitReceipt)
+      .toEqual(results.find(row => row.statusCode === 200)!.json().receipt);
+  } finally { await app.close(); }
+});
 
 it('registers and reconciles the same run through the authenticated HTTP path', async () => {
   const app = await api();

@@ -5,13 +5,29 @@ import type { Fastify } from '../types';
 import { requireAccountPrincipal } from '@/app/api/utils/enableAuthentication';
 import { isServerBackedAutomationEnabled } from '@/app/automation/automationRollout';
 import { createAutomationExecutionSession, automationExecutionSessionRequestSchema,
-  AutomationExecutionSessionError } from '@/app/automation/automationExecutionSession';
+  AutomationExecutionSessionError, automationExecutionExitRequestSchema, recordAutomationExecutionExit } from '@/app/automation/automationExecutionSession';
 import { ExecutionBindingError } from '@/app/session/sessionExecutionBinding';
 import { listAutomationExecutionPage, readAutomationExecutionEvidencePage } from '@/app/automation/automationExecutionPage';
 import { db } from '@/storage/db';
 
 /** Registers a run-owned session; provider start remains a separate, journaled operation. */
 export function automationExecutionRoutes(app: Fastify) {
+  app.post('/v1/automation-runs/:runId/execution-exit', {
+    bodyLimit: 4096, preHandler: app.authenticate,
+    schema: { params: z.strictObject({ runId: z.string().regex(/^[A-Za-z0-9_-]{1,160}$/) }),
+      body: automationExecutionExitRequestSchema.omit({ runId: true }) },
+  }, async (request, reply) => {
+    if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
+    if (!isServerBackedAutomationEnabled()) return reply.code(404).send({ error: 'feature-disabled' });
+    try {
+      const result = await recordAutomationExecutionExit(request.userId, { ...request.body, runId: request.params.runId });
+      return reply.header('Cache-Control', 'no-store').send(result);
+    } catch (error) {
+      if (error instanceof AutomationExecutionSessionError) return reply.code(error.statusCode).send({ error: error.message });
+      throw error;
+    }
+  });
+
   app.get('/v1/sessions/:displaySessionId/automation-runs/:runId/evidence', {
     preHandler: app.authenticate,
     schema: { params: z.strictObject({ displaySessionId: z.string().min(1).max(200), runId: z.string().regex(/^[A-Za-z0-9_-]{1,160}$/) }),

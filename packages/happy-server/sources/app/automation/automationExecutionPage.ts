@@ -1,5 +1,6 @@
 import type { Prisma } from '@prisma/client';
 import { automationExecutionSeedLocalId, automationExecutionSessionId, isAutomationExecutionSessionId } from '@slopus/happy-wire';
+import { automationExecutionExitReceiptSchema } from './automationExecutionSession';
 
 /** Display projection only. Reading it never appends messages to the manual provider input. */
 export async function listAutomationExecutionPage(tx: Prisma.TransactionClient, accountId: string,
@@ -21,18 +22,22 @@ export async function listAutomationExecutionPage(tx: Prisma.TransactionClient, 
       ...(after ? { OR: [{ createdAt: { lt: after.createdAt } }, { createdAt: after.createdAt, id: { lt: after.id } }] } : {}),
     },
     select: { id: true, automationId: true, generation: true, displaySessionId: true, sessionId: true,
-      createdAt: true, scheduledFor: true, status: true, outcome: true, failureCode: true, startedAt: true, completedAt: true,
+      createdAt: true, scheduledFor: true, status: true, outcome: true, failureCode: true, startedAt: true, completedAt: true, executionExitReceipt: true,
       automation: { select: { projectId: true } } },
     orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take: input.limit + 1,
   });
   const page = rows.slice(0, input.limit), last = page.at(-1);
-  return { runs: page.map(row => ({ id: row.id, automationId: row.automationId, projectId: row.automation.projectId,
+  return { runs: page.map(row => {
+    const exit = automationExecutionExitReceiptSchema.safeParse(row.executionExitReceipt);
+    return { id: row.id, automationId: row.automationId, projectId: row.automation.projectId,
     generation: row.generation, displaySessionId: row.displaySessionId, executionSessionId: row.sessionId,
     // COMPLETED/WOKE means dispatch accepted, not proof that the native model finished its answer.
     schedulerStatus: row.status, outcome: row.outcome, failureCode: row.failureCode,
+    executionExitReceipt: exit.success ? exit.data : null,
+    executionExitError: row.executionExitReceipt !== null && !exit.success ? 'INVALID_EXECUTION_EXIT_RECEIPT' : null,
     scheduledFor: row.scheduledFor.getTime(), dispatchedAt: row.startedAt?.getTime() ?? null,
     dispatchReportedAt: row.completedAt?.getTime() ?? null,
-  })), nextCursor: rows.length > input.limit && last
+  }; }), nextCursor: rows.length > input.limit && last
     ? Buffer.from(JSON.stringify([last.createdAt.getTime(), last.id])).toString('base64url') : null };
 }
 

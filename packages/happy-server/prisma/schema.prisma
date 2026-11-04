@@ -639,6 +639,8 @@ model AutomationRun {
     displaySessionId  String?
     executionCreateBodyHash String?
     executionSeedMetadata String?
+    /// Machine-attested quiescence, independent of scheduler dispatch completion.
+    executionExitReceipt Json?
     outcome           AutomationRunOutcome?
     detailCiphertext  Bytes?
     failureCode       String?
