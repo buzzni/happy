@@ -145,3 +145,19 @@ describe('runtime producer shutdown gate', () => {
         expect(storage.flushForShutdown).not.toHaveBeenCalled();
     });
 });
+
+it('observes workspace idle only after the dispatched turn and every writer finish, without freezing ordinary runtime input', async () => {
+    const { gate, ports } = fixture()
+    expect(gate.isWorkspaceIdle()).toBe(true)
+    gate.beginPreparing(); expect(gate.isWorkspaceIdle()).toBe(false)
+    gate.markDispatched(); expect(gate.isWorkspaceIdle()).toBe(false)
+    gate.endTurn(); expect(gate.isWorkspaceIdle()).toBe(true)
+    let release!: () => void
+    const writer = gate.admit(() => new Promise<void>(resolve => { release = resolve }), 'writer')
+    expect(gate.isWorkspaceIdle()).toBe(false)
+    release(); await writer; expect(gate.isWorkspaceIdle()).toBe(true)
+    ports.hasUndeliveredInput.mockReturnValue(true); expect(gate.isWorkspaceIdle()).toBe(false)
+    ports.hasUndeliveredInput.mockReturnValue(false); expect(gate.isWorkspaceIdle()).toBe(true)
+    expect(ports.freezeInbound).not.toHaveBeenCalled(); expect(ports.stopLoop).not.toHaveBeenCalled()
+    gate.beginTermination(); expect(gate.isWorkspaceIdle()).toBe(false)
+})

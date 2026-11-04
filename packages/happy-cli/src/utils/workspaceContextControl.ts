@@ -48,11 +48,11 @@ export function createWorkspaceContextControl(input: { launchId: string; transpo
   const begin = async (operation: NonNullable<typeof current>, command: Extract<Command, { type: 'drain' }>) => {
     const bound = binding!, started = performance.now()
     let ready = false
-    try { ready = !bound.runtime.blocker() && await bound.prepareWorkspaceDrain(operation.controller.signal) }
+    try { ready = bound.runtime.isWorkspaceIdle() && await bound.prepareWorkspaceDrain(operation.controller.signal) }
     catch { logger.warn('[workspace-context] Manual preflight unconfirmed') }
     const remaining = command.sessionBudgetMs - (performance.now() - started)
     if (closed || operation.controller.signal.aborted || current !== operation) return
-    if (!ready || bound.runtime.blocker() || remaining <= 0) {
+    if (!ready || !bound.runtime.isWorkspaceIdle() || remaining <= 0) {
       await send({ type: 'receipt', nonce: operation.nonce, launchId, stored: false, ownership: 'none', reason: 'workspace-busy' })
       if (current === operation) current = null
       return
@@ -126,6 +126,7 @@ export function observeWorkspaceContextChild(input: { child: ChildProcess; launc
     } else if (ownedType(raw, 'workspace-context-reply')) {
       const parsed = replySchema.safeParse(raw)
       if (!parsed.success || parsed.data.launchId !== launchId || parsed.data.reply.launchId !== launchId) { conflicted = true; lostObserver?.(); return }
+      if (parsed.data.reply.type === 'outcome' && parsed.data.reply.decision === 'blocked') conflicted = true
       if (parsed.data.reply.type === 'ready') {
         if (parsed.data.reply.instanceId === launchId) ready = true
         else { conflicted = true; lostObserver?.() }

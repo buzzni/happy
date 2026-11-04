@@ -95,3 +95,36 @@ it.each(['clean', 'missing', 'foreign', 'partial', 'truthy', 'extra', 'killed', 
     expect(await parent.closed).toBe(state === 'clean')
     expect(persist).toHaveBeenCalledTimes(state === 'clean' || state === 'persist-failed' ? 1 : 0)
   })
+
+it('refuses manual drain while a dispatched turn is still finishing storage or a writer is running', async () => {
+  const f = fixture()
+  await new Promise(resolve => setTimeout(resolve, 0))
+  f.runtime.beginPreparing(); f.runtime.markDispatched()
+  expect(await f.parent.drain(new AbortController().signal, 1000)).toBe(false)
+  expect(f.frozen()).toBe(false); f.runtime.endTurn()
+  let release!: () => void
+  const writer = f.runtime.admit(() => new Promise<void>(resolve => { release = resolve }), 'writer')
+  expect(await f.parent.drain(new AbortController().signal, 1000)).toBe(false)
+  expect(f.frozen()).toBe(false); expect(f.prepare).not.toHaveBeenCalled()
+  release(); await writer
+  await new Promise(resolve => setTimeout(resolve, 0))
+  const operation = f.parent.drain(new AbortController().signal, 1000)
+  expect(f.parent.drain(new AbortController().signal, 1000)).toBe(operation)
+  await vi.waitFor(() => expect(f.runtime.isFrozen()).toBe(true))
+  expect(await f.runtime.waitForShutdownDecision()).toBe('confirmed')
+  await f.close(); expect(await operation).toBe(true); expect(f.provider.endInputAndAwaitExit).toHaveBeenCalledOnce()
+})
+
+it('does not allow a later positive packet to override a blocked storage release decision', async () => {
+  const f = fixture(), original = f.child.send.getMockImplementation()!
+  f.child.send.mockImplementation((value: any, done) => {
+    if (value.command?.type === 'ack') { done(null); return true }
+    return original(value, done)
+  })
+  await new Promise(resolve => setTimeout(resolve, 0))
+  const operation = f.parent.drain(new AbortController().signal, 1000)
+  await vi.waitFor(() => expect(f.runtime.isShutdownBlocked()).toBe(true))
+  expect(await operation).toBe(false)
+  await f.close()
+  expect(await f.parent.closed).toBe(false); expect(f.persist).not.toHaveBeenCalled()
+})
