@@ -5,6 +5,7 @@
  * Studio sign every broker command with user authentication or an approved organization device proof. The runtime and the
  * browser never receive that token or any other daemon credential.
  */
+import { createDesktopBrowserLoginClient, type DesktopBrowserLoginDescriptor } from '@/browserRuntime/desktopBrowserLogin'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -26,6 +27,7 @@ const STOP_TIMEOUT_MS = 15_000
 const MAX_NATIVE_CLOCK_WAIT_MS = 30_000
 
 export interface PersonalBrowserRuntime {
+    loginScope: { machineId: string; workspaceId: string; principalId: string; profileId: string }
     /** Session environment: where the runtime and its broker are. */
     sessionEnv: Record<string, string>
     native: NativeBrokerRequestOptions
@@ -43,6 +45,7 @@ export interface PersonalBrowserRuntimeOptions {
     /** The daemon's user/company bearer, read per request (it may rotate). */
     token: () => string
     deviceProof?: BrowserNativeDeviceSigner
+    desktopLogin?: () => DesktopBrowserLoginDescriptor | undefined
     log: (message: string) => void
     fetchImpl?: typeof fetch
     spawnImpl?: typeof spawn
@@ -97,7 +100,14 @@ export function readPersonalBrowserRuntime(options: PersonalBrowserRuntimeOption
         }
         // A personal bearer remains valid even for a company workspace. Only an explicit
         // authorization refusal tries machine/device authentication; no command was issued yet.
-        let response = await send()
+        const desktopLogin = options.desktopLogin?.()
+        const relay = desktopLogin ? createDesktopBrowserLoginClient(desktopLogin, {
+            machineId: config.machineId, workspaceId: config.workspaceId, principalId: config.profiles[0].principalId,
+            profileId: config.profiles[0].profileId,
+        }) : undefined
+        let response = relay
+            ? new Response(JSON.stringify(await relay.issue(command, signal)), { status: 200 })
+            : await send()
         if ((response.status === 401 || response.status === 403) && !config.workspaceId.startsWith('personal:')) {
             if (!options.deviceProof) throw new Error('NATIVE_DEVICE_APPROVAL_REQUIRED')
             const proof = await options.deviceProof({ studioOrigin, machineId: config.machineId,
@@ -132,7 +142,10 @@ export function readPersonalBrowserRuntime(options: PersonalBrowserRuntimeOption
     if (platform === 'darwin') runtimeEnv.PATH = '/usr/bin:/bin'
     Object.assign(runtimeEnv, { ABP_CONFIG_FILE: paths.configFile, ABP_STATE_DIR: paths.stateDir })
     return {
+        loginScope: { machineId: config.machineId, workspaceId: config.workspaceId,
+            principalId: config.profiles[0].principalId, profileId: config.profiles[0].profileId },
         sessionEnv: {
+            ...(options.desktopLogin?.() ? { HAPPY_BROWSER_TASK_DESKTOP_LOGIN: '1' } : {}),
             HAPPY_BROWSER_TASK_RUNTIME_URL: `http://127.0.0.1:${config.runtimePort}`,
             HAPPY_BROWSER_TASK_BROKER_SOCKET: paths.brokerSocket,
             HAPPY_BROWSER_TASK_PROFILE_ID: config.profiles[0].profileId,
@@ -154,7 +167,16 @@ function superviseRuntime(options: PersonalBrowserRuntimeOptions, env: Record<st
     const launch = () => {
         if (stopping) return
         const startedAt = now()
-        const current = spawnImpl(process.execPath, [entry], { env, stdio: ['pipe', 'ignore', 'pipe'], windowsHide: true })
+        const desktopLogin = options.desktopLogin?.()
+        const current = spawnImpl(process.execPath, [entry], {
+            env: { ...env, ...(desktopLogin ? { ABP_DESKTOP_BROWSER_LOGIN_FD: '3' } : {}) },
+            stdio: desktopLogin ? ['pipe', 'ignore', 'pipe', 'pipe'] : ['pipe', 'ignore', 'pipe'], windowsHide: true,
+        })
+        if (desktopLogin) {
+            const channel = current.stdio[3] as import('node:stream').Writable
+            channel.on('error', () => {})
+            channel.end(JSON.stringify(desktopLogin))
+        }
         child = current
         current.stdin?.on('error', () => {})
         current.stderr?.setEncoding('utf8')
@@ -205,7 +227,7 @@ export function watchPersonalBrowserRuntime(options: PersonalBrowserRuntimeOptio
     intervalMs?: number
     /** Returns false when the daemon cannot use it (the broker failed); the check continues. */
     activate(runtime: PersonalBrowserRuntime): boolean
-}): { stop(): Promise<void> } {
+}): { stop(): Promise<void>; refresh(): Promise<void> } {
     let lastMessage: string | undefined
     const log = (message: string) => { if (message !== lastMessage) options.log(message); lastMessage = message }
     let running: PersonalBrowserRuntimeProcess | undefined, stopped = false
@@ -219,10 +241,21 @@ export function watchPersonalBrowserRuntime(options: PersonalBrowserRuntimeOptio
     }
     check()
     if (!running) { timer = setInterval(check, options.intervalMs ?? 10_000); timer.unref?.() }
+    let refreshing: Promise<void> = Promise.resolve()
     return {
+        refresh() {
+            refreshing = refreshing.catch(() => {}).then(async () => {
+                if (stopped) return
+                const previous = running; running = undefined
+                await previous?.stop()
+                check()
+            })
+            return refreshing
+        },
         async stop() {
             stopped = true
             if (timer) clearInterval(timer)
+            await refreshing.catch(() => {})
             await running?.stop()
         },
     }

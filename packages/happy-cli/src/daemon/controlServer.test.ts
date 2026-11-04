@@ -1410,3 +1410,18 @@ describe('scope approval diagnostic transport', () => {
     } finally { await server.stop(); rmSync(directory, { recursive: true, force: true }); }
   });
 });
+
+// The Desktop relay descriptor is accepted only on the daemon's authenticated local control channel.
+it('protects Desktop-login capability and attach and does not expose issuer errors', async () => {
+  const server = await startDaemonControlServer({ getChildren: () => [], stopSession: () => ({ stopped: false, reason: 'not-found' }),
+    spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }), requestShutdown: () => {}, onHappySessionWebhook: () => {},
+    portRegistry: {} as any, desktopBrowserLogin: { status: () => ({ protocol: 1, machineId: 'm' }), attach: async () => { throw Error('private issuer detail') } } })
+  const url = `http://127.0.0.1:${server.port}/browser/desktop-login/`
+  try {
+    for (const path of ['capability', 'attach']) expect((await realFetch(url + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status).toBe(401)
+    const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${server.controlSecret}` }
+    expect(await (await realFetch(url + 'capability', { method: 'POST', headers, body: '{}' })).json()).toMatchObject({ protocol: 1, machineId: 'm' })
+    const reply = await realFetch(url + 'attach', { method: 'POST', headers, body: '{}' })
+    expect(reply.status).toBe(403); expect(await reply.text()).not.toContain('private issuer detail')
+  } finally { await server.stop() }
+})
