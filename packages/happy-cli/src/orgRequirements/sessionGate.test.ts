@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AgentState } from '@/api/types';
-import { createLiteRuntimeTurnGate, createSessionOrgRequirementsGate } from './sessionGate';
+import { createLiteRuntimeTurnGate, createSessionOrgRequirementsGate, liteRuntimeAgent } from './sessionGate';
 import { ORG_SCOPE_HINT_ENV } from './gate';
 
 const doc = (items: Record<string, unknown>) => ({ schemaVersion: 1, companyId: 'c1', revision: 2, modelPolicyUpdatedAt: null, issuedAt: 1, items });
@@ -23,6 +23,12 @@ function session() {
 afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
 
 describe('session gate assembly', () => {
+    it('keeps opencode apart from an ACP agent Studio has no key for', () => {
+        expect(liteRuntimeAgent('opencode')).toBe('opencode');
+        expect(liteRuntimeAgent('grok')).toBe('grok');
+        expect(liteRuntimeAgent('some-acp-agent')).toBe('acp');
+    });
+
     it('makes no gate for a managed run or with the switch off, and still drops the project hint', () => {
         const env: NodeJS.ProcessEnv = { [ORG_SCOPE_HINT_ENV]: 'p1' };
         expect(createSessionOrgRequirementsGate({ agent: 'claude', credentials: null, machineId: 'm', session: session(), env })).toBeNull();
