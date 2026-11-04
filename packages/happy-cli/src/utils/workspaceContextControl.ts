@@ -145,6 +145,9 @@ export function observeWorkspaceContextChild(input: { child: ChildProcess; launc
       })
     })
   })
+  let closedProof: boolean | null = null, closedObserver: ((ok: boolean) => void) | null = null
+  // One observer per owned root; refused preflights must not accumulate pending promise callbacks.
+  void closed.then(ok => { closedProof = ok; closedObserver?.(ok) })
   let operation: Promise<boolean> | null = null
   return { closed,
     drain(signal: AbortSignal, budgetMs = 30000): Promise<boolean> {
@@ -159,7 +162,7 @@ export function observeWorkspaceContextChild(input: { child: ChildProcess; launc
         const done = (ok: boolean) => {
           if (finished) return
           finished = true; clearTimeout(timer); signal.removeEventListener('abort', abort)
-          replyObserver = null; lostObserver = null; resolve(ok)
+          replyObserver = null; lostObserver = null; closedObserver = null; resolve(ok)
         }
         const abort = () => { void send({ type: 'abandon', nonce }); done(false) }
         const timer = setTimeout(abort, budgetMs)
@@ -175,11 +178,11 @@ export function observeWorkspaceContextChild(input: { child: ChildProcess; launc
             if (!stored || intent) { abort(); return }
             intent = true; void send({ type: 'ack', nonce }).then(ok => { if (!ok) done(false) })
           } else if (reply.decision === 'confirmed' && stored && intent) {
-            confirmed = true; void closed.then(ok => done(ok))
+            confirmed = true; if (closedProof !== null) done(closedProof)
           } else { done(false) }
         }
         // Natural root exit may race the final outcome packet; it remains owned until both proofs arrive.
-        void closed.then(ok => { if (!ok || confirmed) done(ok && confirmed) })
+        closedObserver = ok => { if (!ok || confirmed) done(ok && confirmed) }
         void send({ type: 'drain', nonce, sessionBudgetMs: Math.min(20000, budgetMs * 0.7), releaseBudgetMs: Math.min(5000, budgetMs * 0.2) })
           .then(ok => { if (!ok) done(false) })
       }).then(value => { if (retryable && operation === pending) operation = null; return value })
