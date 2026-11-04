@@ -1533,6 +1533,12 @@ export class CodexAppServerClient {
         foregroundDrained: boolean; backgroundDrained: boolean; providerExitedCleanly: boolean;
     }> {
         if (!this.isolatedAutomationContext) throw new Error('AUTOMATION_CONTEXT_POLICY_UNSUPPORTED');
+        return this.finishObservedNativeWriters(budgetMs);
+    }
+
+    private async finishObservedNativeWriters(budgetMs: number): Promise<{
+        foregroundDrained: boolean; backgroundDrained: boolean; providerExitedCleanly: boolean;
+    }> {
         if (!Number.isFinite(budgetMs) || budgetMs <= 0 || budgetMs > 30_000) throw new Error('Invalid exit observation budget');
         if (this.automationExitEvidence) return { ...this.automationExitEvidence };
         const deadline = performance.now() + budgetMs;
