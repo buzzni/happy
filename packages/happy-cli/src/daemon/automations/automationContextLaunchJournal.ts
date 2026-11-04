@@ -21,6 +21,15 @@ export function createAutomationContextLaunchJournal(home: string): AutomationCo
       try { await handle.sync() } finally { await handle.close() }
     }
   }
+  async function openSnapshot(file: string) {
+    const handle = await open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0))
+    try {
+      const stat = await handle.stat()
+      if (!stat.isFile() || stat.nlink !== 1 || stat.size > 1024 * 1024
+        || process.platform !== 'win32' && (stat.uid !== process.getuid?.() || (stat.mode & 0o777) !== 0o600)) throw new Error('AUTOMATION_LAUNCH_JOURNAL_UNSAFE')
+      return handle
+    } catch (error) { await handle.close(); throw error }
+  }
   return {
     async exclusive(runId, work) { await prepare(); return withOwnedFileLock(path(runId) + '.lock', work) },
     async listRunIds() {
@@ -29,11 +38,8 @@ export function createAutomationContextLaunchJournal(home: string): AutomationCo
       for (const name of (await readdir(directory)).sort()) {
         if (!name.endsWith('.json')) continue
         if (!/^[a-f0-9]{64}\.json$/.test(name)) throw new Error('AUTOMATION_LAUNCH_JOURNAL_INVALID')
-        const file = join(directory, name), handle = await open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0))
+        const file = join(directory, name), handle = await openSnapshot(file)
         try {
-          const stat = await handle.stat()
-          if (!stat.isFile() || stat.nlink !== 1 || stat.size > 1024 * 1024
-            || process.platform !== 'win32' && (stat.uid !== process.getuid?.() || (stat.mode & 0o777) !== 0o600)) throw new Error('AUTOMATION_LAUNCH_JOURNAL_UNSAFE')
           const record = automationContextLaunchRecordSchema.parse(JSON.parse(await handle.readFile('utf8')))
           if (path(record.runId) !== file || runs.includes(record.runId)) throw new Error('AUTOMATION_LAUNCH_JOURNAL_INVALID')
           runs.push(record.runId)
@@ -44,12 +50,9 @@ export function createAutomationContextLaunchJournal(home: string): AutomationCo
     async read(runId) {
       await prepare()
       let handle
-      try { handle = await open(path(runId), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)) }
+      try { handle = await openSnapshot(path(runId)) }
       catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error }
       try {
-        const stat = await handle.stat()
-        if (!stat.isFile() || stat.nlink !== 1 || stat.size > 1024 * 1024
-          || process.platform !== 'win32' && (stat.uid !== process.getuid?.() || (stat.mode & 0o777) !== 0o600)) throw new Error('AUTOMATION_LAUNCH_JOURNAL_UNSAFE')
         const record = automationContextLaunchRecordSchema.parse(JSON.parse(await handle.readFile('utf8')))
         if (record.runId !== runId) throw new Error('AUTOMATION_LAUNCH_JOURNAL_INVALID')
         return record
