@@ -47,7 +47,7 @@ describe('spawn wiring', () => {
         const mcpRefusal = text.indexOf('errorMessage: `MCP caller grant rejected (${consumed.reason})`')
         const claim = text.indexOf('const agentPlanClaimRefusal = agentPlanLaunch.claim();')
         const tmuxLaunch = text.indexOf('const tmuxResult = await tmux.spawnInTmux(')
-        const regularLaunch = text.indexOf('return finishSpawn(spawnTrackedHappyProcess({\n            onProcessSubmission: () => ownedStartGuard.submitted(options),')
+        const regularLaunch = text.indexOf('return finishSpawn(spawnTrackedHappyProcess({')
         for (const index of [expansion, seeds, mcpRefusal, claim, tmuxLaunch, regularLaunch]) expect(index).toBeGreaterThan(0)
         expect(seeds).toBeGreaterThan(expansion)
         // An unrelated refusal (the MCP envelope) comes before the claim, so the client's retry is not a replay.

@@ -346,7 +346,7 @@ describe('host custody launches skip tmux (H3-R1-02)', () => {
     it('the daemon skips tmux for a pipe-only owned launch', async () => {
         const { readFile } = await import('node:fs/promises');
         const source = await readFile(new URL('./run.ts', import.meta.url), 'utf8');
-        expect(source).toMatch(/if \(!tmuxAvailable \|\| tmuxSessionName === undefined \|\| ownerPipeRequired\)/);
+        expect(source).toContain('if (!tmuxAvailable || tmuxSessionName === undefined || ownerPipeRequired || contextOwnedChildren.has(options))');
         expect(source).toContain('const ownerPipeRequired = ownedPipeOnlyLaunch?.(options) === true;');
         expect(source).toContain('ownedPipeOnlyLaunch = options => ownedSpawn.pipeOnlyLaunch(options);');
     });

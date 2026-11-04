@@ -2,6 +2,7 @@ import { expect, it, vi } from 'vitest'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { mkdir, symlink } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
+import { createServer } from 'node:http'
 import type { ChildProcess } from 'node:child_process'
 import { readAutomationExecutionRecord,
   sessionCreateBodyHash, type AutomationPayload } from '@slopus/happy-wire'
@@ -11,7 +12,7 @@ import { decrypt, decodeBase64 } from '@/api/encryption'
 import { SessionWriteScopeFixture, eventually, type StoredMessage } from '@/testing/sessionWriteScopeFixture'
 import { createAutomationContextLaunchJournal } from './automationContextLaunchJournal'
 import { createAutomationContextHost } from './automationContextHost'
-import { createAutomationContextTransport } from './automationContextTransport'
+import { createAutomationContextAuthorizer, createAutomationContextTransport } from './automationContextTransport'
 import { createServerAutomationRuntimeStore } from './serverAutomationRuntimeStore'
 import { createAutomationContextWorkspace } from './automationContextWorkspace'
 
@@ -32,6 +33,108 @@ async function seedRun(fixture: SessionWriteScopeFixture, input: Record<string, 
     return response
   }, 'registered machine and claimed fixture run')
 }
+
+it('restores a durable deferred occurrence through the real daemon without replaying it', async () => {
+  vi.stubEnv('HAPPY_SCOPE_FRESH_PROVIDER_STATE', '1')
+  vi.stubEnv('HAPPY_SCOPE_PACKAGED_SERVER', undefined)
+  vi.stubEnv('HAPPY_SCOPE_INSTALLED_CLI', undefined)
+  let fixture: SessionWriteScopeFixture, run: any
+  const secret = randomBytes(32).toString('hex'), runId = `deferred-${randomUUID()}`, claimToken = randomBytes(24).toString('hex')
+  const calls: string[] = []
+  // Scoped Studio facade: real Happy admission is still checked on every target proof.
+  const studio = createServer(async (request, response) => {
+    const reply = (status: number, value: unknown) => response.writeHead(status, { 'Content-Type': 'application/json' }).end(JSON.stringify(value))
+    try {
+      if (!request.url?.startsWith('/api/automation/')) { reply(404, {}); return }
+      let raw = ''; for await (const chunk of request) raw += chunk
+      const body = JSON.parse(raw)
+      if (!run || request.headers.authorization !== `Bearer ${fixture.token}` || body.machineId !== run.machineId
+        || body.runId !== runId || body.claimToken !== claimToken) { reply(403, {}); return }
+      calls.push(request.url)
+      if (request.url === '/api/automation/project-environment') {
+        if (body.conversationSessionId !== run.displaySessionId || body.conversationDirectory !== fixture.project) { reply(403, {}); return }
+        reply(200, { projectId: run.projectId, conversationSessionId: run.displaySessionId,
+          conversationDirectory: fixture.project, environmentVariables: {} }); return
+      }
+      if (request.url === '/api/automation/mcp-caller-grant') {
+        reply(200, { projectId: run.projectId, grant: null, bindingStatus: 'DIRECT_OWNER', connectorPolicy: 'optional', requiredConnectors: [] }); return
+      }
+      if (request.url === '/api/automation/execution-target') {
+        const admission = await fixture.http(`/v1/automation-runs/${runId}/mcp-context`, { machineId: run.machineId, claimToken, executionAdmission: true })
+        if (admission.status !== 200 || admission.body.executionAdmission?.payloadVersion !== 6
+          || body.conversationSessionId !== run.displaySessionId || body.conversationDirectory !== fixture.project) { reply(403, {}); return }
+        reply(200, { executionBindingRequired: false, targetProof: signAutomationExecutionTarget({ automationId: run.automationId,
+          projectId: run.projectId, generation: run.generation, revision: run.revision, machineId: run.machineId,
+          runId, machineAccountId: fixture.accountId, displaySessionId: run.displaySessionId,
+          createBodyHash: await sessionCreateBodyHash(body.createBody), executionBindingRequired: false,
+          bearer: fixture.token, secret, now: Date.now() }) }); return
+      }
+      reply(404, {})
+    } catch { reply(500, {}) }
+  })
+  await new Promise<void>(resolve => studio.listen(0, '127.0.0.1', resolve))
+  const origin = `http://127.0.0.1:${(studio.address() as { port: number }).port}`
+  fixture = new SessionWriteScopeFixture({ provider: 'claude', encryptionVariant: 'legacy',
+    serverEntry: 'sources/testing/automationContextFixture.ts', browserBridgeHost: '::1', automationContextHost: true, automationStudioUrl: origin })
+  let failure: unknown
+  try {
+    await fixture.start()
+    const api = await ApiClient.create({ token: fixture.token, encryption: { type: 'legacy', secret: fixture.seed } })
+    const prepared = api.prepareSessionCreation({ tag: `manual-${randomUUID()}`, metadata: { path: fixture.project,
+      host: 'fixture', flavor: 'claude', claudeSessionId: 'manual-native-keep', homeDir: fixture.home, happyHomeDir: fixture.happyHome,
+      happyLibDir: fixture.cli, happyToolsDir: fixture.tools }, state: { controlledByUser: false } })
+    const displaySessionId = (await fixture.http('/v1/sessions', prepared.body)).body.session.id
+    run = { ...await seedRun(fixture, { accountId: fixture.accountId, displaySessionId, runId, claimToken, directory: fixture.project, secret }), displaySessionId }
+    const journal = createAutomationContextLaunchJournal(fixture.happyHome)
+    const workspace = createAutomationContextWorkspace({ home: fixture.happyHome, isTracked: async () => false })
+    const manual = await workspace.beginManualLaunch([fixture.project])
+    if (!manual.acquired) throw new Error('Manual preparation refused')
+    const host = createAutomationContextHost({ accountId: fixture.accountId, machineId: run.machineId, happyOrigin: fixture.serverUrl,
+      api, journal, workspace, runtimeStore: createServerAutomationRuntimeStore({ filePath: join(fixture.happyHome, 'preparation-runtime.test.json') }),
+      heartbeat: async () => { throw new Error('Only the daemon maintains the saved occurrence') },
+      resolveContext: async () => { throw new Error('Only the daemon resolves renewed authority') },
+      discover: async () => 'unconfirmed', start: async () => { throw new Error('Busy workspace must not submit') }, log: message => fixture.failures.push(message),
+      transportForRun: async () => createAutomationContextTransport({ serverUrl: fixture.serverUrl, token: fixture.token,
+        machineId: run.machineId, runId, claimToken, authorize: createAutomationContextAuthorizer({ studioOrigin: origin,
+          token: fixture.token, machineId: run.machineId, runId, claimToken }) }) })
+    const marker = `scope-marker-deferred-${randomUUID()}`
+    try {
+      expect(await host.dispatch({ automationId: run.automationId, generation: run.generation, revision: run.revision, runId, claimToken,
+        environmentVariables: {}, payload: { name: 'Deferred isolated occurrence', directory: fixture.project, agent: 'claude',
+          model: fixture.modelName, prompt: `Return ${marker} only.`, scriptCommand: null, suppressSilent: false,
+          schedule: { kind: 'once-zoned', date: '2026-11-05', hour: 9, minute: 0, timeZone: 'UTC' },
+          conversation: { sessionId: displaySessionId }, contextPolicy: { kind: 'isolated', reference: null } } }))
+        .toMatchObject({ state: 'waiting', deferred: true })
+      expect(await journal.read(runId)).toMatchObject({ phase: 'registered', deferredDispatch: 'queued' })
+      await fixture.stopDaemon()
+      await fixture.startDaemon()
+    } finally { expect(await manual.finish({ submitted: false, tracked: false })).toBe(true) }
+    await eventually(async () => {
+      await fixture.children()
+      return (await journal.read(runId))?.exitReceipt ? true : undefined
+    }, 'daemon restores, submits and drains the saved automatic occurrence', 45_000)
+    await eventually(async () => {
+      const feed = await fixture.http(`/v1/sessions/${displaySessionId}/automation-runs`)
+      return feed.body.runs?.[0]?.schedulerStatus === 'COMPLETED' ? feed.body.runs[0] : undefined
+    }, 'daemon flushes the original run report')
+    expect(await journal.read(runId)).toMatchObject({ phase: 'started', deferredDispatch: 'settled', exitReceipt: { provider: 'claude' } })
+    expect(calls).toContain('/api/automation/project-environment')
+    expect(calls).toContain('/api/automation/mcp-caller-grant')
+    expect(fixture.modelRequests).toHaveLength(1)
+    expect(fixture.modelRequests[0]).toContain(marker)
+    const manualAfter = (await fixture.http('/v2/sessions/lookup', { ids: [displaySessionId] })).body.sessions[0]
+    expect(decrypt(prepared.encryptionKey, prepared.encryptionVariant, decodeBase64(manualAfter.metadata))).toMatchObject({ claudeSessionId: 'manual-native-keep' })
+    const admission = await workspace.beginManualLaunch([fixture.project])
+    expect(admission.acquired).toBe(true)
+    if (admission.acquired) expect(await admission.finish({ submitted: false, tracked: false })).toBe(true)
+  } catch (error) { failure = new Error(`Deferred daemon failed:\n${await fixture.diagnostics().catch(() => 'Diagnostics unavailable')}`, { cause: error }) }
+  finally {
+    try { await fixture.close() } catch (error) { failure = failure ? new AggregateError([failure, error]) : error }
+    studio.closeAllConnections(); await new Promise<void>(resolve => studio.close(() => resolve()))
+    vi.unstubAllEnvs()
+  }
+  if (failure) throw failure
+})
 
 it('refuses a real daemon manual spawn while automatic ownership exists and permits it after proven release', async () => {
   vi.stubEnv('HAPPY_SCOPE_FRESH_PROVIDER_STATE', '1')
