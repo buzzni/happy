@@ -43,6 +43,18 @@ const GITLINK_PATHS = [
   'vendor/happy',
 ];
 
+/**
+ * 의존성 설치가 다시 쓰는 lockfile. 매니페스트가 그대로면 같은 설치로 다시 만들 수
+ * 있으므로 수정(` M`/`M `)만 무시한다 — 새로 생기거나 지워진 lockfile 은 지킨다.
+ *
+ * 2026-11-04 개발 PC — 정리 실패 55건 중 26건(5.0G)의 사유가 lockfile 하나뿐이었다
+ * (`worktree is dirty (yarn.lock)`). package.json 은 그대로였고, 워커가 설치하면서
+ * lockfile 을 다시 쓴 것이었다. 매니페스트가 함께 바뀌었으면 의도한 의존성 변경일 수
+ * 있으므로 lockfile 도 작업물로 보고 지킨다.
+ */
+const LOCKFILE_NAMES = ['yarn.lock', 'pnpm-lock.yaml', 'package-lock.json'];
+const MANIFEST_NAME = 'package.json';
+
 function isIgnorableEntry(line: string): boolean {
   const status = line.slice(0, 2);
   const path = line.slice(3).trim();
@@ -80,9 +92,24 @@ export function describeUnsavedWorktreeChanges(porcelainStatus: string): string[
 }
 
 function unsavedEntries(porcelainStatus: string): string[] {
-  return porcelainStatus
+  const entries = porcelainStatus
     .split('\n')
     .map((line) => line.replace(/\r$/, ''))
     .filter((line) => line.trim().length > 0)
     .filter((line) => !isIgnorableEntry(line));
+  if (entries.some(isManifestEntry)) return entries;
+  return entries.filter((line) => !isRegeneratedLockfile(line));
+}
+
+function isRegeneratedLockfile(line: string): boolean {
+  const status = line.slice(0, 2);
+  return (status === ' M' || status === 'M ') && LOCKFILE_NAMES.includes(basename(line.slice(3).trim()));
+}
+
+function isManifestEntry(line: string): boolean {
+  return basename(line.slice(3).trim()) === MANIFEST_NAME;
+}
+
+function basename(path: string): string {
+  return path.slice(path.lastIndexOf('/') + 1);
 }
