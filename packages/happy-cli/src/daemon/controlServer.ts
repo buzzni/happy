@@ -118,7 +118,9 @@ export function startDaemonControlServer({
   getDeviceEnrollment = () => null,
   getSetupTokenAccountSwitch = () => null,
   getCallerLaunches = () => null,
+  admitSubprocess,
 }: {
+  admitSubprocess?: (roots: readonly string[]) => Promise<void>;
   /** T1c-b2 H2 owner-contact launch bootstrap; null while the rollout switch is off. */
   getCallerLaunches?: () => { issue(raw: unknown): Promise<unknown>; current(raw: unknown): Promise<{ current: boolean }> } | null;
   getDeviceEnrollment?: () => ReturnType<typeof createDeviceEnrollment> | null;
@@ -857,6 +859,7 @@ export function startDaemonControlServer({
     }, async (request, reply) => {
       try {
         const result = await startServerProcess(request.body, {
+          ...(admitSubprocess ? { admitSubprocess } : {}),
           // Give Node's ChildProcess 'error' event (ENOENT) time to fire
           // before we claim success. Matches the web-ui handler's
           // setImmediate+error-once pattern.
