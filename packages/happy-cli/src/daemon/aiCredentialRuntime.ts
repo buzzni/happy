@@ -60,6 +60,8 @@ export const claudeSwapPython = createClaudeSwapPythonResolver({ platform: proce
 const CLAUDE_STATUS_TIMEOUT_MS = 120_000
 /** A used-up shared account without a known reset is skipped for one 5-hour window. */
 const SHARED_ACCOUNT_UNKNOWN_RESET_MS = 5 * 60 * 60_000
+/** How long a roster read proves shared accounts for start requests (one per turn). */
+const SHARED_START_ROSTER_MS = 60_000
 // Keep readable historical bundles separate from supported installed runtimes.
 // Bundles from supported runtimes are readable; parseCodexMultiAuthBundle still
 // requires the OAuth account v3 / settings v1 contract.
@@ -2611,6 +2613,23 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     }
     return serializeLaunch('prepare', () => sharedMachineSessionEnvironment({ moveFrom: managedAccountId }))
   }
+  /**
+   * Saycode specs/shared-pc-start-budget — what a shared-PC session proves when it asks Studio to start a turn: the company
+   * and generation this PC holds the account at. Every turn asks, so the roster read is reused for a minute; a stale
+   * generation is only refused by Studio, and a refused start still runs (decision D1).
+   */
+  let sharedStartRoster: { readAt: number; companyId: string | null; generations: Map<string, number> } | null = null
+  async function sharedMachineStartProof(managedAccountId: string): Promise<{ companyId: string; credentialGeneration: number } | null> {
+    if (!sharedStartRoster || deps.now() - sharedStartRoster.readAt > SHARED_START_ROSTER_MS) {
+      const held = await sharedMachineCandidates()
+      const candidates = held ? (await held.read()).candidates : []
+      sharedStartRoster = { readAt: deps.now(), companyId: held?.companyId ?? null,
+        generations: new Map(candidates.map(candidate => [candidate.managedAccountId, candidate.credentialGeneration])) }
+    }
+    const credentialGeneration = sharedStartRoster.generations.get(managedAccountId)
+    return sharedStartRoster.companyId && credentialGeneration !== undefined && Number.isSafeInteger(credentialGeneration)
+      ? { companyId: sharedStartRoster.companyId, credentialGeneration } : null
+  }
   /** The environment of exactly that shared account, for a session catching up with a move; null when it is gone. */
   function sharedMachineAccountEnvironment(managedAccountId: string) {
     return serializeLaunch('prepare', () => sharedMachineSessionEnvironment({ account: managedAccountId }))
@@ -2817,7 +2836,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (entries.length !== 1 || entries[0].pending) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_ASSIGNMENT_UNRESOLVED')
     return entries[0].scope
   })
-  return { sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, sharedMachineAccountEnvironment, measureWithPermit, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, refreshCodexOwner, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
+  return { sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, sharedMachineAccountEnvironment, sharedMachineStartProof, measureWithPermit, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, refreshCodexOwner, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
     // One fresh runtime observation per RPC: launching cswap repeatedly can block a secured Windows host.
     let stdout = ''
     try { stdout = (await deps.execFile('cswap', ['token-runtime', 'capabilities'], { maxOutputBytes: 64 * 1024, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })).stdout } catch {}

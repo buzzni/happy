@@ -465,6 +465,54 @@ describe('shared PC setup-token account switch (Saycode specs/shared-pc-session-
   })
 })
 
+describe('shared PC start budget (Saycode specs/shared-pc-start-budget)', () => {
+  const sharedRunning = sharedMachineSetupTokenAuthority({ HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1', [SETUP_TOKEN_SHARED_ACCOUNT_ENV]: A })!
+  const REQUEST = '00000000-0000-4000-8000-0000000000ee'
+  const allowed = { state: 'allowed', validForMs: 15_000 }
+  function startSetup(answer: () => Response | Promise<Response>, extra: Partial<SetupTokenAccountSwitchDeps> = {}) {
+    const sharedMachine = { reportUsage: vi.fn(async () => undefined), rebind: vi.fn(async () => null), environment: vi.fn(async () => null), moved: vi.fn(),
+      startProof: vi.fn(async (): Promise<{ companyId: string; credentialGeneration: number } | null> => ({ companyId: 'org-a', credentialGeneration: 1 })) }
+    const context = setup({ sharedMachine, ...extra })
+    context.session.agentEnvironment = {}
+    context.session.sharedSetupTokenAccount = A
+    vi.mocked(context.deps.fetch).mockImplementation(async (url, init) => {
+      context.requests.push({ url: String(url), body: JSON.parse(String(init?.body)), authorization: new Headers(init?.headers).get('authorization') })
+      return answer()
+    })
+    return { ...context, sharedMachine }
+  }
+
+  it('asks Studio with the machine\'s own token for the account the daemon handed the session', async () => {
+    const wait = { version: 1, state: 'wait', retryAfterMs: 30_000, preferredAccountIds: [B] }
+    const { switcher, requests } = startSetup(() => Response.json(wait))
+    expect(await switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: true, admission: wait })
+    expect(requests).toEqual([{ url: 'https://studio.test/api/claude-setup-token/daemon/shared/start', authorization: 'Bearer machine-token',
+      body: { machineId: 'pc-a', companyId: 'org-a', sessionId: 'session-a', managedAccountId: A, credentialGeneration: 1, requestId: REQUEST } }])
+  })
+
+  it.each([
+    ['an older Studio without the route', () => new Response('{}', { status: 404 })],
+    ['a Studio failure', () => new Response('{}', { status: 503 })],
+    ['a refusal', () => Response.json({ error: 'SETUP_TOKEN_DAEMON_GENERATION_CHANGED' }, { status: 409 })],
+    ['no answer', () => { throw new TypeError('fetch failed') }],
+    ['an unreadable answer', () => new Response('not json')],
+  ])('runs the turn on %s rather than holding it (decision D1)', async (_name, answer) => {
+    const { switcher } = startSetup(answer)
+    expect(await switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: true, admission: allowed })
+  })
+
+  it('runs the turn without asking when it cannot prove the account', async () => {
+    const { switcher, requests, sharedMachine, session } = startSetup(() => Response.json({}))
+    sharedMachine.startProof.mockResolvedValueOnce(null)
+    expect(await switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: true, admission: allowed })
+    delete session.sharedSetupTokenAccount
+    expect(await switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: true, admission: allowed })
+    const offline = startSetup(() => Response.json({}), { studioOrigin: null })
+    expect(await offline.switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: true, admission: allowed })
+    expect([...requests, ...offline.requests]).toEqual([])
+  })
+})
+
 it('forwards authenticated failure context and rejects unsupported reason data', async () => {
  const f=setup(),failure={kind:'authentication' as const,observedAt:1000}
  vi.mocked(f.deps.fetch).mockResolvedValueOnce(Response.json({version:1,allLimited:false,availableAccountIds:[],fallbackReason:'organization-authentication'}))

@@ -448,6 +448,28 @@ describe('managed Claude setup-token runtime', () => {
     expect(await runtime.sharedMachineRebind(A, refusedA)).toMatchObject({ HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: B })
   })
 
+  it('proves a held shared account for a start request from a short-lived roster read (Saycode specs/shared-pc-start-budget)', async () => {
+    const clock = { now: NOW }
+    const { runtime, calls } = fakeMachine([], null, { machineId: 'machine-1', clock })
+    await runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',
+      generation: 1, fingerprint: '1'.padStart(64, '0'), payload: payload(managed(A, 1, fakeToken('a')), managed(B, 2, fakeToken('b'))) })
+    const exports = () => calls.filter(call => call.command === 'cswap' && call.args[0] === 'export').length
+    const before = exports()
+    expect(await runtime.sharedMachineStartProof(A)).toEqual({ companyId: 'company-1', credentialGeneration: 1 })
+    expect(await runtime.sharedMachineStartProof(B)).toEqual({ companyId: 'company-1', credentialGeneration: 2 })
+    expect(await runtime.sharedMachineStartProof('00000000-0000-4000-8000-0000000000ff')).toBeNull()
+    // Every turn asks: the roster is read once a minute, not per turn.
+    expect(exports() - before).toBe(1)
+    clock.now += 60_001
+    expect(await runtime.sharedMachineStartProof(A)).toEqual({ companyId: 'company-1', credentialGeneration: 1 })
+    expect(exports() - before).toBe(2)
+  })
+
+  it('proves no account on a machine without a shared assignment', async () => {
+    const { runtime } = fakeMachine([], null, { machineId: 'machine-1' })
+    expect(await runtime.sharedMachineStartProof(A)).toBeNull()
+  })
+
   it('moves a shared session to an account at 97% of its weekly window but not at 98% (five-hour stays at 95%)', async () => {
     const { runtime } = fakeMachine([], null, { machineId: 'machine-1' })
     await runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',

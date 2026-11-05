@@ -56,6 +56,8 @@ export type SetupTokenAccountSwitchDeps = {
     rebind(managedAccountId: string, observation?: SetupTokenUsageObservation): Promise<Record<string, string> | null>
     environment(managedAccountId: string): Promise<Record<string, string> | null>
     moved(): void
+    /** The company and credential generation this PC holds the account at, for asking Studio to start a turn; null when not held. */
+    startProof?(managedAccountId: string): Promise<{ companyId: string; credentialGeneration: number } | null>
   }
 }
 /**
@@ -65,6 +67,8 @@ export type SetupTokenAccountSwitchDeps = {
 export type SwitchFailure = 'NOT_BOUND' | 'STALE' | 'STUDIO_UNAVAILABLE' | 'NO_ACCOUNT' | 'APPLY_REQUIRED' | 'FORBIDDEN' | 'REQUEST_FAILED' | 'BINDING_REJECTED' | 'PERSISTENCE_FAILED' | 'PERSISTENCE_INDETERMINATE' | 'STUDIO_BUDGET' | 'UNSUPPORTED' | 'ROTATION_LIMIT'
 
 const REQUEST_TIMEOUT_MS = 15_000
+/** What the launcher accepts as a start permit's lifetime; a shared-PC turn run without a Studio decision gets one. */
+const SHARED_START_OPEN_MS = 15_000
 /** Studio asks for at most this many checks per switch (its MAX_PROBES_PER_SWITCH); a further ask is not followed. */
 const MAX_CHECKS_PER_SWITCH = 3
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
@@ -285,8 +289,35 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     return { ok: true, environment }
   }
 
+  /**
+   * Saycode specs/shared-pc-start-budget — a shared-PC session asks Studio with the machine's own token. Only a decision
+   * Studio actually answers holds the turn: an older Studio, a failure, a refusal or no answer runs it (decision D1).
+   */
+  async function sharedStart(sessionId: string, shared: ReturnType<typeof sharedSession>, requestId: string, signal?: AbortSignal) {
+    const open = (detail: string) => {
+      logger.debug(`[setup-token-switch] shared start for ${sessionId} runs without a Studio decision: ${detail}`)
+      return { ok: true as const, admission: { state: 'allowed' as const, validForMs: SHARED_START_OPEN_MS } }
+    }
+    if (!shared) return open('no shared account handed to this session')
+    if (!deps.studioOrigin || !shared.sharedMachine.startProof) return open('Studio or account proof unavailable')
+    try {
+      signal?.throwIfAborted()
+      const proof = await shared.sharedMachine.startProof(shared.managedAccountId)
+      if (!proof) return open('account not held by this PC')
+      const response = await post('shared/start', { machineId: deps.machineId, companyId: proof.companyId, sessionId,
+        managedAccountId: shared.managedAccountId, credentialGeneration: proof.credentialGeneration, requestId })
+      if (!response.ok) return open(`Studio answered ${response.status}`)
+      return { ok: true as const, admission: await response.json() }
+    } catch (error) {
+      if (signal?.aborted) return failure('REQUEST_FAILED', 'shared start cancelled')
+      return open(`${(error as Error)?.name ?? 'error'}`)
+    }
+  }
+
   return {
     async requestStart(sessionId: string, running: string, requestId: string, signal?: AbortSignal) {
+      const shared = sharedSession(sessionId, running)
+      if (shared !== null) return sharedStart(sessionId, shared, requestId, signal)
       const parsed = parseBinding(running)
       if (parsed && isMachineSetupTokenBinding(parsed.binding)) {
         try {
