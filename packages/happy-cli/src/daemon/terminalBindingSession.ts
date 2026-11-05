@@ -56,10 +56,14 @@ export type TerminalOpenDecision =
     | { kind: 'bound'; params: TerminalOpenParams; nonce: string }
     | { kind: 'refused'; error: string; code: string };
 
-export function decideTerminalOpen(
+export type TerminalOpenInspection = Exclude<TerminalOpenDecision, { kind: 'bound' }>
+    | { kind: 'bound'; params: TerminalOpenParams; nonce: string; issuedAt: number };
+
+/** Read-only validation. Opening a PTY still requires decideTerminalOpen's nonce admission. */
+export function inspectTerminalOpen(
     opened: unknown,
-    ctx: { machineId: string; strict: boolean; nonceGuard: RpcNonceGuard; now?: number },
-): TerminalOpenDecision {
+    ctx: { machineId: string; strict: boolean; now?: number },
+): TerminalOpenInspection {
     const now = ctx.now ?? Date.now();
     const binding = readBoundRpcRequest(opened, { method: TERMINAL_OPEN_METHOD, scope: ctx.machineId, now });
     if (binding.kind === 'refused') {
@@ -78,10 +82,20 @@ export function decideTerminalOpen(
     }
     const params = readTerminalOpenParams(binding.params);
     if (!params) return { kind: 'refused', code: 'TERMINAL_BINDING_MALFORMED', error: 'Terminal open params are malformed' };
+    return { kind: 'bound', params, nonce: binding.nonce, issuedAt: binding.issuedAt };
+}
+
+export function decideTerminalOpen(
+    opened: unknown,
+    ctx: { machineId: string; strict: boolean; nonceGuard: RpcNonceGuard; now?: number },
+): TerminalOpenDecision {
+    const now = ctx.now ?? Date.now();
+    const binding = inspectTerminalOpen(opened, { machineId: ctx.machineId, strict: ctx.strict, now });
+    if (binding.kind !== 'bound') return binding;
     const admission = ctx.nonceGuard.admit(binding.nonce, binding.issuedAt, now);
     if (admission === 'replayed') return { kind: 'refused', code: 'RPC_REQUEST_REPLAYED', error: 'Request was already received' };
     if (admission === 'full') return { kind: 'refused', code: 'RPC_TOO_MANY_REQUESTS', error: 'Too many requests within the time window; retry shortly' };
-    return { kind: 'bound', params, nonce: binding.nonce };
+    return { kind: 'bound', params: binding.params, nonce: binding.nonce };
 }
 
 /** How long frames that arrived ahead of a missing one wait for it before the hole ends the terminal. */
