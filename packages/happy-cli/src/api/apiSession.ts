@@ -401,6 +401,7 @@ export interface ApiSessionClientOptions {
     storageHighWaterWrites?: number;
     /** Live host dependency; never part of a session snapshot or RPC payload. */
     withFilesystemMutation?: CommonHandlerOptions['withFilesystemMutation'];
+    admitSubprocess?: CommonHandlerOptions['admitSubprocess'];
 }
 
 export class ApiSessionClient extends EventEmitter {
@@ -740,6 +741,7 @@ export class ApiSessionClient extends EventEmitter {
             ...(isAutomationExecutionSessionId(this.sessionId) ? { processExecution: 'disabled' as const } : {}),
             machineRun: { profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY, managedTools: hostManagedMachineTools(configuration.happyHomeDir) },
             ...(options.withFilesystemMutation ? { withFilesystemMutation: options.withFilesystemMutation } : {}),
+            ...(options.admitSubprocess ? { admitSubprocess: options.admitSubprocess } : {}),
         });
         // aplus-dev-studio-desktop#2111 — stops only what this session's runtime recorded at spawn.
         registerCleanBackgroundProcessesHandler(this.rpcHandlerManager, this.sessionId);

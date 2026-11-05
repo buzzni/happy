@@ -161,6 +161,22 @@ describe('a managed startup', () => {
         expect(seen).toEqual([]);
     });
 
+    it('refuses host process admission in a managed session before opening a client', async () => {
+        const { readManagedStartup } = await import('@/managed/managedStartup');
+        const { ApiClient } = await import('@/api/api');
+        const startup = await readManagedStartup(
+            { HAPPY_MANAGED_BOOTSTRAP_FD: String(anonymousFd(envelopeJson())) }, Date.now(), serverUrl,
+        );
+        const api = ApiClient.managed(startup!.attachment);
+        const admitSubprocess = vi.fn(async (_roots: readonly string[]) => undefined);
+        let client: ReturnType<typeof api.sessionSyncClient> | undefined;
+        try {
+            expect(() => { client = Reflect.apply(api.sessionSyncClient, api, [startup!.attachment.session, { admitSubprocess }]); })
+                .toThrow(/not a managed runtime capability/);
+            expect(admitSubprocess).not.toHaveBeenCalled();
+        } finally { await client?.close(); }
+    });
+
     it('opens the session client on the scoped bearer and the envelope origin', async () => {
         const { readManagedStartup } = await import('@/managed/managedStartup');
         const { ApiClient } = await import('@/api/api');

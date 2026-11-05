@@ -250,6 +250,17 @@ describe('ApiSessionClient v3 messages API migration', () => {
         mockIo.mockReturnValue(mockSocket);
     });
 
+    it('passes only the host process admission dependency into its RPC handlers', async () => {
+        const admitSubprocess = vi.fn(async (_roots: readonly string[]) => { throw new Error('WORKSPACE_OWNER_UNCONFIRMED'); });
+        const client = Reflect.construct(ApiSessionClient, ['fake-token', session, undefined, { admitSubprocess }]) as ApiSessionClient;
+        try {
+            const options = registeredCommonHandlers.mock.calls.at(-1)?.[2];
+            expect(options.admitSubprocess).toBe(admitSubprocess);
+            await expect(options.admitSubprocess([session.metadata.path])).rejects.toThrow('WORKSPACE_OWNER_UNCONFIRMED');
+            expect(admitSubprocess).toHaveBeenCalledOnce();
+        } finally { await client.close(); }
+    });
+
     it('keeps an admitted filesystem writer alive through shutdown and refuses late writes', async () => {
         const gate = new RuntimeProducerGate({
             hasUndeliveredInput: () => false, canFreezeInbound: () => true,

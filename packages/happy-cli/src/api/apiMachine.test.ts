@@ -23,7 +23,8 @@ import { McpCallerGrantEnvelopeConsumer } from '@/daemon/mcpCallerGrantEnvelope'
 import { join } from 'node:path';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { createFilesystemWriteAdmission, createWorkspaceTurnAdmission } from '@/utils/workspaceTurnAdmission';
+import { createFilesystemWriteAdmission, createWorkspaceTurnAdmission, createUnfencedSubprocessAdmission } from '@/utils/workspaceTurnAdmission';
+import { ApiClient } from './api';
 import { hkdfSync, randomBytes } from 'node:crypto';
 
 const {
@@ -166,6 +167,33 @@ describe('ApiMachineClient machine RPC server lane', () => {
             await options.withFilesystemMutation(write);
             expect(await readFile(file, 'utf8')).toBe('saved');
         } finally { await auto.release(true); await rm(home, { recursive: true, force: true }); }
+    });
+
+    it.skipIf(process.platform === 'win32')('passes host process admission through the machine constructor before legacy effects', async () => {
+        const home = await mkdtemp(join(tmpdir(), 'machine-process-admission-'));
+        const root = join(home, 'project'); await mkdir(root);
+        const auto = createWorkspaceTurnAdmission({ home, sessionId: 'automation-run:machine-process', kind: 'automation', roots: [root] });
+        const execute = createUnfencedSubprocessAdmission({ home });
+        const admitSubprocess = (roots: readonly string[]) => execute(roots, async () => undefined);
+        try {
+            await auto.tryAcquire();
+            Reflect.construct(ApiMachineClient, ['fake-token', makeMachine(), undefined, undefined, null, undefined, admitSubprocess]);
+            const options = registeredCommonHandlers.mock.calls.at(-1)![2];
+            expect(options.admitSubprocess).toBe(admitSubprocess);
+            await expect(options.admitSubprocess([root])).rejects.toMatchObject({ code: 'WORKSPACE_BUSY' });
+            await auto.release(true);
+            await options.admitSubprocess([root]);
+            expect(await auto.tryAcquire()).toHaveProperty('reason', 'workspace-owner-unconfirmed');
+        } finally { await auto.release(true); await rm(home, { recursive: true, force: true }); }
+    });
+
+    it('passes host process admission from the account API factory without adding it to default registration', async () => {
+        const api = await ApiClient.create({ token: 'fake-token', encryption: { type: 'legacy', secret: new Uint8Array(32) } });
+        const admitSubprocess = vi.fn(async (_roots: readonly string[]) => undefined);
+        Reflect.apply(api.machineSyncClient, api, [makeMachine(), undefined, undefined, null, undefined, admitSubprocess]);
+        expect(registeredCommonHandlers.mock.calls.at(-1)![2].admitSubprocess).toBe(admitSubprocess);
+        api.machineSyncClient(makeMachine());
+        expect(registeredCommonHandlers.mock.calls.at(-1)![2].admitSubprocess).toBeUndefined();
     });
 
     it('registers machine.run with the daemon-owned trusted profile registry and write policy', () => {

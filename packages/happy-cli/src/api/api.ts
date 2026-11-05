@@ -696,6 +696,7 @@ export class ApiClient {
     if (this.principal.kind === 'managed-session') {
       if (options.trackShutdownStorage) throw new Error('Standalone storage tracking is not a managed runtime capability');
       if (options.withFilesystemMutation) throw new Error('Host filesystem admission is not a managed runtime capability');
+      if (options.admitSubprocess) throw new Error('Host subprocess admission is not a managed runtime capability');
       applySessionUrlEnv(process.env, session.id, configuration.webappUrl);
       // The explicit mode, never inferred: it decides whether redirects are
       // followed and which origin may see this bearer.
@@ -714,9 +715,9 @@ export class ApiClient {
   }
 
   machineSyncClient(machine: Machine, deviceKeys?: DeviceKeys, deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>, processState?: DaemonState,
-    withFilesystemMutation?: CommonHandlerOptions['withFilesystemMutation']): ApiMachineClient {
-    return withFilesystemMutation
-      ? new ApiMachineClient(this.bearer(), machine, deviceKeys, deviceEnrollment, processState, withFilesystemMutation)
+    withFilesystemMutation?: CommonHandlerOptions['withFilesystemMutation'], admitSubprocess?: CommonHandlerOptions['admitSubprocess']): ApiMachineClient {
+    return withFilesystemMutation || admitSubprocess
+      ? new ApiMachineClient(this.bearer(), machine, deviceKeys, deviceEnrollment, processState, withFilesystemMutation, admitSubprocess)
       : new ApiMachineClient(this.bearer(), machine, deviceKeys, deviceEnrollment, processState);
   }
 

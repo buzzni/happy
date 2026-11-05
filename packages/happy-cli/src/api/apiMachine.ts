@@ -974,6 +974,7 @@ export class ApiMachineClient {
         private readonly deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>,
         processState: DaemonState | null = machine.daemonState,
         withFilesystemMutation?: CommonHandlerOptions['withFilesystemMutation'],
+        admitSubprocess?: CommonHandlerOptions['admitSubprocess'],
     ) {
         this.setupTokenAssignmentRecipient = createSetupTokenAssignmentRecipient(deviceKeys?.recipient.secretKey);
         this.processState = Object.freeze({
@@ -1026,6 +1027,7 @@ export class ApiMachineClient {
         this.allowedRoot = allowedRoot;
         registerCommonHandlers(this.rpcHandlerManager, allowedRoot, {
             ...(withFilesystemMutation ? { withFilesystemMutation } : {}),
+            ...(admitSubprocess ? { admitSubprocess } : {}),
             // Machine scope is the Desktop machine.run path and the only one that
             // may run managed writes; its lock is per daemon process.
             machineRun: {
