@@ -132,6 +132,17 @@ export const sessionCreateBodyHash = (value: unknown): Promise<string> => {
   canonicalOrgSetupTokenJson(value);
   return rotationDigest(SessionExecutionCreateBodySchema.parse(value));
 };
+/** Stable consent identity for ACK recovery; refreshing expiry never assigns another nonce or device. */
+export function sessionExecutionAuthorityDigest(value: Pick<SessionExecutionTicketBody,
+  'companyId' | 'machineId' | 'approvalId' | 'deviceKeyId' | 'machineOwnerAccountId' | 'sessionOwnerAccountId'
+  | 'launchId' | 'initialNonce' | 'operationId' | 'sessionTagHash' | 'sessionCreateBodyHash'>): Promise<string> {
+  return rotationDigest({ version: 1, type: 'automation-execution-authority-identity',
+    companyId: value.companyId, machineId: value.machineId, approvalId: value.approvalId, deviceKeyId: value.deviceKeyId,
+    machineOwnerAccountId: value.machineOwnerAccountId, sessionOwnerAccountId: value.sessionOwnerAccountId,
+    launchId: value.launchId, initialNonce: value.initialNonce, operationId: value.operationId,
+    sessionTagHash: value.sessionTagHash, sessionCreateBodyHash: value.sessionCreateBodyHash });
+}
+
 export function rotationSigningBytes(value: unknown): Uint8Array {
   canonicalOrgSetupTokenJson(value);
   const body = bodySchema.parse(value);

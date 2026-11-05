@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import nacl from 'tweetnacl';
 import {
   MachineSetupTokenBindingV2Schema, DaemonRotationRequestBodySchema, rotationSigningBytes,
-  rotationIsFresh, rotationDigest, sessionCreateBodyHash, sessionTagHash,
+  rotationIsFresh, rotationDigest, sessionCreateBodyHash, sessionTagHash, sessionExecutionAuthorityDigest,
   signRotationDocument, verifyRotationDocument, daemonRotationOperationDigest,
   SessionExecutionTicketBodySchema, HappySessionCreateProofBodySchema, parseRotationDocument, RotationObservationSchema,
 } from './sharedMachineRotation';
@@ -19,6 +19,11 @@ describe('portable rotation contract', () => {
       initialNonce: Buffer.alloc(32, 3).toString('base64url'), sessionOwnerAccountId: 'account-1',
       machineOwnerAccountId: 'account-1', sessionTagHash: 'b'.repeat(64), sessionCreateBodyHash: 'c'.repeat(64),
       issuedAt: 100000, expiresAt: 160000 };
+    const digest = await sessionExecutionAuthorityDigest(body);
+    expect(digest).toBe('ed8ac166a7214744c9e7fab916555692e17d648315a35ef5c2c5b8359ed00e2c');
+    const renewed = { ...body, issuedAt: 90000, expiresAt: 150000 };
+    expect(await sessionExecutionAuthorityDigest(renewed)).toBe(digest);
+    expect(await sessionExecutionAuthorityDigest({ ...body, initialNonce: Buffer.alloc(32, 4).toString('base64url') })).not.toBe(digest);
     const document = await signRotationDocument(body as never, keys.secretKey);
     await expect(verifyRotationDocument(document, keys.publicKey)).resolves.toEqual(document);
     await expect(verifyRotationDocument({ ...document, body: { ...body, runId: 'another-run' } }, keys.publicKey)).rejects.toThrow();

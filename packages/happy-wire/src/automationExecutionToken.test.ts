@@ -10,6 +10,14 @@ const verify = (token: string, patch: Record<string, unknown> = {}) => verifyAut
 });
 
 describe('automation execution display target proof', () => {
+  it('binds the original company authority identity and refuses omission or substitution', () => {
+    const bound = { ...target, executionAuthorityDigest: 'b'.repeat(64) };
+    const token = signAutomationExecutionTarget({ ...input, ...bound });
+    expect(verify(token, { expected: bound })).toBe(true);
+    expect(verify(token)).toBe(false);
+    expect(verify(token, { expected: { ...bound, executionAuthorityDigest: 'c'.repeat(64) } })).toBe(false);
+    expect(verify(signAutomationExecutionTarget(input), { expected: bound })).toBe(false);
+  });
   it('authenticates a run, its immutable display target and the exact encrypted creation body', () => {
     const token = signAutomationExecutionTarget(input);
     expect(verify(token)).toBe(true);

@@ -9,6 +9,7 @@ const targetSchema = z.strictObject({
   machineId: id, machineAccountId: id, displaySessionId: id,
   createBodyHash: z.string().regex(/^[a-f0-9]{64}$/),
   executionBindingRequired: z.boolean(),
+  executionAuthorityDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
 });
 const claimsSchema = targetSchema.extend({
   version: z.literal(1), bearerHash: z.string().regex(/^[a-f0-9]{64}$/),
@@ -43,7 +44,7 @@ export function verifyAutomationExecutionTarget(input: {
     if (signature.toString('base64url') !== parts[2] || !timingSafeEqual(mac(parts[1], input.secret), signature)) return false;
     const claims = claimsSchema.parse(JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')));
     const expected = targetSchema.parse(input.expected);
-    return Object.entries(expected).every(([key, value]) => claims[key as keyof typeof expected] === value)
+    return Object.keys(targetSchema.shape).every(key => claims[key as keyof typeof expected] === expected[key as keyof typeof expected])
       && claims.bearerHash === hash(input.bearer)
       && claims.issuedAt <= input.now + 5_000 && claims.expiresAt > input.now
       && claims.expiresAt - claims.issuedAt === TTL_MS;
