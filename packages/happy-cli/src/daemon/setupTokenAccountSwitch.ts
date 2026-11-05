@@ -266,13 +266,14 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     return { session, managedAccountId, recorded, behind, sharedMachine: deps.sharedMachine }
   }
 
-  async function sharedRebindOnce(sessionId: string, shared: NonNullable<ReturnType<typeof sharedSession>>, observation?: SetupTokenUsageObservation): Promise<RebindResult> {
+  /** `move`: the next account's environment from the recorded one, null when none is usable. */
+  async function sharedRebindOnce(sessionId: string, shared: NonNullable<ReturnType<typeof sharedSession>>, move: () => Promise<Record<string, string> | null>): Promise<RebindResult> {
     const { session, recorded } = shared
     let environment: Record<string, string> | null
     try {
       // Catching up is not another move: the session gets the account it was already moved to, while that one lasts.
       environment = shared.behind ? await shared.sharedMachine.environment(recorded) : null
-      if (!environment) environment = await shared.sharedMachine.rebind(recorded, shared.behind ? undefined : observation)
+      if (!environment) environment = await move()
     } catch (error) { return failure('REQUEST_FAILED', `shared rebind ${(error as Error)?.message}`) }
     if (!environment) return { ok: false, reason: 'NO_ACCOUNT' }
     // The session may have ended or moved while the account was prepared: it gets no token then.
@@ -454,7 +455,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       }
       const pending = inFlight.get(sessionId)
       if (pending) return pending
-      const started = (shared ? sharedRebindOnce(sessionId, shared, observation) : rebindOnce(sessionId, running, false, observation?.reason === 'authentication-failed' ? { kind: 'authentication', observedAt: observation.observedAt } : undefined, !!options.startBudget)).finally(() => inFlight.delete(sessionId))
+      const started = (shared ? sharedRebindOnce(sessionId, shared, () => shared.sharedMachine.rebind(shared.recorded, shared.behind ? undefined : observation)) : rebindOnce(sessionId, running, false, observation?.reason === 'authentication-failed' ? { kind: 'authentication', observedAt: observation.observedAt } : undefined, !!options.startBudget)).finally(() => inFlight.delete(sessionId))
       inFlight.set(sessionId, started)
       return started
     },
