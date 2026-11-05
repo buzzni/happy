@@ -477,7 +477,10 @@ export async function runCodex(opts: {
     let runtimeGate: RuntimeProducerGate | undefined;
     const automationExecution = response !== null && isAutomationExecutionSessionId(response.id);
     const filesystemAdmission = workspaceControl ? createFilesystemWriteAdmission({ home: configuration.happyHomeDir }) : undefined;
-    const withFilesystemMutation = workspaceControl || automationExecution ? <T,>(operation: () => Promise<T>): Promise<T> => runtimeGate
+    // No interactive file editor belongs to this internal run; legacy RPC paths can escape via symlinks.
+    const withFilesystemMutation = automationExecution ? <T,>(_operation: () => Promise<T>): Promise<T> =>
+        Promise.reject(new Error('AUTOMATION_FILESYSTEM_RPC_UNSUPPORTED'))
+        : workspaceControl ? <T,>(operation: () => Promise<T>): Promise<T> => runtimeGate
         ? runtimeGate.admit(() => filesystemAdmission ? filesystemAdmission(operation) : operation(), 'writer')
         : Promise.reject(new Error('Runtime input is not open')) : undefined;
     // Permission handler declared here so it can be updated in onSessionSwap callback

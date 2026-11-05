@@ -551,7 +551,11 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     let runtimeGate: RuntimeProducerGate | undefined;
     const automationExecution = isAutomationExecutionSessionId(response.id);
     const filesystemAdmission = workspaceControl ? createFilesystemWriteAdmission({ home: configuration.happyHomeDir }) : undefined;
-    const withFilesystemMutation = workspaceControl || automationExecution ? <T,>(operation: () => Promise<T>): Promise<T> => runtimeGate
+    // Internal executions have no interactive file editor. Legacy RPC paths follow symlinks and
+    // cannot inherit the native actor's narrower workspace authority.
+    const withFilesystemMutation = automationExecution ? <T,>(_operation: () => Promise<T>): Promise<T> =>
+        Promise.reject(new Error('AUTOMATION_FILESYSTEM_RPC_UNSUPPORTED'))
+        : workspaceControl ? <T,>(operation: () => Promise<T>): Promise<T> => runtimeGate
         ? runtimeGate.admit(() => filesystemAdmission ? filesystemAdmission(operation) : operation(), 'writer')
         : Promise.reject(new Error('Runtime input is not open')) : undefined;
     // Create realtime session

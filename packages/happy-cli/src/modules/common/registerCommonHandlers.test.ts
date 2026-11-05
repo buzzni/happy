@@ -44,6 +44,12 @@ afterEach(async () => {
 });
 
 describe('registerCommonHandlers bash scheduling', () => {
+    it('refuses an internal execution shell before it can start an untracked writer', async () => {
+        const { handlers, workingDirectory } = await createHandlers(undefined, { processExecution: 'disabled' } as CommonHandlerOptions);
+        await expect(handlers.get('bash')!({ command: 'printf unsafe > forbidden.txt', cwd: workingDirectory,
+            processExecution: 'enabled' })).resolves.toMatchObject({ success: false, error: 'AUTOMATION_PROCESS_RPC_UNSUPPORTED' });
+        await expect(readFile(join(workingDirectory, 'forbidden.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
+    });
     it('drops another session from machine-scope commands and keeps a session its own scope (utils/childEnv)', async () => {
         const injected = { HAPPY_RECONNECT_SESSION_ID: 'cmr-poisoned', APLUS_SESSION_ID: 'self-session' };
         Object.assign(process.env, injected);
@@ -80,6 +86,21 @@ describe('registerCommonHandlers bash scheduling', () => {
 });
 
 describe('registerCommonHandlers machine.run capability', () => {
+    it.each(['machine-run', 'machine.run'])('refuses untracked internal %s execution and capability advertising', async method => {
+        const registry = createTrustedMachineRunProfileResolver([{
+            id: 'buzzni.test.echo', executable: 'printf', argv: ['{{message}}'],
+            parameters: { message: { type: 'string', maxLength: 32 } }, cwd: 'workspaceRoot',
+            envAllowlist: [], timeoutMs: 1000, outputLimitBytes: 1024, stdin: 'none',
+        }]);
+        const { handlers, workingDirectory } = await createHandlers(undefined, {
+            processExecution: 'disabled', machineRun: { allowLegacyRaw: true, profileRegistry: registry },
+        } as CommonHandlerOptions);
+        const request = method === 'machine-run' ? { version: 1, action: 'start', executable: 'printf', args: ['raw'] }
+            : { action: 'start', profileId: 'buzzni.test.echo', profileDigest: registry.resolve('buzzni.test.echo')!.profileDigest,
+                workspaceRoot: workingDirectory, parameters: { message: 'raw' } };
+        await expect(handlers.get(method)!({ ...request, processExecution: 'enabled' })).rejects.toThrow('AUTOMATION_PROCESS_RPC_UNSUPPORTED');
+        await expect(handlers.get(method)!({ action: 'capabilities' })).rejects.toThrow('AUTOMATION_PROCESS_RPC_UNSUPPORTED');
+    });
     it('keeps the raw RPC and exposes profile capability negotiation on both method names', async () => {
         const { handlers } = await createHandlers(undefined, {
             machineRun: {

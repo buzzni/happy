@@ -345,7 +345,8 @@ export class SessionWriteScopeFixture {
             const reply = messages.find(message => {
                 const decoded = this.decode(message.content.c, id);
                 return decoded?.role === 'session' && decoded.content?.role === 'agent'
-                    && decoded.content?.ev?.t === 'text' && decoded.content.ev.text === `fixture reply ${marker}`;
+                    && (decoded.content?.ev?.t === 'text' || id.startsWith('automation-run:') && decoded.content?.ev?.t === 'final-answer')
+                    && decoded.content.ev.text === `fixture reply ${marker}`;
             });
             return reply && messages.some(message => message.seq > reply.seq && this.decode(message.content.c, id)?.content?.ev?.t === 'turn-end')
                 ? reply : undefined;

@@ -561,6 +561,8 @@ export interface CommonHandlerOptions {
      * session's own handlers, `session` (default) for the machine scope (utils/childEnv).
      */
     childEnvBoundary?: ChildEnvBoundary;
+    /** Internal run sessions have no interactive process RPC producer. Host-only, never RPC input. */
+    processExecution?: 'disabled';
     /** Host-owned operation admission; never populated from RPC input. */
     withFilesystemMutation?: <T>(operation: () => Promise<T>) => Promise<T>;
     machineRun?: {
@@ -608,6 +610,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         profileHandlerOptions,
     );
     const machineRunHandler = async (request: unknown) => {
+        if (options.processExecution === 'disabled') throw new Error('AUTOMATION_PROCESS_RPC_UNSUPPORTED');
         const input = request && typeof request === 'object' && !Array.isArray(request) ? request as Record<string, unknown> : {};
         if (input.action === 'capabilities' || (input.action === 'start' && 'profileId' in input)) return profileMachineRunHandler(request);
         if (input.action === 'status' || input.action === 'cancel') {
@@ -626,7 +629,10 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         return rawMachineRunHandler(request);
     };
     rpcHandlerManager.registerHandler('machine-run', machineRunHandler);
-    rpcHandlerManager.registerHandler('machine.run', profileMachineRunHandler);
+    rpcHandlerManager.registerHandler('machine.run', async (request: unknown) => {
+        if (options.processExecution === 'disabled') throw new Error('AUTOMATION_PROCESS_RPC_UNSUPPORTED');
+        return profileMachineRunHandler(request);
+    });
     const managedTools = machineRunOptions?.managedTools;
     if (managedTools) {
         rpcHandlerManager.registerHandler('machine.tool', async (request: unknown) => {
@@ -648,6 +654,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
 
     // Shell command handler - executes commands in the default shell
     rpcHandlerManager.registerHandler<BashRequest, BashResponse>('bash', async (data) => {
+        if (options.processExecution === 'disabled') return { success: false, error: 'AUTOMATION_PROCESS_RPC_UNSUPPORTED' };
         logger.debug('Shell command request:', data.command);
 
         // Validate cwd if provided

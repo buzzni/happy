@@ -280,6 +280,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
     it.each([false, true])('isolated run rejects external text and attachments before queue admission (buffered=%s)', async buffered => {
         session.id = 'automation-run:run-A';
         const client = new ApiSessionClient('fake-token', session);
+        expect(registeredCommonHandlers.mock.calls.at(-1)?.[2].processExecution).toBe('disabled');
         const onUser = vi.fn(), onFile = vi.fn();
         const queueInput = vi.spyOn(client as any, 'queueInput');
         if (!buffered) { client.onUserMessage(onUser); client.onFileEvent(onFile); }

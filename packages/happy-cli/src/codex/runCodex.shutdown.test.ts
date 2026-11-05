@@ -181,7 +181,7 @@ async function finishFrozenFixture(running: Promise<void>) {
     await running;
 }
 describe('Codex runtime producer bookkeeping', () => {
-    it.each(['stored', 'unconfirmed', 'stale'] as const)('joins isolated filesystem writers and requires current storage (%s)', async storage => {
+    it.each(['stored', 'unconfirmed', 'stale'] as const)('joins isolated MCP writers, refuses legacy file RPCs and requires current storage (%s)', async storage => {
         fixture.session.sessionId = 'automation-run:filesystem-drain';
         fixture.getOrCreateSession.mockResolvedValueOnce({ id: fixture.session.sessionId });
         if (storage === 'unconfirmed') fixture.session.flushForShutdown.mockResolvedValueOnce({ stored: false, reason: 'unconfirmed-write' });
@@ -199,13 +199,17 @@ describe('Codex runtime producer bookkeeping', () => {
             const options = fixture.sessionOptions;
             expect(options?.trackShutdownStorage).toBe(true);
             expect(options?.withFilesystemMutation).toBeTypeOf('function');
-            writing = options!.withFilesystemMutation!(async () => { await pendingWrite; return 'stored'; });
+            const unsafeWrite = vi.fn(async () => 'outside the owned workspace');
+            await expect(options!.withFilesystemMutation!(unsafeWrite)).rejects.toThrow('AUTOMATION_FILESYSTEM_RPC_UNSUPPORTED');
+            expect(unsafeWrite).not.toHaveBeenCalled();
+            expect(fixture.admitTool).toBeTypeOf('function');
+            writing = fixture.admitTool!(async () => { await pendingWrite; return 'stored'; });
             finishTurn();
             await vi.waitFor(() => expect(fixture.gate?.isClosed()).toBe(true));
             expect(fixture.session.close).not.toHaveBeenCalled();
             expect(fixture.reportAutomationExit).not.toHaveBeenCalled();
             const lateWrite = vi.fn(async () => {});
-            await expect(options!.withFilesystemMutation!(lateWrite)).rejects.toThrow('Runtime input is closed');
+            await expect(fixture.admitTool!(lateWrite)).rejects.toThrow('Runtime input is closed');
             expect(lateWrite).not.toHaveBeenCalled();
             finishWrite(); await writing;
             expect(await settled).toBeNull();

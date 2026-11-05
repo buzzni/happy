@@ -449,7 +449,7 @@ describe('runClaude remote JSONL scanner', () => {
         }));
     });
 
-    it.each(['stored', 'unconfirmed', 'stale'] as const)('joins isolated filesystem writers and requires current storage (%s)', async storage => {
+    it.each(['stored', 'unconfirmed', 'stale'] as const)('joins isolated MCP writers, refuses legacy file RPCs and requires current storage (%s)', async storage => {
         const harness = await startRemoteRunClaudeHarness({ sessionId: 'automation-run:filesystem-drain' });
         const pending = createDeferred<void>();
         let writing: Promise<unknown> | undefined, finishing: Promise<void> | undefined;
@@ -459,13 +459,18 @@ describe('runClaude remote JSONL scanner', () => {
             const options = (harness.api.sessionSyncClient.mock.calls[0] as any)?.[1];
             expect(options?.trackShutdownStorage).toBe(true);
             expect(options?.withFilesystemMutation).toBeTypeOf('function');
-            writing = options.withFilesystemMutation(async () => { await pending.promise; return 'stored'; });
+            const unsafeWrite = vi.fn(async () => 'outside the owned workspace');
+            await expect(options.withFilesystemMutation(unsafeWrite)).rejects.toThrow('AUTOMATION_FILESYSTEM_RPC_UNSUPPORTED');
+            expect(unsafeWrite).not.toHaveBeenCalled();
+            const admitTool = mockStartHappyServer.mock.calls.at(-1)?.[1].admitTool;
+            expect(admitTool).toBeTypeOf('function');
+            writing = admitTool(async () => { await pending.promise; return 'stored'; });
             finishing = harness.finish();
             await vi.waitFor(() => expect(harness.loopOptions.standaloneDrain?.gate.isClosed()).toBe(true));
             expect(harness.sessionClient.close).not.toHaveBeenCalled();
             expect(mockReportAutomationContextExit).not.toHaveBeenCalled();
             const lateWrite = vi.fn(async () => {});
-            await expect(options.withFilesystemMutation(lateWrite)).rejects.toThrow('Runtime input is closed');
+            await expect(admitTool(lateWrite)).rejects.toThrow('Runtime input is closed');
             expect(lateWrite).not.toHaveBeenCalled();
             pending.resolve(); await writing; await finishing;
             expect(harness.sessionClient.flushForShutdown).toHaveBeenCalledOnce();

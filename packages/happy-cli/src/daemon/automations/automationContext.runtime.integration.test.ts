@@ -5,12 +5,13 @@ import { join, resolve } from 'node:path'
 import { createServer } from 'node:http'
 import { execFile, type ChildProcess } from 'node:child_process'
 import { promisify } from 'node:util'
-import { readAutomationExecutionRecord,
+import { readAutomationExecutionRecord, bindRpcRequest, readBoundRpcResponse,
   sessionCreateBodyHash, type AutomationPayload } from '@slopus/happy-wire'
 import { signAutomationExecutionTarget } from '@slopus/happy-wire/automationExecutionToken'
 import { signChatAutomationLifecycle } from '@slopus/happy-wire/chatAutomationLifecycleToken'
 import { ApiClient } from '@/api/api'
-import { decrypt, decodeBase64 } from '@/api/encryption'
+import { io } from 'socket.io-client'
+import { decrypt, encrypt, decodeBase64 } from '@/api/encryption'
 import { SessionWriteScopeFixture, eventually, type StoredMessage } from '@/testing/sessionWriteScopeFixture'
 import { createAutomationContextLaunchJournal } from './automationContextLaunchJournal'
 import { createAutomationContextReferenceReader } from './automationContextReference'
@@ -18,6 +19,26 @@ import { createAutomationContextHost } from './automationContextHost'
 import { createAutomationContextAuthorizer, createAutomationContextTransport } from './automationContextTransport'
 import { createServerAutomationRuntimeStore } from './serverAutomationRuntimeStore'
 import { createAutomationContextWorkspace } from './automationContextWorkspace'
+
+async function executionRpc(fixture: SessionWriteScopeFixture, sessionId: string, key: Uint8Array, method: string, params: unknown) {
+  const socket = io(fixture.serverUrl, { path: '/v1/updates', transports: ['websocket'], reconnection: false,
+    auth: { token: fixture.token, clientType: 'user-scoped' } })
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Execution RPC socket unavailable')), 5000)
+      socket.once('connect', () => { clearTimeout(timer); resolve() })
+      socket.once('connect_error', error => { clearTimeout(timer); reject(error) })
+    })
+    const nonce = randomBytes(16).toString('base64')
+    const bound = bindRpcRequest({ method, scope: sessionId, params, nonce, issuedAt: Date.now() })
+    const reply = await socket.timeout(10_000).emitWithAck('rpc-call', { method: `${sessionId}:${method}`,
+      params: Buffer.from(encrypt(key, 'legacy', bound)).toString('base64') })
+    if (!reply.ok) throw new Error(`Execution RPC refused before dispatch: ${reply.error}`)
+    const opened = readBoundRpcResponse(decrypt(key, 'legacy', Buffer.from(reply.result, 'base64')), nonce)
+    if (!opened.ok) throw new Error(`Execution RPC reply binding invalid: ${opened.code}`)
+    return opened.result
+  } finally { socket.disconnect() }
+}
 
 async function seedRun(fixture: SessionWriteScopeFixture, input: Record<string, unknown>): Promise<any> {
   return eventually(async () => {
@@ -339,8 +360,12 @@ it.each(['claude', 'codex'] as const)('keeps four real %s CLI runs on one displa
   vi.stubEnv('HAPPY_SCOPE_FRESH_PROVIDER_STATE', '1')
   vi.stubEnv('HAPPY_SCOPE_PACKAGED_SERVER', undefined)
   vi.stubEnv('HAPPY_SCOPE_INSTALLED_CLI', undefined)
+  const rpcProbeMarker = `scope-marker-rpc-${randomUUID()}`
+  let releaseModel!: () => void
+  const modelGate = new Promise<void>(resolve => { releaseModel = resolve })
   const fixture = new SessionWriteScopeFixture({ provider, encryptionVariant: 'legacy',
-    serverEntry: 'sources/testing/automationContextFixture.ts', browserBridgeHost: '::1' })
+    serverEntry: 'sources/testing/automationContextFixture.ts', browserBridgeHost: '::1',
+    beforeModelResponse: async body => { if (body.includes(rpcProbeMarker)) await modelGate } })
   const journalHome = resolve(process.env.HAPPY_HOME_DIR!)
   let failure: unknown
   try {
@@ -376,7 +401,7 @@ it.each(['claude', 'codex'] as const)('keeps four real %s CLI runs on one displa
       const info = await seedRun(fixture, { accountId: fixture.accountId, displaySessionId, runId, claimToken,
         directory: fixture.project, secret })
       expect(info.machineId).toBe(machineId); runIds.push(runId)
-      const marker = `scope-marker-run-${index}-${randomUUID()}`; markers.push(marker)
+      const marker = index === 0 ? rpcProbeMarker : `scope-marker-run-${index}-${randomUUID()}`; markers.push(marker)
       const payload: AutomationPayload = { name: 'Context minimum flow', directory: fixture.project, agent: provider,
         model: fixture.modelName, prompt: `Return ${marker} only.`, scriptCommand: null, suppressSilent: false,
         schedule: { kind: 'interval', minutes: 60 }, conversation: { sessionId: displaySessionId },
@@ -423,6 +448,23 @@ it.each(['claude', 'codex'] as const)('keeps four real %s CLI runs on one displa
             const metadata = decrypt(decodeBase64(receipt!.prepared.encryptionKey), receipt!.prepared.encryptionVariant, decodeBase64(raw.metadata)) as any
             return typeof metadata[fixture.providerIdentityField] === 'string' ? true : undefined
           }, 'real native identity', 60_000)
+          if (index === 0) {
+            const owned = (await journal.read(runId))!, key = decodeBase64(owned.prepared.encryptionKey)
+            const outside = join(fixture.root, 'rpc-outside'); await mkdir(outside)
+            await symlink(outside, join(fixture.project, 'rpc-escape'))
+            expect(await executionRpc(fixture, owned.sessionId, key, 'writeFile', {
+              path: join(fixture.project, 'rpc-escape/forbidden.txt'), content: Buffer.from('unsafe').toString('base64'),
+            })).toMatchObject({ success: false, error: 'AUTOMATION_FILESYSTEM_RPC_UNSUPPORTED' })
+            expect(await executionRpc(fixture, owned.sessionId, key, 'bash', {
+              command: '(sleep 0.2; printf unsafe > forbidden-shell.txt) >/dev/null 2>&1 &', cwd: fixture.project,
+            })).toMatchObject({ success: false, error: 'AUTOMATION_PROCESS_RPC_UNSUPPORTED' })
+            for (const method of ['machine.run', 'machine-run']) {
+              expect(await executionRpc(fixture, owned.sessionId, key, method, { action: 'capabilities' }))
+                .toMatchObject({ error: 'AUTOMATION_PROCESS_RPC_UNSUPPORTED' })
+            }
+            await expect(readFile(join(outside, 'forbidden.txt'))).rejects.toMatchObject({ code: 'ENOENT' })
+            releaseModel()
+          }
           return { type: 'success', sessionId: options.reconnectEnvironment!.HAPPY_RECONNECT_SESSION_ID }
         }, discover: async () => child?.exitCode === null ? 'running' : 'unconfirmed' })
       const selected = await host.prepare({ automationId: info.automationId, generation: info.generation, revision: info.revision, payload })
@@ -464,6 +506,7 @@ it.each(['claude', 'codex'] as const)('keeps four real %s CLI runs on one displa
         reportId: randomUUID(), runId, sessionId: receipt.sessionId })).toMatchObject({ ok: true })
     }
     expect(nativeIds.size).toBe(4)
+    await expect(readFile(join(fixture.project, 'forbidden-shell.txt'))).rejects.toMatchObject({ code: 'ENOENT' })
     expect(fixture.modelRequests).toHaveLength(4)
     expect(fixture.modelRequests[0]).not.toContain(memoMarker)
     expect(fixture.modelRequests[1]).toContain(memoMarker)
@@ -491,6 +534,7 @@ it.each(['claude', 'codex'] as const)('keeps four real %s CLI runs on one displa
     failure = new Error(`Private context flow failed (${provider}):\n${diagnostics}\nNative group members:\n${members}`, { cause: error })
     throw failure
   } finally {
+    releaseModel()
     try { await fixture.close() } catch (error) {
       if (failure) throw new AggregateError([failure, error], `${(failure as Error).message}\nFixture cleanup: ${String(error)}`)
       throw error

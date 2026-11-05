@@ -737,6 +737,7 @@ export class ApiSessionClient extends EventEmitter {
         });
         registerCommonHandlers(this.rpcHandlerManager, this.metadata.path, {
             childEnvBoundary: 'in-session',
+            ...(isAutomationExecutionSessionId(this.sessionId) ? { processExecution: 'disabled' as const } : {}),
             machineRun: { profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY, managedTools: hostManagedMachineTools(configuration.happyHomeDir) },
             ...(options.withFilesystemMutation ? { withFilesystemMutation: options.withFilesystemMutation } : {}),
         });
