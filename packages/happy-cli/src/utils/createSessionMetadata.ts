@@ -47,6 +47,8 @@ export interface CreateSessionMetadataOptions {
     source?: SessionSource;
     /** The runner wires the unattended approval wait (codexcli-approval-session-binding R15). */
     approvalLifecycle?: boolean;
+    /** Permission-grant matching implemented by this runner, not by its parent daemon. */
+    permissionGrants?: NonNullable<Metadata['runtimeCapabilities']>['permissionGrants'];
 }
 
 /**
@@ -91,6 +93,7 @@ export function createSessionMetadata(opts: CreateSessionMetadataOptions): Sessi
         runtimeCapabilities: {
             saycodeSystemPromptPreference: true,
             ...(opts.approvalLifecycle ? { approvalLifecycle: 1 as const } : {}),
+            ...(opts.permissionGrants ? { permissionGrants: opts.permissionGrants } : {}),
         },
         rpcBinding: RPC_BINDING_CAPABILITY,
         os: os.platform(),
