@@ -28,6 +28,7 @@ const fixture = vi.hoisted(() => ({
     disconnect: vi.fn(async () => {}),
     admitTool: undefined as undefined | (<T>(work: () => Promise<T>) => Promise<T>),
     reconnect: vi.fn(async () => ({})),
+    prepareSideAppServer: vi.fn(async (): Promise<null> => null),
     session: {
         sendProviderUsageEvent: vi.fn(),
         tracksShutdownStorage: true,
@@ -91,6 +92,10 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     authRecoveryBusy = false;
     reconnectForAuth = fixture.reconnect;
     threadId: string | null = null;
+    isConnected = true;
+    sandboxEnabled = false;
+    threadRolloutPath = '/tmp/native-rollout.jsonl';
+    prepareSideAppServer = fixture.prepareSideAppServer;
     connect = async () => { await fixture.onConnect?.(); };
     resumeThread = async ({ threadId }: { threadId: string }) => { await fixture.onResumeThread?.(); this.threadId = threadId; return { threadId, model: 'test' }; };
     disconnect = fixture.disconnect;
@@ -635,6 +640,22 @@ describe('Codex runtime producer bookkeeping', () => {
         await finishFrozenFixture(start());
         expect(result).toMatchObject({ status: 'busy' });
         expect(fixture.reconnect).not.toHaveBeenCalled();
+    });
+    it('answers /btw on its own side launch and refuses it once input is frozen', async () => {
+        const replies: unknown[] = [];
+        fixture.onSend = async () => {
+            const sideQuestion = fixture.session.rpcHandlerManager.registerHandler.mock.calls.find(([name]) => name === 'side-question')![1] as (input: unknown) => Promise<unknown>;
+            // The session client offers no side launch (a mandatory sandbox, say): refused, nothing started.
+            replies.push(await sideQuestion({ question: 'what changed?' }));
+            fixture.gate!.freeze();
+            replies.push(await sideQuestion({ question: 'what changed?' }));
+        };
+        await finishFrozenFixture(start());
+        expect(fixture.prepareSideAppServer).toHaveBeenCalledTimes(1);
+        expect(replies).toEqual([
+            { success: false, error: 'side-question:not-allowed' },
+            { success: false, error: 'side-question:shutting-down' },
+        ]);
     });
     it('tracks steer through the provider acknowledgement and final user echo', async () => {
         let blocker: unknown; let echoBlocker: unknown; let reply: unknown;

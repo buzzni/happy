@@ -2131,6 +2131,25 @@ export class CodexAppServerClient {
         return this.wrapSideLaunch(args, { ...(this.multiAuthProxy?.env ?? sanitizeChildEnv(process.env, { boundary: 'in-session' })) });
     }
 
+    /**
+     * Launch for the `/btw` side question's own app-server (codexSideQuestion.ts): this app-server's
+     * payer, Codex state home and sandbox wrapper (Desktop specs/codexcli-side-question R4-d). The
+     * session's sandbox runtime is borrowed, never initialized or reset — it is process-wide.
+     * Null until connected or when side commands are not allowed.
+     */
+    async prepareSideAppServer(): Promise<{ command: string; args: string[]; env: Record<string, string> } | null> {
+        if (!this.connected || !this.sideCommandAllowed) return null;
+        const env = this.multiAuthProxy
+            ? { ...this.multiAuthProxy.env }
+            : await resolveCodexStateEnvironment({ ...sanitizeChildEnv(process.env, { boundary: 'in-session' }), ...this.startupEnvironment });
+        return this.wrapSideLaunch(['app-server', '--listen', 'stdio://'], env);
+    }
+
+    /** The current thread's rollout file, when Codex reported one for it. */
+    get threadRolloutPath(): string | null {
+        return this.nativeThreadMetadata?.id === this._threadId ? this.nativeThreadMetadata?.path ?? null : null;
+    }
+
     /** The multi-auth proxy arguments and this app-server's sandbox wrapper, on a side launch. Never initializes or resets the sandbox. */
     private async wrapSideLaunch(args: string[], env: Record<string, string>): Promise<{ command: string; args: string[]; env: Record<string, string> }> {
         if (this.sandboxEnabled && process.platform === 'darwin') {

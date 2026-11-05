@@ -173,6 +173,7 @@ import {
 import { DifficultyRoutingCommitter } from '@/difficultyRoutingCommit';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { createCodexUsageEvent } from '@/usage/providerUsageAdapters';
+import { CodexSideQuestionBridge, createCodexSideQuestionRpcHandler } from './codexSideQuestion';
 import { AgentPlanLaunchError } from '@/launcher/agentPlanLaunch';
 import { assertNotAgentPlanThreadWithoutPlan, consumeAgentPlanLaunch, reportAgentPlanApplied, startAgentPlanSession, type AgentPlanSession } from './agentPlanSession';
 import { agentPlanThreadsDir, recordAgentPlanThread } from '@/launcher/agentPlanThreads';
@@ -1195,6 +1196,19 @@ export async function runCodex(opts: {
         hasTitle: () => session.hasTitle(),
         log: (message, detail) => logger.warn(message, detail),
     });
+    // `/btw` (Desktop specs/codexcli-side-question): an ephemeral fork on its own app-server process.
+    // It reads plain data off the session client and never calls into it.
+    const sideQuestion = new CodexSideQuestionBridge({
+        source: () => client?.isConnected ? {
+            threadId: client.threadId,
+            rolloutPath: client.threadRolloutPath,
+            cwd: process.cwd(),
+            model: currentModel ?? null,
+            effort: currentEffort ?? null,
+            sandboxManagedByHappy: client.sandboxEnabled,
+        } : null,
+        launch: () => client.prepareSideAppServer(),
+    });
 
     /**
      * Handles session termination and process exit.
@@ -1246,6 +1260,7 @@ export async function runCodex(opts: {
             }
 
             offTurnTitle.cancel();
+            sideQuestion.dispose();
             // Force close Codex transport (best-effort) so we don't leave stray processes
             try {
                 await client.disconnect();
@@ -1518,6 +1533,19 @@ export async function runCodex(opts: {
     session.rpcHandlerManager.registerHandler('codex-auth-status', async () => authRecovery.status());
     session.rpcHandlerManager.registerHandler('codex-auth-recover', async (params: Record<string, unknown>) =>
         runtimeGate?.isClosed() ? authRecovery.recover(params) : admitRpc(() => authRecovery.recover(params)));
+    session.rpcHandlerManager.registerHandler('side-question', createCodexSideQuestionRpcHandler({
+        bridge: sideQuestion,
+        isManagedRun: () => managedStartup !== null,
+        gate: () => runtimeGate,
+        reportUsage: ({ requestId, usage, model }) => {
+            try {
+                session.sendProviderUsageEvent(createCodexUsageEvent({ sessionId: session.sessionId, responseId: `btw:${requestId}`, occurredAt: Date.now(), model, usage }));
+            } catch (error) {
+                logger.warn('[Codex] Failed to report side question usage:', error);
+            }
+        },
+        newRequestId: () => randomUUID(),
+    }));
 
     session.setInputSteerAvailable(true);
     registerCodexSteerHandler({
@@ -3100,6 +3128,7 @@ export async function runCodex(opts: {
             }
             logger.debug('[codex]: client.disconnect begin');
             offTurnTitle.cancel();
+            sideQuestion.dispose();
             await client.disconnect();
             // Closes the project store this session opened. Its own catch: memory
             // cleanup must not be the thing that fails a shutdown.
