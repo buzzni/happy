@@ -4549,7 +4549,7 @@ export async function startDaemon(): Promise<void> {
     }
     const apiMachine = contextWorkspace
       ? api.machineSyncClient(machine, deviceKeys, deviceEnrollment ?? undefined, initialDaemonState,
-        createFilesystemWriteAdmission({ home: configuration.happyHomeDir }), admitSubprocess)
+        createFilesystemWriteAdmission({ home: configuration.happyHomeDir }), admitSubprocess, reserveLegacyDispatch)
       : api.machineSyncClient(machine, deviceKeys, deviceEnrollment ?? undefined, initialDaemonState);
     if (standaloneWindows) apiMachine.setWindowsStandaloneTrial();
     startDifficultyRoutingMetadataPoll({

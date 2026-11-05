@@ -7,6 +7,7 @@ import type { AutomationConversationDeliverRequest } from '@slopus/happy-wire';
 import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { createWorktreeReclaimHandler } from '@/daemon/worktreeDependencyReclaimRpc';
 import { createSealedSpawnEnvHandler } from '@/modules/common/sealedSpawnEnv';
+import type { LegacyDispatchReservation } from '@/utils/workspaceTurnAdmission';
 import { createWorktreeOpsHandlers } from '@/daemon/worktreeOps';
 /**
  * WebSocket client for machine/daemon communication with Happy server
@@ -975,6 +976,7 @@ export class ApiMachineClient {
         processState: DaemonState | null = machine.daemonState,
         withFilesystemMutation?: CommonHandlerOptions['withFilesystemMutation'],
         private readonly admitSubprocess?: CommonHandlerOptions['admitSubprocess'],
+        private readonly reserveLegacyDispatch?: (roots: readonly string[]) => Promise<LegacyDispatchReservation>,
     ) {
         this.setupTokenAssignmentRecipient = createSetupTokenAssignmentRecipient(deviceKeys?.recipient.secretKey);
         this.processState = Object.freeze({
@@ -1044,7 +1046,10 @@ export class ApiMachineClient {
         // browser starts with the env the server sealed for this machine. Customer lane only.
         this.rpcHandlerManager.registerHandler(
             'spawn-with-sealed-env',
-            createSealedSpawnEnvHandler({ machine: () => this.machine, allowedRoot }),
+            createSealedSpawnEnvHandler({ machine: () => this.machine, allowedRoot,
+                ...(admitSubprocess ? { admitSubprocess } : {}),
+                ...(reserveLegacyDispatch ? { reserveLegacyDispatch } : {}),
+            }),
             { customerBound: true },
         );
         // aplus 4b-3 worktree: worktrees on a strict machine, run here from a server-issued ticket

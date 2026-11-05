@@ -17,6 +17,7 @@ import { connectionState, isNetworkError, isConnectivityError, connectionErrorCo
 import { applySessionUrlEnv } from '@/utils/sessionUrlEnv';
 import type { ManagedAttachment } from '@/managed/managedSessionAttach';
 import type { CommonHandlerOptions } from '@/modules/common/registerCommonHandlers';
+import type { LegacyDispatchReservation } from '@/utils/workspaceTurnAdmission';
 
 /**
  * Who this client is.
@@ -715,9 +716,10 @@ export class ApiClient {
   }
 
   machineSyncClient(machine: Machine, deviceKeys?: DeviceKeys, deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>, processState?: DaemonState,
-    withFilesystemMutation?: CommonHandlerOptions['withFilesystemMutation'], admitSubprocess?: CommonHandlerOptions['admitSubprocess']): ApiMachineClient {
-    return withFilesystemMutation || admitSubprocess
-      ? new ApiMachineClient(this.bearer(), machine, deviceKeys, deviceEnrollment, processState, withFilesystemMutation, admitSubprocess)
+    withFilesystemMutation?: CommonHandlerOptions['withFilesystemMutation'], admitSubprocess?: CommonHandlerOptions['admitSubprocess'],
+    reserveLegacyDispatch?: (roots: readonly string[]) => Promise<LegacyDispatchReservation>): ApiMachineClient {
+    return withFilesystemMutation || admitSubprocess || reserveLegacyDispatch
+      ? new ApiMachineClient(this.bearer(), machine, deviceKeys, deviceEnrollment, processState, withFilesystemMutation, admitSubprocess, reserveLegacyDispatch)
       : new ApiMachineClient(this.bearer(), machine, deviceKeys, deviceEnrollment, processState);
   }
 

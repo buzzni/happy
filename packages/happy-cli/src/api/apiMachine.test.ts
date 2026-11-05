@@ -23,7 +23,9 @@ import { McpCallerGrantEnvelopeConsumer } from '@/daemon/mcpCallerGrantEnvelope'
 import { join } from 'node:path';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { createFilesystemWriteAdmission, createWorkspaceTurnAdmission, createUnfencedSubprocessAdmission } from '@/utils/workspaceTurnAdmission';
+import { createFilesystemWriteAdmission, createWorkspaceTurnAdmission, createUnfencedSubprocessAdmission,
+    createLegacyDispatchAdmission, createSubprocessWriteAdmission } from '@/utils/workspaceTurnAdmission';
+import { sealSpawnEnv } from '@/modules/common/sealedSpawnEnv';
 import { ApiClient } from './api';
 import { hkdfSync, randomBytes } from 'node:crypto';
 
@@ -208,6 +210,33 @@ describe('ApiMachineClient machine RPC server lane', () => {
             expect(admitSubprocess).toHaveBeenCalledWith([directory]);
             expect(result).toEqual({ type: 'error', code: 'WORKSPACE_UNAVAILABLE', message: 'WORKSPACE_BUSY' });
         } finally { await rm(directory, { recursive: true, force: true }); }
+    });
+
+    it.skipIf(process.platform === 'win32')('keeps a sealed machine request unspent behind automatic ownership and retains its later writer', async () => {
+        const home = await mkdtemp(join(tmpdir(), 'machine-sealed-admission-'));
+        const directory = join(home, 'project'); await mkdir(directory);
+        vi.stubEnv('HAPPY_WORKSPACE_ROOT', directory);
+        const automatic = createWorkspaceTurnAdmission({ home, sessionId: 'automation-run:sealed-api', kind: 'automation', roots: [directory] });
+        try {
+            expect(await automatic.tryAcquire()).toEqual({ acquired: true });
+            const api = await ApiClient.create({ token: 'fake-token', encryption: { type: 'legacy', secret: new Uint8Array(32) } });
+            const machine: Machine = { ...makeMachine(), encryptionVariant: 'dataKey', encryptionKey: new Uint8Array(32).fill(7) };
+            const client = Reflect.apply(api.machineSyncClient, api, [machine, undefined, undefined, null, undefined,
+                createSubprocessWriteAdmission({ home }), createLegacyDispatchAdmission({ home })]);
+            const handler = (client as any).rpcHandlerManager.registerHandler.mock.calls.find(([name]: [string]) => name === 'spawn-with-sealed-env')[1];
+            const request = { command: 'printf ran', cwd: directory, envDelivery: 'process', sealedEnv: sealSpawnEnv(deriveServerRpcKey(machine.encryptionKey), {
+                v: 1, purpose: 'spawn-env', machineId: machine.id, projectId: 'project', issuedAt: Date.now(),
+                nonce: randomBytes(16).toString('base64'), env: {},
+            }) };
+            expect(await handler(request)).toMatchObject({ success: false, errorCode: 'WORKSPACE_UNAVAILABLE' });
+            expect(await automatic.release(true)).toBe(true);
+            expect(await handler(request)).toMatchObject({ success: true, stdout: 'ran' });
+            expect(await automatic.tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+        } finally {
+            await automatic.release(true);
+            await rm(home, { recursive: true, force: true });
+            vi.unstubAllEnvs();
+        }
     });
 
     it('registers machine.run with the daemon-owned trusted profile registry and write policy', () => {
