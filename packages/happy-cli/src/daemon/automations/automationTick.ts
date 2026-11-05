@@ -26,6 +26,7 @@ import {
   type ScheduledAutomation,
 } from './automationDomain'
 import type { AutomationStore } from './automationStore'
+import type { LegacyDispatchReservation } from '@/utils/workspaceTurnAdmission'
 
 export interface AutomationTickInput {
   store: AutomationStore
@@ -35,6 +36,7 @@ export interface AutomationTickInput {
   isSessionRunning: (sessionId: string) => boolean
   /** 자식 세션이 보고한 사용자 입력 대기(질문·계획·권한 승인). 없으면 대기 게이트는 늘 열린다. */
   isSessionWaitingForUser?: (sessionId: string) => boolean
+  reserveLegacyDispatch?: (roots: readonly string[]) => Promise<LegacyDispatchReservation>
   logDebug?: (message: string) => void
 }
 
@@ -50,6 +52,22 @@ export async function runAutomationTick(input: AutomationTickInput): Promise<Aut
     .map((automation) => automation.id)
 
   for (const id of dueIds) {
+    let reservation: Extract<LegacyDispatchReservation, { acquired: true }> | undefined
+    if (input.reserveLegacyDispatch) {
+      const current = input.store.list().find(automation => automation.id === id)
+      if (!current || !isAutomationDue(current, input.now)) continue
+      try {
+        const admission = await input.reserveLegacyDispatch([current.directory])
+        if (!admission.acquired) {
+          input.logDebug?.(`[automation-tick] ${id} held before claim: ${admission.reason}`)
+          continue
+        }
+        reservation = admission
+      } catch (error) {
+        input.logDebug?.(`[automation-tick] ${id} workspace unconfirmed before claim: ${failureMessage(error)}`)
+        continue
+      }
+    }
     // 한 자동화의 실패(주입된 deps의 throw 포함)가 나머지 처리를 막지 않는다.
     try {
       // claim은 방금 다시 읽은 최신 목록 위에서 — 앞선 자동화 처리가 store를
@@ -70,6 +88,13 @@ export async function runAutomationTick(input: AutomationTickInput): Promise<Aut
         // 이력 기록 실패까지 다른 자동화를 막지 않는다.
       }
       outcomes.push({ id, outcome: 'error' })
+    } finally {
+      // Submitted subprocesses retain their durable unknown owner; native launches
+      // hand off to the tracked-session gate before this temporary owner is released.
+      try { await reservation?.finish() }
+      catch (error) {
+        input.logDebug?.(`[automation-tick] ${id} handoff unconfirmed; workspace remains reserved: ${failureMessage(error)}`)
+      }
     }
   }
   return outcomes

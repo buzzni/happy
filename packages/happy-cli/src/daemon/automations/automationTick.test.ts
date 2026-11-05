@@ -42,6 +42,64 @@ describe('runAutomationTick', () => {
     }
   }
 
+  it.each(['busy', 'unconfirmed'] as const)('keeps a due occurrence unclaimed when workspace admission is %s', async reason => {
+    const automation = makeDueAutomation({ scriptCommand: 'probe' })
+    store.replaceAll([automation])
+    const input = makeInput()
+    const reserveLegacyDispatch = vi.fn(async () => {
+      if (reason === 'unconfirmed') throw new Error('WORKSPACE_REPOSITORY_IDENTITY_UNCONFIRMED')
+      return { acquired: false as const, reason: 'workspace-busy' as const, sessions: ['isolated'] }
+    })
+    Object.assign(input, { reserveLegacyDispatch })
+    expect(await runAutomationTick(input)).toEqual([])
+    expect(reserveLegacyDispatch).toHaveBeenCalledWith([automation.directory])
+    expect(store.list()).toEqual([automation])
+    expect(input.runScript).not.toHaveBeenCalled()
+    expect(input.spawnSession).not.toHaveBeenCalled()
+  })
+
+  it('holds the preclaim reservation through script and native handoff then releases it', async () => {
+    store.replaceAll([makeDueAutomation({ scriptCommand: 'probe' })])
+    const finish = vi.fn(async () => undefined)
+    const input = makeInput({ runScript: vi.fn(async () => {
+      expect(finish).not.toHaveBeenCalled()
+      return { ok: true, stdout: 'wake' }
+    }) })
+    Object.assign(input, { reserveLegacyDispatch: vi.fn(async () => ({ acquired: true as const, finish })) })
+    expect(await runAutomationTick(input)).toEqual([{ id: 'auto-1', outcome: 'woke' }])
+    expect(input.runScript).toHaveBeenCalledOnce()
+    expect(input.spawnSession).toHaveBeenCalledOnce()
+    expect(finish).toHaveBeenCalledOnce()
+  })
+
+  it('rechecks pause after awaiting the preclaim reservation and releases without dispatch', async () => {
+    store.replaceAll([makeDueAutomation()])
+    const finish = vi.fn(async () => undefined)
+    const input = makeInput()
+    Object.assign(input, { reserveLegacyDispatch: vi.fn(async () => {
+      store.update('auto-1', row => ({ ...row, paused: true }))
+      return { acquired: true as const, finish }
+    }) })
+    expect(await runAutomationTick(input)).toEqual([])
+    expect(input.spawnSession).not.toHaveBeenCalled()
+    expect(store.list()[0].runHistory).toEqual([])
+    expect(finish).toHaveBeenCalledOnce()
+  })
+
+  it('logs an unconfirmed handoff without preventing another folder from running', async () => {
+    store.replaceAll([makeDueAutomation(), makeDueAutomation({ id: 'auto-2', directory: '/repo/other' })])
+    const logDebug = vi.fn()
+    const input = makeInput({ logDebug })
+    const finish = vi.fn(async () => undefined).mockRejectedValueOnce(new Error('WORKSPACE_DISPATCH_HANDOFF_UNCONFIRMED'))
+    Object.assign(input, { reserveLegacyDispatch: vi.fn(async () => ({ acquired: true as const, finish })) })
+    await expect(runAutomationTick(input)).resolves.toEqual([
+      { id: 'auto-1', outcome: 'woke' }, { id: 'auto-2', outcome: 'woke' },
+    ])
+    expect(input.spawnSession).toHaveBeenCalledTimes(2)
+    expect(store.list().map(row => row.runHistory[0]?.outcome)).toEqual(['woke', 'woke'])
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('handoff unconfirmed'))
+  })
+
   it('ignores automations that are not due', async () => {
     const notDue = makeAutomation({ nextRunAt: NOW + 60_000 })
     const paused = makeDueAutomation({ id: 'paused', paused: true })

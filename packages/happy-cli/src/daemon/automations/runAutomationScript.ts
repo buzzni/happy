@@ -26,6 +26,8 @@ export interface RunAutomationScriptInput {
   /** validatePath의 허용 루트 — apiMachine의 RPC 표면과 같은 root를 주입한다. */
   allowedRoot: string
   environmentVariables?: Record<string, string>
+  /** Host-owned port; never read from the automation's encrypted payload. */
+  admitSubprocess?: (roots: readonly string[]) => Promise<void>
 }
 
 export interface RunAutomationScriptResult {
@@ -36,7 +38,7 @@ export interface RunAutomationScriptResult {
 
 export async function runAutomationScript(input: RunAutomationScriptInput): Promise<RunAutomationScriptResult> {
   const validation = validatePath(input.cwd, input.allowedRoot)
-  if (!validation.valid) {
+  if (!validation.valid || !validation.resolvedPath) {
     return { ok: false, stdout: '', error: validation.error ?? 'Invalid cwd' }
   }
 
@@ -50,6 +52,7 @@ export async function runAutomationScript(input: RunAutomationScriptInput): Prom
   }
 
   try {
+    await input.admitSubprocess?.([validation.resolvedPath])
     const { stdout } = await execAsync(input.command, options)
     return { ok: true, stdout: stdout ? stdout.toString() : '' }
   } catch (error) {
