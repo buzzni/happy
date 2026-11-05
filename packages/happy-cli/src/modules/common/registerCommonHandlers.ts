@@ -579,11 +579,16 @@ export interface CommonHandlerOptions {
     };
     /** Tests lower it; production uses DIRECTORY_TREE_MAX_ENTRIES. */
     directoryTreeMaxEntries?: number;
+    /**
+     * Folders outside `workingDirectory` the machine owner approved (modules/common/approvedFolders),
+     * asked on every check so an approval or revocation applies at once. Machine scope only.
+     */
+    approvedRoots?: () => readonly string[];
 }
 
 export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, workingDirectory: string, options: CommonHandlerOptions = {}) {
     const downloadDirectories = createWorkspaceDownloadDirectoryReader();
-    const checkPath = (path: string) => validatePath(path, workingDirectory);
+    const checkPath = (path: string) => validatePath(path, workingDirectory, options.approvedRoots?.());
     rpcHandlerManager.registerHandler('file-discovery', (request: unknown) => fileDiscovery(workingDirectory, request));
     const bashScheduler = createBashRpcScheduler();
     const bashEnvBoundary = options.childEnvBoundary ?? 'session';
@@ -1041,7 +1046,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         try {
             // Prevent deletion of the project root directory
             const resolvedWorkingDir = resolve(workingDirectory);
-            if (validation.resolvedPath === resolvedWorkingDir) {
+            if (validation.resolvedPath === resolvedWorkingDir || options.approvedRoots?.().some((root) => resolve(root) === validation.resolvedPath)) {
                 return { success: false, error: 'Cannot delete the project root directory' };
             }
 
@@ -1166,7 +1171,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
     // specs/project-workspace-auto-create/).
     rpcHandlerManager.registerHandler<EnsureDirectoryRequest, EnsureDirectoryResponse>('ensureDirectory', async (data) => {
         logger.debug('Ensure directory request:', data.path);
-        const result = await ensureDirectory(data.path, workingDirectory);
+        const result = await ensureDirectory(data.path, workingDirectory, options.approvedRoots?.());
         return { success: result.success, error: result.error };
     });
 

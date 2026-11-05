@@ -31,7 +31,7 @@ import {
 import { LIST_FILES_PAGE_CAPABILITY } from '../modules/common/listFilesPageCapability';
 import { createManagedProjectWriteScopePolicy, TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '../modules/common/machineRunProfile';
 import { hostManagedMachineTools } from '../modules/common/moaiMachineRunProfiles';
-import { resolveDaemonAllowedRoot } from '../modules/common/resolveAllowedRoot';
+import { resolveDaemonAllowedRoot, resolveDaemonApprovedRoots } from '../modules/common/resolveAllowedRoot';
 import { REMOTE_TERMINAL_DISABLED_ERROR, resolveMachineLockdownPolicy } from '../daemon/machineLockdownPolicy';
 import { homedir } from 'node:os';
 import { encodeBase64, decodeBase64, encrypt, decrypt, tryDecrypt } from './encryption';
@@ -1023,6 +1023,7 @@ export class ApiMachineClient {
         const allowedRoot = resolveDaemonAllowedRoot(process.env, homedir());
         this.allowedRoot = allowedRoot;
         registerCommonHandlers(this.rpcHandlerManager, allowedRoot, {
+            approvedRoots: resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir),
             // Machine scope is the Desktop machine.run path and the only one that
             // may run managed writes; its lock is per daemon process.
             machineRun: {

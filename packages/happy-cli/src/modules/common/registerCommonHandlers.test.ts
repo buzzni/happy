@@ -632,3 +632,37 @@ describe('file RPCs under strict machine control', () => {
         await expect(handlers.get('readFile')?.({ path: join(home, 'sessions.json') })).resolves.toMatchObject({ success: true });
     });
 });
+
+/*
+ * aplus-dev-studio specs/approved-folder-roots — a folder outside the machine's
+ * allowed root (e.g. C:\workspace beside C:\Users\me) opens only once the
+ * machine owner approved it on this machine.
+ */
+describe('file RPCs for a folder the machine owner approved', () => {
+    it('lists, runs commands in and creates folders under an approved folder outside the allowed root, and nothing beside it', async () => {
+        const outside = await mkdtemp(join(tmpdir(), 'happy-approved-'));
+        temporaryDirectories.push(outside);
+        const project = join(outside, 'hmall_ui');
+        await mkdir(project);
+        await writeFile(join(project, 'README.md'), 'hello');
+        const beside = await mkdtemp(join(tmpdir(), 'happy-not-approved-'));
+        temporaryDirectories.push(beside);
+
+        const closed = await createHandlers();
+        await expect(closed.handlers.get('listDirectory')?.({ path: project })).resolves.toMatchObject({ success: false });
+
+        let approved: string[] = [outside];
+        const { handlers } = await createHandlers(undefined, { approvedRoots: () => approved });
+        await expect(handlers.get('listDirectory')?.({ path: project })).resolves.toMatchObject({
+            success: true, entries: [expect.objectContaining({ name: 'README.md' })],
+        });
+        await expect(handlers.get('readFile')?.({ path: join(project, 'README.md') })).resolves.toMatchObject({ success: true });
+        await expect(handlers.get('bash')?.({ command: 'echo ok', cwd: project })).resolves.toMatchObject({ success: true });
+        await expect(handlers.get('ensureDirectory')?.({ path: join(outside, 'new-app') })).resolves.toMatchObject({ success: true });
+        await expect(handlers.get('deleteFile')?.({ path: outside })).resolves.toMatchObject({ success: false });
+        await expect(handlers.get('listDirectory')?.({ path: beside })).resolves.toMatchObject({ success: false });
+
+        approved = [];
+        await expect(handlers.get('listDirectory')?.({ path: project })).resolves.toMatchObject({ success: false });
+    });
+});

@@ -23,6 +23,7 @@
 
 import { join, resolve } from 'path';
 import { resolveMachineLockdownPolicy } from '@/daemon/machineLockdownPolicy';
+import { readApprovedFolders } from './approvedFolders';
 
 export interface ResolveAllowedRootInput {
     /** workspaceRoot from the machine-registry settings. May be null/undefined. */
@@ -62,4 +63,16 @@ export function resolveDaemonAllowedRoot(
         homeDir,
         mode: resolveMachineLockdownPolicy(env).rpcAllowedRootMode,
     });
+}
+
+/**
+ * Folders the machine owner approved beside the allowed root (approvedFolders).
+ * A trial lockdown (HAPPY_RPC_ALLOWED_ROOT=workspace) keeps its single root.
+ */
+export function resolveDaemonApprovedRoots(
+    env: Record<string, string | undefined>,
+    happyHomeDir: string,
+): (() => readonly string[]) | undefined {
+    if (resolveMachineLockdownPolicy(env).rpcAllowedRootMode !== 'home') return undefined;
+    return () => readApprovedFolders(happyHomeDir);
 }
