@@ -153,12 +153,16 @@ describe('ApiMachineClient machine RPC server lane', () => {
         expect(registeredCommonHandlers).toHaveBeenCalledWith(
             expect.anything(),
             expect.any(String),
-            { machineRun: {
-                profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
-                writeScopePolicy: { acquire: expect.any(Function) },
-                managedTools: { root: expect.stringMatching(/managed-tools$/), tools: [MOAI_MANAGED_TOOL] },
-                allowToolInstall: true,
-            } },
+            {
+                // aplus-dev-studio specs/approved-folder-roots — folders the machine owner approved beside home.
+                approvedRoots: expect.any(Function),
+                machineRun: {
+                    profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
+                    writeScopePolicy: { acquire: expect.any(Function) },
+                    managedTools: { root: expect.stringMatching(/managed-tools$/), tools: [MOAI_MANAGED_TOOL] },
+                    allowToolInstall: true,
+                },
+            },
         );
     });
 
