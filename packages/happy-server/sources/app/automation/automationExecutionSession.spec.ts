@@ -9,9 +9,11 @@ import { createRequire } from 'node:module';
 import { resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import fastify from 'fastify';
+import nacl from 'tweetnacl';
 import { serializerCompiler, validatorCompiler, type ZodTypeProvider } from 'fastify-type-provider-zod';
 import type { Fastify } from '@/app/api/types';
-import { sessionCreateBodyHash, automationExecutionSessionId } from '@slopus/happy-wire';
+import { sessionCreateBodyHash, sessionTagHash, automationExecutionSessionId, signRotationDocument,
+  rotationDigest, rotationSha256, rotationBase64url, SessionExecutionTicketBodySchema, HappySessionCreateProofBodySchema } from '@slopus/happy-wire';
 import { signAutomationExecutionTarget } from '@slopus/happy-wire/automationExecutionToken';
 
 const state = vi.hoisted(() => ({ client: null as any }));
@@ -78,6 +80,94 @@ async function targetProof(input: { runId: string; displaySessionId: string;
 async function register(runId = 'r1', patch: Record<string, unknown> = {}) {
   return createAutomationExecutionSession('owner', bearer, await request(runId, patch), { secret, now });
 }
+
+async function boundRequest(ticketMachineId = 'm1') {
+  const studio = nacl.sign.keyPair.fromSeed(new Uint8Array(32).fill(1));
+  const device = nacl.sign.keyPair.fromSeed(new Uint8Array(32).fill(2));
+  vi.stubEnv('HAPPY_EXECUTION_STUDIO_ORIGIN', 'https://studio.test');
+  vi.stubEnv('HAPPY_EXECUTION_AUDIENCE', 'https://happy.test');
+  vi.stubEnv('HAPPY_EXECUTION_STUDIO_PUBLIC_KEY', rotationBase64url(studio.publicKey));
+  const input = await request();
+  input.executionBindingRequired = true;
+  input.targetProof = await targetProof({ runId: 'r1', displaySessionId: 'manual', body: input.body, executionBindingRequired: true });
+  const hashes = { sessionTagHash: await sessionTagHash(input.body.tag), sessionCreateBodyHash: await sessionCreateBodyHash(input.body) };
+  const ticket = await signRotationDocument(SessionExecutionTicketBodySchema.parse({ version: 1, type: 'saycode-session-execution',
+    audience: 'https://happy.test', studioOrigin: 'https://studio.test', keyId: await rotationSha256(studio.publicKey),
+    companyId: 'company-1', machineId: ticketMachineId, approvalId: 'approval-1', deviceKeyId: await rotationSha256(device.publicKey),
+    machineOwnerAccountId: 'owner', sessionOwnerAccountId: 'owner', launchId: 'launch-1', initialNonce: rotationBase64url(new Uint8Array(32).fill(3)),
+    operationId: 'operation-1', deviceSigningPublicKey: rotationBase64url(device.publicKey), ...hashes,
+    issuedAt: now.getTime(), expiresAt: now.getTime() + 60000 }), studio.secretKey);
+  const deviceProof = await signRotationDocument(HappySessionCreateProofBodySchema.parse({ version: 1, type: 'happy-session-create-proof',
+    audience: 'https://happy.test', method: 'POST', path: '/v1/sessions', ticketDigest: await rotationDigest(ticket),
+    sessionOwnerAccountId: 'owner', ...hashes, issuedAt: now.getTime(), expiresAt: now.getTime() + 60000 }), device.secretKey);
+  const { companyId, approvalId, deviceKeyId, launchId, operationId, initialNonce } = ticket.body;
+  return { input: { ...input, executionProof: { ticket, deviceProof } },
+    recoveryIdentity: { companyId, approvalId, deviceKeyId, launchId, operationId, initialNonce } };
+}
+
+it('refuses another approved machine ticket instead of combining two independent machine authorities', async () => {
+  await client.machine.create({ data: { id: 'm2', accountId: 'owner', metadata: '' } });
+  const { input } = await boundRequest('m2');
+  const { runId, ...payload } = input;
+  const app = await api();
+  try {
+    const result = await app.inject({ method: 'POST', url: `/v1/automation-runs/${runId}/execution-session`,
+      headers: { authorization: `Bearer ${bearer}` }, payload });
+    expect(result.statusCode, result.body).toBe(403);
+    expect(await client.session.count()).toBe(1);
+    expect(await client.sessionExecutionBinding.count()).toBe(0);
+  } finally { await app.close(); }
+});
+
+it.each([false, true])('recovers only the original registered run without reissuing an expired company proof (bound=%s)', async bound => {
+  const prepared = bound ? await boundRequest() : { input: await request(), recoveryIdentity: null };
+  await createAutomationExecutionSession('owner', bearer, prepared.input, { secret, now });
+  const { runId, executionProof: _proof, ...payload } = prepared.input as typeof prepared.input & { executionProof?: unknown };
+  const before = await client.session.findMany(), app = await api();
+  try {
+    if (bound) {
+      now = new Date(now.getTime() + 61000);
+      vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(now);
+      await client.automationRun.update({ where: { id: runId }, data: { runLeaseExpiresAt: new Date(now.getTime() + 60000) } });
+      payload.targetProof = await targetProof({ runId, displaySessionId: 'manual', body: payload.body, executionBindingRequired: true });
+      await expect(createAutomationExecutionSession('owner', bearer, { ...prepared.input, targetProof: payload.targetProof }, { secret, now }))
+        .rejects.toMatchObject({ statusCode: 403 });
+    }
+    const result = await app.inject({ method: 'POST', url: `/v1/automation-runs/${runId}/execution-session/recover`,
+      headers: { authorization: `Bearer ${bearer}` }, payload: { ...payload, recoveryIdentity: prepared.recoveryIdentity } });
+    expect(result.statusCode, result.body).toBe(200);
+    expect(result.json()).toEqual({ status: 'REGISTERED', sessionId: 'automation-run:r1', displaySessionId: 'manual',
+      createBodyHash: await sessionCreateBodyHash(payload.body) });
+    expect(await client.session.findMany()).toEqual(before);
+  } finally { vi.useRealTimers(); await app.close(); }
+});
+
+it('proves an unregistered recovery only after claim and current target authorization', async () => {
+  const { runId, ...payload } = await request(), app = await api();
+  try {
+    const send = (value: unknown) => app.inject({ method: 'POST', url: `/v1/automation-runs/${runId}/execution-session/recover`,
+      headers: { authorization: `Bearer ${bearer}` }, payload: value as any });
+    const result = await send({ ...payload, recoveryIdentity: null });
+    expect(result.statusCode, result.body).toBe(200); expect(result.json()).toEqual({ status: 'NOT_REGISTERED' });
+    expect((await send({ ...payload, claimToken: 'wrong', recoveryIdentity: null })).statusCode).toBe(403);
+    expect(await client.session.count()).toBe(1);
+  } finally { await app.close(); }
+});
+
+it.each(['nonce', 'company', 'missing'] as const)('refuses mismatched original company recovery identity: %s', async mismatch => {
+  const prepared = await boundRequest();
+  await createAutomationExecutionSession('owner', bearer, prepared.input, { secret, now });
+  const { runId, executionProof: _proof, ...payload } = prepared.input;
+  const identity = mismatch === 'missing' ? null : { ...prepared.recoveryIdentity,
+    ...(mismatch === 'nonce' ? { initialNonce: rotationBase64url(new Uint8Array(32).fill(4)) } : { companyId: 'another-company' }) };
+  const app = await api();
+  try {
+    const result = await app.inject({ method: 'POST', url: `/v1/automation-runs/${runId}/execution-session/recover`,
+      headers: { authorization: `Bearer ${bearer}` }, payload: { ...payload, recoveryIdentity: identity } });
+    expect(result.statusCode).toBe(mismatch === 'missing' ? 403 : 409);
+    expect(await client.session.count()).toBe(2); expect(await client.sessionExecutionBinding.count()).toBe(1);
+  } finally { await app.close(); }
+});
 
 async function api() {
   const server = fastify(); server.setValidatorCompiler(validatorCompiler); server.setSerializerCompiler(serializerCompiler);

@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 import { automationExecutionSessionId, automationExecutionSeedLocalId, isAutomationExecutionSessionId,
-  SessionExecutionCreateBodySchema, sessionCreateBodyHash } from '@slopus/happy-wire';
+  SessionExecutionCreateBodySchema, sessionCreateBodyHash, sessionTagHash, rotationDecodeBinary,
+  HappySessionExecutionProofSchema } from '@slopus/happy-wire';
 import { verifyAutomationExecutionTarget, type AutomationExecutionTarget } from '@slopus/happy-wire/automationExecutionToken';
 import { db } from '@/storage/db';
 import { inTx } from '@/storage/inTx';
@@ -14,6 +15,15 @@ export const automationExecutionSessionRequestSchema = z.strictObject({
   body: SessionExecutionCreateBodySchema,
   targetProof: z.string().min(1).max(8_192), executionBindingRequired: z.boolean(),
   executionProof: z.unknown().optional(),
+});
+
+const recoveryIdentitySchema = z.strictObject({
+  companyId: z.string().min(1).max(128), approvalId: z.string().min(1).max(128),
+  deviceKeyId: z.string().regex(/^[a-f0-9]{64}$/), launchId: z.string().min(1).max(128), operationId: z.string().min(1).max(128),
+  initialNonce: z.string().refine(value => { try { rotationDecodeBinary(value, 32); return true; } catch { return false; } }),
+});
+export const automationExecutionRecoveryRequestSchema = automationExecutionSessionRequestSchema.omit({ executionProof: true }).extend({
+  recoveryIdentity: recoveryIdentitySchema.nullable(),
 });
 
 export class AutomationExecutionSessionError extends Error {
@@ -157,6 +167,11 @@ export async function createAutomationExecutionSession(accountId: string, bearer
   const admission = await authorize(db);
   if (input.executionBindingRequired && !input.executionProof) return refuse();
   if (input.executionProof !== undefined) {
+    const parsed = HappySessionExecutionProofSchema.safeParse(input.executionProof);
+    if (!parsed.success) throw new AutomationExecutionSessionError(400, 'Invalid session execution proof');
+    const ticket = parsed.data.ticket.body;
+    if (ticket.machineId !== input.machineId || ticket.machineOwnerAccountId !== accountId
+      || ticket.sessionOwnerAccountId !== accountId) return refuse();
     let created = false;
     const session = await createExecutionBoundSession(accountId, input.body, input.executionProof,
       async (tx, row, isNew) => {
@@ -180,5 +195,41 @@ export async function createAutomationExecutionSession(accountId: string, bearer
       metadata: input.body.metadata, agentState: input.body.agentState, dataEncryptionKey } });
     checkTarget(admission.target);
     return { created: true, session };
+  });
+}
+
+/** Read-only ACK recovery. Current target authority is required even for a proven absence.
+ * Original nonce/identity must match; an expired create proof is never permission to create again. */
+export async function recoverAutomationExecutionSession(accountId: string, bearer: string, raw: unknown,
+  options: { secret?: string; now?: Date } = {}) {
+  const parsed = automationExecutionRecoveryRequestSchema.safeParse(raw);
+  if (!parsed.success) throw new AutomationExecutionSessionError(400, 'Invalid execution recovery request');
+  const { recoveryIdentity, ...rawCreate } = parsed.data;
+  const { input, sessionId, bodyHash, authorize, checkTarget } = await prepareAutomationExecutionAdmission(accountId, bearer, rawCreate, options);
+  if (input.executionBindingRequired !== (recoveryIdentity !== null)) return refuse();
+  return inTx(async tx => {
+    const { run, target } = await authorize(tx);
+    if (!run.executionCreateBodyHash) {
+      if (run.sessionId || run.displaySessionId || run.executionSeedMetadata
+        || await tx.session.findFirst({ where: { accountId, tag: input.body.tag }, select: { id: true } })) return conflict();
+      if (recoveryIdentity && await tx.sessionExecutionBinding.findFirst({ where: { companyId: recoveryIdentity.companyId, OR: [
+        { machineId: input.machineId, launchId: recoveryIdentity.launchId }, { initialNonce: recoveryIdentity.initialNonce },
+        { machineId: input.machineId, operationId: recoveryIdentity.operationId },
+      ] }, select: { sessionId: true } })) return conflict();
+      checkTarget(target);
+      return { status: 'NOT_REGISTERED' as const };
+    }
+    if (run.sessionId !== sessionId || run.displaySessionId !== input.displaySessionId || !run.executionSeedMetadata) return conflict();
+    const session = await tx.session.findFirst({ where: { id: sessionId, accountId, tag: input.body.tag }, select: { id: true } });
+    if (!session) return conflict();
+    const binding = await tx.sessionExecutionBinding.findUnique({ where: { sessionId } });
+    if (recoveryIdentity) {
+      if (!binding || binding.sessionRowId !== sessionId || binding.machineId !== input.machineId
+        || binding.machineOwnerAccountId !== accountId || binding.sessionOwnerAccountId !== accountId
+        || binding.sessionCreateBodyHash !== bodyHash || binding.sessionTagHash !== await sessionTagHash(input.body.tag)
+        || (Object.keys(recoveryIdentity) as Array<keyof typeof recoveryIdentity>).some(key => binding[key] !== recoveryIdentity[key])) return conflict();
+    } else if (binding) return conflict();
+    checkTarget(target);
+    return { status: 'REGISTERED' as const, sessionId, displaySessionId: input.displaySessionId, createBodyHash: bodyHash };
   });
 }
