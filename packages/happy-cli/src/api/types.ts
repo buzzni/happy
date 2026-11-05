@@ -289,6 +289,12 @@ export const MachineMetadataSchema = z.object({
   writeFileAttempt: z.object({ version: z.literal(1) }).optional(),
   /** This daemon serves `listFilesPage` (aplus-dev-studio specs/remote-file-list-pages). */
   listFilesPage: z.object({ version: z.literal(1) }).optional(),
+  /**
+   * aplus-dev-studio-desktop specs/desktop-permission-prefix-grant R7 — this daemon matches a session
+   * `Bash(<prefix>:*)` grant only against a plain single command at a word boundary. Absent: an older
+   * daemon still uses a bare `startsWith`, so Desktop must not offer a prefix grant to it.
+   */
+  permissionGrants: z.object({ bashPrefixMatcher: z.literal('plain-v1') }).optional(),
   /** Profile-based no-shell execution negotiated by Desktop extensions. */
   machineRun: z.object({
     protocolVersion: z.literal(1),
