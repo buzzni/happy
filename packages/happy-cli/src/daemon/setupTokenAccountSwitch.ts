@@ -58,6 +58,8 @@ export type SetupTokenAccountSwitchDeps = {
     moved(): void
     /** The company and credential generation this PC holds the account at, for asking Studio to start a turn; null when not held. */
     startProof?(managedAccountId: string): Promise<{ companyId: string; credentialGeneration: number } | null>
+    /** A held, usable account among those Studio said have start budget left, other than `managedAccountId`; null when none. */
+    startBudgetMove?(managedAccountId: string, preferred: string[]): Promise<Record<string, string> | null>
   }
 }
 /**
@@ -294,6 +296,16 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
    * Saycode specs/shared-pc-start-budget — a shared-PC session asks Studio with the machine's own token. Only a decision
    * Studio actually answers holds the turn: an older Studio, a failure, a refusal or no answer runs it (decision D1).
    */
+  /** The accounts Studio last said have start budget left, per waiting shared-PC session: where a start-budget move goes. */
+  const sharedStartPreferred = new Map<string, string[]>()
+  /** A waiting shared-PC session moves within this PC's accounts onto one Studio said has start budget left; null: none. */
+  async function sharedStartBudgetMove(sessionId: string, shared: NonNullable<ReturnType<typeof sharedSession>>) {
+    const preferred = sharedStartPreferred.get(sessionId) ?? []
+    if (!preferred.length || !shared.sharedMachine.startBudgetMove) return null
+    const environment = await shared.sharedMachine.startBudgetMove(shared.recorded, preferred)
+    if (environment) sharedStartPreferred.delete(sessionId)
+    return environment
+  }
   async function sharedStart(sessionId: string, shared: ReturnType<typeof sharedSession>, requestId: string, signal?: AbortSignal) {
     const open = (detail: string) => {
       logger.debug(`[setup-token-switch] shared start for ${sessionId} runs without a Studio decision: ${detail}`)
@@ -308,7 +320,10 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       const response = await post('shared/start', { machineId: deps.machineId, companyId: proof.companyId, sessionId,
         managedAccountId: shared.managedAccountId, credentialGeneration: proof.credentialGeneration, requestId })
       if (!response.ok) return open(`Studio answered ${response.status}`)
-      return { ok: true as const, admission: await response.json() }
+      const admission = await response.json() as { state?: unknown; preferredAccountIds?: unknown }
+      if (admission?.state === 'wait' && Array.isArray(admission.preferredAccountIds)) sharedStartPreferred.set(sessionId, admission.preferredAccountIds.filter((id: unknown): id is string => typeof id === 'string' && UUID.test(id)))
+      else sharedStartPreferred.delete(sessionId)
+      return { ok: true as const, admission }
     } catch (error) {
       if (signal?.aborted) return failure('REQUEST_FAILED', 'shared start cancelled')
       return open(`${(error as Error)?.name ?? 'error'}`)
@@ -444,8 +459,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       const shared = sharedSession(sessionId, running)
       if (shared === undefined) return Promise.resolve(failure('NOT_BOUND', `rebind: session ${sessionId} is not an unbound shared-PC session`))
       const parsed = parseBinding(running)
-      // An unbound shared-PC session moves without Studio, which alone knows start budget: it keeps waiting.
-      if (options.startBudget && (shared || !parsed)) return Promise.resolve({ ok: false as const, reason: 'UNSUPPORTED' as const })
+      if (options.startBudget && !shared && !parsed) return Promise.resolve({ ok: false as const, reason: 'UNSUPPORTED' as const })
       if (parsed && isMachineSetupTokenBinding(parsed.binding)) {
         const binding = parsed.binding
         return Promise.resolve(deps.machineRuntime?.(binding.companyId)).then(runtime => runtime
@@ -455,7 +469,8 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       }
       const pending = inFlight.get(sessionId)
       if (pending) return pending
-      const started = (shared ? sharedRebindOnce(sessionId, shared, () => shared.sharedMachine.rebind(shared.recorded, shared.behind ? undefined : observation)) : rebindOnce(sessionId, running, false, observation?.reason === 'authentication-failed' ? { kind: 'authentication', observedAt: observation.observedAt } : undefined, !!options.startBudget)).finally(() => inFlight.delete(sessionId))
+      const started = (shared ? sharedRebindOnce(sessionId, shared, options.startBudget ? () => sharedStartBudgetMove(sessionId, shared)
+        : () => shared.sharedMachine.rebind(shared.recorded, shared.behind ? undefined : observation)) : rebindOnce(sessionId, running, false, observation?.reason === 'authentication-failed' ? { kind: 'authentication', observedAt: observation.observedAt } : undefined, !!options.startBudget)).finally(() => inFlight.delete(sessionId))
       inFlight.set(sessionId, started)
       return started
     },

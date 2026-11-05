@@ -471,7 +471,8 @@ describe('shared PC start budget (Saycode specs/shared-pc-start-budget)', () => 
   const allowed = { state: 'allowed', validForMs: 15_000 }
   function startSetup(answer: () => Response | Promise<Response>, extra: Partial<SetupTokenAccountSwitchDeps> = {}) {
     const sharedMachine = { reportUsage: vi.fn(async () => undefined), rebind: vi.fn(async () => null), environment: vi.fn(async () => null), moved: vi.fn(),
-      startProof: vi.fn(async (): Promise<{ companyId: string; credentialGeneration: number } | null> => ({ companyId: 'org-a', credentialGeneration: 1 })) }
+      startProof: vi.fn(async (): Promise<{ companyId: string; credentialGeneration: number } | null> => ({ companyId: 'org-a', credentialGeneration: 1 })),
+      startBudgetMove: vi.fn(async (): Promise<Record<string, string> | null> => null) }
     const context = setup({ sharedMachine, ...extra })
     context.session.agentEnvironment = {}
     context.session.sharedSetupTokenAccount = A
@@ -499,6 +500,32 @@ describe('shared PC start budget (Saycode specs/shared-pc-start-budget)', () => 
   ])('runs the turn on %s rather than holding it (decision D1)', async (_name, answer) => {
     const { switcher } = startSetup(answer)
     expect(await switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: true, admission: allowed })
+  })
+
+  it('moves a waiting shared-PC session onto an account Studio says has start budget left', async () => {
+    const wait = { version: 1, state: 'wait', retryAfterMs: 30_000, preferredAccountIds: [B, C] }
+    const { switcher, sharedMachine, session } = startSetup(() => Response.json(wait))
+    const next = { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next', HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1', [SETUP_TOKEN_SHARED_ACCOUNT_ENV]: B }
+    sharedMachine.startBudgetMove.mockResolvedValueOnce(next)
+    await switcher.requestStart('session-a', sharedRunning, REQUEST)
+    expect(await switcher.rebind('session-a', sharedRunning, undefined, undefined, { startBudget: true })).toEqual({ ok: true, environment: next })
+    expect(sharedMachine.startBudgetMove).toHaveBeenCalledWith(A, [B, C])
+    // A start-budget move is not a used-up account: the session's account is not reported to the PC as refused.
+    expect(sharedMachine.rebind).not.toHaveBeenCalled()
+    expect(session.sharedSetupTokenAccount).toBe(B)
+    expect(session.sharedSetupTokenAccountsLeft).toEqual([A])
+    expect(sharedMachine.moved).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps a shared-PC session waiting when Studio named no account with start budget or the PC holds none of them', async () => {
+    const { switcher, sharedMachine, session } = startSetup(() => Response.json({ version: 1, state: 'wait', retryAfterMs: 30_000, preferredAccountIds: [B] }))
+    // No wait answered yet: nothing names an account with budget.
+    expect(await switcher.rebind('session-a', sharedRunning, undefined, undefined, { startBudget: true })).toEqual({ ok: false, reason: 'NO_ACCOUNT' })
+    expect(sharedMachine.startBudgetMove).not.toHaveBeenCalled()
+    await switcher.requestStart('session-a', sharedRunning, REQUEST)
+    expect(await switcher.rebind('session-a', sharedRunning, undefined, undefined, { startBudget: true })).toEqual({ ok: false, reason: 'NO_ACCOUNT' })
+    expect(sharedMachine.startBudgetMove).toHaveBeenCalledWith(A, [B])
+    expect(session.sharedSetupTokenAccount).toBe(A)
   })
 
   it('runs the turn without asking when it cannot prove the account', async () => {

@@ -225,6 +225,30 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
         }
     });
+    it('runs a start-budget-waiting shared-PC input once on the account it moved to', async () => {
+        const B = '00000000-0000-4000-8000-00000000000b';
+        vi.mocked(requestSetupTokenStart)
+            .mockResolvedValueOnce({ state: 'wait', retryAfterMs: 600000, preferredAccountIds: [B] })
+            .mockResolvedValueOnce({ state: 'allowed', validForMs: 15000 });
+        vi.mocked(requestSetupTokenRebind).mockResolvedValueOnce({ ok: true, environment: {
+            CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-shared-b', HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1', HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: B } });
+        const inputs = vi.fn();
+        const providers: Array<string | undefined> = [];
+        try {
+            const fixture = sharedSessionFixture(inputs);
+            const first = sharedMachineSetupTokenAuthority(process.env);
+            const original = vi.mocked(query).getMockImplementation()!;
+            vi.mocked(query).mockImplementation(options => { providers.push(process.env.CLAUDE_CODE_OAUTH_TOKEN); return original(options); });
+            await claudeRemoteLauncher(fixture as unknown as Session);
+            expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', first, undefined, expect.any(AbortSignal), { startBudget: true });
+            expect(vi.mocked(requestSetupTokenStart).mock.calls.map(call => call[1])).toEqual([first, sharedMachineSetupTokenAuthority({ HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1', HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: B })]);
+            expect(providers).toEqual(['sk-ant-oat01-shared-b']);
+            expect(inputs).toHaveBeenCalledTimes(1);
+        } finally {
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED;
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
+        }
+    });
     it('runs a start-budget-waiting input at once on another organization account that has start budget', async () => {
         vi.mocked(requestSetupTokenStart)
             .mockResolvedValueOnce({ state: 'wait', retryAfterMs: 600000, preferredAccountIds: ['second'] })

@@ -4935,6 +4935,7 @@ export async function startDaemon(): Promise<void> {
         reportUsage: aiCredentialRuntime.sharedMachineUsage, rebind: aiCredentialRuntime.sharedMachineRebind,
         environment: aiCredentialRuntime.sharedMachineAccountEnvironment, moved: () => persistTrackedSessions(),
         startProof: aiCredentialRuntime.sharedMachineStartProof,
+        startBudgetMove: aiCredentialRuntime.sharedMachineStartBudgetMove,
       },
     });
     launchManagedAiCredentialSession = aiCredentialRuntime.launchSession;

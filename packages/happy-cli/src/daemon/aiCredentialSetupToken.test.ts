@@ -465,6 +465,19 @@ describe('managed Claude setup-token runtime', () => {
     expect(exports() - before).toBe(2)
   })
 
+  it('moves a start-budget-waiting shared session only onto a held, usable account Studio named (Saycode specs/shared-pc-start-budget)', async () => {
+    const { runtime } = fakeMachine([], null, { machineId: 'machine-1' })
+    await runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',
+      generation: 1, fingerprint: '1'.padStart(64, '0'), payload: payload(managed(A, 1, fakeToken('a')), managed(B, 1, fakeToken('b'))) })
+    const unknown = '00000000-0000-4000-8000-0000000000ff'
+    expect(await runtime.sharedMachineStartBudgetMove(A, [unknown, B])).toMatchObject({ CLAUDE_CODE_OAUTH_TOKEN: fakeToken('b'), HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: B })
+    // Never back onto the account it leaves, nor onto one this PC does not hold.
+    expect(await runtime.sharedMachineStartBudgetMove(A, [A, unknown])).toBeNull()
+    // Nor onto one this PC holds as used up.
+    await runtime.sharedMachineUsage(B, { observedAt: NOW, reason: 'rate-limited', retryAt: NOW + 3_600_000, windows: [] })
+    expect(await runtime.sharedMachineStartBudgetMove(A, [B])).toBeNull()
+  })
+
   it('proves no account on a machine without a shared assignment', async () => {
     const { runtime } = fakeMachine([], null, { machineId: 'machine-1' })
     expect(await runtime.sharedMachineStartProof(A)).toBeNull()
