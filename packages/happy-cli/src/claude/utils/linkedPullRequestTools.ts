@@ -15,6 +15,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { ApiSessionClient } from '@/api/apiSession';
 import type { Metadata } from '@/api/types';
+import { resolveSessionSandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 
 export const LINKED_PULL_REQUEST_LIMIT = 20;
 
@@ -70,6 +71,24 @@ export function parsePullRequestUrl(input: string): PullRequestRef | null {
     return { url: `https://github.com/${owner}/${repo}/pull/${number}`, repo: `${owner}/${repo}`, number };
 }
 
+/**
+ * Whether a runner gives its agent these tools, decided once from the session's real policy and
+ * used for both the tool registration and `runtimeCapabilities.linkedPullRequests`. Not under a
+ * mandatory sandbox, and — like bash_stream — not in a write-scope session: the request leads
+ * Desktop to look at the PR and send follow-up work, and that path is not yet shown to keep the
+ * session's scope (Saycode Desktop specs/linked-pull-requests D2/D3).
+ */
+export function linkedPullRequestToolsAllowed(env: NodeJS.ProcessEnv = process.env): boolean {
+    return resolveSessionSandboxPolicyMode(env) !== 'mandatory' && env.HAPPY_WRITE_SCOPE_SESSION !== '1';
+}
+
+/** Sets or removes only this capability; the same document when it already says so. */
+export function withLinkedPullRequestCapability(metadata: Metadata, exposed: boolean): Metadata {
+    if ((metadata.runtimeCapabilities?.linkedPullRequests === 1) === exposed) return metadata;
+    const { linkedPullRequests: _advertised, ...others } = metadata.runtimeCapabilities ?? {};
+    return { ...metadata, runtimeCapabilities: { ...others, ...(exposed ? { linkedPullRequests: 1 as const } : {}) } };
+}
+
 export function linkedPullRequestKey(ref: Pick<PullRequestRef, 'repo' | 'number'>): string {
     return `${ref.repo.toLowerCase()}#${ref.number}`;
 }
@@ -88,13 +107,36 @@ function entries(metadata: Metadata): unknown[] {
     return Array.isArray(metadata.linkedPullRequests) ? metadata.linkedPullRequests : [];
 }
 
-/** Readable entries, for `list`. An entry with a malformed `watch` is shown as unwatched. */
-export function readLinkedPullRequests(metadata: Metadata | null): LinkedPullRequest[] {
+/** What `list` and the confirmation read of an entry; never the stored strings themselves. */
+export type LinkedPullRequestView = PullRequestRef & {
+    watch?: { requested: boolean; owned: boolean; state?: NonNullable<LinkedPullRequestWatch['state']>; stopReason?: string; updatedAt?: number };
+};
+
+const STATES = new Set(['watching', 'ready', 'merged', 'stopped']);
+const REASON = /^[A-Za-z0-9_.:-]{1,40}$/;
+
+/**
+ * Readable entries, rebuilt from the parsed URL: another client wrote them, so a stored `url` that
+ * parses (the URL parser drops a newline, for one) is not repeated as written. An entry with a
+ * malformed `watch` reads as unwatched. Writers work on the stored entries, not on this view.
+ */
+export function readLinkedPullRequests(metadata: Metadata | null): LinkedPullRequestView[] {
     if (!metadata) return [];
     return entries(metadata).flatMap((entry) => {
         if (entryKey(entry) === null) return [];
-        const value = entry as LinkedPullRequest;
-        return [{ ...value, watch: isRecord(value.watch) && typeof value.watch.requested === 'boolean' ? value.watch : undefined }];
+        const value = entry as Record<string, unknown>;
+        const ref = parsePullRequestUrl(value.url as string)!;
+        const watch = isRecord(value.watch) && typeof value.watch.requested === 'boolean' ? value.watch : null;
+        return [{
+            ...ref,
+            ...(watch ? { watch: {
+                requested: watch.requested as boolean,
+                owned: isRecord(watch.owner),
+                ...(typeof watch.state === 'string' && STATES.has(watch.state) ? { state: watch.state as NonNullable<LinkedPullRequestWatch['state']> } : {}),
+                ...(typeof watch.stopReason === 'string' && REASON.test(watch.stopReason) ? { stopReason: watch.stopReason } : {}),
+                ...(typeof watch.updatedAt === 'number' && Number.isFinite(watch.updatedAt) ? { updatedAt: watch.updatedAt } : {}),
+            } } : {}),
+        }];
     });
 }
 
@@ -163,20 +205,19 @@ function changeHolds(metadata: Metadata, change: LinkedPullRequestChange): boole
 }
 
 const STALE_MS = 30 * 60_000;
-const REASON = /^[A-Za-z0-9_.:-]{1,40}$/;
 
-/** One `list` line. Desktop writes `state` and `stopReason`, so only known values are repeated. */
-function describeEntry(pr: LinkedPullRequest, now: number): string {
+/** One `list` line, from the parsed view only. */
+function describeEntry(pr: LinkedPullRequestView, now: number): string {
     const watch = pr.watch;
     const name = `${pr.repo}#${pr.number}`;
     let status: string;
     if (watch?.state === 'merged') status = 'merged';
-    else if (watch?.state === 'stopped') status = `stopped: ${typeof watch.stopReason === 'string' && REASON.test(watch.stopReason) ? watch.stopReason : 'no reason given'}`;
+    else if (watch?.state === 'stopped') status = `stopped: ${watch.stopReason ?? 'no reason given'}`;
     else if (!watch?.requested) status = watch?.state === 'watching' || watch?.state === 'ready' ? 'stop requested, Desktop has not stopped it yet' : 'not watched';
     else if (watch.state === 'watching' || watch.state === 'ready') {
         status = watch.state === 'ready' ? 'ready to merge' : 'watching';
-        if (typeof watch.updatedAt === 'number' && now - watch.updatedAt > STALE_MS) status += ' (no update from the watching Desktop for over 30 minutes)';
-    } else status = isRecord(watch.owner) ? 'requested, a Saycode Desktop is starting it' : 'requested, waiting for a Saycode Desktop to pick it up';
+        if (watch.updatedAt !== undefined && now - watch.updatedAt > STALE_MS) status += ' (no update from the watching Desktop for over 30 minutes)';
+    } else status = watch.owned ? 'requested, a Saycode Desktop is starting it' : 'requested, waiting for a Saycode Desktop to pick it up';
     return `- ${name} · watch: ${status} · ${pr.url}`;
 }
 
@@ -208,28 +249,51 @@ export type LinkedPullRequestToolOptions = {
 const DEFAULT_CONFIRM = { timeoutMs: 5000, pollMs: 50 };
 
 /**
- * Queues the change and waits until the client's copy of the metadata shows it, so a `list` right
- * after reads it. `updateMetadata` reports nothing back; the client copy changes on the server's ack.
+ * Changes sent and not yet stored, per session client. The MCP server is rebuilt per request, so
+ * this lives with the client. A change that timed out stays here until the server stores it.
+ */
+const pendingByClient = new WeakMap<object, Array<{ change: LinkedPullRequestChange }>>();
+
+/**
+ * Queues the change and waits until the server has stored it, so a `list` right after reads it.
+ *
+ * The client's write queue keeps order, and a change is judged against the earlier ones not stored
+ * yet: a `stop` after a `start` whose answer timed out is queued behind it instead of reading as
+ * "nothing to stop" while the start still lands later.
  */
 async function record(options: LinkedPullRequestToolOptions, change: LinkedPullRequestChange): Promise<{ outcome: LinkedPullRequestOutcome; confirmed: boolean } | null> {
     const { client } = options;
     const current = client.getMetadata();
     if (!current) return null;
-    const planned = applyLinkedPullRequestChange(current, change);
-    if (planned.metadata === current) return { outcome: planned.outcome, confirmed: true };
-    client.updateMetadata((metadata) => applyLinkedPullRequestChange(metadata, change).metadata);
+    const pending = pendingByClient.get(client) ?? [];
+    pendingByClient.set(client, pending);
+    const projected = pending.reduce((metadata, earlier) => applyLinkedPullRequestChange(metadata, earlier.change).metadata, current);
+    const planned = applyLinkedPullRequestChange(projected, change);
+    let awaited: Array<{ change: LinkedPullRequestChange }>;
+    if (planned.metadata === projected) {
+        if (pending.length === 0) return { outcome: planned.outcome, confirmed: true };
+        // Nothing to send, but the answer rests on earlier changes that are not stored yet.
+        awaited = [...pending];
+    } else {
+        const entry = { change };
+        pending.push(entry);
+        client.updateMetadata((metadata) => applyLinkedPullRequestChange(metadata, change).metadata, {
+            skipUnchanged: true,
+            onStored: () => { const index = pending.indexOf(entry); if (index >= 0) pending.splice(index, 1); },
+        });
+        awaited = [entry];
+    }
     const { timeoutMs, pollMs } = options.confirm ?? DEFAULT_CONFIRM;
     const deadline = Date.now() + timeoutMs;
-    for (;;) {
-        const latest = client.getMetadata();
-        if (latest && changeHolds(latest, change)) return { outcome: planned.outcome, confirmed: true };
-        if (Date.now() >= deadline) {
-            // Replayed against a newer document the change can turn into the limit refusal.
-            const replay = latest ? applyLinkedPullRequestChange(latest, change).outcome : planned.outcome;
-            return { outcome: replay === 'limit' ? 'limit' : planned.outcome, confirmed: false };
-        }
+    while (awaited.some((entry) => pending.includes(entry)) && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, pollMs));
     }
+    const latest = client.getMetadata();
+    const stored = !awaited.some((entry) => pending.includes(entry));
+    if (stored && latest && changeHolds(latest, change)) return { outcome: planned.outcome, confirmed: true };
+    // Replayed against a newer document the change can turn into the limit refusal.
+    const replay = latest ? applyLinkedPullRequestChange(latest, change).outcome : planned.outcome;
+    return { outcome: replay === 'limit' ? 'limit' : planned.outcome, confirmed: false };
 }
 
 function linkReply(outcome: LinkedPullRequestOutcome, name: string): ToolReply {

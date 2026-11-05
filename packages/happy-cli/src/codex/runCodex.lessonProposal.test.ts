@@ -183,6 +183,32 @@ describe('Codex local history wiring', () => {
     });
 });
 
+// aplus-dev-studio-desktop specs/linked-pull-requests R2-3 — the real start path decides once for both.
+describe('Codex linked pull request tools', () => {
+    it.each([['default', undefined, true], ['mandatory', 'mandatory', false]] as const)('follow the %s sandbox policy for registration and advertisement', async (_label, mode, exposed) => {
+        for (const key of Object.keys(process.env)) {
+            if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_|HAPPY_SANDBOX_POLICY_MODE|HAPPY_WRITE_SCOPE_SESSION)/.test(key)) vi.stubEnv(key, undefined);
+        }
+        fixture.aborted = false;
+        vi.stubEnv('HAPPY_AUTOMATION_RUN_ONCE', '1');
+        vi.stubEnv('HAPPY_INITIAL_PROMPT', 'Link the PR');
+        if (mode) {
+            vi.stubEnv('HAPPY_SANDBOX_POLICY_MODE', mode);
+            vi.stubEnv('HAPPY_PROJECT_SANDBOX_CONFIG', JSON.stringify({ enabled: true }));
+        }
+        const review = { prepareReviewTurn: vi.fn(async () => ({ revision: 9 })), reviewFinishedTurn: vi.fn(async () => 'reviewed' as const) };
+        const { runCodex } = await import('./runCodex');
+        await runCodex({ principal: { kind: 'account', credentials: { token: 'test-token' } as never },
+            noSandbox: !mode, lessons: { turn: null, review, sessionKind: 'foreground' } });
+        const { startHappyServer } = await import('@/claude/utils/startHappyServer');
+        expect(startHappyServer).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ linkedPullRequestTools: exposed }));
+        const { ApiClient } = await import('@/api/api');
+        const api = await vi.mocked(ApiClient.create).mock.results[0].value as { getOrCreateSession: ReturnType<typeof vi.fn> };
+        const [{ metadata }] = api.getOrCreateSession.mock.calls[0] as [{ metadata: { runtimeCapabilities?: Record<string, unknown> } }];
+        expect(metadata.runtimeCapabilities?.linkedPullRequests).toBe(exposed ? 1 : undefined);
+    });
+});
+
 describe('Codex foreground lesson proposal wiring', () => {
     it.each(['prepare_rejected', 'late_channel_cancel', 'abort_during_permit', 'accepted', 'abort_during_recall'] as const)(
         'starts stateful host memory only after channel execution admission (%s)', async (scenario) => {

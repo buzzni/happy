@@ -21,6 +21,7 @@ import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
 import { encodeBase64 } from '@/api/encryption';
 import { registerKillSessionHandler } from '@/claude/registerKillSessionHandler';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
+import { linkedPullRequestToolsAllowed } from '@/claude/utils/linkedPullRequestTools';
 import { fetchAplusMcpServers } from '@/aplus/fetchAplusMcpServers';
 import { bridgeAplusMcpServers, mergeMcpServers } from '@/aplus/mergeAplusMcpServers';
 import { appendTitleInstruction } from '@/utils/titlePrompt';
@@ -512,6 +513,8 @@ export async function runAcp(opts: {
   const createdByDisplayName = process.env.HAPPY_CREATED_BY_DISPLAY_NAME;
   // Who asked for this session (aplus-dev-studio specs/session-source-metadata); read once and removed.
   const source = takeSessionSourceFromEnv();
+  // Registration and advertisement follow the same decision (specs/linked-pull-requests R2-3).
+  const linkedPullRequestTools = linkedPullRequestToolsAllowed(process.env);
 
   const { state, metadata } = createSessionMetadata({
     flavor: resolveSessionFlavor(opts.agentName),
@@ -521,7 +524,7 @@ export async function runAcp(opts: {
     ...(createdByAccountId ? { createdBy: { accountId: createdByAccountId, displayName: createdByDisplayName } } : {}),
     source,
     approvalLifecycle: true,
-    linkedPullRequestTools: true,
+    linkedPullRequestTools,
   });
   const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
   if (response) {
@@ -610,9 +613,12 @@ export async function runAcp(opts: {
   let loopDone = false;
   let markLoopDone!: () => void;
   const loopFinished = new Promise<void>((resolve) => { markLoopDone = () => { loopDone = true; resolve(); }; });
-  const happyServer = await startHappyServer(session, launchControl ? {
-    admitTool: <T,>(work: () => Promise<T>) => (runtimeGate ? runtimeGate.admit(work, 'writer') : Promise.reject(new Error('Runtime input is not open'))),
-  } : undefined);
+  const happyServer = await startHappyServer(session, {
+    linkedPullRequestTools,
+    ...(launchControl ? {
+      admitTool: <T,>(work: () => Promise<T>) => (runtimeGate ? runtimeGate.admit(work, 'writer') : Promise.reject(new Error('Runtime input is not open'))),
+    } : {}),
+  });
   // Launched via `node <path>` like Codex: agents that spawn without a shell (Grok on
   // Windows) cannot execute a .mjs shebang script (os error 193).
   const bridgeCommand = join(projectPath(), 'bin', 'happy-mcp.mjs');

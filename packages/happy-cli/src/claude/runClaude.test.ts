@@ -556,16 +556,16 @@ describe('runClaude remote JSONL scanner', () => {
                     approvalLifecycle: 1,
                     saycodeSystemPromptPreference: true,
                     permissionGrants: { bashPrefixMatcher: 'plain-v1' },
-                    // aplus-dev-studio-desktop specs/linked-pull-requests R1-3 — this process exposes the PR tools.
-                    linkedPullRequests: 1,
                 },
             });
+            // aplus-dev-studio-desktop specs/linked-pull-requests R1-3 — startHappyServer corrects kept metadata from this value.
+            expect(mockStartHappyServer).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ linkedPullRequestTools: true }));
         } finally {
             await harness.finish();
         }
     });
 
-    it('drops a persisted PR tools capability that a mandatory sandbox run does not expose', async () => {
+    it('neither registers nor advertises the PR tools under a mandatory sandbox policy', async () => {
         process.env.HAPPY_SANDBOX_POLICY_MODE = 'mandatory';
         process.env.HAPPY_PROJECT_SANDBOX_CONFIG = JSON.stringify({ enabled: true });
         const harness = await startRemoteRunClaudeHarness({ metadata: {
@@ -574,7 +574,7 @@ describe('runClaude remote JSONL scanner', () => {
         try {
             const [{ metadata }] = harness.api.getOrCreateSession.mock.calls[0] as unknown as [{ metadata: { runtimeCapabilities?: object } }];
             expect(metadata.runtimeCapabilities).not.toHaveProperty('linkedPullRequests');
-            expect(harness.sessionClient.getMetadata().runtimeCapabilities).not.toHaveProperty('linkedPullRequests');
+            expect(mockStartHappyServer).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ mandatorySandbox: true, linkedPullRequestTools: false }));
         } finally {
             await harness.finish();
         }

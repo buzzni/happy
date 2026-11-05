@@ -1035,6 +1035,36 @@ describe('ApiSessionClient v3 messages API migration', () => {
             expect(client.getMetadata()).toEqual(written);
         });
 
+        it('sends nothing when the replayed change is already there (skipUnchanged)', async () => {
+            const newer = { ...session.metadata, linkedPullRequests: [linkHappy(session.metadata).linkedPullRequests as unknown[]].flat() };
+            mockSocket.emitWithAck.mockResolvedValueOnce({ result: 'version-mismatch', version: 1, metadata: encryptContent(session, newer) });
+            const client = new ApiSessionClient('fake-token', session);
+            const stored = vi.fn();
+            client.updateMetadata(linkHappy, { skipUnchanged: true, onStored: stored });
+            await waitForCheck(() => expect(stored).toHaveBeenCalledTimes(1));
+            await new Promise(resolve => setTimeout(resolve, 10));
+            expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(1);
+            expect(client.getMetadata()).toEqual(newer);
+            // Unchanged from the start: no write at all.
+            client.updateMetadata(linkHappy, { skipUnchanged: true, onStored: stored });
+            await waitForCheck(() => expect(stored).toHaveBeenCalledTimes(2));
+            expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(1);
+        });
+
+        it('calls onStored only after the server acknowledged the write', async () => {
+            let ack!: () => void;
+            mockSocket.emitWithAck.mockImplementationOnce((_event: string, payload: { metadata: string }) => new Promise(resolve => {
+                ack = () => resolve({ result: 'success', version: 1, metadata: payload.metadata });
+            }));
+            const client = new ApiSessionClient('fake-token', session);
+            const stored = vi.fn();
+            client.updateMetadata(linkHappy, { skipUnchanged: true, onStored: stored });
+            await waitForCheck(() => expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(1));
+            expect(stored).not.toHaveBeenCalled();
+            ack();
+            await waitForCheck(() => expect(stored).toHaveBeenCalledTimes(1));
+        });
+
         it('survives the other metadata writes of a running session', async () => {
             const linked = { ...session.metadata, linkedPullRequests: [desktopEntry] };
             let server: Metadata = linked;

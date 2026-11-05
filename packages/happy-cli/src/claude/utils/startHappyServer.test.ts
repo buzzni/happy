@@ -302,7 +302,7 @@ describe('Happy MCP shutdown admission', () => {
     it('refuses every advertised tool before its callback runs', async () => {
         const admitTool = vi.fn(async () => { throw new Error('closed'); });
         const proposal = vi.fn(() => ({ accepted: true }));
-        const server = await startHappyServer(makeFakeClient(false), { admitTool, proposeLesson: proposal, checkpointReader: { query: proposal } as never });
+        const server = await startHappyServer(makeFakeClient(false), { admitTool, proposeLesson: proposal, checkpointReader: { query: proposal } as never, linkedPullRequestTools: true });
         const args: Record<string, Record<string, unknown>> = {
             session_write_scope: { action: 'list' },
             propose_lesson: { token: '00000000-0000-4000-8000-000000000001', proposal: {} },
