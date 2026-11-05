@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -44,6 +44,57 @@ afterEach(async () => {
 });
 
 describe('registerCommonHandlers bash scheduling', () => {
+    it('forwards host admission to the explicitly enabled raw machine-run adapter', async () => {
+        const admitSubprocess = vi.fn(async (_roots: readonly string[]) => { throw new Error('WORKSPACE_BUSY'); });
+        const { handlers, workingDirectory } = await createHandlers(undefined, { admitSubprocess,
+            machineRun: { allowLegacyRaw: true, profileRegistry: createTrustedMachineRunProfileResolver([]) } });
+        await expect(handlers.get('machine-run')!({ version: 1, action: 'start', executable: 'printf', args: ['blocked'], cwd: workingDirectory }))
+            .rejects.toThrow('WORKSPACE_BUSY');
+        expect(admitSubprocess).toHaveBeenCalledWith([await realpath(workingDirectory)]);
+    });
+    it.each(['machine.run', 'machine-run'])('forwards host admission through the %s profile adapter', async method => {
+        const registry = createTrustedMachineRunProfileResolver([{
+            id: 'buzzni.test.admission', executable: 'printf', argv: ['{{message}}'],
+            parameters: { message: { type: 'string', maxLength: 32 } }, cwd: 'workspaceRoot',
+            envAllowlist: [], timeoutMs: 1000, outputLimitBytes: 1024, stdin: 'none',
+        }]);
+        const admitSubprocess = vi.fn(async (_roots: readonly string[]) => { throw new Error('WORKSPACE_OWNER_UNCONFIRMED'); });
+        const { handlers, workingDirectory } = await createHandlers(undefined, { admitSubprocess, machineRun: { profileRegistry: registry } });
+        await expect(handlers.get(method)!({ action: 'start', profileId: 'buzzni.test.admission',
+            profileDigest: registry.resolve('buzzni.test.admission')!.profileDigest, workspaceRoot: workingDirectory, parameters: { message: 'blocked' } }))
+            .rejects.toThrow('WORKSPACE_OWNER_UNCONFIRMED');
+        const canonical = await realpath(workingDirectory);
+        expect(admitSubprocess).toHaveBeenCalledWith([canonical, canonical]);
+    });
+    it('checks host workspace admission before a legacy shell effect and ignores request-supplied admission', async () => {
+        const admitSubprocess = vi.fn(async (_roots: readonly string[]) => { throw new Error('WORKSPACE_OWNER_UNCONFIRMED'); });
+        const options = { childEnvBoundary: 'session' as const, admitSubprocess };
+        const { handlers, workingDirectory } = await createHandlers(undefined, options);
+        await expect(handlers.get('bash')!({ command: 'printf unsafe > untracked-shell.txt', cwd: workingDirectory,
+            admitSubprocess: async () => undefined })).resolves.toMatchObject({ success: false, error: 'WORKSPACE_OWNER_UNCONFIRMED' });
+        expect(admitSubprocess).toHaveBeenCalledWith([workingDirectory]);
+        await expect(readFile(join(workingDirectory, 'untracked-shell.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
+    });
+    it.each([undefined, '/'])('uses the actual process cwd for default-shell admission (%s)', async cwd => {
+        const admitSubprocess = vi.fn(async (_roots: readonly string[]) => undefined);
+        const { handlers } = await createHandlers(undefined, { childEnvBoundary: 'session', admitSubprocess } as CommonHandlerOptions);
+        await expect(handlers.get('bash')!({ command: 'printf admitted', ...(cwd ? { cwd } : {}) }))
+            .resolves.toMatchObject({ success: true, stdout: 'admitted' });
+        expect(admitSubprocess).toHaveBeenCalledWith([process.cwd()]);
+    });
+    it.each(['ripgrep', 'difftastic'])('checks host admission before starting a legacy raw %s process', async method => {
+        const runner = method === 'ripgrep' ? await import('@/modules/ripgrep/index') : await import('@/modules/difftastic/index');
+        const execute = vi.spyOn(runner, 'run').mockRejectedValue(new Error('untracked process invoked'));
+        const admitSubprocess = vi.fn(async (_roots: readonly string[]) => { throw new Error('WORKSPACE_BUSY'); });
+        try {
+            const options = { childEnvBoundary: 'session' as const, admitSubprocess };
+            const { handlers, workingDirectory } = await createHandlers(undefined, options);
+            await expect(handlers.get(method)!({ args: ['--version'], cwd: workingDirectory }))
+                .resolves.toMatchObject({ success: false, error: 'WORKSPACE_BUSY' });
+            expect(admitSubprocess).toHaveBeenCalledWith([workingDirectory]);
+            expect(execute).not.toHaveBeenCalled();
+        } finally { execute.mockRestore(); }
+    });
     it.each(['ripgrep', 'difftastic'])('refuses internal raw %s before starting any process', async method => {
         const runner = method === 'ripgrep' ? await import('@/modules/ripgrep/index') : await import('@/modules/difftastic/index');
         const execute = vi.spyOn(runner, 'run').mockRejectedValue(new Error('untracked process invoked'));

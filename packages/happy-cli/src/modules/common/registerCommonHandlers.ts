@@ -31,7 +31,7 @@ import {
     type BashRpcExecutionClass,
 } from './bashRpcScheduler';
 import type { PermissionMode } from '@/api/types';
-import { createTypedMachineRunHandler } from './typedMachineRun';
+import { createTypedMachineRunHandler, type TypedMachineRunHandlerOptions } from './typedMachineRun';
 import {
     createProfileAwareMachineRunHandler,
     TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
@@ -565,6 +565,8 @@ export interface CommonHandlerOptions {
     processExecution?: 'disabled';
     /** Host-owned operation admission; never populated from RPC input. */
     withFilesystemMutation?: <T>(operation: () => Promise<T>) => Promise<T>;
+    /** Persist an unknown process writer before submission; host-only, never an RPC field. */
+    admitSubprocess?: TypedMachineRunHandlerOptions['admitSubprocess'];
     machineRun?: {
         /** Host-owned immutable registry. Extension input must never populate this. */
         profileRegistry: TrustedMachineRunProfileRegistry;
@@ -588,10 +590,11 @@ export interface CommonHandlerOptions {
 export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, workingDirectory: string, options: CommonHandlerOptions = {}) {
     const downloadDirectories = createWorkspaceDownloadDirectoryReader();
     const withFilesystemMutation = options.withFilesystemMutation ?? (async <T>(operation: () => Promise<T>) => operation());
+    const admitSubprocess = options.admitSubprocess;
     rpcHandlerManager.registerHandler('file-discovery', (request: unknown) => fileDiscovery(workingDirectory, request));
     const bashScheduler = createBashRpcScheduler();
     const bashEnvBoundary = options.childEnvBoundary ?? 'session';
-    const rawMachineRunHandler = createTypedMachineRunHandler(workingDirectory);
+    const rawMachineRunHandler = createTypedMachineRunHandler(workingDirectory, { admitSubprocess });
     const machineRunOptions = options.machineRun;
     const profileHandlerOptions: MachineRunProfileHandlerOptions = machineRunOptions ? {
         extensionDataDirectory: machineRunOptions.extensionDataDirectory,
@@ -600,7 +603,8 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         platform: machineRunOptions.platform,
         writeScopePolicy: machineRunOptions.writeScopePolicy,
         managedTools: machineRunOptions.managedTools,
-    } : { platform: process.platform };
+        admitSubprocess,
+    } : { platform: process.platform, admitSubprocess };
     // `machine.run` is the profile-aware capability used by Desktop. The
     // hyphenated alias is profile-only by default; raw executable/argv is an
     // explicit internal compatibility mode and is never an extension default.
@@ -679,14 +683,16 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
                     // Build options with shell enabled by default
                     // Note: ExecOptions doesn't support boolean for shell, but exec() uses the default shell when shell is undefined
                     // If cwd is "/", use undefined to let shell use its default (respects user's PATH)
+                    const commandCwd = data.cwd === '/' ? undefined : data.cwd;
                     const options: ExecOptions = {
-                        cwd: data.cwd === '/' ? undefined : data.cwd,
+                        cwd: commandCwd,
                         timeout: data.timeout || 30000, // Default 30 seconds timeout
                         windowsHide: true, // Prevent cmd.exe popup on Windows for every RPC bash call
                         env: sanitizeChildEnv(process.env, { boundary: bashEnvBoundary }),
                     };
 
                     logger.debug('Shell command executing...', { cwd: options.cwd, timeout: options.timeout });
+                    await admitSubprocess?.([commandCwd ?? process.cwd()]);
                     const { stdout, stderr } = await execAsync(data.command, options);
                     logger.debug('Shell command executed, processing result...');
 
@@ -1382,6 +1388,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         }
 
         try {
+            await admitSubprocess?.([data.cwd ?? process.cwd()]);
             const result = await runRipgrep(data.args, { cwd: data.cwd });
             return {
                 success: true,
@@ -1413,6 +1420,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         }
 
         try {
+            await admitSubprocess?.([data.cwd ?? process.cwd()]);
             const result = await runDifftastic(data.args, { cwd: data.cwd });
             return {
                 success: true,

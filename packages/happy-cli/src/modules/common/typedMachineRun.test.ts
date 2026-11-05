@@ -1,9 +1,42 @@
-import { describe, expect, it } from 'vitest';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { describe, expect, it, vi } from 'vitest';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createTypedMachineRunHandler } from './typedMachineRun';
 import { probeProcessGroup, signalProcessGroup } from '../../daemon/managedProcessGroup';
+
+it('checks actual cwd and trusted workspace roots before starting an untracked machine process', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happy-machine-admission-'));
+    try {
+        const extra = join(root, 'extra'); await mkdir(extra);
+        const admitSubprocess = vi.fn(async (_roots: readonly string[]) => { throw new Error('WORKSPACE_BUSY'); });
+        const options = { platform: process.platform, admitSubprocess }, trusted = { env: {}, workspaceRoots: [extra] };
+        const handler = createTypedMachineRunHandler(root, options);
+        await expect(handler({ version: 1, action: 'start', executable: 'touch', args: ['untracked.txt'], cwd: root }, trusted))
+            .rejects.toThrow('WORKSPACE_BUSY');
+        expect(admitSubprocess).toHaveBeenCalledWith([await realpath(root), extra]);
+        await expect(readFile(join(root, 'untracked.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+it('reserves operation capacity while asynchronous host admission is pending and returns it after refusal', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happy-machine-admission-quota-'));
+    let release!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const admitSubprocess = vi.fn(async (_roots: readonly string[]) => { await barrier; throw new Error('ADMISSION_REFUSED'); });
+    const handler = createTypedMachineRunHandler(root, { admitSubprocess });
+    const start = () => handler({ version: 1, action: 'start', executable: 'printf', args: ['blocked'], cwd: root });
+    const pending = Array.from({ length: 32 }, () => start().catch(error => error));
+    const overflow = start().catch(error => error);
+    try {
+        expect(admitSubprocess).toHaveBeenCalledTimes(32);
+        expect(await overflow).toMatchObject({ message: expect.stringContaining('MACHINE_RUN_QUOTA_EXCEEDED') });
+    } finally {
+        release(); await Promise.all([...pending, overflow]);
+        try { await expect(start()).rejects.toThrow('ADMISSION_REFUSED'); }
+        finally { await rm(root, { recursive: true, force: true }); }
+    }
+});
 
 async function waitForTerminal(handler: ReturnType<typeof createTypedMachineRunHandler>, operationId: string) {
     for (let attempt = 0; attempt < 100; attempt++) {
