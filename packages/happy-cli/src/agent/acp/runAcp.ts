@@ -521,6 +521,7 @@ export async function runAcp(opts: {
     ...(createdByAccountId ? { createdBy: { accountId: createdByAccountId, displayName: createdByDisplayName } } : {}),
     source,
     approvalLifecycle: true,
+    linkedPullRequestTools: true,
   });
   const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
   if (response) {

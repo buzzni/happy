@@ -40,6 +40,15 @@ describe('createSessionMetadata', () => {
             .toEqual({ saycodeSystemPromptPreference: true });
     });
 
+    // aplus-dev-studio-desktop specs/linked-pull-requests R1-3 — tool presence, not a version guess.
+    it('advertises the linked pull request tools only for a runner that exposes them', () => {
+        expect(createSessionMetadata({ flavor: 'codex', machineId: 'm', linkedPullRequestTools: true }).metadata.runtimeCapabilities)
+            .toEqual({ saycodeSystemPromptPreference: true, linkedPullRequests: 1 });
+        for (const flavor of ['claude', 'openclaw'] as const) {
+            expect(createSessionMetadata({ flavor, machineId: 'm' }).metadata.runtimeCapabilities).not.toHaveProperty('linkedPullRequests');
+        }
+    });
+
     it('advertises bound session RPCs', () => {
         const { metadata } = createSessionMetadata({ flavor: 'claude', machineId: 'machine-1' });
 

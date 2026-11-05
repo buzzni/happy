@@ -158,6 +158,7 @@ export async function runGemini(opts: {
     ...(createdByAccountId ? { createdBy: { accountId: createdByAccountId, displayName: createdByDisplayName } } : {}),
     source,
     approvalLifecycle: true,
+    linkedPullRequestTools: true,
   });
   const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
 

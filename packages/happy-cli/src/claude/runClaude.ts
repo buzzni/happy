@@ -365,6 +365,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         source,
         approvalLifecycle: true,
         permissionGrants: BASH_PREFIX_MATCHER_CAPABILITY,
+        // startHappyServer below drops them under a mandatory sandbox.
+        linkedPullRequestTools: sandboxPolicyMode !== 'mandatory',
     });
 
     // Resume-in-place must use the latest server document as its metadata
@@ -546,13 +548,17 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     const session = launchControl ? api.sessionSyncClient(response, { trackShutdownStorage: true }) : api.sessionSyncClient(response);
     // Managed attachments (and existing session tags) return persisted metadata instead of the
     // fresh document above. Only this running Claude process may advertise its matcher there.
-    session.updateMetadata((meta) => ({
-        ...meta,
-        runtimeCapabilities: {
-            ...meta.runtimeCapabilities,
-            permissionGrants: BASH_PREFIX_MATCHER_CAPABILITY,
-        },
-    }));
+    session.updateMetadata((meta) => {
+        const { linkedPullRequests: _tools, ...capabilities } = meta.runtimeCapabilities ?? {};
+        return {
+            ...meta,
+            runtimeCapabilities: {
+                ...capabilities,
+                permissionGrants: BASH_PREFIX_MATCHER_CAPABILITY,
+                ...(freshMetadata.runtimeCapabilities?.linkedPullRequests ? { linkedPullRequests: 1 as const } : {}),
+            },
+        };
+    });
     stage('session-client');
     // Created with the message queue below; MCP tools admitted before then are refused by the gate itself.
     let runtimeGate: RuntimeProducerGate | undefined;

@@ -394,6 +394,7 @@ export async function runCodex(opts: {
         ...(createdByAccountId ? { createdBy: { accountId: createdByAccountId, displayName: createdByDisplayName } } : {}),
         source,
         approvalLifecycle: true,
+        linkedPullRequestTools: true,
     });
 
     const skillCommands = await discoverCodexSkillCommands();
