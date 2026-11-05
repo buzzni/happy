@@ -1,10 +1,11 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager';
 import { configuration } from '@/configuration';
+import { createWorkspaceTurnAdmission, createFilesystemWriteAdmission } from '@/utils/workspaceTurnAdmission';
 import { registerCommonHandlers, type CommonHandlerOptions } from './registerCommonHandlers';
 import { createManagedProjectWriteScopePolicy, createTrustedMachineRunProfileResolver } from './machineRunProfile';
 import { managedMachineToolPlatform } from './managedMachineTool';
@@ -631,4 +632,48 @@ describe('file RPCs under strict machine control', () => {
 
         await expect(handlers.get('readFile')?.({ path: join(home, 'sessions.json') })).resolves.toMatchObject({ success: true });
     });
+});
+
+describe.skipIf(process.platform === 'win32')('common filesystem mutation admission', () => {
+    const mutation = createFilesystemWriteAdmission({ home: configuration.happyHomeDir });
+    it.each(['writeFile', 'writeWorkspaceFile', 'renameFile', 'deleteFile', 'copyFile', 'ensureDirectory'])(
+        'does not mutate files through %s while an automatic writer owns the workspace', async method => {
+            const f = await createHandlers(undefined, Object.assign({ childEnvBoundary: 'session' as const }, { withFilesystemMutation: mutation }));
+            const original = join(f.workingDirectory, 'original.txt'); await writeFile(original, 'original');
+            const auto = createWorkspaceTurnAdmission({ home: configuration.happyHomeDir,
+                sessionId: `automation-run:${randomUUID()}`, kind: 'automation', roots: [f.workingDirectory] });
+            await auto.tryAcquire();
+            const requests: Record<string, Record<string, unknown>> = {
+                writeFile: { path: join(f.workingDirectory, 'created.txt'), content: Buffer.from('new').toString('base64') },
+                writeWorkspaceFile: { workspaceRoot: f.workingDirectory, path: join(f.workingDirectory, 'created.txt'), content: Buffer.from('new').toString('base64') },
+                renameFile: { path: original, newName: 'renamed.txt' }, deleteFile: { path: original },
+                copyFile: { path: original, newName: 'copied.txt' }, ensureDirectory: { path: join(f.workingDirectory, 'created-dir') },
+            };
+            try {
+                const result = await f.handlers.get(method)!(requests[method]);
+                expect(result).toMatchObject({ success: false, error: expect.stringContaining('WORKSPACE_BUSY') });
+                expect(await readFile(original, 'utf8')).toBe('original');
+                expect(await readdir(f.workingDirectory)).toEqual(['original.txt']);
+            } finally { await auto.release(true); }
+            expect(await f.handlers.get(method)!(requests[method])).toHaveProperty('success', true);
+        });
+    it('keeps a refused write retryable and replays its original receipt without overwriting later automatic changes', async () => {
+        const f = await createHandlers(undefined, { withFilesystemMutation: mutation });
+        const path = join(f.workingDirectory, 'saved.txt');
+        const request = { path, content: Buffer.from('saved').toString('base64'), expectedHash: null, attemptId: 'same-write-attempt' };
+        const auto = createWorkspaceTurnAdmission({ home: configuration.happyHomeDir,
+            sessionId: `automation-run:${randomUUID()}`, kind: 'automation', roots: [f.workingDirectory] });
+        await auto.tryAcquire();
+        try { expect(await f.handlers.get('writeFile')!(request)).toMatchObject({ success: false, error: 'WORKSPACE_BUSY' }); }
+        finally { await auto.release(true); }
+        const first = await f.handlers.get('writeFile')!(request);
+        expect(first).toHaveProperty('success', true);
+        await auto.tryAcquire();
+        try {
+            await writeFile(path, 'later automatic change');
+            expect(await f.handlers.get('writeFile')!(request)).toEqual({ ...first, replayed: true });
+            expect(await readFile(path, 'utf8')).toBe('later automatic change');
+        } finally { await auto.release(true); }
+    });
+
 });

@@ -141,3 +141,27 @@ export function createWorkspaceTurnAdmission(input: {
     },
   };
 }
+
+/** Only for awaited filesystem operations that close their own handles, never child processes.
+ * Legacy file RPCs can follow aliases and carry no verified project identity, so their short
+ * mutation lease conservatively overlaps every automatic workspace on this daemon. */
+export function createFilesystemWriteAdmission(input: { home: string }) {
+  return async <T>(operation: () => Promise<T>): Promise<T> => {
+    const owner = createWorkspaceTurnAdmission({ home: input.home, sessionId: `file-rpc:${randomUUID()}`,
+      kind: 'manual-launch', roots: ['/'] });
+    const admitted = await owner.tryAcquire();
+    if (!admitted.acquired) {
+      const code = { 'workspace-busy': 'WORKSPACE_BUSY', 'workspace-owner-unconfirmed': 'WORKSPACE_OWNER_UNCONFIRMED',
+        'registry-busy': 'WORKSPACE_REGISTRY_BUSY' }[admitted.reason];
+      throw Object.assign(new Error(code), { code });
+    }
+    try { return await operation(); }
+    finally {
+      try {
+        if (!await owner.release(true)) throw new Error('Filesystem ownership receipt is absent');
+      } catch (cause) {
+        throw Object.assign(new Error('WORKSPACE_FILESYSTEM_RELEASE_UNCONFIRMED', { cause }), { code: 'WORKSPACE_FILESYSTEM_RELEASE_UNCONFIRMED' });
+      }
+    }
+  };
+}

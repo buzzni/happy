@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promis
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createWorkspaceTurnAdmission } from './workspaceTurnAdmission';
+import * as module from './workspaceTurnAdmission';
 
 const test = it.skipIf(process.platform === 'win32');
 let home: string, workspace: string;
@@ -114,4 +115,45 @@ test('cannot use a saved token to release another session identity', async () =>
     bootId: 'boot-A', ownerToken: owner.ownerToken });
   await expect(other.release(true)).rejects.toThrow('WORKSPACE_ADMISSION_IDENTITY_CONFLICT');
   expect((await admission('manual', 'manual').tryAcquire()).acquired).toBe(false);
+});
+
+const filesystemFactory = () => (module as typeof module & {
+  createFilesystemWriteAdmission(input: { home: string }): <T>(work: () => Promise<T>) => Promise<T>
+}).createFilesystemWriteAdmission({ home });
+
+test('rejects a filesystem writer without performing its effect while automatic ownership remains', async () => {
+  const auto = createWorkspaceTurnAdmission({ home, sessionId: 'automation-run:r1', kind: 'automation', roots: [workspace] });
+  await auto.tryAcquire(); let called = false;
+  await expect(filesystemFactory()(async () => { called = true; })).rejects.toThrow('WORKSPACE_BUSY');
+  expect(called).toBe(false);
+});
+
+test.each(['completed', 'failed'])('holds automation until the filesystem producer has %s and releases only that operation', async outcome => {
+  let entered!: () => void, finish!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const pending = new Promise<void>(resolve => { finish = resolve; });
+  const writer = filesystemFactory()(async () => { entered(); await pending; if (outcome === 'failed') throw new Error('synthetic filesystem failure'); return 42; });
+  const settled = writer.then(value => ({ value }), error => ({ error: String(error) }));
+  await started;
+  const auto = createWorkspaceTurnAdmission({ home, sessionId: 'automation-run:r1', kind: 'automation', roots: [workspace] });
+  try { expect((await auto.tryAcquire()).acquired).toBe(false); }
+  finally { finish(); await settled; }
+  expect(await settled).toEqual(outcome === 'failed' ? { error: 'Error: synthetic filesystem failure' } : { value: 42 });
+  expect((await auto.tryAcquire()).acquired).toBe(true);
+});
+
+test('distinguishes an unconfirmed old owner from a live busy workspace without executing the write', async () => {
+  const auto = createWorkspaceTurnAdmission({ home, sessionId: 'automation-run:r1', kind: 'automation', roots: [workspace] });
+  await auto.tryAcquire();
+  const file = join(home, 'workspace-turn-admission.v1', 'owners.json');
+  const value = JSON.parse(await readFile(file, 'utf8')); value.owners[0].pid = 2_147_483_647;
+  await writeFile(file, JSON.stringify(value)); let called = false;
+  await expect(filesystemFactory()(async () => { called = true; })).rejects.toMatchObject({ code: 'WORKSPACE_OWNER_UNCONFIRMED' });
+  expect(called).toBe(false);
+});
+
+test('reports an indeterminate mutation receipt when its filesystem ownership cannot be released', async () => {
+  await expect(filesystemFactory()(async () => {
+    await rm(join(home, 'workspace-turn-admission.v1', 'owners.json'));
+  })).rejects.toMatchObject({ code: 'WORKSPACE_FILESYSTEM_RELEASE_UNCONFIRMED' });
 });

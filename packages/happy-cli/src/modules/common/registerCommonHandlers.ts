@@ -561,6 +561,8 @@ export interface CommonHandlerOptions {
      * session's own handlers, `session` (default) for the machine scope (utils/childEnv).
      */
     childEnvBoundary?: ChildEnvBoundary;
+    /** Host-owned operation admission; never populated from RPC input. */
+    withFilesystemMutation?: <T>(operation: () => Promise<T>) => Promise<T>;
     machineRun?: {
         /** Host-owned immutable registry. Extension input must never populate this. */
         profileRegistry: TrustedMachineRunProfileRegistry;
@@ -583,6 +585,7 @@ export interface CommonHandlerOptions {
 
 export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, workingDirectory: string, options: CommonHandlerOptions = {}) {
     const downloadDirectories = createWorkspaceDownloadDirectoryReader();
+    const withFilesystemMutation = options.withFilesystemMutation ?? (async <T>(operation: () => Promise<T>) => operation());
     rpcHandlerManager.registerHandler('file-discovery', (request: unknown) => fileDiscovery(workingDirectory, request));
     const bashScheduler = createBashRpcScheduler();
     const bashEnvBoundary = options.childEnvBoundary ?? 'session';
@@ -834,10 +837,10 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             const buffer = Buffer.from(data.content, 'base64');
             const contentHash = sha256Hex(buffer);
             const expectedHash = data.expectedHash ?? null;
-            if (data.attemptId === undefined) return await withPathLock(path, () => writeFileWithHashGate(path, buffer, contentHash, expectedHash, false));
+            if (data.attemptId === undefined) return await withPathLock(path, () => withFilesystemMutation(() => writeFileWithHashGate(path, buffer, contentHash, expectedHash, false)));
 
             const attempt = writeFileAttempts.run(data.attemptId, { path, expectedHash, contentHash },
-                () => withPathLock(path, () => writeFileWithHashGate(path, buffer, contentHash, expectedHash, true)));
+                () => withPathLock(path, () => withFilesystemMutation(() => writeFileWithHashGate(path, buffer, contentHash, expectedHash, true))));
             if (attempt.kind === 'conflict') {
                 return { success: false, errorCode: 'ATTEMPT_CONFLICT', error: 'attemptId was already used for a different write' };
             }
@@ -905,7 +908,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         }
         try {
             const buffer = Buffer.from(data.content, 'base64');
-            await writeWorkspaceFile(workingDirectory, data.workspaceRoot, data.path, buffer);
+            await withFilesystemMutation(() => writeWorkspaceFile(workingDirectory, data.workspaceRoot, data.path, buffer));
             return { success: true, hash: createHash('sha256').update(buffer).digest('hex') };
         } catch (error) {
             return {
@@ -1019,7 +1022,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             }
 
             // Perform rename
-            await rename(validation.resolvedPath!, newValidation.resolvedPath!);
+            await withFilesystemMutation(() => rename(validation.resolvedPath!, newValidation.resolvedPath!));
             return { success: true, path: newValidation.resolvedPath };
         } catch (error) {
             logger.debug('Failed to rename:', error);
@@ -1045,7 +1048,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             }
 
             // Perform deletion
-            await rm(validation.resolvedPath!, { recursive: true, force: false });
+            await withFilesystemMutation(() => rm(validation.resolvedPath!, { recursive: true, force: false }));
             return { success: true };
         } catch (error) {
             logger.debug('Failed to delete:', error);
@@ -1150,7 +1153,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             // false (force defaults to true and would silently overwrite), so
             // both are needed to close the gap between the stat check above
             // and the copy itself.
-            await cp(validation.resolvedPath!, targetPath, { recursive: true, force: false, errorOnExist: true });
+            await withFilesystemMutation(() => cp(validation.resolvedPath!, targetPath, { recursive: true, force: false, errorOnExist: true }));
             return { success: true, path: targetPath, name: targetName };
         } catch (error) {
             logger.debug('Failed to copy:', error);
@@ -1165,8 +1168,12 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
     // specs/project-workspace-auto-create/).
     rpcHandlerManager.registerHandler<EnsureDirectoryRequest, EnsureDirectoryResponse>('ensureDirectory', async (data) => {
         logger.debug('Ensure directory request:', data.path);
-        const result = await ensureDirectory(data.path, workingDirectory);
-        return { success: result.success, error: result.error };
+        try {
+            const result = await withFilesystemMutation(() => ensureDirectory(data.path, workingDirectory));
+            return { success: result.success, error: result.error };
+        } catch (error) {
+            return { success: false, error: error instanceof Error ? error.message : 'Directory admission unconfirmed' };
+        }
     });
 
     // Get directory tree handler - recursive with depth control
