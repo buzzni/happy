@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
-import { automationExecutionSessionId, isAutomationExecutionSessionId,
+import { automationExecutionSessionId, automationExecutionSeedLocalId, isAutomationExecutionSessionId,
   SessionExecutionCreateBodySchema, sessionCreateBodyHash } from '@slopus/happy-wire';
 import { verifyAutomationExecutionTarget, type AutomationExecutionTarget } from '@slopus/happy-wire/automationExecutionToken';
 import { db } from '@/storage/db';
@@ -55,6 +55,13 @@ export async function recordAutomationExecutionExit(accountId: string, raw: unkn
       const stored = await tx.automationRun.findFirst({ where, select: { executionExitReceipt: true } });
       return reconcile(stored?.executionExitReceipt);
     }
+    // The owned root has closed after draining native and storage writers. Keep the immutable
+    // question and opaque final-answer/turn evidence; transient tool detail has no display/input role.
+    // Legacy/manual rows and executions without a positive owned receipt are never pruned here.
+    await tx.sessionMessage.deleteMany({ where: { sessionId, OR: [
+      { localId: null }, { NOT: { OR: [{ localId: automationExecutionSeedLocalId(input.runId) },
+        { localId: { startsWith: `automation-evidence:${input.runId}:` } }] } },
+    ] } });
     return { runId: input.runId, sessionId, receipt };
   });
 }

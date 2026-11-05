@@ -116,6 +116,32 @@ it('records a private owned exit after dispatch completion and reconciles a lost
   } finally { await app.close(); }
 });
 
+it.each([true, false])('retains authored result evidence and prunes internal detail only after a positive owned exit (%s)', async positive => {
+  await register();
+  const sessionId = 'automation-run:r1';
+  const keep = ['automation-seed:r1', 'automation-evidence:r1:start', 'automation-evidence:r1:answer', 'automation-evidence:r1:end'];
+  const { automationExecutionSeedLocalId } = await import('@slopus/happy-wire');
+  keep[0] = automationExecutionSeedLocalId('r1');
+  await client.sessionMessage.createMany({ data: [...keep, 'tool-call', null].map((localId, index) => ({
+    sessionId, localId, seq: index + 1, content: { t: 'encrypted', c: `original-ciphertext-${index}` },
+  })) });
+  await client.session.update({ where: { id: sessionId }, data: { seq: 6 } });
+  const before = await client.session.findUniqueOrThrow({ where: { id: sessionId } });
+  const app = await api(), payload = await exitRequest();
+  if (!positive) payload.receipt.writeProducersDrained = false;
+  try {
+    const response = await app.inject({ method: 'POST', url: '/v1/automation-runs/r1/execution-exit',
+      headers: { authorization: `Bearer ${bearer}` }, payload });
+    expect(response.statusCode).toBe(positive ? 200 : 400);
+    const messages = await client.sessionMessage.findMany({ where: { sessionId }, orderBy: { seq: 'asc' } });
+    expect(messages.map(message => message.localId)).toEqual(positive ? keep : [...keep, 'tool-call', null]);
+    expect(messages.map(message => message.content)).toEqual(messages.map((_, index) => ({ t: 'encrypted', c: `original-ciphertext-${index}` })));
+    expect(await client.session.findUniqueOrThrow({ where: { id: sessionId } })).toEqual(before);
+    expect(await client.sessionMessage.findMany({ where: { sessionId: 'manual' }, select: { localId: true } }))
+      .toEqual([{ localId: 'manual-pending' }]);
+  } finally { await app.close(); }
+});
+
 it('rejects conflicting owned exit evidence instead of overwriting the first receipt', async () => {
   await register(); const app = await api(), payload = await exitRequest();
   try {
