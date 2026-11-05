@@ -107,6 +107,7 @@ export function startDaemonControlServer({
   portRegistry,
   browserBridge,
   allowedRoot = homedir(),
+  approvedRoots,
   getMachineEncryption = () => null,
   managedRuntime = false,
   verifyManagedReport,
@@ -114,6 +115,7 @@ export function startDaemonControlServer({
   restartDrain,
   writeScopeRuntime,
   browserLocalSetup,
+  desktopBrowserLogin,
   getDeviceEnrollment = () => null,
   getSetupTokenAccountSwitch = () => null,
   getCallerLaunches = () => null,
@@ -128,6 +130,7 @@ export function startDaemonControlServer({
   /** aplus codexcli-daemon-restart-drain — absent on preflight and in tests that do not drain. */
   restartDrain?: RestartDrainControlPort;
   browserLocalSetup?: BrowserLocalSetup;
+  desktopBrowserLogin?: { status(): unknown; attach(input: unknown): Promise<void> };
   getChildren: () => TrackedSession[];
   stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
   spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
@@ -153,6 +156,8 @@ export function startDaemonControlServer({
    *  Defaults to homedir; only real callers that actually offer `/terminal`
    *  local-direct need to pass the caller's actual value. */
   allowedRoot?: string;
+  /** aplus-dev-studio specs/approved-folder-roots — folders outside allowedRoot the machine owner approved. */
+  approvedRoots?: () => readonly string[];
   /** Null until the daemon's machine registration resolves (it starts after
    *  this server does) — `/terminal` fails closed with a clean error until
    *  set. Defaults to an always-null getter (no local-direct support) so
@@ -302,6 +307,7 @@ export function startDaemonControlServer({
       path: '/terminal',
       controlSecret,
       allowedRoot,
+      approvedRoots,
       getMachineEncryption,
     });
 
@@ -1059,7 +1065,7 @@ export function startDaemonControlServer({
           if (e instanceof BridgeRequestError) {
             logger.debug(`[CONTROL SERVER] browser/request ${method} failed: ${e.code} ${e.message}`);
             reply.code(
-              e.code === 'NO_EXTENSION_CONNECTED' || e.code === 'BRIDGE_PORT_IN_USE' ? 503 :
+              e.code === 'NO_EXTENSION_CONNECTED' || e.code === 'BRIDGE_PORT_IN_USE' || e.code === 'VIEWER_NOT_CONNECTED' ? 503 :
               e.code === 'TIMEOUT' ? 504 :
               502
             );
@@ -1070,6 +1076,13 @@ export function startDaemonControlServer({
       });
     }
 
+    if (desktopBrowserLogin && !managedRuntime && !standaloneDrain) {
+      typed.post('/browser/desktop-login/capability', { schema: { body: z.object({}).strict() } }, async () => desktopBrowserLogin.status());
+      typed.post('/browser/desktop-login/attach', async (request, reply) => {
+        try { await desktopBrowserLogin.attach(request.body); return { protocol: 1, attached: true }; }
+        catch { return reply.code(403).send({ error: 'DESKTOP_BROWSER_LOGIN_REQUIRED' }); }
+      });
+    }
     attachLocalToolAgentRelayRoutes(app);
     if (browserLocalSetup && browserBridge) attachBrowserLocalSetupRoutes(app, browserLocalSetup, browserBridge);
     attachStandaloneDrain(app, managedRuntime ? undefined : standaloneDrain, requestShutdown);

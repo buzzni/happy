@@ -159,6 +159,10 @@ export function v3SessionRoutes(app: Fastify) {
         const contentByLocalId = new Map(uniqueMessages.map((message) => [message.localId, message.content]));
 
         const txResult = await db.$transaction(async (tx) => {
+            // Serialize before reading localIds: a concurrent retry must see the
+            // first writer's committed rows before allocating its own sequence.
+            const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT "id" FROM "Session" WHERE "id" = ${sessionId} AND "accountId" = ${userId} FOR UPDATE`;
+            if (!locked.length) return null;
             const localIds = uniqueMessages.map((message) => message.localId);
             const existing = await tx.sessionMessage.findMany({
                 where: {
@@ -219,6 +223,8 @@ export function v3SessionRoutes(app: Fastify) {
             // 10s `inTx` budget used by the server's other write transactions.
             timeout: 10000
         });
+
+        if (!txResult) return reply.code(404).send({ error: 'Session not found' });
 
         // Announce outside the transaction, and take the whole block of update
         // seqs in one `Account.seq` increment: every writer for this account

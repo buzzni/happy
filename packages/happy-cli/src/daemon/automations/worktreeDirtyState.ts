@@ -80,6 +80,8 @@ export function describeUnsavedWorktreeChanges(porcelainStatus: string): string[
 }
 
 function unsavedEntries(porcelainStatus: string): string[] {
+  // A lockfile-only change can be an intentional resolution update even when
+  // package.json is unchanged. Preserve it unless its generated content is known.
   return porcelainStatus
     .split('\n')
     .map((line) => line.replace(/\r$/, ''))

@@ -8,7 +8,7 @@ it('bounds the SQL read, restricts accepted project access and continues by time
     const first = await listAutomationPage(tx, 'actor', { projectIds: ['chat:c'], limit: 2, cursor: null });
     expect(first.automations.map(row => row.id)).toEqual(['b', 'a']);
     expect(findMany.mock.calls[0][0]).toMatchObject({ take: 3, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], where: {
-        deletedAt: null, payloadVersion: { not: 3 }, projectId: { in: ['chat:c'] },
+        deletedAt: null, payloadVersion: { notIn: [3, 5] }, projectId: { in: ['chat:c'] },
         project: { OR: [{ accountId: 'actor' }, { members: { some: { accountId: 'actor', status: 'accepted' } } }] },
     } });
     const last = await listAutomationPage(tx, 'actor', { projectIds: ['chat:c'], limit: 2, cursor: first.nextCursor });
@@ -25,7 +25,7 @@ it('includes project AI and Chat/project scripts only when the reservation exten
     const input = { projectIds: ['chat:c', 'project-p'], limit: 20, cursor: null, reservationExtensions: true };
     await listAutomationPage({ automation: { findMany } } as unknown as Prisma.TransactionClient, 'actor', input);
     expect(findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 21, where: {
-        projectId: { in: ['chat:c', 'project-p'] }, deletedAt: null,
+        projectId: { in: ['chat:c', 'project-p'] }, deletedAt: null, payloadVersion: { not: 5 },
         AND: [{ OR: [{ projectId: { not: { startsWith: 'chat:' } } }, { payloadVersion: 3 }] }],
         project: { OR: [{ accountId: 'actor' }, { members: { some: { accountId: 'actor', status: 'accepted' } } }] },
     }, include: expect.objectContaining({ scriptRevisions: { orderBy: { revision: 'desc' }, take: 1 }, targetMachine: true, project: true }) }));

@@ -49,6 +49,14 @@ jobs:
     - name: Build package
       run: pnpm --filter @buzzni/happy-cli build
 
+    - name: Verify Desktop login scope, app loss and idle reconnect
+      timeout-minutes: 5
+      run: >-
+        pnpm --filter @buzzni/happy-cli exec vitest run --project unit
+        src/browserRuntime/desktopBrowserLogin.test.ts
+        src/daemon/personalBrowserRuntime.test.ts
+        src/daemon/browserSessionReconnect.test.ts
+
     - name: Verify personal Claude authentication with the real SDK
       if: matrix.node-version == 24
       timeout-minutes: 5
@@ -187,6 +195,14 @@ jobs:
 
     - name: Build package
       run: pnpm --filter @buzzni/happy-cli build
+
+    - name: Verify Desktop login scope, app loss and idle reconnect
+      timeout-minutes: 5
+      run: >-
+        pnpm --filter @buzzni/happy-cli exec vitest run --project unit
+        src/browserRuntime/desktopBrowserLogin.test.ts
+        src/daemon/personalBrowserRuntime.test.ts
+        src/daemon/browserSessionReconnect.test.ts
 
     - name: Pack package
       run: |

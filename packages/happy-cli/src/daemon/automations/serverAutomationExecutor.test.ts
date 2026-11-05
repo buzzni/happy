@@ -4983,6 +4983,20 @@ describe('scheduled run waiting gate', () => {
     fixture.input.resolveMcpSpawnContext = async () => ({ ok: true, value: { mcpCallerGrant: 'grant', mcpConfigProjectId: 'chat:c', bindingStatus: 'BOUND', connectorPolicy: 'optional', requiredConnectors: [] } })
   }
 
+  it.each([false, true])('preserves the live previous worker through an edit or resume (waiting=%s)', async waiting => {
+    const f = setup({ generation: 3, ...claimed })
+    withLastSession(f, 'session-old')
+    f.input.isSessionRunning = () => true
+    f.input.isSessionWaitingForUser = () => waiting
+    const cache = f.input.cache.read()
+    f.input.cache.read = () => ({ ...cache, automations: [{ ...cacheRecord(3), runRequestedAt: f.now }] })
+    await runServerAutomationTick(f.input)
+    expect(f.store.state().schedules[0]).toMatchObject({ generation: 3, lastSessionId: 'session-old' })
+    expect(f.spawnSession).not.toHaveBeenCalled()
+    if (waiting) expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'SKIPPED_GATE', sessionId: 'session-old' }))
+    else expect(f.transport.claim).not.toHaveBeenCalled()
+  })
+
   it('reports a skipped run naming the waiting previous conversation instead of holding it as an overlap', async () => {
     const f = setup(claimed)
     withLastSession(f, 'session-old')

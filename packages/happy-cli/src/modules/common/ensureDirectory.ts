@@ -28,8 +28,9 @@ export interface EnsureDirectoryResult {
 export async function ensureDirectory(
     targetPath: string,
     workingDirectory: string,
+    approvedRoots?: readonly string[],
 ): Promise<EnsureDirectoryResult> {
-    const validation = validatePath(targetPath, workingDirectory);
+    const validation = validatePath(targetPath, workingDirectory, approvedRoots);
     if (!validation.valid) {
         return { success: false, error: validation.error };
     }

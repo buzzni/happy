@@ -10,6 +10,8 @@ import type { SessionOwner } from './sessionRegistration'
 export interface SessionLineage { parentSessionIds?: string[]; conversationIds?: string[] }
 
 export interface Registration {
+    /** Desktop login epoch that owns this registration; no credential is persisted. */
+    desktopLoginId?: string
     secretSha256: string
     owner?: SessionOwner
     /** Host boot id reported by the daemon at registration (the Runtime's own view may differ in a container). */

@@ -101,6 +101,19 @@ describe('next_steps tool', () => {
         } finally { server.stop(); }
     });
 
+    // Saycode Desktop PR #2989: "say it now in a short closing message" read as a cue to write the answer again.
+    it('tells the model not to restate its answer after a card with no question', async () => {
+        const client = fakeClient();
+        const server = await startHappyServer(client, { turnCards: drawnTurn('claude') });
+        try {
+            const reply = await callTool(server, 'next_steps', { summary: 'The report is written above.', actions: [] });
+            const text = reply.result.content[0].text as string;
+            expect(text).toMatch(/^Shown/);
+            expect(text).toContain('Do not repeat your answer or the recap');
+            expect(text).not.toContain('say it now in a short closing message');
+        } finally { server.stop(); }
+    });
+
     it('refuses on a runner whose client does not draw the card (ACP)', async () => {
         const client = fakeClient();
         const server = await startHappyServer(client);

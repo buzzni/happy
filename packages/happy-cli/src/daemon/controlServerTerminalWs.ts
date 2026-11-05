@@ -148,6 +148,8 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
   path: string;
   controlSecret: string;
   allowedRoot: string;
+  /** aplus-dev-studio specs/approved-folder-roots — folders outside allowedRoot the machine owner approved. */
+  approvedRoots?: () => readonly string[];
   /** Null until the daemon's machine registration resolves — a connection
    *  attempted in that (brief, boot-time-only) window gets a clean error
    *  instead of crashing. */
@@ -326,7 +328,7 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
           homedir: homedir(),
           fsExists: existsSync,
           fsMkdir: (p) => mkdirSync(p, { recursive: true }),
-          validate: validatePath,
+          validate: (path, root) => validatePath(path, root, opts.approvedRoots?.()),
         });
 
         let pty: PtySession;

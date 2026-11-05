@@ -139,6 +139,12 @@ describe('sanitizeChildEnv', () => {
         expect(sanitizeChildEnv(env, { boundary: 'in-session' })).toEqual({ PATH: '/usr/bin' })
     })
 
+    it('drops the browser task unavailable reason at every boundary, like the secret it stands in for', () => {
+        const env = { HAPPY_BROWSER_TASK_UNAVAILABLE_REASON: 'NATIVE_DEVICE_APPROVAL_REQUIRED', PATH: '/usr/bin' }
+        expect(sanitizeChildEnv(env)).toEqual({ PATH: '/usr/bin' })
+        expect(sanitizeChildEnv(env, { boundary: 'in-session' })).toEqual({ PATH: '/usr/bin' })
+    })
+
     it('keeps what child runtimes need to run', () => {
         const required = {
             HOME: '/Users/u', PATH: '/usr/bin', SHELL: '/bin/zsh', TMPDIR: '/tmp/x', LANG: 'ko_KR.UTF-8',

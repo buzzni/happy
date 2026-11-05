@@ -94,6 +94,17 @@ describe('runBrowserTool', () => {
         expect(textOf(result)).toContain('browser-bridge.token')
     })
 
+    it('sends the user to the account connection, not the token, when Chrome is paired only with the machine token', async () => {
+        const result = await runBrowserTool({
+            request: fails('VIEWER_NOT_CONNECTED', 'Chrome is connected to this bridge, but not for this account'),
+            method: 'tabs_list',
+            params: {},
+        })
+        expect(result.isError).toBe(true)
+        expect(textOf(result)).toContain('연결')
+        expect(textOf(result)).not.toContain('browser-bridge.token')
+    })
+
     it('does not ask for pairing when another process holds the bridge port', async () => {
         const result = await runBrowserTool({
             request: fails('BRIDGE_PORT_IN_USE', 'another process holds browser bridge port 41777'),

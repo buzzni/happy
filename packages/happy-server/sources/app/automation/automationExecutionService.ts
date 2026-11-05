@@ -103,12 +103,14 @@ export async function syncAutomations(
         take: input.limit,
     });
     const changes: Array<Record<string, unknown>> = [];
+    // Only codecs the daemon advertises (v1 always). Legacy monitor v2, retired native v5 and unknown versions
+    // are tombstoned: an UPSERT the daemon cache rejects would stall that machine's sync cursor.
+    const supportsPayload = (version: number) => version === 1 || ((version === 2 || version === 4) && !!input.payloadVersions?.includes(version));
     for (const change of rows) {
         if (change.kind === 'TOMBSTONE') {
             const deleted = await tx.automation.findFirst({ where: { id: change.automationId, machineAccountId: accountId, machineId }, include: { project: true } });
-            const cancelled = deleted?.projectId.startsWith('chat:') && deleted.deletedAt && deleted.payloadVersion !== 3
-                && (deleted.project?.config as { chatAutomationState?: unknown } | null)?.chatAutomationState === 'deleted'
-                && (deleted.payloadVersion === 1 || input.payloadVersions?.includes(deleted.payloadVersion));
+            const cancelled = deleted?.projectId.startsWith('chat:') && deleted.deletedAt && supportsPayload(deleted.payloadVersion)
+                && (deleted.project?.config as { chatAutomationState?: unknown } | null)?.chatAutomationState === 'deleted';
             changes.push({ seq: change.seq, automationId: change.automationId, revision: change.revision, generation: change.generation, kind: 'TOMBSTONE',
                 ...(cancelled && deleted ? { chatDeleted: true, payloadVersion: deleted.payloadVersion, payloadCiphertext: deleted.payloadCiphertext, machineKeyEnvelope: deleted.machineKeyEnvelope, machineKeyVersion: deleted.machineKeyVersion, paused: true, enabledAt: deleted.enabledAt } : {}),
             });
@@ -123,7 +125,7 @@ export async function syncAutomations(
                 revision: { gte: change.revision },
             },
         });
-        if (!automation || automation.payloadVersion === 3 || (automation.payloadVersion === 4 && !input.payloadVersions?.includes(4))) {
+        if (!automation || !supportsPayload(automation.payloadVersion)) {
             changes.push({ seq: change.seq, automationId: change.automationId, revision: change.revision, generation: change.generation, kind: 'TOMBSTONE' });
             continue;
         }
@@ -200,7 +202,7 @@ export async function ackAutomationSync(
 
 function executable(automation: any, accountId: string, machineId: string, generation: number): boolean {
     return automation
-        && automation.payloadVersion !== 3
+        && [1, 2, 4].includes(automation.payloadVersion)
         && automation.machineAccountId === accountId
         && automation.machineId === machineId
         && automation.generation === generation

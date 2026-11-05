@@ -1,7 +1,7 @@
 import { generateKeyPairSync } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import { BrowserRuntimeError, INTERACTIVE_CAPABILITY_ISSUER, type AgentGrant, type GrantId, type MachineId, type PrincipalId, type ProfileId, type WorkspaceId } from './contracts'
-import { mintAgentGrant, mintInteractiveCapability, signServerCapability, signSessionUserAttestation, verifySessionUserAttestation, verifyToken, type ServerCapability, type SessionUserAttestation, type VerifyPolicy } from './auth'
+import { assertOperation, mintAgentGrant, mintInteractiveCapability, signServerCapability, signSessionUserAttestation, verifySessionUserAttestation, verifyToken, type ServerCapability, type SessionUserAttestation, type VerifyPolicy } from './auth'
 
 const keys = { agentKey: 'synthetic-agent-key', interactiveKey: 'synthetic-ui-key' }
 const grant = (operations: AgentGrant['operations'] = ['getTask']): AgentGrant => ({
@@ -199,5 +199,27 @@ describe('session-user attestation (shared machines)', () => {
         rejects(sign(claims({ issuedAtMs: now + 31_000, expiresAtMs: now + 60_000 })))
         rejects(sign(claims({ principalId: '' as PrincipalId })))
         rejects('abp1.x.y')
+    })
+})
+
+
+describe('page-view capability narrowing', () => {
+    const cap = (extra: Record<string, unknown> = {}) => ({ kind: 'interactive', capabilityId: 'view-cap',
+        principalId: 'p1', workspaceId: 'w1', machineId: 'm1', profileId: 'profile1', viewerSessionId: 'v1',
+        operations: ['getTask', 'takeOver'], issuedAtMs: 10, expiresAtMs: 1000,
+        pageViewScope: { schemaVersion: 1, agentSessionId: 'a1', runtimeBindingId: 'binding' }, ...extra }) as never
+    it('restricts existing task operations to the signed session', () => {
+        const auth = verifyToken(mintInteractiveCapability(cap(), keys, 20), keys, 20)
+        expect(() => assertOperation(auth, 'getTask', { agentSessionId: 'a2' })).toThrow(/session/i)
+        expect(() => assertOperation(auth, 'takeOver', { agentSessionId: 'a1' })).not.toThrow()
+    })
+    it('refuses VNC and profile management with a narrowed capability', () => {
+        for (const operation of ['viewerTicket', 'listSpaces', 'closeSpace', 'setSpaceQuota'])
+            expect(() => mintInteractiveCapability(cap({ operations: [operation] }), keys, 20)).toThrow(/scope/i)
+    })
+    it('requires signed scope for view operations and keeps bootstrap info-only', () => {
+        expect(() => mintInteractiveCapability(cap({ operations: ['openPageView'], pageViewScope: undefined }), keys, 20)).toThrow()
+        expect(() => mintInteractiveCapability(cap({ operations: ['pageViewInfo'], pageViewScope: undefined }), keys, 20)).not.toThrow()
+        expect(() => mintAgentGrant(grant(['pageViewInfo' as never]), keys, 20)).toThrow()
     })
 })

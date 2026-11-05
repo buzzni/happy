@@ -74,6 +74,17 @@ describe('automationSocketHandler', () => {
         }) });
     });
 
+    it('keeps legacy sync available to a withdrawn .383 client advertising the retired codec', async () => {
+        const handlers = new Map<string, Function>();
+        const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
+        services.syncAutomations.mockResolvedValue({ ok: true, value: { serverTime: new Date(10), nextSeq: 0n, changes: [] } });
+        automationSocketHandler('account-1', 'machine-1', socket as never);
+        const callback = vi.fn();
+        await handlers.get('automation-sync')!({ afterSeq: '0', limit: 100, payloadVersions: [1, 4, 5] }, callback);
+        expect(callback).toHaveBeenCalledWith(expect.objectContaining({ ok: true }));
+        expect(services.syncAutomations).toHaveBeenCalledWith({}, 'account-1', 'machine-1', { afterSeq: 0n, limit: 100, payloadVersions: [1, 4, 5] });
+    });
+
     it('registers run-now protocol support and treats an older daemon as version 1', async () => {
         const handlers = new Map<string, Function>();
         const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
@@ -98,6 +109,17 @@ describe('automationSocketHandler', () => {
         expect(services.emitProjectAutomationUpdate).toHaveBeenCalledWith(
             'project-1', { projectId: 'project-1', reason: 'sync' }, 'account-1',
         );
+    });
+
+    it('accepts a pending historical NO_CHANGE report without restoring v5 execution', async () => {
+        const handlers = new Map<string, Function>();
+        const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
+        services.reportAutomationRun.mockResolvedValue({ ok: true, value: { idempotent: true, projectId: 'project-1' } });
+        automationSocketHandler('account-1', 'machine-1', socket as never);
+        const callback = vi.fn();
+        await handlers.get('automation-run-report')!({ runId: 'old', claimToken: 'claim', reportId: 'report', status: 'COMPLETED', outcome: 'NO_CHANGE', sessionId: null, detailCiphertext: null }, callback);
+        expect(callback).toHaveBeenCalledWith(expect.objectContaining({ ok: true }));
+        expect(services.reportAutomationRun).toHaveBeenCalledWith({}, 'account-1', 'machine-1', expect.objectContaining({ outcome: 'NO_CHANGE' }));
     });
 
     it('accepts a safe automation failure code and rejects unstructured values', async () => {

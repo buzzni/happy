@@ -367,3 +367,11 @@ published extension bytes into Desktop. Desktop promotion must compare its
 bundled checksum with the actual GitHub release asset; local candidate archives
 are insufficient proof of publication. A Desktop runtime pin and registry lock
 must be updated only after the CLI release has passed registry verification.
+
+## Withdrawn reservation runtime .383
+
+CLI `1.1.10-aplus.383` is withdrawn while cross-run context isolation is reconsidered. npm `latest` was restored to `.382` and `.383` marked deprecated by approved Actions run `41730508018`. Published versions/tags remain immutable; a subsequent release must use an unused version above `.383`.
+
+The rollback removes native v5 execution. It preserves the independently required Prisma 6/PGlite adapter pin, historical `NO_CHANGE` decoding/reporting, and the already published additive migration/models as inert persistence. Do not delete or rewrite that migration, discard encrypted v5 caches, or run a database down migration as a code rollback. The daemon quarantines validated v5 cache entries with an owner-only exact encrypted backup and restarts sync from zero; unsupported definitions cannot sync, claim or run. A withdrawn .383 daemon may still advertise [1,4,5]; the handshake accepts that old advertisement so its v1/v4 work keeps syncing. A v5 definition is tombstoned when it is synced again (a resync from zero or its next change); one already in that daemon's cache is refused at claim, so it never runs. Existing Chat reservations retain v4 and legacy automations retain per-run workers.
+
+This source rollback does not downgrade already installed CLIs, drain an existing v5 native run, or authorize an operational deployment. Check active native leases/journals and require verified cleanup before any separately authorized deployment to a service that ran v5. No real provider/GitHub run or operating data migration was performed for this rollback.

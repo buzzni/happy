@@ -119,4 +119,8 @@ describe('next-steps card guidance', () => {
     expect(build({})).not.toContain('next_steps');
     expect(build({ saycodePromptBlocks: { nextSteps: true }, saycodeSystemPromptEnabled: false })).toBe('USER');
   });
+
+  it('keeps the answer above the card from being written again after it', () => {
+    expect(build({ saycodePromptBlocks: { nextSteps: true } })).toContain('After the card is shown, do not write your answer again');
+  });
 });

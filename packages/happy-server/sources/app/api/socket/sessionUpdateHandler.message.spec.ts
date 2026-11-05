@@ -4,23 +4,28 @@ const mocks = vi.hoisted(() => ({
     sessionFindUnique: vi.fn(),
     messageFindFirst: vi.fn(),
     messageCreate: vi.fn(),
+    lockSession: vi.fn(),
+    transactionOptions: vi.fn(),
     allocateUserSeq: vi.fn(),
     allocateSessionSeq: vi.fn(),
     emitUpdate: vi.fn(),
     log: vi.fn(),
+    tx: {} as Record<string, unknown>,
 }));
+mocks.tx = { $queryRaw: mocks.lockSession, sessionMessage: { findFirst: mocks.messageFindFirst, create: mocks.messageCreate } };
 
 vi.mock('@/utils/log', () => ({ log: mocks.log }));
 
 vi.mock('@/storage/db', () => ({
     db: {
+        $transaction: async (fn: Function, options?: unknown) => { mocks.transactionOptions(options); return fn(mocks.tx); },
         session: { findUnique: mocks.sessionFindUnique },
         sessionMessage: { findFirst: mocks.messageFindFirst, create: mocks.messageCreate },
     },
 }));
 vi.mock('@/storage/seq', () => ({
     allocateUserSeq: mocks.allocateUserSeq,
-    allocateSessionSeq: mocks.allocateSessionSeq,
+    allocateSessionSeqBatch: mocks.allocateSessionSeq,
 }));
 vi.mock('@/app/presence/sessionCache', () => ({
     activityCache: { isSessionValid: vi.fn(), queueSessionUpdate: vi.fn() },
@@ -56,7 +61,8 @@ describe('socket message persistence', () => {
         mocks.sessionFindUnique.mockResolvedValue({ id: 'session-1', accountId: 'user-1' });
         mocks.messageFindFirst.mockResolvedValue(null);
         mocks.allocateUserSeq.mockResolvedValue(5);
-        mocks.allocateSessionSeq.mockResolvedValue(9);
+        mocks.allocateSessionSeq.mockResolvedValue([9]);
+        mocks.lockSession.mockResolvedValue([{ id: 'session-1' }]);
         mocks.messageCreate.mockImplementation(async (args: any) => ({ id: 'msg-1', ...args.data }));
     });
 
@@ -79,6 +85,34 @@ describe('socket message persistence', () => {
         });
         expect(mocks.emitUpdate).toHaveBeenCalledTimes(1);
         expect(mocks.emitUpdate.mock.calls[0][0].payload.seq).toBe(5);
+    });
+
+    it('locks the session row and rechecks the localId before allocating the seq it inserts in the same transaction', async () => {
+        // REST batches take the same row lock. Allocating outside it would let a
+        // concurrent REST write commit a higher seq and a reader advance past ours.
+        const order: string[] = [];
+        mocks.lockSession.mockImplementation(async () => { order.push('lock'); return [{ id: 'session-1' }]; });
+        mocks.messageFindFirst.mockImplementation(async () => { order.push('dedup'); return null; });
+        mocks.allocateSessionSeq.mockImplementation(async () => { order.push('seq'); return [9]; });
+        mocks.messageCreate.mockImplementation(async (args: any) => { order.push('insert'); return { id: 'msg-1', ...args.data }; });
+
+        await messageHandler()({ sid: 'session-1', message: 'ciphertext', localId: 'local-1' });
+
+        expect(order).toEqual(['dedup', 'lock', 'dedup', 'seq', 'insert']);
+        expect(mocks.allocateSessionSeq).toHaveBeenCalledWith('session-1', 1, mocks.tx);
+        // Waiting behind a REST batch on the same lock must not hit Prisma's 5s default first.
+        expect(mocks.transactionOptions).toHaveBeenCalledWith({ timeout: 10000 });
+    });
+
+    it('drops a retry that a concurrent writer committed while this one waited for the lock', async () => {
+        mocks.messageFindFirst.mockResolvedValueOnce(null).mockResolvedValueOnce({ id: 'msg-concurrent', seq: 4 });
+
+        await messageHandler()({ sid: 'session-1', message: 'ciphertext', localId: 'local-1' });
+
+        expect(mocks.allocateSessionSeq).not.toHaveBeenCalled();
+        expect(mocks.messageCreate).not.toHaveBeenCalled();
+        expect(mocks.allocateUserSeq).not.toHaveBeenCalled();
+        expect(mocks.emitUpdate).not.toHaveBeenCalled();
     });
 
     it('burns no seq when the localId was already persisted', async () => {

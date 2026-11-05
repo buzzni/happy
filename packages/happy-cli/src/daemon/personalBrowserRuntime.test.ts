@@ -1,9 +1,13 @@
+import { mkdtemp, rm } from 'node:fs/promises'
+import { createServer } from 'node:http'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import { describe, expect, it, vi } from 'vitest'
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { personalRuntimePaths } from '@/browserRuntime/personalDesktopRuntime'
-import { readPersonalBrowserRuntime, watchPersonalBrowserRuntime } from './personalBrowserRuntime'
+import { forgetInheritedPersonalBrowserEnv, readPersonalBrowserRuntime, watchPersonalBrowserRuntime } from './personalBrowserRuntime'
 
 const issuer = generateKeyPairSync('ed25519')
 const publicKeyPem = issuer.publicKey.export({ type: 'spki', format: 'pem' }).toString()
@@ -29,6 +33,36 @@ const base = (overrides: Record<string, unknown> = {}) => ({ platform: 'darwin' 
     token: () => 'user-token', log: vi.fn(), readConfig: (path: string) => { expect(path).toBe(paths.configFile); return config() }, ...overrides })
 
 describe('personal browser runtime (daemon side)', () => {
+    it('uses only Desktop signatures and fd3, never a daemon bearer or device fallback', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'pbr-login-'))
+        const descriptor = { protocol: 1, machineId: 'machine-1', workspaceId: 'personal:user-1', principalId: 'user-1', profileId: 'profile-1',
+            socketPath: process.platform === 'win32' ? '\\\\.\\pipe\\saycode-browser-login-' + createHash('sha256').update(randomUUID()).digest('hex') : join(root, 'issuer.sock'), secret: 's'.repeat(43), loginId: 'l'.repeat(43) }
+        let permitted = true
+        const server = createServer((req, res) => {
+            expect(req.headers['x-saycode-browser-login']).toBe(descriptor.secret)
+            const expiresAtMs = Date.now() + 60000
+            res.writeHead(permitted ? 200 : 403); res.end(JSON.stringify({ token: signedCommand(expiresAtMs), expiresAtMs }))
+        })
+        await new Promise<void>(r => server.listen(descriptor.socketPath, r))
+        const fetchImpl = vi.fn(), deviceProof = vi.fn(), token = vi.fn(() => { throw Error('org bearer must not be used') })
+        const child = Object.assign(fakeChild(), { stdio: [null, null, null, new PassThrough()] })
+        let pipe = ''; child.stdio[3]!.on('data', chunk => { pipe += chunk })
+        const spawnImpl = vi.fn((..._args: Parameters<typeof import('node:child_process').spawn>) => child)
+        const runtime = readPersonalBrowserRuntime(base({ desktopLogin: () => descriptor, token, fetchImpl, deviceProof, spawnImpl }))!
+        try {
+            await runtime.native.issue({ generation: 'g', method: 'GET', path: '/v1/sessions', body: '' })
+            permitted = false
+            await expect(runtime.native.issue({ generation: 'g', method: 'GET', path: '/v1/sessions', body: '' })).rejects.toThrow('LOGIN_REQUIRED')
+            expect(fetchImpl).not.toHaveBeenCalled(); expect(deviceProof).not.toHaveBeenCalled(); expect(token).not.toHaveBeenCalled()
+            const process = runtime.start()
+            expect(JSON.parse(pipe)).toEqual(descriptor)
+            expect(JSON.stringify(runtime.sessionEnv)).not.toContain(descriptor.secret)
+            expect(JSON.stringify(spawnImpl.mock.calls[0])).not.toContain(descriptor.secret)
+            expect(spawnImpl.mock.calls[0][2]).toMatchObject({ env: { ABP_DESKTOP_BROWSER_LOGIN_FD: '3' }, stdio: ['pipe', 'ignore', 'pipe', 'pipe'] })
+            child.emit('exit', 0); await process.stop()
+        } finally { await new Promise<void>(r => server.close(() => r())); await rm(root, { recursive: true, force: true }) }
+    })
+
     it('sends a device proof for organization runtime requests and never falls back without approval', async () => {
         const proof = vi.fn(async () => 'signed-proof'), fetchImpl = vi.fn(async () => new Response(JSON.stringify({ token: signedCommand(1000), expiresAtMs: 1000 })))
         fetchImpl.mockResolvedValueOnce(new Response('{}', { status: 401 }))
@@ -245,5 +279,26 @@ describe('watching for the personal runtime installation', () => {
             expect(spawnImpl).toHaveBeenCalledTimes(1)
             void watch.stop()
         } finally { vi.useRealTimers() }
+    })
+})
+
+describe('environment inherited by a restarted daemon', () => {
+    const sessionEnv = (socket: string) => ({ HAPPY_BROWSER_TASK_DESKTOP_LOGIN: '1', HAPPY_BROWSER_TASK_RUNTIME_URL: 'http://127.0.0.1:38787',
+        HAPPY_BROWSER_TASK_BROKER_SOCKET: socket, HAPPY_BROWSER_TASK_PROFILE_ID: 'profile-1', HAPPY_BROWSER_TASK_TENANCY: 'dedicated',
+        HAPPY_BROWSER_TASK_HOST_MODE: 'dedicated-host' })
+
+    it('forgets the personal runtime session variables a previous daemon or its session passed on', () => {
+        const inherited: NodeJS.ProcessEnv = { ...env, ...sessionEnv(paths.brokerSocket) }
+        expect(forgetInheritedPersonalBrowserEnv(inherited, 'darwin', '/Users/u')).toBe(true)
+        expect(inherited).toEqual(env)
+    })
+
+    it('keeps an installer-managed host configuration and every platform without a personal runtime', () => {
+        const managed: NodeJS.ProcessEnv = { ...env, ...sessionEnv('/run/abp/broker.sock') }
+        expect(forgetInheritedPersonalBrowserEnv(managed, 'darwin', '/Users/u')).toBe(false)
+        expect(managed.HAPPY_BROWSER_TASK_RUNTIME_URL).toBe('http://127.0.0.1:38787')
+        const linux: NodeJS.ProcessEnv = { ...env, ...sessionEnv(paths.brokerSocket) }
+        expect(forgetInheritedPersonalBrowserEnv(linux, 'linux', '/Users/u')).toBe(false)
+        expect(linux.HAPPY_BROWSER_TASK_BROKER_SOCKET).toBe(paths.brokerSocket)
     })
 })

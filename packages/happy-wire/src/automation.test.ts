@@ -176,6 +176,7 @@ describe('automation wire contract', () => {
       claimedAt: 1, startedAt: 2, completedAt: 3, lateReport: false,
     };
     expect(automationRunSchema.parse(run)).toEqual(run);
+    expect(automationRunSchema.parse({ ...run, outcome: 'NO_CHANGE' }).outcome).toBe('NO_CHANGE');
     expect(automationRunSchema.safeParse({ ...run, degradedCode: 'secret: do not expose' }).success).toBe(false);
   });
 

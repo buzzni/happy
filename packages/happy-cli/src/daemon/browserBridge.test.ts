@@ -374,6 +374,15 @@ describe('BrowserBridge', () => {
             await expect(promise).resolves.toBe('alice-tabs')
         })
 
+        it('tells a viewer that Chrome is paired only with the machine token, never that another viewer is connected', async () => {
+            const bob = new FakeSocket()
+            bridge.handleConnection(bob, { token: deriveBrowserViewerBridgeToken(TOKEN, BOB_KEY), profile: 'default', viewerKey: BOB_KEY })
+            await expect(bridge.request('tabs_list', {}, { viewerKey: ALICE_KEY })).rejects.toMatchObject({ code: 'NO_EXTENSION_CONNECTED' })
+            connect('justin')
+            await expect(bridge.request('tabs_list', {}, { viewerKey: ALICE_KEY })).rejects.toMatchObject({ code: 'VIEWER_NOT_CONNECTED' })
+            expect(bob.sent).toHaveLength(0)
+        })
+
         it('does not allow a profile name to cross the caller viewer boundary', async () => {
             const alice = new FakeSocket()
             const bob = new FakeSocket()

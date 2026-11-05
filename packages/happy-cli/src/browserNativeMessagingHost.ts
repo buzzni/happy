@@ -4,6 +4,7 @@ import { DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './daemon/
 import { runBrowserNativeMessagingHost } from './daemon/browserNativeMessagingHost'
 import { readOrCreateBrowserBridgeToken, resolveBrowserBridgeTokenFile } from './daemon/browserBridgeToken'
 import { readFile } from 'node:fs/promises'
+import { browserSetupHomes, readBrowserBridgeOwnerHome } from './daemon/browserBridgeOwner'
 
 const userHome = homedir()
 const happyHomeDir = process.env.HAPPY_HOME_DIR?.replace(/^~/, userHome) ?? join(userHome, '.happy')
@@ -29,10 +30,12 @@ void runBrowserNativeMessagingHost({
 /** `keepRefusal` returns a daemon's coded 409 when no home accepts, instead of reporting no daemon. */
 async function postLocalSetup(path: string, body: unknown, { keepRefusal = false, timeoutMs = 2000 } = {}): Promise<unknown> {
     let refusal: unknown
-    // Chrome does not inherit the daemon's HAPPY_HOME_DIR. Probe only the
-    // documented personal/Standalone homes; each endpoint authenticates
+    // Chrome does not inherit the daemon's HAPPY_HOME_DIR. Probe the home the
+    // bridge owner recorded (a Desktop-managed daemon lives in machine-links),
+    // then the documented personal/Standalone homes; each endpoint authenticates
     // with that home's own control secret and accepts its own nonce only.
-    for (const home of new Set([happyHomeDir, join(userHome, '.happy_local'), join(userHome, '.happy_local_dev')])) {
+    const ownerHome = await readBrowserBridgeOwnerHome(userHome)
+    for (const home of browserSetupHomes({ userHome, happyHomeDir, ownerHome })) {
         try {
             const state = JSON.parse(await readFile(join(home, 'daemon.state.json'), 'utf8'))
             if (!Number.isInteger(state.httpPort) || state.httpPort < 1 || state.httpPort > 65535 || typeof state.controlSecret !== 'string') continue

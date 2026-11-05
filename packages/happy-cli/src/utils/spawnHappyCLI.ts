@@ -43,7 +43,7 @@
  * Since we know exactly what needs to happen (run `dist/index.mjs` with specific 
  * Node.js flags), we can bypass all the wrapper layers and do it directly:
  * 
- * `spawn('node', ['--no-warnings', '--no-deprecation', 'dist/index.mjs', ...args])`
+ * `spawn(process.execPath, ['--no-warnings', '--no-deprecation', 'dist/index.mjs', ...args])`
  * 
  * This works on all platforms and achieves the same result without any of the 
  * middleman steps that were providing workarounds for Windows vs Linux differences.
@@ -73,6 +73,7 @@ type HappyCliSpawnRuntime = {
   execArgv: string[];
   argv: string[];
   isBunRuntime: boolean;
+  isElectronRuntime: boolean;
 };
 
 function withQuietNodeFlags(execArgv: string[]): string[] {
@@ -91,6 +92,7 @@ export function resolveHappyCliSpawnCommand(
     execArgv: process.execArgv,
     argv: process.argv,
     isBunRuntime: isBun(),
+    isElectronRuntime: !!process.versions.electron,
   },
 ): HappyCliSpawnCommand {
   const sourceEntrypoint = join(runtime.projectRoot, 'src', 'index.ts');
@@ -111,7 +113,9 @@ export function resolveHappyCliSpawnCommand(
 
   const entrypoint = join(runtime.projectRoot, 'dist', 'index.mjs');
   return {
-    runtime: runtime.isBunRuntime ? 'bun' : 'node',
+    // Stay on the Node that launched us (Desktop's bundled one): an older node earlier on PATH
+    // ignores NODE_USE_SYSTEM_CA. Electron's binary is Node only under ELECTRON_RUN_AS_NODE.
+    runtime: runtime.isBunRuntime ? 'bun' : runtime.isElectronRuntime ? 'node' : runtime.execPath,
     args: [
       '--no-warnings',
       '--no-deprecation',
