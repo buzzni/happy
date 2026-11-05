@@ -21,6 +21,9 @@ import { WRITE_FILE_ATTEMPT_CAPABILITY } from '@/modules/common/writeFileAttempt
 import { LIST_FILES_PAGE_CAPABILITY } from '@/modules/common/listFilesPageCapability';
 import { McpCallerGrantEnvelopeConsumer } from '@/daemon/mcpCallerGrantEnvelope';
 import { join } from 'node:path';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { createFilesystemWriteAdmission, createWorkspaceTurnAdmission } from '@/utils/workspaceTurnAdmission';
 import { hkdfSync, randomBytes } from 'node:crypto';
 
 const {
@@ -144,6 +147,25 @@ describe('ApiMachineClient machine RPC server lane', () => {
 
         expect(rpcManagerConfigs.at(-1)).toBeDefined();
         expect(rpcManagerConfigs.at(-1)?.serverLane).toBeUndefined();
+    });
+
+    it.skipIf(process.platform === 'win32')('uses host-owned filesystem admission before machine RPC effects without changing default registration', async () => {
+        const home = await mkdtemp(join(tmpdir(), 'machine-filesystem-admission-'));
+        const root = join(home, 'project'); await mkdir(root);
+        const file = join(root, 'file.txt');
+        const auto = createWorkspaceTurnAdmission({ home, sessionId: 'automation-run:machine-test', kind: 'automation', roots: [root] });
+        await auto.tryAcquire();
+        try {
+            registeredCommonHandlers.mockClear();
+            Reflect.construct(ApiMachineClient, ['fake-token', makeMachine(), undefined, undefined, null, createFilesystemWriteAdmission({ home })]);
+            const options = registeredCommonHandlers.mock.calls.at(-1)![2];
+            const write = () => writeFile(file, 'saved');
+            await expect(Promise.resolve().then(() => options.withFilesystemMutation(write))).rejects.toMatchObject({ code: 'WORKSPACE_BUSY' });
+            await expect(readFile(file)).rejects.toMatchObject({ code: 'ENOENT' });
+            await auto.release(true);
+            await options.withFilesystemMutation(write);
+            expect(await readFile(file, 'utf8')).toBe('saved');
+        } finally { await auto.release(true); await rm(home, { recursive: true, force: true }); }
     });
 
     it('registers machine.run with the daemon-owned trusted profile registry and write policy', () => {

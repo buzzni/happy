@@ -22,6 +22,7 @@ import { DAEMON_RESTARTING_CODE, withRestartLifecycle } from '@/daemon/restartDr
 import type { DaemonSessionStateResponse } from '@/daemon/daemonSessionState';
 import {
     registerCommonHandlers,
+    type CommonHandlerOptions,
     type RecoverSessionOptions,
     type RecoverSessionResult,
     type ResumeSessionResult,
@@ -972,6 +973,7 @@ export class ApiMachineClient {
         private readonly deviceKeys?: DeviceKeys,
         private readonly deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>,
         processState: DaemonState | null = machine.daemonState,
+        withFilesystemMutation?: CommonHandlerOptions['withFilesystemMutation'],
     ) {
         this.setupTokenAssignmentRecipient = createSetupTokenAssignmentRecipient(deviceKeys?.recipient.secretKey);
         this.processState = Object.freeze({
@@ -1023,6 +1025,7 @@ export class ApiMachineClient {
         const allowedRoot = resolveDaemonAllowedRoot(process.env, homedir());
         this.allowedRoot = allowedRoot;
         registerCommonHandlers(this.rpcHandlerManager, allowedRoot, {
+            ...(withFilesystemMutation ? { withFilesystemMutation } : {}),
             // Machine scope is the Desktop machine.run path and the only one that
             // may run managed writes; its lock is per daemon process.
             machineRun: {

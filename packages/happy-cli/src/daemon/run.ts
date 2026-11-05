@@ -349,6 +349,7 @@ import { mergeAdditionalDirectoriesIntoSandboxEnvironment, readAdditionalDirecto
 import { createAutomationContextWorkspace } from './automations/automationContextWorkspace';
 import { createAutomationContextHost, prepareAutomationContextTick } from './automations/automationContextHost';
 import { createAutomationContextReferenceReader } from './automations/automationContextReference';
+import { createFilesystemWriteAdmission } from '@/utils/workspaceTurnAdmission';
 import { observeWorkspaceContextChild, WORKSPACE_CONTEXT_CONTROL_ENV } from '@/utils/workspaceContextControl';
 import { probeProcessGroup } from './managedProcessGroup';
 import { createAutomationContextLaunchJournal } from './automations/automationContextLaunchJournal';
@@ -4541,7 +4542,10 @@ export async function startDaemon(): Promise<void> {
       const enrollment = deviceEnrollment;
       browserNativeDeviceSigner = createBrowserNativeDeviceProof({ keys: deviceKeys, pin: companyId => enrollment.orgPin(companyId) });
     }
-    const apiMachine = api.machineSyncClient(machine, deviceKeys, deviceEnrollment ?? undefined, initialDaemonState);
+    const apiMachine = contextWorkspace
+      ? api.machineSyncClient(machine, deviceKeys, deviceEnrollment ?? undefined, initialDaemonState,
+        createFilesystemWriteAdmission({ home: configuration.happyHomeDir }))
+      : api.machineSyncClient(machine, deviceKeys, deviceEnrollment ?? undefined, initialDaemonState);
     if (standaloneWindows) apiMachine.setWindowsStandaloneTrial();
     startDifficultyRoutingMetadataPoll({
       apiMachine,

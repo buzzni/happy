@@ -16,6 +16,7 @@ import { Credentials } from '@/persistence';
 import { connectionState, isNetworkError, isConnectivityError, connectionErrorCode } from '@/utils/serverConnectionErrors';
 import { applySessionUrlEnv } from '@/utils/sessionUrlEnv';
 import type { ManagedAttachment } from '@/managed/managedSessionAttach';
+import type { CommonHandlerOptions } from '@/modules/common/registerCommonHandlers';
 
 /**
  * Who this client is.
@@ -711,8 +712,11 @@ export class ApiClient {
     return new ApiSessionClient(this.bearer(), session, undefined, options);
   }
 
-  machineSyncClient(machine: Machine, deviceKeys?: DeviceKeys, deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>, processState?: DaemonState): ApiMachineClient {
-    return new ApiMachineClient(this.bearer(), machine, deviceKeys, deviceEnrollment, processState);
+  machineSyncClient(machine: Machine, deviceKeys?: DeviceKeys, deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>, processState?: DaemonState,
+    withFilesystemMutation?: CommonHandlerOptions['withFilesystemMutation']): ApiMachineClient {
+    return withFilesystemMutation
+      ? new ApiMachineClient(this.bearer(), machine, deviceKeys, deviceEnrollment, processState, withFilesystemMutation)
+      : new ApiMachineClient(this.bearer(), machine, deviceKeys, deviceEnrollment, processState);
   }
 
   /**
