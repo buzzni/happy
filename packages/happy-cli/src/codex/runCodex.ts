@@ -7,6 +7,7 @@ import type { StandaloneLaunchBootstrap } from '../daemon/standaloneLaunchProtoc
 import { RuntimeProducerGate } from '../sessionDrain/runtimeProducerGate';
 import { createLessonProposalTurn } from '@/utils/lessonProposalTurn';
 import { reportAutomationContextExit, type AutomationContextExitEvidence } from '@/utils/automationContextExit';
+import { createFilesystemWriteAdmission } from '@/utils/workspaceTurnAdmission';
 import { takeWorkspaceContextControl } from '@/utils/workspaceContextControl';
 import { CodexAuthRecovery } from './codexAuthRecovery';
 import { render } from "ink";
@@ -270,6 +271,7 @@ export async function runCodex(opts: {
     let automationExit: Parameters<typeof reportAutomationContextExit>[0] | null = null;
     let workspaceExit: AutomationContextExitEvidence | null = null;
     let workspaceStorageClosed = false;
+    let automationStorageConfirmed = false;
     try {
     const accountToken = opts.principal?.kind === 'account' ? opts.principal.credentials.token : null;
     if (managedStartup) {
@@ -473,6 +475,11 @@ export async function runCodex(opts: {
     // Handle server unreachable case - create offline stub with hot reconnection
     let session: ApiSessionClient;
     let runtimeGate: RuntimeProducerGate | undefined;
+    const automationExecution = response !== null && isAutomationExecutionSessionId(response.id);
+    const filesystemAdmission = workspaceControl ? createFilesystemWriteAdmission({ home: configuration.happyHomeDir }) : undefined;
+    const withFilesystemMutation = workspaceControl || automationExecution ? <T,>(operation: () => Promise<T>): Promise<T> => runtimeGate
+        ? runtimeGate.admit(() => filesystemAdmission ? filesystemAdmission(operation) : operation(), 'writer')
+        : Promise.reject(new Error('Runtime input is not open')) : undefined;
     // Permission handler declared here so it can be updated in onSessionSwap callback
     // (assigned later at line ~385 after client setup)
     let permissionHandler: CodexPermissionHandler;
@@ -493,7 +500,9 @@ export async function runCodex(opts: {
         metadata,
         state,
         response,
-        sessionOptions: standaloneLaunch || workspaceControl ? { trackShutdownStorage: true } : undefined,
+        sessionOptions: standaloneLaunch || workspaceControl || automationExecution ? {
+            trackShutdownStorage: true, ...(withFilesystemMutation ? { withFilesystemMutation } : {}),
+        } : undefined,
         onSessionSwap: (newSession) => {
             session = newSession;
             newSession.configureInputQueue(messageQueue, 'remote', inputEvidenceEnabled);
@@ -2778,7 +2787,7 @@ export async function runCodex(opts: {
                         ...(lessonRecall?.outcome === 'selected' ? { lessonBlock: lessonRecall.block } : {}),
                         ...(memoryRecall?.reason === 'context_returned' ? { memoryBlock: buildCodexMemoryReferenceBlock(memoryRecall.context) } : {}),
                     });
-                    if (workspaceControl && runtimeGate && !workspaceTitleObserved && offTurnTitle.covers()) {
+                    if ((workspaceControl || automationExecution) && runtimeGate && !workspaceTitleObserved && offTurnTitle.covers()) {
                         workspaceTitleObserved = true;
                         void runtimeGate.admit(() => offTurnTitle.settled(), 'writer').catch(() => logger.warn('[workspace-context] Title writer unconfirmed'));
                     }
@@ -3129,6 +3138,10 @@ export async function runCodex(opts: {
                 logger.debug('[codex]: flush begin');
                 await session.flush();
                 logger.debug('[codex]: flush done');
+                if (automationExecution) {
+                    const proof = await session.flushForShutdown(10_000);
+                    automationStorageConfirmed = proof.stored && session.isStorageConfirmationCurrent(proof);
+                }
                 logger.debug('[codex]: session.close begin');
                 await session.close();
                 logger.debug('[codex]: session.close done');
@@ -3170,7 +3183,7 @@ export async function runCodex(opts: {
             messageBuffer.clear();
 
             logActiveHandles('cleanup-end');
-            if (automationExit) automationExit.evidence.writeProducersDrained = lessonClosed;
+            if (automationExit) automationExit.evidence.writeProducersDrained = lessonClosed && workspaceStorageClosed && automationStorageConfirmed;
             if (workspaceExit) workspaceExit.writeProducersDrained = lessonClosed && workspaceStorageClosed
                 && !!runtimeGate && !runtimeGate.hasLiveProducers() && !runtimeGate.isShutdownBlocked();
             logger.debug('[codex]: Final cleanup completed');
@@ -3179,6 +3192,8 @@ export async function runCodex(opts: {
             stopCallerGrantRefresh();
             stopCallerGrantExpiryNotice();
             if (!loopExitRecorded) runtimeGate?.loopExited();
+            if (automationExit) automationExit.evidence.writeProducersDrained &&= !!runtimeGate
+                && !runtimeGate.hasLiveProducers() && !runtimeGate.isShutdownBlocked();
         }
     }
     } finally {

@@ -5,6 +5,7 @@ import { prepareSessionWriteScopeClaude } from '@/daemon/sessionWriteScopeClaude
 /** Orchestrates Claude sessions, initial prompts, MCP tools and session lifecycle. */
 import { createLessonProposalTurn } from '@/utils/lessonProposalTurn';
 import { reportAutomationContextExit } from '@/utils/automationContextExit';
+import { createFilesystemWriteAdmission } from '@/utils/workspaceTurnAdmission';
 import { takeWorkspaceContextControl } from '@/utils/workspaceContextControl';
 import { createTurnCardSwitch } from './utils/turnCardTools';
 import { randomUUID } from 'node:crypto';
@@ -548,8 +549,15 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     stage('checkpoint-composition');
     // Created with the message queue below; MCP tools admitted before then are refused by the gate itself.
     let runtimeGate: RuntimeProducerGate | undefined;
+    const automationExecution = isAutomationExecutionSessionId(response.id);
+    const filesystemAdmission = workspaceControl ? createFilesystemWriteAdmission({ home: configuration.happyHomeDir }) : undefined;
+    const withFilesystemMutation = workspaceControl || automationExecution ? <T,>(operation: () => Promise<T>): Promise<T> => runtimeGate
+        ? runtimeGate.admit(() => filesystemAdmission ? filesystemAdmission(operation) : operation(), 'writer')
+        : Promise.reject(new Error('Runtime input is not open')) : undefined;
     // Create realtime session
-    const session = launchControl || workspaceControl ? api.sessionSyncClient(response, { trackShutdownStorage: true }) : api.sessionSyncClient(response);
+    const session = launchControl || workspaceControl || automationExecution ? api.sessionSyncClient(response, {
+        trackShutdownStorage: true, ...(withFilesystemMutation ? { withFilesystemMutation } : {}),
+    }) : api.sessionSyncClient(response);
     stage('session-client');
     let standaloneDrain: ClaudeStandaloneDrain | undefined;
     /**
@@ -809,7 +817,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         trackProtectedBashProcess: checkpointComposition.trackProtectedWriter,
         currentTurnId: () => session.currentTurnId?.() ?? null,
         // A tool call in flight finishes across a drain freeze; none starts after it.
-        ...(launchControl || workspaceControl ? { admitTool: <T,>(work: () => Promise<T>) => (runtimeGate ? runtimeGate.admit(work, 'writer') : Promise.reject(new Error('Runtime input is not open'))) } : {}),
+        ...(launchControl || workspaceControl || automationExecution ? { admitTool: <T,>(work: () => Promise<T>) => (runtimeGate ? runtimeGate.admit(work, 'writer') : Promise.reject(new Error('Runtime input is not open'))) } : {}),
     });
     logger.debug(`[START] Happy MCP server started at ${happyServer.url}`);
 
@@ -935,7 +943,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         ...(orgGate?.restrictsModels() ? { orgModel: mode.orgModel } : {}),
     }));
     session.configureInputQueue(messageQueue, options.startingMode === 'remote' ? 'remote' : 'local', inputEvidenceEnabled);
-    if (launchControl || workspaceControl) {
+    if (launchControl || workspaceControl || automationExecution) {
         // Only the launch-bound local channel can drain this runtime; never a session RPC.
         const gate = new RuntimeProducerGate({
             hasUndeliveredInput: () => messageQueue.size() > 0 || Boolean(standaloneDrain?.hasHeldBackInput()),
@@ -969,7 +977,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         } : session;
         if (workspaceControl) workspaceControl.bind({ provider: guardedProvider, storage, runtime: gate,
             prepareWorkspaceDrain: async signal => !signal.aborted && standaloneDrain!.canDrainWorkspace() });
-        else launchControl!.bind(guardedProvider, storage, gate);
+        else if (launchControl) launchControl.bind(guardedProvider, storage, gate);
     }
     const admitRpc = <T,>(work: () => Promise<T>): Promise<T> => runtimeGate ? runtimeGate.admit(work) : work();
 
@@ -1709,7 +1717,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             message: pushText,
             model: messageModel,
         });
-        if (workspaceControl && runtimeGate && !workspaceTitleObserved && offTurnTitle.covers()) {
+        if ((workspaceControl || automationExecution) && runtimeGate && !workspaceTitleObserved && offTurnTitle.covers()) {
             workspaceTitleObserved = true;
             void runtimeGate.admit(() => offTurnTitle.settled(), 'writer').catch(() => logger.warn('[workspace-context] Title writer unconfirmed'));
         }
@@ -2277,6 +2285,12 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     logger.debug('Waiting for socket to flush...');
     await session.flush();
 
+    let automationStorageConfirmed = false;
+    if (automationExecution) {
+        const proof = await session.flushForShutdown(10_000);
+        automationStorageConfirmed = proof.stored && session.isStorageConfirmationCurrent(proof);
+    }
+
     // Close session
     logger.debug('Closing session...');
     await session.close();
@@ -2297,7 +2311,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     await reportAutomationContextExit({ sessionId: session.sessionId, provider: 'claude', evidence: {
         ...((currentSession as Session | null)?.automationContextExitEvidence
             ?? { providerExitedCleanly: false, foregroundDrained: false, backgroundDrained: false }),
-        writeProducersDrained: true,
+        writeProducersDrained: automationStorageConfirmed && !!runtimeGate
+            && !runtimeGate.hasLiveProducers() && !runtimeGate.isShutdownBlocked(),
     } });
     if (workspaceControl) {
         try { await workspaceControl.reportExit({ ...((currentSession as Session | null)?.automationContextExitEvidence

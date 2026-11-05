@@ -26,12 +26,14 @@ const fixture = vi.hoisted(() => ({
     readMcpStatuses: vi.fn(async (): Promise<import('@slopus/happy-wire').McpRuntimeServerStatus[]> => []),
     getOrCreateSession: vi.fn(async () => ({ id: 'lesson-session' })),
     disconnect: vi.fn(async () => {}),
+    sessionOptions: undefined as import('@/api/apiSession').ApiSessionClientOptions | undefined,
+    reportAutomationExit: vi.fn(async (_input: unknown) => true),
     admitTool: undefined as undefined | (<T>(work: () => Promise<T>) => Promise<T>),
     reconnect: vi.fn(async () => ({})),
     session: {
         sendProviderUsageEvent: vi.fn(),
         tracksShutdownStorage: true,
-        flushForShutdown: vi.fn(async () => ({ stored: true as const, revision: 1 })),
+        flushForShutdown: vi.fn(async (): Promise<import('@/api/sessionStorageBarrier').StorageConfirmation> => ({ stored: true, revision: 1 })),
         isStorageConfirmationCurrent: vi.fn(() => true),
         canFreezeInboundMessagesForShutdown: () => true, freezeInboundMessagesForShutdown: vi.fn(() => true),
         awaitMessageAck: vi.fn(async () => ({ ok: true })),
@@ -60,7 +62,10 @@ vi.mock('@/utils/MessageQueue2', async (original) => {
 vi.mock('@/utils/broadKillShims', () => ({ installBroadKillShims: vi.fn() }));
 vi.mock('@/persistence', async (original) => ({ ...await original<typeof import('@/persistence')>(), readSettings: vi.fn(async () => ({ machineId: 'machine' })) }));
 vi.mock('@/api/api', () => ({ ApiClient: { create: vi.fn(async () => ({ getOrCreateMachine: vi.fn(), getOrCreateSession: fixture.getOrCreateSession })) } }));
-vi.mock('@/utils/setupOfflineReconnection', () => ({ setupOfflineReconnection: () => ({ session: fixture.session }) }));
+vi.mock('@/utils/setupOfflineReconnection', () => ({ setupOfflineReconnection: (options: import('@/utils/setupOfflineReconnection').SetupOfflineReconnectionOptions) => {
+    fixture.sessionOptions = options.sessionOptions; return { session: fixture.session };
+} }));
+vi.mock('@/utils/automationContextExit', () => ({ reportAutomationContextExit: fixture.reportAutomationExit }));
 vi.mock('@/daemon/run', () => ({ initialMachineMetadata: {} }));
 vi.mock('@/daemon/controlClient', () => ({ notifyDaemonSessionStarted: vi.fn(async () => ({})) }));
 vi.mock('@/ui/auth', () => ({ authAndSetupMachineIfNeeded: vi.fn(async () => ({ credentials: { token: 'test-token' } })) }));
@@ -87,6 +92,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     cancelOutputDrain = () => {};
     finishShutdownObservation = () => {};
     finishWorkspaceContext = async () => ({ foregroundDrained: true, backgroundDrained: true, providerExitedCleanly: true });
+    finishAutomationContext = async () => ({ foregroundDrained: true, backgroundDrained: true, providerExitedCleanly: true });
     canDrainWorkspace = async () => true;
     sideCommandAllowed = true;
     clearThreadState = vi.fn(() => { fixture.onClearThreadState?.(); });
@@ -175,6 +181,47 @@ async function finishFrozenFixture(running: Promise<void>) {
     await running;
 }
 describe('Codex runtime producer bookkeeping', () => {
+    it.each(['stored', 'unconfirmed', 'stale'] as const)('joins isolated filesystem writers and requires current storage (%s)', async storage => {
+        fixture.session.sessionId = 'automation-run:filesystem-drain';
+        fixture.getOrCreateSession.mockResolvedValueOnce({ id: fixture.session.sessionId });
+        if (storage === 'unconfirmed') fixture.session.flushForShutdown.mockResolvedValueOnce({ stored: false, reason: 'unconfirmed-write' });
+        if (storage === 'stale') fixture.session.isStorageConfirmationCurrent.mockReturnValue(false);
+        let finishTurn!: () => void, finishWrite!: () => void, enterTurn!: () => void;
+        const turnEntered = new Promise<void>(resolve => { enterTurn = resolve; });
+        const pendingTurn = new Promise<void>(resolve => { finishTurn = resolve; });
+        fixture.onSend = async () => { enterTurn(); await pendingTurn; };
+        const pendingWrite = new Promise<void>(resolve => { finishWrite = resolve; });
+        const running = start();
+        const settled = running.then(() => null, error => error);
+        let writing: Promise<unknown> | undefined;
+        try {
+            await turnEntered;
+            const options = fixture.sessionOptions;
+            expect(options?.trackShutdownStorage).toBe(true);
+            expect(options?.withFilesystemMutation).toBeTypeOf('function');
+            writing = options!.withFilesystemMutation!(async () => { await pendingWrite; return 'stored'; });
+            finishTurn();
+            await vi.waitFor(() => expect(fixture.gate?.isClosed()).toBe(true));
+            expect(fixture.session.close).not.toHaveBeenCalled();
+            expect(fixture.reportAutomationExit).not.toHaveBeenCalled();
+            const lateWrite = vi.fn(async () => {});
+            await expect(options!.withFilesystemMutation!(lateWrite)).rejects.toThrow('Runtime input is closed');
+            expect(lateWrite).not.toHaveBeenCalled();
+            finishWrite(); await writing;
+            expect(await settled).toBeNull();
+            expect(fixture.session.flushForShutdown).toHaveBeenCalledOnce();
+            expect(fixture.reportAutomationExit).toHaveBeenCalledWith(expect.objectContaining({
+                sessionId: 'automation-run:filesystem-drain',
+                evidence: expect.objectContaining({ writeProducersDrained: storage === 'stored' }),
+            }));
+        } finally {
+            finishTurn?.(); finishWrite(); await writing; await settled;
+            fixture.session.sessionId = 'lesson-session';
+            fixture.sessionOptions = undefined;
+            fixture.session.isStorageConfirmationCurrent.mockReturnValue(true);
+            fixture.session.flushForShutdown.mockReset().mockResolvedValue({ stored: true, revision: 1 });
+        }
+    });
     it('retains workspace ownership through a title write after the foreground turn has ended', async () => {
         const control = { bind: vi.fn(), close: vi.fn(), reportExit: vi.fn(async () => true) };
         vi.spyOn(await import('@/utils/workspaceContextControl'), 'takeWorkspaceContextControl').mockReturnValue(control);
