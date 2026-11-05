@@ -164,10 +164,11 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         await running;
         expect(inputs).toHaveBeenCalledTimes(1);
     });
-    it('runs a start-budget-waiting input at once on another organization account that has start budget', async () => {
-        vi.mocked(requestSetupTokenStart)
-            .mockResolvedValueOnce({ state: 'wait', retryAfterMs: 600000, preferredAccountIds: ['second'] })
-            .mockResolvedValueOnce({ state: 'allowed', validForMs: 15000 });
+    it.each(['startBudget','startExhausted'] as const)('runs a held input once after %s moves the account and requests admission again', async reason => {
+        vi.mocked(requestSetupTokenStart).mockReset();
+        if (reason === 'startExhausted') vi.mocked(requestSetupTokenStart).mockRejectedValueOnce(new Error('SETUP_TOKEN_START_ACCOUNT_EXHAUSTED'));
+        else vi.mocked(requestSetupTokenStart).mockResolvedValueOnce({ state: 'wait', retryAfterMs: 600000, preferredAccountIds: ['second'] });
+        vi.mocked(requestSetupTokenStart).mockResolvedValue({ state: 'allowed', validForMs: 15000 });
         const inputs: Array<string | undefined> = [];
         const providers: Array<string | undefined> = [];
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
@@ -202,20 +203,20 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
 
         await claudeRemoteLauncher(session as unknown as Session);
 
-        expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', '{"account":"first"}', undefined, expect.any(AbortSignal), { startBudget: true });
+        expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', '{"account":"first"}', undefined, expect.any(AbortSignal), { [reason]: true });
         expect(vi.mocked(requestSetupTokenStart).mock.calls.map(call => call[1])).toEqual(['{"account":"first"}', '{"account":"second"}']);
         // Admission precedes the provider: none starts on the used-up token, and the same input runs once on the second.
         expect(providers).toEqual(['sk-ant-oat01-second']);
         expect(inputs).toEqual(['sk-ant-oat01-second']);
         const messages = client.sendSessionEvent.mock.calls.map(([event]) => event.message);
-        expect(messages).toContain(START_BUDGET_SWITCHED_NOTICE);
+        expect(messages).toContain(reason === 'startBudget' ? START_BUDGET_SWITCHED_NOTICE : SWITCHED_NOTICE);
         expect(messages.some(message => String(message).includes('기다리고 있습니다'))).toBe(false);
     });
-    it('restarts a running provider on the account with start budget for the next message, keeping that message', async () => {
-        vi.mocked(requestSetupTokenStart)
-            .mockResolvedValueOnce({ state: 'allowed', validForMs: 15000 })
-            .mockResolvedValueOnce({ state: 'wait', retryAfterMs: 600000, preferredAccountIds: ['second'] })
-            .mockResolvedValueOnce({ state: 'allowed', validForMs: 15000 });
+    it.each(['startBudget','startExhausted'] as const)('restarts a running provider after %s before the next message, keeping it once', async reason => {
+        vi.mocked(requestSetupTokenStart).mockReset().mockResolvedValueOnce({ state: 'allowed', validForMs: 15000 });
+        if (reason === 'startExhausted') vi.mocked(requestSetupTokenStart).mockRejectedValueOnce(new Error('SETUP_TOKEN_START_ACCOUNT_EXHAUSTED'));
+        else vi.mocked(requestSetupTokenStart).mockResolvedValueOnce({ state: 'wait', retryAfterMs: 600000, preferredAccountIds: ['second'] });
+        vi.mocked(requestSetupTokenStart).mockResolvedValueOnce({ state: 'allowed', validForMs: 15000 });
         const inputs: Array<[string | undefined, string]> = [];
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
         const handlers = new Map<string, () => Promise<unknown>>();
@@ -252,6 +253,8 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         expect(inputs.map(([token]) => token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
         expect(inputs[1][1]).toContain('second message');
         expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1);
+        expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', '{"account":"first"}', undefined, expect.any(AbortSignal), { [reason]: true });
+        expect(vi.mocked(requestSetupTokenStart).mock.calls.map(call => call[1])).toEqual(['{"account":"first"}', '{"account":"first"}', '{"account":"second"}']);
     });
     it.each(['abort', 'switch'])('handles a budget-waiting input without execution on %s', async action => {
         vi.mocked(requestSetupTokenStart).mockImplementationOnce((_session, _binding, _request, signal) => new Promise(resolve => {

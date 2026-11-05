@@ -56,3 +56,9 @@ describe('machine-v2 pinned Studio and device boundary', () => {
     await expect(protocol.verifyBinding({ body: { ...body, companyId }, signature: Buffer.alloc(64).toString('base64url') }, 'launch')).rejects.toThrow()
   })
 })
+
+it('preserves the start exhaustion code from pinned Studio',async()=>{
+ const {protocol}=setup(vi.fn(async()=>Response.json({error:'SETUP_TOKEN_DAEMON_START_ACCOUNT_EXHAUSTED'},{status:409})) as typeof fetch)
+ const request=await protocol.request({action:'start',operationId:'start',launchId:'launch',sessionId:'session',nonce:Buffer.alloc(32,1).toString('base64url'),bindingRevision:1,requestId:'turn'})
+ await expect(protocol.post(request)).rejects.toMatchObject({reason:'START_ACCOUNT_EXHAUSTED'})
+})

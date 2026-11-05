@@ -7,6 +7,7 @@ export async function waitForSetupTokenStart(deps: {
     notify(): void;
     /** Another account has start budget left: true when the session moved there, so this account's wait ends unadmitted. */
     moveToPreferred?(): Promise<boolean>;
+    moveFromExhausted?(): Promise<boolean>;
     signal: AbortSignal;
 }): Promise<boolean> {
     const requestId = randomUUID();
@@ -15,7 +16,14 @@ export async function waitForSetupTokenStart(deps: {
     try {
         while (!deps.signal.aborted) {
             const sentAt = performance.now();
-            const decision = await deps.request(requestId, deps.signal);
+            let decision: StartDecision;
+            try { decision = await deps.request(requestId, deps.signal); }
+            catch (error) {
+                if (deps.signal.aborted) return false;
+                if (error instanceof Error && error.message === 'SETUP_TOKEN_START_ACCOUNT_EXHAUSTED'
+                    && deps.moveFromExhausted && await deps.moveFromExhausted()) return false;
+                throw error;
+            }
             if (deps.signal.aborted) return false;
             if (decision.state === 'allowed') {
                 if (!Number.isFinite(decision.validForMs) || decision.validForMs <= performance.now() - sentAt) throw new Error('SETUP_TOKEN_START_EXPIRED');
