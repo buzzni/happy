@@ -2618,17 +2618,24 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
    * and generation this PC holds the account at. Every turn asks, so the roster read is reused for a minute; a stale
    * generation is only refused by Studio, and a refused start still runs (decision D1).
    */
-  let sharedStartRoster: { readAt: number; companyId: string | null; generations: Map<string, number> } | null = null
+  type SharedStartRoster = { readAt: number; companyId: string | null; generations: Map<string, number> }
+  let sharedStartRoster: SharedStartRoster | null = null
+  let sharedStartRosterRefresh: Promise<SharedStartRoster> | null = null
   async function sharedMachineStartProof(managedAccountId: string): Promise<{ companyId: string; credentialGeneration: number } | null> {
-    if (!sharedStartRoster || deps.now() - sharedStartRoster.readAt > SHARED_START_ROSTER_MS) {
-      const held = await sharedMachineCandidates()
-      const candidates = held ? (await held.read()).candidates : []
-      sharedStartRoster = { readAt: deps.now(), companyId: held?.companyId ?? null,
-        generations: new Map(candidates.map(candidate => [candidate.managedAccountId, candidate.credentialGeneration])) }
+    let roster = sharedStartRoster
+    if (!roster || deps.now() - roster.readAt > SHARED_START_ROSTER_MS) {
+      // Starts share a refresh, and its credential reads cannot overlap group sync or launch preparation.
+      sharedStartRosterRefresh ??= serialize(async () => {
+        const held = await sharedMachineCandidates()
+        const candidates = held ? (await held.read()).candidates : []
+        return sharedStartRoster = { readAt: deps.now(), companyId: held?.companyId ?? null,
+          generations: new Map(candidates.map(candidate => [candidate.managedAccountId, candidate.credentialGeneration])) }
+      }).finally(() => { sharedStartRosterRefresh = null })
+      roster = await sharedStartRosterRefresh
     }
-    const credentialGeneration = sharedStartRoster.generations.get(managedAccountId)
-    return sharedStartRoster.companyId && credentialGeneration !== undefined && Number.isSafeInteger(credentialGeneration)
-      ? { companyId: sharedStartRoster.companyId, credentialGeneration } : null
+    const credentialGeneration = roster.generations.get(managedAccountId)
+    return roster.companyId && credentialGeneration !== undefined && Number.isSafeInteger(credentialGeneration)
+      ? { companyId: roster.companyId, credentialGeneration } : null
   }
   /**
    * Saycode specs/shared-pc-start-budget — a session waiting for start budget moves onto a held, usable account among

@@ -465,6 +465,52 @@ describe('managed Claude setup-token runtime', () => {
     expect(exports() - before).toBe(2)
   })
 
+  it.each(['cold', 'expired'] as const)('shares one roster refresh across simultaneous starts with a %s cache', async (cache) => {
+    const clock = { now: NOW }
+    const { runtime, calls } = fakeMachine([], null, { machineId: 'machine-1', clock })
+    await runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',
+      generation: 1, fingerprint: '1'.padStart(64, '0'), payload: payload(managed(A, 1, fakeToken('a')), managed(B, 2, fakeToken('b'))) })
+    if (cache === 'expired') {
+      await runtime.sharedMachineStartProof(A)
+      clock.now += 60_001
+    }
+    const before = calls.length
+    const proofs = await Promise.all(Array.from({ length: 20 }, (_, index) => runtime.sharedMachineStartProof(index % 2 ? B : A)))
+    expect(proofs).toEqual(Array.from({ length: 20 }, (_, index) => ({ companyId: 'company-1', credentialGeneration: index % 2 ? 2 : 1 })))
+    const reads = calls.slice(before).filter(call => call.command === 'cswap')
+    expect(reads.filter(call => call.args[0] === 'export')).toHaveLength(1)
+    expect(reads.filter(call => call.args[0] === 'list')).toHaveLength(1)
+  })
+
+  it.each(['cold', 'expired'] as const)('retries a failed shared roster refresh with a %s cache', async (cache) => {
+    const clock = { now: NOW }
+    const options = { machineId: 'machine-1', clock, listFails: false }
+    const { runtime, calls } = fakeMachine([], null, options)
+    await runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',
+      generation: 1, fingerprint: '1'.padStart(64, '0'), payload: payload(managed(A, 1, fakeToken('a'))) })
+    if (cache === 'expired') {
+      await runtime.sharedMachineStartProof(A)
+      clock.now += 60_001
+    }
+    options.listFails = true
+    const before = calls.length
+    const results = await Promise.allSettled(Array.from({ length: 20 }, () => runtime.sharedMachineStartProof(A)))
+    expect(results.every(result => result.status === 'rejected')).toBe(true)
+    expect(calls.slice(before).filter(call => call.command === 'cswap' && call.args[0] === 'export')).toHaveLength(1)
+    options.listFails = false
+    expect(await runtime.sharedMachineStartProof(A)).toEqual({ companyId: 'company-1', credentialGeneration: 1 })
+    expect(calls.slice(before).filter(call => call.command === 'cswap' && call.args[0] === 'export')).toHaveLength(2)
+  })
+
+  it('reads the shared start roster after an already queued assignment finishes', async () => {
+    const { runtime } = fakeMachine([], null, { machineId: 'machine-1' })
+    const assignment = runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',
+      generation: 1, fingerprint: '1'.padStart(64, '0'), payload: payload(managed(A, 1, fakeToken('a'))) })
+    const proof = runtime.sharedMachineStartProof(A)
+    await assignment
+    expect(await proof).toEqual({ companyId: 'company-1', credentialGeneration: 1 })
+  })
+
   it('moves a start-budget-waiting shared session only onto a held, usable account Studio named (Saycode specs/shared-pc-start-budget)', async () => {
     const { runtime } = fakeMachine([], null, { machineId: 'machine-1' })
     await runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',
