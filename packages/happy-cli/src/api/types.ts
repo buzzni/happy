@@ -602,7 +602,20 @@ export type Metadata = {
      * including an older session that survived a daemon upgrade.
      */
     permissionGrants?: { bashPrefixMatcher: 'plain-v1' },
+    /**
+     * aplus-dev-studio-desktop specs/linked-pull-requests R1-3 — this session's agent has the
+     * `saycode_pr_link`/`saycode_pr_watch` tools. Clients use it only for that; reading and writing
+     * `linkedPullRequests` does not depend on it.
+     */
+    linkedPullRequests?: 1,
   },
+  /**
+   * aplus-dev-studio-desktop specs/linked-pull-requests R1-1 — up to 20 `LinkedPullRequest` entries
+   * (claude/utils/linkedPullRequestTools.ts), written by the agent's tools and by Saycode Desktop.
+   * `unknown` for the reason `difficultyRoutingState` is: another client writes it, so every reader
+   * goes through `readLinkedPullRequests` and every writer keeps what it cannot read.
+   */
+  linkedPullRequests?: unknown,
   /** aplus-dev-studio specs/e2ee-machine-control-boundary R18 — reads bound session-scope requests. */
   rpcBinding?: RpcBindingCapability,
   name?: string,

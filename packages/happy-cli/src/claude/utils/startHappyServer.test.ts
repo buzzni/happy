@@ -310,6 +310,8 @@ describe('Happy MCP shutdown admission', () => {
             checkpoint_diff: { checkpointId: 'a'.repeat(40), path: 'file.txt' },
             change_title: { title: 'no-write' }, bash_stream: { command: 'no-execution' },
             next_steps: { summary: 'no-write', actions: [] },
+            saycode_pr_link: { action: 'link', url: 'https://github.com/o/r/pull/1' },
+            saycode_pr_watch: { action: 'start', url: 'https://github.com/o/r/pull/1' },
             script_automations: { request: { operation: 'list' } },
             scheduled_tasks: { request: { operation: 'list' } },
             browser_click: { ref: '@e1' }, browser_fill: { ref: '@e1', value: 'x' },

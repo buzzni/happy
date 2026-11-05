@@ -55,6 +55,7 @@ import { BROWSER_TASK_UNAVAILABLE_REASON_ENV, BROWSER_TASK_UNAVAILABLE_REASON_PA
 import { runScriptAutomationTool, scriptAutomationToolRequestSchema } from './scriptAutomationTools';
 import { runScheduledTaskTool, scheduledTaskToolRequestSchema } from './scheduledTaskTools';
 import { registerTurnCardTools, TURN_CARD_TOOL_NAMES, type TurnCards } from './turnCardTools';
+import { LINKED_PULL_REQUEST_TOOL_NAMES, registerLinkedPullRequestTools } from './linkedPullRequestTools';
 
 export const BASH_STREAM_AGENT_TOOL_NAME = 'mcp__happy__bash_stream';
 
@@ -162,6 +163,9 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
 
     // Not in a mandatory sandbox: that boundary keeps its fixed minimal tool set (like propose_lesson).
     if (!handlers.mandatorySandbox) registerTurnCardTools(mcp, { client: handlers.client, turnCards: handlers.turnCards, runTool });
+
+    // Unlike bash_stream it stays in a write-scope session: it writes only this session's metadata, never files.
+    if (!handlers.mandatorySandbox) registerLinkedPullRequestTools(mcp, { client: handlers.client, runTool });
 
     if (!handlers.mandatorySandbox && !scopedSession) mcp.registerTool('script_automations', {
         title: 'Manage Script Automations',
@@ -772,7 +776,7 @@ export async function startHappyServer(
         socketPath,
         mcpConfig,
         bridgeEnv,
-        toolNames: [...(browserTask?.localClients ? LOCAL_CLIENT_TOOL_NAMES : []), ...(options.mandatorySandbox ? [] : TURN_CARD_TOOL_NAMES), ...(initialComputerAvailable ? ['local_tool_capabilities', 'local_tool_control'] : []), ...(options.checkpointReader ? ['checkpoint_status', 'checkpoint_list', 'checkpoint_preview', 'checkpoint_diff'] : []), ...(options.mandatorySandbox
+        toolNames: [...(browserTask?.localClients ? LOCAL_CLIENT_TOOL_NAMES : []), ...(options.mandatorySandbox ? [] : [...TURN_CARD_TOOL_NAMES, ...LINKED_PULL_REQUEST_TOOL_NAMES]), ...(initialComputerAvailable ? ['local_tool_capabilities', 'local_tool_control'] : []), ...(options.checkpointReader ? ['checkpoint_status', 'checkpoint_list', 'checkpoint_preview', 'checkpoint_diff'] : []), ...(options.mandatorySandbox
             ? ['change_title', ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : [])]
             : [...(options.proposeLesson ? ['propose_lesson'] : []), 'change_title', 'bash_stream', 'script_automations', ...(process.env.HAPPY_WRITE_SCOPE_SESSION === '1' ? [] : ['scheduled_tasks']), ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : BROWSER_TOOL_NAMES)])],
         stop: () => {
