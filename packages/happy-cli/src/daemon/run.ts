@@ -348,6 +348,7 @@ import {
 import { mergeAdditionalDirectoriesIntoSandboxEnvironment, readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv';
 import { createAutomationContextWorkspace } from './automations/automationContextWorkspace';
 import { createAutomationContextHost, prepareAutomationContextTick } from './automations/automationContextHost';
+import { createAutomationContextReferenceReader } from './automations/automationContextReference';
 import { observeWorkspaceContextChild, WORKSPACE_CONTEXT_CONTROL_ENV } from '@/utils/workspaceContextControl';
 import { probeProcessGroup } from './managedProcessGroup';
 import { createAutomationContextLaunchJournal } from './automations/automationContextLaunchJournal';
@@ -5236,9 +5237,15 @@ export async function startDaemon(): Promise<void> {
       token: credentials.token, machineId, runId: run.runId, claimToken: run.claimToken,
       authorize: createAutomationContextAuthorizer({ studioOrigin: trustedStudioOrigin, token: credentials.token,
         machineId, runId: run.runId, claimToken: run.claimToken }) });
-    const contextHost = contextWorkspace && trustedStudioOrigin ? createAutomationContextHost({
-      accountId: await authenticatedAccountId(credentials.token), machineId, happyOrigin: configuration.serverUrl,
-      api, workspace: contextWorkspace, journal: createAutomationContextLaunchJournal(configuration.happyHomeDir),
+    const contextAccountId = contextWorkspace && trustedStudioOrigin ? await authenticatedAccountId(credentials.token) : null;
+    const contextJournal = contextAccountId ? createAutomationContextLaunchJournal(configuration.happyHomeDir) : null;
+    const contextReference = contextAccountId && contextJournal ? createAutomationContextReferenceReader({
+      serverUrl: configuration.serverUrl, token: credentials.token, accountId: contextAccountId, machineId, journal: contextJournal,
+      ...(credentials.encryption.type === 'legacy' ? { legacySecret: credentials.encryption.secret } : {}),
+    }) : null;
+    const contextHost = contextWorkspace && trustedStudioOrigin && contextAccountId && contextJournal && contextReference ? createAutomationContextHost({
+      accountId: contextAccountId, machineId, happyOrigin: configuration.serverUrl,
+      api, workspace: contextWorkspace, journal: contextJournal, resolvePreviousResult: contextReference.resolve,
       runtimeStore: serverAutomationRuntimeStore,
       discover: async sessionId => isAutomationSessionRunning(sessionId) ? 'running' : 'unconfirmed',
       heartbeat: run => apiMachine.serverAutomationTransport().heartbeat(run),

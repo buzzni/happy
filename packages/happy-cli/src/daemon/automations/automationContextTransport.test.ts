@@ -316,3 +316,35 @@ it.each(['ready', 'broken', 'missing', 'aborted'] as const)('prepares legacy tic
   expect(log).toHaveBeenCalledTimes(state === 'broken' ? 1 : 0)
   expect(JSON.stringify(log.mock.calls)).not.toContain('SENSITIVE_JOURNAL_VALUE')
 })
+
+it.each(['changed', 'deleted'])('keeps the frozen previous reference and holds after workspace waiting when it is %s', async reason => {
+  const f = await setup(), directory = join(home, 'workspace'); await mkdir(directory)
+  f.input.payload.directory = directory
+  const payload = { ...f.input.payload, contextPolicy: { kind: 'isolated' as const,
+    reference: { kind: 'previous-result' as const, maxBytes: 16384 } } }
+  const previousResult = { automationId: 'a1', runId: 'prior', revision: 1, status: 'COMPLETED', question: 'Original question', answer: 'PRIVATE_SELECTED_ANSWER' }
+  let unavailable = false
+  const resolvePreviousResult = vi.fn(async () => {
+    if (unavailable && reason === 'deleted') throw new Error('AUTOMATION_REFERENCE_HTTP_404')
+    return unavailable ? { ...previousResult, answer: 'DIFFERENT_ANSWER' } : previousResult
+  })
+  const workspace = createAutomationContextWorkspace({ home, isTracked: async () => false })
+  const manual = await workspace.beginManualLaunch([directory]); expect(manual.acquired).toBe(true)
+  const deps = { ...f.deps, workspace, resolvePreviousResult,
+    reportExit: async () => { throw new Error('No exit reporting before provider') },
+    runtimeStore: createServerAutomationRuntimeStore({ filePath: join(home, 'runtime.json') }),
+    transportForRun: async () => f.transport, resolveContext: async () => ({ environmentVariables: {} }),
+    heartbeat: async () => ({ ok: true }), log: vi.fn(), start: f.start }
+  const host = createAutomationContextHost(deps)
+  const prepared = await (host as any).prepare({ automationId: 'a1', generation: 1, revision: 1, payload })
+  expect(prepared).toEqual({ previousResult })
+  await host.dispatch({ ...f.input, payload, ...prepared, environmentVariables: {} })
+  const original = await f.deps.journal.read('r1')
+  unavailable = true
+  if (manual.acquired) await manual.finish({ submitted: false, tracked: false })
+  await createAutomationContextHost(deps).maintain()
+  expect(f.start).not.toHaveBeenCalled()
+  expect(await f.deps.journal.read('r1')).toMatchObject({ phase: 'registered', deferredDispatch: 'queued', prepared: original!.prepared })
+  expect(resolvePreviousResult).toHaveBeenLastCalledWith({ automationId: 'a1', generation: 1, revision: 1, displaySessionId: 'manual', beforeRunId: 'r1' })
+  expect(JSON.stringify(deps.log.mock.calls)).not.toContain(previousResult.answer)
+})

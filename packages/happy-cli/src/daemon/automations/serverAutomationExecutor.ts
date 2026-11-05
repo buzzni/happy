@@ -4,6 +4,7 @@ import { mergePullRequestFiles, type PullRequestFiles } from './queryGithubPullR
 import { randomUUID } from 'node:crypto'
 import { buildScheduledRunPrompt } from '@/utils/scheduledRunPrompt'
 import { automationExecutionSessionId, isAutomationExecutionSessionId } from '@slopus/happy-wire'
+import { buildAutomationContextInput } from './automationContextInput'
 
 import {
   buildAutomationPrompt,
@@ -31,7 +32,7 @@ import type { AutomationDeliveryCoordinator } from './automationDelivery'
 import { isPermanentGithubTriggerFailure } from './githubTriggerPermanentFailure'
 import {
   forgetUnreachableRetry,
-  hasDueUnreachableRetry,
+  findDueRetry,
   hasUnsettledUnreachableRetry,
   holdUnreachableRetry,
   maintainUnreachableRetries,
@@ -206,8 +207,10 @@ export interface ServerAutomationExecutorInput {
   isolatedContextReady?: boolean
   /** Acknowledges only original run-owned cancellation, never a manual display session. */
   cancelIsolatedContext?: (input: { automationId: string; revision: number; generation: number }) => Promise<boolean>
+  prepareIsolatedContext?: (input: { automationId: string; generation: number; revision: number; payload: ServerAutomationPayload;
+    runId?: string }) => Promise<{ previousResult?: unknown }>
   dispatchIsolatedContext?: (input: { automationId: string; generation: number; revision: number; runId: string; claimToken: string;
-    payload: ServerAutomationPayload; environmentVariables: Record<string, string>; mcpSpawnContext?: AutomationMcpSpawnContext }) => Promise<{
+    payload: ServerAutomationPayload; previousResult?: unknown; environmentVariables: Record<string, string>; mcpSpawnContext?: AutomationMcpSpawnContext }) => Promise<{
       state: 'started' | 'waiting' | 'needs-attention'; sessionId: string; reason?: string;
       /** True only after an active daemon supervisor durably owns this original claim and its eventual report. */
       deferred?: true
@@ -1284,6 +1287,7 @@ async function executeStartedRun(
   run: { runId: string; claimToken: string },
   githubMode: 'poll' | 'work' = 'work',
   trace: RunTrace = { step: 'start' },
+  preparedContext?: { previousResult?: unknown },
 ): Promise<{
   outcome: ServerAutomationReportOutcome
   sessionId: string | null
@@ -1834,7 +1838,7 @@ async function executeStartedRun(
     if (payload.contextPolicy) {
       step('dispatch-isolated-context')
       const dispatched = await input.dispatchIsolatedContext!({ automationId: automation.automationId, generation: automation.generation,
-        revision: automation.revision, ...run, payload, environmentVariables: authority.environmentVariables,
+        revision: automation.revision, ...run, payload, ...preparedContext, environmentVariables: authority.environmentVariables,
         ...(spawnMcpContext ? { mcpSpawnContext: spawnMcpContext } : {}) })
       const degraded = degradedCode ? { degradedCode } : {}
       if (dispatched.sessionId !== automationExecutionSessionId(run.runId)) return {
@@ -2077,12 +2081,28 @@ export async function runServerAutomationTick(
     if (!schedule || schedule.generation !== automation.generation) continue
     // 마감을 확인받지 못한 보류 run 이 있으면 due 를 그대로 두고 다음 틱에 다시 본다.
     if (hasUnsettledUnreachableRetry(runtimeState, automation.automationId)) continue
-    const retryDue = hasDueUnreachableRetry(runtimeState, automation, now)
+    const retryDue = findDueRetry(runtimeState, automation, now)
     if (schedule.nextRunAt > now && !immediateWorker && !retryDue) continue
     const payload = payloads.get(automation.automationId)!
     if (payload.contextPolicy && input.isolatedContextReady === false) {
       input.logDebug?.(`[server-automation] ${automation.automationId} isolated host unready; holding the original occurrence before claim`)
       continue
+    }
+    if (payload.contextPolicy && schedule.contextAdmissionHold?.revision === automation.revision
+      && schedule.contextAdmissionHold.scheduledFor === schedule.nextRunAt) continue
+    let preparedContext: { previousResult?: unknown } | undefined
+    if (payload.contextPolicy) {
+      try {
+        preparedContext = await input.prepareIsolatedContext?.({ automationId: automation.automationId,
+          generation: automation.generation, revision: automation.revision, payload,
+          ...(retryDue ? { runId: retryDue.report.runId } : {}) }) ?? {}
+        buildAutomationContextInput({ automationId: automation.automationId, payload, ...preparedContext })
+      } catch (error) {
+        const code = error instanceof Error && /^AUTOMATION_[A-Z0-9_]{1,100}$/.test(error.message)
+          ? error.message : 'AUTOMATION_CONTEXT_INPUT_UNCONFIRMED'
+        input.logDebug?.(`[server-automation] ${automation.automationId} held before claim code=${code}`)
+        continue
+      }
     }
     const queuedGithubEvents = payload.githubTrigger ? githubQueueDepth(input, automation) : 0
     const githubMode = payload.githubTrigger && queuedGithubEvents === 0 ? 'poll' : 'work'
@@ -2134,6 +2154,14 @@ export async function runServerAutomationTick(
         scheduledFor: schedule.nextRunAt,
       })
       if (!claim.ok || !claim.value) {
+        if (claim.error === 'claim-denied' && payload.contextPolicy && isOnceSchedule(payload.schedule)) {
+          const state = input.runtimeStore.read()
+          input.runtimeStore.write({ ...state, schedules: state.schedules.map(item => item.automationId === automation.automationId
+            ? { ...item, contextAdmissionHold: { code: 'CLAIM_RECONFIRMATION_REQUIRED', revision: automation.revision, scheduledFor: schedule.nextRunAt } }
+            : item) })
+          input.logDebug?.(`[server-automation] ${automation.automationId} once claim denied; original occurrence retained for reconfirmation`)
+          continue
+        }
         if (claim.error === 'already-claimed') markOnceOccurrenceSpent(input, automation.automationId, payload, schedule.nextRunAt)
         if (claim.error === 'claim-denied' || claim.error === 'already-claimed'
           || (claim.error === 'active-run' && schedule.runRequestRevision == null)) {
@@ -2190,7 +2218,7 @@ export async function runServerAutomationTick(
     try {
       result = waitingSessionId
         ? { outcome: 'SKIPPED_GATE', sessionId: waitingSessionId }
-        : await executeStartedRun(input, automation, payload, { runId, claimToken }, githubMode, trace)
+        : await executeStartedRun(input, automation, payload, { runId, claimToken }, githubMode, trace, preparedContext)
     } catch (error) {
       if (error instanceof TickAbandonedError) {
         input.logDebug?.(`[server-automation] ${automation.automationId} run=${runId} abandoned at ${error.step}; reporting the run as failed so the server releases it`)

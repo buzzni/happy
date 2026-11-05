@@ -262,6 +262,18 @@ describe('automationExecutionService', () => {
         }, now)).resolves.toEqual({ ok: false, error: 'claim-denied' });
     });
 
+    it('keeps the original replay window for executable definitions after input holding', async () => {
+        const tx = makeTx();
+        tx.automation.findFirst.mockResolvedValue(automation({ payloadVersion: 4 }));
+        await expect(claimAutomationRun(tx as never, 'account-1', 'machine-1', {
+            automationId: 'automation-1', generation: 3, scheduledFor: new Date(now.getTime() - 91_000),
+        }, now)).resolves.toEqual({ ok: false, error: 'claim-denied' });
+        expect(tx.automationRun.createMany).not.toHaveBeenCalled();
+        await expect(claimAutomationRun(tx as never, 'account-1', 'machine-1', {
+            automationId: 'automation-1', generation: 3, scheduledFor: now,
+        }, now)).resolves.toMatchObject({ ok: true });
+    });
+
     it('accepts an older due time only when it exactly matches the durable run-now request', async () => {
         const tx = makeTx();
         const requestedAt = new Date(now.getTime() - 10 * 60_000);

@@ -143,4 +143,13 @@ describe('serverAutomationRuntimeStore', () => {
     expect(readdirSync(dir)).toEqual(['server-automation-runtime.v1.json'])
     if (process.platform !== 'win32') expect(statSync(file).mode & 0o777).toBe(0o600)
   })
+
+  it('preserves an unconsumed once claim reconfirmation across runtime restart', () => {
+    const store = createServerAutomationRuntimeStore({ filePath: file })
+    const schedule = { automationId: 'a1', generation: 2, nextRunAt: 100, lastSessionId: null,
+      contextAdmissionHold: { code: 'CLAIM_RECONFIRMATION_REQUIRED' as const, revision: 3, scheduledFor: 100 } }
+    store.write({ schedules: [schedule], pendingReports: [] })
+    expect(createServerAutomationRuntimeStore({ filePath: file }).read().schedules[0]).toMatchObject(schedule)
+  })
+
 })

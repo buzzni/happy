@@ -4302,6 +4302,46 @@ describe('isolated scheduled conversation admission', () => {
     return f
   }
 
+  it.each(['reference', 'input'])('holds a one-time isolated occurrence before claim when its %s is unavailable', async reason => {
+    const f = isolatedSetup(), original = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
+    const previousResult = { automationId: 'automation-1', status: 'NONE_ELIGIBLE' }
+    f.input.decryptPayload = () => ({ ...original, ...(reason === 'input' ? { prompt: 'x'.repeat(65536) } : {}),
+      contextPolicy: { kind: 'isolated', reference: reason === 'reference' ? { kind: 'previous-result', maxBytes: 16384 } : null },
+      schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } })
+    const prepare = vi.fn(async () => { if (reason === 'reference') throw new Error('AUTOMATION_REFERENCE_HTTP_404'); return {} })
+    Object.assign(f.input, { prepareIsolatedContext: prepare })
+    const dispatch = vi.fn(async () => ({ state: 'started' as const, sessionId: 'automation-run:run-1' }))
+    f.input.dispatchIsolatedContext = dispatch
+    expect(await runServerAutomationTick(f.input)).toEqual([])
+    expect(f.transport.claim).not.toHaveBeenCalled(); expect(dispatch).not.toHaveBeenCalled()
+    expect(f.transport.report).not.toHaveBeenCalled()
+    const due = f.store.state().schedules[0].nextRunAt
+    expect(due).toBeLessThanOrEqual(f.now)
+    f.input.decryptPayload = () => ({ ...original,
+      contextPolicy: { kind: 'isolated', reference: { kind: 'previous-result', maxBytes: 16384 } },
+      schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } })
+    prepare.mockImplementation(async () => ({ previousResult }))
+    await runServerAutomationTick(f.input)
+    expect(f.transport.claim).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ scheduledFor: due }))
+    expect(dispatch).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ previousResult }))
+  })
+
+  it('preserves an overdue isolated once occurrence for reconfirmation after the server refuses its claim', async () => {
+    const f = isolatedSetup(), original = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
+    f.input.decryptPayload = () => ({ ...original, schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } })
+    f.input.now = f.now + 120_000
+    f.transport.claim.mockResolvedValue({ ok: false, error: 'claim-denied' })
+    f.input.dispatchIsolatedContext = vi.fn(async () => ({ state: 'started' as const, sessionId: 'automation-run:run-1' }))
+    const due = f.store.read().schedules[0].nextRunAt
+    await runServerAutomationTick(f.input)
+    expect(f.store.read().schedules[0]).toMatchObject({ nextRunAt: due,
+      contextAdmissionHold: { code: 'CLAIM_RECONFIRMATION_REQUIRED', revision: 2, scheduledFor: due } })
+    expect(f.store.read().schedules[0].spentOnceAt).toBeUndefined()
+    await runServerAutomationTick(f.input)
+    expect(f.transport.claim).toHaveBeenCalledOnce()
+    expect(f.transport.start).not.toHaveBeenCalled(); expect(f.input.dispatchIsolatedContext).not.toHaveBeenCalled()
+  })
+
   it('dispatches an authorized immutable v6 run without touching manual delivery, resume or project links', async () => {
     const f = isolatedSetup()
     f.input.isSessionWaitingForUser = () => true

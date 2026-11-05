@@ -2,6 +2,7 @@ import type { ChildProcess } from 'node:child_process'
 import { createSerialLock } from '@/utils/refreshRecovery'
 import { observeAutomationContextChild } from '@/utils/automationContextExit'
 import { OwnedStartRefused } from '../ownedSpawn'
+import { buildAutomationContextInput } from './automationContextInput'
 import { createAutomationContextLauncher, type AutomationContextLaunchDependencies, type AutomationContextLaunchRecord,
   type AutomationContextLaunchRequest } from './automationContextLaunch'
 import { createAutomationContextDeferred } from './automationContextDeferred'
@@ -10,6 +11,7 @@ import type { ServerAutomationRuntimeStore } from './serverAutomationRuntimeStor
 
 type Dispatch = NonNullable<ServerAutomationExecutorInput['dispatchIsolatedContext']>
 type DispatchInput = Parameters<Dispatch>[0]
+type Preparation = NonNullable<ServerAutomationExecutorInput['prepareIsolatedContext']>
 type Cancellation = NonNullable<ServerAutomationExecutorInput['cancelIsolatedContext']>
 type Context = Pick<DispatchInput, 'environmentVariables' | 'mcpSpawnContext'>
 type Transport = Pick<AutomationContextLaunchDependencies, 'register' | 'persistSeed'> & {
@@ -24,6 +26,8 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
   runtimeStore: ServerAutomationRuntimeStore
   transportForRun(run: AutomationContextLaunchRequest, prepared: AutomationContextLaunchRecord['prepared']): Promise<Transport>
   resolveContext(run: AutomationContextLaunchRequest): Promise<Context>
+  resolvePreviousResult?(input: { automationId: string; generation: number; revision: number;
+    displaySessionId: string; beforeRunId?: string }): Promise<unknown>
   start: (options: Parameters<AutomationContextLaunchDependencies['start']>[0], context: Context,
     observeChild: (child: ChildProcess) => void) => ReturnType<AutomationContextLaunchDependencies['start']>
   heartbeat: Parameters<typeof createAutomationContextDeferred>[0]['heartbeat']
@@ -35,6 +39,22 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
 }) {
   const entries = new Map<string, ReturnType<typeof createEntry>>()
   const maintain = createSerialLock()
+  async function resolvePrevious(run: Parameters<Preparation>[0], beforeRunId?: string) {
+    if (!deps.resolvePreviousResult || !run.payload.conversation) throw new Error('AUTOMATION_REFERENCE_UNSUPPORTED')
+    return deps.resolvePreviousResult({ automationId: run.automationId, generation: run.generation, revision: run.revision,
+      displaySessionId: run.payload.conversation.sessionId, ...(beforeRunId ? { beforeRunId } : {}) })
+  }
+  const prepare: Preparation = async input => {
+    const original = input.runId ? await entry(input.runId).launcher.restoreRequest(input.runId) : null
+    if (original && (original.automationId !== input.automationId || original.generation !== input.generation || original.revision !== input.revision)) {
+      throw new Error('AUTOMATION_LAUNCH_IDENTITY_CONFLICT')
+    }
+    const previousResult = input.payload.contextPolicy?.reference?.kind === 'previous-result'
+      ? original ? original.previousResult : await resolvePrevious(input) : undefined
+    const result = previousResult === undefined ? {} : { previousResult }
+    buildAutomationContextInput({ ...input, ...result })
+    return result
+  }
   function createEntry(runId: string) {
     const lock = createSerialLock()
     let context: Context | null = null, transport: Transport | null = null
@@ -53,6 +73,12 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
       },
       beforeStart: async (run, prepared) => {
         context = await deps.resolveContext(run)
+        if (run.payload.contextPolicy?.reference?.kind === 'previous-result') {
+          const fresh = await resolvePrevious(run, run.runId)
+          if (JSON.stringify(buildAutomationContextInput({ ...run, previousResult: fresh })) !== JSON.stringify(buildAutomationContextInput(run))) {
+            throw new Error('AUTOMATION_REFERENCE_CHANGED')
+          }
+        }
         await (await deps.transportForRun(run, prepared)).verifyStart(run, prepared)
       },
       start: async options => {
@@ -94,13 +120,26 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
       return lock(async () => {
         context = { environmentVariables: input.environmentVariables, mcpSpawnContext: input.mcpSpawnContext }
         try {
-          const { environmentVariables: _environment, mcpSpawnContext: _mcp, ...run } = input
-          const result = await launcher.launch(run)
+          const { environmentVariables: _environment, mcpSpawnContext: _mcp, ...request } = input
+          const original = await launcher.restoreRequest(input.runId)
+          const selection = original ? { previousResult: original.previousResult }
+            : Object.hasOwn(request, 'previousResult') ? {} : await prepare(request)
+          const result = await launcher.launch({ ...request, ...selection })
           if (result.state === 'waiting') {
             await supervisor.defer(runId)
             return { ...result, deferred: true as const }
           }
           return result
+        } catch (error) {
+          const record = await deps.journal.read(runId)
+          if (error instanceof Error && /^AUTOMATION_REFERENCE_[A-Z0-9_]+$/.test(error.message)
+            && record && (record.phase === 'prepared' || record.phase === 'registered')) {
+            await supervisor.defer(runId)
+            deps.log(`[automation-context] Reference held run=${runId} code=${error.message}`)
+            return { state: 'waiting' as const, sessionId: record.sessionId, displaySessionId: record.displaySessionId,
+              reason: error.message, deferred: true as const }
+          }
+          throw error
         } finally { context = null; transport = null }
       })
     } }
@@ -132,6 +171,7 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
       }
       return confirmed
     },
+    prepare,
     dispatch(input: DispatchInput) { return entry(input.runId).dispatch(input) },
     recover(runId: string) { return entry(runId).launcher.recover(runId) },
     maintain(signal?: AbortSignal) {
@@ -160,8 +200,8 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
 
 /** Prepare the new execution path without making it a prerequisite of legacy ticking. */
 export async function prepareAutomationContextTick(host: (Pick<ReturnType<typeof createAutomationContextHost>, 'maintain' | 'dispatch'>
-  & Partial<Pick<ReturnType<typeof createAutomationContextHost>, 'cancelAutomation'>>) | null,
-  signal: AbortSignal, log: (message: string) => void): Promise<{ isolatedContextReady: boolean; dispatchIsolatedContext?: Dispatch; cancelIsolatedContext?: Cancellation }> {
+  & Partial<Pick<ReturnType<typeof createAutomationContextHost>, 'cancelAutomation' | 'prepare'>>) | null,
+  signal: AbortSignal, log: (message: string) => void): Promise<{ isolatedContextReady: boolean; prepareIsolatedContext?: Preparation; dispatchIsolatedContext?: Dispatch; cancelIsolatedContext?: Cancellation }> {
   if (!host || signal.aborted) return { isolatedContextReady: false }
   try { await host.maintain(signal) }
   catch {
@@ -170,5 +210,5 @@ export async function prepareAutomationContextTick(host: (Pick<ReturnType<typeof
     return { isolatedContextReady: false }
   }
   return signal.aborted ? { isolatedContextReady: false } : { isolatedContextReady: true,
-    dispatchIsolatedContext: host.dispatch, ...(host.cancelAutomation ? { cancelIsolatedContext: host.cancelAutomation } : {}) }
+    dispatchIsolatedContext: host.dispatch, ...(host.prepare ? { prepareIsolatedContext: host.prepare } : {}), ...(host.cancelAutomation ? { cancelIsolatedContext: host.cancelAutomation } : {}) }
 }

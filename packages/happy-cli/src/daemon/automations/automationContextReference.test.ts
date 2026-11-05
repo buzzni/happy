@@ -3,6 +3,7 @@ import { createServer, type Server } from 'node:http'
 import { createHash } from 'node:crypto'
 import { automationExecutionSeedSchema, createEnvelope, sessionCreateBodyHash, type SessionEnvelope } from '@slopus/happy-wire'
 import { encrypt, encodeBase64 } from '@/api/encryption'
+import type { AutomationContextLaunchRecord } from './automationContextLaunch'
 import { createAutomationContextReferenceReader } from './automationContextReference'
 
 let server: Server, origin: string, mode: string, paths: string[]
@@ -15,8 +16,9 @@ function fixture() {
     inputSha256: 'a'.repeat(64), references: [], wholeContextTokens: 'unknown' })
   const { question, ...fields } = seed
   const manifest = { ...fields, questionBytes: Buffer.byteLength(question), seedSha256: createHash('sha256').update(JSON.stringify(seed)).digest('hex') }
-  const encrypted = (data: unknown) => encodeBase64(encrypt(key, 'legacy', data))
-  const body = { tag: 'automation-run:prior', metadata: encrypted({ flavor: 'claude', automationExecutionSeedManifest: manifest }), agentState: null }
+  const encrypted = (data: unknown) => encodeBase64(encrypt(key, mode === 'data-key' ? 'dataKey' : 'legacy', data))
+  const body = { tag: 'automation-run:prior', metadata: encrypted({ flavor: 'claude', automationExecutionSeedManifest: manifest }), agentState: null,
+    ...(mode === 'data-key' ? { dataEncryptionKey: Buffer.alloc(105, 4).toString('base64') } : {}) }
   const row = (seq: number, ev: SessionEnvelope['ev']) => {
     const envelope = createEnvelope('agent', ev, { turn: 'answer-turn' })
     return { seq, localId: `automation-evidence:prior:${envelope.id}`, content: { t: 'encrypted', c: encrypted({ role: 'session', content: envelope }) } }
@@ -53,7 +55,7 @@ beforeEach(async () => {
       const paginated = mode === 'pages' || mode === 'changed-pages'
       res.end(JSON.stringify({ runId: 'prior', automationId: 'a1', generation: 1, displaySessionId: 'manual', executionSessionId: 'automation-run:prior',
         seedManifestCiphertext: f.body.metadata, seedMessage: after ? null : f.seedMessage,
-        dataEncryptionKey: mode === 'missing-key' ? 'new-key-requiring-private-journal' : null,
+        dataEncryptionKey: mode === 'missing-key' ? 'new-key-requiring-private-journal' : f.body.dataEncryptionKey ?? null,
         throughSeq: after && mode === 'changed-pages' ? 5 : 4,
         messages: mode === 'cycle' || mode === 'pending' ? f.messages.slice(0, 2)
           : paginated ? after ? f.messages.slice(2) : f.messages.slice(0, 2) : f.messages,
@@ -90,3 +92,20 @@ it.each(['denied', 'deleted', 'foreign', 'partial', 'missing-key', 'bad-seed', '
     mode = value
     await expect(reader().resolve(input)).rejects.toThrow(/AUTOMATION_REFERENCE_/)
   })
+
+it.each(['valid', 'scope', 'key', 'body'] as const)('uses only the scoped original private dataKey creation record: %s', async variant => {
+  mode = 'data-key'; record = fixture()
+  const original: AutomationContextLaunchRecord = { version: 1,
+    scope: createHash('sha256').update(JSON.stringify([origin, 'owner', 'm1'])).digest('hex'), requestHash: 'a'.repeat(64),
+    automationId: 'a1', generation: 1, revision: 2, runId: 'prior', displaySessionId: 'manual',
+    phase: 'started', sessionId: 'automation-run:prior', prepared: { body: record.body,
+      encryptionKey: encodeBase64(key), encryptionVariant: 'dataKey',
+      seedMessage: { localId: 'automation-seed:prior', content: record.seedMessage.content.c } } }
+  if (variant === 'scope') original.scope = '0'.repeat(64)
+  if (variant === 'key') original.prepared.encryptionKey = encodeBase64(new Uint8Array(32).fill(8))
+  if (variant === 'body') original.prepared.body = { ...original.prepared.body, agentState: 'different-original-body' }
+  const source = createAutomationContextReferenceReader({ serverUrl: origin, token: 'fixture-token', accountId: 'owner', machineId: 'm1',
+    journal: { read: async () => original } })
+  if (variant === 'valid') expect(await source.resolve(input)).toMatchObject({ status: 'COMPLETED', runId: 'prior', answer: 'Selected answer only' })
+  else await expect(source.resolve(input)).rejects.toThrow('AUTOMATION_REFERENCE_UNAVAILABLE')
+})
