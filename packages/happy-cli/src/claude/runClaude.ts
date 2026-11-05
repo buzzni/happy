@@ -546,11 +546,11 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // system.init message in claudeRemote.ts via onSDKMetadata callback
 
     stage('checkpoint-composition');
+    // Created with the message queue below; MCP tools admitted before then are refused by the gate itself.
+    let runtimeGate: RuntimeProducerGate | undefined;
     // Create realtime session
     const session = launchControl || workspaceControl ? api.sessionSyncClient(response, { trackShutdownStorage: true }) : api.sessionSyncClient(response);
     stage('session-client');
-    // Created with the message queue below; MCP tools admitted before then are refused by the gate itself.
-    let runtimeGate: RuntimeProducerGate | undefined;
     let standaloneDrain: ClaudeStandaloneDrain | undefined;
     /**
      * Owns the routing floor across accept → engine-apply. Accepting a turn only

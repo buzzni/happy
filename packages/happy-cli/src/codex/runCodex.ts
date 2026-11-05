@@ -472,6 +472,7 @@ export async function runCodex(opts: {
 
     // Handle server unreachable case - create offline stub with hot reconnection
     let session: ApiSessionClient;
+    let runtimeGate: RuntimeProducerGate | undefined;
     // Permission handler declared here so it can be updated in onSessionSwap callback
     // (assigned later at line ~385 after client setup)
     let permissionHandler: CodexPermissionHandler;
@@ -550,7 +551,7 @@ export async function runCodex(opts: {
     let shouldExit = false;
     let pending: CollectedBatch<EnhancedMode> | null = null;
     // Only a launch-bound local channel can invoke drain; never a session RPC.
-    const runtimeGate = session.tracksShutdownStorage && !managedStartup ? new RuntimeProducerGate({
+    runtimeGate = session.tracksShutdownStorage && !managedStartup ? new RuntimeProducerGate({
         hasUndeliveredInput: () => pending !== null || messageQueue.size() > 0,
         canFreezeInbound: () => !reconnectionHandle && session === initialSession && session.canFreezeInboundMessagesForShutdown(),
         freezeInbound: () => session.freezeInboundMessagesForShutdown(),
