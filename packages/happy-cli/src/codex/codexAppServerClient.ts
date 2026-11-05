@@ -2128,7 +2128,11 @@ export class CodexAppServerClient {
     async prepareSideCommand(args: string[]): Promise<{ command: string; args: string[]; env: Record<string, string> } | null> {
         if (!this.connected || !this.sideCommandAllowed) return null;
         // The proxy env was built from the app-server's already sanitized env.
-        const env: Record<string, string> = { ...(this.multiAuthProxy?.env ?? sanitizeChildEnv(process.env, { boundary: 'in-session' })) };
+        return this.wrapSideLaunch(args, { ...(this.multiAuthProxy?.env ?? sanitizeChildEnv(process.env, { boundary: 'in-session' })) });
+    }
+
+    /** The multi-auth proxy arguments and this app-server's sandbox wrapper, on a side launch. Never initializes or resets the sandbox. */
+    private async wrapSideLaunch(args: string[], env: Record<string, string>): Promise<{ command: string; args: string[]; env: Record<string, string> }> {
         if (this.sandboxEnabled && process.platform === 'darwin') {
             env.CODEX_SANDBOX = 'seatbelt';
         } else if (this.sandboxEnabled && process.platform === 'linux' && env.CODEX_SANDBOX === 'seatbelt') {
