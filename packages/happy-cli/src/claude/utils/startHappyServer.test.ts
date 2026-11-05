@@ -302,7 +302,7 @@ describe('Happy MCP shutdown admission', () => {
     it('refuses every advertised tool before its callback runs', async () => {
         const admitTool = vi.fn(async () => { throw new Error('closed'); });
         const proposal = vi.fn(() => ({ accepted: true }));
-        const server = await startHappyServer(makeFakeClient(false), { admitTool, proposeLesson: proposal, checkpointReader: { query: proposal } as never });
+        const server = await startHappyServer(makeFakeClient(false), { admitTool, proposeLesson: proposal, checkpointReader: { query: proposal } as never, linkedPullRequestTools: true });
         const args: Record<string, Record<string, unknown>> = {
             session_write_scope: { action: 'list' },
             propose_lesson: { token: '00000000-0000-4000-8000-000000000001', proposal: {} },
@@ -310,6 +310,8 @@ describe('Happy MCP shutdown admission', () => {
             checkpoint_diff: { checkpointId: 'a'.repeat(40), path: 'file.txt' },
             change_title: { title: 'no-write' }, bash_stream: { command: 'no-execution' },
             next_steps: { summary: 'no-write', actions: [] },
+            saycode_pr_link: { action: 'link', url: 'https://github.com/o/r/pull/1' },
+            saycode_pr_watch: { action: 'start', url: 'https://github.com/o/r/pull/1' },
             script_automations: { request: { operation: 'list' } },
             scheduled_tasks: { request: { operation: 'list' } },
             browser_click: { ref: '@e1' }, browser_fill: { ref: '@e1', value: 'x' },

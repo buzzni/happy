@@ -10,6 +10,10 @@ import type { ClaudeSessionProtocolState } from '@/claude/utils/sessionProtocolM
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { inputEvidenceMetadata, resolveRecoveredInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings';
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
+import { applyLinkedPullRequestChange, parsePullRequestUrl } from '@/claude/utils/linkedPullRequestTools';
+import { updateClaudePromptSuggestion } from '@/claude/promptSuggestionMetadata';
+import { applySessionModelPinPatch } from '@/utils/sessionModelPin';
+import { mergeAcpSessionConfigIntoMetadata } from '@/agent/acp/sessionConfigMetadata';
 import { SessionStateWrites } from './sessionStateWrites';
 import { SessionStorageBarrier } from './sessionStorageBarrier';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -1003,6 +1007,96 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect(client.getMetadata()).toEqual({
             ...concurrentMetadata,
             lifecycleState: 'running',
+        });
+    });
+
+    // aplus-dev-studio-desktop specs/linked-pull-requests T4 — Desktop and this CLI share the array.
+    describe('linkedPullRequests', () => {
+        const happy = parsePullRequestUrl('https://github.com/buzzni/happy/pull/1125')!;
+        const desktopEntry = {
+            url: 'https://github.com/buzzni/aplus-dev-studio-desktop/pull/2275', repo: 'buzzni/aplus-dev-studio-desktop', number: 2275,
+            linkedAt: 1, linkedBy: 'user', watch: { requested: true, requestedAt: 1, requestedBy: 'user',
+                owner: { clientId: 'desktop-1', claimedAt: 2, heartbeatAt: 3 }, state: 'watching', updatedAt: 3 },
+        };
+        const linkHappy = (metadata: Metadata) => applyLinkedPullRequestChange(metadata, { kind: 'link', pr: happy, by: 'agent', at: 10 }).metadata;
+
+        it('replays a link on the newest document after a version mismatch, keeping the Desktop owner', async () => {
+            const newer = { ...session.metadata, linkedPullRequests: [desktopEntry], summary: { text: 'Desktop title', updatedAt: 2 } };
+            mockSocket.emitWithAck
+                .mockResolvedValueOnce({ result: 'version-mismatch', version: 1, metadata: encryptContent(session, newer) })
+                .mockImplementationOnce(async (_event: string, payload: { metadata: string }) => ({ result: 'success', version: 2, metadata: payload.metadata }));
+            const client = new ApiSessionClient('fake-token', session);
+            client.updateMetadata(linkHappy);
+            await waitForCheck(() => expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(2));
+            const written = decrypt(session.encryptionKey, session.encryptionVariant, decodeBase64(mockSocket.emitWithAck.mock.calls[1][1].metadata)) as Metadata;
+            expect(written).toEqual({ ...newer, linkedPullRequests: [desktopEntry,
+                { url: happy.url, repo: 'buzzni/happy', number: 1125, linkedAt: 10, linkedBy: 'agent' }] });
+            expect(linkHappy(written)).toBe(written);
+            expect(client.getMetadata()).toEqual(written);
+        });
+
+        it('sends nothing when the replayed change is already there (skipUnchanged)', async () => {
+            const newer = { ...session.metadata, linkedPullRequests: [linkHappy(session.metadata).linkedPullRequests as unknown[]].flat() };
+            mockSocket.emitWithAck.mockResolvedValueOnce({ result: 'version-mismatch', version: 1, metadata: encryptContent(session, newer) });
+            const client = new ApiSessionClient('fake-token', session);
+            const stored = vi.fn();
+            client.updateMetadata(linkHappy, { skipUnchanged: true, onStored: stored });
+            await waitForCheck(() => expect(stored).toHaveBeenCalledTimes(1));
+            await new Promise(resolve => setTimeout(resolve, 10));
+            expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(1);
+            expect(client.getMetadata()).toEqual(newer);
+            // Unchanged from the start: no write at all.
+            client.updateMetadata(linkHappy, { skipUnchanged: true, onStored: stored });
+            await waitForCheck(() => expect(stored).toHaveBeenCalledTimes(2));
+            expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(1);
+        });
+
+        it('calls onStored only after the server acknowledged the write', async () => {
+            let ack!: () => void;
+            mockSocket.emitWithAck.mockImplementationOnce((_event: string, payload: { metadata: string }) => new Promise(resolve => {
+                ack = () => resolve({ result: 'success', version: 1, metadata: payload.metadata });
+            }));
+            const client = new ApiSessionClient('fake-token', session);
+            const stored = vi.fn();
+            client.updateMetadata(linkHappy, { skipUnchanged: true, onStored: stored });
+            await waitForCheck(() => expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(1));
+            expect(stored).not.toHaveBeenCalled();
+            ack();
+            await waitForCheck(() => expect(stored).toHaveBeenCalledTimes(1));
+        });
+
+        it('survives the other metadata writes of a running session', async () => {
+            const linked = { ...session.metadata, linkedPullRequests: [desktopEntry] };
+            let server: Metadata = linked;
+            let version = 0;
+            mockSocket.emitWithAck.mockImplementation(async (_event: string, payload: { expectedVersion: number; metadata: string }) => {
+                server = decrypt(session.encryptionKey, session.encryptionVariant, decodeBase64(payload.metadata)) as Metadata;
+                return { result: 'success', version: ++version, metadata: payload.metadata };
+            });
+            const client = new ApiSessionClient('fake-token', { ...session, metadata: linked });
+            client.updateMetadata(metadata => ({ ...metadata, summary: { text: 'CLI title', updatedAt: 4 } }));
+            client.updateMetadata(metadata => ({ ...metadata, permissionMode: 'plan', permissionModeUpdatedAt: 5 }));
+            client.updateMetadata(metadata => updateClaudePromptSuggestion(metadata, 'next', 6));
+            client.updateMetadata(metadata => applySessionModelPinPatch(metadata, { currentModelCode: 'opus', currentThoughtLevelCode: null }));
+            client.updateMetadata(metadata => mergeAcpSessionConfigIntoMetadata(metadata, { currentModeId: 'plan' }));
+            client.updateMetadata(metadata => inputEvidenceMetadata(metadata, false));
+            client.updateMetadata(metadata => ({ ...metadata, lifecycleState: 'archived', lifecycleStateSince: 7, archivedBy: 'cli' }));
+            await waitForCheck(() => expect(version).toBe(7));
+            expect(server).toMatchObject({ summary: { text: 'CLI title' }, permissionMode: 'plan', currentModelCode: 'opus', lifecycleState: 'archived' });
+            expect(server.linkedPullRequests).toEqual([desktopEntry]);
+        });
+
+        it.each(['claude', 'codex'] as const)('keeps the array when a %s runner resumes the session', (flavor) => {
+            const original: Metadata = { ...session.metadata, linkedPullRequests: [desktopEntry],
+                runtimeCapabilities: { saycodeSystemPromptPreference: true, linkedPullRequests: 1 } };
+            const fresh: Metadata = { ...makeSession().metadata, hostPid: 99, runtimeCapabilities: { saycodeSystemPromptPreference: true } };
+            const startup = runnerStartupTransforms(flavor, false, original, fresh);
+            for (const resumed of [startup.metadata, startup.refresh(original)]) {
+                expect(resumed.linkedPullRequests).toEqual([desktopEntry]);
+                expect(resumed.hostPid).toBe(99);
+                // The capability is this runtime's: a runner without the tools does not inherit it.
+                expect(resumed.runtimeCapabilities).not.toHaveProperty('linkedPullRequests');
+            }
         });
     });
 
