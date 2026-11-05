@@ -349,7 +349,7 @@ import { mergeAdditionalDirectoriesIntoSandboxEnvironment, readAdditionalDirecto
 import { createAutomationContextWorkspace } from './automations/automationContextWorkspace';
 import { createAutomationContextHost, prepareAutomationContextTick } from './automations/automationContextHost';
 import { createAutomationContextReferenceReader } from './automations/automationContextReference';
-import { createFilesystemWriteAdmission, createSubprocessWriteAdmission, canonicalWorkspaceAdmissionRoots } from '@/utils/workspaceTurnAdmission';
+import { createFilesystemWriteAdmission, createSubprocessWriteAdmission, createLegacyDispatchAdmission, canonicalWorkspaceAdmissionRoots } from '@/utils/workspaceTurnAdmission';
 import { observeWorkspaceContextChild, WORKSPACE_CONTEXT_CONTROL_ENV } from '@/utils/workspaceContextControl';
 import { probeProcessGroup } from './managedProcessGroup';
 import { createAutomationContextLaunchJournal } from './automations/automationContextLaunchJournal';
@@ -1448,6 +1448,7 @@ export async function startDaemon(): Promise<void> {
     if (standaloneWindows) configureWindowsTerminalHost(standaloneWindows.terminalHost);
     const contextIsolationHostEnabled = process.env.HAPPY_CONTEXT_ISOLATION_HOST === '1' && process.platform !== 'win32';
     const admitSubprocess = contextIsolationHostEnabled ? createSubprocessWriteAdmission({ home: configuration.happyHomeDir }) : undefined;
+    const reserveLegacyDispatch = contextIsolationHostEnabled ? createLegacyDispatchAdmission({ home: configuration.happyHomeDir }) : undefined;
     // codexcli-org-requirements R10.5: which sessions' organizations switched autopilot off, as the
     // session processes recorded it, and the daemon's own entries in the organization audit.
     const orgRequirementsSessions = createOrgRequirementsStore({ happyHomeDir: configuration.happyHomeDir, serverUrl: configuration.serverUrl, accountKey: 'daemon' });
@@ -4204,7 +4205,8 @@ export async function startDaemon(): Promise<void> {
       runTick: () => standaloneWindows ? Promise.resolve() : runAutomationTick({
         store: automationStore,
         now: Date.now(),
-        runScript: (input) => runAutomationScript({ ...input, allowedRoot: automationAllowedRoot }),
+        reserveLegacyDispatch,
+        runScript: (input) => runAutomationScript({ ...input, allowedRoot: automationAllowedRoot, admitSubprocess }),
         spawnSession: spawnAutomationSession,
         isSessionRunning: isAutomationSessionRunning,
         isSessionWaitingForUser: isAutomationSessionWaitingForUser,
@@ -4340,6 +4342,7 @@ export async function startDaemon(): Promise<void> {
     const { port: controlPort, stop: stopControlServer, controlSecret } = await startDaemonControlServer({
       restartDrain: restartDrainControlPort,
       getCallerLaunches: () => callerLaunches,
+      ...(admitSubprocess ? { admitSubprocess } : {}),
       getSetupTokenAccountSwitch: () => setupTokenAccountSwitch,
       getChildren: getCurrentChildren,
       stopSession,
@@ -5300,6 +5303,7 @@ export async function startDaemon(): Promise<void> {
         if (signal.aborted) return;
         await runServerAutomationTick({
         ...contextAdmission,
+        reserveLegacyDispatch,
         hostCommandsAllowed: !standaloneWindows,
         signal,
         delivery: automationDelivery,
@@ -5314,7 +5318,7 @@ export async function startDaemon(): Promise<void> {
           machineId,
           onUnauthenticated: () => recordUnauthenticated(`automation ${automation.automationId}@${automation.revision}`),
         }),
-        runScript: (input) => runAutomationScript({ ...input, allowedRoot: automationAllowedRoot }),
+        runScript: (input) => runAutomationScript({ ...input, allowedRoot: automationAllowedRoot, admitSubprocess }),
         queryGithubPullRequests: (input) => queryGithubPullRequests({
           ...input,
           configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,

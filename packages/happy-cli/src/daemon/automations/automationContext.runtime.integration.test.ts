@@ -372,11 +372,17 @@ it('refuses a real daemon manual spawn while automatic ownership exists and perm
         const blockedAlias = await fixture.control('/spawn-session', { directory, agent: 'claude' })
         expect(blockedAlias.body).toMatchObject({ success: false, code: 'workspace-automation-busy' })
       }
+      const blockedServer = await fixture.control('/start-server', { command: 'node -v', cwd: fixture.project })
+      expect(blockedServer).toMatchObject({ status: 500, body: { code: 'WORKSPACE_UNAVAILABLE', error: 'WORKSPACE_BUSY' } })
       expect((await fixture.http('/v1/sessions')).body.sessions).toEqual(before)
     } finally {
       // This test reserved the workspace but never submitted an automatic provider.
       expect(await workspace.releaseUnsubmitted({ runId, roots: [fixture.project], ownerToken: owned.ownerToken })).toBe(true)
     }
+    const server = await fixture.control('/start-server', { command: 'node -v', cwd: fixture.project })
+    expect(server).toMatchObject({ status: 200, body: { success: true, pid: expect.any(Number) } })
+    expect(await workspace.acquireAutomation({ runId: `server-owner-${randomUUID()}`, roots: [fixture.project] }))
+      .toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' })
     const resumed = await fixture.control('/spawn-session', { directory: fixture.project, agent: 'claude' })
     await fixture.children()
     expect(resumed.body.success).toBe(true)
