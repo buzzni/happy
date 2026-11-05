@@ -529,6 +529,21 @@ describe('shared PC start budget (Saycode specs/shared-pc-start-budget)', () => 
     expect(session.sharedSetupTokenAccount).toBe(A)
   })
 
+  it('forgets the accounts with start budget once the session starts or runs without a decision', async () => {
+    let answer: () => Response = () => Response.json({ version: 1, state: 'wait', retryAfterMs: 30_000, preferredAccountIds: [B] })
+    const { switcher, sharedMachine } = startSetup(() => answer())
+    const startBudget = () => switcher.rebind('session-a', sharedRunning, undefined, undefined, { startBudget: true })
+    for (const next of [() => Response.json({ version: 1, state: 'allowed', validForMs: 15_000 }), () => new Response('{}', { status: 503 }),
+      () => Response.json({ version: 1, state: 'wait', retryAfterMs: 30_000, preferredAccountIds: [] })]) {
+      answer = () => Response.json({ version: 1, state: 'wait', retryAfterMs: 30_000, preferredAccountIds: [B] })
+      await switcher.requestStart('session-a', sharedRunning, REQUEST)
+      answer = next
+      await switcher.requestStart('session-a', sharedRunning, REQUEST)
+      expect(await startBudget()).toEqual({ ok: false, reason: 'NO_ACCOUNT' })
+    }
+    expect(sharedMachine.startBudgetMove).not.toHaveBeenCalled()
+  })
+
   it('runs the turn without asking when it cannot prove the account', async () => {
     const { switcher, requests, sharedMachine, session } = startSetup(() => Response.json({}))
     sharedMachine.startProof.mockResolvedValueOnce(null)

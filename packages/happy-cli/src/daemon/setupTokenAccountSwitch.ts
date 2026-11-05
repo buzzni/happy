@@ -299,18 +299,22 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
    * Saycode specs/shared-pc-start-budget — a shared-PC session asks Studio with the machine's own token. Only a decision
    * Studio actually answers holds the turn: an older Studio, a failure, a refusal or no answer runs it (decision D1).
    */
-  /** The accounts Studio last said have start budget left, per waiting shared-PC session: where a start-budget move goes. */
-  const sharedStartPreferred = new Map<string, string[]>()
+  /**
+   * The accounts Studio last said have start budget left, per waiting shared-PC session: where a start-budget move goes.
+   * Keyed by the tracked session, so an ended session's entry goes with it; any other outcome than such a wait clears it.
+   */
+  const sharedStartPreferred = new WeakMap<TrackedSession, string[]>()
   /** A waiting shared-PC session moves within this PC's accounts onto one Studio said has start budget left; null: none. */
   async function sharedStartBudgetMove(sessionId: string, shared: NonNullable<ReturnType<typeof sharedSession>>) {
-    const preferred = sharedStartPreferred.get(sessionId) ?? []
+    const preferred = sharedStartPreferred.get(shared.session) ?? []
     if (!preferred.length || !shared.sharedMachine.startBudgetMove) return null
     const environment = await shared.sharedMachine.startBudgetMove(shared.recorded, preferred)
-    if (environment) sharedStartPreferred.delete(sessionId)
+    if (environment) sharedStartPreferred.delete(shared.session)
     return environment
   }
   async function sharedStart(sessionId: string, shared: ReturnType<typeof sharedSession>, requestId: string, signal?: AbortSignal) {
     const open = (detail: string) => {
+      if (shared) sharedStartPreferred.delete(shared.session)
       logger.debug(`[setup-token-switch] shared start for ${sessionId} runs without a Studio decision: ${detail}`)
       return { ok: true as const, admission: { state: 'allowed' as const, validForMs: SHARED_START_OPEN_MS } }
     }
@@ -324,11 +328,13 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
         managedAccountId: shared.managedAccountId, credentialGeneration: proof.credentialGeneration, requestId })
       if (!response.ok) return open(`Studio answered ${response.status}`)
       const admission = await response.json() as { state?: unknown; preferredAccountIds?: unknown }
-      if (admission?.state === 'wait' && Array.isArray(admission.preferredAccountIds)) sharedStartPreferred.set(sessionId, admission.preferredAccountIds.filter((id: unknown): id is string => typeof id === 'string' && UUID.test(id)))
-      else sharedStartPreferred.delete(sessionId)
+      const preferred = admission?.state === 'wait' && Array.isArray(admission.preferredAccountIds)
+        ? admission.preferredAccountIds.filter((id: unknown): id is string => typeof id === 'string' && UUID.test(id)) : []
+      if (preferred.length) sharedStartPreferred.set(shared.session, preferred)
+      else sharedStartPreferred.delete(shared.session)
       return { ok: true as const, admission }
     } catch (error) {
-      if (signal?.aborted) return failure('REQUEST_FAILED', 'shared start cancelled')
+      if (signal?.aborted) { sharedStartPreferred.delete(shared.session); return failure('REQUEST_FAILED', 'shared start cancelled') }
       return open(`${(error as Error)?.name ?? 'error'}`)
     }
   }
