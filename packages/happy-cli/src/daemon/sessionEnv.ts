@@ -1,5 +1,6 @@
 import { manualPersonalSelectionSchema, MANUAL_PERSONAL_ENV, type ManualPersonalSelection } from './manualPersonalClaude'
 import { MachineSetupTokenBindingV2Schema, parseCanonicalOrgSetupTokenJson, type MachineSetupTokenBindingV2 } from '@slopus/happy-wire'
+import { randomBytes } from 'node:crypto'
 import { z } from 'zod'
 /**
  * Session spawn environments: what a daemon-spawned child gets explicitly on
@@ -130,6 +131,38 @@ function readRequestedSaycodeAgentGrant(
     return Object.fromEntries(
         SAYCODE_AGENT_ENV_KEYS.flatMap((key) => requested[key] === undefined ? [] : [[key, requested[key]]]),
     )
+}
+
+/**
+ * A client spawn request that carries no agent grant at all gets a root grant at its directory.
+ *
+ * Every session's prompt tells it to use `happy agent`, but each client had to
+ * seed the grant itself, and one spawn path after another forgot (web
+ * 2026-09-13, the mobile app and the web handoff path 2026-11-05): those
+ * sessions answered not_agent_env. Seeding here covers every client, including
+ * ones already installed.
+ *
+ * This adds no authority: a requester could already send a depth-0 grant
+ * itself. A request carrying any SAYCODE_AGENT_* key is left alone, so a child
+ * seed or a capped hub keeps its own values and a broken grant is still dropped
+ * whole instead of coming back as a fresh depth-0 budget. The scope stays at
+ * the directory and MAX_SPAWN is left to the machine-capacity tier.
+ */
+export function withDefaultSaycodeAgentGrant(
+    requested: Record<string, string> | undefined,
+    directory: unknown,
+    newAgentId: () => string = () => `ac-${randomBytes(8).toString('hex')}`,
+): Record<string, string> | undefined {
+    if (requested && Object.keys(requested).some((key) => key.startsWith('SAYCODE_AGENT_'))) return requested
+    const root = typeof directory === 'string' ? directory.trim() : ''
+    if (!DIRECTORY_VALUE.test(root)) return requested
+    return {
+        ...requested,
+        SAYCODE_AGENT_ENV: '1',
+        SAYCODE_AGENT_ROOT: root,
+        SAYCODE_AGENT_DEPTH: '0',
+        SAYCODE_AGENT_ID: newAgentId(),
+    }
 }
 
 /**
