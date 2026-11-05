@@ -21,6 +21,8 @@ import { WRITE_FILE_ATTEMPT_CAPABILITY } from '@/modules/common/writeFileAttempt
 import { LIST_FILES_PAGE_CAPABILITY } from '@/modules/common/listFilesPageCapability';
 import { McpCallerGrantEnvelopeConsumer } from '@/daemon/mcpCallerGrantEnvelope';
 import { join } from 'node:path';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { hkdfSync, randomBytes } from 'node:crypto';
 
 const {
@@ -633,6 +635,47 @@ describe('ApiMachineClient socket reconnection', () => {
 
         afterEach(() => {
             removeDaemonTerminalSession(sessionId);
+        });
+
+        it('uses an approved cwd and falls back after the owner revokes it', async () => {
+            const root = mkdtempSync(join(tmpdir(), 'happy-terminal-approved-'));
+            const originalHome = configuration.happyHomeDir;
+            const ids = ['approved-cwd', 'revoked-cwd'];
+            try {
+                Object.assign(configuration, { happyHomeDir: root });
+                const approvals = join(root, 'approved-folders.json');
+                writeFileSync(approvals, JSON.stringify({ version: 1, folders: [root] }));
+                const machine = makeMachine();
+                const client = new ApiMachineClient('fake-token', machine);
+                client.connect();
+                for (const [index, id] of ids.entries()) {
+                    if (index === 1) writeFileSync(approvals, JSON.stringify({ version: 1, folders: [] }));
+                    mockSocket.emit.mockClear();
+                    const params = encodeBase64(encrypt(machine.encryptionKey, machine.encryptionVariant, {
+                        // Let the relay attach before a short-lived shell emits its output.
+                        userId: 'u1', cwd: root, shell: '/bin/sh', args: ['-c', 'sleep 0.1; pwd'],
+                    }));
+                    const ack = await new Promise<any>((resolve) => emitSocketEvent('terminal-open-fwd', { sessionId: id, params }, resolve));
+                    expect(ack.ok).toBe(true);
+                    await vi.waitFor(() => expect(emitsOf('terminal-closed').filter((event) => event.sessionId === id)).toHaveLength(1), { timeout: 5000 });
+                    const output = emitsOf('terminal-frame').filter((frame) => frame.sessionId === id)
+                        .map((frame) => decrypt(machine.encryptionKey, machine.encryptionVariant, decodeBase64(frame.data))).join('');
+                    if (index === 0) {
+                        expect(output).toContain(root);
+                        expect(output).not.toContain('[info]');
+                    } else {
+                        expect(output).toContain('[info]');
+                    }
+                }
+            } finally {
+                for (const id of ids) {
+                    const entry = getDaemonTerminalSession(id);
+                    if (entry && !entry.exit) void entry.session.terminate();
+                    removeDaemonTerminalSession(id);
+                }
+                Object.assign(configuration, { happyHomeDir: originalHome });
+                rmSync(root, { recursive: true, force: true });
+            }
         });
 
         it('carries a seq and enters the replay buffer like any other frame', async () => {

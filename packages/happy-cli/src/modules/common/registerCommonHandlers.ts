@@ -589,6 +589,10 @@ export interface CommonHandlerOptions {
 export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, workingDirectory: string, options: CommonHandlerOptions = {}) {
     const downloadDirectories = createWorkspaceDownloadDirectoryReader();
     const checkPath = (path: string) => validatePath(path, workingDirectory, options.approvedRoots?.());
+    // Pick a currently authorized anchor; the workspace boundary still checks
+    // absolute paths, project containment, real paths and links beneath it.
+    const workspaceAnchor = (workspaceRoot: string) => [workingDirectory, ...(options.approvedRoots?.() ?? [])]
+        .find((root) => typeof workspaceRoot === 'string' && validatePath(workspaceRoot, root).valid) ?? workingDirectory;
     rpcHandlerManager.registerHandler('file-discovery', (request: unknown) => fileDiscovery(workingDirectory, request));
     const bashScheduler = createBashRpcScheduler();
     const bashEnvBoundary = options.childEnvBoundary ?? 'session';
@@ -870,20 +874,21 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
                 };
             }
             try {
+                const anchor = workspaceAnchor(data.workspaceRoot);
                 if (operation === 'listWorkspaceDownloadDirectory') {
-                    return { success: true, ...await downloadDirectories.list(workingDirectory, data.workspaceRoot, data.path, data.offset!, data.expectedIdentity, data.listingId) };
+                    return { success: true, ...await downloadDirectories.list(anchor, data.workspaceRoot, data.path, data.offset!, data.expectedIdentity, data.listingId) };
                 }
                 if (operation === 'closeWorkspaceDownloadDirectory') {
-                    await downloadDirectories.close(workingDirectory, data.workspaceRoot, data.path, data.listingId!);
+                    await downloadDirectories.close(anchor, data.workspaceRoot, data.path, data.listingId!);
                     return { success: true };
                 }
                 if (operation === 'readWorkspaceFileChunk') {
-                    return { success: true, ...await readWorkspaceFileChunk(workingDirectory, data.workspaceRoot, data.path, data.offset!, data.length!, data.expectedIdentity) };
+                    return { success: true, ...await readWorkspaceFileChunk(anchor, data.workspaceRoot, data.path, data.offset!, data.length!, data.expectedIdentity) };
                 }
                 if (operation === 'listWorkspaceDirectory') {
-                    return { success: true, entries: await listWorkspaceDirectory(workingDirectory, data.workspaceRoot, data.path) };
+                    return { success: true, entries: await listWorkspaceDirectory(anchor, data.workspaceRoot, data.path) };
                 }
-                return { success: true, content: (await readWorkspaceFile(workingDirectory, data.workspaceRoot, data.path)).toString('base64') };
+                return { success: true, content: (await readWorkspaceFile(anchor, data.workspaceRoot, data.path)).toString('base64') };
             } catch (error) {
                 return {
                     success: false,
@@ -911,7 +916,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         }
         try {
             const buffer = Buffer.from(data.content, 'base64');
-            await writeWorkspaceFile(workingDirectory, data.workspaceRoot, data.path, buffer);
+            await writeWorkspaceFile(workspaceAnchor(data.workspaceRoot), data.workspaceRoot, data.path, buffer);
             return { success: true, hash: createHash('sha256').update(buffer).digest('hex') };
         } catch (error) {
             return {

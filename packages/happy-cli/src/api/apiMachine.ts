@@ -4040,7 +4040,7 @@ export class ApiMachineClient {
                     homedir: homedir(),
                     fsExists: existsSync,
                     fsMkdir: (path) => mkdirSync(path, { recursive: true }),
-                    validate: validatePath,
+                    validate: (path, root) => validatePath(path, root, resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir)?.()),
                 });
                 let pty: ReturnType<typeof createPtySession>;
                 try {

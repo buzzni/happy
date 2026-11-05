@@ -639,6 +639,35 @@ describe('file RPCs under strict machine control', () => {
  * machine owner approved it on this machine.
  */
 describe('file RPCs for a folder the machine owner approved', () => {
+    it('authorizes workspace reads, downloads and creates using live approvals', async () => {
+        const outside = await mkdtemp(join(tmpdir(), 'happy-approved-workspace-'));
+        temporaryDirectories.push(outside);
+        const file = join(outside, 'README.md');
+        await writeFile(file, 'hello');
+        let approved = [outside];
+        const { handlers } = await createHandlers(undefined, { approvedRoots: () => approved });
+        const requests = [
+            ['listWorkspaceDirectory', { path: outside }],
+            ['readWorkspaceFile', { path: file }],
+            ['listWorkspaceDownloadDirectory', { path: outside, offset: 0 }],
+            ['readWorkspaceFileChunk', { path: file, offset: 0, length: 5 }],
+            ['writeWorkspaceFile', { path: join(outside, 'created.md'), content: 'eA==', expectedHash: null }],
+        ] as const;
+        for (const [method, request] of requests) {
+            await expect(handlers.get(method)!({ workspaceRoot: outside, ...request })).resolves.toMatchObject({ success: true });
+        }
+        const listing = await handlers.get('listWorkspaceDownloadDirectory')!({ workspaceRoot: outside, path: outside, offset: 0 });
+        await expect(handlers.get('closeWorkspaceDownloadDirectory')!({ workspaceRoot: outside, path: outside, listingId: listing.listingId })).resolves.toMatchObject({ success: true });
+        // Selecting an approved anchor must still enforce the project boundary and reject links.
+        await symlink(file, join(outside, 'linked.md'));
+        await expect(handlers.get('readWorkspaceFile')!({ workspaceRoot: outside, path: join(outside, 'linked.md') })).resolves.toMatchObject({ success: false, errorCode: 'WORKSPACE_PATH_DENIED' });
+        await expect(handlers.get('readWorkspaceFile')!({ workspaceRoot: outside, path: join(outside, '..', 'unapproved.md') })).resolves.toMatchObject({ success: false, errorCode: 'WORKSPACE_PATH_DENIED' });
+        approved = [];
+        for (const [method, request] of requests) {
+            await expect(handlers.get(method)!({ workspaceRoot: outside, ...request })).resolves.toMatchObject({ success: false, errorCode: 'WORKSPACE_PATH_DENIED' });
+        }
+    });
+
     it('lists, runs commands in and creates folders under an approved folder outside the allowed root, and nothing beside it', async () => {
         const outside = await mkdtemp(join(tmpdir(), 'happy-approved-'));
         temporaryDirectories.push(outside);
