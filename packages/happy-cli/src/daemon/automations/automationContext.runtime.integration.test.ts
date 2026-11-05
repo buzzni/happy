@@ -462,6 +462,15 @@ it.each(['claude', 'codex'] as const)('keeps four real %s CLI runs on one displa
               expect(await executionRpc(fixture, owned.sessionId, key, method, { action: 'capabilities' }))
                 .toMatchObject({ error: 'AUTOMATION_PROCESS_RPC_UNSUPPORTED' })
             }
+            const preprocessor = join(fixture.project, 'untracked-pre.sh')
+            await writeFile(preprocessor, '#!/bin/sh\n(sleep 0.2; printf unsafe > forbidden-pre.txt) >/dev/null 2>&1 &\ncat "$1"\n', { mode: 0o700 })
+            await writeFile(join(fixture.project, 'pre-input.txt'), 'probe')
+            expect(await executionRpc(fixture, owned.sessionId, key, 'ripgrep', {
+              args: ['--pre', preprocessor, '', 'pre-input.txt'], cwd: fixture.project,
+            })).toMatchObject({ success: false, error: 'AUTOMATION_PROCESS_RPC_UNSUPPORTED' })
+            expect(await executionRpc(fixture, owned.sessionId, key, 'difftastic', {
+              args: ['--version'], cwd: fixture.project,
+            })).toMatchObject({ success: false, error: 'AUTOMATION_PROCESS_RPC_UNSUPPORTED' })
             await expect(readFile(join(outside, 'forbidden.txt'))).rejects.toMatchObject({ code: 'ENOENT' })
             releaseModel()
           }
@@ -507,6 +516,7 @@ it.each(['claude', 'codex'] as const)('keeps four real %s CLI runs on one displa
     }
     expect(nativeIds.size).toBe(4)
     await expect(readFile(join(fixture.project, 'forbidden-shell.txt'))).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(readFile(join(fixture.project, 'forbidden-pre.txt'))).rejects.toMatchObject({ code: 'ENOENT' })
     expect(fixture.modelRequests).toHaveLength(4)
     expect(fixture.modelRequests[0]).not.toContain(memoMarker)
     expect(fixture.modelRequests[1]).toContain(memoMarker)

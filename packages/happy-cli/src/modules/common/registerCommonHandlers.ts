@@ -1369,6 +1369,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
 
     // Ripgrep handler - raw interface to ripgrep
     rpcHandlerManager.registerHandler<RipgrepRequest, RipgrepResponse>('ripgrep', async (data) => {
+        if (options.processExecution === 'disabled') return { success: false, error: 'AUTOMATION_PROCESS_RPC_UNSUPPORTED' };
         logger.debug('Ripgrep request with args:', data.args, 'cwd:', data.cwd);
 
         // Validate cwd if provided
@@ -1399,6 +1400,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
 
     // Difftastic handler - raw interface to difftastic
     rpcHandlerManager.registerHandler<DifftasticRequest, DifftasticResponse>('difftastic', async (data) => {
+        if (options.processExecution === 'disabled') return { success: false, error: 'AUTOMATION_PROCESS_RPC_UNSUPPORTED' };
         logger.debug('Difftastic request with args:', data.args, 'cwd:', data.cwd);
 
         // Validate cwd if provided

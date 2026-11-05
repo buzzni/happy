@@ -44,6 +44,16 @@ afterEach(async () => {
 });
 
 describe('registerCommonHandlers bash scheduling', () => {
+    it.each(['ripgrep', 'difftastic'])('refuses internal raw %s before starting any process', async method => {
+        const runner = method === 'ripgrep' ? await import('@/modules/ripgrep/index') : await import('@/modules/difftastic/index');
+        const execute = vi.spyOn(runner, 'run').mockRejectedValue(new Error('untracked process invoked'));
+        try {
+            const { handlers, workingDirectory } = await createHandlers(undefined, { processExecution: 'disabled' });
+            await expect(handlers.get(method)!({ args: ['--version'], cwd: workingDirectory }))
+                .resolves.toMatchObject({ success: false, error: 'AUTOMATION_PROCESS_RPC_UNSUPPORTED' });
+            expect(execute).not.toHaveBeenCalled();
+        } finally { execute.mockRestore(); }
+    });
     it('refuses an internal execution shell before it can start an untracked writer', async () => {
         const { handlers, workingDirectory } = await createHandlers(undefined, { processExecution: 'disabled' } as CommonHandlerOptions);
         await expect(handlers.get('bash')!({ command: 'printf unsafe > forbidden.txt', cwd: workingDirectory,
