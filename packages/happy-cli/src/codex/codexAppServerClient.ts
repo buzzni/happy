@@ -1604,7 +1604,7 @@ export class CodexAppServerClient {
         if (remaining <= 0) return { foregroundDrained, backgroundDrained, providerExitedCleanly: false };
         const ended = await this.endInputAndAwaitExit(remaining);
         if (ended.exited) await this.waitForOutputDrain();
-        const readProcesses = () => this.automationProcesses.map(child => ({ observed: child.observer.observed(), clean: child.observer.exitedCleanly(),
+        const readProcesses = () => this.automationProcesses.map(child => ({ pid: child.process.pid ?? null, observed: child.observer.observed(), clean: child.observer.exitedCleanly(),
             group: child.process.pid ? probeProcessGroup(child.process.pid).kind : 'indeterminate' }));
         let processes = readProcesses();
         while (ended.exited && ended.code === 0 && ended.signal === null && processes.length > 0
