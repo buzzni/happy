@@ -172,7 +172,10 @@ jobs:
         echo "happy server smoke test passed (booted + Prisma query engine OK)"
 
   smoke-test-windows:
-    runs-on: windows-latest
+    # pnpm 10.11 bundles node-gyp 11.1, which cannot detect Visual Studio 2026
+    # on windows-latest. Keep VS 2022 available for native dependency builds
+    # when a Node version has no prebuilt better-sqlite3 binary.
+    runs-on: windows-2022
     strategy:
       matrix:
         node-version: [20, 24]
