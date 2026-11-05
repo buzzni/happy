@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -53,6 +53,40 @@ describe('startServerProcess', () => {
     dirs.push(d)
     return d
   }
+
+  it('refuses detached spawn before onSpawn when host workspace admission fails', async () => {
+    const dir = mkdir()
+    const script = writeSleepScript(dir, 0)
+    const admitSubprocess = vi.fn(async () => { throw new Error('WORKSPACE_BUSY') })
+    const onSpawn = vi.fn()
+    const options = { fastFailDelayMs: 50, onSpawn, admitSubprocess }
+    await expect(startServerProcess({ command: `node ${script}`, cwd: dir }, options))
+      .rejects.toMatchObject({ code: 'WORKSPACE_UNAVAILABLE', message: 'WORKSPACE_BUSY' })
+    expect(admitSubprocess).toHaveBeenCalledWith([dir])
+    expect(onSpawn).not.toHaveBeenCalled()
+  })
+
+  it('validates command syntax before asking for host workspace admission', async () => {
+    const dir = mkdir()
+    const admitSubprocess = vi.fn(async () => undefined)
+    const options = { fastFailDelayMs: 50, admitSubprocess }
+    await expect(startServerProcess({ command: 'node server.js && echo no', cwd: dir }, options))
+      .rejects.toMatchObject({ code: 'INVALID_COMMAND' })
+    expect(admitSubprocess).not.toHaveBeenCalled()
+  })
+
+  it('awaits host workspace admission before spawning a detached server', async () => {
+    const dir = mkdir()
+    const script = writeSleepScript(dir, 0)
+    let admitted = false
+    const admitSubprocess = vi.fn(async () => { await Promise.resolve(); admitted = true })
+    const onSpawn = vi.fn(() => { expect(admitted).toBe(true) })
+    const options = { fastFailDelayMs: 50, onSpawn, admitSubprocess }
+    const { pid } = await startServerProcess({ command: `node ${script}`, cwd: dir }, options)
+    expect(onSpawn).toHaveBeenCalledOnce()
+    expect(admitSubprocess).toHaveBeenCalledWith([dir])
+    kill(pid)
+  })
 
   it('spawns a node process and returns its pid', async () => {
     const dir = mkdir()
