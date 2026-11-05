@@ -1,18 +1,31 @@
-import { afterEach, beforeEach, expect, it } from 'vitest';
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { createWorkspaceTurnAdmission } from './workspaceTurnAdmission';
 import * as module from './workspaceTurnAdmission';
+import { readCurrentBootIdSync } from './bootIdentity';
+
+const statHook = vi.hoisted(() => ({ observe: undefined as undefined | ((path: string, bigint: boolean) => Promise<void>) }));
+vi.mock('node:fs/promises', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return { ...actual, stat: async (...args: Parameters<typeof actual.stat>) => {
+    const info = await actual.stat(...args);
+    await statHook.observe?.(String(args[0]), Boolean((args[1] as { bigint?: boolean })?.bigint));
+    return info;
+  } };
+});
 
 const test = it.skipIf(process.platform === 'win32');
+const fixtureBoot = readCurrentBootIdSync() ?? 'boot-A';
 let home: string, workspace: string;
 beforeEach(async () => {
   home = await mkdtemp(join(tmpdir(), 'workspace-turn-admission-'));
   workspace = join(home, 'project'); await mkdir(join(workspace, 'child'), { recursive: true });
 });
-afterEach(async () => { await rm(home, { recursive: true, force: true }); });
-const admission = (sessionId: string, kind: 'manual' | 'automation', roots = [workspace], bootId = 'boot-A') =>
+afterEach(async () => { statHook.observe = undefined; await rm(home, { recursive: true, force: true }); });
+const admission = (sessionId: string, kind: 'manual' | 'automation', roots = [workspace], bootId = fixtureBoot) =>
   createWorkspaceTurnAdmission({ home, sessionId, kind, roots, bootId });
 
 test('holds automation behind active manual work without consuming the manual owner', async () => {
@@ -101,7 +114,7 @@ test('recovers only release authority from a saved owner token, never permission
   const owner = admission('automation-run:r1', 'automation');
   await owner.tryAcquire();
   const recovered = createWorkspaceTurnAdmission({ home, sessionId: 'automation-run:r1', kind: 'automation', roots: [workspace],
-    bootId: 'boot-A', ownerToken: owner.ownerToken });
+    bootId: fixtureBoot, ownerToken: owner.ownerToken });
   expect(await recovered.tryAcquire()).toMatchObject({ acquired: false });
   expect(await recovered.release(false)).toBe(false);
   expect((await admission('manual', 'manual').tryAcquire()).acquired).toBe(false);
@@ -112,7 +125,7 @@ test('recovers only release authority from a saved owner token, never permission
 test('cannot use a saved token to release another session identity', async () => {
   const owner = admission('automation-run:r1', 'automation'); await owner.tryAcquire();
   const other = createWorkspaceTurnAdmission({ home, sessionId: 'automation-run:other', kind: 'automation', roots: [workspace],
-    bootId: 'boot-A', ownerToken: owner.ownerToken });
+    bootId: fixtureBoot, ownerToken: owner.ownerToken });
   await expect(other.release(true)).rejects.toThrow('WORKSPACE_ADMISSION_IDENTITY_CONFLICT');
   expect((await admission('manual', 'manual').tryAcquire()).acquired).toBe(false);
 });
@@ -156,4 +169,164 @@ test('reports an indeterminate mutation receipt when its filesystem ownership ca
   await expect(filesystemFactory()(async () => {
     await rm(join(home, 'workspace-turn-admission.v1', 'owners.json'));
   })).rejects.toMatchObject({ code: 'WORKSPACE_FILESYSTEM_RELEASE_UNCONFIRMED' });
+});
+
+const unfencedFactory = () => (module as typeof module & {
+  createUnfencedSubprocessAdmission(input: { home: string; bootId?: string | null }): <T>(roots: readonly string[], work: () => Promise<T>) => Promise<T>
+}).createUnfencedSubprocessAdmission({ home, bootId: fixtureBoot });
+
+test('persists an unconfirmed folder before invoking a legacy subprocess and never infers drainage from its completion', async () => {
+  const run = unfencedFactory(), auto = admission('automation-run:r1', 'automation');
+  await expect(run([workspace], async () => {
+    expect(await auto.tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+    return 42;
+  })).resolves.toBe(42);
+  expect(await auto.tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+  expect((await admission('legacy-manual', 'manual').tryAcquire()).acquired).toBe(true);
+  const other = join(home, 'other'); await mkdir(other);
+  expect((await admission('automation-run:other', 'automation', [other]).tryAcquire()).acquired).toBe(true);
+  await expect(run([workspace], async () => { throw new Error('legacy error'); })).rejects.toThrow('legacy error');
+  expect(await auto.tryAcquire()).toHaveProperty('reason', 'workspace-owner-unconfirmed');
+});
+
+test('does not run or leave an unconfirmed legacy producer when an automatic owner already holds its folder', async () => {
+  const auto = admission('automation-run:r1', 'automation'); await auto.tryAcquire(); let ran = false;
+  await expect(unfencedFactory()([workspace], async () => { ran = true; })).rejects.toMatchObject({ code: 'WORKSPACE_BUSY' });
+  expect(ran).toBe(false); await auto.release(true);
+  expect((await admission('automation-run:r2', 'automation').tryAcquire()).acquired).toBe(true);
+});
+
+test('coalesces repeated unfenced producers by folder and boot without removing another active reservation', async () => {
+  const manual = admission('ordinary', 'manual'); await manual.tryAcquire();
+  const run = unfencedFactory();
+  for (let i = 0; i < 4; i++) await run([workspace], async () => undefined);
+  const state = JSON.parse(await readFile(join(home, 'workspace-turn-admission.v1', 'owners.json'), 'utf8'));
+  expect(state.owners.filter((owner: any) => owner.kind === 'unfenced')).toHaveLength(1);
+  expect(state.owners.some((owner: any) => owner.token === manual.ownerToken)).toBe(true);
+  expect(await manual.release(true)).toBe(true);
+  expect((await admission('automation-run:r1', 'automation').tryAcquire()).acquired).toBe(false);
+  expect((await createWorkspaceTurnAdmission({ home, sessionId: 'automation-run:unknown', kind: 'automation', roots: [workspace], bootId: null }).tryAcquire()).acquired).toBe(false);
+  expect((await admission('automation-run:reboot', 'automation', [workspace], 'boot-B').tryAcquire()).acquired).toBe(true);
+});
+
+test.each([[false, false], [true, false], [true, true]] as const)('treats linked worktrees as one repository after Git repair=%s and rename=%s', async (repair, move) => {
+  execFileSync('git', ['init', '-q', workspace]);
+  execFileSync('git', ['-C', workspace, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-qm', 'fixture']);
+  const sibling = join(home, 'linked');
+  execFileSync('git', ['-C', workspace, 'worktree', 'add', '-qb', 'fixture-linked', sibling]);
+  const pointer = await readFile(join(sibling, '.git'), 'utf8');
+  if (repair) await writeFile(join(sibling, '.git'), 'incomplete');
+  await unfencedFactory()([sibling], async () => { if (repair) await writeFile(join(sibling, '.git'), pointer); });
+  if (move) await module.createFilesystemWriteAdmission({ home })(async () => { await rename(sibling, join(home, 'moved-checkout')); });
+  expect(await admission('automation-run:r1', 'automation').tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+  const separate = join(home, 'unrelated'); await mkdir(separate);
+  expect((await admission('automation-run:unrelated', 'automation', [separate]).tryAcquire()).acquired).toBe(true);
+});
+
+test('preserves a not-yet-created clone target suffix without blocking its sibling and refuses dangling aliases', async () => {
+  const target = join(home, 'new-clone'), sibling = join(home, 'sibling'); await mkdir(sibling);
+  const candidate = await dispatchFactory()([target]);
+  if (!candidate.acquired) throw new Error('fixture admission refused');
+  expect((await admission('automation-run:preparation', 'automation', [target]).tryAcquire()).acquired).toBe(false);
+  await mkdir(target);
+  await unfencedFactory()([target], async () => undefined);
+  await candidate.finish();
+  expect(await admission('automation-run:target', 'automation', [target]).tryAcquire()).toHaveProperty('reason', 'workspace-owner-unconfirmed');
+  expect((await admission('automation-run:sibling', 'automation', [sibling]).tryAcquire()).acquired).toBe(true);
+  const moved = join(home, 'moved-clone'); await rename(target, moved);
+  expect(await admission('automation-run:moved-clone', 'automation', [moved]).tryAcquire()).toHaveProperty('reason', 'workspace-owner-unconfirmed');
+  const dangling = join(home, 'dangling'); await symlink(join(home, 'absent'), dangling);
+  let ran = false;
+  await expect(unfencedFactory()([join(dangling, 'child')], async () => { ran = true; })).rejects.toThrow();
+  expect(ran).toBe(false);
+});
+
+test('holds automatic repository admission when a registered checkout is replaced by a symlink outside its legacy parent', async () => {
+  execFileSync('git', ['init', '-q', workspace]);
+  execFileSync('git', ['-C', workspace, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-qm', 'fixture']);
+  const parent = join(home, 'legacy-parent'), target = join(home, 'outside'); await mkdir(parent); await mkdir(target);
+  const checkout = join(parent, 'checkout');
+  execFileSync('git', ['-C', workspace, 'worktree', 'add', '-qb', 'fixture-alias', checkout]);
+  await unfencedFactory()([parent], async () => {
+    await rename(checkout, join(parent, 'moved')); await symlink(target, checkout);
+  });
+  await expect(admission('automation-run:alias', 'automation').tryAcquire()).rejects.toThrow('WORKSPACE_REPOSITORY_IDENTITY_UNCONFIRMED');
+});
+
+test('requires an existing folder identity before submitting an untracked subprocess', async () => {
+  let called = false;
+  await expect(unfencedFactory()([join(home, 'absent')], async () => { called = true; })).rejects.toThrow();
+  expect(called).toBe(false);
+});
+
+test('preserves the original legacy result when the operation creates incomplete Git metadata', async () => {
+  await expect(unfencedFactory()([workspace], async () => { await mkdir(join(workspace, '.git')); return 42; })).resolves.toBe(42);
+  await expect(unfencedFactory()([workspace], async () => 43)).resolves.toBe(43);
+  await expect(admission('automation-run:unconfirmed-git', 'automation').tryAcquire()).rejects.toThrow();
+  await unfencedFactory()([workspace], async () => { execFileSync('git', ['init', '-q', workspace]); });
+  expect(await admission('automation-run:repaired-git', 'automation').tryAcquire()).toHaveProperty('reason', 'workspace-owner-unconfirmed');
+});
+
+test('retains an unfenced folder identity across rename and same-path replacement without blocking unrelated siblings', async () => {
+  const run = unfencedFactory(); await run([workspace], async () => undefined);
+  const moved = join(home, 'moved'); await rename(workspace, moved); await mkdir(workspace);
+  await run([workspace], async () => undefined);
+  expect(await admission('automation-run:moved', 'automation', [moved]).tryAcquire()).toHaveProperty('reason', 'workspace-owner-unconfirmed');
+  expect((await admission('ordinary-moved', 'manual', [moved]).tryAcquire()).acquired).toBe(true);
+  const sibling = join(home, 'separate'); await mkdir(sibling);
+  expect((await admission('automation-run:separate', 'automation', [sibling]).tryAcquire()).acquired).toBe(true);
+});
+
+test('keeps a nested unfenced scope blocked when its parent folder is renamed', async () => {
+  await unfencedFactory()([join(workspace, 'child')], async () => undefined);
+  const moved = join(home, 'moved'); await rename(workspace, moved);
+  expect(await admission('automation-run:parent', 'automation', [moved]).tryAcquire()).toHaveProperty('reason', 'workspace-owner-unconfirmed');
+});
+
+const dispatchFactory = () => (module as typeof module & {
+  createLegacyDispatchAdmission(input: { home: string; bootId?: string | null }): (roots: readonly string[]) => Promise<
+    { acquired: false; reason: string } | { acquired: true; finish(): Promise<void> }>
+}).createLegacyDispatchAdmission({ home, bootId: fixtureBoot });
+
+test('reserves a legacy occurrence before claim and hands off only its own reservation', async () => {
+  const reserve = dispatchFactory(), candidate = await reserve([workspace]);
+  expect(candidate.acquired).toBe(true);
+  if (!candidate.acquired) throw new Error('fixture admission refused');
+  expect((await admission('automation-run:r1', 'automation').tryAcquire()).acquired).toBe(false);
+  expect((await admission('concurrent-manual', 'manual').tryAcquire()).acquired).toBe(true);
+  await unfencedFactory()([workspace], async () => undefined);
+  await candidate.finish();
+  expect(await admission('automation-run:r2', 'automation').tryAcquire()).toHaveProperty('reason', 'workspace-owner-unconfirmed');
+});
+
+test('leaves a blocked legacy candidate unclaimed and releases a proven non-dispatch without a sticky scope', async () => {
+  const auto = admission('automation-run:r1', 'automation'); await auto.tryAcquire();
+  expect((await dispatchFactory()([workspace])).acquired).toBe(false);
+  await auto.release(true);
+  const skipped = await dispatchFactory()([workspace]);
+  if (!skipped.acquired) throw new Error('fixture admission refused');
+  await skipped.finish();
+  expect((await admission('automation-run:r2', 'automation').tryAcquire()).acquired).toBe(true);
+});
+
+test('does not admit a stale folder snapshot when a normal filesystem rename races its registry admission', async () => {
+  await unfencedFactory()([workspace], async () => undefined);
+  const target = join(home, 'target'), displaced = join(home, 'displaced'); await mkdir(target);
+  const canonicalTarget = await realpath(target);
+  let moved = false, observed = false;
+  statHook.observe = async (path, bigint) => {
+    if (observed || path !== canonicalTarget || !bigint) return;
+    observed = true;
+    try {
+      await module.createFilesystemWriteAdmission({ home })(async () => {
+        await rename(target, displaced); await rename(workspace, target); moved = true;
+      });
+    } catch (error) {
+      // If automatic admission owns the registry first, the normal filesystem mutation must wait.
+      expect((error as { code?: string }).code).toBe('WORKSPACE_REGISTRY_BUSY');
+    }
+  };
+  const result = await admission('automation-run:race', 'automation', [target]).tryAcquire();
+  expect(observed).toBe(true);
+  expect(result.acquired && moved).toBe(false);
 });
