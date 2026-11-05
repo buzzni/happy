@@ -17,6 +17,11 @@ on:
       - '.github/workflows/cli-smoke-test.yml'
   workflow_dispatch:
 
+env:
+  # The workspace also installs codium's Electron dev dependency. CLI/server
+  # smoke tests never launch it, so avoid its unrelated binary download.
+  ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+
 jobs:
   smoke-test-linux:
     runs-on: ubuntu-latest
