@@ -168,6 +168,9 @@ describe('a managed startup', () => {
             { HAPPY_MANAGED_BOOTSTRAP_FD: String(anonymousFd(envelopeJson())) }, Date.now(), serverUrl,
         );
         const api = ApiClient.managed(startup!.attachment);
+        expect(() => Reflect.apply(api.sessionSyncClient, api, [startup!.attachment.session,
+            { withFilesystemMutation: async (operation: () => Promise<unknown>) => operation() }]))
+            .toThrow(/not a managed runtime capability/);
         const client = api.sessionSyncClient(startup!.attachment.session);
         try {
             expect(client.sessionId).toBe(SESSION_ID);

@@ -6,7 +6,7 @@ import type { DeviceKeys } from '@/daemon/deviceKeys';
 import axios from 'axios'
 import { logger } from '@/ui/logger'
 import type { AgentState, CreateSessionResponse, Metadata, Session, Machine, MachineMetadata, DaemonState } from '@/api/types'
-import { ApiSessionClient } from './apiSession';
+import { ApiSessionClient, type ApiSessionClientOptions } from './apiSession';
 import { ApiMachineClient } from './apiMachine';
 import { decodeBase64, encodeBase64, getRandomBytes, encrypt, decrypt, wrapDataEncryptionKey, buildMachineKeyEnvelopes } from './encryption';
 import { PushNotificationClient } from './pushNotifications';
@@ -692,9 +692,10 @@ export class ApiClient {
     }
   }
 
-  sessionSyncClient(session: Session, options: { trackShutdownStorage?: boolean } = {}): ApiSessionClient {
+  sessionSyncClient(session: Session, options: ApiSessionClientOptions = {}): ApiSessionClient {
     if (this.principal.kind === 'managed-session') {
       if (options.trackShutdownStorage) throw new Error('Standalone storage tracking is not a managed runtime capability');
+      if (options.withFilesystemMutation) throw new Error('Host filesystem admission is not a managed runtime capability');
       applySessionUrlEnv(process.env, session.id, configuration.webappUrl);
       // The explicit mode, never inferred: it decides whether redirects are
       // followed and which origin may see this bearer.

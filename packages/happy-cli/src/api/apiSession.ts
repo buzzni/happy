@@ -20,7 +20,7 @@ import { SessionStorageBarrier, type StorageConfirmation } from './sessionStorag
 import { deriveKey } from '@/utils/deriveKey';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
 import { createRpcRequestListener } from './rpc/rpcRequestListener';
-import { registerCommonHandlers } from '../modules/common/registerCommonHandlers';
+import { registerCommonHandlers, type CommonHandlerOptions } from '../modules/common/registerCommonHandlers';
 import { TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '../modules/common/machineRunProfile';
 import { hostManagedMachineTools } from '../modules/common/moaiMachineRunProfiles';
 import { calculateCost } from '@/utils/pricing';
@@ -395,6 +395,14 @@ export function assertManagedServerOrigin(managed: ManagedCredentialMode): strin
 /** One waiter per open prompt; a session does not hold many at once. */
 const MAX_PENDING_CHANNEL_BINDS = 64;
 
+export interface ApiSessionClientOptions {
+    trackShutdownStorage?: boolean;
+    storageHighWaterBytes?: number;
+    storageHighWaterWrites?: number;
+    /** Live host dependency; never part of a session snapshot or RPC payload. */
+    withFilesystemMutation?: CommonHandlerOptions['withFilesystemMutation'];
+}
+
 export class ApiSessionClient extends EventEmitter {
     private readonly token: string;
     readonly sessionId: string;
@@ -682,7 +690,7 @@ export class ApiSessionClient extends EventEmitter {
         return reply.result;
     }
 
-    constructor(token: string, session: Session, managed?: ManagedCredentialMode, private readonly options: { trackShutdownStorage?: boolean; storageHighWaterBytes?: number; storageHighWaterWrites?: number } = {}) {
+    constructor(token: string, session: Session, managed?: ManagedCredentialMode, private readonly options: ApiSessionClientOptions = {}) {
         super()
         for (const value of [options.storageHighWaterBytes, options.storageHighWaterWrites]) {
             if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) throw new Error('Invalid storage high water mark');
@@ -730,6 +738,7 @@ export class ApiSessionClient extends EventEmitter {
         registerCommonHandlers(this.rpcHandlerManager, this.metadata.path, {
             childEnvBoundary: 'in-session',
             machineRun: { profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY, managedTools: hostManagedMachineTools(configuration.happyHomeDir) },
+            ...(options.withFilesystemMutation ? { withFilesystemMutation: options.withFilesystemMutation } : {}),
         });
         // aplus-dev-studio-desktop#2111 — stops only what this session's runtime recorded at spawn.
         registerCleanBackgroundProcessesHandler(this.rpcHandlerManager, this.sessionId);

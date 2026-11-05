@@ -21,6 +21,7 @@ import type { Metadata, Update } from './types';
 import { logger } from '@/ui/logger';
 import { RECONNECT_NOT_READY_POLL_MS } from './reconnectCadence';
 import { TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
+import { RuntimeProducerGate } from '@/sessionDrain/runtimeProducerGate';
 
 const {
     mockIo,
@@ -247,6 +248,33 @@ describe('ApiSessionClient v3 messages API migration', () => {
         };
 
         mockIo.mockReturnValue(mockSocket);
+    });
+
+    it('keeps an admitted filesystem writer alive through shutdown and refuses late writes', async () => {
+        const gate = new RuntimeProducerGate({
+            hasUndeliveredInput: () => false, canFreezeInbound: () => true,
+            freezeInbound: () => true, stopLoop: () => {},
+        });
+        const withFilesystemMutation = <T,>(operation: () => Promise<T>) => gate.admit(operation, 'writer');
+        const client = Reflect.construct(ApiSessionClient, ['fake-token', session, undefined, { withFilesystemMutation }]) as ApiSessionClient;
+        let finish!: () => void;
+        const waiting = new Promise<void>(resolve => { finish = resolve; });
+        try {
+            const admitted = registeredCommonHandlers.mock.calls.at(-1)?.[2].withFilesystemMutation;
+            expect(admitted).toBeTypeOf('function');
+            const writing = admitted(async () => { await waiting; return 'stored'; });
+            let closed = false;
+            const closing = gate.closeAdmissionAndWait().then(() => { closed = true; gate.loopExited(); });
+            await Promise.resolve();
+            expect(closed).toBe(false);
+            const lateWrite = vi.fn(async () => 'must not write');
+            await expect(admitted(lateWrite)).rejects.toThrow('Runtime input is closed');
+            expect(lateWrite).not.toHaveBeenCalled();
+            finish();
+            await expect(writing).resolves.toBe('stored');
+            await closing;
+            expect(gate.hasLiveProducers()).toBe(false);
+        } finally { finish(); await client.close(); }
     });
 
     it.each([false, true])('isolated run rejects external text and attachments before queue admission (buffered=%s)', async buffered => {
