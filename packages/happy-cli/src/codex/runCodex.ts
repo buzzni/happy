@@ -3058,6 +3058,9 @@ export async function runCodex(opts: {
 
     } finally {
         cancelCapacityRetry();
+        // A side question is an admitted writer. Cancel it before producer settlement or the
+        // drain decision, otherwise its longer timeout can exhaust the shutdown budget.
+        sideQuestion.dispose();
         let loopExitRecorded = false;
         try {
             preemptLessonReview();
@@ -3128,7 +3131,6 @@ export async function runCodex(opts: {
             }
             logger.debug('[codex]: client.disconnect begin');
             offTurnTitle.cancel();
-            sideQuestion.dispose();
             await client.disconnect();
             // Closes the project store this session opened. Its own catch: memory
             // cleanup must not be the thing that fails a shutdown.
