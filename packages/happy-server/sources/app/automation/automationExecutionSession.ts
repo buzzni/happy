@@ -3,7 +3,7 @@ import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 import { automationExecutionSessionId, automationExecutionSeedLocalId, isAutomationExecutionSessionId,
   SessionExecutionCreateBodySchema, sessionCreateBodyHash, sessionTagHash, rotationDecodeBinary,
-  HappySessionExecutionProofSchema } from '@slopus/happy-wire';
+  HappySessionExecutionProofSchema, sessionExecutionAuthorityDigest } from '@slopus/happy-wire';
 import { verifyAutomationExecutionTarget, type AutomationExecutionTarget } from '@slopus/happy-wire/automationExecutionToken';
 import { db } from '@/storage/db';
 import { inTx } from '@/storage/inTx';
@@ -14,6 +14,7 @@ export const automationExecutionSessionRequestSchema = z.strictObject({
   claimToken: z.string().min(1).max(256), displaySessionId: z.string().min(1).max(200),
   body: SessionExecutionCreateBodySchema,
   targetProof: z.string().min(1).max(8_192), executionBindingRequired: z.boolean(),
+  executionAuthorityDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   executionProof: z.unknown().optional(),
 });
 
@@ -88,6 +89,7 @@ async function prepareAutomationExecutionAdmission(accountId: string, bearer: st
   const clock = () => options.now ?? new Date();
   const sessionId = automationExecutionSessionId(input.runId);
   if (input.body.tag !== sessionId || isAutomationExecutionSessionId(input.displaySessionId)) refuse();
+  if (input.executionBindingRequired !== (input.executionAuthorityDigest !== undefined)) refuse();
   const bodyHash = await sessionCreateBodyHash(input.body);
   const claimTokenHash = new Uint8Array(createHash('sha256').update(input.claimToken).digest());
   function checkTarget(target: AutomationExecutionTarget) {
@@ -113,6 +115,7 @@ async function prepareAutomationExecutionAdmission(accountId: string, bearer: st
       revision: a.revision, machineId: input.machineId, machineAccountId: accountId,
       displaySessionId: input.displaySessionId, createBodyHash: bodyHash,
       executionBindingRequired: input.executionBindingRequired,
+      ...(input.executionAuthorityDigest !== undefined ? { executionAuthorityDigest: input.executionAuthorityDigest } : {}),
     };
     checkTarget(target);
     if (a.ownerAccountId !== accountId) {
@@ -167,11 +170,13 @@ export async function createAutomationExecutionSession(accountId: string, bearer
   const admission = await authorize(db);
   if (input.executionBindingRequired && !input.executionProof) return refuse();
   if (input.executionProof !== undefined) {
+    if (!input.executionBindingRequired) return refuse();
     const parsed = HappySessionExecutionProofSchema.safeParse(input.executionProof);
     if (!parsed.success) throw new AutomationExecutionSessionError(400, 'Invalid session execution proof');
     const ticket = parsed.data.ticket.body;
     if (ticket.machineId !== input.machineId || ticket.machineOwnerAccountId !== accountId
       || ticket.sessionOwnerAccountId !== accountId) return refuse();
+    if (await sessionExecutionAuthorityDigest(ticket) !== input.executionAuthorityDigest) return refuse();
     let created = false;
     const session = await createExecutionBoundSession(accountId, input.body, input.executionProof,
       async (tx, row, isNew) => {
@@ -209,6 +214,9 @@ export async function recoverAutomationExecutionSession(accountId: string, beare
   if (input.executionBindingRequired !== (recoveryIdentity !== null)) return refuse();
   return inTx(async tx => {
     const { run, target } = await authorize(tx);
+    if (recoveryIdentity && await sessionExecutionAuthorityDigest({ ...recoveryIdentity,
+      machineId: input.machineId, machineOwnerAccountId: accountId, sessionOwnerAccountId: accountId,
+      sessionTagHash: await sessionTagHash(input.body.tag), sessionCreateBodyHash: bodyHash }) !== input.executionAuthorityDigest) return conflict();
     if (!run.executionCreateBodyHash) {
       if (run.sessionId || run.displaySessionId || run.executionSeedMetadata
         || await tx.session.findFirst({ where: { accountId, tag: input.body.tag }, select: { id: true } })) return conflict();

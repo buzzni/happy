@@ -13,7 +13,7 @@ import nacl from 'tweetnacl';
 import { serializerCompiler, validatorCompiler, type ZodTypeProvider } from 'fastify-type-provider-zod';
 import type { Fastify } from '@/app/api/types';
 import { sessionCreateBodyHash, sessionTagHash, automationExecutionSessionId, signRotationDocument,
-  rotationDigest, rotationSha256, rotationBase64url, SessionExecutionTicketBodySchema, HappySessionCreateProofBodySchema } from '@slopus/happy-wire';
+  rotationDigest, rotationSha256, rotationBase64url, sessionExecutionAuthorityDigest, SessionExecutionTicketBodySchema, HappySessionCreateProofBodySchema } from '@slopus/happy-wire';
 import { signAutomationExecutionTarget } from '@slopus/happy-wire/automationExecutionToken';
 
 const state = vi.hoisted(() => ({ client: null as any }));
@@ -71,10 +71,11 @@ async function request(runId = 'r1', patch: Record<string, unknown> = {}) {
     executionBindingRequired: false, targetProof: proof, ...patch };
 }
 async function targetProof(input: { runId: string; displaySessionId: string;
-  body: { tag: string; metadata: string; agentState: string; dataEncryptionKey: string }; executionBindingRequired: boolean }) {
+  body: { tag: string; metadata: string; agentState: string; dataEncryptionKey: string }; executionBindingRequired: boolean; executionAuthorityDigest?: string }) {
   return signAutomationExecutionTarget({ automationId: 'a1', projectId: 'chat:c1', runId: input.runId,
     generation: 1, revision: 1, machineId: 'm1', machineAccountId: 'owner', displaySessionId: input.displaySessionId,
     executionBindingRequired: input.executionBindingRequired, createBodyHash: await sessionCreateBodyHash(input.body),
+    ...(input.executionAuthorityDigest !== undefined ? { executionAuthorityDigest: input.executionAuthorityDigest } : {}),
     secret, bearer, now: now.getTime() });
 }
 async function register(runId = 'r1', patch: Record<string, unknown> = {}) {
@@ -101,7 +102,9 @@ async function boundRequest(ticketMachineId = 'm1') {
     audience: 'https://happy.test', method: 'POST', path: '/v1/sessions', ticketDigest: await rotationDigest(ticket),
     sessionOwnerAccountId: 'owner', ...hashes, issuedAt: now.getTime(), expiresAt: now.getTime() + 60000 }), device.secretKey);
   const { companyId, approvalId, deviceKeyId, launchId, operationId, initialNonce } = ticket.body;
-  return { input: { ...input, executionProof: { ticket, deviceProof } },
+  const executionAuthorityDigest = await sessionExecutionAuthorityDigest(ticket.body);
+  const proof = await targetProof({ runId: 'r1', displaySessionId: 'manual', body: input.body, executionBindingRequired: true, executionAuthorityDigest });
+  return { input: { ...input, executionAuthorityDigest, targetProof: proof, executionProof: { ticket, deviceProof } },
     recoveryIdentity: { companyId, approvalId, deviceKeyId, launchId, operationId, initialNonce } };
 }
 
@@ -119,17 +122,33 @@ it('refuses another approved machine ticket instead of combining two independent
   } finally { await app.close(); }
 });
 
+it.each(['missing', 'different'] as const)('refuses a company target with a different original authority digest: %s', async mismatch => {
+  const { input } = await boundRequest();
+  const executionAuthorityDigest = mismatch === 'missing' ? undefined : 'f'.repeat(64);
+  const target = await targetProof({ runId: input.runId, displaySessionId: input.displaySessionId, body: input.body,
+    executionBindingRequired: true, executionAuthorityDigest });
+  const { runId, ...payload } = { ...input, executionAuthorityDigest, targetProof: target };
+  const app = await api();
+  try {
+    const result = await app.inject({ method: 'POST', url: `/v1/automation-runs/${runId}/execution-session`,
+      headers: { authorization: `Bearer ${bearer}` }, payload });
+    expect(result.statusCode, result.body).toBe(403);
+    expect(await client.session.count()).toBe(1); expect(await client.sessionExecutionBinding.count()).toBe(0);
+  } finally { await app.close(); }
+});
+
 it.each([false, true])('recovers only the original registered run without reissuing an expired company proof (bound=%s)', async bound => {
   const prepared = bound ? await boundRequest() : { input: await request(), recoveryIdentity: null };
   await createAutomationExecutionSession('owner', bearer, prepared.input, { secret, now });
-  const { runId, executionProof: _proof, ...payload } = prepared.input as typeof prepared.input & { executionProof?: unknown };
+  const { runId, executionProof: _proof, ...payload } = prepared.input as typeof prepared.input & { executionProof?: unknown; executionAuthorityDigest?: string };
   const before = await client.session.findMany(), app = await api();
   try {
     if (bound) {
       now = new Date(now.getTime() + 61000);
       vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(now);
       await client.automationRun.update({ where: { id: runId }, data: { runLeaseExpiresAt: new Date(now.getTime() + 60000) } });
-      payload.targetProof = await targetProof({ runId, displaySessionId: 'manual', body: payload.body, executionBindingRequired: true });
+      payload.targetProof = await targetProof({ runId, displaySessionId: 'manual', body: payload.body, executionBindingRequired: true,
+        executionAuthorityDigest: payload.executionAuthorityDigest });
       await expect(createAutomationExecutionSession('owner', bearer, { ...prepared.input, targetProof: payload.targetProof }, { secret, now }))
         .rejects.toMatchObject({ statusCode: 403 });
     }
