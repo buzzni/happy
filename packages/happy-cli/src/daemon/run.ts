@@ -90,6 +90,7 @@ import { preflightDaemonControlServer, startDaemonControlServer } from './contro
 import { BrowserBridge } from './browserBridge';
 import { BrowserLocalSetup, shouldEnableBrowserLocalSetup } from './browserLocalSetup';
 import { fetchBrowserExtensionScope } from './browserExtensionScope';
+import { writeBrowserBridgeOwnerHome } from './browserBridgeOwner';
 import { readBrowserSetupPolicy, writeBrowserSetupPolicy, localBrowserExtensionMetadata } from './browserLocalSetupStore';
 import { BrowserSessionBrokerClient } from './browserSessionBrokerContract';
 import { getBusyDaemonTerminalCount, getDaemonTerminalSessionCount } from './daemonTerminalSessions';
@@ -202,7 +203,7 @@ import {
 import { machineIdentityMetadataUpdate } from './machineIdentityMetadata';
 import { listMachineIdTwins } from './machineIdTwins';
 import { agentBrowserMachineCapability, agentBrowserMetadataUpdate, browserTaskLineage, browserTaskSpawnSeed, createBrowserTaskSessionBroker, spawnResumedWithBrowserTaskRegistration, startBrowserTaskReconciliation, type BrowserTaskRegistration, type BrowserTaskSessionBroker } from './browserTaskBroker';
-import { readPersonalBrowserRuntime, watchPersonalBrowserRuntime } from './personalBrowserRuntime';
+import { forgetInheritedPersonalBrowserEnv, readPersonalBrowserRuntime, watchPersonalBrowserRuntime } from './personalBrowserRuntime';
 import { checkDesktopBrowserLoginSocket, createDesktopBrowserLoginClient, desktopBrowserLoginDescriptor, type DesktopBrowserLoginDescriptor } from '@/browserRuntime/desktopBrowserLogin';
 import { brokerRequest, createNativeBrokerRequest, type NativeBrokerRequestOptions } from '@/browserRuntime/brokerGrantSource';
 import { createHeldBrowserAttentions, findBrowserAttentionSession, startBrowserAttentionWatcher, type HeldBrowserAttention } from './browserAttentionDelivery';
@@ -315,7 +316,7 @@ import {
 import { preflightAutomationConnectors } from './automations/automationConnectorPreflight';
 import { resolveScriptRuntimeImage, scriptRuntimeReadiness, type ScriptRuntimeReadiness } from './automations/scriptRuntimeReadiness';
 import { createScriptRuntimeSupervisor } from './automations/scriptRuntimeSupervisor';
-import { resolveDaemonAllowedRoot } from '@/modules/common/resolveAllowedRoot';
+import { resolveDaemonAllowedRoot, resolveDaemonApprovedRoots } from '@/modules/common/resolveAllowedRoot';
 import { getProcessStartedAt } from '@/utils/processStartTime';
 import { waitForSessionWebhook } from './spawnWebhookWait';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
@@ -701,6 +702,9 @@ export async function startDaemon(): Promise<void> {
       logger.debug(`[DAEMON RUN] Scrubbing inherited session lineage env: ${key}`);
       delete process.env[key];
     }
+  }
+  if (forgetInheritedPersonalBrowserEnv(process.env)) {
+    logger.debug('[DAEMON RUN] Forgot the personal browser runtime environment inherited from a previous daemon or session');
   }
 
   // 이 머신이 샌드박스를 쓸 수 있는지 기동 시점에 한 번 확인한다. checkDependencies()
@@ -4141,6 +4145,9 @@ export async function startDaemon(): Promise<void> {
         extensionScope: () => fetchBrowserExtensionScope({ origin: readTrustedStudioOrigin(process.env), machineId, token: credentials.token }),
       }) : undefined;
     let stopBrowserBridge: () => Promise<void> = async () => {};
+    // Chrome's native host finds this daemon through this record when its home is not a documented one.
+    const recordBrowserBridgeOwner = () => writeBrowserBridgeOwnerHome(os.homedir(), configuration.happyHomeDir)
+      .catch(error => logger.warn(`[DAEMON RUN] Browser bridge owner not recorded; extension connection may not find this daemon: ${error instanceof Error ? error.message : String(error)}`));
     try {
       if (browserSetupPolicy !== null) {
         const bridgeHost = resolveBrowserBridgeHost(process.env);
@@ -4152,6 +4159,7 @@ export async function startDaemon(): Promise<void> {
           ,consumeSetup: setupCandidate ? id => setupCandidate.consume(id) : undefined
         });
         stopBrowserBridge = bridgeServer.stop;
+        if (setupCandidate) await recordBrowserBridgeOwner();
         if (bridgeHost !== '127.0.0.1') {
           logger.debug(`[DAEMON RUN] Browser bridge bound to ${bridgeHost} (HAPPY_BROWSER_BRIDGE_HOST) — not loopback-only`);
         }
@@ -4165,6 +4173,7 @@ export async function startDaemon(): Promise<void> {
         stopBrowserBridge = retryBrowserBridgeServer({
           bridge: browserBridge, port: DEFAULT_BROWSER_BRIDGE_PORT, host: resolveBrowserBridgeHost(process.env),
           consumeSetup: setupCandidate ? id => setupCandidate.consume(id) : undefined,
+          onListening: setupCandidate ? recordBrowserBridgeOwner : undefined,
         }).stop;
       } else {
         browserLocalSetup = undefined;
@@ -4237,6 +4246,7 @@ export async function startDaemon(): Promise<void> {
       } } : {}),
       // 제어 서버의 파일 접근도 같은 잠금 정책을 따른다(HAPPY_RPC_ALLOWED_ROOT).
       allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
+      approvedRoots: resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir),
       standaloneDrain: standaloneWindows?.drain,
       writeScopeRuntime,
       managedRuntime: managedIdentity.status === 'active',

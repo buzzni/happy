@@ -60,6 +60,7 @@ describe('resolveHappyCliSpawnCommand', () => {
       execArgv: ['--import', '/repo/node_modules/tsx/loader.mjs'],
       argv: ['/node', join(projectRoot, 'src', 'index.ts'), 'daemon', 'start-sync'],
       isBunRuntime: false,
+      isElectronRuntime: false,
     });
 
     expect(result.runtime).toBe('/node');
@@ -84,9 +85,10 @@ describe('resolveHappyCliSpawnCommand', () => {
       execArgv: [],
       argv: ['/node', join(projectRoot, 'dist', 'index.mjs'), 'daemon', 'start-sync'],
       isBunRuntime: false,
+      isElectronRuntime: false,
     });
 
-    expect(result.runtime).toBe('node');
+    expect(result.runtime).toBe('/node');
     expect(result.entrypoint).toBe(join(projectRoot, 'dist', 'index.mjs'));
     expect(result.tsconfigPath).toBeUndefined();
     expect(result.args).toEqual([
@@ -95,6 +97,37 @@ describe('resolveHappyCliSpawnCommand', () => {
       join(projectRoot, 'dist', 'index.mjs'),
       'claude',
     ]);
+  });
+
+  // An older Node first on PATH (a developer PC) ignores NODE_USE_SYSTEM_CA, so the daemon it ran
+  // could not pass a company HTTPS-inspection proxy that the launcher's bundled Node passes.
+  it('keeps the daemon on the Node that launched it, not whichever node PATH finds first', () => {
+    const projectRoot = 'C:/Saycode/resources/happy-cli-runtime/node_modules/@buzzni/happy-cli';
+    const result = resolveHappyCliSpawnCommand(['daemon', 'start-sync'], {
+      projectRoot,
+      execPath: 'C:/Saycode/resources/node-runtime/node.exe',
+      execArgv: ['--no-warnings', '--no-deprecation'],
+      argv: ['C:/Saycode/resources/node-runtime/node.exe', join(projectRoot, 'dist', 'index.mjs'), 'daemon', 'start'],
+      isBunRuntime: false,
+      isElectronRuntime: false,
+    });
+
+    expect(result.runtime).toBe('C:/Saycode/resources/node-runtime/node.exe');
+  });
+
+  // Electron's binary only acts as Node under ELECTRON_RUN_AS_NODE, which a child env may not carry.
+  it('falls back to node on PATH when running inside Electron', () => {
+    const projectRoot = '/repo/packages/happy-cli';
+    const result = resolveHappyCliSpawnCommand(['daemon', 'start-sync'], {
+      projectRoot,
+      execPath: '/Applications/Saycode.app/Contents/MacOS/Saycode',
+      execArgv: [],
+      argv: ['/Applications/Saycode.app/Contents/MacOS/Saycode', join(projectRoot, 'dist', 'index.mjs'), 'daemon', 'start'],
+      isBunRuntime: false,
+      isElectronRuntime: true,
+    });
+
+    expect(result.runtime).toBe('node');
   });
 });
 

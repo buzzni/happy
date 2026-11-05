@@ -55,6 +55,25 @@ export interface PersonalBrowserRuntimeOptions {
     now?: () => number
 }
 
+/** Every variable `sessionEnv` below can set; activation copies them into the daemon's own environment. */
+const PERSONAL_SESSION_ENV = ['HAPPY_BROWSER_TASK_DESKTOP_LOGIN', 'HAPPY_BROWSER_TASK_RUNTIME_URL', 'HAPPY_BROWSER_TASK_BROKER_SOCKET',
+    'HAPPY_BROWSER_TASK_PROFILE_ID', 'HAPPY_BROWSER_TASK_TENANCY', 'HAPPY_BROWSER_TASK_HOST_MODE'] as const
+
+/**
+ * A daemon started by the previous daemon's handoff, or by one of its sessions, inherits the
+ * personal runtime's session variables. Left in place they read as an installer-managed host and
+ * keep this daemon from starting the personal runtime, so its browser grants stay disabled.
+ * Only variables pointing at this user's personal runtime broker are removed.
+ */
+export function forgetInheritedPersonalBrowserEnv(env: NodeJS.ProcessEnv, platform: NodeJS.Platform = process.platform, home?: string): boolean {
+    if (platform !== 'darwin' && platform !== 'win32') return false
+    let brokerSocket: string
+    try { brokerSocket = personalRuntimePaths(platform, env, home).brokerSocket } catch { return false }
+    if (env.HAPPY_BROWSER_TASK_BROKER_SOCKET !== brokerSocket) return false
+    for (const name of PERSONAL_SESSION_ENV) delete env[name]
+    return true
+}
+
 /** The installed personal runtime for this daemon, or undefined when there is none or it is not this machine's. */
 export function readPersonalBrowserRuntime(options: PersonalBrowserRuntimeOptions): PersonalBrowserRuntime | undefined {
     const platform = options.platform ?? process.platform, env = options.env ?? process.env
