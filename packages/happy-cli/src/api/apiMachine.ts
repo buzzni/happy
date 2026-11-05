@@ -917,6 +917,8 @@ export class ApiMachineClient {
     // terminal-open-fwd handler can run validatePath against the same
     // root the rest of the RPC surface uses (Files tab / writeFile).
     private allowedRoot: string;
+    /** aplus-dev-studio specs/approved-folder-roots — folders outside allowedRoot the machine owner approved. */
+    private approvedRoots: (() => readonly string[]) | undefined;
     /**
      * The pending next dial. Non-null means "a retry cadence is running", which
      * is all `getConnectionHealth()` and the connection supervisor read it for.
@@ -1022,8 +1024,9 @@ export class ApiMachineClient {
         // project's workspaceDir.
         const allowedRoot = resolveDaemonAllowedRoot(process.env, homedir());
         this.allowedRoot = allowedRoot;
+        this.approvedRoots = resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir);
         registerCommonHandlers(this.rpcHandlerManager, allowedRoot, {
-            approvedRoots: resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir),
+            approvedRoots: this.approvedRoots,
             // Machine scope is the Desktop machine.run path and the only one that
             // may run managed writes; its lock is per daemon process.
             machineRun: {
@@ -4040,7 +4043,7 @@ export class ApiMachineClient {
                     homedir: homedir(),
                     fsExists: existsSync,
                     fsMkdir: (path) => mkdirSync(path, { recursive: true }),
-                    validate: validatePath,
+                    validate: (path, root) => validatePath(path, root, this.approvedRoots?.()),
                 });
                 let pty: ReturnType<typeof createPtySession>;
                 try {

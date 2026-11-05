@@ -316,7 +316,7 @@ import {
 import { preflightAutomationConnectors } from './automations/automationConnectorPreflight';
 import { resolveScriptRuntimeImage, scriptRuntimeReadiness, type ScriptRuntimeReadiness } from './automations/scriptRuntimeReadiness';
 import { createScriptRuntimeSupervisor } from './automations/scriptRuntimeSupervisor';
-import { resolveDaemonAllowedRoot } from '@/modules/common/resolveAllowedRoot';
+import { resolveDaemonAllowedRoot, resolveDaemonApprovedRoots } from '@/modules/common/resolveAllowedRoot';
 import { getProcessStartedAt } from '@/utils/processStartTime';
 import { waitForSessionWebhook } from './spawnWebhookWait';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
@@ -4246,6 +4246,7 @@ export async function startDaemon(): Promise<void> {
       } } : {}),
       // 제어 서버의 파일 접근도 같은 잠금 정책을 따른다(HAPPY_RPC_ALLOWED_ROOT).
       allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
+      approvedRoots: resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir),
       standaloneDrain: standaloneWindows?.drain,
       writeScopeRuntime,
       managedRuntime: managedIdentity.status === 'active',

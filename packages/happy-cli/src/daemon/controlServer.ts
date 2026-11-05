@@ -107,6 +107,7 @@ export function startDaemonControlServer({
   portRegistry,
   browserBridge,
   allowedRoot = homedir(),
+  approvedRoots,
   getMachineEncryption = () => null,
   managedRuntime = false,
   verifyManagedReport,
@@ -155,6 +156,8 @@ export function startDaemonControlServer({
    *  Defaults to homedir; only real callers that actually offer `/terminal`
    *  local-direct need to pass the caller's actual value. */
   allowedRoot?: string;
+  /** aplus-dev-studio specs/approved-folder-roots — folders outside allowedRoot the machine owner approved. */
+  approvedRoots?: () => readonly string[];
   /** Null until the daemon's machine registration resolves (it starts after
    *  this server does) — `/terminal` fails closed with a clean error until
    *  set. Defaults to an always-null getter (no local-direct support) so
@@ -304,6 +307,7 @@ export function startDaemonControlServer({
       path: '/terminal',
       controlSecret,
       allowedRoot,
+      approvedRoots,
       getMachineEncryption,
     });
 
