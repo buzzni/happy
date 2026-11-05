@@ -1005,3 +1005,77 @@ describe('PermissionHandler tool policy approvals (aplus-dev-studio specs/agent-
         expect(await stub.answer({ id: 'toolu_policy', approved: true })).toMatchObject({ applied: false });
     });
 });
+
+describe('a Bash(<prefix>:*) grant (aplus-dev-studio specs/desktop-permission-prefix-grant R7)', () => {
+    const ASKED = 'ASKED';
+
+    async function grantPrefix(handler: PermissionHandler, stub: ReturnType<typeof createRecordingSessionStub>, grant: string) {
+        const first = handler.handleToolCall(
+            'Bash', { command: 'git add .' }, { permissionMode: 'default' },
+            { signal: new AbortController().signal, toolUseID: 'grant-call' },
+        );
+        expect(await stub.answer({ id: 'grant-call', approved: true, decision: 'approved_for_session', allowTools: [grant] }))
+            .toEqual({ applied: true });
+        await first;
+    }
+
+    // A call nobody answers stays pending; reaching the timer means the matcher did not allow it.
+    async function outcome(handler: PermissionHandler, command: string, id: string) {
+        const timeout = new Promise<typeof ASKED>((resolve) => setTimeout(() => resolve(ASKED), 30));
+        const result = await Promise.race([
+            handler.handleToolCall(
+                'Bash', { command }, { permissionMode: 'default' },
+                { signal: new AbortController().signal, toolUseID: id },
+            ),
+            timeout,
+        ]);
+        return result === ASKED ? ASKED : (result as { behavior: string }).behavior;
+    }
+
+    it.each([
+        ['the prefix itself', 'git add'],
+        ['the prefix and an argument', 'git add .'],
+        ['the prefix and options', 'git add -A src'],
+        ['quoted operators stay one command', 'git add "a && b"'],
+    ])('allows %s without asking', async (_name, command) => {
+        const stub = createRecordingSessionStub();
+        const handler = new PermissionHandler(stub.session);
+        await grantPrefix(handler, stub, 'Bash(git add:*)');
+        expect(await outcome(handler, command, 'next-call')).toBe('allow');
+    });
+
+    it.each([
+        ['a longer program name', 'git addx'],
+        ['a different spacing', 'git  add .'],
+        ['a chained command', 'git add . && rm -rf /'],
+        ['a command after a semicolon', 'git add .; rm -rf ~'],
+        ['a pipe', 'git add . | sh'],
+        ['a substitution', 'git add $(rm -rf ~)'],
+        ['a backtick substitution', 'git add `rm -rf ~`'],
+        ['an escaped quote hiding a separator', 'git add \\"; rm -rf ~; echo \\"'],
+        ['a second line', 'git add .\nrm -rf ~'],
+        ['a redirect', 'git add . > ~/.zshrc'],
+        ['a command over 4000 characters', `git add ${'a'.repeat(4000)}`],
+    ])('still asks for %s', async (_name, command) => {
+        const stub = createRecordingSessionStub();
+        const handler = new PermissionHandler(stub.session);
+        await grantPrefix(handler, stub, 'Bash(git add:*)');
+        expect(await outcome(handler, command, 'next-call')).toBe(ASKED);
+    });
+
+    it('keeps an exact-command grant exact (R7 iii)', async () => {
+        const stub = createRecordingSessionStub();
+        const handler = new PermissionHandler(stub.session);
+        await grantPrefix(handler, stub, 'Bash(git add . && echo done)');
+        // The literal is the one command the person saw, whatever its syntax.
+        expect(await outcome(handler, 'git add . && echo done', 'next-call')).toBe('allow');
+        expect(await outcome(handler, 'git add . && echo done && rm -rf ~', 'other-call')).toBe(ASKED);
+    });
+
+    it('never lets an empty prefix grant everything', async () => {
+        const stub = createRecordingSessionStub();
+        const handler = new PermissionHandler(stub.session);
+        await grantPrefix(handler, stub, 'Bash(:*)');
+        expect(await outcome(handler, ' rm -rf ~', 'next-call')).toBe(ASKED);
+    });
+});

@@ -2,10 +2,9 @@
  * The channel has to be listening before the message loop exists, and a
  * runtime that never gave the child one must not take the child down.
  */
-import { closeSync, createReadStream, openSync } from 'node:fs';
-import { devNull } from 'node:os';
+import { createReadStream } from 'node:fs';
 import { EventEmitter } from 'node:events';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { openManagedControlChannel } from './managedStartup';
 import { managedStopRequest } from './managedControlChannel';
@@ -14,6 +13,11 @@ import {
     registerManagedGracefulStop,
     resetManagedGracefulStopForTests,
 } from './managedGracefulStop';
+
+// A valid Node fd argument, beyond the OS descriptor limit. Opening and closing
+// /dev/null instead lets its number be reused before the stream reads or closes
+// it; delayed stream cleanup can then close a descriptor owned by another test.
+const unopenedFd = 0x7fffffff;
 
 describe('openManagedControlChannel', () => {
     beforeEach(() => { resetManagedGracefulStopForTests(); });
@@ -56,42 +60,43 @@ describe('openManagedControlChannel', () => {
          * the constructor returned. With no listener that is an unhandled
          * `error` event and the whole child dies.
          *
-         * Driven through the real `node:fs` stream over a genuinely closed
+         * Driven through the real `node:fs` stream over an unopened
          * descriptor — no double — because the point is Node's behaviour.
          */
-        const fd = openSync(devNull, 'r');
-        closeSync(fd);
-
         let unusable = 0;
         const dispose = openManagedControlChannel({
-            open: (): never => createReadStream('', { fd, autoClose: false }) as never,
+            open: (): never => createReadStream('', { fd: unopenedFd, autoClose: false }) as never,
             onUnusable: () => { unusable += 1; },
         });
         expect(typeof dispose).toBe('function');
 
-        await new Promise((resolve) => setTimeout(resolve, 50));
-        expect(unusable).toBe(1);
-        dispose?.();
+        try {
+            await vi.waitFor(() => expect(unusable).toBe(1));
+        } finally {
+            dispose?.();
+        }
     });
 
     it('shouldNeverReadAFailedChannelAsARequestToStop', async () => {
         // Fabricating an EOF here would end input on every runtime that did
         // not open the descriptor — the exact opposite of failing closed.
-        const fd = openSync(devNull, 'r');
-        closeSync(fd);
-
         const stop = createManagedGracefulStop({
             queueSize: () => 0,
             hasPending: () => false,
             wake: () => undefined,
         });
         registerManagedGracefulStop(stop);
+        let unusable = 0;
         const dispose = openManagedControlChannel({
-            open: (): never => createReadStream('', { fd, autoClose: false }) as never,
+            open: (): never => createReadStream('', { fd: unopenedFd, autoClose: false }) as never,
+            onUnusable: () => { unusable += 1; },
         });
 
-        await new Promise((resolve) => setTimeout(resolve, 50));
-        expect(stop.requested()).toBe(false);
-        dispose?.();
+        try {
+            await vi.waitFor(() => expect(unusable).toBe(1));
+            expect(stop.requested()).toBe(false);
+        } finally {
+            dispose?.();
+        }
     });
 });
