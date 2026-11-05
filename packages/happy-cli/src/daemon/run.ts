@@ -5240,7 +5240,11 @@ export async function startDaemon(): Promise<void> {
     const contextTransportForRun = (run: AutomationContextLaunchRequest) => createAutomationContextTransport({ serverUrl: configuration.serverUrl,
       token: credentials.token, machineId, runId: run.runId, claimToken: run.claimToken,
       authorize: createAutomationContextAuthorizer({ studioOrigin: trustedStudioOrigin, token: credentials.token,
-        machineId, runId: run.runId, claimToken: run.claimToken }) });
+        machineId, runId: run.runId, claimToken: run.claimToken,
+        ...(contextJournal && contextAccountId && deviceKeys && deviceEnrollment ? { authority: {
+          journal: contextJournal, accountId: contextAccountId, happyOrigin: configuration.serverUrl,
+          keys: deviceKeys, pin: companyId => deviceEnrollment!.orgPin(companyId),
+        } } : {}) }) });
     const contextAccountId = contextWorkspace && trustedStudioOrigin ? await authenticatedAccountId(credentials.token) : null;
     const contextJournal = contextAccountId ? createAutomationContextLaunchJournal(configuration.happyHomeDir) : null;
     const contextReference = contextAccountId && contextJournal ? createAutomationContextReferenceReader({

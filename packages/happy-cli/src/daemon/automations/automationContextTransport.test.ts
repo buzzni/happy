@@ -3,7 +3,11 @@ import { createServer, type Server } from 'node:http'
 import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { sessionCreateBodyHash, type AutomationPayload } from '@slopus/happy-wire'
+import nacl from 'tweetnacl'
+import { sessionCreateBodyHash, sessionExecutionAuthorityDigest, rotationDigest, rotationSha256, rotationBase64url,
+  rotationIsFresh, signRotationDocument, verifyRotationDocument, SessionExecutionTicketBodySchema,
+  SignedAutomationExecutionAuthorityRequestSchema, HappySessionExecutionProofSchema,
+  signOrgSetupTokenDocument, orgSetupTokenKeyId, type AutomationPayload } from '@slopus/happy-wire'
 import { ApiClient } from '@/api/api'
 import { createAutomationContextLaunchJournal } from './automationContextLaunchJournal'
 import { createAutomationContextLauncher } from './automationContextLaunch'
@@ -15,7 +19,13 @@ import { createServerAutomationRuntimeStore } from './serverAutomationRuntimeSto
 let home: string, server: Server, origin: string
 let seed: { localId: string; content: string } | null, stored: Record<string, unknown> | null
 let loseSeedAck: boolean, redirectLookup: boolean, wrongKey: boolean
-let issuerMode: 'personal' | 'company' | 'redirect' | 'malformed' | 'denied'
+let issuerMode: 'personal' | 'company' | 'signed-company' | 'redirect' | 'malformed' | 'denied'
+const companyDevice = nacl.sign.keyPair.fromSeed(new Uint8Array(32).fill(12))
+const companyIssuer = nacl.sign.keyPair.fromSeed(new Uint8Array(32).fill(13))
+const companyOrg = nacl.sign.keyPair.fromSeed(new Uint8Array(32).fill(14))
+let loseRegistrationAck: boolean, failRegistrationBeforeCommit: boolean, corruptCompanyNonce: boolean, foreignCompanyAccount: boolean
+let registeredBodyHash: string | null, registeredAuthorityDigest: string | null, registeredProofDigest: string | null
+let pendingRegistration: { body: any; proofDigest: string } | null, commitAfterAbsent: number, absentCount: number
 let exitMode: 'valid' | 'lost' | 'run' | 'session' | 'provider' | 'time' | 'partial' | 'missing'
 let exitAck: any
 const requests: Array<{ path: string; authorization: string; body: any }> = []
@@ -23,17 +33,69 @@ beforeEach(async () => {
   home = await mkdtemp(join(tmpdir(), 'automation-context-http-'))
   requests.length = 0; seed = null; stored = null; loseSeedAck = false; redirectLookup = false; wrongKey = false
   issuerMode = 'personal'
+  loseRegistrationAck = false; failRegistrationBeforeCommit = false; corruptCompanyNonce = false; foreignCompanyAccount = false
+  registeredBodyHash = null; registeredAuthorityDigest = null; registeredProofDigest = null
+  pendingRegistration = null; commitAfterAbsent = 0; absentCount = 0
   exitMode = 'valid'; exitAck = null
   server = createServer(async (req, res) => {
     let text = ''; for await (const chunk of req) text += chunk
     const body = text ? JSON.parse(text) : null
     requests.push({ path: req.url!, authorization: req.headers.authorization ?? '', body })
+    if (req.url === '/api/claude-setup-token/daemon/v2/public-key') {
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ version: 2, algorithm: 'Ed25519', keyId: await rotationSha256(companyIssuer.publicKey),
+        publicKey: rotationBase64url(companyIssuer.publicKey), studioOrigin: origin, happyOrigin: origin })); return
+    }
     if (req.headers.authorization !== 'Bearer fixture-account-token') { res.writeHead(401).end(); return }
     res.setHeader('Content-Type', 'application/json')
     if (req.url === '/api/automation/execution-target') {
       if (issuerMode === 'redirect') { res.writeHead(307, { Location: '/unexpected-redirect' }).end(); return }
       if (issuerMode === 'denied') { res.writeHead(403).end('{}'); return }
+      if (issuerMode === 'signed-company') {
+        const executionAuthority = { companyId: 'company-1', machineId: 'm1', approvalId: 'approval-1',
+          deviceKeyId: await rotationSha256(companyDevice.publicKey), machineAccountId: foreignCompanyAccount ? 'foreign-owner' : 'owner',
+          studioOrigin: origin, happyOrigin: origin, keyId: await rotationSha256(companyIssuer.publicKey) }
+        if (!body.executionAuthorityRequest) { res.end(JSON.stringify({ executionBindingRequired: true, executionAuthority })); return }
+        try {
+          const signed = SignedAutomationExecutionAuthorityRequestSchema.parse(body.executionAuthorityRequest)
+          await verifyRotationDocument(signed, companyDevice.publicKey)
+          const b = signed.body
+          if (!rotationIsFresh(b, Date.now()) || b.runId !== body.runId || b.machineId !== body.machineId
+            || b.sessionCreateBodyHash !== await sessionCreateBodyHash(body.createBody)) throw new Error('scope mismatch')
+          const executionTicket = await signRotationDocument(SessionExecutionTicketBodySchema.parse({
+            version: 1, type: 'saycode-session-execution', audience: origin, studioOrigin: origin, keyId: executionAuthority.keyId,
+            companyId: b.companyId, machineId: b.machineId, approvalId: b.approvalId, deviceKeyId: b.deviceKeyId,
+            machineOwnerAccountId: b.machineOwnerAccountId, sessionOwnerAccountId: b.sessionOwnerAccountId,
+            launchId: b.launchId, operationId: b.operationId,
+            initialNonce: corruptCompanyNonce ? rotationBase64url(new Uint8Array(32).fill(99)) : b.initialNonce,
+            deviceSigningPublicKey: rotationBase64url(companyDevice.publicKey), sessionTagHash: b.sessionTagHash,
+            sessionCreateBodyHash: b.sessionCreateBodyHash, issuedAt: Date.now(), expiresAt: Date.now() + 60000,
+          }), companyIssuer.secretKey)
+          res.end(JSON.stringify({ targetProof: 'fixture-target-proof', executionBindingRequired: true, executionAuthority,
+            executionTicket, executionAuthorityDigest: await sessionExecutionAuthorityDigest(executionTicket.body) })); return
+        } catch { res.writeHead(403).end('{}'); return }
+      }
       res.end(JSON.stringify({ targetProof: 'fixture-target-proof', executionBindingRequired: issuerMode === 'malformed' ? 'false' : issuerMode === 'company' })); return
+    }
+    if (req.url === '/v1/automation-runs/r1/execution-session/recover') {
+      if (body.claimToken !== 'fixture-claim' || body.machineId !== 'm1' || body.targetProof !== 'fixture-target-proof') { res.writeHead(403).end('{}'); return }
+      if (!stored) {
+        if (registeredBodyHash) { res.writeHead(409).end('{}'); return }
+        absentCount++
+        res.end(JSON.stringify({ status: 'NOT_REGISTERED' }))
+        if (pendingRegistration && absentCount === commitAfterAbsent) {
+          const pending = pendingRegistration.body
+          stored = { id: pending.body.tag, seq: 0, metadata: pending.body.metadata, metadataVersion: 0,
+            agentState: pending.body.agentState, agentStateVersion: 0, dataEncryptionKey: pending.body.dataEncryptionKey }
+          registeredBodyHash = await sessionCreateBodyHash(pending.body)
+          registeredAuthorityDigest = pending.executionAuthorityDigest; registeredProofDigest = pendingRegistration.proofDigest
+        }
+        return
+      }
+      if ((body.executionAuthorityDigest ?? null) !== registeredAuthorityDigest || await sessionCreateBodyHash(body.body) !== registeredBodyHash) {
+        res.writeHead(409).end('{}'); return
+      }
+      res.end(JSON.stringify({ status: 'REGISTERED', sessionId: stored.id, displaySessionId: 'manual', createBodyHash: registeredBodyHash })); return
     }
     if (req.url === '/v1/automation-runs/r1/execution-exit') {
       if (body.claimToken !== 'fixture-claim' || body.machineId !== 'm1') { res.writeHead(403).end('{}'); return }
@@ -50,8 +112,28 @@ beforeEach(async () => {
     }
     if (req.url === '/v1/automation-runs/r1/execution-session') {
       if (body.claimToken !== 'fixture-claim' || body.machineId !== 'm1' || body.targetProof !== 'fixture-target-proof') { res.writeHead(403).end('{}'); return }
+      if (issuerMode === 'signed-company') {
+        try {
+          const proof = HappySessionExecutionProofSchema.parse(body.executionProof)
+          await verifyRotationDocument(proof.ticket, companyIssuer.publicKey)
+          await verifyRotationDocument(proof.deviceProof, companyDevice.publicKey)
+          if (!rotationIsFresh(proof.ticket.body, Date.now()) || !rotationIsFresh(proof.deviceProof.body, Date.now())
+            || proof.deviceProof.body.ticketDigest !== await rotationDigest(proof.ticket)
+            || body.executionAuthorityDigest !== await sessionExecutionAuthorityDigest(proof.ticket.body)) throw new Error('invalid proof')
+          const proofDigest = await rotationDigest(proof)
+          if (failRegistrationBeforeCommit) {
+            failRegistrationBeforeCommit = false; pendingRegistration = { body, proofDigest }
+            res.writeHead(503).end('{}'); return
+          }
+          if (stored && registeredProofDigest !== proofDigest) { res.writeHead(409).end('{}'); return }
+          registeredProofDigest = proofDigest; registeredAuthorityDigest = body.executionAuthorityDigest
+          registeredBodyHash = await sessionCreateBodyHash(body.body)
+        } catch { res.writeHead(403).end('{}'); return }
+      }
       stored ??= { id: body.body.tag, seq: 0, metadata: body.body.metadata, metadataVersion: 0,
         agentState: body.body.agentState, agentStateVersion: 0, dataEncryptionKey: body.body.dataEncryptionKey }
+      registeredBodyHash = await sessionCreateBodyHash(body.body)
+      if (loseRegistrationAck) { loseRegistrationAck = false; req.socket.destroy(); return }
       res.end(JSON.stringify({ sessionId: stored.id, displaySessionId: 'manual', created: !seed })); return
     }
     if (req.url === '/v2/sessions/lookup') {
@@ -74,6 +156,7 @@ beforeEach(async () => {
   origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`
 })
 afterEach(async () => {
+  vi.useRealTimers()
   server?.closeAllConnections(); await new Promise<void>(resolve => server?.close(() => resolve()))
   await rm(home, { recursive: true, force: true })
 })
@@ -92,6 +175,111 @@ async function setup() {
     ...transport, start, discover: async () => 'unconfirmed' as const }
   return { api, prepare, input, authorize, transport, deps, start, launcher: createAutomationContextLauncher(deps) }
 }
+
+async function setupCompany(f: Awaited<ReturnType<typeof setup>>, options: { denyBeforeStart?: boolean; missingPin?: boolean } = {}) {
+  issuerMode = 'signed-company'
+  const approval = await signOrgSetupTokenDocument({ version: 1, kind: 'device-approval', companyId: 'company-1',
+    signingGeneration: 1, signingKeyId: await orgSetupTokenKeyId(companyOrg.publicKey), issuedAt: 1000,
+    approvalId: 'approval-1', approvalRevision: 1, machineId: 'm1', machineType: 'shared', ownerUserId: null,
+    deviceSigningPublicKey: rotationBase64url(companyDevice.publicKey), recipientPublicKey: rotationBase64url(new Uint8Array(32).fill(15)),
+    enrollmentDigest: 'a'.repeat(64) }, companyOrg.secretKey)
+  const config = { studioOrigin: origin, token: 'fixture-account-token', machineId: 'm1', runId: 'r1', claimToken: 'fixture-claim',
+    authority: { journal: f.deps.journal, accountId: 'owner', happyOrigin: origin,
+      keys: { signing: companyDevice, recipient: nacl.box.keyPair.fromSecretKey(new Uint8Array(32).fill(15)) },
+      pin: async (_companyId: string) => options.missingPin ? null : { publicKey: rotationBase64url(companyOrg.publicKey), approval } } }
+  const authorize = createAutomationContextAuthorizer(config)
+  const transport = createAutomationContextTransport({ serverUrl: origin, token: 'fixture-account-token', machineId: 'm1',
+    runId: 'r1', claimToken: 'fixture-claim', authorize })
+  const launcher = createAutomationContextLauncher({ ...f.deps, ...transport, beforeStart: async (run, prepared) => {
+    if (options.denyBeforeStart) issuerMode = 'denied'
+    await transport.verifyStart(run, prepared)
+  } })
+  return { authorize, transport, launcher }
+}
+const creationRequests = () => requests.filter(row => row.path === '/v1/automation-runs/r1/execution-session')
+const signedRequests = () => requests.filter(row => row.path === '/api/automation/execution-target' && row.body.executionAuthorityRequest)
+
+it.each([false, true])('does not start from a reconnect snapshot after the registered execution is deleted (company=%s)', async company => {
+  const f = await setup(), transport = company ? (await setupCompany(f)).transport : f.transport
+  const launcher = createAutomationContextLauncher({ ...f.deps, ...transport, beforeStart: async (run, prepared) => {
+    stored = null
+    await transport.verifyStart(run, prepared)
+  } })
+  await expect(launcher.launch(f.input)).rejects.toThrow()
+  expect(f.start).not.toHaveBeenCalled()
+  expect(await f.deps.journal.read('r1')).toHaveProperty('phase', 'registered')
+})
+
+it.each(['claude', 'codex'] as const)('journals one original company identity and rechecks device authority before %s start', async agent => {
+  const f = await setup(); f.input.payload.agent = agent
+  const company = await setupCompany(f)
+  expect(await company.launcher.launch(f.input)).toHaveProperty('state', 'started')
+  const record = await f.deps.journal.read('r1')
+  expect(record).toHaveProperty('executionAuthority.registrationConfirmed', true)
+  expect(record).not.toHaveProperty('executionAuthority.pendingProof')
+  expect(creationRequests()).toHaveLength(1)
+  expect(signedRequests()).toHaveLength(2)
+  const identities = signedRequests().map(row => row.body.executionAuthorityRequest.body)
+  expect(new Set(identities.map(body => `${body.launchId}:${body.operationId}:${body.initialNonce}`)).size).toBe(1)
+  expect(identities.every(body => body.agent === agent && body.sessionOwnerAccountId === 'owner')).toBe(true)
+  expect(f.prepare).toHaveBeenCalledOnce(); expect(f.start).toHaveBeenCalledOnce()
+  for (const secret of [f.input.payload.prompt, 'encryptionKey', 'seedMessage']) expect(JSON.stringify(signedRequests())).not.toContain(secret)
+})
+
+it('recovers a lost company registration ACK without a second creation request', async () => {
+  const f = await setup(), company = await setupCompany(f); loseRegistrationAck = true
+  expect(await company.launcher.launch(f.input)).toHaveProperty('state', 'started')
+  expect(creationRequests()).toHaveLength(1)
+  expect(requests.filter(row => row.path.endsWith('/execution-session/recover')).length).toBeGreaterThanOrEqual(2)
+  expect(await f.deps.journal.read('r1')).toHaveProperty('executionAuthority.registrationConfirmed', true)
+  expect(f.start).toHaveBeenCalledOnce()
+})
+
+it('renews an unregistered company proof after restart while keeping original body, key and nonce', async () => {
+  const f = await setup(), first = await setupCompany(f); failRegistrationBeforeCommit = true
+  await expect(first.launcher.launch(f.input)).rejects.toThrow('503')
+  const prepared = await f.deps.journal.read('r1')
+  expect(f.start).not.toHaveBeenCalled()
+  vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(Date.now() + 61000)
+  const second = await setupCompany(f)
+  expect(await second.launcher.launch(f.input)).toHaveProperty('state', 'started')
+  const after = await f.deps.journal.read('r1')
+  expect(after?.prepared).toEqual(prepared?.prepared)
+  expect(new Set(signedRequests().map(row => row.body.executionAuthorityRequest.body.initialNonce)).size).toBe(1)
+  expect(creationRequests()).toHaveLength(2); expect(f.prepare).toHaveBeenCalledOnce(); expect(f.start).toHaveBeenCalledOnce()
+})
+
+it('uses the canonical registration receipt when an earlier company POST wins after an absent lookup', async () => {
+  const f = await setup(), first = await setupCompany(f); failRegistrationBeforeCommit = true; commitAfterAbsent = 3
+  await expect(first.launcher.launch(f.input)).rejects.toThrow('503')
+  vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(Date.now() + 1000)
+  const second = await setupCompany(f)
+  expect(await second.launcher.launch(f.input)).toHaveProperty('state', 'started')
+  expect(creationRequests()).toHaveLength(2)
+  expect(absentCount).toBe(3)
+  expect(await f.deps.journal.read('r1')).toHaveProperty('executionAuthority.registrationConfirmed', true)
+  expect(f.prepare).toHaveBeenCalledOnce(); expect(f.start).toHaveBeenCalledOnce()
+})
+
+it('keeps a confirmed company registration after pre-start revocation and resumes by lookup only', async () => {
+  const f = await setup(), first = await setupCompany(f, { denyBeforeStart: true })
+  await expect(first.launcher.launch(f.input)).rejects.toThrow('403')
+  const registered = await f.deps.journal.read('r1')
+  expect(registered).toHaveProperty('executionAuthority.registrationConfirmed', true)
+  expect(f.start).not.toHaveBeenCalled()
+  const second = await setupCompany(f)
+  expect(await second.launcher.launch(f.input)).toHaveProperty('state', 'started')
+  expect((await f.deps.journal.read('r1'))?.prepared).toEqual(registered?.prepared)
+  expect(creationRequests()).toHaveLength(1); expect(f.start).toHaveBeenCalledOnce()
+})
+
+it.each(['pin', 'account', 'nonce'] as const)('refuses a company %s mismatch before registration without downgrade', async mismatch => {
+  const f = await setup(), company = await setupCompany(f, { missingPin: mismatch === 'pin' })
+  foreignCompanyAccount = mismatch === 'account'; corruptCompanyNonce = mismatch === 'nonce'
+  await expect(company.launcher.launch(f.input)).rejects.toThrow()
+  expect(creationRequests()).toHaveLength(0); expect(f.start).not.toHaveBeenCalled()
+  expect(await f.deps.journal.read('r1')).not.toHaveProperty('executionAuthority.registrationConfirmed')
+})
 
 it('registers and stores the exact E2EE seed over authenticated HTTP before submitting a provider', async () => {
   const f = await setup()
@@ -115,6 +303,8 @@ it('rechecks strict admission against the immutable body without re-registering 
   await f.transport.verifyStart(f.input, record.prepared)
   expect(f.authorize).toHaveBeenCalledTimes(2)
   expect(f.authorize.mock.calls[1]).toEqual(f.authorize.mock.calls[0])
+  expect(requests.map(row => row.path)).toEqual(['/v1/automation-runs/r1/execution-session/recover'])
+  requests.length = 0
   f.authorize.mockRejectedValueOnce(new Error('AUTOMATION_CONTEXT_AUTHORITY_DENIED'))
   await expect(f.transport.verifyStart(f.input, record.prepared)).rejects.toThrow('AUTOMATION_CONTEXT_AUTHORITY_DENIED')
   expect(requests).toHaveLength(0)

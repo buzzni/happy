@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import { createHash, randomUUID } from 'node:crypto'
-import { SessionExecutionCreateBodySchema, automationExecutionSeedSchema, automationExecutionSeedManifestSchema,
+import { HappySessionExecutionProofSchema, SessionExecutionCreateBodySchema, automationExecutionSeedSchema, automationExecutionSeedManifestSchema,
   automationExecutionSeedArtifactSchema, automationExecutionSeedLocalId, automationExecutionSessionId, isAutomationExecutionSessionId, automationPayloadSchema } from '@slopus/happy-wire'
 import type { ApiClient } from '@/api/api'
 import type { Metadata, Session } from '@/api/types'
@@ -21,6 +21,12 @@ export const automationContextLaunchRecordSchema = z.strictObject({
     requestCiphertext: z.string().min(1).max(1024 * 1024).optional(),
     seedMessage: z.strictObject({ localId: z.string().min(1).max(200), content: z.string().min(1).max(1024 * 1024) }) }),
   sessionId: z.string().min(1).max(200),
+  executionAuthority: z.strictObject({
+    companyId: z.string().min(1).max(128), machineAccountId: z.string().min(1).max(128),
+    approvalId: z.string().min(1).max(128), deviceKeyId: z.string().regex(/^[a-f0-9]{64}$/),
+    launchId: z.string().uuid(), operationId: z.string().uuid(), initialNonce: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+    pendingProof: HappySessionExecutionProofSchema.optional(), registrationConfirmed: z.literal(true).optional(),
+  }).optional(),
   exitReceipt: z.strictObject({ provider: z.enum(['claude', 'codex']), observedAt: z.number().int().nonnegative() }).optional(),
   exitReceiptAcknowledged: z.literal(true).optional(),
   workspaceOwnerToken: z.string().uuid().optional(),
@@ -260,6 +266,24 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
       if (registered.id !== sessionId || (registered.seq !== 0 && registered.seq !== 1) || registered.encryptionVariant !== prepared.encryptionVariant
         || !Buffer.from(registered.encryptionKey).equals(Buffer.from(encryptionKey))
         || registered.metadata?.claudeSessionId || registered.metadata?.codexThreadId) throw new Error('AUTOMATION_LAUNCH_RECEIPT_CONFLICT')
+      // The authorizer persists creation authority under this launch's exclusive lock.
+      // Accept only that field; never overwrite its fsynced confirmation with our earlier snapshot.
+      const current = await deps.journal.read(runId)
+      const withoutAuthority = (value: AutomationContextLaunchRecord) => {
+        const { executionAuthority, ...rest } = automationContextLaunchRecordSchema.parse(value)
+        return rest
+      }
+      const fixedAuthority = (value: NonNullable<AutomationContextLaunchRecord['executionAuthority']>) => {
+        const { pendingProof, registrationConfirmed, ...identity } = value
+        return identity
+      }
+      if (!current || digest(withoutAuthority(current)) !== digest(withoutAuthority(record))
+        || record.executionAuthority && (!current.executionAuthority
+          || digest(fixedAuthority(record.executionAuthority)) !== digest(fixedAuthority(current.executionAuthority))
+          || record.executionAuthority.registrationConfirmed && !current.executionAuthority.registrationConfirmed)) {
+        throw new Error('AUTOMATION_LAUNCH_IDENTITY_CONFLICT')
+      }
+      record = current
       record = { ...record, phase: 'registered' }
       await deps.journal.write(record)
       const seedReceipt = await deps.persistSeed(registered, structuredClone(prepared.seedMessage))
