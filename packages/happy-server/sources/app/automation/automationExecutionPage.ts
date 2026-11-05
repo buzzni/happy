@@ -1,6 +1,6 @@
 import type { Prisma } from '@prisma/client';
 import { automationExecutionSeedLocalId, automationExecutionSessionId, isAutomationExecutionSessionId } from '@slopus/happy-wire';
-import { automationExecutionExitReceiptSchema } from './automationExecutionSession';
+import { automationExecutionExitReceiptSchema, AutomationExecutionSessionError } from './automationExecutionSession';
 
 /** Display projection only. Reading it never appends messages to the manual provider input. */
 export async function listAutomationExecutionPage(tx: Prisma.TransactionClient, accountId: string,
@@ -73,4 +73,42 @@ export async function readAutomationExecutionEvidencePage(tx: Prisma.Transaction
     dataEncryptionKey: session.dataEncryptionKey ? Buffer.from(session.dataEncryptionKey).toString('base64') : null,
     throughSeq, messages: messages.map(row => ({ ...row, createdAt: row.createdAt.getTime() })),
     nextAfterSeq: rows.length > input.limit ? messages.at(-1)!.seq : null };
+}
+
+/** A history link survives source pruning. Only the client can verify an E2EE final answer. */
+export async function readAutomationExecutionReference(tx: Prisma.TransactionClient, accountId: string,
+  automationId: string, input: { machineId: string; generation: number; revision: number;
+    displaySessionId: string; beforeRunId?: string }) {
+  const denied = () => { throw new AutomationExecutionSessionError(403, 'Invalid automation reference admission'); };
+  const unavailable = () => { throw new AutomationExecutionSessionError(409, 'AUTOMATION_REFERENCE_UNAVAILABLE'); };
+  const definition = await tx.automation.findFirst({ where: { id: automationId, machineAccountId: accountId,
+    machineId: input.machineId, payloadVersion: 6, generation: input.generation, revision: input.revision,
+    paused: false, deletedAt: null, legacyMigrationPending: false }, include: { project: true, targetMachine: true } });
+  if (!definition || definition.project.accountId !== accountId
+    || (definition.project.config as { machineId?: unknown } | null)?.machineId !== input.machineId
+    || definition.machineKeyVersion !== definition.targetMachine?.automationKeyVersion
+    || definition.viewerKeyVersion !== definition.project.automationViewerKeyVersion
+    || isAutomationExecutionSessionId(input.displaySessionId)
+    || !await tx.session.findFirst({ where: { id: input.displaySessionId, accountId }, select: { id: true } })) return denied();
+  if (definition.ownerAccountId !== accountId) {
+    const member = await tx.projectMember.findUnique({ where: {
+      projectId_accountId: { projectId: definition.projectId, accountId: definition.ownerAccountId } } });
+    if (!member || member.status !== 'accepted' || !['owner', 'editor'].includes(member.role)) return denied();
+  }
+  async function candidate(runId: string, requireExit = true) {
+    const run = await tx.automationRun.findFirst({ where: { id: runId, automationId,
+      machineAccountId: accountId, machineId: input.machineId } });
+    if (!run || run.sessionId !== automationExecutionSessionId(runId) || run.displaySessionId !== input.displaySessionId
+      || !run.executionCreateBodyHash || !run.executionSeedMetadata || run.previousExecutionRunId === run.id) return unavailable();
+    const exit = automationExecutionExitReceiptSchema.safeParse(run.executionExitReceipt);
+    if (requireExit && !exit.success) throw new AutomationExecutionSessionError(409, 'AUTOMATION_REFERENCE_UNCONFIRMED');
+    if (!await tx.session.findFirst({ where: { id: run.sessionId, accountId }, select: { id: true } })) return unavailable();
+    return { status: 'CANDIDATE' as const, automationId, runId, generation: run.generation,
+      displaySessionId: run.displaySessionId, executionSessionId: run.sessionId,
+      createBodyHash: run.executionCreateBodyHash, executionExitReceipt: exit.success ? exit.data : null,
+      previousRunId: run.previousExecutionRunId };
+  }
+  const runId = input.beforeRunId ? (await candidate(input.beforeRunId, false)).previousRunId : definition.lastExecutionRunId;
+  if (!runId) return { status: 'NONE_ELIGIBLE' as const, automationId };
+  return candidate(runId);
 }

@@ -591,6 +591,8 @@ model Automation {
     legacyDesiredPaused     Boolean?
     createdAt          DateTime  @default(now())
     updatedAt          DateTime  @updatedAt
+    /// Persistent history head; no FK so pruned runs are unavailable, never an empty history.
+    lastExecutionRunId String?
     runs               AutomationRun[]
     scriptRevisions    ScriptAutomationRevision[]
     scriptKeys         ScriptAutomationKeyEpoch[]
@@ -641,6 +643,7 @@ model AutomationRun {
     executionSeedMetadata String?
     /// Machine-attested quiescence, independent of scheduler dispatch completion.
     executionExitReceipt Json?
+    previousExecutionRunId String?
     outcome           AutomationRunOutcome?
     detailCiphertext  Bytes?
     failureCode       String?

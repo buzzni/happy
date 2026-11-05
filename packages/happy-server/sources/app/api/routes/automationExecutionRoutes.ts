@@ -7,11 +7,30 @@ import { isServerBackedAutomationEnabled } from '@/app/automation/automationRoll
 import { createAutomationExecutionSession, automationExecutionSessionRequestSchema,
   AutomationExecutionSessionError, automationExecutionExitRequestSchema, recordAutomationExecutionExit } from '@/app/automation/automationExecutionSession';
 import { ExecutionBindingError } from '@/app/session/sessionExecutionBinding';
-import { listAutomationExecutionPage, readAutomationExecutionEvidencePage } from '@/app/automation/automationExecutionPage';
+import { listAutomationExecutionPage, readAutomationExecutionEvidencePage, readAutomationExecutionReference } from '@/app/automation/automationExecutionPage';
 import { db } from '@/storage/db';
+import { inTx } from '@/storage/inTx';
 
 /** Registers a run-owned session; provider start remains a separate, journaled operation. */
 export function automationExecutionRoutes(app: Fastify) {
+  app.get('/v1/automations/:automationId/execution-reference', {
+    preHandler: app.authenticate,
+    schema: { params: z.strictObject({ automationId: z.string().min(1).max(200) }),
+      querystring: z.strictObject({ machineId: z.string().min(1).max(200),
+        generation: z.coerce.number().int().positive(), revision: z.coerce.number().int().positive(),
+        displaySessionId: z.string().min(1).max(200), beforeRunId: z.string().regex(/^[A-Za-z0-9_-]{1,160}$/).optional() }) },
+  }, async (request, reply) => {
+    if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
+    if (!isServerBackedAutomationEnabled()) return reply.code(404).send({ error: 'feature-disabled' });
+    try {
+      const result = await inTx(tx => readAutomationExecutionReference(tx, request.userId, request.params.automationId, request.query));
+      return reply.header('Cache-Control', 'no-store').send(result);
+    } catch (error) {
+      if (error instanceof AutomationExecutionSessionError) return reply.code(error.statusCode).send({ error: error.message });
+      throw error;
+    }
+  });
+
   app.post('/v1/automation-runs/:runId/execution-exit', {
     bodyLimit: 4096, preHandler: app.authenticate,
     schema: { params: z.strictObject({ runId: z.string().regex(/^[A-Za-z0-9_-]{1,160}$/) }),

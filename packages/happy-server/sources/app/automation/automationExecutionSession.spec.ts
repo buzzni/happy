@@ -89,8 +89,8 @@ async function api() {
   automationExecutionRoutes(app); await app.ready(); return app;
 }
 
-async function exitRequest() {
-  return { machineId: 'm1', claimToken: 'claim-r1', createBodyHash: await sessionCreateBodyHash((await request()).body),
+async function exitRequest(runId = 'r1') {
+  return { machineId: 'm1', claimToken: `claim-${runId}`, createBodyHash: await sessionCreateBodyHash((await request(runId)).body),
     receipt: { version: 1, provider: 'codex', observedAt: now.getTime(), providerExitedCleanly: true,
       foregroundDrained: true, backgroundDrained: true, writeProducersDrained: true } };
 }
@@ -433,4 +433,86 @@ it('does not downgrade a required execution binding into ordinary session creati
   input.targetProof = await targetProof(input);
   await expect(createAutomationExecutionSession('owner', bearer, input, { secret, now })).rejects.toMatchObject({ statusCode: 403 });
   expect(await client.session.count()).toBe(1);
+});
+
+async function reference(input: Record<string, string> = {}) {
+  const app = await api();
+  try {
+    const query = new URLSearchParams({ machineId: 'm1', generation: '1', revision: '1', displaySessionId: 'manual', ...input });
+    return await app.inject({ method: 'GET', url: `/v1/automations/a1/execution-reference?${query}`,
+      headers: { authorization: `Bearer ${bearer}` } });
+  } finally { await app.close(); }
+}
+
+it('proves an empty reference history before registration and never treats a dispatched run as a completed answer', async () => {
+  const first = await reference();
+  expect(first.statusCode, first.body).toBe(200);
+  expect(first.json()).toEqual({ status: 'NONE_ELIGIBLE', automationId: 'a1' });
+  await register();
+  await reportAutomationRun(client as never, 'owner', 'm1', report('automation-run:r1'), now);
+  const pending = await reference();
+  expect(pending.statusCode, pending.body).toBe(409);
+  expect(pending.json()).toEqual({ error: 'AUTOMATION_REFERENCE_UNCONFIRMED' });
+  expect((await reference({ beforeRunId: 'r1' })).json()).toEqual({ status: 'NONE_ELIGIBLE', automationId: 'a1' });
+  await recordAutomationExecutionExit('owner', { ...await exitRequest(), runId: 'r1' });
+  const confirmed = await reference();
+  expect(confirmed.statusCode, confirmed.body).toBe(200);
+  expect(confirmed.json()).toMatchObject({ status: 'CANDIDATE', automationId: 'a1', runId: 'r1',
+    generation: 1, displaySessionId: 'manual', executionSessionId: 'automation-run:r1', previousRunId: null });
+  expect(confirmed.json()).not.toHaveProperty('answer');
+});
+
+it('keeps registration history stable on replay and exposes a deleted reference as unavailable', async () => {
+  await register(); await run('r2'); await register('r2'); await register();
+  expect(await client.automation.findUniqueOrThrow({ where: { id: 'a1' } })).toMatchObject({ lastExecutionRunId: 'r2' });
+  expect(await client.automationRun.findUniqueOrThrow({ where: { id: 'r2' } })).toMatchObject({ previousExecutionRunId: 'r1' });
+  await client.automationRun.delete({ where: { id: 'r2' } });
+  const missing = await reference();
+  expect(missing.statusCode, missing.body).toBe(409);
+  expect(missing.json()).toEqual({ error: 'AUTOMATION_REFERENCE_UNAVAILABLE' });
+});
+
+it.each(['generation', 'revision', 'machine', 'paused', 'deleted', 'machine-key', 'viewer-key', 'owner', 'display'])(
+  'denies reference selection before returning an empty history: %s', async reason => {
+    const query: Record<string, string> = {};
+    if (reason === 'generation') query.generation = '2';
+    if (reason === 'revision') query.revision = '2';
+    if (reason === 'machine') query.machineId = 'another-machine';
+    if (reason === 'paused') await client.automation.update({ where: { id: 'a1' }, data: { paused: true } });
+    if (reason === 'deleted') await client.automation.update({ where: { id: 'a1' }, data: { deletedAt: now } });
+    if (reason === 'machine-key') await client.machine.update({ where: { accountId_id: { accountId: 'owner', id: 'm1' } }, data: { automationKeyVersion: 2 } });
+    if (reason === 'viewer-key') await client.project.update({ where: { id: 'chat:c1' }, data: { automationViewerKeyVersion: 2 } });
+    if (reason === 'owner') await client.automation.update({ where: { id: 'a1' }, data: { ownerAccountId: 'other' } });
+    if (reason === 'display') query.displaySessionId = 'other-private-chat';
+    expect((await reference(query)).statusCode).toBe(403);
+  });
+
+it('walks only registered history and fails closed when a retained link loses its source', async () => {
+  await register(); await recordAutomationExecutionExit('owner', { ...await exitRequest(), runId: 'r1' });
+  await run('r2'); await register('r2'); await recordAutomationExecutionExit('owner', { ...await exitRequest('r2'), runId: 'r2' });
+  await run('r3'); // A claim without registration is not a provider result.
+  expect((await reference()).json()).toMatchObject({ runId: 'r2', previousRunId: 'r1' });
+  expect((await reference({ beforeRunId: 'r2' })).json()).toMatchObject({ runId: 'r1', previousRunId: null });
+  expect((await reference({ beforeRunId: 'r1' })).json()).toEqual({ status: 'NONE_ELIGIBLE', automationId: 'a1' });
+  expect((await reference({ beforeRunId: 'r3' })).statusCode).toBe(409);
+  await client.session.delete({ where: { id: 'automation-run:r1' } });
+  const missing = await reference({ beforeRunId: 'r2' });
+  expect(missing.statusCode).toBe(409);
+  expect(missing.json()).toEqual({ error: 'AUTOMATION_REFERENCE_UNAVAILABLE' });
+});
+
+it('backfills registered history additively while preserving manual data and corrupt source markers', async () => {
+  await register(); await run('r2'); await register('r2');
+  await run('r3'); // Legacy dispatch must not become a reference.
+  await client.automationRun.update({ where: { id: 'r3' }, data: { sessionId: 'manual', status: 'COMPLETED', outcome: 'WOKE' } });
+  const manual = await client.session.findUniqueOrThrow({ where: { id: 'manual' } });
+  const messages = await client.sessionMessage.findMany();
+  await db.exec('ALTER TABLE "Automation" DROP COLUMN "lastExecutionRunId"; ALTER TABLE "AutomationRun" DROP COLUMN "previousExecutionRunId";');
+  await db.exec(await readFile('prisma/migrations/20261105013000_automation_execution_reference_history/migration.sql', 'utf8'));
+  expect(await client.automation.findUniqueOrThrow({ where: { id: 'a1' } })).toMatchObject({ lastExecutionRunId: 'r2' });
+  expect(await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } })).toMatchObject({ previousExecutionRunId: null });
+  expect(await client.automationRun.findUniqueOrThrow({ where: { id: 'r2' } })).toMatchObject({ previousExecutionRunId: 'r1' });
+  expect(await client.automationRun.findUniqueOrThrow({ where: { id: 'r3' } })).toMatchObject({ previousExecutionRunId: null });
+  expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
+  expect(await client.sessionMessage.findMany()).toEqual(messages);
 });

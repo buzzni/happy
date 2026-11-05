@@ -130,8 +130,12 @@ export async function createAutomationExecutionSession(accountId: string, bearer
         { OR: [{ executionCreateBodyHash: null }, { executionCreateBodyHash: bodyHash }] },
         { OR: [{ executionSeedMetadata: null }, { executionSeedMetadata: input.body.metadata }] }],
     }, data: { sessionId, displaySessionId: input.displaySessionId, executionCreateBodyHash: bodyHash,
-      executionSeedMetadata: input.body.metadata } });
+      executionSeedMetadata: input.body.metadata,
+      ...(!run.executionCreateBodyHash ? { previousExecutionRunId: a.lastExecutionRunId } : {}) } });
     if (changed.count !== 1) return conflict();
+    if (!run.executionCreateBodyHash) {
+      await tx.automation.update({ where: { id: a.id }, data: { lastExecutionRunId: run.id } });
+    }
     return run;
   }
 
