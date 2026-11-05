@@ -4,6 +4,7 @@ import type { ApiSessionClient } from '@/api/apiSession';
 import type { Metadata } from '@/api/types';
 import { startHappyServer } from './startHappyServer';
 import { unixMcpFetch } from './unixMcpFetch';
+import { createOfflineSessionStub } from '@/utils/offlineSessionStub';
 import {
     applyLinkedPullRequestChange,
     LINKED_PULL_REQUEST_LIMIT,
@@ -261,6 +262,21 @@ function directTools(client: ApiSessionClient, timeoutMs = 30) {
 }
 
 describe('saycode_pr_link / saycode_pr_watch tools', () => {
+    it('stores links and watch requests after an offline session reconnects', async () => {
+        let session = createOfflineSessionStub('pr-reconnect');
+        const options = { linkedPullRequestTools: true, getSessionClient: () => session, wrappedSandbox: true };
+        const server = await startHappyServer(session, options) as McpServerHandle;
+        try {
+            expect((await callTool(server, 'saycode_pr_link', { action: 'link', url: HAPPY.url })).isError).toBe(true);
+            const online = fakeClient();
+            session = online.client;
+            expect((await callTool(server, 'saycode_pr_link', { action: 'link', url: HAPPY.url })).isError).toBe(false);
+            expect((await callTool(server, 'saycode_pr_watch', { action: 'start', url: HAPPY.url })).isError).toBe(false);
+            expect(readLinkedPullRequests(online.metadata())[0]).toMatchObject({ url: HAPPY.url, watch: { requested: true } });
+            expect((await callTool(server, 'saycode_pr_link', { action: 'list' })).text).toContain('buzzni/happy#1125');
+        } finally { server.stop(); }
+    });
+
     it('are listed and allowed without a prompt only when the runner exposes them', async () => {
         const open = await startHappyServer(fakeClient().client, { linkedPullRequestTools: true }) as McpServerHandle;
         try {

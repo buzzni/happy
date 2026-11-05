@@ -65,6 +65,7 @@ export interface HappyServerHandlers {
     admitTool?: <T>(work: () => Promise<T>) => Promise<T>;
     changeTitle: (title: string, branchSlug?: string) => Promise<{ success: boolean; error?: string }>;
     client: ApiSessionClient;
+    getSessionClient?: () => ApiSessionClient;
     proposeLesson?: (input: { token: string; proposal: unknown }) => { accepted: boolean };
     /** Per-turn switch for the next-steps card; absent (ACP) refuses it. */
     turnCards?: TurnCards;
@@ -165,7 +166,11 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
     // Not in a mandatory sandbox: that boundary keeps its fixed minimal tool set (like propose_lesson).
     if (!handlers.mandatorySandbox) registerTurnCardTools(mcp, { client: handlers.client, turnCards: handlers.turnCards, runTool });
 
-    if (handlers.linkedPullRequestTools) registerLinkedPullRequestTools(mcp, { client: handlers.client, runTool });
+    if (handlers.linkedPullRequestTools) registerLinkedPullRequestTools(mcp, {
+        // Resolve for each invocation, including after an offline-to-online session swap.
+        get client() { return handlers.getSessionClient?.() ?? handlers.client; },
+        runTool,
+    });
 
     if (!handlers.mandatorySandbox && !scopedSession) mcp.registerTool('script_automations', {
         title: 'Manage Script Automations',
@@ -609,6 +614,8 @@ export async function startHappyServer(
          * attachment, existing tag). Absent: no tools and no write.
          */
         linkedPullRequestTools?: boolean;
+        /** Current runner session for PR tools when offline reconnection replaces the initial client. */
+        getSessionClient?: () => ApiSessionClient;
     } = {},
 ) {
     logger.debug(`[happyMCP] server:start sessionId=${client.sessionId}`);
@@ -701,6 +708,7 @@ export async function startHappyServer(
             checkpointReader: options.checkpointReader,
             admitTool: options.admitTool,
             client,
+            getSessionClient: options.getSessionClient,
             mandatorySandbox: options.mandatorySandbox,
             linkedPullRequestTools,
             proposeLesson: options.proposeLesson,

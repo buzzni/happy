@@ -250,7 +250,7 @@ const DEFAULT_CONFIRM = { timeoutMs: 5000, pollMs: 50 };
 
 /**
  * Changes sent and not yet stored, per session client. The MCP server is rebuilt per request, so
- * this lives with the client. A change that timed out stays here until the server stores it.
+ * this lives with the client. A change that timed out stays until its write is stored or discarded.
  */
 const pendingByClient = new WeakMap<object, Array<{ change: LinkedPullRequestChange }>>();
 
@@ -277,9 +277,11 @@ async function record(options: LinkedPullRequestToolOptions, change: LinkedPullR
     } else {
         const entry = { change };
         pending.push(entry);
+        const removePending = () => { const index = pending.indexOf(entry); if (index >= 0) pending.splice(index, 1); };
         client.updateMetadata((metadata) => applyLinkedPullRequestChange(metadata, change).metadata, {
             skipUnchanged: true,
-            onStored: () => { const index = pending.indexOf(entry); if (index >= 0) pending.splice(index, 1); },
+            onStored: removePending,
+            onDiscarded: removePending,
         });
         awaited = [entry];
     }

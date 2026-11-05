@@ -335,6 +335,24 @@ describe('runAcp', () => {
     });
   });
 
+  it('keeps PR tools bound to the current session after reconnection', async () => {
+    const runPromise = runAcp({
+      credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+      agentName: 'grok', command: 'grok', args: ['agent', 'stdio'],
+    });
+    try {
+      await vi.waitFor(() => expect(mocks.backendState.startSessionCalls).toBe(1));
+      const serverOptions = mocks.mockStartHappyServer.mock.calls[0][1];
+      expect(serverOptions.getSessionClient()).toBe(mocks.mockSession);
+      const reconnected = { ...mocks.mockSession, sessionId: 'reconnected' };
+      mocks.mockSetupOfflineReconnection.mock.calls[0][0].onSessionSwap(reconnected);
+      expect(serverOptions.getSessionClient()).toBe(reconnected);
+    } finally {
+      await mocks.getKillHandler()!();
+      await runPromise;
+    }
+  });
+
   it('launches the Happy MCP bridge through node, which Windows agents can spawn without a shell', async () => {
     const runPromise = runAcp({
       credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },

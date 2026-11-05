@@ -615,6 +615,7 @@ export async function runAcp(opts: {
   const loopFinished = new Promise<void>((resolve) => { markLoopDone = () => { loopDone = true; resolve(); }; });
   const happyServer = await startHappyServer(session, {
     linkedPullRequestTools,
+    getSessionClient: () => session,
     ...(launchControl ? {
       admitTool: <T,>(work: () => Promise<T>) => (runtimeGate ? runtimeGate.admit(work, 'writer') : Promise.reject(new Error('Runtime input is not open'))),
     } : {}),

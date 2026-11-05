@@ -2511,8 +2511,9 @@ export class ApiSessionClient extends EventEmitter {
      * With storage tracking enabled, handlers must be pure and safe to replay against newer state (idempotent).
      * `skipUnchanged`: a handler that returns the document it was given sends nothing, also on a replay.
      * `onStored` runs once the server has the result (or, with `skipUnchanged`, already had it).
+     * `onDiscarded` runs when a failed write is dropped and cannot retry; a retained write does not call it.
      */
-    updateMetadata(handler: (metadata: Metadata) => Metadata, options: { skipUnchanged?: boolean; onStored?: () => void } = {}) {
+    updateMetadata(handler: (metadata: Metadata) => Metadata, options: { skipUnchanged?: boolean; onStored?: () => void; onDiscarded?: () => void } = {}) {
         let attempt: { encrypted: string; expectedVersion: number; uncertain: boolean } | null = null;
         this.metadataWrites.enqueue(() => this.runStateWrite(async () => {
             if (this.closed) return false;
@@ -2554,7 +2555,7 @@ export class ApiSessionClient extends EventEmitter {
                 return false;
             }
             return false;
-        }));
+        }), options.onDiscarded);
     }
 
     /**

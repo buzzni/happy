@@ -2,19 +2,20 @@ import { AsyncLock } from '@/utils/lock';
 import type { SessionStorageBarrier } from './sessionStorageBarrier';
 export class SessionStateWriteRefused extends Error {}
 
-type Write = { apply: () => Promise<boolean>; confirm: (confirmed: boolean) => void; settled: boolean; attempted: boolean };
+type Write = { apply: () => Promise<boolean>; confirm: (confirmed: boolean) => void; onDiscarded?: () => void; settled: boolean; attempted: boolean };
 
 /** Holds later state transforms until every predecessor is stored; only failed writes replay. */
 export class SessionStateWrites {
     private readonly lock = new AsyncLock();
     private readonly pending: Write[] = [];
     constructor(private readonly barrier: SessionStorageBarrier | null, private readonly warn: () => void, private readonly canWrite: () => boolean = () => true, private readonly onBlocked: () => void = () => {}) {}
-    enqueue(apply: () => Promise<boolean>) {
-        const write: Write = { apply, confirm: this.barrier?.track() ?? (() => {}), settled: false, attempted: false };
+    enqueue(apply: () => Promise<boolean>, onDiscarded?: () => void) {
+        const write: Write = { apply, confirm: this.barrier?.track() ?? (() => {}), onDiscarded, settled: false, attempted: false };
         if (this.barrier) this.pending.push(write);
         void this.lock.inLock(async () => {
             if (write.attempted || (this.barrier && this.pending[0] !== write)) return;
             write.settled = await this.tryWrite(write);
+            if (!write.settled && !this.barrier) write.onDiscarded?.();
             this.settlePrefix();
             if (!write.settled) this.blocked();
         });
@@ -40,7 +41,7 @@ export class SessionStateWrites {
             catch (error) {
                 if (this.barrier && error instanceof SessionStateWriteRefused) {
                     // Drop only the non-retryable transform, never its failure evidence.
-                    write.confirm(false); this.warn(); return true;
+                    write.confirm(false); write.onDiscarded?.(); this.warn(); return true;
                 }
                 if (!this.barrier) { this.warn(); return false; }
             }

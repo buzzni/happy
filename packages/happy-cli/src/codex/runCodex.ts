@@ -2040,6 +2040,7 @@ export async function runCodex(opts: {
     // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
     const happyServer = await startHappyServer(session, {
         linkedPullRequestTools,
+        getSessionClient: () => session,
         browserClientApprover: () => permissionHandler,
         agentControl: accountToken !== null,
         exitAfterFirstTurn,

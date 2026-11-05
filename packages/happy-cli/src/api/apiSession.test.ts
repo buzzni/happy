@@ -10,7 +10,8 @@ import type { ClaudeSessionProtocolState } from '@/claude/utils/sessionProtocolM
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { inputEvidenceMetadata, resolveRecoveredInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings';
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
-import { applyLinkedPullRequestChange, parsePullRequestUrl } from '@/claude/utils/linkedPullRequestTools';
+import { applyLinkedPullRequestChange, parsePullRequestUrl, registerLinkedPullRequestTools } from '@/claude/utils/linkedPullRequestTools';
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { updateClaudePromptSuggestion } from '@/claude/promptSuggestionMetadata';
 import { applySessionModelPinPatch } from '@/utils/sessionModelPin';
 import { mergeAcpSessionConfigIntoMetadata } from '@/agent/acp/sessionConfigMetadata';
@@ -1019,6 +1020,30 @@ describe('ApiSessionClient v3 messages API migration', () => {
                 owner: { clientId: 'desktop-1', claimedAt: 2, heartbeatAt: 3 }, state: 'watching', updatedAt: 3 },
         };
         const linkHappy = (metadata: Metadata) => applyLinkedPullRequestChange(metadata, { kind: 'link', pr: happy, by: 'agent', at: 10 }).metadata;
+
+        it.each([
+            ['saycode_pr_link', 'link'],
+            ['saycode_pr_watch', 'start'],
+        ])('retries %s after a terminal metadata write failure', async (name, action) => {
+            const client = new ApiSessionClient('fake-token', session);
+            const tools = new Map<string, (args: unknown) => Promise<{ isError?: boolean }>>();
+            const mcp = { registerTool: (name: string, _config: unknown, handler: never) => tools.set(name, handler) };
+            registerLinkedPullRequestTools(mcp as unknown as McpServer, {
+                client, runTool: work => work(), confirm: { timeoutMs: 50, pollMs: 2 },
+            });
+            try {
+                const call = () => tools.get(name)!({ action, url: happy.url });
+                expect((await call()).isError).toBe(true);
+                expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(1);
+                mockSocket.emitWithAck.mockImplementation(async (_event: string, data: { metadata: string; expectedVersion: number }) => ({
+                    result: 'success', metadata: data.metadata, version: data.expectedVersion + 1,
+                }));
+                expect((await call()).isError).not.toBe(true);
+                expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(2);
+                expect(client.getMetadata()?.linkedPullRequests).toEqual([expect.objectContaining({ url: happy.url })]);
+                if (action === 'start') expect((client.getMetadata()?.linkedPullRequests as any[])[0].watch.requested).toBe(true);
+            } finally { await client.close(); }
+        });
 
         it('replays a link on the newest document after a version mismatch, keeping the Desktop owner', async () => {
             const newer = { ...session.metadata, linkedPullRequests: [desktopEntry], summary: { text: 'Desktop title', updatedAt: 2 } };
@@ -3606,21 +3631,25 @@ describe('ApiSessionClient v3 messages API migration', () => {
             mockSocket.emitWithAck.mockImplementation(async () => ({ result: 'version-mismatch', metadata: encryptContent(session, { ...session.metadata, codexThreadId: 'newer-external' }), version: session.metadataVersion + 2 }));
             const client = new ApiSessionClient('fake-token', session, undefined, { trackShutdownStorage: true });
             const update = vi.fn(metadata => ({ ...metadata, codexThreadId: 'older-intent' }));
-            client.updateMetadata(update);
+            const discarded = vi.fn();
+            client.updateMetadata(update, { onDiscarded: discarded });
             await expect(client.flushForShutdown(1000)).resolves.toEqual({ stored: false, reason: 'unconfirmed-write' });
             expect(update).toHaveBeenCalledTimes(1);
             expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(2);
             expect(client.getMetadata()?.codexThreadId).toBe('newer-external');
+            expect(discarded).toHaveBeenCalledTimes(1);
             await client.close();
         });
         it('records an invalid state transform permanently but lets later valid writes proceed', async () => {
             mockSocket.emitWithAck.mockImplementation(async (_event: string, data: { metadata: string; expectedVersion: number }) => ({ result: 'success', metadata: data.metadata, version: data.expectedVersion + 1 }));
             const client = new ApiSessionClient('fake-token', session, undefined, { trackShutdownStorage: true });
             const invalid = vi.fn(() => { throw new Error('invalid local state'); });
-            client.updateMetadata(invalid);
+            const discarded = vi.fn();
+            client.updateMetadata(invalid, { onDiscarded: discarded });
             client.updateMetadata(metadata => ({ ...metadata, codexThreadId: 'later-valid' }));
             await waitForCheck(() => expect(client.getMetadata()?.codexThreadId).toBe('later-valid'));
             expect(invalid).toHaveBeenCalledTimes(1);
+            expect(discarded).toHaveBeenCalledTimes(1);
             await expect(client.flushForShutdown(1000)).resolves.toEqual({ stored: false, reason: 'unconfirmed-write' });
             await client.close();
         });
@@ -3701,14 +3730,17 @@ describe('ApiSessionClient v3 messages API migration', () => {
             let available = false;
             const first = vi.fn(async () => available);
             const successor = vi.fn(async () => true);
-            writes.enqueue(first);
+            const discarded = vi.fn();
+            writes.enqueue(first, discarded);
             await waitForCheck(() => expect(first).toHaveBeenCalledTimes(3));
             writes.enqueue(successor);
             await new Promise(resolve => setTimeout(resolve, 20));
             expect(successor).not.toHaveBeenCalled();
+            expect(discarded).not.toHaveBeenCalled();
             available = true; writes.retry(() => true);
             await expect(barrier.wait(1000)).resolves.toMatchObject({ stored: true });
             expect(successor).toHaveBeenCalledTimes(1);
+            expect(discarded).not.toHaveBeenCalled();
         });
         it('does not apply a queued state write again after retry already processed it', async () => {
             const barrier = new SessionStorageBarrier();

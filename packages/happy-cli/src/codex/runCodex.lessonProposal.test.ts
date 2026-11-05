@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { ApiSessionClient } from '@/api/apiSession';
 
 const fixture = vi.hoisted(() => ({
     submit: null as null | ((input: { token: string; proposal: unknown }) => { accepted: boolean }),
@@ -50,7 +51,7 @@ vi.mock('@/utils/MessageQueue2', async (original) => {
 vi.mock('@/utils/broadKillShims', () => ({ installBroadKillShims: vi.fn() }));
 vi.mock('@/persistence', async (original) => ({ ...await original<typeof import('@/persistence')>(), readSettings: vi.fn(async () => ({ machineId: 'machine' })) }));
 vi.mock('@/api/api', () => ({ ApiClient: { create: vi.fn(async () => ({ getOrCreateMachine: vi.fn(), getOrCreateSession: vi.fn(async () => ({ id: 'lesson-session' })) })) } }));
-vi.mock('@/utils/setupOfflineReconnection', () => ({ setupOfflineReconnection: () => ({ session: fixture.session }) }));
+vi.mock('@/utils/setupOfflineReconnection', () => ({ setupOfflineReconnection: vi.fn((_options: unknown) => ({ session: fixture.session })) }));
 vi.mock('@/daemon/run', () => ({ initialMachineMetadata: {} }));
 vi.mock('@/daemon/controlClient', () => ({ notifyDaemonSessionStarted: vi.fn(async () => ({})) }));
 vi.mock('@/checkpoint/checkpointSessionComposition', () => ({ createCheckpointSessionComposition: vi.fn(async () => ({})) }));
@@ -206,6 +207,12 @@ describe('Codex linked pull request tools', () => {
         const api = await vi.mocked(ApiClient.create).mock.results[0].value as { getOrCreateSession: ReturnType<typeof vi.fn> };
         const [{ metadata }] = api.getOrCreateSession.mock.calls[0] as [{ metadata: { runtimeCapabilities?: Record<string, unknown> } }];
         expect(metadata.runtimeCapabilities?.linkedPullRequests).toBe(exposed ? 1 : undefined);
+        const serverOptions = vi.mocked(startHappyServer).mock.calls[0][1]!;
+        expect(serverOptions.getSessionClient?.()).toBe(fixture.session);
+        const { setupOfflineReconnection } = await import('@/utils/setupOfflineReconnection');
+        const reconnected = { ...fixture.session, sessionId: 'reconnected' } as unknown as ApiSessionClient;
+        vi.mocked(setupOfflineReconnection).mock.calls[0][0].onSessionSwap(reconnected);
+        expect(serverOptions.getSessionClient?.()).toBe(reconnected);
     });
 });
 
