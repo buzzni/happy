@@ -183,6 +183,91 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
   }
 }
 
+describe('legacy workspace preclaim admission', () => {
+  it('defers worktree cleanup without spending its retry budget when the workspace is busy', async () => {
+    const f = setup()
+    const cache = f.input.cache.read()
+    f.input.cache.read = () => ({ ...cache, automations: cache.automations.map(row => ({ ...row, paused: true })) })
+    const worktree = { automationId: 'automation-1', generation: 2, runId: 'old', repositoryRoot: '/repo',
+      worktreePath: '/isolated/old', directory: '/isolated/old', sessionId: null, createdAt: 1, cleanupAttempts: 3 }
+    f.store.write({ ...f.store.read(), githubWorktrees: [worktree] })
+    const reserveLegacyDispatch = vi.fn(async () => ({ acquired: false as const, reason: 'workspace-busy' as const, sessions: ['isolated'] }))
+    Object.assign(f.input, { reserveLegacyDispatch })
+    await runServerAutomationTick(f.input)
+    expect(reserveLegacyDispatch).toHaveBeenCalledWith(['/repo', '/isolated/old'])
+    expect(f.discardGithubWorktree).not.toHaveBeenCalled()
+    expect(f.store.state().githubWorktrees).toEqual([worktree])
+  })
+
+  it('continues with another folder when a dispatch handoff cannot be confirmed', async () => {
+    const f = setup({ claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-1' } } })
+    const cache = f.input.cache.read()
+    f.input.cache.read = () => ({ ...cache, automations: [...cache.automations,
+      { ...cache.automations[0], automationId: 'automation-2' }] })
+    const state = f.store.read()
+    f.store.write({ ...state, schedules: [...state.schedules, { ...state.schedules[0], automationId: 'automation-2' }] })
+    const original = f.decryptPayload(cacheRecord(), new Uint8Array(32))
+    f.input.decryptPayload = row => ({ ...original, directory: row.automationId === 'automation-1' ? '/repo' : '/other' })
+    const finish = vi.fn(async () => undefined).mockRejectedValueOnce(new Error('WORKSPACE_DISPATCH_HANDOFF_UNCONFIRMED'))
+    Object.assign(f.input, { reserveLegacyDispatch: vi.fn(async () => ({ acquired: true as const, finish })) })
+    expect(await runServerAutomationTick(f.input)).toEqual([
+      { automationId: 'automation-1', outcome: 'WOKE' }, { automationId: 'automation-2', outcome: 'WOKE' },
+    ])
+    expect(f.spawnSession).toHaveBeenCalledTimes(2)
+    expect(finish).toHaveBeenCalledTimes(2)
+    expect(f.logDebug).toHaveBeenCalledWith(expect.stringContaining('handoff unconfirmed'))
+  })
+
+  it.each(['busy', 'unconfirmed'] as const)('preserves the original once occurrence when workspace admission is %s', async reason => {
+    const f = setup({ claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-1' } } })
+    const original = f.decryptPayload(cacheRecord(), new Uint8Array(32))
+    f.input.decryptPayload = () => ({ ...original, schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' }, scriptCommand: 'probe' })
+    const reserveLegacyDispatch = vi.fn(async () => {
+      if (reason === 'unconfirmed') throw new Error('WORKSPACE_REPOSITORY_IDENTITY_UNCONFIRMED')
+      return { acquired: false as const, reason: 'workspace-busy' as const, sessions: ['isolated'] }
+    })
+    Object.assign(f.input, { reserveLegacyDispatch })
+    const originalSchedules = f.store.read().schedules
+    expect(await runServerAutomationTick(f.input)).toEqual([])
+    expect(reserveLegacyDispatch).toHaveBeenCalledWith(['/repo'])
+    expect(f.store.read().schedules).toEqual(originalSchedules)
+    expect(f.transport.claim).not.toHaveBeenCalled()
+    expect(f.runScript).not.toHaveBeenCalled()
+    expect(f.spawnSession).not.toHaveBeenCalled()
+  })
+
+  it('retains an overdue legacy once occurrence for reconfirmation instead of silently spending it', async () => {
+    const f = setup({ claim: { ok: false, error: 'claim-denied' } })
+    const original = f.decryptPayload(cacheRecord(), new Uint8Array(32))
+    f.input.decryptPayload = () => ({ ...original, schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } })
+    const finish = vi.fn(async () => undefined)
+    Object.assign(f.input, { reserveLegacyDispatch: vi.fn(async () => ({ acquired: true as const, finish })) })
+    const due = f.store.read().schedules[0].nextRunAt
+    f.input.now += 120_000
+    await runServerAutomationTick(f.input)
+    expect(f.store.read().schedules[0]).toMatchObject({ nextRunAt: due,
+      contextAdmissionHold: { code: 'CLAIM_RECONFIRMATION_REQUIRED', revision: 2, scheduledFor: due } })
+    expect(f.store.read().schedules[0].spentOnceAt).toBeUndefined()
+    await runServerAutomationTick(f.input)
+    expect(f.transport.claim).toHaveBeenCalledOnce()
+    expect(finish).toHaveBeenCalledOnce()
+    expect(f.transport.start).not.toHaveBeenCalled()
+  })
+
+  it('holds the reservation through execution and releases it even after a refused claim', async () => {
+    const f = setup()
+    const finish = vi.fn(async () => undefined)
+    Object.assign(f.input, { reserveLegacyDispatch: vi.fn(async () => ({ acquired: true as const, finish })) })
+    f.transport.claim.mockImplementation(async () => {
+      expect(finish).not.toHaveBeenCalled()
+      return { ok: false, error: 'offline' }
+    })
+    await runServerAutomationTick(f.input)
+    expect(f.transport.claim).toHaveBeenCalledOnce()
+    expect(finish).toHaveBeenCalledOnce()
+  })
+})
+
 // #3556: daemon/run.ts와 동일하게 실제 exchange/preflight를 연결한다.
 // 외부 HTTP 응답과 세션 spawn만 fixture이며, fetch/SDK initialize/tools/list는 mock하지 않는다.
 describe('예약 자동화 커넥터 실제 HTTP 경로 (#3556)', () => {
@@ -4596,6 +4681,22 @@ describe('unreachable pre-model retry', () => {
     })
     return { ...f, tickAt, grantCalledAt }
   }
+
+  it('does not consume an existing retry while another workspace owner blocks dispatch', async () => {
+    const f = retrySetup()
+    await f.tickAt(0)
+    const retry = f.store.state().unreachableRetries![0]
+    const beforeCalls = f.resolveMcpSpawnContext.mock.calls.length
+    const reserveLegacyDispatch = vi.fn(async () => ({ acquired: false as const, reason: 'workspace-busy' as const, sessions: ['isolated'] }))
+    Object.assign(f.input, { reserveLegacyDispatch })
+    await f.tickAt(MINUTE)
+    expect(reserveLegacyDispatch).toHaveBeenCalledWith(['/repo'])
+    expect(f.store.state().unreachableRetries).toEqual([expect.objectContaining({
+      attempt: retry.attempt, retryAt: retry.retryAt, report: retry.report,
+    })])
+    expect(f.resolveMcpSpawnContext).toHaveBeenCalledTimes(beforeCalls)
+    expect(f.transport.claim).toHaveBeenCalledOnce()
+  })
 
   it('runs the same run once the VPN comes up a couple of minutes after the laptop wakes', async () => {
     const f = retrySetup()

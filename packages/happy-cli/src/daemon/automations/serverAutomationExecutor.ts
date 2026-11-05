@@ -2,6 +2,7 @@ import { stripProviderCredentialOverrides } from '@/managed/managedStartup'
 import type { AutomationProjectEnvironmentResult } from './automationProjectEnvironment'
 import { mergePullRequestFiles, type PullRequestFiles } from './queryGithubPullRequests'
 import { randomUUID } from 'node:crypto'
+import type { LegacyDispatchReservation } from '@/utils/workspaceTurnAdmission'
 import { buildScheduledRunPrompt } from '@/utils/scheduledRunPrompt'
 import { automationExecutionSessionId, isAutomationExecutionSessionId } from '@slopus/happy-wire'
 import { buildAutomationContextInput } from './automationContextInput'
@@ -205,6 +206,8 @@ export interface ServerAutomationExecutorInput {
   /** Private run-owned runtime. The payload is the authored snapshot, never an assembled legacy conversation prompt. */
   /** A failed host recovery holds isolated occurrences before claim, preserving once schedules. */
   isolatedContextReady?: boolean
+  /** Reserve legacy writers before consuming their original claim or retry. */
+  reserveLegacyDispatch?: (roots: readonly string[]) => Promise<LegacyDispatchReservation>
   /** Acknowledges only original run-owned cancellation, never a manual display session. */
   cancelIsolatedContext?: (input: { automationId: string; revision: number; generation: number }) => Promise<boolean>
   prepareIsolatedContext?: (input: { automationId: string; generation: number; revision: number; payload: ServerAutomationPayload;
@@ -1242,6 +1245,21 @@ async function cleanupInactiveGithubWorktrees(input: ServerAutomationExecutorInp
       continue
     }
     if (input.isDirectoryInUse(worktree.worktreePath) || input.isDirectoryInUse(worktree.directory)) continue
+    let reservation: Extract<LegacyDispatchReservation, { acquired: true }> | undefined
+    if (input.reserveLegacyDispatch) {
+      try {
+        const admission = await input.reserveLegacyDispatch([worktree.repositoryRoot, worktree.worktreePath])
+        if (!admission.acquired) {
+          input.logDebug?.(`[server-automation] GitHub cleanup held before retry: ${admission.reason}`)
+          continue
+        }
+        reservation = admission
+      } catch (error) {
+        input.logDebug?.(`[server-automation] GitHub cleanup workspace unconfirmed before retry: ${error}`)
+        continue
+      }
+    }
+    try {
     const discarded = await input.discardGithubWorktree({
       repositoryRoot: worktree.repositoryRoot,
       worktreePath: worktree.worktreePath,
@@ -1277,6 +1295,12 @@ async function cleanupInactiveGithubWorktrees(input: ServerAutomationExecutorInp
       worktree.runId,
       discarded.dirty ? DIRTY_WORKTREE_RETRY_MS : WORKTREE_CLEANUP_RETRY_MS,
     )
+    } finally {
+      try { await reservation?.finish() }
+      catch (error) {
+        input.logDebug?.(`[server-automation] GitHub cleanup handoff unconfirmed; workspace remains reserved: ${error}`)
+      }
+    }
   }
 }
 
@@ -2088,7 +2112,7 @@ export async function runServerAutomationTick(
       input.logDebug?.(`[server-automation] ${automation.automationId} isolated host unready; holding the original occurrence before claim`)
       continue
     }
-    if (payload.contextPolicy && schedule.contextAdmissionHold?.revision === automation.revision
+    if (schedule.contextAdmissionHold?.revision === automation.revision
       && schedule.contextAdmissionHold.scheduledFor === schedule.nextRunAt) continue
     let preparedContext: { previousResult?: unknown } | undefined
     if (payload.contextPolicy) {
@@ -2138,6 +2162,21 @@ export async function runServerAutomationTick(
       scheduleNextTick(input, automation.automationId, now)
       continue
     }
+    let reservation: Extract<LegacyDispatchReservation, { acquired: true }> | undefined
+    if (!payload.contextPolicy && !waitingSessionId && input.reserveLegacyDispatch) {
+      try {
+        const admission = await input.reserveLegacyDispatch([payload.directory])
+        if (!admission.acquired) {
+          input.logDebug?.(`[server-automation] ${automation.automationId} held before claim: ${admission.reason}`)
+          continue
+        }
+        reservation = admission
+      } catch (error) {
+        input.logDebug?.(`[server-automation] ${automation.automationId} workspace unconfirmed before claim: ${error}`)
+        continue
+      }
+    }
+    try {
     // 재시도는 이미 시작된 같은 run 을 이어 쓴다 — 새로 claim 하면 서버 이력에 행이 늘고
     // 같은 회차가 두 번 실행될 수 있다.
     const retry = retryDue ? takeDueUnreachableRetry(input.runtimeStore, automation, now, input.logDebug) : null
@@ -2154,7 +2193,7 @@ export async function runServerAutomationTick(
         scheduledFor: schedule.nextRunAt,
       })
       if (!claim.ok || !claim.value) {
-        if (claim.error === 'claim-denied' && payload.contextPolicy && isOnceSchedule(payload.schedule)) {
+        if (claim.error === 'claim-denied' && (payload.contextPolicy || input.reserveLegacyDispatch) && isOnceSchedule(payload.schedule)) {
           const state = input.runtimeStore.read()
           input.runtimeStore.write({ ...state, schedules: state.schedules.map(item => item.automationId === automation.automationId
             ? { ...item, contextAdmissionHold: { code: 'CLAIM_RECONFIRMATION_REQUIRED', revision: automation.revision, scheduledFor: schedule.nextRunAt } }
@@ -2322,6 +2361,12 @@ export async function runServerAutomationTick(
       && githubEventsProcessed < MAX_GITHUB_EVENTS_PER_TICK) {
       immediateWorkerIds.add(automation.automationId)
       workQueue.push(automation)
+    }
+    } finally {
+      try { await reservation?.finish() }
+      catch (error) {
+        input.logDebug?.(`[server-automation] ${automation.automationId} handoff unconfirmed; workspace remains reserved: ${error}`)
+      }
     }
   }
   return outcomes
