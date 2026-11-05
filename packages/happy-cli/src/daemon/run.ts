@@ -4929,6 +4929,11 @@ export async function startDaemon(): Promise<void> {
       fetch,
       // Passed as is: catching a session up resumes its recorded binding, the runtime's third argument.
       sessionEnvironment: aiCredentialRuntime.sessionEnvironment,
+      disabledSetupTokenAccounts: async () => {
+        const status = await aiCredentialRuntime.status({ provider: 'claude' });
+        return 'setupToken' in status ? (status.setupToken?.accounts ?? [])
+          .filter(account => account.disabled).map(account => account.managedAccountId) : [];
+      },
       recordAgentEnvironment: persistSetupTokenBinding,
       // Saycode specs/setup-token-switch-usage-check — check a candidate nobody measured recently before moving onto it.
       measure: aiCredentialRuntime.measureWithPermit,

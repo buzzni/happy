@@ -63,6 +63,15 @@ it('still holds a shared-PC turn on a wait Studio answers, and never runs it aft
   expect(await waitForSharedSetupTokenStart({ request: async () => { controller.abort(); throw new Error('offline') }, notify: vi.fn(), signal: controller.signal })).toBe(false)
 })
 
+it('bounds retries when no replacement is available and never authorizes the waiting input', async () => {
+  const request = vi.fn(async () => ({ state:'wait' as const, retryAfterMs:1, preferredAccountIds:[] }))
+  const notify = vi.fn(), moveToPreferred = vi.fn(async()=>false)
+  await expect(waitForSetupTokenStart({request,notify,moveToPreferred,signal:new AbortController().signal})).rejects.toThrow('SETUP_TOKEN_START_WAIT_EXHAUSTED')
+  expect(request).toHaveBeenCalledTimes(60)
+  expect(notify).toHaveBeenCalledTimes(1)
+  expect(moveToPreferred).not.toHaveBeenCalled()
+})
+
 it('moves off confirmed start exhaustion without admitting the old provider or using start budget', async () => {
  const request=vi.fn().mockRejectedValue(new Error('SETUP_TOKEN_START_ACCOUNT_EXHAUSTED'))
  const moveFromExhausted=vi.fn(async()=>true),moveToPreferred=vi.fn(),notify=vi.fn()
