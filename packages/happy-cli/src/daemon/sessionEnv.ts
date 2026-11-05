@@ -148,16 +148,17 @@ function readRequestedSaycodeAgentGrant(
  * whole instead of coming back as a fresh depth-0 budget. The scope stays at
  * the directory and MAX_SPAWN is left to the machine-capacity tier.
  */
-export function withDefaultSaycodeAgentGrant(
-    requested: Record<string, string> | undefined,
+export function withDefaultSaycodeAgentGrant<T extends Partial<Record<string, string>>>(
+    requested: T | undefined,
     directory: unknown,
     newAgentId: () => string = () => `ac-${randomBytes(8).toString('hex')}`,
-): Record<string, string> | undefined {
-    if (requested && Object.keys(requested).some((key) => key.startsWith('SAYCODE_AGENT_'))) return requested
+): T | undefined {
+    if (requested && Object.entries(requested).some(([key, value]) => key.startsWith('SAYCODE_AGENT_') && value !== undefined)) return requested
     const root = typeof directory === 'string' ? directory.trim() : ''
     if (!DIRECTORY_VALUE.test(root)) return requested
+    const base = requested ?? ({} as T)
     return {
-        ...requested,
+        ...base,
         SAYCODE_AGENT_ENV: '1',
         SAYCODE_AGENT_ROOT: root,
         SAYCODE_AGENT_DEPTH: '0',
@@ -429,11 +430,16 @@ export function buildResumedSessionSpawnEnvironment(input: {
     automation?: Record<string, string>
     agentEnvironment?: SaycodeAgentEnvironment
     sessionId: string
+    /** Launch cwd that becomes the agent root when the captured environment carries no grant; omit for none. */
+    defaultAgentRoot?: string
 }): Record<string, string> {
     const policyKey = 'HAPPY_PROJECT_SANDBOX_CONFIG'
+    const agentEnvironment = input.defaultAgentRoot === undefined
+        ? input.agentEnvironment
+        : withDefaultSaycodeAgentGrant(input.agentEnvironment ?? {}, input.defaultAgentRoot)
     // A session keeps its own policy; explicit updates still take precedence.
     const policy = input.explicit[policyKey] ?? input.automation?.[policyKey]
-        ?? input.runtime?.[policyKey] ?? input.agentEnvironment?.[policyKey]
+        ?? input.runtime?.[policyKey] ?? agentEnvironment?.[policyKey]
     const runtime = expandEnvironmentVariables(
         sanitizeChildEnv(stripUnsafeRequestedEnvironment(input.runtime ?? {})),
     )
@@ -441,7 +447,7 @@ export function buildResumedSessionSpawnEnvironment(input: {
         sanitizeChildEnv(stripUnsafeRequestedEnvironment(input.automation ?? {})),
     )
     const evidence = {
-        ...requestedInputEvidenceEnvironment(input.agentEnvironment ?? {}),
+        ...requestedInputEvidenceEnvironment(agentEnvironment ?? {}),
         ...requestedInputEvidenceEnvironment(input.runtime ?? {}),
         ...requestedInputEvidenceEnvironment(input.automation ?? {}),
         ...requestedInputEvidenceEnvironment(input.explicit),
@@ -451,7 +457,7 @@ export function buildResumedSessionSpawnEnvironment(input: {
         ...runtime,
         ...automation,
         ...input.explicit,
-        ...(input.agentEnvironment ?? {}),
+        ...(agentEnvironment ?? {}),
         ...evidence,
         ...(policy !== undefined ? { [policyKey]: policy } : {}),
         APLUS_SESSION_ID: input.sessionId,

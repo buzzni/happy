@@ -950,3 +950,28 @@ describe('organization agent plan resume record (aplus specs/org-agent-plan §6.
         expect(resumed).not.toHaveProperty('HAPPY_INITIAL_AGENT_PLAN_DESCRIPTOR')
     })
 })
+
+describe('buildResumedSessionSpawnEnvironment agent capability', () => {
+    // A session started without the grant (an old client) kept answering
+    // not_agent_env after every resume: the resume only restores what was captured.
+    it('gives a resumed session that never had a grant a root grant at its directory', () => {
+        const env = buildResumedSessionSpawnEnvironment({
+            inherited: {}, explicit: {}, agentEnvironment: {}, sessionId: 's1', defaultAgentRoot: '/repo/app',
+        })
+        expect(env).toMatchObject({ SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/repo/app', SAYCODE_AGENT_DEPTH: '0' })
+        expect(env.SAYCODE_AGENT_ID).toMatch(/^ac-[0-9a-f]{16}$/)
+    })
+
+    it('restores a captured grant unchanged', () => {
+        const captured = { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/repo/app/w1', SAYCODE_AGENT_DEPTH: '1', SAYCODE_AGENT_ID: 'ac-child' }
+        const env = buildResumedSessionSpawnEnvironment({
+            inherited: {}, explicit: {}, agentEnvironment: captured, sessionId: 's1', defaultAgentRoot: '/repo/app',
+        })
+        expect(env).toMatchObject(captured)
+    })
+
+    it('adds nothing when the caller gives no default root, as for automation runs', () => {
+        const env = buildResumedSessionSpawnEnvironment({ inherited: {}, explicit: {}, agentEnvironment: {}, sessionId: 's1' })
+        expect(Object.keys(env).filter((key) => key.startsWith('SAYCODE_AGENT_'))).toEqual([])
+    })
+})

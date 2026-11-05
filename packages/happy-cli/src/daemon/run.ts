@@ -3260,6 +3260,8 @@ export async function startDaemon(): Promise<void> {
             },
             agentEnvironment: tracked.agentEnvironment,
             sessionId: happySessionId,
+            // Automation runs are left as they were captured; sessions people started get the grant they missed.
+            ...(options?.automation ? {} : { defaultAgentRoot: launch.cwd }),
           }), managedAiCredentialEnvironment),
           mcpCallerGrantEnvelope: options?.mcpCallerGrantEnvelope,
           trustedMcpCallerGrant: resumeGrantSource.trustedMcpCallerGrant,
