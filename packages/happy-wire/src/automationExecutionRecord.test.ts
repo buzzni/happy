@@ -23,6 +23,48 @@ function record() {
     messages: [row(2, { t: 'turn-start' }), row(3, { t: 'final-answer', text: 'full answer' }), row(4, { t: 'turn-end', status: 'completed' })], complete: true };
 }
 
+function memoRecord() {
+  const data = { automationId: 'a1', memoId: '9e990bba-e408-4eae-8369-ae73ef31962f', revision: 2, title: 'Chosen memo', text: 'PRIVATE_MEMO_A' }
+  const reference = { kind: 'memo', automationId: 'a1', memoId: data.memoId, revision: data.revision, title: data.title,
+    bytes: Buffer.byteLength(JSON.stringify(data), 'utf8'), sha256: createHash('sha256').update(JSON.stringify(data)).digest('hex') }
+  const full = { ...seed(), inputBytes: 1000, referenceBytes: reference.bytes, references: [reference], referenceSnapshots: [{ kind: 'memo', data }] }
+  const { question, referenceSnapshots: _snapshots, ...fields } = full
+  const base = record()
+  return { ...base, metadata: { automationExecutionSeedManifest: { ...fields, questionBytes: Buffer.byteLength(question, 'utf8'),
+    seedSha256: createHash('sha256').update(JSON.stringify(full)).digest('hex') } },
+    seedMessage: { ...base.seedMessage, content: { type: 'automation-execution-seed', seed: full } } }
+}
+
+it('verifies a selected memo snapshot while keeping its raw data out of the creation manifest', async () => {
+  const input = memoRecord()
+  expect(automationExecutionSeedSchema.safeParse(input.seedMessage.content.seed).success).toBe(true)
+  expect(JSON.stringify(input.metadata)).not.toContain('PRIVATE_MEMO_A')
+  expect(await readAutomationExecutionRecord(input)).toMatchObject({ status: 'verified', seed: {
+    referenceSnapshots: [{ kind: 'memo', data: { text: 'PRIVATE_MEMO_A' } }] }, answer: { status: 'completed' } })
+})
+
+it('rejects a changed selected memo even when the outer seed digest is made consistent', async () => {
+  const input = memoRecord()
+  input.seedMessage.content.seed.referenceSnapshots[0].data.text = 'PRIVATE_MEMO_B'
+  input.metadata.automationExecutionSeedManifest.seedSha256 = createHash('sha256').update(JSON.stringify(input.seedMessage.content.seed)).digest('hex')
+  expect(await readAutomationExecutionRecord(input)).toEqual({ status: 'unconfirmed', reason: 'reference-snapshot-conflict' })
+})
+
+it('requires the exact bounded memo snapshot and rejects raw reference data in the creation manifest', () => {
+  const input = memoRecord(), full = input.seedMessage.content.seed
+  const { referenceSnapshots, ...withoutData } = full
+  expect(automationExecutionSeedSchema.safeParse(withoutData).success).toBe(false)
+  expect(automationExecutionSeedManifestSchema.safeParse(input.metadata.automationExecutionSeedManifest).success).toBe(true)
+  expect(automationExecutionSeedManifestSchema.safeParse({ ...input.metadata.automationExecutionSeedManifest, referenceSnapshots }).success).toBe(false)
+  for (const changed of [
+    [{ ...referenceSnapshots[0], data: { ...referenceSnapshots[0].data, automationId: 'other' } }],
+    [{ ...referenceSnapshots[0], data: { ...referenceSnapshots[0].data, memoId: 'ad5a2e48-e1c0-48ea-a763-17a00009afcf' } }],
+    [{ ...referenceSnapshots[0], data: { ...referenceSnapshots[0].data, revision: 3 } }],
+    [{ ...referenceSnapshots[0], data: { ...referenceSnapshots[0].data, text: 'recursive', assembledPrompt: 'old history' } }],
+    [referenceSnapshots[0], referenceSnapshots[0]],
+  ]) expect(automationExecutionSeedSchema.safeParse({ ...full, referenceSnapshots: changed }).success).toBe(false)
+})
+
 it('verifies the immutable question and provenance before returning the full completed answer', async () => {
   const input = record();
   expect(await readAutomationExecutionRecord(input)).toMatchObject({ status: 'verified', seed: seed(), answer: { status: 'completed', answer: 'full answer' } });

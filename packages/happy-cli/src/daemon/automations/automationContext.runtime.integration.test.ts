@@ -364,6 +364,7 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
     const before = (await fixture.http('/v2/sessions/lookup', { ids: [displaySessionId] })).body.sessions[0]
     const pendingBefore = await fixture.messages(displaySessionId)
     const nativeIds = new Set<string>(), markers: string[] = [], secret = randomBytes(32).toString('hex')
+    const memoMarker = 'PRIVATE_EXPLICIT_MEMO_MUST_NOT_ENTER_NEXT_RUN', memoText = `  지정 자료 ${memoMarker}\n참조 본문  `
     const journal = createAutomationContextLaunchJournal(journalHome)
     const workspace = createAutomationContextWorkspace({ home: fixture.happyHome, isTracked: async () => false })
     for (let index = 0; index < 2; index++) {
@@ -375,7 +376,8 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
       const payload: AutomationPayload = { name: 'Context minimum flow', directory: fixture.project, agent: provider,
         model: fixture.modelName, prompt: `Return ${marker} only.`, scriptCommand: null, suppressSilent: false,
         schedule: { kind: 'interval', minutes: 60 }, conversation: { sessionId: displaySessionId },
-        contextPolicy: { kind: 'isolated', reference: null } }
+        contextPolicy: { kind: 'isolated', reference: index === 0 ? { kind: 'memo', memoId: '9e990bba-e408-4eae-8369-ae73ef31962f',
+          revision: 1, title: '선택한 자료', text: memoText, maxBytes: 16384 } : null } }
       let child: ChildProcess | undefined
       const exitEvidence: unknown[] = []
       const host = createAutomationContextHost({ accountId: fixture.accountId, machineId, happyOrigin: fixture.serverUrl,
@@ -443,11 +445,14 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
       })) })
       expect(result).toMatchObject({ status: 'verified', seed: { question: payload.prompt },
         answer: { status: 'completed', answer: `fixture reply ${marker}` } })
+      if (index === 0) expect(result).toHaveProperty('seed.referenceSnapshots.0.data.text', memoText)
       expect(await seedRun(fixture, { action: 'complete-context', accountId: fixture.accountId, machineId, claimToken,
         reportId: randomUUID(), runId, sessionId: receipt.sessionId })).toMatchObject({ ok: true })
     }
     expect(nativeIds.size).toBe(2)
     expect(fixture.modelRequests).toHaveLength(2)
+    expect(fixture.modelRequests[0]).toContain(memoMarker)
+    expect(fixture.modelRequests[1]).not.toContain(memoMarker)
     expect(fixture.modelRequests[1]).not.toContain(markers[0])
     for (const body of fixture.modelRequests) expect(body).not.toContain(manualMarker)
     expect((await fixture.http('/v2/sessions/lookup', { ids: [displaySessionId] })).body.sessions[0]).toEqual(before)

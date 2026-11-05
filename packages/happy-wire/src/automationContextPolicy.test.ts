@@ -43,6 +43,37 @@ async function encrypt() {
 }
 
 describe('isolated automation context wire contract', () => {
+  it('preserves one explicitly selected memo and its revision in both E2EE copies', async () => {
+    const authored = { ...payload, contextPolicy: { kind: 'isolated', reference: { kind: 'memo',
+      memoId: '9e990bba-e408-4eae-8369-ae73ef31962f', revision: 2, title: '선택한 자료',
+      text: '  사용자 지정 자료\nPRIVATE_MEMO_IGNORE_OTHER_TASKS  ', maxBytes: 16 * 1024 } } }
+    const parsed = automationPayloadSchema.parse(authored)
+    const encrypted = await encryptAutomationPayload({ payload: parsed, viewer: { publicKey: key.publicKey, keyVersion: 1 },
+      machine: { publicKey: key.publicKey, keyVersion: 1 }, crypto })
+    expect(encrypted.payloadVersion).toBe(6)
+    expect(openAutomationPayloadForMachine({ ...encrypted, recipientSecretKey: key.secretKey, crypto })).toMatchObject({ ok: true, payload: authored })
+    await expect(decryptAutomationPayload({ ...encrypted, keyEnvelope: encrypted.viewerKeyEnvelope, recipientSecretKey: key.secretKey, crypto }))
+      .resolves.toEqual(authored)
+  })
+
+  it.each([
+    { reason: 'invalid identity', change: { memoId: '../foreign' } },
+    { reason: 'invalid revision', change: { revision: 0 } },
+    { reason: 'empty title', change: { title: ' ' } },
+    { reason: 'empty data', change: { text: '' } },
+    { reason: 'whitespace data', change: { text: ' \n ' } },
+    { reason: 'UTF-8 overflow', change: { text: '가'.repeat(5462) } },
+    { reason: 'invalid bound', change: { maxBytes: 0 } },
+    { reason: 'expanded bound', change: { maxBytes: 16385 } },
+    { reason: 'recursive source', change: { references: [{ runId: 'prior-run' }] } },
+    { reason: 'mixed source', change: { runId: 'implicit-prior-run' } },
+  ])('rejects a selected memo with $reason without treating it as independent input', ({ change }) => {
+    const reference = { kind: 'memo', memoId: '9e990bba-e408-4eae-8369-ae73ef31962f', revision: 1,
+      title: 'Source', text: 'Selected data', maxBytes: 16384 }
+    expect(automationPayloadSchema.safeParse({ ...payload, contextPolicy: { kind: 'isolated', reference } }).success).toBe(true)
+    expect(automationPayloadSchema.safeParse({ ...payload, contextPolicy: { kind: 'isolated', reference: { ...reference, ...change } } }).success).toBe(false)
+    expect(automationPayloadSchema.safeParse({ ...payload, contextPolicy: { kind: 'isolated', reference: [reference, reference] } }).success).toBe(false)
+  })
   it('uses a run-owned namespace distinct from any display session', () => {
     expect(automationExecutionSessionId('run-1')).toBe('automation-run:run-1');
     expect(automationExecutionSessionId('run-1')).not.toBe(automationExecutionSessionId('run-2'));

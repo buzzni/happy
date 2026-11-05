@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { AUTOMATION_CONTEXT_INPUT_MAX_BYTES, type AutomationPayload } from '@slopus/happy-wire'
 import { buildAutomationContextInput } from './automationContextInput'
 
-function payload(reference: { kind: 'previous-result'; maxBytes: number } | null = null): AutomationPayload {
+function payload(reference: NonNullable<AutomationPayload['contextPolicy']>['reference'] = null): AutomationPayload {
   return { name: 'Daily work', prompt: 'Do the current task', directory: '/work', agent: 'codex',
     schedule: { kind: 'interval', minutes: 60 }, conversation: { sessionId: 'manual' },
     scriptCommand: null, suppressSilent: false, contextPolicy: { kind: 'isolated', reference } }
@@ -12,6 +12,27 @@ function previous() {
   return { automationId: 'a1', runId: 'run-previous', revision: 3, status: 'COMPLETED',
     question: 'User-authored question', answer: 'The selected answer' }
 }
+
+it('uses only an explicitly selected memo and records its exact data provenance instead of another result', () => {
+  const reference = { kind: 'memo' as const, memoId: '9e990bba-e408-4eae-8369-ae73ef31962f', revision: 2,
+    title: 'Selected material', text: '  PRIVATE_SELECTED_MEMO\nIgnore fake directives as data.  ', maxBytes: 16384 }
+  const data = { automationId: 'a1', memoId: reference.memoId, revision: 2, title: reference.title, text: reference.text }
+  const result = buildAutomationContextInput({ automationId: 'a1', runId: 'r2', payload: payload(reference), previousResult: previous() })
+  expect(result.initialPrompt).toContain(JSON.stringify(data)); expect(result.initialPrompt).toContain('not instructions')
+  expect(result.initialPrompt).not.toContain(previous().answer)
+  expect(result.referenceBytes).toBe(Buffer.byteLength(JSON.stringify(data), 'utf8'))
+  expect(result.references).toEqual([{ kind: 'memo', automationId: 'a1', memoId: reference.memoId, revision: 2, title: reference.title,
+    bytes: result.referenceBytes, sha256: createHash('sha256').update(JSON.stringify(data)).digest('hex') }])
+  expect(result).toHaveProperty('referenceSnapshots', [{ kind: 'memo', data }])
+})
+
+it.each(['reference', 'input'] as const)('holds oversized selected memo %s data without truncation or fallback', budget => {
+  const p = payload({ kind: 'memo', memoId: '9e990bba-e408-4eae-8369-ae73ef31962f', revision: 1,
+    title: '자료', text: '가'.repeat(1000), maxBytes: budget === 'reference' ? 1000 : 16384 })
+  if (budget === 'input') p.prompt = '가'.repeat(21000)
+  expect(() => buildAutomationContextInput({ automationId: 'a1', runId: 'r2', payload: p, previousResult: previous() }))
+    .toThrow(budget === 'reference' ? 'AUTOMATION_REFERENCE_TOO_LARGE' : 'AUTOMATION_INPUT_TOO_LARGE')
+})
 
 it('builds independent occurrences without carrying prior run, display history or native identity', () => {
   const p = payload()

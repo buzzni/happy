@@ -69,8 +69,11 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
   }
   const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
   const scope = digest([deps.happyOrigin, deps.accountId, deps.machineId])
-  const normalizeRequest = (input: AutomationContextLaunchRequest) => launchRequestSchema.parse({ ...input,
-    previousResult: input.payload.contextPolicy?.reference ? input.previousResult : undefined })
+  const normalizeRequest = (input: AutomationContextLaunchRequest) => {
+    const { previousResult, ...request } = input
+    return launchRequestSchema.parse({ ...request,
+      ...(input.payload.contextPolicy?.reference?.kind === 'previous-result' ? { previousResult } : {}) })
+  }
   const hashRequest = (input: AutomationContextLaunchRequest) => digest({ request: input, seed: buildAutomationContextInput(input) })
   function assertIdentity(record: AutomationContextLaunchRecord, runId: string) {
     const sessionId = automationExecutionSessionId(runId)
@@ -205,8 +208,9 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
     if (isAutomationExecutionSessionId(displaySessionId)) throw new Error('AUTOMATION_LAUNCH_IDENTITY_CONFLICT')
     const executionSeed = automationExecutionSeedSchema.parse({ version: 1, automationId, generation, revision, runId, displaySessionId,
       question: input.payload.prompt, inputBytes: seed.inputBytes, referenceBytes: seed.referenceBytes, references: seed.references,
-      inputSha256: createHash('sha256').update(seed.initialPrompt).digest('hex'), wholeContextTokens: 'unknown' })
-    const { question, ...seedFields } = executionSeed
+      inputSha256: createHash('sha256').update(seed.initialPrompt).digest('hex'), wholeContextTokens: 'unknown',
+      ...(seed.referenceSnapshots ? { referenceSnapshots: seed.referenceSnapshots } : {}) })
+    const { question, referenceSnapshots: _snapshots, ...seedFields } = executionSeed
     const seedManifest = automationExecutionSeedManifestSchema.parse({ ...seedFields,
       questionBytes: Buffer.byteLength(question, 'utf8'), seedSha256: digest(executionSeed) })
     const requestHash = hashRequest(input)

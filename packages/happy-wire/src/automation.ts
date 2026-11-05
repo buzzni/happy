@@ -170,10 +170,16 @@ export function isAutomationExecutionSessionId(sessionId: unknown): sessionId is
 
 export const automationContextPolicySchema = z.object({
   kind: z.literal('isolated'),
-  reference: z.object({
+  reference: z.discriminatedUnion('kind', [z.strictObject({
     kind: z.literal('previous-result'),
     maxBytes: z.number().int().min(1).max(AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES),
-  }).strict().nullable(),
+  }), z.strictObject({
+    kind: z.literal('memo'), memoId: z.string().uuid(), revision: z.number().int().positive(),
+    title: z.string().min(1).max(120).refine(text => text.trim().length > 0),
+    text: z.string().min(1).max(AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES)
+      .refine(text => text.trim().length > 0 && new TextEncoder().encode(text).byteLength <= AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES),
+    maxBytes: z.number().int().min(1).max(AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES),
+  })]).nullable(),
 }).strict();
 export type AutomationContextPolicy = z.infer<typeof automationContextPolicySchema>;
 

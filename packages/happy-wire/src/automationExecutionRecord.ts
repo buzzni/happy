@@ -8,6 +8,14 @@ const eventIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,200}$/);
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 const bytes = (text: string) => new TextEncoder().encode(text).byteLength;
 
+export const automationMemoReferenceDataSchema = z.strictObject({
+  automationId: z.string().min(1).max(200), memoId: z.string().uuid(), revision: z.number().int().positive(),
+  title: z.string().min(1).max(120).refine(text => text.trim().length > 0),
+  text: z.string().min(1).max(AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES)
+    .refine(text => text.trim().length > 0 && bytes(text) <= AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES),
+});
+const automationReferenceSnapshotSchema = z.strictObject({ kind: z.literal('memo'), data: automationMemoReferenceDataSchema });
+
 const automationExecutionSeedBaseSchema = z.strictObject({
   version: z.literal(1), automationId: z.string().min(1).max(200), runId: runIdSchema,
   generation: z.number().int().positive(), revision: z.number().int().positive(),
@@ -16,20 +24,40 @@ const automationExecutionSeedBaseSchema = z.strictObject({
   inputBytes: z.number().int().min(1).max(AUTOMATION_CONTEXT_INPUT_MAX_BYTES),
   referenceBytes: z.number().int().min(0).max(AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES),
   inputSha256: sha256Schema,
-  references: z.array(z.strictObject({ kind: z.literal('previous-result'), automationId: z.string().min(1).max(200),
+  references: z.array(z.discriminatedUnion('kind', [z.strictObject({ kind: z.literal('previous-result'), automationId: z.string().min(1).max(200),
     runId: runIdSchema, revision: z.number().int().positive(),
-    bytes: z.number().int().min(1).max(AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES), sha256: sha256Schema })).max(1),
+    bytes: z.number().int().min(1).max(AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES), sha256: sha256Schema }),
+    z.strictObject({ kind: z.literal('memo'), automationId: z.string().min(1).max(200), memoId: z.string().uuid(),
+      revision: z.number().int().positive(), title: z.string().min(1).max(120),
+      bytes: z.number().int().min(1).max(AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES), sha256: sha256Schema }),
+  ])).max(1),
   wholeContextTokens: z.literal('unknown'),
 });
 function validateSeed(value: Omit<z.infer<typeof automationExecutionSeedBaseSchema>, 'question'>, questionBytes: number, ctx: z.RefinementCtx) {
   if (value.referenceBytes !== value.references.reduce((sum, ref) => sum + ref.bytes, 0)
     || value.inputBytes < questionBytes + value.referenceBytes
-    || value.references.some(ref => ref.automationId !== value.automationId || ref.runId === value.runId)) {
+    || value.references.some(ref => ref.automationId !== value.automationId || ref.kind === 'previous-result' && ref.runId === value.runId)) {
     ctx.addIssue({ code: 'custom', message: 'Invalid automation input provenance or byte accounting' });
   }
 }
 /** Full authored question lives in a run-owned E2EE artifact, never the bounded signed creation envelope. */
-export const automationExecutionSeedSchema = automationExecutionSeedBaseSchema.superRefine((value, ctx) => validateSeed(value, bytes(value.question), ctx));
+export const automationExecutionSeedSchema = automationExecutionSeedBaseSchema.extend({
+  referenceSnapshots: z.array(automationReferenceSnapshotSchema).max(1).optional(),
+}).superRefine((value, ctx) => {
+  validateSeed(value, bytes(value.question), ctx);
+  const invalid = () => ctx.addIssue({ code: 'custom', message: 'Invalid automation reference snapshot' });
+  if (!value.referenceSnapshots) {
+    // Earlier private previous-result artifacts had only provenance. Memo artifacts always retain their data.
+    if (value.references.some(ref => ref.kind === 'memo')) invalid();
+    return;
+  }
+  if (value.referenceSnapshots.length !== value.references.length || value.referenceSnapshots.some((snapshot, index) => {
+    const ref = value.references[index];
+    if (!ref || ref.kind !== snapshot.kind || ref.automationId !== snapshot.data.automationId || ref.revision !== snapshot.data.revision
+      || ref.bytes !== bytes(JSON.stringify(snapshot.data))) return true;
+    return ref.kind === 'memo' && (ref.memoId !== snapshot.data.memoId || ref.title !== snapshot.data.title);
+  })) invalid();
+});
 export type AutomationExecutionSeed = z.infer<typeof automationExecutionSeedSchema>;
 export const automationExecutionSeedManifestSchema = automationExecutionSeedBaseSchema.omit({ question: true }).extend({
   questionBytes: z.number().int().min(1).max(AUTOMATION_CONTEXT_INPUT_MAX_BYTES), seedSha256: sha256Schema,
@@ -72,12 +100,17 @@ export async function readAutomationExecutionRecord(input: {
   for (const key of ['automationId', 'runId', 'generation', 'revision', 'displaySessionId'] as const) {
     if (seed[key] !== input.identity[key]) return { status: 'unconfirmed', reason: 'seed-identity-conflict' };
   }
-  const { question, ...seedFields } = seed;
+  const { question, referenceSnapshots, ...seedFields } = seed;
   const { questionBytes, seedSha256, ...manifestFields } = manifest;
   const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(seed)));
   const hash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
   if (bytes(question) !== questionBytes || hash !== seedSha256 || JSON.stringify(seedFields) !== JSON.stringify(manifestFields)) {
     return { status: 'unconfirmed', reason: 'seed-manifest-conflict' };
+  }
+  for (const [index, snapshot] of (referenceSnapshots ?? []).entries()) {
+    const snapshotDigest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(snapshot.data)));
+    const snapshotHash = Array.from(new Uint8Array(snapshotDigest), byte => byte.toString(16).padStart(2, '0')).join('');
+    if (snapshotHash !== manifest.references[index]?.sha256) return { status: 'unconfirmed', reason: 'reference-snapshot-conflict' };
   }
   return { status: 'verified', seed, answer: readAutomationExecutionAnswer({ ...input, runId: input.identity.runId }) };
 }

@@ -58,6 +58,33 @@ async function workspaceSetup() {
   return { ...f, directory, workspace, input }
 }
 
+it('preserves the existing independent preparation request digest when memo snapshots are added', async () => {
+  const f = await setup()
+  await f.launcher.launch(request())
+  // Captured before memo support: adding data for a new mode must not invalidate old preparations.
+  expect((await f.deps.journal.read('r1'))!.requestHash).toBe('2bca27ef0808f183b59d5a8d8704f862282df474a1ccc03d16abcc0a2744c84c')
+  expect(await f.launcher.restoreRequest('r1')).toEqual(request())
+})
+
+it('keeps selected memo data in the E2EE seed, excludes it from creation metadata and ignores unselected prior results on retry', async () => {
+  const f = await setup(), input = request()
+  const reference = { kind: 'memo' as const, memoId: '9e990bba-e408-4eae-8369-ae73ef31962f', revision: 2,
+    title: 'Chosen source', text: 'PRIVATE_MEMO_ONLY', maxBytes: 16384 }
+  input.payload.contextPolicy = { kind: 'isolated', reference }
+  input.previousResult = { automationId: 'a1', runId: 'prior', revision: 1, status: 'COMPLETED', question: 'Unselected old question', answer: 'PRIVATE_OLD_RESULT' }
+  expect(await f.launcher.launch(input)).toHaveProperty('state', 'started')
+  expect(f.start.mock.calls[0][0].initialPrompt).toContain(reference.text)
+  expect(f.start.mock.calls[0][0].initialPrompt).not.toContain('PRIVATE_OLD_RESULT')
+  const session = f.sessions.get('automation-run:r1')!, raw = f.seedMessages.get(session.id)!
+  expect(JSON.stringify(session.metadata)).not.toContain(reference.text)
+  const seed = automationExecutionSeedArtifactSchema.parse(decrypt(session.encryptionKey, session.encryptionVariant, decodeBase64(raw.content))).seed
+  expect(seed).toHaveProperty('referenceSnapshots', [{ kind: 'memo', data: { automationId: 'a1', memoId: reference.memoId,
+    revision: 2, title: reference.title, text: reference.text } }])
+  expect(await createAutomationContextLauncher(f.deps).launch({ ...input, previousResult: { answer: 'DIFFERENT_UNSELECTED_SOURCE' } })).toHaveProperty('state', 'started')
+  expect(f.prepare).toHaveBeenCalledOnce(); expect(f.start).toHaveBeenCalledOnce()
+  expect(await f.launcher.restoreRequest('r1')).not.toHaveProperty('previousResult')
+})
+
 it('keeps a workspace-busy run unsubmitted and retries its original preparation after manual work releases', async () => {
   const f = await workspaceSetup(), manual = await f.workspace.beginManualLaunch([f.directory])
   if (!manual.acquired) throw new Error('manual preparation refused')
