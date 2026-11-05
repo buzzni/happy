@@ -665,4 +665,27 @@ describe('file RPCs for a folder the machine owner approved', () => {
         approved = [];
         await expect(handlers.get('listDirectory')?.({ path: project })).resolves.toMatchObject({ success: false });
     });
+
+    it('anchors the workspace read, download and create-only write RPCs at an approved folder, until revoked', async () => {
+        const outside = await mkdtemp(join(tmpdir(), 'happy-approved-workspace-'));
+        temporaryDirectories.push(outside);
+        const project = join(outside, 'hmall_ui');
+        await mkdir(project);
+        await writeFile(join(project, 'README.md'), 'hello');
+
+        let approved: string[] = [outside];
+        const { handlers } = await createHandlers(undefined, { approvedRoots: () => approved });
+        await expect(handlers.get('listWorkspaceDirectory')?.({ workspaceRoot: project, path: project })).resolves.toMatchObject({ success: true });
+        await expect(handlers.get('readWorkspaceFile')?.({ workspaceRoot: project, path: join(project, 'README.md') })).resolves.toMatchObject({
+            success: true, content: Buffer.from('hello').toString('base64'),
+        });
+        await expect(handlers.get('listWorkspaceDownloadDirectory')?.({ workspaceRoot: project, path: project, offset: 0 })).resolves.toMatchObject({ success: true });
+        await expect(handlers.get('writeWorkspaceFile')?.({ workspaceRoot: project, path: join(project, 'notes.md'), content: Buffer.from('new').toString('base64'), expectedHash: null })).resolves.toMatchObject({ success: true });
+        expect(await readFile(join(project, 'notes.md'), 'utf8')).toBe('new');
+
+        approved = [];
+        await expect(handlers.get('listWorkspaceDirectory')?.({ workspaceRoot: project, path: project })).resolves.toMatchObject({ success: false, errorCode: 'WORKSPACE_PATH_DENIED' });
+        await expect(handlers.get('readWorkspaceFile')?.({ workspaceRoot: project, path: join(project, 'README.md') })).resolves.toMatchObject({ success: false });
+        await expect(handlers.get('writeWorkspaceFile')?.({ workspaceRoot: project, path: join(project, 'other.md'), content: 'eA==', expectedHash: null })).resolves.toMatchObject({ success: false });
+    });
 });

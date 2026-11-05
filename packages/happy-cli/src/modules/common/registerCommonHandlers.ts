@@ -6,7 +6,7 @@ import { exec, ExecOptions } from 'child_process';
 import { promisify } from 'util';
 import { open, readFile, writeFile, readdir, stat, mkdir, rename, rm, cp } from 'fs/promises';
 import { createHash } from 'crypto';
-import { dirname, join, basename, extname, resolve } from 'path';
+import { dirname, join, basename, extname, isAbsolute, resolve, sep } from 'path';
 import { run as runRipgrep } from '@/modules/ripgrep/index';
 import { run as runDifftastic } from '@/modules/difftastic/index';
 import { RpcHandlerManager } from '../../api/rpc/RpcHandlerManager';
@@ -589,6 +589,13 @@ export interface CommonHandlerOptions {
 export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, workingDirectory: string, options: CommonHandlerOptions = {}) {
     const downloadDirectories = createWorkspaceDownloadDirectoryReader();
     const checkPath = (path: string) => validatePath(path, workingDirectory, options.approvedRoots?.());
+    // The root a workspace RPC is anchored to: the working directory, or the approved folder enclosing workspaceRoot.
+    const workspaceAnchor = (workspaceRoot: unknown) => {
+        if (typeof workspaceRoot !== 'string' || !isAbsolute(workspaceRoot)) return workingDirectory;
+        const root = resolve(workspaceRoot);
+        const encloses = (folder: string) => root === resolve(folder) || root.startsWith(resolve(folder) + sep);
+        return encloses(workingDirectory) ? workingDirectory : options.approvedRoots?.().find(encloses) ?? workingDirectory;
+    };
     rpcHandlerManager.registerHandler('file-discovery', (request: unknown) => fileDiscovery(workingDirectory, request));
     const bashScheduler = createBashRpcScheduler();
     const bashEnvBoundary = options.childEnvBoundary ?? 'session';
@@ -871,19 +878,19 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             }
             try {
                 if (operation === 'listWorkspaceDownloadDirectory') {
-                    return { success: true, ...await downloadDirectories.list(workingDirectory, data.workspaceRoot, data.path, data.offset!, data.expectedIdentity, data.listingId) };
+                    return { success: true, ...await downloadDirectories.list(workspaceAnchor(data.workspaceRoot), data.workspaceRoot, data.path, data.offset!, data.expectedIdentity, data.listingId) };
                 }
                 if (operation === 'closeWorkspaceDownloadDirectory') {
-                    await downloadDirectories.close(workingDirectory, data.workspaceRoot, data.path, data.listingId!);
+                    await downloadDirectories.close(workspaceAnchor(data.workspaceRoot), data.workspaceRoot, data.path, data.listingId!);
                     return { success: true };
                 }
                 if (operation === 'readWorkspaceFileChunk') {
-                    return { success: true, ...await readWorkspaceFileChunk(workingDirectory, data.workspaceRoot, data.path, data.offset!, data.length!, data.expectedIdentity) };
+                    return { success: true, ...await readWorkspaceFileChunk(workspaceAnchor(data.workspaceRoot), data.workspaceRoot, data.path, data.offset!, data.length!, data.expectedIdentity) };
                 }
                 if (operation === 'listWorkspaceDirectory') {
-                    return { success: true, entries: await listWorkspaceDirectory(workingDirectory, data.workspaceRoot, data.path) };
+                    return { success: true, entries: await listWorkspaceDirectory(workspaceAnchor(data.workspaceRoot), data.workspaceRoot, data.path) };
                 }
-                return { success: true, content: (await readWorkspaceFile(workingDirectory, data.workspaceRoot, data.path)).toString('base64') };
+                return { success: true, content: (await readWorkspaceFile(workspaceAnchor(data.workspaceRoot), data.workspaceRoot, data.path)).toString('base64') };
             } catch (error) {
                 return {
                     success: false,
@@ -911,7 +918,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         }
         try {
             const buffer = Buffer.from(data.content, 'base64');
-            await writeWorkspaceFile(workingDirectory, data.workspaceRoot, data.path, buffer);
+            await writeWorkspaceFile(workspaceAnchor(data.workspaceRoot), data.workspaceRoot, data.path, buffer);
             return { success: true, hash: createHash('sha256').update(buffer).digest('hex') };
         } catch (error) {
             return {
