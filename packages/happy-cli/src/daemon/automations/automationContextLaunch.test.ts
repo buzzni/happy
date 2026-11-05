@@ -535,3 +535,19 @@ it.skipIf(process.platform === 'win32').each(['read', 'list'] as const)(
       expect(removed).toBe(true); expect(f.start).toHaveBeenCalledOnce()
     } finally { observe.mockRestore() }
   })
+
+it('retains an explicit first-result resolution in the immutable encrypted seed and on restart', async () => {
+  const f = await setup(), input = request()
+  input.payload.contextPolicy = { kind: 'isolated', reference: { kind: 'previous-result', maxBytes: 16384 } }
+  input.previousResult = { automationId: 'a1', status: 'NONE_ELIGIBLE' }
+  await f.launcher.launch(input)
+  const session = f.sessions.get('automation-run:r1')!, raw = f.seedMessages.get(session.id)!
+  const seed = automationExecutionSeedArtifactSchema.parse(decrypt(session.encryptionKey, session.encryptionVariant, decodeBase64(raw.content))).seed
+  expect(seed).toHaveProperty('referenceResolution', { kind: 'previous-result', status: 'NONE_ELIGIBLE' })
+  expect(seed.references).toEqual([])
+  expect(session.metadata.automationExecutionSeedManifest).toHaveProperty('referenceResolution', seed.referenceResolution)
+  const original = await createAutomationContextLauncher(f.deps).restoreRequest('r1')
+  expect(original?.previousResult).toEqual(input.previousResult)
+  await createAutomationContextLauncher(f.deps).launch(original!)
+  expect(f.prepare).toHaveBeenCalledOnce(); expect(f.start).toHaveBeenCalledOnce()
+})

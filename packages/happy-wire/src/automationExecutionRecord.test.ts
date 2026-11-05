@@ -170,3 +170,14 @@ it('does not reuse an earlier completed answer while a later turn is still pendi
     row(3, { t: 'turn-end', status: 'completed' }), row(4, { t: 'turn-start' }, 'turn-B')]))
     .toEqual({ status: 'pending' });
 });
+
+it('distinguishes a proven first occurrence from an omitted reference and rejects conflicting provenance', () => {
+  const first = { ...seed(), referenceResolution: { kind: 'previous-result', status: 'NONE_ELIGIBLE' } };
+  expect(automationExecutionSeedSchema.safeParse(first).success).toBe(true);
+  const manifest = { ...first, questionBytes: Buffer.byteLength(first.question), seedSha256: 'b'.repeat(64) };
+  delete (manifest as Partial<typeof manifest>).question;
+  expect(automationExecutionSeedManifestSchema.safeParse(manifest).success).toBe(true);
+  expect(automationExecutionSeedSchema.safeParse({ ...first, referenceResolution: { kind: 'previous-result', status: 'UNAVAILABLE' } }).success).toBe(false);
+  expect(automationExecutionSeedSchema.safeParse({ ...first, inputBytes: 1000, referenceBytes: 100,
+    references: [{ kind: 'previous-result', automationId: 'a1', runId: 'r0', revision: 1, bytes: 100, sha256: 'c'.repeat(64) }] }).success).toBe(false);
+});

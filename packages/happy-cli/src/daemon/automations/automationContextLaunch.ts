@@ -209,7 +209,8 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
     const executionSeed = automationExecutionSeedSchema.parse({ version: 1, automationId, generation, revision, runId, displaySessionId,
       question: input.payload.prompt, inputBytes: seed.inputBytes, referenceBytes: seed.referenceBytes, references: seed.references,
       inputSha256: createHash('sha256').update(seed.initialPrompt).digest('hex'), wholeContextTokens: 'unknown',
-      ...(seed.referenceSnapshots ? { referenceSnapshots: seed.referenceSnapshots } : {}) })
+      ...(seed.referenceSnapshots ? { referenceSnapshots: seed.referenceSnapshots } : {}),
+      ...(seed.referenceResolution ? { referenceResolution: seed.referenceResolution } : {}) })
     const { question, referenceSnapshots: _snapshots, ...seedFields } = executionSeed
     const seedManifest = automationExecutionSeedManifestSchema.parse({ ...seedFields,
       questionBytes: Buffer.byteLength(question, 'utf8'), seedSha256: digest(executionSeed) })

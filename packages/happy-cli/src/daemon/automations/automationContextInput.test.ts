@@ -89,3 +89,19 @@ it('does not reinterpret legacy or GitHub input as an isolated occurrence', () =
       .toThrow('AUTOMATION_CONTEXT_POLICY_UNSUPPORTED')
   }
 })
+
+it('runs a proven first occurrence without a source while recording that resolution explicitly', () => {
+  const result = buildAutomationContextInput({ automationId: 'a1', runId: 'r2',
+    payload: payload({ kind: 'previous-result', maxBytes: 16384 }), previousResult: { status: 'NONE_ELIGIBLE', automationId: 'a1' } })
+  expect(result.references).toEqual([])
+  expect(result.referenceBytes).toBe(0)
+  expect(result).toHaveProperty('referenceResolution', { kind: 'previous-result', status: 'NONE_ELIGIBLE' })
+  expect(result.initialPrompt).not.toContain('Reference material')
+})
+
+it.each([null, { status: 'NONE_ELIGIBLE', automationId: 'another' },
+  { status: 'UNAVAILABLE', automationId: 'a1' }, { status: 'NONE_ELIGIBLE', automationId: 'a1', answer: 'hidden' }])(
+  'never converts missing, denied or malformed references into a first occurrence: %j', previousResult => {
+    expect(() => buildAutomationContextInput({ automationId: 'a1', runId: 'r2',
+      payload: payload({ kind: 'previous-result', maxBytes: 16384 }), previousResult })).toThrow('AUTOMATION_REFERENCE_UNAVAILABLE')
+  })

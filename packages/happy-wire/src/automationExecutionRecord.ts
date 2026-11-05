@@ -14,6 +14,14 @@ export const automationMemoReferenceDataSchema = z.strictObject({
   text: z.string().min(1).max(AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES)
     .refine(text => text.trim().length > 0 && bytes(text) <= AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES),
 });
+export const automationPreviousResultDataSchema = z.strictObject({
+  automationId: z.string().min(1).max(200), runId: runIdSchema, revision: z.number().int().positive(),
+  status: z.literal('COMPLETED'), question: z.string().min(1).max(AUTOMATION_CONTEXT_INPUT_MAX_BYTES),
+  answer: z.string().min(1).max(AUTOMATION_CONTEXT_INPUT_MAX_BYTES),
+});
+export const automationPreviousResultNoneSchema = z.strictObject({
+  automationId: z.string().min(1).max(200), status: z.literal('NONE_ELIGIBLE'),
+});
 const automationReferenceSnapshotSchema = z.strictObject({ kind: z.literal('memo'), data: automationMemoReferenceDataSchema });
 
 const automationExecutionSeedBaseSchema = z.strictObject({
@@ -31,10 +39,12 @@ const automationExecutionSeedBaseSchema = z.strictObject({
       revision: z.number().int().positive(), title: z.string().min(1).max(120),
       bytes: z.number().int().min(1).max(AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES), sha256: sha256Schema }),
   ])).max(1),
+  referenceResolution: z.strictObject({ kind: z.literal('previous-result'), status: z.literal('NONE_ELIGIBLE') }).optional(),
   wholeContextTokens: z.literal('unknown'),
 });
 function validateSeed(value: Omit<z.infer<typeof automationExecutionSeedBaseSchema>, 'question'>, questionBytes: number, ctx: z.RefinementCtx) {
-  if (value.referenceBytes !== value.references.reduce((sum, ref) => sum + ref.bytes, 0)
+  if (value.referenceResolution && (value.references.length !== 0 || value.referenceBytes !== 0)
+    || value.referenceBytes !== value.references.reduce((sum, ref) => sum + ref.bytes, 0)
     || value.inputBytes < questionBytes + value.referenceBytes
     || value.references.some(ref => ref.automationId !== value.automationId || ref.kind === 'previous-result' && ref.runId === value.runId)) {
     ctx.addIssue({ code: 'custom', message: 'Invalid automation input provenance or byte accounting' });
