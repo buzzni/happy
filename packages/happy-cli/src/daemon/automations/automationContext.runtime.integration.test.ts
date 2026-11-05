@@ -3,7 +3,8 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { createServer } from 'node:http'
-import type { ChildProcess } from 'node:child_process'
+import { execFile, type ChildProcess } from 'node:child_process'
+import { promisify } from 'node:util'
 import { readAutomationExecutionRecord,
   sessionCreateBodyHash, type AutomationPayload } from '@slopus/happy-wire'
 import { signAutomationExecutionTarget } from '@slopus/happy-wire/automationExecutionToken'
@@ -12,6 +13,7 @@ import { ApiClient } from '@/api/api'
 import { decrypt, decodeBase64 } from '@/api/encryption'
 import { SessionWriteScopeFixture, eventually, type StoredMessage } from '@/testing/sessionWriteScopeFixture'
 import { createAutomationContextLaunchJournal } from './automationContextLaunchJournal'
+import { createAutomationContextReferenceReader } from './automationContextReference'
 import { createAutomationContextHost } from './automationContextHost'
 import { createAutomationContextAuthorizer, createAutomationContextTransport } from './automationContextTransport'
 import { createServerAutomationRuntimeStore } from './serverAutomationRuntimeStore'
@@ -275,7 +277,7 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
     const admission = await workspace.beginManualLaunch([fixture.project])
     expect(admission.acquired).toBe(true)
     if (admission.acquired) expect(await admission.finish({ submitted: false, tracked: false })).toBe(true)
-  } catch (error) { failure = new Error(`Deferred daemon failed:\n${await fixture.diagnostics().catch(() => 'Diagnostics unavailable')}`, { cause: error }) }
+  } catch (error) { failure = new Error(`Deferred daemon failed: ${String(error)}\n${await fixture.diagnostics().catch(() => 'Diagnostics unavailable')}`, { cause: error }) }
   finally {
     releaseFirst(); releaseSecond()
     if (state === 'background' && fixture.project) await writeFile(backgroundPath('release'), 'release').catch(() => {
@@ -333,7 +335,7 @@ it('refuses a real daemon manual spawn while automatic ownership exists and perm
   } finally { await fixture.close() }
 })
 
-it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display target with private history and unchanged manual state', async provider => {
+it.each(['claude', 'codex'] as const)('keeps four real %s CLI runs on one display target with verified references and unchanged manual state', async provider => {
   vi.stubEnv('HAPPY_SCOPE_FRESH_PROVIDER_STATE', '1')
   vi.stubEnv('HAPPY_SCOPE_PACKAGED_SERVER', undefined)
   vi.stubEnv('HAPPY_SCOPE_INSTALLED_CLI', undefined)
@@ -363,26 +365,32 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
     await fixture.send(displaySessionId, manualMarker)
     const before = (await fixture.http('/v2/sessions/lookup', { ids: [displaySessionId] })).body.sessions[0]
     const pendingBefore = await fixture.messages(displaySessionId)
-    const nativeIds = new Set<string>(), markers: string[] = [], secret = randomBytes(32).toString('hex')
+    const nativeIds = new Set<string>(), markers: string[] = [], runIds: string[] = [], secret = randomBytes(32).toString('hex')
     const memoMarker = 'PRIVATE_EXPLICIT_MEMO_MUST_NOT_ENTER_NEXT_RUN', memoText = `  지정 자료 ${memoMarker}\n참조 본문  `
     const journal = createAutomationContextLaunchJournal(journalHome)
     const workspace = createAutomationContextWorkspace({ home: fixture.happyHome, isTracked: async () => false })
-    for (let index = 0; index < 2; index++) {
+    const referenceReader = createAutomationContextReferenceReader({ serverUrl: fixture.serverUrl, token: fixture.token,
+      accountId: fixture.accountId, machineId, journal, legacySecret: fixture.seed })
+    for (let index = 0; index < 4; index++) {
       const runId = `context-${provider}-${index}-${randomUUID()}`, claimToken = randomBytes(24).toString('hex')
       const info = await seedRun(fixture, { accountId: fixture.accountId, displaySessionId, runId, claimToken,
         directory: fixture.project, secret })
-      expect(info.machineId).toBe(machineId)
+      expect(info.machineId).toBe(machineId); runIds.push(runId)
       const marker = `scope-marker-run-${index}-${randomUUID()}`; markers.push(marker)
       const payload: AutomationPayload = { name: 'Context minimum flow', directory: fixture.project, agent: provider,
         model: fixture.modelName, prompt: `Return ${marker} only.`, scriptCommand: null, suppressSilent: false,
         schedule: { kind: 'interval', minutes: 60 }, conversation: { sessionId: displaySessionId },
-        contextPolicy: { kind: 'isolated', reference: index === 0 ? { kind: 'memo', memoId: '9e990bba-e408-4eae-8369-ae73ef31962f',
+        contextPolicy: { kind: 'isolated', reference: index === 0 || index === 2 ? { kind: 'previous-result', maxBytes: 16384 }
+          : index === 1 ? { kind: 'memo', memoId: '9e990bba-e408-4eae-8369-ae73ef31962f',
           revision: 1, title: '선택한 자료', text: memoText, maxBytes: 16384 } : null } }
       let child: ChildProcess | undefined
       const exitEvidence: unknown[] = []
       const host = createAutomationContextHost({ accountId: fixture.accountId, machineId, happyOrigin: fixture.serverUrl,
-        reportExit: async () => { throw new Error('Unexpected fixture-only maintenance') },
-        api, journal, workspace,
+        reportExit: async (run, record) => {
+          await createAutomationContextTransport({ serverUrl: fixture.serverUrl, token: fixture.token, machineId,
+            runId: run.runId, claimToken: run.claimToken, authorize: async () => { throw new Error('Unexpected exit-only authorization') } }).reportExit(record)
+        },
+        api, journal, workspace, resolvePreviousResult: referenceReader.resolve,
         runtimeStore: createServerAutomationRuntimeStore({ filePath: join(fixture.happyHome, 'context-runtime.test.json') }),
         heartbeat: async () => { throw new Error('Unexpected fixture deferred renewal') },
         resolveContext: async () => {
@@ -417,7 +425,8 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
           }, 'real native identity', 60_000)
           return { type: 'success', sessionId: options.reconnectEnvironment!.HAPPY_RECONNECT_SESSION_ID }
         }, discover: async () => child?.exitCode === null ? 'running' : 'unconfirmed' })
-      expect(await host.dispatch({ automationId: info.automationId, generation: info.generation, revision: info.revision, runId, claimToken, payload, environmentVariables: {} }))
+      const selected = await host.prepare({ automationId: info.automationId, generation: info.generation, revision: info.revision, payload })
+      expect(await host.dispatch({ automationId: info.automationId, generation: info.generation, revision: info.revision, runId, claimToken, payload, ...selected, environmentVariables: {} }))
         .toMatchObject({ state: 'started', displaySessionId })
       await eventually(async () => child!.exitCode === 0 ? true : child!.exitCode === null ? undefined : Promise.reject(new Error('Native CLI exit failed')),
         'native CLI natural exit and message flush', 60_000)
@@ -445,27 +454,41 @@ it.each(['claude', 'codex'] as const)('keeps two real %s CLI runs on one display
       })) })
       expect(result).toMatchObject({ status: 'verified', seed: { question: payload.prompt },
         answer: { status: 'completed', answer: `fixture reply ${marker}` } })
-      if (index === 0) expect(result).toHaveProperty('seed.referenceSnapshots.0.data.text', memoText)
+      if (index === 0) expect(result).toHaveProperty('seed.referenceResolution', { kind: 'previous-result', status: 'NONE_ELIGIBLE' })
+      if (index === 1) expect(result).toHaveProperty('seed.referenceSnapshots.0.data.text', memoText)
+      if (index === 2) expect(result).toHaveProperty('seed.references.0.runId', runIds[1])
+      await host.maintain()
+      expect(await journal.read(runId)).toHaveProperty('exitReceiptAcknowledged', true)
+
       expect(await seedRun(fixture, { action: 'complete-context', accountId: fixture.accountId, machineId, claimToken,
         reportId: randomUUID(), runId, sessionId: receipt.sessionId })).toMatchObject({ ok: true })
     }
-    expect(nativeIds.size).toBe(2)
-    expect(fixture.modelRequests).toHaveLength(2)
-    expect(fixture.modelRequests[0]).toContain(memoMarker)
-    expect(fixture.modelRequests[1]).not.toContain(memoMarker)
-    expect(fixture.modelRequests[1]).not.toContain(markers[0])
+    expect(nativeIds.size).toBe(4)
+    expect(fixture.modelRequests).toHaveLength(4)
+    expect(fixture.modelRequests[0]).not.toContain(memoMarker)
+    expect(fixture.modelRequests[1]).toContain(memoMarker)
+    expect(fixture.modelRequests[2]).toContain(markers[1])
+    expect(fixture.modelRequests[2]).not.toContain(memoMarker)
+    expect(fixture.modelRequests[2]).not.toContain(markers[0])
+    expect(fixture.modelRequests[3]).not.toContain(memoMarker)
+    for (const marker of markers.slice(0, 3)) expect(fixture.modelRequests[3]).not.toContain(marker)
     for (const body of fixture.modelRequests) expect(body).not.toContain(manualMarker)
     expect((await fixture.http('/v2/sessions/lookup', { ids: [displaySessionId] })).body.sessions[0]).toEqual(before)
     expect(await fixture.messages(displaySessionId)).toEqual(pendingBefore)
     const visible = (await fixture.http('/v1/sessions')).body.sessions
     expect(visible.map((session: { id: string }) => session.id)).toEqual([displaySessionId])
     const history = await fixture.http(`/v1/sessions/${displaySessionId}/automation-runs`)
-    expect(history.body.runs).toHaveLength(2)
+    expect(history.body.runs).toHaveLength(4)
     expect(fixture.failures).toEqual([])
     console.log(JSON.stringify({ provider, nativeContexts: nativeIds.size, visibleSessions: visible.length,
       runsOnOriginalTarget: history.body.runs.length, manualRows: pendingBefore.length, model: 'local fixture; no external inference' }))
   } catch (error) {
-    failure = new Error(`Private context flow failed (${provider}):\n${await fixture.diagnostics().catch(() => 'Diagnostics unavailable')}`, { cause: error })
+    const diagnostics = await fixture.diagnostics().catch(() => 'Diagnostics unavailable')
+    const groups = new Set([...diagnostics.matchAll(/"processes":\[\{"pid":([0-9]+)/g)].map(match => Number(match[1])))
+    const members = groups.size ? await promisify(execFile)('ps', ['-axo', 'pid,ppid,pgid,stat,comm'], { timeout: 1000 })
+      .then(({ stdout }) => stdout.split('\n').filter(line => groups.has(Number(line.trim().split(/\s+/)[2]))).join('\n'))
+      .catch(() => 'Native group observation unavailable') : ''
+    failure = new Error(`Private context flow failed (${provider}):\n${diagnostics}\nNative group members:\n${members}`, { cause: error })
     throw failure
   } finally {
     try { await fixture.close() } catch (error) {
