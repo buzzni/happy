@@ -4,6 +4,7 @@ import type { ChildProcess } from 'node:child_process';
 import nacl from 'tweetnacl';
 import { createAgentCallerLaunches, readOwnerContactTrust } from './agentCallerLaunches';
 import type { TrackedSession } from './types';
+import { buildSpawnRequestEnvironment, buildResumedSessionSpawnEnvironment, captureSaycodeAgentEnvironment } from './sessionEnv';
 
 const key = () => Buffer.from(nacl.sign.keyPair().publicKey).toString('base64url');
 const trust = { issuer: 'https://studio.example', audience: 'https://happy.example', publicKeys: { k1: 'x'.repeat(43) }, lookupOrigin: 'https://studio.example' };
@@ -48,6 +49,17 @@ function harness(options: { enabled?: boolean; tracked?: Partial<TrackedSession>
 }
 const nonce = 'n'.repeat(32);
 describe('daemon launch caller bindings', () => {
+    it.each(['spawn', 'resume'])('issues depth 0 for a daemon-seeded root on %s and after persistence', async lifecycle => {
+        const env = lifecycle === 'spawn'
+            ? buildSpawnRequestEnvironment({}, undefined, { defaultAgentRoot: '/project' })
+            : buildResumedSessionSpawnEnvironment({ inherited: {}, explicit: {}, sessionId: 'source', defaultAgentRoot: '/project' });
+        expect(env.SAYCODE_AGENT_ENV).toBe('1');
+        const captured = JSON.parse(JSON.stringify(captureSaycodeAgentEnvironment(env)));
+        const resumed = buildResumedSessionSpawnEnvironment({ inherited: {}, explicit: {}, sessionId: 'source',
+            agentEnvironment: captured, defaultAgentRoot: '/project' });
+        const h = harness(); await h.spawn(42, captureSaycodeAgentEnvironment(resumed));
+        await expect(h.launches.issue(h.report())).resolves.toMatchObject({ caller: { depth: 0, scope: '/project' } });
+    });
     it('issues a top-level launch at depth 0 in the directory the daemon launched it', async () => {
         const h = harness(); await h.spawn();
         const report = h.report();
@@ -56,6 +68,22 @@ describe('daemon launch caller bindings', () => {
             scope: '/project', depth: 0, callerPublicKey: report.callerPublicKey });
         expect(issued.trust).toEqual(trust);
         expect((await h.launches.query({ sessionId: 'source', nonce })).caller).toEqual(issued.caller);
+    });
+    it('never turns a requested depth-0 grant into trusted root provenance', async () => {
+        const env = buildSpawnRequestEnvironment({}, { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/project', SAYCODE_AGENT_DEPTH: '0',
+            HAPPY_DAEMON_AGENT_GRANT_STATE: 'root' }, { defaultAgentRoot: '/project' });
+        const h = harness(); await h.spawn(42, captureSaycodeAgentEnvironment(env));
+        await expect(h.launches.issue(h.report())).rejects.toThrow('caller-lineage-unknown');
+    });
+    it('keeps owned-journal lineage ahead of default root provenance', async () => {
+        const agentEnvironment = captureSaycodeAgentEnvironment(buildSpawnRequestEnvironment({}, undefined, { defaultAgentRoot: '/project' }));
+        for (const owned of ['unknown', { sessionId: 'source', scope: '/trusted-scope', depth: 2 }] as const) {
+            const h = harness();
+            const host = await spawnHost(h.launches, 42, { agentEnvironment, owned });
+            const issue = h.launches.issue(h.report({ capability: host.capability }));
+            if (owned === 'unknown') await expect(issue).rejects.toThrow('caller-lineage-unknown');
+            else await expect(issue).resolves.toMatchObject({ caller: { scope: '/trusted-scope', depth: 2 } });
+        }
     });
     it.each([
         ['scope widening', { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/', SAYCODE_AGENT_SCOPE: '/', SAYCODE_AGENT_DEPTH: '2' }],

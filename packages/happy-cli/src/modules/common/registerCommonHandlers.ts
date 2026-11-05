@@ -339,6 +339,8 @@ export interface SpawnSessionOptions {
     model?: string;
     effort?: string;
     environmentVariables?: Record<string, string>;
+    /** Internal RPC adapter choice; seed and record a missing root grant at the daemon environment boundary. */
+    seedDefaultAgentGrant?: boolean;
     /** Existing, daemon-canonicalized read-write roots mounted for this session. */
     additionalDirectories?: string[];
     /** OAuth token for the agent CLI (e.g. CLAUDE_CODE_OAUTH_TOKEN). */
