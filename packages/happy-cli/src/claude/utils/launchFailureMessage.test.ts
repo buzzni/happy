@@ -91,3 +91,8 @@ it('requires explicit provider token revocation before permanently excluding an 
  expect(isClaudeRevokedTokenFailure({ type: 'assistant', error: 'authentication_failed', message: { content: [{ type: 'text', text: 'Failed to authenticate. API Error: 401 OAuth access token has been revoked.' }] } })).toBe(true);
  expect(isClaudeRevokedTokenFailure({ is_error: true, result: 'Failed to authenticate. API Error: 401 OAuth access token is invalid.' })).toBe(false);
 });
+
+it('explains unavailable organization start admission without suggesting personal authentication', () => {
+    expect(describeClaudeLaunchFailure(new Error('SETUP_TOKEN_START_WAIT_EXHAUSTED'))).toContain('organization administrator');
+    expect(describeClaudeLaunchFailure(new Error('SETUP_TOKEN_START_UNAVAILABLE'))).toContain('organization');
+});
