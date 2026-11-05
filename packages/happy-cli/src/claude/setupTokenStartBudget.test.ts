@@ -48,3 +48,15 @@ it('does not ask to move when no account has start budget left', async () => {
   expect(await waitForSetupTokenStart({ request, notify: vi.fn(), moveToPreferred, signal: new AbortController().signal })).toBe(true)
   expect(moveToPreferred).not.toHaveBeenCalled()
 })
+
+it('moves off confirmed start exhaustion without admitting the old provider or using start budget', async () => {
+ const request=vi.fn().mockRejectedValue(new Error('SETUP_TOKEN_START_ACCOUNT_EXHAUSTED'))
+ const moveFromExhausted=vi.fn(async()=>true),moveToPreferred=vi.fn(),notify=vi.fn()
+ expect(await waitForSetupTokenStart({request,moveFromExhausted,moveToPreferred,notify,signal:new AbortController().signal})).toBe(false)
+ expect(moveFromExhausted).toHaveBeenCalledOnce();expect(moveToPreferred).not.toHaveBeenCalled();expect(request).toHaveBeenCalledOnce()
+})
+it.each(['SETUP_TOKEN_START_UNAVAILABLE','SETUP_TOKEN_START_ACCOUNT_EXHAUSTED'])('fails closed when %s cannot recover',async message=>{
+ const moveFromExhausted=vi.fn(async()=>false)
+ await expect(waitForSetupTokenStart({request:async()=>{throw new Error(message)},moveFromExhausted,notify:vi.fn(),signal:new AbortController().signal})).rejects.toThrow(message)
+ expect(moveFromExhausted).toHaveBeenCalledTimes(message.endsWith('ACCOUNT_EXHAUSTED')?1:0)
+})
