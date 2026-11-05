@@ -13,7 +13,12 @@ type CodexGoalStatusBase = {
 
 export type CodexGoalCommand =
     | { type: 'set'; objective: string }
-    | { type: 'clear' };
+    | { type: 'clear' }
+    /** Status-only `thread/goal/set`: the objective is kept (Codex `GoalObjectiveUpdate::Keep`). */
+    | { type: 'resume' }
+    | { type: 'pause' };
+
+export type AgentGoalPhase = NonNullable<Extract<AgentGoalStatus, { status: 'active' }>['phase']>;
 
 const ACTIVE_CODEX_GOAL_STATUSES = new Set([
     'active',
@@ -38,7 +43,15 @@ function goalRecord(value: unknown): (ThreadGoal & Record<string, unknown>) | nu
 }
 
 export function codexGoalActionCapabilities(supported: boolean): AgentGoalCapabilities | undefined {
-    return supported ? { clear: true, edit: true } : undefined;
+    return supported ? { clear: true, edit: true, resume: true } : undefined;
+}
+
+/**
+ * Codex goal statuses a client can act on. `budgetLimited` stays `active`: token budgets are not offered
+ * (Codex `Feature::TokenBudget` is under development), so a budget stop is not something to resume from here.
+ */
+export function codexGoalPhase(status: string): AgentGoalPhase {
+    return status === 'paused' || status === 'blocked' || status === 'usageLimited' ? status : 'active';
 }
 
 function eventThreadId(message: CodexGoalEvent): string | null {
@@ -115,6 +128,7 @@ export function mapCodexGoalEventToAgentGoalStatus(
     return {
         ...baseStatus(threadId, sourceRevision),
         status: 'active',
+        phase: codexGoalPhase(status),
         text: objective,
         ...(opts?.capabilities ? { capabilities: opts.capabilities } : {}),
     };
@@ -142,6 +156,10 @@ export function parseCodexGoalCommand(text: string): CodexGoalCommand | null {
 export function parseCodexGoalActionParams(params: Record<string, unknown>): CodexGoalCommand | null {
     if (params.action === 'clear') {
         return { type: 'clear' };
+    }
+
+    if (params.action === 'resume') {
+        return { type: 'resume' };
     }
 
     if (params.action === 'edit') {

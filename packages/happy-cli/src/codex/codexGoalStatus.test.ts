@@ -32,6 +32,7 @@ describe('mapCodexGoalEventToAgentGoalStatus', () => {
             sourceSessionId: 'thread-1',
             sourceRevision: 1781680007,
             status: 'active',
+            phase: 'active',
             text: 'finish the release',
         });
 
@@ -64,12 +65,14 @@ describe('mapCodexGoalEventToAgentGoalStatus', () => {
         expect(codexGoalActionCapabilities(true)).toEqual({
             clear: true,
             edit: true,
+            resume: true,
         });
         expect(codexGoalActionCapabilities(false)).toBeUndefined();
     });
 
-    it('keeps paused and limited Codex goal states visible as current goals', () => {
-        for (const codexStatus of ['paused', 'blocked', 'usageLimited', 'budgetLimited']) {
+    it('reports why a goal is not running as its phase, and treats a budget stop as active', () => {
+        const expectedPhase = { paused: 'paused', blocked: 'blocked', usageLimited: 'usageLimited', budgetLimited: 'active' };
+        for (const codexStatus of ['paused', 'blocked', 'usageLimited', 'budgetLimited'] as const) {
             const status = mapCodexGoalEventToAgentGoalStatus({
                 type: 'thread_goal_updated',
                 threadId: 'thread-1',
@@ -89,6 +92,7 @@ describe('mapCodexGoalEventToAgentGoalStatus', () => {
                 source: 'codex',
                 sourceSessionId: 'thread-1',
                 status: 'active',
+                phase: expectedPhase[codexStatus],
                 text: `goal ${codexStatus}`,
             });
         }
@@ -198,6 +202,10 @@ describe('parseCodexGoalActionParams', () => {
             type: 'set',
             objective: 'revised goal',
         });
+    });
+
+    it('parses resume, which keeps the objective', () => {
+        expect(parseCodexGoalActionParams({ action: 'resume' })).toEqual({ type: 'resume' });
     });
 
     it('rejects unsupported or empty goal action params', () => {
