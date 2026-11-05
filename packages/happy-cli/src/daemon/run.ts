@@ -90,6 +90,7 @@ import { preflightDaemonControlServer, startDaemonControlServer } from './contro
 import { BrowserBridge } from './browserBridge';
 import { BrowserLocalSetup, shouldEnableBrowserLocalSetup } from './browserLocalSetup';
 import { fetchBrowserExtensionScope } from './browserExtensionScope';
+import { writeBrowserBridgeOwnerHome } from './browserBridgeOwner';
 import { readBrowserSetupPolicy, writeBrowserSetupPolicy, localBrowserExtensionMetadata } from './browserLocalSetupStore';
 import { BrowserSessionBrokerClient } from './browserSessionBrokerContract';
 import { getBusyDaemonTerminalCount, getDaemonTerminalSessionCount } from './daemonTerminalSessions';
@@ -4144,6 +4145,9 @@ export async function startDaemon(): Promise<void> {
         extensionScope: () => fetchBrowserExtensionScope({ origin: readTrustedStudioOrigin(process.env), machineId, token: credentials.token }),
       }) : undefined;
     let stopBrowserBridge: () => Promise<void> = async () => {};
+    // Chrome's native host finds this daemon through this record when its home is not a documented one.
+    const recordBrowserBridgeOwner = () => writeBrowserBridgeOwnerHome(os.homedir(), configuration.happyHomeDir)
+      .catch(error => logger.warn(`[DAEMON RUN] Browser bridge owner not recorded; extension connection may not find this daemon: ${error instanceof Error ? error.message : String(error)}`));
     try {
       if (browserSetupPolicy !== null) {
         const bridgeHost = resolveBrowserBridgeHost(process.env);
@@ -4155,6 +4159,7 @@ export async function startDaemon(): Promise<void> {
           ,consumeSetup: setupCandidate ? id => setupCandidate.consume(id) : undefined
         });
         stopBrowserBridge = bridgeServer.stop;
+        if (setupCandidate) await recordBrowserBridgeOwner();
         if (bridgeHost !== '127.0.0.1') {
           logger.debug(`[DAEMON RUN] Browser bridge bound to ${bridgeHost} (HAPPY_BROWSER_BRIDGE_HOST) — not loopback-only`);
         }
@@ -4168,6 +4173,7 @@ export async function startDaemon(): Promise<void> {
         stopBrowserBridge = retryBrowserBridgeServer({
           bridge: browserBridge, port: DEFAULT_BROWSER_BRIDGE_PORT, host: resolveBrowserBridgeHost(process.env),
           consumeSetup: setupCandidate ? id => setupCandidate.consume(id) : undefined,
+          onListening: setupCandidate ? recordBrowserBridgeOwner : undefined,
         }).stop;
       } else {
         browserLocalSetup = undefined;
