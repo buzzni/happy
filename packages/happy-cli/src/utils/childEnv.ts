@@ -72,6 +72,7 @@ export const NON_INHERITABLE_ENV: readonly NonInheritableEnvEntry[] = [
     { prefix: 'HAPPY_AGENT_PLAN_', kind: 'session-scope' },
     { prefix: 'APLUS_SESSION_', kind: 'session-scope' },
     { prefix: 'SAYCODE_AGENT_', kind: 'session-scope' },
+    { prefix: 'HAPPY_DAEMON_AGENT_GRANT_', kind: 'session-scope' },
     // Per-session connector inputs the runner keeps in its own env
     // (fetchAplusMcpServers, refreshMcpCallerGrant). Not the whole HAPPY_APLUS_
     // prefix: HAPPY_APLUS_MCP_CONFIG_URL and HAPPY_APLUS_STUDIO_ORIGIN are

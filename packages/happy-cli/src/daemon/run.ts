@@ -2221,7 +2221,8 @@ export async function startDaemon(): Promise<void> {
         let extraEnv: Record<string, string> = injectMcpCallerGrant(
           stripManagedCredentialConflicts(
             buildSpawnRequestEnvironment(authEnv, options.environmentVariables,
-              { allowPocBrowserTaskEnv: process.env.HAPPY_BROWSER_POC_REQUEST_ENV === '1' }),
+              { allowPocBrowserTaskEnv: process.env.HAPPY_BROWSER_POC_REQUEST_ENV === '1',
+                ...(options.seedDefaultAgentGrant ? { defaultAgentRoot: directory } : {}) }),
             managedAiCredentialEnvironment,
           ),
           mcpCallerGrant,
@@ -3260,6 +3261,8 @@ export async function startDaemon(): Promise<void> {
             },
             agentEnvironment: tracked.agentEnvironment,
             sessionId: happySessionId,
+            // Automation runs are left as they were captured; sessions people started get the grant they missed.
+            ...(options?.automation ? {} : { defaultAgentRoot: launch.cwd }),
           }), managedAiCredentialEnvironment),
           mcpCallerGrantEnvelope: options?.mcpCallerGrantEnvelope,
           trustedMcpCallerGrant: resumeGrantSource.trustedMcpCallerGrant,
