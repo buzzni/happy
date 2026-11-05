@@ -48,3 +48,12 @@ it('does not ask to move when no account has start budget left', async () => {
   expect(await waitForSetupTokenStart({ request, notify: vi.fn(), moveToPreferred, signal: new AbortController().signal })).toBe(true)
   expect(moveToPreferred).not.toHaveBeenCalled()
 })
+
+it('bounds retries when no replacement is available and never authorizes the waiting input', async () => {
+  const request = vi.fn(async () => ({ state:'wait' as const, retryAfterMs:1, preferredAccountIds:[] }))
+  const notify = vi.fn(), moveToPreferred = vi.fn(async()=>false)
+  await expect(waitForSetupTokenStart({request,notify,moveToPreferred,signal:new AbortController().signal})).rejects.toThrow('SETUP_TOKEN_START_WAIT_EXHAUSTED')
+  expect(request).toHaveBeenCalledTimes(60)
+  expect(notify).toHaveBeenCalledTimes(1)
+  expect(moveToPreferred).not.toHaveBeenCalled()
+})

@@ -621,3 +621,44 @@ it('requests start admission using only the current authenticated binding', asyn
  expect((await switcher.requestStart('other-session',RUNNING_A,'start-2')).ok).toBe(false)
  expect(deps.fetch).toHaveBeenCalledTimes(1)
 })
+
+
+it('excludes PC-disabled accounts from both start admission and rebind without enabling them', async () => {
+ const f=setup({disabledSetupTokenAccounts:vi.fn(async()=>[B])})
+ vi.mocked(f.deps.fetch).mockImplementation(async(url,init)=>{
+  const body=JSON.parse(String(init?.body))
+  if(String(url).endsWith('/start'))return Response.json({version:1,state:'wait',retryAfterMs:30000,preferredAccountIds:[C]})
+  const id=body.excludeManagedAccountIds?.includes(B)?C:B
+  return Response.json({version:1,bindingGrant:'fixture.signature',managedAccountId:id,credentialGeneration:1})
+ })
+ vi.mocked(f.deps.sessionEnvironment).mockImplementation(async(_agent,selection)=>({CLAUDE_CODE_OAUTH_TOKEN:'sk-ant-oat01-fixture',[SETUP_TOKEN_BINDING_ENV]:formatSetupTokenBinding(binding((selection as {managedAccountId:string}).managedAccountId))}))
+ expect(await f.switcher.requestStart('session-a',RUNNING_A,'start-1')).toMatchObject({ok:true,admission:{state:'wait'}})
+ expect(JSON.parse(String(vi.mocked(f.deps.fetch).mock.calls[0][1]?.body))).toMatchObject({excludeManagedAccountIds:[B]})
+ expect(await f.switcher.rebind('session-a',RUNNING_A,undefined,undefined,{startBudget:true})).toMatchObject({ok:true})
+ expect(JSON.parse(String(vi.mocked(f.deps.fetch).mock.calls[1][1]?.body))).toMatchObject({excludeManagedAccountIds:[B]})
+ expect(f.deps.sessionEnvironment).toHaveBeenCalledWith('claude',expect.objectContaining({managedAccountId:C}))
+ expect(f.deps.recordAgentEnvironment).toHaveBeenCalledTimes(1)
+})
+
+it('returns no account once when all replacement candidates are disabled without consuming a grant', async () => {
+ const f=setup({disabledSetupTokenAccounts:async()=>[B,C]})
+ vi.mocked(f.deps.fetch).mockImplementation(async(_url,init)=>{
+  const body=JSON.parse(String(init?.body))
+  return body.excludeManagedAccountIds?.length===2?Response.json({error:'SETUP_TOKEN_DAEMON_NO_ACCOUNT'},{status:409}):Response.json({version:1,bindingGrant:'fixture.signature',managedAccountId:B,credentialGeneration:1})
+ })
+ expect(await f.switcher.rebind('session-a',RUNNING_A)).toEqual({ok:false,reason:'NO_ACCOUNT'})
+ expect(f.deps.fetch).toHaveBeenCalledTimes(1)
+ expect(f.deps.sessionEnvironment).not.toHaveBeenCalled()
+ expect(f.deps.recordAgentEnvironment).not.toHaveBeenCalled()
+ expect(f.session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV]).toBe(RUNNING_A)
+})
+
+it('does not drop disabled-account exclusions when an older Studio rejects them', async () => {
+ const f=setup({disabledSetupTokenAccounts:async()=>[B]})
+ vi.mocked(f.deps.fetch).mockResolvedValue(Response.json({error:'INVALID_INPUT'},{status:400}))
+ expect(await f.switcher.rebind('session-a',RUNNING_A)).toEqual({ok:false,reason:'REQUEST_FAILED'})
+ expect(f.deps.fetch).toHaveBeenCalledTimes(2)
+ for(const [,init] of vi.mocked(f.deps.fetch).mock.calls)expect(JSON.parse(String(init?.body))).toMatchObject({excludeManagedAccountIds:[B]})
+ expect(f.deps.sessionEnvironment).not.toHaveBeenCalled()
+ expect(f.deps.recordAgentEnvironment).not.toHaveBeenCalled()
+})

@@ -11,6 +11,7 @@ export async function waitForSetupTokenStart(deps: {
 }): Promise<boolean> {
     const requestId = randomUUID();
     let notified = false;
+    let waits = 0;
     try {
         while (!deps.signal.aborted) {
             const sentAt = performance.now();
@@ -25,6 +26,8 @@ export async function waitForSetupTokenStart(deps: {
             if (!notified) { notified = true; deps.notify(); }
             if (deps.signal.aborted) return false;
             if (!Number.isFinite(decision.retryAfterMs) || decision.retryAfterMs <= 0) throw new Error('SETUP_TOKEN_START_INVALID_WAIT');
+            // Bound unattended recovery to 60 polls (normally 30 minutes); never dispatch without a permit.
+            if (++waits >= 60) throw new Error('SETUP_TOKEN_START_WAIT_EXHAUSTED');
             // Recheck eligibility/capacity at most once per 30 seconds while waiting.
             await delay(Math.min(30_000, decision.retryAfterMs), undefined, { signal: deps.signal });
         }

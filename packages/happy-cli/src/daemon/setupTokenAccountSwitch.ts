@@ -36,6 +36,8 @@ export type SetupTokenAccountSwitchDeps = {
   /** The daemon's machine token; Studio has Happy confirm it owns this machine and session. */
   bearer(): string
   fetch: typeof fetch
+  /** PC-local disabled slots restrict server choices; never re-enable them to rotate. */
+  disabledSetupTokenAccounts?(): Promise<string[]>
   /** A new grant (a switch), or the daemon's recorded binding (catching up a session that missed a switch). */
   sessionEnvironment(agent: string, selection: AiAuthSelection, recorded?: SetupTokenBinding): Promise<Record<string, string>>
   /**
@@ -199,11 +201,12 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     // Candidates checked in this switch; a switch to another account (not a return) offers to check.
     let measured: string[] | null = deps.measure && !confirmedOnly ? [] : null
     try {
+      const disabled = await deps.disabledSetupTokenAccounts?.() ?? []
       let response: Response, body: Record<string, unknown> | null
       while (true) {
         response = await post(confirmedOnly ? 'return' : 'rebind', { ...proof, ...(selectionRequestId ? { selectionRequestId } : {}),
           ...(tokenProof ? { credentialProofVersion: 1 } : {}), ...(organizationFailure ? { organizationFailure } : {}), ...(measured ? { measureVersion: 1, measured: [...measured] } : {}),
-          ...(startBudget ? { startBudget: true } : {}) })
+          ...(startBudget ? { startBudget: true } : {}), ...(disabled.length ? { excludeManagedAccountIds: disabled } : {}) })
         body = await response.json().catch(() => null) as Record<string, unknown> | null
         // A Studio from before candidate checks refuses the fields it does not know: ask again as before, once.
         if (response.status === 400 && (measured || selectionRequestId)) {
@@ -299,7 +302,9 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       const binding = parsed!.binding
       try {
         signal?.throwIfAborted()
-        const response = await post('start', { machineId: deps.machineId, sessionId, companyId: binding.companyId, bindingNonce: binding.nonce, requestId })
+        const disabled = await deps.disabledSetupTokenAccounts?.() ?? []
+        const response = await post('start', { machineId: deps.machineId, sessionId, companyId: binding.companyId, bindingNonce: binding.nonce, requestId,
+          ...(disabled.length ? { excludeManagedAccountIds: disabled } : {}) })
         if (!response.ok) return failure(refusal(response.status), 'start refused')
         return { ok: true as const, admission: await response.json() }
       } catch { return failure('REQUEST_FAILED', 'start unavailable') }
