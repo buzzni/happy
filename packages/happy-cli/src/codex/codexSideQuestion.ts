@@ -113,6 +113,8 @@ const SIDE_FEATURES_OFF: Record<string, unknown> = {
     'features.memories': false,
     'features.multi_agent': false,
     'features.multi_agent_v2': false,
+    // Also overrides the multi-agent version persisted in the parent's history.
+    'agents.enabled': false,
     'features.enable_fanout': false,
     'features.image_generation': false,
     'features.request_permissions_tool': false,

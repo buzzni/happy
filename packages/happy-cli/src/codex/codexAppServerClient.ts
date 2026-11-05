@@ -2142,7 +2142,15 @@ export class CodexAppServerClient {
         const env = this.multiAuthProxy
             ? { ...this.multiAuthProxy.env }
             : await resolveCodexStateEnvironment({ ...sanitizeChildEnv(process.env, { boundary: 'in-session' }), ...this.startupEnvironment });
-        return this.wrapSideLaunch(['app-server', '--listen', 'stdio://'], env);
+        // Legacy notify runs outside the native sandbox independently of features.hooks.
+        // agents.enabled also prevents parent history from restoring its multi-agent version.
+        return this.wrapSideLaunch([
+            'app-server', '--listen', 'stdio://',
+            '-c', 'notify=[]',
+            '-c', 'features.multi_agent=false',
+            '-c', 'features.multi_agent_v2=false',
+            '-c', 'agents.enabled=false',
+        ], env);
     }
 
     /** The current thread's rollout file, when Codex reported one for it. */

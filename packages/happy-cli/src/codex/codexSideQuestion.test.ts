@@ -122,6 +122,7 @@ describe('buildSideForkConfig (R4-c)', () => {
                 'features.hooks': false,
                 'features.memories': false,
                 'features.multi_agent': false,
+                'agents.enabled': false,
                 'features.image_generation': false,
                 'features.request_permissions_tool': false,
                 'tools.experimental_request_user_input.enabled': false,
