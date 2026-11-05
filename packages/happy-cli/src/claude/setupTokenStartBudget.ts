@@ -45,3 +45,16 @@ export async function waitForSetupTokenStart(deps: {
         throw error;
     }
 }
+/**
+ * Saycode specs/shared-pc-start-budget — an unbound shared-PC turn waits only on a wait Studio answers: when no decision
+ * can be had (daemon or Studio unreachable, an invalid or expired answer) the turn runs (decision D1). Studio answering
+ * wait until the wait bound is a decision, not an outage, so it ends the turn as for a member's session. Cancellation
+ * still never runs it.
+ */
+export async function waitForSharedSetupTokenStart(deps: Parameters<typeof waitForSetupTokenStart>[0]): Promise<boolean> {
+    try { return await waitForSetupTokenStart(deps); }
+    catch (error) {
+        if ((error as Error)?.message === 'SETUP_TOKEN_START_WAIT_EXHAUSTED') throw error;
+        return !deps.signal.aborted;
+    }
+}

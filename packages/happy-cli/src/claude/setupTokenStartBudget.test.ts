@@ -1,5 +1,5 @@
 import { expect, it, vi } from 'vitest'
-import { waitForSetupTokenStart } from './setupTokenStartBudget'
+import { waitForSetupTokenStart, waitForSharedSetupTokenStart } from './setupTokenStartBudget'
 const allowed = { state: 'allowed' as const, validForMs: 15000 }
 it('waits for admission and reuses the same logical start identity', async () => {
   const request = vi.fn().mockResolvedValueOnce({ state: 'wait', retryAfterMs: 30, preferredAccountIds: [] }).mockResolvedValue(allowed)
@@ -47,6 +47,24 @@ it('does not ask to move when no account has start budget left', async () => {
   const moveToPreferred = vi.fn(async () => true)
   expect(await waitForSetupTokenStart({ request, notify: vi.fn(), moveToPreferred, signal: new AbortController().signal })).toBe(true)
   expect(moveToPreferred).not.toHaveBeenCalled()
+})
+// Saycode specs/shared-pc-start-budget — decision D1: only a wait Studio answers holds a shared-PC turn.
+it('runs a shared-PC turn when no decision can be had', async () => {
+  for (const request of [async () => { throw new Error('offline') }, async () => ({ ...allowed, validForMs: 0 })]) {
+    expect(await waitForSharedSetupTokenStart({ request, notify: vi.fn(), signal: new AbortController().signal })).toBe(true)
+  }
+})
+it('does not run a shared-PC turn Studio kept answering wait for until the wait bound', async () => {
+  const request = vi.fn().mockResolvedValue({ state: 'wait', retryAfterMs: 1, preferredAccountIds: [] })
+  await expect(waitForSharedSetupTokenStart({ request, notify: vi.fn(), signal: new AbortController().signal })).rejects.toThrow('SETUP_TOKEN_START_WAIT_EXHAUSTED')
+})
+it('still holds a shared-PC turn on a wait Studio answers, and never runs it after cancellation', async () => {
+  const request = vi.fn().mockResolvedValueOnce({ state: 'wait', retryAfterMs: 30, preferredAccountIds: [] }).mockResolvedValue(allowed)
+  const notify = vi.fn()
+  expect(await waitForSharedSetupTokenStart({ request, notify, signal: new AbortController().signal })).toBe(true)
+  expect(notify).toHaveBeenCalledTimes(1)
+  const controller = new AbortController()
+  expect(await waitForSharedSetupTokenStart({ request: async () => { controller.abort(); throw new Error('offline') }, notify: vi.fn(), signal: controller.signal })).toBe(false)
 })
 
 it('bounds retries when no replacement is available and never authorizes the waiting input', async () => {
