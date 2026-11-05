@@ -54,6 +54,10 @@ describe('setup-token control routes (specs/claude-setup-token-account-selection
       expect((await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}', startBudget: true })).status).toBe(200);
       expect(switcher.rebind).toHaveBeenLastCalledWith('session-a', '{}', undefined, expect.any(AbortSignal), { startBudget: true });
       expect((await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}', startBudget: false })).status).toBe(400);
+      expect((await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}', startExhausted: true })).status).toBe(200);
+      expect(switcher.rebind).toHaveBeenLastCalledWith('session-a', '{}', undefined, expect.any(AbortSignal), { startExhausted: true });
+      expect((await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}', startExhausted: true, startBudget: true })).status).toBe(400);
+
       expect((await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}', observation: finalRefusal })).status).toBe(200);
       expect(switcher.rebind).toHaveBeenLastCalledWith('session-a', '{}', finalRefusal, expect.any(AbortSignal));
       const authFailure = { ...finalRefusal, reason: 'authentication-failed' };

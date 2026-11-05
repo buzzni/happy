@@ -1455,6 +1455,7 @@ export class ApiMachineClient {
                 model,
                 effort,
                 environmentVariables,
+                seedDefaultAgentGrant: true,
                 additionalDirectories: validAdditionalDirectories,
                 token,
                 happyToken,

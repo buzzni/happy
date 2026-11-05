@@ -1,3 +1,4 @@
+import { logger } from '@/ui/logger'
 import { describe, expect, it, vi } from 'vitest'
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitchDeps } from './setupTokenAccountSwitch'
 import { formatSetupTokenBinding, SETUP_TOKEN_BINDING_ENV, SETUP_TOKEN_SHARED_ACCOUNT_ENV, sharedMachineSetupTokenAuthority, type AiAuthSelection, type SetupTokenBinding, type UserSetupTokenBinding } from './sessionEnv'
@@ -695,4 +696,25 @@ it('requests start admission using only the current authenticated binding', asyn
  expect(JSON.parse(String(vi.mocked(deps.fetch).mock.calls[0][1]?.body))).toEqual({machineId:'pc-a',sessionId:'session-a',companyId:'org-a',bindingNonce:NONCE_A,requestId:'start-1'})
  expect((await switcher.requestStart('other-session',RUNNING_A,'start-2')).ok).toBe(false)
  expect(deps.fetch).toHaveBeenCalledTimes(1)
+})
+
+it.each([[409,'SETUP_TOKEN_DAEMON_START_ACCOUNT_EXHAUSTED','START_ACCOUNT_EXHAUSTED'],[409,'SETUP_TOKEN_DAEMON_START_ACCOUNT_UNAVAILABLE','REQUEST_FAILED'],[403,'SETUP_TOKEN_DAEMON_START_ACCOUNT_EXHAUSTED','FORBIDDEN']])('preserves only authenticated confirmed start exhaustion (%s, %s)',async(status,error,reason)=>{
+ const {switcher}=setup({fetch:vi.fn(async()=>Response.json({error},{status})) as typeof fetch})
+ expect(await switcher.requestStart('session-a',RUNNING_A,'start-1')).toEqual({ok:false,reason})
+})
+it('passes start exhaustion as a distinct rebind reason',async()=>{
+ const {switcher,requests}=setup()
+ expect((await switcher.rebind('session-a',RUNNING_A,undefined,undefined,{startExhausted:true})).ok).toBe(true)
+ expect(requests[0].body).toMatchObject({startExhausted:true})
+ expect(requests[0].body).not.toHaveProperty('startBudget')
+})
+
+it('logs start refusal status and code without logging arbitrary response data',async()=>{
+ const debug=vi.spyOn(logger,'debug')
+ try{
+  const {switcher}=setup({fetch:vi.fn(async()=>Response.json({error:'SETUP_TOKEN_DAEMON_START_ACCOUNT_EXHAUSTED',token:'do-not-log'},{status:409})) as typeof fetch})
+  await switcher.requestStart('session-a',RUNNING_A,'request')
+  expect(debug).toHaveBeenCalledWith('[setup-token-switch] START_ACCOUNT_EXHAUSTED: start refused: HTTP 409 SETUP_TOKEN_DAEMON_START_ACCOUNT_EXHAUSTED')
+  expect(debug.mock.calls.flat().join(' ')).not.toContain('do-not-log')
+ }finally{debug.mockRestore()}
 })
