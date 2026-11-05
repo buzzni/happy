@@ -89,6 +89,7 @@ import {
 } from './initialPrompt';
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
+import { BASH_PREFIX_MATCHER_CAPABILITY } from './utils/bashPrefixMatcher';
 import { takeSessionSourceFromEnv } from '@/utils/sessionSource';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { createManagedFollowUpHandler } from '@/managed/managedFollowUp';
@@ -363,6 +364,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         createdBy: createdByAccountId ? { accountId: createdByAccountId, displayName: createdByDisplayName } : undefined,
         source,
         approvalLifecycle: true,
+        permissionGrants: BASH_PREFIX_MATCHER_CAPABILITY,
     });
 
     // Resume-in-place must use the latest server document as its metadata
@@ -542,6 +544,15 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     stage('checkpoint-composition');
     // Create realtime session
     const session = launchControl ? api.sessionSyncClient(response, { trackShutdownStorage: true }) : api.sessionSyncClient(response);
+    // Managed attachments (and existing session tags) return persisted metadata instead of the
+    // fresh document above. Only this running Claude process may advertise its matcher there.
+    session.updateMetadata((meta) => ({
+        ...meta,
+        runtimeCapabilities: {
+            ...meta.runtimeCapabilities,
+            permissionGrants: BASH_PREFIX_MATCHER_CAPABILITY,
+        },
+    }));
     stage('session-client');
     // Created with the message queue below; MCP tools admitted before then are refused by the gate itself.
     let runtimeGate: RuntimeProducerGate | undefined;

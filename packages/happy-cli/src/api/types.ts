@@ -290,9 +290,9 @@ export const MachineMetadataSchema = z.object({
   /** This daemon serves `listFilesPage` (aplus-dev-studio specs/remote-file-list-pages). */
   listFilesPage: z.object({ version: z.literal(1) }).optional(),
   /**
-   * aplus-dev-studio-desktop specs/desktop-permission-prefix-grant R7 — this daemon matches a session
-   * `Bash(<prefix>:*)` grant only against a plain single command at a word boundary. Absent: an older
-   * daemon still uses a bare `startsWith`, so Desktop must not offer a prefix grant to it.
+   * Availability hint for newly launched Claude sessions. Detached sessions can outlive daemon
+   * upgrades: clients must check the target session's runtimeCapabilities.permissionGrants before
+   * offering a prefix grant. This machine marker alone never authorizes one.
    */
   permissionGrants: z.object({ bashPrefixMatcher: z.literal('plain-v1') }).optional(),
   /** Profile-based no-shell execution negotiated by Desktop extensions. */
@@ -596,6 +596,12 @@ export type Metadata = {
      * an older runtime (or an agent without the wait), which never expires anything.
      */
     approvalLifecycle?: 1,
+    /**
+     * Published by the running Claude process, never inferred from machine metadata. Clients may
+     * offer Bash(<prefix>:*) only when this session advertises plain-v1; absent means unsupported,
+     * including an older session that survived a daemon upgrade.
+     */
+    permissionGrants?: { bashPrefixMatcher: 'plain-v1' },
   },
   /** aplus-dev-studio specs/e2ee-machine-control-boundary R18 — reads bound session-scope requests. */
   rpcBinding?: RpcBindingCapability,

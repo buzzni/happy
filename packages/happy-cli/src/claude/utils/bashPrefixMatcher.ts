@@ -18,9 +18,9 @@
 export const MAX_PLAIN_BASH_COMMAND_LENGTH = 4000;
 
 /**
- * Machine-metadata marker (`permissionGrants`): this daemon applies the plain-command matcher above.
- * Desktop offers a prefix grant only to a daemon that advertises it, because an older daemon still
- * matches with a bare `startsWith` (spec R7 iv, Q9).
+ * Live-session marker (`runtimeCapabilities.permissionGrants`): this Claude process applies the
+ * matcher above. Desktop must require this session marker before offering a prefix grant. The same
+ * value in machine metadata is only an availability hint: older sessions survive daemon upgrades.
  */
 export const BASH_PREFIX_MATCHER_CAPABILITY = { bashPrefixMatcher: 'plain-v1' as const };
 

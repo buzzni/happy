@@ -4438,8 +4438,9 @@ export class ApiMachineClient {
             const advertisedListFilesPage = this.managedHandlers ? undefined : LIST_FILES_PAGE_CAPABILITY;
             const listFilesPageStale = JSON.stringify(this.machine.metadata?.listFilesPage)
                 !== JSON.stringify(advertisedListFilesPage);
-            // The Claude permission handler lives in every session process, managed or not, so this
-            // is not gated like the file RPCs above. A machine registered earlier has to republish it.
+            // Availability hint only: every live session owns its permission handler and must
+            // publish its own runtimeCapabilities.permissionGrants, including on a managed runtime.
+            // Detached older sessions do not gain that session marker when this daemon upgrades.
             const permissionGrantsStale = JSON.stringify(this.machine.metadata?.permissionGrants)
                 !== JSON.stringify(BASH_PREFIX_MATCHER_CAPABILITY);
             const advertisedChannelHost = this.managedHandlers ? undefined : this.channelHostAdvertisement;

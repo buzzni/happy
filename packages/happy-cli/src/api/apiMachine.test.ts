@@ -20,6 +20,7 @@ import { MOAI_MANAGED_TOOL } from '@/modules/common/moaiMachineRunProfiles';
 import { WRITE_FILE_ATTEMPT_CAPABILITY } from '@/modules/common/writeFileAttempts';
 import { LIST_FILES_PAGE_CAPABILITY } from '@/modules/common/listFilesPageCapability';
 import { BASH_PREFIX_MATCHER_CAPABILITY } from '@/claude/utils/bashPrefixMatcher';
+import { ApiSessionClient } from './apiSession';
 import { McpCallerGrantEnvelopeConsumer } from '@/daemon/mcpCallerGrantEnvelope';
 import { join } from 'node:path';
 import { hkdfSync, randomBytes } from 'node:crypto';
@@ -1820,10 +1821,8 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
-    // aplus-dev-studio-desktop specs/desktop-permission-prefix-grant R7 — Desktop offers a prefix
-    // grant only to a daemon that says it matches one at a word boundary; a machine registered
-    // before the marker existed has to republish its metadata to carry it.
-    it('advertises the plain-command prefix matcher on a machine registered before the marker existed', async () => {
+    // The upgraded daemon is only an availability hint: a surviving session still needs its own marker.
+    it('advertises machine availability without upgrading a surviving old session capability', async () => {
         vi.useFakeTimers();
         mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
             if (event === 'machine-update-metadata') {
@@ -1836,14 +1835,29 @@ describe('ApiMachineClient socket reconnection', () => {
         });
         const machine = makeMachine();
         expect(machine.metadata?.permissionGrants).toBeUndefined();
+        const oldSession = new ApiSessionClient('fake-token', {
+            id: 'old-live-session', seq: 0, metadataVersion: 0, agentState: null, agentStateVersion: 0,
+            encryptionKey: new Uint8Array(32), encryptionVariant: 'legacy',
+            metadata: {
+                path: '/tmp', host: 'localhost', machineId: machine.id, flavor: 'claude',
+                homeDir: '/home/user', happyHomeDir: '/home/user/.happy',
+                happyLibDir: '/home/user/.happy/lib', happyToolsDir: '/home/user/.happy/tools',
+                runtimeCapabilities: { approvalLifecycle: 1 },
+            },
+        });
         const client = new ApiMachineClient('fake-token', machine);
-        client.connect();
-
-        socketHandlers.connect![0]!();
-        await vi.waitFor(() => expect(machine.metadata?.permissionGrants).toEqual(BASH_PREFIX_MATCHER_CAPABILITY));
-        expect(machine.metadata?.permissionGrants).toEqual({ bashPrefixMatcher: 'plain-v1' });
-
-        client.shutdown();
+        try {
+            client.connect();
+            socketHandlers.connect!.at(-1)!();
+            await vi.waitFor(() => expect(machine.metadata?.permissionGrants).toEqual(BASH_PREFIX_MATCHER_CAPABILITY));
+            expect(machine.metadata?.permissionGrants).toEqual({ bashPrefixMatcher: 'plain-v1' });
+            expect(oldSession.getMetadata()?.machineId).toBe(machine.id);
+            expect(oldSession.getMetadata()?.runtimeCapabilities).toEqual({ approvalLifecycle: 1 });
+            expect(mockSocket.emitWithAck.mock.calls.some(([event]: [string]) => event === 'update-metadata')).toBe(false);
+        } finally {
+            client.shutdown();
+            await oldSession.close();
+        }
     });
 
     // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 — the web starts a strict machine's

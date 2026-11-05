@@ -18,7 +18,9 @@ Desktop이 permission RPC 응답에 `decision: 'approved_for_session'`과 `allow
    - prefix와 command가 모두 평문이어야 하고, prefix는 앞뒤 공백이 없어야 한다(빈 접두가 공백으로 시작하는 명령을 전부 허용하는 경로 차단).
    - `command === prefix || command.startsWith(prefix + ' ')`.
 3. **리터럴 `Bash(<명령>)`은 정확 일치 그대로**(Desktop R7 iii). 변경 없음.
-4. **표지**: machine metadata `permissionGrants: { bashPrefixMatcher: 'plain-v1' }`. 데몬 최초 등록과, 이미 등록된 머신의 갱신(`apiMachine` stale 판정) 양쪽에서 싣는다. 표지가 없으면 Desktop은 접두 선택지를 보이지 않는다(fail-closed).
+4. **런타임 표지**: 접두 선택지의 필수 조건은 대상 세션의 `runtimeCapabilities.permissionGrants.bashPrefixMatcher === 'plain-v1'`이다. 현재 Claude 프로세스가 세션 생성과 시작 시 직접 게시하고, 재개·기존 세션 태그·managed attachment의 저장된 메타데이터에도 반영한다. 표지가 없거나 알 수 없는 값이면 Desktop은 접두 선택지를 보이지 않는다(fail-closed). 머신 표지나 CLI 버전으로 대신 판정하지 않는다.
+   - machine metadata `permissionGrants: { bashPrefixMatcher: 'plain-v1' }`는 신규 세션 지원 가능성을 알리는 참고 정보다. 데몬 최초 등록과 이미 등록된 머신의 갱신(`apiMachine` stale 판정)에 남겨 두지만, 이 표지만으로 접두 선택지를 제공해서는 안 된다.
+   - 데몬 교대는 실행 중인 세션의 프로세스를 교체하지 않는다. 구 Claude 세션은 업그레이드된 머신과 같은 `machineId`를 가져도 세션 표지가 없으므로 계속 미지원이다. 세션이 새 런타임으로 재개될 때만 새 런타임의 capability로 갱신한다.
 5. **공유 사례 파일** `src/claude/utils/bashPrefixMatcher.cases.v1.json` — Desktop `specs/desktop-permission-prefix-grant/cases.v1.json`과 같은 파일. `plainCommand`·`matcher`·`compoundInjection` 섹션을 이 저장소 테스트가 전부 읽는다. Desktop 쪽은 후보·금지 섹션(R4·R5)을 Phase 2에서 더한다.
 
 ## 결정
@@ -26,6 +28,7 @@ Desktop이 permission RPC 응답에 `decision: 'approved_for_session'`과 `allow
 - **적용 범위는 allow 접두 매칭뿐이다.** deny 규칙(`generateHookSettings.ts`의 `Bash(killall:*)`, `machineLockdownPolicy.ts`의 `Bash(env:*)` 등)은 Claude CLI의 `--disallowedTools`·settings로 전달돼 CLI가 평가한다. 이 핸들러의 `allowedBashPrefixes`를 거치지 않으므로 deny의 "넓게 막기" 의미는 바뀌지 않는다. `allowedBashPrefixes`에는 응답의 `allowTools`만 들어간다.
 - 모바일 앱이 보내는 `allowedTools`의 `Bash(x:*)`에도 같은 매처가 적용된다. 허용 범위가 줄어들 뿐(복합 명령·경계 밖은 다시 묻는다)이다.
 - 금지 접두사 목록(Desktop R5)은 이 저장소에 두지 않는다. 데몬은 어떤 접두를 받든 평문·경계 규칙만 집행하고, "어떤 접두를 제안할지"는 Desktop이 정한다.
+- Desktop Phase 2의 gate는 반드시 세션 메타데이터를 읽어야 한다. 이 저장소에는 해당 Desktop UI가 없으므로, 위 세션 표지 계약을 짝 PR과 후속 구현에 함께 반영해야 한다.
 
 ## 비목표
 
