@@ -175,10 +175,12 @@ describe('Codex goal pause and resume', () => {
         expect(setGoal).toHaveBeenCalledWith({ threadId: 'thread-1', status: 'paused' });
     }, 20_000);
 
-    it('publishes the paused phase after the stop', async () => {
+    it('keeps the paused phase runtime-local for installed strict app schemas', async () => {
         duringTurn = async () => { goalEvent('active'); await rpc.get('abort')!({}); };
         await run();
-        expect(lastGoal()).toMatchObject({ status: 'active', phase: 'paused', text: 'ship it', capabilities: { resume: true } });
+        expect(lastGoal()).toMatchObject({ status: 'active', text: 'ship it', capabilities: { clear: true, edit: true } });
+        expect(lastGoal()).not.toHaveProperty('phase');
+        expect(lastGoal()?.capabilities).not.toHaveProperty('resume');
     }, 20_000);
 
     it.each(['paused', 'blocked', 'usageLimited'])('leaves a %s goal alone on stop', async phase => {
@@ -205,6 +207,25 @@ describe('Codex goal pause and resume', () => {
         expect(calls).toEqual(['interrupt']);
     }, 20_000);
 
+    it('interrupts within the stop deadline even when the goal pause never responds', async () => {
+        let releasePause!: (value: { goal: ReturnType<typeof goalOf> }) => void;
+        let interruptedAtDeadline = false;
+        setGoal.mockImplementationOnce(() => new Promise(resolve => { releasePause = resolve; }));
+        duringTurn = async () => {
+            goalEvent('active');
+            const stopping = rpc.get('abort')!({});
+            try {
+                await new Promise(resolve => setTimeout(resolve, 1500));
+                interruptedAtDeadline = calls.includes('interrupt');
+            } finally {
+                releasePause({ goal: goalOf('paused') });
+                await stopping;
+            }
+        };
+        await run();
+        expect(interruptedAtDeadline).toBe(true);
+    }, 20_000);
+
     it('resumes a paused goal through goal-action without changing the objective', async () => {
         duringTurn = async () => {
             goalEvent('paused');
@@ -212,6 +233,24 @@ describe('Codex goal pause and resume', () => {
         };
         await run();
         expect(setGoal).toHaveBeenCalledWith({ threadId: 'thread-1', status: 'active' });
-        expect(lastGoal()).toMatchObject({ phase: 'active', text: 'ship it' });
+        expect(lastGoal()).toMatchObject({ status: 'active', text: 'ship it' });
+    }, 20_000);
+
+    it('does not let a late pause response overwrite a subsequent resume', async () => {
+        let releasePause!: (value: { goal: ReturnType<typeof goalOf> }) => void;
+        setGoal.mockImplementationOnce(() => new Promise(resolve => { releasePause = resolve; }));
+        duringTurn = async () => {
+            goalEvent('active');
+            try {
+                await rpc.get('abort')!({});
+                await rpc.get('goal-action')!({ action: 'resume' });
+            } finally {
+                releasePause({ goal: goalOf('paused') });
+            }
+            await new Promise(resolve => setImmediate(resolve));
+            await rpc.get('abort')!({});
+        };
+        await run();
+        expect(setGoal.mock.calls.map(([params]) => params.status)).toEqual(['paused', 'active', 'paused']);
     }, 20_000);
 });
