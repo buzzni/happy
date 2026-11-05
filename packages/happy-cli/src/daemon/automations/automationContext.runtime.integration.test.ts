@@ -71,11 +71,19 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
   { state: 'archived', provider: 'codex', encryptionVariant: 'legacy' },
   { state: 'deleted', provider: 'claude', encryptionVariant: 'legacy' },
   { state: 'background', provider: 'codex', encryptionVariant: 'legacy' },
-  { state: 'background', provider: 'claude', encryptionVariant: 'legacy' }] as const)(
+  { state: 'background', provider: 'claude', encryptionVariant: 'legacy' },
+  { state: 'legacy-session', provider: 'claude', encryptionVariant: 'legacy' },
+  { state: 'legacy-session', provider: 'codex', encryptionVariant: 'legacy' },
+  { state: 'legacy-machine', provider: 'claude', encryptionVariant: 'legacy' },
+  { state: 'legacy-machine', provider: 'codex', encryptionVariant: 'legacy' },
+  { state: 'linked-manual', provider: 'claude', encryptionVariant: 'legacy' },
+  { state: 'linked-manual', provider: 'codex', encryptionVariant: 'legacy' }] as const)(
   'restores a durable $state $provider $encryptionVariant occurrence through the real daemon without replaying or ignoring a stop', async ({ state, provider, encryptionVariant }) => {
   const chatStopped = state === 'archived' || state === 'deleted'
-  const shouldRun = state !== 'paused' && state !== 'paused-after-wait' && !chatStopped
-  const isManual = state === 'manual' || state === 'queued' || state === 'background'
+  const legacyWriter = state === 'legacy-session' || state === 'legacy-machine'
+  const linkedManual = state === 'linked-manual'
+  const shouldRun = state !== 'paused' && state !== 'paused-after-wait' && !chatStopped && !legacyWriter
+  const isManual = state === 'manual' || state === 'queued' || state === 'background' || legacyWriter || linkedManual
   vi.stubEnv('HAPPY_SCOPE_FRESH_PROVIDER_STATE', '1')
   vi.stubEnv('HAPPY_SCOPE_PACKAGED_SERVER', undefined)
   vi.stubEnv('HAPPY_SCOPE_INSTALLED_CLI', undefined)
@@ -161,9 +169,17 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
   let failure: unknown
   try {
     await fixture.start()
+    let manualDirectory = fixture.project
+    if (linkedManual) {
+      const git = promisify(execFile)
+      await git('git', ['-C', fixture.project, 'init', '-q'])
+      await git('git', ['-C', fixture.project, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-qm', 'fixture'])
+      manualDirectory = join(fixture.root, 'manual-neighbor')
+      await git('git', ['-C', fixture.project, 'worktree', 'add', '-qb', 'manual-neighbor', manualDirectory])
+    }
     const api = await ApiClient.create({ token: fixture.token, encryption: encryptionVariant === 'legacy'
       ? { type: 'legacy', secret: fixture.seed } : { type: 'dataKey', publicKey: fixture.accountBox.publicKey, machineKey: fixture.machineKey } })
-    const manualSessionId = isManual ? await fixture.spawnSession(fixture.project, { enabled: false }) : null
+    const manualSessionId = isManual ? await fixture.spawnSession(manualDirectory, { enabled: false }) : null
     let originalNativeId = 'manual-native-keep'
     if (manualSessionId) {
       await fixture.send(manualSessionId, manualMarker)
@@ -182,7 +198,7 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
     const prepared = api.prepareSessionCreation({ tag: `manual-${randomUUID()}`, metadata: { path: fixture.project,
       host: 'fixture', flavor: provider, [fixture.providerIdentityField]: 'manual-native-keep', homeDir: fixture.home, happyHomeDir: fixture.happyHome,
       happyLibDir: fixture.cli, happyToolsDir: fixture.tools }, state: { controlledByUser: false } })
-    const displaySessionId = manualSessionId ?? (await fixture.http('/v1/sessions', prepared.body)).body.session.id
+    const displaySessionId = manualSessionId && !linkedManual ? manualSessionId : (await fixture.http('/v1/sessions', prepared.body)).body.session.id
     run = { ...await seedRun(fixture, { accountId: fixture.accountId, displaySessionId, runId, claimToken, directory: fixture.project, secret,
       ...(chatStopped ? { chat: true } : {}) }), displaySessionId }
     const journal = createAutomationContextLaunchJournal(fixture.happyHome)
@@ -200,6 +216,14 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
           token: fixture.token, machineId: run.machineId, runId, claimToken }) }) })
     const marker = `scope-marker-deferred-${randomUUID()}`
     try {
+      if (legacyWriter) {
+        const scope = state === 'legacy-session' ? manualSessionId! : run.machineId
+        const key = state === 'legacy-session' ? fixture.sessionKey(manualSessionId!) : fixture.seed
+        const shell = await executionRpc(fixture, scope, key, 'bash', { cwd: fixture.project,
+          command: 'printf recorded > context-unfenced-rpc.txt' })
+        expect(shell, JSON.stringify(shell)).toMatchObject({ success: true })
+        expect(await readFile(join(fixture.project, 'context-unfenced-rpc.txt'), 'utf8')).toBe('recorded')
+      }
       expect(await host.dispatch({ automationId: run.automationId, generation: run.generation, revision: run.revision, runId, claimToken,
         environmentVariables: {}, payload: { name: 'Deferred isolated occurrence', directory: fixture.project, agent: provider,
           model: fixture.modelName, prompt: `Return ${marker} only.`, scriptCommand: null, suppressSilent: false,
@@ -209,7 +233,15 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
       expect(await journal.read(runId)).toMatchObject({ phase: 'registered', deferredDispatch: 'queued' })
       expect((await journal.read(runId))!.prepared.encryptionVariant).toBe(encryptionVariant)
       expect((await journal.read(runId))!.prepared.body.dataEncryptionKey == null).toBe(encryptionVariant === 'legacy')
-      if (state === 'paused') {
+      if (legacyWriter) {
+        expect(await workspace.acquireAutomation({ runId: `unknown-writer-check-${runId}`, roots: [fixture.project] }))
+          .toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' })
+        await eventually(async () => calls.includes('/api/automation/mcp-caller-grant') ? true : undefined,
+          'real daemon retries the original occurrence behind an unknown legacy writer')
+        expect(fixture.modelRequests.some(body => body.includes(marker))).toBe(false)
+        expect(await journal.read(runId)).toMatchObject({ phase: 'registered', deferredDispatch: 'queued' })
+      }
+      if (state === 'paused' || legacyWriter) {
         const response = await fetch(`${fixture.serverUrl}/v1/projects/${encodeURIComponent(run.projectId)}/automations/${encodeURIComponent(run.automationId)}`, {
           method: 'PATCH', headers: { Authorization: `Bearer ${fixture.token}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ expectedRevision: run.revision, paused: true }), signal: AbortSignal.timeout(10_000) })
@@ -286,7 +318,8 @@ it.each([{ state: 'active', provider: 'claude', encryptionVariant: 'legacy' },
       expect(automaticInputs[0]).not.toContain(queuedMarker)
     }
     const manualAfter = (await fixture.http('/v2/sessions/lookup', { ids: [displaySessionId] })).body.sessions[0]
-    expect(decrypt(prepared.encryptionKey, prepared.encryptionVariant, decodeBase64(manualAfter.metadata))).toMatchObject({ [fixture.providerIdentityField]: originalNativeId })
+    expect(decrypt(prepared.encryptionKey, prepared.encryptionVariant, decodeBase64(manualAfter.metadata)))
+      .toMatchObject({ [fixture.providerIdentityField]: linkedManual ? 'manual-native-keep' : originalNativeId })
     if (manualSessionId) {
       expect(await fixture.resumeSession(manualSessionId)).toBe(manualSessionId)
       const followup = `scope-marker-followup-${randomUUID()}`

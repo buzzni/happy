@@ -5,7 +5,7 @@ import { prepareSessionWriteScopeClaude } from '@/daemon/sessionWriteScopeClaude
 /** Orchestrates Claude sessions, initial prompts, MCP tools and session lifecycle. */
 import { createLessonProposalTurn } from '@/utils/lessonProposalTurn';
 import { reportAutomationContextExit } from '@/utils/automationContextExit';
-import { createFilesystemWriteAdmission } from '@/utils/workspaceTurnAdmission';
+import { createFilesystemWriteAdmission, createSubprocessWriteAdmission } from '@/utils/workspaceTurnAdmission';
 import { takeWorkspaceContextControl } from '@/utils/workspaceContextControl';
 import { createTurnCardSwitch } from './utils/turnCardTools';
 import { randomUUID } from 'node:crypto';
@@ -551,6 +551,10 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     let runtimeGate: RuntimeProducerGate | undefined;
     const automationExecution = isAutomationExecutionSessionId(response.id);
     const filesystemAdmission = workspaceControl ? createFilesystemWriteAdmission({ home: configuration.happyHomeDir }) : undefined;
+    const subprocessAdmission = workspaceControl ? createSubprocessWriteAdmission({ home: configuration.happyHomeDir }) : undefined;
+    const admitSubprocess = subprocessAdmission ? (roots: readonly string[]) => runtimeGate
+        ? runtimeGate.admit(() => subprocessAdmission(roots), 'writer')
+        : Promise.reject(new Error('Runtime input is not open')) : undefined;
     // Internal executions have no interactive file editor. Legacy RPC paths follow symlinks and
     // cannot inherit the native actor's narrower workspace authority.
     const withFilesystemMutation = automationExecution ? <T,>(_operation: () => Promise<T>): Promise<T> =>
@@ -561,6 +565,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // Create realtime session
     const session = launchControl || workspaceControl || automationExecution ? api.sessionSyncClient(response, {
         trackShutdownStorage: true, ...(withFilesystemMutation ? { withFilesystemMutation } : {}),
+        ...(admitSubprocess ? { admitSubprocess } : {}),
     }) : api.sessionSyncClient(response);
     stage('session-client');
     let standaloneDrain: ClaudeStandaloneDrain | undefined;

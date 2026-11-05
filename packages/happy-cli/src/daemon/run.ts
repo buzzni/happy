@@ -349,7 +349,7 @@ import { mergeAdditionalDirectoriesIntoSandboxEnvironment, readAdditionalDirecto
 import { createAutomationContextWorkspace } from './automations/automationContextWorkspace';
 import { createAutomationContextHost, prepareAutomationContextTick } from './automations/automationContextHost';
 import { createAutomationContextReferenceReader } from './automations/automationContextReference';
-import { createFilesystemWriteAdmission } from '@/utils/workspaceTurnAdmission';
+import { createFilesystemWriteAdmission, createSubprocessWriteAdmission, canonicalWorkspaceAdmissionRoots } from '@/utils/workspaceTurnAdmission';
 import { observeWorkspaceContextChild, WORKSPACE_CONTEXT_CONTROL_ENV } from '@/utils/workspaceContextControl';
 import { probeProcessGroup } from './managedProcessGroup';
 import { createAutomationContextLaunchJournal } from './automations/automationContextLaunchJournal';
@@ -1446,6 +1446,8 @@ export async function startDaemon(): Promise<void> {
       onRetired: pid => onChildExited(pid) });
     // Terminals run under the verified launcher in their own Job and close with the drain (W0-5h).
     if (standaloneWindows) configureWindowsTerminalHost(standaloneWindows.terminalHost);
+    const contextIsolationHostEnabled = process.env.HAPPY_CONTEXT_ISOLATION_HOST === '1' && process.platform !== 'win32';
+    const admitSubprocess = contextIsolationHostEnabled ? createSubprocessWriteAdmission({ home: configuration.happyHomeDir }) : undefined;
     // codexcli-org-requirements R10.5: which sessions' organizations switched autopilot off, as the
     // session processes recorded it, and the daemon's own entries in the organization audit.
     const orgRequirementsSessions = createOrgRequirementsStore({ happyHomeDir: configuration.happyHomeDir, serverUrl: configuration.serverUrl, accountKey: 'daemon' });
@@ -1943,10 +1945,10 @@ export async function startDaemon(): Promise<void> {
     const manualWorkspaceChildren = new Map<number, ReturnType<typeof observeWorkspaceContextChild>>();
     const observedWorkspaceExit = { foregroundDrained: true, backgroundDrained: true, providerExitedCleanly: true, writeProducersDrained: true };
     // Private rollout only: capability remains unadvertised until the full producer/recovery contract is ready.
-    const contextWorkspace = process.env.HAPPY_CONTEXT_ISOLATION_HOST === '1' && process.platform !== 'win32'
+    const contextWorkspace = contextIsolationHostEnabled
       ? createAutomationContextWorkspace({ home: configuration.happyHomeDir, isTracked: async roots => {
         try {
-          const requested = await Promise.all(roots.map(root => fs.realpath(root)));
+          const requested = await canonicalWorkspaceAdmissionRoots(roots);
           const contains = (parent: string, child: string) => {
             const tail = relative(parent, child);
             return tail === '' || tail !== '..' && !tail.startsWith('..' + sep) && !isAbsolute(tail);
@@ -1956,7 +1958,7 @@ export async function startDaemon(): Promise<void> {
               .filter((directory): directory is string => !!directory);
             if (!directories.length) return 'unconfirmed';
             directories.push(...readAdditionalDirectoriesEnvironment(tracked.agentEnvironment ?? {}));
-            for (const directory of await Promise.all(directories.map(value => fs.realpath(value)))) {
+            for (const directory of await canonicalWorkspaceAdmissionRoots(directories, false)) {
               if (requested.some(root => contains(root, directory) || contains(directory, root))) {
                 const owner = manualWorkspaceChildren.get(tracked.pid);
                 if (!owner || !await owner.drain(new AbortController().signal)) return true;
@@ -4544,7 +4546,7 @@ export async function startDaemon(): Promise<void> {
     }
     const apiMachine = contextWorkspace
       ? api.machineSyncClient(machine, deviceKeys, deviceEnrollment ?? undefined, initialDaemonState,
-        createFilesystemWriteAdmission({ home: configuration.happyHomeDir }))
+        createFilesystemWriteAdmission({ home: configuration.happyHomeDir }), admitSubprocess)
       : api.machineSyncClient(machine, deviceKeys, deviceEnrollment ?? undefined, initialDaemonState);
     if (standaloneWindows) apiMachine.setWindowsStandaloneTrial();
     startDifficultyRoutingMetadataPoll({

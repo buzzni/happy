@@ -278,6 +278,12 @@ export function createUnfencedSubprocessAdmission(input: { home: string; bootId?
   };
 }
 
+/** Host port shared by daemon and manual session RPCs. The record outlives the process call. */
+export function createSubprocessWriteAdmission(input: { home: string }) {
+  const admit = createUnfencedSubprocessAdmission(input);
+  return (roots: readonly string[]): Promise<void> => admit(roots, async () => undefined);
+}
+
 /** Reserve before a legacy occurrence is claimed. finish is a handoff: every submitted producer
  * must already be covered by its native runtime owner or a durable unfenced subprocess record. */
 export function createLegacyDispatchAdmission(input: { home: string; bootId?: string | null }) {

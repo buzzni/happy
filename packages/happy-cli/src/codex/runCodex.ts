@@ -7,7 +7,7 @@ import type { StandaloneLaunchBootstrap } from '../daemon/standaloneLaunchProtoc
 import { RuntimeProducerGate } from '../sessionDrain/runtimeProducerGate';
 import { createLessonProposalTurn } from '@/utils/lessonProposalTurn';
 import { reportAutomationContextExit, type AutomationContextExitEvidence } from '@/utils/automationContextExit';
-import { createFilesystemWriteAdmission } from '@/utils/workspaceTurnAdmission';
+import { createFilesystemWriteAdmission, createSubprocessWriteAdmission } from '@/utils/workspaceTurnAdmission';
 import { takeWorkspaceContextControl } from '@/utils/workspaceContextControl';
 import { CodexAuthRecovery } from './codexAuthRecovery';
 import { render } from "ink";
@@ -477,6 +477,10 @@ export async function runCodex(opts: {
     let runtimeGate: RuntimeProducerGate | undefined;
     const automationExecution = response !== null && isAutomationExecutionSessionId(response.id);
     const filesystemAdmission = workspaceControl ? createFilesystemWriteAdmission({ home: configuration.happyHomeDir }) : undefined;
+    const subprocessAdmission = workspaceControl ? createSubprocessWriteAdmission({ home: configuration.happyHomeDir }) : undefined;
+    const admitSubprocess = subprocessAdmission ? (roots: readonly string[]) => runtimeGate
+        ? runtimeGate.admit(() => subprocessAdmission(roots), 'writer')
+        : Promise.reject(new Error('Runtime input is not open')) : undefined;
     // No interactive file editor belongs to this internal run; legacy RPC paths can escape via symlinks.
     const withFilesystemMutation = automationExecution ? <T,>(_operation: () => Promise<T>): Promise<T> =>
         Promise.reject(new Error('AUTOMATION_FILESYSTEM_RPC_UNSUPPORTED'))
@@ -505,6 +509,7 @@ export async function runCodex(opts: {
         response,
         sessionOptions: standaloneLaunch || workspaceControl || automationExecution ? {
             trackShutdownStorage: true, ...(withFilesystemMutation ? { withFilesystemMutation } : {}),
+            ...(admitSubprocess ? { admitSubprocess } : {}),
         } : undefined,
         onSessionSwap: (newSession) => {
             session = newSession;
