@@ -42,7 +42,7 @@ import {
     MACHINE_RESOURCE_METRICS_RPC,
     createMachineResourceService,
 } from '@/daemon/machineResourceService';
-import { AI_AUTH_SELECTION_CAPABILITY, parseAiAuthSelection, withDefaultSaycodeAgentGrant } from '@/daemon/sessionEnv';
+import { AI_AUTH_SELECTION_CAPABILITY, parseAiAuthSelection } from '@/daemon/sessionEnv';
 import { agentPlanCapabilityForPlatform, parseAgentPlanSpawnParam } from '@/daemon/agentPlanGrantEnvelope';
 import { parseResumeAuthRequirement, type ResumeAuthRequirement } from '@/daemon/resumeSetupTokenRebind';
 import { parseOutputFormat, STRUCTURED_OUTPUT_CAPABILITY } from '@/claude/structuredOutput';
@@ -1454,7 +1454,8 @@ export class ApiMachineClient {
                 agent,
                 model,
                 effort,
-                environmentVariables: withDefaultSaycodeAgentGrant(environmentVariables, directory),
+                environmentVariables,
+                seedDefaultAgentGrant: true,
                 additionalDirectories: validAdditionalDirectories,
                 token,
                 happyToken,

@@ -10,6 +10,7 @@ import { z } from 'zod';
 import { OwnershipCallerBindingSchema, ownershipId } from '@slopus/happy-wire';
 import type { TrackedSession } from './types';
 import { readTrustedStudioOrigin } from './setupTokenBindingProof';
+import { DAEMON_AGENT_GRANT_STATE_ENV } from './sessionEnv';
 
 type Caller = z.infer<typeof OwnershipCallerBindingSchema>;
 type Identity = { machineId: string; happyAccountId: string; epoch: string };
@@ -98,7 +99,10 @@ export function createAgentCallerLaunches(deps: {
             const owned = input.owned && input.owned !== 'unknown' ? input.owned : undefined;
             // An agent grant's scope and depth come from the spawn request; the daemon has no lineage for them.
             // An owned child's come from the daemon's own journal, so they replace both (H3).
-            const depth = owned ? owned.depth : input.owned === 'unknown' || input.agentEnvironment?.SAYCODE_AGENT_ENV === '1' ? null : 0;
+            // Only a daemon-seeded root retains the original top-level launch provenance across resume.
+            const requestedGrant = input.agentEnvironment?.SAYCODE_AGENT_ENV === '1'
+                && input.agentEnvironment[DAEMON_AGENT_GRANT_STATE_ENV] !== 'root';
+            const depth = owned ? owned.depth : input.owned === 'unknown' || requestedGrant ? null : 0;
             let index = -1;
             return {
                 stdio(base: StdioOptions) {

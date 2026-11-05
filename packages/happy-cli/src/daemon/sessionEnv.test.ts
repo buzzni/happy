@@ -6,6 +6,7 @@ import {
     buildSessionSpawnEnvironment,
     buildSessionRequesterEnv,
     captureSaycodeAgentEnvironment,
+    DAEMON_AGENT_GRANT_STATE_ENV,
     stripManagedCredentialConflicts,
     applyAppliedAiAuthSourceEnv,
     overlayManagedCredentialEnvironment,
@@ -256,6 +257,7 @@ describe('buildSpawnRequestEnvironment', () => {
         })).toEqual({
             HAPPY_HOME_DIR: '/trusted/home',
             PROJECT_TOKEN: 'project-token',
+            [DAEMON_AGENT_GRANT_STATE_ENV]: 'rejected',
         })
     })
 
@@ -952,6 +954,41 @@ describe('organization agent plan resume record (aplus specs/org-agent-plan §6.
 })
 
 describe('buildResumedSessionSpawnEnvironment agent capability', () => {
+    it('does not accept root provenance from requested, inherited or resume-request environments', () => {
+        const requested = { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/project', SAYCODE_AGENT_DEPTH: '0',
+            [DAEMON_AGENT_GRANT_STATE_ENV]: 'root' };
+        const spawned = buildSpawnRequestEnvironment({}, requested, { defaultAgentRoot: '/project' });
+        expect(spawned).not.toHaveProperty(DAEMON_AGENT_GRANT_STATE_ENV);
+        const resumed = buildResumedSessionSpawnEnvironment({ inherited: requested, runtime: requested, automation: requested,
+            explicit: {}, agentEnvironment: captureSaycodeAgentEnvironment(spawned), sessionId: 'source', defaultAgentRoot: '/project' });
+        expect(resumed).not.toHaveProperty(DAEMON_AGENT_GRANT_STATE_ENV);
+        expect(buildSessionSpawnEnvironment(requested, {})).not.toHaveProperty(DAEMON_AGENT_GRANT_STATE_ENV);
+    });
+
+    it('keeps a valid capped child grant unchanged through capture and resume', () => {
+        const requested = { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/project', SAYCODE_AGENT_DEPTH: '2', SAYCODE_AGENT_MAX_SPAWN: '0' };
+        const captured = captureSaycodeAgentEnvironment(buildSpawnRequestEnvironment({}, requested, { defaultAgentRoot: '/project' }));
+        const resumed = buildResumedSessionSpawnEnvironment({ inherited: {}, explicit: {}, agentEnvironment: captured,
+            sessionId: 'source', defaultAgentRoot: '/project' });
+        expect(resumed).toMatchObject(requested);
+        expect(resumed).not.toHaveProperty(DAEMON_AGENT_GRANT_STATE_ENV);
+    });
+    it.each([
+        { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/project', SAYCODE_AGENT_DEPTH: '2', SAYCODE_AGENT_MAX_SPAWN: '0', SAYCODE_AGENT_SCOPE: '../bad' },
+        { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_DEPTH: '2' },
+        { SAYCODE_AGENT_ENV: '0' },
+    ])('keeps a rejected or disabled grant absent across repeated capture and resume: %j', requested => {
+        const spawned = buildSpawnRequestEnvironment({}, requested as Record<string, string>);
+        expect(spawned.SAYCODE_AGENT_ENV).toBeUndefined();
+        let captured = JSON.parse(JSON.stringify(captureSaycodeAgentEnvironment(spawned) ?? {}));
+        for (let i = 0; i < 2; i++) {
+            const resumed = buildResumedSessionSpawnEnvironment({ inherited: {}, explicit: {}, agentEnvironment: captured,
+                sessionId: 'source', defaultAgentRoot: '/project' });
+            expect(resumed.SAYCODE_AGENT_ENV).toBeUndefined();
+            expect(resumed.SAYCODE_AGENT_DEPTH).toBeUndefined();
+            captured = JSON.parse(JSON.stringify(captureSaycodeAgentEnvironment(resumed) ?? {}));
+        }
+    });
     // A session started without the grant (an old client) kept answering
     // not_agent_env after every resume: the resume only restores what was captured.
     it('gives a resumed session that never had a grant a root grant at its directory', () => {

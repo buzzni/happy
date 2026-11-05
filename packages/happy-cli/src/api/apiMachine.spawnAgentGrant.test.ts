@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { buildSpawnRequestEnvironment, DAEMON_AGENT_GRANT_STATE_ENV } from '../daemon/sessionEnv';
 
 function machineClient() {
     return { id: 'machine-1', encryptionKey: new Uint8Array(32), encryptionVariant: 'legacy' } as any;
@@ -15,7 +16,9 @@ async function spawnWith(params: Record<string, unknown>) {
         portRegistry: { allocate: () => undefined, get: () => undefined, release: () => undefined, list: () => [], sweep: () => undefined },
     } as any);
     await (client as any).rpcHandlerManager.handlers.get('machine-1:spawn-happy-session')(params);
-    return spawnSession.mock.calls[0][0].environmentVariables as Record<string, string> | undefined;
+    const options = spawnSession.mock.calls[0][0];
+    return buildSpawnRequestEnvironment({}, options.environmentVariables,
+        { defaultAgentRoot: options.seedDefaultAgentGrant ? options.directory : undefined });
 }
 
 describe('spawn-happy-session agent capability', () => {
@@ -56,7 +59,9 @@ describe('spawn-happy-session agent capability', () => {
         // A child whose grant fails validation must not come back as depth 0
         // with a new budget; the daemon drops the broken grant whole later.
         const requested = { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_DEPTH: '2' };
-        expect(await spawnWith({ directory: '/repo/app', environmentVariables: requested })).toEqual(requested);
+        expect(await spawnWith({ directory: '/repo/app', environmentVariables: requested })).toEqual({
+            [DAEMON_AGENT_GRANT_STATE_ENV]: 'rejected',
+        });
     });
 
     it('adds nothing when the directory is not absolute', async () => {

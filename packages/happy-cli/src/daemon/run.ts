@@ -2221,7 +2221,8 @@ export async function startDaemon(): Promise<void> {
         let extraEnv: Record<string, string> = injectMcpCallerGrant(
           stripManagedCredentialConflicts(
             buildSpawnRequestEnvironment(authEnv, options.environmentVariables,
-              { allowPocBrowserTaskEnv: process.env.HAPPY_BROWSER_POC_REQUEST_ENV === '1' }),
+              { allowPocBrowserTaskEnv: process.env.HAPPY_BROWSER_POC_REQUEST_ENV === '1',
+                ...(options.seedDefaultAgentGrant ? { defaultAgentRoot: directory } : {}) }),
             managedAiCredentialEnvironment,
           ),
           mcpCallerGrant,

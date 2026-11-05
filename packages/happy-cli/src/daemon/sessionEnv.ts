@@ -51,6 +51,8 @@ const SAYCODE_AGENT_ENV_KEYS = [
 ] as const
 
 type SaycodeAgentEnvironmentKey = typeof SAYCODE_AGENT_ENV_KEYS[number]
+/** Daemon-written provenance/rejection state, never admitted from a request or inherited by another session. */
+export const DAEMON_AGENT_GRANT_STATE_ENV = 'HAPPY_DAEMON_AGENT_GRANT_STATE'
 const CHECKPOINT_CONTEXT_KEY = CHECKPOINT_SPAWN_CONTEXT_ENV_KEY
 /** Set from the spawn option `browserContinuation` only (request environment cannot carry HAPPY_AUTOMATION_*). */
 export const BROWSER_CONTINUATION_ENV = 'HAPPY_AUTOMATION_BROWSER_CONTINUATION'
@@ -64,7 +66,7 @@ const AGENT_PLAN_SEED_KEYS = [AGENT_PLAN_DESCRIPTOR_ENV, AGENT_PLAN_SECRET_ENV, 
 type AgentPlanSeedKey = typeof AGENT_PLAN_SEED_KEYS[number]
 type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV | AgentPlanSeedKey
 
-export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey, string>>
+export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey | typeof DAEMON_AGENT_GRANT_STATE_ENV, string>>
 
 /**
  * Who asked for one spawn: requester identity (specs/session-created-by) and source
@@ -147,12 +149,15 @@ function readRequestedSaycodeAgentGrant(
  * seed or a capped hub keeps its own values and a broken grant is still dropped
  * whole instead of coming back as a fresh depth-0 budget. The scope stays at
  * the directory and MAX_SPAWN is left to the machine-capacity tier.
+ * Call only with daemon-owned captured state, or after request validation: the
+ * root marker is trusted provenance and must never be copied from request env.
  */
 export function withDefaultSaycodeAgentGrant<T extends Partial<Record<string, string>>>(
     requested: T | undefined,
     directory: unknown,
     newAgentId: () => string = () => `ac-${randomBytes(8).toString('hex')}`,
 ): T | undefined {
+    if (requested?.[DAEMON_AGENT_GRANT_STATE_ENV] !== undefined) return requested
     if (requested && Object.entries(requested).some(([key, value]) => key.startsWith('SAYCODE_AGENT_') && value !== undefined)) return requested
     const root = typeof directory === 'string' ? directory.trim() : ''
     if (!DIRECTORY_VALUE.test(root)) return requested
@@ -163,6 +168,7 @@ export function withDefaultSaycodeAgentGrant<T extends Partial<Record<string, st
         SAYCODE_AGENT_ROOT: root,
         SAYCODE_AGENT_DEPTH: '0',
         SAYCODE_AGENT_ID: newAgentId(),
+        [DAEMON_AGENT_GRANT_STATE_ENV]: 'root',
     }
 }
 
@@ -221,8 +227,13 @@ function readRequestedDelegatedAttendance(requested: Record<string, string>): Re
 export function buildSpawnRequestEnvironment(
     auth: Record<string, string>,
     requested: Record<string, string> | undefined,
-    options: { allowPocBrowserTaskEnv?: boolean } = {},
+    options: { allowPocBrowserTaskEnv?: boolean; defaultAgentRoot?: string } = {},
 ): Record<string, string> {
+    const grant = readRequestedSaycodeAgentGrant(requested ?? {})
+    const hasRequestedGrant = Object.entries(requested ?? {}).some(([key, value]) => key.startsWith('SAYCODE_AGENT_') && value !== undefined)
+    const agentEnvironment = grant ?? (hasRequestedGrant
+        ? { [DAEMON_AGENT_GRANT_STATE_ENV]: 'rejected' }
+        : withDefaultSaycodeAgentGrant<SaycodeAgentEnvironment>(undefined, options.defaultAgentRoot))
     const poc = options.allowPocBrowserTaskEnv
         ? Object.fromEntries(POC_BROWSER_TASK_REQUEST_KEYS.flatMap((key) => requested?.[key] === undefined ? [] : [[key, requested[key]]]))
         : {}
@@ -230,7 +241,7 @@ export function buildSpawnRequestEnvironment(
         ...sanitizeChildEnv(stripUnsafeRequestedEnvironment(requested ?? {})),
         ...poc,
         // The agent grant is re-admitted only after its own validation (paths and counts).
-        ...readRequestedSaycodeAgentGrant(requested ?? {}),
+        ...agentEnvironment,
         ...readRequestedDelegatedAttendance(requested ?? {}),
         ...auth,
         ...requestedInputEvidenceEnvironment(requested ?? {}),
@@ -280,6 +291,8 @@ export function captureSaycodeAgentEnvironment(
     env: NodeJS.ProcessEnv,
 ): SaycodeAgentEnvironment | undefined {
     const captured: SaycodeAgentEnvironment = {}
+    const grantState = env[DAEMON_AGENT_GRANT_STATE_ENV]
+    if (grantState === 'root' || grantState === 'rejected') captured[DAEMON_AGENT_GRANT_STATE_ENV] = grantState
     if (env[MANUAL_PERSONAL_ENV] !== undefined) captured[MANUAL_PERSONAL_ENV] = /^[a-f0-9]{64}$/.test(env[MANUAL_PERSONAL_ENV]!) ? env[MANUAL_PERSONAL_ENV] : ''
     if (env[INPUT_EVIDENCE_ENV] === '0' || env[INPUT_EVIDENCE_ENV] === '1') captured[INPUT_EVIDENCE_ENV] = env[INPUT_EVIDENCE_ENV]
     if (env.SAYCODE_AGENT_ENV === '1' && env.SAYCODE_AGENT_ROOT?.trim()) {
