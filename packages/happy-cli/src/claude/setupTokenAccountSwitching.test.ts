@@ -402,3 +402,21 @@ describe('switching for start budget', () => {
     expect(deps.rebind).not.toHaveBeenCalled()
   })
 })
+
+it('counts start-exhausted moves against the same five usage switches without auto-continuing an unstarted input',async()=>{
+ const {deps,switching}=setup()
+ for(let i=0;i<5;i++)expect(await switching.switchForExhaustedStart()).toBe(true)
+ expect(await switching.switchForExhaustedStart()).toBe(false)
+ expect(deps.notify).toHaveBeenLastCalledWith('This conversation reached its automatic switching limit. Check the organization Claude accounts before retrying.')
+ expect(deps.rebind).toHaveBeenCalledTimes(5)
+ expect(deps.rebind).toHaveBeenLastCalledWith('session-a','binding-a',undefined,expect.any(AbortSignal),{startExhausted:true})
+ switching.onRateLimitEvent(near)
+ expect(await switching.switchIfWanted()).toEqual({switched:false,continueAfter:false})
+ expect(deps.rebind).toHaveBeenCalledTimes(5)
+})
+it('does not retry a failed start-exhausted move in the background',async()=>{
+ const {deps,switching}=setup({rebind:vi.fn(async()=>({ok:false as const,reason:'NO_ACCOUNT'}))})
+ expect(await switching.switchForExhaustedStart()).toBe(false)
+ expect(deps.rebind).toHaveBeenCalledOnce()
+ switching.dispose()
+})

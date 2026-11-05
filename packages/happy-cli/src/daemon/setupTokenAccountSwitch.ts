@@ -62,7 +62,7 @@ export type SetupTokenAccountSwitchDeps = {
  * FORBIDDEN: Studio refuses this binding for good (PC reassigned, unknown binding); the session stops asking.
  * APPLY_REQUIRED: the account Studio would choose is not applied on this PC yet (specs/claude-setup-token-managed-sync R6).
  */
-export type SwitchFailure = 'NOT_BOUND' | 'STALE' | 'STUDIO_UNAVAILABLE' | 'NO_ACCOUNT' | 'APPLY_REQUIRED' | 'FORBIDDEN' | 'REQUEST_FAILED' | 'BINDING_REJECTED' | 'PERSISTENCE_FAILED' | 'PERSISTENCE_INDETERMINATE' | 'STUDIO_BUDGET' | 'UNSUPPORTED' | 'ROTATION_LIMIT'
+export type SwitchFailure = 'NOT_BOUND' | 'STALE' | 'STUDIO_UNAVAILABLE' | 'NO_ACCOUNT' | 'APPLY_REQUIRED' | 'FORBIDDEN' | 'REQUEST_FAILED' | 'BINDING_REJECTED' | 'PERSISTENCE_FAILED' | 'PERSISTENCE_INDETERMINATE' | 'STUDIO_BUDGET' | 'UNSUPPORTED' | 'ROTATION_LIMIT' | 'START_ACCOUNT_EXHAUSTED'
 
 const REQUEST_TIMEOUT_MS = 15_000
 /** Studio asks for at most this many checks per switch (its MAX_PROBES_PER_SWITCH); a further ask is not followed. */
@@ -160,7 +160,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
   }
 
   const selectionRequests = new Map<string, {id:string; expiresAt:number}>()
-  async function rebindOnce(sessionId: string, running: string, confirmedOnly = false, organizationFailure?: { kind: 'authentication'; observedAt: number }, startBudget = false): Promise<RebindResult> {
+  async function rebindOnce(sessionId: string, running: string, confirmedOnly = false, organizationFailure?: { kind: 'authentication'; observedAt: number }, startBudget = false, startExhausted = false): Promise<RebindResult> {
     const bound = boundSession(deps, sessionId, running)
     if (!bound) return failure('NOT_BOUND', `rebind: no binding recorded for session ${sessionId}`)
     const { session, recorded } = bound
@@ -203,7 +203,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       while (true) {
         response = await post(confirmedOnly ? 'return' : 'rebind', { ...proof, ...(selectionRequestId ? { selectionRequestId } : {}),
           ...(tokenProof ? { credentialProofVersion: 1 } : {}), ...(organizationFailure ? { organizationFailure } : {}), ...(measured ? { measureVersion: 1, measured: [...measured] } : {}),
-          ...(startBudget ? { startBudget: true } : {}) })
+          ...(startBudget ? { startBudget: true } : {}), ...(startExhausted ? { startExhausted: true } : {}) })
         body = await response.json().catch(() => null) as Record<string, unknown> | null
         // A Studio from before candidate checks refuses the fields it does not know: ask again as before, once.
         if (response.status === 400 && (measured || selectionRequestId)) {
@@ -300,7 +300,11 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       try {
         signal?.throwIfAborted()
         const response = await post('start', { machineId: deps.machineId, sessionId, companyId: binding.companyId, bindingNonce: binding.nonce, requestId })
-        if (!response.ok) return failure(refusal(response.status), 'start refused')
+        if (!response.ok) {
+          const body = await response.json().catch(() => null) as { error?: unknown } | null
+          const code = typeof body?.error === 'string' && /^SETUP_TOKEN_DAEMON_[A-Z_]+$/.test(body.error) ? body.error : 'UNKNOWN'
+          return failure(response.status === 409 && code === 'SETUP_TOKEN_DAEMON_START_ACCOUNT_EXHAUSTED' ? 'START_ACCOUNT_EXHAUSTED' : refusal(response.status), `start refused: HTTP ${response.status} ${code}`)
+        }
         return { ok: true as const, admission: await response.json() }
       } catch { return failure('REQUEST_FAILED', 'start unavailable') }
     },
@@ -408,22 +412,22 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       }
     },
     /** One switch per session at a time; a second request while one runs gets that one's answer. */
-    rebind(sessionId: string, running: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal, options: { startBudget?: true } = {}): Promise<RebindResult> {
+    rebind(sessionId: string, running: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal, options: { startBudget?: true; startExhausted?: true } = {}): Promise<RebindResult> {
       const shared = sharedSession(sessionId, running)
       if (shared === undefined) return Promise.resolve(failure('NOT_BOUND', `rebind: session ${sessionId} is not an unbound shared-PC session`))
       const parsed = parseBinding(running)
       // An unbound shared-PC session moves without Studio, which alone knows start budget: it keeps waiting.
-      if (options.startBudget && (shared || !parsed)) return Promise.resolve({ ok: false as const, reason: 'UNSUPPORTED' as const })
+      if ((options.startBudget || options.startExhausted) && (shared || !parsed)) return Promise.resolve({ ok: false as const, reason: 'UNSUPPORTED' as const })
       if (parsed && isMachineSetupTokenBinding(parsed.binding)) {
         const binding = parsed.binding
         return Promise.resolve(deps.machineRuntime?.(binding.companyId)).then(runtime => runtime
-          ? (options.startBudget ? runtime.rebind(sessionId, running, observation, signal, options) : runtime.rebind(sessionId, running, observation, signal))
+          ? (options.startBudget || options.startExhausted ? runtime.rebind(sessionId, running, observation, signal, options) : runtime.rebind(sessionId, running, observation, signal))
             .then(environment => ({ ok: true as const, environment }), machineFailure)
           : failure('STUDIO_UNAVAILABLE', 'machine runtime absent'), machineFailure)
       }
       const pending = inFlight.get(sessionId)
       if (pending) return pending
-      const started = (shared ? sharedRebindOnce(sessionId, shared, observation) : rebindOnce(sessionId, running, false, observation?.reason === 'authentication-failed' ? { kind: 'authentication', observedAt: observation.observedAt } : undefined, !!options.startBudget)).finally(() => inFlight.delete(sessionId))
+      const started = (shared ? sharedRebindOnce(sessionId, shared, observation) : rebindOnce(sessionId, running, false, observation?.reason === 'authentication-failed' ? { kind: 'authentication', observedAt: observation.observedAt } : undefined, !!options.startBudget, !!options.startExhausted)).finally(() => inFlight.delete(sessionId))
       inFlight.set(sessionId, started)
       return started
     },
