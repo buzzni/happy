@@ -196,6 +196,20 @@ describe('ApiMachineClient machine RPC server lane', () => {
         expect(registeredCommonHandlers.mock.calls.at(-1)![2].admitSubprocess).toBeUndefined();
     });
 
+    it('applies host admission to a machine start-server RPC before detached spawn', async () => {
+        const directory = await mkdtemp(join(tmpdir(), 'machine-server-admission-'));
+        const admitSubprocess = vi.fn(async () => { throw new Error('WORKSPACE_BUSY'); });
+        try {
+            const client = Reflect.construct(ApiMachineClient, ['fake-token', makeMachine(), undefined, undefined, null, undefined, admitSubprocess]);
+            client.setRPCHandlers({ spawnSession: vi.fn(), stopSession: vi.fn(() => ({ stopped: true as const })),
+                requestShutdown: vi.fn(), portRegistry: {} as any, aiCredentialRuntime: {} as any });
+            const handler = (client as any).rpcHandlerManager.registerHandler.mock.calls.find(([name]: [string]) => name === 'start-server')[1];
+            const result = await handler({ command: 'node -v', cwd: directory });
+            expect(admitSubprocess).toHaveBeenCalledWith([directory]);
+            expect(result).toEqual({ type: 'error', code: 'WORKSPACE_UNAVAILABLE', message: 'WORKSPACE_BUSY' });
+        } finally { await rm(directory, { recursive: true, force: true }); }
+    });
+
     it('registers machine.run with the daemon-owned trusted profile registry and write policy', () => {
         registeredCommonHandlers.mockClear();
         new ApiMachineClient('fake-token', makeMachine());

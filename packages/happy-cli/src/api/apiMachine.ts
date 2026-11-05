@@ -974,7 +974,7 @@ export class ApiMachineClient {
         private readonly deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>,
         processState: DaemonState | null = machine.daemonState,
         withFilesystemMutation?: CommonHandlerOptions['withFilesystemMutation'],
-        admitSubprocess?: CommonHandlerOptions['admitSubprocess'],
+        private readonly admitSubprocess?: CommonHandlerOptions['admitSubprocess'],
     ) {
         this.setupTokenAssignmentRecipient = createSetupTokenAssignmentRecipient(deviceKeys?.recipient.secretKey);
         this.processState = Object.freeze({
@@ -2142,6 +2142,7 @@ export class ApiMachineClient {
                     { command, cwd, env },
                     {
                         fastFailDelayMs: 50,
+                        ...(this.admitSubprocess ? { admitSubprocess: this.admitSubprocess } : {}),
                         onSpawn: (child) => {
                             if (child.pid) {
                                 spawnedServers.set(child.pid, child);
