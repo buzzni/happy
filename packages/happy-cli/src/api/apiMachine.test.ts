@@ -153,12 +153,16 @@ describe('ApiMachineClient machine RPC server lane', () => {
         expect(registeredCommonHandlers).toHaveBeenCalledWith(
             expect.anything(),
             expect.any(String),
-            { machineRun: {
-                profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
-                writeScopePolicy: { acquire: expect.any(Function) },
-                managedTools: { root: expect.stringMatching(/managed-tools$/), tools: [MOAI_MANAGED_TOOL] },
-                allowToolInstall: true,
-            } },
+            {
+                // aplus-dev-studio specs/approved-folder-roots — folders the machine owner approved beside home.
+                approvedRoots: expect.any(Function),
+                machineRun: {
+                    profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
+                    writeScopePolicy: { acquire: expect.any(Function) },
+                    managedTools: { root: expect.stringMatching(/managed-tools$/), tools: [MOAI_MANAGED_TOOL] },
+                    allowToolInstall: true,
+                },
+            },
         );
     });
 
@@ -657,6 +661,63 @@ describe('ApiMachineClient socket reconnection', () => {
             const entry = getDaemonTerminalSession(sessionId)!;
             expect(entry.output.lastSeq()).toBe(1);
             expect(entry.output.bufferedChars()).toBeGreaterThan(0);
+        });
+    });
+
+    /*
+     * aplus-dev-studio specs/approved-folder-roots — a project imported from a folder the machine owner approved
+     * outside home opens its terminal there; once revoked, the same request falls back to home with the banner.
+     */
+    describeUnix('terminal-open-fwd in an approved folder outside home', () => {
+        const sessionIds = ['approved-cwd-1', 'approved-cwd-2'];
+        let outside: string;
+
+        beforeEach(async () => {
+            const { mkdtemp } = await import('node:fs/promises');
+            const { tmpdir } = await import('node:os');
+            outside = await mkdtemp(join(tmpdir(), 'happy-approved-terminal-'));
+        });
+        afterEach(async () => {
+            const { rm } = await import('node:fs/promises');
+            for (const id of sessionIds) removeDaemonTerminalSession(id);
+            await rm(join(configuration.happyHomeDir, 'approved-folders.json'), { force: true });
+            await rm(outside, { recursive: true, force: true });
+        });
+
+        const openAndRead = async (machine: Machine, sessionId: string) => {
+            const params = encodeBase64(encrypt(machine.encryptionKey, machine.encryptionVariant, {
+                userId: 'u1', cwd: outside, shell: '/bin/sh', args: ['-c', 'printf "pwd=%s" "$PWD"'],
+            }));
+            mockSocket.emit.mockClear();
+            const ack = await new Promise<any>((resolve) => emitSocketEvent('terminal-open-fwd', { sessionId, params }, resolve));
+            expect(ack.ok).toBe(true);
+            await vi.waitFor(() => expect(getDaemonTerminalSession(sessionId)?.exit).toBeTruthy(), { timeout: 5000 });
+            mockSocket.emit.mockClear();
+            emitSocketEvent('terminal-resume-fwd', { sessionId, afterSeq: 0 });
+            return mockSocket.emit.mock.calls
+                .filter(([name]: [string]) => name === 'terminal-frame')
+                .map(([, frame]: [string, any]) => decrypt(machine.encryptionKey, machine.encryptionVariant, decodeBase64(frame.data)))
+                .join('');
+        };
+
+        it('starts in the approved folder and falls back to home after revocation', async () => {
+            const { mkdir, writeFile } = await import('node:fs/promises');
+            const { basename } = await import('node:path');
+            await mkdir(configuration.happyHomeDir, { recursive: true });
+            await writeFile(join(configuration.happyHomeDir, 'approved-folders.json'), JSON.stringify({ version: 1, folders: [outside] }));
+            const machine = makeMachine();
+            const client = new ApiMachineClient('fake-token', machine);
+            client.connect();
+
+            const approved = await openAndRead(machine, sessionIds[0]);
+            expect(approved).toContain(`pwd=`);
+            expect(approved).toContain(basename(outside));
+            expect(approved).not.toContain('[info]');
+
+            await writeFile(join(configuration.happyHomeDir, 'approved-folders.json'), JSON.stringify({ version: 1, folders: [] }));
+            const revoked = await openAndRead(machine, sessionIds[1]);
+            expect(revoked).toContain('[info]');
+            expect(revoked).not.toContain(`pwd=${outside}`);
         });
     });
 
