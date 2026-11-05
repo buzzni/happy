@@ -66,8 +66,7 @@ export async function recordAutomationExecutionExit(accountId: string, raw: unkn
   });
 }
 
-/** Registration does not start a provider. The caller must reconcile its durable launch receipt. */
-export async function createAutomationExecutionSession(accountId: string, bearer: string, raw: unknown,
+async function prepareAutomationExecutionAdmission(accountId: string, bearer: string, raw: unknown,
   options: { secret?: string; now?: Date } = {}) {
   const parsed = automationExecutionSessionRequestSchema.safeParse(raw);
   if (!parsed.success) throw new AutomationExecutionSessionError(400, 'Invalid automation execution session request');
@@ -118,6 +117,15 @@ export async function createAutomationExecutionSession(accountId: string, bearer
       || (run.executionSeedMetadata && run.executionSeedMetadata !== input.body.metadata)) return conflict();
     return { run, target };
   }
+
+  return { input, sessionId, bodyHash, claimTokenHash, clock, checkTarget, authorize };
+}
+
+/** Registration does not start a provider. The caller must reconcile its durable launch receipt. */
+export async function createAutomationExecutionSession(accountId: string, bearer: string, raw: unknown,
+  options: { secret?: string; now?: Date } = {}) {
+  const { input, sessionId, bodyHash, claimTokenHash, clock, checkTarget, authorize } =
+    await prepareAutomationExecutionAdmission(accountId, bearer, raw, options);
 
   async function bind(tx: Prisma.TransactionClient, registeredSessionId: string) {
     const { run } = await authorize(tx);
