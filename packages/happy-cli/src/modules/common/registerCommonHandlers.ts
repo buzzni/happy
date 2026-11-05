@@ -583,6 +583,7 @@ export interface CommonHandlerOptions {
 
 export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, workingDirectory: string, options: CommonHandlerOptions = {}) {
     const downloadDirectories = createWorkspaceDownloadDirectoryReader();
+    const checkPath = (path: string) => validatePath(path, workingDirectory);
     rpcHandlerManager.registerHandler('file-discovery', (request: unknown) => fileDiscovery(workingDirectory, request));
     const bashScheduler = createBashRpcScheduler();
     const bashEnvBoundary = options.childEnvBoundary ?? 'session';
@@ -651,7 +652,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         // Special case: "/" means "use shell's default cwd" (used by CLI detection)
         // Security: Still validate all other paths to prevent directory traversal
         if (data.cwd && data.cwd !== '/') {
-            const validation = validatePath(data.cwd, workingDirectory);
+            const validation = checkPath(data.cwd);
             if (!validation.valid) {
                 return { success: false, error: validation.error };
             }
@@ -759,7 +760,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         logger.debug('Read file request:', data.path);
 
         // Validate path is within working directory
-        const validation = validatePath(data.path, workingDirectory);
+        const validation = checkPath(data.path);
         if (!validation.valid) {
             return { success: false, error: validation.error };
         }
@@ -775,7 +776,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
     });
 
     rpcHandlerManager.registerHandler<ReadFileChunkRequest, ReadFileChunkResponse>('readFileChunk', async (data) => {
-        const validation = validatePath(data.path, workingDirectory);
+        const validation = checkPath(data.path);
         if (!validation.valid) {
             return { success: false, error: validation.error };
         }
@@ -821,7 +822,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         logger.debug('Write file request:', data.path);
 
         // Validate path is within working directory
-        const validation = validatePath(data.path, workingDirectory);
+        const validation = checkPath(data.path);
         if (!validation.valid) {
             return { success: false, error: validation.error };
         }
@@ -920,7 +921,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         logger.debug('List directory request:', data.path);
 
         // Validate path is within working directory
-        const validation = validatePath(data.path, workingDirectory);
+        const validation = checkPath(data.path);
         if (!validation.valid) {
             return { success: false, error: validation.error };
         }
@@ -979,7 +980,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         logger.debug('Rename file request:', data.path, 'newName:', data.newName);
 
         // Validate original path is within working directory
-        const validation = validatePath(data.path, workingDirectory);
+        const validation = checkPath(data.path);
         if (!validation.valid) {
             return { success: false, error: validation.error };
         }
@@ -1001,7 +1002,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             const newPath = join(dirname(validation.resolvedPath!), trimmedName);
 
             // Validate new path is within working directory
-            const newValidation = validatePath(newPath, workingDirectory);
+            const newValidation = checkPath(newPath);
             if (!newValidation.valid) {
                 return { success: false, error: newValidation.error };
             }
@@ -1032,7 +1033,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         logger.debug('Delete file request:', data.path);
 
         // Validate path is within working directory
-        const validation = validatePath(data.path, workingDirectory);
+        const validation = checkPath(data.path);
         if (!validation.valid) {
             return { success: false, error: validation.error };
         }
@@ -1058,7 +1059,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         logger.debug('Copy file request:', data.path, 'newName:', data.newName);
 
         // Validate source path is within working directory
-        const validation = validatePath(data.path, workingDirectory);
+        const validation = checkPath(data.path);
         if (!validation.valid) {
             return { success: false, error: validation.error };
         }
@@ -1084,7 +1085,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
                 targetPath = join(dirname(validation.resolvedPath!), trimmedName);
 
                 // Validate new path is within working directory
-                const newValidation = validatePath(targetPath, workingDirectory);
+                const newValidation = checkPath(targetPath);
                 if (!newValidation.valid) {
                     return { success: false, error: newValidation.error };
                 }
@@ -1139,7 +1140,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
                 targetPath = candidatePath;
 
                 // Validate new path is within working directory
-                const newValidation = validatePath(targetPath, workingDirectory);
+                const newValidation = checkPath(targetPath);
                 if (!newValidation.valid) {
                     return { success: false, error: newValidation.error };
                 }
@@ -1174,7 +1175,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         logger.debug('Get directory tree request:', data.path, 'maxDepth:', data.maxDepth);
 
         // Validate path is within working directory
-        const validation = validatePath(data.path, workingDirectory);
+        const validation = checkPath(data.path);
         if (!validation.valid) {
             return { success: false, error: validation.error };
         }
@@ -1300,7 +1301,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
     // (aplus-dev-studio specs/remote-file-list-pages). Stateless: a page resumes after
     // the cursor in walkWorkspace order.
     rpcHandlerManager.registerHandler<ListFilesPageRequest, ListFilesPageResponse>('listFilesPage', async (data) => {
-        const validation = validatePath(data.path, workingDirectory);
+        const validation = checkPath(data.path);
         if (!validation.valid) {
             return { success: false, error: validation.error };
         }
@@ -1359,7 +1360,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
 
         // Validate cwd if provided
         if (data.cwd) {
-            const validation = validatePath(data.cwd, workingDirectory);
+            const validation = checkPath(data.cwd);
             if (!validation.valid) {
                 return { success: false, error: validation.error };
             }
@@ -1389,7 +1390,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
 
         // Validate cwd if provided
         if (data.cwd) {
-            const validation = validatePath(data.cwd, workingDirectory);
+            const validation = checkPath(data.cwd);
             if (!validation.valid) {
                 return { success: false, error: validation.error };
             }
