@@ -1151,43 +1151,6 @@ async function requirePinnedOrigin(pins: WorkspaceRemotePins, dir: string, remot
     }
 }
 
-/** A path or `file://` address: git reads it on this machine, so a credential goes nowhere. */
-function isLocalAddress(address: string): boolean {
-    if (/^file:\/\//i.test(address) || /^[a-z]:[\\/]/i.test(address)) return true;
-    if (address.includes('://')) return false;
-    const colon = address.indexOf(':');
-    const slash = address.search(/[\\/]/);
-    return colon === -1 || (slash !== -1 && slash < colon);
-}
-
-/**
- * Where a sealed credential goes for `remoteUrl`: the address after this machine's `insteadOf` (and, for
- * a push, `pushInsteadOf`) rewrites, read as the network command reads them. Checking `origin` does not
- * cover it: an SSH `origin` is not rewritten by a rule for the HTTPS address.
- */
-async function requireSignedAddress(dir: string, remoteUrl: string, push: boolean): Promise<void> {
-    const fetchUrl = await runGit(dir, ['ls-remote', '--get-url', remoteUrl], { network: true });
-    const addresses = [fetchUrl.stdout.trim()];
-    if (push) {
-        const rules = await runGit(dir, ['config', '--get-regexp', '^url\\..*\\.pushinsteadof$'], { network: true });
-        for (const line of rules.stdout.split('\n')) {
-            const match = /^url\.(.+)\.pushinsteadof (.+)$/i.exec(line.trim());
-            if (match && remoteUrl.startsWith(match[2]!)) addresses.push(match[1]! + remoteUrl.slice(match[2]!.length));
-        }
-    }
-    const wanted = repositoryIdentity(remoteUrl);
-    if (fetchUrl.code !== 0 || addresses.some((address) => !isLocalAddress(address) && repositoryIdentity(address) !== wanted)) {
-        throw new OpFailure('WORKTREE_REMOTE_MISMATCH', '이 머신의 git 설정이 온라인 저장소 주소를 다른 저장소로 바꿉니다.');
-    }
-}
-
-/** With a sealed credential, the server's address once checked; otherwise `origin` and this machine's own login. */
-async function workspaceRemote(dir: string, remoteUrl: string | null, credential: PreparedGitCredential | null, push: boolean): Promise<string> {
-    if (!credential || !remoteUrl) return 'origin';
-    await requireSignedAddress(dir, remoteUrl, push);
-    return remoteUrl;
-}
-
 /** The folder is a repository's root, not a folder inside some repository around it. */
 async function isRepositoryRoot(dir: string): Promise<boolean> {
     return await repositoryRoot(dir) === slashed(dir);
@@ -1219,7 +1182,7 @@ async function workspaceRemoteStatus(
     return serialized(dir, async () => {
         if (!await isRepositoryRoot(dir)) return { isRepo: false, head: null, branch: null, dirtyCount: 0, ahead: null, behind: null, baseBehind: null };
         await requirePinnedOrigin(pins, dir, params.remoteUrl);
-        const remote = await workspaceRemote(dir, params.remoteUrl, credential, false);
+        const remote = credential && params.remoteUrl ? params.remoteUrl : 'origin';
         const online = await fetchBranch(dir, remote, params.branch, credential, true);
         const base = params.baseBranch ? await fetchBranch(dir, remote, params.baseBranch, credential, true) : null;
         const head = await headCommit(dir);
@@ -1240,7 +1203,6 @@ async function workspaceRemoteStatus(
 async function fastForwardWorkspace(
     dir: string,
     params: WorktreeOpParams<'pull-remote'>,
-    remote: string,
     targets: string[],
     head: string | null,
     credential: PreparedGitCredential | null,
@@ -1254,7 +1216,7 @@ async function fastForwardWorkspace(
         if ((await runGit(dir, ['merge', '--ff-only', target])).code !== 0) return { status: 'diverged', head: await headCommit(dir), conflictCount: 0 };
     }
     if (params.push) {
-        const pushed = await runGit(dir, ['push', remote, `refs/heads/${params.branch}:refs/heads/${params.branch}`], {
+        const pushed = await runGit(dir, ['push', 'origin', `refs/heads/${params.branch}:refs/heads/${params.branch}`], {
             network: true, credential, timeoutMs: NETWORK_TIMEOUT_MS,
         });
         if (pushed.code !== 0) {
@@ -1301,11 +1263,11 @@ async function pullWorkspaceRemote(
         // A conflict an earlier pull left is the user's to resolve: committing it would save the markers.
         const unresolved = await unmergedPaths(dir);
         if (unresolved.length > 0) return { status: 'conflict', head, conflictCount: unresolved.length };
-        const remote = await workspaceRemote(dir, params.remoteUrl, credential, params.mode === 'ff-only' && params.push);
+        const remote = credential && params.remoteUrl ? params.remoteUrl : 'origin';
         const targets = [(await fetchBranch(dir, remote, params.branch, credential, false))!];
         if (params.baseBranch) targets.push((await fetchBranch(dir, remote, params.baseBranch, credential, false))!);
         return params.mode === 'ff-only'
-            ? fastForwardWorkspace(dir, params, remote, targets, head, credential)
+            ? fastForwardWorkspace(dir, params, targets, head, credential)
             : mergeIntoWorkspace(dir, params, targets);
     });
 }
