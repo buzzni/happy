@@ -349,7 +349,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     await desktopLogin?.check()
     const production = config?.authMode === 'production'
     const native: NativeRuntime | undefined = config?.nativeService ? await bootstrapMacNativeRuntime(config, stateDir)
-        : config?.personalDesktop ? await bootstrapPersonalDesktopRuntime(config, stateDir, { deferBrowser: true }) : undefined
+        : config?.personalDesktop ? await bootstrapPersonalDesktopRuntime(config, stateDir) : undefined
     const nativeSockets = native?.sockets
     // Secrets the runtime UID may not be able to read are read before dropping root.
     const vncPassword = loadVncPassword()

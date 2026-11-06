@@ -57,13 +57,13 @@ describe.skipIf(process.platform !== 'darwin')('personal desktop runtime on macO
         const paths = personalRuntimePaths('darwin', {}, home)
         let browser: PersonalBrowser | undefined
         const runtime = await bootstrapPersonalDesktopRuntime(parseRuntimeConfig(configJson(1)), paths.stateDir, {
-            deferBrowser: true, env: { HOME: home, TMPDIR: process.env.TMPDIR, ABP_CONFIG_FILE: paths.configFile }, home,
+            env: { HOME: home, TMPDIR: process.env.TMPDIR, ABP_CONFIG_FILE: paths.configFile }, home,
             parent: new PassThrough(), launch: async options => browser = await launchPersonalBrowser(options),
         })
         try {
             await runtime.session.check()
             expect(profileProcesses(paths.profileDir)).toEqual([])
-            const [first, same] = await Promise.all([runtime.startBrowser!(), runtime.startBrowser!()])
+            const [first, same] = await Promise.all([runtime.startBrowser(), runtime.startBrowser()])
             expect(first).toBe(same)
             expect(profileProcesses(paths.profileDir).length).toBeGreaterThan(0)
             const firstInstance = first.driver.browserInstanceId()
@@ -73,7 +73,7 @@ describe.skipIf(process.platform !== 'darwin')('personal desktop runtime on macO
             await runtime.session.check()
             await new Promise(resolve => setTimeout(resolve, 1200))
             expect(profileProcesses(paths.profileDir)).toEqual([])
-            const second = await runtime.startBrowser!()
+            const second = await runtime.startBrowser()
             expect(second.driver.browserInstanceId()).not.toBe(firstInstance)
             expect(profileProcesses(paths.profileDir).length).toBeGreaterThan(0)
             await runtime.close()
@@ -89,6 +89,7 @@ describe.skipIf(process.platform !== 'darwin')('personal desktop runtime on macO
         const env = { HOME: home, TMPDIR: process.env.TMPDIR, ABP_CONFIG_FILE: paths.configFile, HAPPY_ACCESS_KEY: CANARY, ANTHROPIC_API_KEY: CANARY }
         const runtime = await bootstrapPersonalDesktopRuntime(parseRuntimeConfig(configJson(1)), paths.stateDir, { env, home, parent: new PassThrough() })
         try {
+            await runtime.startBrowser()
             const processes = profileProcesses(paths.profileDir)
             expect(processes.length).toBeGreaterThan(1)
             const pgid = processes[0].pgid

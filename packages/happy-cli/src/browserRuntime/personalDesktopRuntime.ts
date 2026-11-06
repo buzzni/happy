@@ -75,8 +75,6 @@ export async function verifyPersonalBrowserExecutable(platform: 'darwin' | 'win3
 }
 
 export interface PersonalDesktopRuntimeDependencies {
-    /** The personal runtime broker may start while Chrome remains cold. */
-    deferBrowser?: boolean
     platform?: NodeJS.Platform
     uid?: number
     env?: NodeJS.ProcessEnv
@@ -95,8 +93,8 @@ export interface PersonalDesktopRuntimeDependencies {
 
 export interface PersonalDesktopRuntime {
     session: NativeBrowserSession
-    startBrowser?(): Promise<NativeBrowserSession>
-    onBrowserStopped?(listener: () => Promise<void>): void
+    startBrowser(): Promise<NativeBrowserSession>
+    onBrowserStopped(listener: () => Promise<void>): void
     sockets: { broker: string; admin: string }
     onParentLost(listener: () => void): void
     close(): Promise<void>
@@ -128,7 +126,7 @@ export async function bootstrapPersonalDesktopRuntime(config: RuntimeConfig, sta
         let browser: PersonalBrowser | undefined
         try {
             // A later demand may follow a Chrome update. Recheck the exact executable.
-            if (dependencies.deferBrowser) await (dependencies.verifyExecutable ?? verifyPersonalBrowserExecutable)(platform, personal.browserExecutable, env)
+            await (dependencies.verifyExecutable ?? verifyPersonalBrowserExecutable)(platform, personal.browserExecutable, env)
             browser = await (dependencies.launch ?? launchPersonalBrowser)({ platform, executable: personal.browserExecutable, profileDir: paths.profileDir, env })
             const owner = (dependencies.readOwner ?? readNativeSessionOwner)(browser.pid)
             if (!owner) throw new Error('PERSONAL_BROWSER_EXITED')
@@ -140,8 +138,7 @@ export async function bootstrapPersonalDesktopRuntime(config: RuntimeConfig, sta
         }
     }
     try {
-        const demand = dependencies.deferBrowser ? createPersonalBrowserDemand(openBrowser) : undefined
-        const session = demand ?? await openBrowser()
+        const session = createPersonalBrowserDemand(openBrowser)
         let closing: Promise<void> | undefined
         const parentListeners: Array<() => void> = []
         const parent = dependencies.parent ?? process.stdin
@@ -152,7 +149,7 @@ export async function bootstrapPersonalDesktopRuntime(config: RuntimeConfig, sta
         parent.once('error', lose)
         parent.resume()
         return { session, sockets: { broker: paths.brokerSocket, admin: paths.adminSocket },
-            ...(demand ? { startBrowser: demand.start, onBrowserStopped: demand.onBrowserStopped } : {}),
+            startBrowser: session.start, onBrowserStopped: session.onBrowserStopped,
             onParentLost(listener) { if (parentLost) listener(); else parentListeners.push(listener) },
             close: () => closing ??= (async () => {
                 const result = await session.close()
