@@ -89,6 +89,7 @@ export async function restoreMissingManagedWorktree(input: {
     readBranchHint: () => Promise<string | null>;
     /** The daemon's record of an automation worktree it removed that contains `cwd`, if any. */
     findRemovedAutomationWorktree?: (cwd: string) => Promise<RemovedAutomationWorktree | null>;
+    admitSubprocess?: (roots: readonly string[]) => Promise<void>;
 }): Promise<MissingWorktreeRestoreResult> {
     const cwd = resolve(input.cwd);
     if (await exists(cwd)) return { kind: 'present' };
@@ -96,7 +97,7 @@ export async function restoreMissingManagedWorktree(input: {
     const marker = cwd.indexOf(MANAGED_SEGMENT);
     if (marker <= 0) {
         const removed = await input.findRemovedAutomationWorktree?.(cwd).catch(() => null);
-        return removed ? restoreRemovedAutomationWorktree(cwd, removed) : { kind: 'not-managed' };
+        return removed ? restoreRemovedAutomationWorktree(cwd, removed, input.admitSubprocess) : { kind: 'not-managed' };
     }
     const root = cwd.slice(0, marker);
     const managedRoot = join(root, '.aplus', 'worktrees');
@@ -118,6 +119,8 @@ export async function restoreMissingManagedWorktree(input: {
 
     // A worktree deleted without `git worktree remove` stays registered and
     // blocks `add`. Pruning only drops entries whose directory is gone.
+    try { await input.admitSubprocess?.([root]); }
+    catch (error) { return { kind: 'failed', reason: error instanceof Error ? error.message : 'WORKSPACE_UNAVAILABLE' }; }
     await git(root, ['worktree', 'prune']);
 
     const rawHint = (await input.readBranchHint().catch(() => null))?.trim() || null;
@@ -150,6 +153,7 @@ export async function restoreMissingManagedWorktree(input: {
 async function restoreRemovedAutomationWorktree(
     cwd: string,
     removed: RemovedAutomationWorktree,
+    admitSubprocess?: (roots: readonly string[]) => Promise<void>,
 ): Promise<MissingWorktreeRestoreResult> {
     const worktreePath = resolve(removed.worktreePath);
     const inside = relative(worktreePath, cwd);
@@ -167,6 +171,8 @@ async function restoreRemovedAutomationWorktree(
         return { kind: 'failed', reason: 'the commit the worktree had when removed is no longer in the repository' };
     }
 
+    try { await admitSubprocess?.([root]); }
+    catch (error) { return { kind: 'failed', reason: error instanceof Error ? error.message : 'WORKSPACE_UNAVAILABLE' }; }
     await git(root, ['worktree', 'prune']);
     const added = await git(root, ['worktree', 'add', '--detach', '--', worktreePath, removed.headSha]);
     if (!added.ok) return { kind: 'failed', reason: `worktree add failed: ${added.error}` };

@@ -263,6 +263,7 @@ import {
 import { runAutomationScript } from './automations/runAutomationScript';
 import { queryGithubPullRequestFiles, queryGithubPullRequests } from './automations/queryGithubPullRequests';
 import { queryGithubIssues } from './automations/queryGithubIssues';
+import { ensureAgentTaskReviewObjects } from './automations/agentTaskReviewObjects';
 import {
   isGithubTriggerWorktreeDirectoryInUse,
   prepareGithubTriggerWorktree,
@@ -1461,7 +1462,8 @@ export async function startDaemon(): Promise<void> {
       capture: captureAutonomousWorktreeFingerprint,
       runPhase: (phase, cwd, signal) => standaloneWindows
         ? Promise.reject(new Error('Standalone Windows trial cannot run unfenced quality-gate commands'))
-        : runAutonomousQualityGatePhase(phase, { cwd, signal }),
+        : runAutonomousQualityGatePhase(phase, { cwd, signal,
+            ...(admitSubprocess ? { admitSubprocess, reserveLegacyDispatch } : {}) }),
       sendRepair: async (sessionId, message, options) => {
         const session = getCurrentChildren().find(candidate => candidate.happySessionId === sessionId);
         if (!session?.encryption) throw new Error(`Session encryption unavailable for ${sessionId}`);
@@ -3241,6 +3243,7 @@ export async function startDaemon(): Promise<void> {
         const claudeSessionId = metadata.claudeSessionId;
         const restoredWorktree = await restoreMissingManagedWorktree({
           cwd: launch.cwd,
+          ...(admitSubprocess ? { admitSubprocess } : {}),
           readBranchHint: async () => claudeSessionId
             ? readClaudeTranscriptBranch(join(getProjectPath(launch.cwd), `${claudeSessionId}.jsonl`))
             : null,
@@ -5436,6 +5439,8 @@ export async function startDaemon(): Promise<void> {
         },
         resumeServerChosenSession: configuration.machineControl !== 'strict',
         spawnSession: spawnAutomationSession,
+        ensureReviewObjects: input => ensureAgentTaskReviewObjects({ ...input,
+          ...(admitSubprocess ? { admitSubprocess } : {}) }),
         prepareGithubWorktree: (input) => prepareGithubTriggerWorktree({
           ...input,
           managedRoot: join(configuration.happyHomeDir, 'automation-worktrees'),
