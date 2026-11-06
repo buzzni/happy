@@ -60,6 +60,8 @@ export const claudeSwapPython = createClaudeSwapPythonResolver({ platform: proce
 const CLAUDE_STATUS_TIMEOUT_MS = 120_000
 /** A used-up shared account without a known reset is skipped for one 5-hour window. */
 const SHARED_ACCOUNT_UNKNOWN_RESET_MS = 5 * 60 * 60_000
+/** How long a roster read proves shared accounts for start requests (one per turn). */
+const SHARED_START_ROSTER_MS = 60_000
 // Keep readable historical bundles separate from supported installed runtimes.
 // Bundles from supported runtimes are readable; parseCodexMultiAuthBundle still
 // requires the OAuth account v3 / settings v1 contract.
@@ -2487,7 +2489,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
    * `account`: exactly the account a prepared launch runs on; `moveFrom`: another usable account for a
    * session leaving that one. Either is null when there is none.
    */
-  async function sharedMachineSessionEnvironment(choice?: { account: string | undefined } | { moveFrom: string } | { prefer: string }): Promise<Record<string, string> | null> {
+  async function sharedMachineSessionEnvironment(choice?: { account: string | undefined } | { moveFrom: string; among?: string[] } | { prefer: string }): Promise<Record<string, string> | null> {
     const held = await sharedMachineCandidates()
     if (!held) return null
     return withSafeErrors('CLAUDE_SETUP_TOKEN_MACHINE_DEFAULT_UNAVAILABLE', async () => {
@@ -2497,7 +2499,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       const chosen = !choice ? usable[0] ?? candidates[0]
         : 'account' in choice ? candidates.find(candidate => candidate.managedAccountId === choice.account)
         : 'prefer' in choice ? candidates.find(candidate => candidate.managedAccountId === choice.prefer) ?? usable[0] ?? candidates[0]
-        : usable.find(candidate => candidate.managedAccountId !== choice.moveFrom)
+        : usable.find(candidate => candidate.managedAccountId !== choice.moveFrom && (!choice.among || choice.among.includes(candidate.managedAccountId)))
       if (!chosen) {
         if (choice) return null
         throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_MACHINE_DEFAULT_UNAVAILABLE')
@@ -2610,6 +2612,37 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       logger.debug(`[setup-token-switch] Studio chose ${studio}, which this PC does not hold; choosing locally`)
     }
     return serializeLaunch('prepare', () => sharedMachineSessionEnvironment({ moveFrom: managedAccountId }))
+  }
+  /**
+   * Saycode specs/shared-pc-start-budget — what a shared-PC session proves when it asks Studio to start a turn: the company
+   * and generation this PC holds the account at. Every turn asks, so the roster read is reused for a minute; a stale
+   * generation is only refused by Studio, and a refused start still runs (decision D1).
+   */
+  type SharedStartRoster = { readAt: number; companyId: string | null; generations: Map<string, number> }
+  let sharedStartRoster: SharedStartRoster | null = null
+  let sharedStartRosterRefresh: Promise<SharedStartRoster> | null = null
+  async function sharedMachineStartProof(managedAccountId: string): Promise<{ companyId: string; credentialGeneration: number } | null> {
+    let roster = sharedStartRoster
+    if (!roster || deps.now() - roster.readAt > SHARED_START_ROSTER_MS) {
+      // Starts share a refresh, and its credential reads cannot overlap group sync or launch preparation.
+      sharedStartRosterRefresh ??= serialize(async () => {
+        const held = await sharedMachineCandidates()
+        const candidates = held ? (await held.read()).candidates : []
+        return sharedStartRoster = { readAt: deps.now(), companyId: held?.companyId ?? null,
+          generations: new Map(candidates.map(candidate => [candidate.managedAccountId, candidate.credentialGeneration])) }
+      }).finally(() => { sharedStartRosterRefresh = null })
+      roster = await sharedStartRosterRefresh
+    }
+    const credentialGeneration = roster.generations.get(managedAccountId)
+    return roster.companyId && credentialGeneration !== undefined && Number.isSafeInteger(credentialGeneration)
+      ? { companyId: roster.companyId, credentialGeneration } : null
+  }
+  /**
+   * Saycode specs/shared-pc-start-budget — a session waiting for start budget moves onto a held, usable account among
+   * those Studio said have budget left. Not a refusal: the account it leaves is not held as used up. Null when none.
+   */
+  function sharedMachineStartBudgetMove(managedAccountId: string, preferred: string[]) {
+    return serializeLaunch('prepare', () => sharedMachineSessionEnvironment({ moveFrom: managedAccountId, among: preferred }))
   }
   /** The environment of exactly that shared account, for a session catching up with a move; null when it is gone. */
   function sharedMachineAccountEnvironment(managedAccountId: string) {
@@ -2817,7 +2850,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (entries.length !== 1 || entries[0].pending) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_ASSIGNMENT_UNRESOLVED')
     return entries[0].scope
   })
-  return { sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, sharedMachineAccountEnvironment, measureWithPermit, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, refreshCodexOwner, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
+  return { sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, sharedMachineAccountEnvironment, sharedMachineStartProof, sharedMachineStartBudgetMove, measureWithPermit, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, refreshCodexOwner, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
     // One fresh runtime observation per RPC: launching cswap repeatedly can block a secured Windows host.
     let stdout = ''
     try { stdout = (await deps.execFile('cswap', ['token-runtime', 'capabilities'], { maxOutputBytes: 64 * 1024, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })).stdout } catch {}

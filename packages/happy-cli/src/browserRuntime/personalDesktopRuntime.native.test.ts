@@ -12,7 +12,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { brokerRequest } from './brokerGrantSource'
 import { parseRuntimeConfig } from './runtimeConfig'
 import { bootstrapPersonalDesktopRuntime, personalRuntimePaths } from './personalDesktopRuntime'
-import { launchPersonalBrowser } from './personalBrowserProcess'
+import { launchPersonalBrowser, type PersonalBrowser } from './personalBrowserProcess'
 
 const run = promisify(execFile)
 const CHROME = process.env.SAYCODE_NATIVE_TEST_CHROME ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
@@ -53,6 +53,34 @@ describe.skipIf(process.platform !== 'darwin')('personal desktop runtime on macO
     }, 60_000)
     afterAll(async () => { await rm(home, { recursive: true, force: true }) })
 
+    it('keeps Chrome cold until demand and does not relaunch after Chrome quits', async () => {
+        const paths = personalRuntimePaths('darwin', {}, home)
+        let browser: PersonalBrowser | undefined
+        const runtime = await bootstrapPersonalDesktopRuntime(parseRuntimeConfig(configJson(1)), paths.stateDir, {
+            env: { HOME: home, TMPDIR: process.env.TMPDIR, ABP_CONFIG_FILE: paths.configFile }, home,
+            parent: new PassThrough(), launch: async options => browser = await launchPersonalBrowser(options),
+        })
+        try {
+            await runtime.session.check()
+            expect(profileProcesses(paths.profileDir)).toEqual([])
+            const [first, same] = await Promise.all([runtime.startBrowser(), runtime.startBrowser()])
+            expect(first).toBe(same)
+            expect(profileProcesses(paths.profileDir).length).toBeGreaterThan(0)
+            const firstInstance = first.driver.browserInstanceId()
+            // Browser.close is Chrome's own quit path, through only this fixture's pipe.
+            browser!.input.write(JSON.stringify({ id: 987654, method: 'Browser.close' }) + '\0')
+            expect(await first.stopped).toEqual({ terminated: true })
+            await runtime.session.check()
+            await new Promise(resolve => setTimeout(resolve, 1200))
+            expect(profileProcesses(paths.profileDir)).toEqual([])
+            const second = await runtime.startBrowser()
+            expect(second.driver.browserInstanceId()).not.toBe(firstInstance)
+            expect(profileProcesses(paths.profileDir).length).toBeGreaterThan(0)
+            await runtime.close()
+            expect(profileProcesses(paths.profileDir)).toEqual([])
+        } finally { await runtime.close().catch(() => undefined) }
+    }, 40_000)
+
     it('opens pages in the dedicated profile over pipes with no listening port, then ends the whole tree', async () => {
         const paths = personalRuntimePaths('darwin', {}, home)
         const site = createServer((_req, res) => { res.setHeader('Content-Type', 'text/html'); res.end('<title>Personal</title><p>Personal mode canary</p>') })
@@ -61,6 +89,7 @@ describe.skipIf(process.platform !== 'darwin')('personal desktop runtime on macO
         const env = { HOME: home, TMPDIR: process.env.TMPDIR, ABP_CONFIG_FILE: paths.configFile, HAPPY_ACCESS_KEY: CANARY, ANTHROPIC_API_KEY: CANARY }
         const runtime = await bootstrapPersonalDesktopRuntime(parseRuntimeConfig(configJson(1)), paths.stateDir, { env, home, parent: new PassThrough() })
         try {
+            await runtime.startBrowser()
             const processes = profileProcesses(paths.profileDir)
             expect(processes.length).toBeGreaterThan(1)
             const pgid = processes[0].pgid
@@ -96,7 +125,8 @@ describe.skipIf(process.platform !== 'darwin')('personal desktop runtime on macO
     it('runs as the daemon child: signed broker only, one runtime per user, and no browser outlives the runtime', async () => {
         const paths = personalRuntimePaths('darwin', {}, home)
         mkdirSync(paths.root, { recursive: true, mode: 0o700 })
-        writeFileSync(paths.configFile, JSON.stringify(configJson(await freePort())), { mode: 0o600 })
+        const port = await freePort()
+        writeFileSync(paths.configFile, JSON.stringify(configJson(port)), { mode: 0o600 })
         const start = () => {
             const child = spawn(process.execPath, [join(bundle, 'dist/runtime.mjs')], {
                 env: { HOME: home, TMPDIR: process.env.TMPDIR, ABP_CONFIG_FILE: paths.configFile, ABP_STATE_DIR: paths.stateDir, HAPPY_ACCESS_KEY: CANARY },
@@ -119,17 +149,20 @@ describe.skipIf(process.platform !== 'darwin')('personal desktop runtime on macO
             second = start()
             expect(await second.exited).toBe(1)
             expect(second.log()).toMatch(/fatal/)
-            expect(profileProcesses(paths.profileDir).length).toBeGreaterThan(0)
+            expect(profileProcesses(paths.profileDir)).toEqual([])
+            const ready = await fetch(`http://127.0.0.1:${port}/v1/ready`)
+            expect(ready.status).toBe(200)
+            expect(profileProcesses(paths.profileDir)).toEqual([])
 
             // The daemon's end (its pipe closes) ends the runtime and its browser.
             first.child.stdin!.end()
             expect(await first.exited).toBe(0)
             expect(await until(() => profileProcesses(paths.profileDir).length === 0, 10000)).toBe(true)
 
-            // A killed runtime cannot keep a browser: Chrome quits at the pipe EOF.
+            // Restarting the broker and polling readiness do not demand a browser.
             const killed = start()
             expect(await listening(killed)).toBe(true)
-            expect(profileProcesses(paths.profileDir).length).toBeGreaterThan(0)
+            expect(profileProcesses(paths.profileDir)).toEqual([])
             killed.child.kill('SIGKILL')
             await killed.exited
             expect(await until(() => profileProcesses(paths.profileDir).length === 0, 10000)).toBe(true)

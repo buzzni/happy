@@ -70,3 +70,10 @@ describe('portable rotation contract', () => {
   });
 
 });
+
+it('accepts start exhaustion only as an exclusive signed rebind reason', () => {
+ const base=fixture.vectors.find(v=>'action' in v.document.body&&v.document.body.action==='claim')!.document.body
+ const body={...base,action:'rebind',path:'/api/claude-setup-token/daemon/v2/rebind',startExhausted:true}
+ expect(DaemonRotationRequestBodySchema.safeParse(body).success).toBe(true)
+ expect(DaemonRotationRequestBodySchema.safeParse({...body,startBudget:true}).success).toBe(false)
+})

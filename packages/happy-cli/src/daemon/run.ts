@@ -48,6 +48,7 @@ import {
   type SpawnSessionResult,
 } from '@/modules/common/registerCommonHandlers';
 import { LIST_FILES_PAGE_CAPABILITY } from '@/modules/common/listFilesPageCapability';
+import { BASH_PREFIX_MATCHER_CAPABILITY } from '@/claude/utils/bashPrefixMatcher';
 import { logger } from '@/ui/logger';
 import { authAndSetupMachineIfNeeded } from '@/ui/auth';
 import { reseedCompanyKey, settleMachineControl } from '@/datakey/machineControl';
@@ -174,6 +175,7 @@ import {
   shareInFlight,
 } from './resumeGuards';
 import { decideResumeCursorPersist } from './resumeCursorPersistence';
+import { createSessionRetention } from './sessionRetention';
 import { stageInitialPromptEnvironment } from '@/utils/initialPrompt';
 import { outputFormatSeed, STRUCTURED_OUTPUT_CAPABILITY } from '@/claude/structuredOutput';
 import {
@@ -444,6 +446,7 @@ export const initialMachineMetadata: MachineMetadata = {
   structuredOutput: STRUCTURED_OUTPUT_CAPABILITY,
   writeFileAttempt: WRITE_FILE_ATTEMPT_CAPABILITY,
   listFilesPage: LIST_FILES_PAGE_CAPABILITY,
+  permissionGrants: BASH_PREFIX_MATCHER_CAPABILITY,
   machineRun: {
     protocolVersion: 1,
     // The machine-scope handler installs the managed write policy (apiMachine).
@@ -2221,7 +2224,8 @@ export async function startDaemon(): Promise<void> {
         let extraEnv: Record<string, string> = injectMcpCallerGrant(
           stripManagedCredentialConflicts(
             buildSpawnRequestEnvironment(authEnv, options.environmentVariables,
-              { allowPocBrowserTaskEnv: process.env.HAPPY_BROWSER_POC_REQUEST_ENV === '1' }),
+              { allowPocBrowserTaskEnv: process.env.HAPPY_BROWSER_POC_REQUEST_ENV === '1',
+                ...(options.seedDefaultAgentGrant ? { defaultAgentRoot: directory } : {}) }),
             managedAiCredentialEnvironment,
           ),
           mcpCallerGrant,
@@ -3260,6 +3264,8 @@ export async function startDaemon(): Promise<void> {
             },
             agentEnvironment: tracked.agentEnvironment,
             sessionId: happySessionId,
+            // Automation runs are left as they were captured; sessions people started get the grant they missed.
+            ...(options?.automation ? {} : { defaultAgentRoot: launch.cwd }),
           }), managedAiCredentialEnvironment),
           mcpCallerGrantEnvelope: options?.mcpCallerGrantEnvelope,
           trustedMcpCallerGrant: resumeGrantSource.trustedMcpCallerGrant,
@@ -3701,6 +3707,7 @@ export async function startDaemon(): Promise<void> {
     // yet — the guard measures their report silence from this moment, not from
     // their (possibly days-old) session start.
     const daemonStartedAt = Date.now();
+    const sessionRetention = createSessionRetention({ home: configuration.happyHomeDir, children: () => getCurrentChildren().filter(session => isPidAlive(session.pid)) });
 
     // The entry `stopSession` below would pick, without touching it. Same two
     // conditions on purpose: the verification must snapshot the process the
@@ -3743,7 +3750,13 @@ export async function startDaemon(): Promise<void> {
               return { stopped: false, reason: 'active', guard: decision.guard, activity: decision.activity };
             }
           } else if (mode === 'if-idle') {
+            let retention;
+            try { retention = session.happySessionId ? sessionRetention.record(session.happySessionId) : undefined; }
+            catch {
+              if (context?.source !== 'session-zombie-sweep') return { stopped: false, reason: 'active', guard: 'retention-store-unavailable', activity: { thinking: false, hasOpenToolCall: false, pendingUserInput: false } };
+            }
             const decision = evaluateIdleStopGuard({
+              retention,
               runtime: session.runtime,
               sessionStartedAt: sessionStartTimes.get(pid),
               daemonStartedAt,
@@ -4215,6 +4228,7 @@ export async function startDaemon(): Promise<void> {
       handingOff: () => restartDrainRuntime?.controlPort.handingOff() ?? false,
     };
     const { port: controlPort, stop: stopControlServer, controlSecret } = await startDaemonControlServer({
+      ...(managedRuntimeActive ? {} : { sessionRetention }),
       restartDrain: restartDrainControlPort,
       getCallerLaunches: () => callerLaunches,
       getSetupTokenAccountSwitch: () => setupTokenAccountSwitch,
@@ -4926,6 +4940,11 @@ export async function startDaemon(): Promise<void> {
       fetch,
       // Passed as is: catching a session up resumes its recorded binding, the runtime's third argument.
       sessionEnvironment: aiCredentialRuntime.sessionEnvironment,
+      disabledSetupTokenAccounts: async () => {
+        const status = await aiCredentialRuntime.status({ provider: 'claude' });
+        return 'setupToken' in status ? (status.setupToken?.accounts ?? [])
+          .filter(account => account.disabled).map(account => account.managedAccountId) : [];
+      },
       recordAgentEnvironment: persistSetupTokenBinding,
       // Saycode specs/setup-token-switch-usage-check — check a candidate nobody measured recently before moving onto it.
       measure: aiCredentialRuntime.measureWithPermit,
@@ -4934,6 +4953,8 @@ export async function startDaemon(): Promise<void> {
       sharedMachine: {
         reportUsage: aiCredentialRuntime.sharedMachineUsage, rebind: aiCredentialRuntime.sharedMachineRebind,
         environment: aiCredentialRuntime.sharedMachineAccountEnvironment, moved: () => persistTrackedSessions(),
+        startProof: aiCredentialRuntime.sharedMachineStartProof,
+        startBudgetMove: aiCredentialRuntime.sharedMachineStartBudgetMove,
       },
     });
     launchManagedAiCredentialSession = aiCredentialRuntime.launchSession;
@@ -5509,8 +5530,6 @@ export async function startDaemon(): Promise<void> {
     // A token's account never changes, so only a confirmed answer is remembered; registration is re-read every time.
     const accountByToken = new Map<string, string>();
     callerLaunches = createAgentCallerLaunches({ enabled: process.env[OWNER_CONTACT_SWITCH] === '1',
-      // Configured ownership trust opens bindings for the broker's same-account check alone (identity-adapter-plan D2).
-      identityOnly: readOwnerContactTrust(process.env, configuration.serverUrl) !== null,
       identity: async () => {
         try {
           const state = await ownedRegistration(), token = state.credentials.token;
@@ -5545,6 +5564,7 @@ export async function startDaemon(): Promise<void> {
     const prepareBrowserSessionReconnect = createBrowserSessionReconnect();
     // Set RPC handlers
     apiMachine.setRPCHandlers({
+      ...(managedRuntimeActive ? {} : { sessionRetention }),
       ownedSpawn,
       daemonSessionState: createDaemonSessionStateHandler(getCurrentChildren),
       byosOfflineReceive,

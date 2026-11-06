@@ -3,7 +3,7 @@ import { closeClaudeTurnWithStatus, mapClaudeLogMessageToSessionEnvelopes, mapCl
     failClaudeLaunchTurn, type ClaudeSessionProtocolState } from './utils/sessionProtocolMapper';
 import { createEnvelope, type SessionEnvelope, type SessionTurnEndStatus, type InputEvidenceV1 } from '@slopus/happy-wire';
 import type { RawJSONLines } from './types';
-import { formatSetupTokenBinding } from '@/daemon/sessionEnv';
+import { formatSetupTokenBinding, sharedMachineSetupTokenAuthority } from '@/daemon/sessionEnv';
 import { readPersonalClaudeCredential } from './personalClaudeCredential';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
@@ -164,10 +164,96 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         await running;
         expect(inputs).toHaveBeenCalledTimes(1);
     });
-    it('runs a start-budget-waiting input at once on another organization account that has start budget', async () => {
+    // Saycode specs/shared-pc-start-budget — an unbound shared-PC session asks with its shared-account authority.
+    function sharedSessionFixture(inputs: () => void) {
+        delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING;
+        process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED = '1';
+        process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT = '00000000-0000-4000-8000-00000000000a';
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const client = {
+            sessionId: 'happy-session-1', rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        vi.mocked(query).mockImplementation(({ prompt }) => Object.assign((async function* () {
+            yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+            for await (const _message of prompt as AsyncIterable<SDKUserMessage>) {
+                inputs();
+                yield assistant('msg-1');
+                yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: 'result-1' };
+                // Leave the remote launcher once the turn is done, as a user switching to local mode would.
+                void handlers.get('switch')!();
+                return;
+            }
+        })(), { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>);
+        queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        return {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 }, cancelLessonReview: vi.fn(),
+            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
+        };
+    }
+    it('holds a shared-PC turn until Studio admits its start, asked with the shared-account authority', async () => {
+        let admit!: (value: { state: 'allowed'; validForMs: number }) => void;
+        vi.mocked(requestSetupTokenStart).mockImplementationOnce(() => new Promise(resolve => { admit = resolve; }));
+        const inputs = vi.fn();
+        try {
+            const running = claudeRemoteLauncher(sharedSessionFixture(inputs) as unknown as Session);
+            await vi.waitFor(() => expect(requestSetupTokenStart).toHaveBeenCalledTimes(1));
+            expect(vi.mocked(requestSetupTokenStart).mock.calls[0][1]).toBe(sharedMachineSetupTokenAuthority(process.env));
+            expect(inputs).not.toHaveBeenCalled();
+            admit({ state: 'allowed', validForMs: 15000 });
+            await running;
+            expect(inputs).toHaveBeenCalledTimes(1);
+        } finally {
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED;
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
+        }
+    });
+    it('runs a shared-PC turn when the start decision cannot be had (decision D1)', async () => {
+        vi.mocked(requestSetupTokenStart).mockRejectedValueOnce(new Error('SETUP_TOKEN_START_UNAVAILABLE'));
+        const inputs = vi.fn();
+        try {
+            await claudeRemoteLauncher(sharedSessionFixture(inputs) as unknown as Session);
+            expect(inputs).toHaveBeenCalledTimes(1);
+        } finally {
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED;
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
+        }
+    });
+    it('runs a start-budget-waiting shared-PC input once on the account it moved to', async () => {
+        const B = '00000000-0000-4000-8000-00000000000b';
         vi.mocked(requestSetupTokenStart)
-            .mockResolvedValueOnce({ state: 'wait', retryAfterMs: 600000, preferredAccountIds: ['second'] })
+            .mockResolvedValueOnce({ state: 'wait', retryAfterMs: 600000, preferredAccountIds: [B] })
             .mockResolvedValueOnce({ state: 'allowed', validForMs: 15000 });
+        vi.mocked(requestSetupTokenRebind).mockResolvedValueOnce({ ok: true, environment: {
+            CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-shared-b', HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1', HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: B } });
+        const inputs = vi.fn();
+        const providers: Array<string | undefined> = [];
+        try {
+            const fixture = sharedSessionFixture(inputs);
+            const first = sharedMachineSetupTokenAuthority(process.env);
+            const original = vi.mocked(query).getMockImplementation()!;
+            vi.mocked(query).mockImplementation(options => { providers.push(process.env.CLAUDE_CODE_OAUTH_TOKEN); return original(options); });
+            await claudeRemoteLauncher(fixture as unknown as Session);
+            expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', first, undefined, expect.any(AbortSignal), { startBudget: true });
+            expect(vi.mocked(requestSetupTokenStart).mock.calls.map(call => call[1])).toEqual([first, sharedMachineSetupTokenAuthority({ HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1', HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: B })]);
+            expect(providers).toEqual(['sk-ant-oat01-shared-b']);
+            expect(inputs).toHaveBeenCalledTimes(1);
+        } finally {
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED;
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
+        }
+    });
+    it.each(['startBudget','startExhausted'] as const)('runs a held input once after %s moves the account and requests admission again', async reason => {
+        vi.mocked(requestSetupTokenStart).mockReset();
+        if (reason === 'startExhausted') vi.mocked(requestSetupTokenStart).mockRejectedValueOnce(new Error('SETUP_TOKEN_START_ACCOUNT_EXHAUSTED'));
+        else vi.mocked(requestSetupTokenStart).mockResolvedValueOnce({ state: 'wait', retryAfterMs: 600000, preferredAccountIds: ['second'] });
+        vi.mocked(requestSetupTokenStart).mockResolvedValue({ state: 'allowed', validForMs: 15000 });
         const inputs: Array<string | undefined> = [];
         const providers: Array<string | undefined> = [];
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
@@ -202,20 +288,20 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
 
         await claudeRemoteLauncher(session as unknown as Session);
 
-        expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', '{"account":"first"}', undefined, expect.any(AbortSignal), { startBudget: true });
+        expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', '{"account":"first"}', undefined, expect.any(AbortSignal), { [reason]: true });
         expect(vi.mocked(requestSetupTokenStart).mock.calls.map(call => call[1])).toEqual(['{"account":"first"}', '{"account":"second"}']);
         // Admission precedes the provider: none starts on the used-up token, and the same input runs once on the second.
         expect(providers).toEqual(['sk-ant-oat01-second']);
         expect(inputs).toEqual(['sk-ant-oat01-second']);
         const messages = client.sendSessionEvent.mock.calls.map(([event]) => event.message);
-        expect(messages).toContain(START_BUDGET_SWITCHED_NOTICE);
+        expect(messages).toContain(reason === 'startBudget' ? START_BUDGET_SWITCHED_NOTICE : SWITCHED_NOTICE);
         expect(messages.some(message => String(message).includes('기다리고 있습니다'))).toBe(false);
     });
-    it('restarts a running provider on the account with start budget for the next message, keeping that message', async () => {
-        vi.mocked(requestSetupTokenStart)
-            .mockResolvedValueOnce({ state: 'allowed', validForMs: 15000 })
-            .mockResolvedValueOnce({ state: 'wait', retryAfterMs: 600000, preferredAccountIds: ['second'] })
-            .mockResolvedValueOnce({ state: 'allowed', validForMs: 15000 });
+    it.each(['startBudget','startExhausted'] as const)('restarts a running provider after %s before the next message, keeping it once', async reason => {
+        vi.mocked(requestSetupTokenStart).mockReset().mockResolvedValueOnce({ state: 'allowed', validForMs: 15000 });
+        if (reason === 'startExhausted') vi.mocked(requestSetupTokenStart).mockRejectedValueOnce(new Error('SETUP_TOKEN_START_ACCOUNT_EXHAUSTED'));
+        else vi.mocked(requestSetupTokenStart).mockResolvedValueOnce({ state: 'wait', retryAfterMs: 600000, preferredAccountIds: ['second'] });
+        vi.mocked(requestSetupTokenStart).mockResolvedValueOnce({ state: 'allowed', validForMs: 15000 });
         const inputs: Array<[string | undefined, string]> = [];
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
         const handlers = new Map<string, () => Promise<unknown>>();
@@ -252,6 +338,8 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         expect(inputs.map(([token]) => token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
         expect(inputs[1][1]).toContain('second message');
         expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1);
+        expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', '{"account":"first"}', undefined, expect.any(AbortSignal), { [reason]: true });
+        expect(vi.mocked(requestSetupTokenStart).mock.calls.map(call => call[1])).toEqual(['{"account":"first"}', '{"account":"first"}', '{"account":"second"}']);
     });
     it.each(['abort', 'switch'])('handles a budget-waiting input without execution on %s', async action => {
         vi.mocked(requestSetupTokenStart).mockImplementationOnce((_session, _binding, _request, signal) => new Promise(resolve => {

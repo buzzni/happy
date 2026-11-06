@@ -41,6 +41,15 @@ describe('browser task agent tools', () => {
             expect(description).toContain(text)
     })
 
+    it('tells the agent that a new space has no task yet and which tool comes next', async () => {
+        const tools = (await (await connect({})).listTools()).tools
+        const descriptionOf = (name: string) => tools.find(t => t.name === name)!.description!
+        for (const text of ['only taskSpaceId', 'no taskId', 'browser_task_create'])
+            expect(descriptionOf('browser_task_create_space')).toContain(text)
+        for (const text of ['taskId', 'browser_task_open_page', 'browser_task_submit_batch'])
+            expect(descriptionOf('browser_task_create')).toContain(text)
+    })
+
     it('warns in every run-once browser tool description while keeping reads available', async () => {
         const getTask = vi.fn(async () => ({ status: 'paused', pauseReason: 'awaiting-agent' }))
         const client = await connect({ getTask }, true)

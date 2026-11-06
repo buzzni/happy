@@ -24,6 +24,7 @@ import packageJson from '../../package.json';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { projectPath } from '@/projectPath';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
+import { linkedPullRequestToolsAllowed } from '@/claude/utils/linkedPullRequestTools';
 import { fetchAplusMcpServers } from '@/aplus/fetchAplusMcpServers';
 import { bridgeAplusMcpServers, mergeMcpServers } from '@/aplus/mergeAplusMcpServers';
 import { MessageBuffer } from '@/ui/ink/messageBuffer';
@@ -149,6 +150,8 @@ export async function runGemini(opts: {
   const createdByDisplayName = process.env.HAPPY_CREATED_BY_DISPLAY_NAME;
   // Who asked for this session (aplus-dev-studio specs/session-source-metadata); read once and removed.
   const source = takeSessionSourceFromEnv();
+  // Registration and advertisement follow the same decision (specs/linked-pull-requests R2-3).
+  const linkedPullRequestTools = linkedPullRequestToolsAllowed(process.env);
 
   const { state, metadata } = createSessionMetadata({
     flavor: 'gemini',
@@ -158,6 +161,7 @@ export async function runGemini(opts: {
     ...(createdByAccountId ? { createdBy: { accountId: createdByAccountId, displayName: createdByDisplayName } } : {}),
     source,
     approvalLifecycle: true,
+    linkedPullRequestTools,
   });
   const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
 
@@ -598,7 +602,7 @@ export async function runGemini(opts: {
   // Start Happy MCP server and create Gemini backend
   //
 
-  const happyServer = await startHappyServer(session);
+  const happyServer = await startHappyServer(session, { linkedPullRequestTools });
   const bridgeCommand = join(projectPath(), 'bin', 'happy-mcp.mjs');
   const aplusMcpServers = bridgeAplusMcpServers(
     await fetchAplusMcpServers(opts.credentials.token, machineId),

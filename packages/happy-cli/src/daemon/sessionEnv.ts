@@ -1,5 +1,6 @@
 import { manualPersonalSelectionSchema, MANUAL_PERSONAL_ENV, type ManualPersonalSelection } from './manualPersonalClaude'
 import { MachineSetupTokenBindingV2Schema, parseCanonicalOrgSetupTokenJson, type MachineSetupTokenBindingV2 } from '@slopus/happy-wire'
+import { randomBytes } from 'node:crypto'
 import { z } from 'zod'
 /**
  * Session spawn environments: what a daemon-spawned child gets explicitly on
@@ -50,6 +51,8 @@ const SAYCODE_AGENT_ENV_KEYS = [
 ] as const
 
 type SaycodeAgentEnvironmentKey = typeof SAYCODE_AGENT_ENV_KEYS[number]
+/** Daemon-written provenance/rejection state, never admitted from a request or inherited by another session. */
+export const DAEMON_AGENT_GRANT_STATE_ENV = 'HAPPY_DAEMON_AGENT_GRANT_STATE'
 const CHECKPOINT_CONTEXT_KEY = CHECKPOINT_SPAWN_CONTEXT_ENV_KEY
 /** Set from the spawn option `browserContinuation` only (request environment cannot carry HAPPY_AUTOMATION_*). */
 export const BROWSER_CONTINUATION_ENV = 'HAPPY_AUTOMATION_BROWSER_CONTINUATION'
@@ -63,7 +66,7 @@ const AGENT_PLAN_SEED_KEYS = [AGENT_PLAN_DESCRIPTOR_ENV, AGENT_PLAN_SECRET_ENV, 
 type AgentPlanSeedKey = typeof AGENT_PLAN_SEED_KEYS[number]
 type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV | AgentPlanSeedKey
 
-export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey, string>>
+export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey | typeof DAEMON_AGENT_GRANT_STATE_ENV, string>>
 
 /**
  * Who asked for one spawn: requester identity (specs/session-created-by) and source
@@ -133,6 +136,43 @@ function readRequestedSaycodeAgentGrant(
 }
 
 /**
+ * A client spawn request that carries no agent grant at all gets a root grant at its directory.
+ *
+ * Every session's prompt tells it to use `happy agent`, but each client had to
+ * seed the grant itself, and one spawn path after another forgot (web
+ * 2026-09-13, the mobile app and the web handoff path 2026-11-05): those
+ * sessions answered not_agent_env. Seeding here covers every client, including
+ * ones already installed.
+ *
+ * This adds no authority: a requester could already send a depth-0 grant
+ * itself. A request carrying any SAYCODE_AGENT_* key is left alone, so a child
+ * seed or a capped hub keeps its own values and a broken grant is still dropped
+ * whole instead of coming back as a fresh depth-0 budget. The scope stays at
+ * the directory and MAX_SPAWN is left to the machine-capacity tier.
+ * Call only with daemon-owned captured state, or after request validation: the
+ * root marker is trusted provenance and must never be copied from request env.
+ */
+export function withDefaultSaycodeAgentGrant<T extends Partial<Record<string, string>>>(
+    requested: T | undefined,
+    directory: unknown,
+    newAgentId: () => string = () => `ac-${randomBytes(8).toString('hex')}`,
+): T | undefined {
+    if (requested?.[DAEMON_AGENT_GRANT_STATE_ENV] !== undefined) return requested
+    if (requested && Object.entries(requested).some(([key, value]) => key.startsWith('SAYCODE_AGENT_') && value !== undefined)) return requested
+    const root = typeof directory === 'string' ? directory.trim() : ''
+    if (!DIRECTORY_VALUE.test(root)) return requested
+    const base = requested ?? ({} as T)
+    return {
+        ...base,
+        SAYCODE_AGENT_ENV: '1',
+        SAYCODE_AGENT_ROOT: root,
+        SAYCODE_AGENT_DEPTH: '0',
+        SAYCODE_AGENT_ID: newAgentId(),
+        [DAEMON_AGENT_GRANT_STATE_ENV]: 'root',
+    }
+}
+
+/**
  * A spawn, resume or automation request supplies environment for the session, but the Happy process
  * itself runs with it first — before the claude UID switch and the sandbox. Variables that make that
  * process (node, the shells and git it runs) load code, change its paths or trust, or steer Happy's own
@@ -187,8 +227,13 @@ function readRequestedDelegatedAttendance(requested: Record<string, string>): Re
 export function buildSpawnRequestEnvironment(
     auth: Record<string, string>,
     requested: Record<string, string> | undefined,
-    options: { allowPocBrowserTaskEnv?: boolean } = {},
+    options: { allowPocBrowserTaskEnv?: boolean; defaultAgentRoot?: string } = {},
 ): Record<string, string> {
+    const grant = readRequestedSaycodeAgentGrant(requested ?? {})
+    const hasRequestedGrant = Object.entries(requested ?? {}).some(([key, value]) => key.startsWith('SAYCODE_AGENT_') && value !== undefined)
+    const agentEnvironment = grant ?? (hasRequestedGrant
+        ? { [DAEMON_AGENT_GRANT_STATE_ENV]: 'rejected' }
+        : withDefaultSaycodeAgentGrant<SaycodeAgentEnvironment>(undefined, options.defaultAgentRoot))
     const poc = options.allowPocBrowserTaskEnv
         ? Object.fromEntries(POC_BROWSER_TASK_REQUEST_KEYS.flatMap((key) => requested?.[key] === undefined ? [] : [[key, requested[key]]]))
         : {}
@@ -196,7 +241,7 @@ export function buildSpawnRequestEnvironment(
         ...sanitizeChildEnv(stripUnsafeRequestedEnvironment(requested ?? {})),
         ...poc,
         // The agent grant is re-admitted only after its own validation (paths and counts).
-        ...readRequestedSaycodeAgentGrant(requested ?? {}),
+        ...agentEnvironment,
         ...readRequestedDelegatedAttendance(requested ?? {}),
         ...auth,
         ...requestedInputEvidenceEnvironment(requested ?? {}),
@@ -246,6 +291,8 @@ export function captureSaycodeAgentEnvironment(
     env: NodeJS.ProcessEnv,
 ): SaycodeAgentEnvironment | undefined {
     const captured: SaycodeAgentEnvironment = {}
+    const grantState = env[DAEMON_AGENT_GRANT_STATE_ENV]
+    if (grantState === 'root' || grantState === 'rejected') captured[DAEMON_AGENT_GRANT_STATE_ENV] = grantState
     if (env[MANUAL_PERSONAL_ENV] !== undefined) captured[MANUAL_PERSONAL_ENV] = /^[a-f0-9]{64}$/.test(env[MANUAL_PERSONAL_ENV]!) ? env[MANUAL_PERSONAL_ENV] : ''
     if (env[INPUT_EVIDENCE_ENV] === '0' || env[INPUT_EVIDENCE_ENV] === '1') captured[INPUT_EVIDENCE_ENV] = env[INPUT_EVIDENCE_ENV]
     if (env.SAYCODE_AGENT_ENV === '1' && env.SAYCODE_AGENT_ROOT?.trim()) {
@@ -396,11 +443,16 @@ export function buildResumedSessionSpawnEnvironment(input: {
     automation?: Record<string, string>
     agentEnvironment?: SaycodeAgentEnvironment
     sessionId: string
+    /** Launch cwd that becomes the agent root when the captured environment carries no grant; omit for none. */
+    defaultAgentRoot?: string
 }): Record<string, string> {
     const policyKey = 'HAPPY_PROJECT_SANDBOX_CONFIG'
+    const agentEnvironment = input.defaultAgentRoot === undefined
+        ? input.agentEnvironment
+        : withDefaultSaycodeAgentGrant(input.agentEnvironment ?? {}, input.defaultAgentRoot)
     // A session keeps its own policy; explicit updates still take precedence.
     const policy = input.explicit[policyKey] ?? input.automation?.[policyKey]
-        ?? input.runtime?.[policyKey] ?? input.agentEnvironment?.[policyKey]
+        ?? input.runtime?.[policyKey] ?? agentEnvironment?.[policyKey]
     const runtime = expandEnvironmentVariables(
         sanitizeChildEnv(stripUnsafeRequestedEnvironment(input.runtime ?? {})),
     )
@@ -408,7 +460,7 @@ export function buildResumedSessionSpawnEnvironment(input: {
         sanitizeChildEnv(stripUnsafeRequestedEnvironment(input.automation ?? {})),
     )
     const evidence = {
-        ...requestedInputEvidenceEnvironment(input.agentEnvironment ?? {}),
+        ...requestedInputEvidenceEnvironment(agentEnvironment ?? {}),
         ...requestedInputEvidenceEnvironment(input.runtime ?? {}),
         ...requestedInputEvidenceEnvironment(input.automation ?? {}),
         ...requestedInputEvidenceEnvironment(input.explicit),
@@ -418,7 +470,7 @@ export function buildResumedSessionSpawnEnvironment(input: {
         ...runtime,
         ...automation,
         ...input.explicit,
-        ...(input.agentEnvironment ?? {}),
+        ...(agentEnvironment ?? {}),
         ...evidence,
         ...(policy !== undefined ? { [policyKey]: policy } : {}),
         APLUS_SESSION_ID: input.sessionId,
