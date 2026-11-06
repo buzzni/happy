@@ -95,6 +95,35 @@ afterEach(() => {
 });
 
 describe('workspace operations with an SSH origin and a sealed HTTPS credential', () => {
+    it('pushes the fast-forwarded collaboration branch through the signed HTTPS address', async () => {
+        git(repo, 'push', '--quiet', bare, 'main:collab-x');
+        git(repo, 'switch', '--quiet', '-c', 'collab-x');
+        pushOnline('online.txt', 'o');
+        git(repo, 'remote', 'set-url', 'origin', 'git@github.com:acme/app.git');
+        const sshCalls = join(root, 'ssh-called');
+        const ssh = join(root, 'ssh.sh');
+        writeFileSync(ssh, `#!/bin/sh\necho called >> '${sshCalls}'\necho 'Permission denied (publickey)' >&2\nexit 255\n`, { mode: 0o700 });
+        const previousSshCommand = process.env.GIT_SSH_COMMAND;
+        process.env.GIT_SSH_COMMAND = `sh '${ssh}'`;
+        try {
+            const answer = await call('pull-remote', {
+                workspaceDir: repo, remoteUrl: ONLINE, branch: 'collab-x', baseBranch: 'main',
+                mode: 'ff-only', expectedHead: git(repo, 'rev-parse', 'HEAD'), push: true,
+            }, true);
+
+            expect(answer, JSON.stringify(answer)).toMatchObject({ success: true });
+            const head = git(bare, 'rev-parse', 'main');
+            expect(answer.result).toMatchObject({ status: 'fast-forwarded', head, conflictCount: 0 });
+            expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
+            expect(git(bare, 'rev-parse', 'collab-x')).toBe(head);
+            expect(existsSync(sshCalls)).toBe(false);
+            expect(git(repo, 'config', '--get', 'remote.origin.url')).toBe('git@github.com:acme/app.git');
+        } finally {
+            if (previousSshCommand === undefined) delete process.env.GIT_SSH_COMMAND;
+            else process.env.GIT_SSH_COMMAND = previousSshCommand;
+        }
+    });
+
     it.each(['remote-status', 'pull-remote'] as const)('%s uses the signed address for both branches without an SSH login', async (op) => {
         git(repo, 'push', '--quiet', bare, 'main:collab-x');
         git(repo, 'switch', '--quiet', '-c', 'collab-x');
