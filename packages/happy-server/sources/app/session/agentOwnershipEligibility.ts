@@ -40,9 +40,25 @@ export function createAgentOwnershipEligibility(deps: { fetch?: typeof fetch; no
             return 'unavailable';
         }
         try {
-            const bytes = await response.arrayBuffer();
-            if (bytes.byteLength > MAX_RESPONSE_BYTES) return 'unavailable';
-            const answer = answerSchema.safeParse(JSON.parse(new TextDecoder().decode(bytes)));
+            if (!response.body) return 'unavailable';
+            const reader = response.body.getReader();
+            const bytes = new Uint8Array(MAX_RESPONSE_BYTES);
+            let size = 0;
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    if (value.byteLength > MAX_RESPONSE_BYTES - size) {
+                        await reader.cancel();
+                        return 'unavailable';
+                    }
+                    bytes.set(value, size);
+                    size += value.byteLength;
+                }
+            } finally {
+                reader.releaseLock();
+            }
+            const answer = answerSchema.safeParse(JSON.parse(new TextDecoder().decode(bytes.subarray(0, size))));
             if (!answer.success) return 'unavailable';
             return answer.data.eligible ? 'eligible' : 'ineligible';
         } catch {
