@@ -556,8 +556,8 @@ export async function reportSetupTokenUsage(sessionId: string, binding: string, 
 }
 /** Longer than the daemon's whole switch (Studio call, grant verification, token slot reads). */
 const SETUP_TOKEN_REBIND_TIMEOUT_MS = 90_000;
-export async function requestSetupTokenRebind(sessionId: string, binding: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal, options?: { startBudget: true }): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string; retryAfterMs?: number }> {
-  const result = await daemonPost('/setup-token/rebind', { sessionId, binding, ...(observation ? { observation } : {}), ...(options?.startBudget ? { startBudget: true } : {}) }, undefined, SETUP_TOKEN_REBIND_TIMEOUT_MS, signal);
+export async function requestSetupTokenRebind(sessionId: string, binding: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal, options?: { startBudget: true } | { startExhausted: true }): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string; retryAfterMs?: number }> {
+  const result = await daemonPost('/setup-token/rebind', { sessionId, binding, ...(observation ? { observation } : {}), ...(options && 'startBudget' in options ? { startBudget: true } : {}), ...(options && 'startExhausted' in options ? { startExhausted: true } : {}) }, undefined, SETUP_TOKEN_REBIND_TIMEOUT_MS, signal);
   if (result?.ok === true && result.environment && typeof result.environment === 'object'
     && Object.values(result.environment).every((value) => typeof value === 'string')) return { ok: true, environment: result.environment };
   // A recovery later than the session's 30-minute background wait still holds the session off until that wait ends.
@@ -588,7 +588,7 @@ export async function reportSetupTokenActivity(sessionId: string, binding: strin
 /** Mandatory organization execution admission; an old/unreachable daemon cannot grant it. */
 export async function requestSetupTokenStart(sessionId: string, binding: string, requestId: string, signal: AbortSignal): Promise<import('../claude/setupTokenStartBudget').StartDecision> {
   const result = await daemonPost('/setup-token/start', { sessionId, binding, requestId }, undefined, 15_000, signal);
-  if (result?.ok !== true) throw new Error('SETUP_TOKEN_START_UNAVAILABLE');
+  if (result?.ok !== true) throw new Error(result?.reason === 'START_ACCOUNT_EXHAUSTED' ? 'SETUP_TOKEN_START_ACCOUNT_EXHAUSTED' : 'SETUP_TOKEN_START_UNAVAILABLE');
   const value = result.admission;
   if (value?.state === 'allowed' && Number.isSafeInteger(value.validForMs) && value.validForMs > 0 && value.validForMs <= 15_000) return value;
   if (value?.state === 'wait' && Number.isSafeInteger(value.retryAfterMs) && value.retryAfterMs > 0 && value.retryAfterMs <= 600_000 && Array.isArray(value.preferredAccountIds) && value.preferredAccountIds.every((id: unknown) => typeof id === 'string')) return value;

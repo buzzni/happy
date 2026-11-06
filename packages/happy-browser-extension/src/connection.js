@@ -10,6 +10,9 @@ import { reconnectDelayMs } from './backoff.js'
 
 export const DEFAULT_PORT = 41777
 export const KEEPALIVE_INTERVAL_MS = 20_000
+/** Wakes the worker while the daemon is gone: MV3 stops an idle worker ~30s after the socket
+ *  drops, and the backoff timer dies with it. 30s is the shortest delay Chrome honours. */
+export const RECONNECT_ALARM = 'bridge-reconnect'
 
 /** Connected and idle. */
 const BADGE_IDLE = { text: '●', color: '#4a9d5f' }
@@ -124,6 +127,7 @@ export function createConnection({
         ws.addEventListener('open', () => {
             consecutiveFailures = 0
             setBadge(BADGE_IDLE)
+            chrome.alarms?.clear(RECONNECT_ALARM)
             keepaliveTimer = setInterval(() => {
                 if (ws.readyState === WebSocketImpl.OPEN) ws.send(JSON.stringify({ type: 'ping' }))
             }, keepaliveIntervalMs)
@@ -164,6 +168,7 @@ export function createConnection({
             socket = null
             setBadge(event?.code === 4401 ? BADGE_AUTH_ERROR : BADGE_OFF)
             scheduleReconnect()
+            chrome.alarms?.create(RECONNECT_ALARM, { delayInMinutes: 0.5 })
         }
         ws.addEventListener('close', onGone)
         ws.addEventListener('error', onGone)

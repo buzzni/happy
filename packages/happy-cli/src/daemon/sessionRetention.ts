@@ -63,16 +63,18 @@ export function createSessionRetention(deps: { home: string; children(): readonl
             store.sessions[sessionId] = record;
             mkdirSync(deps.home, { recursive: true, mode: 0o700 });
             const temp = `${file}.${randomUUID()}.tmp`;
+            let renamed = false;
             try {
                 const fd = openSync(temp, 'wx', 0o600);
                 try { writeFileSync(fd, JSON.stringify(store)); fsyncSync(fd); } finally { closeSync(fd); }
                 renameSync(temp, file);
+                renamed = true;
                 if (process.platform !== 'win32') {
                     const directory = openSync(deps.home, 'r');
                     try { fsyncSync(directory); } finally { closeSync(directory); }
                 }
             } catch {
-                indeterminate = true;
+                indeterminate = renamed;
                 throw Error('RETENTION_STORE_UNAVAILABLE');
             } finally { try { unlinkSync(temp); } catch { /* already committed */ } }
             return snapshot(sessionId, record);

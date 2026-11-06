@@ -25,6 +25,7 @@ import { configuration } from '@/configuration';
 import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
 import { initialMachineMetadata } from '@/daemon/run';
 import { createChangeTitleHandler, startHappyServer } from '@/claude/utils/startHappyServer';
+import { linkedPullRequestToolsAllowed } from '@/claude/utils/linkedPullRequestTools';
 import { startHookServer } from '@/claude/utils/startHookServer';
 import { generateHookSettingsFile, cleanupHookSettingsFile } from '@/claude/utils/generateHookSettings';
 import { handOffCuaToShadowProxy, isToolPolicyEnabled } from '@/toolPolicy/claudeHook';
@@ -89,6 +90,7 @@ import {
 } from './initialPrompt';
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
+import { BASH_PREFIX_MATCHER_CAPABILITY } from './utils/bashPrefixMatcher';
 import { takeSessionSourceFromEnv } from '@/utils/sessionSource';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { createManagedFollowUpHandler } from '@/managed/managedFollowUp';
@@ -303,6 +305,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // 물러나지 않고 던진다. settings.json 은 세션별 staged 홈 상대라 정책 소스가
     // 될 수 없다 — sandboxPolicy.ts 의 주석 참조.
     const sandboxPolicyMode = resolveSessionSandboxPolicyMode(process.env);
+    // Registration and advertisement follow the same decision (specs/linked-pull-requests R2-3).
+    const linkedPullRequestTools = linkedPullRequestToolsAllowed(process.env);
     const sandboxConfig = resolveSessionSandboxConfig({
         noSandbox: Boolean(options.noSandbox),
         env: process.env,
@@ -363,6 +367,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         createdBy: createdByAccountId ? { accountId: createdByAccountId, displayName: createdByDisplayName } : undefined,
         source,
         approvalLifecycle: true,
+        permissionGrants: BASH_PREFIX_MATCHER_CAPABILITY,
+        linkedPullRequestTools,
     });
 
     // Resume-in-place must use the latest server document as its metadata
@@ -542,6 +548,15 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     stage('checkpoint-composition');
     // Create realtime session
     const session = launchControl ? api.sessionSyncClient(response, { trackShutdownStorage: true }) : api.sessionSyncClient(response);
+    // Managed attachments (and existing session tags) return persisted metadata instead of the
+    // fresh document above. Only this running Claude process may advertise its matcher there.
+    session.updateMetadata((meta) => ({
+        ...meta,
+        runtimeCapabilities: {
+            ...meta.runtimeCapabilities,
+            permissionGrants: BASH_PREFIX_MATCHER_CAPABILITY,
+        },
+    }));
     stage('session-client');
     // Created with the message queue below; MCP tools admitted before then are refused by the gate itself.
     let runtimeGate: RuntimeProducerGate | undefined;
@@ -793,6 +808,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         delegatedAttendance: () => delegatedAttendanceFor(turnAttendance.current()),
         browserHostContinues: process.env.HAPPY_AUTOMATION_BROWSER_CONTINUATION === '1',
         mandatorySandbox: sandboxPolicyMode === 'mandatory',
+        linkedPullRequestTools,
         sameUidSandbox: Boolean(scopeLaunch),
         // claudeLocal wraps Claude (and so the bridge) with sandbox-runtime; the session may switch to local mode.
         wrappedSandbox: checkpointComposition.sandboxConfig?.enabled === true && process.platform !== 'win32',

@@ -284,6 +284,14 @@ export class BrowserBridge {
                 `another process holds browser bridge port ${this.heldPort}, so Chrome is connected to it instead of this daemon`
             ))
         }
+        if (!connection && opts.viewerKey && !opts.profile
+            && Array.from(this.byTarget.values()).some((other) => other.viewerKey === undefined)) {
+            // Only a machine-token pairing counts here: whether another viewer is connected must not leak.
+            return Promise.reject(new BridgeRequestError(
+                'VIEWER_NOT_CONNECTED',
+                'Chrome is connected to this bridge with the machine token, but not for this Saycode account'
+            ))
+        }
         if (!connection) {
             // Naming what *is* connected turns "nothing is connected" (false,
             // and unactionable, when the caller simply named the wrong

@@ -29,6 +29,7 @@ import {
     type SpawnSessionResult,
 } from '../modules/common/registerCommonHandlers';
 import { LIST_FILES_PAGE_CAPABILITY } from '../modules/common/listFilesPageCapability';
+import { BASH_PREFIX_MATCHER_CAPABILITY } from '../claude/utils/bashPrefixMatcher';
 import { createManagedProjectWriteScopePolicy, TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '../modules/common/machineRunProfile';
 import { hostManagedMachineTools } from '../modules/common/moaiMachineRunProfiles';
 import { resolveDaemonAllowedRoot, resolveDaemonApprovedRoots } from '../modules/common/resolveAllowedRoot';
@@ -1461,6 +1462,7 @@ export class ApiMachineClient {
                 model,
                 effort,
                 environmentVariables,
+                seedDefaultAgentGrant: true,
                 additionalDirectories: validAdditionalDirectories,
                 token,
                 happyToken,
@@ -4443,6 +4445,11 @@ export class ApiMachineClient {
             const advertisedListFilesPage = this.managedHandlers ? undefined : LIST_FILES_PAGE_CAPABILITY;
             const listFilesPageStale = JSON.stringify(this.machine.metadata?.listFilesPage)
                 !== JSON.stringify(advertisedListFilesPage);
+            // Availability hint only: every live session owns its permission handler and must
+            // publish its own runtimeCapabilities.permissionGrants, including on a managed runtime.
+            // Detached older sessions do not gain that session marker when this daemon upgrades.
+            const permissionGrantsStale = JSON.stringify(this.machine.metadata?.permissionGrants)
+                !== JSON.stringify(BASH_PREFIX_MATCHER_CAPABILITY);
             const advertisedChannelHost = this.managedHandlers ? undefined : this.channelHostAdvertisement;
             const channelHostStale = JSON.stringify(this.machine.metadata?.channelHost)
                 !== JSON.stringify(advertisedChannelHost);
@@ -4491,7 +4498,7 @@ export class ApiMachineClient {
             // Bounded: an acknowledgement that never comes must not block every later change.
             const awaitingServer = this.capabilityUpdateInFlight !== null
                 && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
-            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || agentPlanStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || writeFileAttemptStale || listFilesPageStale)) {
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || agentPlanStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || writeFileAttemptStale || listFilesPageStale || permissionGrantsStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -4528,6 +4535,7 @@ export class ApiMachineClient {
                     structuredOutput: advertisedStructuredOutput,
                     writeFileAttempt: advertisedWriteFileAttempt,
                     listFilesPage: advertisedListFilesPage,
+                    permissionGrants: BASH_PREFIX_MATCHER_CAPABILITY,
                     channelHost: advertisedChannelHost,
                     rpcBinding: advertisedRpcBinding,
                     sealedSpawnEnv: advertisedSealedSpawnEnv,

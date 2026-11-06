@@ -47,6 +47,10 @@ export interface CreateSessionMetadataOptions {
     source?: SessionSource;
     /** The runner wires the unattended approval wait (codexcli-approval-session-binding R15). */
     approvalLifecycle?: boolean;
+    /** Permission-grant matching implemented by this runner, not by its parent daemon. */
+    permissionGrants?: NonNullable<Metadata['runtimeCapabilities']>['permissionGrants'];
+    /** This runner gives its agent the Happy MCP server's linked pull request tools (not under a mandatory sandbox). */
+    linkedPullRequestTools?: boolean;
 }
 
 /**
@@ -91,6 +95,8 @@ export function createSessionMetadata(opts: CreateSessionMetadataOptions): Sessi
         runtimeCapabilities: {
             saycodeSystemPromptPreference: true,
             ...(opts.approvalLifecycle ? { approvalLifecycle: 1 as const } : {}),
+            ...(opts.permissionGrants ? { permissionGrants: opts.permissionGrants } : {}),
+            ...(opts.linkedPullRequestTools ? { linkedPullRequests: 1 as const } : {}),
         },
         rpcBinding: RPC_BINDING_CAPABILITY,
         os: os.platform(),

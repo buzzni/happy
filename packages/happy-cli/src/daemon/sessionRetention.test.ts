@@ -1,4 +1,6 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,7 +12,7 @@ import type { TrackedSession } from './types';
 
 const HOUR = 3600000;
 const dirs: string[] = [];
-afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => { vi.restoreAllMocks(); syncBuiltinESMExports(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 function fixture() {
   const home = mkdtempSync(join(tmpdir(), 'retention-')); dirs.push(home);
   let now = 10 * HOUR;
@@ -21,6 +23,32 @@ function fixture() {
   return { home, open, setTime: (t: number) => { now = t; }, clear: () => { children = []; } };
 }
 describe('session retention at the daemon boundary', () => {
+  it('preserves confirmed policy and allows retry after a pre-rename disk failure', async () => {
+    const h = fixture(), service = h.open();
+    await service.set({ sessionId: 'a', policy: { mode: 'keep-alive' }, expectedRevision: 0 });
+    const before = fs.readFileSync(join(h.home, 'session-retention.v1.json'), 'utf8'), original = fs.openSync;
+    let fail = true;
+    const fault = vi.spyOn(fs, 'openSync').mockImplementation((...args: Parameters<typeof fs.openSync>) => {
+      if (String(args[0]).endsWith('.tmp') && fail) { fail = false; throw Object.assign(Error('disk full'), { code: 'ENOSPC' }); }
+      return original(...args);
+    });
+    syncBuiltinESMExports();
+    await expect(service.set({ sessionId: 'a', policy: { mode: 'default' }, expectedRevision: 1 })).rejects.toThrow('RETENTION_STORE_UNAVAILABLE');
+    fault.mockRestore(); syncBuiltinESMExports();
+    expect(fs.readFileSync(join(h.home, 'session-retention.v1.json'), 'utf8')).toBe(before);
+    expect(await service.get({ sessionId: 'a' })).toMatchObject({ policy: { mode: 'keep-alive' }, revision: 1 });
+    expect(await service.set({ sessionId: 'a', policy: { mode: 'default' }, expectedRevision: 1 })).toMatchObject({ revision: 2 });
+  });
+  it.skipIf(process.platform === 'win32')('holds an indeterminate policy after rename when directory fsync fails', async () => {
+    const h = fixture(), service = h.open(), original = fs.fsyncSync;
+    let calls = 0;
+    const fault = vi.spyOn(fs, 'fsyncSync').mockImplementation(fd => { if (++calls === 2) throw Error('directory fsync failed'); original(fd); });
+    syncBuiltinESMExports();
+    await expect(service.set({ sessionId: 'a', policy: { mode: 'keep-alive' }, expectedRevision: 0 })).rejects.toThrow('RETENTION_STORE_UNAVAILABLE');
+    fault.mockRestore(); syncBuiltinESMExports();
+    await expect(service.get({ sessionId: 'a' })).rejects.toThrow('RETENTION_STORE_UNAVAILABLE');
+    expect(await h.open().get({ sessionId: 'a' })).toMatchObject({ revision: 1 });
+  });
   it('persists only the chosen conversation, restores after restart and rejects stale writes', async () => {
     const h = fixture(), service = h.open();
     expect(await service.get({ sessionId: 'a' })).toMatchObject({ version: 1, policy: { mode: 'default' }, revision: 0 });

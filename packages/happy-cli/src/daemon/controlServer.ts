@@ -543,13 +543,13 @@ export function startDaemonControlServer({
     });
     typed.post('/setup-token/rebind', {
       bodyLimit: 4096,
-      schema: { body: z.object({ sessionId: z.string().min(1).max(128), binding: z.string().min(1).max(8192), observation: setupTokenObservation.optional(), startBudget: z.literal(true).optional() }).strict() },
+      schema: { body: z.object({ sessionId: z.string().min(1).max(128), binding: z.string().min(1).max(8192), observation: setupTokenObservation.optional(), startBudget: z.literal(true).optional(), startExhausted: z.literal(true).optional() }).strict().refine(v => !v.startExhausted || (!v.startBudget && !v.observation)) },
     }, async (request, reply) => {
       const signal = rotationSignal(reply.raw);
       const switcher = getSetupTokenAccountSwitch();
       if (!switcher) return { ok: false as const, reason: 'STUDIO_UNAVAILABLE' as const };
-      const { sessionId, binding, observation, startBudget } = request.body;
-      return startBudget ? switcher.rebind(sessionId, binding, observation, signal, { startBudget }) : switcher.rebind(sessionId, binding, observation, signal);
+      const { sessionId, binding, observation, startBudget, startExhausted } = request.body;
+      return startExhausted ? switcher.rebind(sessionId, binding, observation, signal, { startExhausted }) : startBudget ? switcher.rebind(sessionId, binding, observation, signal, { startBudget }) : switcher.rebind(sessionId, binding, observation, signal);
     });
 
     if (sessionRetention) for (const action of ['get', 'set'] as const) {
@@ -1078,7 +1078,7 @@ export function startDaemonControlServer({
           if (e instanceof BridgeRequestError) {
             logger.debug(`[CONTROL SERVER] browser/request ${method} failed: ${e.code} ${e.message}`);
             reply.code(
-              e.code === 'NO_EXTENSION_CONNECTED' || e.code === 'BRIDGE_PORT_IN_USE' ? 503 :
+              e.code === 'NO_EXTENSION_CONNECTED' || e.code === 'BRIDGE_PORT_IN_USE' || e.code === 'VIEWER_NOT_CONNECTED' ? 503 :
               e.code === 'TIMEOUT' ? 504 :
               502
             );
