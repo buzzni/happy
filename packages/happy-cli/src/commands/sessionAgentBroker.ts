@@ -1,7 +1,7 @@
 import type { SessionOwnerContact } from '@/daemon/sessionOwnerContact'
 import { configuration } from '@/configuration'
 import { runAgentHostProcess } from './agentHostProcess'
-import { createAgentIdentityAuthority, type AgentIdentityAuthority } from '@/daemon/agentIdentityDescriptor'
+import { unavailableAgentIdentityAuthority, type AgentIdentityAuthority } from '@/daemon/agentIdentityDescriptor'
 import { readFileSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, resolve } from 'node:path'
@@ -35,7 +35,7 @@ export function createAgentHostExecutor(input: {
   const manifest = manifestPath ? JSON.parse(readFileSync(manifestPath, 'utf8')) : null
   if (!input.entrypoint && typeof manifest?.bin?.saycode !== 'string') throw new Error('Missing bundled agent CLI')
   const entrypoint = input.entrypoint ?? resolve(dirname(manifestPath!), manifest.bin.saycode)
-  const identityAuthority = input.identityAuthority ?? createAgentIdentityAuthority()
+  const identityAuthority = input.identityAuthority ?? unavailableAgentIdentityAuthority
   return (argv: string[], signal: AbortSignal): Promise<AgentBrokerResult> => {
     const attendance = input.delegatedAttendance?.() ?? null
     const callEnv = attendance ? { ...env, [DELEGATED_ATTENDANCE_ENV]: attendance } : env
