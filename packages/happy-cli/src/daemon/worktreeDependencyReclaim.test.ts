@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { reclaimWorktreeDependencies, type ReclaimDependencies } from './worktreeDependencyReclaim';
 import { createWorktreeReclaimHandler } from './worktreeDependencyReclaimRpc';
+import { createFilesystemWriteAdmission, createWorkspaceTurnAdmission } from '@/utils/workspaceTurnAdmission';
 
 const exec = promisify(execFile);
 const garbage: string[] = [];
@@ -43,6 +44,47 @@ async function exists(path: string) { return access(path).then(() => true, () =>
 afterEach(async () => { for (const root of garbage.splice(0)) await rm(root, { recursive: true, force: true }); });
 
 describe('worktree dependency reclaim', () => {
+    it('keeps RPC cleanup retryable behind automatic ownership and releases proven filesystem work after removal', async () => {
+        const { allowed, root, worktree } = await fixture();
+        const owner = createWorkspaceTurnAdmission({ home: allowed, roots: [root], kind: 'automation', sessionId: 'reclaim-auto' });
+        expect(await owner.tryAcquire()).toEqual({ acquired: true });
+        const handler = Reflect.apply(createWorktreeReclaimHandler, undefined,
+            [allowed, deps(), undefined, createFilesystemWriteAdmission({ home: allowed })]) as ReturnType<typeof createWorktreeReclaimHandler>;
+        const blocked = await handler({ path: root });
+        expect(blocked.deletedPaths).toBe(0); expect(blocked.errors).toContain('WORKSPACE_BUSY');
+        expect(await exists(join(worktree, 'node_modules'))).toBe(true);
+        expect(await owner.release(true)).toBe(true);
+        expect((await handler({ path: root })).deletedPaths).toBe(1);
+        expect(await exists(join(worktree, 'node_modules'))).toBe(false);
+        expect(await owner.tryAcquire()).toEqual({ acquired: true }); await owner.release(true);
+    });
+
+    it('does not acquire filesystem ownership for a healthy cleanup request', async () => {
+        const { allowed, root } = await fixture();
+        const withFilesystemMutation = vi.fn(createFilesystemWriteAdmission({ home: allowed }));
+        const handler = Reflect.apply(createWorktreeReclaimHandler, undefined, [allowed, {
+            storage: async () => ({ totalBytes: 1000 * GiB, availableBytes: 100 * GiB }),
+        }, undefined, withFilesystemMutation]) as ReturnType<typeof createWorktreeReclaimHandler>;
+        const owner = createWorkspaceTurnAdmission({ home: allowed, roots: [root], kind: 'automation', sessionId: 'healthy-reclaim-auto' });
+        expect(await owner.tryAcquire()).toEqual({ acquired: true });
+        try { expect((await handler({ path: root })).status).toBe('not-needed'); expect(withFilesystemMutation).not.toHaveBeenCalled(); }
+        finally { await owner.release(true); }
+    });
+
+    it('holds the cleanup filesystem lease through a failed delete without repeating it or leaking ownership', async () => {
+        const { allowed, root, worktree } = await fixture();
+        const owner = createWorkspaceTurnAdmission({ home: allowed, roots: [root], kind: 'automation', sessionId: 'failed-reclaim-auto' });
+        const remove = vi.fn(async () => {
+            expect(await owner.tryAcquire()).toMatchObject({ acquired: false });
+            throw new Error('fixture delete denied');
+        });
+        const handler = Reflect.apply(createWorktreeReclaimHandler, undefined,
+            [allowed, { ...deps(), remove }, undefined, createFilesystemWriteAdmission({ home: allowed })]) as ReturnType<typeof createWorktreeReclaimHandler>;
+        expect((await handler({ path: root })).errors).toContain('fixture delete denied');
+        expect(remove).toHaveBeenCalledOnce();
+        expect(await exists(join(worktree, 'node_modules'))).toBe(true);
+        expect(await owner.tryAcquire()).toEqual({ acquired: true }); await owner.release(true);
+    });
     it('does no git traversal or process scan when storage is healthy', async () => {
         const { allowed } = await fixture();
         const liveCwds = vi.fn();

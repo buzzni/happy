@@ -1047,7 +1047,7 @@ export class ApiMachineClient {
             },
         });
         this.rpcHandlerManager.registerHandler(
-            'worktree-dependencies:reclaim', createWorktreeReclaimHandler(allowedRoot),
+            'worktree-dependencies:reclaim', createWorktreeReclaimHandler(allowedRoot, {}, undefined, withFilesystemMutation),
         );
         // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 preview stage 2: a preview the
         // browser starts with the env the server sealed for this machine. Customer lane only.
