@@ -65,6 +65,8 @@ import type { NativeBrowserSession } from './nativeBrowserSession'
 /** A browser lifetime the runtime owns over pipes (installed service or personal desktop). */
 interface NativeRuntime {
     session: NativeBrowserSession
+    startBrowser?(): Promise<NativeBrowserSession>
+    onBrowserStopped?(listener: () => Promise<void>): void
     close(): Promise<void>
     /** Personal desktop: sockets in the user's directory instead of the config's. */
     sockets?: { broker: string; admin: string }
@@ -189,6 +191,27 @@ export async function connectAtStart(connections: Array<{ profileId: ProfileId; 
 export function browserReadiness(tenancyMode: 'dedicated' | 'shared', profileIds: ProfileId[], drivers: ReadonlyMap<ProfileId, Pick<CdpDriver, 'isConnected'>>): { browsers: boolean; profileBrowsers: Record<string, boolean> } {
     const profileBrowsers = Object.fromEntries(profileIds.map((profileId) => [profileId, drivers.get(profileId)?.isConnected() === true]))
     return { browsers: tenancyMode === 'shared' || Object.values(profileBrowsers).every(Boolean), profileBrowsers }
+}
+
+/** Serialize a new native lifetime's identity recovery before admitting any new
+ * task. The ordinary recovery path rejects old native instance ids and clears
+ * the profile's disconnect fence; it must not run twice for concurrent starts. */
+export function createPersonalBrowserAdmission(profileId: ProfileId, drivers: Map<ProfileId, CdpDriver>,
+    start: () => Promise<NativeBrowserSession>, reconnected: () => Promise<void>) {
+    let admitted: NativeBrowserSession | undefined, starting: Promise<void> | undefined
+    return (requested: ProfileId): Promise<void> => {
+        if (requested !== profileId) return Promise.reject(new BrowserRuntimeError('SCOPE_DENIED', 'Unknown personal browser profile'))
+        return starting ??= (async () => {
+            const session = await start()
+            await session.check()
+            if (session !== admitted) {
+                drivers.set(profileId, session.driver)
+                await reconnected()
+                await session.check()
+                admitted = session
+            }
+        })().finally(() => { starting = undefined })
+    }
 }
 
 /** A shared machine's Runtime waits this long for its browsers at start-up. */
@@ -420,7 +443,9 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
 
     // Harness keeps the PoC space quota and no idle reclamation unless asked.
     const harnessIdleMs = process.env.ABP_SPACE_IDLE_RECLAIM_MS ? Number(process.env.ABP_SPACE_IDLE_RECLAIM_MS) : undefined
-    const runtime = new BrowserRuntime({ store, drivers, sites,
+    const ensureBrowser = native?.startBrowser ? createPersonalBrowserAdmission(profiles[0].profileId, drivers,
+        native.startBrowser, () => runtime.onDriverReconnected(profiles[0].profileId)) : undefined
+    const runtime: BrowserRuntime = new BrowserRuntime({ store, drivers, sites, ...(ensureBrowser ? { ensureBrowser } : {}),
         pageViewEnabled: process.platform === 'darwin' && !!config?.personalDesktop,
         ...(config ? { profilePrincipals: config.profilePrincipals } : {}),
         ...(config?.profileAssignments ? { profileAssignments: config.profileAssignments } : {}),
@@ -430,6 +455,10 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
         spaceIdleReclaimMs: config?.spaceIdleReclaimMs ?? (Number.isFinite(harnessIdleMs) ? harnessIdleMs : undefined) })
 
     let shuttingDown = false
+    native?.onBrowserStopped?.(async () => {
+        await runtime.onDriverDisconnected(profiles[0].profileId)
+        log('personal browser stopped; waiting for a new browser task')
+    })
     if (native) void native.session.stopped.then(async () => {
         if (shuttingDown) return
         shuttingDown = true
@@ -613,8 +642,13 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
 
     const readyChecks = async (): Promise<Record<string, boolean>> => {
         const disk = await statfs(stateDir).catch(() => undefined)
+        // A personal broker can accept a new task while its browser is intentionally
+        // stopped. Its native admission still fails closed after unconfirmed cleanup.
+        const browsers = native?.startBrowser
+            ? await native.session.check().then(() => true, () => false)
+            : browserReadiness(config?.tenancyMode ?? 'dedicated', profiles.map((profile) => profile.profileId), drivers).browsers
         return {
-            browsers: browserReadiness(config?.tenancyMode ?? 'dedicated', profiles.map((profile) => profile.profileId), drivers).browsers,
+            browsers,
             writerLock: Date.now() - heartbeatOkAtMs <= 3 * LOCK_HEARTBEAT_MS && (flockHeld || !production),
             disk: Boolean(disk && disk.bavail * disk.bsize >= MIN_FREE_DISK_BYTES),
             revocations: (broker?.pendingRevocations() ?? 0) === 0,

@@ -21,6 +21,8 @@ import { transitionTask } from './stateMachine'
 /** Operations that only read a task's record: allowed on an earlier assignment's records for their owner. */
 const HISTORY_READ_OPERATIONS: ReadonlySet<Operation> = new Set<Operation>(['getTask', 'subscribe', 'listTasks'])
 export interface BrowserRuntimeOptions {
+    /** Personal PC only: a new, authorized task starts the owned browser on demand. */
+    ensureBrowser?: (profileId: ProfileId) => Promise<void>
     /** Enabled only by the personal macOS GUI runtime wrapper. */
     pageViewEnabled?: boolean
     store: TaskStore
@@ -375,6 +377,14 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             return this.view(duplicate.result as StoredTask)
         }
         this.assertSpaceOpen(space)
+        if (this.options.ensureBrowser) {
+            await this.options.ensureBrowser(space.profileId)
+            // Startup can await OS verification. Admission must still be current afterward.
+            space = this.requireSpace(req.taskSpaceId)
+            this.checkCredential(auth, 'createTask', space.profileId, req.taskSpaceId)
+            await this.authorizeSpace(auth, space)
+            this.assertSpaceOpen(this.requireSpace(req.taskSpaceId))
+        }
         const now = this.clock.now()
         const taskId = `task-${randomUUID()}` as TaskId
         const credential = auth.credential as AgentGrant
