@@ -2088,13 +2088,14 @@ export class CodexAppServerClient {
 
     async setGoal(opts: {
         threadId: string;
-        objective: string;
+        /** Omit to keep the stored objective (a status-only change: pause or resume). */
+        objective?: string;
         status?: ThreadGoalSetParams['status'];
         tokenBudget?: number | null;
     }): Promise<ThreadGoalSetResponse> {
         const params: ThreadGoalSetParams = {
             threadId: opts.threadId,
-            objective: opts.objective,
+            ...(opts.objective !== undefined ? { objective: opts.objective } : {}),
             ...(opts.status !== undefined ? { status: opts.status } : {}),
             ...(opts.tokenBudget !== undefined ? { tokenBudget: opts.tokenBudget } : {}),
         };

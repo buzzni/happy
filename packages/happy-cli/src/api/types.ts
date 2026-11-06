@@ -735,10 +735,14 @@ export type AgentGoalStatus = {
       status: 'active',
       sourceSessionId: string,
       text: string,
+      /** Codex: why the goal is or is not running. Absent from older runtimes, which only report `active`. */
+      phase?: 'active' | 'paused' | 'blocked' | 'usageLimited',
       capabilities?: {
         clear?: boolean,
         stop?: boolean,
         edit?: boolean,
+        /** `goal-action {action:'resume'}` restarts a paused goal without changing its objective. */
+        resume?: boolean,
       },
       progress?: {
         currentStep?: number,

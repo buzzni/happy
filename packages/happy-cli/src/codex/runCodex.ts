@@ -153,9 +153,11 @@ import { consumeReconnectFreshLaunch, consumeReconnectSessionEnvironment } from 
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import {
     codexGoalActionCapabilities,
+    codexGoalStatusForSharedState,
     mapCodexGoalEventToAgentGoalStatus,
     parseCodexGoalActionParams,
     parseCodexGoalCommand,
+    type AgentGoalPhase,
     type CodexGoalCommand,
 } from './codexGoalStatus';
 import {
@@ -1136,7 +1138,35 @@ export async function runCodex(opts: {
      * This is the equivalent of Claude Code's abort - it stops what's currently
      * happening but keeps the session alive for new prompts.
      */
-    async function handleAbort() {
+    async function pauseActiveGoalForStop() {
+        const threadId = client?.threadId;
+        if (codexGoalPhase !== 'active' || !threadId || !client.supportsGoalActions()) return;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+            // Pause first to prevent automatic continuation, but a stalled control RPC must not
+            // delay interruption and its forced-restart fallback for the normal 30-second RPC timeout.
+            const result = await Promise.race([
+                client.setGoal({ threadId, status: 'paused' }),
+                new Promise<null>(resolve => {
+                    timer = setTimeout(() => {
+                        logger.debug('[Codex] Goal pause deadline reached; proceeding with interruption');
+                        resolve(null);
+                    }, 1000);
+                }),
+            ]);
+            // A late pause response must not replace a goal resumed after this stop completed.
+            if (result) {
+                updateCodexGoalState({ type: 'thread_goal_updated', threadId, goal: result.goal });
+                messageBuffer.addMessage('Goal paused', 'status');
+            }
+        } catch (error) {
+            logger.debug('[Codex] Could not pause the goal on stop:', error);
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
+    }
+
+    async function handleAbort(opts: { pauseGoal?: boolean } = {}) {
         if (runtimeGate?.isFrozen()) return;
         // aplus-dev-studio-desktop#2111 — before any await, so the mark is in place when this RPC answers.
         session.markCurrentTurnAborted?.(); // optional: test doubles of the session omit it; the abort must not depend on it
@@ -1154,6 +1184,13 @@ export async function runCodex(opts: {
                 // Resolve any pending permission requests as 'abort' first.
                 if (permissionHandler) {
                     permissionHandler.abortAll();
+                }
+
+                // Codex continues an active goal on its own once the turn ends, so a user stop that leaves it
+                // active restarts the work. Codex's own TUI pauses the goal when interrupting for the same reason.
+                // Without an active goal, skip the extra await so the stop keeps its usual ordering.
+                if (opts.pauseGoal && codexGoalPhase === 'active') {
+                    await pauseActiveGoalForStop();
                 }
 
                 // Request interruption, then force-restart Codex app-server if
@@ -1293,7 +1330,7 @@ export async function runCodex(opts: {
     };
 
     // Register abort handler
-    session.rpcHandlerManager.registerHandler('abort', handleAbort);
+    session.rpcHandlerManager.registerHandler('abort', () => handleAbort({ pauseGoal: true }));
 
     if (runtimeGate) {
         session.rpcHandlerManager.registerHandler('killSession', async () => {
@@ -1622,6 +1659,8 @@ export async function runCodex(opts: {
             session.sendSessionProtocolMessage(envelope);
         }
     });
+    /** Last observed goal phase; `null` when there is no live goal. Decides whether a stop must pause it. */
+    let codexGoalPhase: AgentGoalPhase | null = null;
     const updateCodexGoalState = (message: Record<string, unknown>) => {
         const capabilities = codexGoalActionCapabilities(client.supportsGoalActions());
         const goalStatus = mapCodexGoalEventToAgentGoalStatus(
@@ -1632,9 +1671,10 @@ export async function runCodex(opts: {
         if (!goalStatus) {
             return;
         }
+        codexGoalPhase = goalStatus.status === 'active' ? goalStatus.phase ?? 'active' : null;
         session.updateAgentState((currentState) => ({
             ...currentState,
-            agentGoalStatus: goalStatus,
+            agentGoalStatus: codexGoalStatusForSharedState(goalStatus),
         }));
     };
     const handleCodexGoalCommand = async (
@@ -1661,6 +1701,20 @@ export async function runCodex(opts: {
                     });
                 }
                 messageBuffer.addMessage('Goal cleared', 'status');
+                return true;
+            }
+
+            if (command.type === 'pause' || command.type === 'resume') {
+                const result = await client.setGoal({
+                    threadId,
+                    status: command.type === 'pause' ? 'paused' : 'active',
+                });
+                updateCodexGoalState({
+                    type: 'thread_goal_updated',
+                    threadId,
+                    goal: result.goal,
+                });
+                messageBuffer.addMessage(command.type === 'pause' ? 'Goal paused' : 'Goal resumed', 'status');
                 return true;
             }
 
