@@ -30,6 +30,15 @@ function harness(overrides: Record<string, unknown> = {}) {
 }
 
 describe('personal desktop runtime bootstrap', () => {
+    it('keeps a deferred personal browser cold through preparation and admission checks', async () => {
+        const { deps, events } = harness({ deferBrowser: true })
+        const runtime = await bootstrapPersonalDesktopRuntime(config(), paths.stateDir, deps)
+        await runtime.session.check()
+        expect(events).not.toContain('launch')
+        await runtime.close()
+        expect(events).not.toContain('launch')
+        expect(events.at(-1)).toBe('unlock')
+    })
     it('keeps every file in the user Saycode directory', () => {
         expect(paths).toMatchObject({ root: '/Users/u/Library/Application Support/Saycode/browser-runtime',
             stateDir: '/Users/u/Library/Application Support/Saycode/browser-runtime/state',
@@ -46,12 +55,15 @@ describe('personal desktop runtime bootstrap', () => {
     it('runs a Windows browser as the runtime token user, with named pipes and no POSIX ownership checks', async () => {
         const windowsPaths = personalRuntimePaths('win32', { LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local' })
         const windowsConfig = { ...config(), personalDesktop: { platform: 'win32' as const, browserExecutable: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe' } }
-        const { deps } = harness({ platform: 'win32', uid: undefined, identity: 'S-1-5-21-1-2-3-1001',
+        const { deps } = harness({ deferBrowser: true, platform: 'win32', uid: undefined, identity: 'S-1-5-21-1-2-3-1001',
             env: { ABP_CONFIG_FILE: windowsPaths.configFile, LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local' } })
         const runtime = await bootstrapPersonalDesktopRuntime(windowsConfig, windowsPaths.stateDir, deps)
         expect(runtime.sockets).toEqual({ broker: windowsPaths.brokerSocket, admin: windowsPaths.adminSocket })
         expect(deps.prepareDirectory).toHaveBeenCalledWith(windowsPaths.profileDir, undefined)
+        expect(deps.launch).not.toHaveBeenCalled()
+        await runtime.startBrowser!()
         expect(deps.openSession).toHaveBeenCalledWith(expect.objectContaining({ protection: { mode: 'basic', identity: 'S-1-5-21-1-2-3-1001' } }))
+        await runtime.close()
     })
 
     it('prepares private directories, verifies the browser, locks, then opens a same-user session on the dedicated profile', async () => {

@@ -8,6 +8,7 @@ import { promisify } from 'node:util'
 import type { RuntimeConfig } from './runtimeConfig'
 import { acquireNativeWriterLock, readNativeProcessPrincipal, readNativeSessionOwner } from './nativeHostPrimitives'
 import { openNativeBrowserSession, type NativeBrowserSession } from './nativeBrowserSession'
+import { createPersonalBrowserDemand } from './personalBrowserDemand'
 import { launchPersonalBrowser, type PersonalBrowser } from './personalBrowserProcess'
 
 const exec = promisify(execFile)
@@ -74,6 +75,8 @@ export async function verifyPersonalBrowserExecutable(platform: 'darwin' | 'win3
 }
 
 export interface PersonalDesktopRuntimeDependencies {
+    /** The personal runtime broker may start while Chrome remains cold. */
+    deferBrowser?: boolean
     platform?: NodeJS.Platform
     uid?: number
     env?: NodeJS.ProcessEnv
@@ -92,6 +95,8 @@ export interface PersonalDesktopRuntimeDependencies {
 
 export interface PersonalDesktopRuntime {
     session: NativeBrowserSession
+    startBrowser?(): Promise<NativeBrowserSession>
+    onBrowserStopped?(listener: () => Promise<void>): void
     sockets: { broker: string; admin: string }
     onParentLost(listener: () => void): void
     close(): Promise<void>
@@ -119,13 +124,24 @@ export async function bootstrapPersonalDesktopRuntime(config: RuntimeConfig, sta
     if (!identity) throw new Error('ABP personal runtime cannot read its own OS identity')
 
     const lock = await (dependencies.lock ?? acquireNativeWriterLock)(paths.writerLock)
-    let browser: PersonalBrowser | undefined
+    const openBrowser = async (): Promise<NativeBrowserSession> => {
+        let browser: PersonalBrowser | undefined
+        try {
+            // A later demand may follow a Chrome update. Recheck the exact executable.
+            if (dependencies.deferBrowser) await (dependencies.verifyExecutable ?? verifyPersonalBrowserExecutable)(platform, personal.browserExecutable, env)
+            browser = await (dependencies.launch ?? launchPersonalBrowser)({ platform, executable: personal.browserExecutable, profileDir: paths.profileDir, env })
+            const owner = (dependencies.readOwner ?? readNativeSessionOwner)(browser.pid)
+            if (!owner) throw new Error('PERSONAL_BROWSER_EXITED')
+            return await (dependencies.openSession ?? openNativeBrowserSession)({ input: browser.input, output: browser.output, owner,
+                protection: { mode: 'basic', identity }, terminate: browser.terminate, maxAgentWindows: config.maxAgentWindows })
+        } catch (error) {
+            try { await browser?.terminate() } catch { throw new Error('ABP personal startup cleanup is unconfirmed') }
+            throw error
+        }
+    }
     try {
-        browser = await (dependencies.launch ?? launchPersonalBrowser)({ platform, executable: personal.browserExecutable, profileDir: paths.profileDir, env })
-        const owner = (dependencies.readOwner ?? readNativeSessionOwner)(browser.pid)
-        if (!owner) throw new Error('PERSONAL_BROWSER_EXITED')
-        const session = await (dependencies.openSession ?? openNativeBrowserSession)({ input: browser.input, output: browser.output, owner,
-            protection: { mode: 'basic', identity }, terminate: browser.terminate, maxAgentWindows: config.maxAgentWindows })
+        const demand = dependencies.deferBrowser ? createPersonalBrowserDemand(openBrowser) : undefined
+        const session = demand ?? await openBrowser()
         let closing: Promise<void> | undefined
         const parentListeners: Array<() => void> = []
         const parent = dependencies.parent ?? process.stdin
@@ -136,16 +152,17 @@ export async function bootstrapPersonalDesktopRuntime(config: RuntimeConfig, sta
         parent.once('error', lose)
         parent.resume()
         return { session, sockets: { broker: paths.brokerSocket, admin: paths.adminSocket },
+            ...(demand ? { startBrowser: demand.start, onBrowserStopped: demand.onBrowserStopped } : {}),
             onParentLost(listener) { if (parentLost) listener(); else parentListeners.push(listener) },
             close: () => closing ??= (async () => {
                 const result = await session.close()
-                await lock.close()
                 if (!result.terminated) throw new Error('ABP personal browser termination is unconfirmed')
+                await lock.close()
             })(),
         }
     } catch (error) {
         // Startup failure is fatal; never fall back to the user's own Chrome or a debugging port.
-        const cleanup = await Promise.allSettled([browser?.terminate(), lock.close()])
+        const cleanup = await Promise.allSettled([lock.close()])
         if (cleanup.some(result => result.status === 'rejected')) throw new Error('ABP personal startup cleanup is unconfirmed')
         throw error
     }
