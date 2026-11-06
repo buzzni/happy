@@ -1151,6 +1151,44 @@ async function requirePinnedOrigin(pins: WorkspaceRemotePins, dir: string, remot
     }
 }
 
+/** Check the selected transport with the same environment/configuration as the network call. */
+async function workspaceRemote(
+    dir: string,
+    remoteUrl: string | null,
+    credential: PreparedGitCredential | null,
+    push = false,
+): Promise<string> {
+    if (!credential || !remoteUrl) return 'origin';
+    const options = { network: true, credential, readOnly: true };
+    const fetchAddress = await runGit(dir, ['ls-remote', '--get-url', remoteUrl], options);
+    const addresses = [fetchAddress];
+    if (push) {
+        // Explicit URL pushes prefer the longest matching pushInsteadOf prefix, falling
+        // back to the normal insteadOf expansion when no push rule matches.
+        const rules = await runGit(dir, ['config', '--null', '--get-regexp', '^url\\..*\\.pushinsteadof$'], options);
+        if (rules.code !== 0 && rules.code !== 1) {
+            throw new OpFailure('WORKTREE_REMOTE_MISMATCH', '온라인 push 주소를 확인할 수 없습니다.');
+        }
+        let longest = -1;
+        let pushAddress = fetchAddress.stdout.trim();
+        for (const entry of rules.stdout.split('\0').filter(Boolean)) {
+            const separator = entry.indexOf('\n');
+            const prefix = entry.slice(separator + 1);
+            if (separator >= 0 && remoteUrl.startsWith(prefix) && prefix.length > longest) {
+                longest = prefix.length;
+                pushAddress = entry.slice(4, separator - '.pushinsteadof'.length) + remoteUrl.slice(prefix.length);
+            }
+        }
+        addresses.push({ code: 0, stdout: pushAddress, stderr: '' });
+    }
+    const identity = repositoryIdentity(remoteUrl); // requirePinnedOrigin already checked this identity.
+    if (!identity || addresses.some((result) => result.code !== 0 || !result.stdout.trim()
+        || result.stdout.trim().split('\n').some((address) => repositoryIdentity(address) !== identity))) {
+        throw new OpFailure('WORKTREE_REMOTE_MISMATCH', '선택한 온라인 주소가 연결된 저장소와 다른 저장소를 가리킵니다.');
+    }
+    return remoteUrl;
+}
+
 /** The folder is a repository's root, not a folder inside some repository around it. */
 async function isRepositoryRoot(dir: string): Promise<boolean> {
     return await repositoryRoot(dir) === slashed(dir);
@@ -1182,7 +1220,7 @@ async function workspaceRemoteStatus(
     return serialized(dir, async () => {
         if (!await isRepositoryRoot(dir)) return { isRepo: false, head: null, branch: null, dirtyCount: 0, ahead: null, behind: null, baseBehind: null };
         await requirePinnedOrigin(pins, dir, params.remoteUrl);
-        const remote = credential && params.remoteUrl ? params.remoteUrl : 'origin';
+        const remote = await workspaceRemote(dir, params.remoteUrl, credential);
         const online = await fetchBranch(dir, remote, params.branch, credential, true);
         const base = params.baseBranch ? await fetchBranch(dir, remote, params.baseBranch, credential, true) : null;
         const head = await headCommit(dir);
@@ -1206,6 +1244,7 @@ async function fastForwardWorkspace(
     targets: string[],
     head: string | null,
     credential: PreparedGitCredential | null,
+    remote: string,
 ): Promise<WorktreeOpResult<'pull-remote'>> {
     if (await dirtyCount(dir) > 0) return { status: 'dirty', head, conflictCount: 0 };
     if (await currentBranch(dir) !== params.branch) {
@@ -1216,7 +1255,7 @@ async function fastForwardWorkspace(
         if ((await runGit(dir, ['merge', '--ff-only', target])).code !== 0) return { status: 'diverged', head: await headCommit(dir), conflictCount: 0 };
     }
     if (params.push) {
-        const pushed = await runGit(dir, ['push', 'origin', `refs/heads/${params.branch}:refs/heads/${params.branch}`], {
+        const pushed = await runGit(dir, ['push', remote, `refs/heads/${params.branch}:refs/heads/${params.branch}`], {
             network: true, credential, timeoutMs: NETWORK_TIMEOUT_MS,
         });
         if (pushed.code !== 0) {
@@ -1263,11 +1302,11 @@ async function pullWorkspaceRemote(
         // A conflict an earlier pull left is the user's to resolve: committing it would save the markers.
         const unresolved = await unmergedPaths(dir);
         if (unresolved.length > 0) return { status: 'conflict', head, conflictCount: unresolved.length };
-        const remote = credential && params.remoteUrl ? params.remoteUrl : 'origin';
+        const remote = await workspaceRemote(dir, params.remoteUrl, credential, params.mode === 'ff-only' && params.push);
         const targets = [(await fetchBranch(dir, remote, params.branch, credential, false))!];
         if (params.baseBranch) targets.push((await fetchBranch(dir, remote, params.baseBranch, credential, false))!);
         return params.mode === 'ff-only'
-            ? fastForwardWorkspace(dir, params, targets, head, credential)
+            ? fastForwardWorkspace(dir, params, targets, head, credential, remote)
             : mergeIntoWorkspace(dir, params, targets);
     });
 }
