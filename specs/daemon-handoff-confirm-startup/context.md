@@ -1,5 +1,23 @@
 # context — daemon-handoff-confirm-startup
 
+## 2026-11-06 후속: 느린 소유 daemon 앞에서 한 번의 health 실패로 자식이 죽음
+
+- 근거: 운영 공용 Linux 머신(c593bc29)에서 새 세션 자식이
+  `DAEMON_HEALTH_UNCONFIRMED: PID ... is alive but its control server could not be verified` 로
+  exit 1 했고, 같은 날 같은 머신에서 spawn RPC 시간 초과·소켓 끊김이 이어졌다. 어떤 부모 조건
+  (offline 소켓·중간 launcher·버전)이 지름길을 막았는지는 머신 로그를 못 봐 확정하지 않았다.
+- 결정: 지름길 조건(소유 증명)은 바꾸지 않는다. 검증 경로에서 `DAEMON_HEALTH_UNCONFIRMED` 만
+  15초 동안 1초 간격으로 다시 확인한다. daemon 의 세션 시작 대기(60초) 안에서 끝난다.
+  다른 오류는 재시도하지 않고, 끝까지 미확인이면 이전처럼 막는다. 교체 daemon 은 띄우지 않는다.
+- TDD: 느린 소유자가 두 번째 확인에서 응답하면 계속 진행(1), 60초의 절반 안에 포기(1),
+  다른 오류 비재시도(1) 추가. 기존 미확인 거부 테스트는 fake timer 로 같은 결론을 확인한다.
+  실제 프로세스 테스트(lock 불일치)는 여전히 blocked·보고 0건·state/lock 원문 보존이고
+  health 요청 수만 1 → 여러 번으로 바뀌었다.
+- 뮤테이션: 재시도 0 → "계속 진행" 테스트 실패, 재시도 40초 → "절반 안에 포기" 테스트 실패.
+- 검증: `pnpm run typecheck` 통과. `src/daemon` 5,245건 통과. 실패는 happy-server 의존성을
+  설치하지 않은 워크트리에서 `daemon.integration.test.ts` 가 로드되지 않은 1건이다.
+- 반영: 실제 머신에는 이 수정이 담긴 CLI 릴리스(CI tag publish) 후 데몬 업데이트가 필요하다.
+
 ## 2026-10-19 후속: 온라인 소유 daemon이 띄운 자식의 중복 health 확인
 
 진행 중. 사용자 권한은 수정·관련 검증·main 반영이며 새 Windows Trial 빌드/설치 검증은

@@ -7,6 +7,11 @@ import { isPidAlive, readDaemonLockHolderPid, readDaemonState } from '@/persiste
 
 const DAEMON_READY_TIMEOUT_MS = 5000
 const DAEMON_READY_POLL_INTERVAL_MS = 100
+// A live owner whose control server misses one 2s probe is usually busy, not gone. Its child keeps
+// checking well inside the daemon's 60s session-start wait (spawnWebhookWait) instead of exiting
+// before it can report in. It still never replaces an owner it could not verify.
+const HEALTH_UNCONFIRMED_RETRY_MS = 15_000
+const HEALTH_UNCONFIRMED_RETRY_INTERVAL_MS = 1_000
 
 /** The online lock owner just spawned us; its authenticated session reports still apply. */
 async function isCurrentDaemonParent(): Promise<boolean> {
@@ -21,6 +26,19 @@ async function isCurrentDaemonParent(): Promise<boolean> {
   return readDaemonLockHolderPid() === state.pid && isPidAlive(state.pid)
 }
 
+async function isCurrentVersionRunningAllowingSlowOwner(): Promise<boolean> {
+  const deadline = Date.now() + HEALTH_UNCONFIRMED_RETRY_MS
+  while (true) {
+    try {
+      return await isDaemonRunningCurrentlyInstalledHappyVersion()
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.startsWith('DAEMON_HEALTH_UNCONFIRMED') || Date.now() >= deadline) throw error
+      logger.debug('[DAEMON CONTROL] Daemon health unconfirmed; checking again')
+      await new Promise(resolve => setTimeout(resolve, HEALTH_UNCONFIRMED_RETRY_INTERVAL_MS))
+    }
+  }
+}
+
 export async function ensureDaemonRunning(): Promise<void> {
   logger.debug('Ensuring Happy background service is running & matches our version...')
 
@@ -29,7 +47,7 @@ export async function ensureDaemonRunning(): Promise<void> {
     return
   }
 
-  if (await isDaemonRunningCurrentlyInstalledHappyVersion()) {
+  if (await isCurrentVersionRunningAllowingSlowOwner()) {
     return
   }
 
