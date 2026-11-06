@@ -153,7 +153,7 @@ export function registerBrowserTaskTools(mcp: McpServer, client: RuntimeClient, 
 
     mcp.registerTool('browser_task_create_space', {
         title: 'Create browser task space',
-        description: 'Create an isolated task space (tab group) in the granted browser profile. profileId defaults to the session’s granted profile.' + sessionNote,
+        description: 'Create an isolated task space (tab group) in the granted browser profile. profileId defaults to the session’s granted profile. Its result holds only taskSpaceId: the space has no task yet (no taskId), so call browser_task_create with it next.' + sessionNote,
         inputSchema: { profileId: z.string().min(1).optional(), requestId: reqId },
     }, async (a) => { const r = id(a.requestId); return run(r, async () => client.createSpace({ profileId: ((brokerDecides ? undefined : a.profileId) ?? await grantedProfile()) as never, requestId: r as never })) })
 
@@ -168,7 +168,7 @@ export function registerBrowserTaskTools(mcp: McpServer, client: RuntimeClient, 
 
     mcp.registerTool('browser_task_create', {
         title: 'Create browser task',
-        description: 'Create a task inside a task space. The task keeps running on the runtime even if this session disconnects.' + sessionNote,
+        description: 'Create a task inside a task space. The task keeps running on the runtime even if this session disconnects. Returns the taskId that browser_task_open_page and browser_task_submit_batch take.' + sessionNote,
         inputSchema: { taskSpaceId: z.string().min(1), requestId: reqId },
     }, async (a) => { const r = id(a.requestId); return run(r, () => client.createTask({ taskSpaceId: a.taskSpaceId as never, requestId: r as never })) })
 
