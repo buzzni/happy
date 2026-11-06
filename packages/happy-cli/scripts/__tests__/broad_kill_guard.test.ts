@@ -1,11 +1,11 @@
-import { describe, it, expect } from 'vitest';
-import { spawnSync } from 'node:child_process';
+import { describe, it, expect, vi } from 'vitest';
+import { spawn, spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 
 const GUARD_SCRIPT = join(__dirname, '..', 'broad_kill_guard.cjs');
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const { isBroadKillCommand } = require(GUARD_SCRIPT);
+const { isBroadKillCommand, findKillHazard } = require(GUARD_SCRIPT);
 
 describe('broad_kill_guard pattern matching', () => {
     it('blocks the exact command from the real incident', () => {
@@ -56,6 +56,90 @@ describe('broad_kill_guard pattern matching', () => {
     });
 });
 
+// 2026-11-06: `pkill -f "vitest run" -U $(id -u)` — on macOS `-U` and the uid became extra patterns,
+// `-U` matched `X-Aplus-User-Id` in every Claude child's argv, and idle sessions across the machine died.
+describe('findKillHazard: pkill options after the pattern', () => {
+    const noMatches = () => [];
+
+    it.each([
+        'pkill -f "vitest run" -U $(id -u) 2>/dev/null',
+        "pkill -f 'vitest run' -9",
+        'npm test; pkill -f vitest -u me',
+        'cd /repo\npkill -f vitest -U 504',
+        'pkill -f vitest \\\n  -U 504',
+        'pkill -f vitest -- extra',
+    ])('blocks: %s', (command) => {
+        expect(findKillHazard(command, { listMatches: noMatches })).toMatch(/happy-guard.*before the pattern/s);
+    });
+
+    it.each([
+        'pkill -U $(id -u) -f "vitest run"',
+        'pkill -9 -f vitest 2>&1 | head',
+        'pkill -f -- -U',
+        'pkill -f vitest > /dev/null',
+        'echo pkill -f a -U b',
+        'pkill -f vitest # stop tests -U later',
+        'pkill -f "`printf vitest | head -1`"',
+    ])('allows: %s', (command) => {
+        expect(findKillHazard(command, { listMatches: noMatches })).toBeNull();
+    });
+});
+
+describe('findKillHazard: preview of what pkill would match', () => {
+    it('blocks when a match is an agent runtime and names it', () => {
+        const message = findKillHazard('pkill -f "vitest run"', {
+            listMatches: () => [
+                { pid: 2315, command: '/x/node_modules/@buzzni/happy-cli/node_modules/@anthropic-ai/claude-agent-sdk-darwin-arm64/claude --output-format stream-json' },
+                { pid: 15137, command: '/bin/zsh -c npx vitest run src/a.test.ts' },
+            ],
+        });
+        expect(message).toContain('2315');
+        expect(message).not.toContain('15137');
+    });
+
+    it('allows when no match is an agent runtime', () => {
+        expect(findKillHazard('pkill -f "vitest run"', { listMatches: () => [{ pid: 15137, command: '/bin/zsh -c npx vitest run' }] })).toBeNull();
+    });
+
+    it('previews with selection options only, widening past values it cannot expand', () => {
+        const calls: string[][] = [];
+        findKillHazard('pkill -9 -U $(id -u) -f "vitest run"', { listMatches: (args: string[]) => { calls.push(args); return []; } });
+        expect(calls).toEqual([['-f', 'vitest run']]);
+    });
+
+    it('does not guess a pattern it cannot expand', () => {
+        const listMatches = vi.fn(() => []);
+        expect(findKillHazard('pkill -f "$PATTERN"', { listMatches })).toBeNull();
+        expect(listMatches).not.toHaveBeenCalled();
+    });
+
+    it('previews a pkill on a later line and joins a continued line', () => {
+        const calls: string[][] = [];
+        const listMatches = (args: string[]) => { calls.push(args); return []; };
+        findKillHazard('cd /repo\npkill -f vitest', { listMatches });
+        findKillHazard('pkill -x \\\n  vitest', { listMatches });
+        expect(calls).toEqual([['-f', 'vitest'], ['-x', 'vitest']]);
+    });
+
+    it('keeps a backslash inside double quotes unless it escapes $ ` " \\ or a newline, as sh does', () => {
+        const calls: string[][] = [];
+        findKillHazard('pkill -f "a\\(1\\)\\$b\\"c"', { listMatches: (args: string[]) => { calls.push(args); return []; } });
+        expect(calls).toEqual([['-f', 'a\\(1\\)$b"c']]);
+    });
+
+    // Linux pgrep does not skip its parent: the hook can be the newest match now and gone when pkill runs.
+    it('previews every candidate instead of only the newest or oldest', () => {
+        const calls: string[][] = [];
+        const listMatches = (args: string[]) => { calls.push(args); return []; };
+        for (const option of ['-n', '-o', '--newest', '--oldest']) findKillHazard(`pkill ${option} -f vitest`, { listMatches });
+        expect(calls).toEqual(Array(4).fill(['-f', 'vitest']));
+    });
+
+    it('allows when the preview cannot run', () => {
+        expect(findKillHazard('pkill -f vitest', { listMatches: () => null })).toBeNull();
+    });
+});
+
 describe('broad_kill_guard hook process behavior', () => {
     function runGuard(payload: string): { status: number | null; stderr: string } {
         const result = spawnSync('node', [GUARD_SCRIPT], { input: payload, encoding: 'utf8' });
@@ -69,13 +153,57 @@ describe('broad_kill_guard hook process behavior', () => {
         }));
         expect(status).toBe(2);
         expect(stderr).toContain('happy-guard');
-        expect(stderr).toContain('pkill -f vitest');
+        expect(stderr).toContain('kill <PID>');
+        // A bare `pkill -f vitest` also stops other sessions' test runs, so it is no longer the advice.
+        expect(stderr).not.toContain('pkill -f vitest');
+    });
+
+    it('exits 2 when an option follows the pattern', () => {
+        const { status, stderr } = runGuard(JSON.stringify({
+            tool_name: 'Bash',
+            tool_input: { command: 'pkill -f "vitest run" -U 504 2>/dev/null' }
+        }));
+        expect(status).toBe(2);
+        expect(stderr).toContain('-U');
+    });
+
+    it.skipIf(process.platform === 'win32')('exits 2 when the pattern matches a running agent process', async () => {
+        const marker = `guard-test-${process.pid}-${Date.now()}`;
+        // An argv that looks like an installed happy-cli runtime and carries a unique marker.
+        const fake = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', `/opt/lib/node_modules/@buzzni/happy-cli/${marker}`], { stdio: 'ignore' });
+        try {
+            await new Promise(resolve => setTimeout(resolve, 300));
+            const { status, stderr } = runGuard(JSON.stringify({
+                tool_name: 'Bash',
+                tool_input: { command: `pkill -f ${marker}` }
+            }));
+            expect(status).toBe(2);
+            expect(stderr).toContain(String(fake.pid));
+        } finally {
+            fake.kill();
+        }
+    });
+
+    it.skipIf(process.platform === 'win32')('matches a double-quoted escaped regex the way the shell passes it', async () => {
+        const marker = `guardesc${process.pid}${Date.now()}`;
+        const fake = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', `/opt/lib/node_modules/@buzzni/happy-cli/${marker}(1)`], { stdio: 'ignore' });
+        try {
+            await new Promise(resolve => setTimeout(resolve, 300));
+            const { status, stderr } = runGuard(JSON.stringify({
+                tool_name: 'Bash',
+                tool_input: { command: `pkill -f "${marker}\\(1\\)"` }
+            }));
+            expect(status).toBe(2);
+            expect(stderr).toContain(String(fake.pid));
+        } finally {
+            fake.kill();
+        }
     });
 
     it('exits 0 on a safe command', () => {
         const { status } = runGuard(JSON.stringify({
             tool_name: 'Bash',
-            tool_input: { command: 'pkill -f vitest' }
+            tool_input: { command: 'pkill -f happy-guard-test-no-such-process' }
         }));
         expect(status).toBe(0);
     });
