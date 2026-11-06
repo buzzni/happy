@@ -28,6 +28,8 @@ const fixture = vi.hoisted(() => ({
     disconnect: vi.fn(async () => {}),
     admitTool: undefined as undefined | (<T>(work: () => Promise<T>) => Promise<T>),
     reconnect: vi.fn(async () => ({})),
+    prepareSideAppServer: vi.fn(async (): Promise<import('./codexOffTurnTitle').CodexCommandLaunch | null> => null),
+    sideConnection: null as import('./codexSideQuestion').CodexSideConnection | null,
     session: {
         sendProviderUsageEvent: vi.fn(),
         tracksShutdownStorage: true,
@@ -76,6 +78,14 @@ vi.mock('@/claude/utils/startHappyServer', () => ({ startHappyServer: vi.fn(asyn
     return { url: 'http://127.0.0.1:1', toolNames: ['propose_lesson'], stop: vi.fn(() => { fixture.events.push('mcpStopped'); }) };
 }) }));
 vi.mock('@/ui/logger', () => ({ logger: { debug: vi.fn(), debugLargeJson: vi.fn(), info: vi.fn(), infoDeveloper: vi.fn(), warn: vi.fn() } }));
+vi.mock('./codexSideQuestion', async (original) => {
+    const actual = await original<typeof import('./codexSideQuestion')>();
+    return { ...actual, CodexSideQuestionBridge: class extends actual.CodexSideQuestionBridge {
+        constructor(deps: ConstructorParameters<typeof actual.CodexSideQuestionBridge>[0]) {
+            super({ ...deps, connect: async () => fixture.sideConnection! });
+        }
+    } };
+});
 vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     setCuaShadow = () => {};
     setTurnDispatchHandler = (handler: () => void) => { fixture.markDispatched = handler; };
@@ -91,6 +101,10 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     authRecoveryBusy = false;
     reconnectForAuth = fixture.reconnect;
     threadId: string | null = null;
+    isConnected = true;
+    sandboxEnabled = false;
+    threadRolloutPath = '/tmp/native-rollout.jsonl';
+    prepareSideAppServer = fixture.prepareSideAppServer;
     connect = async () => { await fixture.onConnect?.(); };
     resumeThread = async ({ threadId }: { threadId: string }) => { await fixture.onResumeThread?.(); this.threadId = threadId; return { threadId, model: 'test' }; };
     disconnect = fixture.disconnect;
@@ -145,6 +159,7 @@ afterEach(() => {
 });
 afterEach(() => { process.exitCode = originalExitCode; vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.clearAllMocks(); fixture.onSend = null; fixture.onInterrupt = null; fixture.onSteer = null; fixture.onConnect = null; fixture.onResumeThread = null; fixture.steerText = ''; fixture.omitCompletionObservers = false; fixture.completionThread = { id: 'thread', path: '/tmp/native-rollout.jsonl' }; fixture.readThread.mockReset().mockResolvedValue({ thread: { id: 'thread', path: '/tmp/native-rollout.jsonl' } }); fixture.gate = null; fixture.events = []; fixture.session.freezeInboundMessagesForShutdown.mockReturnValue(true); });
 afterEach(() => { fixture.recoverMcp.mockReset().mockResolvedValue({ status: 'ready', affectedServers: [] }); fixture.readMcpStatuses.mockReset().mockResolvedValue([]); });
+afterEach(() => { fixture.sideConnection = null; fixture.prepareSideAppServer.mockReset().mockResolvedValue(null); });
 async function start(prompt = 'Test input', confirmed = false, review?: import('@/memory/lessonReviewWorker').LessonReviewWorker, standaloneLaunch?: StandaloneLaunchBootstrap, resumeThreadId?: string, reconnect?: import('@/daemon/reconnectSessionEnv').ReconnectSessionClientSnapshot, launch?: { args?: string[]; modelSeed?: string }) {
     for (const key of Object.keys(process.env)) {
         if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_)/.test(key)) vi.stubEnv(key, undefined);
@@ -636,6 +651,77 @@ describe('Codex runtime producer bookkeeping', () => {
         expect(result).toMatchObject({ status: 'busy' });
         expect(fixture.reconnect).not.toHaveBeenCalled();
     });
+    it('answers /btw on its own side launch and refuses it once input is frozen', async () => {
+        const replies: unknown[] = [];
+        fixture.onSend = async () => {
+            const sideQuestion = fixture.session.rpcHandlerManager.registerHandler.mock.calls.find(([name]) => name === 'side-question')![1] as (input: unknown) => Promise<unknown>;
+            // The session client offers no side launch (a mandatory sandbox, say): refused, nothing started.
+            replies.push(await sideQuestion({ question: 'what changed?' }));
+            fixture.gate!.freeze();
+            replies.push(await sideQuestion({ question: 'what changed?' }));
+        };
+        await finishFrozenFixture(start());
+        expect(fixture.prepareSideAppServer).toHaveBeenCalledTimes(1);
+        expect(replies).toEqual([
+            { success: false, error: 'side-question:not-allowed' },
+            { success: false, error: 'side-question:shutting-down' },
+        ]);
+    });
+    it('cancels an already pending side question before drain storage confirmation', async () => {
+        const listeners = new Set<(method: string, params: unknown) => void>();
+        let turnStarted = false;
+        const connection: import('./codexSideQuestion').CodexSideConnection = {
+            request: vi.fn(async (method: string) => {
+                if (method === 'config/read') return { config: {} };
+                if (method === 'thread/fork') return { thread: { id: 'side', ephemeral: true }, sandbox: { type: 'readOnly' } };
+                if (method === 'turn/start') { turnStarted = true; return { turn: { id: 'side-turn' } }; }
+                return {};
+            }),
+            onNotification: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+            deniedRequests: () => 0,
+            close: vi.fn(async () => {}),
+        };
+        fixture.sideConnection = connection;
+        fixture.prepareSideAppServer.mockResolvedValue({ command: 'unused', args: [], env: {} });
+        let question!: Promise<unknown>;
+        let drain!: SessionDrain;
+        let pending!: Promise<DrainReceipt>;
+        const flushForShutdown = vi.fn(async () => ({ stored: true as const, revision: 1 }));
+        fixture.onSend = async () => {
+            const handler = fixture.session.rpcHandlerManager.registerHandler.mock.calls.find(([name]) => name === 'side-question')![1] as (input: unknown) => Promise<unknown>;
+            question = handler({ question: 'A slow side question' });
+            await vi.waitFor(() => expect(turnStarted).toBe(true));
+            drain = new SessionDrain('pending-side-question', {
+                freezeInputForShutdown: () => true, interruptTurn: async () => {},
+                endInputAndAwaitExit: async () => ({ exited: true, code: 0, signal: null }),
+                waitForOutputDrain: async () => {}, cancelOutputDrain: () => {}, finishShutdownObservation: () => {},
+            }, { tracksShutdownStorage: true, flushForShutdown, isStorageConfirmationCurrent: () => true },
+            async () => {}, fixture.gate!);
+            pending = drain.drain(3000);
+        };
+        const running = start();
+        try {
+            await vi.waitFor(() => expect(fixture.events).toContain('loopExited'), { timeout: 10000 });
+            const observation = new AbortController();
+            const timer = setTimeout(() => observation.abort(), 200);
+            try { await fixture.gate!.quiesce(observation.signal); }
+            finally { clearTimeout(timer); }
+            expect(await question).toMatchObject({ success: false, error: expect.stringContaining('session ended') });
+            expect(connection.request).toHaveBeenCalledWith('turn/interrupt', { threadId: 'side', turnId: 'side-turn' });
+            expect(connection.close).toHaveBeenCalledOnce();
+            expect(await pending).toMatchObject({ status: 'provider-drained', stored: true });
+            expect(fixture.session.close).not.toHaveBeenCalled();
+        } finally {
+            // Let the unfixed implementation settle too, so a failed regression cannot retain the loop.
+            for (const listener of [...listeners]) listener('turn/completed', { threadId: 'side', turn: { id: 'side-turn', status: 'completed' } });
+            await question;
+            const receipt = await pending;
+            if (receipt.stored) drain.releaseRuntime(receipt);
+            await running;
+        }
+        expect(fixture.session.close).toHaveBeenCalledOnce();
+    });
+
     it('tracks steer through the provider acknowledgement and final user echo', async () => {
         let blocker: unknown; let echoBlocker: unknown; let reply: unknown;
         fixture.onSend = async () => {

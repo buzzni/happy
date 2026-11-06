@@ -5774,6 +5774,27 @@ describe('CodexAppServerClient sandbox integration', () => {
     });
 
     describe('prepareSideCommand', () => {
+        it('disables notify and multi-agent runtime before wrapping the side app-server only', async () => {
+            const { CodexAppServerClient } = await import('./codexAppServerClient');
+            const client = new CodexAppServerClient(sandboxConfig, undefined, undefined, 'owner-choice');
+            try {
+                await client.connect();
+                expect(mockWrapForMcpTransport.mock.calls[0][1]).not.toContain('notify=[]');
+                expect(mockWrapForMcpTransport.mock.calls[0][1]).not.toContain('features.multi_agent=false');
+                mockWrapForMcpTransport.mockClear();
+                await client.prepareSideAppServer();
+                expect(mockWrapForMcpTransport).toHaveBeenCalledWith('codex', [
+                    'app-server', '--listen', 'stdio://',
+                    '-c', 'notify=[]',
+                    '-c', 'features.multi_agent=false',
+                    '-c', 'features.multi_agent_v2=false',
+                    '-c', 'agents.enabled=false',
+                ]);
+            } finally {
+                await client.disconnect();
+            }
+        });
+
         it('launches plain codex with the app-server environment when there is no proxy or sandbox', async () => {
             const { CodexAppServerClient } = await import('./codexAppServerClient');
             const client = new CodexAppServerClient();
