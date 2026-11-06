@@ -121,6 +121,15 @@ afterEach(() => {
 });
 
 describe('worktree ops tickets', () => {
+    it('does not retain a rejected branch-name check as an unknown writer', async () => {
+        const set = createWorktreeOpsHandlers({ machine: () => machine, allowedRoot: root, happyHomeDir: home, now: () => NOW,
+            reserveLegacyDispatch: createLegacyDispatchAdmission({ home }), admitSubprocess: createSubprocessWriteAdmission({ home }) });
+        expect(await call('create-branch', { workspaceDir: repo, branchName: 'bad..branch' }, {}, set))
+            .toMatchObject({ success: false, errorCode: 'WORKSPACE_BRANCH_INVALID' });
+        expect(await createWorkspaceTurnAdmission({ home, roots: [repo], kind: 'automation', sessionId: 'auto-after-invalid-ref' }).tryAcquire())
+            .toEqual({ acquired: true });
+    });
+
     it('releases a temporary workspace reservation even when credential cleanup fails before a Git writer', async () => {
         const finish = vi.fn(async () => {});
         const admitSubprocess = vi.fn(async () => {});

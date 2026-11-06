@@ -502,13 +502,13 @@ async function snapshotCurrent(dir: string): Promise<{ revision: string; branch:
     const repo = await repositoryRoot(dir);
     if (!repo) throw new OpFailure('WORKTREE_SNAPSHOT_FAILED', 'git repository root not found');
     await stageNonPrivate(dir, 'WORKTREE_SNAPSHOT_FAILED');
-    const unchanged = (await runGit(dir, ['diff', '--cached', '--quiet'])).code === 0;
-    const hasHead = (await runGit(dir, ['rev-parse', '--verify', 'HEAD'])).code === 0;
+    const unchanged = (await runGit(dir, ['diff', '--cached', '--quiet'], { readOnly: true })).code === 0;
+    const hasHead = (await runGit(dir, ['rev-parse', '--verify', 'HEAD'], { readOnly: true })).code === 0;
     if (!unchanged || !hasHead) {
         await gitOk(dir, [...STUDIO_AUTHOR, 'commit', '--allow-empty', '-m', 'A+ Studio: 새 작업 버전 시작 전 저장'], 'WORKTREE_SNAPSHOT_FAILED');
     }
-    const revision = (await gitOk(dir, ['rev-parse', 'HEAD'], 'WORKTREE_SNAPSHOT_FAILED')).trim();
-    const head = await runGit(dir, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+    const revision = (await gitOk(dir, ['rev-parse', 'HEAD'], 'WORKTREE_SNAPSHOT_FAILED', { readOnly: true })).trim();
+    const head = await runGit(dir, ['symbolic-ref', '--quiet', '--short', 'HEAD'], { readOnly: true });
     return { revision, branch: head.code === 0 ? head.stdout.trim() || null : null };
 }
 
@@ -565,7 +565,7 @@ async function createWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
     if (!repo) throw new OpFailure('WORKTREE_REPO_NOT_FOUND', 'git repository root not found');
     return serialized(repo, async () => {
         for (const ref of [params.name, ...(params.baseSource === 'origin' ? [params.baseRef!] : [])]) {
-            await gitOk(workspace, ['check-ref-format', '--branch', ref], 'WORKTREE_INVALID_REF');
+            await gitOk(workspace, ['check-ref-format', '--branch', ref], 'WORKTREE_INVALID_REF', { readOnly: true });
         }
         // A workspace inside someone else's repository must not get a worktree there unless the
         // server confirmed that repository root with the user (the 2026-07-19 incident).
@@ -594,7 +594,7 @@ async function createWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
                     const error = gitError(fetched);
                     throw new OpFailure(AUTH_FAILURE.test(error) ? 'WORKTREE_AUTH_REQUIRED' : 'WORKTREE_FETCH_FAILED', error);
                 }
-                baseRevision = (await gitOk(repo, ['rev-parse', '--verify', `${fetchRef}^{commit}`], 'WORKTREE_FETCH_FAILED')).trim();
+                baseRevision = (await gitOk(repo, ['rev-parse', '--verify', `${fetchRef}^{commit}`], 'WORKTREE_FETCH_FAILED', { readOnly: true })).trim();
             } finally {
                 await runGit(repo, ['update-ref', '-d', fetchRef]);
             }
@@ -602,7 +602,7 @@ async function createWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
             if (baseRef) {
                 base = baseRef;
             } else {
-                const originHead = await runGit(repo, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
+                const originHead = await runGit(repo, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD'], { readOnly: true });
                 base = originHead.code === 0 && originHead.stdout.trim() ? originHead.stdout.trim() : 'HEAD';
             }
             baseRevision = base;
@@ -719,7 +719,7 @@ async function requireBranch(dir: string, branch: string): Promise<void> {
 /** The server's checkpoint: everything but private env files, committed when anything is staged. */
 async function checkpoint(dir: string, message: string): Promise<void> {
     await stageNonPrivate(dir, 'WORKTREE_CHECKPOINT_FAILED');
-    if ((await runGit(dir, ['diff', '--cached', '--quiet'])).code !== 0) {
+    if ((await runGit(dir, ['diff', '--cached', '--quiet'], { readOnly: true })).code !== 0) {
         await gitOk(dir, [...STUDIO_AUTHOR, 'commit', '-m', message], 'WORKTREE_CHECKPOINT_FAILED');
     }
 }
@@ -746,7 +746,7 @@ async function fetchBranch(dir: string, remote: string, branch: string, credenti
             if (allowMissing && NO_REMOTE_BRANCH.test(error)) return null;
             throw new OpFailure(AUTH_FAILURE.test(error) ? 'WORKTREE_AUTH_REQUIRED' : 'WORKTREE_FETCH_FAILED', error);
         }
-        return (await gitOk(dir, ['rev-parse', '--verify', `${fetchRef}^{commit}`], 'WORKTREE_FETCH_FAILED')).trim();
+        return (await gitOk(dir, ['rev-parse', '--verify', `${fetchRef}^{commit}`], 'WORKTREE_FETCH_FAILED', { readOnly: true })).trim();
     } finally {
         await runGit(dir, ['update-ref', '-d', fetchRef]);
     }
@@ -852,7 +852,7 @@ async function updateWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
             // Every conflict one way: a side that deleted the file wins as a deletion.
             const stage = params.conflictChoice === 'current' ? '2' : '3';
             for (const conflict of await unmergedPaths(target.path)) {
-                if ((await runGit(target.path, ['cat-file', '-e', `:${stage}:${conflict}`])).code === 0) {
+                if ((await runGit(target.path, ['cat-file', '-e', `:${stage}:${conflict}`], { readOnly: true })).code === 0) {
                     await runGit(target.path, ['checkout', params.conflictChoice === 'current' ? '--ours' : '--theirs', '--', conflict]);
                     await runGit(target.path, ['add', '--', conflict]);
                 } else {
@@ -869,7 +869,7 @@ async function updateWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
             if (conflicts.length > 0) throw new OpFailure('WORKTREE_UPDATE_CONFLICT', gitError(merged), { conflicts });
             throw new OpFailure('WORKTREE_UPDATE_FAILED', gitError(merged));
         }
-        return { head: (await gitOk(target.path, ['rev-parse', 'HEAD'], 'WORKTREE_UPDATE_FAILED')).trim() };
+        return { head: (await gitOk(target.path, ['rev-parse', 'HEAD'], 'WORKTREE_UPDATE_FAILED', { readOnly: true })).trim() };
     });
 }
 
@@ -931,7 +931,7 @@ async function publishWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: 
             const error = gitError(pushed);
             throw new OpFailure(AUTH_FAILURE.test(error) ? 'WORKTREE_AUTH_REQUIRED' : 'WORKTREE_PUSH_FAILED', error);
         }
-        return { commit: (await gitOk(target.path, ['rev-parse', 'HEAD'], 'WORKTREE_PUSH_FAILED')).trim() };
+        return { commit: (await gitOk(target.path, ['rev-parse', 'HEAD'], 'WORKTREE_PUSH_FAILED', { readOnly: true })).trim() };
     });
 }
 
@@ -965,7 +965,7 @@ async function createBranch(guard: PathGuard, ticket: WorktreeTicket & { op: 'cr
     const params: WorktreeOpParams<'create-branch'> = ticket.params;
     const dir = await guard.directory(params.workspaceDir);
     return serialized(dir, async () => {
-        await gitOk(dir, ['check-ref-format', '--branch', params.branchName], 'WORKSPACE_BRANCH_INVALID');
+        await gitOk(dir, ['check-ref-format', '--branch', params.branchName], 'WORKSPACE_BRANCH_INVALID', { readOnly: true });
         const inside = await runGit(dir, ['rev-parse', '--is-inside-work-tree'], { readOnly: true });
         if (inside.code !== 0 || inside.stdout.trim() !== 'true') {
             await gitOk(dir, ['init', '--quiet', '--initial-branch=main'], 'WORKSPACE_BRANCH_FAILED');
@@ -989,7 +989,7 @@ async function prepareConversation(
     const dir = await guard.directory(params.workspaceDir);
     return serialized(dir, async () => {
         const base = params.baseBranch;
-        await gitOk(dir, ['check-ref-format', '--branch', base], 'WORKSPACE_CHECKOUT_FAILED');
+        await gitOk(dir, ['check-ref-format', '--branch', base], 'WORKSPACE_CHECKOUT_FAILED', { readOnly: true });
         const current = await currentBranch(dir);
         if (params.source === 'local' && params.allowCurrentBranchDirty && current === base) return { branch: base };
         const status = await gitOk(dir, ['status', '--porcelain=v2', '--untracked-files=all', '--', ...params.statusPathspecs], 'WORKSPACE_STATUS_FAILED', { readOnly: true });
@@ -1341,7 +1341,7 @@ async function cloneWorkspace(
             throw new OpFailure(/remote branch .* not found/i.test(error) ? 'WORKSPACE_CLONE_BRANCH_MISSING' : 'WORKSPACE_CLONE_FAILED', error);
         }
         await pins.pin(slashed(dir), 'workspace', identity);
-        return { changed: true, head: (await gitOk(dir, ['rev-parse', 'HEAD'], 'WORKSPACE_CLONE_FAILED')).trim(), branch: params.branch };
+        return { changed: true, head: (await gitOk(dir, ['rev-parse', 'HEAD'], 'WORKSPACE_CLONE_FAILED', { readOnly: true })).trim(), branch: params.branch };
     });
 }
 
