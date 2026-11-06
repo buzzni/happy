@@ -647,6 +647,8 @@ model AutomationRun {
     outcome           AutomationRunOutcome?
     detailCiphertext  Bytes?
     failureCode       String?
+    /// Bounded public waiting state; cleared when the scheduler claim becomes terminal.
+    holdCode          String?
     degradedCode      String?
     queueDepth         Int?
     queuePosition      Int?

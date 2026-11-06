@@ -22,7 +22,7 @@ vi.mock('@/storage/db', () => ({ db: new Proxy({}, { get: (_target, key) => {
   return typeof value === 'function' ? value.bind(state.client) : value;
 } }) }));
 import { createAutomationExecutionSession, recordAutomationExecutionExit } from './automationExecutionSession';
-import { reportAutomationRun } from './automationExecutionService';
+import { heartbeatAutomationRun, reportAutomationRun } from './automationExecutionService';
 import { automationExecutionRoutes } from '@/app/api/routes/automationExecutionRoutes';
 
 let now: Date;
@@ -449,6 +449,42 @@ it('applies the additive migration without changing legacy definitions, runs or 
   expect(await client.automation.findUniqueOrThrow({ where: { id: 'a1' } })).toEqual(definition);
   expect(await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } }))
     .toEqual({ ...legacy, displaySessionId: null, executionCreateBodyHash: null, executionSeedMetadata: null });
+  expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
+  expect(await client.sessionMessage.findMany()).toEqual(messages);
+});
+
+it('persists only the original live claim hold and never restores it after a terminal report', async () => {
+  const input = { runId: 'r1', claimToken: 'claim-r1', holdCode: 'WORKSPACE_BUSY' };
+  expect(await heartbeatAutomationRun(client, 'owner', 'm1', input, now)).toMatchObject({ ok: true });
+  expect(await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } })).toHaveProperty('holdCode', 'WORKSPACE_BUSY');
+  for (const [account, machine, claimToken] of [['other', 'm1', 'claim-r1'], ['owner', 'other', 'claim-r1'], ['owner', 'm1', 'wrong']]) {
+    expect(await heartbeatAutomationRun(client, account, machine, { ...input, claimToken, holdCode: null }, now))
+      .toEqual({ ok: false, error: 'run-not-running' });
+  }
+  expect(await heartbeatAutomationRun(client, 'owner', 'm1', { runId: 'r1', claimToken: 'claim-r1' }, now)).toMatchObject({ ok: true });
+  expect(await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } })).toHaveProperty('holdCode', 'WORKSPACE_BUSY');
+  expect(await heartbeatAutomationRun(client, 'owner', 'm1', { ...input, holdCode: null }, now)).toMatchObject({ ok: true });
+  expect(await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } })).toHaveProperty('holdCode', null);
+  await register();
+  await heartbeatAutomationRun(client, 'owner', 'm1', input, now);
+  expect(await reportAutomationRun(client, 'owner', 'm1', report('automation-run:r1', {
+    status: 'FAILED', outcome: 'ERROR', failureCode: 'AUTOMATION_START_UNCONFIRMED',
+  }), now)).toMatchObject({ ok: true });
+  expect(await heartbeatAutomationRun(client, 'owner', 'm1', input, now)).toEqual({ ok: false, error: 'run-not-running' });
+  expect(await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } }))
+    .toMatchObject({ status: 'FAILED', holdCode: null, failureCode: 'AUTOMATION_START_UNCONFIRMED' });
+});
+
+it('adds nullable hold state without rewriting legacy definitions, runs, or manual history', async () => {
+  await client.automation.update({ where: { id: 'a1' }, data: { payloadVersion: 4 } });
+  await client.automationRun.update({ where: { id: 'r1' }, data: { sessionId: 'manual', status: 'COMPLETED', outcome: 'WOKE' } });
+  const definition = await client.automation.findUniqueOrThrow({ where: { id: 'a1' } });
+  const legacy = await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } });
+  const manual = await client.session.findUniqueOrThrow({ where: { id: 'manual' } }), messages = await client.sessionMessage.findMany();
+  await db.exec('ALTER TABLE "AutomationRun" DROP COLUMN "holdCode";');
+  await db.exec(await readFile('prisma/migrations/20261106010000_automation_execution_hold/migration.sql', 'utf8'));
+  expect(await client.automation.findUniqueOrThrow({ where: { id: 'a1' } })).toEqual(definition);
+  expect(await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } })).toEqual({ ...legacy, holdCode: null });
   expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
   expect(await client.sessionMessage.findMany()).toEqual(messages);
 });

@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { Prisma, type AutomationRunOutcome, type Prisma as PrismaTypes } from '@prisma/client';
-import { AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION, automationExecutionSessionId, isAutomationExecutionSessionId } from '@slopus/happy-wire';
+import { AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION, automationExecutionSessionId, isAutomationExecutionSessionId, automationRunHeartbeatRequestSchema } from '@slopus/happy-wire';
 import { invalidateSessionFollowups } from './sessionFollowupInvalidationService';
 
 type Tx = PrismaTypes.TransactionClient;
@@ -16,6 +16,7 @@ export type AutomationExecutionError =
     | 'claim-cancelled'
     | 'claim-expired'
     | 'run-not-running'
+    | 'invalid-heartbeat'
     | 'report-conflict';
 
 type Result<T> = { ok: true; value: T } | { ok: false; error: AutomationExecutionError };
@@ -241,11 +242,11 @@ export async function claimAutomationRun(
 
     await tx.automationRun.updateMany({
         where: { automationId: input.automationId, status: 'CLAIMED', claimExpiresAt: { lt: now } },
-        data: { status: 'EXPIRED', completedAt: now },
+        data: { status: 'EXPIRED', completedAt: now, holdCode: null },
     });
     await tx.automationRun.updateMany({
         where: { automationId: input.automationId, status: 'RUNNING', runLeaseExpiresAt: { lt: now } },
-        data: { status: 'ABANDONED', completedAt: now },
+        data: { status: 'ABANDONED', completedAt: now, holdCode: null },
     });
 
     const claimToken = randomBytes(32).toString('base64url');
@@ -306,11 +307,11 @@ export async function startAutomationRun(
     if (!run) return { ok: false, error: 'claim-not-found' };
     if (run.status !== 'CLAIMED') return { ok: false, error: 'claim-cancelled' };
     if (run.claimExpiresAt < now) {
-        await tx.automationRun.updateMany({ where: { id: run.id, status: 'CLAIMED' }, data: { status: 'EXPIRED', completedAt: now } });
+        await tx.automationRun.updateMany({ where: { id: run.id, status: 'CLAIMED' }, data: { status: 'EXPIRED', completedAt: now, holdCode: null } });
         return { ok: false, error: 'claim-expired' };
     }
     if (!executable(run.automation, accountId, machineId, run.generation)) {
-        await tx.automationRun.updateMany({ where: { id: run.id, status: 'CLAIMED' }, data: { status: 'CANCELLED', completedAt: now } });
+        await tx.automationRun.updateMany({ where: { id: run.id, status: 'CLAIMED' }, data: { status: 'CANCELLED', completedAt: now, holdCode: null } });
         return { ok: false, error: 'claim-cancelled' };
     }
     const runLeaseExpiresAt = new Date(now.getTime() + 5 * 60_000);
@@ -383,20 +384,26 @@ export async function heartbeatAutomationRun(
     tx: Tx,
     accountId: string,
     machineId: string,
-    input: { runId: string; claimToken: string },
+    input: { runId: string; claimToken: string; holdCode?: string | null },
     now: Date = new Date(),
 ): Promise<Result<{ runLeaseExpiresAt: Date }>> {
+    const parsed = automationRunHeartbeatRequestSchema.safeParse(input);
+    if (!parsed.success) return { ok: false, error: 'invalid-heartbeat' };
+    const request = parsed.data;
     const runLeaseExpiresAt = new Date(now.getTime() + 5 * 60_000);
     const changed = await tx.automationRun.updateMany({
         where: {
-            id: input.runId,
+            id: request.runId,
             machineAccountId: accountId,
             machineId,
-            claimTokenHash: tokenHash(input.claimToken),
+            claimTokenHash: tokenHash(request.claimToken),
             status: 'RUNNING',
             runLeaseExpiresAt: { gte: now },
+            ...(request.holdCode !== undefined ? {
+                OR: [{ automation: { payloadVersion: 6 } }, { executionCreateBodyHash: { not: null } }],
+            } : {}),
         },
-        data: { runLeaseExpiresAt },
+        data: { runLeaseExpiresAt, ...(request.holdCode !== undefined ? { holdCode: request.holdCode } : {}) },
     });
     return changed.count === 1
         ? { ok: true, value: { runLeaseExpiresAt } }
@@ -503,6 +510,7 @@ export async function reportAutomationRun(
                 sessionId: input.sessionId,
                 detailCiphertext: input.detailCiphertext,
                 failureCode: input.failureCode,
+                holdCode: null,
                 degradedCode,
                 queueDepth,
                 queuePosition,

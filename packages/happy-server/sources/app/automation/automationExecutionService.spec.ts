@@ -345,7 +345,7 @@ describe('automationExecutionService', () => {
         await expect(startAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token',
         }, now)).resolves.toEqual({ ok: false, error: 'claim-cancelled' });
-        expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: { status: 'CANCELLED', completedAt: now } }));
+        expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: { status: 'CANCELLED', completedAt: now, holdCode: null } }));
     });
 
     it('does not resurrect a run after its heartbeat lease expires', async () => {
@@ -357,6 +357,67 @@ describe('automationExecutionService', () => {
         }, now)).resolves.toEqual({ ok: false, error: 'run-not-running' });
         expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
             where: expect.objectContaining({ runLeaseExpiresAt: { gte: now } }),
+        }));
+    });
+
+    it.each(['WORKSPACE_BUSY', null])('updates only the original live isolated claim hold (%s)', async holdCode => {
+        const tx = makeTx(), input = { runId: 'run-1', claimToken: 'token', holdCode };
+        expect(await heartbeatAutomationRun(tx as never, 'account-1', 'machine-1', input, now)).toMatchObject({ ok: true });
+        expect(tx.automationRun.updateMany).toHaveBeenCalledWith({
+            where: expect.objectContaining({ id: 'run-1', machineAccountId: 'account-1', machineId: 'machine-1',
+                claimTokenHash: expect.any(Uint8Array), status: 'RUNNING', runLeaseExpiresAt: { gte: now },
+                OR: [{ automation: { payloadVersion: 6 } }, { executionCreateBodyHash: { not: null } }],
+            }), data: { runLeaseExpiresAt: new Date(now.getTime() + 5 * 60_000), holdCode },
+        });
+    });
+
+    it('preserves a deferred hold when a generic heartbeat omits its state', async () => {
+        const tx = makeTx();
+        await heartbeatAutomationRun(tx as never, 'account-1', 'machine-1', { runId: 'run-1', claimToken: 'token' }, now);
+        expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+            data: { runLeaseExpiresAt: new Date(now.getTime() + 5 * 60_000) },
+        }));
+    });
+
+    it('refuses an unbounded heartbeat reason before any database mutation', async () => {
+        const tx = makeTx(), input = { runId: 'run-1', claimToken: 'token', holdCode: 'private raw diagnostic' };
+        expect(await heartbeatAutomationRun(tx as never, 'account-1', 'machine-1', input, now))
+            .toEqual({ ok: false, error: 'invalid-heartbeat' });
+        expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('cannot restore a hold after the original claim has expired or reached a terminal state', async () => {
+        const tx = makeTx(), input = { runId: 'run-1', claimToken: 'token', holdCode: 'WORKSPACE_OWNER_UNCONFIRMED' };
+        tx.automationRun.updateMany.mockResolvedValue({ count: 0 });
+        expect(await heartbeatAutomationRun(tx as never, 'account-1', 'machine-1', input, now))
+            .toEqual({ ok: false, error: 'run-not-running' });
+        expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({
+            id: 'run-1', machineAccountId: 'account-1', machineId: 'machine-1', claimTokenHash: expect.any(Uint8Array),
+            status: 'RUNNING', runLeaseExpiresAt: { gte: now },
+        }) }));
+    });
+
+    it.each(['COMPLETED', 'FAILED'] as const)('clears a hold on terminal dispatch report while retaining the %s result', async status => {
+        const tx = makeTx(), sessionId = 'automation-run:run-1';
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', automation: automation({ payloadVersion: 6 }), status: 'RUNNING',
+            reportId: null, sessionId, displaySessionId: 'manual', executionCreateBodyHash: 'hash', holdCode: 'WORKSPACE_BUSY',
+            runLeaseExpiresAt: new Date(now.getTime() + 60_000) });
+        tx.session.findFirst.mockResolvedValue({ id: sessionId });
+        const failureCode = status === 'FAILED' ? 'AUTOMATION_START_UNCONFIRMED' : null;
+        expect(await reportAutomationRun(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', reportId: 'report-1', status,
+            outcome: status === 'FAILED' ? 'ERROR' : 'WOKE', sessionId, detailCiphertext: null, failureCode,
+        }, now)).toMatchObject({ ok: true });
+        expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ status, holdCode: null, failureCode }),
+        }));
+    });
+
+    it('clears held state when maintenance expires or abandons a claim', async () => {
+        const tx = makeTx();
+        await claimAutomationRun(tx as never, 'account-1', 'machine-1', { automationId: 'automation-1', generation: 3, scheduledFor: now }, now);
+        for (const status of ['EXPIRED', 'ABANDONED']) expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ status, holdCode: null }),
         }));
     });
 
