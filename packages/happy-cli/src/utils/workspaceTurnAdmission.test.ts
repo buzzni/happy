@@ -6,6 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { createWorkspaceTurnAdmission } from './workspaceTurnAdmission';
 import * as module from './workspaceTurnAdmission';
 import { readCurrentBootIdSync } from './bootIdentity';
+import { FileLockHeldError, withOwnedFileLock } from './ownedFileLock';
 
 const statHook = vi.hoisted(() => ({ observe: undefined as undefined | ((path: string, bigint: boolean) => Promise<void>) }));
 vi.mock('node:fs/promises', async importOriginal => {
@@ -52,6 +53,48 @@ test('preserves existing concurrent manual behavior and isolates unrelated works
   expect((await admission('manual-B', 'manual').tryAcquire()).acquired).toBe(true);
   const other = join(home, 'other'); await mkdir(other);
   expect((await admission('automation-run:r1', 'automation', [other]).tryAcquire()).acquired).toBe(true);
+});
+
+test('serializes concurrent manual bookkeeping without rejecting compatible work or losing proven releases', async () => {
+  const owners = Array.from({ length: 5 }, (_, index) => admission(`manual-concurrent-${index}`, 'manual'));
+  expect(await Promise.all(owners.map(owner => owner.tryAcquire()))).toEqual(owners.map(() => ({ acquired: true })));
+  expect(await Promise.allSettled(owners.map(owner => owner.release(true))))
+    .toEqual(owners.map(() => ({ status: 'fulfilled', value: true })));
+  expect(await admission('automation-run:after-manual-concurrent', 'automation').tryAcquire()).toEqual({ acquired: true });
+});
+
+test('retains concurrent legacy writers once each despite contended registry bookkeeping', async () => {
+  const operation = vi.fn(async () => 'submitted');
+  const execute = module.createUnfencedSubprocessAdmission({ home, bootId: fixtureBoot });
+  expect(await Promise.allSettled(Array.from({ length: 5 }, () => execute([workspace], operation))))
+    .toEqual(Array.from({ length: 5 }, () => ({ status: 'fulfilled', value: 'submitted' })));
+  expect(operation).toHaveBeenCalledTimes(5);
+  expect(await admission('automation-run:after-concurrent-legacy', 'automation').tryAcquire())
+    .toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+});
+
+test('keeps a live registry lock owned and bounds manual waiting without delaying automatic admission', async () => {
+  const directory = join(home, 'workspace-turn-admission.v1'); await mkdir(directory, { mode: 0o700 });
+  const manual = admission('manual-lock-held', 'manual');
+  await withOwnedFileLock(join(directory, 'owners.json.lock'), async () => {
+    expect(await admission('automation-run:lock-held', 'automation').tryAcquire())
+      .toMatchObject({ acquired: false, reason: 'registry-busy' });
+    expect(await manual.tryAcquire()).toMatchObject({ acquired: false, reason: 'registry-busy' });
+  });
+  expect(await manual.tryAcquire()).toEqual({ acquired: true });
+  expect(await manual.release(true)).toBe(true);
+});
+
+test('never repeats registry work after its callback has started', async () => {
+  const actual = await realpath(workspace);
+  let calls = 0;
+  statHook.observe = async (path, bigint) => {
+    if (path === actual && bigint) { calls++; throw new FileLockHeldError('contended'); }
+  };
+  expect(await admission('manual-entered-work', 'manual').tryAcquire()).toMatchObject({ acquired: false, reason: 'registry-busy' });
+  expect(calls).toBe(1);
+  statHook.observe = undefined;
+  expect(await admission('automation-run:after-entered-work', 'automation').tryAcquire()).toEqual({ acquired: true });
 });
 
 test('compares parent, child, additional roots and aliases by their canonical directory', async () => {

@@ -26,6 +26,18 @@ export type LegacyDispatchReservation = Exclude<WorkspaceTurnAdmissionResult, { 
   acquired: true; finish(): Promise<void>;
 };
 const MAX_REGISTRY_BYTES = 1024 * 1024;
+/** Retry only failure to acquire the short bookkeeping lock, never its work or a workspace conflict. */
+async function withRegistryLock<T>(path: string, work: () => Promise<T>, retries = 25): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    let entered = false;
+    try {
+      return await withOwnedFileLock(path, async () => { entered = true; return work(); });
+    } catch (error) {
+      if (entered || !(error instanceof FileLockHeldError) || attempt >= retries) throw error;
+    }
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+}
 async function rootIdentities(roots: readonly string[]): Promise<NonNullable<Owner['identities']>> {
   const result: NonNullable<Owner['identities']> = [];
   for (const root of roots) {
@@ -190,7 +202,7 @@ export function createWorkspaceTurnAdmission(input: {
     async tryAcquire(): Promise<WorkspaceTurnAdmissionResult> {
       await prepare();
       try {
-        return await withOwnedFileLock(file + '.lock', async () => {
+        return await withRegistryLock(file + '.lock', async () => {
           // Normal filesystem mutations acquire this same registry before their effect.
           // Resolve here so a completed rename cannot invalidate an earlier outside snapshot.
           const paths = await canonicalRoots();
@@ -216,7 +228,7 @@ export function createWorkspaceTurnAdmission(input: {
             bootId, roots: paths, identities, acquiredAt: Date.now() }));
           await write(owners);
           return { acquired: true } as const;
-        });
+        }, input.kind === 'automation' ? 0 : 25);
       } catch (error) {
         if (error instanceof FileLockHeldError) return { acquired: false, reason: 'registry-busy', sessions: [] };
         throw error;
@@ -228,7 +240,7 @@ export function createWorkspaceTurnAdmission(input: {
     async retainUnconfirmed(): Promise<void> {
       if (input.kind !== 'manual-launch') throw new Error('WORKSPACE_ADMISSION_IDENTITY_CONFLICT');
       await prepare();
-      await withOwnedFileLock(file + '.lock', async () => {
+      await withRegistryLock(file + '.lock', async () => {
         const owners = await read(), own = owners.find(owner => owner.token === token && owner.controller === controller);
         if (!own || own.kind !== 'manual-launch' || own.sessionId !== input.sessionId) throw new Error('WORKSPACE_ADMISSION_IDENTITY_CONFLICT');
         const retained = owners.filter(owner => owner !== own);
@@ -248,7 +260,7 @@ export function createWorkspaceTurnAdmission(input: {
     async release(quiescent: boolean): Promise<boolean> {
       if (!quiescent) return false;
       await prepare();
-      return withOwnedFileLock(file + '.lock', async () => {
+      return withRegistryLock(file + '.lock', async () => {
         const owners = await read();
         const own = owners.find(owner => owner.token === token);
         if (!own) return false;
