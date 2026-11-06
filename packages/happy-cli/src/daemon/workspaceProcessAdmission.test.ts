@@ -7,6 +7,7 @@ import { createLegacyDispatchAdmission, createSubprocessWriteAdmission, createWo
 import { runAutonomousQualityGatePhase } from './autonomousQualityGateRunner';
 import { restoreMissingManagedWorktree } from './missingWorktreeRestore';
 import { ensureAgentTaskReviewObjects } from './automations/agentTaskReviewObjects';
+import { prepareGithubTriggerWorktree, removeGithubTriggerWorktree } from './automations/githubTriggerWorktree';
 
 let home: string;
 let repo: string;
@@ -69,5 +70,36 @@ test('review object preparation does not fetch behind an automatic owner and tra
     const check = automatic(); expect(await check.tryAcquire()).toEqual({ acquired: true }); await check.release(true);
     expect(await ensureAgentTaskReviewObjects(input)).toMatchObject({ ok: true, fetched: ['a'.repeat(40)] });
     expect(runCommand).toHaveBeenCalledOnce();
+    expect(await owner.tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+});
+
+test('GitHub worktree preparation stops before mutation behind automatic ownership and records its later checkout scope', async () => {
+    const managedRoot = join(home, 'managed'); await mkdir(managedRoot);
+    const runCommand = vi.fn(async (command: { args: string[] }) => ({ ok: true as const, stdout: command.args[0] === 'rev-parse' ? repo : '' }));
+    const input = { runId: 'github-preparation', directory: repo, managedRoot, runCommand,
+        ensureDirectory: async () => {}, pathExists: async () => true, resolveRealPath: async (path: string) => path,
+        releaseSubmodulePointers: vi.fn(async () => ({ released: [] })), onPlanned: vi.fn(), admitSubprocess: ports().admitSubprocess };
+    const owner = automatic(); expect(await owner.tryAcquire()).toEqual({ acquired: true });
+    expect(await prepareGithubTriggerWorktree(input)).toMatchObject({ ok: false, cleaned: true, error: 'WORKSPACE_BUSY' });
+    expect(runCommand.mock.calls.some(([command]) => command.args[0] === 'worktree')).toBe(false);
+    expect(input.releaseSubmodulePointers).not.toHaveBeenCalled();
+    expect(await owner.release(true)).toBe(true);
+    expect(await prepareGithubTriggerWorktree(input)).toMatchObject({ ok: true });
+    expect(await owner.tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+    expect(await createWorkspaceTurnAdmission({ home, roots: [managedRoot], kind: 'automation', sessionId: 'auto-checkout-scope' }).tryAcquire())
+        .toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+});
+
+test('GitHub cleanup inspects status without recording a writer and reserves before actual removal', async () => {
+    const path = join(home, 'checkout'); await mkdir(path);
+    const runCommand = vi.fn(async () => ({ ok: true as const, stdout: '' }));
+    const input = { repositoryRoot: repo, worktreePath: path, runCommand, pathExists: async () => true,
+        releaseSubmodulePointers: vi.fn(async () => ({ released: [] })), admitSubprocess: ports().admitSubprocess };
+    const owner = automatic(); expect(await owner.tryAcquire()).toEqual({ acquired: true });
+    expect(await removeGithubTriggerWorktree(input)).toMatchObject({ ok: false, dirty: false, error: 'WORKSPACE_BUSY' });
+    expect(runCommand).toHaveBeenCalledOnce();
+    expect(input.releaseSubmodulePointers).not.toHaveBeenCalled();
+    expect(await owner.release(true)).toBe(true);
+    expect(await removeGithubTriggerWorktree(input)).toEqual({ ok: true });
     expect(await owner.tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
 });

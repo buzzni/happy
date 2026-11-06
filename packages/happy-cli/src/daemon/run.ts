@@ -3083,8 +3083,11 @@ export async function startDaemon(): Promise<void> {
     });
     const discardRememberedGithubWorktree = rememberGithubWorktreeRemoval(input => removeGithubTriggerWorktree({
       ...input,
+      ...(admitSubprocess ? { admitSubprocess } : {}),
       reclaimArtifacts: async () => {
-        const report = await reclaimGithubArtifacts(input);
+        const reclaim = () => reclaimGithubArtifacts(input);
+        const report = await (contextIsolationHostEnabled
+          ? createFilesystemWriteAdmission({ home: configuration.happyHomeDir })(reclaim) : reclaim());
         if (report.status !== 'deferred') logger.debug(`[DAEMON RUN] [github-artifact-reclaim] ${JSON.stringify(report)}`);
       },
     }), {
@@ -5462,6 +5465,7 @@ export async function startDaemon(): Promise<void> {
           ...(admitSubprocess ? { admitSubprocess } : {}) }),
         prepareGithubWorktree: (input) => prepareGithubTriggerWorktree({
           ...input,
+          ...(admitSubprocess ? { admitSubprocess } : {}),
           managedRoot: join(configuration.happyHomeDir, 'automation-worktrees'),
         }),
         discardGithubWorktree: discardRememberedGithubWorktree,
