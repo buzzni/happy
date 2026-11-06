@@ -88,7 +88,16 @@ function commandSegments(command) {
     };
     for (let i = 0; i < command.length; i++) {
         const c = command[i];
-        if (c === '\\') { start(); word.text += command[i + 1] ?? ''; i++; continue; }
+        if (c === '\\') {
+            // A backslash-newline continues the line; any other escaped character is literal.
+            if (command[i + 1] !== '\n') { start(); word.text += command[i + 1] ?? ''; }
+            i++;
+            continue;
+        }
+        if (c === '#' && word === null) {
+            while (i + 1 < command.length && command[i + 1] !== '\n') i++;
+            continue;
+        }
         if (c === "'") {
             start();
             const end = command.indexOf("'", i + 1);
@@ -121,7 +130,16 @@ function commandSegments(command) {
             i = j;
             continue;
         }
-        if (c === '$' || c === '`') { start(); word.dynamic = true; word.text += c; continue; }
+        if (c === '`') {
+            start();
+            word.dynamic = true;
+            const end = command.indexOf('`', i + 1);
+            const stop = end === -1 ? command.length : end;
+            word.text += command.slice(i, stop + 1);
+            i = stop;
+            continue;
+        }
+        if (c === '$') { start(); word.dynamic = true; word.text += c; continue; }
         if (c === '>' || c === '<') {
             if (word !== null && /^\d*$/.test(word.text)) word = null;
             else finish();
@@ -136,8 +154,8 @@ function commandSegments(command) {
             i = j - 1;
             continue;
         }
-        if (/\s/.test(c)) { finish(); continue; }
-        if (';&|()'.includes(c)) {
+        if (c !== '\n' && /\s/.test(c)) { finish(); continue; }
+        if (';&|()\n'.includes(c)) {
             finish();
             if (segments[segments.length - 1].length > 0) segments.push([]);
             continue;
@@ -164,7 +182,8 @@ function optionAfterPattern(args) {
     let seenPattern = false;
     for (let i = 0; i < args.length; i++) {
         const text = args[i].text;
-        if (text === '--') return null;
+        // `--` ends the options only before the pattern; after it, it is one more pattern.
+        if (text === '--' && !seenPattern) return null;
         if (seenPattern) {
             if (isOption(text)) return text;
         } else if (!isOption(text)) {

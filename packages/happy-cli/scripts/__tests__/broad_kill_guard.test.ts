@@ -65,6 +65,9 @@ describe('findKillHazard: pkill options after the pattern', () => {
         'pkill -f "vitest run" -U $(id -u) 2>/dev/null',
         "pkill -f 'vitest run' -9",
         'npm test; pkill -f vitest -u me',
+        'cd /repo\npkill -f vitest -U 504',
+        'pkill -f vitest \\\n  -U 504',
+        'pkill -f vitest -- extra',
     ])('blocks: %s', (command) => {
         expect(findKillHazard(command, { listMatches: noMatches })).toMatch(/happy-guard.*before the pattern/s);
     });
@@ -75,6 +78,8 @@ describe('findKillHazard: pkill options after the pattern', () => {
         'pkill -f -- -U',
         'pkill -f vitest > /dev/null',
         'echo pkill -f a -U b',
+        'pkill -f vitest # stop tests -U later',
+        'pkill -f "`printf vitest | head -1`"',
     ])('allows: %s', (command) => {
         expect(findKillHazard(command, { listMatches: noMatches })).toBeNull();
     });
@@ -106,6 +111,14 @@ describe('findKillHazard: preview of what pkill would match', () => {
         const listMatches = vi.fn(() => []);
         expect(findKillHazard('pkill -f "$PATTERN"', { listMatches })).toBeNull();
         expect(listMatches).not.toHaveBeenCalled();
+    });
+
+    it('previews a pkill on a later line and joins a continued line', () => {
+        const calls: string[][] = [];
+        const listMatches = (args: string[]) => { calls.push(args); return []; };
+        findKillHazard('cd /repo\npkill -f vitest', { listMatches });
+        findKillHazard('pkill -x \\\n  vitest', { listMatches });
+        expect(calls).toEqual([['-f', 'vitest'], ['-x', 'vitest']]);
     });
 
     it('allows when the preview cannot run', () => {
