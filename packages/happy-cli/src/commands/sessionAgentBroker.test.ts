@@ -3,7 +3,7 @@ import { promisify } from 'node:util'
 import { mkdtemp, mkdir, writeFile, rm, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createAgentHostExecutor, startSessionAgentBroker, compatibleAgentHostEntrypoint } from './sessionAgentBroker'
 import { startAgentBroker } from './agentBroker'
 import { filterCredentialsFromEnv } from '@/sandbox/config'
@@ -171,4 +171,31 @@ it('uses private host IPC for fresh personal ownership, never provider env claim
     env: { SAYCODE_AGENT_PERSONAL: 'true' }, entrypoint })
   expect(JSON.parse((await missing(['prompt', 'sibling', 'hello'], new AbortController().signal)).stdout).ownership)
     .toMatchObject({ relation: 'unknown' })
+})
+
+it('answers a batched ownership request in one authority call and never vouches for the host itself', async () => {
+  const root = await fixture(), entrypoint = join(root, 'owner-batch-cli.mjs')
+  await writeFile(entrypoint, `
+    process.on('message', response => {
+      console.log(JSON.stringify({exitCode:0,stdout:JSON.stringify({ok:true,ownerships:response.ownerships ?? null})}));
+      process.disconnect();
+    });
+    process.send({type:'agent-ownership-v1',requestId:'request',targetSessionIds:JSON.parse(process.argv[3])});
+  `)
+  const own = { relation: 'own-sibling' as const, proof: 'personal-same-account' as const, reason: 'same-account' }
+  const inspectMany = vi.fn(async (ids: string[]) => Object.fromEntries(ids.map(id => [id, own])))
+  const inspect = vi.fn(async () => own)
+  const execute = createAgentHostExecutor({ sessionId: 'current', directory: root, env: {}, entrypoint, identityAuthority: { inspect, inspectMany } })
+  const run = async (ids: unknown) => JSON.parse((await execute([JSON.stringify(ids)], new AbortController().signal)).stdout).ownerships
+  expect(await run(['a', 'current', 'b'])).toEqual({ a: own, b: own,
+    current: { relation: 'unknown', proof: null, reason: 'identity-unavailable' } })
+  expect(inspectMany).toHaveBeenCalledTimes(1)
+  expect(inspectMany).toHaveBeenCalledWith(['a', 'b'])
+  expect(inspect).not.toHaveBeenCalled()
+  const single = createAgentHostExecutor({ sessionId: 'current', directory: root, env: {}, entrypoint, identityAuthority: { inspect } })
+  expect(JSON.parse((await single([JSON.stringify(['a', 'b'])], new AbortController().signal)).stdout).ownerships).toEqual({ a: own, b: own })
+  for (const invalid of [[], Array.from({ length: 101 }, (_, i) => 's' + i), [''], [1]]) {
+    const host = await execute([JSON.stringify(invalid)], AbortSignal.timeout(1_000))
+    expect(host.stdout).not.toContain('ownerships":{')
+  }
 })
