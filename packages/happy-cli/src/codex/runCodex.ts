@@ -1183,7 +1183,8 @@ export async function runCodex(opts: {
 
                 // Codex continues an active goal on its own once the turn ends, so a user stop that leaves it
                 // active restarts the work. Codex's own TUI pauses the goal when interrupting for the same reason.
-                if (opts.pauseGoal) {
+                // Without an active goal, skip the extra await so the stop keeps its usual ordering.
+                if (opts.pauseGoal && codexGoalPhase === 'active') {
                     await pauseActiveGoalForStop();
                 }
 
