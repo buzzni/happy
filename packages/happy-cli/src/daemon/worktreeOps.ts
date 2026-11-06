@@ -1205,6 +1205,7 @@ async function fastForwardWorkspace(
     params: WorktreeOpParams<'pull-remote'>,
     targets: string[],
     head: string | null,
+    remote: string,
     credential: PreparedGitCredential | null,
 ): Promise<WorktreeOpResult<'pull-remote'>> {
     if (await dirtyCount(dir) > 0) return { status: 'dirty', head, conflictCount: 0 };
@@ -1216,7 +1217,7 @@ async function fastForwardWorkspace(
         if ((await runGit(dir, ['merge', '--ff-only', target])).code !== 0) return { status: 'diverged', head: await headCommit(dir), conflictCount: 0 };
     }
     if (params.push) {
-        const pushed = await runGit(dir, ['push', 'origin', `refs/heads/${params.branch}:refs/heads/${params.branch}`], {
+        const pushed = await runGit(dir, ['push', remote, `refs/heads/${params.branch}:refs/heads/${params.branch}`], {
             network: true, credential, timeoutMs: NETWORK_TIMEOUT_MS,
         });
         if (pushed.code !== 0) {
@@ -1267,7 +1268,7 @@ async function pullWorkspaceRemote(
         const targets = [(await fetchBranch(dir, remote, params.branch, credential, false))!];
         if (params.baseBranch) targets.push((await fetchBranch(dir, remote, params.baseBranch, credential, false))!);
         return params.mode === 'ff-only'
-            ? fastForwardWorkspace(dir, params, targets, head, credential)
+            ? fastForwardWorkspace(dir, params, targets, head, remote, credential)
             : mergeIntoWorkspace(dir, params, targets);
     });
 }
