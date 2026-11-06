@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { SessionOwnershipRelationRequestSchema } from '@slopus/happy-wire';
 import { createAgentRelationAuthority, readAgentRelationHost } from './agentRelationAuthority';
 
 const host = { serverUrl: 'https://happy.example', machineId: 'machine-1', token: 'happy-token' };
@@ -26,6 +27,8 @@ describe('broker relation authority (personal-ownership-simplification-plan H-C2
         const relation = h.calls.find(c => c.url === 'https://happy.example/v1/session-ownership/relation')!;
         expect(relation.init).toMatchObject({ method: 'POST', redirect: 'error', headers: { authorization: 'Bearer happy-token', 'content-type': 'application/json' } });
         expect(JSON.parse(String(relation.init.body))).toEqual({ v: 1, callerSessionId: 'hub', machineId: 'machine-1', sessionIds: ['mine', 'theirs'] });
+        // Contract with happy-server: the body is exactly what the shared v1 wire schema accepts.
+        expect(SessionOwnershipRelationRequestSchema.parse(JSON.parse(String(relation.init.body)))).toEqual(JSON.parse(String(relation.init.body)));
     });
 
     it('asks again on every inspection and reads the account only once', async () => {
