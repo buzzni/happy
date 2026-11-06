@@ -129,6 +129,46 @@ describe('workspace operations with an SSH origin and a sealed HTTPS credential'
         expect(git(repo, 'config', '--get', 'remote.origin.url')).toBe('git@github.com:acme/app.git');
         expect(pins()).toEqual({ v: 1, workspaces: { [repo]: { workspace: 'github.com/acme/app' } } });
     });
+
+    it('pull-remote pushes a fast-forward to the signed address too', async () => {
+        git(repo, 'push', '--quiet', bare, 'main:collab-x');
+        git(repo, 'switch', '--quiet', '-c', 'collab-x');
+        pushOnline('merged.txt', 'm');
+        const sshCalls = sshOrigin();
+
+        const answer = await call('pull-remote', {
+            workspaceDir: repo, remoteUrl: ONLINE, branch: 'collab-x', baseBranch: 'main', mode: 'ff-only',
+            expectedHead: git(repo, 'rev-parse', 'HEAD'), push: true,
+        }, true);
+
+        expect(answer, JSON.stringify(answer)).toMatchObject({ success: true, result: { status: 'fast-forwarded' } });
+        expect(git(bare, 'rev-parse', 'collab-x')).toBe(git(bare, 'rev-parse', 'main'));
+        expect(existsSync(sshCalls)).toBe(false);
+    });
+
+    // Only the HTTPS address is rewritten: `origin` (SSH) still names the repository, so the origin check alone passes.
+    it.each([
+        ['remote-status', 'insteadOf'],
+        ['pull-remote', 'insteadOf'],
+        ['pull-remote', 'pushInsteadOf'],
+    ] as const)('%s refuses when the machine\'s %s sends the signed address to another repository', async (op, rule) => {
+        git(repo, 'push', '--quiet', bare, 'main:collab-x');
+        git(repo, 'switch', '--quiet', '-c', 'collab-x');
+        pushOnline('merged.txt', 'm');
+        sshOrigin();
+        const elsewhere = `[url "https://evil.example/"]\n\t${rule} = https://github.com/\n`;
+        writeFileSync(join(root, 'gitconfig'), rule === 'insteadOf' ? elsewhere : `[url "${bare}"]\n\tinsteadOf = ${ONLINE}\n${elsewhere}`);
+
+        const head = git(repo, 'rev-parse', 'HEAD');
+        const answer = await call(op, {
+            workspaceDir: repo, remoteUrl: ONLINE, branch: 'collab-x', baseBranch: 'main',
+            ...(op === 'pull-remote' ? { mode: 'ff-only', expectedHead: head, push: true } : {}),
+        }, true);
+
+        expect(answer, JSON.stringify(answer)).toMatchObject({ success: false, errorCode: 'WORKTREE_REMOTE_MISMATCH' });
+        expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
+        expect(git(bare, 'rev-parse', 'collab-x')).not.toBe(git(bare, 'rev-parse', 'main'));
+    });
 });
 
 describe('workspace:remote-status', () => {
