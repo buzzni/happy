@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promi
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { createLegacyDispatchAdmission, createSubprocessWriteAdmission, createWorkspaceTurnAdmission } from '@/utils/workspaceTurnAdmission';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CheckpointLedger } from './checkpointLedger';
 import { CheckpointGarbageCollector } from './checkpointGarbageCollector';
@@ -97,6 +98,23 @@ describe('CheckpointRestoreExecutor', () => {
             checkpointId: snapshot.checkpointId,
         });
     }
+
+    it('refuses a host-owned restore before consuming its operation and retains the later Git writer', async () => {
+        const plan = await createAgentModifiedPlan();
+        const options = { mutate: undefined, reserveLegacyDispatch: createLegacyDispatchAdmission({ home: fixtureRoot }),
+            admitSubprocess: createSubprocessWriteAdmission({ home: fixtureRoot }) };
+        const executor = new CheckpointRestoreExecutor(checkpointRoot, options);
+        const request = { ...binding, projectPath, plan, operationId: 'host-admission-restore', confirmed: true };
+        const owner = createWorkspaceTurnAdmission({ home: fixtureRoot, roots: [projectPath], kind: 'automation', sessionId: 'restore-auto' });
+        expect(await owner.tryAcquire()).toEqual({ acquired: true });
+        try {
+            await expect(executor.execute(request)).rejects.toThrow('WORKSPACE_BUSY');
+            expect(await readFile(join(projectPath, 'tracked.txt'), 'utf8')).toBe('agent version\n');
+        } finally { await owner.release(true); }
+        expect(await executor.execute(request)).toMatchObject({ status: 'completed' });
+        expect(await readFile(join(projectPath, 'tracked.txt'), 'utf8')).toBe('before\n');
+        expect(await owner.tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+    });
 
     it('restores a checkpoint and then its safety checkpoint without claiming later user edits', async () => {
         const plan = await createAgentModifiedPlan();

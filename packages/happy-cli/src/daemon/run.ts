@@ -5836,6 +5836,7 @@ export async function startDaemon(): Promise<void> {
         retireWorktree: (params) => new CheckpointRetention(join(configuration.happyHomeDir, 'checkpoints')).retireWorktree(params),
         ...createCheckpointRpcHandlers({
         checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
+        ...(admitSubprocess ? { admitSubprocess, reserveLegacyDispatch } : {}),
         resolveAuthority: (sessionId) => resolveCheckpointSessionAuthority({
           sessionId,
           trackedSession: findTrackedSessionById(sessionId),
