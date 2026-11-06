@@ -38,7 +38,8 @@ import { REMOTE_TERMINAL_DISABLED_ERROR, resolveMachineLockdownPolicy } from '..
 import { homedir } from 'node:os';
 import { encodeBase64, decodeBase64, encrypt, decrypt, tryDecrypt } from './encryption';
 import { machineKeyTerminalCipher } from '@/daemon/terminalCipher';
-import { bindTerminal, createTerminalOpenNonceGuard, decideTerminalOpen, receiveBoundTerminalFrame, type BoundTerminal } from '@/daemon/terminalBindingSession';
+import { bindTerminal, createTerminalOpenNonceGuard, inspectTerminalOpen, receiveBoundTerminalFrame, type BoundTerminal } from '@/daemon/terminalBindingSession';
+import { prepareTerminalOpen, type TerminalOpenPreparation } from '@/daemon/terminalOpenAdmission';
 import { createTerminalOutputCoalescer } from '@/daemon/terminalOutputCoalescer';
 import {
     MACHINE_RESOURCE_METRICS_RPC,
@@ -153,7 +154,7 @@ import packageJson from '../../package.json';
 import { AUTOMATION_PROTOCOL_VERSION, AUTOMATION_SCHEDULE_KINDS, COMPANY_KEY_RESEED_CAPABILITY, COMPANY_KEY_RESEED_METHOD, PROJECT_PURGE_CAPABILITY, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, TERMINAL_BINDING_CAPABILITY, WORKSPACE_SYNC_CAPABILITY, WORKTREE_OPS_CAPABILITY, type AuthenticatedEnvelopesCapability } from '@slopus/happy-wire';
 import { stopServerProcess, StopServerError } from '@/daemon/stopServer';
 import { createPtySession } from '@/daemon/remoteTerminal';
-import { decideTerminalCwd, formatCwdFallbackBanner } from '@/daemon/decideTerminalCwd';
+import { formatCwdFallbackBanner } from '@/daemon/decideTerminalCwd';
 import { validatePath } from '@/modules/common/pathSecurity';
 import { existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -833,6 +834,7 @@ export class ApiMachineClient {
     private readonly machineResourceService = createMachineResourceService();
     /** Remembers bound terminal opens across reconnects, so one recorded open opens one shell. */
     private readonly terminalOpenNonceGuard = createTerminalOpenNonceGuard();
+    private readonly openingTerminals = new Map<string, { cancelled: boolean }>();
     // Live raw-TCP tunnels for preview WebSocket upgrades (previewWsProxy.ts).
     private previewWsProxy: PreviewWsProxy | null = null;
     /**
@@ -4000,6 +4002,8 @@ export class ApiMachineClient {
         // trial does attach it: its runtime roots every shell in the verified pty host and closes
         // terminals on drain (Desktop specs/windows-build-support W0-5h).
         if (!this.managedHandlers) this.onAcked('terminal-open-fwd', async (msg, ack) => {
+            let openingId: string | undefined;
+            let preparation: Extract<TerminalOpenPreparation, { kind: 'ready' }> | undefined;
             try {
                 const { sessionId, params } = msg || {};
                 if (!sessionId || typeof sessionId !== 'string') {
@@ -4026,16 +4030,39 @@ export class ApiMachineClient {
                 }
                 // terminal-binding-strict-design §4-2: a bound open with a terminal key is a v2
                 // terminal; the v1 open stays on compat and is refused under strict.
-                const decision = decideTerminalOpen(opened.value, {
+                const preview = inspectTerminalOpen(opened.value, {
                     machineId,
                     strict: configuration.machineControl === 'strict',
-                    nonceGuard: this.terminalOpenNonceGuard,
                 });
-                if (decision.kind === 'refused') {
-                    logger.debug(`[API MACHINE] terminal-open-fwd refused: ${decision.code}`);
-                    ack({ ok: false, error: decision.error, code: decision.code });
+                if (preview.kind === 'refused') {
+                    ack({ ok: false, error: preview.error, code: preview.code });
                     return;
                 }
+                if (this.openingTerminals.has(sessionId)) {
+                    ack({ ok: false, code: 'TERMINAL_OPEN_PENDING', error: 'Terminal opening is already pending' });
+                    return;
+                }
+                const opening = { cancelled: false };
+                this.openingTerminals.set(sessionId, opening);
+                openingId = sessionId;
+                const prepared = await prepareTerminalOpen({ opened: opened.value, machineId,
+                    strict: configuration.machineControl === 'strict', nonceGuard: this.terminalOpenNonceGuard,
+                    reserveLegacyDispatch: this.reserveLegacyDispatch, admitSubprocess: this.admitSubprocess,
+                    cwd: { allowedRoot: this.allowedRoot, homedir: homedir(), fsExists: existsSync,
+                        fsMkdir: path => { mkdirSync(path, { recursive: true }); }, validate: validatePath },
+                });
+                if (prepared.kind === 'refused') {
+                    ack({ ok: false, error: prepared.error, code: prepared.code });
+                    return;
+                }
+                preparation = prepared;
+                if (opening.cancelled) {
+                    await prepared.cancel();
+                    ack({ ok: false, code: 'TERMINAL_OPEN_CANCELLED', error: 'Terminal opening was cancelled' });
+                    return;
+                }
+                const { decision, cwdDecision } = prepared;
+                await prepared.submit(() => {
                 const opts: any = decision.params;
                 const auditUserId = typeof opts?.userId === 'string' ? opts.userId : 'remote-client';
                 // specs/remote-terminal-cwd-fallback/ — never let
@@ -4044,14 +4071,6 @@ export class ApiMachineClient {
                 // when safe, and falls back to homedir otherwise so the
                 // user always gets a working shell instead of node-pty's
                 // raw `chdir(2) failed.: No such file or directory`.
-                const cwdDecision = decideTerminalCwd({
-                    requested: typeof opts?.cwd === 'string' ? opts.cwd : undefined,
-                    allowedRoot: this.allowedRoot,
-                    homedir: homedir(),
-                    fsExists: existsSync,
-                    fsMkdir: (path) => mkdirSync(path, { recursive: true }),
-                    validate: validatePath,
-                });
                 let pty: ReturnType<typeof createPtySession>;
                 try {
                     pty = createPtySession({
@@ -4181,10 +4200,14 @@ export class ApiMachineClient {
                         ? { ...RELAY_TERMINAL_CAPS, terminalBinding: { version: 1, proof: bound.proof } }
                         : RELAY_TERMINAL_CAPS,
                 });
+                });
             } catch (e) {
                 const message = e instanceof Error ? e.message : String(e);
                 logger.debug(`[API MACHINE] terminal-open-fwd internal error: ${message}`);
                 ack({ ok: false, error: 'Internal error' });
+            } finally {
+                await preparation?.cancel();
+                if (openingId) this.openingTerminals.delete(openingId);
             }
         });
 
@@ -4284,6 +4307,8 @@ export class ApiMachineClient {
 
         this.socket.on('terminal-close-fwd', (msg) => {
             const { sessionId } = msg || {};
+            const opening = this.openingTerminals.get(sessionId);
+            if (opening) opening.cancelled = true;
             const entry = getDaemonTerminalSession(sessionId);
             if (!entry) return;
             // terminal-binding-strict-design decision b: the relay can end a terminal anyway (it can

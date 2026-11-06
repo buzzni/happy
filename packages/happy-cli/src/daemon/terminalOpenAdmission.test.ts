@@ -31,27 +31,42 @@ function fixture() {
     return { home, project, other, request, input, automatic };
 }
 
+async function ready(input: TerminalOpenAdmissionInput) {
+    const result = await prepareTerminalOpen(input);
+    expect(result.kind).toBe('ready');
+    if (result.kind !== 'ready') throw new Error(result.code);
+    return result;
+}
+
 describe('prepareTerminalOpen', () => {
     it('holds a terminal before nonce consumption and permits the same request after proven automatic release', async () => {
         const f = fixture(), owner = f.automatic(), input = f.input();
         expect(await owner.tryAcquire()).toEqual({ acquired: true });
         expect(await prepareTerminalOpen(input)).toMatchObject({ kind: 'refused', code: 'WORKSPACE_UNAVAILABLE' });
         expect(await owner.release(true)).toBe(true);
-        expect(await prepareTerminalOpen(input)).toMatchObject({ kind: 'ready', cwdDecision: { cwd: f.project } });
+        const prepared = await ready(input);
+        expect(prepared.cwdDecision.cwd).toBe(f.project);
+        await prepared.submit(() => undefined);
         expect(await f.automatic().tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
     });
 
     it('does not reserve the whole home when a different project has an automatic owner', async () => {
         const f = fixture(), owner = f.automatic(f.other);
         expect(await owner.tryAcquire()).toEqual({ acquired: true });
-        try { expect(await prepareTerminalOpen(f.input())).toMatchObject({ kind: 'ready', cwdDecision: { cwd: f.project } }); }
+        try {
+            const prepared = await ready(f.input());
+            expect(prepared.cwdDecision.cwd).toBe(f.project);
+            await prepared.cancel();
+        }
         finally { await owner.release(true); }
     });
 
     it('creates a validated missing cwd under reservation before retaining its actual inode', async () => {
         const f = fixture(), directory = join(f.home, 'new', 'project');
-        expect(await prepareTerminalOpen(f.input(f.request(directory)))).toMatchObject({ kind: 'ready', cwdDecision: { cwd: directory } });
+        const prepared = await ready(f.input(f.request(directory)));
+        expect(prepared.cwdDecision.cwd).toBe(directory);
         expect(existsSync(directory)).toBe(true);
+        await prepared.submit(() => undefined);
         expect(await f.automatic(directory).tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
     });
 
@@ -66,7 +81,7 @@ describe('prepareTerminalOpen', () => {
 
     it('does not retain a replay with a different cwd as a new writer', async () => {
         const f = fixture(), request = f.request();
-        expect((await prepareTerminalOpen(f.input(request))).kind).toBe('ready');
+        await (await ready(f.input(request))).submit(() => undefined);
         expect(await prepareTerminalOpen(f.input(f.request(f.other, request.nonce))))
             .toMatchObject({ kind: 'refused', code: 'RPC_REQUEST_REPLAYED' });
         const owner = f.automatic(f.other);
@@ -97,6 +112,47 @@ describe('prepareTerminalOpen', () => {
         const f = fixture(), input = f.input(); input.reserveLegacyDispatch = undefined;
         expect(await prepareTerminalOpen(input)).toMatchObject({ kind: 'refused', code: 'WORKSPACE_ADMISSION_UNAVAILABLE' });
         input.reserveLegacyDispatch = createLegacyDispatchAdmission({ home: f.home });
-        expect((await prepareTerminalOpen(input)).kind).toBe('ready');
+        await (await ready(input)).cancel();
+    });
+
+    it('releases a cancelled preparation without retaining an unfenced writer', async () => {
+        const f = fixture(), prepared = await ready(f.input());
+        await prepared.cancel();
+        const owner = f.automatic();
+        expect(await owner.tryAcquire()).toEqual({ acquired: true });
+        await owner.release(true);
+        const start = vi.fn();
+        await expect(prepared.submit(start)).rejects.toThrow('TERMINAL_OPEN_ALREADY_SETTLED');
+        expect(start).not.toHaveBeenCalled();
+    });
+
+    it('keeps the temporary owner through synchronous submission and durable retention', async () => {
+        const f = fixture(), input = f.input();
+        let release!: () => void;
+        const gate = new Promise<void>(resolve => { release = resolve; });
+        const retain = input.admitSubprocess!;
+        input.admitSubprocess = async roots => { await gate; await retain(roots); };
+        const prepared = await ready(input), start = vi.fn();
+        const submitted = prepared.submit(start);
+        expect(start).toHaveBeenCalledOnce();
+        try {
+            expect(await f.automatic().tryAcquire()).toMatchObject({ acquired: false });
+            await prepared.cancel();
+            expect(await f.automatic().tryAcquire()).toMatchObject({ acquired: false });
+        } finally { release(); await submitted; }
+        expect(await f.automatic().tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+        await expect(prepared.submit(start)).rejects.toThrow('TERMINAL_OPEN_ALREADY_SETTLED');
+        expect(start).toHaveBeenCalledOnce();
+    });
+
+    it.each([false, true])('retains submitted ownership without replacing the original throw=%s result when tracking fails', async throws => {
+        const f = fixture(), input = f.input();
+        input.admitSubprocess = async () => { throw new Error('WORKSPACE_REGISTRY_BUSY'); };
+        const prepared = await ready(input), start = vi.fn(() => { if (throws) throw new Error('original spawn failure'); });
+        if (throws) await expect(prepared.submit(start)).rejects.toThrow('original spawn failure');
+        else await expect(prepared.submit(start)).resolves.toBeUndefined();
+        expect(start).toHaveBeenCalledOnce();
+        await prepared.cancel();
+        expect(await f.automatic().tryAcquire()).toMatchObject({ acquired: false });
     });
 });

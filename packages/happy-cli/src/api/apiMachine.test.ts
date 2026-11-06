@@ -852,6 +852,108 @@ describe('ApiMachineClient socket reconnection', () => {
             };
         }
 
+        it('holds an automatic workspace before opening a relay PTY and permits the original request after release', async () => {
+            const home = await mkdtemp(join(tmpdir(), 'relay-terminal-admission-'));
+            const directory = join(home, 'project'); await mkdir(directory);
+            vi.stubEnv('HAPPY_WORKSPACE_ROOT', directory);
+            const owner = createWorkspaceTurnAdmission({ home, roots: [directory], kind: 'automation', sessionId: 'automation-run:relay' });
+            const sessionId = 'v2-host-relay';
+            try {
+                expect(await owner.tryAcquire()).toEqual({ acquired: true });
+                const machine = makeMachine();
+                let retention: Promise<void> | undefined;
+                const client = Reflect.construct(ApiMachineClient, ['fake-token', machine, undefined, undefined, null, undefined,
+                    (roots: readonly string[]) => retention = createSubprocessWriteAdmission({ home })(roots), createLegacyDispatchAdmission({ home })]);
+                client.connect();
+                const opener = boundOpen(machine, { params: { cwd: directory } });
+                expect(await open(machine, sessionId, opener.params)).toMatchObject({ ok: false, code: 'WORKSPACE_UNAVAILABLE' });
+                expect(getDaemonTerminalSession(sessionId)).toBeNull();
+                expect(await owner.release(true)).toBe(true);
+                expect(await open(machine, sessionId, opener.params)).toMatchObject({ ok: true });
+                expect(retention).toBeDefined(); await retention;
+                await vi.waitFor(async () => expect(await owner.tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' }));
+            } finally {
+                await getDaemonTerminalSession(sessionId)?.session.terminate(); removeDaemonTerminalSession(sessionId);
+                await owner.release(true); await rm(home, { recursive: true, force: true }); vi.unstubAllEnvs();
+            }
+        });
+
+        it('does not open a relay PTY after the pending request was closed', async () => {
+            const home = await mkdtemp(join(tmpdir(), 'relay-terminal-cancel-'));
+            const directory = join(home, 'project'); await mkdir(directory);
+            vi.stubEnv('HAPPY_WORKSPACE_ROOT', directory);
+            let release!: () => void;
+            const gate = new Promise<void>(resolve => { release = resolve; });
+            const reserve = vi.fn(async (roots: readonly string[]) => { await gate; return createLegacyDispatchAdmission({ home })(roots); });
+            const machine = makeMachine();
+            const client = Reflect.construct(ApiMachineClient, ['fake-token', machine, undefined, undefined, null, undefined,
+                createSubprocessWriteAdmission({ home }), reserve]);
+            client.connect();
+            const sessionId = 'v2-pending-closed', opener = boundOpen(machine, { params: { cwd: directory } });
+            const pending = open(machine, sessionId, opener.params);
+            try {
+                await vi.waitFor(() => expect(reserve).toHaveBeenCalledOnce());
+                emitSocketEvent('terminal-close-fwd', { sessionId });
+                release();
+                expect(await pending).toMatchObject({ ok: false, code: 'TERMINAL_OPEN_CANCELLED' });
+                expect(getDaemonTerminalSession(sessionId)).toBeNull();
+                const owner = createWorkspaceTurnAdmission({ home, roots: [directory], kind: 'automation', sessionId: 'automation-run:after-terminal-cancel' });
+                expect(await owner.tryAcquire()).toEqual({ acquired: true });
+                await owner.release(true);
+            } finally {
+                release(); await pending; await rm(home, { recursive: true, force: true }); vi.unstubAllEnvs();
+            }
+        });
+
+        it('refuses a duplicate relay open while the same session admission is pending', async () => {
+            let release!: () => void;
+            const gate = new Promise<void>(resolve => { release = resolve; });
+            const reserve = vi.fn(async () => { await gate; return { acquired: true as const, finish: async () => undefined }; });
+            const machine = makeMachine();
+            const client = Reflect.construct(ApiMachineClient, ['fake-token', machine, undefined, undefined, null, undefined,
+                vi.fn(async () => { throw new Error('WORKSPACE_BUSY'); }), reserve]);
+            client.connect();
+            const sessionId = 'v2-pending-duplicate';
+            const pending = open(machine, sessionId, boundOpen(machine).params);
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+                await vi.waitFor(() => expect(reserve).toHaveBeenCalledOnce());
+                const duplicate = await Promise.race([open(machine, sessionId, boundOpen(machine).params),
+                    new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), 1000); })]);
+                expect(duplicate).toMatchObject({ ok: false, code: 'TERMINAL_OPEN_PENDING' });
+                expect(reserve).toHaveBeenCalledOnce();
+            } finally { if (timer) clearTimeout(timer); release(); await pending; }
+        });
+
+        it('closes an already submitted relay PTY while durable retention is pending without releasing its writer', async () => {
+            const home = await mkdtemp(join(tmpdir(), 'relay-terminal-submitted-close-'));
+            const directory = join(home, 'project'); await mkdir(directory);
+            vi.stubEnv('HAPPY_WORKSPACE_ROOT', directory);
+            let release!: () => void;
+            const gate = new Promise<void>(resolve => { release = resolve; });
+            let retention: Promise<void> | undefined;
+            const machine = makeMachine(), sessionId = 'v2-submitted-close';
+            const client = Reflect.construct(ApiMachineClient, ['fake-token', machine, undefined, undefined, null, undefined,
+                (roots: readonly string[]) => retention = (async () => { await gate; await createSubprocessWriteAdmission({ home })(roots); })(),
+                createLegacyDispatchAdmission({ home })]);
+            client.connect();
+            try {
+                expect(await open(machine, sessionId, boundOpen(machine, { params: { cwd: directory } }).params)).toMatchObject({ ok: true });
+                const entry = getDaemonTerminalSession(sessionId);
+                expect(entry).not.toBeNull(); expect(retention).toBeDefined();
+                const owner = createWorkspaceTurnAdmission({ home, roots: [directory], kind: 'automation', sessionId: 'automation-run:submitted-terminal' });
+                expect(await owner.tryAcquire()).toMatchObject({ acquired: false });
+                emitSocketEvent('terminal-close-fwd', { sessionId });
+                await entry?.session.terminate();
+                expect(getDaemonTerminalSession(sessionId)).toBeNull();
+                release(); await retention;
+                await vi.waitFor(async () => expect(await owner.tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' }));
+            } finally {
+                release(); await retention; await getDaemonTerminalSession(sessionId)?.session.terminate(); removeDaemonTerminalSession(sessionId);
+                await rm(home, { recursive: true, force: true }); vi.unstubAllEnvs();
+            }
+        });
+
         it('opens a bound terminal, proves it, and runs sealed input in order', async () => {
             const machine = makeMachine();
             const client = new ApiMachineClient('fake-token', machine);
