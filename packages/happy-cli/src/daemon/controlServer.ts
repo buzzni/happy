@@ -25,6 +25,7 @@ import { startServerProcess, StartServerError } from './startServer';
 import { stopServerProcess, StopServerError } from './stopServer';
 import { BrowserBridge, BridgeRequestError } from './browserBridge';
 import { attachTerminalWsRoute, type TerminalRouteMachine as TerminalMachineEncryption } from './controlServerTerminalWs';
+import type { TerminalOpenAdmissionInput } from './terminalOpenAdmission';
 import { scopeErrorCode } from './sessionWriteScopeErrors';
 import type { SessionWriteScopeRuntime } from './sessionWriteScopeRuntime';
 import { SetupTokenActivitySchema } from '@slopus/happy-wire';
@@ -119,8 +120,10 @@ export function startDaemonControlServer({
   getSetupTokenAccountSwitch = () => null,
   getCallerLaunches = () => null,
   admitSubprocess,
+  reserveLegacyDispatch,
 }: {
   admitSubprocess?: (roots: readonly string[]) => Promise<void>;
+  reserveLegacyDispatch?: TerminalOpenAdmissionInput['reserveLegacyDispatch'];
   /** T1c-b2 H2 owner-contact launch bootstrap; null while the rollout switch is off. */
   getCallerLaunches?: () => { issue(raw: unknown): Promise<unknown>; current(raw: unknown): Promise<{ current: boolean }> } | null;
   getDeviceEnrollment?: () => ReturnType<typeof createDeviceEnrollment> | null;
@@ -307,6 +310,8 @@ export function startDaemonControlServer({
       controlSecret,
       allowedRoot,
       getMachineEncryption,
+      ...(admitSubprocess ? { admitSubprocess } : {}),
+      ...(reserveLegacyDispatch ? { reserveLegacyDispatch } : {}),
     });
 
     // Set up Zod type provider

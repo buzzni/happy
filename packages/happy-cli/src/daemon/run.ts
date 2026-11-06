@@ -4342,7 +4342,7 @@ export async function startDaemon(): Promise<void> {
     const { port: controlPort, stop: stopControlServer, controlSecret } = await startDaemonControlServer({
       restartDrain: restartDrainControlPort,
       getCallerLaunches: () => callerLaunches,
-      ...(admitSubprocess ? { admitSubprocess } : {}),
+      ...(admitSubprocess ? { admitSubprocess, reserveLegacyDispatch } : {}),
       getSetupTokenAccountSwitch: () => setupTokenAccountSwitch,
       getChildren: getCurrentChildren,
       stopSession,

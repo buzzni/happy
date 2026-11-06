@@ -11,6 +11,7 @@ import { signAutomationExecutionTarget } from '@slopus/happy-wire/automationExec
 import { signChatAutomationLifecycle } from '@slopus/happy-wire/chatAutomationLifecycleToken'
 import { ApiClient } from '@/api/api'
 import { io } from 'socket.io-client'
+import { WebSocket } from 'ws'
 import { decrypt, encrypt, decodeBase64 } from '@/api/encryption'
 import { SessionWriteScopeFixture, eventually, type StoredMessage } from '@/testing/sessionWriteScopeFixture'
 import { createAutomationContextLaunchJournal } from './automationContextLaunchJournal'
@@ -352,6 +353,35 @@ it('refuses a real daemon manual spawn while automatic ownership exists and perm
     browserBridgeHost: '::1', automationContextHost: true })
   try {
     await fixture.start()
+    const machineId = await eventually(async () => {
+      const machines = (await fixture.http('/v1/machines')).body
+      return Array.isArray(machines) && machines[0]?.id ? machines[0].id as string : undefined
+    }, 'disposable machine registration before terminal scope binding')
+    const directOpen = async (): Promise<any> => {
+      const ws = new WebSocket(`ws://127.0.0.1:${fixture.state.httpPort}/terminal`, {
+        headers: { Authorization: `Bearer ${fixture.state.controlSecret}` },
+      })
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('Disposable terminal connection timed out')), 5000)
+          ws.once('open', () => { clearTimeout(timer); resolve() })
+          ws.once('error', error => { clearTimeout(timer); reject(error) })
+        })
+        const reqId = randomUUID()
+        const opened = bindRpcRequest({ method: 'terminal-open', scope: machineId, issuedAt: Date.now(), nonce: randomBytes(16).toString('base64'),
+          params: { terminalBinding: 1, terminalKey: randomBytes(32).toString('base64'), terminalId: randomBytes(16).toString('base64'),
+            cwd: fixture.project, shell: process.execPath, args: ['-e', '0'] } })
+        return await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('Disposable terminal ACK timed out')), 5000)
+          ws.on('message', raw => {
+            const reply = JSON.parse(raw.toString())
+            if (reply.reqId !== reqId) return
+            clearTimeout(timer); resolve(reply)
+          })
+          ws.send(JSON.stringify({ reqId, event: 'terminal-open', data: { params: Buffer.from(encrypt(fixture.seed, 'legacy', opened)).toString('base64') } }))
+        })
+      } finally { ws.close() }
+    }
     const nested = join(fixture.project, 'nested'), alias = join(fixture.root, 'project-alias')
     await mkdir(nested); await symlink(fixture.project, alias)
     const workspace = createAutomationContextWorkspace({ home: fixture.happyHome, isTracked: async () => false })
@@ -368,6 +398,7 @@ it('refuses a real daemon manual spawn while automatic ownership exists and perm
       await fixture.children()
       expect(blocked.body.success).toBe(false)
       expect(blocked.body.code).toBe('workspace-automation-busy')
+      expect((await directOpen()).error).toBe('workspace-busy')
       for (const directory of [nested, alias]) {
         const blockedAlias = await fixture.control('/spawn-session', { directory, agent: 'claude' })
         expect(blockedAlias.body).toMatchObject({ success: false, code: 'workspace-automation-busy' })
@@ -379,6 +410,7 @@ it('refuses a real daemon manual spawn while automatic ownership exists and perm
       // This test reserved the workspace but never submitted an automatic provider.
       expect(await workspace.releaseUnsubmitted({ runId, roots: [fixture.project], ownerToken: owned.ownerToken })).toBe(true)
     }
+    expect((await directOpen()).data?.ok).toBe(true)
     const server = await fixture.control('/start-server', { command: 'node -v', cwd: fixture.project })
     expect(server).toMatchObject({ status: 200, body: { success: true, pid: expect.any(Number) } })
     expect(await workspace.acquireAutomation({ runId: `server-owner-${randomUUID()}`, roots: [fixture.project] }))
