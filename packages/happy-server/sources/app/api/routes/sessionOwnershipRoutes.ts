@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { Readable } from 'node:stream';
-import { parseCanonicalOrgSetupTokenJson } from '@slopus/happy-wire';
+import { parseCanonicalOrgSetupTokenJson, SessionOwnershipRelationRequestSchema, type SessionOwnershipRelationResponse } from '@slopus/happy-wire';
 import type { Fastify } from '@/app/api/types';
 import { db } from '@/storage/db';
 import { requireAccountPrincipal } from '@/app/api/utils/enableAuthentication';
@@ -8,10 +8,6 @@ import { confirmOwnership, lookupOwnership, inspectOwnershipMachine, ownershipEn
 import { agentOwnershipRelationEnabled, createAgentOwnershipEligibility } from '@/app/session/agentOwnershipEligibility';
 import { createRateLimiter } from '@/app/auth/selfHostAuthPolicy';
 
-const relationRequest = z.object({
-    v: z.literal(1), callerSessionId: z.string().min(1).max(128), machineId: z.string().min(1).max(128),
-    sessionIds: z.array(z.string().min(1).max(128)).min(1).max(100),
-}).strict();
 
 export function sessionOwnershipRoutes(app: Fastify) {
     app.get('/v1/session-ownership/capabilities', async () => ({ sessionOwnershipV1: ownershipEnabled() }));
@@ -74,7 +70,7 @@ export function sessionOwnershipRoutes(app: Fastify) {
     const eligibility = createAgentOwnershipEligibility();
     const limiter = createRateLimiter({ relation: { limit: 120, windowMs: 60_000 } });
     app.post('/v1/session-ownership/relation', {
-        preHandler: app.authenticate, schema: { body: relationRequest },
+        preHandler: app.authenticate, schema: { body: SessionOwnershipRelationRequestSchema },
     }, async (request, reply) => {
         if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
         const accountId = request.userId, body = request.body;
@@ -84,7 +80,7 @@ export function sessionOwnershipRoutes(app: Fastify) {
         const caller = await db.session.findFirst({ where: { id: body.callerSessionId, accountId }, select: { id: true } });
         const machine = await db.machine.findUnique({ where: { id: body.machineId } });
         if (!caller || machine?.accountId !== accountId) return reply.code(403).send({ error: 'Not the caller account' });
-        const unavailable = { v: 1, callerAccountId: accountId, proof: null, unavailable: true };
+        const unavailable = { v: 1, callerAccountId: accountId, proof: null, unavailable: true } satisfies SessionOwnershipRelationResponse;
         if (!agentOwnershipRelationEnabled()) return reply.send(unavailable);
         const verdict = await eligibility(accountId, body.machineId);
         if (verdict === 'unavailable') return reply.send(unavailable);
@@ -92,7 +88,8 @@ export function sessionOwnershipRoutes(app: Fastify) {
             where: { id: { in: body.sessionIds }, accountId }, select: { id: true },
         })).map(session => session.id)) : new Set<string>();
         const relations = Object.fromEntries(body.sessionIds.map(id =>
-            [id, owned.has(id) && id !== body.callerSessionId ? 'own' : 'not-own']));
-        return reply.send({ v: 1, callerAccountId: accountId, proof: verdict === 'eligible' ? 'personal-same-account' : null, relations });
+            [id, owned.has(id) && id !== body.callerSessionId ? 'own' as const : 'not-own' as const]));
+        return reply.send({ v: 1, callerAccountId: accountId, proof: verdict === 'eligible' ? 'personal-same-account' : null,
+            relations } satisfies SessionOwnershipRelationResponse);
     });
 }

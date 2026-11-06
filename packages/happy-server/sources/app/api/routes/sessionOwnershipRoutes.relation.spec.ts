@@ -10,6 +10,7 @@ vi.mock('@/storage/db', () => ({ db: {
     machine: { findUnique: dbMocks.machineFindUnique },
 } }));
 
+import { SessionOwnershipRelationRequestSchema, SessionOwnershipRelationResponseSchema } from '@slopus/happy-wire';
 import { sessionOwnershipRoutes } from './sessionOwnershipRoutes';
 
 // Stand-in for A+ `POST /api/internal/agent-ownership/eligibility` (aplus-dev-studio #5857).
@@ -48,10 +49,21 @@ async function createApp() {
 }
 
 const request = { v: 1, callerSessionId: 'hub', machineId: 'machine-1', sessionIds: ['hub', 'mine', 'theirs', 'missing'] };
-const ask = (app: Fastify, body: unknown = request, headers: Record<string, string> = { 'x-user-id': 'account-a' }) =>
-    app.inject({ method: 'POST', url: '/v1/session-ownership/relation', headers, payload: body as object });
+// Contract with happy-cli: every answer the real route gives must be what the shared v1 wire schema accepts.
+const ask = async (app: Fastify, body: unknown = request, headers: Record<string, string> = { 'x-user-id': 'account-a' }) => {
+    const response = await app.inject({ method: 'POST', url: '/v1/session-ownership/relation', headers, payload: body as object });
+    if (response.statusCode === 200) expect(SessionOwnershipRelationResponseSchema.parse(response.json())).toEqual(response.json());
+    return response;
+};
 
 describe('POST /v1/session-ownership/relation', () => {
+    it('accepts exactly the shared v1 request', async () => {
+        const app = await createApp();
+        expect(SessionOwnershipRelationRequestSchema.parse(request)).toEqual(request);
+        expect((await ask(app)).statusCode).toBe(200);
+        await app.close();
+    });
+
     beforeEach(() => {
         vi.clearAllMocks();
         studioCalls = [];

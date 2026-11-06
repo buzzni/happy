@@ -3,17 +3,12 @@
  * registered personal machine. The host fixes its own server, machine and token once at start; nothing comes from
  * the provider, request env or session metadata. Every inspection asks again: listing answers are not reused. */
 import { z } from 'zod';
+import { SessionOwnershipRelationResponseSchema, type SessionOwnershipRelationRequest } from '@slopus/happy-wire';
 import type { AgentIdentityAuthority, AgentOwnershipVerdict } from './agentIdentityDescriptor';
 
 export interface AgentRelationHost { serverUrl: string; machineId: string; token: string }
 const MAX_BODY = 65_536;
 const unknown = (reason: string): AgentOwnershipVerdict => ({ relation: 'unknown', proof: null, reason });
-const answerSchema = z.union([
-    z.object({ v: z.literal(1), callerAccountId: z.string().min(1), proof: z.null(), unavailable: z.literal(true) }).strict(),
-    // v1 `own` means only personal account + registered personal machine + same account. Any other proof is rejected.
-    z.object({ v: z.literal(1), callerAccountId: z.string().min(1), proof: z.literal('personal-same-account').nullable(),
-        relations: z.record(z.string(), z.enum(['own', 'not-own'])) }).strict(),
-]);
 
 /** Read once when the host starts, before the provider: the daemon's server-confirmed machine id and this home's token. */
 export async function readAgentRelationHost(input: { serverUrl: string;
@@ -50,8 +45,9 @@ export function createAgentRelationAuthority(input: { host: AgentRelationHost | 
         try {
             const accountId = await callerAccount();
             if (!accountId) return all(unknown('identity-unavailable'));
-            const parsed = answerSchema.safeParse(await json('/v1/session-ownership/relation', { method: 'POST',
-                body: JSON.stringify({ v: 1, callerSessionId: input.callerSessionId, machineId: input.host.machineId, sessionIds: targets }) }));
+            const parsed = SessionOwnershipRelationResponseSchema.safeParse(await json('/v1/session-ownership/relation', { method: 'POST',
+                body: JSON.stringify({ v: 1, callerSessionId: input.callerSessionId, machineId: input.host.machineId,
+                    sessionIds: targets } satisfies SessionOwnershipRelationRequest) }));
             if (!parsed.success || parsed.data.callerAccountId !== accountId) return all(unknown('identity-unproven'));
             const answer = parsed.data;
             if ('unavailable' in answer) return all(unknown('ownership-unavailable'));
