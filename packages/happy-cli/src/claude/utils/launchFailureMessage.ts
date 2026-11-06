@@ -1,3 +1,5 @@
+import { constants as osConstants } from 'node:os';
+
 export const PERSONAL_CLAUDE_AUTH_FAILURE = 'CLAUDE_PERSONAL_AUTH_NOT_VERIFIED';
 export const ORGANIZATION_CLAUDE_AUTH_FAILURE = 'CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED';
 
@@ -36,11 +38,22 @@ export function describeClaudeLaunchFailure(error: unknown): string {
     if (code === 'ENOENT' || /\bENOENT\b/.test(text)) {
         return 'Claude Code could not start: its executable could not be found on this machine. Reinstall happy-cli on it.';
     }
-    const signal = /terminated by signal (SIG[A-Z0-9]+)/.exec(text)?.[1];
+    if (/your account is on hold/i.test(text)) {
+        return 'Claude Code stopped: the Claude account this session uses is on hold. '
+            + 'Check it at https://claude.ai/restricted, or switch this session to another Claude account, then send again.';
+    }
+    const signal = /terminated by signal (SIG[A-Z0-9]+)/.exec(text)?.[1] ?? signalOfExitCode(text);
     if (signal) {
         return `Claude Code could not start: it stopped unexpectedly (${signal}). Check this machine's daemon log.`;
     }
     return 'Claude Code could not start on this machine. Check this machine\'s daemon log for details.';
+}
+
+/** The SDK reports a child killed by signal N as "exited with code 128+N" (SIGTERM → 143). */
+function signalOfExitCode(text: string): string | undefined {
+    const code = Number(/exited with code (\d+)/.exec(text)?.[1]);
+    if (!(code > 128 && code < 160)) return undefined;
+    return Object.entries(osConstants.signals).find(([, number]) => number === code - 128)?.[0];
 }
 
 /**
