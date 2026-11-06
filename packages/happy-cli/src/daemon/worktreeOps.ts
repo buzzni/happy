@@ -14,6 +14,7 @@
  * private askpass and its env, never the command line, a log line or an answer.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHmac } from 'node:crypto';
 import { appendFile, copyFile, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, rmdir, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -46,6 +47,7 @@ import { stopProjectNativeProcesses, type NativeStopResult } from './projectNati
 import { isWithinDirectory } from '@/modules/common/happyHomeGuard';
 import { openSealedForMachine } from '@/modules/common/machineSeal';
 import { logger } from '@/ui/logger';
+import type { LegacyDispatchReservation } from '@/utils/workspaceTurnAdmission';
 
 export const WORKTREE_OPS_METHODS = WORKTREE_OPS.map((op) => worktreeOpMethod(op));
 export type WorktreeOpsMethod = ReturnType<typeof worktreeOpMethod>;
@@ -84,7 +86,14 @@ export type WorktreeOpsDeps = {
     happyHomeDir: string;
     now?: () => number;
     purge?: ProjectPurgeIo;
+    reserveLegacyDispatch?: (roots: readonly string[]) => Promise<LegacyDispatchReservation>;
+    admitSubprocess?: (roots: readonly string[]) => Promise<void>;
 };
+
+const operationAdmission = new AsyncLocalStorage<{
+    roots: readonly string[];
+    admitSubprocess: NonNullable<WorktreeOpsDeps['admitSubprocess']>;
+} | undefined>();
 
 export type WorktreeOpAnswer =
     | { success: true; result: Record<string, unknown>; finishedAt: number; attestation: string }
@@ -198,7 +207,12 @@ type GitOptions = {
  */
 const NETWORK_CONFIG = ['-c', 'http.followRedirects=false', '-c', 'protocol.http.allow=never'];
 
-function runGit(cwd: string, args: string[], options: GitOptions = {}): Promise<GitResult> {
+async function runGit(cwd: string, args: string[], options: GitOptions = {}): Promise<GitResult> {
+    const admission = operationAdmission.getStore();
+    if (admission && !options.readOnly) await admission.admitSubprocess([...new Set([...admission.roots, cwd])]);
+    // Fixed metadata diffs must not invoke repository-configured external diff/textconv programs.
+    const commandIndex = args[0] === '-c' ? 2 : 0;
+    if (args[commandIndex] === 'diff') args = [...args.slice(0, commandIndex + 1), '--no-ext-diff', '--no-textconv', ...args.slice(commandIndex + 1)];
     return new Promise((resolvePromise) => {
         const child = spawn('git', [
             '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
@@ -429,7 +443,7 @@ async function serialized<T>(path: string, run: () => Promise<T>): Promise<T> {
 }
 
 async function repositoryRoot(dir: string): Promise<string | null> {
-    const result = await runGit(dir, ['rev-parse', '--show-toplevel']);
+    const result = await runGit(dir, ['rev-parse', '--show-toplevel'], { readOnly: true });
     return result.code === 0 ? result.stdout.trim() : null;
 }
 
@@ -452,7 +466,7 @@ async function readCapability(dir: string): Promise<WorktreeOpResult<'capability
 }
 
 async function prepare(dir: string): Promise<WorktreeOpResult<'prepare'>> {
-    const inside = await runGit(dir, ['rev-parse', '--is-inside-work-tree']);
+    const inside = await runGit(dir, ['rev-parse', '--is-inside-work-tree'], { readOnly: true });
     if (inside.code !== 0 || inside.stdout.trim() !== 'true') {
         await gitOk(dir, ['init', '--quiet', '--initial-branch=main'], 'WORKTREE_PREPARE_FAILED');
     }
@@ -462,7 +476,7 @@ async function prepare(dir: string): Promise<WorktreeOpResult<'prepare'>> {
 }
 
 async function excludeFile(repo: string): Promise<string> {
-    return resolve(repo, (await gitOk(repo, ['rev-parse', '--git-path', 'info/exclude'], 'WORKTREE_ADD_FAILED')).trim());
+    return resolve(repo, (await gitOk(repo, ['rev-parse', '--git-path', 'info/exclude'], 'WORKTREE_ADD_FAILED', { readOnly: true })).trim());
 }
 
 async function excludeLines(repo: string, lines: string[]): Promise<void> {
@@ -1609,6 +1623,42 @@ export function createWorktreeOpsHandlers(deps: WorktreeOpsDeps): Record<Worktre
     const guard = pathGuard(deps.allowedRoot, deps.happyHomeDir);
     const pins = remotePins(deps.happyHomeDir);
 
+    async function admissionRoots(ticket: WorktreeTicket): Promise<{ candidates: string[]; writers: string[] }> {
+        if ('workspaceDir' in ticket.params) {
+            const requested = resolve(ticket.params.workspaceDir);
+            if (ticket.op === 'clone') {
+                if (!isManagedProjectFolder(requested, ticket.projectId)) throw new OpFailure('PATH_DENIED', "Not this project's managed workspace folder");
+                if (!repositoryIdentity(ticket.params.remoteUrl)) throw new OpFailure('WORKSPACE_REMOTE_INVALID', 'The repository address names no repository');
+                await requireUnlinkedPath(requested);
+            }
+            let dir: string;
+            try { dir = await guard.directory(requested); }
+            catch (error) {
+                if ((ticket.op !== 'clone' && ticket.op !== 'purge-project') || !(error instanceof OpFailure) || error.errorCode !== 'WORKSPACE_MISSING') throw error;
+                await guard.missing(requested);
+                dir = requested;
+            }
+            if (ticket.op === 'purge-project' && dir !== requested) throw new OpFailure('PATH_DENIED', 'The folder is reached through a link');
+            if (ticket.op === 'create' || ticket.op === 'adopt-check') {
+                const repo = await repositoryRoot(dir);
+                if (!repo) throw new OpFailure('WORKTREE_REPO_NOT_FOUND', 'git repository root not found');
+                if (repo !== slashed(dir) && repo !== ticket.params.expectedRepoRoot) throw new OpFailure('WORKTREE_NOT_REPO_ROOT', 'workspace dir is not the repository root');
+                const root = await guard.directory(repo);
+                if (ticket.op === 'create') {
+                    const target = managedWorktreePath(root, ticket.projectId, ticket.params.name);
+                    await requireUnlinkedLanding(root, target);
+                    return { candidates: [root, target], writers: [root] };
+                }
+                const target = await resolveWorktreeTarget(guard, ticket.params.worktreePath, ticket.projectId);
+                if (target.repoRoot !== root) throw new OpFailure('PATH_DENIED', 'path is outside this repository managed worktree directory');
+                return { candidates: [root, target.path], writers: [root] };
+            }
+            return { candidates: [dir], writers: [dir] };
+        }
+        const target = await resolveWorktreeTarget(guard, ticket.params.worktreePath, ticket.projectId);
+        return { candidates: [target.repoRoot, target.path], writers: [target.repoRoot] };
+    }
+
     const run = (ticket: WorktreeTicket, credential: PreparedGitCredential | null): Promise<Record<string, unknown>> => {
         switch (ticket.op) {
             case 'capability': return guard.directory(ticket.params.workspaceDir).then(readCapability);
@@ -1651,13 +1701,25 @@ export function createWorktreeOpsHandlers(deps: WorktreeOpsDeps): Record<Worktre
             if (!read.ok) return refused('GIT_CREDENTIAL_INVALID', 'The credential was not sealed for this machine and ticket');
             credential = { username: read.username, token: read.token };
         }
-        const admission = await usedTickets(deps.happyHomeDir).admit(ticket.opId, ticket.issuedAt, at);
-        if (admission === 'replayed') return refused('TICKET_REPLAYED', 'This ticket was already used');
-        if (admission === 'full') return refused('TICKET_BUSY', 'Too many worktree operations in the window');
-
-        const prepared = credential ? await prepareGitCredential(credential) : null;
+        let reservation: Extract<LegacyDispatchReservation, { acquired: true }> | undefined;
+        let prepared: PreparedGitCredential | null = null;
         try {
-            const result = await run(ticket, prepared);
+            if (!!deps.reserveLegacyDispatch !== !!deps.admitSubprocess) throw new OpFailure('WORKSPACE_ADMISSION_UNAVAILABLE', 'Host process reservation is unavailable');
+            let context: Parameters<typeof operationAdmission.run>[0];
+            if (deps.reserveLegacyDispatch && deps.admitSubprocess) {
+                const roots = await admissionRoots(ticket);
+                const admitted = await deps.reserveLegacyDispatch(roots.candidates);
+                if (!admitted.acquired) throw new OpFailure({ 'workspace-busy': 'WORKSPACE_BUSY', 'workspace-owner-unconfirmed': 'WORKSPACE_OWNER_UNCONFIRMED', 'registry-busy': 'WORKSPACE_REGISTRY_BUSY' }[admitted.reason], admitted.reason);
+                reservation = admitted;
+                context = { roots: roots.writers, admitSubprocess: deps.admitSubprocess };
+            }
+            const freshAt = now();
+            if (freshAt > ticket.expiresAt || ticket.issuedAt > freshAt + ISSUE_SKEW_MS) return refused('TICKET_EXPIRED', 'This ticket is not valid now');
+            const admission = await usedTickets(deps.happyHomeDir).admit(ticket.opId, ticket.issuedAt, freshAt);
+            if (admission === 'replayed') return refused('TICKET_REPLAYED', 'This ticket was already used');
+            if (admission === 'full') return refused('TICKET_BUSY', 'Too many worktree operations in the window');
+            prepared = credential ? await prepareGitCredential(credential) : null;
+            const result = await operationAdmission.run(context, () => run(ticket, prepared));
             const finishedAt = now();
             logger.debug('[worktree-ops] done', { op, opId: ticket.opId });
             return { success: true, result, finishedAt, attestation: attestWorktreeResult(machine.encryptionKey, ticket, result, finishedAt) };
@@ -1666,7 +1728,11 @@ export function createWorktreeOpsHandlers(deps: WorktreeOpsDeps): Record<Worktre
             logger.debug('[worktree-ops] failed', { op, error: error instanceof Error ? error.message : String(error) });
             return refused('WORKTREE_OP_FAILED', error instanceof Error ? error.message : 'Worktree operation failed');
         } finally {
-            await prepared?.dispose();
+            try { await prepared?.dispose(); }
+            finally {
+                try { await reservation?.finish(); }
+                catch { logger.debug('[worktree-ops] Workspace handoff unconfirmed; temporary ownership retained'); }
+            }
         }
     };
 

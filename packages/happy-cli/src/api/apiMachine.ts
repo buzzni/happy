@@ -1056,7 +1056,10 @@ export class ApiMachineClient {
         );
         // aplus 4b-3 worktree: worktrees on a strict machine, run here from a server-issued ticket
         // and signed for the server. Customer lane only.
-        const worktreeOps = createWorktreeOpsHandlers({ machine: () => this.machine, allowedRoot, happyHomeDir: configuration.happyHomeDir });
+        const worktreeOps = createWorktreeOpsHandlers({ machine: () => this.machine, allowedRoot, happyHomeDir: configuration.happyHomeDir,
+            ...(admitSubprocess ? { admitSubprocess } : {}),
+            ...(reserveLegacyDispatch ? { reserveLegacyDispatch } : {}),
+        });
         for (const [method, handler] of Object.entries(worktreeOps)) {
             this.rpcHandlerManager.registerHandler(method, handler, { customerBound: true });
         }

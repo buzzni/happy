@@ -212,6 +212,32 @@ describe('ApiMachineClient machine RPC server lane', () => {
         } finally { await rm(directory, { recursive: true, force: true }); }
     });
 
+    it.skipIf(process.platform === 'win32')('reserves a machine worktree ticket before consuming it and retains its actual writer', async () => {
+        const home = await mkdtemp(join(tmpdir(), 'machine-worktree-admission-'));
+        const directory = join(home, 'project'); await mkdir(directory);
+        vi.stubEnv('HAPPY_WORKSPACE_ROOT', directory);
+        const automatic = createWorkspaceTurnAdmission({ home, roots: [directory], kind: 'automation', sessionId: 'automation-run:worktree-api' });
+        try {
+            expect(await automatic.tryAcquire()).toEqual({ acquired: true });
+            const machine: Machine = { ...makeMachine(), encryptionVariant: 'dataKey' };
+            const client = new ApiMachineClient('fake-token', machine, undefined, undefined, null, undefined,
+                createSubprocessWriteAdmission({ home }), createLegacyDispatchAdmission({ home }));
+            const handler = (client as any).rpcHandlerManager.registerHandler.mock.calls.find(([name]: [string]) => name === 'worktree:prepare')[1];
+            const at = Date.now();
+            const request = { ticket: { v: 1, opId: randomBytes(16).toString('base64'), op: 'prepare', projectId: 'project', machineId: machine.id,
+                issuedAt: at, expiresAt: at + 60_000, params: { workspaceDir: directory } } };
+            expect(await handler(request)).toMatchObject({ success: false, errorCode: 'WORKSPACE_BUSY' });
+            await expect(readFile(join(directory, '.git', 'HEAD'))).rejects.toMatchObject({ code: 'ENOENT' });
+            expect(await automatic.release(true)).toBe(true);
+            expect(await handler(request)).toMatchObject({ success: true });
+            expect(await automatic.tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+        } finally {
+            await automatic.release(true);
+            await rm(home, { recursive: true, force: true });
+            vi.unstubAllEnvs();
+        }
+    });
+
     it.skipIf(process.platform === 'win32')('keeps a sealed machine request unspent behind automatic ownership and retains its later writer', async () => {
         const home = await mkdtemp(join(tmpdir(), 'machine-sealed-admission-'));
         const directory = join(home, 'project'); await mkdir(directory);
