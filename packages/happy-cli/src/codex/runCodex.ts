@@ -152,6 +152,7 @@ import { consumeReconnectFreshLaunch, consumeReconnectSessionEnvironment } from 
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import {
     codexGoalActionCapabilities,
+    codexGoalStatusForSharedState,
     mapCodexGoalEventToAgentGoalStatus,
     parseCodexGoalActionParams,
     parseCodexGoalCommand,
@@ -1135,10 +1136,28 @@ export async function runCodex(opts: {
     async function pauseActiveGoalForStop() {
         const threadId = client?.threadId;
         if (codexGoalPhase !== 'active' || !threadId || !client.supportsGoalActions()) return;
+        let timer: ReturnType<typeof setTimeout> | undefined;
         try {
-            await handleCodexGoalCommand({ type: 'pause' }, threadId);
+            // Pause first to prevent automatic continuation, but a stalled control RPC must not
+            // delay interruption and its forced-restart fallback for the normal 30-second RPC timeout.
+            const result = await Promise.race([
+                client.setGoal({ threadId, status: 'paused' }),
+                new Promise<null>(resolve => {
+                    timer = setTimeout(() => {
+                        logger.debug('[Codex] Goal pause deadline reached; proceeding with interruption');
+                        resolve(null);
+                    }, 1000);
+                }),
+            ]);
+            // A late pause response must not replace a goal resumed after this stop completed.
+            if (result) {
+                updateCodexGoalState({ type: 'thread_goal_updated', threadId, goal: result.goal });
+                messageBuffer.addMessage('Goal paused', 'status');
+            }
         } catch (error) {
             logger.debug('[Codex] Could not pause the goal on stop:', error);
+        } finally {
+            if (timer) clearTimeout(timer);
         }
     }
 
@@ -1607,7 +1626,7 @@ export async function runCodex(opts: {
             session.sendSessionProtocolMessage(envelope);
         }
     });
-    /** Last goal phase this runtime published; `null` when there is no live goal. Decides whether a stop must pause it. */
+    /** Last observed goal phase; `null` when there is no live goal. Decides whether a stop must pause it. */
     let codexGoalPhase: AgentGoalPhase | null = null;
     const updateCodexGoalState = (message: Record<string, unknown>) => {
         const capabilities = codexGoalActionCapabilities(client.supportsGoalActions());
@@ -1622,7 +1641,7 @@ export async function runCodex(opts: {
         codexGoalPhase = goalStatus.status === 'active' ? goalStatus.phase ?? 'active' : null;
         session.updateAgentState((currentState) => ({
             ...currentState,
-            agentGoalStatus: goalStatus,
+            agentGoalStatus: codexGoalStatusForSharedState(goalStatus),
         }));
     };
     const handleCodexGoalCommand = async (

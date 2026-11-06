@@ -102,6 +102,7 @@ export const AgentGoalCapabilitiesSchema = z.object({
     clear: z.boolean().optional(),
     stop: z.boolean().optional(),
     edit: z.boolean().optional(),
+    resume: z.boolean().optional(),
 }).strict();
 
 const AgentGoalStatusBaseSchema = z.object({
@@ -124,6 +125,7 @@ export const AgentGoalStatusSchema = z.discriminatedUnion('status', [
         status: z.literal('active'),
         sourceSessionId: z.string().trim().min(1),
         text: z.string().trim().min(1),
+        phase: z.enum(['active', 'paused', 'blocked', 'usageLimited']).optional(),
         capabilities: AgentGoalCapabilitiesSchema.optional(),
         progress: AgentGoalProgressSchema.optional(),
     }).strict(),

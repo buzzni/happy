@@ -54,6 +54,18 @@ export function codexGoalPhase(status: string): AgentGoalPhase {
     return status === 'paused' || status === 'blocked' || status === 'usageLimited' ? status : 'active';
 }
 
+/**
+ * Installed apps use strict goal schemas and shared state has no reader capability negotiation.
+ * Keep the new controls runtime-local until readers can negotiate support for these fields.
+ */
+export function codexGoalStatusForSharedState(goal: AgentGoalStatus): AgentGoalStatus {
+    if (goal.status !== 'active') return goal;
+    const { phase, capabilities, ...status } = goal;
+    if (!capabilities) return status;
+    const { resume, ...compatibleCapabilities } = capabilities;
+    return { ...status, capabilities: compatibleCapabilities };
+}
+
 function eventThreadId(message: CodexGoalEvent): string | null {
     const goal = goalRecord(message.goal);
     return nonEmptyString(message.threadId)
