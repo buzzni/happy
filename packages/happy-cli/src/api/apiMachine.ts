@@ -575,6 +575,7 @@ type IsolatedViewerStartResult = {
 } & ViewerBrowserState;
 
 type MachineRpcHandlers = {
+    sessionRetention?: import('@/daemon/sessionRetention').SessionRetention;
     ownedSpawn?: OwnedSpawnRpc;
     daemonSessionState?: (request: unknown) => Promise<DaemonSessionStateResponse>;
     spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
@@ -1155,6 +1156,7 @@ export class ApiMachineClient {
     }
 
     setRPCHandlers({
+        sessionRetention,
         daemonSessionState,
         spawnSession,
         resumeSession,
@@ -1176,6 +1178,10 @@ export class ApiMachineClient {
         channelHostCall,
         ownedSpawn,
     }: MachineRpcHandlers) {
+        if (sessionRetention && !this.windowsStandaloneTrial) {
+            this.rpcHandlerManager.registerHandler('session-retention-get-v1', sessionRetention.get, { customerBound: true });
+            this.rpcHandlerManager.registerHandler('session-retention-set-v1', sessionRetention.set, { customerBound: true });
+        }
         if (!this.windowsStandaloneTrial) registerOwnedSpawnRpc((method, handler) => this.rpcHandlerManager.registerHandler(method, handler), ownedSpawn);
         this.daemonSessionStateRpcAvailable = !!daemonSessionState;
         if (daemonSessionState) {

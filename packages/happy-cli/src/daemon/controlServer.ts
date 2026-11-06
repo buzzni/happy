@@ -30,6 +30,7 @@ import type { SessionWriteScopeRuntime } from './sessionWriteScopeRuntime';
 import { SetupTokenActivitySchema } from '@slopus/happy-wire';
 import type { SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
 import type { AutomationTurnResult } from '@/api/automationTurnTracker';
+import type { SessionRetention } from './sessionRetention';
 
 /**
  * The only control-server paths a managed runtime may serve, and even these
@@ -97,6 +98,7 @@ import type { ChildProcess } from 'node:child_process';
 import { homedir } from 'node:os';
 
 export function startDaemonControlServer({
+  sessionRetention,
   getChildren,
   stopSession,
   spawnSession,
@@ -120,6 +122,7 @@ export function startDaemonControlServer({
   getSetupTokenAccountSwitch = () => null,
   getCallerLaunches = () => null,
 }: {
+  sessionRetention?: SessionRetention;
   /** T1c-b2 H2 owner-contact launch bootstrap; null while the rollout switch is off. */
   getCallerLaunches?: () => { issue(raw: unknown): Promise<unknown>; current(raw: unknown): Promise<{ current: boolean }> } | null;
   getDeviceEnrollment?: () => ReturnType<typeof createDeviceEnrollment> | null;
@@ -548,6 +551,16 @@ export function startDaemonControlServer({
       const { sessionId, binding, observation, startBudget } = request.body;
       return startBudget ? switcher.rebind(sessionId, binding, observation, signal, { startBudget }) : switcher.rebind(sessionId, binding, observation, signal);
     });
+
+    if (sessionRetention) for (const action of ['get', 'set'] as const) {
+      typed.post(`/session-retention/${action}`, { bodyLimit: 4096, schema: { body: z.unknown() } }, async request => {
+        try { return await sessionRetention[action](request.body); }
+        catch (error) {
+          const message = error instanceof Error ? error.message : '';
+          return { error: /^RETENTION_[A-Z_]+$/.test(message) ? message : 'RETENTION_INVALID' };
+        }
+      });
+    }
 
     // List all tracked sessions
     typed.post('/list', {
