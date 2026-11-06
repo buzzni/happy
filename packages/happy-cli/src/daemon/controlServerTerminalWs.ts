@@ -149,6 +149,8 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
   path: string;
   controlSecret: string;
   allowedRoot: string;
+  /** aplus-dev-studio specs/approved-folder-roots — folders outside allowedRoot the machine owner approved. */
+  approvedRoots?: () => readonly string[];
   /** Null until the daemon's machine registration resolves — a connection
    *  attempted in that (brief, boot-time-only) window gets a clean error
    *  instead of crashing. */
@@ -318,7 +320,8 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
           reserveLegacyDispatch: opts.reserveLegacyDispatch,
           admitSubprocess: opts.admitSubprocess,
           cwd: { allowedRoot: opts.allowedRoot, homedir: homedir(), fsExists: existsSync,
-            fsMkdir: p => { mkdirSync(p, { recursive: true }); }, validate: validatePath },
+            fsMkdir: p => { mkdirSync(p, { recursive: true }); },
+            validate: (path, root) => validatePath(path, root, opts.approvedRoots?.()) },
         });
         if (prepared.kind === 'refused') {
           logger.debug(`[CONTROL SERVER] /terminal open refused: ${prepared.code}`);

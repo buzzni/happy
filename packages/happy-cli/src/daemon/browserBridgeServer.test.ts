@@ -48,12 +48,14 @@ describe('browserBridgeServer', () => {
             store.close()
         } finally { await server.stop() }
     })
-    it('takes the port over once the process holding it exits', async () => {
+    it.each([false, true])('takes the port over once the process holding it exits (owner recording fails: %s)', async (failOwnerRecording) => {
         const holder = createServer()
         await new Promise<void>(resolve => holder.listen(0, '127.0.0.1', resolve))
         const heldPort = (holder.address() as AddressInfo).port
         const retryBridge = new BrowserBridge({ authToken: TOKEN })
-        const retry = retryBrowserBridgeServer({ bridge: retryBridge, port: heldPort, retryMs: 20 })
+        const retry = retryBrowserBridgeServer({ bridge: retryBridge, port: heldPort, retryMs: 20,
+            onListening: failOwnerRecording ? async () => { throw new Error('owner record is read-only') } : undefined,
+        })
         try {
             await new Promise(resolve => setTimeout(resolve, 60))
             await expect(retryBridge.request('tabs_list', {})).rejects.toMatchObject({ code: 'BRIDGE_PORT_IN_USE' })
@@ -268,6 +270,19 @@ describe('controlServer /browser routes', () => {
         })
         expect(res.status).toBe(503)
         expect((await res.json() as { code: string }).code).toBe('BRIDGE_PORT_IN_USE')
+    })
+
+    it('POST /browser/request returns 503 when Chrome is paired only with the machine token', async () => {
+        const { ws } = await connectExtension(bridgePort, `token=${TOKEN}&profile=justin`)
+        await expect.poll(() => bridge.connections()).toEqual([{ profile: 'justin' }])
+        const res = await fetch(`${baseUrl}/browser/request`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ method: 'ping', viewerKey: 'bv1_abcdefghijklmnopqrstuvwxyz012345' }),
+        })
+        expect(res.status).toBe(503)
+        expect((await res.json() as { code: string }).code).toBe('VIEWER_NOT_CONNECTED')
+        ws.close()
     })
 
     it('POST /browser/request returns 504 on extension timeout', async () => {

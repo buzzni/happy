@@ -19,6 +19,8 @@ import { TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRu
 import { MOAI_MANAGED_TOOL } from '@/modules/common/moaiMachineRunProfiles';
 import { WRITE_FILE_ATTEMPT_CAPABILITY } from '@/modules/common/writeFileAttempts';
 import { LIST_FILES_PAGE_CAPABILITY } from '@/modules/common/listFilesPageCapability';
+import { BASH_PREFIX_MATCHER_CAPABILITY } from '@/claude/utils/bashPrefixMatcher';
+import { ApiSessionClient } from './apiSession';
 import { McpCallerGrantEnvelopeConsumer } from '@/daemon/mcpCallerGrantEnvelope';
 import { join } from 'node:path';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
@@ -272,12 +274,16 @@ describe('ApiMachineClient machine RPC server lane', () => {
         expect(registeredCommonHandlers).toHaveBeenCalledWith(
             expect.anything(),
             expect.any(String),
-            { machineRun: {
-                profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
-                writeScopePolicy: { acquire: expect.any(Function) },
-                managedTools: { root: expect.stringMatching(/managed-tools$/), tools: [MOAI_MANAGED_TOOL] },
-                allowToolInstall: true,
-            } },
+            {
+                // aplus-dev-studio specs/approved-folder-roots — folders the machine owner approved beside home.
+                approvedRoots: expect.any(Function),
+                machineRun: {
+                    profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
+                    writeScopePolicy: { acquire: expect.any(Function) },
+                    managedTools: { root: expect.stringMatching(/managed-tools$/), tools: [MOAI_MANAGED_TOOL] },
+                    allowToolInstall: true,
+                },
+            },
         );
     });
 
@@ -776,6 +782,63 @@ describe('ApiMachineClient socket reconnection', () => {
             const entry = getDaemonTerminalSession(sessionId)!;
             expect(entry.output.lastSeq()).toBe(1);
             expect(entry.output.bufferedChars()).toBeGreaterThan(0);
+        });
+    });
+
+    /*
+     * aplus-dev-studio specs/approved-folder-roots — a project imported from a folder the machine owner approved
+     * outside home opens its terminal there; once revoked, the same request falls back to home with the banner.
+     */
+    describeUnix('terminal-open-fwd in an approved folder outside home', () => {
+        const sessionIds = ['approved-cwd-1', 'approved-cwd-2'];
+        let outside: string;
+
+        beforeEach(async () => {
+            const { mkdtemp } = await import('node:fs/promises');
+            const { tmpdir } = await import('node:os');
+            outside = await mkdtemp(join(tmpdir(), 'happy-approved-terminal-'));
+        });
+        afterEach(async () => {
+            const { rm } = await import('node:fs/promises');
+            for (const id of sessionIds) removeDaemonTerminalSession(id);
+            await rm(join(configuration.happyHomeDir, 'approved-folders.json'), { force: true });
+            await rm(outside, { recursive: true, force: true });
+        });
+
+        const openAndRead = async (machine: Machine, sessionId: string) => {
+            const params = encodeBase64(encrypt(machine.encryptionKey, machine.encryptionVariant, {
+                userId: 'u1', cwd: outside, shell: '/bin/sh', args: ['-c', 'printf "pwd=%s" "$PWD"'],
+            }));
+            mockSocket.emit.mockClear();
+            const ack = await new Promise<any>((resolve) => emitSocketEvent('terminal-open-fwd', { sessionId, params }, resolve));
+            expect(ack.ok).toBe(true);
+            await vi.waitFor(() => expect(getDaemonTerminalSession(sessionId)?.exit).toBeTruthy(), { timeout: 5000 });
+            mockSocket.emit.mockClear();
+            emitSocketEvent('terminal-resume-fwd', { sessionId, afterSeq: 0 });
+            return mockSocket.emit.mock.calls
+                .filter(([name]: [string]) => name === 'terminal-frame')
+                .map(([, frame]: [string, any]) => decrypt(machine.encryptionKey, machine.encryptionVariant, decodeBase64(frame.data)))
+                .join('');
+        };
+
+        it('starts in the approved folder and falls back to home after revocation', async () => {
+            const { mkdir, writeFile } = await import('node:fs/promises');
+            const { basename } = await import('node:path');
+            await mkdir(configuration.happyHomeDir, { recursive: true });
+            await writeFile(join(configuration.happyHomeDir, 'approved-folders.json'), JSON.stringify({ version: 1, folders: [outside] }));
+            const machine = makeMachine();
+            const client = new ApiMachineClient('fake-token', machine);
+            client.connect();
+
+            const approved = await openAndRead(machine, sessionIds[0]);
+            expect(approved).toContain(`pwd=`);
+            expect(approved).toContain(basename(outside));
+            expect(approved).not.toContain('[info]');
+
+            await writeFile(join(configuration.happyHomeDir, 'approved-folders.json'), JSON.stringify({ version: 1, folders: [] }));
+            const revoked = await openAndRead(machine, sessionIds[1]);
+            expect(revoked).toContain('[info]');
+            expect(revoked).not.toContain(`pwd=${outside}`);
         });
     });
 
@@ -1977,6 +2040,45 @@ describe('ApiMachineClient socket reconnection', () => {
         await vi.waitFor(() => expect(machine.metadata?.listFilesPage).toEqual(LIST_FILES_PAGE_CAPABILITY));
 
         client.shutdown();
+    });
+
+    // The upgraded daemon is only an availability hint: a surviving session still needs its own marker.
+    it('advertises machine availability without upgrading a surviving old session capability', async () => {
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            if (event === 'machine-update-state') {
+                return { result: 'success', version: 1, daemonState: data.daemonState };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        expect(machine.metadata?.permissionGrants).toBeUndefined();
+        const oldSession = new ApiSessionClient('fake-token', {
+            id: 'old-live-session', seq: 0, metadataVersion: 0, agentState: null, agentStateVersion: 0,
+            encryptionKey: new Uint8Array(32), encryptionVariant: 'legacy',
+            metadata: {
+                path: '/tmp', host: 'localhost', machineId: machine.id, flavor: 'claude',
+                homeDir: '/home/user', happyHomeDir: '/home/user/.happy',
+                happyLibDir: '/home/user/.happy/lib', happyToolsDir: '/home/user/.happy/tools',
+                runtimeCapabilities: { approvalLifecycle: 1 },
+            },
+        });
+        const client = new ApiMachineClient('fake-token', machine);
+        try {
+            client.connect();
+            socketHandlers.connect!.at(-1)!();
+            await vi.waitFor(() => expect(machine.metadata?.permissionGrants).toEqual(BASH_PREFIX_MATCHER_CAPABILITY));
+            expect(machine.metadata?.permissionGrants).toEqual({ bashPrefixMatcher: 'plain-v1' });
+            expect(oldSession.getMetadata()?.machineId).toBe(machine.id);
+            expect(oldSession.getMetadata()?.runtimeCapabilities).toEqual({ approvalLifecycle: 1 });
+            expect(mockSocket.emitWithAck.mock.calls.some(([event]: [string]) => event === 'update-metadata')).toBe(false);
+        } finally {
+            client.shutdown();
+            await oldSession.close();
+        }
     });
 
     // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 — the web starts a strict machine's

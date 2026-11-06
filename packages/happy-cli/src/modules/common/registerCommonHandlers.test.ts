@@ -759,3 +759,59 @@ describe.skipIf(process.platform === 'win32')('common filesystem mutation admiss
     });
 
 });
+/*
+ * aplus-dev-studio specs/approved-folder-roots — a folder outside the machine's
+ * allowed root (e.g. C:\workspace beside C:\Users\me) opens only once the
+ * machine owner approved it on this machine.
+ */
+describe('file RPCs for a folder the machine owner approved', () => {
+    it('lists, runs commands in and creates folders under an approved folder outside the allowed root, and nothing beside it', async () => {
+        const outside = await mkdtemp(join(tmpdir(), 'happy-approved-'));
+        temporaryDirectories.push(outside);
+        const project = join(outside, 'hmall_ui');
+        await mkdir(project);
+        await writeFile(join(project, 'README.md'), 'hello');
+        const beside = await mkdtemp(join(tmpdir(), 'happy-not-approved-'));
+        temporaryDirectories.push(beside);
+
+        const closed = await createHandlers();
+        await expect(closed.handlers.get('listDirectory')?.({ path: project })).resolves.toMatchObject({ success: false });
+
+        let approved: string[] = [outside];
+        const { handlers } = await createHandlers(undefined, { approvedRoots: () => approved });
+        await expect(handlers.get('listDirectory')?.({ path: project })).resolves.toMatchObject({
+            success: true, entries: [expect.objectContaining({ name: 'README.md' })],
+        });
+        await expect(handlers.get('readFile')?.({ path: join(project, 'README.md') })).resolves.toMatchObject({ success: true });
+        await expect(handlers.get('bash')?.({ command: 'echo ok', cwd: project })).resolves.toMatchObject({ success: true });
+        await expect(handlers.get('ensureDirectory')?.({ path: join(outside, 'new-app') })).resolves.toMatchObject({ success: true });
+        await expect(handlers.get('deleteFile')?.({ path: outside })).resolves.toMatchObject({ success: false });
+        await expect(handlers.get('listDirectory')?.({ path: beside })).resolves.toMatchObject({ success: false });
+
+        approved = [];
+        await expect(handlers.get('listDirectory')?.({ path: project })).resolves.toMatchObject({ success: false });
+    });
+
+    it('anchors the workspace read, download and create-only write RPCs at an approved folder, until revoked', async () => {
+        const outside = await mkdtemp(join(tmpdir(), 'happy-approved-workspace-'));
+        temporaryDirectories.push(outside);
+        const project = join(outside, 'hmall_ui');
+        await mkdir(project);
+        await writeFile(join(project, 'README.md'), 'hello');
+
+        let approved: string[] = [outside];
+        const { handlers } = await createHandlers(undefined, { approvedRoots: () => approved });
+        await expect(handlers.get('listWorkspaceDirectory')?.({ workspaceRoot: project, path: project })).resolves.toMatchObject({ success: true });
+        await expect(handlers.get('readWorkspaceFile')?.({ workspaceRoot: project, path: join(project, 'README.md') })).resolves.toMatchObject({
+            success: true, content: Buffer.from('hello').toString('base64'),
+        });
+        await expect(handlers.get('listWorkspaceDownloadDirectory')?.({ workspaceRoot: project, path: project, offset: 0 })).resolves.toMatchObject({ success: true });
+        await expect(handlers.get('writeWorkspaceFile')?.({ workspaceRoot: project, path: join(project, 'notes.md'), content: Buffer.from('new').toString('base64'), expectedHash: null })).resolves.toMatchObject({ success: true });
+        expect(await readFile(join(project, 'notes.md'), 'utf8')).toBe('new');
+
+        approved = [];
+        await expect(handlers.get('listWorkspaceDirectory')?.({ workspaceRoot: project, path: project })).resolves.toMatchObject({ success: false, errorCode: 'WORKSPACE_PATH_DENIED' });
+        await expect(handlers.get('readWorkspaceFile')?.({ workspaceRoot: project, path: join(project, 'README.md') })).resolves.toMatchObject({ success: false });
+        await expect(handlers.get('writeWorkspaceFile')?.({ workspaceRoot: project, path: join(project, 'other.md'), content: 'eA==', expectedHash: null })).resolves.toMatchObject({ success: false });
+    });
+});

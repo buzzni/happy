@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { Metadata } from '@/api/types';
 import { mergeReconnectSessionMetadata } from './reconnectSessionMetadata';
+import { createSessionMetadata } from './createSessionMetadata';
+import { BASH_PREFIX_MATCHER_CAPABILITY } from '@/claude/utils/bashPrefixMatcher';
 
 describe('mergeReconnectSessionMetadata', () => {
     it('refreshes process-owned metadata when a persisted session resumes', () => {
@@ -57,5 +59,21 @@ describe('mergeReconnectSessionMetadata', () => {
         } as Metadata;
 
         expect(mergeReconnectSessionMetadata(undefined, freshLaunchMetadata)).toBe(freshLaunchMetadata);
+    });
+
+    it.each([true, false])('refreshes permission grants from the replacement runner (supported=%s)', (supported) => {
+        const persistedMetadata = {
+            ...createSessionMetadata({ flavor: 'claude', machineId: 'm',
+                permissionGrants: BASH_PREFIX_MATCHER_CAPABILITY }).metadata,
+            summary: { text: 'Preserved title', updatedAt: 1 },
+        };
+        const freshMetadata = createSessionMetadata({ flavor: 'claude', machineId: 'm',
+            ...(supported ? { permissionGrants: BASH_PREFIX_MATCHER_CAPABILITY } : {}),
+        }).metadata;
+        const resumed = mergeReconnectSessionMetadata(persistedMetadata, freshMetadata);
+
+        expect(resumed.summary).toEqual(persistedMetadata.summary);
+        expect(resumed.runtimeCapabilities?.permissionGrants)
+            .toEqual(supported ? { bashPrefixMatcher: 'plain-v1' } : undefined);
     });
 });

@@ -24,7 +24,7 @@ vi.mock('@/ui/logger', () => ({
   logger: { debug: mocks.mockLoggerDebug },
 }))
 
-import { checkIfDaemonRunningAndCleanupStaleState, requestSetupTokenRebind, stopDaemon } from './controlClient'
+import { checkIfDaemonRunningAndCleanupStaleState, requestSetupTokenRebind, requestSetupTokenStart, stopDaemon } from './controlClient'
 
 const DEAD_PID = 3058947
 const HTTP_PORT = 33417
@@ -266,4 +266,14 @@ describe('requestSetupTokenRebind', () => {
       expect(await requestSetupTokenRebind('session-a', 'binding')).toEqual({ ok: false, reason: 'NO_ACCOUNT', retryAfterMs: sessionDelay })
     } finally { fetchSpy.mockRestore() }
   })
+})
+
+it('preserves start exhaustion through local control and sends a distinct rebind reason',async()=>{
+ const state=stateWithPid(process.pid);mocks.mockReadDaemonStateSnapshot.mockResolvedValue({state,raw:JSON.stringify(state)})
+ const fetchSpy=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(Response.json({ok:false,reason:'START_ACCOUNT_EXHAUSTED'})).mockResolvedValueOnce(Response.json({ok:true,environment:{TOKEN:'synthetic'}}))
+ try{
+  await expect(requestSetupTokenStart('s','binding','request',new AbortController().signal)).rejects.toThrow('SETUP_TOKEN_START_ACCOUNT_EXHAUSTED')
+  expect(await requestSetupTokenRebind('s','binding',undefined,undefined,{startExhausted:true})).toEqual({ok:true,environment:{TOKEN:'synthetic'}})
+  expect(JSON.parse(String(fetchSpy.mock.calls[1][1]?.body))).toEqual({sessionId:'s',binding:'binding',startExhausted:true})
+ }finally{fetchSpy.mockRestore()}
 })

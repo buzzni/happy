@@ -1,6 +1,7 @@
 /** Pinned, device-authenticated Studio protocol. No request-supplied origin or public key. */
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
+import { logger } from '@/ui/logger'
 import {
   DAEMON_ROTATION_PATHS, DaemonRotationRequestBodySchema, MachineSetupTokenBindingV2DocumentSchema,
   SessionExecutionTicketSchema, parseCanonicalOrgSetupTokenJson, rotationDecodeBinary,
@@ -67,6 +68,9 @@ export function createMachineSetupTokenProtocol(deps: {
     const raw = await boundedJson(response)
     if (!response.ok) {
       const code = (raw as { error?: unknown })?.error
+      const safeCode = typeof code === 'string' && /^SETUP_TOKEN_DAEMON_[A-Z_]+$/.test(code) ? code : 'UNKNOWN'
+      logger.debug(`[setup-token-switch] ${body.action} refused: HTTP ${response.status} ${safeCode}`)
+      if (body.action === 'start' && response.status === 409 && code === 'SETUP_TOKEN_DAEMON_START_ACCOUNT_EXHAUSTED') throw new MachineRotationError('START_ACCOUNT_EXHAUSTED')
       if (response.status === 429) {
         const value = response.headers.get('Retry-After'), seconds = value && /^\d+$/.test(value) ? Number(value) * 1000 : value ? Date.parse(value) - now() : 60000
         throw new MachineRotationError('STUDIO_BUDGET', Number.isFinite(seconds) ? Math.max(1000, Math.min(seconds, 1800000)) : 60000)

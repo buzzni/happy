@@ -55,13 +55,13 @@ async function setup(expectedRefusal: 'account_limit' | 'authentication_failed' 
       return op ? Response.json(op) : Response.json({ error: 'SETUP_TOKEN_DAEMON_OPERATION_NOT_FOUND' }, { status: 404 })
     }
     // A Studio from before start-budget switches refuses the field without recording anything.
-    if (refuseStartBudget && body.action === 'rebind' && body.startBudget) return Response.json({ error: 'SETUP_TOKEN_DAEMON_INVALID_INPUT' }, { status: 400 })
+    if (refuseStartBudget && body.action === 'rebind' && (body.startBudget || body.startExhausted)) return Response.json({ error: 'SETUP_TOKEN_DAEMON_INVALID_INPUT' }, { status: 400 })
     const prior = operations.get(body.operationId); if (prior) return Response.json(prior)
     if (body.action === 'issue' || body.action === 'rebind') {
       const pending = disk.get(body.launchId)?.pending
       expect(pending?.request.operationId).toBe(body.operationId) // Intent ACK BEFORE mutation.
       const previous = body.action === 'rebind' ? bindings.get(body.nonce)! : undefined
-      if (body.action === 'rebind' && !body.startBudget) {
+      if (body.action === 'rebind' && !body.startBudget && !body.startExhausted) {
         expect(body.observation).toMatchObject({ managedAccountId: previous!.managedAccountId, credentialGeneration: 1, accountWideRefusal: expectedRefusal, windows: [] })
       }
       const binding: MachineSetupTokenBindingV2 = { version: 2, type: 'claude-setup-token-binding', audience: 'saycode-daemon', principalType: 'machine', companyId, machineId,
@@ -220,6 +220,16 @@ describe('machine-v2 actual launch and control consumer transaction', () => {
     await runtime.prepareLaunch(t.input);
     expect(t.sessionEnvironment).toHaveBeenCalledTimes(1);
   });
+  it('counts start-exhausted moves across daemon recovery without usage inventions', async () => {
+    const t=await setup(),runtime=t.build(),launch=await runtime.prepareLaunch(t.input);t.attach(launch.environment)
+    const id=launch.session.id,running=()=>t.sessions.get(id)!.agentEnvironment![SETUP_TOKEN_BINDING_ENV]!
+    for(let i=0;i<5;i++)await t.build().rebind(id,running(),undefined,undefined,{startExhausted:true})
+    await expect(t.build().rebind(id,running(),undefined,undefined,{startExhausted:true})).rejects.toThrow('ROTATION_LIMIT')
+    const moves=t.requests.filter(r=>r.action==='rebind')
+    expect(moves).toHaveLength(5)
+    expect(moves.every(r=>r.action==='rebind'&&r.startExhausted===true&&!r.observation&&!r.startBudget)).toBe(true)
+    expect([...t.disk.values()][0].startBudgetMoves??0).toBe(0)
+  })
   it('moves for start budget without usage evidence, outside the five usage-limit switches', async () => {
     const t = await setup(), runtime = t.build(), launch = await runtime.prepareLaunch(t.input); t.attach(launch.environment)
     const id = launch.session.id, running = () => t.sessions.get(id)!.agentEnvironment![SETUP_TOKEN_BINDING_ENV]!
@@ -236,11 +246,11 @@ describe('machine-v2 actual launch and control consumer transaction', () => {
     expect(revision()).toBe(12)
     await expect(replaced.rebind(id, running(), refusal)).rejects.toThrow('ROTATION_LIMIT')
   })
-  it('does not let a start-budget ask Studio refused hold back a later usage-limit switch', async () => {
+  it.each(['startBudget','startExhausted'] as const)('does not let a %s ask Studio refused hold back a later usage-limit switch', async reason => {
     const t = await setup(), runtime = t.build(), launch = await runtime.prepareLaunch(t.input); t.attach(launch.environment)
     const id = launch.session.id, running = launch.environment[SETUP_TOKEN_BINDING_ENV]
     t.refuseStartBudget()
-    await expect(runtime.rebind(id, running, undefined, undefined, { startBudget: true })).rejects.toThrow('REQUEST_FAILED')
+    await expect(runtime.rebind(id, running, undefined, undefined, reason==='startBudget'?{startBudget:true}:{startExhausted:true})).rejects.toThrow('REQUEST_FAILED')
     expect([...t.disk.values()][0].pending).toBeUndefined()
     await runtime.rebind(id, running, refusal)
     const rebinds = t.requests.filter(r => r.action === 'rebind')

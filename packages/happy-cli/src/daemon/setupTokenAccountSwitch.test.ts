@@ -1,3 +1,4 @@
+import { logger } from '@/ui/logger'
 import { describe, expect, it, vi } from 'vitest'
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitchDeps } from './setupTokenAccountSwitch'
 import { formatSetupTokenBinding, SETUP_TOKEN_BINDING_ENV, SETUP_TOKEN_SHARED_ACCOUNT_ENV, sharedMachineSetupTokenAuthority, type AiAuthSelection, type SetupTokenBinding, type UserSetupTokenBinding } from './sessionEnv'
@@ -465,6 +466,96 @@ describe('shared PC setup-token account switch (Saycode specs/shared-pc-session-
   })
 })
 
+describe('shared PC start budget (Saycode specs/shared-pc-start-budget)', () => {
+  const sharedRunning = sharedMachineSetupTokenAuthority({ HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1', [SETUP_TOKEN_SHARED_ACCOUNT_ENV]: A })!
+  const REQUEST = '00000000-0000-4000-8000-0000000000ee'
+  const allowed = { state: 'allowed', validForMs: 15_000 }
+  function startSetup(answer: () => Response | Promise<Response>, extra: Partial<SetupTokenAccountSwitchDeps> = {}) {
+    const sharedMachine = { reportUsage: vi.fn(async () => undefined), rebind: vi.fn(async () => null), environment: vi.fn(async () => null), moved: vi.fn(),
+      startProof: vi.fn(async (): Promise<{ companyId: string; credentialGeneration: number } | null> => ({ companyId: 'org-a', credentialGeneration: 1 })),
+      startBudgetMove: vi.fn(async (): Promise<Record<string, string> | null> => null) }
+    const context = setup({ sharedMachine, ...extra })
+    context.session.agentEnvironment = {}
+    context.session.sharedSetupTokenAccount = A
+    vi.mocked(context.deps.fetch).mockImplementation(async (url, init) => {
+      context.requests.push({ url: String(url), body: JSON.parse(String(init?.body)), authorization: new Headers(init?.headers).get('authorization') })
+      return answer()
+    })
+    return { ...context, sharedMachine }
+  }
+
+  it('asks Studio with the machine\'s own token for the account the daemon handed the session', async () => {
+    const wait = { version: 1, state: 'wait', retryAfterMs: 30_000, preferredAccountIds: [B] }
+    const { switcher, requests } = startSetup(() => Response.json(wait))
+    expect(await switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: true, admission: wait })
+    expect(requests).toEqual([{ url: 'https://studio.test/api/claude-setup-token/daemon/shared/start', authorization: 'Bearer machine-token',
+      body: { machineId: 'pc-a', companyId: 'org-a', sessionId: 'session-a', managedAccountId: A, credentialGeneration: 1, requestId: REQUEST } }])
+  })
+
+  it.each([
+    ['an older Studio without the route', () => new Response('{}', { status: 404 })],
+    ['a Studio failure', () => new Response('{}', { status: 503 })],
+    ['a refusal', () => Response.json({ error: 'SETUP_TOKEN_DAEMON_GENERATION_CHANGED' }, { status: 409 })],
+    ['no answer', () => { throw new TypeError('fetch failed') }],
+    ['an unreadable answer', () => new Response('not json')],
+  ])('runs the turn on %s rather than holding it (decision D1)', async (_name, answer) => {
+    const { switcher } = startSetup(answer)
+    expect(await switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: true, admission: allowed })
+  })
+
+  it('moves a waiting shared-PC session onto an account Studio says has start budget left', async () => {
+    const wait = { version: 1, state: 'wait', retryAfterMs: 30_000, preferredAccountIds: [B, C] }
+    const { switcher, sharedMachine, session } = startSetup(() => Response.json(wait))
+    const next = { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next', HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1', [SETUP_TOKEN_SHARED_ACCOUNT_ENV]: B }
+    sharedMachine.startBudgetMove.mockResolvedValueOnce(next)
+    await switcher.requestStart('session-a', sharedRunning, REQUEST)
+    expect(await switcher.rebind('session-a', sharedRunning, undefined, undefined, { startBudget: true })).toEqual({ ok: true, environment: next })
+    expect(sharedMachine.startBudgetMove).toHaveBeenCalledWith(A, [B, C])
+    // A start-budget move is not a used-up account: the session's account is not reported to the PC as refused.
+    expect(sharedMachine.rebind).not.toHaveBeenCalled()
+    expect(session.sharedSetupTokenAccount).toBe(B)
+    expect(session.sharedSetupTokenAccountsLeft).toEqual([A])
+    expect(sharedMachine.moved).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps a shared-PC session waiting when Studio named no account with start budget or the PC holds none of them', async () => {
+    const { switcher, sharedMachine, session } = startSetup(() => Response.json({ version: 1, state: 'wait', retryAfterMs: 30_000, preferredAccountIds: [B] }))
+    // No wait answered yet: nothing names an account with budget.
+    expect(await switcher.rebind('session-a', sharedRunning, undefined, undefined, { startBudget: true })).toEqual({ ok: false, reason: 'NO_ACCOUNT' })
+    expect(sharedMachine.startBudgetMove).not.toHaveBeenCalled()
+    await switcher.requestStart('session-a', sharedRunning, REQUEST)
+    expect(await switcher.rebind('session-a', sharedRunning, undefined, undefined, { startBudget: true })).toEqual({ ok: false, reason: 'NO_ACCOUNT' })
+    expect(sharedMachine.startBudgetMove).toHaveBeenCalledWith(A, [B])
+    expect(session.sharedSetupTokenAccount).toBe(A)
+  })
+
+  it('forgets the accounts with start budget once the session starts or runs without a decision', async () => {
+    let answer: () => Response = () => Response.json({ version: 1, state: 'wait', retryAfterMs: 30_000, preferredAccountIds: [B] })
+    const { switcher, sharedMachine } = startSetup(() => answer())
+    const startBudget = () => switcher.rebind('session-a', sharedRunning, undefined, undefined, { startBudget: true })
+    for (const next of [() => Response.json({ version: 1, state: 'allowed', validForMs: 15_000 }), () => new Response('{}', { status: 503 }),
+      () => Response.json({ version: 1, state: 'wait', retryAfterMs: 30_000, preferredAccountIds: [] })]) {
+      answer = () => Response.json({ version: 1, state: 'wait', retryAfterMs: 30_000, preferredAccountIds: [B] })
+      await switcher.requestStart('session-a', sharedRunning, REQUEST)
+      answer = next
+      await switcher.requestStart('session-a', sharedRunning, REQUEST)
+      expect(await startBudget()).toEqual({ ok: false, reason: 'NO_ACCOUNT' })
+    }
+    expect(sharedMachine.startBudgetMove).not.toHaveBeenCalled()
+  })
+
+  it('runs the turn without asking when it cannot prove the account', async () => {
+    const { switcher, requests, sharedMachine, session } = startSetup(() => Response.json({}))
+    sharedMachine.startProof.mockResolvedValueOnce(null)
+    expect(await switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: true, admission: allowed })
+    delete session.sharedSetupTokenAccount
+    expect(await switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: true, admission: allowed })
+    const offline = startSetup(() => Response.json({}), { studioOrigin: null })
+    expect(await offline.switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: true, admission: allowed })
+    expect([...requests, ...offline.requests]).toEqual([])
+  })
+})
+
 it('forwards authenticated failure context and rejects unsupported reason data', async () => {
  const f=setup(),failure={kind:'authentication' as const,observedAt:1000}
  vi.mocked(f.deps.fetch).mockResolvedValueOnce(Response.json({version:1,allLimited:false,availableAccountIds:[],fallbackReason:'organization-authentication'}))
@@ -620,4 +711,66 @@ it('requests start admission using only the current authenticated binding', asyn
  expect(JSON.parse(String(vi.mocked(deps.fetch).mock.calls[0][1]?.body))).toEqual({machineId:'pc-a',sessionId:'session-a',companyId:'org-a',bindingNonce:NONCE_A,requestId:'start-1'})
  expect((await switcher.requestStart('other-session',RUNNING_A,'start-2')).ok).toBe(false)
  expect(deps.fetch).toHaveBeenCalledTimes(1)
+})
+
+
+it('excludes PC-disabled accounts from both start admission and rebind without enabling them', async () => {
+ const f=setup({disabledSetupTokenAccounts:vi.fn(async()=>[B])})
+ vi.mocked(f.deps.fetch).mockImplementation(async(url,init)=>{
+  const body=JSON.parse(String(init?.body))
+  if(String(url).endsWith('/start'))return Response.json({version:1,state:'wait',retryAfterMs:30000,preferredAccountIds:[C]})
+  const id=body.excludeManagedAccountIds?.includes(B)?C:B
+  return Response.json({version:1,bindingGrant:'fixture.signature',managedAccountId:id,credentialGeneration:1})
+ })
+ vi.mocked(f.deps.sessionEnvironment).mockImplementation(async(_agent,selection)=>({CLAUDE_CODE_OAUTH_TOKEN:'sk-ant-oat01-fixture',[SETUP_TOKEN_BINDING_ENV]:formatSetupTokenBinding(binding((selection as {managedAccountId:string}).managedAccountId))}))
+ expect(await f.switcher.requestStart('session-a',RUNNING_A,'start-1')).toMatchObject({ok:true,admission:{state:'wait'}})
+ expect(JSON.parse(String(vi.mocked(f.deps.fetch).mock.calls[0][1]?.body))).toMatchObject({excludeManagedAccountIds:[B]})
+ expect(await f.switcher.rebind('session-a',RUNNING_A,undefined,undefined,{startBudget:true})).toMatchObject({ok:true})
+ expect(JSON.parse(String(vi.mocked(f.deps.fetch).mock.calls[1][1]?.body))).toMatchObject({excludeManagedAccountIds:[B]})
+ expect(f.deps.sessionEnvironment).toHaveBeenCalledWith('claude',expect.objectContaining({managedAccountId:C}))
+ expect(f.deps.recordAgentEnvironment).toHaveBeenCalledTimes(1)
+})
+
+it('returns no account once when all replacement candidates are disabled without consuming a grant', async () => {
+ const f=setup({disabledSetupTokenAccounts:async()=>[B,C]})
+ vi.mocked(f.deps.fetch).mockImplementation(async(_url,init)=>{
+  const body=JSON.parse(String(init?.body))
+  return body.excludeManagedAccountIds?.length===2?Response.json({error:'SETUP_TOKEN_DAEMON_NO_ACCOUNT'},{status:409}):Response.json({version:1,bindingGrant:'fixture.signature',managedAccountId:B,credentialGeneration:1})
+ })
+ expect(await f.switcher.rebind('session-a',RUNNING_A)).toEqual({ok:false,reason:'NO_ACCOUNT'})
+ expect(f.deps.fetch).toHaveBeenCalledTimes(1)
+ expect(f.deps.sessionEnvironment).not.toHaveBeenCalled()
+ expect(f.deps.recordAgentEnvironment).not.toHaveBeenCalled()
+ expect(f.session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV]).toBe(RUNNING_A)
+})
+
+it('does not drop disabled-account exclusions when an older Studio rejects them', async () => {
+ const f=setup({disabledSetupTokenAccounts:async()=>[B]})
+ vi.mocked(f.deps.fetch).mockResolvedValue(Response.json({error:'INVALID_INPUT'},{status:400}))
+ expect(await f.switcher.rebind('session-a',RUNNING_A)).toEqual({ok:false,reason:'REQUEST_FAILED'})
+ expect(f.deps.fetch).toHaveBeenCalledTimes(2)
+ for(const [,init] of vi.mocked(f.deps.fetch).mock.calls)expect(JSON.parse(String(init?.body))).toMatchObject({excludeManagedAccountIds:[B]})
+ expect(f.deps.sessionEnvironment).not.toHaveBeenCalled()
+ expect(f.deps.recordAgentEnvironment).not.toHaveBeenCalled()
+})
+
+it.each([[409,'SETUP_TOKEN_DAEMON_START_ACCOUNT_EXHAUSTED','START_ACCOUNT_EXHAUSTED'],[409,'SETUP_TOKEN_DAEMON_START_ACCOUNT_UNAVAILABLE','REQUEST_FAILED'],[403,'SETUP_TOKEN_DAEMON_START_ACCOUNT_EXHAUSTED','FORBIDDEN']])('preserves only authenticated confirmed start exhaustion (%s, %s)',async(status,error,reason)=>{
+ const {switcher}=setup({fetch:vi.fn(async()=>Response.json({error},{status})) as typeof fetch})
+ expect(await switcher.requestStart('session-a',RUNNING_A,'start-1')).toEqual({ok:false,reason})
+})
+it('passes start exhaustion as a distinct rebind reason',async()=>{
+ const {switcher,requests}=setup()
+ expect((await switcher.rebind('session-a',RUNNING_A,undefined,undefined,{startExhausted:true})).ok).toBe(true)
+ expect(requests[0].body).toMatchObject({startExhausted:true})
+ expect(requests[0].body).not.toHaveProperty('startBudget')
+})
+
+it('logs start refusal status and code without logging arbitrary response data',async()=>{
+ const debug=vi.spyOn(logger,'debug')
+ try{
+  const {switcher}=setup({fetch:vi.fn(async()=>Response.json({error:'SETUP_TOKEN_DAEMON_START_ACCOUNT_EXHAUSTED',token:'do-not-log'},{status:409})) as typeof fetch})
+  await switcher.requestStart('session-a',RUNNING_A,'request')
+  expect(debug).toHaveBeenCalledWith('[setup-token-switch] START_ACCOUNT_EXHAUSTED: start refused: HTTP 409 SETUP_TOKEN_DAEMON_START_ACCOUNT_EXHAUSTED')
+  expect(debug.mock.calls.flat().join(' ')).not.toContain('do-not-log')
+ }finally{debug.mockRestore()}
 })

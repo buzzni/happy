@@ -55,6 +55,7 @@ import { BROWSER_TASK_UNAVAILABLE_REASON_ENV, BROWSER_TASK_UNAVAILABLE_REASON_PA
 import { runScriptAutomationTool, scriptAutomationToolRequestSchema } from './scriptAutomationTools';
 import { runScheduledTaskTool, scheduledTaskToolRequestSchema } from './scheduledTaskTools';
 import { registerTurnCardTools, TURN_CARD_TOOL_NAMES, type TurnCards } from './turnCardTools';
+import { LINKED_PULL_REQUEST_TOOL_NAMES, registerLinkedPullRequestTools, withLinkedPullRequestCapability } from './linkedPullRequestTools';
 
 export const BASH_STREAM_AGENT_TOOL_NAME = 'mcp__happy__bash_stream';
 
@@ -81,6 +82,7 @@ export interface HappyServerHandlers {
     /** The run-once host keeps the session parked while a browser task waits for the user. */
     browserHostContinues?: boolean;
     mandatorySandbox?: boolean;
+    linkedPullRequestTools?: boolean;
 }
 
 // The first title generated through change_title is the one users rely on to
@@ -162,6 +164,8 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
 
     // Not in a mandatory sandbox: that boundary keeps its fixed minimal tool set (like propose_lesson).
     if (!handlers.mandatorySandbox) registerTurnCardTools(mcp, { client: handlers.client, turnCards: handlers.turnCards, runTool });
+
+    if (handlers.linkedPullRequestTools) registerLinkedPullRequestTools(mcp, { client: handlers.client, runTool });
 
     if (!handlers.mandatorySandbox && !scopedSession) mcp.registerTool('script_automations', {
         title: 'Manage Script Automations',
@@ -599,6 +603,12 @@ export async function startHappyServer(
         protectedBashCwd?: () => string | null;
         trackProtectedBashProcess?: (child: ChildProcess) => void;
         currentTurnId?: () => number | null;
+        /**
+         * The runner's `linkedPullRequestToolsAllowed()`, the value it advertised at creation. Given, it
+         * also corrects the advertisement on metadata the server kept from an earlier run (managed
+         * attachment, existing tag). Absent: no tools and no write.
+         */
+        linkedPullRequestTools?: boolean;
     } = {},
 ) {
     logger.debug(`[happyMCP] server:start sessionId=${client.sessionId}`);
@@ -632,6 +642,11 @@ export async function startHappyServer(
     };
     const initialComputerAvailable = await computerAvailable();
     const changeTitle = createChangeTitleHandler(client);
+    const linkedPullRequestTools = options.linkedPullRequestTools === true && !options.mandatorySandbox
+        && process.env.HAPPY_WRITE_SCOPE_SESSION !== '1';
+    if (options.linkedPullRequestTools !== undefined) {
+        client.updateMetadata((metadata) => withLinkedPullRequestCapability(metadata, linkedPullRequestTools), { skipUnchanged: true });
+    }
     // The same-UID Linux scope boundary denies socket(AF_UNIX); do not start without Happy tools.
     if (options.mandatorySandbox && options.sameUidSandbox && process.platform === 'linux') {
         throw new MandatorySandboxError('capability-unavailable', 'Same-UID Linux scope MCP transport unavailable');
@@ -687,6 +702,7 @@ export async function startHappyServer(
             admitTool: options.admitTool,
             client,
             mandatorySandbox: options.mandatorySandbox,
+            linkedPullRequestTools,
             proposeLesson: options.proposeLesson,
             turnCards: options.turnCards,
             protectedBashCwd: options.protectedBashCwd,
@@ -772,7 +788,7 @@ export async function startHappyServer(
         socketPath,
         mcpConfig,
         bridgeEnv,
-        toolNames: [...(browserTask?.localClients ? LOCAL_CLIENT_TOOL_NAMES : []), ...(options.mandatorySandbox ? [] : TURN_CARD_TOOL_NAMES), ...(initialComputerAvailable ? ['local_tool_capabilities', 'local_tool_control'] : []), ...(options.checkpointReader ? ['checkpoint_status', 'checkpoint_list', 'checkpoint_preview', 'checkpoint_diff'] : []), ...(options.mandatorySandbox
+        toolNames: [...(browserTask?.localClients ? LOCAL_CLIENT_TOOL_NAMES : []), ...(options.mandatorySandbox ? [] : TURN_CARD_TOOL_NAMES), ...(linkedPullRequestTools ? LINKED_PULL_REQUEST_TOOL_NAMES : []), ...(initialComputerAvailable ? ['local_tool_capabilities', 'local_tool_control'] : []), ...(options.checkpointReader ? ['checkpoint_status', 'checkpoint_list', 'checkpoint_preview', 'checkpoint_diff'] : []), ...(options.mandatorySandbox
             ? ['change_title', ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : [])]
             : [...(options.proposeLesson ? ['propose_lesson'] : []), 'change_title', 'bash_stream', 'script_automations', ...(process.env.HAPPY_WRITE_SCOPE_SESSION === '1' ? [] : ['scheduled_tasks']), ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : BROWSER_TOOL_NAMES)])],
         stop: () => {

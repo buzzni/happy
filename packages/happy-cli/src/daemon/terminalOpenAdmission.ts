@@ -64,6 +64,14 @@ export async function prepareTerminalOpen(input: TerminalOpenAdmissionInput): Pr
         },
         async submit(operation) {
             if (phase !== 'prepared') throw new Error('TERMINAL_OPEN_ALREADY_SETTLED');
+            // Folder approval may change while workspace reservations are awaited. Check in
+            // the same synchronous turn as PTY creation; the intentional home fallback stays valid.
+            if (typeof params?.cwd === 'string' && params.cwd && !cwdDecision.fallback) {
+                const current = input.cwd.validate(cwdDecision.cwd, input.cwd.allowedRoot);
+                if (!current.valid || (current.resolvedPath ?? cwdDecision.cwd) !== cwdDecision.cwd) {
+                    throw new Error('TERMINAL_DIRECTORY_APPROVAL_CHANGED');
+                }
+            }
             phase = 'submitted';
             try { operation(); }
             finally {

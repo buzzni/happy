@@ -1,4 +1,4 @@
-import { waitForSetupTokenStart } from './setupTokenStartBudget';
+import { waitForSetupTokenStart, waitForSharedSetupTokenStart } from './setupTokenStartBudget';
 import { requestSetupTokenStart } from '../daemon/controlClient';
 import { MANUAL_PERSONAL_ENV } from '@/daemon/manualPersonalClaude';
 import { createSetupTokenActivityReporter } from './setupTokenActivity';
@@ -575,6 +575,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     /** The setup-token binding (or shared-PC account) the running provider started with; usage is booked to it, not to a later switch. */
     let providerBinding: string | undefined;
     let providerActivityBinding: string | undefined;
+    /** An unbound shared-PC provider's account authority, which asks to start turns but reports no activity. */
+    let providerSharedStartAuthority: string | undefined;
     const activityReporter = createSetupTokenActivityReporter({
         sessionId: () => session.client.sessionId,
         binding: () => providerActivityBinding,
@@ -941,18 +943,19 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             /** Aborted with `providerEnded`: an input wait this generation left behind frees the queue's single waiter slot. */
             const generationEnded = new AbortController();
             const admitTurn = async (message: { channelRequestId?: string } | null) => {
-                const binding = personalFallback?.identity() ? undefined : providerActivityBinding;
+                const binding = personalFallback?.identity() ? undefined : providerActivityBinding ?? providerSharedStartAuthority;
                 if (!binding) return true;
+                const shared = binding !== providerActivityBinding;
                 try {
                     const sessionId = session.client.sessionId;
                     if (!sessionId) throw new Error('SETUP_TOKEN_START_SESSION_MISSING');
-                    const admitted = await waitForSetupTokenStart({
+                    const admitted = await (shared ? waitForSharedSetupTokenStart : waitForSetupTokenStart)({
                         request: (requestId, signal) => requestSetupTokenStart(sessionId, binding, requestId, signal),
                         signal: AbortSignal.any([controller.signal, generationEnded.signal]),
-                        notify: () => session.client.sendSessionEvent({ type: 'message', message: '계정의 작업 시작 한도에 도달해 기다리고 있습니다. 여유가 생기면 이어서 실행합니다.' }),
+                        notify: () => session.client.sendSessionEvent({ type: 'message', message: '조직 Claude 계정으로 지금 실행할 수 없어 기다리고 있습니다. 사용 가능한 계정으로 전환하거나 상태가 회복되면 이어서 실행합니다. 반복되면 조직 관리자에게 계정 연결과 비활성화 상태를 확인해 주세요.' }),
                         // Moved: this provider holds the old token, so the input stays pending for the next one. A due
                         // transient retry (no message) has nothing to keep pending, so it waits on this account.
-                        ...(message ? { moveToPreferred: async () => !!await setupTokenSwitching?.switchForStartBudget() } : {}),
+                        ...(message ? { moveToPreferred: async () => !!await setupTokenSwitching?.switchForStartBudget(), moveFromExhausted: async () => !!await setupTokenSwitching?.switchForExhaustedStart() } : {}),
                     });
                     return admitted && !providerOptionsStale();
                 } catch (error) {
@@ -973,6 +976,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             // Capture authority before the first thinking callback, which can precede system/init.
             providerBinding = runningAuthority();
             providerActivityBinding = personalFallback?.identity() ? undefined : process.env[SETUP_TOKEN_BINDING_ENV];
+            providerSharedStartAuthority = personalFallback?.identity() || providerActivityBinding ? undefined : sharedMachineSetupTokenAuthority(process.env);
             const optionsCredentialGeneration = personalFallback?.generation() ?? 0;
             const providerOptionsStale = () => providerStale() || optionsCredentialGeneration !== (personalFallback?.generation() ?? 0);
             try {

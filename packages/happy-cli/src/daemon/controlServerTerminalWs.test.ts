@@ -138,9 +138,11 @@ describe('/terminal WS protocol (T7-T8)', () => {
   let machineEncryption: { encryptionKey: Uint8Array; encryptionVariant: 'legacy'; machineId?: string; strict?: boolean } | null
   let reserve: TerminalOpenAdmissionInput['reserveLegacyDispatch']
   let admit: TerminalOpenAdmissionInput['admitSubprocess']
+  let approved: string[] = []
 
   beforeEach(async () => {
     reserve = undefined; admit = undefined
+    approved = []
     dir = mkdtempSync(path.join(tmpdir(), 'control-server-terminal-ws-proto-'))
     machineEncryption = { encryptionKey: getRandomBytes(32), encryptionVariant: 'legacy' }
     const registry = createPortRegistry({
@@ -157,6 +159,7 @@ describe('/terminal WS protocol (T7-T8)', () => {
       onHappySessionWebhook: () => {},
       portRegistry: registry,
       allowedRoot: dir,
+      approvedRoots: () => approved,
       getMachineEncryption: () => machineEncryption,
       reserveLegacyDispatch: (roots: readonly string[]) => reserve ? reserve(roots) : Promise.resolve({ acquired: true as const, finish: async () => undefined }),
       admitSubprocess: async (roots: readonly string[]) => { await admit?.(roots) },
@@ -289,6 +292,40 @@ describe('/terminal WS protocol (T7-T8)', () => {
     expect(typeof ack.data.sessionId).toBe('string')
     expect(ack.data.caps).toEqual({ resume: true, snapshot: true, local: true, attach: true, pagedResume: true })
     ws.close()
+  })
+
+  // aplus-dev-studio specs/approved-folder-roots — the same approval the file RPCs honor opens the terminal there.
+  it('starts in a folder the machine owner approved outside the allowed root, and not once revoked', async () => {
+    const outside = mkdtempSync(path.join(tmpdir(), 'control-server-terminal-approved-'))
+    const openAndCollect = async () => {
+      const ws = await connect()
+      const reqId = randomUUID()
+      // One listener for the whole exchange: the fallback banner frame can arrive before the ack, back to back.
+      const text = await new Promise<string>((resolve, reject) => {
+        let collected = '', acked = false
+        ws.on('message', (raw: RawData) => {
+          const msg = JSON.parse(raw.toString())
+          if (msg.reqId === reqId) { if (!msg.data?.ok) reject(new Error(JSON.stringify(msg))); acked = true }
+          else if (msg.data?.event === 'terminal-frame') collected += decryptFrame(msg)
+          if (acked && collected.includes('DONE')) resolve(collected)
+        })
+        ws.send(JSON.stringify({ reqId, event: 'terminal-open', data: { machineId: 'm1', params: openParams({ cwd: outside, script: "process.stdout.write('cwd=' + process.cwd() + '\\nDONE\\n')" }) } }))
+      })
+      ws.close()
+      return text
+    }
+    try {
+      approved = [outside]
+      const inApproved = await openAndCollect()
+      expect(inApproved).toContain(path.basename(outside))
+      expect(inApproved).not.toContain('[info]')
+
+      approved = []
+      const revoked = await openAndCollect()
+      expect(revoked).toContain('[info]')
+    } finally {
+      rmSync(outside, { recursive: true, force: true })
+    }
   })
 
   it('errors the ack instead of opening when the machine key is not ready yet', async () => {

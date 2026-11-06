@@ -2531,14 +2531,23 @@ export class ApiSessionClient extends EventEmitter {
         return this.options.trackShutdownStorage ? apply() : backoff(apply);
     }
 
-    /** With storage tracking enabled, handlers must be pure and safe to replay against newer state (idempotent). */
-    updateMetadata(handler: (metadata: Metadata) => Metadata) {
+    /**
+     * With storage tracking enabled, handlers must be pure and safe to replay against newer state (idempotent).
+     * `skipUnchanged`: a handler that returns the document it was given sends nothing, also on a replay.
+     * `onStored` runs once the server has the result (or, with `skipUnchanged`, already had it).
+     */
+    updateMetadata(handler: (metadata: Metadata) => Metadata, options: { skipUnchanged?: boolean; onStored?: () => void } = {}) {
         let attempt: { encrypted: string; expectedVersion: number; uncertain: boolean } | null = null;
         this.metadataWrites.enqueue(() => this.runStateWrite(async () => {
             if (this.closed) return false;
             if (!attempt || !this.options.trackShutdownStorage) {
                 try {
-                    const updated = handler(this.metadata!);
+                    const current = this.metadata!;
+                    const updated = handler(current);
+                    if (options.skipUnchanged && updated === current) {
+                        options.onStored?.();
+                        return true;
+                    }
                     attempt = { expectedVersion: this.metadataVersion, encrypted: encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, updated)), uncertain: false };
                 } catch (error) {
                     if (this.options.trackShutdownStorage) throw new SessionStateWriteRefused('Invalid local metadata transform');
@@ -2554,7 +2563,9 @@ export class ApiSessionClient extends EventEmitter {
                 && answer.metadata === encrypted && answer.version === expectedVersion + 1)) {
                 this.metadata = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(answer.metadata));
                 this.metadataVersion = answer.version;
-                return answer.metadata === encrypted && Number.isSafeInteger(answer.version) && answer.version === expectedVersion + 1;
+                const stored = answer.metadata === encrypted && Number.isSafeInteger(answer.version) && answer.version === expectedVersion + 1;
+                if (stored) options.onStored?.();
+                return stored;
             } else if (answer.result === 'version-mismatch') {
                 if (answer.version > this.metadataVersion) {
                     this.metadataVersion = answer.version;

@@ -24,6 +24,8 @@ export function describeClaudeLaunchFailure(error: unknown): string {
         return error.stage === 'initialize' ? CLAUDE_STARTUP_TIMEOUT_NOTICE : CLAUDE_AUTH_CHECK_TIMEOUT_NOTICE;
     }
     const text = error instanceof Error ? error.message : String(error);
+    if (text === 'SETUP_TOKEN_START_WAIT_EXHAUSTED') return 'No organization Claude account became available after repeated checks. Ask your organization administrator to check the assigned accounts, then send again.';
+    if (text === 'SETUP_TOKEN_START_UNAVAILABLE') return 'The organization Claude account could not be authorized to start. Ask your organization administrator to check the assigned accounts, then send again.';
     if (text === ORGANIZATION_CLAUDE_AUTH_FAILURE) return 'Organization Claude stopped because the assigned account or policy could not be verified. Check this machine’s CLI and assigned account, then send again.';
     if (text === PERSONAL_CLAUDE_AUTH_FAILURE) return 'Personal Claude stopped because the selected account or policy could not be verified. Check the account and send again.';
     const code = (error as { code?: unknown } | null)?.code;

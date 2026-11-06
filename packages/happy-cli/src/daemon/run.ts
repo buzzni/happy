@@ -48,6 +48,7 @@ import {
   type SpawnSessionResult,
 } from '@/modules/common/registerCommonHandlers';
 import { LIST_FILES_PAGE_CAPABILITY } from '@/modules/common/listFilesPageCapability';
+import { BASH_PREFIX_MATCHER_CAPABILITY } from '@/claude/utils/bashPrefixMatcher';
 import { logger } from '@/ui/logger';
 import { authAndSetupMachineIfNeeded } from '@/ui/auth';
 import { reseedCompanyKey, settleMachineControl } from '@/datakey/machineControl';
@@ -90,6 +91,7 @@ import { preflightDaemonControlServer, startDaemonControlServer } from './contro
 import { BrowserBridge } from './browserBridge';
 import { BrowserLocalSetup, shouldEnableBrowserLocalSetup } from './browserLocalSetup';
 import { fetchBrowserExtensionScope } from './browserExtensionScope';
+import { writeBrowserBridgeOwnerHome } from './browserBridgeOwner';
 import { readBrowserSetupPolicy, writeBrowserSetupPolicy, localBrowserExtensionMetadata } from './browserLocalSetupStore';
 import { BrowserSessionBrokerClient } from './browserSessionBrokerContract';
 import { getBusyDaemonTerminalCount, getDaemonTerminalSessionCount } from './daemonTerminalSessions';
@@ -316,7 +318,7 @@ import {
 import { preflightAutomationConnectors } from './automations/automationConnectorPreflight';
 import { resolveScriptRuntimeImage, scriptRuntimeReadiness, type ScriptRuntimeReadiness } from './automations/scriptRuntimeReadiness';
 import { createScriptRuntimeSupervisor } from './automations/scriptRuntimeSupervisor';
-import { resolveDaemonAllowedRoot } from '@/modules/common/resolveAllowedRoot';
+import { resolveDaemonAllowedRoot, resolveDaemonApprovedRoots } from '@/modules/common/resolveAllowedRoot';
 import { getProcessStartedAt } from '@/utils/processStartTime';
 import { waitForSessionWebhook } from './spawnWebhookWait';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
@@ -453,6 +455,7 @@ export const initialMachineMetadata: MachineMetadata = {
   structuredOutput: STRUCTURED_OUTPUT_CAPABILITY,
   writeFileAttempt: WRITE_FILE_ATTEMPT_CAPABILITY,
   listFilesPage: LIST_FILES_PAGE_CAPABILITY,
+  permissionGrants: BASH_PREFIX_MATCHER_CAPABILITY,
   machineRun: {
     protocolVersion: 1,
     // The machine-scope handler installs the managed write policy (apiMachine).
@@ -2280,7 +2283,8 @@ export async function startDaemon(): Promise<void> {
         let extraEnv: Record<string, string> = injectMcpCallerGrant(
           stripManagedCredentialConflicts(
             buildSpawnRequestEnvironment(authEnv, options.environmentVariables,
-              { allowPocBrowserTaskEnv: process.env.HAPPY_BROWSER_POC_REQUEST_ENV === '1' }),
+              { allowPocBrowserTaskEnv: process.env.HAPPY_BROWSER_POC_REQUEST_ENV === '1',
+                ...(options.seedDefaultAgentGrant ? { defaultAgentRoot: directory } : {}) }),
             managedAiCredentialEnvironment,
           ),
           mcpCallerGrant,
@@ -3379,6 +3383,8 @@ export async function startDaemon(): Promise<void> {
             },
             agentEnvironment: tracked.agentEnvironment,
             sessionId: happySessionId,
+            // Automation runs are left as they were captured; sessions people started get the grant they missed.
+            ...(options?.automation ? {} : { defaultAgentRoot: launch.cwd }),
           }), managedAiCredentialEnvironment),
           mcpCallerGrantEnvelope: options?.mcpCallerGrantEnvelope,
           trustedMcpCallerGrant: resumeGrantSource.trustedMcpCallerGrant,
@@ -4278,6 +4284,9 @@ export async function startDaemon(): Promise<void> {
         extensionScope: () => fetchBrowserExtensionScope({ origin: readTrustedStudioOrigin(process.env), machineId, token: credentials.token }),
       }) : undefined;
     let stopBrowserBridge: () => Promise<void> = async () => {};
+    // Chrome's native host finds this daemon through this record when its home is not a documented one.
+    const recordBrowserBridgeOwner = () => writeBrowserBridgeOwnerHome(os.homedir(), configuration.happyHomeDir)
+      .catch(error => logger.warn(`[DAEMON RUN] Browser bridge owner not recorded; extension connection may not find this daemon: ${error instanceof Error ? error.message : String(error)}`));
     try {
       if (browserSetupPolicy !== null) {
         const bridgeHost = resolveBrowserBridgeHost(process.env);
@@ -4289,6 +4298,7 @@ export async function startDaemon(): Promise<void> {
           ,consumeSetup: setupCandidate ? id => setupCandidate.consume(id) : undefined
         });
         stopBrowserBridge = bridgeServer.stop;
+        if (setupCandidate) await recordBrowserBridgeOwner();
         if (bridgeHost !== '127.0.0.1') {
           logger.debug(`[DAEMON RUN] Browser bridge bound to ${bridgeHost} (HAPPY_BROWSER_BRIDGE_HOST) — not loopback-only`);
         }
@@ -4302,6 +4312,7 @@ export async function startDaemon(): Promise<void> {
         stopBrowserBridge = retryBrowserBridgeServer({
           bridge: browserBridge, port: DEFAULT_BROWSER_BRIDGE_PORT, host: resolveBrowserBridgeHost(process.env),
           consumeSetup: setupCandidate ? id => setupCandidate.consume(id) : undefined,
+          onListening: setupCandidate ? recordBrowserBridgeOwner : undefined,
         }).stop;
       } else {
         browserLocalSetup = undefined;
@@ -4375,6 +4386,7 @@ export async function startDaemon(): Promise<void> {
       } } : {}),
       // 제어 서버의 파일 접근도 같은 잠금 정책을 따른다(HAPPY_RPC_ALLOWED_ROOT).
       allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
+      approvedRoots: resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir),
       standaloneDrain: standaloneWindows?.drain,
       writeScopeRuntime,
       managedRuntime: managedIdentity.status === 'active',
@@ -5057,6 +5069,11 @@ export async function startDaemon(): Promise<void> {
       fetch,
       // Passed as is: catching a session up resumes its recorded binding, the runtime's third argument.
       sessionEnvironment: aiCredentialRuntime.sessionEnvironment,
+      disabledSetupTokenAccounts: async () => {
+        const status = await aiCredentialRuntime.status({ provider: 'claude' });
+        return 'setupToken' in status ? (status.setupToken?.accounts ?? [])
+          .filter(account => account.disabled).map(account => account.managedAccountId) : [];
+      },
       recordAgentEnvironment: persistSetupTokenBinding,
       // Saycode specs/setup-token-switch-usage-check — check a candidate nobody measured recently before moving onto it.
       measure: aiCredentialRuntime.measureWithPermit,
@@ -5065,6 +5082,8 @@ export async function startDaemon(): Promise<void> {
       sharedMachine: {
         reportUsage: aiCredentialRuntime.sharedMachineUsage, rebind: aiCredentialRuntime.sharedMachineRebind,
         environment: aiCredentialRuntime.sharedMachineAccountEnvironment, moved: () => persistTrackedSessions(),
+        startProof: aiCredentialRuntime.sharedMachineStartProof,
+        startBudgetMove: aiCredentialRuntime.sharedMachineStartBudgetMove,
       },
     });
     launchManagedAiCredentialSession = aiCredentialRuntime.launchSession;

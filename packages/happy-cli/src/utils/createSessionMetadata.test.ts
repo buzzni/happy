@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { SandboxConfig } from '@/persistence';
 import { createSessionMetadata } from './createSessionMetadata';
+import { BASH_PREFIX_MATCHER_CAPABILITY } from '@/claude/utils/bashPrefixMatcher';
 
 function createSandboxConfig(overrides: Partial<SandboxConfig> = {}): SandboxConfig {
     return {
@@ -39,11 +40,35 @@ describe('createSessionMetadata', () => {
             .toEqual({ saycodeSystemPromptPreference: true });
     });
 
+    // aplus-dev-studio-desktop specs/linked-pull-requests R1-3 — tool presence, not a version guess.
+    it('advertises the linked pull request tools only for a runner that exposes them', () => {
+        expect(createSessionMetadata({ flavor: 'codex', machineId: 'm', linkedPullRequestTools: true }).metadata.runtimeCapabilities)
+            .toEqual({ saycodeSystemPromptPreference: true, linkedPullRequests: 1 });
+        for (const flavor of ['claude', 'openclaw'] as const) {
+            expect(createSessionMetadata({ flavor, machineId: 'm' }).metadata.runtimeCapabilities).not.toHaveProperty('linkedPullRequests');
+        }
+    });
+
     it('advertises bound session RPCs', () => {
         const { metadata } = createSessionMetadata({ flavor: 'claude', machineId: 'machine-1' });
 
         expect(metadata.rpcBinding).toEqual({ version: 1 });
     });
+
+    it('advertises the Bash matcher only when the running runner supplies it', () => {
+        const { metadata } = createSessionMetadata({
+            flavor: 'claude', machineId: 'machine-1',
+            permissionGrants: BASH_PREFIX_MATCHER_CAPABILITY,
+        });
+        expect(metadata.runtimeCapabilities?.permissionGrants).toEqual({ bashPrefixMatcher: 'plain-v1' });
+    });
+
+    it.each(['claude', 'codex', 'gemini', 'opencode', 'openclaw', 'grok', 'acp'] as const)(
+        'does not infer a %s session matcher from its flavor or machine identity', (flavor) => {
+            const { metadata } = createSessionMetadata({ flavor, machineId: 'upgraded-machine' });
+            expect(metadata.runtimeCapabilities).not.toHaveProperty('permissionGrants');
+        },
+    );
     // aplus-dev-studio specs/session-source-metadata — the runner hands over what the daemon asked for.
     it('records the session source only when the runner supplies one', () => {
         expect(createSessionMetadata({ flavor: 'codex', machineId: 'machine-1', source: 'schedule' }).metadata.source).toBe('schedule');

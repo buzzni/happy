@@ -29,6 +29,7 @@ import { ApprovalExpiryTimers, withoutExpiresAt } from "@/utils/approvalExpiry";
 import { unattendedExpiryMessage, type TurnAttendanceState } from "@/api/turnAttendance";
 import { composeDenyMessage, recordedDenyReason } from "@/utils/permissionDenyMessage";
 import { ceilingDenialMessage } from "@/orgRequirements/gate";
+import { bashPrefixAllows } from "./bashPrefixMatcher";
 
 export type { PermissionAck };
 
@@ -314,8 +315,10 @@ export class PermissionHandler implements PolicyApprover {
                     return { behavior: 'allow', updatedInput: input as Record<string, unknown> };
                 }
                 // Check prefix matches
+                // A prefix grant covers only a plain single command at a word boundary (spec
+                // desktop-permission-prefix-grant R7); anything else asks the person as before.
                 for (const prefix of this.allowedBashPrefixes) {
-                    if (inputObj.command.startsWith(prefix)) {
+                    if (bashPrefixAllows(prefix, inputObj.command)) {
                         return { behavior: 'allow', updatedInput: input as Record<string, unknown> };
                     }
                 }

@@ -39,6 +39,29 @@ async function ready(input: TerminalOpenAdmissionInput) {
 }
 
 describe('prepareTerminalOpen', () => {
+    it('preserves an empty requested cwd as the intentional home directory outside a configured workspace root', async () => {
+        const f = fixture(), input = f.input(f.request(''));
+        input.cwd.allowedRoot = f.project;
+        const admit = vi.fn(input.admitSubprocess!); input.admitSubprocess = admit;
+        const prepared = await ready(input), start = vi.fn();
+        expect(prepared.cwdDecision).toEqual({ cwd: f.home });
+        await prepared.submit(start);
+        expect(start).toHaveBeenCalledOnce(); expect(admit).toHaveBeenCalledWith([f.home]);
+    });
+
+    it('does not submit a terminal after its folder approval is revoked during preparation', async () => {
+        const f = fixture(), input = f.input();
+        let approved = true;
+        input.cwd.validate = (path, root) => approved ? validatePath(path, root) : { valid: false, error: 'Folder approval revoked' };
+        const admit = vi.fn(input.admitSubprocess!); input.admitSubprocess = admit;
+        const prepared = await ready(input), start = vi.fn();
+        approved = false;
+        try { await expect(prepared.submit(start)).rejects.toThrow('TERMINAL_DIRECTORY_APPROVAL_CHANGED'); }
+        finally { await prepared.cancel(); }
+        expect(start).not.toHaveBeenCalled(); expect(admit).not.toHaveBeenCalled();
+        const owner = f.automatic(); expect(await owner.tryAcquire()).toEqual({ acquired: true }); await owner.release(true);
+    });
+
     it('holds a terminal before nonce consumption and permits the same request after proven automatic release', async () => {
         const f = fixture(), owner = f.automatic(), input = f.input();
         expect(await owner.tryAcquire()).toEqual({ acquired: true });

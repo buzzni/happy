@@ -84,12 +84,13 @@ const DEFAULT_PORT_RETRY_MS = 10_000
  * without browser control until restart. Retries while the port is taken and takes it over once
  * that process exits; any other bind error ends the retries.
  */
-export function retryBrowserBridgeServer({ bridge, port, host = '127.0.0.1', retryMs = DEFAULT_PORT_RETRY_MS, consumeSetup }: {
+export function retryBrowserBridgeServer({ bridge, port, host = '127.0.0.1', retryMs = DEFAULT_PORT_RETRY_MS, consumeSetup, onListening }: {
     bridge: BrowserBridge
     port: number
     host?: string
     retryMs?: number
     consumeSetup?: (operationId: string) => Promise<unknown>
+    onListening?: () => Promise<void>
 }): { stop: () => Promise<void> } {
     let stopped = false
     let timer: NodeJS.Timeout | undefined
@@ -99,6 +100,9 @@ export function retryBrowserBridgeServer({ bridge, port, host = '127.0.0.1', ret
         startBrowserBridgeServer({ bridge, port, host, consumeSetup }).then(async (server) => {
             if (stopped) { await server.stop(); return }
             stopServer = server.stop
+            try { await onListening?.() }
+            catch (error) { logger.warn(`[BROWSER BRIDGE] Listener callback failed: ${error instanceof Error ? error.message : String(error)}`) }
+            if (stopped) return
             bridge.setListenerUnavailable(null)
             logger.debug(`[BROWSER BRIDGE] Took over ${host}:${port} after it was released`)
         }, (err: NodeJS.ErrnoException) => {

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { createConnection, KEEPALIVE_INTERVAL_MS } from './connection.js'
+import { createConnection, KEEPALIVE_INTERVAL_MS, RECONNECT_ALARM } from './connection.js'
 
 /** Fake WebSocket capturing what the connection sends and letting tests fire events. */
 class FakeWebSocket {
@@ -250,6 +250,22 @@ describe('createConnection', () => {
         expect(FakeWebSocket.instances).toHaveLength(1)
         await vi.advanceTimersByTimeAsync(1)
         expect(FakeWebSocket.instances).toHaveLength(2)
+    })
+
+    it('asks Chrome to wake the worker while the daemon is gone and stops asking once connected', async () => {
+        // MV3 stops an idle worker ~30s after the socket drops, taking the backoff timer with it;
+        // only an alarm wakes it again, and nothing else would reconnect until a click or restart.
+        const alarms = []
+        const chrome = { ...fakeChrome(), alarms: {
+            create: (name, info) => { alarms.push(['create', name, info]) },
+            clear: (name) => { alarms.push(['clear', name]) },
+        } }
+        const connection = make(chrome)
+        await connection.connect()
+        FakeWebSocket.instances[0].open()
+        expect(alarms).toEqual([['clear', RECONNECT_ALARM]])
+        FakeWebSocket.instances[0].close()
+        expect(alarms.at(-1)).toEqual(['create', RECONNECT_ALARM, { delayInMinutes: 0.5 }])
     })
 
     it('answers a command from the daemon and ignores its pong', async () => {

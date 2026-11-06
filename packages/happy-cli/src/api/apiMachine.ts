@@ -31,9 +31,10 @@ import {
     type SpawnSessionResult,
 } from '../modules/common/registerCommonHandlers';
 import { LIST_FILES_PAGE_CAPABILITY } from '../modules/common/listFilesPageCapability';
+import { BASH_PREFIX_MATCHER_CAPABILITY } from '../claude/utils/bashPrefixMatcher';
 import { createManagedProjectWriteScopePolicy, TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '../modules/common/machineRunProfile';
 import { hostManagedMachineTools } from '../modules/common/moaiMachineRunProfiles';
-import { resolveDaemonAllowedRoot } from '../modules/common/resolveAllowedRoot';
+import { resolveDaemonAllowedRoot, resolveDaemonApprovedRoots } from '../modules/common/resolveAllowedRoot';
 import { REMOTE_TERMINAL_DISABLED_ERROR, resolveMachineLockdownPolicy } from '../daemon/machineLockdownPolicy';
 import { homedir } from 'node:os';
 import { encodeBase64, decodeBase64, encrypt, decrypt, tryDecrypt } from './encryption';
@@ -921,6 +922,8 @@ export class ApiMachineClient {
     // terminal-open-fwd handler can run validatePath against the same
     // root the rest of the RPC surface uses (Files tab / writeFile).
     private allowedRoot: string;
+    /** aplus-dev-studio specs/approved-folder-roots — folders outside allowedRoot the machine owner approved. */
+    private approvedRoots: (() => readonly string[]) | undefined;
     /**
      * The pending next dial. Non-null means "a retry cadence is running", which
      * is all `getConnectionHealth()` and the connection supervisor read it for.
@@ -1029,9 +1032,11 @@ export class ApiMachineClient {
         // project's workspaceDir.
         const allowedRoot = resolveDaemonAllowedRoot(process.env, homedir());
         this.allowedRoot = allowedRoot;
+        this.approvedRoots = resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir);
         registerCommonHandlers(this.rpcHandlerManager, allowedRoot, {
             ...(withFilesystemMutation ? { withFilesystemMutation } : {}),
             ...(admitSubprocess ? { admitSubprocess } : {}),
+            approvedRoots: this.approvedRoots,
             // Machine scope is the Desktop machine.run path and the only one that
             // may run managed writes; its lock is per daemon process.
             machineRun: {
@@ -1466,6 +1471,7 @@ export class ApiMachineClient {
                 model,
                 effort,
                 environmentVariables,
+                seedDefaultAgentGrant: true,
                 additionalDirectories: validAdditionalDirectories,
                 token,
                 happyToken,
@@ -4052,7 +4058,8 @@ export class ApiMachineClient {
                     strict: configuration.machineControl === 'strict', nonceGuard: this.terminalOpenNonceGuard,
                     reserveLegacyDispatch: this.reserveLegacyDispatch, admitSubprocess: this.admitSubprocess,
                     cwd: { allowedRoot: this.allowedRoot, homedir: homedir(), fsExists: existsSync,
-                        fsMkdir: path => { mkdirSync(path, { recursive: true }); }, validate: validatePath },
+                        fsMkdir: path => { mkdirSync(path, { recursive: true }); },
+                        validate: (path, root) => validatePath(path, root, this.approvedRoots?.()) },
                 });
                 if (prepared.kind === 'refused') {
                     ack({ ok: false, error: prepared.error, code: prepared.code });
@@ -4472,6 +4479,11 @@ export class ApiMachineClient {
             const advertisedListFilesPage = this.managedHandlers ? undefined : LIST_FILES_PAGE_CAPABILITY;
             const listFilesPageStale = JSON.stringify(this.machine.metadata?.listFilesPage)
                 !== JSON.stringify(advertisedListFilesPage);
+            // Availability hint only: every live session owns its permission handler and must
+            // publish its own runtimeCapabilities.permissionGrants, including on a managed runtime.
+            // Detached older sessions do not gain that session marker when this daemon upgrades.
+            const permissionGrantsStale = JSON.stringify(this.machine.metadata?.permissionGrants)
+                !== JSON.stringify(BASH_PREFIX_MATCHER_CAPABILITY);
             const advertisedChannelHost = this.managedHandlers ? undefined : this.channelHostAdvertisement;
             const channelHostStale = JSON.stringify(this.machine.metadata?.channelHost)
                 !== JSON.stringify(advertisedChannelHost);
@@ -4520,7 +4532,7 @@ export class ApiMachineClient {
             // Bounded: an acknowledgement that never comes must not block every later change.
             const awaitingServer = this.capabilityUpdateInFlight !== null
                 && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
-            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || agentPlanStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || writeFileAttemptStale || listFilesPageStale)) {
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || agentPlanStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || writeFileAttemptStale || listFilesPageStale || permissionGrantsStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -4557,6 +4569,7 @@ export class ApiMachineClient {
                     structuredOutput: advertisedStructuredOutput,
                     writeFileAttempt: advertisedWriteFileAttempt,
                     listFilesPage: advertisedListFilesPage,
+                    permissionGrants: BASH_PREFIX_MATCHER_CAPABILITY,
                     channelHost: advertisedChannelHost,
                     rpcBinding: advertisedRpcBinding,
                     sealedSpawnEnv: advertisedSealedSpawnEnv,
