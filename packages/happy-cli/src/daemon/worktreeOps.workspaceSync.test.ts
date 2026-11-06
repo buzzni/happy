@@ -95,21 +95,15 @@ afterEach(() => {
 });
 
 describe('workspace operations with an SSH origin and a sealed HTTPS credential', () => {
-    /** `origin` becomes the SSH address, whose login always fails; the returned file appears once it is tried. */
-    function sshOrigin(): string {
+    it.each(['remote-status', 'pull-remote'] as const)('%s uses the signed address for both branches without an SSH login', async (op) => {
+        git(repo, 'push', '--quiet', bare, 'main:collab-x');
+        git(repo, 'switch', '--quiet', '-c', 'collab-x');
+        pushOnline('online.txt', 'o');
         git(repo, 'remote', 'set-url', 'origin', 'git@github.com:acme/app.git');
         const sshCalls = join(root, 'ssh-called');
         const ssh = join(root, 'ssh.sh');
         writeFileSync(ssh, `#!/bin/sh\necho called >> '${sshCalls}'\necho 'Permission denied (publickey)' >&2\nexit 255\n`, { mode: 0o700 });
         git(repo, 'config', 'core.sshCommand', `sh '${ssh}'`);
-        return sshCalls;
-    }
-
-    it.each(['remote-status', 'pull-remote'] as const)('%s uses the signed address for both branches without an SSH login', async (op) => {
-        git(repo, 'push', '--quiet', bare, 'main:collab-x');
-        git(repo, 'switch', '--quiet', '-c', 'collab-x');
-        pushOnline('online.txt', 'o');
-        const sshCalls = sshOrigin();
 
         const head = git(repo, 'rev-parse', 'HEAD');
         const answer = await call(op, {
