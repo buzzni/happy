@@ -30,7 +30,7 @@ for arg in "$@"; do
     case "$p" in
         node|node.exe|electron|Electron|happy|happy-cli|caffeinate)
             echo "happy-guard: blocked — killing '$arg' would take down the happy daemon and every agent session on this machine (they all run on node)." >&2
-            echo "Instead: kill the specific PID you started (kill <PID>), or use a narrow pattern like: pkill -f vitest" >&2
+            echo "Instead: kill the specific PID you started (kill <PID>), or a pattern only your own processes match, options first: pkill -U \\"\\$(id -u)\\" -f '<your worktree>/node_modules/.bin/vitest'" >&2
             exit 87
             ;;
     esac
