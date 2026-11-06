@@ -175,6 +175,7 @@ import {
   shareInFlight,
 } from './resumeGuards';
 import { decideResumeCursorPersist } from './resumeCursorPersistence';
+import { createSessionRetention } from './sessionRetention';
 import { stageInitialPromptEnvironment } from '@/utils/initialPrompt';
 import { outputFormatSeed, STRUCTURED_OUTPUT_CAPABILITY } from '@/claude/structuredOutput';
 import {
@@ -3706,6 +3707,7 @@ export async function startDaemon(): Promise<void> {
     // yet — the guard measures their report silence from this moment, not from
     // their (possibly days-old) session start.
     const daemonStartedAt = Date.now();
+    const sessionRetention = createSessionRetention({ home: configuration.happyHomeDir, children: () => getCurrentChildren().filter(session => isPidAlive(session.pid)) });
 
     // The entry `stopSession` below would pick, without touching it. Same two
     // conditions on purpose: the verification must snapshot the process the
@@ -3748,7 +3750,13 @@ export async function startDaemon(): Promise<void> {
               return { stopped: false, reason: 'active', guard: decision.guard, activity: decision.activity };
             }
           } else if (mode === 'if-idle') {
+            let retention;
+            try { retention = session.happySessionId ? sessionRetention.record(session.happySessionId) : undefined; }
+            catch {
+              if (context?.source !== 'session-zombie-sweep') return { stopped: false, reason: 'active', guard: 'retention-store-unavailable', activity: { thinking: false, hasOpenToolCall: false, pendingUserInput: false } };
+            }
             const decision = evaluateIdleStopGuard({
+              retention,
               runtime: session.runtime,
               sessionStartedAt: sessionStartTimes.get(pid),
               daemonStartedAt,
@@ -4220,6 +4228,7 @@ export async function startDaemon(): Promise<void> {
       handingOff: () => restartDrainRuntime?.controlPort.handingOff() ?? false,
     };
     const { port: controlPort, stop: stopControlServer, controlSecret } = await startDaemonControlServer({
+      ...(managedRuntimeActive ? {} : { sessionRetention }),
       restartDrain: restartDrainControlPort,
       getCallerLaunches: () => callerLaunches,
       getSetupTokenAccountSwitch: () => setupTokenAccountSwitch,
@@ -5557,6 +5566,7 @@ export async function startDaemon(): Promise<void> {
     const prepareBrowserSessionReconnect = createBrowserSessionReconnect();
     // Set RPC handlers
     apiMachine.setRPCHandlers({
+      ...(managedRuntimeActive ? {} : { sessionRetention }),
       ownedSpawn,
       daemonSessionState: createDaemonSessionStateHandler(getCurrentChildren),
       byosOfflineReceive,
