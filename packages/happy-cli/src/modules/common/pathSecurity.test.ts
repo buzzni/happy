@@ -33,6 +33,19 @@ describe('validatePath', () => {
         expect(result.error).toContain('outside the working directory');
     });
 
+    it('should allow paths inside a folder the machine owner approved outside the working directory', () => {
+        const approved = [resolve('/srv/workspace')];
+
+        expect(validatePath(resolve('/srv/workspace/hmall_ui/src'), workingDir, approved)).toEqual({
+            valid: true,
+            resolvedPath: resolve('/srv/workspace/hmall_ui/src'),
+        });
+        expect(validatePath(resolve('/srv/workspace'), workingDir, approved).valid).toBe(true);
+        expect(validatePath(resolve('/srv/workspace-other'), workingDir, approved).valid).toBe(false);
+        expect(validatePath(resolve('/srv/workspace/../secrets'), workingDir, approved).valid).toBe(false);
+        expect(validatePath('../../../srv/workspace/x', workingDir, approved).valid).toBe(true);
+    });
+
     it('should allow the working directory itself', () => {
         expect(validatePath('.', workingDir)).toEqual({
             valid: true,

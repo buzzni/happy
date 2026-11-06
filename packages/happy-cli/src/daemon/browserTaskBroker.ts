@@ -65,12 +65,31 @@ export function browserTaskLineage(options: { parentSessionId?: string; resumeCl
         : undefined
 }
 
+export type BrowserTaskRegistration = { registrationId: string; sessionSecret: string }
+/** A registration refused with a code (never free text) the session can show its agent. */
+export type BrowserTaskRegistrationRefusal = { unavailableReason: string }
+export type BrowserTaskRegistrationResult = BrowserTaskRegistration | BrowserTaskRegistrationRefusal | undefined
+
+/** Why a session process got no browser task secret; read once by its MCP server, like the secret. */
+export const BROWSER_TASK_UNAVAILABLE_REASON_ENV = 'HAPPY_BROWSER_TASK_UNAVAILABLE_REASON'
+/** The native issuer's own refusal codes only (NATIVE_DEVICE_APPROVAL_REQUIRED, ...); other errors stay in the log. */
+export const BROWSER_TASK_UNAVAILABLE_REASON_PATTERN = /^NATIVE_[A-Z_]{1,72}$/
+
+/** What a registration result hands the session process: its secret, or the refusal code, and the registration to bind. */
+export function browserTaskSpawnSeed(result: BrowserTaskRegistrationResult): { registration?: BrowserTaskRegistration; environment: Record<string, string> } {
+    if (!result) return { environment: {} }
+    return 'sessionSecret' in result
+        ? { registration: result, environment: { HAPPY_BROWSER_TASK_SESSION_SECRET: result.sessionSecret } }
+        : { environment: { [BROWSER_TASK_UNAVAILABLE_REASON_ENV]: result.unavailableReason } }
+}
+
 export interface BrowserTaskSessionBroker {
     /**
      * `lineage`: a fork or recovery (the Runtime refuses a conversation of an earlier profile assignment).
      * `attestation`: Studio's session-user attestation of a new chat (shared machines).
+     * A refusal carries a reason only when the request failed with a code (e.g. NATIVE_DEVICE_APPROVAL_REQUIRED).
      */
-    register(lineage?: BrowserTaskLineage, attestation?: string): Promise<{ registrationId: string; sessionSecret: string } | undefined>
+    register(lineage?: BrowserTaskLineage, attestation?: string): Promise<BrowserTaskRegistrationResult>
     /**
      * True once bound, or while a transient refusal (admission held) is retried in the background, which
      * revokes the registration itself if the Runtime then denies it or the deadline passes. False: denied
@@ -85,6 +104,8 @@ export interface BrowserTaskSessionBroker {
     retryPendingRevocations(): Promise<number>
     /** Whether a revocation of this target is still unconfirmed (queued for retry). */
     isRevocationPending(target: RevokeTarget): boolean
+    /** The native refusal code (NATIVE_*) that left this revocation unconfirmed, if that was the cause. */
+    revocationRefusal?(target: RevokeTarget): string | undefined
     /** Whether a task of the session waits for the user; throws when the Runtime gives no answer. */
     waiting(agentSessionId: string): Promise<boolean>
 }
@@ -171,10 +192,10 @@ function writeQueueFileDurably(file: string, data: string): void {
  * accepts Studio's session-user attestation at spawn; tenancyMode lets Studio refuse a machine it thinks is
  * of the other mode. Absent elsewhere and on older daemons, which Studio sends no attestation to.
  */
-export function agentBrowserMachineCapability(env: NodeJS.ProcessEnv = process.env): { protocol: 2; tenancyMode: 'dedicated' | 'shared'; hostMode: 'browser-only' | 'dedicated-host'; profileId?: string } | undefined {
+export function agentBrowserMachineCapability(env: NodeJS.ProcessEnv = process.env): { protocol: 2; desktopLogin?: 1; tenancyMode: 'dedicated' | 'shared'; hostMode: 'browser-only' | 'dedicated-host'; profileId?: string } | undefined {
     if (!env.HAPPY_BROWSER_TASK_RUNTIME_URL) return undefined
     const profileId = env.HAPPY_BROWSER_TASK_PROFILE_ID
-    return { ...(env.HAPPY_BROWSER_TASK_TENANCY !== 'shared' && typeof profileId === 'string' && profileId.length > 0 && profileId.length <= 256 && profileId.trim() === profileId ? { profileId } : {}), protocol: 2, tenancyMode: env.HAPPY_BROWSER_TASK_TENANCY === 'shared' ? 'shared' : 'dedicated', hostMode: env.HAPPY_BROWSER_TASK_HOST_MODE === 'browser-only' ? 'browser-only' : 'dedicated-host' }
+    return { ...(env.HAPPY_BROWSER_TASK_DESKTOP_LOGIN === '1' && env.HAPPY_BROWSER_TASK_TENANCY !== 'shared' ? { desktopLogin: 1 as const } : {}), ...(env.HAPPY_BROWSER_TASK_TENANCY !== 'shared' && typeof profileId === 'string' && profileId.length > 0 && profileId.length <= 256 && profileId.trim() === profileId ? { profileId } : {}), protocol: 2, tenancyMode: env.HAPPY_BROWSER_TASK_TENANCY === 'shared' ? 'shared' : 'dedicated', hostMode: env.HAPPY_BROWSER_TASK_HOST_MODE === 'browser-only' ? 'browser-only' : 'dedicated-host' }
 }
 
 /**
@@ -215,7 +236,7 @@ export function createBrowserTaskSessionBroker(
     const headers: Record<string, string> = daemonToken ? { 'x-abp-daemon-token': daemonToken } : {}
     if (options.native) request = createNativeBrokerRequest(options.native, request)
     /** The reply status, or 0 when the socket was unreachable. */
-    const send = async (path: string, body: Record<string, unknown>): Promise<{ status: number; result?: Record<string, unknown>; transient?: boolean }> => {
+    const send = async (path: string, body: Record<string, unknown>): Promise<{ status: number; result?: Record<string, unknown>; transient?: boolean; unavailableReason?: string }> => {
         try {
             const reply = await request(socketPath, 'POST', path, headers, { schemaVersion: 1, ...body })
             if (reply.status === 200 && reply.body.ok) return { status: 200, result: reply.body.result as Record<string, unknown> }
@@ -225,7 +246,9 @@ export function createBrowserTaskSessionBroker(
             return { status: reply.status, transient: reply.status === 503 && reply.body.error?.code === 'RUNTIME_UNAVAILABLE' && reply.body.error?.retryable === true }
         } catch (error) {
             logger.debug(`[DAEMON RUN] Browser task broker ${path} unreachable: ${error instanceof Error ? error.message : 'unknown'}`)
-            return { status: 0 }
+            // The native issuer refuses with a code (an organization PC without device approval); free text stays in the log.
+            const code = error instanceof Error && BROWSER_TASK_UNAVAILABLE_REASON_PATTERN.test(error.message) ? error.message : undefined
+            return { status: 0, ...(code ? { unavailableReason: code } : {}) }
         }
     }
 
@@ -249,9 +272,11 @@ export function createBrowserTaskSessionBroker(
         }
     }
     /** Confirmed (200) and invalid requests (400, never retryable) leave the queue. */
+    const refusals = new Map<string, string>()
     const attempt = async (target: RevokeTarget): Promise<void> => {
         // Explicitly preserve logical tasks on exits, reconciliation, and replacement registration.
-        const { status } = await send('/v1/sessions/revoke', { ...target, endSession: false })
+        const { status, unavailableReason } = await send('/v1/sessions/revoke', { ...target, endSession: false })
+        if (unavailableReason) refusals.set(key(target), unavailableReason); else refusals.delete(key(target))
         if (status !== 200 && status !== 400) return
         pending = pending.filter((entry) => key(entry) !== key(target))
         savePending()
@@ -322,9 +347,10 @@ export function createBrowserTaskSessionBroker(
                 reply = await send('/v1/sessions/register', body)
             }
             const result = reply.result
-            return typeof result?.registrationId === 'string' && typeof result.sessionSecret === 'string'
-                ? { registrationId: result.registrationId, sessionSecret: result.sessionSecret }
-                : undefined
+            if (typeof result?.registrationId === 'string' && typeof result.sessionSecret === 'string') {
+                return { registrationId: result.registrationId, sessionSecret: result.sessionSecret }
+            }
+            return reply.unavailableReason ? { unavailableReason: reply.unavailableReason } : undefined
         },
         async bind(registrationId, agentSessionId, pid) {
             let owner: SessionOwner | undefined
@@ -398,6 +424,7 @@ export function createBrowserTaskSessionBroker(
         },
         retryPendingRevocations,
         isRevocationPending: (target) => pending.some((entry) => key(entry) === key(target)),
+        revocationRefusal: (target) => pending.some((entry) => key(entry) === key(target)) ? refusals.get(key(target)) : undefined,
     }
     return broker
 }
@@ -408,17 +435,21 @@ export function createBrowserTaskSessionBroker(
  * have); while that revocation is unconfirmed nothing is registered, because the queued retry revokes by
  * session id and would take the new binding with it. The caller binds the result once the child runs.
  */
-export async function registerResumedBrowserSession(broker: BrowserTaskSessionBroker | undefined, agentSessionId: string): Promise<{ registrationId: string; sessionSecret: string } | undefined> {
+export async function registerResumedBrowserSession(broker: BrowserTaskSessionBroker | undefined, agentSessionId: string): Promise<BrowserTaskRegistrationResult> {
     if (!broker) return undefined
     await broker.revoke({ agentSessionId }).catch(() => undefined)
-    if (broker.isRevocationPending({ agentSessionId })) return undefined
+    if (broker.isRevocationPending({ agentSessionId })) {
+        // Still registers nothing; a native refusal (an organization PC without device approval) still reaches the agent.
+        const unavailableReason = broker.revocationRefusal?.({ agentSessionId })
+        return unavailableReason ? { unavailableReason } : undefined
+    }
     // The session itself is the lineage: only a session bound in the current assignment gets a grant again.
     return broker.register({ parentSessionIds: [agentSessionId] })
 }
 
 /**
  * Resumed session processes need their own registration: the previous process's one was revoked at its exit.
- * Registers (registerResumedBrowserSession), hands the secret to the spawn, binds the known session id, and
+ * Registers (registerResumedBrowserSession), hands the secret (or the refusal code) to the spawn, binds the known session id, and
  * revokes it if the spawn does not succeed.
  */
 export async function spawnResumedWithBrowserTaskRegistration<R extends { type: string }>(input: {
@@ -430,12 +461,12 @@ export async function spawnResumedWithBrowserTaskRegistration<R extends { type: 
     onRevokeFailure: (error: unknown) => void
 }): Promise<R> {
     const { broker, agentSessionId } = input
-    const registration = await registerResumedBrowserSession(broker, agentSessionId)
-    if (!broker || !registration) return input.spawn(input.env)
+    const { registration, environment } = browserTaskSpawnSeed(await registerResumedBrowserSession(broker, agentSessionId))
+    if (!broker || !registration) return input.spawn({ ...input.env, ...environment })
     const release = () => broker.revoke({ registrationId: registration.registrationId }).catch(input.onRevokeFailure)
     let result: R
     try {
-        result = await input.spawn({ ...input.env, HAPPY_BROWSER_TASK_SESSION_SECRET: registration.sessionSecret })
+        result = await input.spawn({ ...input.env, ...environment })
     } catch (error) {
         await release()
         throw error

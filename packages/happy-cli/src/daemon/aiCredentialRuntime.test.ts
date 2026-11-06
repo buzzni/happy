@@ -334,6 +334,28 @@ describe('AI credential machine runtime', () => {
       expect(JSON.parse(files.get(poolPath)!).accounts[0].refreshToken).toBe('rotated-account-a')
     })
 
+    it.each([
+      { name: 'another account', accountId: 'account-b', sub: 'user' },
+      { name: 'another user of the same workspace', accountId: 'account-a', sub: 'other-user' },
+    ])('does not store the login of $name when the live Codex home switches during the refresh', async ({ accountId, sub }) => {
+      const { runtime, files, pool, execFile } = owner()
+      const other = `header.${Buffer.from(JSON.stringify({ sub, exp: Math.floor((NOW + 10 * DAY) / 1000) })).toString('base64url')}.signature`
+      files.set(livePath, JSON.stringify({ auth_mode: 'chatgpt', tokens: { account_id: 'account-a', access_token: pool.accounts[0]!.accessToken, refresh_token: 'refresh-a', id_token: 'id' } }))
+      const driver = execFile.getMockImplementation()!
+      execFile.mockImplementation(async (command, args, options) => {
+        if (command === process.execPath && args[0] === '-e') {
+          files.set(livePath, JSON.stringify({ auth_mode: 'chatgpt', tokens: { account_id: accountId, access_token: other, refresh_token: 'other-login', id_token: 'id' } }))
+          return { stdout: '', stderr: '' }
+        }
+        return driver(command, args, options)
+      })
+
+      const result = await runtime.refreshCodexOwner({ provider: 'codex', thresholdMs: 3 * DAY })
+
+      expect(JSON.parse(files.get(poolPath)!).accounts[0]).toMatchObject({ accountId: 'account-a', refreshToken: 'refresh-a', accessToken: pool.accounts[0]!.accessToken })
+      expect(result).toMatchObject({ refreshedAccountIds: [], failedAccounts: [{ accountId: 'account-a', errorKind: 'CODEX_OWNER_REFRESH_RACED' }] })
+    })
+
     it('keeps a login Codex already rotated even when the driver then fails', async () => {
       const { runtime, files } = owner({ failsAfterRotating: true })
 
@@ -2213,6 +2235,94 @@ describe('AI credential machine runtime', () => {
     expect(execFile).toHaveBeenCalledWith('npm', [
       'install', '--global', 'codex-multi-auth@2.16.0',
     ], expect.anything())
+  })
+
+  // 2026-11-03 Mac: npm's global bin was not on PATH, so every install missed the 2.25.0 CLI found first and apply never converged.
+  it('runs codex-multi-auth from npm\'s global bin, so the pinned install reaches the CLI it checks', async () => {
+    let files!: Map<string, string>
+    const cliOnPath = (environment?: NodeJS.ProcessEnv) => environment?.PATH?.split(':')[0] === '/global/bin' && files.has('/global/lib/node_modules/codex-multi-auth/package.json') ? '2.16.0' : '2.25.0'
+    const execFile = vi.fn(async (command: string, args: string[], options?: { environment?: NodeJS.ProcessEnv }) => {
+      if (command === 'codex-multi-auth' && args[0] === '--version') return { stdout: `${cliOnPath(options?.environment)}\n`, stderr: '' }
+      if (command === 'npm' && args[0] === 'root') return { stdout: '/global/lib/node_modules\n', stderr: '' }
+      if (command === 'npm' && args[0] === 'install') files.set('/global/lib/node_modules/codex-multi-auth/package.json', JSON.stringify({ version: '2.16.0' }))
+      return { stdout: '', stderr: '' }
+    })
+    const configured = setup({ execFile, env: { PATH: '/tools/bin:/usr/bin' } })
+    files = configured.files
+    files.delete('/global/node_modules/codex-multi-auth/package.json')
+
+    await expect(configured.runtime.apply({
+      provider: 'codex', payload: JSON.stringify(codexMultiAuthBundle()),
+    })).resolves.toMatchObject({ configured: true })
+    const cliCalls = execFile.mock.calls.filter(([command]) => command === 'codex-multi-auth')
+    expect(cliCalls.length).toBeGreaterThan(0)
+    for (const [, , options] of cliCalls) expect(options?.environment?.PATH).toBe('/global/bin:/tools/bin:/usr/bin')
+  })
+
+  it('refreshes npm global root between captures on the same runtime', async () => {
+    let npmRoot = '/old/lib/node_modules'
+    const execFile = vi.fn(async (command: string, args: string[], options?: { environment?: NodeJS.ProcessEnv }) => {
+      if (command === 'npm' && args[0] === 'root') return { stdout: npmRoot, stderr: '' }
+      if (command === 'codex-multi-auth' && args[0] === '--version') {
+        return { stdout: options?.environment?.PATH?.split(':')[0] === '/old/bin' ? '2.16.0' : '2.19.0', stderr: '' }
+      }
+      return { stdout: '', stderr: '' }
+    })
+    const { runtime, files } = setup({ execFile, platform: 'linux', env: { PATH: '/new/bin:/old/bin:/usr/bin' } })
+    files.set('/old/lib/node_modules/codex-multi-auth/package.json', JSON.stringify({ version: '2.16.0' }))
+    files.set('/new/lib/node_modules/codex-multi-auth/package.json', JSON.stringify({ version: '2.19.0' }))
+    files.set('/home/operator/.codex/multi-auth/openai-codex-accounts.json', JSON.stringify(codexMultiAuthBundle().accounts))
+
+    expect(JSON.parse((await runtime.capture({ provider: 'codex' })).payload).packageVersion).toBe('2.16.0')
+    npmRoot = '/new/lib/node_modules'
+    for (let attempt = 0; attempt < 2; attempt++) {
+      expect(JSON.parse((await runtime.capture({ provider: 'codex' })).payload).packageVersion).toBe('2.19.0')
+    }
+  })
+
+  it('refreshes npm global root after installing codex-multi-auth', async () => {
+    let npmRoot = '/old/lib/node_modules'
+    let files!: Map<string, string>
+    const execFile = vi.fn(async (command: string, args: string[], options?: { environment?: NodeJS.ProcessEnv }) => {
+      if (command === 'npm' && args[0] === 'root') return { stdout: npmRoot, stderr: '' }
+      if (command === 'npm' && args[0] === 'install') {
+        npmRoot = '/new/lib/node_modules'
+        files.set('/new/lib/node_modules/codex-multi-auth/package.json', JSON.stringify({ version: '2.16.0' }))
+      }
+      if (command === 'codex-multi-auth' && args[0] === '--version') {
+        return { stdout: options?.environment?.PATH?.split(':')[0] === '/old/bin' ? '2.8.4' : '2.16.0', stderr: '' }
+      }
+      return { stdout: '', stderr: '' }
+    })
+    const configured = setup({ execFile, platform: 'linux', env: { PATH: '/new/bin:/old/bin:/usr/bin' } })
+    files = configured.files
+    files.set('/old/lib/node_modules/codex-multi-auth/package.json', JSON.stringify({ version: '2.8.4' }))
+
+    await expect(configured.runtime.apply({
+      provider: 'codex', payload: JSON.stringify(codexMultiAuthBundle()),
+    })).resolves.toMatchObject({ configured: true })
+    expect(execFile).toHaveBeenCalledWith('npm', ['install', '--global', 'codex-multi-auth@2.16.0'], expect.anything())
+    const cliCalls = execFile.mock.calls.filter(([command]) => command === 'codex-multi-auth')
+    expect(cliCalls[0]?.[2]?.environment?.PATH?.split(':')[0]).toBe('/old/bin')
+    for (const [, , options] of cliCalls.slice(1)) expect(options?.environment?.PATH?.split(':')[0]).toBe('/new/bin')
+  })
+
+  it('uses one npm global root for CLI and package metadata inspection', async () => {
+    let npmRoot = '/old/lib/node_modules'
+    const execFile = vi.fn(async (command: string, args: string[]) => {
+      if (command === 'npm' && args[0] === 'root') return { stdout: npmRoot, stderr: '' }
+      if (command === 'codex-multi-auth' && args[0] === '--version') {
+        npmRoot = '/new/lib/node_modules'
+        return { stdout: '2.16.0', stderr: '' }
+      }
+      return { stdout: '', stderr: '' }
+    })
+    const { runtime, files } = setup({ execFile, platform: 'linux' })
+    files.set('/old/lib/node_modules/codex-multi-auth/package.json', JSON.stringify({ version: '2.16.0' }))
+    files.set('/new/lib/node_modules/codex-multi-auth/package.json', JSON.stringify({ version: '2.19.0' }))
+    files.set('/home/operator/.codex/multi-auth/openai-codex-accounts.json', JSON.stringify(codexMultiAuthBundle().accounts))
+
+    expect(JSON.parse((await runtime.capture({ provider: 'codex' })).payload).packageVersion).toBe('2.16.0')
   })
 
   it('preserves untouched Codex multi-auth files when a later backup fails', async () => {

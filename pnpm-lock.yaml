@@ -8,6 +8,7 @@ overrides:
   whatwg-url: 14.2.0
   parse-path: 7.0.3
   '@types/parse-path': 7.0.3
+  pglite-prisma-adapter>@prisma/driver-adapter-utils: 6.19.2
 
 importers:
 
@@ -931,8 +932,8 @@ importers:
         specifier: 0.96.0
         version: 0.96.0(zod@4.4.3)
       '@buzzni/saycode-cli':
-        specifier: 0.9.10
-        version: 0.9.10
+        specifier: 0.9.12
+        version: 0.9.12
       '@modelcontextprotocol/sdk':
         specifier: 1.29.0
         version: 1.29.0(zod@4.4.3)
@@ -1161,8 +1162,8 @@ importers:
         specifier: ^5.0.3
         version: 5.0.5
       pglite-prisma-adapter:
-        specifier: ^0.7.2
-        version: 0.7.2(@electric-sql/pglite@0.3.15)(@prisma/client@6.19.2(prisma@6.19.2(typescript@5.9.3))(typescript@5.9.3))
+        specifier: 0.6.1
+        version: 0.6.1(@electric-sql/pglite@0.3.15)(@prisma/client@6.19.2(prisma@6.19.2(typescript@5.9.3))(typescript@5.9.3))
       pino:
         specifier: ^10.3.0
         version: 10.3.0
@@ -2029,8 +2030,8 @@ packages:
   '@bufbuild/protobuf@1.10.1':
     resolution: {integrity: sha512-wJ8ReQbHxsAfXhrf9ixl0aYbZorRuOWpBNzm8pL8ftmSxQx/wnJD5Eg861NwJU/czy2VXFIebCeZnZrI9rktIQ==}
 
-  '@buzzni/saycode-cli@0.9.10':
-    resolution: {integrity: sha512-JffTBfGZ0mm5KrMicnLOp/mNLAFNOkvSazOljPeAMt+dD6j9IY1sWsRdWp67Fr6FqJrf/YpBfXpB3xXyYd6ZVg==}
+  '@buzzni/saycode-cli@0.9.12':
+    resolution: {integrity: sha512-HoBwVo6jjcLSmryCOWAKgYsP27YuZ0uCkRsLvSznvGLosbse64kPhGa68WxbvGI5304SlnWYT1G6oOJ8dG0w7Q==}
     engines: {node: '>=20'}
     hasBin: true
 
@@ -12962,6 +12963,15 @@ packages:
     peerDependencies:
       '@types/emscripten': '>=1.39.6'
 
+  '@prisma/driver-adapter-utils@6.19.2':
+    resolution: {integrity: sha512-tkHsL3jhx81eXg2oqtJH/1IEs8uEeUb1RpqHtwYqdNb176u9D0mnHRZM1/cKca/XhLpq49Nnd9XDxdMfWcKAYA==}
+
+  pglite-prisma-adapter@0.6.1:
+    resolution: {integrity: sha512-Qb2rVecLSSngq+xPBLzMcqFkrCgCXNi2cuVAa009kOMiinqUmdGkEw6ZKpL0zeiEc9+YbLOy3PY8uKtMPA4P3Q==}
+    peerDependencies:
+      '@electric-sql/pglite': '>=0.2.0'
+      '@prisma/client': '>= 6.10.0'
+
 snapshots:
 
   '@agentclientprotocol/sdk@0.14.1(zod@4.4.3)':
@@ -13798,7 +13808,7 @@ snapshots:
 
   '@bufbuild/protobuf@1.10.1': {}
 
-  '@buzzni/saycode-cli@0.9.10': {}
+  '@buzzni/saycode-cli@0.9.12': {}
 
   '@chevrotain/cst-dts-gen@11.0.3':
     dependencies:
@@ -26694,3 +26704,14 @@ snapshots:
     dependencies:
       '@types/emscripten': 1.41.5
       type-fest: 5.5.0
+
+  '@prisma/driver-adapter-utils@6.19.2':
+    dependencies:
+      '@prisma/debug': 6.19.2
+
+  pglite-prisma-adapter@0.6.1(@electric-sql/pglite@0.3.15)(@prisma/client@6.19.2(prisma@6.19.2(typescript@5.9.3))(typescript@5.9.3)):
+    dependencies:
+      '@electric-sql/pglite': 0.3.15
+      '@prisma/client': 6.19.2(prisma@6.19.2(typescript@5.9.3))(typescript@5.9.3)
+      '@prisma/driver-adapter-utils': 6.19.2
+      postgres-array: 3.0.4

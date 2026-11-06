@@ -386,6 +386,26 @@ describe('BrowserRuntime durable request contract', () => {
         await h.store.close()
     })
 
+    it('gives back a user lease on a task whose agent write has an unknown outcome', async () => {
+        const h = await createHarness('abp-runtime-release-agent-uncertain-')
+        const uiCredential: InteractiveCapability = { kind: 'interactive', capabilityId: 'release-uncertain-ui' as never,
+            principalId: 'p' as never, workspaceId: 'w' as never, machineId: 'm' as never, viewerSessionId: 'viewer',
+            profileId: h.profileId, operations: ['takeOver', 'releaseControl'], issuedAtMs: 0, expiresAtMs: 3_600_000 }
+        const uiAuth = { credential: uiCredential, verifiedAtMs: h.clock.now() }
+        const taken = await h.runtime.takeOver(uiAuth, { taskId: h.task.taskId, tabId: h.opened.tabId,
+            expectedEpoch: h.runtime.leases.owner(h.opened.tabId, h.profileId).leaseEpoch, requestId: 'take-uncertain' as RequestId })
+        // A takeover over an in-flight agent write records it as uncertain; such entries are never cleared.
+        await h.store.mutate(h.task.taskId, (current) => ({ patch: { uncertainActions: ['agent-write' as never] },
+            event: { schemaVersion: 1, taskId: current.taskId, seq: 0, stateVersion: current.stateVersion + 1, type: 'state-changed',
+                atMs: h.clock.now(), leaseEpoch: 0, data: {} } as never }))
+        // Only a human page input still draining may hold the release; otherwise the lease would fence the profile for good.
+        const released = await h.runtime.releaseControl(uiAuth, { taskId: h.task.taskId, tabId: h.opened.tabId,
+            expectedEpoch: taken.leaseEpoch, requestId: 'release-uncertain' as RequestId })
+        expect(released.owner.kind).toBe('none')
+        expect(h.runtime.leases.owner(h.opened.tabId, h.profileId).owner.kind).toBe('none')
+        await h.store.close()
+    })
+
     it('restores a disconnected task when the browser instance is unchanged', async () => {
         const h = await createHarness('abp-runtime-driver-resume-')
         await h.runtime.onDriverDisconnected(h.profileId)

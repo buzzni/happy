@@ -17,6 +17,11 @@ on:
       - '.github/workflows/cli-smoke-test.yml'
   workflow_dispatch:
 
+env:
+  # The workspace also installs codium's Electron dev dependency. CLI/server
+  # smoke tests never launch it, so avoid its unrelated binary download.
+  ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+
 jobs:
   smoke-test-linux:
     runs-on: ubuntu-latest
@@ -48,6 +53,14 @@ jobs:
 
     - name: Build package
       run: pnpm --filter @buzzni/happy-cli build
+
+    - name: Verify Desktop login scope, app loss and idle reconnect
+      timeout-minutes: 5
+      run: >-
+        pnpm --filter @buzzni/happy-cli exec vitest run --project unit
+        src/browserRuntime/desktopBrowserLogin.test.ts
+        src/daemon/personalBrowserRuntime.test.ts
+        src/daemon/browserSessionReconnect.test.ts
 
     - name: Verify personal Claude authentication with the real SDK
       if: matrix.node-version == 24
@@ -164,7 +177,10 @@ jobs:
         echo "happy server smoke test passed (booted + Prisma query engine OK)"
 
   smoke-test-windows:
-    runs-on: windows-latest
+    # pnpm 10.11 bundles node-gyp 11.1, which cannot detect Visual Studio 2026
+    # on windows-latest. Keep VS 2022 available for native dependency builds
+    # when a Node version has no prebuilt better-sqlite3 binary.
+    runs-on: windows-2022
     strategy:
       matrix:
         node-version: [20, 24]
@@ -187,6 +203,14 @@ jobs:
 
     - name: Build package
       run: pnpm --filter @buzzni/happy-cli build
+
+    - name: Verify Desktop login scope, app loss and idle reconnect
+      timeout-minutes: 5
+      run: >-
+        pnpm --filter @buzzni/happy-cli exec vitest run --project unit
+        src/browserRuntime/desktopBrowserLogin.test.ts
+        src/daemon/personalBrowserRuntime.test.ts
+        src/daemon/browserSessionReconnect.test.ts
 
     - name: Pack package
       run: |

@@ -45,6 +45,9 @@ function describeError(error: BrowserClientError): string {
     switch (error.code) {
         case 'NO_EXTENSION_CONNECTED':
             return PAIRING_HINT
+        case 'VIEWER_NOT_CONNECTED':
+            // Pasting the token again would only recreate the same machine-wide pairing.
+            return `${error.message}. Do not ask for the token. With Saycode running on this computer, ask the user to click the Happy Browser Bridge extension icon in Chrome and press 연결 on its settings page to connect it to their account.`
         case 'BRIDGE_PORT_IN_USE':
             // The extension is paired — with another Saycode/happy daemon on this machine. Re-pairing
             // cannot help; this daemon takes the port over by itself once that process exits.

@@ -126,7 +126,7 @@ export function registerTurnCardTools(mcp: McpServer, options: {
         }
         return reply(args.question
             ? 'Shown: the card with your recap, question and buttons is under this turn. Write nothing more; the user answers with a button or a message.'
-            : 'Shown: the recap is under this turn. If you have more to say, say it now in a short closing message.');
+            : 'Shown: the recap is under this turn. Do not repeat your answer or the recap. Only if something new is left to say, add one short sentence; otherwise end the turn.');
     }));
 
     mcp.registerTool('archive_conversation', {

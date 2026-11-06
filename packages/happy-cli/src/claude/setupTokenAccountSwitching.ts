@@ -3,8 +3,8 @@ import type { SetupTokenRotationState } from '@/api/types'
  * Moves a setup-token-bound Claude session off a used-up organization account (Saycode
  * specs/claude-setup-token-account-selection, stage 3).
  *
- * The provider's own `rate_limit_event`s say how full the bound account is. Once a window reaches
- * 95% or a request is refused, the next turn boundary asks the daemon for another account; Studio
+ * The provider's own `rate_limit_event`s say how full the bound account is. Once a window reaches its
+ * used-up share (five-hour 95%, weekly 98%) or a request is refused, the next turn boundary asks the daemon for another account; Studio
  * chooses it and the daemon verifies the grant like a launch. The launcher then restarts the provider
  * on the same Claude conversation with the new token. A refused turn is continued automatically.
  *
@@ -22,7 +22,7 @@ export type SetupTokenAccountSwitchingDeps = {
   /** The binding record the running provider started with; the daemon books usage and switches against exactly it. */
   binding(): string | undefined
   report(sessionId: string, binding: string, observation: SetupTokenUsageObservation, signal?: AbortSignal): Promise<Outcome>
-  rebind(sessionId: string, binding: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal, options?: { startBudget: true }): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string; retryAfterMs?: number }>
+  rebind(sessionId: string, binding: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal, options?: { startBudget: true } | { startExhausted: true }): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string; retryAfterMs?: number }>
   applyEnvironment(environment: Record<string, string>): void
   notify(message: string): void
   notifyState?(message: string, state: SetupTokenRotationState): void
@@ -96,11 +96,11 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
   }
 
   /** `startBudget`: the bound account only ran out of start budget; a failed move changes nothing and the turn keeps waiting. */
-  async function switchOnce(sessionId: string, binding: string, startBudget = false) {
+  async function switchOnce(sessionId: string, binding: string, startBudget = false, startExhausted = false) {
     const epoch = cancelEpoch, user = userEpoch
-    if (refused && !startBudget) retryDeadline ??= now() + retryWindowMs
+    if (refused && !startBudget && !startExhausted) retryDeadline ??= now() + retryWindowMs
     if (deps.notifyState && !startBudget) tell('The session is switching organization Claude accounts.', 'switching')
-    const result = await (startBudget ? deps.rebind(sessionId, binding, undefined, cancellation.signal, { startBudget: true }) : deps.rebind(sessionId, binding, latestObservation, cancellation.signal))
+    const result = await (startBudget ? deps.rebind(sessionId, binding, undefined, cancellation.signal, { startBudget: true }) : startExhausted ? deps.rebind(sessionId, binding, undefined, cancellation.signal, { startExhausted: true }) : deps.rebind(sessionId, binding, latestObservation, cancellation.signal))
       .catch(() => ({ ok: false as const, reason: 'REQUEST_FAILED' }))
     if (disposed || paused || epoch !== cancelEpoch) return { switched: false, continueAfter: false }
     if (!result.ok && startBudget) {
@@ -118,7 +118,7 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
         wanted = false
         if (result.reason === 'FORBIDDEN') stop()
       }
-      if (AWAITED.has(result.reason) && refused) {
+      if (AWAITED.has(result.reason) && refused && !startExhausted) {
         if (result.reason !== 'NO_ACCOUNT') tell(result.reason === 'APPLY_REQUIRED' || result.reason === 'BINDING_REJECTED' ? APPLY_REQUIRED_NOTICE : 'The organization account service is temporarily unavailable. The session will retry.', result.reason === 'APPLY_REQUIRED' || result.reason === 'BINDING_REJECTED' ? 'apply-required' : 'retrying')
         startBackground()
       }
@@ -139,15 +139,15 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
     if (!startBudget) switches++
     told.clear(); lastReportAt = -Infinity; lastReportedExhausted = false
     logger.debug(`[setup-token-switch] session ${sessionId} moved to another organization account (${startBudget ? 'start budget' : `${switches} of ${MAX_SWITCHES}`})`)
-    const continueAfter = !startBudget && refused && user === userEpoch
+    const continueAfter = !startBudget && !startExhausted && refused && user === userEpoch
     refused = false; authenticationFailed = false; lastFailure = null; latestObservation = undefined; retryDeadline = null; retryAfterMs = 0
     emit(startBudget ? START_BUDGET_SWITCHED_NOTICE : switchedAfterAuthenticationFailure ? 'This organization Claude account could not authenticate, so the session moved to another organization account.' : SWITCHED_NOTICE, 'switched')
     return { switched: true, continueAfter }
   }
 
   /** One switch per session at a time: a turn boundary and a background attempt share it. */
-  function attempt(sessionId: string, binding: string, startBudget = false) {
-    inFlight ??= switchOnce(sessionId, binding, startBudget).finally(() => { inFlight = null })
+  function attempt(sessionId: string, binding: string, startBudget = false, startExhausted = false) {
+    inFlight ??= switchOnce(sessionId, binding, startBudget, startExhausted).finally(() => { inFlight = null })
     return inFlight
   }
 
@@ -244,6 +244,18 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
       })
     },
     canSwitch,
+    /** The input has not run: use the quota allowance, without scheduling an automatic continuation. */
+    async switchForExhaustedStart(): Promise<boolean> {
+      if (!disposed && !paused && !stopped && switches >= MAX_SWITCHES) {
+        tell('This conversation reached its automatic switching limit. Check the organization Claude accounts before retrying.', 'failed')
+      }
+      if (!canSwitch()) return false
+      const sessionId = deps.sessionId(), binding = deps.binding()
+      if (!sessionId || !binding) return false
+      const result = await attempt(sessionId, binding, false, true)
+      if (result.switched) endBackground()
+      return result.switched
+    },
     /**
      * The bound account has no start budget left for the next turn while another has (Saycode
      * specs/claude-setup-token-account-selection). True when the session now runs on that account; a switch already

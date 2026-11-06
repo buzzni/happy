@@ -16,6 +16,7 @@ import { spawn } from 'node:child_process'
 import { chmod, mkdir, mkdtemp, open, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
+import { withNpmGlobalBinOnPath } from './npmGlobalBin'
 import { logger } from '@/ui/logger'
 import { credentialFileLockPath, withCredentialLock } from '@/utils/credentialLock'
 import {
@@ -38,6 +39,7 @@ import {
 import { SETUP_TOKEN_BINDING_ENV, SETUP_TOKEN_SHARED_ACCOUNT_ENV, formatSetupTokenBinding, overlayManagedCredentialEnvironment, type AiAuthSelection, type SetupTokenBinding, type MachineSetupTokenBindingRecord, isMachineSetupTokenBinding } from './sessionEnv'
 import { readTrustedStudioOrigin, setupTokenCredentialMatches, type SetupTokenBindingVerifier } from './setupTokenBindingProof'
 import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS } from '@/claude/utils/claudeAuthOverrideEnv'
+import { setupTokenWindowUsedUp } from '@/claude/setupTokenUsageTracker'
 import { openSetupTokenAssignment, type SetupTokenAssignmentRecipient } from './setupTokenAssignmentWire'
 import { HAPPY_AI_AUTH_SOURCE_ENV } from '@/usage/aiAuthSource'
 import { CODEX_LOGIN_REFRESH_DRIVER } from './codexLoginRefreshDriver'
@@ -56,10 +58,10 @@ const CLAUDE_SWAP_VERSION = '0.27.0b3'
 /** Windows: the daemon's claude-swap calls and `cswap auto` run through this verified base Python (RE8). */
 export const claudeSwapPython = createClaudeSwapPythonResolver({ platform: process.platform, find: () => findClaudeSwapPython(CLAUDE_SWAP_PACKAGE, process.env), verify: verifyClaudeSwapPython })
 const CLAUDE_STATUS_TIMEOUT_MS = 120_000
-/** Either window at this share means the account is used up; the session tracker's and Studio's rule. */
-const SHARED_ACCOUNT_USED_UP_PCT = 95
 /** A used-up shared account without a known reset is skipped for one 5-hour window. */
 const SHARED_ACCOUNT_UNKNOWN_RESET_MS = 5 * 60 * 60_000
+/** How long a roster read proves shared accounts for start requests (one per turn). */
+const SHARED_START_ROSTER_MS = 60_000
 // Keep readable historical bundles separate from supported installed runtimes.
 // Bundles from supported runtimes are readable; parseCodexMultiAuthBundle still
 // requires the OAuth account v3 / settings v1 contract.
@@ -618,11 +620,14 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         const auth = parseOptionalCredentialJson(await readOptionalText(deps, path))
         return auth && isObject(auth.tokens) ? auth.tokens : null
       }
-      // Writes rotated tokens into the pool entry, unless another writer replaced that entry's refresh token meanwhile.
+      // Writes rotated tokens into the pool entry, unless another writer replaced that entry's refresh token meanwhile
+      // or the tokens belong to another login (the live home can switch accounts while the driver runs).
       const adopt = (accountId: string, expected: readonly string[], tokens: Record<string, unknown>) => deps.lockCredentialFile(accountsPath, async () => {
         const pool = await readPool()
         const entry = pool.accounts.find(account => account.accountId === accountId)
-        if (!entry || !expected.includes(entry.refreshToken)) return false
+        if (!entry || !expected.includes(entry.refreshToken) || tokens.account_id !== accountId) return false
+        const subject = tokenSubject(entry.accessToken)
+        if (subject !== null && tokenSubject(tokens.access_token) !== subject) return false
         Object.assign(entry, { accessToken: tokens.access_token, refreshToken: tokens.refresh_token,
           ...(codexAccessTokenExpiry(tokens.access_token) ? { expiresAt: codexAccessTokenExpiry(tokens.access_token) } : {}) })
         await writeAtomicFile(deps, accountsPath, JSON.stringify(pool))
@@ -1416,16 +1421,30 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     return isSupportedCodexMultiAuthVersion(installed.cli) && installed.cli === installed.global ? installed.cli : null
   }
 
+  // codex-multi-auth runs from npm's global bin, beside the package the proxy and group adapters load.
+  // 2026-11-03 Mac: that bin was not on PATH, so every pinned install missed the CLI found first.
+  async function resolveNpmGlobalRoot(): Promise<string | null> {
+    return deps.execFile('npm', ['root', '--global']).then((result) => nonEmptyTrimmed(result.stdout), () => null)
+  }
+
+  async function runCodexMultiAuth(args: string[], options: CommandOptions = {}, globalRoot?: string | null): Promise<AiCredentialCommandResult> {
+    const root = globalRoot === undefined ? await resolveNpmGlobalRoot() : globalRoot
+    return deps.execFile('codex-multi-auth', args, root
+      ? { ...options, environment: withNpmGlobalBinOnPath(options.environment ?? deps.env, root, deps.platform) }
+      : options)
+  }
+
   async function inspectCodexMultiAuthInstallation(): Promise<{ cli: string; global: string }> {
+    // Resolve once per inspection so CLI selection and metadata use the same current prefix.
+    const root = await resolveNpmGlobalRoot()
     const installed = { cli: 'unknown', global: 'unknown' }
     const safeVersion = (value: unknown): string => typeof value === 'string' && /^\d{1,6}\.\d{1,6}\.\d{1,6}$/.test(value) ? value : 'unknown'
     try {
-      installed.cli = safeVersion((await deps.execFile('codex-multi-auth', ['--version'])).stdout.trim())
+      installed.cli = safeVersion((await runCodexMultiAuth(['--version'], {}, root)).stdout.trim())
     } catch {
       // Preserve unknown for the diagnostic; never include command output or secrets.
     }
     try {
-      const root = nonEmptyTrimmed((await deps.execFile('npm', ['root', '--global'])).stdout)
       if (root) {
         const packageJson = JSON.parse(await deps.readFile(join(root, 'codex-multi-auth', 'package.json'))) as unknown
         installed.global = isObject(packageJson) ? safeVersion(packageJson.version) : 'unknown'
@@ -1538,7 +1557,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       })
       if (repairedActive) {
         // Refresh the same live identity, never switch a valid personal login to another account.
-        await deps.execFile('codex-multi-auth', ['switch', String(merged.activeIndex + 1)], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
+        await runCodexMultiAuth(['switch', String(merged.activeIndex + 1)], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
         // Read what the switch left and write it back under one lock hold, so nothing lands in between.
         await deps.lockCredentialFile(accountsPath, async () => {
           const selected = JSON.parse(await deps.readFile(accountsPath)) as CodexMultiAuthBundle['accounts']
@@ -1562,7 +1581,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       { path: accountsPath, content: JSON.stringify(replacement) },
       { path: settingsPath, content: JSON.stringify(settings) },
     ], async (ownWrite) => {
-      await deps.execFile('codex-multi-auth', ['forecast', '--live', '--json'], {
+      await runCodexMultiAuth(['forecast', '--live', '--json'], {
         maxOutputBytes: MAX_PAYLOAD_BYTES,
         timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
       })
@@ -1597,7 +1616,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         await writeAtomicFile(deps, accountsPath, sortedContent)
         return { selection, accountCount: currentBundle.accounts.accounts.length }
       })
-      await deps.execFile('codex-multi-auth', ['check'], {
+      await runCodexMultiAuth(['check'], {
         maxOutputBytes: MAX_PAYLOAD_BYTES,
         timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
       })
@@ -1789,12 +1808,12 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       const verified = await verifyLocalAiAccounts(deps, selected, [identity], before.accounts, { budgetMs: 60_000 })
       if (!verified.accounts[0]?.ok) throw new AiCredentialRuntimeError('AI_CREDENTIAL_ACTIVE_INVALID')
       try {
-        await deps.execFile('codex-multi-auth', ['switch', String(index + 1)], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
+        await runCodexMultiAuth(['switch', String(index + 1)], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
         const after = JSON.parse(await deps.readFile(path))
         if (after.activeIndex !== index) throw new AiCredentialRuntimeError('AI_CREDENTIAL_ACTIVE_INVALID')
         await assertCodexLiveAccount(after.accounts[index])
       } catch (error) {
-        await deps.execFile('codex-multi-auth', ['switch', String(before.activeIndex + 1)], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS }).catch(() => undefined)
+        await runCodexMultiAuth(['switch', String(before.activeIndex + 1)], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS }).catch(() => undefined)
         await writeAtomicFile(deps, path, JSON.stringify(before))
         if (previousLive !== null) await writeAtomicFile(deps, livePath, previousLive)
         else await deps.rm(livePath, { force: true })
@@ -2166,7 +2185,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         }))
         if (!bundle) throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
         await assertSupportedCodexMultiAuthInstalled()
-        await deps.execFile('codex-multi-auth', ['check'], {
+        await runCodexMultiAuth(['check'], {
           maxOutputBytes: MAX_PAYLOAD_BYTES,
           timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
         })
@@ -2470,7 +2489,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
    * `account`: exactly the account a prepared launch runs on; `moveFrom`: another usable account for a
    * session leaving that one. Either is null when there is none.
    */
-  async function sharedMachineSessionEnvironment(choice?: { account: string | undefined } | { moveFrom: string } | { prefer: string }): Promise<Record<string, string> | null> {
+  async function sharedMachineSessionEnvironment(choice?: { account: string | undefined } | { moveFrom: string; among?: string[] } | { prefer: string }): Promise<Record<string, string> | null> {
     const held = await sharedMachineCandidates()
     if (!held) return null
     return withSafeErrors('CLAUDE_SETUP_TOKEN_MACHINE_DEFAULT_UNAVAILABLE', async () => {
@@ -2480,7 +2499,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       const chosen = !choice ? usable[0] ?? candidates[0]
         : 'account' in choice ? candidates.find(candidate => candidate.managedAccountId === choice.account)
         : 'prefer' in choice ? candidates.find(candidate => candidate.managedAccountId === choice.prefer) ?? usable[0] ?? candidates[0]
-        : usable.find(candidate => candidate.managedAccountId !== choice.moveFrom)
+        : usable.find(candidate => candidate.managedAccountId !== choice.moveFrom && (!choice.among || choice.among.includes(candidate.managedAccountId)))
       if (!chosen) {
         if (choice) return null
         throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_MACHINE_DEFAULT_UNAVAILABLE')
@@ -2562,7 +2581,8 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     sharedAccountUsage.set(managedAccountId, usage)
     let full = false
     for (const window of observation.windows) {
-      const usedUp = window.pct !== null && window.pct >= SHARED_ACCOUNT_USED_UP_PCT
+      // The session tracker's and Studio's rule.
+      const usedUp = setupTokenWindowUsedUp(window.kind, window.pct)
       full ||= usedUp
       if ((usage.windows.get(window.kind)?.observedAt ?? -Infinity) > observation.observedAt) continue
       usage.windows.set(window.kind, { observedAt: observation.observedAt,
@@ -2592,6 +2612,37 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       logger.debug(`[setup-token-switch] Studio chose ${studio}, which this PC does not hold; choosing locally`)
     }
     return serializeLaunch('prepare', () => sharedMachineSessionEnvironment({ moveFrom: managedAccountId }))
+  }
+  /**
+   * Saycode specs/shared-pc-start-budget — what a shared-PC session proves when it asks Studio to start a turn: the company
+   * and generation this PC holds the account at. Every turn asks, so the roster read is reused for a minute; a stale
+   * generation is only refused by Studio, and a refused start still runs (decision D1).
+   */
+  type SharedStartRoster = { readAt: number; companyId: string | null; generations: Map<string, number> }
+  let sharedStartRoster: SharedStartRoster | null = null
+  let sharedStartRosterRefresh: Promise<SharedStartRoster> | null = null
+  async function sharedMachineStartProof(managedAccountId: string): Promise<{ companyId: string; credentialGeneration: number } | null> {
+    let roster = sharedStartRoster
+    if (!roster || deps.now() - roster.readAt > SHARED_START_ROSTER_MS) {
+      // Starts share a refresh, and its credential reads cannot overlap group sync or launch preparation.
+      sharedStartRosterRefresh ??= serialize(async () => {
+        const held = await sharedMachineCandidates()
+        const candidates = held ? (await held.read()).candidates : []
+        return sharedStartRoster = { readAt: deps.now(), companyId: held?.companyId ?? null,
+          generations: new Map(candidates.map(candidate => [candidate.managedAccountId, candidate.credentialGeneration])) }
+      }).finally(() => { sharedStartRosterRefresh = null })
+      roster = await sharedStartRosterRefresh
+    }
+    const credentialGeneration = roster.generations.get(managedAccountId)
+    return roster.companyId && credentialGeneration !== undefined && Number.isSafeInteger(credentialGeneration)
+      ? { companyId: roster.companyId, credentialGeneration } : null
+  }
+  /**
+   * Saycode specs/shared-pc-start-budget — a session waiting for start budget moves onto a held, usable account among
+   * those Studio said have budget left. Not a refusal: the account it leaves is not held as used up. Null when none.
+   */
+  function sharedMachineStartBudgetMove(managedAccountId: string, preferred: string[]) {
+    return serializeLaunch('prepare', () => sharedMachineSessionEnvironment({ moveFrom: managedAccountId, among: preferred }))
   }
   /** The environment of exactly that shared account, for a session catching up with a move; null when it is gone. */
   function sharedMachineAccountEnvironment(managedAccountId: string) {
@@ -2799,7 +2850,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (entries.length !== 1 || entries[0].pending) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_ASSIGNMENT_UNRESOLVED')
     return entries[0].scope
   })
-  return { sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, sharedMachineAccountEnvironment, measureWithPermit, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, refreshCodexOwner, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
+  return { sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, sharedMachineAccountEnvironment, sharedMachineStartProof, sharedMachineStartBudgetMove, measureWithPermit, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, refreshCodexOwner, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
     // One fresh runtime observation per RPC: launching cswap repeatedly can block a secured Windows host.
     let stdout = ''
     try { stdout = (await deps.execFile('cswap', ['token-runtime', 'capabilities'], { maxOutputBytes: 64 * 1024, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })).stdout } catch {}

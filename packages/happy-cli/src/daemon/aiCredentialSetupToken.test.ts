@@ -356,7 +356,7 @@ describe('managed Claude setup-token runtime', () => {
     await expect(runtime.launchSession(first, () => 'started')).resolves.toBe('started')
     // New launches and resumes skip the used-up account; with no other usable account a session stays put.
     expect(await runtime.sessionEnvironment('claude')).toMatchObject({ HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: B })
-    await runtime.sharedMachineUsage(B, { ...refused, reason: 'ok', retryAt: null, windows: [{ kind: 'unified7d', pct: 97, resetsAt: NOW + 7_200_000 }] })
+    await runtime.sharedMachineUsage(B, { ...refused, reason: 'ok', retryAt: null, windows: [{ kind: 'unified7d', pct: 98, resetsAt: NOW + 7_200_000 }] })
     expect(await runtime.sharedMachineRebind(B, refused)).toBeNull()
     // Everything used up: a launch keeps the machine default rather than refusing to start.
     expect(await runtime.sessionEnvironment('claude')).toMatchObject({ HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: A })
@@ -438,7 +438,7 @@ describe('managed Claude setup-token runtime', () => {
       generation: 1, fingerprint: '1'.padStart(64, '0'), payload: payload(managed(A, 1, fakeToken('a')), managed(B, 1, fakeToken('b'))) })
     const reading = (observedAt: number, kind: 'unified5h' | 'unified7d', pct: number) =>
       ({ observedAt, reason: 'ok' as const, retryAt: null, windows: [{ kind, pct, resetsAt: NOW + 7_200_000 }] })
-    await runtime.sharedMachineUsage(B, reading(NOW, 'unified7d', 97))
+    await runtime.sharedMachineUsage(B, reading(NOW, 'unified7d', 98))
     // Another session on B reads only its 5-hour window; an older weekly reading arrives late.
     await runtime.sharedMachineUsage(B, reading(NOW + 1, 'unified5h', 10))
     await runtime.sharedMachineUsage(B, reading(NOW - 1_000, 'unified7d', 20))
@@ -446,6 +446,103 @@ describe('managed Claude setup-token runtime', () => {
     expect(await runtime.sharedMachineRebind(A, refusedA)).toBeNull()
     await runtime.sharedMachineUsage(B, reading(NOW + 2, 'unified7d', 50))
     expect(await runtime.sharedMachineRebind(A, refusedA)).toMatchObject({ HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: B })
+  })
+
+  it('proves a held shared account for a start request from a short-lived roster read (Saycode specs/shared-pc-start-budget)', async () => {
+    const clock = { now: NOW }
+    const { runtime, calls } = fakeMachine([], null, { machineId: 'machine-1', clock })
+    await runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',
+      generation: 1, fingerprint: '1'.padStart(64, '0'), payload: payload(managed(A, 1, fakeToken('a')), managed(B, 2, fakeToken('b'))) })
+    const exports = () => calls.filter(call => call.command === 'cswap' && call.args[0] === 'export').length
+    const before = exports()
+    expect(await runtime.sharedMachineStartProof(A)).toEqual({ companyId: 'company-1', credentialGeneration: 1 })
+    expect(await runtime.sharedMachineStartProof(B)).toEqual({ companyId: 'company-1', credentialGeneration: 2 })
+    expect(await runtime.sharedMachineStartProof('00000000-0000-4000-8000-0000000000ff')).toBeNull()
+    // Every turn asks: the roster is read once a minute, not per turn.
+    expect(exports() - before).toBe(1)
+    clock.now += 60_001
+    expect(await runtime.sharedMachineStartProof(A)).toEqual({ companyId: 'company-1', credentialGeneration: 1 })
+    expect(exports() - before).toBe(2)
+  })
+
+  it.each(['cold', 'expired'] as const)('shares one roster refresh across simultaneous starts with a %s cache', async (cache) => {
+    const clock = { now: NOW }
+    const { runtime, calls } = fakeMachine([], null, { machineId: 'machine-1', clock })
+    await runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',
+      generation: 1, fingerprint: '1'.padStart(64, '0'), payload: payload(managed(A, 1, fakeToken('a')), managed(B, 2, fakeToken('b'))) })
+    if (cache === 'expired') {
+      await runtime.sharedMachineStartProof(A)
+      clock.now += 60_001
+    }
+    const before = calls.length
+    const proofs = await Promise.all(Array.from({ length: 20 }, (_, index) => runtime.sharedMachineStartProof(index % 2 ? B : A)))
+    expect(proofs).toEqual(Array.from({ length: 20 }, (_, index) => ({ companyId: 'company-1', credentialGeneration: index % 2 ? 2 : 1 })))
+    const reads = calls.slice(before).filter(call => call.command === 'cswap')
+    expect(reads.filter(call => call.args[0] === 'export')).toHaveLength(1)
+    expect(reads.filter(call => call.args[0] === 'list')).toHaveLength(1)
+  })
+
+  it.each(['cold', 'expired'] as const)('retries a failed shared roster refresh with a %s cache', async (cache) => {
+    const clock = { now: NOW }
+    const options = { machineId: 'machine-1', clock, listFails: false }
+    const { runtime, calls } = fakeMachine([], null, options)
+    await runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',
+      generation: 1, fingerprint: '1'.padStart(64, '0'), payload: payload(managed(A, 1, fakeToken('a'))) })
+    if (cache === 'expired') {
+      await runtime.sharedMachineStartProof(A)
+      clock.now += 60_001
+    }
+    options.listFails = true
+    const before = calls.length
+    const results = await Promise.allSettled(Array.from({ length: 20 }, () => runtime.sharedMachineStartProof(A)))
+    expect(results.every(result => result.status === 'rejected')).toBe(true)
+    expect(calls.slice(before).filter(call => call.command === 'cswap' && call.args[0] === 'export')).toHaveLength(1)
+    options.listFails = false
+    expect(await runtime.sharedMachineStartProof(A)).toEqual({ companyId: 'company-1', credentialGeneration: 1 })
+    expect(calls.slice(before).filter(call => call.command === 'cswap' && call.args[0] === 'export')).toHaveLength(2)
+  })
+
+  it('reads the shared start roster after an already queued assignment finishes', async () => {
+    const { runtime } = fakeMachine([], null, { machineId: 'machine-1' })
+    const assignment = runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',
+      generation: 1, fingerprint: '1'.padStart(64, '0'), payload: payload(managed(A, 1, fakeToken('a'))) })
+    const proof = runtime.sharedMachineStartProof(A)
+    await assignment
+    expect(await proof).toEqual({ companyId: 'company-1', credentialGeneration: 1 })
+  })
+
+  it('moves a start-budget-waiting shared session only onto a held, usable account Studio named (Saycode specs/shared-pc-start-budget)', async () => {
+    const { runtime } = fakeMachine([], null, { machineId: 'machine-1' })
+    await runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',
+      generation: 1, fingerprint: '1'.padStart(64, '0'), payload: payload(managed(A, 1, fakeToken('a')), managed(B, 1, fakeToken('b'))) })
+    const unknown = '00000000-0000-4000-8000-0000000000ff'
+    expect(await runtime.sharedMachineStartBudgetMove(A, [unknown, B])).toMatchObject({ CLAUDE_CODE_OAUTH_TOKEN: fakeToken('b'), HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: B })
+    // Never back onto the account it leaves, nor onto one this PC does not hold.
+    expect(await runtime.sharedMachineStartBudgetMove(A, [A, unknown])).toBeNull()
+    // Nor onto one this PC holds as used up.
+    await runtime.sharedMachineUsage(B, { observedAt: NOW, reason: 'rate-limited', retryAt: NOW + 3_600_000, windows: [] })
+    expect(await runtime.sharedMachineStartBudgetMove(A, [B])).toBeNull()
+  })
+
+  it('proves no account on a machine without a shared assignment', async () => {
+    const { runtime } = fakeMachine([], null, { machineId: 'machine-1' })
+    expect(await runtime.sharedMachineStartProof(A)).toBeNull()
+  })
+
+  it('moves a shared session to an account at 97% of its weekly window but not at 98% (five-hour stays at 95%)', async () => {
+    const { runtime } = fakeMachine([], null, { machineId: 'machine-1' })
+    await runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',
+      generation: 1, fingerprint: '1'.padStart(64, '0'), payload: payload(managed(A, 1, fakeToken('a')), managed(B, 1, fakeToken('b'))) })
+    const reading = (observedAt: number, kind: 'unified5h' | 'unified7d', pct: number) =>
+      ({ observedAt, reason: 'ok' as const, retryAt: null, windows: [{ kind, pct, resetsAt: NOW + 7_200_000 }] })
+    const refusedA = { observedAt: NOW, reason: 'rate-limited' as const, retryAt: NOW + 3_600_000, windows: [] }
+    await runtime.sharedMachineUsage(B, reading(NOW, 'unified7d', 97))
+    expect(await runtime.sharedMachineRebind(A, refusedA)).toMatchObject({ HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: B })
+    await runtime.sharedMachineUsage(B, reading(NOW + 1, 'unified7d', 98))
+    expect(await runtime.sharedMachineRebind(A, refusedA)).toBeNull()
+    await runtime.sharedMachineUsage(B, reading(NOW + 2, 'unified7d', 50))
+    await runtime.sharedMachineUsage(B, reading(NOW + 3, 'unified5h', 95))
+    expect(await runtime.sharedMachineRebind(A, refusedA)).toBeNull()
   })
 
   it('keeps refusing an unbound session while a user assignment desires a setup-token, even on a shared machine', async () => {

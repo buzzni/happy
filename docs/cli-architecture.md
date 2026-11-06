@@ -1,6 +1,36 @@
 # CLI Architecture
 
+## Existing Desktop login for a personal browser
+
+A compatible Desktop main can attach an execution-scoped login relay to its local
+personal/dedicated daemon. The personal bearer stays in Desktop main; the runtime
+receives only the scoped descriptor through inherited fd3. Each API admission
+checks the current login, and changed login epochs retire their registrations.
+Shared/protected runtimes and Linux retain the existing authentication path.
+The authenticated `browser-session-prepare` RPC reconnects only an idle child owned
+by this daemon, proves its exit, and relies on normal resume for new session grants;
+it never replays a prompt. A daemon-owned per-session coordinator serializes
+concurrent prepares and retains the stopped PID/start identity after timeouts or
+tracking removal until exit is proven; a retry cannot assume the process ended.
+Windows relay pipes use Desktop's same-user/SYSTEM DACL.
+Revisit this boundary if the relay moves outside Desktop main or the supported
+runtime tenancy changes. Formal release and install acceptance remain separate
+from a source build or synthetic issuer test.
+
 ## Personal browser native-command dispatch
+
+The personal Desktop runtime prepares its broker and private profile without
+launching Chrome. Only a newly authorized browser task starts an owned native
+session; registration, readiness, listing and duplicate task requests do not.
+Concurrent starts share one launch. Chrome's own Quit ends that browser lifetime
+without exiting the broker or triggering the daemon's restart supervisor. The
+runtime fences disconnected tasks before a later new task may start another
+native session; it never adopts the previous tabs or replays their actions.
+Unconfirmed termination or fencing blocks further admission and readiness. Each
+start rechecks the signed executable and keeps the existing UID/SID, process
+incarnation, dedicated profile and private-pipe checks. Protected/shared runtimes
+retain their existing lifecycle. Revisit this boundary if browser start gains a
+second caller or the runtime exposes a public lifecycle command.
 
 `daemon/personalBrowserRuntime` verifies the issuer envelope against the installed
 runtime's public trust and waits until its signed issuance time before returning
@@ -947,7 +977,7 @@ The daemon owns trusted viewer-scoped browser setup, single-use operation IDs, p
 
 The same extension is also published on the Chrome Web Store (`oonefemjapkafdiibkllemkjdlmmblbc`). The native host allows both the bundled and store extension origins, the loopback setup exchange accepts either origin, and `begin` takes an optional `extensionId` (bundled or store only) so the setup page opens in the install the user actually has. The daemon cannot read the installed store version, so the caller owns that gate: Desktop sends the store `extensionId` only when the profile has store version 0.2.0 or newer (earlier store builds cannot complete setup pairing), and otherwise sends the user to the store listing. A daemon-side constant would need a Happy release every time the store listing changes. Setup pairings use a credential derived from the shared bridge token, viewer key and pairing id (`deriveBrowserSetupPairingToken`). A scope with a setup policy entry admits only that live pairing; a daemon whose home has no entry (another `HAPPY_HOME_DIR`, a lost policy file) falls back to the plain viewer credential, which a revoked pairing token never matches. Setup is offered only while this daemon owns the bridge port. A consumed pairing whose Chrome is offline reports `waiting`, not `expired`. An unreadable policy disables the bridge with a `BROWSER_SETUP_POLICY_CORRUPT` warning; writes fsync before rename. The session MCP availability probe is bounded to 2s. A revoke whose durable write fails is denied in memory but reloads after a daemon restart until Desktop's journal retry succeeds.
 
-`localToolAgentRelay` discovers the running Desktop broker through authenticated daemon control routes with a 30-second lease and rejects takeover of a live relay. Discovery grants no caller authority. Happy MCP advertises `local_tool_capabilities` and `local_tool_control` only when available at session startup, outside mandatory sandbox/browser-task runtimes. Each invocation fixes launcher machine/session/caller context, carries MCP cancellation, and asks Desktop to verify the live caller and separate computer-control consent. Cloud requires a signed Studio caller grant; only the trusted loopback Standalone configuration may use local Happy credentials. No arbitrary executable/argv or raw CUA MCP is exposed. Revisit this boundary when adding another provider or headless host; keep custody and permission enforcement with the trusted broker.
+`localToolAgentRelay` discovers the running Desktop broker through authenticated daemon control routes with a 30-second lease and rejects takeover of a live relay. Discovery grants no caller authority. Happy MCP advertises `local_tool_capabilities` and `local_tool_control` only when available at session startup, outside mandatory sandbox runtimes and installer-managed browser hosts (`HAPPY_BROWSER_TASK_TENANCY=shared` or `HAPPY_BROWSER_TASK_HOST_MODE=browser-only`); beside the personal Desktop browser runtime its description points web pages to `browser_task_*`. A refused browser session registration hands the session only a native issuer code (`NATIVE_*`, e.g. `NATIVE_DEVICE_APPROVAL_REQUIRED`) for its tool error. Each invocation fixes launcher machine/session/caller context, carries MCP cancellation, and asks Desktop to verify the live caller and separate computer-control consent. Cloud requires a signed Studio caller grant; only the trusted loopback Standalone configuration may use local Happy credentials. No arbitrary executable/argv or raw CUA MCP is exposed. Revisit this boundary when adding another provider or headless host; keep custody and permission enforcement with the trusted broker.
 
 ## Setup-token rotation persistence acknowledgement
 

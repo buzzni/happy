@@ -22,14 +22,17 @@ describe('setup-token usage tracker (Saycode specs/claude-setup-token-account-se
   it('reads both windows when the event carries them together', () => {
     const tracker = createSetupTokenUsageTracker(() => NOW)
     const update = tracker.observe({ status: 'allowed_warning', unifiedWindows: {
-      five_hour: { utilization: 0.1, resetsAt: inSeconds(3_600_000) }, seven_day: { utilization: 0.96, resetsAt: inSeconds(86_400_000) } } })
+      five_hour: { utilization: 0.1, resetsAt: inSeconds(3_600_000) }, seven_day: { utilization: 0.98, resetsAt: inSeconds(86_400_000) } } })
     expect(update?.exhausted).toBe(true)
-    expect(update?.observation?.windows.map(window => window.pct)).toEqual([10, 96])
+    expect(update?.observation?.windows.map(window => window.pct)).toEqual([10, 98])
   })
 
-  it('treats 95% in either window, or a rejected request, as used up', () => {
-    expect(createSetupTokenUsageTracker(() => NOW).observe({ status: 'allowed', rateLimitType: 'five_hour', utilization: 0.949, resetsAt: inSeconds(60_000) })?.exhausted).toBe(false)
-    expect(createSetupTokenUsageTracker(() => NOW).observe({ status: 'allowed', rateLimitType: 'seven_day', utilization: 0.95, resetsAt: inSeconds(60_000) })?.exhausted).toBe(true)
+  it('treats 95% of the five-hour window, 98% of the weekly window, or a rejected request, as used up', () => {
+    const exhausted = (rateLimitType: string, utilization: number) => createSetupTokenUsageTracker(() => NOW).observe({ status: 'allowed', rateLimitType, utilization, resetsAt: inSeconds(60_000) })?.exhausted
+    expect(exhausted('five_hour', 0.949)).toBe(false)
+    expect(exhausted('five_hour', 0.95)).toBe(true)
+    expect(exhausted('seven_day', 0.979)).toBe(false)
+    expect(exhausted('seven_day', 0.98)).toBe(true)
     const rejected = createSetupTokenUsageTracker(() => NOW).observe({ status: 'rejected', rateLimitType: 'five_hour', resetsAt: inSeconds(60_000) })
     expect(rejected).toEqual({ exhausted: true, observation: { observedAt: NOW, reason: 'rate-limited', retryAt: inSeconds(60_000) * 1000,
       windows: [{ kind: 'unified5h', pct: 100, resetsAt: inSeconds(60_000) * 1000 }] } })

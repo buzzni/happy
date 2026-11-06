@@ -10,7 +10,7 @@
  * outside a browser; this file only wires it to the real chrome APIs.
  */
 
-import { createConnection } from './connection.js'
+import { createConnection, RECONNECT_ALARM } from './connection.js'
 import { prepareLocalConnection } from './nativePairing.js'
 import { ensureDefaultProfileName } from './profileId.js'
 
@@ -48,6 +48,8 @@ chrome.storage.onChanged.addListener((changes, area) => {
     connection.restart()
 })
 
+// Registered at top level so the alarm can wake a stopped worker; connect() is a no-op when connected.
+chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === RECONNECT_ALARM) void connection.connect() })
 chrome.runtime.onStartup.addListener(() => { void connectOrPair() })
 chrome.runtime.onInstalled.addListener(details => {
     void connectOrPair().then(prepared => {

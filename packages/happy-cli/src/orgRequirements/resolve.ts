@@ -15,7 +15,8 @@ import {
     type OrgToolRuleV1,
 } from '@slopus/happy-wire';
 
-export type OrgAgent = 'claude' | 'codex' | 'gemini' | 'grok' | 'openclaw' | 'opencode';
+/** `acp`: an ACP agent Studio has no key for, so a restriction never allows it. */
+export type OrgAgent = 'claude' | 'codex' | 'gemini' | 'grok' | 'openclaw' | 'opencode' | 'acp';
 
 export type OrgAiModelsItem = { kind: 'allowedSet'; values: string[]; default: string | null; source: 'organization' | 'member' };
 export type OrgRequirementItem =
@@ -186,7 +187,7 @@ const CLAUDE_MODEL_ALIASES: ReadonlyMap<string, string> = new Map([
     ['claude-fable-5', 'claude-fable-5-1'],
 ]);
 /** Agents Studio keys by agent alone: any model is `<agent>:*`. */
-const WILDCARD_AGENTS: ReadonlySet<OrgAgent> = new Set(['grok', 'openclaw']);
+const WILDCARD_AGENTS: ReadonlySet<OrgAgent> = new Set(['grok', 'openclaw', 'opencode']);
 const MAX_MODEL_LENGTH = 256;
 
 /**

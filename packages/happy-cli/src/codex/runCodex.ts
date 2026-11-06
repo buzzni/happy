@@ -59,6 +59,7 @@ import { readCodexLogin, withCodexOwnerRefreshNotice } from './codexOwnerManaged
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { takeSessionSourceFromEnv } from '@/utils/sessionSource';
 import { createChangeTitleHandler, startHappyServer } from '@/claude/utils/startHappyServer';
+import { linkedPullRequestToolsAllowed } from '@/claude/utils/linkedPullRequestTools';
 import {
     CALLER_GRANT_EXPIRED_NOTICE,
     onMcpCallerGrantExpired,
@@ -346,6 +347,8 @@ export async function runCodex(opts: {
     // 로컬 머신 설정보다 우선한다. 이 배선이 없어서 agent=codex 워커가 샌드박스 없이 떴고,
     // Codex 네이티브 readOnly 정책으로 떨어져 lifecycle 콜백을 전부 놓쳤다.
     const sandboxPolicyMode = resolveSessionSandboxPolicyMode(process.env);
+    // Registration and advertisement follow the same decision (specs/linked-pull-requests R2-3).
+    const linkedPullRequestTools = linkedPullRequestToolsAllowed(process.env);
     const sandboxConfig = resolveSessionSandboxConfig({
         noSandbox: Boolean(opts.noSandbox),
         env: process.env,
@@ -394,6 +397,7 @@ export async function runCodex(opts: {
         ...(createdByAccountId ? { createdBy: { accountId: createdByAccountId, displayName: createdByDisplayName } } : {}),
         source,
         approvalLifecycle: true,
+        linkedPullRequestTools,
     });
 
     const skillCommands = await discoverCodexSkillCommands();
@@ -2035,6 +2039,7 @@ export async function runCodex(opts: {
     const turnCards = createTurnCardSwitch('codex');
     // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
     const happyServer = await startHappyServer(session, {
+        linkedPullRequestTools,
         browserClientApprover: () => permissionHandler,
         agentControl: accountToken !== null,
         exitAfterFirstTurn,

@@ -1,3 +1,5 @@
+import { createBrowserSessionReconnect } from './browserSessionReconnect';
+import { readBrowserTaskPidStartTime } from './browserTaskSessionOwner';
 import { createBrowserNativeDeviceProof, type BrowserNativeDeviceSigner } from './browserNativeDeviceProof';
 import { createManualPersonalSpawn, MANUAL_PERSONAL_ENV } from './manualPersonalClaude';
 import { createOwnedSpawnRuntime, createOwnedStartGuard } from './ownedSpawnRuntime';
@@ -46,6 +48,7 @@ import {
   type SpawnSessionResult,
 } from '@/modules/common/registerCommonHandlers';
 import { LIST_FILES_PAGE_CAPABILITY } from '@/modules/common/listFilesPageCapability';
+import { BASH_PREFIX_MATCHER_CAPABILITY } from '@/claude/utils/bashPrefixMatcher';
 import { logger } from '@/ui/logger';
 import { authAndSetupMachineIfNeeded } from '@/ui/auth';
 import { reseedCompanyKey, settleMachineControl } from '@/datakey/machineControl';
@@ -88,6 +91,7 @@ import { preflightDaemonControlServer, startDaemonControlServer } from './contro
 import { BrowserBridge } from './browserBridge';
 import { BrowserLocalSetup, shouldEnableBrowserLocalSetup } from './browserLocalSetup';
 import { fetchBrowserExtensionScope } from './browserExtensionScope';
+import { writeBrowserBridgeOwnerHome } from './browserBridgeOwner';
 import { readBrowserSetupPolicy, writeBrowserSetupPolicy, localBrowserExtensionMetadata } from './browserLocalSetupStore';
 import { BrowserSessionBrokerClient } from './browserSessionBrokerContract';
 import { getBusyDaemonTerminalCount, getDaemonTerminalSessionCount } from './daemonTerminalSessions';
@@ -199,9 +203,10 @@ import {
 } from './sessionIdleReaper';
 import { machineIdentityMetadataUpdate } from './machineIdentityMetadata';
 import { listMachineIdTwins } from './machineIdTwins';
-import { agentBrowserMachineCapability, agentBrowserMetadataUpdate, browserTaskLineage, createBrowserTaskSessionBroker, spawnResumedWithBrowserTaskRegistration, startBrowserTaskReconciliation, type BrowserTaskSessionBroker } from './browserTaskBroker';
-import { watchPersonalBrowserRuntime } from './personalBrowserRuntime';
-import type { NativeBrokerRequestOptions } from '@/browserRuntime/brokerGrantSource';
+import { agentBrowserMachineCapability, agentBrowserMetadataUpdate, browserTaskLineage, browserTaskSpawnSeed, createBrowserTaskSessionBroker, spawnResumedWithBrowserTaskRegistration, startBrowserTaskReconciliation, type BrowserTaskRegistration, type BrowserTaskSessionBroker } from './browserTaskBroker';
+import { forgetInheritedPersonalBrowserEnv, readPersonalBrowserRuntime, watchPersonalBrowserRuntime } from './personalBrowserRuntime';
+import { checkDesktopBrowserLoginSocket, createDesktopBrowserLoginClient, desktopBrowserLoginDescriptor, type DesktopBrowserLoginDescriptor } from '@/browserRuntime/desktopBrowserLogin';
+import { brokerRequest, createNativeBrokerRequest, type NativeBrokerRequestOptions } from '@/browserRuntime/brokerGrantSource';
 import { createHeldBrowserAttentions, findBrowserAttentionSession, startBrowserAttentionWatcher, type HeldBrowserAttention } from './browserAttentionDelivery';
 import {
   createProcFs,
@@ -312,7 +317,7 @@ import {
 import { preflightAutomationConnectors } from './automations/automationConnectorPreflight';
 import { resolveScriptRuntimeImage, scriptRuntimeReadiness, type ScriptRuntimeReadiness } from './automations/scriptRuntimeReadiness';
 import { createScriptRuntimeSupervisor } from './automations/scriptRuntimeSupervisor';
-import { resolveDaemonAllowedRoot } from '@/modules/common/resolveAllowedRoot';
+import { resolveDaemonAllowedRoot, resolveDaemonApprovedRoots } from '@/modules/common/resolveAllowedRoot';
 import { getProcessStartedAt } from '@/utils/processStartTime';
 import { waitForSessionWebhook } from './spawnWebhookWait';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
@@ -440,6 +445,7 @@ export const initialMachineMetadata: MachineMetadata = {
   structuredOutput: STRUCTURED_OUTPUT_CAPABILITY,
   writeFileAttempt: WRITE_FILE_ATTEMPT_CAPABILITY,
   listFilesPage: LIST_FILES_PAGE_CAPABILITY,
+  permissionGrants: BASH_PREFIX_MATCHER_CAPABILITY,
   machineRun: {
     protocolVersion: 1,
     // The machine-scope handler installs the managed write policy (apiMachine).
@@ -698,6 +704,9 @@ export async function startDaemon(): Promise<void> {
       logger.debug(`[DAEMON RUN] Scrubbing inherited session lineage env: ${key}`);
       delete process.env[key];
     }
+  }
+  if (forgetInheritedPersonalBrowserEnv(process.env)) {
+    logger.debug('[DAEMON RUN] Forgot the personal browser runtime environment inherited from a previous daemon or session');
   }
 
   // 이 머신이 샌드박스를 쓸 수 있는지 기동 시점에 한 번 확인한다. checkDependencies()
@@ -1886,7 +1895,9 @@ export async function startDaemon(): Promise<void> {
     /** Set once the machine sync client exists; an activation before that is published with the first metadata check. */
     let publishAgentBrowserCapability: (() => void) | undefined;
     let browserNativeDeviceSigner: BrowserNativeDeviceSigner | undefined;
+    let personalDesktopLogin: DesktopBrowserLoginDescriptor | undefined;
     const personalBrowserWatch = browserTaskBroker || process.env.HAPPY_BROWSER_TASK_RUNTIME_URL ? undefined : watchPersonalBrowserRuntime({
+      desktopLogin: () => personalDesktopLogin,
       deviceProof: async request => {
         if (!browserNativeDeviceSigner) throw new Error('NATIVE_DEVICE_APPROVAL_REQUIRED');
         return browserNativeDeviceSigner(request);
@@ -2028,7 +2039,7 @@ export async function startDaemon(): Promise<void> {
 
       let preparedMachineSessionId: string | undefined;
       let stagedDeferredContinuationContextFile: string | undefined;
-      let browserTaskRegistration: { registrationId: string; sessionSecret: string } | undefined;
+      let browserTaskRegistration: BrowserTaskRegistration | undefined;
       const releaseBrowserTaskRegistration = async (): Promise<void> => {
         const registration = browserTaskRegistration;
         browserTaskRegistration = undefined;
@@ -2212,7 +2223,8 @@ export async function startDaemon(): Promise<void> {
         let extraEnv: Record<string, string> = injectMcpCallerGrant(
           stripManagedCredentialConflicts(
             buildSpawnRequestEnvironment(authEnv, options.environmentVariables,
-              { allowPocBrowserTaskEnv: process.env.HAPPY_BROWSER_POC_REQUEST_ENV === '1' }),
+              { allowPocBrowserTaskEnv: process.env.HAPPY_BROWSER_POC_REQUEST_ENV === '1',
+                ...(options.seedDefaultAgentGrant ? { defaultAgentRoot: directory } : {}) }),
             managedAiCredentialEnvironment,
           ),
           mcpCallerGrant,
@@ -2422,11 +2434,10 @@ export async function startDaemon(): Promise<void> {
         // A fork or recovery continues an existing conversation under a new session id: say which, so the
         // Runtime refuses a conversation of an earlier profile assignment.
         // Studio's session-user attestation (a new chat on a shared machine) goes to the broker only.
-        browserTaskRegistration = await browserTaskBroker?.register(browserTaskLineage(options), options.browserAttestation);
-        if (browserTaskRegistration) {
-          // Session process only; it removes the secret from its env before spawning claude.
-          extraEnv.HAPPY_BROWSER_TASK_SESSION_SECRET = browserTaskRegistration.sessionSecret;
-        }
+        const browserTaskSeed = browserTaskSpawnSeed(await browserTaskBroker?.register(browserTaskLineage(options), options.browserAttestation));
+        browserTaskRegistration = browserTaskSeed.registration;
+        // Session process only: the secret, or why there is none. It removes both from its env before spawning claude.
+        Object.assign(extraEnv, browserTaskSeed.environment);
 
         // The plan grant is spent only now, once nothing else can refuse this spawn before a child is launched:
         // web-ui and Desktop retry a refused spawn (an unreadable MCP envelope after a key rotation) with the
@@ -3252,6 +3263,8 @@ export async function startDaemon(): Promise<void> {
             },
             agentEnvironment: tracked.agentEnvironment,
             sessionId: happySessionId,
+            // Automation runs are left as they were captured; sessions people started get the grant they missed.
+            ...(options?.automation ? {} : { defaultAgentRoot: launch.cwd }),
           }), managedAiCredentialEnvironment),
           mcpCallerGrantEnvelope: options?.mcpCallerGrantEnvelope,
           trustedMcpCallerGrant: resumeGrantSource.trustedMcpCallerGrant,
@@ -4137,6 +4150,9 @@ export async function startDaemon(): Promise<void> {
         extensionScope: () => fetchBrowserExtensionScope({ origin: readTrustedStudioOrigin(process.env), machineId, token: credentials.token }),
       }) : undefined;
     let stopBrowserBridge: () => Promise<void> = async () => {};
+    // Chrome's native host finds this daemon through this record when its home is not a documented one.
+    const recordBrowserBridgeOwner = () => writeBrowserBridgeOwnerHome(os.homedir(), configuration.happyHomeDir)
+      .catch(error => logger.warn(`[DAEMON RUN] Browser bridge owner not recorded; extension connection may not find this daemon: ${error instanceof Error ? error.message : String(error)}`));
     try {
       if (browserSetupPolicy !== null) {
         const bridgeHost = resolveBrowserBridgeHost(process.env);
@@ -4148,6 +4164,7 @@ export async function startDaemon(): Promise<void> {
           ,consumeSetup: setupCandidate ? id => setupCandidate.consume(id) : undefined
         });
         stopBrowserBridge = bridgeServer.stop;
+        if (setupCandidate) await recordBrowserBridgeOwner();
         if (bridgeHost !== '127.0.0.1') {
           logger.debug(`[DAEMON RUN] Browser bridge bound to ${bridgeHost} (HAPPY_BROWSER_BRIDGE_HOST) — not loopback-only`);
         }
@@ -4161,6 +4178,7 @@ export async function startDaemon(): Promise<void> {
         stopBrowserBridge = retryBrowserBridgeServer({
           bridge: browserBridge, port: DEFAULT_BROWSER_BRIDGE_PORT, host: resolveBrowserBridgeHost(process.env),
           consumeSetup: setupCandidate ? id => setupCandidate.consume(id) : undefined,
+          onListening: setupCandidate ? recordBrowserBridgeOwner : undefined,
         }).stop;
       } else {
         browserLocalSetup = undefined;
@@ -4218,8 +4236,22 @@ export async function startDaemon(): Promise<void> {
       portRegistry,
       browserBridge,
       browserLocalSetup,
+      ...(personalBrowserWatch ? { desktopBrowserLogin: {
+        status: () => ({ protocol: 1, machineId, loginId: personalDesktopLogin?.loginId ?? null }),
+        attach: async (input: unknown) => {
+          const descriptor = desktopBrowserLoginDescriptor.parse(input);
+          const runtime = readPersonalBrowserRuntime({ machineId, studioOrigin: readTrustedStudioOrigin(process.env), token: () => credentials.token, log: () => {} });
+          if (!runtime) throw new Error('DESKTOP_BROWSER_LOGIN_UNAVAILABLE');
+          await checkDesktopBrowserLoginSocket(descriptor);
+          await createDesktopBrowserLoginClient(descriptor, runtime.loginScope).check();
+          if (personalDesktopLogin?.loginId === descriptor.loginId) return;
+          personalDesktopLogin = descriptor;
+          await personalBrowserWatch.refresh();
+        },
+      } } : {}),
       // 제어 서버의 파일 접근도 같은 잠금 정책을 따른다(HAPPY_RPC_ALLOWED_ROOT).
       allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
+      approvedRoots: resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir),
       standaloneDrain: standaloneWindows?.drain,
       writeScopeRuntime,
       managedRuntime: managedIdentity.status === 'active',
@@ -4899,6 +4931,11 @@ export async function startDaemon(): Promise<void> {
       fetch,
       // Passed as is: catching a session up resumes its recorded binding, the runtime's third argument.
       sessionEnvironment: aiCredentialRuntime.sessionEnvironment,
+      disabledSetupTokenAccounts: async () => {
+        const status = await aiCredentialRuntime.status({ provider: 'claude' });
+        return 'setupToken' in status ? (status.setupToken?.accounts ?? [])
+          .filter(account => account.disabled).map(account => account.managedAccountId) : [];
+      },
       recordAgentEnvironment: persistSetupTokenBinding,
       // Saycode specs/setup-token-switch-usage-check — check a candidate nobody measured recently before moving onto it.
       measure: aiCredentialRuntime.measureWithPermit,
@@ -4907,6 +4944,8 @@ export async function startDaemon(): Promise<void> {
       sharedMachine: {
         reportUsage: aiCredentialRuntime.sharedMachineUsage, rebind: aiCredentialRuntime.sharedMachineRebind,
         environment: aiCredentialRuntime.sharedMachineAccountEnvironment, moved: () => persistTrackedSessions(),
+        startProof: aiCredentialRuntime.sharedMachineStartProof,
+        startBudgetMove: aiCredentialRuntime.sharedMachineStartBudgetMove,
       },
     });
     launchManagedAiCredentialSession = aiCredentialRuntime.launchSession;
@@ -5515,6 +5554,7 @@ export async function startDaemon(): Promise<void> {
     // Switch off: no lookup, so every launch is exactly the existing one.
     if (process.env[OWNER_CONTACT_SWITCH] === '1') ownedLaunchLineage = sessionId => ownedSpawn.launchLineage(sessionId);
     ownedPipeOnlyLaunch = options => ownedSpawn.pipeOnlyLaunch(options);
+    const prepareBrowserSessionReconnect = createBrowserSessionReconnect();
     // Set RPC handlers
     apiMachine.setRPCHandlers({
       ownedSpawn,
@@ -5546,6 +5586,33 @@ export async function startDaemon(): Promise<void> {
       portRegistry,
       automationStore,
       aiCredentialRuntime,
+      ...(personalBrowserWatch ? { browserSessionPrepare: async (sessionId: string) => {
+        if (!personalDesktopLogin || !personalBrowserNative) return { supported: false };
+        const login = personalDesktopLogin, native = personalBrowserNative;
+        return prepareBrowserSessionReconnect({
+          sessionId,
+          current: async () => {
+            if (personalDesktopLogin !== login) return false;
+            await createDesktopBrowserLoginClient(login, login).check();
+            return personalDesktopLogin === login;
+          },
+          registered: async () => {
+            const reply = await createNativeBrokerRequest(native)(native.socketPath, 'GET', '/v1/sessions', {});
+            if (reply.status !== 200 || !reply.body.ok || !Array.isArray(reply.body.result)) throw Error('DESKTOP_BROWSER_LOGIN_REQUIRED');
+            return reply.body.result.some((row: { agentSessionId?: string; revoking?: boolean }) => row.agentSessionId === sessionId && row.revoking === false);
+          },
+          target: () => {
+            if (sessionId.startsWith('PID-')) throw Error('Invalid browser session');
+            const target = findStopTarget(sessionId);
+            if (!target || target.session.happySessionId !== sessionId) return undefined;
+            const child = target.session.childProcess;
+            return { pid: target.pid, token: target.session, owned: target.session.startedBy === 'daemon' && child?.pid === target.pid && child.exitCode === null && child.signalCode === null && !child.killed };
+          },
+          startTime: readBrowserTaskPidStartTime,
+          alive: isPidAlive,
+          stop: () => stopSession(sessionId, { mode: 'if-not-busy', source: 'desktop-browser-reconnect', reason: 'browser-login-ready' }),
+        });
+      } } : {}),
       // A personal runtime may activate after this registration: resolve the broker per call.
       ...(browserTaskBroker || personalBrowserWatch ? {
         browserSessionWaiting: async (sessionId: string) => heldBrowserAttentions.answerWaiting(sessionId)
@@ -6087,13 +6154,16 @@ export async function startDaemon(): Promise<void> {
     };
     stopBrowserAttention = startBrowserAttentionWatcher(browserAttentionOptions);
     // The personal runtime may become active later; its attention feed then starts too.
+    let stopPersonalAttention: (() => Promise<void>) | undefined;
+    const stopBaseAttention = stopBrowserAttention;
     const startPersonalBrowserAttention = (native: NativeBrokerRequestOptions) => {
+      void stopPersonalAttention?.();
       const stopPersonal = startBrowserAttentionWatcher({ ...browserAttentionOptions, native });
-      const stopPrevious = stopBrowserAttention;
-      stopBrowserAttention = async () => { await stopPrevious(); await stopPersonal(); };
+      stopPersonalAttention = stopPersonal;
+      stopBrowserAttention = async () => { await stopBaseAttention(); await stopPersonalAttention?.(); };
     };
     if (personalBrowserNative) startPersonalBrowserAttention(personalBrowserNative);
-    else onPersonalBrowserActive = startPersonalBrowserAttention;
+    onPersonalBrowserActive = startPersonalBrowserAttention;
 
     logger.debug('[DAEMON RUN] Daemon started successfully, waiting for shutdown request');
 

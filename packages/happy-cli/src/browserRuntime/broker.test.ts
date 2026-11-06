@@ -41,7 +41,7 @@ const attest = (principalId: string, issuedAtMs = 1_000_000, key = issuer.privat
 }, { kid: 'k1', privateKey: key })
 /** A shared machine: [principalId, assignmentId] per configured profile, and removed principals. */
 interface SharedSetup { profiles: Array<[string, string]>; tombstones?: Record<string, number> }
-async function harness(options: { dir?: string; owner?: string; assignment?: string | null; shared?: SharedSetup; admit?: () => Promise<void>; sessionHistory?: (agentSessionId: string) => Array<string | undefined>; revokeGrant?: (grantId: GrantId) => Promise<void>; recoveryRetryMs?: number; endSession?: (agentSessionId: string) => Promise<void>; sessionWaiting?: (agentSessionId: string) => Promise<boolean> } = {}) {
+async function harness(options: { desktopLoginId?: string; dir?: string; owner?: string; assignment?: string | null; shared?: SharedSetup; admit?: () => Promise<void>; sessionHistory?: (agentSessionId: string) => Array<string | undefined>; revokeGrant?: (grantId: GrantId) => Promise<void>; recoveryRetryMs?: number; endSession?: (agentSessionId: string) => Promise<void>; sessionWaiting?: (agentSessionId: string) => Promise<boolean> } = {}) {
     const dir = options.dir ?? await mkdtemp(join(tmpdir(), 'abp-broker-'))
     if (!options.dir) cleanups.push(() => rm(dir, { recursive: true, force: true }))
     const store = await TaskStore.open(dir)
@@ -52,7 +52,7 @@ async function harness(options: { dir?: string; owner?: string; assignment?: str
     const socketPath = join(dir, 'broker.sock')
     let now = 1_000_000
     const broker: Broker = await startBroker({
-        socketPath, stateDir: dir, attention,
+        socketPath, stateDir: dir, attention, desktopLoginId: options.desktopLoginId,
         daemonTokenSha256: createHash('sha256').update(DAEMON_TOKEN).digest('hex'),
         identity: { machineId: 'machine-h' as never, workspaceId: 'workspace-1' as never },
         ...options.shared ? {
@@ -91,6 +91,28 @@ async function harness(options: { dir?: string; owner?: string; assignment?: str
 }
 
 describe('broker socket', () => {
+    it('retires a withdrawn Desktop epoch before accepting grants and preserves ordinary headless registrations', async () => {
+        const headless = await harness()
+        const ordinary = await headless.register('headless')
+        await headless.close()
+        const first = await harness({ dir: headless.dir, desktopLoginId: 'first' })
+        const old = await first.register()
+        const issued = await first.grant(old.sessionSecret)
+        expect(issued.status).toBe(200)
+        const credential = verifyToken(issued.body.result.token, keys, 1_000_000).credential
+        if (credential.kind !== 'agent-grant') throw Error('expected agent grant')
+        const grantId = credential.grantId
+        await first.close()
+        const next = await harness({ dir: first.dir, desktopLoginId: 'second', revokeGrant: async () => { throw Error('hold recovery') } })
+        expect(next.broker.revokingGrantIds().has(grantId)).toBe(true)
+        expect((await next.grant(old.sessionSecret)).status).toBe(401)
+        expect((await next.grant(ordinary.sessionSecret, { agentSessionId: 'headless' })).status).toBe(200)
+        const rows = JSON.parse(await readFile(join(next.dir, 'broker-sessions.json'), 'utf8')).registrations
+        expect(Object.values(rows)).toContainEqual(expect.objectContaining({ desktopLoginId: 'first', revoking: true }))
+        const resumed = await next.register('new-session')
+        expect((await next.grant(resumed.sessionSecret, { agentSessionId: 'new-session' })).status).toBe(200)
+    })
+
     it('lists only public registration metadata with daemon auth, preserving owners across restart', async () => {
         const h = await harness()
         const owner = { bootId: 'boot-a', pid: 123, pidStartTime: '98765' }

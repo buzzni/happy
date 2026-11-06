@@ -548,3 +548,19 @@ describe('automationService', () => {
         expect(tx.automationChange.create).not.toHaveBeenCalled();
     });
 });
+
+it('refuses a previously persisted native v5 run request after rollback', async () => {
+  const { tx } = makeTx({ automation: automationRecord({ payloadVersion: 5 }) });
+  expect(await requestAutomationRun(tx as never, 'editor-1', 'project-1', 'automation-1', 1)).toEqual({ ok: false, error: 'automation-run-unsupported' });
+});
+
+it('keeps legacy monitor v2 run requests accepted as before the rollback', async () => {
+  const { tx } = makeTx({ automation: automationRecord({ payloadVersion: 2 }) });
+  expect(await requestAutomationRun(tx as never, 'editor-1', 'project-1', 'automation-1', 1)).toMatchObject({ ok: true });
+});
+
+it('reports a retired native v5 registration as a conflict instead of returning a row clients cannot parse', async () => {
+  const { tx } = makeTx();
+  tx.automation.findUnique = vi.fn(async () => automationRecord({ payloadVersion: 5 }));
+  await expect(getRegisteredAutomation(tx as never, 'editor-1', 'project-1', 'registration-key-1')).resolves.toEqual({ ok: false, error: 'registration-conflict' });
+});

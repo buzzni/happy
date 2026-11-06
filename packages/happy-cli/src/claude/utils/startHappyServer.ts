@@ -46,6 +46,7 @@ import type { CheckpointAgentReader } from '@/checkpoint/checkpointAgentReader';
 import { RuntimeClient } from '@/browserRuntime/runtimeClient';
 import { createBrokerGrantSource } from '@/browserRuntime/brokerGrantSource';
 import { BrowserRuntimeError } from '@/browserRuntime/contracts';
+import { BROWSER_TASK_UNAVAILABLE_REASON_ENV, BROWSER_TASK_UNAVAILABLE_REASON_PATTERN } from '@/daemon/browserTaskBroker';
 
 // chat-tool-output-streaming Phase 3 — bash_stream emits its agent-side
 // tool name via this constant so per-runner mappers (sessionProtocolMapper
@@ -54,6 +55,7 @@ import { BrowserRuntimeError } from '@/browserRuntime/contracts';
 import { runScriptAutomationTool, scriptAutomationToolRequestSchema } from './scriptAutomationTools';
 import { runScheduledTaskTool, scheduledTaskToolRequestSchema } from './scheduledTaskTools';
 import { registerTurnCardTools, TURN_CARD_TOOL_NAMES, type TurnCards } from './turnCardTools';
+import { LINKED_PULL_REQUEST_TOOL_NAMES, registerLinkedPullRequestTools, withLinkedPullRequestCapability } from './linkedPullRequestTools';
 
 export const BASH_STREAM_AGENT_TOOL_NAME = 'mcp__happy__bash_stream';
 
@@ -80,6 +82,7 @@ export interface HappyServerHandlers {
     /** The run-once host keeps the session parked while a browser task waits for the user. */
     browserHostContinues?: boolean;
     mandatorySandbox?: boolean;
+    linkedPullRequestTools?: boolean;
 }
 
 // The first title generated through change_title is the one users rely on to
@@ -161,6 +164,8 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
 
     // Not in a mandatory sandbox: that boundary keeps its fixed minimal tool set (like propose_lesson).
     if (!handlers.mandatorySandbox) registerTurnCardTools(mcp, { client: handlers.client, turnCards: handlers.turnCards, runTool });
+
+    if (handlers.linkedPullRequestTools) registerLinkedPullRequestTools(mcp, { client: handlers.client, runTool });
 
     if (!handlers.mandatorySandbox && !scopedSession) mcp.registerTool('script_automations', {
         title: 'Manage Script Automations',
@@ -336,7 +341,7 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
         registerBrowserTools(mcp, runTool);
     }
 
-    if (handlers.localToolAvailable && !handlers.mandatorySandbox && !handlers.browserTaskRuntime) {
+    if (handlers.localToolAvailable && !handlers.mandatorySandbox) {
         const invoke = async (operation: Record<string, unknown>, signal?: AbortSignal) => runTool(async () => {
             try {
                 const context = await localToolAgentContext(handlers.client.sessionId, handlers.client.getMetadata()?.machineId);
@@ -349,7 +354,8 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
             }
         });
         mcp.registerTool('local_tool_capabilities', {
-            title: 'Inspect approved computer tools', description: 'List currently approved local computer tool operations and their bounded input schemas. Inspect before controlling the computer. Native permission prompts and denied/ambiguous input require the user.', inputSchema: {},
+            title: 'Inspect approved computer tools', description: 'List currently approved local computer tool operations and their bounded input schemas. Inspect before controlling the computer. Native permission prompts and denied/ambiguous input require the user.'
+                + (handlers.browserTaskRuntime ? ' Prefer the browser_task_* tools for web pages; use computer control for other desktop apps.' : ''), inputSchema: {},
         }, (_input, extra) => invoke({ action: 'describe' }, extra.signal));
         mcp.registerTool('local_tool_control', {
             title: 'Control this computer', description: 'Run a currently approved operation from local_tool_capabilities. Use fresh window/element references; do not bypass native permission prompts. Requires the same authenticated user, machine and conversation on a running Desktop. Cancel releases only this conversation; remote work may remain unconfirmed.',
@@ -524,11 +530,26 @@ function takeBrowserTaskSessionSecret(): string | undefined {
     return browserTaskSessionSecret;
 }
 
+/** Why the daemon could not register this session; a code only, re-checked here before it reaches the agent. */
+let browserTaskUnavailableReason: string | undefined;
+function takeBrowserTaskUnavailableReason(): string | undefined {
+    const reason = process.env[BROWSER_TASK_UNAVAILABLE_REASON_ENV];
+    browserTaskUnavailableReason ??= reason && BROWSER_TASK_UNAVAILABLE_REASON_PATTERN.test(reason) ? reason : undefined;
+    delete process.env[BROWSER_TASK_UNAVAILABLE_REASON_ENV];
+    return browserTaskUnavailableReason;
+}
+
+/** What the user can do about a refusal; other codes are shown as they are. */
+const BROWSER_TASK_UNAVAILABLE_ACTIONS: Record<string, string> = {
+    NATIVE_DEVICE_APPROVAL_REQUIRED: ': this organization PC needs device approval. Ask the user to have an organization admin start device registration for this PC, then confirm it in Saycode My settings → Develop → Machines → Details of this computer.',
+};
+
 function createBrowserTaskRuntimeClient(client: ApiSessionClient, profileId: string, approver?: () => PolicyApprover | null): { runtime: RuntimeClient; profileId: string | (() => Promise<string>); localClients?: LocalClientSession } | undefined {
     const baseUrl = process.env.HAPPY_BROWSER_TASK_RUNTIME_URL;
     if (!baseUrl) return undefined;
     const socketPath = process.env.HAPPY_BROWSER_TASK_BROKER_SOCKET;
     const sessionSecret = takeBrowserTaskSessionSecret();
+    const unavailableReason = takeBrowserTaskUnavailableReason();
     if (socketPath && sessionSecret) {
         // Execution machine H: the Runtime broker issues this session's grant (D4), for the profile it picks
         // (on a shared machine the session user's).
@@ -544,10 +565,13 @@ function createBrowserTaskRuntimeClient(client: ApiSessionClient, profileId: str
     }
     // Harness only: the E2E harness writes a grant file for the session.
     const grantFile = process.env.HAPPY_BROWSER_TASK_GRANT_FILE;
+    const unavailable = unavailableReason
+        ? `browser task grant is unavailable (${unavailableReason})${BROWSER_TASK_UNAVAILABLE_ACTIONS[unavailableReason] ?? ''}`
+        : 'browser task grant is unavailable';
     // Read at call time so a rotated grant is picked up without a restart.
     const token = async () => {
         const grant = grantFile ? await readFile(grantFile, 'utf8').catch(() => '') : '';
-        if (!grant.trim()) throw new BrowserRuntimeError('UNAUTHORIZED', 'browser task grant is unavailable');
+        if (!grant.trim()) throw new BrowserRuntimeError('UNAUTHORIZED', unavailable);
         return grant.trim();
     };
     return { runtime: new RuntimeClient({ baseUrl, token }), profileId };
@@ -579,6 +603,12 @@ export async function startHappyServer(
         protectedBashCwd?: () => string | null;
         trackProtectedBashProcess?: (child: ChildProcess) => void;
         currentTurnId?: () => number | null;
+        /**
+         * The runner's `linkedPullRequestToolsAllowed()`, the value it advertised at creation. Given, it
+         * also corrects the advertisement on metadata the server kept from an earlier run (managed
+         * attachment, existing tag). Absent: no tools and no write.
+         */
+        linkedPullRequestTools?: boolean;
     } = {},
 ) {
     logger.debug(`[happyMCP] server:start sessionId=${client.sessionId}`);
@@ -598,8 +628,10 @@ export async function startHappyServer(
         logger.debug('[happyMCP] legacy browser_* tools disabled by HAPPY_BROWSER_TASK_RUNTIME_URL (agent browser PoC)');
     }
 
+    // An installer-managed browser host (shared tenancy or browser-only) is not the signed-in person's own PC.
+    const managedBrowserHost = !!browserTaskRuntime && (process.env.HAPPY_BROWSER_TASK_TENANCY === 'shared' || process.env.HAPPY_BROWSER_TASK_HOST_MODE === 'browser-only');
     const computerAvailable = async () => {
-        if (options.mandatorySandbox || browserTaskRuntime) return false;
+        if (options.mandatorySandbox || managedBrowserHost) return false;
         try {
             const context = await localToolAgentContext(client.sessionId, client.getMetadata()?.machineId);
             if (!context) return false;
@@ -610,6 +642,11 @@ export async function startHappyServer(
     };
     const initialComputerAvailable = await computerAvailable();
     const changeTitle = createChangeTitleHandler(client);
+    const linkedPullRequestTools = options.linkedPullRequestTools === true && !options.mandatorySandbox
+        && process.env.HAPPY_WRITE_SCOPE_SESSION !== '1';
+    if (options.linkedPullRequestTools !== undefined) {
+        client.updateMetadata((metadata) => withLinkedPullRequestCapability(metadata, linkedPullRequestTools), { skipUnchanged: true });
+    }
     // The same-UID Linux scope boundary denies socket(AF_UNIX); do not start without Happy tools.
     if (options.mandatorySandbox && options.sameUidSandbox && process.platform === 'linux') {
         throw new MandatorySandboxError('capability-unavailable', 'Same-UID Linux scope MCP transport unavailable');
@@ -665,6 +702,7 @@ export async function startHappyServer(
             admitTool: options.admitTool,
             client,
             mandatorySandbox: options.mandatorySandbox,
+            linkedPullRequestTools,
             proposeLesson: options.proposeLesson,
             turnCards: options.turnCards,
             protectedBashCwd: options.protectedBashCwd,
@@ -750,7 +788,7 @@ export async function startHappyServer(
         socketPath,
         mcpConfig,
         bridgeEnv,
-        toolNames: [...(browserTask?.localClients ? LOCAL_CLIENT_TOOL_NAMES : []), ...(options.mandatorySandbox ? [] : TURN_CARD_TOOL_NAMES), ...(initialComputerAvailable ? ['local_tool_capabilities', 'local_tool_control'] : []), ...(options.checkpointReader ? ['checkpoint_status', 'checkpoint_list', 'checkpoint_preview', 'checkpoint_diff'] : []), ...(options.mandatorySandbox
+        toolNames: [...(browserTask?.localClients ? LOCAL_CLIENT_TOOL_NAMES : []), ...(options.mandatorySandbox ? [] : TURN_CARD_TOOL_NAMES), ...(linkedPullRequestTools ? LINKED_PULL_REQUEST_TOOL_NAMES : []), ...(initialComputerAvailable ? ['local_tool_capabilities', 'local_tool_control'] : []), ...(options.checkpointReader ? ['checkpoint_status', 'checkpoint_list', 'checkpoint_preview', 'checkpoint_diff'] : []), ...(options.mandatorySandbox
             ? ['change_title', ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : [])]
             : [...(options.proposeLesson ? ['propose_lesson'] : []), 'change_title', 'bash_stream', 'script_automations', ...(process.env.HAPPY_WRITE_SCOPE_SESSION === '1' ? [] : ['scheduled_tasks']), ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : BROWSER_TOOL_NAMES)])],
         stop: () => {

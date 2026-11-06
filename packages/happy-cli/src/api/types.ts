@@ -289,6 +289,12 @@ export const MachineMetadataSchema = z.object({
   writeFileAttempt: z.object({ version: z.literal(1) }).optional(),
   /** This daemon serves `listFilesPage` (aplus-dev-studio specs/remote-file-list-pages). */
   listFilesPage: z.object({ version: z.literal(1) }).optional(),
+  /**
+   * Availability hint for newly launched Claude sessions. Detached sessions can outlive daemon
+   * upgrades: clients must check the target session's runtimeCapabilities.permissionGrants before
+   * offering a prefix grant. This machine marker alone never authorizes one.
+   */
+  permissionGrants: z.object({ bashPrefixMatcher: z.literal('plain-v1') }).optional(),
   /** Profile-based no-shell execution negotiated by Desktop extensions. */
   machineRun: z.object({
     protocolVersion: z.literal(1),
@@ -332,7 +338,7 @@ export const MachineMetadataSchema = z.object({
    * Agent Browser execution machine. protocol 2: spawns accept `browserAttestation` (a session-user
    * attestation). Studio sends one only when this is reported, and treats the machine by `tenancyMode`.
    */
-  agentBrowser: z.object({ profileId: z.string().min(1).max(256).optional(), protocol: z.number().int().positive(), tenancyMode: z.enum(['dedicated', 'shared']), hostMode: z.enum(['browser-only', 'dedicated-host']).optional() }).optional(),
+  agentBrowser: z.object({ desktopLogin: z.literal(1).optional(), profileId: z.string().min(1).max(256).optional(), protocol: z.number().int().positive(), tenancyMode: z.enum(['dedicated', 'shared']), hostMode: z.enum(['browser-only', 'dedicated-host']).optional() }).optional(),
 })
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>
@@ -590,7 +596,26 @@ export type Metadata = {
      * an older runtime (or an agent without the wait), which never expires anything.
      */
     approvalLifecycle?: 1,
+    /**
+     * Published by the running Claude process, never inferred from machine metadata. Clients may
+     * offer Bash(<prefix>:*) only when this session advertises plain-v1; absent means unsupported,
+     * including an older session that survived a daemon upgrade.
+     */
+    permissionGrants?: { bashPrefixMatcher: 'plain-v1' },
+    /**
+     * aplus-dev-studio-desktop specs/linked-pull-requests R1-3 — this session's agent has the
+     * `saycode_pr_link`/`saycode_pr_watch` tools. Clients use it only for that; reading and writing
+     * `linkedPullRequests` does not depend on it.
+     */
+    linkedPullRequests?: 1,
   },
+  /**
+   * aplus-dev-studio-desktop specs/linked-pull-requests R1-1 — up to 20 `LinkedPullRequest` entries
+   * (claude/utils/linkedPullRequestTools.ts), written by the agent's tools and by Saycode Desktop.
+   * `unknown` for the reason `difficultyRoutingState` is: another client writes it, so every reader
+   * goes through `readLinkedPullRequests` and every writer keeps what it cannot read.
+   */
+  linkedPullRequests?: unknown,
   /** aplus-dev-studio specs/e2ee-machine-control-boundary R18 — reads bound session-scope requests. */
   rpcBinding?: RpcBindingCapability,
   name?: string,

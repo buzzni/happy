@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import tweetnacl from 'tweetnacl'
@@ -131,6 +131,36 @@ describe('serverAutomationCache', () => {
     expect(() => cache.applySync({ serverTime: 2, nextSeq: '1', changes: [] })).toThrow('automation-sync-invalid')
     expect(() => cache.applySync({ serverTime: 2, nextSeq: '3', changes: [{ kind: 'UPSERT' }] })).toThrow('automation-sync-invalid')
     expect(readFileSync(file, 'utf8')).toBe(before)
+  })
+
+  it('quarantines a previous v5 cache without losing supported work, cancellation targets or acknowledgements', () => {
+    const encrypted = bundle({ name: 'task' }, tweetnacl.box.keyPair().publicKey)
+    const supported = { automationId: 'legacy', revision: 2, generation: 1, payloadVersion: 4, ...encrypted, machineKeyVersion: 1, paused: false, enabledAt: 1 }
+    const native = { ...supported, automationId: 'native', payloadVersion: 5 }
+    const original = JSON.stringify({ version: 1, conversationSync: true, chatLifecycleSync: true, cursor: '99', serverTime: 100, syncedAt: 100,
+      automations: [supported, native], pendingAcknowledgements: [{ automationId: 'legacy', revision: 2 }, { automationId: 'native', revision: 2 }],
+      pendingCancellations: [{ ...supported, automationId: 'cancel' }, { ...native, automationId: 'native-cancel' }] })
+    writeFileSync(file, original)
+    const cache = createServerAutomationCache({ filePath: file })
+    expect(cache.read()).toMatchObject({ cursor: 0n, automations: [supported], pendingAcknowledgements: [{ automationId: 'legacy', revision: 2 }], pendingCancellations: [{ ...supported, automationId: 'cancel' }] })
+    const backups = readdirSync(dir).filter(name => name.includes('unsupported-v5'))
+    expect(backups).toHaveLength(1)
+    expect(readFileSync(path.join(dir, backups[0]), 'utf8')).toBe(original)
+    if (process.platform !== 'win32') expect(statSync(path.join(dir, backups[0])).mode & 0o777).toBe(0o600)
+    expect(createServerAutomationCache({ filePath: file }).read().cursor).toBe(0n)
+    cache.applySync({ serverTime: 101, nextSeq: '100', changes: [{ seq: '100', kind: 'TOMBSTONE', automationId: 'native', revision: 3, generation: 1 }] })
+    expect(cache.read().automations).toMatchObject([supported])
+    expect(cache.read().cursor).toBe(100n)
+  })
+
+  it('resyncs a previous reservation-aware cache once even when only v4 rows remain', () => {
+    const cache = createServerAutomationCache({ filePath: file })
+    cache.applySync({ serverTime: 100, nextSeq: '99', changes: [] })
+    const disk = JSON.parse(readFileSync(file, 'utf8'))
+    writeFileSync(file, JSON.stringify({ ...disk, reservationSync: true }))
+    expect(cache.read().cursor).toBe(0n)
+    cache.applySync({ serverTime: 101, nextSeq: '100', changes: [] })
+    expect(cache.read().cursor).toBe(100n)
   })
 
   it('fails closed on a corrupt cache instead of silently resetting its cursor', () => {

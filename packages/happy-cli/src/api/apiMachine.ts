@@ -29,9 +29,10 @@ import {
     type SpawnSessionResult,
 } from '../modules/common/registerCommonHandlers';
 import { LIST_FILES_PAGE_CAPABILITY } from '../modules/common/listFilesPageCapability';
+import { BASH_PREFIX_MATCHER_CAPABILITY } from '../claude/utils/bashPrefixMatcher';
 import { createManagedProjectWriteScopePolicy, TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '../modules/common/machineRunProfile';
 import { hostManagedMachineTools } from '../modules/common/moaiMachineRunProfiles';
-import { resolveDaemonAllowedRoot } from '../modules/common/resolveAllowedRoot';
+import { resolveDaemonAllowedRoot, resolveDaemonApprovedRoots } from '../modules/common/resolveAllowedRoot';
 import { REMOTE_TERMINAL_DISABLED_ERROR, resolveMachineLockdownPolicy } from '../daemon/machineLockdownPolicy';
 import { homedir } from 'node:os';
 import { encodeBase64, decodeBase64, encrypt, decrypt, tryDecrypt } from './encryption';
@@ -626,6 +627,7 @@ type MachineRpcHandlers = {
      * Chat(beta)) keeps the session instead of deleting it, so the attention after an approval or a login
      * can resume it. Absent on a machine without the browser runtime.
      */
+    browserSessionPrepare?: (sessionId: string) => Promise<{ supported: boolean; reconnect?: boolean }>;
     browserSessionWaiting?: (sessionId: string) => Promise<boolean>;
     aiCredentialRuntime: AiCredentialRuntime;
     autonomousQualityGate?: AutonomousQualityGateRpcHandlers;
@@ -916,6 +918,8 @@ export class ApiMachineClient {
     // terminal-open-fwd handler can run validatePath against the same
     // root the rest of the RPC surface uses (Files tab / writeFile).
     private allowedRoot: string;
+    /** aplus-dev-studio specs/approved-folder-roots — folders outside allowedRoot the machine owner approved. */
+    private approvedRoots: (() => readonly string[]) | undefined;
     /**
      * The pending next dial. Non-null means "a retry cadence is running", which
      * is all `getConnectionHealth()` and the connection supervisor read it for.
@@ -1021,7 +1025,9 @@ export class ApiMachineClient {
         // project's workspaceDir.
         const allowedRoot = resolveDaemonAllowedRoot(process.env, homedir());
         this.allowedRoot = allowedRoot;
+        this.approvedRoots = resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir);
         registerCommonHandlers(this.rpcHandlerManager, allowedRoot, {
+            approvedRoots: this.approvedRoots,
             // Machine scope is the Desktop machine.run path and the only one that
             // may run managed writes; its lock is per daemon process.
             machineRun: {
@@ -1167,6 +1173,7 @@ export class ApiMachineClient {
         linkSpawnedSession,
         difficultyRouting,
         browserSessionWaiting,
+        browserSessionPrepare,
         channelHostCall,
         ownedSpawn,
     }: MachineRpcHandlers) {
@@ -1174,6 +1181,13 @@ export class ApiMachineClient {
         this.daemonSessionStateRpcAvailable = !!daemonSessionState;
         if (daemonSessionState) {
             this.rpcHandlerManager.registerHandler('daemon-session-state', daemonSessionState);
+        }
+        if (browserSessionPrepare) {
+            this.rpcHandlerManager.registerHandler('browser-session-prepare', async (params: unknown) => {
+                const row = params as { sessionId?: unknown } | null;
+                if (!row || Object.keys(row).join(',') !== 'sessionId' || typeof row.sessionId !== 'string' || !row.sessionId || row.sessionId.length > 256) throw Error('Invalid browser session');
+                return browserSessionPrepare(row.sessionId);
+            });
         }
         if (browserSessionWaiting) {
             this.rpcHandlerManager.registerHandler('browser-session-waiting', async (params: unknown) => {
@@ -1442,6 +1456,7 @@ export class ApiMachineClient {
                 model,
                 effort,
                 environmentVariables,
+                seedDefaultAgentGrant: true,
                 additionalDirectories: validAdditionalDirectories,
                 token,
                 happyToken,
@@ -4030,7 +4045,7 @@ export class ApiMachineClient {
                     homedir: homedir(),
                     fsExists: existsSync,
                     fsMkdir: (path) => mkdirSync(path, { recursive: true }),
-                    validate: validatePath,
+                    validate: (path, root) => validatePath(path, root, this.approvedRoots?.()),
                 });
                 let pty: ReturnType<typeof createPtySession>;
                 try {
@@ -4424,6 +4439,11 @@ export class ApiMachineClient {
             const advertisedListFilesPage = this.managedHandlers ? undefined : LIST_FILES_PAGE_CAPABILITY;
             const listFilesPageStale = JSON.stringify(this.machine.metadata?.listFilesPage)
                 !== JSON.stringify(advertisedListFilesPage);
+            // Availability hint only: every live session owns its permission handler and must
+            // publish its own runtimeCapabilities.permissionGrants, including on a managed runtime.
+            // Detached older sessions do not gain that session marker when this daemon upgrades.
+            const permissionGrantsStale = JSON.stringify(this.machine.metadata?.permissionGrants)
+                !== JSON.stringify(BASH_PREFIX_MATCHER_CAPABILITY);
             const advertisedChannelHost = this.managedHandlers ? undefined : this.channelHostAdvertisement;
             const channelHostStale = JSON.stringify(this.machine.metadata?.channelHost)
                 !== JSON.stringify(advertisedChannelHost);
@@ -4472,7 +4492,7 @@ export class ApiMachineClient {
             // Bounded: an acknowledgement that never comes must not block every later change.
             const awaitingServer = this.capabilityUpdateInFlight !== null
                 && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
-            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || agentPlanStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || writeFileAttemptStale || listFilesPageStale)) {
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || agentPlanStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || writeFileAttemptStale || listFilesPageStale || permissionGrantsStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -4509,6 +4529,7 @@ export class ApiMachineClient {
                     structuredOutput: advertisedStructuredOutput,
                     writeFileAttempt: advertisedWriteFileAttempt,
                     listFilesPage: advertisedListFilesPage,
+                    permissionGrants: BASH_PREFIX_MATCHER_CAPABILITY,
                     channelHost: advertisedChannelHost,
                     rpcBinding: advertisedRpcBinding,
                     sealedSpawnEnv: advertisedSealedSpawnEnv,
