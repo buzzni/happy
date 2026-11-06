@@ -170,6 +170,13 @@ automatic daemon startup. Revisit this shortcut if spawning stops preserving
 direct OS parentage; an intermediary must use the verified fallback rather than
 an environment flag that bypasses ownership checks.
 
+When that verification only reports `DAEMON_HEALTH_UNCONFIRMED` (the recorded
+owner is alive but its control server missed one two-second probe), the launch
+checks again for up to 15 seconds before failing. A busy daemon then still gets
+the session report inside its 60-second session-start wait. The retry never
+starts or replaces a daemon and keeps every ownership check; an owner that stays
+unverified still blocks the launch.
+
 ```mermaid
 graph TB
     subgraph "Happy CLI"

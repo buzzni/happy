@@ -74,7 +74,7 @@ describe('ensureDaemonRunning', () => {
     })
   })
 
-  afterEach(() => vi.unstubAllEnvs())
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs() })
 
   it('returns without spawning when the daemon is already running', async () => {
     mocks.mockIsDaemonRunningCurrentlyInstalledHappyVersion.mockResolvedValue(true)
@@ -89,9 +89,45 @@ describe('ensureDaemonRunning', () => {
   })
 
   it('does not spawn a replacement when a live owner has unconfirmed health', async () => {
+    vi.useFakeTimers()
     mocks.mockIsDaemonRunningCurrentlyInstalledHappyVersion.mockRejectedValue(new Error('DAEMON_HEALTH_UNCONFIRMED'))
-    await expect(ensureDaemonRunning()).rejects.toThrow('DAEMON_HEALTH_UNCONFIRMED')
+    const outcome = expect(ensureDaemonRunning()).rejects.toThrow('DAEMON_HEALTH_UNCONFIRMED')
+    await vi.advanceTimersByTimeAsync(60_000)
+    await outcome
     expect(mocks.mockSpawnHappyCLI).not.toHaveBeenCalled()
+  })
+
+  // A daemon busy past one 2s probe is still the owner: its child keeps checking within the
+  // daemon's session-start wait instead of exiting before it can report in.
+  it('continues once a slow live owner confirms its health on a later check', async () => {
+    vi.useFakeTimers()
+    mocks.mockIsDaemonRunningCurrentlyInstalledHappyVersion
+      .mockRejectedValueOnce(new Error('DAEMON_HEALTH_UNCONFIRMED: PID 1 is alive'))
+      .mockResolvedValueOnce(true)
+    const outcome = expect(ensureDaemonRunning()).resolves.toBeUndefined()
+    await vi.advanceTimersByTimeAsync(5_000)
+    await outcome
+    expect(mocks.mockIsDaemonRunningCurrentlyInstalledHappyVersion).toHaveBeenCalledTimes(2)
+    expect(mocks.mockSpawnHappyCLI).not.toHaveBeenCalled()
+  })
+
+  it('gives up on an unconfirmed owner within the daemon session-start wait', async () => {
+    vi.useFakeTimers()
+    const DAEMON_SESSION_START_TIMEOUT_MS = 60_000
+    mocks.mockIsDaemonRunningCurrentlyInstalledHappyVersion.mockRejectedValue(new Error('DAEMON_HEALTH_UNCONFIRMED'))
+    let settledAt: number | undefined
+    const started = Date.now()
+    ensureDaemonRunning().catch(() => { settledAt = Date.now() - started })
+    await vi.advanceTimersByTimeAsync(DAEMON_SESSION_START_TIMEOUT_MS)
+    expect(settledAt).toBeDefined()
+    expect(settledAt!).toBeLessThan(DAEMON_SESSION_START_TIMEOUT_MS / 2)
+    expect(mocks.mockSpawnHappyCLI).not.toHaveBeenCalled()
+  })
+
+  it('does not retry errors other than unconfirmed health', async () => {
+    mocks.mockIsDaemonRunningCurrentlyInstalledHappyVersion.mockRejectedValue(new Error('EACCES'))
+    await expect(ensureDaemonRunning()).rejects.toThrow('EACCES')
+    expect(mocks.mockIsDaemonRunningCurrentlyInstalledHappyVersion).toHaveBeenCalledOnce()
   })
 
   it('continues a child of the online owning daemon without a second HTTP health check', async () => {
@@ -119,23 +155,29 @@ describe('ensureDaemonRunning', () => {
     ['an unbound control port', { httpPort: 0 }],
     ['missing control credentials', { controlSecret: undefined }],
   ])('retains normal health verification for %s', async (_name, changes) => {
+    vi.useFakeTimers()
     mocks.mockReadDaemonState.mockResolvedValue({ ...onlineParent(), ...changes })
     mocks.mockReadDaemonLockHolderPid.mockReturnValue(process.ppid)
     mocks.mockIsPidAlive.mockReturnValue(true)
     mocks.mockIsDaemonRunningCurrentlyInstalledHappyVersion.mockRejectedValue(new Error('DAEMON_HEALTH_UNCONFIRMED'))
 
-    await expect(ensureDaemonRunning()).rejects.toThrow('DAEMON_HEALTH_UNCONFIRMED')
-    expect(mocks.mockIsDaemonRunningCurrentlyInstalledHappyVersion).toHaveBeenCalledOnce()
+    const outcome = expect(ensureDaemonRunning()).rejects.toThrow('DAEMON_HEALTH_UNCONFIRMED')
+    await vi.advanceTimersByTimeAsync(60_000)
+    await outcome
+    expect(mocks.mockIsDaemonRunningCurrentlyInstalledHappyVersion).toHaveBeenCalled()
     expect(mocks.mockSpawnHappyCLI).not.toHaveBeenCalled()
   })
 
   it.each([null, process.ppid + 1])('retains verification when the daemon lock owner is %s', async lockPid => {
+    vi.useFakeTimers()
     mocks.mockReadDaemonState.mockResolvedValue(onlineParent())
     mocks.mockReadDaemonLockHolderPid.mockReturnValue(lockPid)
     mocks.mockIsPidAlive.mockReturnValue(true)
     mocks.mockIsDaemonRunningCurrentlyInstalledHappyVersion.mockRejectedValue(new Error('DAEMON_HEALTH_UNCONFIRMED'))
 
-    await expect(ensureDaemonRunning()).rejects.toThrow('DAEMON_HEALTH_UNCONFIRMED')
+    const outcome = expect(ensureDaemonRunning()).rejects.toThrow('DAEMON_HEALTH_UNCONFIRMED')
+    await vi.advanceTimersByTimeAsync(60_000)
+    await outcome
     expect(mocks.mockSpawnHappyCLI).not.toHaveBeenCalled()
   })
 
@@ -283,11 +325,13 @@ describe('daemon parent handoff across real processes', () => {
       const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('HAPPY_')))
       const { stdout } = await promisify(execFile)(process.execPath,
         ['--import', 'tsx', '--input-type=module', '-e', script],
-        { timeout: 20_000, env: { ...env, HAPPY_HOME_DIR: home, TSX_TSCONFIG_PATH: join(process.cwd(), 'tsconfig.json') } })
+        { timeout: 30_000, env: { ...env, HAPPY_HOME_DIR: home, TSX_TSCONFIG_PATH: join(process.cwd(), 'tsconfig.json') } })
       const result = JSON.parse(stdout.trim().split('\n').at(-1)!)
       expect(result.parentPid).toBe(process.pid)
       expect(result.phase).toBe(ownsLock ? 'ready' : 'blocked')
-      expect(healthRequests).toBe(ownsLock ? 0 : 1)
+      // An unverified owner is checked again for a bounded window, then still blocks the report.
+      if (ownsLock) expect(healthRequests).toBe(0)
+      else expect(healthRequests).toBeGreaterThan(1)
       expect(reports).toEqual(ownsLock ? [{ authenticated: true, sessionId: 'parent-fixture-session', hostPid: result.childPid }] : [])
       expect(await readFile(stateFile, 'utf8')).toBe(state)
       expect(await readFile(lockFile, 'utf8')).toBe(lock)
@@ -296,5 +340,5 @@ describe('daemon parent handoff across real processes', () => {
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
       await rm(home, { recursive: true, force: true })
     }
-  }, 25_000)
+  }, 35_000)
 })
