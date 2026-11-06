@@ -1,7 +1,6 @@
 import { createLocalClientSession, registerLocalClientTools, LOCAL_CLIENT_TOOL_NAMES, type LocalClientSession } from '@/browserRuntime/localClientSession';
 import type { PolicyApprover } from '@/toolPolicy/policyGate';
 import { startSessionAgentBroker } from '@/commands/sessionAgentBroker';
-import { configuration } from '@/configuration';
 import { startHostOwnerContact, takeOwnerContactCapability } from '@/daemon/sessionOwnerContactHost';
 import { isDaemonCallerBindingCurrent, requestDaemonCallerBinding } from '@/daemon/controlClient';
 import { readCredentials } from '@/persistence';
@@ -763,10 +762,8 @@ export async function startHappyServer(
     const ownerContact = await startHostOwnerContact({ env: process.env, session: client,
         capability: () => takeOwnerContactCapability(process.env), issue: requestDaemonCallerBinding, current: isDaemonCallerBindingCurrent,
         token: async () => (await readCredentials())?.token ?? null,
-        // The broker's personal same-account check needs this host's own Happy origin (identity-adapter-plan H-C).
-        happyOrigin: configuration.serverUrl,
-        startBroker: (contact, identity) => options.agentControl
-            ? startSessionAgentBroker(client.sessionId, process.env, options.admitTool, undefined, options.delegatedAttendance, identity, contact)
+        startBroker: contact => options.agentControl
+            ? startSessionAgentBroker(client.sessionId, process.env, options.admitTool, undefined, options.delegatedAttendance, undefined, contact)
             : Promise.resolve(null) });
     const agentBroker = ownerContact.broker;
     // Env for the stdio bridge. Codex and ACP agents receive it over JSON-RPC, not argv.

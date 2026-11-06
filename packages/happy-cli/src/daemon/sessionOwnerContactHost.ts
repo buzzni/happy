@@ -10,11 +10,8 @@ import { createSessionOwnerContact, type SessionOwnerContact } from './sessionOw
 import { createOwnerContactNetwork } from './sessionOwnerContactNetwork';
 import { startSessionOwnerContactLocal } from './sessionOwnerContactLocal';
 import { OWNER_CONTACT_FD, OWNER_CONTACT_SWITCH } from './agentCallerLaunches';
-import { createAgentIdentityAuthority, type AgentIdentityAuthority } from './agentIdentityDescriptor';
-import { createAgentIdentityAdapter } from './agentIdentityAdapter';
 
 type Caller = z.infer<typeof OwnershipCallerBindingSchema>;
-type Trust = z.infer<typeof issuedSchema>['trust'];
 const issuedSchema = z.object({ caller: OwnershipCallerBindingSchema, trust: z.object({ issuer: z.string().min(1), audience: z.string().min(1),
     publicKeys: z.record(z.string(), z.string()), lookupOrigin: z.string().url() }).strict() }).strict();
 export interface OwnerContactHostSession {
@@ -23,7 +20,7 @@ export interface OwnerContactHostSession {
     runtimeId: string;
     callOwnerRelay(method: string, request: unknown, signal: AbortSignal): Promise<unknown>;
 }
-export interface OwnerContactHost { binding: Caller; trust: Trust; contact: SessionOwnerContact; close(): void }
+export interface OwnerContactHost { binding: Caller; contact: SessionOwnerContact; close(): void }
 type LaunchReport = { sessionId: string; runtimeId: string; hostPid: number; callerPublicKey: string; capability: string };
 const CAPABILITY = /^[A-Za-z0-9_-]{43}$/;
 
@@ -83,7 +80,7 @@ export async function startSessionOwnerContactHost(input: {
             } },
             ...createOwnerContactNetwork({ origin: lookupOrigin, token: input.token, fetch: input.fetch,
                 rpc: (method, request, signal) => input.session.callOwnerRelay(method, request, signal) }) });
-        return { binding: { ...binding }, trust: issued.trust, contact, close: () => contact.close() };
+        return { binding: { ...binding }, contact, close: () => contact.close() };
     } catch {
         // Unavailable owner relay never blocks the host, provider, existing reads or descendant control.
         keys.secretKey.fill(0);
@@ -105,30 +102,18 @@ export async function startHostOwnerContact<Broker>(input: {
     current(binding: Caller): Promise<boolean>;
     token(): Promise<string | null>;
     fetch?: typeof fetch;
-    /** This host's Happy server origin. Without it the broker gets no personal same-account authority. */
-    happyOrigin?: string;
-    startBroker(contact: SessionOwnerContact | undefined, identity?: AgentIdentityAuthority): Promise<Broker | null>;
+    startBroker(contact: SessionOwnerContact | undefined): Promise<Broker | null>;
 }): Promise<{ broker: Broker | null; close(): Promise<void> }> {
     const capability = await input.capability();
     // An inherited address names another host's contact, so no path may hand it to this host's provider.
     delete input.env.SAYCODE_OWNER_CONTACT_SOCKET;
-    const startBroker = (contact: SessionOwnerContact | undefined, identity: AgentIdentityAuthority | undefined) =>
-        identity ? input.startBroker(contact, identity) : input.startBroker(contact);
-    const switchOn = input.env[OWNER_CONTACT_SWITCH] === '1';
-    // Same short-circuit order as before: no capability, or neither consumer, never asks for the managed origin.
-    if (!capability || (!switchOn && !input.happyOrigin) || input.session.getManagedOrigin() !== null) {
+    if (input.env[OWNER_CONTACT_SWITCH] !== '1' || input.session.getManagedOrigin() !== null || !capability) {
         return { broker: await input.startBroker(undefined), close: async () => {} };
-    }
-    if (!switchOn) {
-        // Owner contact off: the daemon may still issue a binding for the broker's same-account check (D2).
-        const identity = input.happyOrigin ? await issueIdentityAuthority(input, capability) : undefined;
-        return { broker: await startBroker(undefined, identity), close: async () => {} };
     }
     let closed = false;
     const host = await startSessionOwnerContactHost({ enabled: true, session: input.session, hostPid: input.hostPid,
         live: () => !closed, capability, issue: input.issue, current: input.current, token: input.token, fetch: input.fetch });
-    const identity = host ? identityAuthority(input, host.binding, host.trust) : undefined;
-    const broker = await startBroker(host ? hostEntryPolicy(host, 'broker') : undefined, identity);
+    const broker = await input.startBroker(host ? hostEntryPolicy(host, 'broker') : undefined);
     const socketContact = host && hostEntryPolicy(host, broker ? 'chat-socket' : 'direct-socket');
     const local = socketContact ? await startSessionOwnerContactLocal({ enabled: true, contact: socketContact }).catch(() => null) : null;
     const address = local?.environment.SAYCODE_OWNER_CONTACT_SOCKET;
@@ -139,28 +124,6 @@ export async function startHostOwnerContact<Broker>(input: {
         host?.close();
         await local?.close();
     } };
-}
-type IdentityInput = { session: OwnerContactHostSession; hostPid?: number; issue(report: LaunchReport): Promise<unknown>;
-    current(binding: Caller): Promise<boolean>; token(): Promise<string | null>; fetch?: typeof fetch; happyOrigin?: string };
-/** The broker's personal same-account authority over the daemon-issued binding and trust (identity-adapter-plan H-C). */
-function identityAuthority(input: IdentityInput, binding: Caller, trust: Trust): AgentIdentityAuthority | undefined {
-    if (!input.happyOrigin) return undefined;
-    return createAgentIdentityAuthority(createAgentIdentityAdapter({ binding, trust, happyOrigin: input.happyOrigin,
-        current: () => input.current(binding), token: input.token, fetch: input.fetch }));
-}
-/** Identity-only bootstrap: the binding proves which machine and account this host runs as, and nothing is ever
- * signed with it, so the secret half of the reported key is discarded at once. Any failure leaves no authority. */
-async function issueIdentityAuthority(input: IdentityInput, capability: string): Promise<AgentIdentityAuthority | undefined> {
-    const keys = nacl.sign.keyPair();
-    keys.secretKey.fill(0);
-    const callerPublicKey = Buffer.from(keys.publicKey).toString('base64url');
-    try {
-        const issued = issuedSchema.parse(await input.issue({ sessionId: input.session.sessionId, runtimeId: input.session.runtimeId,
-            hostPid: input.hostPid ?? process.pid, callerPublicKey, capability }));
-        if (issued.caller.sessionId !== input.session.sessionId || issued.caller.runtimeId !== input.session.runtimeId
-            || issued.caller.callerPublicKey !== callerPublicKey) return undefined;
-        return identityAuthority(input, issued.caller, issued.trust);
-    } catch { return undefined; }
 }
 const OWNED_CHILD_OPERATIONS = new Set(['spawn-owned-child', 'owned-child-status']);
 /** The sibling controls (Desktop amendment S1/S2) — steer, and an agent-entry abort (sibling stop) — reach main only as a depth 0
