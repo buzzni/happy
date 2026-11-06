@@ -62,8 +62,9 @@ const BLOCK_MESSAGE = [
 const VALUE_OPTIONS = new Set(['-F', '-G', '-M', '-N', '-P', '-U', '-g', '-j', '-s', '-t', '-u', '--signal',
     '--uid', '--euid', '--group', '--pgroup', '--parent', '--session', '--terminal', '--pidfile', '--ns', '--nslist',
     '--runstates', '--env', '--cgroup']);
-// pkill-only options that pick the signal or the output, not the processes; left out of the pgrep preview.
-const NON_SELECTING_OPTION = /^-(?:\d+|[A-Z][A-Z0-9]+|e|I|l|q|c|-echo|-count|-signal=.*)$/;
+// Left out of the pgrep preview: pkill-only options that pick the signal or the output, and the newest/oldest
+// selectors — Linux pgrep does not skip its parent, so the hook could be the "newest" now and gone when pkill runs.
+const NON_SELECTING_OPTION = /^-(?:\d+|[A-Z][A-Z0-9]+|e|I|l|q|c|n|o|-echo|-count|-newest|-oldest|-signal=.*)$/;
 const PREFIX_WORDS = new Set(['sudo', 'command', 'exec', 'nohup', 'time', 'env']);
 
 // Command lines of the agent runtime: the installed happy CLI (daemon, sessions, MCP proxies), the Claude
@@ -110,7 +111,12 @@ function commandSegments(command) {
             start();
             let j = i + 1;
             for (; j < command.length && command[j] !== '"'; j++) {
-                if (command[j] === '\\') { word.text += command[j + 1] ?? ''; j++; continue; }
+                // Inside double quotes a backslash escapes only $ ` " \ and newline; before anything else it stays.
+                if (command[j] === '\\' && '$`"\\\n'.includes(command[j + 1] ?? '')) {
+                    if (command[j + 1] !== '\n') word.text += command[j + 1];
+                    j++;
+                    continue;
+                }
                 if (command[j] === '$' || command[j] === '`') word.dynamic = true;
                 word.text += command[j];
             }

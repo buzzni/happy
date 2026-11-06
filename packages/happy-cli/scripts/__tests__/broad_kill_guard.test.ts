@@ -121,6 +121,20 @@ describe('findKillHazard: preview of what pkill would match', () => {
         expect(calls).toEqual([['-f', 'vitest'], ['-x', 'vitest']]);
     });
 
+    it('keeps a backslash inside double quotes unless it escapes $ ` " \\ or a newline, as sh does', () => {
+        const calls: string[][] = [];
+        findKillHazard('pkill -f "a\\(1\\)\\$b\\"c"', { listMatches: (args: string[]) => { calls.push(args); return []; } });
+        expect(calls).toEqual([['-f', 'a\\(1\\)$b"c']]);
+    });
+
+    // Linux pgrep does not skip its parent: the hook can be the newest match now and gone when pkill runs.
+    it('previews every candidate instead of only the newest or oldest', () => {
+        const calls: string[][] = [];
+        const listMatches = (args: string[]) => { calls.push(args); return []; };
+        for (const option of ['-n', '-o', '--newest', '--oldest']) findKillHazard(`pkill ${option} -f vitest`, { listMatches });
+        expect(calls).toEqual(Array(4).fill(['-f', 'vitest']));
+    });
+
     it('allows when the preview cannot run', () => {
         expect(findKillHazard('pkill -f vitest', { listMatches: () => null })).toBeNull();
     });
@@ -162,6 +176,22 @@ describe('broad_kill_guard hook process behavior', () => {
             const { status, stderr } = runGuard(JSON.stringify({
                 tool_name: 'Bash',
                 tool_input: { command: `pkill -f ${marker}` }
+            }));
+            expect(status).toBe(2);
+            expect(stderr).toContain(String(fake.pid));
+        } finally {
+            fake.kill();
+        }
+    });
+
+    it.skipIf(process.platform === 'win32')('matches a double-quoted escaped regex the way the shell passes it', async () => {
+        const marker = `guardesc${process.pid}${Date.now()}`;
+        const fake = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', `/opt/lib/node_modules/@buzzni/happy-cli/${marker}(1)`], { stdio: 'ignore' });
+        try {
+            await new Promise(resolve => setTimeout(resolve, 300));
+            const { status, stderr } = runGuard(JSON.stringify({
+                tool_name: 'Bash',
+                tool_input: { command: `pkill -f "${marker}\\(1\\)"` }
             }));
             expect(status).toBe(2);
             expect(stderr).toContain(String(fake.pid));
