@@ -261,6 +261,21 @@ export const automationRunStatusSchema = z.enum([
   'CLAIMED', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED', 'EXPIRED', 'ABANDONED',
 ]);
 export const automationRunOutcomeSchema = z.enum(['WOKE', 'SILENT', 'SKIPPED_GATE', 'ERROR', 'NO_CHANGE']);
+/** Public state codes only; provider/HTTP diagnostics and task text never enter run history. */
+export const automationExecutionHoldCodeSchema = z.enum([
+  'WORKSPACE_BUSY', 'WORKSPACE_OWNER_UNCONFIRMED', 'WORKSPACE_REGISTRY_BUSY',
+  'AUTOMATION_REFERENCE_UNAVAILABLE', 'AUTOMATION_REFERENCE_UNCONFIRMED',
+  'AUTOMATION_REFERENCE_TOO_LARGE', 'AUTOMATION_REFERENCE_CHANGED',
+  'AUTOMATION_AUTHORIZATION_UNCONFIRMED', 'AUTOMATION_START_UNCONFIRMED', 'AUTOMATION_HOLD_UNCONFIRMED',
+]);
+export type AutomationExecutionHoldCode = z.infer<typeof automationExecutionHoldCodeSchema>;
+export const automationRunHeartbeatRequestSchema = z.object({
+  runId: z.string().min(1).max(160),
+  claimToken: z.string().min(1).max(256),
+  // Omission preserves state; explicit null clears a previous hold.
+  holdCode: automationExecutionHoldCodeSchema.nullable().optional(),
+});
+export type AutomationRunHeartbeatRequest = z.infer<typeof automationRunHeartbeatRequestSchema>;
 export const automationRunSchema = z.object({
   id: z.string().min(1),
   automationId: z.string().min(1),
@@ -272,6 +287,7 @@ export const automationRunSchema = z.object({
   outcome: automationRunOutcomeSchema.nullable(),
   detailCiphertext: base64Schema(PAYLOAD_MAX_BYTES).nullable(),
   failureCode: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/).nullable().optional(),
+  holdCode: automationExecutionHoldCodeSchema.nullable().optional(),
   degradedCode: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/).nullable().optional(),
   queueDepth: z.number().int().min(0).max(10_000).nullable().optional(),
   queuePosition: z.number().int().min(0).max(10_000).nullable().optional(),

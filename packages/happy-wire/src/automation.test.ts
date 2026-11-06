@@ -6,6 +6,7 @@ import {
   automationPayloadSchema,
   githubTriggerSchema,
   automationRunSchema,
+  automationRunHeartbeatRequestSchema,
   automationTargetSchema,
   createAutomationApiClient,
   decryptAutomationPayload,
@@ -178,6 +179,30 @@ describe('automation wire contract', () => {
     expect(automationRunSchema.parse(run)).toEqual(run);
     expect(automationRunSchema.parse({ ...run, outcome: 'NO_CHANGE' }).outcome).toBe('NO_CHANGE');
     expect(automationRunSchema.safeParse({ ...run, degradedCode: 'secret: do not expose' }).success).toBe(false);
+  });
+
+  it('preserves only bounded waiting codes on run history without exposing raw diagnostics', () => {
+    const run = { id: 'run-1', automationId: 'automation-1', generation: 1, scheduledFor: 1,
+      machineId: 'machine-1', status: 'RUNNING', sessionId: null, outcome: null, detailCiphertext: null,
+      claimedAt: 1, startedAt: 2, completedAt: null, lateReport: false };
+    expect(automationRunSchema.parse({ ...run, holdCode: 'WORKSPACE_BUSY' })).toHaveProperty('holdCode', 'WORKSPACE_BUSY');
+    expect(automationRunSchema.parse({ ...run, holdCode: null })).toHaveProperty('holdCode', null);
+    expect(automationRunSchema.parse(run)).not.toHaveProperty('holdCode');
+    expect(automationRunSchema.safeParse({ ...run, holdCode: 'raw diagnostic containing private input' }).success).toBe(false);
+    expect(automationRunSchema.safeParse({ ...run, holdCode: 'UNREVIEWED_CODE' }).success).toBe(false);
+  });
+
+  it('distinguishes omitted heartbeat state from explicit clearing and refuses unbounded reasons', () => {
+    const schema = automationRunHeartbeatRequestSchema;
+    const original = { runId: 'run-1', claimToken: 'private-claim' };
+    expect(schema.parse(original)).toEqual(original);
+    expect(schema.parse({ ...original, holdCode: null })).toEqual({ ...original, holdCode: null });
+    expect(schema.parse({ ...original, holdCode: 'WORKSPACE_OWNER_UNCONFIRMED' }))
+      .toEqual({ ...original, holdCode: 'WORKSPACE_OWNER_UNCONFIRMED' });
+    for (const holdCode of ['private diagnostic', 'UNREVIEWED_CODE', 1]) {
+      expect(schema.safeParse({ ...original, holdCode }).success).toBe(false);
+    }
+    expect(schema.parse({ ...original, machineId: 'untrusted' })).toEqual(original);
   });
 
   it('rejects payloads that the daemon cannot execute safely', () => {
