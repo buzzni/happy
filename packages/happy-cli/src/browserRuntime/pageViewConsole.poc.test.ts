@@ -16,6 +16,12 @@ const BINDING = 'binding-1'
 const identity = { kind: 'interactive', profileId: 'profile-a', principalId: 'user-1', viewerSessionId: 'viewer-this' }
 const capability = (tag: string, claims: Record<string, unknown>) =>
     `abp2.${b64({ alg: 'EdDSA', kid: 'k', typ: 'abp-cap' })}.${b64({ ...identity, capabilityId: tag, expiresAtMs: Date.now() + 600_000, ...claims })}.sig-${tag}`
+/** eventually() that fails the test when the condition never holds (eventually itself returns the last value). */
+async function until<T>(fn: () => T | Promise<T>, ok: (value: T) => boolean, timeoutMs = 5_000): Promise<T> {
+    const value = await eventually(fn, ok, timeoutMs)
+    if (!ok(value)) throw new Error(`condition not met within ${timeoutMs} ms; last value: ${JSON.stringify(value)?.slice(0, 300)}`)
+    return value
+}
 const bootstrap = (tag: string) => capability(tag, { operations: ['pageViewInfo'] })
 const scoped = (tag: string) => capability(tag, { operations: ['listTasks', 'getTask', 'takeOver', 'releaseControl', 'resume', 'cancel', 'approve', 'subscribe',
     'openPageView', 'getPageFrame', 'dispatchPageInput', 'closePageView'], pageViewScope: { schemaVersion: 1, agentSessionId: SESSION, runtimeBindingId: BINDING } })
@@ -114,11 +120,11 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
     /** Bootstrap, then the scoped capability; resolves once the first frame is on screen. */
     async function openRemote(): Promise<string> {
         const target = await harness.openFrontTab(`${origin}/console?remotePage=1&agentSessionId=${SESSION}&lang=en`)
-        await eventually(() => harness.evaluate(target, 'window.__abpPageView'), (v) => v === 1)
+        await until(() => harness.evaluate(target, 'window.__abpPageView'), (v) => v === 1)
         await hand(target, bootstrap('boot'))
-        expect(await eventually(() => harness.evaluate(target, 'window.__abpPageViewBinding'), (v) => v === BINDING)).toBe(BINDING)
+        expect(await until(() => harness.evaluate(target, 'window.__abpPageViewBinding'), (v) => v === BINDING)).toBe(BINDING)
         await hand(target, scoped('scoped'))
-        await eventually(() => harness.evaluate(target, `!document.getElementById('page').hidden`), Boolean, 10_000)
+        await until(() => harness.evaluate(target, `!document.getElementById('page').hidden`), Boolean, 10_000)
         return target
     }
 
@@ -129,7 +135,7 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
             expect(ops.find((o) => o.op === 'pageViewInfo')).toMatchObject({ bearer: expect.stringMatching(/\.sig-boot$/), body: { schemaVersion: 1, profileId: 'profile-a' } })
             expect(ops.filter((o) => o.bearer.endsWith('.sig-boot')).map((o) => o.op)).toEqual(['pageViewInfo'])
             expect(ops.find((o) => o.op === 'openPageView')?.body).toEqual({ schemaVersion: 1, agentSessionId: SESSION, runtimeBindingId: BINDING, taskId: 'task-1', tabId: 'tab-1' })
-            expect(await eventually(() => harness.evaluate(target, `document.getElementById('status').textContent`), (s) => s === 'Observing')).toBe('Observing')
+            expect(await until(() => harness.evaluate(target, `document.getElementById('status').textContent`), (s) => s === 'Observing')).toBe('Observing')
         } finally { await harness.closeTarget(target) }
     })
 
@@ -142,9 +148,9 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
             await harness.evaluate(target, 'new Promise(r => setTimeout(r, 600))')
             expect(ops.filter((o) => o.op === 'dispatchPageInput')).toEqual([])
             leaseOwner = { kind: 'user', principalId: 'user-1', viewerSessionId: 'viewer-this' }
-            await eventually(() => harness.evaluate(target, `document.getElementById('status').textContent`), (s) => s === 'You have control', 10_000)
+            await until(() => harness.evaluate(target, `document.getElementById('status').textContent`), (s) => s === 'You have control', 10_000)
             await click(target, box.x + box.width / 2, box.y + box.height / 2)
-            const sent = await eventually(() => ops.filter((o) => o.op === 'dispatchPageInput'), (list) => list.some((o) => o.body.event.type === 'mouseReleased'))
+            const sent = await until(() => ops.filter((o) => o.op === 'dispatchPageInput'), (list) => list.some((o) => o.body.event.type === 'mouseReleased'))
             const press = sent.find((o) => o.body.event.type === 'mousePressed')!
             expect(press.body).toMatchObject({ schemaVersion: 1, leaseEpoch: 4, frameId: expect.stringMatching(/^frame-/), event: { kind: 'pointer', button: 'left' } })
             expect(press.body.event.x).toBeCloseTo(320, -1)
@@ -167,7 +173,7 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
             expect(observed.length).toBeGreaterThanOrEqual(3)
             expect(Math.min(...gaps(observed))).toBeGreaterThanOrEqual(450)
             leaseOwner = { kind: 'user', principalId: 'user-1', viewerSessionId: 'viewer-this' }
-            await eventually(() => harness.evaluate(target, `document.getElementById('status').textContent`), (s) => s === 'You have control', 10_000)
+            await until(() => harness.evaluate(target, `document.getElementById('status').textContent`), (s) => s === 'You have control', 10_000)
             const controlling = Date.now()
             await wait(target, 1500)
             const controlled = gaps(frameReads(controlling))
@@ -183,7 +189,7 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
             await wait(target, 600)
             const refusedAt = Date.now()
             refuseFrames = 1
-            await eventually(() => refuseFrames, (n) => n === 0, 5_000)
+            await until(() => refuseFrames, (n) => n === 0, 5_000)
             const reads = frameReads(refusedAt)
             await wait(target, 1500)
             const after = frameReads(refusedAt)
@@ -194,11 +200,11 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
     /** The personal PC's own console in a conversation: bootstrap, then the scoped capability; resolves once the page is on screen. */
     async function openLocal(lang = 'en'): Promise<string> {
         const target = await harness.openFrontTab(`${origin}/console?agentSessionId=${SESSION}&lang=${lang}`)
-        await eventually(() => harness.evaluate(target, 'window.__abpPageView'), (v) => v === 1)
+        await until(() => harness.evaluate(target, 'window.__abpPageView'), (v) => v === 1)
         await hand(target, bootstrap('local-boot'))
-        expect(await eventually(() => harness.evaluate(target, 'window.__abpPageViewBinding'), (v) => v === BINDING)).toBe(BINDING)
+        expect(await until(() => harness.evaluate(target, 'window.__abpPageViewBinding'), (v) => v === BINDING)).toBe(BINDING)
         await hand(target, scoped('local-scoped'))
-        await eventually(() => harness.evaluate(target, `!document.getElementById('page').hidden`), Boolean, 10_000)
+        await until(() => harness.evaluate(target, `!document.getElementById('page').hidden`), Boolean, 10_000)
         return target
     }
 
@@ -236,15 +242,15 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
             expect(ops.filter((o) => o.op === 'dispatchPageInput')).toEqual([])
             leaseOwner = { kind: 'user', principalId: 'user-1', viewerSessionId: 'viewer-this' }
             await harness.evaluate(target, `document.getElementById('refreshTasks').click()`)
-            await eventually(() => harness.evaluate(target, `!!document.querySelector('#tasks button[data-task="task-1"]')`), Boolean, 5_000)
+            await until(() => harness.evaluate(target, `!!document.querySelector('#tasks button[data-task="task-1"]')`), Boolean, 5_000)
             await harness.evaluate(target, `document.querySelector('#tasks button[data-task="task-1"]').click()`)
-            await eventually(() => harness.evaluate(target, `document.getElementById('screenHintText').textContent`), (s) => s === 'You have control. Input reaches the page.', 10_000)
+            await until(() => harness.evaluate(target, `document.getElementById('screenHintText').textContent`), (s) => s === 'You have control. Input reaches the page.', 10_000)
             await click(target, box.x + box.width / 2, box.y + box.height / 2)
-            const sent = await eventually(() => ops.filter((o) => o.op === 'dispatchPageInput'), (list) => list.some((o) => o.body.event.type === 'mouseReleased'))
+            const sent = await until(() => ops.filter((o) => o.op === 'dispatchPageInput'), (list) => list.some((o) => o.body.event.type === 'mouseReleased'))
             expect(sent[0].body).toMatchObject({ leaseEpoch: 4, frameId: expect.stringMatching(/^frame-/), event: { kind: 'pointer' } })
             const opened = ops.filter((o) => o.op === 'openPageView').length
             await harness.evaluate(target, `document.getElementById('release').click()`)
-            await eventually(() => ops.filter((o) => o.op === 'openPageView').length, (n) => n > opened, 10_000)
+            await until(() => ops.filter((o) => o.op === 'openPageView').length, (n) => n > opened, 10_000)
             const order = ops.map((o) => o.op).filter((op) => ['releaseControl', 'closePageView', 'openPageView'].includes(op))
             expect(order.slice(order.lastIndexOf('releaseControl'))).toEqual(['releaseControl', 'closePageView', 'openPageView'])
         } finally { await harness.closeTarget(target) }
@@ -255,13 +261,13 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
         const target = await openLocal()
         try {
             frameError = 'SCOPE_DENIED'
-            await eventually(() => harness.evaluate(target, `!!document.getElementById('pageRetry').getClientRects().length`), Boolean, 5_000)
+            await until(() => harness.evaluate(target, `!!document.getElementById('pageRetry').getClientRects().length`), Boolean, 5_000)
             expect(await harness.evaluate(target, `document.getElementById('screenHintText').textContent`)).toBe('This conversation cannot access the page.')
             frameError = null
             const opened = ops.filter((o) => o.op === 'openPageView').length
             await harness.evaluate(target, `document.getElementById('pageRetry').click()`)
-            await eventually(() => ops.filter((o) => o.op === 'openPageView').length, (n) => n > opened, 5_000)
-            await eventually(() => harness.evaluate(target, `document.getElementById('screenHintText').textContent`), (s) => s === 'Observing the page. Take over to use it.', 5_000)
+            await until(() => ops.filter((o) => o.op === 'openPageView').length, (n) => n > opened, 5_000)
+            await until(() => harness.evaluate(target, `document.getElementById('screenHintText').textContent`), (s) => s === 'Observing the page. Take over to use it.', 5_000)
             expect(await harness.evaluate(target, `!!document.getElementById('pageRetry').getClientRects().length`)).toBe(false)
         } finally { frameError = null; await harness.closeTarget(target) }
     })
@@ -270,7 +276,7 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
     async function controlLocal(): Promise<{ target: string; x: number; y: number }> {
         leaseOwner = { kind: 'user', principalId: 'user-1', viewerSessionId: 'viewer-this' }
         const target = await openLocal()
-        await eventually(() => harness.evaluate(target, `document.getElementById('screenHintText').textContent`), (s) => s === 'You have control. Input reaches the page.', 10_000)
+        await until(() => harness.evaluate(target, `document.getElementById('screenHintText').textContent`), (s) => s === 'You have control. Input reaches the page.', 10_000)
         const box = JSON.parse(await harness.evaluate(target, `JSON.stringify(document.getElementById('page').getBoundingClientRect())`))
         return { target, x: box.x + box.width / 2, y: box.y + box.height / 2 }
     }
@@ -282,7 +288,7 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
         try {
             dropInput = true
             await click(target, x, y)
-            await eventually(() => harness.evaluate(target, `document.getElementById('screenHintText').textContent`), (s) => s === 'Checking input receipt. Do not repeat the input.', 5_000)
+            await until(() => harness.evaluate(target, `document.getElementById('screenHintText').textContent`), (s) => s === 'Checking input receipt. Do not repeat the input.', 5_000)
             await wait(target, 1500)
             // One press reached the Runtime; neither it nor the release queued behind it was sent again.
             // One input left the console. Chrome itself may replay a POST whose connection dropped unanswered (the same body,
@@ -303,11 +309,11 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
         try {
             inputDelayMs = 800
             await click(target, x, y)
-            await eventually(() => inputs().length, (n) => n === 1, 5_000)
+            await until(() => inputs().length, (n) => n === 1, 5_000)
             const first = inputs()[0]!.body.viewId
-            await eventually(() => harness.evaluate(target, `!!document.querySelector('#tasks button[data-task="task-2"]')`), Boolean, 20_000)
+            await until(() => harness.evaluate(target, `!!document.querySelector('#tasks button[data-task="task-2"]')`), Boolean, 20_000)
             await harness.evaluate(target, `document.querySelector('#tasks button[data-task="task-2"]').click()`)
-            const switched = await eventually(() => ops.find((o) => o.op === 'openPageView' && o.body.taskId === 'task-2'), Boolean, 5_000)
+            const switched = await until(() => ops.find((o) => o.op === 'openPageView' && o.body.taskId === 'task-2'), Boolean, 5_000)
             await wait(target, 1500)
             // The press in flight finished on its own view; the rest of that click died with the view.
             expect(inputs().map((o) => o.body.viewId)).toEqual([first])
@@ -321,11 +327,11 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
         const { target, x, y } = await controlLocal()
         try {
             await click(target, x, y)
-            await eventually(() => inputs().length, (n) => n >= 3, 5_000)
+            await until(() => inputs().length, (n) => n >= 3, 5_000)
             const viewId = inputs()[0]!.body.viewId
             expect(await harness.evaluate(target, `document.activeElement && document.activeElement.id`)).toBe('pageInput')
             await harness.evaluate(target, `document.getElementById('takeOver').focus()`)
-            await eventually(() => ops.filter((o) => o.op === 'closePageView').map((o) => o.body.viewId), (ids) => ids.includes(viewId), 5_000)
+            await until(() => ops.filter((o) => o.op === 'closePageView').map((o) => o.body.viewId), (ids) => ids.includes(viewId), 5_000)
             const sent = inputs().length
             await harness.evaluate(target, `document.getElementById('pageInput').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }))`)
             await wait(target, 400)
@@ -338,7 +344,7 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
         const target = await harness.openFrontTab(`${origin}/console?agentSessionId=${SESSION}&lang=en`)
         try {
             await hand(target, capability('broad', {}))
-            await eventually(() => harness.evaluate(target, `document.getElementById('detailId').textContent`), (id) => id === 'task-1')
+            await until(() => harness.evaluate(target, `document.getElementById('detailId').textContent`), (id) => id === 'task-1')
             await wait(target, 600)
             expect(ops.filter((o) => ['pageViewInfo', 'openPageView', 'getPageFrame'].includes(o.op))).toEqual([])
             expect(JSON.parse(await harness.evaluate(target, `JSON.stringify({ title: document.querySelector('#screenEmpty b').textContent,
