@@ -401,3 +401,87 @@ describe('removals deferred for a running session', () => {
     expect(deps.remove).not.toHaveBeenCalled()
   })
 })
+
+// Saycode #5882: a dedicated PC made shared keeps the group its member applied. That entry held the accounts the
+// machine's own assignment names too, so the machine could not replace them and its receipt was refused.
+describe('a dedicated PC made shared', () => {
+  const machine = (generation: number, payload: string | null) => ({ version: 1 as const, scope: 'company', principalType: 'machine' as const, machineId: 'pc-1',
+    provider: 'claude' as const, generation, fingerprint: String(generation).padStart(64, 'c'), payload })
+  function sharedPc() {
+    const base = setup()
+    const pc = createCredentialGroupSync({ ...base.deps, appliedMachineId: 'pc-1' })
+    return { ...base, pc }
+  }
+
+  it('hands the accounts the former member\'s assignment holds on this PC to the machine\'s assignment', async () => {
+    const { pc, input, deps, installed } = sharedPc()
+    await pc.sync({ ...input(1, '["shared","member-only"]'), userId: 'former' })
+    await pc.sync(machine(1, '["shared","machine-new"]'))
+    expect(deps.apply).toHaveBeenLastCalledWith('claude', '["shared","machine-new"]', ['shared'])
+    expect(await pc.authorizeMachine('company', 'pc-1', 'shared')).toBe(true)
+    expect(await pc.authorize('company', 'former', 'shared')).toBe(false)
+    // The member's revocation, whenever it comes, removes only what the machine does not use.
+    await pc.sync({ ...input(2, null), userId: 'former' })
+    expect([...installed].sort()).toEqual(['machine-new', 'personal', 'shared'])
+    await pc.sync(machine(2, null))
+    expect([...installed]).toEqual(['personal'])
+  })
+
+  it('also takes them over after the member\'s assignment was revoked first, keeping the accounts it still held', async () => {
+    const { pc, input, deps } = sharedPc()
+    await pc.sync({ ...input(1, '["shared"]'), userId: 'former' })
+    deps.apply.mockRejectedValueOnce(new Error('AI_GROUP_RECEIPT_INVALID'))
+    await expect(pc.sync(machine(1, '["shared"]'))).rejects.toThrow('AI_GROUP_RECEIPT_INVALID')
+    await pc.sync({ ...input(2, null), userId: 'former' })
+    await pc.sync(machine(2, '["shared"]'))
+    expect(await pc.authorizeMachine('company', 'pc-1', 'shared')).toBe(true)
+  })
+
+  // The reported PC: a signed setup-token delivery, whose member entry held the slot only in managedHeld.
+  it('takes over a managed setup-token the member\'s assignment holds only as applied', async () => {
+    const { deps, installed, metadata } = managedSetup()
+    await deps.write(JSON.stringify({ version: 1, entries: [{ scope: 'company', principalType: 'user', userId: 'former', provider: 'claude', generation: 1, assignmentGeneration: 1,
+      fingerprint: 'a'.repeat(64), payloadDigest: null, desired: ['managed-a'], managed: ['managed-a'], owned: [], managedHeld: ['managed-a'], pending: false, appliedMachineId: 'pc-1' }] }))
+    installed.add('managed-a'); metadata.add('managed-a')
+    const pc = createCredentialGroupSync({ ...deps, appliedMachineId: 'pc-1' })
+    await pc.sync(machine(1, '["managed-a"]'))
+    expect(deps.apply).toHaveBeenLastCalledWith('claude', '["managed-a"]', ['managed-a'])
+    expect(await pc.authorizeMachine('company', 'pc-1', 'managed-a')).toBe(true)
+  })
+
+  // Made dedicated again: the member's assignment takes the accounts back, whichever of the two syncs comes first.
+  it.each([['revoked first', true], ['revoked later', false]])('hands them back to the member when the PC is made dedicated again, machine %s', async (_name, revokedFirst) => {
+    const { pc, input, deps, installed } = sharedPc()
+    await pc.sync({ ...input(1, '["shared"]'), userId: 'former' })
+    await pc.sync(machine(1, '["shared"]'))
+    if (revokedFirst) await pc.sync(machine(2, null))
+    await pc.sync({ ...input(2, '["shared"]'), userId: 'former' })
+    expect(deps.apply).toHaveBeenLastCalledWith('claude', '["shared"]', ['shared'])
+    expect(await pc.authorize('company', 'former', 'shared')).toBe(true)
+    expect(await pc.authorizeMachine('company', 'pc-1', 'shared')).toBe(false)
+    if (!revokedFirst) await pc.sync(machine(2, null))
+    expect([...installed].sort()).toEqual(['personal', 'shared'])
+    await pc.sync({ ...input(3, null), userId: 'former' })
+    expect([...installed]).toEqual(['personal'])
+  })
+
+  it('leaves another machine\'s assignment on the same OS home alone, even one written before PCs were recorded', async () => {
+    const { deps } = sharedPc()
+    await createCredentialGroupSync(deps).sync({ ...machine(1, '["shared"]'), machineId: 'pc-0' })
+    const pc = createCredentialGroupSync({ ...deps, appliedMachineId: 'pc-1' })
+    await pc.sync(machine(1, '["shared"]'))
+    expect(deps.apply).toHaveBeenLastCalledWith('claude', '["shared"]', [])
+  })
+
+  it.each([
+    ['another scope', { scope: 'other' }, 'pc-1'],
+    ['another PC on the same OS home', {}, 'pc-2'],
+  ])('leaves a member\'s assignment of %s alone', async (_name, override, appliedMachineId) => {
+    const { deps, input } = sharedPc()
+    await createCredentialGroupSync({ ...deps, appliedMachineId }).sync({ ...input(1, '["shared"]'), userId: 'member', ...override })
+    const pc = createCredentialGroupSync({ ...deps, appliedMachineId: 'pc-1' })
+    await pc.sync(machine(1, '["shared"]'))
+    expect(deps.apply).toHaveBeenLastCalledWith('claude', '["shared"]', [])
+    expect(await pc.authorizeMachine('company', 'pc-1', 'shared')).toBe(false)
+  })
+})

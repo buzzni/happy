@@ -162,13 +162,25 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
     const desired=normalized.payload===null?[]:[...new Set(deps.incoming(normalized.provider,normalized.payload))]
     if(desired.length>500||desired.some(value=>!id(value)))fail('AI_GROUP_INVALID_INPUT')
     const managed=normalized.payload===null?[]:(deps.managedIdentities?.(normalized.provider,normalized.payload)??[]).filter(value=>desired.includes(value))
+    // A dedicated PC made shared keeps the group its member applied (Saycode #5882). The machine's own assignment takes
+    // over what that group holds here and the machine names too: otherwise neither may replace it, and no revocation
+    // removes an account another entry desires. Its managedHeld stays: removal reads every entry's record anyway.
+    // Made dedicated again, the member's assignment takes them back from this PC's machine assignment the same way.
+    const formerHere=(e:Entry)=>normalized.principalType==='machine'?principalType(e)==='user'&&appliedHere(e)
+      :principalType(e)==='machine'&&Boolean(deps.appliedMachineId)&&e.machineId===deps.appliedMachineId&&appliedHere(e)
+    const handed:string[]=[]
+    for(const former of journal.entries.filter(e=>e.scope===normalized.scope&&e.provider===normalized.provider&&formerHere(e))){
+      const taken=[...former.owned,...(former.managedHeld??[])].filter(value=>desired.includes(value))
+      former.owned=former.owned.filter(value=>!taken.includes(value))
+      handed.push(...taken)
+    }
     // A desired managed slot already installed in Saycode's managed format is this entry's again unless another entry
     // claims it: a lost journal, an older repair or an older identity format must not strand it (specs/claude-setup-token-managed-sync R2).
     const claimed=new Set(journal.entries.filter(e=>e.provider===normalized.provider&&e!==slot).flatMap(e=>[...e.owned,...(e.managedHeld??[])]))
     const unclaimed=managed.filter(value=>before.has(value)&&!(slot?.owned??[]).includes(value)&&!claimed.has(value))
     const local=unclaimed.length&&deps.managedInstalled?await deps.managedInstalled(normalized.provider):[]
     const reacquired=unclaimed.filter(value=>local.some(item=>item.identity===value&&!item.aliases.some(alias=>claimed.has(alias))))
-    const replaceable=[...new Set([...(slot?.owned??[]),...reacquired])]
+    const replaceable=[...new Set([...(slot?.owned??[]),...reacquired,...handed])]
     const entry:Entry={scope:normalized.scope,principalType:normalized.principalType,userId:normalized.userId,...(normalized.machineId?{machineId:normalized.machineId}:{}),provider:normalized.provider,generation:normalized.generation,assignmentGeneration:normalized.assignmentGeneration??normalized.generation,leaseId:normalized.leaseId,fingerprint:normalized.fingerprint,payloadDigest,desired,managed,appliedCredentials:[],
       owned:[...new Set([...replaceable,...desired.filter(value=>!before.has(value))])],managedHeld:[...(slot?.managedHeld??[])],pending:true,...(deps.appliedMachineId?{appliedMachineId:deps.appliedMachineId}:{})}
     journal.entries=journal.entries.filter(e=>!(e.scope===normalized.scope&&e.provider===normalized.provider&&sameSlot(e,normalized)))
