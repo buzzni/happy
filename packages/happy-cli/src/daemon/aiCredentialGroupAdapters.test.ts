@@ -1,6 +1,6 @@
 import { mkdtemp,readFile,writeFile,mkdir,chmod,rename,rm,readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, delimiter, join } from 'node:path'
 import { execFile as exec,execFileSync } from 'node:child_process'
 import { promisify } from 'node:util'
 import { describe,expect,it,vi } from 'vitest'
@@ -97,10 +97,10 @@ describe('provider group custody removal',()=>{
     expect(execFile).not.toHaveBeenCalled()
   })
   it('switches off a removed live Codex login with the CLI beside the global package it just edited',async()=>{
-    const files=new Map([['/h/.codex/auth.json',JSON.stringify({tokens:{account_id:'gone'}})],['/h/.codex/multi-auth/openai-codex-accounts.json',JSON.stringify({version:3,accounts:[{accountId:'kept'}],activeIndex:0})]])
+    const files=new Map([[join('/h','.codex','auth.json'),JSON.stringify({tokens:{account_id:'gone'}})],[join('/h','.codex','multi-auth','openai-codex-accounts.json'),JSON.stringify({version:3,accounts:[{accountId:'kept'}],activeIndex:0})]])
     const execFile=vi.fn(async(command:string,args:string[])=>({stdout:command==='npm'&&args[0]==='root'?'/global/lib/node_modules\n':'',stderr:''}))
-    const adapter=createGroupProviderAdapters({homeDir:'/h',env:{PATH:'/tools/bin:/usr/bin'},platform:'darwin',execFile,readFile:async(path:string)=>files.get(path)??Promise.reject(Object.assign(new Error('missing'),{code:'ENOENT'}))} as unknown as AiCredentialRuntimeDependencies)
+    const adapter=createGroupProviderAdapters({homeDir:'/h',env:{PATH:['/tools/bin','/usr/bin'].join(delimiter)},platform:'darwin',execFile,readFile:async(path:string)=>files.get(path)??Promise.reject(Object.assign(new Error('missing'),{code:'ENOENT'}))} as unknown as AiCredentialRuntimeDependencies)
     await adapter.remove('codex',[groupAccountIdentity('codex',{accountId:'gone'})])
-    expect(execFile).toHaveBeenCalledWith('codex-multi-auth',['switch','1'],expect.objectContaining({environment:expect.objectContaining({PATH:'/global/bin:/tools/bin:/usr/bin'})}))
+    expect(execFile).toHaveBeenCalledWith('codex-multi-auth',['switch','1'],expect.objectContaining({environment:expect.objectContaining({PATH:[join('/global','bin'),'/tools/bin','/usr/bin'].join(delimiter)})}))
   })
 })
