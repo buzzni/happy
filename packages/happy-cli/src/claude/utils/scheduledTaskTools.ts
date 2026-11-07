@@ -2,8 +2,8 @@ import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import nacl from 'tweetnacl';
 import * as z from 'zod';
-import { automationPublicSchema, automationTargetSchema, decryptAutomationPayload, encryptAutomationPayload,
-  scheduledManagementAutomationSchema, scheduledTaskToolRequestSchema, type AutomationCryptoAdapter, type AutomationPublic, type ScheduledManagementRequest } from '@slopus/happy-wire';
+import { automationPublicSchema, automationTargetSchema, decryptAutomationPayload, encryptAutomationPayload, openAutomationPayloadForMachine,
+  scheduledManagementAutomationSchema, scheduledTaskToolRequestSchema, type AutomationCryptoAdapter, type AutomationPublic, type AutomationPayload, type ScheduledManagementRequest } from '@slopus/happy-wire';
 import { readLocalHappyAgentCredentials } from '@/resume/localHappyAgentAuth';
 import { configuration } from '@/configuration';
 import { decodeBase64, decryptLegacy, decryptWithDataKey } from '@/api/encryption';
@@ -26,7 +26,7 @@ export function createScheduledTaskTools(options: {
   projectId: string; sessionId: string; machineId: string; directory: string;
   viewerKeyPair?: nacl.BoxKeyPair; viewerPublicKey?: Uint8Array; machineKey?: { publicKey: Uint8Array; secretKey: Uint8Array; registeredKeyVersion: number };
   request(input: ScheduledManagementRequest): Promise<unknown>;
-  ensureExecutionSupported(): Promise<void>;
+  ensureExecutionSupported(payloadVersion?: 4 | 6): Promise<void>;
 }) {
   const viewerPublicKey = options.viewerKeyPair?.publicKey ?? options.viewerPublicKey;
   if (!viewerPublicKey || (!options.viewerKeyPair && !options.machineKey)) throw new Error('SCHEDULED_TASK_CREDENTIALS_REQUIRED');
@@ -38,17 +38,22 @@ export function createScheduledTaskTools(options: {
       || target.machineKeyVersion !== options.machineKey.registeredKeyVersion)) throw new Error('SCHEDULED_TASK_MACHINE_KEY_MISMATCH');
   }
   async function payload(row: AutomationPublic) {
-    if (row.projectId !== options.projectId || row.machineId !== options.machineId || row.payloadVersion !== 4) throw new Error('SCHEDULED_TASK_SCOPE_MISMATCH');
-    let keyEnvelope = row.viewerKeyEnvelope, secretKey = options.viewerKeyPair?.secretKey;
+    if (row.projectId !== options.projectId || row.machineId !== options.machineId || (row.payloadVersion !== 4 && row.payloadVersion !== 6)) throw new Error('SCHEDULED_TASK_SCOPE_MISMATCH');
+    let value: AutomationPayload;
     if (options.machineKey) {
       const target = automationTargetSchema.parse(await options.request({ operation: 'read_target' }));
       verifyMachine(target);
-      if (target.viewerPublicKey !== crypto.encodeBase64(viewerPublicKey!) || row.machineKeyVersion !== target.machineKeyVersion
+      if (row.machineKeyVersion !== target.machineKeyVersion
         || row.machineAccountId !== target.machineAccountId) throw new Error('SCHEDULED_TASK_MACHINE_KEY_MISMATCH');
-      keyEnvelope = scheduledManagementAutomationSchema.parse(row).machineKeyEnvelope;
-      secretKey = options.machineKey.secretKey;
-    }
-    const value = await decryptAutomationPayload({ ...row, keyEnvelope, recipientSecretKey: secretKey!, crypto });
+      // Read the machine's existing envelope, including web-sealed v3. This does not authorize execution.
+      const opened = openAutomationPayloadForMachine({ ...row,
+        machineKeyEnvelope: scheduledManagementAutomationSchema.parse(row).machineKeyEnvelope,
+        recipientSecretKey: options.machineKey.secretKey, crypto });
+      if (!opened.ok) throw new Error('automation-decrypt-failed');
+      value = opened.payload;
+    } else value = await decryptAutomationPayload({ ...row, keyEnvelope: row.viewerKeyEnvelope,
+      recipientSecretKey: options.viewerKeyPair!.secretKey, crypto });
+    if (value.seal && (value.seal.machineId !== options.machineId || value.seal.projectId !== options.projectId)) throw new Error('SCHEDULED_TASK_SCOPE_MISMATCH');
     if (!value.conversation || value.directory !== options.directory
       || !options.projectId.startsWith('chat:') && value.conversation.sessionId !== options.sessionId) throw new Error('SCHEDULED_TASK_SCOPE_MISMATCH');
     return value;
@@ -57,6 +62,7 @@ export function createScheduledTaskTools(options: {
     const value = await payload(row);
     return { id: row.id, name: value.name, prompt: value.prompt, schedule: value.schedule, paused: row.paused, revision: row.revision,
       conversationSessionId: value.conversation!.sessionId, currentConversation: value.conversation!.sessionId === options.sessionId,
+      executionContext: value.contextPolicy ? { kind: 'isolated', reference: value.contextPolicy.reference?.kind ?? null } : { kind: 'continued' },
       timeZone: 'execution-pc', runnerApplied: row.appliedRevision === row.revision, appliedRevision: row.appliedRevision, executionConfirmed: false };
   }
   async function read(automationId: string) {
@@ -66,8 +72,17 @@ export function createScheduledTaskTools(options: {
   }
   async function registration(registrationKey: string) {
     const row = rowResponse.parse(await options.request({ operation: 'get_registration', registrationKey })).automation;
-    if (row) await payload(row);
+    if (row) {
+      if (row.payloadVersion !== 4) throw new Error('REGISTRATION_CONFLICT');
+      await payload(row);
+    }
     return row;
+  }
+  function pauseMatches(before: AutomationPublic, after: AutomationPublic, paused: boolean) {
+    const preserved = ['id', 'projectId', 'machineId', 'payloadVersion', 'payloadCiphertext', 'viewerKeyId', 'viewerKeyVersion',
+      'viewerKeyEnvelope', 'machineKeyVersion', 'ownerAccountId', 'machineAccountId'] as const;
+    return after.revision === before.revision + 1 && after.generation === before.generation + 1 && after.paused === paused
+      && preserved.every(field => after[field] === before[field]);
   }
   return { async execute(raw: unknown): Promise<unknown> {
     const input = scheduledTaskToolRequestSchema.parse(raw);
@@ -77,8 +92,11 @@ export function createScheduledTaskTools(options: {
     }
     if (input.operation === 'get') return summary(await read(input.automationId));
     if (input.operation === 'set_paused') {
-      if (!input.paused) await options.ensureExecutionSupported();
       const before = await read(input.automationId);
+      if (!input.paused) {
+        if (before.payloadVersion === 6) await options.ensureExecutionSupported(6);
+        else await options.ensureExecutionSupported();
+      }
       if (before.revision !== input.expectedRevision) throw new Error('REVISION_CONFLICT');
       if (!input.paused && (await payload(before)).conversation!.sessionId !== options.sessionId) throw new Error('CHAT_SESSION_CHANGED');
       if (before.paused === input.paused) return summary(before);
@@ -88,19 +106,17 @@ export function createScheduledTaskTools(options: {
         if (!response) throw new Error('SCHEDULED_TASK_UNAVAILABLE'); row = response;
       } catch (error) {
         const recovered = await read(input.automationId).catch(() => null);
-        if (!recovered || recovered.revision !== before.revision + 1 || recovered.paused !== input.paused
-          || recovered.payloadCiphertext !== before.payloadCiphertext || recovered.viewerKeyEnvelope !== before.viewerKeyEnvelope) throw error;
+        if (!recovered || !pauseMatches(before, recovered, input.paused)) throw error;
         row = recovered;
       }
-      if (row.id !== before.id || row.revision !== before.revision + 1 || row.paused !== input.paused
-        || row.payloadCiphertext !== before.payloadCiphertext) throw new Error('SCHEDULED_TASK_RESPONSE_INVALID');
+      if (!pauseMatches(before, row, input.paused)) throw new Error('SCHEDULED_TASK_RESPONSE_INVALID');
       return summary(row);
     }
     await options.ensureExecutionSupported();
     const intended = { name: input.name, prompt: input.prompt, schedule: input.schedule, directory: options.directory,
       conversation: { sessionId: options.sessionId }, agent: null, scriptCommand: null, suppressSilent: false };
     const matching = async (row: AutomationPublic) => {
-      if (!isDeepStrictEqual(await payload(row), intended)) throw new Error('REGISTRATION_CONFLICT');
+      if (row.payloadVersion !== 4 || !isDeepStrictEqual(await payload(row), intended)) throw new Error('REGISTRATION_CONFLICT');
       return row;
     };
     const existing = await registration(input.registrationKey);
@@ -180,8 +196,8 @@ export async function runScheduledTaskTool(raw: unknown, session: { sessionId: s
   } catch { throw new Error('SCHEDULED_TASK_CHAT_REQUIRED'); }
   const tools = createScheduledTaskTools({ projectId: scope, sessionId: session.sessionId, directory: session.directory, machineId,
     ...(credentials ? { viewerKeyPair: credentials.contentKeyPair } : { viewerPublicKey: encryption!.publicKey, machineKey: machineKey! }),
-    ensureExecutionSupported: async () => {
-      if (configuration.machineControl === 'strict') throw new Error('SCHEDULED_TASK_SEALING_UNSUPPORTED');
+    ensureExecutionSupported: async (payloadVersion = 4) => {
+      if (payloadVersion === 4 && configuration.machineControl === 'strict') throw new Error('SCHEDULED_TASK_SEALING_UNSUPPORTED');
       const response = await fetch(`${configuration.serverUrl}/v1/machines/${encodeURIComponent(machineId)}`, {
         headers: { Authorization: `Bearer ${token}` }, redirect: 'error', signal: AbortSignal.timeout(10000) });
       if (!response.ok) throw new Error('SCHEDULED_TASK_RUNNER_UNSUPPORTED');
@@ -189,7 +205,8 @@ export async function runScheduledTaskTool(raw: unknown, session: { sessionId: s
       if (machine.id !== machineId) throw new Error('SCHEDULED_TASK_SCOPE_MISMATCH');
       const metadata = credentials ? decryptLegacy(decodeBase64(machine.metadata), credentials.secret) : decryptWithDataKey(decodeBase64(machine.metadata), encryption!.machineKey);
       if (metadata?.automationSupport?.conversation !== true || metadata?.automationSupport?.serverBacked !== true) throw new Error('SCHEDULED_TASK_RUNNER_UNSUPPORTED');
-      if (metadata.automationSupport.authenticatedEnvelopes?.required) throw new Error('SCHEDULED_TASK_SEALING_UNSUPPORTED');
+      if (payloadVersion === 6 && metadata.automationSupport.contextIsolationVersion !== 1) throw new Error('SCHEDULED_TASK_RUNNER_UNSUPPORTED');
+      if (payloadVersion === 4 && metadata.automationSupport.authenticatedEnvelopes?.required) throw new Error('SCHEDULED_TASK_SEALING_UNSUPPORTED');
       if (machineKey) {
         const response = await fetch(`${configuration.serverUrl}/v1/machines/${encodeURIComponent(machineId)}/automation-reader-key`, {
           headers: { Authorization: `Bearer ${token}` }, redirect: 'error', signal: AbortSignal.timeout(10000) });
@@ -201,7 +218,7 @@ export async function runScheduledTaskTool(raw: unknown, session: { sessionId: s
     },
     request: async request => {
       const response = await fetch(new URL('/api/automation/scheduled-management', url), { method: 'POST', redirect: 'error',
-        headers: { Authorization: `Bearer ${token}`, 'X-Aplus-Caller-Grant': callerGrant!, 'Content-Type': 'application/json' },
+        headers: { Authorization: `Bearer ${token}`, 'X-Aplus-Caller-Grant': callerGrant!, 'X-Saycode-Scheduled-Task-Payloads': '4,6', 'Content-Type': 'application/json' },
         body: JSON.stringify({ machineId, sessionId: session.sessionId, ...(projectId ? { projectId, directory: session.directory } : {}), request }), signal: AbortSignal.timeout(15000) });
       const value = await response.json() as { error?: unknown };
       if (!response.ok) throw new Error(typeof value.error === 'string' && /^[A-Z0-9_-]{1,100}$/.test(value.error) ? value.error : 'SCHEDULED_TASK_UNAVAILABLE');

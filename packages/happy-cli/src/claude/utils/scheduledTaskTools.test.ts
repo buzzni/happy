@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import nacl from 'tweetnacl';
+import { createHash } from 'node:crypto';
+import { encryptAutomationPayload, type AutomationCryptoAdapter } from '@slopus/happy-wire';
 import { createScheduledTaskTools, runScheduledTaskTool } from './scheduledTaskTools';
 import { openServerAutomationPayload } from '@/daemon/automations/serverAutomationCache';
 import { encryptWithDataKey, encryptLegacy } from '@/api/encryption';
@@ -45,6 +47,29 @@ function fixture(machineReader = false) {
   const ensureExecutionSupported = vi.fn(async () => {});
   const tools = createScheduledTaskTools({ projectId: 'chat:chat', sessionId: 'session', machineId: 'pc', directory: '/work/chat', ...(machineReader ? { viewerPublicKey: viewer.publicKey, machineKey: { ...machine, registeredKeyVersion: 1 } } : { viewerKeyPair: viewer }), request, ensureExecutionSupported });
   return { tools, rows, request, ensureExecutionSupported, loseCreate: () => { loseCreate = true; }, loseUpdate: () => { loseUpdate = true; } };
+}
+
+const testCrypto: AutomationCryptoAdapter = {
+  randomBytes: length => nacl.randomBytes(length),
+  secretBoxSeal: (value, key) => { const nonce = nacl.randomBytes(24); return new Uint8Array([...nonce, ...nacl.secretbox(value, nonce, key)]); },
+  secretBoxOpen: (value, key) => nacl.secretbox.open(value.subarray(24), value.subarray(0, 24), key),
+  boxSeal: (value, key) => { const pair = nacl.box.keyPair(), nonce = nacl.randomBytes(24); return new Uint8Array([...pair.publicKey, ...nonce, ...nacl.box(value, nonce, key, pair.secretKey)]); },
+  boxOpen: (value, key) => nacl.box.open(value.subarray(56), value.subarray(32, 56), value.subarray(0, 32), key),
+  sha256: async value => new Uint8Array(createHash('sha256').update(value).digest()),
+  encodeBase64: (value, urlSafe) => Buffer.from(value).toString(urlSafe ? 'base64url' : 'base64'),
+  decodeBase64: value => new Uint8Array(Buffer.from(value, 'base64')),
+};
+
+async function isolated(f: ReturnType<typeof fixture>, signed = false, patch = {}, sender = viewer) {
+  await f.tools.execute(create);
+  const encrypted = await encryptAutomationPayload({ payload: { name: create.name, prompt: create.prompt,
+    schedule: { kind: 'interval', minutes: 15 }, directory: '/work/chat', conversation: { sessionId: 'session' },
+    agent: 'codex', scriptCommand: null, suppressSilent: false, contextPolicy: { kind: 'isolated', reference: null },
+    ...(signed ? { seal: { version: 1 as const, machineId: 'pc', projectId: 'chat:chat', automationKey: 'reservation-request-001', sealedAt: 1 } } : {}), ...patch },
+    viewer: { publicKey: viewer.publicKey, keyVersion: 1 }, machine: { publicKey: machine.publicKey, keyVersion: 1 },
+    ...(signed ? { sender } : {}), crypto: testCrypto });
+  Object.assign(f.rows[0], encrypted);
+  f.ensureExecutionSupported.mockClear(); f.request.mockClear();
 }
 
 describe('current-Chat scheduled task tools', () => {
@@ -161,7 +186,7 @@ describe('scheduled tool runtime authority and runner capability', () => {
     expect(await runScheduledTaskTool({ operation: 'list' }, session)).toEqual([]);
     expect(f.calls).toHaveLength(1);
     expect(f.calls[0].url).toBe('http://studio.fixture/api/automation/scheduled-management');
-    expect(f.calls[0].init).toMatchObject({ redirect: 'error', headers: { 'X-Aplus-Caller-Grant': f.grant + '-refreshed', Authorization: 'Bearer fixture-only-token' } });
+    expect(f.calls[0].init).toMatchObject({ redirect: 'error', headers: { 'X-Aplus-Caller-Grant': f.grant + '-refreshed', Authorization: 'Bearer fixture-only-token', 'X-Saycode-Scheduled-Task-Payloads': '4,6' } });
     expect(JSON.parse(f.calls[0].init!.body as string)).toEqual({ machineId: 'pc', sessionId: 'session', request: { operation: 'list' } });
   });
   it('refuses unsupported/strict machines before any management write or bootstrap', async () => {
@@ -252,3 +277,100 @@ it('keeps simultaneous machine-reader creates on one reservation and does not ex
   f.rows[0].projectId = 'project';
   await expect(other.execute({ operation: 'get', automationId: 'reservation' })).rejects.toThrow('SCHEDULED_TASK_SCOPE_MISMATCH');
 });
+
+
+describe('isolated scheduled-task management', () => {
+  it('lists mixed legacy/isolated rows and opens both anonymous and signed v6 with viewer or machine credentials', async () => {
+    for (const machineReader of [false, true]) for (const signed of [false, true]) {
+      const f = fixture(machineReader); await isolated(f, signed);
+      const legacy = fixture(machineReader); await legacy.tools.execute(create);
+      f.rows.push({ ...legacy.rows[0], id: 'legacy' });
+      expect(await f.tools.execute({ operation: 'list' })).toMatchObject([
+        { id: 'reservation', executionContext: { kind: 'isolated', reference: null } },
+        { id: 'legacy', executionContext: { kind: 'continued' } },
+      ]);
+      expect(await f.tools.execute({ operation: 'get', automationId: 'reservation' })).toMatchObject({ id: 'reservation', prompt: create.prompt });
+    }
+  });
+  it('pauses and recovers a lost v6 receipt once and gates resume against isolated support', async () => {
+    const f = fixture(true); await isolated(f, true); f.loseUpdate();
+    const cipher = f.rows[0].payloadCiphertext;
+    expect(await f.tools.execute({ operation: 'set_paused', automationId: 'reservation', expectedRevision: 2, paused: true })).toMatchObject({ paused: true, revision: 3 });
+    expect(f.ensureExecutionSupported).not.toHaveBeenCalled();
+    expect(f.request.mock.calls.filter(([r]) => r.operation === 'set_paused')).toHaveLength(1);
+    f.ensureExecutionSupported.mockRejectedValueOnce(new Error('SCHEDULED_TASK_RUNNER_UNSUPPORTED'));
+    await expect(f.tools.execute({ operation: 'set_paused', automationId: 'reservation', expectedRevision: 3, paused: false })).rejects.toThrow('SCHEDULED_TASK_RUNNER_UNSUPPORTED');
+    expect(f.rows[0]).toMatchObject({ paused: true, revision: 3, payloadCiphertext: cipher });
+    expect(await f.tools.execute({ operation: 'set_paused', automationId: 'reservation', expectedRevision: 3, paused: false })).toMatchObject({ paused: false, revision: 4 });
+    expect(f.ensureExecutionSupported).toHaveBeenLastCalledWith(6);
+    expect(f.rows[0].payloadCiphertext).toBe(cipher);
+  });
+  it('refuses cross-conversation resume and foreign scope without a mutation', async () => {
+    for (const patch of [{ directory: '/other' }, { conversation: { sessionId: 'old-session' } }]) {
+      const f = fixture(); await isolated(f, false, patch); f.rows[0].paused = true;
+      await expect(f.tools.execute({ operation: 'set_paused', automationId: 'reservation', expectedRevision: 2, paused: false })).rejects.toThrow(patch.directory ? 'SCHEDULED_TASK_SCOPE_MISMATCH' : 'CHAT_SESSION_CHANGED');
+      expect(f.request.mock.calls.some(([r]) => r.operation === 'set_paused')).toBe(false);
+    }
+  });
+  it('rejects a changed payload version in a pause acknowledgment before decrypting or reporting success', async () => {
+    for (const version of [4, 6]) {
+      const f = fixture(); if (version === 6) await isolated(f); else await f.tools.execute(create);
+      const original = f.request.getMockImplementation()!;
+      f.request.mockImplementation(async input => {
+        const result = await original(input);
+        return input.operation === 'set_paused' ? { automation: { ...result.automation, payloadVersion: version === 4 ? 6 : 4 } } : result;
+      });
+      await expect(f.tools.execute({ operation: 'set_paused', automationId: 'reservation', expectedRevision: 2, paused: true })).rejects.toThrow('SCHEDULED_TASK_RESPONSE_INVALID');
+    }
+  });
+  it('never reinterprets v6 as a create registration and preserves scope and authenticated-envelope binding', async () => {
+    const f = fixture(true); await isolated(f, true);
+    await expect(f.tools.execute(create)).rejects.toThrow('REGISTRATION_CONFLICT');
+    expect(f.request.mock.calls.some(([r]) => ['create', 'complete_registration'].includes(r.operation))).toBe(false);
+    f.rows[0].payloadCiphertext = Buffer.from([1, ...new Uint8Array(55).fill(3)]).toString('base64');
+    await expect(f.tools.execute({ operation: 'get', automationId: 'reservation' })).rejects.toThrow('automation-decrypt-failed');
+  });
+});
+
+
+it('reads a web-authored v6 machine copy when its viewer key differs from the PC customer key', async () => {
+  const f = fixture(), customer = nacl.box.keyPair(); await isolated(f, true, {}, customer);
+  const reader = createScheduledTaskTools({ projectId: 'chat:chat', sessionId: 'session', machineId: 'pc', directory: '/work/chat',
+    viewerPublicKey: customer.publicKey, machineKey: { ...machine, registeredKeyVersion: 1 }, request: f.request, ensureExecutionSupported: f.ensureExecutionSupported });
+  expect(await reader.execute({ operation: 'get', automationId: 'reservation' })).toMatchObject({ prompt: create.prompt });
+  expect(await reader.execute({ operation: 'set_paused', automationId: 'reservation', expectedRevision: 2, paused: true })).toMatchObject({ paused: true });
+  await expect(reader.execute(create)).rejects.toThrow('REGISTRATION_CONFLICT');
+  f.request.mockClear();
+  await expect(reader.execute({ ...create, registrationKey: 'separate-new-request-001' })).rejects.toThrow('SCHEDULED_TASK_VIEWER_KEY_MISMATCH');
+  expect(f.request.mock.calls.some(([r]) => ['create', 'viewer_key', 'complete_registration'].includes(r.operation))).toBe(false);
+})
+it('rejects signed definitions sealed for another machine or project before a pause mutation', async () => {
+  for (const patch of [{ machineId: 'other', projectId: 'chat:chat' }, { machineId: 'pc', projectId: 'chat:other' }]) {
+    const f = fixture(true); await isolated(f, true, { seal: { version: 1, automationKey: 'reservation-request-001', sealedAt: 1, ...patch } });
+    await expect(f.tools.execute({ operation: 'set_paused', automationId: 'reservation', expectedRevision: 2, paused: true })).rejects.toThrow('SCHEDULED_TASK_SCOPE_MISMATCH');
+    expect(f.request.mock.calls.some(([r]) => r.operation === 'set_paused')).toBe(false);
+  }
+})
+it('resumes signed v6 on strict PCs only with exact isolation capability and the current machine reader key', async () => {
+  for (const variant of ['ready', 'missing-capability', 'wrong-key'] as const) {
+    const f = fixture(true); await isolated(f, true); f.rows[0].paused = true;
+    const metadataKey = nacl.randomBytes(32);
+    runtime.credentials.mockReturnValue(null);
+    runtime.machineCredentials.mockResolvedValue({ token: 'fixture-token', encryption: { type: 'dataKey', publicKey: viewer.publicKey, machineKey: metadataKey } });
+    runtime.key.mockReturnValue({ ...machine, registeredKeyVersion: 1 }); runtime.configuration.machineControl = 'strict';
+    vi.stubEnv('HAPPY_APLUS_MCP_CONFIG_URL', 'http://studio.fixture/api/me/mcp-config');
+    vi.stubEnv('HAPPY_APLUS_MCP_CALLER_GRANT', Buffer.from(JSON.stringify({ personalChatId: 'chat', projectId: null })).toString('base64url') + '.fixture-signature');
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      if (String(url).endsWith('/automation-reader-key')) return Response.json({ machineId: 'pc', publicKey: Buffer.from(machine.publicKey).toString('base64'), keyVersion: variant === 'wrong-key' ? 2 : 1 });
+      if (String(url).includes('/v1/machines/')) return Response.json({ machine: { id: 'pc', metadata: Buffer.from(encryptWithDataKey({ automationSupport: {
+        conversation: true, serverBacked: true, contextIsolationVersion: variant === 'missing-capability' ? 0 : 1, authenticatedEnvelopes: { required: true },
+      } }, metadataKey)).toString('base64') } });
+      expect(init.headers['X-Saycode-Scheduled-Task-Payloads']).toBe('4,6');
+      return Response.json(await f.request(JSON.parse(init.body).request));
+    }));
+    const result = runScheduledTaskTool({ operation: 'set_paused', automationId: 'reservation', expectedRevision: 2, paused: false }, { sessionId: 'session', machineId: 'pc', directory: '/work/chat' });
+    if (variant === 'ready') expect(await result).toMatchObject({ paused: false, revision: 3 });
+    else await expect(result).rejects.toThrow(variant === 'wrong-key' ? 'SCHEDULED_TASK_MACHINE_KEY_MISMATCH' : 'SCHEDULED_TASK_RUNNER_UNSUPPORTED');
+    expect(f.request.mock.calls.filter(([r]) => r.operation === 'set_paused')).toHaveLength(variant === 'ready' ? 1 : 0);
+  }
+})
