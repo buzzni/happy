@@ -341,6 +341,39 @@ describe('Claude model changes across provider restarts', () => {
         expect(client.closeClaudeSessionTurn).not.toHaveBeenCalledWith('failed');
     });
 
+    it('fails one turn for a malformed --plugin-dir and then waits for the next message (specs/cli-plugin-dir-and-env-scrub R5-a)', async () => {
+        // Parsed before the first message, the error relaunched the provider at once, again and again.
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const client = {
+            sessionId: 'plugin-dir-failure-test',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(),
+            failClaudeLaunchTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        vi.mocked(query).mockReset();
+        queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+            cancelLessonReview: vi.fn(),
+            sessionId: null, path: process.cwd(), queue, client, mcpServers: {}, claudeArgs: ['--plugin-dir'],
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+        } as unknown as Session;
+        const running = claudeRemoteLauncher(session);
+        await vi.waitFor(() => expect(client.failClaudeLaunchTurn).toHaveBeenCalled());
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(client.failClaudeLaunchTurn).toHaveBeenCalledOnce();
+        expect(client.sendSessionEvent).toHaveBeenCalledOnce();
+        expect(client.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('--plugin-dir requires') }));
+        expect(query).not.toHaveBeenCalled();
+        void handlers.get('switch')!();
+        await running;
+    });
+
     it('tells the user to sign in to Claude Code on this machine when it answers "Not logged in"', async () => {
         // Desktop specs/headless-standalone-server R36 (M1): without a Claude login Claude Code answers with a
         // synthetic "Not logged in · Please run /login" (shape captured from claude-code 2.1.296), which said

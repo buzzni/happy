@@ -29,6 +29,7 @@ import { query, type QueryOptions, type SDKMessage, type SDKSystemMessage, Abort
 import type { MessageParam } from '@anthropic-ai/sdk/resources'
 import { mapToClaudeMode } from "./utils/permissionMode";
 import { claudeCheckSession } from "./utils/claudeCheckSession";
+import { pluginsFromArgs } from "./utils/pluginsFromArgs";
 import { join } from 'node:path';
 import { parseSpecialCommand } from "@/parsers/specialCommands";
 import { logger } from "@/lib";
@@ -423,6 +424,10 @@ async function runClaudeRemote(
         return;
     }
 
+    // After the first message, before any turn preparation: a malformed `--plugin-dir` fails this one
+    // turn and the launcher waits for the next message. Parsed earlier, it relaunched without waiting.
+    const plugins = pluginsFromArgs(opts.claudeArgs, opts.path);
+
     const preparation = preparationFor(initial.latency);
     const initialTurn = opts.beforeTurn ? await measurePreparation(preparation, 'before-turn', opts.beforeTurn) : undefined;
     const providerPath = initialTurn?.providerPath ?? opts.path;
@@ -515,6 +520,7 @@ async function runClaudeRemote(
         additionalDirectories: readAdditionalDirectoriesEnvironment(process.env),
         resume: startFrom ?? undefined,
         mcpServers: hasMcpServers ? mergedMcpServers : undefined,
+        plugins,
         permissionMode: mapToClaudeMode(initial.mode.permissionMode),
         model: initial.mode.model,
         fallbackModel: initial.mode.fallbackModel,

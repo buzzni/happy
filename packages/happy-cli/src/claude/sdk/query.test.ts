@@ -96,6 +96,15 @@ describe('query adapter', () => {
         expect(lastOptions().outputFormat).toBeUndefined();
     });
 
+    it('forwards plugin directories to the SDK and leaves them absent otherwise', () => {
+        // specs/cli-plugin-dir-and-env-scrub R5-a: a remote session's `--plugin-dir` reaches Claude only here.
+        const plugins = [{ type: 'local' as const, path: '/plugins/one' }];
+        query({ prompt: 'continue', options: { plugins } });
+        expect(lastOptions().plugins).toEqual(plugins);
+        query({ prompt: 'continue' });
+        expect(lastOptions().plugins).toBeUndefined();
+    });
+
     it('accepts a readable JavaScript CLI entrypoint without requiring native execute permissions', () => {
         const executable = join(configDirectory, 'cli.js');
         writeFileSync(executable, '// CLI entrypoint', { mode: 0o600 });

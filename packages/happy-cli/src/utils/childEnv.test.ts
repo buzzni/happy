@@ -257,3 +257,45 @@ describe('organization agent plan proxy key', () => {
         expect(sanitizeChildEnv(env)).toEqual({ PATH: '/usr/bin' })
     })
 })
+
+describe('upstream session-scoped keys (specs/cli-plugin-dir-and-env-scrub R5-b)', () => {
+    // upstream daemon/sessionEnvironment.ts scrubs these by exact name; here each one sits under a prefix entry.
+    const foreign = {
+        PATH: '/usr/bin',
+        HAPPY_FORK_CODEX_THREAD_ID: 'thread-of-a-fork-spawn',
+        HAPPY_SIDE_CHAT: '1',
+        CODEX_THREAD_ID: 'thread-of-the-codex-shell-that-started-the-daemon',
+    }
+
+    it('reach neither a process that hosts a session nor the agent CLI and its shells', () => {
+        expect(sanitizeChildEnv(foreign)).toEqual({ PATH: '/usr/bin' })
+        expect(sanitizeChildEnv(foreign, { boundary: 'in-session' })).toEqual({ PATH: '/usr/bin' })
+        expect(sanitizeChildEnv({ codex_thread_id: 't', Happy_Side_Chat: '1', PATH: '/usr/bin' })).toEqual({ PATH: '/usr/bin' })
+    })
+
+    it('are classified by what the value names', () => {
+        // Already covered before this change, by the HAPPY_FORK prefix.
+        expect(nonInheritableEnvEntry('HAPPY_FORK_CODEX_THREAD_ID')).toEqual({ prefix: 'HAPPY_FORK', kind: 'session-lineage' })
+        // Codex sets it in its own tool shells: seen by a happy process, it always names another session's thread.
+        expect(nonInheritableEnvEntry('CODEX_THREAD_ID')?.kind).toBe('session-lineage')
+        // upstream's daemon sets it for one side-chat spawn; the runner reads it once.
+        expect(nonInheritableEnvEntry('HAPPY_SIDE_CHAT')?.kind).toBe('spawn-seed')
+    })
+
+    it('are forgotten by a reused runtime, except the side-chat seed of this run', () => {
+        const env: NodeJS.ProcessEnv = { ...foreign }
+        clearInheritedSessionLineage(env)
+        expect(env).toEqual({ PATH: '/usr/bin', HAPPY_SIDE_CHAT: '1' })
+    })
+
+    it('leave the fork thread a spawn sets explicitly in place (R5-c)', () => {
+        // daemon/run.ts writes HAPPY_FORK_CODEX_THREAD_ID into the spawn's explicit env; codex/runCodex.ts reads it.
+        const spawned = buildManagedSessionSpawnEnvironment(foreign, { HAPPY_FORK_CODEX_THREAD_ID: 'thread-to-fork' }, {})
+        expect(spawned).toEqual({ PATH: '/usr/bin', HAPPY_FORK_CODEX_THREAD_ID: 'thread-to-fork' })
+    })
+
+    it('are not accepted from a spawn request environment', () => {
+        expect(buildSpawnRequestEnvironment({}, { HAPPY_SIDE_CHAT: '1', CODEX_THREAD_ID: 'made-up' })).not.toHaveProperty('HAPPY_SIDE_CHAT')
+        expect(buildSpawnRequestEnvironment({}, { HAPPY_SIDE_CHAT: '1', CODEX_THREAD_ID: 'made-up' })).not.toHaveProperty('CODEX_THREAD_ID')
+    })
+})
