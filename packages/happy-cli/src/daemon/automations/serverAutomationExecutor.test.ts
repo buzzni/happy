@@ -5220,18 +5220,42 @@ describe('놓친 예약 회차 기록', () => {
     expect(store.state().schedules[0]!.nextRunAt).toBe(T - 185 * MIN)
   })
 
-  it('reports the rest of the gap from the next slot when the first slot had actually run', async () => {
+  it('reports the rest of the gap from the next slot, in the same tick, when the first slot had actually run', async () => {
     // Its claim reached the server before the PC went down, but the daemon never heard back.
-    const { input, store, transport, recordMissed } = stale({ nextRunAt: T - 185 * MIN, record: { ok: false, error: 'already-claimed' } })
+    const { input, store, transport, recordMissed } = stale({ nextRunAt: T - 185 * MIN })
+    recordMissed.mockResolvedValueOnce({ ok: false, error: 'already-claimed' })
 
     await runServerAutomationTick(input)
+
+    expect(recordMissed.mock.calls.map(([call]) => [call.firstMissedAt, call.missedCount])).toEqual([
+      [T - 185 * MIN, 13], [T - 170 * MIN, 12],
+    ])
     expect(transport.claim).not.toHaveBeenCalled()
-    expect(store.state().schedules[0]!.nextRunAt).toBe(T - 170 * MIN)
-
-    recordMissed.mockResolvedValue({ ok: true, value: { runId: 'missed-2', idempotent: false } })
-    await runServerAutomationTick(input)
-    expect(recordMissed).toHaveBeenLastCalledWith(expect.objectContaining({ firstMissedAt: T - 170 * MIN, missedCount: 12 }))
     expect(store.state().schedules[0]!.nextRunAt).toBe(T + 10 * MIN)
+  })
+
+  it('claims the next slot right away when it is still inside the claim window after an already-run first slot', async () => {
+    const { input, transport, recordMissed } = stale({ nextRunAt: T - 15 * MIN - 60_000, record: { ok: false, error: 'already-claimed' }, claim: { ok: false, error: 'already-claimed' } })
+
+    await runServerAutomationTick(input)
+
+    expect(recordMissed).toHaveBeenCalledTimes(1)
+    expect(transport.claim).toHaveBeenCalledWith(expect.objectContaining({ scheduledFor: T - 60_000 }))
+  })
+
+  it('gives up on a gap the server never confirms after several ticks and lets later slots run', async () => {
+    const { input, store, transport, recordMissed } = stale({
+      nextRunAt: T - 185 * MIN, record: { ok: false, error: 'record-failed' }, claim: { ok: false, error: 'claim-denied' },
+    })
+
+    for (let tick = 0; tick < 4; tick++) await runServerAutomationTick(input)
+    expect(transport.claim).not.toHaveBeenCalled()
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T - 185 * MIN)
+
+    await runServerAutomationTick(input)
+    expect(recordMissed).toHaveBeenCalledTimes(5)
+    expect(transport.claim).toHaveBeenCalledTimes(1)
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T + 15 * MIN)
   })
 
   it('does not count a run-now request postponed behind a running session and then slept through', async () => {

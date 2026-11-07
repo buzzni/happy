@@ -738,6 +738,18 @@ function advanceSchedule(
   })
 }
 
+/** 저장을 확인받지 못한 놓침 기록의 재시도 상한. 넘으면 기록 없이 현행 경로로 넘어간다(같은 자동화의 이후 회차 보호). */
+const MAX_UNCONFIRMED_MISSED_RECORDS = 5
+/** 한 틱에서 이미 실행된 첫 회차(already-claimed)를 건너뛰며 다시 보고하는 횟수 상한. */
+const MAX_CLAIMED_SLOTS_PER_TICK = 3
+/** 공백별 미확인 횟수. 런타임 저장소(데몬당 하나)마다 따로 둬 프로세스 수명 동안만 센다. */
+const unconfirmedMissedRecordsByStore = new WeakMap<object, Map<string, number>>()
+function unconfirmedMissedRecords(input: ServerAutomationExecutorInput): Map<string, number> {
+  let attempts = unconfirmedMissedRecordsByStore.get(input.runtimeStore)
+  if (!attempts) unconfirmedMissedRecordsByStore.set(input.runtimeStore, attempts = new Map())
+  return attempts
+}
+
 /** 놓침 기록이 정한 다음 회차로 일정을 옮긴다. 미룬 즉시 실행 표시는 그 요청이 지나갔으므로 지운다. */
 function writeScheduleNextRunAt(input: ServerAutomationExecutorInput, automationId: string, nextRunAt: number): void {
   const state = input.runtimeStore.read()
@@ -771,6 +783,7 @@ async function recordMissedRuns(
   payload: ServerAutomationPayload,
   schedule: ServerAutomationScheduleState,
   now: number,
+  claimedSlotsLeft = MAX_CLAIMED_SLOTS_PER_TICK,
 ): Promise<'claim' | 'retry' | 'recorded'> {
   if (!serverRecordsMissedRuns || !input.transport.recordMissed) return 'claim'
   const plan = planMissedRuns({
@@ -791,23 +804,40 @@ async function recordMissedRuns(
     missedCount: plan.missedCount,
     failureCode: 'MISSED_OFFLINE',
   })
+  const attemptKey = `${automation.automationId}:${automation.generation}:${plan.firstMissedAt}`
+  const attempts = unconfirmedMissedRecords(input)
   if (!recorded.ok) {
     if (recorded.error === 'ack-timeout' || recorded.error === 'record-failed') {
-      input.logDebug?.(`[server-automation] ${automation.automationId} missed-run record not stored (${recorded.error}); keeping the schedule for the next tick`)
-      return 'retry'
+      const failed = (attempts.get(attemptKey) ?? 0) + 1
+      if (failed < MAX_UNCONFIRMED_MISSED_RECORDS) {
+        attempts.set(attemptKey, failed)
+        input.logDebug?.(`[server-automation] ${automation.automationId} missed-run record not stored (${recorded.error}); keeping the schedule for the next tick`)
+        return 'retry'
+      }
+      // Never stored after several tries: let later slots run rather than hold the automation forever.
+      attempts.delete(attemptKey)
+      input.logDebug?.(`[server-automation] ${automation.automationId} missed-run record not stored after ${failed} tries; skipping without a record`)
+      return 'claim'
     }
+    attempts.delete(attemptKey)
     if (recorded.error === 'already-claimed') {
-      // The first slot did run (its claim reached the server, the answer did not): report the rest from the next slot.
+      // The first slot did run (its claim reached the server, the answer did not): report the rest from the next slot,
+      // in this tick, so a next slot still inside the claim window is claimed instead of aging into a miss.
       markOnceOccurrenceSpent(input, automation.automationId, payload, plan.firstMissedAt)
       const next = payload.schedule.kind === 'interval'
         ? plan.firstMissedAt + payload.schedule.minutes * 60_000
         : nextScheduledAt(payload.schedule, plan.firstMissedAt)
       writeScheduleNextRunAt(input, automation.automationId, next)
-      return 'retry'
+      schedule.nextRunAt = next
+      if (next > now) return 'recorded'
+      return claimedSlotsLeft > 1
+        ? recordMissedRuns(input, serverRecordsMissedRuns, automation, payload, schedule, now, claimedSlotsLeft - 1)
+        : 'retry'
     }
     input.logDebug?.(`[server-automation] ${automation.automationId} missed-run record refused (${recorded.error}); skipping without a record`)
     return 'claim'
   }
+  attempts.delete(attemptKey)
   const resumeAt = plan.resumeAt ?? NEVER_RUN_AT
   writeScheduleNextRunAt(input, automation.automationId, resumeAt)
   input.logDebug?.(
