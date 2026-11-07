@@ -28,12 +28,14 @@ repeatable-read snapshot에서 세션·상한·행을 읽고 응답에는 다음
 - `contentRevision`: 현재 암호문 JSON의 SHA-256 digest. 순서가 있는 revision 번호나 평문 finality가 아니다.
 - generation: cohort·session ID·createdAt·암호화 헤더의 digest. ciphertext-only rewrap은 행 revision만 바뀔 수 있다.
   소비자는 미확정 행을 재조회해야 하며 헤더가 같다는 이유로 본문 불변을 가정하지 않는다.
-- 응답 전체 512KiB 초과는 413, 미래/역행 상한은 409, 미소유/삭제 대상은 404, 비활성은 503이다.
+- 응답은 512KiB 안에서 행 단위로 잘리고 `hasMore=true`로 마지막 포함 seq부터 이어 읽게 한다.
+  단일 행이 512KiB를 넘으면 그 행만 담아 반환해 커서가 항상 전진한다.
+- 미래/역행 상한은 409, 미소유/삭제 대상은 404, 비활성은 503이다.
 - 현재 개별 행 삭제 경로는 없으며 세션 삭제는 전체를 삭제한다. seq 숫자의 연속성을 완전성 근거로 사용하지 않는다.
 
 ## 검증과 한계
 
-PGlite 통합 검증은 삽입 전 writer transaction을 멈춘 상태에서 새 상한이 보이지 않음을 확인한다.
+PGlite/PostgreSQL 통합 검증은 삽입 전 writer transaction을 멈춘 상태에서 읽어도 반환된 상한까지의 행이 모두 포함됨을 확인한다.
 함께 확인하는 경계는 capability 비활성, 고정 상한/페이지, 동일 seq 갱신 digest, 암호화 헤더 변경,
 타 계정/기존 GET 호환성 및 socket transaction 배치다. 운영 DB·실제 rolling deployment 수락은 별도다.
 서버는 E2EE 본문을 해독하지 않으며 응답 전체 finality와 임의 요청의 작업 성공을 보장하지 않는다.
