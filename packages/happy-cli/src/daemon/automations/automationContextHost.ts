@@ -5,7 +5,7 @@ import { OwnedStartRefused } from '../ownedSpawn'
 import { buildAutomationContextInput } from './automationContextInput'
 import { createAutomationContextLauncher, type AutomationContextLaunchDependencies, type AutomationContextLaunchRecord,
   type AutomationContextLaunchRequest } from './automationContextLaunch'
-import { createAutomationContextDeferred } from './automationContextDeferred'
+import { automationContextHoldCode, createAutomationContextDeferred } from './automationContextDeferred'
 import type { ServerAutomationExecutorInput } from './serverAutomationExecutor'
 import type { ServerAutomationRuntimeStore } from './serverAutomationRuntimeStore'
 
@@ -39,6 +39,15 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
 }) {
   const entries = new Map<string, ReturnType<typeof createEntry>>()
   const maintain = createSerialLock()
+  async function defer(run: AutomationContextLaunchRequest, reason?: string) {
+    const holdCode = automationContextHoldCode(reason)
+    await supervisor.defer(run.runId, holdCode)
+    try {
+      const published = await deps.heartbeat({ runId: run.runId, claimToken: run.claimToken, holdCode })
+      if (!published.ok) deps.log(`[automation-context] Hold publication unconfirmed run=${run.runId}`)
+    } catch { deps.log(`[automation-context] Hold publication unconfirmed run=${run.runId}`) }
+    return holdCode
+  }
   async function resolvePrevious(run: Parameters<Preparation>[0], beforeRunId?: string) {
     if (!deps.resolvePreviousResult || !run.payload.conversation) throw new Error('AUTOMATION_REFERENCE_UNSUPPORTED')
     return deps.resolvePreviousResult({ automationId: run.automationId, generation: run.generation, revision: run.revision,
@@ -126,7 +135,7 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
             : Object.hasOwn(request, 'previousResult') ? {} : await prepare(request)
           const result = await launcher.launch({ ...request, ...selection })
           if (result.state === 'waiting') {
-            await supervisor.defer(runId)
+            await defer(input, result.reason)
             return { ...result, deferred: true as const }
           }
           return result
@@ -134,10 +143,15 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
           const record = await deps.journal.read(runId)
           if (error instanceof Error && /^AUTOMATION_REFERENCE_[A-Z0-9_]+$/.test(error.message)
             && record && (record.phase === 'prepared' || record.phase === 'registered')) {
-            await supervisor.defer(runId)
-            deps.log(`[automation-context] Reference held run=${runId} code=${error.message}`)
+            const holdCode = await defer(input, error.message)
+            deps.log(`[automation-context] Reference held run=${runId} code=${holdCode}`)
             return { state: 'waiting' as const, sessionId: record.sessionId, displaySessionId: record.displaySessionId,
-              reason: error.message, deferred: true as const }
+              reason: holdCode, deferred: true as const }
+          }
+          if (record?.phase === 'submitted' || record?.phase === 'started') {
+            deps.log(`[automation-context] Native start remains unconfirmed run=${runId}`)
+            return { state: 'needs-attention' as const, sessionId: record.sessionId, displaySessionId: record.displaySessionId,
+              reason: 'AUTOMATION_START_UNCONFIRMED' }
           }
           throw error
         } finally { context = null; transport = null }

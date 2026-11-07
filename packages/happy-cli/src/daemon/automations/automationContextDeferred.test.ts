@@ -35,7 +35,7 @@ async function setup() {
       schedule: { kind: 'once-zoned', date: '2026-11-05', hour: 9, minute: 0, timeZone: 'UTC' },
       conversation: { sessionId: 'manual' }, contextPolicy: { kind: 'isolated', reference: null } } }
   const pending: PendingAutomationReport[] = []
-  const heartbeat = vi.fn(async (): Promise<{ ok: boolean; error?: string }> => ({ ok: true }))
+  const heartbeat = vi.fn(async (_input: { runId: string; claimToken: string; holdCode?: string | null }): Promise<{ ok: boolean; error?: string }> => ({ ok: true }))
   const resumeOriginal = vi.fn(async (saved: AutomationContextLaunchRequest) => launcher.launch(saved))
   const enqueueReport = vi.fn(async (report: PendingAutomationReport) => { pending.push(structuredClone(report)) })
   const log = vi.fn()
@@ -59,11 +59,55 @@ it('renews the original waiting claim and resumes only its immutable input after
   await createAutomationContextDeferred(f.deps).maintain()
   expect(f.start).toHaveBeenCalledOnce()
   expect(f.resumeOriginal.mock.calls.at(-1)![0]).toMatchObject({ claimToken: 'original-private-claim', payload: { prompt: 'original authored question' } })
-  expect(f.heartbeat).toHaveBeenCalledWith({ runId: 'r1', claimToken: 'original-private-claim' })
+  expect(f.heartbeat).toHaveBeenCalledWith({ runId: 'r1', claimToken: 'original-private-claim', holdCode: 'AUTOMATION_HOLD_UNCONFIRMED' })
   expect(f.pending).toEqual([expect.objectContaining({ runId: 'r1', outcome: 'WOKE', sessionId: 'automation-run:r1' })])
   expect(await f.journal.read('r1')).toHaveProperty('deferredDispatch', 'settled')
   await createAutomationContextDeferred(f.deps).maintain()
   expect(f.start).toHaveBeenCalledOnce(); expect(f.enqueueReport).toHaveBeenCalledOnce()
+})
+
+it('persists a bounded hold across coordinator restart and clears it only after the original run starts', async () => {
+  const f = await setup()
+  await Reflect.apply(f.supervisor.defer, f.supervisor, ['r1', 'WORKSPACE_BUSY'])
+  expect(await f.journal.read('r1')).toHaveProperty('deferredHoldCode', 'WORKSPACE_BUSY')
+  const restarted = createAutomationContextDeferred(f.deps)
+  await restarted.maintain()
+  expect(f.heartbeat).toHaveBeenCalledWith({ runId: 'r1', claimToken: 'original-private-claim', holdCode: 'WORKSPACE_BUSY' })
+  expect(f.start).not.toHaveBeenCalled()
+  await restarted.maintain()
+  expect(f.heartbeat.mock.calls.at(-1)![0]).toEqual({ runId: 'r1', claimToken: 'original-private-claim', holdCode: 'WORKSPACE_BUSY' })
+  expect(await f.journal.read('r1')).toHaveProperty('deferredHoldCode', 'WORKSPACE_BUSY')
+  await f.releaseManual(); await restarted.maintain()
+  expect(f.start).toHaveBeenCalledOnce()
+  expect(f.heartbeat).toHaveBeenCalledWith({ runId: 'r1', claimToken: 'original-private-claim', holdCode: null })
+  expect(f.pending[0]).toMatchObject({ runId: 'r1', claimToken: 'original-private-claim', outcome: 'WOKE' })
+  expect(await f.journal.read('r1')).toHaveProperty('deferredDispatch', 'settled')
+  expect(await f.journal.read('r1')).not.toHaveProperty('deferredHoldCode')
+})
+
+it('stores a changed reference hold as a bounded code instead of persisting its raw HTTP diagnostic', async () => {
+  const f = await setup()
+  f.resumeOriginal.mockResolvedValueOnce({ state: 'waiting', sessionId: 'automation-run:r1', displaySessionId: 'manual',
+    reason: 'AUTOMATION_REFERENCE_READ_HTTP_503' })
+  await f.supervisor.maintain()
+  const record = await f.journal.read('r1')
+  expect(record).toHaveProperty('deferredHoldCode', 'AUTOMATION_REFERENCE_UNCONFIRMED')
+  expect(JSON.stringify(record)).not.toContain('AUTOMATION_REFERENCE_READ_HTTP_503')
+  expect(f.start).not.toHaveBeenCalled(); expect(f.pending).toEqual([])
+})
+
+it('keeps a started run reportable without replay when publishing its cleared hold fails', async () => {
+  const f = await setup(); await f.releaseManual()
+  f.heartbeat.mockImplementation(async input => {
+    if (input.holdCode === null) throw new Error('status transport unavailable')
+    return { ok: true }
+  })
+  await f.supervisor.maintain()
+  expect(f.heartbeat).toHaveBeenCalledWith({ runId: 'r1', claimToken: 'original-private-claim', holdCode: null })
+  expect(f.pending[0]).toMatchObject({ runId: 'r1', outcome: 'WOKE' })
+  expect(f.log).toHaveBeenCalled()
+  await createAutomationContextDeferred(f.deps).maintain()
+  expect(f.start).toHaveBeenCalledOnce()
 })
 
 it('cancels a revoked unsubmitted claim without dispatching or touching the manual reservation', async () => {

@@ -3,7 +3,7 @@ import { registerOwnedSpawnRpc, type OwnedSpawnRpc } from '@/daemon/ownedSpawnRp
 import { z } from 'zod';
 import type { createDeviceEnrollment } from '@/daemon/deviceEnrollment';
 import type { DeviceKeys } from '@/daemon/deviceKeys';
-import type { AutomationConversationDeliverRequest } from '@slopus/happy-wire';
+import type { AutomationConversationDeliverRequest, AutomationRunHeartbeatRequest } from '@slopus/happy-wire';
 import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { createWorktreeReclaimHandler } from '@/daemon/worktreeDependencyReclaimRpc';
 import { createSealedSpawnEnvHandler } from '@/modules/common/sealedSpawnEnv';
@@ -440,10 +440,7 @@ interface DaemonToServerEvents {
         runId: string;
         claimToken: string;
     }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
-    'automation-run-heartbeat': (data: {
-        runId: string;
-        claimToken: string;
-    }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
+    'automation-run-heartbeat': (data: AutomationRunHeartbeatRequest, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
     'automation-conversation-deliver': (data: AutomationConversationDeliverRequest, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
     'automation-run-report': (data: PendingAutomationReport, cb: (answer: {
         ok: boolean;

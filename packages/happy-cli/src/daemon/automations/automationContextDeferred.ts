@@ -1,9 +1,21 @@
 import type { AutomationContextLaunchJournal, AutomationContextLaunchRequest, createAutomationContextLauncher } from './automationContextLaunch'
 import type { PendingAutomationReport } from './serverAutomationRuntimeStore'
 import { OwnedStartRefused } from '../ownedSpawn'
+import { automationExecutionHoldCodeSchema, type AutomationExecutionHoldCode, type AutomationRunHeartbeatRequest } from '@slopus/happy-wire'
 
 type Launcher = ReturnType<typeof createAutomationContextLauncher>
 const revokedClaims = new Set(['claim-cancelled', 'claim-expired', 'claim-not-found', 'run-not-running'])
+
+export function automationContextHoldCode(reason?: string): AutomationExecutionHoldCode {
+  if (reason === 'workspace-busy' || reason === 'tracked-session-busy') return 'WORKSPACE_BUSY'
+  if (reason === 'workspace-owner-unconfirmed') return 'WORKSPACE_OWNER_UNCONFIRMED'
+  if (reason === 'registry-busy') return 'WORKSPACE_REGISTRY_BUSY'
+  const known = automationExecutionHoldCodeSchema.safeParse(reason)
+  if (known.success) return known.data
+  if (reason?.startsWith('AUTOMATION_REFERENCE_')) return 'AUTOMATION_REFERENCE_UNCONFIRMED'
+  if (/^AUTOMATION_(?:CONTEXT|STUDIO_ADMISSION)_/.test(reason ?? '')) return 'AUTOMATION_AUTHORIZATION_UNCONFIRMED'
+  return 'AUTOMATION_HOLD_UNCONFIRMED'
+}
 
 /** Keeps the original RUNNING occurrence while manual work owns its workspace. Maintenance may resume only
  * a positively unsubmitted snapshot; submitted/unknown starts are read-only recovered and never replayed.
@@ -11,7 +23,7 @@ const revokedClaims = new Set(['claim-cancelled', 'claim-expired', 'claim-not-fo
 export function createAutomationContextDeferred(deps: {
   journal: AutomationContextLaunchJournal
   launcherFor(runId: string): Launcher
-  heartbeat(input: { runId: string; claimToken: string }): Promise<{ ok: boolean; error?: string }>
+  heartbeat(input: AutomationRunHeartbeatRequest): Promise<{ ok: boolean; error?: string }>
   resumeOriginal(input: AutomationContextLaunchRequest): ReturnType<Launcher['launch']>
   pendingReportFor(runId: string): PendingAutomationReport | null
   enqueueReport(report: PendingAutomationReport): Promise<void>
@@ -32,7 +44,8 @@ export function createAutomationContextDeferred(deps: {
           || value.sessionId !== null && value.sessionId !== record!.sessionId) throw new Error('AUTOMATION_REPORT_IDENTITY_CONFLICT')
       }
       if (queued) { assertQueued(queued); await launcher.finishDeferred(runId); continue }
-      const heartbeat = await deps.heartbeat({ runId, claimToken: saved.claimToken })
+      const heartbeat = await deps.heartbeat({ runId, claimToken: saved.claimToken,
+        holdCode: record.deferredHoldCode ?? 'AUTOMATION_HOLD_UNCONFIRMED' })
       if (signal?.aborted) return
       let failureCode: string | undefined
       if (!heartbeat.ok) {
@@ -55,7 +68,10 @@ export function createAutomationContextDeferred(deps: {
           if (signal?.aborted) return
           try {
             const resumed = await deps.resumeOriginal(saved)
-            if (resumed.state === 'waiting') continue
+            if (resumed.state === 'waiting') {
+              await launcher.markDeferred(runId, automationContextHoldCode(resumed.reason))
+              continue
+            }
             if (resumed.state !== 'started') failureCode = 'AUTOMATION_START_UNCONFIRMED'
           } catch (error) {
             // Read the durable submission boundary, not the exception text, before deciding whether retry is safe.
@@ -66,7 +82,10 @@ export function createAutomationContextDeferred(deps: {
             if (observed?.state === 'not-started') {
               if (error instanceof OwnedStartRefused || code === 'AUTOMATION_CONTEXT_REQUEST_UNCONFIRMED'
                 || code === 'AUTOMATION_STUDIO_ADMISSION_UNCONFIRMED'
-                || /^AUTOMATION_(?:CONTEXT|STUDIO_ADMISSION)_HTTP_5\d\d$/.test(code)) continue
+                || /^AUTOMATION_(?:CONTEXT|STUDIO_ADMISSION)_HTTP_5\d\d$/.test(code)) {
+                await launcher.markDeferred(runId, automationContextHoldCode(code))
+                continue
+              }
               await launcher.cancelUnsubmitted(runId)
               failureCode = code
             } else failureCode = 'AUTOMATION_START_UNCONFIRMED'
@@ -75,6 +94,12 @@ export function createAutomationContextDeferred(deps: {
       }
       record = await deps.journal.read(runId)
       if (!record) throw new Error('AUTOMATION_DEFERRED_SNAPSHOT_UNAVAILABLE')
+      if (!failureCode) {
+        try {
+          const cleared = await deps.heartbeat({ runId, claimToken: saved.claimToken, holdCode: null })
+          if (!cleared.ok) deps.log(`[automation-context] Started hold clear unconfirmed run=${runId}`)
+        } catch { deps.log(`[automation-context] Started hold clear unconfirmed run=${runId}`) }
+      }
       const report: PendingAutomationReport = { runId, claimToken: saved.claimToken, reportId,
         status: failureCode ? 'FAILED' : 'COMPLETED', outcome: failureCode ? 'ERROR' : 'WOKE',
         sessionId: record.phase === 'prepared' ? null : record.sessionId, failureCode: failureCode ?? null,
@@ -88,7 +113,7 @@ export function createAutomationContextDeferred(deps: {
     }
   }
   return {
-    defer(runId: string) { return deps.launcherFor(runId).markDeferred(runId) },
+    defer(runId: string, holdCode?: AutomationExecutionHoldCode) { return deps.launcherFor(runId).markDeferred(runId, holdCode) },
     maintain(signal?: AbortSignal): Promise<void> {
       if (maintenance) return maintenance
       const current = maintain(signal)

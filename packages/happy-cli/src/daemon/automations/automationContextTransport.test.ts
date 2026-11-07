@@ -325,7 +325,8 @@ it('does not confirm an unobserved child or replay it after a spawn ACK without 
     transportForRun: async () => f.transport,
     resolveContext, heartbeat: async () => ({ ok: true }), log: vi.fn(),
     start: f.start })
-  await expect(host.dispatch({ ...f.input, environmentVariables: { EXPIRED_AUTHORITY: 'old' } })).rejects.toThrow('AUTOMATION_CHILD_OBSERVATION_UNCONFIRMED')
+  expect(await host.dispatch({ ...f.input, environmentVariables: { EXPIRED_AUTHORITY: 'old' } })).toMatchObject({
+    state: 'needs-attention', sessionId: 'automation-run:r1', reason: 'AUTOMATION_START_UNCONFIRMED' })
   expect(resolveContext).toHaveBeenCalledExactlyOnceWith(f.input)
   expect(f.start).toHaveBeenCalledWith(expect.objectContaining({ environmentVariables: { CURRENT_AUTHORITY: 'renewed' } }),
     { environmentVariables: { CURRENT_AUTHORITY: 'renewed' } }, expect.any(Function))
@@ -349,7 +350,7 @@ it.each(['waiting', 'unconfirmed'] as const)('cancels only original isolated exe
     heartbeat: async () => ({ ok: true }), log: vi.fn(), start: f.start }
   const host = createAutomationContextHost(deps)
   if (state === 'waiting') expect(await host.dispatch({ ...f.input, environmentVariables: {} })).toHaveProperty('state', 'waiting')
-  else await expect(host.dispatch({ ...f.input, environmentVariables: {} })).rejects.toThrow('AUTOMATION_CHILD_OBSERVATION_UNCONFIRMED')
+  else expect(await host.dispatch({ ...f.input, environmentVariables: {} })).toHaveProperty('state', 'needs-attention')
   const cancel = host.cancelAutomation
   expect(await cancel({ automationId: 'another-automation', generation: 2, revision: 2 })).toBe(true)
   expect(await cancel({ automationId: f.input.automationId, generation: 1, revision: 1 })).toBe(true)
@@ -524,17 +525,21 @@ it.each(['changed', 'deleted'])('keeps the frozen previous reference and holds a
     reportExit: async () => { throw new Error('No exit reporting before provider') },
     runtimeStore: createServerAutomationRuntimeStore({ filePath: join(home, 'runtime.json') }),
     transportForRun: async () => f.transport, resolveContext: async () => ({ environmentVariables: {} }),
-    heartbeat: async () => ({ ok: true }), log: vi.fn(), start: f.start }
+    heartbeat: vi.fn(async (_input: unknown) => ({ ok: true })), log: vi.fn(), start: f.start }
   const host = createAutomationContextHost(deps)
   const prepared = await (host as any).prepare({ automationId: 'a1', generation: 1, revision: 1, payload })
   expect(prepared).toEqual({ previousResult })
   await host.dispatch({ ...f.input, payload, ...prepared, environmentVariables: {} })
+  expect(deps.heartbeat).toHaveBeenCalledWith({ runId: 'r1', claimToken: f.input.claimToken, holdCode: 'WORKSPACE_BUSY' })
   const original = await f.deps.journal.read('r1')
   unavailable = true
   if (manual.acquired) await manual.finish({ submitted: false, tracked: false })
   await createAutomationContextHost(deps).maintain()
   expect(f.start).not.toHaveBeenCalled()
   expect(await f.deps.journal.read('r1')).toMatchObject({ phase: 'registered', deferredDispatch: 'queued', prepared: original!.prepared })
+  expect(await f.deps.journal.read('r1')).toHaveProperty('deferredHoldCode', reason === 'changed' ? 'AUTOMATION_REFERENCE_CHANGED' : 'AUTOMATION_REFERENCE_UNCONFIRMED')
+  expect(deps.heartbeat).toHaveBeenLastCalledWith({ runId: 'r1', claimToken: f.input.claimToken,
+    holdCode: reason === 'changed' ? 'AUTOMATION_REFERENCE_CHANGED' : 'AUTOMATION_REFERENCE_UNCONFIRMED' })
   expect(resolvePreviousResult).toHaveBeenLastCalledWith({ automationId: 'a1', generation: 1, revision: 1, displaySessionId: 'manual', beforeRunId: 'r1' })
   expect(JSON.stringify(deps.log.mock.calls)).not.toContain(previousResult.answer)
 })

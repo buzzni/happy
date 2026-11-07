@@ -2638,6 +2638,12 @@ describe('ApiMachineClient socket reconnection', () => {
         expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-claim', {
             automationId: 'automation-1', generation: 2, scheduledFor: 10,
         });
+        const transport = client.serverAutomationTransport();
+        for (const holdCode of ['WORKSPACE_BUSY', null] as const) {
+            const heartbeat = { runId: 'run-1', claimToken: 'token', holdCode };
+            await transport.heartbeat(heartbeat);
+            expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-run-heartbeat', heartbeat);
+        }
         client.shutdown();
     });
 

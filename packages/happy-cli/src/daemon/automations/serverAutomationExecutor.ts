@@ -4,7 +4,7 @@ import { mergePullRequestFiles, type PullRequestFiles } from './queryGithubPullR
 import { randomUUID } from 'node:crypto'
 import type { LegacyDispatchReservation } from '@/utils/workspaceTurnAdmission'
 import { buildScheduledRunPrompt } from '@/utils/scheduledRunPrompt'
-import { automationExecutionSessionId, isAutomationExecutionSessionId } from '@slopus/happy-wire'
+import { automationExecutionSessionId, isAutomationExecutionSessionId, type AutomationRunHeartbeatRequest } from '@slopus/happy-wire'
 import { buildAutomationContextInput } from './automationContextInput'
 
 import {
@@ -87,7 +87,7 @@ const SCHEDULED_AUTOMATION_PROMPT_PREAMBLE = [
 export interface ServerAutomationTransport {
   claim(input: { automationId: string; generation: number; scheduledFor: number }): Promise<TransportResult>
   start(input: { runId: string; claimToken: string }): Promise<TransportResult>
-  heartbeat(input: { runId: string; claimToken: string }): Promise<TransportResult>
+  heartbeat(input: AutomationRunHeartbeatRequest): Promise<TransportResult>
   report(input: PendingAutomationReport): Promise<TransportResult>
 }
 

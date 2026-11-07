@@ -1,7 +1,8 @@
 import { z } from 'zod'
 import { createHash, randomUUID } from 'node:crypto'
 import { HappySessionExecutionProofSchema, SessionExecutionCreateBodySchema, automationExecutionSeedSchema, automationExecutionSeedManifestSchema,
-  automationExecutionSeedArtifactSchema, automationExecutionSeedLocalId, automationExecutionSessionId, isAutomationExecutionSessionId, automationPayloadSchema } from '@slopus/happy-wire'
+  automationExecutionSeedArtifactSchema, automationExecutionSeedLocalId, automationExecutionSessionId, isAutomationExecutionSessionId, automationPayloadSchema,
+  automationExecutionHoldCodeSchema, type AutomationExecutionHoldCode } from '@slopus/happy-wire'
 import type { ApiClient } from '@/api/api'
 import type { Metadata, Session } from '@/api/types'
 import type { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/registerCommonHandlers'
@@ -31,6 +32,7 @@ export const automationContextLaunchRecordSchema = z.strictObject({
   exitReceiptAcknowledged: z.literal(true).optional(),
   workspaceOwnerToken: z.string().uuid().optional(),
   deferredDispatch: z.enum(['queued', 'settled']).optional(),
+  deferredHoldCode: automationExecutionHoldCodeSchema.optional(),
   cancelledBeforeSubmit: z.literal(true).optional(),
 })
 export type AutomationContextLaunchRecord = z.infer<typeof automationContextLaunchRecordSchema>
@@ -101,14 +103,16 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
       evidence: { providerExitedCleanly: true, foregroundDrained: true, backgroundDrained: true, writeProducersDrained: true } })
   }
   return {
-    async markDeferred(runId: string): Promise<boolean> {
+    async markDeferred(runId: string, holdCode?: AutomationExecutionHoldCode): Promise<boolean> {
       return exclusive(runId, async () => {
         const record = await deps.journal.read(runId)
         if (!record) throw new Error('AUTOMATION_DEFERRED_STATE_CONFLICT')
         assertIdentity(record, runId)
         if (record.cancelledBeforeSubmit || record.deferredDispatch === 'settled'
           || record.phase !== 'prepared' && record.phase !== 'registered') throw new Error('AUTOMATION_DEFERRED_STATE_CONFLICT')
-        if (!record.deferredDispatch) await deps.journal.write({ ...record, deferredDispatch: 'queued' })
+        if (!record.deferredDispatch || holdCode !== undefined && holdCode !== record.deferredHoldCode) {
+          await deps.journal.write({ ...record, deferredDispatch: 'queued', ...(holdCode === undefined ? {} : { deferredHoldCode: holdCode }) })
+        }
         return true
       })
     },
@@ -117,7 +121,10 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
         const record = await deps.journal.read(runId)
         if (!record?.deferredDispatch) throw new Error('AUTOMATION_DEFERRED_STATE_CONFLICT')
         assertIdentity(record, runId)
-        if (record.deferredDispatch !== 'settled') await deps.journal.write({ ...record, deferredDispatch: 'settled' })
+        if (record.deferredDispatch !== 'settled' || record.deferredHoldCode !== undefined) {
+          const { deferredHoldCode: _holdCode, ...settled } = record
+          await deps.journal.write({ ...settled, deferredDispatch: 'settled' })
+        }
       })
     },
     async cancelUnsubmitted(runId: string): Promise<boolean> {
