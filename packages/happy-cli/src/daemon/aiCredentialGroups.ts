@@ -165,8 +165,11 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
     // A dedicated PC made shared keeps the group its member applied (Saycode #5882). The machine's own assignment takes
     // over what that group holds here and the machine names too: otherwise neither may replace it, and no revocation
     // removes an account another entry desires. Its managedHeld stays: removal reads every entry's record anyway.
+    // Made dedicated again, the member's assignment takes them back from this PC's machine assignment the same way.
+    const formerHere=(e:Entry)=>normalized.principalType==='machine'?principalType(e)==='user'&&appliedHere(e)
+      :principalType(e)==='machine'&&Boolean(deps.appliedMachineId)&&e.machineId===deps.appliedMachineId&&appliedHere(e)
     const handed:string[]=[]
-    if(normalized.principalType==='machine')for(const former of journal.entries.filter(e=>e.scope===normalized.scope&&e.provider===normalized.provider&&principalType(e)==='user'&&appliedHere(e))){
+    for(const former of journal.entries.filter(e=>e.scope===normalized.scope&&e.provider===normalized.provider&&formerHere(e))){
       const taken=[...former.owned,...(former.managedHeld??[])].filter(value=>desired.includes(value))
       former.owned=former.owned.filter(value=>!taken.includes(value))
       handed.push(...taken)
