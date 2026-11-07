@@ -43,6 +43,7 @@ import { randomUUID } from 'node:crypto';
 import { execSync } from 'node:child_process';
 import { logger } from '@/ui/logger';
 import { installBroadKillShims } from '@/utils/broadKillShims';
+import { installHappyCommandShim } from '@/utils/happyCommandShim';
 import { Credentials, readSettings } from '@/persistence';
 import { resolveSessionSandboxConfig } from '@/sandbox/resolveSessionSandboxConfig';
 import { resolveSessionSandboxPolicyMode } from '@/sandbox/sandboxPolicy';
@@ -288,6 +289,8 @@ export async function runCodex(opts: {
 
     const deferredContinuation = createDeferredContinuationContextConsumer(process.env);
     installBroadKillShims();
+    // The prompt's `happy agent` must reach this CLI however the daemon was launched.
+    installHappyCommandShim();
     const automationRunOnceRequested = consumeAutomationRunOnce(process.env);
     const reconnectSession = consumeReconnectSessionEnvironment(process.env);
     const reconnectSessionId = reconnectSession?.id;
