@@ -19,10 +19,16 @@ const COMMAND_TOOLS = new Set(['Bash', 'Monitor']);
 const MAX_REMEMBERED = 64;
 const MAX_COMMAND_LENGTH = 1000;
 
-function remember<V>(map: Map<string, V>, key: string, value: V): void {
+/** Keeps the newest entries; one still `listed` is never the one dropped, however long its task runs. */
+function remember<V>(map: Map<string, V>, key: string, value: V, listed?: ReadonlyMap<string, unknown>): void {
     map.delete(key);
     map.set(key, value);
-    if (map.size > MAX_REMEMBERED) map.delete(map.keys().next().value!);
+    if (map.size <= MAX_REMEMBERED) return;
+    for (const oldest of map.keys()) {
+        if (listed?.has(oldest)) continue;
+        map.delete(oldest);
+        return;
+    }
 }
 
 export function createClaudeBackgroundTaskDetails(now: () => number = Date.now) {
@@ -48,7 +54,7 @@ export function createClaudeBackgroundTaskDetails(now: () => number = Date.now) 
             if (message.type !== 'system' || message.subtype !== 'task_started' || !message.tool_use_id) return null;
             const origin = toolUses.get(message.tool_use_id);
             if (!origin) return null;
-            remember(origins, message.task_id, origin);
+            remember(origins, message.task_id, origin, startedAt);
             return message.task_id;
         },
         /** The rows for one full list; a task listed before keeps its start time. */

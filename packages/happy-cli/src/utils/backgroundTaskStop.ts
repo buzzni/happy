@@ -7,12 +7,18 @@
  * drops it once the provider reports it gone; the client waits for that.
  */
 import type { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager';
+import type { ApiSessionClient } from '@/api/apiSession';
 import { logger } from '@/ui/logger';
 
 export type BackgroundTaskStopStatus = 'requested' | 'not_found' | 'unavailable' | 'unsupported' | 'failed';
 export type BackgroundTaskStopResult = { status: BackgroundTaskStopStatus };
 
 const MAX_TASK_ID_LENGTH = 512;
+
+/** Publishes `runtimeCapabilities.backgroundTaskStop` on a session whose handler is registered. */
+export function advertiseBackgroundTaskStop(session: Pick<ApiSessionClient, 'updateMetadata'>): void {
+    session.updateMetadata(current => ({ ...current, runtimeCapabilities: { ...current.runtimeCapabilities, backgroundTaskStop: 1 } }));
+}
 
 export function registerBackgroundTaskStopHandler(
     rpcHandlerManager: Pick<RpcHandlerManager, 'registerHandler'>,

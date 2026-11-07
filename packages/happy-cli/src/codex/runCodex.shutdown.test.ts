@@ -879,7 +879,12 @@ describe('Codex offline start', () => {
         const { BasePermissionHandler } = await import('@/utils/BasePermissionHandler');
         const updateSession = vi.spyOn(BasePermissionHandler.prototype, 'updateSession');
 
+        const metadataWritesBefore = fixture.session.updateMetadata.mock.calls.length;
         await fixture.reconnectOffline!();
+        // The stub could not write metadata: the real session advertises Stop for background terminals
+        // (aplus-dev-studio-desktop specs/agent-background-work-panel R4).
+        expect(fixture.session.updateMetadata.mock.calls.slice(metadataWritesBefore).map(([update]) => update({})))
+            .toContainEqual({ runtimeCapabilities: { backgroundTaskStop: 1 } });
         // The swap still re-attaches the input queue, steer, permissions and the archive listener (R4-d).
         expect(updateSession).toHaveBeenCalledWith(fixture.session);
         expect(fixture.session.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', expect.any(Boolean));

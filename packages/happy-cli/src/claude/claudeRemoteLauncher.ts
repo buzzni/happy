@@ -50,7 +50,7 @@ import { createEnvelope, isAutomationExecutionSessionId, type McpRuntimeServerSt
 import type { McpRuntimeRecovery } from './mcpRuntimeRecovery';
 import { registerMcpReconnectHandler } from './registerMcpReconnectHandler';
 import { createClaudeBackgroundTaskDetails } from './claudeBackgroundTaskDetails';
-import { registerBackgroundTaskStopHandler } from '@/utils/backgroundTaskStop';
+import { advertiseBackgroundTaskStop, registerBackgroundTaskStopHandler } from '@/utils/backgroundTaskStop';
 import { publishClaudePromptSuggestion } from './promptSuggestionMetadata';
 import { createStreamDeltaRelay } from './streamDeltaRelay';
 import { contextUsageBreakdownRequestItem, contextUsageSignalItem, withContextUsageSignals, type ClaudeControlRequest } from './claudeContextUsage';
@@ -299,7 +299,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             await stopBackgroundTask(taskId);
             return 'requested';
         });
-        session.client.updateMetadata(current => ({ ...current, runtimeCapabilities: { ...current.runtimeCapabilities, backgroundTaskStop: 1 } }));
+        advertiseBackgroundTaskStop(session.client);
     }
 
     // Drop any permission requests left over in agent state from a

@@ -44,6 +44,21 @@ describe('Claude background task rows (specs/agent-background-work-panel R1)', (
         expect(details.list([{ task_id: 'a', task_type: 'local_bash', description: '' }])[0]).not.toHaveProperty('command');
     });
 
+    it('keeps the command of a listed task however many other tasks start and end meanwhile', () => {
+        const details = createClaudeBackgroundTaskDetails(() => 1);
+        details.observe(toolUse('use-server', 'Bash', { command: 'npm run dev' }));
+        details.observe(started('server', 'use-server'));
+        const server = { task_id: 'server', task_type: 'local_bash', description: 'dev server' };
+        details.list([server]);
+        for (let i = 0; i < 100; i++) {
+            details.observe(toolUse(`use-${i}`, 'Bash', { command: `step ${i}` }));
+            details.observe(started(`t-${i}`, `use-${i}`));
+            details.list([server, { task_id: `t-${i}`, task_type: 'local_bash', description: '' }]);
+            details.list([server]);
+        }
+        expect(details.list([server])[0]).toEqual(expect.objectContaining({ command: 'npm run dev', toolName: 'Bash' }));
+    });
+
     it('restarts the clock of a task that left the list and caps the command length', () => {
         let clock = 1;
         const details = createClaudeBackgroundTaskDetails(() => clock);

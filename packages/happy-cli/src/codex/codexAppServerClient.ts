@@ -401,12 +401,12 @@ export class CodexAppServerClient {
      * terminal of the thread. The list drops the terminal on the next refresh, brought forward here.
      */
     async terminateBackgroundTask(callId: string): Promise<BackgroundTaskStopStatus> {
-        const task = this.backgroundTasks.get(callId);
-        if (!task) return 'not_found';
-        const threadId = this._threadId;
-        if (!task.processId || !threadId || !this.connected) return 'unavailable';
+        if (!this.backgroundTasks.has(callId)) return 'not_found';
+        // The thread that listed it, not the current one: after `/clear` a terminal of the old thread can still be listed.
+        const target = this.backgroundTasks.stopTarget(callId);
+        if (!target || !this.connected) return 'unavailable';
         try {
-            await this.request('thread/backgroundTerminals/terminate', { threadId, processId: task.processId }, 5000);
+            await this.request('thread/backgroundTerminals/terminate', target, 5000);
         } catch (error) {
             // A Codex without the method rejects its name (an unknown request variant).
             if (/unknown variant|method not found|code=-32601/i.test(String(error))) return 'unsupported';

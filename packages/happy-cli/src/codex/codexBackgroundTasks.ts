@@ -15,6 +15,8 @@ export class CodexBackgroundTasks {
     private generation = 0;
     private completed = new Set<string>();
     private snapshotConfirmed = false;
+    /** The thread of the last full snapshot: every `running` task was listed on it. */
+    private listedThreadId: string | null = null;
 
     constructor(
         private readonly request: (method: string, params: unknown) => Promise<unknown>,
@@ -23,8 +25,16 @@ export class CodexBackgroundTasks {
     ) {}
 
     get hasTasks(): boolean { return this.tasks.size > 0; }
-    /** The listed terminal with this call id, for a stop by its process id. */
-    get(callId: string): CodexBackgroundTask | undefined { return this.tasks.get(callId); }
+    has(callId: string): boolean { return this.tasks.has(callId); }
+    /**
+     * Where to stop a terminal (aplus-dev-studio-desktop specs/agent-background-work-panel R2): only one the last full
+     * snapshot listed, on the thread that listed it. An unconfirmed or restored entry may name another thread or
+     * app-server process, so it has no target.
+     */
+    stopTarget(callId: string): { threadId: string; processId: string } | null {
+        const task = this.tasks.get(callId);
+        return task?.status === 'running' && task.processId && this.listedThreadId ? { threadId: this.listedThreadId, processId: task.processId } : null;
+    }
     /** An empty UI list on a failed/unsupported read is never writer quiescence. */
     get confirmedEmpty(): boolean { return this.snapshotConfirmed && this.tasks.size === 0; }
 
@@ -83,6 +93,7 @@ export class CodexBackgroundTasks {
             if (generation !== this.generation) return;
             for (const id of completedDuringRead) next.delete(id);
             this.tasks = next;
+            this.listedThreadId = threadId;
             this.snapshotConfirmed = true;
             // Retain tombstones through this read, then allow the next fresh snapshot.
             this.completed = new Set();
