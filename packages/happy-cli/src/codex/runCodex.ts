@@ -2605,7 +2605,8 @@ export async function runCodex(opts: {
                 let routingApplied = false;
                 try {
                     if (clearRecoveryError) throw clearRecoveryError;
-                    await measure('auth', () => authRecovery.prepareTurn());
+                    // Only a blocked session waits here; an extra await would let a kill land mid-preparation.
+                    if (authRecovery.status().state === 'failed') await measure('auth', () => authRecovery.prepareTurn());
                     if (checkpointComposition.completeTurn) {
                         // specs/linux-checkpoint-enforcement-backend R4 — open the checkpoint turn (and
                         // materialize its workspace) before codex is wrapped and spawned. On Linux bwrap
