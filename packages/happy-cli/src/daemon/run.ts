@@ -175,7 +175,8 @@ import {
   shareInFlight,
 } from './resumeGuards';
 import { decideResumeCursorPersist } from './resumeCursorPersistence';
-import { createSessionRetention } from './sessionRetention';
+import { createSessionRetention, retentionProtects } from './sessionRetention';
+import { readStaleRuntimeRestartConfig, sweepStaleRuntimeSessions } from './staleRuntimeSessionRestart';
 import { stageInitialPromptEnvironment } from '@/utils/initialPrompt';
 import { outputFormatSeed, STRUCTURED_OUTPUT_CAPABILITY } from '@/claude/structuredOutput';
 import {
@@ -5871,6 +5872,7 @@ export async function startDaemon(): Promise<void> {
       : 60_000;
     const idleReaperConfig = readDaemonSessionIdleReaperConfig(process.env, { managedRuntimeActive });
     const emptySessionReaperMs = readEmptySessionReaperMs(process.env);
+    const staleRuntimeRestartConfig = readStaleRuntimeRestartConfig(process.env);
     let heartbeatRunning = false
     const restartOnStaleVersionAndHeartbeat = setInterval(async () => {
       if (heartbeatRunning) {
@@ -5986,6 +5988,24 @@ export async function startDaemon(): Promise<void> {
       if (handingOffToInstalledBundle) {
         heartbeatRunning = false;
         return;
+      }
+      // Session processes outlive a daemon update and keep the old code: stop idle ones so the
+      // next input resumes them on this runtime (aplus specs/stale-runtime-session-restart).
+      // Not while this daemon is itself about to be replaced — a resume would be refused meanwhile.
+      if (handoffAutomation === 'run-automations' && !bundleReplaced && !managedRuntimeActive && !staleRuntimeRestartConfig.disabled) {
+        sweepStaleRuntimeSessions({
+          trackedSessions: getCurrentChildren(),
+          sessionStartTimes,
+          daemonVersion: packageJson.version,
+          stopSession,
+          retentionProtects: (session) => {
+            try { return retentionProtects(sessionRetention.record(session.happySessionId!), session.runtime, Date.now()); }
+            catch { return true; }
+          },
+          quietMs: staleRuntimeRestartConfig.quietMs,
+          batchMax: idleReaperConfig.batchMax,
+          logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
+        });
       }
       if (handoffAutomation === 'run-automations') {
         // Scheduled automations tick — 하트비트 케이던스로 기동하되 await하지
