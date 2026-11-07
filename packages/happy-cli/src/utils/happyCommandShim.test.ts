@@ -65,6 +65,15 @@ describe.skipIf(isWindows)('installHappyCommandShim', () => {
         expect(statSync(join(shimDir!, 'happy')).mode & 0o111).toBeTruthy();
         expect(env.PATH).toBe(`${shimDir}:/usr/bin`);
     });
+
+    // POSIX names are case-sensitive: a lowercase `path` is some other variable.
+    it('shouldLeaveALowercasePathVariableAloneOnPosix', () => {
+        const env: NodeJS.ProcessEnv = { path: 'not a search path', PATH: '/usr/bin' };
+
+        const shimDir = installHappyCommandShim(env, homeDir, { runtime: '/bin/echo', args: [] });
+
+        expect(env).toEqual({ path: 'not a search path', PATH: `${shimDir}:/usr/bin` });
+    });
 });
 
 describe('installHappyCommandShim on Windows', () => {
@@ -101,6 +110,16 @@ describe('installHappyCommandShim on Windows', () => {
             installHappyCommandShim(env, homeDir, printArgs);
 
             expect(JSON.parse(cmd(env, 'happy agent whoami').stdout)).toEqual(['C:\\사용자 100%', 'agent', 'whoami']);
+        });
+
+        // PowerShell runs `happy.cmd` through cmd, so `%VAR%` and embedded `"` in arguments are cmd's to
+        // reparse; plain arguments, spaces included, must arrive intact.
+        it('shouldRunTheSessionsOwnCliFromPowerShell', () => {
+            const env = sessionEnv();
+            installHappyCommandShim(env, homeDir, { runtime: process.execPath, args: ['-e', 'console.log(JSON.stringify(process.argv.slice(1)))'] });
+
+            const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', "happy agent 'two words'"], { env, encoding: 'utf8' });
+            expect(JSON.parse(result.stdout)).toEqual(['agent', 'two words']);
         });
 
         it('shouldReturnTheCliExitCodeThroughCmd', () => {

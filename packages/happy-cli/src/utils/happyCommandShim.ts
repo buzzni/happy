@@ -41,6 +41,10 @@ function shScript(command: HappyCliCommand): string {
  * cmd and PowerShell (Codex on Windows) find this one through PATHEXT. cmd decodes a batch file in
  * the console code page, which would garble a non-ASCII profile path, so the file names no path: it
  * runs the command the session put in its environment, which stays Unicode.
+ *
+ * PowerShell runs it through cmd too, so `%VAR%` and embedded `"` in arguments are cmd's to reparse.
+ * A `happy.ps1` would pass them verbatim, but the default Restricted execution policy refuses every
+ * script, and PowerShell prefers the .ps1 over this file: `happy` would stop working there.
  */
 const CMD_SCRIPT = [
     '@rem happy command shim - see happyCommandShim.ts in happy-cli.',
@@ -93,7 +97,8 @@ export function installHappyCommandShim(
         }
 
         const delimiter = platform === 'win32' ? ';' : ':';
-        const pathKey = Object.keys(env).find((key) => key.toUpperCase() === 'PATH') ?? 'PATH';
+        // Only Windows names are case-insensitive; on POSIX a lowercase `path` is another variable.
+        const pathKey = platform === 'win32' ? Object.keys(env).find((key) => key.toUpperCase() === 'PATH') ?? 'Path' : 'PATH';
         const currentPath = env[pathKey] ?? '';
         if (!currentPath.split(delimiter).includes(shimDir)) {
             env[pathKey] = currentPath ? `${shimDir}${delimiter}${currentPath}` : shimDir;
