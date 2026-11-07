@@ -1,4 +1,5 @@
 import type { ChildProcess } from 'node:child_process'
+import type { AutomationExecutionQuestionIdentity } from '@slopus/happy-wire'
 import { createSerialLock } from '@/utils/refreshRecovery'
 import { observeAutomationContextChild } from '@/utils/automationContextExit'
 import { OwnedStartRefused } from '../ownedSpawn'
@@ -27,7 +28,7 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
   transportForRun(run: AutomationContextLaunchRequest, prepared: AutomationContextLaunchRecord['prepared']): Promise<Transport>
   resolveContext(run: AutomationContextLaunchRequest): Promise<Context>
   resolvePreviousResult?(input: { automationId: string; generation: number; revision: number;
-    displaySessionId: string; beforeRunId?: string }): Promise<unknown>
+    displaySessionId: string; beforeRunId?: string; questionIdentity?: AutomationExecutionQuestionIdentity }): Promise<unknown>
   start: (options: Parameters<AutomationContextLaunchDependencies['start']>[0], context: Context,
     observeChild: (child: ChildProcess) => void) => ReturnType<AutomationContextLaunchDependencies['start']>
   heartbeat: Parameters<typeof createAutomationContextDeferred>[0]['heartbeat']
@@ -51,7 +52,8 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
   async function resolvePrevious(run: Parameters<Preparation>[0], beforeRunId?: string) {
     if (!deps.resolvePreviousResult || !run.payload.conversation) throw new Error('AUTOMATION_REFERENCE_UNSUPPORTED')
     return deps.resolvePreviousResult({ automationId: run.automationId, generation: run.generation, revision: run.revision,
-      displaySessionId: run.payload.conversation.sessionId, ...(beforeRunId ? { beforeRunId } : {}) })
+      displaySessionId: run.payload.conversation.sessionId, ...(beforeRunId ? { beforeRunId } : {}),
+      ...(run.payload.executionQuestion ? { questionIdentity: run.payload.executionQuestion } : {}) })
   }
   const prepare: Preparation = async input => {
     const original = input.runId ? await entry(input.runId).launcher.restoreRequest(input.runId) : null

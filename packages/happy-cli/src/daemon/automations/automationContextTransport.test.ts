@@ -543,3 +543,41 @@ it.each(['changed', 'deleted'])('keeps the frozen previous reference and holds a
   expect(resolvePreviousResult).toHaveBeenLastCalledWith({ automationId: 'a1', generation: 1, revision: 1, displaySessionId: 'manual', beforeRunId: 'r1' })
   expect(JSON.stringify(deps.log.mock.calls)).not.toContain(previousResult.answer)
 })
+
+const questionIdentity = { requestId: 'ad5ab630-9a10-4dc7-957e-e2d628a4df2a', sourceRunId: 'prior' }
+it('keeps the explicit question identity when preparing its selected previous result', async () => {
+  const f = await setup()
+  const payload = { ...f.input.payload, executionQuestion: questionIdentity,
+    contextPolicy: { kind: 'isolated' as const, reference: { kind: 'previous-result' as const, maxBytes: 16384 } } }
+  const previousResult = { automationId: 'a1', runId: 'prior', revision: 1, status: 'COMPLETED', question: 'Selected question', answer: 'Selected answer' }
+  const resolvePreviousResult = vi.fn(async () => previousResult)
+  const host = createAutomationContextHost({ ...f.deps,
+    workspace: createAutomationContextWorkspace({ home, isTracked: async () => false }), resolvePreviousResult,
+    runtimeStore: createServerAutomationRuntimeStore({ filePath: join(home, 'runtime.json') }),
+    transportForRun: async () => f.transport, resolveContext: async () => ({ environmentVariables: {} }),
+    reportExit: async () => {}, heartbeat: async () => ({ ok: true }), log: () => {}, start: f.start })
+  expect(await host.prepare({ ...f.input, runId: questionIdentity.requestId, payload })).toEqual({ previousResult })
+  expect(resolvePreviousResult).toHaveBeenCalledWith({ automationId: 'a1', generation: 1, revision: 1,
+    displaySessionId: 'manual', questionIdentity })
+  expect(f.start).not.toHaveBeenCalled()
+})
+it('sends the question identity to the trusted Studio issuer', async () => {
+  const authorize = createAutomationContextAuthorizer({ studioOrigin: origin, token: 'fixture-account-token', machineId: 'm1',
+    runId: questionIdentity.requestId, claimToken: 'fixture-claim' })
+  await authorize({ automationId: 'a1', runId: questionIdentity.requestId, generation: 1, revision: 1,
+    machineId: 'm1', displaySessionId: 'manual', conversationDirectory: '/work', agent: 'codex',
+    questionRequestId: questionIdentity.requestId, body: { tag: `automation-run:${questionIdentity.requestId}`, metadata: 'cipher', agentState: null } } as any)
+  expect(requests.find(row => row.path === '/api/automation/execution-target')?.body).toHaveProperty('questionRequestId', questionIdentity.requestId)
+})
+it.each(['register', 'verifyStart'] as const)('forwards the sealed question identity during %s authorization', async action => {
+  const f = await setup(), authorize = vi.fn(async (_target: unknown): Promise<never> => { throw new Error('stop-before-http') })
+  const transport = createAutomationContextTransport({ serverUrl: origin, token: 'fixture-account-token', machineId: 'm1',
+    runId: questionIdentity.requestId, claimToken: 'fixture-claim', authorize })
+  const run = { ...f.input, runId: questionIdentity.requestId, payload: { ...f.input.payload, executionQuestion: questionIdentity,
+    contextPolicy: { kind: 'isolated' as const, reference: { kind: 'previous-result' as const, maxBytes: 16384 } } } }
+  const prepared = { body: { tag: `automation-run:${questionIdentity.requestId}`, metadata: 'cipher', agentState: null },
+    encryptionKey: 'key', encryptionVariant: 'legacy' as const }
+  await expect(transport[action](run, prepared as any)).rejects.toThrow('stop-before-http')
+  expect(authorize).toHaveBeenCalledWith(expect.objectContaining({ questionRequestId: questionIdentity.requestId }))
+  expect(f.start).not.toHaveBeenCalled()
+})

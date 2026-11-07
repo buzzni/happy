@@ -25,7 +25,7 @@ const sessionSchema = z.object({ id: z.string(), seq: z.number().int().nonnegati
 
 export type AutomationContextTargetRequest = {
   automationId: string; runId: string; generation: number; revision: number; machineId: string;
-  displaySessionId: string; conversationDirectory: string; agent: 'claude' | 'codex'; body: Readonly<SessionExecutionCreateBody>
+  displaySessionId: string; conversationDirectory: string; agent: 'claude' | 'codex'; questionRequestId?: string; body: Readonly<SessionExecutionCreateBody>
 }
 
 /** The daemon's explicit trust configuration is the only destination. Payloads supply no URLs or downgrade flags. */
@@ -75,7 +75,8 @@ export function createAutomationContextAuthorizer(input: {
     return record
   }
   return async (target, action) => {
-    if (target.machineId !== input.machineId || target.runId !== input.runId) throw new Error('AUTOMATION_CONTEXT_IDENTITY_CONFLICT')
+    if (target.machineId !== input.machineId || target.runId !== input.runId
+      || target.questionRequestId !== undefined && target.questionRequestId !== input.runId) throw new Error('AUTOMATION_CONTEXT_IDENTITY_CONFLICT')
     if (action) {
       const record = await recordFor(target), authority = record.executionAuthority
       if (!authority || !candidate?.executionProof) return conflict()
@@ -94,7 +95,8 @@ export function createAutomationContextAuthorizer(input: {
     }
     const body = { machineId: input.machineId, runId: input.runId, claimToken: input.claimToken,
       generation: target.generation, revision: target.revision, conversationSessionId: target.displaySessionId,
-      conversationDirectory: target.conversationDirectory, agent: target.agent, createBody: target.body }
+      conversationDirectory: target.conversationDirectory, agent: target.agent, createBody: target.body,
+      ...(target.questionRequestId ? { questionRequestId: target.questionRequestId } : {}) }
     const raw = await json('/api/automation/execution-target', body)
     const personal = admissionSchema.omit({ executionProof: true }).safeParse(raw)
     if (personal.success && !personal.data.executionBindingRequired && !personal.data.executionAuthorityDigest) {
@@ -186,7 +188,8 @@ export function createAutomationContextTransport(input: {
       // Recheck the strict issuer after waiting without creating another session or seed.
       const admission = admissionSchema.parse(await input.authorize({ automationId: run.automationId, runId: run.runId,
         generation: run.generation, revision: run.revision, machineId: input.machineId, displaySessionId,
-        conversationDirectory: run.payload.directory, agent: run.payload.agent, body: structuredClone(prepared.body) }))
+        conversationDirectory: run.payload.directory, agent: run.payload.agent, body: structuredClone(prepared.body),
+        ...(run.payload.executionQuestion ? { questionRequestId: run.payload.executionQuestion.requestId } : {}) }))
       if (admission.executionBindingRequired && (!admission.executionProof || !admission.executionAuthorityDigest)) throw new Error('AUTOMATION_EXECUTION_PROOF_REQUIRED')
       const { executionProof, ...currentAuthority } = admission, ticket = executionProof?.ticket.body
       const receipt = z.strictObject({ status: z.literal('REGISTERED'), sessionId: z.string(), displaySessionId: z.string(),
@@ -219,7 +222,8 @@ export function createAutomationContextTransport(input: {
       // No authored prompt, seed ciphertext or private key is sent to the issuer.
       const target: AutomationContextTargetRequest = { automationId: run.automationId, runId: run.runId,
         generation: run.generation, revision: run.revision, machineId: input.machineId, displaySessionId,
-        conversationDirectory: run.payload.directory, agent: run.payload.agent, body: structuredClone(prepared.body) }
+        conversationDirectory: run.payload.directory, agent: run.payload.agent, body: structuredClone(prepared.body),
+        ...(run.payload.executionQuestion ? { questionRequestId: run.payload.executionQuestion.requestId } : {}) }
       let admission = admissionSchema.parse(await input.authorize(target))
       if (admission.executionBindingRequired && (!admission.executionProof || !admission.executionAuthorityDigest)) throw new Error('AUTOMATION_EXECUTION_PROOF_REQUIRED')
       const createBodyHash = await sessionCreateBodyHash(prepared.body)
