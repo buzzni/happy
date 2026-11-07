@@ -72,7 +72,7 @@ import {
     refreshMcpCallerGrantIfExpiring,
     startMcpCallerGrantRefreshTimer,
 } from '@/aplus/refreshMcpCallerGrant';
-import { mergeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
+import { mergeAplusMcpServers, withSaycodeInstructionsPreference } from '@/aplus/mergeAplusMcpServers';
 import { encodeBase64 } from '@/api/encryption';
 import type { Session as ApiSession, UserMessage } from '@/api/types';
 import { getProjectPath } from './utils/path';
@@ -2062,7 +2062,10 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     }
     // While the shadow runs, the hook steps aside for `cua-driver`: an org server of that name must not displace it.
     const shadowSafe = <T,>(servers: Record<string, T>): Record<string, T> => (cuaUpstream ? withoutCuaDriver(servers) : servers);
-    const aplusMcpServers = shadowSafe(initialAplusMcpSnapshot?.servers ?? {});
+    const aplusMcpServers = withSaycodeInstructionsPreference(
+        shadowSafe(initialAplusMcpSnapshot?.servers ?? {}),
+        currentSaycodeSystemPromptEnabled,
+    );
     const baseMcpServers = {
         'happy': happyServer.mcpConfig,
         ...(toolPolicy && cuaUpstream ? {
@@ -2208,7 +2211,9 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 await (measure ? measure('mcp-grant', refresh) : refresh());
                 const fetchConfig = () => fetchAplusMcpServersResult(token, account, { sessionId: session.sessionId, lifecycle: 'turn', ...(orgGate ? { onRequirements: orgGate.onRequirements } : {}) });
                 const fetched = await (measure ? measure('mcp-fetch', fetchConfig) : fetchConfig());
-                return fetched.ok ? { ...fetched, servers: shadowSafe(fetched.servers) } : fetched;
+                return fetched.ok
+                    ? { ...fetched, servers: withSaycodeInstructionsPreference(shadowSafe(fetched.servers), currentSaycodeSystemPromptEnabled) }
+                    : fetched;
             },
         },
         session,
