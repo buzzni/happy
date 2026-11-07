@@ -21,12 +21,13 @@ Claude는 실행 중 요금제 한도 정보를 두 경로로 준다.
 - **R8-a** 신규 `claude/utils/usageLimits.ts` — 순수 함수(정규화·병합)와 타입.
   - `synthesizeStatus(utilization)`: 숫자가 아니면 `undefined`, `>= 100` → `rejected`, `>= 90` → `allowed_warning`, 그 밖 `allowed`.
   - `windowsFromGetUsage(rate_limits)`: 각 창 id를 그대로 쓰고, `utilization`은 0~100으로 자르며(숫자 아니면 `null`), `resets_at`은 유효한 ISO면 정규화된 ISO(`toISOString`), 아니면 `null`. 상태는 `synthesizeStatus`. `extra_usage`(과금 상태)와 창 모양(`utilization`·`resets_at` 둘 다 없음)이 아닌 항목은 뺀다.
-  - `fromRateLimitEvent(info)`: `utilization` 0~1 비율 → 퍼센트(소수 첫째 자리, 0~100으로 자름; `<= 1`일 때만 ×100 — 단위가 이미 퍼센트로 바뀌어도 맞게), `resetsAt` unix 초 → ISO(`>= 1e12`면 이미 ms로 본다). `rateLimitType`이 있으면 그 id의 창, 없으면 `unbound`(지금 걸린 창이 무엇인지 모름). 입력 객체를 바꾸지 않는다(R8-c).
-  - `mergeUsageLimits(current, patch)`: id별 병합. 같은 id면 새 값이 이기되 새 값의 `utilization`·`resetsAt`이 비면 이전 값을 지킨다(허용 이벤트는 비율 없이 오기 때문). `patch.replace`(get_usage 전체 스냅샷)면 이전 창을 버리고 패치에서 시작한다. `unbound`는 알려진 창 중 사용률이 가장 높은 창에 적용하고, 사용률 있는 창이 없으면 합성 `plan` 창을 한 개만 유지(upsert)한다. `current`가 깨졌거나(배열 아님, id 없는 항목) 다른 버전이 쓴 모양이어도 던지지 않고 읽을 수 있는 창만 쓴다. 같은 패치를 두 번 적용해도 결과가 같다(`updateAgentState`가 버전 충돌 때 콜백을 다시 돌림).
+  - `fromRateLimitEvent(info)`: `utilization` 0~1 비율 → 퍼센트(소수 첫째 자리, 0~100으로 자름; `<= 1`일 때만 ×100 — 단위가 이미 퍼센트로 바뀌어도 맞게), `resetsAt` unix 초 → ISO(`>= 1e12`면 이미 ms로 본다; 날짜로 나타낼 수 없는 값은 `null`). `rateLimitType`이 비지 않은 문자열이면 그 id의 창, 아니면 `unbound`(지금 걸린 창이 무엇인지 모름). 모르는 `status`의 이벤트는 버린다. 입력 객체를 바꾸지 않는다(R8-c).
+  - `mergeUsageLimits(current, patch)`: id별 병합. 같은 id면 새 값이 이기되 새 값의 `utilization`·`resetsAt`이 비면 이전 값을 지킨다(허용 이벤트는 비율 없이 오기 때문). `patch.replace`(get_usage 전체 스냅샷)면 이전 창을 버리고 패치에서 시작한다. `unbound`는 상태·재설정 시각을 알려진 창 중 사용률이 가장 높은 창에 적용하되 그 창의 사용률은 바꾸지 않고(어느 창의 사용률인지 모르며, 바꾸면 재적용 때 다른 창을 고르게 된다), 사용률 있는 창이 없으면 합성 `plan` 창을 한 개만 유지(upsert)하며 사용률도 그 창에 둔다. `current`가 깨졌거나(배열 아님, id 없는 항목) 다른 버전이 쓴 모양이어도 던지지 않고 읽을 수 있는 창만 쓴다. 같은 패치를 두 번 적용해도 결과가 같다(`updateAgentState`가 버전 충돌 때 콜백을 다시 돌림).
   - 시각 필드: 창의 `resetsAt`은 ISO 문자열(R8), 스냅샷의 `capturedAt`은 다른 agentState 필드(`transientRetry.scheduledAt`, `agentGoalStatus.observedAt`)처럼 epoch ms.
 - **R8-b** 수집·게시.
-  - 수집기(`claude/utils/usageLimitsCollector.ts`)는 query 하나(= `claudeRemote` 한 번 실행) 동안 산다. `rate_limit_event`를 버퍼에 모으고(id별 최신, unbound는 최신 하나), result마다 한 번 비운다. 첫 result에서만 `get_usage`(`skipBehaviors: true`)로 seed하고 그 패치는 `replace`다. 같은 창에 이벤트가 먼저 와 있으면 이벤트가 이기되, 이벤트에 비율이 없으면 seed 비율로 채운다.
-  - 버퍼가 비었으면 게시하지 않는다. 직전 게시와 내용(창·unbound)이 같으면 게시하지 않는다(변화 없으면 생략).
+  - 수집기(`claude/utils/usageLimitsCollector.ts`)는 query 하나(= `claudeRemote` 한 번 실행) 동안 산다. `rate_limit_event`를 버퍼에 모으고(id별 최신, unbound는 최신 하나), result마다 한 번 비운다. 첫 result에서만 `get_usage`(`skipBehaviors: true`)로 seed하고, 답을 받았으면 창이 하나도 없어도 그 패치는 `replace`다(이전 계정 창을 지운다). 같은 창에 이벤트가 먼저 와 있으면 이벤트가 이기되, 이벤트에 없는 사용률·재설정 시각은 각각 seed 값으로 채운다.
+  - 버퍼가 비었으면 게시하지 않는다. 이 query가 지금까지 게시한 패치들의 병합 결과에 새 패치를 더해도 창(id·상태·사용률·재설정 시각)이 같으면 게시하지 않는다(변화 없으면 생략).
+  - launcher는 그 세션(`session.client`)에서 가장 최근에 시작한 query의 패치만 게시한다 — launcher를 다시 들어와도(local↔remote) 이어지는 세는 값. 계정 전환이나 모드 전환으로 provider가 다시 뜬 뒤 이전 query의 seed가 늦게 끝나도, 떠난 계정의 창이 새 스냅샷을 덮지 않는다.
   - 비우기는 직렬화한다: seed를 기다리는 중 다음 result가 와도 패치가 섞이거나 순서가 바뀌지 않는다.
   - `get_usage`가 없거나(구 SDK), 던지거나, `rate_limits_available`이 거짓이거나, 10초 안에 답이 없으면 seed 없이 이벤트만 게시한다. 실패는 턴을 막지 않는다(결과 처리는 비우기를 기다리지 않음).
   - 게시: `claudeRemote` 옵션 `onUsageLimits(patch)` → launcher가 `session.client.updateAgentState(current => ({ ...current, usageLimits: mergeUsageLimits(current.usageLimits, patch) }))`. 병합은 콜백 안에서 하므로 버전 충돌 재시도는 최신 상태 위에서 다시 계산된다(기존 `transientRetry` 패턴).
