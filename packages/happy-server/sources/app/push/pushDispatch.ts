@@ -29,6 +29,7 @@
 import { db } from "@/storage/db";
 import { isUserActive } from "@/app/push/focusTracker";
 import { sendPushNotifications } from "@/app/push/pushSend";
+import { pushOutcomesCounter } from "@/app/monitoring/metrics2";
 import { error, log } from "@/utils/log";
 
 /**
@@ -104,13 +105,21 @@ async function fetchTokensAndSend(params: {
     return { status, tokens: tokens.length, sent: okCount, failed: failedCount, reason };
 }
 
-export async function dispatchSessionEventPush(params: {
+type SessionEventPush = {
     userId: string;
     sessionId: string;
     title: string;
     body: string;
     data?: Record<string, unknown>;
-}): Promise<PushOutcome> {
+};
+
+export async function dispatchSessionEventPush(params: SessionEventPush): Promise<PushOutcome> {
+    const outcome = await dispatch(params);
+    pushOutcomesCounter.inc({ status: outcome.status });
+    return outcome;
+}
+
+async function dispatch(params: SessionEventPush): Promise<PushOutcome> {
     const { userId, sessionId, title, body, data } = params;
 
     try {

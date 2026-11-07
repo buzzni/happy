@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
     sendPushNotifications: vi.fn(),
     log: vi.fn(),
     error: vi.fn(),
+    countOutcome: vi.fn(),
 }));
 
 vi.mock('@/storage/db', () => ({
@@ -20,6 +21,7 @@ vi.mock('@/storage/db', () => ({
 vi.mock('@/app/push/focusTracker', () => ({ isUserActive: mocks.isUserActive }));
 vi.mock('@/app/push/pushSend', () => ({ sendPushNotifications: mocks.sendPushNotifications }));
 vi.mock('@/utils/log', () => ({ log: mocks.log, error: mocks.error }));
+vi.mock('@/app/monitoring/metrics2', () => ({ pushOutcomesCounter: { inc: mocks.countOutcome } }));
 
 import { dispatchSessionEventPush } from './pushDispatch';
 
@@ -125,5 +127,14 @@ describe('dispatchSessionEventPush outcome', () => {
         const outcome = await dispatch();
 
         expect(outcome.status).toBe('sent');
+    });
+
+    it('counts every outcome by status', async () => {
+        mocks.sendPushNotifications.mockResolvedValue([{ status: 'ok' }, { status: 'ok' }]);
+        await dispatch();
+        mocks.findTokens.mockRejectedValue(new Error('db down'));
+        await dispatch();
+
+        expect(mocks.countOutcome.mock.calls).toEqual([[{ status: 'sent' }], [{ status: 'failed' }]]);
     });
 });
