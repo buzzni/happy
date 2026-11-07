@@ -449,6 +449,22 @@ describe('a dedicated PC made shared', () => {
     expect(await pc.authorizeMachine('company', 'pc-1', 'managed-a')).toBe(true)
   })
 
+  // Made dedicated again: the member's assignment takes the accounts back, whichever of the two syncs comes first.
+  it.each([['revoked first', true], ['revoked later', false]])('hands them back to the member when the PC is made dedicated again, machine %s', async (_name, revokedFirst) => {
+    const { pc, input, deps, installed } = sharedPc()
+    await pc.sync({ ...input(1, '["shared"]'), userId: 'former' })
+    await pc.sync(machine(1, '["shared"]'))
+    if (revokedFirst) await pc.sync(machine(2, null))
+    await pc.sync({ ...input(2, '["shared"]'), userId: 'former' })
+    expect(deps.apply).toHaveBeenLastCalledWith('claude', '["shared"]', ['shared'])
+    expect(await pc.authorize('company', 'former', 'shared')).toBe(true)
+    expect(await pc.authorizeMachine('company', 'pc-1', 'shared')).toBe(false)
+    if (!revokedFirst) await pc.sync(machine(2, null))
+    expect([...installed].sort()).toEqual(['personal', 'shared'])
+    await pc.sync({ ...input(3, null), userId: 'former' })
+    expect([...installed]).toEqual(['personal'])
+  })
+
   it('leaves another machine\'s assignment on the same OS home alone, even one written before PCs were recorded', async () => {
     const { deps } = sharedPc()
     await createCredentialGroupSync(deps).sync({ ...machine(1, '["shared"]'), machineId: 'pc-0' })
