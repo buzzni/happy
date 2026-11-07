@@ -214,12 +214,39 @@ it('does not expose an allocated watermark before its message transaction commit
         await tx.sessionMessage.create({ data: { sessionId: 'session-1', seq: 2, content: { t: 'encrypted', c: 'committed' } } });
     });
     await started;
-    let observed = false;
-    const read = observe().then(response => { observed = true; return response; });
-    await new Promise(resolve => setTimeout(resolve, 20));
-    expect(observed).toBe(false);
+    // PGlite blocks the reader until the writer commits; PostgreSQL lets it snapshot first. Either is valid.
+    const read = observe('observation_version=1&after_seq=0&limit=200');
+    await Promise.race([read, new Promise(resolve => setTimeout(resolve, 200))]);
     release(); await write;
     const result = (await read).json();
-    expect(result.observation.coveredThroughSeq).toBe(2);
-    expect(result.hasMore).toBe(true);
+    expect([1, 2]).toContain(result.observation.coveredThroughSeq);
+    expect(result.messages.map((message: { seq: number }) => message.seq))
+        .toEqual(Array.from({ length: result.observation.coveredThroughSeq }, (_, index) => index + 1));
+    expect(result.hasMore).toBe(false);
+})
+it('pages past rows that do not fit the response budget instead of refusing the page', async () => {
+    process.env.HAPPY_OBSERVATION_COHORT = 'test-cohort';
+    const large = (seq: number) => ({ sessionId: 'session-1', seq, content: { t: 'encrypted' as const, c: 'x'.repeat(300 * 1024) } });
+    await client.sessionMessage.createMany({ data: [large(2), large(3), { sessionId: 'session-1', seq: 4, content: { t: 'encrypted', c: 'small' } }] });
+    await client.session.update({ where: { id: 'session-1' }, data: { seq: 4 } });
+    const first = await observe('observation_version=1&after_seq=0&limit=200');
+    expect(first.statusCode).toBe(200);
+    expect(Buffer.byteLength(first.body)).toBeLessThanOrEqual(512 * 1024);
+    expect(first.json().messages.map((message: { seq: number }) => message.seq)).toEqual([1, 2]);
+    expect(first.json().hasMore).toBe(true);
+    const next = (await observe('observation_version=1&after_seq=2&limit=200')).json();
+    expect(next.messages.map((message: { seq: number }) => message.seq)).toEqual([3, 4]);
+    expect(next.hasMore).toBe(false);
+})
+it('returns a single row larger than the response budget on its own', async () => {
+    process.env.HAPPY_OBSERVATION_COHORT = 'test-cohort';
+    await client.sessionMessage.create({ data: { sessionId: 'session-1', seq: 2, content: { t: 'encrypted', c: 'x'.repeat(600 * 1024) } } });
+    await client.sessionMessage.create({ data: { sessionId: 'session-1', seq: 3, content: { t: 'encrypted', c: 'small' } } });
+    await client.session.update({ where: { id: 'session-1' }, data: { seq: 3 } });
+    for (const query of ['observation_version=1&after_seq=1&limit=200', 'observation_version=1&after_seq=1&through_seq=2&limit=1']) {
+        const response = await observe(query);
+        expect(response.statusCode).toBe(200);
+        expect(response.json().messages.map((message: { seq: number }) => message.seq)).toEqual([2]);
+    }
+    expect((await observe('observation_version=1&after_seq=1&limit=200')).json().hasMore).toBe(true);
 })

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { db } from '@/storage/db';
 
+const MAX_PAGE_BYTES = 512 * 1024;
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 function cohort() {
     const value = process.env.HAPPY_OBSERVATION_COHORT;
@@ -27,13 +28,17 @@ export async function readSessionObservation(accountId: string, sessionId: strin
             orderBy: { seq: 'asc' }, take: limit + 1,
             select: { id: true, seq: true, content: true, localId: true, createdAt: true, updatedAt: true },
         });
-        const body = {
-            messages: rows.slice(0, limit).map(row => ({ ...row, createdAt: row.createdAt.getTime(), updatedAt: row.updatedAt.getTime(), contentRevision: digest(row.content) })),
-            hasMore: rows.length > limit,
-            observation: { version: 1, generation: digest([selectedCohort, session.id, session.createdAt, session.dataEncryptionKey]),
-                coveredThroughSeq: upper, observedAt: Date.now(), retention: 'full', contract: 'committed-session-history-v1', responseFinality: 'unknown' },
-        };
-        if (Buffer.byteLength(JSON.stringify(body)) > 512 * 1024) return { status: 413, body: { error: 'observation-page-too-large' } };
-        return { status: 200, body };
+        const page = rows.slice(0, limit).map(row => ({ ...row, createdAt: row.createdAt.getTime(), updatedAt: row.updatedAt.getTime(), contentRevision: digest(row.content) }));
+        const observation = { version: 1, generation: digest([selectedCohort, session.id, session.createdAt, session.dataEncryptionKey]),
+            coveredThroughSeq: upper, observedAt: Date.now(), retention: 'full', contract: 'committed-session-history-v1', responseFinality: 'unknown' };
+        // Cut the page at the byte budget so the cursor always advances; a single oversized row is returned alone.
+        let bytes = Buffer.byteLength(JSON.stringify({ messages: [], hasMore: true, observation }));
+        let count = 0;
+        while (count < page.length) {
+            bytes += Buffer.byteLength(JSON.stringify(page[count])) + (count > 0 ? 1 : 0);
+            if (count > 0 && bytes > MAX_PAGE_BYTES) break;
+            count++;
+        }
+        return { status: 200, body: { messages: page.slice(0, count), hasMore: rows.length > count, observation } };
     }, { isolationLevel: 'RepeatableRead', timeout: 5000 });
 }
