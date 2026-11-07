@@ -799,6 +799,29 @@ export type AgentState = {
   toolPolicy?: { recent: ToolPolicyAuditRecord[] }
   /** aplus-dev-studio-desktop specs/codexcli-org-requirements R10.6, R16a — absent outside any organization. */
   orgRequirements?: OrgRequirementsAgentState
+  /**
+   * Saycode specs/cli-usage-limits-snapshot R8 — the plan rate-limit windows Claude last reported for this
+   * session. Clients must tolerate window ids they don't recognize; absent from older runtimes.
+   */
+  usageLimits?: UsageLimits
+}
+
+export type UsageLimitWindowStatus = 'allowed' | 'allowed_warning' | 'rejected'
+
+export type UsageLimitWindow = {
+  /** Claude's window id (`five_hour`, `seven_day`, `seven_day_opus`, …), or `plan` when the provider did not say which. */
+  id: string
+  status?: UsageLimitWindowStatus
+  /** Percent of the window used, 0-100. */
+  utilization: number | null
+  /** ISO 8601 time the window resets. */
+  resetsAt: string | null
+}
+
+export type UsageLimits = {
+  /** Epoch ms of the last change published. */
+  capturedAt: number
+  windows: UsageLimitWindow[]
 }
 
 /**
