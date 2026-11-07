@@ -1,7 +1,8 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { Prisma, type AutomationRunOutcome, type Prisma as PrismaTypes } from '@prisma/client';
-import { AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION, automationExecutionSessionId, isAutomationExecutionSessionId, automationRunHeartbeatRequestSchema } from '@slopus/happy-wire';
+import { AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION, automationExecutionSessionId, isAutomationExecutionSessionId, automationRunHeartbeatRequestSchema, automationExecutionQuestionBindingId } from '@slopus/happy-wire';
 import { invalidateSessionFollowups } from './sessionFollowupInvalidationService';
+import { readAutomationExecutionQuestionForRun } from './automationExecutionQuestionAdmission';
 
 type Tx = PrismaTypes.TransactionClient;
 type Binary = Uint8Array<ArrayBuffer>;
@@ -296,7 +297,7 @@ export async function claimAutomationRun(
 }
 
 async function claimedRun(tx: Tx, accountId: string, machineId: string, runId: string, claimToken: string) {
-    return tx.automationRun.findFirst({
+    const run = await tx.automationRun.findFirst({
         where: { id: runId, machineAccountId: accountId, machineId, claimTokenHash: tokenHash(claimToken) },
         include: {
             automation: {
@@ -307,6 +308,7 @@ async function claimedRun(tx: Tx, accountId: string, machineId: string, runId: s
             },
         },
     });
+    return run ? { ...run, executionQuestion: await readAutomationExecutionQuestionForRun(tx, run) } : null;
 }
 
 export async function startAutomationRun(
@@ -323,7 +325,7 @@ export async function startAutomationRun(
         await tx.automationRun.updateMany({ where: { id: run.id, status: 'CLAIMED' }, data: { status: 'EXPIRED', completedAt: now, holdCode: null } });
         return { ok: false, error: 'claim-expired' };
     }
-    if (!executable(run.automation, accountId, machineId, run.generation)) {
+    if (run.kind === 'QUESTION' ? !run.executionQuestion : !executable(run.automation, accountId, machineId, run.generation)) {
         await tx.automationRun.updateMany({ where: { id: run.id, status: 'CLAIMED' }, data: { status: 'CANCELLED', completedAt: now, holdCode: null } });
         return { ok: false, error: 'claim-cancelled' };
     }
@@ -341,7 +343,7 @@ export async function resolveAutomationRunMcpContext(
     tx: Tx,
     accountId: string,
     machineId: string,
-    input: { runId: string; claimToken: string; sessionId?: string; executionAdmission?: true },
+    input: { runId: string; claimToken: string; sessionId?: string; executionAdmission?: true; questionProtocol?: 1 },
     now: Date = new Date(),
 ): Promise<Result<{
     automationId: string;
@@ -349,16 +351,19 @@ export async function resolveAutomationRunMcpContext(
     projectId: string;
     machineId: string;
     runLeaseExpiresAt: number | null;
+    questionRequestId?: string;
+    executionBindingId?: string;
     executionAdmission?: { payloadVersion: 6; generation: number; revision: number; machineAccountId: string };
 }>> {
     const run = await claimedRun(tx, accountId, machineId, input.runId, input.claimToken);
     if (!run) return { ok: false, error: 'claim-not-found' };
+    if (run.kind === 'QUESTION' && (!run.executionQuestion || input.questionProtocol !== 1)) return { ok: false, error: 'claim-cancelled' };
     const activelyRunning = run.status === 'RUNNING'
         && run.runLeaseExpiresAt !== null
         && run.runLeaseExpiresAt >= now;
     const a = run.automation;
     if (input.executionAdmission && (!activelyRunning || input.sessionId || a.payloadVersion !== 6
-        || a.generation !== run.generation || a.paused || a.deletedAt || a.legacyMigrationPending
+        || a.generation !== run.generation || a.paused && !run.executionQuestion || a.deletedAt || a.legacyMigrationPending
         || a.machineAccountId !== accountId || a.machineId !== machineId
         || a.machineKeyVersion !== a.targetMachine?.automationKeyVersion
         || a.viewerKeyVersion !== a.project.automationViewerKeyVersion)) {
@@ -383,10 +388,12 @@ export async function resolveAutomationRunMcpContext(
         ok: true,
         value: {
             automationId: run.automationId,
-            ownerAccountId: run.automation.ownerAccountId,
+            ownerAccountId: run.executionQuestion?.requestedByAccountId ?? run.automation.ownerAccountId,
             projectId: run.automation.projectId,
             machineId: run.machineId,
             runLeaseExpiresAt: activelyRunning ? run.runLeaseExpiresAt!.getTime() : null,
+            ...(run.executionQuestion ? { questionRequestId: run.executionQuestion.id,
+                executionBindingId: automationExecutionQuestionBindingId(run.executionQuestion.id) } : {}),
             ...(input.executionAdmission ? { executionAdmission: { payloadVersion: 6 as const,
                 generation: run.generation, revision: a.revision, machineAccountId: run.machineAccountId } } : {}),
         },

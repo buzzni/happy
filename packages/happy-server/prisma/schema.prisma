@@ -680,6 +680,7 @@ model AutomationRun {
 // Source runs may be pruned: retaining the source ID must produce unavailable, never another source.
 model AutomationExecutionQuestion {
     id String @id
+    requestedByAccountId String
     automationId String
     automation Automation @relation(fields: [automationId], references: [id], onDelete: Cascade)
     sourceRunId String

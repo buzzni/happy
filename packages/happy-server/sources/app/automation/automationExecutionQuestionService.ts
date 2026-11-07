@@ -20,7 +20,7 @@ export async function queueAutomationExecutionQuestion(tx: Tx, actorId: string, 
   const replay = async () => {
     const existing = await tx.automationExecutionQuestion.findUnique({ where: { id: input.requestId } });
     if (!existing) return null;
-    if (existing.automationId !== automationId || existing.requestHash !== requestHash) return reject(409, 'AUTOMATION_QUESTION_REQUEST_CONFLICT');
+    if (existing.automationId !== automationId || existing.requestedByAccountId !== actorId || existing.requestHash !== requestHash) return reject(409, 'AUTOMATION_QUESTION_REQUEST_CONFLICT');
     return publicQuestion(existing);
   };
   const existing = await replay();
@@ -46,7 +46,7 @@ export async function queueAutomationExecutionQuestion(tx: Tx, actorId: string, 
       return reject(404, 'AUTOMATION_QUESTION_SOURCE_UNAVAILABLE');
     }
   }
-  const created = await tx.automationExecutionQuestion.createMany({ skipDuplicates: true, data: [{ id: input.requestId, automationId,
+  const created = await tx.automationExecutionQuestion.createMany({ skipDuplicates: true, data: [{ id: input.requestId, requestedByAccountId: actorId, automationId,
     sourceRunId: input.sourceRunId, generation: input.generation, revision: input.expectedRevision, displaySessionId: input.displaySessionId,
     machineAccountId: definition.machineAccountId, machineId: definition.machineId, encrypted: input.encrypted, requestHash }] });
   if (created.count !== 1) return await replay() ?? reject(503, 'AUTOMATION_QUESTION_STORAGE_UNCONFIRMED');
@@ -62,6 +62,8 @@ export async function claimAutomationExecutionQuestion(tx: Tx, accountId: string
   if (!question || question.machineAccountId !== accountId || question.machineId !== machineId) return reject(404, 'AUTOMATION_QUESTION_NOT_FOUND');
   const snapshot = readCurrentAutomationQuestion(question, question.automation);
   if (!snapshot) return reject(409, 'AUTOMATION_QUESTION_TARGET_UNAVAILABLE');
+  const access = await projectAccess(tx, question.requestedByAccountId, question.automation.projectId);
+  if (!access?.canEdit) return reject(403, 'AUTOMATION_QUESTION_REQUESTER_REVOKED');
   const identity = { requestId, sourceRunId: question.sourceRunId, automationId: question.automationId,
     projectId: question.automation.projectId, generation: question.generation, revision: question.revision,
     displaySessionId: question.displaySessionId, executionBindingId: automationExecutionQuestionBindingId(requestId), encrypted: snapshot.encrypted };

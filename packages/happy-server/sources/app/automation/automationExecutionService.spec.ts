@@ -61,6 +61,31 @@ function makeTx() {
 }
 
 describe('automationExecutionService', () => {
+    it('starts only a question-bound claim while preserving a paused schedule and exposes its separate requester binding', async () => {
+        const tx = makeTx(), id = '9cc41d26-562e-4b48-8e2f-a38dc2c85a78';
+        const definition = automation({ payloadVersion: 6, paused: true, project: { id: 'project-1', accountId: 'account-1',
+            config: { machineId: 'machine-1' }, automationViewerKeyVersion: 5 }, targetMachine: { automationKeyVersion: 4, automationContextIsolationVersion: 1 } });
+        const one = (size: number) => Buffer.concat([Buffer.from([1]), Buffer.alloc(size - 1)]).toString('base64');
+        const question = { id, requestedByAccountId: 'account-1', automationId: definition.id, generation: 3, revision: 2, displaySessionId: 'manual', sourceRunId: 'source',
+            machineAccountId: 'account-1', machineId: 'machine-1', cancelledAt: null, runId: id, automation: definition,
+            encrypted: { payloadVersion: 6, payloadCiphertext: one(41), viewerKeyId: 'k', viewerKeyVersion: 5, machineKeyVersion: 4,
+                viewerKeyEnvelope: one(105), machineKeyEnvelope: one(105) } };
+        Object.assign(tx, { automationExecutionQuestion: { findUnique: vi.fn(async () => question) },
+            project: { findUnique: vi.fn(async () => definition.project) }, projectMember: { findUnique: vi.fn(async () => null) } });
+        const run = { id, kind: 'QUESTION', automationId: definition.id, machineAccountId: 'account-1', machineId: 'machine-1',
+            generation: 3, previousExecutionRunId: 'source', status: 'CLAIMED', claimExpiresAt: new Date(now.getTime() + 60_000), automation: definition };
+        tx.automationRun.findFirst.mockResolvedValue(run);
+        expect(await startAutomationRun(tx as never, 'account-1', 'machine-1', { runId: id, claimToken: 'token' }, now)).toMatchObject({ ok: true });
+        tx.automationRun.findFirst.mockResolvedValue({ ...run, status: 'RUNNING', runLeaseExpiresAt: new Date(now.getTime() + 60_000) });
+        expect(await resolveAutomationRunMcpContext(tx as never, 'account-1', 'machine-1', { runId: id, claimToken: 'token', executionAdmission: true }, now))
+            .toEqual({ ok: false, error: 'claim-cancelled' });
+        expect(await resolveAutomationRunMcpContext(tx as never, 'account-1', 'machine-1', { runId: id, claimToken: 'token', executionAdmission: true, questionProtocol: 1 }, now))
+            .toMatchObject({ ok: true, value: { ownerAccountId: 'account-1', questionRequestId: id, executionBindingId: `automation-question:${id}` } });
+        expect(tx.automation.updateMany).not.toHaveBeenCalled();
+        question.requestedByAccountId = 'revoked-requester';
+        expect(await resolveAutomationRunMcpContext(tx as never, 'account-1', 'machine-1', { runId: id, claimToken: 'token', executionAdmission: true, questionProtocol: 1 }, now))
+            .toEqual({ ok: false, error: 'claim-cancelled' });
+    });
     it('does not mistake a question at the same timestamp for a claimed scheduled slot', async () => {
         const tx = makeTx();
         tx.automationRun.createMany.mockResolvedValue({ count: 0 });

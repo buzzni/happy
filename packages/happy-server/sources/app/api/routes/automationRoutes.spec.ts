@@ -339,6 +339,16 @@ describe('automationRoutes', () => {
         });
     });
 
+    it('forwards explicit question protocol support and never infers it for older Studio callers', async () => {
+        mocks.resolveAutomationRunMcpContext.mockResolvedValue({ ok: false, error: 'claim-cancelled' });
+        const app = await makeApp();
+        await app.inject({ method: 'POST', url: '/v1/automation-runs/run-1/mcp-context', headers: { authorization: 'Bearer test' },
+            payload: { machineId: 'machine-1', claimToken: 'token', questionProtocol: 1 } });
+        expect(mocks.resolveAutomationRunMcpContext).toHaveBeenCalledWith({}, 'user-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', questionProtocol: 1,
+        });
+    });
+
     it.each([false, 'true', 1])('rejects a malformed execution admission flag %s', async executionAdmission => {
         const app = await makeApp();
         const response = await app.inject({ method: 'POST', url: '/v1/automation-runs/run-1/mcp-context',

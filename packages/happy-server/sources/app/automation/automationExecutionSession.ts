@@ -8,6 +8,7 @@ import { verifyAutomationExecutionTarget, type AutomationExecutionTarget } from 
 import { db } from '@/storage/db';
 import { inTx } from '@/storage/inTx';
 import { createExecutionBoundSession } from '@/app/session/sessionExecutionBinding';
+import { readAutomationExecutionQuestionForRun } from './automationExecutionQuestionAdmission';
 
 export const automationExecutionSessionRequestSchema = z.strictObject({
   runId: z.string().min(1).max(160), machineId: z.string().min(1).max(200),
@@ -96,16 +97,18 @@ async function prepareAutomationExecutionAdmission(accountId: string, bearer: st
     if (!verifyAutomationExecutionTarget({ token: input.targetProof, expected: target, bearer, secret, now: clock().getTime() })) refuse();
   }
 
-  async function authorize(tx: Pick<Prisma.TransactionClient, 'automationRun' | 'projectMember' | 'session'>) {
+  async function authorize(tx: Prisma.TransactionClient) {
     const run = await tx.automationRun.findFirst({
       where: { id: input.runId, machineAccountId: accountId, machineId: input.machineId, claimTokenHash },
       include: { automation: { include: { project: true, targetMachine: true } } },
     });
     if (!run) return refuse();
+    const question = await readAutomationExecutionQuestionForRun(tx, run);
+    if (run.kind === 'QUESTION' && !question) return refuse();
     const a = run.automation, now = clock();
     const config = a.project.config as { machineId?: unknown } | null;
     if (run.status !== 'RUNNING' || !run.runLeaseExpiresAt || run.runLeaseExpiresAt < now
-      || a.payloadVersion !== 6 || a.generation !== run.generation || a.paused || a.deletedAt || a.legacyMigrationPending
+      || a.payloadVersion !== 6 || a.generation !== run.generation || a.paused && !question || a.deletedAt || a.legacyMigrationPending
       || a.machineAccountId !== accountId || a.machineId !== input.machineId
       || a.project.accountId !== accountId || config?.machineId !== input.machineId
       || a.machineKeyVersion !== a.targetMachine?.automationKeyVersion
@@ -115,10 +118,11 @@ async function prepareAutomationExecutionAdmission(accountId: string, bearer: st
       revision: a.revision, machineId: input.machineId, machineAccountId: accountId,
       displaySessionId: input.displaySessionId, createBodyHash: bodyHash,
       executionBindingRequired: input.executionBindingRequired,
+      ...(question ? { questionRequestId: question.id } : {}),
       ...(input.executionAuthorityDigest !== undefined ? { executionAuthorityDigest: input.executionAuthorityDigest } : {}),
     };
     checkTarget(target);
-    if (a.ownerAccountId !== accountId) {
+    if (!question && a.ownerAccountId !== accountId) {
       const member = await tx.projectMember.findUnique({ where: { projectId_accountId: { projectId: a.projectId, accountId: a.ownerAccountId } } });
       if (!member || member.status !== 'accepted' || !['owner', 'editor'].includes(member.role)) return refuse();
     }
@@ -128,7 +132,8 @@ async function prepareAutomationExecutionAdmission(accountId: string, bearer: st
       || (run.displaySessionId && run.displaySessionId !== input.displaySessionId)
       || (run.executionCreateBodyHash && run.executionCreateBodyHash !== bodyHash)
       || (run.executionSeedMetadata && run.executionSeedMetadata !== input.body.metadata)) return conflict();
-    return { run, target };
+    if (question && question.displaySessionId !== input.displaySessionId) return refuse();
+    return { run, target, question };
   }
 
   return { input, sessionId, bodyHash, claimTokenHash, clock, checkTarget, authorize };
@@ -141,16 +146,16 @@ export async function createAutomationExecutionSession(accountId: string, bearer
     await prepareAutomationExecutionAdmission(accountId, bearer, raw, options);
 
   async function bind(tx: Prisma.TransactionClient, registeredSessionId: string) {
-    const { run } = await authorize(tx);
+    const { run, question } = await authorize(tx);
     if (registeredSessionId !== sessionId) return conflict();
     const a = run.automation;
     // Same definition -> run order as pause/delete/conversation delivery.
-    const definition = await tx.automation.updateMany({ where: {
+    const definition = question ? null : await tx.automation.updateMany({ where: {
       id: a.id, revision: a.revision, generation: run.generation, paused: false, deletedAt: null,
       targetMachine: { is: { automationKeyVersion: a.machineKeyVersion } },
       project: { is: { automationViewerKeyVersion: a.viewerKeyVersion } },
     }, data: { revision: a.revision } });
-    if (definition.count !== 1) return refuse();
+    if (definition && definition.count !== 1) return refuse();
     const changed = await tx.automationRun.updateMany({ where: {
       id: run.id, claimTokenHash, status: 'RUNNING', runLeaseExpiresAt: { gte: clock() },
       AND: [{ OR: [{ sessionId: null }, { sessionId }] },
@@ -159,9 +164,9 @@ export async function createAutomationExecutionSession(accountId: string, bearer
         { OR: [{ executionSeedMetadata: null }, { executionSeedMetadata: input.body.metadata }] }],
     }, data: { sessionId, displaySessionId: input.displaySessionId, executionCreateBodyHash: bodyHash,
       executionSeedMetadata: input.body.metadata,
-      ...(!run.executionCreateBodyHash ? { previousExecutionRunId: a.lastExecutionRunId } : {}) } });
+      ...(!run.executionCreateBodyHash && !question ? { previousExecutionRunId: a.lastExecutionRunId } : {}) } });
     if (changed.count !== 1) return conflict();
-    if (!run.executionCreateBodyHash) {
+    if (!run.executionCreateBodyHash && !question) {
       await tx.automation.update({ where: { id: a.id }, data: { lastExecutionRunId: run.id } });
     }
     return run;

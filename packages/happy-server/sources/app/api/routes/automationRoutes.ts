@@ -47,6 +47,7 @@ const mcpContextSchema = z.object({
     claimToken: z.string().min(1).max(256),
     sessionId: z.string().min(1).optional(),
     executionAdmission: z.literal(true).optional(),
+    questionProtocol: z.literal(1).optional(),
 });
 
 function decode(value: string): Uint8Array<ArrayBuffer> {
@@ -162,6 +163,7 @@ export function automationRoutes(app: Fastify) {
                 claimToken: request.body.claimToken,
                 ...(request.body.sessionId ? { sessionId: request.body.sessionId } : {}),
                 ...(request.body.executionAdmission ? { executionAdmission: request.body.executionAdmission } : {}),
+                ...(request.body.questionProtocol ? { questionProtocol: request.body.questionProtocol } : {}),
             },
         ));
         if (!result.ok) {

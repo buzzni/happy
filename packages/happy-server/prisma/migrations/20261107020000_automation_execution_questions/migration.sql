@@ -1,5 +1,6 @@
 CREATE TABLE "AutomationExecutionQuestion" (
     "id" TEXT NOT NULL,
+    "requestedByAccountId" TEXT NOT NULL,
     "automationId" TEXT NOT NULL,
     "sourceRunId" TEXT NOT NULL,
     "generation" INTEGER NOT NULL,

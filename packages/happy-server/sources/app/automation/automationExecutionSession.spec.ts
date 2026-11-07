@@ -22,10 +22,11 @@ vi.mock('@/storage/db', () => ({ db: new Proxy({}, { get: (_target, key) => {
   return typeof value === 'function' ? value.bind(state.client) : value;
 } }) }));
 import { createAutomationExecutionSession, recordAutomationExecutionExit } from './automationExecutionSession';
-import { claimAutomationRun, heartbeatAutomationRun, registerAutomationMachineKey, reportAutomationRun, startAutomationRun, syncAutomations } from './automationExecutionService';
+import { claimAutomationRun, heartbeatAutomationRun, registerAutomationMachineKey, reportAutomationRun, resolveAutomationRunMcpContext, startAutomationRun, syncAutomations } from './automationExecutionService';
 import { createRegisteredAutomation, getAutomationTarget, updateAutomation } from './automationService';
 import { automationExecutionRoutes } from '@/app/api/routes/automationExecutionRoutes';
 import { transitionChatAutomations } from './automationChatLifecycle';
+import { queueAutomationExecutionQuestion } from './automationExecutionQuestionService';
 
 let now: Date;
 const secret = 'automation-target-test-secret-at-least-thirty-two-bytes';
@@ -310,13 +311,44 @@ it('queues an idempotent encrypted question about one completed run without edit
     // No retry of B is necessary: C also clears B's expired running lease before taking a new slot.
     await client.automationRun.update({ where: { id: nextQuestion.requestId }, data: { status: 'RUNNING', runLeaseExpiresAt: new Date(0) } });
     const thirdQuestion = { ...payload, requestId: 'cfcf32a2-a102-4aef-b282-4e35699d4f3a' };
-    expect((await send(thirdQuestion)).statusCode).toBe(200);
+    const requester = await client.projectMember.create({ data: { projectId: 'chat:c1', accountId: 'other', invitedBy: 'owner', role: 'editor', status: 'accepted' } });
+    expect(await queueAutomationExecutionQuestion(client, 'other', 'chat:c1', 'a1', thirdQuestion)).toMatchObject({ state: 'QUEUED' });
+    expect((await send(thirdQuestion)).statusCode).toBe(409); // An accepted collaborator cannot replay another requester's identity.
+    await client.projectMember.update({ where: { id: requester.id }, data: { status: 'removed' } });
+    const revokedClaim = await app.inject({ method: 'POST', url: `/v1/machines/m1/automation-questions/${thirdQuestion.requestId}/claim`,
+      headers: { authorization: `Bearer ${bearer}` }, payload: { claimToken: 'd'.repeat(43) } });
+    expect(revokedClaim.statusCode).toBe(403);
+    expect((await client.automationExecutionQuestion.findUniqueOrThrow({ where: { id: thirdQuestion.requestId } })).runId).toBeNull();
+    await client.projectMember.update({ where: { id: requester.id }, data: { status: 'accepted' } });
     const thirdClaim = await app.inject({ method: 'POST', url: `/v1/machines/m1/automation-questions/${thirdQuestion.requestId}/claim`,
       headers: { authorization: `Bearer ${bearer}` }, payload: { claimToken: 'd'.repeat(43) } });
     expect(thirdClaim.statusCode, thirdClaim.body).toBe(200);
     expect((await client.automationRun.findUniqueOrThrow({ where: { id: nextQuestion.requestId } })).status).toBe('ABANDONED');
     expect((await claim()).json()).toMatchObject({ runId: payload.requestId, state: 'EXPIRED' });
     expect(await client.automationRun.count()).toBe(6);
+    const pausedDefinition = await client.automation.findUniqueOrThrow({ where: { id: 'a1' } });
+    expect(await startAutomationRun(client, 'owner', 'm1', { runId: thirdQuestion.requestId, claimToken: 'd'.repeat(43) }))
+      .toMatchObject({ ok: true });
+    expect(await resolveAutomationRunMcpContext(client, 'owner', 'm1', { runId: thirdQuestion.requestId, claimToken: 'd'.repeat(43), executionAdmission: true, questionProtocol: 1 }))
+      .toMatchObject({ ok: true, value: { ownerAccountId: 'other', questionRequestId: thirdQuestion.requestId, executionBindingId: `automation-question:${thirdQuestion.requestId}` } });
+    const { runId: _runId, ...execution } = await request(thirdQuestion.requestId, { claimToken: 'd'.repeat(43) });
+    const executionUrl = `/v1/automation-runs/${thirdQuestion.requestId}/execution-session`;
+    const oldProof = await app.inject({ method: 'POST', url: executionUrl, headers: { authorization: `Bearer ${bearer}` }, payload: execution });
+    expect(oldProof.statusCode).toBe(403);
+    const questionProof = signAutomationExecutionTarget({ automationId: 'a1', projectId: 'chat:c1', runId: thirdQuestion.requestId,
+      generation: 1, revision: 1, machineId: 'm1', machineAccountId: 'owner', displaySessionId: 'manual', questionRequestId: thirdQuestion.requestId,
+      executionBindingRequired: false, createBodyHash: await sessionCreateBodyHash(execution.body), secret, bearer, now: Date.now() });
+    await client.projectMember.update({ where: { id: requester.id }, data: { status: 'removed' } });
+    const revoked = await app.inject({ method: 'POST', url: executionUrl, headers: { authorization: `Bearer ${bearer}` }, payload: { ...execution, targetProof: questionProof } });
+    expect(revoked.statusCode).toBe(403);
+    expect(await client.session.findUnique({ where: { id: automationExecutionSessionId(thirdQuestion.requestId) } })).toBeNull();
+    await client.projectMember.update({ where: { id: requester.id }, data: { status: 'accepted' } });
+    const created = await app.inject({ method: 'POST', url: executionUrl, headers: { authorization: `Bearer ${bearer}` }, payload: { ...execution, targetProof: questionProof } });
+    expect(created.statusCode, created.body).toBe(200);
+    expect(created.json()).toMatchObject({ sessionId: automationExecutionSessionId(thirdQuestion.requestId), displaySessionId: 'manual', created: true });
+    expect(await client.automation.findUniqueOrThrow({ where: { id: 'a1' } })).toEqual(pausedDefinition);
+    expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
+    expect((await client.automationRun.findUniqueOrThrow({ where: { id: thirdQuestion.requestId } })).previousExecutionRunId).toBe('r1');
   } finally { await app.close(); }
 });
 

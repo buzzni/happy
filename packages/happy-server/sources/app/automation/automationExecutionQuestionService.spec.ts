@@ -26,7 +26,7 @@ it('queues a manual followup even while the schedule is paused without touching 
   expect(f.tx.automation.update).not.toHaveBeenCalled(); expect(f.tx.automation.updateMany).not.toHaveBeenCalled();
   expect(f.tx.automationRun.createMany).not.toHaveBeenCalled();
   expect(f.tx.automationExecutionQuestion.createMany).toHaveBeenCalledWith(expect.objectContaining({ skipDuplicates: true,
-    data: [expect.objectContaining({ id: f.input.requestId, automationId: 'a1', sourceRunId: 'source', generation: 3, revision: 2, displaySessionId: 'manual', encrypted: f.input.encrypted })] }));
+    data: [expect.objectContaining({ id: f.input.requestId, requestedByAccountId: 'owner', automationId: 'a1', sourceRunId: 'source', generation: 3, revision: 2, displaySessionId: 'manual', encrypted: f.input.encrypted })] }));
 });
 it.each(['foreign-display', 'unconfirmed-exit', 'readiness', 'revision', 'generation', 'viewer-key', 'machine-key', 'deleted', 'archived'])('refuses unsafe question source or current execution state (%s)', async reason => {
   const f = fixture();
@@ -51,7 +51,7 @@ it('refuses a viewer before reading the source or storing a request', async () =
 
 it('claims a separate question run with the durable caller token and the selected source without consuming the schedule', async () => {
   const f = fixture(), token = 'a'.repeat(43), now = new Date(10_000);
-  f.tx.automationExecutionQuestion.findUnique.mockResolvedValue({ id: f.input.requestId, automationId: 'a1', sourceRunId: 'source', generation: 3,
+  f.tx.automationExecutionQuestion.findUnique.mockResolvedValue({ id: f.input.requestId, requestedByAccountId: 'owner', automationId: 'a1', sourceRunId: 'source', generation: 3,
     revision: 2, displaySessionId: 'manual', machineAccountId: 'owner', machineId: 'm1', encrypted: f.input.encrypted, runId: null, cancelledAt: null,
     createdAt: new Date(1), automation: { ...f.definition, project: { id: 'p1', accountId: 'owner', config: { machineId: 'm1' }, automationViewerKeyVersion: 1 } } });
   Object.assign(f.tx.automationExecutionQuestion, { updateMany: vi.fn(async () => ({ count: 1 })) });
@@ -67,7 +67,7 @@ it('claims a separate question run with the durable caller token and the selecte
 
 it.each(['expired-claim', 'expired-running', 'missing-running-lease'])('never reuses an expired question execution admission (%s)', async state => {
   const f = fixture(), token = 'a'.repeat(43), now = new Date(10_000);
-  f.tx.automationExecutionQuestion.findUnique.mockResolvedValue({ id: f.input.requestId, automationId: 'a1', sourceRunId: 'source', generation: 3,
+  f.tx.automationExecutionQuestion.findUnique.mockResolvedValue({ id: f.input.requestId, requestedByAccountId: 'owner', automationId: 'a1', sourceRunId: 'source', generation: 3,
     revision: 2, displaySessionId: 'manual', machineAccountId: 'owner', machineId: 'm1', encrypted: f.input.encrypted, runId: f.input.requestId, cancelledAt: null,
     createdAt: new Date(1), automation: { ...f.definition, project: { id: 'p1', accountId: 'owner', config: { machineId: 'm1' }, automationViewerKeyVersion: 1 } } });
   Object.assign(f.tx.automationRun, { findUnique: vi.fn(async () => ({ id: f.input.requestId, kind: 'QUESTION', automationId: 'a1', generation: 3,
