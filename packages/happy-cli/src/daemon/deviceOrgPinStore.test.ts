@@ -34,6 +34,21 @@ it('allows concurrent identical retries but refuses replacement and preserves th
  await expect(f.store.pin({...f.candidate,publicKey:Buffer.from(nacl.sign.keyPair().publicKey).toString('base64url')})).rejects.toThrow();
  expect(await f.store.get('company')).toMatchObject(f.candidate);
 });
+// aplus#5876 — a PC that became shared replaces the pin it got as a dedicated PC, only under the same organization key.
+it('replaces the pin it was told it replaces with an approval under the same key, and nothing else',async()=>{
+ const f=await fixture();await f.store.pin(f.candidate);
+ const shared={...f.candidate,approval:await signOrgSetupTokenDocument({...f.candidate.approval.body,approvalId:'shared',machineType:'shared',ownerUserId:null},f.signer.secretKey)};
+ await expect(f.store.pin(shared)).rejects.toThrow('ORG_PIN_CONFLICT');
+ const stranger=nacl.sign.keyPair();
+ const otherKey={publicKey:Buffer.from(stranger.publicKey).toString('base64url'),approval:await signOrgSetupTokenDocument({...shared.approval.body,signingKeyId:await orgSetupTokenKeyId(stranger.publicKey)},stranger.secretKey)};
+ await expect(f.store.pin(otherKey,f.candidate)).rejects.toThrow('ORG_PIN_CONFLICT');
+ await expect(f.store.pin(shared,otherKey)).rejects.toThrow('ORG_PIN_CONFLICT');
+ expect(await f.store.get('company')).toMatchObject(f.candidate);
+ await f.store.pin(shared,f.candidate);
+ expect(await createDeviceOrgPinStore(f.deps).get('company')).toMatchObject(shared);
+ expect((await readdir(f.directory)).sort()).toEqual(['keys.json',basename(f.path)].sort());
+ await expect(f.store.pin(shared,f.candidate)).resolves.toBeUndefined();
+});
 it('fails closed for corrupted storage instead of returning no policy',async()=>{
  const f=await fixture();await f.store.pin(f.candidate);await writeFile(f.path,'{}');
  await expect(createDeviceOrgPinStore(f.deps).get('company')).rejects.toThrow();

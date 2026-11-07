@@ -7,7 +7,8 @@ import type { DeviceKeys } from './deviceKeys';
 const requestSchema = z.object({ companyId: z.string(), machineType: z.enum(['dedicated', 'shared']), ownerUserId: z.string().nullable(), orgSigningPublicKey: z.string(), signingGeneration: z.number() }).strict();
 const confirmationSchema = z.object({ companyId: z.string(), machineId: z.string(), enrollmentDigest: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
 type Approval = OrgSetupTokenDocument & { body: Extract<OrgSetupTokenDocument['body'], { kind: 'device-approval' }> };
-type Pending = { approval: Approval | null; readyToPin: boolean; pinned: boolean; transcript: OrgDeviceEnrollmentTranscript; digest: string; proof: string; locallyConfirmed: boolean };
+type Pinned = NonNullable<Awaited<ReturnType<ReturnType<typeof createDeviceOrgPinStore>['get']>>>;
+type Pending = { approval: Approval | null; readyToPin: boolean; pinned: boolean; transcript: OrgDeviceEnrollmentTranscript; digest: string; proof: string; locallyConfirmed: boolean; replaces?: Pinned };
 /** Pending comparisons are ephemeral. Neither confirmation alone grants persistent trust.
  * Restarting the daemon loses the pending comparison; persisted pins are owned by the approval store.
  */
@@ -29,7 +30,7 @@ export function createDeviceEnrollment(deps: { machineId: string; keys: DeviceKe
         if (now() >= enrollment.transcript.expiresAt) throw new Error('DEVICE_ENROLLMENT_EXPIRED');
         // Consent is checked here; registration cannot change while this durable write is in flight.
         const candidate = { publicKey: enrollment.transcript.orgSigningPublicKey, approval: { ...enrollment.approval, body: { ...enrollment.approval.body } } };
-        committing = deps.store.pin(candidate).then(async () => {
+        committing = deps.store.pin(candidate, enrollment.replaces).then(async () => {
             enrollment.pinned = true;
             // A PC that pinned a shared approval is a shared PC: later approvals may be confirmed automatically.
             if (enrollment.transcript.machineType === 'shared') await deps.marker?.record('shared').catch(() => undefined);
@@ -40,10 +41,11 @@ export function createDeviceEnrollment(deps: { machineId: string; keys: DeviceKe
     }
     const awaitingShared = (companyId: string) => pending?.transcript.companyId === companyId && now() < pending.transcript.expiresAt
         && pending.transcript.machineType === 'shared' && pending.transcript.ownerUserId === null && !pending.pinned ? pending : null;
-    /** Stands in for the local confirmation of a shared approval; a failed check leaves the manual confirmation in place. */
+    /** Stands in for the local confirmation of a shared approval; a failed check leaves the manual confirmation in place.
+     * Never for a replacement (aplus#5876): the marker is never rewritten, so it cannot vouch for giving up a pin this PC's user confirmed. */
     async function confirmAutomatically(enrollment: Pending, current: number) {
         const { transcript, approval } = enrollment;
-        if (enrollment.locallyConfirmed || !approval || !deps.autoConfirm || transcript.machineType !== 'shared' || transcript.ownerUserId !== null) return;
+        if (enrollment.locallyConfirmed || enrollment.replaces || !approval || !deps.autoConfirm || transcript.machineType !== 'shared' || transcript.ownerUserId !== null) return;
         const confirmed = await deps.autoConfirm({ transcript: { ...transcript }, approval: { ...approval, body: { ...approval.body } } }).catch(() => false);
         if (current !== revision || pending !== enrollment) throw new Error('DEVICE_ENROLLMENT_REPLACED');
         if (confirmed === true) enrollment.locallyConfirmed = true;
@@ -59,7 +61,12 @@ export function createDeviceEnrollment(deps: { machineId: string; keys: DeviceKe
             const current = ++revision;
             pending = null;
             const request = requestSchema.parse(input);
-            if (deps.store && await deps.store.get(request.companyId)) throw new Error('ORG_ALREADY_PINNED');
+            const pinned = deps.store ? await deps.store.get(request.companyId) : null;
+            // aplus#5876 — an approval for another kind of PC (dedicated↔shared, another owner) can never authenticate this
+            // PC as it is now, so it may be replaced; the organization key stays pinned, its rotation is a separate transition.
+            const body = pinned?.approval?.body;
+            if (pinned && (pinned.publicKey !== request.orgSigningPublicKey || body?.kind !== 'device-approval' ||
+                (body.machineType === request.machineType && body.ownerUserId === request.ownerUserId))) throw new Error('ORG_ALREADY_PINNED');
             if (revision !== current) throw new Error('DEVICE_ENROLLMENT_REPLACED');
             const transcript: OrgDeviceEnrollmentTranscript = { version: 1, ...request, machineId: deps.machineId,
                 deviceSigningPublicKey: Buffer.from(deps.keys.signing.publicKey).toString('base64url'),
@@ -70,7 +77,7 @@ export function createDeviceEnrollment(deps: { machineId: string; keys: DeviceKe
             const proof = Buffer.from(nacl.sign.detached(bytes, deps.keys.signing.secretKey)).toString('base64url');
             if (revision !== current) throw new Error('DEVICE_ENROLLMENT_REPLACED');
             if (now() >= transcript.expiresAt) throw new Error('DEVICE_ENROLLMENT_EXPIRED');
-            pending = { transcript, digest, proof, locallyConfirmed: false, approval: null, readyToPin: false, pinned: false };
+            pending = { transcript, digest, proof, locallyConfirmed: false, approval: null, readyToPin: false, pinned: false, ...(pinned ? { replaces: pinned } : {}) };
             return copy(pending);
         },
         async approve(json: string): Promise<void> {

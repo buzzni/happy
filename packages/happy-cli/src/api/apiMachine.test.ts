@@ -2625,6 +2625,19 @@ describe('device registration RPC boundary', () => {
             else expect(await capabilities()).not.toHaveProperty('autoOrgPinVersion');
         }
     });
+    // aplus#5876 — Studio registers a PC again over a pin for another kind of PC only where the enrollment replaces it.
+    it('advertises re-pinning for another kind of PC wherever it has device keys and an enrollment controller', async () => {
+        const runtime = { capabilities: vi.fn(async () => ({ setupTokenVersion: 1, setupTokenStatusVersion: 1 })), setupTokenGroupSync: vi.fn(), groupSync: vi.fn(), status: vi.fn(), groupReceipt: vi.fn() } as any;
+        const keys = { signing: nacl.sign.keyPair(), recipient: nacl.box.keyPair() };
+        const enrollment = { begin: vi.fn(), approve: vi.fn(), getStatus: vi.fn(), orgPin: vi.fn(async () => null), autoConfirms: false };
+        for (const [client, offered] of [[new ApiMachineClient('token', makeMachine(), keys, enrollment as never), true], [new ApiMachineClient('token', makeMachine(), keys), false]] as const) {
+            client.setRPCHandlers({ spawnSession: vi.fn(), stopSession: vi.fn(), requestShutdown: vi.fn(), portRegistry: {} as any, aiCredentialRuntime: runtime });
+            const manager = (client as unknown as { rpcHandlerManager: { registerHandler: ReturnType<typeof vi.fn> } }).rpcHandlerManager;
+            const capabilities = manager.registerHandler.mock.calls.find(([method]) => method === 'ai-credential:capabilities')![1];
+            if (offered) expect(await capabilities()).toMatchObject({ orgRepinVersion: 1 });
+            else expect(await capabilities()).not.toHaveProperty('orgRepinVersion');
+        }
+    });
     it('does not offer signed delivery without both device keys and a local enrollment controller', async () => {
         const runtime = { capabilities: vi.fn(async () => ({ setupTokenVersion: 1, setupTokenStatusVersion: 1 })), setupTokenGroupSync: vi.fn(), groupSync: vi.fn(), status: vi.fn(), groupReceipt: vi.fn() } as any;
         for (const client of [new ApiMachineClient('token', makeMachine(), { signing: nacl.sign.keyPair(), recipient: nacl.box.keyPair() }), new ApiMachineClient('token', makeMachine())]) {
