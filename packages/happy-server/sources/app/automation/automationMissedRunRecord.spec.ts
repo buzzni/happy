@@ -41,7 +41,7 @@ describe('recordMissedAutomationRuns', () => {
     it('stores the whole gap as a single EXPIRED row keyed by its first missed slot', async () => {
         const tx = makeTx();
         await expect(record(tx)).resolves.toEqual({
-            ok: true, value: { runId: expect.any(String), idempotent: false, projectId: 'project-1' },
+            ok: true, value: { runId: expect.any(String), idempotent: false, countRaised: false, projectId: 'project-1' },
         });
         expect(tx.automationRun.createMany).toHaveBeenCalledTimes(1);
         const { data, skipDuplicates } = tx.automationRun.createMany.mock.calls[0]![0];
@@ -66,7 +66,7 @@ describe('recordMissedAutomationRuns', () => {
         tx.automationRun.findFirst.mockResolvedValue({ id: 'run-existing', failureCode: 'MISSED_OFFLINE', missedCount: 8 });
 
         await expect(record(tx)).resolves.toEqual({
-            ok: true, value: { runId: 'run-existing', idempotent: true, projectId: 'project-1' },
+            ok: true, value: { runId: 'run-existing', idempotent: true, countRaised: false, projectId: 'project-1' },
         });
         expect(tx.automationRun.findFirst).toHaveBeenCalledWith(expect.objectContaining({
             where: { automationId: 'automation-1', generation: 3, scheduledFor: firstMissedAt },
@@ -79,23 +79,24 @@ describe('recordMissedAutomationRuns', () => {
         tx.automationRun.createMany.mockResolvedValue({ count: 0 });
         tx.automationRun.findFirst.mockResolvedValue({ id: 'run-existing', failureCode: 'MISSED_OFFLINE', missedCount: 8 });
 
-        await expect(record(tx, { missedCount: 12 })).resolves.toMatchObject({ ok: true, value: { idempotent: true } });
+        await expect(record(tx, { missedCount: 12 })).resolves.toMatchObject({ ok: true, value: { idempotent: true, countRaised: true } });
         expect(tx.automationRun.updateMany).toHaveBeenCalledWith({
             where: { id: 'run-existing', failureCode: { in: ['MISSED_OFFLINE', 'MISSED_COLLAPSED'] }, missedCount: { lt: 12 } },
             data: { missedCount: 12 },
         });
 
         tx.automationRun.updateMany.mockClear();
-        await record(tx, { missedCount: 3 });
+        await expect(record(tx, { missedCount: 3 })).resolves.toMatchObject({ ok: true, value: { countRaised: false } });
         expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
     });
 
-    it('leaves a real run on the same slot untouched and reports it as already recorded', async () => {
+    it('answers already-claimed for a real run on the first slot so the daemon reports the rest of the gap', async () => {
+        // The claim reached the server but its ack was lost; the remaining slots must not vanish with it.
         const tx = makeTx();
         tx.automationRun.createMany.mockResolvedValue({ count: 0 });
         tx.automationRun.findFirst.mockResolvedValue({ id: 'run-real', failureCode: null, missedCount: null });
 
-        await expect(record(tx, { missedCount: 12 })).resolves.toMatchObject({ ok: true, value: { runId: 'run-real', idempotent: true } });
+        await expect(record(tx, { missedCount: 12 })).resolves.toEqual({ ok: false, error: 'already-claimed' });
         expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
     });
 

@@ -294,6 +294,8 @@ export const MAX_MISSED_RUN_COUNT = 1000;
  * first missed slot. A new status value would make old Desktop parsers reject the whole list, so
  * the row reuses EXPIRED and carries the gap size in `missedCount`. The same gap reported again
  * (daemon restart, lost ack) hits the slot fence and adds nothing; a longer report only raises the count.
+ * A real run already on the first slot (its claim reached the server but the daemon never heard back)
+ * is `already-claimed`: the daemon then reports the rest of the gap from the next slot.
  */
 export async function recordMissedAutomationRuns(
     tx: Tx,
@@ -307,7 +309,7 @@ export async function recordMissedAutomationRuns(
         failureCode: MissedRunFailureCode;
     },
     now: Date = new Date(),
-): Promise<Result<{ runId: string; idempotent: boolean; projectId: string }>> {
+): Promise<Result<{ runId: string; idempotent: boolean; countRaised: boolean; projectId: string }>> {
     if (!Number.isInteger(input.missedCount) || input.missedCount < 1 || input.missedCount > MAX_MISSED_RUN_COUNT
         || !MISSED_RUN_FAILURE_CODES.includes(input.failureCode)) {
         return { ok: false, error: 'claim-denied' };
@@ -345,7 +347,7 @@ export async function recordMissedAutomationRuns(
         skipDuplicates: true,
     });
     if (created.count === 1) {
-        return { ok: true, value: { runId, idempotent: false, projectId: automation.projectId } };
+        return { ok: true, value: { runId, idempotent: false, countRaised: false, projectId: automation.projectId } };
     }
     const sameSlot = await tx.automationRun.findFirst({
         where: { automationId: automation.id, generation: input.generation, scheduledFor: input.firstMissedAt },
@@ -353,14 +355,16 @@ export async function recordMissedAutomationRuns(
     });
     if (!sameSlot) return { ok: false, error: 'report-conflict' };
     // A real run on that slot means it was not missed after all; leave it as it is.
-    if (MISSED_RUN_FAILURE_CODES.includes(sameSlot.failureCode as MissedRunFailureCode)
-        && (sameSlot.missedCount ?? 0) < input.missedCount) {
-        await tx.automationRun.updateMany({
+    if (!MISSED_RUN_FAILURE_CODES.includes(sameSlot.failureCode as MissedRunFailureCode)) {
+        return { ok: false, error: 'already-claimed' };
+    }
+    const raised = (sameSlot.missedCount ?? 0) < input.missedCount
+        ? (await tx.automationRun.updateMany({
             where: { id: sameSlot.id, failureCode: { in: [...MISSED_RUN_FAILURE_CODES] }, missedCount: { lt: input.missedCount } },
             data: { missedCount: input.missedCount },
-        });
-    }
-    return { ok: true, value: { runId: sameSlot.id, idempotent: true, projectId: automation.projectId } };
+        })).count > 0
+        : false;
+    return { ok: true, value: { runId: sameSlot.id, idempotent: true, countRaised: raised, projectId: automation.projectId } };
 }
 
 async function claimedRun(tx: Tx, accountId: string, machineId: string, runId: string, claimToken: string) {

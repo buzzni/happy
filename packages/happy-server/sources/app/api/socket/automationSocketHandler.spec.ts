@@ -423,7 +423,7 @@ describe('automationSocketHandler', () => {
     it('records a missed gap for the socket machine, scoped to its project, silent on a replay', async () => {
         const handlers = bind();
         services.recordMissedAutomationRuns.mockResolvedValue({
-            ok: true, value: { runId: 'run-9', idempotent: false, projectId: 'project-7' },
+            ok: true, value: { runId: 'run-9', idempotent: false, countRaised: false, projectId: 'project-7' },
         });
         const gap = {
             automationId: 'automation-1', generation: 3, firstMissedAt: 1000, missedCount: 8,
@@ -436,7 +436,7 @@ describe('automationSocketHandler', () => {
             automationId: 'automation-1', generation: 3, firstMissedAt: new Date(1000), missedCount: 8,
             failureCode: 'MISSED_OFFLINE',
         });
-        expect(callback).toHaveBeenCalledWith({ ok: true, value: { runId: 'run-9', idempotent: false, projectId: 'project-7' } });
+        expect(callback).toHaveBeenCalledWith({ ok: true, value: { runId: 'run-9', idempotent: false, countRaised: false, projectId: 'project-7' } });
         expect(services.emitProjectAutomationUpdate).toHaveBeenCalledWith(
             'project-7',
             { projectId: 'project-7', automationId: 'automation-1', reason: 'run' },
@@ -445,9 +445,27 @@ describe('automationSocketHandler', () => {
 
         services.emitProjectAutomationUpdate.mockClear();
         services.recordMissedAutomationRuns.mockResolvedValue({
-            ok: true, value: { runId: 'run-9', idempotent: true, projectId: 'project-7' },
+            ok: true, value: { runId: 'run-9', idempotent: true, countRaised: false, projectId: 'project-7' },
         });
         await handlers.get('automation-missed-record')!(gap, vi.fn());
+        expect(services.emitProjectAutomationUpdate).not.toHaveBeenCalled();
+
+        // A replay that raised the stored count changed what the history shows.
+        services.recordMissedAutomationRuns.mockResolvedValue({
+            ok: true, value: { runId: 'run-9', idempotent: true, countRaised: true, projectId: 'project-7' },
+        });
+        await handlers.get('automation-missed-record')!(gap, vi.fn());
+        expect(services.emitProjectAutomationUpdate).toHaveBeenCalledTimes(1);
+    });
+
+    it('answers record-failed, not invalid-input, when storing the gap fails so the daemon retries', async () => {
+        const handlers = bind();
+        services.recordMissedAutomationRuns.mockRejectedValue(new Error('connection terminated'));
+        const callback = vi.fn();
+        await handlers.get('automation-missed-record')!({
+            automationId: 'automation-1', generation: 3, firstMissedAt: 1000, missedCount: 8, failureCode: 'MISSED_OFFLINE',
+        }, callback);
+        expect(callback).toHaveBeenCalledWith({ ok: false, error: 'record-failed' });
         expect(services.emitProjectAutomationUpdate).not.toHaveBeenCalled();
     });
 

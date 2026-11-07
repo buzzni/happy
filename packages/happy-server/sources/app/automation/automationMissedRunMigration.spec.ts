@@ -26,6 +26,8 @@ beforeAll(async () => {
 beforeEach(async () => {
     pg = new PGlite();
     await pg.exec(schema);
+    // The one-active-run fence lives only in the original SQL migration, not in the Prisma schema.
+    await pg.exec(`CREATE UNIQUE INDEX "AutomationRun_one_active_run_per_automation" ON "AutomationRun"("automationId") WHERE "status" IN ('CLAIMED', 'RUNNING');`);
     await pg.exec('ALTER TABLE "AutomationRun" DROP COLUMN "missedCount";');
     // Adapter 0.7.2 returns Uint8Array bytea cells; Prisma's bridge expects JSON arrays.
     const adapter = new PrismaPGlite(pg), connect = adapter.connect.bind(adapter);
@@ -75,9 +77,9 @@ it('keeps old history as ordinary rows and records a re-reported gap only once',
     const first = await client.$transaction((tx) => recordMissedAutomationRuns(tx, 'account-1', 'machine-1', gap(8), now));
     expect(first).toMatchObject({ ok: true, value: { idempotent: false } });
     const replay = await client.$transaction((tx) => recordMissedAutomationRuns(tx, 'account-1', 'machine-1', gap(8), now));
-    expect(replay).toEqual({ ok: true, value: { runId: (first as any).value.runId, idempotent: true, projectId: 'project-1' } });
+    expect(replay).toEqual({ ok: true, value: { runId: (first as any).value.runId, idempotent: true, countRaised: false, projectId: 'project-1' } });
     const longer = await client.$transaction((tx) => recordMissedAutomationRuns(tx, 'account-1', 'machine-1', gap(11), now));
-    expect(longer).toMatchObject({ ok: true, value: { idempotent: true } });
+    expect(longer).toMatchObject({ ok: true, value: { idempotent: true, countRaised: true } });
 
     const runs = await client.automationRun.findMany({ orderBy: { scheduledFor: 'asc' }, select: { id: true, status: true, failureCode: true, missedCount: true, scheduledFor: true, startedAt: true, sessionId: true } });
     expect(runs).toEqual([
@@ -92,4 +94,22 @@ it('does not hold the one-active-run fence, so the next slot can still be claime
         automationId: 'automation-1', generation: 3, scheduledFor: now,
     }, now));
     expect(claim).toMatchObject({ ok: true });
+    // The fence is really installed: a second active claim on the next slot is refused while the first holds it.
+    const second = await client.$transaction((tx) => claimAutomationRun(tx, 'account-1', 'machine-1', {
+        automationId: 'automation-1', generation: 3, scheduledFor: new Date(now.getTime() + 10_000),
+    }, now));
+    expect(second).toEqual({ ok: false, error: 'active-run' });
+});
+
+it('refuses to write a real run off as missed and reports it as already claimed', async () => {
+    const claimed = await client.$transaction((tx) => claimAutomationRun(tx, 'account-1', 'machine-1', {
+        automationId: 'automation-1', generation: 3, scheduledFor: now,
+    }, now));
+    expect(claimed).toMatchObject({ ok: true });
+    const later = new Date(now.getTime() + 3 * 3_600_000);
+    const missed = await client.$transaction((tx) => recordMissedAutomationRuns(tx, 'account-1', 'machine-1', {
+        ...gap(12), firstMissedAt: now,
+    }, later));
+    expect(missed).toEqual({ ok: false, error: 'already-claimed' });
+    expect(await client.automationRun.count({ where: { failureCode: 'MISSED_OFFLINE' } })).toBe(0);
 });

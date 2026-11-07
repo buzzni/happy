@@ -165,16 +165,23 @@ export function automationSocketHandler(accountId: string, machineId: string, so
     on('automation-missed-record', async (data, callback) => answer(callback, () => {
         const failureCode = MISSED_RUN_FAILURE_CODES.find((code) => code === data?.failureCode);
         if (!failureCode) throw new Error('invalid-input');
-        return inTx((tx) => recordMissedAutomationRuns(tx, accountId, machineId, {
+        const input = {
             automationId: requiredString(data?.automationId),
             generation: integer(data?.generation, 1, Number.MAX_SAFE_INTEGER),
             firstMissedAt: new Date(integer(data?.firstMissedAt, 0, Number.MAX_SAFE_INTEGER)),
             missedCount: integer(data?.missedCount, 1, MAX_MISSED_RUN_COUNT),
             failureCode,
-        }));
+        };
+        // A storage failure is not a refusal: the daemon keeps its schedule and reports the gap again (R5),
+        // where a malformed request (invalid-input above) or a refusal lets it move on without a record.
+        return inTx((tx) => recordMissedAutomationRuns(tx, accountId, machineId, input))
+            .catch((error) => {
+                warn({ err: error }, 'automation socket: missed-run record failed to store');
+                return { ok: false as const, error: 'record-failed' };
+            });
     }, async (value) => {
-        const { idempotent, projectId } = value as { idempotent: boolean; projectId: string };
-        if (idempotent) return;
+        const { idempotent, countRaised, projectId } = value as { idempotent: boolean; countRaised: boolean; projectId: string };
+        if (idempotent && !countRaised) return;
         await emitProjectAutomationUpdate(projectId, {
             projectId,
             automationId: requiredString(data?.automationId),
