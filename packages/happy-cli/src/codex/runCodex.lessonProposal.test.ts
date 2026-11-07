@@ -14,6 +14,7 @@ const fixture = vi.hoisted(() => ({
     proposal: { name: 'Verified recovery' },
     statusProbeFails: false,
     authBlockedReason: null as null | 'limit-reached',
+    authBlocked: false,
     send: vi.fn(),
     startThread: vi.fn(),
     readThread: vi.fn(async (_options?: { threadId: string; includeTurns: boolean }) => ({ thread: { id: 'thread', path: '/tmp/native-rollout.jsonl' } })),
@@ -51,8 +52,13 @@ vi.mock('@/utils/MessageQueue2', async (original) => {
 vi.mock('@/codex/codexAuthRecovery', async (original) => {
     const actual = await original<typeof import('@/codex/codexAuthRecovery')>();
     return { ...actual, CodexAuthRecovery: class extends actual.CodexAuthRecovery {
+        status = () => {
+            const status = super.status();
+            return fixture.authBlocked ? { ...status, state: 'failed' as const } : status;
+        };
         prepareTurn = async () => {
             if (fixture.authBlockedReason) throw new actual.CodexAuthRecoveryError(fixture.authBlockedReason);
+            if (fixture.authBlocked) { fixture.authBlocked = false; return; }
             return super.prepareTurn();
         };
     } };
@@ -93,6 +99,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     startThread = async (options: unknown) => { fixture.startThread(options); this.threadId = 'thread'; return { threadId: 'thread', model: 'test' }; };
     readThread = (options: { threadId: string; includeTurns: boolean }) => fixture.readThread(options);
     abortPreparedTurn = vi.fn();
+    clearThreadState = () => { this.threadId = null; };
     abortTurnWithFallback = async () => ({ forcedRestart: false });
     sendTurnAndWait = async (prompt: string, options: unknown) => {
         fixture.send(prompt, options);
@@ -118,7 +125,7 @@ afterEach(() => {
     }
     fixture.readThread.mockReset().mockResolvedValue({ thread: { id: 'thread', path: '/tmp/native-rollout.jsonl' } });
     fixture.completedTurnId = 'native-completed-turn';
-    fixture.requestIds = undefined; fixture.channelRequestId = undefined; vi.unstubAllEnvs(); vi.restoreAllMocks(); vi.clearAllMocks(); fixture.submit = null; fixture.onSend = null; fixture.onSteer = null; fixture.steerText = ''; fixture.statusProbeFails = false; fixture.authBlockedReason = null; fixture.completedThread = null; fixture.session.sendTurnLatency.mockReset(); });
+    fixture.requestIds = undefined; fixture.channelRequestId = undefined; vi.unstubAllEnvs(); vi.restoreAllMocks(); vi.clearAllMocks(); fixture.submit = null; fixture.onSend = null; fixture.onSteer = null; fixture.steerText = ''; fixture.statusProbeFails = false; fixture.authBlockedReason = null; fixture.authBlocked = false; fixture.completedThread = null; fixture.session.sendTurnLatency.mockReset(); });
 
 // specs/checkpoint-local-history — Codex keeps its process across turns and records the folder
 // before dispatch and after the turn, including a turn the provider failed.
@@ -615,6 +622,59 @@ describe('Codex foreground lesson proposal wiring', () => {
         const events = fixture.session.sendSessionEvent.mock.calls.map(([event]) => event);
         expect(events).toContainEqual({ type: 'message', message: CODEX_AUTH_BLOCKED_NOTICES.limitReached });
         expect(events).not.toContainEqual({ type: 'message', message: 'Process exited unexpectedly' });
+    });
+
+    it('recovers a blocked session before /clear, then resets the context instead of sending it as a prompt', async () => {
+        // /clear in a blocked session skips the control branch. Recovering it later on the normal
+        // dispatch path sent the literal text to Codex and left the thread as it was.
+        fixture.authBlocked = true;
+        for (const key of Object.keys(process.env)) {
+            if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_)/.test(key)) vi.stubEnv(key, undefined);
+        }
+        vi.stubEnv('HAPPY_AUTOMATION_RUN_ONCE', '1');
+        vi.stubEnv('HAPPY_INITIAL_PROMPT', '/clear');
+        // /clear is control, not a turn, so a run-once session does not end on it; close the queue instead.
+        fixture.session.sendSessionEvent.mockImplementation((event: { message?: string }) => {
+            if (event.message === 'Context was reset') fixture.closeQueue?.();
+        });
+        const { runCodex } = await import('./runCodex');
+        let events: unknown[];
+        try {
+            await runCodex({ principal: { kind: 'account', credentials: { token: 'test-token' } as never },
+                noSandbox: true, lessons: { turn: null, review: null, sessionKind: 'foreground' } });
+        } finally {
+            events = fixture.session.sendSessionEvent.mock.calls.map(([event]) => event);
+            fixture.session.sendSessionEvent.mockReset();
+        }
+        expect(fixture.authBlocked).toBe(false);
+        expect(fixture.send).not.toHaveBeenCalled();
+        expect(events).toContainEqual({ type: 'message', message: 'Context was reset' });
+    });
+
+    it('keeps the context when recovery before /clear fails, and says why', async () => {
+        fixture.authBlocked = true;
+        fixture.authBlockedReason = 'limit-reached';
+        for (const key of Object.keys(process.env)) {
+            if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_)/.test(key)) vi.stubEnv(key, undefined);
+        }
+        vi.stubEnv('HAPPY_AUTOMATION_RUN_ONCE', '1');
+        vi.stubEnv('HAPPY_INITIAL_PROMPT', '/clear');
+        const { CODEX_AUTH_BLOCKED_NOTICES } = await import('@/codex/codexAuthRecovery');
+        fixture.session.sendSessionEvent.mockImplementation((event: { message?: string }) => {
+            if (event.message === CODEX_AUTH_BLOCKED_NOTICES.limitReached) fixture.closeQueue?.();
+        });
+        const { runCodex } = await import('./runCodex');
+        let events: unknown[];
+        try {
+            await runCodex({ principal: { kind: 'account', credentials: { token: 'test-token' } as never },
+                noSandbox: true, lessons: { turn: null, review: null, sessionKind: 'foreground' } });
+        } finally {
+            events = fixture.session.sendSessionEvent.mock.calls.map(([event]) => event);
+            fixture.session.sendSessionEvent.mockReset();
+        }
+        expect(fixture.send).not.toHaveBeenCalled();
+        expect(events).toContainEqual({ type: 'message', message: CODEX_AUTH_BLOCKED_NOTICES.limitReached });
+        expect(events).not.toContainEqual({ type: 'message', message: 'Context was reset' });
     });
 });
 

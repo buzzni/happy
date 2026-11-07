@@ -2556,6 +2556,21 @@ export async function runCodex(opts: {
 
                 await measure('auth', () => authRecovery.beginTurn());
                 if (shouldExit) { authRecovery.endTurn(); break; }
+                if (shouldHandleCodexClear(message) && authRecovery.status().state === 'failed') {
+                    // A blocked session recovers before /clear, as before any other message. The
+                    // normal dispatch path would recover it too, and then send "/clear" as a prompt.
+                    try {
+                        await measure('auth', () => authRecovery.prepareTurn());
+                    } catch (error) {
+                        latency?.finish('failed');
+                        authRecovery.endTurn();
+                        const failureMessage = describeCodexAuthRecoveryFailure(error) ?? 'Process exited unexpectedly';
+                        messageBuffer.addMessage(failureMessage, 'status');
+                        session.sendSessionEvent({ type: 'message', message: failureMessage });
+                        emitReadyIfIdle({ pending, queueSize: () => messageQueue.size(), shouldExit, sendReady });
+                        continue;
+                    }
+                }
                 if (shouldHandleCodexClear(message) && authRecovery.status().state !== 'failed') {
                     latency?.finish('control');
                     authRecovery.endTurn();
