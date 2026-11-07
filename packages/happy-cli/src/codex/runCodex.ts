@@ -2556,6 +2556,9 @@ export async function runCodex(opts: {
 
                 await measure('auth', () => authRecovery.beginTurn());
                 if (shouldExit) { authRecovery.endTurn(); break; }
+                // A blocked session recovers before /clear is decided; otherwise a recovered one sends "/clear" to Codex.
+                const clearRecoveryError = shouldHandleCodexClear(message) && authRecovery.status().state === 'failed'
+                    ? await Promise.resolve(measure('auth', () => authRecovery.prepareTurn())).then(() => undefined, (error: unknown) => error) : undefined;
                 if (shouldHandleCodexClear(message) && authRecovery.status().state !== 'failed') {
                     latency?.finish('control');
                     authRecovery.endTurn();
@@ -2601,6 +2604,7 @@ export async function runCodex(opts: {
 
                 let routingApplied = false;
                 try {
+                    if (clearRecoveryError) throw clearRecoveryError;
                     await measure('auth', () => authRecovery.prepareTurn());
                     if (checkpointComposition.completeTurn) {
                         // specs/linux-checkpoint-enforcement-backend R4 — open the checkpoint turn (and
