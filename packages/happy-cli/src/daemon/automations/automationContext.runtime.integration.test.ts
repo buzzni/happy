@@ -1,5 +1,6 @@
 import { expect, it, vi } from 'vitest'
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import nacl from 'tweetnacl'
 import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { createServer } from 'node:http'
@@ -20,6 +21,140 @@ import { createAutomationContextHost } from './automationContextHost'
 import { createAutomationContextAuthorizer, createAutomationContextTransport } from './automationContextTransport'
 import { createServerAutomationRuntimeStore } from './serverAutomationRuntimeStore'
 import { createAutomationContextWorkspace } from './automationContextWorkspace'
+
+it.each(['claude', 'codex'] as const)('runs two publicly registered isolated %s occurrences through negotiated daemon sync with the manual chat unchanged', async provider => {
+  vi.stubEnv('HAPPY_SCOPE_FRESH_PROVIDER_STATE', '1')
+  vi.stubEnv('HAPPY_SCOPE_PACKAGED_SERVER', undefined)
+  vi.stubEnv('HAPPY_SCOPE_INSTALLED_CLI', undefined)
+  let fixture: SessionWriteScopeFixture, machineId = '', displaySessionId = ''
+  const secret = randomBytes(32).toString('hex')
+  const studio = createServer(async (request, response) => {
+    const reply = (status: number, value: unknown) => response.writeHead(status, { 'Content-Type': 'application/json' }).end(JSON.stringify(value))
+    try {
+      if (!request.url?.startsWith('/api/automation/') || request.headers.authorization !== `Bearer ${fixture.token}`) { reply(403, {}); return }
+      let raw = ''; for await (const chunk of request) raw += chunk
+      const body = JSON.parse(raw)
+      if (body.machineId !== machineId || body.conversationSessionId && body.conversationSessionId !== displaySessionId
+        || body.conversationDirectory && body.conversationDirectory !== fixture.project) { reply(403, {}); return }
+      const admission = await fetch(`${fixture.serverUrl}/v1/automation-runs/${encodeURIComponent(body.runId)}/mcp-context`, {
+        method: 'POST', headers: { Authorization: `Bearer ${fixture.token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ machineId, claimToken: body.claimToken, executionAdmission: true }), signal: AbortSignal.timeout(10_000) })
+      if (!admission.ok) { await admission.body?.cancel(); reply(403, {}); return }
+      const admitted = await admission.json() as any
+      if (admitted.executionAdmission?.payloadVersion !== 6) { reply(403, {}); return }
+      if (request.url === '/api/automation/project-environment') {
+        reply(200, { projectId: admitted.projectId, conversationSessionId: displaySessionId,
+          conversationDirectory: fixture.project, environmentVariables: {} }); return
+      }
+      if (request.url === '/api/automation/mcp-caller-grant') {
+        reply(200, { projectId: admitted.projectId, grant: null, bindingStatus: 'DIRECT_OWNER', connectorPolicy: 'optional', requiredConnectors: [] }); return
+      }
+      if (request.url === '/api/automation/execution-target') {
+        reply(200, { executionBindingRequired: false, targetProof: signAutomationExecutionTarget({ automationId: admitted.automationId,
+          projectId: admitted.projectId, generation: admitted.executionAdmission.generation, revision: admitted.executionAdmission.revision,
+          machineId, runId: body.runId, machineAccountId: fixture.accountId, displaySessionId,
+          createBodyHash: await sessionCreateBodyHash(body.createBody), executionBindingRequired: false,
+          bearer: fixture.token, secret, now: Date.now() }) }); return
+      }
+      reply(404, {})
+    } catch { reply(500, {}) }
+  })
+  await new Promise<void>(resolve => studio.listen(0, '127.0.0.1', resolve))
+  const origin = `http://127.0.0.1:${(studio.address() as { port: number }).port}`
+  fixture = new SessionWriteScopeFixture({ provider, encryptionVariant: 'legacy', automationContextHost: true,
+    automationStudioUrl: origin, serverEntry: 'sources/testing/automationContextFixture.ts', browserBridgeHost: '::1' })
+  let failure: unknown
+  try {
+    await fixture.start()
+    const machines = await eventually(async () => {
+      const rows = (await fixture.http('/v1/machines')).body
+      return Array.isArray(rows) && rows[0]?.id ? rows : undefined
+    }, 'public fixture machine registration')
+    machineId = machines[0].id
+    const api = await ApiClient.create({ token: fixture.token, encryption: { type: 'legacy', secret: fixture.seed } })
+    const prepared = api.prepareSessionCreation({ tag: `public-manual-${randomUUID()}`, metadata: {
+      path: fixture.project, host: 'fixture', flavor: provider, [fixture.providerIdentityField]: 'manual-native-keep',
+      homeDir: fixture.home, happyHomeDir: fixture.happyHome, happyLibDir: fixture.cli, happyToolsDir: fixture.tools,
+    }, state: { controlledByUser: false } })
+    displaySessionId = (await fixture.http('/v1/sessions', prepared.body)).body.session.id
+    await fixture.session(displaySessionId); await fixture.send(displaySessionId, `scope-marker-manual-${randomUUID()}`)
+    const before = (await fixture.http('/v2/sessions/lookup', { ids: [displaySessionId] })).body.sessions[0]
+    const pendingBefore = await fixture.messages(displaySessionId)
+    // This fixture-only seed creates the authorized project and proof key; tested occurrences below
+    // are created, claimed, started and reported exclusively through the public API and real daemon.
+    const info = await seedRun(fixture, { accountId: fixture.accountId, displaySessionId, directory: fixture.project,
+      runId: `bootstrap-${randomUUID()}`, claimToken: randomBytes(24).toString('hex'), secret })
+    const projectPath = `/v1/projects/${encodeURIComponent(info.projectId)}`
+    async function write(method: string, path: string, body: unknown) {
+      const response = await fetch(fixture.serverUrl + path, { method, signal: AbortSignal.timeout(10_000),
+        headers: { Authorization: `Bearer ${fixture.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      const value = await response.json() as any
+      if (!response.ok) throw new Error(`Public fixture request failed ${method} ${path}: ${response.status} ${JSON.stringify(value)}`)
+      return value
+    }
+    const target = await eventually(async () => {
+      const row = (await fixture.http(projectPath + '/automation-target')).body.target
+      return row?.contextIsolationVersion === 1 ? row : undefined
+    }, 'explicit daemon and server context capability')
+    const viewer = nacl.box.keyPair()
+    const viewerKey = await write('PUT', projectPath + '/automation-viewer-key', {
+      expectedKeyVersion: target.viewerKeyVersion, publicKey: Buffer.from(viewer.publicKey).toString('base64') })
+    const nativeIds = new Set<string>(), marker = `scope-marker-public-${randomUUID()}`
+    const journal = createAutomationContextLaunchJournal(fixture.happyHome)
+    let definition: any
+    for (let index = 0; index < 2; index++) {
+      if (index === 0) {
+        const payload: AutomationPayload = { name: 'Public independent schedule', directory: fixture.project, agent: provider,
+          model: fixture.modelName, prompt: `Return ${marker} only.`, scriptCommand: null, suppressSilent: false,
+          schedule: { kind: 'interval', minutes: 60 }, conversation: { sessionId: displaySessionId }, contextPolicy: { kind: 'isolated', reference: null } }
+        const dek = nacl.randomBytes(32), nonce = nacl.randomBytes(24)
+        const seal = (publicKey: Uint8Array) => {
+          const ephemeral = nacl.box.keyPair(), boxNonce = nacl.randomBytes(24)
+          return Buffer.from([1, ...ephemeral.publicKey, ...boxNonce, ...nacl.box(dek, boxNonce, publicKey, ephemeral.secretKey)]).toString('base64')
+        }
+        definition = (await write('PUT', projectPath + `/automations/registrations/${randomUUID()}`, { payloadVersion: 6, paused: true,
+          payloadCiphertext: Buffer.from([1, ...nonce, ...nacl.secretbox(Buffer.from(JSON.stringify(payload)), nonce, dek)]).toString('base64'),
+          viewerKeyId: createHash('sha256').update(viewer.publicKey).digest('base64url'), viewerKeyVersion: viewerKey.keyVersion,
+          viewerKeyEnvelope: seal(viewer.publicKey), machineKeyVersion: target.machineKeyVersion,
+          machineKeyEnvelope: seal(Buffer.from(target.machinePublicKey, 'base64')) })).automation
+        definition = (await write('PATCH', projectPath + `/automations/${definition.id}`, { expectedRevision: definition.revision, paused: false })).automation
+      }
+      // Repeating the same saved request must still create a distinct native context.
+      definition = (await write('POST', projectPath + `/automations/${definition.id}/run`, { expectedRevision: definition.revision })).automation
+      const runs = await eventually(async () => {
+        const rows = (await fixture.http(projectPath + `/automation-runs?automationId=${definition.id}`)).body.runs
+        return Array.isArray(rows) && rows.length === index + 1 && rows[0].sessionId ? rows : undefined
+      }, 'public scheduler claims and dispatches this occurrence', 60_000)
+      const run = runs[0]
+      const receipt = await eventually(async () => {
+        const row = await journal.read(run.id)
+        return row?.exitReceiptAcknowledged ? row : undefined
+      }, 'actual native completion and owned exit publication', 90_000)
+      const raw = (await fixture.http('/v2/sessions/lookup', { ids: [run.sessionId] })).body.sessions[0]
+      const metadata = decrypt(decodeBase64(receipt.prepared.encryptionKey), receipt.prepared.encryptionVariant, decodeBase64(raw.metadata)) as any
+      expect(metadata[fixture.providerIdentityField]).toBeTruthy()
+      expect(metadata[fixture.providerIdentityField]).not.toBe('manual-native-keep')
+      expect(nativeIds.has(metadata[fixture.providerIdentityField])).toBe(false); nativeIds.add(metadata[fixture.providerIdentityField])
+      const evidence = (await fixture.http(`/v1/sessions/${displaySessionId}/automation-runs/${run.id}/evidence`)).body
+      const open = (text: string) => decrypt(decodeBase64(receipt.prepared.encryptionKey), receipt.prepared.encryptionVariant, decodeBase64(text))
+      const result = await readAutomationExecutionRecord({ identity: { automationId: definition.id, runId: run.id, generation: run.generation,
+        revision: receipt.revision, displaySessionId }, metadata: open(evidence.seedManifestCiphertext), complete: evidence.nextAfterSeq === null,
+        seedMessage: { ...evidence.seedMessage, content: open(evidence.seedMessage.content.c) },
+        messages: evidence.messages.map((row: StoredMessage) => ({ ...row, content: open(row.content.c) })) })
+      expect(result).toMatchObject({ status: 'verified', answer: { status: 'completed', answer: `fixture reply ${marker}` } })
+    }
+    expect(nativeIds.size).toBe(2)
+    const after = (await fixture.http('/v2/sessions/lookup', { ids: [displaySessionId] })).body.sessions[0]
+    expect(after.metadata).toBe(before.metadata); expect(after.agentState).toBe(before.agentState)
+    expect(await fixture.messages(displaySessionId)).toEqual(pendingBefore)
+    expect((await fixture.http('/v1/sessions')).body.sessions.map((row: any) => row.id)).toEqual([displaySessionId])
+  } catch (error) { failure = new Error(`Public ${provider} flow failed: ${String(error)}\n${await fixture.diagnostics().catch(() => 'Diagnostics unavailable')}`, { cause: error }) }
+  finally {
+    try { await fixture.close() } catch (error) { failure = failure ? new AggregateError([failure, error]) : error }
+    studio.closeAllConnections(); await new Promise<void>(resolve => studio.close(() => resolve())); vi.unstubAllEnvs()
+  }
+  if (failure) throw failure
+})
 
 async function executionRpc(fixture: SessionWriteScopeFixture, sessionId: string, key: Uint8Array, method: string, params: unknown) {
   const socket = io(fixture.serverUrl, { path: '/v1/updates', transports: ['websocket'], reconnection: false,

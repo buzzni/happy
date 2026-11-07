@@ -1450,7 +1450,8 @@ export async function startDaemon(): Promise<void> {
       onRetired: pid => onChildExited(pid) });
     // Terminals run under the verified launcher in their own Job and close with the drain (W0-5h).
     if (standaloneWindows) configureWindowsTerminalHost(standaloneWindows.terminalHost);
-    const contextIsolationHostEnabled = process.env.HAPPY_CONTEXT_ISOLATION_HOST === '1' && process.platform !== 'win32';
+    const contextIsolationHostEnabled = process.env.HAPPY_CONTEXT_ISOLATION_HOST !== '0'
+      && process.platform !== 'win32' && managedIdentity.status !== 'active';
     const admitSubprocess = contextIsolationHostEnabled ? createSubprocessWriteAdmission({ home: configuration.happyHomeDir }) : undefined;
     const reserveLegacyDispatch = contextIsolationHostEnabled ? createLegacyDispatchAdmission({ home: configuration.happyHomeDir }) : undefined;
     // codexcli-org-requirements R10.5: which sessions' organizations switched autopilot off, as the
@@ -1950,7 +1951,7 @@ export async function startDaemon(): Promise<void> {
     const contextOwnedChildren = new WeakMap<SpawnSessionOptions, (child: import('node:child_process').ChildProcess) => void>();
     const manualWorkspaceChildren = new Map<number, ReturnType<typeof observeWorkspaceContextChild>>();
     const observedWorkspaceExit = { foregroundDrained: true, backgroundDrained: true, providerExitedCleanly: true, writeProducersDrained: true };
-    // Private rollout only: capability remains unadvertised until the full producer/recovery contract is ready.
+    // The same admission boundary protects native runs and every host workspace producer.
     const contextWorkspace = contextIsolationHostEnabled
       ? createAutomationContextWorkspace({ home: configuration.happyHomeDir, isTracked: async roots => {
         try {
@@ -4108,7 +4109,8 @@ export async function startDaemon(): Promise<void> {
     // 실행 틱은 아래 하트비트 루프에 얹힌다(별도 타이머 없음).
     const automationStore = createAutomationStore({ filePath: configuration.automationsFile });
     const serverAutomationCache = createServerAutomationCache({
-      filePath: configuration.serverAutomationsCacheFile,
+      filePath: contextIsolationHostEnabled ? join(configuration.happyHomeDir, 'server-automations.context-v6.json') : configuration.serverAutomationsCacheFile,
+      ...(contextIsolationHostEnabled ? { format: 'isolated-v6' as const } : {}),
     });
     const serverAutomationRuntimeStore = createServerAutomationRuntimeStore({
       filePath: configuration.serverAutomationsRuntimeFile,
@@ -5320,12 +5322,16 @@ export async function startDaemon(): Promise<void> {
         finally { contextOwnedChildren.delete(options); }
       },
     }) : null;
+    const initialContextAdmission = await prepareAutomationContextTick(contextHost, new AbortController().signal,
+      message => logger.warn(message));
+    apiMachine.setAutomationContextIsolationReady(initialContextAdmission.isolatedContextReady);
     const serverAutomationTickRunner = createAutomationTickRunner({
       // Windows standalone: sessions launch through the verified Job owner, so scheduled
       // sessions run; script gates and GitHub triggers would spawn unfenced cmd/gh/git.
       runTick: async (signal) => {
         const contextAdmission = await prepareAutomationContextTick(contextHost, signal, message => logger.warn(message));
         if (signal.aborted) return;
+        apiMachine.setAutomationContextIsolationReady(contextAdmission.isolatedContextReady);
         await runServerAutomationTick({
         ...contextAdmission,
         reserveLegacyDispatch,

@@ -94,6 +94,19 @@ describe('serverAutomationCache', () => {
     cache.markCancelled!([{ automationId: 'a1', revision: 2 }]); expect(cache.read().pendingCancellations).toEqual([])
   })
 
+  it('durably resets only the isolated sync cursor while preserving pending cancellation and acknowledgement', () => {
+    const key = tweetnacl.box.keyPair(), encrypted = bundle({ name: 'sealed target' }, key.publicKey)
+    const cache = createServerAutomationCache({ filePath: file, format: 'isolated-v6' })
+    cache.applySync({ serverTime: 1000, nextSeq: '2', changes: [
+      { seq: '1', automationId: 'a1', revision: 2, generation: 2, kind: 'UPSERT', payloadVersion: 6, ...encrypted, machineKeyVersion: 1, paused: false, enabledAt: 1 },
+      { seq: '2', automationId: 'a2', revision: 2, generation: 2, kind: 'TOMBSTONE', chatDeleted: true, payloadVersion: 6, ...encrypted, machineKeyVersion: 1, paused: true, enabledAt: 1 },
+    ] })
+    const before = cache.read()
+    ;(cache as any).resetCursor()
+    expect(createServerAutomationCache({ filePath: file, format: 'isolated-v6' }).read()).toEqual({ ...before, cursor: 0n })
+    expect(statSync(file).mode & 0o777).toBe(0o600)
+  })
+
   it('atomically stores only encrypted deltas and advances the durable cursor', () => {
     const keyPair = tweetnacl.box.keyPair()
     const encrypted = bundle({

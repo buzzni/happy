@@ -8,6 +8,7 @@ import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { createWorktreeReclaimHandler } from '@/daemon/worktreeDependencyReclaimRpc';
 import { createSealedSpawnEnvHandler } from '@/modules/common/sealedSpawnEnv';
 import type { LegacyDispatchReservation } from '@/utils/workspaceTurnAdmission';
+import { createSerialLock } from '@/utils/refreshRecovery';
 import { createWorktreeOpsHandlers } from '@/daemon/worktreeOps';
 /**
  * WebSocket client for machine/daemon communication with Happy server
@@ -414,9 +415,10 @@ interface DaemonToServerEvents {
         expectedKeyVersion: number;
         publicKey: string;
         protocolVersion: number;
+        contextIsolationVersion: 0 | 1;
     }, cb: (answer: {
         ok: boolean;
-        value?: { keyVersion: number };
+        value?: { keyVersion: number; contextIsolationVersion?: 1; syncFromStart?: true };
         error?: string;
     }) => void) => void;
     'automation-sync': (data: { afterSeq: string; limit: number; payloadVersions?: number[] }, cb: (answer: {
@@ -811,6 +813,10 @@ export class ApiMachineClient {
     /** Set once the daemon can resolve projects to workspaces. */
     private lessonHosts: LessonHostSupervisor | null = null;
     private automationProtocolVersion: number = AUTOMATION_PROTOCOL_VERSION;
+    private automationContextHostReady = false;
+    private automationContextIsolationVersion: 0 | 1 = 0;
+    private automationContextReadinessEpoch = 0;
+    private readonly automationKeyRegistration = createSerialLock();
     private scriptRuntimeReadiness: ScriptRuntimeReadiness | null = null;
     private lastKnownScriptRuntimeKey: string | null = null;
     private persistAutomationKeyVersion: ((version: number) => void) | null = null;
@@ -2616,6 +2622,19 @@ export class ApiMachineClient {
         this.persistAutomationKeyVersion = persistVersion;
     }
 
+    /** Trusted daemon composition, before connect. A protocol number cannot enable the private host. */
+    setAutomationContextIsolationReady(ready: boolean): void {
+        const changed = this.automationContextHostReady !== ready;
+        this.automationContextHostReady = ready;
+        if (changed) this.automationContextReadinessEpoch++;
+        if (!ready) this.automationContextIsolationVersion = 0;
+        if (changed && this.automationKey && this.socket?.connected) {
+            void this.registerAutomationKey().catch(() => {
+                logger.debug('[API MACHINE] Context host registration remains unconfirmed');
+            });
+        }
+    }
+
     /**
      * aplus-dev-studio specs/e2ee-machine-control-boundary R12/R15 — the sender this daemon
      * trusts for automations, follow-ups and scripts, or null when it has none (legacy
@@ -3438,8 +3457,9 @@ export class ApiMachineClient {
         if (!this.serverAutomationCache || this.serverAutomationSyncInFlight) return;
         const sync = syncServerAutomationDeltas({
             cache: this.serverAutomationCache,
-            sync: (request) => this.socket.emitWithAck('automation-sync', { ...request, payloadVersions: [1, 4] }),
-            ack: (request) => this.socket.emitWithAck('automation-sync-ack', request),
+            sync: (request) => this.socket.timeout(AUTOMATION_ACK_TIMEOUT_MS).emitWithAck('automation-sync', { ...request,
+                payloadVersions: this.automationContextIsolationVersion === 1 ? [1, 4, 6] : [1, 4] }),
+            ack: (request) => this.socket.timeout(AUTOMATION_ACK_TIMEOUT_MS).emitWithAck('automation-sync-ack', request),
         }).then((result) => {
             if (result.changed > 0) logger.debug(`[API MACHINE] Applied ${result.changed} automation delta(s)`);
         }).catch((error) => {
@@ -3456,13 +3476,39 @@ export class ApiMachineClient {
     }
 
     private async registerAutomationKey(): Promise<void> {
+        const registered = await this.automationKeyRegistration(() => this.performAutomationKeyRegistration());
+        if (!registered || registered.readinessEpoch !== this.automationContextReadinessEpoch) return;
+        // Display metadata must not hold the authoritative key-registration queue while its ACK is lost.
+        await this.updateMachineMetadata((metadata) => ({
+            ...(metadata || {} as any),
+            automationSupport: {
+                rpcAvailable: this.automationRpcAvailable,
+                serverBacked: this.automationServerKeyVersion !== null,
+                keyVersion: this.automationServerKeyVersion ?? registered.keyVersion,
+                sessionFollowup: true,
+                conversation: true,
+                protocolVersion: this.automationProtocolVersion,
+                contextIsolationVersion: this.automationContextIsolationVersion,
+                scheduleKinds: [...AUTOMATION_SCHEDULE_KINDS],
+                delivery: 1,
+                ...this.automationHostCommandsField(),
+                ...this.authenticatedEnvelopesField(),
+                ...this.scriptRuntimeField(),
+            },
+        }));
+    }
+
+    private async performAutomationKeyRegistration(): Promise<{ keyVersion: number; readinessEpoch: number } | undefined> {
+        const readinessEpoch = this.automationContextReadinessEpoch;
         this.automationLegacyFallbackEnabled = false;
+        this.automationContextIsolationVersion = 0;
         const key = this.automationKey;
         if (!key) return;
-        const answer = await this.socket.emitWithAck('automation-key-register', {
+        const answer = await this.socket.timeout(AUTOMATION_ACK_TIMEOUT_MS).emitWithAck('automation-key-register', {
             expectedKeyVersion: key.registeredKeyVersion,
             publicKey: Buffer.from(key.publicKey).toString('base64'),
             protocolVersion: this.automationProtocolVersion,
+            contextIsolationVersion: this.automationContextHostReady ? 1 : 0,
         });
         if (!answer.ok || !answer.value || !Number.isSafeInteger(answer.value.keyVersion)) {
             if (answer.error === 'feature-disabled') {
@@ -3478,23 +3524,18 @@ export class ApiMachineClient {
             this.automationKey = { ...key, registeredKeyVersion: keyVersion };
         }
         this.automationServerKeyVersion = keyVersion;
+        if (readinessEpoch !== this.automationContextReadinessEpoch) return;
+        if (this.automationContextHostReady && answer.value.contextIsolationVersion === 1 && answer.value.syncFromStart === true) {
+            // A previous unsupported response may already have consumed v6 tombstones. Drain that
+            // page before durably resetting, including when the previous registration ACK was lost.
+            await this.serverAutomationSyncInFlight;
+            if (readinessEpoch !== this.automationContextReadinessEpoch || !this.automationContextHostReady) return;
+            if (!this.serverAutomationCache?.resetCursor) throw new Error('AUTOMATION_CONTEXT_CACHE_UNAVAILABLE');
+            this.serverAutomationCache.resetCursor();
+            this.automationContextIsolationVersion = 1;
+        }
         this.requestServerAutomationSync();
-        await this.updateMachineMetadata((metadata) => ({
-            ...(metadata || {} as any),
-            automationSupport: {
-                rpcAvailable: this.automationRpcAvailable,
-                serverBacked: true,
-                keyVersion,
-                sessionFollowup: true,
-                conversation: true,
-                protocolVersion: this.automationProtocolVersion,
-                scheduleKinds: [...AUTOMATION_SCHEDULE_KINDS],
-                delivery: 1,
-                ...this.automationHostCommandsField(),
-                ...this.authenticatedEnvelopesField(),
-                ...this.scriptRuntimeField(),
-            },
-        }));
+        return { keyVersion, readinessEpoch };
     }
 
     private syncResumeSessionRpcRegistration(): void {
@@ -4442,7 +4483,8 @@ export class ApiMachineClient {
             const cliVersionChanged = prevCliVersion !== newCliVersion;
             const scriptRuntimeKey = this.scriptRuntimeReadiness ? scriptRuntimeReadinessKey(this.scriptRuntimeReadiness) : null;
             const automationSupportChanged = this.lastKnownAutomationRpcAvailable !== this.automationRpcAvailable
-                || this.lastKnownScriptRuntimeKey !== scriptRuntimeKey;
+                || this.lastKnownScriptRuntimeKey !== scriptRuntimeKey
+                || this.machine.metadata?.automationSupport?.contextIsolationVersion !== this.automationContextIsolationVersion;
             const autonomousQualityGateSupportChanged = this.lastKnownAutonomousQualityGateRpcAvailable !== this.autonomousQualityGateRpcAvailable;
             const automationServerKeyChanged = this.lastKnownAutomationServerKeyVersion !== this.automationServerKeyVersion;
             const daemonSessionStateAvailable = this.daemonSessionStateRpcAvailable && !this.managedHandlers;
@@ -4549,6 +4591,7 @@ export class ApiMachineClient {
                         sessionFollowup: true,
                 conversation: true,
                         protocolVersion: this.automationProtocolVersion,
+                        contextIsolationVersion: this.automationContextIsolationVersion,
                         // 새 종류는 서버 자동화 실행기만 계산한다(레거시 RPC 저장소는 받지 않는다).
                         ...(this.automationServerKeyVersion !== null ? { scheduleKinds: [...AUTOMATION_SCHEDULE_KINDS], delivery: 1 as const } : {}),
                         ...this.automationHostCommandsField(),

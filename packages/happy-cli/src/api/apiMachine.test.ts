@@ -86,7 +86,8 @@ vi.mock('@/utils/detectCLI', () => ({
         claude: false,
         codex: false,
         gemini: false,
-        openclaw: false
+        openclaw: false,
+        detectedAt: 1,
     }))
 }));
 
@@ -95,7 +96,8 @@ vi.mock('@/resume/localHappyAgentAuth', () => ({
         rpcAvailable: false,
         requiresSameMachine: false,
         requiresHappyAgentAuth: false,
-        happyAgentAuthenticated: false
+        happyAgentAuthenticated: false,
+        detectedAt: 1,
     }))
 }));
 
@@ -2394,8 +2396,148 @@ describe('ApiMachineClient socket reconnection', () => {
             expectedKeyVersion: 3,
             publicKey: Buffer.from(new Uint8Array(32).fill(7)).toString('base64'),
             protocolVersion: protocolVersion ?? AUTOMATION_PROTOCOL_VERSION,
+            contextIsolationVersion: 0,
         });
         expect(mockSocket.emitWithAck).toHaveBeenCalledWith('machine-update-metadata', expect.any(Object));
+        client.shutdown();
+    });
+
+    it.each([{ ready: false, server: true }, { ready: true, server: false }, { ready: true, server: true }])('negotiates the context host and resets sync only after server confirmation ($ready/$server)', async ({ ready, server }) => {
+        const supported = ready && server;
+        let cursor = 5n;
+        const cache = { read: vi.fn(() => ({ cursor })), resetCursor: vi.fn(() => { cursor = 0n }),
+            applySync: vi.fn(() => ({ nextSeq: cursor, acknowledgements: [] })), markAcknowledged: vi.fn() };
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 1, ...(supported ? { contextIsolationVersion: 1, syncFromStart: true } : {}) } };
+            if (event === 'automation-sync') return { ok: true, value: { serverTime: 10, nextSeq: cursor.toString(), changes: [] } };
+            if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
+            return { result: 'success' };
+        });
+        const machine = makeMachine(), client = new ApiMachineClient('fake-token', machine);
+        client.setAutomationKey({ version: 1, publicKey: new Uint8Array(32).fill(7), secretKey: new Uint8Array(32).fill(8), registeredKeyVersion: 1 }, vi.fn(), 99);
+        (client as any).setAutomationContextIsolationReady(ready);
+        client.setServerAutomationCache(cache as any);
+        client.connect(); socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(cache.applySync).toHaveBeenCalled());
+        expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-key-register', expect.objectContaining({ protocolVersion: 99, contextIsolationVersion: ready ? 1 : 0 }));
+        expect(cache.resetCursor).toHaveBeenCalledTimes(supported ? 1 : 0);
+        expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-sync', { afterSeq: supported ? '0' : '5', limit: 500, payloadVersions: supported ? [1, 4, 6] : [1, 4] });
+        if (supported) expect(cache.resetCursor.mock.invocationCallOrder[0]).toBeLessThan(cache.applySync.mock.invocationCallOrder[0]);
+        await vi.waitFor(() => expect(machine.metadata?.automationSupport).toHaveProperty('contextIsolationVersion', supported ? 1 : 0));
+        client.shutdown();
+    });
+
+    it('serializes readiness registration behind an unacknowledged previous key registration', async () => {
+        let release!: () => void;
+        const gate = new Promise<void>(resolve => { release = resolve });
+        let registrations = 0;
+        const cache = { read: () => ({ cursor: 0n }), resetCursor: vi.fn(), applySync: () => ({ nextSeq: 0n, acknowledgements: [] }), markAcknowledged: vi.fn() };
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'automation-key-register') {
+                registrations++;
+                if (registrations === 1) await gate;
+                return { ok: true, value: { keyVersion: 1, ...(data.contextIsolationVersion === 1 ? { contextIsolationVersion: 1, syncFromStart: true } : {}) } };
+            }
+            if (event === 'automation-sync') return { ok: true, value: { serverTime: 10, nextSeq: '0', changes: [] } };
+            if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
+            return { result: 'success' };
+        });
+        const machine = makeMachine(), client = new ApiMachineClient('fake-token', machine);
+        client.setAutomationKey({ version: 1, publicKey: new Uint8Array(32).fill(7), secretKey: new Uint8Array(32).fill(8), registeredKeyVersion: 1 }, vi.fn());
+        client.setServerAutomationCache(cache as any); client.connect(); socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(registrations).toBe(1));
+        mockSocket.connected = true;
+        client.setAutomationContextIsolationReady(true);
+        try {
+            await Promise.resolve(); await Promise.resolve();
+            expect(registrations).toBe(1);
+        } finally { release() }
+        await vi.waitFor(() => expect(machine.metadata?.automationSupport?.contextIsolationVersion).toBe(1));
+        expect(cache.resetCursor).toHaveBeenCalledOnce();
+        expect(registrations).toBe(2); client.shutdown();
+    });
+
+    it('drains an older unsupported sync page before persisting the ready cursor reset', async () => {
+        let release!: (value: unknown) => void, syncs = 0, cursor = 5n;
+        const firstPage = new Promise(resolve => { release = resolve });
+        const cache = { read: () => ({ cursor }), resetCursor: vi.fn(() => { cursor = 0n }),
+            applySync: vi.fn((value: any) => { cursor = BigInt(value.nextSeq); return { nextSeq: cursor, acknowledgements: [] } }), markAcknowledged: vi.fn() };
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 1,
+                ...(data.contextIsolationVersion === 1 ? { contextIsolationVersion: 1, syncFromStart: true } : {}) } };
+            if (event === 'automation-sync') return ++syncs === 1 ? firstPage : { ok: true, value: { serverTime: 10, nextSeq: '0', changes: [] } };
+            if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
+            return { result: 'success' };
+        });
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        client.setAutomationKey({ version: 1, publicKey: new Uint8Array(32).fill(7), secretKey: new Uint8Array(32).fill(8), registeredKeyVersion: 1 }, vi.fn());
+        client.setServerAutomationCache(cache as any); client.connect(); socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(syncs).toBe(1)); mockSocket.connected = true;
+        client.setAutomationContextIsolationReady(true);
+        await Promise.resolve(); await Promise.resolve();
+        expect(cache.resetCursor).not.toHaveBeenCalled();
+        release({ ok: true, value: { serverTime: 10, nextSeq: '5', changes: [] } });
+        await vi.waitFor(() => expect(syncs).toBe(2));
+        expect(cache.applySync.mock.invocationCallOrder[0]).toBeLessThan(cache.resetCursor.mock.invocationCallOrder[0]);
+        expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-sync', { afterSeq: '0', limit: 500, payloadVersions: [1, 4, 6] });
+        client.shutdown();
+    });
+
+    it('does not restore withdrawn readiness after its registration waits on an older sync page', async () => {
+        let release!: (value: unknown) => void, syncs = 0;
+        const firstPage = new Promise(resolve => { release = resolve });
+        const cache = { read: () => ({ cursor: 5n }), resetCursor: vi.fn(),
+            applySync: vi.fn(() => ({ nextSeq: 5n, acknowledgements: [] })), markAcknowledged: vi.fn() };
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 1,
+                ...(data.contextIsolationVersion === 1 ? { contextIsolationVersion: 1, syncFromStart: true } : {}) } };
+            if (event === 'automation-sync') return ++syncs === 1 ? firstPage : { ok: true, value: { serverTime: 10, nextSeq: '5', changes: [] } };
+            if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
+            return { result: 'success' };
+        });
+        const machine = makeMachine(), client = new ApiMachineClient('fake-token', machine);
+        client.setAutomationKey({ version: 1, publicKey: new Uint8Array(32).fill(7), secretKey: new Uint8Array(32).fill(8), registeredKeyVersion: 1 }, vi.fn());
+        client.setServerAutomationCache(cache as any); client.connect(); socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(syncs).toBe(1)); mockSocket.connected = true;
+        client.setAutomationContextIsolationReady(true);
+        await vi.waitFor(() => expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-key-register', expect.objectContaining({ contextIsolationVersion: 1 })));
+        client.setAutomationContextIsolationReady(false);
+        release({ ok: true, value: { serverTime: 10, nextSeq: '5', changes: [] } });
+        await vi.waitFor(() => expect(syncs).toBeGreaterThan(1));
+        expect(cache.resetCursor).not.toHaveBeenCalled();
+        expect(mockSocket.emitWithAck).not.toHaveBeenCalledWith('automation-sync', expect.objectContaining({ payloadVersions: [1, 4, 6] }));
+        await vi.waitFor(() => expect(machine.metadata?.automationSupport?.contextIsolationVersion).toBe(0));
+        client.shutdown();
+    });
+
+    it.each(['automation-sync-ack', 'machine-update-metadata'])('keeps readiness withdrawal deliverable when an earlier %s ACK is lost', async blockedEvent => {
+        let blocked = false, synced = false;
+        const registrations: number[] = [];
+        const cache = { read: () => ({ cursor: 0n }), resetCursor: vi.fn(),
+            applySync: () => ({ nextSeq: 1n, acknowledgements: [{ automationId: 'a1', revision: 1 }] }), markAcknowledged: vi.fn() };
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'automation-key-register') {
+                registrations.push(data.contextIsolationVersion);
+                return { ok: true, value: { keyVersion: 1, ...(data.contextIsolationVersion === 1 ? { contextIsolationVersion: 1, syncFromStart: true } : {}) } };
+            }
+            if (event === blockedEvent) { blocked = true; return new Promise(() => {}) }
+            if (event === 'automation-sync') { synced = true; return { ok: true, value: { serverTime: 10, nextSeq: '1', changes: [] } } }
+            if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
+            return { ok: true, value: { acknowledged: 1 } };
+        });
+        const bounded = vi.fn(async (event: string, data: unknown) => {
+            if (event === 'automation-sync-ack' && blockedEvent === event) { blocked = true; throw new Error('operation has timed out') }
+            return mockSocket.emitWithAck(event, data);
+        });
+        mockSocket.timeout.mockReturnValue({ emitWithAck: bounded });
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        client.setAutomationKey({ version: 1, publicKey: new Uint8Array(32).fill(7), secretKey: new Uint8Array(32).fill(8), registeredKeyVersion: 1 }, vi.fn());
+        client.setServerAutomationCache(cache as any); client.setAutomationContextIsolationReady(true);
+        client.connect(); socketHandlers.connect![0]!(); mockSocket.connected = true;
+        await vi.waitFor(() => expect(blocked && synced).toBe(true));
+        client.setAutomationContextIsolationReady(false);
+        await vi.waitFor(() => expect(registrations.at(-1)).toBe(0));
+        if (blockedEvent === 'automation-sync-ack') expect(bounded).toHaveBeenCalledWith(blockedEvent, { items: [{ automationId: 'a1', revision: 1 }] });
         client.shutdown();
     });
 

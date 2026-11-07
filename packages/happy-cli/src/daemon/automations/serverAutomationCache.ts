@@ -46,6 +46,7 @@ export type ServerAutomationPayload = AutomationPayload
 
 export interface ServerAutomationCache {
   read(): ServerAutomationCacheState
+  resetCursor?(): void
   applySync(value: unknown): { nextSeq: bigint; acknowledgements: Array<{ automationId: string; revision: number }> }
   markAcknowledged(items: Array<{ automationId: string; revision: number }>): void
   markCancelled?(items: Array<{ automationId: string; revision: number }>): void
@@ -197,6 +198,10 @@ export function createServerAutomationCache(options: { filePath: string; now?: (
   const isolated = options.format === 'isolated-v6'
   return {
     read: () => readState(options.filePath, isolated),
+    resetCursor() {
+      const current = readState(options.filePath, isolated)
+      persist(options.filePath, { ...current, cursor: 0n }, isolated)
+    },
     applySync(value) {
       const response = object(value)
       const serverTime = timestamp(response.serverTime)

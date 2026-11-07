@@ -170,6 +170,7 @@ export const MachineMetadataSchema = z.object({
     sessionFollowup: z.literal(true).optional(),
     conversation: z.literal(true).optional(),
     protocolVersion: z.number().int().min(1).optional(),
+    contextIsolationVersion: z.union([z.literal(0), z.literal(1)]).optional(),
     /** false: 스크립트 조건·GitHub 트리거처럼 Job 밖 명령이 필요한 자동화는 실행하지 않는다(Windows 정식 빌드). */
     hostCommands: z.boolean().optional(),
     /**

@@ -189,7 +189,7 @@ export class SessionWriteScopeFixture {
             TMPDIR: this.temporaryDirectory, LANG: 'en_US.UTF-8', HAPPY_HOME_DIR: this.happyHome,
             HAPPY_SERVER_URL: this.serverUrl, HAPPY_WEBAPP_URL: this.serverUrl, HAPPY_DISABLE_CAFFEINATE: '1',
             HAPPY_DAEMON_HEARTBEAT_INTERVAL: '500',
-            ...(this.options.automationContextHost ? { HAPPY_CONTEXT_ISOLATION_HOST: '1', HAPPY_WORKSPACE_ROOT: this.root } : {}),
+            ...(this.options.automationContextHost ? { HAPPY_WORKSPACE_ROOT: this.root } : {}),
             ...(this.options.automationContextHost && this.options.automationStudioUrl ? { HAPPY_APLUS_STUDIO_ORIGIN: this.options.automationStudioUrl } : {}),
             ...(this.options.automationStudioUrl ? { HAPPY_APLUS_MCP_CONFIG_URL: `${this.options.automationStudioUrl}/api/me/mcp-config` } : {}),
             CODEX_HOME: codexHome, OPENAI_API_KEY: 'fixture-local-only', NO_PROXY: process.platform === 'linux' ? '' : '127.0.0.1,localhost',
