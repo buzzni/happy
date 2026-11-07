@@ -194,6 +194,14 @@ export async function runScheduledTaskTool(raw: unknown, session: { sessionId: s
     if (projectId ? claim.projectId !== projectId || claim.personalChatId !== null : claim.projectId !== null || !claim.personalChatId) throw new Error();
     scope = projectId ?? `chat:${claim.personalChatId}`;
   } catch { throw new Error('SCHEDULED_TASK_CHAT_REQUIRED'); }
+  const request = async (request: ScheduledManagementRequest) => {
+      const response = await fetch(new URL('/api/automation/scheduled-management', url), { method: 'POST', redirect: 'error',
+        headers: { Authorization: `Bearer ${token}`, 'X-Aplus-Caller-Grant': callerGrant!, 'X-Saycode-Scheduled-Task-Payloads': '4,6', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ machineId, sessionId: session.sessionId, ...(projectId ? { projectId, directory: session.directory } : {}), request }), signal: AbortSignal.timeout(15000) });
+      const value = await response.json() as { error?: unknown };
+      if (!response.ok) throw new Error(typeof value.error === 'string' && /^[A-Z0-9_-]{1,100}$/.test(value.error) ? value.error : 'SCHEDULED_TASK_UNAVAILABLE');
+      return value;
+  };
   const tools = createScheduledTaskTools({ projectId: scope, sessionId: session.sessionId, directory: session.directory, machineId,
     ...(credentials ? { viewerKeyPair: credentials.contentKeyPair } : { viewerPublicKey: encryption!.publicKey, machineKey: machineKey! }),
     ensureExecutionSupported: async (payloadVersion = 4) => {
@@ -216,14 +224,7 @@ export async function runScheduledTaskTool(raw: unknown, session: { sessionId: s
           || key.keyVersion !== machineKey.registeredKeyVersion) throw new Error('SCHEDULED_TASK_MACHINE_KEY_MISMATCH');
       }
     },
-    request: async request => {
-      const response = await fetch(new URL('/api/automation/scheduled-management', url), { method: 'POST', redirect: 'error',
-        headers: { Authorization: `Bearer ${token}`, 'X-Aplus-Caller-Grant': callerGrant!, 'X-Saycode-Scheduled-Task-Payloads': '4,6', 'Content-Type': 'application/json' },
-        body: JSON.stringify({ machineId, sessionId: session.sessionId, ...(projectId ? { projectId, directory: session.directory } : {}), request }), signal: AbortSignal.timeout(15000) });
-      const value = await response.json() as { error?: unknown };
-      if (!response.ok) throw new Error(typeof value.error === 'string' && /^[A-Z0-9_-]{1,100}$/.test(value.error) ? value.error : 'SCHEDULED_TASK_UNAVAILABLE');
-      return value;
-    },
+    request,
   });
   return tools.execute(raw);
 }
