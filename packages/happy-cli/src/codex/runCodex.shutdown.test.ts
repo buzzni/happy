@@ -30,6 +30,10 @@ const fixture = vi.hoisted(() => ({
     reconnect: vi.fn(async () => ({})),
     prepareSideAppServer: vi.fn(async (): Promise<import('./codexOffTurnTitle').CodexCommandLaunch | null> => null),
     sideConnection: null as import('./codexSideQuestion').CodexSideConnection | null,
+    /** Start with the server unreachable: the runner gets the offline stub, `session` arrives on reconnect. */
+    offline: false,
+    reconnectOffline: null as null | (() => Promise<unknown>),
+    abortTurn: vi.fn(async () => ({ forcedRestart: false })),
     session: {
         sendProviderUsageEvent: vi.fn(),
         tracksShutdownStorage: true,
@@ -61,8 +65,18 @@ vi.mock('@/utils/MessageQueue2', async (original) => {
 });
 vi.mock('@/utils/broadKillShims', () => ({ installBroadKillShims: vi.fn() }));
 vi.mock('@/persistence', async (original) => ({ ...await original<typeof import('@/persistence')>(), readSettings: vi.fn(async () => ({ machineId: 'machine' })) }));
-vi.mock('@/api/api', () => ({ ApiClient: { create: vi.fn(async () => ({ getOrCreateMachine: vi.fn(), getOrCreateSession: fixture.getOrCreateSession })) } }));
-vi.mock('@/utils/setupOfflineReconnection', () => ({ setupOfflineReconnection: () => ({ session: fixture.session }) }));
+vi.mock('@/api/api', () => ({ ApiClient: { create: vi.fn(async () => ({ getOrCreateMachine: vi.fn(), getOrCreateSession: fixture.getOrCreateSession, sessionSyncClient: () => fixture.session })) } }));
+vi.mock('@/utils/setupOfflineReconnection', async (original) => {
+    const actual = await original<typeof import('@/utils/setupOfflineReconnection')>();
+    return { setupOfflineReconnection: (opts: Parameters<typeof actual.setupOfflineReconnection>[0]) => fixture.offline ? actual.setupOfflineReconnection(opts) : { session: fixture.session } };
+});
+vi.mock('@/utils/serverConnectionErrors', async (original) => ({
+    ...await original<typeof import('@/utils/serverConnectionErrors')>(),
+    startOfflineReconnection: (config: { onReconnected: () => Promise<unknown> }) => {
+        fixture.reconnectOffline = config.onReconnected;
+        return { cancel: vi.fn(), getSession: () => null, isReconnected: () => false };
+    },
+}));
 vi.mock('@/daemon/run', () => ({ initialMachineMetadata: {} }));
 vi.mock('@/daemon/controlClient', () => ({ notifyDaemonSessionStarted: vi.fn(async () => ({})) }));
 vi.mock('@/ui/auth', () => ({ authAndSetupMachineIfNeeded: vi.fn(async () => ({ credentials: { token: 'test-token' } })) }));
@@ -117,7 +131,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     startThread = async (options: unknown) => { fixture.startThread(options); this.threadId = 'thread'; return { threadId: 'thread', model: 'test' }; };
     readThread = (options: { threadId: string; includeTurns: boolean }) => fixture.readThread(options);
     abortPreparedTurn = vi.fn();
-    abortTurnWithFallback = async () => ({ forcedRestart: false });
+    abortTurnWithFallback = fixture.abortTurn;
     sendTurnAndWait = async (prompt: string, options?: {
         onCompleted?: (turnId: string, thread: { id: string; path: string } | null) => void;
         onCompletionObservationSettled?: () => void;
@@ -160,6 +174,7 @@ afterEach(() => {
 afterEach(() => { process.exitCode = originalExitCode; vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.clearAllMocks(); fixture.onSend = null; fixture.onInterrupt = null; fixture.onSteer = null; fixture.onConnect = null; fixture.onResumeThread = null; fixture.steerText = ''; fixture.omitCompletionObservers = false; fixture.completionThread = { id: 'thread', path: '/tmp/native-rollout.jsonl' }; fixture.readThread.mockReset().mockResolvedValue({ thread: { id: 'thread', path: '/tmp/native-rollout.jsonl' } }); fixture.gate = null; fixture.events = []; fixture.session.freezeInboundMessagesForShutdown.mockReturnValue(true); });
 afterEach(() => { fixture.recoverMcp.mockReset().mockResolvedValue({ status: 'ready', affectedServers: [] }); fixture.readMcpStatuses.mockReset().mockResolvedValue([]); });
 afterEach(() => { fixture.sideConnection = null; fixture.prepareSideAppServer.mockReset().mockResolvedValue(null); });
+afterEach(() => { fixture.offline = false; fixture.reconnectOffline = null; });
 async function start(prompt = 'Test input', confirmed = false, review?: import('@/memory/lessonReviewWorker').LessonReviewWorker, standaloneLaunch?: StandaloneLaunchBootstrap, resumeThreadId?: string, reconnect?: import('@/daemon/reconnectSessionEnv').ReconnectSessionClientSnapshot, launch?: { args?: string[]; modelSeed?: string }) {
     for (const key of Object.keys(process.env)) {
         if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_)/.test(key)) vi.stubEnv(key, undefined);
@@ -770,6 +785,43 @@ describe('Codex runtime producer bookkeeping', () => {
         await start();
         expect(blockers).toEqual(['producer-busy', 'input-undelivered']);
     });
+});
+describe('Codex offline start', () => {
+    // An offline start has no runtime gate and never installs a dispatch handler, so drop the last test's.
+    beforeEach(() => { fixture.markDispatched = null; });
+    it('answers app messages, abort and kill on the real session after reconnecting', async () => {
+        fixture.offline = true;
+        fixture.getOrCreateSession.mockResolvedValueOnce(null as never);
+        const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+        const handler = (name: string) => fixture.session.rpcHandlerManager.registerHandler.mock.calls.find(([key]) => key === name)?.[1] as ((input?: unknown) => Promise<unknown>) | undefined;
+        fixture.onSend = async () => { await handler('abort')!(); };
+        for (const key of Object.keys(process.env)) {
+            if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_)/.test(key)) vi.stubEnv(key, undefined);
+        }
+        // Automation run-once needs a server, so this runner waits for input until killed.
+        const { runCodex } = await import('./runCodex');
+        const running = runCodex({ principal: { kind: 'account', credentials: { token: 'test-token' } as never }, noSandbox: true });
+        await vi.waitFor(() => expect(vi.mocked(logger.debug).mock.calls.some(([line]) => String(line).includes('Waiting for messages'))).toBe(true));
+        expect(fixture.session.onUserMessage).not.toHaveBeenCalled();
+
+        await fixture.reconnectOffline!();
+        // The swap still re-attaches the input queue, steer and the archive listener (R4-d).
+        expect(fixture.session.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', expect.any(Boolean));
+        expect(fixture.session.setInputSteerAvailable).toHaveBeenCalledWith(true);
+        expect(fixture.session.on).toHaveBeenCalledWith('archived', expect.any(Function));
+
+        const receive = fixture.session.onUserMessage.mock.calls[0][0] as (input: unknown) => Promise<void>;
+        await receive({ content: { text: 'After reconnect' } });
+        await vi.waitFor(() => expect(fixture.abortTurn).toHaveBeenCalledOnce());
+        expect(fixture.send).toHaveBeenCalledWith('After reconnect', expect.anything());
+
+        await handler('killSession')!();
+        await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+        expect(fixture.session.sendSessionDeath).toHaveBeenCalled();
+        // process.exit is stubbed, so let the loop end on its own.
+        fixture.closeQueue?.();
+        await running;
+    }, 20_000);
 });
 describe('Codex sub-agent list metadata (codexSubagentTasks)', () => {
     type MetadataUpdate = (metadata: Record<string, unknown>) => Record<string, unknown>;
