@@ -4,6 +4,9 @@ const services = vi.hoisted(() => ({
     ackAutomationSync: vi.fn(),
     claimAutomationRun: vi.fn(),
     heartbeatAutomationRun: vi.fn(),
+    MAX_MISSED_RUN_COUNT: 1000,
+    MISSED_RUN_FAILURE_CODES: ['MISSED_OFFLINE', 'MISSED_COLLAPSED'],
+    recordMissedAutomationRuns: vi.fn(),
     registerAutomationMachineKey: vi.fn(),
     reportAutomationRun: vi.fn(),
     startAutomationRun: vi.fn(),
@@ -60,7 +63,7 @@ describe('automationSocketHandler', () => {
         automationSocketHandler('account-1', 'machine-1', socket as never);
 
         expect([...handlers.keys()].sort()).toEqual([
-            'automation-claim', 'automation-conversation-deliver', 'automation-key-register', 'automation-run-heartbeat',
+            'automation-claim', 'automation-conversation-deliver', 'automation-key-register', 'automation-missed-record', 'automation-run-heartbeat',
             'automation-run-report', 'automation-run-start', 'automation-sync', 'automation-sync-ack',
             'session-followup-claim', 'session-followup-deliver', 'session-followup-evaluate',
             'session-followup-sync',
@@ -415,6 +418,73 @@ describe('automationSocketHandler', () => {
         await handlers.get('automation-run-report')!(report, vi.fn());
         expect(services.emitProjectAutomationUpdate).not.toHaveBeenCalled();
         expect(services.emitAutomationUpdate).not.toHaveBeenCalled();
+    });
+
+    it('records a missed gap for the socket machine, scoped to its project, silent on a replay', async () => {
+        const handlers = bind();
+        services.recordMissedAutomationRuns.mockResolvedValue({
+            ok: true, value: { runId: 'run-9', idempotent: false, countRaised: false, projectId: 'project-7' },
+        });
+        const gap = {
+            automationId: 'automation-1', generation: 3, firstMissedAt: 1000, missedCount: 8,
+            failureCode: 'MISSED_OFFLINE', machineId: 'foreign', projectId: 'attacker-supplied-project',
+        };
+        const callback = vi.fn();
+
+        await handlers.get('automation-missed-record')!(gap, callback);
+        expect(services.recordMissedAutomationRuns).toHaveBeenCalledWith({}, 'account-1', 'machine-1', {
+            automationId: 'automation-1', generation: 3, firstMissedAt: new Date(1000), missedCount: 8,
+            failureCode: 'MISSED_OFFLINE',
+        });
+        expect(callback).toHaveBeenCalledWith({ ok: true, value: { runId: 'run-9', idempotent: false, countRaised: false, projectId: 'project-7' } });
+        expect(services.emitProjectAutomationUpdate).toHaveBeenCalledWith(
+            'project-7',
+            { projectId: 'project-7', automationId: 'automation-1', reason: 'run' },
+            'account-1',
+        );
+
+        services.emitProjectAutomationUpdate.mockClear();
+        services.recordMissedAutomationRuns.mockResolvedValue({
+            ok: true, value: { runId: 'run-9', idempotent: true, countRaised: false, projectId: 'project-7' },
+        });
+        await handlers.get('automation-missed-record')!(gap, vi.fn());
+        expect(services.emitProjectAutomationUpdate).not.toHaveBeenCalled();
+
+        // A replay that raised the stored count changed what the history shows.
+        services.recordMissedAutomationRuns.mockResolvedValue({
+            ok: true, value: { runId: 'run-9', idempotent: true, countRaised: true, projectId: 'project-7' },
+        });
+        await handlers.get('automation-missed-record')!(gap, vi.fn());
+        expect(services.emitProjectAutomationUpdate).toHaveBeenCalledTimes(1);
+    });
+
+    it('answers record-failed, not invalid-input, when storing the gap fails so the daemon retries', async () => {
+        const handlers = bind();
+        services.recordMissedAutomationRuns.mockRejectedValue(new Error('connection terminated'));
+        const callback = vi.fn();
+        await handlers.get('automation-missed-record')!({
+            automationId: 'automation-1', generation: 3, firstMissedAt: 1000, missedCount: 8, failureCode: 'MISSED_OFFLINE',
+        }, callback);
+        expect(callback).toHaveBeenCalledWith({ ok: false, error: 'record-failed' });
+        expect(services.emitProjectAutomationUpdate).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        { failureCode: 'SOMETHING_ELSE' },
+        { missedCount: 0 },
+        { missedCount: 1001 },
+        { firstMissedAt: 'yesterday' },
+        { firstMissedAt: 8_640_000_000_000_001 },
+        { generation: 0 },
+    ])('rejects a malformed missed gap %o before touching the database', async (patch) => {
+        const handlers = bind();
+        const callback = vi.fn();
+        await handlers.get('automation-missed-record')!({
+            automationId: 'automation-1', generation: 3, firstMissedAt: 1000, missedCount: 8, failureCode: 'MISSED_OFFLINE',
+            ...patch,
+        }, callback);
+        expect(callback).toHaveBeenCalledWith({ ok: false, error: 'invalid-input' });
+        expect(services.recordMissedAutomationRuns).not.toHaveBeenCalled();
     });
 
     it('keeps the machine-key rotation account-wide', async () => {
