@@ -6,7 +6,7 @@ import { SessionLaunchControl } from '../sessionDrain/sessionLaunchControl';
 import type { StandaloneLaunchBootstrap } from '../daemon/standaloneLaunchProtocol';
 import { RuntimeProducerGate } from '../sessionDrain/runtimeProducerGate';
 import { createLessonProposalTurn } from '@/utils/lessonProposalTurn';
-import { CodexAuthRecovery } from './codexAuthRecovery';
+import { CodexAuthRecovery, describeCodexAuthRecoveryFailure } from './codexAuthRecovery';
 import { render } from "ink";
 import {
     createManagedGracefulStop,
@@ -2557,6 +2557,9 @@ export async function runCodex(opts: {
 
                 await measure('auth', () => authRecovery.beginTurn());
                 if (shouldExit) { authRecovery.endTurn(); break; }
+                // A blocked session recovers before /clear is decided; otherwise a recovered one sends "/clear" to Codex.
+                const clearRecoveryError = shouldHandleCodexClear(message) && authRecovery.status().state === 'failed'
+                    ? await Promise.resolve(measure('auth', () => authRecovery.prepareTurn())).then(() => undefined, (error: unknown) => error) : undefined;
                 if (shouldHandleCodexClear(message) && authRecovery.status().state !== 'failed') {
                     latency?.finish('control');
                     authRecovery.endTurn();
@@ -2602,7 +2605,9 @@ export async function runCodex(opts: {
 
                 let routingApplied = false;
                 try {
-                    authRecovery.assertReady();
+                    if (clearRecoveryError) throw clearRecoveryError;
+                    // Only a blocked session waits here; an extra await would let a kill land mid-preparation.
+                    if (authRecovery.status().state === 'failed') await measure('auth', () => authRecovery.prepareTurn());
                     if (checkpointComposition.completeTurn) {
                         // specs/linux-checkpoint-enforcement-backend R4 — open the checkpoint turn (and
                         // materialize its workspace) before codex is wrapped and spawned. On Linux bwrap
@@ -3030,7 +3035,7 @@ export async function runCodex(opts: {
                     // would have produced from a real turn_aborted, reusing its guard logic
                     // (harmless no-op if currentTurnId is already null).
                     logger.warn('Error in codex session:', error);
-                    const failureMessage = describeCheckpointFailure(error) ?? 'Process exited unexpectedly';
+                    const failureMessage = describeCheckpointFailure(error) ?? describeCodexAuthRecoveryFailure(error) ?? 'Process exited unexpectedly';
                     messageBuffer.addMessage(failureMessage, 'status');
                     session.sendSessionEvent({ type: 'message', message: failureMessage });
                     // Carries the correlation in and reads it back, like the normal event path. A
