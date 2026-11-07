@@ -13,6 +13,7 @@ const fixture = vi.hoisted(() => ({
     onSteer: null as null | (() => Promise<void>),
     proposal: { name: 'Verified recovery' },
     statusProbeFails: false,
+    authBlockedReason: null as null | 'limit-reached',
     send: vi.fn(),
     startThread: vi.fn(),
     readThread: vi.fn(async (_options?: { threadId: string; includeTurns: boolean }) => ({ thread: { id: 'thread', path: '/tmp/native-rollout.jsonl' } })),
@@ -45,6 +46,15 @@ vi.mock('@/utils/MessageQueue2', async (original) => {
                 ...(fixture.channelRequestId ? { channelRequestId: fixture.channelRequestId } : {}),
             } : batch;
         }
+    } };
+});
+vi.mock('@/codex/codexAuthRecovery', async (original) => {
+    const actual = await original<typeof import('@/codex/codexAuthRecovery')>();
+    return { ...actual, CodexAuthRecovery: class extends actual.CodexAuthRecovery {
+        prepareTurn = async () => {
+            if (fixture.authBlockedReason) throw new actual.CodexAuthRecoveryError(fixture.authBlockedReason);
+            return super.prepareTurn();
+        };
     } };
 });
 vi.mock('@/utils/broadKillShims', () => ({ installBroadKillShims: vi.fn() }));
@@ -108,7 +118,7 @@ afterEach(() => {
     }
     fixture.readThread.mockReset().mockResolvedValue({ thread: { id: 'thread', path: '/tmp/native-rollout.jsonl' } });
     fixture.completedTurnId = 'native-completed-turn';
-    fixture.requestIds = undefined; fixture.channelRequestId = undefined; vi.unstubAllEnvs(); vi.restoreAllMocks(); vi.clearAllMocks(); fixture.submit = null; fixture.onSend = null; fixture.onSteer = null; fixture.steerText = ''; fixture.statusProbeFails = false; fixture.completedThread = null; fixture.session.sendTurnLatency.mockReset(); });
+    fixture.requestIds = undefined; fixture.channelRequestId = undefined; vi.unstubAllEnvs(); vi.restoreAllMocks(); vi.clearAllMocks(); fixture.submit = null; fixture.onSend = null; fixture.onSteer = null; fixture.steerText = ''; fixture.statusProbeFails = false; fixture.authBlockedReason = null; fixture.completedThread = null; fixture.session.sendTurnLatency.mockReset(); });
 
 // specs/checkpoint-local-history — Codex keeps its process across turns and records the folder
 // before dispatch and after the turn, including a turn the provider failed.
@@ -586,6 +596,25 @@ describe('Codex foreground lesson proposal wiring', () => {
         expect(review.reviewFinishedTurn).toHaveBeenCalledOnce();
         expect(fixture.session.sendSessionEvent.mock.calls.map(([event]) => event))
             .not.toContainEqual({ type: 'message', message: 'Process exited unexpectedly' });
+    });
+
+    it('does not dispatch into a session a failed sign-in or limit recovery blocked, and says why', async () => {
+        // A blocked session used to report every new message as a process crash, which also
+        // hid the recovery card Desktop shows for sign-in and usage limit failures.
+        fixture.authBlockedReason = 'limit-reached';
+        for (const key of Object.keys(process.env)) {
+            if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_)/.test(key)) vi.stubEnv(key, undefined);
+        }
+        vi.stubEnv('HAPPY_AUTOMATION_RUN_ONCE', '1');
+        vi.stubEnv('HAPPY_INITIAL_PROMPT', 'Summarize the memo list');
+        const { CODEX_AUTH_BLOCKED_NOTICES } = await import('@/codex/codexAuthRecovery');
+        const { runCodex } = await import('./runCodex');
+        await runCodex({ principal: { kind: 'account', credentials: { token: 'test-token' } as never },
+            noSandbox: true, lessons: { turn: null, review: null, sessionKind: 'foreground' } });
+        expect(fixture.send).not.toHaveBeenCalled();
+        const events = fixture.session.sendSessionEvent.mock.calls.map(([event]) => event);
+        expect(events).toContainEqual({ type: 'message', message: CODEX_AUTH_BLOCKED_NOTICES.limitReached });
+        expect(events).not.toContainEqual({ type: 'message', message: 'Process exited unexpectedly' });
     });
 });
 

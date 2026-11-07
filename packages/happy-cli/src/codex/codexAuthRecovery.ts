@@ -8,6 +8,23 @@ export class CodexAuthRecoveryError extends Error {
     }
 }
 
+type RecoveryFailureReason = CodexAuthRecoveryError['reason'];
+
+/** Turn notices for a blocked session. Desktop translates these exact texts (src/domain/runtimeEventMessages.ts). */
+export const CODEX_AUTH_BLOCKED_NOTICES = {
+    limitReached: 'Codex usage limit is still reached, so this message was not sent. Send it again after the limit resets, or switch this conversation to another AI.',
+    signInRequired: 'Codex is not signed in on this machine, so this message was not sent. Sign in to Codex again, then send the message again.',
+    reconnectFailed: 'Codex could not reconnect this conversation after a sign-in or usage limit error, so this message was not sent. Check the Codex connection, then send the message again.',
+} as const;
+
+/** A blocked turn names its reason; the generic process-exit notice would hide the recovery the user needs. */
+export function describeCodexAuthRecoveryFailure(error: unknown): string | null {
+    if (!(error instanceof CodexAuthRecoveryError)) return null;
+    if (error.reason === 'limit-reached') return CODEX_AUTH_BLOCKED_NOTICES.limitReached;
+    if (error.reason === 'authentication-required') return CODEX_AUTH_BLOCKED_NOTICES.signInRequired;
+    return CODEX_AUTH_BLOCKED_NOTICES.reconnectFailed;
+}
+
 type RecoveryClient = {
     readonly authRecoverySource: CodexAuthSource;
     readonly authRecoveryBusy: boolean;
@@ -29,6 +46,7 @@ export class CodexAuthRecovery {
     private generation = 0;
     private turnBusy = false;
     private blocked = false;
+    private lastFailure: RecoveryFailureReason | null = null;
     private inFlight: Promise<RecoveryResult> | null = null;
     private operationId: string | null = null;
     private last: { operationId: string; result: RecoveryResult } | null = null;
@@ -51,6 +69,24 @@ export class CodexAuthRecovery {
     endTurn(): void { this.turnBusy = false; }
     assertReady(): void {
         if (this.blocked) throw new Error('Codex authentication recovery is required before continuing this conversation');
+    }
+
+    /**
+     * A message sent into a session a failed recovery left blocked runs the same transaction once
+     * before dispatch. Only that new message goes out, on the resumed thread; nothing is replayed.
+     */
+    async prepareTurn(): Promise<void> {
+        if (!this.blocked) return;
+        if (!this.status().canRecover || this.client.authRecoveryBusy) throw new CodexAuthRecoveryError(this.lastFailure ?? 'restart-failed');
+        this.generation++;
+        try {
+            await this.client.reconnectForAuth();
+            this.blocked = false;
+            this.lastFailure = null;
+        } catch (error) {
+            this.lastFailure = error instanceof CodexAuthRecoveryError ? error.reason : 'restart-failed';
+            throw new CodexAuthRecoveryError(this.lastFailure);
+        }
     }
 
     recover(params: Record<string, unknown>): Promise<RecoveryResult> {
@@ -76,10 +112,12 @@ export class CodexAuthRecovery {
             try {
                 const account = await this.client.reconnectForAuth();
                 this.blocked = false;
+                this.lastFailure = null;
                 return { ...result('ready'), account };
             } catch (error) {
                 // Provider errors may contain credentials. Only our bounded codes cross the RPC.
-                return result('failed', error instanceof CodexAuthRecoveryError ? error.reason : 'restart-failed');
+                this.lastFailure = error instanceof CodexAuthRecoveryError ? error.reason : 'restart-failed';
+                return result('failed', this.lastFailure);
             }
         }).then(outcome => {
             this.last = { operationId, result: outcome };

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { CodexAuthRecovery } from './codexAuthRecovery';
+import { CODEX_AUTH_BLOCKED_NOTICES, CodexAuthRecovery, CodexAuthRecoveryError, describeCodexAuthRecoveryFailure } from './codexAuthRecovery';
 
 function fixture(reconnect = vi.fn(async () => 'authenticated' as const)) {
     const client = { authRecoverySource: 'cli-login' as const, authRecoveryBusy: false, threadId: 'thread-a', reconnectForAuth: reconnect };
@@ -52,6 +52,40 @@ describe('CodexAuthRecovery session contract', () => {
         reconnect.mockResolvedValue('authenticated');
         expect((await recovery.recover({ ...request(), operationId: 'operation-2' })).status).toBe('ready');
         expect(() => recovery.assertReady()).not.toThrow();
+    });
+
+    it('retries the same recovery once when the next message arrives, dispatching only after it succeeds', async () => {
+        const { recovery, request, reconnect } = fixture(vi.fn(async () => { throw new CodexAuthRecoveryError('limit-reached'); }));
+        await recovery.recover(request());
+        await recovery.beginTurn();
+        await expect(recovery.prepareTurn()).rejects.toMatchObject({ reason: 'limit-reached' });
+        expect(reconnect).toHaveBeenCalledTimes(2);
+        expect(() => recovery.assertReady()).toThrow('Codex authentication recovery is required');
+        recovery.endTurn();
+
+        reconnect.mockResolvedValue('authenticated');
+        await recovery.beginTurn();
+        await recovery.prepareTurn();
+        expect(reconnect).toHaveBeenCalledTimes(3);
+        expect(() => recovery.assertReady()).not.toThrow();
+        expect(recovery.status()).toMatchObject({ state: 'idle', generation: 3 });
+        await recovery.prepareTurn();
+        expect(reconnect).toHaveBeenCalledTimes(3);
+    });
+
+    it('does not restart the provider for a turn while its approvals are still open', async () => {
+        const { recovery, request, reconnect, client } = fixture(vi.fn(async () => { throw new CodexAuthRecoveryError('authentication-required'); }));
+        await recovery.recover(request());
+        client.authRecoveryBusy = true;
+        await expect(recovery.prepareTurn()).rejects.toMatchObject({ reason: 'authentication-required' });
+        expect(reconnect).toHaveBeenCalledTimes(1);
+    });
+
+    it('names the blocking reason instead of a process crash', () => {
+        expect(describeCodexAuthRecoveryFailure(new CodexAuthRecoveryError('limit-reached'))).toBe(CODEX_AUTH_BLOCKED_NOTICES.limitReached);
+        expect(describeCodexAuthRecoveryFailure(new CodexAuthRecoveryError('authentication-required'))).toBe(CODEX_AUTH_BLOCKED_NOTICES.signInRequired);
+        expect(describeCodexAuthRecoveryFailure(new CodexAuthRecoveryError('resume-failed'))).toBe(CODEX_AUTH_BLOCKED_NOTICES.reconnectFailed);
+        expect(describeCodexAuthRecoveryFailure(new Error('spawn failed'))).toBeNull();
     });
 
     it('refuses stale runtime and generation, and running provider approvals', async () => {

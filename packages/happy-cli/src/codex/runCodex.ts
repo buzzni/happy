@@ -6,7 +6,7 @@ import { SessionLaunchControl } from '../sessionDrain/sessionLaunchControl';
 import type { StandaloneLaunchBootstrap } from '../daemon/standaloneLaunchProtocol';
 import { RuntimeProducerGate } from '../sessionDrain/runtimeProducerGate';
 import { createLessonProposalTurn } from '@/utils/lessonProposalTurn';
-import { CodexAuthRecovery } from './codexAuthRecovery';
+import { CodexAuthRecovery, describeCodexAuthRecoveryFailure } from './codexAuthRecovery';
 import { render } from "ink";
 import {
     createManagedGracefulStop,
@@ -2601,7 +2601,7 @@ export async function runCodex(opts: {
 
                 let routingApplied = false;
                 try {
-                    authRecovery.assertReady();
+                    await measure('auth', () => authRecovery.prepareTurn());
                     if (checkpointComposition.completeTurn) {
                         // specs/linux-checkpoint-enforcement-backend R4 — open the checkpoint turn (and
                         // materialize its workspace) before codex is wrapped and spawned. On Linux bwrap
@@ -3029,7 +3029,7 @@ export async function runCodex(opts: {
                     // would have produced from a real turn_aborted, reusing its guard logic
                     // (harmless no-op if currentTurnId is already null).
                     logger.warn('Error in codex session:', error);
-                    const failureMessage = describeCheckpointFailure(error) ?? 'Process exited unexpectedly';
+                    const failureMessage = describeCheckpointFailure(error) ?? describeCodexAuthRecoveryFailure(error) ?? 'Process exited unexpectedly';
                     messageBuffer.addMessage(failureMessage, 'status');
                     session.sendSessionEvent({ type: 'message', message: failureMessage });
                     // Carries the correlation in and reads it back, like the normal event path. A
