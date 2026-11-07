@@ -3166,7 +3166,8 @@ export async function startDaemon(): Promise<void> {
           }
         }
 
-        if (options?.model) {
+        // An ACP agent takes its model with each message; `opencode acp` has no --model flag.
+        if (options?.model && launch.args[0] !== 'acp') {
           launch.args.push('--model', options.model);
         }
         if (options?.permissionMode) {
@@ -3197,7 +3198,7 @@ export async function startDaemon(): Promise<void> {
           ? await stageInitialPromptEnvironment(options.automation.initialPrompt)
           : null;
 
-        const resumeAgent = launch.args[0] === 'codex' ? 'codex' : 'claude';
+        const resumeAgent = launch.args[0] === 'codex' ? 'codex' : launch.args[0] === 'acp' ? 'opencode' : 'claude';
         const inheritedResumeEnvironment = resolveInheritedSpawnEnvironment({
           agent: resumeAgent,
           env: process.env,

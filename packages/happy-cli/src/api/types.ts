@@ -634,6 +634,7 @@ export type Metadata = {
   machineId?: string,
   claudeSessionId?: string, // Claude Code session ID
   codexThreadId?: string, // Codex app-server thread ID
+  acpSessionId?: string, // ACP agent session ID (OpenCode), continued with session/resume on a daemon resume
   tools?: string[],
   slashCommands?: string[],
   /**

@@ -224,6 +224,17 @@ describe('buildResumeLaunch', () => {
         })).toThrow('Happy session session-4 has no Codex thread to resume (Codex never started a thread in it, or its context was reset). Start a new conversation.');
     });
 
+    // 2026-11-07: an ended OpenCode conversation refused every new message with this error.
+    it('reattaches an OpenCode session through the ACP runner', () => {
+        expect(buildResumeLaunch(
+            { id: 'session-5', active: true, metadata: { path: '/tmp/repo', flavor: 'opencode' } as never },
+            { startedBy: 'daemon', claudeStartingMode: 'remote' },
+        )).toEqual({
+            cwd: '/tmp/repo',
+            args: ['acp', 'opencode', '--started-by', 'daemon'],
+        });
+    });
+
     it('rejects unsupported flavors', () => {
         expect(() => buildResumeLaunch({
             id: 'session-3',
