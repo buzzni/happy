@@ -428,6 +428,19 @@ describe('createEnvelope', () => {
     });
   });
 
+  // Saycode specs/chat-tool-result-output R16 — the tool's returned text rides
+  // on the same tool-call-end. Optional: frames from older CLIs still parse,
+  // and createEnvelope must not drop the field in transit.
+  it('keeps an optional tool result on a tool-call-end envelope', () => {
+    const result = { text: 'Exit code 1\nhead…tail', isError: true, omitted: 42 };
+    const envelope = createEnvelope('agent', { t: 'tool-call-end', call: 'call-1', result }, { id: 'fixed-id', time: 12345 });
+    expect(envelope.ev).toEqual({ t: 'tool-call-end', call: 'call-1', result });
+    expect(sessionEnvelopeSchema.parse(JSON.parse(JSON.stringify(envelope))).ev).toEqual({ t: 'tool-call-end', call: 'call-1', result });
+    expect(sessionEventSchema.parse({ t: 'tool-call-end', call: 'call-1', result: { text: '' } })).toEqual({ t: 'tool-call-end', call: 'call-1', result: { text: '' } });
+    expect(sessionEventSchema.parse({ t: 'tool-call-end', call: 'call-1' })).toEqual({ t: 'tool-call-end', call: 'call-1' });
+    expect(sessionEventSchema.safeParse({ t: 'tool-call-end', call: 'call-1', result: { isError: true } }).success).toBe(false);
+  });
+
   it('validates role/event compatibility', () => {
     expect(() => createEnvelope('user', { t: 'service', text: 'internal event' })).toThrow();
   });

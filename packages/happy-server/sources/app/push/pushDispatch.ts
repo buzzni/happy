@@ -20,12 +20,38 @@
  *   - Clients send `app-state: { state: 'active' | 'background' }` via socket.
  *   - Old clients that never send it are treated as active (connected = present).
  *   - On disconnect the socket (and its state) disappears automatically.
+ *
+ * Every path returns a PushOutcome so the push-event route can report what
+ * actually happened — before this, a total push outage looked identical to a
+ * delivered push from the CLI, Desktop and logs alike.
  */
 
 import { db } from "@/storage/db";
 import { isUserActive } from "@/app/push/focusTracker";
 import { sendPushNotifications } from "@/app/push/pushSend";
-import { log } from "@/utils/log";
+import { pushOutcomesCounter } from "@/app/monitoring/metrics2";
+import { error, log } from "@/utils/log";
+
+/**
+ * Budget for one dispatch, from the presence check to the last Expo batch.
+ * The push-event route awaits it, so it stays inside the CLI's 15s timeout.
+ */
+const DISPATCH_BUDGET_MS = 10_000;
+
+/**
+ * What happened to one session-event push.
+ * - suppressed: a UI client is active, nothing was sent
+ * - no_tokens: the account has no registered device
+ * - sent / partial / failed: every / some / no token got an ok ticket;
+ *   failed also covers an exception anywhere in the dispatch
+ */
+export type PushOutcome = {
+    status: 'sent' | 'partial' | 'suppressed' | 'no_tokens' | 'failed';
+    tokens: number;
+    sent: number;
+    failed: number;
+    reason?: string;
+};
 import { isAutomationExecutionSessionId } from '@slopus/happy-wire';
 
 async function fetchTokensAndSend(params: {
@@ -35,7 +61,8 @@ async function fetchTokensAndSend(params: {
     body: string;
     data: Record<string, unknown>;
     channelId: string;
-}): Promise<void> {
+    deadline: number;
+}): Promise<PushOutcome> {
     // All push tokens are mobile — web/CLI never register Expo tokens.
     const tokens = await db.accountPushToken.findMany({
         where: { accountId: params.userId }
@@ -43,7 +70,7 @@ async function fetchTokensAndSend(params: {
 
     if (tokens.length === 0) {
         log({ module: 'push' }, `No push tokens for user ${params.userId} session ${params.sessionId} — skipped`);
-        return;
+        return { status: 'no_tokens', tokens: 0, sent: 0, failed: 0 };
     }
 
     const tickets = await sendPushNotifications(
@@ -54,7 +81,8 @@ async function fetchTokensAndSend(params: {
             data: params.data,
             sound: 'default' as const,
             channelId: params.channelId
-        }))
+        })),
+        { timeoutMs: Math.max(0, params.deadline - Date.now()) }
     );
 
     let okCount = 0;
@@ -67,29 +95,53 @@ async function fetchTokensAndSend(params: {
         }
         errors.push(ticket.details?.error || ticket.message || 'unknown');
         if (ticket.details?.error === 'DeviceNotRegistered') {
-            void db.accountPushToken.deleteMany({
+            // Prisma queries are lazy: without .then/.catch this never runs.
+            db.accountPushToken.deleteMany({
                 where: { id: tokens[i].id }
+            }).catch(deleteError => {
+                error({ module: 'push' }, `Failed to remove unregistered push token ${tokens[i].id}: ${deleteError}`);
             });
         }
     }
 
-    if (errors.length === 0) {
+    // A token without a ticket was never confirmed delivered.
+    const failedCount = tokens.length - okCount;
+    if (failedCount === 0) {
         log({ module: 'push' }, `Push sent for user ${params.userId} session ${params.sessionId}: ${okCount} token(s)`);
-    } else {
-        log({ module: 'push', level: 'warn' }, `Push partial for user ${params.userId} session ${params.sessionId}: ok=${okCount} errors=${JSON.stringify(errors)}`);
+        return { status: 'sent', tokens: tokens.length, sent: okCount, failed: 0 };
     }
+
+    // Distinct causes only — one Expo outage would otherwise repeat per token.
+    const reason = errors.length > 0 ? [...new Set(errors)].join(', ') : 'missing ticket';
+    const status = okCount === 0 ? 'failed' : 'partial';
+    error({ module: 'push' }, `Push ${status} for user ${params.userId} session ${params.sessionId}: ok=${okCount} failed=${failedCount} reason=${reason}`);
+    return { status, tokens: tokens.length, sent: okCount, failed: failedCount, reason };
 }
 
-export async function dispatchSessionEventPush(params: {
+type SessionEventPush = {
     userId: string;
     sessionId: string;
     title: string;
     body: string;
     data?: Record<string, unknown>;
-}): Promise<void> {
+};
+
+export async function dispatchSessionEventPush(params: SessionEventPush): Promise<PushOutcome> {
+    const outcome = await dispatch(params);
+    countPushOutcome(outcome);
+    return outcome;
+}
+
+/** Counts an outcome decided outside dispatch (e.g. a SILENT automation run). */
+export function countPushOutcome(outcome: PushOutcome): void {
+    pushOutcomesCounter.inc({ status: outcome.status });
+}
+
+async function dispatch(params: SessionEventPush): Promise<PushOutcome> {
     const { userId, title, body, data } = params;
     let sessionId = params.sessionId;
     let runId: string | undefined;
+    const deadline = Date.now() + DISPATCH_BUDGET_MS;
 
     try {
         if (isAutomationExecutionSessionId(sessionId)) {
@@ -102,7 +154,7 @@ export async function dispatchSessionEventPush(params: {
                 : null;
             if (!display || !run) {
                 log({ module: 'push', level: 'warn' }, `Automation attention target unavailable for user ${userId} execution ${sessionId}`);
-                return;
+                return { status: 'suppressed', tokens: 0, sent: 0, failed: 0, reason: 'automation-target-unavailable' };
             }
             // Attention belongs to the registered display chat, never a separate internal chat.
             sessionId = display.id;
@@ -111,21 +163,26 @@ export async function dispatchSessionEventPush(params: {
         try {
             if (await isUserActive(userId)) {
                 log({ module: 'push' }, `Suppressed session-event push for user ${userId} session ${sessionId}: user active`);
-                return;
+                return { status: 'suppressed', tokens: 0, sent: 0, failed: 0, reason: 'user-active' };
             }
         } catch (presenceError) {
-            log({ module: 'push', level: 'error' }, `Presence check failed, sending push anyway: ${presenceError}`);
+            error({ module: 'push' }, `Presence check failed, sending push anyway: ${presenceError}`);
         }
 
-        await fetchTokensAndSend({
+        return await fetchTokensAndSend({
             userId,
             sessionId,
             title,
             body,
             data: runId ? { ...(data ?? {}), sessionId, runId } : { sessionId, ...(data ?? {}) },
-            channelId: 'messages'
+            channelId: 'messages',
+            deadline
         });
-    } catch (error) {
-        log({ module: 'push', level: 'error' }, `Session-event push dispatch failed: ${error}`);
+    } catch (dispatchError) {
+        error({ module: 'push' }, `Session-event push dispatch failed: ${dispatchError}`);
+        // The error class only: messages (e.g. Prisma's) can carry DB hosts and
+        // query details, and this reason goes back in the HTTP response.
+        const reason = `exception:${dispatchError instanceof Error ? dispatchError.name : 'unknown'}`;
+        return { status: 'failed', tokens: 0, sent: 0, failed: 0, reason };
     }
 }

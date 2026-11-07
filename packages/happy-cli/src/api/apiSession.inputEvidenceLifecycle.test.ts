@@ -52,7 +52,15 @@ it.each([false, true])('preserves merge-base turns/consumers with evidence opt-i
                     ? original[field]?.map((prompt: string) => prompt === 'The previous request stopped because the organization Claude account reached its usage limit. The session now uses another account — continue from where you stopped.'
                         ? 'The previous request stopped because the organization Claude account was unavailable. The session now uses another account — continue from where you stopped.' : prompt)
                     : original[field];
-                expect.soft(actual?.[field], `${original.name}: ${field}`).toEqual(expected);
+                // Saycode specs/chat-tool-result-output R16 adds the optional tool-call-end `result`; the
+                // merge-base CLI never sent it. Compare everything else and check the added field's shape.
+                const received = field === 'wire' ? actual?.[field]?.map((event: any) => {
+                    if (event.ev?.t !== 'tool-call-end' || event.ev.result === undefined) return event;
+                    expect.soft(event.ev.result, `${original.name}: tool-call-end result`).toEqual({ text: expect.any(String) });
+                    const { result: _result, ...ev } = event.ev;
+                    return { ...event, ev };
+                }) : actual?.[field];
+                expect.soft(received, `${original.name}: ${field}`).toEqual(expected);
             }
             for (const revision of actual?.evidence ?? []) {
                 expect.soft(revision.inputEvidence).toMatchObject({ coverage: 'incomplete', inputs: [], inputCount: 0, terminal: true });

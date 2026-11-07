@@ -463,6 +463,8 @@ export async function runGemini(opts: {
 
   const handleKillSession = async (killOpts?: { stampArchive?: boolean }) => {
     logger.debug('[Gemini] Kill session requested - terminating process');
+    // A kill ends the turn the swap was waiting for; record it on the reconnected session, not the stub.
+    applyPendingSessionSwap();
     await handleAbort();
     logger.debug('[Gemini] Abort completed, proceeding with termination');
 

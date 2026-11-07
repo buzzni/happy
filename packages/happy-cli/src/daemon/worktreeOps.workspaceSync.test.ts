@@ -11,7 +11,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpath
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { GIT_CREDENTIAL_SEAL_KEY_LABEL, worktreeOpMethod, type WorktreeOp } from '@slopus/happy-wire';
 import { deriveServerRpcKey } from '@/api/encryption';
 import { sealForMachine } from '@/modules/common/machineSeal';
@@ -27,6 +27,26 @@ let repo: string;
 let bare: string;
 let other: string;
 let previousGlobalConfig: string | undefined;
+let previousPath: string | undefined;
+
+/** Keep URL resolution real; substitute local transport only after Git selects fetch/push. */
+function useLocalHttpsTransport() {
+    const executable = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+    const bin = join(root, 'bin');
+    mkdirSync(bin);
+    writeFileSync(join(root, 'gitconfig'), '');
+    writeFileSync(join(bin, 'git'), `#!${process.execPath}
+const { spawnSync } = require('node:child_process');
+const args = process.argv.slice(2);
+if (args.includes('fetch') || args.includes('push')) {
+    const index = args.indexOf(${JSON.stringify(ONLINE)});
+    if (index !== -1) args[index] = ${JSON.stringify(bare)};
+}
+const result = spawnSync(${JSON.stringify(executable)}, args, { stdio: 'inherit' });
+process.exit(result.status ?? 1);
+`, { mode: 0o700 });
+    process.env.PATH = `${bin}${delimiter}${process.env.PATH}`;
+}
 
 function git(cwd: string, ...args: string[]): string {
     return execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8' }).trim();
@@ -68,6 +88,7 @@ function pushOnline(file: string, content: string, branch = 'main') {
 }
 
 beforeEach(() => {
+    previousPath = process.env.PATH;
     root = realpathSync(mkdtempSync(join(tmpdir(), 'workspace-sync-')));
     home = realpathSync(mkdtempSync(join(tmpdir(), 'workspace-sync-home-')));
     bare = join(root, 'origin.git');
@@ -88,10 +109,104 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
     if (previousGlobalConfig === undefined) delete process.env.GIT_CONFIG_GLOBAL;
     else process.env.GIT_CONFIG_GLOBAL = previousGlobalConfig;
     rmSync(root, { recursive: true, force: true });
     rmSync(home, { recursive: true, force: true });
+});
+
+describe('workspace operations with an SSH origin and a sealed HTTPS credential', () => {
+    it.each(['remote-status', 'pull-remote'] as const)('%s uses the signed address for both branches without an SSH login', async (op) => {
+        useLocalHttpsTransport();
+        git(repo, 'push', '--quiet', bare, 'main:collab-x');
+        git(repo, 'switch', '--quiet', '-c', 'collab-x');
+        pushOnline('online.txt', 'o');
+        git(repo, 'remote', 'set-url', 'origin', 'git@github.com:acme/app.git');
+        const sshCalls = join(root, 'ssh-called');
+        const ssh = join(root, 'ssh.sh');
+        writeFileSync(ssh, `#!/bin/sh\necho called >> '${sshCalls}'\necho 'Permission denied (publickey)' >&2\nexit 255\n`, { mode: 0o700 });
+        git(repo, 'config', 'core.sshCommand', `sh '${ssh}'`);
+
+        const head = git(repo, 'rev-parse', 'HEAD');
+        const answer = await call(op, {
+            workspaceDir: repo, remoteUrl: ONLINE, branch: 'collab-x', baseBranch: 'main',
+            ...(op === 'pull-remote' ? { mode: 'merge', expectedHead: head, push: false } : {}),
+        }, true);
+
+        expect(answer, JSON.stringify(answer)).toMatchObject({ success: true });
+        if (op === 'remote-status') {
+            expect(answer.result).toMatchObject({ head, ahead: 0, behind: 0, baseBehind: 1 });
+            expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
+        } else {
+            expect(answer.result).toMatchObject({ status: 'merged', head: git(bare, 'rev-parse', 'main'), conflictCount: 0 });
+            expect(readFileSync(join(repo, 'online.txt'), 'utf8')).toBe('o');
+        }
+        expect(existsSync(sshCalls)).toBe(false);
+        expect(git(repo, 'config', '--get', 'remote.origin.url')).toBe('git@github.com:acme/app.git');
+        expect(pins()).toEqual({ v: 1, workspaces: { [repo]: { workspace: 'github.com/acme/app' } } });
+    });
+
+    it.each(['remote-status', 'pull-remote'] as const)('%s refuses an HTTPS-only rewrite to another repository', async (op) => {
+        pushOnline('untrusted.txt', 'other repository');
+        git(repo, 'remote', 'set-url', 'origin', 'git@github.com:acme/app.git');
+        // Only the selected HTTPS address is rewritten; the SSH origin and its pin remain valid.
+        writeFileSync(join(root, 'gitconfig'), '');
+        git(repo, 'config', `url.${bare}.insteadOf`, ONLINE);
+        writeFileSync(join(home, 'workspace-remotes.json'), JSON.stringify({ v: 1, workspaces: { [repo]: { workspace: 'github.com/acme/app' } } }));
+        const head = git(repo, 'rev-parse', 'HEAD');
+        const answer = await call(op, {
+            workspaceDir: repo, remoteUrl: ONLINE, branch: 'main', baseBranch: null,
+            ...(op === 'pull-remote' ? { mode: 'ff-only', expectedHead: head, push: false } : {}),
+        }, true);
+        expect(answer).toMatchObject({ success: false, errorCode: 'WORKTREE_REMOTE_MISMATCH' });
+        expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
+        expect(existsSync(join(repo, 'untrusted.txt'))).toBe(false);
+        expect(git(repo, 'for-each-ref', 'refs/aplus')).toBe('');
+    });
+
+    it('pushes a fast-forwarded collaboration branch through the selected HTTPS address', async () => {
+        useLocalHttpsTransport();
+        git(repo, 'push', '--quiet', bare, 'main:collab-x');
+        git(repo, 'switch', '--quiet', '-c', 'collab-x');
+        pushOnline('online.txt', 'o');
+        git(repo, 'remote', 'set-url', 'origin', 'git@github.com:acme/app.git');
+        const sshCalls = join(root, 'ssh-called');
+        const ssh = join(root, 'ssh.sh');
+        writeFileSync(ssh, `#!/bin/sh\necho called >> '${sshCalls}'\necho 'Permission denied (publickey)' >&2\nexit 255\n`, { mode: 0o700 });
+        git(repo, 'config', 'core.sshCommand', `sh '${ssh}'`);
+        const answer = await call('pull-remote', {
+            workspaceDir: repo, remoteUrl: ONLINE, branch: 'collab-x', baseBranch: 'main',
+            mode: 'ff-only', expectedHead: git(repo, 'rev-parse', 'HEAD'), push: true,
+        }, true);
+        expect(answer, JSON.stringify(answer)).toMatchObject({ success: true, result: { status: 'fast-forwarded' } });
+        expect(git(bare, 'rev-parse', 'collab-x')).toBe(git(bare, 'rev-parse', 'main'));
+        expect(existsSync(sshCalls)).toBe(false);
+        expect(git(repo, 'config', '--get', 'remote.origin.url')).toBe('git@github.com:acme/app.git');
+    });
+
+    it('checks network-only global rewrites before fetching with a sealed credential', async () => {
+        git(repo, 'remote', 'set-url', 'origin', 'git@github.com:acme/app.git');
+        // The fixture's GIT_CONFIG_GLOBAL rewrites only HTTPS, and local identity checks do not read it.
+        expect(await call('remote-status', {
+            workspaceDir: repo, remoteUrl: ONLINE, branch: 'main', baseBranch: null,
+        }, true)).toMatchObject({ success: false, errorCode: 'WORKTREE_REMOTE_MISMATCH' });
+    });
+
+    it('refuses a push-only rewrite before fast-forwarding the workspace', async () => {
+        useLocalHttpsTransport();
+        pushOnline('online.txt', 'o');
+        git(repo, 'remote', 'set-url', 'origin', 'git@github.com:acme/app.git');
+        git(repo, 'config', 'url.https://github.com/acme/other.git.pushInsteadOf', ONLINE);
+        const head = git(repo, 'rev-parse', 'HEAD');
+        expect(await call('pull-remote', {
+            workspaceDir: repo, remoteUrl: ONLINE, branch: 'main', baseBranch: null,
+            mode: 'ff-only', expectedHead: head, push: true,
+        }, true)).toMatchObject({ success: false, errorCode: 'WORKTREE_REMOTE_MISMATCH' });
+        expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
+        expect(existsSync(join(repo, 'online.txt'))).toBe(false);
+    });
 });
 
 describe('workspace:remote-status', () => {

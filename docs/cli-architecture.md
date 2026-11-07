@@ -19,6 +19,19 @@ from a source build or synthetic issuer test.
 
 ## Personal browser native-command dispatch
 
+The personal Desktop runtime prepares its broker and private profile without
+launching Chrome. Only a newly authorized browser task starts an owned native
+session; registration, readiness, listing and duplicate task requests do not.
+Concurrent starts share one launch. Chrome's own Quit ends that browser lifetime
+without exiting the broker or triggering the daemon's restart supervisor. The
+runtime fences disconnected tasks before a later new task may start another
+native session; it never adopts the previous tabs or replays their actions.
+Unconfirmed termination or fencing blocks further admission and readiness. Each
+start rechecks the signed executable and keeps the existing UID/SID, process
+incarnation, dedicated profile and private-pipe checks. Protected/shared runtimes
+retain their existing lifecycle. Revisit this boundary if browser start gains a
+second caller or the runtime exposes a public lifecycle command.
+
 `daemon/personalBrowserRuntime` verifies the issuer envelope against the installed
 runtime's public trust and waits until its signed issuance time before returning
 the command for dispatch. This tolerates an issuer slightly ahead of the local
@@ -156,6 +169,13 @@ launchers with an intermediate parent retain normal health verification and
 automatic daemon startup. Revisit this shortcut if spawning stops preserving
 direct OS parentage; an intermediary must use the verified fallback rather than
 an environment flag that bypasses ownership checks.
+
+When that verification only reports `DAEMON_HEALTH_UNCONFIRMED` (the recorded
+owner is alive but its control server missed one two-second probe), the launch
+checks again for up to 15 seconds before failing. A busy daemon then still gets
+the session report inside its 60-second session-start wait. The retry never
+starts or replaces a daemon and keeps every ownership check; an owner that stays
+unverified still blocks the launch.
 
 ```mermaid
 graph TB

@@ -30,6 +30,12 @@ const fixture = vi.hoisted(() => ({
     reportAutomationExit: vi.fn(async (_input: unknown) => true),
     admitTool: undefined as undefined | (<T>(work: () => Promise<T>) => Promise<T>),
     reconnect: vi.fn(async () => ({})),
+    prepareSideAppServer: vi.fn(async (): Promise<import('./codexOffTurnTitle').CodexCommandLaunch | null> => null),
+    sideConnection: null as import('./codexSideQuestion').CodexSideConnection | null,
+    /** Start with the server unreachable: the runner gets the offline stub, `session` arrives on reconnect. */
+    offline: false,
+    reconnectOffline: null as null | (() => Promise<unknown>),
+    abortTurn: vi.fn(async () => ({ forcedRestart: false })),
     session: {
         sendProviderUsageEvent: vi.fn(),
         tracksShutdownStorage: true,
@@ -61,10 +67,18 @@ vi.mock('@/utils/MessageQueue2', async (original) => {
 });
 vi.mock('@/utils/broadKillShims', () => ({ installBroadKillShims: vi.fn() }));
 vi.mock('@/persistence', async (original) => ({ ...await original<typeof import('@/persistence')>(), readSettings: vi.fn(async () => ({ machineId: 'machine' })) }));
-vi.mock('@/api/api', () => ({ ApiClient: { create: vi.fn(async () => ({ getOrCreateMachine: vi.fn(), getOrCreateSession: fixture.getOrCreateSession })) } }));
-vi.mock('@/utils/setupOfflineReconnection', () => ({ setupOfflineReconnection: (options: import('@/utils/setupOfflineReconnection').SetupOfflineReconnectionOptions) => {
-    fixture.sessionOptions = options.sessionOptions; return { session: fixture.session };
-} }));
+vi.mock('@/api/api', () => ({ ApiClient: { create: vi.fn(async () => ({ getOrCreateMachine: vi.fn(), getOrCreateSession: fixture.getOrCreateSession, sessionSyncClient: () => fixture.session })) } }));
+vi.mock('@/utils/setupOfflineReconnection', async (original) => {
+    const actual = await original<typeof import('@/utils/setupOfflineReconnection')>();
+    return { setupOfflineReconnection: (opts: Parameters<typeof actual.setupOfflineReconnection>[0]) => { fixture.sessionOptions = opts.sessionOptions; return fixture.offline ? actual.setupOfflineReconnection(opts) : { session: fixture.session }; } };
+});
+vi.mock('@/utils/serverConnectionErrors', async (original) => ({
+    ...await original<typeof import('@/utils/serverConnectionErrors')>(),
+    startOfflineReconnection: (config: { onReconnected: () => Promise<unknown> }) => {
+        fixture.reconnectOffline = config.onReconnected;
+        return { cancel: vi.fn(), getSession: () => null, isReconnected: () => false };
+    },
+}));
 vi.mock('@/utils/automationContextExit', () => ({ reportAutomationContextExit: fixture.reportAutomationExit }));
 vi.mock('@/daemon/run', () => ({ initialMachineMetadata: {} }));
 vi.mock('@/daemon/controlClient', () => ({ notifyDaemonSessionStarted: vi.fn(async () => ({})) }));
@@ -81,6 +95,14 @@ vi.mock('@/claude/utils/startHappyServer', () => ({ createChangeTitleHandler: vi
     return { url: 'http://127.0.0.1:1', toolNames: ['propose_lesson'], stop: vi.fn(() => { fixture.events.push('mcpStopped'); }) };
 }) }));
 vi.mock('@/ui/logger', () => ({ logger: { debug: vi.fn(), debugLargeJson: vi.fn(), info: vi.fn(), infoDeveloper: vi.fn(), warn: vi.fn() } }));
+vi.mock('./codexSideQuestion', async (original) => {
+    const actual = await original<typeof import('./codexSideQuestion')>();
+    return { ...actual, CodexSideQuestionBridge: class extends actual.CodexSideQuestionBridge {
+        constructor(deps: ConstructorParameters<typeof actual.CodexSideQuestionBridge>[0]) {
+            super({ ...deps, connect: async () => fixture.sideConnection! });
+        }
+    } };
+});
 vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     setCuaShadow = () => {};
     setTurnDispatchHandler = (handler: () => void) => { fixture.markDispatched = handler; };
@@ -100,6 +122,10 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     authRecoveryBusy = false;
     reconnectForAuth = fixture.reconnect;
     threadId: string | null = null;
+    isConnected = true;
+    sandboxEnabled = false;
+    threadRolloutPath = '/tmp/native-rollout.jsonl';
+    prepareSideAppServer = fixture.prepareSideAppServer;
     connect = async () => { await fixture.onConnect?.(); };
     resumeThread = async ({ threadId }: { threadId: string }) => { await fixture.onResumeThread?.(); this.threadId = threadId; return { threadId, model: 'test' }; };
     disconnect = fixture.disconnect;
@@ -112,7 +138,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     startThread = async (options: unknown) => { fixture.startThread(options); this.threadId = 'thread'; return { threadId: 'thread', model: 'test' }; };
     readThread = (options: { threadId: string; includeTurns: boolean }) => fixture.readThread(options);
     abortPreparedTurn = vi.fn();
-    abortTurnWithFallback = async () => ({ forcedRestart: false });
+    abortTurnWithFallback = fixture.abortTurn;
     sendTurnAndWait = async (prompt: string, options?: {
         onCompleted?: (turnId: string, thread: { id: string; path: string } | null) => void;
         onCompletionObservationSettled?: () => void;
@@ -154,6 +180,8 @@ afterEach(() => {
 });
 afterEach(() => { process.exitCode = originalExitCode; vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.clearAllMocks(); fixture.onSend = null; fixture.onInterrupt = null; fixture.onSteer = null; fixture.onConnect = null; fixture.onResumeThread = null; fixture.steerText = ''; fixture.omitCompletionObservers = false; fixture.completionThread = { id: 'thread', path: '/tmp/native-rollout.jsonl' }; fixture.readThread.mockReset().mockResolvedValue({ thread: { id: 'thread', path: '/tmp/native-rollout.jsonl' } }); fixture.gate = null; fixture.events = []; fixture.session.freezeInboundMessagesForShutdown.mockReturnValue(true); });
 afterEach(() => { fixture.recoverMcp.mockReset().mockResolvedValue({ status: 'ready', affectedServers: [] }); fixture.readMcpStatuses.mockReset().mockResolvedValue([]); });
+afterEach(() => { fixture.sideConnection = null; fixture.prepareSideAppServer.mockReset().mockResolvedValue(null); });
+afterEach(() => { fixture.offline = false; fixture.reconnectOffline = null; delete (fixture.session as { runtimeId?: string }).runtimeId; });
 async function start(prompt = 'Test input', confirmed = false, review?: import('@/memory/lessonReviewWorker').LessonReviewWorker, standaloneLaunch?: StandaloneLaunchBootstrap, resumeThreadId?: string, reconnect?: import('@/daemon/reconnectSessionEnv').ReconnectSessionClientSnapshot, launch?: { args?: string[]; modelSeed?: string; keepOpen?: boolean }) {
     for (const key of Object.keys(process.env)) {
         if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_)/.test(key)) vi.stubEnv(key, undefined);
@@ -710,6 +738,77 @@ describe('Codex runtime producer bookkeeping', () => {
         expect(result).toMatchObject({ status: 'busy' });
         expect(fixture.reconnect).not.toHaveBeenCalled();
     });
+    it('answers /btw on its own side launch and refuses it once input is frozen', async () => {
+        const replies: unknown[] = [];
+        fixture.onSend = async () => {
+            const sideQuestion = fixture.session.rpcHandlerManager.registerHandler.mock.calls.find(([name]) => name === 'side-question')![1] as (input: unknown) => Promise<unknown>;
+            // The session client offers no side launch (a mandatory sandbox, say): refused, nothing started.
+            replies.push(await sideQuestion({ question: 'what changed?' }));
+            fixture.gate!.freeze();
+            replies.push(await sideQuestion({ question: 'what changed?' }));
+        };
+        await finishFrozenFixture(start());
+        expect(fixture.prepareSideAppServer).toHaveBeenCalledTimes(1);
+        expect(replies).toEqual([
+            { success: false, error: 'side-question:not-allowed' },
+            { success: false, error: 'side-question:shutting-down' },
+        ]);
+    });
+    it('cancels an already pending side question before drain storage confirmation', async () => {
+        const listeners = new Set<(method: string, params: unknown) => void>();
+        let turnStarted = false;
+        const connection: import('./codexSideQuestion').CodexSideConnection = {
+            request: vi.fn(async (method: string) => {
+                if (method === 'config/read') return { config: {} };
+                if (method === 'thread/fork') return { thread: { id: 'side', ephemeral: true }, sandbox: { type: 'readOnly' } };
+                if (method === 'turn/start') { turnStarted = true; return { turn: { id: 'side-turn' } }; }
+                return {};
+            }),
+            onNotification: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+            deniedRequests: () => 0,
+            close: vi.fn(async () => {}),
+        };
+        fixture.sideConnection = connection;
+        fixture.prepareSideAppServer.mockResolvedValue({ command: 'unused', args: [], env: {} });
+        let question!: Promise<unknown>;
+        let drain!: SessionDrain;
+        let pending!: Promise<DrainReceipt>;
+        const flushForShutdown = vi.fn(async () => ({ stored: true as const, revision: 1 }));
+        fixture.onSend = async () => {
+            const handler = fixture.session.rpcHandlerManager.registerHandler.mock.calls.find(([name]) => name === 'side-question')![1] as (input: unknown) => Promise<unknown>;
+            question = handler({ question: 'A slow side question' });
+            await vi.waitFor(() => expect(turnStarted).toBe(true));
+            drain = new SessionDrain('pending-side-question', {
+                freezeInputForShutdown: () => true, interruptTurn: async () => {},
+                endInputAndAwaitExit: async () => ({ exited: true, code: 0, signal: null }),
+                waitForOutputDrain: async () => {}, cancelOutputDrain: () => {}, finishShutdownObservation: () => {},
+            }, { tracksShutdownStorage: true, flushForShutdown, isStorageConfirmationCurrent: () => true },
+            async () => {}, fixture.gate!);
+            pending = drain.drain(3000);
+        };
+        const running = start();
+        try {
+            await vi.waitFor(() => expect(fixture.events).toContain('loopExited'), { timeout: 10000 });
+            const observation = new AbortController();
+            const timer = setTimeout(() => observation.abort(), 200);
+            try { await fixture.gate!.quiesce(observation.signal); }
+            finally { clearTimeout(timer); }
+            expect(await question).toMatchObject({ success: false, error: expect.stringContaining('session ended') });
+            expect(connection.request).toHaveBeenCalledWith('turn/interrupt', { threadId: 'side', turnId: 'side-turn' });
+            expect(connection.close).toHaveBeenCalledOnce();
+            expect(await pending).toMatchObject({ status: 'provider-drained', stored: true });
+            expect(fixture.session.close).not.toHaveBeenCalled();
+        } finally {
+            // Let the unfixed implementation settle too, so a failed regression cannot retain the loop.
+            for (const listener of [...listeners]) listener('turn/completed', { threadId: 'side', turn: { id: 'side-turn', status: 'completed' } });
+            await question;
+            const receipt = await pending;
+            if (receipt.stored) drain.releaseRuntime(receipt);
+            await running;
+        }
+        expect(fixture.session.close).toHaveBeenCalledOnce();
+    });
+
     it('tracks steer through the provider acknowledgement and final user echo', async () => {
         let blocker: unknown; let echoBlocker: unknown; let reply: unknown;
         fixture.onSend = async () => {
@@ -758,6 +857,53 @@ describe('Codex runtime producer bookkeeping', () => {
         await start();
         expect(blockers).toEqual(['producer-busy', 'input-undelivered']);
     });
+});
+describe('Codex offline start', () => {
+    // An offline start has no runtime gate and never installs a dispatch handler, so drop the last test's.
+    beforeEach(() => { fixture.markDispatched = null; });
+    it('answers app messages, abort and kill on the real session after reconnecting', async () => {
+        fixture.offline = true;
+        fixture.getOrCreateSession.mockResolvedValueOnce(null as never);
+        Object.assign(fixture.session, { runtimeId: 'real-runtime' });
+        const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+        const handler = (name: string) => fixture.session.rpcHandlerManager.registerHandler.mock.calls.find(([key]) => key === name)?.[1] as ((input?: unknown) => Promise<unknown>) | undefined;
+        fixture.onSend = async () => { await handler('abort')!(); };
+        for (const key of Object.keys(process.env)) {
+            if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_)/.test(key)) vi.stubEnv(key, undefined);
+        }
+        // Automation run-once needs a server, so this runner waits for input until killed.
+        const { runCodex } = await import('./runCodex');
+        const running = runCodex({ principal: { kind: 'account', credentials: { token: 'test-token' } as never }, noSandbox: true });
+        await vi.waitFor(() => expect(vi.mocked(logger.debug).mock.calls.some(([line]) => String(line).includes('Waiting for messages'))).toBe(true));
+        expect(fixture.session.onUserMessage).not.toHaveBeenCalled();
+        const { BasePermissionHandler } = await import('@/utils/BasePermissionHandler');
+        const updateSession = vi.spyOn(BasePermissionHandler.prototype, 'updateSession');
+
+        await fixture.reconnectOffline!();
+        // The swap still re-attaches the input queue, steer, permissions and the archive listener (R4-d).
+        expect(updateSession).toHaveBeenCalledWith(fixture.session);
+        expect(fixture.session.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', expect.any(Boolean));
+        expect(fixture.session.setInputSteerAvailable).toHaveBeenCalledWith(true);
+        expect(fixture.session.on).toHaveBeenCalledWith('archived', expect.any(Function));
+
+        const receive = fixture.session.onUserMessage.mock.calls[0][0] as (input: unknown) => Promise<void>;
+        await receive({ content: { text: 'After reconnect' } });
+        await vi.waitFor(() => expect(fixture.abortTurn).toHaveBeenCalledOnce());
+        expect(fixture.send).toHaveBeenCalledWith('After reconnect', expect.anything());
+
+        // Channel ingress answers for the reconnected runtime, not the stub it was set up on.
+        const capability = await handler('channel-capability')!() as { runtimeId: string };
+        expect(capability.runtimeId).toBe('real-runtime');
+        await expect(handler('channel-prompt')!({ text: 'From a channel', requestId: 'channel-1', expectedRuntimeId: capability.runtimeId }))
+            .resolves.toMatchObject({ ok: true });
+
+        await handler('killSession')!();
+        await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+        expect(fixture.session.sendSessionDeath).toHaveBeenCalled();
+        // process.exit is stubbed, so let the loop end on its own.
+        fixture.closeQueue?.();
+        await running;
+    }, 20_000);
 });
 describe('Codex sub-agent list metadata (codexSubagentTasks)', () => {
     type MetadataUpdate = (metadata: Record<string, unknown>) => Record<string, unknown>;
@@ -881,3 +1027,18 @@ describe('Codex sub-agent turn-end reap exemption (markLaunchedBackgroundJob)', 
         expect(fixture.session.markLaunchedBackgroundJob).not.toHaveBeenCalled();
     });
 });
+
+it('refuses direct side-question RPCs for an isolated execution without starting another native context', async () => {
+  fixture.session.sessionId='automation-run:side-question-denied'
+  fixture.getOrCreateSession.mockResolvedValueOnce({id:fixture.session.sessionId})
+  let reply: unknown
+  fixture.onSend=async () => {
+    const handler=fixture.session.rpcHandlerManager.registerHandler.mock.calls.find(([name]) => name === 'side-question')![1] as (input:unknown) => Promise<unknown>
+    reply=await handler({question:'copy the whole rollout'})
+  }
+  try {
+    await start()
+    expect(reply).toEqual({success:false,error:'side-question:managed-run'})
+    expect(fixture.prepareSideAppServer).not.toHaveBeenCalled()
+  } finally {fixture.session.sessionId='lesson-session'}
+})

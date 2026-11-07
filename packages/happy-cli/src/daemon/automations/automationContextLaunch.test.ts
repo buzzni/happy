@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { readReconnectSessionEnvironment } from '../reconnectSessionEnv'
-import { automationExecutionSeedArtifactSchema, type AutomationPayload } from '@slopus/happy-wire'
+import { automationExecutionSeedArtifactSchema, automationPayloadSchema, type AutomationPayload } from '@slopus/happy-wire'
 import { ApiClient } from '@/api/api'
 import { decodeBase64, decrypt } from '@/api/encryption'
 import type { Session } from '@/api/types'
@@ -12,6 +12,7 @@ import { OwnedStartRefused } from '../ownedSpawn'
 import { FileLockHeldError } from '@/utils/ownedFileLock'
 import { createAutomationContextLaunchJournal } from './automationContextLaunchJournal'
 import { createAutomationContextLauncher, type AutomationContextLaunchDependencies, type AutomationContextLaunchRequest } from './automationContextLaunch'
+import { buildAutomationContextInput } from './automationContextInput'
 import { createAutomationContextWorkspace } from './automationContextWorkspace'
 
 let home: string
@@ -62,8 +63,9 @@ it('preserves the existing independent preparation request digest when memo snap
   const f = await setup()
   await f.launcher.launch(request())
   // Captured before memo support: adding data for a new mode must not invalidate old preparations.
-  expect((await f.deps.journal.read('r1'))!.requestHash).toBe('2bca27ef0808f183b59d5a8d8704f862282df474a1ccc03d16abcc0a2744c84c')
-  expect(await f.launcher.restoreRequest('r1')).toEqual(request())
+  const legacy={...request(),payload:automationPayloadSchema.parse(request().payload)}
+  expect(createHash('sha256').update(JSON.stringify({request:legacy,seed:buildAutomationContextInput(legacy)})).digest('hex')).toBe('2bca27ef0808f183b59d5a8d8704f862282df474a1ccc03d16abcc0a2744c84c')
+  expect(await f.launcher.restoreRequest('r1')).toMatchObject({...request(),runTime:{at:expect.any(Number)}})
 })
 
 it('keeps selected memo data in the E2EE seed, excludes it from creation metadata and ignores unselected prior results on retry', async () => {
@@ -107,7 +109,9 @@ it.each(['AUTOMATION_AUTHORITY_REVOKED', 'AUTOMATION_CONTEXT_REQUEST_UNCONFIRMED
     return result
   })
   const beforeStart = vi.fn(async (input: AutomationContextLaunchRequest) => {
-    expect(input).toEqual(f.input)
+    const { runTime, ...original } = input
+    expect(original).toEqual(f.input)
+    expect(runTime).toMatchObject({at:expect.any(Number)})
     if (!authorized) throw new Error(code)
   })
   const deps = { ...f.deps, beforeStart }
@@ -339,9 +343,11 @@ it('restores the exact encrypted run input and selected result independently of 
   const f = await setup(), input = request()
   input.payload.contextPolicy = { kind: 'isolated', reference: { kind: 'previous-result', maxBytes: 16_384 } }
   input.previousResult = { automationId: 'a1', runId: 'r0', revision: 1, status: 'COMPLETED', question: 'prior authored question', answer: 'private completed result' }
-  const expected = structuredClone(input)
   f.register.mockRejectedValueOnce(new Error('offline'))
   await expect(f.launcher.launch(input)).rejects.toThrow('offline')
+  const expected = await f.launcher.restoreRequest('r1')
+  if (!expected) throw new Error('Missing persisted input')
+  expect(expected).toMatchObject(input)
   input.payload.prompt = 'edited task'; input.claimToken = 'changed claim'; input.previousResult = undefined
   const restarted = createAutomationContextLauncher(f.deps)
   expect(await restarted.restoreRequest('r1')).toEqual(expected)
@@ -550,4 +556,23 @@ it('retains an explicit first-result resolution in the immutable encrypted seed 
   expect(original?.previousResult).toEqual(input.previousResult)
   await createAutomationContextLauncher(f.deps).launch(original!)
   expect(f.prepare).toHaveBeenCalledOnce(); expect(f.start).toHaveBeenCalledOnce()
+})
+
+it.each(['schedule-zone', 'machine-zone'] as const)('freezes the actual occurrence clock before registration and reuses it after ACK loss (%s)', async kind => {
+  const clock=vi.spyOn(Date,'now').mockReturnValue(Date.UTC(2026,10,7,1,0))
+  vi.stubEnv('TZ','Asia/Seoul')
+  try {
+    const f=await setup(), input=request()
+    if(kind === 'schedule-zone') input.payload.schedule={kind:'daily-zoned',timeZone:'Asia/Seoul',hour:10,minute:0}
+    f.register.mockRejectedValueOnce(new Error('lost-clock-ACK'))
+    await expect(f.launcher.launch(input)).rejects.toThrow('lost-clock-ACK')
+    const before=await f.launcher.restoreRequest('r1')
+    expect(before).toHaveProperty('runTime',{at:Date.UTC(2026,10,7,1,0),timeZone:'Asia/Seoul'})
+    clock.mockReturnValue(Date.UTC(2026,10,8,1,0))
+    vi.stubEnv('TZ','UTC')
+    await createAutomationContextLauncher(f.deps).launch(input)
+    expect(await f.launcher.restoreRequest('r1')).toEqual(before)
+    expect(f.start.mock.calls[0][0].initialPrompt).toContain('2026-11-07 10:00')
+    expect(f.start.mock.calls[0][0].initialPrompt).not.toContain('2026-11-08')
+  } finally {clock.mockRestore();vi.unstubAllEnvs()}
 })

@@ -16,6 +16,7 @@ import {
 import { BASH_STREAM_AGENT_TOOL_NAME } from './startHappyServer';
 import { recordToolUse, getToolNameById, shouldRedact } from '@/redact/redactGate';
 import { backgroundTaskNoticeId, sdkBackgroundTaskCompletion, stoppedBackgroundTaskCompletion } from './backgroundTaskCompletion';
+import { toolResultText } from './toolResultText';
 
 type BackgroundEvidenceLaunch = {
     taskId: string;
@@ -1106,12 +1107,17 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
                 const images = redacted
                     ? undefined
                     : extractToolResultImages((block as { content?: unknown }).content);
+                // Fail closed: without the tool_use (e.g. a CLI attached mid-call) the redact policy cannot be checked.
+                const result = redacted || getToolNameById(block.tool_use_id) === undefined
+                    ? undefined
+                    : toolResultText((block as { content?: unknown }).content, (block as { is_error?: unknown }).is_error);
                 envelopes.push(createEnvelope('agent', {
                     t: 'tool-call-end',
                     call: block.tool_use_id,
                     ...(images ? { images } : {}),
                     ...(!redacted ? { browserQuotaKind: browserQuotaFailure(block.content) } : {}),
                     ...(backgroundTaskId ? { backgroundTaskId } : {}),
+                    ...(result ? { result } : {}),
                 }, { turn: turnId, subagent }));
                 const completion = redacted || message.isSidechain || subagent ? null
                     : stoppedBackgroundTaskCompletion(getToolNameById(block.tool_use_id), block);

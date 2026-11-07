@@ -68,6 +68,8 @@ export async function migrateLegacyDeviceState(home: string, machineId: string):
 }
 /** Initial pins are immutable. Rotation/revocation require separate authenticated transitions.
  * Only the enrollment coordinator calls pin after both confirmations. No trust in remote flags.
+ * The one replacement (aplus#5876) is a new approval for another kind of PC under the same organization key: the
+ * coordinator names the pin it replaces, and only that exact pin is replaced.
  */
 export function createDeviceOrgPinStore(deps: { home: string; machineId: string; keys: DeviceKeys }) {
     const directory = deviceDirectory(deps.home, deps.machineId);
@@ -103,12 +105,14 @@ export function createDeviceOrgPinStore(deps: { home: string; machineId: string;
     }
     return {
         get,
-        async pin(candidate: DeviceOrgPin): Promise<void> {
+        async pin(candidate: DeviceOrgPin, replaces?: DeviceOrgPin): Promise<void> {
             const record = await validate({ version: 1, policy: 'signed-required', ...candidate });
             const serialized = canonicalOrgSetupTokenJson(record);
             const companyId = record.approval.body.companyId;
             const existing = await get(companyId);
-            if (existing) {
+            const replacing = !!existing && !!replaces && replaces.publicKey === record.publicKey && existing.publicKey === record.publicKey &&
+                canonicalOrgSetupTokenJson(existing.approval) === canonicalOrgSetupTokenJson(replaces.approval);
+            if (existing && !replacing) {
                 if (canonicalOrgSetupTokenJson(existing) !== serialized) throw new Error('ORG_PIN_CONFLICT');
                 await syncDirectory();
                 return;
@@ -118,8 +122,10 @@ export function createDeviceOrgPinStore(deps: { home: string; machineId: string;
                 const file = await open(temporary, 'wx', 0o600);
                 try { await file.writeFile(serialized); await file.sync(); } finally { await file.close(); }
                 await protectStandaloneObservationDirectory(directory);
+                // Swaps the named pin in one step, so a crash leaves either the old pin or the new one.
+                if (replacing) await rename(temporary, join(directory, deviceStateName('o', companyId)));
                 // Publish a fully flushed file without replacing any existing pin, even across processes.
-                try { await link(temporary, join(directory, deviceStateName('o', companyId))); }
+                else try { await link(temporary, join(directory, deviceStateName('o', companyId))); }
                 catch (error) {
                     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
                     if (canonicalOrgSetupTokenJson(await get(companyId)) !== serialized) throw new Error('ORG_PIN_CONFLICT');

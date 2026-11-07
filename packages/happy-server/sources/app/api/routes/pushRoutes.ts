@@ -1,10 +1,20 @@
 import { z } from "zod";
 import { type Fastify } from "../types";
 import { db } from "@/storage/db";
-import { dispatchSessionEventPush } from "@/app/push/pushDispatch";
+import { countPushOutcome, dispatchSessionEventPush, type PushOutcome } from "@/app/push/pushDispatch";
 import { buildSessionEventEphemeral, eventRouter } from "@/app/events/eventRouter";
 import { persistTurnReadySessionEvent } from "@/app/events/persistSessionEvent";
 import { log } from "@/utils/log";
+
+const pushOutcomeSchema = z.object({
+    status: z.enum(['sent', 'partial', 'suppressed', 'no_tokens', 'failed']),
+    tokens: z.number(),
+    sent: z.number(),
+    failed: z.number(),
+    reason: z.string().optional()
+}) satisfies z.ZodType<PushOutcome>;
+
+const SILENT_AUTOMATION_OUTCOME: PushOutcome = { status: 'suppressed', tokens: 0, sent: 0, failed: 0, reason: 'silent-automation' };
 
 export function pushRoutes(app: Fastify) {
     
@@ -101,7 +111,8 @@ export function pushRoutes(app: Fastify) {
             }),
             response: {
                 200: z.object({
-                    success: z.literal(true)
+                    success: z.literal(true),
+                    push: pushOutcomeSchema
                 }),
                 404: z.object({
                     error: z.literal('Session not found')
@@ -133,7 +144,9 @@ export function pushRoutes(app: Fastify) {
                 select: { id: true }
             });
             if (silentAutomationRun) {
-                return reply.send({ success: true });
+                log({ module: 'push' }, `Suppressed session-event push for user ${userId} session ${sessionId}: silent automation run`);
+                countPushOutcome(SILENT_AUTOMATION_OUTCOME);
+                return reply.send({ success: true, push: SILENT_AUTOMATION_OUTCOME });
             }
             // 기록 실패가 기존 알림 경로를 막지 않게 한다 — web-ui 완료 알림만 늦어진다.
             try {
@@ -152,7 +165,10 @@ export function pushRoutes(app: Fastify) {
             recipientFilter: { type: 'all-interested-in-session', sessionId }
         });
 
-        void dispatchSessionEventPush({
+        // Awaited so the response reports what really happened to the push.
+        // The CLI posts this fire-and-forget, and pushSend caps the Expo send,
+        // so the wait never blocks a turn.
+        const push = await dispatchSessionEventPush({
             userId,
             sessionId,
             title,
@@ -160,7 +176,7 @@ export function pushRoutes(app: Fastify) {
             data: { ...(data ?? {}), kind }
         });
 
-        return reply.send({ success: true });
+        return reply.send({ success: true, push });
     });
 
     // Get Push Tokens API

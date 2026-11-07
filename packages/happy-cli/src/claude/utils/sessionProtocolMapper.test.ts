@@ -209,7 +209,7 @@ describe('mapClaudeLogMessageToSessionEnvelopes', () => {
         expect(ended.envelopes).toEqual(
             expect.arrayContaining([
                 expect.objectContaining({
-                    ev: { t: 'tool-call-end', call: 'tool-1' },
+                    ev: { t: 'tool-call-end', call: 'tool-1', result: { text: 'ok' } },
                 }),
             ]),
         );
@@ -295,7 +295,7 @@ describe('mapClaudeLogMessageToSessionEnvelopes', () => {
 
         expect(ended.envelopes).toEqual(
             expect.arrayContaining([
-                expect.objectContaining({ ev: { t: 'tool-call-end', call: 'tool-noimg-1' } }),
+                expect.objectContaining({ ev: { t: 'tool-call-end', call: 'tool-noimg-1', result: { text: 'ok' } } }),
             ]),
         );
     });
@@ -334,7 +334,8 @@ describe('mapClaudeLogMessageToSessionEnvelopes', () => {
         expect(ended.envelopes).toEqual(
             expect.arrayContaining([
                 expect.objectContaining({
-                    ev: { t: 'tool-call-end', call: 'tool-bg-1', backgroundTaskId: 'b59ok9s5w' },
+                    ev: { t: 'tool-call-end', call: 'tool-bg-1', backgroundTaskId: 'b59ok9s5w',
+                        result: { text: 'Command running in background with ID: b59ok9s5w. Output is being written to: /tmp/tasks/b59ok9s5w.output.' } },
                 }),
             ]),
         );
@@ -372,7 +373,8 @@ describe('mapClaudeLogMessageToSessionEnvelopes', () => {
         expect(ended.envelopes).toEqual(
             expect.arrayContaining([
                 expect.objectContaining({
-                    ev: { t: 'tool-call-end', call: 'tool-bga-1', backgroundTaskId: 'a1958ec940e6b45bf' },
+                    ev: { t: 'tool-call-end', call: 'tool-bga-1', backgroundTaskId: 'a1958ec940e6b45bf',
+                        result: { text: 'Async agent launched successfully.\nagentId: a1958ec940e6b45bf (internal ID - do not mention)' } },
                 }),
             ]),
         );
@@ -403,7 +405,7 @@ describe('mapClaudeLogMessageToSessionEnvelopes', () => {
 
         expect(ended.envelopes).toEqual(
             expect.arrayContaining([
-                expect.objectContaining({ ev: { t: 'tool-call-end', call: 'tool-fg-1' } }),
+                expect.objectContaining({ ev: { t: 'tool-call-end', call: 'tool-fg-1', result: { text: 'a.txt\nb.txt' } } }),
             ]),
         );
     });
@@ -444,6 +446,71 @@ describe('mapClaudeLogMessageToSessionEnvelopes', () => {
                 expect.objectContaining({ ev: { t: 'tool-call-end', call: 'tool-redact-1' } }),
             ]),
         );
+    });
+
+    // Saycode specs/chat-tool-result-output R16 — the tool's returned text rides on tool-call-end.
+    describe('tool result text', () => {
+        function endEvents(results: unknown[], tools: Array<{ id: string; name: string }>) {
+            const started = mapClaudeLogMessageToSessionEnvelopes({ type: 'assistant', uuid: `a-${tools[0].id}`, message: { role: 'assistant',
+                content: tools.map(tool => ({ type: 'tool_use', id: tool.id, name: tool.name, input: {} })) } } as any, { currentTurnId: null });
+            const ended = mapClaudeLogMessageToSessionEnvelopes({ type: 'user', uuid: `u-${tools[0].id}`, message: { role: 'user', content: results } } as any,
+                { currentTurnId: started.currentTurnId });
+            return ended.envelopes.filter(envelope => envelope.ev.t === 'tool-call-end').map(envelope => envelope.ev);
+        }
+
+        // Real Claude records (transcript JSONL), ids kept: a failed Bash string body and an MCP text-block body.
+        it('carries a string body with its error flag and an array body as text', () => {
+            const failed = { type: 'tool_result', content: 'Exit code 1\nmax-lines: ok (base origin/main@2ab74d561748, new-file limit 500)\nrelease notes: 1개 조각으로 production 변경을 설명함\nexpected an object but got: array ([])', is_error: true, tool_use_id: 'toolu_01Y1x9hsALEJ13VDtdVmaq7o' };
+            const mcp = { tool_use_id: 'toolu_016UcNyvZVsgtZjZA2LhgwHC', type: 'tool_result', content: [{ type: 'text', text: 'Successfully changed chat title to: "happy 런타임: 예약 실행 시각 주입·tool-call-end result"' }] };
+            expect(endEvents([failed], [{ id: failed.tool_use_id, name: 'Bash' }])).toEqual([{ t: 'tool-call-end', call: failed.tool_use_id,
+                result: { text: failed.content, isError: true } }]);
+            expect(endEvents([mcp], [{ id: mcp.tool_use_id, name: 'mcp__happy__change_title' }])).toEqual([{ t: 'tool-call-end', call: mcp.tool_use_id,
+                result: { text: mcp.content[0].text } }]);
+        });
+
+        it('joins text blocks, keeps images on their own field and skips non-text blocks', () => {
+            const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAA' } };
+            expect(endEvents([{ type: 'tool_result', tool_use_id: 'read-1', content: [{ type: 'text', text: 'line 1' }, image, { type: 'text', text: '\u001b[32mline 2\u001b[0m' }] }],
+                [{ id: 'read-1', name: 'Read' }])).toEqual([{ t: 'tool-call-end', call: 'read-1',
+                images: [{ mediaType: 'image/png', data: 'AAA' }], result: { text: 'line 1\nline 2' } }]);
+            // Real ToolSearch record: only a tool_reference block, so there is no text to send.
+            expect(endEvents([{ type: 'tool_result', tool_use_id: 'toolu_01CqLc93wGvohk9EtpH4arxU', content: [{ type: 'tool_reference', tool_name: 'mcp__happy__change_title' }] }],
+                [{ id: 'toolu_01CqLc93wGvohk9EtpH4arxU', name: 'ToolSearch' }])).toEqual([{ t: 'tool-call-end', call: 'toolu_01CqLc93wGvohk9EtpH4arxU' }]);
+        });
+
+        it('keeps the first 6,000 and last 10,000 characters of a long body', () => {
+            const body = 'H'.repeat(6_000) + 'M'.repeat(500) + 'T'.repeat(10_000);
+            expect(endEvents([{ type: 'tool_result', tool_use_id: 'bash-long', content: body }], [{ id: 'bash-long', name: 'Bash' }]))
+                .toEqual([{ t: 'tool-call-end', call: 'bash-long', result: { text: 'H'.repeat(6_000) + 'T'.repeat(10_000), omitted: 500 } }]);
+        });
+
+        it.each(['Skill', 'mcp__aplus-common__get_common_skill', 'mcp__aplus-company__get_skill'])('leaves the result out for the policy-redacted %s', (name) => {
+            expect(endEvents([{ type: 'tool_result', tool_use_id: `redacted-${name}`, is_error: true, content: [{ type: 'text', text: 'product guidance body' }] }],
+                [{ id: `redacted-${name}`, name }])).toEqual([{ t: 'tool-call-end', call: `redacted-${name}` }]);
+        });
+
+        // A CLI attached to an existing session never saw the tool_use, so it cannot tell whether the
+        // tool is policy-redacted: fail closed instead of sending the body.
+        it('leaves the result out when the call was never seen and its tool name is unknown', () => {
+            const ended = mapClaudeLogMessageToSessionEnvelopes({ type: 'user', uuid: 'u-unseen', message: { role: 'user',
+                content: [{ type: 'tool_result', tool_use_id: 'unseen-mcp-call', content: [{ type: 'text', text: 'company guidance body' }] }] } } as any,
+                { currentTurnId: null });
+            expect(ended.envelopes.filter(envelope => envelope.ev.t === 'tool-call-end').map(envelope => envelope.ev))
+                .toEqual([{ t: 'tool-call-end', call: 'unseen-mcp-call' }]);
+        });
+
+        it('matches each parallel result to its own call by tool_use_id', () => {
+            const events = endEvents([
+                { type: 'tool_result', tool_use_id: 'grep-2', content: 'second', is_error: true },
+                { type: 'tool_result', tool_use_id: 'skill-3', content: 'secret guidance' },
+                { type: 'tool_result', tool_use_id: 'grep-1', content: [{ type: 'text', text: 'first' }] },
+            ], [{ id: 'grep-1', name: 'Grep' }, { id: 'grep-2', name: 'Grep' }, { id: 'skill-3', name: 'Skill' }]);
+            expect(events).toEqual([
+                { t: 'tool-call-end', call: 'grep-2', result: { text: 'second', isError: true } },
+                { t: 'tool-call-end', call: 'skill-3' },
+                { t: 'tool-call-end', call: 'grep-1', result: { text: 'first' } },
+            ]);
+        });
     });
 
     it('exposes the generated session subagent id on Agent tool calls', () => {
@@ -893,7 +960,7 @@ describe('channel correlation on runs that produce no text', () => {
             },
         } as any, state);
         expect(result.envelopes).toEqual(expect.arrayContaining([
-            expect.objectContaining({ ev: { t: 'tool-call-end', call: 'tool-bg', backgroundTaskId: 'task-bg-1' } }),
+            expect.objectContaining({ ev: expect.objectContaining({ t: 'tool-call-end', call: 'tool-bg', backgroundTaskId: 'task-bg-1' }) }),
         ]));
         closeClaudeTurnWithStatus(state, 'completed');
 

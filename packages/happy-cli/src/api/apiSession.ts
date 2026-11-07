@@ -1,4 +1,4 @@
-import { HubInputGate, TurnInputEvidence, type QueueInputEvidence, type EvidenceBatch } from './turnInputEvidence';
+import { HubInputGate, TurnInputEvidence, queueInputEvidence, type QueueInputEvidence, type EvidenceBatch } from './turnInputEvidence';
 import type { MessageQueue2 } from '@/utils/MessageQueue2';
 import type { SetupTokenRotationState } from './types';
 import { logger } from '@/ui/logger'
@@ -448,12 +448,7 @@ export class ApiSessionClient extends EventEmitter {
         this.updateMetadata(meta => ({ ...meta, runtimeCapabilities: { ...meta.runtimeCapabilities, agentContact } }));
     }
     setInputSteerAvailable(available: boolean): void { this.contactSteer = available; this.setInputMode(this.inputGate.mode); }
-    queueInput(message: UserMessage): QueueInputEvidence {
-        return { ref: message.serverMessageId
-            ? { kind: 'rest', serverMessageId: message.serverMessageId, serverSeq: message.serverSeq ?? null }
-            : { kind: 'unidentified', runtimeInputId: randomUUID() },
-            ...(message.meta && Object.hasOwn(message.meta, 'hubPrompt') ? { guard: message.meta.hubPrompt ?? null } : {}) };
-    }
+    queueInput(message: UserMessage): QueueInputEvidence { return queueInputEvidence(message); }
     admitInput(input: QueueInputEvidence, publishAccepted = false): boolean {
         if (input.continuation && !this.inputEvidence.isContinuationCurrent(input.continuation)) return false;
         if (input.guard === undefined) return true;
@@ -1178,7 +1173,7 @@ export class ApiSessionClient extends EventEmitter {
             this.inputEvidence.cancelContinuation('replaced');
             const automationRunId = incoming.meta?.sentFrom === 'automation' ? automationRunIdFromLocalKey(incoming.localKey) : null;
             const userMessage = automationRunId
-                ? { ...incoming, content: { ...incoming.content, text: buildScheduledRunPrompt(incoming.content.text) } }
+                ? { ...incoming, content: { ...incoming.content, text: buildScheduledRunPrompt(incoming.content.text, { at: Date.now() }) } }
                 : incoming;
             const settledAutomationTurns = automationRunId
                 ? this.automationTurns.arm(automationRunId)

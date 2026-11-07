@@ -11,7 +11,7 @@ import type { ApiClient } from '@/api/api';
 import type { ApiSessionClient, ApiSessionClientOptions } from '@/api/apiSession';
 import type { AgentState, Metadata, Session } from '@/api/types';
 import { configuration } from '@/configuration';
-import { createOfflineSessionStub } from '@/utils/offlineSessionStub';
+import { createOfflineSessionStub, transferOfflineRegistrations } from '@/utils/offlineSessionStub';
 import { startOfflineReconnection } from '@/utils/serverConnectionErrors';
 import { resolveManagedOfflineFallback } from '@/managed/managedStartup';
 
@@ -59,7 +59,8 @@ export interface SetupOfflineReconnectionResult {
  *
  * If the server is unreachable (response is null), this creates an offline
  * session stub and starts background reconnection. When reconnection succeeds,
- * the `onSessionSwap` callback is invoked with the new real session.
+ * the handlers registered on the stub move to the new real session, and then
+ * the `onSessionSwap` callback is invoked with it.
  *
  * @param opts - Options including api, sessionTag, metadata, state, response, onSessionSwap
  * @returns Result with session, reconnectionHandle, and isOffline flag
@@ -104,6 +105,8 @@ export function setupOfflineReconnection(opts: SetupOfflineReconnectionOptions):
                 const resp = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
                 if (!resp) throw new Error('Server unavailable');
                 const realSession = api.sessionSyncClient(resp, opts.sessionOptions);
+                // Runners registered their handlers once, on the stub; the swap callback does not redo that.
+                transferOfflineRegistrations(session, realSession);
                 // Notify caller to swap the session reference
                 onSessionSwap(realSession);
                 return realSession;

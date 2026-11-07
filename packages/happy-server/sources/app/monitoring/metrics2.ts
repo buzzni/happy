@@ -145,6 +145,14 @@ export const automationReadRequestsCounter = new Counter({
     registers: [register]
 });
 
+// A sustained rise in failed/partial is a push outage the CLI never sees.
+export const pushOutcomesCounter = new Counter({
+    name: 'push_outcomes_total',
+    help: 'Session-event push dispatches by outcome',
+    labelNames: ['status'] as const,
+    registers: [register]
+});
+
 export const httpRequestDurationHistogram = new Histogram({
     name: 'http_request_duration_seconds',
     help: 'HTTP request duration in seconds',

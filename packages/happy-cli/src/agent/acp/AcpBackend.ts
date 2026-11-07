@@ -20,6 +20,7 @@ import {
   type InitializeRequest,
   type NewSessionRequest,
   type NewSessionResponse,
+  type InitializeResponse,
   type PromptRequest,
   type ContentBlock,
 } from '@agentclientprotocol/sdk';
@@ -209,6 +210,18 @@ export interface AcpBackendOptions {
 
   /** Log raw session updates to console */
   verbose?: boolean;
+
+  /**
+   * The agent's own session from a previous process of this conversation. It is
+   * continued with `session/resume` when the agent advertises it; otherwise, or
+   * when the agent refuses it, a new agent session starts.
+   */
+  resumeSessionId?: string;
+}
+
+export interface AcpStartSessionResult extends StartSessionResult {
+  /** The agent's session id, which a later process passes back as `resumeSessionId`. */
+  agentSessionId: string;
 }
 
 /**
@@ -377,7 +390,7 @@ export class AcpBackend implements AgentBackend {
     }
   }
 
-  async startSession(initialPrompt?: string): Promise<StartSessionResult> {
+  async startSession(initialPrompt?: string): Promise<AcpStartSessionResult> {
     if (this.disposed) {
       throw new Error('Backend has been disposed');
     }
@@ -792,9 +805,10 @@ export class AcpBackend implements AgentBackend {
         mcpServers: mcpServers as unknown as NewSessionRequest['mcpServers'],
       };
 
-      logger.debug(`[AcpBackend] Creating new session...`);
+      const resumedResponse = await this.resumePreviousSession(initializeResponse, newSessionRequest.mcpServers, initTimeout, startupFailurePromise);
+      if (!resumedResponse) logger.debug(`[AcpBackend] Creating new session...`);
 
-      const sessionResponse = await withRetry(
+      const sessionResponse = resumedResponse ?? await withRetry(
         async () => {
           let timeoutHandle: NodeJS.Timeout | null = null;
           try {
@@ -848,7 +862,7 @@ export class AcpBackend implements AgentBackend {
         });
       }
 
-      return { sessionId };
+      return { sessionId, agentSessionId: sessionResponse.sessionId };
 
     } catch (error) {
       // Log to file only, not console
@@ -891,6 +905,42 @@ export class AcpBackend implements AgentBackend {
         }, ms);
       },
     };
+  }
+
+  /**
+   * Continues `options.resumeSessionId` so the agent keeps the conversation it
+   * already had (no history replay, unlike `session/load`). Null means a new
+   * session must start: nothing to resume, no support, or the agent refused it.
+   */
+  private async resumePreviousSession(
+    initializeResponse: InitializeResponse,
+    mcpServers: NewSessionRequest['mcpServers'],
+    timeoutMs: number,
+    startupFailurePromise: Promise<never>,
+  ): Promise<NewSessionResponse | null> {
+    const sessionId = this.options.resumeSessionId;
+    if (!sessionId || !initializeResponse.agentCapabilities?.sessionCapabilities?.resume) {
+      return null;
+    }
+    let timeoutHandle: NodeJS.Timeout | null = null;
+    try {
+      const resumed = await Promise.race([
+        startupFailurePromise,
+        this.connection!.unstable_resumeSession({ sessionId, cwd: this.options.cwd, mcpServers }),
+        new Promise<never>((_, reject) => {
+          timeoutHandle = setTimeout(() => reject(new Error(`Resume session timeout after ${timeoutMs}ms`)), timeoutMs);
+        }),
+      ]);
+      logger.debug(`[AcpBackend] Resumed session: ${sessionId}`);
+      return { ...resumed, sessionId };
+    } catch (error) {
+      logger.debug(`[AcpBackend] Could not resume session ${sessionId}; starting a new one:`, error);
+      return null;
+    } finally {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+    }
   }
 
   private emitInitialSessionMetadata(sessionResponse: NewSessionResponse): void {

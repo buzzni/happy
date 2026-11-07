@@ -2468,6 +2468,9 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect(delivered.content.text).toContain('Do not create, register, or resume a schedule');
         expect(delivered.content.text).toContain('current occurrence');
         expect(delivered.content.text.endsWith(original.content.text)).toBe(true);
+        // Saycode specs/scheduled-missed-run-policy R1·R2: the run time reaches the model, never the stored message.
+        const machineZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        expect(delivered.content.text).toMatch(new RegExp(`\\n\\[CURRENT RUN TIME: \\w+day, \\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2} \\(${machineZone}, UTC[+-]\\d{2}:\\d{2}\\)\\]\\nOriginal task:\\n`));
         expect(original.content.text).toBe('1시간마다 철학적인 문구 하나씩 해줘');
         expect(mockAxiosPost).not.toHaveBeenCalled();
         expect(mockAxiosPut).not.toHaveBeenCalled();

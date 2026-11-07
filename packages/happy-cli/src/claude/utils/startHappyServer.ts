@@ -1,10 +1,11 @@
 import { createLocalClientSession, registerLocalClientTools, LOCAL_CLIENT_TOOL_NAMES, type LocalClientSession } from '@/browserRuntime/localClientSession';
 import type { PolicyApprover } from '@/toolPolicy/policyGate';
 import { startSessionAgentBroker } from '@/commands/sessionAgentBroker';
-import { configuration } from '@/configuration';
 import { startHostOwnerContact, takeOwnerContactCapability } from '@/daemon/sessionOwnerContactHost';
 import { isDaemonCallerBindingCurrent, requestDaemonCallerBinding } from '@/daemon/controlClient';
-import { readCredentials } from '@/persistence';
+import { readCredentials, readSettings } from '@/persistence';
+import { configuration } from '@/configuration';
+import { createAgentRelationAuthority, readAgentRelationHost } from '@/daemon/agentRelationAuthority';
 import type { DelegatedAttendance } from '@/api/turnAttendance';
 import { registerSessionWriteScopeTools } from '@/daemon/sessionWriteScopeAgentTools';
 import { localToolAgentContext, requestLocalToolAgent } from '@/daemon/localToolAgentRelay';
@@ -763,11 +764,14 @@ export async function startHappyServer(
     const ownerContact = await startHostOwnerContact({ env: process.env, session: client,
         capability: () => takeOwnerContactCapability(process.env), issue: requestDaemonCallerBinding, current: isDaemonCallerBindingCurrent,
         token: async () => (await readCredentials())?.token ?? null,
-        // The broker's personal same-account check needs this host's own Happy origin (identity-adapter-plan H-C).
-        happyOrigin: configuration.serverUrl,
-        startBroker: (contact, identity) => options.agentControl
-            ? startSessionAgentBroker(client.sessionId, process.env, options.admitTool, undefined, options.delegatedAttendance, identity, contact)
-            : Promise.resolve(null) });
+        // Personal sibling relations come from Happy (personal-ownership-simplification-plan H-C2), whatever the
+        // owner-contact switch says. Server, machine and token are this host's own, fixed before the provider starts.
+        startBroker: async contact => options.agentControl
+            ? startSessionAgentBroker(client.sessionId, process.env, options.admitTool, undefined, options.delegatedAttendance,
+                createAgentRelationAuthority({ callerSessionId: client.sessionId,
+                    host: await readAgentRelationHost({ serverUrl: configuration.serverUrl, settings: () => readSettings(), credentials: readCredentials }) }),
+                contact)
+            : null });
     const agentBroker = ownerContact.broker;
     // Env for the stdio bridge. Codex and ACP agents receive it over JSON-RPC, not argv.
     const bridgeEnv: Record<string, string> = socketPath

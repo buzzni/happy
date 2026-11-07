@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto'
 import { AUTOMATION_CONTEXT_INPUT_MAX_BYTES, automationContextPolicySchema, automationMemoReferenceDataSchema, automationPreviousResultDataSchema, automationPreviousResultNoneSchema, automationExecutionQuestionIdentitySchema,
   type AutomationExecutionSeed, type AutomationPayload } from '@slopus/happy-wire'
-import { buildScheduledRunPrompt } from '@/utils/scheduledRunPrompt'
+import { buildScheduledRunPrompt, type ScheduledRunTime } from '@/utils/scheduledRunPrompt'
 
 export function buildAutomationContextInput(input: {
-  automationId: string; runId?: string; payload: AutomationPayload; previousResult?: unknown
+  automationId: string; runId?: string; runTime?: ScheduledRunTime; payload: AutomationPayload; previousResult?: unknown
 }): { initialPrompt: string; inputBytes: number; referenceBytes: number; references: AutomationExecutionSeed['references'];
   referenceSnapshots?: AutomationExecutionSeed['referenceSnapshots']; referenceResolution?: AutomationExecutionSeed['referenceResolution'] } {
   const policy = automationContextPolicySchema.safeParse(input.payload.contextPolicy)
@@ -13,7 +13,9 @@ export function buildAutomationContextInput(input: {
   const question = input.payload.executionQuestion
   if (question !== undefined && (!automationExecutionQuestionIdentitySchema.safeParse(question).success
     || input.runId !== question.requestId || policy.data.reference?.kind !== 'previous-result')) throw new Error('AUTOMATION_CONTEXT_POLICY_UNSUPPORTED')
-  let initialPrompt = buildScheduledRunPrompt(input.payload.prompt)
+  let initialPrompt = buildScheduledRunPrompt(input.payload.prompt, input.runTime ?? { at: 0 })
+  // Compatibility for already persisted pre-time snapshots; every new launch supplies its frozen runTime.
+  if (!input.runTime) initialPrompt = initialPrompt.replace(/^\[CURRENT RUN TIME:[^\n]+\]\n/m, '')
   let referenceBytes = 0
   const references: ReturnType<typeof buildAutomationContextInput>['references'] = []
   let referenceSnapshots: AutomationExecutionSeed['referenceSnapshots']

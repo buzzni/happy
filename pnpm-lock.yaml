@@ -932,8 +932,8 @@ importers:
         specifier: 0.96.0
         version: 0.96.0(zod@4.4.3)
       '@buzzni/saycode-cli':
-        specifier: 0.9.12
-        version: 0.9.12
+        specifier: 0.9.13
+        version: 0.9.13
       '@modelcontextprotocol/sdk':
         specifier: 1.29.0
         version: 1.29.0(zod@4.4.3)
@@ -2030,8 +2030,8 @@ packages:
   '@bufbuild/protobuf@1.10.1':
     resolution: {integrity: sha512-wJ8ReQbHxsAfXhrf9ixl0aYbZorRuOWpBNzm8pL8ftmSxQx/wnJD5Eg861NwJU/czy2VXFIebCeZnZrI9rktIQ==}
 
-  '@buzzni/saycode-cli@0.9.12':
-    resolution: {integrity: sha512-HoBwVo6jjcLSmryCOWAKgYsP27YuZ0uCkRsLvSznvGLosbse64kPhGa68WxbvGI5304SlnWYT1G6oOJ8dG0w7Q==}
+  '@buzzni/saycode-cli@0.9.13':
+    resolution: {integrity: sha512-xJ/S8TveIdfnqFcVJXWZwNa3Z54ybXDav/Dorj2w1mH2YAgRMJpab0XyD2rZ44G4z0UBkq2FBO0U+tTzxVg0XQ==}
     engines: {node: '>=20'}
     hasBin: true
 
@@ -13808,7 +13808,7 @@ snapshots:
 
   '@bufbuild/protobuf@1.10.1': {}
 
-  '@buzzni/saycode-cli@0.9.12': {}
+  '@buzzni/saycode-cli@0.9.13': {}
 
   '@chevrotain/cst-dts-gen@11.0.3':
     dependencies:

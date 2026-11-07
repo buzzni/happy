@@ -637,6 +637,7 @@ export type Metadata = {
   machineId?: string,
   claudeSessionId?: string, // Claude Code session ID
   codexThreadId?: string, // Codex app-server thread ID
+  acpSessionId?: string, // ACP agent session ID (OpenCode), continued with session/resume on a daemon resume
   tools?: string[],
   slashCommands?: string[],
   /**
@@ -738,10 +739,14 @@ export type AgentGoalStatus = {
       status: 'active',
       sourceSessionId: string,
       text: string,
+      /** Codex: why the goal is or is not running. Absent from older runtimes, which only report `active`. */
+      phase?: 'active' | 'paused' | 'blocked' | 'usageLimited',
       capabilities?: {
         clear?: boolean,
         stop?: boolean,
         edit?: boolean,
+        /** `goal-action {action:'resume'}` restarts a paused goal without changing its objective. */
+        resume?: boolean,
       },
       progress?: {
         currentStep?: number,

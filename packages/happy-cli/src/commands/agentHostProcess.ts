@@ -45,6 +45,24 @@ export function runAgentHostProcess(input: {
         if (child.connected) child.send({ type: 'owner-contact-v1-result', requestId: value.requestId, ...response }, () => {})
         return
       }
+      if (value?.type === 'agent-ownership-v1' && Object.keys(value).length === 3 && Array.isArray(value.targetSessionIds)) {
+        // One batch per listing (Desktop personal-ownership-simplification-plan S-D5 a). The host itself is never vouched for.
+        const ids = value.targetSessionIds
+        if (typeof value.requestId !== 'string' || value.requestId.length > 64 || ids.length < 1 || ids.length > 100
+          || !ids.every(id => typeof id === 'string' && id && id.length <= 256) || pending >= 16) return
+        pending++
+        const targets = [...new Set(ids as string[])].filter(id => id !== input.sourceSessionId)
+        const ownerships: Record<string, Awaited<ReturnType<AgentIdentityAuthority['inspect']>>> = {}
+        for (const id of ids as string[]) ownerships[id] = { relation: 'unknown', proof: null, reason: 'identity-unavailable' }
+        try {
+          const answers = !targets.length ? {} : input.identityAuthority.inspectMany ? await input.identityAuthority.inspectMany(targets)
+            : Object.fromEntries(await Promise.all(targets.map(async id => [id, await input.identityAuthority.inspect(id)])))
+          for (const id of targets) if (Object.hasOwn(answers, id)) ownerships[id] = answers[id]
+        } catch { /* No fallback to request env, company credentials or metadata. */ }
+        finally { pending-- }
+        if (child.connected) child.send({ type: 'agent-ownership-v1-result', requestId: value.requestId, ownerships }, () => {})
+        return
+      }
       if (!value || value.type !== 'agent-ownership-v1' || Object.keys(value).length !== 3
         || typeof value.requestId !== 'string' || value.requestId.length > 64
         || typeof value.targetSessionId !== 'string' || !value.targetSessionId || value.targetSessionId.length > 256 || pending >= 16) return

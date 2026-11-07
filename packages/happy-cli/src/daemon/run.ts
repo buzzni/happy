@@ -142,7 +142,7 @@ import { createCollectorSchedule } from './collectorSchedule';
 import { organizationResumeRefusal, resumeSetupTokenEnvironment, shareResumeInFlight, type ResumeAuthRequirement } from './resumeSetupTokenRebind';
 import type { AiAuthSource } from '@/usage/aiAuthSource';
 import { detectCLIAvailability } from '@/utils/detectCLI';
-import { buildResumeLaunch } from '@/resume/handleResumeCommand';
+import { buildResumeLaunch, resumeLaunchAgent } from '@/resume/handleResumeCommand';
 import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
 import { decodeBase64, decrypt, encodeBase64, encrypt } from '@/api/encryption';
 import {
@@ -175,6 +175,8 @@ import {
   shareInFlight,
 } from './resumeGuards';
 import { decideResumeCursorPersist } from './resumeCursorPersistence';
+import { createSessionRetention, retentionProtects } from './sessionRetention';
+import { readStaleRuntimeRestartConfig, sweepStaleRuntimeSessions } from './staleRuntimeSessionRestart';
 import { stageInitialPromptEnvironment } from '@/utils/initialPrompt';
 import { outputFormatSeed, STRUCTURED_OUTPUT_CAPABILITY } from '@/claude/structuredOutput';
 import {
@@ -3234,6 +3236,7 @@ export async function startDaemon(): Promise<void> {
           {
             startedBy: 'daemon',
             claudeStartingMode: 'remote',
+            automationPrompt: options?.automation !== undefined,
             emptyCodexSession: { serverSeq: serverSnapshot.seq, processedSeq: baselineSeq },
             ...(unstartedMachineExecution ? { emptyMachineClaudeSession: { sessionId: happySessionId, serverSeq: serverSnapshot.seq, processedSeq: baselineSeq, startNeverSubmitted: true as const } } : {}),
           },
@@ -3290,7 +3293,8 @@ export async function startDaemon(): Promise<void> {
           }
         }
 
-        if (options?.model) {
+        // An ACP agent takes its model with each message; `opencode acp` has no --model flag.
+        if (options?.model && resumeLaunchAgent(launch) !== 'opencode') {
           launch.args.push('--model', options.model);
         }
         if (options?.permissionMode) {
@@ -3321,7 +3325,7 @@ export async function startDaemon(): Promise<void> {
           ? await stageInitialPromptEnvironment(options.automation.initialPrompt)
           : null;
 
-        const resumeAgent = launch.args[0] === 'codex' ? 'codex' : 'claude';
+        const resumeAgent = resumeLaunchAgent(launch);
         const inheritedResumeEnvironment = resolveInheritedSpawnEnvironment({
           agent: resumeAgent,
           env: process.env,
@@ -3844,6 +3848,7 @@ export async function startDaemon(): Promise<void> {
     // yet — the guard measures their report silence from this moment, not from
     // their (possibly days-old) session start.
     const daemonStartedAt = Date.now();
+    const sessionRetention = createSessionRetention({ home: configuration.happyHomeDir, children: () => getCurrentChildren().filter(session => isPidAlive(session.pid)) });
 
     // The entry `stopSession` below would pick, without touching it. Same two
     // conditions on purpose: the verification must snapshot the process the
@@ -3886,7 +3891,13 @@ export async function startDaemon(): Promise<void> {
               return { stopped: false, reason: 'active', guard: decision.guard, activity: decision.activity };
             }
           } else if (mode === 'if-idle') {
+            let retention;
+            try { retention = session.happySessionId ? sessionRetention.record(session.happySessionId) : undefined; }
+            catch {
+              if (context?.source !== 'session-zombie-sweep') return { stopped: false, reason: 'active', guard: 'retention-store-unavailable', activity: { thinking: false, hasOpenToolCall: false, pendingUserInput: false } };
+            }
             const decision = evaluateIdleStopGuard({
+              retention,
               runtime: session.runtime,
               sessionStartedAt: sessionStartTimes.get(pid),
               daemonStartedAt,
@@ -4360,6 +4371,7 @@ export async function startDaemon(): Promise<void> {
       handingOff: () => restartDrainRuntime?.controlPort.handingOff() ?? false,
     };
     const { port: controlPort, stop: stopControlServer, controlSecret } = await startDaemonControlServer({
+      ...(managedRuntimeActive ? {} : { sessionRetention }),
       restartDrain: restartDrainControlPort,
       getCallerLaunches: () => callerLaunches,
       ...(admitSubprocess ? { admitSubprocess, reserveLegacyDispatch } : {}),
@@ -5748,8 +5760,6 @@ export async function startDaemon(): Promise<void> {
     // A token's account never changes, so only a confirmed answer is remembered; registration is re-read every time.
     const accountByToken = new Map<string, string>();
     callerLaunches = createAgentCallerLaunches({ enabled: process.env[OWNER_CONTACT_SWITCH] === '1',
-      // Configured ownership trust opens bindings for the broker's same-account check alone (identity-adapter-plan D2).
-      identityOnly: readOwnerContactTrust(process.env, configuration.serverUrl) !== null,
       identity: async () => {
         try {
           const state = await ownedRegistration(), token = state.credentials.token;
@@ -5784,6 +5794,7 @@ export async function startDaemon(): Promise<void> {
     const prepareBrowserSessionReconnect = createBrowserSessionReconnect();
     // Set RPC handlers
     apiMachine.setRPCHandlers({
+      ...(managedRuntimeActive ? {} : { sessionRetention }),
       ownedSpawn,
       daemonSessionState: createDaemonSessionStateHandler(getCurrentChildren),
       byosOfflineReceive,
@@ -6091,6 +6102,7 @@ export async function startDaemon(): Promise<void> {
       : 60_000;
     const idleReaperConfig = readDaemonSessionIdleReaperConfig(process.env, { managedRuntimeActive });
     const emptySessionReaperMs = readEmptySessionReaperMs(process.env);
+    const staleRuntimeRestartConfig = readStaleRuntimeRestartConfig(process.env);
     let heartbeatRunning = false
     const restartOnStaleVersionAndHeartbeat = setInterval(async () => {
       if (heartbeatRunning) {
@@ -6206,6 +6218,24 @@ export async function startDaemon(): Promise<void> {
       if (handingOffToInstalledBundle) {
         heartbeatRunning = false;
         return;
+      }
+      // Session processes outlive a daemon update and keep the old code: stop idle ones so the
+      // next input resumes them on this runtime (aplus specs/stale-runtime-session-restart).
+      // Not while this daemon is itself about to be replaced — a resume would be refused meanwhile.
+      if (handoffAutomation === 'run-automations' && !bundleReplaced && !managedRuntimeActive && !staleRuntimeRestartConfig.disabled) {
+        sweepStaleRuntimeSessions({
+          trackedSessions: getCurrentChildren(),
+          sessionStartTimes,
+          daemonVersion: packageJson.version,
+          stopSession,
+          retentionProtects: (session) => {
+            try { return retentionProtects(sessionRetention.record(session.happySessionId!), session.runtime, Date.now()); }
+            catch { return true; }
+          },
+          quietMs: staleRuntimeRestartConfig.quietMs,
+          batchMax: idleReaperConfig.batchMax,
+          logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
+        });
       }
       if (handoffAutomation === 'run-automations') {
         // Scheduled automations tick — 하트비트 케이던스로 기동하되 await하지

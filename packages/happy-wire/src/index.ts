@@ -25,6 +25,7 @@ export * from './orgRequirements';
 export * from './scheduledTasks';
 export * from './sharedMachineRotation';
 export * from './sessionOwnership';
+export * from './sessionOwnershipRelation';
 
 export * from './sessionOwnerRelay';
 export * from './sessionOwnerRelayCodec';

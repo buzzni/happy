@@ -41,6 +41,23 @@ describe('describeClaudeLaunchFailure', () => {
         expect(describeClaudeLaunchFailure(new Error('Claude Code process terminated by signal SIGABRT. stderr: ASSERTION FAILED: MemoryExhaustion'))).toMatch(/stopped unexpectedly \(SIGABRT\)/);
     });
 
+    // The SDK reports a signalled child as "exited with code 128+N", not "terminated by signal"
+    // (2026-11-06: a stray `pkill` SIGTERMed idle Claude children and users saw only the generic text).
+    it('names the signal behind a 128+N exit code in the format Desktop already recognises', () => {
+        expect(describeClaudeLaunchFailure(new Error('Claude Code process exited with code 143')))
+            .toBe('Claude Code could not start: it stopped unexpectedly (SIGTERM). Check this machine\'s daemon log.');
+        expect(describeClaudeLaunchFailure(new Error('Claude Code process exited with code 137'))).toMatch(/\(SIGKILL\)/);
+        expect(describeClaudeLaunchFailure(new Error('Claude Code process exited with code 1'))).toMatch(/could not start on this machine/);
+        expect(describeClaudeLaunchFailure(new Error('Claude Code process exited with code 200'))).toMatch(/could not start on this machine/);
+    });
+
+    it('says the account is on hold instead of a generic startup failure', () => {
+        const message = describeClaudeLaunchFailure(new Error('Claude Code returned an error result: Your account is on hold and can\'t use Claude Code. View details or appeal: https://claude.ai/restricted'));
+        expect(message).toMatch(/on hold/);
+        expect(message).toContain('https://claude.ai/restricted');
+        expect(message).not.toMatch(/could not start/);
+    });
+
     it('falls back to a generic message and never echoes unknown stderr', () => {
         const message = describeClaudeLaunchFailure(new Error('Claude Code process exited with code 1. stderr: token=sk-ant-secret-value at /home/me/.claude'));
         expect(message).not.toMatch(/sk-ant|\/home\/me/);

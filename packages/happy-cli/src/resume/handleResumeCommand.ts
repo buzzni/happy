@@ -18,6 +18,8 @@ export type ResumeLaunchOptions = {
     startedBy?: 'daemon' | 'terminal';
     /** Fresh authenticated server head and the prior child's processed cursor. */
     emptyCodexSession?: { serverSeq?: number; processedSeq: number };
+    /** The launch carries an automation prompt and run-once flag (daemon automation resume). */
+    automationPrompt?: boolean;
     /** Daemon-only durable machine execution proof: no provider start was ever submitted. */
     emptyMachineClaudeSession?: { sessionId: string; serverSeq?: number; processedSeq: number; startNeverSubmitted: true };
 };
@@ -49,12 +51,15 @@ export function parseResumeCommandArgs(args: string[]): { showHelp: boolean; ses
     };
 }
 
-function resolveFlavor(metadata: Metadata): 'codex' | 'claude' | null {
+function resolveFlavor(metadata: Metadata): 'codex' | 'claude' | 'opencode' | null {
     if (metadata.flavor === 'codex' || metadata.codexThreadId) {
         return 'codex';
     }
     if (metadata.flavor === 'claude' || metadata.claudeSessionId) {
         return 'claude';
+    }
+    if (metadata.flavor === 'opencode') {
+        return 'opencode';
     }
     return null;
 }
@@ -101,7 +106,29 @@ export function buildResumeLaunch(session: ResumableHappySession, options: Resum
         };
     }
 
+    // Daemon only: the daemon hands the ACP runner this Happy session to reattach to,
+    // and the runner asks OpenCode to continue its own session (metadata.acpSessionId).
+    // A terminal launch has neither and would start a new conversation instead.
+    if (flavor === 'opencode' && options.startedBy === 'daemon') {
+        // The ACP runner reads neither: the resume would report success, drop the prompt
+        // and never exit. Refused, the caller falls back to a new session.
+        if (options.automationPrompt) {
+            throw new Error(`Happy session ${session.id} cannot take an automation prompt: the OpenCode runner does not support one.`);
+        }
+        return {
+            cwd: metadata.path,
+            args: ['acp', 'opencode', '--started-by', 'daemon'],
+        };
+    }
+
     throw new Error(`Happy session ${session.id} uses unsupported flavor "${metadata.flavor ?? 'unknown'}".`);
+}
+
+/** The agent a resumed launch runs, which decides the credentials the daemon gives it. */
+export function resumeLaunchAgent(launch: ResumeLaunch): 'claude' | 'codex' | 'opencode' {
+    if (launch.args[0] === 'codex') return 'codex';
+    if (launch.args[0] === 'acp') return 'opencode';
+    return 'claude';
 }
 
 export function formatResumeHelp(): string {

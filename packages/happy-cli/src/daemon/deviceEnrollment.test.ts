@@ -123,6 +123,25 @@ it('blocks re-enrollment during persistence and rejects enrollment over a stored
  await expect(f.state.begin(input())).rejects.toThrow('ORG_ALREADY_PINNED');
 });
 
+// aplus#5876 — a PC approved as dedicated and then made shared must be able to register again, under the same key only.
+it('registers over a pin for another kind of PC under the same key and replaces exactly that pin',async()=>{
+ const signer=nacl.sign.keyPair();const publicKey=Buffer.from(signer.publicKey).toString('base64url');
+ const pinned={publicKey,policy:'signed-required',approval:{body:{kind:'device-approval',companyId:'company',machineType:'dedicated',ownerUserId:'user'}}};
+ const store={get:vi.fn().mockResolvedValue(pinned),pin:vi.fn().mockResolvedValue(undefined)};
+ const f=fixture(store as never);const request={...input(),orgSigningPublicKey:publicKey};
+ await expect(f.state.begin(request)).rejects.toThrow('ORG_ALREADY_PINNED');
+ await expect(f.state.begin({...request,ownerUserId:'other'})).resolves.toBeDefined();
+ await expect(f.state.begin({...input(),machineType:'shared',ownerUserId:null})).rejects.toThrow('ORG_ALREADY_PINNED');
+ const pending=await f.state.begin({...request,machineType:'shared',ownerUserId:null});const t=pending.transcript;
+ const approval=JSON.stringify(await signOrgSetupTokenDocument({version:1,kind:'device-approval',companyId:t.companyId,signingGeneration:t.signingGeneration,
+  signingKeyId:await orgSetupTokenKeyId(signer.publicKey),issuedAt:1000,approvalId:'shared',approvalRevision:1,machineId:t.machineId,machineType:t.machineType,
+  ownerUserId:t.ownerUserId,deviceSigningPublicKey:t.deviceSigningPublicKey,recipientPublicKey:t.recipientPublicKey,enrollmentDigest:pending.digest},signer.secretKey));
+ await f.state.approve(approval);await f.state.confirm({companyId:'company',machineId:'machine',enrollmentDigest:pending.digest});
+ expect(store.pin).toHaveBeenCalledTimes(1);
+ expect(store.pin.mock.calls[0][0]).toMatchObject({publicKey,approval:{body:{approvalId:'shared',machineType:'shared'}}});
+ expect(store.pin.mock.calls[0][1]).toBe(pinned);
+});
+
 it('returns only public local status for the requested organization and reads persistent pins after restart',async()=>{
  const store={get:vi.fn().mockResolvedValue(null),pin:vi.fn().mockResolvedValue(undefined)};
  const f=await approvalFixture(store);

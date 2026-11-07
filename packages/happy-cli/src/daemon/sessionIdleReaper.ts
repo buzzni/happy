@@ -1,6 +1,7 @@
 import axios from 'axios';
 
 import type { SessionRuntimeState, TrackedSession } from './types';
+import { retentionProtects, type RetentionRecord } from './sessionRetention';
 
 /** Idle cut: a session with no real user activity for this long is cleaned up
  *  (SIGTERM — the session stays resumable). */
@@ -277,6 +278,7 @@ export function readIdleStopGuardConfig(env: NodeJS.ProcessEnv = process.env): I
  * restart instead of being reaped on the first tick.
  */
 export function evaluateIdleStopGuard(input: {
+  retention?: RetentionRecord;
   runtime?: SessionRuntimeState;
   sessionStartedAt?: number;
   /** When this daemon process started — lower bound for how long a session
@@ -345,6 +347,8 @@ export function evaluateIdleStopGuard(input: {
   if (silenceSinceAt !== undefined && now - silenceSinceAt >= config.hardCapMs) {
     return { allow: true };
   }
+
+  if (retentionProtects(input.retention, runtime, now)) return deny('session-retention');
 
   if (sessionAgeMs !== undefined && sessionAgeMs < config.minSessionAgeMs) {
     return deny('min-session-age');
@@ -664,7 +668,7 @@ export function sweepEmptySessions(input: {
   return stopped;
 }
 
-function resolveStoppableAgent(session: TrackedSession): 'claude' | 'codex' | null {
+export function resolveStoppableAgent(session: TrackedSession): 'claude' | 'codex' | null {
   const flavor = session.happySessionMetadataFromLocalWebhook?.flavor;
   if (flavor === 'claude' || flavor === 'codex') return flavor;
   if (!flavor) return 'claude';

@@ -45,6 +45,7 @@ export interface AutomationContextLaunchJournal {
 }
 
 const launchRequestSchema = z.strictObject({ automationId: z.string().min(1).max(200), generation: z.number().int().positive(), revision: z.number().int().positive(),
+  runTime: z.strictObject({at:z.number().int().nonnegative().safe(),timeZone:z.string().min(1).max(100).optional()}).optional(),
   runId: z.string().regex(/^[A-Za-z0-9_-]{1,160}$/), claimToken: z.string().min(1).max(256), payload: automationPayloadSchema, previousResult: z.unknown().optional() })
 export type AutomationContextLaunchRequest = z.infer<typeof launchRequestSchema>
 type AutomationContextRecovery = { state: 'not-started' | 'running' | 'ended' | 'needs-attention'; sessionId: string; displaySessionId: string;
@@ -214,23 +215,33 @@ export function createAutomationContextLauncher(deps: AutomationContextLaunchDep
     state: 'started' | 'needs-attention' | 'waiting'; sessionId: string; displaySessionId: string; reason?: string
   }> {
     input = normalizeRequest(input)
-    const seed = buildAutomationContextInput(input)
     const { automationId, generation, revision, runId } = input
     const { directory, model, effort } = input.payload, agent = input.payload.agent as 'claude' | 'codex'
     const sessionId = automationExecutionSessionId(runId), displaySessionId = input.payload.conversation!.sessionId
     if (isAutomationExecutionSessionId(displaySessionId)) throw new Error('AUTOMATION_LAUNCH_IDENTITY_CONFLICT')
-    const executionSeed = automationExecutionSeedSchema.parse({ version: 1, automationId, generation, revision, runId, displaySessionId,
-      question: input.payload.prompt, inputBytes: seed.inputBytes, referenceBytes: seed.referenceBytes, references: seed.references,
-      inputSha256: createHash('sha256').update(seed.initialPrompt).digest('hex'), wholeContextTokens: 'unknown',
-      ...(seed.referenceSnapshots ? { referenceSnapshots: seed.referenceSnapshots } : {}),
-      ...(seed.referenceResolution ? { referenceResolution: seed.referenceResolution } : {}) })
-    const { question, referenceSnapshots: _snapshots, ...seedFields } = executionSeed
-    const seedManifest = automationExecutionSeedManifestSchema.parse({ ...seedFields,
-      questionBytes: Buffer.byteLength(question, 'utf8'), seedSha256: digest(executionSeed) })
-    const requestHash = hashRequest(input)
     const publicResult = (state: 'started' | 'needs-attention') => ({ state, sessionId, displaySessionId })
     return exclusive(runId, async () => {
       let record = await deps.journal.read(runId)
+      if (!input.runTime) {
+        if (record) {
+          if (!record.prepared.requestCiphertext) throw new Error('AUTOMATION_LAUNCH_SNAPSHOT_INVALID')
+          const saved = launchRequestSchema.parse(decrypt(decodeBase64(record.prepared.encryptionKey), record.prepared.encryptionVariant,
+            decodeBase64(record.prepared.requestCiphertext)))
+          // Missing runTime is a pre-time journal. Preserve its exact old prompt/hash instead of replaying it as a new occurrence.
+          if (saved.runTime) input = normalizeRequest({ ...input, runTime: saved.runTime })
+        } else input = normalizeRequest({ ...input, runTime: { at: Date.now(), timeZone: 'timeZone' in input.payload.schedule
+          ? input.payload.schedule.timeZone : Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC' } })
+      }
+      const seed = buildAutomationContextInput(input)
+      const executionSeed = automationExecutionSeedSchema.parse({ version: 1, automationId, generation, revision, runId, displaySessionId,
+        question: input.payload.prompt, inputBytes: seed.inputBytes, referenceBytes: seed.referenceBytes, references: seed.references,
+        inputSha256: createHash('sha256').update(seed.initialPrompt).digest('hex'), wholeContextTokens: 'unknown',
+        ...(seed.referenceSnapshots ? { referenceSnapshots: seed.referenceSnapshots } : {}),
+        ...(seed.referenceResolution ? { referenceResolution: seed.referenceResolution } : {}) })
+      const { question, referenceSnapshots: _snapshots, ...seedFields } = executionSeed
+      const seedManifest = automationExecutionSeedManifestSchema.parse({ ...seedFields,
+        questionBytes: Buffer.byteLength(question, 'utf8'), seedSha256: digest(executionSeed) })
+      const requestHash = hashRequest(input)
       if (record && (record.scope !== scope || record.requestHash !== requestHash || record.sessionId !== sessionId
         || record.displaySessionId !== displaySessionId || record.automationId !== automationId
         || record.generation !== generation || record.revision !== revision)) throw new Error('AUTOMATION_LAUNCH_IDENTITY_CONFLICT')

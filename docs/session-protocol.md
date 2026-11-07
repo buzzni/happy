@@ -132,6 +132,7 @@ Tool invocation completes. Matches a prior `tool-call-start` by `call`.
 | `call` | string | Matches `tool-call-start.call` |
 | `images` | array? | Optional. Image blocks of the tool result (e.g. Read on an image file), each `{ mediaType, data }` with base64 `data`. They ride inline on this event instead of a separate upload; consumers that only read `call` are unaffected |
 | `backgroundTaskId` | string? | Optional. The detached job a Claude `run_in_background` launch created: later reports about that job carry this id, never the tool call id, and its completion answers the request again. Transport metadata, never rendered. A Codex `CodexAgent` row never carries it |
+| `result` | object? | Optional. The text the tool returned, as `{ text, isError?, omitted? }`. Cleaned in this order: a string body as is, or the `text` blocks of an array body joined with `\n` (other blocks are skipped — images keep using `images`); ANSI escapes removed; `\r\n` turned into `\n`. Lengths count code points: over 16,000 it keeps the first 6,000 and the last 10,000 (so the cut is always right after code point 6,000 and never splits a surrogate pair) and `omitted` is the number dropped between them. `isError` is set only when the provider flagged the result as an error. Left out for policy-redacted tools (`HAPPY_REDACT_*`), for a call whose `tool_use` the CLI never saw (it cannot check the policy, e.g. after attaching mid-call), and for a body with no text that is not an error. Claude only for now; absent from older CLIs |
 
 ### `file`
 

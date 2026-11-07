@@ -30,6 +30,15 @@ function harness(overrides: Record<string, unknown> = {}) {
 }
 
 describe('personal desktop runtime bootstrap', () => {
+    it('keeps a personal browser cold through preparation and admission checks', async () => {
+        const { deps, events } = harness()
+        const runtime = await bootstrapPersonalDesktopRuntime(config(), paths.stateDir, deps)
+        await runtime.session.check()
+        expect(events).not.toContain('launch')
+        await runtime.close()
+        expect(events).not.toContain('launch')
+        expect(events.at(-1)).toBe('unlock')
+    })
     it('keeps every file in the user Saycode directory', () => {
         expect(paths).toMatchObject({ root: '/Users/u/Library/Application Support/Saycode/browser-runtime',
             stateDir: '/Users/u/Library/Application Support/Saycode/browser-runtime/state',
@@ -51,13 +60,17 @@ describe('personal desktop runtime bootstrap', () => {
         const runtime = await bootstrapPersonalDesktopRuntime(windowsConfig, windowsPaths.stateDir, deps)
         expect(runtime.sockets).toEqual({ broker: windowsPaths.brokerSocket, admin: windowsPaths.adminSocket })
         expect(deps.prepareDirectory).toHaveBeenCalledWith(windowsPaths.profileDir, undefined)
+        expect(deps.launch).not.toHaveBeenCalled()
+        await runtime.startBrowser()
         expect(deps.openSession).toHaveBeenCalledWith(expect.objectContaining({ protection: { mode: 'basic', identity: 'S-1-5-21-1-2-3-1001' } }))
+        await runtime.close()
     })
 
     it('prepares private directories, verifies the browser, locks, then opens a same-user session on the dedicated profile', async () => {
         const { deps, events } = harness()
         const runtime = await bootstrapPersonalDesktopRuntime(config(), paths.stateDir, deps)
-        expect(events).toEqual([`dir ${paths.root}`, `dir ${paths.stateDir}`, `dir ${paths.profileDir}`, `dir ${paths.runDir}`, 'verify', 'lock', 'launch', 'session'])
+        await runtime.startBrowser()
+        expect(events).toEqual([`dir ${paths.root}`, `dir ${paths.stateDir}`, `dir ${paths.profileDir}`, `dir ${paths.runDir}`, 'verify', 'lock', 'verify', 'launch', 'session'])
         expect(deps.launch).toHaveBeenCalledWith(expect.objectContaining({ platform: 'darwin', executable: CHROME, profileDir: paths.profileDir }))
         expect(deps.openSession).toHaveBeenCalledWith(expect.objectContaining({ protection: { mode: 'basic', identity: '501' }, owner: { bootId: 'b', pid: 900, pidStartTime: '1' } }))
         expect(runtime.sockets).toEqual({ broker: paths.brokerSocket, admin: paths.adminSocket })
@@ -87,8 +100,10 @@ describe('personal desktop runtime bootstrap', () => {
 
     it('terminates the browser and releases the lock when the session cannot open', async () => {
         const { deps, events } = harness({ openSession: vi.fn(async () => { throw new Error('RUNTIME_UNAVAILABLE') }) })
-        await expect(bootstrapPersonalDesktopRuntime(config(), paths.stateDir, deps)).rejects.toThrow('RUNTIME_UNAVAILABLE')
+        const runtime = await bootstrapPersonalDesktopRuntime(config(), paths.stateDir, deps)
+        await expect(runtime.startBrowser()).rejects.toThrow('RUNTIME_UNAVAILABLE')
         expect(events).toContain('terminate')
+        await runtime.close()
         expect(events).toContain('unlock')
     })
 
@@ -110,6 +125,7 @@ describe('personal desktop runtime bootstrap', () => {
         const { deps, session } = harness()
         session.close.mockResolvedValueOnce({ terminated: false })
         const runtime = await bootstrapPersonalDesktopRuntime(config(), paths.stateDir, deps)
+        await runtime.startBrowser()
         await expect(runtime.close()).rejects.toThrow(/unconfirmed/)
     })
 })
