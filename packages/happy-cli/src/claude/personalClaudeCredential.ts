@@ -5,6 +5,7 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { groupAccountIdentity } from '@/daemon/aiCredentialGroupAdapters'
+import { withUvToolBinOnPath } from '@/daemon/uvToolBin'
 
 export type PersonalClaudeCredential = { accountRef: string; label: string; accessToken: string; expiresAt: number; roster?: { email: string; organizationUuid: string } }
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value)
@@ -67,7 +68,8 @@ export async function readPersonalClaudeCredentials(): Promise<PersonalClaudeCre
                 legacyIdentities.push([row[0], row[1]])
             }
         }
-        const result = await promisify(execFile)('cswap', ['export', '-'], { timeout: 15_000, maxBuffer: 1024 * 1024 })
+        // An app opened from the Dock has no shell PATH: find cswap where the daemon installed it.
+        const result = await promisify(execFile)('cswap', ['export', '-'], { timeout: 15_000, maxBuffer: 1024 * 1024, env: withUvToolBinOnPath() })
         if (before !== await readFile(path, 'utf8') || provenance !== await readProvenance()) return []
         return personalClaudeCredentials(JSON.parse(result.stdout), JSON.parse(before), Date.now(), legacyIdentities)
     } catch { return [] }
