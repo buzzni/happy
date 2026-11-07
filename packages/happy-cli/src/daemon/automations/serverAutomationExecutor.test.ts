@@ -5766,6 +5766,39 @@ describe('돌아오면 1회 실행', () => {
     expect(store.state().schedules[0]!.nextRunAt).toBe(T - 185 * MIN)
   })
 
+  it('does not run late once the collapsed row has failed to store several times', async () => {
+    // The schedule would move past the gap it never recorded; give the gap up like the default rule does.
+    const { input, transport, spawnSession, recordMissed } = back({
+      nextRunAt: T - 185 * MIN, record: { ok: false, error: 'record-failed' }, claim: { ok: false, error: 'claim-denied' },
+    })
+
+    for (let tick = 0; tick < 5; tick++) await runServerAutomationTick(input)
+
+    expect(recordMissed).toHaveBeenCalledTimes(5)
+    expect(transport.claim).toHaveBeenCalledTimes(1)
+    expect(transport.claim).toHaveBeenCalledWith({ automationId: 'automation-1', generation: 2, scheduledFor: T - 185 * MIN })
+    expect(spawnSession).not.toHaveBeenCalled()
+  })
+
+  it('still runs an opted-in one-time occurrence late once after the workspace held it before its claim', async () => {
+    const once = { kind: 'once-zoned' as const, date: '2026-11-07', hour: 6, minute: 0, timeZone: 'UTC' }
+    const slot = Date.UTC(2026, 10, 7, 6, 0)
+    const { input, transport, spawnSession, recordMissed } = back({ schedule: once, enabledAt: T - 4 * 60 * MIN, generation: 3 })
+    const reserve = vi.fn()
+      .mockResolvedValueOnce({ acquired: false as const, reason: 'workspace-busy' as const, sessions: ['other'] })
+      .mockResolvedValue({ acquired: true as const, finish: vi.fn(async () => undefined) })
+    Object.assign(input, { reserveLegacyDispatch: reserve })
+
+    await runServerAutomationTick(input)
+    expect(transport.claim).not.toHaveBeenCalled()
+
+    input.now = T + 5 * MIN
+    await runServerAutomationTick(input)
+    expect(recordMissed).not.toHaveBeenCalled()
+    expect(transport.claim).toHaveBeenCalledWith({ automationId: 'automation-1', generation: 3, scheduledFor: slot, catchUp: true })
+    expect(spawnSession).toHaveBeenCalledTimes(1)
+  })
+
   it('moves on without a second try when another run still holds the automation', async () => {
     const { input, store, transport, spawnSession } = back({ nextRunAt: T - 185 * MIN, claim: { ok: false, error: 'active-run' } })
 

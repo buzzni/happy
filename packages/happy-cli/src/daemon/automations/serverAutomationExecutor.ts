@@ -821,8 +821,14 @@ async function recordMissedRuns(
   now: number,
   claimedSlotsLeft = MAX_CLAIMED_SLOTS_PER_TICK,
 ): Promise<'claim' | 'retry' | 'recorded' | 'catch-up'> {
+  const optedIn = payload.missedRunPolicy === 'catch_up_once' && server.catchesUp
   if (isOnceSchedule(payload.schedule) && schedule.contextAdmissionDeferred?.revision === automation.revision
-    && schedule.contextAdmissionDeferred.scheduledFor === schedule.nextRunAt) return 'claim'
+    && schedule.contextAdmissionDeferred.scheduledFor === schedule.nextRunAt) {
+    // Held before its claim (workspace busy), not missed offline. An opted-in occurrence held past the claim window
+    // still runs late once (R13); the server refuses it if it is too old or from before this generation.
+    const held = { firstMissedAt: schedule.nextRunAt, missedCount: 1, capped: false, resumeAt: null }
+    return optedIn && planCatchUp(payload.schedule, held, now)?.runAt != null ? 'catch-up' : 'claim'
+  }
   if (!server.recordsMissedRuns || !input.transport.recordMissed) return 'claim'
   const plan = planMissedRuns({
     schedule: payload.schedule,
@@ -836,9 +842,7 @@ async function recordMissedRuns(
   })
   if (!plan) return 'claim'
   // 기본·건너뜀(R12)과 서버가 늦은 claim 을 모르면 전부 놓침으로 기록한다. 너무 오래된 공백도 같다.
-  const catchUp = payload.missedRunPolicy === 'catch_up_once' && server.catchesUp
-    ? planCatchUp(payload.schedule, plan, now)
-    : null
+  const catchUp = optedIn ? planCatchUp(payload.schedule, plan, now) : null
   if (catchUp && catchUp.collapsedCount === 0 && catchUp.runAt !== null) {
     schedule.nextRunAt = catchUp.runAt
     return 'catch-up'
@@ -862,11 +866,8 @@ async function recordMissedRuns(
       }
       // Never stored after several tries: let later slots run rather than hold the automation forever.
       attempts.delete(attemptKey)
+      // A late run would move the schedule past the gap it could not record, so this gives up on it too.
       input.logDebug?.(`[server-automation] ${automation.automationId} missed-run record not stored after ${failed} tries; skipping without a record`)
-      if (catchUp?.runAt != null) {
-        schedule.nextRunAt = catchUp.runAt
-        return 'catch-up'
-      }
       return 'claim'
     }
     attempts.delete(attemptKey)
