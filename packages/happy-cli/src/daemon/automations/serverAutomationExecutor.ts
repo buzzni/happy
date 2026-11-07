@@ -1289,7 +1289,12 @@ async function executeStartedRun(
     input.logDebug?.(`[server-automation] ${automation.automationId} needs host commands, which this runtime does not allow`)
     return { outcome: 'ERROR', sessionId: null, failureCode: 'HOST_COMMANDS_UNSUPPORTED' }
   }
-  let prompt = `${SCHEDULED_AUTOMATION_PROMPT_PREAMBLE}\n\n${buildScheduledRunPrompt(payload.prompt)}`
+  // The model sees when this occurrence actually starts: input.now is the tick snapshot, which a slow
+  // claim/start or an earlier automation in the same tick can leave minutes behind.
+  let prompt = `${SCHEDULED_AUTOMATION_PROMPT_PREAMBLE}\n\n${buildScheduledRunPrompt(payload.prompt, {
+    at: Date.now(),
+    timeZone: 'timeZone' in payload.schedule ? payload.schedule.timeZone : undefined,
+  })}`
   let environmentVariables: Record<string, string> | undefined
   let agentTaskDispatch: AutomationAgentTaskDispatch | null = null
   let persistGithubTriggerState: ((
