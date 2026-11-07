@@ -178,4 +178,32 @@ describe('runGemini offline start', () => {
         exit.mockRestore();
         vi.unstubAllEnvs();
     }, 20_000);
+
+    it('records a kill that arrives while the swap waits for the running turn on the real session', async () => {
+        const realSession = makeRealSession();
+        mocks.getOrCreateSession.mockResolvedValueOnce(null).mockResolvedValue({ id: 'real-session' });
+        mocks.sessionSyncClient.mockReturnValue(realSession);
+        let releaseStart!: () => void;
+        mocks.backend.startGate = new Promise((resolve) => { releaseStart = resolve; });
+        vi.stubEnv('HAPPY_INITIAL_PROMPT', 'Offline first');
+        const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+        const { createGeminiBackend } = await import('@/agent/factories/gemini');
+
+        const running = runGemini({ credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } } });
+        await vi.waitFor(() => expect(createGeminiBackend).toHaveBeenCalled());
+        const { onReconnected } = mocks.startOfflineReconnection.mock.calls[0][0];
+        await onReconnected();
+
+        await realSession.call('killSession');
+        await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+        expect(realSession.updateMetadata).toHaveBeenCalled();
+        expect(realSession.sendSessionDeath).toHaveBeenCalled();
+        expect(realSession.close).toHaveBeenCalled();
+
+        releaseStart();
+        mocks.closeQueue?.();
+        await running;
+        exit.mockRestore();
+        vi.unstubAllEnvs();
+    }, 20_000);
 });
