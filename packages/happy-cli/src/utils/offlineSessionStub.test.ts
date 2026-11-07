@@ -1,6 +1,7 @@
 /** The offline session stub is a no-op for every session method a runner calls before reconnection. */
 import { describe, expect, it, vi } from 'vitest';
 import type { ApiSessionClient } from '@/api/apiSession';
+import { queueInputEvidence } from '@/api/turnInputEvidence';
 import { createOfflineSessionStub, transferOfflineRegistrations } from './offlineSessionStub';
 
 function fakeRealSession() {
@@ -15,6 +16,13 @@ describe('createOfflineSessionStub', () => {
     it('takes the Codex sub-agent mark as a no-op', () => {
         const session = createOfflineSessionStub('test');
         expect(session.markLaunchedBackgroundJob()).toBeUndefined();
+    });
+
+    it('witnesses queued input the way the real session does', () => {
+        const session = createOfflineSessionStub('test');
+        const message = { role: 'user', content: { type: 'text', text: 'hi' }, serverMessageId: 'm-1', serverSeq: 7 } as const;
+        expect(session.queueInput(message)).toEqual(queueInputEvidence(message));
+        expect(session.queueInput(message)).toEqual({ ref: { kind: 'rest', serverMessageId: 'm-1', serverSeq: 7 } });
     });
 });
 

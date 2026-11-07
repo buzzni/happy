@@ -9,6 +9,8 @@ const mocks = vi.hoisted(() => ({
     backend: {
         prompts: [] as string[],
         cancelCalls: [] as string[],
+        /** While set, the backend's session start waits for it, keeping the first turn in progress. */
+        startGate: null as Promise<void> | null,
     },
 }));
 
@@ -60,7 +62,10 @@ vi.mock('@/agent/factories/gemini', () => ({
     createGeminiBackend: vi.fn(() => ({
         backend: {
             onMessage: vi.fn(),
-            startSession: async () => ({ sessionId: 'acp-session-1' }),
+            startSession: async () => {
+                await mocks.backend.startGate;
+                return { sessionId: 'acp-session-1' };
+            },
             sendPrompt: async (_sessionId: string, prompt: string) => { mocks.backend.prompts.push(prompt); },
             cancel: async (sessionId: string) => { mocks.backend.cancelCalls.push(sessionId); },
             dispose: async () => {},
@@ -107,6 +112,7 @@ describe('runGemini offline start', () => {
         vi.clearAllMocks();
         mocks.backend.prompts = [];
         mocks.backend.cancelCalls = [];
+        mocks.backend.startGate = null;
         mocks.closeQueue = null;
         mocks.startOfflineReconnection.mockReturnValue({ cancel: vi.fn(), getSession: () => null, isReconnected: () => false });
     });
@@ -141,5 +147,35 @@ describe('runGemini offline start', () => {
         mocks.closeQueue?.();
         await running;
         exit.mockRestore();
+    }, 20_000);
+
+    it('takes a message that arrives while the swap waits for the running turn, and sends it next', async () => {
+        const realSession = makeRealSession();
+        mocks.getOrCreateSession.mockResolvedValueOnce(null).mockResolvedValue({ id: 'real-session' });
+        mocks.sessionSyncClient.mockReturnValue(realSession);
+        let releaseStart!: () => void;
+        mocks.backend.startGate = new Promise((resolve) => { releaseStart = resolve; });
+        vi.stubEnv('HAPPY_INITIAL_PROMPT', 'Offline first');
+        const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+        const { createGeminiBackend } = await import('@/agent/factories/gemini');
+
+        const running = runGemini({ credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } } });
+        await vi.waitFor(() => expect(createGeminiBackend).toHaveBeenCalled());
+        const { onReconnected } = mocks.startOfflineReconnection.mock.calls[0][0];
+        await onReconnected();
+        // Gemini defers the swap until the turn ends, so the runner still holds the stub here.
+        expect(realSession.configureInputQueue).not.toHaveBeenCalled();
+
+        expect(() => realSession.deliver('Arrived mid-turn')).not.toThrow();
+        releaseStart();
+        await vi.waitFor(() => expect(mocks.backend.prompts.some((prompt) => prompt.includes('Arrived mid-turn'))).toBe(true));
+        expect(realSession.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', false);
+
+        await realSession.call('killSession');
+        await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+        mocks.closeQueue?.();
+        await running;
+        exit.mockRestore();
+        vi.unstubAllEnvs();
     }, 20_000);
 });

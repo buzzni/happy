@@ -12,7 +12,7 @@
 
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
-import { TurnInputEvidence, type EvidenceBatch } from '@/api/turnInputEvidence';
+import { TurnInputEvidence, queueInputEvidence, type EvidenceBatch } from '@/api/turnInputEvidence';
 import type { ApiSessionClient } from '@/api/apiSession';
 import type { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager';
 
@@ -64,6 +64,9 @@ export function createOfflineSessionStub(sessionTag: string): ApiSessionClient {
         // Offline input is unwitnessed: never advertise capability or publish a fabricated receipt.
         inputEvidence,
         configureInputQueue: () => {},
+        // A runner whose swap waits for its running turn (Gemini) still holds the stub when the
+        // transferred user-message handler receives input on the real session.
+        queueInput: queueInputEvidence,
         setInputMode: () => {},
         setInputSteerAvailable: () => {},
         setPendingInputEvidence: (batch: EvidenceBatch | null) => inputEvidence.setPending(batch),
