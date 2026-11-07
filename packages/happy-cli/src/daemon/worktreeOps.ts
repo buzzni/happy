@@ -430,14 +430,17 @@ async function serialized<T>(path: string, run: () => Promise<T>): Promise<T> {
 
 /** Waits out another process's write (Desktop's pull, another daemon); a daemon shutdown stops the wait. */
 async function acquireRepositoryLock(lock: string): Promise<void> {
-    const giveUpAt = Date.now() + repositoryLockWaitMs;
-    for (;;) {
+    const startedAt = Date.now();
+    const giveUpAt = startedAt + repositoryLockWaitMs;
+    for (let attempt = 0; ; attempt += 1) {
         try {
             await mkdir(lock);
+            if (attempt > 0) logger.debug('[worktree-ops] repository lock acquired after waiting', { lock, waitedMs: Date.now() - startedAt });
             return;
         } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
         }
+        if (attempt === 0) logger.debug('[worktree-ops] waiting for repository lock', { lock, waitMs: repositoryLockWaitMs });
         if (drainingRepositoryWrites) throw new OpFailure('WORKTREE_OPERATION_IN_PROGRESS', 'The daemon is shutting down. Retry after reconnecting.');
         if (Date.now() >= giveUpAt) {
             throw new OpFailure('WORKTREE_OPERATION_IN_PROGRESS', `Another Git operation is in progress. Retry after it finishes. If its process terminated, verify no Git writer is running before removing the lock: ${lock}`, { lockPath: lock });
