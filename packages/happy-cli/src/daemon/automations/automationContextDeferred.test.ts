@@ -9,7 +9,7 @@ import type { PendingAutomationReport } from './serverAutomationRuntimeStore'
 import { createAutomationContextLauncher, type AutomationContextLaunchRequest } from './automationContextLaunch'
 import { createAutomationContextLaunchJournal } from './automationContextLaunchJournal'
 import { createAutomationContextWorkspace } from './automationContextWorkspace'
-import { createAutomationContextDeferred } from './automationContextDeferred'
+import { createAutomationContextDeferred, automationContextHoldCode } from './automationContextDeferred'
 
 let home: string
 beforeEach(async () => { home = await mkdtemp(join(tmpdir(), 'context-deferred-')) })
@@ -182,4 +182,8 @@ it('recovers a lost report-queue ACK by reading the stored report without anothe
   await createAutomationContextDeferred(f.deps).maintain()
   expect(f.start).toHaveBeenCalledOnce(); expect(f.enqueueReport).toHaveBeenCalledOnce()
   expect(await f.journal.read('r1')).toHaveProperty('deferredDispatch', 'settled')
+})
+
+it('preserves an oversized assembled input as a bounded actionable hold', () => {
+  expect(automationContextHoldCode('AUTOMATION_INPUT_TOO_LARGE')).toBe('AUTOMATION_INPUT_TOO_LARGE')
 })

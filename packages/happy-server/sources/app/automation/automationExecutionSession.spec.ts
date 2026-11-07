@@ -398,6 +398,9 @@ it('pages encrypted pending questions, publishes bounded preclaim holds and canc
     expect(hold.statusCode, hold.body).toBe(200);
     expect((await app.inject({ method: 'GET', url: publicUrl, headers })).json()).toMatchObject({
       questions: [{ requestId: payload.requestId, runId: null, state: 'QUEUED', holdCode: 'AUTOMATION_REFERENCE_TOO_LARGE', encrypted: payload.encrypted }], nextCursor: null });
+    const oversized = await app.inject({ method: 'PATCH', url: questionUrl, headers, payload: { holdCode: 'AUTOMATION_INPUT_TOO_LARGE' } });
+    expect(oversized.statusCode, oversized.body).toBe(200);
+    expect((await app.inject({ method: 'GET', url: publicUrl, headers })).json().questions[0].holdCode).toBe('AUTOMATION_INPUT_TOO_LARGE');
     expect((await app.inject({ method: 'PATCH', url: questionUrl, headers, payload: { holdCode: 'PRIVATE_ERROR_LOG' } })).statusCode).toBe(400);
     await client.project.create({ data: { id: 'other-project', accountId: 'other', name: 'Foreign scope' } });
     expect((await app.inject({ method: 'GET', url: publicUrl.replace('chat:c1', 'other-project'), headers })).statusCode).toBe(404);
