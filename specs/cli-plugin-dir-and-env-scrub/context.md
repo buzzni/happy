@@ -1,6 +1,6 @@
 ---
 기능: cli-plugin-dir-and-env-scrub
-상태: 진행중(T6 — PR)
+상태: 진행중(T6 — PR #1160 CI 초록·리뷰봇 approve, 머지 대기)
 마지막 갱신: 2026-11-07
 ---
 
@@ -22,8 +22,10 @@ origin/main 9bba63e7b(H1·H2 포함)에서 분기. T1~T4 완료.
   - 반영: spawn RPC `resumeClaudeSessionId`에 `--plugin-dir=…`를 넣으면 argv에서 별도 옵션이 되어 플러그인으로 실림 → RPC에서 `-`로 시작·NUL·비문자열 거절(빈 값은 기존대로 없음 취급). 복구 경로는 전사 파일 존재 확인이 막아 손대지 않음.
   - 미반영: R5 표기 `happy claude -- --plugin-dir`이 여전히 안 실림. 사유는 위 결정(터미널 Claude도 `--` 뒤를 피연산자로 읽어 같은 동작, R5-a가 `--`에서 멈춤을 명시). 요구사항 문구 조정은 사용자 몫 — PR·보고에 확인 항목으로 올림.
 
+- 2026-11-07 리뷰봇(cicd-buzzni, 532cbc7) approve·발견 없음. 미실행 검사: 실계정 Claude로 `--plugin-dir` 로드 실측(사용자 수동 확인 항목).
+
 ## 열린 문제
 - (범위 밖) `src/claude` 런처 테스트 4개 파일(setupTokenSwitch·structuredOutput·ContextUsage·startHappyServer) 42건은 Saycode 세션 안의 셸에서 돌리면 그 세션 env 때문에 실패한다(origin/main 소스로도 같은 42건, env를 지우면 108건 모두 통과). CI는 해당 없음.
 
 ## 다음 시작점
-T6 PR·리뷰봇·CI.
+PR https://github.com/buzzni/happy/pull/1160 — 리뷰봇 반영·CI 확인 뒤 머지는 지휘 세션.
