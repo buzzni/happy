@@ -48,7 +48,8 @@ export function createUsageLimitsCollector(deps: {
         try {
             const usage = await Promise.race([
                 deps.readUsage(),
-                new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), SEED_TIMEOUT_MS); }),
+                // Unref'd: a seed still waiting never holds the process open at exit.
+                new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), SEED_TIMEOUT_MS); timer.unref?.(); }),
             ]) as { rate_limits_available?: unknown; rate_limits?: unknown } | null;
             if (usage?.rate_limits_available !== true || !usage.rate_limits || typeof usage.rate_limits !== 'object') return null;
             return windowsFromGetUsage(usage.rate_limits as Record<string, unknown>);

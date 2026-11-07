@@ -54,6 +54,10 @@ describe('fromRateLimitEvent', () => {
             .toEqual({ unbound: { status: 'rejected', utilization: null, resetsAt: null } });
     });
 
+    it('leaves overage out, as the seed leaves out extra usage', () => {
+        expect(fromRateLimitEvent({ status: 'rejected', rateLimitType: 'overage', resetsAt: 1_767_225_600 })).toEqual({});
+    });
+
     it('does not change the event the account switcher also reads (R8-c)', () => {
         const info = Object.freeze({ status: 'rejected' as const, rateLimitType: 'five_hour', utilization: 0.97, resetsAt: 1_767_225_600 });
         expect(() => fromRateLimitEvent(info)).not.toThrow();

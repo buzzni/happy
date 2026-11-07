@@ -1,6 +1,6 @@
 ---
 기능: cli-usage-limits-snapshot
-상태: 진행중(T6 — PR)
+상태: 진행중(T6 — PR #1168 CI 초록·리뷰봇 approve 반영, 머지 대기)
 마지막 갱신: 2026-11-07
 ---
 
@@ -24,10 +24,11 @@ origin/main 5b53b48a4(H4 포함)에서 분기. T1~T4 완료.
   - 사용률만 있는 이벤트가 seed의 재설정 시각을 버림 → 두 필드 따로 보충.
   - `resetsAt: 1e20`이 `toISOString` RangeError로 메시지 루프를 깸 → 표현 불가 날짜는 `null`.
   - "한도 미지원" 테스트가 availability 가드를 검증 못 함 → `false`+창 있는 입력 추가.
+- 2026-11-07 리뷰봇(cicd-buzzni, e122b25) approve·low 1건 반영: `rateLimitType: 'overage'` 이벤트를 창으로 저장하지 않음(seed의 `extra_usage` 제외와 일치). 봇 미확인 메모(대기 중인 seed 타이머가 종료를 붙잡음)도 반영 — 타이머 `unref`.
 - 2026-11-07 `rate_limit_info.unifiedWindows`는 SDK 타입에 없고 포크 tracker만 방어적으로 읽는다 — 스냅샷은 수집하지 않음(spec 범위 밖).
 
 ## 열린 문제
 - (범위 밖) `claudeRemoteLauncherContextUsage` 녹화 재생 테스트가 높은 부하(load 78)에서 한 번 실패, 단독 재실행은 통과. 이 변경과 무관.
 
 ## 다음 시작점
-T6 — PR 생성·리뷰봇·CI.
+PR https://github.com/buzzni/happy/pull/1168 — 머지는 지휘 세션.

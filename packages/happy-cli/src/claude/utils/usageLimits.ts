@@ -74,9 +74,12 @@ export function windowsFromGetUsage(rateLimits: Record<string, unknown>): UsageL
     return windows;
 }
 
-/** An event from a newer CLI with a status this build cannot represent says nothing (`{}`). */
+/**
+ * An event from a newer CLI with a status this build cannot represent says nothing (`{}`), and so does one about
+ * overage: that is spend beyond the plan, which the seed leaves out too (`extra_usage`).
+ */
 export function fromRateLimitEvent(info: RateLimitEventInfo): { window?: UsageLimitWindow; unbound?: UnboundRateLimit } {
-    if (!STATUSES.has(info.status)) return {};
+    if (!STATUSES.has(info.status) || info.rateLimitType === 'overage') return {};
     const reading = { status: info.status, utilization: eventPercent(info.utilization), resetsAt: eventResetIso(info.resetsAt) };
     return typeof info.rateLimitType === 'string' && info.rateLimitType ? { window: { id: info.rateLimitType, ...reading } } : { unbound: reading };
 }
