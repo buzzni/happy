@@ -99,6 +99,37 @@ describe('ApiMachineClient Codex fork RPCs', () => {
         }));
     });
 
+    it.each([
+        ['claude', 'resumeClaudeSessionId', '--plugin-dir=/tmp/elsewhere'],
+        ['claude', 'resumeClaudeSessionId', '-p'],
+        ['claude', 'resumeClaudeSessionId', 'bad\0id'],
+        ['claude', 'resumeClaudeSessionId', 42],
+        ['codex', 'resumeCodexThreadId', '--config=x'],
+    ])('refuses a %s resume id the CLI would read as an option or cannot pass: %s=%j (specs/cli-plugin-dir-and-env-scrub R5-a)', async (agent, field, value) => {
+        // It is placed right after `--resume` in the child's argv; an option there reaches Claude as its own flag.
+        const spawnSession = vi.fn().mockResolvedValue({ type: 'success', sessionId: 'never' });
+        const { ApiMachineClient } = await import('./apiMachine');
+        const client = new ApiMachineClient('token', machineClient());
+        client.setRPCHandlers(rpcHandlers({ spawnSession }));
+
+        await expect(handlersFrom(client).get('machine-1:spawn-happy-session')?.({
+            directory: '/tmp/project', agent, [field]: value,
+        })).rejects.toThrow('Resume id');
+        expect(spawnSession).not.toHaveBeenCalled();
+    });
+
+    it('accepts a Claude session id to resume', async () => {
+        const spawnSession = vi.fn().mockResolvedValue({ type: 'success', sessionId: 'happy-forked' });
+        const { ApiMachineClient } = await import('./apiMachine');
+        const client = new ApiMachineClient('token', machineClient());
+        client.setRPCHandlers(rpcHandlers({ spawnSession }));
+
+        await handlersFrom(client).get('machine-1:spawn-happy-session')?.({
+            directory: '/tmp/project', agent: 'claude', resumeClaudeSessionId: '11111111-2222-4333-8444-555555555555',
+        });
+        expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({ resumeClaudeSessionId: '11111111-2222-4333-8444-555555555555' }));
+    });
+
     it('lists Codex rewind points from thread/read', async () => {
         codexClientMethods.readThread.mockResolvedValue({
             thread: {

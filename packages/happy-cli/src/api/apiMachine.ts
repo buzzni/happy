@@ -776,6 +776,18 @@ function hasAck(event: string, ack: unknown): ack is (response: any) => void {
     return false;
 }
 
+/**
+ * A provider conversation id the daemon places right after `--resume` in the child's argv. One the CLI
+ * would read as an option (`--plugin-dir=…`) would reach Claude or Codex as a flag of its own. Empty means
+ * none, as the daemon has always treated it.
+ */
+function readResumeId(value: unknown): void {
+    if (value === undefined || value === null || value === '') return;
+    if (typeof value !== 'string' || value.startsWith('-') || value.includes('\0')) {
+        throw new Error('Resume id must be a provider conversation id, not an option');
+    }
+}
+
 export class ApiMachineClient {
     private socket!: Socket<ServerToDaemonEvents, DaemonToServerEvents>;
     /** Set when the managed credential ended; suppresses every reconnect. */
@@ -1381,6 +1393,8 @@ export class ApiMachineClient {
             if (!directory) {
                 throw new Error('Directory is required');
             }
+            readResumeId(resumeClaudeSessionId);
+            readResumeId(resumeCodexThreadId);
             if (mcpCallerGrantEnvelope !== undefined && typeof mcpCallerGrantEnvelope !== 'string') {
                 throw new Error('MCP caller grant envelope must be a string');
             }
