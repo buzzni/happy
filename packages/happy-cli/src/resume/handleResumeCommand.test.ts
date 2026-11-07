@@ -243,6 +243,17 @@ describe('buildResumeLaunch', () => {
         expect(() => buildResumeLaunch(session, { startedBy: 'terminal' })).toThrow('unsupported flavor "opencode"');
     });
 
+    // An automation resume hands the child its prompt and run-once flag, which the ACP
+    // runner reads neither of: the resume would "succeed", drop the prompt and never exit,
+    // where a refusal lets review_apply fall back to a new worker.
+    it('refuses an automation resume of an OpenCode session', () => {
+        const session = { id: 'session-7', active: false, metadata: { path: '/tmp/repo', flavor: 'opencode' } as never };
+        expect(() => buildResumeLaunch(session, { startedBy: 'daemon', automationPrompt: true }))
+            .toThrow('Happy session session-7 cannot take an automation prompt: the OpenCode runner does not support one.');
+        const claude = { id: 'c', active: false, metadata: { path: '/tmp/repo', flavor: 'claude', claudeSessionId: 'c1' } as never };
+        expect(buildResumeLaunch(claude, { startedBy: 'daemon', automationPrompt: true }).args[0]).toBe('claude');
+    });
+
     it.each([
         [['claude', '--resume', 'c1'], 'claude'],
         [['codex', '--resume', 't1'], 'codex'],

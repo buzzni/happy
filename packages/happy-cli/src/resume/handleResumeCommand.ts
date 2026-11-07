@@ -18,6 +18,8 @@ export type ResumeLaunchOptions = {
     startedBy?: 'daemon' | 'terminal';
     /** Fresh authenticated server head and the prior child's processed cursor. */
     emptyCodexSession?: { serverSeq?: number; processedSeq: number };
+    /** The launch carries an automation prompt and run-once flag (daemon automation resume). */
+    automationPrompt?: boolean;
     /** Daemon-only durable machine execution proof: no provider start was ever submitted. */
     emptyMachineClaudeSession?: { sessionId: string; serverSeq?: number; processedSeq: number; startNeverSubmitted: true };
 };
@@ -108,6 +110,11 @@ export function buildResumeLaunch(session: ResumableHappySession, options: Resum
     // and the runner asks OpenCode to continue its own session (metadata.acpSessionId).
     // A terminal launch has neither and would start a new conversation instead.
     if (flavor === 'opencode' && options.startedBy === 'daemon') {
+        // The ACP runner reads neither: the resume would report success, drop the prompt
+        // and never exit. Refused, the caller falls back to a new session.
+        if (options.automationPrompt) {
+            throw new Error(`Happy session ${session.id} cannot take an automation prompt: the OpenCode runner does not support one.`);
+        }
         return {
             cwd: metadata.path,
             args: ['acp', 'opencode', '--started-by', 'daemon'],

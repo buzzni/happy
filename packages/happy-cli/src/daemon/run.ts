@@ -3111,6 +3111,7 @@ export async function startDaemon(): Promise<void> {
           {
             startedBy: 'daemon',
             claudeStartingMode: 'remote',
+            automationPrompt: options?.automation !== undefined,
             emptyCodexSession: { serverSeq: serverSnapshot.seq, processedSeq: baselineSeq },
             ...(unstartedMachineExecution ? { emptyMachineClaudeSession: { sessionId: happySessionId, serverSeq: serverSnapshot.seq, processedSeq: baselineSeq, startNeverSubmitted: true as const } } : {}),
           },
