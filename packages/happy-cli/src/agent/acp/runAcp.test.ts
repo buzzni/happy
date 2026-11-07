@@ -70,6 +70,7 @@ const mocks = vi.hoisted(() => {
     mockGetOrCreateMachine: vi.fn(async () => ({})),
     mockGetOrCreateSession: vi.fn(async () => ({ id: 'session-1' })),
     mockSetupOfflineReconnection: vi.fn(),
+    mockStartOfflineReconnection: vi.fn(),
     mockNotifyDaemonSessionStarted: vi.fn(async () => ({ error: null })),
     mockStartHappyServer: vi.fn(),
     mockProjectPath: vi.fn(() => '/tmp/happy'),
@@ -119,9 +120,15 @@ vi.mock('@/daemon/controlClient', () => ({
   notifyDaemonSessionStarted: mocks.mockNotifyDaemonSessionStarted,
 }));
 
-vi.mock('@/claude/registerKillSessionHandler', () => ({
-  registerKillSessionHandler: mocks.mockKillRegister,
-}));
+vi.mock('@/claude/registerKillSessionHandler', async () => {
+  const actual = await vi.importActual<typeof import('@/claude/registerKillSessionHandler')>('@/claude/registerKillSessionHandler');
+  return {
+    registerKillSessionHandler: (...args: Parameters<typeof actual.registerKillSessionHandler>) => {
+      mocks.mockKillRegister(...args);
+      actual.registerKillSessionHandler(...args);
+    },
+  };
+});
 
 vi.mock('@/claude/utils/startHappyServer', () => ({
     startHappyServer: mocks.mockStartHappyServer,
@@ -136,6 +143,7 @@ vi.mock('@/utils/serverConnectionErrors', () => ({
   connectionState: {
     setBackend: mocks.mockSetBackend,
   },
+  startOfflineReconnection: mocks.mockStartOfflineReconnection,
 }));
 
 vi.mock('@/ui/logger', () => ({
@@ -667,6 +675,53 @@ describe('runAcp', () => {
     expect(mocks.mockSession.skipExistingMessages).not.toHaveBeenCalled();
     const applied = mocks.mockSession.updateMetadata.mock.calls.map(([update]) => update({ path: '/repo' } as never));
     expect(applied).toEqual(expect.arrayContaining([expect.objectContaining({ acpSessionId: 'agent-session-1' })]));
+  });
+
+  it('answers app messages, abort and kill on the real session after an offline start reconnects', async () => {
+    // The real session records registrations in the shared handler state; the offline stub records them only for transfer.
+    const realSession = { ...mocks.mockSession };
+    const actual = await vi.importActual<typeof import('@/utils/setupOfflineReconnection')>('@/utils/setupOfflineReconnection');
+    mocks.mockSetupOfflineReconnection.mockImplementation(actual.setupOfflineReconnection);
+    mocks.mockStartOfflineReconnection.mockReturnValue({ cancel: vi.fn(), getSession: () => null, isReconnected: () => false });
+    mocks.mockGetOrCreateSession
+      .mockResolvedValueOnce(null as any)
+      .mockResolvedValue({ id: 'real-session' });
+    mocks.mockApiCreate.mockResolvedValue({
+      getOrCreateMachine: mocks.mockGetOrCreateMachine,
+      getOrCreateSession: mocks.mockGetOrCreateSession,
+      sessionSyncClient: vi.fn(() => realSession),
+    });
+    const runPromise = runAcp({
+      credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+      agentName: 'gemini',
+      command: 'gemini',
+      args: ['--experimental-acp'],
+    });
+    await vi.waitFor(() => {
+      expect(mocks.backendState.startSessionCalls).toBe(1);
+    });
+    expect(mocks.getUserMessageHandler()).toBeNull();
+    const { BasePermissionHandler } = await import('@/utils/BasePermissionHandler');
+    const updateSession = vi.spyOn(BasePermissionHandler.prototype, 'updateSession');
+
+    const { onReconnected } = mocks.mockStartOfflineReconnection.mock.calls[0][0];
+    await onReconnected();
+
+    // The swap still re-attaches the input queue, permissions and the archive listener (R4-d).
+    expect(updateSession).toHaveBeenCalledWith(realSession);
+    updateSession.mockRestore();
+    expect(realSession.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', false);
+    expect(realSession.on).toHaveBeenCalledWith('archived', expect.any(Function));
+
+    mocks.getUserMessageHandler()!({ role: 'user', content: { type: 'text', text: 'after reconnect' } });
+    await vi.waitFor(() => {
+      expect(mocks.backendState.prompts.map(({ prompt }) => prompt)).toContain('after reconnect');
+    });
+    await mocks.sessionHandlers.get('abort')!({});
+    expect(mocks.backendState.cancelCalls).toContain('acp-session-1');
+
+    await mocks.sessionHandlers.get('killSession')!({});
+    await runPromise;
   });
 
   it('registers abort handler that cancels the ACP backend session', async () => {

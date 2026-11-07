@@ -1777,7 +1777,8 @@ export async function runCodex(opts: {
     }));
 
     const channelAcceptance = new ChannelPromptAcceptance({
-        runtimeId: session.runtimeId,
+        // Read live, like the capability answer: an offline start swaps in the reconnected session's runtime.
+        get runtimeId() { return session.runtimeId; },
         requestApproval: ({ requestId, runtimeId, nonce }) => session.sendSessionProtocolMessage(
             createEnvelope('agent', { t: 'channel-ready', requestId, runtimeId, nonce })),
         isManagedRun: () => Boolean(managedStartup),
