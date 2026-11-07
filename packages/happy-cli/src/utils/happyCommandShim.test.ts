@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { installHappyCommandShim } from './happyCommandShim';
-import { mkdtempSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -64,5 +64,87 @@ describe.skipIf(isWindows)('installHappyCommandShim', () => {
         expect(shimDir!.startsWith(join(homeDir, 'happy-shims'))).toBe(true);
         expect(statSync(join(shimDir!, 'happy')).mode & 0o111).toBeTruthy();
         expect(env.PATH).toBe(`${shimDir}:/usr/bin`);
+    });
+
+    // POSIX names are case-sensitive: a lowercase `path` is some other variable.
+    it('shouldLeaveALowercasePathVariableAloneOnPosix', () => {
+        const env: NodeJS.ProcessEnv = { path: 'not a search path', PATH: '/usr/bin' };
+
+        const shimDir = installHappyCommandShim(env, homeDir, { runtime: '/bin/echo', args: [] });
+
+        expect(env).toEqual({ path: 'not a search path', PATH: `${shimDir}:/usr/bin` });
+    });
+});
+
+describe('installHappyCommandShim on Windows', () => {
+    let homeDir: string;
+
+    beforeEach(() => {
+        homeDir = mkdtempSync(join(tmpdir(), 'happy command shim-'));
+    });
+
+    afterEach(() => {
+        rmSync(homeDir, { recursive: true, force: true });
+    });
+
+    // A Windows environment copy keeps the variable as `Path`; adding `PATH` beside it would leave
+    // which one a child sees up to the runtime.
+    it('shouldPrependTheShimToTheExistingWindowsPathVariable', () => {
+        const env: NodeJS.ProcessEnv = { Path: 'C:\\Windows' };
+
+        const shimDir = installHappyCommandShim(env, homeDir, { runtime: 'node.exe', args: [] }, 'win32');
+
+        expect(env.Path).toBe(`${shimDir};C:\\Windows`);
+        expect(env).not.toHaveProperty('PATH');
+    });
+
+    describe.runIf(isWindows)('running the shim', () => {
+        // Codex runs commands through PowerShell/cmd, which find `happy.cmd` through PATHEXT. cmd reads
+        // a batch file in the console code page, so a non-ASCII profile path must not pass through it.
+        const printArgs = { runtime: process.execPath, args: ['-e', 'console.log(JSON.stringify(process.argv.slice(1)))', 'C:\\사용자 100%'] };
+        const sessionEnv = (): NodeJS.ProcessEnv => ({ ...process.env });
+        const cmd = (env: NodeJS.ProcessEnv, line: string) => spawnSync('cmd.exe', ['/d', '/s', '/c', line], { env, encoding: 'utf8' });
+
+        it('shouldRunTheSessionsOwnCliFromCmd', () => {
+            const env = sessionEnv();
+            installHappyCommandShim(env, homeDir, printArgs);
+
+            expect(JSON.parse(cmd(env, 'happy agent whoami').stdout)).toEqual(['C:\\사용자 100%', 'agent', 'whoami']);
+        });
+
+        // PowerShell runs `happy.cmd` through cmd, so `%VAR%` and embedded `"` in arguments are cmd's to
+        // reparse; plain arguments, spaces included, must arrive intact.
+        it('shouldRunTheSessionsOwnCliFromPowerShell', () => {
+            const env = sessionEnv();
+            installHappyCommandShim(env, homeDir, { runtime: process.execPath, args: ['-e', 'console.log(JSON.stringify(process.argv.slice(1)))'] });
+
+            const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', "happy agent 'two words'"], { env, encoding: 'utf8' });
+            expect(JSON.parse(result.stdout)).toEqual(['agent', 'two words']);
+        });
+
+        it('shouldReturnTheCliExitCodeThroughCmd', () => {
+            const env = sessionEnv();
+            installHappyCommandShim(env, homeDir, { runtime: process.execPath, args: ['-e', 'process.exit(3)'] });
+
+            expect(cmd(env, 'happy').status).toBe(3);
+        });
+
+        it('shouldGiveASourceModeCliItsTsconfigFromCmd', () => {
+            const env = sessionEnv();
+            delete env.TSX_TSCONFIG_PATH;
+            installHappyCommandShim(env, homeDir, { runtime: process.execPath, args: ['-e', 'console.log(process.env.TSX_TSCONFIG_PATH)'], tsconfigPath: 'C:\\사용자\\100% tsconfig.json' });
+
+            expect(cmd(env, 'happy').stdout.trim()).toBe('C:\\사용자\\100% tsconfig.json');
+        });
+
+        // Claude Code runs commands through Git Bash, which runs the extensionless sh shim.
+        const gitBash = 'C:\\Program Files\\Git\\bin\\bash.exe';
+        it.runIf(existsSync(gitBash))('shouldRunTheSessionsOwnCliFromGitBash', () => {
+            const env = sessionEnv();
+            installHappyCommandShim(env, homeDir, printArgs);
+
+            const result = spawnSync(gitBash, ['-c', 'happy agent whoami'], { env, encoding: 'utf8' });
+            expect(JSON.parse(result.stdout)).toEqual(['C:\\사용자 100%', 'agent', 'whoami']);
+        });
     });
 });

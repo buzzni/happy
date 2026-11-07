@@ -93,6 +93,7 @@ function serializeRun(row: AutomationRun) {
         failureCode: row.failureCode,
         holdCode: row.holdCode ?? null,
         degradedCode: row.degradedCode,
+        missedCount: row.missedCount,
         queueDepth: row.queueDepth,
         queuePosition: row.queuePosition,
         queueTotal: row.queueTotal,

@@ -180,6 +180,33 @@ describe('automationRoutes', () => {
         expect(run).not.toHaveProperty('claimTokenHash'); expect(run).not.toHaveProperty('executionSeedMetadata');
     });
 
+    it('serializes the missed slot count of a missed-run row and null on ordinary runs', async () => {
+        const base = {
+            automationId: 'automation-1', generation: 1, machineId: 'machine-1', sessionId: null, outcome: null,
+            detailCiphertext: null, degradedCode: null, queueDepth: null, queuePosition: null, queueTotal: null,
+            queueEstimatedAt: null, claimedAt: new Date(2), startedAt: null, completedAt: new Date(4), lateReport: false,
+        };
+        mocks.listAutomationRuns.mockResolvedValue({
+            ok: true,
+            value: [
+                { ...base, id: 'run-missed', scheduledFor: new Date(1), status: 'EXPIRED', failureCode: 'MISSED_OFFLINE', missedCount: 8 },
+                { ...base, id: 'run-expired', scheduledFor: new Date(3), status: 'EXPIRED', failureCode: null, missedCount: null },
+            ],
+        });
+        const app = await makeApp();
+        const response = await app.inject({
+            method: 'GET',
+            url: '/v1/projects/project-1/automation-runs',
+            headers: { authorization: 'Bearer test' },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(response.json().runs).toEqual([
+            expect.objectContaining({ id: 'run-missed', status: 'EXPIRED', failureCode: 'MISSED_OFFLINE', missedCount: 8, scheduledFor: 1 }),
+            expect.objectContaining({ id: 'run-expired', status: 'EXPIRED', failureCode: null, missedCount: null }),
+        ]);
+    });
+
     it('decodes encrypted create fields and derives actor/project outside the body', async () => {
         mocks.createAutomation.mockResolvedValue({ ok: true, value: record() });
         const app = await makeApp();

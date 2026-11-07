@@ -660,6 +660,8 @@ model AutomationRun {
     /// Bounded public waiting state; cleared when the scheduler claim becomes terminal.
     holdCode          String?
     degradedCode      String?
+    // Slots one missed-run row stands for (scheduled-missed-run-policy); null on ordinary runs.
+    missedCount       Int?
     queueDepth         Int?
     queuePosition      Int?
     queueTotal         Int?
