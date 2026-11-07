@@ -12,6 +12,8 @@ upstream 참고: slopus/happy d75b9df23 `fix(cli): forward plugin directories in
 
 - **R5** (정본 그대로) Given `happy claude -- --plugin-dir <dir>` 인자, When remote start·resume, Then SDK `plugins` 옵션에 그 디렉터리가 전달된다. `utils/childEnv.ts` 스크럽 목록에 `CODEX_THREAD_ID`·`HAPPY_SIDE_CHAT`이 없으면 추가한다(prefix 구조 유지).
 
+> **사실 확인(2026-11-07, 요구사항은 그대로)**: R5의 표기 `happy claude -- --plugin-dir <dir>`는 `main.ts`가 `--`를 그대로 Claude 인자에 넣어 `claudeArgs = ['--', '--plugin-dir', '<dir>']`이 된다. 터미널 Claude(2.1.305)도 `--` 뒤를 옵션이 아닌 피연산자(프롬프트)로 읽는다(`claude -p -- --version`이 버전을 찍지 않음, 오프라인 실측). 그래서 R5-a의 "`--`에서 멈춤"을 따르면 터미널과 remote가 같게 동작하고, 플러그인이 실리는 실제 형식은 `happy claude --plugin-dir <dir>`(happy가 모르는 인자를 Claude로 넘김)이다. 테스트는 이 형식(`claudeArgs = ['--plugin-dir', '<dir>']`)으로 R5를 확인한다.
+
 ### 세부
 
 - **R5-a** `claude/utils/pluginsFromArgs.ts`(upstream 계약과 같게)
