@@ -5,6 +5,7 @@ import { createManualPersonalSpawn, MANUAL_PERSONAL_ENV } from './manualPersonal
 import { createOwnedSpawnRuntime, createOwnedStartGuard } from './ownedSpawnRuntime';
 import { createAgentCallerLaunches, OWNER_CONTACT_SWITCH, readOwnerContactTrust, type OwnedLaunchLineage } from './agentCallerLaunches';
 import { drainWorktreeOperations } from './worktreeOps';
+import { drainBashRpcs } from '@/modules/common/bashRpcScheduler';
 import { createMachineSetupTokenProtocol, MachineRotationError } from './machineSetupTokenProtocol';
 import { chooseLaunchRotation, createMachineRotationResolver } from './machineRotationResolver';
 import { discoverMachineSetupTokenSession } from './machineSetupTokenRecovery';
@@ -5940,7 +5941,7 @@ export async function startDaemon(): Promise<void> {
       const handoffResult = await handoffToReplacedBundle({
         preflightReplacement: async () => true,
         teardownCurrentDaemon: async () => {
-          await drainWorktreeOperations();
+          await Promise.all([drainWorktreeOperations(), drainBashRpcs()]);
           clearInterval(restartOnStaleVersionAndHeartbeat);
           await checkpointRetentionSchedule.stop();
 
@@ -6326,7 +6327,7 @@ export async function startDaemon(): Promise<void> {
       // A ready drain closes its terminals (socket still up, so each says why) and writes its outcome line.
       await restartDrainRuntime?.finalizeReady();
       restartDrainRuntime?.dispose();
-      await drainWorktreeOperations();
+      await Promise.all([drainWorktreeOperations(), drainBashRpcs()]);
       logger.debug(`[DAEMON RUN] Starting proper cleanup (source: ${source}, errorMessage: ${errorMessage})...`);
       await checkpointRetentionSchedule.stop();
 
@@ -6435,7 +6436,7 @@ export async function startDaemon(): Promise<void> {
     stopClaudeSwapSupervisor();
     await stopScriptWorker().catch((shutdownError) => logger.debug('[script-automations] Shutdown report remains in outbox', shutdownError));
     logger.debug('[DAEMON RUN][FATAL] Failed somewhere unexpectedly - exiting with code 1', error);
-    await drainWorktreeOperations();
+    await Promise.all([drainWorktreeOperations(), drainBashRpcs()]);
     process.exit(1);
   }
 }
