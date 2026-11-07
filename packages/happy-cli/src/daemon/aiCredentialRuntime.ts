@@ -17,6 +17,7 @@ import { chmod, mkdir, mkdtemp, open, readdir, readFile, rename, rm, writeFile }
 import { homedir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
 import { withNpmGlobalBinOnPath } from './npmGlobalBin'
+import { withUvToolBinOnPath } from './uvToolBin'
 import { logger } from '@/ui/logger'
 import { credentialFileLockPath, withCredentialLock } from '@/utils/credentialLock'
 import {
@@ -3501,27 +3502,6 @@ export function runAiCredentialCommand(
       child.stdin?.end(options.input)
     }
   })
-}
-
-export function withUvToolBinOnPath(
-  environment: NodeJS.ProcessEnv = process.env,
-  homeDir: string = homedir(),
-  command: 'uv' | 'cswap' = 'cswap',
-): NodeJS.ProcessEnv {
-  const toolBin = (command === 'uv' ? environment.UV_INSTALL_DIR : environment.UV_TOOL_BIN_DIR)
-    || environment.XDG_BIN_HOME
-    || (environment.XDG_DATA_HOME
-      ? join(environment.XDG_DATA_HOME, '..', 'bin')
-      : join(homeDir, '.local', 'bin'))
-  const pathKey = Object.keys(environment).find((key) => key.toUpperCase() === 'PATH') ?? 'PATH'
-  const currentPath = environment[pathKey] ?? ''
-  const remainingPath = currentPath
-    .split(delimiter)
-    .filter((entry) => entry && entry !== toolBin)
-  return {
-    ...environment,
-    [pathKey]: [toolBin, ...remainingPath].join(delimiter),
-  }
 }
 
 export type AiCredentialRuntime = ReturnType<typeof createAiCredentialRuntime>
