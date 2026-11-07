@@ -110,7 +110,7 @@ describe('bash RPC scheduler', () => {
             await expect(queued).rejects.toBeInstanceOf(BashRpcBusyError);
             gate.resolve();
 
-            await expect(drained).resolves.toEqual({ running: 1, terminated: 0, remaining: 0 });
+            await expect(drained).resolves.toEqual({ running: 1, remaining: 0 });
             await running;
             expect(queuedTask).not.toHaveBeenCalled();
         });
@@ -138,30 +138,17 @@ describe('bash RPC scheduler', () => {
             gate.resolve();
 
             expect(early).toBe('waiting');
-            await expect(Promise.all([first, second])).resolves.toEqual([{ running: 1, terminated: 0, remaining: 0 }, { running: 1, terminated: 0, remaining: 0 }]);
+            await expect(Promise.all([first, second])).resolves.toEqual([{ running: 1, remaining: 0 }, { running: 1, remaining: 0 }]);
             await running;
         });
 
-        it('terminates work still running after the bound so its own cleanup trap can release what it holds', async () => {
-            const scheduler = createBashRpcScheduler();
-            let aborted = false;
-            const running = scheduler.run('foreground', (signal) => new Promise<void>((done) => {
-                signal.addEventListener('abort', () => { aborted = true; done(); });
-            }));
-            await vi.waitFor(() => expect(scheduler.snapshot().running).toBe(1));
-
-            await expect(drainBashRpcs({ waitMs: 20, termGraceMs: 1_000 })).resolves.toEqual({ running: 1, terminated: 1, remaining: 0 });
-            expect(aborted).toBe(true);
-            await running;
-        });
-
-        it('reports work that outlived termination', async () => {
+        it('stops waiting after the bound and reports the work still running', async () => {
             const scheduler = createBashRpcScheduler();
             const gate = deferred();
             const running = scheduler.run('foreground', () => gate.promise);
             await vi.waitFor(() => expect(scheduler.snapshot().running).toBe(1));
 
-            await expect(drainBashRpcs({ waitMs: 10, termGraceMs: 10 })).resolves.toEqual({ running: 1, terminated: 1, remaining: 1 });
+            await expect(drainBashRpcs({ waitMs: 20 })).resolves.toEqual({ running: 1, remaining: 1 });
             gate.resolve();
             await running;
         });

@@ -693,7 +693,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             logger.debug('Shell command queued', { executionClass, ...schedulerState });
         }
         try {
-            return await bashScheduler.run(executionClass, async (shutdownSignal) => {
+            return await bashScheduler.run(executionClass, async () => {
                 try {
                     // Build options with shell enabled by default
                     // Note: ExecOptions doesn't support boolean for shell, but exec() uses the default shell when shell is undefined
@@ -704,8 +704,6 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
                         timeout: data.timeout || 30000, // Default 30 seconds timeout
                         windowsHide: true, // Prevent cmd.exe popup on Windows for every RPC bash call
                         env: sanitizeChildEnv(process.env, { boundary: bashEnvBoundary }),
-                        // SIGTERM (exec's default killSignal) once a daemon shutdown stops waiting (bashRpcScheduler).
-                        signal: shutdownSignal,
                     };
 
                     logger.debug('Shell command executing...', { cwd: options.cwd, timeout: options.timeout });
