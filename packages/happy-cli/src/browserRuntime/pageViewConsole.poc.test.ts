@@ -28,6 +28,8 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
     const ops: Array<{ op: string; bearer: string; body: Record<string, any>; at: number }> = []
     let leaseOwner: Record<string, unknown> = { kind: 'none' }
     let frames = 0
+    /** Frame reads the fake Runtime refuses as rate limited, as the real one does inside its interval. */
+    let refuseFrames = 0
     const task = () => ({ taskId: 'task-1', agentSessionId: SESSION, status: 'paused', pauseReason: 'user-control', stateVersion: 3, tabs: ['tab-1'],
         uncertainActions: [], cancelRequested: false, updatedAtMs: Date.now(), tabLeases: [{ tabId: 'tab-1', leaseEpoch: 4, owner: leaseOwner }] })
 
@@ -43,6 +45,12 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
                 const body = JSON.parse(raw || '{}')
                 ops.push({ op: m[1], bearer: String(req.headers.authorization ?? '').replace(/^Bearer /, ''), body, at: Date.now() })
                 const status = { closed: false, draining: false, unknown: false, lastAccepted: 0, lastSettled: 0, receipts: [] }
+                if (m[1] === 'getPageFrame' && !body.statusOnly && refuseFrames > 0) {
+                    refuseFrames--
+                    res.writeHead(429, { 'content-type': 'application/json' })
+                    res.end(JSON.stringify({ ok: false, error: { code: 'QUOTA_EXCEEDED', message: 'Page capture rate limited' } }))
+                    return
+                }
                 const result = m[1] === 'pageViewInfo' ? { schemaVersion: 1, supported: true, input: true, runtimeBindingId: BINDING }
                     : m[1] === 'listTasks' ? { tasks: [task()] }
                         : m[1] === 'getTask' ? task()
@@ -121,5 +129,44 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
             expect(press.body.event.y).toBeCloseTo(240, -1)
             expect(sent.map((o) => o.body.sequence)).toEqual(sent.map((_o, i) => i + 1))
         } finally { await harness.closeTarget(target) }
+    })
+
+    const frameReads = (after: number) => ops.filter((o) => o.op === 'getPageFrame' && !o.body.statusOnly && o.at >= after).map((o) => o.at)
+    const gaps = (times: number[]) => times.slice(1).map((t, i) => t - times[i])
+    const wait = (target: string, ms: number) => harness.evaluate(target, `new Promise(r => setTimeout(r, ${ms}))`)
+
+    it('remote console: frame reads keep to the Runtime interval, 500 ms while observing and 200 ms with control', async () => {
+        ops.length = 0; leaseOwner = { kind: 'none' }
+        const target = await openRemote()
+        try {
+            const observing = Date.now()
+            await wait(target, 2500)
+            const observed = frameReads(observing)
+            expect(observed.length).toBeGreaterThanOrEqual(3)
+            expect(Math.min(...gaps(observed))).toBeGreaterThanOrEqual(450)
+            leaseOwner = { kind: 'user', principalId: 'user-1', viewerSessionId: 'viewer-this' }
+            await eventually(() => harness.evaluate(target, `document.getElementById('status').textContent`), (s) => s === 'You have control', 10_000)
+            const controlling = Date.now()
+            await wait(target, 1500)
+            const controlled = gaps(frameReads(controlling))
+            expect(Math.min(...controlled)).toBeGreaterThanOrEqual(180)
+            expect(controlled.some((gap) => gap < 450)).toBe(true)
+        } finally { await harness.closeTarget(target) }
+    })
+
+    it('remote console: a rate-limited frame read waits a second before the next one', async () => {
+        ops.length = 0; leaseOwner = { kind: 'none' }
+        const target = await openRemote()
+        try {
+            await wait(target, 600)
+            const refusedAt = Date.now()
+            refuseFrames = 1
+            await eventually(() => refuseFrames, (n) => n === 0, 5_000)
+            const reads = frameReads(refusedAt)
+            await wait(target, 1500)
+            const after = frameReads(refusedAt)
+            expect(after.length).toBeGreaterThan(reads.length)
+            expect(after[1] - after[0]).toBeGreaterThanOrEqual(950)
+        } finally { refuseFrames = 0; await harness.closeTarget(target) }
     })
 })

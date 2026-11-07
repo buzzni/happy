@@ -9,6 +9,9 @@ function createPageViewer(o) {
     let view = null, frame = null;
     let sequence = 0, polling = false, inputBusy = false, lost = false, composing = false, fitted = true;
     let confirmedAt = -Infinity, captureAge = 0, keyModifiers = 0;
+    // Runtime serves a view one frame per 500 ms, or per 200 ms while this viewer holds the tab; a read inside that
+    // interval (or over the profile's byte budget, reset each second) is refused, so the next one waits that long.
+    let lastRead = -Infinity, retryAt = -Infinity;
     let wheelRefresh = false;
     const queue = [];
     const keys = new Set();
@@ -77,6 +80,9 @@ function createPageViewer(o) {
                 return;
             owner = view; gen = o.generation();
             const started = performance.now();
+            if (started - lastRead < (own() ? 200 : 500) || started < retryAt)
+                return;
+            lastRead = started;
             const result = await o.request('getPageFrame', { schemaVersion: 1, viewId: owner.viewId });
             if (view !== owner || owner.closed || gen !== o.generation() || document.hidden)
                 return;
@@ -126,6 +132,8 @@ function createPageViewer(o) {
             }
         }
         catch (e) {
+            if (e?.code === 'QUOTA_EXCEEDED')
+                retryAt = performance.now() + 1000;
             if (view === owner && !owner?.closed && gen === o.generation()
                 && e?.code !== 'QUOTA_EXCEEDED' && e?.code !== 'CONFLICT' && e?.code !== 'STALE_REF')
                 o.fail(e);
