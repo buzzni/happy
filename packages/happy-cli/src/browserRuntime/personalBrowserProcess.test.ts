@@ -28,6 +28,15 @@ describe('personal browser launch', () => {
         expect(args).not.toContain('about:blank')
     })
 
+    it('keeps a covered or minimized Mac window from being backgrounded, without lifting timer throttling', () => {
+        const mac = personalBrowserArgs('darwin', '/p/profile')
+        expect(mac).toContain('--disable-backgrounding-occluded-windows')
+        expect(mac).toContain('--disable-renderer-backgrounding')
+        expect(mac).not.toContain('--disable-background-timer-throttling')
+        const windows = personalBrowserArgs('win32', 'C:\\p')
+        expect(windows.some(arg => arg.includes('backgrounding'))).toBe(false)
+    })
+
     it('spawns detached with fd 3/4 pipes and the filtered environment', async () => {
         const spawn = vi.fn(() => fakeChild(4242))
         const browser = await launchPersonalBrowser({ platform: 'darwin', executable: '/c/chrome', profileDir: '/p', env: { HOME: '/h', SECRET: 's' } },

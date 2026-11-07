@@ -200,6 +200,13 @@ describe('runtime HTTP server', () => {
             consoleScreenMode: 'native-window' })
         const html = await (await fetch(`${server.url}/console?screenMode=vnc`)).text()
         expect(html).toContain('NATIVE_SCREEN=true')
+        expect(html).toContain('PAGE_VIEW=NATIVE_SCREEN&&false&&')
+    })
+
+    it('offers the personal page view in its own console only when the Runtime serves page views', async () => {
+        server = await startRuntimeServer({ api: makeFake().api, verifyToken, port: 0, health: () => ({}),
+            consoleScreenMode: 'native-window', consolePageView: true })
+        expect(await (await fetch(`${server.url}/console?agentSessionId=s`)).text()).toContain('PAGE_VIEW=NATIVE_SCREEN&&true&&')
     })
 
     it('tells the console which Studio origins may hand it a capability', async () => {

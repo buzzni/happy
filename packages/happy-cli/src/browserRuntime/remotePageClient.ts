@@ -54,14 +54,9 @@ function remotePageClient() {
     $('empty').textContent = text.waiting;
     $('machine').textContent = query.get('machineName') || text.machine;
     image.alt = text.image;
-    let token = '', expiry = 0, binding = '', task = null, view = null, frame = null;
-    let generation = 0, sequence = 0, busy = false, polling = false, inputBusy = false, lost = false, composing = false, fitted = true;
-    let confirmedAt = -Infinity, captureAge = 0, lastList = -Infinity, keyModifiers = 0;
-    let wheelRefresh = false;
-    const queue = [];
-    const keys = new Set();
+    let token = '', expiry = 0, binding = '', task = null;
+    let generation = 0, busy = false, lastList = -Infinity;
     const status = (value, error = false) => { $('status').textContent = value; $('status').dataset.error = String(error); };
-    const clearImage = () => { frame = null; image.hidden = true; image.removeAttribute('src'); $('empty').hidden = false; confirmedAt = -Infinity; };
     const askHost = () => window.parent.postMessage({ type: 'abp-capability-request' }, location.origin);
     const claims = () => { try {
         return JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(token.split('.')[2].replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0))));
@@ -86,20 +81,17 @@ function remotePageClient() {
         }
     };
     const fail = (error) => {
-        queue.length = 0;
-        confirmedAt = -Infinity;
+        viewer.halt();
         status(error?.code === 'UNAUTHORIZED' ? text.expired : error?.code === 'SCOPE_DENIED' || error?.code === 'ORIGIN_DENIED' ? text.forbidden
             : error?.code === 'UNSUPPORTED_OPERATION' ? text.unsupported : error?.code === 'OUTCOME_UNKNOWN' ? text.unresolved : text.offline, true);
         render();
     };
-    const own = () => {
-        const c = claims();
-        return task?.tabLeases?.find((l) => l.tabId === view?.tabId && l.owner.kind === 'user' && l.owner.viewerSessionId === c.viewerSessionId && l.owner.principalId === c.principalId);
-    };
-    const fresh = () => !!frame && performance.now() - confirmedAt + captureAge < 3000;
     const ended = () => ['succeeded', 'failed', 'cancelled'].includes(task?.status);
-    const canInput = () => !!own() && fresh() && !busy && !lost && !ended() && !document.hidden && !view?.closed;
+    const viewer = createPageViewer({ request, image, input, viewport: $('viewport'), empty: $('empty'), text, status, fail, render: () => render(),
+        task: () => task, ended, identity: claims, busy: () => busy, generation: () => generation, token: () => token });
+    const own = viewer.own, fresh = viewer.fresh;
     function render() {
+        const view = viewer.view(), lost = viewer.lost();
         const tabList = JSON.stringify(task?.tabs || []);
         if (tabs.dataset.list !== tabList) {
             tabs.textContent = '';
@@ -109,7 +101,7 @@ function remotePageClient() {
             tabs.dataset.list = tabList;
         }
         if (view && tabs.value !== view.tabId) tabs.value = view.tabId;
-        tabs.disabled = busy || inputBusy || !task?.tabs?.length;
+        tabs.disabled = busy || viewer.inputBusy() || !task?.tabs?.length;
         $('take').disabled = busy || lost || !fresh() || ended() || !view || !!own() || !!task?.uncertainActions?.length;
         $('release').disabled = busy || !own() || lost;
         $('resume').disabled = busy || lost || !fresh() || ended() || task?.pauseReason !== 'user-input-complete' || !!task?.uncertainActions?.length;
@@ -119,20 +111,9 @@ function remotePageClient() {
             $(id).hidden = !approval;
             $(id).disabled = busy;
         }
-        $('viewport').classList.toggle('stale', !!frame && !fresh());
-        image.setAttribute('aria-disabled', String(!canInput()));
+        viewer.paint();
     }
-    async function close() {
-        const old = view;
-        view = null;
-        wheelRefresh = false;
-        queue.length = 0;
-        keys.clear();
-        keyModifiers = 0;
-        clearImage();
-        if (old && token)
-            await request('closePageView', { schemaVersion: 1, viewId: old.viewId });
-    }
+    const close = viewer.close;
     async function openTask(next, selectedTab) {
         const gen = ++generation;
         busy = true;
@@ -142,7 +123,6 @@ function remotePageClient() {
             if (gen !== generation)
                 return;
             task = next;
-            sequence = 0;
             if (ended()) {
                 $('empty').textContent = text.ended;
                 status(text.ended);
@@ -154,13 +134,7 @@ function remotePageClient() {
                 return;
             }
             const tabId = next.tabs.includes(selectedTab) ? selectedTab : next.tabs[0];
-            const opened = await request('openPageView', { schemaVersion: 1, agentSessionId: sessionId, runtimeBindingId: binding, taskId: next.taskId, tabId });
-            if (gen !== generation) {
-                await request('closePageView', { schemaVersion: 1, viewId: opened.viewId });
-                return;
-            }
-            view = { ...opened, tabId };
-            status(text.connecting);
+            await viewer.open({ agentSessionId: sessionId, runtimeBindingId: binding, taskId: next.taskId }, tabId, () => gen === generation);
         }
         catch (e) {
             if (gen === generation)
@@ -190,6 +164,7 @@ function remotePageClient() {
         if (tasks.some((t) => t.taskId === previous))
             select.value = previous;
         const next = tasks.find((t) => t.taskId === select.value);
+        const view = viewer.view();
         if (next?.taskId !== task?.taskId || !next?.tabs?.includes(view?.tabId) || view?.closed)
             await openTask(next);
         else if (next) {
@@ -210,255 +185,38 @@ function remotePageClient() {
             render();
         }
     }
-    async function receipt() {
-        if (!view)
-            return;
-        const owner = view;
-        const result = await request('getPageFrame', { schemaVersion: 1, viewId: owner.viewId, statusOnly: true });
-        if (view !== owner)
-            return;
-        if (result.status.unknown) {
-            status(text.unresolved, true);
-            return;
-        }
-        if (!result.status.draining && result.status.lastSettled >= sequence)
-            status(text.confirmed);
-    }
-    async function poll() {
-        if (polling || inputBusy || busy || !token || document.hidden)
-            return;
-        if (Date.now() >= expiry - 30000)
-            askHost();
-        if (Date.now() >= expiry) {
-            fail({ code: 'UNAUTHORIZED' });
-            return;
-        }
-        if (!claims().pageViewScope)
-            return;
-        polling = true;
-        let owner = view, gen = generation;
-        try {
-            if (lost) {
-                await receipt();
-                return;
+    function poll() {
+        return viewer.poll(() => {
+            if (!token)
+                return false;
+            if (Date.now() >= expiry - 30000)
+                askHost();
+            if (Date.now() >= expiry) {
+                fail({ code: 'UNAUTHORIZED' });
+                return false;
             }
+            if (!claims().pageViewScope)
+                return false;
+        }, async () => {
             if (performance.now() - lastList >= 1500)
                 await list();
             if (ended()) {
-                if (view) await close();
+                if (viewer.view()) await close();
                 $('empty').textContent = text.ended;
-                status(text.ended); render(); return;
+                status(text.ended); render(); return false;
             }
-            if (!view || busy)
-                return;
-            owner = view; gen = generation;
-            const started = performance.now();
-            const result = await request('getPageFrame', { schemaVersion: 1, viewId: owner.viewId });
-            if (view !== owner || owner.closed || gen !== generation || document.hidden)
-                return;
-            if (result.status.unknown) {
-                lost = true;
-                status(text.unresolved, true);
-                render();
-                return;
-            }
-            if (result.status.closed) {
-                owner.closed = true;
-                queue.length = 0;
-                confirmedAt = -Infinity;
-                status(text.confirmed);
-                render();
-                return;
-            }
-            if (result.frame) {
-                const next = result.frame;
-                const decoded = new Image();
-                decoded.src = 'data:image/jpeg;base64,' + next.data;
-                await decoded.decode();
-                if (view !== owner || owner.closed || gen !== generation || document.hidden)
-                    return;
-                // Only unsent wheel gestures may follow our scroll across page offsets. Other
-                // input still belongs to the old image; navigation/resize/zoom never rebase it.
-                const scrollOnly = wheelRefresh && frame?.documentGeneration === next.documentGeneration
-                    && ['width', 'height', 'scale'].every(k => frame.viewport[k] === next.viewport[k])
-                    && queue.every(e => e.kind === 'wheel' || e.kind === 'pointer' && e.type === 'mouseMoved');
-                if (scrollOnly) {
-                    for (let i = queue.length - 1; i >= 0; --i) if (queue[i].kind === 'pointer') queue.splice(i, 1);
-                }
-                if (queue.length && frame && !scrollOnly && (frame.documentGeneration !== next.documentGeneration || JSON.stringify(frame.viewport) !== JSON.stringify(next.viewport))) {
-                    lost = true; queue.length = 0; status(text.confirmed, true); await close(); render(); return;
-                }
-                wheelRefresh = false;
-                frame = next;
-                confirmedAt = performance.now();
-                captureAge = next.ageMs + performance.now() - started;
-                image.src = decoded.src;
-                image.hidden = false;
-                $('empty').hidden = true;
-                image.style.width = fitted ? '' : next.viewport.width + 'px';
-                image.style.height = fitted ? '' : next.viewport.height + 'px';
-                status(fresh() ? own() ? text.control : text.observe : text.stale);
-                render();
-            }
-        }
-        catch (e) {
-            if (view === owner && !owner?.closed && gen === generation
-                && e?.code !== 'QUOTA_EXCEEDED' && e?.code !== 'CONFLICT' && e?.code !== 'STALE_REF')
-                fail(e);
-        }
-        finally {
-            polling = false;
-            void flush();
-        }
-    }
-    async function flush() {
-        if (wheelRefresh || polling || inputBusy || !queue.length || !canInput())
-            return;
-        const event = queue.shift(), owner = view, lease = own(), gen = generation;
-        const current = frame;
-        inputBusy = true;
-        const n = ++sequence;
-        try {
-            const result = await request('dispatchPageInput', { schemaVersion: 1, viewId: owner.viewId, frameId: current.frameId, leaseEpoch: lease.leaseEpoch, sequence: n, event });
-            if (view !== owner || gen !== generation)
-                return;
-            if (result.state !== 'applied') {
-                lost = true;
-                queue.length = 0;
-                status(result.state === 'unknown' ? text.unresolved : text.confirmed, true);
-                render();
-            }
-            else if (event.kind === 'wheel') wheelRefresh = true;
-        }
-        catch (e) {
-            queue.length = 0;
-            if (!e?.known) {
-                lost = true;
-                status(text.unknown, true);
-                render();
-                void receipt().catch(fail);
-            }
-            else {
-                lost = true;
-                fail(e);
-                if (e.code === 'STALE_REF' || e.code === 'STALE_LEASE' || e.code === 'CONFLICT')
-                    status(text.confirmed, true);
-            }
-        }
-        finally {
-            inputBusy = false;
-            if (view === owner)
-                void flush();
-        }
-    }
-    function enqueue(event) {
-        if (!canInput())
-            return;
-        const last = queue[queue.length - 1];
-        if (event.kind === 'pointer' && event.type === 'mouseMoved' && last?.kind === 'pointer' && last.type === 'mouseMoved')
-            queue[queue.length - 1] = event;
-        else if (event.kind === 'wheel' && last?.kind === 'wheel') {
-            last.deltaX = Math.max(-4096, Math.min(4096, last.deltaX + event.deltaX));
-            last.deltaY = Math.max(-4096, Math.min(4096, last.deltaY + event.deltaY));
-        }
-        else if (queue.length < 32)
-            queue.push(event);
-        else {
-            lost = true;
-            queue.length = 0;
-            status(text.confirmed, true);
-            void close().catch(fail);
-            render();
-            return;
-        }
-        void flush();
-    }
-    const mods = (e) => (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
-    function point(e) {
-        if (!frame)
-            return null;
-        const r = image.getBoundingClientRect(), ratio = Math.min(r.width / frame.pixelWidth, r.height / frame.pixelHeight);
-        const width = frame.pixelWidth * ratio, height = frame.pixelHeight * ratio;
-        const x = (e.clientX - r.left - (r.width - width) / 2) / width * frame.viewport.width;
-        const y = (e.clientY - r.top - (r.height - height) / 2) / height * frame.viewport.height;
-        return x >= 0 && y >= 0 && x < frame.viewport.width && y < frame.viewport.height ? { x, y } : null;
-    }
-    for (const [dom, type] of [['pointerdown', 'mousePressed'], ['pointerup', 'mouseReleased'], ['pointermove', 'mouseMoved']])
-        image.addEventListener(dom, e => {
-            if (!canInput())
-                return;
-            const p = point(e);
-            if (!p)
-                return;
-            e.preventDefault();
-            if (dom === 'pointerdown') {
-                input.focus({ preventScroll: true });
-                image.setPointerCapture(e.pointerId);
-            }
-            enqueue({ kind: 'pointer', type, ...p, button: dom === 'pointermove' ? 'none' : ['left', 'middle', 'right'][e.button] || 'none', buttons: e.buttons & 7, clickCount: dom === 'pointermove' ? 0 : Math.min(2, e.detail || 1), modifiers: mods(e) });
         });
-    image.addEventListener('contextmenu', e => { if (canInput())
-        e.preventDefault(); });
-    image.addEventListener('wheel', e => {
-        if (!canInput())
-            return;
-        const p = point(e);
-        if (!p)
-            return;
-        e.preventDefault();
-        const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? frame.viewport.height : 1;
-        enqueue({ kind: 'wheel', ...p, deltaX: Math.max(-4096, Math.min(4096, e.deltaX * unit)), deltaY: Math.max(-4096, Math.min(4096, e.deltaY * unit)), modifiers: mods(e) });
-    }, { passive: false });
-    image.addEventListener('focus', () => { if (canInput())
-        input.focus({ preventScroll: true }); });
-    input.addEventListener('compositionstart', () => { composing = true; });
-    input.addEventListener('compositionend', e => { composing = false; if (e.data)
-        enqueue({ kind: 'text', text: e.data.slice(0, 1024) }); input.value = ''; });
-    input.addEventListener('beforeinput', raw => {
-        const e = raw;
-        if (composing || e.isComposing || e.inputType === 'insertFromComposition')
-            return;
-        if (e.inputType === 'insertText' && e.data) {
-            e.preventDefault();
-            enqueue({ kind: 'text', text: e.data.slice(0, 1024) });
-        }
-    });
-    input.addEventListener('paste', e => { if (!canInput())
-        return; e.preventDefault(); const value = e.clipboardData?.getData('text/plain'); if (value)
-        enqueue({ kind: 'text', text: value.slice(0, 1024) }); });
-    input.addEventListener('input', () => { if (!composing)
-        input.value = ''; });
-    for (const type of ['keydown', 'keyup'])
-        input.addEventListener(type, e => {
-            if (composing || e.isComposing || e.key === 'Process' || e.key === 'Dead')
-                return;
-            if (!canInput()) {
-                e.preventDefault();
-                return;
-            }
-            const shortcut = e.ctrlKey || e.metaKey || e.altKey;
-            if (e.code === 'KeyV' && (e.ctrlKey || e.metaKey))
-                return; // let the native paste event deliver plain text exactly once
-            if (e.key.length === 1 && !shortcut)
-                return; // beforeinput/composition is the only printable text path
-            e.preventDefault();
-            keyModifiers = mods(e);
-            if (type === 'keydown')
-                keys.add(e.code);
-            else
-                keys.delete(e.code);
-            enqueue({ kind: 'key', type: type === 'keydown' ? 'keyDown' : 'keyUp', key: e.key, code: e.code, modifiers: keyModifiers });
-        });
+    }
     async function action(op, extra) {
         if (busy || !task)
             return;
         busy = true;
-        queue.length = 0;
+        viewer.clearQueue();
         render();
         const id = task.taskId;
         try {
             if (op === 'releaseControl') {
-                if (view) view.closed = true; // invalidate in-flight reads before the release request
+                viewer.invalidate(); // invalidate in-flight reads before the release request
                 status(text.returning);
             }
             const result = await request(op, { taskId: id, requestId: crypto.randomUUID(), ...extra });
@@ -480,45 +238,35 @@ function remotePageClient() {
             render();
         }
     }
-    $('take').onclick = () => { const tabId = view?.tabId; const epoch = task?.tabLeases?.find((l) => l.tabId === tabId)?.leaseEpoch; void action('takeOver', { tabId, expectedEpoch: epoch }); };
-    $('release').onclick = () => { void action('releaseControl', { tabId: view?.tabId, expectedEpoch: own()?.leaseEpoch }); };
+    $('take').onclick = () => { const tabId = viewer.view()?.tabId; const epoch = task?.tabLeases?.find((l) => l.tabId === tabId)?.leaseEpoch; void action('takeOver', { tabId, expectedEpoch: epoch }); };
+    $('release').onclick = () => { void action('releaseControl', { tabId: viewer.view()?.tabId, expectedEpoch: own()?.leaseEpoch }); };
     $('resume').onclick = () => { void action('resume', { expectedVersion: task?.stateVersion }); };
     $('stop').onclick = () => { void action('cancel', {}); };
     for (const id of ['approve', 'reject'])
         $(id).onclick = () => { const approval = task?.pendingApproval; if (approval)
             void action('approve', { approvalId: approval.approvalId, bindingHash: approval.bindingHash, decision: id === 'approve' ? 'approve' : 'reject' }); };
     select.onchange = () => { const id = select.value; void request('getTask', { taskId: id }).then(openTask).catch(fail); };
-    tabs.onchange = () => { if (!busy && !inputBusy) void openTask(task, tabs.value).catch(fail); };
-    $('fit').onclick = () => { fitted = !fitted; $('viewport').classList.toggle('actual', !fitted); $('fit').setAttribute('aria-pressed', String(fitted)); image.style.width = fitted || !frame ? '' : frame.viewport.width + 'px'; image.style.height = fitted || !frame ? '' : frame.viewport.height + 'px'; };
-    $('retry').onclick = () => { if (inputBusy || busy)
-        return; ++generation; lost = false; busy = true; render();
+    tabs.onchange = () => { if (!busy && !viewer.inputBusy()) void openTask(task, tabs.value).catch(fail); };
+    $('fit').onclick = () => { $('fit').setAttribute('aria-pressed', String(viewer.toggleFit())); };
+    $('retry').onclick = () => { if (viewer.inputBusy() || busy)
+        return; ++generation; viewer.clearLost(); busy = true; render();
         void close().catch(() => {}).finally(() => {
             token = ''; binding = ''; w.__abpPageViewBinding = null; lastList = -Infinity;
             busy = false; status(text.connecting); render(); askHost();
         }); };
-    input.addEventListener('blur', () => {
-        const owner = view;
-        if (!owner || !own())
-            return;
-        owner.closed = true;
-        queue.length = 0;
-        keys.clear();
-        render();
-        void request('closePageView', { schemaVersion: 1, viewId: owner.viewId }).catch(fail);
-    });
-    document.addEventListener('visibilitychange', () => { queue.length = 0; if (document.hidden) {
+    document.addEventListener('visibilitychange', () => { viewer.clearQueue(); if (document.hidden) {
         ++generation;
         void close().catch(fail);
     }
     else if (task && token)
         void openTask(task).catch(fail); });
-    window.addEventListener('pagehide', () => { ++generation; queue.length = 0; void close().catch(() => { }); });
+    window.addEventListener('pagehide', () => { ++generation; viewer.clearQueue(); void close().catch(() => { }); });
     window.addEventListener('message', event => {
         const d = event.data;
         if (event.source !== window.parent || event.origin !== location.origin || d?.type !== 'abp-capability' || typeof d.token !== 'string' || !Number.isSafeInteger(d.expiresAtMs))
             return;
         void (async () => {
-            if (inputBusy)
+            if (viewer.inputBusy())
                 return; // renewal will be requested again; never replace a pending mutation's token
             const previous = token;
             token = d.token;
@@ -551,19 +299,15 @@ function remotePageClient() {
                 fail({ code: 'SCOPE_DENIED' });
                 return;
             }
-            if (previous && view)
+            if (previous && viewer.view())
                 await close();
             await list();
-            if (task && !view)
+            if (task && !viewer.view())
                 await openTask(task);
             void poll();
         })().catch(fail);
     });
-    setInterval(() => { if (frame && !fresh()) {
-        queue.length = 0;
-        status(text.stale, true);
-        render();
-    } void poll(); }, 220);
+    setInterval(() => { viewer.checkStale(); void poll(); }, 220);
     setInterval(() => { if (!token || Date.now() >= expiry - 60000)
         askHost(); }, 10000);
     status(text.connecting);

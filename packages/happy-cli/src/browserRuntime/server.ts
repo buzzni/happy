@@ -93,6 +93,8 @@ export interface RuntimeServerOptions {
     consoleHostOrigins?: readonly string[]
     /** Personal PCs show their dedicated Chrome windows; they do not have a VNC display. */
     consoleScreenMode?: 'native-window'
+    /** The Runtime serves page views (Mac personal PC): its own conversation console offers the page in the screen area. */
+    consolePageView?: boolean
 }
 
 export interface RuntimeServer { url: string; port: number; close(): Promise<void> }
@@ -203,7 +205,7 @@ export async function startRuntimeServer(opts: RuntimeServerOptions): Promise<Ru
                     'content-security-policy': "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:",
                 })
                 return res.end(url.searchParams.get('remotePage') === '1' && opts.consoleScreenMode === 'native-window'
-                    ? renderRemoteConsolePage() : renderConsolePage({ hostOrigins: opts.consoleHostOrigins ?? [], screenMode: opts.consoleScreenMode }))
+                    ? renderRemoteConsolePage() : renderConsolePage({ hostOrigins: opts.consoleHostOrigins ?? [], screenMode: opts.consoleScreenMode, pageView: opts.consolePageView === true }))
             }
             if (req.method === 'GET' && url.pathname.startsWith(VIEWER_ASSET_PREFIX) && opts.viewerAssetsDir
                 && await serveViewerAsset(opts.viewerAssetsDir, url.pathname, res)) return

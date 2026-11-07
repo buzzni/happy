@@ -9,7 +9,9 @@ import { CdpConnection } from './cdpConnection'
 import { CdpDriver } from './cdpDriver'
 import { openNativeBrowserSession } from '../nativeBrowserSession'
 import { readNativeSessionOwner } from '../nativeHostPrimitives'
+import { personalBrowserArgs } from '../personalBrowserProcess'
 import type { BrowserInstanceId } from '../contracts'
+import { delay } from './pocTestKit'
 
 // This is an actual macOS Chrome acceptance check, not the Windows pipe contract.
 // Never point it at a user's profile or pass --no-sandbox.
@@ -104,3 +106,64 @@ it.skipIf(process.platform !== 'darwin')('opens a real basic browser session wit
         await new Promise<void>(resolve => site.close(() => resolve()))
     }
 }, 20000)
+
+// A personal PC gives each owned tab its own headful window, which the user usually leaves behind Saycode or
+// minimizes. A command left unanswered past the connection timeout closes the whole connection and with it the
+// browser session, so page capture and input must keep answering in those window states (the driver's focus
+// emulation on every owned page is what keeps such a page painting).
+it.skipIf(process.platform !== 'darwin')('keeps page capture and input answering while an owned headful window is covered or minimized', async () => {
+    const profile = await mkdtemp(join(tmpdir(), 'abp-covered-chrome-'))
+    const site = createServer((_req, res) => {
+        res.setHeader('Content-Type', 'text/html')
+        res.end('<title>Covered window</title><style>body{margin:0}input{position:absolute;left:20px;top:20px;width:200px;height:40px}</style>'
+            + '<input id="field" oninput="document.getElementById(\'typed\').textContent=\'typed:\'+this.value"><p id="typed" style="margin-top:80px"></p><p id="tick">0</p>'
+            + '<script>let n=0;setInterval(()=>{document.getElementById("tick").textContent=String(++n)},100)</script>')
+    })
+    await new Promise<void>(resolve => site.listen(0, '127.0.0.1', resolve))
+    const origin = `http://127.0.0.1:${(site.address() as { port: number }).port}`
+    const chrome = process.env.SAYCODE_NATIVE_TEST_CHROME ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+    const child = spawn(chrome, personalBrowserArgs('darwin', profile), { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] })
+    const exited = new Promise<void>(resolve => child.once('close', () => resolve()))
+    const connection = CdpConnection.fromPipe(child.stdio[3] as Writable, child.stdio[4] as Readable, { timeoutMs: 8000 })
+    const driver = new CdpDriver({ connectPipe: async () => ({ connection, browserInstanceId: 'native-covered-window' as BrowserInstanceId }) })
+    try {
+        await driver.connect()
+        const tab = await driver.openTab(origin, [origin], { timeoutMs: 5000 })
+        const cover = await driver.openTab(origin, [origin], { timeoutMs: 5000 })
+        const windowOf = async (targetId: string) => (await connection.send('Browser.getWindowForTarget', { targetId })).windowId as number
+        const shown = await windowOf(tab.targetId), covering = await windowOf(cover.targetId)
+        await connection.send('Browser.setWindowBounds', { windowId: shown, bounds: { left: 60, top: 60, width: 640, height: 480, windowState: 'normal' } })
+        const answersIn = async (state: string, text: string, typed: string) => {
+            const frames = []
+            for (let i = 0; i < 4; i++) {
+                const started = Date.now()
+                frames.push(await driver.pageView.capture(tab.tabId, () => {}, 55, 1280))
+                expect(Date.now() - started, `${state} capture ${i}`).toBeLessThan(2000)
+                await delay(250)
+            }
+            // The ticking counter is repainted between captures: the page is not frozen on its last frame.
+            expect(new Set(frames.map(frame => frame.data)).size, `${state} repaint`).toBeGreaterThan(1)
+            const frame = frames[frames.length - 1]
+            const pointer = { kind: 'pointer' as const, x: 80, y: 40, button: 'left' as const, buttons: 1, clickCount: 1, modifiers: 0 }
+            await driver.pageView.input(tab.tabId, frame, { ...pointer, type: 'mousePressed' }, () => {})
+            await driver.pageView.input(tab.tabId, frame, { ...pointer, buttons: 0, type: 'mouseReleased' }, () => {})
+            await driver.pageView.input(tab.tabId, frame, { kind: 'text', text }, () => {})
+            await driver.pageView.release(tab.tabId)
+            expect(JSON.stringify(await driver.observe(tab.tabId, [origin], { timeoutMs: 5000 })), `${state} input`).toContain(`typed:${typed}`)
+        }
+        await connection.send('Browser.setWindowBounds', { windowId: covering, bounds: { left: 0, top: 0, width: 900, height: 700, windowState: 'normal' } })
+        await delay(500)
+        await answersIn('covered', '가', '가')
+        await connection.send('Browser.setWindowBounds', { windowId: shown, bounds: { windowState: 'minimized' } })
+        await delay(500)
+        await answersIn('minimized', '나', '가나')
+        expect(connection.closed).toBe(false)
+    } finally {
+        await driver.close().catch(() => undefined)
+        connection.close()
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+        await exited
+        await rm(profile, { recursive: true, force: true })
+        await new Promise<void>(resolve => site.close(() => resolve()))
+    }
+}, 40_000)
