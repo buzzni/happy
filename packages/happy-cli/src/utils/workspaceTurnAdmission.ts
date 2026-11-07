@@ -26,6 +26,31 @@ export type LegacyDispatchReservation = Exclude<WorkspaceTurnAdmissionResult, { 
   acquired: true; finish(): Promise<void>;
 };
 const MAX_REGISTRY_BYTES = 1024 * 1024;
+/** Unknown descendants cannot be evicted by age or PID. At capacity, retain a broader boot-bound
+ * fence instead: legacy work can proceed, while any new automatic workspace needs verification. */
+function boundedOwners(owners: Owner[]): Owner[] {
+  const fits = (value: Owner[]) => registrySchema.safeParse({ version: 1, owners: value }).success
+    && Buffer.byteLength(JSON.stringify({ version: 1, owners: value })) <= MAX_REGISTRY_BYTES;
+  const pressure = !fits(owners), groups = new Map<string | null, Owner[]>();
+  for (const owner of owners) if (owner.kind === 'unfenced') {
+    const group = groups.get(owner.bootId) ?? []; group.push(owner); groups.set(owner.bootId, group);
+  }
+  const compact = new Set([...groups].filter(([, group]) => pressure
+    || group.length > 1 && group.some(owner => owner.roots.includes('/'))).map(([boot]) => boot));
+  if (!compact.size) {
+    if (pressure) throw new Error('WORKSPACE_ADMISSION_CAPACITY');
+    return owners;
+  }
+  const retained = owners.filter(owner => owner.kind !== 'unfenced' || !compact.has(owner.bootId));
+  for (const boot of compact) {
+    const group = groups.get(boot)!;
+    const original = group.find(owner => owner.roots.includes('/')) ?? group[0];
+    retained.push({ ...original, roots: ['/'], identities: undefined, controller: undefined });
+  }
+  if (!fits(retained)) throw new Error('WORKSPACE_ADMISSION_CAPACITY');
+  if (pressure) logger.warn('[workspace-admission] Unconfirmed writer capacity requires broader workspace verification');
+  return retained;
+}
 /** Retry only failure to acquire the short bookkeeping lock, never its work or a workspace conflict. */
 async function withRegistryLock<T>(path: string, work: () => Promise<T>, retries = 25): Promise<T> {
   for (let attempt = 0; ; attempt++) {
@@ -178,7 +203,7 @@ export function createWorkspaceTurnAdmission(input: {
     } finally { await handle.close(); }
   }
   async function write(owners: Owner[]) {
-    const data = JSON.stringify(registrySchema.parse({ version: 1, owners }));
+    const data = JSON.stringify(registrySchema.parse({ version: 1, owners: boundedOwners(owners) }));
     if (Buffer.byteLength(data) > MAX_REGISTRY_BYTES) throw new Error('WORKSPACE_ADMISSION_CAPACITY');
     const temporary = file + '.' + randomUUID() + '.tmp';
     const handle = await open(temporary, 'wx', 0o600);
@@ -216,21 +241,28 @@ export function createWorkspaceTurnAdmission(input: {
             }
             return { acquired: true } as const;
           }
-          const blockers = owners.filter(owner => owner.token === token || owner.sessionId === input.sessionId ||
-            (owner.kind === 'automation' || input.kind === 'automation')
-              && (owner.roots.some(a => paths.some(b => overlaps(a, b))) || identitiesOverlap(owner.identities, identities)));
-          if (blockers.length) {
+          const refusal = (entries: Owner[]): Exclude<WorkspaceTurnAdmissionResult, { acquired: true }> | null => {
+            const blockers = entries.filter(owner => owner.token === token || owner.sessionId === input.sessionId ||
+              (owner.kind === 'automation' || input.kind === 'automation')
+                && (owner.roots.some(a => paths.some(b => overlaps(a, b))) || identitiesOverlap(owner.identities, identities)));
+            if (!blockers.length) return null;
             const confirmedAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
             return { acquired: false, reason: blockers.some(owner => owner.kind === 'unfenced' || !confirmedAlive(owner.pid))
-              ? 'workspace-owner-unconfirmed' : 'workspace-busy', sessions: [...new Set(blockers.map(owner => owner.sessionId))] } as const;
-          }
-          owners.push(ownerSchema.parse({ token, controller, sessionId: input.sessionId, kind: input.kind, pid: process.pid,
-            bootId, roots: paths, identities, acquiredAt: Date.now() }));
-          await write(owners);
+              ? 'workspace-owner-unconfirmed' : 'workspace-busy', sessions: [...new Set(blockers.map(owner => owner.sessionId))] };
+          };
+          const blocked = refusal(owners); if (blocked) return blocked;
+          const candidate = ownerSchema.parse({ token, controller, sessionId: input.sessionId, kind: input.kind, pid: process.pid,
+            bootId, roots: paths, identities, acquiredAt: Date.now() });
+          const next = boundedOwners([...owners, candidate]), others = next.filter(owner => owner !== candidate);
+          const widened = refusal(others);
+          if (widened) { await write(others); return widened; }
+          await write(next);
           return { acquired: true } as const;
         }, input.kind === 'automation' ? 0 : 25);
       } catch (error) {
-        if (error instanceof FileLockHeldError) return { acquired: false, reason: 'registry-busy', sessions: [] };
+        if (error instanceof FileLockHeldError || error instanceof Error && error.message === 'WORKSPACE_ADMISSION_CAPACITY') {
+          return { acquired: false, reason: 'registry-busy', sessions: [] };
+        }
         throw error;
       }
     },

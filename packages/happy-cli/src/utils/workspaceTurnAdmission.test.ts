@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } fr
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { createWorkspaceTurnAdmission } from './workspaceTurnAdmission';
 import * as module from './workspaceTurnAdmission';
 import { readCurrentBootIdSync } from './bootIdentity';
@@ -71,6 +72,80 @@ test('retains concurrent legacy writers once each despite contended registry boo
   expect(operation).toHaveBeenCalledTimes(5);
   expect(await admission('automation-run:after-concurrent-legacy', 'automation').tryAcquire())
     .toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+});
+
+test.each(['filesystem', 'subprocess'])('keeps %s work available at unknown-writer registry capacity without dropping live ownership', async kind => {
+  const manual = admission('preserved-manual', 'manual');
+  expect(await manual.tryAcquire()).toEqual({ acquired: true });
+  const file = join(home, 'workspace-turn-admission.v1', 'owners.json');
+  const registry = JSON.parse(await readFile(file, 'utf8')), original = registry.owners[0];
+  registry.owners.push(...Array.from({ length: 511 }, (_, index) => ({ token: randomUUID(), sessionId: `old-process-${index}`,
+    kind: 'unfenced', pid: process.pid, bootId: fixtureBoot, acquiredAt: 1, roots: [join(home, `old-${index}`)] })));
+  await writeFile(file, JSON.stringify(registry));
+  const operation = vi.fn(async () => { await writeFile(join(workspace, 'capacity-result'), 'kept'); return 'kept'; });
+  const result = kind === 'filesystem' ? await module.createFilesystemWriteAdmission({ home })(operation)
+    : await module.createUnfencedSubprocessAdmission({ home, bootId: fixtureBoot })([workspace], operation);
+  expect(result).toBe('kept'); expect(operation).toHaveBeenCalledOnce();
+  const saved = JSON.parse(await readFile(file, 'utf8'));
+  expect(saved.owners.length).toBeLessThanOrEqual(512);
+  expect(Buffer.byteLength(JSON.stringify(saved))).toBeLessThanOrEqual(1024 * 1024);
+  expect(saved.owners.find((owner: any) => owner.token === original.token)).toEqual(original);
+  expect(await manual.release(true)).toBe(true);
+  const other = join(home, 'other-capacity'); await mkdir(other);
+  expect(await admission('automation-run:capacity', 'automation', [other]).tryAcquire())
+    .toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+});
+
+test.each(['identities', 'bytes'])('retains unknown custody at the $0 limit while allowing a legacy process', async pressure => {
+  const directory = join(home, 'workspace-turn-admission.v1'); await mkdir(directory, { mode: 0o700 });
+  const root = await realpath(workspace);
+  const owner = { token: randomUUID(), sessionId: 'old-process', kind: 'unfenced', pid: process.pid, bootId: fixtureBoot,
+    acquiredAt: 1, roots: [root], identities: pressure === 'identities'
+      ? Array.from({ length: 512 }, (_, index) => ({ root, identity: `old-inode-${index}`, ancestors: [] as string[] }))
+      : [{ root, identity: '', ancestors: [] as string[] }] };
+  const registry = { version: 1, owners: [owner] };
+  if (pressure === 'bytes') owner.identities[0].identity = 'x'.repeat(1024 * 1024 - 64 - Buffer.byteLength(JSON.stringify(registry)));
+  const file = join(directory, 'owners.json'); await writeFile(file, JSON.stringify(registry), { mode: 0o600 });
+  const operation = vi.fn(async () => 'submitted');
+  expect(await module.createUnfencedSubprocessAdmission({ home, bootId: fixtureBoot })([workspace], operation)).toBe('submitted');
+  expect(operation).toHaveBeenCalledOnce();
+  expect(Buffer.byteLength(await readFile(file))).toBeLessThanOrEqual(1024 * 1024);
+  const other = join(home, 'other-pressure'); await mkdir(other);
+  expect(await admission('automation-run:pressure', 'automation', [other]).tryAcquire())
+    .toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+});
+
+test('holds the first automatic candidate after capacity broadens custody and preserves unknown boot evidence', async () => {
+  const directory = join(home, 'workspace-turn-admission.v1'); await mkdir(directory, { mode: 0o700 });
+  const file = join(directory, 'owners.json');
+  await writeFile(file, JSON.stringify({ version: 1, owners: Array.from({ length: 512 }, (_, index) => ({
+    token: randomUUID(), sessionId: `unconfirmed-${index}`, kind: 'unfenced', pid: process.pid,
+    bootId: index % 2 ? fixtureBoot : null, acquiredAt: 1, roots: [join(home, `old-root-${index}`)],
+  })) }), { mode: 0o600 });
+  const other = join(home, 'first-candidate'); await mkdir(other);
+  expect(await admission('automation-run:first-pressure', 'automation', [other]).tryAcquire())
+    .toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+  const saved = JSON.parse(await readFile(file, 'utf8'));
+  expect(saved.owners).toHaveLength(2);
+  expect(saved.owners.every((owner: any) => owner.kind === 'unfenced' && owner.roots.length === 1 && owner.roots[0] === '/')).toBe(true);
+  expect(await admission('automation-run:after-reboot', 'automation', [other], 'another-proven-boot').tryAcquire())
+    .toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+});
+
+test('returns a bounded retryable refusal for live-owner capacity and recovers after a proven release', async () => {
+  const owner = admission('known-owner-to-release', 'manual'); await owner.tryAcquire();
+  const file = join(home, 'workspace-turn-admission.v1', 'owners.json');
+  const registry = JSON.parse(await readFile(file, 'utf8'));
+  registry.owners.push(...Array.from({ length: 511 }, (_, index) => ({ ...registry.owners[0], token: randomUUID(),
+    controller: randomUUID(), sessionId: `known-other-${index}` })));
+  await writeFile(file, JSON.stringify(registry));
+  const operation = vi.fn(async () => 'written'), execute = module.createFilesystemWriteAdmission({ home });
+  await expect(execute(operation)).rejects.toMatchObject({ code: 'WORKSPACE_REGISTRY_BUSY' });
+  expect(operation).not.toHaveBeenCalled();
+  expect(JSON.parse(await readFile(file, 'utf8'))).toEqual(registry);
+  expect(await owner.release(true)).toBe(true);
+  expect(await execute(operation)).toBe('written'); expect(operation).toHaveBeenCalledOnce();
+  expect(JSON.parse(await readFile(file, 'utf8')).owners).toHaveLength(511);
 });
 
 test('keeps a live registry lock owned and bounds manual waiting without delaying automatic admission', async () => {
