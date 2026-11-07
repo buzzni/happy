@@ -352,6 +352,7 @@ import { mergeAdditionalDirectoriesIntoSandboxEnvironment, readAdditionalDirecto
 import { createAutomationContextWorkspace } from './automations/automationContextWorkspace';
 import { createAutomationContextHost, prepareAutomationContextTick } from './automations/automationContextHost';
 import { createAutomationContextReferenceReader } from './automations/automationContextReference';
+import { createAutomationQuestionWorker, withAutomationQuestionWorker } from './automations/automationQuestionWorker';
 import { createFilesystemWriteAdmission, createSubprocessWriteAdmission, createLegacyDispatchAdmission, canonicalWorkspaceAdmissionRoots } from '@/utils/workspaceTurnAdmission';
 import { observeWorkspaceContextChild, WORKSPACE_CONTEXT_CONTROL_ENV } from '@/utils/workspaceContextControl';
 import { probeProcessGroup } from './managedProcessGroup';
@@ -5299,7 +5300,7 @@ export async function startDaemon(): Promise<void> {
         if (!tracked?.encryption || !localDirectory || await resolveAutomationDirectoryMatch(localDirectory, directory) !== true) {
           throw new Error('AUTOMATION_STOP_TARGET_UNCONFIRMED');
         }
-        await stopSessionWithExitVerification(sessionId, { source: 'server-automation', reason: 'Owning Chat was deleted' });
+        await stopSessionWithExitVerification(sessionId, { source: 'server-automation', reason: 'Automation execution cancellation requested' });
       },
       resolveContext: async run => {
         // Deferred work obtains a new principal/environment; persisted bearer grants and credentials are never reused.
@@ -5322,16 +5323,29 @@ export async function startDaemon(): Promise<void> {
         finally { contextOwnedChildren.delete(options); }
       },
     }) : null;
+    const questionWorker = contextHost && contextJournal && contextAccountId ? createAutomationQuestionWorker({
+      home: configuration.happyHomeDir, serverUrl: configuration.serverUrl, token: credentials.token,
+      accountId: contextAccountId, machineId, journal: contextJournal, host: contextHost, runtimeStore: serverAutomationRuntimeStore,
+      transport: apiMachine.serverAutomationTransport(), log: message => logger.warn(message),
+      decode: question => trustedServerAutomationPayload({ automationId: question.automationId, generation: question.generation,
+        revision: question.revision, ...question.encrypted, paused: true, enabledAt: 0 }, {
+        machineSecretKey: machineAutomationKey.secretKey, trust: payloadTrust, machineId,
+        questionIdentity: { requestId: question.requestId, sourceRunId: question.sourceRunId },
+        onUnauthenticated: () => recordUnauthenticated(`automation question ${question.requestId}`),
+      }),
+    }) : null;
     const initialContextAdmission = await prepareAutomationContextTick(contextHost, new AbortController().signal,
-      message => logger.warn(message));
+      message => logger.warn(message), questionWorker);
     apiMachine.setAutomationContextIsolationReady(initialContextAdmission.isolatedContextReady);
-    const serverAutomationTickRunner = createAutomationTickRunner({
+    let questionsReady = initialContextAdmission.isolatedContextReady;
+    const scheduledServerAutomationTickRunner = createAutomationTickRunner({
       // Windows standalone: sessions launch through the verified Job owner, so scheduled
       // sessions run; script gates and GitHub triggers would spawn unfenced cmd/gh/git.
       runTick: async (signal) => {
-        const contextAdmission = await prepareAutomationContextTick(contextHost, signal, message => logger.warn(message));
+        const contextAdmission = await prepareAutomationContextTick(contextHost, signal, message => logger.warn(message), questionWorker);
         if (signal.aborted) return;
         apiMachine.setAutomationContextIsolationReady(contextAdmission.isolatedContextReady);
+        questionsReady = contextAdmission.isolatedContextReady;
         await runServerAutomationTick({
         ...contextAdmission,
         reserveLegacyDispatch,
@@ -5462,7 +5476,7 @@ export async function startDaemon(): Promise<void> {
           const localDirectory = tracked.happySessionMetadataFromLocalWebhook?.path ?? tracked.directory;
           if (!tracked.encryption || !localDirectory || await resolveAutomationDirectoryMatch(localDirectory, directory) !== true) return false;
           if (!isAutomationSessionRunning(sessionId)) return true;
-          const stopped = await stopSessionWithExitVerification(sessionId, { source: 'server-automation', reason: 'Owning Chat was deleted' });
+          const stopped = await stopSessionWithExitVerification(sessionId, { source: 'server-automation', reason: 'Automation execution cancellation requested' });
           return stopped.exitVerification.status === 'exited' || stopped.exitVerification.status === 'not-tracked';
         },
         resumeServerChosenSession: configuration.machineControl !== 'strict',
@@ -5499,6 +5513,9 @@ export async function startDaemon(): Promise<void> {
       // 정상 tick 은 1분 하트비트 안에 끝난다 (spawn webhook 대기 최대 60초, gh·git 호출은
       // 각자 상한이 있다). 이를 10배 넘기면 끝나지 않는 await 다 — 버리고 새로 시작한다.
       stalledAfterMs: SERVER_AUTOMATION_TICK_STALL_MS,
+    });
+    const serverAutomationTickRunner = withAutomationQuestionWorker(scheduledServerAutomationTickRunner, questionWorker, {
+      isReady: () => questionsReady, log: message => logger.warn(message),
     });
     const sessionFollowupSyncState = createSessionFollowupSyncState();
     const sessionFollowupTickRunner = createAutomationTickRunner({

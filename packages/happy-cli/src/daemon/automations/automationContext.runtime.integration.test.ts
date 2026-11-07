@@ -7,7 +7,7 @@ import { createServer } from 'node:http'
 import { execFile, type ChildProcess } from 'node:child_process'
 import { promisify } from 'node:util'
 import { readAutomationExecutionRecord, bindRpcRequest, readBoundRpcResponse,
-  sessionCreateBodyHash, type AutomationPayload } from '@slopus/happy-wire'
+  sessionCreateBodyHash, automationExecutionSessionId, type AutomationPayload } from '@slopus/happy-wire'
 import { signAutomationExecutionTarget } from '@slopus/happy-wire/automationExecutionToken'
 import { signChatAutomationLifecycle } from '@slopus/happy-wire/chatAutomationLifecycleToken'
 import { ApiClient } from '@/api/api'
@@ -22,7 +22,7 @@ import { createAutomationContextAuthorizer, createAutomationContextTransport } f
 import { createServerAutomationRuntimeStore } from './serverAutomationRuntimeStore'
 import { createAutomationContextWorkspace } from './automationContextWorkspace'
 
-it.each(['claude', 'codex'] as const)('runs two publicly registered isolated %s occurrences through negotiated daemon sync with the manual chat unchanged', async provider => {
+it.each(['claude', 'codex'] as const)('runs two publicly registered isolated %s occurrences and a selected follow-up with the manual chat unchanged', async provider => {
   vi.stubEnv('HAPPY_SCOPE_FRESH_PROVIDER_STATE', '1')
   vi.stubEnv('HAPPY_SCOPE_PACKAGED_SERVER', undefined)
   vi.stubEnv('HAPPY_SCOPE_INSTALLED_CLI', undefined)
@@ -38,7 +38,7 @@ it.each(['claude', 'codex'] as const)('runs two publicly registered isolated %s 
         || body.conversationDirectory && body.conversationDirectory !== fixture.project) { reply(403, {}); return }
       const admission = await fetch(`${fixture.serverUrl}/v1/automation-runs/${encodeURIComponent(body.runId)}/mcp-context`, {
         method: 'POST', headers: { Authorization: `Bearer ${fixture.token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ machineId, claimToken: body.claimToken, executionAdmission: true }), signal: AbortSignal.timeout(10_000) })
+        body: JSON.stringify({ machineId, claimToken: body.claimToken, executionAdmission: true, questionProtocol: 1 }), signal: AbortSignal.timeout(10_000) })
       if (!admission.ok) { await admission.body?.cancel(); reply(403, {}); return }
       const admitted = await admission.json() as any
       if (admitted.executionAdmission?.payloadVersion !== 6) { reply(403, {}); return }
@@ -50,9 +50,11 @@ it.each(['claude', 'codex'] as const)('runs two publicly registered isolated %s 
         reply(200, { projectId: admitted.projectId, grant: null, bindingStatus: 'DIRECT_OWNER', connectorPolicy: 'optional', requiredConnectors: [] }); return
       }
       if (request.url === '/api/automation/execution-target') {
+        if (body.questionRequestId !== admitted.questionRequestId) { reply(403, {}); return }
         reply(200, { executionBindingRequired: false, targetProof: signAutomationExecutionTarget({ automationId: admitted.automationId,
           projectId: admitted.projectId, generation: admitted.executionAdmission.generation, revision: admitted.executionAdmission.revision,
           machineId, runId: body.runId, machineAccountId: fixture.accountId, displaySessionId,
+          ...(admitted.questionRequestId ? { questionRequestId: admitted.questionRequestId } : {}),
           createBodyHash: await sessionCreateBodyHash(body.createBody), executionBindingRequired: false,
           bearer: fixture.token, secret, now: Date.now() }) }); return
       }
@@ -99,7 +101,7 @@ it.each(['claude', 'codex'] as const)('runs two publicly registered isolated %s 
     const viewer = nacl.box.keyPair()
     const viewerKey = await write('PUT', projectPath + '/automation-viewer-key', {
       expectedKeyVersion: target.viewerKeyVersion, publicKey: Buffer.from(viewer.publicKey).toString('base64') })
-    const nativeIds = new Set<string>(), marker = `scope-marker-public-${randomUUID()}`
+    const runIds: string[] = [], nativeIds = new Set<string>(), marker = `scope-marker-public-${randomUUID()}`
     const journal = createAutomationContextLaunchJournal(fixture.happyHome)
     let definition: any
     for (let index = 0; index < 2; index++) {
@@ -125,7 +127,7 @@ it.each(['claude', 'codex'] as const)('runs two publicly registered isolated %s 
         const rows = (await fixture.http(projectPath + `/automation-runs?automationId=${definition.id}`)).body.runs
         return Array.isArray(rows) && rows.length === index + 1 && rows[0].sessionId ? rows : undefined
       }, 'public scheduler claims and dispatches this occurrence', 60_000)
-      const run = runs[0]
+      const run = runs[0]; runIds.push(run.id)
       const receipt = await eventually(async () => {
         const row = await journal.read(run.id)
         return row?.exitReceiptAcknowledged ? row : undefined
@@ -144,6 +146,50 @@ it.each(['claude', 'codex'] as const)('runs two publicly registered isolated %s 
       expect(result).toMatchObject({ status: 'verified', answer: { status: 'completed', answer: `fixture reply ${marker}` } })
     }
     expect(nativeIds.size).toBe(2)
+    // An explicit question is independent of the saved schedule, including when paused.
+    definition = (await write('PATCH', projectPath + `/automations/${definition.id}`, { expectedRevision: definition.revision, paused: true })).automation
+    const unchanged = (await fixture.http(projectPath + '/automations')).body.automations.find((row: any) => row.id === definition.id)
+    const requestId = randomUUID(), questionMarker = `scope-marker-selected-question-${randomUUID()}`
+    const questionPayload: AutomationPayload = { name: 'Selected result question', directory: fixture.project, agent: provider,
+      model: fixture.modelName, prompt: `Return ${questionMarker} only.`, scriptCommand: null, suppressSilent: false,
+      schedule: { kind: 'interval', minutes: 60 }, conversation: { sessionId: displaySessionId },
+      contextPolicy: { kind: 'isolated', reference: { kind: 'previous-result', maxBytes: 16384 } },
+      executionQuestion: { requestId, sourceRunId: runIds[0] } }
+    const dek = nacl.randomBytes(32), nonce = nacl.randomBytes(24)
+    const seal = (publicKey: Uint8Array) => {
+      const ephemeral = nacl.box.keyPair(), boxNonce = nacl.randomBytes(24)
+      return Buffer.from([1, ...ephemeral.publicKey, ...boxNonce, ...nacl.box(dek, boxNonce, publicKey, ephemeral.secretKey)]).toString('base64')
+    }
+    const question = { requestId, sourceRunId: runIds[0], generation: definition.generation, expectedRevision: definition.revision, displaySessionId,
+      encrypted: { payloadVersion: 6, payloadCiphertext: Buffer.from([1, ...nonce, ...nacl.secretbox(Buffer.from(JSON.stringify(questionPayload)), nonce, dek)]).toString('base64'),
+        viewerKeyId: createHash('sha256').update(viewer.publicKey).digest('base64url'), viewerKeyVersion: viewerKey.keyVersion,
+        viewerKeyEnvelope: seal(viewer.publicKey), machineKeyVersion: target.machineKeyVersion,
+        machineKeyEnvelope: seal(Buffer.from(target.machinePublicKey, 'base64')) } }
+    const questionPath = projectPath + `/automations/${definition.id}/execution-questions`
+    expect(await write('POST', questionPath, question)).toMatchObject({ requestId, sourceRunId: runIds[0], state: 'QUEUED' })
+    expect(await write('POST', questionPath, question)).toMatchObject({ requestId, sourceRunId: runIds[0] })
+    const questionReceipt = await eventually(async () => {
+      const value = await journal.read(requestId)
+      return value?.exitReceiptAcknowledged ? value : undefined
+    }, 'fresh explicit question through the production daemon producer', 90_000)
+    const rawQuestion = (await fixture.http('/v2/sessions/lookup', { ids: [automationExecutionSessionId(requestId)] })).body.sessions[0]
+    const openQuestion = (text: string) => decrypt(decodeBase64(questionReceipt.prepared.encryptionKey), questionReceipt.prepared.encryptionVariant, decodeBase64(text))
+    const questionMetadata = openQuestion(rawQuestion.metadata) as any
+    expect(questionMetadata[fixture.providerIdentityField]).toBeTruthy()
+    expect(nativeIds.has(questionMetadata[fixture.providerIdentityField])).toBe(false)
+    expect(questionMetadata[fixture.providerIdentityField]).not.toBe('manual-native-keep')
+    const questionEvidence = (await fixture.http(`/v1/sessions/${displaySessionId}/automation-runs/${requestId}/evidence`)).body
+    const answer = await readAutomationExecutionRecord({ identity: { automationId: definition.id, runId: requestId, generation: definition.generation,
+      revision: definition.revision, displaySessionId }, metadata: openQuestion(questionEvidence.seedManifestCiphertext), complete: questionEvidence.nextAfterSeq === null,
+      seedMessage: { ...questionEvidence.seedMessage, content: openQuestion(questionEvidence.seedMessage.content.c) },
+      messages: questionEvidence.messages.map((row: StoredMessage) => ({ ...row, content: openQuestion(row.content.c) })) })
+    expect(answer).toMatchObject({ status: 'verified', seed: { question: questionPayload.prompt, references: [{ runId: runIds[0] }] },
+      answer: { status: 'completed', answer: `fixture reply ${questionMarker}` } })
+    const inputs = fixture.modelRequests.filter(body => body.includes(questionMarker))
+    expect(inputs.length).toBeGreaterThan(0)
+    expect(inputs.some(body => body.includes(runIds[0]))).toBe(true)
+    expect(inputs.every(body => !body.includes(runIds[1]))).toBe(true)
+    expect((await fixture.http(projectPath + '/automations')).body.automations.find((row: any) => row.id === definition.id)).toEqual(unchanged)
     const after = (await fixture.http('/v2/sessions/lookup', { ids: [displaySessionId] })).body.sessions[0]
     expect(after.metadata).toBe(before.metadata); expect(after.agentState).toBe(before.agentState)
     expect(await fixture.messages(displaySessionId)).toEqual(pendingBefore)

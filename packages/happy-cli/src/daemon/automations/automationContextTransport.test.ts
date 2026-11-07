@@ -16,7 +16,7 @@ import { createAutomationContextHost, prepareAutomationContextTick } from './aut
 import { createAutomationContextWorkspace } from './automationContextWorkspace'
 import { createServerAutomationRuntimeStore } from './serverAutomationRuntimeStore'
 
-let home: string, server: Server, origin: string
+let home: string, server: Server, origin: string, fixtureRunId: string
 let seed: { localId: string; content: string } | null, stored: Record<string, unknown> | null
 let loseSeedAck: boolean, redirectLookup: boolean, wrongKey: boolean
 let issuerMode: 'personal' | 'company' | 'signed-company' | 'redirect' | 'malformed' | 'denied'
@@ -30,6 +30,7 @@ let exitMode: 'valid' | 'lost' | 'run' | 'session' | 'provider' | 'time' | 'part
 let exitAck: any
 const requests: Array<{ path: string; authorization: string; body: any }> = []
 beforeEach(async () => {
+  fixtureRunId = 'r1'
   home = await mkdtemp(join(tmpdir(), 'automation-context-http-'))
   requests.length = 0; seed = null; stored = null; loseSeedAck = false; redirectLookup = false; wrongKey = false
   issuerMode = 'personal'
@@ -41,14 +42,15 @@ beforeEach(async () => {
     let text = ''; for await (const chunk of req) text += chunk
     const body = text ? JSON.parse(text) : null
     requests.push({ path: req.url!, authorization: req.headers.authorization ?? '', body })
-    if (req.url === '/api/claude-setup-token/daemon/v2/public-key') {
+    const requestPath = req.url!.replace(fixtureRunId, 'r1')
+    if (requestPath === '/api/claude-setup-token/daemon/v2/public-key') {
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({ version: 2, algorithm: 'Ed25519', keyId: await rotationSha256(companyIssuer.publicKey),
         publicKey: rotationBase64url(companyIssuer.publicKey), studioOrigin: origin, happyOrigin: origin })); return
     }
     if (req.headers.authorization !== 'Bearer fixture-account-token') { res.writeHead(401).end(); return }
     res.setHeader('Content-Type', 'application/json')
-    if (req.url === '/api/automation/execution-target') {
+    if (requestPath === '/api/automation/execution-target') {
       if (issuerMode === 'redirect') { res.writeHead(307, { Location: '/unexpected-redirect' }).end(); return }
       if (issuerMode === 'denied') { res.writeHead(403).end('{}'); return }
       if (issuerMode === 'signed-company') {
@@ -77,7 +79,7 @@ beforeEach(async () => {
       }
       res.end(JSON.stringify({ targetProof: 'fixture-target-proof', executionBindingRequired: issuerMode === 'malformed' ? 'false' : issuerMode === 'company' })); return
     }
-    if (req.url === '/v1/automation-runs/r1/execution-session/recover') {
+    if (requestPath === '/v1/automation-runs/r1/execution-session/recover') {
       if (body.claimToken !== 'fixture-claim' || body.machineId !== 'm1' || body.targetProof !== 'fixture-target-proof') { res.writeHead(403).end('{}'); return }
       if (!stored) {
         if (registeredBodyHash) { res.writeHead(409).end('{}'); return }
@@ -97,7 +99,7 @@ beforeEach(async () => {
       }
       res.end(JSON.stringify({ status: 'REGISTERED', sessionId: stored.id, displaySessionId: 'manual', createBodyHash: registeredBodyHash })); return
     }
-    if (req.url === '/v1/automation-runs/r1/execution-exit') {
+    if (requestPath === '/v1/automation-runs/r1/execution-exit') {
       if (body.claimToken !== 'fixture-claim' || body.machineId !== 'm1') { res.writeHead(403).end('{}'); return }
       exitAck ??= { runId: 'r1', sessionId: 'automation-run:r1', receipt: { ...body.receipt, receivedAt: 123 } }
       if (exitMode === 'lost') { exitMode = 'valid'; req.socket.destroy(); return }
@@ -110,7 +112,7 @@ beforeEach(async () => {
       if (exitMode === 'missing') delete ack.receipt
       res.end(JSON.stringify(ack)); return
     }
-    if (req.url === '/v1/automation-runs/r1/execution-session') {
+    if (requestPath === '/v1/automation-runs/r1/execution-session') {
       if (body.claimToken !== 'fixture-claim' || body.machineId !== 'm1' || body.targetProof !== 'fixture-target-proof') { res.writeHead(403).end('{}'); return }
       if (issuerMode === 'signed-company') {
         try {
@@ -136,17 +138,17 @@ beforeEach(async () => {
       if (loseRegistrationAck) { loseRegistrationAck = false; req.socket.destroy(); return }
       res.end(JSON.stringify({ sessionId: stored.id, displaySessionId: 'manual', created: !seed })); return
     }
-    if (req.url === '/v2/sessions/lookup') {
+    if (requestPath === '/v2/sessions/lookup') {
       if (redirectLookup) { res.writeHead(302, { Location: '/unexpected-redirect' }).end(); return }
       res.end(JSON.stringify({ sessions: stored ? [{ ...stored, ...(wrongKey ? { dataEncryptionKey: 'foreign-key' } : {}) }] : [] })); return
     }
-    if (req.url === '/v3/sessions/automation-run%3Ar1/messages') {
+    if (requestPath === '/v3/sessions/automation-run%3Ar1/messages') {
       seed ??= body.messages[0]
       if (stored) stored.seq = 1
       if (loseSeedAck) { loseSeedAck = false; req.socket.destroy(); return }
       res.end(JSON.stringify({ messages: [{ id: 'stored-seed', localId: seed!.localId, seq: 1 }] })); return
     }
-    if (req.url === '/v3/sessions/automation-run%3Ar1/messages?after_seq=0&limit=1') {
+    if (requestPath === '/v3/sessions/automation-run%3Ar1/messages?after_seq=0&limit=1') {
       res.end(JSON.stringify({ messages: seed ? [{ id: 'stored-seed', localId: seed.localId, seq: 1,
         content: { t: 'encrypted', c: seed.content } }] : [], hasMore: false })); return
     }
@@ -160,17 +162,18 @@ afterEach(async () => {
   server?.closeAllConnections(); await new Promise<void>(resolve => server?.close(() => resolve()))
   await rm(home, { recursive: true, force: true })
 })
-async function setup() {
+async function setup(runId = 'r1') {
+  fixtureRunId = runId
   const api = await ApiClient.create({ token: 'fixture-account-token', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) } })
   const prepare = vi.spyOn(api, 'prepareSessionCreation')
   const payload: AutomationPayload = { name: 'Task', prompt: 'Current occurrence only', directory: '/work', agent: 'codex',
     scriptCommand: null, suppressSilent: false, schedule: { kind: 'interval', minutes: 60 },
     conversation: { sessionId: 'manual' }, contextPolicy: { kind: 'isolated', reference: null } }
-  const input = { automationId: 'a1', generation: 1, revision: 1, runId: 'r1', claimToken: 'fixture-claim', payload }
+  const input = { automationId: 'a1', generation: 1, revision: 1, runId, claimToken: 'fixture-claim', payload }
   const authorize = vi.fn(async (_target: unknown) => ({ targetProof: 'fixture-target-proof', executionBindingRequired: false }))
   const transport = createAutomationContextTransport({ serverUrl: origin, token: 'fixture-account-token', machineId: 'm1',
-    runId: 'r1', claimToken: 'fixture-claim', authorize })
-  const start = vi.fn(async () => ({ type: 'success' as const, sessionId: 'automation-run:r1' }))
+    runId, claimToken: 'fixture-claim', authorize })
+  const start = vi.fn(async () => ({ type: 'success' as const, sessionId: `automation-run:${runId}` }))
   const deps = { accountId: 'owner', machineId: 'm1', happyOrigin: origin, api, journal: createAutomationContextLaunchJournal(home),
     ...transport, start, discover: async () => 'unconfirmed' as const }
   return { api, prepare, input, authorize, transport, deps, start, launcher: createAutomationContextLauncher(deps) }
@@ -580,4 +583,37 @@ it.each(['register', 'verifyStart'] as const)('forwards the sealed question iden
   await expect(transport[action](run, prepared as any)).rejects.toThrow('stop-before-http')
   expect(authorize).toHaveBeenCalledWith(expect.objectContaining({ questionRequestId: questionIdentity.requestId }))
   expect(f.start).not.toHaveBeenCalled()
+})
+
+it.each(['same-pause', 'later-change', 'explicit'] as const)('preserves an explicit question after the original pause but honors its own cancellation (%s)', async mode => {
+  const f = await setup(questionIdentity.requestId), directory = join(home, 'workspace'); await mkdir(directory)
+  const payload = { ...f.input.payload, directory, executionQuestion: questionIdentity,
+    contextPolicy: { kind: 'isolated' as const, reference: { kind: 'previous-result' as const, maxBytes: 16384 } } }
+  const previousResult = { automationId: 'a1', runId: 'prior', revision: 1, status: 'COMPLETED', question: 'Original Q', answer: 'Original A' }
+  const workspace = createAutomationContextWorkspace({ home, isTracked: async () => false })
+  const manual = await workspace.beginManualLaunch([directory]); expect(manual.acquired).toBe(true)
+  const host = createAutomationContextHost({ ...f.deps, workspace,
+    resolvePreviousResult: async () => previousResult,
+    runtimeStore: createServerAutomationRuntimeStore({ filePath: join(home, 'runtime.json') }),
+    transportForRun: async () => f.transport, resolveContext: async () => ({ environmentVariables: {} }),
+    reportExit: async () => {}, heartbeat: async () => ({ ok: true }), log: vi.fn(), start: f.start })
+  expect(await host.dispatch({ ...f.input, payload, previousResult, environmentVariables: {} })).toHaveProperty('state', 'waiting')
+  if (mode === 'explicit') expect(await (host as any).cancelRun(questionIdentity.requestId)).toBe(true)
+  else expect(await host.cancelAutomation({ automationId: 'a1', generation: mode === 'later-change' ? 2 : 1,
+    revision: mode === 'later-change' ? 2 : 1 })).toBe(true)
+  if (mode === 'same-pause') expect(await f.deps.journal.read(questionIdentity.requestId)).not.toHaveProperty('cancelledBeforeSubmit')
+  else expect(await f.deps.journal.read(questionIdentity.requestId)).toHaveProperty('cancelledBeforeSubmit', true)
+  expect(f.start).not.toHaveBeenCalled()
+  if (manual.acquired) await manual.finish({ submitted: false, tracked: false })
+})
+it.each(['ready', 'missing', 'unsafe'] as const)('requires durable question recovery before production isolated readiness (%s)', async state => {
+  const maintain = vi.fn(async () => {}), dispatch = vi.fn(), log = vi.fn()
+  const producer = state === 'missing' ? null : { ready: vi.fn(async () => {
+    if (state === 'unsafe') throw new Error('private-claim-file')
+  }) }
+  const admission = await (prepareAutomationContextTick as any)({ maintain, dispatch }, new AbortController().signal, log, producer)
+  expect(admission.isolatedContextReady).toBe(state === 'ready')
+  expect(maintain).toHaveBeenCalledTimes(state === 'ready' ? 1 : 0)
+  if (producer) expect(producer.ready).toHaveBeenCalledOnce()
+  expect(JSON.stringify(log.mock.calls)).not.toContain('private-claim-file')
 })

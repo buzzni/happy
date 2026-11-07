@@ -177,11 +177,19 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
       deps.runtimeStore.write({ ...state, pendingReports: [...state.pendingReports, report] })
     }, log: deps.log })
   return {
+    async cancelRun(runId: string): Promise<boolean> {
+      const record = await deps.journal.read(runId)
+      return !record || entry(runId).cancel({ automationId: record.automationId, generation: record.generation, revision: record.revision })
+    },
     async cancelAutomation(request: Parameters<Cancellation>[0]): Promise<boolean> {
       let confirmed = true
       for (const runId of await deps.journal.listRunIds()) {
         const record = await deps.journal.read(runId)
         if (record?.automationId === request.automationId && record.generation <= request.generation && record.revision <= request.revision) {
+          const run = await entry(runId).launcher.restoreRequest(runId)
+          if (!run) throw new Error('AUTOMATION_LAUNCH_SNAPSHOT_INVALID')
+          // A question created from the already-paused revision is an explicit one-off request.
+          if (run.payload.executionQuestion && record.generation === request.generation && record.revision === request.revision) continue
           if (!await entry(runId).cancel(request)) confirmed = false
         }
       }
@@ -217,9 +225,13 @@ export function createAutomationContextHost(deps: Pick<AutomationContextLaunchDe
 /** Prepare the new execution path without making it a prerequisite of legacy ticking. */
 export async function prepareAutomationContextTick(host: (Pick<ReturnType<typeof createAutomationContextHost>, 'maintain' | 'dispatch'>
   & Partial<Pick<ReturnType<typeof createAutomationContextHost>, 'cancelAutomation' | 'prepare'>>) | null,
-  signal: AbortSignal, log: (message: string) => void): Promise<{ isolatedContextReady: boolean; prepareIsolatedContext?: Preparation; dispatchIsolatedContext?: Dispatch; cancelIsolatedContext?: Cancellation }> {
+  signal: AbortSignal, log: (message: string) => void, questions?: { ready(): Promise<void> } | null): Promise<{ isolatedContextReady: boolean; prepareIsolatedContext?: Preparation; dispatchIsolatedContext?: Dispatch; cancelIsolatedContext?: Cancellation }> {
   if (!host || signal.aborted) return { isolatedContextReady: false }
-  try { await host.maintain(signal) }
+  try {
+    if (questions === null) throw new Error('AUTOMATION_QUESTION_PRODUCER_UNAVAILABLE')
+    await questions?.ready()
+    await host.maintain(signal)
+  }
   catch {
     // Journal integrity is a prerequisite of isolated work, not of existing v1/v4 automations.
     log('[automation-context] Recovery unconfirmed; isolated admission paused for this tick')
