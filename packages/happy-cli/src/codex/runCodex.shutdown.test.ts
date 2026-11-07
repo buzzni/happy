@@ -174,7 +174,7 @@ afterEach(() => {
 afterEach(() => { process.exitCode = originalExitCode; vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.clearAllMocks(); fixture.onSend = null; fixture.onInterrupt = null; fixture.onSteer = null; fixture.onConnect = null; fixture.onResumeThread = null; fixture.steerText = ''; fixture.omitCompletionObservers = false; fixture.completionThread = { id: 'thread', path: '/tmp/native-rollout.jsonl' }; fixture.readThread.mockReset().mockResolvedValue({ thread: { id: 'thread', path: '/tmp/native-rollout.jsonl' } }); fixture.gate = null; fixture.events = []; fixture.session.freezeInboundMessagesForShutdown.mockReturnValue(true); });
 afterEach(() => { fixture.recoverMcp.mockReset().mockResolvedValue({ status: 'ready', affectedServers: [] }); fixture.readMcpStatuses.mockReset().mockResolvedValue([]); });
 afterEach(() => { fixture.sideConnection = null; fixture.prepareSideAppServer.mockReset().mockResolvedValue(null); });
-afterEach(() => { fixture.offline = false; fixture.reconnectOffline = null; });
+afterEach(() => { fixture.offline = false; fixture.reconnectOffline = null; delete (fixture.session as { runtimeId?: string }).runtimeId; });
 async function start(prompt = 'Test input', confirmed = false, review?: import('@/memory/lessonReviewWorker').LessonReviewWorker, standaloneLaunch?: StandaloneLaunchBootstrap, resumeThreadId?: string, reconnect?: import('@/daemon/reconnectSessionEnv').ReconnectSessionClientSnapshot, launch?: { args?: string[]; modelSeed?: string }) {
     for (const key of Object.keys(process.env)) {
         if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_)/.test(key)) vi.stubEnv(key, undefined);
@@ -792,6 +792,7 @@ describe('Codex offline start', () => {
     it('answers app messages, abort and kill on the real session after reconnecting', async () => {
         fixture.offline = true;
         fixture.getOrCreateSession.mockResolvedValueOnce(null as never);
+        Object.assign(fixture.session, { runtimeId: 'real-runtime' });
         const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
         const handler = (name: string) => fixture.session.rpcHandlerManager.registerHandler.mock.calls.find(([key]) => key === name)?.[1] as ((input?: unknown) => Promise<unknown>) | undefined;
         fixture.onSend = async () => { await handler('abort')!(); };
@@ -817,6 +818,12 @@ describe('Codex offline start', () => {
         await receive({ content: { text: 'After reconnect' } });
         await vi.waitFor(() => expect(fixture.abortTurn).toHaveBeenCalledOnce());
         expect(fixture.send).toHaveBeenCalledWith('After reconnect', expect.anything());
+
+        // Channel ingress answers for the reconnected runtime, not the stub it was set up on.
+        const capability = await handler('channel-capability')!() as { runtimeId: string };
+        expect(capability.runtimeId).toBe('real-runtime');
+        await expect(handler('channel-prompt')!({ text: 'From a channel', requestId: 'channel-1', expectedRuntimeId: capability.runtimeId }))
+            .resolves.toMatchObject({ ok: true });
 
         await handler('killSession')!();
         await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
