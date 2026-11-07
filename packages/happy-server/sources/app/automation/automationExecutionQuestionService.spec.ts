@@ -98,6 +98,7 @@ it('scopes queue pages before limiting, binds cursor to its machine and never re
   await expect(listMachineAutomationQuestions(f.tx as never, 'owner', 'm2', { cursor: page.nextCursor })).rejects.toThrow('AUTOMATION_QUESTION_PAGE_INVALID');
   expect(findMany).toHaveBeenCalledTimes(2);
   f.tx.project.findUnique.mockResolvedValue(null as never);
+  f.tx.session.findFirst.mockResolvedValue(null as never);
   await expect(listProjectAutomationQuestions(f.tx as never, 'owner', 'p2', { displaySessionId: 'manual' })).rejects.toThrow();
   expect(findMany).toHaveBeenCalledTimes(2);
 });
@@ -107,4 +108,19 @@ it('refuses question cancellation by a viewer before reading or changing the req
   f.tx.projectMember.findUnique.mockResolvedValue({ status: 'accepted', role: 'viewer' });
   await expect(cancelAutomationExecutionQuestion(f.tx as never, 'viewer', 'p1', f.input.requestId, 'manual')).rejects.toThrow();
   expect(findFirst).not.toHaveBeenCalled(); expect(updateMany).not.toHaveBeenCalled();
+});
+
+it.each(['matched', 'foreign-machine', 'foreign-generation', 'unregistered'] as const)('projects only the exact question execution registration (%s)', async reason => {
+  const f = fixture(), row = { id: f.input.requestId, sourceRunId: 'source', automationId: 'a1', generation: 3, revision: 2,
+    displaySessionId: 'manual', machineId: 'm1', machineAccountId: 'owner', encrypted: f.input.encrypted, runId: f.input.requestId,
+    cancelledAt: null, holdCode: null, createdAt: new Date(1), automation: { projectId: 'p1' } };
+  Object.assign(f.tx.automationExecutionQuestion, { findMany: vi.fn(async () => [row]) });
+  const run = { id: f.input.requestId, automationId: 'a1', generation: reason === 'foreign-generation' ? 4 : 3, machineAccountId: 'owner',
+    machineId: reason === 'foreign-machine' ? 'other' : 'm1', status: 'COMPLETED', sessionId: `automation-run:${f.input.requestId}`,
+    executionCreateBodyHash: reason === 'unregistered' ? null : 'owned-hash', claimTokenHash: 'PRIVATE_TOKEN' };
+  Object.assign(f.tx.automationRun, { findMany: vi.fn(async () => [run]) });
+  const page = await listProjectAutomationQuestions(f.tx as never, 'owner', 'p1', { displaySessionId: 'manual' });
+  expect(page.questions[0]).toMatchObject({ executionRegistered: reason === 'matched',
+    runState: reason === 'matched' || reason === 'unregistered' ? 'COMPLETED' : null });
+  expect(JSON.stringify(page)).not.toContain('PRIVATE_TOKEN'); expect(JSON.stringify(page)).not.toContain('owned-hash');
 });

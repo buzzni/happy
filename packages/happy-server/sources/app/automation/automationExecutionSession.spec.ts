@@ -346,6 +346,10 @@ it('queues an idempotent encrypted question about one completed run without edit
     const created = await app.inject({ method: 'POST', url: executionUrl, headers: { authorization: `Bearer ${bearer}` }, payload: { ...execution, targetProof: questionProof } });
     expect(created.statusCode, created.body).toBe(200);
     expect(created.json()).toMatchObject({ sessionId: automationExecutionSessionId(thirdQuestion.requestId), displaySessionId: 'manual', created: true });
+    const pendingPage = await app.inject({ method: 'GET', url: '/v1/projects/chat:c1/execution-questions?displaySessionId=manual', headers: { authorization: `Bearer ${bearer}` } });
+    expect(pendingPage.statusCode).toBe(200);
+    expect(pendingPage.json().questions.find((row: any) => row.requestId === thirdQuestion.requestId))
+      .toMatchObject({ runState: 'RUNNING', executionRegistered: true });
     expect(await client.automation.findUniqueOrThrow({ where: { id: 'a1' } })).toEqual(pausedDefinition);
     expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
     expect((await client.automationRun.findUniqueOrThrow({ where: { id: thirdQuestion.requestId } })).previousExecutionRunId).toBe('r1');
@@ -395,6 +399,7 @@ it('pages encrypted pending questions, publishes bounded preclaim holds and canc
     expect((await app.inject({ method: 'GET', url: publicUrl, headers })).json()).toMatchObject({
       questions: [{ requestId: payload.requestId, runId: null, state: 'QUEUED', holdCode: 'AUTOMATION_REFERENCE_TOO_LARGE', encrypted: payload.encrypted }], nextCursor: null });
     expect((await app.inject({ method: 'PATCH', url: questionUrl, headers, payload: { holdCode: 'PRIVATE_ERROR_LOG' } })).statusCode).toBe(400);
+    await client.project.create({ data: { id: 'other-project', accountId: 'other', name: 'Foreign scope' } });
     expect((await app.inject({ method: 'GET', url: publicUrl.replace('chat:c1', 'other-project'), headers })).statusCode).toBe(404);
     const cancelUrl = `/v1/projects/chat:c1/execution-questions/${payload.requestId}/cancel`;
     const cancel = () => app.inject({ method: 'POST', url: cancelUrl, headers, payload: { displaySessionId: 'manual' } });
@@ -1022,4 +1027,19 @@ it('backfills registered history additively while preserving manual data and cor
   expect(await client.automationRun.findUniqueOrThrow({ where: { id: 'r3' } })).toMatchObject({ previousExecutionRunId: null });
   expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
   expect(await client.sessionMessage.findMany()).toEqual(messages);
+});
+it('reads an owned ordinary display with no automation scope as empty without provisioning or hiding real scope access loss', async () => {
+  await client.project.delete({ where: { id: 'chat:c1' } });
+  const manual = await client.session.findUniqueOrThrow({ where: { id: 'manual' } });
+  const app = await api(), headers = { authorization: `Bearer ${bearer}` };
+  try {
+    const empty = await app.inject({ method: 'GET', url: '/v1/projects/chat:c1/execution-questions?displaySessionId=manual', headers });
+    expect(empty.statusCode, empty.body).toBe(200); expect(empty.json()).toEqual({ questions: [], nextCursor: null });
+    expect(await client.project.count()).toBe(0); expect(await client.automation.count()).toBe(0);
+    expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
+    await client.session.create({ data: { id: 'foreign-display', accountId: 'other', tag: 'foreign', metadata: '' } });
+    expect((await app.inject({ method: 'GET', url: '/v1/projects/chat:c1/execution-questions?displaySessionId=foreign-display', headers })).statusCode).toBe(404);
+    await client.project.create({ data: { id: 'chat:c1', accountId: 'other', name: 'Foreign scope' } });
+    expect((await app.inject({ method: 'GET', url: '/v1/projects/chat:c1/execution-questions?displaySessionId=manual', headers })).statusCode).toBe(404);
+  } finally { await app.close(); }
 });

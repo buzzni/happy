@@ -1,5 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
-import type { Prisma, AutomationExecutionQuestion } from '@prisma/client';
+import type { Prisma, AutomationExecutionQuestion, AutomationRun } from '@prisma/client';
 import { z } from 'zod';
 import { automationExecutionQuestionRequestSchema, automationExecutionSessionId, automationExecutionQuestionBindingId, automationExecutionHoldCodeSchema } from '@slopus/happy-wire';
 import { projectAccess, chatAutomationsBlocked } from './automationService';
@@ -110,11 +110,22 @@ export async function claimAutomationExecutionQuestion(tx: Tx, accountId: string
 
 const questionCursorSchema = z.strictObject({ scope: z.string(), id: z.string().uuid(), createdAt: z.number().int().nonnegative().max(8_640_000_000_000_000) });
 const questionRelations = { automation: { include: { project: true, targetMachine: true } } } as const;
-function questionView(row: AutomationExecutionQuestion, projectId: string) {
+type QuestionRun = Pick<AutomationRun, 'id' | 'automationId' | 'generation' | 'machineAccountId' | 'machineId' | 'status' | 'sessionId' | 'executionCreateBodyHash'>;
+async function readQuestionRuns(tx: Tx, questions: AutomationExecutionQuestion[]) {
+  const ids = questions.filter(row => row.runId === row.id).map(row => row.id);
+  if (!ids.length) return new Map<string, QuestionRun>();
+  const rows = await tx.automationRun.findMany({ where: { id: { in: ids }, kind: 'QUESTION' }, select: { id: true,
+    automationId: true, generation: true, machineAccountId: true, machineId: true, status: true, sessionId: true, executionCreateBodyHash: true } });
+  return new Map(rows.map(row => [row.id, row]));
+}
+function questionView(row: AutomationExecutionQuestion, projectId: string, run?: QuestionRun) {
+  const bound = run && run.id === row.id && row.runId === row.id && run.automationId === row.automationId
+    && run.generation === row.generation && run.machineAccountId === row.machineAccountId && run.machineId === row.machineId ? run : null;
   const hold = automationExecutionHoldCodeSchema.safeParse(row.holdCode);
   return { requestId: row.id, sourceRunId: row.sourceRunId, automationId: row.automationId, projectId,
     generation: row.generation, revision: row.revision, displaySessionId: row.displaySessionId,
-    machineId: row.machineId, encrypted: row.encrypted, runId: row.runId,
+    machineId: row.machineId, encrypted: row.encrypted, runId: row.runId, runState: bound?.status ?? null,
+    executionRegistered: !!bound?.executionCreateBodyHash && bound.sessionId === automationExecutionSessionId(row.id),
     state: row.cancelledAt ? 'CANCEL_REQUESTED' as const : row.runId ? 'CLAIMED' as const : 'QUEUED' as const,
     holdCode: hold.success ? hold.data : row.holdCode ? 'AUTOMATION_HOLD_UNCONFIRMED' as const : null,
     createdAt: row.createdAt.getTime() };
@@ -134,7 +145,8 @@ async function pageQuestions(tx: Tx, where: Prisma.AutomationExecutionQuestionWh
   const rows = await tx.automationExecutionQuestion.findMany({ where: { AND: [where, boundary] }, include: questionRelations,
     orderBy: [{ createdAt: order }, { id: order }], take: limit + 1 });
   const selected = rows.slice(0, limit), last = selected.at(-1);
-  return { questions: selected.map(row => questionView(row, row.automation.projectId)),
+  const runs = await readQuestionRuns(tx, selected);
+  return { questions: selected.map(row => questionView(row, row.automation.projectId, runs.get(row.id))),
     nextCursor: rows.length > limit && last ? Buffer.from(JSON.stringify({ scope, id: last.id, createdAt: last.createdAt.getTime() })).toString('base64url') : null };
 }
 
@@ -147,7 +159,7 @@ export async function readMachineAutomationQuestion(tx: Tx, accountId: string, m
   if (!row) return reject(404, 'AUTOMATION_QUESTION_NOT_FOUND');
   const access = await projectAccess(tx, row.requestedByAccountId, row.automation.projectId);
   const available = !!access?.canEdit && !!readCurrentAutomationQuestion(row, row.automation);
-  return { ...questionView(row, row.automation.projectId), available };
+  return { ...questionView(row, row.automation.projectId, (await readQuestionRuns(tx, [row])).get(row.id)), available };
 }
 export async function holdMachineAutomationQuestion(tx: Tx, accountId: string, machineId: string, requestId: string, raw: unknown) {
   const holdCode = automationExecutionHoldCodeSchema.nullable().parse(raw);
@@ -158,7 +170,15 @@ export async function holdMachineAutomationQuestion(tx: Tx, accountId: string, m
 }
 export async function listProjectAutomationQuestions(tx: Tx, actorId: string, projectId: string,
   input: { displaySessionId: string; cursor?: string | null; limit?: number }) {
-  if (!await projectAccess(tx, actorId, projectId)) return reject(404, 'AUTOMATION_QUESTION_NOT_FOUND');
+  if (!await projectAccess(tx, actorId, projectId)) {
+    // Ordinary Chats have no Happy automation mirror until their first explicit save. Absence is empty
+    // only for an owned display; an existing scope whose membership was revoked must remain denied.
+    if (await tx.project.findUnique({ where: { id: projectId }, select: { id: true } })
+      || !await tx.session.findFirst({ where: { id: input.displaySessionId, accountId: actorId }, select: { id: true } })) {
+      return reject(404, 'AUTOMATION_QUESTION_NOT_FOUND');
+    }
+    return { questions: [], nextCursor: null };
+  }
   return pageQuestions(tx, { automation: { projectId }, displaySessionId: input.displaySessionId },
     JSON.stringify(['project', projectId, input.displaySessionId]), input, true);
 }
@@ -170,5 +190,5 @@ export async function cancelAutomationExecutionQuestion(tx: Tx, actorId: string,
   if (!row.cancelledAt) await tx.automationExecutionQuestion.updateMany({ where: { id: requestId, cancelledAt: null },
     data: { cancelledAt: new Date(), holdCode: null } });
   // A cancellation intent is not a positive native-exit receipt.
-  return { ...questionView(row, projectId), state: 'CANCEL_REQUESTED' as const, holdCode: null };
+  return { ...questionView(row, projectId, (await readQuestionRuns(tx, [row])).get(row.id)), state: 'CANCEL_REQUESTED' as const, holdCode: null };
 }
