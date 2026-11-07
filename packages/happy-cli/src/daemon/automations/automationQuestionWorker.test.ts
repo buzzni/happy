@@ -1,7 +1,7 @@
 import { createAutomationTickRunner } from './automationTickRunner'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { createServer, type Server } from 'node:http'
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { AutomationPayload } from '@slopus/happy-wire'
@@ -140,6 +140,30 @@ it('retires a terminal question only after its matching owned-exit acknowledgeme
   await createAutomationQuestionWorker(f.deps).maintain(); await createAutomationQuestionWorker(f.deps).maintain()
   expect(requests.filter(row => row.path.includes(requestId))).toHaveLength(count)
   expect(f.host.dispatch).toHaveBeenCalledOnce()
+})
+it('observes accepted questions without re-preparing or re-claiming while exit is unacknowledged and keeps cancellation live', async () => {
+  const f = fixture(); await f.worker.maintain(); state = 'COMPLETED'; row.runState = 'COMPLETED'
+  const file = (await files(home)).find(file => file.includes('automation-context-questions.v1'))!
+  const original = await stat(file)
+  for (let attempt = 0; attempt < 3; attempt++) await createAutomationQuestionWorker(f.deps).maintain()
+  expect(requests.filter(item => item.path.endsWith('/claim'))).toHaveLength(1)
+  expect(f.host.prepare).toHaveBeenCalledOnce(); expect(f.deps.decode).toHaveBeenCalledOnce()
+  expect(f.host.dispatch).toHaveBeenCalledOnce()
+  expect((await stat(file)).ino).toBe(original.ino)
+  expect(requests.filter(item => item.path.endsWith(requestId) && item.method === 'GET')).toHaveLength(3)
+  row.state = 'CANCEL_REQUESTED'; row.available = false; f.host.cancelRun.mockResolvedValue(false)
+  await createAutomationQuestionWorker(f.deps).maintain()
+  expect(f.host.cancelRun).toHaveBeenCalledExactlyOnceWith(requestId)
+  expect(JSON.parse(await readFile(file, 'utf8')).phase).toBe('active')
+  row.state = 'CLAIMED'; row.available = true
+  vi.spyOn(f.deps.journal, 'read').mockResolvedValue({ runId: requestId, automationId: 'a1', generation: 3, revision: 2,
+    sessionId: `automation-run:${requestId}`, displaySessionId: 'manual', exitReceiptAcknowledged: true,
+    exitReceipt: { provider: 'codex', observedAt: 1000 } } as never)
+  await createAutomationQuestionWorker(f.deps).maintain()
+  expect(JSON.parse(await readFile(file, 'utf8')).phase).toBe('finished')
+  const count = requests.filter(item => item.path.includes(requestId)).length
+  await createAutomationQuestionWorker(f.deps).maintain()
+  expect(requests.filter(item => item.path.includes(requestId))).toHaveLength(count)
 })
 it('keeps polling other questions when one owned cancellation cannot be confirmed', async () => {
   const f = fixture(); await f.worker.maintain(); row.state = 'CANCEL_REQUESTED'; row.available = false

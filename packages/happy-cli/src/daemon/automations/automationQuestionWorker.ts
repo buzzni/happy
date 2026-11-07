@@ -33,7 +33,8 @@ const questionSchema = z.object({ requestId: z.string().uuid(), sourceRunId: z.s
   encrypted: automationExecutionQuestionRequestSchema.shape.encrypted, createdAt: z.number().int().nonnegative().safe() })
 type Question = z.infer<typeof questionSchema>
 const currentSchema = questionSchema.extend({ runId: z.string().uuid().nullable(), state: z.enum(['QUEUED', 'CLAIMED', 'CANCEL_REQUESTED']),
-  holdCode: automationExecutionHoldCodeSchema.nullable(), available: z.boolean().optional() })
+  holdCode: automationExecutionHoldCodeSchema.nullable(), available: z.boolean().optional(),
+  runState: z.enum(['CLAIMED', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED', 'EXPIRED', 'ABANDONED']).nullable().optional() })
 const recordSchema = z.strictObject({ version: z.literal(1), scope: z.string().regex(/^[a-f0-9]{64}$/), question: questionSchema,
   claimToken: z.string().regex(/^[A-Za-z0-9_-]{43}$/), phase: z.enum(['claiming', 'active', 'finished']) })
 type Record = z.infer<typeof recordSchema>
@@ -164,6 +165,9 @@ export function createAutomationQuestionWorker(deps: AutomationQuestionWorkerInp
           await write({ ...saved!, phase: 'finished' }); return
         }
       }
+      // Dispatch acceptance is not a native exit. Keep observing cancellation/authority above,
+      // but do not re-read references, claim or fsync the same active request every tick.
+      if (saved?.phase === 'active' && current.runId === id && current.runState === 'COMPLETED') return
       const payload = deps.decode(question)
       if (payload.executionQuestion?.requestId !== id || payload.executionQuestion.sourceRunId !== question.sourceRunId
         || payload.conversation?.sessionId !== question.displaySessionId || !payload.contextPolicy
