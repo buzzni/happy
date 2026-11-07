@@ -76,6 +76,13 @@ Command: `happy daemon stop [--for-restart [--reason r] [--grace N] [--no-wait]]
    SIGKILL the daemon process. Session processes are never signalled. A refusal (401/409) stays a refusal.
 4. On shutdown `cleanupAndShutdown()` marks the state file `stopped` and keeps `trackedSessions` so the
    next daemon re-adopts the still-running sessions.
+5. Every exit path (shutdown, bundle handoff, fatal) and a ready drain's `closeTerminalsForRestart` call
+   `drainBashRpcs()` first thing: it closes `bash` admission synchronously (new and queued commands get the
+   retryable `DAEMON_BUSY`) and waits up to 5 s from that call for running ones; the result is awaited just
+   before `apiMachine.shutdown()`, so the wait overlaps the teardown and stays inside step 3's 10 s. Why: a
+   shell still writing after the daemon exits dies of SIGPIPE without its EXIT trap and leaves the shared
+   `saycode-desktop-write.lock` behind. Commands past the bound are not signalled — SIGTERM would reach only
+   the outer `/bin/sh -c`, not the lock-owning subshell — and are counted in the log.
 
 ## 2. Session Management
 

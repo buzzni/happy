@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
     BashRpcBusyError,
     createBashRpcScheduler,
+    drainBashRpcs,
 } from './bashRpcScheduler';
 
 function deferred() {
@@ -85,5 +86,71 @@ describe('bash RPC scheduler', () => {
         firstGate.resolve();
         await expect(foreground).resolves.toBe('foreground');
         await Promise.all([first, retained]);
+    });
+
+    describe('at daemon shutdown', () => {
+        it('refuses new work so a Git writer cannot start just before the daemon exits', async () => {
+            const scheduler = createBashRpcScheduler();
+            const task = vi.fn(async () => 'ran');
+            await drainBashRpcs({ waitMs: 10 });
+
+            await expect(scheduler.run('foreground', task)).rejects.toMatchObject({ errorCode: 'DAEMON_BUSY' });
+            expect(task).not.toHaveBeenCalled();
+        });
+
+        it('refuses queued work that never started and waits for running work to finish', async () => {
+            const scheduler = createBashRpcScheduler({ maxConcurrent: 1 });
+            const gate = deferred();
+            const running = scheduler.run('foreground', () => gate.promise);
+            const queuedTask = vi.fn(async () => undefined);
+            const queued = scheduler.run('foreground', queuedTask);
+            await vi.waitFor(() => expect(scheduler.snapshot().running).toBe(1));
+
+            const drained = drainBashRpcs({ waitMs: 5_000 });
+            await expect(queued).rejects.toBeInstanceOf(BashRpcBusyError);
+            gate.resolve();
+
+            await expect(drained).resolves.toEqual({ running: 1, remaining: 0 });
+            await running;
+            expect(queuedTask).not.toHaveBeenCalled();
+        });
+
+        it('closes admission the moment shutdown is requested, before anything is awaited', async () => {
+            const scheduler = createBashRpcScheduler();
+            const task = vi.fn(async () => 'ran');
+            const drained = drainBashRpcs({ waitMs: 10 });
+            const late = scheduler.run('foreground', task);
+
+            await expect(late).rejects.toMatchObject({ errorCode: 'DAEMON_BUSY' });
+            await drained;
+            expect(task).not.toHaveBeenCalled();
+        });
+
+        it('makes every concurrent shutdown path wait for the same running work', async () => {
+            const scheduler = createBashRpcScheduler();
+            const gate = deferred();
+            const running = scheduler.run('foreground', () => gate.promise);
+            await vi.waitFor(() => expect(scheduler.snapshot().running).toBe(1));
+
+            const first = drainBashRpcs({ waitMs: 5_000 });
+            const second = drainBashRpcs({ waitMs: 5_000 });
+            const early = await Promise.race([second.then(() => 'settled'), new Promise((resolve) => setTimeout(() => resolve('waiting'), 20))]);
+            gate.resolve();
+
+            expect(early).toBe('waiting');
+            await expect(Promise.all([first, second])).resolves.toEqual([{ running: 1, remaining: 0 }, { running: 1, remaining: 0 }]);
+            await running;
+        });
+
+        it('stops waiting after the bound and reports the work still running', async () => {
+            const scheduler = createBashRpcScheduler();
+            const gate = deferred();
+            const running = scheduler.run('foreground', () => gate.promise);
+            await vi.waitFor(() => expect(scheduler.snapshot().running).toBe(1));
+
+            await expect(drainBashRpcs({ waitMs: 20 })).resolves.toEqual({ running: 1, remaining: 1 });
+            gate.resolve();
+            await running;
+        });
     });
 });

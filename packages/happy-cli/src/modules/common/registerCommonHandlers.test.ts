@@ -9,6 +9,7 @@ import { createWorkspaceTurnAdmission, createFilesystemWriteAdmission } from '@/
 import { registerCommonHandlers, type CommonHandlerOptions } from './registerCommonHandlers';
 import { createManagedProjectWriteScopePolicy, createTrustedMachineRunProfileResolver } from './machineRunProfile';
 import { managedMachineToolPlatform } from './managedMachineTool';
+import { drainBashRpcs } from './bashRpcScheduler';
 
 type Handler = (data: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
@@ -144,6 +145,18 @@ describe('registerCommonHandlers bash scheduling', () => {
             exitCode: 0,
         });
     });
+});
+
+describe('registerCommonHandlers bash at daemon shutdown', () => {
+    it('answers a command that arrives after shutdown began with the retryable busy error and does not run it', async () => {
+        const { handlers, workingDirectory } = await createHandlers();
+        await drainBashRpcs({ waitMs: 10 });
+
+        await expect(handlers.get('bash')!({ command: 'printf ran > ran.txt', cwd: workingDirectory }))
+            .resolves.toMatchObject({ success: false, errorCode: 'DAEMON_BUSY' });
+        await expect(readdir(workingDirectory)).resolves.not.toContain('ran.txt');
+    });
+
 });
 
 describe('registerCommonHandlers machine.run capability', () => {
