@@ -437,6 +437,13 @@ interface DaemonToServerEvents {
         runId: string;
         claimToken: string;
     }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
+    'automation-missed-record': (data: {
+        automationId: string;
+        generation: number;
+        firstMissedAt: number;
+        missedCount: number;
+        failureCode: 'MISSED_OFFLINE';
+    }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
     'automation-run-heartbeat': (data: {
         runId: string;
         claimToken: string;
@@ -2666,6 +2673,7 @@ export class ApiMachineClient {
             start: (input) => this.automationAck('automation-run-start', bounded().emitWithAck('automation-run-start', input)),
             heartbeat: (input) => this.automationAck('automation-run-heartbeat', bounded().emitWithAck('automation-run-heartbeat', input)),
             report: (input) => this.automationAck('automation-run-report', bounded().emitWithAck('automation-run-report', input)),
+            recordMissed: (input) => this.automationAck('automation-missed-record', bounded().emitWithAck('automation-missed-record', input)),
         };
     }
 

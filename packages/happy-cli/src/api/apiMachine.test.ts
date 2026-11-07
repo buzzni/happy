@@ -2435,6 +2435,11 @@ describe('ApiMachineClient socket reconnection', () => {
             .resolves.toEqual({ ok: false, error: 'ack-timeout' });
         await expect(transport.report({ runId: 'run-1', claimToken: 'token', reportId: 'report-1' }))
             .resolves.toEqual({ ok: false, error: 'ack-timeout' });
+        // An old server has no handler for the missed-run record and never acks it; the executor reads
+        // this as "not confirmed" and keeps the schedule (scheduled-missed-run-policy R5).
+        const gap = { automationId: 'automation-1', generation: 2, firstMissedAt: 10, missedCount: 3, failureCode: 'MISSED_OFFLINE' };
+        await expect(transport.recordMissed(gap)).resolves.toEqual({ ok: false, error: 'ack-timeout' });
+        expect(timedOut).toHaveBeenCalledWith('automation-missed-record', gap);
 
         expect(mockSocket.timeout).toHaveBeenCalledWith(30_000);
         expect(timedOut).toHaveBeenCalledWith('automation-claim', { automationId: 'automation-1', generation: 2, scheduledFor: 10 });

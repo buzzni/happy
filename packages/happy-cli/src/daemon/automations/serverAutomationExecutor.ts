@@ -15,6 +15,7 @@ import {
   type AutomationSchedule,
 } from './automationDomain'
 import type { EncryptedServerAutomation, ServerAutomationCacheState, ServerAutomationPayload } from './serverAutomationCache'
+import { planMissedRuns } from './serverAutomationMissedRuns'
 import type {
   GithubAutomationWorktreeState,
   GithubIssueProgressMarkerState,
@@ -86,6 +87,14 @@ export interface ServerAutomationTransport {
   start(input: { runId: string; claimToken: string }): Promise<TransportResult>
   heartbeat(input: { runId: string; claimToken: string }): Promise<TransportResult>
   report(input: PendingAutomationReport): Promise<TransportResult>
+  /** specs/scheduled-missed-run-policy R4·R5 — 놓친 회차 공백 하나를 서버 이력의 한 행으로 기록한다. */
+  recordMissed?(input: {
+    automationId: string
+    generation: number
+    firstMissedAt: number
+    missedCount: number
+    failureCode: 'MISSED_OFFLINE'
+  }): Promise<TransportResult>
 }
 
 export interface ServerAutomationExecutorInput {
@@ -727,6 +736,65 @@ function advanceSchedule(
       ...(lastSessionId !== undefined ? { lastSessionId } : {}),
     } : schedule),
   })
+}
+
+/**
+ * specs/scheduled-missed-run-policy R4·R5 — claim 창을 넘겨 지난 회차를 실행 없이 넘기기 전에
+ * 그 공백을 서버에 한 행으로 기록한다. 기록이 확인되기 전에는 일정을 넘기지 않는다.
+ * - 'claim': 놓친 회차가 없거나 서버가 기록을 거절·모름 → 기존 claim 경로(지난 회차면 claim-denied 로 넘어간다).
+ *   기록 뒤 claim 창 안의 회차가 남았으면 `schedule.nextRunAt` 이 그 회차로 바뀌어 이어서 claim 한다.
+ * - 'retry': ack 를 받지 못함 → 일정을 그대로 두고 다음 틱에 같은 공백을 다시 보고한다(서버가 첫 회차로 흡수).
+ * - 'recorded': 기록됐고 일정을 다음 회차로 넘겼다.
+ */
+async function recordMissedRuns(
+  input: ServerAutomationExecutorInput,
+  serverRecordsMissedRuns: boolean,
+  automation: EncryptedServerAutomation,
+  payload: ServerAutomationPayload,
+  schedule: ServerAutomationScheduleState,
+  now: number,
+): Promise<'claim' | 'retry' | 'recorded'> {
+  if (!serverRecordsMissedRuns || !input.transport.recordMissed) return 'claim'
+  const plan = planMissedRuns({
+    schedule: payload.schedule,
+    nextRunAt: schedule.nextRunAt,
+    now,
+    enabledAt: automation.enabledAt,
+    paused: automation.paused,
+    runRequestedAt: automation.runRequestedAt,
+    githubTrigger: Boolean(payload.githubTrigger),
+  })
+  if (!plan) return 'claim'
+  const recorded = await input.transport.recordMissed({
+    automationId: automation.automationId,
+    generation: automation.generation,
+    firstMissedAt: plan.firstMissedAt,
+    missedCount: plan.missedCount,
+    failureCode: 'MISSED_OFFLINE',
+  })
+  if (!recorded.ok) {
+    if (recorded.error === 'ack-timeout') {
+      input.logDebug?.(`[server-automation] ${automation.automationId} missed-run record unconfirmed; keeping the schedule for the next tick`)
+      return 'retry'
+    }
+    input.logDebug?.(`[server-automation] ${automation.automationId} missed-run record refused (${recorded.error}); skipping without a record`)
+    return 'claim'
+  }
+  const resumeAt = plan.resumeAt ?? NEVER_RUN_AT
+  const state = input.runtimeStore.read()
+  input.runtimeStore.write({
+    ...state,
+    schedules: state.schedules.map((item) => item.automationId === automation.automationId
+      ? { ...item, nextRunAt: resumeAt }
+      : item),
+  })
+  input.logDebug?.(
+    `[server-automation] ${automation.automationId} recorded ${plan.capped ? `${plan.missedCount}+` : plan.missedCount}`
+    + ` missed run(s) from ${new Date(plan.firstMissedAt).toISOString()}`,
+  )
+  if (resumeAt > now) return 'recorded'
+  schedule.nextRunAt = resumeAt
+  return 'claim'
 }
 
 function makeGithubTriggerStatePersister(
@@ -2084,6 +2152,8 @@ export async function runServerAutomationTick(
       ({ runId, claimToken } = retry.report)
       leaseExpiresAt = retry.leaseExpiresAt
     } else {
+      const missed = await recordMissedRuns(input, cache.missedRunRecord === true, automation, payload, schedule, now)
+      if (missed !== 'claim') continue
       const claim = await input.transport.claim({
         automationId: automation.automationId,
         generation: automation.generation,
