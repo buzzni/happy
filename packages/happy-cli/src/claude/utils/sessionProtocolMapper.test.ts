@@ -489,6 +489,16 @@ describe('mapClaudeLogMessageToSessionEnvelopes', () => {
                 [{ id: `redacted-${name}`, name }])).toEqual([{ t: 'tool-call-end', call: `redacted-${name}` }]);
         });
 
+        // A CLI attached to an existing session never saw the tool_use, so it cannot tell whether the
+        // tool is policy-redacted: fail closed instead of sending the body.
+        it('leaves the result out when the call was never seen and its tool name is unknown', () => {
+            const ended = mapClaudeLogMessageToSessionEnvelopes({ type: 'user', uuid: 'u-unseen', message: { role: 'user',
+                content: [{ type: 'tool_result', tool_use_id: 'unseen-mcp-call', content: [{ type: 'text', text: 'company guidance body' }] }] } } as any,
+                { currentTurnId: null });
+            expect(ended.envelopes.filter(envelope => envelope.ev.t === 'tool-call-end').map(envelope => envelope.ev))
+                .toEqual([{ t: 'tool-call-end', call: 'unseen-mcp-call' }]);
+        });
+
         it('matches each parallel result to its own call by tool_use_id', () => {
             const events = endEvents([
                 { type: 'tool_result', tool_use_id: 'grep-2', content: 'second', is_error: true },

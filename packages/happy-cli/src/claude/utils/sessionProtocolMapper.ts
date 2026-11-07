@@ -1107,7 +1107,8 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
                 const images = redacted
                     ? undefined
                     : extractToolResultImages((block as { content?: unknown }).content);
-                const result = redacted
+                // Fail closed: without the tool_use (e.g. a CLI attached mid-call) the redact policy cannot be checked.
+                const result = redacted || getToolNameById(block.tool_use_id) === undefined
                     ? undefined
                     : toolResultText((block as { content?: unknown }).content, (block as { is_error?: unknown }).is_error);
                 envelopes.push(createEnvelope('agent', {

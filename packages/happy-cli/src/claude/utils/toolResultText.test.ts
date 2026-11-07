@@ -12,6 +12,10 @@ describe('toolResultText', () => {
         expect(toolResultText(raw, false)).toEqual({ text: 'FAIL src/a.test.ts\ndonelink\rprogress' });
     });
 
+    it('removes a whole OSC sequence whose payload has spaces, with either terminator', () => {
+        expect(toolResultText('\u001b]0;my command\u0007text \u001b]2;window title here\u001b\\done', false)).toEqual({ text: 'text done' });
+    });
+
     it('keeps an empty body and an error without text, but nothing for a body with no text', () => {
         expect(toolResultText('', undefined)).toEqual({ text: '' });
         expect(toolResultText(undefined, true)).toEqual({ text: '', isError: true });
