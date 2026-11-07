@@ -18,7 +18,7 @@ import {
   type AutomationSchedule,
 } from './automationDomain'
 import type { EncryptedServerAutomation, ServerAutomationCacheState, ServerAutomationPayload } from './serverAutomationCache'
-import { planMissedRuns } from './serverAutomationMissedRuns'
+import { planCatchUp, planMissedRuns } from './serverAutomationMissedRuns'
 import type {
   GithubAutomationWorktreeState,
   GithubIssueProgressMarkerState,
@@ -86,7 +86,8 @@ const SCHEDULED_AUTOMATION_PROMPT_PREAMBLE = [
 ].join('\n')
 
 export interface ServerAutomationTransport {
-  claim(input: { automationId: string; generation: number; scheduledFor: number }): Promise<TransportResult>
+  /** `catchUp`: specs/scheduled-missed-run-policy R11 — 놓친 회차를 늦게 1회 실행한다(서버 상한 8일). */
+  claim(input: { automationId: string; generation: number; scheduledFor: number; catchUp?: true }): Promise<TransportResult>
   start(input: { runId: string; claimToken: string }): Promise<TransportResult>
   heartbeat(input: AutomationRunHeartbeatRequest): Promise<TransportResult>
   report(input: PendingAutomationReport): Promise<TransportResult>
@@ -96,7 +97,7 @@ export interface ServerAutomationTransport {
     generation: number
     firstMissedAt: number
     missedCount: number
-    failureCode: 'MISSED_OFFLINE'
+    failureCode: 'MISSED_OFFLINE' | 'MISSED_COLLAPSED'
   }): Promise<TransportResult>
 }
 
@@ -630,15 +631,21 @@ function nextScheduledAt(schedule: AutomationSchedule, from: number): number {
  */
 const ONCE_FIRST_SIGHT_GRACE_MS = 60_000
 
-/** 새 generation 의 첫 다음 실행 시각. 서버는 enabledAt 이전 회차를 거절하므로 그 앞으로는 가지 않는다. */
+/**
+ * 새 generation 의 첫 다음 실행 시각. 서버는 enabledAt 이전 회차를 거절하므로 그 앞으로는 가지 않는다.
+ * `돌아오면 1회 실행`을 고른 1회 예약은 enabledAt 부터 본다 — 저장 직후 꺼진 PC가 처음 볼 때 이미 지난
+ * 회차를 잃지 않고 놓친 회차로 넘겨 늦게 1회 실행한다(specs/scheduled-missed-run-policy R13).
+ */
 function firstScheduledAt(
-  schedule: AutomationSchedule,
+  payload: ServerAutomationPayload,
   now: number,
   enabledAt: number,
   previous: ServerAutomationScheduleState | undefined,
 ): number {
+  const { schedule } = payload
   if (!isOnceSchedule(schedule)) return nextScheduledAt(schedule, Math.max(now, enabledAt))
-  const next = nextScheduledAt(schedule, Math.max(now - ONCE_FIRST_SIGHT_GRACE_MS, enabledAt))
+  const from = payload.missedRunPolicy === 'catch_up_once' ? enabledAt : Math.max(now - ONCE_FIRST_SIGHT_GRACE_MS, enabledAt)
+  const next = nextScheduledAt(schedule, from)
   // 이미 실행한 회차는 유예로 되살리지 않는다 — 서버의 같은 회차 거절은 generation 단위라 두 번 돈다.
   return next === previous?.spentOnceAt ? NEVER_RUN_AT : next
 }
@@ -682,7 +689,7 @@ function reconcileSchedules(
     byId.set(automation.automationId, {
       automationId: automation.automationId,
       generation: automation.generation,
-      nextRunAt: automation.runRequestedAt ?? firstScheduledAt(payload.schedule, now, automation.enabledAt, current),
+      nextRunAt: automation.runRequestedAt ?? firstScheduledAt(payload, now, automation.enabledAt, current),
       lastSessionId: current?.lastSessionId ?? null,
       ...(current?.spentOnceAt !== undefined ? { spentOnceAt: current.spentOnceAt } : {}),
       ...(automation.runRequestedAt == null ? {} : { runRequestRevision: automation.revision }),
@@ -802,19 +809,21 @@ function deferOnceAdmission(input: ServerAutomationExecutorInput, automation: En
  * - 'retry': 저장을 확인하지 못함(ack 없음·서버 저장 실패) → 일정을 그대로 두고 다음 틱에 같은 공백을 다시 보고한다
  *   (서버가 첫 회차로 흡수). 첫 회차가 실제로 실행돼 있었으면(already-claimed) 그다음 회차부터 다시 센다.
  * - 'recorded': 기록됐고 일정을 다음 회차로 넘겼다.
+ * - 'catch-up': `돌아오면 1회 실행`(R11·R13) — 앞선 회차는 `MISSED_COLLAPSED` 한 행으로 기록됐고
+ *   `schedule.nextRunAt` 이 가장 최근 놓친 회차로 바뀌었다. 호출부가 그 회차를 `catchUp` 으로 claim 한다.
  */
 async function recordMissedRuns(
   input: ServerAutomationExecutorInput,
-  serverRecordsMissedRuns: boolean,
+  server: { recordsMissedRuns: boolean; catchesUp: boolean },
   automation: EncryptedServerAutomation,
   payload: ServerAutomationPayload,
   schedule: ServerAutomationScheduleState,
   now: number,
   claimedSlotsLeft = MAX_CLAIMED_SLOTS_PER_TICK,
-): Promise<'claim' | 'retry' | 'recorded'> {
+): Promise<'claim' | 'retry' | 'recorded' | 'catch-up'> {
   if (isOnceSchedule(payload.schedule) && schedule.contextAdmissionDeferred?.revision === automation.revision
     && schedule.contextAdmissionDeferred.scheduledFor === schedule.nextRunAt) return 'claim'
-  if (!serverRecordsMissedRuns || !input.transport.recordMissed) return 'claim'
+  if (!server.recordsMissedRuns || !input.transport.recordMissed) return 'claim'
   const plan = planMissedRuns({
     schedule: payload.schedule,
     nextRunAt: schedule.nextRunAt,
@@ -826,12 +835,20 @@ async function recordMissedRuns(
     githubTrigger: Boolean(payload.githubTrigger),
   })
   if (!plan) return 'claim'
+  // 기본·건너뜀(R12)과 서버가 늦은 claim 을 모르면 전부 놓침으로 기록한다. 너무 오래된 공백도 같다.
+  const catchUp = payload.missedRunPolicy === 'catch_up_once' && server.catchesUp
+    ? planCatchUp(payload.schedule, plan, now)
+    : null
+  if (catchUp && catchUp.collapsedCount === 0 && catchUp.runAt !== null) {
+    schedule.nextRunAt = catchUp.runAt
+    return 'catch-up'
+  }
   const recorded = await input.transport.recordMissed({
     automationId: automation.automationId,
     generation: automation.generation,
     firstMissedAt: plan.firstMissedAt,
-    missedCount: plan.missedCount,
-    failureCode: 'MISSED_OFFLINE',
+    missedCount: catchUp ? catchUp.collapsedCount : plan.missedCount,
+    failureCode: catchUp ? 'MISSED_COLLAPSED' : 'MISSED_OFFLINE',
   })
   const attemptKey = `${automation.automationId}:${automation.generation}:${plan.firstMissedAt}`
   const attempts = unconfirmedMissedRecords(input)
@@ -846,6 +863,10 @@ async function recordMissedRuns(
       // Never stored after several tries: let later slots run rather than hold the automation forever.
       attempts.delete(attemptKey)
       input.logDebug?.(`[server-automation] ${automation.automationId} missed-run record not stored after ${failed} tries; skipping without a record`)
+      if (catchUp?.runAt != null) {
+        schedule.nextRunAt = catchUp.runAt
+        return 'catch-up'
+      }
       return 'claim'
     }
     attempts.delete(attemptKey)
@@ -860,13 +881,20 @@ async function recordMissedRuns(
       schedule.nextRunAt = next
       if (next > now) return 'recorded'
       return claimedSlotsLeft > 1
-        ? recordMissedRuns(input, serverRecordsMissedRuns, automation, payload, schedule, now, claimedSlotsLeft - 1)
+        ? recordMissedRuns(input, server, automation, payload, schedule, now, claimedSlotsLeft - 1)
         : 'retry'
     }
     input.logDebug?.(`[server-automation] ${automation.automationId} missed-run record refused (${recorded.error}); skipping without a record`)
     return 'claim'
   }
   attempts.delete(attemptKey)
+  if (catchUp?.runAt != null) {
+    // 저장이 확인된 뒤에만 넘긴다. 이후 claim 응답을 잃어도 다음 틱은 이 회차 하나만 다시 본다.
+    writeScheduleNextRunAt(input, automation.automationId, catchUp.runAt)
+    schedule.nextRunAt = catchUp.runAt
+    input.logDebug?.(`[server-automation] ${automation.automationId} collapsed ${catchUp.collapsedCount} missed run(s); running the latest late once`)
+    return 'catch-up'
+  }
   const resumeAt = plan.resumeAt ?? NEVER_RUN_AT
   writeScheduleNextRunAt(input, automation.automationId, resumeAt)
   input.logDebug?.(
@@ -2329,12 +2357,15 @@ export async function runServerAutomationTick(
       ({ runId, claimToken } = retry.report)
       leaseExpiresAt = retry.leaseExpiresAt
     } else {
-      const missed = await recordMissedRuns(input, cache.missedRunRecord === true, automation, payload, schedule, now)
-      if (missed !== 'claim') continue
+      const missed = await recordMissedRuns(input, {
+        recordsMissedRuns: cache.missedRunRecord === true, catchesUp: cache.catchUpClaim === true,
+      }, automation, payload, schedule, now)
+      if (missed === 'retry' || missed === 'recorded') continue
       const claim = await input.transport.claim({
         automationId: automation.automationId,
         generation: automation.generation,
         scheduledFor: schedule.nextRunAt,
+        ...(missed === 'catch-up' ? { catchUp: true as const } : {}),
       })
       if (!claim.ok || !claim.value) {
         if (claim.error === 'claim-denied' && (payload.contextPolicy || input.reserveLegacyDispatch) && isOnceSchedule(payload.schedule)) {

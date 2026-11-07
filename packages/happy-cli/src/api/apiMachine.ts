@@ -437,6 +437,7 @@ interface DaemonToServerEvents {
         automationId: string;
         generation: number;
         scheduledFor: number;
+        catchUp?: true;
     }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
     'automation-run-start': (data: {
         runId: string;
@@ -447,7 +448,7 @@ interface DaemonToServerEvents {
         generation: number;
         firstMissedAt: number;
         missedCount: number;
-        failureCode: 'MISSED_OFFLINE';
+        failureCode: 'MISSED_OFFLINE' | 'MISSED_COLLAPSED';
     }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
     'automation-run-heartbeat': (data: AutomationRunHeartbeatRequest, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
     'automation-conversation-deliver': (data: AutomationConversationDeliverRequest, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
@@ -839,6 +840,8 @@ export class ApiMachineClient {
     private readonly automationKeyRegistration = createSerialLock();
     private scriptRuntimeReadiness: ScriptRuntimeReadiness | null = null;
     private lastKnownScriptRuntimeKey: string | null = null;
+    /** specs/scheduled-missed-run-policy R14 — the last automation sync said the server honours `catchUp` claims. */
+    private automationCatchUpClaim = false;
     private persistAutomationKeyVersion: ((version: number) => void) | null = null;
     private automationServerKeyVersion: number | null = null;
     // Fail closed while server-backed ownership is unresolved. Legacy file ticks
@@ -2645,6 +2648,23 @@ export class ApiMachineClient {
         return this.scriptRuntimeReadiness ? { scriptRuntime: this.scriptRuntimeReadiness } : {};
     }
 
+    /**
+     * specs/scheduled-missed-run-policy R14 — Desktop offers the per-schedule missed-run choice only on this.
+     * Advertised only when this daemon runs server-backed automations against a server that accepts late
+     * `catchUp` claims; an old server ignores the field, so "run once when back" would quietly do nothing.
+     */
+    private automationMissedRunPolicyField(): { missedRunPolicy?: 1 } {
+        return this.automationServerKeyVersion !== null && this.automationCatchUpClaim ? { missedRunPolicy: 1 } : {};
+    }
+
+    private refreshAutomationCatchUpClaim(): void {
+        try {
+            this.automationCatchUpClaim = this.serverAutomationCache?.read().catchUpClaim === true;
+        } catch (error) {
+            logger.debug(`[API MACHINE] Automation cache unreadable for catch-up support: ${error}`);
+        }
+    }
+
     setAutomationKey(key: MachineAutomationKey, persistVersion: (version: number) => void, protocolVersion: number = AUTOMATION_PROTOCOL_VERSION): void {
         this.automationKey = key;
         this.automationProtocolVersion = protocolVersion;
@@ -2692,6 +2712,7 @@ export class ApiMachineClient {
 
     setServerAutomationCache(cache: ServerAutomationCache): void {
         this.serverAutomationCache = cache;
+        this.refreshAutomationCatchUpClaim();
     }
 
     shouldRunLegacyAutomationScheduler(): boolean {
@@ -3492,6 +3513,7 @@ export class ApiMachineClient {
             ack: (request) => this.socket.timeout(AUTOMATION_ACK_TIMEOUT_MS).emitWithAck('automation-sync-ack', request),
         }).then((result) => {
             if (result.changed > 0) logger.debug(`[API MACHINE] Applied ${result.changed} automation delta(s)`);
+            this.refreshAutomationCatchUpClaim();
         }).catch((error) => {
             logger.debug(`[API MACHINE] Automation sync failed: ${error}`);
         }).finally(() => {
@@ -3521,6 +3543,7 @@ export class ApiMachineClient {
                 contextIsolationVersion: this.automationContextIsolationVersion,
                 scheduleKinds: [...AUTOMATION_SCHEDULE_KINDS],
                 delivery: 1,
+                ...this.automationMissedRunPolicyField(),
                 ...this.automationHostCommandsField(),
                 ...this.authenticatedEnvelopesField(),
                 ...this.scriptRuntimeField(),
@@ -4514,7 +4537,8 @@ export class ApiMachineClient {
             const scriptRuntimeKey = this.scriptRuntimeReadiness ? scriptRuntimeReadinessKey(this.scriptRuntimeReadiness) : null;
             const automationSupportChanged = this.lastKnownAutomationRpcAvailable !== this.automationRpcAvailable
                 || this.lastKnownScriptRuntimeKey !== scriptRuntimeKey
-                || this.machine.metadata?.automationSupport?.contextIsolationVersion !== this.automationContextIsolationVersion;
+                || this.machine.metadata?.automationSupport?.contextIsolationVersion !== this.automationContextIsolationVersion
+                || this.machine.metadata?.automationSupport?.missedRunPolicy !== this.automationMissedRunPolicyField().missedRunPolicy;
             const autonomousQualityGateSupportChanged = this.lastKnownAutonomousQualityGateRpcAvailable !== this.autonomousQualityGateRpcAvailable;
             const automationServerKeyChanged = this.lastKnownAutomationServerKeyVersion !== this.automationServerKeyVersion;
             const daemonSessionStateAvailable = this.daemonSessionStateRpcAvailable && !this.managedHandlers;
@@ -4624,6 +4648,7 @@ export class ApiMachineClient {
                         contextIsolationVersion: this.automationContextIsolationVersion,
                         // 새 종류는 서버 자동화 실행기만 계산한다(레거시 RPC 저장소는 받지 않는다).
                         ...(this.automationServerKeyVersion !== null ? { scheduleKinds: [...AUTOMATION_SCHEDULE_KINDS], delivery: 1 as const } : {}),
+                        ...this.automationMissedRunPolicyField(),
                         ...this.automationHostCommandsField(),
                         ...this.authenticatedEnvelopesField(),
                         ...this.scriptRuntimeField(),
