@@ -701,11 +701,15 @@ describe('runAcp', () => {
       expect(mocks.backendState.startSessionCalls).toBe(1);
     });
     expect(mocks.getUserMessageHandler()).toBeNull();
+    const { BasePermissionHandler } = await import('@/utils/BasePermissionHandler');
+    const updateSession = vi.spyOn(BasePermissionHandler.prototype, 'updateSession');
 
     const { onReconnected } = mocks.mockStartOfflineReconnection.mock.calls[0][0];
     await onReconnected();
 
-    // The swap still re-attaches the input queue and the archive listener (R4-d).
+    // The swap still re-attaches the input queue, permissions and the archive listener (R4-d).
+    expect(updateSession).toHaveBeenCalledWith(realSession);
+    updateSession.mockRestore();
     expect(realSession.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', false);
     expect(realSession.on).toHaveBeenCalledWith('archived', expect.any(Function));
 

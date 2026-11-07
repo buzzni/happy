@@ -803,9 +803,12 @@ describe('Codex offline start', () => {
         const running = runCodex({ principal: { kind: 'account', credentials: { token: 'test-token' } as never }, noSandbox: true });
         await vi.waitFor(() => expect(vi.mocked(logger.debug).mock.calls.some(([line]) => String(line).includes('Waiting for messages'))).toBe(true));
         expect(fixture.session.onUserMessage).not.toHaveBeenCalled();
+        const { BasePermissionHandler } = await import('@/utils/BasePermissionHandler');
+        const updateSession = vi.spyOn(BasePermissionHandler.prototype, 'updateSession');
 
         await fixture.reconnectOffline!();
-        // The swap still re-attaches the input queue, steer and the archive listener (R4-d).
+        // The swap still re-attaches the input queue, steer, permissions and the archive listener (R4-d).
+        expect(updateSession).toHaveBeenCalledWith(fixture.session);
         expect(fixture.session.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', expect.any(Boolean));
         expect(fixture.session.setInputSteerAvailable).toHaveBeenCalledWith(true);
         expect(fixture.session.on).toHaveBeenCalledWith('archived', expect.any(Function));
