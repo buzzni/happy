@@ -2,6 +2,7 @@
 import { randomUUID } from 'node:crypto';
 import { createEnvelope, hubPromptGuardSchema, inputRefSchema, type HubInputAdmissionV1,
     type InputEvidenceV1, type InputRef, type SessionEnvelope } from '@slopus/happy-wire';
+import type { UserMessage } from './types';
 
 export type EvidenceBatch = { inputs: InputRef[]; inputCount: number; continuation?: InputEvidenceV1; incompleteReasons?: string[] };
 type AdditionalKind = InputEvidenceV1['additional']['items'][number]['kind'];
@@ -9,6 +10,14 @@ type Attempt = InputEvidenceV1['additional']['items'][number];
 type AttemptState = InputEvidenceV1['additional']['items'][number]['state'];
 type ContinuationKind = InputEvidenceV1['continuation']['kind'];
 export type QueueInputEvidence = { ref: InputRef; guard?: unknown; continuation?: InputEvidenceV1 };
+
+/** The queue witness for one received user message; it depends on the message alone. */
+export function queueInputEvidence(message: UserMessage): QueueInputEvidence {
+    return { ref: message.serverMessageId
+        ? { kind: 'rest', serverMessageId: message.serverMessageId, serverSeq: message.serverSeq ?? null }
+        : { kind: 'unidentified', runtimeInputId: randomUUID() },
+        ...(message.meta && Object.hasOwn(message.meta, 'hubPrompt') ? { guard: message.meta.hubPrompt ?? null } : {}) };
+}
 
 /** Host state, never inferred from delayed metadata echoes. Calls and transitions are synchronous. */
 export class HubInputGate {
