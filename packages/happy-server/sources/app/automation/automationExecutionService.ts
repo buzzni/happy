@@ -29,25 +29,29 @@ export async function registerAutomationMachineKey(
     tx: Tx,
     accountId: string,
     machineId: string,
-    input: { expectedKeyVersion: number; publicKey: Binary; protocolVersion: number },
-): Promise<Result<{ keyVersion: number; invalidatedProjectIds: string[]; targetChanged: boolean }>> {
+    input: { expectedKeyVersion: number; publicKey: Binary; protocolVersion: number; contextIsolationVersion?: 0 | 1 },
+): Promise<Result<{ keyVersion: number; invalidatedProjectIds: string[]; targetChanged: boolean; contextIsolationVersion?: 1; syncFromStart?: true }>> {
+    // Repeat on every registration: an earlier ACK may have been lost after capability was committed.
+    const contextSync = input.contextIsolationVersion === 1 ? { contextIsolationVersion: 1 as const, syncFromStart: true as const } : {};
     const current = await tx.machine.findFirst({
         where: { id: machineId, accountId },
         select: {
             automationPublicKey: true,
             automationKeyVersion: true,
             automationProtocolVersion: true,
+            automationContextIsolationVersion: true,
         },
     });
     if (current?.automationPublicKey
         && Buffer.from(current.automationPublicKey).equals(Buffer.from(input.publicKey))) {
         // 데몬은 재접속마다 같은 키를 다시 등록한다. 키도 프로토콜도 그대로면 target 은
         // 바뀌지 않았으므로 호출자가 계정 전체 무효화를 보내지 않게 알린다.
-        const protocolChanged = current.automationProtocolVersion !== input.protocolVersion;
+        const protocolChanged = current.automationProtocolVersion !== input.protocolVersion
+            || (current.automationContextIsolationVersion ?? 0) !== (input.contextIsolationVersion ?? 0);
         if (protocolChanged) {
             const changed = await tx.machine.updateMany({
                 where: { id: machineId, accountId, automationKeyVersion: current.automationKeyVersion },
-                data: { automationProtocolVersion: input.protocolVersion },
+                data: { automationProtocolVersion: input.protocolVersion, automationContextIsolationVersion: input.contextIsolationVersion ?? 0 },
             });
             if (changed.count === 0) return { ok: false, error: 'key-version-conflict' };
         }
@@ -64,6 +68,7 @@ export async function registerAutomationMachineKey(
                 keyVersion: current.automationKeyVersion,
                 invalidatedProjectIds: [...new Set(invalidated.map((followup) => followup.projectId as string))],
                 targetChanged: protocolChanged,
+                ...contextSync,
             },
         };
     }
@@ -73,6 +78,7 @@ export async function registerAutomationMachineKey(
             automationPublicKey: input.publicKey,
             automationKeyVersion: { increment: 1 },
             automationProtocolVersion: input.protocolVersion,
+            automationContextIsolationVersion: input.contextIsolationVersion ?? 0,
         },
     });
     if (changed.count === 0) return { ok: false, error: 'key-version-conflict' };
@@ -87,6 +93,7 @@ export async function registerAutomationMachineKey(
             keyVersion: input.expectedKeyVersion + 1,
             invalidatedProjectIds: [...new Set(invalidated.map((followup) => followup.projectId as string))],
             targetChanged: true,
+            ...contextSync,
         },
     };
 }
@@ -106,7 +113,11 @@ export async function syncAutomations(
     const changes: Array<Record<string, unknown>> = [];
     // Only codecs the daemon advertises (v1 always). Legacy monitor v2, retired native v5 and unknown versions
     // are tombstoned: an UPSERT the daemon cache rejects would stall that machine's sync cursor.
-    const supportsPayload = (version: number) => version === 1 || ((version === 2 || version === 4) && !!input.payloadVersions?.includes(version));
+    const isolatedMachine = input.payloadVersions?.includes(6) ? await tx.machine.findFirst({
+        where: { id: machineId, accountId }, select: { automationContextIsolationVersion: true },
+    }) : null;
+    const supportsPayload = (version: number) => version === 1 || ((version === 2 || version === 4
+        || version === 6 && isolatedMachine?.automationContextIsolationVersion === 1) && !!input.payloadVersions?.includes(version));
     for (const change of rows) {
         if (change.kind === 'TOMBSTONE') {
             const deleted = await tx.automation.findFirst({ where: { id: change.automationId, machineAccountId: accountId, machineId }, include: { project: true } });
@@ -203,7 +214,8 @@ export async function ackAutomationSync(
 
 function executable(automation: any, accountId: string, machineId: string, generation: number): boolean {
     return automation
-        && [1, 2, 4].includes(automation.payloadVersion)
+        && ([1, 2, 4].includes(automation.payloadVersion)
+            || automation.payloadVersion === 6 && automation.targetMachine?.automationContextIsolationVersion === 1)
         && automation.machineAccountId === accountId
         && automation.machineId === machineId
         && automation.generation === generation
@@ -227,7 +239,7 @@ export async function claimAutomationRun(
         where: { id: input.automationId, machineAccountId: accountId, machineId, deletedAt: null },
         include: {
             project: { select: { automationViewerKeyVersion: true } },
-            targetMachine: { select: { automationKeyVersion: true } },
+            targetMachine: { select: { automationKeyVersion: true, automationContextIsolationVersion: true } },
         },
     });
     const inClaimWindow = input.scheduledFor.getTime() >= now.getTime() - 90_000
@@ -289,7 +301,7 @@ async function claimedRun(tx: Tx, accountId: string, machineId: string, runId: s
             automation: {
                 include: {
                     project: { select: { automationViewerKeyVersion: true } },
-                    targetMachine: { select: { automationKeyVersion: true } },
+                    targetMachine: { select: { automationKeyVersion: true, automationContextIsolationVersion: true } },
                 },
             },
         },

@@ -36,6 +36,33 @@ describe('automationSocketHandler', () => {
     });
     afterEach(() => delete process.env.SAYCODE_AUTOMATION_ENABLED);
 
+    it.each([undefined, 0, 1, 99])('validates explicit isolation readiness on authenticated key registration (%s)', async contextIsolationVersion => {
+        const handlers = new Map<string, Function>();
+        const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
+        services.registerAutomationMachineKey.mockResolvedValue({ ok: true, value: { keyVersion: 1 } });
+        automationSocketHandler('account-1', 'machine-1', socket as never);
+        const callback = vi.fn();
+        await handlers.get('automation-key-register')!({ expectedKeyVersion: 0, publicKey: Buffer.alloc(32).toString('base64'),
+            protocolVersion: 99, ...(contextIsolationVersion === undefined ? {} : { contextIsolationVersion }), accountId: 'foreign', machineId: 'foreign' }, callback);
+        if (contextIsolationVersion === 99) {
+            expect(services.registerAutomationMachineKey).not.toHaveBeenCalled();
+            expect(callback).toHaveBeenCalledWith({ ok: false, error: 'invalid-input' });
+        } else expect(services.registerAutomationMachineKey).toHaveBeenCalledWith({}, 'account-1', 'machine-1', {
+            expectedKeyVersion: 0, publicKey: new Uint8Array(32), protocolVersion: 99, contextIsolationVersion: contextIsolationVersion ?? 0,
+        });
+    });
+
+    it('accepts the isolated codec advertisement without accepting retired execution semantics', async () => {
+        const handlers = new Map<string, Function>();
+        const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
+        services.syncAutomations.mockResolvedValue({ ok: true, value: { changes: [], nextSeq: 0n } });
+        automationSocketHandler('account-1', 'machine-1', socket as never);
+        const callback = vi.fn();
+        await handlers.get('automation-sync')!({ afterSeq: '0', limit: 100, payloadVersions: [1, 4, 6] }, callback);
+        expect(services.syncAutomations).toHaveBeenCalledWith({}, 'account-1', 'machine-1', { afterSeq: 0n, limit: 100, payloadVersions: [1, 4, 6] });
+        expect(callback).toHaveBeenCalledWith(expect.objectContaining({ ok: true }));
+    });
+
     it('fails closed when the global rollout flag is disabled', async () => {
         process.env.SAYCODE_AUTOMATION_ENABLED = 'false';
         const handlers = new Map<string, Function>();

@@ -320,6 +320,7 @@ model Machine {
     automationPublicKey Bytes?
     automationKeyVersion Int       @default(0)
     automationProtocolVersion Int  @default(1)
+    automationContextIsolationVersion Int @default(0)
     automations        Automation[] @relation("AutomationTargetMachine")
 
     executionBindings SessionExecutionBinding[]

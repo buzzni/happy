@@ -22,7 +22,8 @@ vi.mock('@/storage/db', () => ({ db: new Proxy({}, { get: (_target, key) => {
   return typeof value === 'function' ? value.bind(state.client) : value;
 } }) }));
 import { createAutomationExecutionSession, recordAutomationExecutionExit } from './automationExecutionSession';
-import { heartbeatAutomationRun, reportAutomationRun } from './automationExecutionService';
+import { claimAutomationRun, heartbeatAutomationRun, registerAutomationMachineKey, reportAutomationRun, startAutomationRun, syncAutomations } from './automationExecutionService';
+import { createRegisteredAutomation, getAutomationTarget, updateAutomation } from './automationService';
 import { automationExecutionRoutes } from '@/app/api/routes/automationExecutionRoutes';
 import { transitionChatAutomations } from './automationChatLifecycle';
 
@@ -64,6 +65,55 @@ async function run(id: string) {
     status: 'RUNNING', claimTokenHash: new Uint8Array(createHash('sha256').update(`claim-${id}`).digest()),
     claimExpiresAt: new Date(now.getTime() + 60_000), runLeaseExpiresAt: new Date(now.getTime() + 60_000) } });
 }
+
+it('migrates readiness as unsupported without changing existing manual or automation records', async () => {
+  const machine = await client.machine.findUniqueOrThrow({ where: { id: 'm1' } });
+  const automation = await client.automation.findUniqueOrThrow({ where: { id: 'a1' } });
+  const manual = await client.session.findUniqueOrThrow({ where: { id: 'manual' } });
+  await db.exec('ALTER TABLE "Machine" DROP COLUMN "automationContextIsolationVersion";');
+  await db.exec(await readFile('prisma/migrations/20261107010000_automation_context_capability/migration.sql', 'utf8'));
+  expect(await client.machine.findUniqueOrThrow({ where: { id: 'm1' } })).toEqual({ ...machine, automationContextIsolationVersion: 0 });
+  expect(await client.automation.findUniqueOrThrow({ where: { id: 'a1' } })).toEqual(automation);
+  expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
+});
+
+it('registers one isolated reservation and fences a claimed start when an older daemon replaces readiness', async () => {
+  const publicKey = new Uint8Array(32).fill(3);
+  await client.project.update({ where: { id: 'chat:c1' }, data: { automationViewerPublicKey: publicKey } });
+  await client.machine.update({ where: { id: 'm1' }, data: { automationPublicKey: publicKey } });
+  const key = { expectedKeyVersion: 1, publicKey, protocolVersion: 4, contextIsolationVersion: 1 as const };
+  expect(await registerAutomationMachineKey(client, 'owner', 'm1', key)).toMatchObject({ ok: true, value: { keyVersion: 1 } });
+  expect(await getAutomationTarget(client, 'owner', 'chat:c1')).toMatchObject({ ok: true, value: { contextIsolationVersion: 1 } });
+  const input = { payloadVersion: 6, payloadCiphertext: new Uint8Array([2]), viewerKeyId: 'k', viewerKeyVersion: 1,
+    viewerKeyEnvelope: publicKey, machineKeyVersion: 1, machineKeyEnvelope: publicKey, paused: true };
+  const created = await createRegisteredAutomation(client, 'owner', 'chat:c1', 'isolated-register-1', input);
+  if (!created.ok) throw new Error(created.error);
+  const retry = await createRegisteredAutomation(client, 'owner', 'chat:c1', 'isolated-register-1', input);
+  expect(retry).toEqual(created);
+  const enabled = await updateAutomation(client, 'owner', 'chat:c1', created.value.id, { expectedRevision: created.value.revision, paused: false });
+  if (!enabled.ok) throw new Error(enabled.error);
+  expect(await syncAutomations(client, 'owner', 'm1', { afterSeq: 0n, limit: 100, payloadVersions: [1, 4, 6] }))
+    .toMatchObject({ ok: true, value: { changes: expect.arrayContaining([expect.objectContaining({ automationId: created.value.id, kind: 'UPSERT', payloadVersion: 6 })]) } });
+  const claimed = await claimAutomationRun(client, 'owner', 'm1', { automationId: created.value.id,
+    generation: enabled.value.generation, scheduledFor: new Date() });
+  if (!claimed.ok) throw new Error(claimed.error);
+  const { contextIsolationVersion: _supported, ...oldKey } = key;
+  expect(await registerAutomationMachineKey(client, 'owner', 'm1', oldKey)).toMatchObject({ ok: true, value: { keyVersion: 1, targetChanged: true } });
+  expect(await getAutomationTarget(client, 'owner', 'chat:c1')).toMatchObject({ ok: true, value: { contextIsolationVersion: 0 } });
+  expect(await startAutomationRun(client, 'owner', 'm1', { runId: claimed.value.runId, claimToken: claimed.value.claimToken }))
+    .toMatchObject({ ok: false });
+  const unsupported = await syncAutomations(client, 'owner', 'm1', { afterSeq: 0n, limit: 100, payloadVersions: [1, 4, 6] });
+  if (!unsupported.ok) throw new Error(unsupported.error);
+  expect(unsupported.value.changes.every(row => row.kind === 'TOMBSTONE')).toBe(true);
+  const restored = await registerAutomationMachineKey(client, 'owner', 'm1', key);
+  expect(restored).toMatchObject({ ok: true, value: { contextIsolationVersion: 1, syncFromStart: true } });
+  expect((await registerAutomationMachineKey(client, 'owner', 'm1', key))).toMatchObject({ ok: true, value: { contextIsolationVersion: 1, syncFromStart: true, targetChanged: false } });
+  expect(await syncAutomations(client, 'owner', 'm1', { afterSeq: 0n, limit: 100, payloadVersions: [1, 4, 6] }))
+    .toMatchObject({ ok: true, value: { changes: expect.arrayContaining([expect.objectContaining({ automationId: created.value.id,
+      kind: 'UPSERT', payloadVersion: 6, revision: enabled.value.revision, generation: enabled.value.generation })]) } });
+  expect(await client.session.count()).toBe(1);
+  expect(await client.sessionMessage.count({ where: { sessionId: 'manual' } })).toBe(1);
+});
 async function request(runId = 'r1', patch: Record<string, unknown> = {}) {
   const body = { tag: automationExecutionSessionId(runId), metadata: `encrypted-new-context-${runId}`,
     agentState: 'encrypted-empty-state', dataEncryptionKey: Buffer.alloc(105, 1).toString('base64') };

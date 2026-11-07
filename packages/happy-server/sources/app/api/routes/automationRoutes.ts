@@ -325,7 +325,7 @@ export function automationRoutes(app: Fastify) {
         return reply.send({ automation: result.value ? serializeAutomation(result.value) : null });
     });
     app.put('/v1/projects/:projectId/automations/registrations/:registrationKey', {
-        preHandler: app.authenticate, schema: { params: registrationParams, body: createSchema.extend({ payloadVersion: z.literal(4), paused: z.literal(true) }).strict() },
+        preHandler: app.authenticate, schema: { params: registrationParams, body: createSchema.extend({ payloadVersion: z.union([z.literal(4), z.literal(6)]), paused: z.literal(true) }).strict() },
     }, async (request, reply) => {
         if (rejectWhenDisabled(reply)) return;
         const body = request.body;

@@ -61,6 +61,37 @@ function makeTx() {
 }
 
 describe('automationExecutionService', () => {
+    it.each([0, 1])('requires a full sync on every ready registration including a lost previous ACK (%s)', async previousVersion => {
+        const tx = makeTx(), publicKey = new Uint8Array(32);
+        tx.machine.findFirst.mockResolvedValue({ automationPublicKey: publicKey, automationKeyVersion: 4,
+            automationProtocolVersion: 4, automationContextIsolationVersion: previousVersion });
+        await expect(Reflect.apply(registerAutomationMachineKey, null, [tx, 'account-1', 'machine-1', {
+            expectedKeyVersion: 4, publicKey, protocolVersion: 4, contextIsolationVersion: 1,
+        }])).resolves.toMatchObject({ ok: true, value: { contextIsolationVersion: 1, syncFromStart: true } });
+        expect(tx.automation.updateMany).not.toHaveBeenCalled();
+    });
+    it.each([undefined, 1])('registers explicit isolation readiness and clears it for an older daemon (%s)', async contextIsolationVersion => {
+        const tx = makeTx(), publicKey = new Uint8Array(32);
+        tx.machine.findFirst.mockResolvedValue({ automationPublicKey: publicKey, automationKeyVersion: 4,
+            automationProtocolVersion: 4, automationContextIsolationVersion: contextIsolationVersion === 1 ? 0 : 1 });
+        await expect(Reflect.apply(registerAutomationMachineKey, null, [tx, 'account-1', 'machine-1', {
+            expectedKeyVersion: 4, publicKey, protocolVersion: 4, ...(contextIsolationVersion === undefined ? {} : { contextIsolationVersion }),
+        }])).resolves.toMatchObject({ ok: true, value: { keyVersion: 4, targetChanged: true } });
+        expect(tx.machine.updateMany).toHaveBeenCalledWith({ where: { id: 'machine-1', accountId: 'account-1', automationKeyVersion: 4 },
+            data: { automationProtocolVersion: 4, automationContextIsolationVersion: contextIsolationVersion ?? 0 } });
+    });
+
+    it.each([0, 1])('syncs and claims isolated runs only with explicit machine readiness (%s)', async contextIsolationVersion => {
+        const tx = makeTx();
+        tx.machine.findFirst.mockResolvedValue({ automationContextIsolationVersion: contextIsolationVersion });
+        tx.automation.findFirst.mockResolvedValue(automation({ payloadVersion: 6,
+            targetMachine: { automationKeyVersion: 4, automationContextIsolationVersion: contextIsolationVersion } }));
+        await expect(syncAutomations(tx as never, 'account-1', 'machine-1', { afterSeq: 0n, limit: 100, payloadVersions: [1, 4, 6] }))
+            .resolves.toMatchObject({ ok: true, value: { changes: [{ kind: contextIsolationVersion === 1 ? 'UPSERT' : 'TOMBSTONE' }] } });
+        await expect(claimAutomationRun(tx as never, 'account-1', 'machine-1', { automationId: 'automation-1', generation: 3, scheduledFor: now }, now))
+            .resolves.toMatchObject({ ok: contextIsolationVersion === 1 });
+        if (contextIsolationVersion === 0) expect(tx.automationRun.createMany).not.toHaveBeenCalled();
+    });
     it.each([3, 5, 6, 99])('tombstones removed or unknown payload %s even when advertised', async (payloadVersion) => {
         const tx = makeTx();
         tx.automation.findFirst.mockResolvedValue(automation({ payloadVersion }));
@@ -128,6 +159,7 @@ describe('automationExecutionService', () => {
                 automationPublicKey: new Uint8Array(32),
                 automationKeyVersion: { increment: 1 },
                 automationProtocolVersion: 2,
+                automationContextIsolationVersion: 0,
             },
         });
         expect(tx.sessionFollowup.findMany).toHaveBeenCalledWith({ where: expect.objectContaining({
@@ -151,7 +183,7 @@ describe('automationExecutionService', () => {
         })).resolves.toEqual({ ok: true, value: { keyVersion: 4, invalidatedProjectIds: [], targetChanged: true } });
         expect(tx.machine.updateMany).toHaveBeenCalledWith({
             where: { id: 'machine-1', accountId: 'account-1', automationKeyVersion: 4 },
-            data: { automationProtocolVersion: 2 },
+            data: { automationProtocolVersion: 2, automationContextIsolationVersion: 0 },
         });
     });
 

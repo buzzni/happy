@@ -58,6 +58,7 @@ function makeTx(options: {
     automation?: ReturnType<typeof automationRecord> | null;
     machineAccountId?: string;
     automationProtocolVersion?: number;
+    contextIsolationVersion?: number;
     activeAutomationCount?: number;
     followupCount?: number;
 } = {}) {
@@ -91,6 +92,7 @@ function makeTx(options: {
                 automationPublicKey: new Uint8Array(32),
                 automationKeyVersion: 3,
                 automationProtocolVersion: options.automationProtocolVersion ?? 2,
+                automationContextIsolationVersion: options.contextIsolationVersion ?? 0,
             })),
         },
         automation: {
@@ -134,6 +136,18 @@ const createInput = {
 };
 
 describe('automationService', () => {
+    it('creates and explicitly converts a legacy definition only on an isolated-capable target', async () => {
+        const { tx } = makeTx({ contextIsolationVersion: 1 });
+        await expect(getAutomationTarget(tx as never, 'editor-1', 'project-1')).resolves.toMatchObject({ ok: true, value: { contextIsolationVersion: 1 } });
+        await expect(createAutomation(tx as never, 'editor-1', 'project-1', { ...createInput, payloadVersion: 6 })).resolves.toMatchObject({ ok: true });
+        await expect(updateAutomation(tx as never, 'editor-1', 'project-1', 'automation-1', { ...createInput, payloadVersion: 6, expectedRevision: 1 })).resolves.toMatchObject({ ok: true });
+        expect(tx.automation.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ payloadVersion: 6 }) }));
+    });
+
+    it('resumes an isolated definition only while its explicit capability remains ready', async () => {
+        const { tx } = makeTx({ contextIsolationVersion: 1, automation: automationRecord({ payloadVersion: 6 }) });
+        await expect(updateAutomation(tx as never, 'editor-1', 'project-1', 'automation-1', { expectedRevision: 1, paused: false })).resolves.toMatchObject({ ok: true });
+    });
     it.each([4, 6, 99])('does not enable isolated payloads from protocol number %s before the execution capability is ready', async protocolVersion => {
         const { tx } = makeTx({ automationProtocolVersion: protocolVersion });
         await expect(createAutomation(tx as never, 'editor-1', 'project-1', { ...createInput, payloadVersion: 6 }))
