@@ -312,6 +312,18 @@ export const automationEncryptedFieldsSchema = z.object({
 });
 export type AutomationEncryptedFields = z.infer<typeof automationEncryptedFieldsSchema>;
 
+/** One explicit question about an immutable run; never a definition update or a scheduled run-now. */
+export const automationExecutionQuestionRequestSchema = z.strictObject({
+  requestId: z.string().uuid(), sourceRunId: z.string().regex(/^[A-Za-z0-9_-]{1,160}$/),
+  expectedRevision: positiveInteger, generation: positiveInteger,
+  displaySessionId: z.string().min(1).max(200).refine(id => !isAutomationExecutionSessionId(id)),
+  encrypted: automationEncryptedFieldsSchema.extend({ payloadVersion: z.literal(6) }).strict(),
+});
+export type AutomationExecutionQuestionRequest = z.infer<typeof automationExecutionQuestionRequestSchema>;
+export function automationExecutionQuestionBindingId(requestId: string): string {
+  return `automation-question:${z.string().uuid().parse(requestId)}`;
+}
+
 export const automationCreateRequestSchema = automationEncryptedFieldsSchema.extend({ paused: z.boolean().default(false) });
 export type AutomationCreateRequest = z.input<typeof automationCreateRequestSchema>;
 

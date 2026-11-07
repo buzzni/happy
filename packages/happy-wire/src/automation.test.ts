@@ -8,12 +8,28 @@ import {
   automationRunSchema,
   automationRunHeartbeatRequestSchema,
   automationTargetSchema,
+  automationExecutionQuestionRequestSchema,
   createAutomationApiClient,
   decryptAutomationPayload,
   encryptAutomationPayload,
   type AutomationCryptoAdapter,
   type AutomationPublic,
 } from './automation';
+
+it('accepts only bounded isolated question requests and rejects unknown or legacy execution fields', () => {
+  const base = { requestId: '9cc41d26-562e-4b48-8e2f-a38dc2c85a78', sourceRunId: 'source-run', expectedRevision: 2,
+    generation: 3, displaySessionId: 'manual', encrypted: { payloadVersion: 6,
+      payloadCiphertext: Buffer.concat([Buffer.from([1]), Buffer.alloc(40)]).toString('base64'), viewerKeyId: 'key', viewerKeyVersion: 1,
+      machineKeyVersion: 1, viewerKeyEnvelope: Buffer.concat([Buffer.from([1]), Buffer.alloc(104)]).toString('base64'),
+      machineKeyEnvelope: Buffer.concat([Buffer.from([1]), Buffer.alloc(104)]).toString('base64') } };
+  expect(automationExecutionQuestionRequestSchema.safeParse(base).success).toBe(true);
+  for (const changed of [{ ...base, displaySessionId: 'automation-run:source-run' }, { ...base, expectedRevision: 0 },
+    { ...base, requestId: 'not-a-request' }, { ...base, prompt: 'plaintext' },
+    { ...base, encrypted: { ...base.encrypted, payloadVersion: 4 } },
+    { ...base, encrypted: { ...base.encrypted, unexpected: true } }]) {
+    expect(automationExecutionQuestionRequestSchema.safeParse(changed).success).toBe(false);
+  }
+});
 
 describe('github trigger automation payload', () => {
   it('accepts a server-backed PR trigger without changing legacy scheduled payloads', () => {
