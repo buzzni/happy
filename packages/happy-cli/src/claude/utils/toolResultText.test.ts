@@ -16,6 +16,13 @@ describe('toolResultText', () => {
         expect(toolResultText('\u001b]0;my command\u0007text \u001b]2;window title here\u001b\\done', false)).toEqual({ text: 'text done' });
     });
 
+    // Every OSC start must stop at the next one: otherwise each scans to the end and the strip is quadratic.
+    it('strips an escape-heavy body in linear time', () => {
+        const started = performance.now();
+        expect(toolResultText('\u009D'.repeat(100_000) + 'ok', false)).toMatchObject({ omitted: 100_002 - TOOL_RESULT_MAX_CHARS });
+        expect(performance.now() - started).toBeLessThan(1_000);
+    });
+
     it('keeps an empty body and an error without text, but nothing for a body with no text', () => {
         expect(toolResultText('', undefined)).toEqual({ text: '' });
         expect(toolResultText(undefined, true)).toEqual({ text: '', isError: true });

@@ -18,7 +18,7 @@ export type ToolResultText = { text: string; isError?: boolean; omitted?: number
 // Escape sequences — the text is shown plain, never colored. A terminated OSC (window title,
 // hyperlink) goes as a whole whatever its payload; the rest is the `ansi-regex` pattern.
 const ANSI_ESCAPE = new RegExp([
-    '(?:\\u001B\\]|\\u009D)[^\\u0007\\u001B\\u009C]*(?:\\u0007|\\u001B\\\\|\\u009C)',
+    '(?:\\u001B\\]|\\u009D)[^\\u0007\\u001B\\u009C\\u009D]*(?:\\u0007|\\u001B\\\\|\\u009C)',
     '[\\u001B\\u009B][[\\]()#;?]*(?:(?:(?:(?:;[-a-zA-Z\\d\\/#&.:=?%@~_]+)*|[a-zA-Z\\d]+(?:;[-a-zA-Z\\d\\/#&.:=?%@~_]*)*)?(?:\\u0007|\\u001B\\u005C|\\u009C))',
     '(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PR-TZcf-nq-uy=><~]))',
 ].join('|'), 'g');
