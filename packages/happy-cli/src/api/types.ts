@@ -183,6 +183,11 @@ export const MachineMetadataSchema = z.object({
      * channel host to send results and failure alerts. Whether the host can is `channelHost.deliver`.
      */
     delivery: z.literal(1).optional(),
+    /**
+     * aplus-dev-studio specs/scheduled-missed-run-policy R14 — this daemon reads `payload.missedRunPolicy` and its
+     * server accepts late catch-up claims. Without it Desktop hides the per-schedule missed-run choice.
+     */
+    missedRunPolicy: z.literal(1).optional(),
     /** aplus-dev-studio specs/e2ee-machine-control-boundary R12/R15 — seal with this sender, to this key. */
     authenticatedEnvelopes: authenticatedEnvelopesCapabilitySchema.optional(),
     /** Why this machine does or does not run script automations. Enums and a short fingerprint only (specs/script-runtime-readiness). */

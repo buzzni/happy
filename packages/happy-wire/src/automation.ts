@@ -187,6 +187,16 @@ export const automationExecutionQuestionIdentitySchema = z.strictObject({ reques
   sourceRunId: z.string().regex(/^[A-Za-z0-9_-]{1,160}$/) }).refine(value => value.requestId !== value.sourceRunId);
 export type AutomationExecutionQuestionIdentity = z.infer<typeof automationExecutionQuestionIdentitySchema>;
 
+/**
+ * aplus-dev-studio specs/scheduled-missed-run-policy R10~R14 — what the daemon does with slots it missed
+ * while the machine was off or asleep. Absent and 'default' keep the current rule (missed slots are
+ * recorded, never run); 'skip' is the same today but stays put if the default ever changes;
+ * 'catch_up_once' runs the latest missed slot once when the machine is back. Older daemons strip the key.
+ */
+export const AUTOMATION_MISSED_RUN_POLICIES = ['default', 'catch_up_once', 'skip'] as const;
+export const automationMissedRunPolicySchema = z.enum(AUTOMATION_MISSED_RUN_POLICIES);
+export type AutomationMissedRunPolicy = z.infer<typeof automationMissedRunPolicySchema>;
+
 export const automationPayloadSchema = z.object({
   name: z.string().trim().min(1).max(200),
   schedule: automationScheduleSchema,
@@ -205,6 +215,8 @@ export const automationPayloadSchema = z.object({
   executionQuestion: automationExecutionQuestionIdentitySchema.optional(),
   // A delivery this daemon cannot read is dropped, never a reason to skip the run itself.
   delivery: automationDeliverySchema.optional().catch(undefined),
+  // A value this daemon does not know falls back to the default rule instead of refusing the automation.
+  missedRunPolicy: automationMissedRunPolicySchema.optional().catch(undefined),
   seal: automationSealSchema.optional(),
 }).superRefine((payload, context) => {
   if (payload.executionQuestion && payload.contextPolicy?.reference?.kind !== 'previous-result') {

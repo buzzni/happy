@@ -5654,3 +5654,202 @@ describe('놓친 예약 회차 기록', () => {
     expect(store.state().schedules[0]!.nextRunAt).toBe(T + 1)
   })
 })
+
+// aplus-dev-studio specs/scheduled-missed-run-policy R11~R13 — an automation opted into "run once when back"
+// runs its latest missed slot once, late, and collapses the rest into one row.
+describe('돌아오면 1회 실행', () => {
+  const T = Date.UTC(2026, 10, 7, 9, 0)
+  const MIN = 60_000
+
+  function back(options: {
+    nextRunAt?: number
+    policy?: 'catch_up_once' | 'skip' | 'default' | null
+    serverCatchesUp?: boolean
+    record?: { ok: boolean; value?: any; error?: string }
+    claim?: { ok: boolean; value?: any; error?: string }
+    schedule?: unknown
+    enabledAt?: number
+    generation?: number
+  }) {
+    const fixture = setup({ claim: options.claim ?? { ok: true, value: { runId: 'run-late', claimToken: 'claim-token' } } })
+    const base = fixture.input.cache.read
+    fixture.input.cache = { read: () => {
+      const state = base()
+      return {
+        ...state, missedRunRecord: true, ...(options.serverCatchesUp === false ? {} : { catchUpClaim: true }),
+        automations: state.automations.map((row) => ({
+          ...row, ...(options.enabledAt !== undefined ? { enabledAt: options.enabledAt } : {}),
+          ...(options.generation !== undefined ? { generation: options.generation } : {}),
+        })),
+      }
+    } }
+    fixture.input.now = T
+    fixture.store.write({
+      ...fixture.store.read(),
+      schedules: options.nextRunAt === undefined ? [] : [{ automationId: 'automation-1', generation: 2, nextRunAt: options.nextRunAt, lastSessionId: null }],
+    })
+    const payload = fixture.decryptPayload(cacheRecord(), new Uint8Array(32))
+    const policy = options.policy === undefined ? 'catch_up_once' : options.policy
+    fixture.input.decryptPayload = () => ({
+      ...payload,
+      ...(options.schedule ? { schedule: options.schedule } : {}),
+      ...(policy === null ? {} : { missedRunPolicy: policy }),
+    } as never)
+    const recordMissed = vi.fn(async (_input: any): Promise<any> => options.record ?? ({ ok: true, value: { runId: 'missed-1', idempotent: false } }))
+    Object.assign(fixture.input.transport, { recordMissed })
+    return { ...fixture, recordMissed }
+  }
+
+  it('records the earlier slots as one collapsed row and runs the latest slot once, on its own time', async () => {
+    const { input, store, transport, recordMissed, spawnSession } = back({ nextRunAt: T - 185 * MIN })
+
+    await runServerAutomationTick(input)
+
+    // 13 slots at 15 minutes: 12 collapse, the 13th (5 minutes ago) runs late.
+    expect(recordMissed).toHaveBeenCalledTimes(1)
+    expect(recordMissed).toHaveBeenCalledWith({
+      automationId: 'automation-1', generation: 2, firstMissedAt: T - 185 * MIN, missedCount: 12, failureCode: 'MISSED_COLLAPSED',
+    })
+    expect(transport.claim).toHaveBeenCalledTimes(1)
+    expect(transport.claim).toHaveBeenCalledWith({ automationId: 'automation-1', generation: 2, scheduledFor: T - 5 * MIN, catchUp: true })
+    expect(recordMissed.mock.invocationCallOrder[0]!).toBeLessThan(transport.claim.mock.invocationCallOrder[0]!)
+    expect(spawnSession).toHaveBeenCalledTimes(1)
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T + 15 * MIN)
+
+    await runServerAutomationTick(input)
+    expect(transport.claim).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['skip', 'default', null] as const)('runs nothing late for the %s policy', async (policy) => {
+    const { input, store, transport, recordMissed } = back({ nextRunAt: T - 185 * MIN, policy })
+
+    await runServerAutomationTick(input)
+
+    expect(recordMissed).toHaveBeenCalledWith(expect.objectContaining({ missedCount: 13, failureCode: 'MISSED_OFFLINE' }))
+    expect(transport.claim).not.toHaveBeenCalled()
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T + 10 * MIN)
+  })
+
+  it('keeps the default rule against a server that does not accept late claims', async () => {
+    const { input, transport, recordMissed } = back({ nextRunAt: T - 185 * MIN, serverCatchesUp: false })
+
+    await runServerAutomationTick(input)
+
+    expect(recordMissed).toHaveBeenCalledWith(expect.objectContaining({ missedCount: 13, failureCode: 'MISSED_OFFLINE' }))
+    expect(transport.claim).not.toHaveBeenCalled()
+  })
+
+  it('does not run the late slot twice when the claim answer is lost and the daemon tries again', async () => {
+    const { input, store, transport, recordMissed, spawnSession } = back({ nextRunAt: T - 185 * MIN, claim: { ok: false, error: 'ack-timeout' } })
+
+    await runServerAutomationTick(input)
+    // The collapsed row is stored; only the late slot is left to claim.
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T - 5 * MIN)
+
+    // The first claim did reach the server: the same slot is refused, and nothing is recorded again.
+    transport.claim.mockResolvedValue({ ok: false, error: 'already-claimed' })
+    await runServerAutomationTick(input)
+    expect(transport.claim.mock.calls.map(([call]) => [call.scheduledFor, call.catchUp])).toEqual([
+      [T - 5 * MIN, true], [T - 5 * MIN, true],
+    ])
+    expect(recordMissed).toHaveBeenCalledTimes(1)
+    expect(spawnSession).not.toHaveBeenCalled()
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T + 15 * MIN)
+  })
+
+  it('keeps the whole gap for the next tick when the collapsed row is not confirmed', async () => {
+    const { input, store, transport } = back({ nextRunAt: T - 185 * MIN, record: { ok: false, error: 'ack-timeout' } })
+
+    await runServerAutomationTick(input)
+
+    expect(transport.claim).not.toHaveBeenCalled()
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T - 185 * MIN)
+  })
+
+  it('does not run late once the collapsed row has failed to store several times', async () => {
+    // The schedule would move past the gap it never recorded; give the gap up like the default rule does.
+    const { input, transport, spawnSession, recordMissed } = back({
+      nextRunAt: T - 185 * MIN, record: { ok: false, error: 'record-failed' }, claim: { ok: false, error: 'claim-denied' },
+    })
+
+    for (let tick = 0; tick < 5; tick++) await runServerAutomationTick(input)
+
+    expect(recordMissed).toHaveBeenCalledTimes(5)
+    expect(transport.claim).toHaveBeenCalledTimes(1)
+    expect(transport.claim).toHaveBeenCalledWith({ automationId: 'automation-1', generation: 2, scheduledFor: T - 185 * MIN })
+    expect(spawnSession).not.toHaveBeenCalled()
+  })
+
+  it('still runs an opted-in one-time occurrence late once after the workspace held it before its claim', async () => {
+    const once = { kind: 'once-zoned' as const, date: '2026-11-07', hour: 6, minute: 0, timeZone: 'UTC' }
+    const slot = Date.UTC(2026, 10, 7, 6, 0)
+    const { input, transport, spawnSession, recordMissed } = back({ schedule: once, enabledAt: T - 4 * 60 * MIN, generation: 3 })
+    const reserve = vi.fn()
+      .mockResolvedValueOnce({ acquired: false as const, reason: 'workspace-busy' as const, sessions: ['other'] })
+      .mockResolvedValue({ acquired: true as const, finish: vi.fn(async () => undefined) })
+    Object.assign(input, { reserveLegacyDispatch: reserve })
+
+    await runServerAutomationTick(input)
+    expect(transport.claim).not.toHaveBeenCalled()
+
+    input.now = T + 5 * MIN
+    await runServerAutomationTick(input)
+    expect(recordMissed).not.toHaveBeenCalled()
+    expect(transport.claim).toHaveBeenCalledWith({ automationId: 'automation-1', generation: 3, scheduledFor: slot, catchUp: true })
+    expect(spawnSession).toHaveBeenCalledTimes(1)
+  })
+
+  it('moves on without a second try when another run still holds the automation', async () => {
+    const { input, store, transport, spawnSession } = back({ nextRunAt: T - 185 * MIN, claim: { ok: false, error: 'active-run' } })
+
+    await runServerAutomationTick(input)
+    await runServerAutomationTick(input)
+
+    expect(transport.claim).toHaveBeenCalledTimes(1)
+    expect(spawnSession).not.toHaveBeenCalled()
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T + 15 * MIN)
+  })
+
+  it('lets a slot still inside the claim window be the one run and collapses the gap before it', async () => {
+    const daily = { kind: 'daily-zoned' as const, hour: 9, minute: 0, timeZone: 'UTC' }
+    const { input, transport, recordMissed } = back({ nextRunAt: T - 24 * 60 * MIN, schedule: daily })
+    input.now = T + 30_000
+
+    await runServerAutomationTick(input)
+
+    expect(recordMissed).toHaveBeenCalledWith(expect.objectContaining({ firstMissedAt: T - 24 * 60 * MIN, missedCount: 1, failureCode: 'MISSED_COLLAPSED' }))
+    expect(transport.claim).toHaveBeenCalledTimes(1)
+    expect(transport.claim).toHaveBeenCalledWith({ automationId: 'automation-1', generation: 2, scheduledFor: T })
+  })
+
+  it('runs a one-time schedule late once when the PC was off right after saving it, then never again', async () => {
+    // Saved at 05:00 for 06:00; the daemon first sees this generation at 09:00.
+    const once = { kind: 'once-zoned' as const, date: '2026-11-07', hour: 6, minute: 0, timeZone: 'UTC' }
+    const slot = Date.UTC(2026, 10, 7, 6, 0)
+    const { input, store, transport, recordMissed, spawnSession } = back({ schedule: once, enabledAt: T - 4 * 60 * MIN, generation: 3 })
+
+    await runServerAutomationTick(input)
+
+    expect(recordMissed).not.toHaveBeenCalled()
+    expect(transport.claim).toHaveBeenCalledWith({ automationId: 'automation-1', generation: 3, scheduledFor: slot, catchUp: true })
+    expect(spawnSession).toHaveBeenCalledTimes(1)
+    expect(store.state().schedules[0]).toMatchObject({ generation: 3, nextRunAt: NEVER_RUN_AT, spentOnceAt: slot })
+
+    // An edit or resume (new generation) after it ran does not bring the spent slot back.
+    const base = input.cache.read
+    input.cache = { read: () => ({ ...base(), automations: base().automations.map((row) => ({ ...row, generation: 4 })) }) }
+    await runServerAutomationTick(input)
+    expect(transport.claim).toHaveBeenCalledTimes(1)
+    expect(store.state().schedules[0]).toMatchObject({ generation: 4, nextRunAt: NEVER_RUN_AT })
+  })
+
+  it('leaves a one-time schedule without the opt-in exactly as before', async () => {
+    const once = { kind: 'once-zoned' as const, date: '2026-11-07', hour: 6, minute: 0, timeZone: 'UTC' }
+    const { input, store, transport } = back({ schedule: once, enabledAt: T - 4 * 60 * MIN, generation: 3, policy: null })
+
+    await runServerAutomationTick(input)
+
+    expect(transport.claim).not.toHaveBeenCalled()
+    expect(store.state().schedules[0]).toMatchObject({ generation: 3, nextRunAt: NEVER_RUN_AT })
+  })
+})
