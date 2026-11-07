@@ -15,6 +15,7 @@ import {
   type AutomationSchedule,
 } from './automationDomain'
 import type { EncryptedServerAutomation, ServerAutomationCacheState, ServerAutomationPayload } from './serverAutomationCache'
+import { planMissedRuns } from './serverAutomationMissedRuns'
 import type {
   GithubAutomationWorktreeState,
   GithubIssueProgressMarkerState,
@@ -86,6 +87,14 @@ export interface ServerAutomationTransport {
   start(input: { runId: string; claimToken: string }): Promise<TransportResult>
   heartbeat(input: { runId: string; claimToken: string }): Promise<TransportResult>
   report(input: PendingAutomationReport): Promise<TransportResult>
+  /** specs/scheduled-missed-run-policy R4·R5 — 놓친 회차 공백 하나를 서버 이력의 한 행으로 기록한다. */
+  recordMissed?(input: {
+    automationId: string
+    generation: number
+    firstMissedAt: number
+    missedCount: number
+    failureCode: 'MISSED_OFFLINE'
+  }): Promise<TransportResult>
 }
 
 export interface ServerAutomationExecutorInput {
@@ -722,11 +731,122 @@ function advanceSchedule(
   input.runtimeStore.write({
     ...state,
     schedules: state.schedules.map((schedule) => schedule.automationId === automationId ? {
-      ...schedule,
+      ...withoutDeferredRunRequest(schedule),
       nextRunAt: nextScheduledAt(payload.schedule, now),
       ...(lastSessionId !== undefined ? { lastSessionId } : {}),
     } : schedule),
   })
+}
+
+/** 저장을 확인받지 못한 놓침 기록의 재시도 상한. 넘으면 기록 없이 현행 경로로 넘어간다(같은 자동화의 이후 회차 보호). */
+const MAX_UNCONFIRMED_MISSED_RECORDS = 5
+/** 한 틱에서 이미 실행된 첫 회차(already-claimed)를 건너뛰며 다시 보고하는 횟수 상한. */
+const MAX_CLAIMED_SLOTS_PER_TICK = 3
+/** 공백별 미확인 횟수. 런타임 저장소(데몬당 하나)마다 따로 둬 프로세스 수명 동안만 센다. */
+const unconfirmedMissedRecordsByStore = new WeakMap<object, Map<string, number>>()
+function unconfirmedMissedRecords(input: ServerAutomationExecutorInput): Map<string, number> {
+  let attempts = unconfirmedMissedRecordsByStore.get(input.runtimeStore)
+  if (!attempts) unconfirmedMissedRecordsByStore.set(input.runtimeStore, attempts = new Map())
+  return attempts
+}
+
+/** 놓침 기록이 정한 다음 회차로 일정을 옮긴다. 미룬 즉시 실행 표시는 그 요청이 지나갔으므로 지운다. */
+function writeScheduleNextRunAt(input: ServerAutomationExecutorInput, automationId: string, nextRunAt: number): void {
+  const state = input.runtimeStore.read()
+  input.runtimeStore.write({
+    ...state,
+    schedules: state.schedules.map((item) => item.automationId === automationId
+      ? { ...withoutDeferredRunRequest(item), nextRunAt }
+      : item),
+  })
+}
+
+/** 일정이 다음 회차로 넘어가면 미룬 즉시 실행 요청은 지나간 것이다. */
+function withoutDeferredRunRequest(schedule: ServerAutomationScheduleState): ServerAutomationScheduleState {
+  const { deferredRunRequestAt: _passed, ...rest } = schedule
+  return rest
+}
+
+/**
+ * specs/scheduled-missed-run-policy R4·R5 — claim 창을 넘겨 지난 회차를 실행 없이 넘기기 전에
+ * 그 공백을 서버에 한 행으로 기록한다. 기록이 확인되기 전에는 일정을 넘기지 않는다.
+ * - 'claim': 놓친 회차가 없거나 서버가 기록을 거절·모름 → 기존 claim 경로(지난 회차면 claim-denied 로 넘어간다).
+ *   기록 뒤 claim 창 안의 회차가 남았으면 `schedule.nextRunAt` 이 그 회차로 바뀌어 이어서 claim 한다.
+ * - 'retry': 저장을 확인하지 못함(ack 없음·서버 저장 실패) → 일정을 그대로 두고 다음 틱에 같은 공백을 다시 보고한다
+ *   (서버가 첫 회차로 흡수). 첫 회차가 실제로 실행돼 있었으면(already-claimed) 그다음 회차부터 다시 센다.
+ * - 'recorded': 기록됐고 일정을 다음 회차로 넘겼다.
+ */
+async function recordMissedRuns(
+  input: ServerAutomationExecutorInput,
+  serverRecordsMissedRuns: boolean,
+  automation: EncryptedServerAutomation,
+  payload: ServerAutomationPayload,
+  schedule: ServerAutomationScheduleState,
+  now: number,
+  claimedSlotsLeft = MAX_CLAIMED_SLOTS_PER_TICK,
+): Promise<'claim' | 'retry' | 'recorded'> {
+  if (!serverRecordsMissedRuns || !input.transport.recordMissed) return 'claim'
+  const plan = planMissedRuns({
+    schedule: payload.schedule,
+    nextRunAt: schedule.nextRunAt,
+    now,
+    enabledAt: automation.enabledAt,
+    paused: automation.paused,
+    runRequestedAt: automation.runRequestedAt,
+    ...(schedule.deferredRunRequestAt !== undefined ? { deferredRunRequestAt: schedule.deferredRunRequestAt } : {}),
+    githubTrigger: Boolean(payload.githubTrigger),
+  })
+  if (!plan) return 'claim'
+  const recorded = await input.transport.recordMissed({
+    automationId: automation.automationId,
+    generation: automation.generation,
+    firstMissedAt: plan.firstMissedAt,
+    missedCount: plan.missedCount,
+    failureCode: 'MISSED_OFFLINE',
+  })
+  const attemptKey = `${automation.automationId}:${automation.generation}:${plan.firstMissedAt}`
+  const attempts = unconfirmedMissedRecords(input)
+  if (!recorded.ok) {
+    if (recorded.error === 'ack-timeout' || recorded.error === 'record-failed') {
+      const failed = (attempts.get(attemptKey) ?? 0) + 1
+      if (failed < MAX_UNCONFIRMED_MISSED_RECORDS) {
+        attempts.set(attemptKey, failed)
+        input.logDebug?.(`[server-automation] ${automation.automationId} missed-run record not stored (${recorded.error}); keeping the schedule for the next tick`)
+        return 'retry'
+      }
+      // Never stored after several tries: let later slots run rather than hold the automation forever.
+      attempts.delete(attemptKey)
+      input.logDebug?.(`[server-automation] ${automation.automationId} missed-run record not stored after ${failed} tries; skipping without a record`)
+      return 'claim'
+    }
+    attempts.delete(attemptKey)
+    if (recorded.error === 'already-claimed') {
+      // The first slot did run (its claim reached the server, the answer did not): report the rest from the next slot,
+      // in this tick, so a next slot still inside the claim window is claimed instead of aging into a miss.
+      markOnceOccurrenceSpent(input, automation.automationId, payload, plan.firstMissedAt)
+      const next = payload.schedule.kind === 'interval'
+        ? plan.firstMissedAt + payload.schedule.minutes * 60_000
+        : nextScheduledAt(payload.schedule, plan.firstMissedAt)
+      writeScheduleNextRunAt(input, automation.automationId, next)
+      schedule.nextRunAt = next
+      if (next > now) return 'recorded'
+      return claimedSlotsLeft > 1
+        ? recordMissedRuns(input, serverRecordsMissedRuns, automation, payload, schedule, now, claimedSlotsLeft - 1)
+        : 'retry'
+    }
+    input.logDebug?.(`[server-automation] ${automation.automationId} missed-run record refused (${recorded.error}); skipping without a record`)
+    return 'claim'
+  }
+  attempts.delete(attemptKey)
+  const resumeAt = plan.resumeAt ?? NEVER_RUN_AT
+  writeScheduleNextRunAt(input, automation.automationId, resumeAt)
+  input.logDebug?.(
+    `[server-automation] ${automation.automationId} recorded ${plan.capped ? `${plan.missedCount}+` : plan.missedCount}`
+    + ` missed run(s) from ${new Date(plan.firstMissedAt).toISOString()}`,
+  )
+  if (resumeAt > now) return 'recorded'
+  schedule.nextRunAt = resumeAt
+  return 'claim'
 }
 
 function makeGithubTriggerStatePersister(
@@ -769,12 +889,13 @@ function scheduleNextTick(
   automationId: string,
   now: number,
   sequence = 1,
+  deferredRunRequestAt?: number,
 ): void {
   const state = input.runtimeStore.read()
   input.runtimeStore.write({
     ...state,
     schedules: state.schedules.map((item) => item.automationId === automationId
-      ? { ...item, nextRunAt: now + sequence }
+      ? { ...item, nextRunAt: now + sequence, ...(deferredRunRequestAt !== undefined ? { deferredRunRequestAt } : {}) }
       : item),
   })
 }
@@ -2052,7 +2173,8 @@ export async function runServerAutomationTick(
       && schedule.lastSessionId
       && input.isSessionRunning(schedule.lastSessionId)) {
       // 보류한 재시도는 그대로 두고 다음 틱에 다시 본다 — 정규 시각을 당기면 재시도가 정규 실행에 밀려 버려진다.
-      if (!retryDue) scheduleNextTick(input, automation.automationId, now)
+      // 미루는 것이 즉시 실행 요청이면 그 시각을 남긴다 — 미룬 시각은 요청과 달라져 놓침으로 잘못 셀 수 있다.
+      if (!retryDue) scheduleNextTick(input, automation.automationId, now, 1, automation.runRequestedAt != null && schedule.nextRunAt === automation.runRequestedAt ? automation.runRequestedAt : undefined)
       continue
     }
     const dispatchesGithubWork = payload.githubTrigger
@@ -2084,6 +2206,8 @@ export async function runServerAutomationTick(
       ({ runId, claimToken } = retry.report)
       leaseExpiresAt = retry.leaseExpiresAt
     } else {
+      const missed = await recordMissedRuns(input, cache.missedRunRecord === true, automation, payload, schedule, now)
+      if (missed !== 'claim') continue
       const claim = await input.transport.claim({
         automationId: automation.automationId,
         generation: automation.generation,

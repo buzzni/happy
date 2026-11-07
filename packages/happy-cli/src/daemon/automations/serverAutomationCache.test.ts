@@ -89,6 +89,22 @@ describe('serverAutomationCache', () => {
     })
   })
 
+  it('remembers whether the last sync came from a server that records missed runs', () => {
+    // scheduled-missed-run-policy: an old server never acks automation-missed-record, so the
+    // daemon only waits on that event after the server said it understands it.
+    const cache = createServerAutomationCache({ filePath: file })
+    expect(cache.read().missedRunRecord).toBe(false)
+
+    cache.applySync({ serverTime: 1_000, nextSeq: '1', changes: [], missedRunRecord: 1 })
+    expect(cache.read().missedRunRecord).toBe(true)
+    cache.markAcknowledged([])
+    expect(createServerAutomationCache({ filePath: file }).read().missedRunRecord).toBe(true)
+
+    // A rolled-back server stops advertising it on the next sync.
+    cache.applySync({ serverTime: 2_000, nextSeq: '1', changes: [] })
+    expect(cache.read().missedRunRecord).toBe(false)
+  })
+
   it('durably keeps the sealed deletion target until its session stop is acknowledged', () => {
     const keyPair = tweetnacl.box.keyPair(); const encrypted = bundle({ name: 'task', prompt: 'work', directory: '/chat', schedule: { kind: 'interval', minutes: 15 }, conversation: { sessionId: 's' } }, keyPair.publicKey)
     const cache = createServerAutomationCache({ filePath: file })

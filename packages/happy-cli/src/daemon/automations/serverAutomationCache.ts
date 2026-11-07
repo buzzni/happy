@@ -40,6 +40,11 @@ export interface ServerAutomationCacheState {
   automations: EncryptedServerAutomation[]
   pendingAcknowledgements: Array<{ automationId: string; revision: number }>
   pendingCancellations?: EncryptedServerAutomation[]
+  /**
+   * 서버가 `automation-missed-record` 를 받는다고 마지막 sync 에서 알렸다(scheduled-missed-run-policy).
+   * 구 서버는 그 이벤트에 ack 하지 않으므로, 이게 없으면 놓친 회차를 기록하려고 기다리지 않는다.
+   */
+  missedRunRecord?: boolean
 }
 
 export type ServerAutomationPayload = AutomationPayload
@@ -119,7 +124,7 @@ function readState(filePath: string): ServerAutomationCacheState {
     raw = readFileSync(filePath, 'utf8')
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      return { cursor: 0n, serverTime: 0, syncedAt: 0, automations: [], pendingAcknowledgements: [] }
+      return { cursor: 0n, serverTime: 0, syncedAt: 0, automations: [], pendingAcknowledgements: [], missedRunRecord: false }
     }
     throw error
   }
@@ -147,6 +152,7 @@ function readState(filePath: string): ServerAutomationCacheState {
         if (!Array.isArray(disk.pendingCancellations)) fail()
         return supportedEntries(disk.pendingCancellations)
       })(),
+      missedRunRecord: disk.missedRunRecord === true,
     }
     if (unsupportedIds.size || disk.reservationSync === true) {
       const backup = `${filePath}.unsupported-v5.${createHash('sha256').update(raw).digest('hex').slice(0, 16)}.json`
@@ -185,6 +191,7 @@ function persist(filePath: string, state: ServerAutomationCacheState): void {
     automations: state.automations,
     pendingAcknowledgements: state.pendingAcknowledgements,
     pendingCancellations: state.pendingCancellations ?? [],
+    missedRunRecord: state.missedRunRecord === true,
   }), { encoding: 'utf8', mode: 0o600 })
   renameSync(tmp, filePath)
   chmodSync(filePath, 0o600)
@@ -236,6 +243,7 @@ export function createServerAutomationCache(options: { filePath: string; now?: (
         automations: [...byId.values()],
         pendingAcknowledgements,
         pendingCancellations: [...cancellations.values()],
+        missedRunRecord: response.missedRunRecord === 1,
       })
       return {
         nextSeq,
