@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { type Fastify } from "../types";
 import { db } from "@/storage/db";
-import { dispatchSessionEventPush, type PushOutcome } from "@/app/push/pushDispatch";
+import { countPushOutcome, dispatchSessionEventPush, type PushOutcome } from "@/app/push/pushDispatch";
 import { buildSessionEventEphemeral, eventRouter } from "@/app/events/eventRouter";
 import { persistTurnReadySessionEvent } from "@/app/events/persistSessionEvent";
 import { log } from "@/utils/log";
@@ -144,6 +144,8 @@ export function pushRoutes(app: Fastify) {
                 select: { id: true }
             });
             if (silentAutomationRun) {
+                log({ module: 'push' }, `Suppressed session-event push for user ${userId} session ${sessionId}: silent automation run`);
+                countPushOutcome(SILENT_AUTOMATION_OUTCOME);
                 return reply.send({ success: true, push: SILENT_AUTOMATION_OUTCOME });
             }
             // 기록 실패가 기존 알림 경로를 막지 않게 한다 — web-ui 완료 알림만 늦어진다.

@@ -39,6 +39,12 @@ import { error, log } from "@/utils/log";
  * - sent / partial / failed: every / some / no token got an ok ticket;
  *   failed also covers an exception anywhere in the dispatch
  */
+/**
+ * Budget for one dispatch, from the presence check to the last Expo batch.
+ * The push-event route awaits it, so it stays inside the CLI's 15s timeout.
+ */
+const DISPATCH_BUDGET_MS = 10_000;
+
 export type PushOutcome = {
     status: 'sent' | 'partial' | 'suppressed' | 'no_tokens' | 'failed';
     tokens: number;
@@ -54,6 +60,7 @@ async function fetchTokensAndSend(params: {
     body: string;
     data: Record<string, unknown>;
     channelId: string;
+    deadline: number;
 }): Promise<PushOutcome> {
     // All push tokens are mobile — web/CLI never register Expo tokens.
     const tokens = await db.accountPushToken.findMany({
@@ -73,7 +80,8 @@ async function fetchTokensAndSend(params: {
             data: params.data,
             sound: 'default' as const,
             channelId: params.channelId
-        }))
+        })),
+        { timeoutMs: Math.max(0, params.deadline - Date.now()) }
     );
 
     let okCount = 0;
@@ -86,8 +94,11 @@ async function fetchTokensAndSend(params: {
         }
         errors.push(ticket.details?.error || ticket.message || 'unknown');
         if (ticket.details?.error === 'DeviceNotRegistered') {
-            void db.accountPushToken.deleteMany({
+            // Prisma queries are lazy: without .then/.catch this never runs.
+            db.accountPushToken.deleteMany({
                 where: { id: tokens[i].id }
+            }).catch(deleteError => {
+                error({ module: 'push' }, `Failed to remove unregistered push token ${tokens[i].id}: ${deleteError}`);
             });
         }
     }
@@ -102,7 +113,7 @@ async function fetchTokensAndSend(params: {
     // Distinct causes only — one Expo outage would otherwise repeat per token.
     const reason = errors.length > 0 ? [...new Set(errors)].join(', ') : 'missing ticket';
     const status = okCount === 0 ? 'failed' : 'partial';
-    error({ module: 'push' }, `Push ${status} for user ${params.userId} session ${params.sessionId}: ok=${okCount} failed=${failedCount} errors=${JSON.stringify(errors)}`);
+    error({ module: 'push' }, `Push ${status} for user ${params.userId} session ${params.sessionId}: ok=${okCount} failed=${failedCount} reason=${reason}`);
     return { status, tokens: tokens.length, sent: okCount, failed: failedCount, reason };
 }
 
@@ -116,12 +127,18 @@ type SessionEventPush = {
 
 export async function dispatchSessionEventPush(params: SessionEventPush): Promise<PushOutcome> {
     const outcome = await dispatch(params);
-    pushOutcomesCounter.inc({ status: outcome.status });
+    countPushOutcome(outcome);
     return outcome;
+}
+
+/** Counts an outcome decided outside dispatch (e.g. a SILENT automation run). */
+export function countPushOutcome(outcome: PushOutcome): void {
+    pushOutcomesCounter.inc({ status: outcome.status });
 }
 
 async function dispatch(params: SessionEventPush): Promise<PushOutcome> {
     const { userId, sessionId, title, body, data } = params;
+    const deadline = Date.now() + DISPATCH_BUDGET_MS;
 
     try {
         try {
@@ -139,11 +156,14 @@ async function dispatch(params: SessionEventPush): Promise<PushOutcome> {
             title,
             body,
             data: { sessionId, ...(data ?? {}) },
-            channelId: 'messages'
+            channelId: 'messages',
+            deadline
         });
     } catch (dispatchError) {
         error({ module: 'push' }, `Session-event push dispatch failed: ${dispatchError}`);
-        const reason = dispatchError instanceof Error ? dispatchError.message : String(dispatchError);
+        // The error class only: messages (e.g. Prisma's) can carry DB hosts and
+        // query details, and this reason goes back in the HTTP response.
+        const reason = `exception:${dispatchError instanceof Error ? dispatchError.name : 'unknown'}`;
         return { status: 'failed', tokens: 0, sent: 0, failed: 0, reason };
     }
 }

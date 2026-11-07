@@ -41,8 +41,14 @@
 
 - 핸들러는 dispatch 결과를 **기다려** 응답한다. CLI(`happy-cli/src/api/pushNotifications.ts`)는 이 요청을
   fire-and-forget(`void (async () => …)`, 15초 타임아웃)으로 보내므로 지연이 턴을 막지 않는다.
-- 응답 지연에 상한을 두려고 `pushSend.ts`의 Expo 전송 전체에 8초 공용 마감(`AbortSignal.timeout`)을 둔다.
-  마감을 넘긴 배치는 `Network error`/timeout 실패로 집계된다.
+- 응답 지연에 상한을 두려고 dispatch 시작부터 10초 예산을 재고, Expo 전송(`pushSend.ts`, 기본 8초 공용 마감
+  `AbortSignal.timeout`)에는 예산의 남은 시간만 준다. 마감을 넘긴 배치는 `Timeout` 실패로 집계된다.
+  presence 확인·토큰 조회 자체가 멈추는 경우는 상한 밖이다(기존과 같음, CLI는 15초 뒤 포기).
+- 예외의 `reason`은 오류 클래스 이름만 담는다(`exception:<name>`). Prisma 오류 메시지에는 DB 호스트·쿼리
+  세부가 들어갈 수 있고 이 값은 HTTP 응답으로 나가므로, 원문은 서버 로그에만 남긴다.
+- SILENT 자동화 억제도 info 로그와 카운터에 남긴다(presence 억제와 같은 관측 기준).
+- `DeviceNotRegistered` 토큰 삭제가 실제로 실행되게 고친다. Prisma 쿼리는 지연 실행이라 기존 `void deleteMany()`는
+  한 번도 실행되지 않았다(연결 불가 DB로 직접 실행해 확인). R3-b "정리 로직 유지"의 전제다.
 - SILENT 자동화 완료로 push를 보내지 않는 경로도 `push`를 채운다: `{ status: 'suppressed', reason: 'silent-automation', tokens: 0, sent: 0, failed: 0 }`.
 
 ## 수락 기준

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
     findTokens: vi.fn(),
@@ -25,6 +25,15 @@ vi.mock('@/app/monitoring/metrics2', () => ({ pushOutcomesCounter: { inc: mocks.
 
 import { dispatchSessionEventPush } from './pushDispatch';
 
+/** Mimics a PrismaPromise: the query only runs once something subscribes. */
+function lazyQuery() {
+    const query = { executed: false, then: (resolve: (value: unknown) => void, reject: (reason: unknown) => void) => {
+        query.executed = true;
+        return Promise.resolve({ count: 1 }).then(resolve, reject);
+    }, catch: (reject: (reason: unknown) => void) => query.then(() => undefined, reject) };
+    return query;
+}
+
 function dispatch() {
     return dispatchSessionEventPush({
         userId: 'account-1',
@@ -44,7 +53,11 @@ describe('dispatchSessionEventPush outcome', () => {
         vi.clearAllMocks();
         mocks.isUserActive.mockResolvedValue(false);
         mocks.findTokens.mockResolvedValue(twoTokens);
-        mocks.deleteTokens.mockResolvedValue({ count: 1 });
+        mocks.deleteTokens.mockImplementation(lazyQuery);
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
     });
 
     it('reports suppressed when a UI client is active, without touching tokens', async () => {
@@ -87,6 +100,7 @@ describe('dispatchSessionEventPush outcome', () => {
 
         expect(outcome).toEqual({ status: 'partial', tokens: 2, sent: 1, failed: 1, reason: 'DeviceNotRegistered' });
         expect(mocks.deleteTokens).toHaveBeenCalledWith({ where: { id: 'token-row-2' } });
+        expect(mocks.deleteTokens.mock.results[0].value.executed).toBe(true);
         expect(mocks.error).toHaveBeenCalledOnce();
         expect(String(mocks.error.mock.calls[0][1])).toContain('DeviceNotRegistered');
     });
@@ -108,16 +122,33 @@ describe('dispatchSessionEventPush outcome', () => {
 
         const outcome = await dispatch();
 
-        expect(outcome).toMatchObject({ status: 'partial', tokens: 2, sent: 1, failed: 1 });
+        expect(outcome).toMatchObject({ status: 'partial', tokens: 2, sent: 1, failed: 1, reason: 'missing ticket' });
+        expect(String(mocks.error.mock.calls[0][1])).toContain('missing ticket');
     });
 
-    it('reports failed with the reason when dispatch throws', async () => {
-        mocks.findTokens.mockRejectedValue(new Error('db down'));
+    it('reports failed with the error class only when dispatch throws, keeping the message in the log', async () => {
+        class PrismaClientInitializationError extends Error { name = 'PrismaClientInitializationError'; }
+        mocks.findTokens.mockRejectedValue(new PrismaClientInitializationError("Can't reach database server at db.internal:5432"));
 
         const outcome = await dispatch();
 
-        expect(outcome).toEqual({ status: 'failed', tokens: 0, sent: 0, failed: 0, reason: 'db down' });
+        expect(outcome).toEqual({ status: 'failed', tokens: 0, sent: 0, failed: 0, reason: 'exception:PrismaClientInitializationError' });
         expect(mocks.error).toHaveBeenCalledOnce();
+        expect(String(mocks.error.mock.calls[0][1])).toContain('db.internal:5432');
+    });
+
+    it('gives the Expo send only what is left of the dispatch budget', async () => {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(1_000_000);
+        mocks.findTokens.mockImplementation(async () => {
+            vi.setSystemTime(1_000_000 + 9_500);
+            return twoTokens;
+        });
+        mocks.sendPushNotifications.mockResolvedValue([{ status: 'ok' }, { status: 'ok' }]);
+
+        await dispatch();
+
+        expect(mocks.sendPushNotifications.mock.calls[0][1]).toEqual({ timeoutMs: 500 });
     });
 
     it('still sends when the presence check itself fails', async () => {

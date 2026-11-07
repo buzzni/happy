@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
     findSession: vi.fn(),
     findAutomationRun: vi.fn(),
     dispatchSessionEventPush: vi.fn(async () => ({ status: 'sent', tokens: 1, sent: 1, failed: 0 })),
+    countPushOutcome: vi.fn(),
     emitEphemeral: vi.fn(),
     persistTurnReadySessionEvent: vi.fn(),
 }));
@@ -22,7 +23,10 @@ vi.mock('@/storage/db', () => ({
         },
     },
 }));
-vi.mock('@/app/push/pushDispatch', () => ({ dispatchSessionEventPush: mocks.dispatchSessionEventPush }));
+vi.mock('@/app/push/pushDispatch', () => ({
+    dispatchSessionEventPush: mocks.dispatchSessionEventPush,
+    countPushOutcome: mocks.countPushOutcome,
+}));
 vi.mock('@/app/events/persistSessionEvent', () => ({ persistTurnReadySessionEvent: mocks.persistTurnReadySessionEvent }));
 vi.mock('@/app/events/eventRouter', () => ({
     buildSessionEventEphemeral: vi.fn(() => ({ type: 'session-event' })),
@@ -184,5 +188,6 @@ describe('pushRoutes push outcome', () => {
             success: true,
             push: { status: 'suppressed', tokens: 0, sent: 0, failed: 0, reason: 'silent-automation' },
         });
+        expect(mocks.countPushOutcome).toHaveBeenCalledWith(expect.objectContaining({ status: 'suppressed', reason: 'silent-automation' }));
     });
 });
