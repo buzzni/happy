@@ -5210,6 +5210,54 @@ describe('놓친 예약 회차 기록', () => {
     expect(github.recordMissed).not.toHaveBeenCalled()
   })
 
+  it('retries when the server could not store the gap instead of moving on without a record', async () => {
+    const { input, store, transport, recordMissed } = stale({ nextRunAt: T - 185 * MIN, record: { ok: false, error: 'record-failed' } })
+
+    await runServerAutomationTick(input)
+
+    expect(recordMissed).toHaveBeenCalledTimes(1)
+    expect(transport.claim).not.toHaveBeenCalled()
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T - 185 * MIN)
+  })
+
+  it('reports the rest of the gap from the next slot when the first slot had actually run', async () => {
+    // Its claim reached the server before the PC went down, but the daemon never heard back.
+    const { input, store, transport, recordMissed } = stale({ nextRunAt: T - 185 * MIN, record: { ok: false, error: 'already-claimed' } })
+
+    await runServerAutomationTick(input)
+    expect(transport.claim).not.toHaveBeenCalled()
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T - 170 * MIN)
+
+    recordMissed.mockResolvedValue({ ok: true, value: { runId: 'missed-2', idempotent: false } })
+    await runServerAutomationTick(input)
+    expect(recordMissed).toHaveBeenLastCalledWith(expect.objectContaining({ firstMissedAt: T - 170 * MIN, missedCount: 12 }))
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T + 10 * MIN)
+  })
+
+  it('does not count a run-now request postponed behind a running session and then slept through', async () => {
+    const requestedAt = T - 3 * 60 * MIN
+    const fixture = stale({ nextRunAt: requestedAt, claim: { ok: false, error: 'claim-denied' } })
+    const base = fixture.input.cache.read
+    fixture.input.cache = { read: () => {
+      const state = base()
+      return { ...state, automations: state.automations.map((row) => ({ ...row, runRequestedAt: requestedAt })) }
+    } }
+    fixture.store.write({ ...fixture.store.read(), schedules: [{ automationId: 'automation-1', generation: 2, nextRunAt: requestedAt, lastSessionId: 'session-busy', runRequestRevision: 2 }] })
+    // The previous run is still going when the request comes due: the request waits a tick.
+    fixture.input.now = requestedAt + 1_000
+    fixture.input.isSessionRunning = vi.fn(() => true)
+    await runServerAutomationTick(fixture.input)
+    expect(fixture.store.state().schedules[0]).toMatchObject({ nextRunAt: requestedAt + 1_001, deferredRunRequestAt: requestedAt })
+
+    // The PC sleeps; on waking the session is over and the postponed time is far behind.
+    fixture.input.now = T
+    fixture.input.isSessionRunning = vi.fn(() => false)
+    await runServerAutomationTick(fixture.input)
+    expect(fixture.recordMissed).not.toHaveBeenCalled()
+    expect(fixture.transport.claim).toHaveBeenCalledWith(expect.objectContaining({ scheduledFor: requestedAt + 1_001 }))
+    expect(fixture.store.state().schedules[0]!).not.toHaveProperty('deferredRunRequestAt')
+  })
+
   it('keeps deferring behind a still-running previous session instead of recording', async () => {
     const { input, store, recordMissed } = stale({ nextRunAt: T - 185 * MIN })
     store.write({ ...store.read(), schedules: [{ automationId: 'automation-1', generation: 2, nextRunAt: T - 185 * MIN, lastSessionId: 'session-busy' }] })

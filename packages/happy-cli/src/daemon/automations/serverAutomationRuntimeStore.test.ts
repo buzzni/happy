@@ -32,6 +32,16 @@ describe('serverAutomationRuntimeStore', () => {
     expect(createServerAutomationRuntimeStore({ filePath: file }).read().schedules[0]).toMatchObject({ spentOnceAt: 500 })
   })
 
+  it('keeps a postponed run-now request across a reload', () => {
+    // scheduled-missed-run-policy R7: without it a daemon restart would count the postponed request as a missed run.
+    const store = createServerAutomationRuntimeStore({ filePath: file })
+    store.write({
+      schedules: [{ automationId: 'automation-1', generation: 2, nextRunAt: 1_001, lastSessionId: 'session-1', runRequestRevision: 2, deferredRunRequestAt: 900 }],
+      pendingReports: [],
+    })
+    expect(createServerAutomationRuntimeStore({ filePath: file }).read().schedules[0]).toMatchObject({ deferredRunRequestAt: 900 })
+  })
+
   it('atomically persists schedule state and pending idempotent reports as owner-only', () => {
     const store = createServerAutomationRuntimeStore({ filePath: file })
     store.write({

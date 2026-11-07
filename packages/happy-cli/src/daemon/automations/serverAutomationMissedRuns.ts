@@ -21,6 +21,8 @@ export interface MissedRunPlanInput {
   enabledAt: number
   paused: boolean
   runRequestedAt: number | null | undefined
+  /** 직전 회차 세션 때문에 미룬 즉시 실행 요청 시각 — nextRunAt 은 미룬 시각이라 요청과 같지 않다. */
+  deferredRunRequestAt?: number
   githubTrigger: boolean
 }
 
@@ -44,7 +46,8 @@ export function planMissedRuns(input: MissedRunPlanInput): MissedRunPlan | null 
   const { schedule, nextRunAt, now } = input
   const cutoff = now - MISSED_RUN_CLAIM_WINDOW_MS
   if (input.paused || input.githubTrigger || schedule.kind === 'github') return null
-  if (input.runRequestedAt != null && input.runRequestedAt === nextRunAt) return null
+  if (input.runRequestedAt != null
+    && (input.runRequestedAt === nextRunAt || input.runRequestedAt === input.deferredRunRequestAt)) return null
   if (!Number.isSafeInteger(nextRunAt) || nextRunAt >= cutoff || nextRunAt < input.enabledAt) return null
 
   if (schedule.kind === 'interval') {

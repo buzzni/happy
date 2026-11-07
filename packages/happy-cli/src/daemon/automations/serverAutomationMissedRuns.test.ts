@@ -95,6 +95,8 @@ describe('planMissedRuns', () => {
     expect(plan({ kind: 'github', minutes: 15 }, first, now)).toBeNull()
     expect(plan(schedule, first, now, { enabledAt: first + 1 })).toBeNull()
     expect(plan(schedule, Number.MAX_SAFE_INTEGER, now)).toBeNull()
+    // A run-now request postponed behind a still-running session keeps its identity while it waits.
+    expect(plan(schedule, first, now, { runRequestedAt: first - 30 * MINUTE, deferredRunRequestAt: first - 30 * MINUTE })).toBeNull()
     // A run-now request for another instant does not hide the stale regular slot.
     expect(plan(schedule, first, now, { runRequestedAt: first - HOUR })).toMatchObject({ missedCount: 12 })
   })

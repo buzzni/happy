@@ -731,11 +731,28 @@ function advanceSchedule(
   input.runtimeStore.write({
     ...state,
     schedules: state.schedules.map((schedule) => schedule.automationId === automationId ? {
-      ...schedule,
+      ...withoutDeferredRunRequest(schedule),
       nextRunAt: nextScheduledAt(payload.schedule, now),
       ...(lastSessionId !== undefined ? { lastSessionId } : {}),
     } : schedule),
   })
+}
+
+/** 놓침 기록이 정한 다음 회차로 일정을 옮긴다. 미룬 즉시 실행 표시는 그 요청이 지나갔으므로 지운다. */
+function writeScheduleNextRunAt(input: ServerAutomationExecutorInput, automationId: string, nextRunAt: number): void {
+  const state = input.runtimeStore.read()
+  input.runtimeStore.write({
+    ...state,
+    schedules: state.schedules.map((item) => item.automationId === automationId
+      ? { ...withoutDeferredRunRequest(item), nextRunAt }
+      : item),
+  })
+}
+
+/** 일정이 다음 회차로 넘어가면 미룬 즉시 실행 요청은 지나간 것이다. */
+function withoutDeferredRunRequest(schedule: ServerAutomationScheduleState): ServerAutomationScheduleState {
+  const { deferredRunRequestAt: _passed, ...rest } = schedule
+  return rest
 }
 
 /**
@@ -743,7 +760,8 @@ function advanceSchedule(
  * 그 공백을 서버에 한 행으로 기록한다. 기록이 확인되기 전에는 일정을 넘기지 않는다.
  * - 'claim': 놓친 회차가 없거나 서버가 기록을 거절·모름 → 기존 claim 경로(지난 회차면 claim-denied 로 넘어간다).
  *   기록 뒤 claim 창 안의 회차가 남았으면 `schedule.nextRunAt` 이 그 회차로 바뀌어 이어서 claim 한다.
- * - 'retry': ack 를 받지 못함 → 일정을 그대로 두고 다음 틱에 같은 공백을 다시 보고한다(서버가 첫 회차로 흡수).
+ * - 'retry': 저장을 확인하지 못함(ack 없음·서버 저장 실패) → 일정을 그대로 두고 다음 틱에 같은 공백을 다시 보고한다
+ *   (서버가 첫 회차로 흡수). 첫 회차가 실제로 실행돼 있었으면(already-claimed) 그다음 회차부터 다시 센다.
  * - 'recorded': 기록됐고 일정을 다음 회차로 넘겼다.
  */
 async function recordMissedRuns(
@@ -762,6 +780,7 @@ async function recordMissedRuns(
     enabledAt: automation.enabledAt,
     paused: automation.paused,
     runRequestedAt: automation.runRequestedAt,
+    ...(schedule.deferredRunRequestAt !== undefined ? { deferredRunRequestAt: schedule.deferredRunRequestAt } : {}),
     githubTrigger: Boolean(payload.githubTrigger),
   })
   if (!plan) return 'claim'
@@ -773,21 +792,24 @@ async function recordMissedRuns(
     failureCode: 'MISSED_OFFLINE',
   })
   if (!recorded.ok) {
-    if (recorded.error === 'ack-timeout') {
-      input.logDebug?.(`[server-automation] ${automation.automationId} missed-run record unconfirmed; keeping the schedule for the next tick`)
+    if (recorded.error === 'ack-timeout' || recorded.error === 'record-failed') {
+      input.logDebug?.(`[server-automation] ${automation.automationId} missed-run record not stored (${recorded.error}); keeping the schedule for the next tick`)
+      return 'retry'
+    }
+    if (recorded.error === 'already-claimed') {
+      // The first slot did run (its claim reached the server, the answer did not): report the rest from the next slot.
+      markOnceOccurrenceSpent(input, automation.automationId, payload, plan.firstMissedAt)
+      const next = payload.schedule.kind === 'interval'
+        ? plan.firstMissedAt + payload.schedule.minutes * 60_000
+        : nextScheduledAt(payload.schedule, plan.firstMissedAt)
+      writeScheduleNextRunAt(input, automation.automationId, next)
       return 'retry'
     }
     input.logDebug?.(`[server-automation] ${automation.automationId} missed-run record refused (${recorded.error}); skipping without a record`)
     return 'claim'
   }
   const resumeAt = plan.resumeAt ?? NEVER_RUN_AT
-  const state = input.runtimeStore.read()
-  input.runtimeStore.write({
-    ...state,
-    schedules: state.schedules.map((item) => item.automationId === automation.automationId
-      ? { ...item, nextRunAt: resumeAt }
-      : item),
-  })
+  writeScheduleNextRunAt(input, automation.automationId, resumeAt)
   input.logDebug?.(
     `[server-automation] ${automation.automationId} recorded ${plan.capped ? `${plan.missedCount}+` : plan.missedCount}`
     + ` missed run(s) from ${new Date(plan.firstMissedAt).toISOString()}`,
@@ -837,12 +859,13 @@ function scheduleNextTick(
   automationId: string,
   now: number,
   sequence = 1,
+  deferredRunRequestAt?: number,
 ): void {
   const state = input.runtimeStore.read()
   input.runtimeStore.write({
     ...state,
     schedules: state.schedules.map((item) => item.automationId === automationId
-      ? { ...item, nextRunAt: now + sequence }
+      ? { ...item, nextRunAt: now + sequence, ...(deferredRunRequestAt !== undefined ? { deferredRunRequestAt } : {}) }
       : item),
   })
 }
@@ -2120,7 +2143,8 @@ export async function runServerAutomationTick(
       && schedule.lastSessionId
       && input.isSessionRunning(schedule.lastSessionId)) {
       // 보류한 재시도는 그대로 두고 다음 틱에 다시 본다 — 정규 시각을 당기면 재시도가 정규 실행에 밀려 버려진다.
-      if (!retryDue) scheduleNextTick(input, automation.automationId, now)
+      // 미루는 것이 즉시 실행 요청이면 그 시각을 남긴다 — 미룬 시각은 요청과 달라져 놓침으로 잘못 셀 수 있다.
+      if (!retryDue) scheduleNextTick(input, automation.automationId, now, 1, automation.runRequestedAt != null && schedule.nextRunAt === automation.runRequestedAt ? automation.runRequestedAt : undefined)
       continue
     }
     const dispatchesGithubWork = payload.githubTrigger

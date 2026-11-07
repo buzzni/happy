@@ -23,6 +23,12 @@ export interface ServerAutomationScheduleState {
    * 새 generation 으로 다시 claim 한다. 구 데몬 파서는 이 필드를 버릴 뿐 파일을 거부하지 않는다.
    */
   spentOnceAt?: number
+  /**
+   * 즉시 실행 요청을 직전 회차 세션 때문에 미뤘을 때 그 요청 시각. 미루면 nextRunAt 이 now+1 로 바뀌어 요청과의
+   * 연결이 끊기므로, 그 사이 PC 가 잠들어도 놓친 정규 회차로 세지 않게 남긴다(scheduled-missed-run-policy R7).
+   * 일정이 다음 회차로 넘어가면 지운다. 구 데몬 파서는 이 필드를 버릴 뿐 파일을 거부하지 않는다.
+   */
+  deferredRunRequestAt?: number
 }
 
 export interface GithubIssueProgressMarkerState {
@@ -265,6 +271,7 @@ function parse(raw: string): ServerAutomationRuntimeState {
             : integer(row.runRequestRevision, 1),
         } : {}),
         ...(row.spentOnceAt !== undefined ? { spentOnceAt: integer(row.spentOnceAt) } : {}),
+        ...(row.deferredRunRequestAt !== undefined ? { deferredRunRequestAt: integer(row.deferredRunRequestAt) } : {}),
       }
     })
     const pendingReports = disk.pendingReports.map(parsePendingReport)
