@@ -52,12 +52,23 @@ export const sessionToolCallStartEventSchema = z.object({
 // launch it belongs to — without it a stopped task shows as running forever.
 // Transport metadata, never rendered. Optional — consumers that only read
 // `.call` are unaffected.
+// Saycode specs/chat-tool-result-output R16 — `result` is the text the tool
+// returned (stdout/stderr, search hits, MCP text), ANSI-stripped plain text.
+// Over 16,000 characters it keeps the first 6,000 and last 10,000 and
+// `omitted` counts the characters dropped between them. `isError` mirrors the
+// provider's error flag. Producers leave it out for policy-redacted tools.
+// Optional — absent on frames from older CLIs.
 export const sessionToolCallEndEventSchema = z.object({
   t: z.literal('tool-call-end'),
   call: z.string(),
   images: z.array(z.object({ mediaType: z.string(), data: z.string() })).optional(),
   backgroundTaskId: z.string().optional(),
   browserQuotaKind: z.enum(['spaces', 'tabs', 'windows', 'time', 'journal']).optional(),
+  result: z.object({
+    text: z.string(),
+    isError: z.boolean().optional(),
+    omitted: z.number().optional(),
+  }).optional(),
 });
 
 // chat-tool-output-streaming Phase 3 — daemon-emitted incremental
