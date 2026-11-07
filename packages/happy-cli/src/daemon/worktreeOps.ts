@@ -66,6 +66,9 @@ const MERGE_CONFLICT = /conflict|automatic merge failed/i;
 const NO_REMOTE_BRANCH = /couldn't find remote ref|remote ref does not exist/i;
 const PRIVATE_ENV_EXCLUDES = [':(exclude).env', ':(exclude).env.local', ':(exclude,glob)**/.env', ':(exclude,glob)**/.env.local'];
 const MAX_DIRTY_STATUS_CHARS = 64 * 1024;
+/** Desktop holds the shared lock through a pull or fetch; waiting covers that instead of failing a conversation start. */
+const REPOSITORY_LOCK_WAIT_MS = 60_000;
+const REPOSITORY_LOCK_POLL_MS = 250;
 /** The operations that reach a remote, and so may bring a sealed credential. */
 const REMOTE_OPS: ReadonlySet<WorktreeOp> = new Set(['create', 'publish', 'reconcile', 'prepare-conversation', 'remote-status', 'pull-remote', 'clone', 'sync-remote']);
 
@@ -84,6 +87,8 @@ export type WorktreeOpsDeps = {
     happyHomeDir: string;
     now?: () => number;
     purge?: ProjectPurgeIo;
+    /** How long a write waits for another process's repository lock before refusing. */
+    repositoryLockWaitMs?: number;
 };
 
 export type WorktreeOpAnswer =
@@ -389,6 +394,8 @@ async function resolveWorktreeTarget(guard: PathGuard, path: string, projectId: 
 
 const repositoryQueues = new Map<string, Promise<unknown>>();
 let drainingRepositoryWrites = false;
+/** Module state like the queues above: one handler set per daemon, set by createWorktreeOpsHandlers. */
+let repositoryLockWaitMs = REPOSITORY_LOCK_WAIT_MS;
 
 /** Called before daemon shutdown/handoff releases ownership; never unlock live Git children. */
 export async function drainWorktreeOperations(): Promise<void> {
@@ -400,6 +407,8 @@ export async function drainWorktreeOperations(): Promise<void> {
 async function serialized<T>(path: string, run: () => Promise<T>): Promise<T> {
     if (drainingRepositoryWrites) throw new OpFailure('WORKTREE_OPERATION_IN_PROGRESS', 'The daemon is shutting down. Retry after reconnecting.');
     const key = slashed(path);
+    // Fixed on arrival: writes queued behind one another must not each wait a full window.
+    const giveUpAt = Date.now() + repositoryLockWaitMs;
     const previous = repositoryQueues.get(key) ?? Promise.resolve();
     const next = previous.catch(() => undefined).then(async () => {
         // The process queue cannot exclude Desktop or another daemon. Share their lock after
@@ -409,14 +418,7 @@ async function serialized<T>(path: string, run: () => Promise<T>): Promise<T> {
         if (common.code !== 0) return run();
         const directory = await realpath(resolve(path, common.stdout.trim()));
         const lock = join(directory, 'saycode-desktop-write.lock');
-        try {
-            await mkdir(lock);
-        } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-                throw new OpFailure('WORKTREE_OPERATION_IN_PROGRESS', `Another Git operation is in progress. Retry after it finishes. If its process terminated, verify no Git writer is running before removing the lock: ${lock}`, { lockPath: lock });
-            }
-            throw error;
-        }
+        await acquireRepositoryLock(lock, giveUpAt);
         try { return await run(); }
         finally { await rmdir(lock).catch(() => undefined); }
     });
@@ -425,6 +427,26 @@ async function serialized<T>(path: string, run: () => Promise<T>): Promise<T> {
         return await next;
     } finally {
         if (repositoryQueues.get(key) === next) repositoryQueues.delete(key);
+    }
+}
+
+/** Waits out another process's write (Desktop's pull, another daemon); a daemon shutdown stops the wait. */
+async function acquireRepositoryLock(lock: string, giveUpAt: number): Promise<void> {
+    const startedAt = Date.now();
+    for (let attempt = 0; ; attempt += 1) {
+        try {
+            await mkdir(lock);
+            if (attempt > 0) logger.debug('[worktree-ops] repository lock acquired after waiting', { lock, waitedMs: Date.now() - startedAt });
+            return;
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        }
+        if (attempt === 0) logger.debug('[worktree-ops] waiting for repository lock', { lock, waitMs: Math.max(0, giveUpAt - startedAt) });
+        if (drainingRepositoryWrites) throw new OpFailure('WORKTREE_OPERATION_IN_PROGRESS', 'The daemon is shutting down. Retry after reconnecting.');
+        if (Date.now() >= giveUpAt) {
+            throw new OpFailure('WORKTREE_OPERATION_IN_PROGRESS', `Another Git operation is in progress. Retry after it finishes. If its process terminated, verify no Git writer is running before removing the lock: ${lock}`, { lockPath: lock });
+        }
+        await new Promise((resolve) => setTimeout(resolve, REPOSITORY_LOCK_POLL_MS));
     }
 }
 
@@ -1647,6 +1669,7 @@ function remotePins(happyHomeDir: string): WorkspaceRemotePins {
 
 export function createWorktreeOpsHandlers(deps: WorktreeOpsDeps): Record<WorktreeOpsMethod, (request: unknown) => Promise<WorktreeOpAnswer>> {
     const now = deps.now ?? Date.now;
+    repositoryLockWaitMs = deps.repositoryLockWaitMs ?? REPOSITORY_LOCK_WAIT_MS;
     const guard = pathGuard(deps.allowedRoot, deps.happyHomeDir);
     const pins = remotePins(deps.happyHomeDir);
 
