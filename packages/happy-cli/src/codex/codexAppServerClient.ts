@@ -24,6 +24,7 @@ import { withCodexRecallOwnership } from '@/memory/recallOwnerMarker';
 import { nativeCodexRecallOwnershipOverrides } from '@/memory/nativeCodexRecallOwnership';
 import { CODEX_CONFIG_UNREADABLE, CUA_DRIVER_SERVER } from '@/toolPolicy/cuaShadow';
 import { CodexBackgroundTasks, type CodexBackgroundTask } from './codexBackgroundTasks';
+import type { BackgroundTaskStopStatus } from '@/utils/backgroundTaskStop';
 import { CodexSubagentTracker, type CodexSubagentSpawn } from './codexSubagentTracker';
 import { readCodexOutput } from './codexOutputReader';
 import { resolveCodexStateEnvironment } from './codexStateRecovery';
@@ -392,6 +393,27 @@ export class CodexAppServerClient {
 
     restoreBackgroundTasks(tasks: CodexBackgroundTask[]): void {
         this.backgroundTasks.restore(tasks);
+    }
+
+    /**
+     * Ends one listed background terminal by its own process id (aplus-dev-studio-desktop
+     * specs/agent-background-work-panel R2). `thread/backgroundTerminals/clean` is not used: it ends every
+     * terminal of the thread. The list drops the terminal on the next refresh, brought forward here.
+     */
+    async terminateBackgroundTask(callId: string): Promise<BackgroundTaskStopStatus> {
+        const task = this.backgroundTasks.get(callId);
+        if (!task) return 'not_found';
+        const threadId = this._threadId;
+        if (!task.processId || !threadId || !this.connected) return 'unavailable';
+        try {
+            await this.request('thread/backgroundTerminals/terminate', { threadId, processId: task.processId }, 5000);
+        } catch (error) {
+            // A Codex without the method rejects its name (an unknown request variant).
+            if (/unknown variant|method not found|code=-32601/i.test(String(error))) return 'unsupported';
+            throw error;
+        }
+        this.scheduleBackgroundRefresh(1000);
+        return 'requested';
     }
 
     private scheduleBackgroundRefresh(delay = 5000): void {

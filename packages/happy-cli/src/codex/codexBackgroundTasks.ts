@@ -5,6 +5,8 @@ export type CodexBackgroundTask = {
     command: string;
     processId?: string;
     status: 'running' | 'unknown';
+    /** When this runtime first saw it (aplus-dev-studio-desktop specs/agent-background-work-panel R1). */
+    startedAt?: number;
 };
 
 /** A full runtime snapshot, never a guess based on elapsed wall-clock time. */
@@ -17,9 +19,12 @@ export class CodexBackgroundTasks {
     constructor(
         private readonly request: (method: string, params: unknown) => Promise<unknown>,
         private readonly publish: (tasks: CodexBackgroundTask[]) => void,
+        private readonly now: () => number = Date.now,
     ) {}
 
     get hasTasks(): boolean { return this.tasks.size > 0; }
+    /** The listed terminal with this call id, for a stop by its process id. */
+    get(callId: string): CodexBackgroundTask | undefined { return this.tasks.get(callId); }
     /** An empty UI list on a failed/unsupported read is never writer quiescence. */
     get confirmedEmpty(): boolean { return this.snapshotConfirmed && this.tasks.size === 0; }
 
@@ -46,7 +51,9 @@ export class CodexBackgroundTasks {
         const generation = ++this.generation;
         this.snapshotConfirmed = false;
         for (const task of candidates) {
-            if (!this.completed.has(task.callId)) this.tasks.set(task.callId, { ...task, status: 'unknown' });
+            if (!this.completed.has(task.callId)) {
+                this.tasks.set(task.callId, { ...task, status: 'unknown', startedAt: this.tasks.get(task.callId)?.startedAt ?? this.now() });
+            }
         }
         const completedDuringRead = this.completed;
         const next = new Map<string, CodexBackgroundTask>();
@@ -63,7 +70,10 @@ export class CodexBackgroundTasks {
                         || typeof row.processId !== 'string' || typeof row.command !== 'string') {
                         throw new Error('Invalid background terminal entry');
                     }
-                    next.set(row.itemId, { callId: row.itemId, command: row.command, processId: row.processId, status: 'running' });
+                    next.set(row.itemId, {
+                        callId: row.itemId, command: row.command, processId: row.processId, status: 'running',
+                        startedAt: this.tasks.get(row.itemId)?.startedAt ?? this.now(),
+                    });
                 }
                 if (result.nextCursor != null && typeof result.nextCursor !== 'string') throw new Error('Invalid background terminal cursor');
                 cursor = result.nextCursor || undefined;
