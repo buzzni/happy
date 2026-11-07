@@ -249,6 +249,71 @@ async function api() {
   automationExecutionRoutes(app); await app.ready(); return app;
 }
 
+it('queues an idempotent encrypted question about one completed run without editing its definition or manual session', async () => {
+  await register();
+  await reportAutomationRun(client, 'owner', 'm1', report('automation-run:r1'), now);
+  await recordAutomationExecutionExit('owner', { runId: 'r1', ...await exitRequest() });
+  await client.machine.update({ where: { id: 'm1' }, data: { automationContextIsolationVersion: 1 } });
+  const definition = await client.automation.findUniqueOrThrow({ where: { id: 'a1' } });
+  const manual = await client.session.findUniqueOrThrow({ where: { id: 'manual' } });
+  const one = (size: number) => Buffer.concat([Buffer.from([1]), Buffer.alloc(size - 1)]).toString('base64');
+  const payload = { requestId: '9cc41d26-562e-4b48-8e2f-a38dc2c85a78', sourceRunId: 'r1', expectedRevision: definition.revision,
+    generation: definition.generation, displaySessionId: 'manual', encrypted: { payloadVersion: 6, payloadCiphertext: one(41),
+      viewerKeyId: 'k', viewerKeyVersion: 1, viewerKeyEnvelope: one(105), machineKeyVersion: 1, machineKeyEnvelope: one(105) } };
+  const app = await api(), send = (body = payload) => app.inject({ method: 'POST', url: '/v1/projects/chat:c1/automations/a1/execution-questions',
+    headers: { authorization: `Bearer ${bearer}` }, payload: body });
+  try {
+    const first = await send(); expect(first.statusCode, first.body).toBe(200);
+    expect(first.json()).toEqual({ requestId: payload.requestId, sourceRunId: 'r1', runId: null, state: 'QUEUED' });
+    expect((await send()).json()).toEqual(first.json());
+    const conflict = await send({ ...payload, encrypted: { ...payload.encrypted, viewerKeyId: 'other' } });
+    expect(conflict.statusCode).toBe(409);
+    expect(await client.automation.findUniqueOrThrow({ where: { id: 'a1' } })).toEqual(definition);
+    expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
+    expect(await client.automationRun.count()).toBe(1);
+  } finally { await app.close(); }
+});
+
+it('adds a separate question queue through the migration while preserving saved definitions, native metadata and run history', async () => {
+  const definition = await client.automation.findUniqueOrThrow({ where: { id: 'a1' } });
+  const manual = await client.session.findUniqueOrThrow({ where: { id: 'manual' } });
+  const originalRun = await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } });
+  await db.exec('DROP TABLE "AutomationExecutionQuestion"');
+  await db.exec(await readFile('prisma/migrations/20261107020000_automation_execution_questions/migration.sql', 'utf8'));
+  expect(await client.automationExecutionQuestion.count()).toBe(0);
+  expect(await client.automation.findUniqueOrThrow({ where: { id: 'a1' } })).toEqual(definition);
+  expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
+  expect(await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } })).toEqual(originalRun);
+});
+
+it('rejects question requests with lost authority, changed generation, unsupported target or unconfirmed source', async () => {
+  await register();
+  await client.machine.update({ where: { id: 'm1' }, data: { automationContextIsolationVersion: 1 } });
+  const one = (size: number) => Buffer.concat([Buffer.from([1]), Buffer.alloc(size - 1)]).toString('base64');
+  const payload = { requestId: '9cc41d26-562e-4b48-8e2f-a38dc2c85a78', sourceRunId: 'r1', expectedRevision: 1,
+    generation: 1, displaySessionId: 'manual', encrypted: { payloadVersion: 6, payloadCiphertext: one(41), viewerKeyId: 'k',
+      viewerKeyVersion: 1, viewerKeyEnvelope: one(105), machineKeyVersion: 1, machineKeyEnvelope: one(105) } };
+  const app = await api(), url = '/v1/projects/chat:c1/automations/a1/execution-questions', headers = { authorization: `Bearer ${bearer}` };
+  const send = (body: Record<string, unknown> = payload) => app.inject({ method: 'POST', url, headers, payload: body });
+  try {
+    expect((await app.inject({ method: 'POST', url, payload })).statusCode).toBe(401);
+    expect((await app.inject({ method: 'POST', url, headers: { ...headers, 'x-test-principal': 'browser-sync' }, payload })).statusCode).toBe(403);
+    expect((await send({ ...payload, encrypted: { ...payload.encrypted, payloadVersion: 4 } })).statusCode).toBe(400);
+    expect((await send()).statusCode).toBe(409); // No positive owned exit, even though dispatch can be accepted.
+    await recordAutomationExecutionExit('owner', { runId: 'r1', ...await exitRequest() });
+    expect((await send({ ...payload, sourceRunId: 'absent' })).statusCode).toBe(404);
+    expect((await send({ ...payload, displaySessionId: 'other-display' })).statusCode).toBe(404);
+    expect((await send({ ...payload, generation: 2 })).statusCode).toBe(409);
+    await client.machine.update({ where: { id: 'm1' }, data: { automationContextIsolationVersion: 0 } });
+    expect((await send()).statusCode).toBe(409);
+    await client.machine.update({ where: { id: 'm1' }, data: { automationContextIsolationVersion: 1 } });
+    await client.project.update({ where: { id: 'chat:c1' }, data: { config: { machineId: 'm1', chatAutomationState: 'archived' } } });
+    expect((await send()).statusCode).toBe(409);
+    expect(await client.automationExecutionQuestion.count()).toBe(0);
+    expect(await client.automationRun.count()).toBe(1);
+  } finally { await app.close(); }
+});
+
 async function exitRequest(runId = 'r1') {
   return { machineId: 'm1', claimToken: `claim-${runId}`, createBodyHash: await sessionCreateBodyHash((await request(runId)).body),
     receipt: { version: 1, provider: 'codex', observedAt: now.getTime(), providerExitedCleanly: true,

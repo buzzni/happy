@@ -1,5 +1,5 @@
 import { Readable } from 'node:stream';
-import { parseCanonicalOrgSetupTokenJson } from '@slopus/happy-wire';
+import { parseCanonicalOrgSetupTokenJson, automationExecutionQuestionRequestSchema } from '@slopus/happy-wire';
 import { z } from 'zod';
 import type { Fastify } from '../types';
 import { requireAccountPrincipal } from '@/app/api/utils/enableAuthentication';
@@ -11,9 +11,25 @@ import { ExecutionBindingError } from '@/app/session/sessionExecutionBinding';
 import { listAutomationExecutionPage, readAutomationExecutionEvidencePage, readAutomationExecutionReference } from '@/app/automation/automationExecutionPage';
 import { db } from '@/storage/db';
 import { inTx } from '@/storage/inTx';
+import { queueAutomationExecutionQuestion } from '@/app/automation/automationExecutionQuestionService';
 
 /** Registers a run-owned session; provider start remains a separate, journaled operation. */
 export function automationExecutionRoutes(app: Fastify) {
+  app.post('/v1/projects/:projectId/automations/:automationId/execution-questions', {
+    bodyLimit: 400_000, preHandler: app.authenticate,
+    schema: { params: z.strictObject({ projectId: z.string().min(1).max(200), automationId: z.string().min(1).max(200) }),
+      body: automationExecutionQuestionRequestSchema },
+  }, async (request, reply) => {
+    if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
+    if (!isServerBackedAutomationEnabled()) return reply.code(404).send({ error: 'feature-disabled' });
+    try {
+      const result = await inTx(tx => queueAutomationExecutionQuestion(tx, request.userId, request.params.projectId, request.params.automationId, request.body));
+      return reply.header('Cache-Control', 'no-store').send(result);
+    } catch (error) {
+      if (error instanceof AutomationExecutionSessionError) return reply.code(error.statusCode).send({ error: error.message });
+      throw error;
+    }
+  });
   app.post('/v1/automation-runs/:runId/execution-session/recover', {
     bodyLimit: 150_000, preHandler: app.authenticate,
     schema: { params: z.strictObject({ runId: z.string().regex(/^[A-Za-z0-9_-]{1,160}$/) }),

@@ -595,6 +595,7 @@ model Automation {
     /// Persistent history head; no FK so pruned runs are unavailable, never an empty history.
     lastExecutionRunId String?
     runs               AutomationRun[]
+    executionQuestions AutomationExecutionQuestion[]
     scriptRevisions    ScriptAutomationRevision[]
     scriptKeys         ScriptAutomationKeyEpoch[]
     scriptInvocations  ScriptInvocation[]
@@ -666,6 +667,27 @@ model AutomationRun {
     @@index([automationId, status])
     @@index([machineAccountId, machineId, status])
     @@index([displaySessionId, createdAt])
+}
+
+// Explicit one-off followups have their own immutable encrypted input and idempotency identity.
+// Source runs may be pruned: retaining the source ID must produce unavailable, never another source.
+model AutomationExecutionQuestion {
+    id String @id
+    automationId String
+    automation Automation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+    sourceRunId String
+    generation Int
+    revision Int
+    displaySessionId String
+    machineAccountId String
+    machineId String
+    encrypted Json
+    requestHash String
+    runId String? @unique
+    cancelledAt DateTime?
+    createdAt DateTime @default(now())
+
+    @@index([machineAccountId, machineId, createdAt, id], map: "AutomationExecutionQuestion_machine_fifo")
 }
 
 model ScriptArtifact {

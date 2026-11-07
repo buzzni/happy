@@ -28,7 +28,7 @@ export const automationExecutionRecoveryRequestSchema = automationExecutionSessi
 });
 
 export class AutomationExecutionSessionError extends Error {
-  constructor(readonly statusCode: 400 | 403 | 409 | 503, message: string) { super(message); }
+  constructor(readonly statusCode: 400 | 403 | 404 | 409 | 503, message: string) { super(message); }
 }
 const refuse = () => { throw new AutomationExecutionSessionError(403, 'Invalid automation execution admission'); };
 const conflict = () => { throw new AutomationExecutionSessionError(409, 'Automation execution identity conflict'); };
