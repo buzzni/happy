@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -8,6 +8,9 @@ import { createPortRegistry } from './portRegistry'
 import { startDaemonControlServer } from './controlServer'
 import { encrypt, decrypt, encodeBase64, decodeBase64, getRandomBytes } from '@/api/encryption'
 import { getDaemonTerminalSession, getDaemonTerminalSessionCount, _resetDaemonTerminalSessionsForTest } from './daemonTerminalSessions'
+import { bindRpcRequest } from '@slopus/happy-wire'
+import { createLegacyDispatchAdmission, createSubprocessWriteAdmission, createWorkspaceTurnAdmission } from '@/utils/workspaceTurnAdmission'
+import type { TerminalOpenAdmissionInput } from './terminalOpenAdmission'
 
 async function waitFor(check: () => boolean, ms: number): Promise<void> {
   const start = Date.now()
@@ -132,10 +135,13 @@ describe('/terminal WS protocol (T7-T8)', () => {
   let port: number
   let controlSecret: string
   let stopServer: () => Promise<void>
-  let machineEncryption: { encryptionKey: Uint8Array; encryptionVariant: 'legacy' } | null
+  let machineEncryption: { encryptionKey: Uint8Array; encryptionVariant: 'legacy'; machineId?: string; strict?: boolean } | null
+  let reserve: TerminalOpenAdmissionInput['reserveLegacyDispatch']
+  let admit: TerminalOpenAdmissionInput['admitSubprocess']
   let approved: string[] = []
 
   beforeEach(async () => {
+    reserve = undefined; admit = undefined
     approved = []
     dir = mkdtempSync(path.join(tmpdir(), 'control-server-terminal-ws-proto-'))
     machineEncryption = { encryptionKey: getRandomBytes(32), encryptionVariant: 'legacy' }
@@ -145,17 +151,20 @@ describe('/terminal WS protocol (T7-T8)', () => {
       portMax: 30010,
       isPortBindable: async () => true,
     })
-    const server = await startDaemonControlServer({
+    const input = {
       getChildren: () => [],
-      stopSession: () => ({ stopped: false, reason: 'not-found' }),
-      spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
+      stopSession: () => ({ stopped: false as const, reason: 'not-found' as const }),
+      spawnSession: async () => ({ type: 'error' as const, errorMessage: 'unused' }),
       requestShutdown: () => {},
       onHappySessionWebhook: () => {},
       portRegistry: registry,
       allowedRoot: dir,
       approvedRoots: () => approved,
       getMachineEncryption: () => machineEncryption,
-    })
+      reserveLegacyDispatch: (roots: readonly string[]) => reserve ? reserve(roots) : Promise.resolve({ acquired: true as const, finish: async () => undefined }),
+      admitSubprocess: async (roots: readonly string[]) => { await admit?.(roots) },
+    }
+    const server = await startDaemonControlServer(input)
     port = server.port
     controlSecret = server.controlSecret
     stopServer = server.stop
@@ -196,6 +205,81 @@ describe('/terminal WS protocol (T7-T8)', () => {
     expect(msg.data.event).toBe('terminal-frame')
     return decrypt(machineEncryption!.encryptionKey, machineEncryption!.encryptionVariant, decodeBase64(msg.data.data))
   }
+
+  function open(ws: WebSocket, params: string): Promise<any> {
+    const reqId = randomUUID()
+    return new Promise(resolve => {
+      const receive = (raw: RawData) => {
+        const message = JSON.parse(raw.toString())
+        if (message.reqId !== reqId) return
+        ws.off('message', receive); resolve(message)
+      }
+      ws.on('message', receive)
+      ws.send(JSON.stringify({ reqId, event: 'terminal-open', data: { params } }))
+    })
+  }
+
+  it('holds a bound direct opening before consuming its nonce and permits the same request after automatic release', async () => {
+    const directory = path.join(dir, 'project'); mkdirSync(directory)
+    machineEncryption!.machineId = 'direct-machine'; machineEncryption!.strict = true
+    reserve = createLegacyDispatchAdmission({ home: dir }); admit = createSubprocessWriteAdmission({ home: dir })
+    const owner = createWorkspaceTurnAdmission({ home: dir, roots: [directory], kind: 'automation', sessionId: 'automation-run:direct' })
+    expect(await owner.tryAcquire()).toEqual({ acquired: true })
+    const params = encodeBase64(encrypt(machineEncryption!.encryptionKey, 'legacy', bindRpcRequest({
+      method: 'terminal-open', scope: 'direct-machine', nonce: encodeBase64(getRandomBytes(16)), issuedAt: Date.now(),
+      params: { terminalBinding: 1, terminalKey: encodeBase64(getRandomBytes(32)), terminalId: encodeBase64(getRandomBytes(16)),
+        cwd: directory, shell: process.execPath, args: ['-e', 'setTimeout(() => {}, 10000)'] },
+    })))
+    const ws = await connect()
+    try {
+      const blocked = await open(ws, params)
+      expect(blocked.error).toBeTruthy(); expect(getDaemonTerminalSessionCount()).toBe(0)
+      expect(await owner.release(true)).toBe(true)
+      const accepted = await open(ws, params)
+      expect(accepted.data?.ok).toBe(true)
+      await waitFor(() => getDaemonTerminalSessionCount() === 1, 1000)
+    } finally { ws.close(); await owner.release(true) }
+  })
+
+  it('refuses a duplicate direct opening while the first admission is pending', async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const finish = vi.fn(async () => undefined)
+    const pendingReserve = vi.fn(async () => { await gate; return { acquired: true as const, finish } })
+    reserve = pendingReserve
+    admit = async () => undefined
+    const ws = await connect()
+    const first = open(ws, openParams({ cwd: dir, script: 'setTimeout(() => {}, 10000)' }))
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await vi.waitFor(() => expect(pendingReserve).toHaveBeenCalledOnce())
+      const second = await Promise.race([open(ws, openParams({ cwd: dir })),
+        new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), 1000) })])
+      expect(second?.error).toMatch(/pending/)
+      expect(pendingReserve).toHaveBeenCalledOnce()
+    } finally { if (timer) clearTimeout(timer); release(); await first; ws.close() }
+  })
+
+  it('does not spawn a direct PTY when its websocket closed during admission', async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const finish = vi.fn(async () => undefined)
+    const pendingReserve = vi.fn(async () => { await gate; return { acquired: true as const, finish } })
+    reserve = pendingReserve; admit = vi.fn(async () => undefined)
+    const marker = path.join(dir, 'cancelled-terminal.txt'), ws = await connect()
+    ws.send(JSON.stringify({ reqId: randomUUID(), event: 'terminal-open', data: {
+      params: openParams({ cwd: dir, script: `require('fs').writeFileSync(${JSON.stringify(marker)}, 'spawned')` }),
+    } }))
+    try {
+      await vi.waitFor(() => expect(pendingReserve).toHaveBeenCalledOnce())
+      const closed = new Promise<void>(resolve => ws.once('close', () => resolve()))
+      ws.close(); await closed; release()
+      await vi.waitFor(() => expect(finish).toHaveBeenCalled())
+      expect(getDaemonTerminalSessionCount()).toBe(0)
+      expect(admit).not.toHaveBeenCalled()
+      expect(existsSync(marker)).toBe(false)
+    } finally { release(); ws.close() }
+  })
 
   it('opens a PTY and acks with sessionId + local:true caps', async () => {
     const ws = await connect()

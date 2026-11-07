@@ -8,7 +8,7 @@ import {
     CheckpointProtectionStateStore,
     type CheckpointPendingDecision,
 } from './checkpointProtectionState';
-import { CheckpointRestoreExecutor } from './checkpointRestore';
+import { CheckpointRestoreExecutor, type CheckpointRestoreExecutorOptions } from './checkpointRestore';
 import { LOCAL_HISTORY_MAX_FILE_BYTES } from './checkpointLocalHistory';
 import { CheckpointRestorePlanner } from './checkpointRestorePlan';
 import { checkpointOperationRefPrefix, resolveCheckpointStoreLayout } from './checkpointStore';
@@ -137,8 +137,12 @@ export function createCheckpointRpcHandlers(input: {
     restartSession(authority: CheckpointRpcSessionAuthority): Promise<void>;
     refreshSession?(authority: CheckpointRpcSessionAuthority): Promise<void>;
     restoreExecutor?: CheckpointRestoreExecutor;
+    reserveLegacyDispatch?: CheckpointRestoreExecutorOptions['reserveLegacyDispatch'];
+    admitSubprocess?: CheckpointRestoreExecutorOptions['admitSubprocess'];
 }): CheckpointRpcHandlers {
-    const restoreExecutor = input.restoreExecutor ?? new CheckpointRestoreExecutor(input.checkpointRoot);
+    const restoreExecutor = input.restoreExecutor ?? new CheckpointRestoreExecutor(input.checkpointRoot, {
+        reserveLegacyDispatch: input.reserveLegacyDispatch, admitSubprocess: input.admitSubprocess,
+    });
     const protectionState = new CheckpointProtectionStateStore(input.checkpointRoot);
     const resolveRequestAuthority = async (request: z.infer<typeof bindingRequestSchema>) => {
         const authority = await input.resolveAuthority(request.sessionId);

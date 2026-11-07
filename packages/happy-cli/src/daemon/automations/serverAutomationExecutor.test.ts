@@ -184,6 +184,92 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
   }
 }
 
+describe('legacy workspace preclaim admission', () => {
+  it('defers worktree cleanup without spending its retry budget when the workspace is busy', async () => {
+    const f = setup()
+    const cache = f.input.cache.read()
+    f.input.cache.read = () => ({ ...cache, automations: cache.automations.map(row => ({ ...row, paused: true })) })
+    const worktree = { automationId: 'automation-1', generation: 2, runId: 'old', repositoryRoot: '/repo',
+      worktreePath: '/isolated/old', directory: '/isolated/old', sessionId: null, createdAt: 1, cleanupAttempts: 3 }
+    f.store.write({ ...f.store.read(), githubWorktrees: [worktree] })
+    const reserveLegacyDispatch = vi.fn(async () => ({ acquired: false as const, reason: 'workspace-busy' as const, sessions: ['isolated'] }))
+    Object.assign(f.input, { reserveLegacyDispatch })
+    await runServerAutomationTick(f.input)
+    expect(reserveLegacyDispatch).toHaveBeenCalledWith(['/repo', '/isolated/old'])
+    expect(f.discardGithubWorktree).not.toHaveBeenCalled()
+    expect(f.store.state().githubWorktrees).toEqual([worktree])
+  })
+
+  it('continues with another folder when a dispatch handoff cannot be confirmed', async () => {
+    const f = setup({ claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-1' } } })
+    const cache = f.input.cache.read()
+    f.input.cache.read = () => ({ ...cache, automations: [...cache.automations,
+      { ...cache.automations[0], automationId: 'automation-2' }] })
+    const state = f.store.read()
+    f.store.write({ ...state, schedules: [...state.schedules, { ...state.schedules[0], automationId: 'automation-2' }] })
+    const original = f.decryptPayload(cacheRecord(), new Uint8Array(32))
+    f.input.decryptPayload = row => ({ ...original, directory: row.automationId === 'automation-1' ? '/repo' : '/other' })
+    const finish = vi.fn(async () => undefined).mockRejectedValueOnce(new Error('WORKSPACE_DISPATCH_HANDOFF_UNCONFIRMED'))
+    Object.assign(f.input, { reserveLegacyDispatch: vi.fn(async () => ({ acquired: true as const, finish })) })
+    expect(await runServerAutomationTick(f.input)).toEqual([
+      { automationId: 'automation-1', outcome: 'WOKE' }, { automationId: 'automation-2', outcome: 'WOKE' },
+    ])
+    expect(f.spawnSession).toHaveBeenCalledTimes(2)
+    expect(finish).toHaveBeenCalledTimes(2)
+    expect(f.logDebug).toHaveBeenCalledWith(expect.stringContaining('handoff unconfirmed'))
+  })
+
+  it.each(['busy', 'unconfirmed'] as const)('preserves the original once occurrence when workspace admission is %s', async reason => {
+    const f = setup({ claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-1' } } })
+    const original = f.decryptPayload(cacheRecord(), new Uint8Array(32))
+    f.input.decryptPayload = () => ({ ...original, schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' }, scriptCommand: 'probe' })
+    const reserveLegacyDispatch = vi.fn(async () => {
+      if (reason === 'unconfirmed') throw new Error('WORKSPACE_REPOSITORY_IDENTITY_UNCONFIRMED')
+      return { acquired: false as const, reason: 'workspace-busy' as const, sessions: ['isolated'] }
+    })
+    Object.assign(f.input, { reserveLegacyDispatch })
+    const originalSchedules = f.store.read().schedules
+    expect(await runServerAutomationTick(f.input)).toEqual([])
+    expect(reserveLegacyDispatch).toHaveBeenCalledWith(['/repo'])
+    expect(f.store.read().schedules).toEqual(originalSchedules.map(schedule => ({ ...schedule,
+      contextAdmissionDeferred: { revision: cacheRecord().revision, scheduledFor: schedule.nextRunAt } })))
+    expect(f.transport.claim).not.toHaveBeenCalled()
+    expect(f.runScript).not.toHaveBeenCalled()
+    expect(f.spawnSession).not.toHaveBeenCalled()
+  })
+
+  it('retains an overdue legacy once occurrence for reconfirmation instead of silently spending it', async () => {
+    const f = setup({ claim: { ok: false, error: 'claim-denied' } })
+    const original = f.decryptPayload(cacheRecord(), new Uint8Array(32))
+    f.input.decryptPayload = () => ({ ...original, schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } })
+    const finish = vi.fn(async () => undefined)
+    Object.assign(f.input, { reserveLegacyDispatch: vi.fn(async () => ({ acquired: true as const, finish })) })
+    const due = f.store.read().schedules[0].nextRunAt
+    f.input.now += 120_000
+    await runServerAutomationTick(f.input)
+    expect(f.store.read().schedules[0]).toMatchObject({ nextRunAt: due,
+      contextAdmissionHold: { code: 'CLAIM_RECONFIRMATION_REQUIRED', revision: 2, scheduledFor: due } })
+    expect(f.store.read().schedules[0].spentOnceAt).toBeUndefined()
+    await runServerAutomationTick(f.input)
+    expect(f.transport.claim).toHaveBeenCalledOnce()
+    expect(finish).toHaveBeenCalledOnce()
+    expect(f.transport.start).not.toHaveBeenCalled()
+  })
+
+  it('holds the reservation through execution and releases it even after a refused claim', async () => {
+    const f = setup()
+    const finish = vi.fn(async () => undefined)
+    Object.assign(f.input, { reserveLegacyDispatch: vi.fn(async () => ({ acquired: true as const, finish })) })
+    f.transport.claim.mockImplementation(async () => {
+      expect(finish).not.toHaveBeenCalled()
+      return { ok: false, error: 'offline' }
+    })
+    await runServerAutomationTick(f.input)
+    expect(f.transport.claim).toHaveBeenCalledOnce()
+    expect(finish).toHaveBeenCalledOnce()
+  })
+})
+
 // #3556: daemon/run.ts와 동일하게 실제 exchange/preflight를 연결한다.
 // 외부 HTTP 응답과 세션 spawn만 fixture이며, fetch/SDK initialize/tools/list는 mock하지 않는다.
 describe('예약 자동화 커넥터 실제 HTTP 경로 (#3556)', () => {
@@ -4317,6 +4403,253 @@ describe('host commands disallowed (Windows standalone runtime)', () => {
 })
 
 
+describe('isolated scheduled conversation admission', () => {
+  function isolatedSetup() {
+    const f = setup({ claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-1' } } })
+    const cache = f.input.cache.read()
+    f.input.cache.read = () => ({ ...cache, automations: [{ ...cache.automations[0], payloadVersion: 6 }] })
+    const payload = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
+    f.input.decryptPayload = () => ({ ...payload, conversation: { sessionId: 'manual' }, contextPolicy: { kind: 'isolated', reference: null } })
+    f.input.resolveMcpSpawnContext = async () => ({ ok: true, value: { mcpCallerGrant: 'grant',
+      mcpConfigProjectId: 'chat:c', bindingStatus: 'BOUND', connectorPolicy: 'optional', requiredConnectors: [] } })
+    return f
+  }
+
+  it.each(['reference', 'input'])('holds a one-time isolated occurrence before claim when its %s is unavailable', async reason => {
+    const f = isolatedSetup(), original = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
+    const previousResult = { automationId: 'automation-1', status: 'NONE_ELIGIBLE' }
+    f.input.decryptPayload = () => ({ ...original, ...(reason === 'input' ? { prompt: 'x'.repeat(65536) } : {}),
+      contextPolicy: { kind: 'isolated', reference: reason === 'reference' ? { kind: 'previous-result', maxBytes: 16384 } : null },
+      schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } })
+    const prepare = vi.fn(async () => { if (reason === 'reference') throw new Error('AUTOMATION_REFERENCE_HTTP_404'); return {} })
+    Object.assign(f.input, { prepareIsolatedContext: prepare })
+    const dispatch = vi.fn(async () => ({ state: 'started' as const, sessionId: 'automation-run:run-1' }))
+    f.input.dispatchIsolatedContext = dispatch
+    expect(await runServerAutomationTick(f.input)).toEqual([])
+    expect(f.transport.claim).not.toHaveBeenCalled(); expect(dispatch).not.toHaveBeenCalled()
+    expect(f.transport.report).not.toHaveBeenCalled()
+    const due = f.store.state().schedules[0].nextRunAt
+    expect(due).toBeLessThanOrEqual(f.now)
+    f.input.decryptPayload = () => ({ ...original,
+      contextPolicy: { kind: 'isolated', reference: { kind: 'previous-result', maxBytes: 16384 } },
+      schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } })
+    prepare.mockImplementation(async () => ({ previousResult }))
+    await runServerAutomationTick(f.input)
+    expect(f.transport.claim).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ scheduledFor: due }))
+    expect(dispatch).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ previousResult }))
+  })
+
+  it('preserves an overdue isolated once occurrence for reconfirmation after the server refuses its claim', async () => {
+    const f = isolatedSetup(), original = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
+    f.input.decryptPayload = () => ({ ...original, schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } })
+    f.input.now = f.now + 120_000
+    f.transport.claim.mockResolvedValue({ ok: false, error: 'claim-denied' })
+    f.input.dispatchIsolatedContext = vi.fn(async () => ({ state: 'started' as const, sessionId: 'automation-run:run-1' }))
+    const due = f.store.read().schedules[0].nextRunAt
+    await runServerAutomationTick(f.input)
+    expect(f.store.read().schedules[0]).toMatchObject({ nextRunAt: due,
+      contextAdmissionHold: { code: 'CLAIM_RECONFIRMATION_REQUIRED', revision: 2, scheduledFor: due } })
+    expect(f.store.read().schedules[0].spentOnceAt).toBeUndefined()
+    await runServerAutomationTick(f.input)
+    expect(f.transport.claim).toHaveBeenCalledOnce()
+    expect(f.transport.start).not.toHaveBeenCalled(); expect(f.input.dispatchIsolatedContext).not.toHaveBeenCalled()
+  })
+
+  it('dispatches an authorized immutable v6 run without touching manual delivery, resume or project links', async () => {
+    const f = isolatedSetup()
+    f.input.isSessionWaitingForUser = () => true
+    const deliver = vi.fn(async () => ({ ok: true as const, sessionId: 'manual' })); f.input.deliverConversation = deliver
+    const dispatch = vi.fn(async () => ({ state: 'started' as const, sessionId: 'automation-run:run-1' }))
+    f.input.dispatchIsolatedContext = dispatch
+    expect(await runServerAutomationTick(f.input)).toEqual([{ automationId: 'automation-1', outcome: 'WOKE' }])
+    expect(dispatch).toHaveBeenCalledWith({ automationId: 'automation-1', generation: 2, revision: 2,
+      runId: 'run-1', claimToken: 'claim-1', payload: f.input.decryptPayload(cacheRecord(), new Uint8Array(32)),
+      environmentVariables: { PROJECT_SECRET: 'project-value', GROUP_ONLY: 'group-value' },
+      mcpSpawnContext: expect.objectContaining({ mcpCallerGrant: 'grant', mcpConfigProjectId: 'chat:c' }) })
+    expect(f.input.resolveProjectEnvironment).toHaveBeenCalledWith({ runId: 'run-1', claimToken: 'claim-1', conversationSessionId: 'manual',
+      conversationDirectory: f.input.decryptPayload(cacheRecord(), new Uint8Array(32)).directory })
+    expect(deliver).not.toHaveBeenCalled(); expect(f.spawnSession).not.toHaveBeenCalled(); expect(f.resumeSession).not.toHaveBeenCalled()
+    expect(f.linkSession).not.toHaveBeenCalled()
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'WOKE', sessionId: 'automation-run:run-1' }))
+  })
+
+  it.each(['waiting', 'needs-attention', 'wrong-session'] as const)('reports %s without falling back to the manual context', async state => {
+    const f = isolatedSetup()
+    f.input.dispatchIsolatedContext = async () => ({ state: state === 'wrong-session' ? 'started' : state,
+      sessionId: state === 'wrong-session' ? 'manual' : 'automation-run:run-1', reason: 'workspace-busy' })
+    await runServerAutomationTick(f.input)
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: 'ERROR',
+      failureCode: state === 'waiting' ? 'AUTOMATION_DEFERRED_OWNER_UNCONFIRMED' : state === 'needs-attention' ? 'AUTOMATION_START_UNCONFIRMED' : 'AUTOMATION_EXECUTION_IDENTITY_CONFLICT',
+    }))
+    expect(f.spawnSession).not.toHaveBeenCalled(); expect(f.resumeSession).not.toHaveBeenCalled()
+  })
+
+  it.each([false, true])('holds an unready isolated once occurrence while continuing legacy work (missed record=%s)', async missedRunRecord => {
+    const f = isolatedSetup(), isolated = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
+    const cache = f.input.cache.read(), legacy = { ...cache.automations[0], automationId: 'legacy', payloadVersion: 1 as const }
+    f.input.cache.read = () => ({ ...cache, missedRunRecord, automations: [...cache.automations, legacy] })
+    const recordMissed = vi.fn(async () => ({ ok: true })); Object.assign(f.transport, { recordMissed })
+    const state = f.store.read()
+    f.store.write({ ...state, schedules: [...state.schedules, { ...state.schedules[0], automationId: 'legacy' }] })
+    f.input.decryptPayload = row => row.automationId === 'legacy' ? { ...isolated, conversation: undefined, contextPolicy: undefined }
+      : { ...isolated, schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } }
+    const dispatch = vi.fn(async () => ({ state: 'started' as const, sessionId: 'automation-run:run-1' }))
+    f.input.dispatchIsolatedContext = dispatch
+    f.input.isolatedContextReady = false
+    expect(await runServerAutomationTick(f.input)).toEqual([{ automationId: 'legacy', outcome: 'WOKE' }])
+    expect(f.transport.claim.mock.calls.map(([row]) => row.automationId)).toEqual(['legacy'])
+    expect(f.spawnSession).toHaveBeenCalledOnce(); expect(dispatch).not.toHaveBeenCalled()
+    expect(recordMissed).not.toHaveBeenCalled()
+    const held = f.store.state().schedules.find(row => row.automationId === 'automation-1')!
+    expect(held.nextRunAt).toBeLessThanOrEqual(f.now)
+    expect(f.transport.report).not.toHaveBeenCalledWith(expect.objectContaining({ automationId: 'automation-1' }))
+    f.transport.claim.mockClear()
+    f.input.isolatedContextReady = true
+    expect(await runServerAutomationTick(f.input)).toEqual([{ automationId: 'automation-1', outcome: 'WOKE' }])
+    expect(f.transport.claim.mock.calls.map(([row]) => row.automationId)).toEqual(['automation-1'])
+    expect(dispatch).toHaveBeenCalledOnce()
+    expect(f.transport.claim).toHaveBeenCalledWith(expect.objectContaining({ scheduledFor: held.nextRunAt }))
+  })
+
+  it.each(['unready', 'reference'])('keeps an overdue isolated occurrence due before missed-run recording while held for %s', async reason => {
+    const f = isolatedSetup(), original = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
+    const cache = f.input.cache.read(); f.input.cache.read = () => ({ ...cache, missedRunRecord: true })
+    f.input.now = f.now + 120_000
+    f.input.decryptPayload = () => ({ ...original, contextPolicy: { kind: 'isolated', reference: { kind: 'previous-result', maxBytes: 16384 } },
+      schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } })
+    const recordMissed = vi.fn(async () => ({ ok: true })); Object.assign(f.transport, { recordMissed })
+    f.input.isolatedContextReady = reason !== 'unready'
+    f.input.prepareIsolatedContext = vi.fn(async () => { throw new Error('AUTOMATION_REFERENCE_UNAVAILABLE') })
+    f.input.dispatchIsolatedContext = vi.fn(async () => ({ state: 'started' as const, sessionId: 'automation-run:run-1' }))
+    const originalSchedule = f.store.read().schedules[0]
+    await runServerAutomationTick(f.input); await runServerAutomationTick(f.input)
+    expect(recordMissed).not.toHaveBeenCalled(); expect(f.transport.claim).not.toHaveBeenCalled()
+    expect(f.transport.report).not.toHaveBeenCalled(); expect(f.input.dispatchIsolatedContext).not.toHaveBeenCalled()
+    expect(f.store.read().schedules[0]).toMatchObject(originalSchedule)
+  })
+
+  it.each(['unready', 'reference', 'legacy'])('preserves the original held once for reconfirmation after %s recovers beyond the claim window', async reason => {
+    const f = isolatedSetup(), original = f.input.decryptPayload(cacheRecord(), new Uint8Array(32)), cache = f.input.cache.read()
+    f.input.cache.read = () => ({ ...cache, missedRunRecord: true, automations: cache.automations.map(row => ({ ...row,
+      ...(reason === 'legacy' ? { payloadVersion: 1 as const } : {}) })) })
+    f.input.decryptPayload = () => ({ ...original, conversation: reason === 'legacy' ? undefined : original.conversation,
+      contextPolicy: reason === 'legacy' ? undefined : { kind: 'isolated', reference: { kind: 'previous-result', maxBytes: 16384 } },
+      schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } })
+    const recordMissed = vi.fn(async () => ({ ok: true })); Object.assign(f.transport, { recordMissed })
+    const prepare = vi.fn(async (): Promise<{ previousResult?: unknown }> => { throw new Error('AUTOMATION_REFERENCE_UNAVAILABLE') })
+    f.input.prepareIsolatedContext = prepare; f.input.isolatedContextReady = reason !== 'unready'
+    let blocked = true
+    if (reason === 'legacy') f.input.reserveLegacyDispatch = async () => blocked
+      ? { acquired: false, reason: 'workspace-busy', sessions: [] } : { acquired: true, finish: async () => {} }
+    f.input.dispatchIsolatedContext = vi.fn(async () => ({ state: 'started' as const, sessionId: 'automation-run:run-1' }))
+    await runServerAutomationTick(f.input)
+    const due = f.store.read().schedules[0].nextRunAt
+    blocked = false; f.input.isolatedContextReady = true; f.input.now = f.now + 120_000
+    prepare.mockResolvedValue({ previousResult: { automationId: 'automation-1', status: 'NONE_ELIGIBLE' } })
+    f.transport.claim.mockResolvedValue({ ok: false, error: 'claim-denied' })
+    await runServerAutomationTick(f.input)
+    expect(recordMissed).not.toHaveBeenCalled()
+    expect(f.transport.claim).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ scheduledFor: due }))
+    expect(f.store.read().schedules[0]).toMatchObject({ nextRunAt: due, contextAdmissionHold: {
+      code: 'CLAIM_RECONFIRMATION_REQUIRED', revision: cache.automations[0].revision, scheduledFor: due } })
+    expect(f.input.dispatchIsolatedContext).not.toHaveBeenCalled(); expect(f.spawnSession).not.toHaveBeenCalled()
+  })
+
+  it.each(['revision', 'due'])('does not let a stale admission %s suppress ordinary offline missed recording', async changed => {
+    const f = isolatedSetup(), original = f.input.decryptPayload(cacheRecord(), new Uint8Array(32)), cache = f.input.cache.read()
+    f.input.cache.read = () => ({ ...cache, missedRunRecord: true }); f.input.now = f.now + 120_000
+    f.input.decryptPayload = () => ({ ...original, schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } })
+    const state = f.store.read(), due = state.schedules[0].nextRunAt
+    f.store.write({ ...state, schedules: state.schedules.map(row => ({ ...row, contextAdmissionDeferred: {
+      revision: cache.automations[0].revision + (changed === 'revision' ? 1 : 0), scheduledFor: due + (changed === 'due' ? 1 : 0) } })) })
+    const recordMissed = vi.fn(async () => ({ ok: true })); Object.assign(f.transport, { recordMissed })
+    await runServerAutomationTick(f.input)
+    expect(recordMissed).toHaveBeenCalledOnce(); expect(f.transport.claim).not.toHaveBeenCalled()
+    expect(f.store.read().schedules[0].contextAdmissionDeferred).toBeUndefined()
+  })
+
+  it('still records an offline isolated once that was never held by admission', async () => {
+    const f = isolatedSetup(), original = f.input.decryptPayload(cacheRecord(), new Uint8Array(32)), cache = f.input.cache.read()
+    f.input.cache.read = () => ({ ...cache, missedRunRecord: true }); f.input.now = f.now + 120_000
+    f.input.decryptPayload = () => ({ ...original, schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } })
+    const recordMissed = vi.fn(async () => ({ ok: true })); Object.assign(f.transport, { recordMissed })
+    await runServerAutomationTick(f.input)
+    expect(recordMissed).toHaveBeenCalledOnce(); expect(f.transport.claim).not.toHaveBeenCalled()
+    expect(f.store.read().schedules[0].nextRunAt).toBeGreaterThan(f.input.now!)
+  })
+
+  it('keeps a deferred one-time run active under its durable runtime owner instead of reporting completion or claiming another occurrence', async () => {
+    const f = isolatedSetup(), original = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
+    f.input.decryptPayload = () => ({ ...original, schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } })
+    const dispatch = vi.fn(async () => ({ state: 'waiting' as const, sessionId: 'automation-run:run-1', deferred: true as const }))
+    f.input.dispatchIsolatedContext = dispatch
+    expect(await runServerAutomationTick(f.input)).toEqual([{ automationId: 'automation-1', outcome: 'SKIPPED_GATE' }])
+    expect(f.transport.start).toHaveBeenCalledOnce()
+    expect(f.transport.report).not.toHaveBeenCalled()
+    expect(f.store.read().pendingReports).toEqual([])
+    expect(f.store.read().schedules[0].nextRunAt).toBe(NEVER_RUN_AT)
+    await runServerAutomationTick(f.input)
+    expect(f.transport.claim).toHaveBeenCalledOnce()
+    expect(dispatch).toHaveBeenCalledOnce()
+  })
+
+  it('refuses revoked target access before invoking the isolated runtime', async () => {
+    const f = isolatedSetup(), dispatch = vi.fn()
+    f.input.dispatchIsolatedContext = dispatch
+    f.input.resolveProjectEnvironment = async () => ({ ok: false, error: 'revoked' })
+    await runServerAutomationTick(f.input)
+    expect(dispatch).not.toHaveBeenCalled()
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ failureCode: 'CONVERSATION_TARGET_UNAVAILABLE' }))
+  })
+
+  it('refuses an isolated policy without an isolated launcher instead of delivering into the manual session', async () => {
+    const f = setup({ claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-1' } } });
+    const base = f.input.decryptPayload(cacheRecord(), new Uint8Array(32));
+    f.input.decryptPayload = () => ({ ...base, conversation: { sessionId: 'manual' },
+      contextPolicy: { kind: 'isolated', reference: null } });
+    f.input.resolveMcpSpawnContext = async () => ({ ok: true, value: { mcpCallerGrant: 'grant',
+      mcpConfigProjectId: 'chat:c', bindingStatus: 'BOUND', connectorPolicy: 'optional', requiredConnectors: [] } });
+    const deliver = vi.fn(async () => ({ ok: true as const, sessionId: 'manual' }));
+    f.input.deliverConversation = deliver;
+    expect(await runServerAutomationTick(f.input)).toEqual([{ automationId: 'automation-1', outcome: 'ERROR' }]);
+    expect(deliver).not.toHaveBeenCalled();
+    expect(f.spawnSession).not.toHaveBeenCalled();
+    expect(f.resumeSession).not.toHaveBeenCalled();
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ failureCode: 'ISOLATED_CONTEXT_UNSUPPORTED' }));
+  });
+
+  it('keeps isolated cancellation pending without touching a manual or legacy session', async () => {
+    const f = setup();
+    const base = f.input.decryptPayload(cacheRecord(), new Uint8Array(32));
+    f.input.decryptPayload = () => ({ ...base, conversation: { sessionId: 'manual' },
+      contextPolicy: { kind: 'isolated', reference: null } });
+    const cache = f.input.cache.read();
+    f.input.cache.read = () => ({ ...cache, automations: [], pendingCancellations: [cacheRecord()] });
+    const state = f.store.read(); state.schedules[0].lastSessionId = 'previous-legacy-run'; f.store.write(state);
+    const cancel = vi.fn(async () => true); f.input.cancelScheduledSession = cancel;
+    const markCancelled = vi.fn(); f.input.cache.markCancelled = markCancelled;
+    await runServerAutomationTick(f.input);
+    expect(cancel).not.toHaveBeenCalled();
+    expect(markCancelled).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('routes isolated cancellation only through the original run-owned adapter (confirmed=%s)', async confirmed => {
+    const f = setup(), record = { ...cacheRecord(), payloadVersion: 6 as const };
+    const base = f.input.decryptPayload(cacheRecord(), new Uint8Array(32));
+    f.input.decryptPayload = () => ({ ...base, conversation: { sessionId: 'manual' }, contextPolicy: { kind: 'isolated', reference: null } });
+    const cache = f.input.cache.read();
+    f.input.cache.read = () => ({ ...cache, automations: [], pendingCancellations: [record] });
+    const cancel = vi.fn(async () => confirmed), manualCancel = vi.fn(async () => true), markCancelled = vi.fn();
+    f.input.cancelScheduledSession = manualCancel; f.input.cache.markCancelled = markCancelled;
+    const input = { ...f.input, cancelIsolatedContext: cancel };
+    await runServerAutomationTick(input);
+    expect(cancel).toHaveBeenCalledExactlyOnceWith({ automationId: record.automationId, revision: record.revision, generation: record.generation });
+    expect(manualCancel).not.toHaveBeenCalled(); expect(f.spawnSession).not.toHaveBeenCalled(); expect(f.resumeSession).not.toHaveBeenCalled();
+    expect(markCancelled.mock.calls).toEqual(confirmed ? [[[{ automationId: record.automationId, revision: record.revision }]]] : []);
+  });
+});
+
 describe('ordinary scheduled conversation execution', () => {
   it('keeps deletion pending until the sealed ordinary target is stopped, without resuming it', async () => {
     const f = setup(); const cache = f.input.cache.read(); const record = cacheRecord();
@@ -4445,6 +4778,22 @@ describe('unreachable pre-model retry', () => {
     })
     return { ...f, tickAt, grantCalledAt }
   }
+
+  it('does not consume an existing retry while another workspace owner blocks dispatch', async () => {
+    const f = retrySetup()
+    await f.tickAt(0)
+    const retry = f.store.state().unreachableRetries![0]
+    const beforeCalls = f.resolveMcpSpawnContext.mock.calls.length
+    const reserveLegacyDispatch = vi.fn(async () => ({ acquired: false as const, reason: 'workspace-busy' as const, sessions: ['isolated'] }))
+    Object.assign(f.input, { reserveLegacyDispatch })
+    await f.tickAt(MINUTE)
+    expect(reserveLegacyDispatch).toHaveBeenCalledWith(['/repo'])
+    expect(f.store.state().unreachableRetries).toEqual([expect.objectContaining({
+      attempt: retry.attempt, retryAt: retry.retryAt, report: retry.report,
+    })])
+    expect(f.resolveMcpSpawnContext).toHaveBeenCalledTimes(beforeCalls)
+    expect(f.transport.claim).toHaveBeenCalledOnce()
+  })
 
   it('runs the same run once the VPN comes up a couple of minutes after the laptop wakes', async () => {
     const f = retrySetup()
@@ -4778,6 +5127,18 @@ describe('unreachable pre-model retry', () => {
 })
 
 describe('pending report queue', () => {
+  it('replays an internal execution report without replacing the display chat session mapping', async () => {
+    const f = setup()
+    f.store.write({ ...f.store.read(), pendingReports: [{
+      runId: 'run-isolated', claimToken: 'claim', reportId: 'receipt-isolated', status: 'COMPLETED',
+      outcome: 'WOKE', sessionId: 'automation-run:run-isolated', detailCiphertext: null,
+    }] })
+    await runServerAutomationTick(f.input)
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-isolated' }))
+    expect(f.linkSession).not.toHaveBeenCalled()
+    expect(f.store.state().pendingReports).toEqual([])
+  })
+
   it('drops a report the server refuses for good and still sends the reports queued behind it', async () => {
     const f = setup()
     const state = f.store.read()

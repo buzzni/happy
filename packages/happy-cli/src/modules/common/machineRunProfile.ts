@@ -10,6 +10,7 @@ import {
     type TrustedMachineRunSpawn,
     type TypedMachineRunRequest,
     type TypedMachineRunResponse,
+    type TypedMachineRunHandlerOptions,
 } from './typedMachineRun';
 import { validatePath } from './pathSecurity';
 import { MOAI_MACHINE_RUN_PROFILES } from './moaiMachineRunProfiles';
@@ -103,6 +104,8 @@ export interface MachineRunProfileHandlerOptions {
     tempDirectory?: string;
     /** Reuse the legacy lifecycle store when both RPC shapes share a method. */
     typedHandler?: (input: TypedMachineRunRequest, trusted?: TrustedMachineRunSpawn) => Promise<TypedMachineRunResponse>;
+    /** Admission for the default process adapter; a custom typedHandler owns its own lifecycle. */
+    admitSubprocess?: TypedMachineRunHandlerOptions['admitSubprocess'];
     /** Host-owned policy required before any profile with a write scope can run. */
     writeScopePolicy?: MachineRunWriteScopePolicy;
     /** A profile whose executable names one of these tools runs only its verified install. */
@@ -499,6 +502,7 @@ export function createProfileAwareMachineRunHandler(
         baseEnvironment,
         allowAbsoluteArguments: true,
         allowStructuredArguments: true,
+        admitSubprocess: options.admitSubprocess,
     });
 
     return async (input: unknown) => {
@@ -557,7 +561,7 @@ export function createProfileAwareMachineRunHandler(
                 env,
                 timeoutMs: profile.timeoutMs,
                 outputLimitBytes: profile.outputLimitBytes,
-            }, { env: trustedEnv, onSettled: cleanup });
+            }, { env: trustedEnv, onSettled: cleanup, workspaceRoots: [requestedWorkspaceRoot] });
             return withoutVersion(result);
         } catch (error) {
             cleanup();

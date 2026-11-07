@@ -28,6 +28,7 @@ import {
     type AutomationServiceError,
 } from '@/app/automation/automationService';
 import { resolveAutomationRunMcpContext } from '@/app/automation/automationExecutionService';
+import { automationExecutionRoutes } from './automationExecutionRoutes';
 import { listAutomationPage } from '@/app/automation/automationPageService';
 import { serializeScriptAutomation } from './scriptAutomationRoutes';
 import { readChatAutomationImpact, transitionChatAutomations } from '@/app/automation/automationChatLifecycle';
@@ -45,6 +46,8 @@ const mcpContextSchema = z.object({
     machineId: z.string().min(1),
     claimToken: z.string().min(1).max(256),
     sessionId: z.string().min(1).optional(),
+    executionAdmission: z.literal(true).optional(),
+    questionProtocol: z.literal(1).optional(),
 });
 
 function decode(value: string): Uint8Array<ArrayBuffer> {
@@ -88,6 +91,7 @@ function serializeRun(row: AutomationRun) {
         outcome: row.outcome,
         detailCiphertext: row.detailCiphertext ? Buffer.from(row.detailCiphertext).toString('base64') : null,
         failureCode: row.failureCode,
+        holdCode: row.holdCode ?? null,
         degradedCode: row.degradedCode,
         missedCount: row.missedCount,
         queueDepth: row.queueDepth,
@@ -125,6 +129,7 @@ function rejectWhenDisabled(reply: FastifyReply): boolean {
 }
 
 export function automationRoutes(app: Fastify) {
+    automationExecutionRoutes(app);
     const lifecycleProof = (authorization: unknown, proof: unknown, projectId: string, state: 'impact' | 'active' | 'archived' | 'deleted') => typeof authorization === 'string' && typeof proof === 'string' && verifyChatAutomationLifecycle({
         token: proof, bearer: authorization.replace(/^Bearer /i, ''), projectId, state, now: Date.now(),
         secret: process.env.SCRIPT_AUTOMATION_ADMISSION_SECRET || (process.env.HAPPY_STANDALONE_CONTROL === 'stdin-v1' ? process.env.HANDY_MASTER_SECRET : '') || '',
@@ -158,6 +163,8 @@ export function automationRoutes(app: Fastify) {
                 runId: request.params.runId,
                 claimToken: request.body.claimToken,
                 ...(request.body.sessionId ? { sessionId: request.body.sessionId } : {}),
+                ...(request.body.executionAdmission ? { executionAdmission: request.body.executionAdmission } : {}),
+                ...(request.body.questionProtocol ? { questionProtocol: request.body.questionProtocol } : {}),
             },
         ));
         if (!result.ok) {
@@ -321,7 +328,7 @@ export function automationRoutes(app: Fastify) {
         return reply.send({ automation: result.value ? serializeAutomation(result.value) : null });
     });
     app.put('/v1/projects/:projectId/automations/registrations/:registrationKey', {
-        preHandler: app.authenticate, schema: { params: registrationParams, body: createSchema.extend({ payloadVersion: z.literal(4), paused: z.literal(true) }).strict() },
+        preHandler: app.authenticate, schema: { params: registrationParams, body: createSchema.extend({ payloadVersion: z.union([z.literal(4), z.literal(6)]), paused: z.literal(true) }).strict() },
     }, async (request, reply) => {
         if (rejectWhenDisabled(reply)) return;
         const body = request.body;

@@ -2,7 +2,10 @@ import { stripProviderCredentialOverrides } from '@/managed/managedStartup'
 import type { AutomationProjectEnvironmentResult } from './automationProjectEnvironment'
 import { mergePullRequestFiles, type PullRequestFiles } from './queryGithubPullRequests'
 import { randomUUID } from 'node:crypto'
+import type { LegacyDispatchReservation } from '@/utils/workspaceTurnAdmission'
 import { buildScheduledRunPrompt } from '@/utils/scheduledRunPrompt'
+import { automationExecutionSessionId, isAutomationExecutionSessionId, type AutomationRunHeartbeatRequest } from '@slopus/happy-wire'
+import { buildAutomationContextInput } from './automationContextInput'
 
 import {
   buildAutomationPrompt,
@@ -31,7 +34,7 @@ import type { AutomationDeliveryCoordinator } from './automationDelivery'
 import { isPermanentGithubTriggerFailure } from './githubTriggerPermanentFailure'
 import {
   forgetUnreachableRetry,
-  hasDueUnreachableRetry,
+  findDueRetry,
   hasUnsettledUnreachableRetry,
   holdUnreachableRetry,
   maintainUnreachableRetries,
@@ -85,7 +88,7 @@ const SCHEDULED_AUTOMATION_PROMPT_PREAMBLE = [
 export interface ServerAutomationTransport {
   claim(input: { automationId: string; generation: number; scheduledFor: number }): Promise<TransportResult>
   start(input: { runId: string; claimToken: string }): Promise<TransportResult>
-  heartbeat(input: { runId: string; claimToken: string }): Promise<TransportResult>
+  heartbeat(input: AutomationRunHeartbeatRequest): Promise<TransportResult>
   report(input: PendingAutomationReport): Promise<TransportResult>
   /** specs/scheduled-missed-run-policy R4·R5 — 놓친 회차 공백 하나를 서버 이력의 한 행으로 기록한다. */
   recordMissed?(input: {
@@ -209,6 +212,21 @@ export interface ServerAutomationExecutorInput {
     sessionId: string
   }) => Promise<{ ok: boolean; error?: string; skipped?: boolean }>
   deliverConversation?: (input: { runId: string; claimToken: string; sessionId: string; directory: string; prompt: string; mcpSpawnContext?: AutomationMcpSpawnContext }) => Promise<{ ok: true; sessionId: string } | { ok: false; error: string }>
+  /** Private run-owned runtime. The payload is the authored snapshot, never an assembled legacy conversation prompt. */
+  /** A failed host recovery holds isolated occurrences before claim, preserving once schedules. */
+  isolatedContextReady?: boolean
+  /** Reserve legacy writers before consuming their original claim or retry. */
+  reserveLegacyDispatch?: (roots: readonly string[]) => Promise<LegacyDispatchReservation>
+  /** Acknowledges only original run-owned cancellation, never a manual display session. */
+  cancelIsolatedContext?: (input: { automationId: string; revision: number; generation: number }) => Promise<boolean>
+  prepareIsolatedContext?: (input: { automationId: string; generation: number; revision: number; payload: ServerAutomationPayload;
+    runId?: string }) => Promise<{ previousResult?: unknown }>
+  dispatchIsolatedContext?: (input: { automationId: string; generation: number; revision: number; runId: string; claimToken: string;
+    payload: ServerAutomationPayload; previousResult?: unknown; environmentVariables: Record<string, string>; mcpSpawnContext?: AutomationMcpSpawnContext }) => Promise<{
+      state: 'started' | 'waiting' | 'needs-attention'; sessionId: string; reason?: string;
+      /** True only after an active daemon supervisor durably owns this original claim and its eventual report. */
+      deferred?: true
+    }>
   resumeSession: (input: {
     sessionId: string
     directory: string
@@ -485,7 +503,7 @@ const LINK_RETRY_GIVEUP_MS = 24 * 60 * 60 * 1000
  * 앞 대화다(대기 게이트) — 그 대화는 이미 연결됐으므로 건너뛴 회차가 다시 연결하지 않는다.
  */
 function reportLinksSession(report: PendingAutomationReport): report is PendingAutomationReport & { sessionId: string } {
-  return report.sessionId !== null && report.outcome !== 'SKIPPED_GATE'
+  return report.sessionId !== null && !isAutomationExecutionSessionId(report.sessionId) && report.outcome !== 'SKIPPED_GATE'
 }
 
 function isLinkStillRetryable(
@@ -637,7 +655,7 @@ function markOnceOccurrenceSpent(
   input.runtimeStore.write({
     ...state,
     schedules: state.schedules.map((schedule) => schedule.automationId === automationId
-      ? { ...schedule, spentOnceAt: scheduledFor }
+      ? { ...withoutDeferredRunRequest(schedule), spentOnceAt: scheduledFor }
       : schedule),
   })
 }
@@ -763,8 +781,17 @@ function writeScheduleNextRunAt(input: ServerAutomationExecutorInput, automation
 
 /** 일정이 다음 회차로 넘어가면 미룬 즉시 실행 요청은 지나간 것이다. */
 function withoutDeferredRunRequest(schedule: ServerAutomationScheduleState): ServerAutomationScheduleState {
-  const { deferredRunRequestAt: _passed, ...rest } = schedule
+  const { deferredRunRequestAt: _passed, contextAdmissionDeferred: _admission, ...rest } = schedule
   return rest
+}
+
+/** Keep a once occurrence that was actually held before claim distinct from an offline miss. */
+function deferOnceAdmission(input: ServerAutomationExecutorInput, automation: EncryptedServerAutomation,
+  payload: ServerAutomationPayload, schedule: ServerAutomationScheduleState, retryDue: unknown): void {
+  if (retryDue || !isOnceSchedule(payload.schedule)) return
+  const state = input.runtimeStore.read()
+  input.runtimeStore.write({ ...state, schedules: state.schedules.map(item => item.automationId === automation.automationId
+    ? { ...item, contextAdmissionDeferred: { revision: automation.revision, scheduledFor: schedule.nextRunAt } } : item) })
 }
 
 /**
@@ -785,6 +812,8 @@ async function recordMissedRuns(
   now: number,
   claimedSlotsLeft = MAX_CLAIMED_SLOTS_PER_TICK,
 ): Promise<'claim' | 'retry' | 'recorded'> {
+  if (isOnceSchedule(payload.schedule) && schedule.contextAdmissionDeferred?.revision === automation.revision
+    && schedule.contextAdmissionDeferred.scheduledFor === schedule.nextRunAt) return 'claim'
   if (!serverRecordsMissedRuns || !input.transport.recordMissed) return 'claim'
   const plan = planMissedRuns({
     schedule: payload.schedule,
@@ -1348,6 +1377,21 @@ async function cleanupInactiveGithubWorktrees(input: ServerAutomationExecutorInp
       continue
     }
     if (input.isDirectoryInUse(worktree.worktreePath) || input.isDirectoryInUse(worktree.directory)) continue
+    let reservation: Extract<LegacyDispatchReservation, { acquired: true }> | undefined
+    if (input.reserveLegacyDispatch) {
+      try {
+        const admission = await input.reserveLegacyDispatch([worktree.repositoryRoot, worktree.worktreePath])
+        if (!admission.acquired) {
+          input.logDebug?.(`[server-automation] GitHub cleanup held before retry: ${admission.reason}`)
+          continue
+        }
+        reservation = admission
+      } catch (error) {
+        input.logDebug?.(`[server-automation] GitHub cleanup workspace unconfirmed before retry: ${error}`)
+        continue
+      }
+    }
+    try {
     const discarded = await input.discardGithubWorktree({
       repositoryRoot: worktree.repositoryRoot,
       worktreePath: worktree.worktreePath,
@@ -1383,6 +1427,12 @@ async function cleanupInactiveGithubWorktrees(input: ServerAutomationExecutorInp
       worktree.runId,
       discarded.dirty ? DIRTY_WORKTREE_RETRY_MS : WORKTREE_CLEANUP_RETRY_MS,
     )
+    } finally {
+      try { await reservation?.finish() }
+      catch (error) {
+        input.logDebug?.(`[server-automation] GitHub cleanup handoff unconfirmed; workspace remains reserved: ${error}`)
+      }
+    }
   }
 }
 
@@ -1393,6 +1443,7 @@ async function executeStartedRun(
   run: { runId: string; claimToken: string },
   githubMode: 'poll' | 'work' = 'work',
   trace: RunTrace = { step: 'start' },
+  preparedContext?: { previousResult?: unknown },
 ): Promise<{
   outcome: ServerAutomationReportOutcome
   sessionId: string | null
@@ -1401,10 +1452,17 @@ async function executeStartedRun(
   queueDepth?: number
   /** 프롬프트를 세션에 전달하기 전 단계가 상대에 닿지 못해 실패한 코드 (automationUnreachableRetry). */
   unreachable?: string
+  deferred?: true
 }> {
   const step = (name: string): void => {
     trace.step = name
     if (input.signal?.aborted) throw new TickAbandonedError(name)
+  }
+  // Never reinterpret a run-owned context policy as legacy conversation delivery.
+  if (payload.contextPolicy && (!input.dispatchIsolatedContext || automation.payloadVersion !== 6 || !payload.conversation
+    || payload.githubTrigger || payload.scriptCommand !== null || !['claude', 'codex'].includes(payload.agent ?? ''))
+    || automation.payloadVersion === 6 && !payload.contextPolicy) {
+    return { outcome: 'ERROR', sessionId: null, failureCode: 'ISOLATED_CONTEXT_UNSUPPORTED' }
   }
   if (input.hostCommandsAllowed === false && (payload.scriptCommand || payload.githubTrigger)) {
     input.logDebug?.(`[server-automation] ${automation.automationId} needs host commands, which this runtime does not allow`)
@@ -1836,6 +1894,8 @@ async function executeStartedRun(
       }
     }
     if (payload.conversation && (context.connectorPolicy !== 'optional' || context.requiredConnectors.length > 0)) return { outcome: 'ERROR', sessionId: null, failureCode: 'CONVERSATION_POLICY_UNSUPPORTED' }
+    // Optional connector failure must not erase the authenticated run principal on a fresh execution.
+    if (payload.contextPolicy) spawnMcpContext = context
     expectedConnectors = context.requiredConnectors
     if (context.connectorPolicy !== 'none') {
       step('preflight-mcp-connectors')
@@ -1929,12 +1989,29 @@ async function executeStartedRun(
   if (payload.conversation) {
     step('resolve-project-environment')
     const authority = await input.resolveProjectEnvironment({ ...run, conversationSessionId: payload.conversation.sessionId,
-      ...(!mcpContext.value?.mcpConfigProjectId.startsWith('chat:') ? { conversationDirectory: payload.directory } : {}) })
+      ...(payload.contextPolicy || !mcpContext.value?.mcpConfigProjectId.startsWith('chat:') ? { conversationDirectory: payload.directory } : {}) })
     if (!authority.ok) {
       return {
         outcome: 'ERROR', sessionId: null, failureCode: authority.code ?? 'CONVERSATION_TARGET_UNAVAILABLE',
         ...(authority.unreachable ? { unreachable: authority.unreachable } : {}),
       }
+    }
+    if (payload.contextPolicy) {
+      step('dispatch-isolated-context')
+      const dispatched = await input.dispatchIsolatedContext!({ automationId: automation.automationId, generation: automation.generation,
+        revision: automation.revision, ...run, payload, ...preparedContext, environmentVariables: authority.environmentVariables,
+        ...(spawnMcpContext ? { mcpSpawnContext: spawnMcpContext } : {}) })
+      const degraded = degradedCode ? { degradedCode } : {}
+      if (dispatched.sessionId !== automationExecutionSessionId(run.runId)) return {
+        outcome: 'ERROR', sessionId: null, failureCode: 'AUTOMATION_EXECUTION_IDENTITY_CONFLICT', ...degraded,
+      }
+      if (dispatched.state === 'waiting') return dispatched.deferred === true
+        ? { outcome: 'SKIPPED_GATE', sessionId: dispatched.sessionId, deferred: true, ...degraded }
+        : { outcome: 'ERROR', sessionId: dispatched.sessionId, failureCode: 'AUTOMATION_DEFERRED_OWNER_UNCONFIRMED', ...degraded }
+      if (dispatched.state !== 'started') return {
+        outcome: 'ERROR', sessionId: dispatched.sessionId, failureCode: 'AUTOMATION_START_UNCONFIRMED', ...degraded,
+      }
+      return { outcome: 'WOKE', sessionId: dispatched.sessionId, ...degraded }
     }
   }
   const builtPrompt = buildAutomationPrompt(payload.conversation ? payload.prompt : prompt, scriptOutput)
@@ -2082,6 +2159,13 @@ export async function runServerAutomationTick(
   for (const cancelled of input.cache.read().pendingCancellations ?? []) {
     try {
       const payload = input.decryptPayload(cancelled, input.machineSecretKey)
+      if (payload.contextPolicy) {
+        if (cancelled.payloadVersion === 6 && await input.cancelIsolatedContext?.({ automationId: cancelled.automationId,
+          revision: cancelled.revision, generation: cancelled.generation })) {
+          input.cache.markCancelled?.([{ automationId: cancelled.automationId, revision: cancelled.revision }])
+        } else input.logDebug?.(`[server-automation] ${cancelled.automationId} isolated cancellation pending: run-owned exit unconfirmed`)
+        continue
+      }
       const sessionId = payload.conversation?.sessionId ?? input.runtimeStore.read().schedules.find(row => row.automationId === cancelled.automationId)?.lastSessionId
       if (sessionId && await input.cancelScheduledSession?.({ sessionId, directory: payload.directory })) {
         input.cache.markCancelled?.([{ automationId: cancelled.automationId, revision: cancelled.revision }])
@@ -2158,15 +2242,37 @@ export async function runServerAutomationTick(
     if (!schedule || schedule.generation !== automation.generation) continue
     // 마감을 확인받지 못한 보류 run 이 있으면 due 를 그대로 두고 다음 틱에 다시 본다.
     if (hasUnsettledUnreachableRetry(runtimeState, automation.automationId)) continue
-    const retryDue = hasDueUnreachableRetry(runtimeState, automation, now)
+    const retryDue = findDueRetry(runtimeState, automation, now)
     if (schedule.nextRunAt > now && !immediateWorker && !retryDue) continue
     const payload = payloads.get(automation.automationId)!
+    if (payload.contextPolicy && input.isolatedContextReady === false) {
+      deferOnceAdmission(input, automation, payload, schedule, retryDue)
+      input.logDebug?.(`[server-automation] ${automation.automationId} isolated host unready; holding the original occurrence before claim`)
+      continue
+    }
+    if (schedule.contextAdmissionHold?.revision === automation.revision
+      && schedule.contextAdmissionHold.scheduledFor === schedule.nextRunAt) continue
+    let preparedContext: { previousResult?: unknown } | undefined
+    if (payload.contextPolicy) {
+      try {
+        preparedContext = await input.prepareIsolatedContext?.({ automationId: automation.automationId,
+          generation: automation.generation, revision: automation.revision, payload,
+          ...(retryDue ? { runId: retryDue.report.runId } : {}) }) ?? {}
+        buildAutomationContextInput({ automationId: automation.automationId, payload, ...preparedContext })
+      } catch (error) {
+        const code = error instanceof Error && /^AUTOMATION_[A-Z0-9_]{1,100}$/.test(error.message)
+          ? error.message : 'AUTOMATION_CONTEXT_INPUT_UNCONFIRMED'
+        deferOnceAdmission(input, automation, payload, schedule, retryDue)
+        input.logDebug?.(`[server-automation] ${automation.automationId} held before claim code=${code}`)
+        continue
+      }
+    }
     const queuedGithubEvents = payload.githubTrigger ? githubQueueDepth(input, automation) : 0
     const githubMode = payload.githubTrigger && queuedGithubEvents === 0 ? 'poll' : 'work'
     // 대기 게이트(aplus-dev-studio-desktop #2196): 대상 대화(이어 쓰는 대화, 아니면 직전 회차 대화)가 사용자 답을
     // 기다리면 회차를 claim 해 SKIPPED_GATE + 그 대화 id 로 보고한다 — 실행하지 않은 회차가 이력에 남고,
     // 겹침처럼 매 틱 조용히 미루지 않는다. 보류한 재시도는 이미 시작한 회차라 게이트를 다시 보지 않는다.
-    const waitingSessionId = payload.githubTrigger || retryDue
+    const waitingSessionId = payload.githubTrigger || payload.contextPolicy || retryDue
       ? null
       : previousRunWaitingSessionId(payload.conversation?.sessionId ?? schedule.lastSessionId, input)
     if (!waitingSessionId && !payload.githubTrigger && !payload.conversation
@@ -2196,6 +2302,23 @@ export async function runServerAutomationTick(
       scheduleNextTick(input, automation.automationId, now)
       continue
     }
+    let reservation: Extract<LegacyDispatchReservation, { acquired: true }> | undefined
+    if (!payload.contextPolicy && !waitingSessionId && input.reserveLegacyDispatch) {
+      try {
+        const admission = await input.reserveLegacyDispatch([payload.directory])
+        if (!admission.acquired) {
+          deferOnceAdmission(input, automation, payload, schedule, retryDue)
+          input.logDebug?.(`[server-automation] ${automation.automationId} held before claim: ${admission.reason}`)
+          continue
+        }
+        reservation = admission
+      } catch (error) {
+        deferOnceAdmission(input, automation, payload, schedule, retryDue)
+        input.logDebug?.(`[server-automation] ${automation.automationId} workspace unconfirmed before claim: ${error}`)
+        continue
+      }
+    }
+    try {
     // 재시도는 이미 시작된 같은 run 을 이어 쓴다 — 새로 claim 하면 서버 이력에 행이 늘고
     // 같은 회차가 두 번 실행될 수 있다.
     const retry = retryDue ? takeDueUnreachableRetry(input.runtimeStore, automation, now, input.logDebug) : null
@@ -2214,6 +2337,14 @@ export async function runServerAutomationTick(
         scheduledFor: schedule.nextRunAt,
       })
       if (!claim.ok || !claim.value) {
+        if (claim.error === 'claim-denied' && (payload.contextPolicy || input.reserveLegacyDispatch) && isOnceSchedule(payload.schedule)) {
+          const state = input.runtimeStore.read()
+          input.runtimeStore.write({ ...state, schedules: state.schedules.map(item => item.automationId === automation.automationId
+            ? { ...item, contextAdmissionHold: { code: 'CLAIM_RECONFIRMATION_REQUIRED', revision: automation.revision, scheduledFor: schedule.nextRunAt } }
+            : item) })
+          input.logDebug?.(`[server-automation] ${automation.automationId} once claim denied; original occurrence retained for reconfirmation`)
+          continue
+        }
         if (claim.error === 'already-claimed') markOnceOccurrenceSpent(input, automation.automationId, payload, schedule.nextRunAt)
         if (claim.error === 'claim-denied' || claim.error === 'already-claimed'
           || (claim.error === 'active-run' && schedule.runRequestRevision == null)) {
@@ -2265,11 +2396,12 @@ export async function runServerAutomationTick(
       degradedCode?: string
       queueDepth?: number
       unreachable?: string
+      deferred?: true
     }
     try {
       result = waitingSessionId
         ? { outcome: 'SKIPPED_GATE', sessionId: waitingSessionId }
-        : await executeStartedRun(input, automation, payload, { runId, claimToken }, githubMode, trace)
+        : await executeStartedRun(input, automation, payload, { runId, claimToken }, githubMode, trace, preparedContext)
     } catch (error) {
       if (error instanceof TickAbandonedError) {
         input.logDebug?.(`[server-automation] ${automation.automationId} run=${runId} abandoned at ${error.step}; reporting the run as failed so the server releases it`)
@@ -2309,6 +2441,12 @@ export async function runServerAutomationTick(
       }
       if (retry) rememberRetrySession(input.runtimeStore, automation.automationId, result.sessionId)
       else advanceSchedule(input, automation.automationId, payload, now, result.sessionId)
+    }
+    if (result.deferred === true) {
+      // The runtime owns the same RUNNING claim. In particular a one-time schedule must
+      // not be terminally skipped here or claimed again while its workspace is busy.
+      outcomes.push({ automationId: automation.automationId, outcome: result.outcome })
+      continue
     }
     // AgentTask의 서버 큐는 로컬 GitHub 이벤트 queueDepth에 포함되지 않는다.
     // worker를 시작했으면 같은 tick의 남은 예산으로 다시 조회하고, 초과분은 다음 tick에 실행한다.
@@ -2367,6 +2505,12 @@ export async function runServerAutomationTick(
       && githubEventsProcessed < MAX_GITHUB_EVENTS_PER_TICK) {
       immediateWorkerIds.add(automation.automationId)
       workQueue.push(automation)
+    }
+    } finally {
+      try { await reservation?.finish() }
+      catch (error) {
+        input.logDebug?.(`[server-automation] ${automation.automationId} handoff unconfirmed; workspace remains reserved: ${error}`)
+      }
     }
   }
   return outcomes

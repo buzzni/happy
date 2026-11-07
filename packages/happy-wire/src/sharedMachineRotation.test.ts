@@ -2,13 +2,37 @@ import { describe, expect, it } from 'vitest';
 import nacl from 'tweetnacl';
 import {
   MachineSetupTokenBindingV2Schema, DaemonRotationRequestBodySchema, rotationSigningBytes,
-  rotationIsFresh, rotationDigest, sessionCreateBodyHash, sessionTagHash,
+  rotationIsFresh, rotationDigest, sessionCreateBodyHash, sessionTagHash, sessionExecutionAuthorityDigest,
   signRotationDocument, verifyRotationDocument, daemonRotationOperationDigest,
   SessionExecutionTicketBodySchema, HappySessionCreateProofBodySchema, parseRotationDocument, RotationObservationSchema,
 } from './sharedMachineRotation';
 import fixture from './fixtures/sharedMachineRotation.v1.json';
 
 describe('portable rotation contract', () => {
+
+  it.each(['claude', 'codex'] as const)('signs provider-neutral execution authority for %s without any provider credential', async agent => {
+    const keys = nacl.sign.keyPair.fromSeed(new Uint8Array(32).fill(7));
+    const body = { version: 1, type: 'automation-execution-authority', audience: 'https://studio.test',
+      method: 'POST', path: '/api/automation/execution-target', companyId: 'company-1', machineId: 'machine-1',
+      approvalId: 'approval-1', deviceKeyId: 'a'.repeat(64), runId: 'run-1', generation: 1, revision: 2,
+      displaySessionId: 'manual-1', agent, launchId: 'launch-1', operationId: 'operation-1',
+      initialNonce: Buffer.alloc(32, 3).toString('base64url'), sessionOwnerAccountId: 'account-1',
+      machineOwnerAccountId: 'account-1', sessionTagHash: 'b'.repeat(64), sessionCreateBodyHash: 'c'.repeat(64),
+      issuedAt: 100000, expiresAt: 160000 };
+    const digest = await sessionExecutionAuthorityDigest(body);
+    expect(digest).toBe('ed8ac166a7214744c9e7fab916555692e17d648315a35ef5c2c5b8359ed00e2c');
+    const renewed = { ...body, issuedAt: 90000, expiresAt: 150000 };
+    expect(await sessionExecutionAuthorityDigest(renewed)).toBe(digest);
+    expect(await sessionExecutionAuthorityDigest({ ...body, initialNonce: Buffer.alloc(32, 4).toString('base64url') })).not.toBe(digest);
+    const document = await signRotationDocument(body as never, keys.secretKey);
+    await expect(verifyRotationDocument(document, keys.publicKey)).resolves.toEqual(document);
+    await expect(verifyRotationDocument({ ...document, body: { ...body, runId: 'another-run' } }, keys.publicKey)).rejects.toThrow();
+    expect(() => rotationSigningBytes({ ...body, path: '/v1/sessions' })).toThrow();
+    expect(() => rotationSigningBytes({ ...body, managedAccountId: 'must-not-issue-a-provider-account' })).toThrow();
+    expect(() => rotationSigningBytes({ ...body, credentialGeneration: 1 })).toThrow();
+    expect(() => rotationSigningBytes({ ...body, initialNonce: 'short' })).toThrow();
+  });
+
   it('pins every canonical byte, digest and Ed25519 signature independently of round trips', async () => {
     for (const vector of fixture.vectors) {
       expect(new TextDecoder().decode(rotationSigningBytes(vector.document.body))).toBe(vector.signingText);

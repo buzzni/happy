@@ -18,6 +18,8 @@ import { execSync, type ChildProcess } from 'node:child_process';
 import { spawn as crossSpawn } from 'cross-spawn';
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
 import { logger } from '@/ui/logger';
+import { createProviderExitObserver, type ProviderExitObserver } from '@/managed/managedProviderExitObserver';
+import { probeProcessGroup } from '@/daemon/managedProcessGroup';
 import { withCodexRecallOwnership } from '@/memory/recallOwnerMarker';
 import { nativeCodexRecallOwnershipOverrides } from '@/memory/nativeCodexRecallOwnership';
 import { CODEX_CONFIG_UNREADABLE, CUA_DRIVER_SERVER } from '@/toolPolicy/cuaShadow';
@@ -295,6 +297,7 @@ export class CodexAppServerClient {
     private disconnectOperation: { key: string; promise: Promise<void> } | null = null;
     private outputFailed = false;
     private turnAdmissionAbort: AbortController | null = null;
+    private workspaceTurnOperations = 0;
     private nextId = 1;
     private pending = new Map<number, PendingRequest>();
     private processEpoch = 0;
@@ -306,6 +309,9 @@ export class CodexAppServerClient {
     private readonly markTurnDispatched?: () => void;
     private onTurnDispatch?: () => void;
     private readonly protectedWriterTree: CheckpointWriterProcessTree | null;
+    private readonly automationProcesses: Array<{ process: ChildProcess; observer: ProviderExitObserver }> = [];
+    private automationExitEvidence: { foregroundDrained: boolean; backgroundDrained: boolean; providerExitedCleanly: boolean } | null = null;
+    private automationInputClosed = false;
     private sandboxCleanup: (() => Promise<void>) | null = null;
     private multiAuthProxy: PreparedCodexMultiAuthProxy | null = null;
     private readonly managedProviderArgs: string[] | null;
@@ -481,6 +487,10 @@ export class CodexAppServerClient {
          * own login.
          */
         agentPlanProviderArgs?: string[] | null,
+        /** Fixed from the Happy run identity before the first native process starts. */
+        private readonly isolatedAutomationContext = false,
+        /** Set only by a launch-bound workspace owner; it must not alter manual memory/configuration. */
+        private readonly workspaceExitObservation = false,
     ) {
         this.sandboxConfig = sandboxConfig;
         this.sandboxPolicyMode = sandboxPolicyMode;
@@ -568,6 +578,7 @@ export class CodexAppServerClient {
     }
 
     private assertInputOpen(): void {
+        if (this.automationInputClosed) throw new Error('AUTOMATION_CONTEXT_INPUT_CLOSED');
         if (this.shutdownInputFrozen) throw new Error('Codex input is frozen for shutdown');
     }
 
@@ -1240,6 +1251,8 @@ export class CodexAppServerClient {
             'stdio://',
             '-c', 'features.default_mode_request_user_input=true',
             ...(this.managedProviderArgs ?? this.agentPlanProviderArgs ?? this.multiAuthProxy?.args ?? []),
+            ...(this.isolatedAutomationContext ? ['-c', 'memories.use_memories=false', '-c', 'memories.generate_memories=false',
+                '-c', 'features.memories=false', '-c', 'features.hooks=false'] : []),
         ];
         this.sandboxEnabled = false;
         this.sandboxInitFailed = false;
@@ -1313,6 +1326,7 @@ export class CodexAppServerClient {
         // Use cross-spawn so npm-installed wrappers (codex.cmd / codex.ps1) resolve on Windows.
         // Native child_process.spawn fails with ENOENT for .cmd shims (issues #980, #1016).
         let proc: ReturnType<typeof crossSpawn>;
+        const observeExit = this.isolatedAutomationContext || this.workspaceExitObservation;
         try {
             this.assertInputOpen();
             if (revision !== this.disconnectRevision) throw new Error('Codex connection cancelled by disconnect');
@@ -1320,13 +1334,17 @@ export class CodexAppServerClient {
                 stdio: ['pipe', 'pipe', 'pipe'],
                 env,
                 windowsHide: true,
-                detached: Boolean(this.protectedWriterTree),
+                detached: Boolean(this.protectedWriterTree) || observeExit,
             });
         } catch (error) {
             await this.disconnectInternal();
             throw error;
         }
         this.process = proc;
+        if (observeExit) {
+            const observer = createProviderExitObserver(); observer.watch(proc);
+            this.automationProcesses.push({ process: proc, observer });
+        }
         this.protectedWriterTree?.track(proc);
         // The only point that may say the plan reached Codex (spec §6.3-3): the process was started with it.
         if (this.agentPlanProviderArgs) this.agentPlanAppliedToLaunch = true;
@@ -1433,6 +1451,16 @@ export class CodexAppServerClient {
             this.connected = true;
             this.subagentTrackingAvailable = isSubagentTrackingAvailable(codexVersion);
             this.subagents.setAvailable(this.subagentTrackingAvailable);
+            if (this.isolatedAutomationContext) {
+                const effective = await this.request('config/read', { cwd: process.cwd(), includeLayers: false }, 3000) as {
+                    config?: { memories?: { use_memories?: unknown; generate_memories?: unknown }; features?: { memories?: unknown; hooks?: unknown } };
+                };
+                const config = effective.config;
+                if (config?.memories?.use_memories !== false || config.memories.generate_memories !== false
+                    || config.features?.memories !== false || config.features.hooks !== false) {
+                    throw new Error('AUTOMATION_NATIVE_MEMORY_UNSUPPORTED');
+                }
+            }
             await confirmSessionWriteScope(scopeConfirmation, this.sandboxEnabled, this.sandboxConfig ?? undefined);
             logger.debug('[CodexAppServer] Connected and initialized');
         } catch (error) {
@@ -1501,6 +1529,95 @@ export class CodexAppServerClient {
                 finish({ exited: false, code: null, signal: null });
             }
         });
+    }
+
+    /** Cooperative native writer proof for a private run, distinct from model answer completion.
+     * A failed background read, active/unknown child, signal or surviving group never counts as natural exit. */
+    async finishAutomationContext(budgetMs: number): Promise<{
+        foregroundDrained: boolean; backgroundDrained: boolean; providerExitedCleanly: boolean;
+    }> {
+        if (!this.isolatedAutomationContext) throw new Error('AUTOMATION_CONTEXT_POLICY_UNSUPPORTED');
+        return this.finishObservedNativeWriters(budgetMs);
+    }
+
+    private workspaceForegroundIdle(proc: ChildProcess | null, threadId: string | null): boolean {
+        return this.connected && !!proc && !!threadId && !this._turnId && !this.pendingTurnCompletion
+            && !this.deferredRawTurnCompletion && this.openCommandExecutionTurns.size === 0
+            && this.outstandingServerRequests === 0 && this.userInputRequests.size === 0 && this.serverRequestTasks.size === 0
+            && this.pending.size === 0 && this.workspaceTurnOperations === 0;
+    }
+
+    /** Read-only preflight; the root must recheck its own input/writer gate before freezing. */
+    async canDrainWorkspace(): Promise<boolean> {
+        if (!this.workspaceExitObservation || this.automationInputClosed || this.shutdownInputFrozen) return false;
+        const proc = this.process, threadId = this._threadId, epoch = this.processEpoch;
+        if (!this.workspaceForegroundIdle(proc, threadId) || !threadId) return false;
+        await this.backgroundTasks.refresh(threadId);
+        return proc === this.process && epoch === this.processEpoch && threadId === this._threadId
+            && this.workspaceForegroundIdle(proc, threadId) && this.backgroundTasks.confirmedEmpty && this.subagents.confirmedIdle;
+    }
+
+    async finishWorkspaceContext(budgetMs: number): Promise<{
+        foregroundDrained: boolean; backgroundDrained: boolean; providerExitedCleanly: boolean;
+    }> {
+        if (!this.workspaceExitObservation) throw new Error('WORKSPACE_EXIT_OBSERVATION_UNSUPPORTED');
+        if (!Number.isFinite(budgetMs) || budgetMs <= 0 || budgetMs > 30_000) throw new Error('Invalid exit observation budget');
+        if (this.automationExitEvidence) return { ...this.automationExitEvidence };
+        const deadline = performance.now() + budgetMs, proc = this.process, threadId = this._threadId, epoch = this.processEpoch;
+        const idle = () => this.workspaceForegroundIdle(proc, threadId);
+        // Unlike an isolated automatic run, a busy manual context must remain usable. Read before sealing.
+        if (!idle() || !threadId) return { foregroundDrained: false, backgroundDrained: false, providerExitedCleanly: false };
+        await this.backgroundTasks.refresh(threadId);
+        if (proc !== this.process || epoch !== this.processEpoch || threadId !== this._threadId || !idle()) {
+            return { foregroundDrained: false, backgroundDrained: false, providerExitedCleanly: false };
+        }
+        const backgroundDrained = this.backgroundTasks.confirmedEmpty && this.subagents.confirmedIdle;
+        const remaining = Math.ceil(deadline - performance.now());
+        if (!backgroundDrained || remaining <= 0) return { foregroundDrained: true, backgroundDrained, providerExitedCleanly: false };
+        return this.finishObservedNativeWriters(remaining);
+    }
+
+    private async finishObservedNativeWriters(budgetMs: number): Promise<{
+        foregroundDrained: boolean; backgroundDrained: boolean; providerExitedCleanly: boolean;
+    }> {
+        if (!Number.isFinite(budgetMs) || budgetMs <= 0 || budgetMs > 30_000) throw new Error('Invalid exit observation budget');
+        if (this.automationExitEvidence) return { ...this.automationExitEvidence };
+        const deadline = performance.now() + budgetMs;
+        const proc = this.process, threadId = this._threadId, epoch = this.processEpoch;
+        // Seal before the first await; a late reconnect or queued turn must not invalidate this exit observation.
+        this.automationInputClosed = true;
+        const foregroundIdle = () => this.connected && !!proc && !!threadId && !this._turnId && !this.pendingTurnCompletion
+            && !this.deferredRawTurnCompletion && this.openCommandExecutionTurns.size === 0
+            && this.outstandingServerRequests === 0 && this.userInputRequests.size === 0 && this.serverRequestTasks.size === 0;
+        const foregroundDrained = foregroundIdle();
+        if (!foregroundDrained || !threadId) return { foregroundDrained: false, backgroundDrained: false, providerExitedCleanly: false };
+        if (this.backgroundTimer) clearTimeout(this.backgroundTimer);
+        this.backgroundTimer = null;
+        await this.backgroundTasks.refresh(threadId);
+        if (proc !== this.process || epoch !== this.processEpoch || !foregroundIdle()) {
+            return { foregroundDrained: false, backgroundDrained: false, providerExitedCleanly: false };
+        }
+        const backgroundDrained = this.backgroundTasks.confirmedEmpty && this.subagents.confirmedIdle;
+        if (!backgroundDrained) return { foregroundDrained, backgroundDrained, providerExitedCleanly: false };
+        // EOF alone asks for natural shutdown. This method never delivers a termination signal.
+        const remaining = Math.ceil(deadline - performance.now());
+        if (remaining <= 0) return { foregroundDrained, backgroundDrained, providerExitedCleanly: false };
+        const ended = await this.endInputAndAwaitExit(remaining);
+        if (ended.exited) await this.waitForOutputDrain();
+        const readProcesses = () => this.automationProcesses.map(child => ({ pid: child.process.pid ?? null, observed: child.observer.observed(), clean: child.observer.exitedCleanly(),
+            group: child.process.pid ? probeProcessGroup(child.process.pid).kind : 'indeterminate' }));
+        let processes = readProcesses();
+        while (ended.exited && ended.code === 0 && ended.signal === null && processes.length > 0
+            && processes.every(child => child.clean) && processes.some(child => child.group !== 'no-local-trace') && performance.now() < deadline) {
+            await new Promise(resolve => setTimeout(resolve, 20));
+            processes = readProcesses();
+        }
+        const providerExitedCleanly = ended.exited && ended.code === 0 && ended.signal === null
+            && processes.length > 0 && processes.every(child => child.clean && child.group === 'no-local-trace');
+        if (!providerExitedCleanly) logger.debug('[automation-context] EOF exit unconfirmed ' + JSON.stringify({ ended, processes }));
+        const result = { foregroundDrained, backgroundDrained, providerExitedCleanly };
+        if (providerExitedCleanly) this.automationExitEvidence = result;
+        return result;
     }
 
     private disconnectInternal(opts?: Parameters<CodexAppServerClient['performDisconnectInternal']>[0]): Promise<void> {
@@ -1577,7 +1694,10 @@ export class CodexAppServerClient {
             const alive = proc && proc.exitCode == null && proc.signalCode == null;
             try {
                 proc?.stdin?.end();
-                if (alive) proc?.kill('SIGTERM');
+                if (alive) {
+                    this.automationProcesses.find(child => child.process === proc)?.observer.markForced();
+                    proc?.kill('SIGTERM');
+                }
             } catch { /* ignore */ }
 
             // Force kill after 2s (unref so timer doesn't block process exit)
@@ -1745,7 +1865,26 @@ export class CodexAppServerClient {
         const readNativeServers = () => nativeRead ??= (this.request('config/read', { cwd, includeLayers: false }, 3000) as Promise<{
             config?: { mcp_servers?: unknown };
         }>).then((effective) => effective.config?.mcp_servers);
-        if (this.recallHostPrepared && !this.managedProviderArgs && this.sandboxPolicyMode === 'owner-choice') {
+        if (this.isolatedAutomationContext) {
+            const native = await readNativeServers();
+            if (native !== undefined && native !== null && (typeof native !== 'object' || Array.isArray(native))) {
+                throw new Error('AUTOMATION_NATIVE_MEMORY_UNSUPPORTED');
+            }
+            // Native config deep-merges. Explicitly turn off every inherited server not supplied by this run.
+            // Valid inert transports avoid copying native commands, arguments or credentials into the override.
+            const disabled: Record<string, unknown> = Object.create(null);
+            for (const [name, value] of Object.entries(native ?? {})) {
+                if (mcpServers && Object.hasOwn(mcpServers, name)) continue;
+                const entry = value !== null && typeof value === 'object' ? value as Record<string, unknown> : {};
+                disabled[name] = typeof entry.url === 'string'
+                    ? { url: 'http://127.0.0.1:9/disabled', enabled: false }
+                    : { command: process.execPath, args: ['-e', 'process.exit(0)'], enabled: false };
+            }
+            config.mcp_servers = { ...disabled, ...mcpServers };
+            config.memories = { use_memories: false, generate_memories: false };
+            config.features = { memories: false, hooks: false };
+        }
+        if (this.recallHostPrepared && !this.isolatedAutomationContext && !this.managedProviderArgs && this.sandboxPolicyMode === 'owner-choice') {
             let nativeServers: unknown;
             try {
                 // MCP stdio children filter their environment. Mark the existing native
@@ -2504,78 +2643,86 @@ export class CodexAppServerClient {
         /** Host observer invoked only after the provider accepts turn/start. */
         onSubmitted?: () => void;
     }): Promise<void> {
-        if (!this._threadId) {
-            throw new Error('No active thread. Call startThread first.');
-        }
-
-        this.assertInputOpen();
-        const turnPreparation = this.consumePreparedTurn(opts)
-            ?? await this.resolveBeforeTurn(opts)?.();
-        this.assertInputOpen();
-        // From here the prompt goes to the provider: whatever happens next, the turn's workspace is
-        // no longer discardable. specs/linux-checkpoint-enforcement-backend R4.
-        this.markTurnDispatched?.();
-        const effectiveOpts = applyCheckpointTurnPreparation(opts, turnPreparation);
-
-        const extraInputItems = opts?.extraInputItems ?? [];
-        const input: InputItem[] = [];
-        if (prompt.length > 0 || extraInputItems.length === 0) {
-            input.push({ type: 'text', text: prompt });
-        }
-        input.push(...extraInputItems);
-
-        // Build params — only include optional fields when set (server uses thread defaults otherwise)
-        const params: Record<string, unknown> = {
-            threadId: this._threadId,
-            input,
-        };
-        if (effectiveOpts?.cwd) params.cwd = effectiveOpts.cwd;
-        if (effectiveOpts?.approvalPolicy) params.approvalPolicy = effectiveOpts.approvalPolicy;
-        if (effectiveOpts?.model) params.model = effectiveOpts.model;
-        if (effectiveOpts?.effort) params.effort = effectiveOpts.effort;
-
-        // Map sandbox mode to the camelCase policy format the server expects.
-        if (effectiveOpts?.sandbox) {
-            params.sandboxPolicy = resolveCodexSandboxPolicy(
-                effectiveOpts.sandbox,
-                effectiveOpts.writableRoots ?? this.threadDefaults?.writableRoots ?? [],
-            );
-        }
-
-        // turn/start returns immediately; turn completes via events.
-        // We don't await completion here — the caller's event handler
-        // tracks task_complete / turn_aborted.
-        const observation = this.pendingTurnCompletion?.observation;
-        const result = await (opts?.beforeDispatch || opts?.onDispatched
-            ? this.request('turn/start', params, undefined, opts)
-            : this.request('turn/start', params)) as { turn?: { id?: string | null } };
-        try { opts?.onSubmitted?.(); } catch { logger.warn('[CodexAppServer] Submission observer failed'); }
-        const binding = this.pendingProjectBinding;
-        if (binding && binding.threadId === params.threadId) {
-            this.pendingProjectBinding = null;
-            void bindCodexThreadToProject({
-                ...binding,
-                request: (method, payload, timeoutMs) => binding.epoch === this.processEpoch
-                    ? this.request(method, payload, timeoutMs)
-                    : Promise.reject(new Error('Codex connection replaced')),
-            });
-        }
-        const turnId = result?.turn?.id;
-        if (typeof turnId === 'string' && turnId.length > 0) {
-            if (observation && this.nativeCompletionObservations.has(observation)) {
-                observation.turnId = turnId;
-                observation.successful = observation.earlyCompletions.get(turnId) ?? null;
-                observation.earlyCompletions.clear();
-                if (observation.successful === false) this.settleNativeCompletionObservation(observation, false);
+        this.workspaceTurnOperations++;
+        try {
+            if (!this._threadId) {
+                throw new Error('No active thread. Call startThread first.');
             }
-            this._turnId = turnId;
-            if (this.pendingTurnCompletion) {
-                if (this.pendingTurnCompletion.startedTurnId !== turnId) {
-                    this.pendingTurnCompletion.startedTurnId = null;
+
+            this.assertInputOpen();
+            const turnPreparation = this.consumePreparedTurn(opts)
+                ?? await this.resolveBeforeTurn(opts)?.();
+            this.assertInputOpen();
+            // From here the prompt goes to the provider: whatever happens next, the turn's workspace is
+            // no longer discardable. specs/linux-checkpoint-enforcement-backend R4.
+            this.markTurnDispatched?.();
+            const effectiveOpts = applyCheckpointTurnPreparation(opts, turnPreparation);
+
+            const extraInputItems = opts?.extraInputItems ?? [];
+            const input: InputItem[] = [];
+            if (prompt.length > 0 || extraInputItems.length === 0) {
+                input.push({ type: 'text', text: prompt });
+            }
+            input.push(...extraInputItems);
+
+            // Build params — only include optional fields when set (server uses thread defaults otherwise)
+            const params: Record<string, unknown> = {
+                threadId: this._threadId,
+                input,
+            };
+            if (effectiveOpts?.cwd) params.cwd = effectiveOpts.cwd;
+            if (effectiveOpts?.approvalPolicy) params.approvalPolicy = effectiveOpts.approvalPolicy;
+            if (effectiveOpts?.model) params.model = effectiveOpts.model;
+            if (effectiveOpts?.effort) params.effort = effectiveOpts.effort;
+
+            // Map sandbox mode to the camelCase policy format the server expects.
+            if (effectiveOpts?.sandbox) {
+                params.sandboxPolicy = resolveCodexSandboxPolicy(
+                    effectiveOpts.sandbox,
+                    effectiveOpts.writableRoots ?? this.threadDefaults?.writableRoots ?? [],
+                );
+            }
+
+            // turn/start returns immediately; turn completes via events.
+            // We don't await completion here — the caller's event handler
+            // tracks task_complete / turn_aborted.
+            const observation = this.pendingTurnCompletion?.observation;
+            const result = await (opts?.beforeDispatch || opts?.onDispatched
+                ? this.request('turn/start', params, undefined, opts)
+                : this.request('turn/start', params)) as { turn?: { id?: string | null } };
+            try { opts?.onSubmitted?.(); } catch { logger.warn('[CodexAppServer] Submission observer failed'); }
+            const binding = this.pendingProjectBinding;
+            if (binding && binding.threadId === params.threadId) {
+                this.pendingProjectBinding = null;
+                void bindCodexThreadToProject({
+                    ...binding,
+                    request: (method, payload, timeoutMs) => binding.epoch === this.processEpoch
+                        ? this.request(method, payload, timeoutMs)
+                        : Promise.reject(new Error('Codex connection replaced')),
+                });
+            }
+            const turnId = result?.turn?.id;
+            if (typeof turnId === 'string' && turnId.length > 0) {
+                if (observation && this.nativeCompletionObservations.has(observation)) {
+                    observation.turnId = turnId;
+                    observation.successful = observation.earlyCompletions.get(turnId) ?? null;
+                    observation.earlyCompletions.clear();
+                    if (observation.successful === false) this.settleNativeCompletionObservation(observation, false);
                 }
-                this.pendingTurnCompletion.turnId = turnId;
-                this.pendingTurnCompletion.turnIdConfirmed = true;
+                // A terminal can be consumed in the same stdout chunk as the ACK, before this continuation.
+                if (!this.completedTurnIds.has(turnId)) {
+                    this._turnId = turnId;
+                    if (this.pendingTurnCompletion) {
+                        if (this.pendingTurnCompletion.startedTurnId !== turnId) {
+                            this.pendingTurnCompletion.startedTurnId = null;
+                        }
+                        this.pendingTurnCompletion.turnId = turnId;
+                        this.pendingTurnCompletion.turnIdConfirmed = true;
+                    }
+                }
             }
+        } finally {
+            this.workspaceTurnOperations--;
         }
     }
 
@@ -2614,95 +2761,106 @@ export class CodexAppServerClient {
         /** Max time without any turn activity before interrupting the provider. */
         turnTimeoutMs?: number;
     }): Promise<{ aborted: boolean }> {
-        if (!this._threadId) {
-            throw new Error('No active thread. Call startThread first.');
-        }
-
-        // Wait for any in-flight interruptTurn() to complete before starting a new
-        // turn. Otherwise the stale turn/interrupt RPC can reach Codex after our
-        // turn/start and abort the wrong turn.
-        if (this.pendingInterrupt) {
-            await this.pendingInterrupt;
-            // Yield to the event loop so any stale turn_aborted/task_complete
-            // notifications queued by the interrupted turn are processed now
-            // (harmlessly, since pendingTurnCompletion is null at this point).
-            await new Promise(resolve => setTimeout(resolve, 0));
-        }
-
-        await this.admitTurn();
-
-        // Clear any stale watchdog snapshot so it can only describe this turn's abort.
-        this.pendingInactivityAbort = null;
-
-        this.assertInputOpen();
-        const turnPreparation = this.consumePreparedTurn(opts)
-            ?? await this.resolveBeforeTurn(opts)?.();
-        this.assertInputOpen();
-        // From here the prompt goes to the provider: whatever happens next, the turn's workspace is
-        // no longer discardable. specs/linux-checkpoint-enforcement-backend R4.
-        this.markTurnDispatched?.();
-        const effectiveOpts = applyCheckpointTurnPreparation(opts, turnPreparation);
-
-        const timeoutMs = opts?.turnTimeoutMs ?? CodexAppServerClient.TURN_TIMEOUT_MS;
-        // Checkpoint completion quiesces the provider process. Its own rollout metadata
-        // must be captured now; no constructed path or model/RPC argument can replace it.
-        const completedThread = this.nativeThreadMetadata?.id === this._threadId
-            ? { ...this.nativeThreadMetadata } : null;
-        const observation = opts?.onCompleted ? {
-            turnId: null as string | null, threadId: this._threadId, thread: completedThread,
-            successful: null as boolean | null, applied: false, timer: undefined as ReturnType<typeof setTimeout> | undefined,
-            earlyCompletions: new Map<string, boolean>(),
-            onCompleted: opts.onCompleted, onSettled: opts.onCompletionObservationSettled,
-        } : undefined;
-        if (observation) this.nativeCompletionObservations.add(observation);
-        const completion = new Promise<boolean>((resolve) => {
-            this.pendingTurnCompletion = {
-                resolve,
-                turnId: null,
-                startedTurnId: null,
-                turnIdConfirmed: false,
-                hasSteeredInput: false,
-                inactivityTimeoutMs: timeoutMs,
-                inactivityTimer: null,
-                observation,
-            };
-            this.schedulePendingTurnInactivityTimeout();
-        });
-
+        this.workspaceTurnOperations++;
         try {
-            await this.sendTurn(
-                prompt,
-                effectiveOpts ? { ...effectiveOpts, beforeTurn: undefined } : undefined,
-            );
-        } catch (err) {
-            this.resolvePendingTurn(true);
-            throw err;
-        }
-
-        const aborted = await completion;
-        try {
-            if (this.completeTurn) {
-                const applyResult = await this.completeTurn(async () => {
-                    if (!this.protectedWriterTree) {
-                        throw new Error('checkpoint writer process tree is unavailable');
-                    }
-                    await this.protectedWriterTree.quiesce(() => this.disconnectInternal({
-                        preserveThreadState: true,
-                        awaitProcessExit: true,
-                    }));
-                });
-                if (applyResult.status !== 'completed') throw new Error('checkpoint turn apply did not complete');
+            if (!this._threadId) {
+                throw new Error('No active thread. Call startThread first.');
             }
-        } catch (error) {
-            if (observation) this.settleNativeCompletionObservation(observation, false);
-            throw error;
+
+            // Wait for any in-flight interruptTurn() to complete before starting a new
+            // turn. Otherwise the stale turn/interrupt RPC can reach Codex after our
+            // turn/start and abort the wrong turn.
+            if (this.pendingInterrupt) {
+                await this.pendingInterrupt;
+                // Yield to the event loop so any stale turn_aborted/task_complete
+                // notifications queued by the interrupted turn are processed now
+                // (harmlessly, since pendingTurnCompletion is null at this point).
+                await new Promise(resolve => setTimeout(resolve, 0));
+            }
+
+            await this.admitTurn();
+
+            // Clear any stale watchdog snapshot so it can only describe this turn's abort.
+            this.pendingInactivityAbort = null;
+
+            this.assertInputOpen();
+            const turnPreparation = this.consumePreparedTurn(opts)
+                ?? await this.resolveBeforeTurn(opts)?.();
+            this.assertInputOpen();
+            // From here the prompt goes to the provider: whatever happens next, the turn's workspace is
+            // no longer discardable. specs/linux-checkpoint-enforcement-backend R4.
+            this.markTurnDispatched?.();
+            const effectiveOpts = applyCheckpointTurnPreparation(opts, turnPreparation);
+
+            const timeoutMs = opts?.turnTimeoutMs ?? CodexAppServerClient.TURN_TIMEOUT_MS;
+            // Checkpoint completion quiesces the provider process. Its own rollout metadata
+            // must be captured now; no constructed path or model/RPC argument can replace it.
+            const completedThread = this.nativeThreadMetadata?.id === this._threadId
+                ? { ...this.nativeThreadMetadata } : null;
+            const observation = opts?.onCompleted ? {
+                turnId: null as string | null, threadId: this._threadId, thread: completedThread,
+                successful: null as boolean | null, applied: false, timer: undefined as ReturnType<typeof setTimeout> | undefined,
+                earlyCompletions: new Map<string, boolean>(),
+                onCompleted: opts.onCompleted, onSettled: opts.onCompletionObservationSettled,
+            } : undefined;
+            if (observation) this.nativeCompletionObservations.add(observation);
+            const completion = new Promise<boolean>((resolve) => {
+                this.pendingTurnCompletion = {
+                    resolve,
+                    turnId: null,
+                    startedTurnId: null,
+                    turnIdConfirmed: false,
+                    hasSteeredInput: false,
+                    inactivityTimeoutMs: timeoutMs,
+                    inactivityTimer: null,
+                    observation,
+                };
+                this.schedulePendingTurnInactivityTimeout();
+            });
+
+            try {
+                await this.sendTurn(
+                    prompt,
+                    effectiveOpts ? { ...effectiveOpts, beforeTurn: undefined } : undefined,
+                );
+            } catch (err) {
+                this.resolvePendingTurn(true);
+                throw err;
+            }
+
+            const aborted = await completion;
+            try {
+                if (this.completeTurn) {
+                    const applyResult = await this.completeTurn(async () => {
+                        if (!this.protectedWriterTree) {
+                            throw new Error('checkpoint writer process tree is unavailable');
+                        }
+                        if (this.isolatedAutomationContext) {
+                            const exit = await this.finishAutomationContext(10_000);
+                            if (!exit.providerExitedCleanly || !exit.foregroundDrained || !exit.backgroundDrained) {
+                                throw new Error('AUTOMATION_WORKSPACE_EXIT_UNCONFIRMED');
+                            }
+                        }
+                        await this.protectedWriterTree.quiesce(() => this.disconnectInternal({
+                            preserveThreadState: true,
+                            awaitProcessExit: true,
+                        }));
+                    });
+                    if (applyResult.status !== 'completed') throw new Error('checkpoint turn apply did not complete');
+                }
+            } catch (error) {
+                if (observation) this.settleNativeCompletionObservation(observation, false);
+                throw error;
+            }
+            if (observation && this.nativeCompletionObservations.has(observation)) {
+                observation.applied = true;
+                if (aborted || observation.successful !== null) this.settleNativeCompletionObservation(observation, !aborted && observation.successful === true);
+                else observation.timer = setTimeout(() => this.settleNativeCompletionObservation(observation, false), 2_000);
+            }
+            return { aborted };
+        } finally {
+            this.workspaceTurnOperations--;
         }
-        if (observation && this.nativeCompletionObservations.has(observation)) {
-            observation.applied = true;
-            if (aborted || observation.successful !== null) this.settleNativeCompletionObservation(observation, !aborted && observation.successful === true);
-            else observation.timer = setTimeout(() => this.settleNativeCompletionObservation(observation, false), 2_000);
-        }
-        return { aborted };
     }
 
     private resolveBeforeTurn(
@@ -2804,7 +2962,12 @@ export class CodexAppServerClient {
 
     private request(method: string, params?: unknown, timeoutMs?: number,
         dispatch?: { beforeDispatch?: () => void; onDispatched?: () => void }): Promise<unknown> {
-        if (this.shutdownInputFrozen && method !== 'turn/interrupt') return Promise.reject(new Error('Codex input is frozen for shutdown'));
+        if (this.automationInputClosed && !['thread/backgroundTerminals/list', 'turn/interrupt'].includes(method)) {
+            return Promise.reject(new Error('AUTOMATION_CONTEXT_INPUT_CLOSED'));
+        }
+        // The private workspace drain still needs a fresh read-only background snapshot after input freeze.
+        const workspaceBackgroundRead = this.workspaceExitObservation && method === 'thread/backgroundTerminals/list';
+        if (this.shutdownInputFrozen && method !== 'turn/interrupt' && !workspaceBackgroundRead) return Promise.reject(new Error('Codex input is frozen for shutdown'));
         const timeout = timeoutMs ?? CodexAppServerClient.REQUEST_TIMEOUT_MS;
         return new Promise((resolve, reject) => {
             if (!this.process?.stdin?.writable) {

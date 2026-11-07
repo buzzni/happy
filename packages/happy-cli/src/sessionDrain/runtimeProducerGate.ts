@@ -28,6 +28,9 @@ export class RuntimeProducerGate {
         return null;
     }
 
+    /** Automatic workspace handoff must leave a whole manual turn and every existing writer untouched. */
+    isWorkspaceIdle(): boolean { return this.blocker() === null && this.phase === 'idle' && this.tasks.size === 0; }
+
     /** Called after all preflights and provider freeze, in the same synchronous stack. */
     freeze(): void {
         if (this.frozen) throw new Error('Runtime input already frozen');

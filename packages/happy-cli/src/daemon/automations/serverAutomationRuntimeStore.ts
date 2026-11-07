@@ -17,6 +17,10 @@ export interface ServerAutomationScheduleState {
   nextRunAt: number
   lastSessionId: string | null
   runRequestRevision?: number | null
+  /** A denied isolated once claim needs a new explicit run request; it is not a spent occurrence. */
+  contextAdmissionHold?: { code: 'CLAIM_RECONFIRMATION_REQUIRED'; revision: number; scheduledFor: number }
+  /** A pre-claim admission hold is not an offline missed occurrence. */
+  contextAdmissionDeferred?: { revision: number; scheduledFor: number }
   /**
    * 1회 예약에서 이미 실행한(claim 성공 또는 서버의 같은 회차 거절) 정규 회차 시각. generation 이 바뀌어도
    * 넘긴다 — 서버의 같은 회차 거절은 generation 단위라, 이것 없이는 실행 직후의 편집·재개가 그 회차를
@@ -260,6 +264,9 @@ function parse(raw: string): ServerAutomationRuntimeState {
     if (disk.version !== 1 || !Array.isArray(disk.schedules) || !Array.isArray(disk.pendingReports)) invalid()
     const schedules = disk.schedules.map((value) => {
       const row = record(value)
+      const deferred = row.contextAdmissionDeferred === undefined ? undefined : record(row.contextAdmissionDeferred)
+      const hold = row.contextAdmissionHold === undefined ? undefined : record(row.contextAdmissionHold)
+      if (hold && hold.code !== 'CLAIM_RECONFIRMATION_REQUIRED') invalid()
       return {
         automationId: text(row.automationId, 200),
         generation: integer(row.generation, 1),
@@ -271,6 +278,9 @@ function parse(raw: string): ServerAutomationRuntimeState {
             : integer(row.runRequestRevision, 1),
         } : {}),
         ...(row.spentOnceAt !== undefined ? { spentOnceAt: integer(row.spentOnceAt) } : {}),
+        ...(hold ? { contextAdmissionHold: { code: 'CLAIM_RECONFIRMATION_REQUIRED' as const,
+          revision: integer(hold.revision, 1), scheduledFor: integer(hold.scheduledFor) } } : {}),
+        ...(deferred ? { contextAdmissionDeferred: { revision: integer(deferred.revision, 1), scheduledFor: integer(deferred.scheduledFor) } } : {}),
         ...(row.deferredRunRequestAt !== undefined ? { deferredRunRequestAt: integer(row.deferredRunRequestAt) } : {}),
       }
     })

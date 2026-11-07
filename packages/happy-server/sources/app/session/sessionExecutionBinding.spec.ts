@@ -27,6 +27,7 @@ vi.mock('@/app/session/sessionDelete', () => ({ sessionDelete: vi.fn() }));
 vi.mock('@/app/session/sessionArchive', () => ({ sessionArchive: vi.fn() }));
 import { sessionRoutes } from '@/app/api/routes/sessionRoutes';
 import { machineSessionOwnerRoutes } from '@/app/api/routes/machineSessionOwnerRoutes';
+import { createExecutionBoundSession } from '@/app/session/sessionExecutionBinding';
 
 const studio = nacl.sign.keyPair.fromSeed(new Uint8Array(32).fill(1));
 const device = nacl.sign.keyPair.fromSeed(new Uint8Array(32).fill(2));
@@ -111,6 +112,25 @@ async function unchanged() {
 }
 
 describe('Happy execution create / lookup boundary against isolated PostgreSQL', () => {
+  it('keeps the execution proof boundary when the server reserves a run-owned session identity', async () => {
+    const body = { ...fixture.createBody, tag: 'automation-run:run-owned' };
+    const proof = await signed(body);
+    const first = await createExecutionBoundSession('personal-account', body, proof, undefined, undefined, 'run-owned');
+    expect(first.id).toBe('automation-run:run-owned');
+    const replay = await createExecutionBoundSession('personal-account', body, proof, undefined, undefined, 'run-owned');
+    expect(replay.id).toBe(first.id);
+    expect(await client.sessionExecutionBinding.count()).toBe(1);
+    expect((await client.sessionExecutionBinding.findFirstOrThrow()).sessionId).toBe(first.id);
+    expect(state.emitted).toHaveLength(1);
+  });
+
+  it('does not let ordinary session creation claim a reserved execution tag', async () => {
+    const body = { ...fixture.createBody, tag: 'automation-run:run-owned' };
+    const response = await create(await signed(body), body);
+    expect(response.statusCode).toBe(400);
+    await unchanged();
+  });
+
   it.skipIf(!process.env.ROTATION_PRODUCER_FIXTURE)('cross-repository: accepts actual Studio and CLI output without re-signing', async () => {
     const artifact = JSON.parse(await readFile(process.env.ROTATION_PRODUCER_FIXTURE!, 'utf8')) as {
       publicKey: string; body: SessionExecutionCreateBody; proof: HappySessionExecutionProof;

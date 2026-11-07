@@ -8,7 +8,7 @@
  */
 
 import type { ApiClient } from '@/api/api';
-import type { ApiSessionClient } from '@/api/apiSession';
+import type { ApiSessionClient, ApiSessionClientOptions } from '@/api/apiSession';
 import type { AgentState, Metadata, Session } from '@/api/types';
 import { configuration } from '@/configuration';
 import { createOfflineSessionStub, transferOfflineRegistrations } from '@/utils/offlineSessionStub';
@@ -24,7 +24,7 @@ export interface SetupOfflineReconnectionOptions {
      * of its own — the parent holds the only key for the one it was given.
      */
     managedRun?: boolean;
-    sessionOptions?: { trackShutdownStorage?: boolean };
+    sessionOptions?: ApiSessionClientOptions;
     /** API client instance */
     api: ApiClient;
     /** Unique session tag */

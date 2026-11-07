@@ -14,6 +14,7 @@
  * private askpass and its env, never the command line, a log line or an answer.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHmac } from 'node:crypto';
 import { appendFile, copyFile, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, rmdir, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -46,6 +47,7 @@ import { stopProjectNativeProcesses, type NativeStopResult } from './projectNati
 import { isWithinDirectory } from '@/modules/common/happyHomeGuard';
 import { openSealedForMachine } from '@/modules/common/machineSeal';
 import { logger } from '@/ui/logger';
+import type { LegacyDispatchReservation } from '@/utils/workspaceTurnAdmission';
 
 export const WORKTREE_OPS_METHODS = WORKTREE_OPS.map((op) => worktreeOpMethod(op));
 export type WorktreeOpsMethod = ReturnType<typeof worktreeOpMethod>;
@@ -87,9 +89,17 @@ export type WorktreeOpsDeps = {
     happyHomeDir: string;
     now?: () => number;
     purge?: ProjectPurgeIo;
+    reserveLegacyDispatch?: (roots: readonly string[]) => Promise<LegacyDispatchReservation>;
+    admitSubprocess?: (roots: readonly string[]) => Promise<void>;
     /** How long a write waits for another process's repository lock before refusing. */
     repositoryLockWaitMs?: number;
 };
+
+const operationAdmission = new AsyncLocalStorage<{
+    roots: readonly string[];
+    admitSubprocess?: WorktreeOpsDeps['admitSubprocess'];
+    assertTicketFresh: () => void;
+} | undefined>();
 
 export type WorktreeOpAnswer =
     | { success: true; result: Record<string, unknown>; finishedAt: number; attestation: string }
@@ -203,7 +213,12 @@ type GitOptions = {
  */
 const NETWORK_CONFIG = ['-c', 'http.followRedirects=false', '-c', 'protocol.http.allow=never'];
 
-function runGit(cwd: string, args: string[], options: GitOptions = {}): Promise<GitResult> {
+async function runGit(cwd: string, args: string[], options: GitOptions = {}): Promise<GitResult> {
+    const admission = operationAdmission.getStore();
+    if (admission?.admitSubprocess && !options.readOnly) await admission.admitSubprocess([...new Set([...admission.roots, cwd])]);
+    // Fixed metadata diffs must not invoke repository-configured external diff/textconv programs.
+    const commandIndex = args[0] === '-c' ? 2 : 0;
+    if (args[commandIndex] === 'diff') args = [...args.slice(0, commandIndex + 1), '--no-ext-diff', '--no-textconv', ...args.slice(commandIndex + 1)];
     return new Promise((resolvePromise) => {
         const child = spawn('git', [
             '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
@@ -415,11 +430,17 @@ async function serialized<T>(path: string, run: () => Promise<T>): Promise<T> {
         // the ticket/path guard has resolved this repository; no credential or wire change.
         const common = await runGit(path, ['rev-parse', '--git-common-dir'], { readOnly: true });
         // Existing prepare/purge operations also accept a folder that is not a repository yet.
-        if (common.code !== 0) return run();
+        if (common.code !== 0) {
+            operationAdmission.getStore()?.assertTicketFresh();
+            return run();
+        }
         const directory = await realpath(resolve(path, common.stdout.trim()));
         const lock = join(directory, 'saycode-desktop-write.lock');
         await acquireRepositoryLock(lock, giveUpAt);
-        try { return await run(); }
+        try {
+            operationAdmission.getStore()?.assertTicketFresh();
+            return await run();
+        }
         finally { await rmdir(lock).catch(() => undefined); }
     });
     repositoryQueues.set(key, next);
@@ -451,7 +472,7 @@ async function acquireRepositoryLock(lock: string, giveUpAt: number): Promise<vo
 }
 
 async function repositoryRoot(dir: string): Promise<string | null> {
-    const result = await runGit(dir, ['rev-parse', '--show-toplevel']);
+    const result = await runGit(dir, ['rev-parse', '--show-toplevel'], { readOnly: true });
     return result.code === 0 ? result.stdout.trim() : null;
 }
 
@@ -474,7 +495,7 @@ async function readCapability(dir: string): Promise<WorktreeOpResult<'capability
 }
 
 async function prepare(dir: string): Promise<WorktreeOpResult<'prepare'>> {
-    const inside = await runGit(dir, ['rev-parse', '--is-inside-work-tree']);
+    const inside = await runGit(dir, ['rev-parse', '--is-inside-work-tree'], { readOnly: true });
     if (inside.code !== 0 || inside.stdout.trim() !== 'true') {
         await gitOk(dir, ['init', '--quiet', '--initial-branch=main'], 'WORKTREE_PREPARE_FAILED');
     }
@@ -484,7 +505,7 @@ async function prepare(dir: string): Promise<WorktreeOpResult<'prepare'>> {
 }
 
 async function excludeFile(repo: string): Promise<string> {
-    return resolve(repo, (await gitOk(repo, ['rev-parse', '--git-path', 'info/exclude'], 'WORKTREE_ADD_FAILED')).trim());
+    return resolve(repo, (await gitOk(repo, ['rev-parse', '--git-path', 'info/exclude'], 'WORKTREE_ADD_FAILED', { readOnly: true })).trim());
 }
 
 async function excludeLines(repo: string, lines: string[]): Promise<void> {
@@ -510,13 +531,13 @@ async function snapshotCurrent(dir: string): Promise<{ revision: string; branch:
     const repo = await repositoryRoot(dir);
     if (!repo) throw new OpFailure('WORKTREE_SNAPSHOT_FAILED', 'git repository root not found');
     await stageNonPrivate(dir, 'WORKTREE_SNAPSHOT_FAILED');
-    const unchanged = (await runGit(dir, ['diff', '--cached', '--quiet'])).code === 0;
-    const hasHead = (await runGit(dir, ['rev-parse', '--verify', 'HEAD'])).code === 0;
+    const unchanged = (await runGit(dir, ['diff', '--cached', '--quiet'], { readOnly: true })).code === 0;
+    const hasHead = (await runGit(dir, ['rev-parse', '--verify', 'HEAD'], { readOnly: true })).code === 0;
     if (!unchanged || !hasHead) {
         await gitOk(dir, [...STUDIO_AUTHOR, 'commit', '--allow-empty', '-m', 'A+ Studio: 새 작업 버전 시작 전 저장'], 'WORKTREE_SNAPSHOT_FAILED');
     }
-    const revision = (await gitOk(dir, ['rev-parse', 'HEAD'], 'WORKTREE_SNAPSHOT_FAILED')).trim();
-    const head = await runGit(dir, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+    const revision = (await gitOk(dir, ['rev-parse', 'HEAD'], 'WORKTREE_SNAPSHOT_FAILED', { readOnly: true })).trim();
+    const head = await runGit(dir, ['symbolic-ref', '--quiet', '--short', 'HEAD'], { readOnly: true });
     return { revision, branch: head.code === 0 ? head.stdout.trim() || null : null };
 }
 
@@ -573,7 +594,7 @@ async function createWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
     if (!repo) throw new OpFailure('WORKTREE_REPO_NOT_FOUND', 'git repository root not found');
     return serialized(repo, async () => {
         for (const ref of [params.name, ...(params.baseSource === 'origin' ? [params.baseRef!] : [])]) {
-            await gitOk(workspace, ['check-ref-format', '--branch', ref], 'WORKTREE_INVALID_REF');
+            await gitOk(workspace, ['check-ref-format', '--branch', ref], 'WORKTREE_INVALID_REF', { readOnly: true });
         }
         // A workspace inside someone else's repository must not get a worktree there unless the
         // server confirmed that repository root with the user (the 2026-07-19 incident).
@@ -602,7 +623,7 @@ async function createWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
                     const error = gitError(fetched);
                     throw new OpFailure(AUTH_FAILURE.test(error) ? 'WORKTREE_AUTH_REQUIRED' : 'WORKTREE_FETCH_FAILED', error);
                 }
-                baseRevision = (await gitOk(repo, ['rev-parse', '--verify', `${fetchRef}^{commit}`], 'WORKTREE_FETCH_FAILED')).trim();
+                baseRevision = (await gitOk(repo, ['rev-parse', '--verify', `${fetchRef}^{commit}`], 'WORKTREE_FETCH_FAILED', { readOnly: true })).trim();
             } finally {
                 await runGit(repo, ['update-ref', '-d', fetchRef]);
             }
@@ -610,7 +631,7 @@ async function createWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
             if (baseRef) {
                 base = baseRef;
             } else {
-                const originHead = await runGit(repo, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
+                const originHead = await runGit(repo, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD'], { readOnly: true });
                 base = originHead.code === 0 && originHead.stdout.trim() ? originHead.stdout.trim() : 'HEAD';
             }
             baseRevision = base;
@@ -727,7 +748,7 @@ async function requireBranch(dir: string, branch: string): Promise<void> {
 /** The server's checkpoint: everything but private env files, committed when anything is staged. */
 async function checkpoint(dir: string, message: string): Promise<void> {
     await stageNonPrivate(dir, 'WORKTREE_CHECKPOINT_FAILED');
-    if ((await runGit(dir, ['diff', '--cached', '--quiet'])).code !== 0) {
+    if ((await runGit(dir, ['diff', '--cached', '--quiet'], { readOnly: true })).code !== 0) {
         await gitOk(dir, [...STUDIO_AUTHOR, 'commit', '-m', message], 'WORKTREE_CHECKPOINT_FAILED');
     }
 }
@@ -754,7 +775,7 @@ async function fetchBranch(dir: string, remote: string, branch: string, credenti
             if (allowMissing && NO_REMOTE_BRANCH.test(error)) return null;
             throw new OpFailure(AUTH_FAILURE.test(error) ? 'WORKTREE_AUTH_REQUIRED' : 'WORKTREE_FETCH_FAILED', error);
         }
-        return (await gitOk(dir, ['rev-parse', '--verify', `${fetchRef}^{commit}`], 'WORKTREE_FETCH_FAILED')).trim();
+        return (await gitOk(dir, ['rev-parse', '--verify', `${fetchRef}^{commit}`], 'WORKTREE_FETCH_FAILED', { readOnly: true })).trim();
     } finally {
         await runGit(dir, ['update-ref', '-d', fetchRef]);
     }
@@ -860,7 +881,7 @@ async function updateWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
             // Every conflict one way: a side that deleted the file wins as a deletion.
             const stage = params.conflictChoice === 'current' ? '2' : '3';
             for (const conflict of await unmergedPaths(target.path)) {
-                if ((await runGit(target.path, ['cat-file', '-e', `:${stage}:${conflict}`])).code === 0) {
+                if ((await runGit(target.path, ['cat-file', '-e', `:${stage}:${conflict}`], { readOnly: true })).code === 0) {
                     await runGit(target.path, ['checkout', params.conflictChoice === 'current' ? '--ours' : '--theirs', '--', conflict]);
                     await runGit(target.path, ['add', '--', conflict]);
                 } else {
@@ -877,7 +898,7 @@ async function updateWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
             if (conflicts.length > 0) throw new OpFailure('WORKTREE_UPDATE_CONFLICT', gitError(merged), { conflicts });
             throw new OpFailure('WORKTREE_UPDATE_FAILED', gitError(merged));
         }
-        return { head: (await gitOk(target.path, ['rev-parse', 'HEAD'], 'WORKTREE_UPDATE_FAILED')).trim() };
+        return { head: (await gitOk(target.path, ['rev-parse', 'HEAD'], 'WORKTREE_UPDATE_FAILED', { readOnly: true })).trim() };
     });
 }
 
@@ -939,7 +960,7 @@ async function publishWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: 
             const error = gitError(pushed);
             throw new OpFailure(AUTH_FAILURE.test(error) ? 'WORKTREE_AUTH_REQUIRED' : 'WORKTREE_PUSH_FAILED', error);
         }
-        return { commit: (await gitOk(target.path, ['rev-parse', 'HEAD'], 'WORKTREE_PUSH_FAILED')).trim() };
+        return { commit: (await gitOk(target.path, ['rev-parse', 'HEAD'], 'WORKTREE_PUSH_FAILED', { readOnly: true })).trim() };
     });
 }
 
@@ -973,7 +994,7 @@ async function createBranch(guard: PathGuard, ticket: WorktreeTicket & { op: 'cr
     const params: WorktreeOpParams<'create-branch'> = ticket.params;
     const dir = await guard.directory(params.workspaceDir);
     return serialized(dir, async () => {
-        await gitOk(dir, ['check-ref-format', '--branch', params.branchName], 'WORKSPACE_BRANCH_INVALID');
+        await gitOk(dir, ['check-ref-format', '--branch', params.branchName], 'WORKSPACE_BRANCH_INVALID', { readOnly: true });
         const inside = await runGit(dir, ['rev-parse', '--is-inside-work-tree'], { readOnly: true });
         if (inside.code !== 0 || inside.stdout.trim() !== 'true') {
             await gitOk(dir, ['init', '--quiet', '--initial-branch=main'], 'WORKSPACE_BRANCH_FAILED');
@@ -997,7 +1018,7 @@ async function prepareConversation(
     const dir = await guard.directory(params.workspaceDir);
     return serialized(dir, async () => {
         const base = params.baseBranch;
-        await gitOk(dir, ['check-ref-format', '--branch', base], 'WORKSPACE_CHECKOUT_FAILED');
+        await gitOk(dir, ['check-ref-format', '--branch', base], 'WORKSPACE_CHECKOUT_FAILED', { readOnly: true });
         const current = await currentBranch(dir);
         if (params.source === 'local' && params.allowCurrentBranchDirty && current === base) return { branch: base };
         const status = await gitOk(dir, ['status', '--porcelain=v2', '--untracked-files=all', '--', ...params.statusPathspecs], 'WORKSPACE_STATUS_FAILED', { readOnly: true });
@@ -1390,7 +1411,7 @@ async function cloneWorkspace(
             throw new OpFailure(/remote branch .* not found/i.test(error) ? 'WORKSPACE_CLONE_BRANCH_MISSING' : 'WORKSPACE_CLONE_FAILED', error);
         }
         await pins.pin(slashed(dir), 'workspace', identity);
-        return { changed: true, head: (await gitOk(dir, ['rev-parse', 'HEAD'], 'WORKSPACE_CLONE_FAILED')).trim(), branch: params.branch };
+        return { changed: true, head: (await gitOk(dir, ['rev-parse', 'HEAD'], 'WORKSPACE_CLONE_FAILED', { readOnly: true })).trim(), branch: params.branch };
     });
 }
 
@@ -1673,6 +1694,42 @@ export function createWorktreeOpsHandlers(deps: WorktreeOpsDeps): Record<Worktre
     const guard = pathGuard(deps.allowedRoot, deps.happyHomeDir);
     const pins = remotePins(deps.happyHomeDir);
 
+    async function admissionRoots(ticket: WorktreeTicket): Promise<{ candidates: string[]; writers: string[] }> {
+        if ('workspaceDir' in ticket.params) {
+            const requested = resolve(ticket.params.workspaceDir);
+            if (ticket.op === 'clone') {
+                if (!isManagedProjectFolder(requested, ticket.projectId)) throw new OpFailure('PATH_DENIED', "Not this project's managed workspace folder");
+                if (!repositoryIdentity(ticket.params.remoteUrl)) throw new OpFailure('WORKSPACE_REMOTE_INVALID', 'The repository address names no repository');
+                await requireUnlinkedPath(requested);
+            }
+            let dir: string;
+            try { dir = await guard.directory(requested); }
+            catch (error) {
+                if ((ticket.op !== 'clone' && ticket.op !== 'purge-project') || !(error instanceof OpFailure) || error.errorCode !== 'WORKSPACE_MISSING') throw error;
+                await guard.missing(requested);
+                dir = requested;
+            }
+            if (ticket.op === 'purge-project' && dir !== requested) throw new OpFailure('PATH_DENIED', 'The folder is reached through a link');
+            if (ticket.op === 'create' || ticket.op === 'adopt-check') {
+                const repo = await repositoryRoot(dir);
+                if (!repo) throw new OpFailure('WORKTREE_REPO_NOT_FOUND', 'git repository root not found');
+                if (repo !== slashed(dir) && repo !== ticket.params.expectedRepoRoot) throw new OpFailure('WORKTREE_NOT_REPO_ROOT', 'workspace dir is not the repository root');
+                const root = await guard.directory(repo);
+                if (ticket.op === 'create') {
+                    const target = managedWorktreePath(root, ticket.projectId, ticket.params.name);
+                    await requireUnlinkedLanding(root, target);
+                    return { candidates: [root, target], writers: [root] };
+                }
+                const target = await resolveWorktreeTarget(guard, ticket.params.worktreePath, ticket.projectId);
+                if (target.repoRoot !== root) throw new OpFailure('PATH_DENIED', 'path is outside this repository managed worktree directory');
+                return { candidates: [root, target.path], writers: [root] };
+            }
+            return { candidates: [dir], writers: [dir] };
+        }
+        const target = await resolveWorktreeTarget(guard, ticket.params.worktreePath, ticket.projectId);
+        return { candidates: [target.repoRoot, target.path], writers: [target.repoRoot] };
+    }
+
     const run = (ticket: WorktreeTicket, credential: PreparedGitCredential | null): Promise<Record<string, unknown>> => {
         switch (ticket.op) {
             case 'capability': return guard.directory(ticket.params.workspaceDir).then(readCapability);
@@ -1715,13 +1772,30 @@ export function createWorktreeOpsHandlers(deps: WorktreeOpsDeps): Record<Worktre
             if (!read.ok) return refused('GIT_CREDENTIAL_INVALID', 'The credential was not sealed for this machine and ticket');
             credential = { username: read.username, token: read.token };
         }
-        const admission = await usedTickets(deps.happyHomeDir).admit(ticket.opId, ticket.issuedAt, at);
-        if (admission === 'replayed') return refused('TICKET_REPLAYED', 'This ticket was already used');
-        if (admission === 'full') return refused('TICKET_BUSY', 'Too many worktree operations in the window');
-
-        const prepared = credential ? await prepareGitCredential(credential) : null;
+        let reservation: Extract<LegacyDispatchReservation, { acquired: true }> | undefined;
+        let prepared: PreparedGitCredential | null = null;
         try {
-            const result = await run(ticket, prepared);
+            if (!!deps.reserveLegacyDispatch !== !!deps.admitSubprocess) throw new OpFailure('WORKSPACE_ADMISSION_UNAVAILABLE', 'Host process reservation is unavailable');
+            let context: NonNullable<Parameters<typeof operationAdmission.run>[0]> = { roots: [], assertTicketFresh: () => {
+                const freshAt = now();
+                if (freshAt > ticket.expiresAt || ticket.issuedAt > freshAt + ISSUE_SKEW_MS) {
+                    throw new OpFailure('TICKET_EXPIRED', 'This ticket is not valid now');
+                }
+            } };
+            if (deps.reserveLegacyDispatch && deps.admitSubprocess) {
+                const roots = await admissionRoots(ticket);
+                const admitted = await deps.reserveLegacyDispatch(roots.candidates);
+                if (!admitted.acquired) throw new OpFailure({ 'workspace-busy': 'WORKSPACE_BUSY', 'workspace-owner-unconfirmed': 'WORKSPACE_OWNER_UNCONFIRMED', 'registry-busy': 'WORKSPACE_REGISTRY_BUSY' }[admitted.reason], admitted.reason);
+                reservation = admitted;
+                context = { ...context, roots: roots.writers, admitSubprocess: deps.admitSubprocess };
+            }
+            const freshAt = now();
+            if (freshAt > ticket.expiresAt || ticket.issuedAt > freshAt + ISSUE_SKEW_MS) return refused('TICKET_EXPIRED', 'This ticket is not valid now');
+            const admission = await usedTickets(deps.happyHomeDir).admit(ticket.opId, ticket.issuedAt, freshAt);
+            if (admission === 'replayed') return refused('TICKET_REPLAYED', 'This ticket was already used');
+            if (admission === 'full') return refused('TICKET_BUSY', 'Too many worktree operations in the window');
+            prepared = credential ? await prepareGitCredential(credential) : null;
+            const result = await operationAdmission.run(context, () => run(ticket, prepared));
             const finishedAt = now();
             logger.debug('[worktree-ops] done', { op, opId: ticket.opId });
             return { success: true, result, finishedAt, attestation: attestWorktreeResult(machine.encryptionKey, ticket, result, finishedAt) };
@@ -1730,7 +1804,11 @@ export function createWorktreeOpsHandlers(deps: WorktreeOpsDeps): Record<Worktre
             logger.debug('[worktree-ops] failed', { op, error: error instanceof Error ? error.message : String(error) });
             return refused('WORKTREE_OP_FAILED', error instanceof Error ? error.message : 'Worktree operation failed');
         } finally {
-            await prepared?.dispose();
+            try { await prepared?.dispose(); }
+            finally {
+                try { await reservation?.finish(); }
+                catch { logger.debug('[worktree-ops] Workspace handoff unconfirmed; temporary ownership retained'); }
+            }
         }
     };
 

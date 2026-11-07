@@ -109,7 +109,7 @@ export async function runMigrations(opts: { pgliteDir: string; migrationsDir?: s
     await pg.close();
 }
 
-async function serve() {
+export async function serve() {
     // Capture parent EOF/commands before asynchronous initialization; drain only after startup.
     const control = process.env.HAPPY_STANDALONE_CONTROL === "stdin-v1"
         ? standaloneControl(process.stdin) : undefined;

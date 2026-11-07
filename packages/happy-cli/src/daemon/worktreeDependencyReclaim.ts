@@ -38,7 +38,7 @@ export function emptyReclaimResult(): ReclaimResult {
         skips: {}, errors: [] };
 }
 async function git(root: string, ...args: string[]) {
-    return (await exec('git', ['-C', root, ...args], commandOptions)).stdout;
+    return (await exec('git', ['-C', root, '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...args], commandOptions)).stdout;
 }
 async function storage(path: string): Promise<Storage> {
     const s = await statfs(path);

@@ -12,6 +12,7 @@ export class CodexBackgroundTasks {
     private tasks = new Map<string, CodexBackgroundTask>();
     private generation = 0;
     private completed = new Set<string>();
+    private snapshotConfirmed = false;
 
     constructor(
         private readonly request: (method: string, params: unknown) => Promise<unknown>,
@@ -19,8 +20,12 @@ export class CodexBackgroundTasks {
     ) {}
 
     get hasTasks(): boolean { return this.tasks.size > 0; }
+    /** An empty UI list on a failed/unsupported read is never writer quiescence. */
+    get confirmedEmpty(): boolean { return this.snapshotConfirmed && this.tasks.size === 0; }
 
     restore(tasks: CodexBackgroundTask[]): void {
+        this.generation++;
+        this.snapshotConfirmed = false;
         this.tasks = new Map(tasks.map(task => [task.callId, { ...task, status: 'unknown' }]));
         if (this.hasTasks) this.publish([...this.tasks.values()]);
     }
@@ -32,12 +37,14 @@ export class CodexBackgroundTasks {
 
     invalidate(): void {
         this.generation++;
+        this.snapshotConfirmed = false;
         for (const [id, task] of this.tasks) this.tasks.set(id, { ...task, status: 'unknown' });
         if (this.hasTasks) this.publish([...this.tasks.values()]);
     }
 
     async refresh(threadId: string, candidates: Array<{ callId: string; command: string }> = []): Promise<void> {
         const generation = ++this.generation;
+        this.snapshotConfirmed = false;
         for (const task of candidates) {
             if (!this.completed.has(task.callId)) this.tasks.set(task.callId, { ...task, status: 'unknown' });
         }
@@ -66,6 +73,7 @@ export class CodexBackgroundTasks {
             if (generation !== this.generation) return;
             for (const id of completedDuringRead) next.delete(id);
             this.tasks = next;
+            this.snapshotConfirmed = true;
             // Retain tombstones through this read, then allow the next fresh snapshot.
             this.completed = new Set();
         } catch (error) {

@@ -69,6 +69,7 @@ export async function ensureAgentTaskReviewObjects(input: {
   runCommand?: (command: ReviewObjectCommand) => Promise<ReviewObjectCommandResult>;
   has?: (sha: string) => Promise<boolean>;
   environmentVariables?: Record<string, string>;
+  admitSubprocess?: (roots: readonly string[]) => Promise<void>;
 }): Promise<{ ok: true; fetched: string[] } | { ok: false; error: string }> {
   if (input.shas.length === 0) return { ok: true, fetched: [] };
   const runCommand = input.runCommand ?? defaultRunCommand;
@@ -84,6 +85,9 @@ export async function ensureAgentTaskReviewObjects(input: {
     if (!await has(sha)) missing.push(sha);
   }
   if (missing.length === 0) return { ok: true, fetched: [] };
+
+  try { await input.admitSubprocess?.([input.directory]); }
+  catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'WORKSPACE_UNAVAILABLE' }; }
 
   // 옵션은 최소로 둔다. `--no-write-fetch-head` 는 git 2.29+ 전용이라 2.25 를 쓰는
   // 프로덕션 머신에서 usage 만 출력하고 아무것도 받아오지 않는다 — 확인 없이 붙였다가

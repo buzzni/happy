@@ -25,6 +25,7 @@ import { startServerProcess, StartServerError } from './startServer';
 import { stopServerProcess, StopServerError } from './stopServer';
 import { BrowserBridge, BridgeRequestError } from './browserBridge';
 import { attachTerminalWsRoute, type TerminalRouteMachine as TerminalMachineEncryption } from './controlServerTerminalWs';
+import type { TerminalOpenAdmissionInput } from './terminalOpenAdmission';
 import { scopeErrorCode } from './sessionWriteScopeErrors';
 import type { SessionWriteScopeRuntime } from './sessionWriteScopeRuntime';
 import { SetupTokenActivitySchema } from '@slopus/happy-wire';
@@ -121,7 +122,11 @@ export function startDaemonControlServer({
   getDeviceEnrollment = () => null,
   getSetupTokenAccountSwitch = () => null,
   getCallerLaunches = () => null,
+  admitSubprocess,
+  reserveLegacyDispatch,
 }: {
+  admitSubprocess?: (roots: readonly string[]) => Promise<void>;
+  reserveLegacyDispatch?: TerminalOpenAdmissionInput['reserveLegacyDispatch'];
   sessionRetention?: SessionRetention;
   /** T1c-b2 H2 owner-contact launch bootstrap; null while the rollout switch is off. */
   getCallerLaunches?: () => { issue(raw: unknown): Promise<unknown>; current(raw: unknown): Promise<{ current: boolean }> } | null;
@@ -312,6 +317,8 @@ export function startDaemonControlServer({
       allowedRoot,
       approvedRoots,
       getMachineEncryption,
+      ...(admitSubprocess ? { admitSubprocess } : {}),
+      ...(reserveLegacyDispatch ? { reserveLegacyDispatch } : {}),
     });
 
     // Set up Zod type provider
@@ -874,6 +881,7 @@ export function startDaemonControlServer({
     }, async (request, reply) => {
       try {
         const result = await startServerProcess(request.body, {
+          ...(admitSubprocess ? { admitSubprocess } : {}),
           // Give Node's ChildProcess 'error' event (ENOENT) time to fire
           // before we claim success. Matches the web-ui handler's
           // setImmediate+error-once pattern.

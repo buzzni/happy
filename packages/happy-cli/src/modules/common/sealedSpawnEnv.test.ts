@@ -5,9 +5,10 @@
 import { existsSync, mkdtempSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { deriveServerRpcKey } from '@/api/encryption';
 import { createSealedSpawnEnvHandler, openSealedSpawnEnv, sealSpawnEnv } from './sealedSpawnEnv';
+import type { LegacyDispatchReservation } from '@/utils/workspaceTurnAdmission';
 
 const machineKey = new Uint8Array(32).fill(3);
 const laneKey = deriveServerRpcKey(machineKey);
@@ -24,11 +25,16 @@ function sealed(over: Record<string, unknown> = {}, key: Uint8Array = laneKey): 
   } as never);
 }
 
-function handler(machine: Partial<{ id: string; encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey' }> = {}) {
+function handler(machine: Partial<{ id: string; encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey' }> = {}, host: {
+  now?: () => number;
+  reserveLegacyDispatch?: (roots: readonly string[]) => Promise<LegacyDispatchReservation>;
+  admitSubprocess?: (roots: readonly string[]) => Promise<void>;
+} = {}) {
   return createSealedSpawnEnvHandler({
     machine: () => ({ id: 'machine-1', encryptionKey: machineKey, encryptionVariant: 'dataKey', ...machine }),
     allowedRoot: root,
     now: () => now,
+    ...host,
   });
 }
 
@@ -46,6 +52,58 @@ describe('openSealedSpawnEnv', () => {
 });
 
 describe('spawn-with-sealed-env', () => {
+  it('keeps the sealed nonce usable after workspace refusal and never retains a replay as a writer', async () => {
+    let busy = true;
+    const finish = vi.fn(async () => undefined);
+    const reserveLegacyDispatch = vi.fn(async () => busy
+      ? { acquired: false as const, reason: 'workspace-busy' as const, sessions: ['isolated'] }
+      : { acquired: true as const, finish });
+    const admitSubprocess = vi.fn(async () => undefined);
+    const run = handler({}, { reserveLegacyDispatch, admitSubprocess });
+    const request = { command: 'printf ran', cwd: root, sealedEnv: sealed(), envDelivery: 'process' as const };
+    expect(await run(request)).toMatchObject({ success: false, errorCode: 'WORKSPACE_UNAVAILABLE' });
+    expect(reserveLegacyDispatch).toHaveBeenCalledWith([root]);
+    expect(admitSubprocess).not.toHaveBeenCalled();
+    expect(finish).not.toHaveBeenCalled();
+    busy = false;
+    expect(await run(request)).toMatchObject({ success: true, stdout: 'ran' });
+    expect(admitSubprocess).toHaveBeenCalledExactlyOnceWith([root]);
+    expect(finish).toHaveBeenCalledOnce();
+    expect(await run(request)).toMatchObject({ success: false, errorCode: 'SEALED_ENV_REPLAYED' });
+    expect(admitSubprocess).toHaveBeenCalledOnce();
+    expect(finish).toHaveBeenCalledTimes(2);
+  });
+
+  it('rechecks expiration after awaiting the workspace reservation without submitting a writer', async () => {
+    let at = now;
+    const finish = vi.fn(async () => undefined);
+    const admitSubprocess = vi.fn(async () => undefined);
+    const run = handler({}, { now: () => at, admitSubprocess,
+      reserveLegacyDispatch: async () => { at += 10 * 60_000; return { acquired: true, finish }; } });
+    expect(await run({ command: 'printf ran', cwd: root, sealedEnv: sealed(), envDelivery: 'process' }))
+      .toMatchObject({ success: false, errorCode: 'SEALED_ENV_STALE' });
+    expect(admitSubprocess).not.toHaveBeenCalled();
+    expect(finish).toHaveBeenCalledOnce();
+  });
+
+  it('holds an unconfirmed workspace without consuming the sealed request', async () => {
+    const admitSubprocess = vi.fn(async () => undefined);
+    const run = handler({}, { admitSubprocess, reserveLegacyDispatch: async () => {
+      throw new Error('WORKSPACE_REPOSITORY_IDENTITY_UNCONFIRMED');
+    } });
+    expect(await run({ command: 'printf ran', cwd: root, sealedEnv: sealed(), envDelivery: 'process' }))
+      .toMatchObject({ success: false, errorCode: 'WORKSPACE_UNAVAILABLE' });
+    expect(admitSubprocess).not.toHaveBeenCalled();
+  });
+
+  it('refuses a host process port without its pre-nonce reservation contract', async () => {
+    const admitSubprocess = vi.fn(async () => undefined);
+    const run = handler({}, { admitSubprocess });
+    expect(await run({ command: 'printf ran', cwd: root, sealedEnv: sealed(), envDelivery: 'process' }))
+      .toMatchObject({ success: false, errorCode: 'WORKSPACE_ADMISSION_UNAVAILABLE' });
+    expect(admitSubprocess).not.toHaveBeenCalled();
+  });
+
   it('runs the command with the opened env as process env, not as command text', async () => {
     const result = await handler()({ command: 'printf %s "$API_KEY"', cwd: root, sealedEnv: sealed(), envDelivery: 'process' });
     expect(result).toMatchObject({ success: true, stdout: 'secret-value', exitCode: 0 });

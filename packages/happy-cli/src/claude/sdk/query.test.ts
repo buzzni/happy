@@ -33,6 +33,24 @@ describe('query adapter', () => {
         return (sdkQuery.mock.calls as unknown as [{ options: Record<string, unknown> }][]).at(-1)![0].options;
     }
 
+    it('disables native automatic memory for an isolated run while preserving explicit tools and permission hooks', () => {
+        const settingsPath = join(configDirectory, 'isolated-hooks.json');
+        const hooks = { PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: 'trusted-policy-hook' }] }] };
+        writeFileSync(settingsPath, JSON.stringify({ hooks, autoMemoryEnabled: true,
+            env: { CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0', KEEP_SETTING: 'value' } }));
+        vi.stubEnv('CLAUDE_CODE_DISABLE_AUTO_MEMORY', '0');
+        const mcpServers = { approved: { command: 'approved-mcp' } };
+        query({ prompt: 'this occurrence', options: { isolatedAutomationContext: true,
+            settingsPath, settingSources: ['user', 'project'], mcpServers, resume: 'own-run-continuation' } });
+        const options = lastOptions();
+        expect(options).toMatchObject({ settingSources: [], strictMcpConfig: true, mcpServers, resume: 'own-run-continuation',
+            env: { CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', CLAUDE_MEMORY_RECALL_OWNER: 'host', CLAUDE_MEMORY_LESSON_OWNER: 'host' } });
+        expect(JSON.parse(options.settings as string)).toMatchObject({ autoMemoryEnabled: false, hooks,
+            env: { CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', KEEP_SETTING: 'value' } });
+        expect(process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe('0');
+        expect(JSON.parse(readFileSync(settingsPath, 'utf8')).autoMemoryEnabled).toBe(true);
+    });
+
     it('pins the assigned organization token on every query, including resume and title calls', () => {
         vi.stubEnv('HAPPY_AI_AUTH_SOURCE', 'org-bundle');
         for (const token of ['fixture-first-generation', 'fixture-next-generation']) {

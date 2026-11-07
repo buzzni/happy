@@ -420,10 +420,12 @@ export class MessageQueue2<T> {
      * Wait for messages and return all messages with the same mode as a single string
      * Returns { message: string, mode: T } or null if aborted/closed
      */
-    async waitForMessagesAndGetAsString(abortSignal?: AbortSignal, claim?: () => boolean): Promise<CollectedBatch<T> | null> {
+    async waitForMessagesAndGetAsString(abortSignal?: AbortSignal, claim?: () => boolean,
+        beforeDequeue?: () => Promise<boolean>): Promise<CollectedBatch<T> | null> {
         this.discardInvalid();
         // If we have messages, return them immediately
         if (this.queue.length > 0) {
+            if (beforeDequeue && (!await beforeDequeue() || abortSignal?.aborted || this.closed)) return null;
             return this.collectBatch(claim);
         }
 
@@ -439,6 +441,7 @@ export class MessageQueue2<T> {
             return null;
         }
 
+        if (beforeDequeue && (!await beforeDequeue() || abortSignal?.aborted || this.closed)) return null;
         return this.collectBatch(claim);
     }
 

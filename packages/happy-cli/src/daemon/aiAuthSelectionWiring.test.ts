@@ -117,10 +117,11 @@ describe('배선 가드: spawn 이 선택을 존중하고 검증하는가', () =
     expect(owned).toContain('const result = await deps.start(prepared.options, prepared.launch);');
     // Dispatch evidence is set at both process-launch boundaries, after validation. Without it
     // a lost webhook could be misclassified as a retryable refusal and spawn a duplicate.
-    expect(text).toContain('onProcessSubmission: () => ownedStartGuard.submitted(options),');
-    expect(text).toContain('if (standaloneWindows) onProcessSubmission?.();');
+    expect(text).toMatch(/onProcessSubmission: \(\) => \{\s*if \(workspaceLaunch\) workspaceLaunch.submitted = true;\s*ownedStartGuard\.submitted\(options\);/);
+    expect(text).toContain('if (standaloneWindows) { workspaceLaunch.submitted = true; onProcessSubmission?.(); }');
     expect(text).toContain('if (ownedStartGuard.wasSubmitted(options)) return finishSpawn(Promise.resolve({');
-    expect(text).toMatch(/try \{ onProcessSubmission\?\.\(\); return spawnHappyCLI\(/);
+    const regular = text.slice(text.indexOf('const happyProcess = prepared?.childProcess'), text.indexOf('scopeReports?.attach(happyProcess);'));
+    expect(regular).toMatch(/try \{\s*workspaceLaunch\.submitted = true; onProcessSubmission\?\.\(\);[\s\S]*?const child = spawnHappyCLI\(/);
   });
 
   it('두 spawn 경로가 자식에게 건네는 바로 그 env 를 검증한다', async () => {
@@ -133,10 +134,11 @@ describe('배선 가드: spawn 이 선택을 존중하고 검증하는가', () =
     expect(text).toContain('const managedAiCredentialEnvironment = await applyManualPersonal(options.aiAuthSelection, launchAuthorityEnvironment,')
     expect(text).toMatch(/const tmuxEnv = applyAppliedAiAuthSourceEnv\(/)
     expect(text).toMatch(/const spawnEnvironment = applyAppliedAiAuthSourceEnv\(/)
-    expect(text).toMatch(/\}, tmuxEnv, start => launchManagedAiCredentialSession\(launchAuthorityEnvironment, \(\) => \{\s*ownedStartGuard\.submitted\(options\); return start\(\);\s*\}\)\)/)
+    expect(text).toMatch(/\}, tmuxEnv, start => launchManagedAiCredentialSession\(launchAuthorityEnvironment, \(\) => \{\s*if \(workspaceLaunch\) workspaceLaunch.submitted = true;\s*ownedStartGuard\.submitted\(options\); return start\(\);\s*\}\)\)/)
     expect(text).toMatch(/env: spawnEnvironment,\s*managedAiCredentialEnvironment,\s*launchAuthorityEnvironment,/)
     expect(text).toMatch(/launchManagedAiCredentialSession = aiCredentialRuntime\.launchSession/)
-    expect(text).toMatch(/await launchManagedAiCredentialSession\(launchAuthorityEnvironment,\s*\(\) => \{[^;]*;\s*try \{ onProcessSubmission\?\.\(\); return spawnHappyCLI\(/)
+    const regular = text.slice(text.indexOf('const happyProcess = prepared?.childProcess'), text.indexOf('scopeReports?.attach(happyProcess);'))
+    expect(regular).toMatch(/await launchManagedAiCredentialSession\(launchAuthorityEnvironment,\s*\(\) => \{[\s\S]*?try \{\s*workspaceLaunch\.submitted = true; onProcessSubmission\?\.\(\);[\s\S]*?const child = spawnHappyCLI\(/)
     expect(text).toMatch(/await launchManagedAiCredentialSession\(launchAuthorityEnvironment, \(\) => prepared\.resume\(\)\)/)
     expect(text).toMatch(/resumeTargetSessionId: happySessionId,\s*managedAiCredentialEnvironment,/)
   })

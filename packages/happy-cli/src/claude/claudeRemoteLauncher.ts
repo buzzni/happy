@@ -46,7 +46,7 @@ import { mergeUsageLimits } from "./utils/usageLimits";
 import { getAskUserQuestionToolCallIds } from "./utils/questionNotification";
 import { cleanupStdinAfterInk } from "@/utils/terminalStdinCleanup";
 import type { ContentBlockParam } from '@anthropic-ai/sdk/resources';
-import { createEnvelope, type McpRuntimeServerStatus } from '@slopus/happy-wire';
+import { createEnvelope, isAutomationExecutionSessionId, type McpRuntimeServerStatus } from '@slopus/happy-wire';
 import type { McpRuntimeRecovery } from './mcpRuntimeRecovery';
 import { registerMcpReconnectHandler } from './registerMcpReconnectHandler';
 import { publishClaudePromptSuggestion } from './promptSuggestionMetadata';
@@ -88,6 +88,8 @@ const usageLimitsQueries = new WeakMap<object, number>();
 
 export async function claudeRemoteLauncher(session: Session): Promise<'switch' | 'exit'> {
     logger.debug('[claudeRemoteLauncher] Starting remote launcher');
+    const isolatedAutomation = isAutomationExecutionSessionId(session.client.sessionId);
+    const observeWorkspaceExit = isolatedAutomation || session.standaloneDrain?.workspaceExitObservation === true;
 
     // Survives generation restarts within this session; see the call below.
     const lessonObservations = createLessonTurnObservations();
@@ -924,7 +926,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
              * actually starts.
              */
             const proof = generationProofs.begin((onStarted) => (
-                session.managedRun || drain ? createProviderExitObserver(onStarted) : null
+                session.managedRun || drain || isolatedAutomation ? createProviderExitObserver(onStarted) : null
             ));
             const sdkExit = proof?.observer ?? null;
             messageBuffer.addMessage('═'.repeat(40), 'status');
@@ -1021,6 +1023,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     managedSettingsLockdown: session.managedSettingsLockdown,
                     personalClaudeAuth: personalFallback?.identity() ? { oauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? '' } : undefined,
                     managedRun: session.managedRun,
+                    workspaceExitObservation: session.standaloneDrain?.workspaceExitObservation,
+                    onWorkspaceReadinessReady: reader => session.standaloneDrain?.setWorkspaceReadiness(reader),
                     /*
                      * A fresh observer for **this** generation.
                      *
@@ -1030,6 +1034,14 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                      * process and gets a different observer.
                      */
                     ...(sdkExit ? { providerExitObserver: sdkExit } : {}),
+                    ...(observeWorkspaceExit ? { onAutomationContextExit: (evidence: NonNullable<Session['automationContextExitEvidence']>) => {
+                        const previous = session.automationContextExitEvidence;
+                        session.automationContextExitEvidence = {
+                            foregroundDrained: (previous?.foregroundDrained ?? true) && evidence.foregroundDrained,
+                            backgroundDrained: (previous?.backgroundDrained ?? true) && evidence.backgroundDrained,
+                            providerExitedCleanly: (previous?.providerExitedCleanly ?? true) && evidence.providerExitedCleanly,
+                        };
+                    } } : {}),
                     /*
                      * `completeTurn` and `exitAfterFirstTurn` return without
                      * ever calling `nextMessage`, so the exhaustion they do

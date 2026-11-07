@@ -71,6 +71,23 @@ async function createApp() {
 }
 
 describe("sessionRoutes", () => {
+    it.each([
+        '/v1/sessions',
+        '/v2/sessions/active',
+        '/v2/sessions?cursor=cursor_v1_manual-session',
+        '/v2/sessions/recent?cursor=cursor_v2_1793754000000_manual-session',
+    ])('excludes run-owned execution sessions before pagination in %s', async url => {
+        dbMock.session.findMany.mockResolvedValue([]);
+        const app = await createApp();
+        try {
+            const response = await app.inject({ method: 'GET', url, headers: { 'x-user-id': 'user-1' } });
+            expect(response.statusCode).toBe(200);
+            expect(dbMock.session.findMany).toHaveBeenCalledWith(expect.objectContaining({
+                where: expect.objectContaining({ accountId: 'user-1', NOT: { id: { startsWith: 'automation-run:' } } }),
+            }));
+        } finally { await app.close(); }
+    });
+
     it("registers all routes without duplicate method/path pairs", async () => {
         const app = await createApp();
 

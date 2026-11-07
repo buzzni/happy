@@ -45,7 +45,8 @@ import { WebSocketServer, type WebSocket, type RawData } from 'ws';
 import { logger } from '@/ui/logger';
 import { decodeBase64, decrypt } from '@/api/encryption';
 import { validatePath } from '@/modules/common/pathSecurity';
-import { decideTerminalCwd, formatCwdFallbackBanner } from './decideTerminalCwd';
+import { formatCwdFallbackBanner } from './decideTerminalCwd';
+import { prepareTerminalOpen, type TerminalOpenAdmissionInput, type TerminalOpenPreparation } from './terminalOpenAdmission';
 import { createPtySession, type PtySession } from './remoteTerminal';
 import {
   addDaemonTerminalSession,
@@ -59,7 +60,7 @@ import {
 import { createTerminalOutputCoalescer } from './terminalOutputCoalescer';
 import { replyToTerminalResume, resetPagedResume, sendExitAfterReplay } from './terminalResumeReply';
 import { machineKeyTerminalCipher, type MachineEncryption } from './terminalCipher';
-import { bindTerminal, createTerminalOpenNonceGuard, decideTerminalOpen, receiveBoundTerminalFrame, replyToBoundResume } from './terminalBindingSession';
+import { bindTerminal, createTerminalOpenNonceGuard, receiveBoundTerminalFrame, replyToBoundResume } from './terminalBindingSession';
 
 export interface TerminalWsRoute {
   wss: WebSocketServer;
@@ -156,6 +157,8 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
   getMachineEncryption: () => TerminalRouteMachine | null;
   /** Tests shorten this; production uses DIRECT_TERMINAL_DETACH_GRACE_MS. */
   detachGraceMs?: number;
+  reserveLegacyDispatch?: TerminalOpenAdmissionInput['reserveLegacyDispatch'];
+  admitSubprocess?: TerminalOpenAdmissionInput['admitSubprocess'];
 }): TerminalWsRoute {
   const detachGraceMs = opts.detachGraceMs ?? DIRECT_TERMINAL_DETACH_GRACE_MS;
   const wss = new WebSocketServer({
@@ -255,6 +258,7 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
     // The terminal this connection carries, once `terminal-open` or
     // `terminal-attach` succeeds. One per connection.
     let bound: DirectTerminal | null = null;
+    let openingPending = false;
 
     const send = (message: { reqId?: string; data?: unknown; error?: string }) => sendOn(ws, message);
 
@@ -280,6 +284,14 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
 
       if (event === 'terminal-open') {
         if (bound !== null) return; // duplicate open on an already-open connection — ignore.
+        if (openingPending) {
+          if (reqId) send({ reqId, error: 'Terminal opening is already pending' });
+          return;
+        }
+        openingPending = true;
+        void (async () => {
+        let preparation: Extract<TerminalOpenPreparation, { kind: 'ready' }> | undefined;
+        try {
 
         const machineEncryption = opts.getMachineEncryption();
         if (!machineEncryption) {
@@ -301,16 +313,28 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
           if (reqId) send({ reqId, error: 'Failed to decrypt open params' });
           return;
         }
-        const decision = decideTerminalOpen(openParams, {
+        const prepared = await prepareTerminalOpen({ opened: openParams,
           machineId: machineEncryption.machineId ?? '',
           strict: machineEncryption.strict === true,
           nonceGuard: terminalOpenNonceGuard,
+          reserveLegacyDispatch: opts.reserveLegacyDispatch,
+          admitSubprocess: opts.admitSubprocess,
+          cwd: { allowedRoot: opts.allowedRoot, homedir: homedir(), fsExists: existsSync,
+            fsMkdir: p => { mkdirSync(p, { recursive: true }); },
+            validate: (path, root) => validatePath(path, root, opts.approvedRoots?.()) },
         });
-        if (decision.kind === 'refused') {
-          logger.debug(`[CONTROL SERVER] /terminal open refused: ${decision.code}`);
-          if (reqId) send({ reqId, error: decision.error });
+        if (prepared.kind === 'refused') {
+          logger.debug(`[CONTROL SERVER] /terminal open refused: ${prepared.code}`);
+          if (reqId) send({ reqId, error: prepared.error });
           return;
         }
+        preparation = prepared;
+        if (ws.readyState !== ws.OPEN) return;
+        if (bound !== null) {
+          if (reqId) send({ reqId, error: 'Terminal connection is already attached' });
+          return;
+        }
+        const { decision, cwdDecision } = prepared;
         openParams = decision.params as OpenParams;
 
         const auditUserId = auditUserIdOf(openParams);
@@ -322,15 +346,7 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
           if (reqId) send({ reqId, error: 'Too many active terminals' });
           return;
         }
-        const cwdDecision = decideTerminalCwd({
-          requested: typeof openParams.cwd === 'string' ? openParams.cwd : undefined,
-          allowedRoot: opts.allowedRoot,
-          homedir: homedir(),
-          fsExists: existsSync,
-          fsMkdir: (p) => mkdirSync(p, { recursive: true }),
-          validate: (path, root) => validatePath(path, root, opts.approvedRoots?.()),
-        });
-
+        await prepared.submit(() => {
         let pty: PtySession;
         try {
           pty = createPtySession({
@@ -428,6 +444,15 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
         if (reqId) send({ reqId, data: { ok: true, sessionId, caps: opening
           ? { ...DIRECT_TERMINAL_CAPS, terminalBinding: { version: 1, proof: opening.proof } }
           : DIRECT_TERMINAL_CAPS } });
+        });
+        } finally {
+          await preparation?.cancel();
+          openingPending = false;
+        }
+        })().catch(error => {
+          logger.debug(`[CONTROL SERVER] /terminal opening failed: ${error instanceof Error ? error.message : String(error)}`);
+          if (reqId) send({ reqId, error: 'Terminal opening failed' });
+        });
         return;
       }
 

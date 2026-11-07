@@ -8,6 +8,7 @@ import { CheckpointProtectionStateStore } from './checkpointProtectionState';
 import { CheckpointRestoreExecutor, type CheckpointRestoreMutation } from './checkpointRestore';
 import { CheckpointStore } from './checkpointStore';
 import { createCheckpointLocalHistory } from './checkpointLocalHistory';
+import { createLegacyDispatchAdmission, createSubprocessWriteAdmission, createWorkspaceTurnAdmission } from '@/utils/workspaceTurnAdmission';
 
 const operationId = (sequence: number): string => (
     `123e4567-e89b-42d3-a456-${sequence.toString().padStart(12, '0')}`
@@ -43,10 +44,12 @@ describe('checkpoint daemon RPC', () => {
         restartSession = vi.fn(async () => {}),
         refreshSession?: () => Promise<void>,
         exclusions: { excludedPaths: string[]; excludedPatterns: string[] } = { excludedPaths: [], excludedPatterns: [] },
+        admission: { reserveLegacyDispatch?: ReturnType<typeof createLegacyDispatchAdmission>; admitSubprocess?: ReturnType<typeof createSubprocessWriteAdmission> } = {},
     ) {
         const protectionState = new CheckpointProtectionStateStore(checkpointRoot);
         return createCheckpointRpcHandlers({
             checkpointRoot,
+            ...admission,
             ...(restoreExecutor ? { restoreExecutor } : {}),
             resolveEventPublisher: async () => ({ rewind }),
             restartSession,
@@ -171,6 +174,53 @@ describe('checkpoint daemon RPC', () => {
         });
         return snapshot.checkpointId;
     }
+
+    it.each(['execute', 'retry'] as const)('keeps a blocked restore %s retryable without publishing or changing files', async method => {
+        const checkpointId = await createAgentModifiedCheckpoint();
+        const rewind = vi.fn(async () => ({ id: 'event', seq: 1, createdAt: Date.now(), idempotent: false }));
+        const handlers = createHandlers(undefined, rewind, undefined, undefined, undefined, {
+            reserveLegacyDispatch: createLegacyDispatchAdmission({ home: fixtureRoot }),
+            admitSubprocess: createSubprocessWriteAdmission({ home: fixtureRoot }),
+        });
+        const plan = await handlers.preview({ schemaVersion: 1, ...authority, checkpointId });
+        const request = { schemaVersion: 1, ...authority, operationId: operationId(101), confirmed: true, plan };
+        const owner = createWorkspaceTurnAdmission({ home: fixtureRoot, roots: [projectPath], kind: 'automation', sessionId: 'checkpoint-auto' });
+        expect(await owner.tryAcquire()).toEqual({ acquired: true });
+        await expect(handlers[method](request)).rejects.toThrow('WORKSPACE_BUSY');
+        expect(await readFile(join(projectPath, 'tracked.txt'), 'utf8')).toBe('agent version\n');
+        expect(rewind).not.toHaveBeenCalled();
+        expect(await owner.release(true)).toBe(true);
+        expect(await handlers[method](request)).toMatchObject({ status: 'completed' });
+        expect(await readFile(join(projectPath, 'tracked.txt'), 'utf8')).toBe('before\n');
+        expect(rewind).toHaveBeenCalledOnce();
+        expect(await owner.tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+    });
+
+    it.each([false, true])('does not retain a no-write checkpoint result (stale=%s) as an unknown writer', async stale => {
+        const checkpointId = await createAgentModifiedCheckpoint();
+        if (!stale) await writeFile(join(projectPath, 'tracked.txt'), 'later user version\n');
+        const admitSubprocess = vi.fn(createSubprocessWriteAdmission({ home: fixtureRoot }));
+        const handlers = createHandlers(undefined, undefined, undefined, undefined, undefined, {
+            reserveLegacyDispatch: createLegacyDispatchAdmission({ home: fixtureRoot }), admitSubprocess,
+        });
+        const plan = await handlers.preview({ schemaVersion: 1, ...authority, checkpointId }) as { entries: unknown[] };
+        const result = await handlers.execute({ schemaVersion: 1, ...authority, operationId: operationId(102), confirmed: true,
+            plan: stale ? { ...plan, entries: [] } : plan });
+        expect(result).toMatchObject({ status: stale ? 'stale-plan' : 'completed' });
+        expect(admitSubprocess).not.toHaveBeenCalled();
+        const owner = createWorkspaceTurnAdmission({ home: fixtureRoot, roots: [projectPath], kind: 'automation', sessionId: 'checkpoint-read-only' });
+        expect(await owner.tryAcquire()).toEqual({ acquired: true }); await owner.release(true);
+    });
+
+    it('refuses a partially configured checkpoint host before any restore effect', async () => {
+        const checkpointId = await createAgentModifiedCheckpoint(), admitSubprocess = vi.fn(async () => {});
+        const handlers = createHandlers(undefined, undefined, undefined, undefined, undefined, { admitSubprocess });
+        const plan = await handlers.preview({ schemaVersion: 1, ...authority, checkpointId });
+        await expect(handlers.execute({ schemaVersion: 1, ...authority, operationId: operationId(103), confirmed: true, plan }))
+            .rejects.toThrow('WORKSPACE_ADMISSION_UNAVAILABLE');
+        expect(admitSubprocess).not.toHaveBeenCalled();
+        expect(await readFile(join(projectPath, 'tracked.txt'), 'utf8')).toBe('agent version\n');
+    });
 
     it('previews current exclusions instead of offering a restore that execute rejects', async () => {
         const checkpointId = await createAgentModifiedCheckpoint();

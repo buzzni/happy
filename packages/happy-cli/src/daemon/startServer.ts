@@ -14,6 +14,7 @@
 
 import { spawn, ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { sanitizeChildEnv } from '@/utils/childEnv'
 import { tokenizeCommand } from './tokenizeCommand'
 
@@ -22,6 +23,7 @@ export type StartServerErrorCode =
   | 'INVALID_COMMAND'
   | 'EXEC_NOT_FOUND'
   | 'SPAWN_FAILED'
+  | 'WORKSPACE_UNAVAILABLE'
 
 export class StartServerError extends Error {
   public readonly code: StartServerErrorCode
@@ -47,6 +49,8 @@ export interface StartServerOptions {
   fastFailDelayMs?: number
   /** Hook so controlServer / apiMachine can track the child for future stop-server RPCs. */
   onSpawn?: (child: ChildProcess) => void
+  /** Host-only writer admission, before a detached process can outlive this call. */
+  admitSubprocess?: (roots: readonly string[]) => Promise<void>
 }
 
 /**
@@ -54,7 +58,7 @@ export interface StartServerOptions {
  * `StartServerError` carrying a stable machine-readable code so callers
  * can translate to HTTP status / RPC envelope shapes.
  */
-export function startServerProcess(
+export async function startServerProcess(
   req: StartServerRequest,
   opts: StartServerOptions = {},
 ): Promise<StartServerResult> {
@@ -72,6 +76,11 @@ export function startServerProcess(
     )
   }
   const [cmd, ...args] = argv
+
+  try { await opts.admitSubprocess?.([resolve(req.cwd)]) }
+  catch (error) {
+    throw new StartServerError('WORKSPACE_UNAVAILABLE', error instanceof Error ? error.message : String(error))
+  }
 
   return new Promise((resolve, reject) => {
     let child: ChildProcess

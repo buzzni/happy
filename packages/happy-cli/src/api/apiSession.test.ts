@@ -25,6 +25,7 @@ import type { Metadata, Update } from './types';
 import { logger } from '@/ui/logger';
 import { RECONNECT_NOT_READY_POLL_MS } from './reconnectCadence';
 import { TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
+import { RuntimeProducerGate } from '@/sessionDrain/runtimeProducerGate';
 
 const {
     mockIo,
@@ -251,6 +252,87 @@ describe('ApiSessionClient v3 messages API migration', () => {
         };
 
         mockIo.mockReturnValue(mockSocket);
+    });
+
+    it('passes only the host process admission dependency into its RPC handlers', async () => {
+        const admitSubprocess = vi.fn(async (_roots: readonly string[]) => { throw new Error('WORKSPACE_OWNER_UNCONFIRMED'); });
+        const client = Reflect.construct(ApiSessionClient, ['fake-token', session, undefined, { admitSubprocess }]) as ApiSessionClient;
+        try {
+            const options = registeredCommonHandlers.mock.calls.at(-1)?.[2];
+            expect(options.admitSubprocess).toBe(admitSubprocess);
+            await expect(options.admitSubprocess([session.metadata.path])).rejects.toThrow('WORKSPACE_OWNER_UNCONFIRMED');
+            expect(admitSubprocess).toHaveBeenCalledOnce();
+        } finally { await client.close(); }
+    });
+
+    it('keeps an admitted filesystem writer alive through shutdown and refuses late writes', async () => {
+        const gate = new RuntimeProducerGate({
+            hasUndeliveredInput: () => false, canFreezeInbound: () => true,
+            freezeInbound: () => true, stopLoop: () => {},
+        });
+        const withFilesystemMutation = <T,>(operation: () => Promise<T>) => gate.admit(operation, 'writer');
+        const client = Reflect.construct(ApiSessionClient, ['fake-token', session, undefined, { withFilesystemMutation }]) as ApiSessionClient;
+        let finish!: () => void;
+        const waiting = new Promise<void>(resolve => { finish = resolve; });
+        try {
+            const admitted = registeredCommonHandlers.mock.calls.at(-1)?.[2].withFilesystemMutation;
+            expect(admitted).toBeTypeOf('function');
+            const writing = admitted(async () => { await waiting; return 'stored'; });
+            let closed = false;
+            const closing = gate.closeAdmissionAndWait().then(() => { closed = true; gate.loopExited(); });
+            await Promise.resolve();
+            expect(closed).toBe(false);
+            const lateWrite = vi.fn(async () => 'must not write');
+            await expect(admitted(lateWrite)).rejects.toThrow('Runtime input is closed');
+            expect(lateWrite).not.toHaveBeenCalled();
+            finish();
+            await expect(writing).resolves.toBe('stored');
+            await closing;
+            expect(gate.hasLiveProducers()).toBe(false);
+        } finally { finish(); await client.close(); }
+    });
+
+    it.each([false, true])('isolated run rejects external text and attachments before queue admission (buffered=%s)', async buffered => {
+        session.id = 'automation-run:run-A';
+        const client = new ApiSessionClient('fake-token', session);
+        expect(registeredCommonHandlers.mock.calls.at(-1)?.[2].processExecution).toBe('disabled');
+        const onUser = vi.fn(), onFile = vi.fn();
+        const queueInput = vi.spyOn(client as any, 'queueInput');
+        if (!buffered) { client.onUserMessage(onUser); client.onFileEvent(onFile); }
+        try {
+            (client as any).routeIncomingMessage({ role: 'user', content: { type: 'text', text: 'injected manual input' } });
+            (client as any).routeIncomingMessage({ role: 'session', content: { type: 'session', data: { id: 'file-A', time: 1, role: 'user', ev: {
+                t: 'file', ref: 'private-blob', size: 3, name: 'private.txt',
+            } } } });
+            if (buffered) { client.onUserMessage(onUser); client.onFileEvent(onFile); }
+            expect(onUser).not.toHaveBeenCalled();
+            expect(onFile).not.toHaveBeenCalled();
+            expect(queueInput).not.toHaveBeenCalled();
+            expect(logger.warn).toHaveBeenCalled();
+        } finally { await client.close(); }
+    });
+
+    it.each([false, true])('persists full isolated final evidence without changing ordinary opt-in (isolated=%s)', async isolated => {
+        if (isolated) session.id = 'automation-run:run-A';
+        const client = new ApiSessionClient('fake-token', session);
+        const enqueue = vi.spyOn(client as any, 'enqueueMessage').mockImplementation(() => undefined);
+        const fullAnswer = 'answer '.repeat(500);
+        try {
+            client.sendClaudeSessionMessage({ type: 'assistant', uuid: 'assistant-A', message: { role: 'assistant',
+                content: [{ type: 'text', text: 'checking' }] } } as any);
+            client.sendFinalAnswerForChannelTurn(fullAnswer);
+            client.closeClaudeSessionTurn('completed');
+            const messages = enqueue.mock.calls.map(([message, , localId]) => ({ message: message as any, localId }));
+            const final = messages.find(({ message }) => message.content?.ev.t === 'final-answer');
+            if (!isolated) { expect(final).toBeUndefined(); return; }
+            expect(final?.message.content.ev).toEqual({ t: 'final-answer', text: fullAnswer });
+            const boundaries = messages.filter(({ message }) => ['turn-start', 'final-answer', 'turn-end'].includes(message.content?.ev.t));
+            expect(boundaries.map(({ message }) => message.content.ev.t)).toEqual(['turn-start', 'final-answer', 'turn-end']);
+            expect(new Set(boundaries.map(({ message }) => message.content.turn)).size).toBe(1);
+            for (const { message, localId } of boundaries) {
+                expect(localId).toBe(`automation-evidence:run-A:${message.content.id}`);
+            }
+        } finally { await client.close(); }
     });
 
     async function evidenceMetadataHost(enabled = true, flavor = 'claude') {

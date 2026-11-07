@@ -25,6 +25,7 @@ import {
 import { emitSessionFollowupMessageUpdate } from '@/app/automation/sessionFollowupUpdate';
 import {
     automationConversationDeliverRequestSchema,
+    automationRunHeartbeatRequestSchema,
     sessionFollowupClaimRequestSchema,
     sessionFollowupDeliverRequestSchema,
     sessionFollowupEvaluationRequestSchema,
@@ -110,6 +111,9 @@ export function automationSocketHandler(accountId: string, machineId: string, so
     on('automation-key-register', async (data, callback) => answer(callback, () => inTx((tx) => registerAutomationMachineKey(tx, accountId, machineId, {
         expectedKeyVersion: integer(data?.expectedKeyVersion, 0, Number.MAX_SAFE_INTEGER),
         publicKey: bytes(data?.publicKey, 32, 32),
+        contextIsolationVersion: data?.contextIsolationVersion === undefined ? 0
+            : data.contextIsolationVersion === 0 || data.contextIsolationVersion === 1 ? data.contextIsolationVersion
+            : (() => { throw new Error('invalid-input'); })(),
         protocolVersion: data?.protocolVersion === undefined
             ? 1
             : integer(data.protocolVersion, 1, Number.MAX_SAFE_INTEGER),
@@ -130,7 +134,7 @@ export function automationSocketHandler(accountId: string, machineId: string, so
         return inTx((tx) => syncAutomations(tx, accountId, machineId, {
             afterSeq,
             limit: integer(data?.limit, 1, 500),
-            ...(data?.payloadVersions !== undefined ? { payloadVersions: Array.isArray(data.payloadVersions) && data.payloadVersions.length <= 3 && data.payloadVersions.every((version: unknown) => version === 1 || version === 4 || version === 5) ? data.payloadVersions : (() => { throw new Error('invalid-input'); })() } : {}),
+            ...(data?.payloadVersions !== undefined ? { payloadVersions: Array.isArray(data.payloadVersions) && data.payloadVersions.length <= 4 && data.payloadVersions.every((version: unknown) => version === 1 || version === 4 || version === 5 || version === 6) ? data.payloadVersions : (() => { throw new Error('invalid-input'); })() } : {}),
         }));
     }));
 
@@ -203,9 +207,11 @@ export function automationSocketHandler(accountId: string, machineId: string, so
         }, accountId);
     }));
 
-    on('automation-run-heartbeat', async (data, callback) => answer(callback, () => inTx((tx) => heartbeatAutomationRun(tx, accountId, machineId, {
-        runId: requiredString(data?.runId), claimToken: requiredString(data?.claimToken),
-    }))));
+    on('automation-run-heartbeat', async (data, callback) => answer(callback, async () => {
+        const parsed = automationRunHeartbeatRequestSchema.safeParse(data);
+        if (!parsed.success) return { ok: false, error: 'invalid-heartbeat' };
+        return inTx((tx) => heartbeatAutomationRun(tx, accountId, machineId, parsed.data));
+    }));
 
     on('automation-conversation-deliver', async (data, callback) => answer(callback, () => {
         const input = automationConversationDeliverRequestSchema.parse(data);

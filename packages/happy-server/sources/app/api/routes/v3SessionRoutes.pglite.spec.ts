@@ -162,13 +162,13 @@ describe('message batch writes against the stored rows', () => {
     });
 });
 
-async function observe(query = 'observation_version=1&after_seq=0&limit=1', accountId = 'account-1') {
+async function observe(query = 'observation_version=1&after_seq=0&limit=1', accountId = 'account-1', sessionId = 'session-1') {
     const app = fastify(); app.setValidatorCompiler(validatorCompiler); app.setSerializerCompiler(serializerCompiler);
     const typed = app.withTypeProvider<ZodTypeProvider>() as unknown as Fastify;
     const authenticate = async (request: any) => { request.userId = accountId; };
     typed.decorate('authenticate', authenticate); typed.decorate('authenticateSessionScope', authenticate);
     v3SessionRoutes(typed); await typed.ready();
-    try { return await typed.inject({ method: 'GET', url: '/v3/sessions/session-1/messages?' + query }); }
+    try { return await typed.inject({ method: 'GET', url: `/v3/sessions/${sessionId}/messages?` + query }); }
     finally { await typed.close(); }
 }
 it('refuses observation until all writers are explicitly opted into a cohort', async () => {
@@ -249,4 +249,19 @@ it('returns a single row larger than the response budget on its own', async () =
         expect(response.json().messages.map((message: { seq: number }) => message.seq)).toEqual([2]);
     }
     expect((await observe('observation_version=1&after_seq=1&limit=200')).json().hasMore).toBe(true);
+})
+
+it('refuses full-retention observation for prunable execution sessions without changing ownership or raw reads', async () => {
+    process.env.HAPPY_OBSERVATION_COHORT = 'test-cohort';
+    const id = 'automation-run:run-retention';
+    await client.session.create({ data: { id, tag: id, accountId: 'account-1', metadata: '', seq: 1 } });
+    await client.sessionMessage.create({ data: { sessionId: id, seq: 1, content: { t: 'encrypted', c: 'run' } } });
+    const response = await observe(undefined, 'account-1', id);
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({ error: 'observation-unsupported' });
+    expect((await observe(undefined, 'other', id)).statusCode).toBe(404);
+    const raw = await observe('after_seq=0&limit=1', 'account-1', id);
+    expect(raw.statusCode).toBe(200);
+    expect(raw.json().messages).toHaveLength(1);
+    expect(raw.json().observation).toBeUndefined();
 })

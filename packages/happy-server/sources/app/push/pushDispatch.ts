@@ -52,6 +52,7 @@ export type PushOutcome = {
     failed: number;
     reason?: string;
 };
+import { isAutomationExecutionSessionId } from '@slopus/happy-wire';
 
 async function fetchTokensAndSend(params: {
     userId: string;
@@ -137,10 +138,28 @@ export function countPushOutcome(outcome: PushOutcome): void {
 }
 
 async function dispatch(params: SessionEventPush): Promise<PushOutcome> {
-    const { userId, sessionId, title, body, data } = params;
+    const { userId, title, body, data } = params;
+    let sessionId = params.sessionId;
+    let runId: string | undefined;
     const deadline = Date.now() + DISPATCH_BUDGET_MS;
 
     try {
+        if (isAutomationExecutionSessionId(sessionId)) {
+            const run = await db.automationRun.findFirst({
+                where: { sessionId, machineAccountId: userId, displaySessionId: { not: null } },
+                select: { id: true, displaySessionId: true },
+            });
+            const display = run?.displaySessionId && !isAutomationExecutionSessionId(run.displaySessionId)
+                ? await db.session.findFirst({ where: { id: run.displaySessionId, accountId: userId }, select: { id: true } })
+                : null;
+            if (!display || !run) {
+                log({ module: 'push', level: 'warn' }, `Automation attention target unavailable for user ${userId} execution ${sessionId}`);
+                return { status: 'suppressed', tokens: 0, sent: 0, failed: 0, reason: 'automation-target-unavailable' };
+            }
+            // Attention belongs to the registered display chat, never a separate internal chat.
+            sessionId = display.id;
+            runId = run.id;
+        }
         try {
             if (await isUserActive(userId)) {
                 log({ module: 'push' }, `Suppressed session-event push for user ${userId} session ${sessionId}: user active`);
@@ -155,7 +174,7 @@ async function dispatch(params: SessionEventPush): Promise<PushOutcome> {
             sessionId,
             title,
             body,
-            data: { sessionId, ...(data ?? {}) },
+            data: runId ? { ...(data ?? {}), sessionId, runId } : { sessionId, ...(data ?? {}) },
             channelId: 'messages',
             deadline
         });

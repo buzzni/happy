@@ -3,6 +3,14 @@ import { describe, expect, it } from 'vitest';
 import { resolveSessionMemoryScope } from './memoryScope';
 
 describe('resolveSessionMemoryScope', () => {
+    it('keeps an isolated run out of project recall and ingest even with a valid project binding', () => {
+        expect(resolveSessionMemoryScope({
+            env: { HAPPY_CHECKPOINT_SPAWN_CONTEXT: JSON.stringify({ schemaVersion: 1,
+                projectId: 'project-a', worktreeId: 'worktree-a', checkpointRoot: '/private/checkpoint' }) },
+            projectPath: '/private/project-a', sessionId: 'automation-run:run-a',
+        })).toEqual({ kind: 'session', scopeId: 'automation-run:run-a' });
+    });
+
     it('uses the authenticated project binding for project sessions', () => {
         expect(resolveSessionMemoryScope({
             env: {

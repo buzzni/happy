@@ -1,4 +1,5 @@
 import type { TurnAttendanceState } from '@/api/turnAttendance';
+import type { NativeAutomationContextExitEvidence } from '@/utils/automationContextExit';
 import type { ClaudeOrgRequirements } from './claudeOrgRequirements';
 import type { ScopeClaudeSandbox } from '@/daemon/sessionWriteScopeClaude';
 import type { ClaudeStandaloneDrain } from './claudeStandaloneDrain';
@@ -88,6 +89,7 @@ export class Session {
      *  place the default lives — before the first keepalive is sent. */
     mode: 'local' | 'remote';
     thinking: boolean = false;
+    automationContextExitEvidence: NativeAutomationContextExitEvidence | null = null;
     /**
      * Who answers a tool policy `ask` (aplus-dev-studio specs/agent-tool-policy R11). Set by the
      * remote launcher while it runs; `null` in local (terminal) mode, where the hook cannot reach a

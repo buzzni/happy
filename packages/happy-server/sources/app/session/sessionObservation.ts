@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { db } from '@/storage/db';
+import { isAutomationExecutionSessionId } from '@slopus/happy-wire';
 
 const MAX_PAGE_BYTES = 512 * 1024;
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -22,6 +23,8 @@ export async function readSessionObservation(accountId: string, sessionId: strin
             id: true, seq: true, createdAt: true, dataEncryptionKey: true,
         } });
         if (!session) return { status: 404, body: { error: 'Session not found' } };
+        // Execution tool/raw rows may be pruned after exit; full-retention coverage cannot be promised.
+        if (isAutomationExecutionSessionId(session.id)) return { status: 409, body: { error: 'observation-unsupported' } };
         const upper = through ?? session.seq;
         if (upper > session.seq || after > upper) return { status: 409, body: { error: 'history-incomplete' } };
         const rows = await tx.sessionMessage.findMany({ where: { sessionId, seq: { gt: after, lte: upper } },

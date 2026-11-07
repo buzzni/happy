@@ -26,6 +26,7 @@ beforeAll(async () => {
 beforeEach(async () => {
     pg = new PGlite();
     await pg.exec(schema);
+    await pg.exec(`CREATE UNIQUE INDEX "AutomationRun_scheduled_slot" ON "AutomationRun"("automationId", "generation", "scheduledFor") WHERE "kind" = 'SCHEDULED'`);
     // The one-active-run fence lives only in the original SQL migration, not in the Prisma schema.
     await pg.exec(`CREATE UNIQUE INDEX "AutomationRun_one_active_run_per_automation" ON "AutomationRun"("automationId") WHERE "status" IN ('CLAIMED', 'RUNNING');`);
     await pg.exec('ALTER TABLE "AutomationRun" DROP COLUMN "missedCount";');
@@ -71,6 +72,36 @@ afterEach(async () => {
 
 const gap = (missedCount: number) => ({
     automationId: 'automation-1', generation: 3, firstMissedAt, missedCount, failureCode: 'MISSED_OFFLINE' as const,
+});
+
+it.each([0, 1])('records isolated missed slots only for the currently supported machine (%s)', async contextIsolationVersion => {
+    await client.automation.update({ where: { id: 'automation-1' }, data: { payloadVersion: 6 } });
+    await client.machine.update({ where: { id: 'machine-1' }, data: { automationContextIsolationVersion: contextIsolationVersion } });
+    const first = await client.$transaction(tx => recordMissedAutomationRuns(tx, 'account-1', 'machine-1', gap(8), now));
+    if (contextIsolationVersion === 0) {
+        expect(first).toEqual({ ok: false, error: 'claim-denied' });
+        expect(await client.automationRun.count({ where: { failureCode: 'MISSED_OFFLINE' } })).toBe(0);
+    } else {
+        expect(first).toMatchObject({ ok: true, value: { idempotent: false } });
+        expect(await client.$transaction(tx => recordMissedAutomationRuns(tx, 'account-1', 'machine-1', gap(8), now)))
+            .toMatchObject({ ok: true, value: { runId: (first as any).value.runId, idempotent: true } });
+        expect(await client.automationRun.count({ where: { failureCode: 'MISSED_OFFLINE' } })).toBe(1);
+    }
+});
+
+it('deduplicates only the scheduled missed slot when a completed question occupies the same timestamp', async () => {
+    const question = await client.automationRun.create({ data: { id: 'question-same-slot', kind: 'QUESTION',
+        automationId: 'automation-1', generation: 3, scheduledFor: firstMissedAt, machineAccountId: 'account-1', machineId: 'machine-1',
+        status: 'COMPLETED', claimTokenHash: new Uint8Array(32).fill(4), claimExpiresAt: now } });
+    const first = await client.$transaction(tx => recordMissedAutomationRuns(tx, 'account-1', 'machine-1', gap(8), now));
+    if (!first.ok) throw new Error(first.error);
+    expect(await client.$transaction(tx => recordMissedAutomationRuns(tx, 'account-1', 'machine-1', gap(8), now)))
+        .toMatchObject({ ok: true, value: { runId: first.value.runId, idempotent: true, countRaised: false } });
+    expect(await client.$transaction(tx => recordMissedAutomationRuns(tx, 'account-1', 'machine-1', gap(11), now)))
+        .toMatchObject({ ok: true, value: { runId: first.value.runId, idempotent: true, countRaised: true } });
+    expect(await client.automationRun.findMany({ where: { kind: 'SCHEDULED', scheduledFor: firstMissedAt } }))
+        .toEqual([expect.objectContaining({ id: first.value.runId, missedCount: 11, status: 'EXPIRED' })]);
+    expect(await client.automationRun.findUniqueOrThrow({ where: { id: question.id } })).toEqual(question);
 });
 
 it('keeps old history as ordinary rows and records a re-reported gap only once', async () => {

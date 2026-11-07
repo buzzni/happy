@@ -3,7 +3,7 @@ import { log } from "@/utils/log";
 import { GitHubProfile } from "@/app/api/types";
 import { AccountProfile } from "@/types";
 import { getPublicUrl } from "@/storage/files";
-import type { SessionMessageContent } from "@slopus/happy-wire";
+import { isAutomationExecutionSessionId, type SessionMessageContent } from "@slopus/happy-wire";
 import { hasActiveUserScopedSocketIn, userScopedRoom } from "@/app/events/hasActiveUserScopedSocket";
 import { deliverManagedSession } from "@/app/api/socket/managed/managedDelivery";
 
@@ -390,14 +390,24 @@ class EventRouter {
         recipientFilter: RecipientFilter;
         skipSenderConnection?: ClientConnection;
     }): void {
-        const rooms = this.getRoomsForFilter(params.userId, params.recipientFilter);
+        const body = params.payload?.body;
+        const sessionId = params.eventName === 'update'
+            ? body?.sid ?? body?.sessionId ?? (['new-session', 'update-session'].includes(body?.t) ? body?.id : undefined)
+            : params.payload?.sessionId ?? (['activity', 'stream', 'usage'].includes(params.payload?.type) ? params.payload?.id : undefined);
+        const internal = isAutomationExecutionSessionId(sessionId);
+        // A run owns this session. Ordinary clients read its result through the
+        // authorized run projection; generic fan-out must not create another chat.
+        const rooms = internal ? [`user:${params.userId}:session:${sessionId}`]
+            : this.getRoomsForFilter(params.userId, params.recipientFilter);
 
         // Managed children of this session, addressed explicitly. Each packet
         // is released by the replica holding the socket, after that replica
         // re-reads the grant.
-        if (params.recipientFilter.type === 'all-interested-in-session') {
+        const managedSessionId = internal ? sessionId
+            : params.recipientFilter.type === 'all-interested-in-session' ? params.recipientFilter.sessionId : null;
+        if (managedSessionId) {
             deliverManagedSession(this.managedIo, {
-                sessionId: params.recipientFilter.sessionId,
+                sessionId: managedSessionId,
                 accountId: params.userId,
                 event: params.eventName,
                 args: [params.payload],

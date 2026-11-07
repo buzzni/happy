@@ -45,7 +45,9 @@ type CommandResult = { ok: true; stdout: string } | { ok: false; error: string }
 
 async function defaultRunCommand(command: GithubTriggerWorktreeCommand): Promise<CommandResult> {
   try {
-    const result = await execFileAsync(command.executable, command.args, {
+    const args = command.executable === 'git'
+      ? ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...command.args] : command.args
+    const result = await execFileAsync(command.executable, args, {
       cwd: command.cwd,
       env: { ...process.env, ...command.environmentVariables, GIT_OPTIONAL_LOCKS: '0' },
       timeout: COMMAND_TIMEOUT_MS,
@@ -85,6 +87,7 @@ export async function removeGithubTriggerWorktree(input: {
   pathExists?: (path: string) => Promise<boolean>
   /** Daemon-owned generated artifacts only; source preservation still returns dirty. */
   reclaimArtifacts?: () => Promise<void>
+  admitSubprocess?: (roots: readonly string[]) => Promise<void>
 }): Promise<
   | { ok: true }
   | { ok: false; dirty: boolean; error: string }
@@ -117,6 +120,8 @@ export async function removeGithubTriggerWorktree(input: {
     catch (cause) { error += `; artifact reclamation failed: ${cause instanceof Error ? cause.message : String(cause)}` }
     return { ok: false, dirty: true, error }
   }
+  try { await input.admitSubprocess?.([input.repositoryRoot, input.worktreePath]) }
+  catch (error) { return { ok: false, dirty: false, error: error instanceof Error ? error.message : 'WORKSPACE_UNAVAILABLE' } }
   const removed = await commandOrError(runCommand, {
     executable: 'git',
     // --force 없이는 서브모듈을 가진 worktree 를 git 이 거부한다
@@ -147,6 +152,7 @@ export async function prepareGithubTriggerWorktree(input: {
   pathExists?: (path: string) => Promise<boolean>
   resolveRealPath?: (path: string) => Promise<string>
   onPlanned: (plan: GithubTriggerWorktreePlan) => void
+  admitSubprocess?: (roots: readonly string[]) => Promise<void>
 }): Promise<
   | ({ ok: true } & GithubTriggerWorktreePlan)
   | { ok: false; error: string; cleaned: boolean }
@@ -208,6 +214,9 @@ export async function prepareGithubTriggerWorktree(input: {
     : worktreePath
   const plan = { repositoryRoot, worktreePath, directory }
   input.onPlanned(plan)
+
+  try { await input.admitSubprocess?.([repositoryRoot, resolve(input.managedRoot)]) }
+  catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'WORKSPACE_UNAVAILABLE', cleaned: true } }
 
   // 앞선 실행이 남긴 core.worktree 가 이미 지워진 worktree 를 가리키면 이 저장소의
   // git 명령이 전부 죽는다 — worktree add 자체도 같은 오류로 실패하므로 먼저 푼다.

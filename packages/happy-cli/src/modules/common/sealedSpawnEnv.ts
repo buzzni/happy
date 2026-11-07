@@ -20,6 +20,7 @@ import {
     type SealedSpawnEnvPayload,
 } from '@slopus/happy-wire';
 import { RpcNonceGuard } from '@/api/rpc/rpcNonceGuard';
+import type { LegacyDispatchReservation } from '@/utils/workspaceTurnAdmission';
 import { openSealedForMachine, sealForMachine } from './machineSeal';
 import { logger } from '@/ui/logger';
 import { validatePath } from './pathSecurity';
@@ -130,6 +131,8 @@ export function createSealedSpawnEnvHandler(deps: {
     machine: () => MachineKeyView;
     allowedRoot: string;
     now?: () => number;
+    reserveLegacyDispatch?: (roots: readonly string[]) => Promise<LegacyDispatchReservation>;
+    admitSubprocess?: (roots: readonly string[]) => Promise<void>;
 }): (request: SealedSpawnEnvRequest) => Promise<SealedSpawnEnvResponse> {
     const now = deps.now ?? Date.now;
     const nonces = new RpcNonceGuard({ windowMs: SEALED_SPAWN_ENV_WINDOW_MS, maxEntries: 10_000, whenFull: 'refuse' });
@@ -151,8 +154,27 @@ export function createSealedSpawnEnvHandler(deps: {
                 ? refused(payload.code, 'The sealed env sets a reserved name', { rejectedNames: payload.names })
                 : refused(payload.code, 'The sealed env was refused');
         }
+        if (!!deps.admitSubprocess !== !!deps.reserveLegacyDispatch) {
+            return refused('WORKSPACE_ADMISSION_UNAVAILABLE', 'Host process reservation is unavailable');
+        }
+        let reservation: Extract<LegacyDispatchReservation, { acquired: true }> | undefined;
+        if (deps.reserveLegacyDispatch) {
+            try {
+                const result = await deps.reserveLegacyDispatch([cwd.resolvedPath]);
+                if (!result.acquired) return refused('WORKSPACE_UNAVAILABLE', result.reason);
+                reservation = result;
+            } catch {
+                return refused('WORKSPACE_UNAVAILABLE', 'Workspace approval is unconfirmed');
+            }
+        }
+        try {
+        const submissionAt = reservation ? now() : at;
+        if (reservation) {
+            const current = readSealedSpawnEnvPayload(opened, { machineId: machine.id, now: submissionAt });
+            if (!current.ok) return refused(current.code, 'The sealed env was refused after workspace admission');
+        }
         const issuedAt = (opened as { issuedAt: number }).issuedAt;
-        const admission = nonces.admit(payload.nonce, issuedAt, at);
+        const admission = nonces.admit(payload.nonce, issuedAt, submissionAt);
         if (admission === 'replayed') return refused('SEALED_ENV_REPLAYED', 'This sealed env was already used');
         if (admission === 'full') return refused('SEALED_ENV_BUSY', 'Too many sealed envs in the window');
 
@@ -169,6 +191,7 @@ export function createSealedSpawnEnvHandler(deps: {
             }
             const timeout = Math.min(request.timeout ?? DEFAULT_TIMEOUT_MS, SEALED_SPAWN_ENV_MAX_TIMEOUT_MS);
             const options = { cwd: cwd.resolvedPath, windowsHide: true, env };
+            await deps.admitSubprocess?.([cwd.resolvedPath]);
             logger.debug('[sealed-spawn-env] running', { cwd: options.cwd, delivery: request.envDelivery, names: Object.keys(payload.env).length });
             const { stdout, stderr } = await spawnWithProcessTreeTimeout(request.command, options, timeout);
             return { success: true, stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), exitCode: 0 };
@@ -184,6 +207,10 @@ export function createSealedSpawnEnvHandler(deps: {
             };
         } finally {
             if (envDir) await rm(envDir, { recursive: true, force: true });
+        }
+        } finally {
+            try { await reservation?.finish(); }
+            catch { logger.debug('[sealed-spawn-env] Workspace handoff unconfirmed; ownership remains reserved'); }
         }
     };
 }

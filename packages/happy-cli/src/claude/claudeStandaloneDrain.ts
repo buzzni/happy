@@ -25,11 +25,18 @@ export class ClaudeStandaloneDrain {
     private launcher: ClaudeLauncherDrainPort | null = null;
     private query: { interrupt: () => Promise<unknown> } | null = null;
     private turnRunning = false;
+    private workspaceReadiness: (() => boolean) | null = null;
     private finished = false;
     private settleLoop!: () => void;
     private readonly loopFinished = new Promise<void>((resolve) => { this.settleLoop = resolve; });
 
-    constructor(readonly gate: RuntimeProducerGate) {}
+    constructor(readonly gate: RuntimeProducerGate, readonly workspaceExitObservation = false) {}
+
+    setWorkspaceReadiness(reader: (() => boolean) | null): void { this.workspaceReadiness = reader; }
+    canDrainWorkspace(): boolean {
+        return this.workspaceExitObservation && this.launcher !== null && !this.finished && !this.turnRunning
+            && !this.hasHeldBackInput() && this.gate.isWorkspaceIdle() && this.workspaceReadiness?.() === true;
+    }
 
     /** The launcher's loop may start again (a relaunch); the latest one answers. */
     attachLauncher(port: ClaudeLauncherDrainPort): void { this.launcher = port; }
