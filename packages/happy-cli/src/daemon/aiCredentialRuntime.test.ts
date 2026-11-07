@@ -13,10 +13,10 @@ import {
   selectLeastRemainingCodexAccounts,
   syncDirectoryForDurability,
   timeAiCredentialCommand,
-  withUvToolBinOnPath,
   type AiCredentialCommandResult,
   type AiCredentialRuntimeDependencies,
 } from './aiCredentialRuntime'
+import { withUvToolBinOnPath } from './uvToolBin'
 
 describe('timeAiCredentialCommand', () => {
   it('logs each helper duration with word-shaped subcommands only', async () => {
