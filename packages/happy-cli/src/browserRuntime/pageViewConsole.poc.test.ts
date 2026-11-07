@@ -33,7 +33,11 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
     let refuseFrames = 0
     /** A frame read the fake Runtime answers with this error (a view the Runtime no longer accepts). */
     let frameError: string | null = null
-    const task = () => ({ taskId: 'task-1', agentSessionId: SESSION, status: 'paused', pauseReason: 'user-control', stateVersion: 3, tabs: ['tab-1'],
+    /** Input answers the fake Runtime loses (the connection drops before the receipt) or holds back. */
+    let dropInput = false, inputDelayMs = 0
+    /** A second open task of this conversation, for switching while input is under way. */
+    let secondTask = false
+    const task = (taskId = 'task-1') => ({ taskId, agentSessionId: SESSION, status: 'paused', pauseReason: 'user-control', stateVersion: 3, tabs: ['tab-1'],
         uncertainActions: [], cancelRequested: false, updatedAtMs: Date.now(), tabLeases: [{ tabId: 'tab-1', leaseEpoch: 4, owner: leaseOwner }] })
 
     beforeAll(async () => {
@@ -60,14 +64,15 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
                     res.end(JSON.stringify({ ok: false, error: { code: 'QUOTA_EXCEEDED', message: 'Page capture rate limited' } }))
                     return
                 }
+                if (m[1] === 'dispatchPageInput' && dropInput) { req.socket.destroy(); return }
                 if (m[1] === 'getPageFrame' && !body.statusOnly && frameError) {
                     res.writeHead(403, { 'content-type': 'application/json' })
                     res.end(JSON.stringify({ ok: false, error: { code: frameError, message: 'refused' } }))
                     return
                 }
                 const result = m[1] === 'pageViewInfo' ? { schemaVersion: 1, supported: true, input: true, runtimeBindingId: BINDING }
-                    : m[1] === 'listTasks' ? { tasks: [task()] }
-                        : m[1] === 'getTask' ? task()
+                    : m[1] === 'listTasks' ? { tasks: secondTask ? [task(), task('task-2')] : [task()] }
+                        : m[1] === 'getTask' ? task(body.taskId)
                             : m[1] === 'openPageView' ? { schemaVersion: 1, viewId: 'view-' + ops.length, expiresAtMs: Date.now() + 600_000, input: true }
                                 : m[1] === 'getPageFrame' ? body.statusOnly ? { schemaVersion: 1, status } : { schemaVersion: 1, status, frame: {
                                     data: jpeg, mimeType: 'image/jpeg', pixelWidth: 64, pixelHeight: 48, frameId: 'frame-' + ++frames, ageMs: 0, capturedAtMs: Date.now(), captureDurationMs: 1,
@@ -75,8 +80,10 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
                                     : m[1] === 'dispatchPageInput' ? { sequence: body.sequence, state: 'applied' }
                                         : m[1] === 'releaseControl' ? { owner: 'none', task: task() }
                                         : m[1] === 'closePageView' ? status : {}
-                res.writeHead(200, { 'content-type': 'application/json' })
-                res.end(JSON.stringify({ ok: true, result }))
+                setTimeout(() => {
+                    res.writeHead(200, { 'content-type': 'application/json' })
+                    res.end(JSON.stringify({ ok: true, result }))
+                }, m[1] === 'dispatchPageInput' ? inputDelayMs : 0)
             })
         })
         await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
@@ -229,6 +236,7 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
             expect(ops.filter((o) => o.op === 'dispatchPageInput')).toEqual([])
             leaseOwner = { kind: 'user', principalId: 'user-1', viewerSessionId: 'viewer-this' }
             await harness.evaluate(target, `document.getElementById('refreshTasks').click()`)
+            await eventually(() => harness.evaluate(target, `!!document.querySelector('#tasks button[data-task="task-1"]')`), Boolean, 5_000)
             await harness.evaluate(target, `document.querySelector('#tasks button[data-task="task-1"]').click()`)
             await eventually(() => harness.evaluate(target, `document.getElementById('screenHintText').textContent`), (s) => s === 'You have control. Input reaches the page.', 10_000)
             await click(target, box.x + box.width / 2, box.y + box.height / 2)
@@ -256,6 +264,73 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
             await eventually(() => harness.evaluate(target, `document.getElementById('screenHintText').textContent`), (s) => s === 'Observing the page. Take over to use it.', 5_000)
             expect(await harness.evaluate(target, `!!document.getElementById('pageRetry').getClientRects().length`)).toBe(false)
         } finally { frameError = null; await harness.closeTarget(target) }
+    })
+
+    /** The local console with this viewer holding the shown task's tab; resolves once it says so. */
+    async function controlLocal(): Promise<{ target: string; x: number; y: number }> {
+        leaseOwner = { kind: 'user', principalId: 'user-1', viewerSessionId: 'viewer-this' }
+        const target = await openLocal()
+        await eventually(() => harness.evaluate(target, `document.getElementById('screenHintText').textContent`), (s) => s === 'You have control. Input reaches the page.', 10_000)
+        const box = JSON.parse(await harness.evaluate(target, `JSON.stringify(document.getElementById('page').getBoundingClientRect())`))
+        return { target, x: box.x + box.width / 2, y: box.y + box.height / 2 }
+    }
+    const inputs = () => ops.filter((o) => o.op === 'dispatchPageInput')
+
+    it('local console: an input whose answer is lost is never sent again, and Reconnect is offered', async () => {
+        ops.length = 0
+        const { target, x, y } = await controlLocal()
+        try {
+            dropInput = true
+            await click(target, x, y)
+            await eventually(() => harness.evaluate(target, `document.getElementById('screenHintText').textContent`), (s) => s === 'Checking input receipt. Do not repeat the input.', 5_000)
+            await wait(target, 1500)
+            // One press reached the Runtime; neither it nor the release queued behind it was sent again.
+            // One input left the console. Chrome itself may replay a POST whose connection dropped unanswered (the same body,
+            // which the Runtime answers from its receipt); the console never sent a new sequence or the rest of the click.
+            expect(new Set(inputs().map((o) => JSON.stringify(o.body))).size).toBe(1)
+            expect(inputs()[0]!.body).toMatchObject({ sequence: 1, event: { type: 'mouseMoved' } })
+            expect(ops.some((o) => o.op === 'getPageFrame' && o.body.statusOnly)).toBe(true)
+            expect(await harness.evaluate(target, `!!document.getElementById('pageRetry').getClientRects().length`)).toBe(true)
+            await click(target, x, y)
+            await wait(target, 600)
+            expect(new Set(inputs().map((o) => o.body.sequence))).toEqual(new Set([1]))
+        } finally { dropInput = false; await harness.closeTarget(target) }
+    })
+
+    it('local console: input queued for one task never reaches the page of the task switched to', async () => {
+        ops.length = 0; secondTask = true
+        const { target, x, y } = await controlLocal()
+        try {
+            inputDelayMs = 800
+            await click(target, x, y)
+            await eventually(() => inputs().length, (n) => n === 1, 5_000)
+            const first = inputs()[0]!.body.viewId
+            await eventually(() => harness.evaluate(target, `!!document.querySelector('#tasks button[data-task="task-2"]')`), Boolean, 20_000)
+            await harness.evaluate(target, `document.querySelector('#tasks button[data-task="task-2"]').click()`)
+            const switched = await eventually(() => ops.find((o) => o.op === 'openPageView' && o.body.taskId === 'task-2'), Boolean, 5_000)
+            await wait(target, 1500)
+            // The press in flight finished on its own view; the rest of that click died with the view.
+            expect(inputs().map((o) => o.body.viewId)).toEqual([first])
+            expect(ops.filter((o) => o.op === 'closePageView').map((o) => o.body.viewId)).toContain(first)
+            expect(switched!.body.tabId).toBe('tab-1')
+        } finally { inputDelayMs = 0; secondTask = false; await harness.closeTarget(target) }
+    })
+
+    it('local console: leaving the page for another control or window ends its input', async () => {
+        ops.length = 0
+        const { target, x, y } = await controlLocal()
+        try {
+            await click(target, x, y)
+            await eventually(() => inputs().length, (n) => n >= 3, 5_000)
+            const viewId = inputs()[0]!.body.viewId
+            expect(await harness.evaluate(target, `document.activeElement && document.activeElement.id`)).toBe('pageInput')
+            await harness.evaluate(target, `document.getElementById('takeOver').focus()`)
+            await eventually(() => ops.filter((o) => o.op === 'closePageView').map((o) => o.body.viewId), (ids) => ids.includes(viewId), 5_000)
+            const sent = inputs().length
+            await harness.evaluate(target, `document.getElementById('pageInput').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }))`)
+            await wait(target, 400)
+            expect(inputs().filter((o) => o.body.viewId === viewId)).toHaveLength(sent)
+        } finally { await harness.closeTarget(target) }
     })
 
     it('local console: a capability without the page scope keeps the Chrome window guidance and the spaces', async () => {
