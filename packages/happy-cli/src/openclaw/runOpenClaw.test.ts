@@ -35,6 +35,8 @@ const mocks = vi.hoisted(() => {
     /** When set, sendPrompt hangs until cancel, simulating an unresponsive gateway. */
     hangPromptUntilCancel: false,
     resolveHangingPrompt: null as (() => void) | null,
+    /** The backend's live gateway session key, which abort cancels. */
+    sessionKey: null as string | null,
   };
 
   return {
@@ -43,6 +45,7 @@ const mocks = vi.hoisted(() => {
     mockGetOrCreateMachine: vi.fn(async () => ({})),
     mockGetOrCreateSession: vi.fn(async () => ({ id: 'session-1' })),
     mockSetupOfflineReconnection: vi.fn(),
+    mockStartOfflineReconnection: vi.fn(),
     mockNotifyDaemonSessionStarted: vi.fn(async () => ({ error: null })),
     mockSetBackend: vi.fn(),
     mockKillRegister: vi.fn((_rpc: unknown, handler: () => Promise<void>) => {
@@ -86,12 +89,19 @@ vi.mock('@/daemon/controlClient', () => ({
   notifyDaemonSessionStarted: mocks.mockNotifyDaemonSessionStarted,
 }));
 
-vi.mock('@/claude/registerKillSessionHandler', () => ({
-  registerKillSessionHandler: mocks.mockKillRegister,
-}));
+vi.mock('@/claude/registerKillSessionHandler', async () => {
+  const actual = await vi.importActual<typeof import('@/claude/registerKillSessionHandler')>('@/claude/registerKillSessionHandler');
+  return {
+    registerKillSessionHandler: (...args: Parameters<typeof actual.registerKillSessionHandler>) => {
+      mocks.mockKillRegister(...args);
+      actual.registerKillSessionHandler(...args);
+    },
+  };
+});
 
 vi.mock('@/utils/serverConnectionErrors', () => ({
   connectionState: { setBackend: mocks.mockSetBackend },
+  startOfflineReconnection: mocks.mockStartOfflineReconnection,
 }));
 
 vi.mock('@/ui/logger', () => ({
@@ -100,6 +110,10 @@ vi.mock('@/ui/logger', () => ({
 
 vi.mock('./OpenClawBackend', () => ({
   OpenClawBackend: class MockOpenClawBackend {
+    get sessionKey() {
+      return mocks.backendState.sessionKey;
+    }
+
     onMessage(handler: (message: any) => void) {
       mocks.backendState.listeners.push(handler);
     }
@@ -174,6 +188,7 @@ describe('runOpenClaw turn inactivity watchdog', () => {
     mocks.backendState.failPromptsMatching = null;
     mocks.backendState.hangPromptUntilCancel = false;
     mocks.backendState.resolveHangingPrompt = null;
+    mocks.backendState.sessionKey = null;
 
     mocks.mockApiCreate.mockResolvedValue({
       getOrCreateMachine: mocks.mockGetOrCreateMachine,
@@ -322,5 +337,81 @@ describe('runOpenClaw turn inactivity watchdog', () => {
 
     await mocks.getKillHandler()!();
     await settled;
+  });
+});
+
+describe('runOpenClaw offline start', () => {
+  /** A real session's surface the runner touches, keeping what was registered so the test can deliver through it. */
+  const makeRealSession = () => {
+    const rpc = new Map<string, (params?: unknown) => unknown>();
+    let userMessage: ((message: any) => void) | null = null;
+    return {
+      sessionId: 'real-session',
+      on: vi.fn(),
+      onUserMessage: vi.fn((handler: (message: any) => void) => { userMessage = handler; }),
+      onFileEvent: vi.fn(),
+      keepAlive: vi.fn(),
+      sendSessionProtocolMessage: vi.fn(),
+      sendSessionEvent: vi.fn(),
+      updateMetadata: vi.fn(),
+      sendSessionDeath: vi.fn(),
+      flush: vi.fn(async () => { }),
+      close: vi.fn(async () => { }),
+      updateAgentState: vi.fn(),
+      rpcHandlerManager: {
+        registerHandler: vi.fn((method: string, handler: (params?: unknown) => unknown) => { rpc.set(method, handler); }),
+      },
+      deliver: (text: string) => userMessage?.({ role: 'user', content: { type: 'text', text } }),
+      call: async (method: string) => rpc.get(method)?.(),
+    };
+  };
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    mocks.backendState.listeners = [];
+    mocks.backendState.prompts = [];
+    mocks.backendState.cancelCalls = [];
+    mocks.backendState.failPromptsMatching = null;
+    mocks.backendState.hangPromptUntilCancel = false;
+    mocks.backendState.resolveHangingPrompt = null;
+    mocks.backendState.sessionKey = null;
+    const actual = await vi.importActual<typeof import('@/utils/setupOfflineReconnection')>('@/utils/setupOfflineReconnection');
+    mocks.mockSetupOfflineReconnection.mockImplementation(actual.setupOfflineReconnection);
+    mocks.mockStartOfflineReconnection.mockReturnValue({ cancel: vi.fn(), getSession: () => null, isReconnected: () => false });
+  });
+
+  it('answers app messages, abort and kill on the real session after reconnecting', async () => {
+    const realSession = makeRealSession();
+    const getOrCreateSession = vi.fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValue({ id: 'real-session' });
+    mocks.mockApiCreate.mockResolvedValue({
+      getOrCreateMachine: mocks.mockGetOrCreateMachine,
+      getOrCreateSession,
+      sessionSyncClient: vi.fn(() => realSession),
+    });
+
+    const settled = startRunner(5000).then(() => null).catch((error: Error) => error);
+    await vi.waitFor(() => {
+      expect(mocks.mockKillRegister).toHaveBeenCalled();
+    });
+    const { onReconnected } = mocks.mockStartOfflineReconnection.mock.calls[0][0];
+    await onReconnected();
+
+    // The swap still re-attaches the archive listener (R4-d).
+    expect(realSession.on).toHaveBeenCalledWith('archived', expect.any(Function));
+
+    realSession.deliver('after reconnect');
+    await vi.waitFor(() => {
+      expect(mocks.backendState.prompts).toContain('after reconnect');
+    });
+
+    mocks.backendState.sessionKey = 'openclaw-session-1';
+    await realSession.call('abort');
+    expect(mocks.backendState.cancelCalls).toContain('openclaw-session-1');
+
+    mocks.backendState.sessionKey = null;
+    await realSession.call('killSession');
+    expect(await settled).toBeNull();
   });
 });
