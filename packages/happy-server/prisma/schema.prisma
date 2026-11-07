@@ -541,6 +541,11 @@ enum AutomationChangeKind {
     TOMBSTONE
 }
 
+enum AutomationRunKind {
+    SCHEDULED
+    QUESTION
+}
+
 enum AutomationRunStatus {
     CLAIMED
     RUNNING
@@ -627,6 +632,7 @@ model AutomationChange {
 // A run row is both the atomic execution claim and the shared run history.
 model AutomationRun {
     id                String                @id @default(cuid())
+    kind              AutomationRunKind     @default(SCHEDULED)
     automationId      String
     automation        Automation            @relation(fields: [automationId], references: [id], onDelete: Cascade)
     generation        Int
@@ -663,7 +669,8 @@ model AutomationRun {
     createdAt         DateTime              @default(now())
     updatedAt         DateTime              @updatedAt
 
-    @@unique([automationId, generation, scheduledFor])
+    // The SCHEDULED-only unique slot is maintained by a partial index in the migration.
+    @@index([automationId, generation, scheduledFor])
     @@index([automationId, status])
     @@index([machineAccountId, machineId, status])
     @@index([displaySessionId, createdAt])

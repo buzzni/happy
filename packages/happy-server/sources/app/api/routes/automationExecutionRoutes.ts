@@ -11,10 +11,25 @@ import { ExecutionBindingError } from '@/app/session/sessionExecutionBinding';
 import { listAutomationExecutionPage, readAutomationExecutionEvidencePage, readAutomationExecutionReference } from '@/app/automation/automationExecutionPage';
 import { db } from '@/storage/db';
 import { inTx } from '@/storage/inTx';
-import { queueAutomationExecutionQuestion } from '@/app/automation/automationExecutionQuestionService';
+import { claimAutomationExecutionQuestion, queueAutomationExecutionQuestion } from '@/app/automation/automationExecutionQuestionService';
 
 /** Registers a run-owned session; provider start remains a separate, journaled operation. */
 export function automationExecutionRoutes(app: Fastify) {
+  app.post('/v1/machines/:machineId/automation-questions/:requestId/claim', {
+    preHandler: app.authenticate,
+    schema: { params: z.strictObject({ machineId: z.string().min(1).max(200), requestId: z.string().uuid() }),
+      body: z.strictObject({ claimToken: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }) },
+  }, async (request, reply) => {
+    if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
+    if (!isServerBackedAutomationEnabled()) return reply.code(404).send({ error: 'feature-disabled' });
+    try {
+      const result = await inTx(tx => claimAutomationExecutionQuestion(tx, request.userId, request.params.machineId, request.params.requestId, request.body.claimToken));
+      return reply.header('Cache-Control', 'no-store').send(result);
+    } catch (error) {
+      if (error instanceof AutomationExecutionSessionError) return reply.code(error.statusCode).send({ error: error.message });
+      throw error;
+    }
+  });
   app.post('/v1/projects/:projectId/automations/:automationId/execution-questions', {
     bodyLimit: 400_000, preHandler: app.authenticate,
     schema: { params: z.strictObject({ projectId: z.string().min(1).max(200), automationId: z.string().min(1).max(200) }),

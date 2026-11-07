@@ -61,6 +61,14 @@ function makeTx() {
 }
 
 describe('automationExecutionService', () => {
+    it('does not mistake a question at the same timestamp for a claimed scheduled slot', async () => {
+        const tx = makeTx();
+        tx.automationRun.createMany.mockResolvedValue({ count: 0 });
+        tx.automationRun.findFirst.mockImplementation(async query => query.where.kind === 'SCHEDULED' ? null : { id: 'question-run' });
+        await expect(claimAutomationRun(tx as never, 'account-1', 'machine-1', { automationId: 'automation-1', generation: 3, scheduledFor: now }, now))
+            .resolves.toEqual({ ok: false, error: 'active-run' });
+        expect(tx.automationRun.findFirst).toHaveBeenCalledWith({ where: { automationId: 'automation-1', generation: 3, scheduledFor: now, kind: 'SCHEDULED' }, select: { id: true } });
+    });
     it.each([0, 1])('requires a full sync on every ready registration including a lost previous ACK (%s)', async previousVersion => {
         const tx = makeTx(), publicKey = new Uint8Array(32);
         tx.machine.findFirst.mockResolvedValue({ automationPublicKey: publicKey, automationKeyVersion: 4,

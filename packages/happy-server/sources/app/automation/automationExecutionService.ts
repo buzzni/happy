@@ -284,6 +284,7 @@ export async function claimAutomationRun(
                 automationId: automation.id,
                 generation: input.generation,
                 scheduledFor: input.scheduledFor,
+                kind: 'SCHEDULED',
             },
             select: { id: true },
         });

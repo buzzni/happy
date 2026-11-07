@@ -1,6 +1,6 @@
-import { createHash } from 'node:crypto';
-import type { Prisma } from '@prisma/client';
-import { automationExecutionQuestionRequestSchema, automationExecutionSessionId } from '@slopus/happy-wire';
+import { createHash, timingSafeEqual } from 'node:crypto';
+import type { Automation, AutomationExecutionQuestion, Machine, Prisma, Project } from '@prisma/client';
+import { automationExecutionQuestionRequestSchema, automationExecutionSessionId, automationExecutionQuestionBindingId } from '@slopus/happy-wire';
 import { projectAccess, chatAutomationsBlocked } from './automationService';
 import { AutomationExecutionSessionError, automationExecutionExitReceiptSchema } from './automationExecutionSession';
 
@@ -50,4 +50,70 @@ export async function queueAutomationExecutionQuestion(tx: Tx, actorId: string, 
     machineAccountId: definition.machineAccountId, machineId: definition.machineId, encrypted: input.encrypted, requestHash }] });
   if (created.count !== 1) return await replay() ?? reject(503, 'AUTOMATION_QUESTION_STORAGE_UNCONFIRMED');
   return publicQuestion({ id: input.requestId, sourceRunId: input.sourceRunId, runId: null, cancelledAt: null });
+}
+
+export function readCurrentAutomationQuestion(question: AutomationExecutionQuestion,
+  definition: Automation & { project: Project; targetMachine: Machine | null }) {
+  const parsed = automationExecutionQuestionRequestSchema.safeParse({ requestId: question.id, sourceRunId: question.sourceRunId,
+    expectedRevision: question.revision, generation: question.generation, displaySessionId: question.displaySessionId, encrypted: question.encrypted });
+  if (!parsed.success || question.cancelledAt || definition.id !== question.automationId || definition.deletedAt || definition.legacyMigrationPending
+    || definition.payloadVersion !== 6 || definition.revision !== question.revision || definition.generation !== question.generation
+    || definition.machineAccountId !== question.machineAccountId || definition.machineId !== question.machineId
+    || definition.project.accountId !== question.machineAccountId || (definition.project.config as { machineId?: unknown } | null)?.machineId !== question.machineId
+    || chatAutomationsBlocked(definition.project) || definition.targetMachine?.automationContextIsolationVersion !== 1
+    || definition.machineKeyVersion !== definition.targetMachine.automationKeyVersion || definition.machineKeyVersion !== parsed.data.encrypted.machineKeyVersion
+    || definition.viewerKeyVersion !== definition.project.automationViewerKeyVersion || definition.viewerKeyVersion !== parsed.data.encrypted.viewerKeyVersion) return null;
+  return parsed.data;
+}
+
+/** The daemon persists this caller-generated token before sending the claim. An ACK replay reuses the same run. */
+export async function claimAutomationExecutionQuestion(tx: Tx, accountId: string, machineId: string, requestId: string, claimToken: string, now = new Date()) {
+  if (!/^[A-Za-z0-9_-]{43}$/.test(claimToken)) return reject(400, 'INVALID_AUTOMATION_QUESTION_CLAIM');
+  const question = await tx.automationExecutionQuestion.findUnique({ where: { id: requestId }, include: {
+    automation: { include: { project: true, targetMachine: true } },
+  } });
+  if (!question || question.machineAccountId !== accountId || question.machineId !== machineId) return reject(404, 'AUTOMATION_QUESTION_NOT_FOUND');
+  const snapshot = readCurrentAutomationQuestion(question, question.automation);
+  if (!snapshot) return reject(409, 'AUTOMATION_QUESTION_TARGET_UNAVAILABLE');
+  const identity = { requestId, sourceRunId: question.sourceRunId, automationId: question.automationId,
+    projectId: question.automation.projectId, generation: question.generation, revision: question.revision,
+    displaySessionId: question.displaySessionId, executionBindingId: automationExecutionQuestionBindingId(requestId), encrypted: snapshot.encrypted };
+  const claimTokenHash = new Uint8Array(createHash('sha256').update(claimToken).digest());
+  if (question.runId) {
+    const run = await tx.automationRun.findUnique({ where: { id: question.runId } });
+    if (!run || run.id !== requestId || run.kind !== 'QUESTION' || run.automationId !== question.automationId || run.generation !== question.generation
+      || run.machineAccountId !== accountId || run.machineId !== machineId || run.previousExecutionRunId !== question.sourceRunId
+      || run.claimTokenHash.length !== claimTokenHash.length || !timingSafeEqual(run.claimTokenHash, claimTokenHash)) return reject(409, 'AUTOMATION_QUESTION_CLAIM_CONFLICT');
+    if (run.status === 'CLAIMED' && run.claimExpiresAt < now
+      || run.status === 'RUNNING' && (!run.runLeaseExpiresAt || run.runLeaseExpiresAt < now)) {
+      const state = run.status === 'CLAIMED' ? 'EXPIRED' as const : 'ABANDONED' as const;
+      const expired = await tx.automationRun.updateMany({ where: { id: run.id, status: run.status,
+        ...(run.status === 'CLAIMED' ? { claimExpiresAt: { lt: now } } : { OR: [{ runLeaseExpiresAt: null }, { runLeaseExpiresAt: { lt: now } }] }) },
+        data: { status: state, completedAt: now, holdCode: null } });
+      if (expired.count !== 1) return reject(503, 'AUTOMATION_QUESTION_CLAIM_STATE_CHANGED');
+      // Return the terminal state so the transaction commits; throwing here would keep the active slot occupied.
+      return { ...identity, runId: run.id, state, claimExpiresAt: run.claimExpiresAt.getTime(), runLeaseExpiresAt: run.runLeaseExpiresAt?.getTime() ?? null };
+    }
+    return { ...identity, runId: run.id, state: run.status, claimExpiresAt: run.claimExpiresAt.getTime(), runLeaseExpiresAt: run.runLeaseExpiresAt?.getTime() ?? null };
+  }
+  const source = await tx.automationRun.findFirst({ where: { id: question.sourceRunId, automationId: question.automationId,
+    machineAccountId: accountId, machineId } });
+  if (!source || source.sessionId !== automationExecutionSessionId(question.sourceRunId) || source.displaySessionId !== question.displaySessionId
+    || !source.executionCreateBodyHash || !source.executionSeedMetadata) return reject(404, 'AUTOMATION_QUESTION_SOURCE_UNAVAILABLE');
+  if (!automationExecutionExitReceiptSchema.safeParse(source.executionExitReceipt).success) return reject(409, 'AUTOMATION_QUESTION_SOURCE_UNCONFIRMED');
+  await tx.automationRun.updateMany({ where: { automationId: question.automationId, status: 'CLAIMED', claimExpiresAt: { lt: now } },
+    data: { status: 'EXPIRED', completedAt: now, holdCode: null } });
+  await tx.automationRun.updateMany({ where: { automationId: question.automationId, status: 'RUNNING',
+    OR: [{ runLeaseExpiresAt: null }, { runLeaseExpiresAt: { lt: now } }] }, data: { status: 'ABANDONED', completedAt: now, holdCode: null } });
+  const claimExpiresAt = new Date(now.getTime() + 120_000);
+  const created = await tx.automationRun.createMany({ skipDuplicates: true, data: [{ id: requestId, kind: 'QUESTION', automationId: question.automationId,
+    generation: question.generation, scheduledFor: question.createdAt, machineAccountId: accountId, machineId, status: 'CLAIMED',
+    claimTokenHash, claimExpiresAt, previousExecutionRunId: question.sourceRunId }] });
+  if (created.count !== 1) {
+    const collision = await tx.automationRun.findUnique({ where: { id: requestId }, select: { id: true } });
+    return reject(409, collision ? 'AUTOMATION_QUESTION_CLAIM_CONFLICT' : 'AUTOMATION_QUESTION_BUSY');
+  }
+  const bound = await tx.automationExecutionQuestion.updateMany({ where: { id: requestId, runId: null, cancelledAt: null }, data: { runId: requestId } });
+  if (bound.count !== 1) return reject(409, 'AUTOMATION_QUESTION_CLAIM_CONFLICT');
+  return { ...identity, runId: requestId, state: 'CLAIMED' as const, claimExpiresAt: claimExpiresAt.getTime(), runLeaseExpiresAt: null };
 }

@@ -42,6 +42,7 @@ beforeEach(async () => {
   vi.stubEnv('SAYCODE_AUTOMATION_ENABLED', 'true');
   vi.stubEnv('SCRIPT_AUTOMATION_ADMISSION_SECRET', secret);
   db = new PGlite(); await db.exec(sql);
+  await db.exec(`CREATE UNIQUE INDEX "AutomationRun_scheduled_slot" ON "AutomationRun"("automationId", "generation", "scheduledFor") WHERE "kind" = 'SCHEDULED'`);
   client = new PrismaClient({ adapter: new PrismaPGlite(db) }); state.client = client;
   await client.account.createMany({ data: [{ id: 'owner', publicKey: 'owner' }, { id: 'other', publicKey: 'other' }] });
   await client.project.create({ data: { id: 'chat:c1', accountId: 'owner', name: 'Chat',
@@ -271,6 +272,51 @@ it('queues an idempotent encrypted question about one completed run without edit
     expect(await client.automation.findUniqueOrThrow({ where: { id: 'a1' } })).toEqual(definition);
     expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
     expect(await client.automationRun.count()).toBe(1);
+    const question = await client.automationExecutionQuestion.findUniqueOrThrow({ where: { id: payload.requestId } });
+    const original = await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } });
+    await db.exec(`CREATE UNIQUE INDEX "AutomationRun_one_active_run_per_automation" ON "AutomationRun"("automationId") WHERE "status" IN ('CLAIMED', 'RUNNING')`);
+    await client.automationRun.create({ data: { id: 'regular-slot', automationId: 'a1', generation: definition.generation, scheduledFor: question.createdAt,
+      machineAccountId: 'owner', machineId: 'm1', status: 'COMPLETED', claimExpiresAt: original.claimExpiresAt,
+      claimTokenHash: new Uint8Array(createHash('sha256').update('regular-slot').digest()) } });
+    const claimUrl = `/v1/machines/m1/automation-questions/${payload.requestId}/claim`;
+    const claim = () => app.inject({ method: 'POST', url: claimUrl, headers: { authorization: `Bearer ${bearer}` }, payload: { claimToken: 'a'.repeat(43) } });
+    await client.automationRun.create({ data: { id: 'active-slot', automationId: 'a1', generation: definition.generation, scheduledFor: new Date(1),
+      machineAccountId: 'owner', machineId: 'm1', status: 'CLAIMED', claimExpiresAt: original.claimExpiresAt,
+      claimTokenHash: new Uint8Array(createHash('sha256').update('active-slot').digest()) } });
+    const busy = await claim(); expect(busy.statusCode).toBe(409); expect(busy.json()).toEqual({ error: 'AUTOMATION_QUESTION_BUSY' });
+    expect((await client.automationExecutionQuestion.findUniqueOrThrow({ where: { id: payload.requestId } })).runId).toBeNull();
+    await client.automationRun.update({ where: { id: 'active-slot' }, data: { status: 'COMPLETED' } });
+    const claimed = await claim(); expect(claimed.statusCode, claimed.body).toBe(200);
+    expect(claimed.json()).toMatchObject({ requestId: payload.requestId, runId: payload.requestId, sourceRunId: 'r1', state: 'CLAIMED' });
+    expect((await claim()).json()).toEqual(claimed.json());
+    const conflictClaim = await app.inject({ method: 'POST', url: claimUrl, headers: { authorization: `Bearer ${bearer}` }, payload: { claimToken: 'b'.repeat(43) } });
+    expect(conflictClaim.statusCode).toBe(409);
+    expect(await client.automationRun.count()).toBe(4);
+    expect(await client.automationRun.findUniqueOrThrow({ where: { id: payload.requestId } })).toMatchObject({ kind: 'QUESTION', previousExecutionRunId: 'r1', scheduledFor: question.createdAt });
+    expect(await client.automation.findUniqueOrThrow({ where: { id: 'a1' } })).toEqual(definition);
+    expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
+    // Paused schedules have no regular claim loop to clear an expired question's active slot.
+    await client.automation.update({ where: { id: 'a1' }, data: { paused: true } });
+    await client.automationRun.update({ where: { id: payload.requestId }, data: { claimExpiresAt: new Date(0) } });
+    const expired = await claim(); expect(expired.statusCode, expired.body).toBe(200);
+    expect(expired.json()).toMatchObject({ runId: payload.requestId, state: 'EXPIRED' });
+    expect((await client.automationRun.findUniqueOrThrow({ where: { id: payload.requestId } })).status).toBe('EXPIRED');
+    const nextQuestion = { ...payload, requestId: 'd23e9200-51d4-4f8a-adf7-4ed3dc7d26d6' };
+    expect((await send(nextQuestion)).statusCode).toBe(200);
+    const nextClaim = await app.inject({ method: 'POST', url: `/v1/machines/m1/automation-questions/${nextQuestion.requestId}/claim`,
+      headers: { authorization: `Bearer ${bearer}` }, payload: { claimToken: 'c'.repeat(43) } });
+    expect(nextClaim.statusCode, nextClaim.body).toBe(200); expect(nextClaim.json()).toMatchObject({ runId: nextQuestion.requestId, state: 'CLAIMED' });
+    expect((await client.automation.findUniqueOrThrow({ where: { id: 'a1' } })).paused).toBe(true);
+    // No retry of B is necessary: C also clears B's expired running lease before taking a new slot.
+    await client.automationRun.update({ where: { id: nextQuestion.requestId }, data: { status: 'RUNNING', runLeaseExpiresAt: new Date(0) } });
+    const thirdQuestion = { ...payload, requestId: 'cfcf32a2-a102-4aef-b282-4e35699d4f3a' };
+    expect((await send(thirdQuestion)).statusCode).toBe(200);
+    const thirdClaim = await app.inject({ method: 'POST', url: `/v1/machines/m1/automation-questions/${thirdQuestion.requestId}/claim`,
+      headers: { authorization: `Bearer ${bearer}` }, payload: { claimToken: 'd'.repeat(43) } });
+    expect(thirdClaim.statusCode, thirdClaim.body).toBe(200);
+    expect((await client.automationRun.findUniqueOrThrow({ where: { id: nextQuestion.requestId } })).status).toBe('ABANDONED');
+    expect((await claim()).json()).toMatchObject({ runId: payload.requestId, state: 'EXPIRED' });
+    expect(await client.automationRun.count()).toBe(6);
   } finally { await app.close(); }
 });
 
@@ -284,6 +330,26 @@ it('adds a separate question queue through the migration while preserving saved 
   expect(await client.automation.findUniqueOrThrow({ where: { id: 'a1' } })).toEqual(definition);
   expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
   expect(await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } })).toEqual(originalRun);
+});
+
+it('preserves scheduled slot uniqueness while giving questions a separate slot in the migration', async () => {
+  const original = await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } });
+  const manual = await client.session.findUniqueOrThrow({ where: { id: 'manual' } });
+  await db.exec(`DROP INDEX "AutomationRun_scheduled_slot";
+    DROP INDEX "AutomationRun_automationId_generation_scheduledFor_idx";
+    ALTER TABLE "AutomationRun" DROP COLUMN "kind";
+    DROP TYPE "AutomationRunKind";
+    CREATE UNIQUE INDEX "AutomationRun_automationId_generation_scheduledFor_key" ON "AutomationRun"("automationId", "generation", "scheduledFor");`);
+  await db.exec(await readFile('prisma/migrations/20261107021000_automation_question_run_slots/migration.sql', 'utf8'));
+  expect(await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } })).toEqual(original);
+  expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
+  const row = { automationId: 'a1', generation: 1, scheduledFor: original.scheduledFor, machineAccountId: 'owner', machineId: 'm1',
+    status: 'COMPLETED' as const, claimExpiresAt: original.claimExpiresAt };
+  const token = (id: string) => new Uint8Array(createHash('sha256').update(id).digest());
+  await client.automationRun.create({ data: { ...row, id: 'question', kind: 'QUESTION', claimTokenHash: token('question') } });
+  await expect(client.automationRun.create({ data: { ...row, id: 'scheduled-copy', kind: 'SCHEDULED', claimTokenHash: token('scheduled-copy') } }))
+    .rejects.toThrow(/Unique constraint/);
+  expect(await client.automationRun.count()).toBe(2);
 });
 
 it('rejects question requests with lost authority, changed generation, unsupported target or unconfirmed source', async () => {
