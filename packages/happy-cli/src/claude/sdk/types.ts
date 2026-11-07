@@ -51,6 +51,8 @@ export interface QueryOptions {
      */
     tools?: string[]
     mcpServers?: Record<string, unknown>
+    /** Local plugin directories to load, e.g. the session's `--plugin-dir` arguments (claude/utils/pluginsFromArgs.ts). */
+    plugins?: Options['plugins']
     permissionMode?: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan'
     continue?: boolean
     resume?: string
