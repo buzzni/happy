@@ -121,9 +121,18 @@ describe('claudeRemote', () => {
             expect((await run({ claudeArgs: ['--model', 'opus', '--', '--plugin-dir', 'x'] })).plugins).toBeUndefined();
         });
 
-        it('fails the launch before starting Claude when one has no path', async () => {
-            await expect(run({ claudeArgs: ['--plugin-dir'] })).rejects.toThrow('--plugin-dir requires');
+        it('fails the turn before preparing it or starting Claude when one has no path', async () => {
+            const beforeTurn = vi.fn();
+            await expect(run({ claudeArgs: ['--plugin-dir'], beforeTurn })).rejects.toThrow('--plugin-dir requires');
+            expect(beforeTurn).not.toHaveBeenCalled();
             expect(query).not.toHaveBeenCalled();
+        });
+
+        it('waits for a message before reading them, so a malformed one cannot relaunch without input', async () => {
+            vi.mocked(query).mockReset();
+            await expect(claudeRemote({ sessionId: null, path: sessionPath, allowedTools: [], claudeArgs: ['--plugin-dir'],
+                nextMessage: async () => null, onReady: vi.fn(), canCallTool: async () => ({ behavior: 'allow' }) as any,
+                isAborted: () => false, onSessionFound: vi.fn(), onThinkingChange: vi.fn(), onMessage: vi.fn() } as any)).resolves.toBe('not-started');
         });
     });
 

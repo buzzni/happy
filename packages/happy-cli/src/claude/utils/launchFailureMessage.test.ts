@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ClaudeAuthNotVerifiedError, CLAUDE_NOT_SIGNED_IN_NOTICE, isClaudeRevokedTokenFailure, isClaudeAuthenticationFailure, claudeNotSignedInNotice, describeClaudeLaunchFailure, isClaudeTokenRefreshFailure } from './launchFailureMessage';
+import { pluginsFromArgs } from './pluginsFromArgs';
 
 // Desktop specs/headless-standalone-server R21: the user sees why Claude Code did not start, but
 // never raw stderr — it can carry paths, env values or tokens.
@@ -56,6 +57,15 @@ describe('describeClaudeLaunchFailure', () => {
         expect(message).toMatch(/on hold/);
         expect(message).toContain('https://claude.ai/restricted');
         expect(message).not.toMatch(/could not start/);
+    });
+
+    it('names a malformed --plugin-dir and what to do (specs/cli-plugin-dir-and-env-scrub R5-a)', () => {
+        let error: unknown;
+        try { pluginsFromArgs(['--plugin-dir'], '/session'); } catch (caught) { error = caught; }
+        expect(describeClaudeLaunchFailure(error)).toBe(
+            'Claude Code could not start: --plugin-dir requires a path. Start this session again with a valid --plugin-dir.');
+        // Only the argument's own error: the same words from elsewhere stay generic.
+        expect(describeClaudeLaunchFailure(new Error('--plugin-dir requires a path'))).toMatch(/daemon log/);
     });
 
     it('falls back to a generic message and never echoes unknown stderr', () => {

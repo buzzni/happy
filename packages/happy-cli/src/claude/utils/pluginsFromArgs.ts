@@ -1,6 +1,14 @@
 import { resolve } from 'node:path';
 import type { QueryOptions } from '../sdk/types';
 
+/** A `--plugin-dir` without a usable path. The message names no path, only the argument. */
+export class PluginDirArgumentError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'PluginDirArgumentError';
+    }
+}
+
 /**
  * The plugin directories a person gave Claude on the command line
  * (`happy claude -- --plugin-dir <dir>`), as the SDK `plugins` option.
@@ -20,7 +28,7 @@ export function pluginsFromArgs(args: readonly string[] = [], cwd: string): Quer
         if (arg === '--plugin-dir') {
             const next = args[++i];
             if (next === undefined || next.startsWith('-')) {
-                throw new Error('--plugin-dir requires a path');
+                throw new PluginDirArgumentError('--plugin-dir requires a path');
             }
             path = next;
         } else if (arg.startsWith('--plugin-dir=')) {
@@ -29,7 +37,7 @@ export function pluginsFromArgs(args: readonly string[] = [], cwd: string): Quer
             continue;
         }
         if (!path || path.includes('\0')) {
-            throw new Error('--plugin-dir requires a non-empty path without null bytes');
+            throw new PluginDirArgumentError('--plugin-dir requires a non-empty path without null bytes');
         }
         plugins.push({ type: 'local', path: resolve(cwd, path) });
     }

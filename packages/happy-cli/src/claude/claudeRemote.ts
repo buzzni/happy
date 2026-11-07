@@ -307,9 +307,6 @@ async function runClaudeRemote(
         }
     }
 
-    // Before any turn preparation: a malformed `--plugin-dir` fails this launch, not a half-prepared turn.
-    const plugins = pluginsFromArgs(opts.claudeArgs, opts.path);
-
     // Set environment variables for Claude Code SDK
     if (opts.claudeEnvVars) {
         Object.entries(opts.claudeEnvVars).forEach(([key, value]) => {
@@ -426,6 +423,10 @@ async function runClaudeRemote(
         opts.onReady();
         return;
     }
+
+    // After the first message, before any turn preparation: a malformed `--plugin-dir` fails this one
+    // turn and the launcher waits for the next message. Parsed earlier, it relaunched without waiting.
+    const plugins = pluginsFromArgs(opts.claudeArgs, opts.path);
 
     const preparation = preparationFor(initial.latency);
     const initialTurn = opts.beforeTurn ? await measurePreparation(preparation, 'before-turn', opts.beforeTurn) : undefined;
