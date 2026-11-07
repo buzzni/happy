@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
-import type { Prisma } from '@prisma/client';
-import { automationExecutionQuestionRequestSchema, automationExecutionSessionId, automationExecutionQuestionBindingId } from '@slopus/happy-wire';
+import type { Prisma, AutomationExecutionQuestion } from '@prisma/client';
+import { z } from 'zod';
+import { automationExecutionQuestionRequestSchema, automationExecutionSessionId, automationExecutionQuestionBindingId, automationExecutionHoldCodeSchema } from '@slopus/happy-wire';
 import { projectAccess, chatAutomationsBlocked } from './automationService';
 import { AutomationExecutionSessionError, automationExecutionExitReceiptSchema } from './automationExecutionSession';
 import { readCurrentAutomationQuestion } from './automationExecutionQuestionAdmission';
@@ -102,7 +103,72 @@ export async function claimAutomationExecutionQuestion(tx: Tx, accountId: string
     const collision = await tx.automationRun.findUnique({ where: { id: requestId }, select: { id: true } });
     return reject(409, collision ? 'AUTOMATION_QUESTION_CLAIM_CONFLICT' : 'AUTOMATION_QUESTION_BUSY');
   }
-  const bound = await tx.automationExecutionQuestion.updateMany({ where: { id: requestId, runId: null, cancelledAt: null }, data: { runId: requestId } });
+  const bound = await tx.automationExecutionQuestion.updateMany({ where: { id: requestId, runId: null, cancelledAt: null }, data: { runId: requestId, holdCode: null } });
   if (bound.count !== 1) return reject(409, 'AUTOMATION_QUESTION_CLAIM_CONFLICT');
   return { ...identity, runId: requestId, state: 'CLAIMED' as const, claimExpiresAt: claimExpiresAt.getTime(), runLeaseExpiresAt: null };
+}
+
+const questionCursorSchema = z.strictObject({ scope: z.string(), id: z.string().uuid(), createdAt: z.number().int().nonnegative().max(8_640_000_000_000_000) });
+const questionRelations = { automation: { include: { project: true, targetMachine: true } } } as const;
+function questionView(row: AutomationExecutionQuestion, projectId: string) {
+  const hold = automationExecutionHoldCodeSchema.safeParse(row.holdCode);
+  return { requestId: row.id, sourceRunId: row.sourceRunId, automationId: row.automationId, projectId,
+    generation: row.generation, revision: row.revision, displaySessionId: row.displaySessionId,
+    machineId: row.machineId, encrypted: row.encrypted, runId: row.runId,
+    state: row.cancelledAt ? 'CANCEL_REQUESTED' as const : row.runId ? 'CLAIMED' as const : 'QUEUED' as const,
+    holdCode: hold.success ? hold.data : row.holdCode ? 'AUTOMATION_HOLD_UNCONFIRMED' as const : null,
+    createdAt: row.createdAt.getTime() };
+}
+async function pageQuestions(tx: Tx, where: Prisma.AutomationExecutionQuestionWhereInput, scope: string,
+  input: { cursor?: string | null; limit?: number }, descending: boolean) {
+  const limit = z.number().int().min(1).max(20).parse(input.limit ?? 20);
+  let anchor: z.infer<typeof questionCursorSchema> | null = null;
+  if (input.cursor) {
+    try { anchor = questionCursorSchema.parse(JSON.parse(Buffer.from(input.cursor, 'base64url').toString('utf8'))); }
+    catch { return reject(400, 'AUTOMATION_QUESTION_PAGE_INVALID'); }
+    if (anchor.scope !== scope) return reject(400, 'AUTOMATION_QUESTION_PAGE_INVALID');
+  }
+  const order = descending ? 'desc' as const : 'asc' as const;
+  const boundary = anchor ? { OR: [{ createdAt: { [descending ? 'lt' : 'gt']: new Date(anchor.createdAt) } },
+    { createdAt: new Date(anchor.createdAt), id: { [descending ? 'lt' : 'gt']: anchor.id } }] } : {};
+  const rows = await tx.automationExecutionQuestion.findMany({ where: { AND: [where, boundary] }, include: questionRelations,
+    orderBy: [{ createdAt: order }, { id: order }], take: limit + 1 });
+  const selected = rows.slice(0, limit), last = selected.at(-1);
+  return { questions: selected.map(row => questionView(row, row.automation.projectId)),
+    nextCursor: rows.length > limit && last ? Buffer.from(JSON.stringify({ scope, id: last.id, createdAt: last.createdAt.getTime() })).toString('base64url') : null };
+}
+
+export async function listMachineAutomationQuestions(tx: Tx, accountId: string, machineId: string, input: { cursor?: string | null; limit?: number }) {
+  return pageQuestions(tx, { machineAccountId: accountId, machineId, runId: null, cancelledAt: null },
+    JSON.stringify(['machine', accountId, machineId]), input, false);
+}
+export async function readMachineAutomationQuestion(tx: Tx, accountId: string, machineId: string, requestId: string) {
+  const row = await tx.automationExecutionQuestion.findFirst({ where: { id: requestId, machineAccountId: accountId, machineId }, include: questionRelations });
+  if (!row) return reject(404, 'AUTOMATION_QUESTION_NOT_FOUND');
+  const access = await projectAccess(tx, row.requestedByAccountId, row.automation.projectId);
+  const available = !!access?.canEdit && !!readCurrentAutomationQuestion(row, row.automation);
+  return { ...questionView(row, row.automation.projectId), available };
+}
+export async function holdMachineAutomationQuestion(tx: Tx, accountId: string, machineId: string, requestId: string, raw: unknown) {
+  const holdCode = automationExecutionHoldCodeSchema.nullable().parse(raw);
+  const result = await tx.automationExecutionQuestion.updateMany({ where: { id: requestId, machineAccountId: accountId, machineId,
+    runId: null, cancelledAt: null }, data: { holdCode } });
+  if (result.count !== 1) return reject(409, 'AUTOMATION_QUESTION_STATE_CHANGED');
+  return { requestId, holdCode };
+}
+export async function listProjectAutomationQuestions(tx: Tx, actorId: string, projectId: string,
+  input: { displaySessionId: string; cursor?: string | null; limit?: number }) {
+  if (!await projectAccess(tx, actorId, projectId)) return reject(404, 'AUTOMATION_QUESTION_NOT_FOUND');
+  return pageQuestions(tx, { automation: { projectId }, displaySessionId: input.displaySessionId },
+    JSON.stringify(['project', projectId, input.displaySessionId]), input, true);
+}
+export async function cancelAutomationExecutionQuestion(tx: Tx, actorId: string, projectId: string, requestId: string, displaySessionId: string) {
+  const access = await projectAccess(tx, actorId, projectId);
+  if (!access?.canEdit) return reject(404, 'AUTOMATION_QUESTION_NOT_FOUND');
+  const row = await tx.automationExecutionQuestion.findFirst({ where: { id: requestId, displaySessionId, automation: { projectId } } });
+  if (!row) return reject(404, 'AUTOMATION_QUESTION_NOT_FOUND');
+  if (!row.cancelledAt) await tx.automationExecutionQuestion.updateMany({ where: { id: requestId, cancelledAt: null },
+    data: { cancelledAt: new Date(), holdCode: null } });
+  // A cancellation intent is not a positive native-exit receipt.
+  return { ...questionView(row, projectId), state: 'CANCEL_REQUESTED' as const, holdCode: null };
 }

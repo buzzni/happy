@@ -1,5 +1,6 @@
 import { Readable } from 'node:stream';
-import { parseCanonicalOrgSetupTokenJson, automationExecutionQuestionRequestSchema } from '@slopus/happy-wire';
+import type { FastifyReply } from 'fastify';
+import { parseCanonicalOrgSetupTokenJson, automationExecutionQuestionRequestSchema, automationExecutionHoldCodeSchema } from '@slopus/happy-wire';
 import { z } from 'zod';
 import type { Fastify } from '../types';
 import { requireAccountPrincipal } from '@/app/api/utils/enableAuthentication';
@@ -11,10 +12,54 @@ import { ExecutionBindingError } from '@/app/session/sessionExecutionBinding';
 import { listAutomationExecutionPage, readAutomationExecutionEvidencePage, readAutomationExecutionReference } from '@/app/automation/automationExecutionPage';
 import { db } from '@/storage/db';
 import { inTx } from '@/storage/inTx';
-import { claimAutomationExecutionQuestion, queueAutomationExecutionQuestion } from '@/app/automation/automationExecutionQuestionService';
+import { claimAutomationExecutionQuestion, queueAutomationExecutionQuestion, listMachineAutomationQuestions, readMachineAutomationQuestion,
+  holdMachineAutomationQuestion, listProjectAutomationQuestions, cancelAutomationExecutionQuestion } from '@/app/automation/automationExecutionQuestionService';
+
+async function questionReply(reply: FastifyReply, work: () => Promise<unknown>) {
+  if (!isServerBackedAutomationEnabled()) return reply.code(404).send({ error: 'feature-disabled' });
+  try { return reply.header('Cache-Control', 'no-store').send(await work()); }
+  catch (error) {
+    if (error instanceof AutomationExecutionSessionError) return reply.code(error.statusCode).send({ error: error.message });
+    throw error;
+  }
+}
+const questionMachineParams = z.strictObject({ machineId: z.string().min(1).max(200), requestId: z.string().uuid() });
+const questionPageQuery = z.strictObject({ limit: z.coerce.number().int().min(1).max(20).default(20), cursor: z.string().min(1).max(1024).optional() });
 
 /** Registers a run-owned session; provider start remains a separate, journaled operation. */
 export function automationExecutionRoutes(app: Fastify) {
+  app.get('/v1/machines/:machineId/automation-questions', {
+    preHandler: app.authenticate, schema: { params: questionMachineParams.omit({ requestId: true }), querystring: questionPageQuery },
+  }, async (request, reply) => {
+    if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
+    return questionReply(reply, () => inTx(tx => listMachineAutomationQuestions(tx, request.userId, request.params.machineId, request.query)));
+  });
+  app.get('/v1/machines/:machineId/automation-questions/:requestId', {
+    preHandler: app.authenticate, schema: { params: questionMachineParams },
+  }, async (request, reply) => {
+    if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
+    return questionReply(reply, () => inTx(tx => readMachineAutomationQuestion(tx, request.userId, request.params.machineId, request.params.requestId)));
+  });
+  app.patch('/v1/machines/:machineId/automation-questions/:requestId', {
+    preHandler: app.authenticate, schema: { params: questionMachineParams, body: z.strictObject({ holdCode: automationExecutionHoldCodeSchema.nullable() }) },
+  }, async (request, reply) => {
+    if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
+    return questionReply(reply, () => inTx(tx => holdMachineAutomationQuestion(tx, request.userId, request.params.machineId, request.params.requestId, request.body.holdCode)));
+  });
+  app.get('/v1/projects/:projectId/execution-questions', {
+    preHandler: app.authenticate, schema: { params: z.strictObject({ projectId: z.string().min(1).max(200) }),
+      querystring: questionPageQuery.extend({ displaySessionId: z.string().min(1).max(200) }) },
+  }, async (request, reply) => {
+    if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
+    return questionReply(reply, () => inTx(tx => listProjectAutomationQuestions(tx, request.userId, request.params.projectId, request.query)));
+  });
+  app.post('/v1/projects/:projectId/execution-questions/:requestId/cancel', {
+    preHandler: app.authenticate, schema: { params: z.strictObject({ projectId: z.string().min(1).max(200), requestId: z.string().uuid() }),
+      body: z.strictObject({ displaySessionId: z.string().min(1).max(200) }) },
+  }, async (request, reply) => {
+    if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
+    return questionReply(reply, () => inTx(tx => cancelAutomationExecutionQuestion(tx, request.userId, request.params.projectId, request.params.requestId, request.body.displaySessionId)));
+  });
   app.post('/v1/machines/:machineId/automation-questions/:requestId/claim', {
     preHandler: app.authenticate,
     schema: { params: z.strictObject({ machineId: z.string().min(1).max(200), requestId: z.string().uuid() }),
@@ -33,7 +78,7 @@ export function automationExecutionRoutes(app: Fastify) {
   app.post('/v1/projects/:projectId/automations/:automationId/execution-questions', {
     bodyLimit: 400_000, preHandler: app.authenticate,
     schema: { params: z.strictObject({ projectId: z.string().min(1).max(200), automationId: z.string().min(1).max(200) }),
-      body: automationExecutionQuestionRequestSchema },
+      body: automationExecutionQuestionRequestSchema, automationExecutionHoldCodeSchema },
   }, async (request, reply) => {
     if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
     if (!isServerBackedAutomationEnabled()) return reply.code(404).send({ error: 'feature-disabled' });

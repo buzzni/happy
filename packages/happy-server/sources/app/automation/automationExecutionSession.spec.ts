@@ -370,6 +370,47 @@ it('queues an idempotent encrypted question about one completed run without edit
   } finally { await app.close(); }
 });
 
+it('pages encrypted pending questions, publishes bounded preclaim holds and cancels only the selected question', async () => {
+  await register(); await reportAutomationRun(client, 'owner', 'm1', report('automation-run:r1'), now);
+  await recordAutomationExecutionExit('owner', { runId: 'r1', ...await exitRequest() });
+  await client.machine.update({ where: { id: 'm1' }, data: { automationContextIsolationVersion: 1 } });
+  const definition = await client.automation.findUniqueOrThrow({ where: { id: 'a1' } });
+  const one = (size: number) => Buffer.concat([Buffer.from([1]), Buffer.alloc(size - 1)]).toString('base64');
+  const payload = { requestId: 'c6e7d925-4f88-4727-9a33-b4603407d32b', sourceRunId: 'r1', expectedRevision: definition.revision,
+    generation: definition.generation, displaySessionId: 'manual', encrypted: { payloadVersion: 6, payloadCiphertext: one(41),
+      viewerKeyId: 'k', viewerKeyVersion: 1, viewerKeyEnvelope: one(105), machineKeyVersion: 1, machineKeyEnvelope: one(105) } };
+  await queueAutomationExecutionQuestion(client, 'owner', 'chat:c1', 'a1', payload);
+  const app = await api(), headers = { authorization: `Bearer ${bearer}` };
+  const queueUrl = '/v1/machines/m1/automation-questions', questionUrl = `${queueUrl}/${payload.requestId}`;
+  const publicUrl = '/v1/projects/chat:c1/execution-questions?displaySessionId=manual';
+  try {
+    const list = await app.inject({ method: 'GET', url: queueUrl, headers });
+    expect(list.statusCode, list.body).toBe(200);
+    expect(list.json()).toMatchObject({ questions: [{ requestId: payload.requestId, automationId: 'a1', projectId: 'chat:c1',
+      sourceRunId: 'r1', displaySessionId: 'manual', generation: 1, revision: 1, encrypted: payload.encrypted, holdCode: null }], nextCursor: null });
+    const foreign = await app.inject({ method: 'GET', url: '/v1/machines/m2/automation-questions', headers });
+    expect(foreign.json()).toEqual({ questions: [], nextCursor: null });
+    const hold = await app.inject({ method: 'PATCH', url: questionUrl, headers, payload: { holdCode: 'AUTOMATION_REFERENCE_TOO_LARGE' } });
+    expect(hold.statusCode, hold.body).toBe(200);
+    expect((await app.inject({ method: 'GET', url: publicUrl, headers })).json()).toMatchObject({
+      questions: [{ requestId: payload.requestId, runId: null, state: 'QUEUED', holdCode: 'AUTOMATION_REFERENCE_TOO_LARGE', encrypted: payload.encrypted }], nextCursor: null });
+    expect((await app.inject({ method: 'PATCH', url: questionUrl, headers, payload: { holdCode: 'PRIVATE_ERROR_LOG' } })).statusCode).toBe(400);
+    expect((await app.inject({ method: 'GET', url: publicUrl.replace('chat:c1', 'other-project'), headers })).statusCode).toBe(404);
+    const cancelUrl = `/v1/projects/chat:c1/execution-questions/${payload.requestId}/cancel`;
+    const cancel = () => app.inject({ method: 'POST', url: cancelUrl, headers, payload: { displaySessionId: 'manual' } });
+    const cancelled = await cancel(); expect(cancelled.statusCode, cancelled.body).toBe(200);
+    expect(cancelled.json()).toMatchObject({ requestId: payload.requestId, state: 'CANCEL_REQUESTED', holdCode: null });
+    expect((await cancel()).json()).toEqual(cancelled.json());
+    expect((await app.inject({ method: 'GET', url: questionUrl, headers })).json()).toMatchObject({ state: 'CANCEL_REQUESTED' });
+    expect((await app.inject({ method: 'GET', url: queueUrl, headers })).json()).toEqual({ questions: [], nextCursor: null });
+    expect((await app.inject({ method: 'POST', url: questionUrl + '/claim', headers, payload: { claimToken: 'a'.repeat(43) } })).statusCode).toBe(409);
+    expect(await client.automation.findUniqueOrThrow({ where: { id: 'a1' } })).toEqual(definition);
+    expect(await client.automationRun.count()).toBe(1);
+    const serialized = JSON.stringify((await app.inject({ method: 'GET', url: publicUrl, headers })).json());
+    expect(serialized).not.toContain('claimToken'); expect(serialized).not.toContain('requestedByAccountId');
+  } finally { await app.close(); }
+});
+
 it('adds a separate question queue through the migration while preserving saved definitions, native metadata and run history', async () => {
   const definition = await client.automation.findUniqueOrThrow({ where: { id: 'a1' } });
   const manual = await client.session.findUniqueOrThrow({ where: { id: 'manual' } });
@@ -380,6 +421,16 @@ it('adds a separate question queue through the migration while preserving saved 
   expect(await client.automation.findUniqueOrThrow({ where: { id: 'a1' } })).toEqual(definition);
   expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
   expect(await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } })).toEqual(originalRun);
+});
+
+it('adds preclaim hold state without changing saved definitions, existing questions or manual messages', async () => {
+  const definition = await client.automation.findUniqueOrThrow({ where: { id: 'a1' } });
+  const messages = await client.sessionMessage.findMany({ where: { sessionId: 'manual' } });
+  await db.exec('ALTER TABLE "AutomationExecutionQuestion" DROP COLUMN "holdCode";');
+  await db.exec(await readFile('prisma/migrations/20261107022000_automation_question_hold/migration.sql', 'utf8'));
+  expect(await client.automation.findUniqueOrThrow({ where: { id: 'a1' } })).toEqual(definition);
+  expect(await client.sessionMessage.findMany({ where: { sessionId: 'manual' } })).toEqual(messages);
+  expect(await client.automationExecutionQuestion.count()).toBe(0);
 });
 
 it('preserves scheduled slot uniqueness while giving questions a separate slot in the migration', async () => {

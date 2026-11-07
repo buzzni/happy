@@ -1,6 +1,7 @@
 import { expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { claimAutomationExecutionQuestion, queueAutomationExecutionQuestion } from './automationExecutionQuestionService';
+import { claimAutomationExecutionQuestion, queueAutomationExecutionQuestion, listMachineAutomationQuestions,
+  listProjectAutomationQuestions, cancelAutomationExecutionQuestion } from './automationExecutionQuestionService';
 
 function fixture() {
   const one = (size: number) => Buffer.concat([Buffer.from([1]), Buffer.alloc(size - 1)]).toString('base64');
@@ -78,4 +79,32 @@ it.each(['expired-claim', 'expired-running', 'missing-running-lease'])('never re
   });
   expect(f.tx.automationRun.updateMany).toHaveBeenCalled();
   expect(f.tx.automationRun.createMany).not.toHaveBeenCalled();
+});
+
+it('scopes queue pages before limiting, binds cursor to its machine and never reads a foreign project page', async () => {
+  const f = fixture(), row = { id: f.input.requestId, sourceRunId: 'source', automationId: 'a1', generation: 3, revision: 2,
+    displaySessionId: 'manual', machineId: 'm1', encrypted: f.input.encrypted, runId: null, cancelledAt: null, holdCode: null,
+    createdAt: new Date(1), automation: { projectId: 'p1' } };
+  const findMany = vi.fn(async () => [row, { ...row, id: 'c6e7d925-4f88-4727-9a33-b4603407d32b' }]);
+  Object.assign(f.tx.automationExecutionQuestion, { findMany });
+  const page = await listMachineAutomationQuestions(f.tx as never, 'owner', 'm1', { limit: 1 });
+  expect(page.questions).toHaveLength(1); expect(page.nextCursor).toEqual(expect.any(String));
+  expect(findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { AND: [
+    { machineAccountId: 'owner', machineId: 'm1', runId: null, cancelledAt: null }, {}] }, take: 2,
+    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] }));
+  await listMachineAutomationQuestions(f.tx as never, 'owner', 'm1', { limit: 1, cursor: page.nextCursor });
+  expect(findMany).toHaveBeenLastCalledWith(expect.objectContaining({ where: { AND: [expect.anything(), { OR: [
+    { createdAt: { gt: new Date(1) } }, { createdAt: new Date(1), id: { gt: row.id } }] }] } }));
+  await expect(listMachineAutomationQuestions(f.tx as never, 'owner', 'm2', { cursor: page.nextCursor })).rejects.toThrow('AUTOMATION_QUESTION_PAGE_INVALID');
+  expect(findMany).toHaveBeenCalledTimes(2);
+  f.tx.project.findUnique.mockResolvedValue(null as never);
+  await expect(listProjectAutomationQuestions(f.tx as never, 'owner', 'p2', { displaySessionId: 'manual' })).rejects.toThrow();
+  expect(findMany).toHaveBeenCalledTimes(2);
+});
+it('refuses question cancellation by a viewer before reading or changing the request', async () => {
+  const f = fixture(), findFirst = vi.fn(), updateMany = vi.fn();
+  Object.assign(f.tx.automationExecutionQuestion, { findFirst, updateMany });
+  f.tx.projectMember.findUnique.mockResolvedValue({ status: 'accepted', role: 'viewer' });
+  await expect(cancelAutomationExecutionQuestion(f.tx as never, 'viewer', 'p1', f.input.requestId, 'manual')).rejects.toThrow();
+  expect(findFirst).not.toHaveBeenCalled(); expect(updateMany).not.toHaveBeenCalled();
 });

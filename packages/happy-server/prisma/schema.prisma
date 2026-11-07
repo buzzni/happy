@@ -691,6 +691,7 @@ model AutomationExecutionQuestion {
     machineId String
     encrypted Json
     requestHash String
+    holdCode String?
     runId String? @unique
     cancelledAt DateTime?
     createdAt DateTime @default(now())
