@@ -47,10 +47,11 @@ function eventPercent(utilization: number | undefined): number | null {
     return clampPercent(Math.round((utilization <= 1 ? utilization * 100 : utilization) * 10) / 10);
 }
 
-/** Unix seconds, or milliseconds should the provider switch units. */
+/** Unix seconds, or milliseconds should the provider switch units. A time no date can hold reads as none. */
 function eventResetIso(resetsAt: number | undefined): string | null {
     if (!finite(resetsAt) || resetsAt <= 0) return null;
-    return new Date(resetsAt < 1e12 ? resetsAt * 1000 : resetsAt).toISOString();
+    const date = new Date(resetsAt < 1e12 ? resetsAt * 1000 : resetsAt);
+    return Number.isFinite(date.getTime()) ? date.toISOString() : null;
 }
 
 function isoOrNull(value: unknown): string | null {
@@ -112,7 +113,7 @@ export function mergeUsageLimits(current: UsageLimits | null | undefined, patch:
         };
     }
     if (patch.unbound) {
-        // No window id: apply it to the window closest to its limit rather than hide a refusal.
+        // No window id: apply its status and reset to the window closest to its limit rather than hide a refusal.
         let target = -1;
         for (let i = 0; i < windows.length; i++) {
             const u = windows[i].utilization;
@@ -124,7 +125,9 @@ export function mergeUsageLimits(current: UsageLimits | null | undefined, patch:
         const updated = {
             ...prior,
             status: patch.unbound.status,
-            utilization: patch.unbound.utilization ?? prior.utilization,
+            // Its percent is the binding window's, which is unknown: only the synthetic window takes it. Writing it
+            // into a guessed window would also change which window the same patch picks when a write retries.
+            utilization: prior.id === 'plan' ? patch.unbound.utilization ?? prior.utilization : prior.utilization,
             resetsAt: patch.unbound.resetsAt ?? prior.resetsAt,
         };
         if (target >= 0) windows[target] = updated; else windows.push(updated);

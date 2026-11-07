@@ -79,6 +79,13 @@ import { SETUP_TOKEN_BINDING_ENV, SETUP_TOKEN_RESUME_REBOUND_ENV, sharedMachineS
 /** Sent when the member retries a turn the organization account refused to authenticate (Saycode specs/org-auth-failure-account-switch). */
 const AUTHENTICATION_RETRY_PROMPT = 'The previous request stopped because the organization Claude account could not authenticate. Try the request again from where you stopped.';
 
+/**
+ * specs/cli-usage-limits-snapshot — queries started per session client, across launcher entries (local↔remote).
+ * Only the newest publishes usage limits: an older one's late patch (its seed outlived a restart onto another
+ * account, or the launcher it ran in) describes what it left.
+ */
+const usageLimitsQueries = new WeakMap<object, number>();
+
 export async function claudeRemoteLauncher(session: Session): Promise<'switch' | 'exit'> {
     logger.debug('[claudeRemoteLauncher] Starting remote launcher');
 
@@ -601,12 +608,6 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     /** The provider runs on a binding the session has since switched away from. */
     const providerStale = () => providerRunning && (providerCredentialGeneration !== (personalFallback?.generation() ?? 0) || providerBinding !== undefined && providerBinding !== runningAuthority());
 
-    /**
-     * specs/cli-usage-limits-snapshot — queries started so far. Only the newest publishes usage limits: an
-     * older one's late patch (its seed outlived a restart onto another account) describes the account it left.
-     */
-    let usageLimitsQueries = 0;
-
     let backgroundTasks: NonNullable<Metadata['claudeBackgroundTasks']> | undefined;
     function publishBackgroundTasks(next: NonNullable<Metadata['claudeBackgroundTasks']>) {
         backgroundTasks = next;
@@ -984,7 +985,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             providerSharedStartAuthority = personalFallback?.identity() || providerActivityBinding ? undefined : sharedMachineSetupTokenAuthority(process.env);
             const optionsCredentialGeneration = personalFallback?.generation() ?? 0;
             const providerOptionsStale = () => providerStale() || optionsCredentialGeneration !== (personalFallback?.generation() ?? 0);
-            const usageLimitsQuery = ++usageLimitsQueries;
+            const usageLimitsQuery = (usageLimitsQueries.get(session.client) ?? 0) + 1;
+            usageLimitsQueries.set(session.client, usageLimitsQuery);
             try {
                 const remoteResult = await claudeRemote({
                     sessionId: session.sessionId,
@@ -1476,7 +1478,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     },
                     // Merged inside the write, so a version-mismatch retry merges again on the newest state.
                     onUsageLimits: (patch) => {
-                        if (usageLimitsQuery !== usageLimitsQueries) return;
+                        if (usageLimitsQuery !== usageLimitsQueries.get(session.client)) return;
                         session.client.updateAgentState((current) => ({ ...current, usageLimits: mergeUsageLimits(current.usageLimits, patch) }));
                     },
                     onMcpStatus: (status: McpRuntimeServerStatus) => {

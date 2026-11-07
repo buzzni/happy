@@ -69,6 +69,19 @@ describe('createUsageLimitsCollector', () => {
         ]);
     });
 
+    it('takes the seed\'s reset for an event that carries only a percent', async () => {
+        const { collector, published } = setup(async () => usage({ five_hour: { utilization: 40, resets_at: '2026-01-01T05:00:00Z' } }));
+        collector.observe(event({ status: 'allowed', rateLimitType: 'five_hour', utilization: 0.5 }));
+        await collector.turnEnded();
+        expect(published[0].windows).toEqual([{ id: 'five_hour', status: 'allowed', utilization: 50, resetsAt: '2026-01-01T05:00:00.000Z' }]);
+    });
+
+    it('replaces the stored windows even when the seed reports none, so the previous account\'s do not stay', async () => {
+        const { collector, published } = setup(async () => usage({}));
+        await collector.turnEnded();
+        expect(published).toEqual([{ capturedAt: 1000, windows: [], replace: true }]);
+    });
+
     it('skips a turn whose windows did not change', async () => {
         const { collector, published } = setup();
         const same = event({ status: 'allowed', rateLimitType: 'five_hour', utilization: 0.5, resetsAt: RESET });
@@ -100,6 +113,7 @@ describe('createUsageLimitsCollector', () => {
 
     it.each([
         ['plan limits do not apply', async () => usage(null)],
+        ['plan limits do not apply even with windows attached', async () => ({ rate_limits_available: false, rate_limits: { seven_day: { utilization: 70, resets_at: null } } })],
         ['the request fails', async () => { throw new Error('closed'); }],
     ])('publishes the events alone when %s', async (_name, readUsage) => {
         const { collector, published } = setup(readUsage);

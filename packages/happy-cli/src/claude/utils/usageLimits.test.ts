@@ -31,6 +31,10 @@ describe('fromRateLimitEvent', () => {
             .toMatchObject({ utilization: 42, resetsAt: '2026-01-01T00:00:00.000Z' });
     });
 
+    it('reads a reset outside what a date can hold as none', () => {
+        expect(fromRateLimitEvent({ status: 'allowed', rateLimitType: 'five_hour', resetsAt: 1e20 }).window?.resetsAt).toBeNull();
+    });
+
     it('leaves out what the event does not carry', () => {
         expect(fromRateLimitEvent({ status: 'allowed', rateLimitType: 'five_hour' }).window)
             .toEqual({ id: 'five_hour', status: 'allowed', utilization: null, resetsAt: null });
@@ -116,25 +120,27 @@ describe('mergeUsageLimits', () => {
             .toEqual({ capturedAt: 2, windows: [base.windows[1]] });
     });
 
-    it('applies an unbound event to the fullest window', () => {
-        const merged = mergeUsageLimits(base, { capturedAt: 2, windows: [], unbound: { status: 'rejected', utilization: null, resetsAt: '2026-01-02T00:00:00.000Z' } });
+    it('applies an unbound event\'s status and reset to the fullest window, keeping that window\'s own percent', () => {
+        const merged = mergeUsageLimits(base, { capturedAt: 2, windows: [], unbound: { status: 'rejected', utilization: 50, resetsAt: '2026-01-02T00:00:00.000Z' } });
         expect(merged.windows).toEqual([
             base.windows[0],
             { id: 'seven_day', status: 'rejected', utilization: 70, resetsAt: '2026-01-02T00:00:00.000Z' },
         ]);
     });
 
-    it('keeps one synthetic plan window when no window has a percent', () => {
-        const patch = { capturedAt: 2, windows: [], unbound: { status: 'rejected' as const, utilization: null, resetsAt: null } };
+    it('keeps one synthetic plan window, with the event\'s percent, when no window has a percent', () => {
+        const patch = { capturedAt: 2, windows: [], unbound: { status: 'rejected' as const, utilization: 100, resetsAt: null } };
         const once = mergeUsageLimits(undefined, patch);
-        expect(once.windows).toEqual([{ id: 'plan', status: 'rejected', utilization: null, resetsAt: null }]);
+        expect(once.windows).toEqual([{ id: 'plan', status: 'rejected', utilization: 100, resetsAt: null }]);
+        expect(mergeUsageLimits(once, patch)).toEqual(once);
         expect(mergeUsageLimits(once, { ...patch, unbound: { status: 'allowed', utilization: null, resetsAt: null } }).windows)
-            .toEqual([{ id: 'plan', status: 'allowed', utilization: null, resetsAt: null }]);
+            .toEqual([{ id: 'plan', status: 'allowed', utilization: 100, resetsAt: null }]);
     });
 
-    it('gives the same result when applied again, as a state write retry does', () => {
-        const patch = { capturedAt: 2, windows: [{ id: 'five_hour', status: 'allowed' as const, utilization: null, resetsAt: null }], unbound: { status: 'rejected' as const, utilization: 99, resetsAt: null } };
-        const once = mergeUsageLimits(base, patch);
+    it.each([99, 50])('gives the same result when applied again, as a state write retry does (unbound at %s%%)', (utilization) => {
+        const current: UsageLimits = { capturedAt: 1, windows: [{ ...base.windows[0], utilization: 80 }, base.windows[1]] };
+        const patch = { capturedAt: 2, windows: [{ id: 'five_hour', status: 'allowed' as const, utilization: null, resetsAt: null }], unbound: { status: 'rejected' as const, utilization, resetsAt: null } };
+        const once = mergeUsageLimits(current, patch);
         expect(mergeUsageLimits(once, patch)).toEqual(once);
     });
 

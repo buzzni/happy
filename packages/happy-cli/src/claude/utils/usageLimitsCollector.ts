@@ -65,15 +65,16 @@ export function createUsageLimitsCollector(deps: {
         let replace = false;
         if (!seeded) {
             seeded = true;
-            for (const window of await seed() ?? []) {
-                replace = true;
+            const seededWindows = await seed();
+            // A full answer replaces the stored windows even when it lists none: they were the previous account's.
+            replace = seededWindows !== null;
+            for (const window of seededWindows ?? []) {
                 const event = windows.get(window.id);
-                // The turn's event is fresher, but an allowed one carries no percent: take the seed's.
-                if (!event) windows.set(window.id, window);
-                else if (event.utilization === null) windows.set(window.id, { ...event, utilization: window.utilization, resetsAt: event.resetsAt ?? window.resetsAt });
+                // The turn's event is fresher, but an allowed one carries no percent and some no reset: take the seed's.
+                windows.set(window.id, event ? { ...event, utilization: event.utilization ?? window.utilization, resetsAt: event.resetsAt ?? window.resetsAt } : window);
             }
         }
-        if (windows.size === 0 && !unbound) return;
+        if (windows.size === 0 && !unbound && !replace) return;
         const patch: UsageLimitsPatch = { capturedAt: now(), windows: [...windows.values()], ...(unbound ? { unbound } : {}), ...(replace ? { replace } : {}) };
         const next = mergeUsageLimits(published, patch);
         if (published && signature(next) === signature(published)) return;

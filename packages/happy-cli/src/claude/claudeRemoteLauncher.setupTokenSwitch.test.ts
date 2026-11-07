@@ -616,6 +616,61 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         expect(agentState.usageLimits).toEqual(fresh);
     });
 
+    // Saycode specs/cli-usage-limits-snapshot R8-b — the session leaves remote mode and comes back with a new launcher.
+    it('drops a late usage reading from a query of an earlier remote launcher of the same session', async () => {
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        let agentState: Record<string, unknown> = {};
+        const client = {
+            sessionId: 'happy-session-1',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn((update: (current: Record<string, unknown>) => Record<string, unknown>) => { agentState = update(agentState); }),
+            updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(), failClaudeLaunchTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        let answerFirstSeed!: (value: unknown) => void;
+        const seeds = [
+            vi.fn(() => new Promise((resolve) => { answerFirstSeed = resolve; })),
+            vi.fn(async () => ({ rate_limits_available: true, rate_limits: { five_hour: { utilization: 3, resets_at: null } } })),
+        ];
+        let generation = 0;
+        vi.mocked(query).mockImplementation(({ prompt }) => {
+            const current = generation++;
+            const response = (async function* () {
+                yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+                for await (const _message of prompt as AsyncIterable<SDKUserMessage>) {
+                    yield assistant(`msg-${current}`);
+                    yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: `result-${current}` };
+                    if (current === 1) await vi.waitFor(() => expect(agentState.usageLimits).toBeDefined());
+                    void handlers.get('switch')!();
+                    return;
+                }
+            })();
+            return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {},
+                usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: seeds[current] }) as unknown as ReturnType<typeof query>;
+        });
+        const session: Record<string, unknown> = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 }, cancelLessonReview: vi.fn(),
+            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
+        };
+
+        queue.push('first', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        await claudeRemoteLauncher(session as unknown as Session);
+        queue.push('back in remote mode', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        await claudeRemoteLauncher(session as unknown as Session);
+
+        const fresh = { capturedAt: expect.any(Number), windows: [{ id: 'five_hour', status: 'allowed', utilization: 3, resetsAt: null }] };
+        expect(agentState.usageLimits).toEqual(fresh);
+        answerFirstSeed({ rate_limits_available: true, rate_limits: { five_hour: { utilization: 100, resets_at: null } } });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(seeds[0]).toHaveBeenCalledOnce();
+        expect(agentState.usageLimits).toEqual(fresh);
+    });
+
     // Saycode specs/shared-pc-session-account-continuation — a shared PC session has no Studio binding.
     it('moves an unbound shared-PC session off a used-up account and continues the refused turn', async () => {
         const SHARED_A = '0b6f2c1e-1111-4a2b-8c3d-000000000001';
