@@ -215,6 +215,12 @@ jobs:
         src/daemon/personalBrowserRuntime.test.ts
         src/daemon/browserSessionReconnect.test.ts
 
+    - name: Verify sessions reach their own CLI as `happy` from cmd and Git Bash
+      timeout-minutes: 5
+      run: >-
+        pnpm --filter @buzzni/happy-cli exec vitest run --project unit
+        src/utils/happyCommandShim.test.ts
+
     - name: Pack package
       run: |
         $publishDir = Join-Path $env:RUNNER_TEMP "happy-cli-publish"
