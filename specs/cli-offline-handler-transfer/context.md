@@ -1,6 +1,6 @@
 ---
 기능: cli-offline-handler-transfer
-상태: 진행중(T6 PR)
+상태: 진행중(T6 — PR #1155 리뷰봇·CI)
 마지막 갱신: 2026-11-07
 ---
 
@@ -31,4 +31,4 @@ origin/main 3fbd89815(.395)에서 분기. T1~T4 완료: stub 등록 기록·이�
 - (범위 밖) `api/apiSession.test.ts` "reports an observed org deployment login only on the events it was handed"는 변경 전 코드에서도 실패(로컬, 전역 build 없는 반복 설정).
 
 ## 다음 시작점
-T5 교차 리뷰 → T6 PR.
+PR https://github.com/buzzni/happy/pull/1155 — 리뷰봇 반영·CI 확인 뒤 머지는 지휘 세션.
