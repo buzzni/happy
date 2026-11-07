@@ -9,6 +9,7 @@ const targetSchema = z.strictObject({
   machineId: id, machineAccountId: id, displaySessionId: id,
   createBodyHash: z.string().regex(/^[a-f0-9]{64}$/),
   executionBindingRequired: z.boolean(),
+  questionRequestId: z.string().uuid().optional(),
   executionAuthorityDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
 });
 const claimsSchema = targetSchema.extend({

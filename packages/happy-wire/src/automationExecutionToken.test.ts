@@ -10,6 +10,14 @@ const verify = (token: string, patch: Record<string, unknown> = {}) => verifyAut
 });
 
 describe('automation execution display target proof', () => {
+  it('requires the exact one-off request identity and rejects a legacy proof without it', () => {
+    const question = { ...target, questionRequestId: '9cc41d26-562e-4b48-8e2f-a38dc2c85a78' };
+    const token = signAutomationExecutionTarget({ ...input, ...question });
+    expect(verify(token, { expected: question })).toBe(true);
+    expect(verify(token)).toBe(false);
+    expect(verify(signAutomationExecutionTarget(input), { expected: question })).toBe(false);
+    expect(verify(token, { expected: { ...question, questionRequestId: 'd23e9200-51d4-4f8a-adf7-4ed3dc7d26d6' } })).toBe(false);
+  });
   it('binds the original company authority identity and refuses omission or substitution', () => {
     const bound = { ...target, executionAuthorityDigest: 'b'.repeat(64) };
     const token = signAutomationExecutionTarget({ ...input, ...bound });
