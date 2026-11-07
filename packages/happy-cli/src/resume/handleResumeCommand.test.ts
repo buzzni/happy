@@ -7,7 +7,7 @@ import { consumeInputEvidenceOption, resolveInputEvidenceOption } from '@/utils/
 import { buildManagedSessionSpawnEnvironment, buildSpawnRequestEnvironment } from '@/daemon/sessionEnv';
 import { spawnHappyCLI } from '@/utils/spawnHappyCLI';
 
-import { buildResumeLaunch, formatResumeHelp, handleResumeCommand, parseResumeCommandArgs } from './handleResumeCommand';
+import { buildResumeLaunch, formatResumeHelp, handleResumeCommand, parseResumeCommandArgs, resumeLaunchAgent } from './handleResumeCommand';
 import { resolveHappySession } from './resolveHappySession';
 
 vi.mock('@/persistence', () => ({ readPersistedSessions: vi.fn(() => ({})) }));
@@ -233,6 +233,22 @@ describe('buildResumeLaunch', () => {
             cwd: '/tmp/repo',
             args: ['acp', 'opencode', '--started-by', 'daemon'],
         });
+    });
+
+    // Only the daemon hands the runner the session to reattach to; a terminal launch
+    // would silently start a new conversation under the name of resuming one.
+    it('refuses to resume an OpenCode session outside the daemon', () => {
+        const session = { id: 'session-6', active: false, metadata: { path: '/tmp/repo', flavor: 'opencode' } as never };
+        expect(() => buildResumeLaunch(session)).toThrow('Happy session session-6 uses unsupported flavor "opencode".');
+        expect(() => buildResumeLaunch(session, { startedBy: 'terminal' })).toThrow('unsupported flavor "opencode"');
+    });
+
+    it.each([
+        [['claude', '--resume', 'c1'], 'claude'],
+        [['codex', '--resume', 't1'], 'codex'],
+        [['acp', 'opencode', '--started-by', 'daemon'], 'opencode'],
+    ] as const)('names the agent whose credentials a resumed %j receives', (args, agent) => {
+        expect(resumeLaunchAgent({ cwd: '/tmp/repo', args: [...args] })).toBe(agent);
     });
 
     it('rejects unsupported flavors', () => {

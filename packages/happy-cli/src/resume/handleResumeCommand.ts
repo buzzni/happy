@@ -104,20 +104,24 @@ export function buildResumeLaunch(session: ResumableHappySession, options: Resum
         };
     }
 
-    if (flavor === 'opencode') {
-        // The ACP runner reattaches to this Happy session and asks OpenCode to
-        // continue its own session (metadata.acpSessionId) when it can.
-        const args = ['acp', 'opencode'];
-        if (options.startedBy) {
-            args.push('--started-by', options.startedBy);
-        }
+    // Daemon only: the daemon hands the ACP runner this Happy session to reattach to,
+    // and the runner asks OpenCode to continue its own session (metadata.acpSessionId).
+    // A terminal launch has neither and would start a new conversation instead.
+    if (flavor === 'opencode' && options.startedBy === 'daemon') {
         return {
             cwd: metadata.path,
-            args,
+            args: ['acp', 'opencode', '--started-by', 'daemon'],
         };
     }
 
     throw new Error(`Happy session ${session.id} uses unsupported flavor "${metadata.flavor ?? 'unknown'}".`);
+}
+
+/** The agent a resumed launch runs, which decides the credentials the daemon gives it. */
+export function resumeLaunchAgent(launch: ResumeLaunch): 'claude' | 'codex' | 'opencode' {
+    if (launch.args[0] === 'codex') return 'codex';
+    if (launch.args[0] === 'acp') return 'opencode';
+    return 'claude';
 }
 
 export function formatResumeHelp(): string {

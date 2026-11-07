@@ -142,7 +142,7 @@ import { createCollectorSchedule } from './collectorSchedule';
 import { organizationResumeRefusal, resumeSetupTokenEnvironment, shareResumeInFlight, type ResumeAuthRequirement } from './resumeSetupTokenRebind';
 import type { AiAuthSource } from '@/usage/aiAuthSource';
 import { detectCLIAvailability } from '@/utils/detectCLI';
-import { buildResumeLaunch } from '@/resume/handleResumeCommand';
+import { buildResumeLaunch, resumeLaunchAgent } from '@/resume/handleResumeCommand';
 import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
 import { decodeBase64, decrypt, encodeBase64, encrypt } from '@/api/encryption';
 import {
@@ -3167,7 +3167,7 @@ export async function startDaemon(): Promise<void> {
         }
 
         // An ACP agent takes its model with each message; `opencode acp` has no --model flag.
-        if (options?.model && launch.args[0] !== 'acp') {
+        if (options?.model && resumeLaunchAgent(launch) !== 'opencode') {
           launch.args.push('--model', options.model);
         }
         if (options?.permissionMode) {
@@ -3198,7 +3198,7 @@ export async function startDaemon(): Promise<void> {
           ? await stageInitialPromptEnvironment(options.automation.initialPrompt)
           : null;
 
-        const resumeAgent = launch.args[0] === 'codex' ? 'codex' : launch.args[0] === 'acp' ? 'opencode' : 'claude';
+        const resumeAgent = resumeLaunchAgent(launch);
         const inheritedResumeEnvironment = resolveInheritedSpawnEnvironment({
           agent: resumeAgent,
           env: process.env,
