@@ -23,7 +23,8 @@ upstream 참고: slopus/happy d75b9df23 `fix(cli): forward plugin directories in
   - 상대경로는 세션 경로(`opts.path`) 기준으로 절대화한다. 데몬이 띄운 runner의 프로세스 cwd는 세션 경로와 다를 수 있다. 체크포인트 턴의 `providerPath`가 아니라 세션 경로를 쓰는 이유: 사람이 인자를 준 기준이 세션 경로이고, 터미널 실행도 Claude를 그 경로에서 띄운다.
   - 결과는 `{ type: 'local', path }[]`, 하나도 없으면 `undefined`(SDK 기본 동작 유지). 입력 배열은 바꾸지 않는다.
   - remote start(`sessionId` 없음)와 resume(`sessionId` 있음, 또는 인자의 `--resume <id>`) 모두 같은 query 옵션 조립을 지나므로 양쪽에서 `plugins`가 실린다. 테스트는 둘을 따로 단언한다.
-  - 잘못된 인자는 SDK를 부르기 전에 그 실행을 실패시킨다. 원격 launcher는 이를 launch 실패로 그 턴에 알리고 다음 메시지를 기다린다(기존 launch 오류 경로, 무한 재시작 없음).
+  - 잘못된 인자는 **첫 메시지를 받은 뒤, 턴 준비(`beforeTurn`) 전에** 그 턴을 실패시킨다. 원격 launcher는 이를 launch 실패("Claude Code could not start: --plugin-dir requires …")로 그 턴에 한 번 알리고 다음 메시지를 기다린다(무한 재시작 없음). 첫 메시지 전에 읽으면 launcher가 입력 없이 곧바로 다시 띄워 끝없이 반복한다(교차 리뷰로 발견, launcher 테스트로 고정).
+  - 원격 spawn RPC(`spawn-happy-session`)의 `resumeClaudeSessionId`·`resumeCodexThreadId`는 데몬이 자식 argv의 `--resume` 바로 뒤에 넣는다. `-`로 시작하는 값(`--plugin-dir=…`)은 별도 옵션으로 남아 이 변경 뒤 플러그인으로 실릴 수 있으므로, RPC가 `-`로 시작·NUL·비문자열 값을 거절한다. 빈 값·null은 지금처럼 "없음"(데몬이 falsy를 건너뜀). 세션 복구 경로(`daemon/sessionRecovery.ts`)는 그 id 이름의 유효한 Claude 전사 파일이 이 머신에 있어야만 resume하므로 따로 막지 않는다.
   - `sdk/types.ts`의 `QueryOptions`에 `plugins?: Options['plugins']`, `sdk/query.ts`가 그대로 SDK에 넘긴다.
   - **사용자 지정 목록과 Claude 보고 목록의 관계**: `plugins` 옵션은 Claude에 주는 **입력**이고, `systemInit.plugins`는 Claude가 실제로 불러온 플러그인의 **보고**다(사용자 지정 + 설치된 플러그인). 둘을 합치지 않는다. 메타데이터의 `plugins`는 지금처럼 Claude 보고만 쓴다 — 불러오기에 실패한 경로를 "불러옴"으로 보이지 않기 위해서다.
   - 필수 샌드박스(`processSandbox`)에서도 그대로 넘긴다. 터미널 실행도 같은 인자를 막지 않고, 플러그인은 샌드박스에 갇힌 Claude 프로세스가 읽으므로 그 파일시스템 경계를 그대로 받는다.
