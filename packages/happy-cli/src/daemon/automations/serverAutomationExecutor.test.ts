@@ -32,6 +32,7 @@ import type { ServerAutomationRuntimeState } from './serverAutomationRuntimeStor
 import { MAX_WORKTREE_CLEANUP_ATTEMPTS } from './worktreeCleanupGiveUp'
 import { AGENT_TASK_CLIENT_PATH } from './agentTaskClient'
 import { withInboxItemInstruction } from './automationDomain'
+import { buildScheduledRunPrompt } from '@/utils/scheduledRunPrompt'
 import { buildSandboxRuntimeConfig } from '@/sandbox/config'
 
 function cacheRecord(generation = 2, migrationPending = false) {
@@ -368,6 +369,23 @@ describe('예약 자동화 커넥터 실제 HTTP 경로 (#3556)', () => {
     expect(prompt).toContain('재연동·설정 변경')
     expect(prompt.endsWith(`\n\n${withInboxItemInstruction('prompt')}`)).toBe(true)
     expect(spawnSession.mock.calls[0]![0].agent).toBe(agent)
+  })
+
+  // Saycode specs/scheduled-missed-run-policy R1: the line carries the run's start time on the schedule's clock.
+  it.each([
+    [{ kind: 'daily-zoned' as const, hour: 9, minute: 0, timeZone: 'Asia/Seoul' }, 'Asia/Seoul'],
+    [{ kind: 'interval' as const, minutes: 15 }, Intl.DateTimeFormat().resolvedOptions().timeZone],
+  ])('새 세션 예약 회차 initialPrompt에 실제 실행 시각 줄을 Original task 앞에 넣는다 (%o)', async (schedule, zone) => {
+    const fixture = setup({ claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } } })
+    const payload = fixture.decryptPayload(cacheRecord(), new Uint8Array(32))
+    fixture.input.decryptPayload = () => ({ ...payload, schedule })
+    await expect(runServerAutomationTick(fixture.input)).resolves.toEqual([{ automationId: 'automation-1', outcome: 'WOKE' }])
+    const prompt = fixture.spawnSession.mock.calls[0]![0].initialPrompt
+    const expected = buildScheduledRunPrompt('prompt', { at: fixture.now, timeZone: zone }).split('\n')
+    const runTimeLine = expected[expected.indexOf('Original task:') - 1]!
+    expect(runTimeLine).toMatch(new RegExp(`^\\[CURRENT RUN TIME: .+ \\(${zone}, UTC[+-]\\d{2}:\\d{2}\\)\\]$`))
+    expect(prompt).toContain(`\n${runTimeLine}\nOriginal task:\n\nprompt`)
+    expect(prompt.match(/\[CURRENT RUN TIME:/g)).toHaveLength(1)
   })
 })
 

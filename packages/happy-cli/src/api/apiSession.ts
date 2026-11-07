@@ -1162,7 +1162,7 @@ export class ApiSessionClient extends EventEmitter {
             this.inputEvidence.cancelContinuation('replaced');
             const automationRunId = incoming.meta?.sentFrom === 'automation' ? automationRunIdFromLocalKey(incoming.localKey) : null;
             const userMessage = automationRunId
-                ? { ...incoming, content: { ...incoming.content, text: buildScheduledRunPrompt(incoming.content.text) } }
+                ? { ...incoming, content: { ...incoming.content, text: buildScheduledRunPrompt(incoming.content.text, { at: Date.now() }) } }
                 : incoming;
             const settledAutomationTurns = automationRunId
                 ? this.automationTurns.arm(automationRunId)
