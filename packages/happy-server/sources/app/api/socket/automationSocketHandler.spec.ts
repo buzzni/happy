@@ -362,6 +362,23 @@ describe('automationSocketHandler', () => {
         );
     });
 
+    it('forwards a catch-up claim only when the daemon sends an explicit true', async () => {
+        // specs/scheduled-missed-run-policy R11 — a truthy string or number must not widen the claim window.
+        const handlers = bind();
+        services.claimAutomationRun.mockResolvedValue({ ok: false, error: 'claim-denied' });
+        const claimInputs = () => services.claimAutomationRun.mock.calls.map((call: unknown[]) => call[3]);
+
+        await handlers.get('automation-claim')!({ automationId: 'automation-1', generation: 3, scheduledFor: 1000, catchUp: true }, vi.fn());
+        await handlers.get('automation-claim')!({ automationId: 'automation-1', generation: 3, scheduledFor: 1000, catchUp: 'true' }, vi.fn());
+        await handlers.get('automation-claim')!({ automationId: 'automation-1', generation: 3, scheduledFor: 1000 }, vi.fn());
+
+        expect(claimInputs()).toEqual([
+            { automationId: 'automation-1', generation: 3, scheduledFor: new Date(1000), catchUp: true },
+            { automationId: 'automation-1', generation: 3, scheduledFor: new Date(1000) },
+            { automationId: 'automation-1', generation: 3, scheduledFor: new Date(1000) },
+        ]);
+    });
+
     it('acknowledges the daemon before the project update fan-out settles', async () => {
         // 데몬의 자동화 tick 은 이 ack 를 기다린다. fan-out 이 늦으면 ack 도 늦었고,
         // 2026-10-24 에는 ack 하나가 영영 오지 않아 한 머신의 자동화가 재시작 전까지 멈췄다.

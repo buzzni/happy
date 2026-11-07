@@ -547,3 +547,23 @@ describe('messenger delivery settings (Saycode specs/_archive/automation-result-
     expect(automationPayloadSchema.parse(ordinary)).toEqual(ordinary);
   });
 });
+
+describe('missed-run policy (aplus-dev-studio specs/scheduled-missed-run-policy R10~R14)', () => {
+  const ordinary = { name: 'Report', schedule: { kind: 'daily', hour: 9, minute: 0 }, prompt: 'Report', directory: '/chat', scriptCommand: null, suppressSilent: false, agent: 'claude' };
+
+  it('keeps an explicit skip apart from no choice at all', () => {
+    expect(automationPayloadSchema.parse({ ...ordinary, missedRunPolicy: 'skip' }).missedRunPolicy).toBe('skip');
+    expect(automationPayloadSchema.parse({ ...ordinary, missedRunPolicy: 'catch_up_once' }).missedRunPolicy).toBe('catch_up_once');
+    expect(automationPayloadSchema.parse({ ...ordinary, missedRunPolicy: 'default' }).missedRunPolicy).toBe('default');
+    expect(automationPayloadSchema.parse(ordinary)).toEqual(ordinary);
+    expect('missedRunPolicy' in automationPayloadSchema.parse(ordinary)).toBe(false);
+  });
+
+  it('runs a payload with a policy it cannot read as if none were chosen', () => {
+    for (const missedRunPolicy of ['catch_up_all', true, 1, null, '']) {
+      const parsed = automationPayloadSchema.safeParse({ ...ordinary, missedRunPolicy });
+      expect(parsed.success).toBe(true);
+      expect(parsed.success && parsed.data.missedRunPolicy).toBeUndefined();
+    }
+  });
+});

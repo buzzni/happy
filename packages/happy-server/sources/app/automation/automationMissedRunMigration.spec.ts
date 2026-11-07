@@ -144,3 +144,24 @@ it('refuses to write a real run off as missed and reports it as already claimed'
     expect(missed).toEqual({ ok: false, error: 'already-claimed' });
     expect(await client.automationRun.count({ where: { failureCode: 'MISSED_OFFLINE' } })).toBe(0);
 });
+
+it('runs the latest missed slot once on a catch-up claim and refuses it after a restart', async () => {
+    // specs/scheduled-missed-run-policy R11 — the earlier slots collapse into one row, the latest runs once.
+    const latest = new Date(now.getTime() - 3_600_000);
+    // The current generation began before the gap (an edit or the activation that bumped it to 3).
+    await client.automationChange.create({ data: {
+        automationId: 'automation-1', machineAccountId: 'account-1', machineId: 'machine-1', revision: 2, generation: 3, kind: 'UPSERT',
+        createdAt: new Date('2026-11-06T00:00:00.000Z'),
+    } });
+    expect(await client.$transaction((tx) => recordMissedAutomationRuns(tx, 'account-1', 'machine-1', {
+        ...gap(7), failureCode: 'MISSED_COLLAPSED',
+    }, now))).toMatchObject({ ok: true });
+    const claim = (catchUp: boolean) => client.$transaction((tx) => claimAutomationRun(tx, 'account-1', 'machine-1', {
+        automationId: 'automation-1', generation: 3, scheduledFor: latest, catchUp,
+    }, now));
+    expect(await claim(false)).toEqual({ ok: false, error: 'claim-denied' });
+    expect(await claim(true)).toMatchObject({ ok: true });
+    await client.automationRun.updateMany({ where: { scheduledFor: latest }, data: { status: 'COMPLETED', completedAt: now } });
+    expect(await claim(true)).toEqual({ ok: false, error: 'already-claimed' });
+    expect(await client.automationRun.count({ where: { scheduledFor: latest } })).toBe(1);
+});
