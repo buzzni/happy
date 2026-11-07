@@ -91,7 +91,7 @@ describe('dispatchSessionEventPush outcome', () => {
         expect(String(mocks.error.mock.calls[0][1])).toContain('DeviceNotRegistered');
     });
 
-    it('reports failed when no ticket got through', async () => {
+    it('reports failed with each distinct cause once when no ticket got through', async () => {
         mocks.sendPushNotifications.mockResolvedValue([
             { status: 'error', message: 'HTTP 503' },
             { status: 'error', message: 'HTTP 503' },
@@ -99,7 +99,7 @@ describe('dispatchSessionEventPush outcome', () => {
 
         const outcome = await dispatch();
 
-        expect(outcome).toEqual({ status: 'failed', tokens: 2, sent: 0, failed: 2, reason: 'HTTP 503, HTTP 503' });
+        expect(outcome).toEqual({ status: 'failed', tokens: 2, sent: 0, failed: 2, reason: 'HTTP 503' });
         expect(mocks.error).toHaveBeenCalledOnce();
     });
 

@@ -99,7 +99,8 @@ async function fetchTokensAndSend(params: {
         return { status: 'sent', tokens: tokens.length, sent: okCount, failed: 0 };
     }
 
-    const reason = errors.length > 0 ? errors.join(', ') : 'missing ticket';
+    // Distinct causes only — one Expo outage would otherwise repeat per token.
+    const reason = errors.length > 0 ? [...new Set(errors)].join(', ') : 'missing ticket';
     const status = okCount === 0 ? 'failed' : 'partial';
     error({ module: 'push' }, `Push ${status} for user ${params.userId} session ${params.sessionId}: ok=${okCount} failed=${failedCount} errors=${JSON.stringify(errors)}`);
     return { status, tokens: tokens.length, sent: okCount, failed: failedCount, reason };
