@@ -445,8 +445,9 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     const harnessIdleMs = process.env.ABP_SPACE_IDLE_RECLAIM_MS ? Number(process.env.ABP_SPACE_IDLE_RECLAIM_MS) : undefined
     const ensureBrowser = native?.startBrowser ? createPersonalBrowserAdmission(profiles[0].profileId, drivers,
         native.startBrowser, () => runtime.onDriverReconnected(profiles[0].profileId)) : undefined
+    const pageViewEnabled = process.platform === 'darwin' && !!config?.personalDesktop
     const runtime: BrowserRuntime = new BrowserRuntime({ store, drivers, sites, ...(ensureBrowser ? { ensureBrowser } : {}),
-        pageViewEnabled: process.platform === 'darwin' && !!config?.personalDesktop,
+        pageViewEnabled,
         ...(config ? { profilePrincipals: config.profilePrincipals } : {}),
         ...(config?.profileAssignments ? { profileAssignments: config.profileAssignments } : {}),
         maxSpacesPerProfile: config?.maxSpacesPerProfile,
@@ -677,7 +678,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
         ...(viewer ? { viewer } : {}),
         ...(existsSync(viewerAssetsDir) ? { viewerAssetsDir } : {}),
         consoleHostOrigins: config?.consoleHostOrigins ?? (process.env.ABP_CONSOLE_HOST_ORIGINS ?? '').split(',').filter(Boolean),
-        ...(config?.personalDesktop ? { consoleScreenMode: 'native-window' as const } : {}),
+        ...(config?.personalDesktop ? { consoleScreenMode: 'native-window' as const, consolePageView: pageViewEnabled } : {}),
     })
     const admin: AdminServer = await startAdminServer({
         runtime, drivers,

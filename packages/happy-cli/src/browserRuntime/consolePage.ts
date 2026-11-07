@@ -1,4 +1,5 @@
 import { spaceStyles, spaceMarkup, spaceScript } from './consoleSpaces'
+import { pageViewerScript } from './pageViewer'
 /**
  * Client console served at GET /console: find the principal's open tasks on the
  * capability's profile, watch a task's events, answer approvals, take/release
@@ -42,8 +43,14 @@ import { spaceStyles, spaceMarkup, spaceScript } from './consoleSpaces'
  * `__abpViewerControl` (whether this console's own capability holds the shown task's lease), so without control a wheel over an
  * actual-size screen pans the frame instead of being swallowed by the canvas. Activity and Advanced are
  * buttons on that line whose panels open under the screen, closed by default.
+ *
+ * Personal PC page view (`pageView`, native-window only): a conversation console of a Runtime that serves page views
+ * shows the selected task's page in the screen area. It publishes `__abpPageView`; a pageViewInfo-only bootstrap from the
+ * host only learns the runtime binding (`__abpPageViewBinding`, then a new request), and only a capability scoped to this
+ * conversation and binding opens the page. Such a capability cannot manage spaces, so their entry is hidden. Any other
+ * capability keeps the Chrome window guidance.
  */
-export function renderConsolePage(opts: { hostOrigins?: readonly string[]; screenMode?: 'native-window' } = {}): string {
+export function renderConsolePage(opts: { hostOrigins?: readonly string[]; screenMode?: 'native-window'; pageView?: boolean } = {}): string {
     // JSON in an inline script: escape '<' so an origin can never close the tag.
     const hostOrigins = JSON.stringify(opts.hostOrigins ?? []).replace(/</g, '\\u003c')
     return `<!doctype html>
@@ -210,6 +217,15 @@ padding:10px 12px;border-radius:var(--radius-md);line-height:1.35;font-weight:40
 #screenEmpty{flex:1 1 auto;min-height:160px;display:flex;align-items:center;justify-content:center}
 .native-window #openScreen,.native-window #viewGroup{display:none}
 .native-window #screenEmpty{flex:0 0 auto;min-height:0}
+/* Personal PC page view: the page image in the screen area (hidden until a frame arrives), fit or actual size, dimmed when stale. */
+.native-window.page-view #viewGroup{display:inline-flex}
+#pageBox{position:relative;flex:1 1 auto;min-height:240px;border-radius:var(--radius-md);overflow:auto;border:1px solid var(--border);background:var(--canvas);display:flex;align-items:center;justify-content:center}
+#pageBox:has(#page[hidden]){display:none}
+#page{display:block;max-width:100%;max-height:100%;object-fit:contain;touch-action:none;user-select:none}
+#page:focus-visible{outline:2px solid var(--ring);outline-offset:-2px}
+#pageBox.actual{display:block}#pageBox.actual #page{max-width:none;max-height:none}#pageBox.stale #page{opacity:.45}
+/* Outside the box: hiding the box between views must not blur the input (a blur ends the view's input). */
+#pageInput{position:fixed;left:0;top:0;opacity:.01;width:1px;height:1px;resize:none;border:0;padding:0;pointer-events:none}
 /* Folds: Activity and Advanced are buttons in the screen's head line; their panels open under the screen, closed by default. */
 button.fold{height:30px;padding:0 10px;font-size:12px;color:var(--muted-foreground);border-color:transparent;background:transparent}
 button.fold:hover{background:var(--surface-hover);color:var(--foreground);border-color:transparent}
@@ -276,11 +292,13 @@ ${spaceMarkup}
 <div id="actionResult"></div></section>
 </div>
 <div class="screen-head"><h2><svg aria-hidden="true"><use href="#i-monitor"/></svg><span data-t="screen">Screen</span></h2>
-<p class="screen-hint" data-t="screenHint">input reaches the page only while you hold take over</p>
+<p class="screen-hint" id="screenHintText" role="status" data-t="screenHint">input reaches the page only while you hold take over</p>
 <div class="row"><button id="eventsToggle" class="fold" type="button" aria-expanded="false" aria-controls="eventsPanel" data-t="events">Activity</button><button id="advancedToggle" class="fold" type="button" aria-expanded="false" aria-controls="advanced" data-t="advanced">Advanced</button>
 <span class="seg" id="viewGroup" role="group" aria-label="Screen size"><button id="fitToggle" type="button" aria-pressed="true" data-t="fit">Fit to screen</button><button id="actualSize" type="button" aria-pressed="false" data-t="actual">Actual size</button></span>
-<button id="openScreen" type="button" data-t="openScreen">Open screen</button></div></div>
+<button id="pageRetry" type="button" data-t="pageRetry" hidden>Reconnect</button><button id="openScreen" type="button" data-t="openScreen">Open screen</button></div></div>
 <div id="screenBox" hidden><iframe id="screen" title="Browser screen" referrerpolicy="no-referrer"></iframe><p id="screenState" role="status" data-t="reconnecting" hidden>Reconnecting…</p></div>
+<div id="pageBox"><img id="page" alt="" tabindex="0" draggable="false" hidden></div>
+<textarea id="pageInput" autocomplete="off" spellcheck="false"></textarea>
 <section class="card" id="screenEmpty"><div class="empty"><svg aria-hidden="true"><use href="#i-monitor"/></svg><b data-t="screenEmptyTitle">The screen is not open</b><span data-t="screenEmptyBody">Open screen shows the agent's browser here. Take over to use the page yourself (login, verification); release it and the agent continues.</span></div></section>
 <section class="card fold-panel" id="eventsPanel" hidden><h2><svg aria-hidden="true"><use href="#i-activity"/></svg><span data-t="events">Activity</span></h2><div id="events"></div></section>
 <section class="card fold-panel" id="advanced" hidden><h2><svg aria-hidden="true"><use href="#i-settings"/></svg><span data-t="advanced">Advanced</span></h2>
@@ -296,6 +314,7 @@ ${spaceMarkup}
 <p data-t="autoExplanation">Disclosures and tab changes continue automatically. Sending, deleting and unclear actions still need you.</p>
 <p id="autoTask" class="mono small"></p><div id="autoOrigins"></div><p data-t="autoExpiry">Only this task and the selected sites, until this connection expires. Restarting clears Auto.</p>
 <div class="row"><button id="autoCancel" type="button" data-t="autoCancel">Cancel</button><button id="autoConfirm" type="button" class="primary" data-t="autoConfirm">Enable Auto</button></div></dialog>
+<script>${pageViewerScript}</script>
 <script>
 (function(){
 var $=function(i){return document.getElementById(i)};
@@ -354,6 +373,22 @@ if(NATIVE_SCREEN){document.body.classList.add('native-window');$('openScreen').h
  screenEmptyBody:'에이전트가 페이지를 열면 Saycode가 연 전용 Chrome 창이 생겨요. 작업 PC에서 Chrome으로 전환해 해당 창을 선택하세요. 직접 조작하기 전 제어권을 가져오고, 마친 뒤 반납하고 계속 진행하세요.'}:
  {screenHint:'Take over before using the page yourself.',screenEmptyTitle:'View in Chrome on the task PC',
  screenEmptyBody:'When the agent opens a page, find the dedicated Chrome window opened by Saycode on the task PC. Switch to Chrome and select that window. Take over before using it yourself, then release control and resume when finished.'})}
+/** Personal PC page view (see renderConsolePage): only in a conversation console of a Runtime that serves it. */
+var PAGE_VIEW=NATIVE_SCREEN&&${opts.pageView === true}&&!!taskSession;
+var PT=LANG==='ko'?{connecting:'페이지 화면에 연결 중…',observe:'페이지를 보고 있어요. 직접 조작하려면 제어권을 가져오세요.',control:'직접 조작 중이에요. 입력이 페이지에 전달돼요.',
+ stale:'화면 갱신이 늦어지고 있어요. 입력을 멈췄어요.',unresolved:'입력 결과를 확인할 수 없어 에이전트 계속 진행을 막았어요.',confirmed:'입력 처리 상태를 확인했어요. 다시 연결을 눌러 이어가세요.',
+ unknown:'입력 결과를 확인 중이에요. 같은 입력을 다시 보내지 마세요.',expired:'접근 권한이 만료됐어요. Saycode가 갱신하기를 기다리고 있어요.',forbidden:'이 대화의 페이지에 접근할 수 없어요.',
+ offline:'연결이 끊겼어요. 이전 화면에서는 입력할 수 없어요.',unsupported:'이 런타임은 여기서 페이지를 보여줄 수 없어요. 작업 PC의 Chrome 창을 사용하세요.',
+ emptyTitle:'페이지를 기다리고 있어요',emptyBody:'에이전트가 이 대화에서 페이지를 열면 여기에 보여요. 작업 PC의 전용 Chrome 창에서도 같은 페이지를 볼 수 있어요. 창에서 직접 조작할 때도 먼저 제어권을 가져오고, 마친 뒤 반납하고 계속 진행하세요.',
+ image:'현재 대화의 브라우저 페이지',input:'페이지 텍스트 입력'}
+ :{connecting:'Connecting to the page…',observe:'Observing the page. Take over to use it.',control:'You have control. Input reaches the page.',
+ stale:'Page updates are delayed. Input is stopped.',unresolved:'Input outcome is unknown. Resuming the agent is blocked.',confirmed:'Input receipt checked. Press Reconnect to continue.',
+ unknown:'Checking input receipt. Do not repeat the input.',expired:'Access expired. Waiting for Saycode to renew it.',forbidden:'This conversation cannot access the page.',
+ offline:'Disconnected. Input on the previous image is stopped.',unsupported:'This runtime cannot show the page here. Use the Chrome window on the task PC.',
+ emptyTitle:'Waiting for the page',emptyBody:'When the agent opens a page in this conversation, it shows here. The dedicated Chrome window on the task PC shows the same page; take over before using it there too, then release control and resume when finished.',
+ image:'Browser page for this conversation',input:'Page text input'};
+T.pageRetry=LANG==='ko'?'다시 연결':'Reconnect';$('page').alt=PT.image;$('pageInput').setAttribute('aria-label',PT.input);
+if(PAGE_VIEW){Object.defineProperty(window,'__abpPageView',{value:1});window.__abpPageViewBinding=null}
 document.querySelectorAll('[data-t]').forEach(function(el){var v=T[el.getAttribute('data-t')];if(typeof v==='string')el.textContent=v});
 document.querySelectorAll('[data-tt]').forEach(function(el){var v=T[el.getAttribute('data-tt')];if(typeof v==='string'){el.title=v;el.setAttribute('aria-label',v)}});
 document.title=T.title;$('events').setAttribute('data-empty',T.noEvents);
@@ -399,7 +434,8 @@ function setCapability(token,expiresAtMs){var renewal=!!S.token;
  S.principalId=typeof payload.principalId==='string'?payload.principalId:'';S.viewerSessionId=typeof payload.viewerSessionId==='string'?payload.viewerSessionId:'';
  capPill(T.connected+(S.expiresAtMs?' · '+(LANG==='ko'?hhmm(S.expiresAtMs)+' '+T.until:T.until+' '+hhmm(S.expiresAtMs)):''),'on');
  $('capState').title='profile '+S.profileId;
- spaceCapabilityChanged(payload);scheduleRenewal();if(renewal&&S.screenOpen)openScreen();return true}
+ spaceCapabilityChanged(payload);S.pageScope=PAGE_VIEW&&payload.pageViewScope?payload.pageViewScope:null;pageMode();
+ scheduleRenewal();if(renewal&&S.screenOpen)openScreen();return true}
 function scheduleRenewal(){clearTimeout(S.renewTimer);if(!S.expiresAtMs)return;
  var wait=Math.max(0,S.expiresAtMs-RENEW_BEFORE_MS-Date.now());
  S.renewTimer=setTimeout(askHost,wait)}
@@ -407,6 +443,7 @@ window.addEventListener('message',function(event){
  if(!fromHost(event))return;
  var d=event.data;if(!d||d.type!=='abp-capability'||typeof d.token!=='string'||typeof d.expiresAtMs!=='number')return;
  // The first capability lists the tasks; a renewal lists them again only when the last attempt failed (the alert is up).
+ if(PAGE_VIEW&&pageCapability(d.token))return;
  var first=!S.token;if(setCapability(d.token,d.expiresAtMs)&&(first||!$('notice').hidden))listTasks()});
 /** The fragment is read on load and again on a later change (the host reopens the same page with a new capability). */
 ${spaceScript}
@@ -462,7 +499,7 @@ function showTask(t){if(taskSession&&t.agentSessionId!==taskSession)return;if(mo
  ['takeOver','resume','stop'].forEach(function(id){$(id).disabled=done});$('release').disabled=done&&!mine;
  renderMode(t);syncTask(t);markSelected(t.taskId);applyControl();
  // An approval left on a stopped task is nothing to decide (the Runtime answers CONFLICT): the card goes with the task.
- var a=!done&&t.pendingApproval;$('approvalBox').hidden=!a;if(a)renderApproval(a)}
+ var a=!done&&t.pendingApproval;$('approvalBox').hidden=!a;if(a)renderApproval(a);syncPage()}
 /**
  * Whether this user holds the shown task's control decides what the viewer does with the wheel and the keys: without
  * control noVNC is view-only, so a wheel over an actual-size screen pans the frame (and keys are not grabbed); with
@@ -500,7 +537,7 @@ function listTasks(quiet){if(!S.token)return;quiet=quiet===true;var seq=++S.list
  * was answered a moment ago: its own state wins unless the list carries a newer version. A quiet answer landing while
  * the menu is open waits for it to close — the cards under the user's keyboard or pointer stay put.
  */
-function clearScopedTask(){if(modeDialogTask)closeAutoDialog();S.task=null;++S.gen;$('taskId').value='';$('tabId').value='';$('detail').hidden=true;$('placeholder').hidden=false;menuLabel();applyControl()}
+function clearScopedTask(){if(modeDialogTask)closeAutoDialog();S.task=null;++S.gen;$('taskId').value='';$('tabId').value='';$('detail').hidden=true;$('placeholder').hidden=false;menuLabel();applyControl();syncPage()}
 function applyTasks(tasks,quiet){if(taskSession)tasks=tasks.filter(function(t){return t.agentSessionId===taskSession});var shown=S.task;
  if(shown)tasks=tasks.map(function(t){return t.taskId===shown.taskId&&(Number(shown.stateVersion)||0)>=(Number(t.stateVersion)||0)?shown:t});
  tasks=tasks.filter(function(t){return !finished(t)||ownLease(t)});
@@ -623,7 +660,10 @@ $('autoConfirm').onclick=function(){var t=modeDialogTask;if(!t||!S.task||t.taskI
  closeAutoDialog();if(origins.length)changeMode(t,'auto',origins)};
 $('approve').onclick=function(){decide('approve')};$('reject').onclick=function(){decide('reject')};
 $('takeOver').onclick=function(){act(op('takeOver',{taskId:$('taskId').value.trim(),tabId:$('tabId').value.trim(),expectedEpoch:tabEpoch(),requestId:rid()}))};
-$('release').onclick=function(){act(op('releaseControl',{taskId:$('taskId').value.trim(),tabId:$('tabId').value.trim(),expectedEpoch:tabEpoch(),requestId:rid()}))};
+$('release').onclick=function(){var p=op('releaseControl',{taskId:$('taskId').value.trim(),tabId:$('tabId').value.trim(),expectedEpoch:tabEpoch(),requestId:rid()});
+ // A view read under the released control is not shown: the view is invalidated first and reopened by the task's answer.
+ if(pageViewer&&S.pageScope){pageBusy=true;pageViewer.invalidate();pageStatus(LANG==='ko'?'입력을 정리하는 중…':'Draining page input…');p=p.then(function(r){pageKey='';return r}).finally(function(){pageBusy=false})}
+ act(p)};
 $('resume').onclick=function(){if(S.task)act(op('resume',{taskId:S.task.taskId,expectedVersion:S.task.stateVersion,requestId:rid()}))};
 $('stop').onclick=function(){act(op('cancel',{taskId:$('taskId').value.trim(),requestId:rid()}))};
 /** A viewer connection is bound to the capability it was ticketed with: renewal reconnects it. */
@@ -648,12 +688,64 @@ $('screen').onload=function(){$('screenState').hidden=true};
  * resizeSession: the remote display keeps its size whatever the frame is.
  */
 function applyFit(){$('fitToggle').setAttribute('aria-pressed',S.fit?'true':'false');$('actualSize').setAttribute('aria-pressed',S.fit?'false':'true');window.__abpViewerFit=S.fit;
+ if(pageViewer&&pageFitted!==S.fit)pageFitted=pageViewer.toggleFit();
  try{var w=$('screen').contentWindow;if(w&&w.__abpRfb)w.__abpRfb.scaleViewport=S.fit}catch(e){}}
 $('fitToggle').onclick=function(){S.fit=true;applyFit()};$('actualSize').onclick=function(){S.fit=false;applyFit()};
 $('fitToggle').title=T.fitHint;$('actualSize').title=T.actualHint;$('viewGroup').setAttribute('aria-label',T.viewMode);
 applyFit();
 function fold(btn){btn.onclick=function(){var panel=$(btn.getAttribute('aria-controls'));panel.hidden=!panel.hidden;btn.setAttribute('aria-expanded',panel.hidden?'false':'true')}}
 fold($('eventsToggle'));fold($('advancedToggle'));
+/**
+ * Page view wiring. The engine reads frames and sends input for the shown task's tab; this console keeps the capability,
+ * the task and its controls. A view is (re)opened when the shown task or tab changes, or after it closed (at most every
+ * 1.5 s); an unknown input outcome waits for Reconnect, never a silent retry.
+ */
+var pageViewer=null,pageGen=0,pageBusy=false,pageKey='',pageOpenedAt=-Infinity,pageFitted=true;
+function pageStatus(text,error){var h=$('screenHintText');h.textContent=text;h.classList.toggle('warn-text',!!error)}
+function pageFail(e){var c=e&&e.code;pageViewer.halt();pageViewer.paint();
+ pageStatus(c==='UNAUTHORIZED'?PT.expired:c==='SCOPE_DENIED'||c==='ORIGIN_DENIED'?PT.forbidden:c==='UNSUPPORTED_OPERATION'?PT.unsupported:c==='OUTCOME_UNKNOWN'?PT.unresolved:PT.offline,true)}
+function pageOp(name,body){var ctl=new AbortController(),timer=setTimeout(function(){ctl.abort()},6000);
+ return fetch('/v1/ops/'+name,{method:'POST',cache:'no-store',signal:ctl.signal,headers:{'content-type':'application/json',authorization:'Bearer '+S.token},body:JSON.stringify(body)})
+ .then(function(r){return r.json().then(function(j){if(!r.ok||j.ok!==true)throw Object.assign(new Error('Page request refused'),{code:j.error&&j.error.code,known:true});return j.result})})
+ .finally(function(){clearTimeout(timer)})}
+/**
+ * A host answer this console handles itself (true): the pageViewInfo-only bootstrap, which only learns the binding and
+ * asks again, and a page capability for another conversation or binding, which is refused. Anything else goes on.
+ */
+function pageCapability(token){var parts=token.split('.'),c=parts.length===4?decodePart(parts[2]):null;if(!c)return false;
+ if(c.pageViewScope){var v=c.pageViewScope;if(v.schemaVersion===1&&v.agentSessionId===taskSession&&!!S.pageBinding&&v.runtimeBindingId===S.pageBinding)return false;
+  capPill(T.unreadable,'bad');return true}
+ if(!c.operations||c.operations.length!==1||c.operations[0]!=='pageViewInfo')return false;
+ fetch('/v1/ops/pageViewInfo',{method:'POST',cache:'no-store',headers:{'content-type':'application/json',authorization:'Bearer '+token},body:JSON.stringify({schemaVersion:1,profileId:c.profileId})})
+ .then(function(r){return r.json()}).then(function(j){var info=j&&j.ok===true&&j.result;
+  if(!info||info.schemaVersion!==1||!info.supported||typeof info.runtimeBindingId!=='string')throw new Error('unsupported');
+  S.pageBinding=info.runtimeBindingId;window.__abpPageViewBinding=S.pageBinding;askHost()})
+ .catch(function(){S.pageBinding='';window.__abpPageViewBinding=null;window.__abpPageViewUnsupported=1;pageStatus(PT.unsupported,true);askHost()});
+ return true}
+/** The screen area follows the capability: the page view with a page capability, the Chrome window guidance otherwise. */
+function pageMode(){var on=!!S.pageScope;document.body.classList.toggle('page-view',on);$('viewGroup').hidden=!on&&NATIVE_SCREEN;$('pageRetry').hidden=!on;
+ $('spaceToggle').hidden=on;if(on&&!$('spacePanel').hidden)spaceToggle(false);
+ var b=$('screenEmpty').querySelector('b'),span=$('screenEmpty').querySelector('span');b.textContent=on?PT.emptyTitle:T.screenEmptyTitle;span.textContent=on?PT.emptyBody:T.screenEmptyBody;
+ if(!on){pageStatus(T.screenHint,false);if(pageViewer){++pageGen;pageKey='';void pageViewer.close().catch(function(){})}}else syncPage()}
+/** Opens the view of the shown task's tab when it changed (force: also when unchanged), closing the previous one first. */
+function syncPage(force){if(!pageViewer||!S.pageScope)return;var t=S.task,typed=$('tabId').value.trim();
+ var tab=t&&!finished(t)&&t.tabs&&t.tabs.length?(t.tabs.indexOf(typed)>=0?typed:t.tabs[0]):'';
+ var key=tab?t.taskId+'|'+tab:'',v=pageViewer.view();
+ if(!force&&key===pageKey&&(!key||v&&!v.closed))return;
+ if(!force&&key===pageKey&&performance.now()-pageOpenedAt<1500)return;
+ pageKey=key;pageOpenedAt=performance.now();var gen=++pageGen;pageBusy=true;pageViewer.paint();
+ pageViewer.close().then(function(){if(gen!==pageGen)return;
+  if(!key){pageStatus(t&&finished(t)?T[t.status]:PT.emptyTitle,false);return}
+  return pageViewer.open({agentSessionId:taskSession,runtimeBindingId:S.pageBinding,taskId:t.taskId},tab,function(){return gen===pageGen})})
+ .catch(function(e){if(gen===pageGen)pageFail(e)}).finally(function(){if(gen===pageGen){pageBusy=false;pageViewer.paint()}})}
+if(PAGE_VIEW){
+ pageViewer=createPageViewer({request:pageOp,image:$('page'),input:$('pageInput'),viewport:$('pageBox'),empty:$('screenEmpty'),text:PT,status:pageStatus,fail:pageFail,
+  render:function(){pageViewer.paint()},task:function(){return S.task},ended:function(){return !!S.task&&finished(S.task)},
+  identity:function(){return {viewerSessionId:S.viewerSessionId,principalId:S.principalId}},busy:function(){return pageBusy},generation:function(){return pageGen},token:function(){return S.token}});
+ setInterval(function(){pageViewer.checkStale();void pageViewer.poll(function(){return !!(S.token&&S.pageScope)},function(){var v=pageViewer.view();if(!v||v.closed){syncPage();return false}})},220);
+ $('pageRetry').onclick=function(){if(pageViewer.inputBusy()||pageBusy)return;pageViewer.clearLost();syncPage(true)};
+ document.addEventListener('visibilitychange',function(){pageViewer.clearQueue();if(document.hidden){++pageGen;pageKey='';void pageViewer.close().catch(function(){})}else syncPage(true)});
+ window.addEventListener('pagehide',function(){++pageGen;pageViewer.clearQueue();void pageViewer.close().catch(function(){})})}
 // Reload, back navigation or a restored panel arrive without a fragment: ask the host now.
 if(S.token)listTasks();else askHost();
 })();
