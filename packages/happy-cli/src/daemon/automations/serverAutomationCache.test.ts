@@ -160,6 +160,19 @@ describe('serverAutomationCache', () => {
     expect(cache.read().missedRunRecord).toBe(false)
   })
 
+  it('remembers whether the last sync came from a server that accepts late catch-up claims', () => {
+    // scheduled-missed-run-policy R11·R14: an old server ignores catchUp and denies the late slot.
+    const cache = createServerAutomationCache({ filePath: file })
+    expect(cache.read().catchUpClaim).toBe(false)
+
+    cache.applySync({ serverTime: 1_000, nextSeq: '1', changes: [], missedRunRecord: 1, catchUpClaim: 1 })
+    expect(cache.read().catchUpClaim).toBe(true)
+    expect(createServerAutomationCache({ filePath: file }).read().catchUpClaim).toBe(true)
+
+    cache.applySync({ serverTime: 2_000, nextSeq: '1', changes: [], missedRunRecord: 1 })
+    expect(cache.read().catchUpClaim).toBe(false)
+  })
+
   it('durably keeps the sealed deletion target until its session stop is acknowledged', () => {
     const keyPair = tweetnacl.box.keyPair(); const encrypted = bundle({ name: 'task', prompt: 'work', directory: '/chat', schedule: { kind: 'interval', minutes: 15 }, conversation: { sessionId: 's' } }, keyPair.publicKey)
     const cache = createServerAutomationCache({ filePath: file })

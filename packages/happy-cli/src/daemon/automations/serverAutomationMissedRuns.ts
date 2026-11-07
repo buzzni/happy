@@ -76,3 +76,44 @@ export function planMissedRuns(input: MissedRunPlanInput): MissedRunPlan | null 
     resumeAt: computeNextRunAt(schedule, cutoff - 1),
   }
 }
+
+/**
+ * 서버가 받는 늦은 claim 의 상한(happy-server AUTOMATION_CATCH_UP_MAX_AGE_MS). 서버는 자기 시계로 다시
+ * 확인하므로, 이 경계 가까이의 회차는 거절될 수 있어 여유를 두고 기본 규칙(놓침 기록)으로 넘긴다.
+ */
+export const CATCH_UP_MAX_AGE_MS = 8 * 24 * 60 * 60_000
+const CATCH_UP_CLOCK_MARGIN_MS = 5 * 60_000
+
+export interface CatchUpPlan {
+  /** 늦게 1회 실행할 회차(놓친 회차 중 가장 최근). null 이면 claim 창 안에 남은 회차가 그 1회다. */
+  runAt: number | null
+  /** `MISSED_COLLAPSED` 한 행에 남길 회차 수. 0 이면 행을 만들지 않는다. 상한에 걸리면 상한 그대로(하한). */
+  collapsedCount: number
+}
+
+/**
+ * specs/scheduled-missed-run-policy R11·R13 — `돌아오면 1회 실행` 예약의 공백을 1회 실행과 합친 기록으로 나눈다.
+ * 가장 최근 놓친 회차가 서버 상한보다 오래됐으면 null — 호출부는 기본 규칙(전부 놓침 기록)으로 처리한다.
+ */
+export function planCatchUp(schedule: AutomationSchedule, plan: MissedRunPlan, now: number): CatchUpPlan | null {
+  if (plan.resumeAt !== null && plan.resumeAt <= now) return { runAt: null, collapsedCount: plan.missedCount }
+  const latest = latestMissedAt(schedule, plan, now)
+  if (latest < now - CATCH_UP_MAX_AGE_MS + CATCH_UP_CLOCK_MARGIN_MS) return null
+  return { runAt: latest, collapsedCount: plan.capped ? plan.missedCount : plan.missedCount - 1 }
+}
+
+function latestMissedAt(schedule: AutomationSchedule, plan: MissedRunPlan, now: number): number {
+  const cutoff = now - MISSED_RUN_CLAIM_WINDOW_MS
+  if (schedule.kind === 'interval') {
+    const step = schedule.minutes * 60_000
+    return plan.firstMissedAt + (Math.ceil((cutoff - plan.firstMissedAt) / step) - 1) * step
+  }
+  // 상한 뒤의 회차를 처음부터 다시 걷지 않는다 — 서버가 받는 범위(상한 기간) 안에서만 찾는다.
+  let latest = plan.firstMissedAt
+  let slot = computeNextRunAt(schedule, Math.max(plan.firstMissedAt, cutoff - CATCH_UP_MAX_AGE_MS))
+  for (let walked = 0; slot !== null && slot < cutoff && walked < MAX_COUNTED_MISSED_RUNS; walked++) {
+    latest = slot
+    slot = computeNextRunAt(schedule, slot)
+  }
+  return latest
+}

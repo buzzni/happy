@@ -2609,6 +2609,36 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
+    // aplus-dev-studio specs/scheduled-missed-run-policy R14 — Desktop shows the per-schedule missed-run choice only on
+    // this; an old server ignores late catch-up claims, so the daemon advertises it only after the server said it can.
+    it.each([
+        { catchUpClaim: true, expected: 1 },
+        { catchUpClaim: false, expected: undefined },
+    ])('advertises missedRunPolicy=$expected when the server accepts catch-up claims=$catchUpClaim', async ({ catchUpClaim, expected }) => {
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 4 } };
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        const client = new ApiMachineClient('fake-token', machine);
+        (client as any).setAutomationKey({
+            version: 1,
+            publicKey: new Uint8Array(32).fill(7),
+            secretKey: new Uint8Array(32).fill(8),
+            registeredKeyVersion: 3,
+        }, vi.fn());
+        client.setServerAutomationCache({ read: () => ({ catchUpClaim }) } as any);
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.automationSupport?.serverBacked).toBe(true));
+        expect(MachineMetadataSchema.parse(machine.metadata).automationSupport?.missedRunPolicy).toBe(expected);
+        client.shutdown();
+    });
+
     // Desktop explains why script automations are unavailable from this field; without it a
     // machine that stayed on protocol 4 only shows up as SCRIPT_RUNNER_UNSUPPORTED.
     it.each([
