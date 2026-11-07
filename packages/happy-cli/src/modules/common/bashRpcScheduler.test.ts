@@ -110,18 +110,58 @@ describe('bash RPC scheduler', () => {
             await expect(queued).rejects.toBeInstanceOf(BashRpcBusyError);
             gate.resolve();
 
-            await expect(drained).resolves.toEqual({ running: 1, remaining: 0 });
+            await expect(drained).resolves.toEqual({ running: 1, terminated: 0, remaining: 0 });
             await running;
             expect(queuedTask).not.toHaveBeenCalled();
         });
 
-        it('stops waiting after the bound and reports the work still running', async () => {
+        it('closes admission the moment shutdown is requested, before anything is awaited', async () => {
+            const scheduler = createBashRpcScheduler();
+            const task = vi.fn(async () => 'ran');
+            const drained = drainBashRpcs({ waitMs: 10 });
+            const late = scheduler.run('foreground', task);
+
+            await expect(late).rejects.toMatchObject({ errorCode: 'DAEMON_BUSY' });
+            await drained;
+            expect(task).not.toHaveBeenCalled();
+        });
+
+        it('makes every concurrent shutdown path wait for the same running work', async () => {
             const scheduler = createBashRpcScheduler();
             const gate = deferred();
             const running = scheduler.run('foreground', () => gate.promise);
             await vi.waitFor(() => expect(scheduler.snapshot().running).toBe(1));
 
-            await expect(drainBashRpcs({ waitMs: 20 })).resolves.toEqual({ running: 1, remaining: 1 });
+            const first = drainBashRpcs({ waitMs: 5_000 });
+            const second = drainBashRpcs({ waitMs: 5_000 });
+            const early = await Promise.race([second.then(() => 'settled'), new Promise((resolve) => setTimeout(() => resolve('waiting'), 20))]);
+            gate.resolve();
+
+            expect(early).toBe('waiting');
+            await expect(Promise.all([first, second])).resolves.toEqual([{ running: 1, terminated: 0, remaining: 0 }, { running: 1, terminated: 0, remaining: 0 }]);
+            await running;
+        });
+
+        it('terminates work still running after the bound so its own cleanup trap can release what it holds', async () => {
+            const scheduler = createBashRpcScheduler();
+            let aborted = false;
+            const running = scheduler.run('foreground', (signal) => new Promise<void>((done) => {
+                signal.addEventListener('abort', () => { aborted = true; done(); });
+            }));
+            await vi.waitFor(() => expect(scheduler.snapshot().running).toBe(1));
+
+            await expect(drainBashRpcs({ waitMs: 20, termGraceMs: 1_000 })).resolves.toEqual({ running: 1, terminated: 1, remaining: 0 });
+            expect(aborted).toBe(true);
+            await running;
+        });
+
+        it('reports work that outlived termination', async () => {
+            const scheduler = createBashRpcScheduler();
+            const gate = deferred();
+            const running = scheduler.run('foreground', () => gate.promise);
+            await vi.waitFor(() => expect(scheduler.snapshot().running).toBe(1));
+
+            await expect(drainBashRpcs({ waitMs: 10, termGraceMs: 10 })).resolves.toEqual({ running: 1, terminated: 1, remaining: 1 });
             gate.resolve();
             await running;
         });

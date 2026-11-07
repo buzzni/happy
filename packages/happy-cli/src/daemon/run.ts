@@ -5938,10 +5938,12 @@ export async function startDaemon(): Promise<void> {
     let handingOffToInstalledBundle = false;
     const handOffToInstalledBundle = async () => {
       handingOffToInstalledBundle = true;
+      // This process exits whatever the handoff result, so bash admission closes here.
+      const bashRpcsDrained = drainBashRpcs();
       const handoffResult = await handoffToReplacedBundle({
         preflightReplacement: async () => true,
         teardownCurrentDaemon: async () => {
-          await Promise.all([drainWorktreeOperations(), drainBashRpcs()]);
+          await drainWorktreeOperations();
           clearInterval(restartOnStaleVersionAndHeartbeat);
           await checkpointRetentionSchedule.stop();
 
@@ -5954,6 +5956,7 @@ export async function startDaemon(): Promise<void> {
           // Before the replacement exists: it starts its own host, and two hosts must never
           // overlap. stop() returns only once the child has exited (SIGKILL after its grace).
           await channelHost?.stop();
+          await bashRpcsDrained;
           apiMachine.shutdown();
           await stopControlServer();
           await writeScopeRuntime?.close();
@@ -6018,7 +6021,8 @@ export async function startDaemon(): Promise<void> {
         sessionFollowupTickRunner.resume();
         scriptAutomationTickRunner.resume();
       },
-      closeTerminalsForRestart: () => apiMachine.closeDaemonTerminalsForRestart(),
+      // The ready drain's point of no return: bash admission closes before the terminals go.
+      closeTerminalsForRestart: () => { void drainBashRpcs(); return apiMachine.closeDaemonTerminalsForRestart(); },
       preflightReplacement: () => preflightInstalledHappyCLI(),
       handOff: handOffToInstalledBundle,
       shutdown: () => requestShutdown('happy-cli'),
@@ -6324,10 +6328,12 @@ export async function startDaemon(): Promise<void> {
       shutdownCleanupStarted = true;
       clearTimeout(startupShutdownFallback);
       startupShutdownFallback = undefined;
+      // Closes bash admission now, before anything below is awaited; the wait is collected before the socket goes.
+      const bashRpcsDrained = drainBashRpcs();
       // A ready drain closes its terminals (socket still up, so each says why) and writes its outcome line.
       await restartDrainRuntime?.finalizeReady();
       restartDrainRuntime?.dispose();
-      await Promise.all([drainWorktreeOperations(), drainBashRpcs()]);
+      await drainWorktreeOperations();
       logger.debug(`[DAEMON RUN] Starting proper cleanup (source: ${source}, errorMessage: ${errorMessage})...`);
       await checkpointRetentionSchedule.stop();
 
@@ -6363,6 +6369,7 @@ export async function startDaemon(): Promise<void> {
       await new Promise(resolve => setTimeout(resolve, 100));
 
       await channelHost?.stop();
+      await bashRpcsDrained;
       apiMachine.shutdown();
       await stopControlServer();
       await writeScopeRuntime?.close();
@@ -6430,13 +6437,14 @@ export async function startDaemon(): Promise<void> {
     const shutdownRequest = await resolvesWhenShutdownRequested;
     await cleanupAndShutdown(shutdownRequest.source, shutdownRequest.errorMessage);
   } catch (error) {
+    const bashRpcsDrained = drainBashRpcs();
     await stopBrowserAttention();
     await standaloneWindows?.owner.close().catch(() => {});
     stopLogHousekeeping();
     stopClaudeSwapSupervisor();
     await stopScriptWorker().catch((shutdownError) => logger.debug('[script-automations] Shutdown report remains in outbox', shutdownError));
     logger.debug('[DAEMON RUN][FATAL] Failed somewhere unexpectedly - exiting with code 1', error);
-    await Promise.all([drainWorktreeOperations(), drainBashRpcs()]);
+    await Promise.all([drainWorktreeOperations(), bashRpcsDrained]);
     process.exit(1);
   }
 }

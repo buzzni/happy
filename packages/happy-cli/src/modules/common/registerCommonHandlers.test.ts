@@ -156,6 +156,19 @@ describe('registerCommonHandlers bash at daemon shutdown', () => {
             .resolves.toMatchObject({ success: false, errorCode: 'DAEMON_BUSY' });
         await expect(readdir(workingDirectory)).resolves.not.toContain('ran.txt');
     });
+
+    // The Desktop Git writer's shape: a shared lock directory released by its own EXIT trap. A shell the daemon
+    // abandons dies of SIGPIPE without that trap; one the daemon terminates finishes its foreground command first.
+    it.skipIf(process.platform === 'win32')('terminates a command still running at the bound so its trap releases the lock', async () => {
+        const { handlers, workingDirectory } = await createHandlers();
+        const command = "mkdir lock && trap 'rmdir lock' EXIT && trap 'exit 130' HUP INT TERM && sleep 1 && printf done";
+        const response = handlers.get('bash')!({ command, cwd: workingDirectory, timeout: 30_000 });
+        await vi.waitFor(async () => expect(await readdir(workingDirectory)).toContain('lock'));
+
+        await expect(drainBashRpcs({ waitMs: 50, termGraceMs: 3_000 })).resolves.toMatchObject({ running: 1, terminated: 1 });
+        await expect(response).resolves.toMatchObject({ success: false });
+        await vi.waitFor(async () => expect(await readdir(workingDirectory)).not.toContain('lock'), { timeout: 5_000 });
+    });
 });
 
 describe('registerCommonHandlers machine.run capability', () => {

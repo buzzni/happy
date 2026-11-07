@@ -20,45 +20,60 @@ export class BashRpcBusyError extends Error {
     }
 }
 
+/** The signal aborts once a daemon shutdown stops waiting for this command. */
+type BashRpcTask<T> = (signal: AbortSignal) => Promise<T> | T;
+
 interface QueuedTask<T> {
     executionClass: BashRpcExecutionClass;
-    task: () => Promise<T> | T;
+    task: BashRpcTask<T>;
     resolve: (value: T | PromiseLike<T>) => void;
     reject: (reason?: unknown) => void;
 }
 
 export interface BashRpcScheduler {
-    run<T>(executionClass: BashRpcExecutionClass, task: () => Promise<T> | T): Promise<T>;
+    run<T>(executionClass: BashRpcExecutionClass, task: BashRpcTask<T>): Promise<T>;
     snapshot(): BashRpcSchedulerSnapshot;
 }
 
 export interface BashRpcDrainResult {
     /** Commands that were running when the drain began. */
     running: number;
-    /** Commands still running when the drain gave up; they outlive the daemon. */
+    /** Commands still running at the bound, sent SIGTERM so their own cleanup traps run. */
+    terminated: number;
+    /** Commands still running after termination; they outlive the daemon. */
     remaining: number;
 }
+
+type DrainOptions = { waitMs: number; termGraceMs: number };
 
 /**
  * Shutdown hooks of every scheduler in this process. Module state like the worktree queues in
  * daemon/worktreeOps: the daemon drains them without each handler set being plumbed to it.
  */
-const liveSchedulers = new Set<(waitMs: number) => Promise<BashRpcDrainResult>>();
+const liveSchedulers = new Set<(options: DrainOptions) => Promise<BashRpcDrainResult>>();
 
 /**
- * Called before the daemon exits. Refuses new and queued commands with the retryable busy error (the
- * caller's retry reaches the next daemon) and waits a bounded time for running ones, so a Git writer
- * is neither started into a dying daemon nor cut off holding the shared repository lock. The bound
- * stays inside the 10 s `stopDaemon()` gives `/stop` before it SIGKILLs the daemon.
+ * Called on every daemon exit path. The first call closes admission synchronously: new and queued commands
+ * get the busy error (the caller may retry against the next daemon), so a Git writer is never started into a
+ * dying daemon. Running commands get `waitMs`, counted from that first call so the wait overlaps the rest of
+ * the teardown; then SIGTERM, so a writer's trap releases the shared repository lock instead of the shell dying
+ * of SIGPIPE after the daemon exits (a signal-killed shell skips its EXIT trap). The shell defers the trap until
+ * its foreground command returns, so a write is never cut off. Both bounds stay inside the 10 s `stopDaemon()`
+ * gives `/stop` before it SIGKILLs the daemon. Concurrent callers share the same wait.
  */
-export async function drainBashRpcs(options: { waitMs?: number } = {}): Promise<BashRpcDrainResult> {
-    const results = await Promise.all([...liveSchedulers].map((shutdown) => shutdown(options.waitMs ?? 5_000)));
+export async function drainBashRpcs(options: Partial<DrainOptions> = {}): Promise<BashRpcDrainResult> {
+    const resolved = { waitMs: options.waitMs ?? 5_000, termGraceMs: options.termGraceMs ?? 1_000 };
+    const results = await Promise.all([...liveSchedulers].map((shutdown) => shutdown(resolved)));
     const total = results.reduce((sum, result) => ({
         running: sum.running + result.running,
+        terminated: sum.terminated + result.terminated,
         remaining: sum.remaining + result.remaining,
-    }), { running: 0, remaining: 0 });
+    }), { running: 0, terminated: 0, remaining: 0 });
     // An idle drain is the expected case; only commands caught by the shutdown are worth a line.
-    if (total.running > 0) logger.debug(`[bash-rpc] shutdown drain: running=${total.running} stillRunning=${total.remaining}`);
+    if (total.running > 0) {
+        logger.debug(`[bash-rpc] shutdown drain: running=${total.running} terminated=${total.terminated} stillRunning=${total.remaining}`
+            + (total.terminated > 0 ? ' (a terminated Git writer releases its repository lock from its own trap)' : ''));
+    }
     return total;
 }
 
@@ -76,7 +91,9 @@ export function createBashRpcScheduler(options: {
     let running = 0;
     let runningBackground = 0;
     let closed = false;
+    let shuttingDown: Promise<BashRpcDrainResult> | null = null;
     const idleWaiters: Array<() => void> = [];
+    const termination = new AbortController();
 
     const snapshot = (): BashRpcSchedulerSnapshot => ({
         running,
@@ -92,7 +109,7 @@ export function createBashRpcScheduler(options: {
         if (item.executionClass === 'background') runningBackground += 1;
         notify();
         Promise.resolve()
-            .then(item.task)
+            .then(() => item.task(termination.signal))
             .then(item.resolve, item.reject)
             .finally(() => {
                 running -= 1;
@@ -117,28 +134,37 @@ export function createBashRpcScheduler(options: {
         notify();
     };
 
-    const shutdown = async (waitMs: number): Promise<BashRpcDrainResult> => {
+    /** Resolves true once nothing runs, false when the bound passes first. */
+    const idleWithin = async (ms: number): Promise<boolean> => {
+        if (running === 0) return true;
+        let timer: NodeJS.Timeout | undefined;
+        const idle = await Promise.race([
+            new Promise<boolean>((wake) => { idleWaiters.push(() => wake(true)); }),
+            new Promise<boolean>((wake) => { timer = setTimeout(() => wake(false), ms); }),
+        ]);
+        clearTimeout(timer);
+        return idle;
+    };
+
+    // Memoized: a second shutdown path (e.g. a signal during bundle handoff) waits on the same commands
+    // instead of finding nothing to wait for. The close below runs before the first await.
+    const shutdown = (drainOptions: DrainOptions): Promise<BashRpcDrainResult> => shuttingDown ??= (async () => {
         closed = true;
-        liveSchedulers.delete(shutdown);
         for (const item of [...foregroundQueue.splice(0), ...backgroundQueue.splice(0)]) {
             item.reject(new BashRpcBusyError('Daemon is shutting down'));
         }
-        const atStart = running;
-        if (running > 0) {
-            let timer: NodeJS.Timeout | undefined;
-            await Promise.race([
-                new Promise<void>((wake) => { idleWaiters.push(wake); }),
-                new Promise<void>((wake) => { timer = setTimeout(wake, waitMs); }),
-            ]);
-            clearTimeout(timer);
-        }
         notify();
-        return { running: atStart, remaining: running };
-    };
+        const atStart = running;
+        if (await idleWithin(drainOptions.waitMs)) return { running: atStart, terminated: 0, remaining: 0 };
+        const terminated = running;
+        termination.abort();
+        await idleWithin(drainOptions.termGraceMs);
+        return { running: atStart, terminated, remaining: running };
+    })().finally(() => liveSchedulers.delete(shutdown));
     liveSchedulers.add(shutdown);
 
     return {
-        run<T>(executionClass: BashRpcExecutionClass, task: () => Promise<T> | T): Promise<T> {
+        run<T>(executionClass: BashRpcExecutionClass, task: BashRpcTask<T>): Promise<T> {
             return new Promise<T>((resolve, reject) => {
                 if (closed) {
                     reject(new BashRpcBusyError('Daemon is shutting down'));
