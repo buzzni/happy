@@ -33,18 +33,18 @@ import { pushOutcomesCounter } from "@/app/monitoring/metrics2";
 import { error, log } from "@/utils/log";
 
 /**
+ * Budget for one dispatch, from the presence check to the last Expo batch.
+ * The push-event route awaits it, so it stays inside the CLI's 15s timeout.
+ */
+const DISPATCH_BUDGET_MS = 10_000;
+
+/**
  * What happened to one session-event push.
  * - suppressed: a UI client is active, nothing was sent
  * - no_tokens: the account has no registered device
  * - sent / partial / failed: every / some / no token got an ok ticket;
  *   failed also covers an exception anywhere in the dispatch
  */
-/**
- * Budget for one dispatch, from the presence check to the last Expo batch.
- * The push-event route awaits it, so it stays inside the CLI's 15s timeout.
- */
-const DISPATCH_BUDGET_MS = 10_000;
-
 export type PushOutcome = {
     status: 'sent' | 'partial' | 'suppressed' | 'no_tokens' | 'failed';
     tokens: number;
