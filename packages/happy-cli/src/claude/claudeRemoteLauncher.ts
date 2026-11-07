@@ -42,6 +42,7 @@ import {
 } from '@/channel/channelTurnOrdering';
 import { judgeStructuredOutput, type StructuredOutputResult } from '@/claude/structuredOutput';
 import { getToolName } from "./utils/getToolName";
+import { mergeUsageLimits } from "./utils/usageLimits";
 import { getAskUserQuestionToolCallIds } from "./utils/questionNotification";
 import { cleanupStdinAfterInk } from "@/utils/terminalStdinCleanup";
 import type { ContentBlockParam } from '@anthropic-ai/sdk/resources';
@@ -600,6 +601,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     /** The provider runs on a binding the session has since switched away from. */
     const providerStale = () => providerRunning && (providerCredentialGeneration !== (personalFallback?.generation() ?? 0) || providerBinding !== undefined && providerBinding !== runningAuthority());
 
+    /**
+     * specs/cli-usage-limits-snapshot — queries started so far. Only the newest publishes usage limits: an
+     * older one's late patch (its seed outlived a restart onto another account) describes the account it left.
+     */
+    let usageLimitsQueries = 0;
+
     let backgroundTasks: NonNullable<Metadata['claudeBackgroundTasks']> | undefined;
     function publishBackgroundTasks(next: NonNullable<Metadata['claudeBackgroundTasks']>) {
         backgroundTasks = next;
@@ -977,6 +984,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             providerSharedStartAuthority = personalFallback?.identity() || providerActivityBinding ? undefined : sharedMachineSetupTokenAuthority(process.env);
             const optionsCredentialGeneration = personalFallback?.generation() ?? 0;
             const providerOptionsStale = () => providerStale() || optionsCredentialGeneration !== (personalFallback?.generation() ?? 0);
+            const usageLimitsQuery = ++usageLimitsQueries;
             try {
                 const remoteResult = await claudeRemote({
                     sessionId: session.sessionId,
@@ -1465,6 +1473,11 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     onSideQuestionChannelReady: (channel) => {
                         if (channel) sideQuestion.provide(channel); else sideQuestion.clear();
                         contextUsageRequest = channel?.request ?? null;
+                    },
+                    // Merged inside the write, so a version-mismatch retry merges again on the newest state.
+                    onUsageLimits: (patch) => {
+                        if (usageLimitsQuery !== usageLimitsQueries) return;
+                        session.client.updateAgentState((current) => ({ ...current, usageLimits: mergeUsageLimits(current.usageLimits, patch) }));
                     },
                     onMcpStatus: (status: McpRuntimeServerStatus) => {
                         session.client.updateMetadata((currentMetadata) => ({

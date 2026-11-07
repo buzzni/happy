@@ -9,6 +9,8 @@ import { McpRuntimeRecovery } from './mcpRuntimeRecovery';
 import { query } from '@/claude/sdk';
 import type { EnhancedMode } from './loop';
 import { CLAUDE_TRANSIENT_CONTINUE_PROMPT } from './claudeTransientRetry';
+import { mergeUsageLimits, type UsageLimitsPatch } from './utils/usageLimits';
+import type { UsageLimits } from '@/api/types';
 
 vi.mock('@/claude/sdk', () => ({
     query: vi.fn(),
@@ -1255,6 +1257,57 @@ describe('claudeRemote', () => {
                 argos: { type: 'http', url: 'https://argos.test/mcp' },
             });
             expect(onApplied).toHaveBeenCalledOnce();
+        });
+    });
+
+    describe('plan usage limits (specs/cli-usage-limits-snapshot R8)', () => {
+        const limit = (utilization?: number) => ({ type: 'rate_limit_event', uuid: 'rl', session_id: 's',
+            rate_limit_info: { status: 'allowed', rateLimitType: 'five_hour', utilization, resetsAt: 1_767_225_600 } });
+        /** One provider turn per prompt; `turns[i]` are the events before that turn's result. */
+        const run = async (turns: unknown[][], onUsageLimits?: (patch: UsageLimitsPatch) => void) => {
+            const readUsage = vi.fn(async () => ({ rate_limits_available: true, rate_limits: { seven_day: { utilization: 70, resets_at: '2026-01-07T00:00:00Z' } } }));
+            vi.mocked(query).mockImplementation(({ prompt }: any) => Object.assign((async function* () {
+                let turn = 0;
+                for await (const _input of prompt) {
+                    yield* turns[turn++] as object[];
+                    yield { type: 'result', subtype: 'success' };
+                }
+            })(), { mcpServerStatus: async () => [], setPermissionMode: async () => {}, usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: readUsage }) as any);
+            const onMessage = vi.fn();
+            let count = 0;
+            await claudeRemote({ sessionId: null, path: process.cwd(), allowedTools: [], hookSettingsPath: '/tmp/happy-test-settings.json',
+                nextMessage: async () => count++ < turns.length ? { message: `turn-${count}`, mode } : null,
+                onReady: vi.fn(), canCallTool: async () => ({ behavior: 'allow' }) as any, isAborted: () => false,
+                onSessionFound: vi.fn(), onThinkingChange: vi.fn(), onMessage, onUsageLimits });
+            return { readUsage, onMessage };
+        };
+
+        it('publishes at most once a turn, seeded at the first result, skipping a turn with nothing new', async () => {
+            const published: UsageLimitsPatch[] = [];
+            const { readUsage } = await run([[limit(0.5), limit(0.6)], [limit(0.6)], [limit(0.7)]], (patch) => published.push(patch));
+            await vi.waitFor(() => expect(published).toHaveLength(2));
+            expect(readUsage).toHaveBeenCalledOnce();
+            expect(readUsage).toHaveBeenCalledWith({ skipBehaviors: true });
+            expect(published.map(({ windows, replace }) => ({ windows: windows.map(w => [w.id, w.utilization]), replace }))).toEqual([
+                { windows: [['five_hour', 60], ['seven_day', 70]], replace: true },
+                { windows: [['five_hour', 70]], replace: undefined },
+            ]);
+            // On top of what an earlier runtime left: the seed replaces it, later turns merge by window.
+            const earlier: UsageLimits = { capturedAt: 1, windows: [{ id: 'seven_day_opus', status: 'allowed', utilization: 5, resetsAt: null }] };
+            expect(published.reduce(mergeUsageLimits, earlier).windows).toEqual([
+                { id: 'five_hour', status: 'allowed', utilization: 70, resetsAt: '2026-01-01T00:00:00.000Z' },
+                { id: 'seven_day', status: 'allowed', utilization: 70, resetsAt: '2026-01-07T00:00:00.000Z' },
+            ]);
+        });
+
+        it('still hands every rate limit event to the account switcher (R8-c)', async () => {
+            const { onMessage } = await run([[limit(0.5)], [limit(0.6)]], vi.fn());
+            expect(onMessage.mock.calls.filter(([message]) => message.type === 'rate_limit_event')).toHaveLength(2);
+        });
+
+        it('does not ask for usage when nobody publishes it', async () => {
+            const { readUsage } = await run([[limit(0.5)]]);
+            expect(readUsage).not.toHaveBeenCalled();
         });
     });
 });

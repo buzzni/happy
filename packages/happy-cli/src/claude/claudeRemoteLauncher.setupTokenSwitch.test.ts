@@ -555,6 +555,67 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         expect(successfulResults).toEqual(['result-2']);
     });
 
+    // Saycode specs/cli-usage-limits-snapshot R8-b, R8-c — the switch and the session's usage snapshot read the same event.
+    it('switches on a refusal while publishing usage limits, and drops the left account\'s late reading', async () => {
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        let agentState: Record<string, unknown> = {};
+        const client = {
+            sessionId: 'happy-session-1',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn((update: (current: Record<string, unknown>) => Record<string, unknown>) => { agentState = update(agentState); }),
+            updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(), failClaudeLaunchTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        let answerFirstSeed!: (value: unknown) => void;
+        const seeds = [
+            vi.fn(() => new Promise((resolve) => { answerFirstSeed = resolve; })),
+            vi.fn(async () => ({ rate_limits_available: true, rate_limits: { five_hour: { utilization: 3, resets_at: '2026-01-01T05:00:00Z' } } })),
+        ];
+        const tokens: Array<string | undefined> = [];
+        vi.mocked(query).mockImplementation(({ prompt, options }) => {
+            const generation = tokens.push(options?.env?.CLAUDE_CODE_OAUTH_TOKEN) - 1;
+            const response = (async function* () {
+                yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+                for await (const _message of prompt as AsyncIterable<SDKUserMessage>) {
+                    if (generation === 0) {
+                        yield refused;
+                        yield { type: 'result', subtype: 'success', result: 'Claude AI usage limit reached', is_error: true, uuid: 'result-1' };
+                        continue;
+                    }
+                    yield assistant('msg-2');
+                    yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: 'result-2' };
+                    await vi.waitFor(() => expect(agentState.usageLimits).toBeDefined());
+                    void handlers.get('switch')!();
+                    return;
+                }
+            })();
+            return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {},
+                usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: seeds[generation] }) as unknown as ReturnType<typeof query>;
+        });
+        queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        const session: Record<string, unknown> = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 }, cancelLessonReview: vi.fn(),
+            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
+        };
+
+        await claudeRemoteLauncher(session as unknown as Session);
+
+        expect(tokens).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
+        expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', '{"account":"first"}', expect.objectContaining({ reason: 'rate-limited' }), expect.any(AbortSignal));
+        const fresh = { capturedAt: expect.any(Number), windows: [{ id: 'five_hour', status: 'allowed', utilization: 3, resetsAt: '2026-01-01T05:00:00.000Z' }] };
+        expect(agentState.usageLimits).toEqual(fresh);
+        // The first account's seed answers only now: its refused five-hour window must not come back.
+        answerFirstSeed({ rate_limits_available: true, rate_limits: { five_hour: { utilization: 100, resets_at: null } } });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(seeds[0]).toHaveBeenCalledWith({ skipBehaviors: true });
+        expect(agentState.usageLimits).toEqual(fresh);
+    });
+
     // Saycode specs/shared-pc-session-account-continuation — a shared PC session has no Studio binding.
     it('moves an unbound shared-PC session off a used-up account and continues the refused turn', async () => {
         const SHARED_A = '0b6f2c1e-1111-4a2b-8c3d-000000000001';
