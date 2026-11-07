@@ -5305,7 +5305,8 @@ export async function startDaemon(): Promise<void> {
       resolveContext: async run => {
         // Deferred work obtains a new principal/environment; persisted bearer grants and credentials are never reused.
         const common = { configUrl: `${trustedStudioOrigin}/api/me/mcp-config`, machineToken: credentials.token, machineId,
-          runId: run.runId, claimToken: run.claimToken };
+          runId: run.runId, claimToken: run.claimToken,
+          ...(run.payload.executionQuestion ? { conversationSessionId: run.payload.conversation!.sessionId, conversationDirectory: run.payload.directory } : {}) };
         const authority = await fetchAutomationProjectEnvironment({ ...common,
           conversationSessionId: run.payload.conversation!.sessionId, conversationDirectory: run.payload.directory });
         if (!authority.ok) throw new Error(authority.unreachable ? 'AUTOMATION_STUDIO_ADMISSION_UNCONFIRMED' : 'AUTOMATION_CONTEXT_AUTHORITY_DENIED');

@@ -352,6 +352,7 @@ export async function resolveAutomationRunMcpContext(
     machineId: string;
     runLeaseExpiresAt: number | null;
     questionRequestId?: string;
+    questionDisplaySessionId?: string;
     executionBindingId?: string;
     executionAdmission?: { payloadVersion: 6; generation: number; revision: number; machineAccountId: string };
 }>> {
@@ -392,7 +393,7 @@ export async function resolveAutomationRunMcpContext(
             projectId: run.automation.projectId,
             machineId: run.machineId,
             runLeaseExpiresAt: activelyRunning ? run.runLeaseExpiresAt!.getTime() : null,
-            ...(run.executionQuestion ? { questionRequestId: run.executionQuestion.id,
+            ...(run.executionQuestion ? { questionRequestId: run.executionQuestion.id, questionDisplaySessionId: run.executionQuestion.displaySessionId,
                 executionBindingId: automationExecutionQuestionBindingId(run.executionQuestion.id) } : {}),
             ...(input.executionAdmission ? { executionAdmission: { payloadVersion: 6 as const,
                 generation: run.generation, revision: a.revision, machineAccountId: run.machineAccountId } } : {}),

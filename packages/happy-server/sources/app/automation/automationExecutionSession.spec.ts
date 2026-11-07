@@ -330,7 +330,7 @@ it('queues an idempotent encrypted question about one completed run without edit
     expect(await startAutomationRun(client, 'owner', 'm1', { runId: thirdQuestion.requestId, claimToken: 'd'.repeat(43) }))
       .toMatchObject({ ok: true });
     expect(await resolveAutomationRunMcpContext(client, 'owner', 'm1', { runId: thirdQuestion.requestId, claimToken: 'd'.repeat(43), executionAdmission: true, questionProtocol: 1 }))
-      .toMatchObject({ ok: true, value: { ownerAccountId: 'other', questionRequestId: thirdQuestion.requestId, executionBindingId: `automation-question:${thirdQuestion.requestId}` } });
+      .toMatchObject({ ok: true, value: { ownerAccountId: 'other', questionRequestId: thirdQuestion.requestId, questionDisplaySessionId: 'manual', executionBindingId: `automation-question:${thirdQuestion.requestId}` } });
     const { runId: _runId, ...execution } = await request(thirdQuestion.requestId, { claimToken: 'd'.repeat(43) });
     const executionUrl = `/v1/automation-runs/${thirdQuestion.requestId}/execution-session`;
     const oldProof = await app.inject({ method: 'POST', url: executionUrl, headers: { authorization: `Bearer ${bearer}` }, payload: execution });
