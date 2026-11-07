@@ -165,7 +165,10 @@ describe('automation wire contract', () => {
     };
     expect(automationTargetSchema.parse({ ...target, automationProtocolVersion: 3 }))
       .toMatchObject({ automationProtocolVersion: 3 });
-    expect(automationTargetSchema.parse(target)).toMatchObject({ automationProtocolVersion: 1 });
+    expect(automationTargetSchema.parse(target)).toMatchObject({ automationProtocolVersion: 1, contextIsolationVersion: 0 });
+    expect(automationTargetSchema.parse({ ...target, automationProtocolVersion: 99 })).toHaveProperty('contextIsolationVersion', 0);
+    expect(automationTargetSchema.parse({ ...target, contextIsolationVersion: 1 })).toHaveProperty('contextIsolationVersion', 1);
+    expect(automationTargetSchema.safeParse({ ...target, contextIsolationVersion: 99 }).success).toBe(false);
   });
 
   it('preserves a safe degraded connector code on a completed run', () => {

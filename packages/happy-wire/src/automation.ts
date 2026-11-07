@@ -253,6 +253,7 @@ export const automationTargetSchema = z.object({
   viewerPublicKey: publicKeySchema.nullable(),
   viewerKeyVersion: z.number().int().min(0),
   automationProtocolVersion: positiveInteger.default(1),
+  contextIsolationVersion: z.union([z.literal(0), z.literal(1)]).default(0),
   sessionFollowupSupported: z.boolean().default(false),
 });
 export type AutomationTarget = z.infer<typeof automationTargetSchema>;
