@@ -22,7 +22,11 @@ function automation(patch: Record<string, unknown> = {}) {
 function makeTx() {
     return {
         automation: { findFirst: vi.fn(async (): Promise<unknown> => automation()) },
-        automationChange: { findMany: vi.fn(async () => []) },
+        automationChange: {
+            findMany: vi.fn(async () => []),
+            // The first change of the current generation: when it was created, edited, paused or resumed.
+            findFirst: vi.fn(async (): Promise<unknown> => ({ createdAt: new Date(0) })),
+        },
         automationRun: {
             createMany: vi.fn(async (_input: { data: any[]; skipDuplicates: boolean }) => ({ count: 1 })),
             findFirst: vi.fn(async (): Promise<unknown> => null),
@@ -81,6 +85,34 @@ describe('claimAutomationRun catch-up', () => {
         await expect(claim(paused, slot, { catchUp: true })).resolves.toEqual({ ok: false, error: 'claim-denied' });
 
         for (const tx of [beforeEnable, staleGeneration, paused]) expect(tx.automationRun.createMany).not.toHaveBeenCalled();
+    });
+
+    it('refuses a late slot that passed before this generation began, such as one slept through while paused', async () => {
+        // Saved 05:00 for 06:00, paused 05:30, resumed 09:00: resume bumps the generation but keeps enabledAt.
+        const slot = new Date(now.getTime() - 3 * 60 * 60_000);
+        const resumed = makeTx();
+        resumed.automationChange.findFirst.mockResolvedValue({ createdAt: now });
+        await expect(claim(resumed, slot, { catchUp: true })).resolves.toEqual({ ok: false, error: 'claim-denied' });
+        expect(resumed.automationChange.findFirst).toHaveBeenCalledWith({
+            where: { automationId: 'automation-1', generation: 3 }, orderBy: { seq: 'asc' }, select: { createdAt: true },
+        });
+        expect(resumed.automationRun.createMany).not.toHaveBeenCalled();
+
+        // Edited 05:00 to 06:00 and switched off: the slot belongs to the edited generation and may still run.
+        const edited = makeTx();
+        edited.automationChange.findFirst.mockResolvedValue({ createdAt: new Date(slot.getTime() - 60 * 60_000) });
+        await expect(claim(edited, slot, { catchUp: true })).resolves.toMatchObject({ ok: true });
+
+        // No change row for the generation means its start is unknown: refuse rather than guess.
+        const unknown = makeTx();
+        unknown.automationChange.findFirst.mockResolvedValue(null);
+        await expect(claim(unknown, slot, { catchUp: true })).resolves.toEqual({ ok: false, error: 'claim-denied' });
+    });
+
+    it('does not look the generation up for a catch-up claim still inside the regular window', async () => {
+        const tx = makeTx();
+        await expect(claim(tx, new Date(now.getTime() - 30_000), { catchUp: true })).resolves.toMatchObject({ ok: true });
+        expect(tx.automationChange.findFirst).not.toHaveBeenCalled();
     });
 
     it('answers already-claimed when the same late slot is claimed again', async () => {

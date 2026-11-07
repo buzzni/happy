@@ -241,6 +241,10 @@ const AUTOMATION_RUN_NOW_MAX_AGE_MS = 15 * 60_000;
  */
 export const AUTOMATION_CATCH_UP_MAX_AGE_MS = 8 * 24 * 60 * 60_000;
 
+function inRegularWindow(scheduledFor: Date, now: Date): boolean {
+    return scheduledFor.getTime() >= now.getTime() - 90_000 && scheduledFor.getTime() <= now.getTime() + 15_000;
+}
+
 export async function claimAutomationRun(
     tx: Tx,
     accountId: string,
@@ -255,15 +259,25 @@ export async function claimAutomationRun(
             targetMachine: { select: { automationKeyVersion: true, automationContextIsolationVersion: true } },
         },
     });
-    const pastWindowMs = input.catchUp === true ? AUTOMATION_CATCH_UP_MAX_AGE_MS : 90_000;
-    const inClaimWindow = input.scheduledFor.getTime() >= now.getTime() - pastWindowMs
-        && input.scheduledFor.getTime() <= now.getTime() + 15_000;
+    const inClaimWindow = input.catchUp === true
+        ? input.scheduledFor.getTime() >= now.getTime() - AUTOMATION_CATCH_UP_MAX_AGE_MS && input.scheduledFor.getTime() <= now.getTime() + 15_000
+        : inRegularWindow(input.scheduledFor, now);
     const durableRunNowRequest = automation?.runRequestedAt?.getTime() === input.scheduledFor.getTime()
         && input.scheduledFor.getTime() >= now.getTime() - AUTOMATION_RUN_NOW_MAX_AGE_MS;
     if (!inClaimWindow && !durableRunNowRequest) return { ok: false, error: 'claim-denied' };
     if (!automation || !executable(automation, accountId, machineId, input.generation)
         || input.scheduledFor < automation.enabledAt) {
         return { ok: false, error: 'claim-denied' };
+    }
+    // A slot only the widened window admits must belong to this generation: a pause, resume or edit bumps the
+    // generation but keeps enabledAt, so without this a slot that passed while paused could still run (R7).
+    if (input.catchUp === true && !inRegularWindow(input.scheduledFor, now) && !durableRunNowRequest) {
+        const generationStart = await tx.automationChange.findFirst({
+            where: { automationId: automation.id, generation: input.generation },
+            orderBy: { seq: 'asc' },
+            select: { createdAt: true },
+        });
+        if (!generationStart || input.scheduledFor < generationStart.createdAt) return { ok: false, error: 'claim-denied' };
     }
 
     await tx.automationRun.updateMany({
