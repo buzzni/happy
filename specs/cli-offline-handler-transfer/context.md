@@ -1,22 +1,27 @@
 ---
 기능: cli-offline-handler-transfer
-상태: 진행중(T1)
+상태: 진행중(T5 셀프·교차 리뷰)
 마지막 갱신: 2026-11-07
 ---
 
 # context
 
 ## 현재 상태
-origin/main 3fbd89815(.395)에서 분기. spec 세트 작성.
+origin/main 3fbd89815(.395)에서 분기. T1~T4 완료: stub 등록 기록·이전, swap 전 이전, 러너 4종 통합 테스트(각각 이전 줄을 주석 처리하면 실패함을 확인), Gemini 미뤄진 swap용 stub `queueInput`.
+검증: `pnpm typecheck` 통과, 실제 unit 프로젝트(전역 build 포함)로 관련 9개 파일 151건 통과. 이후 추가분은 반복 설정으로 13건 통과.
 
 ## 결정 로그
 - 2026-11-07 Claude 경로는 해당 없음(spec R4-c 근거). 오프라인 분기가 stub 없이 claudeLocal만 돌리고 종료.
 - 2026-11-07 `onFileEvent`도 같은 결함이라 함께 이전(R4-a2). Codex가 stub에 등록.
 - 2026-11-07 RPC `policy` 인자(`customerBound`)도 기억해 옮김 — 포크 `RpcHandlerManager.registerHandler`가 세 번째 인자를 받음(upstream엔 없음).
 - 2026-11-07 ACP 러너도 같은 경로라 테스트 범위에 포함.
+- 2026-11-07 Gemini는 처리 중이면 swap을 턴 끝까지 미룬다(`pendingSessionSwap`). 이전된 user-message 핸들러가 그 사이 `session.queueInput`을 stub에 불러 TypeError → 메시지 유실. 러너를 고치지 않고 stub에 실제와 같은 순수 `queueInput`을 둠(R4-b2). 계산은 `api/turnInputEvidence.ts`의 `queueInputEvidence`로 분리해 실제 세션과 공유(구조 커밋 분리).
+- 2026-11-07 기록 비우기는 같은 객체를 제자리에서 비운다 — stub 클로저가 쥔 객체를 갈아 끼우면 이후 등록이 조용히 사라진다.
+- 2026-11-07 Codex 오프라인 테스트는 run-once 없이 띄운다(오프라인 자동화는 Codex가 시작을 거부). 오프라인 Codex는 runtime gate가 없어 dispatch 핸들러를 설치하지 않으므로 그 describe에서 이전 테스트의 `fixture.markDispatched`를 비운다.
 
 ## 열린 문제
-- 없음
+- (범위 밖) stub에 `hasTitle`이 없어 오프라인에서 시작한 턴이 실패한다: Codex `runCodex.ts:2835`, Gemini `buildGeminiTurnPrompt({ hasTitle: session.hasTitle() })`. origin/main 동일. 재접속 뒤 턴은 실제 세션이라 정상.
+- (범위 밖) `api/apiSession.test.ts` "reports an observed org deployment login only on the events it was handed"는 변경 전 코드에서도 실패(로컬, 전역 build 없는 반복 설정).
 
 ## 다음 시작점
-T1.
+T5 교차 리뷰 → T6 PR.
