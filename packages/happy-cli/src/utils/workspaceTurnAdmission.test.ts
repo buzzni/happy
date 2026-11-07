@@ -64,6 +64,27 @@ test('serializes concurrent manual bookkeeping without rejecting compatible work
   expect(await admission('automation-run:after-manual-concurrent', 'automation').tryAcquire()).toEqual({ acquired: true });
 });
 
+test.each(['filesystem', 'subprocess'])('queues local %s admission behind slow identity observation without failing a compatible operation', async kind => {
+  const root = await realpath(workspace), slow = admission('slow-local-owner', 'manual');
+  let entered!: () => void, unblock!: () => void, blocked = false;
+  const observed = new Promise<void>(resolve => { entered = resolve; });
+  const hold = new Promise<void>(resolve => { unblock = resolve; });
+  statHook.observe = async (path, bigint) => {
+    if (blocked || !bigint || path !== root) return;
+    blocked = true; entered(); await hold;
+  };
+  const first = slow.tryAcquire(); await observed;
+  const operation = vi.fn(async () => 'submitted');
+  const second = kind === 'filesystem' ? module.createFilesystemWriteAdmission({ home })(operation)
+    : module.createUnfencedSubprocessAdmission({ home, bootId: fixtureBoot })([workspace], operation);
+  const settled = Promise.allSettled([first, second]);
+  try { await new Promise(resolve => setTimeout(resolve, 1000)); }
+  finally { unblock(); }
+  expect(await settled).toEqual([{ status: 'fulfilled', value: { acquired: true } }, { status: 'fulfilled', value: 'submitted' }]);
+  expect(operation).toHaveBeenCalledOnce();
+  expect(await slow.release(true)).toBe(true);
+});
+
 test('retains concurrent legacy writers once each despite contended registry bookkeeping', async () => {
   const operation = vi.fn(async () => 'submitted');
   const execute = module.createUnfencedSubprocessAdmission({ home, bootId: fixtureBoot });

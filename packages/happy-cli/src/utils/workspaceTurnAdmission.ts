@@ -4,6 +4,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { z } from 'zod';
 import { withOwnedFileLock, FileLockHeldError } from './ownedFileLock';
 import { readCurrentBootIdSync } from './bootIdentity';
@@ -51,16 +52,35 @@ function boundedOwners(owners: Owner[]): Owner[] {
   if (pressure) logger.warn('[workspace-admission] Unconfirmed writer capacity requires broader workspace verification');
   return retained;
 }
-/** Retry only failure to acquire the short bookkeeping lock, never its work or a workspace conflict. */
+const registryQueues = new Map<string, Promise<void>>();
+const heldRegistryPaths = new AsyncLocalStorage<ReadonlySet<string>>();
+/** Queue local bookkeeping; retry only foreign file-lock contention, never the callback's work.
+ * Identity observation stays inside the file lock so a rename cannot invalidate its snapshot. */
 async function withRegistryLock<T>(path: string, work: () => Promise<T>, retries = 25): Promise<T> {
-  for (let attempt = 0; ; attempt++) {
-    let entered = false;
-    try {
-      return await withOwnedFileLock(path, async () => { entered = true; return work(); });
-    } catch (error) {
-      if (entered || !(error instanceof FileLockHeldError) || attempt >= retries) throw error;
+  // An awaited admission from inside this very observation cannot queue behind itself.
+  if (heldRegistryPaths.getStore()?.has(path)) throw new FileLockHeldError('contended');
+  const previous = registryQueues.get(path) ?? Promise.resolve();
+  let finish!: () => void;
+  const pending = new Promise<void>(resolve => { finish = resolve; });
+  const next = previous.catch(() => undefined).then(() => pending);
+  registryQueues.set(path, next);
+  try {
+    await previous.catch(() => undefined);
+    for (let attempt = 0; ; attempt++) {
+      let entered = false;
+      try {
+        return await withOwnedFileLock(path, async () => {
+          entered = true;
+          return heldRegistryPaths.run(new Set([...(heldRegistryPaths.getStore() ?? []), path]), work);
+        });
+      } catch (error) {
+        if (entered || !(error instanceof FileLockHeldError) || attempt >= retries) throw error;
+      }
+      await new Promise(resolve => setTimeout(resolve, 20));
     }
-    await new Promise(resolve => setTimeout(resolve, 20));
+  } finally {
+    finish();
+    if (registryQueues.get(path) === next) registryQueues.delete(path);
   }
 }
 async function rootIdentities(roots: readonly string[]): Promise<NonNullable<Owner['identities']>> {
