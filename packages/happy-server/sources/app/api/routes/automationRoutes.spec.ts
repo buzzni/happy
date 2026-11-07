@@ -164,6 +164,22 @@ describe('automationRoutes', () => {
         });
     });
 
+    it.each(['WORKSPACE_BUSY', null])('projects waiting state on the original run history without private claim fields (%s)', async holdCode => {
+        mocks.listAutomationRuns.mockResolvedValue({ ok: true, value: [{
+            id: 'run-1', automationId: 'automation-1', generation: 1, scheduledFor: new Date(1), machineId: 'machine-1',
+            status: 'RUNNING', sessionId: 'automation-run:run-1', outcome: null, detailCiphertext: null, holdCode,
+            failureCode: null, degradedCode: null, queueDepth: null, queuePosition: null, queueTotal: null, queueEstimatedAt: null,
+            claimedAt: new Date(2), startedAt: new Date(3), completedAt: null, lateReport: false,
+            claimTokenHash: new Uint8Array([1]), executionSeedMetadata: 'private-encrypted-seed',
+        }] });
+        const app = await makeApp();
+        const response = await app.inject({ method: 'GET', url: '/v1/projects/project-1/automation-runs', headers: { authorization: 'Bearer test' } });
+        expect(response.statusCode).toBe(200);
+        const run = response.json().runs[0];
+        expect(run).toMatchObject({ id: 'run-1', status: 'RUNNING', holdCode });
+        expect(run).not.toHaveProperty('claimTokenHash'); expect(run).not.toHaveProperty('executionSeedMetadata');
+    });
+
     it('decodes encrypted create fields and derives actor/project outside the body', async () => {
         mocks.createAutomation.mockResolvedValue({ ok: true, value: record() });
         const app = await makeApp();

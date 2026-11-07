@@ -122,6 +122,27 @@ describe('automationSocketHandler', () => {
         expect(services.reportAutomationRun).toHaveBeenCalledWith({}, 'account-1', 'machine-1', expect.objectContaining({ outcome: 'NO_CHANGE' }));
     });
 
+    it.each([undefined, null, 'WORKSPACE_BUSY'])('preserves the heartbeat state field without accepting body identity (%s)', async holdCode => {
+        const handlers = new Map<string, Function>();
+        const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
+        services.heartbeatAutomationRun.mockResolvedValue({ ok: true, value: { runLeaseExpiresAt: new Date(1000) } });
+        automationSocketHandler('account-1', 'machine-1', socket as never);
+        const input = { runId: 'run-1', claimToken: 'claim', ...(holdCode !== undefined ? { holdCode } : {}) }, callback = vi.fn();
+        await handlers.get('automation-run-heartbeat')!({ ...input, machineId: 'foreign', accountId: 'foreign' }, callback);
+        expect(services.heartbeatAutomationRun).toHaveBeenCalledWith({}, 'account-1', 'machine-1', input);
+        expect(callback).toHaveBeenCalledWith(expect.objectContaining({ ok: true }));
+    });
+
+    it.each(['private diagnostic', 1])('rejects an invalid heartbeat state before invoking storage (%s)', async holdCode => {
+        const handlers = new Map<string, Function>();
+        const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
+        automationSocketHandler('account-1', 'machine-1', socket as never);
+        const callback = vi.fn();
+        await handlers.get('automation-run-heartbeat')!({ runId: 'run-1', claimToken: 'claim', holdCode }, callback);
+        expect(callback).toHaveBeenCalledWith({ ok: false, error: 'invalid-heartbeat' });
+        expect(services.heartbeatAutomationRun).not.toHaveBeenCalled();
+    });
+
     it('accepts a safe automation failure code and rejects unstructured values', async () => {
         const handlers = new Map<string, Function>();
         const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };

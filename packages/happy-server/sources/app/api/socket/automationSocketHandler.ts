@@ -22,6 +22,7 @@ import {
 import { emitSessionFollowupMessageUpdate } from '@/app/automation/sessionFollowupUpdate';
 import {
     automationConversationDeliverRequestSchema,
+    automationRunHeartbeatRequestSchema,
     sessionFollowupClaimRequestSchema,
     sessionFollowupDeliverRequestSchema,
     sessionFollowupEvaluationRequestSchema,
@@ -169,9 +170,11 @@ export function automationSocketHandler(accountId: string, machineId: string, so
         }, accountId);
     }));
 
-    on('automation-run-heartbeat', async (data, callback) => answer(callback, () => inTx((tx) => heartbeatAutomationRun(tx, accountId, machineId, {
-        runId: requiredString(data?.runId), claimToken: requiredString(data?.claimToken),
-    }))));
+    on('automation-run-heartbeat', async (data, callback) => answer(callback, async () => {
+        const parsed = automationRunHeartbeatRequestSchema.safeParse(data);
+        if (!parsed.success) return { ok: false, error: 'invalid-heartbeat' };
+        return inTx((tx) => heartbeatAutomationRun(tx, accountId, machineId, parsed.data));
+    }));
 
     on('automation-conversation-deliver', async (data, callback) => answer(callback, () => {
         const input = automationConversationDeliverRequestSchema.parse(data);

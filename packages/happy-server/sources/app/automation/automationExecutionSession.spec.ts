@@ -24,6 +24,7 @@ vi.mock('@/storage/db', () => ({ db: new Proxy({}, { get: (_target, key) => {
 import { createAutomationExecutionSession, recordAutomationExecutionExit } from './automationExecutionSession';
 import { heartbeatAutomationRun, reportAutomationRun } from './automationExecutionService';
 import { automationExecutionRoutes } from '@/app/api/routes/automationExecutionRoutes';
+import { transitionChatAutomations } from './automationChatLifecycle';
 
 let now: Date;
 const secret = 'automation-target-test-secret-at-least-thirty-two-bytes';
@@ -377,6 +378,35 @@ it('reads run records from the original display chat with stable pagination and 
     expect((await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).seq).toBe(3);
     expect(await client.sessionMessage.count()).toBe(1);
   } finally { await app.close(); }
+});
+
+it('projects persisted holds on the original display run without writing into its manual conversation', async () => {
+  await register();
+  const manual = await client.session.findUniqueOrThrow({ where: { id: 'manual' } }), messages = await client.sessionMessage.findMany();
+  const app = await api(), input = { runId: 'r1', claimToken: 'claim-r1', holdCode: 'WORKSPACE_OWNER_UNCONFIRMED' };
+  try {
+    for (const holdCode of [input.holdCode, null]) {
+      expect(await heartbeatAutomationRun(client, 'owner', 'm1', { ...input, holdCode }, now)).toMatchObject({ ok: true });
+      const response = await app.inject({ method: 'GET', url: '/v1/sessions/manual/automation-runs', headers: { authorization: `Bearer ${bearer}` } });
+      expect(response.statusCode, response.body).toBe(200);
+      expect(response.json().runs[0]).toMatchObject({ id: 'r1', schedulerStatus: 'RUNNING', holdCode,
+        displaySessionId: 'manual', executionSessionId: 'automation-run:r1' });
+      expect(response.body).not.toContain('claim-r1'); expect(response.body).not.toContain('claimTokenHash');
+    }
+    expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
+    expect(await client.sessionMessage.findMany()).toEqual(messages);
+  } finally { await app.close(); }
+});
+
+it.each(['archived', 'deleted'] as const)('clears waiting state when its owning Chat is %s and refuses later heartbeats', async state => {
+  await register();
+  const input = { runId: 'r1', claimToken: 'claim-r1', holdCode: 'WORKSPACE_BUSY' };
+  expect(await heartbeatAutomationRun(client, 'owner', 'm1', input, now)).toMatchObject({ ok: true });
+  await transitionChatAutomations(client, 'owner', 'chat:c1', state, now);
+  expect(await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } })).toMatchObject({
+    status: 'CANCELLED', holdCode: null, failureCode: state === 'deleted' ? 'CHAT_DELETED' : 'CHAT_ARCHIVED',
+  });
+  expect(await heartbeatAutomationRun(client, 'owner', 'm1', input, now)).toEqual({ ok: false, error: 'run-not-running' });
 });
 
 it('does not expose run records through a foreign display chat, internal ID or lost project access', async () => {

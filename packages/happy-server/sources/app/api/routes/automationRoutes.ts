@@ -90,6 +90,7 @@ function serializeRun(row: AutomationRun) {
         outcome: row.outcome,
         detailCiphertext: row.detailCiphertext ? Buffer.from(row.detailCiphertext).toString('base64') : null,
         failureCode: row.failureCode,
+        holdCode: row.holdCode ?? null,
         degradedCode: row.degradedCode,
         queueDepth: row.queueDepth,
         queuePosition: row.queuePosition,
