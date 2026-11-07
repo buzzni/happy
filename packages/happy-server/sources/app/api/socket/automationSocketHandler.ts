@@ -158,6 +158,8 @@ export function automationSocketHandler(accountId: string, machineId: string, so
         automationId: requiredString(data?.automationId),
         generation: integer(data?.generation, 1, Number.MAX_SAFE_INTEGER),
         scheduledFor: new Date(integer(data?.scheduledFor, 0, Number.MAX_SAFE_INTEGER)),
+        // specs/scheduled-missed-run-policy R11 — only an explicit true widens the window; anything else is a plain claim.
+        ...(data?.catchUp === true ? { catchUp: true } : {}),
     })), (value) => {
         const { projectId } = value as { projectId: string };
         return emitProjectAutomationUpdate(projectId, {

@@ -105,7 +105,7 @@ export async function syncAutomations(
     machineId: string,
     input: { afterSeq: bigint; limit: number; payloadVersions?: number[] },
     now: Date = new Date(),
-): Promise<Result<{ serverTime: Date; nextSeq: bigint; changes: Array<Record<string, unknown>>; missedRunRecord: 1 }>> {
+): Promise<Result<{ serverTime: Date; nextSeq: bigint; changes: Array<Record<string, unknown>>; missedRunRecord: 1; catchUpClaim: 1 }>> {
     const rows = await tx.automationChange.findMany({
         where: { machineAccountId: accountId, machineId, seq: { gt: input.afterSeq } },
         orderBy: { seq: 'asc' },
@@ -167,6 +167,9 @@ export async function syncAutomations(
             // Tells the daemon this server records missed slots (`automation-missed-record`).
             // An old server never acks that event, so the daemon must not wait on it there.
             missedRunRecord: 1,
+            // Tells the daemon this server honours `catchUp` on a claim. An old server ignores the
+            // field and denies the late slot, so the daemon only offers the policy where it works.
+            catchUpClaim: 1,
         },
     };
 }
@@ -231,12 +234,18 @@ function executable(automation: any, accountId: string, machineId: string, gener
 }
 
 const AUTOMATION_RUN_NOW_MAX_AGE_MS = 15 * 60_000;
+/**
+ * aplus-dev-studio specs/scheduled-missed-run-policy R11·R13 — how late an opted-in "run once when
+ * back" claim may be. The policy lives in the encrypted payload, so the server cannot check it;
+ * this bound, enabledAt, the generation and the slot fence are what keep a late claim honest.
+ */
+export const AUTOMATION_CATCH_UP_MAX_AGE_MS = 8 * 24 * 60 * 60_000;
 
 export async function claimAutomationRun(
     tx: Tx,
     accountId: string,
     machineId: string,
-    input: { automationId: string; generation: number; scheduledFor: Date },
+    input: { automationId: string; generation: number; scheduledFor: Date; catchUp?: boolean },
     now: Date = new Date(),
 ): Promise<Result<{ runId: string; claimToken: string; claimExpiresAt: Date; serverTime: Date; projectId: string }>> {
     const automation = await tx.automation.findFirst({
@@ -246,7 +255,8 @@ export async function claimAutomationRun(
             targetMachine: { select: { automationKeyVersion: true, automationContextIsolationVersion: true } },
         },
     });
-    const inClaimWindow = input.scheduledFor.getTime() >= now.getTime() - 90_000
+    const pastWindowMs = input.catchUp === true ? AUTOMATION_CATCH_UP_MAX_AGE_MS : 90_000;
+    const inClaimWindow = input.scheduledFor.getTime() >= now.getTime() - pastWindowMs
         && input.scheduledFor.getTime() <= now.getTime() + 15_000;
     const durableRunNowRequest = automation?.runRequestedAt?.getTime() === input.scheduledFor.getTime()
         && input.scheduledFor.getTime() >= now.getTime() - AUTOMATION_RUN_NOW_MAX_AGE_MS;
