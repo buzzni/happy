@@ -27,6 +27,15 @@ function shellQuote(value: string): string {
     return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+function shScript(command: HappyCliCommand): string {
+    // Like spawnHappyCLI, a source-mode CLI gets its tsconfig unless the caller set one.
+    const tsconfig = command.tsconfigPath
+        ? `[ "\${TSX_TSCONFIG_PATH+set}" = set ] || TSX_TSCONFIG_PATH=${shellQuote(command.tsconfigPath)}\nexport TSX_TSCONFIG_PATH\n`
+        : '';
+    const exec = [command.runtime, ...command.args].map(shellQuote).join(' ');
+    return `#!/bin/sh\n# happy command shim — see happyCommandShim.ts in happy-cli.\n${tsconfig}exec ${exec} "$@"\n`;
+}
+
 /**
  * Write the `happy` shim and prepend the shim directory to env.PATH.
  *
@@ -44,12 +53,7 @@ export function installHappyCommandShim(
         return null;
     }
     try {
-        // Like spawnHappyCLI, a source-mode CLI gets its tsconfig unless the caller set one.
-        const tsconfig = command.tsconfigPath
-            ? `[ "\${TSX_TSCONFIG_PATH+set}" = set ] || TSX_TSCONFIG_PATH=${shellQuote(command.tsconfigPath)}\nexport TSX_TSCONFIG_PATH\n`
-            : '';
-        const exec = [command.runtime, ...command.args].map(shellQuote).join(' ');
-        const script = `#!/bin/sh\n# happy command shim — see happyCommandShim.ts in happy-cli.\n${tsconfig}exec ${exec} "$@"\n`;
+        const script = shScript(command);
         // One directory per CLI command: sessions of different CLI versions share the home, and a
         // session starting later must not redirect another session's `happy`. Sessions of the same
         // CLI may still rewrite it while one runs it: replace it atomically, not in place.
