@@ -47,7 +47,7 @@ import { pageViewerScript } from './pageViewer'
  * Personal PC page view (`pageView`, native-window only): a conversation console of a Runtime that serves page views
  * shows the selected task's page in the screen area. It publishes `__abpPageView`; a pageViewInfo-only bootstrap from the
  * host only learns the runtime binding (`__abpPageViewBinding`, then a new request), and only a capability scoped to this
- * conversation and binding opens the page. Such a capability cannot manage spaces, so their entry is hidden. Any other
+ * conversation and binding opens the page. Such a capability cannot manage spaces; their entry navigates to a separate management document. Any other
  * capability keeps the Chrome window guidance.
  */
 export function renderConsolePage(opts: { hostOrigins?: readonly string[]; screenMode?: 'native-window'; pageView?: boolean } = {}): string {
@@ -222,7 +222,7 @@ padding:10px 12px;border-radius:var(--radius-md);line-height:1.35;font-weight:40
 #pageBox{position:relative;flex:1 1 auto;min-height:240px;border-radius:var(--radius-md);overflow:auto;border:1px solid var(--border);background:var(--canvas);display:flex;align-items:center;justify-content:center}
 #pageBox:has(#page[hidden]){display:none}
 #page{display:block;max-width:100%;max-height:100%;object-fit:contain;touch-action:none;user-select:none}
-#page:focus-visible{outline:2px solid var(--ring);outline-offset:-2px}
+body:has(#pageInput:focus-visible) #pageBox,#page:focus-visible{outline:2px solid var(--ring);outline-offset:-2px}
 #pageBox.actual{display:block}#pageBox.actual #page{max-width:none;max-height:none}#pageBox.stale #page{opacity:.45}
 /* Outside the box: hiding the box between views must not blur the input (a blur ends the view's input). */
 #pageInput{position:fixed;left:0;top:0;opacity:.01;width:1px;height:1px;resize:none;border:0;padding:0;pointer-events:none}
@@ -276,7 +276,7 @@ ${spaceStyles}
 <button id="refreshTasks" class="icon" type="button" data-tt="refresh" title="Refresh"><svg aria-hidden="true"><use href="#i-refresh"/></svg></button></div>
 <div id="tasks" class="muted">not connected</div></div></details>
 <span class="spacer"></span>
-<button id="spaceToggle" type="button" aria-expanded="false" aria-controls="spacePanel">Spaces</button><span id="capState" class="pill"><i></i><span>not connected</span></span></header>
+<button id="consoleBack" type="button" hidden></button><button id="spaceToggle" type="button" aria-expanded="false" aria-controls="spacePanel">Spaces</button><span id="capState" class="pill"><i></i><span>not connected</span></span></header>
 ${spaceMarkup}
 <main>
 <div class="card notice" id="notice" role="alert" hidden><svg aria-hidden="true"><use href="#i-shield"/></svg><span id="noticeText"></span><button id="noticeRetry" type="button" data-t="retry">Retry</button></div>
@@ -426,7 +426,7 @@ function askHost(){clearTimeout(S.renewTimer);window.parent.postMessage({type:'a
 function fromHost(event){return (event.source===window.parent&&event.origin===location.origin)
  ||(!!window.opener&&event.source===window.opener&&HOST_ORIGINS.indexOf(event.origin)>=0)}
 function hhmm(ms){var d=new Date(ms);return isFinite(d.getTime())?d.toLocaleTimeString(LANG==='ko'?'ko-KR':'en-US',{hour:'2-digit',minute:'2-digit'}):''}
-function setCapability(token,expiresAtMs){var renewal=!!S.token;
+function setCapability(token,expiresAtMs){var renewal=!!S.token&&S.token!==token;
  var parts=String(token||'').split('.');var payload=parts.length>=3?decodePart(parts[parts.length===4?2:1]):null;
  if(!payload||typeof payload.profileId!=='string'){capPill(T.unreadable,'bad');return false}
  S.token=token;S.profileId=payload.profileId;S.expiresAtMs=Number(expiresAtMs)||Number(payload.expiresAtMs)||0;
@@ -435,7 +435,7 @@ function setCapability(token,expiresAtMs){var renewal=!!S.token;
  capPill(T.connected+(S.expiresAtMs?' · '+(LANG==='ko'?hhmm(S.expiresAtMs)+' '+T.until:T.until+' '+hhmm(S.expiresAtMs)):''),'on');
  $('capState').title='profile '+S.profileId;
  // A view lives only as long as the capability that opened it: a renewal reopens it under the new one.
- spaceCapabilityChanged(payload);S.pageScope=PAGE_VIEW&&payload.pageViewScope?payload.pageViewScope:null;pageMode();if(renewal&&S.pageScope)syncPage(true);
+ spaceCapabilityChanged(payload);S.pageScope=PAGE_VIEW&&payload.pageViewScope?payload.pageViewScope:null;pageMode(renewal);
  scheduleRenewal();if(renewal&&S.screenOpen)openScreen();return true}
 function scheduleRenewal(){clearTimeout(S.renewTimer);if(!S.expiresAtMs)return;
  var wait=Math.max(0,S.expiresAtMs-RENEW_BEFORE_MS-Date.now());
@@ -444,6 +444,7 @@ window.addEventListener('message',function(event){
  if(!fromHost(event))return;
  var d=event.data;if(!d||d.type!=='abp-capability'||typeof d.token!=='string'||typeof d.expiresAtMs!=='number')return;
  // The first capability lists the tasks; a renewal lists them again only when the last attempt failed (the alert is up).
+ if(PAGE_VIEW&&pageViewer&&pageViewer.inputBusy())return; // Host retries renewal; pending input keeps its original authority.
  if(PAGE_VIEW&&pageCapability(d.token))return;
  var first=!S.token;if(setCapability(d.token,d.expiresAtMs)&&(first||!$('notice').hidden))listTasks()});
 /** The fragment is read on load and again on a later change (the host reopens the same page with a new capability). */
@@ -500,7 +501,7 @@ function showTask(t){if(taskSession&&t.agentSessionId!==taskSession)return;if(mo
  ['takeOver','resume','stop'].forEach(function(id){$(id).disabled=done});$('release').disabled=done&&!mine;
  renderMode(t);syncTask(t);markSelected(t.taskId);applyControl();
  // An approval left on a stopped task is nothing to decide (the Runtime answers CONFLICT): the card goes with the task.
- var a=!done&&t.pendingApproval;$('approvalBox').hidden=!a;if(a)renderApproval(a);syncPage()}
+ var a=!done&&t.pendingApproval;$('approvalBox').hidden=!a;if(a)renderApproval(a);syncPage();if(pageViewer)renderPage()}
 /**
  * Whether this user holds the shown task's control decides what the viewer does with the wheel and the keys: without
  * control noVNC is view-only, so a wheel over an actual-size screen pans the frame (and keys are not grabbed); with
@@ -665,7 +666,7 @@ $('release').onclick=function(){var p=op('releaseControl',{taskId:$('taskId').va
  // A view read under the released control is not shown: the view is invalidated first and reopened by the task's answer.
  if(pageViewer&&S.pageScope){pageBusy=true;pageViewer.invalidate();pageStatus(LANG==='ko'?'입력을 정리하는 중…':'Draining page input…');p=p.then(function(r){pageKey='';return r}).finally(function(){pageBusy=false})}
  act(p)};
-$('resume').onclick=function(){if(S.task)act(op('resume',{taskId:S.task.taskId,expectedVersion:S.task.stateVersion,requestId:rid()}))};
+$('resume').onclick=function(){if(pageViewer&&(pageViewer.lost()||pageViewer.inputBusy()))return;if(S.task)act(op('resume',{taskId:S.task.taskId,expectedVersion:S.task.stateVersion,requestId:rid()}))};
 $('stop').onclick=function(){act(op('cancel',{taskId:$('taskId').value.trim(),requestId:rid()}))};
 /** A viewer connection is bound to the capability it was ticketed with: renewal reconnects it. */
 /** The screen counts as open from the click, so a renewal during the first ticket request reopens it; only the latest reply is shown. */
@@ -705,7 +706,8 @@ var pageViewer=null,pageGen=0,pageBusy=false,pageKey='',pageOpenedAt=-Infinity,p
 /** The screen line says what the view is doing; Reconnect is offered only after a failure or an input receipt check. */
 function pageStatus(text,error){var h=$('screenHintText');h.textContent=text;h.classList.toggle('warn-text',!!error);
  $('pageRetry').hidden=!S.pageScope||!(error||pageViewer&&pageViewer.lost())}
-function pageFail(e){var c=e&&e.code;pageViewer.halt();pageViewer.paint();
+function renderPage(){pageViewer.paint();if(!S.pageScope)return;$('resume').disabled=!S.task||finished(S.task)||S.task.pauseReason!=='user-input-complete'||!!S.task.uncertainActions.length||pageBusy||pageViewer.lost()||pageViewer.inputBusy()}
+function pageFail(e){var c=e&&e.code;pageViewer.halt();renderPage();
  pageStatus(c==='UNAUTHORIZED'?PT.expired:c==='SCOPE_DENIED'||c==='ORIGIN_DENIED'?PT.forbidden:c==='UNSUPPORTED_OPERATION'?PT.unsupported:c==='OUTCOME_UNKNOWN'?PT.unresolved:PT.offline,true)}
 function pageOp(name,body){var ctl=new AbortController(),timer=setTimeout(function(){ctl.abort()},6000);
  return fetch('/v1/ops/'+name,{method:'POST',cache:'no-store',signal:ctl.signal,headers:{'content-type':'application/json',authorization:'Bearer '+S.token},body:JSON.stringify(body)})
@@ -717,21 +719,23 @@ function pageOp(name,body){var ctl=new AbortController(),timer=setTimeout(functi
  */
 function pageCapability(token){var parts=token.split('.'),c=parts.length===4?decodePart(parts[2]):null;if(!c)return false;
  if(c.pageViewScope){var v=c.pageViewScope;if(v.schemaVersion===1&&v.agentSessionId===taskSession&&!!S.pageBinding&&v.runtimeBindingId===S.pageBinding)return false;
-  capPill(T.unreadable,'bad');return true}
+  pageFail({code:'SCOPE_DENIED'});return true}
  if(!c.operations||c.operations.length!==1||c.operations[0]!=='pageViewInfo')return false;
  fetch('/v1/ops/pageViewInfo',{method:'POST',cache:'no-store',headers:{'content-type':'application/json',authorization:'Bearer '+token},body:JSON.stringify({schemaVersion:1,profileId:c.profileId})})
- .then(function(r){return r.json()}).then(function(j){var info=j&&j.ok===true&&j.result;
-  if(!info||info.schemaVersion!==1||!info.supported||typeof info.runtimeBindingId!=='string')throw new Error('unsupported');
+ .then(function(r){return r.json().then(function(j){if(!r.ok||j.ok!==true)throw {code:j.error&&j.error.code};return j.result})}).then(function(info){
+  if(info&&info.schemaVersion===1&&info.supported===false)throw {code:'UNSUPPORTED_OPERATION'};
+  if(!info||info.schemaVersion!==1||info.supported!==true||typeof info.runtimeBindingId!=='string'||!info.runtimeBindingId.trim()||info.runtimeBindingId.length>256)throw {code:'SCOPE_DENIED'};
   S.pageBinding=info.runtimeBindingId;window.__abpPageViewBinding=S.pageBinding;askHost()})
- .catch(function(){S.pageBinding='';window.__abpPageViewBinding=null;window.__abpPageViewUnsupported=1;pageStatus(PT.unsupported,true);askHost()});
+ .catch(function(e){if(e&&e.code==='UNSUPPORTED_OPERATION'){S.pageBinding='';window.__abpPageViewBinding=null;window.__abpPageViewUnsupported=1;pageStatus(PT.unsupported,true);askHost()}
+  else pageFail(e)});
  return true}
 /** The screen area follows the capability: the page view with a page capability, the Chrome window guidance otherwise. */
-function pageMode(){var on=!!S.pageScope;document.body.classList.toggle('page-view',on);$('viewGroup').hidden=!on&&NATIVE_SCREEN;$('pageRetry').hidden=true;
- $('spaceToggle').hidden=on;if(on&&!$('spacePanel').hidden)spaceToggle(false);
+function pageMode(renewal){var on=!!S.pageScope;document.body.classList.toggle('page-view',on);$('viewGroup').hidden=!on&&NATIVE_SCREEN;$('pageRetry').hidden=true;
+ $('spaceToggle').hidden=false;if(on&&!$('spacePanel').hidden)spaceToggle(false);
  var b=$('screenEmpty').querySelector('b'),span=$('screenEmpty').querySelector('span');b.textContent=on?PT.emptyTitle:T.screenEmptyTitle;span.textContent=on?PT.emptyBody:T.screenEmptyBody;
- if(!on){pageStatus(T.screenHint,false);if(pageViewer){++pageGen;pageKey='';void pageViewer.close().catch(function(){})}}else syncPage()}
+ if(!on){pageStatus(T.screenHint,false);if(pageViewer){++pageGen;pageKey='';void pageViewer.close().catch(function(){})}}else syncPage(renewal&&!pageViewer.lost())}
 /** Opens the view of the shown task's tab when it changed (force: also when unchanged), closing the previous one first. */
-function syncPage(force){if(!pageViewer||!S.pageScope||!S.pageBinding)return;var t=S.task,typed=$('tabId').value.trim();
+function syncPage(force){if(!pageViewer||!S.pageScope||!S.pageBinding||pageViewer.lost()&&!force)return;var t=S.task,typed=$('tabId').value.trim();
  var tab=t&&!finished(t)&&t.tabs&&t.tabs.length?(t.tabs.indexOf(typed)>=0?typed:t.tabs[0]):'';
  var key=tab?t.taskId+'|'+tab:'',v=pageViewer.view();
  if(!force&&key===pageKey&&(!key||v&&!v.closed))return;
@@ -743,14 +747,20 @@ function syncPage(force){if(!pageViewer||!S.pageScope||!S.pageBinding)return;var
  .catch(function(e){if(gen===pageGen)pageFail(e)}).finally(function(){if(gen===pageGen){pageBusy=false;pageViewer.paint()}})}
 if(PAGE_VIEW){
  pageViewer=createPageViewer({request:pageOp,image:$('page'),input:$('pageInput'),viewport:$('pageBox'),empty:$('screenEmpty'),text:PT,status:pageStatus,fail:pageFail,
-  render:function(){pageViewer.paint()},task:function(){return S.task},ended:function(){return !!S.task&&finished(S.task)},
+  render:renderPage,task:function(){return S.task},ended:function(){return !!S.task&&finished(S.task)},
   identity:function(){return {viewerSessionId:S.viewerSessionId,principalId:S.principalId}},busy:function(){return pageBusy},generation:function(){return pageGen},token:function(){return S.token}});
- setInterval(function(){pageViewer.checkStale();void pageViewer.poll(function(){return !!(S.token&&S.pageScope)},function(){var v=pageViewer.view();if(!v||v.closed){syncPage();return false}})},220);
+ setInterval(function(){pageViewer.checkStale();void pageViewer.poll(function(){if(S.pageScope&&Date.now()>=S.expiresAtMs){pageFail({code:'UNAUTHORIZED'});return false}return !!(S.token&&S.pageScope)},function(){var v=pageViewer.view();if(!v||v.closed){syncPage();return false}})},220);
  // Reconnect starts over from the bootstrap: a relaunched browser has a new binding, which only pageViewInfo tells.
- $('pageRetry').onclick=function(){if(pageViewer.inputBusy()||pageBusy)return;pageViewer.clearLost();++pageGen;pageKey='';
-  void pageViewer.close().catch(function(){}).finally(function(){S.pageBinding='';window.__abpPageViewBinding=null;pageStatus(PT.connecting,false);askHost()})};
+ $('pageRetry').onclick=function(){if(pageViewer.inputBusy()||pageBusy)return;++pageGen;pageKey='';pageBusy=true;
+  pageViewer.close().catch(function(){}).finally(function(){S.token='';S.pageBinding='';window.__abpPageViewBinding=null;pageViewer.clearLost();pageBusy=false;pageStatus(PT.connecting,false);askHost()})};
  document.addEventListener('visibilitychange',function(){pageViewer.clearQueue();if(document.hidden){++pageGen;pageKey='';void pageViewer.close().catch(function(){})}else syncPage(true)});
  window.addEventListener('pagehide',function(){++pageGen;pageViewer.clearQueue();void pageViewer.close().catch(function(){})})}
+// Management gets its own document and host-issued token; the conversation view never receives management authority.
+var ordinarySpaces=$('spaceToggle').onclick;
+$('spaceToggle').onclick=function(){if(!S.pageScope)return ordinarySpaces();var u=new URL(location.href);u.searchParams.delete('agentSessionId');u.searchParams.delete('remotePage');u.searchParams.set('spaces','1');u.searchParams.set('returnToSession',taskSession);var theme=document.documentElement.dataset.theme;if(theme==='light'||theme==='dark')u.searchParams.set('theme',theme);u.hash='';location.href=u.href};
+var returnSession=Q.get('returnToSession');
+if(!taskSession&&Q.get('spaces')==='1'){spaceToggle(true);if(returnSession&&returnSession.length<=256){$('consoleBack').hidden=false;$('consoleBack').textContent=LANG==='ko'?'대화 화면으로':'Back to conversation';
+ $('consoleBack').onclick=function(){var u=new URL(location.href);u.searchParams.delete('spaces');u.searchParams.delete('returnToSession');u.searchParams.set('agentSessionId',returnSession);u.hash='';location.href=u.href}}}
 // Reload, back navigation or a restored panel arrive without a fragment: ask the host now.
 if(S.token)listTasks();else askHost();
 })();

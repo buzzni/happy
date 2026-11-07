@@ -43,6 +43,9 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
     let dropInput = false, inputDelayMs = 0
     /** A second open task of this conversation, for switching while input is under way. */
     let secondTask = false
+    /** A bootstrap the fake Runtime refuses with this code, and input answers held until the test releases them. */
+    let bootstrapError: string | null = null
+    let inputGate: { promise: Promise<void>; release(): void } | undefined
     /** The Runtime's current binding (a relaunched browser gets a new one) and the capabilities that have run out. */
     let binding = BINDING
     const expired = new Set<string>()
@@ -75,7 +78,12 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
                     res.end(JSON.stringify({ ok: false, error: { code: 'QUOTA_EXCEEDED', message: 'Page capture rate limited' } }))
                     return
                 }
-                if (m[1] === 'dispatchPageInput' && dropInput) { req.socket.destroy(); return }
+                if (m[1] === 'pageViewInfo' && bootstrapError) {
+                    res.writeHead(403, { 'content-type': 'application/json' })
+                    res.end(JSON.stringify({ ok: false, error: { code: bootstrapError, message: 'refused' } }))
+                    return
+                }
+                if (m[1] === 'dispatchPageInput' && dropInput && !inputGate) { req.socket.destroy(); return }
                 const view = views.get(String(body.viewId))
                 const refused = m[1] === 'openPageView' && body.runtimeBindingId !== binding ? 'SCOPE_DENIED'
                     : ['getPageFrame', 'dispatchPageInput'].includes(m[1]) && view && (expired.has(view.bearer) || view.binding !== binding) ? 'UNAUTHORIZED' : null
@@ -101,10 +109,14 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
                                     : m[1] === 'dispatchPageInput' ? { sequence: body.sequence, state: 'applied' }
                                         : m[1] === 'releaseControl' ? { owner: 'none', task: task() }
                                         : m[1] === 'closePageView' ? status : {}
-                setTimeout(() => {
+                const answer = () => {
+                    // A held input released while dropInput is set loses its answer, as a dropped connection does.
+                    if (m[1] === 'dispatchPageInput' && dropInput) { req.socket.destroy(); return }
                     res.writeHead(200, { 'content-type': 'application/json' })
                     res.end(JSON.stringify({ ok: true, result }))
-                }, m[1] === 'dispatchPageInput' ? inputDelayMs : 0)
+                }
+                if (m[1] === 'dispatchPageInput' && inputGate) void inputGate.promise.then(answer)
+                else setTimeout(answer, m[1] === 'dispatchPageInput' ? inputDelayMs : 0)
             })
         })
         await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
@@ -241,7 +253,7 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
                     controls: ['takeOver', 'release', 'resume', 'stop', 'autoMode'].every(id => !!document.getElementById(id).getClientRects().length),
                     hint: document.getElementById('screenHintText').textContent })`))
                 // Reconnect is offered only after a failure or an input receipt check, not while the page is live.
-                expect(state).toMatchObject({ page: true, guide: false, sizes: true, spaces: false, reconnect: false, controls: true })
+                expect(state).toMatchObject({ page: true, guide: false, sizes: true, spaces: true, reconnect: false, controls: true })
                 expect(state.hint).toBe(lang === 'ko' ? '페이지를 보고 있어요. 직접 조작하려면 제어권을 가져오세요.' : 'Observing the page. Take over to use it.')
             } finally { await harness.closeTarget(target) }
         }
@@ -390,6 +402,112 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
             // No view was opened with an empty or stale binding while the new one was being learned.
             expect(ops.filter((o) => o.op === 'openPageView').map((o) => o.body.runtimeBindingId).every((b) => b === BINDING || b === 'binding-2')).toBe(true)
         } finally { binding = BINDING; await harness.closeTarget(target) }
+    })
+
+    const gate = () => { let release!: () => void; inputGate = { promise: new Promise<void>((r) => { release = r }), release: () => release() } }
+    const typeText = (target: string, data: string) => harness.evaluate(target,
+        `document.getElementById('pageInput').dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertText', data: ${JSON.stringify(data)}, cancelable: true }))`)
+
+    it('local console: an authentication failure during the bootstrap is neither "unsupported" nor a broad fallback', async () => {
+        ops.length = 0; bootstrapError = 'UNAUTHORIZED'
+        const target = await harness.openFrontTab(`${origin}/console?agentSessionId=${SESSION}&lang=en`)
+        try {
+            await until(() => harness.evaluate(target, 'window.__abpPageView'), (v) => v === 1)
+            await hand(target, bootstrap('denied'))
+            await until(() => ops.some((o) => o.op === 'pageViewInfo'), Boolean)
+            await wait(target, 250)
+            // "Unsupported" would make the host fall back to the broad capability; an auth failure must not.
+            expect(await harness.evaluate(target, 'window.__abpPageViewUnsupported')).not.toBe(1)
+            expect(await harness.evaluate(target, 'window.__abpPageViewBinding')).toBeNull()
+            expect(ops.filter((o) => o.op === 'listTasks')).toHaveLength(0)
+        } finally { bootstrapError = null; await harness.closeTarget(target) }
+    })
+
+    it('local console: a renewal waits for the input under way, then replaces the view', async () => {
+        const { target } = await controlLocal()
+        ops.length = 0
+        gate()
+        try {
+            await typeText(target, 'x')
+            const first = await until(() => ops.find((o) => o.op === 'dispatchPageInput'), Boolean)
+            await hand(target, scoped('renewed-busy'))
+            await wait(target, 300)
+            // The pending input keeps the authority it was sent with; the renewal is not taken meanwhile.
+            expect(ops.filter((o) => o.bearer.endsWith('.sig-renewed-busy'))).toHaveLength(0)
+            inputGate!.release(); inputGate = undefined
+            await wait(target, 200)
+            await hand(target, scoped('renewed-busy'))
+            await until(() => ops.find((o) => o.op === 'openPageView' && o.bearer.endsWith('.sig-renewed-busy')), Boolean)
+            expect(inputs()).toHaveLength(1)
+            expect(ops.filter((o) => o.op === 'closePageView').map((o) => o.body.viewId)).toContain(first!.body.viewId)
+        } finally { inputGate?.release(); inputGate = undefined; await harness.closeTarget(target) }
+    })
+
+    it('local console: a composition started on one task never commits into another task', async () => {
+        secondTask = true
+        const { target } = await controlLocal()
+        ops.length = 0
+        try {
+            await harness.evaluate(target, `document.getElementById('pageInput').dispatchEvent(new CompositionEvent('compositionstart'))`)
+            await until(() => harness.evaluate(target, `!!document.querySelector('#tasks button[data-task="task-2"]')`), Boolean, 20_000)
+            await harness.evaluate(target, `document.querySelector('#tasks button[data-task="task-2"]').click()`)
+            await until(() => ops.find((o) => o.op === 'openPageView' && o.body.taskId === 'task-2'), Boolean)
+            await until(() => harness.evaluate(target, `document.getElementById('screenHintText').textContent`), (s) => s === 'You have control. Input reaches the page.', 10_000)
+            await harness.evaluate(target, `document.getElementById('pageInput').dispatchEvent(new CompositionEvent('compositionend', { data: '이전 작업' }))`)
+            await wait(target, 300)
+            expect(inputs()).toHaveLength(0)
+        } finally { secondTask = false; await harness.closeTarget(target) }
+    })
+
+    it('local console: an input whose answer is lost keeps Continue disabled', async () => {
+        const { target } = await controlLocal()
+        ops.length = 0
+        try {
+            dropInput = true
+            await typeText(target, 'x')
+            await until(() => ops.some((o) => o.op === 'getPageFrame' && o.body.statusOnly), Boolean)
+            expect(await harness.evaluate(target, `document.getElementById('resume').disabled`)).toBe(true)
+            await harness.evaluate(target, `document.getElementById('resume').click()`)
+            await wait(target, 300)
+            expect(ops.filter((o) => o.op === 'resume')).toHaveLength(0)
+        } finally { dropInput = false; await harness.closeTarget(target) }
+    })
+
+    it('local console: a late failed input of the previous task does not block the new view', async () => {
+        secondTask = true
+        const { target } = await controlLocal()
+        ops.length = 0
+        gate()
+        try {
+            await typeText(target, 'old')
+            const old = await until(() => ops.find((o) => o.op === 'dispatchPageInput'), Boolean)
+            await until(() => harness.evaluate(target, `!!document.querySelector('#tasks button[data-task="task-2"]')`), Boolean, 20_000)
+            await harness.evaluate(target, `document.querySelector('#tasks button[data-task="task-2"]').click()`)
+            await until(() => ops.find((o) => o.op === 'openPageView' && o.body.taskId === 'task-2'), Boolean)
+            dropInput = true; inputGate!.release(); inputGate = undefined
+            await wait(target, 400); dropInput = false
+            await until(() => harness.evaluate(target, `document.getElementById('screenHintText').textContent`), (s) => s === 'You have control. Input reaches the page.', 10_000)
+            await typeText(target, 'new')
+            const sent = await until(() => inputs().filter((o) => o.body.event.text === 'new'), (a) => a.length === 1)
+            expect(sent[0]!.body.viewId).not.toBe(old!.body.viewId)
+        } finally { inputGate?.release(); inputGate = undefined; dropInput = false; secondTask = false; await harness.closeTarget(target) }
+    })
+
+    it('local console: Spaces opens a separate management document that never holds the page capability', async () => {
+        ops.length = 0; leaseOwner = { kind: 'none' }
+        const target = await openLocal()
+        try {
+            await harness.evaluate(target, `document.getElementById('spaceToggle').click()`)
+            await until(() => harness.evaluate(target, 'location.search'), (s) => s.includes('spaces=1'))
+            await until(() => harness.evaluate(target, 'document.readyState'), (s) => s === 'complete')
+            expect(await harness.evaluate(target, 'window.__abpPageView')).toBeUndefined()
+            await hand(target, capability('management', { operations: ['listTasks', 'listSpaces', 'closeSpace', 'setSpaceQuota'] }))
+            await until(() => ops.find((o) => o.op === 'listSpaces'), Boolean)
+            expect(ops.filter((o) => o.op === 'listSpaces').every((o) => o.bearer.endsWith('.sig-management'))).toBe(true)
+            await harness.evaluate(target, `document.getElementById('consoleBack').click()`)
+            await until(() => harness.evaluate(target, 'location.search'), (s) => s.includes(`agentSessionId=${SESSION}`))
+            await until(() => harness.evaluate(target, 'window.__abpPageView'), (v) => v === 1)
+        } finally { await harness.closeTarget(target) }
     })
 
     it('local console: a capability without the page scope keeps the Chrome window guidance and the spaces', async () => {
