@@ -379,9 +379,18 @@ describe('예약 자동화 커넥터 실제 HTTP 경로 (#3556)', () => {
     const fixture = setup({ claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } } })
     const payload = fixture.decryptPayload(cacheRecord(), new Uint8Array(32))
     fixture.input.decryptPayload = () => ({ ...payload, schedule })
-    await expect(runServerAutomationTick(fixture.input)).resolves.toEqual([{ automationId: 'automation-1', outcome: 'WOKE' }])
+    // The tick snapshot (input.now) is older than the start when claim/start replies are slow.
+    const startedAt = fixture.now + 65_000
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(startedAt)
+    try {
+      await expect(runServerAutomationTick(fixture.input)).resolves.toEqual([{ automationId: 'automation-1', outcome: 'WOKE' }])
+    } finally {
+      vi.useRealTimers()
+    }
     const prompt = fixture.spawnSession.mock.calls[0]![0].initialPrompt
-    const expected = buildScheduledRunPrompt('prompt', { at: fixture.now, timeZone: zone }).split('\n')
+    expect(prompt).not.toContain(buildScheduledRunPrompt('prompt', { at: fixture.now, timeZone: zone }).split('\n').find(line => line.startsWith('[CURRENT RUN TIME:')))
+    const expected = buildScheduledRunPrompt('prompt', { at: startedAt, timeZone: zone }).split('\n')
     const runTimeLine = expected[expected.indexOf('Original task:') - 1]!
     expect(runTimeLine).toMatch(new RegExp(`^\\[CURRENT RUN TIME: .+ \\(${zone}, UTC[+-]\\d{2}:\\d{2}\\)\\]$`))
     expect(prompt).toContain(`\n${runTimeLine}\nOriginal task:\n\nprompt`)
