@@ -4,7 +4,7 @@ import { automationExecutionExitReceiptSchema, AutomationExecutionSessionError }
 
 /** Display projection only. Reading it never appends messages to the manual provider input. */
 export async function listAutomationExecutionPage(tx: Prisma.TransactionClient, accountId: string,
-  displaySessionId: string, input: { limit: number; cursor: string | null }) {
+  displaySessionId: string, input: { limit: number; cursor: string | null; projectId?: string }) {
   if (isAutomationExecutionSessionId(displaySessionId)
     || !await tx.session.findFirst({ where: { id: displaySessionId, accountId }, select: { id: true } })) return null;
   let after: { createdAt: Date; id: string } | null = null;
@@ -18,7 +18,8 @@ export async function listAutomationExecutionPage(tx: Prisma.TransactionClient, 
   }
   const rows = await tx.automationRun.findMany({
     where: { displaySessionId, machineAccountId: accountId, executionCreateBodyHash: { not: null },
-      automation: { project: { OR: [{ accountId }, { members: { some: { accountId, status: 'accepted' } } }] } },
+      automation: { ...(input.projectId ? { projectId: input.projectId } : {}),
+        project: { OR: [{ accountId }, { members: { some: { accountId, status: 'accepted' } } }] } },
       ...(after ? { OR: [{ createdAt: { lt: after.createdAt } }, { createdAt: after.createdAt, id: { lt: after.id } }] } : {}),
     },
     select: { id: true, automationId: true, generation: true, displaySessionId: true, sessionId: true,
@@ -43,14 +44,16 @@ export async function listAutomationExecutionPage(tx: Prisma.TransactionClient, 
 
 /** The server selects opaque boundary receipts, never decrypting or inferring a model answer. */
 export async function readAutomationExecutionEvidencePage(tx: Prisma.TransactionClient, accountId: string,
-  displaySessionId: string, runId: string, input: { limit: number; after_seq: number; through_seq?: number }) {
+  displaySessionId: string, runId: string, input: { limit: number; after_seq: number; through_seq?: number; projectId?: string }) {
   if (isAutomationExecutionSessionId(displaySessionId)
     || !await tx.session.findFirst({ where: { id: displaySessionId, accountId }, select: { id: true } })) return null;
   const run = await tx.automationRun.findFirst({
     where: { id: runId, displaySessionId, machineAccountId: accountId, executionCreateBodyHash: { not: null },
       executionSeedMetadata: { not: null },
-      automation: { project: { OR: [{ accountId }, { members: { some: { accountId, status: 'accepted' } } }] } } },
-    select: { id: true, automationId: true, generation: true, sessionId: true, executionSeedMetadata: true },
+      automation: { ...(input.projectId ? { projectId: input.projectId } : {}),
+        project: { OR: [{ accountId }, { members: { some: { accountId, status: 'accepted' } } }] } } },
+    select: { id: true, automationId: true, generation: true, sessionId: true, executionSeedMetadata: true,
+      automation: { select: { projectId: true } } },
   });
   if (!run || run.sessionId !== automationExecutionSessionId(runId)) return null;
   const session = await tx.session.findFirst({ where: { id: run.sessionId, accountId },
@@ -67,7 +70,8 @@ export async function readAutomationExecutionEvidencePage(tx: Prisma.Transaction
     where: { sessionId: run.sessionId, localId: automationExecutionSeedLocalId(runId), seq: { lte: throughSeq } },
     select: { id: true, seq: true, localId: true, content: true, createdAt: true },
   }) : null;
-  return { runId, automationId: run.automationId, generation: run.generation, displaySessionId, executionSessionId: run.sessionId,
+  return { runId, automationId: run.automationId, projectId: run.automation.projectId,
+    generation: run.generation, displaySessionId, executionSessionId: run.sessionId,
     seedManifestCiphertext: run.executionSeedMetadata,
     seedMessage: seedMessage ? { ...seedMessage, createdAt: seedMessage.createdAt.getTime() } : null,
     dataEncryptionKey: session.dataEncryptionKey ? Buffer.from(session.dataEncryptionKey).toString('base64') : null,

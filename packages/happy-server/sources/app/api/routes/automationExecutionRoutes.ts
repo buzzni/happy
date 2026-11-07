@@ -68,6 +68,7 @@ export function automationExecutionRoutes(app: Fastify) {
     preHandler: app.authenticate,
     schema: { params: z.strictObject({ displaySessionId: z.string().min(1).max(200), runId: z.string().regex(/^[A-Za-z0-9_-]{1,160}$/) }),
       querystring: z.strictObject({ limit: z.coerce.number().int().min(1).max(100).default(50),
+        projectId: z.string().min(1).max(200).optional(),
         after_seq: z.coerce.number().int().min(0).max(2_147_483_647).default(0),
         through_seq: z.coerce.number().int().min(0).max(2_147_483_647).optional() }) },
   }, async (request, reply) => {
@@ -90,6 +91,7 @@ export function automationExecutionRoutes(app: Fastify) {
     preHandler: app.authenticate,
     schema: { params: z.strictObject({ displaySessionId: z.string().min(1).max(200) }),
       querystring: z.strictObject({ limit: z.coerce.number().int().min(1).max(100).default(20),
+        projectId: z.string().min(1).max(200).optional(),
         cursor: z.string().min(1).max(1024).nullable().default(null) }) },
   }, async (request, reply) => {
     if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);

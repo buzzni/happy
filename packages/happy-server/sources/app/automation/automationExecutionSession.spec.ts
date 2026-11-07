@@ -430,6 +430,30 @@ it('reads run records from the original display chat with stable pagination and 
   } finally { await app.close(); }
 });
 
+it('binds display history and every evidence page to the requested project even for one shared Happy account', async () => {
+  await register(); await run('r2'); await register('r2');
+  await client.project.create({ data: { id: 'other-project', accountId: 'owner', name: 'Other' } });
+  const original = await client.automation.findUniqueOrThrow({ where: { id: 'a1' } });
+  await client.automation.create({ data: { ...original, id: 'a2', projectId: 'other-project', lastExecutionRunId: null } });
+  await client.automationRun.update({ where: { id: 'r2' }, data: { automationId: 'a2' } });
+  const app = await api();
+  try {
+    const get = (path: string) => app.inject({ method: 'GET', url: path, headers: { authorization: `Bearer ${bearer}` } });
+    const first = await get('/v1/sessions/manual/automation-runs?projectId=chat%3Ac1&limit=1');
+    expect(first.statusCode, first.body).toBe(200);
+    expect(first.json()).toMatchObject({ runs: [{ id: 'r1', projectId: 'chat:c1' }], nextCursor: null });
+    expect(first.body).not.toContain('r2');
+    const other = await get('/v1/sessions/manual/automation-runs?projectId=other-project');
+    expect(other.statusCode, other.body).toBe(200);
+    expect(other.json()).toMatchObject({ runs: [{ id: 'r2', projectId: 'other-project' }] });
+    const evidence = await get('/v1/sessions/manual/automation-runs/r1/evidence?projectId=chat%3Ac1');
+    expect(evidence.statusCode, evidence.body).toBe(200);
+    expect(evidence.json()).toMatchObject({ runId: 'r1', projectId: 'chat:c1' });
+    expect((await get('/v1/sessions/manual/automation-runs/r2/evidence?projectId=chat%3Ac1')).statusCode).toBe(404);
+    expect((await get('/v1/sessions/manual/automation-runs/r1/evidence?projectId=other-project')).statusCode).toBe(404);
+  } finally { await app.close(); }
+});
+
 it('projects persisted holds on the original display run without writing into its manual conversation', async () => {
   await register();
   const manual = await client.session.findUniqueOrThrow({ where: { id: 'manual' } }), messages = await client.sessionMessage.findMany();
