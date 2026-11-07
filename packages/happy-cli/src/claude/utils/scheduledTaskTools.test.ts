@@ -302,7 +302,7 @@ describe('isolated scheduled-task management', () => {
     await expect(f.tools.execute({ operation: 'set_paused', automationId: 'reservation', expectedRevision: 3, paused: false })).rejects.toThrow('SCHEDULED_TASK_RUNNER_UNSUPPORTED');
     expect(f.rows[0]).toMatchObject({ paused: true, revision: 3, payloadCiphertext: cipher });
     expect(await f.tools.execute({ operation: 'set_paused', automationId: 'reservation', expectedRevision: 3, paused: false })).toMatchObject({ paused: false, revision: 4 });
-    expect(f.ensureExecutionSupported).toHaveBeenLastCalledWith(6);
+    expect(f.ensureExecutionSupported).toHaveBeenLastCalledWith(6, expect.objectContaining({ id: 'reservation', payloadVersion: 6, machineKeyEnvelope: f.rows[0].machineKeyEnvelope }));
     expect(f.rows[0].payloadCiphertext).toBe(cipher);
   });
   it('refuses cross-conversation resume and foreign scope without a mutation', async () => {
@@ -351,26 +351,35 @@ it('rejects signed definitions sealed for another machine or project before a pa
     expect(f.request.mock.calls.some(([r]) => r.operation === 'set_paused')).toBe(false);
   }
 })
-it('resumes signed v6 on strict PCs only with exact isolation capability and the current machine reader key', async () => {
-  for (const variant of ['ready', 'missing-capability', 'wrong-key'] as const) {
-    const f = fixture(true); await isolated(f, true); f.rows[0].paused = true;
-    const metadataKey = nacl.randomBytes(32);
-    runtime.credentials.mockReturnValue(null);
+it.each(['ready', 'missing-capability', 'wrong-key', 'anonymous-strict', 'anonymous-required',
+  'untrusted-compat', 'machine-sender', 'viewer-strict', 'viewer-compatible', 'viewer-missing-key'] as const)(
+  'uses the daemon sealing policy before any v6 resume mutation (%s)', async variant => {
+    const viewerMode = variant.startsWith('viewer-'), anonymous = variant.startsWith('anonymous-') || viewerMode;
+    const sender = variant === 'untrusted-compat' ? nacl.box.keyPair() : variant === 'machine-sender' ? machine : viewer;
+    const f = fixture(true); await isolated(f, !anonymous, {}, sender); f.rows[0].paused = true;
+    const metadataKey = nacl.randomBytes(32), legacySecret = nacl.randomBytes(32);
+    runtime.credentials.mockReturnValue(viewerMode ? { token: 'fixture-token', secret: legacySecret, contentKeyPair: viewer } : null);
     runtime.machineCredentials.mockResolvedValue({ token: 'fixture-token', encryption: { type: 'dataKey', publicKey: viewer.publicKey, machineKey: metadataKey } });
-    runtime.key.mockReturnValue({ ...machine, registeredKeyVersion: 1 }); runtime.configuration.machineControl = 'strict';
+    runtime.key.mockReturnValue(variant === 'viewer-missing-key' ? undefined : { ...machine, registeredKeyVersion: 1 });
+    runtime.configuration.machineControl = ['untrusted-compat', 'machine-sender', 'viewer-compatible', 'viewer-missing-key', 'anonymous-required'].includes(variant) ? 'legacy' : 'strict';
     vi.stubEnv('HAPPY_APLUS_MCP_CONFIG_URL', 'http://studio.fixture/api/me/mcp-config');
     vi.stubEnv('HAPPY_APLUS_MCP_CALLER_GRANT', Buffer.from(JSON.stringify({ personalChatId: 'chat', projectId: null })).toString('base64url') + '.fixture-signature');
     vi.stubGlobal('fetch', vi.fn(async (url, init) => {
       if (String(url).endsWith('/automation-reader-key')) return Response.json({ machineId: 'pc', publicKey: Buffer.from(machine.publicKey).toString('base64'), keyVersion: variant === 'wrong-key' ? 2 : 1 });
-      if (String(url).includes('/v1/machines/')) return Response.json({ machine: { id: 'pc', metadata: Buffer.from(encryptWithDataKey({ automationSupport: {
-        conversation: true, serverBacked: true, contextIsolationVersion: variant === 'missing-capability' ? 0 : 1, authenticatedEnvelopes: { required: true },
-      } }, metadataKey)).toString('base64') } });
+      if (String(url).includes('/v1/machines/')) {
+        const metadata = { automationSupport: { conversation: true, serverBacked: true,
+          contextIsolationVersion: variant === 'missing-capability' ? 0 : 1,
+          authenticatedEnvelopes: { required: ['ready', 'wrong-key', 'missing-capability', 'anonymous-required'].includes(variant) } } };
+        return Response.json({ machine: { id: 'pc', metadata: Buffer.from(viewerMode ? encryptLegacy(metadata, legacySecret) : encryptWithDataKey(metadata, metadataKey)).toString('base64') } });
+      }
       expect(init.headers['X-Saycode-Scheduled-Task-Payloads']).toBe('4,6');
       return Response.json(await f.request(JSON.parse(init.body).request));
     }));
     const result = runScheduledTaskTool({ operation: 'set_paused', automationId: 'reservation', expectedRevision: 2, paused: false }, { sessionId: 'session', machineId: 'pc', directory: '/work/chat' });
-    if (variant === 'ready') expect(await result).toMatchObject({ paused: false, revision: 3 });
-    else await expect(result).rejects.toThrow(variant === 'wrong-key' ? 'SCHEDULED_TASK_MACHINE_KEY_MISMATCH' : 'SCHEDULED_TASK_RUNNER_UNSUPPORTED');
-    expect(f.request.mock.calls.filter(([r]) => r.operation === 'set_paused')).toHaveLength(variant === 'ready' ? 1 : 0);
-  }
-})
+    const success = variant === 'ready' || variant === 'viewer-compatible';
+    if (success) expect(await result).toMatchObject({ paused: false, revision: 3 });
+    else await expect(result).rejects.toThrow(variant === 'wrong-key' ? 'SCHEDULED_TASK_MACHINE_KEY_MISMATCH'
+      : variant === 'missing-capability' ? 'SCHEDULED_TASK_RUNNER_UNSUPPORTED' : 'SCHEDULED_TASK_SEALING_UNSUPPORTED');
+    expect(f.request.mock.calls.filter(([r]) => r.operation === 'set_paused')).toHaveLength(success ? 1 : 0);
+    if (!success) expect(f.rows[0]).toMatchObject({ paused: true, revision: 2 });
+  })

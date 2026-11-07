@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import nacl from 'tweetnacl';
 import * as z from 'zod';
-import { automationPublicSchema, automationTargetSchema, decryptAutomationPayload, encryptAutomationPayload, openAutomationPayloadForMachine,
+import { automationTargetSchema, decryptAutomationPayload, encryptAutomationPayload, openAutomationPayloadForMachine,
   scheduledManagementAutomationSchema, scheduledTaskToolRequestSchema, type AutomationCryptoAdapter, type AutomationPublic, type AutomationPayload, type ScheduledManagementRequest } from '@slopus/happy-wire';
 import { readLocalHappyAgentCredentials } from '@/resume/localHappyAgentAuth';
 import { configuration } from '@/configuration';
@@ -10,6 +10,7 @@ import { decodeBase64, decryptLegacy, decryptWithDataKey } from '@/api/encryptio
 import { refreshMcpCallerGrantIfExpiring } from '@/aplus/refreshMcpCallerGrant';
 import { readCredentials } from '@/persistence';
 import { readMachineAutomationKey } from '@/daemon/automations/machineAutomationKey';
+import { judgePayload } from '@/daemon/automations/payloadTrust';
 
 export { scheduledTaskToolRequestSchema } from '@slopus/happy-wire';
 const crypto: AutomationCryptoAdapter = {
@@ -26,11 +27,11 @@ export function createScheduledTaskTools(options: {
   projectId: string; sessionId: string; machineId: string; directory: string;
   viewerKeyPair?: nacl.BoxKeyPair; viewerPublicKey?: Uint8Array; machineKey?: { publicKey: Uint8Array; secretKey: Uint8Array; registeredKeyVersion: number };
   request(input: ScheduledManagementRequest): Promise<unknown>;
-  ensureExecutionSupported(payloadVersion?: 4 | 6): Promise<void>;
+  ensureExecutionSupported(payloadVersion?: 4 | 6, row?: AutomationPublic): Promise<void>;
 }) {
   const viewerPublicKey = options.viewerKeyPair?.publicKey ?? options.viewerPublicKey;
   if (!viewerPublicKey || (!options.viewerKeyPair && !options.machineKey)) throw new Error('SCHEDULED_TASK_CREDENTIALS_REQUIRED');
-  const responseRow = options.machineKey ? scheduledManagementAutomationSchema : automationPublicSchema;
+  const responseRow = options.machineKey ? scheduledManagementAutomationSchema : scheduledManagementAutomationSchema.partial({ machineKeyEnvelope: true });
   const rowResponse = z.object({ automation: responseRow.nullable() });
   function verifyMachine(target: z.infer<typeof automationTargetSchema>) {
     if (target.machineId !== options.machineId) throw new Error('SCHEDULED_TASK_SCOPE_MISMATCH');
@@ -94,7 +95,7 @@ export function createScheduledTaskTools(options: {
     if (input.operation === 'set_paused') {
       const before = await read(input.automationId);
       if (!input.paused) {
-        if (before.payloadVersion === 6) await options.ensureExecutionSupported(6);
+        if (before.payloadVersion === 6) await options.ensureExecutionSupported(6, before);
         else await options.ensureExecutionSupported();
       }
       if (before.revision !== input.expectedRevision) throw new Error('REVISION_CONFLICT');
@@ -204,7 +205,7 @@ export async function runScheduledTaskTool(raw: unknown, session: { sessionId: s
   };
   const tools = createScheduledTaskTools({ projectId: scope, sessionId: session.sessionId, directory: session.directory, machineId,
     ...(credentials ? { viewerKeyPair: credentials.contentKeyPair } : { viewerPublicKey: encryption!.publicKey, machineKey: machineKey! }),
-    ensureExecutionSupported: async (payloadVersion = 4) => {
+    ensureExecutionSupported: async (payloadVersion = 4, row) => {
       if (payloadVersion === 4 && configuration.machineControl === 'strict') throw new Error('SCHEDULED_TASK_SEALING_UNSUPPORTED');
       const response = await fetch(`${configuration.serverUrl}/v1/machines/${encodeURIComponent(machineId)}`, {
         headers: { Authorization: `Bearer ${token}` }, redirect: 'error', signal: AbortSignal.timeout(10000) });
@@ -215,13 +216,31 @@ export async function runScheduledTaskTool(raw: unknown, session: { sessionId: s
       if (metadata?.automationSupport?.conversation !== true || metadata?.automationSupport?.serverBacked !== true) throw new Error('SCHEDULED_TASK_RUNNER_UNSUPPORTED');
       if (payloadVersion === 6 && metadata.automationSupport.contextIsolationVersion !== 1) throw new Error('SCHEDULED_TASK_RUNNER_UNSUPPORTED');
       if (payloadVersion === 4 && metadata.automationSupport.authenticatedEnvelopes?.required) throw new Error('SCHEDULED_TASK_SEALING_UNSUPPORTED');
-      if (machineKey) {
+      const executionKey = machineKey ?? (payloadVersion === 6 ? readMachineAutomationKey(configuration.automationKeyFile) : undefined);
+      if (payloadVersion === 6 && (!executionKey || executionKey.registeredKeyVersion < 1)) throw new Error('SCHEDULED_TASK_SEALING_UNSUPPORTED');
+      if (executionKey) {
         const response = await fetch(`${configuration.serverUrl}/v1/machines/${encodeURIComponent(machineId)}/automation-reader-key`, {
           headers: { Authorization: `Bearer ${token}` }, redirect: 'error', signal: AbortSignal.timeout(10000) });
         if (!response.ok) throw new Error('SCHEDULED_TASK_MACHINE_KEY_UNAVAILABLE');
         const key = z.object({ machineId: z.string(), publicKey: z.string(), keyVersion: z.number().int().positive() }).parse(await response.json());
-        if (key.machineId !== machineId || key.publicKey !== crypto.encodeBase64(machineKey.publicKey)
-          || key.keyVersion !== machineKey.registeredKeyVersion) throw new Error('SCHEDULED_TASK_MACHINE_KEY_MISMATCH');
+        if (key.machineId !== machineId || key.publicKey !== crypto.encodeBase64(executionKey.publicKey)
+          || key.keyVersion !== executionKey.registeredKeyVersion) throw new Error('SCHEDULED_TASK_MACHINE_KEY_MISMATCH');
+      }
+      if (payloadVersion === 6) {
+        const definition = scheduledManagementAutomationSchema.safeParse(row);
+        if (!definition.success || definition.data.payloadVersion !== 6) throw new Error('SCHEDULED_TASK_SEALING_UNSUPPORTED');
+        const target = automationTargetSchema.parse(await request({ operation: 'read_target' }));
+        if (target.machineId !== machineId || target.machinePublicKey !== crypto.encodeBase64(executionKey!.publicKey)
+          || target.machineKeyVersion !== executionKey!.registeredKeyVersion || definition.data.machineKeyVersion !== target.machineKeyVersion
+          || definition.data.machineAccountId !== target.machineAccountId) throw new Error('SCHEDULED_TASK_MACHINE_KEY_MISMATCH');
+        // Use the daemon's policy, including compat's rejection of signed but untrusted senders.
+        // A viewer copy cannot establish the machine envelope's authentication.
+        const verdict = judgePayload({ trust: {
+          mode: configuration.machineControl === 'strict' || metadata.automationSupport.authenticatedEnvelopes?.required ? 'strict' : 'compat',
+          customerPublicKey: encryption?.publicKey ?? null, machineAutomationPublicKey: executionKey!.publicKey,
+        }, opening: openAutomationPayloadForMachine({ ...definition.data, recipientSecretKey: executionKey!.secretKey, crypto }),
+        contextMatches: payload => payload.seal?.machineId === machineId && payload.seal.projectId === scope });
+        if (!verdict.run) throw new Error('SCHEDULED_TASK_SEALING_UNSUPPORTED');
       }
     },
     request,
