@@ -23,8 +23,8 @@ async function until<T>(fn: () => T | Promise<T>, ok: (value: T) => boolean, tim
     return value
 }
 const bootstrap = (tag: string) => capability(tag, { operations: ['pageViewInfo'] })
-const scoped = (tag: string) => capability(tag, { operations: ['listTasks', 'getTask', 'takeOver', 'releaseControl', 'resume', 'cancel', 'approve', 'subscribe',
-    'openPageView', 'getPageFrame', 'dispatchPageInput', 'closePageView'], pageViewScope: { schemaVersion: 1, agentSessionId: SESSION, runtimeBindingId: BINDING } })
+const scoped = (tag: string, runtimeBindingId = BINDING) => capability(tag, { operations: ['listTasks', 'getTask', 'takeOver', 'releaseControl', 'resume', 'cancel', 'approve', 'subscribe',
+    'openPageView', 'getPageFrame', 'dispatchPageInput', 'closePageView'], pageViewScope: { schemaVersion: 1, agentSessionId: SESSION, runtimeBindingId } })
 
 describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Runtime)', () => {
     let chrome: LaunchedChrome
@@ -43,6 +43,11 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
     let dropInput = false, inputDelayMs = 0
     /** A second open task of this conversation, for switching while input is under way. */
     let secondTask = false
+    /** The Runtime's current binding (a relaunched browser gets a new one) and the capabilities that have run out. */
+    let binding = BINDING
+    const expired = new Set<string>()
+    /** As the Runtime does, a view lives only as long as the capability that opened it, and only under its binding. */
+    const views = new Map<string, { bearer: string; binding: string }>()
     const task = (taskId = 'task-1') => ({ taskId, agentSessionId: SESSION, status: 'paused', pauseReason: 'user-control', stateVersion: 3, tabs: ['tab-1'],
         uncertainActions: [], cancelRequested: false, updatedAtMs: Date.now(), tabLeases: [{ tabId: 'tab-1', leaseEpoch: 4, owner: leaseOwner }] })
 
@@ -71,12 +76,22 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
                     return
                 }
                 if (m[1] === 'dispatchPageInput' && dropInput) { req.socket.destroy(); return }
+                const view = views.get(String(body.viewId))
+                const refused = m[1] === 'openPageView' && body.runtimeBindingId !== binding ? 'SCOPE_DENIED'
+                    : ['getPageFrame', 'dispatchPageInput'].includes(m[1]) && view && (expired.has(view.bearer) || view.binding !== binding) ? 'UNAUTHORIZED' : null
+                if (refused) {
+                    res.writeHead(403, { 'content-type': 'application/json' })
+                    res.end(JSON.stringify({ ok: false, error: { code: refused, message: 'refused' } }))
+                    return
+                }
                 if (m[1] === 'getPageFrame' && !body.statusOnly && frameError) {
                     res.writeHead(403, { 'content-type': 'application/json' })
                     res.end(JSON.stringify({ ok: false, error: { code: frameError, message: 'refused' } }))
                     return
                 }
-                const result = m[1] === 'pageViewInfo' ? { schemaVersion: 1, supported: true, input: true, runtimeBindingId: BINDING }
+                const bearer = ops[ops.length - 1]!.bearer
+                if (m[1] === 'openPageView') views.set('view-' + ops.length, { bearer, binding: body.runtimeBindingId })
+                const result = m[1] === 'pageViewInfo' ? { schemaVersion: 1, supported: true, input: true, runtimeBindingId: binding }
                     : m[1] === 'listTasks' ? { tasks: secondTask ? [task(), task('task-2')] : [task()] }
                         : m[1] === 'getTask' ? task(body.taskId)
                             : m[1] === 'openPageView' ? { schemaVersion: 1, viewId: 'view-' + ops.length, expiresAtMs: Date.now() + 600_000, input: true }
@@ -266,6 +281,11 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
             frameError = null
             const opened = ops.filter((o) => o.op === 'openPageView').length
             await harness.evaluate(target, `document.getElementById('pageRetry').click()`)
+            // Reconnect goes back to the host: a new bootstrap, then the scoped capability, before the view reopens.
+            await until(() => harness.evaluate(target, 'window.__abpPageViewBinding'), (v) => v === null, 5_000)
+            await hand(target, bootstrap('retry-boot'))
+            await until(() => harness.evaluate(target, 'window.__abpPageViewBinding'), (v) => v === BINDING, 5_000)
+            await hand(target, scoped('retry-scoped'))
             await until(() => ops.filter((o) => o.op === 'openPageView').length, (n) => n > opened, 5_000)
             await until(() => harness.evaluate(target, `document.getElementById('screenHintText').textContent`), (s) => s === 'Observing the page. Take over to use it.', 5_000)
             expect(await harness.evaluate(target, `!!document.getElementById('pageRetry').getClientRects().length`)).toBe(false)
@@ -337,6 +357,39 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
             await wait(target, 400)
             expect(inputs().filter((o) => o.body.viewId === viewId)).toHaveLength(sent)
         } finally { await harness.closeTarget(target) }
+    })
+
+    it('local console: a renewed capability reopens the view, which would otherwise end with the old one', async () => {
+        ops.length = 0; leaseOwner = { kind: 'none' }
+        const target = await openLocal()
+        try {
+            await hand(target, scoped('local-renewed'))
+            await until(() => ops.find((o) => o.op === 'openPageView' && o.bearer.endsWith('.sig-local-renewed')), Boolean, 5_000)
+            expired.add(ops.find((o) => o.op === 'openPageView')!.bearer)
+            const after = ops.length
+            await wait(target, 1500)
+            expect(ops.slice(after).filter((o) => o.op === 'getPageFrame' && !o.body.statusOnly).every((o) => o.bearer.endsWith('.sig-local-renewed'))).toBe(true)
+            expect(await harness.evaluate(target, `document.getElementById('screenHintText').textContent`)).toBe('Observing the page. Take over to use it.')
+        } finally { expired.clear(); await harness.closeTarget(target) }
+    })
+
+    it('local console: Reconnect learns the runtime binding again after the browser was relaunched', async () => {
+        ops.length = 0; leaseOwner = { kind: 'none' }
+        const target = await openLocal()
+        try {
+            binding = 'binding-2'
+            await until(() => harness.evaluate(target, `!!document.getElementById('pageRetry').getClientRects().length`), Boolean, 5_000)
+            await harness.evaluate(target, `document.getElementById('pageRetry').click()`)
+            // Back to the host for a new bootstrap: the learned binding is gone.
+            await until(() => harness.evaluate(target, 'window.__abpPageViewBinding'), (v) => v === null, 5_000)
+            await hand(target, bootstrap('relaunch-boot'))
+            await until(() => harness.evaluate(target, 'window.__abpPageViewBinding'), (v) => v === 'binding-2', 5_000)
+            await hand(target, scoped('relaunch-scoped', 'binding-2'))
+            await until(() => ops.find((o) => o.op === 'openPageView' && o.body.runtimeBindingId === 'binding-2'), Boolean, 5_000)
+            await until(() => harness.evaluate(target, `document.getElementById('screenHintText').textContent`), (s) => s === 'Observing the page. Take over to use it.', 5_000)
+            // No view was opened with an empty or stale binding while the new one was being learned.
+            expect(ops.filter((o) => o.op === 'openPageView').map((o) => o.body.runtimeBindingId).every((b) => b === BINDING || b === 'binding-2')).toBe(true)
+        } finally { binding = BINDING; await harness.closeTarget(target) }
     })
 
     it('local console: a capability without the page scope keeps the Chrome window guidance and the spaces', async () => {

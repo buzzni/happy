@@ -434,7 +434,8 @@ function setCapability(token,expiresAtMs){var renewal=!!S.token;
  S.principalId=typeof payload.principalId==='string'?payload.principalId:'';S.viewerSessionId=typeof payload.viewerSessionId==='string'?payload.viewerSessionId:'';
  capPill(T.connected+(S.expiresAtMs?' · '+(LANG==='ko'?hhmm(S.expiresAtMs)+' '+T.until:T.until+' '+hhmm(S.expiresAtMs)):''),'on');
  $('capState').title='profile '+S.profileId;
- spaceCapabilityChanged(payload);S.pageScope=PAGE_VIEW&&payload.pageViewScope?payload.pageViewScope:null;pageMode();
+ // A view lives only as long as the capability that opened it: a renewal reopens it under the new one.
+ spaceCapabilityChanged(payload);S.pageScope=PAGE_VIEW&&payload.pageViewScope?payload.pageViewScope:null;pageMode();if(renewal&&S.pageScope)syncPage(true);
  scheduleRenewal();if(renewal&&S.screenOpen)openScreen();return true}
 function scheduleRenewal(){clearTimeout(S.renewTimer);if(!S.expiresAtMs)return;
  var wait=Math.max(0,S.expiresAtMs-RENEW_BEFORE_MS-Date.now());
@@ -730,7 +731,7 @@ function pageMode(){var on=!!S.pageScope;document.body.classList.toggle('page-vi
  var b=$('screenEmpty').querySelector('b'),span=$('screenEmpty').querySelector('span');b.textContent=on?PT.emptyTitle:T.screenEmptyTitle;span.textContent=on?PT.emptyBody:T.screenEmptyBody;
  if(!on){pageStatus(T.screenHint,false);if(pageViewer){++pageGen;pageKey='';void pageViewer.close().catch(function(){})}}else syncPage()}
 /** Opens the view of the shown task's tab when it changed (force: also when unchanged), closing the previous one first. */
-function syncPage(force){if(!pageViewer||!S.pageScope)return;var t=S.task,typed=$('tabId').value.trim();
+function syncPage(force){if(!pageViewer||!S.pageScope||!S.pageBinding)return;var t=S.task,typed=$('tabId').value.trim();
  var tab=t&&!finished(t)&&t.tabs&&t.tabs.length?(t.tabs.indexOf(typed)>=0?typed:t.tabs[0]):'';
  var key=tab?t.taskId+'|'+tab:'',v=pageViewer.view();
  if(!force&&key===pageKey&&(!key||v&&!v.closed))return;
@@ -745,7 +746,9 @@ if(PAGE_VIEW){
   render:function(){pageViewer.paint()},task:function(){return S.task},ended:function(){return !!S.task&&finished(S.task)},
   identity:function(){return {viewerSessionId:S.viewerSessionId,principalId:S.principalId}},busy:function(){return pageBusy},generation:function(){return pageGen},token:function(){return S.token}});
  setInterval(function(){pageViewer.checkStale();void pageViewer.poll(function(){return !!(S.token&&S.pageScope)},function(){var v=pageViewer.view();if(!v||v.closed){syncPage();return false}})},220);
- $('pageRetry').onclick=function(){if(pageViewer.inputBusy()||pageBusy)return;pageViewer.clearLost();syncPage(true)};
+ // Reconnect starts over from the bootstrap: a relaunched browser has a new binding, which only pageViewInfo tells.
+ $('pageRetry').onclick=function(){if(pageViewer.inputBusy()||pageBusy)return;pageViewer.clearLost();++pageGen;pageKey='';
+  void pageViewer.close().catch(function(){}).finally(function(){S.pageBinding='';window.__abpPageViewBinding=null;pageStatus(PT.connecting,false);askHost()})};
  document.addEventListener('visibilitychange',function(){pageViewer.clearQueue();if(document.hidden){++pageGen;pageKey='';void pageViewer.close().catch(function(){})}else syncPage(true)});
  window.addEventListener('pagehide',function(){++pageGen;pageViewer.clearQueue();void pageViewer.close().catch(function(){})})}
 // Reload, back navigation or a restored panel arrive without a fragment: ask the host now.
