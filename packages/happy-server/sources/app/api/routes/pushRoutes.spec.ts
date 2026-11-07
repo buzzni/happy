@@ -6,7 +6,8 @@ import type { Fastify } from '../types';
 const mocks = vi.hoisted(() => ({
     findSession: vi.fn(),
     findAutomationRun: vi.fn(),
-    dispatchSessionEventPush: vi.fn(),
+    dispatchSessionEventPush: vi.fn(async () => ({ status: 'sent', tokens: 1, sent: 1, failed: 0 })),
+    countPushOutcome: vi.fn(),
     emitEphemeral: vi.fn(),
     persistTurnReadySessionEvent: vi.fn(),
 }));
@@ -22,7 +23,10 @@ vi.mock('@/storage/db', () => ({
         },
     },
 }));
-vi.mock('@/app/push/pushDispatch', () => ({ dispatchSessionEventPush: mocks.dispatchSessionEventPush }));
+vi.mock('@/app/push/pushDispatch', () => ({
+    dispatchSessionEventPush: mocks.dispatchSessionEventPush,
+    countPushOutcome: mocks.countPushOutcome,
+}));
 vi.mock('@/app/events/persistSessionEvent', () => ({ persistTurnReadySessionEvent: mocks.persistTurnReadySessionEvent }));
 vi.mock('@/app/events/eventRouter', () => ({
     buildSessionEventEphemeral: vi.fn(() => ({ type: 'session-event' })),
@@ -144,5 +148,46 @@ describe('pushRoutes turn-ready event', () => {
         expect(response.statusCode).toBe(200);
         expect(mocks.emitEphemeral).toHaveBeenCalledOnce();
         expect(mocks.dispatchSessionEventPush).toHaveBeenCalledOnce();
+    });
+});
+
+describe('pushRoutes push outcome', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mocks.findSession.mockResolvedValue({ id: 'session-1' });
+        mocks.findAutomationRun.mockResolvedValue(null);
+        mocks.persistTurnReadySessionEvent.mockResolvedValue({ id: 'event-1', seq: 1 });
+    });
+
+    it('reports the dispatch outcome under push while keeping success', async () => {
+        const outcome = { status: 'partial', tokens: 2, sent: 1, failed: 1, reason: 'DeviceNotRegistered' };
+        mocks.dispatchSessionEventPush.mockResolvedValue(outcome);
+
+        const response = await sendDone(await makeApp());
+
+        expect(response.statusCode).toBe(200);
+        expect(response.json()).toEqual({ success: true, push: outcome });
+    });
+
+    it('reports a failed push without failing the request', async () => {
+        const outcome = { status: 'failed', tokens: 0, sent: 0, failed: 0, reason: 'db down' };
+        mocks.dispatchSessionEventPush.mockResolvedValue(outcome);
+
+        const response = await sendDone(await makeApp());
+
+        expect(response.statusCode).toBe(200);
+        expect(response.json()).toEqual({ success: true, push: outcome });
+    });
+
+    it('reports a SILENT automation completion as suppressed', async () => {
+        mocks.findAutomationRun.mockResolvedValue({ id: 'run-1' });
+
+        const response = await sendDone(await makeApp());
+
+        expect(response.json()).toEqual({
+            success: true,
+            push: { status: 'suppressed', tokens: 0, sent: 0, failed: 0, reason: 'silent-automation' },
+        });
+        expect(mocks.countPushOutcome).toHaveBeenCalledWith(expect.objectContaining({ status: 'suppressed', reason: 'silent-automation' }));
     });
 });

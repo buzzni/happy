@@ -7,6 +7,13 @@
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 const BATCH_SIZE = 100;
 
+/**
+ * One deadline for the whole send. `/v1/sessions/:id/push-event` awaits the
+ * result, so it must finish well inside the CLI's 15s request timeout instead
+ * of holding the request open on a hanging Expo call.
+ */
+const SEND_TIMEOUT_MS = 8_000;
+
 export interface PushMessage {
     to: string;
     title?: string;
@@ -24,12 +31,17 @@ export interface PushTicket {
     details?: { error?: string };
 }
 
-export async function sendPushNotifications(messages: PushMessage[]): Promise<PushTicket[]> {
+export async function sendPushNotifications(
+    messages: PushMessage[],
+    options: { timeoutMs?: number } = {}
+): Promise<PushTicket[]> {
     if (messages.length === 0) {
         return [];
     }
 
     const tickets: PushTicket[] = [];
+    // Shared across batches so a large fan-out cannot extend the total wait.
+    const signal = AbortSignal.timeout(options.timeoutMs ?? SEND_TIMEOUT_MS);
 
     for (let i = 0; i < messages.length; i += BATCH_SIZE) {
         const batch = messages.slice(i, i + BATCH_SIZE);
@@ -37,7 +49,8 @@ export async function sendPushNotifications(messages: PushMessage[]): Promise<Pu
             const response = await fetch(EXPO_PUSH_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(batch)
+                body: JSON.stringify(batch),
+                signal
             });
 
             if (!response.ok) {
@@ -53,7 +66,7 @@ export async function sendPushNotifications(messages: PushMessage[]): Promise<Pu
         } catch {
             tickets.push(...batch.map(() => ({
                 status: 'error' as const,
-                message: 'Network error'
+                message: signal.aborted ? 'Timeout' : 'Network error'
             })));
         }
     }
