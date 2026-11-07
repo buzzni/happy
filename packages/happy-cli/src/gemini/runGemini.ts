@@ -15,6 +15,7 @@ import { join, resolve } from 'node:path';
 import { ApiClient } from '@/api/api';
 import { logger } from '@/ui/logger';
 import { installBroadKillShims } from '@/utils/broadKillShims';
+import { installHappyCommandShim } from '@/utils/happyCommandShim';
 import { Credentials, readSettings } from '@/persistence';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { takeSessionSourceFromEnv } from '@/utils/sessionSource';
@@ -78,6 +79,8 @@ export async function runGemini(opts: {
   // Shield killall/pkill against broad kills before anything is spawned —
   // Gemini has no PreToolUse hook system, so the PATH shim is its only guard.
   installBroadKillShims();
+  // The prompt's `happy agent` must reach this CLI however the daemon was launched.
+  installHappyCommandShim();
 
   //
   // Define session
