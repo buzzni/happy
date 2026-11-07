@@ -668,7 +668,7 @@ export function sweepEmptySessions(input: {
   return stopped;
 }
 
-function resolveStoppableAgent(session: TrackedSession): 'claude' | 'codex' | null {
+export function resolveStoppableAgent(session: TrackedSession): 'claude' | 'codex' | null {
   const flavor = session.happySessionMetadataFromLocalWebhook?.flavor;
   if (flavor === 'claude' || flavor === 'codex') return flavor;
   if (!flavor) return 'claude';
