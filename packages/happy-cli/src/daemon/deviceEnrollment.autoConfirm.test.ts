@@ -59,6 +59,29 @@ it('never confirms a dedicated PC automatically, and does not advertise it witho
     expect((await sharedFixture()).state.autoConfirms).toBe(false);
 });
 
+// aplus#5876 — the marker is never rewritten, so a shared-marked PC re-registered as someone's dedicated PC still passes
+// the automatic check; giving up a pin its user confirmed at this PC needs that user's comparison again.
+it('never confirms automatically an approval that replaces an existing pin', async () => {
+    const signer = nacl.sign.keyPair();
+    const publicKey = Buffer.from(signer.publicKey).toString('base64url');
+    const pinned = { publicKey, policy: 'signed-required', approval: { body: { kind: 'device-approval', companyId: 'company', machineType: 'dedicated', ownerUserId: 'user' } } };
+    const store = { get: vi.fn().mockResolvedValue(pinned), pin: vi.fn().mockResolvedValue(undefined) };
+    const autoConfirm = vi.fn(async () => true);
+    const state = createDeviceEnrollment({ machineId: 'machine', keys: { signing: nacl.sign.keyPair(), recipient: nacl.box.keyPair() },
+        store: store as never, now: () => 1000, autoConfirm: autoConfirm as never, marker: memoryMarker('shared') });
+    const pending = await state.begin({ companyId: 'company', machineType: 'shared', ownerUserId: null, orgSigningPublicKey: publicKey, signingGeneration: 1 });
+    const t = pending.transcript;
+    await state.approve(JSON.stringify(await signOrgSetupTokenDocument({ version: 1, kind: 'device-approval', companyId: t.companyId,
+        signingGeneration: 1, signingKeyId: await orgSetupTokenKeyId(signer.publicKey), issuedAt: 1000, approvalId: 'shared',
+        approvalRevision: 1, machineId: t.machineId, machineType: t.machineType, ownerUserId: t.ownerUserId,
+        deviceSigningPublicKey: t.deviceSigningPublicKey, recipientPublicKey: t.recipientPublicKey, enrollmentDigest: pending.digest }, signer.secretKey)));
+    expect(autoConfirm).not.toHaveBeenCalled();
+    expect(store.pin).not.toHaveBeenCalled();
+    expect(state.status()).toMatchObject({ locallyConfirmed: false, pinned: false });
+    await state.confirm({ companyId: 'company', machineId: 'machine', enrollmentDigest: pending.digest });
+    expect(store.pin).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ publicKey }), pinned);
+});
+
 it('marks the PC as shared once a shared approval is pinned, however it was confirmed', async () => {
     for (const autoConfirm of [vi.fn(async () => true), vi.fn(async () => false)]) {
         const marker = memoryMarker();
