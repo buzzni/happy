@@ -9,6 +9,7 @@ import {
   automationRunHeartbeatRequestSchema,
   automationTargetSchema,
   automationExecutionQuestionRequestSchema,
+  openAutomationPayloadForMachine,
   createAutomationApiClient,
   decryptAutomationPayload,
   encryptAutomationPayload,
@@ -173,6 +174,22 @@ const automation: AutomationPublic = {
 };
 
 describe('automation wire contract', () => {
+  it('retains an encrypted question identity only for an isolated selected-result input', async () => {
+    const identity = { requestId: '9cc41d26-562e-4b48-8e2f-a38dc2c85a78', sourceRunId: 'source-run' };
+    const question = { ...payload, conversation: { sessionId: 'manual' }, contextPolicy: { kind: 'isolated' as const,
+      reference: { kind: 'previous-result' as const, maxBytes: 16_384 } }, executionQuestion: identity };
+    expect(automationPayloadSchema.parse(question)).toMatchObject({ executionQuestion: identity });
+    for (const changed of [{ ...question, contextPolicy: undefined }, { ...question, contextPolicy: { kind: 'isolated', reference: null } },
+      { ...question, executionQuestion: { ...identity, sourceRunId: identity.requestId } }, { ...question, executionQuestion: { ...identity, requestId: 'invalid' } }]) {
+      expect(automationPayloadSchema.safeParse(changed).success).toBe(false);
+    }
+    const crypto = fakeCrypto(), encrypted = await encryptAutomationPayload({ payload: question, crypto,
+      viewer: { publicKey: bytes(32, 11), keyVersion: 2 }, machine: { publicKey: bytes(32, 13), keyVersion: 4 } });
+    const open = { ...encrypted, recipientSecretKey: bytes(32, 13), crypto };
+    expect(openAutomationPayloadForMachine(open)).toMatchObject({ ok: false });
+    expect(openAutomationPayloadForMachine({ ...open, questionIdentity: identity })).toMatchObject({ ok: true, payload: { executionQuestion: identity } });
+    expect(openAutomationPayloadForMachine({ ...open, questionIdentity: { ...identity, sourceRunId: 'different' } })).toMatchObject({ ok: false });
+  });
   it('preserves the target daemon automation capability and defaults legacy responses', () => {
     const target = {
       machineAccountId: 'account-1', machineId: 'machine-1',

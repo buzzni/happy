@@ -296,6 +296,21 @@ describe('client-sealed payloads on the daemon', () => {
     }
   }
 
+  it('opens a sealed question only for its exact one-off request and source, never as an ordinary scheduled payload', async () => {
+    const questionIdentity = { requestId: '9cc41d26-562e-4b48-8e2f-a38dc2c85a78', sourceRunId: 'selected-source' }
+    const payload = { ...automationPayload, scriptCommand: null, conversation: { sessionId: 'manual' },
+      contextPolicy: { kind: 'isolated' as const, reference: { kind: 'previous-result' as const, maxBytes: 16_384 } }, executionQuestion: questionIdentity, seal: automationSeal }
+    const encrypted = await encryptAutomationPayload({ payload, viewer: { publicKey: viewer.publicKey, keyVersion: 1 },
+      machine: { publicKey: machine.publicKey, keyVersion: 1 }, sender: company, crypto: naclCrypto })
+    const row = { ...encrypted, automationId: 'automation-1', generation: 1, revision: 1, paused: true, enabledAt: 1 }
+    const original = { machineSecretKey: machine.secretKey, trust: trust('strict'), machineId: 'machine-1' }
+    expect(() => trustedServerAutomationPayload(row, original)).toThrow('PAYLOAD_UNREADABLE')
+    const bound = { ...original, questionIdentity }
+    expect(trustedServerAutomationPayload(row, bound)).toEqual(payload)
+    const other = { ...original, questionIdentity: { ...questionIdentity, sourceRunId: 'other-source' } }
+    expect(() => trustedServerAutomationPayload(row, other)).toThrow('PAYLOAD_UNREADABLE')
+  })
+
   it('syncs a v3 automation and runs it in strict when the customer sealed it for this machine', async () => {
     await expect(judgeAutomation('strict', { sender: company, seal: automationSeal }))
       .resolves.toEqual({ ...automationPayload, seal: automationSeal })

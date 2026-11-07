@@ -183,6 +183,10 @@ export const automationContextPolicySchema = z.object({
 }).strict();
 export type AutomationContextPolicy = z.infer<typeof automationContextPolicySchema>;
 
+export const automationExecutionQuestionIdentitySchema = z.strictObject({ requestId: z.string().uuid(),
+  sourceRunId: z.string().regex(/^[A-Za-z0-9_-]{1,160}$/) }).refine(value => value.requestId !== value.sourceRunId);
+export type AutomationExecutionQuestionIdentity = z.infer<typeof automationExecutionQuestionIdentitySchema>;
+
 export const automationPayloadSchema = z.object({
   name: z.string().trim().min(1).max(200),
   schedule: automationScheduleSchema,
@@ -198,10 +202,14 @@ export const automationPayloadSchema = z.object({
   githubTrigger: githubTriggerSchema.optional(),
   conversation: z.object({ sessionId: z.string().trim().min(1).max(200) }).optional(),
   contextPolicy: automationContextPolicySchema.optional(),
+  executionQuestion: automationExecutionQuestionIdentitySchema.optional(),
   // A delivery this daemon cannot read is dropped, never a reason to skip the run itself.
   delivery: automationDeliverySchema.optional().catch(undefined),
   seal: automationSealSchema.optional(),
 }).superRefine((payload, context) => {
+  if (payload.executionQuestion && payload.contextPolicy?.reference?.kind !== 'previous-result') {
+    context.addIssue({ code: 'custom', path: ['executionQuestion'], message: 'a question must reference its selected result in a fresh context' });
+  }
   if (payload.contextPolicy && new TextEncoder().encode(payload.prompt).byteLength > AUTOMATION_CONTEXT_INPUT_MAX_BYTES) {
     context.addIssue({ code: 'custom', path: ['prompt'], message: 'isolated context input exceeds its byte budget' });
   }
@@ -314,11 +322,11 @@ export type AutomationEncryptedFields = z.infer<typeof automationEncryptedFields
 
 /** One explicit question about an immutable run; never a definition update or a scheduled run-now. */
 export const automationExecutionQuestionRequestSchema = z.strictObject({
-  requestId: z.string().uuid(), sourceRunId: z.string().regex(/^[A-Za-z0-9_-]{1,160}$/),
+  ...automationExecutionQuestionIdentitySchema.shape,
   expectedRevision: positiveInteger, generation: positiveInteger,
   displaySessionId: z.string().min(1).max(200).refine(id => !isAutomationExecutionSessionId(id)),
   encrypted: automationEncryptedFieldsSchema.extend({ payloadVersion: z.literal(6) }).strict(),
-});
+}).refine(value => value.requestId !== value.sourceRunId);
 export type AutomationExecutionQuestionRequest = z.infer<typeof automationExecutionQuestionRequestSchema>;
 export function automationExecutionQuestionBindingId(requestId: string): string {
   return `automation-question:${z.string().uuid().parse(requestId)}`;
@@ -462,6 +470,7 @@ export function openAutomationPayloadForMachine(input: {
   machineKeyEnvelope: string;
   recipientSecretKey: Uint8Array;
   crypto: AutomationCryptoAdapter;
+  questionIdentity?: AutomationExecutionQuestionIdentity;
 }): MachinePayloadOpening<AutomationPayload> {
   let ciphertext: Uint8Array;
   let envelope: Uint8Array;
@@ -488,6 +497,8 @@ export function openAutomationPayloadForMachine(input: {
     if (!plaintext) return { ok: false, reason: 'malformed' };
     const payload = automationPayloadSchema.safeParse(JSON.parse(new TextDecoder().decode(plaintext)));
     if (!payload.success || input.payloadVersion !== (payload.data.contextPolicy ? 6 : payload.data.conversation ? 4 : 1)) return { ok: false, reason: 'malformed' };
+    if (payload.data.executionQuestion?.requestId !== input.questionIdentity?.requestId
+      || payload.data.executionQuestion?.sourceRunId !== input.questionIdentity?.sourceRunId) return { ok: false, reason: 'malformed' };
     return { ok: true, payload: payload.data, authentication: opened.authentication };
   } catch {
     return { ok: false, reason: 'malformed' };

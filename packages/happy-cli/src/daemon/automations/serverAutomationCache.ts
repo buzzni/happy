@@ -9,6 +9,7 @@ import {
   openSessionFollowupPayloadForMachine,
   type AutomationCryptoAdapter,
   type AutomationPayload,
+  type AutomationExecutionQuestionIdentity,
   type MachinePayloadOpening,
   type SessionFollowupDaemon,
   type SessionFollowupPayload,
@@ -297,6 +298,7 @@ const machineCrypto: AutomationCryptoAdapter = {
 export function openServerAutomationPayload(
   automation: EncryptedServerAutomation,
   machineSecretKey: Uint8Array,
+  questionIdentity?: AutomationExecutionQuestionIdentity,
 ): MachinePayloadOpening<ServerAutomationPayload> {
   return openAutomationPayloadForMachine({
     payloadVersion: automation.payloadVersion,
@@ -304,6 +306,7 @@ export function openServerAutomationPayload(
     machineKeyEnvelope: automation.machineKeyEnvelope,
     recipientSecretKey: machineSecretKey,
     crypto: machineCrypto,
+    questionIdentity,
   })
 }
 
@@ -324,6 +327,7 @@ interface TrustedPayloadInput {
   machineSecretKey: Uint8Array
   trust: PayloadTrust
   machineId: string
+  questionIdentity?: AutomationExecutionQuestionIdentity
   /** Called when compat runs an anonymous payload, so it can be recorded (R14). */
   onUnauthenticated?: () => void
 }
@@ -339,7 +343,7 @@ export function trustedServerAutomationPayload(
 ): ServerAutomationPayload {
   const verdict = judgePayload({
     trust: input.trust,
-    opening: openServerAutomationPayload(automation, input.machineSecretKey),
+    opening: openServerAutomationPayload(automation, input.machineSecretKey, input.questionIdentity),
     contextMatches: (payload) => payload.seal?.machineId === input.machineId,
   })
   if (!verdict.run) throw new Error(verdict.code)

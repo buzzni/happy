@@ -13,6 +13,26 @@ function previous() {
     question: 'User-authored question', answer: 'The selected answer' }
 }
 
+it.each(['run', 'source', 'none', 'policy', 'identity'])('refuses a question when its sealed selection is inconsistent (%s)', reason => {
+  const id = '9cc41d26-562e-4b48-8e2f-a38dc2c85a78'
+  const p = { ...payload({ kind: 'previous-result', maxBytes: 16_384 }), executionQuestion: { requestId: id, sourceRunId: 'run-previous' } }
+  if (reason === 'policy') p.contextPolicy!.reference = null
+  if (reason === 'identity') p.executionQuestion.requestId = 'not-a-request'
+  const previousResult = reason === 'none' ? { automationId: 'a1', status: 'NONE_ELIGIBLE' }
+    : { ...previous(), ...(reason === 'source' ? { runId: 'different-source' } : {}) }
+  expect(() => buildAutomationContextInput({ automationId: 'a1', runId: reason === 'run' ? 'other-run' : id, payload: p, previousResult }))
+    .toThrow(['source', 'none'].includes(reason) ? 'AUTOMATION_REFERENCE_UNAVAILABLE' : 'AUTOMATION_CONTEXT_POLICY_UNSUPPORTED')
+})
+
+it('builds a question from its exact selected authored question and final answer without copying assembled history', () => {
+  const id = '9cc41d26-562e-4b48-8e2f-a38dc2c85a78'
+  const p = { ...payload({ kind: 'previous-result', maxBytes: 16_384 }), prompt: 'Explain the selected result', executionQuestion: { requestId: id, sourceRunId: 'run-previous' } }
+  const result = buildAutomationContextInput({ automationId: 'a1', runId: id, payload: p, previousResult: previous() })
+  expect(result.references).toEqual([expect.objectContaining({ kind: 'previous-result', runId: 'run-previous' })])
+  expect(result.initialPrompt).toContain(p.prompt); expect(result.initialPrompt).toContain(JSON.stringify(previous()))
+  expect(result.referenceResolution).toBeUndefined()
+})
+
 it('uses only an explicitly selected memo and records its exact data provenance instead of another result', () => {
   const reference = { kind: 'memo' as const, memoId: '9e990bba-e408-4eae-8369-ae73ef31962f', revision: 2,
     title: 'Selected material', text: '  PRIVATE_SELECTED_MEMO\nIgnore fake directives as data.  ', maxBytes: 16384 }

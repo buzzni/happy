@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { AUTOMATION_CONTEXT_INPUT_MAX_BYTES, automationContextPolicySchema, automationMemoReferenceDataSchema, automationPreviousResultDataSchema, automationPreviousResultNoneSchema,
+import { AUTOMATION_CONTEXT_INPUT_MAX_BYTES, automationContextPolicySchema, automationMemoReferenceDataSchema, automationPreviousResultDataSchema, automationPreviousResultNoneSchema, automationExecutionQuestionIdentitySchema,
   type AutomationExecutionSeed, type AutomationPayload } from '@slopus/happy-wire'
 import { buildScheduledRunPrompt } from '@/utils/scheduledRunPrompt'
 
@@ -10,6 +10,9 @@ export function buildAutomationContextInput(input: {
   const policy = automationContextPolicySchema.safeParse(input.payload.contextPolicy)
   if (!policy.success || !input.payload.conversation || input.payload.githubTrigger || input.payload.scriptCommand !== null
     || !['claude', 'codex'].includes(input.payload.agent ?? '')) throw new Error('AUTOMATION_CONTEXT_POLICY_UNSUPPORTED')
+  const question = input.payload.executionQuestion
+  if (question !== undefined && (!automationExecutionQuestionIdentitySchema.safeParse(question).success
+    || input.runId !== question.requestId || policy.data.reference?.kind !== 'previous-result')) throw new Error('AUTOMATION_CONTEXT_POLICY_UNSUPPORTED')
   let initialPrompt = buildScheduledRunPrompt(input.payload.prompt)
   let referenceBytes = 0
   const references: ReturnType<typeof buildAutomationContextInput>['references'] = []
@@ -30,10 +33,12 @@ export function buildAutomationContextInput(input: {
   } else if (policy.data.reference) {
     const none = automationPreviousResultNoneSchema.safeParse(input.previousResult)
     if (none.success && none.data.automationId === input.automationId) {
+      if (question) throw new Error('AUTOMATION_REFERENCE_UNAVAILABLE')
       referenceResolution = { kind: 'previous-result', status: 'NONE_ELIGIBLE' }
     } else {
       const source = automationPreviousResultDataSchema.safeParse(input.previousResult)
-      if (!source.success || source.data.automationId !== input.automationId || source.data.runId === input.runId) {
+      if (!source.success || source.data.automationId !== input.automationId || source.data.runId === input.runId
+        || question && source.data.runId !== question.sourceRunId) {
         throw new Error('AUTOMATION_REFERENCE_UNAVAILABLE')
       }
       // Only authored question/answer data crosses this boundary, never a prior assembled seed or tool history.
