@@ -5,14 +5,14 @@
  * `rate_limit_event`s are buffered and taken at each result. The first result also seeds every window
  * from `get_usage` — the query has nothing to ask before its first turn — and that patch replaces the
  * stored windows, so a provider restarted on another account does not keep the previous one's. A turn
- * whose readings match the last published patch publishes nothing.
+ * whose readings would not change what this query already published publishes nothing.
  *
  * Lives as long as the query (one `claudeRemote` run). Never blocks the turn: the seed is bounded and
  * every failure only drops that reading.
  */
 import { logger } from '@/ui/logger';
-import type { UsageLimitWindow } from '@/api/types';
-import { fromRateLimitEvent, windowsFromGetUsage, type RateLimitEventInfo, type UnboundRateLimit, type UsageLimitsPatch } from './usageLimits';
+import type { UsageLimits, UsageLimitWindow } from '@/api/types';
+import { fromRateLimitEvent, mergeUsageLimits, windowsFromGetUsage, type RateLimitEventInfo, type UnboundRateLimit, type UsageLimitsPatch } from './usageLimits';
 
 const SEED_TIMEOUT_MS = 10_000;
 const USAGE_METHOD = 'usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET';
@@ -26,6 +26,9 @@ export function usageReaderOf(query: unknown): (() => Promise<unknown>) | null {
     return typeof read === 'function' ? () => read.call(query, { skipBehaviors: true }) : null;
 }
 
+/** Field by field: an event and the seed spell the same window with keys in a different order. */
+const signature = (limits: UsageLimits) => JSON.stringify(limits.windows.map(w => [w.id, w.status ?? null, w.utilization, w.resetsAt]));
+
 export function createUsageLimitsCollector(deps: {
     readUsage: (() => Promise<unknown>) | null;
     publish: (patch: UsageLimitsPatch) => void;
@@ -35,7 +38,8 @@ export function createUsageLimitsCollector(deps: {
     let pendingWindows = new Map<string, UsageLimitWindow>();
     let pendingUnbound: UnboundRateLimit | undefined;
     let seeded = false;
-    let lastSignature: string | null = null;
+    /** What this query's published patches add up to; a patch that leaves it unchanged is not sent. */
+    let published: UsageLimits | null = null;
     let chain: Promise<void> = Promise.resolve();
 
     const seed = async (): Promise<UsageLimitWindow[] | null> => {
@@ -71,10 +75,10 @@ export function createUsageLimitsCollector(deps: {
         }
         if (windows.size === 0 && !unbound) return;
         const patch: UsageLimitsPatch = { capturedAt: now(), windows: [...windows.values()], ...(unbound ? { unbound } : {}), ...(replace ? { replace } : {}) };
-        const signature = JSON.stringify([patch.windows, unbound ?? null]);
-        if (signature === lastSignature) return;
+        const next = mergeUsageLimits(published, patch);
+        if (published && signature(next) === signature(published)) return;
         deps.publish(patch);
-        lastSignature = signature;
+        published = next;
     };
 
     return {

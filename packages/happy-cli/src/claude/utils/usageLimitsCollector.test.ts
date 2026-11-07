@@ -81,6 +81,16 @@ describe('createUsageLimitsCollector', () => {
         expect(published.map(p => p.windows[0].utilization)).toEqual([50, 51]);
     });
 
+    it('skips a turn that only repeats what an earlier, larger patch already published', async () => {
+        const { collector, published } = setup(async () => usage({ seven_day: { utilization: 70, resets_at: null } }));
+        collector.observe(event({ status: 'allowed', rateLimitType: 'five_hour', utilization: 0.5 }));
+        await collector.turnEnded();
+        collector.observe(event({ status: 'allowed', rateLimitType: 'five_hour', utilization: 0.5 }));
+        collector.observe(event({ status: 'allowed', rateLimitType: 'seven_day' }));
+        await collector.turnEnded();
+        expect(published).toHaveLength(1);
+    });
+
     it('keeps an unbound event for the launcher to place', async () => {
         const { collector, published } = setup();
         collector.observe(event({ status: 'rejected', resetsAt: RESET }));
