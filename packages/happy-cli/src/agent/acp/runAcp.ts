@@ -18,6 +18,8 @@ import { consumeDelegatedAttendance, inputAttendanceFromMeta, TurnAttendanceStat
 import { takeSessionSourceFromEnv } from '@/utils/sessionSource';
 import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
 import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
+import { consumeReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
+import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import { encodeBase64 } from '@/api/encryption';
 import { registerKillSessionHandler } from '@/claude/registerKillSessionHandler';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
@@ -495,6 +497,8 @@ export async function runAcp(opts: {
   const turnInactivityTimeoutMs = opts.turnInactivityTimeoutMs ?? TURN_INACTIVITY_TIMEOUT_MS;
   const sessionTag = randomUUID();
   const deferredContinuation = createDeferredContinuationContextConsumer(process.env);
+  // A daemon resume hands over the existing Happy session instead of a new one.
+  const reconnectSession = consumeReconnectSessionEnvironment(process.env);
   connectionState.setBackend(opts.agentName);
 
   const api = await ApiClient.create(opts.credentials);
@@ -516,7 +520,7 @@ export async function runAcp(opts: {
   // Registration and advertisement follow the same decision (specs/linked-pull-requests R2-3).
   const linkedPullRequestTools = linkedPullRequestToolsAllowed(process.env);
 
-  const { state, metadata } = createSessionMetadata({
+  const { state, metadata: freshMetadata } = createSessionMetadata({
     flavor: resolveSessionFlavor(opts.agentName),
     machineId: settings.machineId,
     startedBy: opts.startedBy,
@@ -526,7 +530,11 @@ export async function runAcp(opts: {
     approvalLifecycle: true,
     linkedPullRequestTools,
   });
-  const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
+  // Resume-in-place starts from the latest server metadata, which keeps the title and acpSessionId.
+  const metadata = mergeReconnectSessionMetadata(reconnectSession?.metadata, freshMetadata);
+  const response = reconnectSession
+    ? { ...reconnectSession, metadata, agentState: state }
+    : await api.getOrCreateSession({ tag: sessionTag, metadata, state });
   if (response) {
     logAcp('muted', `Happy Session ID: ${response.id}`);
   }
@@ -556,6 +564,12 @@ export async function runAcp(opts: {
     },
   });
   session = initialSession;
+  if (reconnectSession) {
+    // Un-archive the session and deliver only the messages the previous process never processed.
+    session.suppressNextArchiveSignal();
+    session.skipExistingMessages(reconnectSession.seq);
+    session.updateMetadata((current) => mergeReconnectSessionMetadata(current, freshMetadata));
+  }
   // Organization requirements (codexcli-org-requirements R10.7): ACP agents enforce no ceiling or tool rule.
   const orgTurn = createLiteRuntimeTurnGate(createSessionOrgRequirementsGate({
     agent: liteRuntimeAgent(opts.agentName),
@@ -659,6 +673,7 @@ export async function runAcp(opts: {
     permissionHandler: watchdogAwarePermissionHandler,
     transportHandler: new DefaultTransport(opts.agentName),
     verbose,
+    resumeSessionId: reconnectSession?.metadata.acpSessionId,
   });
 
   let thinking = false;
@@ -1103,6 +1118,8 @@ export async function runAcp(opts: {
   try {
     const started = await backend.startSession();
     acpSessionId = started.sessionId;
+    // What the next resume of this conversation asks the agent to continue.
+    session.updateMetadata((current) => ({ ...current, acpSessionId: started.agentSessionId }));
     if (verbose) {
       if (!sawSlashCommands) {
         logAcp('muted', `Outgoing slash commands from ${opts.agentName}: not reported yet`);

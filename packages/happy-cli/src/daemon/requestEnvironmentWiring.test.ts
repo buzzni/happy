@@ -19,6 +19,12 @@ describe('request environment wiring', () => {
     const launch = resume.slice(resume.indexOf('const launch = buildResumeLaunch('), resume.indexOf('// The managed worktree'))
     expect(launch).toContain('emptyCodexSession: { serverSeq: serverSnapshot.seq, processedSeq: baselineSeq },')
   })
+  it('tells the resume launch an automation prompt rides along, so an OpenCode session refuses it', async () => {
+    const source = await runSource()
+    const resume = source.slice(source.indexOf('const spawnResumedSession = async'))
+    const launch = resume.slice(resume.indexOf('const launch = buildResumeLaunch('), resume.indexOf('// The managed worktree'))
+    expect(launch).toContain('automationPrompt: options?.automation !== undefined,')
+  })
   it('same-session recovery starts the resumed child with the requested environment', async () => {
     const source = await runSource()
     const sameSession = source.slice(source.indexOf("if (decision.kind === 'same-session') {"))

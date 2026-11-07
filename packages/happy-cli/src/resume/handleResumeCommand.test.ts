@@ -7,7 +7,7 @@ import { consumeInputEvidenceOption, resolveInputEvidenceOption } from '@/utils/
 import { buildManagedSessionSpawnEnvironment, buildSpawnRequestEnvironment } from '@/daemon/sessionEnv';
 import { spawnHappyCLI } from '@/utils/spawnHappyCLI';
 
-import { buildResumeLaunch, formatResumeHelp, handleResumeCommand, parseResumeCommandArgs } from './handleResumeCommand';
+import { buildResumeLaunch, formatResumeHelp, handleResumeCommand, parseResumeCommandArgs, resumeLaunchAgent } from './handleResumeCommand';
 import { resolveHappySession } from './resolveHappySession';
 
 vi.mock('@/persistence', () => ({ readPersistedSessions: vi.fn(() => ({})) }));
@@ -222,6 +222,44 @@ describe('buildResumeLaunch', () => {
                 happyToolsDir: '/tmp/happy/tools',
             },
         })).toThrow('Happy session session-4 has no Codex thread to resume (Codex never started a thread in it, or its context was reset). Start a new conversation.');
+    });
+
+    // 2026-11-07: an ended OpenCode conversation refused every new message with this error.
+    it('reattaches an OpenCode session through the ACP runner', () => {
+        expect(buildResumeLaunch(
+            { id: 'session-5', active: true, metadata: { path: '/tmp/repo', flavor: 'opencode' } as never },
+            { startedBy: 'daemon', claudeStartingMode: 'remote' },
+        )).toEqual({
+            cwd: '/tmp/repo',
+            args: ['acp', 'opencode', '--started-by', 'daemon'],
+        });
+    });
+
+    // Only the daemon hands the runner the session to reattach to; a terminal launch
+    // would silently start a new conversation under the name of resuming one.
+    it('refuses to resume an OpenCode session outside the daemon', () => {
+        const session = { id: 'session-6', active: false, metadata: { path: '/tmp/repo', flavor: 'opencode' } as never };
+        expect(() => buildResumeLaunch(session)).toThrow('Happy session session-6 uses unsupported flavor "opencode".');
+        expect(() => buildResumeLaunch(session, { startedBy: 'terminal' })).toThrow('unsupported flavor "opencode"');
+    });
+
+    // An automation resume hands the child its prompt and run-once flag, which the ACP
+    // runner reads neither of: the resume would "succeed", drop the prompt and never exit,
+    // where a refusal lets review_apply fall back to a new worker.
+    it('refuses an automation resume of an OpenCode session', () => {
+        const session = { id: 'session-7', active: false, metadata: { path: '/tmp/repo', flavor: 'opencode' } as never };
+        expect(() => buildResumeLaunch(session, { startedBy: 'daemon', automationPrompt: true }))
+            .toThrow('Happy session session-7 cannot take an automation prompt: the OpenCode runner does not support one.');
+        const claude = { id: 'c', active: false, metadata: { path: '/tmp/repo', flavor: 'claude', claudeSessionId: 'c1' } as never };
+        expect(buildResumeLaunch(claude, { startedBy: 'daemon', automationPrompt: true }).args[0]).toBe('claude');
+    });
+
+    it.each([
+        [['claude', '--resume', 'c1'], 'claude'],
+        [['codex', '--resume', 't1'], 'codex'],
+        [['acp', 'opencode', '--started-by', 'daemon'], 'opencode'],
+    ] as const)('names the agent whose credentials a resumed %j receives', (args, agent) => {
+        expect(resumeLaunchAgent({ cwd: '/tmp/repo', args: [...args] })).toBe(agent);
     });
 
     it('rejects unsupported flavors', () => {

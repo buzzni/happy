@@ -27,6 +27,8 @@ const mocks = vi.hoisted(() => {
     updateAgentState: vi.fn((handler: (state: Record<string, unknown>) => Record<string, unknown>) => {
       handler({});
     }),
+    suppressNextArchiveSignal: vi.fn(),
+    skipExistingMessages: vi.fn(),
     rpcHandlerManager: {
       registerHandler: vi.fn((name: string, handler: (params: any) => Promise<any> | any) => {
         sessionHandlers.set(name, handler);
@@ -45,6 +47,8 @@ const mocks = vi.hoisted(() => {
     cancelCalls: [] as string[],
     disposeCalls: 0,
     constructorArgs: null as any,
+    /** The agent-side session id the fake backend reports, i.e. what a later resume asks for. */
+    agentSessionId: 'agent-session-1',
     /** When set, sendPrompt emits nothing so the turn looks silent. */
     silentPrompt: false,
     /**
@@ -168,7 +172,7 @@ vi.mock('./AcpBackend', async (importOriginal) => {
           listener(message);
         }
       }
-      return { sessionId: 'acp-session-1' };
+      return { sessionId: 'acp-session-1', agentSessionId: mocks.backendState.agentSessionId };
     }
 
     async sendPrompt(sessionId: string, prompt: string) {
@@ -249,6 +253,7 @@ vi.mock('./AcpBackend', async (importOriginal) => {
 });
 
 import { runAcp } from './runAcp';
+import { buildReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
 
 describe('runAcp', () => {
   const stripAnsi = (line: string) => line.replace(/\u001b\[[0-9;]*m/g, '');
@@ -272,6 +277,7 @@ describe('runAcp', () => {
     mocks.backendState.cancelCalls = [];
     mocks.backendState.disposeCalls = 0;
     mocks.backendState.constructorArgs = null;
+    mocks.backendState.agentSessionId = 'agent-session-1';
     mocks.backendState.silentPrompt = false;
     mocks.backendState.hangPromptUntilCancel = false;
     mocks.backendState.resolveHangingPrompt = null;
@@ -592,6 +598,75 @@ describe('runAcp', () => {
 
     await mocks.getKillHandler()!();
     await runPromise;
+  });
+
+  describe('daemon resume (HAPPY_RECONNECT_*)', () => {
+    const reconnect = (metadata: Record<string, unknown>) => buildReconnectSessionEnvironment({
+      sessionId: 'resumed-session',
+      encryption: { encryptionKey: new Uint8Array(32).fill(7), encryptionVariant: 'dataKey', seq: 12, metadataVersion: 4, agentStateVersion: 2 },
+      serverSnapshot: { metadata: { path: '/repo', host: 'host', flavor: 'opencode', ...metadata } as never, seq: 20, metadataVersion: 5, agentStateVersion: 3 },
+      baselineSeq: 12,
+    });
+    const runResumed = async (env: ReturnType<typeof buildReconnectSessionEnvironment>) => {
+      for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+      try {
+        const runPromise = runAcp({
+          credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+          agentName: 'opencode',
+          command: 'opencode',
+          args: ['acp'],
+          startedBy: 'daemon',
+        });
+        await vi.waitFor(() => expect(mocks.backendState.startSessionCalls).toBe(1));
+        await mocks.getKillHandler()!();
+        await runPromise;
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    };
+
+    // 2026-11-07: a message to an ended OpenCode conversation failed with
+    // 'uses unsupported flavor "opencode"' instead of continuing it.
+    it('reattaches to the same Happy session and delivers only the messages it never processed', async () => {
+      await runResumed(reconnect({ acpSessionId: 'agent-session-0' }));
+
+      expect(mocks.mockGetOrCreateSession).not.toHaveBeenCalled();
+      const [{ response, metadata }] = mocks.mockSetupOfflineReconnection.mock.calls[0] as unknown as [{ response: { id: string; seq: number }; metadata: Record<string, unknown> }];
+      expect(response).toMatchObject({ id: 'resumed-session', seq: 12 });
+      expect(metadata).toMatchObject({ flavor: 'opencode', acpSessionId: 'agent-session-0' });
+      expect(mocks.mockSession.suppressNextArchiveSignal).toHaveBeenCalled();
+      expect(mocks.mockSession.skipExistingMessages).toHaveBeenCalledWith(12);
+      expect(mocks.mockNotifyDaemonSessionStarted).toHaveBeenCalledWith('resumed-session', expect.anything(), expect.anything());
+      expect(process.env.HAPPY_RECONNECT_ENCRYPTION_KEY).toBeUndefined();
+    });
+
+    it('asks the agent to continue its previous session and records the session it runs', async () => {
+      mocks.backendState.agentSessionId = 'agent-session-0';
+      await runResumed(reconnect({ acpSessionId: 'agent-session-0' }));
+
+      expect(mocks.backendState.constructorArgs.resumeSessionId).toBe('agent-session-0');
+      const recorded = mocks.mockSession.updateMetadata.mock.calls
+        .map(([update]) => update({ path: '/repo' } as never))
+        .find((applied: Record<string, unknown>) => applied.acpSessionId !== undefined);
+      expect(recorded).toMatchObject({ acpSessionId: 'agent-session-0' });
+    });
+  });
+
+  it('records the agent session of a new conversation so a later resume can continue it', async () => {
+    const runPromise = runAcp({
+      credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+      agentName: 'opencode',
+      command: 'opencode',
+      args: ['acp'],
+    });
+    await vi.waitFor(() => expect(mocks.backendState.startSessionCalls).toBe(1));
+    await mocks.getKillHandler()!();
+    await runPromise;
+
+    expect(mocks.backendState.constructorArgs.resumeSessionId).toBeUndefined();
+    expect(mocks.mockSession.skipExistingMessages).not.toHaveBeenCalled();
+    const applied = mocks.mockSession.updateMetadata.mock.calls.map(([update]) => update({ path: '/repo' } as never));
+    expect(applied).toEqual(expect.arrayContaining([expect.objectContaining({ acpSessionId: 'agent-session-1' })]));
   });
 
   it('registers abort handler that cancels the ACP backend session', async () => {

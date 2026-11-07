@@ -34,8 +34,8 @@ afterEach(async () => {
   crossSpawnEnvs.length = 0;
 });
 
-function backend(args: string[] = [], env: Record<string, string> = {}): AcpBackend {
-  const created = new AcpBackend({ agentName: 'fake', cwd: process.cwd(), command: process.execPath, args: [agent, ...args], env });
+function backend(args: string[] = [], env: Record<string, string> = {}, resumeSessionId?: string): AcpBackend {
+  const created = new AcpBackend({ agentName: 'fake', cwd: process.cwd(), command: process.execPath, args: [agent, ...args], env, resumeSessionId });
   backends.push(created);
   return created;
 }
@@ -106,5 +106,36 @@ describe('AcpBackend process', () => {
     await b.dispose();
     expect(crossSpawnCalls).toContainEqual({ command: 'taskkill', args: ['/pid', String(pid), '/t', '/f'] });
     expect(b.processExit()).toMatchObject({ forced: true });
+  });
+});
+
+describe('AcpBackend session resume', () => {
+  const requests = (file: string) => readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { method: string; params: Record<string, unknown> });
+  const methodsFile = () => {
+    const dir = mkdtempSync(join(tmpdir(), 'acp-resume-')); dirs.push(dir);
+    return join(dir, 'methods.jsonl');
+  };
+
+  it('continues the previous agent session when the agent supports session/resume', async () => {
+    const out = methodsFile();
+    const started = await backend([], { FAKE_ACP_RESUMABLE: '1', FAKE_ACP_METHODS_OUT: out }, 'prior-session').startSession();
+    expect(started.agentSessionId).toBe('prior-session');
+    const sent = requests(out);
+    expect(sent.map((request) => request.method)).toEqual(['initialize', 'session/resume']);
+    expect(sent[1].params).toMatchObject({ sessionId: 'prior-session', cwd: process.cwd() });
+  });
+
+  it('starts a new agent session when the agent cannot resume', async () => {
+    const out = methodsFile();
+    const started = await backend([], { FAKE_ACP_METHODS_OUT: out }, 'prior-session').startSession();
+    expect(started.agentSessionId).toBe('fake-session');
+    expect(requests(out).map((request) => request.method)).toEqual(['initialize', 'session/new']);
+  });
+
+  it('starts a new agent session when the agent refuses the resume', async () => {
+    const out = methodsFile();
+    const started = await backend([], { FAKE_ACP_RESUMABLE: '1', FAKE_ACP_RESUME_FAILS: '1', FAKE_ACP_METHODS_OUT: out }, 'gone-session').startSession();
+    expect(started.agentSessionId).toBe('fake-session');
+    expect(requests(out).map((request) => request.method)).toEqual(['initialize', 'session/resume', 'session/new']);
   });
 });
