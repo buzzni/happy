@@ -1038,3 +1038,15 @@ it('stops waiting for a Desktop-held lock when the daemon drains, leaving that l
     expect(existsSync(lock)).toBe(true);
     expect(git(repo, 'branch', '--list', 'bright-fox')).toBe('');
 });
+
+it('refuses every queued write within one lock window of its arrival, not one window per queued write', async () => {
+    const lock = join(repo, '.git', 'saycode-desktop-write.lock');
+    mkdirSync(lock);
+    const set = handlers({ repositoryLockWaitMs: 400 });
+    const started = Date.now();
+    const answers = await Promise.all(['one-fox', 'two-fox', 'three-fox'].map((name) => call('create', create({ name }), {}, set)));
+    expect(answers.every((answer) => answer.errorCode === 'WORKTREE_OPERATION_IN_PROGRESS')).toBe(true);
+    // A deadline per queued write would take about 3 × 400ms here.
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(existsSync(lock)).toBe(true);
+});

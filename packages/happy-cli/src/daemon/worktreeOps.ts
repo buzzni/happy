@@ -407,6 +407,8 @@ export async function drainWorktreeOperations(): Promise<void> {
 async function serialized<T>(path: string, run: () => Promise<T>): Promise<T> {
     if (drainingRepositoryWrites) throw new OpFailure('WORKTREE_OPERATION_IN_PROGRESS', 'The daemon is shutting down. Retry after reconnecting.');
     const key = slashed(path);
+    // Fixed on arrival: writes queued behind one another must not each wait a full window.
+    const giveUpAt = Date.now() + repositoryLockWaitMs;
     const previous = repositoryQueues.get(key) ?? Promise.resolve();
     const next = previous.catch(() => undefined).then(async () => {
         // The process queue cannot exclude Desktop or another daemon. Share their lock after
@@ -416,7 +418,7 @@ async function serialized<T>(path: string, run: () => Promise<T>): Promise<T> {
         if (common.code !== 0) return run();
         const directory = await realpath(resolve(path, common.stdout.trim()));
         const lock = join(directory, 'saycode-desktop-write.lock');
-        await acquireRepositoryLock(lock);
+        await acquireRepositoryLock(lock, giveUpAt);
         try { return await run(); }
         finally { await rmdir(lock).catch(() => undefined); }
     });
@@ -429,9 +431,8 @@ async function serialized<T>(path: string, run: () => Promise<T>): Promise<T> {
 }
 
 /** Waits out another process's write (Desktop's pull, another daemon); a daemon shutdown stops the wait. */
-async function acquireRepositoryLock(lock: string): Promise<void> {
+async function acquireRepositoryLock(lock: string, giveUpAt: number): Promise<void> {
     const startedAt = Date.now();
-    const giveUpAt = startedAt + repositoryLockWaitMs;
     for (let attempt = 0; ; attempt += 1) {
         try {
             await mkdir(lock);
@@ -440,7 +441,7 @@ async function acquireRepositoryLock(lock: string): Promise<void> {
         } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
         }
-        if (attempt === 0) logger.debug('[worktree-ops] waiting for repository lock', { lock, waitMs: repositoryLockWaitMs });
+        if (attempt === 0) logger.debug('[worktree-ops] waiting for repository lock', { lock, waitMs: Math.max(0, giveUpAt - startedAt) });
         if (drainingRepositoryWrites) throw new OpFailure('WORKTREE_OPERATION_IN_PROGRESS', 'The daemon is shutting down. Retry after reconnecting.');
         if (Date.now() >= giveUpAt) {
             throw new OpFailure('WORKTREE_OPERATION_IN_PROGRESS', `Another Git operation is in progress. Retry after it finishes. If its process terminated, verify no Git writer is running before removing the lock: ${lock}`, { lockPath: lock });
