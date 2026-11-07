@@ -349,6 +349,24 @@ it('queues an idempotent encrypted question about one completed run without edit
     expect(await client.automation.findUniqueOrThrow({ where: { id: 'a1' } })).toEqual(pausedDefinition);
     expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
     expect((await client.automationRun.findUniqueOrThrow({ where: { id: thirdQuestion.requestId } })).previousExecutionRunId).toBe('r1');
+    const selectedReference = `/v1/automations/a1/execution-reference?machineId=m1&generation=1&revision=1&displaySessionId=manual&questionRequestId=${thirdQuestion.requestId}`;
+    await client.automation.update({ where: { id: 'a1' }, data: { lastExecutionRunId: 'unrelated-latest' } });
+    const selected = await app.inject({ method: 'GET', url: selectedReference, headers: { authorization: `Bearer ${bearer}` } });
+    expect(selected.statusCode, selected.body).toBe(200);
+    expect(selected.json()).toMatchObject({ status: 'CANDIDATE', runId: 'r1', executionSessionId: 'automation-run:r1' });
+    const wrongAnchor = await app.inject({ method: 'GET', url: selectedReference + '&beforeRunId=other-run', headers: { authorization: `Bearer ${bearer}` } });
+    expect(wrongAnchor.statusCode).toBe(403);
+    const preclaim = { ...payload, requestId: 'f84ba6f1-f662-440b-a758-3ff972551bb0' };
+    await queueAutomationExecutionQuestion(client, 'owner', 'chat:c1', 'a1', preclaim);
+    const preclaimReference = selectedReference.replace(thirdQuestion.requestId, preclaim.requestId);
+    expect((await app.inject({ method: 'GET', url: preclaimReference, headers: { authorization: `Bearer ${bearer}` } })).statusCode).toBe(200);
+    expect((await client.automationExecutionQuestion.findUniqueOrThrow({ where: { id: preclaim.requestId } })).runId).toBeNull();
+    await client.projectMember.update({ where: { id: requester.id }, data: { status: 'removed' } });
+    expect((await app.inject({ method: 'GET', url: selectedReference, headers: { authorization: `Bearer ${bearer}` } })).statusCode).toBe(403);
+    await client.projectMember.update({ where: { id: requester.id }, data: { status: 'accepted' } });
+    await client.session.delete({ where: { id: 'automation-run:r1' } });
+    const lostSource = await app.inject({ method: 'GET', url: selectedReference, headers: { authorization: `Bearer ${bearer}` } });
+    expect(lostSource.statusCode).toBe(409); expect(lostSource.json()).toEqual({ error: 'AUTOMATION_REFERENCE_UNAVAILABLE' });
   } finally { await app.close(); }
 });
 

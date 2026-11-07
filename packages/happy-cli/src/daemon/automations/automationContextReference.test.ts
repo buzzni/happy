@@ -82,6 +82,25 @@ it.each(['valid', 'pages'])('verifies encrypted authored question and completed 
     question: 'Authored question only', answer: 'Selected answer only' })
   if (mode === 'pages') expect(paths.filter(path => path.includes('/evidence'))).toHaveLength(2)
 })
+
+it('pins a question to its original selected result and sends its request identity instead of selecting the latest history', async () => {
+  const questionIdentity = { requestId: '9cc41d26-562e-4b48-8e2f-a38dc2c85a78', sourceRunId: 'prior' }
+  const selection = { ...input, questionIdentity, beforeRunId: questionIdentity.requestId }
+  expect(await reader().resolve(selection)).toMatchObject({ runId: 'prior', question: 'Authored question only', answer: 'Selected answer only' })
+  const query = new URL(paths[0], origin).searchParams
+  expect(query.get('questionRequestId')).toBe(questionIdentity.requestId)
+  expect(query.get('beforeRunId')).toBe(questionIdentity.requestId)
+})
+
+it.each(['none', 'failed', 'wrong-source', 'wrong-anchor'])('holds an exact question reference without walking to an older result: %s', async reason => {
+  mode = reason === 'none' || reason === 'failed' ? reason : 'valid'
+  const questionIdentity = { requestId: '9cc41d26-562e-4b48-8e2f-a38dc2c85a78', sourceRunId: reason === 'wrong-source' ? 'different-source' : 'prior' }
+  const selection = { ...input, questionIdentity, beforeRunId: reason === 'wrong-anchor' ? 'other-request' : questionIdentity.requestId }
+  await expect(reader().resolve(selection)).rejects.toThrow(/AUTOMATION_REFERENCE_/)
+  expect(paths.some(path => new URL(path, origin).searchParams.get('beforeRunId') === 'prior')).toBe(false)
+  if (reason === 'wrong-source') expect(paths).toHaveLength(1)
+  if (reason === 'wrong-anchor') expect(paths).toHaveLength(0)
+})
 it('skips a verified failed native answer and follows its retained history instead of using dispatch status', async () => {
   mode = 'failed'
   expect(await reader().resolve(input)).toEqual({ status: 'NONE_ELIGIBLE', automationId: 'a1' })

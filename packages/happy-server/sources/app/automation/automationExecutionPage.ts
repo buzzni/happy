@@ -1,6 +1,8 @@
 import type { Prisma } from '@prisma/client';
 import { automationExecutionSeedLocalId, automationExecutionSessionId, isAutomationExecutionSessionId } from '@slopus/happy-wire';
 import { automationExecutionExitReceiptSchema, AutomationExecutionSessionError } from './automationExecutionSession';
+import { readCurrentAutomationQuestion } from './automationExecutionQuestionAdmission';
+import { projectAccess } from './automationService';
 
 /** Display projection only. Reading it never appends messages to the manual provider input. */
 export async function listAutomationExecutionPage(tx: Prisma.TransactionClient, accountId: string,
@@ -82,19 +84,32 @@ export async function readAutomationExecutionEvidencePage(tx: Prisma.Transaction
 /** A history link survives source pruning. Only the client can verify an E2EE final answer. */
 export async function readAutomationExecutionReference(tx: Prisma.TransactionClient, accountId: string,
   automationId: string, input: { machineId: string; generation: number; revision: number;
-    displaySessionId: string; beforeRunId?: string }) {
+    displaySessionId: string; beforeRunId?: string; questionRequestId?: string }) {
   const denied = () => { throw new AutomationExecutionSessionError(403, 'Invalid automation reference admission'); };
   const unavailable = () => { throw new AutomationExecutionSessionError(409, 'AUTOMATION_REFERENCE_UNAVAILABLE'); };
   const definition = await tx.automation.findFirst({ where: { id: automationId, machineAccountId: accountId,
     machineId: input.machineId, payloadVersion: 6, generation: input.generation, revision: input.revision,
-    paused: false, deletedAt: null, legacyMigrationPending: false }, include: { project: true, targetMachine: true } });
+    ...(input.questionRequestId === undefined ? { paused: false } : {}), deletedAt: null, legacyMigrationPending: false }, include: { project: true, targetMachine: true } });
   if (!definition || definition.project.accountId !== accountId
     || (definition.project.config as { machineId?: unknown } | null)?.machineId !== input.machineId
     || definition.machineKeyVersion !== definition.targetMachine?.automationKeyVersion
     || definition.viewerKeyVersion !== definition.project.automationViewerKeyVersion
     || isAutomationExecutionSessionId(input.displaySessionId)
     || !await tx.session.findFirst({ where: { id: input.displaySessionId, accountId }, select: { id: true } })) return denied();
-  if (definition.ownerAccountId !== accountId) {
+  const question = input.questionRequestId === undefined ? null : await tx.automationExecutionQuestion.findUnique({ where: { id: input.questionRequestId } });
+  if (input.questionRequestId !== undefined) {
+    if (!question || question.id !== input.questionRequestId || question.automationId !== automationId
+      || question.machineAccountId !== accountId || question.machineId !== input.machineId || question.displaySessionId !== input.displaySessionId
+      || !readCurrentAutomationQuestion(question, definition)) return denied();
+    if (!(await projectAccess(tx, question.requestedByAccountId, definition.projectId))?.canEdit) return denied();
+    if (input.beforeRunId !== undefined) {
+      if (input.beforeRunId !== question.id || question.runId !== input.beforeRunId) return denied();
+      const bound = await tx.automationRun.findUnique({ where: { id: input.beforeRunId } });
+      if (!bound || bound.kind !== 'QUESTION' || bound.automationId !== automationId || bound.generation !== question.generation
+        || bound.machineAccountId !== accountId || bound.machineId !== input.machineId || bound.previousExecutionRunId !== question.sourceRunId) return denied();
+    }
+  }
+  if (!question && definition.ownerAccountId !== accountId) {
     const member = await tx.projectMember.findUnique({ where: {
       projectId_accountId: { projectId: definition.projectId, accountId: definition.ownerAccountId } } });
     if (!member || member.status !== 'accepted' || !['owner', 'editor'].includes(member.role)) return denied();
@@ -112,7 +127,8 @@ export async function readAutomationExecutionReference(tx: Prisma.TransactionCli
       createBodyHash: run.executionCreateBodyHash, executionExitReceipt: exit.success ? exit.data : null,
       previousRunId: run.previousExecutionRunId };
   }
-  const runId = input.beforeRunId ? (await candidate(input.beforeRunId, false)).previousRunId : definition.lastExecutionRunId;
+  const runId = question ? question.sourceRunId
+    : input.beforeRunId ? (await candidate(input.beforeRunId, false)).previousRunId : definition.lastExecutionRunId;
   if (!runId) return { status: 'NONE_ELIGIBLE' as const, automationId };
   return candidate(runId);
 }

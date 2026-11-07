@@ -1,13 +1,13 @@
 import { z } from 'zod'
 import { createHash } from 'node:crypto'
-import { automationExecutionSeedManifestSchema, automationExecutionSessionId, automationPreviousResultDataSchema,
+import { automationExecutionSeedManifestSchema, automationExecutionSessionId, automationPreviousResultDataSchema, automationExecutionQuestionIdentitySchema,
   automationPreviousResultNoneSchema, readAutomationExecutionRecord, sessionCreateBodyHash } from '@slopus/happy-wire'
 import { decodeBase64, decrypt } from '@/api/encryption'
 import type { AutomationContextLaunchJournal } from './automationContextLaunch'
 
 const selectionSchema = z.strictObject({ automationId: z.string().min(1).max(200), generation: z.number().int().positive(),
   revision: z.number().int().positive(), displaySessionId: z.string().min(1).max(200),
-  beforeRunId: z.string().regex(/^[A-Za-z0-9_-]{1,160}$/).optional() })
+  beforeRunId: z.string().regex(/^[A-Za-z0-9_-]{1,160}$/).optional(), questionIdentity: automationExecutionQuestionIdentitySchema.optional() })
 const candidateSchema = z.strictObject({ status: z.literal('CANDIDATE'), automationId: z.string(), runId: z.string(),
   generation: z.number().int().positive(), displaySessionId: z.string(), executionSessionId: z.string(),
   createBodyHash: z.string().regex(/^[a-f0-9]{64}$/), previousRunId: z.string().nullable(),
@@ -37,6 +37,7 @@ export function createAutomationContextReferenceReader(deps: {
     async resolve(raw: z.infer<typeof selectionSchema>): Promise<Resolution> {
       try {
         const input = selectionSchema.parse(raw), signal = AbortSignal.timeout(10_000)
+        if (input.questionIdentity && input.beforeRunId !== undefined && input.beforeRunId !== input.questionIdentity.requestId) throw unavailable()
         let remainingBytes = 4 * 1024 * 1024
         async function request(path: string) {
           const response = await fetch(base + path, { redirect: 'error', signal, headers: { Authorization: `Bearer ${deps.token}` } })
@@ -59,17 +60,19 @@ export function createAutomationContextReferenceReader(deps: {
         let beforeRunId = input.beforeRunId
         while (true) {
           const query = new URLSearchParams({ machineId: deps.machineId, generation: String(input.generation), revision: String(input.revision),
-            displaySessionId: input.displaySessionId, ...(beforeRunId ? { beforeRunId } : {}) })
+            displaySessionId: input.displaySessionId, ...(beforeRunId ? { beforeRunId } : {}),
+            ...(input.questionIdentity ? { questionRequestId: input.questionIdentity.requestId } : {}) })
           const rawCandidate = await request(`/v1/automations/${encodeURIComponent(input.automationId)}/execution-reference?${query}`)
           const none = automationPreviousResultNoneSchema.safeParse(rawCandidate)
           if (none.success) {
-            if (none.data.automationId !== input.automationId) throw unavailable()
+            if (input.questionIdentity || none.data.automationId !== input.automationId) throw unavailable()
             return none.data
           }
           const candidate = candidateSchema.parse(rawCandidate)
           if (candidate.automationId !== input.automationId || candidate.displaySessionId !== input.displaySessionId
             || candidate.executionSessionId !== automationExecutionSessionId(candidate.runId)
-            || candidate.runId === input.beforeRunId || visited.has(candidate.runId) || candidate.previousRunId === candidate.runId) throw unavailable()
+            || candidate.runId === input.beforeRunId || visited.has(candidate.runId) || candidate.previousRunId === candidate.runId
+            || input.questionIdentity && candidate.runId !== input.questionIdentity.sourceRunId) throw unavailable()
           visited.add(candidate.runId)
           const firstPath = `/v1/sessions/${encodeURIComponent(input.displaySessionId)}/automation-runs/${encodeURIComponent(candidate.runId)}/evidence`
           const first = pageSchema.parse(await request(firstPath + '?after_seq=0&limit=50'))
@@ -113,6 +116,7 @@ export function createAutomationContextReferenceReader(deps: {
           if (record.answer.status === 'completed') return automationPreviousResultDataSchema.parse({ automationId: input.automationId,
             runId: candidate.runId, revision: record.seed.revision, status: 'COMPLETED', question: record.seed.question, answer: record.answer.answer })
           if (record.answer.status !== 'failed' && record.answer.status !== 'cancelled') throw new Error('AUTOMATION_REFERENCE_UNCONFIRMED')
+          if (input.questionIdentity) throw unavailable()
           beforeRunId = candidate.runId
         }
       } catch (error) {

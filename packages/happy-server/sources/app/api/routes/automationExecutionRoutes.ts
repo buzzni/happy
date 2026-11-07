@@ -66,7 +66,8 @@ export function automationExecutionRoutes(app: Fastify) {
     schema: { params: z.strictObject({ automationId: z.string().min(1).max(200) }),
       querystring: z.strictObject({ machineId: z.string().min(1).max(200),
         generation: z.coerce.number().int().positive(), revision: z.coerce.number().int().positive(),
-        displaySessionId: z.string().min(1).max(200), beforeRunId: z.string().regex(/^[A-Za-z0-9_-]{1,160}$/).optional() }) },
+        displaySessionId: z.string().min(1).max(200), beforeRunId: z.string().regex(/^[A-Za-z0-9_-]{1,160}$/).optional(),
+        questionRequestId: z.string().uuid().optional() }) },
   }, async (request, reply) => {
     if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
     if (!isServerBackedAutomationEnabled()) return reply.code(404).send({ error: 'feature-disabled' });
