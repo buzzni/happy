@@ -96,7 +96,7 @@ export async function syncAutomations(
     machineId: string,
     input: { afterSeq: bigint; limit: number; payloadVersions?: number[] },
     now: Date = new Date(),
-): Promise<Result<{ serverTime: Date; nextSeq: bigint; changes: Array<Record<string, unknown>> }>> {
+): Promise<Result<{ serverTime: Date; nextSeq: bigint; changes: Array<Record<string, unknown>>; missedRunRecord: 1 }>> {
     const rows = await tx.automationChange.findMany({
         where: { machineAccountId: accountId, machineId, seq: { gt: input.afterSeq } },
         orderBy: { seq: 'asc' },
@@ -151,6 +151,9 @@ export async function syncAutomations(
             serverTime: now,
             nextSeq: rows.length > 0 ? rows[rows.length - 1]!.seq : input.afterSeq,
             changes,
+            // Tells the daemon this server records missed slots (`automation-missed-record`).
+            // An old server never acks that event, so the daemon must not wait on it there.
+            missedRunRecord: 1,
         },
     };
 }
@@ -279,6 +282,85 @@ export async function claimAutomationRun(
             : { ok: false, error: 'active-run' };
     }
     return { ok: true, value: { runId, claimToken, claimExpiresAt, serverTime: now, projectId: automation.projectId } };
+}
+
+export const MISSED_RUN_FAILURE_CODES = ['MISSED_OFFLINE', 'MISSED_COLLAPSED'] as const;
+export type MissedRunFailureCode = typeof MISSED_RUN_FAILURE_CODES[number];
+export const MAX_MISSED_RUN_COUNT = 1000;
+
+/**
+ * aplus-dev-studio specs/scheduled-missed-run-policy R4~R9 — the daemon reports slots it could not
+ * run (machine off, asleep or disconnected past the claim window) as one EXPIRED row keyed by the
+ * first missed slot. A new status value would make old Desktop parsers reject the whole list, so
+ * the row reuses EXPIRED and carries the gap size in `missedCount`. The same gap reported again
+ * (daemon restart, lost ack) hits the slot fence and adds nothing; a longer report only raises the count.
+ */
+export async function recordMissedAutomationRuns(
+    tx: Tx,
+    accountId: string,
+    machineId: string,
+    input: {
+        automationId: string;
+        generation: number;
+        firstMissedAt: Date;
+        missedCount: number;
+        failureCode: MissedRunFailureCode;
+    },
+    now: Date = new Date(),
+): Promise<Result<{ runId: string; idempotent: boolean; projectId: string }>> {
+    if (!Number.isInteger(input.missedCount) || input.missedCount < 1 || input.missedCount > MAX_MISSED_RUN_COUNT
+        || !MISSED_RUN_FAILURE_CODES.includes(input.failureCode)) {
+        return { ok: false, error: 'claim-denied' };
+    }
+    // A slot still inside the claim window can be claimed and run; it is not missed yet.
+    if (input.firstMissedAt.getTime() >= now.getTime() - 90_000) return { ok: false, error: 'claim-denied' };
+    const automation = await tx.automation.findFirst({
+        where: { id: input.automationId, machineAccountId: accountId, machineId, deletedAt: null },
+        include: {
+            project: { select: { automationViewerKeyVersion: true } },
+            targetMachine: { select: { automationKeyVersion: true } },
+        },
+    });
+    if (!automation || !executable(automation, accountId, machineId, input.generation)
+        || input.firstMissedAt < automation.enabledAt) {
+        return { ok: false, error: 'claim-denied' };
+    }
+    const runId = randomUUID();
+    const created = await tx.automationRun.createMany({
+        data: [{
+            id: runId,
+            automationId: automation.id,
+            generation: input.generation,
+            scheduledFor: input.firstMissedAt,
+            machineAccountId: accountId,
+            machineId,
+            status: 'EXPIRED',
+            // Nobody holds the token behind this hash, so the row can never be started or reported.
+            claimTokenHash: tokenHash(randomBytes(32).toString('base64url')),
+            claimExpiresAt: now,
+            completedAt: now,
+            failureCode: input.failureCode,
+            missedCount: input.missedCount,
+        }],
+        skipDuplicates: true,
+    });
+    if (created.count === 1) {
+        return { ok: true, value: { runId, idempotent: false, projectId: automation.projectId } };
+    }
+    const sameSlot = await tx.automationRun.findFirst({
+        where: { automationId: automation.id, generation: input.generation, scheduledFor: input.firstMissedAt },
+        select: { id: true, failureCode: true, missedCount: true },
+    });
+    if (!sameSlot) return { ok: false, error: 'report-conflict' };
+    // A real run on that slot means it was not missed after all; leave it as it is.
+    if (MISSED_RUN_FAILURE_CODES.includes(sameSlot.failureCode as MissedRunFailureCode)
+        && (sameSlot.missedCount ?? 0) < input.missedCount) {
+        await tx.automationRun.updateMany({
+            where: { id: sameSlot.id, failureCode: { in: [...MISSED_RUN_FAILURE_CODES] }, missedCount: { lt: input.missedCount } },
+            data: { missedCount: input.missedCount },
+        });
+    }
+    return { ok: true, value: { runId: sameSlot.id, idempotent: true, projectId: automation.projectId } };
 }
 
 async function claimedRun(tx: Tx, accountId: string, machineId: string, runId: string, claimToken: string) {

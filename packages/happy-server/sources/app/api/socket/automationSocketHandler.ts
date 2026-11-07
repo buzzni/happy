@@ -4,6 +4,9 @@ import {
     ackAutomationSync,
     claimAutomationRun,
     heartbeatAutomationRun,
+    MAX_MISSED_RUN_COUNT,
+    MISSED_RUN_FAILURE_CODES,
+    recordMissedAutomationRuns,
     registerAutomationMachineKey,
     reportAutomationRun,
     startAutomationRun,
@@ -152,6 +155,27 @@ export function automationSocketHandler(accountId: string, machineId: string, so
     })), (value) => {
         const { projectId } = value as { projectId: string };
         return emitProjectAutomationUpdate(projectId, {
+            projectId,
+            automationId: requiredString(data?.automationId),
+            reason: 'run',
+        }, accountId);
+    }));
+
+    // specs/scheduled-missed-run-policy R4·R5 — one row for a whole gap of missed slots; replays are absorbed.
+    on('automation-missed-record', async (data, callback) => answer(callback, () => {
+        const failureCode = MISSED_RUN_FAILURE_CODES.find((code) => code === data?.failureCode);
+        if (!failureCode) throw new Error('invalid-input');
+        return inTx((tx) => recordMissedAutomationRuns(tx, accountId, machineId, {
+            automationId: requiredString(data?.automationId),
+            generation: integer(data?.generation, 1, Number.MAX_SAFE_INTEGER),
+            firstMissedAt: new Date(integer(data?.firstMissedAt, 0, Number.MAX_SAFE_INTEGER)),
+            missedCount: integer(data?.missedCount, 1, MAX_MISSED_RUN_COUNT),
+            failureCode,
+        }));
+    }, async (value) => {
+        const { idempotent, projectId } = value as { idempotent: boolean; projectId: string };
+        if (idempotent) return;
+        await emitProjectAutomationUpdate(projectId, {
             projectId,
             automationId: requiredString(data?.automationId),
             reason: 'run',

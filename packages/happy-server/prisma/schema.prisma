@@ -639,6 +639,8 @@ model AutomationRun {
     detailCiphertext  Bytes?
     failureCode       String?
     degradedCode      String?
+    // Slots one missed-run row stands for (scheduled-missed-run-policy); null on ordinary runs.
+    missedCount       Int?
     queueDepth         Int?
     queuePosition      Int?
     queueTotal         Int?
