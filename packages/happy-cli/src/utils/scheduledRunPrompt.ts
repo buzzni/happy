@@ -9,18 +9,21 @@ export interface ScheduledRunTime {
 }
 
 function formatRunTime({ at, timeZone }: ScheduledRunTime): string {
-    const machineZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+    // The first zone that formats wins: the schedule's, then the machine's, then UTC (an unusable TZ).
     // Keep the zone name as the schedule spells it; ICU may canonicalize it (Asia/Kathmandu -> Asia/Katmandu).
-    const zone = timeZone ?? machineZone
-    let format: Intl.DateTimeFormat
-    try {
-        format = new Intl.DateTimeFormat('en-US', {
-            timeZone: zone, weekday: 'long', year: 'numeric', month: '2-digit', day: '2-digit',
-            hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
-        })
-    } catch {
-        return formatRunTime({ at })
-    }
+    const zone = [timeZone, Intl.DateTimeFormat().resolvedOptions().timeZone].find((candidate) => {
+        if (!candidate) return false
+        try {
+            new Intl.DateTimeFormat('en-US', { timeZone: candidate })
+            return true
+        } catch {
+            return false
+        }
+    }) ?? 'UTC'
+    const format = new Intl.DateTimeFormat('en-US', {
+        timeZone: zone, weekday: 'long', year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+    })
     const parts = Object.fromEntries(format.formatToParts(at).map(part => [part.type, part.value]))
     // Wall clock minus the instant (both floored to the minute) is the zone's offset at that instant, DST included.
     const offsetMinutes = Math.round((

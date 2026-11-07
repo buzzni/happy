@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { buildScheduledRunPrompt } from './scheduledRunPrompt'
 
 // Saycode specs/scheduled-missed-run-policy R1: the run-time line sits right before `Original task:`.
@@ -10,6 +10,8 @@ function runTimeLine(prompt: string): string {
 }
 
 describe('buildScheduledRunPrompt', () => {
+    afterEach(() => vi.restoreAllMocks())
+
     it('puts the actual run time of the occurrence right before the original task', () => {
         const prompt = buildScheduledRunPrompt('Report', { at: Date.UTC(2026, 10, 7, 0, 20, 59), timeZone: 'Asia/Seoul' })
         expect(runTimeLine(prompt)).toBe('[CURRENT RUN TIME: Saturday, 2026-11-07 09:20 (Asia/Seoul, UTC+09:00)]')
@@ -33,5 +35,11 @@ describe('buildScheduledRunPrompt', () => {
         expect(runTimeLine(buildScheduledRunPrompt('task', { at, timeZone })))
             .toBe(runTimeLine(buildScheduledRunPrompt('task', { at, timeZone: machineZone })))
         expect(runTimeLine(buildScheduledRunPrompt('task', { at, timeZone }))).toContain(`(${machineZone}, UTC`)
+    })
+
+    it('falls back to UTC instead of recursing when the machine zone is unusable too', () => {
+        vi.spyOn(Intl.DateTimeFormat.prototype, 'resolvedOptions').mockReturnValue({ timeZone: 'Bad/Machine' } as Intl.ResolvedDateTimeFormatOptions)
+        expect(runTimeLine(buildScheduledRunPrompt('task', { at: Date.UTC(2026, 10, 7, 0, 20), timeZone: 'Not/AZone' })))
+            .toBe('[CURRENT RUN TIME: Saturday, 2026-11-07 00:20 (UTC, UTC+00:00)]')
     })
 })
