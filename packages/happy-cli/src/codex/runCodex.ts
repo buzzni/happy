@@ -9,7 +9,7 @@ import { createLessonProposalTurn } from '@/utils/lessonProposalTurn';
 import { reportAutomationContextExit, type AutomationContextExitEvidence } from '@/utils/automationContextExit';
 import { createFilesystemWriteAdmission, createSubprocessWriteAdmission } from '@/utils/workspaceTurnAdmission';
 import { takeWorkspaceContextControl } from '@/utils/workspaceContextControl';
-import { CodexAuthRecovery } from './codexAuthRecovery';
+import { CodexAuthRecovery, describeCodexAuthRecoveryFailure } from './codexAuthRecovery';
 import { render } from "ink";
 import {
     createManagedGracefulStop,
@@ -46,6 +46,7 @@ import { randomUUID } from 'node:crypto';
 import { execSync } from 'node:child_process';
 import { logger } from '@/ui/logger';
 import { installBroadKillShims } from '@/utils/broadKillShims';
+import { installHappyCommandShim } from '@/utils/happyCommandShim';
 import { Credentials, readSettings } from '@/persistence';
 import { resolveSessionSandboxConfig } from '@/sandbox/resolveSessionSandboxConfig';
 import { resolveSessionSandboxPolicyMode } from '@/sandbox/sandboxPolicy';
@@ -299,6 +300,8 @@ export async function runCodex(opts: {
 
     const deferredContinuation = createDeferredContinuationContextConsumer(process.env);
     installBroadKillShims();
+    // The prompt's `happy agent` must reach this CLI however the daemon was launched.
+    installHappyCommandShim();
     const automationRunOnceRequested = consumeAutomationRunOnce(process.env);
     const reconnectSession = consumeReconnectSessionEnvironment(process.env);
     const reconnectSessionId = reconnectSession?.id;
@@ -2595,6 +2598,9 @@ export async function runCodex(opts: {
 
                 await measure('auth', () => authRecovery.beginTurn());
                 if (shouldExit) { authRecovery.endTurn(); break; }
+                // A blocked session recovers before /clear is decided; otherwise a recovered one sends "/clear" to Codex.
+                const clearRecoveryError = shouldHandleCodexClear(message) && authRecovery.status().state === 'failed'
+                    ? await Promise.resolve(measure('auth', () => authRecovery.prepareTurn())).then(() => undefined, (error: unknown) => error) : undefined;
                 if (shouldHandleCodexClear(message) && authRecovery.status().state !== 'failed') {
                     latency?.finish('control');
                     authRecovery.endTurn();
@@ -2640,7 +2646,9 @@ export async function runCodex(opts: {
 
                 let routingApplied = false;
                 try {
-                    authRecovery.assertReady();
+                    if (clearRecoveryError) throw clearRecoveryError;
+                    // Only a blocked session waits here; an extra await would let a kill land mid-preparation.
+                    if (authRecovery.status().state === 'failed') await measure('auth', () => authRecovery.prepareTurn());
                     if (checkpointComposition.completeTurn) {
                         // specs/linux-checkpoint-enforcement-backend R4 — open the checkpoint turn (and
                         // materialize its workspace) before codex is wrapped and spawned. On Linux bwrap
@@ -3072,7 +3080,7 @@ export async function runCodex(opts: {
                     // would have produced from a real turn_aborted, reusing its guard logic
                     // (harmless no-op if currentTurnId is already null).
                     logger.warn('Error in codex session:', error);
-                    const failureMessage = describeCheckpointFailure(error) ?? 'Process exited unexpectedly';
+                    const failureMessage = describeCheckpointFailure(error) ?? describeCodexAuthRecoveryFailure(error) ?? 'Process exited unexpectedly';
                     messageBuffer.addMessage(failureMessage, 'status');
                     session.sendSessionEvent({ type: 'message', message: failureMessage });
                     // Carries the correlation in and reads it back, like the normal event path. A

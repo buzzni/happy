@@ -56,6 +56,7 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
         disallowedTools: opts?.disallowedTools,
         tools: opts?.tools,
         mcpServers: opts?.mcpServers as Options['mcpServers'],
+        plugins: opts?.plugins,
         systemPrompt,
         settings,
         strictMcpConfig: opts?.isolatedAutomationContext ? true : opts?.strictMcpConfig,

@@ -85,6 +85,7 @@ import { homedir } from 'node:os';
 import { projectPath } from '@/projectPath';
 import { RawJSONLinesSchema, type RawJSONLines } from './types';
 import { installBroadKillShims } from '@/utils/broadKillShims';
+import { installHappyCommandShim } from '@/utils/happyCommandShim';
 import { consumeReconnectFreshLaunch, consumeReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
 import {
     assertClaudeConfirmedDeliveryPossible,
@@ -266,6 +267,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // Shield killall/pkill against broad kills before anything is spawned —
     // everything this session launches inherits the shimmed PATH.
     installBroadKillShims();
+    // The prompt's `happy agent` must reach this CLI however the daemon was launched.
+    installHappyCommandShim();
     // Authenticated before any API client or server session exists: a launch the
     // daemon did not reserve must not create one.
     if (standaloneLaunch && (managedStartup || options.startedBy !== 'daemon')) {

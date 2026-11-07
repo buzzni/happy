@@ -50,12 +50,13 @@ function git(cwd: string, ...args: string[]): string {
     return execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8' }).trim();
 }
 
-function handlers(overrides: { allowedRoot?: string; machine?: typeof machine } = {}) {
+function handlers(overrides: { allowedRoot?: string; machine?: typeof machine; repositoryLockWaitMs?: number } = {}) {
     return createWorktreeOpsHandlers({
         machine: () => overrides.machine ?? machine,
         allowedRoot: overrides.allowedRoot ?? root,
         happyHomeDir: home,
         now: () => NOW,
+        repositoryLockWaitMs: overrides.repositoryLockWaitMs,
     });
 }
 
@@ -134,7 +135,7 @@ describe('worktree ops tickets', () => {
         const finish = vi.fn(async () => {});
         const admitSubprocess = vi.fn(async () => {});
         const set = createWorktreeOpsHandlers({ machine: () => machine, allowedRoot: root, happyHomeDir: home, now: () => NOW,
-            reserveLegacyDispatch: async () => ({ acquired: true, finish }), admitSubprocess });
+            reserveLegacyDispatch: async () => ({ acquired: true, finish }), admitSubprocess, repositoryLockWaitMs: 0 });
         const sent = ticket('create', create({ expectedRepoRoot: null, name: 'cleanup-refusal' }));
         // The request is valid, but the operation cannot acquire the existing repository write lock.
         mkdirSync(join(repo, '.git', 'saycode-desktop-write.lock'));
@@ -243,14 +244,46 @@ describe('worktree ops tickets', () => {
         expect(reserve).not.toHaveBeenCalled();
     });
 
-    it('refuses a Desktop-held common Git lock before creating a worktree', async () => {
+    it('refuses a Desktop-held common Git lock that outlasts the wait before creating a worktree', async () => {
         const lock = join(repo, '.git', 'saycode-desktop-write.lock');
         mkdirSync(lock);
         const head = git(repo, 'rev-parse', 'HEAD');
-        expect(await call('create', create())).toMatchObject({ success: false, errorCode: 'WORKTREE_OPERATION_IN_PROGRESS', lockPath: lock });
+        expect(await call('create', create(), {}, handlers({ repositoryLockWaitMs: 300 }))).toMatchObject({ success: false, errorCode: 'WORKTREE_OPERATION_IN_PROGRESS', lockPath: lock });
         expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
         expect(git(repo, 'branch', '--list', 'bright-fox')).toBe('');
         expect(existsSync(lock)).toBe(true);
+    });
+
+    it.each([false, true])('refuses an expired ticket after waiting for the Git lock and releases its own lock (workspace admission=%s)', async withAdmission => {
+        let at = NOW;
+        const finish = vi.fn(async () => {}), admitSubprocess = vi.fn(async () => {});
+        const set = createWorktreeOpsHandlers({ machine: () => machine, allowedRoot: root, happyHomeDir: home,
+            now: () => at, repositoryLockWaitMs: 10_000,
+            ...(withAdmission ? { reserveLegacyDispatch: async () => ({ acquired: true as const, finish }), admitSubprocess } : {}) });
+        const lock = join(repo, '.git', 'saycode-desktop-write.lock');
+        mkdirSync(lock);
+        const request = { ticket: ticket('create', create(), { expiresAt: NOW + 100 }) };
+        const released = setTimeout(() => { at = NOW + 200; rmSync(lock, { recursive: true }); }, 300);
+        try {
+            expect(await set['worktree:create'](request)).toMatchObject({ success: false, errorCode: 'TICKET_EXPIRED' });
+        } finally { clearTimeout(released); }
+        expect(git(repo, 'branch', '--list', 'bright-fox')).toBe('');
+        expect(existsSync(join(repo, '.aplus', 'worktrees', 'p1', 'bright-fox'))).toBe(false);
+        expect(existsSync(lock)).toBe(false);
+        expect(admitSubprocess).not.toHaveBeenCalled();
+        expect(finish).toHaveBeenCalledTimes(withAdmission ? 1 : 0);
+        expect(await set['worktree:create'](request)).toMatchObject({ success: false, errorCode: 'TICKET_EXPIRED' });
+    });
+
+    it('waits for a Desktop-held common Git lock and creates the worktree once it is released', async () => {
+        const lock = join(repo, '.git', 'saycode-desktop-write.lock');
+        mkdirSync(lock);
+        const released = setTimeout(() => rmSync(lock, { recursive: true }), 500);
+        try {
+            expect(await call('create', create(), {}, handlers({ repositoryLockWaitMs: 10_000 }))).toMatchObject({ success: true });
+        } finally { clearTimeout(released); }
+        expect(git(repo, 'branch', '--list', 'bright-fox')).toContain('bright-fox');
+        expect(existsSync(lock)).toBe(false);
     });
 
     it('releases only its own disk lock after a rejected write and allows a fresh retry', async () => {
@@ -1147,4 +1180,32 @@ it('drains accepted writes before daemon exit and refuses new writes while their
         release(); await active; await closing;
         expect(existsSync(lock)).toBe(false); expect(git(repo, 'branch', '--list', 'bright-fox')).toBe('');
     } finally { release(); await active; }
+});
+
+it('stops waiting for a Desktop-held lock when the daemon drains, leaving that lock alone', async () => {
+    vi.resetModules();
+    const lifecycle = await import('./worktreeOps');
+    const set = lifecycle.createWorktreeOpsHandlers({ machine: () => machine, allowedRoot: root, happyHomeDir: home, now: () => NOW, repositoryLockWaitMs: 60_000 });
+    const lock = join(repo, '.git', 'saycode-desktop-write.lock');
+    mkdirSync(lock);
+    const waiting = call('create', create(), {}, set);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    const started = Date.now();
+    await lifecycle.drainWorktreeOperations();
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(await waiting).toMatchObject({ success: false, errorCode: 'WORKTREE_OPERATION_IN_PROGRESS' });
+    expect(existsSync(lock)).toBe(true);
+    expect(git(repo, 'branch', '--list', 'bright-fox')).toBe('');
+});
+
+it('refuses every queued write within one lock window of its arrival, not one window per queued write', async () => {
+    const lock = join(repo, '.git', 'saycode-desktop-write.lock');
+    mkdirSync(lock);
+    const set = handlers({ repositoryLockWaitMs: 400 });
+    const started = Date.now();
+    const answers = await Promise.all(['one-fox', 'two-fox', 'three-fox'].map((name) => call('create', create({ name }), {}, set)));
+    expect(answers.every((answer) => answer.errorCode === 'WORKTREE_OPERATION_IN_PROGRESS')).toBe(true);
+    // A deadline per queued write would take about 3 × 400ms here.
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(existsSync(lock)).toBe(true);
 });

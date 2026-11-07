@@ -1,3 +1,4 @@
+import { resolve } from 'node:path';
 import { createLessonTurnObservations } from '@/memory/lessonTurnObservations';
 import { createLessonProposalTurn } from '@/utils/lessonProposalTurn';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -106,6 +107,63 @@ describe('claudeRemote', () => {
             expect(spawn).toHaveBeenCalledWith(launch);
             expect(close).not.toHaveBeenCalled(); // The parent, after all generations, owns this boundary.
         } finally { prepare.mockRestore(); }
+    });
+
+    describe('plugin directories from the command line (specs/cli-plugin-dir-and-env-scrub R5-a)', () => {
+        const sessionPath = resolve('fixture session');
+        const resumeId = '11111111-2222-4333-8444-555555555555';
+        const run = async (overrides: Record<string, unknown>) => {
+            vi.mocked(query).mockReturnValue({ async *[Symbol.asyncIterator]() { yield { type: 'result', subtype: 'success' }; } } as any);
+            let count = 0;
+            await claudeRemote({ sessionId: null, path: sessionPath, allowedTools: [], hookSettingsPath: '/tmp/synthetic-settings.json',
+                nextMessage: async () => count++ === 0 ? { message: 'synthetic', mode } : null,
+                onReady: vi.fn(), canCallTool: async () => ({ behavior: 'allow' }) as any, isAborted: () => false,
+                onSessionFound: vi.fn(), onThinkingChange: vi.fn(), onMessage: vi.fn(), ...overrides } as any);
+            return vi.mocked(query).mock.calls[0][0].options!;
+        };
+        const expected = [
+            { type: 'local', path: resolve(sessionPath, 'my plugin') },
+            { type: 'local', path: resolve(sessionPath, 'second') },
+        ];
+
+        it('loads them on a fresh start, relative to the session path', async () => {
+            const options = await run({ claudeArgs: ['--plugin-dir', './my plugin', '--plugin-dir=second'] });
+            expect(options.resume).toBeUndefined();
+            expect(options.plugins).toEqual(expected);
+        });
+
+        it('loads them when the arguments resume a Claude session', async () => {
+            const options = await run({ claudeArgs: ['--resume', resumeId, '--plugin-dir', './my plugin', '--plugin-dir=second'] });
+            expect(options.resume).toBe(resumeId);
+            expect(options.plugins).toEqual(expected);
+        });
+
+        it('loads them when the runner resumes its own session, inside a process sandbox too', async () => {
+            const options = await run({
+                sessionId: 'retained-session', sandboxPolicyMode: 'mandatory', scopeProcessSandbox: { spawn: vi.fn(), close: vi.fn() },
+                claudeArgs: ['--plugin-dir', './my plugin', '--plugin-dir=second'],
+            });
+            expect(options.resume).toBe('retained-session');
+            expect(options.plugins).toEqual(expected);
+        });
+
+        it('leaves the SDK default without one', async () => {
+            expect((await run({ claudeArgs: ['--model', 'opus', '--', '--plugin-dir', 'x'] })).plugins).toBeUndefined();
+        });
+
+        it('fails the turn before preparing it or starting Claude when one has no path', async () => {
+            const beforeTurn = vi.fn();
+            await expect(run({ claudeArgs: ['--plugin-dir'], beforeTurn })).rejects.toThrow('--plugin-dir requires');
+            expect(beforeTurn).not.toHaveBeenCalled();
+            expect(query).not.toHaveBeenCalled();
+        });
+
+        it('waits for a message before reading them, so a malformed one cannot relaunch without input', async () => {
+            vi.mocked(query).mockReset();
+            await expect(claudeRemote({ sessionId: null, path: sessionPath, allowedTools: [], claudeArgs: ['--plugin-dir'],
+                nextMessage: async () => null, onReady: vi.fn(), canCallTool: async () => ({ behavior: 'allow' }) as any,
+                isAborted: () => false, onSessionFound: vi.fn(), onThinkingChange: vi.fn(), onMessage: vi.fn() } as any)).resolves.toBe('not-started');
+        });
     });
 
     describe('off-turn title bridge', () => {

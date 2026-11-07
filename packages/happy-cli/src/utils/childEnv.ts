@@ -18,10 +18,12 @@
  *    version mismatch, and the daemon inherits the child's env — every session
  *    the daemon spawns afterwards reconnects to the same happy session. That is
  *    the 2026-07-19 incident: chats from every project queued into one session
- *    and replayed each other's prompts.
+ *    and replayed each other's prompts. CODEX_THREAD_ID, which Codex sets in
+ *    its own shells, names another session's thread in the same way.
  *  - `spawn-seed`: one-shot input to the runner of this spawn. 'HAPPY_INITIAL_'
  *    covers HAPPY_INITIAL_PROMPT(_LOCAL_ID) and the HAPPY_INITIAL_MODEL /
- *    HAPPY_INITIAL_EFFORT spawn seeds; HAPPY_AUTOMATION_* (run-once, resume
+ *    HAPPY_INITIAL_EFFORT spawn seeds; HAPPY_SIDE_CHAT marks one side-chat
+ *    spawn; HAPPY_AUTOMATION_* (run-once, resume
  *    prompt, browser continuation) is read by the runner before agent code runs;
  *    the browser task session secret (or why there is none) is read once by
  *    the runner's MCP server;
@@ -56,7 +58,12 @@ export const NON_INHERITABLE_ENV: readonly NonInheritableEnvEntry[] = [
     { prefix: 'HAPPY_FORK', kind: 'session-lineage' },
     { prefix: 'HAPPY_CREATED_BY', kind: 'session-lineage' },
     { prefix: 'HAPPY_DEFERRED_CONTINUATION_', kind: 'session-lineage' },
+    // Codex puts its own thread id in its tool shells. A happy process (daemon, runner, `happy` command) that
+    // sees one was started from another session's shell, so no child of it may carry that thread.
+    { prefix: 'CODEX_THREAD_ID', kind: 'session-lineage' },
     { prefix: 'HAPPY_INITIAL_', kind: 'spawn-seed' },
+    // upstream's daemon marks one side-chat spawn with it; inherited, every later session would be one too.
+    { prefix: 'HAPPY_SIDE_CHAT', kind: 'spawn-seed' },
     { prefix: 'HAPPY_BROWSER_TASK_SESSION_SECRET', kind: 'spawn-seed' },
     { prefix: 'HAPPY_BROWSER_TASK_UNAVAILABLE_REASON', kind: 'spawn-seed' },
     // Run-once, resume prompt, browser continuation: read by the runner before agent code runs (lessonSessionHost).

@@ -169,7 +169,8 @@ async function setup(runId = 'r1') {
   const payload: AutomationPayload = { name: 'Task', prompt: 'Current occurrence only', directory: '/work', agent: 'codex',
     scriptCommand: null, suppressSilent: false, schedule: { kind: 'interval', minutes: 60 },
     conversation: { sessionId: 'manual' }, contextPolicy: { kind: 'isolated', reference: null } }
-  const input = { automationId: 'a1', generation: 1, revision: 1, runId, claimToken: 'fixture-claim', payload }
+  const input = { automationId: 'a1', generation: 1, revision: 1, runId, claimToken: 'fixture-claim', payload,
+    runTime: { at: 1_794_000_000_000, timeZone: 'Asia/Seoul' } }
   const authorize = vi.fn(async (_target: unknown) => ({ targetProof: 'fixture-target-proof', executionBindingRequired: false }))
   const transport = createAutomationContextTransport({ serverUrl: origin, token: 'fixture-account-token', machineId: 'm1',
     runId, claimToken: 'fixture-claim', authorize })

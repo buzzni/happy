@@ -19,11 +19,14 @@ export function personalBrowserEnv(platform: 'darwin' | 'win32', source: NodeJS.
 }
 
 /** Headful (the user signs in to sites in its windows), but it opens no window of its own: one appears only
- * when an agent opens a page, so a prepared PC does not show an empty browser. */
+ * when an agent opens a page, so a prepared PC does not show an empty browser. On a Mac the owned windows usually sit
+ * behind Saycode or minimized; backgrounded there, a page intermittently stopped answering CDP past the connection
+ * timeout (which ends the browser session), so those windows are not backgrounded. Timer throttling stays. */
 export function personalBrowserArgs(platform: 'darwin' | 'win32', profileDir: string): string[] {
     return ['--remote-debugging-pipe', `--user-data-dir=${profileDir}`,
         '--no-first-run', '--no-default-browser-check', '--disable-sync', '--disable-extensions',
-        ...platform === 'darwin' ? ['--password-store=basic', '--use-mock-keychain'] : [],
+        ...platform === 'darwin' ? ['--password-store=basic', '--use-mock-keychain',
+            '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding'] : [],
         '--no-startup-window']
 }
 
