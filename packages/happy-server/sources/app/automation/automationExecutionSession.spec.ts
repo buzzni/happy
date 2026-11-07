@@ -27,6 +27,7 @@ import { createRegisteredAutomation, getAutomationTarget, updateAutomation } fro
 import { automationExecutionRoutes } from '@/app/api/routes/automationExecutionRoutes';
 import { transitionChatAutomations } from './automationChatLifecycle';
 import { queueAutomationExecutionQuestion } from './automationExecutionQuestionService';
+import { automationSocketHandler } from '@/app/api/socket/automationSocketHandler';
 
 let now: Date;
 const secret = 'automation-target-test-secret-at-least-thirty-two-bytes';
@@ -293,7 +294,7 @@ it('queues an idempotent encrypted question about one completed run without edit
     const conflictClaim = await app.inject({ method: 'POST', url: claimUrl, headers: { authorization: `Bearer ${bearer}` }, payload: { claimToken: 'b'.repeat(43) } });
     expect(conflictClaim.statusCode).toBe(409);
     expect(await client.automationRun.count()).toBe(4);
-    expect(await client.automationRun.findUniqueOrThrow({ where: { id: payload.requestId } })).toMatchObject({ kind: 'QUESTION', previousExecutionRunId: 'r1', scheduledFor: question.createdAt });
+    expect(await client.automationRun.findUniqueOrThrow({ where: { id: payload.requestId } })).toMatchObject({ kind: 'QUESTION', executionPayloadVersion: 6, previousExecutionRunId: 'r1', scheduledFor: question.createdAt });
     expect(await client.automation.findUniqueOrThrow({ where: { id: 'a1' } })).toEqual(definition);
     expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
     // Paused schedules have no regular claim loop to clear an expired question's active slot.
@@ -771,6 +772,56 @@ it('keeps the registered execution identity after definition edits and on report
     .resolves.toEqual({ ok: false, error: 'report-conflict' });
   await expect(reportAutomationRun(client, 'owner', 'm1', report('automation-run:r1'), now))
     .resolves.toMatchObject({ ok: true, value: { idempotent: true } });
+});
+
+it.each([1, 4].flatMap(payloadVersion => [false, true].map(reportedBeforeEdit => ({ payloadVersion, reportedBeforeEdit }))))(
+  'accepts legacy v$payloadVersion reports after explicit v6 conversion (previous ACK=$reportedBeforeEdit)', async ({ payloadVersion, reportedBeforeEdit }) => {
+    await client.automation.update({ where: { id: 'a1' }, data: { payloadVersion } });
+    const handlers = new Map<string, (data: unknown, callback: (response: any) => void) => Promise<void>>();
+    automationSocketHandler('owner', 'm1', { on: (event: string, handler: any) => handlers.set(event, handler) } as never);
+    const send = async () => {
+      const ack = vi.fn(); await handlers.get('automation-run-report')!(report('manual'), ack);
+      expect(ack).toHaveBeenCalledOnce(); return ack.mock.calls[0][0];
+    };
+    if (reportedBeforeEdit) expect(await send()).toMatchObject({ ok: true, value: { idempotent: false } });
+    await client.automation.update({ where: { id: 'a1' }, data: { payloadVersion: 6, generation: 2, revision: 2 } });
+    const manual = await client.session.findUniqueOrThrow({ where: { id: 'manual' } });
+    expect(await send()).toMatchObject({ ok: true, value: { idempotent: reportedBeforeEdit, status: 'COMPLETED' } });
+    expect(await send()).toMatchObject({ ok: true, value: { idempotent: true } });
+    expect(await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } })).toMatchObject({
+      generation: 1, sessionId: 'manual', displaySessionId: null, executionCreateBodyHash: null, status: 'COMPLETED', reportId: 'receipt-r1',
+    });
+    expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
+  });
+
+it('keeps an unregistered isolated claim fenced after its definition generation changes', async () => {
+  await client.automationRun.update({ where: { id: 'r1' }, data: { status: 'CANCELLED' } });
+  await client.automation.update({ where: { id: 'a1' }, data: { enabledAt: new Date(0) } });
+  await client.machine.update({ where: { id: 'm1' }, data: { automationContextIsolationVersion: 1 } });
+  const claimed = await claimAutomationRun(client, 'owner', 'm1', { automationId: 'a1', generation: 1, scheduledFor: now }, now);
+  if (!claimed.ok) throw new Error(claimed.error);
+  const { runId, claimToken } = claimed.value;
+  expect(await startAutomationRun(client, 'owner', 'm1', { runId, claimToken }, now)).toHaveProperty('ok', true);
+  await client.automation.update({ where: { id: 'a1' }, data: { generation: 2, revision: 2 } });
+  expect(await reportAutomationRun(client, 'owner', 'm1', { ...report('manual'), runId, claimToken }, now))
+    .toEqual({ ok: false, error: 'report-conflict' });
+  expect(await client.automationRun.findUniqueOrThrow({ where: { id: runId } })).toMatchObject({
+    generation: 1, executionPayloadVersion: 6, status: 'RUNNING', sessionId: null, reportId: null,
+  });
+});
+
+it('adds an unknown claim-version stamp without changing legacy runs, definitions or manual data', async () => {
+  await client.automation.update({ where: { id: 'a1' }, data: { payloadVersion: 4 } });
+  const legacy = await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } });
+  const definition = await client.automation.findUniqueOrThrow({ where: { id: 'a1' } });
+  const manual = await client.session.findUniqueOrThrow({ where: { id: 'manual' } });
+  await db.exec('ALTER TABLE "AutomationRun" DROP COLUMN IF EXISTS "executionPayloadVersion"');
+  await db.exec(await readFile('prisma/migrations/20261107023000_automation_run_payload_snapshot/migration.sql', 'utf8'));
+  expect(await db.query('SELECT "executionPayloadVersion" FROM "AutomationRun" WHERE id = $1', ['r1']))
+    .toMatchObject({ rows: [{ executionPayloadVersion: null }] });
+  expect(await client.automationRun.findUniqueOrThrow({ where: { id: 'r1' } })).toEqual(legacy);
+  expect(await client.automation.findUniqueOrThrow({ where: { id: 'a1' } })).toEqual(definition);
+  expect(await client.session.findUniqueOrThrow({ where: { id: 'manual' } })).toEqual(manual);
 });
 
 it('requires registration before a v6 report can name an execution', async () => {

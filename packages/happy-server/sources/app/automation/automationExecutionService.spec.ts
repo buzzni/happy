@@ -647,6 +647,21 @@ describe('automationExecutionService', () => {
         expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
     });
 
+    it('keeps a prior legacy generation reportable after the current definition switches to v6', async () => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', generation: 3, kind: 'SCHEDULED',
+            status: 'RUNNING', reportId: null, sessionId: null, displaySessionId: null, executionCreateBodyHash: null,
+            automation: automation({ payloadVersion: 6, generation: 4 }) });
+        tx.session.findFirst.mockResolvedValue({ id: 'session-1' });
+        expect(await reportAutomationRun(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
+            outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null, failureCode: null,
+        }, now)).toMatchObject({ ok: true, value: { idempotent: false } });
+        expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ sessionId: 'session-1', reportId: 'report-1' }),
+        }));
+    });
+
     it('rejects a first completion report linked to a foreign session', async () => {
         const tx = makeTx();
         tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null, automation: automation() });

@@ -270,6 +270,7 @@ export async function claimAutomationRun(
             id: runId,
             automationId: automation.id,
             generation: input.generation,
+            executionPayloadVersion: automation.payloadVersion,
             scheduledFor: input.scheduledFor,
             machineAccountId: accountId,
             machineId,
@@ -455,7 +456,9 @@ export async function reportAutomationRun(
 ): Promise<Result<{ idempotent: boolean; status: string; outcome: AutomationRunOutcome | null; projectId: string }>> {
     const run = await claimedRun(tx, accountId, machineId, input.runId, input.claimToken);
     if (!run) return { ok: false, error: 'claim-not-found' };
-    const isolatedRun = run.automation.payloadVersion === 6 || !!run.displaySessionId
+    const isolatedRun = run.executionPayloadVersion === 6
+        || (run.executionPayloadVersion == null && run.automation.payloadVersion === 6 && run.generation === run.automation.generation)
+        || run.kind === 'QUESTION' || !!run.displaySessionId
         || !!run.executionCreateBodyHash || isAutomationExecutionSessionId(run.sessionId);
     if (isolatedRun) {
         // Registration, not a completion report, fixes the run's execution identity.

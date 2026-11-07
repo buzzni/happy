@@ -97,7 +97,7 @@ export async function claimAutomationExecutionQuestion(tx: Tx, accountId: string
     OR: [{ runLeaseExpiresAt: null }, { runLeaseExpiresAt: { lt: now } }] }, data: { status: 'ABANDONED', completedAt: now, holdCode: null } });
   const claimExpiresAt = new Date(now.getTime() + 120_000);
   const created = await tx.automationRun.createMany({ skipDuplicates: true, data: [{ id: requestId, kind: 'QUESTION', automationId: question.automationId,
-    generation: question.generation, scheduledFor: question.createdAt, machineAccountId: accountId, machineId, status: 'CLAIMED',
+    generation: question.generation, executionPayloadVersion: 6, scheduledFor: question.createdAt, machineAccountId: accountId, machineId, status: 'CLAIMED',
     claimTokenHash, claimExpiresAt, previousExecutionRunId: question.sourceRunId }] });
   if (created.count !== 1) {
     const collision = await tx.automationRun.findUnique({ where: { id: requestId }, select: { id: true } });

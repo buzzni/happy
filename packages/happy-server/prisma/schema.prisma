@@ -636,6 +636,8 @@ model AutomationRun {
     automationId      String
     automation        Automation            @relation(fields: [automationId], references: [id], onDelete: Cascade)
     generation        Int
+    /// Immutable claim-time version; null denotes a run created before this snapshot existed.
+    executionPayloadVersion Int?
     scheduledFor      DateTime
     machineAccountId  String
     machineId         String
