@@ -44,6 +44,12 @@ describe('fromRateLimitEvent', () => {
         });
     });
 
+    it('drops an event whose status this build does not know, and reads a non-text window id as unbound', () => {
+        expect(fromRateLimitEvent({ status: 'throttled' } as never)).toEqual({});
+        expect(fromRateLimitEvent({ status: 'rejected', rateLimitType: 7 } as never))
+            .toEqual({ unbound: { status: 'rejected', utilization: null, resetsAt: null } });
+    });
+
     it('does not change the event the account switcher also reads (R8-c)', () => {
         const info = Object.freeze({ status: 'rejected' as const, rateLimitType: 'five_hour', utilization: 0.97, resetsAt: 1_767_225_600 });
         expect(() => fromRateLimitEvent(info)).not.toThrow();

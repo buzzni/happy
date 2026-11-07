@@ -73,9 +73,11 @@ export function windowsFromGetUsage(rateLimits: Record<string, unknown>): UsageL
     return windows;
 }
 
+/** An event from a newer CLI with a status this build cannot represent says nothing (`{}`). */
 export function fromRateLimitEvent(info: RateLimitEventInfo): { window?: UsageLimitWindow; unbound?: UnboundRateLimit } {
+    if (!STATUSES.has(info.status)) return {};
     const reading = { status: info.status, utilization: eventPercent(info.utilization), resetsAt: eventResetIso(info.resetsAt) };
-    return info.rateLimitType ? { window: { id: info.rateLimitType, ...reading } } : { unbound: reading };
+    return typeof info.rateLimitType === 'string' && info.rateLimitType ? { window: { id: info.rateLimitType, ...reading } } : { unbound: reading };
 }
 
 /** Windows from a state another build may have written: only the readable ones, as this build's shape. */
