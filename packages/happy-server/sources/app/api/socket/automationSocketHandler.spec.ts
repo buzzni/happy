@@ -474,6 +474,7 @@ describe('automationSocketHandler', () => {
         { missedCount: 0 },
         { missedCount: 1001 },
         { firstMissedAt: 'yesterday' },
+        { firstMissedAt: 8_640_000_000_000_001 },
         { generation: 0 },
     ])('rejects a malformed missed gap %o before touching the database', async (patch) => {
         const handlers = bind();

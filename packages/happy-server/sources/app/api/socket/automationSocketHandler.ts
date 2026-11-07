@@ -31,6 +31,8 @@ import {
     sessionFollowupSyncRequestSchema,
 } from '@slopus/happy-wire';
 
+const MAX_DATE_MS = 8_640_000_000_000_000;
+
 type Callback = (response: { ok: boolean; value?: unknown; error?: string }) => void;
 
 function requiredString(value: unknown): string {
@@ -168,7 +170,8 @@ export function automationSocketHandler(accountId: string, machineId: string, so
         const input = {
             automationId: requiredString(data?.automationId),
             generation: integer(data?.generation, 1, Number.MAX_SAFE_INTEGER),
-            firstMissedAt: new Date(integer(data?.firstMissedAt, 0, Number.MAX_SAFE_INTEGER)),
+            // Capped at the largest valid Date: past it the row would fail to store and the daemon would retry forever.
+            firstMissedAt: new Date(integer(data?.firstMissedAt, 0, MAX_DATE_MS)),
             missedCount: integer(data?.missedCount, 1, MAX_MISSED_RUN_COUNT),
             failureCode,
         };
