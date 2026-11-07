@@ -41,10 +41,11 @@ export function createDeviceEnrollment(deps: { machineId: string; keys: DeviceKe
     }
     const awaitingShared = (companyId: string) => pending?.transcript.companyId === companyId && now() < pending.transcript.expiresAt
         && pending.transcript.machineType === 'shared' && pending.transcript.ownerUserId === null && !pending.pinned ? pending : null;
-    /** Stands in for the local confirmation of a shared approval; a failed check leaves the manual confirmation in place. */
+    /** Stands in for the local confirmation of a shared approval; a failed check leaves the manual confirmation in place.
+     * Never for a replacement (aplus#5876): the marker is never rewritten, so it cannot vouch for giving up a pin this PC's user confirmed. */
     async function confirmAutomatically(enrollment: Pending, current: number) {
         const { transcript, approval } = enrollment;
-        if (enrollment.locallyConfirmed || !approval || !deps.autoConfirm || transcript.machineType !== 'shared' || transcript.ownerUserId !== null) return;
+        if (enrollment.locallyConfirmed || enrollment.replaces || !approval || !deps.autoConfirm || transcript.machineType !== 'shared' || transcript.ownerUserId !== null) return;
         const confirmed = await deps.autoConfirm({ transcript: { ...transcript }, approval: { ...approval, body: { ...approval.body } } }).catch(() => false);
         if (current !== revision || pending !== enrollment) throw new Error('DEVICE_ENROLLMENT_REPLACED');
         if (confirmed === true) enrollment.locallyConfirmed = true;
