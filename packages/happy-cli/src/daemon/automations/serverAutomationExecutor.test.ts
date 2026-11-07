@@ -231,7 +231,8 @@ describe('legacy workspace preclaim admission', () => {
     const originalSchedules = f.store.read().schedules
     expect(await runServerAutomationTick(f.input)).toEqual([])
     expect(reserveLegacyDispatch).toHaveBeenCalledWith(['/repo'])
-    expect(f.store.read().schedules).toEqual(originalSchedules)
+    expect(f.store.read().schedules).toEqual(originalSchedules.map(schedule => ({ ...schedule,
+      contextAdmissionDeferred: { revision: cacheRecord().revision, scheduledFor: schedule.nextRunAt } })))
     expect(f.transport.claim).not.toHaveBeenCalled()
     expect(f.runScript).not.toHaveBeenCalled()
     expect(f.spawnSession).not.toHaveBeenCalled()
@@ -4484,10 +4485,11 @@ describe('isolated scheduled conversation admission', () => {
     expect(f.spawnSession).not.toHaveBeenCalled(); expect(f.resumeSession).not.toHaveBeenCalled()
   })
 
-  it('holds an unready isolated once occurrence while continuing legacy work and later claims the original occurrence', async () => {
+  it.each([false, true])('holds an unready isolated once occurrence while continuing legacy work (missed record=%s)', async missedRunRecord => {
     const f = isolatedSetup(), isolated = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
     const cache = f.input.cache.read(), legacy = { ...cache.automations[0], automationId: 'legacy', payloadVersion: 1 as const }
-    f.input.cache.read = () => ({ ...cache, automations: [...cache.automations, legacy] })
+    f.input.cache.read = () => ({ ...cache, missedRunRecord, automations: [...cache.automations, legacy] })
+    const recordMissed = vi.fn(async () => ({ ok: true })); Object.assign(f.transport, { recordMissed })
     const state = f.store.read()
     f.store.write({ ...state, schedules: [...state.schedules, { ...state.schedules[0], automationId: 'legacy' }] })
     f.input.decryptPayload = row => row.automationId === 'legacy' ? { ...isolated, conversation: undefined, contextPolicy: undefined }
@@ -4498,6 +4500,7 @@ describe('isolated scheduled conversation admission', () => {
     expect(await runServerAutomationTick(f.input)).toEqual([{ automationId: 'legacy', outcome: 'WOKE' }])
     expect(f.transport.claim.mock.calls.map(([row]) => row.automationId)).toEqual(['legacy'])
     expect(f.spawnSession).toHaveBeenCalledOnce(); expect(dispatch).not.toHaveBeenCalled()
+    expect(recordMissed).not.toHaveBeenCalled()
     const held = f.store.state().schedules.find(row => row.automationId === 'automation-1')!
     expect(held.nextRunAt).toBeLessThanOrEqual(f.now)
     expect(f.transport.report).not.toHaveBeenCalledWith(expect.objectContaining({ automationId: 'automation-1' }))
@@ -4507,6 +4510,73 @@ describe('isolated scheduled conversation admission', () => {
     expect(f.transport.claim.mock.calls.map(([row]) => row.automationId)).toEqual(['automation-1'])
     expect(dispatch).toHaveBeenCalledOnce()
     expect(f.transport.claim).toHaveBeenCalledWith(expect.objectContaining({ scheduledFor: held.nextRunAt }))
+  })
+
+  it.each(['unready', 'reference'])('keeps an overdue isolated occurrence due before missed-run recording while held for %s', async reason => {
+    const f = isolatedSetup(), original = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
+    const cache = f.input.cache.read(); f.input.cache.read = () => ({ ...cache, missedRunRecord: true })
+    f.input.now = f.now + 120_000
+    f.input.decryptPayload = () => ({ ...original, contextPolicy: { kind: 'isolated', reference: { kind: 'previous-result', maxBytes: 16384 } },
+      schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } })
+    const recordMissed = vi.fn(async () => ({ ok: true })); Object.assign(f.transport, { recordMissed })
+    f.input.isolatedContextReady = reason !== 'unready'
+    f.input.prepareIsolatedContext = vi.fn(async () => { throw new Error('AUTOMATION_REFERENCE_UNAVAILABLE') })
+    f.input.dispatchIsolatedContext = vi.fn(async () => ({ state: 'started' as const, sessionId: 'automation-run:run-1' }))
+    const originalSchedule = f.store.read().schedules[0]
+    await runServerAutomationTick(f.input); await runServerAutomationTick(f.input)
+    expect(recordMissed).not.toHaveBeenCalled(); expect(f.transport.claim).not.toHaveBeenCalled()
+    expect(f.transport.report).not.toHaveBeenCalled(); expect(f.input.dispatchIsolatedContext).not.toHaveBeenCalled()
+    expect(f.store.read().schedules[0]).toMatchObject(originalSchedule)
+  })
+
+  it.each(['unready', 'reference', 'legacy'])('preserves the original held once for reconfirmation after %s recovers beyond the claim window', async reason => {
+    const f = isolatedSetup(), original = f.input.decryptPayload(cacheRecord(), new Uint8Array(32)), cache = f.input.cache.read()
+    f.input.cache.read = () => ({ ...cache, missedRunRecord: true, automations: cache.automations.map(row => ({ ...row,
+      ...(reason === 'legacy' ? { payloadVersion: 1 as const } : {}) })) })
+    f.input.decryptPayload = () => ({ ...original, conversation: reason === 'legacy' ? undefined : original.conversation,
+      contextPolicy: reason === 'legacy' ? undefined : { kind: 'isolated', reference: { kind: 'previous-result', maxBytes: 16384 } },
+      schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } })
+    const recordMissed = vi.fn(async () => ({ ok: true })); Object.assign(f.transport, { recordMissed })
+    const prepare = vi.fn(async (): Promise<{ previousResult?: unknown }> => { throw new Error('AUTOMATION_REFERENCE_UNAVAILABLE') })
+    f.input.prepareIsolatedContext = prepare; f.input.isolatedContextReady = reason !== 'unready'
+    let blocked = true
+    if (reason === 'legacy') f.input.reserveLegacyDispatch = async () => blocked
+      ? { acquired: false, reason: 'workspace-busy', sessions: [] } : { acquired: true, finish: async () => {} }
+    f.input.dispatchIsolatedContext = vi.fn(async () => ({ state: 'started' as const, sessionId: 'automation-run:run-1' }))
+    await runServerAutomationTick(f.input)
+    const due = f.store.read().schedules[0].nextRunAt
+    blocked = false; f.input.isolatedContextReady = true; f.input.now = f.now + 120_000
+    prepare.mockResolvedValue({ previousResult: { automationId: 'automation-1', status: 'NONE_ELIGIBLE' } })
+    f.transport.claim.mockResolvedValue({ ok: false, error: 'claim-denied' })
+    await runServerAutomationTick(f.input)
+    expect(recordMissed).not.toHaveBeenCalled()
+    expect(f.transport.claim).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ scheduledFor: due }))
+    expect(f.store.read().schedules[0]).toMatchObject({ nextRunAt: due, contextAdmissionHold: {
+      code: 'CLAIM_RECONFIRMATION_REQUIRED', revision: cache.automations[0].revision, scheduledFor: due } })
+    expect(f.input.dispatchIsolatedContext).not.toHaveBeenCalled(); expect(f.spawnSession).not.toHaveBeenCalled()
+  })
+
+  it.each(['revision', 'due'])('does not let a stale admission %s suppress ordinary offline missed recording', async changed => {
+    const f = isolatedSetup(), original = f.input.decryptPayload(cacheRecord(), new Uint8Array(32)), cache = f.input.cache.read()
+    f.input.cache.read = () => ({ ...cache, missedRunRecord: true }); f.input.now = f.now + 120_000
+    f.input.decryptPayload = () => ({ ...original, schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } })
+    const state = f.store.read(), due = state.schedules[0].nextRunAt
+    f.store.write({ ...state, schedules: state.schedules.map(row => ({ ...row, contextAdmissionDeferred: {
+      revision: cache.automations[0].revision + (changed === 'revision' ? 1 : 0), scheduledFor: due + (changed === 'due' ? 1 : 0) } })) })
+    const recordMissed = vi.fn(async () => ({ ok: true })); Object.assign(f.transport, { recordMissed })
+    await runServerAutomationTick(f.input)
+    expect(recordMissed).toHaveBeenCalledOnce(); expect(f.transport.claim).not.toHaveBeenCalled()
+    expect(f.store.read().schedules[0].contextAdmissionDeferred).toBeUndefined()
+  })
+
+  it('still records an offline isolated once that was never held by admission', async () => {
+    const f = isolatedSetup(), original = f.input.decryptPayload(cacheRecord(), new Uint8Array(32)), cache = f.input.cache.read()
+    f.input.cache.read = () => ({ ...cache, missedRunRecord: true }); f.input.now = f.now + 120_000
+    f.input.decryptPayload = () => ({ ...original, schedule: { kind: 'once-zoned', date: '1970-01-01', hour: 0, minute: 16, timeZone: 'UTC' } })
+    const recordMissed = vi.fn(async () => ({ ok: true })); Object.assign(f.transport, { recordMissed })
+    await runServerAutomationTick(f.input)
+    expect(recordMissed).toHaveBeenCalledOnce(); expect(f.transport.claim).not.toHaveBeenCalled()
+    expect(f.store.read().schedules[0].nextRunAt).toBeGreaterThan(f.input.now!)
   })
 
   it('keeps a deferred one-time run active under its durable runtime owner instead of reporting completion or claiming another occurrence', async () => {
@@ -5372,5 +5442,215 @@ describe('scheduled run waiting gate', () => {
     c.input.deliverConversation = deliver as never
     await runServerAutomationTick(c.input)
     expect(deliver.mock.calls[0]![0].prompt).toBe('prompt')
+  })
+})
+
+// aplus-dev-studio specs/scheduled-missed-run-policy R4·R5·R7 — a schedule left stale by sleep or
+// shutdown is written to the server as one missed row before the daemon moves on.
+describe('놓친 예약 회차 기록', () => {
+  const T = Date.UTC(2026, 10, 7, 9, 0)
+  const MIN = 60_000
+
+  function stale(options: {
+    nextRunAt: number
+    record?: { ok: boolean; value?: any; error?: string }
+    serverRecords?: boolean
+    claim?: { ok: boolean; value?: any; error?: string }
+  }) {
+    const fixture = setup({ claim: options.claim })
+    const base = fixture.input.cache.read
+    fixture.input.cache = { read: () => ({ ...base(), ...(options.serverRecords === false ? {} : { missedRunRecord: true }) }) }
+    fixture.input.now = T
+    fixture.store.write({
+      ...fixture.store.read(),
+      schedules: [{ automationId: 'automation-1', generation: 2, nextRunAt: options.nextRunAt, lastSessionId: null }],
+    })
+    const recordMissed = vi.fn(async (_input: any): Promise<any> => options.record ?? ({ ok: true, value: { runId: 'missed-1', idempotent: false } }))
+    Object.assign(fixture.input.transport, { recordMissed })
+    return { ...fixture, recordMissed }
+  }
+
+  it('records the whole gap as one report and moves to the next slot only after the server stores it', async () => {
+    const { input, store, transport, recordMissed, spawnSession } = stale({ nextRunAt: T - 185 * MIN })
+
+    await runServerAutomationTick(input)
+
+    expect(recordMissed).toHaveBeenCalledTimes(1)
+    expect(recordMissed).toHaveBeenCalledWith({
+      automationId: 'automation-1', generation: 2, firstMissedAt: T - 185 * MIN, missedCount: 13,
+      failureCode: 'MISSED_OFFLINE',
+    })
+    // The 15 minute grid resumes at the first slot after the gap; nothing is claimed or run late.
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T + 10 * MIN)
+    expect(transport.claim).not.toHaveBeenCalled()
+    expect(spawnSession).not.toHaveBeenCalled()
+  })
+
+  it('keeps the stale schedule when the server does not confirm, and reports the same gap next tick', async () => {
+    const { input, store, transport, recordMissed } = stale({ nextRunAt: T - 185 * MIN, record: { ok: false, error: 'ack-timeout' } })
+
+    await runServerAutomationTick(input)
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T - 185 * MIN)
+    expect(transport.claim).not.toHaveBeenCalled()
+
+    // A daemon restart re-reads the same stale schedule; the report names the same first slot,
+    // so the server's slot fence absorbs it.
+    recordMissed.mockResolvedValue({ ok: true, value: { runId: 'missed-1', idempotent: true } })
+    await runServerAutomationTick(input)
+    expect(recordMissed.mock.calls.map(([call]) => call.firstMissedAt)).toEqual([T - 185 * MIN, T - 185 * MIN])
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T + 10 * MIN)
+  })
+
+  it('falls back to the existing claim path when the server refuses the record', async () => {
+    const { input, store, transport, recordMissed } = stale({
+      nextRunAt: T - 185 * MIN, record: { ok: false, error: 'claim-denied' }, claim: { ok: false, error: 'claim-denied' },
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(recordMissed).toHaveBeenCalledTimes(1)
+    expect(transport.claim).toHaveBeenCalledWith(expect.objectContaining({ scheduledFor: T - 185 * MIN }))
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T + 15 * MIN)
+  })
+
+  it('behaves exactly as before against a server that does not advertise missed-run records', async () => {
+    const { input, store, transport, recordMissed } = stale({
+      nextRunAt: T - 185 * MIN, serverRecords: false, claim: { ok: false, error: 'claim-denied' },
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(recordMissed).not.toHaveBeenCalled()
+    expect(transport.claim).toHaveBeenCalledWith(expect.objectContaining({ scheduledFor: T - 185 * MIN }))
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T + 15 * MIN)
+  })
+
+  it('claims a slot that is still inside the claim window right after recording the gap before it', async () => {
+    const { input, store, transport, recordMissed } = stale({
+      nextRunAt: T - 180 * MIN, claim: { ok: false, error: 'already-claimed' },
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(recordMissed).toHaveBeenCalledWith(expect.objectContaining({ firstMissedAt: T - 180 * MIN, missedCount: 12 }))
+    expect(transport.claim).toHaveBeenCalledWith({ automationId: 'automation-1', generation: 2, scheduledFor: T })
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T + 15 * MIN)
+  })
+
+  it('does not record a delay inside the claim window', async () => {
+    const { input, transport, recordMissed } = stale({ nextRunAt: T - 60_000, claim: { ok: false, error: 'already-claimed' } })
+
+    await runServerAutomationTick(input)
+
+    expect(recordMissed).not.toHaveBeenCalled()
+    expect(transport.claim).toHaveBeenCalledWith(expect.objectContaining({ scheduledFor: T - 60_000 }))
+  })
+
+  it('does not record a stale run-now request or a GitHub trigger', async () => {
+    const runNow = stale({ nextRunAt: T - 185 * MIN, claim: { ok: false, error: 'claim-denied' } })
+    const base = runNow.input.cache.read
+    runNow.input.cache = { read: () => {
+      const state = base()
+      return { ...state, automations: state.automations.map((row) => ({ ...row, runRequestedAt: T - 185 * MIN })) }
+    } }
+    await runServerAutomationTick(runNow.input)
+    expect(runNow.recordMissed).not.toHaveBeenCalled()
+
+    const github = stale({ nextRunAt: T - 185 * MIN, claim: { ok: false, error: 'claim-denied' } })
+    github.input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const }, prompt: 'Review',
+      directory: '/repo', scriptCommand: null, suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: null,
+      },
+    }))
+    await runServerAutomationTick(github.input)
+    expect(github.recordMissed).not.toHaveBeenCalled()
+  })
+
+  it('retries when the server could not store the gap instead of moving on without a record', async () => {
+    const { input, store, transport, recordMissed } = stale({ nextRunAt: T - 185 * MIN, record: { ok: false, error: 'record-failed' } })
+
+    await runServerAutomationTick(input)
+
+    expect(recordMissed).toHaveBeenCalledTimes(1)
+    expect(transport.claim).not.toHaveBeenCalled()
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T - 185 * MIN)
+  })
+
+  it('reports the rest of the gap from the next slot, in the same tick, when the first slot had actually run', async () => {
+    // Its claim reached the server before the PC went down, but the daemon never heard back.
+    const { input, store, transport, recordMissed } = stale({ nextRunAt: T - 185 * MIN })
+    recordMissed.mockResolvedValueOnce({ ok: false, error: 'already-claimed' })
+
+    await runServerAutomationTick(input)
+
+    expect(recordMissed.mock.calls.map(([call]) => [call.firstMissedAt, call.missedCount])).toEqual([
+      [T - 185 * MIN, 13], [T - 170 * MIN, 12],
+    ])
+    expect(transport.claim).not.toHaveBeenCalled()
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T + 10 * MIN)
+  })
+
+  it('claims the next slot right away when it is still inside the claim window after an already-run first slot', async () => {
+    const { input, transport, recordMissed } = stale({ nextRunAt: T - 15 * MIN - 60_000, record: { ok: false, error: 'already-claimed' }, claim: { ok: false, error: 'already-claimed' } })
+
+    await runServerAutomationTick(input)
+
+    expect(recordMissed).toHaveBeenCalledTimes(1)
+    expect(transport.claim).toHaveBeenCalledWith(expect.objectContaining({ scheduledFor: T - 60_000 }))
+  })
+
+  it('gives up on a gap the server never confirms after several ticks and lets later slots run', async () => {
+    const { input, store, transport, recordMissed } = stale({
+      nextRunAt: T - 185 * MIN, record: { ok: false, error: 'record-failed' }, claim: { ok: false, error: 'claim-denied' },
+    })
+
+    for (let tick = 0; tick < 4; tick++) await runServerAutomationTick(input)
+    expect(transport.claim).not.toHaveBeenCalled()
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T - 185 * MIN)
+
+    await runServerAutomationTick(input)
+    expect(recordMissed).toHaveBeenCalledTimes(5)
+    expect(transport.claim).toHaveBeenCalledTimes(1)
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T + 15 * MIN)
+  })
+
+  it('does not count a run-now request postponed behind a running session and then slept through', async () => {
+    const requestedAt = T - 3 * 60 * MIN
+    const fixture = stale({ nextRunAt: requestedAt, claim: { ok: false, error: 'claim-denied' } })
+    const base = fixture.input.cache.read
+    fixture.input.cache = { read: () => {
+      const state = base()
+      return { ...state, automations: state.automations.map((row) => ({ ...row, runRequestedAt: requestedAt })) }
+    } }
+    fixture.store.write({ ...fixture.store.read(), schedules: [{ automationId: 'automation-1', generation: 2, nextRunAt: requestedAt, lastSessionId: 'session-busy', runRequestRevision: 2 }] })
+    // The previous run is still going when the request comes due: the request waits a tick.
+    fixture.input.now = requestedAt + 1_000
+    fixture.input.isSessionRunning = vi.fn(() => true)
+    await runServerAutomationTick(fixture.input)
+    expect(fixture.store.state().schedules[0]).toMatchObject({ nextRunAt: requestedAt + 1_001, deferredRunRequestAt: requestedAt })
+
+    // The PC sleeps; on waking the session is over and the postponed time is far behind.
+    fixture.input.now = T
+    fixture.input.isSessionRunning = vi.fn(() => false)
+    await runServerAutomationTick(fixture.input)
+    expect(fixture.recordMissed).not.toHaveBeenCalled()
+    expect(fixture.transport.claim).toHaveBeenCalledWith(expect.objectContaining({ scheduledFor: requestedAt + 1_001 }))
+    expect(fixture.store.state().schedules[0]!).not.toHaveProperty('deferredRunRequestAt')
+  })
+
+  it('keeps deferring behind a still-running previous session instead of recording', async () => {
+    const { input, store, recordMissed } = stale({ nextRunAt: T - 185 * MIN })
+    store.write({ ...store.read(), schedules: [{ automationId: 'automation-1', generation: 2, nextRunAt: T - 185 * MIN, lastSessionId: 'session-busy' }] })
+    input.isSessionRunning = vi.fn(() => true)
+
+    await runServerAutomationTick(input)
+
+    expect(recordMissed).not.toHaveBeenCalled()
+    expect(store.state().schedules[0]!.nextRunAt).toBe(T + 1)
   })
 })

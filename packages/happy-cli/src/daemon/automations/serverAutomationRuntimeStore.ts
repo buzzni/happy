@@ -19,12 +19,20 @@ export interface ServerAutomationScheduleState {
   runRequestRevision?: number | null
   /** A denied isolated once claim needs a new explicit run request; it is not a spent occurrence. */
   contextAdmissionHold?: { code: 'CLAIM_RECONFIRMATION_REQUIRED'; revision: number; scheduledFor: number }
+  /** A pre-claim admission hold is not an offline missed occurrence. */
+  contextAdmissionDeferred?: { revision: number; scheduledFor: number }
   /**
    * 1회 예약에서 이미 실행한(claim 성공 또는 서버의 같은 회차 거절) 정규 회차 시각. generation 이 바뀌어도
    * 넘긴다 — 서버의 같은 회차 거절은 generation 단위라, 이것 없이는 실행 직후의 편집·재개가 그 회차를
    * 새 generation 으로 다시 claim 한다. 구 데몬 파서는 이 필드를 버릴 뿐 파일을 거부하지 않는다.
    */
   spentOnceAt?: number
+  /**
+   * 즉시 실행 요청을 직전 회차 세션 때문에 미뤘을 때 그 요청 시각. 미루면 nextRunAt 이 now+1 로 바뀌어 요청과의
+   * 연결이 끊기므로, 그 사이 PC 가 잠들어도 놓친 정규 회차로 세지 않게 남긴다(scheduled-missed-run-policy R7).
+   * 일정이 다음 회차로 넘어가면 지운다. 구 데몬 파서는 이 필드를 버릴 뿐 파일을 거부하지 않는다.
+   */
+  deferredRunRequestAt?: number
 }
 
 export interface GithubIssueProgressMarkerState {
@@ -256,6 +264,7 @@ function parse(raw: string): ServerAutomationRuntimeState {
     if (disk.version !== 1 || !Array.isArray(disk.schedules) || !Array.isArray(disk.pendingReports)) invalid()
     const schedules = disk.schedules.map((value) => {
       const row = record(value)
+      const deferred = row.contextAdmissionDeferred === undefined ? undefined : record(row.contextAdmissionDeferred)
       const hold = row.contextAdmissionHold === undefined ? undefined : record(row.contextAdmissionHold)
       if (hold && hold.code !== 'CLAIM_RECONFIRMATION_REQUIRED') invalid()
       return {
@@ -271,6 +280,8 @@ function parse(raw: string): ServerAutomationRuntimeState {
         ...(row.spentOnceAt !== undefined ? { spentOnceAt: integer(row.spentOnceAt) } : {}),
         ...(hold ? { contextAdmissionHold: { code: 'CLAIM_RECONFIRMATION_REQUIRED' as const,
           revision: integer(hold.revision, 1), scheduledFor: integer(hold.scheduledFor) } } : {}),
+        ...(deferred ? { contextAdmissionDeferred: { revision: integer(deferred.revision, 1), scheduledFor: integer(deferred.scheduledFor) } } : {}),
+        ...(row.deferredRunRequestAt !== undefined ? { deferredRunRequestAt: integer(row.deferredRunRequestAt) } : {}),
       }
     })
     const pendingReports = disk.pendingReports.map(parsePendingReport)

@@ -1023,10 +1023,19 @@ describe('ApiMachineClient socket reconnection', () => {
             let release!: () => void;
             const gate = new Promise<void>(resolve => { release = resolve; });
             let retention: Promise<void> | undefined;
+            const handoffs: Promise<void>[] = [];
+            const reserve = createLegacyDispatchAdmission({ home });
+            const reserveTracked = async (roots: readonly string[]) => {
+                const reservation = await reserve(roots);
+                if (!reservation.acquired) return reservation;
+                return { acquired: true as const, finish: () => {
+                    const pending = reservation.finish(); handoffs.push(pending); return pending;
+                } };
+            };
             const machine = makeMachine(), sessionId = 'v2-submitted-close';
             const client = Reflect.construct(ApiMachineClient, ['fake-token', machine, undefined, undefined, null, undefined,
                 (roots: readonly string[]) => retention = (async () => { await gate; await createSubprocessWriteAdmission({ home })(roots); })(),
-                createLegacyDispatchAdmission({ home })]);
+                reserveTracked]);
             client.connect();
             try {
                 expect(await open(machine, sessionId, boundOpen(machine, { params: { cwd: directory } }).params)).toMatchObject({ ok: true });
@@ -1041,6 +1050,9 @@ describe('ApiMachineClient socket reconnection', () => {
                 await vi.waitFor(async () => expect(await owner.tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' }));
             } finally {
                 release(); await retention; await getDaemonTerminalSession(sessionId)?.session.terminate(); removeDaemonTerminalSession(sessionId);
+                // The relay ACK precedes asynchronous reservation handoff. Drain both releases before removing their registry.
+                if (retention) await vi.waitFor(() => expect(handoffs).toHaveLength(2));
+                await Promise.all(handoffs);
                 await rm(home, { recursive: true, force: true }); vi.unstubAllEnvs();
             }
         });
@@ -2804,6 +2816,11 @@ describe('ApiMachineClient socket reconnection', () => {
             .resolves.toEqual({ ok: false, error: 'ack-timeout' });
         await expect(transport.report({ runId: 'run-1', claimToken: 'token', reportId: 'report-1' }))
             .resolves.toEqual({ ok: false, error: 'ack-timeout' });
+        // An old server has no handler for the missed-run record and never acks it; the executor reads
+        // this as "not confirmed" and keeps the schedule (scheduled-missed-run-policy R5).
+        const gap = { automationId: 'automation-1', generation: 2, firstMissedAt: 10, missedCount: 3, failureCode: 'MISSED_OFFLINE' };
+        await expect(transport.recordMissed(gap)).resolves.toEqual({ ok: false, error: 'ack-timeout' });
+        expect(timedOut).toHaveBeenCalledWith('automation-missed-record', gap);
 
         expect(mockSocket.timeout).toHaveBeenCalledWith(30_000);
         expect(timedOut).toHaveBeenCalledWith('automation-claim', { automationId: 'automation-1', generation: 2, scheduledFor: 10 });
