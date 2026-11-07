@@ -1,6 +1,6 @@
 # happy-server push 결과 보고(PushOutcome) Context
 
-> 마지막 갱신: 2026-11-07 / 상태: 진행중(T1~T4 완료, T5 리뷰·PR)
+> 마지막 갱신: 2026-11-07 / 상태: 진행중(PR #1154 머지 대기 — tasks 전부 완료)
 
 ## 현재 상태
 
@@ -26,6 +26,8 @@
 - 관련 테스트: `pushDispatch.spec.ts`(10) · `pushSend.spec.ts`(3) · `pushRoutes.spec.ts`(10) 통과.
 - happy-server 전체 `pnpm test`: 149 파일 / 1973 통과(519 skip은 DB 필요 통합 테스트). `pnpm typecheck` 통과.
 
+- PR https://github.com/buzzni/happy/pull/1154 — smoke CI 5종 통과, 리뷰봇 30분 무응답, origin/main 병합(force-push 금지라 rebase 대신 merge).
+
 ## 다음 시작점
 
-tasks.md T5 — 교차 리뷰 반영, PR, CI.
+머지는 지휘 세션 몫. 후속: CLI·Desktop이 응답 `push`를 읽어 표시(범위 밖), 배포 뒤 `push_outcomes_total` 확인.
