@@ -701,7 +701,9 @@ fold($('eventsToggle'));fold($('advancedToggle'));
  * 1.5 s); an unknown input outcome waits for Reconnect, never a silent retry.
  */
 var pageViewer=null,pageGen=0,pageBusy=false,pageKey='',pageOpenedAt=-Infinity,pageFitted=true;
-function pageStatus(text,error){var h=$('screenHintText');h.textContent=text;h.classList.toggle('warn-text',!!error)}
+/** The screen line says what the view is doing; Reconnect is offered only after a failure or an input receipt check. */
+function pageStatus(text,error){var h=$('screenHintText');h.textContent=text;h.classList.toggle('warn-text',!!error);
+ $('pageRetry').hidden=!S.pageScope||!(error||pageViewer&&pageViewer.lost())}
 function pageFail(e){var c=e&&e.code;pageViewer.halt();pageViewer.paint();
  pageStatus(c==='UNAUTHORIZED'?PT.expired:c==='SCOPE_DENIED'||c==='ORIGIN_DENIED'?PT.forbidden:c==='UNSUPPORTED_OPERATION'?PT.unsupported:c==='OUTCOME_UNKNOWN'?PT.unresolved:PT.offline,true)}
 function pageOp(name,body){var ctl=new AbortController(),timer=setTimeout(function(){ctl.abort()},6000);
@@ -723,7 +725,7 @@ function pageCapability(token){var parts=token.split('.'),c=parts.length===4?dec
  .catch(function(){S.pageBinding='';window.__abpPageViewBinding=null;window.__abpPageViewUnsupported=1;pageStatus(PT.unsupported,true);askHost()});
  return true}
 /** The screen area follows the capability: the page view with a page capability, the Chrome window guidance otherwise. */
-function pageMode(){var on=!!S.pageScope;document.body.classList.toggle('page-view',on);$('viewGroup').hidden=!on&&NATIVE_SCREEN;$('pageRetry').hidden=!on;
+function pageMode(){var on=!!S.pageScope;document.body.classList.toggle('page-view',on);$('viewGroup').hidden=!on&&NATIVE_SCREEN;$('pageRetry').hidden=true;
  $('spaceToggle').hidden=on;if(on&&!$('spacePanel').hidden)spaceToggle(false);
  var b=$('screenEmpty').querySelector('b'),span=$('screenEmpty').querySelector('span');b.textContent=on?PT.emptyTitle:T.screenEmptyTitle;span.textContent=on?PT.emptyBody:T.screenEmptyBody;
  if(!on){pageStatus(T.screenHint,false);if(pageViewer){++pageGen;pageKey='';void pageViewer.close().catch(function(){})}}else syncPage()}

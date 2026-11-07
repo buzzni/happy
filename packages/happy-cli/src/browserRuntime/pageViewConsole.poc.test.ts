@@ -31,6 +31,8 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
     let frames = 0
     /** Frame reads the fake Runtime refuses as rate limited, as the real one does inside its interval. */
     let refuseFrames = 0
+    /** A frame read the fake Runtime answers with this error (a view the Runtime no longer accepts). */
+    let frameError: string | null = null
     const task = () => ({ taskId: 'task-1', agentSessionId: SESSION, status: 'paused', pauseReason: 'user-control', stateVersion: 3, tabs: ['tab-1'],
         uncertainActions: [], cancelRequested: false, updatedAtMs: Date.now(), tabLeases: [{ tabId: 'tab-1', leaseEpoch: 4, owner: leaseOwner }] })
 
@@ -56,6 +58,11 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
                     refuseFrames--
                     res.writeHead(429, { 'content-type': 'application/json' })
                     res.end(JSON.stringify({ ok: false, error: { code: 'QUOTA_EXCEEDED', message: 'Page capture rate limited' } }))
+                    return
+                }
+                if (m[1] === 'getPageFrame' && !body.statusOnly && frameError) {
+                    res.writeHead(403, { 'content-type': 'application/json' })
+                    res.end(JSON.stringify({ ok: false, error: { code: frameError, message: 'refused' } }))
                     return
                 }
                 const result = m[1] === 'pageViewInfo' ? { schemaVersion: 1, supported: true, input: true, runtimeBindingId: BINDING }
@@ -202,9 +209,11 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
                     guide: !!document.getElementById('screenEmpty').getClientRects().length,
                     sizes: !!document.getElementById('viewGroup').getClientRects().length,
                     spaces: !!document.getElementById('spaceToggle').getClientRects().length,
+                    reconnect: !!document.getElementById('pageRetry').getClientRects().length,
                     controls: ['takeOver', 'release', 'resume', 'stop', 'autoMode'].every(id => !!document.getElementById(id).getClientRects().length),
                     hint: document.getElementById('screenHintText').textContent })`))
-                expect(state).toMatchObject({ page: true, guide: false, sizes: true, spaces: false, controls: true })
+                // Reconnect is offered only after a failure or an input receipt check, not while the page is live.
+                expect(state).toMatchObject({ page: true, guide: false, sizes: true, spaces: false, reconnect: false, controls: true })
                 expect(state.hint).toBe(lang === 'ko' ? '페이지를 보고 있어요. 직접 조작하려면 제어권을 가져오세요.' : 'Observing the page. Take over to use it.')
             } finally { await harness.closeTarget(target) }
         }
@@ -231,6 +240,22 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
             const order = ops.map((o) => o.op).filter((op) => ['releaseControl', 'closePageView', 'openPageView'].includes(op))
             expect(order.slice(order.lastIndexOf('releaseControl'))).toEqual(['releaseControl', 'closePageView', 'openPageView'])
         } finally { await harness.closeTarget(target) }
+    })
+
+    it('local console: a refused view offers Reconnect, which reopens the view', async () => {
+        ops.length = 0; leaseOwner = { kind: 'none' }
+        const target = await openLocal()
+        try {
+            frameError = 'SCOPE_DENIED'
+            await eventually(() => harness.evaluate(target, `!!document.getElementById('pageRetry').getClientRects().length`), Boolean, 5_000)
+            expect(await harness.evaluate(target, `document.getElementById('screenHintText').textContent`)).toBe('This conversation cannot access the page.')
+            frameError = null
+            const opened = ops.filter((o) => o.op === 'openPageView').length
+            await harness.evaluate(target, `document.getElementById('pageRetry').click()`)
+            await eventually(() => ops.filter((o) => o.op === 'openPageView').length, (n) => n > opened, 5_000)
+            await eventually(() => harness.evaluate(target, `document.getElementById('screenHintText').textContent`), (s) => s === 'Observing the page. Take over to use it.', 5_000)
+            expect(await harness.evaluate(target, `!!document.getElementById('pageRetry').getClientRects().length`)).toBe(false)
+        } finally { frameError = null; await harness.closeTarget(target) }
     })
 
     it('local console: a capability without the page scope keeps the Chrome window guidance and the spaces', async () => {
