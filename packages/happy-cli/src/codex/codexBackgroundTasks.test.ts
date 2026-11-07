@@ -76,6 +76,28 @@ describe('Codex background reconciliation', () => {
         await refresh;
         expect(publish.mock.lastCall?.[0]).toEqual([expect.objectContaining({ ...task, status: 'unknown' })]);
     });
+    it('keeps the time a terminal was first seen across refreshes (specs/agent-background-work-panel R1)', async () => {
+        let clock = 1_000;
+        const publish = vi.fn();
+        const tracker = new CodexBackgroundTasks(async () => ({ data: [row], nextCursor: null }), publish, () => clock);
+        await tracker.refresh('thread', [task]);
+        clock = 9_000;
+        await tracker.refresh('thread');
+        expect(publish.mock.lastCall?.[0]).toEqual([expect.objectContaining({ callId: 'cmd', startedAt: 1_000 })]);
+        expect(tracker.stopTarget('cmd')).toEqual({ threadId: 'thread', processId: '42' });
+    });
+    it('stops a terminal only on the thread whose full snapshot listed it, never a restored or unconfirmed one', async () => {
+        const tracker = new CodexBackgroundTasks(async () => ({ data: [row], nextCursor: null }), vi.fn());
+        tracker.restore([{ callId: 'cmd', command: 'vite', processId: '42', status: 'running' }]);
+        expect(tracker.has('cmd')).toBe(true);
+        expect(tracker.stopTarget('cmd')).toBeNull();
+        await tracker.refresh('old-thread');
+        // `/clear` starts another thread; until its snapshot the listed terminal still belongs to the old one.
+        expect(tracker.stopTarget('cmd')).toEqual({ threadId: 'old-thread', processId: '42' });
+        tracker.invalidate();
+        expect(tracker.stopTarget('cmd')).toBeNull();
+        expect(tracker.stopTarget('missing')).toBeNull();
+    });
     it('treats malformed responses as unavailable, not an empty authoritative list', async () => {
         const publish = vi.fn();
         const tracker = new CodexBackgroundTasks(async () => ({ data: [{ itemId: 'cmd' }] }), publish);

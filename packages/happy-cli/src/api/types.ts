@@ -616,6 +616,11 @@ export type Metadata = {
      * `linkedPullRequests` does not depend on it.
      */
     linkedPullRequests?: 1,
+    /**
+     * aplus-dev-studio-desktop specs/agent-background-work-panel R2/R4 — this runtime answers
+     * `background-task-stop` for the tasks it lists. Absent: an older runtime; clients show the list without Stop.
+     */
+    backgroundTaskStop?: 1,
   },
   /**
    * aplus-dev-studio-desktop specs/linked-pull-requests R1-1 — up to 20 `LinkedPullRequest` entries
@@ -654,9 +659,14 @@ export type Metadata = {
   claudeBackgroundTasks?: {
     startedAt: number;
     available: boolean;
-    tasks: Array<{ taskId: string; label: string; kind: 'shell' | 'agent' }> | null;
+    /**
+     * `taskType` (the SDK `task_type`), `startedAt` (first listed) and, for a Bash/Monitor task, `command` and
+     * `toolName` are aplus-dev-studio-desktop specs/agent-background-work-panel R1; readers treat them as optional.
+     */
+    tasks: Array<{ taskId: string; label: string; kind: 'shell' | 'agent'; taskType?: string; startedAt?: number; command?: string; toolName?: string }> | null;
   },
-  codexBackgroundTasks?: Array<{ callId: string; command: string; processId?: string; status: 'running' | 'unknown' }>,
+  /** `startedAt`: when this runtime first saw the terminal (specs/agent-background-work-panel R1). */
+  codexBackgroundTasks?: Array<{ callId: string; command: string; processId?: string; status: 'running' | 'unknown'; startedAt?: number }>,
   /**
    * The Codex sub-agents (child threads) running now, the shape of `claudeBackgroundTasks`; REPLACE on every
    * publish. `taskId` is the child thread id, which is also the call id of its `CodexAgent` row.

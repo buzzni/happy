@@ -49,6 +49,8 @@ import type { ContentBlockParam } from '@anthropic-ai/sdk/resources';
 import { createEnvelope, isAutomationExecutionSessionId, type McpRuntimeServerStatus } from '@slopus/happy-wire';
 import type { McpRuntimeRecovery } from './mcpRuntimeRecovery';
 import { registerMcpReconnectHandler } from './registerMcpReconnectHandler';
+import { createClaudeBackgroundTaskDetails } from './claudeBackgroundTaskDetails';
+import { advertiseBackgroundTaskStop, registerBackgroundTaskStopHandler } from '@/utils/backgroundTaskStop';
 import { publishClaudePromptSuggestion } from './promptSuggestionMetadata';
 import { createStreamDeltaRelay } from './streamDeltaRelay';
 import { contextUsageBreakdownRequestItem, contextUsageSignalItem, withContextUsageSignals, type ClaudeControlRequest } from './claudeContextUsage';
@@ -287,6 +289,18 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         () => mcpController,
         () => mcpStatusReader,
     );
+    // Stops one listed background task through the live query (specs/agent-background-work-panel R2). Not for a
+    // managed run: the server's managed scope does not admit this RPC name, so it is neither registered nor advertised.
+    let stopBackgroundTask: ((taskId: string) => Promise<void>) | null = null;
+    if (!session.managedRun) {
+        registerBackgroundTaskStopHandler(session.client.rpcHandlerManager, async (taskId) => {
+            if (!backgroundTasks?.available || !backgroundTasks.tasks?.some(task => task.taskId === taskId)) return 'not_found';
+            if (!stopBackgroundTask) return 'unavailable';
+            await stopBackgroundTask(taskId);
+            return 'requested';
+        });
+        advertiseBackgroundTaskStop(session.client);
+    }
 
     // Drop any permission requests left over in agent state from a
     // previous CLI process that died while a tool prompt was open. The
@@ -611,6 +625,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     const providerStale = () => providerRunning && (providerCredentialGeneration !== (personalFallback?.generation() ?? 0) || providerBinding !== undefined && providerBinding !== runningAuthority());
 
     let backgroundTasks: NonNullable<Metadata['claudeBackgroundTasks']> | undefined;
+    const backgroundTaskDetails = createClaudeBackgroundTaskDetails();
     function publishBackgroundTasks(next: NonNullable<Metadata['claudeBackgroundTasks']>) {
         backgroundTasks = next;
         session.client.updateMetadata(current => ({ ...current, claudeBackgroundTasks: next }));
@@ -646,13 +661,14 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 available: true,
                 // REPLACE, including empty: edge bookends can arrive out of
                 // order and must never resurrect a task removed by this list.
-                tasks: message.tasks.filter(task => !task.ambient).map(task => ({
-                    taskId: task.task_id,
-                    label: task.description,
-                    kind: task.task_type.includes('bash') ? 'shell' : 'agent',
-                })),
+                tasks: backgroundTaskDetails.list(message.tasks.filter(task => !task.ambient)),
             });
             return;
+        }
+        // The command of a task already listed (its `task_started` usually follows the list).
+        const commandKnown = backgroundTaskDetails.observe(message);
+        if (commandKnown && backgroundTasks?.tasks?.some(task => task.taskId === commandKnown && !task.command)) {
+            publishBackgroundTasks({ ...backgroundTasks, tasks: backgroundTaskDetails.withCommands(backgroundTasks.tasks) });
         }
 
 
@@ -1473,6 +1489,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     },
                     onQueryReady: (q) => {
                         drain?.setQuery({ interrupt: q.interrupt });
+                        stopBackgroundTask = q.stopTask;
                         permissionHandler.setPermissionModeUpdater(async (mode) => {
                             await q.setPermissionMode(mode);
                         });
@@ -1664,6 +1681,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 logger.debug('[remote]: launch done');
                 // This generation is gone; no turn of it can still be running.
                 drain?.setQuery(null);
+                stopBackgroundTask = null;
                 drain?.turnEnded();
                 permissionHandler.reset(undefined, 'generation-ended');
                 modeHash = null;

@@ -1,6 +1,7 @@
 import { installCodexUserInputBoundary } from './utils/codexUserInput';
 /** Orchestrates Codex sessions, initial prompts, MCP tools and session lifecycle. */
 import type { CodexBackgroundTask } from './codexBackgroundTasks';
+import { advertiseBackgroundTaskStop, registerBackgroundTaskStopHandler } from '@/utils/backgroundTaskStop';
 import type { CodexSubagentSnapshot } from './codexSubagentTracker';
 import { SessionLaunchControl } from '../sessionDrain/sessionLaunchControl';
 import type { StandaloneLaunchBootstrap } from '../daemon/standaloneLaunchProtocol';
@@ -532,6 +533,9 @@ export async function runCodex(opts: {
             if (onSessionArchived) {
                 newSession.on('archived', onSessionArchived);
             }
+            // The handler moves with the RPC registrations; the capability lives in metadata, which an
+            // offline stub could not write (specs/agent-background-work-panel R4).
+            if (managedStartup === null) advertiseBackgroundTaskStop(newSession);
         }
     });
     session = initialSession;
@@ -1607,6 +1611,12 @@ export async function runCodex(opts: {
     session.rpcHandlerManager.registerHandler('codex-auth-status', async () => authRecovery.status());
     session.rpcHandlerManager.registerHandler('codex-auth-recover', async (params: Record<string, unknown>) =>
         runtimeGate?.isClosed() ? authRecovery.recover(params) : admitRpc(() => authRecovery.recover(params)));
+    // One listed background terminal (aplus-dev-studio-desktop specs/agent-background-work-panel R2). Not for a
+    // managed run: the server's managed scope does not admit this RPC name, so it is neither registered nor advertised.
+    if (managedStartup === null) {
+        registerBackgroundTaskStopHandler(session.rpcHandlerManager, (taskId) => client.terminateBackgroundTask(taskId));
+        advertiseBackgroundTaskStop(session);
+    }
     session.rpcHandlerManager.registerHandler('side-question', createCodexSideQuestionRpcHandler({
         bridge: sideQuestion,
         isManagedRun: () => managedStartup !== null || automationExecution,

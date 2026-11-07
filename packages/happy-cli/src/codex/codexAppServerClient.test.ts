@@ -6316,6 +6316,42 @@ describe('explicit authentication recovery', () => {
         expect(events.filter(event => event.type === 'task_complete')).toHaveLength(1);
         await client.disconnect();
     });
+    it.each([
+        ['requested', { result: { terminated: true } }],
+        ['unsupported', { error: { code: -32600, message: 'Invalid request: unknown variant `thread/backgroundTerminals/terminate`' } }],
+    ] as const)('stops one listed background terminal by its process id (%s)', async (status, reply) => {
+        const events: Array<Record<string, unknown>> = [];
+        const terminations: unknown[] = [];
+        const proc = createMockProcess({ onRequest: (msg, stdout) => {
+            if (msg.method === 'thread/start') pushJsonLine(stdout, { id: msg.id, result: { thread: { id: 'bg-thread' } } });
+            if (msg.method === 'thread/backgroundTerminals/list') {
+                pushJsonLine(stdout, { id: msg.id, result: { data: [{ itemId: 'bg-cmd', processId: '42', command: 'vite' }], nextCursor: null } });
+            }
+            if (msg.method === 'thread/backgroundTerminals/terminate') {
+                terminations.push(msg.params);
+                pushJsonLine(stdout, { id: msg.id, ...reply });
+            }
+            if (msg.method === 'turn/start') setTimeout(() => {
+                pushJsonLine(stdout, { id: msg.id, result: { turn: { id: 'bg-turn' } } });
+                pushJsonLine(stdout, { method: 'turn/started', params: { threadId: 'bg-thread', turn: { id: 'bg-turn' } } });
+                pushJsonLine(stdout, { method: 'item/started', params: { threadId: 'bg-thread', turnId: 'bg-turn', item: { type: 'commandExecution', id: 'bg-cmd', command: 'vite' } } });
+                setTimeout(() => pushJsonLine(stdout, { method: 'turn/completed', params: { threadId: 'bg-thread', turn: { id: 'bg-turn', status: 'completed' } } }), 30);
+            }, 0);
+        } });
+        mockSpawn.mockImplementation(() => proc);
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        client.setEventHandler(event => events.push(event as Record<string, unknown>));
+        await client.connect();
+        await client.startThread({ model: 'gpt-test', cwd: '/tmp', approvalPolicy: 'never', sandbox: 'danger-full-access' });
+        await client.sendTurnAndWait('start server');
+        expect(events).toContainEqual(expect.objectContaining({ type: 'background_tasks', tasks: [expect.objectContaining({ callId: 'bg-cmd', startedAt: expect.any(Number) })] }));
+        await expect(client.terminateBackgroundTask('other')).resolves.toBe('not_found');
+        await expect(client.terminateBackgroundTask('bg-cmd')).resolves.toBe(status);
+        // Only that terminal, never `clean` (every terminal of the thread).
+        expect(terminations).toEqual([{ threadId: 'bg-thread', processId: '42' }]);
+        await client.disconnect();
+    });
 
 });
 

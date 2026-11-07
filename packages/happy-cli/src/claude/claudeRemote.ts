@@ -178,7 +178,7 @@ export async function claudeRemote(opts: {
     signal?: AbortSignal,
     canCallTool: (toolName: string, input: unknown, mode: EnhancedMode, options: { signal: AbortSignal; toolUseID: string }) => Promise<PermissionResult>,
     /** Called when the Query object is ready — allows permission handler to call setPermissionMode */
-    onQueryReady?: (query: { setPermissionMode: (mode: string) => Promise<void>; interrupt: () => Promise<unknown> }) => void,
+    onQueryReady?: (query: { setPermissionMode: (mode: string) => Promise<void>; interrupt: () => Promise<unknown>; stopTask: (taskId: string) => Promise<void> }) => void,
     /** Path to temporary settings file with SessionStart hook (required for session tracking) */
     hookSettingsPath: string,
     /**
@@ -816,6 +816,8 @@ function readTurnText(content: unknown): string {
             setPermissionMode: (mode: string) => response.setPermissionMode(mode as any),
             // Ends the running turn through the SDK without killing its process.
             interrupt: () => response.interrupt(),
+            // One background task (specs/agent-background-work-panel R2); its end arrives as a new task list.
+            stopTask: (taskId: string) => response.stopTask(taskId),
         });
     }
 

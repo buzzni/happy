@@ -117,9 +117,9 @@ describe('Claude model changes across provider restarts', () => {
         expect(onModeApplied.mock.calls.map(([ids]) => ids)).toEqual(modes.map((_, i) => [`req-${i}`]));
         expect(new Set(onModeApplied.mock.calls.map(([, id]) => id)).size).toBe(modes.length);
         expect(snapshots.filter(s => s.tasks === null && s.available).length).toBeGreaterThanOrEqual(3);
-        expect(snapshots).toContainEqual(expect.objectContaining({ tasks: [{ taskId: 'bg-1', label: 'server', kind: 'shell' }], available: true }));
+        expect(snapshots).toContainEqual(expect.objectContaining({ tasks: [expect.objectContaining({ taskId: 'bg-1', label: 'server', kind: 'shell' })], available: true }));
         expect(snapshots).toContainEqual(expect.objectContaining({ tasks: [], available: false }));
-        expect(snapshots.at(-1)).toEqual(expect.objectContaining({ tasks: [{ taskId: 'bg-3', label: 'server', kind: 'shell' }], available: false }));
+        expect(snapshots.at(-1)).toEqual(expect.objectContaining({ tasks: [expect.objectContaining({ taskId: 'bg-3', label: 'server', kind: 'shell' })], available: false }));
         expect(lessonReviewLifecycle.completedAssistantTurns).toBe(modes.length);
         expect(cancelLessonReview).toHaveBeenCalled();
         expect(lessonReviewLifecycle.controller.signal.aborted).toBe(true);

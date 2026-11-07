@@ -19,8 +19,8 @@ const AGENT = { task_id: 'agent-1', task_type: 'local_agent', subagent_type: 'ge
 const SERVER = { task_id: 'server-1', task_type: 'local_bash', description: 'dev server' };
 const listed = (tasks: object[]) => ({ type: 'system', subtype: 'background_tasks_changed', tasks });
 const result = (n: number) => ({ type: 'result', subtype: 'success', result: '', is_error: false, uuid: `result-${n}` });
-const AGENT_RUNNING = { available: true, tasks: [{ taskId: 'agent-1', label: 'sleeper', kind: 'agent' }] };
-const SERVER_RUNNING = { available: true, tasks: [{ taskId: 'server-1', label: 'dev server', kind: 'shell' }] };
+const AGENT_RUNNING = { available: true, tasks: [{ taskId: 'agent-1', label: 'sleeper', kind: 'agent', taskType: 'local_agent', startedAt: expect.any(Number) }] };
+const SERVER_RUNNING = { available: true, tasks: [{ taskId: 'server-1', label: 'dev server', kind: 'shell', taskType: 'local_bash', startedAt: expect.any(Number) }] };
 const UNKNOWN = { available: true, tasks: null };
 
 type Listed = NonNullable<Metadata['claudeBackgroundTasks']>;
@@ -53,9 +53,9 @@ function sessionOf(queue: MessageQueue2<EnhancedMode>, client: unknown): Session
     } as unknown as Session;
 }
 
-function engine(response: AsyncGenerator<unknown>, engineChanges: unknown[]) {
+function engine(response: AsyncGenerator<unknown>, engineChanges: unknown[], stopTask = async (_taskId: string) => {}) {
     return Object.assign(response, {
-        mcpServerStatus: async () => [], setPermissionMode: async () => {},
+        mcpServerStatus: async () => [], setPermissionMode: async () => {}, stopTask,
         setModel: async (model?: string) => { engineChanges.push({ model }); },
         applyFlagSettings: async (settings: unknown) => { engineChanges.push(settings); },
     }) as unknown as ReturnType<typeof query>;
@@ -232,5 +232,38 @@ describe('background work across the turns of one Claude process', () => {
             expect.objectContaining(UNKNOWN),
             expect.objectContaining({ ...UNKNOWN, available: false }),
         ]);
+    }, 15_000);
+
+    it('stops one listed task through the live query and advertises it (specs/agent-background-work-panel R2)', async () => {
+        const mode: EnhancedMode = { permissionMode: 'default', model: 'claude-sonnet-5' };
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, (params?: unknown) => Promise<unknown>>();
+        const { client, published } = recordingClient('stop-background-task', handlers as Map<string, () => Promise<unknown>>);
+        const stopTask = vi.fn(async (_taskId: string) => {});
+        const answers: unknown[] = [];
+        const stop = (taskId: string) => handlers.get('background-task-stop')!({ taskId });
+        vi.mocked(query).mockImplementation(({ prompt }) => engine((async function* () {
+            for await (const _message of prompt as AsyncIterable<SDKUserMessage>) {
+                yield INIT;
+                yield { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'use-1', name: 'Bash', input: { command: 'npm run dev', run_in_background: true } }] } };
+                yield listed([SERVER]);
+                yield { type: 'system', subtype: 'task_started', task_id: 'server-1', tool_use_id: 'use-1', description: 'dev server' };
+                answers.push(await stop('server-1'), await stop('not-listed'));
+                yield listed([]);
+                yield result(1);
+                void handlers.get('switch')!();
+                return;
+            }
+        })(), [], stopTask));
+        queue.push('turn-0', mode);
+        await claudeRemoteLauncher(sessionOf(queue, client));
+        expect(client.getMetadata().runtimeCapabilities).toEqual(expect.objectContaining({ backgroundTaskStop: 1 }));
+        // The command reaches the list once its `task_started` names the Bash call.
+        expect(published).toContainEqual(expect.objectContaining({ tasks: [expect.objectContaining({ taskId: 'server-1', command: 'npm run dev', toolName: 'Bash' })] }));
+        expect(answers).toEqual([{ status: 'requested' }, { status: 'not_found' }]);
+        expect(stopTask).toHaveBeenCalledTimes(1);
+        expect(stopTask).toHaveBeenCalledWith('server-1');
+        // Without a live query (the process ended), a stop is not attempted.
+        await expect(stop('server-1')).resolves.toEqual({ status: 'not_found' });
     }, 15_000);
 });
