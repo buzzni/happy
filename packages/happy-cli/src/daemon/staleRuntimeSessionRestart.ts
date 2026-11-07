@@ -11,7 +11,7 @@
  * environment and folder scope — a daemon-side respawn would have none of them. The stop is the
  * same resumable SIGTERM the idle reapers use.
  */
-import { DEFAULT_IDLE_STOP_PRESENCE_STALE_MS, DEFAULT_SESSION_IDLE_REAPER_BATCH_MAX, type StopSessionContext, type StopSessionResult } from './sessionIdleReaper';
+import { DEFAULT_IDLE_STOP_PRESENCE_STALE_MS, DEFAULT_SESSION_IDLE_REAPER_BATCH_MAX, resolveStoppableAgent, type StopSessionContext, type StopSessionResult } from './sessionIdleReaper';
 import type { TrackedSession } from './types';
 
 /** Idle time after the last turn end / user input before a stale session is stopped. Covers a
@@ -67,6 +67,9 @@ export function sweepStaleRuntimeSessions(input: {
     const sessionId = session.happySessionId;
     const version = session.happySessionMetadataFromLocalWebhook?.version;
     if (!sessionId || !isOlderRuntimeVersion(version, input.daemonVersion)) continue;
+    // Only what `resume-happy-session` brings back: daemon-spawned claude/codex. A terminal-started
+    // process is the user's shell job, and other agents have no resume path.
+    if (session.startedBy !== 'daemon' || !resolveStoppableAgent(session)) continue;
 
     // Only a fresh, idle report proves nothing would be lost. Background jobs, an attached
     // terminal and a retention policy keep the process: they hold state a resume cannot restore.

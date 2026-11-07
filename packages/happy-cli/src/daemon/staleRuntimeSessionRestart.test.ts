@@ -92,6 +92,24 @@ describe('sweepStaleRuntimeSessions', () => {
     expect(stopSession).not.toHaveBeenCalled();
   });
 
+  it('leaves agents a resume cannot restart and sessions the daemon did not start', () => {
+    const { stopped, stopSession } = sweep([
+      tracked({ pid: 101, happySessionId: 'gemini', happySessionMetadataFromLocalWebhook: { flavor: 'gemini', version: '1.1.10-aplus.388' } as never }),
+      tracked({ pid: 102, happySessionId: 'openclaw', happySessionMetadataFromLocalWebhook: { flavor: 'openclaw', version: '1.1.10-aplus.388' } as never }),
+      // Started from a terminal: its process is the user's shell job, not something a resume brings back.
+      tracked({ pid: 103, happySessionId: 'terminal', startedBy: 'terminal' }),
+    ]);
+
+    expect(stopped).toBe(0);
+    expect(stopSession).not.toHaveBeenCalled();
+  });
+
+  it('treats a codex session like a claude one', () => {
+    const { stopped } = sweep([tracked({ happySessionMetadataFromLocalWebhook: { flavor: 'codex', version: '1.1.10-aplus.388' } as never })]);
+
+    expect(stopped).toBe(1);
+  });
+
   it('never interrupts work, a terminal, a background job or an unknown runtime', () => {
     const cases: Array<Partial<TrackedSession>> = [
       { runtime: idleRuntime({ thinking: true }) },
