@@ -1,3 +1,4 @@
+import { readSessionObservation, observationCapability } from '@/app/session/sessionObservation';
 import { buildNewMessageUpdate, eventRouter } from "@/app/events/eventRouter";
 import { db } from "@/storage/db";
 import { allocateSessionSeqBatch, allocateUserSeqBatch } from "@/storage/seq";
@@ -19,6 +20,8 @@ import { requireSessionScopeAuth } from "@/app/api/utils/enableAuthentication";
 const getMessagesQuerySchema = z.object({
     after_seq: z.coerce.number().int().min(0).optional(),
     before_seq: z.coerce.number().int().min(1).optional(),
+    observation_version: z.literal('1').optional(),
+    through_seq: z.coerce.number().int().min(0).optional(),
     limit: z.coerce.number().int().min(1).max(500).default(100)
 }).refine(
     (data) => !(data.after_seq !== undefined && data.before_seq !== undefined),
@@ -65,6 +68,7 @@ function toSendResponseMessage(message: Omit<SelectedMessage, "content">) {
 export function v3SessionRoutes(app: Fastify) {
     // Reachable by a managed child for its own session. The ownership query
     // below is unchanged and still applies; the decorator adds the grant.
+    app.get('/v3/session-observation', { preHandler: app.authenticate }, async (_request, reply) => reply.send(observationCapability()));
     app.get('/v3/sessions/:sessionId/messages', {
         preHandler: requireSessionScopeAuth(app) as never,
         schema: {
@@ -76,7 +80,13 @@ export function v3SessionRoutes(app: Fastify) {
     }, async (request, reply) => {
         const userId = request.userId;
         const { sessionId } = request.params;
-        const { after_seq, before_seq, limit } = request.query;
+        const { after_seq, before_seq, limit, observation_version, through_seq } = request.query;
+        if (observation_version) {
+            if (before_seq !== undefined || (through_seq !== undefined && through_seq < (after_seq ?? 0)) || limit > 200) return reply.code(400).send({ error: 'invalid-observation-range' });
+            const result = await readSessionObservation(userId, sessionId, after_seq ?? 0, through_seq, limit);
+            return reply.code(result.status).send(result.body);
+        }
+        if (through_seq !== undefined) return reply.code(400).send({ error: 'observation-version-required' });
 
         const session = await db.session.findFirst({
             where: {
