@@ -30,6 +30,8 @@ import type { MessageParam } from '@anthropic-ai/sdk/resources'
 import { mapToClaudeMode } from "./utils/permissionMode";
 import { claudeCheckSession } from "./utils/claudeCheckSession";
 import { pluginsFromArgs } from "./utils/pluginsFromArgs";
+import { createUsageLimitsCollector, usageReaderOf } from "./utils/usageLimitsCollector";
+import type { UsageLimitsPatch } from "./utils/usageLimits";
 import { join } from 'node:path';
 import { parseSpecialCommand } from "@/parsers/specialCommands";
 import { logger } from "@/lib";
@@ -256,6 +258,8 @@ export async function claudeRemote(opts: {
     offTurnTitle?: ClaudeTitleBridge,
     /** The live query's `/btw` side-question channel, then `null` once the query ends. */
     onSideQuestionChannelReady?: (channel: ClaudeSideQuestionChannel | null) => void,
+    /** specs/cli-usage-limits-snapshot R8 — at most one plan rate-limit change per turn, for the session's agent state. */
+    onUsageLimits?: (patch: UsageLimitsPatch) => void,
     /** How long a run-once result may wait on background work before ending anyway. */
     backgroundWaitBudgetMs?: number,
 }) {
@@ -767,6 +771,7 @@ function readTurnText(content: unknown): string {
     // A managed run answers only the prompt its envelope admitted; a side question would be a second one.
     const sideQuestionRequest = opts.managedRun === true ? null : sideQuestionRequestOf(response);
     if (sideQuestionRequest) opts.onSideQuestionChannelReady?.({ request: sideQuestionRequest, isTurnInProgress: () => thinking });
+    const usageLimits = opts.onUsageLimits ? createUsageLimitsCollector({ readUsage: usageReaderOf(response), publish: opts.onUsageLimits }) : null;
     const mcpRecovery = new McpRuntimeRecovery(response, { onStatus: opts.onMcpStatus });
     opts.onMcpStatusReaderReady?.(mcpRecovery);
     const mcpConfigSynchronizer = opts.mcpConfig
@@ -948,6 +953,8 @@ function readTurnText(content: unknown): string {
                 ? { ...message, isCompactSummary: true } as SDKMessage
                 : message;
             if (!released) opts.onMessage(outboundMessage);
+            // The account switcher reads the same event from `onMessage`; the collector only reads it.
+            usageLimits?.observe(message);
 
             if (message.type === 'system' && message.subtype === 'background_tasks_changed') {
                 awaitedBackgroundTaskIds.clear();
@@ -1036,6 +1043,8 @@ function readTurnText(content: unknown): string {
                 opts.onActiveInputReady?.(null);
                 updateThinking(false);
                 logger.debug('[claudeRemote] Result received');
+                // Not awaited: the first result's usage seed must not hold up the turn.
+                void usageLimits?.turnEnded();
 
                 /*
                  * A turn that reached a result ended normally. The worker
