@@ -20,12 +20,31 @@
  *   - Clients send `app-state: { state: 'active' | 'background' }` via socket.
  *   - Old clients that never send it are treated as active (connected = present).
  *   - On disconnect the socket (and its state) disappears automatically.
+ *
+ * Every path returns a PushOutcome so the push-event route can report what
+ * actually happened — before this, a total push outage looked identical to a
+ * delivered push from the CLI, Desktop and logs alike.
  */
 
 import { db } from "@/storage/db";
 import { isUserActive } from "@/app/push/focusTracker";
 import { sendPushNotifications } from "@/app/push/pushSend";
-import { log } from "@/utils/log";
+import { error, log } from "@/utils/log";
+
+/**
+ * What happened to one session-event push.
+ * - suppressed: a UI client is active, nothing was sent
+ * - no_tokens: the account has no registered device
+ * - sent / partial / failed: every / some / no token got an ok ticket;
+ *   failed also covers an exception anywhere in the dispatch
+ */
+export type PushOutcome = {
+    status: 'sent' | 'partial' | 'suppressed' | 'no_tokens' | 'failed';
+    tokens: number;
+    sent: number;
+    failed: number;
+    reason?: string;
+};
 
 async function fetchTokensAndSend(params: {
     userId: string;
@@ -34,7 +53,7 @@ async function fetchTokensAndSend(params: {
     body: string;
     data: Record<string, unknown>;
     channelId: string;
-}): Promise<void> {
+}): Promise<PushOutcome> {
     // All push tokens are mobile — web/CLI never register Expo tokens.
     const tokens = await db.accountPushToken.findMany({
         where: { accountId: params.userId }
@@ -42,7 +61,7 @@ async function fetchTokensAndSend(params: {
 
     if (tokens.length === 0) {
         log({ module: 'push' }, `No push tokens for user ${params.userId} session ${params.sessionId} — skipped`);
-        return;
+        return { status: 'no_tokens', tokens: 0, sent: 0, failed: 0 };
     }
 
     const tickets = await sendPushNotifications(
@@ -72,11 +91,17 @@ async function fetchTokensAndSend(params: {
         }
     }
 
-    if (errors.length === 0) {
+    // A token without a ticket was never confirmed delivered.
+    const failedCount = tokens.length - okCount;
+    if (failedCount === 0) {
         log({ module: 'push' }, `Push sent for user ${params.userId} session ${params.sessionId}: ${okCount} token(s)`);
-    } else {
-        log({ module: 'push', level: 'warn' }, `Push partial for user ${params.userId} session ${params.sessionId}: ok=${okCount} errors=${JSON.stringify(errors)}`);
+        return { status: 'sent', tokens: tokens.length, sent: okCount, failed: 0 };
     }
+
+    const reason = errors.length > 0 ? errors.join(', ') : 'missing ticket';
+    const status = okCount === 0 ? 'failed' : 'partial';
+    error({ module: 'push' }, `Push ${status} for user ${params.userId} session ${params.sessionId}: ok=${okCount} failed=${failedCount} errors=${JSON.stringify(errors)}`);
+    return { status, tokens: tokens.length, sent: okCount, failed: failedCount, reason };
 }
 
 export async function dispatchSessionEventPush(params: {
@@ -85,20 +110,20 @@ export async function dispatchSessionEventPush(params: {
     title: string;
     body: string;
     data?: Record<string, unknown>;
-}): Promise<void> {
+}): Promise<PushOutcome> {
     const { userId, sessionId, title, body, data } = params;
 
     try {
         try {
             if (await isUserActive(userId)) {
                 log({ module: 'push' }, `Suppressed session-event push for user ${userId} session ${sessionId}: user active`);
-                return;
+                return { status: 'suppressed', tokens: 0, sent: 0, failed: 0, reason: 'user-active' };
             }
         } catch (presenceError) {
-            log({ module: 'push', level: 'error' }, `Presence check failed, sending push anyway: ${presenceError}`);
+            error({ module: 'push' }, `Presence check failed, sending push anyway: ${presenceError}`);
         }
 
-        await fetchTokensAndSend({
+        return await fetchTokensAndSend({
             userId,
             sessionId,
             title,
@@ -106,7 +131,9 @@ export async function dispatchSessionEventPush(params: {
             data: { sessionId, ...(data ?? {}) },
             channelId: 'messages'
         });
-    } catch (error) {
-        log({ module: 'push', level: 'error' }, `Session-event push dispatch failed: ${error}`);
+    } catch (dispatchError) {
+        error({ module: 'push' }, `Session-event push dispatch failed: ${dispatchError}`);
+        const reason = dispatchError instanceof Error ? dispatchError.message : String(dispatchError);
+        return { status: 'failed', tokens: 0, sent: 0, failed: 0, reason };
     }
 }
