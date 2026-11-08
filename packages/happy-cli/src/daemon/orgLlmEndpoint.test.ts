@@ -9,6 +9,7 @@ import {
   resolveOrgLlmEndpointLaunch,
   type OrgLlmEndpointEntry,
 } from './orgLlmEndpoint'
+import { ORG_ENDPOINT_OWNED_ENV_KEYS } from '@/claude/utils/orgEndpointEnvKeys'
 import type { AiAuthSelection } from './sessionEnv'
 
 // aplus specs/org-llm-endpoints C4·C5 — the daemon's local copy of an organization LLM endpoint and the
@@ -215,7 +216,10 @@ describe('buildOrgLlmEndpointEnvironment', () => {
       ANTHROPIC_DEFAULT_OPUS_MODEL: 'big',
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'corp-model-v1',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'corp-model-v1',
+      ANTHROPIC_DEFAULT_FABLE_MODEL: 'big',
+      CLAUDE_CODE_SUBAGENT_MODEL: 'corp-model-v1',
       API_TIMEOUT_MS: '600000',
+      CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1',
       ANTHROPIC_API_KEY: '',
       ANTHROPIC_CUSTOM_HEADERS: '',
       CLAUDE_CODE_OAUTH_TOKEN: '',
@@ -223,9 +227,23 @@ describe('buildOrgLlmEndpointEnvironment', () => {
       CLAUDE_CODE_USE_VERTEX: '',
       CLAUDE_CODE_USE_FOUNDRY: '',
       ANTHROPIC_SMALL_FAST_MODEL: '',
+      ANTHROPIC_PROFILE: '',
+      CLAUDE_CODE_USE_ANTHROPIC_AWS: '',
+      CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD: '',
+      CLAUDE_CODE_USE_MANTLE: '',
       HAPPY_AI_AUTH_SOURCE: 'org-endpoint',
       HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING: 'binding-1:endpoint-1:target-a:3',
     })
+  })
+
+  it('maps the fable tier to the plain model when no opus mapping exists', () => {
+    const env = buildOrgLlmEndpointEnvironment({ entry: entry(), target, bindingId: 'binding-1' })
+    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('corp-model-v1')
+  })
+
+  it('writes every key of the shared owned set, so the scrub list cannot drift from the env', () => {
+    const env = buildOrgLlmEndpointEnvironment({ entry: entry(), target, bindingId: 'binding-1' })
+    expect(Object.keys(env).filter((key) => !key.startsWith('HAPPY_')).sort()).toEqual([...ORG_ENDPOINT_OWNED_ENV_KEYS].sort())
   })
 
   it('uses a non-secret dummy token for an endpoint without auth', () => {

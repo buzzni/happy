@@ -6,7 +6,7 @@
  * only — it never asks Studio at spawn time. Pure on purpose: files and the network are injected by the
  * runtime, so the rules below are testable without either.
  */
-import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS } from '@/claude/utils/claudeAuthOverrideEnv'
+import { ORG_ENDPOINT_CLEARED_ENV_KEYS } from '@/claude/utils/orgEndpointEnvKeys'
 import { HAPPY_AI_AUTH_SOURCE_ENV } from '@/usage/aiAuthSource'
 import {
     formatOrgEndpointBinding,
@@ -203,16 +203,14 @@ export async function probeOrgLlmEndpointTarget(input: {
     }
 }
 
-/** C5's closed managed environment. Every other Claude auth override and the small-fast model are written empty. */
+/** C5's closed managed environment (keys: `orgEndpointEnvKeys`). Every other route to a backend is written empty. */
 export function buildOrgLlmEndpointEnvironment(input: {
     entry: OrgLlmEndpointEntry
     target: OrgLlmEndpointTarget
     bindingId: string
 }): Record<string, string> {
     const { entry, target, bindingId } = input
-    const cleared = Object.fromEntries(CLAUDE_AUTH_OVERRIDE_ENV_KEYS
-        .filter((key) => key !== 'ANTHROPIC_AUTH_TOKEN' && key !== 'ANTHROPIC_BASE_URL')
-        .map((key) => [key, '']))
+    const cleared = Object.fromEntries(ORG_ENDPOINT_CLEARED_ENV_KEYS.map((key) => [key, '']))
     return {
         ANTHROPIC_BASE_URL: target.url,
         ANTHROPIC_AUTH_TOKEN: entry.token ?? ORG_LLM_ENDPOINT_NO_AUTH_TOKEN,
@@ -221,9 +219,11 @@ export function buildOrgLlmEndpointEnvironment(input: {
         ANTHROPIC_DEFAULT_OPUS_MODEL: entry.models.opus ?? entry.model,
         ANTHROPIC_DEFAULT_SONNET_MODEL: entry.models.sonnet ?? entry.model,
         ANTHROPIC_DEFAULT_HAIKU_MODEL: entry.models.haiku ?? entry.model,
+        ANTHROPIC_DEFAULT_FABLE_MODEL: entry.models.opus ?? entry.model,
+        CLAUDE_CODE_SUBAGENT_MODEL: entry.model,
         API_TIMEOUT_MS: String(entry.apiTimeoutMs),
+        CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1',
         ...cleared,
-        ANTHROPIC_SMALL_FAST_MODEL: '',
         [HAPPY_AI_AUTH_SOURCE_ENV]: 'org-endpoint',
         [ORG_ENDPOINT_BINDING_ENV]: formatOrgEndpointBinding({ bindingId, endpointId: entry.id, targetId: target.id, generation: entry.generation }),
     }
