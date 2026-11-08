@@ -123,6 +123,22 @@ export type ChildEnvBoundary = 'session' | 'in-session'
  */
 export const SETUP_TOKEN_BINDING_ENV = 'HAPPY_AI_AUTH_SETUP_TOKEN_BINDING'
 
+/**
+ * Secret-free record of which organization LLM endpoint target a session was started on
+ * (aplus specs/org-llm-endpoints C5): `<bindingId>:<endpointId>:<targetId>:<generation>`.
+ * Daemon-written only, scrubbed like the setup-token binding.
+ */
+export const ORG_ENDPOINT_BINDING_ENV = 'HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING'
+
+/**
+ * What an endpoint session's environment owns besides the marker. A daemon restarted by that session
+ * inherits all of it, and the next session would then talk to this endpoint with this endpoint's token.
+ */
+const ORG_ENDPOINT_OWNED_ENV_KEYS = new Set([
+    'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'CLAUDE_CODE_MAX_CONTEXT_TOKENS', 'API_TIMEOUT_MS',
+])
+
 export function nonInheritableEnvEntry(key: string): NonInheritableEnvEntry | undefined {
     const name = key.toUpperCase()
     return NON_INHERITABLE_ENV.find((entry) => name.startsWith(entry.prefix))
@@ -144,10 +160,13 @@ export function sanitizeChildEnv(
     // Inside the session the bound token is the one the agent must spend.
     const dropBoundBearer = boundary === 'session'
         && Object.keys(env).some((key) => key.toUpperCase() === SETUP_TOKEN_BINDING_ENV && env[key] !== undefined)
+    const dropOrgEndpointRouting = boundary === 'session'
+        && Object.keys(env).some((key) => key.toUpperCase() === ORG_ENDPOINT_BINDING_ENV && env[key] !== undefined)
     const sanitized: Record<string, string> = {}
     for (const [key, value] of Object.entries(env)) {
         if (value === undefined || isDropped(key, boundary)) continue
         if (dropBoundBearer && key.toUpperCase() === 'CLAUDE_CODE_OAUTH_TOKEN') continue
+        if (dropOrgEndpointRouting && ORG_ENDPOINT_OWNED_ENV_KEYS.has(key.toUpperCase())) continue
         sanitized[key] = value
     }
     return sanitized

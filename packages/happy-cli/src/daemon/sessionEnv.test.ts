@@ -17,7 +17,11 @@ import {
     verifyAiAuthSelection,
     captureSaycodeAgentEnvironment as captureSetupTokenEnvironment,
     readSetupTokenResumeSelection,
+    ORG_ENDPOINT_BINDING_ENV,
+    formatOrgEndpointBinding,
+    readOrgEndpointResumeSelection,
 } from './sessionEnv'
+import { buildZaiClaudeEnvironment } from '../managed/zaiClaudeEnvironment'
 import { injectMcpCallerGrant } from './mcpCallerGrantEnvelope'
 import { readAiAuthConnectionVersion } from '../usage/aiAuthSource'
 import { sanitizeChildEnv } from '../utils/childEnv'
@@ -594,7 +598,7 @@ describe('parseAiAuthSelection', () => {
         expect(parseAiAuthSelection(undefined)).toBeUndefined()
     })
 
-    it.each(AI_AUTH_SELECTION_KINDS.filter((kind) => kind !== 'claude-setup-token'))('닫힌 집합의 %s 를 받는다', (kind) => {
+    it.each(AI_AUTH_SELECTION_KINDS.filter((kind) => kind !== 'claude-setup-token' && kind !== 'org-endpoint'))('닫힌 집합의 %s 를 받는다', (kind) => {
         expect(parseAiAuthSelection({ kind })).toEqual({ kind })
     })
 
@@ -1027,6 +1031,108 @@ describe('buildResumedSessionSpawnEnvironment agent capability', () => {
     it('adds nothing when the caller gives no default root, as for automation runs', () => {
         const env = buildResumedSessionSpawnEnvironment({ inherited: {}, explicit: {}, agentEnvironment: {}, sessionId: 's1' })
         expect(Object.keys(env).filter((key) => key.startsWith('SAYCODE_AGENT_'))).toEqual([])
+    })
+})
+
+
+describe('org-endpoint selection (aplus specs/org-llm-endpoints C5)', () => {
+    const base = { kind: 'org-endpoint', bindingId: 'binding-1', endpointId: 'endpoint-1', generation: 3, candidates: ['target-b', 'target-a'] }
+
+    it('accepts the closed shape and keeps the candidate order', () => {
+        expect(parseAiAuthSelection({ ...base, extra: 1 })).toEqual(base)
+        expect(AI_AUTH_SELECTION_KINDS).toContain('org-endpoint')
+    })
+
+    it.each([
+        { label: 'bindingId 누락', patch: { bindingId: undefined }, error: /bindingId/ },
+        { label: 'bindingId 에 구분자', patch: { bindingId: 'a:b' }, error: /bindingId/ },
+        { label: 'endpointId 누락', patch: { endpointId: undefined }, error: /endpointId/ },
+        { label: 'generation 0', patch: { generation: 0 }, error: /generation/ },
+        { label: 'generation 소수', patch: { generation: 1.5 }, error: /generation/ },
+        { label: 'candidates 비어 있음', patch: { candidates: [] }, error: /candidates/ },
+        { label: 'candidates 17개', patch: { candidates: Array.from({ length: 17 }, (_, i) => `t${i}`) }, error: /candidates/ },
+        { label: 'candidates 에 구분자', patch: { candidates: ['t:1'] }, error: /candidates/ },
+        { label: 'candidates 중복', patch: { candidates: ['t1', 't1'] }, error: /candidates/ },
+        { label: 'candidates 가 문자열', patch: { candidates: 't1' }, error: /candidates/ },
+    ])('rejects $label — never drops the selection quietly', ({ patch, error }) => {
+        expect(() => parseAiAuthSelection({ ...base, ...patch })).toThrow(error)
+    })
+
+    it('never lets a request ask for the daemon-internal resume mode', () => {
+        expect(parseAiAuthSelection({ ...base, resume: true })).not.toHaveProperty('resume')
+    })
+
+    it('is proven only by the daemon-written org-endpoint source', () => {
+        const selection = parseAiAuthSelection(base)!
+        expect(verifyAiAuthSelection(selection, { HAPPY_AI_AUTH_SOURCE: 'org-endpoint' })).toEqual({ appliedSource: 'org-endpoint' })
+        expect(verifyAiAuthSelection(selection, { HAPPY_AI_AUTH_SOURCE: 'org-bundle' }).rejection).toMatch(/org-endpoint/)
+        expect(verifyAiAuthSelection(selection, {}).rejection).toMatch(/org-endpoint/)
+        expect(honorsManagedAiCredentials(selection)).toBe(true)
+    })
+
+    describe('binding record for resume', () => {
+        const binding = formatOrgEndpointBinding({ bindingId: 'binding-1', endpointId: 'endpoint-1', targetId: 'target-a', generation: 3 })
+
+        it('formats <bindingId>:<endpointId>:<targetId>:<generation>', () => {
+            expect(binding).toBe('binding-1:endpoint-1:target-a:3')
+            expect(ORG_ENDPOINT_BINDING_ENV).toBe('HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING')
+        })
+
+        it('is captured from the final child env and turns back into a single-candidate resume selection', () => {
+            const captured = captureSaycodeAgentEnvironment({ [ORG_ENDPOINT_BINDING_ENV]: binding, ANTHROPIC_AUTH_TOKEN: 'endpoint-secret' })
+            expect(captured).toEqual({ [ORG_ENDPOINT_BINDING_ENV]: binding })
+            expect(readOrgEndpointResumeSelection(captured)).toEqual({
+                kind: 'org-endpoint', bindingId: 'binding-1', endpointId: 'endpoint-1', generation: 3, candidates: ['target-a'], resume: true })
+            expect(readOrgEndpointResumeSelection({})).toBeUndefined()
+            expect(readOrgEndpointResumeSelection(undefined)).toBeUndefined()
+        })
+
+        it.each(['', 'binding-1:endpoint-1:target-a', 'a:b:c:0', 'a:b:c:x', 'a:b:c:1:2', 'a b:b:c:1'])(
+            'retains a corrupt record as an invalid sentinel and refuses the resume: %j', (corrupt) => {
+                const captured = captureSaycodeAgentEnvironment({ [ORG_ENDPOINT_BINDING_ENV]: corrupt })
+                expect(captured).toEqual({ [ORG_ENDPOINT_BINDING_ENV]: '' })
+                expect(() => readOrgEndpointResumeSelection(captured)).toThrow(/org endpoint binding/i)
+            })
+
+        it('is never inherited from the daemon env or taken from a request', () => {
+            expect(sanitizeChildEnv({ [ORG_ENDPOINT_BINDING_ENV]: binding })).toEqual({})
+            expect(buildSpawnRequestEnvironment({}, { [ORG_ENDPOINT_BINDING_ENV]: binding })).toEqual({})
+        })
+    })
+
+    it('stops an endpoint session from carrying its token and address to a later session through an inherited env', () => {
+        const inherited = { PATH: '/usr/bin', ANTHROPIC_BASE_URL: 'https://llm.corp', ANTHROPIC_AUTH_TOKEN: 'endpoint-secret',
+            ANTHROPIC_MODEL: 'corp-model', [ORG_ENDPOINT_BINDING_ENV]: 'b:e:t:1' }
+        expect(sanitizeChildEnv(inherited)).toEqual({ PATH: '/usr/bin' })
+        // An unrelated Z.AI/personal base URL without the endpoint marker stays untouched.
+        expect(sanitizeChildEnv({ ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic' })).toEqual({ ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic' })
+        // Inside the session the endpoint env is exactly what the agent must see.
+        expect(sanitizeChildEnv(inherited, { boundary: 'in-session' })).toMatchObject({ ANTHROPIC_BASE_URL: 'https://llm.corp', ANTHROPIC_AUTH_TOKEN: 'endpoint-secret' })
+    })
+})
+
+describe('managed environments that carry ANTHROPIC_BASE_URL own the whole routing (aplus specs/org-llm-endpoints C5)', () => {
+    const requested = {
+        SAFE: 'value',
+        ANTHROPIC_API_KEY: 'req-key', ANTHROPIC_AUTH_TOKEN: 'req-token', CLAUDE_CODE_OAUTH_TOKEN: 'req-oauth',
+        CLAUDE_CODE_USE_BEDROCK: '1', CLAUDE_CODE_USE_VERTEX: '1', CLAUDE_CODE_USE_FOUNDRY: '1', ANTHROPIC_CUSTOM_HEADERS: 'x: y',
+        ANTHROPIC_MODEL: 'req-model', ANTHROPIC_SMALL_FAST_MODEL: 'req-small',
+        ANTHROPIC_DEFAULT_OPUS_MODEL: 'req-opus', ANTHROPIC_DEFAULT_SONNET_MODEL: 'req-sonnet', ANTHROPIC_DEFAULT_HAIKU_MODEL: 'req-haiku',
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS: '123',
+    }
+
+    it('strips auth overrides, model keys and the context limit for a non-Z.AI base URL', () => {
+        expect(stripManagedCredentialConflicts(requested, { ANTHROPIC_BASE_URL: 'https://llm.corp', ANTHROPIC_AUTH_TOKEN: 'endpoint-token' }))
+            .toEqual({ SAFE: 'value' })
+    })
+
+    it('keeps stripping for the real Z.AI lease environment (the caller context limit now goes too)', () => {
+        expect(stripManagedCredentialConflicts(requested, buildZaiClaudeEnvironment('zai-key'))).toEqual({ SAFE: 'value' })
+    })
+
+    it('a cleared (empty) ANTHROPIC_BASE_URL does not count as a routing owner', () => {
+        expect(stripManagedCredentialConflicts(requested, { ANTHROPIC_BASE_URL: '', CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-FAKE' }))
+            .toMatchObject({ ANTHROPIC_MODEL: 'req-model', ANTHROPIC_DEFAULT_OPUS_MODEL: 'req-opus', CLAUDE_CODE_MAX_CONTEXT_TOKENS: '123' })
     })
 })
 
