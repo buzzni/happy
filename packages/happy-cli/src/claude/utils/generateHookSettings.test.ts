@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { orgEndpointRoutingSettingsEnv } from './orgEndpointEnvKeys';
-import { buildHookSettings, toolPolicyHookCommands } from './generateHookSettings';
+import { buildHookSettings, cleanupHookSettingsFile, generateHookSettingsFile, toolPolicyHookCommands } from './generateHookSettings';
 import { resolveMachineLockdownPolicy } from '@/daemon/machineLockdownPolicy';
 
 const base = { hookCommand: 'node fwd 1234', broadKillGuardCommand: 'node guard', homeDir: '/home/trial' };
@@ -80,5 +81,31 @@ describe('buildHookSettings', () => {
         expect(JSON.stringify(settings)).not.toContain('corp-secret-token');
         expect(orgEndpointRoutingSettingsEnv({ HAPPY_AI_AUTH_SOURCE: 'org-bundle', ANTHROPIC_BASE_URL: 'https://x' })).toBeUndefined();
         expect(orgEndpointRoutingSettingsEnv({ ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic' })).toBeUndefined();
+    });
+});
+
+// The unit setup points HAPPY_HOME_DIR at a temporary directory, so this writes nothing outside it.
+describe('generateHookSettingsFile for an organization LLM endpoint session', () => {
+    afterEach(() => { vi.unstubAllEnvs(); });
+
+    it('writes the routing block from the session environment into the file Claude gets as --settings, without the token', () => {
+        vi.stubEnv('HAPPY_AI_AUTH_SOURCE', 'org-endpoint');
+        vi.stubEnv('ANTHROPIC_BASE_URL', 'https://llm.corp.example');
+        vi.stubEnv('ANTHROPIC_AUTH_TOKEN', 'corp-secret-token');
+        vi.stubEnv('ANTHROPIC_MODEL', 'corp-model');
+        vi.stubEnv('CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST', '1');
+        const path = generateHookSettingsFile(4321);
+        try {
+            const text = readFileSync(path, 'utf8');
+            expect(JSON.parse(text).env).toMatchObject({ ANTHROPIC_BASE_URL: 'https://llm.corp.example', ANTHROPIC_MODEL: 'corp-model', CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1' });
+            expect(text).not.toContain('corp-secret-token');
+        } finally { cleanupHookSettingsFile(path); }
+    });
+
+    it('writes no env block for any other session', () => {
+        vi.stubEnv('HAPPY_AI_AUTH_SOURCE', 'org-bundle');
+        vi.stubEnv('ANTHROPIC_BASE_URL', 'https://api.z.ai/api/anthropic');
+        const path = generateHookSettingsFile(4321);
+        try { expect(JSON.parse(readFileSync(path, 'utf8'))).not.toHaveProperty('env'); } finally { cleanupHookSettingsFile(path); }
     });
 });
