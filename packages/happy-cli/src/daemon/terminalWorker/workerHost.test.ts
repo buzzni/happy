@@ -13,7 +13,7 @@ describe('TerminalWorkerHost', () => {
     afterEach(() => { rmSync(home, { recursive: true, force: true }) })
 
     const host = (fake: ReturnType<typeof fakeWorkerConnection>, launchDelay?: Promise<void>) => new TerminalWorkerHost({
-        happyHome: home, cliVersion: '1', enabled: true, log: () => {},
+        happyHome: home, enabled: true, log: () => {},
         launch: async () => { await launchDelay; return { connection: fake.connection, pid: 7 } },
     })
 

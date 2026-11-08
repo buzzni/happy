@@ -35,7 +35,6 @@ export interface WorkerSessionArgs {
 
 export interface TerminalWorkerHostOptions {
     happyHome: string
-    cliVersion: string
     enabled: boolean
     log: (message: string) => void
     launch?: (happyHome: string) => Promise<LaunchedTerminalWorker>
@@ -71,7 +70,6 @@ export class TerminalWorkerHost {
     async start(): Promise<AdoptedWorkerTerminal[]> {
         const result = await adoptTerminalWorkers({
             happyHome: this.options.happyHome,
-            cliVersion: this.options.cliVersion,
             workersEnabled: this.enabled,
             log: this.options.log,
             deps: defaultAdoptionDeps(this.options.happyHome, this.options.adoptionDeps),
@@ -82,9 +80,10 @@ export class TerminalWorkerHost {
         }
         const terminals: AdoptedWorkerTerminal[] = []
         for (const adopted of result.adopted) {
-            // HR8: one current worker of this CLI version; any other is only drained.
-            const held = this.hold(adopted.connection, !(adopted.sameVersion && this.current === null))
-            if (!held.draining) this.current = held
+            // HR8: an adopted worker only finishes what it holds — even one of this CLI version. Its
+            // shells inherit the environment of the daemon that started it, and a restart may have
+            // been for a new environment (`env-reapply`); new terminals open on this daemon's own worker.
+            const held = this.hold(adopted.connection, true)
             let listed: WorkerListResult
             try {
                 listed = await adopted.connection.request<WorkerListResult>('list')

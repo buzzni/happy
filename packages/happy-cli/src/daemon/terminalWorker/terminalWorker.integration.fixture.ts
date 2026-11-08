@@ -3,8 +3,8 @@
  * route and terminal worker host in their own process, against a temporary HAPPY_HOME_DIR and a
  * fixed machine key. Workers are the built `happy terminal-worker`.
  *
- * Env: HAPPY_HOME_DIR, FIXTURE_KEY (base64 machine key), FIXTURE_WORKERS ('0' = off),
- * FIXTURE_CLI_VERSION. Writes `fixture-<pid>.port` once listening.
+ * Env: HAPPY_HOME_DIR, FIXTURE_KEY (base64 machine key), FIXTURE_WORKERS ('0' = off).
+ * Writes `fixture-<pid>.port` once listening.
  * Signals: SIGTERM = stop (terminals close), SIGUSR2 = restart keeping terminals, SIGKILL = crash.
  */
 import { appendFileSync, renameSync, writeFileSync } from 'node:fs'
@@ -23,7 +23,6 @@ async function main() {
     const server = createServer()
     const host = new TerminalWorkerHost({
         happyHome: home,
-        cliVersion: process.env.FIXTURE_CLI_VERSION ?? '1.0.0-test',
         enabled: process.env.FIXTURE_WORKERS !== '0',
         log,
     })

@@ -82,7 +82,7 @@ with its secret. Per record:
 | pid gone, or alive with another start time (pid reuse) | record retired, no signal |
 | alive but the socket does not answer | nothing (retried next start) |
 | answers, other protocol (or workers off) | frozen `shutdown` |
-| answers, same protocol | adopted; a worker of another CLI version only drains (no new terminals) |
+| answers, same protocol | adopted; it only drains (no new terminals) — new shells open on this daemon's own worker, with this daemon's environment |
 
 Adopted direct terminals are registered under their old session id with the detach grace (30 s)
 counted from adoption; the app re-attaches within it.

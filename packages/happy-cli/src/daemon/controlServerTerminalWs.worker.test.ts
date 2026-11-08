@@ -37,7 +37,7 @@ describe('/terminal with terminal workers', () => {
             await createsHeld
             return { pid: 4242 }
         })
-        const host = new TerminalWorkerHost({ happyHome: dir, cliVersion: '1', enabled: true, log: () => {}, launch: async () => ({ connection: fake.connection, pid: 1 }) })
+        const host = new TerminalWorkerHost({ happyHome: dir, enabled: true, log: () => {}, launch: async () => ({ connection: fake.connection, pid: 1 }) })
         server = createServer()
         route = attachTerminalWsRoute(server, {
             path: '/terminal', controlSecret: 'secret', allowedRoot: dir,

@@ -4378,7 +4378,6 @@ export async function startDaemon(): Promise<void> {
     // aplus terminal-survive-runner-restart: PTYs in detached workers that outlive this daemon (opt-in, HR11).
     const terminalWorkers = new TerminalWorkerHost({
       happyHome: configuration.happyHomeDir,
-      cliVersion: packageJson.version,
       enabled: !standaloneWindows && terminalWorkersEnabled(),
       log: (message) => logger.debug(message),
     });

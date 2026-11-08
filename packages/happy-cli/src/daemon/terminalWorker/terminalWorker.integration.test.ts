@@ -213,6 +213,12 @@ describe.runIf(posix)('a daemon restarting around its terminals (HR9)', () => {
         expect(Math.min(...afterSeqs)).toBeGreaterThan(lastSeq)
         again.close()
 
+        // HR8: a new terminal opens on this daemon's own worker (its environment), not the adopted one.
+        const fresh = await TerminalClient.connect(second.port, key)
+        expect((await fresh.open()).data?.ok).toBe(true)
+        expect(listTerminalWorkerRecords(home).filter((file) => 'record' in file)).toHaveLength(2)
+        fresh.close()
+
         await stopDaemon(second, 'SIGTERM')
         await waitFor(() => !alive(shellPid))
     })

@@ -10,7 +10,7 @@
  *   socket does not answer / hello fails       → leave everything (next start retries)
  *   authenticated, other protocol              → frozen `shutdown`
  *   authenticated, our protocol, workers off   → frozen `shutdown` (off converges to no workers)
- *   authenticated, our protocol, workers on    → adopt (current if same CLI version, else draining)
+ *   authenticated, our protocol, workers on    → adopt; it only drains (new terminals open on this daemon's worker)
  */
 import { readCurrentBootIdSync } from '@/utils/bootIdentity'
 import { getProcessStartedAt } from '@/utils/processStartTime'
@@ -28,8 +28,6 @@ export interface AdoptionSummary {
 
 export interface AdoptedWorker {
     connection: WorkerConnection
-    /** Same CLI version as this daemon: new terminals may open on it (HR8). */
-    sameVersion: boolean
 }
 
 export interface AdoptionDeps {
@@ -69,7 +67,6 @@ export function defaultAdoptionDeps(happyHome: string, overrides: Partial<Adopti
 
 export async function adoptTerminalWorkers(input: {
     happyHome: string
-    cliVersion: string
     workersEnabled: boolean
     log: (message: string) => void
     deps: AdoptionDeps
@@ -136,7 +133,7 @@ export async function adoptTerminalWorkers(input: {
             connection.close()
             continue
         }
-        adopted.push({ connection, sameVersion: connection.ack.cliVersion === input.cliVersion })
+        adopted.push({ connection })
         summary.adopted++
         log(`[TERMINAL-WORKER] ${tag} adopted (cli ${connection.ack.cliVersion})`)
     }

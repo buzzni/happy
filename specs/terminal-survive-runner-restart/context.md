@@ -30,6 +30,9 @@ aplus 오케스트레이션 T10. 2026-11-08 사용자가 조건 3개를 붙여 �
 
 - [2026-11-08] 교차 리뷰(codex gpt-6.1-sol high) major 7·minor 2 전부 반영: 종료 중 워커는 create·새 컨트롤러를 거부하고 shutdown 응답은 터미널이 끝난 뒤, 세션은 create·dump 요청 전에 구독하고 첫 리더까지 출력을 보관, v2 터미널은 바인딩을 create에 함께 실어 원자적으로 보관(`contract: v2`인데 바인딩 없으면 입양 거부), SIGTERM/SIGINT는 ready restart 드레인 뒤에도 닫기(`keepsWorkerTerminalsOnExit`), 실패·무응답 create는 terminate+forget 보상, 종료한 세션은 연결 리스너 해제, 진행 중 열기도 사용자당 5개 상한에 포함, 시작 시각 미확인이면 연결도 신호도 없음(HR6 그대로), 시작 중 stop은 launch를 기다려 회수.
 
+- [2026-11-08] 리뷰봇(medium) 반영: 입양한 워커는 같은 CLI 버전이어도 draining. 터미널을 유지한 `env-reapply` 재시작 뒤 새 셸이 이전 데몬 환경을 물려받던 문제. 대가: 재시작마다 이전 워커가 남은 터미널이 끝날 때까지 하나 더 산다.
+- [2026-11-08] CI macOS 잡 `tsc --noEmit` 힙 부족 2회: 로컬 측정에서 main과 브랜치의 tsc 최대 RSS가 같음(약 2.6GB) — 러너 문제로 판단해 재실행.
+
 ## 열린 문제
 
 - 후속 spec 예약: `terminal-survive-relay-restart` — 릴레이 경로 터미널 유지. 범위: 서버 세션 보류·데몬 재등록·클라이언트 재부착. 선행: 다중 레플리카 세션 보류 계약, happy-server 배포, 기본 켜짐 전환(tasks F1).
