@@ -20,6 +20,7 @@ import {
     ORG_ENDPOINT_BINDING_ENV,
     formatOrgEndpointBinding,
     readOrgEndpointResumeSelection,
+    readAppliedOrgLlmEndpoint,
 } from './sessionEnv'
 import { buildZaiClaudeEnvironment } from '../managed/zaiClaudeEnvironment'
 import { injectMcpCallerGrant } from './mcpCallerGrantEnvelope'
@@ -1093,6 +1094,13 @@ describe('org-endpoint selection (aplus specs/org-llm-endpoints C5)', () => {
                 expect(captured).toEqual({ [ORG_ENDPOINT_BINDING_ENV]: '' })
                 expect(() => readOrgEndpointResumeSelection(captured)).toThrow(/org endpoint binding/i)
             })
+
+        it('tells the spawn result which binding and target the daemon applied', () => {
+            expect(readAppliedOrgLlmEndpoint({ [ORG_ENDPOINT_BINDING_ENV]: binding, ANTHROPIC_AUTH_TOKEN: 'endpoint-secret' }))
+                .toEqual({ bindingId: 'binding-1', targetId: 'target-a' })
+            expect(readAppliedOrgLlmEndpoint({})).toBeUndefined()
+            expect(readAppliedOrgLlmEndpoint({ [ORG_ENDPOINT_BINDING_ENV]: '' })).toBeUndefined()
+        })
 
         it('is never inherited from the daemon env or taken from a request', () => {
             expect(sanitizeChildEnv({ [ORG_ENDPOINT_BINDING_ENV]: binding })).toEqual({})

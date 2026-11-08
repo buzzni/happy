@@ -1356,6 +1356,10 @@ export class ApiMachineClient {
             }
             return capabilities;
         });
+        // aplus specs/org-llm-endpoints C4 — carries the endpoint's token, so it stays off SERVER_LANE_METHODS like group-sync.
+        this.rpcHandlerManager.registerHandler('ai-credential:org-llm-endpoint-sync', (params) => (
+            aiCredentialRuntime.orgLlmEndpointSync(params)
+        ));
         this.rpcHandlerManager.registerHandler('ai-credential:apply', (params) => (
             aiCredentialRuntime.apply(params)
         ));
@@ -1581,6 +1585,9 @@ export class ApiMachineClient {
                             : {}),
                         ...(result.appliedAiAuthSource
                             ? { appliedAiAuthSource: result.appliedAiAuthSource }
+                            : {}),
+                        ...(result.appliedOrgLlmEndpoint
+                            ? { appliedOrgLlmEndpoint: result.appliedOrgLlmEndpoint }
                             : {}),
                         ...(result.launchMcpDropped?.length ? { launchMcpDropped: result.launchMcpDropped } : {}),
                     };

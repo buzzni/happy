@@ -163,6 +163,20 @@ describe('배선 가드: spawn 이 선택을 존중하고 검증하는가', () =
   })
 })
 
+describe('org-endpoint wiring (aplus specs/org-llm-endpoints C5)', () => {
+  it('a resume rebuilds the recorded target and never falls into the setup-token rebind that may move an account', async () => {
+    const text = await runSource()
+    expect(text).toMatch(/const resumeOrgEndpoint = readOrgEndpointResumeSelection\(tracked\.agentEnvironment\);/)
+    expect(text).toMatch(/resumeOrgEndpoint\s*\?\s*\{ environment: await resolveManagedAiCredentialEnvironment\(resumeAgent, resumeOrgEndpoint\), rebound: false \}\s*:\s*await resumeSetupTokenEnvironment\(/)
+  })
+
+  it('the applied target reaches the spawn result', async () => {
+    const text = await runSource()
+    expect(text).toMatch(/appliedOrgLlmEndpoint = readAppliedOrgLlmEndpoint\(managedAiCredentialEnvironment\)/)
+    expect(text).toMatch(/\.\.\.\(appliedOrgLlmEndpoint \? \{ appliedOrgLlmEndpoint \} : \{\}\)/)
+  })
+})
+
 describe('setup-token account switch wiring (Saycode specs/claude-setup-token-account-selection)', () => {
   it("hands the switch the runtime's own session environment, recorded binding included", async () => {
     const block = (await runSource()).match(/createSetupTokenAccountSwitch\(\{[\s\S]*?\n {4}\}\);/)?.[0] ?? ''

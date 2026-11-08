@@ -137,6 +137,8 @@ import {
   type AiAuthSelection,
   type SetupTokenBinding,
   readSetupTokenResumeSelection,
+  readOrgEndpointResumeSelection,
+  readAppliedOrgLlmEndpoint,
   isMachineSetupTokenBinding,
   sharedMachineSetupTokenAccount,
   SETUP_TOKEN_BINDING_ENV,
@@ -2134,6 +2136,8 @@ export async function startDaemon(): Promise<void> {
           allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
         });
         let launchMcp: PreparedLaunchMcpServers | undefined;
+        // Set once the managed environment is resolved; stays undefined for every selection but `org-endpoint`.
+        let appliedOrgLlmEndpoint: { bindingId: string; targetId: string } | undefined;
         const finishSpawn = async (
           spawn: Promise<SpawnSessionResult>,
           appliedAiAuthSource?: AiAuthSource,
@@ -2155,7 +2159,8 @@ export async function startDaemon(): Promise<void> {
             const withAuthSource: SpawnSessionResult = appliedAiAuthSource === undefined
               ? result
               : { ...result, appliedAiAuthSource };
-            const reported: SpawnSessionResult = launchMcpDropped ? { ...withAuthSource, launchMcpDropped } : withAuthSource;
+            const withEndpoint: SpawnSessionResult = { ...withAuthSource, ...(appliedOrgLlmEndpoint ? { appliedOrgLlmEndpoint } : {}) };
+            const reported: SpawnSessionResult = launchMcpDropped ? { ...withEndpoint, launchMcpDropped } : withEndpoint;
             if (options.additionalDirectories === undefined) return reported;
             return {
               ...reported,
@@ -2298,6 +2303,7 @@ export async function startDaemon(): Promise<void> {
         const personalAnchor = readSetupTokenResumeSelection(launchAuthorityEnvironment)?.binding;
         const managedAiCredentialEnvironment = await applyManualPersonal(options.aiAuthSelection, launchAuthorityEnvironment,
           personalAnchor && !isMachineSetupTokenBinding(personalAnchor) ? personalAnchor : undefined);
+        appliedOrgLlmEndpoint = readAppliedOrgLlmEndpoint(managedAiCredentialEnvironment);
         logger.debug(`[timing] spawn managed-credential-environment ${Date.now() - credentialStartedAt}ms`);
         let extraEnv: Record<string, string> = injectMcpCallerGrant(
           stripManagedCredentialConflicts(
@@ -3255,6 +3261,10 @@ export async function startDaemon(): Promise<void> {
         });
 
         const resumeBinding = readSetupTokenResumeSelection(tracked.agentEnvironment);
+        // aplus specs/org-llm-endpoints C5: an endpoint session resumes on its recorded target at its recorded
+        // generation or not at all (a corrupt record throws here); no other address or source stands in.
+        const resumeOrgEndpoint = readOrgEndpointResumeSelection(tracked.agentEnvironment);
+        if (resumeOrgEndpoint && resumeBinding) throw new Error('Recorded org endpoint and setup-token bindings conflict; the session is not resumed');
         const resumeMachineRuntime = resumeBinding && isMachineSetupTokenBinding(resumeBinding.binding)
           ? await machineRuntimeFor(resumeBinding.binding.companyId) : undefined;
         const recoveredMachineEnvironment = resumeMachineRuntime && resumeBinding
@@ -3369,7 +3379,9 @@ export async function startDaemon(): Promise<void> {
         resumingSetupTokenSessions.set(happySessionId, tracked);
         let resumedCredentials: { environment: Record<string, string>; rebound: boolean };
         try {
-          resumedCredentials = recoveredMachineEnvironment ? { environment: recoveredMachineEnvironment, rebound: false } : await resumeSetupTokenEnvironment({
+          resumedCredentials = recoveredMachineEnvironment ? { environment: recoveredMachineEnvironment, rebound: false } : resumeOrgEndpoint
+            ? { environment: await resolveManagedAiCredentialEnvironment(resumeAgent, resumeOrgEndpoint), rebound: false }
+            : await resumeSetupTokenEnvironment({
             sessionId: happySessionId,
             recorded: tracked.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV],
             manualChoice: restoreManualToOrganization ? undefined : tracked.agentEnvironment?.[MANUAL_PERSONAL_ENV],

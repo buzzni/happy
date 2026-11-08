@@ -676,6 +676,12 @@ export function parseOrgEndpointBinding(value: string): OrgEndpointBinding | nul
     return { bindingId: parts[0]!, endpointId: parts[1]!, targetId: parts[2]!, generation: Number(parts[3]) }
 }
 
+/** Which binding and target the daemon applied to a finished managed environment; what the spawn result reports. */
+export function readAppliedOrgLlmEndpoint(env: Record<string, string | undefined>): { bindingId: string; targetId: string } | undefined {
+    const binding = parseOrgEndpointBinding(env[ORG_ENDPOINT_BINDING_ENV] ?? '')
+    return binding ? { bindingId: binding.bindingId, targetId: binding.targetId } : undefined
+}
+
 /**
  * What a resume must rebuild: the recorded target of the recorded generation, nothing else. No other target
  * is a candidate, so a resume can never move to another URL. A corrupt record refuses the resume.

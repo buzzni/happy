@@ -1432,6 +1432,20 @@ describe('ApiMachineClient socket reconnection', () => {
         expect(runtime.groupReceipt).toHaveBeenCalledWith('company','claude');
     });
 
+    it('routes the organization LLM endpoint sync to the runtime on the unbound lane the server cannot reach with its own key', async () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        const runtime = { orgLlmEndpointSync: vi.fn(async () => ({ ok: true, generation: 4 })) };
+        client.setRPCHandlers({ spawnSession: vi.fn(), stopSession: vi.fn(), requestShutdown: vi.fn(), portRegistry: {} as any, aiCredentialRuntime: runtime as any });
+        const registration = (client as any).rpcHandlerManager.registerHandler.mock.calls
+            .find(([method]: [string]) => method === 'ai-credential:org-llm-endpoint-sync');
+        expect(registration).toBeDefined();
+        // Not customer-bound (same as group-sync) and absent from SERVER_LANE_METHODS: the server key never reaches a token.
+        expect(registration[2]).toBeUndefined();
+        const params = { version: 1, companyId: 'c', userId: 'u', endpoint: {} };
+        expect(await registration[1](params)).toEqual({ ok: true, generation: 4 });
+        expect(runtime.orgLlmEndpointSync).toHaveBeenCalledWith(params);
+    });
+
     it('routes machine-scoped group receipts without changing the legacy status request', async () => {
         const client = new ApiMachineClient('fake-token', makeMachine());
         const groupReceipt = vi.fn(async () => ({ reconciled: true }));
