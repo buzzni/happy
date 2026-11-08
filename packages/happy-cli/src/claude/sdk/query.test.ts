@@ -85,11 +85,20 @@ describe('query adapter', () => {
             expect(pinnedQuery).not.toHaveBeenCalled();
         });
 
-        it('folds the requested and the fallback model onto the endpoint names before the SDK sees them', () => {
+        it('folds the requested model onto the endpoint names and drops the fallback model before the SDK sees them', () => {
             query({ prompt: 'hello', options: { model: 'claude-opus-5-5', fallbackModel: 'haiku' } });
             expect(pinnedEndpointQuery.mock.calls.at(-1)).toBeDefined();
             const options = (pinnedEndpointQuery.mock.calls.at(-1) as unknown as [unknown, { options: Record<string, unknown> }])[1].options;
-            expect(options).toMatchObject({ model: 'corp-model', fallbackModel: 'corp-small' });
+            expect(options).toMatchObject({ model: 'corp-model' });
+            // An endpoint has no second model to fall back to, and the SDK refuses a fallback equal to the main model
+            // (which folding produces whenever the endpoint maps no tiers).
+            expect(options.fallbackModel).toBeUndefined();
+        });
+
+        it.each(['claude-sonnet-5', 'sonnet', 'corp-model', 'corp-small'])('never hands the SDK a fallback model equal to the main one (%s)', fallback => {
+            query({ prompt: 'hello', options: { model: 'claude-opus-5-5', fallbackModel: fallback } });
+            const options = (pinnedEndpointQuery.mock.calls.at(-1) as unknown as [unknown, { options: Record<string, unknown> }])[1].options;
+            expect(options.fallbackModel).toBeUndefined();
         });
 
         // The pin applies its flag layer after Claude Code started; the settings files' env is read at startup (telemetry
@@ -128,6 +137,12 @@ describe('query adapter', () => {
             query({ prompt: 'hello', options: { model: 'claude-opus-5-5' } });
             expect(pinnedEndpointQuery).not.toHaveBeenCalled();
             expect(lastOptions().model).toBe('claude-opus-5-5');
+        });
+
+        it('leaves every other source\'s fallback model alone', () => {
+            vi.stubEnv('HAPPY_AI_AUTH_SOURCE', 'org-bundle');
+            query({ prompt: 'hello', options: { model: 'claude-opus-5-5', fallbackModel: 'claude-sonnet-5' } });
+            expect(lastOptions().fallbackModel).toBe('claude-sonnet-5');
         });
     });
 

@@ -18,6 +18,7 @@ import {
   consumePendingInitialSaycodeSystemPromptEnabled,
   defaultClaudeModelForRuntime,
   normalizeClaudeModelForRuntime,
+  resolveClaudeModelForRuntime,
   stageInitialPromptEnvironment,
 } from './initialPrompt'
 
@@ -227,6 +228,32 @@ describe('model names in an organization LLM endpoint runtime', () => {
   it('leaves every other runtime as it was', () => {
     expect(normalizeClaudeModelForRuntime('claude-sonnet-5-5', { ...endpoint, HAPPY_AI_AUTH_SOURCE: 'org-bundle' })).toBe('claude-sonnet-5-5')
     expect(defaultClaudeModelForRuntime({}, 'opus')).toBe('opus')
+  })
+
+  // The way every turn resolves its model (runClaude): normalize, then give a turn that named none the default.
+  // Applying the default to an already-normalized value used to overwrite the tier mapping with ANTHROPIC_MODEL.
+  describe('a turn\'s model, normalized and then defaulted as runClaude does', () => {
+    const resolved = (model: string | undefined, env: NodeJS.ProcessEnv) => resolveClaudeModelForRuntime(model, env)
+
+    it.each([
+      ['opus', 'corp-big'], ['claude-opus-5-5', 'corp-model'], ['haiku', 'corp-small'], ['claude-sonnet-5-5', 'corp-model'],
+      ['corp-small', 'corp-small'], ['corp-big', 'corp-big'],
+    ])('keeps the endpoint mapping %s -> %s instead of the plain endpoint model', (requested, expected) => {
+      expect(resolved(requested, endpoint)).toBe(expected)
+    })
+
+    it('gives a turn that named no model the endpoint model, and nothing else', () => {
+      expect(resolved(undefined, endpoint)).toBe('corp-model')
+      expect(resolved('', endpoint)).toBe('corp-model')
+    })
+
+    it.each([
+      ['claude-opus-5', { ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic' }],
+      [undefined, { ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic' }],
+      ['claude-sonnet-5', {}], [undefined, {}], ['opus', { HAPPY_AI_AUTH_SOURCE: 'org-bundle' }],
+    ])('is exactly the earlier normalize-then-default for every other runtime (%s, %j)', (model, env) => {
+      expect(resolved(model, env)).toBe(defaultClaudeModelForRuntime(env, normalizeClaudeModelForRuntime(model, env)))
+    })
   })
 })
 

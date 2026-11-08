@@ -114,6 +114,15 @@ describe('Claude runner adapter of the organization gate', () => {
         expect(env).toMatchObject(names);
     });
 
+    it('keeps an endpoint session\'s names even when the endpoint\'s address is the Z.AI one', () => {
+        // The administrator registered Z.AI as the endpoint: the endpoint's own names win over the built-in Z.AI mapping.
+        const names = { ANTHROPIC_MODEL: 'corp-model', ANTHROPIC_DEFAULT_OPUS_MODEL: 'corp-big', ANTHROPIC_DEFAULT_SONNET_MODEL: 'corp-model', ANTHROPIC_DEFAULT_HAIKU_MODEL: 'corp-small',
+            ANTHROPIC_DEFAULT_FABLE_MODEL: 'corp-big', CLAUDE_CODE_SUBAGENT_MODEL: 'corp-model' };
+        const env: Record<string, string | undefined> = { HAPPY_AI_AUTH_SOURCE: 'org-endpoint', ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic', ...names };
+        expect(stripModelSelectionEnv(env, undefined)).toEqual([]);
+        expect(env).toMatchObject(names);
+    });
+
     it('launches the terminal without bypass and with the clipped mode under a ceiling', () => {
         gate.onRequirements({ kind: 'response', status: 'ok', requirements: doc({ 'permissions.mode': { kind: 'ceiling', max: 'acceptEdits' } }) });
         expect(adapter().localLaunchArgs(['--resume', 'x', '--dangerously-skip-permissions', '--permission-mode', 'bypassPermissions', '--allow-dangerously-skip-permissions']))

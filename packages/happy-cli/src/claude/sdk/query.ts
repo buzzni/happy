@@ -101,7 +101,9 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
     // An endpoint serves its own model names only; this is the last place every query — the title job's and the
     // sub-agents' included — passes, so a Claude ID some caller kept cannot reach it.
     sdkOptions.model = foldModelToOrgEndpoint(sdkOptions.model, env)
-    sdkOptions.fallbackModel = foldModelToOrgEndpoint(sdkOptions.fallbackModel, env)
+    // No fallback in an endpoint session: it has no second model, and the SDK refuses a fallback equal to the main model
+    // (which folding produces whenever the endpoint maps no tiers) by not creating the query at all.
+    if (env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint') sdkOptions.fallbackModel = undefined
 
     // Map canCallTool -> canUseTool
     if (opts?.canCallTool) {

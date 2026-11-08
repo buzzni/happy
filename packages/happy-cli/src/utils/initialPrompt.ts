@@ -147,6 +147,21 @@ export function defaultClaudeModelForRuntime(
 }
 
 /**
+ * A turn's model as the runtime runs it: `normalizeClaudeModelForRuntime`, then the default for a turn that named none.
+ *
+ * Every per-turn caller needs both steps and neither alone: `defaultClaudeModelForRuntime` on an already-normalized
+ * value would replace an endpoint's tier mapping (opus -> corp-big) with its plain model. Z.AI and the other runtimes
+ * keep exactly the earlier composition.
+ */
+export function resolveClaudeModelForRuntime(
+  model: string | undefined,
+  env: NodeJS.ProcessEnv,
+): string | undefined {
+  if (isOrgEndpointRuntime(env)) return foldModelToOrgEndpoint(model || undefined, env) ?? env.ANTHROPIC_MODEL
+  return defaultClaudeModelForRuntime(env, normalizeClaudeModelForRuntime(model, env))
+}
+
+/**
  * Read the daemon-provided initial effort seed exactly once
  * (HAPPY_INITIAL_EFFORT). Validation against the agent's accepted set is the
  * caller's job — accepted values differ per agent (Claude vs Codex).

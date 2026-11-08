@@ -90,7 +90,8 @@ export function stripModelSelectionEnv(env: Record<string, string | undefined>, 
     const endpoint = env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint';
     const removed = new Set<string>();
     for (const key of MODEL_SELECTION_ENV) {
-        const kept = zai ? ZAI_TIER_ENV[key] : endpoint ? env[key] : undefined;
+        // The endpoint first: an administrator may register the Z.AI address as an endpoint, and its names are not Z.AI's.
+        const kept = endpoint ? env[key] : zai ? ZAI_TIER_ENV[key] : undefined;
         if (env[key] !== undefined && env[key] !== kept) { delete env[key]; removed.add(key); }
         if (extra && extra[key] !== undefined && extra[key] !== kept) { delete extra[key]; removed.add(key); }
     }
