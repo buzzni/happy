@@ -1205,6 +1205,14 @@ describe('ApiMachineClient socket reconnection', () => {
         }
     });
 
+    // aplus-dev-studio-desktop ADR-085: a strict machine's AI browser console rides the customer-key lane only.
+    it('registers the sealed AI browser console as a customer-bound machine method', () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        expect((client as any).rpcHandlerManager.registerHandler).toHaveBeenCalledWith(
+            'agent-browser:console-http-v1', expect.any(Function), { customerBound: true, ownNonceBudget: true },
+        );
+    });
+
     it('registers dependency reclaim on the authenticated machine RPC surface', () => {
         const client = new ApiMachineClient('fake-token', makeMachine());
         expect((client as any).rpcHandlerManager.registerHandler).toHaveBeenCalledWith(

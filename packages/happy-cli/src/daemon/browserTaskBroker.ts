@@ -192,10 +192,11 @@ function writeQueueFileDurably(file: string, data: string): void {
  * accepts Studio's session-user attestation at spawn; tenancyMode lets Studio refuse a machine it thinks is
  * of the other mode. Absent elsewhere and on older daemons, which Studio sends no attestation to.
  */
-export function agentBrowserMachineCapability(env: NodeJS.ProcessEnv = process.env): { protocol: 2; desktopLogin?: 1; tenancyMode: 'dedicated' | 'shared'; hostMode: 'browser-only' | 'dedicated-host'; profileId?: string } | undefined {
+/** `sealedConsole`: the personal desktop runtime's remote page console is reachable over the customer-key RPC (aplus-dev-studio-desktop ADR-085). */
+export function agentBrowserMachineCapability(env: NodeJS.ProcessEnv = process.env): { protocol: 2; desktopLogin?: 1; tenancyMode: 'dedicated' | 'shared'; hostMode: 'browser-only' | 'dedicated-host'; profileId?: string; sealedConsole?: 1 } | undefined {
     if (!env.HAPPY_BROWSER_TASK_RUNTIME_URL) return undefined
     const profileId = env.HAPPY_BROWSER_TASK_PROFILE_ID
-    return { ...(env.HAPPY_BROWSER_TASK_DESKTOP_LOGIN === '1' && env.HAPPY_BROWSER_TASK_TENANCY !== 'shared' ? { desktopLogin: 1 as const } : {}), ...(env.HAPPY_BROWSER_TASK_TENANCY !== 'shared' && typeof profileId === 'string' && profileId.length > 0 && profileId.length <= 256 && profileId.trim() === profileId ? { profileId } : {}), protocol: 2, tenancyMode: env.HAPPY_BROWSER_TASK_TENANCY === 'shared' ? 'shared' : 'dedicated', hostMode: env.HAPPY_BROWSER_TASK_HOST_MODE === 'browser-only' ? 'browser-only' : 'dedicated-host' }
+    return { ...(env.HAPPY_BROWSER_TASK_DESKTOP_LOGIN === '1' && env.HAPPY_BROWSER_TASK_TENANCY !== 'shared' ? { desktopLogin: 1 as const } : {}), ...(env.HAPPY_BROWSER_TASK_TENANCY !== 'shared' && typeof profileId === 'string' && profileId.length > 0 && profileId.length <= 256 && profileId.trim() === profileId ? { profileId } : {}), protocol: 2, tenancyMode: env.HAPPY_BROWSER_TASK_TENANCY === 'shared' ? 'shared' : 'dedicated', hostMode: env.HAPPY_BROWSER_TASK_HOST_MODE === 'browser-only' ? 'browser-only' : 'dedicated-host', ...(env.HAPPY_BROWSER_TASK_TENANCY !== 'shared' && env.HAPPY_BROWSER_TASK_SEALED_CONSOLE === '1' ? { sealedConsole: 1 as const } : {}) }
 }
 
 /**

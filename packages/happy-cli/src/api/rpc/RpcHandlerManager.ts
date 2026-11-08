@@ -25,6 +25,8 @@ import { RpcNonceGuard } from './rpcNonceGuard';
 export class RpcHandlerManager {
     private handlers: RpcHandlerMap = new Map();
     private customerBound = new Set<string>();
+    /** Methods that remember their nonces apart, so their volume cannot refuse other bound requests. */
+    private ownNonceGuards = new Map<string, RpcNonceGuard>();
     private readonly scopePrefix: string;
     private readonly encryptionKey: Uint8Array;
     private readonly encryptionVariant: 'legacy' | 'dataKey';
@@ -32,6 +34,7 @@ export class RpcHandlerManager {
     private readonly requireBoundRequests: boolean;
     private readonly nonceGuard: RpcNonceGuard;
     private readonly customerBoundNonceGuard: RpcNonceGuard;
+    private readonly maxBoundRequestsInWindow: number;
     private readonly logger: (message: string, data?: any) => void;
     private socket: Socket | null = null;
     /**
@@ -54,9 +57,10 @@ export class RpcHandlerManager {
             maxEntries: config.maxBoundRequestsInWindow ?? 10_000,
             whenFull: this.requireBoundRequests ? 'refuse' : 'evict-oldest',
         });
+        this.maxBoundRequestsInWindow = config.maxBoundRequestsInWindow ?? 10_000;
         this.customerBoundNonceGuard = new RpcNonceGuard({
             windowMs: RPC_BINDING_WINDOW_MS,
-            maxEntries: config.maxBoundRequestsInWindow ?? 10_000,
+            maxEntries: this.maxBoundRequestsInWindow,
             whenFull: 'refuse',
         });
         this.logger = config.logger || ((msg, data) => defaultLogger.debug(msg, data));
@@ -70,7 +74,7 @@ export class RpcHandlerManager {
     registerHandler<TRequest = any, TResponse = any>(
         method: string,
         handler: RpcHandler<TRequest, TResponse>,
-        policy?: { customerBound?: boolean }
+        policy?: { customerBound?: boolean; ownNonceBudget?: boolean }
     ): void {
         const prefixedMethod = this.getPrefixedMethod(method);
 
@@ -78,6 +82,8 @@ export class RpcHandlerManager {
         this.handlers.set(prefixedMethod, handler);
         if (policy?.customerBound) this.customerBound.add(prefixedMethod);
         else this.customerBound.delete(prefixedMethod);
+        if (policy?.ownNonceBudget) this.ownNonceGuards.set(prefixedMethod, new RpcNonceGuard({ windowMs: RPC_BINDING_WINDOW_MS, maxEntries: this.maxBoundRequestsInWindow, whenFull: 'refuse' }));
+        else this.ownNonceGuards.delete(prefixedMethod);
 
         if (this.socket) {
             this.socket.emit('rpc-register', { method: prefixedMethod });
@@ -109,6 +115,7 @@ export class RpcHandlerManager {
         const prefixedMethod = this.getPrefixedMethod(method);
         this.handlers.delete(prefixedMethod);
         this.customerBound.delete(prefixedMethod);
+        this.ownNonceGuards.delete(prefixedMethod);
 
         if (this.socket) {
             this.socket.emit('rpc-unregister', { method: prefixedMethod });
@@ -198,7 +205,8 @@ export class RpcHandlerManager {
                     }
                     // A stale request is remembered from when it arrived. Its own issue time
                     // would forget it at once, or hold the guard's oldest slot for hours.
-                    const guard = this.customerBound.has(request.method) ? this.customerBoundNonceGuard : this.nonceGuard;
+                    const guard = this.ownNonceGuards.get(request.method)
+                        ?? (this.customerBound.has(request.method) ? this.customerBoundNonceGuard : this.nonceGuard);
                     const admission = guard.admit(binding.nonce, binding.stale ? now : binding.issuedAt, now);
                     if (admission === 'full') {
                         this.logger('[RPC] Bound request refused: the time window holds as many as it can remember', { method: request.method });
@@ -320,6 +328,7 @@ export class RpcHandlerManager {
     clearHandlers(): void {
         this.handlers.clear();
         this.customerBound.clear();
+        this.ownNonceGuards.clear();
         this.logger('Cleared all RPC handlers');
     }
 
