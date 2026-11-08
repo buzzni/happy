@@ -364,6 +364,10 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Build CLI
+        # `tsc --noEmit` uses ~2.4 GB here and sits right at the macOS runner's default V8 heap
+        # limit (main OOM'd here too); give the type check an explicit ceiling instead.
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
         run: pnpm --filter @buzzni/happy-cli build
       - name: Verify host sandbox test is eligible
         run: |
