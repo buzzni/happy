@@ -34,6 +34,10 @@ export async function findAllHappyProcesses(): Promise<Array<{ pid: number, comm
       let type = 'unknown';
       if (proc.pid === process.pid) {
         type = 'current';
+      } else if (/\bterminal-worker\b/.test(cmd)) {
+        // aplus terminal-survive-runner-restart HR10: owns the user's shells across daemon restarts.
+        // Never a runaway — only `happy daemon stop` and the next daemon's adoption close it.
+        type = cmd.includes('tsx') ? 'dev-terminal-worker' : 'terminal-worker';
       } else if (cmd.includes('--version')) {
         type = cmd.includes('tsx') ? 'dev-daemon-version-check' : 'daemon-version-check';
       } else if (cmd.includes('daemon start-sync') || cmd.includes('daemon start')) {

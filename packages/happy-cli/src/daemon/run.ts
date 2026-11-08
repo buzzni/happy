@@ -95,7 +95,11 @@ import { fetchBrowserExtensionScope } from './browserExtensionScope';
 import { writeBrowserBridgeOwnerHome } from './browserBridgeOwner';
 import { readBrowserSetupPolicy, writeBrowserSetupPolicy, localBrowserExtensionMetadata } from './browserLocalSetupStore';
 import { BrowserSessionBrokerClient } from './browserSessionBrokerContract';
-import { getBusyDaemonTerminalCount, getDaemonTerminalSessionCount } from './daemonTerminalSessions';
+import { getBusyDaemonTerminalCount, getDaemonTerminalSessionCount, type DaemonTerminalEntry } from './daemonTerminalSessions';
+import { TerminalWorkerHost } from './terminalWorker/workerHost';
+import { decideTerminalSurvival, keepsWorkerTerminalsOnExit, terminalWorkersEnabled, type TerminalSurvivalDecision } from './terminalWorker/survivalDecision';
+import { installedWorkerProtocolMatches } from './terminalWorker/installedProtocol';
+import { isWorkerPtySession } from './terminalWorker/workerPtySession';
 import { startBrowserBridgeServer, retryBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './browserBridgeServer';
 import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
 import { prepareBrowserNativeMessaging, registerBrowserNativeHost } from './browserNativeHostRegistration';
@@ -4371,8 +4375,15 @@ export async function startDaemon(): Promise<void> {
       stopBlocked: () => restartDrainRuntime?.controlPort.stopBlocked() ?? false,
       handingOff: () => restartDrainRuntime?.controlPort.handingOff() ?? false,
     };
-    const { port: controlPort, stop: stopControlServer, controlSecret } = await startDaemonControlServer({
+    // aplus terminal-survive-runner-restart: PTYs in detached workers that outlive this daemon (opt-in, HR11).
+    const terminalWorkers = new TerminalWorkerHost({
+      happyHome: configuration.happyHomeDir,
+      enabled: !standaloneWindows && terminalWorkersEnabled(),
+      log: (message) => logger.debug(message),
+    });
+    const { port: controlPort, stop: stopControlServer, controlSecret, adoptTerminals } = await startDaemonControlServer({
       ...(managedRuntimeActive ? {} : { sessionRetention }),
+      terminalWorkers,
       restartDrain: restartDrainControlPort,
       getCallerLaunches: () => callerLaunches,
       ...(admitSubprocess ? { admitSubprocess, reserveLegacyDispatch } : {}),
@@ -4424,6 +4435,14 @@ export async function startDaemon(): Promise<void> {
 
     // The managed launch path hands this to each child with its credential.
     managedControlPortValue = controlPort;
+
+    // HR2·HR6: before the state file names this daemon's port, so a reconnecting app's attach
+    // finds the adopted terminals already registered.
+    try {
+      adoptTerminals(await terminalWorkers.start());
+    } catch (error) {
+      logger.debug(`[TERMINAL-WORKER] adoption failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
 
     // Write initial daemon state (no lock needed for state file)
     const fileState: DaemonLocallyPersistedState = {
@@ -5920,6 +5939,23 @@ export async function startDaemon(): Promise<void> {
         + Number(sessionFollowupTickRunner.isRunning())
         + activeServerAutomationLeaseCount,
     });
+    // aplus terminal-survive-runner-restart HR3·HR5: what a restart does with worker terminals.
+    // The installed bundle is read each time — it is what the next daemon runs from.
+    const terminalSurvivalFor = (intent: 'restart' | 'stop', reason: Parameters<typeof decideTerminalSurvival>[0]['reason']): TerminalSurvivalDecision | null =>
+      terminalWorkers.enabled ? decideTerminalSurvival({
+        platform: process.platform,
+        workersEnabled: true,
+        intent,
+        reason,
+        installedProtocolMatches: installedWorkerProtocolMatches(),
+        recordsReadable: terminalWorkers.recordsReadable(),
+      }) : null;
+    const survivesRestart = (entry: DaemonTerminalEntry) => isWorkerPtySession(entry.session);
+    // A pending handoff restarts for `bundle-replaced`; an open drain says its own reason.
+    const restartKeepsWorkerTerminals = () => {
+      const view = restartDrainRuntime?.controller.current();
+      return (view ? terminalSurvivalFor(view.intent, view.reason) : terminalSurvivalFor('restart', 'bundle-replaced'))?.terminals === 'keep';
+    };
     const getRestartDrainActivity = (): RestartDrainActivity => {
       const now = Date.now();
       return {
@@ -5929,7 +5965,7 @@ export async function startDaemon(): Promise<void> {
           { now, knownSince: (pid) => Math.max(daemonStartedAt, pidToAdoptedAt.get(pid) ?? 0, sessionStartTimes.get(pid) ?? 0) },
         ) + admittedLaunches.count(),
         automationCount: getRuntimeActivity().activeAutomationCount,
-        busyTerminalCount: getBusyDaemonTerminalCount(now),
+        busyTerminalCount: getBusyDaemonTerminalCount(now, undefined, restartKeepsWorkerTerminals() ? survivesRestart : undefined),
         openTerminalCount: getDaemonTerminalSessionCount(),
       };
     };
@@ -5959,6 +5995,8 @@ export async function startDaemon(): Promise<void> {
           await bashRpcsDrained;
           apiMachine.shutdown();
           await stopControlServer();
+          // Kept by a ready drain → left running for the replacement; otherwise closed (HR3).
+          await terminalWorkers.stop();
           await writeScopeRuntime?.close();
           await standaloneWindows?.owner.close();
           await stopBrowserBridge();
@@ -6022,7 +6060,15 @@ export async function startDaemon(): Promise<void> {
         scriptAutomationTickRunner.resume();
       },
       // The ready drain's point of no return: bash admission closes before the terminals go.
-      closeTerminalsForRestart: () => { void drainBashRpcs(); return apiMachine.closeDaemonTerminalsForRestart(); },
+      // Worker terminals the drain keeps stay as they are (HR3); everything else closes, as before.
+      closeTerminalsForRestart: async (view) => {
+        void drainBashRpcs();
+        const keep = terminalSurvivalFor(view.intent, view.reason)?.terminals === 'keep';
+        terminalWorkers.setKeeping(keep);
+        if (terminalWorkers.enabled) logger.debug(`[TERMINAL-WORKER] restart ${view.intent}/${view.reason}: worker terminals ${keep ? 'kept' : 'closed'}`);
+        return apiMachine.closeDaemonTerminalsForRestart(keep ? survivesRestart : undefined);
+      },
+      terminalSurvival: (view) => terminalSurvivalFor(view.intent, view.reason),
       preflightReplacement: () => preflightInstalledHappyCLI(),
       handOff: handOffToInstalledBundle,
       shutdown: () => requestShutdown('happy-cli'),
@@ -6032,6 +6078,7 @@ export async function startDaemon(): Promise<void> {
       log: (message) => logger.debug(message),
     });
     restartDrainRuntime = drainRuntime;
+    apiMachine.setTerminalSurvivalProvider(() => terminalWorkers.state());
     if (drainRuntime) {
       apiMachine.setRestartLifecycleProvider(() => drainRuntime.lifecycle());
       onSighup = () => { void drainRuntime.sighup(); };
@@ -6371,7 +6418,11 @@ export async function startDaemon(): Promise<void> {
       await channelHost?.stop();
       await bashRpcsDrained;
       apiMachine.shutdown();
+      // HR3: SIGTERM/SIGINT and plain stops close the worker terminals; an uncaught exception is a
+      // crash and leaves them; `daemon stop --for-restart` keeps what its ready drain kept.
+      terminalWorkers.setKeeping(keepsWorkerTerminalsOnExit({ source, readyDrainKeeps: terminalWorkers.isKeeping() }));
       await stopControlServer();
+      await terminalWorkers.stop();
       await writeScopeRuntime?.close();
       await standaloneWindows?.owner.close();
       await stopBrowserBridge();

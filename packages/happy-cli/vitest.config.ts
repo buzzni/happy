@@ -70,6 +70,19 @@ export default defineConfig({
                 },
             },
             {
+                // aplus specs/terminal-survive-runner-restart HR9 — detached terminal workers, real processes.
+                extends: true,
+                test: {
+                    name: 'integration-terminal-worker',
+                    include: ['src/daemon/terminalWorker/*.integration.test.ts'],
+                    setupFiles: ['./src/testing/unit.setup.ts'],
+                    fileParallelism: false,
+                    maxWorkers: 1,
+                    testTimeout: 120_000,
+                    hookTimeout: 60_000,
+                },
+            },
+            {
                 extends: true,
                 test: {
                     name: 'integration-write-scope',

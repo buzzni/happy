@@ -64,6 +64,15 @@ one line to `HAPPY_HOME_DIR/restart-drain-outcomes.jsonl` (counts only) and logs
 Published as `daemonState.lifecycle`. The Windows standalone trial keeps its own shutdown drain and does
 not advertise this one.
 
+### Terminal workers
+
+aplus `specs/terminal-survive-runner-restart` (opt-in `HAPPY_TERMINAL_WORKER=1` this release): direct
+terminals' PTYs live in a detached `happy terminal-worker` process, adopted by the next daemon at start
+(before the state file names the new port). A ready restart drain decides keep/close
+(`terminalWorker/survivalDecision.ts`); handoff and `cleanupAndShutdown` call `terminalWorkers.stop()`
+after `stopControlServer()` — kept workers are only let go of, otherwise shut down. Details and the
+fail-safe adoption rules: `docs/terminal-worker.md`.
+
 ### Stopping the Daemon
 
 Command: `happy daemon stop [--for-restart [--reason r] [--grace N] [--no-wait]]`, `happy daemon restart`

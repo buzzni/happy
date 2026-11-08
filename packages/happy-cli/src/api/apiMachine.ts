@@ -20,7 +20,8 @@ import { logger } from '@/ui/logger';
 import { configuration } from '@/configuration';
 import { MachineMetadata, DaemonState, Machine, Update, UpdateMachineBody } from './types';
 import type { DaemonRestartLifecycle } from './types';
-import { DAEMON_RESTARTING_CODE, withRestartLifecycle } from '@/daemon/restartDrainLifecycle';
+import { DAEMON_RESTARTING_CODE, withRestartLifecycle, withTerminalSurvival } from '@/daemon/restartDrainLifecycle';
+import type { TerminalSurvivalState } from '@/daemon/terminalWorker/workerHost';
 import type { DaemonSessionStateResponse } from '@/daemon/daemonSessionState';
 import {
     registerCommonHandlers,
@@ -811,6 +812,8 @@ export class ApiMachineClient {
     }) | null = null;
     /** aplus codexcli-daemon-restart-drain R6·R22 — current drain / pending handoff, null while running normally. */
     private restartLifecycleProvider: (() => DaemonRestartLifecycle | null) | null = null;
+    /** aplus terminal-survive-runner-restart HR4·HR10 — null while terminal workers are off. */
+    private terminalSurvivalProvider: (() => TerminalSurvivalState | null) | null = null;
     private lastKnownCLIAvailability: CLIAvailability | null = null;
     private lastKnownResumeSupport: ResumeSupport | null = null;
     // specs/20260521-happy-cli-version-republish — daemon 재시작 후 새 cli
@@ -3973,12 +3976,12 @@ export class ApiMachineClient {
             this.stopSmartReconnect();
             this.reconnectAttempts = 0;
 
-            this.updateDaemonState((state) => ({
+            this.updateDaemonState((state) => withTerminalSurvival({
                 ...state,
                 status: 'running',
                 pid: process.pid,
                 ...this.processState
-            }));
+            }, this.terminalSurvivalProvider?.() ?? null));
             void this.registerAutomationKey().catch((error) => {
                 logger.debug(`[API MACHINE] Failed to register automation key: ${error}`);
             });
@@ -4513,7 +4516,7 @@ export class ApiMachineClient {
             this.socket.emit('machine-alive', payload);
             const activity = this.runtimeActivityProvider?.();
             if (activity) {
-                this.updateDaemonState((state) => withRestartLifecycle({
+                this.updateDaemonState((state) => withRestartLifecycle(withTerminalSurvival({
                     ...state,
                     status: state?.status ?? 'running',
                     activity: {
@@ -4522,7 +4525,7 @@ export class ApiMachineClient {
                         ...(typeof activity.inTurnCount === 'number' ? { inTurnCount: Math.max(0, Math.floor(activity.inTurnCount)) } : {}),
                         reportedAt: Date.now(),
                     },
-                }, this.restartLifecycleProvider?.() ?? null)).catch((err) => {
+                }, this.terminalSurvivalProvider?.() ?? null), this.restartLifecycleProvider?.() ?? null)).catch((err) => {
                     logger.debug('[API MACHINE] Failed to publish runtime activity:', err);
                 });
             }
@@ -4706,10 +4709,14 @@ export class ApiMachineClient {
         this.restartLifecycleProvider = provider;
     }
 
+    setTerminalSurvivalProvider(provider: () => TerminalSurvivalState | null): void {
+        this.terminalSurvivalProvider = provider;
+    }
+
     /** Push the drain state now instead of waiting for the next keep-alive (R6). */
     publishRestartLifecycle(): void {
         const lifecycle = this.restartLifecycleProvider?.() ?? null;
-        this.updateDaemonState((state) => withRestartLifecycle({ ...state, status: state?.status ?? 'running' }, lifecycle))
+        this.updateDaemonState((state) => withRestartLifecycle(withTerminalSurvival({ ...state, status: state?.status ?? 'running' }, this.terminalSurvivalProvider?.() ?? null), lifecycle))
             .catch((err) => logger.debug('[API MACHINE] Failed to publish restart lifecycle:', err));
     }
 
@@ -4717,8 +4724,8 @@ export class ApiMachineClient {
      * R23: close every daemon terminal before a restart, while the socket is still
      * up so each `terminal-closed` carries `reason: 'daemon-restart'`.
      */
-    async closeDaemonTerminalsForRestart(): Promise<number> {
-        const closed = await closeAllDaemonTerminalSessionsForRestart();
+    async closeDaemonTerminalsForRestart(survives?: Parameters<typeof closeAllDaemonTerminalSessionsForRestart>[0]): Promise<number> {
+        const closed = await closeAllDaemonTerminalSessionsForRestart(survives);
         // The close frames are emitted from each PTY's exit handler; give them a beat to leave.
         if (closed > 0) await new Promise((resolve) => setTimeout(resolve, 200));
         return closed;

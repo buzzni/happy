@@ -9,6 +9,7 @@ import chalk from 'chalk'
 import { configuration } from '@/configuration'
 import { readSettings, readCredentials } from '@/persistence'
 import { checkIfDaemonRunningAndCleanupStaleState } from '@/daemon/controlClient'
+import { listTerminalWorkerRecords } from '@/daemon/terminalWorker/record'
 import { findAllHappyProcesses } from '@/daemon/doctor'
 import { readDaemonState } from '@/persistence'
 import { existsSync, readdirSync, statSync } from 'node:fs'
@@ -65,6 +66,19 @@ function getLogFiles(logDir: string): { file: string, path: string, modified: Da
 }
 
 /**
+ * aplus terminal-survive-runner-restart HR10: how many terminal workers this home has and which
+ * versions — read from their records, the same ledger the daemon adopts from.
+ */
+export function describeTerminalWorkers(happyHome: string): string {
+    const files = listTerminalWorkerRecords(happyHome);
+    if (files.length === 0) return 'Terminal workers: none';
+    const records = files.flatMap((file) => 'record' in file ? [file.record] : []);
+    const unreadable = files.length - records.length;
+    const versions = [...new Set(records.map((record) => record.cliVersion))].join(', ');
+    return `Terminal workers: ${records.length}${versions ? ` (cli ${versions})` : ''}${unreadable ? `, ${unreadable} unreadable record(s)` : ''}`;
+}
+
+/**
  * Slim daemon status output for `happy daemon status`
  */
 export async function runDoctorDaemon(): Promise<void> {
@@ -79,6 +93,7 @@ export async function runDoctorDaemon(): Promise<void> {
             console.log(`  Port:    ${state.httpPort}`);
             console.log(`  Started: ${new Date(state.startTime).toLocaleString()}`);
             console.log(`  Version: ${state.startedWithCliVersion}`);
+            console.log(`  ${describeTerminalWorkers(configuration.happyHomeDir)}`);
         } else if (state && !isRunning) {
             console.log(chalk.yellow('⚠️  Daemon state exists but process not running (stale)'));
         } else {
@@ -130,6 +145,8 @@ export async function runDoctorCommand(): Promise<void> {
                     'dev-doctor': '🛠️  Dev Doctor',
                     'dev-related': '🛠️  Dev Related',
                     'doctor': '🩺 Doctor',
+                    'terminal-worker': '🖥️  Terminal Workers (keep terminals across daemon restarts)',
+                    'dev-terminal-worker': '🛠️  Dev Terminal Workers',
                     'unknown': '❓ Unknown'
                 };
 
@@ -263,6 +280,7 @@ export async function runDoctorCommand(): Promise<void> {
             console.log(`  Port:    ${state.httpPort}`);
             console.log(`  Started: ${new Date(state.startTime).toLocaleString()}`);
             console.log(`  Version: ${state.startedWithCliVersion}`);
+            console.log(`  ${describeTerminalWorkers(configuration.happyHomeDir)}`);
         } else if (state && !isRunning) {
             console.log(chalk.yellow('⚠️  Daemon state exists but process not running (stale)'));
         } else {

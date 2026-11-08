@@ -65,6 +65,13 @@ jobs:
         src/daemon/sessionRetentionControl.test.ts
         src/daemon/sessionIdleReaper.test.ts
 
+    - name: Verify terminals survive a daemon restart (terminal workers)
+      timeout-minutes: 5
+      run: >-
+        pnpm --filter @buzzni/happy-cli exec vitest run
+        --project integration-terminal-worker --project unit
+        src/daemon/terminalWorker src/daemon/doctor.terminalWorker.test.ts
+
     - name: Verify personal Claude authentication with the real SDK
       if: matrix.node-version == 24
       timeout-minutes: 5
@@ -344,6 +351,10 @@ jobs:
   smoke-test-macos:
     runs-on: macos-latest
     timeout-minutes: 30
+    # `tsc --noEmit` (the build, and every vitest global setup that rebuilds) uses ~2.4 GB and sits
+    # right at the macOS runner's default V8 heap limit — main OOM'd in these steps too.
+    env:
+      NODE_OPTIONS: --max-old-space-size=6144
     steps:
       - uses: actions/checkout@v4
         with:

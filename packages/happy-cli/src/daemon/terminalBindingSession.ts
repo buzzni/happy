@@ -46,6 +46,7 @@ import { RpcNonceGuard } from '@/api/rpc/rpcNonceGuard';
 import { logger } from '@/ui/logger';
 import { recordBytesIn, recordTerminalActivity, type DaemonTerminalEntry, type TerminalExit } from './daemonTerminalSessions';
 import { replyToTerminalResume } from './terminalResumeReply';
+import type { SerializedTerminalBinding } from './terminalWorker/protocol';
 
 export function createTerminalOpenNonceGuard(options: { maxEntries?: number } = {}): RpcNonceGuard {
     return new RpcNonceGuard({ windowMs: RPC_BINDING_WINDOW_MS, maxEntries: options.maxEntries ?? 10_000, whenFull: 'refuse' });
@@ -132,6 +133,8 @@ export interface BoundTerminal {
      * A repeat is still a replay, and anything but an attach is unreadable here.
      */
     openAttach(data: string): { kind: 'frame'; frame: Extract<TerminalInFrame, { kind: 'attach' }> } | { kind: 'replayed' } | { kind: 'unreadable' };
+    /** Key material and input position, for a terminal worker to hold across a daemon restart (memory only). */
+    exportState(): SerializedTerminalBinding;
 }
 
 export function bindTerminal(input: {
@@ -143,16 +146,53 @@ export function bindTerminal(input: {
     const { params, sessionId } = input;
     const terminalKey = decodeBase64(params.terminalKey);
     const daemonNonce = new Uint8Array(randomBytes(16));
+    const terminal = createBoundTerminal({ sessionId, terminalId: params.terminalId, terminalKey, daemonNonce, lastInSeq: 0 });
+    const proof = encodeBase64(encryptWithDataKey({
+        terminalBinding: TERMINAL_BINDING_VERSION,
+        nonce: input.nonce,
+        sessionId,
+        terminalId: params.terminalId,
+        daemonNonce: encodeBase64(daemonNonce),
+        caps: input.caps,
+    }, terminalKey));
+    return { terminal, proof };
+}
+
+/**
+ * Rebuilds a bound terminal from `BoundTerminal.exportState()` — a daemon that adopted the
+ * terminal from a worker (aplus specs/terminal-survive-runner-restart §2.4). The same key and
+ * daemon nonce give the same frame keys, so the client's open proof still holds; input admission
+ * resumes after `lastInSeq`.
+ */
+export function restoreBoundTerminal(input: { sessionId: string; state: SerializedTerminalBinding }): BoundTerminal {
+    const { state } = input;
+    return createBoundTerminal({
+        sessionId: input.sessionId,
+        terminalId: state.terminalId,
+        terminalKey: decodeBase64(state.terminalKey),
+        daemonNonce: decodeBase64(state.daemonNonce),
+        lastInSeq: state.lastInSeq,
+    });
+}
+
+function createBoundTerminal(input: {
+    sessionId: string;
+    terminalId: string;
+    terminalKey: Uint8Array;
+    daemonNonce: Uint8Array;
+    lastInSeq: number;
+}): BoundTerminal {
+    const { sessionId, terminalId, terminalKey, daemonNonce } = input;
     const frameKey = (dir: 'in' | 'out') => new Uint8Array(hkdfSync(
         TERMINAL_FRAME_KEY_HASH,
         terminalKey,
         daemonNonce,
-        Buffer.from(terminalFrameKeyInfo(dir, sessionId, params.terminalId), 'utf8'),
+        Buffer.from(terminalFrameKeyInfo(dir, sessionId, terminalId), 'utf8'),
         TERMINAL_FRAME_KEY_LENGTH,
     ));
     const inKey = frameKey('in');
     const outKey = frameKey('out');
-    let lastInSeq = 0;
+    let lastInSeq = input.lastInSeq;
     const held = new Map<number, TerminalInFrame>();
     const readIn = (data: string) => {
         let opened: unknown = null;
@@ -161,12 +201,12 @@ export function bindTerminal(input: {
         } catch {
             opened = null;
         }
-        return readTerminalFrame(opened, { terminalId: params.terminalId, dir: 'in' });
+        return readTerminalFrame(opened, { terminalId, dir: 'in' });
     };
 
-    const terminal: BoundTerminal = {
-        terminalId: params.terminalId,
-        sealOut: (body) => encodeBase64(encryptWithDataKey({ v: TERMINAL_BINDING_VERSION, t: params.terminalId, dir: 'out', ...body }, outKey)),
+    return {
+        terminalId,
+        sealOut: (body) => encodeBase64(encryptWithDataKey({ v: TERMINAL_BINDING_VERSION, t: terminalId, dir: 'out', ...body }, outKey)),
         openIn: (data) => {
             const frame = readIn(data);
             if (!frame) return { kind: 'unreadable' };
@@ -203,16 +243,13 @@ export function bindTerminal(input: {
             lastInSeq = frame.seq;
             return { kind: 'frame', frame };
         },
+        exportState: () => ({
+            terminalId,
+            terminalKey: encodeBase64(terminalKey),
+            daemonNonce: encodeBase64(daemonNonce),
+            lastInSeq,
+        }),
     };
-    const proof = encodeBase64(encryptWithDataKey({
-        terminalBinding: TERMINAL_BINDING_VERSION,
-        nonce: input.nonce,
-        sessionId,
-        terminalId: params.terminalId,
-        daemonNonce: encodeBase64(daemonNonce),
-        caps: input.caps,
-    }, terminalKey));
-    return { terminal, proof };
 }
 
 /**

@@ -358,6 +358,12 @@ export const DaemonRestartLifecycleSchema = z.object({
   busyTerminalCount: z.number().int().min(0).optional(),
   /** Epoch ms the drain ends at the latest. */
   deadlineAt: z.number().optional(),
+  /**
+   * aplus terminal-survive-runner-restart HR3 — whether this drain leaves the terminal-worker
+   * terminals running, and why not. Only from a daemon that advertises `terminalSurvival`.
+   */
+  terminals: z.union([z.enum(['keep', 'close']), z.string()]).optional(),
+  terminalsCloseReason: z.string().optional(),
   /** Bundle replaced on disk, waiting for a quiet moment (admission still open). */
   pendingHandoff: z.object({
     detectedAt: z.number(),
@@ -368,6 +374,19 @@ export const DaemonRestartLifecycleSchema = z.object({
 })
 
 export type DaemonRestartLifecycle = z.infer<typeof DaemonRestartLifecycleSchema>
+
+export const TerminalSurvivalStateSchema = z.object({
+  version: z.number().int(),
+  workers: z.object({ current: z.number().int().min(0), draining: z.number().int().min(0) }),
+  workerVersion: z.string().optional(),
+  lastAdoption: z.object({
+    at: z.number(),
+    adopted: z.number().int().min(0),
+    closed: z.number().int().min(0),
+    reaped: z.number().int().min(0),
+    failed: z.number().int().min(0),
+  }).optional(),
+})
 
 /**
  * Daemon state - dynamic runtime information (frequently updated)
@@ -402,6 +421,11 @@ export const DaemonStateSchema = z.object({
    * Declared here because this schema strips unknown keys.
    */
   lifecycle: DaemonRestartLifecycleSchema.optional(),
+  /**
+   * aplus terminal-survive-runner-restart HR4·HR10 — this daemon keeps terminals in terminal workers
+   * across a restart, and how those workers stand (counts only). Absent when workers are off.
+   */
+  terminalSurvival: TerminalSurvivalStateSchema.optional(),
 })
 
 export type DaemonState = z.infer<typeof DaemonStateSchema>

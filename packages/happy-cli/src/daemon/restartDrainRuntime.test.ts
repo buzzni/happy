@@ -7,7 +7,13 @@ import { createDaemonRestartDrainRuntime, type DaemonRestartDrainRuntime } from 
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 10))
 
-function harness(options: { activity?: Partial<RestartDrainActivity>; preflight?: boolean; preflightImpl?: () => Promise<boolean>; env?: NodeJS.ProcessEnv } = {}) {
+function harness(options: {
+    activity?: Partial<RestartDrainActivity>
+    preflight?: boolean
+    preflightImpl?: () => Promise<boolean>
+    env?: NodeJS.ProcessEnv
+    terminalSurvival?: Parameters<typeof createDaemonRestartDrainRuntime>[0]['terminalSurvival']
+} = {}) {
     let now = 1_000_000
     let activity: RestartDrainActivity = { inTurnCount: 0, automationCount: 0, busyTerminalCount: 0, openTerminalCount: 0, ...options.activity }
     const home = mkdtempSync(join(tmpdir(), 'drain-runtime-'))
@@ -31,6 +37,7 @@ function harness(options: { activity?: Partial<RestartDrainActivity>; preflight?
         cliVersion: '1.1.10-test',
         env: options.env ?? {},
         tickIntervalMs: 5,
+        ...(options.terminalSurvival ? { terminalSurvival: options.terminalSurvival } : {}),
         ...spies,
     })
     return {
@@ -230,6 +237,38 @@ describe('daemon restart drain runtime', () => {
             expect(h.ledger()).toEqual([])
             await h.runtime.finalizeReady()
             expect(h.ledger()).toEqual([expect.objectContaining({ outcome: 'idle', reason: 'env-reapply', closedTerminalCount: 1 })])
+        })
+    })
+
+    describe('terminal survival (aplus terminal-survive-runner-restart HR3)', () => {
+        it('says from the start of a drain whether worker terminals survive it, and why not', async () => {
+            const h = current = harness({
+                activity: { inTurnCount: 1 },
+                terminalSurvival: (view) => view.reason === 'account-switch'
+                    ? { terminals: 'close', reason: 'account-switch' }
+                    : { terminals: 'keep' },
+            })
+            h.runtime.controlPort.begin({ reason: 'user-restart', intent: 'restart', trigger: 'request', leaseSeconds: 30 })
+            expect(h.runtime.lifecycle()).toMatchObject({ state: 'draining', terminals: 'keep' })
+            expect(h.runtime.lifecycle()).not.toHaveProperty('terminalsCloseReason')
+        })
+
+        it('carries the close reason, and nothing at all from a daemon without workers', async () => {
+            const closing = current = harness({ activity: { inTurnCount: 1 }, terminalSurvival: () => ({ terminals: 'close', reason: 'account-switch' }) })
+            closing.runtime.controlPort.begin({ reason: 'account-switch', intent: 'restart', trigger: 'request', leaseSeconds: 30 })
+            expect(closing.runtime.lifecycle()).toMatchObject({ terminals: 'close', terminalsCloseReason: 'account-switch' })
+            closing.runtime.dispose()
+
+            const plain = current = harness({ activity: { inTurnCount: 1 } })
+            plain.runtime.controlPort.begin({ reason: 'user-restart', intent: 'restart', trigger: 'request', leaseSeconds: 30 })
+            expect(plain.runtime.lifecycle()).not.toHaveProperty('terminals')
+        })
+
+        it('hands the ready drain to the terminal close step, so its intent and reason decide what survives', async () => {
+            const h = current = harness()
+            await h.runtime.heartbeat(true)
+            await flush()
+            expect(h.spies.closeTerminalsForRestart).toHaveBeenCalledWith(expect.objectContaining({ intent: 'restart', reason: 'bundle-replaced' }))
         })
     })
 

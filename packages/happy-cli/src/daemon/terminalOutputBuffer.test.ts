@@ -260,3 +260,31 @@ describe('terminalOutputBuffer paged resume (B-R3)', () => {
         expect(buffer.resume(1)).toEqual({ kind: 'replay', frames: [{ seq: 2, chunk: 'bbb' }, { seq: 3, chunk: 'ccc' }] });
     });
 });
+
+describe('terminalOutputBuffer pushAt (a worker owns the seq)', () => {
+    it('buffers under the given seq, drops repeats, and lists what it holds', () => {
+        const buffer = createTerminalOutputBuffer();
+        expect(buffer.pushAt(1, 'a')).toBe(1);
+        expect(buffer.pushAt(2, 'b')).toBe(2);
+        expect(buffer.pushAt(2, 'b-again')).toBe(2);
+        expect(buffer.frames()).toEqual([{ seq: 1, chunk: 'a' }, { seq: 2, chunk: 'b' }]);
+        // Ordinary pushes continue from the last given seq.
+        expect(buffer.push('c')).toBe(3);
+    });
+
+    it('restored mid-stream, answers an older client with a snapshot of what it holds', () => {
+        const buffer = createTerminalOutputBuffer();
+        buffer.pushAt(41, 'x');
+        buffer.pushAt(42, 'y');
+        expect(buffer.lastSeq()).toBe(42);
+        expect(buffer.resume(41)).toEqual({ kind: 'replay', frames: [{ seq: 42, chunk: 'y' }] });
+        expect(buffer.resume(10)).toEqual({ kind: 'snapshot', seq: 42, data: 'xy' });
+    });
+
+    it('trims to its ceiling like push', () => {
+        const buffer = createTerminalOutputBuffer(3, 10);
+        buffer.pushAt(5, 'aa');
+        buffer.pushAt(6, 'bb');
+        expect(buffer.frames()).toEqual([{ seq: 6, chunk: 'bb' }]);
+    });
+});
