@@ -1,6 +1,6 @@
 ---
 기능: cross-machine-agent-delegation
-상태: 블록됨 — spec 승인 대기(Desktop·happy Draft PR)
+상태: 블록됨 — spec 승인 대기(Draft PR happy #1183·Desktop #3102)
 마지막 갱신: 2026-11-08
 ---
 
