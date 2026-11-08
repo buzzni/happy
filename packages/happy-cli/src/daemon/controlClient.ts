@@ -588,9 +588,17 @@ export async function reportSetupTokenActivity(sessionId: string, binding: strin
 /** Mandatory organization execution admission; an old/unreachable daemon cannot grant it. */
 export async function requestSetupTokenStart(sessionId: string, binding: string, requestId: string, signal: AbortSignal): Promise<import('../claude/setupTokenStartBudget').StartDecision> {
   const result = await daemonPost('/setup-token/start', { sessionId, binding, requestId }, undefined, 15_000, signal);
+  if (result?.reason === 'CAPACITY_ACTOR_REQUIRED') throw new Error('CAPACITY_ACTOR_REQUIRED');
   if (result?.ok !== true) throw new Error(result?.reason === 'START_ACCOUNT_EXHAUSTED' ? 'SETUP_TOKEN_START_ACCOUNT_EXHAUSTED' : 'SETUP_TOKEN_START_UNAVAILABLE');
   const value = result.admission;
   if (value?.state === 'allowed' && Number.isSafeInteger(value.validForMs) && value.validForMs > 0 && value.validForMs <= 15_000) return value;
   if (value?.state === 'wait' && Number.isSafeInteger(value.retryAfterMs) && value.retryAfterMs > 0 && value.retryAfterMs <= 600_000 && Array.isArray(value.preferredAccountIds) && value.preferredAccountIds.every((id: unknown) => typeof id === 'string')) return value;
   throw new Error('SETUP_TOKEN_START_INVALID_RESPONSE');
+}
+
+export async function requestSetupTokenCapacity(sessionId: string, binding: string, operation: string,
+  actor: import('../claude/setupTokenUserCapacity').SetupTokenCapacityActor, runtimeId: string, extra?: Record<string, unknown>, signal?: AbortSignal) {
+  const result = await daemonPost('/setup-token/capacity', { sessionId, binding, operation, actor, runtimeId, extra }, undefined, 15_000, signal);
+  if (result?.ok !== true || typeof result.admission?.state !== 'string') throw new Error(result?.reason ?? 'CAPACITY_UNAVAILABLE');
+  return result.admission as { state: string; managedAccountId?: string; credentialGeneration?: number; epoch?: number; validForMs?: number; retryAfterMs?: number; requiresMove?: boolean; reason?: string };
 }

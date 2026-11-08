@@ -29,6 +29,8 @@ import type { ClaudeOrgRequirements, OrgModelRequest } from './claudeOrgRequirem
 export type ClaudeEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 export interface EnhancedMode {
+    setupTokenCapacityActor?: import('./setupTokenUserCapacity').SetupTokenCapacityActor;
+    setupTokenCapacityRetry?: true;
     permissionMode: PermissionMode;
     model?: string;
     fallbackModel?: string;

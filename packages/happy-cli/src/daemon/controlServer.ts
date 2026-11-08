@@ -127,7 +127,7 @@ export function startDaemonControlServer({
   getCallerLaunches?: () => { issue(raw: unknown): Promise<unknown>; current(raw: unknown): Promise<{ current: boolean }> } | null;
   getDeviceEnrollment?: () => ReturnType<typeof createDeviceEnrollment> | null;
   /** Saycode specs/claude-setup-token-account-selection — null until the AI credential runtime exists. */
-  getSetupTokenAccountSwitch?: () => (Pick<SetupTokenAccountSwitch, 'availability' | 'returnFromPersonal' | 'reportUsage' | 'reportActivity' | 'rebind'> & Partial<Pick<SetupTokenAccountSwitch, 'requestStart'>>) | null;
+  getSetupTokenAccountSwitch?: () => (Pick<SetupTokenAccountSwitch, 'availability' | 'returnFromPersonal' | 'reportUsage' | 'reportActivity' | 'rebind'> & Partial<Pick<SetupTokenAccountSwitch, 'requestStart' | 'capacity'>>) | null;
   writeScopeRuntime?: SessionWriteScopeRuntime | null;
   standaloneDrain?: StandaloneDrain;
   /** aplus codexcli-daemon-restart-drain — absent on preflight and in tests that do not drain. */
@@ -502,6 +502,16 @@ export function startDaemonControlServer({
       response.on('close', () => { if (!response.writableEnded) cancellation.abort(); });
       return cancellation.signal;
     };
+    typed.post('/setup-token/capacity', {
+      bodyLimit: 16384,
+      schema: { body: z.object({ sessionId: z.string().min(1).max(128), binding: z.string().min(1).max(8192),
+        operation: z.enum(['reserve', 'observe', 'claim', 'heartbeat', 'finish', 'cancel', 'recover', 'lost', 'delivery']), runtimeId: z.string().min(1).max(128),
+        actor: z.object({ companyId: z.string(), machineId: z.string(), sessionId: z.string(), requestId: z.string(), contentHash: z.string(), proof: z.string().max(4096) }).strict(),
+        extra: z.record(z.string(), z.unknown()).optional() }).strict() },
+    }, async (request, reply) => {
+      const switcher = getSetupTokenAccountSwitch();
+      return switcher?.capacity ? switcher.capacity(request.body.sessionId, request.body.binding, request.body.operation, request.body.actor, request.body.runtimeId, request.body.extra, rotationSignal(reply.raw)) : { ok: false, reason: 'CAPACITY_UNAVAILABLE' };
+    });
     typed.post('/setup-token/start', {
       bodyLimit: 16384,
       schema: { body: z.object({ sessionId: z.string().min(1).max(128), binding: z.string().min(1).max(8192), requestId: z.string().uuid() }).strict() },

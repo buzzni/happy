@@ -414,6 +414,7 @@ export type Machine = {
  * Message metadata schema
  */
 export const MessageMetaSchema = z.object({
+  setupTokenCapacityActor: z.unknown().optional(),
   // Retain malformed/unknown versions for explicit rejection; never strip into ordinary input.
   hubPrompt: z.unknown().optional(),
   sentFrom: z.string().optional(), // Source identifier

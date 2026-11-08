@@ -1,4 +1,6 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { requestSetupTokenStart } from '@/daemon/controlClient';
+vi.mock('@/daemon/controlClient', async original => ({ ...await original<typeof import('@/daemon/controlClient')>(), requestSetupTokenStart: vi.fn() }));
 
 const {
     mockClaudeLocal,
@@ -50,12 +52,28 @@ function createDeferred<T>() {
 }
 
 describe('claudeLocalLauncher', () => {
+    afterEach(() => vi.unstubAllEnvs());
     beforeEach(() => {
         vi.clearAllMocks();
+        vi.stubEnv('HAPPY_AI_AUTH_SOURCE', '');
+        vi.stubEnv('HAPPY_AI_AUTH_SETUP_TOKEN_BINDING', '');
+        vi.stubEnv('HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED', '');
         mockCreateSessionScanner.mockResolvedValue({
             onNewSession: vi.fn(),
             cleanup: vi.fn(async () => {}),
         });
+    });
+    it('does not launch an unidentifiable local producer under the person-capacity policy', async () => {
+        vi.stubEnv('HAPPY_AI_AUTH_SETUP_TOKEN_BINDING', '{}');
+        vi.mocked(requestSetupTokenStart).mockRejectedValue(new Error('CAPACITY_ACTOR_REQUIRED'));
+        const session = {
+            sessionId: 'native', path: '/tmp/project', queue: { reset: vi.fn(), setOnMessage: vi.fn(), size: () => 0 },
+            client: { sessionId: 'happy-local', rpcHandlerManager: { registerHandler: vi.fn() }, sendSessionEvent: vi.fn(), closeClaudeSessionTurn: vi.fn() },
+            addSessionFoundCallback: vi.fn(), removeSessionFoundCallback: vi.fn(), consumeOneTimeFlags: vi.fn(),
+        };
+        expect(await claudeLocalLauncher(session as any)).toEqual({ type: 'switch' });
+        expect(mockClaudeLocal).not.toHaveBeenCalled();
+        expect(session.client.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({ type: 'message' }));
     });
 
     it('aborts local Claude Code when an app message requests remote control', async () => {

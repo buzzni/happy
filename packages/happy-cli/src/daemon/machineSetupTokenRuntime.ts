@@ -308,7 +308,7 @@ export function createMachineSetupTokenRuntime(deps: {
       return { ok: true as const }
     },
     /** `startBudget`: ask for an account with start budget left; such a move carries no usage evidence. */
-    rebind(sessionId: string, running: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal, options: { startBudget?: true; startExhausted?: true } = {}) {
+    rebind(sessionId: string, running: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal, options: { startBudget?: true; startExhausted?: true; capacityRequestId?: string } = {}) {
       const binding = bindingOf(running)
       return serial(binding.launchId, async () => {
         signal?.throwIfAborted();
@@ -328,7 +328,7 @@ export function createMachineSetupTokenRuntime(deps: {
         if (!options.startBudget && current.bindingRevision - (state.startBudgetMoves ?? 0) >= 6) throw new MachineRotationError('ROTATION_LIMIT')
         const request = await protocol.request({ action: 'rebind', operationId: randomUUID(), launchId: binding.launchId, sessionId,
           nonce: binding.nonce, bindingRevision: binding.bindingRevision,
-          ...(options.startBudget ? { startBudget: true as const } : options.startExhausted ? { startExhausted: true as const } : { observation: toRotationObservation(binding, observation!) }) })
+          ...(options.startBudget ? { startBudget: true as const, ...(options.capacityRequestId ? { capacityRequestId: options.capacityRequestId } : {}) } : options.startExhausted ? { startExhausted: true as const } : { observation: toRotationObservation(binding, observation!) }) })
         state.pending = { request, claimOperationId: randomUUID(), commitOperationId: randomUUID() }
         await journal.write(state)
         let result: MachineRotationResult

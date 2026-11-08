@@ -1,6 +1,9 @@
 import { expect, it, vi } from 'vitest'
 import { waitForSetupTokenStart, waitForSharedSetupTokenStart } from './setupTokenStartBudget'
 const allowed = { state: 'allowed' as const, validForMs: 15000 }
+it('does not apply legacy shared fail-open to a person-capacity refusal', async () => {
+  await expect(waitForSharedSetupTokenStart({ request: async () => { throw new Error('CAPACITY_ACTOR_REQUIRED') }, notify: vi.fn(), signal: new AbortController().signal })).rejects.toThrow('CAPACITY_ACTOR_REQUIRED')
+})
 it('waits for admission and reuses the same logical start identity', async () => {
   const request = vi.fn().mockResolvedValueOnce({ state: 'wait', retryAfterMs: 30, preferredAccountIds: [] }).mockResolvedValue(allowed)
   const notify = vi.fn()
@@ -49,9 +52,9 @@ it('does not ask to move when no account has start budget left', async () => {
   expect(moveToPreferred).not.toHaveBeenCalled()
 })
 // Saycode specs/shared-pc-start-budget — decision D1: only a wait Studio answers holds a shared-PC turn.
-it('runs a shared-PC turn when no decision can be had', async () => {
+it('requires a positive shared-PC decision when policy cannot be determined', async () => {
   for (const request of [async () => { throw new Error('offline') }, async () => ({ ...allowed, validForMs: 0 })]) {
-    expect(await waitForSharedSetupTokenStart({ request, notify: vi.fn(), signal: new AbortController().signal })).toBe(true)
+    await expect(waitForSharedSetupTokenStart({ request, notify: vi.fn(), signal: new AbortController().signal })).rejects.toThrow()
   }
 })
 it('does not run a shared-PC turn Studio kept answering wait for until the wait bound', async () => {
