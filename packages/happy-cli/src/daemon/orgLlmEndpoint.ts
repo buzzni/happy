@@ -80,11 +80,13 @@ function parseEndpoint(value: unknown, code: string): Omit<OrgLlmEndpointEntry, 
     if (!isOrgEndpointId(value.id)) throw new OrgLlmEndpointError(code)
     const generation = integerInRange(value.generation, 1, Number.MAX_SAFE_INTEGER, code)
     if (typeof value.model !== 'string' || !MODEL.test(value.model)) throw new OrgLlmEndpointError(code)
-    if (!isRecord(value.models)) throw new OrgLlmEndpointError(code)
-    closedKeys(value.models, TIERS, code)
+    // An endpoint with no tier mapping may leave `models` out; present, it is a closed object.
+    const tierModels = value.models === undefined ? {} : value.models
+    if (!isRecord(tierModels)) throw new OrgLlmEndpointError(code)
+    closedKeys(tierModels, TIERS, code)
     const models: OrgLlmEndpointEntry['models'] = {}
     for (const tier of TIERS) {
-        const tierModel = value.models[tier]
+        const tierModel = tierModels[tier]
         if (tierModel === undefined) continue
         if (typeof tierModel !== 'string' || !MODEL.test(tierModel)) throw new OrgLlmEndpointError(code)
         models[tier] = tierModel

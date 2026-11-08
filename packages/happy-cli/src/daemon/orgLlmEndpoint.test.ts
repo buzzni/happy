@@ -52,6 +52,13 @@ describe('parseOrgLlmEndpointSync', () => {
     expect(parsed).not.toHaveProperty('token')
   })
 
+  it('treats an omitted tier mapping as none, but not a malformed one', () => {
+    const { models: _omitted, ...withoutModels } = payload().endpoint
+    expect(parseOrgLlmEndpointSync({ ...payload(), endpoint: withoutModels }).models).toEqual({})
+    expect(failure(() => parseOrgLlmEndpointSync(payload({}, { models: null })))).toBe('ORG_LLM_ENDPOINT_PAYLOAD_INVALID')
+    expect(failure(() => parseOrgLlmEndpointSync(payload({}, { models: 'opus' })))).toBe('ORG_LLM_ENDPOINT_PAYLOAD_INVALID')
+  })
+
   it.each([
     { label: 'null', params: null },
     { label: 'array', params: [] },
