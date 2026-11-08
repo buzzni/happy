@@ -65,6 +65,13 @@ jobs:
         src/daemon/sessionRetentionControl.test.ts
         src/daemon/sessionIdleReaper.test.ts
 
+    - name: Verify terminals survive a daemon restart (terminal workers)
+      timeout-minutes: 5
+      run: >-
+        pnpm --filter @buzzni/happy-cli exec vitest run
+        --project integration-terminal-worker --project unit
+        src/daemon/terminalWorker src/daemon/doctor.terminalWorker.test.ts
+
     - name: Verify personal Claude authentication with the real SDK
       if: matrix.node-version == 24
       timeout-minutes: 5

@@ -63,7 +63,7 @@ daemon ──spawn(detached, stdio: [ignore, pipe(ready), logFd])──► termi
 4. 소켓 connect 거부 + pid·시작 시각 일치 → 응답 없는 워커: 신호 없음, 기록 유지, 로그.
 5. 소켓 accepting → 인증 hello. 같은 프로토콜 → 입양(`list`+`dump`+메타로 레지스트리 복원). 버전 다름 → 동결 `shutdown`. 인증 실패 → 신호 없음.
 - 입양한 워커의 `cliVersion`이 다르면 draining(HR8). 같으면 current. current가 둘 이상이면 첫째만 current, 나머지 draining.
-- 입양된 릴레이 경로 터미널(크래시 뒤에만 생김)은 서버 세션이 이미 닫혔으므로 즉시 terminate.
+- 릴레이 경로 터미널은 워커에서 열지 않는다(데몬 안 PTY 그대로) — 재시작에 어차피 닫히므로 워커에 둘 이유가 없다. 입양 데이터에 직결이 아닌 터미널이 있으면(방어) 즉시 terminate.
 - 기록 삭제는 recordId가 일치할 때만(같은 파일명을 새 워커가 다시 쓴 경우 보존).
 
 ### 2.7 Windows·플래그

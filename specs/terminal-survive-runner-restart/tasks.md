@@ -25,7 +25,7 @@
 - [x] T12a. (HR10) `doctor.ts` `terminal-worker` 분류·`doctor clean` 제외, `happy daemon status` 워커 줄, `terminalSurvival` 진단 필드(workers·workerVersion·lastAdoption) → 단위 테스트
 
 ## Phase 4 — 문서·마무리
-- [ ] T13. `docs/terminal-worker.md`, context 갱신
+- [x] T13. `docs/terminal-worker.md`, context 갱신
 - [ ] T14. 셀프 리뷰 → 교차 리뷰 → PR(`buzzni/happy` main) → 리뷰봇 → rebase/CI
 
 ## 후속 (이번 PR 범위 아님)
