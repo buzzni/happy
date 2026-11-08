@@ -149,6 +149,7 @@ import { resolveRecoveredInputEvidenceEnvironment } from '@/utils/inputEvidenceS
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
 import { createOrgLlmEndpointStudioClient } from './orgLlmEndpointStudio';
 import { createOrgEndpointStartReporter } from './orgLlmEndpointStartReport';
+import { orgEndpointParentRefusal } from './orgEndpointSessionMarker';
 import { createSetupTokenCapacityFence, proveCapacityProcessesStopped } from './setupTokenCapacityFence';
 import { createCollectorSchedule } from './collectorSchedule';
 import { organizationResumeRefusal, resumeSetupTokenEnvironment, shareResumeInFlight, type ResumeAuthRequirement } from './resumeSetupTokenRebind';
@@ -2085,6 +2086,19 @@ export async function startDaemon(): Promise<void> {
         `[DAEMON RUN] Spawning session agent=${options.agent} directory=${options.directory}`
         + ` callerGrant=${trustedMcpContext ? 'automation' : options.mcpCallerGrantEnvelope ? 'envelope' : 'absent'}`,
       );
+
+      // A spawn that continues a conversation (a fork, a session-gone continuation, a move to another machine) of an
+      // organization LLM endpoint session would carry what was said there to another model source (org-llm-endpoints r3).
+      // Before anything is created: nothing of a refused spawn should exist.
+      const endpointParentRefusal = options.parentSessionId || options.resumeClaudeSessionId
+        ? orgEndpointParentRefusal({
+          ...(options.parentSessionId ? { parentSessionId: options.parentSessionId } : {}),
+          ...(options.resumeClaudeSessionId ? { resumeClaudeSessionId: options.resumeClaudeSessionId } : {}),
+          records: readPersistedSessions(),
+          selection: options.aiAuthSelection,
+        })
+        : undefined;
+      if (endpointParentRefusal) return { type: 'error', errorMessage: endpointParentRefusal };
 
       // Lesson eligibility uses the registered daemon machine, not an optional RPC field.
       const { directory, sessionId, approvedNewDirectoryCreation = true } = options;

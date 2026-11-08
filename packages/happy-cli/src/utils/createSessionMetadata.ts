@@ -18,6 +18,8 @@ import type { SandboxConfig } from '@/persistence';
 import packageJson from '../../package.json';
 import type { SessionSource } from '@/utils/sessionSource';
 import { readDelegatedFromEnv } from '@/utils/delegatedFrom';
+import { ORG_ENDPOINT_BINDING_ENV } from '@/utils/childEnv';
+import { orgEndpointMarker } from '@/daemon/orgEndpointSessionMarker';
 
 /**
  * Backend flavor identifier for session metadata.
@@ -89,6 +91,7 @@ export function createSessionMetadata(opts: CreateSessionMetadataOptions): Sessi
         controlledByUser: false,
     };
     const delegatedFrom = readDelegatedFromEnv(process.env);
+    const orgLlmEndpoint = orgEndpointMarker(process.env[ORG_ENDPOINT_BINDING_ENV]);
 
     const metadata: Metadata = {
         path: process.cwd(),
@@ -121,6 +124,8 @@ export function createSessionMetadata(opts: CreateSessionMetadataOptions): Sessi
         ...(opts.source ? { source: opts.source } : {}),
         // Read here rather than by each runner: every flavor a delegated spawn can start records it.
         ...(delegatedFrom ? { delegatedFrom } : {}),
+        // The daemon wrote the binding into this process's environment; the metadata keeps its non-secret half (r3).
+        ...(orgLlmEndpoint ? { orgLlmEndpoint } : {}),
     };
 
     return { state, metadata };

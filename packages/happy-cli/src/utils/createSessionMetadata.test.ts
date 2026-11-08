@@ -89,6 +89,22 @@ describe('createSessionMetadata', () => {
         expect(createSessionMetadata({ flavor: 'claude', machineId: 'machine-b' }).metadata).not.toHaveProperty('delegatedFrom');
     });
 
+    // aplus specs/org-llm-endpoints r3 — the web client and a recovery with no local record recognize an endpoint session by this.
+    it('records the non-secret endpoint marker only for a session the daemon started on an organization LLM endpoint', () => {
+        const env = process.env;
+        try {
+            process.env = { ...env, HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING: 'binding-1:endpoint-1:target-a:3', ANTHROPIC_AUTH_TOKEN: 'endpoint-secret-token', ANTHROPIC_BASE_URL: 'https://llm.corp.example' };
+            const { metadata } = createSessionMetadata({ flavor: 'claude', machineId: 'machine-b' });
+            expect(metadata.orgLlmEndpoint).toEqual({ version: 1, bindingId: 'binding-1', endpointId: 'endpoint-1' });
+            expect(JSON.stringify(metadata)).not.toMatch(/endpoint-secret-token|llm\.corp\.example|target-a/);
+            process.env = { ...env, HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING: '' };
+            expect(createSessionMetadata({ flavor: 'claude', machineId: 'machine-b' }).metadata).not.toHaveProperty('orgLlmEndpoint');
+        } finally {
+            process.env = env;
+        }
+        expect(createSessionMetadata({ flavor: 'claude', machineId: 'machine-b' }).metadata).not.toHaveProperty('orgLlmEndpoint');
+    });
+
     it('sets metadata.sandbox to the config when enabled', () => {
         const sandbox = createSandboxConfig();
         const { metadata } = createSessionMetadata({

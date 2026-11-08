@@ -2,6 +2,7 @@ import type { PersistedSession } from '@/persistence';
 import type { ReconnectableHappySession } from '@/resume/resolveHappySession';
 import type { ResumeSessionErrorCode } from '@/modules/common/registerCommonHandlers';
 import { ORG_ENDPOINT_BINDING_ENV } from '@/utils/childEnv';
+import { isOrgEndpointBoundMetadata } from './orgEndpointSessionMarker';
 
 export type UntrackedSessionRecoveryDecision =
   | { kind: 'same-session'; baselineSeq: number }
@@ -100,9 +101,11 @@ export function decideUntrackedSessionRecovery(input: {
     return { kind: 'same-session', baselineSeq };
   }
 
-  // A record, even a corrupt one: the session ran on an organization LLM endpoint, and the new session below would
-  // start without it. Only the same Happy session can resume it, and only after Studio confirms the binding.
-  if (input.persistedSession?.agentEnvironment?.[ORG_ENDPOINT_BINDING_ENV] !== undefined) {
+  // A record, even a corrupt one, or the marker the session's own metadata carries (the record can be gone): the
+  // session ran on an organization LLM endpoint, and the new session below would start without it. Only the same
+  // Happy session can resume it, and only after Studio confirms the binding.
+  if (input.persistedSession?.agentEnvironment?.[ORG_ENDPOINT_BINDING_ENV] !== undefined
+    || isOrgEndpointBoundMetadata(serverSession.metadata)) {
     return {
       kind: 'refuse',
       code: 'SESSION_RESUME_FAILED',
