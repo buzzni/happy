@@ -111,6 +111,23 @@ Initiated by mobile app via backend RPC:
 5. Daemon updates tracking with `happySessionId`, resolves awaiter
 6. RPC returns session info to mobile app
 
+#### Extension MCP servers (`launchMcpServers`)
+
+aplus-dev-studio-desktop `specs/extension-session-and-worktree-hooks`: `spawn-happy-session` and
+`resume-happy-session` take an optional `launchMcpServers` map (advertised as `daemonState.launchMcpServers: 1`)
+and answer `launchMcpDropped: [{ name, reason: 'name-conflict' | 'invalid' | 'unsupported-agent' }]` when they
+dropped any (`src/aplus/launchMcpServers.ts`). The organization's MCP map is built by the session process, not
+the daemon, so the daemon passes the survivors as the one-shot `HAPPY_INITIAL_LAUNCH_MCP_SERVERS` seed (a tmux
+launch, whose env becomes `-e` argv, gets an owner-only file via `HAPPY_INITIAL_LAUNCH_MCP_SERVERS_FILE`). The CLI
+bootstrap (`index.ts`) takes it out of the env before anything spawns (`aplus/launchMcpSeed.ts`); the Claude/Codex
+runner puts the servers under every server the session already has, which always wins a name: internal (`happy`,
+`cua-driver`), `/api/me/mcp-config`, Claude user/local/project (`.claude.json`, `.mcp.json`) and Codex
+`config.toml` (checked through `config/read` in `CodexAppServerClient`; unreadable = not applied). For the answer
+the daemon looks up the organization's names while the child starts (`fetchAplusMcpServerNames`, one try, no
+`process.env` writes) and reads Claude's config files; a failed lookup only leaves those conflicts unreported, and
+Codex `config.toml` conflicts are enforced but never reported. Values (args, env, headers) are never logged, never captured into
+`agentEnvironment` and never kept for daemon-started resumes — those resume without the servers.
+
 ### Terminal-Spawned Sessions
 
 User runs `happy` directly:

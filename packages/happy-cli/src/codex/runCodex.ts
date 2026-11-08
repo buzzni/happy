@@ -82,6 +82,7 @@ import {
 } from '@/aplus/fetchAplusMcpServers';
 import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/connectorToolGuidance';
 import { bridgeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
+import { codexLaunchMcpServers, consumeLaunchMcpServersSeed, launchMcpServersBeside } from '@/aplus/launchMcpServers';
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { CodexDisplay } from "@/ui/ink/CodexDisplay";
 import { trimIdent } from "@/utils/trimIdent";
@@ -256,6 +257,9 @@ export async function runCodex(opts: {
         sessionKind: LessonTurnKind;
     };
 }): Promise<void> {
+    // Desktop extension MCP servers for this launch (aplus/launchMcpServers.ts): first, before anything copies
+    // the environment or starts a subprocess; usually the CLI bootstrap already took them into memory.
+    const launchMcpServers = consumeLaunchMcpServersSeed(process.env);
     const inputEvidenceOption = consumeInputEvidenceOption(process.env);
     await initializeScopeReportSigner();
     const scopeLaunch = takeScopeLaunchBootstrap();
@@ -2219,7 +2223,7 @@ export async function runCodex(opts: {
             ...configStatuses,
         ],
     }));
-    const baseMcpServers = {
+    const internalMcpServers = {
         happy: {
             command: process.execPath,
             args: ['--no-warnings', '--no-deprecation', bridgeEntrypoint, '--url', happyServer.url],
@@ -2264,6 +2268,19 @@ export async function runCodex(opts: {
             ? { toolPolicy: { env: (name: string) => policyAdapterEnv(name) ?? {}, toolTimeoutSec: CUA_SHADOW_TOOL_TIMEOUT_SECONDS } }
             : {}),
     };
+    // Under every server this session already has: an organization server that arrives later wins the name too,
+    // and http goes through the bridge organization servers use (tool policy included).
+    const sessionLaunchMcpServers = launchMcpServersBeside(launchMcpServers, Object.keys(initialAplusMcpServers));
+    if (Object.keys(launchMcpServers).length > 0) {
+        logger.debug(`[launch-mcp] Codex adds ${Object.keys(sessionLaunchMcpServers).join(',') || '(none)'} of ${Object.keys(launchMcpServers).length}`);
+    }
+    const baseMcpServers = {
+        ...codexLaunchMcpServers(sessionLaunchMcpServers, (servers) => bridgeAplusMcpServers(servers, bridgeOptions)),
+        ...internalMcpServers,
+    };
+    // `config.toml` servers are only known through the app-server's `config/read`; the client drops these names
+    // there when the user's config holds them (Codex would keep the user's env and run our command).
+    if (Object.keys(sessionLaunchMcpServers).length > 0) client.setLaunchMcpServerNames(Object.keys(sessionLaunchMcpServers));
     const listExternalServices = (mcpServers: Record<string, unknown>) => listExpectedMcpServices({
         expectedConnectors: readExpectedConnectors(),
         expectedMcpServices: readExpectedMcpServices(),

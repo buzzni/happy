@@ -568,6 +568,42 @@ describe('CodexAppServerClient sandbox integration', () => {
         expect(runtime['cua-driver']).toBe(org);
     });
 
+    // happy PR #1185 review: Codex deep-merges the thread map into config.toml, so an injected server sharing a
+    // user server's name would run the injected command with the user's env (credentials).
+    it.each([
+        ['the user config.toml holds the name: the injected server is not applied', { files: { command: 'user-files-mcp', env: { USER_TOKEN: 'user-secret' } } }, false],
+        ['config/read unreadable: not applied rather than risk the user env', 'unreadable', false],
+        ['no user server of that name: applied', { other: { command: 'x' } }, true],
+    ] as const)('launch MCP name collision with config.toml — %s', async (_label, native, applied) => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        client.setLaunchMcpServerNames(['files']);
+        const injected = { command: '/opt/ext/files-mcp', args: ['--stdio'], env: { EXT: '1' } };
+        const runtime = { happy: { command: 'happy-mcp' }, files: injected };
+        const request = vi.spyOn(client as any, 'request').mockImplementation(async (method: any) => {
+            if (method === 'config/read') {
+                if (native === 'unreadable') throw new Error('private config response');
+                return { config: { mcp_servers: native } };
+            }
+            return { thread: { id: 'thread' }, model: 'test' };
+        });
+        await client.startThread({ mcpServers: runtime });
+        const start = request.mock.calls.find(([method]) => method === 'thread/start')![1] as { config: { mcp_servers: Record<string, any> } };
+        expect(start.config.mcp_servers.happy).toEqual({ command: 'happy-mcp' });
+        if (applied) expect(start.config.mcp_servers.files).toEqual(injected);
+        else expect(start.config.mcp_servers).not.toHaveProperty('files');
+        expect(runtime.files).toBe(injected);
+    });
+
+    it('reads no native config when no launch MCP server is in the map', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        client.setLaunchMcpServerNames(['files']);
+        const request = vi.spyOn(client as any, 'request').mockResolvedValue({ thread: { id: 'thread' }, model: 'test' });
+        await client.startThread({ mcpServers: { happy: { command: 'happy-mcp' } } });
+        expect(request).not.toHaveBeenCalledWith('config/read', expect.anything(), expect.anything());
+    });
+
     it.each(['interrupt', 'preparation'])('T2RT-01 rechecks input after the %s await at the actual write', async boundary => {
         const { CodexAppServerClient } = await import('./codexAppServerClient');
         const writes: string[] = [];

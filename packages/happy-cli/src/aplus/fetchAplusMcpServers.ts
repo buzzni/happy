@@ -392,3 +392,43 @@ export async function fetchAplusMcpServersResult(
 export async function fetchAplusMcpServers(token: string, machineId: string): Promise<AplusMcpServersMap> {
     return (await fetchAplusMcpConfigSnapshot(token, machineId)).servers
 }
+
+/**
+ * The names of the servers `/api/me/mcp-config` would give a session started with `childEnv` — the
+ * same URL (with its project) and caller grant the session process reads. For the daemon's
+ * `launchMcpDropped` answer (launchMcpServers.ts): one attempt, no retry, and unlike the session
+ * fetch above it writes nothing to `process.env`, which in the daemon is every later session's.
+ * The body carries capability tokens; only its keys are read and nothing of it is logged.
+ * `null` when there is nothing to ask or no usable answer.
+ */
+export async function fetchAplusMcpServerNames(
+    childEnv: Record<string, string | undefined>,
+    token: string,
+    machineId: string | undefined,
+): Promise<string[] | null> {
+    const configUrl = childEnv.HAPPY_APLUS_MCP_CONFIG_URL
+    if (!configUrl || !machineId) return null
+    const callerGrant = childEnv.HAPPY_APLUS_MCP_CALLER_GRANT
+    const ctl = new AbortController()
+    const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS)
+    try {
+        const res = await fetch(configUrl, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'X-Aplus-Machine-Id': machineId,
+                ...(callerGrant ? { 'X-Aplus-Caller-Grant': callerGrant } : {}),
+            },
+            signal: ctl.signal,
+        })
+        if (!res.ok) return null
+        const body = await res.json() as { mcpServers?: unknown }
+        return body?.mcpServers && typeof body.mcpServers === 'object' && !Array.isArray(body.mcpServers)
+            ? Object.keys(body.mcpServers)
+            : null
+    } catch {
+        return null
+    } finally {
+        clearTimeout(timer)
+    }
+}

@@ -43,6 +43,7 @@ import {
 import { installManagedMachineTool, managedMachineToolPlatform, managedMachineToolStatus } from './managedMachineTool';
 import { sanitizeChildEnv, type ChildEnvBoundary } from '@/utils/childEnv';
 import type { ClaudeOutputFormat } from '@/claude/structuredOutput';
+import type { LaunchMcpDropped, LaunchMcpRequest } from '@/aplus/launchMcpServers';
 
 const execAsync = promisify(exec);
 const READ_FILE_CHUNK_MAX_BYTES = 3 * 1024 * 1024;
@@ -471,6 +472,11 @@ export interface SpawnSessionOptions {
     agentPlan?: AgentPlanSpawnParam;
     /** Session-scoped Claude structured output, validated at the RPC boundary (specs/claude-cli-benchmark-followups R2). */
     outputFormat?: ClaudeOutputFormat;
+    /**
+     * MCP servers a Desktop extension adds to this launch, checked at the RPC boundary
+     * (aplus/launchMcpServers.ts). Only sent to a daemon advertising `daemonState.launchMcpServers`.
+     */
+    launchMcpServers?: LaunchMcpRequest;
 }
 
 export type SpawnSessionResult =
@@ -488,6 +494,8 @@ export type SpawnSessionResult =
             accepted: string[];
             skipped: Partial<Record<'missing' | 'not-directory' | 'canonicalize-failed' | 'duplicate' | 'primary', number>>;
         };
+        /** `launchMcpServers` entries this launch did not add, by name and reason. Absent when none. */
+        launchMcpDropped?: LaunchMcpDropped[];
     }
     | { type: 'requestToApproveDirectoryCreation'; directory: string }
     | {
@@ -525,7 +533,7 @@ export type ResumeSessionErrorCode =
     | 'SESSION_RESUME_FAILED';
 
 export type ResumeSessionResult =
-    | { type: 'success'; sessionId: string }
+    | { type: 'success'; sessionId: string; launchMcpDropped?: LaunchMcpDropped[] }
     | { type: 'requestToApproveDirectoryCreation'; directory: string }
     | {
         type: 'error';

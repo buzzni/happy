@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
     withoutRecoveredConfigFailure,
     fetchAplusMcpServers,
+    fetchAplusMcpServerNames,
     fetchAplusMcpServersResult,
     isConnectorPlatformConfigured,
     mcpConfigFailureStatuses,
@@ -485,5 +486,54 @@ describe('withoutRecoveredConfigFailure', () => {
         expect(withoutRecoveredConfigFailure({ ok: true, servers: {} }, [gmail])).toBeNull();
         expect(withoutRecoveredConfigFailure({ ok: true, servers: {} }, undefined)).toBeNull();
         expect(withoutRecoveredConfigFailure({ ok: false, reason: 'http-error', error: 'mcp-config responded with 403' }, [stale])).toBeNull();
+    });
+});
+
+describe('fetchAplusMcpServerNames', () => {
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        delete process.env.HAPPY_APLUS_EXPECTED_CONNECTORS;
+        delete process.env.HAPPY_BROWSER_VIEWER_SCOPE_REQUIRED;
+    });
+
+    const childEnv = {
+        HAPPY_APLUS_MCP_CONFIG_URL: 'http://aplus.test/api/me/mcp-config?project_id=p1',
+        HAPPY_APLUS_MCP_CALLER_GRANT: 'grant-1',
+    };
+
+    it('names the servers the session process will be given, with the same URL and grant', async () => {
+        const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+            mcpServers: { github: { type: 'http', url: 'https://gw.test/github', headers: { Authorization: 'Bearer cap' } } },
+            connectorReadiness: { expected: ['github'] },
+            browserViewerRouting: { required: true },
+        }), { status: 200 }));
+        vi.stubGlobal('fetch', fetchMock);
+
+        await expect(fetchAplusMcpServerNames(childEnv, 'happy-token', 'machine-1')).resolves.toEqual(['github']);
+        const [url, init] = fetchMock.mock.calls[0];
+        expect(String(url)).toBe('http://aplus.test/api/me/mcp-config?project_id=p1');
+        expect(init?.headers).toEqual({
+            Authorization: 'Bearer happy-token',
+            'X-Aplus-Machine-Id': 'machine-1',
+            'X-Aplus-Caller-Grant': 'grant-1',
+        });
+        // The daemon's own environment is every later session's: the lookup must not write to it.
+        expect(process.env.HAPPY_APLUS_EXPECTED_CONNECTORS).toBeUndefined();
+        expect(process.env.HAPPY_BROWSER_VIEWER_SCOPE_REQUIRED).toBeUndefined();
+    });
+
+    it('answers null when there is no configuration to ask or the answer is unusable', async () => {
+        const fetchMock = vi.fn<typeof fetch>()
+            .mockResolvedValueOnce(new Response('down', { status: 503 }))
+            .mockRejectedValueOnce(new Error('socket hang up'))
+            .mockResolvedValueOnce(new Response(JSON.stringify({}), { status: 200 }));
+        vi.stubGlobal('fetch', fetchMock);
+
+        await expect(fetchAplusMcpServerNames({}, 'happy-token', 'machine-1')).resolves.toBeNull();
+        await expect(fetchAplusMcpServerNames(childEnv, 'happy-token', undefined)).resolves.toBeNull();
+        expect(fetchMock).not.toHaveBeenCalled();
+        for (let i = 0; i < 3; i++) {
+            await expect(fetchAplusMcpServerNames(childEnv, 'happy-token', 'machine-1')).resolves.toBeNull();
+        }
     });
 });

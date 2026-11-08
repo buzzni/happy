@@ -431,6 +431,12 @@ export const DaemonStateSchema = z.object({
    * across a restart, and how those workers stand (counts only). Absent when workers are off.
    */
   terminalSurvival: TerminalSurvivalStateSchema.optional(),
+  /**
+   * aplus-dev-studio-desktop extension-session-and-worktree-hooks — `spawn-happy-session` and
+   * `resume-happy-session` take `launchMcpServers` and answer `launchMcpDropped`. Desktop sends the
+   * field only when this is present. A property of the running code, so part of the process state.
+   */
+  launchMcpServers: z.literal(1).optional(),
 })
 
 export type DaemonState = z.infer<typeof DaemonStateSchema>

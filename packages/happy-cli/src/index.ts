@@ -7,7 +7,11 @@
 import { captureStandaloneLaunchBootstrap } from './daemon/standaloneLaunchProtocol'
 import { handleAgentCommand } from './commands/agentCommand'
 import { loadBrowserTaskEnv } from './daemon/browserTaskEnv'
+import { captureLaunchMcpServersSeed } from './aplus/launchMcpSeed'
 
+// Extension MCP server definitions can hold secrets: out of the environment (and off disk) before
+// anything below can start a subprocess that would inherit them. The runner takes them from memory.
+captureLaunchMcpServersSeed(process.env)
 const args = process.argv.slice(2)
 if (args[0] === 'daemon' && args[1] === 'start-sync') loadBrowserTaskEnv(process.env)
 try { captureStandaloneLaunchBootstrap(process.env, args) }
