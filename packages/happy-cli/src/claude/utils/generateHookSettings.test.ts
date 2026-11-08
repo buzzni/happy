@@ -57,10 +57,11 @@ describe('buildHookSettings', () => {
         expect(locked.permissions).toEqual({ deny: ['Bash(killall:*)'], disableBypassPermissionsMode: 'disable' });
     });
 
-    it('passes protected directories to the file guard', () => {
+    it('passes protected directories and the skill lock file beside the policy file to the file guard', () => {
         const input = { execPath: '/n', scriptsDir: '/s', port: 1, secretFile: '/sec', policyFile: '/h/tool-policy.json' };
-        expect(toolPolicyHookCommands(input).fileGuardCommand).toBe('"/n" "/s/tool_policy_file_guard.cjs" "/h/tool-policy.json"');
+        const skillLocks = ' --skill-locks "/h/skill-locks.json" --hook 1 "/sec"';
+        expect(toolPolicyHookCommands(input).fileGuardCommand).toBe(`"/n" "/s/tool_policy_file_guard.cjs" "/h/tool-policy.json"${skillLocks}`);
         expect(toolPolicyHookCommands({ ...input, protectedDirs: ['/h/org-requirements'] }).fileGuardCommand)
-            .toBe('"/n" "/s/tool_policy_file_guard.cjs" "/h/tool-policy.json" --dir "/h/org-requirements"');
+            .toBe(`"/n" "/s/tool_policy_file_guard.cjs" "/h/tool-policy.json" --dir "/h/org-requirements"${skillLocks}`);
     });
 });

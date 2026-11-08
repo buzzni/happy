@@ -881,7 +881,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
 
     // Start Hook server for receiving Claude session notifications
     const hookServer = await startHookServer({
-        ...(toolPolicy && toolPolicyGate ? { preToolUse: { secret: toolPolicy.secret, decide: toolPolicyGate.decide, toolsListed: toolPolicyGate.toolsListed } } : {}),
+        ...(toolPolicy && toolPolicyGate ? { preToolUse: { secret: toolPolicy.secret, decide: toolPolicyGate.decide, toolsListed: toolPolicyGate.toolsListed, unattended: () => turnAttendance.policyUnattended() } } : {}),
         onSessionHook: (sessionId, data) => {
             logger.debug(`[START] Session hook received: ${sessionId}`, data);
 

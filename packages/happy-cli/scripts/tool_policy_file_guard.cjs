@@ -22,11 +22,21 @@
  * unreachable would lift the organization's policy). A file tool aimed inside one, or a Bash command naming
  * a path inside one, is blocked.
  *
+ * `--skill-locks <file>` adds skill locks (aplus-dev-studio-desktop specs/skill-lock): a write into a locked
+ * skill's directory is blocked (skill_lock_guard.cjs decides), and so is any command naming the lock file itself.
+ * A lock file that cannot be read locks every skill root in an unattended turn only (R4): the guard asks the
+ * session's hook server (`--hook <port> <secret-file>`) whether this turn is unattended, and takes no answer as
+ * unattended. Everything else about this guard stays best-effort.
+ *
  * Usage: node tool_policy_file_guard.cjs <policy-file-path> [--dir <protected-directory>]...
+ *        [--skill-locks <file>] [--hook <port> <secret-file>]
  */
 
+const fs = require('fs');
+const http = require('http');
 const os = require('os');
 const path = require('path');
+const { readSkillLocks, skillLockRefusal, ALL_SKILLS_REFUSAL, SKILL_LOCK_FILE_MESSAGE } = require('./skill_lock_guard.cjs');
 
 const MESSAGE = '도구 정책으로 막힘: Saycode 도구 정책 파일은 에이전트가 바꿀 수 없다 — 정책은 Saycode 설정 화면에서 사용자가 바꾼다. 대신: 필요한 변경을 사용자에게 요청하라. 이 제한을 스크립트·자동화 도구·셸 명령 등 다른 방법으로 우회하지 마라.';
 
@@ -118,34 +128,107 @@ function targetsProtectedDirectory(payload, protectedDir, env = defaultEnv(prote
     return inside(fold(normalize(target, cwd, env)), dir);
 }
 
-function main() {
-    const policyFile = process.argv[2];
-    const dirs = [];
-    for (let i = 3; i < process.argv.length - 1; i++) {
-        if (process.argv[i] === '--dir') dirs.push(process.argv[++i]);
+
+const ATTENDANCE_TIMEOUT_MS = 3000;
+
+/** Whether the session's current turn is unattended; any failure to learn it counts as unattended (fail closed). */
+function askUnattended(hook) {
+    return new Promise((resolve) => {
+        try {
+            ask(hook, resolve);
+        } catch {
+            resolve(true);
+        }
+    });
+}
+
+/** One question to the session's hook server; resolves with true (unattended) on any failure to get an answer. */
+function ask(hook, resolve) {
+    // A response that stalls or breaks off after the headers is no answer either.
+    setTimeout(() => resolve(true), ATTENDANCE_TIMEOUT_MS + 500);
+    let secret;
+    try {
+        secret = fs.readFileSync(hook.secretFile, 'utf8').trim();
+    } catch {
+        return resolve(true);
     }
+    const request = http.request({
+        host: '127.0.0.1', port: Number(hook.port), path: '/hook/attendance', method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-happy-hook-secret': secret },
+        timeout: ATTENDANCE_TIMEOUT_MS,
+    }, (response) => {
+        const chunks = [];
+        response.on('error', () => resolve(true));
+        response.on('aborted', () => resolve(true));
+        response.on('data', (chunk) => chunks.push(chunk));
+        response.on('end', () => {
+            try {
+                const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+                resolve(response.statusCode !== 200 || body.unattended !== false);
+            } catch {
+                resolve(true);
+            }
+        });
+    });
+    request.on('timeout', () => request.destroy());
+    request.on('error', () => resolve(true));
+    request.end('{}');
+}
+
+function parseArgs(argv) {
+    const options = { policyFile: argv[2], dirs: [], skillLocks: null, hook: null };
+    for (let i = 3; i < argv.length; i++) {
+        if (argv[i] === '--dir' && i + 1 < argv.length) options.dirs.push(argv[++i]);
+        else if (argv[i] === '--skill-locks' && i + 1 < argv.length) options.skillLocks = argv[++i];
+        else if (argv[i] === '--hook' && i + 2 < argv.length) options.hook = { port: argv[++i], secretFile: argv[++i] };
+    }
+    return options;
+}
+
+/** The block reason for this payload, or null. A corrupt lock file refuses on any failure in its own branch (R4). */
+async function decide(payload, options, env = { home: os.homedir(), vars: process.env, caseInsensitive: process.platform === 'darwin' || process.platform === 'win32' }) {
+    if (options.policyFile && targetsPolicyFile(payload, path.resolve(options.policyFile))) return MESSAGE;
+    if (options.dirs.some((dir) => dir && targetsProtectedDirectory(payload, path.resolve(dir)))) return DIRECTORY_MESSAGE;
+    if (!options.skillLocks) return null;
+    const lockFile = path.resolve(options.skillLocks);
+    if (targetsPolicyFile(payload, lockFile)) return SKILL_LOCK_FILE_MESSAGE;
+    const locks = readSkillLocks(lockFile);
+    if (locks.kind === 'ok') return skillLockRefusal(payload, { dirs: locks.dirs, record: lockFile }, env);
+    if (locks.kind !== 'corrupt') return null;
+    // Only a call that would touch a skill pays for the question. From here on a failure refuses (R4).
+    let refusal;
+    try {
+        refusal = skillLockRefusal(payload, { allSkills: true, record: lockFile }, env);
+    } catch {
+        refusal = ALL_SKILLS_REFUSAL;
+    }
+    if (!refusal) return null;
+    return (!options.hook || await askUnattended(options.hook)) ? refusal : null;
+}
+
+function main() {
+    const options = parseArgs(process.argv);
     const chunks = [];
     process.stdin.on('data', (chunk) => chunks.push(chunk));
     process.stdin.on('end', () => {
+        let payload;
         try {
-            const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-            if (policyFile && targetsPolicyFile(payload, path.resolve(policyFile))) {
-                process.stderr.write(MESSAGE + '\n');
-                process.exit(2);
-            }
-            if (dirs.some((dir) => dir && targetsProtectedDirectory(payload, path.resolve(dir)))) {
-                process.stderr.write(DIRECTORY_MESSAGE + '\n');
-                process.exit(2);
-            }
+            payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
         } catch {
-            // fall through
+            process.exit(0);
         }
-        process.exit(0);
+        decide(payload, options).then((reason) => {
+            if (reason) {
+                process.stderr.write(reason + '\n', () => process.exit(2));
+                return;
+            }
+            process.exit(0);
+        }, () => process.exit(0));
     });
     process.stdin.resume();
 }
 
-module.exports = { targetsPolicyFile, targetsProtectedDirectory };
+module.exports = { targetsPolicyFile, targetsProtectedDirectory, decide, parseArgs };
 
 if (require.main === module) {
     main();
