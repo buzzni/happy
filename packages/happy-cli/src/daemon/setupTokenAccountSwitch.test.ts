@@ -490,7 +490,8 @@ describe('shared PC start budget (Saycode specs/shared-pc-start-budget)', () => 
   const sharedRunning = sharedMachineSetupTokenAuthority({ HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1', [SETUP_TOKEN_SHARED_ACCOUNT_ENV]: A })!
   const REQUEST = '00000000-0000-4000-8000-0000000000ee'
   function startSetup(answer: () => Response | Promise<Response>, extra: Partial<SetupTokenAccountSwitchDeps> = {}) {
-    const sharedMachine = { reportUsage: vi.fn(async () => undefined), rebind: vi.fn(async () => null), environment: vi.fn(async () => null), moved: vi.fn(),
+    const sharedMachine = { reportUsage: vi.fn(async () => undefined), rebind: vi.fn(async (): Promise<Record<string, string> | null> => null),
+      environment: vi.fn(async (): Promise<Record<string, string> | null> => null), moved: vi.fn(),
       startProof: vi.fn(async (): Promise<{ companyId: string; credentialGeneration: number } | null> => ({ companyId: 'org-a', credentialGeneration: 1 })),
       startBudgetMove: vi.fn(async (): Promise<Record<string, string> | null> => null) }
     const context = setup({ sharedMachine, ...extra })
@@ -563,9 +564,24 @@ describe('shared PC start budget (Saycode specs/shared-pc-start-budget)', () => 
     expect(sharedMachine.startBudgetMove).not.toHaveBeenCalled()
   })
 
+  it('moves a shared-PC session off an account a later sync took off this PC', async () => {
+    const { switcher, requests, sharedMachine, session } = startSetup(() => Response.json({}))
+    const next = { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next', HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1', [SETUP_TOKEN_SHARED_ACCOUNT_ENV]: B }
+    sharedMachine.startProof.mockResolvedValueOnce(null)
+    expect(await switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: false, reason: 'START_ACCOUNT_EXHAUSTED' })
+    expect(sharedMachine.environment).toHaveBeenCalledWith(A)
+    sharedMachine.rebind.mockResolvedValueOnce(next)
+    expect(await switcher.rebind('session-a', sharedRunning, undefined, undefined, { startExhausted: true })).toEqual({ ok: true, environment: next })
+    expect(sharedMachine.rebind).toHaveBeenCalledWith(A, undefined)
+    expect(session.sharedSetupTokenAccount).toBe(B)
+    expect(requests).toEqual([])
+  })
+
   it('refuses a turn when account or Studio authority is missing', async () => {
     const { switcher, requests, sharedMachine, session } = startSetup(() => Response.json({}))
+    // Still held, but without a company to prove it for: moving would not help.
     sharedMachine.startProof.mockResolvedValueOnce(null)
+    sharedMachine.environment.mockResolvedValueOnce({ CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-a', [SETUP_TOKEN_SHARED_ACCOUNT_ENV]: A })
     expect(await switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: false, reason: 'REQUEST_FAILED' })
     delete session.sharedSetupTokenAccount
     expect(await switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: false, reason: 'REQUEST_FAILED' })
