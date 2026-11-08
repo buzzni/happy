@@ -65,6 +65,15 @@ export interface TerminalOutputBuffer {
     /** Assigns the next seq, buffers the chunk, and returns that seq. */
     push(chunk: string): number
     /**
+     * Buffers a chunk under a seq someone else assigned — a terminal worker owns the seq of
+     * the terminals it runs (specs/terminal-survive-runner-restart §2.3). A seq at or below the
+     * last one is a repeat and is dropped. Seqs skipped before the first frame count as trimmed.
+     * Returns the last seq.
+     */
+    pushAt(seq: number, chunk: string): number
+    /** The frames still buffered, oldest first — what an adopting daemon restores from. */
+    frames(): BufferedTerminalFrame[]
+    /**
      * Decides how to answer a resume for a client that has seen `afterSeq`.
      * With `maxChars` the answer is one page of at most that many characters
      * (capped at TERMINAL_RESUME_PAGE_CHARS, never splitting a frame); without
@@ -174,6 +183,21 @@ export function createTerminalOutputBuffer(
             chars += chunk.length
             trim()
             return nextSeq
+        },
+
+        pushAt(seq, chunk) {
+            if (!Number.isSafeInteger(seq) || seq <= nextSeq) return nextSeq
+            // Nothing buffered yet: whatever came before this seq is history this buffer never held.
+            if (frames.length === 0 && seq > nextSeq + 1) trimmedThrough = Math.max(trimmedThrough, seq - 1)
+            nextSeq = seq
+            frames.push({ seq, chunk })
+            chars += chunk.length
+            trim()
+            return nextSeq
+        },
+
+        frames() {
+            return frames.map((frame) => ({ ...frame }))
         },
 
         resume(afterSeq, requestedPage) {
