@@ -34,6 +34,14 @@ export type SealedConsoleResult =
     | { ok: true; status: number; headers: Record<string, string>; bodyB64: string }
     | { ok: false; code: SealedConsoleFailure }
 
+/**
+ * The runtime the console may reach: only the personal desktop runtime serves the remote page console
+ * (`consoleScreenMode: 'native-window'`); an installer-managed runtime answers the same path with its VNC console.
+ */
+export function sealedConsoleRuntimeUrl(env: NodeJS.ProcessEnv): string | undefined {
+    return env.HAPPY_BROWSER_TASK_SEALED_CONSOLE === '1' ? env.HAPPY_BROWSER_TASK_RUNTIME_URL : undefined
+}
+
 /** The runtime Desktop configured for this PC: plain HTTP on the loopback address, nothing else. */
 function runtimePort(runtimeUrl: string | undefined): number | undefined {
     if (!runtimeUrl) return undefined

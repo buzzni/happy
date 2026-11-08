@@ -1209,7 +1209,7 @@ describe('ApiMachineClient socket reconnection', () => {
     it('registers the sealed AI browser console as a customer-bound machine method', () => {
         const client = new ApiMachineClient('fake-token', makeMachine());
         expect((client as any).rpcHandlerManager.registerHandler).toHaveBeenCalledWith(
-            'agent-browser:console-http-v1', expect.any(Function), { customerBound: true },
+            'agent-browser:console-http-v1', expect.any(Function), { customerBound: true, ownNonceBudget: true },
         );
     });
 

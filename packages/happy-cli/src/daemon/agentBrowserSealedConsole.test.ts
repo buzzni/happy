@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server } from 'node:http'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { forwardSealedConsoleRequest } from './agentBrowserSealedConsole'
+import { forwardSealedConsoleRequest, sealedConsoleRuntimeUrl } from './agentBrowserSealedConsole'
 
 describe('forwardSealedConsoleRequest', () => {
     let runtime: Server
@@ -92,5 +92,12 @@ describe('forwardSealedConsoleRequest', () => {
 
     it('refuses a response larger than the console needs instead of returning part of it', async () => {
         expect(await forwardSealedConsoleRequest({ method: 'POST', path: '/v1/ops/huge' }, runtimeUrl)).toEqual({ ok: false, code: 'TOO_LARGE' })
+    })
+})
+
+describe('sealedConsoleRuntimeUrl', () => {
+    it('names the runtime only where the personal desktop runtime serves the remote page console', () => {
+        expect(sealedConsoleRuntimeUrl({ HAPPY_BROWSER_TASK_RUNTIME_URL: 'http://127.0.0.1:38700', HAPPY_BROWSER_TASK_SEALED_CONSOLE: '1' })).toBe('http://127.0.0.1:38700')
+        expect(sealedConsoleRuntimeUrl({ HAPPY_BROWSER_TASK_RUNTIME_URL: 'http://127.0.0.1:38700' })).toBeUndefined()
     })
 })

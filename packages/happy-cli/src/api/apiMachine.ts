@@ -75,7 +75,7 @@ import {
     type SessionExitVerification,
 } from '@/daemon/sessionExitVerification';
 import { proxyHttp, PreviewProxyError } from '@/daemon/previewProxy';
-import { AGENT_BROWSER_CONSOLE_METHOD, forwardSealedConsoleRequest } from '@/daemon/agentBrowserSealedConsole';
+import { AGENT_BROWSER_CONSOLE_METHOD, forwardSealedConsoleRequest, sealedConsoleRuntimeUrl } from '@/daemon/agentBrowserSealedConsole';
 /**
  * Bound preview requests travel on their own Socket.IO event. Kept as a
  * constant so the daemon and happy-server cannot drift apart silently — a
@@ -1077,9 +1077,10 @@ export class ApiMachineClient {
             'worktree-dependencies:reclaim', createWorktreeReclaimHandler(allowedRoot, {}, undefined, withFilesystemMutation),
         );
         // aplus-dev-studio-desktop ADR-085: the AI browser console of a strict machine, sealed end to end. Read at call
-        // time: a personal runtime Desktop sets up after sign-in exports its address into this process then.
+        // time: a personal runtime Desktop sets up after sign-in exports its address into this process then. Its own
+        // nonce budget: a console polls page frames, and must not refuse the machine's other control requests.
         this.rpcHandlerManager.registerHandler(AGENT_BROWSER_CONSOLE_METHOD,
-            params => forwardSealedConsoleRequest(params, process.env.HAPPY_BROWSER_TASK_RUNTIME_URL), { customerBound: true });
+            params => forwardSealedConsoleRequest(params, sealedConsoleRuntimeUrl(process.env)), { customerBound: true, ownNonceBudget: true });
         // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 preview stage 2: a preview the
         // browser starts with the env the server sealed for this machine. Customer lane only.
         this.rpcHandlerManager.registerHandler(

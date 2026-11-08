@@ -57,7 +57,7 @@ export interface PersonalBrowserRuntimeOptions {
 
 /** Every variable `sessionEnv` below can set; activation copies them into the daemon's own environment. */
 const PERSONAL_SESSION_ENV = ['HAPPY_BROWSER_TASK_DESKTOP_LOGIN', 'HAPPY_BROWSER_TASK_RUNTIME_URL', 'HAPPY_BROWSER_TASK_BROKER_SOCKET',
-    'HAPPY_BROWSER_TASK_PROFILE_ID', 'HAPPY_BROWSER_TASK_TENANCY', 'HAPPY_BROWSER_TASK_HOST_MODE'] as const
+    'HAPPY_BROWSER_TASK_PROFILE_ID', 'HAPPY_BROWSER_TASK_TENANCY', 'HAPPY_BROWSER_TASK_HOST_MODE', 'HAPPY_BROWSER_TASK_SEALED_CONSOLE'] as const
 
 /**
  * A daemon started by the previous daemon's handoff, or by one of its sessions, inherits the
@@ -170,6 +170,8 @@ export function readPersonalBrowserRuntime(options: PersonalBrowserRuntimeOption
             HAPPY_BROWSER_TASK_PROFILE_ID: config.profiles[0].profileId,
             HAPPY_BROWSER_TASK_TENANCY: 'dedicated',
             HAPPY_BROWSER_TASK_HOST_MODE: 'dedicated-host',
+            // Its console serves the remote page view, so it is reachable over the customer-key RPC (desktop ADR-085).
+            HAPPY_BROWSER_TASK_SEALED_CONSOLE: '1',
         },
         native: { socketPath: paths.brokerSocket, machineId: config.machineId, workspaceId: config.workspaceId, issue },
         start: () => superviseRuntime(options, runtimeEnv),
