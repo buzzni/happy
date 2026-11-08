@@ -13,9 +13,9 @@
 - [x] T5. `terminalWorker/survivalDecision.ts` spec HR3 표 + `readTerminalWorkerFlag`(HR11 플래그 3값) → 표 전 행·플래그 테스트
 
 ## Phase 2 — 워커 프로세스와 프록시
-- [ ] T6. (structural) `TerminalOutputBuffer` seq 지정 append·dump/restore, `bindTerminal` 상태 내보내기/복원 — 동작 보존 → 기존 테스트 + 새 단위 테스트
-- [ ] T7. `terminalWorker/workerProcess.ts` + `happy terminal-worker` 하위 명령(`--protocol-version` 포함) → 통합 테스트(생성·입출력·terminate·hello 실패·컨트롤러 교체·자기 수명)
-- [ ] T8. `terminalWorker/workerClient.ts`(launch·connect·hello·요청/응답) + `workerPtySession.ts`(PtySession 구현) → 통합 테스트
+- [x] T6. (structural) `TerminalOutputBuffer` seq 지정 append·dump/restore, `bindTerminal` 상태 내보내기/복원 — 동작 보존 → 기존 테스트 + 새 단위 테스트
+- [x] T7. `terminalWorker/workerProcess.ts` + `happy terminal-worker` 하위 명령(`--protocol-version` 포함) → 통합 테스트(생성·입출력·terminate·hello 실패·컨트롤러 교체·자기 수명)
+- [x] T8. `terminalWorker/workerClient.ts`(launch·connect·hello·요청/응답) + `workerPtySession.ts`(PtySession 구현) → 통합 테스트
 
 ## Phase 3 — 데몬 배선
 - [ ] T9. `terminalWorker/adoption.ts` 시작 시 분류·입양·리퍼(spec HR6 규칙) → 단위(가짜 프로세스 테이블) + 통합(고아·부팅 ID·비호환)
