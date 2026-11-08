@@ -3,7 +3,7 @@ import type { Options, Query, SDKUserMessage, query } from '@anthropic-ai/claude
 import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS } from '../utils/claudeAuthOverrideEnv';
 
 import { logger } from '@/lib';
-import { ORG_ENDPOINT_OWNED_ENV_KEYS } from '../utils/orgEndpointEnvKeys';
+import { ORG_ENDPOINT_CLEARED_ENV_KEYS, ORG_ENDPOINT_VALUE_ENV_KEYS } from '../utils/orgEndpointEnvKeys';
 import {
     ClaudeAuthNotVerifiedError, ORG_ENDPOINT_CLAUDE_AUTH_FAILURE, ORGANIZATION_CLAUDE_AUTH_FAILURE, PERSONAL_CLAUDE_AUTH_FAILURE,
     type ClaudeAuthCheckReason, type ClaudeAuthCheckStage,
@@ -42,6 +42,8 @@ export function queryWithPinnedCredential(
     const authEnv = Object.fromEntries(CLAUDE_AUTH_OVERRIDE_ENV_KEYS.map(key => [key, '']));
     // Newer backends/profiles must not inherit a different credential route.
     for (const key of ['ANTHROPIC_PROFILE', 'CLAUDE_CODE_USE_ANTHROPIC_AWS', 'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD', 'CLAUDE_CODE_USE_MANTLE']) authEnv[key] = '';
+    // A socket moves every request to a local listener under the same address and token.
+    authEnv.ANTHROPIC_UNIX_SOCKET = '';
     // Native host routing ignores authentication env from settings even during live reloads.
     authEnv.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1';
     authEnv.CLAUDE_CODE_OAUTH_TOKEN = oauthToken;
@@ -71,7 +73,10 @@ export function queryWithPinnedEndpoint(
 ): Query {
     const failureCode = ORG_ENDPOINT_CLAUDE_AUTH_FAILURE;
     const authEnv: Record<string, string> = {};
-    for (const key of ORG_ENDPOINT_OWNED_ENV_KEYS) {
+    // A route the endpoint closes is empty whatever the environment says: a value left there (a daemon that predates the
+    // key, an inherited variable) is not the daemon's choice to keep, and its absence is not a reason to refuse.
+    for (const key of ORG_ENDPOINT_CLEARED_ENV_KEYS) authEnv[key] = '';
+    for (const key of ORG_ENDPOINT_VALUE_ENV_KEYS) {
         const value = environment[key];
         if (value === undefined || /[\r\n\0]/.test(value)) throw new Error(failureCode);
         authEnv[key] = value;

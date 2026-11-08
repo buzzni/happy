@@ -13,6 +13,7 @@ import { ensureLocalProxyBypass } from '../utils/proxyBypass'
 import { resolveHappyEntrypoint } from './happyEntrypoint'
 import { queryWithPinnedCredential, queryWithPinnedEndpoint } from './credentialPin'
 import { foldModelToOrgEndpoint } from '../utils/orgEndpointModel'
+import { orgEndpointRoutingSettingsEnv } from '../utils/orgEndpointEnvKeys'
 import { sanitizeChildEnv } from '@/utils/childEnv'
 import { RECALL_OWNER_ENV } from '@/memory/recallOwnerMarker'
 import { LESSON_OWNER_ENV } from '@/memory/lessonOwnerMarker'
@@ -26,7 +27,8 @@ const isolatedMemoryEnvironment = Object.freeze({
  */
 export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): Query {
     const opts = params.options
-    const settings = resolveSettings(opts)
+    const endpointRouting = orgEndpointRoutingSettingsEnv(process.env)
+    const settings = resolveSettings(opts, endpointRouting)
 
     // Build system prompt
     let systemPrompt: Options['systemPrompt'] = undefined
@@ -132,13 +134,13 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
     })
 }
 
-function resolveSettings(opts: QueryOptions | undefined): string | undefined {
+function resolveSettings(opts: QueryOptions | undefined, endpointRouting?: Record<string, string>): string | undefined {
     const denyRules = opts?.permissionsDeny ?? []
     const emptyPluginServers = findEmptySyncedPluginServers().filter(name => !opts?.mcpServers?.[name])
     // SDK 는 settings 파일 경로와 sandbox 옵션의 동시 사용을 거부한다. 우리 규칙을
     // 경로로 넘기면 CLI 가 그 파일만 읽고 여기서 더한 것은 사라지므로, 합쳐야 할
     // 것이 하나라도 있으면 인라인한다.
-    if (!opts?.isolatedAutomationContext && emptyPluginServers.length === 0 && (!opts?.settingsPath || (!opts.sandbox && denyRules.length === 0))) return opts?.settingsPath
+    if (!opts?.isolatedAutomationContext && !endpointRouting && emptyPluginServers.length === 0 && (!opts?.settingsPath || (!opts.sandbox && denyRules.length === 0))) return opts?.settingsPath
     const rawSettings = opts?.settingsPath ? readFileSync(opts.settingsPath, 'utf8') : '{}'
     let parsedSettings: unknown
     try {
@@ -155,6 +157,13 @@ function resolveSettings(opts: QueryOptions | undefined): string | undefined {
         if (typeof settingsEnv !== 'object' || Array.isArray(settingsEnv)) throw new Error('Claude hook environment must be a JSON object')
         settings.autoMemoryEnabled = false
         settings.env = { ...settingsEnv, ...isolatedMemoryEnvironment }
+    }
+    if (endpointRouting) {
+        // The routing is the daemon's: it wins over whatever env the hook settings file carried for the same keys.
+        const settings = parsedSettings as Record<string, unknown>
+        const settingsEnv = settings.env ?? {}
+        if (typeof settingsEnv !== 'object' || Array.isArray(settingsEnv)) throw new Error('Claude hook environment must be a JSON object')
+        settings.env = { ...settingsEnv, ...endpointRouting }
     }
     if (emptyPluginServers.length > 0) {
         const settings = parsedSettings as { deniedMcpServers?: { serverName?: string }[] }

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { orgEndpointRoutingSettingsEnv } from './orgEndpointEnvKeys';
+import { ORG_ENDPOINT_CLEARED_ENV_KEYS, orgEndpointRoutingSettingsEnv } from './orgEndpointEnvKeys';
 import { buildHookSettings, cleanupHookSettingsFile, generateHookSettingsFile, toolPolicyHookCommands } from './generateHookSettings';
 import { resolveMachineLockdownPolicy } from '@/daemon/machineLockdownPolicy';
 
@@ -75,7 +75,11 @@ describe('buildHookSettings', () => {
             HAPPY_AI_AUTH_SOURCE: 'org-endpoint', ANTHROPIC_BASE_URL: 'https://llm.corp.example', ANTHROPIC_AUTH_TOKEN: 'corp-secret-token',
             ANTHROPIC_MODEL: 'corp-model', CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1', ANTHROPIC_API_KEY: '', UNRELATED: 'x',
         });
-        expect(env).toEqual({ ANTHROPIC_BASE_URL: 'https://llm.corp.example', ANTHROPIC_MODEL: 'corp-model', CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1', ANTHROPIC_API_KEY: '' });
+        expect(env).toMatchObject({ ANTHROPIC_BASE_URL: 'https://llm.corp.example', ANTHROPIC_MODEL: 'corp-model', CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1', ANTHROPIC_API_KEY: '' });
+        expect(env).not.toHaveProperty('ANTHROPIC_AUTH_TOKEN');
+        expect(env).not.toHaveProperty('UNRELATED');
+        // A closed route is written empty whether or not the daemon's environment carried it (a daemon older than the key).
+        for (const key of ORG_ENDPOINT_CLEARED_ENV_KEYS) expect(env?.[key], key).toBe('');
         const settings = buildHookSettings({ ...base, policy: resolveMachineLockdownPolicy({}), env });
         expect(settings).toMatchObject({ env, hooks: plain.hooks, permissions: plain.permissions });
         expect(JSON.stringify(settings)).not.toContain('corp-secret-token');

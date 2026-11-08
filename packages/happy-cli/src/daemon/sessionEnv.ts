@@ -198,6 +198,8 @@ const UNSAFE_REQUEST_ENV_KEYS = new Set([
     // Where the agent sends its requests and under which headers (aplus specs/org-llm-endpoints D1): a project
     // variable would carry the session's credential to any address. The platform sets these itself, never a request.
     'ANTHROPIC_BASE_URL', 'ANTHROPIC_BEDROCK_BASE_URL', 'ANTHROPIC_VERTEX_BASE_URL', 'ANTHROPIC_CUSTOM_HEADERS',
+    // The transport itself: a socket path sends every request to a local listener under an unchanged address and token (r3).
+    'ANTHROPIC_UNIX_SOCKET',
     'SSL_CERT_FILE', 'SSL_CERT_DIR', 'SSH_ASKPASS', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME',
     // OpenSSL loads config, providers and engines (code) from these; bash runs startup options and traces.
     'OPENSSL_CONF', 'OPENSSL_MODULES', 'OPENSSL_ENGINES', 'SHELLOPTS', 'BASHOPTS', 'PS4',

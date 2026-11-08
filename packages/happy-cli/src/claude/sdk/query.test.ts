@@ -92,6 +92,31 @@ describe('query adapter', () => {
             expect(options).toMatchObject({ model: 'corp-model', fallbackModel: 'corp-small' });
         });
 
+        // The pin applies its flag layer after Claude Code started; the settings files' env is read at startup (telemetry
+        // is initialised from it), so the startup flag layer must carry the closed routes too — token excluded.
+        it('starts Claude Code with the closed routes in the flag settings even without a hook settings file, never the token', () => {
+            query({ prompt: 'hello' });
+            const options = (pinnedEndpointQuery.mock.calls.at(-1) as unknown as [unknown, { options: { settings?: string } }])[1].options;
+            const settings = JSON.parse(options.settings!);
+            expect(settings.env).toMatchObject({ ANTHROPIC_BASE_URL: 'https://llm.corp.example', ANTHROPIC_MODEL: 'corp-model', CLAUDE_CODE_ENABLE_TELEMETRY: '', ANTHROPIC_UNIX_SOCKET: '' });
+            expect(options.settings).not.toContain('corp-token');
+        });
+
+        it('adds the closed routes to a hook settings file\'s own env and keeps its hooks', () => {
+            const settingsPath = join(configDirectory, 'hooks.json');
+            const hooks = { SessionStart: [{ matcher: '*' }] };
+            writeFileSync(settingsPath, JSON.stringify({ hooks, env: { KEEP: 'yes', ANTHROPIC_MODEL: 'corp-model' } }));
+            query({ prompt: 'hello', options: { settingsPath } });
+            const options = (pinnedEndpointQuery.mock.calls.at(-1) as unknown as [unknown, { options: { settings?: string } }])[1].options;
+            expect(JSON.parse(options.settings!)).toMatchObject({ hooks, env: { KEEP: 'yes', ANTHROPIC_MODEL: 'corp-model', CLAUDE_CODE_ENABLE_TELEMETRY: '' } });
+        });
+
+        it('leaves the settings of every other source as they were', () => {
+            vi.stubEnv('HAPPY_AI_AUTH_SOURCE', 'org-bundle');
+            query({ prompt: 'hello' });
+            expect(lastOptions().settings).toBeUndefined();
+        });
+
         it('leaves a query with no model naming none, for the pinned environment to answer', () => {
             query({ prompt: 'hello' });
             const options = (pinnedEndpointQuery.mock.calls.at(-1) as unknown as [unknown, { options: Record<string, unknown> }])[1].options;

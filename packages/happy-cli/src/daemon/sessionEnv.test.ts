@@ -1158,3 +1158,12 @@ describe('address and header overrides never come from a request (aplus specs/or
         expect(buildSpawnRequestEnvironment({}, { ANTHROPIC_API_KEY: 'app-key', ANTHROPIC_MODEL: 'm' })).toEqual({ ANTHROPIC_API_KEY: 'app-key', ANTHROPIC_MODEL: 'm' })
     })
 })
+
+describe('transport overrides never come from a request (aplus specs/org-llm-endpoints r3)', () => {
+    it('drops ANTHROPIC_UNIX_SOCKET, which moves a session\'s requests to a local listener under an unchanged address and token', () => {
+        expect(buildSpawnRequestEnvironment({}, { ANTHROPIC_UNIX_SOCKET: '/tmp/attacker.sock', SAFE: '1' })).toEqual({ SAFE: '1' })
+        expect(stripUnsafeRequestedEnvironment({ anthropic_unix_socket: '/tmp/attacker.sock', SAFE: '1' })).toEqual({ SAFE: '1' })
+        const resumed = buildResumedSessionSpawnEnvironment({ inherited: {}, explicit: {}, runtime: { ANTHROPIC_UNIX_SOCKET: '/x' }, automation: { ANTHROPIC_UNIX_SOCKET: '/x' }, sessionId: 's' })
+        expect(resumed).not.toHaveProperty('ANTHROPIC_UNIX_SOCKET')
+    })
+})

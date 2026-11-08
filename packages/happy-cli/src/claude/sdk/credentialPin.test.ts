@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Options, Query, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { queryWithPinnedCredential, queryWithPinnedEndpoint } from './credentialPin';
 import { buildOrgLlmEndpointEnvironment, parseOrgLlmEndpointSync } from '@/daemon/orgLlmEndpoint';
-import { ORG_ENDPOINT_OWNED_ENV_KEYS } from '../utils/orgEndpointEnvKeys';
+import { ORG_ENDPOINT_CLEARED_ENV_KEYS, ORG_ENDPOINT_OWNED_ENV_KEYS } from '../utils/orgEndpointEnvKeys';
 import { describeClaudeLaunchFailure } from '../utils/launchFailureMessage';
 import { logger } from '@/lib';
 const TOKEN = 'fixture-owner-token';
@@ -34,6 +34,8 @@ describe('pinned credential at the SDK request boundary', () => {
         expect(f.controls.applyFlagSettings).toHaveBeenCalledOnce();
         expect(f.controls.applyFlagSettings.mock.calls[0][0]).toMatchObject({ apiKeyHelper: '', env: { CLAUDE_CODE_OAUTH_TOKEN: TOKEN, ANTHROPIC_API_KEY: '', KEEP_FLAG_ENV: 'yes' } });
         expect(Object.keys(f.controls.applyFlagSettings.mock.calls[0][0]).sort()).toEqual(['apiKeyHelper', 'env']);
+        // The socket route changes the transport under an unchanged address and token; it is forced empty like the other routes.
+        expect(f.controls.applyFlagSettings.mock.calls[0][0]).toMatchObject({ env: { ANTHROPIC_UNIX_SOCKET: '' } });
         expect(f.create.mock.calls[0][0]).toMatchObject({ options });
         expect(f.received).toHaveLength(1); expect(f.received[0].message.content).toBe('hello');
     });
@@ -219,7 +221,7 @@ describe('pinned organization LLM endpoint at the SDK request boundary', () => {
         expect(applied.env).toMatchObject({
             KEEP_FLAG_ENV: 'yes', ANTHROPIC_BASE_URL: 'https://llm-a.corp.example', ANTHROPIC_AUTH_TOKEN: 'corp-endpoint-token',
             ANTHROPIC_MODEL: 'corp-model', ANTHROPIC_DEFAULT_OPUS_MODEL: 'corp-big', CLAUDE_CODE_SUBAGENT_MODEL: 'corp-model',
-            CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1', ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', CLAUDE_CODE_USE_MANTLE: '', ANTHROPIC_PROFILE: '',
+            CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1', ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', CLAUDE_CODE_USE_MANTLE: '', ANTHROPIC_PROFILE: '', ANTHROPIC_UNIX_SOCKET: '',
         });
         // Exactly the daemon's non-marker keys, nothing the settings files could add.
         expect(Object.keys(applied.env).filter(key => key !== 'KEEP_FLAG_ENV').sort()).toEqual([...ORG_ENDPOINT_OWNED_ENV_KEYS].sort());
@@ -235,6 +237,8 @@ describe('pinned organization LLM endpoint at the SDK request boundary', () => {
         ['the sub-agent model', { CLAUDE_CODE_SUBAGENT_MODEL: 'claude-sonnet-5' }],
         ['a re-enabled provider', { CLAUDE_CODE_USE_MANTLE: '1' }],
         ['a header', { ANTHROPIC_CUSTOM_HEADERS: 'Authorization: Bearer other' }],
+        ['a unix socket', { ANTHROPIC_UNIX_SOCKET: '/tmp/attacker.sock' }],
+        ['telemetry switched on', { CLAUDE_CODE_ENABLE_TELEMETRY: '1' }],
         ['host routing turned off', { CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '0' }],
     ])('refuses a settings layer that wins with %s before any input, naming no value', async (_label, override) => {
         const f = endpointFixture();
@@ -282,7 +286,7 @@ describe('pinned organization LLM endpoint at the SDK request boundary', () => {
     });
 
     it.each([
-        ['an owned key missing', (env: Record<string, string>) => { delete env.CLAUDE_CODE_USE_MANTLE; }],
+        ['a value key missing', (env: Record<string, string>) => { delete env.ANTHROPIC_DEFAULT_OPUS_MODEL; }],
         ['no address', (env: Record<string, string>) => { env.ANTHROPIC_BASE_URL = ''; }],
         ['no token', (env: Record<string, string>) => { env.ANTHROPIC_AUTH_TOKEN = ''; }],
         ['host routing off', (env: Record<string, string>) => { env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = ''; }],
@@ -291,6 +295,18 @@ describe('pinned organization LLM endpoint at the SDK request boundary', () => {
         const f = endpointFixture(); const env = { ...daemonEnv }; damage(env);
         expect(() => queryWithPinnedEndpoint(f.create as never, { prompt: 'hello', options: endpointOptions }, env)).toThrow(CODE);
         expect(f.create).not.toHaveBeenCalled();
+    });
+
+    it('forces every closed route empty whatever the session environment holds, even when a daemon that predates the key left it out', async () => {
+        const f = endpointFixture();
+        const env: Record<string, string> = { ...daemonEnv, ANTHROPIC_UNIX_SOCKET: '/tmp/attacker.sock', CLAUDE_CODE_ENABLE_TELEMETRY: '1', CLAUDE_CODE_USE_MANTLE: '1' };
+        delete env.ANTHROPIC_PROFILE;
+        const q = queryWithPinnedEndpoint(f.create as never, { prompt: 'hello', options: { ...endpointOptions, env } }, env);
+        await q.next();
+        const applied = f.controls.applyFlagSettings.mock.calls[0][0] as { env: Record<string, string> };
+        for (const key of ORG_ENDPOINT_CLEARED_ENV_KEYS) expect(applied.env[key], key).toBe('');
+        expect((f.create.mock.calls[0][0] as unknown as { options: Options }).options.env).toMatchObject({ ANTHROPIC_UNIX_SOCKET: '', CLAUDE_CODE_ENABLE_TELEMETRY: '' });
+        expect(f.received).toHaveLength(1);
     });
 
     it('tells the user a sentence, not the code', () => {

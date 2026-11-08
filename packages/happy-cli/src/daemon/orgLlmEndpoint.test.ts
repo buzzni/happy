@@ -231,9 +231,23 @@ describe('buildOrgLlmEndpointEnvironment', () => {
       CLAUDE_CODE_USE_ANTHROPIC_AWS: '',
       CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD: '',
       CLAUDE_CODE_USE_MANTLE: '',
+      ANTHROPIC_UNIX_SOCKET: '',
+      CLAUDE_CODE_ENABLE_TELEMETRY: '',
+      ENABLE_BETA_TRACING_DETAILED: '',
+      BETA_TRACING_ENDPOINT: '',
       HAPPY_AI_AUTH_SOURCE: 'org-endpoint',
       HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING: 'binding-1:endpoint-1:target-a:3',
     })
+  })
+
+  it('writes the unix socket route empty, so a socket left in the daemon environment cannot carry the endpoint token elsewhere', () => {
+    const env = buildOrgLlmEndpointEnvironment({ entry: entry(), target, bindingId: 'binding-1' })
+    expect(env.ANTHROPIC_UNIX_SOCKET).toBe('')
+  })
+
+  it('writes the telemetry gates empty, so an exporter named by the environment cannot carry the conversation out', () => {
+    const env = buildOrgLlmEndpointEnvironment({ entry: entry(), target, bindingId: 'binding-1' })
+    expect([env.CLAUDE_CODE_ENABLE_TELEMETRY, env.ENABLE_BETA_TRACING_DETAILED, env.BETA_TRACING_ENDPOINT]).toEqual(['', '', ''])
   })
 
   it('maps the fable tier to the plain model when no opus mapping exists', () => {

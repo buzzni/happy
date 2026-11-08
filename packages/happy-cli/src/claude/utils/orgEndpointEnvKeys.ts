@@ -32,6 +32,15 @@ export const ORG_ENDPOINT_CLEARED_ENV_KEYS = [
     'CLAUDE_CODE_USE_ANTHROPIC_AWS',
     'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD',
     'CLAUDE_CODE_USE_MANTLE',
+    // Not a model backend but the transport: with a socket Claude Code sends every request there under the same address
+    // and token (observed with the real SDK, credentialPin.integration.test.ts), so a listener on the machine reads both.
+    'ANTHROPIC_UNIX_SOCKET',
+    // Not a route to a model but a second way for the conversation to leave: with the switch on, Claude Code posts prompts
+    // and API bodies to whatever OTEL_EXPORTER_OTLP_ENDPOINT / BETA_TRACING_ENDPOINT name (observed with the real SDK).
+    // Only the gates are owned; the exporter variables are inert without them and a developer's own app may use them.
+    'CLAUDE_CODE_ENABLE_TELEMETRY',
+    'ENABLE_BETA_TRACING_DETAILED',
+    'BETA_TRACING_ENDPOINT',
 ] as const
 
 export const ORG_ENDPOINT_OWNED_ENV_KEYS: readonly string[] = [...ORG_ENDPOINT_VALUE_ENV_KEYS, ...ORG_ENDPOINT_CLEARED_ENV_KEYS]
@@ -39,16 +48,19 @@ export const ORG_ENDPOINT_OWNED_ENV_KEYS: readonly string[] = [...ORG_ENDPOINT_V
 /**
  * The routing part of an endpoint session's environment as a settings `env` block, or undefined outside one.
  *
- * Passed to the terminal's Claude through `--settings`, which outranks the user's and the project's settings files
- * on any Claude Code version, so those cannot re-point the address or the models. The token is left out on purpose:
- * it would otherwise be written to a file, and without the address a token set elsewhere reaches only the endpoint.
+ * Passed to Claude Code as flag settings at startup (`--settings`), which outrank the user's and the project's settings
+ * files on any Claude Code version — and are in force before the SDK pin can apply its own after start-up, which is too
+ * late for what Claude Code initialises from the files' env (telemetry). The token is left out on purpose: it would
+ * otherwise be written to a file or an argument. A closed route is written empty whether or not the daemon's
+ * environment carried it, so a daemon that predates a key still closes it.
  */
 export function orgEndpointRoutingSettingsEnv(env: Record<string, string | undefined>): Record<string, string> | undefined {
     if (env.HAPPY_AI_AUTH_SOURCE !== 'org-endpoint' || !env.ANTHROPIC_BASE_URL) return undefined
     const block: Record<string, string> = {}
-    for (const key of ORG_ENDPOINT_OWNED_ENV_KEYS) {
+    for (const key of ORG_ENDPOINT_VALUE_ENV_KEYS) {
         const value = env[key]
         if (key !== 'ANTHROPIC_AUTH_TOKEN' && value !== undefined) block[key] = value
     }
+    for (const key of ORG_ENDPOINT_CLEARED_ENV_KEYS) block[key] = ''
     return block
 }
