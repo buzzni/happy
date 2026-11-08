@@ -238,11 +238,20 @@ export function killAllDaemonTerminalSessions(route?: 'relay' | 'direct'): numbe
 /** A terminal typed into within this window is in use and a restart waits for it (R23). */
 export const BUSY_TERMINAL_INPUT_WINDOW_MS = 10 * 60 * 1000
 
-export function getBusyDaemonTerminalCount(now: number = Date.now(), windowMs: number = BUSY_TERMINAL_INPUT_WINDOW_MS): number {
+/**
+ * `survives` names the terminals a restart would keep (aplus terminal-survive-runner-restart HR3):
+ * nobody waits for those, since the restart does not end them.
+ */
+export function getBusyDaemonTerminalCount(
+    now: number = Date.now(),
+    windowMs: number = BUSY_TERMINAL_INPUT_WINDOW_MS,
+    survives?: (entry: DaemonTerminalEntry) => boolean,
+): number {
     let busy = 0
     for (const entry of sessions.values()) {
         // An ended terminal kept only for resume (D4 B-R2) is nobody's to wait for.
         if (entry.exit) continue
+        if (survives?.(entry)) continue
         if (entry.lastInputAt !== null && now - entry.lastInputAt < windowMs) busy++
     }
     return busy
@@ -251,11 +260,14 @@ export function getBusyDaemonTerminalCount(now: number = Date.now(), windowMs: n
 /**
  * Close every terminal because the daemon is being replaced: each entry is
  * tagged so its `terminal-closed` frame says why, then torn down and awaited.
- * Resolves with how many live terminals were closed.
+ * Resolves with how many live terminals were closed. Terminals `survives` names
+ * are left as they are — they outlive this daemon in a terminal worker
+ * (aplus terminal-survive-runner-restart HR3).
  */
-export async function closeAllDaemonTerminalSessionsForRestart(): Promise<number> {
+export async function closeAllDaemonTerminalSessionsForRestart(survives?: (entry: DaemonTerminalEntry) => boolean): Promise<number> {
     const pending: Promise<TerminateOutcome>[] = []
     for (const [id, entry] of sessions) {
+        if (!entry.exit && survives?.(entry)) continue
         clearTimers(entry)
         // Already ended and kept only for resume (D4 B-R2): nothing to tear down.
         if (entry.exit) {

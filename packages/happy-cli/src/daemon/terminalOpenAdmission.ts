@@ -17,8 +17,12 @@ export interface TerminalOpenAdmissionInput {
 
 export type TerminalOpenPreparation = Extract<TerminalOpenDecision, { kind: 'refused' }>
     | { kind: 'ready'; decision: Exclude<TerminalOpenDecision, { kind: 'refused' }>; cwdDecision: CwdDecision;
-        /** Install the PTY, listeners and ACK synchronously while temporary ownership is held. */
-        submit(operation: () => void): Promise<void>; cancel(): Promise<void> };
+        /**
+         * Install the PTY, listeners and ACK while temporary ownership is held. The synchronous part
+         * of `operation` runs in the same turn as the approval re-check; a terminal worker's
+         * `create` request leaves in that part and is awaited (aplus terminal-survive-runner-restart).
+         */
+        submit(operation: () => void | Promise<void>): Promise<void>; cancel(): Promise<void> };
 
 export async function prepareTerminalOpen(input: TerminalOpenAdmissionInput): Promise<TerminalOpenPreparation> {
     const preview = inspectTerminalOpen(input.opened, { machineId: input.machineId, strict: input.strict, now: input.now?.() });
@@ -73,7 +77,7 @@ export async function prepareTerminalOpen(input: TerminalOpenAdmissionInput): Pr
                 }
             }
             phase = 'submitted';
-            try { operation(); }
+            try { await operation(); }
             finally {
                 // Until durable retention succeeds, the temporary owners still block auto.
                 // A tracking failure cannot overwrite a real process result or release its scope.
