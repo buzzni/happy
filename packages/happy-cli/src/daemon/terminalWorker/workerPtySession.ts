@@ -13,6 +13,8 @@ export interface WorkerPtySession extends PtySession {
     /** Output with the seq the worker gave it — the seq the daemon's replay buffer must use. */
     onOutput(cb: (seq: number, chunk: string) => void): () => void
     setMeta(meta: WorkerTerminalMeta): Promise<void>
+    /** Output the daemon made (a banner), numbered by the worker in line with the shell's. */
+    inject(data: string): void
     /** Stops forwarding and leaves the PTY running in the worker. Its exit is never reported here. */
     detach(): void
     /** Tells the worker an ended terminal is no longer needed. */
@@ -121,6 +123,9 @@ export function createWorkerPtySession(input: {
             }
             exitListeners.add(cb)
             return () => exitListeners.delete(cb)
+        },
+        inject(data) {
+            if (exit === null) connection.post('inject', { id, data })
         },
         async setMeta(meta) {
             if (!connection.isOpen()) return

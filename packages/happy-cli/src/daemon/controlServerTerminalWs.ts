@@ -60,15 +60,22 @@ import {
 import { createTerminalOutputCoalescer } from './terminalOutputCoalescer';
 import { replyToTerminalResume, resetPagedResume, sendExitAfterReplay } from './terminalResumeReply';
 import { machineKeyTerminalCipher, type MachineEncryption } from './terminalCipher';
-import { bindTerminal, createTerminalOpenNonceGuard, receiveBoundTerminalFrame, replyToBoundResume } from './terminalBindingSession';
+import { bindTerminal, createTerminalOpenNonceGuard, receiveBoundTerminalFrame, replyToBoundResume, restoreBoundTerminal } from './terminalBindingSession';
+import type { AdoptedWorkerTerminal, TerminalWorkerHost } from './terminalWorker/workerHost';
+import type { WorkerTerminalMeta } from './terminalWorker/protocol';
+import { isWorkerPtySession } from './terminalWorker/workerPtySession';
 
 export interface TerminalWsRoute {
   wss: WebSocketServer;
   /** Closes the WS server and every open connection — plain `wss.close()`
    *  only stops accepting new ones and waits for existing sockets to close
    *  on their own, which would hang a test/shutdown with a client still open.
-   *  Also ends every terminal still waiting out its detach grace. */
+   *  Also ends every terminal still waiting out its detach grace — except, when the terminal
+   *  workers are keeping (aplus terminal-survive-runner-restart HR3), the worker terminals, which
+   *  are let go of for the next daemon to adopt. */
   close: () => Promise<void>;
+  /** Registers the direct terminals a starting daemon adopted from terminal workers (HR2). */
+  adopt: (terminals: AdoptedWorkerTerminal[]) => void;
 }
 
 export type { MachineEncryption };
@@ -103,6 +110,15 @@ export const MAX_DIRECT_TERMINALS_PER_USER = 5;
 /** What the open ack and a successful attach advertise. */
 const DIRECT_TERMINAL_CAPS = { resume: true, snapshot: true, local: true, attach: true, pagedResume: true } as const;
 
+/**
+ * A terminal in a terminal worker also says it outlives a daemon restart (aplus
+ * terminal-survive-runner-restart HR4). Plaintext ack/attach caps only: the sealed v2 proof caps
+ * are a strict schema on the client, so an extra key there would break every older app.
+ */
+function capsFor(pty: PtySession) {
+  return isWorkerPtySession(pty) ? { ...DIRECT_TERMINAL_CAPS, survive: true } : DIRECT_TERMINAL_CAPS;
+}
+
 interface OpenParams {
   userId?: string;
   cols?: number;
@@ -129,6 +145,8 @@ interface DirectTerminal {
   graceTimer: ReturnType<typeof setTimeout> | null;
   /** The user closed it: nobody re-attaches to it, so it waits out no grace window. */
   closing: boolean;
+  /** Worker terminals only: what the worker keeps for the daemon that adopts it next. */
+  meta?: WorkerTerminalMeta;
 }
 
 /** The registry entry holds the exit, as on the relay path (D4 B-R2). */
@@ -159,6 +177,8 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
   detachGraceMs?: number;
   reserveLegacyDispatch?: TerminalOpenAdmissionInput['reserveLegacyDispatch'];
   admitSubprocess?: TerminalOpenAdmissionInput['admitSubprocess'];
+  /** aplus terminal-survive-runner-restart: where new terminals open when workers are on. */
+  terminalWorkers?: TerminalWorkerHost;
 }): TerminalWsRoute {
   const detachGraceMs = opts.detachGraceMs ?? DIRECT_TERMINAL_DETACH_GRACE_MS;
   const wss = new WebSocketServer({
@@ -195,6 +215,8 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
     terminal.graceTimer = null;
     if (terminals.get(terminal.sessionId) === terminal) terminals.delete(terminal.sessionId);
     removeDaemonTerminalSession(terminal.sessionId);
+    // An ended worker terminal is kept by its worker for an adopting daemon; nobody needs it now.
+    if (isWorkerPtySession(terminal.pty) && exitOf(terminal) !== null) terminal.pty.forget();
   };
 
   /** Tells the attached client the PTY ended, and drops the terminal. */
@@ -249,6 +271,86 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
     // A waiting terminal must not keep the daemon process alive on its own.
     terminal.graceTimer.unref?.();
     logger.debug(`[LOCAL-DIRECT-TERMINAL] detached session=${terminal.sessionId} — ${detachGraceMs}ms to re-attach`);
+  };
+
+  /** Sends one numbered output frame to whichever WebSocket carries the terminal now, if any. */
+  const sendFrame = (terminal: DirectTerminal, seq: number, chunk: string) => {
+    if (terminal.ws === null) return;
+    const binding = terminal.entry.binding;
+    try {
+      if (binding) {
+        // A v2 frame carries its seq sealed.
+        sendOn(terminal.ws, { data: { event: 'terminal-frame', sessionId: terminal.sessionId, data: binding.sealOut({ kind: 'output', seq, data: chunk }) } });
+        return;
+      }
+      const machineEncryption = opts.getMachineEncryption();
+      if (!machineEncryption) return;
+      sendOn(terminal.ws, { data: { event: 'terminal-frame', sessionId: terminal.sessionId, seq, data: machineKeyTerminalCipher(machineEncryption).seal(chunk) } });
+    } catch (e) {
+      logger.debug(`[CONTROL SERVER] /terminal frame encrypt failed: ${(e as Error).message}`);
+    }
+  };
+
+  /**
+   * Output and exit handling, the same for a terminal opened here and one adopted from a worker.
+   * A worker numbers the output itself (its seq is what clients resume from, before and after a
+   * restart); a terminal in this process is coalesced and numbered here, as before.
+   */
+  const wireTerminal = (terminal: DirectTerminal) => {
+    const { sessionId, pty, entry } = terminal;
+    let flushLocal: (() => void) | null = null;
+    if (isWorkerPtySession(pty)) {
+      pty.onOutput((seq, chunk) => {
+        recordBytesOut(sessionId, chunk.length);
+        if (entry.output.pushAt(seq, chunk) === seq) sendFrame(terminal, seq, chunk);
+      });
+    } else {
+      // Buffer first, then send. Output while detached is buffered only, and
+      // replayed when a client attaches and resumes.
+      const outputCoalescer = createTerminalOutputCoalescer({
+        sessionId,
+        emit: (chunk) => sendFrame(terminal, entry.output.push(chunk), chunk),
+      });
+      pty.onData((chunk) => {
+        recordBytesOut(sessionId, chunk.length);
+        outputCoalescer.push(chunk);
+      });
+      flushLocal = () => {
+        outputCoalescer.flush();
+        outputCoalescer.dispose();
+      };
+    }
+    pty.onExit((code, signal) => {
+      flushLocal?.();
+      // Kept in the registry, like a relay terminal, so a re-attaching
+      // client resumes into the last output and this exit (D4 B-R2).
+      if (!markDaemonTerminalSessionExited(sessionId, { code, signal })) {
+        // A restart close (aplus codexcli-daemon-restart-drain R23) already took it
+        // out of the registry; this terminal still answers its client's replay and
+        // must say it ended.
+        entry.exit = { code, signal };
+      }
+      // Audit every end, however it came about (exit, close, grace expiry, shutdown).
+      logger.debug(
+        `[LOCAL-DIRECT-TERMINAL] close session=${sessionId} user=${entry.userId} exitCode=${code} signal=${signal ?? 'null'} ` +
+        `bytesIn=${entry.bytesIn} bytesOut=${entry.bytesOut} durationMs=${Date.now() - entry.openedAt}`,
+      );
+      // Grace already expired: nobody is coming back for it.
+      if (terminals.get(sessionId) !== terminal) {
+        if (isWorkerPtySession(pty)) pty.forget();
+        return;
+      }
+      if (terminal.closing) {
+        // The user closed it: say so if still attached, and let it go.
+        sendClosed(terminal);
+        forget(terminal);
+        return;
+      }
+      // Attached: say so (after any replay in flight). Detached: the
+      // buffered output and the exit wait out the grace window for a
+      // client that reattaches.
+      if (terminal.ws !== null) sendClosedAfterReplay(terminal);
+    });
   };
 
   wss.on('connection', (ws) => {
@@ -346,18 +448,25 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
           if (reqId) send({ reqId, error: 'Too many active terminals' });
           return;
         }
-        await prepared.submit(() => {
+        // aplus terminal-survive-runner-restart: started (if need be) before the approval re-check,
+        // so the create request leaves in the same turn as that check. No worker → opened here.
+        const worker = opts.terminalWorkers?.enabled ? await opts.terminalWorkers.ensureWorker() : null;
+        const meta: WorkerTerminalMeta = { userId: auditUserId, route: 'direct', machineId: null, openedAt: Date.now() };
+        await prepared.submit(async () => {
         let pty: PtySession;
+        const ptyOptions = {
+          userId: auditUserId,
+          shell: typeof openParams.shell === 'string' ? openParams.shell : undefined,
+          args: Array.isArray(openParams.args) ? openParams.args : undefined,
+          cwd: cwdDecision.cwd,
+          env: openParams.env && typeof openParams.env === 'object' ? openParams.env : undefined,
+          cols: Number.isInteger(openParams.cols) ? openParams.cols : undefined,
+          rows: Number.isInteger(openParams.rows) ? openParams.rows : undefined,
+        };
         try {
-          pty = createPtySession({
-            userId: auditUserId,
-            shell: typeof openParams.shell === 'string' ? openParams.shell : undefined,
-            args: Array.isArray(openParams.args) ? openParams.args : undefined,
-            cwd: cwdDecision.cwd,
-            env: openParams.env && typeof openParams.env === 'object' ? openParams.env : undefined,
-            cols: Number.isInteger(openParams.cols) ? openParams.cols : undefined,
-            rows: Number.isInteger(openParams.rows) ? openParams.rows : undefined,
-          });
+          pty = worker && opts.terminalWorkers
+            ? await opts.terminalWorkers.createSession(worker, { ...ptyOptions, meta })
+            : createPtySession(ptyOptions);
         } catch (e) {
           const message = e instanceof Error ? e.message : String(e);
           logger.debug(`[CONTROL SERVER] /terminal open spawn failed: ${message}`);
@@ -374,27 +483,22 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
         const terminal: DirectTerminal = { sessionId, pty, entry, userId: auditUserId, ws, graceTimer: null, closing: false };
         terminals.set(sessionId, terminal);
         bound = terminal;
-
-        // Buffer first, then send — to whichever WebSocket carries the
-        // terminal now, if any. Output while detached is buffered only, and
-        // replayed when a client attaches and resumes.
-        const emitFrame = (chunk: string) => {
-          const seq = entry.output.push(chunk);
-          try {
-            // A v2 frame carries its seq sealed.
-            sendOn(terminal.ws, { data: entry.binding
-              ? { event: 'terminal-frame', sessionId, data: entry.binding.sealOut({ kind: 'output', seq, data: chunk }) }
-              : { event: 'terminal-frame', sessionId, seq, data: machineKeyTerminalCipher(machineEncryption).seal(chunk) } });
-          } catch (e) {
-            logger.debug(`[CONTROL SERVER] /terminal frame encrypt failed: ${(e as Error).message}`);
-          }
-        };
+        if (isWorkerPtySession(pty)) {
+          // The worker holds the v2 key in memory so an adopting daemon can rebuild the binding.
+          terminal.meta = opening ? { ...meta, binding: opening.terminal.exportState() } : meta;
+          if (opening) pty.setMeta(terminal.meta).catch((e) => logger.debug(`[LOCAL-DIRECT-TERMINAL] setMeta failed: ${(e as Error).message}`));
+        }
+        wireTerminal(terminal);
 
         if (cwdDecision.fallback) {
           const banner = formatCwdFallbackBanner(cwdDecision);
           if (banner) {
-            emitFrame(banner);
-            recordBytesOut(sessionId, banner.length);
+            if (isWorkerPtySession(pty)) {
+              pty.inject(banner);
+            } else {
+              sendFrame(terminal, entry.output.push(banner), banner);
+              recordBytesOut(sessionId, banner.length);
+            }
           }
           logger.debug(
             `[LOCAL-DIRECT-TERMINAL] cwd-fallback session=${sessionId} user=${entry.userId} ` +
@@ -402,48 +506,10 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
           );
         }
 
-        const outputCoalescer = createTerminalOutputCoalescer({
-          sessionId,
-          emit: (chunk) => emitFrame(chunk),
-        });
-        pty.onData((chunk) => {
-          recordBytesOut(sessionId, chunk.length);
-          outputCoalescer.push(chunk);
-        });
-        pty.onExit((code, signal) => {
-          outputCoalescer.flush();
-          outputCoalescer.dispose();
-          // Kept in the registry, like a relay terminal, so a re-attaching
-          // client resumes into the last output and this exit (D4 B-R2).
-          if (!markDaemonTerminalSessionExited(sessionId, { code, signal })) {
-            // A restart close (aplus codexcli-daemon-restart-drain R23) already took it
-            // out of the registry; this terminal still answers its client's replay and
-            // must say it ended.
-            entry.exit = { code, signal };
-          }
-          // Audit every end, however it came about (exit, close, grace expiry, shutdown).
-          logger.debug(
-            `[LOCAL-DIRECT-TERMINAL] close session=${sessionId} user=${entry.userId} exitCode=${code} signal=${signal ?? 'null'} ` +
-            `bytesIn=${entry.bytesIn} bytesOut=${entry.bytesOut} durationMs=${Date.now() - entry.openedAt}`,
-          );
-          // Grace already expired: nobody is coming back for it.
-          if (terminals.get(sessionId) !== terminal) return;
-          if (terminal.closing) {
-            // The user closed it: say so if still attached, and let it go.
-            sendClosed(terminal);
-            forget(terminal);
-            return;
-          }
-          // Attached: say so (after any replay in flight). Detached: the
-          // buffered output and the exit wait out the grace window for a
-          // client that reattaches.
-          if (terminal.ws !== null) sendClosedAfterReplay(terminal);
-        });
-
         logger.debug(`[LOCAL-DIRECT-TERMINAL] open session=${sessionId} user=${entry.userId} pid=${pty.pid}`);
         if (reqId) send({ reqId, data: { ok: true, sessionId, caps: opening
-          ? { ...DIRECT_TERMINAL_CAPS, terminalBinding: { version: 1, proof: opening.proof } }
-          : DIRECT_TERMINAL_CAPS } });
+          ? { ...capsFor(pty), terminalBinding: { version: 1, proof: opening.proof } }
+          : capsFor(pty) } });
         });
         } finally {
           await preparation?.cancel();
@@ -486,7 +552,7 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
           resetPagedResume(boundTerminal.entry.output);
           recordTerminalActivity(sessionId);
           logger.debug(`[LOCAL-DIRECT-TERMINAL] bound attach session=${sessionId} exited=${exitOf(boundTerminal) !== null}`);
-          if (reqId) send({ reqId, data: { ok: true, sessionId, caps: DIRECT_TERMINAL_CAPS } });
+          if (reqId) send({ reqId, data: { ok: true, sessionId, caps: capsFor(boundTerminal.pty) } });
           // The attach names where its client stopped: the replay answers it right away.
           replyToBoundResume({
             sessionId,
@@ -524,7 +590,7 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
         resetPagedResume(terminal.entry.output);
         recordTerminalActivity(sessionId);
         logger.debug(`[LOCAL-DIRECT-TERMINAL] attach session=${sessionId} user=${terminal.userId} exited=${exitOf(terminal) !== null}`);
-        if (reqId) send({ reqId, data: { ok: true, sessionId, caps: DIRECT_TERMINAL_CAPS } });
+        if (reqId) send({ reqId, data: { ok: true, sessionId, caps: capsFor(terminal.pty) } });
         return;
       }
 
@@ -626,17 +692,64 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
     });
   });
 
+  /** Hands a worker terminal over to the next daemon: its latest binding state goes to the worker first. */
+  const release = async (terminal: DirectTerminal) => {
+    const pty = terminal.pty;
+    if (!isWorkerPtySession(pty)) return;
+    const binding = terminal.entry.binding;
+    const meta = terminal.meta && binding ? { ...terminal.meta, binding: binding.exportState() } : terminal.meta;
+    if (meta) await pty.setMeta(meta).catch((e) => logger.debug(`[LOCAL-DIRECT-TERMINAL] setMeta failed: ${(e as Error).message}`));
+    pty.detach();
+  };
+
   return {
     wss,
-    close: () =>
-      new Promise((resolve) => {
-        for (const terminal of [...terminals.values()]) {
-          forget(terminal);
-          if (exitOf(terminal) === null) void terminal.pty.terminate();
+    close: async () => {
+      const keeping = opts.terminalWorkers?.isKeeping() === true;
+      const released: Promise<void>[] = [];
+      for (const terminal of [...terminals.values()]) {
+        const survives = keeping && isWorkerPtySession(terminal.pty) && exitOf(terminal) === null;
+        if (survives) released.push(release(terminal));
+        if (terminal.graceTimer) clearTimeout(terminal.graceTimer);
+        terminal.graceTimer = null;
+        terminals.delete(terminal.sessionId);
+        removeDaemonTerminalSession(terminal.sessionId);
+        if (!survives && exitOf(terminal) === null) void terminal.pty.terminate();
+      }
+      if (released.length > 0) {
+        await Promise.all(released);
+        logger.debug(`[LOCAL-DIRECT-TERMINAL] left ${released.length} terminal(s) in their workers for the next daemon`);
+      }
+      for (const ws of sockets) ws.terminate();
+      sockets.clear();
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+    },
+    adopt: (adopted) => {
+      for (const { session, dump } of adopted) {
+        if (dump.meta.route !== 'direct' || terminals.has(dump.id)) {
+          // Only direct terminals are kept for a restart; anything else has nobody to reconnect.
+          void session.terminate().finally(() => session.forget());
+          continue;
         }
-        for (const ws of sockets) ws.terminate();
-        sockets.clear();
-        wss.close(() => resolve());
-      }),
+        const entry = addDaemonTerminalSession(dump.id, session, { userId: dump.meta.userId, machineId: dump.meta.machineId, route: 'direct' });
+        for (const frame of dump.frames) entry.output.pushAt(frame.seq, frame.chunk);
+        if (dump.meta.binding) {
+          try {
+            entry.binding = restoreBoundTerminal({ sessionId: dump.id, state: dump.meta.binding });
+          } catch (e) {
+            logger.debug(`[LOCAL-DIRECT-TERMINAL] adopted binding unreadable session=${dump.id}: ${(e as Error).message}`);
+            removeDaemonTerminalSession(dump.id);
+            void session.terminate().finally(() => session.forget());
+            continue;
+          }
+        }
+        const terminal: DirectTerminal = { sessionId: dump.id, pty: session, entry, userId: dump.meta.userId, ws: null, graceTimer: null, closing: false, meta: dump.meta };
+        terminals.set(dump.id, terminal);
+        wireTerminal(terminal);
+        // HR2: nobody is attached yet — the client has the detach grace, counted from now, to come back.
+        detach(terminal);
+        logger.debug(`[LOCAL-DIRECT-TERMINAL] adopted session=${dump.id} pid=${dump.pid} lastSeq=${dump.lastSeq} exited=${dump.exit !== null}`);
+      }
+    },
   };
 }

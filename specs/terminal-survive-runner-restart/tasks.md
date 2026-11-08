@@ -18,11 +18,11 @@
 - [x] T8. `terminalWorker/workerClient.ts`(launch·connect·hello·요청/응답) + `workerPtySession.ts`(PtySession 구현) → 통합 테스트
 
 ## Phase 3 — 데몬 배선
-- [ ] T9. `terminalWorker/adoption.ts` 시작 시 분류·입양·리퍼(spec HR6 규칙) → 단위(가짜 프로세스 테이블) + 통합(고아·부팅 ID·비호환)
-- [ ] T10. 세션 생성 경로 선택(`remoteTerminal.ts`), 직결 경로 입양 등록·detach grace·`caps.survive`(`controlServerTerminalWs.ts`), 릴레이 경로 유지 안 함 → 기존 테스트 회귀 + 새 케이스
-- [ ] T11. 드레인 keep/close 결정·lifecycle 광고·busy 집계·`finalizeReady` 분기·설치본 프로토콜 질의(`restartDrainRuntime.ts`·`restartDrainLifecycle.ts`·`run.ts`) → restartDrain 테스트 + 통합(keep 드레인)
-- [ ] T12. 종료 경로: SIGTERM/stop = 워커 shutdown, 핸드오프 = detach, `TerminalWsRoute.close` 분기, `daemonState.terminalSurvival` 광고, 플래그 꺼짐 = 지금 경로 + 시작 리퍼 → 통합(stop은 셸 종료, SIGKILL 뒤 생존·입양)
-- [ ] T12a. (HR10) `doctor.ts` `terminal-worker` 분류·`doctor clean` 제외, `happy daemon status` 워커 줄, `terminalSurvival` 진단 필드(workers·workerVersion·lastAdoption) → 단위 테스트
+- [x] T9. `terminalWorker/adoption.ts` 시작 시 분류·입양·리퍼(spec HR6 규칙) → 단위(가짜 프로세스 테이블) + 통합(고아·부팅 ID·비호환)
+- [x] T10. 세션 생성 경로 선택(`remoteTerminal.ts`), 직결 경로 입양 등록·detach grace·`caps.survive`(`controlServerTerminalWs.ts`), 릴레이 경로 유지 안 함 → 기존 테스트 회귀 + 새 케이스
+- [x] T11. 드레인 keep/close 결정·lifecycle 광고·busy 집계·`finalizeReady` 분기·설치본 프로토콜 질의(`restartDrainRuntime.ts`·`restartDrainLifecycle.ts`·`run.ts`) → restartDrain 테스트 + 통합(keep 드레인)
+- [x] T12. 종료 경로: SIGTERM/stop = 워커 shutdown, 핸드오프 = detach, `TerminalWsRoute.close` 분기, `daemonState.terminalSurvival` 광고, 플래그 꺼짐 = 지금 경로 + 시작 리퍼 → 통합(stop은 셸 종료, SIGKILL 뒤 생존·입양)
+- [x] T12a. (HR10) `doctor.ts` `terminal-worker` 분류·`doctor clean` 제외, `happy daemon status` 워커 줄, `terminalSurvival` 진단 필드(workers·workerVersion·lastAdoption) → 단위 테스트
 
 ## Phase 4 — 문서·마무리
 - [ ] T13. `docs/terminal-worker.md`, context 갱신

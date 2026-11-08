@@ -238,6 +238,15 @@ export async function startTerminalWorker(options: TerminalWorkerOptions): Promi
                 if (terminal.exit === null && isRecord(args) && typeof args.data === 'string') terminal.pty.write(args.data)
                 return {}
             }
+            case 'inject': {
+                // Daemon-made output (the cwd fallback banner) numbered in line with the shell's.
+                const terminal = terminalOf(args)
+                if (terminal.exit === null && isRecord(args) && typeof args.data === 'string') {
+                    terminal.coalescer.push(args.data)
+                    terminal.coalescer.flush()
+                }
+                return {}
+            }
             case 'resize': {
                 const terminal = terminalOf(args)
                 if (terminal.exit === null && isRecord(args) && Number.isInteger(args.cols) && Number.isInteger(args.rows)) {

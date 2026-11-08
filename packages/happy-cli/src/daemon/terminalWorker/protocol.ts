@@ -94,6 +94,12 @@ export interface WorkerCreateArgs {
     bufferFrames?: number
 }
 
+/**
+ * Version 1 ops beyond the frozen ones: `create` → WorkerCreateResult, `write {id,data}`,
+ * `inject {id,data}` (daemon-made output, numbered with the shell's), `resize {id,cols,rows}`,
+ * `signal {id,signal}`, `terminate {id,graceMs?}` → {outcome}, `dump {id}` → WorkerDumpResult,
+ * `setMeta {id,meta}`, `forget {id}` (an ended terminal nobody needs).
+ */
 export interface WorkerCreateResult {
     pid: number
 }
