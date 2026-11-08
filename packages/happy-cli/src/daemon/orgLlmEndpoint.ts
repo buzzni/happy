@@ -150,7 +150,7 @@ export type OrgLlmEndpointFetch = (url: string, init: RequestInit) => Promise<Re
 export type OrgLlmEndpointProbe = (input: { url: string; token?: string }) => Promise<OrgLlmEndpointProbeResult>
 
 /** An error's name and code only: its message can carry the address and the credential. */
-function failureReason(error: unknown): string {
+export function failureReason(error: unknown): string {
     const name = error instanceof Error && /^[A-Za-z]{1,40}$/.test(error.name) ? error.name : typeof error
     const code = [(error as { code?: unknown } | null)?.code, (error as { cause?: { code?: unknown } } | null)?.cause?.code]
         .find((candidate): candidate is string => typeof candidate === 'string' && /^[A-Z0-9_]{1,32}$/.test(candidate))
