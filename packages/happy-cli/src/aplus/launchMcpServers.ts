@@ -12,8 +12,11 @@
  * them: log lines and drop reports carry names and counts only, and the seed is not one of the keys
  * `captureSaycodeAgentEnvironment` records.
  */
+import { readFileSync, realpathSync } from 'node:fs'
+import { join } from 'node:path'
 import { logger } from '@/ui/logger'
 import { CUA_DRIVER_SERVER } from '@/toolPolicy/cuaShadow'
+import { LAUNCH_MCP_SERVERS_ENV, takeLaunchMcpServersSeed } from './launchMcpSeed'
 import type { AplusMcpServersMap } from './fetchAplusMcpServers'
 import type { McpServersMap } from './mergeAplusMcpServers'
 
@@ -34,8 +37,7 @@ export const LAUNCH_MCP_SERVERS_CAPABILITY = 1 as const
 /** Servers the session process itself names. An injected server never takes one of these. */
 export const RESERVED_LAUNCH_MCP_SERVER_NAMES: readonly string[] = ['happy', CUA_DRIVER_SERVER]
 
-/** One-shot seed, scrubbed from every child like the other `HAPPY_INITIAL_` seeds (childEnv.ts). */
-export const LAUNCH_MCP_SERVERS_ENV = 'HAPPY_INITIAL_LAUNCH_MCP_SERVERS'
+export { LAUNCH_MCP_SERVERS_ENV }
 
 const SUPPORTED_AGENTS = new Set(['claude', 'codex'])
 const MAX_SERVERS = 8
@@ -167,13 +169,12 @@ export function prepareLaunchMcpServers(input: {
 }
 
 /**
- * The session process's half: read the seed once and delete it, so neither the agent nor its tool
- * shells see the values. The daemon validated it; it is checked again, and anything that no longer
+ * The session process's half: the seed the CLI bootstrap already took out of the environment
+ * (launchMcpSeed.ts), or the environment itself, once — neither the agent nor its tool shells see it. The daemon validated it; it is checked again, and anything that no longer
  * parses is read as nothing rather than failing the session.
  */
 export function consumeLaunchMcpServersSeed(env: NodeJS.ProcessEnv): Record<string, LaunchMcpServer> {
-    const raw = env[LAUNCH_MCP_SERVERS_ENV]
-    delete env[LAUNCH_MCP_SERVERS_ENV]
+    const raw = takeLaunchMcpServersSeed(env)
     if (!raw) return {}
     let parsed: unknown
     try {
@@ -183,6 +184,54 @@ export function consumeLaunchMcpServersSeed(env: NodeJS.ProcessEnv): Record<stri
         return {}
     }
     return parseLaunchMcpServers(parsed)?.servers ?? {}
+}
+
+function jsonFile(path: string): unknown {
+    try {
+        return JSON.parse(readFileSync(path, 'utf8'))
+    } catch {
+        return undefined
+    }
+}
+
+/**
+ * Names of the MCP servers Claude itself loads for `cwd`: user scope (`.claude.json` `mcpServers`),
+ * local scope (`.claude.json` `projects[cwd].mcpServers`) and project scope (`cwd/.mcp.json`). An
+ * SDK / `--mcp-config` entry of the same name replaces the user's server (cuaShadow.ts, measured
+ * 2026-10-22), so an injected server must stand aside for these. Every scope is counted whatever
+ * `settingSources` the session loads: standing aside too often only costs the injected server.
+ */
+export function readClaudeMcpServerNames(input: { configDir: string; cwd: string }): string[] {
+    const names = new Set<string>()
+    const add = (servers: unknown) => {
+        if (isRecord(servers)) for (const name of Object.keys(servers)) names.add(name)
+    }
+    const cwds = new Set([input.cwd])
+    try { cwds.add(realpathSync(input.cwd)) } catch { /* a missing cwd has no project config */ }
+    const config = jsonFile(join(input.configDir, '.claude.json'))
+    if (isRecord(config)) {
+        add(config.mcpServers)
+        const projects = isRecord(config.projects) ? config.projects : {}
+        for (const cwd of cwds) {
+            const project = projects[cwd]
+            if (isRecord(project)) add(project.mcpServers)
+        }
+    }
+    for (const cwd of cwds) {
+        const project = jsonFile(join(cwd, '.mcp.json'))
+        if (isRecord(project)) add(project.mcpServers)
+    }
+    return [...names]
+}
+
+/**
+ * The agent's own configured server names the daemon can read for its `name-conflict` answer: Claude's
+ * (`CLAUDE_CONFIG_DIR` from the child's environment, else the home directory). Codex `config.toml` is
+ * read by the app-server only, so its conflicts are enforced by the session process and not reported.
+ */
+export function agentMcpServerNames(agent: string, input: { env: Record<string, string | undefined>; homeDir: string; cwd: string }): string[] {
+    if (agent !== 'claude') return []
+    return readClaudeMcpServerNames({ configDir: input.env.CLAUDE_CONFIG_DIR || input.homeDir, cwd: input.cwd })
 }
 
 /** Claude's `mcpServers` shape (SDK option and `--mcp-config`). */

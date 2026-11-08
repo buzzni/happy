@@ -99,7 +99,7 @@ import { takeSessionSourceFromEnv } from '@/utils/sessionSource';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { createManagedFollowUpHandler } from '@/managed/managedFollowUp';
 import { consumeOutputFormatSeed } from './structuredOutput';
-import { claudeLaunchMcpServers, consumeLaunchMcpServersSeed, launchMcpServersBeside } from '@/aplus/launchMcpServers';
+import { claudeLaunchMcpServers, consumeLaunchMcpServersSeed, launchMcpServersBeside, readClaudeMcpServerNames } from '@/aplus/launchMcpServers';
 import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodePromptBlocks, consumePendingInitialSaycodeSystemPromptEnabled, defaultClaudeModelForRuntime, normalizeClaudeModelForRuntime, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
 import {
     createSessionModelPinPublisher,
@@ -227,6 +227,9 @@ export type RunnerPrincipal =
     | { kind: 'managed'; startup: ManagedStartup };
 
 export async function runClaude(principal: RunnerPrincipal, options: StartOptions = {}): Promise<void> {
+    // Desktop extension MCP servers for this launch (aplus/launchMcpServers.ts): first, before anything copies
+    // the environment or starts a subprocess; usually the CLI bootstrap already took them into memory.
+    const launchMcpServers = consumeLaunchMcpServersSeed(process.env);
     const inputEvidenceOption = consumeInputEvidenceOption(process.env);
     await initializeScopeReportSigner();
     const scopeLaunch = takeScopeLaunchBootstrap();
@@ -1037,8 +1040,6 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // validated it; a seed that does not parse is dropped, and the session runs without a format.
     const outputFormat = consumeOutputFormatSeed(process.env) ?? undefined;
     if (outputFormat) logger.debug('[START] Structured output requested for this session');
-    // Desktop extension MCP servers for this launch (aplus/launchMcpServers.ts): read once, removed from the env.
-    const launchMcpServers = consumeLaunchMcpServersSeed(process.env);
     const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
         process.env,
     );
@@ -2103,8 +2104,12 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // While the shadow runs, the hook steps aside for `cua-driver`: an org server of that name must not displace it.
     const shadowSafe = <T,>(servers: Record<string, T>): Record<string, T> => (cuaUpstream ? withoutCuaDriver(servers) : servers);
     const aplusMcpServers = shadowSafe(initialAplusMcpSnapshot?.servers ?? {});
-    // Under every server this session already has: an organization server that arrives later wins the name too.
-    const sessionLaunchMcpServers = launchMcpServersBeside(launchMcpServers, Object.keys(aplusMcpServers));
+    // Under every server this session already has — the organization's (one that arrives later wins the name too)
+    // and the user's own user/local/project servers, which an `--mcp-config` entry of the same name would replace.
+    const sessionLaunchMcpServers = launchMcpServersBeside(launchMcpServers, [
+        ...Object.keys(aplusMcpServers),
+        ...readClaudeMcpServerNames({ configDir: process.env.CLAUDE_CONFIG_DIR || homedir(), cwd: workingDirectory }),
+    ]);
     if (Object.keys(launchMcpServers).length > 0) {
         logger.debug(`[launch-mcp] Claude adds ${Object.keys(sessionLaunchMcpServers).join(',') || '(none)'} of ${Object.keys(launchMcpServers).length}`);
     }

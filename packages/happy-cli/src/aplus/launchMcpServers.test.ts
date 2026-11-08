@@ -1,11 +1,17 @@
 /**
  * Saycode Desktop extension-session-and-worktree-hooks — `launchMcpServers` on spawn and resume.
  */
+import { existsSync, mkdirSync, mkdtempSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { logger } from '@/ui/logger'
+import { LAUNCH_MCP_SERVERS_FILE_ENV, captureLaunchMcpServersSeed, stageLaunchMcpServersSeedFile } from './launchMcpSeed'
 import {
     LAUNCH_MCP_SERVERS_ENV,
     RESERVED_LAUNCH_MCP_SERVER_NAMES,
+    agentMcpServerNames,
+    readClaudeMcpServerNames,
     claudeLaunchMcpServers,
     codexLaunchMcpServers,
     consumeLaunchMcpServersSeed,
@@ -180,6 +186,78 @@ describe('session process side', () => {
             docs: { command: 'bridge', args: ['--url', 'https://mcp.example.com/mcp'] },
         })
         expect(bridge).toHaveBeenCalledWith({ docs: { type: 'http', url: 'https://mcp.example.com/mcp', headers: { Authorization: 'Bearer x' } } })
+    })
+})
+
+describe('seed transport', () => {
+    const seedEnv = () => prepareLaunchMcpServers({ request: parseLaunchMcpServers({ files: stdio() }), agent: 'claude', lookupServerNames: async () => null }).environment
+
+    it('is taken out of the environment at the CLI bootstrap and handed to the runner from memory', () => {
+        const env: NodeJS.ProcessEnv = { ...seedEnv() }
+        captureLaunchMcpServersSeed(env)
+        expect(env[LAUNCH_MCP_SERVERS_ENV]).toBeUndefined()
+        // The runner later finds nothing in the environment and still gets the servers, once.
+        expect(Object.keys(consumeLaunchMcpServersSeed(env))).toEqual(['files'])
+        expect(consumeLaunchMcpServersSeed(env)).toEqual({})
+    })
+
+    it('goes by owner-only file for a tmux launch, which the session process reads and removes', () => {
+        const root = mkdtempSync(join(tmpdir(), 'launch-mcp-stage-'))
+        const staged = stageLaunchMcpServersSeedFile({ ...seedEnv(), OTHER: '1' }, join(root, 'tmp'))
+        const file = staged.environment[LAUNCH_MCP_SERVERS_FILE_ENV]
+        expect(staged.environment[LAUNCH_MCP_SERVERS_ENV]).toBeUndefined()
+        expect(staged.environment.OTHER).toBe('1')
+        expect(statSync(file).mode & 0o777).toBe(0o600)
+        expect(JSON.stringify(staged.environment)).not.toContain('server.js')
+
+        const env: NodeJS.ProcessEnv = { ...staged.environment }
+        expect(Object.keys(consumeLaunchMcpServersSeed(env))).toEqual(['files'])
+        expect(env[LAUNCH_MCP_SERVERS_FILE_ENV]).toBeUndefined()
+        expect(existsSync(dirname(file))).toBe(false)
+    })
+
+    it('removes the staged file when the tmux launch did not happen', () => {
+        const root = mkdtempSync(join(tmpdir(), 'launch-mcp-stage-'))
+        const staged = stageLaunchMcpServersSeedFile(seedEnv(), root)
+        const file = staged.environment[LAUNCH_MCP_SERVERS_FILE_ENV]
+        staged.cleanup()
+        expect(existsSync(dirname(file))).toBe(false)
+        expect(stageLaunchMcpServersSeedFile({ OTHER: '1' }, root).environment).toEqual({ OTHER: '1' })
+    })
+})
+
+describe("the agent's own MCP servers", () => {
+    function claudeHome() {
+        const configDir = mkdtempSync(join(tmpdir(), 'launch-mcp-claude-'))
+        const cwd = join(configDir, 'project')
+        mkdirSync(cwd)
+        writeFileSync(join(configDir, '.claude.json'), JSON.stringify({
+            mcpServers: { github: { command: 'gh-mcp', env: { GITHUB_TOKEN: 'user-secret' } } },
+            projects: { [cwd]: { mcpServers: { db: { command: 'db-mcp' } } }, '/elsewhere': { mcpServers: { other: {} } } },
+        }))
+        writeFileSync(join(cwd, '.mcp.json'), JSON.stringify({ mcpServers: { docs: { type: 'http', url: 'https://x' } } }))
+        return { configDir, cwd }
+    }
+
+    it('reads Claude user, local and project server names', () => {
+        expect(readClaudeMcpServerNames(claudeHome()).sort()).toEqual(['db', 'docs', 'github'])
+        expect(readClaudeMcpServerNames({ configDir: '/nonexistent', cwd: '/nonexistent' })).toEqual([])
+    })
+
+    it('takes CLAUDE_CONFIG_DIR from the child environment and has no reader for Codex', () => {
+        const { configDir, cwd } = claudeHome()
+        expect(agentMcpServerNames('claude', { env: { CLAUDE_CONFIG_DIR: configDir }, homeDir: '/nonexistent', cwd })).toContain('github')
+        expect(agentMcpServerNames('claude', { env: {}, homeDir: configDir, cwd })).toContain('github')
+        expect(agentMcpServerNames('codex', { env: { CLAUDE_CONFIG_DIR: configDir }, homeDir: configDir, cwd })).toEqual([])
+    })
+
+    it('lets a user or project server keep its name: the injected one is dropped and reported', async () => {
+        const home = claudeHome()
+        const request = parseLaunchMcpServers({ github: stdio(), docs: http(), files: stdio() })
+        const prepared = prepareLaunchMcpServers({ request, agent: 'claude', lookupServerNames: async () => agentMcpServerNames('claude', { env: {}, homeDir: home.configDir, cwd: home.cwd }) })
+        expect(await prepared.report()).toEqual([{ name: 'github', reason: 'name-conflict' }, { name: 'docs', reason: 'name-conflict' }])
+        const servers = parseLaunchMcpServers({ github: stdio(), docs: http(), files: stdio() })!.servers
+        expect(Object.keys(launchMcpServersBeside(servers, readClaudeMcpServerNames(home)))).toEqual(['files'])
     })
 })
 

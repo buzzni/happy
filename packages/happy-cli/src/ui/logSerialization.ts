@@ -7,6 +7,12 @@
 import { inspect } from 'node:util'
 
 const SENSITIVE_LOG_KEY = /(^|_)(authorization|token|secret|password|passphrase|api_key|private_key|encryption_key|access_key)($|_)/i
+/**
+ * A child_process error carries the whole command line: `spawnargs` (spawn) and `cmd` (exec). Argv can
+ * hold secrets — tmux takes a session's environment as `-e NAME=value` — so an error keeps its message
+ * (`spawn tmux ENOENT`) and loses these.
+ */
+const COMMAND_LINE_ERROR_KEY = /^(spawnargs|cmd)$/i
 
 function normalizeLogKey(key: string): string {
   return key.replace(/([a-z0-9])([A-Z])/g, '$1_$2').replace(/[^a-zA-Z0-9]+/g, '_')
@@ -55,7 +61,7 @@ function sanitizeLogError(error: Error, seen: WeakMap<object, unknown>): Error {
   for (const key of keys) {
     if (key === 'name' || key === 'message' || key === 'stack') continue
     Object.defineProperty(sanitized, key, {
-      value: SENSITIVE_LOG_KEY.test(normalizeLogKey(key))
+      value: SENSITIVE_LOG_KEY.test(normalizeLogKey(key)) || COMMAND_LINE_ERROR_KEY.test(key)
         ? '[REDACTED]'
         : sanitizeLogValue((error as unknown as Record<string, unknown>)[key], seen),
       enumerable: true, configurable: true, writable: true,

@@ -134,7 +134,9 @@ describe('배선 가드: spawn 이 선택을 존중하고 검증하는가', () =
     expect(text).toContain('const managedAiCredentialEnvironment = await applyManualPersonal(options.aiAuthSelection, launchAuthorityEnvironment,')
     expect(text).toMatch(/const tmuxEnv = applyAppliedAiAuthSourceEnv\(/)
     expect(text).toMatch(/const spawnEnvironment = applyAppliedAiAuthSourceEnv\(/)
-    expect(text).toMatch(/\}, tmuxEnv, start => launchManagedAiCredentialSession\(launchAuthorityEnvironment, \(\) => \{\s*if \(workspaceLaunch\) workspaceLaunch.submitted = true;\s*ownedStartGuard\.submitted\(options\); return start\(\);\s*\}\)\)/)
+    // tmux: the verified env, with only the launch MCP seed moved from `-e` argv to an owner-only file.
+    expect(text).toContain("const tmuxLaunchMcp = stageLaunchMcpServersSeedFile(tmuxEnv, join(configuration.happyHomeDir, 'tmp'));")
+    expect(text).toMatch(/\}, tmuxLaunchMcp\.environment, start => launchManagedAiCredentialSession\(launchAuthorityEnvironment, \(\) => \{\s*if \(workspaceLaunch\) workspaceLaunch.submitted = true;\s*ownedStartGuard\.submitted\(options\); return start\(\);\s*\}\)\)/)
     expect(text).toMatch(/env: spawnEnvironment,\s*managedAiCredentialEnvironment,\s*launchAuthorityEnvironment,/)
     expect(text).toMatch(/launchManagedAiCredentialSession = aiCredentialRuntime\.launchSession/)
     const regular = text.slice(text.indexOf('const happyProcess = prepared?.childProcess'), text.indexOf('scopeReports?.attach(happyProcess);'))

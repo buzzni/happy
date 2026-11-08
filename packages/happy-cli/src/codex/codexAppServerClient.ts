@@ -1875,18 +1875,47 @@ export class CodexAppServerClient {
 
     private cuaShadow: ((nativeServers: unknown) => Record<string, unknown> | null) | null = null;
 
+    /**
+     * Desktop extension MCP servers in this session's map (aplus/launchMcpServers.ts). They stand aside
+     * for a user `config.toml` server of the same name: Codex deep-merges the thread map into the native
+     * one, so the user's entry would keep its `env` (credentials) and run the injected command.
+     */
+    setLaunchMcpServerNames(names: readonly string[]): void {
+        this.launchMcpServerNames = [...names];
+    }
+
+    private launchMcpServerNames: string[] = [];
+
     private async buildThreadConfig(
         mcpServers?: Record<string, unknown>,
         writableRoots?: readonly string[],
         cwd = process.cwd(),
     ): Promise<Record<string, unknown> | null> {
         const config: Record<string, unknown> = {};
-        if (mcpServers) config.mcp_servers = mcpServers;
         // Never log this response: native config can contain credentials.
         let nativeRead: Promise<unknown> | null = null;
         const readNativeServers = () => nativeRead ??= (this.request('config/read', { cwd, includeLayers: false }, 3000) as Promise<{
             config?: { mcp_servers?: unknown };
         }>).then((effective) => effective.config?.mcp_servers);
+        const requested = mcpServers;
+        const injected = requested ? this.launchMcpServerNames.filter((name) => Object.hasOwn(requested, name)) : [];
+        if (mcpServers && injected.length > 0) {
+            let native: unknown;
+            let unreadable = false;
+            try {
+                native = await readNativeServers();
+            } catch {
+                unreadable = true;
+            }
+            // A config Happy cannot read may hold any of them: none is applied rather than one inheriting user env.
+            const nativeNames = native !== null && typeof native === 'object' && !Array.isArray(native) ? Object.keys(native) : [];
+            const yielded = unreadable ? injected : injected.filter((name) => nativeNames.includes(name));
+            if (yielded.length > 0) {
+                mcpServers = Object.fromEntries(Object.entries(mcpServers).filter(([name]) => !yielded.includes(name)));
+                logger.debug(`[launch-mcp] Codex config.toml holds ${unreadable ? '(unreadable)' : yielded.join(',')}; not applied: ${yielded.join(',')}`);
+            }
+        }
+        if (mcpServers) config.mcp_servers = mcpServers;
         if (this.isolatedAutomationContext) {
             const native = await readNativeServers();
             if (native !== undefined && native !== null && (typeof native !== 'object' || Array.isArray(native))) {

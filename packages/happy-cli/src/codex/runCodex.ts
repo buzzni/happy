@@ -257,6 +257,9 @@ export async function runCodex(opts: {
         sessionKind: LessonTurnKind;
     };
 }): Promise<void> {
+    // Desktop extension MCP servers for this launch (aplus/launchMcpServers.ts): first, before anything copies
+    // the environment or starts a subprocess; usually the CLI bootstrap already took them into memory.
+    const launchMcpServers = consumeLaunchMcpServersSeed(process.env);
     const inputEvidenceOption = consumeInputEvidenceOption(process.env);
     await initializeScopeReportSigner();
     const scopeLaunch = takeScopeLaunchBootstrap();
@@ -614,8 +617,6 @@ export async function runCodex(opts: {
     // A plan session runs the grant's model; the gateway overwrites any other choice anyway.
     const explicitInitialModel = agentPlanLaunch?.descriptor.model ?? opts.initialModel ?? pendingInitialModel ?? reconnectPin.model;
     const rawInitialEffortSeed = consumePendingInitialEffort(process.env) ?? reconnectPin.effort;
-    // Desktop extension MCP servers for this launch (aplus/launchMcpServers.ts): read once, removed from the env.
-    const launchMcpServers = consumeLaunchMcpServersSeed(process.env);
     if (rawInitialEffortSeed && !isSupportedCodexReasoningEffort(rawInitialEffortSeed)) {
         logger.debug(`[Codex] Ignoring invalid initial effort seed: ${rawInitialEffortSeed}`);
     }
@@ -2277,6 +2278,9 @@ export async function runCodex(opts: {
         ...codexLaunchMcpServers(sessionLaunchMcpServers, (servers) => bridgeAplusMcpServers(servers, bridgeOptions)),
         ...internalMcpServers,
     };
+    // `config.toml` servers are only known through the app-server's `config/read`; the client drops these names
+    // there when the user's config holds them (Codex would keep the user's env and run our command).
+    if (Object.keys(sessionLaunchMcpServers).length > 0) client.setLaunchMcpServerNames(Object.keys(sessionLaunchMcpServers));
     const listExternalServices = (mcpServers: Record<string, unknown>) => listExpectedMcpServices({
         expectedConnectors: readExpectedConnectors(),
         expectedMcpServices: readExpectedMcpServices(),

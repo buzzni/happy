@@ -148,7 +148,8 @@ import { organizationResumeRefusal, resumeSetupTokenEnvironment, shareResumeInFl
 import type { AiAuthSource } from '@/usage/aiAuthSource';
 import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch, resumeLaunchAgent } from '@/resume/handleResumeCommand';
-import { prepareLaunchMcpServers, type LaunchMcpRequest, type PreparedLaunchMcpServers } from '@/aplus/launchMcpServers';
+import { agentMcpServerNames, prepareLaunchMcpServers, type LaunchMcpRequest, type PreparedLaunchMcpServers } from '@/aplus/launchMcpServers';
+import { stageLaunchMcpServersSeedFile } from '@/aplus/launchMcpSeed';
 import { fetchAplusMcpServerNames } from '@/aplus/fetchAplusMcpServers';
 import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
 import { decodeBase64, decrypt, encodeBase64, encrypt } from '@/api/encryption';
@@ -2517,7 +2518,10 @@ export async function startDaemon(): Promise<void> {
         launchMcp = prepareLaunchMcpServers({
           request: options.launchMcpServers,
           agent: options.agent ?? 'claude',
-          lookupServerNames: () => fetchAplusMcpServerNames(extraEnv, options.happyToken ?? credentials.token, machineId),
+          lookupServerNames: async () => [
+            ...await fetchAplusMcpServerNames(extraEnv, options.happyToken ?? credentials.token, machineId) ?? [],
+            ...agentMcpServerNames(options.agent ?? 'claude', { env: { ...process.env, ...extraEnv }, homeDir: os.homedir(), cwd: directory }),
+          ],
         });
         Object.assign(extraEnv, launchMcp.environment);
 
@@ -2615,11 +2619,13 @@ export async function startDaemon(): Promise<void> {
             }));
           }
 
+          // tmux passes the environment as `new-window -e NAME=value` argv: the launch MCP seed goes by owner-only file.
+          const tmuxLaunchMcp = stageLaunchMcpServersSeedFile(tmuxEnv, join(configuration.happyHomeDir, 'tmp'));
           const tmuxResult = await tmux.spawnInTmux([fullCommand], {
             sessionName: tmuxSessionName,
             windowName: windowName,
             cwd: directory
-          }, tmuxEnv, start => launchManagedAiCredentialSession(launchAuthorityEnvironment, () => {
+          }, tmuxLaunchMcp.environment, start => launchManagedAiCredentialSession(launchAuthorityEnvironment, () => {
             if (workspaceLaunch) workspaceLaunch.submitted = true;
             ownedStartGuard.submitted(options); return start();
           }));
@@ -2671,6 +2677,7 @@ export async function startDaemon(): Promise<void> {
               type: 'error', errorMessage: 'Owned tmux start outcome is unknown',
               ...(contextWorkspace ? { code: 'workspace-start-unconfirmed' } : {}),
             }));
+            tmuxLaunchMcp.cleanup();
             logger.debug(`[DAEMON RUN] Failed to spawn in tmux: ${tmuxResult.error}, falling back to regular spawning`);
             useTmux = false;
           }
@@ -3498,7 +3505,10 @@ export async function startDaemon(): Promise<void> {
         const resumeLaunchMcp = prepareLaunchMcpServers({
           request: options?.launchMcpServers,
           agent: resumeAgent,
-          lookupServerNames: () => fetchAplusMcpServerNames(resumedEnvironment, credentialDecision.token, machineId),
+          lookupServerNames: async () => [
+            ...await fetchAplusMcpServerNames(resumedEnvironment, credentialDecision.token, machineId) ?? [],
+            ...agentMcpServerNames(resumeAgent, { env: resumedEnvironment, homeDir: os.homedir(), cwd: launch.cwd }),
+          ],
         });
         Object.assign(resumedEnvironment, resumeLaunchMcp.environment);
 
