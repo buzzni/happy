@@ -142,6 +142,7 @@ import { createSessionOrgRequirementsGate } from '@/orgRequirements/sessionGate'
 import { orgRequirementsDirectory } from '@/orgRequirements/store';
 import { createClaudeOrgRequirements, orgTitleModel, stripModelSelectionEnv, type OrgModelRequest } from './claudeOrgRequirements';
 import { messageModelOrigin } from '@/orgRequirements/resolve';
+import { assertRemoteOnlyForOrgEndpoint } from './utils/orgEndpointLocalMode';
 
 /**
  * How long a confirmed initial prompt waits for its acknowledgement before the
@@ -299,6 +300,9 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     if (options.startedBy === 'daemon' && options.startingMode === 'local') {
         throw new Error('Daemon-spawned sessions cannot use local/interactive mode. Use --happy-starting-mode remote or spawn sessions directly from terminal.');
     }
+
+    // An organization LLM endpoint session cannot be handed to the terminal's Claude (aplus specs/org-llm-endpoints r3).
+    assertRemoteOnlyForOrgEndpoint(process.env, options.startingMode ?? 'local');
 
     // Set backend for offline warnings (before any API calls)
     connectionState.setBackend('Claude');

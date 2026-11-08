@@ -571,3 +571,43 @@ describe('/btw side question on the live provider', () => {
         expect(await handlers.get('side-question')!({ question: 'after exit?' })).toEqual({ success: false, error: 'side-question:not-running' });
     });
 });
+
+describe('an organization LLM endpoint session never leaves remote mode (aplus specs/org-llm-endpoints r3)', () => {
+    it('refuses the switch to the terminal with a message, keeps running, and switches again once the session is no longer an endpoint one', async () => {
+        vi.stubEnv('HAPPY_AI_AUTH_SOURCE', 'org-endpoint');
+        try {
+            const queue = new MessageQueue2<EnhancedMode>(hashObject);
+            const handlers = new Map<string, () => Promise<unknown>>();
+            const events: Array<{ type: string; message?: string }> = [];
+            const client = {
+                sessionId: 'endpoint-local-mode-test',
+                rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+                updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+                setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+                setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+                applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(),
+                sendSessionEvent: vi.fn((event: { type: string; message?: string }) => events.push(event)),
+                setInputMode: vi.fn(),
+            };
+            const session = {
+                lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+                cancelLessonReview: vi.fn(),
+                sessionId: null, path: process.cwd(), queue, client, mcpServers: {},
+                api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+                consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+            } as unknown as Session;
+            let settled = false;
+            const launcher = claudeRemoteLauncher(session).finally(() => { settled = true; });
+            await vi.waitFor(() => expect(handlers.has('switch')).toBe(true));
+            const answer = await handlers.get('switch')!();
+            expect(answer).toMatchObject({ success: false, error: expect.stringContaining('터미널') });
+            expect(events).toContainEqual({ type: 'message', message: (answer as { error: string }).error });
+            expect(client.setInputMode).not.toHaveBeenCalledWith('transitioning');
+            await new Promise(resolve => setTimeout(resolve, 50));
+            expect(settled).toBe(false);
+            vi.unstubAllEnvs();
+            await handlers.get('switch')!();
+            await expect(launcher).resolves.toBe('switch');
+        } finally { vi.unstubAllEnvs(); }
+    });
+});

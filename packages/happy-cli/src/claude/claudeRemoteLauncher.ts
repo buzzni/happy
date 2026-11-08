@@ -80,6 +80,7 @@ import {
     createClaudeTransientRetry,
 } from './claudeTransientRetry';
 import { SETUP_TOKEN_BINDING_ENV, SETUP_TOKEN_RESUME_REBOUND_ENV, sharedMachineSetupTokenAuthority } from '@/daemon/sessionEnv';
+import { orgEndpointLocalModeRefusal } from './utils/orgEndpointLocalMode';
 
 /** Sent when the member retries a turn the organization account refused to authenticate (Saycode specs/org-auth-failure-account-switch). */
 const AUTHENTICATION_RETRY_PROMPT = 'The previous request stopped because the organization Claude account could not authenticate. Try the request again from where you stopped.';
@@ -209,6 +210,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     }
 
     async function doSwitch() {
+        // The terminal's Claude cannot be pinned to the endpoint (orgEndpointLocalMode): say so, and stay remote.
+        const refusal = orgEndpointLocalModeRefusal(process.env);
+        if (refusal) {
+            session.client.sendSessionEvent({ type: 'message', message: refusal });
+            return { success: false, error: refusal };
+        }
         session.client.setInputMode?.('transitioning');
         for (const batch of [preparingBatch, pending]) {
             if (!batch) continue;
@@ -221,6 +228,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             exitReason = 'switch';
         }
         await abort();
+        return undefined;
     }
 
     session.client.setInputMode?.('remote');
