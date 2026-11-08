@@ -3,12 +3,15 @@
  * authenticated by the daemon's own happy token like its other Studio calls (`setupTokenAccountSwitch`):
  *
  *  - `session-started`: the session now exists, so Studio can turn the prepared binding into a started one.
- *    Never part of the spawn's outcome — a failure is logged and the session runs.
+ *    Never part of the spawn's outcome — a failure is logged and the session runs. Reported only when Studio answers
+ *    `{ok:true, bindingId, status:'started'}` for this binding.
  *  - `resume-check`: before a resume rebuilds an endpoint's environment from the local copy, Studio says whether the
- *    binding is still valid (endpoint active, same generation, target there, user still assigned). Anything but a 200
- *    refuses the resume: the local copy alone can be older than the administrator's last change.
+ *    binding is still valid (endpoint active, same generation, target there, user still assigned). Only a 200 with
+ *    `{ok:true}` lets the resume go: the local copy alone can be older than the administrator's last change, and a
+ *    2xx page from a proxy or a misrouted deployment says nothing about the binding.
  *
- * Nothing in a log, an error or a result here carries the token, an address or a response body.
+ * The answer is read up to a small limit and parsed as JSON. Nothing in a log, an error or a result here carries the
+ * token, an address or a response body.
  */
 import { failureReason } from './orgLlmEndpoint'
 
@@ -31,7 +34,8 @@ export type OrgLlmEndpointStudioDeps = {
   sleep?(ms: number): Promise<void>
 }
 
-type Attempt = { status: number } | { failure: string }
+type Attempt = { status: number; body: unknown } | { failure: string }
+const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
 
 export function createOrgLlmEndpointStudioClient(deps: OrgLlmEndpointStudioDeps) {
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
@@ -44,8 +48,7 @@ export function createOrgLlmEndpointStudioClient(deps: OrgLlmEndpointStudioDeps)
         headers: { Authorization: `Bearer ${deps.bearer()}`, 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
-      await discardBody(response, signal)
-      return { status: response.status }
+      return { status: response.status, body: await readJsonBody(response, signal) }
     } catch (error) {
       return { failure: failureReason(error) }
     }
@@ -64,7 +67,12 @@ export function createOrgLlmEndpointStudioClient(deps: OrgLlmEndpointStudioDeps)
     for (let tries = 0; tries <= STARTED_RETRY_DELAYS_MS.length; tries++) {
       if (tries > 0) await sleep(STARTED_RETRY_DELAYS_MS[tries - 1]!)
       attempt = await post('session-started', report)
-      if ('status' in attempt && attempt.status >= 200 && attempt.status < 300) return { ok: true }
+      if ('status' in attempt && attempt.status >= 200 && attempt.status < 300) {
+        if (isStartedAnswer(attempt.body, report.bindingId)) return { ok: true }
+        // A 2xx that is not Studio's documented answer (a proxy page, another route) is not a report that landed.
+        deps.warn('org-llm-endpoint session-started report got an unexpected answer; it stays unreported')
+        return { ok: false }
+      }
       if (!transient(attempt)) break
     }
     deps.warn(`org-llm-endpoint session-started report failed (${describe(attempt)}); the session keeps running`)
@@ -81,7 +89,11 @@ export function createOrgLlmEndpointStudioClient(deps: OrgLlmEndpointStudioDeps)
       await sleep(RESUME_RETRY_DELAY_MS)
       attempt = await post('resume-check', query)
     }
-    if ('status' in attempt && attempt.status === 200) return { ok: true }
+    if ('status' in attempt && attempt.status === 200) {
+      if (isObject(attempt.body) && attempt.body.ok === true) return { ok: true }
+      deps.warn('org-llm-endpoint resume-check got an unexpected answer; the session is not resumed')
+      return { ok: false, reason: 'REFUSED' }
+    }
     const unreachable = transient(attempt)
     deps.warn(`org-llm-endpoint resume-check ${unreachable ? 'unreachable' : 'refused'} (${describe(attempt)}); the session is not resumed`)
     return { ok: false, reason: unreachable ? 'UNREACHABLE' : 'REFUSED' }
@@ -90,21 +102,35 @@ export function createOrgLlmEndpointStudioClient(deps: OrgLlmEndpointStudioDeps)
   return { reportSessionStarted, checkResume }
 }
 
-/** Reads a little of the answer so the connection can be reused, then lets go; the timeout covers a stalled body. */
-async function discardBody(response: Response, signal: AbortSignal): Promise<void> {
+const isStartedAnswer = (body: unknown, bindingId: string): boolean =>
+  isObject(body) && body.ok === true && body.bindingId === bindingId && body.status === 'started'
+
+/**
+ * The answer as JSON, or undefined when it is not readable: larger than the limit, not JSON, stalled past the timeout.
+ * Whatever is left unread is cancelled so the connection can be released.
+ */
+async function readJsonBody(response: Response, signal: AbortSignal): Promise<unknown> {
   const reader = response.body?.getReader()
-  if (!reader) return
+  if (!reader) return undefined
   const expired = new Promise<never>((_resolve, reject) => {
     signal.addEventListener('abort', () => reject(new Error('response timeout')), { once: true })
   })
+  const chunks: Uint8Array[] = []
+  let read = 0
   try {
-    let read = 0
-    while (read < RESPONSE_READ_LIMIT) {
+    for (;;) {
       const chunk = await Promise.race([reader.read(), expired])
       if (chunk.done) break
       read += chunk.value.byteLength
+      if (read > RESPONSE_READ_LIMIT) return undefined
+      chunks.push(chunk.value)
     }
   } finally {
     void reader.cancel().catch(() => undefined)
+  }
+  try {
+    return JSON.parse(new TextDecoder().decode(Buffer.concat(chunks)))
+  } catch {
+    return undefined
   }
 }
