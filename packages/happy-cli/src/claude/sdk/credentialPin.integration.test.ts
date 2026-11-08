@@ -271,6 +271,36 @@ describe.skipIf(!enabled)('real SDK credential pin with project rules', () => {
                 expect(f.received.length).toBeGreaterThan(0);
             } finally { await new Promise<void>(r => collector.close(() => r())); }
         }, 40_000);
+        // The remaining transport/authentication variables of the bundled Claude Code that the endpoint set does not own: each is
+        // pointed at a listener in the environment (what a request could carry) and in the user's settings file, and must not
+        // move the conversation or the token there. The outcome documents why those keys are not owned.
+        const otherRoutes = [
+            ['gateway mode', { CLAUDE_CODE_USE_GATEWAY: '1' }],
+            ['the files API base', { CLAUDE_CODE_API_BASE_URL: 'ATTACKER' }],
+            ['a custom OAuth deployment', { CLAUDE_CODE_CUSTOM_OAUTH_URL: 'ATTACKER' }],
+            ['provider base addresses without a provider switch', { ANTHROPIC_FOUNDRY_BASE_URL: 'ATTACKER', ANTHROPIC_AWS_BASE_URL: 'ATTACKER', ANTHROPIC_GOOGLE_CLOUD_BASE_URL: 'ATTACKER', ANTHROPIC_BEDROCK_MANTLE_BASE_URL: 'ATTACKER', AWS_ENDPOINT_URL: 'ATTACKER', AWS_ENDPOINT_URL_BEDROCK_RUNTIME: 'ATTACKER' }],
+            ['host auth indirection', { CLAUDE_CODE_HOST_AUTH_ENV_VAR: 'ATTACKER_TOKEN', ATTACKER_TOKEN: 'fixture-host-auth' }],
+            // The fixture endpoint is on loopback, which an HTTP client does not send through a proxy; this row cannot show a proxy move.
+            ['an HTTP proxy (loopback target)', { HTTP_PROXY: 'ATTACKER', http_proxy: 'ATTACKER', ALL_PROXY: 'ATTACKER', NO_PROXY: '' }],
+            ['workload identity', { ANTHROPIC_IDENTITY_TOKEN: 'fixture-jwt', ANTHROPIC_FEDERATION_RULE_ID: 'rule', ANTHROPIC_ORGANIZATION_ID: 'org', ANTHROPIC_SERVICE_ACCOUNT_ID: 'sa' }],
+        ] as const;
+        // The remaining transport/authentication variables of the bundled Claude Code that the endpoint set does not own: each is
+        // pointed at a listener in the process environment (what a request could carry) and in the user's settings file, and must
+        // not move the conversation or the token there — it is refused, fails to start, or is inert. This documents why none is owned.
+        it.each(otherRoutes.flatMap(([label, vars]) => (['process environment', 'user settings file'] as const).map(where => [label, where, vars] as const)))(
+            'does not send the conversation or the token elsewhere through %s (set in the %s)', async (label, where, vars) => {
+                const { f, attackerUrl } = await arrange();
+                const environment = Object.fromEntries(Object.entries(vars).map(([k, v]) => [k, v === 'ATTACKER' ? attackerUrl : v]));
+                if (where === 'process environment') for (const [key, value] of Object.entries(environment)) vi.stubEnv(key, value);
+                else writeFileSync(f.files[0], JSON.stringify({ env: environment }));
+                q = happyQuery({ prompt: 'other-route-request', options: { cwd: f.options.cwd, model: 'claude-sonnet-4-6', settingSources: f.options.settingSources,
+                    spawnClaudeCodeProcess: f.options.spawnClaudeCodeProcess, persistSession: false, tools: [], maxTurns: 1 } });
+                let failure: unknown;
+                try { for await (const message of q) if (message.type === 'result') break; } catch (error) { failure = error; }
+                const leaked = attackerHits.filter(hit => hit.includes('other-route-request') || hit.includes(TOKEN));
+                console.log(`[endpoint-pin] other-route ${label}/${where}: attackerHits=${attackerHits.length} leaked=${leaked.length} endpointHits=${f.received.length} failure=${(failure as Error | undefined)?.message ?? 'none'}`);
+                expect(leaked).toEqual([]);
+            }, 40_000);
         it('refuses a changed address that appears between two requests, before the second reaches anyone', async () => {
             const { f, attackerUrl } = await arrange();
             let next!: () => void; const second = new Promise<void>(resolve => { next = resolve; });
