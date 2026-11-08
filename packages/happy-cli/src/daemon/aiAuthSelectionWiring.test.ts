@@ -175,6 +175,23 @@ describe('org-endpoint wiring (aplus specs/org-llm-endpoints C5)', () => {
     expect(text).toMatch(/explicitUserGrant: options\.aiAuthSelection\?\.kind === 'claude-setup-token' \|\| options\.aiAuthSelection\?\.kind === 'org-endpoint',/)
   })
 
+  it('a resume asks Studio about the recorded binding before it rebuilds the endpoint, and a refusal ends the resume', async () => {
+    const text = await runSource()
+    const check = text.indexOf('orgEndpointStudio.checkResume({')
+    const rebuild = text.indexOf('resolveManagedAiCredentialEnvironment(resumeAgent, resumeOrgEndpoint)')
+    expect(check).toBeGreaterThan(0)
+    expect(check).toBeLessThan(rebuild)
+    expect(text).toMatch(/if \(!endpointVerdict\.ok\) \{\s*return \{\s*type: 'error',\s*code: 'SESSION_RESUME_FAILED',/)
+    expect(text).toMatch(/bindingId: resumeOrgEndpoint\.bindingId, sessionId: happySessionId, endpointId: resumeOrgEndpoint\.endpointId,\s*targetId: resumeOrgEndpoint\.candidates\[0\]!, generation: resumeOrgEndpoint\.generation,/)
+  })
+
+  it('a started endpoint session is reported to Studio without holding the spawn result', async () => {
+    const text = await runSource()
+    expect(text).toMatch(/if \(appliedOrgLlmEndpoint\) void orgEndpointStudio\.reportSessionStarted\(\{ \.\.\.appliedOrgLlmEndpoint, sessionId: result\.sessionId \}\);/)
+    // The client authenticates with the daemon's own token and trusted origin, like its other Studio calls.
+    expect(text).toMatch(/createOrgLlmEndpointStudioClient\(\{\s*studioOrigin: readTrustedStudioOrigin\(process\.env\), bearer: \(\) => credentials\.token, fetch,/)
+  })
+
   it('the applied target reaches the spawn result', async () => {
     const text = await runSource()
     expect(text).toMatch(/appliedOrgLlmEndpoint = readAppliedOrgLlmEndpoint\(managedAiCredentialEnvironment\)/)

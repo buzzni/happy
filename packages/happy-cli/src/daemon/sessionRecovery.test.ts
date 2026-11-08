@@ -86,6 +86,32 @@ describe('decideUntrackedSessionRecovery', () => {
     });
   });
 
+  // aplus specs/org-llm-endpoints r2 — a new Happy session carries none of the old session's endpoint binding, so the
+  // old conversation would continue on whatever source this machine defaults to (another URL, or another company's account).
+  it.each([
+    ['a recorded endpoint binding', 'binding-1:endpoint-1:target-a:3'],
+    ['a corrupt endpoint binding record', ''],
+  ])('refuses to continue into a new Happy session with %s, whatever the agent', (_label, binding) => {
+    for (const agentMetadata of [{}, { flavor: 'codex' as const, claudeSessionId: undefined, codexThreadId: 'codex-old' }]) {
+      const decision = decideUntrackedSessionRecovery({
+        serverSession: serverSession({ metadata: { ...serverSession().metadata, ...agentMetadata } }),
+        persistedSession: { ...persisted(), agentEnvironment: { HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING: binding } },
+        pathExists: true,
+        nativeSessionExists: true,
+      })
+      expect(decision).toEqual({ kind: 'refuse', code: 'SESSION_RESUME_FAILED', reason: expect.stringContaining('organization LLM endpoint') })
+    }
+  })
+
+  it('still reconnects the same Happy session of an endpoint session, whose resume Studio confirms', () => {
+    expect(decideUntrackedSessionRecovery({
+      serverSession: serverSession(),
+      persistedSession: { ...persisted(17), agentEnvironment: { HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING: 'binding-1:endpoint-1:target-a:3' } },
+      pathExists: true,
+      nativeSessionExists: true,
+    })).toEqual({ kind: 'same-session', baselineSeq: 17 });
+  });
+
   it('continues a verified Codex thread into a new Happy session', () => {
     expect(decideUntrackedSessionRecovery({
       serverSession: serverSession({

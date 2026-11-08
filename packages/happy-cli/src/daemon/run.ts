@@ -147,6 +147,7 @@ import {
 import { sanitizeChildEnv } from '@/utils/childEnv';
 import { resolveRecoveredInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings';
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
+import { createOrgLlmEndpointStudioClient } from './orgLlmEndpointStudio';
 import { createSetupTokenCapacityFence, proveCapacityProcessesStopped } from './setupTokenCapacityFence';
 import { createCollectorSchedule } from './collectorSchedule';
 import { organizationResumeRefusal, resumeSetupTokenEnvironment, shareResumeInFlight, type ResumeAuthRequirement } from './resumeSetupTokenRebind';
@@ -2049,6 +2050,10 @@ export async function startDaemon(): Promise<void> {
     };
 
     const applyManualPersonal = createManualPersonalSpawn(readTrustedStudioOrigin(process.env), machineId);
+    // aplus specs/org-llm-endpoints r2 — tells Studio an endpoint session started, and asks it before a resume rebuilds one.
+    const orgEndpointStudio = createOrgLlmEndpointStudioClient({
+      studioOrigin: readTrustedStudioOrigin(process.env), bearer: () => credentials.token, fetch, warn: (message) => logger.warn(message),
+    });
     type WorkspaceLaunchObservation = { submitted: boolean; tracked: boolean; onObservedExit?: () => Promise<void> };
     const spawnSessionUnchecked = async (
       options: SpawnSessionOptions,
@@ -2161,6 +2166,8 @@ export async function startDaemon(): Promise<void> {
               ? result
               : { ...result, appliedAiAuthSource };
             const withEndpoint: SpawnSessionResult = { ...withAuthSource, ...(appliedOrgLlmEndpoint ? { appliedOrgLlmEndpoint } : {}) };
+            // Not awaited, never fails the spawn: the session already runs, and Studio learns of it on its own clock.
+            if (appliedOrgLlmEndpoint) void orgEndpointStudio.reportSessionStarted({ ...appliedOrgLlmEndpoint, sessionId: result.sessionId });
             const reported: SpawnSessionResult = launchMcpDropped ? { ...withEndpoint, launchMcpDropped } : withEndpoint;
             if (options.additionalDirectories === undefined) return reported;
             return {
@@ -3266,6 +3273,21 @@ export async function startDaemon(): Promise<void> {
         // generation or not at all (a corrupt record throws here); no other address or source stands in.
         const resumeOrgEndpoint = readOrgEndpointResumeSelection(tracked.agentEnvironment);
         if (resumeOrgEndpoint && resumeBinding) throw new Error('Recorded org endpoint and setup-token bindings conflict; the session is not resumed');
+        // The local copy of the endpoint can be older than the administrator's last change (a removed address, a rotated
+        // token, a stopped endpoint, a revoked assignment). Studio confirms the binding, or the session is not resumed.
+        if (resumeOrgEndpoint) {
+          const endpointVerdict = await orgEndpointStudio.checkResume({
+            bindingId: resumeOrgEndpoint.bindingId, sessionId: happySessionId, endpointId: resumeOrgEndpoint.endpointId,
+            targetId: resumeOrgEndpoint.candidates[0]!, generation: resumeOrgEndpoint.generation,
+          });
+          if (!endpointVerdict.ok) {
+            return {
+              type: 'error',
+              code: 'SESSION_RESUME_FAILED',
+              errorMessage: `The organization LLM endpoint of this session could not be confirmed (${endpointVerdict.reason}); the session is not resumed on another source.`,
+            };
+          }
+        }
         const resumeMachineRuntime = resumeBinding && isMachineSetupTokenBinding(resumeBinding.binding)
           ? await machineRuntimeFor(resumeBinding.binding.companyId) : undefined;
         const recoveredMachineEnvironment = resumeMachineRuntime && resumeBinding
