@@ -3,8 +3,9 @@ import type { Options, Query, SDKUserMessage, query } from '@anthropic-ai/claude
 import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS } from '../utils/claudeAuthOverrideEnv';
 
 import { logger } from '@/lib';
+import { ORG_ENDPOINT_OWNED_ENV_KEYS } from '../utils/orgEndpointEnvKeys';
 import {
-    ClaudeAuthNotVerifiedError, ORGANIZATION_CLAUDE_AUTH_FAILURE, PERSONAL_CLAUDE_AUTH_FAILURE,
+    ClaudeAuthNotVerifiedError, ORG_ENDPOINT_CLAUDE_AUTH_FAILURE, ORGANIZATION_CLAUDE_AUTH_FAILURE, PERSONAL_CLAUDE_AUTH_FAILURE,
     type ClaudeAuthCheckReason, type ClaudeAuthCheckStage,
 } from '../utils/launchFailureMessage';
 const CONTROL_TIMEOUT_MS = 10_000;
@@ -52,6 +53,40 @@ export function queryWithPinnedCredential(
             || (effective.allowedProviders !== undefined && (!Array.isArray(effective.allowedProviders) || !effective.allowedProviders.includes('anthropic')))),
         accountMatches: account => !(!account || account.apiProvider !== 'firstParty' || account.tokenSource !== 'CLAUDE_CODE_OAUTH_TOKEN'
             || (account.apiKeySource !== undefined && account.apiKeySource !== 'none')),
+    });
+}
+
+/**
+ * An organization LLM endpoint session (aplus specs/org-llm-endpoints r2). The daemon built the session's
+ * environment from the synced entry and handed it to this process; Claude Code then reads the user's and the
+ * project's `settings.json`, whose `env` would replace the address, the token and the model. Every owned key is
+ * therefore forced into the flag settings (above those files) and compared with what Claude Code reports as
+ * effective before each input: an address or token that is not the daemon's refuses the request instead of
+ * sending the endpoint's token — or the conversation — to wherever a project file points.
+ */
+export function queryWithPinnedEndpoint(
+    create: typeof query,
+    params: { prompt: string | AsyncIterable<SDKUserMessage>; options: Options },
+    environment: Record<string, string | undefined>,
+): Query {
+    const failureCode = ORG_ENDPOINT_CLAUDE_AUTH_FAILURE;
+    const authEnv: Record<string, string> = {};
+    for (const key of ORG_ENDPOINT_OWNED_ENV_KEYS) {
+        const value = environment[key];
+        if (value === undefined || /[\r\n\0]/.test(value)) throw new Error(failureCode);
+        authEnv[key] = value;
+    }
+    if (!authEnv.ANTHROPIC_BASE_URL || !authEnv.ANTHROPIC_AUTH_TOKEN || authEnv.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST !== '1') throw new Error(failureCode);
+    return pinQuery(create, params, {
+        failureCode, label: 'org-endpoint', authEnv,
+        // A provider allow-list admits a custom endpoint only when the same managed source pins its address, and that
+        // address would then differ from the daemon's: nothing a list can say makes this session verifiable.
+        policyAllows: effective => effective.allowedProviders === undefined,
+        // Claude Code reports a custom address with a bearer token as a first-party account whose token source is
+        // ANTHROPIC_AUTH_TOKEN (observed with the real SDK); a cloud provider, an API key or a login is another route.
+        accountMatches: account => account !== undefined && account.apiProvider === 'firstParty'
+            && account.tokenSource === 'ANTHROPIC_AUTH_TOKEN'
+            && (account.apiKeySource === undefined || account.apiKeySource === 'none'),
     });
 }
 

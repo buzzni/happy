@@ -5,7 +5,8 @@ import { join } from 'node:path';
 
 const sdkQuery = vi.hoisted(() => vi.fn(() => ({ mocked: true })));
 const pinnedQuery = vi.hoisted(() => vi.fn(() => ({ pinned: true })));
-vi.mock('./credentialPin', () => ({ queryWithPinnedCredential: pinnedQuery }));
+const pinnedEndpointQuery = vi.hoisted(() => vi.fn(() => ({ pinnedEndpoint: true })));
+vi.mock('./credentialPin', () => ({ queryWithPinnedCredential: pinnedQuery, queryWithPinnedEndpoint: pinnedEndpointQuery }));
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
     query: sdkQuery,
@@ -18,6 +19,7 @@ describe('query adapter', () => {
     beforeEach(() => {
         sdkQuery.mockClear();
         pinnedQuery.mockClear();
+        pinnedEndpointQuery.mockClear();
         vi.stubEnv('HAPPY_AI_AUTH_SOURCE', undefined);
         vi.stubEnv('CLAUDE_CODE_OAUTH_TOKEN', undefined);
         configDirectory = mkdtempSync(join(tmpdir(), 'happy-plugin-config-'));
@@ -61,6 +63,47 @@ describe('query adapter', () => {
             }), token, 'organization');
         }
         expect(sdkQuery).not.toHaveBeenCalled();
+    });
+
+    // aplus specs/org-llm-endpoints r2 — an endpoint session is pinned after the settings files load too.
+    describe('organization LLM endpoint session', () => {
+        const endpointEnvironment = {
+            HAPPY_AI_AUTH_SOURCE: 'org-endpoint', ANTHROPIC_BASE_URL: 'https://llm.corp.example', ANTHROPIC_AUTH_TOKEN: 'corp-token',
+            ANTHROPIC_MODEL: 'corp-model', ANTHROPIC_DEFAULT_OPUS_MODEL: 'corp-big', ANTHROPIC_DEFAULT_SONNET_MODEL: 'corp-model',
+            ANTHROPIC_DEFAULT_HAIKU_MODEL: 'corp-small', ANTHROPIC_DEFAULT_FABLE_MODEL: 'corp-big',
+        };
+        beforeEach(() => { for (const [key, value] of Object.entries(endpointEnvironment)) vi.stubEnv(key, value); });
+
+        it('goes through the endpoint pin with the daemon environment on every query, resume and title call included', () => {
+            for (const options of [{ resume: 'session', settingSources: ['user', 'project'] as ('user' | 'project')[] }, undefined]) {
+                query({ prompt: 'continue', options });
+                expect(pinnedEndpointQuery).toHaveBeenLastCalledWith(sdkQuery, expect.objectContaining({
+                    options: expect.objectContaining({ env: expect.objectContaining(endpointEnvironment) }),
+                }), expect.objectContaining(endpointEnvironment));
+            }
+            expect(sdkQuery).not.toHaveBeenCalled();
+            expect(pinnedQuery).not.toHaveBeenCalled();
+        });
+
+        it('folds the requested and the fallback model onto the endpoint names before the SDK sees them', () => {
+            query({ prompt: 'hello', options: { model: 'claude-opus-5-5', fallbackModel: 'haiku' } });
+            expect(pinnedEndpointQuery.mock.calls.at(-1)).toBeDefined();
+            const options = (pinnedEndpointQuery.mock.calls.at(-1) as unknown as [unknown, { options: Record<string, unknown> }])[1].options;
+            expect(options).toMatchObject({ model: 'corp-model', fallbackModel: 'corp-small' });
+        });
+
+        it('leaves a query with no model naming none, for the pinned environment to answer', () => {
+            query({ prompt: 'hello' });
+            const options = (pinnedEndpointQuery.mock.calls.at(-1) as unknown as [unknown, { options: Record<string, unknown> }])[1].options;
+            expect(options.model).toBeUndefined();
+        });
+
+        it('keeps every other source off the endpoint pin and its model untouched', () => {
+            vi.stubEnv('HAPPY_AI_AUTH_SOURCE', 'org-bundle');
+            query({ prompt: 'hello', options: { model: 'claude-opus-5-5' } });
+            expect(pinnedEndpointQuery).not.toHaveBeenCalled();
+            expect(lastOptions().model).toBe('claude-opus-5-5');
+        });
     });
 
     it.each(['personal-subscription', 'org-bundle-observed', undefined])('keeps ordinary token source %s on the existing route', source => {

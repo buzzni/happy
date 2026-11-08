@@ -11,7 +11,8 @@ import type { QueryOptions, QueryPrompt, SDKMessage } from './types'
 import type { SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
 import { ensureLocalProxyBypass } from '../utils/proxyBypass'
 import { resolveHappyEntrypoint } from './happyEntrypoint'
-import { queryWithPinnedCredential } from './credentialPin'
+import { queryWithPinnedCredential, queryWithPinnedEndpoint } from './credentialPin'
+import { foldModelToOrgEndpoint } from '../utils/orgEndpointModel'
 import { sanitizeChildEnv } from '@/utils/childEnv'
 import { RECALL_OWNER_ENV } from '@/memory/recallOwnerMarker'
 import { LESSON_OWNER_ENV } from '@/memory/lessonOwnerMarker'
@@ -95,6 +96,10 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
         ensureLocalProxyBypass(env)
     }
     sdkOptions.env = env
+    // An endpoint serves its own model names only; this is the last place every query — the title job's and the
+    // sub-agents' included — passes, so a Claude ID some caller kept cannot reach it.
+    sdkOptions.model = foldModelToOrgEndpoint(sdkOptions.model, env)
+    sdkOptions.fallbackModel = foldModelToOrgEndpoint(sdkOptions.fallbackModel, env)
 
     // Map canCallTool -> canUseTool
     if (opts?.canCallTool) {
@@ -114,6 +119,12 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
     if (env.HAPPY_AI_AUTH_SOURCE === 'org-bundle' && env.CLAUDE_CODE_OAUTH_TOKEN) return queryWithPinnedCredential(sdkQuery, {
         prompt: params.prompt as string | AsyncIterable<SDKUserMessage>, options: sdkOptions,
     }, env.CLAUDE_CODE_OAUTH_TOKEN, 'organization')
+
+    // An organization LLM endpoint's address, token and models would otherwise be replaced by the same keys in a
+    // user or project settings file. No fallback: a session whose environment the pin cannot read does not start.
+    if (env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint') return queryWithPinnedEndpoint(sdkQuery, {
+        prompt: params.prompt as string | AsyncIterable<SDKUserMessage>, options: sdkOptions,
+    }, env)
 
     return sdkQuery({
         prompt: params.prompt as string | AsyncIterable<SDKUserMessage>,
