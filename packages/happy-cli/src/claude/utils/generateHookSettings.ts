@@ -17,6 +17,7 @@ import {
     type MachineLockdownPolicy,
 } from '@/daemon/machineLockdownPolicy';
 import { buildToolPolicyHookEntries, skillLocksFilePath } from '@/toolPolicy/claudeHook';
+import { orgEndpointRoutingSettingsEnv } from './orgEndpointEnvKeys';
 
 /**
  * Pure settings document. `permissions.deny` always guards broad kills; under
@@ -36,8 +37,11 @@ export function buildHookSettings(input: {
      * R10.10): Claude refuses bypass from the command line and from its own mode cycling in the terminal.
      */
     disableBypassPermissions?: boolean;
+    /** An organization LLM endpoint session's routing (`orgEndpointRoutingSettingsEnv`), above the settings files. */
+    env?: Record<string, string>;
 }): Record<string, unknown> {
     return {
+        ...(input.env ? { env: input.env } : {}),
         permissions: {
             deny: [
                 "Bash(killall:*)",
@@ -115,6 +119,7 @@ export function generateHookSettingsFile(
     const broadKillGuardScript = resolve(projectPath(), 'scripts', 'broad_kill_guard.cjs');
     const broadKillGuardCommand = `node "${broadKillGuardScript}"`;
 
+    const endpointEnv = orgEndpointRoutingSettingsEnv(process.env);
     const settings = buildHookSettings({
         hookCommand,
         broadKillGuardCommand,
@@ -131,6 +136,7 @@ export function generateHookSettingsFile(
             }),
         } : {}),
         ...(options.disableBypassPermissions ? { disableBypassPermissions: true } : {}),
+        ...(endpointEnv ? { env: endpointEnv } : {}),
     });
 
     writeFileSync(filepath, JSON.stringify(settings, null, 2), { mode: 0o600 });

@@ -35,3 +35,20 @@ export const ORG_ENDPOINT_CLEARED_ENV_KEYS = [
 ] as const
 
 export const ORG_ENDPOINT_OWNED_ENV_KEYS: readonly string[] = [...ORG_ENDPOINT_VALUE_ENV_KEYS, ...ORG_ENDPOINT_CLEARED_ENV_KEYS]
+
+/**
+ * The routing part of an endpoint session's environment as a settings `env` block, or undefined outside one.
+ *
+ * Passed to the terminal's Claude through `--settings`, which outranks the user's and the project's settings files
+ * on any Claude Code version, so those cannot re-point the address or the models. The token is left out on purpose:
+ * it would otherwise be written to a file, and without the address a token set elsewhere reaches only the endpoint.
+ */
+export function orgEndpointRoutingSettingsEnv(env: Record<string, string | undefined>): Record<string, string> | undefined {
+    if (env.HAPPY_AI_AUTH_SOURCE !== 'org-endpoint' || !env.ANTHROPIC_BASE_URL) return undefined
+    const block: Record<string, string> = {}
+    for (const key of ORG_ENDPOINT_OWNED_ENV_KEYS) {
+        const value = env[key]
+        if (key !== 'ANTHROPIC_AUTH_TOKEN' && value !== undefined) block[key] = value
+    }
+    return block
+}
