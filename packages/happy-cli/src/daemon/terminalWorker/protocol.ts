@@ -71,6 +71,11 @@ export interface WorkerTerminalMeta {
     route: 'relay' | 'direct'
     machineId: string | null
     openedAt: number
+    /**
+     * Which open contract the terminal came from. A v2 terminal is created with its binding, so
+     * one without it is never adopted (it would fall back to the machine key's v1 controls).
+     */
+    contract?: 'v1' | 'v2'
     binding?: SerializedTerminalBinding
 }
 

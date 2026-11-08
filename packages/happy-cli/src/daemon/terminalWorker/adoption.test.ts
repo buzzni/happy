@@ -59,10 +59,14 @@ describe('adoptTerminalWorkers', () => {
         expect(listTerminalWorkerRecords(home)).toHaveLength(1)
     })
 
-    it('still asks the socket when the start time cannot be read — the secret proves who it is', async () => {
-        record()
-        const d = deps({ processStartedAt: () => undefined })
-        expect((await run(d)).summary.adopted).toBe(1)
+    it('touches nothing whose start time cannot be verified, on either side (HR6)', async () => {
+        const unreadable = record()
+        record({ startedAt: null })
+        const d = deps({ processStartedAt: (pid) => pid === unreadable.pid ? undefined : 5_000 })
+        const result = await run(d)
+        expect(d.connect).not.toHaveBeenCalled()
+        expect(result.summary).toMatchObject({ failed: 2, adopted: 0, reaped: 0 })
+        expect(listTerminalWorkerRecords(home)).toHaveLength(2)
     })
 
     it('reports an unreadable record and does not touch it', async () => {

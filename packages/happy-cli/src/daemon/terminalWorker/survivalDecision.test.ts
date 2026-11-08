@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { RESTART_DRAIN_REASONS } from '../restartDrain'
-import { decideTerminalSurvival, readTerminalWorkerFlag, TERMINAL_WORKER_DEFAULT_ENABLED, terminalWorkersEnabled, type TerminalSurvivalInput } from './survivalDecision'
+import { decideTerminalSurvival, keepsWorkerTerminalsOnExit, readTerminalWorkerFlag, TERMINAL_WORKER_DEFAULT_ENABLED, terminalWorkersEnabled, type TerminalSurvivalInput } from './survivalDecision'
 
 const base: TerminalSurvivalInput = {
     platform: 'darwin', workersEnabled: true, intent: 'restart', reason: 'bundle-replaced',
@@ -42,5 +42,19 @@ describe('readTerminalWorkerFlag (spec HR11)', () => {
         expect(terminalWorkersEnabled('win32', { HAPPY_TERMINAL_WORKER: '1' })).toBe(false)
         expect(terminalWorkersEnabled('darwin', { HAPPY_TERMINAL_WORKER: '1' })).toBe(true)
         expect(terminalWorkersEnabled('linux', {})).toBe(false)
+    })
+})
+
+describe('keepsWorkerTerminalsOnExit (spec HR3)', () => {
+    it('closes on SIGTERM/SIGINT even after a restart drain that kept them', () => {
+        expect(keepsWorkerTerminalsOnExit({ source: 'os-signal', readyDrainKeeps: true })).toBe(false)
+    })
+    it('leaves them on an uncaught exception, like a crash', () => {
+        expect(keepsWorkerTerminalsOnExit({ source: 'exception', readyDrainKeeps: false })).toBe(true)
+    })
+    it('keeps them on a requested stop only after a restart drain decided so', () => {
+        expect(keepsWorkerTerminalsOnExit({ source: 'happy-cli', readyDrainKeeps: true })).toBe(true)
+        expect(keepsWorkerTerminalsOnExit({ source: 'happy-cli', readyDrainKeeps: false })).toBe(false)
+        expect(keepsWorkerTerminalsOnExit({ source: 'happy-app', readyDrainKeeps: false })).toBe(false)
     })
 })

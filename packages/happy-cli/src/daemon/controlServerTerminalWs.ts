@@ -38,6 +38,7 @@
  * either, so this is an existing gap, not a regression introduced here.
  */
 
+import { randomUUID } from 'node:crypto';
 import type { Server as HttpServer } from 'node:http';
 import { existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -201,6 +202,8 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
 
   const sockets = new Set<WebSocket>();
   const terminals = new Map<string, DirectTerminal>();
+  /** Opens past the per-user check that have not registered yet: a worker create is awaited. */
+  const pendingOpens = new Map<string, number>();
   /** One recorded bound open opens one shell (terminalBindingSession.ts). */
   const terminalOpenNonceGuard = createTerminalOpenNonceGuard();
 
@@ -393,6 +396,7 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
         openingPending = true;
         void (async () => {
         let preparation: Extract<TerminalOpenPreparation, { kind: 'ready' }> | undefined;
+        let reservedFor: string | null = null;
         try {
 
         const machineEncryption = opts.getMachineEncryption();
@@ -440,7 +444,7 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
         openParams = decision.params as OpenParams;
 
         const auditUserId = auditUserIdOf(openParams);
-        let open = 0;
+        let open = pendingOpens.get(auditUserId) ?? 0;
         for (const terminal of terminals.values()) {
           if (terminal.userId === auditUserId && exitOf(terminal) === null && !terminal.closing) open += 1;
         }
@@ -448,11 +452,23 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
           if (reqId) send({ reqId, error: 'Too many active terminals' });
           return;
         }
+        pendingOpens.set(auditUserId, (pendingOpens.get(auditUserId) ?? 0) + 1);
+        reservedFor = auditUserId;
         // aplus terminal-survive-runner-restart: started (if need be) before the approval re-check,
         // so the create request leaves in the same turn as that check. No worker → opened here.
         const worker = opts.terminalWorkers?.enabled ? await opts.terminalWorkers.ensureWorker() : null;
         if (ws.readyState !== ws.OPEN) return;
-        const meta: WorkerTerminalMeta = { userId: auditUserId, route: 'direct', machineId: null, openedAt: Date.now() };
+        // A worker terminal gets its id here and a v2 one its binding with it, so the worker never
+        // holds a v2 terminal without the key that guards it — not even for a moment before a crash.
+        const workerSessionId = worker ? randomUUID() : null;
+        const workerOpening = workerSessionId && decision.kind === 'bound'
+          ? bindTerminal({ params: decision.params, nonce: decision.nonce, sessionId: workerSessionId, caps: { ...DIRECT_TERMINAL_CAPS } })
+          : null;
+        const meta: WorkerTerminalMeta = {
+          userId: auditUserId, route: 'direct', machineId: null, openedAt: Date.now(),
+          contract: decision.kind === 'bound' ? 'v2' : 'v1',
+          ...(workerOpening ? { binding: workerOpening.terminal.exportState() } : {}),
+        };
         await prepared.submit(async () => {
         let pty: PtySession;
         const ptyOptions = {
@@ -465,8 +481,8 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
           rows: Number.isInteger(openParams.rows) ? openParams.rows : undefined,
         };
         try {
-          pty = worker && opts.terminalWorkers
-            ? await opts.terminalWorkers.createSession(worker, { ...ptyOptions, meta })
+          pty = worker && opts.terminalWorkers && workerSessionId
+            ? await opts.terminalWorkers.createSession(worker, { ...ptyOptions, id: workerSessionId, meta })
             : createPtySession(ptyOptions);
         } catch (e) {
           const message = e instanceof Error ? e.message : String(e);
@@ -482,18 +498,14 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
 
         const sessionId = pty.id;
         const entry = addDaemonTerminalSession(sessionId, pty, { userId: auditUserId, machineId: null, route: 'direct' });
-        const opening = decision.kind === 'bound'
+        const opening = workerOpening ?? (decision.kind === 'bound'
           ? bindTerminal({ params: decision.params, nonce: decision.nonce, sessionId, caps: { ...DIRECT_TERMINAL_CAPS } })
-          : null;
+          : null);
         if (opening) entry.binding = opening.terminal;
         const terminal: DirectTerminal = { sessionId, pty, entry, userId: auditUserId, ws, graceTimer: null, closing: false };
         terminals.set(sessionId, terminal);
         bound = terminal;
-        if (isWorkerPtySession(pty)) {
-          // The worker holds the v2 key in memory so an adopting daemon can rebuild the binding.
-          terminal.meta = opening ? { ...meta, binding: opening.terminal.exportState() } : meta;
-          if (opening) pty.setMeta(terminal.meta).catch((e) => logger.debug(`[LOCAL-DIRECT-TERMINAL] setMeta failed: ${(e as Error).message}`));
-        }
+        if (isWorkerPtySession(pty)) terminal.meta = meta;
         wireTerminal(terminal);
 
         if (cwdDecision.fallback) {
@@ -518,6 +530,11 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
           : capsFor(pty) } });
         });
         } finally {
+          if (reservedFor !== null) {
+            const left = (pendingOpens.get(reservedFor) ?? 1) - 1;
+            if (left > 0) pendingOpens.set(reservedFor, left);
+            else pendingOpens.delete(reservedFor);
+          }
           await preparation?.cancel();
           openingPending = false;
         }
@@ -732,7 +749,7 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
     },
     adopt: (adopted) => {
       for (const { session, dump } of adopted) {
-        if (dump.meta.route !== 'direct' || terminals.has(dump.id)) {
+        if (dump.meta.route !== 'direct' || terminals.has(dump.id) || (dump.meta.contract === 'v2' && !dump.meta.binding)) {
           // Only direct terminals are kept for a restart; anything else has nobody to reconnect.
           void session.terminate().finally(() => session.forget());
           continue;

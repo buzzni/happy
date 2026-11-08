@@ -97,7 +97,7 @@ import { readBrowserSetupPolicy, writeBrowserSetupPolicy, localBrowserExtensionM
 import { BrowserSessionBrokerClient } from './browserSessionBrokerContract';
 import { getBusyDaemonTerminalCount, getDaemonTerminalSessionCount, type DaemonTerminalEntry } from './daemonTerminalSessions';
 import { TerminalWorkerHost } from './terminalWorker/workerHost';
-import { decideTerminalSurvival, terminalWorkersEnabled, type TerminalSurvivalDecision } from './terminalWorker/survivalDecision';
+import { decideTerminalSurvival, keepsWorkerTerminalsOnExit, terminalWorkersEnabled, type TerminalSurvivalDecision } from './terminalWorker/survivalDecision';
 import { installedWorkerProtocolMatches } from './terminalWorker/installedProtocol';
 import { isWorkerPtySession } from './terminalWorker/workerPtySession';
 import { startBrowserBridgeServer, retryBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './browserBridgeServer';
@@ -6419,9 +6419,9 @@ export async function startDaemon(): Promise<void> {
       await channelHost?.stop();
       await bashRpcsDrained;
       apiMachine.shutdown();
-      // HR3: a stop, SIGTERM or SIGINT closes the worker terminals; an uncaught exception is a
-      // crash, which leaves them for the next daemon like a crash that never got here.
-      if (source === 'exception') terminalWorkers.setKeeping(true);
+      // HR3: SIGTERM/SIGINT and plain stops close the worker terminals; an uncaught exception is a
+      // crash and leaves them; `daemon stop --for-restart` keeps what its ready drain kept.
+      terminalWorkers.setKeeping(keepsWorkerTerminalsOnExit({ source, readyDrainKeeps: terminalWorkers.isKeeping() }));
       await stopControlServer();
       await terminalWorkers.stop();
       await writeScopeRuntime?.close();

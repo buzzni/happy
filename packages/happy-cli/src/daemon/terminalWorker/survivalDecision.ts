@@ -61,3 +61,16 @@ export function decideTerminalSurvival(input: TerminalSurvivalInput): TerminalSu
     if (!input.installedProtocolMatches) return { terminals: 'close', reason: 'incompatible' }
     return { terminals: 'keep' }
 }
+
+export type DaemonExitSource = 'happy-app' | 'happy-cli' | 'os-signal' | 'exception'
+
+/**
+ * HR3 at the moment the daemon goes: SIGTERM/SIGINT always close (even after a restart drain that
+ * would have kept them); an uncaught exception is a crash and leaves them; a requested stop keeps
+ * them only when a ready restart drain decided so (`happy daemon stop --for-restart`).
+ */
+export function keepsWorkerTerminalsOnExit(input: { source: DaemonExitSource; readyDrainKeeps: boolean }): boolean {
+    if (input.source === 'os-signal') return false
+    if (input.source === 'exception') return true
+    return input.readyDrainKeeps
+}

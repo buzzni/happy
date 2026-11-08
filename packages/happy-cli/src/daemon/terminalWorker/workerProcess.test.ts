@@ -184,6 +184,20 @@ describe.runIf(posix)('terminal worker process', () => {
         worker = null
     })
 
+    it('takes no new terminal or controller once shutting down, and answers only when its shells are gone', async () => {
+        await start()
+        const connection = await controller()
+        // Ignores the hangup: shutdown has to wait out the grace and escalate.
+        const { pid } = await connection.request<{ pid: number }>('create', { id: 't1', shell: '/bin/sh', args: ['-c', 'trap "" HUP; while :; do sleep 0.1; done'], meta })
+        const shuttingDown = connection.request('shutdown')
+        await expect(connection.request('create', { id: 't2', shell: '/bin/sh', args: [], meta })).rejects.toThrow('shutting down')
+        await expect(connectTerminalWorker(worker!.record)).rejects.toThrow()
+        await shuttingDown
+        expect(() => process.kill(pid, 0)).toThrow()
+        await waitFor(() => exited.length > 0)
+        worker = null
+    })
+
     it('drops a connection that never says hello', async () => {
         await start({ helloTimeoutMs: 50 })
         const socket = connect(worker!.socketPath)

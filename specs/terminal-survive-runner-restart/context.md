@@ -28,6 +28,8 @@ aplus 오케스트레이션 T10. 2026-11-08 사용자가 조건 3개를 붙여 �
 - [2026-11-08] cwd 대체 배너는 워커 `inject` 연산으로 보낸다(셸 출력과 같은 seq 열에 들어가야 재생이 맞음).
 - [2026-11-08] 크래시 뒤 입양된 v2 터미널의 `lastInSeq`는 마지막 `setMeta`(열 때·정상 핸드오프 직전) 값이라 낡을 수 있다. 직결 경로는 새 데몬의 control secret이 있어야 붙을 수 있어 재생 공격 표면은 같은 PC의 앱뿐이다.
 
+- [2026-11-08] 교차 리뷰(codex gpt-6.1-sol high) major 7·minor 2 전부 반영: 종료 중 워커는 create·새 컨트롤러를 거부하고 shutdown 응답은 터미널이 끝난 뒤, 세션은 create·dump 요청 전에 구독하고 첫 리더까지 출력을 보관, v2 터미널은 바인딩을 create에 함께 실어 원자적으로 보관(`contract: v2`인데 바인딩 없으면 입양 거부), SIGTERM/SIGINT는 ready restart 드레인 뒤에도 닫기(`keepsWorkerTerminalsOnExit`), 실패·무응답 create는 terminate+forget 보상, 종료한 세션은 연결 리스너 해제, 진행 중 열기도 사용자당 5개 상한에 포함, 시작 시각 미확인이면 연결도 신호도 없음(HR6 그대로), 시작 중 stop은 launch를 기다려 회수.
+
 ## 열린 문제
 
 - 후속 spec 예약: `terminal-survive-relay-restart` — 릴레이 경로 터미널 유지. 범위: 서버 세션 보류·데몬 재등록·클라이언트 재부착. 선행: 다중 레플리카 세션 보류 계약, happy-server 배포, 기본 켜짐 전환(tasks F1).

@@ -93,13 +93,14 @@ export class TerminalWorkerHost {
                 continue
             }
             for (const entry of listed.terminals) {
+                // Listening before the dump: output after the dumped seq is held for the route, not lost.
+                const session = createWorkerPtySession({ connection: adopted.connection, id: entry.id, userId: '', pid: entry.pid })
                 try {
                     const dump = await adopted.connection.request<WorkerDumpResult>('dump', { id: entry.id })
-                    const session = this.track(held, createWorkerPtySession({
-                        connection: adopted.connection, id: dump.id, userId: dump.meta.userId, pid: dump.pid, cols: dump.cols, rows: dump.rows, exit: dump.exit,
-                    }))
-                    terminals.push({ session, dump })
+                    session.settle({ pid: dump.pid, userId: dump.meta.userId, cols: dump.cols, rows: dump.rows, exit: dump.exit })
+                    terminals.push({ session: this.track(held, session), dump })
                 } catch (error) {
+                    session.detach()
                     this.options.log(`[TERMINAL-WORKER] dump ${entry.id} failed: ${(error as Error).message}`)
                 }
             }
@@ -137,17 +138,29 @@ export class TerminalWorkerHost {
         return (await this.launching)?.connection ?? null
     }
 
-    /** Opens a terminal on `connection` (from `ensureWorker`). The create request leaves in this call's synchronous part. */
-    async createSession(connection: WorkerConnection, args: WorkerSessionArgs): Promise<WorkerPtySession> {
+    /**
+     * Opens a terminal on `connection` (from `ensureWorker`) under `args.id` (a new id when absent).
+     * The create request leaves in this call's synchronous part. A create that failed or went
+     * unanswered may still have started a shell; it is ended and forgotten rather than left running.
+     */
+    async createSession(connection: WorkerConnection, args: WorkerSessionArgs & { id?: string }): Promise<WorkerPtySession> {
         const held = [...this.workers].find((worker) => worker.connection === connection)
-        if (!held || held.draining) throw new Error('terminal worker is not available')
-        const id = randomUUID()
-        const { pid } = await connection.request<{ pid: number }>('create', {
-            id, shell: args.shell, args: args.args, cwd: args.cwd, env: args.env, cols: args.cols, rows: args.rows, meta: args.meta,
-        })
-        return this.track(held, createWorkerPtySession({
-            connection, id, userId: args.userId, pid, cols: args.cols ?? 80, rows: args.rows ?? 24,
-        }))
+        if (!held || held.draining || this.stopped) throw new Error('terminal worker is not available')
+        const id = args.id ?? randomUUID()
+        // Listening before the create: its first output or exit can share a socket read with the reply.
+        const session = createWorkerPtySession({ connection, id, userId: args.userId, cols: args.cols, rows: args.rows })
+        try {
+            const { pid } = await connection.request<{ pid: number }>('create', {
+                id, shell: args.shell, args: args.args, cwd: args.cwd, env: args.env, cols: args.cols, rows: args.rows, meta: args.meta,
+            })
+            session.settle({ pid })
+        } catch (error) {
+            session.detach()
+            connection.request('terminate', { id, graceMs: 500 }).catch(() => {})
+                .finally(() => { connection.request('forget', { id }).catch(() => {}) })
+            throw error
+        }
+        return this.track(held, session)
     }
 
     /** The decision of a ready drain (spec HR3): worker terminals are left running when this daemon goes. */
@@ -166,6 +179,8 @@ export class TerminalWorkerHost {
     async stop(): Promise<void> {
         if (this.stopped) return
         this.stopped = true
+        // A worker still starting is this daemon's too: it is handled below like the others.
+        await this.launching?.catch(() => null)
         const workers = [...this.workers]
         if (this.keeping) {
             for (const worker of workers) worker.connection.close()

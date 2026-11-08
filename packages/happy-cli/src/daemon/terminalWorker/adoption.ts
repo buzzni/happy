@@ -6,6 +6,7 @@
  *   record unreadable                          → leave it, log the path; recordsReadable = false
  *   another boot                               → retire the record, no signal
  *   pid gone, or alive with another start time → retire the record, no signal (pid reuse)
+ *   start time unverifiable (either side)      → leave everything
  *   socket does not answer / hello fails       → leave everything (next start retries)
  *   authenticated, other protocol              → frozen `shutdown`
  *   authenticated, our protocol, workers off   → frozen `shutdown` (off converges to no workers)
@@ -99,7 +100,13 @@ export async function adoptTerminalWorkers(input: {
             continue
         }
         const observedStart = deps.processStartedAt(record.pid)
-        if (record.startedAt !== null && observedStart !== undefined && observedStart !== record.startedAt) {
+        if (record.startedAt === null || observedStart === undefined) {
+            // HR6: the process cannot be told apart from another holding its pid — touch nothing.
+            summary.failed++
+            log(`[TERMINAL-WORKER] ${tag} start time cannot be verified; left alone`)
+            continue
+        }
+        if (observedStart !== record.startedAt) {
             if (deps.retire(record)) summary.reaped++
             log(`[TERMINAL-WORKER] ${tag} now belongs to another process; record retired`)
             continue

@@ -123,19 +123,34 @@ export async function startTerminalWorker(options: TerminalWorkerOptions): Promi
             : terminal.pty.terminate().catch((): TerminateOutcome => 'escaped')))
     }
 
+    let closing: Promise<void> | null = null
+    /**
+     * Ends every terminal. From the first call on the worker takes no new terminal, controller or
+     * request — a terminal created after the snapshot below would escape it — so whoever asked for
+     * the shutdown knows, once this resolves, that nothing is left running.
+     */
+    function closeTerminals(why: string): Promise<void> {
+        closing ??= (async () => {
+            exiting = true
+            log(`[TERMINAL-WORKER] shutting down (${why}) live=${liveCount()}`)
+            for (const timer of timers) clearInterval(timer)
+            const outcomes = await terminateAll()
+            const escaped = outcomes.filter((outcome) => outcome === 'escaped').length
+            if (escaped > 0) log(`[TERMINAL-WORKER] ${escaped} terminal(s) escaped termination`)
+        })()
+        return closing
+    }
+
     async function shutdown(why: string): Promise<void> {
-        if (exiting) return
-        exiting = true
-        log(`[TERMINAL-WORKER] shutting down (${why}) live=${liveCount()}`)
-        for (const timer of timers) clearInterval(timer)
-        const outcomes = await terminateAll()
-        const escaped = outcomes.filter((outcome) => outcome === 'escaped').length
-        if (escaped > 0) log(`[TERMINAL-WORKER] ${escaped} terminal(s) escaped termination`)
+        await closeTerminals(why)
         finish()
     }
 
     /** Leaves without touching terminals — only reached when none is left alive. */
+    let finished = false
     function finish(): void {
+        if (finished) return
+        finished = true
         exiting = true
         for (const timer of timers) clearInterval(timer)
         try { retireTerminalWorkerRecord(options.happyHome, record) } catch {/* best effort */}
@@ -217,6 +232,7 @@ export async function startTerminalWorker(options: TerminalWorkerOptions): Promi
 
     async function handleRequest(request: WorkerRequest): Promise<unknown> {
         const args = request.args
+        if (exiting && request.op !== 'list' && request.op !== 'shutdown') throw new Error('terminal worker is shutting down')
         switch (request.op) {
             // ── frozen ──
             case 'list': {
@@ -226,8 +242,9 @@ export async function startTerminalWorker(options: TerminalWorkerOptions): Promi
                 return result
             }
             case 'shutdown':
-                // Answered first; the caller only needs to know it was heard.
-                setImmediate(() => { void shutdown('requested') })
+                // Answered once every terminal is gone, then the worker leaves.
+                await closeTerminals('requested')
+                setImmediate(finish)
                 return {}
             // ── version 1 ──
             case 'create':
@@ -301,7 +318,8 @@ export async function startTerminalWorker(options: TerminalWorkerOptions): Promi
         const framed = attachFramedSocket(socket, (message) => {
             if (!isRecord(message)) return
             if (!authenticated) {
-                if (message.type !== 'hello' || !secretsMatch(secret, message.secret)) {
+                // A worker on its way out is nobody's to adopt.
+                if (exiting || message.type !== 'hello' || !secretsMatch(secret, message.secret)) {
                     socket.destroy()
                     return
                 }
