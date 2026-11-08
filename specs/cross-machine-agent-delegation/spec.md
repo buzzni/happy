@@ -1,6 +1,6 @@
 # 다른 작업PC로 위임 — 데몬 위임 lane Spec
 
-> 작성일: 2026-11-08 / 상태: **초안 — 승인 대기** (Desktop Draft PR과 함께 승인)
+> 작성일: 2026-11-08 / 상태: **승인됨(2026-11-08, A1~A6 승인·D-1~D-7 권장안)** — 구현 진행
 > ⚠️ 승인 후에는 사용자 지시 없이 수정 금지
 > 짝 문서: aplus-dev-studio-desktop `specs/cross-machine-agent-delegation/` — 사용자 시나리오·`happy agent` CLI 계약·Desktop 표시·승인 항목 A1~A6·결정 D-1~D-7의 정본.
 > 이 문서는 **데몬 쪽**(위임 연결 저장, 위임 lane, `agent-delegation:*` RPC, 자식 metadata·능력 광고, 오케스트레이션 안내)의 정본이다.

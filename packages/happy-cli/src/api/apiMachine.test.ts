@@ -2190,6 +2190,31 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
+    // aplus-dev-studio specs/cross-machine-agent-delegation R11 — only a daemon that wired the links advertises them.
+    it.each([
+        { available: true, managed: false, expected: { version: 1 } },
+        { available: false, managed: false, expected: undefined },
+        { available: true, managed: true, expected: undefined },
+    ])('advertises agent delegation when wired (available: $available, managed: $managed)', async ({ available, managed, expected }) => {
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
+            if (event === 'machine-update-state') return { result: 'success', version: 1, daemonState: data.daemonState };
+            return { result: 'success' };
+        });
+        const machine = { ...makeMachine(), encryptionVariant: 'dataKey' as const };
+        machine.metadata = { ...machine.metadata!, agentDelegation: expected ? undefined : { version: 1 } };
+        const client = new ApiMachineClient('fake-token', machine);
+        (client as any).agentDelegationAvailable = available;
+        if (managed) (client as any).managedHandlers = {};
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.agentDelegation).toEqual(expected));
+
+        client.shutdown();
+    });
+
     describe('channel host', () => {
         const advertisement = {
             protocolVersion: 1 as const,

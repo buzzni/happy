@@ -41,6 +41,14 @@ describe('natural-language child orchestration routing eval (T14)', () => {
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT.includes('you may also steer or stop it')).toBe(atLeast0910);
   });
 
+  // aplus-dev-studio specs/cross-machine-agent-delegation R15 — gated on whoami, never a local fallback, one hop.
+  it('offers another work PC only when whoami lists delegation targets', () => {
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('Only when whoami lists `delegation.targets`');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('`happy agent spawn --machine <target> --project <path-on-that-pc> --prompt <text>`');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('never create the child on this PC instead');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('A session started by delegation never uses `--machine` again');
+  });
+
   it('routes an explicitly durable child away from provider-native subagents', () => {
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('visible, reopenable, or controllable later');
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('MUST use `happy agent`');

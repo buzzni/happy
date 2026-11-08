@@ -1,6 +1,6 @@
 # 다른 작업PC로 위임 — 데몬 위임 lane Plan
 
-> 작성일: 2026-11-08 / 상태: 초안 — 승인 대기
+> 작성일: 2026-11-08 / 상태: 승인됨(2026-11-08, D-1~D-7 권장안) — 구현 진행
 > 근거 문서: [spec.md](./spec.md) · 짝: aplus-dev-studio-desktop `specs/cross-machine-agent-delegation/plan.md`(Core 분류·대안·참고 코드 정본)
 
 ## 아키텍처 영향
@@ -26,9 +26,9 @@ Desktop이 PC 쌍마다 만들고 두 데몬에 고객 lane RPC로 설치한다.
 
 ## 단계 (Phases)
 
-- [ ] **Phase 1: 저장소·연결 RPC** (R1~R5, R11) → 검증: 저장소 원자적 쓰기·0600·상한, 고객 lane 외 거절, `list`가 키 미포함
-- [ ] **Phase 2: 위임 lane** (R6, R7, R14) → 검증: 판정 순서, 허용 목록, 거절 봉인 키, 연결 없음 무변화
-- [ ] **Phase 3: spawn·session-key·stop** (R8~R10) → 검증: 디렉터리·깊이·동시 상한, env 재구성, metadata, 피어 불일치 거절
+- [x] **Phase 1: 저장소·연결 RPC** (R1~R5, R11) → 검증: 저장소 원자적 쓰기·0600·상한, 고객 lane 외 거절, `list`가 키 미포함
+- [x] **Phase 2: 위임 lane** (R6, R7, R14) → 검증: 판정 순서, 허용 목록, 거절 봉인 키, 연결 없음 무변화
+- [x] **Phase 3: spawn·session-key·stop** (R8~R10) → 검증: 디렉터리·깊이·동시 상한, env 재구성, metadata, 피어 불일치 거절
 - [ ] **Phase 4: 안내·핀·PR** (R12, R13) → 검증: 프롬프트 스냅샷, `pnpm test`, PR CI. 릴리스·Desktop pin은 지휘 세션
 
 ## 리스크와 대응
@@ -43,6 +43,6 @@ Desktop이 PC 쌍마다 만들고 두 데몬에 고객 lane RPC로 설치한다.
 
 - 사용자 요청 범위·실행 근거: Desktop 오케스트레이션 Phase 5 T13(spec 세션).
 - 승인 필요 여부·이유: 필요 — 데몬 RPC·lane·metadata 추가, 새 신뢰 경로(Desktop 승인 항목 A2·A4).
-- 승인받은 사항: 없음.
+- 승인받은 사항: 2026-11-08 사용자 — Desktop 승인 항목 A1~A6, 결정 D-1~D-7 권장안.
 - 사용자 지정 검토 지점: Desktop·happy Draft PR 승인.
-- 보류 범위·재개 조건: 구현 전체 — 승인 후 구현 세션이 이 브랜치를 이어받는다.
+- 보류 범위·재개 조건: 없음(구현 진행). 릴리스·Desktop pin은 지휘 세션.

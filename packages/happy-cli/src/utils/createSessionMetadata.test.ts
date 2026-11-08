@@ -75,6 +75,20 @@ describe('createSessionMetadata', () => {
         expect(createSessionMetadata({ flavor: 'codex', machineId: 'machine-1' }).metadata).not.toHaveProperty('source');
     });
 
+    // aplus-dev-studio specs/cross-machine-agent-delegation R9 — every flavor records it, from the daemon's env.
+    it('records delegatedFrom only when the daemon handed both the machine and the session', () => {
+        const env = process.env;
+        try {
+            process.env = { ...env, HAPPY_CREATED_BY_DELEGATED_FROM_MACHINE_ID: 'machine-a', HAPPY_CREATED_BY_DELEGATED_FROM_SESSION_ID: 'parent-1' };
+            expect(createSessionMetadata({ flavor: 'codex', machineId: 'machine-b' }).metadata.delegatedFrom).toEqual({ machineId: 'machine-a', sessionId: 'parent-1' });
+            process.env = { ...env, HAPPY_CREATED_BY_DELEGATED_FROM_MACHINE_ID: 'machine-a' };
+            expect(createSessionMetadata({ flavor: 'claude', machineId: 'machine-b' }).metadata).not.toHaveProperty('delegatedFrom');
+        } finally {
+            process.env = env;
+        }
+        expect(createSessionMetadata({ flavor: 'claude', machineId: 'machine-b' }).metadata).not.toHaveProperty('delegatedFrom');
+    });
+
     it('sets metadata.sandbox to the config when enabled', () => {
         const sandbox = createSandboxConfig();
         const { metadata } = createSessionMetadata({

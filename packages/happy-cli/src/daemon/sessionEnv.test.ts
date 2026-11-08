@@ -210,6 +210,15 @@ describe('buildSpawnRequestEnvironment', () => {
         })
     })
 
+    // aplus-dev-studio specs/cross-machine-agent-delegation R8 — the delegated child's `happy agent` refuses a second hop.
+    it('keeps the delegated-from machine with the grant and drops the grant when it is malformed', () => {
+        const grant = { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/work/app', SAYCODE_AGENT_DEPTH: '1' }
+        expect(buildSpawnRequestEnvironment({}, { ...grant, SAYCODE_AGENT_DELEGATED_FROM: 'machine-a' }))
+            .toEqual({ ...grant, SAYCODE_AGENT_DELEGATED_FROM: 'machine-a' })
+        expect(buildSpawnRequestEnvironment({}, { ...grant, SAYCODE_AGENT_DELEGATED_FROM: 'a b;rm' }))
+            .toEqual({ [DAEMON_AGENT_GRANT_STATE_ENV]: 'rejected' })
+    })
+
     it('keeps the capability while still rejecting session-hijacking lineage', () => {
         expect(buildSpawnRequestEnvironment({}, {
             SAYCODE_AGENT_ENV: '1',
@@ -889,6 +898,13 @@ describe('buildSessionRequesterEnv', () => {
 
     it.each(['Schedule', 'has space', '', 'x'.repeat(40), 42, null])('drops a malformed source (%s)', (sessionSource) => {
         expect(buildSessionRequesterEnv({ sessionSource })).toEqual({})
+    })
+
+    it('carries the delegating machine and session under the scrubbed requester prefix', () => {
+        expect(buildSessionRequesterEnv({ delegatedFrom: { machineId: 'machine-a', sessionId: 'parent-1' } })).toEqual({
+            HAPPY_CREATED_BY_DELEGATED_FROM_MACHINE_ID: 'machine-a',
+            HAPPY_CREATED_BY_DELEGATED_FROM_SESSION_ID: 'parent-1',
+        })
     })
 
     it('keeps requester identity next to the source', () => {

@@ -271,6 +271,11 @@ export const MachineMetadataSchema = z.object({
    */
   aiAuthSelection: z.object({ version: z.literal(1) }).optional(),
   /**
+   * aplus-dev-studio specs/cross-machine-agent-delegation R11 — `agent-delegation:*` RPCs and the
+   * delegation lane are served. Desktop offers the link switch only for a machine that says so.
+   */
+  agentDelegation: z.object({ version: z.literal(1) }).optional(),
+  /**
    * aplus specs/org-agent-plan §6.3-1 — `spawn-happy-session` accepts `agentPlan: { grantEnvelope }` for Codex.
    * A separate field rather than a v2 of `aiAuthSelection`, which clients support at exactly version 1.
    * Windows daemons do not publish it (§6.3-5).
@@ -741,6 +746,12 @@ export type Metadata = {
    * doesn't supply it (specs/session-created-by).
    */
   createdBy?: { accountId: string; displayName?: string }
+  /**
+   * The linked machine and its session this one was started for (aplus-dev-studio
+   * specs/cross-machine-agent-delegation R9). Desktop shows the child under that parent only when the
+   * parent's ledger names this session too.
+   */
+  delegatedFrom?: { machineId: string; sessionId: string }
   /**
    * Who started the session (`user`, `schedule`, `github-trigger`, …). An open
    * enum written once at creation; absent on older sessions and on spawns that
