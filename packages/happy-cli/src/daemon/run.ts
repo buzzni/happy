@@ -148,7 +148,7 @@ import { organizationResumeRefusal, resumeSetupTokenEnvironment, shareResumeInFl
 import type { AiAuthSource } from '@/usage/aiAuthSource';
 import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch, resumeLaunchAgent } from '@/resume/handleResumeCommand';
-import { prepareLaunchMcpServers, type LaunchMcpRequest, type PreparedLaunchMcpServers } from '@/aplus/launchMcpServers';
+import { launchMcpDroppedWithoutLaunch, prepareLaunchMcpServers, type LaunchMcpRequest, type PreparedLaunchMcpServers } from '@/aplus/launchMcpServers';
 import { fetchAplusMcpServerNames } from '@/aplus/fetchAplusMcpServers';
 import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
 import { decodeBase64, decrypt, encodeBase64, encrypt } from '@/api/encryption';
@@ -3145,7 +3145,8 @@ export async function startDaemon(): Promise<void> {
             };
           }
           logger.debug(`[DAEMON RUN] Resume requested for ${happySessionId} but a live child is already attached — reusing it`);
-          return { type: 'success', sessionId: happySessionId };
+          const launchMcpDropped = launchMcpDroppedWithoutLaunch(options?.launchMcpServers);
+          return launchMcpDropped ? { type: 'success', sessionId: happySessionId, launchMcpDropped } : { type: 'success', sessionId: happySessionId };
         }
 
         const tracked = findTrackedSessionById(happySessionId);
@@ -3579,7 +3580,7 @@ export async function startDaemon(): Promise<void> {
     };
 
     const resumeSession = (happySessionId: string, options?: ResumeSessionOptions): Promise<ResumeSessionResult> =>
-      shareResumeInFlight(resumeInFlight, happySessionId, options?.aiAuthRequirement, () => spawnResumedSession(happySessionId, options));
+      shareResumeInFlight(resumeInFlight, happySessionId, options?.aiAuthRequirement, () => spawnResumedSession(happySessionId, options), options?.launchMcpServers);
 
     const queueCheckpointRestart = createCheckpointRestartQueue();
     const restartCheckpointSession = (authority: CheckpointRpcSessionAuthority, preserveProtection = false): Promise<void> =>

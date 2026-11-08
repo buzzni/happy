@@ -8,6 +8,7 @@ import { MANUAL_PERSONAL_ENV } from './manualPersonalClaude'
  * still assigns, through the same rebind a used-up account takes mid-session, and resumes on it.
  */
 import type { ResumeSessionResult } from '@/modules/common/registerCommonHandlers'
+import { launchMcpDroppedWithoutLaunch, type LaunchMcpRequest } from '@/aplus/launchMcpServers'
 import { AiCredentialRuntimeError } from './aiCredentialRuntime'
 import { shareInFlight } from './resumeGuards'
 import type { RebindResult } from './setupTokenAccountSwitch'
@@ -67,15 +68,25 @@ export function organizationResumeRefusal(requirement: ResumeAuthRequirement | u
 /**
  * Concurrent resumes of one session share a single attempt, decided with the first caller's options only.
  * A caller with a requirement never takes that result: it may be a child on this PC's login (review #976).
+ * A joiner with launch MCP servers adds none of them, and its answer says so (launchMcpServers.ts).
  */
 export function shareResumeInFlight(
   inflight: Map<string, Promise<ResumeSessionResult>>,
   sessionId: string,
   requirement: ResumeAuthRequirement | undefined,
   start: () => Promise<ResumeSessionResult>,
+  launchMcp?: LaunchMcpRequest,
 ): Promise<ResumeSessionResult> {
-  if (requirement && inflight.has(sessionId)) {
+  const joined = inflight.get(sessionId)
+  if (requirement && joined) {
     return Promise.resolve({ type: 'error', code: 'SESSION_LIVE', errorMessage: `Session ${sessionId} is already being resumed; retry once it settles.` })
+  }
+  if (joined && launchMcp) {
+    return joined.then((result) => {
+      if (result.type !== 'success') return result
+      const launchMcpDropped = launchMcpDroppedWithoutLaunch(launchMcp)
+      return launchMcpDropped ? { type: 'success', sessionId: result.sessionId, launchMcpDropped } : { type: 'success', sessionId: result.sessionId }
+    })
   }
   return shareInFlight(inflight, sessionId, start)
 }

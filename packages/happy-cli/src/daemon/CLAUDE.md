@@ -115,8 +115,9 @@ Initiated by mobile app via backend RPC:
 
 aplus-dev-studio-desktop `specs/extension-session-and-worktree-hooks`: `spawn-happy-session` and
 `resume-happy-session` take an optional `launchMcpServers` map (advertised as `daemonState.launchMcpServers: 1`)
-and answer `launchMcpDropped: [{ name, reason: 'name-conflict' | 'invalid' | 'unsupported-agent' }]` when they
-dropped any (`src/aplus/launchMcpServers.ts`). The organization's MCP map is built by the session process, not
+and answer `launchMcpDropped: [{ name, reason: 'name-conflict' | 'invalid' | 'unsupported-agent' | 'session-live' }]`
+when they dropped any (`src/aplus/launchMcpServers.ts`). A resume that reuses a live child or joins another
+resume in flight starts no process, so every requested name comes back dropped (`session-live`). The organization's MCP map is built by the session process, not
 the daemon, so the daemon passes the survivors as the one-shot `HAPPY_INITIAL_LAUNCH_MCP_SERVERS` seed; the
 Claude/Codex runner reads and deletes it and puts the servers under the internal (`happy`, `cua-driver`) and
 `/api/me/mcp-config` servers, which always win a name. For the answer the daemon looks the organization's names

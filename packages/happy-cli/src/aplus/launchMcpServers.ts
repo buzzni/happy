@@ -21,7 +21,8 @@ export type LaunchMcpServer =
     | { transport: 'stdio'; command: string; args?: string[]; env?: Record<string, string> }
     | { transport: 'http'; url: string; headers?: Record<string, string> }
 
-export type LaunchMcpDropReason = 'name-conflict' | 'invalid' | 'unsupported-agent'
+/** `session-live`: the resume started no process (a live child was reused, or another resume's start joined). */
+export type LaunchMcpDropReason = 'name-conflict' | 'invalid' | 'unsupported-agent' | 'session-live'
 
 export type LaunchMcpDropped = { name: string; reason: LaunchMcpDropReason }
 
@@ -164,6 +165,16 @@ export function prepareLaunchMcpServers(input: {
             return all.length > 0 ? all : undefined
         },
     }
+}
+
+/**
+ * The answer for a resume that starts no process: a running process read its seed at start, so
+ * none of the requested servers is added. Undefined when the field was absent or empty.
+ */
+export function launchMcpDroppedWithoutLaunch(request: LaunchMcpRequest | undefined): LaunchMcpDropped[] | undefined {
+    if (!request) return undefined
+    const all = [...request.dropped, ...Object.keys(request.servers).map((name) => ({ name, reason: 'session-live' as const }))]
+    return all.length > 0 ? all : undefined
 }
 
 /**

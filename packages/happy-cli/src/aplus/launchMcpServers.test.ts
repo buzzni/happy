@@ -9,6 +9,7 @@ import {
     claudeLaunchMcpServers,
     codexLaunchMcpServers,
     consumeLaunchMcpServersSeed,
+    launchMcpDroppedWithoutLaunch,
     launchMcpServersBeside,
     parseLaunchMcpServers,
     prepareLaunchMcpServers,
@@ -140,6 +141,23 @@ describe('prepareLaunchMcpServers', () => {
         const lookup = vi.fn(async () => [])
         prepareLaunchMcpServers({ request: parseLaunchMcpServers({ happy: stdio() }), agent: 'claude', lookupServerNames: lookup })
         expect(lookup).not.toHaveBeenCalled()
+    })
+})
+
+describe('launchMcpDroppedWithoutLaunch', () => {
+    // Review #1185: a resume that reuses a live child or joins another resume starts no process to read a seed.
+    it('drops every requested name when no process is started', () => {
+        const request = parseLaunchMcpServers({ files: stdio(), docs: http(), broken: { transport: 'stdio' } })
+        expect(launchMcpDroppedWithoutLaunch(request)).toEqual([
+            { name: 'broken', reason: 'invalid' },
+            { name: 'files', reason: 'session-live' },
+            { name: 'docs', reason: 'session-live' },
+        ])
+    })
+
+    it('omits the answer when the field was absent or empty', () => {
+        expect(launchMcpDroppedWithoutLaunch(undefined)).toBeUndefined()
+        expect(launchMcpDroppedWithoutLaunch(parseLaunchMcpServers({}))).toBeUndefined()
     })
 })
 

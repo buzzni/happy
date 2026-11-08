@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { AiCredentialRuntimeError } from './aiCredentialRuntime'
 import type { ResumeSessionResult } from '@/modules/common/registerCommonHandlers'
 import { organizationResumeRefusal, parseResumeAuthRequirement, resumeSetupTokenEnvironment, shareResumeInFlight } from './resumeSetupTokenRebind'
+import { parseLaunchMcpServers } from '@/aplus/launchMcpServers'
 
 const RECORDED = '{"account":"removed"}'
 const NEXT = { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next', HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: '{"account":"assigned"}' }
@@ -87,6 +88,24 @@ describe('organization-only resume requirement', () => {
     const own = vi.fn(async (): Promise<ResumeSessionResult> => ({ type: 'error', code: 'CLAUDE_ORGANIZATION_RESUME_REQUIRED', errorMessage: 'no record' }))
     expect(await shareResumeInFlight(inflight, 's1', requirement, own)).toMatchObject({ code: 'CLAUDE_ORGANIZATION_RESUME_REQUIRED' })
     expect(own).toHaveBeenCalledTimes(1)
+  })
+
+  // Review #1185: the joiner's start never runs, so none of its launch MCP servers reaches a process.
+  it('answers a joiner with launch MCP servers that none of them were added', async () => {
+    const inflight = new Map<string, Promise<ResumeSessionResult>>()
+    let release!: () => void
+    const start = vi.fn(() => new Promise<ResumeSessionResult>(resolve => {
+      release = () => resolve({ type: 'success', sessionId: 's1', launchMcpDropped: [{ name: 'first', reason: 'name-conflict' }] })
+    }))
+    const joinerStart = vi.fn(start)
+
+    const first = shareResumeInFlight(inflight, 's1', undefined, start, parseLaunchMcpServers({ first: { transport: 'stdio', command: 'node' } }))
+    const joiner = shareResumeInFlight(inflight, 's1', undefined, joinerStart, parseLaunchMcpServers({ ext: { transport: 'stdio', command: 'node' } }))
+    release()
+
+    expect(await first).toEqual({ type: 'success', sessionId: 's1', launchMcpDropped: [{ name: 'first', reason: 'name-conflict' }] })
+    expect(await joiner).toEqual({ type: 'success', sessionId: 's1', launchMcpDropped: [{ name: 'ext', reason: 'session-live' }] })
+    expect(joinerStart).not.toHaveBeenCalled()
   })
 })
 

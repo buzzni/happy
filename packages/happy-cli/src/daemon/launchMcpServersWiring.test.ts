@@ -45,6 +45,15 @@ describe('daemon resume', () => {
     expect(prepare).toBeLessThan(resume.indexOf('spawnResumedWithBrowserTaskRegistration({'))
     expect(resume).toContain('const launchMcpDropped = await resumeLaunchMcp.report();')
   })
+
+  // Review #1185: a live child read its seed at start, so reusing it adds none of the requested servers.
+  it('answers a reused live child with every requested server dropped', async () => {
+    const resume = between(await source('./run.ts'), 'const spawnResumedSession = async (', 'const resumeInFlight = new Map')
+    const reuse = resume.indexOf('a live child is already attached — reusing it')
+    const answer = resume.indexOf('const launchMcpDropped = launchMcpDroppedWithoutLaunch(options?.launchMcpServers);')
+    expect(answer).toBeGreaterThan(reuse)
+    expect(answer).toBeLessThan(resume.indexOf('const tracked = findTrackedSessionById(happySessionId);'))
+  })
 })
 
 describe('runners', () => {
