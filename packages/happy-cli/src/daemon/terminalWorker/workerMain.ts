@@ -1,7 +1,6 @@
 /**
  * `happy terminal-worker` (specs/terminal-survive-runner-restart HR1·HR5).
  *
- *   happy terminal-worker --protocol-version   prints the worker protocol this install speaks
  *   happy terminal-worker --record-id <id>     runs a worker; prints `ready <socket>` once listening
  *
  * Started detached by the daemon (workerLaunch.ts), never by hand.
@@ -14,11 +13,6 @@ import { terminalWorkerLogPath } from './record'
 import { startTerminalWorker } from './workerProcess'
 
 const args = process.argv.slice(3)
-
-if (args.includes('--protocol-version')) {
-    process.stdout.write(`${workerProtocolVersion()}\n`)
-    process.exit(0)
-}
 
 const recordIdIndex = args.indexOf('--record-id')
 const recordId = recordIdIndex >= 0 ? args[recordIdIndex + 1] : undefined

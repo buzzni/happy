@@ -51,8 +51,10 @@ Frames: 4-byte big-endian length + UTF-8 JSON, at most 16 MiB.
 Version 1 ops: `create`, `write`, `inject`, `resize`, `signal`, `terminate`, `dump`, `setMeta`,
 `forget`; events `output {id,seq,data}` and `exit {id,code,signal}`. A daemon adopts only workers of
 its own `TERMINAL_WORKER_PROTOCOL_VERSION` and shuts the others down with the frozen `shutdown`.
-Before a restart keeps terminals, the daemon asks the installed bundle
-`happy terminal-worker --protocol-version`; anything but its own version closes them (`incompatible`).
+Before a restart keeps terminals, the daemon reads the installed bundle's `package.json` field
+`happyTerminalWorkerProtocol` (not by running it: a bundle from before workers would take an unknown
+subcommand for a session to start); anything but its own version closes them (`incompatible`).
+Bump that field together with `TERMINAL_WORKER_PROTOCOL_VERSION` — a unit test holds them equal.
 
 ## What a restart does
 

@@ -1,37 +1,24 @@
 /**
  * Does the installed bundle speak this daemon's worker protocol? (specs/terminal-survive-runner-restart
  * HR5) Asked before a restart keeps terminals: the daemon that starts next runs from the installed
- * files and adopts only workers of its own protocol. Anything but a clear yes is a no.
+ * files and adopts only workers of its own protocol.
+ *
+ * Read from the installed `package.json` (`happyTerminalWorkerProtocol`) rather than by running the
+ * installed CLI: a bundle from before workers would take an unknown subcommand for a session to
+ * start. A missing or unreadable field is a no.
  */
-import type { ChildProcess } from 'node:child_process'
-import { spawnHappyCLI } from '@/utils/spawnHappyCLI'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { projectPath } from '@/projectPath'
 import { TERMINAL_WORKER_PROTOCOL_VERSION } from './protocol'
 
-export function queryInstalledWorkerProtocol({
-    spawn = spawnHappyCLI,
-    timeoutMs = 15_000,
-}: { spawn?: typeof spawnHappyCLI; timeoutMs?: number } = {}): Promise<boolean> {
-    let child: ChildProcess
+export const INSTALLED_PROTOCOL_FIELD = 'happyTerminalWorkerProtocol'
+
+export function installedWorkerProtocolMatches(root: string = projectPath()): boolean {
     try {
-        child = spawn(['terminal-worker', '--protocol-version'], { stdio: ['ignore', 'pipe', 'ignore'] })
+        const installed = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as Record<string, unknown>
+        return installed[INSTALLED_PROTOCOL_FIELD] === TERMINAL_WORKER_PROTOCOL_VERSION
     } catch {
-        return Promise.resolve(false)
+        return false
     }
-    return new Promise((resolve) => {
-        let output = ''
-        let settled = false
-        const finish = (matches: boolean) => {
-            if (settled) return
-            settled = true
-            clearTimeout(timer)
-            resolve(matches)
-        }
-        const timer = setTimeout(() => {
-            child.kill()
-            finish(false)
-        }, timeoutMs)
-        child.stdout?.on('data', (chunk: Buffer) => { output += chunk.toString('utf8') })
-        child.once('error', () => finish(false))
-        child.once('exit', (code) => finish(code === 0 && output.trim() === String(TERMINAL_WORKER_PROTOCOL_VERSION)))
-    })
 }

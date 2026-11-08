@@ -451,6 +451,7 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
         // aplus terminal-survive-runner-restart: started (if need be) before the approval re-check,
         // so the create request leaves in the same turn as that check. No worker → opened here.
         const worker = opts.terminalWorkers?.enabled ? await opts.terminalWorkers.ensureWorker() : null;
+        if (ws.readyState !== ws.OPEN) return;
         const meta: WorkerTerminalMeta = { userId: auditUserId, route: 'direct', machineId: null, openedAt: Date.now() };
         await prepared.submit(async () => {
         let pty: PtySession;
@@ -471,6 +472,11 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
           const message = e instanceof Error ? e.message : String(e);
           logger.debug(`[CONTROL SERVER] /terminal open spawn failed: ${message}`);
           if (reqId) send({ reqId, error: message });
+          return;
+        }
+        // The worker's create was awaited: a connection that went meanwhile would leave a shell nobody detaches.
+        if (ws.readyState !== ws.OPEN || bound !== null) {
+          void pty.terminate().finally(() => { if (isWorkerPtySession(pty)) pty.forget(); });
           return;
         }
 

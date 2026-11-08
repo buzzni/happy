@@ -98,7 +98,7 @@ import { BrowserSessionBrokerClient } from './browserSessionBrokerContract';
 import { getBusyDaemonTerminalCount, getDaemonTerminalSessionCount, type DaemonTerminalEntry } from './daemonTerminalSessions';
 import { TerminalWorkerHost } from './terminalWorker/workerHost';
 import { decideTerminalSurvival, terminalWorkersEnabled, type TerminalSurvivalDecision } from './terminalWorker/survivalDecision';
-import { queryInstalledWorkerProtocol } from './terminalWorker/installedProtocol';
+import { installedWorkerProtocolMatches } from './terminalWorker/installedProtocol';
 import { isWorkerPtySession } from './terminalWorker/workerPtySession';
 import { startBrowserBridgeServer, retryBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './browserBridgeServer';
 import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
@@ -5941,23 +5941,14 @@ export async function startDaemon(): Promise<void> {
         + activeServerAutomationLeaseCount,
     });
     // aplus terminal-survive-runner-restart HR3·HR5: what a restart does with worker terminals.
-    // The installed bundle's protocol is asked at start, when a drain opens, and again (awaited)
-    // at the point of no return.
-    let installedWorkerProtocolMatches = true;
-    let installedWorkerProtocolCheckedAt = 0;
-    const refreshInstalledWorkerProtocol = async () => {
-      installedWorkerProtocolCheckedAt = Date.now();
-      installedWorkerProtocolMatches = await queryInstalledWorkerProtocol();
-      return installedWorkerProtocolMatches;
-    };
-    if (terminalWorkers.enabled) void refreshInstalledWorkerProtocol();
+    // The installed bundle is read each time — it is what the next daemon runs from.
     const terminalSurvivalFor = (intent: 'restart' | 'stop', reason: Parameters<typeof decideTerminalSurvival>[0]['reason']): TerminalSurvivalDecision | null =>
       terminalWorkers.enabled ? decideTerminalSurvival({
         platform: process.platform,
         workersEnabled: true,
         intent,
         reason,
-        installedProtocolMatches: installedWorkerProtocolMatches,
+        installedProtocolMatches: installedWorkerProtocolMatches(),
         recordsReadable: terminalWorkers.recordsReadable(),
       }) : null;
     const survivesRestart = (entry: DaemonTerminalEntry) => isWorkerPtySession(entry.session);
@@ -6073,7 +6064,6 @@ export async function startDaemon(): Promise<void> {
       // Worker terminals the drain keeps stay as they are (HR3); everything else closes, as before.
       closeTerminalsForRestart: async (view) => {
         void drainBashRpcs();
-        if (terminalWorkers.enabled) await refreshInstalledWorkerProtocol();
         const keep = terminalSurvivalFor(view.intent, view.reason)?.terminals === 'keep';
         terminalWorkers.setKeeping(keep);
         if (terminalWorkers.enabled) logger.debug(`[TERMINAL-WORKER] restart ${view.intent}/${view.reason}: worker terminals ${keep ? 'kept' : 'closed'}`);
@@ -6083,13 +6073,7 @@ export async function startDaemon(): Promise<void> {
       preflightReplacement: () => preflightInstalledHappyCLI(),
       handOff: handOffToInstalledBundle,
       shutdown: () => requestShutdown('happy-cli'),
-      publishLifecycle: () => {
-        apiMachine.publishRestartLifecycle();
-        // A drain just opened: ask the installed bundle again, then say what that means for terminals.
-        if (terminalWorkers.enabled && restartDrainRuntime?.controller.current() && Date.now() - installedWorkerProtocolCheckedAt > 10_000) {
-          void refreshInstalledWorkerProtocol().then(() => apiMachine.publishRestartLifecycle());
-        }
-      },
+      publishLifecycle: () => apiMachine.publishRestartLifecycle(),
       happyHomeDir: configuration.happyHomeDir,
       cliVersion: packageJson.version,
       log: (message) => logger.debug(message),

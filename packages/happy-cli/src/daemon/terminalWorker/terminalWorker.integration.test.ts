@@ -11,7 +11,6 @@ import { WebSocket } from 'ws'
 import { decodeBase64, decrypt, encodeBase64, encrypt, getRandomBytes } from '@/api/encryption'
 import { readCurrentBootIdSync } from '@/utils/bootIdentity'
 import { getProcessStartedAt } from '@/utils/processStartTime'
-import { resolveHappyCliSpawnCommand } from '@/utils/spawnHappyCLI'
 import { TERMINAL_WORKER_PROTOCOL_OVERRIDE_ENV, type WorkerListResult } from './protocol'
 import { listTerminalWorkerRecords, writeTerminalWorkerRecord, type TerminalWorkerRecord } from './record'
 import { connectTerminalWorker, launchTerminalWorker, type WorkerConnection } from './workerClient'
@@ -46,11 +45,6 @@ describe.runIf(posix)('terminal worker as a real detached process', () => {
     })
 
     const env = (extra: NodeJS.ProcessEnv = {}) => ({ ...process.env, HAPPY_HOME_DIR: home, ...extra })
-
-    it('reports its protocol version from the installed build', () => {
-        const command = resolveHappyCliSpawnCommand(['terminal-worker', '--protocol-version'])
-        expect(execFileSync(command.runtime, command.args, { encoding: 'utf8', env: env() }).trim()).toBe('1')
-    })
 
     it('runs in its own process group, records itself owner-only, and keeps its shells across controllers', async () => {
         const { connection, pid } = await launchTerminalWorker({ happyHome: home, env: env() })

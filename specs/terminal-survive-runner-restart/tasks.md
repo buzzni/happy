@@ -14,7 +14,7 @@
 
 ## Phase 2 — 워커 프로세스와 프록시
 - [x] T6. (structural) `TerminalOutputBuffer` seq 지정 append·dump/restore, `bindTerminal` 상태 내보내기/복원 — 동작 보존 → 기존 테스트 + 새 단위 테스트
-- [x] T7. `terminalWorker/workerProcess.ts` + `happy terminal-worker` 하위 명령(`--protocol-version` 포함) → 통합 테스트(생성·입출력·terminate·hello 실패·컨트롤러 교체·자기 수명)
+- [x] T7. `terminalWorker/workerProcess.ts` + `happy terminal-worker` 하위 명령(설치본 프로토콜은 package.json `happyTerminalWorkerProtocol`) → 통합 테스트(생성·입출력·terminate·hello 실패·컨트롤러 교체·자기 수명)
 - [x] T8. `terminalWorker/workerClient.ts`(launch·connect·hello·요청/응답) + `workerPtySession.ts`(PtySession 구현) → 통합 테스트
 
 ## Phase 3 — 데몬 배선

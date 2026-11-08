@@ -48,7 +48,7 @@ daemon ──spawn(detached, stdio: [ignore, pipe(ready), logFd])──► termi
 
 ### 2.5 유지 결정과 광고 (HR3·HR4)
 
-- 드레인 runtime이 드레인 시작 시 `decideTerminalSurvival({platform, workerEnabled, intent, reason, installedProtocol, recordsReadable})` → `{terminals:'keep'|'close', reason?}`를 계산해 lifecycle에 싣는다. `installedProtocol`은 기존 `preflightReplacement`와 같은 자리에서 설치본에 `terminal-worker --protocol-version`을 물어 얻는다(실패·불일치 = `incompatible`).
+- 드레인 runtime이 드레인 시작 시 `decideTerminalSurvival({platform, workerEnabled, intent, reason, installedProtocol, recordsReadable})` → `{terminals:'keep'|'close', reason?}`를 계산해 lifecycle에 싣는다. `installedProtocol`은 설치본 `package.json`의 `happyTerminalWorkerProtocol`을 매번 읽어 얻는다(없음·불일치 = `incompatible`).
 - `finalizeReady`: keep이면 릴레이 터미널만 지금처럼 `daemon-restart`로 닫고, 직결 워커 터미널은 `setMeta`로 바인딩 상태를 밀어 넣은 뒤 소켓만 끊는다(`detach`). close면 지금처럼 전부 닫는다(워커 `terminate` → 워커가 비면 스스로 종료).
 - `getRestartDrainActivity().busyTerminalCount`·핸드오프 터미널 대기: keep일 때 닫힐 터미널만 센다.
 - 종료 경로: `requestShutdown`(SIGTERM·SIGINT·stop 드레인·`happy daemon stop`) = 워커 `shutdown`(닫기). 핸드오프 성공 = detach 후 `process.exit(0)`. 크래시 = 아무것도 안 함.
