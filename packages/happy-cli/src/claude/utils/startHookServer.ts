@@ -92,6 +92,11 @@ export interface HookServerOptions {
         decide: (call: PreToolUseCall, signal: AbortSignal) => Promise<HookVerdict>;
         /** R9: the cua-driver shadow proxy and the stdio bridge report what their server lists. */
         toolsListed?: (tools: ListedTool[]) => void;
+        /**
+         * The current turn's "nobody to ask" (aplus-dev-studio-desktop specs/skill-lock R4): the file guard asks
+         * only when the skill lock file is corrupt, to lock every skill in an unattended turn.
+         */
+        unattended?: () => boolean;
     };
 }
 
@@ -167,6 +172,17 @@ export async function startHookServer(options: HookServerOptions): Promise<HookS
 
             if (req.method === 'POST' && req.url === '/hook/tools-listed' && preToolUse) {
                 await handleToolsListed(req, res, preToolUse);
+                return;
+            }
+
+            if (req.method === 'POST' && req.url === '/hook/attendance' && preToolUse?.unattended) {
+                const presented = req.headers[PRE_TOOL_USE_SECRET_HEADER];
+                req.resume();
+                if (typeof presented !== 'string' || !secretMatches(presented, preToolUse.secret)) {
+                    res.writeHead(403).end('forbidden');
+                    return;
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ unattended: preToolUse.unattended() }));
                 return;
             }
 

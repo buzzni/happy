@@ -23,6 +23,15 @@ export const POLICY_HOOK_TIMEOUT_SECONDS = 1900;
 
 export const TOOL_POLICY_FILE_NAME = 'tool-policy.json';
 
+/**
+ * Skill locks (aplus-dev-studio-desktop specs/skill-lock): written by Desktop beside the policy file, read by
+ * the file guard hook on every Edit/Write/MultiEdit/NotebookEdit/Bash call.
+ */
+export const SKILL_LOCKS_FILE_NAME = 'skill-locks.json';
+
+/** `skill-lock` in `toolPolicy.enforcement`: Claude sessions on this daemon refuse writes into locked skills. */
+export const TOOL_POLICY_SKILL_LOCK = 'skill-lock';
+
 export function isToolPolicyEnabled(env: NodeJS.ProcessEnv): boolean {
     return env.HAPPY_TOOL_POLICY?.trim().toLowerCase() !== 'off';
 }
@@ -36,15 +45,20 @@ export function isToolPolicyEnabled(env: NodeJS.ProcessEnv): boolean {
  * verb rule this daemon decides by (policy-tables §4), so Desktop labels a conversation's tools by its PC's rule.
  * `policyVersion` names its table: Desktop's labels use its own PC's dictionary, so a different version labels nothing.
  * `grant-control`: a session lists and revokes its conversation grants over session RPCs (grantControl.ts, R18).
+ * `skill-lock`: the file guard refuses agent writes into skills the user locked (Claude sessions only).
  */
 export function toolPolicyMachineCapability(env: NodeJS.ProcessEnv): { version: 1; enforcement: string[]; policyVersion: string } | undefined {
     return isToolPolicyEnabled(env)
-        ? { version: 1, enforcement: ['claude-hook', 'cua-proxy', 'codex-bridge', `verb-words:${BUILTIN_TABLES.mcp.verbWords}`, TOOL_POLICY_GRANT_CONTROL], policyVersion: BUILTIN_TABLES.policyVersion }
+        ? { version: 1, enforcement: ['claude-hook', 'cua-proxy', 'codex-bridge', `verb-words:${BUILTIN_TABLES.mcp.verbWords}`, TOOL_POLICY_GRANT_CONTROL, TOOL_POLICY_SKILL_LOCK], policyVersion: BUILTIN_TABLES.policyVersion }
         : undefined;
 }
 
 export function toolPolicyFilePath(happyHomeDir: string): string {
     return join(happyHomeDir, TOOL_POLICY_FILE_NAME);
+}
+
+export function skillLocksFilePath(happyHomeDir: string): string {
+    return join(happyHomeDir, SKILL_LOCKS_FILE_NAME);
 }
 
 /**

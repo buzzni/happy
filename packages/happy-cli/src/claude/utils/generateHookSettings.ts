@@ -5,7 +5,7 @@
  * to notify our HTTP server when sessions change (new session, resume, compact, etc.)
  */
 
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { writeFileSync, mkdirSync, unlinkSync, existsSync } from 'node:fs';
 import { configuration } from '@/configuration';
@@ -16,7 +16,7 @@ import {
     resolveMachineLockdownPolicy,
     type MachineLockdownPolicy,
 } from '@/daemon/machineLockdownPolicy';
-import { buildToolPolicyHookEntries } from '@/toolPolicy/claudeHook';
+import { buildToolPolicyHookEntries, skillLocksFilePath } from '@/toolPolicy/claudeHook';
 
 /**
  * Pure settings document. `permissions.deny` always guards broad kills; under
@@ -80,9 +80,11 @@ export function buildHookSettings(input: {
  */
 export function toolPolicyHookCommands(input: { execPath: string; scriptsDir: string; port: number; secretFile: string; policyFile: string; protectedDirs?: string[] }): { forwarderCommand: string; fileGuardCommand: string } {
     const dirs = (input.protectedDirs ?? []).map((dir) => ` --dir "${dir}"`).join('');
+    // aplus-dev-studio-desktop specs/skill-lock: the lock file sits beside the policy file Desktop writes.
+    const skillLocks = ` --skill-locks "${skillLocksFilePath(dirname(input.policyFile))}" --hook ${input.port} "${input.secretFile}"`;
     return {
         forwarderCommand: `"${input.execPath}" "${join(input.scriptsDir, 'policy_hook_forwarder.cjs')}" ${input.port} "${input.secretFile}"`,
-        fileGuardCommand: `"${input.execPath}" "${join(input.scriptsDir, 'tool_policy_file_guard.cjs')}" "${input.policyFile}"${dirs}`,
+        fileGuardCommand: `"${input.execPath}" "${join(input.scriptsDir, 'tool_policy_file_guard.cjs')}" "${input.policyFile}"${dirs}${skillLocks}`,
     };
 }
 
