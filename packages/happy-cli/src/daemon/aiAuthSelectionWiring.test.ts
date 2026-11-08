@@ -187,9 +187,20 @@ describe('org-endpoint wiring (aplus specs/org-llm-endpoints C5)', () => {
 
   it('a started endpoint session is reported to Studio without holding the spawn result', async () => {
     const text = await runSource()
-    expect(text).toMatch(/if \(appliedOrgLlmEndpoint\) void orgEndpointStudio\.reportSessionStarted\(\{ \.\.\.appliedOrgLlmEndpoint, sessionId: result\.sessionId \}\);/)
+    expect(text).toMatch(/if \(appliedOrgLlmEndpoint\) void orgEndpointStartReports\.reportAfterSpawn\(result\.sessionId, appliedOrgLlmEndpoint\);/)
+    expect(text).toMatch(/send: \(report\) => orgEndpointStudio\.reportSessionStarted\(report\),/)
     // The client authenticates with the daemon's own token and trusted origin, like its other Studio calls.
     expect(text).toMatch(/createOrgLlmEndpointStudioClient\(\{\s*studioOrigin: readTrustedStudioOrigin\(process\.env\), bearer: \(\) => credentials\.token, fetch,/)
+  })
+
+  it('a resume sends a start report Studio never took before it asks Studio, and the record it updates is the tracked one and the persisted one', async () => {
+    const text = await runSource()
+    const resend = text.indexOf('orgEndpointStartReports.resendIfPending(happySessionId,')
+    const check = text.indexOf('orgEndpointStudio.checkResume({')
+    expect(resend).toBeGreaterThan(0)
+    expect(resend).toBeLessThan(check)
+    // Both copies: the cursor writers persist the tracked session's environment, so updating only the file would be undone.
+    expect(text).toMatch(/if \(tracked\) tracked\.agentEnvironment = agentEnvironment;\s*const saved = readPersistedSessions\(\)\[sessionId\];\s*if \(saved\) persistSession\(sessionId, \{ \.\.\.saved, agentEnvironment, savedAt: Date\.now\(\) \}\);/)
   })
 
   it('the applied target reaches the spawn result', async () => {

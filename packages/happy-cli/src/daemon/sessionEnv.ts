@@ -23,7 +23,7 @@ import { ADDITIONAL_DIRECTORIES_ENV, readAdditionalDirectoriesEnvironment } from
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars'
 import { normalizeSessionSource, SESSION_SOURCE_ENV } from '@/utils/sessionSource'
 import { DELEGATED_ATTENDANCE_ENV, parseDelegatedAttendance } from '@/api/turnAttendance'
-import { ORG_ENDPOINT_BINDING_ENV, sanitizeChildEnv, SETUP_TOKEN_BINDING_ENV } from '@/utils/childEnv'
+import { ORG_ENDPOINT_BINDING_ENV, ORG_ENDPOINT_UNREPORTED_ENV, sanitizeChildEnv, SETUP_TOKEN_BINDING_ENV } from '@/utils/childEnv'
 import { OUTPUT_FORMAT_ENV, parseOutputFormat } from '@/claude/structuredOutput'
 import { INPUT_EVIDENCE_ENV, requestedInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings'
 import { AGENT_PLAN_DESCRIPTOR_ENV, AGENT_PLAN_SECRET_ENV } from '@/launcher/agentPlanLaunch'
@@ -38,7 +38,7 @@ function isValidOutputFormatSeed(raw: string): boolean {
     }
 }
 
-export { ORG_ENDPOINT_BINDING_ENV, SETUP_TOKEN_BINDING_ENV }
+export { ORG_ENDPOINT_BINDING_ENV, ORG_ENDPOINT_UNREPORTED_ENV, SETUP_TOKEN_BINDING_ENV }
 
 const SAYCODE_AGENT_ENV_KEYS = [
     'SAYCODE_AGENT_ENV',
@@ -68,7 +68,7 @@ export const BROWSER_CONTINUATION_ENV = 'HAPPY_AUTOMATION_BROWSER_CONTINUATION'
  */
 const AGENT_PLAN_SEED_KEYS = [AGENT_PLAN_DESCRIPTOR_ENV, AGENT_PLAN_SECRET_ENV, AGENT_PLAN_THREADS_DIR_ENV] as const
 type AgentPlanSeedKey = typeof AGENT_PLAN_SEED_KEYS[number]
-type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | typeof ORG_ENDPOINT_BINDING_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV | AgentPlanSeedKey
+type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | typeof ORG_ENDPOINT_BINDING_ENV | typeof ORG_ENDPOINT_UNREPORTED_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV | AgentPlanSeedKey
 
 export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey | typeof DAEMON_AGENT_GRANT_STATE_ENV, string>>
 
@@ -348,6 +348,8 @@ export function captureSaycodeAgentEnvironment(
     // Same sentinel rule as the setup-token binding: a corrupt record stays bound-but-invalid and the resume refuses it.
     const orgEndpointBinding = env[ORG_ENDPOINT_BINDING_ENV]
     if (orgEndpointBinding !== undefined) captured[ORG_ENDPOINT_BINDING_ENV] = parseOrgEndpointBinding(orgEndpointBinding) ? orgEndpointBinding : ''
+    // An undelivered start report travels with the record until Studio has it (r3); any other value is dropped.
+    if (env[ORG_ENDPOINT_UNREPORTED_ENV] === '1') captured[ORG_ENDPOINT_UNREPORTED_ENV] = '1'
     if (env[AGENT_PLAN_DESCRIPTOR_ENV] && env[AGENT_PLAN_SECRET_ENV]) {
         for (const key of AGENT_PLAN_SEED_KEYS) if (env[key]) captured[key] = env[key]
     }

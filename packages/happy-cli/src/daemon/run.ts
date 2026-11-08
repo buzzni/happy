@@ -148,6 +148,7 @@ import { sanitizeChildEnv } from '@/utils/childEnv';
 import { resolveRecoveredInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings';
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
 import { createOrgLlmEndpointStudioClient } from './orgLlmEndpointStudio';
+import { createOrgEndpointStartReporter } from './orgLlmEndpointStartReport';
 import { createSetupTokenCapacityFence, proveCapacityProcessesStopped } from './setupTokenCapacityFence';
 import { createCollectorSchedule } from './collectorSchedule';
 import { organizationResumeRefusal, resumeSetupTokenEnvironment, shareResumeInFlight, type ResumeAuthRequirement } from './resumeSetupTokenRebind';
@@ -2054,6 +2055,18 @@ export async function startDaemon(): Promise<void> {
     const orgEndpointStudio = createOrgLlmEndpointStudioClient({
       studioOrigin: readTrustedStudioOrigin(process.env), bearer: () => credentials.token, fetch, warn: (message) => logger.warn(message),
     });
+    // r3: a start report Studio never took stays pending in the session's record and is sent again before a resume.
+    const orgEndpointStartReports = createOrgEndpointStartReporter({
+      send: (report) => orgEndpointStudio.reportSessionStarted(report),
+      readEnvironment: (sessionId) => findTrackedSessionById(sessionId)?.agentEnvironment,
+      writeEnvironment: (sessionId, agentEnvironment) => {
+        const tracked = findTrackedSessionById(sessionId);
+        if (tracked) tracked.agentEnvironment = agentEnvironment;
+        const saved = readPersistedSessions()[sessionId];
+        if (saved) persistSession(sessionId, { ...saved, agentEnvironment, savedAt: Date.now() });
+      },
+      warn: (message) => logger.warn(message),
+    });
     type WorkspaceLaunchObservation = { submitted: boolean; tracked: boolean; onObservedExit?: () => Promise<void> };
     const spawnSessionUnchecked = async (
       options: SpawnSessionOptions,
@@ -2167,7 +2180,7 @@ export async function startDaemon(): Promise<void> {
               : { ...result, appliedAiAuthSource };
             const withEndpoint: SpawnSessionResult = { ...withAuthSource, ...(appliedOrgLlmEndpoint ? { appliedOrgLlmEndpoint } : {}) };
             // Not awaited, never fails the spawn: the session already runs, and Studio learns of it on its own clock.
-            if (appliedOrgLlmEndpoint) void orgEndpointStudio.reportSessionStarted({ ...appliedOrgLlmEndpoint, sessionId: result.sessionId });
+            if (appliedOrgLlmEndpoint) void orgEndpointStartReports.reportAfterSpawn(result.sessionId, appliedOrgLlmEndpoint);
             const reported: SpawnSessionResult = launchMcpDropped ? { ...withEndpoint, launchMcpDropped } : withEndpoint;
             if (options.additionalDirectories === undefined) return reported;
             return {
@@ -3276,6 +3289,8 @@ export async function startDaemon(): Promise<void> {
         // The local copy of the endpoint can be older than the administrator's last change (a removed address, a rotated
         // token, a stopped endpoint, a revoked assignment). Studio confirms the binding, or the session is not resumed.
         if (resumeOrgEndpoint) {
+          // A start report Studio never took is sent first; resume-check is still the authority, so a failure here only logs.
+          await orgEndpointStartReports.resendIfPending(happySessionId, { bindingId: resumeOrgEndpoint.bindingId, targetId: resumeOrgEndpoint.candidates[0]! });
           const endpointVerdict = await orgEndpointStudio.checkResume({
             bindingId: resumeOrgEndpoint.bindingId, sessionId: happySessionId, endpointId: resumeOrgEndpoint.endpointId,
             targetId: resumeOrgEndpoint.candidates[0]!, generation: resumeOrgEndpoint.generation,

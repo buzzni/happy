@@ -18,6 +18,7 @@ import {
     captureSaycodeAgentEnvironment as captureSetupTokenEnvironment,
     readSetupTokenResumeSelection,
     ORG_ENDPOINT_BINDING_ENV,
+    ORG_ENDPOINT_UNREPORTED_ENV,
     formatOrgEndpointBinding,
     readOrgEndpointResumeSelection,
     readAppliedOrgLlmEndpoint,
@@ -1105,6 +1106,17 @@ describe('org-endpoint selection (aplus specs/org-llm-endpoints C5)', () => {
         it('is never inherited from the daemon env or taken from a request', () => {
             expect(sanitizeChildEnv({ [ORG_ENDPOINT_BINDING_ENV]: binding })).toEqual({})
             expect(buildSpawnRequestEnvironment({}, { [ORG_ENDPOINT_BINDING_ENV]: binding })).toEqual({})
+        })
+
+        // r3 — an undelivered start report travels with the persisted record until Studio has it.
+        it('keeps the undelivered-report marker through capture, and takes it neither from a request nor an inheritance', () => {
+            expect(ORG_ENDPOINT_UNREPORTED_ENV).toBe('HAPPY_AI_AUTH_ORG_ENDPOINT_UNREPORTED')
+            expect(captureSaycodeAgentEnvironment({ [ORG_ENDPOINT_BINDING_ENV]: binding, [ORG_ENDPOINT_UNREPORTED_ENV]: '1' }))
+                .toEqual({ [ORG_ENDPOINT_BINDING_ENV]: binding, [ORG_ENDPOINT_UNREPORTED_ENV]: '1' })
+            expect(captureSaycodeAgentEnvironment({ [ORG_ENDPOINT_BINDING_ENV]: binding, [ORG_ENDPOINT_UNREPORTED_ENV]: 'yes' }))
+                .toEqual({ [ORG_ENDPOINT_BINDING_ENV]: binding })
+            expect(sanitizeChildEnv({ [ORG_ENDPOINT_UNREPORTED_ENV]: '1' })).toEqual({})
+            expect(buildSpawnRequestEnvironment({}, { [ORG_ENDPOINT_UNREPORTED_ENV]: '1' })).toEqual({})
         })
     })
 

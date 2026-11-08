@@ -132,6 +132,12 @@ export const SETUP_TOKEN_BINDING_ENV = 'HAPPY_AI_AUTH_SETUP_TOKEN_BINDING'
 export const ORG_ENDPOINT_BINDING_ENV = 'HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING'
 
 /**
+ * `'1'` while the daemon's session-started report for an endpoint session has not reached Studio (r3). Kept in the
+ * session's persisted record so a lost report is sent again before a resume; daemon-written only, scrubbed like the binding.
+ */
+export const ORG_ENDPOINT_UNREPORTED_ENV = 'HAPPY_AI_AUTH_ORG_ENDPOINT_UNREPORTED'
+
+/**
  * What an endpoint session's environment owns besides the marker. A daemon restarted by that session
  * inherits all of it, and the next session would then talk to this endpoint with this endpoint's token.
  */
