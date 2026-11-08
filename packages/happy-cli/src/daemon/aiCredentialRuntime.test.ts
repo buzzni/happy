@@ -17,6 +17,7 @@ import {
   type AiCredentialRuntimeDependencies,
 } from './aiCredentialRuntime'
 import { withUvToolBinOnPath } from './uvToolBin'
+import { applyAppliedAiAuthSourceEnv, buildManagedSessionSpawnEnvironment, buildSpawnRequestEnvironment, captureSaycodeAgentEnvironment, readOrgEndpointResumeSelection, verifyAiAuthSelection } from './sessionEnv'
 
 describe('timeAiCredentialCommand', () => {
   it('logs each helper duration with word-shaped subcommands only', async () => {
@@ -4408,6 +4409,31 @@ describe('organization LLM endpoint', () => {
     await expect(runtime.sessionEnvironment('claude', resume)).rejects.toMatchObject({ kind: 'ORG_LLM_ENDPOINT_GENERATION_MISMATCH' })
     await runtime.orgLlmEndpointSync(syncParams({}, { generation: 2, targets: [{ id: 'target-b', url: 'https://llm-b.corp.example' }] }))
     await expect(runtime.sessionEnvironment('claude', resume)).rejects.toMatchObject({ kind: 'ORG_LLM_ENDPOINT_TARGET_UNKNOWN' })
+  })
+
+  it('wins the whole spawn composition and its record survives a capture-resume round trip', async () => {
+    const { runtime } = setup({ fetch: answering('llm-a') })
+    await runtime.orgLlmEndpointSync(syncParams())
+    const chosen = selection({ candidates: ['target-a'] })
+    const managed = await runtime.sessionEnvironment('claude', chosen)
+    const requested = buildSpawnRequestEnvironment({}, {
+      ANTHROPIC_BASE_URL: 'https://evil.invalid', ANTHROPIC_MODEL: 'claude-opus-5', ANTHROPIC_SMALL_FAST_MODEL: 'claude-haiku-4-5',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'requested-haiku', CLAUDE_CODE_MAX_CONTEXT_TOKENS: '1', ANTHROPIC_API_KEY: 'app-key', KEEP: 'yes',
+    })
+    const inherited = { PATH: '/usr/bin', ANTHROPIC_API_KEY: 'machine-key', CLAUDE_CODE_OAUTH_TOKEN: 'machine-oauth', CLAUDE_CODE_USE_BEDROCK: '1', ANTHROPIC_SMALL_FAST_MODEL: 'inherited-small' }
+    const env = applyAppliedAiAuthSourceEnv(buildManagedSessionSpawnEnvironment(inherited, requested, managed), true)
+
+    expect(env).toMatchObject({
+      PATH: '/usr/bin', KEEP: 'yes',
+      ANTHROPIC_BASE_URL: 'https://llm-a.corp.example', ANTHROPIC_AUTH_TOKEN: 'corp-token-123', ANTHROPIC_MODEL: 'corp-model-v1',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'corp-model-v1', CLAUDE_CODE_MAX_CONTEXT_TOKENS: '200000',
+      ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', CLAUDE_CODE_USE_BEDROCK: '', ANTHROPIC_SMALL_FAST_MODEL: '',
+      HAPPY_AI_AUTH_SOURCE: 'org-endpoint',
+    })
+    expect(verifyAiAuthSelection(chosen, env).rejection).toBeUndefined()
+
+    const resume = readOrgEndpointResumeSelection(captureSaycodeAgentEnvironment(env))!
+    await expect(runtime.sessionEnvironment('claude', resume)).resolves.toEqual(managed)
   })
 
   it('does not hold the credential queue while it probes', async () => {
