@@ -28,6 +28,8 @@ import { DIFFICULTY_CLASSIFIER_REVISION } from './difficultyRoutingArtifacts';
 import { healInstallArtifacts } from './installArtifactsHeal';
 import fs from 'fs/promises';
 import os from 'os';
+import { createAgentDelegationStore } from './agentDelegationStore';
+import { delegationConcurrencyLimit } from './agentDelegationMethods';
 import * as tmp from 'tmp';
 import axios from 'axios';
 import * as z from 'zod';
@@ -2275,6 +2277,7 @@ export async function startDaemon(): Promise<void> {
               happyToolsDir: join(projectPath(), 'tools', 'unpacked'), flavor: 'claude', startedFromDaemon: true, startedBy: 'daemon',
               lifecycleState: 'running', lifecycleStateSince: Date.now(),
               ...(options.createdByAccountId ? { createdBy: { accountId: options.createdByAccountId } } : {}),
+              ...(options.delegatedFrom ? { delegatedFrom: options.delegatedFrom } : {}),
               ...(sessionSource ? { source: sessionSource } : {}) },
             createSession: input => ownerApi.getOrCreateSession({ ...input, dataKey: channelSessionKeys.get(options) }),
           });
@@ -2326,6 +2329,7 @@ export async function startDaemon(): Promise<void> {
           createdByAccountId: options.createdByAccountId,
           createdByDisplayName: options.createdByDisplayName,
           sessionSource,
+          delegatedFrom: options.delegatedFrom,
         }));
         logger.debug(`[DAEMON RUN] Environment variable keys (before expansion) (${Object.keys(extraEnv).length}): ${Object.keys(extraEnv).join(', ')}`);
 
@@ -5819,6 +5823,14 @@ export async function startDaemon(): Promise<void> {
     // Set RPC handlers
     apiMachine.setRPCHandlers({
       ...(managedRuntimeActive ? {} : { sessionRetention }),
+      // aplus-dev-studio specs/cross-machine-agent-delegation: links a person installed from Desktop.
+      ...(managedRuntimeActive || standaloneWindows ? {} : { agentDelegation: {
+        store: createAgentDelegationStore({ path: join(configuration.happyHomeDir, 'agent-delegation.json'), log: message => logger.debug(message) }),
+        isSessionLive: sessionId => hasLiveDaemonChild(sessionId, pidToTrackedSession.values(), isPidAlive, ownsUnresolvedJob),
+        readSessionVariant: sessionId => readPersistedSessions()[sessionId]?.encryptionVariant ?? null,
+        stopSession: sessionId => stopSession(sessionId, { source: 'agent-delegation', reason: 'record-failed', mode: 'force' }),
+        concurrencyLimit: delegationConcurrencyLimit({ cpuCount: os.cpus().length, totalMemoryBytes: os.totalmem() }),
+      } }),
       ownedSpawn,
       daemonSessionState: createDaemonSessionStateHandler(getCurrentChildren),
       byosOfflineReceive,

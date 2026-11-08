@@ -17,6 +17,7 @@ import { projectPath } from '@/projectPath';
 import type { SandboxConfig } from '@/persistence';
 import packageJson from '../../package.json';
 import type { SessionSource } from '@/utils/sessionSource';
+import { readDelegatedFromEnv } from '@/utils/delegatedFrom';
 
 /**
  * Backend flavor identifier for session metadata.
@@ -87,6 +88,7 @@ export function createSessionMetadata(opts: CreateSessionMetadataOptions): Sessi
     const state: AgentState = {
         controlledByUser: false,
     };
+    const delegatedFrom = readDelegatedFromEnv(process.env);
 
     const metadata: Metadata = {
         path: process.cwd(),
@@ -117,6 +119,8 @@ export function createSessionMetadata(opts: CreateSessionMetadataOptions): Sessi
         ...(opts.forkedFromMessageId ? { forkedFromMessageId: opts.forkedFromMessageId } : {}),
         ...(opts.createdBy ? { createdBy: opts.createdBy } : {}),
         ...(opts.source ? { source: opts.source } : {}),
+        // Read here rather than by each runner: every flavor a delegated spawn can start records it.
+        ...(delegatedFrom ? { delegatedFrom } : {}),
     };
 
     return { state, metadata };

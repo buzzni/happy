@@ -11,6 +11,7 @@ import {
     RpcRequest,
     RpcHandlerConfig,
     ServerLaneConfig,
+    DelegationLaneConfig,
 } from './types';
 import { Socket } from 'socket.io-client';
 import {
@@ -31,6 +32,9 @@ export class RpcHandlerManager {
     private readonly encryptionKey: Uint8Array;
     private readonly encryptionVariant: 'legacy' | 'dataKey';
     private readonly serverLane: ServerLaneConfig | null;
+    private delegationLane: DelegationLaneConfig | null;
+    /** Apart from the customer guards, so a linked machine's volume cannot refuse this machine's owner. */
+    private readonly delegationNonceGuard: RpcNonceGuard;
     private readonly requireBoundRequests: boolean;
     private readonly nonceGuard: RpcNonceGuard;
     private readonly customerBoundNonceGuard: RpcNonceGuard;
@@ -51,6 +55,7 @@ export class RpcHandlerManager {
         this.encryptionKey = config.encryptionKey;
         this.encryptionVariant = config.encryptionVariant;
         this.serverLane = config.serverLane ?? null;
+        this.delegationLane = config.delegationLane ?? null;
         this.requireBoundRequests = config.requireBoundRequests === true;
         this.nonceGuard = new RpcNonceGuard({
             windowMs: RPC_BINDING_WINDOW_MS,
@@ -59,6 +64,11 @@ export class RpcHandlerManager {
         });
         this.maxBoundRequestsInWindow = config.maxBoundRequestsInWindow ?? 10_000;
         this.customerBoundNonceGuard = new RpcNonceGuard({
+            windowMs: RPC_BINDING_WINDOW_MS,
+            maxEntries: this.maxBoundRequestsInWindow,
+            whenFull: 'refuse',
+        });
+        this.delegationNonceGuard = new RpcNonceGuard({
             windowMs: RPC_BINDING_WINDOW_MS,
             maxEntries: this.maxBoundRequestsInWindow,
             whenFull: 'refuse',
@@ -96,6 +106,14 @@ export class RpcHandlerManager {
      */
     setManagedAllowlist(methods: readonly string[]): void {
         this.managedAllowlist = new Set(methods);
+    }
+
+    /**
+     * Opens the delegation lane once the daemon has its link store. Never closed again for the life
+     * of the manager; revoking a link empties `links` instead.
+     */
+    setDelegationLane(lane: DelegationLaneConfig): void {
+        this.delegationLane = lane;
     }
 
     /** Internal host policy, independent of managed identity and enforced for late registrations too. */
@@ -165,9 +183,13 @@ export class RpcHandlerManager {
             // customer-lane request names its method, scope, issue time and
             // nonce inside the ciphertext; the server routes the method in
             // clear. The reply to a bound request carries its nonce back.
+            // A delegation-lane request is always held to strict: the server
+            // never has a link key, so its window and nonce are real protection.
             let params: unknown = opened.value;
             let replyNonce: string | null = null;
-            if (opened.lane === 'customer') {
+            const sealWithLaneKey = (value: unknown) => encodeBase64(encrypt(opened.key, opened.variant, value));
+            const strictBinding = opened.lane === 'delegation' || this.requireBoundRequests || this.customerBound.has(request.method);
+            if (opened.lane === 'customer' || opened.lane === 'delegation') {
                 const now = Date.now();
                 const binding = readBoundRpcRequest(opened.value, {
                     method: bareMethod,
@@ -176,7 +198,7 @@ export class RpcHandlerManager {
                     // Under compat the server can already obtain the scope key, so the
                     // window would protect nothing and only refuse a client whose clock
                     // is off. Strict keeps it.
-                    allowStale: !(this.requireBoundRequests || this.customerBound.has(request.method)),
+                    allowStale: !strictBinding,
                 });
                 if (binding.kind === 'refused') {
                     this.logger('[RPC] Bound request refused', { method: request.method, code: binding.code });
@@ -187,11 +209,11 @@ export class RpcHandlerManager {
                             : 'Request binding refused',
                         code: binding.code,
                     };
-                    return sealWithScopeKey(binding.nonce ? bindRpcResponse(binding.nonce, refusal) : refusal);
+                    return sealWithLaneKey(binding.nonce ? bindRpcResponse(binding.nonce, refusal) : refusal);
                 }
-                if (binding.kind === 'unbound' && (this.requireBoundRequests || this.customerBound.has(request.method))) {
+                if (binding.kind === 'unbound' && strictBinding) {
                     this.logger('[RPC] Unbound request refused under strict machine control', { method: request.method });
-                    return sealWithScopeKey({
+                    return sealWithLaneKey({
                         error: 'Strict machine control accepts only bound requests',
                         code: 'RPC_UNBOUND_REQUEST',
                     });
@@ -205,19 +227,19 @@ export class RpcHandlerManager {
                     }
                     // A stale request is remembered from when it arrived. Its own issue time
                     // would forget it at once, or hold the guard's oldest slot for hours.
-                    const guard = this.ownNonceGuards.get(request.method)
+                    const guard = opened.lane === 'delegation' ? this.delegationNonceGuard : this.ownNonceGuards.get(request.method)
                         ?? (this.customerBound.has(request.method) ? this.customerBoundNonceGuard : this.nonceGuard);
                     const admission = guard.admit(binding.nonce, binding.stale ? now : binding.issuedAt, now);
                     if (admission === 'full') {
                         this.logger('[RPC] Bound request refused: the time window holds as many as it can remember', { method: request.method });
-                        return sealWithScopeKey(bindRpcResponse(binding.nonce, {
+                        return sealWithLaneKey(bindRpcResponse(binding.nonce, {
                             error: 'Too many requests within the time window; retry shortly',
                             code: 'RPC_TOO_MANY_REQUESTS',
                         }));
                     }
                     if (admission === 'replayed') {
                         this.logger('[RPC] Replayed request refused', { method: request.method });
-                        return sealWithScopeKey(bindRpcResponse(binding.nonce, {
+                        return sealWithLaneKey(bindRpcResponse(binding.nonce, {
                             error: 'Request was already received',
                             code: 'RPC_REQUEST_REPLAYED',
                         }));
@@ -232,8 +254,9 @@ export class RpcHandlerManager {
                 replyNonce ? bindRpcResponse(replyNonce, value) : value,
             ));
             // Refusals before dispatch stay sealed with the scope key, so a
-            // server-lane caller cannot read them; a bound one is bound.
-            const sealRefusal = (value: unknown) => opened.lane === 'customer' ? seal(value) : sealWithScopeKey(value);
+            // server-lane caller cannot read them; a bound one is bound. A linked
+            // machine reads its own refusals: it must tell its agent why.
+            const sealRefusal = (value: unknown) => opened.lane === 'server' ? sealWithScopeKey(value) : seal(value);
 
             const refusal = this.methodPolicy?.(bareMethod);
             if (refusal) return sealRefusal(refusal);
@@ -243,6 +266,12 @@ export class RpcHandlerManager {
                     error: `${bareMethod} is not available on a managed runtime; use the managed dispatch RPCs`,
                     code: 'MANAGED_CAPABILITY_REQUIRED',
                 });
+            }
+
+            // Before the handler lookup, so the lane learns nothing about methods it may not call.
+            if (opened.lane === 'delegation' && !this.delegationLane!.allows(bareMethod)) {
+                this.logger('[RPC] Delegation lane method refused', { method: request.method, peer: opened.peer });
+                return seal({ error: `${bareMethod} is not available to a linked machine`, code: 'DELEGATION_LANE_METHOD_NOT_ALLOWED' });
             }
 
             const handler = this.handlers.get(request.method);
@@ -256,11 +285,19 @@ export class RpcHandlerManager {
                 return seal({ error: `${bareMethod} is not available to the server lane`, code: 'SERVER_LANE_METHOD_NOT_ALLOWED' });
             }
 
+            const delegated = opened.lane === 'delegation' ? { lane: 'delegation' as const, peer: opened.peer! } : null;
+            const admission = delegated ? this.delegationLane!.admit?.(bareMethod, params, delegated.peer) ?? null : null;
+            if (admission) {
+                this.logger('[RPC] Delegation lane call refused', { method: request.method, peer: delegated!.peer, code: admission.code });
+                return seal(admission);
+            }
+
             // Call the handler
-            this.logger('[RPC] Calling handler', { method: request.method, lane: opened.lane, bound: replyNonce !== null });
+            this.logger('[RPC] Calling handler', { method: request.method, lane: opened.lane, bound: replyNonce !== null, ...(delegated ? { peer: delegated.peer } : {}) });
+            const invoke = () => delegated ? handler(params, delegated) : handler(params);
             let result: unknown;
             try {
-                result = await (trace ? trace.measure('daemon-handler', () => Promise.resolve(handler(params))) : handler(params));
+                result = await (trace ? trace.measure('daemon-handler', () => Promise.resolve(invoke())) : invoke());
             } catch (error) {
                 this.logger('[RPC] [ERROR] Error handling request', { error });
                 return seal({ error: error instanceof Error ? error.message : 'Unknown error' });
@@ -281,18 +318,22 @@ export class RpcHandlerManager {
         }
     }
 
-    /** Opens params with the scope key, then the server lane key; null when neither does. */
-    private openParams(params: string): { value: any; lane: 'customer' | 'server'; key: Uint8Array; variant: 'legacy' | 'dataKey' } | null {
+    /** Opens params with the scope key, then the server lane key, then each link key; null when none does. */
+    private openParams(params: string): { value: any; lane: 'customer' | 'server' | 'delegation'; key: Uint8Array; variant: 'legacy' | 'dataKey'; peer?: string } | null {
         const bytes = decodeBase64(params);
         const asCustomer = tryDecrypt(this.encryptionKey, this.encryptionVariant, bytes);
         if (asCustomer.ok) {
             return { value: asCustomer.value, lane: 'customer', key: this.encryptionKey, variant: this.encryptionVariant };
         }
-        if (!this.serverLane) return null;
-        const asServer = tryDecrypt(this.serverLane.encryptionKey, 'dataKey', bytes);
-        return asServer.ok
-            ? { value: asServer.value, lane: 'server', key: this.serverLane.encryptionKey, variant: 'dataKey' }
-            : null;
+        if (this.serverLane) {
+            const asServer = tryDecrypt(this.serverLane.encryptionKey, 'dataKey', bytes);
+            if (asServer.ok) return { value: asServer.value, lane: 'server', key: this.serverLane.encryptionKey, variant: 'dataKey' };
+        }
+        for (const link of this.delegationLane?.links() ?? []) {
+            const asPeer = tryDecrypt(link.key, 'dataKey', bytes);
+            if (asPeer.ok) return { value: asPeer.value, lane: 'delegation', key: link.key, variant: 'dataKey', peer: link.peer };
+        }
+        return null;
     }
 
     onSocketConnect(socket: Socket): void {

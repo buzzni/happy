@@ -399,6 +399,12 @@ export interface SpawnSessionOptions {
      */
     createdByAccountId?: string;
     createdByDisplayName?: string;
+    /**
+     * The linked machine and its session that asked for this one (aplus-dev-studio
+     * specs/cross-machine-agent-delegation R9), recorded as metadata `delegatedFrom`. Set only by the
+     * daemon's delegated spawn, never from a request. Not lineage — re-supplied on every spawn.
+     */
+    delegatedFrom?: { machineId: string; sessionId: string };
     /** Who asked for this session, recorded as metadata `source` (see SessionSource). Not lineage. */
     sessionSource?: SessionSource;
     axStep?: 'plan' | 'design' | 'free';

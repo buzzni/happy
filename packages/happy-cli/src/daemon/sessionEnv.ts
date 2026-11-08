@@ -28,6 +28,7 @@ import { OUTPUT_FORMAT_ENV, parseOutputFormat } from '@/claude/structuredOutput'
 import { INPUT_EVIDENCE_ENV, requestedInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings'
 import { AGENT_PLAN_DESCRIPTOR_ENV, AGENT_PLAN_SECRET_ENV } from '@/launcher/agentPlanLaunch'
 import { AGENT_PLAN_THREADS_DIR_ENV } from '@/launcher/agentPlanThreads'
+import { DELEGATED_FROM_MACHINE_ENV, DELEGATED_FROM_SESSION_ENV } from '@/utils/delegatedFrom'
 
 function isValidOutputFormatSeed(raw: string): boolean {
     try {
@@ -48,6 +49,9 @@ const SAYCODE_AGENT_ENV_KEYS = [
     'SAYCODE_AGENT_DEPTH',
     'SAYCODE_AGENT_MAX_SPAWN',
     'SAYCODE_AGENT_ID',
+    // aplus-dev-studio specs/cross-machine-agent-delegation: the linked machine a delegated session was
+    // started for. Only narrows (its `happy agent` refuses a second hop), so a forged one costs nothing.
+    'SAYCODE_AGENT_DELEGATED_FROM',
 ] as const
 
 type SaycodeAgentEnvironmentKey = typeof SAYCODE_AGENT_ENV_KEYS[number]
@@ -78,10 +82,15 @@ export function buildSessionRequesterEnv(options: {
     createdByAccountId?: string
     createdByDisplayName?: string
     sessionSource?: unknown
+    delegatedFrom?: { machineId: string; sessionId: string }
 }): Record<string, string> {
     const env: Record<string, string> = {}
     if (options.createdByAccountId) env.HAPPY_CREATED_BY_ACCOUNT_ID = options.createdByAccountId
     if (options.createdByDisplayName) env.HAPPY_CREATED_BY_DISPLAY_NAME = options.createdByDisplayName
+    if (options.delegatedFrom) {
+        env[DELEGATED_FROM_MACHINE_ENV] = options.delegatedFrom.machineId
+        env[DELEGATED_FROM_SESSION_ENV] = options.delegatedFrom.sessionId
+    }
     const source = normalizeSessionSource(options.sessionSource)
     if (source) env[SESSION_SOURCE_ENV] = source
     return env
@@ -115,6 +124,7 @@ export function buildSessionSpawnEnvironment(
 const DIRECTORY_VALUE = /^(\/|[A-Za-z]:[\\/]|\\\\)/
 const COUNT_VALUE = /^\d{1,9}$/
 const AGENT_ID_VALUE = /^[A-Za-z0-9_-]{1,64}$/
+const MACHINE_ID_VALUE = /^[A-Za-z0-9_.:-]{1,128}$/
 
 function readRequestedSaycodeAgentGrant(
     requested: Record<string, string>,
@@ -130,6 +140,7 @@ function readRequestedSaycodeAgentGrant(
     if (!isValid('SAYCODE_AGENT_DEPTH', COUNT_VALUE)) return undefined
     if (!isValid('SAYCODE_AGENT_MAX_SPAWN', COUNT_VALUE)) return undefined
     if (!isValid('SAYCODE_AGENT_ID', AGENT_ID_VALUE)) return undefined
+    if (!isValid('SAYCODE_AGENT_DELEGATED_FROM', MACHINE_ID_VALUE)) return undefined
     return Object.fromEntries(
         SAYCODE_AGENT_ENV_KEYS.flatMap((key) => requested[key] === undefined ? [] : [[key, requested[key]]]),
     )

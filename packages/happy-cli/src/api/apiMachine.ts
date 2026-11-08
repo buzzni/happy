@@ -59,6 +59,8 @@ import type { ByosOfflineRpcHandlers } from '@/daemon/byosOfflineReceive';
 import type { DifficultyRoutingClassifierHost } from '@/daemon/difficultyRoutingClassifierHost';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
 import { machineServerLane } from './rpc/serverLane';
+import { machineDelegationLane } from './rpc/delegationLane';
+import { AGENT_DELEGATION_CAPABILITY, delegationLaneAdmission, registerAgentDelegationRpc, type AgentDelegationHost } from '@/daemon/agentDelegationMethods';
 import { createMachineMetadataHandlers, probeLocalHttp, runFileWithoutShell } from '@/daemon/machineMetadataMethods';
 import { createRpcRequestListener } from './rpc/rpcRequestListener';
 import { detectCLIAvailability, CLIAvailability } from '@/utils/detectCLI';
@@ -589,6 +591,8 @@ type IsolatedViewerStartResult = {
 
 type MachineRpcHandlers = {
     sessionRetention?: import('@/daemon/sessionRetention').SessionRetention;
+    /** aplus-dev-studio specs/cross-machine-agent-delegation. Absent = no links, no lane, no advertisement. */
+    agentDelegation?: AgentDelegationHost;
     ownedSpawn?: OwnedSpawnRpc;
     daemonSessionState?: (request: unknown) => Promise<DaemonSessionStateResponse>;
     spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
@@ -998,6 +1002,7 @@ export class ApiMachineClient {
      */
     private connectionSupervisorInterval: NodeJS.Timeout | null = null;
     private companyKeyReseedAvailable = false;
+    private agentDelegationAvailable = false;
     /** When the socket was last known to be down. Null only while connected. */
     private disconnectedSince: number | null = null;
 
@@ -1229,6 +1234,7 @@ export class ApiMachineClient {
         browserSessionPrepare,
         channelHostCall,
         ownedSpawn,
+        agentDelegation,
     }: MachineRpcHandlers) {
         if (sessionRetention && !this.windowsStandaloneTrial) {
             this.rpcHandlerManager.registerHandler('session-retention-get-v1', sessionRetention.get, { customerBound: true });
@@ -1589,6 +1595,19 @@ export class ApiMachineClient {
 
         this.syncResumeSessionRpcRegistration();
         this.syncRecoverSessionRpcRegistration();
+
+        // Not on a managed runtime or the Windows trial: neither serves the spawn path a link would reach.
+        if (agentDelegation && !this.managedHandlers && !this.windowsStandaloneTrial) {
+            registerAgentDelegationRpc((method, handler) => this.rpcHandlerManager.registerHandler(method, handler), agentDelegation, {
+                spawn: spawnSession,
+                afterSpawn: (input) => this.linkSpawnedSessionHandler?.(input),
+            });
+            this.rpcHandlerManager.setDelegationLane(machineDelegationLane({
+                links: () => agentDelegation.store.laneLinks(),
+                admit: delegationLaneAdmission(agentDelegation.store),
+            }));
+            this.agentDelegationAvailable = true;
+        }
 
         // Register stop session handler
         this.rpcHandlerManager.registerHandler('stop-session', async (params: any) => {
@@ -4627,6 +4646,9 @@ export class ApiMachineClient {
                 : TERMINAL_BINDING_CAPABILITY;
             const terminalBindingStale = JSON.stringify(this.machine.metadata?.terminalBinding)
                 !== JSON.stringify(advertisedTerminalBinding);
+            const advertisedAgentDelegation = this.agentDelegationAvailable && !this.managedHandlers ? AGENT_DELEGATION_CAPABILITY : undefined;
+            const agentDelegationStale = JSON.stringify(this.machine.metadata?.agentDelegation)
+                !== JSON.stringify(advertisedAgentDelegation);
 
             this.syncResumeSessionRpcRegistration();
 
@@ -4637,7 +4659,7 @@ export class ApiMachineClient {
             // Bounded: an acknowledgement that never comes must not block every later change.
             const awaitingServer = this.capabilityUpdateInFlight !== null
                 && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
-            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || agentPlanStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || writeFileAttemptStale || listFilesPageStale || permissionGrantsStale)) {
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || agentPlanStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || agentDelegationStale || writeFileAttemptStale || listFilesPageStale || permissionGrantsStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -4685,6 +4707,7 @@ export class ApiMachineClient {
                     workspaceSync: advertisedWorkspaceSync,
                     companyKeyReseed: advertisedCompanyKeyReseed,
                     terminalBinding: advertisedTerminalBinding,
+                    agentDelegation: advertisedAgentDelegation,
                     daemonSessionState: daemonSessionStateAvailable ? { version: 1 } : undefined,
                     happyCliVersion: newCliVersion,
                 })).catch((err) => {
