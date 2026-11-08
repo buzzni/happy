@@ -1,3 +1,4 @@
+import { randomUUID, createHash } from 'node:crypto';
 import { TurnInputEvidence, type EvidenceBatch } from '@/api/turnInputEvidence';
 import { closeClaudeTurnWithStatus, mapClaudeLogMessageToSessionEnvelopes, mapClaudeChannelFinalAnswer,
     failClaudeLaunchTurn, type ClaudeSessionProtocolState } from './utils/sessionProtocolMapper';
@@ -12,7 +13,7 @@ import type { Session } from './session';
 import type { EnhancedMode } from './loop';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
-import { requestSetupTokenStart, requestSetupTokenRebind, reportSetupTokenActivity, reportSetupTokenUsage, requestSetupTokenAvailability, returnFromPersonalClaude } from '@/daemon/controlClient';
+import { requestSetupTokenCapacity, requestSetupTokenStart, requestSetupTokenRebind, reportSetupTokenActivity, reportSetupTokenUsage, requestSetupTokenAvailability, returnFromPersonalClaude } from '@/daemon/controlClient';
 import { APPLY_REQUIRED_NOTICE, CONTINUE_PROMPT, RESUME_REBOUND_NOTICE, START_BUDGET_SWITCHED_NOTICE, SWITCHED_NOTICE } from './setupTokenAccountSwitching';
 import { PERSONAL_RECHECK_NOTICE } from './personalClaudeFallback';
 import { claudeCheckSession } from './utils/claudeCheckSession';
@@ -27,6 +28,7 @@ vi.mock('./utils/claudeCheckSession', () => ({ claudeCheckSession: vi.fn(() => t
 vi.mock('@/daemon/controlClient', async (original) => ({
     ...await original<typeof import('@/daemon/controlClient')>(),
     requestSetupTokenStart: vi.fn(async () => ({ state: 'allowed', validForMs: 15000 })),
+    requestSetupTokenCapacity: vi.fn(),
     requestSetupTokenAvailability: vi.fn(), returnFromPersonalClaude: vi.fn(),
     reportSetupTokenUsage: vi.fn(async () => {}),
     reportSetupTokenActivity: vi.fn(async () => ({ ok: true })),
@@ -176,6 +178,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
             setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
             setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            failClaudeLaunchTurn: vi.fn(() => { void handlers.get('switch')!(); }),
             applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
         };
         vi.mocked(query).mockImplementation(({ prompt }) => Object.assign((async function* () {
@@ -197,6 +200,29 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
         };
     }
+    it('claims a proved human input before SDK startup and bypasses the old start budget', async () => {
+        const inputs = vi.fn(), session = sharedSessionFixture(inputs);
+        const actor = { companyId: 'org-a', machineId: 'pc-a', sessionId: session.client.sessionId,
+            requestId: randomUUID(), contentHash: createHash('sha256').update('hello').digest('hex'), proof: 'signed.proof' };
+        session.queue.queue.length = 0;
+        session.queue.push('hello', { permissionMode: 'default', setupTokenCapacityActor: actor });
+        vi.mocked(requestSetupTokenCapacity).mockImplementation(async (_session, _binding, operation, _actor, _runtime, extra) => {
+            if (operation === 'reserve') return { state: 'reserved', managedAccountId: '00000000-0000-4000-8000-00000000000a', credentialGeneration: 1, epoch: 1, validForMs: 15000 };
+            return { state: operation === 'claim' ? 'claimed' : operation === 'finish' ? 'finished' : String(extra?.deliveryState) };
+        });
+        try {
+            await claudeRemoteLauncher(session as unknown as Session);
+            expect(inputs).toHaveBeenCalledOnce();
+            expect(requestSetupTokenStart).not.toHaveBeenCalled();
+            const calls = vi.mocked(requestSetupTokenCapacity).mock.calls;
+            expect(calls.map(call => call[2])).toEqual(['reserve', 'claim', 'delivery', 'delivery', 'finish']);
+            const claim = calls.findIndex(call => call[2] === 'claim');
+            expect(vi.mocked(requestSetupTokenCapacity).mock.invocationCallOrder[claim]).toBeLessThan(vi.mocked(query).mock.invocationCallOrder[0]);
+        } finally {
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED;
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
+        }
+    });
     it('holds a shared-PC turn until Studio admits its start, asked with the shared-account authority', async () => {
         let admit!: (value: { state: 'allowed'; validForMs: number }) => void;
         vi.mocked(requestSetupTokenStart).mockImplementationOnce(() => new Promise(resolve => { admit = resolve; }));
@@ -214,12 +240,15 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
         }
     });
-    it('runs a shared-PC turn when the start decision cannot be had (decision D1)', async () => {
+    it('does not start the SDK when a shared-PC decision cannot be obtained', async () => {
         vi.mocked(requestSetupTokenStart).mockRejectedValueOnce(new Error('SETUP_TOKEN_START_UNAVAILABLE'));
         const inputs = vi.fn();
         try {
-            await claudeRemoteLauncher(sharedSessionFixture(inputs) as unknown as Session);
-            expect(inputs).toHaveBeenCalledTimes(1);
+            const session = sharedSessionFixture(inputs);
+            await claudeRemoteLauncher(session as unknown as Session);
+            expect(inputs).not.toHaveBeenCalled();
+            expect(query).not.toHaveBeenCalled();
+            expect(session.client.failClaudeLaunchTurn).toHaveBeenCalledOnce();
         } finally {
             delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED;
             delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;

@@ -38,6 +38,7 @@ export type SetupTokenAccountSwitchDeps = {
   fetch: typeof fetch
   /** PC-local disabled slots restrict server choices; never re-enable them to rotate. */
   disabledSetupTokenAccounts?(): Promise<string[]>
+  capacityFenced?(managedAccountId: string): Promise<boolean>
   /** A new grant (a switch), or the daemon's recorded binding (catching up a session that missed a switch). */
   sessionEnvironment(agent: string, selection: AiAuthSelection, recorded?: SetupTokenBinding): Promise<Record<string, string>>
   /**
@@ -68,11 +69,9 @@ export type SetupTokenAccountSwitchDeps = {
  * FORBIDDEN: Studio refuses this binding for good (PC reassigned, unknown binding); the session stops asking.
  * APPLY_REQUIRED: the account Studio would choose is not applied on this PC yet (specs/claude-setup-token-managed-sync R6).
  */
-export type SwitchFailure = 'NOT_BOUND' | 'STALE' | 'STUDIO_UNAVAILABLE' | 'NO_ACCOUNT' | 'APPLY_REQUIRED' | 'FORBIDDEN' | 'REQUEST_FAILED' | 'BINDING_REJECTED' | 'PERSISTENCE_FAILED' | 'PERSISTENCE_INDETERMINATE' | 'STUDIO_BUDGET' | 'UNSUPPORTED' | 'ROTATION_LIMIT' | 'START_ACCOUNT_EXHAUSTED'
+export type SwitchFailure = 'NOT_BOUND' | 'STALE' | 'STUDIO_UNAVAILABLE' | 'NO_ACCOUNT' | 'APPLY_REQUIRED' | 'FORBIDDEN' | 'REQUEST_FAILED' | 'BINDING_REJECTED' | 'PERSISTENCE_FAILED' | 'PERSISTENCE_INDETERMINATE' | 'STUDIO_BUDGET' | 'UNSUPPORTED' | 'ROTATION_LIMIT' | 'START_ACCOUNT_EXHAUSTED' | 'CAPACITY_ACTOR_REQUIRED'
 
 const REQUEST_TIMEOUT_MS = 15_000
-/** What the launcher accepts as a start permit's lifetime; a shared-PC turn run without a Studio decision gets one. */
-const SHARED_START_OPEN_MS = 15_000
 /** Studio asks for at most this many checks per switch (its MAX_PROBES_PER_SWITCH); a further ask is not followed. */
 const MAX_CHECKS_PER_SWITCH = 3
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
@@ -103,6 +102,7 @@ const failure = (reason: SwitchFailure, detail: string) => {
 const refusal = (status: number) => status === 401 || status === 403 ? 'FORBIDDEN' as const : 'REQUEST_FAILED' as const
 
 export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps) {
+  const capacityTargets = new Map<string, { requestId: string; target: string }>();
   const post = (route: string, body: object) => deps.fetch(`${deps.studioOrigin}/api/claude-setup-token/daemon/${route}`, {
     method: 'POST', redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     headers: { Authorization: `Bearer ${deps.bearer()}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
@@ -212,7 +212,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       while (true) {
         response = await post(confirmedOnly ? 'return' : 'rebind', { ...proof, ...(selectionRequestId ? { selectionRequestId } : {}),
           ...(tokenProof ? { credentialProofVersion: 1 } : {}), ...(organizationFailure ? { organizationFailure } : {}), ...(measured ? { measureVersion: 1, measured: [...measured] } : {}),
-          ...(startBudget ? { startBudget: true } : {}), ...(startExhausted ? { startExhausted: true } : {}), ...(disabled.length ? { excludeManagedAccountIds: disabled } : {}) })
+          ...(startBudget ? { startBudget: true, ...(capacityTargets.get(sessionId) ? { capacityRequestId: capacityTargets.get(sessionId)!.requestId } : {}) } : {}), ...(startExhausted ? { startExhausted: true } : {}), ...(disabled.length ? { excludeManagedAccountIds: disabled } : {}) })
         body = await response.json().catch(() => null) as Record<string, unknown> | null
         // A Studio from before candidate checks refuses the fields it does not know: ask again as before, once.
         if (response.status === 400 && (measured || selectionRequestId)) {
@@ -297,7 +297,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
 
   /**
    * Saycode specs/shared-pc-start-budget — a shared-PC session asks Studio with the machine's own token. Only a decision
-   * Studio actually answers holds the turn: an older Studio, a failure, a refusal or no answer runs it (decision D1).
+   * Studio actually answers holds the turn: an older Studio, a failure, a refusal or no answer cannot prove that the person-capacity policy is off.
    */
   /**
    * The accounts Studio last said have start budget left, per waiting shared-PC session: where a start-budget move goes.
@@ -313,10 +313,13 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     return environment
   }
   async function sharedStart(sessionId: string, shared: ReturnType<typeof sharedSession>, requestId: string, signal?: AbortSignal) {
+    let fenced = false;
+    try { fenced = shared ? await deps.capacityFenced?.(shared.recorded) ?? false : false; }
+    catch { return failure('CAPACITY_ACTOR_REQUIRED', 'capacity fence cannot be read'); }
     const open = (detail: string) => {
+      if (fenced) return failure('CAPACITY_ACTOR_REQUIRED', `fenced account requires a positive server decision: ${detail}`);
       if (shared) sharedStartPreferred.delete(shared.session)
-      logger.debug(`[setup-token-switch] shared start for ${sessionId} runs without a Studio decision: ${detail}`)
-      return { ok: true as const, admission: { state: 'allowed' as const, validForMs: SHARED_START_OPEN_MS } }
+      return failure('REQUEST_FAILED', `shared start for ${sessionId} has no positive Studio decision: ${detail}`)
     }
     if (!shared) return open('no shared account handed to this session')
     if (!deps.studioOrigin || !shared.sharedMachine.startProof) return open('Studio or account proof unavailable')
@@ -326,7 +329,11 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       if (!proof) return open('account not held by this PC')
       const response = await post('shared/start', { machineId: deps.machineId, companyId: proof.companyId, sessionId,
         managedAccountId: shared.managedAccountId, credentialGeneration: proof.credentialGeneration, requestId })
-      if (!response.ok) return open(`Studio answered ${response.status}`)
+      if (!response.ok) {
+        const refusal = await response.json().catch(() => null) as { error?: string } | null;
+        if (refusal?.error?.includes('CAPACITY_')) return failure('CAPACITY_ACTOR_REQUIRED', 'An authenticated input actor is required');
+        return open(`Studio answered ${response.status}`);
+      }
       const admission = await response.json() as { state?: unknown; preferredAccountIds?: unknown }
       const preferred = admission?.state === 'wait' && Array.isArray(admission.preferredAccountIds)
         ? admission.preferredAccountIds.filter((id: unknown): id is string => typeof id === 'string' && UUID.test(id)) : []
@@ -340,6 +347,44 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
   }
 
   return {
+    async capacity(sessionId: string, running: string, operation: string, actor: import('../claude/setupTokenUserCapacity').SetupTokenCapacityActor, runtimeId: string, extra?: Record<string, unknown>, signal?: AbortSignal) {
+      if (!deps.studioOrigin || actor.machineId !== deps.machineId || actor.sessionId !== sessionId) return { ok: false as const, reason: 'CAPACITY_ACTOR_FORBIDDEN' };
+      const parsed = parseBinding(running);
+      const shared = sharedSession(sessionId, running);
+      const session = deps.findSession(sessionId);
+      const currentId = parsed?.binding.managedAccountId ?? (shared ? shared.recorded : undefined);
+      if (!session || !currentId || parsed && session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV] !== running) return { ok: false as const, reason: 'CAPACITY_STALE_BINDING' };
+      try {
+        let generation: number | undefined;
+        if (operation === 'reserve' || operation === 'claim' || operation === 'observe') {
+          const authority = parsed?.binding ?? (shared ? await shared.sharedMachine.startProof?.(shared.recorded) : undefined);
+          if (!authority || authority.companyId !== actor.companyId) return { ok: false as const, reason: 'CAPACITY_BINDING_FORBIDDEN' };
+          generation = authority.credentialGeneration;
+          if (operation === 'observe') extra = { ...extra, managedAccountId: currentId, credentialGeneration: generation, startSource: parsed ? 'bound' : 'legacy' };
+          const disabled = await deps.disabledSetupTokenAccounts?.() ?? [];
+          if (operation === 'claim' && (extra?.managedAccountId !== currentId || extra?.credentialGeneration !== generation || disabled.includes(currentId))) return { ok: false as const, reason: 'CAPACITY_BINDING_FORBIDDEN' };
+          if (operation === 'reserve') extra = { ...extra, excludeManagedAccountIds: disabled };
+        }
+        const response = await deps.fetch(`${deps.studioOrigin}/api/claude-setup-token/capacity/${operation}`, {
+          method: 'POST', redirect: 'error', signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
+          headers: { Authorization: `Bearer ${deps.bearer()}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...extra, companyId: actor.companyId, machineId: deps.machineId, sessionId, requestId: actor.requestId, contentHash: actor.contentHash, actorProof: actor.proof, runtimeId }),
+        });
+        const admission = await response.json() as Record<string, unknown>;
+        if (!response.ok) return { ok: false as const, reason: typeof admission.error === 'string' ? admission.error : 'CAPACITY_UNAVAILABLE' };
+        if (operation === 'reserve' && admission.state !== 'reserved' || ['claim', 'finish', 'cancel', 'lost'].includes(operation) && capacityTargets.get(sessionId)?.requestId === admission.executionRequestId) {
+          capacityTargets.delete(sessionId);
+          if (shared) sharedStartPreferred.delete(shared.session);
+        }
+        if (operation === 'reserve' && admission.state === 'reserved' && typeof admission.managedAccountId === 'string') {
+          if (admission.managedAccountId === currentId && admission.credentialGeneration !== generation) return { ok: false as const, reason: 'CAPACITY_GENERATION_CHANGED' };
+          capacityTargets.set(sessionId, { requestId: typeof admission.executionRequestId === 'string' ? admission.executionRequestId : actor.requestId, target: admission.managedAccountId });
+          if (shared) sharedStartPreferred.set(shared.session, [admission.managedAccountId]);
+          admission.requiresMove = admission.managedAccountId !== currentId;
+        }
+        return { ok: true as const, admission };
+      } catch { return { ok: false as const, reason: 'CAPACITY_UNAVAILABLE' }; }
+    },
     async requestStart(sessionId: string, running: string, requestId: string, signal?: AbortSignal) {
       const shared = sharedSession(sessionId, running)
       if (shared !== null) return sharedStart(sessionId, shared, requestId, signal)
@@ -360,6 +405,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
         if (!response.ok) {
           const body = await response.json().catch(() => null) as { error?: unknown } | null
           const code = typeof body?.error === 'string' && /^SETUP_TOKEN_DAEMON_[A-Z_]+$/.test(body.error) ? body.error : 'UNKNOWN'
+          if (code.includes('CAPACITY_')) return failure('CAPACITY_ACTOR_REQUIRED', 'An authenticated input actor is required');
           return failure(response.status === 409 && code === 'SETUP_TOKEN_DAEMON_START_ACCOUNT_EXHAUSTED' ? 'START_ACCOUNT_EXHAUSTED' : refusal(response.status), `start refused: HTTP ${response.status} ${code}`)
         }
         return { ok: true as const, admission: await response.json() }
@@ -479,7 +525,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       if (parsed && isMachineSetupTokenBinding(parsed.binding)) {
         const binding = parsed.binding
         return Promise.resolve(deps.machineRuntime?.(binding.companyId)).then(runtime => runtime
-          ? (options.startBudget || options.startExhausted ? runtime.rebind(sessionId, running, observation, signal, options) : runtime.rebind(sessionId, running, observation, signal))
+          ? (options.startBudget || options.startExhausted ? runtime.rebind(sessionId, running, observation, signal, { ...options, ...(options.startBudget && capacityTargets.get(sessionId) ? { capacityRequestId: capacityTargets.get(sessionId)!.requestId } : {}) }) : runtime.rebind(sessionId, running, observation, signal))
             .then(environment => ({ ok: true as const, environment }), machineFailure)
           : failure('STUDIO_UNAVAILABLE', 'machine runtime absent'), machineFailure)
       }

@@ -77,6 +77,7 @@ export function createMachineSetupTokenProtocol(deps: {
       }
       if (code === 'SETUP_TOKEN_DAEMON_OPERATION_NOT_FOUND') throw new MachineRotationError('OPERATION_NOT_FOUND')
       if (code === 'SETUP_TOKEN_DAEMON_APPLY_REQUIRED') throw new MachineRotationError('APPLY_REQUIRED')
+      if (typeof code === 'string' && code.includes('CAPACITY_')) throw new MachineRotationError('CAPACITY_ACTOR_REQUIRED')
       if (code === 'SETUP_TOKEN_DAEMON_UNSUPPORTED') throw new MachineRotationError('UNSUPPORTED')
       throw new MachineRotationError(response.status === 401 || response.status === 403 ? 'FORBIDDEN' : 'REQUEST_FAILED')
     }

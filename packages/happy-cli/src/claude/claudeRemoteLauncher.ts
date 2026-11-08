@@ -1,5 +1,8 @@
 import { waitForSetupTokenStart, waitForSharedSetupTokenStart } from './setupTokenStartBudget';
-import { requestSetupTokenStart } from '../daemon/controlClient';
+import { requestSetupTokenStart, requestSetupTokenCapacity } from '../daemon/controlClient';
+import { createSetupTokenCapacityRuntime } from './setupTokenUserCapacity';
+import { configuration } from '@/configuration';
+import { join } from 'node:path';
 import { MANUAL_PERSONAL_ENV } from '@/daemon/manualPersonalClaude';
 import { createSetupTokenActivityReporter } from './setupTokenActivity';
 import { MandatorySandboxError } from '@/sandbox/sandboxPolicy';
@@ -610,6 +613,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     /** A refused turn to continue as the first turn of the next provider (set by a switch). */
     let continuation: EnhancedMode | null = null;
     function enqueueAccountContinuation(mode: EnhancedMode) {
+        if (mode.setupTokenCapacityActor) mode = { ...mode, setupTokenCapacityRetry: true };
         // No native transcript exists yet: retain the actual request, attachments and authority.
         if (!session.sessionId && lastCommittedBatch) {
             pending = { ...lastCommittedBatch, mode, continuation: session.client.inputEvidence?.takeContinuation() };
@@ -624,6 +628,24 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     /** The provider runs on a binding the session has since switched away from. */
     const providerStale = () => providerRunning && (providerCredentialGeneration !== (personalFallback?.generation() ?? 0) || providerBinding !== undefined && providerBinding !== runningAuthority());
 
+    let capacityWork: Promise<void> = Promise.resolve();
+    let capacityFailure: unknown;
+    const capacity = createSetupTokenCapacityRuntime({
+        directory: join(configuration.happyHomeDir, 'setup-token-capacity', session.client.sessionId),
+        request: (operation, actor, runtimeId, extra, signal) => {
+            const binding = runningAuthority();
+            if (!binding) throw new Error('CAPACITY_BINDING_MISSING');
+            return requestSetupTokenCapacity(session.client.sessionId, binding, operation, actor, runtimeId, extra, signal);
+        },
+        move: async () => !!await setupTokenSwitching?.switchForStartBudget(),
+        notify: () => session.client.sendSessionEvent({ type: 'message', message: '조직 AI 계정이 모두 사용 중입니다. 계정당 최대 4명까지 사용할 수 있어 자리가 생길 때까지 기다립니다. 입력과 첨부는 유지되며, 취소할 수 있습니다.' }),
+    });
+    const queueCapacity = (action: () => Promise<void>) => {
+        capacityWork = capacityWork.then(action).catch(error => {
+            capacityFailure = error;
+            logger.warn(`[setup-token-capacity] ${error instanceof Error ? error.message : 'lifecycle unavailable'}`);
+        });
+    };
     let backgroundTasks: NonNullable<Metadata['claudeBackgroundTasks']> | undefined;
     const backgroundTaskDetails = createClaudeBackgroundTaskDetails();
     function publishBackgroundTasks(next: NonNullable<Metadata['claudeBackgroundTasks']>) {
@@ -663,6 +685,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 // order and must never resurrect a task removed by this list.
                 tasks: backgroundTaskDetails.list(message.tasks.filter(task => !task.ambient)),
             });
+            if (!message.tasks.some(task => !task.ambient) && ongoingToolCalls.size === 0) queueCapacity(() => capacity.idle());
             return;
         }
         // The command of a task already listed (its `task_started` usually follows the list).
@@ -678,6 +701,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         // 턴 종료 result 는 transcript 로 가지 않는다 — 사용량 보정만 세션에 넘긴다
         // (Z.AI 호환 경로의 assistant usage 0 문제, src/usage/claudeTurnUsage.ts).
         if (message.type === 'result') {
+            const backgroundActive = !!backgroundTasks?.tasks?.length || ongoingToolCalls.size > 0;
+            queueCapacity(() => capacity.result(message, backgroundActive));
             session.client.applyClaudeTurnResult(
                 message as unknown as { uuid?: unknown; usage?: unknown; modelUsage?: unknown },
                 aiAuthObservation?.current(),
@@ -942,7 +967,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
              * actually starts.
              */
             const proof = generationProofs.begin((onStarted) => (
-                session.managedRun || drain || isolatedAutomation ? createProviderExitObserver(onStarted) : null
+                session.managedRun || drain || isolatedAutomation || runningAuthority() ? createProviderExitObserver(() => { onStarted(); capacity.providerStarted(); }) : null
             ));
             const sdkExit = proof?.observer ?? null;
             messageBuffer.addMessage('═'.repeat(40), 'status');
@@ -966,14 +991,40 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             let providerEnded = false;
             /** Aborted with `providerEnded`: an input wait this generation left behind frees the queue's single waiter slot. */
             const generationEnded = new AbortController();
-            const admitTurn = async (message: { channelRequestId?: string } | null) => {
+            const capacityHeartbeat = setInterval(() => queueCapacity(() => capacity.heartbeat()), 15000);
+            capacityHeartbeat.unref();
+            const admitTurn = async (message: { channelRequestId?: string; mode?: EnhancedMode } | null) => {
                 const binding = personalFallback?.identity() ? undefined : providerActivityBinding ?? providerSharedStartAuthority;
                 if (!binding) return true;
                 const shared = binding !== providerActivityBinding;
                 try {
                     const sessionId = session.client.sessionId;
                     if (!sessionId) throw new Error('SETUP_TOKEN_START_SESSION_MISSING');
+                    await capacityWork;
+                    if (capacityFailure) throw capacityFailure;
+                    const actor = message?.mode?.setupTokenCapacityActor;
+                    let legacyRequestId: string | undefined;
+                    if (actor) {
+                        if (message?.mode?.setupTokenCapacityRetry) await capacity.retry(actor);
+                        const outcome = await capacity.admit(actor, AbortSignal.any([controller.signal, generationEnded.signal]));
+                        if (outcome.state === 'moved') return false;
+                        if (outcome.state === 'result') {
+                            // Restore the saved provider result only; never submit its original input again.
+                            messageQueue.enqueue(pendingRequestItem(message?.channelRequestId ?? null));
+                            const result = outcome.result as { result?: unknown };
+                            if (typeof result?.result === 'string') {
+                                await messageQueue.flush();
+                                if (message?.channelRequestId) session.client.sendFinalAnswerForChannelTurn(result.result);
+                                else session.client.sendSessionEvent({ type: 'message', message: `이전에 완료된 응답을 복구했습니다.\n\n${result.result}` });
+                            }
+                            controller.abort();
+                            return false;
+                        }
+                        if (outcome.state === 'admitted') return !providerOptionsStale();
+                        if (outcome.state === 'off') legacyRequestId = outcome.legacyRequestId;
+                    }
                     const admitted = await (shared ? waitForSharedSetupTokenStart : waitForSetupTokenStart)({
+                        ...(legacyRequestId ? { requestId: legacyRequestId } : {}),
                         request: (requestId, signal) => requestSetupTokenStart(sessionId, binding, requestId, signal),
                         signal: AbortSignal.any([controller.signal, generationEnded.signal]),
                         notify: () => session.client.sendSessionEvent({ type: 'message', message: '조직 Claude 계정으로 지금 실행할 수 없어 기다리고 있습니다. 사용 가능한 계정으로 전환하거나 상태가 회복되면 이어서 실행합니다. 반복되면 조직 관리자에게 계정 연결과 비활성화 상태를 확인해 주세요.' }),
@@ -981,8 +1032,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         // transient retry (no message) has nothing to keep pending, so it waits on this account.
                         ...(message ? { moveToPreferred: async () => !!await setupTokenSwitching?.switchForStartBudget(), moveFromExhausted: async () => !!await setupTokenSwitching?.switchForExhaustedStart() } : {}),
                     });
+                    if (admitted && actor && legacyRequestId) await capacity.observe(actor, AbortSignal.any([controller.signal, generationEnded.signal]));
                     return admitted && !providerOptionsStale();
                 } catch (error) {
+                    if (controller.signal.aborted || generationEnded.signal.aborted) return false;
                     // A later turn's rejection never reaches the launch catch (claudeRemote ends the input), so report it here.
                     launchFailure = describeClaudeLaunchFailure(error);
                     if (message) {
@@ -1288,7 +1341,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             const due = transientRetry.takeDue();
                             // Cancelled rather than due: keep waiting for the user.
                             if (!due) continue;
-                            if (!await admitTurn(null)) return null;
+                            if (!await admitTurn({ mode: { ...due.mode.mode, setupTokenCapacityRetry: true } })) return null;
                             session.client.noteTransientRetryDispatched();
                             if (drain && !drain.claimTurn()) { exitReason = 'exit'; return null; }
                             await messageQueue.flush();
@@ -1633,6 +1686,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     continue;
                 }
             } finally {
+                clearInterval(capacityHeartbeat);
+                await capacityWork;
+                try {
+                    if (sdkExit && capacity.hasActive()) await waitForObservedExit(sdkExit, MANAGED_REPORT_EXIT_BUDGET_MS);
+                    await capacity.providerStopped(!!sdkExit?.observed() && !backgroundTasks?.tasks?.length && ongoingToolCalls.size === 0);
+                }
+                catch (error) { logger.warn(`[setup-token-capacity] provider exit report failed: ${error instanceof Error ? error.message : 'unavailable'}`); }
                 activityReporter.thinking(false);
                 providerEnded = true;
                 generationEnded.abort();
