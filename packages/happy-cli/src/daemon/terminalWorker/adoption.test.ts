@@ -94,13 +94,13 @@ describe('adoptTerminalWorkers', () => {
         expect(result.summary).toMatchObject({ closed: 1, adopted: 0 })
     })
 
-    it('adopts workers of its protocol, telling a same-version one from an older one (HR8)', async () => {
+    it('adopts workers of its protocol, same CLI version or older (HR8)', async () => {
         record()
         record()
         const same = connection()
         const older = connection({ cliVersion: '1.9.0' })
         const result = await run(deps({ connect: vi.fn().mockResolvedValueOnce(same.value).mockResolvedValueOnce(older.value) }))
-        expect(result.adopted.map((entry) => entry.sameVersion)).toEqual([true, false])
+        expect(result.adopted.map((entry) => entry.connection)).toEqual([same.value, older.value])
         expect(result.summary).toMatchObject({ adopted: 2 })
         expect(same.request).not.toHaveBeenCalled()
     })

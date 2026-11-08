@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { fakeWorkerConnection } from './fakeWorkerConnection.testing'
+import { writeTerminalWorkerRecord } from './record'
 import { TerminalWorkerHost } from './workerHost'
 
 const meta = { userId: 'u', route: 'direct' as const, machineId: null, openedAt: 1 }
@@ -60,6 +61,29 @@ describe('TerminalWorkerHost', () => {
         await stopping
         expect(fake.connection.request).toHaveBeenCalledWith('shutdown')
         expect(await h.ensureWorker()).toBeNull()
+    })
+
+    it('a same-version worker adopted from an earlier daemon keeps its terminals but never takes new ones', async () => {
+        // Its shells would get the earlier daemon's environment, e.g. across an env-reapply restart.
+        writeTerminalWorkerRecord(home, {
+            recordId: '00000001-aaaa-4aaa-8aaa-aaaaaaaaaaaa', pid: 1001, startedAt: 5, bootId: 'boot',
+            socketPath: join(home, 'w.sock'), secret: 's', protocolVersion: 1, cliVersion: '1', createdAt: 1,
+        })
+        const adopted = fakeWorkerConnection((op) => {
+            if (op === 'list') return { terminals: [{ id: 't1', pid: 5, exited: false }] }
+            if (op === 'dump') return { id: 't1', pid: 5, cols: 80, rows: 24, meta, frames: [], lastSeq: 0, exit: null }
+            return {}
+        })
+        const launched = fakeWorkerConnection()
+        const h = new TerminalWorkerHost({
+            happyHome: home, cliVersion: '1', enabled: true, log: () => {},
+            launch: async () => ({ connection: launched.connection, pid: 7 }),
+            adoptionDeps: { currentBootId: () => 'boot', processStartedAt: () => 5, isAlive: () => true, connect: async () => adopted.connection },
+        })
+        expect((await h.start()).map((terminal) => terminal.dump.id)).toEqual(['t1'])
+        expect(h.state()?.workers).toEqual({ current: 0, draining: 1 })
+        expect(await h.ensureWorker()).toBe(launched.connection)
+        await expect(h.createSession(adopted.connection, { userId: 'u', meta })).rejects.toThrow('not available')
     })
 
     it('a keeping stop lets go of its workers without shutting them down', async () => {

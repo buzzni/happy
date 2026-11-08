@@ -7,7 +7,7 @@
 
 | 항목 | 내용 |
 |---|---|
-| 프로세스 경계 | **변경.** 데몬 안 PTY → detached 터미널 워커 프로세스(데몬당 current 1개 + 이전 버전 draining 0~N개). 데몬이 죽어도 셸과 그 자식이 산다 |
+| 프로세스 경계 | **변경.** 데몬 안 PTY → detached 터미널 워커 프로세스(데몬당 current 1개 + 입양한 draining 0~N개). 데몬이 죽어도 셸과 그 자식이 산다 |
 | 관련 모듈 | 신규 `src/daemon/terminalWorker/`(protocol·frames·record·socketPath·workerProcess·workerClient·workerPtySession·adoption·reaper), 수정 `remoteTerminal.ts`(세션 생성 경로 선택), `daemonTerminalSessions.ts`(입양 등록·유지 대상 집계), `controlServerTerminalWs.ts`(입양된 직결 터미널 등록·caps.survive·종료 시 detach), `api/apiMachine.ts`(릴레이 터미널은 지금처럼), `restartDrainRuntime.ts`·`restartDrainLifecycle.ts`(유지 결정·광고), `run.ts`(시작 시 입양·종료 경로별 close/detach), `src/index.ts`/CLI 진입(`happy terminal-worker` 하위 명령) |
 | 소비 경로 | 핸드오프(`handOffToInstalledBundle`)·SIGHUP 재시작·`happy daemon stop`·SIGTERM·크래시 재기동, Desktop 재시작 예고(`daemonState.lifecycle`), 직결 재연결(`terminal-attach`) |
 | 새 외부 의존성 | 없음(node-pty·node 내장만) |
@@ -62,7 +62,7 @@ daemon ──spawn(detached, stdio: [ignore, pipe(ready), logFd])──► termi
 3. pid 없음 → 기록 삭제. pid 있음 + 시작 시각(`utils/processStartTime.ts`) 다름 → pid 재사용, 기록 삭제·신호 없음. 시작 시각을 못 읽음 → 아무것도 안 함.
 4. 소켓 connect 거부 + pid·시작 시각 일치 → 응답 없는 워커: 신호 없음, 기록 유지, 로그.
 5. 소켓 accepting → 인증 hello. 같은 프로토콜 → 입양(`list`+`dump`+메타로 레지스트리 복원). 버전 다름 → 동결 `shutdown`. 인증 실패 → 신호 없음.
-- 입양한 워커의 `cliVersion`이 다르면 draining(HR8). 같으면 current. current가 둘 이상이면 첫째만 current, 나머지 draining.
+- 입양한 워커는 `cliVersion`이 같아도 draining(HR8). 워커의 셸은 워커를 띄운 데몬의 env를 받으므로, 새 터미널은 현재 데몬이 띄운 워커에 연다(2026-11-08 리뷰 반영).
 - 릴레이 경로 터미널은 워커에서 열지 않는다(데몬 안 PTY 그대로) — 재시작에 어차피 닫히므로 워커에 둘 이유가 없다. 입양 데이터에 직결이 아닌 터미널이 있으면(방어) 즉시 terminate.
 - 기록 삭제는 recordId가 일치할 때만(같은 파일명을 새 워커가 다시 쓴 경우 보존).
 

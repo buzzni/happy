@@ -82,9 +82,9 @@ export class TerminalWorkerHost {
         }
         const terminals: AdoptedWorkerTerminal[] = []
         for (const adopted of result.adopted) {
-            // HR8: one current worker of this CLI version; any other is only drained.
-            const held = this.hold(adopted.connection, !(adopted.sameVersion && this.current === null))
-            if (!held.draining) this.current = held
+            // HR8: an adopted worker is only drained, whatever its version. Its shells get the
+            // environment of the daemon that launched it, so new terminals open on this daemon's own.
+            const held = this.hold(adopted.connection, true)
             let listed: WorkerListResult
             try {
                 listed = await adopted.connection.request<WorkerListResult>('list')
