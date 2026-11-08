@@ -203,12 +203,14 @@ describe('org-endpoint wiring (aplus specs/org-llm-endpoints C5)', () => {
     expect(text).toMatch(/if \(tracked\) tracked\.agentEnvironment = agentEnvironment;\s*const saved = readPersistedSessions\(\)\[sessionId\];\s*if \(saved\) persistSession\(sessionId, \{ \.\.\.saved, agentEnvironment, savedAt: Date\.now\(\) \}\);/)
   })
 
-  it('a spawn that continues another conversation is refused for an endpoint parent before anything is created, with the selection the requester sent', async () => {
+  it('a spawn that continues another conversation is refused for an endpoint parent before anything is created, whatever selection the requester sent', async () => {
     const text = await runSource()
     const guard = text.indexOf('orgEndpointParentRefusal({')
     expect(guard).toBeGreaterThan(0)
     expect(guard).toBeLessThan(text.indexOf('await fs.access(directory);'))
-    expect(text).toMatch(/options\.parentSessionId \|\| options\.resumeClaudeSessionId\s*\?\s*orgEndpointParentRefusal\(\{[\s\S]*?records: readPersistedSessions\(\),\s*selection: options\.aiAuthSelection,/)
+    expect(text).toMatch(/options\.parentSessionId \|\| options\.resumeClaudeSessionId\s*\?\s*orgEndpointParentRefusal\(\{[\s\S]*?records: readPersistedSessions\(\),\s*\}\)/)
+    // No selection reaches the check: a same-endpoint selection must not excuse a parent that has a binding record or marker.
+    expect(text.slice(guard, text.indexOf('if (endpointParentRefusal)'))).not.toMatch(/selection/)
     expect(text).toMatch(/if \(endpointParentRefusal\) return \{ type: 'error', errorMessage: endpointParentRefusal \};/)
   })
 

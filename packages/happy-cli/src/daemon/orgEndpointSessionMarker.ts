@@ -8,7 +8,7 @@
  */
 import type { PersistedSession } from '@/persistence'
 import { ORG_ENDPOINT_BINDING_ENV } from '@/utils/childEnv'
-import { parseOrgEndpointBinding, type AiAuthSelection } from './sessionEnv'
+import { parseOrgEndpointBinding } from './sessionEnv'
 
 /** `Metadata.orgLlmEndpoint`: only ids, never an address, a target or a token. */
 export type OrgEndpointSessionMarker = { version: 1; bindingId: string; endpointId: string }
@@ -24,45 +24,30 @@ export function isOrgEndpointBoundMetadata(metadata: { orgLlmEndpoint?: unknown 
     return metadata?.orgLlmEndpoint !== undefined && metadata.orgLlmEndpoint !== null
 }
 
-type Evidence = { endpointId: string | undefined }
-
-/** `endpointId` is undefined when the record proves a binding but not which endpoint (corrupt record, unreadable marker). */
-function evidenceOf(record: PersistedSession): Evidence | undefined {
-    const bindingEnv = record.agentEnvironment?.[ORG_ENDPOINT_BINDING_ENV]
-    if (bindingEnv !== undefined) return { endpointId: parseOrgEndpointBinding(bindingEnv)?.endpointId }
+/** Whether the record proves an endpoint binding, even a corrupt one (which endpoint it was is no longer relevant). */
+function isEndpointBound(record: PersistedSession): boolean {
+    if (record.agentEnvironment?.[ORG_ENDPOINT_BINDING_ENV] !== undefined) return true
     const marked = (record.metadata as { orgLlmEndpoint?: unknown }).orgLlmEndpoint
-    if (marked === undefined || marked === null) return undefined
-    const endpointId = typeof marked === 'object' ? (marked as { endpointId?: unknown }).endpointId : undefined
-    return { endpointId: typeof endpointId === 'string' ? endpointId : undefined }
+    return marked !== undefined && marked !== null
 }
 
 /**
  * The refusal for a spawn that continues a conversation (`parentSessionId`, or a native `resumeClaudeSessionId` that
- * some recorded session ran) when that conversation ran on an endpoint — unless the spawn is itself a selection of the
- * same endpoint, which prepares and verifies its own binding. Only this machine's records are visible here: a parent
+ * some recorded session ran) when that conversation ran on an endpoint. No selection excuses it, not even one of the same
+ * endpoint: a new binding would carry the conversation to another URL or generation. Continuing the same session goes
+ * through the resume path, whose resume-check pins both. Only this machine's records are visible here: a parent
  * on another machine is the requester's check, through the metadata marker.
  */
 export function orgEndpointParentRefusal(input: {
     parentSessionId?: string
     resumeClaudeSessionId?: string
     records: Record<string, PersistedSession>
-    selection?: AiAuthSelection
 }): string | undefined {
-    const evidence: Evidence[] = []
     const parent = input.parentSessionId ? input.records[input.parentSessionId] : undefined
-    if (parent) { const found = evidenceOf(parent); if (found) evidence.push(found) }
-    if (input.resumeClaudeSessionId) {
-        for (const record of Object.values(input.records)) {
-            if ((record.metadata as { claudeSessionId?: unknown }).claudeSessionId !== input.resumeClaudeSessionId) continue
-            const found = evidenceOf(record)
-            if (found) evidence.push(found)
-        }
-    }
-    if (evidence.length === 0) return undefined
-    const selection = input.selection
-    const sameEndpoint = selection?.kind === 'org-endpoint'
-        && evidence.every((found) => found.endpointId !== undefined && found.endpointId === selection.endpointId)
-    if (sameEndpoint) return undefined
+    const bound = (parent !== undefined && isEndpointBound(parent))
+        || (input.resumeClaudeSessionId !== undefined && Object.values(input.records).some((record) =>
+            (record.metadata as { claudeSessionId?: unknown }).claudeSessionId === input.resumeClaudeSessionId && isEndpointBound(record)))
+    if (!bound) return undefined
     return 'ORG_LLM_ENDPOINT_PARENT_BOUND: this conversation ran on an organization LLM endpoint and cannot be continued in a new session '
         + 'under another model source; continue it on the same endpoint.'
 }

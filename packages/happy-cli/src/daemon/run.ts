@@ -2095,7 +2095,6 @@ export async function startDaemon(): Promise<void> {
           ...(options.parentSessionId ? { parentSessionId: options.parentSessionId } : {}),
           ...(options.resumeClaudeSessionId ? { resumeClaudeSessionId: options.resumeClaudeSessionId } : {}),
           records: readPersistedSessions(),
-          selection: options.aiAuthSelection,
         })
         : undefined;
       if (endpointParentRefusal) return { type: 'error', errorMessage: endpointParentRefusal };

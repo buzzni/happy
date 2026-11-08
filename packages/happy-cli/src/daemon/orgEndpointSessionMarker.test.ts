@@ -55,25 +55,17 @@ describe('a spawn that continues another conversation', () => {
 
     it('is refused when the recorded binding is corrupt, since what it was bound to is unknown', () => {
         expect(orgEndpointParentRefusal({ parentSessionId: 'parent-1', records: { 'parent-1': record({ env: { [ORG_ENDPOINT_BINDING_ENV]: '' } }) } })).toMatch(/ORG_LLM_ENDPOINT_PARENT_BOUND/)
-        expect(orgEndpointParentRefusal({ parentSessionId: 'parent-1', records: { 'parent-1': record({ env: { [ORG_ENDPOINT_BINDING_ENV]: '' } }) }, selection: endpointSelection('endpoint-1') }))
-            .toMatch(/ORG_LLM_ENDPOINT_PARENT_BOUND/)
     })
 
-    it('is refused under another selection, however it was chosen, and under none', () => {
-        for (const selection of [undefined, { kind: 'org-bundle' as const }, { kind: 'machine-personal' as const }, endpointSelection('endpoint-2')]) {
-            expect(orgEndpointParentRefusal({ parentSessionId: 'parent-1', records: { 'parent-1': bound }, selection })).toMatch(/ORG_LLM_ENDPOINT_PARENT_BOUND/)
+    it('is refused under any selection, the same endpoint included: a same-session resume goes through resume-check, which pins URL and generation', () => {
+        // Inputs are built as variables: the function takes no selection, so a literal would be an excess property.
+        for (const selection of [undefined, { kind: 'org-bundle' as const }, { kind: 'machine-personal' as const }, endpointSelection('endpoint-2'), endpointSelection('endpoint-1')]) {
+            for (const input of [
+                { parentSessionId: 'parent-1', records: { 'parent-1': bound }, selection },
+                { resumeClaudeSessionId: 'claude-1', records: { 'parent-1': bound }, selection },
+                { parentSessionId: 'parent-1', resumeClaudeSessionId: 'claude-1', records: { 'parent-1': bound }, selection },
+            ]) expect(orgEndpointParentRefusal(input)).toMatch(/ORG_LLM_ENDPOINT_PARENT_BOUND/)
         }
-    })
-
-    it('goes on when it is a selection of the same endpoint, which prepares and verifies its own binding', () => {
-        expect(orgEndpointParentRefusal({ parentSessionId: 'parent-1', records: { 'parent-1': bound }, selection: endpointSelection('endpoint-1') })).toBeUndefined()
-        expect(orgEndpointParentRefusal({ resumeClaudeSessionId: 'claude-1', records: { 'parent-1': bound }, selection: endpointSelection('endpoint-1') })).toBeUndefined()
-    })
-
-    it('needs every endpoint-bound conversation it names to be of that endpoint', () => {
-        const other = record({ env: { [ORG_ENDPOINT_BINDING_ENV]: 'binding-9:endpoint-9:target-a:1' } })
-        expect(orgEndpointParentRefusal({ parentSessionId: 'parent-1', resumeClaudeSessionId: 'claude-1', records: { 'parent-1': bound, 'parent-2': { ...other, metadata: { ...other.metadata, claudeSessionId: 'claude-1' } } },
-            selection: endpointSelection('endpoint-1') })).toMatch(/ORG_LLM_ENDPOINT_PARENT_BOUND/)
     })
 
     it('leaves every other spawn alone: no parent, an unknown parent, an ordinary parent, an ordinary resume', () => {
