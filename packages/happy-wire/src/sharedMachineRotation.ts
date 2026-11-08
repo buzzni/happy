@@ -63,10 +63,11 @@ export const DaemonRotationRequestBodySchema = z.discriminatedUnion('action', [
   z.object({ ...requestCommon, action: z.literal('start'), path: z.literal(DAEMON_ROTATION_PATHS.start), ...claim, requestId: id }).strict(),
   z.object({ ...requestCommon, action: z.literal('usage'), path: z.literal(DAEMON_ROTATION_PATHS.usage), ...claim, observation: RotationObservationSchema.optional(), activity: SetupTokenActivitySchema.optional() }).strict(),
   // A rebind carries usage evidence, or a start-admission reason that Studio verifies.
-  z.object({ ...requestCommon, action: z.literal('rebind'), path: z.literal(DAEMON_ROTATION_PATHS.rebind), ...claim, observation: RotationObservationSchema.optional(), startBudget: z.literal(true).optional(), startExhausted: z.literal(true).optional() }).strict(),
+  z.object({ ...requestCommon, action: z.literal('rebind'), path: z.literal(DAEMON_ROTATION_PATHS.rebind), ...claim, observation: RotationObservationSchema.optional(), startBudget: z.literal(true).optional(), capacityRequestId: id.optional(), startExhausted: z.literal(true).optional() }).strict(),
   z.object({ ...requestCommon, action: z.literal('operation'), path: z.literal(DAEMON_ROTATION_PATHS.operation), targetOperationId: id }).strict(),
 ]).refine(lifetime).refine(v => v.action !== 'usage' || !!v.observation !== !!v.activity)
-  .refine(v => v.action !== 'rebind' || [v.observation, v.startBudget, v.startExhausted].filter(Boolean).length === 1);
+  .refine(v => v.action !== 'rebind' || [v.observation, v.startBudget, v.startExhausted].filter(Boolean).length === 1)
+  .refine(v => v.action !== 'rebind' || !v.capacityRequestId || v.startBudget === true);
 export type DaemonRotationRequestBody = z.infer<typeof DaemonRotationRequestBodySchema>;
 
 export const SessionExecutionTicketBodySchema = z.object({

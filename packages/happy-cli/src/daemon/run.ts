@@ -143,6 +143,7 @@ import {
 import { sanitizeChildEnv } from '@/utils/childEnv';
 import { resolveRecoveredInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings';
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
+import { createSetupTokenCapacityFence, proveCapacityProcessesStopped } from './setupTokenCapacityFence';
 import { createCollectorSchedule } from './collectorSchedule';
 import { organizationResumeRefusal, resumeSetupTokenEnvironment, shareResumeInFlight, type ResumeAuthRequirement } from './resumeSetupTokenRebind';
 import type { AiAuthSource } from '@/usage/aiAuthSource';
@@ -5099,7 +5100,10 @@ export async function startDaemon(): Promise<void> {
       if (runtime) for (const recovered of await runtime.recoverLaunches()) sessionIdToFinishedSession.set(recovered.happySessionId!, recovered);
     } catch (error) { logger.warn(`[machine-rotation] startup recovery failed: ${error instanceof Error ? error.message : 'unknown'}`); }
     // Saycode specs/claude-setup-token-account-selection — a bound session moves off a used-up account.
+    const setupTokenCapacityFence = createSetupTokenCapacityFence({ directory: configuration.happyHomeDir, machineId,
+      proveIdle: async () => getCurrentChildren().length === 0 && await proveCapacityProcessesStopped() });
     setupTokenAccountSwitch = createSetupTokenAccountSwitch({
+      capacityFenced: setupTokenCapacityFence.fenced,
       findSession: (sessionId) => getCurrentChildren().find(session => session.happySessionId === sessionId) ?? resumingSetupTokenSessions.get(sessionId),
       studioOrigin: trustedStudioOrigin,
       machineId,
@@ -5844,6 +5848,7 @@ export async function startDaemon(): Promise<void> {
       portRegistry,
       automationStore,
       aiCredentialRuntime,
+      setupTokenCapacityBarrier: setupTokenCapacityFence.barrier,
       ...(personalBrowserWatch ? { browserSessionPrepare: async (sessionId: string) => {
         if (!personalDesktopLogin || !personalBrowserNative) return { supported: false };
         const login = personalDesktopLogin, native = personalBrowserNative;

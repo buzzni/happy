@@ -9,6 +9,8 @@ import { createFilesystemWriteAdmission, createSubprocessWriteAdmission } from '
 import { takeWorkspaceContextControl } from '@/utils/workspaceContextControl';
 import { createTurnCardSwitch } from './utils/turnCardTools';
 import { randomUUID } from 'node:crypto';
+import { readSetupTokenCapacityActor } from './setupTokenUserCapacity';
+import { describeClaudeLaunchFailure } from './utils/launchFailureMessage';
 
 import { ApiClient } from '@/api/api';
 import { consumeInputEvidenceOption, inputEvidenceMetadata, resolveInputEvidenceOption } from '@/utils/inputEvidenceSettings';
@@ -952,6 +954,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
 
     // Import MessageQueue2 and create message queue
     const messageQueue = new MessageQueue2<EnhancedMode>(mode => hashObject({
+        setupTokenCapacityActor: mode.setupTokenCapacityActor,
         isPlan: mode.permissionMode === 'plan',
         model: mode.model,
         fallbackModel: mode.fallbackModel,
@@ -1347,6 +1350,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     });
 
     const handleUserMessage = createSerialAsyncHandler<ClaimedUserMessage>(async ({ message, attachmentsPromise }) => {
+        const capacityActor = readSetupTokenCapacityActor(message.meta?.setupTokenCapacityActor, message.content.text);
 
         // Stamp the prompt so the remote-mode JSONL scanner can dedupe
         // it later — the SDK is about to write this same text to disk
@@ -1531,7 +1535,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             // Whatever this flushed will never run, so its routing decisions are
             // dead. The floor never moved for them — they were only ever pending.
             difficultyRoutingCommitter.discardPending(
-                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage, undefined, inputAttendanceFromMeta(message.meta, session.getMetadata()?.source), session.queueInput(message)),
+                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, { ...currentEnhancedMode(), ...(capacityActor ? { setupTokenCapacityActor: capacityActor } : {}) }, attachmentsForThisMessage, undefined, inputAttendanceFromMeta(message.meta, session.getMetadata()?.source), session.queueInput(message)),
                 'superseded',
             );
             logger.debugLargeJson('[start] /compact command pushed to queue:', safeUserMessageDebugPayload(message));
@@ -1549,7 +1553,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             difficultyRoutingCommitter.requestEpoch();
             deferredContinuation.prepare(message.content.text);
             difficultyRoutingCommitter.discardPending(
-                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage, undefined, inputAttendanceFromMeta(message.meta, session.getMetadata()?.source), session.queueInput(message)),
+                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, { ...currentEnhancedMode(), ...(capacityActor ? { setupTokenCapacityActor: capacityActor } : {}) }, attachmentsForThisMessage, undefined, inputAttendanceFromMeta(message.meta, session.getMetadata()?.source), session.queueInput(message)),
                 'superseded',
             );
             logger.debugLargeJson('[start] /clear command pushed to queue:', safeUserMessageDebugPayload(message));
@@ -1709,6 +1713,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         }
 
         enhancedModeForThisMessage = {
+            ...(capacityActor ? { setupTokenCapacityActor: capacityActor } : {}),
             permissionMode: messagePermissionMode || 'default',
             model: messageModel,
             fallbackModel: messageFallbackModel,
@@ -1811,6 +1816,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         }
         logger.debugLargeJson('User message pushed to queue:', safeUserMessageDebugPayload(message))
     }, (error) => {
+        if (error instanceof Error && error.message.startsWith('CAPACITY_')) session.sendSessionEvent({ type: 'message', message: describeClaudeLaunchFailure(error) });
         logger.warn('[loop] Failed to handle user message', {
             errorName: error instanceof Error ? error.name : typeof error,
         });

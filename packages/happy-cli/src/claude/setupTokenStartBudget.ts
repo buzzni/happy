@@ -3,6 +3,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 export type StartDecision = { state: 'allowed'; validForMs: number } | { state: 'wait'; retryAfterMs: number; preferredAccountIds: string[] }
 /** A turn retains its request identity through polling/response loss. Cancellation never authorizes execution. */
 export async function waitForSetupTokenStart(deps: {
+    requestId?: string;
     request(requestId: string, signal: AbortSignal): Promise<StartDecision>;
     notify(): void;
     /** Another account has start budget left: true when the session moved there, so this account's wait ends unadmitted. */
@@ -10,7 +11,7 @@ export async function waitForSetupTokenStart(deps: {
     moveFromExhausted?(): Promise<boolean>;
     signal: AbortSignal;
 }): Promise<boolean> {
-    const requestId = randomUUID();
+    const requestId = deps.requestId ?? randomUUID();
     let notified = false;
     let waits = 0;
     try {
@@ -45,16 +46,7 @@ export async function waitForSetupTokenStart(deps: {
         throw error;
     }
 }
-/**
- * Saycode specs/shared-pc-start-budget — an unbound shared-PC turn waits only on a wait Studio answers: when no decision
- * can be had (daemon or Studio unreachable, an invalid or expired answer) the turn runs (decision D1). Studio answering
- * wait until the wait bound is a decision, not an outage, so it ends the turn as for a member's session. Cancellation
- * still never runs it.
- */
+/** A missing decision cannot prove the four-person policy is off, including on legacy shared PCs. */
 export async function waitForSharedSetupTokenStart(deps: Parameters<typeof waitForSetupTokenStart>[0]): Promise<boolean> {
-    try { return await waitForSetupTokenStart(deps); }
-    catch (error) {
-        if ((error as Error)?.message === 'SETUP_TOKEN_START_WAIT_EXHAUSTED') throw error;
-        return !deps.signal.aborted;
-    }
+    return waitForSetupTokenStart(deps);
 }

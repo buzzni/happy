@@ -39,6 +39,26 @@ function setup(extra: Partial<SetupTokenAccountSwitchDeps> = {}) {
 }
 
 describe('setup-token account switch (specs/claude-setup-token-account-selection)', () => {
+  it('moves only to the capacity reservation, retaining its execution identity across rebind', async () => {
+    const { switcher, deps, requests } = setup()
+    vi.mocked(deps.fetch).mockImplementationOnce(async (url, init) => {
+      requests.push({ url: String(url), body: JSON.parse(String(init?.body)), authorization: new Headers(init?.headers).get('authorization') })
+      return Response.json({ state: 'reserved', managedAccountId: B, credentialGeneration: 1, epoch: 1, validForMs: 15000, executionRequestId: 'execution-r' })
+    })
+    const actor = { companyId: 'org-a', machineId: 'pc-a', sessionId: 'session-a', requestId: 'input-r', contentHash: 'a'.repeat(64), proof: 'signed.proof' }
+    expect(await switcher.capacity('session-a', RUNNING_A, 'reserve', actor, 'runtime', { companyId: 'forged', runtimeId: 'forged' })).toMatchObject({ ok: true, admission: { requiresMove: true } })
+    expect(requests[0]).toMatchObject({ url: 'https://studio.test/api/claude-setup-token/capacity/reserve', body: { companyId: 'org-a', runtimeId: 'runtime', actorProof: actor.proof, requestId: 'input-r', excludeManagedAccountIds: [] } })
+    expect(await switcher.rebind('session-a', RUNNING_A, undefined, undefined, { startBudget: true })).toHaveProperty('ok', true)
+    expect(requests[1].body).toMatchObject({ startBudget: true, capacityRequestId: 'execution-r' })
+  })
+  it('refuses a disabled or stale local credential before a capacity claim', async () => {
+    const { switcher, deps } = setup({ disabledSetupTokenAccounts: async () => [A] })
+    const actor = { companyId: 'org-a', machineId: 'pc-a', sessionId: 'session-a', requestId: 'input-r', contentHash: 'a'.repeat(64), proof: 'signed.proof' }
+    expect(await switcher.capacity('session-a', RUNNING_A, 'claim', actor, 'runtime', { managedAccountId: A, credentialGeneration: 1, epoch: 1 })).toEqual({ ok: false, reason: 'CAPACITY_BINDING_FORBIDDEN' })
+    expect(deps.fetch).not.toHaveBeenCalled()
+    expect(await switcher.capacity('session-a', RUNNING_A, 'reserve', { ...actor, machineId: 'other' }, 'runtime')).toEqual({ ok: false, reason: 'CAPACITY_ACTOR_FORBIDDEN' })
+    expect(deps.fetch).not.toHaveBeenCalled()
+  })
   it('keeps token-value verification negotiated across an account switch and refuses a downgraded response', async () => {
     const { switcher, session, deps } = setup()
     const running = formatSetupTokenBinding({ ...binding(A), tokenProof: 'a'.repeat(64) })
@@ -469,7 +489,6 @@ describe('shared PC setup-token account switch (Saycode specs/shared-pc-session-
 describe('shared PC start budget (Saycode specs/shared-pc-start-budget)', () => {
   const sharedRunning = sharedMachineSetupTokenAuthority({ HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1', [SETUP_TOKEN_SHARED_ACCOUNT_ENV]: A })!
   const REQUEST = '00000000-0000-4000-8000-0000000000ee'
-  const allowed = { state: 'allowed', validForMs: 15_000 }
   function startSetup(answer: () => Response | Promise<Response>, extra: Partial<SetupTokenAccountSwitchDeps> = {}) {
     const sharedMachine = { reportUsage: vi.fn(async () => undefined), rebind: vi.fn(async () => null), environment: vi.fn(async () => null), moved: vi.fn(),
       startProof: vi.fn(async (): Promise<{ companyId: string; credentialGeneration: number } | null> => ({ companyId: 'org-a', credentialGeneration: 1 })),
@@ -498,9 +517,9 @@ describe('shared PC start budget (Saycode specs/shared-pc-start-budget)', () => 
     ['a refusal', () => Response.json({ error: 'SETUP_TOKEN_DAEMON_GENERATION_CHANGED' }, { status: 409 })],
     ['no answer', () => { throw new TypeError('fetch failed') }],
     ['an unreadable answer', () => new Response('not json')],
-  ])('runs the turn on %s rather than holding it (decision D1)', async (_name, answer) => {
+  ])('requires a positive server decision on %s', async (_name, answer) => {
     const { switcher } = startSetup(answer)
-    expect(await switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: true, admission: allowed })
+    expect(await switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: false, reason: 'REQUEST_FAILED' })
   })
 
   it('moves a waiting shared-PC session onto an account Studio says has start budget left', async () => {
@@ -544,14 +563,14 @@ describe('shared PC start budget (Saycode specs/shared-pc-start-budget)', () => 
     expect(sharedMachine.startBudgetMove).not.toHaveBeenCalled()
   })
 
-  it('runs the turn without asking when it cannot prove the account', async () => {
+  it('refuses a turn when account or Studio authority is missing', async () => {
     const { switcher, requests, sharedMachine, session } = startSetup(() => Response.json({}))
     sharedMachine.startProof.mockResolvedValueOnce(null)
-    expect(await switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: true, admission: allowed })
+    expect(await switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: false, reason: 'REQUEST_FAILED' })
     delete session.sharedSetupTokenAccount
-    expect(await switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: true, admission: allowed })
+    expect(await switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: false, reason: 'REQUEST_FAILED' })
     const offline = startSetup(() => Response.json({}), { studioOrigin: null })
-    expect(await offline.switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: true, admission: allowed })
+    expect(await offline.switcher.requestStart('session-a', sharedRunning, REQUEST)).toEqual({ ok: false, reason: 'REQUEST_FAILED' })
     expect([...requests, ...offline.requests]).toEqual([])
   })
 })

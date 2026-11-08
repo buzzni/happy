@@ -5,6 +5,10 @@ import { Future } from "@/utils/future";
 import { createSessionScanner } from "./utils/sessionScanner";
 import type { SaycodePromptBlockOverrides } from "@/prompt/promptProvenance";
 import { MandatorySandboxError } from '@/sandbox/sandboxPolicy';
+import { SETUP_TOKEN_BINDING_ENV, sharedMachineSetupTokenAuthority } from '@/daemon/sessionEnv';
+import { requestSetupTokenStart } from '@/daemon/controlClient';
+import { waitForSetupTokenStart } from './setupTokenStartBudget';
+import { describeClaudeLaunchFailure } from './utils/launchFailureMessage';
 
 export type LauncherResult = { type: 'switch' } | { type: 'exit', code: number };
 
@@ -120,6 +124,12 @@ export async function claudeLocalLauncher(
             // Recomputed per launch: the organization ceiling may have changed since the last one (R10.10).
             const orgLaunch = session.orgRequirements?.localLaunchArgs(session.claudeArgs);
             try {
+                const binding = process.env.HAPPY_AI_AUTH_SOURCE === 'personal-subscription' ? undefined : process.env[SETUP_TOKEN_BINDING_ENV] ?? sharedMachineSetupTokenAuthority(process.env);
+                if (binding && !await waitForSetupTokenStart({
+                    signal: processAbortController.signal,
+                    request: (requestId, signal) => requestSetupTokenStart(session.client.sessionId, binding, requestId, signal),
+                    notify: () => session.client.sendSessionEvent({ type: 'message', message: '조직 AI 계정의 실행 허가를 기다리고 있습니다.' }),
+                })) { exitReason ??= { type: 'switch' }; break; }
                 await claudeLocal({
                     path: session.path,
                     sessionId: session.sessionId,
@@ -152,6 +162,12 @@ export async function claudeLocalLauncher(
                 }
             } catch (e) {
                 logger.debug('[local]: launch error', e);
+                if (e instanceof Error && /^(CAPACITY_|SETUP_TOKEN_START_)/.test(e.message)) {
+                    session.client.sendSessionEvent({ type: 'message', message: describeClaudeLaunchFailure(e) });
+                    session.client.closeClaudeSessionTurn('failed');
+                    exitReason = { type: 'switch' };
+                    break;
+                }
                 // 격리 필수 머신의 거절은 재시도 대상이 아니다. 아래 일반 오류
                 // 경로는 `continue` 로 다시 띄우므로, 여기서 끊지 않으면 격리를
                 // 세울 수 없는 머신에서 무한 재기동이 된다.

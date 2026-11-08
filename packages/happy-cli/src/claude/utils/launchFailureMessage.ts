@@ -27,6 +27,10 @@ export function describeClaudeLaunchFailure(error: unknown): string {
         return error.stage === 'initialize' ? CLAUDE_STARTUP_TIMEOUT_NOTICE : CLAUDE_AUTH_CHECK_TIMEOUT_NOTICE;
     }
     const text = error instanceof Error ? error.message : String(error);
+    if (text === 'CAPACITY_WAIT_EXPIRED') return '조직 AI 계정의 빈자리를 30분 동안 기다렸습니다. 입력과 첨부를 확인한 뒤 다시 요청하거나 관리자에게 계정 상태를 확인해 주세요.';
+    if (text === 'CAPACITY_ACTOR_REQUIRED' || text === 'CAPACITY_INPUT_PROOF_INVALID') return '요청한 사용자를 확인할 수 없어 실행을 멈췄습니다. 앱과 작업PC 실행기를 업데이트한 뒤 다시 요청해 주세요. 원래 입력과 첨부는 대화에 남아 있습니다.';
+    if (/^CAPACITY_(DELIVERY_UNKNOWN|PROVIDER_EXIT_UNCONFIRMED|RECOVERY_REQUIRED)$/i.test(text)) return '이전 실행의 전달 또는 종료 상태를 확인할 수 없어 자동 재전송을 멈췄습니다. 원래 입력과 첨부는 유지됩니다. 조직 관리자에게 계정 복구 상태를 확인해 주세요.';
+    if (text.startsWith('CAPACITY_')) return '조직 AI 계정의 사용 권한이나 실행 상태를 확인하지 못해 실행을 멈췄습니다. 원래 입력과 첨부는 유지됩니다. 계정 상태를 확인한 뒤 다시 요청해 주세요.';
     if (text === 'SETUP_TOKEN_START_WAIT_EXHAUSTED') return 'No organization Claude account became available after repeated checks. Ask your organization administrator to check the assigned accounts, then send again.';
     if (text === 'SETUP_TOKEN_START_UNAVAILABLE') return 'The organization Claude account could not be authorized to start. Ask your organization administrator to check the assigned accounts, then send again.';
     if (text === ORGANIZATION_CLAUDE_AUTH_FAILURE) return 'Organization Claude stopped because the assigned account or policy could not be verified. Check this machine’s CLI and assigned account, then send again.';

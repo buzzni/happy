@@ -643,6 +643,7 @@ type MachineRpcHandlers = {
     browserSessionPrepare?: (sessionId: string) => Promise<{ supported: boolean; reconnect?: boolean }>;
     browserSessionWaiting?: (sessionId: string) => Promise<boolean>;
     aiCredentialRuntime: AiCredentialRuntime;
+    setupTokenCapacityBarrier?: (input: unknown) => Promise<unknown>;
     autonomousQualityGate?: AutonomousQualityGateRpcHandlers;
     checkpoint?: CheckpointRpcHandlers;
     /**
@@ -1218,6 +1219,7 @@ export class ApiMachineClient {
         portRegistry,
         automationStore,
         aiCredentialRuntime,
+        setupTokenCapacityBarrier,
         autonomousQualityGate,
         checkpoint,
         byosOfflineReceive,
@@ -1317,11 +1319,12 @@ export class ApiMachineClient {
             aiCredentialRuntime.capture(params)
         ));
         this.rpcHandlerManager.registerHandler('ai-credential:token-probe', params => aiCredentialRuntime.tokenProbe(params), { customerBound: true });
+        if (setupTokenCapacityBarrier) this.rpcHandlerManager.registerHandler('ai-credential:capacity-barrier', setupTokenCapacityBarrier, { customerBound: true });
         this.rpcHandlerManager.registerHandler('ai-credential:collector-probe', params => aiCredentialRuntime.collectorProbe(params, this.machine.id), { customerBound: true });
         this.rpcHandlerManager.registerHandler('ai-credential:personal-claude-accounts', async () => ({ version: 1, accounts: (await readPersonalClaudeCredentials()).map(({ accountRef, label, roster }) => ({ accountRef, label, roster })) }), { customerBound: true });
         this.rpcHandlerManager.registerHandler('ai-credential:capabilities', async () => {
             const baseCapabilities = await aiCredentialRuntime.capabilities(this.machine.id);
-            const capabilities = { ...baseCapabilities, ...(baseCapabilities.newSessionProfileBinding ? { personalClaudeSelectionVersion: 1 } : {}) };
+            const capabilities = { ...baseCapabilities, ...(setupTokenCapacityBarrier ? { setupTokenUserCapacityVersion: 1 } : {}), ...(baseCapabilities.newSessionProfileBinding ? { personalClaudeSelectionVersion: 1 } : {}) };
             if (!setupTokenAssignmentKillSwitchEnabled()
                 && capabilities.setupTokenVersion === 1 && capabilities.setupTokenStatusVersion === 1) {
                 return {
