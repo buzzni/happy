@@ -114,13 +114,14 @@ describe('installHappyCommandShim on Windows', () => {
 
         // PowerShell runs `happy.cmd` through cmd, so `%VAR%` and embedded `"` in arguments are cmd's to
         // reparse; plain arguments, spaces included, must arrive intact.
+        // A cold Windows PowerShell start alone takes 3 s on a CI runner and 8 s on a busy one.
         it('shouldRunTheSessionsOwnCliFromPowerShell', () => {
             const env = sessionEnv();
             installHappyCommandShim(env, homeDir, { runtime: process.execPath, args: ['-e', 'console.log(JSON.stringify(process.argv.slice(1)))'] });
 
             const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', "happy agent 'two words'"], { env, encoding: 'utf8' });
             expect(JSON.parse(result.stdout)).toEqual(['agent', 'two words']);
-        });
+        }, 30_000);
 
         it('shouldReturnTheCliExitCodeThroughCmd', () => {
             const env = sessionEnv();

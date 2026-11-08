@@ -326,7 +326,14 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     try {
       signal?.throwIfAborted()
       const proof = await shared.sharedMachine.startProof(shared.managedAccountId)
-      if (!proof) return open('account not held by this PC')
+      if (!proof) {
+        // A later sync took the account off this PC: the session moves to one it holds, as off a used-up account.
+        if (!await shared.sharedMachine.environment(shared.managedAccountId)) {
+          sharedStartPreferred.delete(shared.session)
+          return failure('START_ACCOUNT_EXHAUSTED', `shared start for ${sessionId}: account no longer held by this PC`)
+        }
+        return open('account not held by this PC')
+      }
       const response = await post('shared/start', { machineId: deps.machineId, companyId: proof.companyId, sessionId,
         managedAccountId: shared.managedAccountId, credentialGeneration: proof.credentialGeneration, requestId })
       if (!response.ok) {
@@ -520,7 +527,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       if (shared === undefined) return Promise.resolve(failure('NOT_BOUND', `rebind: session ${sessionId} is not an unbound shared-PC session`))
       const parsed = parseBinding(running)
       // An unbound shared-PC session moves off a refused account within this PC, without Studio's exhaustion check.
-      if (options.startExhausted && (shared || !parsed)) return Promise.resolve({ ok: false as const, reason: 'UNSUPPORTED' as const })
+      if (options.startExhausted && !shared && !parsed) return Promise.resolve({ ok: false as const, reason: 'UNSUPPORTED' as const })
       if (options.startBudget && !shared && !parsed) return Promise.resolve({ ok: false as const, reason: 'UNSUPPORTED' as const })
       if (parsed && isMachineSetupTokenBinding(parsed.binding)) {
         const binding = parsed.binding
