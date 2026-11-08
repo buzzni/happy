@@ -41,11 +41,15 @@ describe('runClaude session model pin wiring', () => {
     // way on Z.AI the SDK falls to its own sonnet tier = glm-4.7, so the same
     // Default that seeds flash would switch models on the first mobile turn.
     it('applies the runtime default to a cleared model, but never to the fallback model', () => {
+        // One call that normalizes and then defaults (org-llm-endpoints r3), so an endpoint's tier mapping survives.
         expect(source).toContain(
-            'messageModel = defaultClaudeModelForRuntime(process.env, messageModel)',
+            'messageModel = resolveClaudeModelForRuntime(message.meta.model || undefined, process.env)',
         );
         expect(source).not.toContain(
             'messageFallbackModel = defaultClaudeModelForRuntime(',
+        );
+        expect(source).not.toContain(
+            'messageFallbackModel = resolveClaudeModelForRuntime(',
         );
     });
 });
