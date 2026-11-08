@@ -280,14 +280,20 @@ describe.skipIf(!enabled)('real SDK credential pin with project rules', () => {
             ['a custom OAuth deployment', { CLAUDE_CODE_CUSTOM_OAUTH_URL: 'ATTACKER' }],
             ['provider base addresses without a provider switch', { ANTHROPIC_FOUNDRY_BASE_URL: 'ATTACKER', ANTHROPIC_AWS_BASE_URL: 'ATTACKER', ANTHROPIC_GOOGLE_CLOUD_BASE_URL: 'ATTACKER', ANTHROPIC_BEDROCK_MANTLE_BASE_URL: 'ATTACKER', AWS_ENDPOINT_URL: 'ATTACKER', AWS_ENDPOINT_URL_BEDROCK_RUNTIME: 'ATTACKER' }],
             ['host auth indirection', { CLAUDE_CODE_HOST_AUTH_ENV_VAR: 'ATTACKER_TOKEN', ATTACKER_TOKEN: 'fixture-host-auth' }],
-            // The fixture endpoint is on loopback, which an HTTP client does not send through a proxy; this row cannot show a proxy move.
+            // Settings file only (see machineOnlyRoutes): the fixture endpoint is on loopback, which macOS clients do not proxy but Linux ones do.
             ['an HTTP proxy (loopback target)', { HTTP_PROXY: 'ATTACKER', http_proxy: 'ATTACKER', ALL_PROXY: 'ATTACKER', NO_PROXY: '' }],
             ['workload identity', { ANTHROPIC_IDENTITY_TOKEN: 'fixture-jwt', ANTHROPIC_FEDERATION_RULE_ID: 'rule', ANTHROPIC_ORGANIZATION_ID: 'org', ANTHROPIC_SERVICE_ACCOUNT_ID: 'sa' }],
         ] as const;
+        // A request cannot carry a proxy (the daemon drops every `*_PROXY` request key, see sessionEnv.test.ts), so a proxy in the
+        // process environment is the machine's own network configuration rather than a route anyone else controls. Only the
+        // settings-file variant is an attack; the process variant also hangs on Linux, where loopback requests do go through it.
+        const machineOnlyRoutes: ReadonlySet<string> = new Set(['an HTTP proxy (loopback target)']);
         // The remaining transport/authentication variables of the bundled Claude Code that the endpoint set does not own: each is
         // pointed at a listener in the process environment (what a request could carry) and in the user's settings file, and must
         // not move the conversation or the token there — it is refused, fails to start, or is inert. This documents why none is owned.
-        it.each(otherRoutes.flatMap(([label, vars]) => (['process environment', 'user settings file'] as const).map(where => [label, where, vars] as const)))(
+        it.each(otherRoutes.flatMap(([label, vars]) => (['process environment', 'user settings file'] as const)
+            .filter(where => !(where === 'process environment' && machineOnlyRoutes.has(label)))
+            .map(where => [label, where, vars] as const)))(
             'does not send the conversation or the token elsewhere through %s (set in the %s)', async (label, where, vars) => {
                 const { f, attackerUrl } = await arrange();
                 const environment = Object.fromEntries(Object.entries(vars).map(([k, v]) => [k, v === 'ATTACKER' ? attackerUrl : v]));
