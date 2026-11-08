@@ -148,6 +148,8 @@ import { organizationResumeRefusal, resumeSetupTokenEnvironment, shareResumeInFl
 import type { AiAuthSource } from '@/usage/aiAuthSource';
 import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch, resumeLaunchAgent } from '@/resume/handleResumeCommand';
+import { prepareLaunchMcpServers, type LaunchMcpRequest, type PreparedLaunchMcpServers } from '@/aplus/launchMcpServers';
+import { fetchAplusMcpServerNames } from '@/aplus/fetchAplusMcpServers';
 import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
 import { decodeBase64, decrypt, encodeBase64, encrypt } from '@/api/encryption';
 import {
@@ -2127,6 +2129,7 @@ export async function startDaemon(): Promise<void> {
           primaryDirectory: directory,
           allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
         });
+        let launchMcp: PreparedLaunchMcpServers | undefined;
         const finishSpawn = async (
           spawn: Promise<SpawnSessionResult>,
           appliedAiAuthSource?: AiAuthSource,
@@ -2144,9 +2147,11 @@ export async function startDaemon(): Promise<void> {
               await releaseBrowserTaskRegistration();
             }
             if (result.type !== 'success') return result;
-            const reported: SpawnSessionResult = appliedAiAuthSource === undefined
+            const launchMcpDropped = await launchMcp?.report();
+            const withAuthSource: SpawnSessionResult = appliedAiAuthSource === undefined
               ? result
               : { ...result, appliedAiAuthSource };
+            const reported: SpawnSessionResult = launchMcpDropped ? { ...withAuthSource, launchMcpDropped } : withAuthSource;
             if (options.additionalDirectories === undefined) return reported;
             return {
               ...reported,
@@ -2507,6 +2512,14 @@ export async function startDaemon(): Promise<void> {
         browserTaskRegistration = browserTaskSeed.registration;
         // Session process only: the secret, or why there is none. It removes both from its env before spawning claude.
         Object.assign(extraEnv, browserTaskSeed.environment);
+        // Desktop extension MCP servers (launchMcpServers.ts): a seed after expansion like the others, so a `${...}`
+        // in a value is content. The organization's server names are looked up while the child starts.
+        launchMcp = prepareLaunchMcpServers({
+          request: options.launchMcpServers,
+          agent: options.agent ?? 'claude',
+          lookupServerNames: () => fetchAplusMcpServerNames(extraEnv, options.happyToken ?? credentials.token, machineId),
+        });
+        Object.assign(extraEnv, launchMcp.environment);
 
         // The plan grant is spent only now, once nothing else can refuse this spawn before a child is launched:
         // web-ui and Desktop retry a refused spawn (an unreadable MCP envelope after a key rotation) with the
@@ -3069,6 +3082,8 @@ export async function startDaemon(): Promise<void> {
       /** Present = replace the roots granted at spawn (a live child is left untouched). */
       additionalDirectories?: string[];
       checkpointRestart?: true;
+      /** Desktop extension MCP servers for the respawned process, checked at the RPC boundary. */
+      launchMcpServers?: LaunchMcpRequest;
       /** Daemon-internal only; never deserialized from a machine RPC. */
       writeScopeEnvironment?: Record<string, string>;
       writeScopeValidate?: () => Promise<void>;
@@ -3479,6 +3494,14 @@ export async function startDaemon(): Promise<void> {
           }
         }
 
+        // The same launch MCP rule as a spawn, for the process this resume starts; a live child above keeps its own.
+        const resumeLaunchMcp = prepareLaunchMcpServers({
+          request: options?.launchMcpServers,
+          agent: resumeAgent,
+          lookupServerNames: () => fetchAplusMcpServerNames(resumedEnvironment, credentialDecision.token, machineId),
+        });
+        Object.assign(resumedEnvironment, resumeLaunchMcp.environment);
+
         const result = await spawnResumedWithBrowserTaskRegistration({
           broker: browserTaskBroker,
           agentSessionId: happySessionId,
@@ -3502,9 +3525,10 @@ export async function startDaemon(): Promise<void> {
           ownerPid: () => Array.from(pidToTrackedSession.values()).find((session) => session.happySessionId === happySessionId)?.pid,
           onRevokeFailure: reportBrowserTaskRevokeFailure,
         });
-        return result.type === 'error'
-          ? { ...result, code: 'SESSION_RESUME_FAILED' }
-          : result;
+        if (result.type === 'error') return { ...result, code: 'SESSION_RESUME_FAILED' };
+        if (result.type !== 'success') return result;
+        const launchMcpDropped = await resumeLaunchMcp.report();
+        return launchMcpDropped ? { ...result, launchMcpDropped } : result;
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : (error && typeof error === 'object' ? JSON.stringify(error) : String(error));
         logger.debug(`[DAEMON RUN] Failed to resume session: ${errorMessage}`, error instanceof Error ? error.stack : undefined);

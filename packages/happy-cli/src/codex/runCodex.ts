@@ -82,6 +82,7 @@ import {
 } from '@/aplus/fetchAplusMcpServers';
 import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/connectorToolGuidance';
 import { bridgeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
+import { codexLaunchMcpServers, consumeLaunchMcpServersSeed, launchMcpServersBeside } from '@/aplus/launchMcpServers';
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { CodexDisplay } from "@/ui/ink/CodexDisplay";
 import { trimIdent } from "@/utils/trimIdent";
@@ -613,6 +614,8 @@ export async function runCodex(opts: {
     // A plan session runs the grant's model; the gateway overwrites any other choice anyway.
     const explicitInitialModel = agentPlanLaunch?.descriptor.model ?? opts.initialModel ?? pendingInitialModel ?? reconnectPin.model;
     const rawInitialEffortSeed = consumePendingInitialEffort(process.env) ?? reconnectPin.effort;
+    // Desktop extension MCP servers for this launch (aplus/launchMcpServers.ts): read once, removed from the env.
+    const launchMcpServers = consumeLaunchMcpServersSeed(process.env);
     if (rawInitialEffortSeed && !isSupportedCodexReasoningEffort(rawInitialEffortSeed)) {
         logger.debug(`[Codex] Ignoring invalid initial effort seed: ${rawInitialEffortSeed}`);
     }
@@ -2219,7 +2222,7 @@ export async function runCodex(opts: {
             ...configStatuses,
         ],
     }));
-    const baseMcpServers = {
+    const internalMcpServers = {
         happy: {
             command: process.execPath,
             args: ['--no-warnings', '--no-deprecation', bridgeEntrypoint, '--url', happyServer.url],
@@ -2263,6 +2266,16 @@ export async function runCodex(opts: {
         ...(cuaPolicyEnv && sandboxPolicyMode !== 'mandatory'
             ? { toolPolicy: { env: (name: string) => policyAdapterEnv(name) ?? {}, toolTimeoutSec: CUA_SHADOW_TOOL_TIMEOUT_SECONDS } }
             : {}),
+    };
+    // Under every server this session already has: an organization server that arrives later wins the name too,
+    // and http goes through the bridge organization servers use (tool policy included).
+    const sessionLaunchMcpServers = launchMcpServersBeside(launchMcpServers, Object.keys(initialAplusMcpServers));
+    if (Object.keys(launchMcpServers).length > 0) {
+        logger.debug(`[launch-mcp] Codex adds ${Object.keys(sessionLaunchMcpServers).join(',') || '(none)'} of ${Object.keys(launchMcpServers).length}`);
+    }
+    const baseMcpServers = {
+        ...codexLaunchMcpServers(sessionLaunchMcpServers, (servers) => bridgeAplusMcpServers(servers, bridgeOptions)),
+        ...internalMcpServers,
     };
     const listExternalServices = (mcpServers: Record<string, unknown>) => listExpectedMcpServices({
         expectedConnectors: readExpectedConnectors(),

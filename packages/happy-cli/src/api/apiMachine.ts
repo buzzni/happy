@@ -281,6 +281,7 @@ import { createSignedSetupTokenVerifier } from '@/daemon/signedSetupTokenAssignm
 import type { AutonomousQualityGateRpcHandlers } from '@/daemon/autonomousQualityGateRpc';
 import type { CheckpointRpcHandlers } from '@/checkpoint/checkpointRpc';
 import { normalizeSessionSource } from '@/utils/sessionSource';
+import { LAUNCH_MCP_SERVERS_CAPABILITY, parseLaunchMcpServers, type LaunchMcpRequest } from '@/aplus/launchMcpServers';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const BROKER_ACTIVITY_TOUCH_INTERVAL_MS = 60_000;
@@ -602,6 +603,8 @@ type MachineRpcHandlers = {
         /** Present = authoritative (empty withdraws every root); absent = keep the session's roots. */
         additionalDirectories?: string[];
         aiAuthRequirement?: ResumeAuthRequirement;
+        /** Checked at this boundary (launchMcpServers.ts); absent = no injected MCP servers. */
+        launchMcpServers?: LaunchMcpRequest;
     }) => Promise<ResumeSessionResult>;
     recoverSession?: (sessionId: string, options: RecoverSessionOptions) => Promise<RecoverSessionResult>;
     stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
@@ -945,6 +948,8 @@ export class ApiMachineClient {
         /** Present = authoritative (empty withdraws every root); absent = keep the session's roots. */
         additionalDirectories?: string[];
         aiAuthRequirement?: ResumeAuthRequirement;
+        /** Checked at this boundary (launchMcpServers.ts); absent = no injected MCP servers. */
+        launchMcpServers?: LaunchMcpRequest;
     }) => Promise<ResumeSessionResult>) | null = null;
     private recoverSessionHandler: ((sessionId: string, options: RecoverSessionOptions) => Promise<RecoverSessionResult>) | null = null;
     private linkSpawnedSessionHandler: ((input: { sessionId: string; directory: string }) => void | Promise<void>) | null = null;
@@ -1001,7 +1006,7 @@ export class ApiMachineClient {
     private disconnectedSince: number | null = null;
 
     /** Process identity is not replicated state: a server conflict can contain the previous daemon. */
-    private readonly processState: Readonly<Pick<DaemonState, 'pid' | 'httpPort' | 'startedAt' | 'mcpCallerGrantPublicKey'>>;
+    private readonly processState: Readonly<Pick<DaemonState, 'pid' | 'httpPort' | 'startedAt' | 'mcpCallerGrantPublicKey' | 'launchMcpServers'>>;
 
     constructor(
         private token: string,
@@ -1019,6 +1024,7 @@ export class ApiMachineClient {
             httpPort: processState?.httpPort,
             startedAt: processState?.startedAt ?? Date.now(),
             mcpCallerGrantPublicKey: processState?.mcpCallerGrantPublicKey,
+            launchMcpServers: LAUNCH_MCP_SERVERS_CAPABILITY,
         });
         // Initialize RPC handler manager
         this.rpcHandlerManager = new RpcHandlerManager({
@@ -1424,6 +1430,7 @@ export class ApiMachineClient {
                 aiAuthSelection,
                 agentPlan,
                 outputFormat,
+                launchMcpServers,
             } = params || {};
             logger.debug(`[API MACHINE] Spawning session: dir=${directory}, hasUserCreds=${!!(happyToken && happySecret)}`);
 
@@ -1506,6 +1513,9 @@ export class ApiMachineClient {
                 throw new Error('Browser attestation must be a string of at most 4096 characters');
             }
 
+            // Entries are kept or dropped one by one, never thrown: values can be secrets and must not reach an error.
+            const validLaunchMcpServers = parseLaunchMcpServers(launchMcpServers);
+
             const result = await spawnSession({
                 directory,
                 sessionId,
@@ -1540,6 +1550,7 @@ export class ApiMachineClient {
                 aiAuthSelection: validAiAuthSelection,
                 ...(validAgentPlan ? { agentPlan: validAgentPlan } : {}),
                 ...(validOutputFormat ? { outputFormat: validOutputFormat } : {}),
+                ...(validLaunchMcpServers ? { launchMcpServers: validLaunchMcpServers } : {}),
             });
 
             switch (result.type) {
@@ -1562,6 +1573,7 @@ export class ApiMachineClient {
                         ...(result.appliedAiAuthSource
                             ? { appliedAiAuthSource: result.appliedAiAuthSource }
                             : {}),
+                        ...(result.launchMcpDropped?.length ? { launchMcpDropped: result.launchMcpDropped } : {}),
                     };
 
                 case 'requestToApproveDirectoryCreation':
@@ -3616,6 +3628,7 @@ export class ApiMachineClient {
                         expectedConnectors,
                         additionalDirectories,
                         aiAuthRequirement,
+                        launchMcpServers,
                     } = params || {};
 
                     if (!sessionId || typeof sessionId !== 'string') {
@@ -3644,6 +3657,7 @@ export class ApiMachineClient {
                     }
                     const validExpectedConnectors = readExpectedConnectors(expectedConnectors);
                     const validAiAuthRequirement = parseResumeAuthRequirement(aiAuthRequirement);
+                    const validLaunchMcpServers = parseLaunchMcpServers(launchMcpServers);
 
                     const handler = this.resumeSessionHandler;
                     if (!handler) {
@@ -3659,10 +3673,15 @@ export class ApiMachineClient {
                         expectedConnectors: validExpectedConnectors,
                         ...(validAdditionalDirectories !== undefined ? { additionalDirectories: validAdditionalDirectories } : {}),
                         ...(validAiAuthRequirement ? { aiAuthRequirement: validAiAuthRequirement } : {}),
+                        ...(validLaunchMcpServers ? { launchMcpServers: validLaunchMcpServers } : {}),
                     });
                     switch (result.type) {
                         case 'success':
-                            return { type: 'success', sessionId: result.sessionId };
+                            return {
+                                type: 'success',
+                                sessionId: result.sessionId,
+                                ...(result.launchMcpDropped?.length ? { launchMcpDropped: result.launchMcpDropped } : {}),
+                            };
                         case 'requestToApproveDirectoryCreation':
                             return result;
                         case 'error':

@@ -99,6 +99,7 @@ import { takeSessionSourceFromEnv } from '@/utils/sessionSource';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { createManagedFollowUpHandler } from '@/managed/managedFollowUp';
 import { consumeOutputFormatSeed } from './structuredOutput';
+import { claudeLaunchMcpServers, consumeLaunchMcpServersSeed, launchMcpServersBeside } from '@/aplus/launchMcpServers';
 import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodePromptBlocks, consumePendingInitialSaycodeSystemPromptEnabled, defaultClaudeModelForRuntime, normalizeClaudeModelForRuntime, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
 import {
     createSessionModelPinPublisher,
@@ -1036,6 +1037,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // validated it; a seed that does not parse is dropped, and the session runs without a format.
     const outputFormat = consumeOutputFormatSeed(process.env) ?? undefined;
     if (outputFormat) logger.debug('[START] Structured output requested for this session');
+    // Desktop extension MCP servers for this launch (aplus/launchMcpServers.ts): read once, removed from the env.
+    const launchMcpServers = consumeLaunchMcpServersSeed(process.env);
     const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
         process.env,
     );
@@ -2100,7 +2103,13 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // While the shadow runs, the hook steps aside for `cua-driver`: an org server of that name must not displace it.
     const shadowSafe = <T,>(servers: Record<string, T>): Record<string, T> => (cuaUpstream ? withoutCuaDriver(servers) : servers);
     const aplusMcpServers = shadowSafe(initialAplusMcpSnapshot?.servers ?? {});
+    // Under every server this session already has: an organization server that arrives later wins the name too.
+    const sessionLaunchMcpServers = launchMcpServersBeside(launchMcpServers, Object.keys(aplusMcpServers));
+    if (Object.keys(launchMcpServers).length > 0) {
+        logger.debug(`[launch-mcp] Claude adds ${Object.keys(sessionLaunchMcpServers).join(',') || '(none)'} of ${Object.keys(launchMcpServers).length}`);
+    }
     const baseMcpServers = {
+        ...claudeLaunchMcpServers(sessionLaunchMcpServers),
         'happy': happyServer.mcpConfig,
         ...(toolPolicy && cuaUpstream ? {
             [CUA_DRIVER_SERVER]: claudeCuaShadowEntry({

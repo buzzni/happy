@@ -111,6 +111,19 @@ Initiated by mobile app via backend RPC:
 5. Daemon updates tracking with `happySessionId`, resolves awaiter
 6. RPC returns session info to mobile app
 
+#### Extension MCP servers (`launchMcpServers`)
+
+aplus-dev-studio-desktop `specs/extension-session-and-worktree-hooks`: `spawn-happy-session` and
+`resume-happy-session` take an optional `launchMcpServers` map (advertised as `daemonState.launchMcpServers: 1`)
+and answer `launchMcpDropped: [{ name, reason: 'name-conflict' | 'invalid' | 'unsupported-agent' }]` when they
+dropped any (`src/aplus/launchMcpServers.ts`). The organization's MCP map is built by the session process, not
+the daemon, so the daemon passes the survivors as the one-shot `HAPPY_INITIAL_LAUNCH_MCP_SERVERS` seed; the
+Claude/Codex runner reads and deletes it and puts the servers under the internal (`happy`, `cua-driver`) and
+`/api/me/mcp-config` servers, which always win a name. For the answer the daemon looks the organization's names
+up itself while the child starts (`fetchAplusMcpServerNames`, one try, no `process.env` writes); a failed lookup
+only leaves those conflicts unreported. Values (args, env, headers) are never logged, never captured into
+`agentEnvironment` and never kept for daemon-started resumes — those resume without the servers.
+
 ### Terminal-Spawned Sessions
 
 User runs `happy` directly:
