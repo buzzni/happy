@@ -2027,7 +2027,8 @@ export async function startDaemon(): Promise<void> {
       if (chosen) return chosen;
       const runtime = await chooseLaunchRotation({
         managedClaude: (!options.agent || options.agent === 'claude') && honorsManagedAiCredentials(options.aiAuthSelection),
-        explicitUserGrant: options.aiAuthSelection?.kind === 'claude-setup-token',
+        // An endpoint launch spends no company account either: rotation would reserve one before the selection is verified.
+        explicitUserGrant: options.aiAuthSelection?.kind === 'claude-setup-token' || options.aiAuthSelection?.kind === 'org-endpoint',
         precreatedSession: !!options.reconnectEnvironment,
         resolver: machineRotation, scope: sharedMachineScope,
         log: (reason, unexpected) => {

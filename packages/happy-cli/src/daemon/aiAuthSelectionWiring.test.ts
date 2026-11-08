@@ -170,6 +170,11 @@ describe('org-endpoint wiring (aplus specs/org-llm-endpoints C5)', () => {
     expect(text).toMatch(/resumeOrgEndpoint\s*\?\s*\{ environment: await resolveManagedAiCredentialEnvironment\(resumeAgent, resumeOrgEndpoint\), rebound: false \}\s*:\s*await resumeSetupTokenEnvironment\(/)
   })
 
+  it('an endpoint launch never takes the shared-machine rotation: it spends no company account', async () => {
+    const text = await runSource()
+    expect(text).toMatch(/explicitUserGrant: options\.aiAuthSelection\?\.kind === 'claude-setup-token' \|\| options\.aiAuthSelection\?\.kind === 'org-endpoint',/)
+  })
+
   it('the applied target reaches the spawn result', async () => {
     const text = await runSource()
     expect(text).toMatch(/appliedOrgLlmEndpoint = readAppliedOrgLlmEndpoint\(managedAiCredentialEnvironment\)/)
