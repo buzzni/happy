@@ -77,6 +77,20 @@ describe('skillLockRefusal — terminal writes into a locked skill', () => {
         'eval "rm -rf ~/.claude/skills/deep-research"',
         "python3 - <<'PY'\nopen('/Users/me/.claude/skills/deep-research/SKILL.md', 'w').write('x')\nPY",
         "cd .claude/skills/review && python3 -c \"open('SKILL.md','a').write('x')\"",
+        // cross review: block words, joined operators, wrapper cwd and environment, short options, negated globs
+        'if true; then rm ~/.claude/skills/deep-research/SKILL.md; fi',
+        '{ rm ~/.claude/skills/deep-research/SKILL.md; }',
+        'for f in a b; do rm ~/.claude/skills/deep-research/$f; done',
+        'while true; do echo x >> ~/.claude/skills/deep-research/log; done',
+        'true&&>~/.claude/skills/deep-research/SKILL.md',
+        '(>~/.claude/skills/deep-research/SKILL.md)',
+        '! rm ~/.claude/skills/deep-research/SKILL.md',
+        'env -C ~/.claude/skills/deep-research rm SKILL.md',
+        'env --chdir=.claude/skills/review rm SKILL.md',
+        "env D=~/.claude/skills/deep-research bash -c 'rm \"$D/SKILL.md\"'",
+        'cp -t~/.claude/skills/deep-research /tmp/a',
+        'install -d ~/.claude/skills/deep-research/new',
+        'rm ~/.claude/skills/[!a]*/SKILL.md',
     ])('refuses %s', (command) => {
         const reason = refusal(bash(command));
         expect(reason).toContain('스킬 잠금으로 막힘');
@@ -117,6 +131,12 @@ describe('skillLockRefusal — what stays allowed', () => {
         'echo x > /dev/null',
         'cd ~/.claude/skills/deep-research; cd /tmp; echo x > SKILL.md',
         '(cd ~/.claude/skills/deep-research); echo x > SKILL.md',
+        'cd ~/.claude/skills/deep-research && unzip -p /tmp/a.zip SKILL.md',
+        'unzip -l /tmp/a.zip -d ~/.claude/skills/deep-research',
+        'if [ -f x ]; then echo ok; fi',
+        'for f in ~/.claude/skills/deep-research/*.md; do cat $f; done',
+        'env -C /tmp rm SKILL.md',
+        'rm ~/.claude/skills/[!d]*/SKILL.md',
     ])('allows %s', (command) => {
         expect(refusal(bash(command))).toBeNull();
     });
@@ -172,6 +192,24 @@ describe('skillLockRefusal — every skill locked (corrupt lock file, unattended
     });
 });
 
+describe('the lock file (record)', () => {
+    const RECORD = '/Users/me/.happy/skill-locks.json';
+    const withRecord = { ...LOCKS, record: RECORD };
+    it.each([
+        'rm -rf ~/.happy',
+        'mv ~/.happy /tmp/old-happy',
+        'rm ~/.happy/skill-locks.json',
+        'rm ~/.happy/skill-*.json',
+    ])('refuses %s while a skill is locked', (command) => {
+        expect(refusal(bash(command), withRecord)).toContain('스킬 잠금 설정 파일');
+    });
+
+    it('allows other files in the same home and nothing at all without a lock', () => {
+        expect(refusal(bash('rm ~/.happy/logs/old.log'), withRecord)).toBeNull();
+        expect(refusal(bash('rm -rf ~/.happy'), { dirs: [], record: RECORD })).toBeNull();
+    });
+});
+
 describe('symlinked skills', () => {
     it('refuses a write through the link to the locked directory', () => {
         const root = realpathSync(mkdtempSync(join(tmpdir(), 'skill-lock-')));
@@ -185,6 +223,14 @@ describe('symlinked skills', () => {
             const locks = { dirs: [{ dir: real, name: 'deep-research' }] };
             expect(skillLockRefusal(bash('echo x > ~/.claude/skills/deep-research/SKILL.md', join(root, 'home')), locks, env)).toContain("'deep-research'");
             expect(skillLockRefusal({ tool_name: 'Edit', tool_input: { file_path: join(root, 'home', '.claude', 'skills', 'deep-research', 'new.md') }, cwd: root }, locks, env)).toContain("'deep-research'");
+            // cross review: a glob through the link, `..` after a link, a link inside the skill, and R4 fail-closed
+            expect(skillLockRefusal(bash('rm ~/.claude/skills/deep-research/*.md', join(root, 'home')), locks, env)).toContain("'deep-research'");
+            mkdirSync(join(real, 'sub'));
+            symlinkSync(join(real, 'sub'), join(root, 'via'));
+            expect(skillLockRefusal({ tool_name: 'Write', tool_input: { file_path: `${root}/via/../SKILL.md` }, cwd: root }, locks, env)).toContain("'deep-research'");
+            symlinkSync('/tmp', join(real, 'out'));
+            expect(skillLockRefusal(bash(`rm ${join(real, 'out')}`, root), locks, env)).toContain("'deep-research'");
+            expect(skillLockRefusal({ tool_name: 'Write', tool_input: { file_path: join(root, 'home', '.claude', 'skills', 'deep-research', 'SKILL.md') }, cwd: root }, { allSkills: true }, env)).toBe(ALL_SKILLS_REFUSAL);
         } finally {
             rmSync(root, { recursive: true, force: true });
         }

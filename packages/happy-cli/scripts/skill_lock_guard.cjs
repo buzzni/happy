@@ -25,6 +25,8 @@ function skillRefusal(name) {
     return `스킬 잠금으로 막힘: '${name}' 스킬은 사용자가 잠가 에이전트가 바꿀 수 없다(파일 도구·터미널 모두). 대신: 바꾸려던 내용을 사용자에게 알리고 요청하라. ${NO_BYPASS}`;
 }
 
+const SKILL_LOCK_FILE_MESSAGE = '스킬 잠금으로 막힘: 스킬 잠금 설정 파일(과 그 폴더)은 에이전트가 바꾸거나 지울 수 없다 — 잠금은 Saycode 설정 화면에서 사용자가 바꾼다. 대신: 필요한 변경을 사용자에게 요청하라. 이 제한을 스크립트·자동화 도구·셸 명령 등 다른 방법으로 우회하지 마라.';
+
 const ALL_SKILLS_REFUSAL = `스킬 잠금으로 막힘: 스킬 잠금 설정 파일을 읽을 수 없어, 사람이 보고 있지 않은 이 실행에서는 모든 스킬 폴더를 잠긴 것으로 다룬다. 대신: 사용자에게 Saycode 설정의 스킬 잠금을 다시 저장해 달라고 요청하라. ${NO_BYPASS}`;
 
 // ── lock file ────────────────────────────────────────────────────────────────────────────────────
@@ -88,10 +90,13 @@ function realish(abs) {
 
 function globToRegExp(component) {
     let source = '';
-    for (const ch of component) {
+    for (let i = 0; i < component.length; i++) {
+        const ch = component[i];
         if (ch === '*') source += '.*';
         else if (ch === '?') source += '.';
-        else if (ch === '[' || ch === ']') source += ch;
+        // The shell's negated class `[!a]` is `[^a]` to a regular expression.
+        else if (ch === '[') source += component[i + 1] === '!' ? (i++, '[^') : '[';
+        else if (ch === ']') source += ch;
         else source += ch.replace(/[.+^${}()|\\]/g, '\\$&');
     }
     try {
@@ -106,14 +111,17 @@ const hasGlob = (value) => /[*?[]/.test(value);
 /**
  * What one call is checked against. `ancestor`: '' — only a path at or inside a locked skill; 'any' — also a
  * directory above one (recursive deletes, moves, permission changes); 'skills' — above one only inside a
- * skills root (a recursive copy or an extraction there can merge into the skill).
+ * skills root (a recursive copy or an extraction there can merge into the skill). The lock file itself (`record`)
+ * counts as locked too, and so does any directory above it for 'any': removing it would lift every lock.
  */
 function createScope(input) {
     const fold = input.caseInsensitive ? (value) => value.toLowerCase() : (value) => value;
     const realpath = input.realpath || realish;
+    // The OS resolves `..` after following symlinks, so the real path is taken before normalizing.
+    const real = (value) => fold(stripSlash(path.resolve(realpath(value))));
     const roots = input.allSkills ? [] : input.dirs.map((entry) => ({
         name: entry.name,
-        dir: fold(stripSlash(realpath(path.resolve(entry.dir)))),
+        dir: real(entry.dir),
         // Inline code names the path as written, which may be a symlink to the real directory.
         written: fold(stripSlash(path.resolve(entry.dir))),
     }));
@@ -121,36 +129,58 @@ function createScope(input) {
         for (const base of [input.home, input.cwd]) {
             for (const agent of ['.claude', '.agents', '.codex']) {
                 const dir = path.join(base, agent, 'skills');
-                roots.push({ name: dir, dir: fold(stripSlash(realpath(dir))), written: fold(dir) });
+                roots.push({ name: dir, dir: real(dir), written: fold(dir) });
             }
         }
     }
+    const record = input.record ? real(input.record) : null;
     const refusal = (root) => (input.allSkills ? ALL_SKILLS_REFUSAL : skillRefusal(root.name));
 
-    function hitResolved(resolved, ancestor) {
-        const real = fold(stripSlash(realpath(resolved)));
-        if (input.allSkills && SKILLS_ROOT.test(real)) return ALL_SKILLS_REFUSAL;
+    function hitOne(candidate, ancestor) {
+        if (record && (candidate === record || (ancestor === 'any' && candidate !== path.parse(candidate).root && inside(record, candidate)))) {
+            return SKILL_LOCK_FILE_MESSAGE;
+        }
+        if (input.allSkills && SKILLS_ROOT.test(candidate)) return ALL_SKILLS_REFUSAL;
         for (const root of roots) {
-            if (inside(real, root.dir)) return refusal(root);
-            if (ancestor && real !== path.parse(real).root && inside(root.dir, real)
-                && (ancestor === 'any' || SKILLS_ROOT.test(real))) return refusal(root);
+            if (inside(candidate, root.dir)) return refusal(root);
+            if (ancestor && candidate !== path.parse(candidate).root && inside(root.dir, candidate)
+                && (ancestor === 'any' || SKILLS_ROOT.test(candidate))) return refusal(root);
         }
         return null;
     }
 
-    /** A glob is matched component by component against each locked dir (no filesystem expansion). */
+    /**
+     * Three readings of one path: fully resolved (where a write lands), resolved up to the parent (a symlink
+     * inside a locked skill is itself removed or replaced), and as written (a skill installed as a symlink still
+     * sits under a skills root — the fail-closed reading in R4 needs that).
+     */
+    function hitResolved(resolved, ancestor) {
+        const asWritten = fold(stripSlash(path.resolve(resolved)));
+        const parentReal = fold(stripSlash(path.join(real(path.dirname(resolved)), path.basename(resolved))));
+        return hitOne(real(resolved), ancestor) || hitOne(parentReal, ancestor) || hitOne(asWritten, ancestor);
+    }
+
+    /** A glob is matched component by component against each locked dir; its literal prefix is resolved first. */
     function hitGlob(pattern, ancestor) {
-        const parts = fold(pattern).split(/[\\/]+/);
-        for (const root of roots) {
-            const rootParts = root.dir.split(/[\\/]+/);
-            const n = Math.min(parts.length, rootParts.length);
-            let matches = true;
-            for (let i = 0; i < n && matches; i++) matches = globToRegExp(parts[i]).test(rootParts[i]);
-            if (!matches) continue;
-            if (parts.length >= rootParts.length) return refusal(root);
-            if (ancestor === 'any' || (ancestor === 'skills' && SKILLS_ROOT.test(parts.join('/')))) return refusal(root);
+        const parts = path.resolve(pattern).split(/[\\/]+/);
+        const firstGlob = parts.findIndex(hasGlob);
+        const prefix = parts.slice(0, firstGlob).join('/') || '/';
+        const readings = [fold(pattern), [real(prefix), ...parts.slice(firstGlob)].join('/')];
+        for (const reading of readings) {
+            const readingParts = fold(reading).split(/[\\/]+/);
+            for (const target of [...roots.map((root) => ({ root, dir: root.dir })), ...roots.map((root) => ({ root, dir: root.written })),
+                ...(record ? [{ root: null, dir: record }] : [])]) {
+                const targetParts = target.dir.split(/[\\/]+/);
+                const n = Math.min(readingParts.length, targetParts.length);
+                let matches = true;
+                for (let i = 0; i < n && matches; i++) matches = globToRegExp(readingParts[i]).test(targetParts[i]);
+                if (!matches) continue;
+                const reason = target.root ? refusal(target.root) : SKILL_LOCK_FILE_MESSAGE;
+                if (readingParts.length >= targetParts.length) return reason;
+                if (ancestor === 'any' || (ancestor === 'skills' && target.root && SKILLS_ROOT.test(readingParts.join('/')))) return reason;
+            }
+            if (input.allSkills && SKILLS_ROOT.test(fold(reading))) return ALL_SKILLS_REFUSAL;
         }
-        if (input.allSkills && SKILLS_ROOT.test(fold(pattern))) return ALL_SKILLS_REFUSAL;
         return null;
     }
 
@@ -159,12 +189,18 @@ function createScope(input) {
         /** A shell word (or tool path), expanded the way the shell would before it reaches the command. */
         hit(word, cwd, vars, ancestor = '') {
             if (typeof word !== 'string' || word.length === 0) return null;
-            const resolved = path.resolve(cwd, expand(word, vars, input.home));
+            const resolved = joinPath(cwd, expand(word, vars, input.home));
             return hasGlob(resolved) ? hitGlob(resolved, ancestor) : hitResolved(resolved, ancestor);
         },
         roots,
+        record,
         fold,
     };
+}
+
+/** cwd + word without normalizing `..` away: the real path is taken first (see createScope). */
+function joinPath(cwd, word) {
+    return path.isAbsolute(word) ? word : `${cwd.replace(/[\\/]+$/, '')}/${word}`;
 }
 
 const VAR = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g;
@@ -180,6 +216,7 @@ function expand(word, vars, home) {
 // ── shell words ──────────────────────────────────────────────────────────────────────────────────
 
 const OPERATOR_CHARS = ';&|<>()';
+const OPERATORS = ['&>>', ';;&', '<<<', '<<-', '>>', '&&', '||', '|&', ';;', ';&', '&>', '>|', '>&', '<&', '<<', '<>', ';', '&', '|', '(', ')', '<', '>'];
 
 /**
  * Shell-ish tokens: quotes removed, an unquoted newline becomes `;`, runs of `;&|<>()` become operator tokens
@@ -248,15 +285,16 @@ function tokenize(command) {
             continue;
         }
         if (OPERATOR_CHARS.includes(ch)) {
-            let op = '';
-            while (i < command.length && OPERATOR_CHARS.includes(command[i])) op += command[i++];
+            // One operator at a time, longest first: `true&&>f` is `&&` then `>`, `(>f)` is `(` then `>`.
+            const op = OPERATORS.find((candidate) => command.startsWith(candidate, i));
+            i += op.length;
+            // A bare fd number right before a redirection belongs to it (`2>`), not to the command's words.
             if ((op[0] === '>' || op[0] === '<') && started && !quotedWord && /^\d+$/.test(word)) {
                 word = '';
                 started = false;
-                op = 'N' + op;
             }
             flush();
-            tokens.push({ text: op.replace(/^N/, ''), op: true });
+            tokens.push({ text: op, op: true });
             continue;
         }
         word += ch;
@@ -314,10 +352,32 @@ const WRAPPER_OPTIONS_WITH_ARG = {
 };
 const WRAPPERS = new Set(['sudo', 'env', 'command', 'builtin', 'exec', 'nohup', 'setsid', 'time', 'nice', 'xargs', 'timeout', 'stdbuf', 'ionice', 'caffeinate', 'doas']);
 
-function stripWrappers(argv) {
+/** Words that open or close a shell block; the command follows them (`if true; then rm f; fi`). */
+const RESERVED = new Set(['if', 'then', 'elif', 'else', 'fi', 'do', 'done', 'while', 'until', '{', '}', '!', 'esac', 'time', 'coproc']);
+/** Their words are a list, not a command (`for f in a b`). */
+const LIST_HEADS = new Set(['for', 'case', 'select', 'function']);
+
+/**
+ * The command a simple command really runs, past block words, `VAR=…` prefixes and wrappers (`sudo`, `env`,
+ * `nohup`, `xargs`…). `env -C dir` moves the working directory, and assignments reach the command's environment
+ * (`env D=… bash -c '… $D …'`) — both apply to this command only.
+ */
+function unwrap(argv, cwd, vars, home) {
     let rest = argv;
+    let where = cwd;
+    const env = { ...vars };
+    const assign = (word) => {
+        const [, name, value] = ASSIGNMENT.exec(word);
+        env[name] = expand(value, env, home);
+    };
     while (rest.length > 0) {
+        if (RESERVED.has(rest[0])) {
+            rest = rest.slice(1);
+            continue;
+        }
+        if (LIST_HEADS.has(rest[0])) return { argv: [], cwd: where, vars: env };
         if (ASSIGNMENT.test(rest[0])) {
+            assign(rest[0]);
             rest = rest.slice(1);
             continue;
         }
@@ -326,11 +386,15 @@ function stripWrappers(argv) {
         const takesValue = WRAPPER_OPTIONS_WITH_ARG[head] || new Set();
         rest = rest.slice(1);
         while (rest.length > 0 && (rest[0].startsWith('-') || (head === 'env' && ASSIGNMENT.test(rest[0])))) {
-            rest = takesValue.has(rest[0]) ? rest.slice(2) : rest.slice(1);
+            const flag = rest[0];
+            if (head === 'env' && ASSIGNMENT.test(flag)) assign(flag);
+            if (head === 'env' && (flag === '-C' || flag === '--chdir') && rest.length > 1) where = joinPath(where, expand(rest[1], env, home));
+            if (head === 'env' && flag.startsWith('--chdir=')) where = joinPath(where, expand(flag.slice('--chdir='.length), env, home));
+            rest = takesValue.has(flag) ? rest.slice(2) : rest.slice(1);
         }
         if (head === 'timeout' && rest.length > 0) rest = rest.slice(1); // the duration
     }
-    return rest;
+    return { argv: rest, cwd: where, vars: env };
 }
 
 const operands = (args) => args.filter((arg) => arg && !arg.startsWith('-'));
@@ -392,6 +456,8 @@ function createChecker(scope, env) {
 
     function fileVerbs(verb, args, cwd, vars) {
         if (WRITES_EVERY_OPERAND.has(verb)) return firstHit(operands(args), cwd, vars, RECURSIVE.has(verb) ? 'any' : '');
+        // `install -d a b` creates every operand as a directory.
+        if (verb === 'install' && args.some((arg) => arg === '-d' || arg === '--directory' || /^-[A-Za-z]*d[A-Za-z]*$/.test(arg))) return firstHit(operands(args), cwd, vars, '');
         if (verb === 'dd') return firstHit(args.filter((arg) => arg.startsWith('of=')).map((arg) => arg.slice(3)), cwd, vars, '');
         if (!WRITES_LAST_OPERAND.has(verb)) return null;
         let target = null;
@@ -400,6 +466,7 @@ function createChecker(scope, env) {
             const arg = args[i];
             if (arg.startsWith('--target-directory=')) target = arg.slice('--target-directory='.length);
             else if ((arg === '-t' || arg === '--target-directory') && i + 1 < args.length) target = args[++i];
+            else if (/^-t./.test(arg)) target = arg.slice(2);
             else rest.push(arg);
         }
         const ops = operands(rest);
@@ -448,7 +515,7 @@ function createChecker(scope, env) {
         const rest = [...args];
         while (rest.length > 0 && rest[0].startsWith('-')) {
             const flag = rest.shift();
-            if (flag === '-C' && rest.length > 0) where = path.resolve(cwd, expand(rest.shift(), vars, env.home));
+            if (flag === '-C' && rest.length > 0) where = joinPath(cwd, expand(rest.shift(), vars, env.home));
             else if (['-c', '--git-dir', '--work-tree', '--namespace'].includes(flag) && rest.length > 0) rest.shift();
         }
         const sub = rest.shift();
@@ -472,11 +539,12 @@ function createChecker(scope, env) {
         if (!['tar', 'gtar', 'bsdtar', 'unzip', '7z', '7za'].includes(verb)) return null;
         let dest = cwd;
         for (let i = 0; i < args.length - 1; i++) {
-            if (['-C', '--directory', '-d'].includes(args[i])) dest = path.resolve(cwd, expand(args[i + 1], vars, env.home));
-            if (args[i].startsWith('-o') && (verb === '7z' || verb === '7za')) dest = path.resolve(cwd, expand(args[i].slice(2), vars, env.home));
+            if (['-C', '--directory', '-d'].includes(args[i])) dest = joinPath(cwd, expand(args[i + 1], vars, env.home));
+            if (args[i].startsWith('-o') && (verb === '7z' || verb === '7za')) dest = joinPath(cwd, expand(args[i].slice(2), vars, env.home));
         }
         const bundled = args.length > 0 && !args[0].startsWith('-') && args[0].includes('x');
-        const extracting = verb === 'unzip' || ((verb === '7z' || verb === '7za') && args[0] === 'x') || bundled
+        // `unzip -p|-l|-t|-v|-Z` print, list or test; nothing is written.
+        const extracting = (verb === 'unzip' && !args.some((arg) => /^-[A-Za-z]*[pltvZ]/.test(arg))) || ((verb === '7z' || verb === '7za') && args[0] === 'x') || bundled
             || args.some((arg) => arg === '--extract' || arg === '-x' || (/^-[A-Za-z]*x/.test(arg) && !arg.startsWith('--')));
         return extracting ? scope.hitResolved(dest, 'skills') : null;
     }
@@ -523,13 +591,14 @@ function createChecker(scope, env) {
                 const reason = scope.hit(target, cwd, vars, '');
                 if (reason) return reason;
             }
-            argv = stripWrappers(argv);
+            const command = unwrap(argv, cwd, vars, env.home);
+            argv = command.argv;
             if (argv.length > 0 && (argv[0] === 'cd' || argv[0] === 'pushd')) {
                 const to = argv.slice(1).find((arg) => !arg.startsWith('-'));
                 if (to === undefined) cwd = env.home;
-                else if (to !== '-') cwd = path.resolve(cwd, expand(to, vars, env.home));
+                else if (to !== '-') cwd = joinPath(cwd, expand(to, vars, env.home));
             } else if (argv.length > 0) {
-                const reason = argvRefusal(argv, cwd, vars, depth);
+                const reason = argvRefusal(argv, command.cwd, command.vars, depth);
                 if (reason) return reason;
             }
             for (const ch of segment.separator) {
@@ -545,14 +614,15 @@ function createChecker(scope, env) {
 
 /**
  * The refusal for this hook payload, or null. `locks`: `{ dirs }` from the lock file, or `{ allSkills: true }`
- * when it is corrupt in an unattended turn (every skill root counts as locked, spec R4).
+ * when it is corrupt in an unattended turn (every skill root counts as locked, spec R4); `record` — the lock
+ * file, protected along with the directories above it while anything is locked.
  */
 function skillLockRefusal(payload, locks, env) {
     const input = (payload && payload.tool_input) || {};
     const cwd = (payload && payload.cwd) || process.cwd();
     const allSkills = locks.allSkills === true;
     if (!allSkills && (!locks.dirs || locks.dirs.length === 0)) return null;
-    const scope = createScope({ dirs: locks.dirs || [], allSkills, cwd, home: env.home, caseInsensitive: env.caseInsensitive, realpath: env.realpath });
+    const scope = createScope({ dirs: locks.dirs || [], allSkills, record: locks.record, cwd, home: env.home, caseInsensitive: env.caseInsensitive, realpath: env.realpath });
     const vars = { ...(env.vars || {}), HOME: env.home };
     if (payload.tool_name === 'Bash') {
         if (typeof input.command !== 'string') return null;
@@ -560,10 +630,10 @@ function skillLockRefusal(payload, locks, env) {
     }
     const targets = [input.file_path, input.notebook_path].filter((value) => typeof value === 'string' && value.length > 0);
     for (const target of targets) {
-        const reason = scope.hitResolved(path.resolve(cwd, expand(target, vars, env.home)), '');
+        const reason = scope.hitResolved(joinPath(cwd, expand(target, vars, env.home)), '');
         if (reason) return reason;
     }
     return null;
 }
 
-module.exports = { readSkillLocks, skillLockRefusal, tokenize, ALL_SKILLS_REFUSAL };
+module.exports = { readSkillLocks, skillLockRefusal, tokenize, ALL_SKILLS_REFUSAL, SKILL_LOCK_FILE_MESSAGE };

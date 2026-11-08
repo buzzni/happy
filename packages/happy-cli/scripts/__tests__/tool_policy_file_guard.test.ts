@@ -176,8 +176,15 @@ describe('tool_policy_file_guard --skill-locks', () => {
         writeFileSync(lockFile, JSON.stringify({ version: 1, locked: [] }));
         const result = await guard(shell(`echo '{"version":1,"locked":[]}' > ${lockFile}`));
         expect(result.status).toBe(2);
-        expect(result.stderr).toContain('스킬 잠금 설정 파일은 에이전트가 바꿀 수 없다');
+        expect(result.stderr).toContain('스킬 잠금 설정 파일(과 그 폴더)은 에이전트가 바꾸거나 지울 수 없다');
         expect((await guard(write(lockFile))).status).toBe(2);
+    });
+
+    it('refuses removing the home that holds the lock file while a skill is locked', async () => {
+        writeFileSync(lockFile, JSON.stringify({ version: 1, locked: [{ dir: skill, name: 'deep-research' }] }));
+        const result = await guard(shell(`rm -rf ${join(home, '.happy')}`));
+        expect(result.status).toBe(2);
+        expect(result.stderr).toContain('스킬 잠금 설정 파일');
     });
 
     it('passes everything when there is no lock file', async () => {
@@ -207,6 +214,11 @@ describe('tool_policy_file_guard --skill-locks', () => {
             expect((await guard(write(join(home, 'project', 'a.ts')), ['--hook', String(server.port), secretFile])).status).toBe(0);
             unattended = false;
             expect((await guard(write(join(skill, 'SKILL.md')), ['--hook', String(server.port), secretFile])).status).toBe(0);
+        });
+
+        it('treats a secret the request cannot even carry as unattended', async () => {
+            writeFileSync(secretFile, 'a\nb');
+            expect((await guard(write(join(skill, 'SKILL.md')), ['--hook', String(server.port), secretFile])).status).toBe(2);
         });
 
         it('treats an unanswered question as unattended', async () => {

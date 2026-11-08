@@ -36,7 +36,7 @@ const fs = require('fs');
 const http = require('http');
 const os = require('os');
 const path = require('path');
-const { readSkillLocks, skillLockRefusal } = require('./skill_lock_guard.cjs');
+const { readSkillLocks, skillLockRefusal, ALL_SKILLS_REFUSAL, SKILL_LOCK_FILE_MESSAGE } = require('./skill_lock_guard.cjs');
 
 const MESSAGE = '도구 정책으로 막힘: Saycode 도구 정책 파일은 에이전트가 바꿀 수 없다 — 정책은 Saycode 설정 화면에서 사용자가 바꾼다. 대신: 필요한 변경을 사용자에게 요청하라. 이 제한을 스크립트·자동화 도구·셸 명령 등 다른 방법으로 우회하지 마라.';
 
@@ -128,39 +128,51 @@ function targetsProtectedDirectory(payload, protectedDir, env = defaultEnv(prote
     return inside(fold(normalize(target, cwd, env)), dir);
 }
 
-const SKILL_LOCK_FILE_MESSAGE = '스킬 잠금으로 막힘: 스킬 잠금 설정 파일은 에이전트가 바꿀 수 없다 — 잠금은 Saycode 설정 화면에서 사용자가 바꾼다. 대신: 필요한 변경을 사용자에게 요청하라. 이 제한을 스크립트·자동화 도구·셸 명령 등 다른 방법으로 우회하지 마라.';
 
 const ATTENDANCE_TIMEOUT_MS = 3000;
 
 /** Whether the session's current turn is unattended; any failure to learn it counts as unattended (fail closed). */
 function askUnattended(hook) {
     return new Promise((resolve) => {
-        let secret;
         try {
-            secret = fs.readFileSync(hook.secretFile, 'utf8').trim();
+            ask(hook, resolve);
         } catch {
-            return resolve(true);
+            resolve(true);
         }
-        const request = http.request({
-            host: '127.0.0.1', port: Number(hook.port), path: '/hook/attendance', method: 'POST',
-            headers: { 'content-type': 'application/json', 'x-happy-hook-secret': secret },
-            timeout: ATTENDANCE_TIMEOUT_MS,
-        }, (response) => {
-            const chunks = [];
-            response.on('data', (chunk) => chunks.push(chunk));
-            response.on('end', () => {
-                try {
-                    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-                    resolve(response.statusCode !== 200 || body.unattended !== false);
-                } catch {
-                    resolve(true);
-                }
-            });
-        });
-        request.on('timeout', () => request.destroy());
-        request.on('error', () => resolve(true));
-        request.end('{}');
     });
+}
+
+/** One question to the session's hook server; resolves with true (unattended) on any failure to get an answer. */
+function ask(hook, resolve) {
+    // A response that stalls or breaks off after the headers is no answer either.
+    setTimeout(() => resolve(true), ATTENDANCE_TIMEOUT_MS + 500);
+    let secret;
+    try {
+        secret = fs.readFileSync(hook.secretFile, 'utf8').trim();
+    } catch {
+        return resolve(true);
+    }
+    const request = http.request({
+        host: '127.0.0.1', port: Number(hook.port), path: '/hook/attendance', method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-happy-hook-secret': secret },
+        timeout: ATTENDANCE_TIMEOUT_MS,
+    }, (response) => {
+        const chunks = [];
+        response.on('error', () => resolve(true));
+        response.on('aborted', () => resolve(true));
+        response.on('data', (chunk) => chunks.push(chunk));
+        response.on('end', () => {
+            try {
+                const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+                resolve(response.statusCode !== 200 || body.unattended !== false);
+            } catch {
+                resolve(true);
+            }
+        });
+    });
+    request.on('timeout', () => request.destroy());
+    request.on('error', () => resolve(true));
+    request.end('{}');
 }
 
 function parseArgs(argv) {
@@ -173,7 +185,7 @@ function parseArgs(argv) {
     return options;
 }
 
-/** The block reason for this payload, or null. Rejects only where the attendance check itself is needed and fails. */
+/** The block reason for this payload, or null. A corrupt lock file refuses on any failure in its own branch (R4). */
 async function decide(payload, options, env = { home: os.homedir(), vars: process.env, caseInsensitive: process.platform === 'darwin' || process.platform === 'win32' }) {
     if (options.policyFile && targetsPolicyFile(payload, path.resolve(options.policyFile))) return MESSAGE;
     if (options.dirs.some((dir) => dir && targetsProtectedDirectory(payload, path.resolve(dir)))) return DIRECTORY_MESSAGE;
@@ -181,10 +193,15 @@ async function decide(payload, options, env = { home: os.homedir(), vars: proces
     const lockFile = path.resolve(options.skillLocks);
     if (targetsPolicyFile(payload, lockFile)) return SKILL_LOCK_FILE_MESSAGE;
     const locks = readSkillLocks(lockFile);
-    if (locks.kind === 'ok') return skillLockRefusal(payload, { dirs: locks.dirs }, env);
+    if (locks.kind === 'ok') return skillLockRefusal(payload, { dirs: locks.dirs, record: lockFile }, env);
     if (locks.kind !== 'corrupt') return null;
-    // Only a call that would touch a skill pays for the question.
-    const refusal = skillLockRefusal(payload, { allSkills: true }, env);
+    // Only a call that would touch a skill pays for the question. From here on a failure refuses (R4).
+    let refusal;
+    try {
+        refusal = skillLockRefusal(payload, { allSkills: true, record: lockFile }, env);
+    } catch {
+        refusal = ALL_SKILLS_REFUSAL;
+    }
     if (!refusal) return null;
     return (!options.hook || await askUnattended(options.hook)) ? refusal : null;
 }
