@@ -33,7 +33,12 @@ describe.skipIf(!findChrome())('human page port in isolated real Chrome (local P
         expect(await harness.evaluate(tab.targetId, "document.querySelector('#field').value")).toBe('한글 입력 확')
         await expect(driver.pageView.input(tab.tabId, frame, { kind: 'text', text: 'refused' }, () => { throw new Error('control changed') })).rejects.toThrow('control changed')
         expect(await harness.evaluate(tab.targetId, "document.querySelector('#field').value")).toBe('한글 입력 확')
+        // A view close drains keys/buttons even when the user leaves before sending keyUp/mouseReleased.
+        await harness.evaluate(tab.targetId, `window.released=[];addEventListener('keyup',e=>window.released.push(e.code));addEventListener('mouseup',()=>window.released.push('mouse'))`)
+        await driver.pageView.input(tab.tabId, frame, { kind: 'key', type: 'keyDown', key: 'Shift', code: 'ShiftLeft', modifiers: 8 }, () => {})
+        await driver.pageView.input(tab.tabId, frame, { ...pointer, type: 'mousePressed' }, () => {})
         await driver.pageView.release(tab.tabId)
+        expect(await harness.evaluate(tab.targetId, `window.released`)).toEqual(['ShiftLeft', 'mouse'])
         await harness.evaluate(tab.targetId, 'window.scrollTo(0, 300)')
         await expect(driver.pageView.input(tab.tabId, frame, { kind: 'text', text: 'old-frame' }, () => {})).rejects.toMatchObject({ code: 'STALE_REF' })
         await driver.closeTab(tab.tabId, { timeoutMs: 15000 })

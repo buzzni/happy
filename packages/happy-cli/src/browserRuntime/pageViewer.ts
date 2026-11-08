@@ -12,7 +12,7 @@ function createPageViewer(o) {
     // Runtime serves a view one frame per 500 ms, or per 200 ms while this viewer holds the tab; a read inside that
     // interval (or over the profile's byte budget, reset each second) is refused, so the next one waits that long.
     let lastRead = -Infinity, retryAt = -Infinity;
-    let wheelRefresh = false;
+    let wheelRefresh = false, compositionView = null;
     const queue = [];
     const keys = new Set();
     const clearImage = () => { frame = null; image.hidden = true; image.removeAttribute('src'); o.empty.hidden = false; confirmedAt = -Infinity; };
@@ -30,6 +30,7 @@ function createPageViewer(o) {
         const old = view;
         view = null;
         wheelRefresh = false;
+        compositionView = null; composing = false; input.value = '';
         queue.length = 0;
         keys.clear();
         keyModifiers = 0;
@@ -149,6 +150,7 @@ function createPageViewer(o) {
         const event = queue.shift(), owner = view, lease = own(), gen = o.generation();
         const current = frame;
         inputBusy = true;
+        o.render();
         const n = ++sequence;
         try {
             const result = await o.request('dispatchPageInput', { schemaVersion: 1, viewId: owner.viewId, frameId: current.frameId, leaseEpoch: lease.leaseEpoch, sequence: n, event });
@@ -163,6 +165,7 @@ function createPageViewer(o) {
             else if (event.kind === 'wheel') wheelRefresh = true;
         }
         catch (e) {
+            if (view !== owner || gen !== o.generation()) return;
             queue.length = 0;
             if (!e?.known) {
                 lost = true;
@@ -179,6 +182,7 @@ function createPageViewer(o) {
         }
         finally {
             inputBusy = false;
+            o.render();
             if (view === owner)
                 void flush();
         }
@@ -243,8 +247,8 @@ function createPageViewer(o) {
     }, { passive: false });
     image.addEventListener('focus', () => { if (canInput())
         input.focus({ preventScroll: true }); });
-    input.addEventListener('compositionstart', () => { composing = true; });
-    input.addEventListener('compositionend', e => { composing = false; if (e.data)
+    input.addEventListener('compositionstart', () => { composing = true; compositionView = view; });
+    input.addEventListener('compositionend', e => { const owner = compositionView; composing = false; compositionView = null; if (owner && owner === view && e.data)
         enqueue({ kind: 'text', text: e.data.slice(0, 1024) }); input.value = ''; });
     input.addEventListener('beforeinput', raw => {
         const e = raw;
@@ -282,6 +286,7 @@ function createPageViewer(o) {
             enqueue({ kind: 'key', type: type === 'keydown' ? 'keyDown' : 'keyUp', key: e.key, code: e.code, modifiers: keyModifiers });
         });
     input.addEventListener('blur', () => {
+        compositionView = null; composing = false; input.value = '';
         const owner = view;
         if (!owner || !own())
             return;
