@@ -4407,8 +4407,37 @@ describe('organization LLM endpoint', () => {
     expect(fetch).not.toHaveBeenCalled()
     await runtime.orgLlmEndpointSync(syncParams({}, { generation: 3, targets: [{ id: 'target-b', url: 'https://llm-b.corp.example' }] }))
     await expect(runtime.sessionEnvironment('claude', resume)).rejects.toMatchObject({ kind: 'ORG_LLM_ENDPOINT_GENERATION_MISMATCH' })
-    await runtime.orgLlmEndpointSync(syncParams({}, { generation: 2, targets: [{ id: 'target-b', url: 'https://llm-b.corp.example' }] }))
-    await expect(runtime.sessionEnvironment('claude', resume)).rejects.toMatchObject({ kind: 'ORG_LLM_ENDPOINT_TARGET_UNKNOWN' })
+    // Same generation, other targets: an idempotent re-sync may replace the entry (a lower one may not, below).
+    await runtime.orgLlmEndpointSync(syncParams({}, { generation: 3, targets: [{ id: 'target-b', url: 'https://llm-b.corp.example' }] }))
+    await expect(runtime.sessionEnvironment('claude', { ...resume, generation: 3 })).rejects.toMatchObject({ kind: 'ORG_LLM_ENDPOINT_TARGET_UNKNOWN' })
+  })
+
+  it('refuses a sync of a lower generation, keeps the stored entry and says which generation it holds', async () => {
+    const { runtime, files, writeFile } = setup()
+    await runtime.orgLlmEndpointSync(syncParams({}, { generation: 5, token: 'newer-token' }))
+    writeFile.mockClear()
+    const rejected = await runtime.orgLlmEndpointSync(syncParams({}, { generation: 4, token: 'older-token' })).catch((error: unknown) => error)
+    expect(rejected).toMatchObject({ kind: 'ORG_LLM_ENDPOINT_STALE_GENERATION', storedGeneration: 5 })
+    expect(String((rejected as Error).message)).toContain('storedGeneration=5')
+    expect(String((rejected as Error).message)).not.toContain('token')
+    expect(writeFile).not.toHaveBeenCalled()
+    expect(JSON.parse(files.get(storePath)!).endpoints['endpoint-1']).toMatchObject({ generation: 5, token: 'newer-token' })
+  })
+
+  it('lets a lower generation of another endpoint through', async () => {
+    const { runtime } = setup()
+    await runtime.orgLlmEndpointSync(syncParams({}, { generation: 5 }))
+    await expect(runtime.orgLlmEndpointSync(syncParams({}, { id: 'endpoint-2', generation: 1 }))).resolves.toEqual({ ok: true, generation: 1 })
+  })
+
+  it('serializes a late older sync behind a newer one so the older cannot win the race', async () => {
+    const { runtime, files } = setup()
+    const results = await Promise.allSettled([
+      runtime.orgLlmEndpointSync(syncParams({}, { generation: 6 })),
+      runtime.orgLlmEndpointSync(syncParams({}, { generation: 5 })),
+    ])
+    expect(results.map((result) => result.status)).toEqual(['fulfilled', 'rejected'])
+    expect(JSON.parse(files.get(storePath)!).endpoints['endpoint-1'].generation).toBe(6)
   })
 
   it('wins the whole spawn composition and its record survives a capture-resume round trip', async () => {

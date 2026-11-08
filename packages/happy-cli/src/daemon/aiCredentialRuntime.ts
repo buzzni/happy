@@ -234,6 +234,14 @@ export class AiCredentialRuntimeError extends Error {
   }
 }
 
+/** A sync older than the stored endpoint; `storedGeneration` tells the sender what this machine holds. */
+class OrgLlmEndpointStaleGenerationError extends AiCredentialRuntimeError {
+  constructor(readonly storedGeneration: number) {
+    super('ORG_LLM_ENDPOINT_STALE_GENERATION')
+    this.message += ` [storedGeneration=${storedGeneration}]`
+  }
+}
+
 /** An additive Claude apply that imported shared slots but could not activate one: the slots stay, so they keep their provenance. */
 class ClaudeActivationError extends AiCredentialRuntimeError {
   constructor(kind: string, readonly importedAccounts: ClaudeListDetails['accounts']) {
@@ -2763,6 +2771,10 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
           if (!(error instanceof OrgLlmEndpointError)) throw error
           deps.warn?.('org-llm-endpoints store was unreadable and is replaced by the synced endpoint only')
         }
+        // A prepare that read the endpoint before an admin change can arrive after the one that read it after:
+        // the older view must not bring back a removed address or a replaced token.
+        const stored = current?.endpoints[entry.id]
+        if (stored && entry.generation < stored.generation) throw new OrgLlmEndpointStaleGenerationError(stored.generation)
         await deps.mkdir(join(deps.homeDir, '.happy'), { recursive: true, mode: 0o700 })
         await writeAtomicFile(deps, orgLlmEndpointStorePath(), JSON.stringify(replaceOrgLlmEndpoint(current, entry)))
         return { ok: true as const, generation: entry.generation }
