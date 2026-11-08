@@ -16,6 +16,19 @@ const object = (v: unknown): v is ObjectValue => !!v && typeof v === 'object' &&
 type LiveSettings = { effective: ObjectValue; sources: Array<{ source: string; settings: ObjectValue }> };
 type PinControls = { getSettings(): Promise<unknown> };
 
+/** What differs between the credentials this pin can hold: the values it forces, and what it accepts as proof. */
+type PinSpec = {
+    failureCode: string;
+    /** Names the pin in debug logs; never a value. */
+    label: string;
+    /** Forced into the flag settings and re-checked against the live effective settings before every input. */
+    authEnv: Record<string, string>;
+    /** False when an administrator policy conflicts with the credential, whatever the env says. */
+    policyAllows(effective: ObjectValue): boolean;
+    /** The account Claude Code reports after a reinitialize; false when it is not the one pinned. */
+    accountMatches(account: ObjectValue | undefined): boolean;
+};
+
 /** Fail closed if the installed SDK/CLI cannot prove the session's effective authentication. */
 export function queryWithPinnedCredential(
     create: typeof query,
@@ -25,7 +38,6 @@ export function queryWithPinnedCredential(
 ): Query {
     const failureCode = source === 'organization' ? ORGANIZATION_CLAUDE_AUTH_FAILURE : PERSONAL_CLAUDE_AUTH_FAILURE;
     if (!oauthToken || /[\r\n\0]/.test(oauthToken)) throw new Error(failureCode);
-    const signal = params.options.abortController?.signal;
     const authEnv = Object.fromEntries(CLAUDE_AUTH_OVERRIDE_ENV_KEYS.map(key => [key, '']));
     // Newer backends/profiles must not inherit a different credential route.
     for (const key of ['ANTHROPIC_PROFILE', 'CLAUDE_CODE_USE_ANTHROPIC_AWS', 'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD', 'CLAUDE_CODE_USE_MANTLE']) authEnv[key] = '';
@@ -33,6 +45,24 @@ export function queryWithPinnedCredential(
     authEnv.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1';
     authEnv.CLAUDE_CODE_OAUTH_TOKEN = oauthToken;
     authEnv.ANTHROPIC_BASE_URL = params.options.env?.ANTHROPIC_BASE_URL ?? '';
+    return pinQuery(create, params, {
+        failureCode, label: source, authEnv,
+        policyAllows: effective => !(effective.forceLoginOrgUUID !== undefined
+            || (effective.forceLoginMethod !== undefined && effective.forceLoginMethod !== 'claudeai')
+            || (effective.allowedProviders !== undefined && (!Array.isArray(effective.allowedProviders) || !effective.allowedProviders.includes('anthropic')))),
+        accountMatches: account => !(!account || account.apiProvider !== 'firstParty' || account.tokenSource !== 'CLAUDE_CODE_OAUTH_TOKEN'
+            || (account.apiKeySource !== undefined && account.apiKeySource !== 'none')),
+    });
+}
+
+function pinQuery(
+    create: typeof query,
+    params: { prompt: string | AsyncIterable<SDKUserMessage>; options: Options },
+    spec: PinSpec,
+): Query {
+    const { failureCode, authEnv } = spec;
+    const source = spec.label;
+    const signal = params.options.abortController?.signal;
     const startedAt = Date.now();
     const fail = (stage: ClaudeAuthCheckStage, reason: ClaudeAuthCheckReason): never => {
         throw new ClaudeAuthNotVerifiedError(failureCode, stage, reason);
@@ -89,15 +119,11 @@ export function queryWithPinnedCredential(
     async function verify() {
         const { effective } = await settings('recheck');
         const env = effective.env;
-        if (effective.forceLoginOrgUUID !== undefined
-            || (effective.forceLoginMethod !== undefined && effective.forceLoginMethod !== 'claudeai')
-            || (effective.allowedProviders !== undefined && (!Array.isArray(effective.allowedProviders) || !effective.allowedProviders.includes('anthropic')))) fail('recheck', 'policy');
+        if (!spec.policyAllows(effective)) fail('recheck', 'policy');
         if (effective.apiKeyHelper !== '' || !object(env)
             || Object.entries(authEnv).some(([key, value]) => env[key] !== value)) fail('recheck', 'mismatch');
         const info = await control('recheck', () => response.reinitialize());
-        const account = info.account;
-        if (!account || account.apiProvider !== 'firstParty' || account.tokenSource !== 'CLAUDE_CODE_OAUTH_TOKEN'
-            || (account.apiKeySource !== undefined && account.apiKeySource !== 'none')) fail('recheck', 'mismatch');
+        if (!spec.accountMatches(info.account as ObjectValue | undefined)) fail('recheck', 'mismatch');
     }
     async function* guardedInput(): AsyncGenerator<SDKUserMessage> {
         let readingInput = false;
