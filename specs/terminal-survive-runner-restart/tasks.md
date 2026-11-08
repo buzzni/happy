@@ -6,11 +6,11 @@
 - [x] T0. 아키텍처 변경 승인(plan §7 ①~④) — 2026-11-08 조건 3개 붙여 승인, spec HR10~HR12·plan §2.8~2.10에 반영
 
 ## Phase 1 — 워커 프리미티브
-- [ ] T1. `terminalWorker/frames.ts` 길이 접두 JSON 프레임 인코더/디코더 → 단위 테스트(분할 수신·최대 크기·잘못된 길이)
-- [ ] T2. `terminalWorker/protocol.ts` 버전 상수·동결 봉투 타입·`classifyWorkerProtocol` → 단위 테스트
-- [ ] T3. `terminalWorker/record.ts` 기록 원자적 쓰기(0600/0700)·읽기·recordId 확인 삭제 → 단위 테스트
-- [ ] T4. `terminalWorker/socketPath.ts` 바이트 예산·후보 디렉터리·owner-only 검증 → 단위 테스트
-- [ ] T5. `terminalWorker/survivalDecision.ts` spec HR3 표 + `readTerminalWorkerFlag`(HR11 플래그 3값) → 표 전 행·플래그 테스트
+- [x] T1. `terminalWorker/frames.ts` 길이 접두 JSON 프레임 인코더/디코더 → 단위 테스트(분할 수신·최대 크기·잘못된 길이)
+- [x] T2. `terminalWorker/protocol.ts` 버전 상수·동결 봉투 타입·`classifyWorkerProtocol` → 단위 테스트
+- [x] T3. `terminalWorker/record.ts` 기록 원자적 쓰기(0600/0700)·읽기·recordId 확인 삭제 → 단위 테스트
+- [x] T4. `terminalWorker/socketPath.ts` 바이트 예산·후보 디렉터리·owner-only 검증 → 단위 테스트
+- [x] T5. `terminalWorker/survivalDecision.ts` spec HR3 표 + `readTerminalWorkerFlag`(HR11 플래그 3값) → 표 전 행·플래그 테스트
 
 ## Phase 2 — 워커 프로세스와 프록시
 - [ ] T6. (structural) `TerminalOutputBuffer` seq 지정 append·dump/restore, `bindTerminal` 상태 내보내기/복원 — 동작 보존 → 기존 테스트 + 새 단위 테스트
