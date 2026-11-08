@@ -102,6 +102,18 @@ describe('Claude runner adapter of the organization gate', () => {
         expect(zaiExtra).toEqual({});
     });
 
+    it('keeps exactly the model names an organization LLM endpoint session was started with', () => {
+        const names = { ANTHROPIC_MODEL: 'corp-model', ANTHROPIC_DEFAULT_OPUS_MODEL: 'corp-big', ANTHROPIC_DEFAULT_FABLE_MODEL: 'corp-big', CLAUDE_CODE_SUBAGENT_MODEL: 'corp-model', ANTHROPIC_SMALL_FAST_MODEL: '' };
+        const env: Record<string, string | undefined> = { HAPPY_AI_AUTH_SOURCE: 'org-endpoint', ...names, ANTHROPIC_DEFAULT_SONNET_MODEL: 'corp-model', PATH: '/bin' };
+        expect(stripModelSelectionEnv(env, undefined)).toEqual([]);
+        expect(env).toMatchObject(names);
+        // A request cannot add to or change them: only a value equal to the daemon's own stays.
+        const extra: Record<string, string> = { ANTHROPIC_MODEL: 'claude-opus-5', ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5', CLAUDE_CODE_SUBAGENT_MODEL: 'corp-model' };
+        expect(stripModelSelectionEnv(env, extra).sort()).toEqual(['ANTHROPIC_DEFAULT_HAIKU_MODEL', 'ANTHROPIC_MODEL']);
+        expect(extra).toEqual({ CLAUDE_CODE_SUBAGENT_MODEL: 'corp-model' });
+        expect(env).toMatchObject(names);
+    });
+
     it('launches the terminal without bypass and with the clipped mode under a ceiling', () => {
         gate.onRequirements({ kind: 'response', status: 'ok', requirements: doc({ 'permissions.mode': { kind: 'ceiling', max: 'acceptEdits' } }) });
         expect(adapter().localLaunchArgs(['--resume', 'x', '--dangerously-skip-permissions', '--permission-mode', 'bypassPermissions', '--allow-dangerously-skip-permissions']))

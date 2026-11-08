@@ -203,6 +203,33 @@ describe('normalizeClaudeModelForRuntime', () => {
   })
 })
 
+// aplus specs/org-llm-endpoints r2 — an endpoint session runs only the endpoint's own model names.
+describe('model names in an organization LLM endpoint runtime', () => {
+  const endpoint = {
+    HAPPY_AI_AUTH_SOURCE: 'org-endpoint', ANTHROPIC_BASE_URL: 'https://llm.corp.example', ANTHROPIC_MODEL: 'corp-model',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'corp-big', ANTHROPIC_DEFAULT_SONNET_MODEL: 'corp-model', ANTHROPIC_DEFAULT_HAIKU_MODEL: 'corp-small',
+  }
+
+  it('folds a requested Claude model, an alias and Default onto the endpoint names', () => {
+    expect(normalizeClaudeModelForRuntime('claude-sonnet-5-5', endpoint)).toBe('corp-model')
+    expect(normalizeClaudeModelForRuntime('claude-fable-5', endpoint)).toBe('corp-model')
+    expect(normalizeClaudeModelForRuntime('opus', endpoint)).toBe('corp-big')
+    expect(normalizeClaudeModelForRuntime('haiku', endpoint)).toBe('corp-small')
+    expect(normalizeClaudeModelForRuntime('default', endpoint)).toBe('corp-model')
+  })
+
+  it('keeps an unpicked model unpicked, and gives the spawn that named none the endpoint model', () => {
+    expect(normalizeClaudeModelForRuntime(undefined, endpoint)).toBeUndefined()
+    expect(defaultClaudeModelForRuntime(endpoint, 'opus')).toBe('corp-model')
+    expect(defaultClaudeModelForRuntime({ ...endpoint, ANTHROPIC_MODEL: '' }, 'opus')).toBe('opus')
+  })
+
+  it('leaves every other runtime as it was', () => {
+    expect(normalizeClaudeModelForRuntime('claude-sonnet-5-5', { ...endpoint, HAPPY_AI_AUTH_SOURCE: 'org-bundle' })).toBe('claude-sonnet-5-5')
+    expect(defaultClaudeModelForRuntime({}, 'opus')).toBe('opus')
+  })
+})
+
 // web-ui 는 'Default' 선택 시 meta.model 을 **아예 싣지 않고**(sync/index.ts:
 // `resolvedModel !== 'default' ? { model } : {}`), spawn RPC 에는 model 파라미터
 // 자체가 없다. 그래서 실제 "기본값" 경로는 'default' 문자열이 아니라 **모델 부재**다.

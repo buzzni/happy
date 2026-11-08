@@ -81,13 +81,16 @@ const ZAI_TIER_ENV: Partial<Record<typeof MODEL_SELECTION_ENV[number], string>> 
 /**
  * While an organization restricts models, a request's environment must not run a model the turn did not
  * name: the turn's model goes to the SDK explicitly, and these go. A Z.AI runtime keeps exactly the daemon's
- * tier mapping — without it every model name misses — and loses any other value. Returns what was removed.
+ * tier mapping — without it every model name misses — and loses any other value; an organization LLM endpoint
+ * session keeps the names the daemon wrote the same way. Returns what was removed.
  */
 export function stripModelSelectionEnv(env: Record<string, string | undefined>, extra: Record<string, string> | undefined): string[] {
     const zai = isZaiClaudeRuntime(env as NodeJS.ProcessEnv);
+    // An endpoint session's names are the daemon's own and nothing else serves them (org-llm-endpoints r2).
+    const endpoint = env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint';
     const removed = new Set<string>();
     for (const key of MODEL_SELECTION_ENV) {
-        const kept = zai ? ZAI_TIER_ENV[key] : undefined;
+        const kept = zai ? ZAI_TIER_ENV[key] : endpoint ? env[key] : undefined;
         if (env[key] !== undefined && env[key] !== kept) { delete env[key]; removed.add(key); }
         if (extra && extra[key] !== undefined && extra[key] !== kept) { delete extra[key]; removed.add(key); }
     }
