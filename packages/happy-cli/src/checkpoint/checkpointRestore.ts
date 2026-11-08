@@ -20,6 +20,8 @@ import {
 } from './checkpointRestorePlan';
 import { CheckpointStore, resolveCheckpointStoreLayout } from './checkpointStore';
 import { checkpointExclusionMatcher } from './checkpointCoverage';
+import type { LegacyDispatchReservation } from '@/utils/workspaceTurnAdmission';
+import { logger } from '@/ui/logger';
 
 export type CheckpointRestoreExecuteRequest = CheckpointLedgerBinding & {
     operationId: string;
@@ -64,6 +66,8 @@ export type CheckpointRestoreMutation = {
 export type CheckpointRestoreExecutorOptions = {
     mutate?: (mutation: CheckpointRestoreMutation) => Promise<void>;
     observer?: CheckpointOperationObserver;
+    reserveLegacyDispatch?: (roots: readonly string[]) => Promise<LegacyDispatchReservation>;
+    admitSubprocess?: (roots: readonly string[]) => Promise<void>;
 };
 
 const restoreExecutionQueues = new Map<string, Promise<void>>();
@@ -72,11 +76,15 @@ export class CheckpointRestoreExecutor {
     private readonly checkpointRoot: string;
     private readonly mutate: (mutation: CheckpointRestoreMutation) => Promise<void>;
     private readonly observer: CheckpointOperationObserver | undefined;
+    private readonly reserveLegacyDispatch: CheckpointRestoreExecutorOptions['reserveLegacyDispatch'];
+    private readonly admitSubprocess: CheckpointRestoreExecutorOptions['admitSubprocess'];
 
     constructor(checkpointRoot: string, options: CheckpointRestoreExecutorOptions = {}) {
         this.checkpointRoot = resolve(checkpointRoot);
         this.mutate = options.mutate ?? ((mutation) => mutation.apply());
         this.observer = options.observer;
+        this.reserveLegacyDispatch = options.reserveLegacyDispatch;
+        this.admitSubprocess = options.admitSubprocess;
     }
 
     execute(
@@ -95,6 +103,7 @@ export class CheckpointRestoreExecutor {
     ): Promise<CheckpointRestoreExecuteResult> {
         if (!request.confirmed) return { status: 'cancelled' };
         validateOperationId(request.operationId);
+        if (!!this.reserveLegacyDispatch !== !!this.admitSubprocess) throw new Error('WORKSPACE_ADMISSION_UNAVAILABLE');
         const projectPath = await realpath(request.projectPath);
         const layout = resolveCheckpointStoreLayout({
             checkpointRoot: this.checkpointRoot,
@@ -103,7 +112,10 @@ export class CheckpointRestoreExecutor {
             worktreeId: request.worktreeId,
         });
         const journalFile = checkpointRestoreJournalPath(layout, request.operationId);
-        return withCheckpointPin(this.checkpointRoot, {
+        const reservation = await this.reserveLegacyDispatch?.([projectPath]);
+        if (reservation && !reservation.acquired) throw new Error({ 'workspace-busy': 'WORKSPACE_BUSY', 'workspace-owner-unconfirmed': 'WORKSPACE_OWNER_UNCONFIRMED', 'registry-busy': 'WORKSPACE_REGISTRY_BUSY' }[reservation.reason]);
+        try {
+        return await withCheckpointPin(this.checkpointRoot, {
             sessionId: request.sessionId,
             projectId: request.projectId,
             worktreeId: request.worktreeId,
@@ -114,6 +126,12 @@ export class CheckpointRestoreExecutor {
             projectPath,
             journalFile,
         )));
+        } finally {
+            if (reservation?.acquired) {
+                try { await reservation.finish(); }
+                catch { logger.debug('[checkpoint-restore] Workspace handoff unconfirmed; temporary ownership retained'); }
+            }
+        }
     }
 
     private async executeConfirmed(
@@ -216,6 +234,7 @@ export class CheckpointRestoreExecutor {
             && (entry.outcome === 'pending' || entry.outcome === 'failed')
         ));
         if (!hasPendingMutation) return journal.entries.map(toEntryResult);
+        await this.admitSubprocess?.([projectPath]);
         const indexesDirectory = join(layout.gitDirectory, 'restore-indexes');
         await mkdir(indexesDirectory, { recursive: true });
         const temporaryDirectory = await mkdtemp(join(indexesDirectory, 'apply-'));

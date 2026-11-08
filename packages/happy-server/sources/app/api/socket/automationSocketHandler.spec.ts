@@ -39,6 +39,33 @@ describe('automationSocketHandler', () => {
     });
     afterEach(() => delete process.env.SAYCODE_AUTOMATION_ENABLED);
 
+    it.each([undefined, 0, 1, 99])('validates explicit isolation readiness on authenticated key registration (%s)', async contextIsolationVersion => {
+        const handlers = new Map<string, Function>();
+        const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
+        services.registerAutomationMachineKey.mockResolvedValue({ ok: true, value: { keyVersion: 1 } });
+        automationSocketHandler('account-1', 'machine-1', socket as never);
+        const callback = vi.fn();
+        await handlers.get('automation-key-register')!({ expectedKeyVersion: 0, publicKey: Buffer.alloc(32).toString('base64'),
+            protocolVersion: 99, ...(contextIsolationVersion === undefined ? {} : { contextIsolationVersion }), accountId: 'foreign', machineId: 'foreign' }, callback);
+        if (contextIsolationVersion === 99) {
+            expect(services.registerAutomationMachineKey).not.toHaveBeenCalled();
+            expect(callback).toHaveBeenCalledWith({ ok: false, error: 'invalid-input' });
+        } else expect(services.registerAutomationMachineKey).toHaveBeenCalledWith({}, 'account-1', 'machine-1', {
+            expectedKeyVersion: 0, publicKey: new Uint8Array(32), protocolVersion: 99, contextIsolationVersion: contextIsolationVersion ?? 0,
+        });
+    });
+
+    it('accepts the isolated codec advertisement without accepting retired execution semantics', async () => {
+        const handlers = new Map<string, Function>();
+        const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
+        services.syncAutomations.mockResolvedValue({ ok: true, value: { changes: [], nextSeq: 0n } });
+        automationSocketHandler('account-1', 'machine-1', socket as never);
+        const callback = vi.fn();
+        await handlers.get('automation-sync')!({ afterSeq: '0', limit: 100, payloadVersions: [1, 4, 6] }, callback);
+        expect(services.syncAutomations).toHaveBeenCalledWith({}, 'account-1', 'machine-1', { afterSeq: 0n, limit: 100, payloadVersions: [1, 4, 6] });
+        expect(callback).toHaveBeenCalledWith(expect.objectContaining({ ok: true }));
+    });
+
     it('fails closed when the global rollout flag is disabled', async () => {
         process.env.SAYCODE_AUTOMATION_ENABLED = 'false';
         const handlers = new Map<string, Function>();
@@ -123,6 +150,27 @@ describe('automationSocketHandler', () => {
         await handlers.get('automation-run-report')!({ runId: 'old', claimToken: 'claim', reportId: 'report', status: 'COMPLETED', outcome: 'NO_CHANGE', sessionId: null, detailCiphertext: null }, callback);
         expect(callback).toHaveBeenCalledWith(expect.objectContaining({ ok: true }));
         expect(services.reportAutomationRun).toHaveBeenCalledWith({}, 'account-1', 'machine-1', expect.objectContaining({ outcome: 'NO_CHANGE' }));
+    });
+
+    it.each([undefined, null, 'WORKSPACE_BUSY'])('preserves the heartbeat state field without accepting body identity (%s)', async holdCode => {
+        const handlers = new Map<string, Function>();
+        const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
+        services.heartbeatAutomationRun.mockResolvedValue({ ok: true, value: { runLeaseExpiresAt: new Date(1000) } });
+        automationSocketHandler('account-1', 'machine-1', socket as never);
+        const input = { runId: 'run-1', claimToken: 'claim', ...(holdCode !== undefined ? { holdCode } : {}) }, callback = vi.fn();
+        await handlers.get('automation-run-heartbeat')!({ ...input, machineId: 'foreign', accountId: 'foreign' }, callback);
+        expect(services.heartbeatAutomationRun).toHaveBeenCalledWith({}, 'account-1', 'machine-1', input);
+        expect(callback).toHaveBeenCalledWith(expect.objectContaining({ ok: true }));
+    });
+
+    it.each(['private diagnostic', 1])('rejects an invalid heartbeat state before invoking storage (%s)', async holdCode => {
+        const handlers = new Map<string, Function>();
+        const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
+        automationSocketHandler('account-1', 'machine-1', socket as never);
+        const callback = vi.fn();
+        await handlers.get('automation-run-heartbeat')!({ runId: 'run-1', claimToken: 'claim', holdCode }, callback);
+        expect(callback).toHaveBeenCalledWith({ ok: false, error: 'invalid-heartbeat' });
+        expect(services.heartbeatAutomationRun).not.toHaveBeenCalled();
     });
 
     it('accepts a safe automation failure code and rejects unstructured values', async () => {
@@ -312,6 +360,23 @@ describe('automationSocketHandler', () => {
             { projectId: 'project-7', automationId: 'automation-1', reason: 'run' },
             'account-1',
         );
+    });
+
+    it('forwards a catch-up claim only when the daemon sends an explicit true', async () => {
+        // specs/scheduled-missed-run-policy R11 — a truthy string or number must not widen the claim window.
+        const handlers = bind();
+        services.claimAutomationRun.mockResolvedValue({ ok: false, error: 'claim-denied' });
+        const claimInputs = () => services.claimAutomationRun.mock.calls.map((call: unknown[]) => call[3]);
+
+        await handlers.get('automation-claim')!({ automationId: 'automation-1', generation: 3, scheduledFor: 1000, catchUp: true }, vi.fn());
+        await handlers.get('automation-claim')!({ automationId: 'automation-1', generation: 3, scheduledFor: 1000, catchUp: 'true' }, vi.fn());
+        await handlers.get('automation-claim')!({ automationId: 'automation-1', generation: 3, scheduledFor: 1000 }, vi.fn());
+
+        expect(claimInputs()).toEqual([
+            { automationId: 'automation-1', generation: 3, scheduledFor: new Date(1000), catchUp: true },
+            { automationId: 'automation-1', generation: 3, scheduledFor: new Date(1000) },
+            { automationId: 'automation-1', generation: 3, scheduledFor: new Date(1000) },
+        ]);
     });
 
     it('acknowledges the daemon before the project update fan-out settles', async () => {

@@ -80,20 +80,20 @@ async function makeApp() {
 }
 
 describe('automationRoutes', () => {
-    it('exposes readonly registration recovery and only paused v4 idempotent creation', async () => {
+    it.each([4, 6])('exposes readonly registration recovery and only paused v%s idempotent creation', async payloadVersion => {
         const app = await makeApp();
         const url = '/v1/projects/project-1/automations/registrations/registration-key-1';
         mocks.getRegisteredAutomation.mockResolvedValue({ ok: true, value: null });
         const missing = await app.inject({ method: 'GET', url });
         expect(missing.statusCode).toBe(200); expect(missing.json()).toEqual({ automation: null });
         expect(mocks.getRegisteredAutomation).toHaveBeenCalledWith({}, 'user-1', 'project-1', 'registration-key-1');
-        const payload = { payloadVersion: 4, paused: true, payloadCiphertext: Buffer.from(payloadCiphertext).toString('base64'),
+        const payload = { payloadVersion, paused: true, payloadCiphertext: Buffer.from(payloadCiphertext).toString('base64'),
             viewerKeyId: 'viewer-key', viewerKeyVersion: 1, viewerKeyEnvelope: Buffer.from(keyEnvelope).toString('base64'),
             machineKeyVersion: 1, machineKeyEnvelope: Buffer.from(keyEnvelope).toString('base64') };
-        mocks.createRegisteredAutomation.mockResolvedValue({ ok: true, value: { ...record(), payloadVersion: 4, paused: true } });
+        mocks.createRegisteredAutomation.mockResolvedValue({ ok: true, value: { ...record(), payloadVersion, paused: true } });
         const created = await app.inject({ method: 'PUT', url, payload });
         expect(created.statusCode).toBe(200); expect(created.json().automation.paused).toBe(true);
-        expect(mocks.createRegisteredAutomation).toHaveBeenCalledWith({}, 'user-1', 'project-1', 'registration-key-1', expect.objectContaining({ payloadVersion: 4, paused: true }));
+        expect(mocks.createRegisteredAutomation).toHaveBeenCalledWith({}, 'user-1', 'project-1', 'registration-key-1', expect.objectContaining({ payloadVersion, paused: true }));
         for (const patch of [{ paused: false }, { payloadVersion: 1 }, { userId: 'other' }]) {
             expect((await app.inject({ method: 'PUT', url, payload: { ...payload, ...patch } })).statusCode).toBe(400);
         }
@@ -162,6 +162,22 @@ describe('automationRoutes', () => {
             degradedCode: 'GRANT_MISSING', queueDepth: 2, queuePosition: 1, queueTotal: 3,
             queueEstimatedAt: 5,
         });
+    });
+
+    it.each(['WORKSPACE_BUSY', null])('projects waiting state on the original run history without private claim fields (%s)', async holdCode => {
+        mocks.listAutomationRuns.mockResolvedValue({ ok: true, value: [{
+            id: 'run-1', automationId: 'automation-1', generation: 1, scheduledFor: new Date(1), machineId: 'machine-1',
+            status: 'RUNNING', sessionId: 'automation-run:run-1', outcome: null, detailCiphertext: null, holdCode,
+            failureCode: null, degradedCode: null, queueDepth: null, queuePosition: null, queueTotal: null, queueEstimatedAt: null,
+            claimedAt: new Date(2), startedAt: new Date(3), completedAt: null, lateReport: false,
+            claimTokenHash: new Uint8Array([1]), executionSeedMetadata: 'private-encrypted-seed',
+        }] });
+        const app = await makeApp();
+        const response = await app.inject({ method: 'GET', url: '/v1/projects/project-1/automation-runs', headers: { authorization: 'Bearer test' } });
+        expect(response.statusCode).toBe(200);
+        const run = response.json().runs[0];
+        expect(run).toMatchObject({ id: 'run-1', status: 'RUNNING', holdCode });
+        expect(run).not.toHaveProperty('claimTokenHash'); expect(run).not.toHaveProperty('executionSeedMetadata');
     });
 
     it('serializes the missed slot count of a missed-run row and null on ordinary runs', async () => {
@@ -332,6 +348,38 @@ describe('automationRoutes', () => {
             payload: { machineId: 'machine-1' },
         });
 
+        expect(response.statusCode).toBe(400);
+        expect(mocks.resolveAutomationRunMcpContext).not.toHaveBeenCalled();
+    });
+
+    it('forwards an explicit execution admission request without inferring it from a legacy caller', async () => {
+        const value = { automationId: 'automation-1', ownerAccountId: 'owner', projectId: 'project-1', machineId: 'machine-1',
+            runLeaseExpiresAt: 1_000_060_000, executionAdmission: { payloadVersion: 6, generation: 3, revision: 2, machineAccountId: 'user-1' } };
+        mocks.resolveAutomationRunMcpContext.mockResolvedValue({ ok: true, value });
+        const app = await makeApp();
+        const response = await app.inject({ method: 'POST', url: '/v1/automation-runs/run-1/mcp-context',
+            headers: { authorization: 'Bearer test' }, payload: { machineId: 'machine-1', claimToken: 'token', executionAdmission: true } });
+        expect(response.statusCode, response.body).toBe(200);
+        expect(response.json()).toEqual(value);
+        expect(mocks.resolveAutomationRunMcpContext).toHaveBeenCalledWith({}, 'user-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', executionAdmission: true,
+        });
+    });
+
+    it('forwards explicit question protocol support and never infers it for older Studio callers', async () => {
+        mocks.resolveAutomationRunMcpContext.mockResolvedValue({ ok: false, error: 'claim-cancelled' });
+        const app = await makeApp();
+        await app.inject({ method: 'POST', url: '/v1/automation-runs/run-1/mcp-context', headers: { authorization: 'Bearer test' },
+            payload: { machineId: 'machine-1', claimToken: 'token', questionProtocol: 1 } });
+        expect(mocks.resolveAutomationRunMcpContext).toHaveBeenCalledWith({}, 'user-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', questionProtocol: 1,
+        });
+    });
+
+    it.each([false, 'true', 1])('rejects a malformed execution admission flag %s', async executionAdmission => {
+        const app = await makeApp();
+        const response = await app.inject({ method: 'POST', url: '/v1/automation-runs/run-1/mcp-context',
+            headers: { authorization: 'Bearer test' }, payload: { machineId: 'machine-1', claimToken: 'token', executionAdmission } });
         expect(response.statusCode).toBe(400);
         expect(mocks.resolveAutomationRunMcpContext).not.toHaveBeenCalled();
     });

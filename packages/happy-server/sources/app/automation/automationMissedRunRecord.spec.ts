@@ -69,7 +69,7 @@ describe('recordMissedAutomationRuns', () => {
             ok: true, value: { runId: 'run-existing', idempotent: true, countRaised: false, projectId: 'project-1' },
         });
         expect(tx.automationRun.findFirst).toHaveBeenCalledWith(expect.objectContaining({
-            where: { automationId: 'automation-1', generation: 3, scheduledFor: firstMissedAt },
+            where: { automationId: 'automation-1', generation: 3, scheduledFor: firstMissedAt, kind: 'SCHEDULED' },
         }));
         expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
     });

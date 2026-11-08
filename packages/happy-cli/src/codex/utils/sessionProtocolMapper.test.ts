@@ -2,6 +2,23 @@ import { describe, expect, it } from 'vitest';
 import { mapCodexMcpMessageToSessionEnvelopes, mapCodexProcessorMessageToSessionEnvelopes, mapCodexThreadItemToSessionEnvelopes } from './sessionProtocolMapper';
 
 describe('channel request correlation on Codex turn boundaries', () => {
+    it('records an isolated automation final without enabling unrelated input evidence', () => {
+        const state = { currentTurnId: 'turn-A', currentRequestId: null };
+        const map = (message: Record<string, unknown>, current = state) => Reflect.apply(
+            mapCodexMcpMessageToSessionEnvelopes, undefined, [message, current, false, true],
+        ) as ReturnType<typeof mapCodexMcpMessageToSessionEnvelopes>;
+        const fullAnswer = 'result '.repeat(500);
+        const final = map({ type: 'agent_message', phase: 'final_answer', message: fullAnswer });
+        expect(final.envelopes.map(event => event.ev.t)).toEqual(['text', 'final-answer']);
+        expect(final.envelopes[1]).toMatchObject({ turn: 'turn-A', ev: { text: fullAnswer } });
+        expect(map({ type: 'agent_message', phase: 'commentary', message: 'working' }).envelopes.map(e => e.ev.t)).toEqual(['text']);
+        expect(map({ type: 'agent_message', phase: 'final_answer', message: 'unmapped' }, { currentTurnId: null as any, currentRequestId: null })
+            .envelopes.map(e => e.ev.t)).toEqual(['text']);
+        expect(map({ type: 'agent_message', phase: 'final_answer', message: 'subagent', subagent: 'child' })
+            .envelopes.some(e => e.ev.t === 'final-answer')).toBe(false);
+        expect(state).toEqual({ currentTurnId: 'turn-A', currentRequestId: null });
+    });
+
     it.each([false, true])('T2RT-25 gates only the non-channel final candidate (evidence=%s)', enabled => {
         for (const requestId of [null, 'channel-A']) {
             for (const turn of [null, 'native-A']) {

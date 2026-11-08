@@ -3,7 +3,8 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname } from 'node:path'
-import { claudeSwapPython, withUvToolBinOnPath, type AiCredentialRotationStatus } from './aiCredentialRuntime'
+import { claudeSwapPython, type AiCredentialRotationStatus } from './aiCredentialRuntime'
+import { withUvToolBinOnPath } from './uvToolBin'
 import { claudeSwapLaunch } from './claudeSwapPython'
 
 export type ClaudeSwapChild = {

@@ -29,6 +29,25 @@ function env(overrides: Record<string, string | undefined> = {}): NodeJS.Process
 }
 
 describe('lesson session bootstrap', () => {
+    it('does not authenticate, recall or teach project lessons for a run-owned context', async () => {
+        const original = globalThis.fetch;
+        const fetchImpl = vi.fn();
+        globalThis.fetch = fetchImpl;
+        const input = { accountToken: 'token', machineId: 'm1', sessionId: 'automation-run:r1',
+            happyHomeDir: '/tmp/happy-lesson-bootstrap', env: env() };
+        const bootstrap = vi.fn(async () => null);
+        try {
+            expect(await createLessonSessionHost(input)).toBeNull();
+            const host = createLazyLessonSessionHost({ ...input, bootstrap });
+            expect(host.sessionKind).toBe('automation');
+            expect(host.turn).toBeNull();
+            expect(host.review).toBeNull();
+            await host.close();
+            expect(fetchImpl).not.toHaveBeenCalled();
+            expect(bootstrap).not.toHaveBeenCalled();
+        } finally { globalThis.fetch = original; }
+    });
+
     it('gives up on its own budget instead of holding the first turn open', async () => {
         // A studio that never answers. Every inner call has its own timeout,
         // but three in sequence still add up to a wait the user sits through.

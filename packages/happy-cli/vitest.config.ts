@@ -10,6 +10,19 @@ export default defineConfig({
             {
                 extends: true,
                 test: {
+                    name: 'integration-automation-context',
+                    include: ['src/daemon/automations/automationContext.native.integration.test.ts',
+                        'src/daemon/automations/automationContext.runtime.integration.test.ts'],
+                    setupFiles: ['./src/testing/unit.setup.ts'],
+                    fileParallelism: false,
+                    maxWorkers: 1,
+                    testTimeout: 180_000,
+                    hookTimeout: 30_000,
+                },
+            },
+            {
+                extends: true,
+                test: {
                     name: 'browser-native-host',
                     include: ['src/browserRuntime/**/*.native.test.ts'],
                     setupFiles: ['./src/testing/unit.setup.ts'],
@@ -53,6 +66,19 @@ export default defineConfig({
                     fileParallelism: false,
                     maxWorkers: 1,
                     testTimeout: 180_000,
+                    hookTimeout: 60_000,
+                },
+            },
+            {
+                // aplus specs/terminal-survive-runner-restart HR9 — detached terminal workers, real processes.
+                extends: true,
+                test: {
+                    name: 'integration-terminal-worker',
+                    include: ['src/daemon/terminalWorker/*.integration.test.ts'],
+                    setupFiles: ['./src/testing/unit.setup.ts'],
+                    fileParallelism: false,
+                    maxWorkers: 1,
+                    testTimeout: 120_000,
                     hookTimeout: 60_000,
                 },
             },

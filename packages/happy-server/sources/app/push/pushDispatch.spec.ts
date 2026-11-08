@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
+    run: vi.fn(), session: vi.fn(),
     findTokens: vi.fn(),
     deleteTokens: vi.fn(),
     isUserActive: vi.fn(),
@@ -12,6 +13,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('@/storage/db', () => ({
     db: {
+        automationRun: { findFirst: mocks.run }, session: { findFirst: mocks.session },
         accountPushToken: {
             findMany: mocks.findTokens,
             deleteMany: mocks.deleteTokens,
@@ -168,4 +170,53 @@ describe('dispatchSessionEventPush outcome', () => {
 
         expect(mocks.countOutcome.mock.calls).toEqual([[{ status: 'sent' }], [{ status: 'failed' }]]);
     });
+});
+
+describe('isolated execution attention target', () => {
+beforeEach(() => {
+    vi.resetAllMocks();
+    mocks.isUserActive.mockResolvedValue(false);
+    mocks.findTokens.mockResolvedValue([{ id: 't1', token: 'expo-token' }]);
+    mocks.sendPushNotifications.mockResolvedValue([{ status: 'ok' }]);
+    mocks.run.mockResolvedValue({ id: 'r1', displaySessionId: 'manual' });
+    mocks.session.mockResolvedValue({ id: 'manual' });
+});
+
+it('routes an internal execution attention event to its owned display chat with its run identity', async () => {
+    await dispatchSessionEventPush({ userId: 'owner', sessionId: 'automation-run:r1',
+        title: 'Permission needed', body: 'Review this run', data: { sessionId: 'spoof', runId: 'spoof', event: 'permission' } });
+    expect(mocks.run).toHaveBeenCalledWith(expect.objectContaining({ where: {
+        sessionId: 'automation-run:r1', machineAccountId: 'owner', displaySessionId: { not: null },
+    } }));
+    expect(mocks.session).toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'manual', accountId: 'owner' } }));
+    expect(mocks.sendPushNotifications).toHaveBeenCalledWith([expect.objectContaining({
+        title: 'Permission needed', body: 'Review this run', data: {
+            sessionId: 'manual', runId: 'r1', event: 'permission',
+        },
+    })], {timeoutMs:expect.any(Number)});
+});
+
+it.each(['unregistered', 'inaccessible', 'internal-display'])(
+    'does not send a separate-chat notification for an %s execution target', async reason => {
+        if (reason === 'unregistered') mocks.run.mockResolvedValue(null);
+        if (reason === 'inaccessible') mocks.session.mockResolvedValue(null);
+        if (reason === 'internal-display') mocks.run.mockResolvedValue({ id: 'r1', displaySessionId: 'automation-run:other' });
+        expect(await dispatchSessionEventPush({ userId: 'owner', sessionId: 'automation-run:r1', title: 'Done', body: 'Result' })).toMatchObject({status:'suppressed',reason:'automation-target-unavailable'});
+        expect(mocks.findTokens).not.toHaveBeenCalled();
+        expect(mocks.sendPushNotifications).not.toHaveBeenCalled();
+        expect(mocks.log).toHaveBeenCalledWith(expect.objectContaining({ level: 'warn' }), expect.any(String));
+    });
+
+it('preserves ordinary session notifications without an automation lookup', async () => {
+    await dispatchSessionEventPush({ userId: 'owner', sessionId: 'manual', title: 'Done', body: 'Result' });
+    expect(mocks.run).not.toHaveBeenCalled();
+    expect(mocks.sendPushNotifications).toHaveBeenCalledWith([expect.objectContaining({ data: { sessionId: 'manual' } })], {timeoutMs:expect.any(Number)});
+});
+
+it('still suppresses a mapped run notification while the user is active', async () => {
+    mocks.isUserActive.mockResolvedValue(true);
+    await dispatchSessionEventPush({ userId: 'owner', sessionId: 'automation-run:r1', title: 'Done', body: 'Result' });
+    expect(mocks.sendPushNotifications).not.toHaveBeenCalled();
+});
+
 });

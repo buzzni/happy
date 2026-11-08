@@ -91,7 +91,7 @@ describe('personal browser runtime (daemon side)', () => {
         // HOME decides the macOS user directory.
         const runtime = readPersonalBrowserRuntime(base())!
         expect(runtime.sessionEnv).toEqual({ HAPPY_BROWSER_TASK_RUNTIME_URL: 'http://127.0.0.1:38787', HAPPY_BROWSER_TASK_BROKER_SOCKET: paths.brokerSocket,
-            HAPPY_BROWSER_TASK_PROFILE_ID: 'profile-1', HAPPY_BROWSER_TASK_TENANCY: 'dedicated', HAPPY_BROWSER_TASK_HOST_MODE: 'dedicated-host' })
+            HAPPY_BROWSER_TASK_PROFILE_ID: 'profile-1', HAPPY_BROWSER_TASK_TENANCY: 'dedicated', HAPPY_BROWSER_TASK_HOST_MODE: 'dedicated-host', HAPPY_BROWSER_TASK_SEALED_CONSOLE: '1' })
         expect(runtime.native).toMatchObject({ socketPath: paths.brokerSocket, machineId: 'machine-1', workspaceId: 'personal:user-1' })
     })
 
@@ -285,7 +285,7 @@ describe('watching for the personal runtime installation', () => {
 describe('environment inherited by a restarted daemon', () => {
     const sessionEnv = (socket: string) => ({ HAPPY_BROWSER_TASK_DESKTOP_LOGIN: '1', HAPPY_BROWSER_TASK_RUNTIME_URL: 'http://127.0.0.1:38787',
         HAPPY_BROWSER_TASK_BROKER_SOCKET: socket, HAPPY_BROWSER_TASK_PROFILE_ID: 'profile-1', HAPPY_BROWSER_TASK_TENANCY: 'dedicated',
-        HAPPY_BROWSER_TASK_HOST_MODE: 'dedicated-host' })
+        HAPPY_BROWSER_TASK_HOST_MODE: 'dedicated-host', HAPPY_BROWSER_TASK_SEALED_CONSOLE: '1' })
 
     it('forgets the personal runtime session variables a previous daemon or its session passed on', () => {
         const inherited: NodeJS.ProcessEnv = { ...env, ...sessionEnv(paths.brokerSocket) }

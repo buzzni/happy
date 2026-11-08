@@ -23,6 +23,12 @@ import { BASH_PREFIX_MATCHER_CAPABILITY } from '@/claude/utils/bashPrefixMatcher
 import { ApiSessionClient } from './apiSession';
 import { McpCallerGrantEnvelopeConsumer } from '@/daemon/mcpCallerGrantEnvelope';
 import { join } from 'node:path';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { createFilesystemWriteAdmission, createWorkspaceTurnAdmission, createUnfencedSubprocessAdmission,
+    createLegacyDispatchAdmission, createSubprocessWriteAdmission } from '@/utils/workspaceTurnAdmission';
+import { sealSpawnEnv } from '@/modules/common/sealedSpawnEnv';
+import { ApiClient } from './api';
 import { hkdfSync, randomBytes } from 'node:crypto';
 
 const {
@@ -80,7 +86,8 @@ vi.mock('@/utils/detectCLI', () => ({
         claude: false,
         codex: false,
         gemini: false,
-        openclaw: false
+        openclaw: false,
+        detectedAt: 1,
     }))
 }));
 
@@ -89,7 +96,8 @@ vi.mock('@/resume/localHappyAgentAuth', () => ({
         rpcAvailable: false,
         requiresSameMachine: false,
         requiresHappyAgentAuth: false,
-        happyAgentAuthenticated: false
+        happyAgentAuthenticated: false,
+        detectedAt: 1,
     }))
 }));
 
@@ -146,6 +154,119 @@ describe('ApiMachineClient machine RPC server lane', () => {
 
         expect(rpcManagerConfigs.at(-1)).toBeDefined();
         expect(rpcManagerConfigs.at(-1)?.serverLane).toBeUndefined();
+    });
+
+    it.skipIf(process.platform === 'win32')('uses host-owned filesystem admission before machine RPC effects without changing default registration', async () => {
+        const home = await mkdtemp(join(tmpdir(), 'machine-filesystem-admission-'));
+        const root = join(home, 'project'); await mkdir(root);
+        const file = join(root, 'file.txt');
+        const auto = createWorkspaceTurnAdmission({ home, sessionId: 'automation-run:machine-test', kind: 'automation', roots: [root] });
+        await auto.tryAcquire();
+        try {
+            registeredCommonHandlers.mockClear();
+            Reflect.construct(ApiMachineClient, ['fake-token', makeMachine(), undefined, undefined, null, createFilesystemWriteAdmission({ home })]);
+            const options = registeredCommonHandlers.mock.calls.at(-1)![2];
+            const write = () => writeFile(file, 'saved');
+            await expect(Promise.resolve().then(() => options.withFilesystemMutation(write))).rejects.toMatchObject({ code: 'WORKSPACE_BUSY' });
+            await expect(readFile(file)).rejects.toMatchObject({ code: 'ENOENT' });
+            await auto.release(true);
+            await options.withFilesystemMutation(write);
+            expect(await readFile(file, 'utf8')).toBe('saved');
+        } finally { await auto.release(true); await rm(home, { recursive: true, force: true }); }
+    });
+
+    it.skipIf(process.platform === 'win32')('passes host process admission through the machine constructor before legacy effects', async () => {
+        const home = await mkdtemp(join(tmpdir(), 'machine-process-admission-'));
+        const root = join(home, 'project'); await mkdir(root);
+        const auto = createWorkspaceTurnAdmission({ home, sessionId: 'automation-run:machine-process', kind: 'automation', roots: [root] });
+        const execute = createUnfencedSubprocessAdmission({ home });
+        const admitSubprocess = (roots: readonly string[]) => execute(roots, async () => undefined);
+        try {
+            await auto.tryAcquire();
+            Reflect.construct(ApiMachineClient, ['fake-token', makeMachine(), undefined, undefined, null, undefined, admitSubprocess]);
+            const options = registeredCommonHandlers.mock.calls.at(-1)![2];
+            expect(options.admitSubprocess).toBe(admitSubprocess);
+            await expect(options.admitSubprocess([root])).rejects.toMatchObject({ code: 'WORKSPACE_BUSY' });
+            await auto.release(true);
+            await options.admitSubprocess([root]);
+            expect(await auto.tryAcquire()).toHaveProperty('reason', 'workspace-owner-unconfirmed');
+        } finally { await auto.release(true); await rm(home, { recursive: true, force: true }); }
+    });
+
+    it('passes host process admission from the account API factory without adding it to default registration', async () => {
+        const api = await ApiClient.create({ token: 'fake-token', encryption: { type: 'legacy', secret: new Uint8Array(32) } });
+        const admitSubprocess = vi.fn(async (_roots: readonly string[]) => undefined);
+        Reflect.apply(api.machineSyncClient, api, [makeMachine(), undefined, undefined, null, undefined, admitSubprocess]);
+        expect(registeredCommonHandlers.mock.calls.at(-1)![2].admitSubprocess).toBe(admitSubprocess);
+        api.machineSyncClient(makeMachine());
+        expect(registeredCommonHandlers.mock.calls.at(-1)![2].admitSubprocess).toBeUndefined();
+    });
+
+    it('applies host admission to a machine start-server RPC before detached spawn', async () => {
+        const directory = await mkdtemp(join(tmpdir(), 'machine-server-admission-'));
+        const admitSubprocess = vi.fn(async () => { throw new Error('WORKSPACE_BUSY'); });
+        try {
+            const client = Reflect.construct(ApiMachineClient, ['fake-token', makeMachine(), undefined, undefined, null, undefined, admitSubprocess]);
+            client.setRPCHandlers({ spawnSession: vi.fn(), stopSession: vi.fn(() => ({ stopped: true as const })),
+                requestShutdown: vi.fn(), portRegistry: {} as any, aiCredentialRuntime: {} as any });
+            const handler = (client as any).rpcHandlerManager.registerHandler.mock.calls.find(([name]: [string]) => name === 'start-server')[1];
+            const result = await handler({ command: 'node -v', cwd: directory });
+            expect(admitSubprocess).toHaveBeenCalledWith([directory]);
+            expect(result).toEqual({ type: 'error', code: 'WORKSPACE_UNAVAILABLE', message: 'WORKSPACE_BUSY' });
+        } finally { await rm(directory, { recursive: true, force: true }); }
+    });
+
+    it.skipIf(process.platform === 'win32')('reserves a machine worktree ticket before consuming it and retains its actual writer', async () => {
+        const home = await mkdtemp(join(tmpdir(), 'machine-worktree-admission-'));
+        const directory = join(home, 'project'); await mkdir(directory);
+        vi.stubEnv('HAPPY_WORKSPACE_ROOT', directory);
+        const automatic = createWorkspaceTurnAdmission({ home, roots: [directory], kind: 'automation', sessionId: 'automation-run:worktree-api' });
+        try {
+            expect(await automatic.tryAcquire()).toEqual({ acquired: true });
+            const machine: Machine = { ...makeMachine(), encryptionVariant: 'dataKey' };
+            const client = new ApiMachineClient('fake-token', machine, undefined, undefined, null, undefined,
+                createSubprocessWriteAdmission({ home }), createLegacyDispatchAdmission({ home }));
+            const handler = (client as any).rpcHandlerManager.registerHandler.mock.calls.find(([name]: [string]) => name === 'worktree:prepare')[1];
+            const at = Date.now();
+            const request = { ticket: { v: 1, opId: randomBytes(16).toString('base64'), op: 'prepare', projectId: 'project', machineId: machine.id,
+                issuedAt: at, expiresAt: at + 60_000, params: { workspaceDir: directory } } };
+            expect(await handler(request)).toMatchObject({ success: false, errorCode: 'WORKSPACE_BUSY' });
+            await expect(readFile(join(directory, '.git', 'HEAD'))).rejects.toMatchObject({ code: 'ENOENT' });
+            expect(await automatic.release(true)).toBe(true);
+            expect(await handler(request)).toMatchObject({ success: true });
+            expect(await automatic.tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+        } finally {
+            await automatic.release(true);
+            await rm(home, { recursive: true, force: true });
+            vi.unstubAllEnvs();
+        }
+    });
+
+    it.skipIf(process.platform === 'win32')('keeps a sealed machine request unspent behind automatic ownership and retains its later writer', async () => {
+        const home = await mkdtemp(join(tmpdir(), 'machine-sealed-admission-'));
+        const directory = join(home, 'project'); await mkdir(directory);
+        vi.stubEnv('HAPPY_WORKSPACE_ROOT', directory);
+        const automatic = createWorkspaceTurnAdmission({ home, sessionId: 'automation-run:sealed-api', kind: 'automation', roots: [directory] });
+        try {
+            expect(await automatic.tryAcquire()).toEqual({ acquired: true });
+            const api = await ApiClient.create({ token: 'fake-token', encryption: { type: 'legacy', secret: new Uint8Array(32) } });
+            const machine: Machine = { ...makeMachine(), encryptionVariant: 'dataKey', encryptionKey: new Uint8Array(32).fill(7) };
+            const client = Reflect.apply(api.machineSyncClient, api, [machine, undefined, undefined, null, undefined,
+                createSubprocessWriteAdmission({ home }), createLegacyDispatchAdmission({ home })]);
+            const handler = (client as any).rpcHandlerManager.registerHandler.mock.calls.find(([name]: [string]) => name === 'spawn-with-sealed-env')[1];
+            const request = { command: 'printf ran', cwd: directory, envDelivery: 'process', sealedEnv: sealSpawnEnv(deriveServerRpcKey(machine.encryptionKey), {
+                v: 1, purpose: 'spawn-env', machineId: machine.id, projectId: 'project', issuedAt: Date.now(),
+                nonce: randomBytes(16).toString('base64'), env: {},
+            }) };
+            expect(await handler(request)).toMatchObject({ success: false, errorCode: 'WORKSPACE_UNAVAILABLE' });
+            expect(await automatic.release(true)).toBe(true);
+            expect(await handler(request)).toMatchObject({ success: true, stdout: 'ran' });
+            expect(await automatic.tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+        } finally {
+            await automatic.release(true);
+            await rm(home, { recursive: true, force: true });
+            vi.unstubAllEnvs();
+        }
     });
 
     it('registers machine.run with the daemon-owned trusted profile registry and write policy', () => {
@@ -822,6 +943,120 @@ describe('ApiMachineClient socket reconnection', () => {
             };
         }
 
+        it('holds an automatic workspace before opening a relay PTY and permits the original request after release', async () => {
+            const home = await mkdtemp(join(tmpdir(), 'relay-terminal-admission-'));
+            const directory = join(home, 'project'); await mkdir(directory);
+            vi.stubEnv('HAPPY_WORKSPACE_ROOT', directory);
+            const owner = createWorkspaceTurnAdmission({ home, roots: [directory], kind: 'automation', sessionId: 'automation-run:relay' });
+            const sessionId = 'v2-host-relay';
+            try {
+                expect(await owner.tryAcquire()).toEqual({ acquired: true });
+                const machine = makeMachine();
+                let retention: Promise<void> | undefined;
+                const client = Reflect.construct(ApiMachineClient, ['fake-token', machine, undefined, undefined, null, undefined,
+                    (roots: readonly string[]) => retention = createSubprocessWriteAdmission({ home })(roots), createLegacyDispatchAdmission({ home })]);
+                client.connect();
+                const opener = boundOpen(machine, { params: { cwd: directory } });
+                expect(await open(machine, sessionId, opener.params)).toMatchObject({ ok: false, code: 'WORKSPACE_UNAVAILABLE' });
+                expect(getDaemonTerminalSession(sessionId)).toBeNull();
+                expect(await owner.release(true)).toBe(true);
+                expect(await open(machine, sessionId, opener.params)).toMatchObject({ ok: true });
+                expect(retention).toBeDefined(); await retention;
+                await vi.waitFor(async () => expect(await owner.tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' }));
+            } finally {
+                await getDaemonTerminalSession(sessionId)?.session.terminate(); removeDaemonTerminalSession(sessionId);
+                await owner.release(true); await rm(home, { recursive: true, force: true }); vi.unstubAllEnvs();
+            }
+        });
+
+        it('does not open a relay PTY after the pending request was closed', async () => {
+            const home = await mkdtemp(join(tmpdir(), 'relay-terminal-cancel-'));
+            const directory = join(home, 'project'); await mkdir(directory);
+            vi.stubEnv('HAPPY_WORKSPACE_ROOT', directory);
+            let release!: () => void;
+            const gate = new Promise<void>(resolve => { release = resolve; });
+            const reserve = vi.fn(async (roots: readonly string[]) => { await gate; return createLegacyDispatchAdmission({ home })(roots); });
+            const machine = makeMachine();
+            const client = Reflect.construct(ApiMachineClient, ['fake-token', machine, undefined, undefined, null, undefined,
+                createSubprocessWriteAdmission({ home }), reserve]);
+            client.connect();
+            const sessionId = 'v2-pending-closed', opener = boundOpen(machine, { params: { cwd: directory } });
+            const pending = open(machine, sessionId, opener.params);
+            try {
+                await vi.waitFor(() => expect(reserve).toHaveBeenCalledOnce());
+                emitSocketEvent('terminal-close-fwd', { sessionId });
+                release();
+                expect(await pending).toMatchObject({ ok: false, code: 'TERMINAL_OPEN_CANCELLED' });
+                expect(getDaemonTerminalSession(sessionId)).toBeNull();
+                const owner = createWorkspaceTurnAdmission({ home, roots: [directory], kind: 'automation', sessionId: 'automation-run:after-terminal-cancel' });
+                expect(await owner.tryAcquire()).toEqual({ acquired: true });
+                await owner.release(true);
+            } finally {
+                release(); await pending; await rm(home, { recursive: true, force: true }); vi.unstubAllEnvs();
+            }
+        });
+
+        it('refuses a duplicate relay open while the same session admission is pending', async () => {
+            let release!: () => void;
+            const gate = new Promise<void>(resolve => { release = resolve; });
+            const reserve = vi.fn(async () => { await gate; return { acquired: true as const, finish: async () => undefined }; });
+            const machine = makeMachine();
+            const client = Reflect.construct(ApiMachineClient, ['fake-token', machine, undefined, undefined, null, undefined,
+                vi.fn(async () => { throw new Error('WORKSPACE_BUSY'); }), reserve]);
+            client.connect();
+            const sessionId = 'v2-pending-duplicate';
+            const pending = open(machine, sessionId, boundOpen(machine).params);
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+                await vi.waitFor(() => expect(reserve).toHaveBeenCalledOnce());
+                const duplicate = await Promise.race([open(machine, sessionId, boundOpen(machine).params),
+                    new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), 1000); })]);
+                expect(duplicate).toMatchObject({ ok: false, code: 'TERMINAL_OPEN_PENDING' });
+                expect(reserve).toHaveBeenCalledOnce();
+            } finally { if (timer) clearTimeout(timer); release(); await pending; }
+        });
+
+        it('closes an already submitted relay PTY while durable retention is pending without releasing its writer', async () => {
+            const home = await mkdtemp(join(tmpdir(), 'relay-terminal-submitted-close-'));
+            const directory = join(home, 'project'); await mkdir(directory);
+            vi.stubEnv('HAPPY_WORKSPACE_ROOT', directory);
+            let release!: () => void;
+            const gate = new Promise<void>(resolve => { release = resolve; });
+            let retention: Promise<void> | undefined;
+            const handoffs: Promise<void>[] = [];
+            const reserve = createLegacyDispatchAdmission({ home });
+            const reserveTracked = async (roots: readonly string[]) => {
+                const reservation = await reserve(roots);
+                if (!reservation.acquired) return reservation;
+                return { acquired: true as const, finish: () => {
+                    const pending = reservation.finish(); handoffs.push(pending); return pending;
+                } };
+            };
+            const machine = makeMachine(), sessionId = 'v2-submitted-close';
+            const client = Reflect.construct(ApiMachineClient, ['fake-token', machine, undefined, undefined, null, undefined,
+                (roots: readonly string[]) => retention = (async () => { await gate; await createSubprocessWriteAdmission({ home })(roots); })(),
+                reserveTracked]);
+            client.connect();
+            try {
+                expect(await open(machine, sessionId, boundOpen(machine, { params: { cwd: directory } }).params)).toMatchObject({ ok: true });
+                const entry = getDaemonTerminalSession(sessionId);
+                expect(entry).not.toBeNull(); expect(retention).toBeDefined();
+                const owner = createWorkspaceTurnAdmission({ home, roots: [directory], kind: 'automation', sessionId: 'automation-run:submitted-terminal' });
+                expect(await owner.tryAcquire()).toMatchObject({ acquired: false });
+                emitSocketEvent('terminal-close-fwd', { sessionId });
+                await entry?.session.terminate();
+                expect(getDaemonTerminalSession(sessionId)).toBeNull();
+                release(); await retention;
+                await vi.waitFor(async () => expect(await owner.tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' }));
+            } finally {
+                release(); await retention; await getDaemonTerminalSession(sessionId)?.session.terminate(); removeDaemonTerminalSession(sessionId);
+                // The relay ACK precedes asynchronous reservation handoff. Drain both releases before removing their registry.
+                if (retention) await vi.waitFor(() => expect(handoffs).toHaveLength(2));
+                await Promise.all(handoffs);
+                await rm(home, { recursive: true, force: true }); vi.unstubAllEnvs();
+            }
+        });
+
         it('opens a bound terminal, proves it, and runs sealed input in order', async () => {
             const machine = makeMachine();
             const client = new ApiMachineClient('fake-token', machine);
@@ -968,6 +1203,14 @@ describe('ApiMachineClient socket reconnection', () => {
                 method, expect.any(Function), { customerBound: true },
             );
         }
+    });
+
+    // aplus-dev-studio-desktop ADR-085: a strict machine's AI browser console rides the customer-key lane only.
+    it('registers the sealed AI browser console as a customer-bound machine method', () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        expect((client as any).rpcHandlerManager.registerHandler).toHaveBeenCalledWith(
+            'agent-browser:console-http-v1', expect.any(Function), { customerBound: true, ownNonceBudget: true },
+        );
     });
 
     it('registers dependency reclaim on the authenticated machine RPC surface', () => {
@@ -2173,8 +2416,148 @@ describe('ApiMachineClient socket reconnection', () => {
             expectedKeyVersion: 3,
             publicKey: Buffer.from(new Uint8Array(32).fill(7)).toString('base64'),
             protocolVersion: protocolVersion ?? AUTOMATION_PROTOCOL_VERSION,
+            contextIsolationVersion: 0,
         });
         expect(mockSocket.emitWithAck).toHaveBeenCalledWith('machine-update-metadata', expect.any(Object));
+        client.shutdown();
+    });
+
+    it.each([{ ready: false, server: true }, { ready: true, server: false }, { ready: true, server: true }])('negotiates the context host and resets sync only after server confirmation ($ready/$server)', async ({ ready, server }) => {
+        const supported = ready && server;
+        let cursor = 5n;
+        const cache = { read: vi.fn(() => ({ cursor })), resetCursor: vi.fn(() => { cursor = 0n }),
+            applySync: vi.fn(() => ({ nextSeq: cursor, acknowledgements: [] })), markAcknowledged: vi.fn() };
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 1, ...(supported ? { contextIsolationVersion: 1, syncFromStart: true } : {}) } };
+            if (event === 'automation-sync') return { ok: true, value: { serverTime: 10, nextSeq: cursor.toString(), changes: [] } };
+            if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
+            return { result: 'success' };
+        });
+        const machine = makeMachine(), client = new ApiMachineClient('fake-token', machine);
+        client.setAutomationKey({ version: 1, publicKey: new Uint8Array(32).fill(7), secretKey: new Uint8Array(32).fill(8), registeredKeyVersion: 1 }, vi.fn(), 99);
+        (client as any).setAutomationContextIsolationReady(ready);
+        client.setServerAutomationCache(cache as any);
+        client.connect(); socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(cache.applySync).toHaveBeenCalled());
+        expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-key-register', expect.objectContaining({ protocolVersion: 99, contextIsolationVersion: ready ? 1 : 0 }));
+        expect(cache.resetCursor).toHaveBeenCalledTimes(supported ? 1 : 0);
+        expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-sync', { afterSeq: supported ? '0' : '5', limit: 500, payloadVersions: supported ? [1, 4, 6] : [1, 4] });
+        if (supported) expect(cache.resetCursor.mock.invocationCallOrder[0]).toBeLessThan(cache.applySync.mock.invocationCallOrder[0]);
+        await vi.waitFor(() => expect(machine.metadata?.automationSupport).toHaveProperty('contextIsolationVersion', supported ? 1 : 0));
+        client.shutdown();
+    });
+
+    it('serializes readiness registration behind an unacknowledged previous key registration', async () => {
+        let release!: () => void;
+        const gate = new Promise<void>(resolve => { release = resolve });
+        let registrations = 0;
+        const cache = { read: () => ({ cursor: 0n }), resetCursor: vi.fn(), applySync: () => ({ nextSeq: 0n, acknowledgements: [] }), markAcknowledged: vi.fn() };
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'automation-key-register') {
+                registrations++;
+                if (registrations === 1) await gate;
+                return { ok: true, value: { keyVersion: 1, ...(data.contextIsolationVersion === 1 ? { contextIsolationVersion: 1, syncFromStart: true } : {}) } };
+            }
+            if (event === 'automation-sync') return { ok: true, value: { serverTime: 10, nextSeq: '0', changes: [] } };
+            if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
+            return { result: 'success' };
+        });
+        const machine = makeMachine(), client = new ApiMachineClient('fake-token', machine);
+        client.setAutomationKey({ version: 1, publicKey: new Uint8Array(32).fill(7), secretKey: new Uint8Array(32).fill(8), registeredKeyVersion: 1 }, vi.fn());
+        client.setServerAutomationCache(cache as any); client.connect(); socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(registrations).toBe(1));
+        mockSocket.connected = true;
+        client.setAutomationContextIsolationReady(true);
+        try {
+            await Promise.resolve(); await Promise.resolve();
+            expect(registrations).toBe(1);
+        } finally { release() }
+        await vi.waitFor(() => expect(machine.metadata?.automationSupport?.contextIsolationVersion).toBe(1));
+        expect(cache.resetCursor).toHaveBeenCalledOnce();
+        expect(registrations).toBe(2); client.shutdown();
+    });
+
+    it('drains an older unsupported sync page before persisting the ready cursor reset', async () => {
+        let release!: (value: unknown) => void, syncs = 0, cursor = 5n;
+        const firstPage = new Promise(resolve => { release = resolve });
+        const cache = { read: () => ({ cursor }), resetCursor: vi.fn(() => { cursor = 0n }),
+            applySync: vi.fn((value: any) => { cursor = BigInt(value.nextSeq); return { nextSeq: cursor, acknowledgements: [] } }), markAcknowledged: vi.fn() };
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 1,
+                ...(data.contextIsolationVersion === 1 ? { contextIsolationVersion: 1, syncFromStart: true } : {}) } };
+            if (event === 'automation-sync') return ++syncs === 1 ? firstPage : { ok: true, value: { serverTime: 10, nextSeq: '0', changes: [] } };
+            if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
+            return { result: 'success' };
+        });
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        client.setAutomationKey({ version: 1, publicKey: new Uint8Array(32).fill(7), secretKey: new Uint8Array(32).fill(8), registeredKeyVersion: 1 }, vi.fn());
+        client.setServerAutomationCache(cache as any); client.connect(); socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(syncs).toBe(1)); mockSocket.connected = true;
+        client.setAutomationContextIsolationReady(true);
+        await Promise.resolve(); await Promise.resolve();
+        expect(cache.resetCursor).not.toHaveBeenCalled();
+        release({ ok: true, value: { serverTime: 10, nextSeq: '5', changes: [] } });
+        await vi.waitFor(() => expect(syncs).toBe(2));
+        expect(cache.applySync.mock.invocationCallOrder[0]).toBeLessThan(cache.resetCursor.mock.invocationCallOrder[0]);
+        expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-sync', { afterSeq: '0', limit: 500, payloadVersions: [1, 4, 6] });
+        client.shutdown();
+    });
+
+    it('does not restore withdrawn readiness after its registration waits on an older sync page', async () => {
+        let release!: (value: unknown) => void, syncs = 0;
+        const firstPage = new Promise(resolve => { release = resolve });
+        const cache = { read: () => ({ cursor: 5n }), resetCursor: vi.fn(),
+            applySync: vi.fn(() => ({ nextSeq: 5n, acknowledgements: [] })), markAcknowledged: vi.fn() };
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 1,
+                ...(data.contextIsolationVersion === 1 ? { contextIsolationVersion: 1, syncFromStart: true } : {}) } };
+            if (event === 'automation-sync') return ++syncs === 1 ? firstPage : { ok: true, value: { serverTime: 10, nextSeq: '5', changes: [] } };
+            if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
+            return { result: 'success' };
+        });
+        const machine = makeMachine(), client = new ApiMachineClient('fake-token', machine);
+        client.setAutomationKey({ version: 1, publicKey: new Uint8Array(32).fill(7), secretKey: new Uint8Array(32).fill(8), registeredKeyVersion: 1 }, vi.fn());
+        client.setServerAutomationCache(cache as any); client.connect(); socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(syncs).toBe(1)); mockSocket.connected = true;
+        client.setAutomationContextIsolationReady(true);
+        await vi.waitFor(() => expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-key-register', expect.objectContaining({ contextIsolationVersion: 1 })));
+        client.setAutomationContextIsolationReady(false);
+        release({ ok: true, value: { serverTime: 10, nextSeq: '5', changes: [] } });
+        await vi.waitFor(() => expect(syncs).toBeGreaterThan(1));
+        expect(cache.resetCursor).not.toHaveBeenCalled();
+        expect(mockSocket.emitWithAck).not.toHaveBeenCalledWith('automation-sync', expect.objectContaining({ payloadVersions: [1, 4, 6] }));
+        await vi.waitFor(() => expect(machine.metadata?.automationSupport?.contextIsolationVersion).toBe(0));
+        client.shutdown();
+    });
+
+    it.each(['automation-sync-ack', 'machine-update-metadata'])('keeps readiness withdrawal deliverable when an earlier %s ACK is lost', async blockedEvent => {
+        let blocked = false, synced = false;
+        const registrations: number[] = [];
+        const cache = { read: () => ({ cursor: 0n }), resetCursor: vi.fn(),
+            applySync: () => ({ nextSeq: 1n, acknowledgements: [{ automationId: 'a1', revision: 1 }] }), markAcknowledged: vi.fn() };
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'automation-key-register') {
+                registrations.push(data.contextIsolationVersion);
+                return { ok: true, value: { keyVersion: 1, ...(data.contextIsolationVersion === 1 ? { contextIsolationVersion: 1, syncFromStart: true } : {}) } };
+            }
+            if (event === blockedEvent) { blocked = true; return new Promise(() => {}) }
+            if (event === 'automation-sync') { synced = true; return { ok: true, value: { serverTime: 10, nextSeq: '1', changes: [] } } }
+            if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
+            return { ok: true, value: { acknowledged: 1 } };
+        });
+        const bounded = vi.fn(async (event: string, data: unknown) => {
+            if (event === 'automation-sync-ack' && blockedEvent === event) { blocked = true; throw new Error('operation has timed out') }
+            return mockSocket.emitWithAck(event, data);
+        });
+        mockSocket.timeout.mockReturnValue({ emitWithAck: bounded });
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        client.setAutomationKey({ version: 1, publicKey: new Uint8Array(32).fill(7), secretKey: new Uint8Array(32).fill(8), registeredKeyVersion: 1 }, vi.fn());
+        client.setServerAutomationCache(cache as any); client.setAutomationContextIsolationReady(true);
+        client.connect(); socketHandlers.connect![0]!(); mockSocket.connected = true;
+        await vi.waitFor(() => expect(blocked && synced).toBe(true));
+        client.setAutomationContextIsolationReady(false);
+        await vi.waitFor(() => expect(registrations.at(-1)).toBe(0));
+        if (blockedEvent === 'automation-sync-ack') expect(bounded).toHaveBeenCalledWith(blockedEvent, { items: [{ automationId: 'a1', revision: 1 }] });
         client.shutdown();
     });
 
@@ -2231,6 +2614,36 @@ describe('ApiMachineClient socket reconnection', () => {
             .toEqual(['interval', 'daily', 'once', 'weekly', 'daily-zoned', 'once-zoned', 'weekly-zoned']);
         // Saycode specs/_archive/automation-result-delivery R3 — Desktop offers messenger delivery only on this.
         expect(MachineMetadataSchema.parse(machine.metadata).automationSupport?.delivery).toBe(1);
+        client.shutdown();
+    });
+
+    // aplus-dev-studio specs/scheduled-missed-run-policy R14 — Desktop shows the per-schedule missed-run choice only on
+    // this; an old server ignores late catch-up claims, so the daemon advertises it only after the server said it can.
+    it.each([
+        { catchUpClaim: true, expected: 1 },
+        { catchUpClaim: false, expected: undefined },
+    ])('advertises missedRunPolicy=$expected when the server accepts catch-up claims=$catchUpClaim', async ({ catchUpClaim, expected }) => {
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 4 } };
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        const client = new ApiMachineClient('fake-token', machine);
+        (client as any).setAutomationKey({
+            version: 1,
+            publicKey: new Uint8Array(32).fill(7),
+            secretKey: new Uint8Array(32).fill(8),
+            registeredKeyVersion: 3,
+        }, vi.fn());
+        client.setServerAutomationCache({ read: () => ({ catchUpClaim }) } as any);
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.automationSupport?.serverBacked).toBe(true));
+        expect(MachineMetadataSchema.parse(machine.metadata).automationSupport?.missedRunPolicy).toBe(expected);
         client.shutdown();
     });
 
@@ -2417,6 +2830,12 @@ describe('ApiMachineClient socket reconnection', () => {
         expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-claim', {
             automationId: 'automation-1', generation: 2, scheduledFor: 10,
         });
+        const transport = client.serverAutomationTransport();
+        for (const holdCode of ['WORKSPACE_BUSY', null] as const) {
+            const heartbeat = { runId: 'run-1', claimToken: 'token', holdCode };
+            await transport.heartbeat(heartbeat);
+            expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-run-heartbeat', heartbeat);
+        }
         client.shutdown();
     });
 

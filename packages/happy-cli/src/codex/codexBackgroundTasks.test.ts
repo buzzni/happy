@@ -4,6 +4,33 @@ import { CodexBackgroundTasks } from './codexBackgroundTasks';
 const task = { callId: 'cmd', command: 'vite' };
 const row = { itemId: 'cmd', processId: '42', command: 'vite' };
 describe('Codex background reconciliation', () => {
+    it('requires an authoritative complete empty snapshot, not absence of displayed tasks, for writer drain', async () => {
+        const request = vi.fn().mockRejectedValueOnce(new Error('unsupported')).mockResolvedValueOnce({ data: [], nextCursor: null });
+        const tracker = new CodexBackgroundTasks(request, vi.fn());
+        expect(tracker.confirmedEmpty).toBe(false);
+        await tracker.refresh('thread');
+        expect(tracker.hasTasks).toBe(false); expect(tracker.confirmedEmpty).toBe(false);
+        await tracker.refresh('thread');
+        expect(tracker.confirmedEmpty).toBe(true);
+        tracker.invalidate();
+        expect(tracker.confirmedEmpty).toBe(false);
+    });
+    it('keeps writer drain unconfirmed during reads, after restore, and after an outdated response', async () => {
+        let finish!: (value: unknown) => void;
+        const request = vi.fn().mockResolvedValueOnce({ data: [], nextCursor: null })
+            .mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+        const tracker = new CodexBackgroundTasks(request, vi.fn());
+        await tracker.refresh('thread'); expect(tracker.confirmedEmpty).toBe(true);
+        const pending = tracker.refresh('thread'); expect(tracker.confirmedEmpty).toBe(false);
+        tracker.restore([]); finish({ data: [], nextCursor: null }); await pending;
+        expect(tracker.confirmedEmpty).toBe(false);
+    });
+    it('can confirm the end of the last task only after a successful full snapshot established ownership', async () => {
+        const tracker = new CodexBackgroundTasks(async () => ({ data: [row], nextCursor: null }), vi.fn());
+        tracker.complete('unseen'); expect(tracker.confirmedEmpty).toBe(false);
+        await tracker.refresh('thread'); expect(tracker.confirmedEmpty).toBe(false);
+        tracker.complete(row.itemId); expect(tracker.confirmedEmpty).toBe(true);
+    });
     it('reads all pages before publishing running tasks and clears absent tasks without claiming success', async () => {
         const request = vi.fn().mockResolvedValueOnce({ data: [row], nextCursor: 'next' })
             .mockResolvedValueOnce({ data: [{ ...row, itemId: 'other' }], nextCursor: null })
@@ -48,6 +75,28 @@ describe('Codex background reconciliation', () => {
         finish({ data: [row], nextCursor: null });
         await refresh;
         expect(publish.mock.lastCall?.[0]).toEqual([expect.objectContaining({ ...task, status: 'unknown' })]);
+    });
+    it('keeps the time a terminal was first seen across refreshes (specs/agent-background-work-panel R1)', async () => {
+        let clock = 1_000;
+        const publish = vi.fn();
+        const tracker = new CodexBackgroundTasks(async () => ({ data: [row], nextCursor: null }), publish, () => clock);
+        await tracker.refresh('thread', [task]);
+        clock = 9_000;
+        await tracker.refresh('thread');
+        expect(publish.mock.lastCall?.[0]).toEqual([expect.objectContaining({ callId: 'cmd', startedAt: 1_000 })]);
+        expect(tracker.stopTarget('cmd')).toEqual({ threadId: 'thread', processId: '42' });
+    });
+    it('stops a terminal only on the thread whose full snapshot listed it, never a restored or unconfirmed one', async () => {
+        const tracker = new CodexBackgroundTasks(async () => ({ data: [row], nextCursor: null }), vi.fn());
+        tracker.restore([{ callId: 'cmd', command: 'vite', processId: '42', status: 'running' }]);
+        expect(tracker.has('cmd')).toBe(true);
+        expect(tracker.stopTarget('cmd')).toBeNull();
+        await tracker.refresh('old-thread');
+        // `/clear` starts another thread; until its snapshot the listed terminal still belongs to the old one.
+        expect(tracker.stopTarget('cmd')).toEqual({ threadId: 'old-thread', processId: '42' });
+        tracker.invalidate();
+        expect(tracker.stopTarget('cmd')).toBeNull();
+        expect(tracker.stopTarget('missing')).toBeNull();
     });
     it('treats malformed responses as unavailable, not an empty authoritative list', async () => {
         const publish = vi.fn();

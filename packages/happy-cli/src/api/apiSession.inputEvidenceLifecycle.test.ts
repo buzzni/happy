@@ -59,7 +59,14 @@ it.each([false, true])('preserves merge-base turns/consumers with evidence opt-i
                     expect.soft(event.ev.result, `${original.name}: tool-call-end result`).toEqual({ text: expect.any(String) });
                     const { result: _result, ...ev } = event.ev;
                     return { ...event, ev };
-                }) : actual?.[field];
+                }) : field === 'metadata' && actual?.metadata?.runtimeCapabilities?.backgroundTaskStop !== undefined ? (() => {
+                    // Saycode specs/agent-background-work-panel R2 advertises per-task Stop; the merge-base CLI had no such
+                    // capability. Check the added flag and compare the rest.
+                    expect.soft(actual.metadata.runtimeCapabilities.backgroundTaskStop, `${original.name}: backgroundTaskStop`).toBe(1);
+                    const { backgroundTaskStop: _flag, ...capabilities } = actual.metadata.runtimeCapabilities;
+                    const { runtimeCapabilities: _capabilities, ...metadata } = actual.metadata;
+                    return Object.keys(capabilities).length ? { ...metadata, runtimeCapabilities: capabilities } : metadata;
+                })() : actual?.[field];
                 expect.soft(received, `${original.name}: ${field}`).toEqual(expected);
             }
             for (const revision of actual?.evidence ?? []) {

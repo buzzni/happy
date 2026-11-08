@@ -60,20 +60,32 @@ export type OwnedSpawnRuntime = OwnedSpawnRpc & {
 };
 /** Private daemon dispatch evidence; never accepted from RPC, argv, or provider environment. */
 export function createOwnedStartGuard() {
-    const active = new WeakSet<SpawnSessionOptions>(), submitted = new WeakSet<SpawnSessionOptions>();
+    const active = new WeakMap<SpawnSessionOptions, { observers: number; submitted: boolean }>();
+    function observeSubmission(options: SpawnSessionOptions) {
+        const state = active.get(options) ?? { observers: 0, submitted: false };
+        state.observers += 1; active.set(options, state);
+        let closed = false;
+        return () => {
+            if (closed) return;
+            closed = true; state.observers -= 1;
+            if (state.observers === 0 && active.get(options) === state) active.delete(options);
+        };
+    }
+    const wasSubmitted = (options: SpawnSessionOptions) => active.get(options)?.submitted === true;
     return {
-        submitted(options: SpawnSessionOptions) { if (active.has(options)) submitted.add(options); },
-        wasSubmitted(options: SpawnSessionOptions) { return submitted.has(options); },
+        observeSubmission,
+        submitted(options: SpawnSessionOptions) { const state = active.get(options); if (state) state.submitted = true; },
+        wasSubmitted,
         async start(options: SpawnSessionOptions, launch: () => Promise<SpawnSessionResult>) {
-            active.add(options);
+            const stop = observeSubmission(options);
             try {
                 const result = await launch();
-                if (result.type !== 'success' && !submitted.has(options)) {
+                if (result.type !== 'success' && !wasSubmitted(options)) {
                     throw new OwnedStartRefused(result.type === 'requestToApproveDirectoryCreation' ? 'directory-approval-required'
                         : result.code === 'daemon-restarting' ? 'daemon-restarting' : 'validation-error');
                 }
                 return result;
-            } finally { active.delete(options); submitted.delete(options); }
+            } finally { stop(); }
         },
     };
 }

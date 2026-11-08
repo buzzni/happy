@@ -6,13 +6,31 @@ import {
   automationPayloadSchema,
   githubTriggerSchema,
   automationRunSchema,
+  automationRunHeartbeatRequestSchema,
   automationTargetSchema,
+  automationExecutionQuestionRequestSchema,
+  openAutomationPayloadForMachine,
   createAutomationApiClient,
   decryptAutomationPayload,
   encryptAutomationPayload,
   type AutomationCryptoAdapter,
   type AutomationPublic,
 } from './automation';
+
+it('accepts only bounded isolated question requests and rejects unknown or legacy execution fields', () => {
+  const base = { requestId: '9cc41d26-562e-4b48-8e2f-a38dc2c85a78', sourceRunId: 'source-run', expectedRevision: 2,
+    generation: 3, displaySessionId: 'manual', encrypted: { payloadVersion: 6,
+      payloadCiphertext: Buffer.concat([Buffer.from([1]), Buffer.alloc(40)]).toString('base64'), viewerKeyId: 'key', viewerKeyVersion: 1,
+      machineKeyVersion: 1, viewerKeyEnvelope: Buffer.concat([Buffer.from([1]), Buffer.alloc(104)]).toString('base64'),
+      machineKeyEnvelope: Buffer.concat([Buffer.from([1]), Buffer.alloc(104)]).toString('base64') } };
+  expect(automationExecutionQuestionRequestSchema.safeParse(base).success).toBe(true);
+  for (const changed of [{ ...base, displaySessionId: 'automation-run:source-run' }, { ...base, expectedRevision: 0 },
+    { ...base, requestId: 'not-a-request' }, { ...base, prompt: 'plaintext' },
+    { ...base, encrypted: { ...base.encrypted, payloadVersion: 4 } },
+    { ...base, encrypted: { ...base.encrypted, unexpected: true } }]) {
+    expect(automationExecutionQuestionRequestSchema.safeParse(changed).success).toBe(false);
+  }
+});
 
 describe('github trigger automation payload', () => {
   it('accepts a server-backed PR trigger without changing legacy scheduled payloads', () => {
@@ -156,6 +174,22 @@ const automation: AutomationPublic = {
 };
 
 describe('automation wire contract', () => {
+  it('retains an encrypted question identity only for an isolated selected-result input', async () => {
+    const identity = { requestId: '9cc41d26-562e-4b48-8e2f-a38dc2c85a78', sourceRunId: 'source-run' };
+    const question = { ...payload, conversation: { sessionId: 'manual' }, contextPolicy: { kind: 'isolated' as const,
+      reference: { kind: 'previous-result' as const, maxBytes: 16_384 } }, executionQuestion: identity };
+    expect(automationPayloadSchema.parse(question)).toMatchObject({ executionQuestion: identity });
+    for (const changed of [{ ...question, contextPolicy: undefined }, { ...question, contextPolicy: { kind: 'isolated', reference: null } },
+      { ...question, executionQuestion: { ...identity, sourceRunId: identity.requestId } }, { ...question, executionQuestion: { ...identity, requestId: 'invalid' } }]) {
+      expect(automationPayloadSchema.safeParse(changed).success).toBe(false);
+    }
+    const crypto = fakeCrypto(), encrypted = await encryptAutomationPayload({ payload: question, crypto,
+      viewer: { publicKey: bytes(32, 11), keyVersion: 2 }, machine: { publicKey: bytes(32, 13), keyVersion: 4 } });
+    const open = { ...encrypted, recipientSecretKey: bytes(32, 13), crypto };
+    expect(openAutomationPayloadForMachine(open)).toMatchObject({ ok: false });
+    expect(openAutomationPayloadForMachine({ ...open, questionIdentity: identity })).toMatchObject({ ok: true, payload: { executionQuestion: identity } });
+    expect(openAutomationPayloadForMachine({ ...open, questionIdentity: { ...identity, sourceRunId: 'different' } })).toMatchObject({ ok: false });
+  });
   it('preserves the target daemon automation capability and defaults legacy responses', () => {
     const target = {
       machineAccountId: 'account-1', machineId: 'machine-1',
@@ -164,7 +198,10 @@ describe('automation wire contract', () => {
     };
     expect(automationTargetSchema.parse({ ...target, automationProtocolVersion: 3 }))
       .toMatchObject({ automationProtocolVersion: 3 });
-    expect(automationTargetSchema.parse(target)).toMatchObject({ automationProtocolVersion: 1 });
+    expect(automationTargetSchema.parse(target)).toMatchObject({ automationProtocolVersion: 1, contextIsolationVersion: 0 });
+    expect(automationTargetSchema.parse({ ...target, automationProtocolVersion: 99 })).toHaveProperty('contextIsolationVersion', 0);
+    expect(automationTargetSchema.parse({ ...target, contextIsolationVersion: 1 })).toHaveProperty('contextIsolationVersion', 1);
+    expect(automationTargetSchema.safeParse({ ...target, contextIsolationVersion: 99 }).success).toBe(false);
   });
 
   it('preserves a safe degraded connector code on a completed run', () => {
@@ -178,6 +215,30 @@ describe('automation wire contract', () => {
     expect(automationRunSchema.parse(run)).toEqual(run);
     expect(automationRunSchema.parse({ ...run, outcome: 'NO_CHANGE' }).outcome).toBe('NO_CHANGE');
     expect(automationRunSchema.safeParse({ ...run, degradedCode: 'secret: do not expose' }).success).toBe(false);
+  });
+
+  it('preserves only bounded waiting codes on run history without exposing raw diagnostics', () => {
+    const run = { id: 'run-1', automationId: 'automation-1', generation: 1, scheduledFor: 1,
+      machineId: 'machine-1', status: 'RUNNING', sessionId: null, outcome: null, detailCiphertext: null,
+      claimedAt: 1, startedAt: 2, completedAt: null, lateReport: false };
+    expect(automationRunSchema.parse({ ...run, holdCode: 'WORKSPACE_BUSY' })).toHaveProperty('holdCode', 'WORKSPACE_BUSY');
+    expect(automationRunSchema.parse({ ...run, holdCode: null })).toHaveProperty('holdCode', null);
+    expect(automationRunSchema.parse(run)).not.toHaveProperty('holdCode');
+    expect(automationRunSchema.safeParse({ ...run, holdCode: 'raw diagnostic containing private input' }).success).toBe(false);
+    expect(automationRunSchema.safeParse({ ...run, holdCode: 'UNREVIEWED_CODE' }).success).toBe(false);
+  });
+
+  it('distinguishes omitted heartbeat state from explicit clearing and refuses unbounded reasons', () => {
+    const schema = automationRunHeartbeatRequestSchema;
+    const original = { runId: 'run-1', claimToken: 'private-claim' };
+    expect(schema.parse(original)).toEqual(original);
+    expect(schema.parse({ ...original, holdCode: null })).toEqual({ ...original, holdCode: null });
+    expect(schema.parse({ ...original, holdCode: 'WORKSPACE_OWNER_UNCONFIRMED' }))
+      .toEqual({ ...original, holdCode: 'WORKSPACE_OWNER_UNCONFIRMED' });
+    for (const holdCode of ['private diagnostic', 'UNREVIEWED_CODE', 1]) {
+      expect(schema.safeParse({ ...original, holdCode }).success).toBe(false);
+    }
+    expect(schema.parse({ ...original, machineId: 'untrusted' })).toEqual(original);
   });
 
   it('rejects payloads that the daemon cannot execute safely', () => {
@@ -230,6 +291,19 @@ describe('automation wire contract', () => {
       recipientSecretKey: bytes(32, 1),
       crypto,
     })).rejects.toThrow('automation-decrypt-failed');
+  });
+
+  it('keeps existing payload versions and refuses relabeling them as isolated execution', async () => {
+    const crypto = fakeCrypto();
+    for (const original of [payload, { ...payload, conversation: { sessionId: 'manual-session' } }]) {
+      const encrypted = await encryptAutomationPayload({ payload: original,
+        viewer: { publicKey: bytes(32, 11), keyVersion: 2 },
+        machine: { publicKey: bytes(32, 13), keyVersion: 4 }, crypto });
+      expect(encrypted.payloadVersion).toBe('conversation' in original ? 4 : 1);
+      await expect(decryptAutomationPayload({ ...encrypted, payloadVersion: 6,
+        keyEnvelope: encrypted.viewerKeyEnvelope, recipientSecretKey: bytes(32, 11), crypto }))
+        .rejects.toThrow('automation-decrypt-failed');
+    }
   });
 });
 
@@ -471,5 +545,25 @@ describe('messenger delivery settings (Saycode specs/_archive/automation-result-
 
   it('leaves payloads without a delivery choice exactly as they were', () => {
     expect(automationPayloadSchema.parse(ordinary)).toEqual(ordinary);
+  });
+});
+
+describe('missed-run policy (aplus-dev-studio specs/scheduled-missed-run-policy R10~R14)', () => {
+  const ordinary = { name: 'Report', schedule: { kind: 'daily', hour: 9, minute: 0 }, prompt: 'Report', directory: '/chat', scriptCommand: null, suppressSilent: false, agent: 'claude' };
+
+  it('keeps an explicit skip apart from no choice at all', () => {
+    expect(automationPayloadSchema.parse({ ...ordinary, missedRunPolicy: 'skip' }).missedRunPolicy).toBe('skip');
+    expect(automationPayloadSchema.parse({ ...ordinary, missedRunPolicy: 'catch_up_once' }).missedRunPolicy).toBe('catch_up_once');
+    expect(automationPayloadSchema.parse({ ...ordinary, missedRunPolicy: 'default' }).missedRunPolicy).toBe('default');
+    expect(automationPayloadSchema.parse(ordinary)).toEqual(ordinary);
+    expect('missedRunPolicy' in automationPayloadSchema.parse(ordinary)).toBe(false);
+  });
+
+  it('runs a payload with a policy it cannot read as if none were chosen', () => {
+    for (const missedRunPolicy of ['catch_up_all', true, 1, null, '']) {
+      const parsed = automationPayloadSchema.safeParse({ ...ordinary, missedRunPolicy });
+      expect(parsed.success).toBe(true);
+      expect(parsed.success && parsed.data.missedRunPolicy).toBeUndefined();
+    }
   });
 });

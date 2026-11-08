@@ -170,6 +170,7 @@ export const MachineMetadataSchema = z.object({
     sessionFollowup: z.literal(true).optional(),
     conversation: z.literal(true).optional(),
     protocolVersion: z.number().int().min(1).optional(),
+    contextIsolationVersion: z.union([z.literal(0), z.literal(1)]).optional(),
     /** false: 스크립트 조건·GitHub 트리거처럼 Job 밖 명령이 필요한 자동화는 실행하지 않는다(Windows 정식 빌드). */
     hostCommands: z.boolean().optional(),
     /**
@@ -182,6 +183,11 @@ export const MachineMetadataSchema = z.object({
      * channel host to send results and failure alerts. Whether the host can is `channelHost.deliver`.
      */
     delivery: z.literal(1).optional(),
+    /**
+     * aplus-dev-studio specs/scheduled-missed-run-policy R14 — this daemon reads `payload.missedRunPolicy` and its
+     * server accepts late catch-up claims. Without it Desktop hides the per-schedule missed-run choice.
+     */
+    missedRunPolicy: z.literal(1).optional(),
     /** aplus-dev-studio specs/e2ee-machine-control-boundary R12/R15 — seal with this sender, to this key. */
     authenticatedEnvelopes: authenticatedEnvelopesCapabilitySchema.optional(),
     /** Why this machine does or does not run script automations. Enums and a short fingerprint only (specs/script-runtime-readiness). */
@@ -338,7 +344,7 @@ export const MachineMetadataSchema = z.object({
    * Agent Browser execution machine. protocol 2: spawns accept `browserAttestation` (a session-user
    * attestation). Studio sends one only when this is reported, and treats the machine by `tenancyMode`.
    */
-  agentBrowser: z.object({ desktopLogin: z.literal(1).optional(), profileId: z.string().min(1).max(256).optional(), protocol: z.number().int().positive(), tenancyMode: z.enum(['dedicated', 'shared']), hostMode: z.enum(['browser-only', 'dedicated-host']).optional() }).optional(),
+  agentBrowser: z.object({ desktopLogin: z.literal(1).optional(), profileId: z.string().min(1).max(256).optional(), protocol: z.number().int().positive(), tenancyMode: z.enum(['dedicated', 'shared']), hostMode: z.enum(['browser-only', 'dedicated-host']).optional(), sealedConsole: z.literal(1).optional() }).optional(),
 })
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>
@@ -352,6 +358,12 @@ export const DaemonRestartLifecycleSchema = z.object({
   busyTerminalCount: z.number().int().min(0).optional(),
   /** Epoch ms the drain ends at the latest. */
   deadlineAt: z.number().optional(),
+  /**
+   * aplus terminal-survive-runner-restart HR3 — whether this drain leaves the terminal-worker
+   * terminals running, and why not. Only from a daemon that advertises `terminalSurvival`.
+   */
+  terminals: z.union([z.enum(['keep', 'close']), z.string()]).optional(),
+  terminalsCloseReason: z.string().optional(),
   /** Bundle replaced on disk, waiting for a quiet moment (admission still open). */
   pendingHandoff: z.object({
     detectedAt: z.number(),
@@ -362,6 +374,19 @@ export const DaemonRestartLifecycleSchema = z.object({
 })
 
 export type DaemonRestartLifecycle = z.infer<typeof DaemonRestartLifecycleSchema>
+
+export const TerminalSurvivalStateSchema = z.object({
+  version: z.number().int(),
+  workers: z.object({ current: z.number().int().min(0), draining: z.number().int().min(0) }),
+  workerVersion: z.string().optional(),
+  lastAdoption: z.object({
+    at: z.number(),
+    adopted: z.number().int().min(0),
+    closed: z.number().int().min(0),
+    reaped: z.number().int().min(0),
+    failed: z.number().int().min(0),
+  }).optional(),
+})
 
 /**
  * Daemon state - dynamic runtime information (frequently updated)
@@ -396,6 +421,11 @@ export const DaemonStateSchema = z.object({
    * Declared here because this schema strips unknown keys.
    */
   lifecycle: DaemonRestartLifecycleSchema.optional(),
+  /**
+   * aplus terminal-survive-runner-restart HR4·HR10 — this daemon keeps terminals in terminal workers
+   * across a restart, and how those workers stand (counts only). Absent when workers are off.
+   */
+  terminalSurvival: TerminalSurvivalStateSchema.optional(),
 })
 
 export type DaemonState = z.infer<typeof DaemonStateSchema>
@@ -587,6 +617,8 @@ export type Metadata = {
   setupTokenRotation?: { version: 1; principalType: 'machine'; bindingVersion: 0 | 2 },
   /** Captured session opt-in, retained only when ON for resume/recovery. */
   inputEvidenceEnabled?: boolean,
+  /** Immutable initial copy is retained on the automation run, outside mutable native metadata. */
+  automationExecutionSeedManifest?: import('@slopus/happy-wire').AutomationExecutionSeedManifest,
   runtimeCapabilities?: {
     agentContact?: { v: 1; runtimeId: string; principal: 'account' | 'managed'; prompt: boolean; steer: boolean;
       inputEvidence: 1 | null; guardedPrompt: 1 | null; mode: 'remote' | 'local' | 'transitioning'; modeEpoch: number },
@@ -609,6 +641,11 @@ export type Metadata = {
      * `linkedPullRequests` does not depend on it.
      */
     linkedPullRequests?: 1,
+    /**
+     * aplus-dev-studio-desktop specs/agent-background-work-panel R2/R4 — this runtime answers
+     * `background-task-stop` for the tasks it lists. Absent: an older runtime; clients show the list without Stop.
+     */
+    backgroundTaskStop?: 1,
   },
   /**
    * aplus-dev-studio-desktop specs/linked-pull-requests R1-1 — up to 20 `LinkedPullRequest` entries
@@ -647,9 +684,14 @@ export type Metadata = {
   claudeBackgroundTasks?: {
     startedAt: number;
     available: boolean;
-    tasks: Array<{ taskId: string; label: string; kind: 'shell' | 'agent' }> | null;
+    /**
+     * `taskType` (the SDK `task_type`), `startedAt` (first listed) and, for a Bash/Monitor task, `command` and
+     * `toolName` are aplus-dev-studio-desktop specs/agent-background-work-panel R1; readers treat them as optional.
+     */
+    tasks: Array<{ taskId: string; label: string; kind: 'shell' | 'agent'; taskType?: string; startedAt?: number; command?: string; toolName?: string }> | null;
   },
-  codexBackgroundTasks?: Array<{ callId: string; command: string; processId?: string; status: 'running' | 'unknown' }>,
+  /** `startedAt`: when this runtime first saw the terminal (specs/agent-background-work-panel R1). */
+  codexBackgroundTasks?: Array<{ callId: string; command: string; processId?: string; status: 'running' | 'unknown'; startedAt?: number }>,
   /**
    * The Codex sub-agents (child threads) running now, the shape of `claudeBackgroundTasks`; REPLACE on every
    * publish. `taskId` is the child thread id, which is also the call id of its `CodexAgent` row.

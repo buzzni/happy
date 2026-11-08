@@ -19,6 +19,7 @@ const {
     mockCreateCheckpointEventPublisher,
     mockScopeBootstrap,
     mockPrepareScopeClaude,
+    mockReportAutomationContextExit,
 } = vi.hoisted(() => ({
     mockApiClientCreate: vi.fn(),
     mockCreateSessionScanner: vi.fn(),
@@ -32,6 +33,11 @@ const {
     mockCreateCheckpointEventPublisher: vi.fn(),
     mockScopeBootstrap: vi.fn(),
     mockPrepareScopeClaude: vi.fn(),
+    mockReportAutomationContextExit: vi.fn(async () => true),
+}));
+
+vi.mock('@/utils/automationContextExit', () => ({
+    reportAutomationContextExit: mockReportAutomationContextExit,
 }));
 
 vi.mock('@/daemon/sessionWriteScopeReports', () => ({ initializeScopeReportSigner: vi.fn(async () => null), takeScopeLaunchBootstrap: mockScopeBootstrap }));
@@ -137,6 +143,7 @@ async function expectPromptRejectsFast(promise: Promise<unknown>, pattern: RegEx
 }
 
 async function startRemoteRunClaudeHarness(opts: {
+    sessionId?: string;
     metadata?: Record<string, unknown>;
     updateAgentState?: ReturnType<typeof vi.fn>;
     registerHandler?: ReturnType<typeof vi.fn>;
@@ -159,8 +166,12 @@ async function startRemoteRunClaudeHarness(opts: {
     const sessionClient = {
         configureInputQueue: vi.fn(),
         queueInput: vi.fn(() => ({ ref: { kind: 'unidentified', runtimeInputId: 'test-input' } })),
-        sessionId: 'happy-session-1',
+        sessionId: opts.sessionId ?? 'happy-session-1',
         tracksShutdownStorage: true,
+        canFreezeInboundMessagesForShutdown: () => true,
+        freezeInboundMessagesForShutdown: vi.fn(() => true),
+        flushForShutdown: vi.fn(async (): Promise<import('@/api/sessionStorageBarrier').StorageConfirmation> => ({ stored: true, revision: 1 })),
+        isStorageConfirmationCurrent: vi.fn(() => true),
         confirmShutdownCursor: vi.fn(async () => true),
         suppressNextArchiveSignal: vi.fn(),
         skipExistingMessages: vi.fn(),
@@ -192,7 +203,7 @@ async function startRemoteRunClaudeHarness(opts: {
     const api = {
         getOrCreateMachine: vi.fn(async () => ({})),
         getOrCreateSession: vi.fn(async () => ({
-            id: 'happy-session-1',
+            id: opts.sessionId ?? 'happy-session-1',
             seq: 0,
             metadata: {},
             metadataVersion: 0,
@@ -414,6 +425,60 @@ describe('runClaude remote JSONL scanner', () => {
             }
         }
         originalListeners.clear();
+    });
+
+    it('joins the isolated scanner before flushing storage and reporting drained writers', async () => {
+        const drained = createDeferred<void>();
+        const cleanup = vi.fn(async () => drained.promise);
+        mockCreateSessionScanner.mockResolvedValueOnce({ onNewSession: vi.fn(), cleanup });
+        const harness = await startRemoteRunClaudeHarness({ sessionId: 'automation-run:scanner-drain' });
+        const finish = harness.finish();
+        try {
+            await vi.waitFor(() => expect(cleanup).toHaveBeenCalledOnce());
+            expect(harness.sessionClient.flush).not.toHaveBeenCalled();
+            expect(harness.sessionClient.close).not.toHaveBeenCalled();
+            expect(mockReportAutomationContextExit).not.toHaveBeenCalled();
+        } finally {
+            drained.resolve();
+            await finish;
+        }
+        expect(harness.sessionClient.flush).toHaveBeenCalledOnce();
+        expect(mockReportAutomationContextExit).toHaveBeenCalledWith(expect.objectContaining({
+            sessionId: 'automation-run:scanner-drain',
+            evidence: expect.objectContaining({ writeProducersDrained: true }),
+        }));
+    });
+
+    it.each(['stored', 'unconfirmed', 'stale'] as const)('joins isolated MCP writers, refuses legacy file RPCs and requires current storage (%s)', async storage => {
+        const harness = await startRemoteRunClaudeHarness({ sessionId: 'automation-run:filesystem-drain' });
+        const pending = createDeferred<void>();
+        let writing: Promise<unknown> | undefined, finishing: Promise<void> | undefined;
+        if (storage === 'unconfirmed') harness.sessionClient.flushForShutdown.mockResolvedValueOnce({ stored: false, reason: 'unconfirmed-write' });
+        if (storage === 'stale') harness.sessionClient.isStorageConfirmationCurrent.mockReturnValue(false);
+        try {
+            const options = (harness.api.sessionSyncClient.mock.calls[0] as any)?.[1];
+            expect(options?.trackShutdownStorage).toBe(true);
+            expect(options?.withFilesystemMutation).toBeTypeOf('function');
+            const unsafeWrite = vi.fn(async () => 'outside the owned workspace');
+            await expect(options.withFilesystemMutation(unsafeWrite)).rejects.toThrow('AUTOMATION_FILESYSTEM_RPC_UNSUPPORTED');
+            expect(unsafeWrite).not.toHaveBeenCalled();
+            const admitTool = mockStartHappyServer.mock.calls.at(-1)?.[1].admitTool;
+            expect(admitTool).toBeTypeOf('function');
+            writing = admitTool(async () => { await pending.promise; return 'stored'; });
+            finishing = harness.finish();
+            await vi.waitFor(() => expect(harness.loopOptions.standaloneDrain?.gate.isClosed()).toBe(true));
+            expect(harness.sessionClient.close).not.toHaveBeenCalled();
+            expect(mockReportAutomationContextExit).not.toHaveBeenCalled();
+            const lateWrite = vi.fn(async () => {});
+            await expect(admitTool(lateWrite)).rejects.toThrow('Runtime input is closed');
+            expect(lateWrite).not.toHaveBeenCalled();
+            pending.resolve(); await writing; await finishing;
+            expect(harness.sessionClient.flushForShutdown).toHaveBeenCalledOnce();
+            expect(mockReportAutomationContextExit).toHaveBeenCalledWith(expect.objectContaining({
+                sessionId: 'automation-run:filesystem-drain',
+                evidence: expect.objectContaining({ writeProducersDrained: storage === 'stored' }),
+            }));
+        } finally { pending.resolve(); await writing; await (finishing ?? harness.finish()); }
     });
 
     it.each([undefined, '0', 'true', '1'])('T2RT-23 requires explicit evidence opt-in (%s)', async optIn => {

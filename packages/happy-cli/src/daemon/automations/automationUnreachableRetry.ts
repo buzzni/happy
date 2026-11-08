@@ -248,7 +248,7 @@ export function hasUnsettledUnreachableRetry(state: ServerAutomationRuntimeState
   return (state.unreachableRetries ?? []).some((item) => item.automationId === automationId && item.releasing)
 }
 
-function findDueRetry(
+export function findDueRetry(
   state: ServerAutomationRuntimeState,
   automation: EncryptedServerAutomation,
   now: number,

@@ -82,7 +82,21 @@ export const HappySessionCreateProofBodySchema = z.object({
   sessionOwnerAccountId: id, ...hashes, ...times,
 }).strict().refine(lifetime);
 export type HappySessionCreateProofBody = z.infer<typeof HappySessionCreateProofBodySchema>;
-const bodySchema = z.union([MachineSetupTokenBindingV2Schema, DaemonRotationRequestBodySchema, SessionExecutionTicketBodySchema, HappySessionCreateProofBodySchema]);
+/** Device consent for a single run-owned execution. It never assigns a provider account. */
+export const AutomationExecutionAuthorityRequestBodySchema = z.object({
+  version: z.literal(1), type: z.literal('automation-execution-authority'), audience: RotationOriginSchema,
+  method: z.literal('POST'), path: z.literal('/api/automation/execution-target'),
+  ...identity, operationId: id, initialNonce: binary(32),
+  runId: z.string().min(1).max(160).regex(/^[A-Za-z0-9_-]+$/), generation: positive, revision: positive,
+  displaySessionId: z.string().min(1).max(200), agent: z.enum(['claude', 'codex']),
+  sessionOwnerAccountId: id, machineOwnerAccountId: id, ...hashes, ...times,
+}).strict().refine(lifetime);
+export type AutomationExecutionAuthorityRequestBody = z.infer<typeof AutomationExecutionAuthorityRequestBodySchema>;
+export const SignedAutomationExecutionAuthorityRequestSchema = z.object({
+  body: AutomationExecutionAuthorityRequestBodySchema, signature: binary(64),
+}).strict();
+
+const bodySchema = z.union([MachineSetupTokenBindingV2Schema, DaemonRotationRequestBodySchema, SessionExecutionTicketBodySchema, HappySessionCreateProofBodySchema, AutomationExecutionAuthorityRequestBodySchema]);
 export type RotationSignedBody = z.infer<typeof bodySchema>;
 export const MachineSetupTokenBindingV2DocumentSchema = z.object({ body: MachineSetupTokenBindingV2Schema, signature: binary(64) }).strict();
 export const DaemonRotationRequestSchema = z.object({ body: DaemonRotationRequestBodySchema, signature: binary(64) }).strict();
@@ -119,6 +133,17 @@ export const sessionCreateBodyHash = (value: unknown): Promise<string> => {
   canonicalOrgSetupTokenJson(value);
   return rotationDigest(SessionExecutionCreateBodySchema.parse(value));
 };
+/** Stable consent identity for ACK recovery; refreshing expiry never assigns another nonce or device. */
+export function sessionExecutionAuthorityDigest(value: Pick<SessionExecutionTicketBody,
+  'companyId' | 'machineId' | 'approvalId' | 'deviceKeyId' | 'machineOwnerAccountId' | 'sessionOwnerAccountId'
+  | 'launchId' | 'initialNonce' | 'operationId' | 'sessionTagHash' | 'sessionCreateBodyHash'>): Promise<string> {
+  return rotationDigest({ version: 1, type: 'automation-execution-authority-identity',
+    companyId: value.companyId, machineId: value.machineId, approvalId: value.approvalId, deviceKeyId: value.deviceKeyId,
+    machineOwnerAccountId: value.machineOwnerAccountId, sessionOwnerAccountId: value.sessionOwnerAccountId,
+    launchId: value.launchId, initialNonce: value.initialNonce, operationId: value.operationId,
+    sessionTagHash: value.sessionTagHash, sessionCreateBodyHash: value.sessionCreateBodyHash });
+}
+
 export function rotationSigningBytes(value: unknown): Uint8Array {
   canonicalOrgSetupTokenJson(value);
   const body = bodySchema.parse(value);

@@ -110,6 +110,38 @@ beforeEach(() => {
     vi.setSystemTime(new Date('2026-10-28T00:00:00Z'));
 });
 
+describe('native writer drain confidence', () => {
+    it('requires supported tracking and a known main thread before confirming idle', () => {
+        const { tracker } = setup();
+        expect(tracker.confirmedIdle).toBe(false);
+        tracker.setAvailable(true); expect(tracker.confirmedIdle).toBe(false);
+        tracker.setMainThread(V2.main); expect(tracker.confirmedIdle).toBe(true);
+        tracker.invalidate(); expect(tracker.confirmedIdle).toBe(false);
+    });
+    it('holds unknown and running children even while classification hides their rows, and accepts an observed idle child', async () => {
+        const { tracker, calls } = setup(); tracker.setAvailable(true); tracker.setMainThread(V2.main);
+        tracker.observeMainItem('item/completed', v2Activity('started'), V2.turn);
+        expect(tracker.running).toEqual([]); expect(tracker.confirmedIdle).toBe(false);
+        calls[0].resolve(threadRead(V2.child, V2.main, { status: 'idle' })); await flush();
+        expect(tracker.confirmedIdle).toBe(true);
+        tracker.observeOtherThread('turn/started', turnEvent(V2.child, V2.childTurn)); expect(tracker.confirmedIdle).toBe(false);
+        tracker.observeOtherThread('turn/completed', turnEvent(V2.child, V2.childTurn)); expect(tracker.confirmedIdle).toBe(true);
+    });
+    it('does not infer idle from a classified child whose native status is unknown', async () => {
+        const { tracker, calls } = setup(); tracker.setAvailable(true); tracker.setMainThread(V2.main);
+        tracker.observeOtherThread('thread/status/changed', statusChanged(V2.child, 'future-unknown-state'));
+        calls[0].resolve(threadRead(V2.child, V2.main, { status: 'future-unknown-state' })); await flush();
+        expect(tracker.confirmedIdle).toBe(false);
+        tracker.setMainThread('new-main'); expect(tracker.confirmedIdle).toBe(false);
+    });
+    it('does not erase unknown child writers when the runtime disconnects or the tracker is disposed', () => {
+        const { tracker } = setup(); tracker.setAvailable(true); tracker.setMainThread(V2.main);
+        tracker.observeMainItem('item/completed', v2Activity('started'), V2.turn);
+        tracker.invalidate(); tracker.setMainThread('new-main'); expect(tracker.confirmedIdle).toBe(false);
+        tracker.dispose(); expect(tracker.confirmedIdle).toBe(false);
+    });
+});
+
 afterEach(() => {
     vi.useRealTimers();
 });

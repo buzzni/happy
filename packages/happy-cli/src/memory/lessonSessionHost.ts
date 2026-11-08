@@ -21,7 +21,7 @@
 import { resolve } from 'node:path';
 import packageJson from '../../package.json';
 
-import type { SessionEnvelope } from '@slopus/happy-wire';
+import { isAutomationExecutionSessionId, type SessionEnvelope } from '@slopus/happy-wire';
 
 import { logger } from '@/ui/logger';
 import { refreshMcpCallerGrantIfExpiring } from '@/aplus/refreshMcpCallerGrant';
@@ -179,6 +179,9 @@ export function createLazyLessonSessionHost(
         bootstrap?: () => Promise<LessonSessionHost | null>;
     },
 ): LessonSessionHost {
+    if (isAutomationExecutionSessionId(input.sessionId)) {
+        return { sessionKind: 'automation', turn: null, review: null, close: async () => undefined };
+    }
     let ready: LessonSessionHost | null = null;
     let disposed = false;
     let starting = false;
@@ -359,6 +362,7 @@ async function bootstrapLessonSessionHost(input: {
     announceCandidate?: (envelope: SessionEnvelope) => void;
 }): Promise<LessonSessionHost | null> {
     reportBootstrap('start');
+    if (isAutomationExecutionSessionId(input.sessionId)) return null;
     const env = input.env ?? process.env;
     const origin = studioOrigin(env);
     const spawnContext = readCheckpointSpawnContext(env);

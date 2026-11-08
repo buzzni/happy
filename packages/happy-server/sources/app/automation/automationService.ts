@@ -84,6 +84,7 @@ interface AutomationTarget {
     machinePublicKey: Binary;
     machineKeyVersion: number;
     automationProtocolVersion: number;
+    contextIsolationVersion: number;
 }
 
 export async function projectAccess(tx: Tx, actorId: string, projectId: string): Promise<ProjectAccess | null> {
@@ -132,6 +133,7 @@ async function targetForProject(tx: Tx, project: ProjectAccess['project']): Prom
             automationPublicKey: true,
             automationKeyVersion: true,
             automationProtocolVersion: true,
+            automationContextIsolationVersion: true,
         },
     });
     if (!machine?.automationPublicKey || machine.automationKeyVersion < 1) return null;
@@ -141,6 +143,7 @@ async function targetForProject(tx: Tx, project: ProjectAccess['project']): Prom
         machinePublicKey: machine.automationPublicKey,
         machineKeyVersion: machine.automationKeyVersion,
         automationProtocolVersion: machine.automationProtocolVersion,
+        contextIsolationVersion: machine.automationContextIsolationVersion,
     };
 }
 
@@ -152,6 +155,7 @@ export interface AutomationTargetView {
     viewerPublicKey: Binary | null;
     viewerKeyVersion: number;
     automationProtocolVersion: number;
+    contextIsolationVersion: number;
     sessionFollowupSupported: boolean;
 }
 
@@ -174,6 +178,7 @@ export async function getAutomationTarget(
             viewerPublicKey: access.project.automationViewerPublicKey,
             viewerKeyVersion: access.project.automationViewerKeyVersion,
             automationProtocolVersion: target.automationProtocolVersion,
+            contextIsolationVersion: target.contextIsolationVersion,
             sessionFollowupSupported:
                 target.automationProtocolVersion >= AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION,
         },
@@ -223,8 +228,9 @@ export async function replaceAutomationViewerKeyIfUnused(
 function validateKeyVersions(
     project: ProjectAccess['project'],
     target: AutomationTarget,
-    input: Pick<AutomationPayloadInput, 'viewerKeyVersion' | 'machineKeyVersion'>,
+    input: Pick<AutomationPayloadInput, 'payloadVersion' | 'viewerKeyVersion' | 'machineKeyVersion'>,
 ): AutomationServiceError | null {
+    if (input.payloadVersion === 6 && target.contextIsolationVersion !== 1) return 'automation-run-unsupported';
     if (!project.automationViewerPublicKey || project.automationViewerKeyVersion < 1) {
         return 'viewer-key-unavailable';
     }
@@ -264,7 +270,7 @@ export async function listAutomations(
     if (!access) return { ok: false, error: 'not-found' };
     const rows = await tx.automation.findMany({
         // Script v3 and retired native v5 stay hidden; reserved monitor v2 remains legacy inventory.
-        where: { projectId, deletedAt: null, payloadVersion: { in: [1, 2, 4] } },
+        where: { projectId, deletedAt: null, payloadVersion: { in: [1, 2, 4, 6] } },
         orderBy: { createdAt: 'desc' },
     });
     return { ok: true, value: rows };
@@ -280,7 +286,7 @@ export async function getAutomationManagement(tx: Tx, actorId: string, projectId
     const row = await tx.automation.findUnique({ where: { id: automationId } });
     if (!row) return { ok: false, error: 'not-found' };
     if (row.projectId !== projectId || row.ownerAccountId !== actorId || row.machineId !== machineId
-        || row.machineAccountId !== target.machineAccountId || row.payloadVersion !== 4 || row.deletedAt) return { ok: false, error: 'forbidden' };
+        || row.machineAccountId !== target.machineAccountId || ![4, 6].includes(row.payloadVersion) || row.deletedAt) return { ok: false, error: 'forbidden' };
     return { ok: true, value: row };
 }
 
@@ -319,12 +325,13 @@ export async function requestAutomationRun(
         where: { id: automationId, projectId, deletedAt: null },
         include: {
             targetMachine: {
-                select: { automationProtocolVersion: true, automationKeyVersion: true },
+                select: { automationProtocolVersion: true, automationKeyVersion: true, automationContextIsolationVersion: true },
             },
         },
     });
     if (!current) return { ok: false, error: 'not-found' };
-    if (![1, 2, 4].includes(current.payloadVersion)) return { ok: false, error: 'automation-run-unsupported' };
+    if (![1, 2, 4, 6].includes(current.payloadVersion)
+        || current.payloadVersion === 6 && current.targetMachine?.automationContextIsolationVersion !== 1) return { ok: false, error: 'automation-run-unsupported' };
     if (current.revision !== expectedRevision) {
         return { ok: false, error: 'revision-conflict', latest: current };
     }
@@ -414,7 +421,7 @@ export async function createRegisteredAutomation(tx: Tx, actorId: string, projec
     const access = await projectAccess(tx, actorId, projectId);
     if (!access) return { ok: false, error: 'not-found' };
     if (!access.canEdit) return { ok: false, error: 'forbidden' };
-    if (input.payloadVersion !== 4 || input.paused !== true || !/^[A-Za-z0-9_-]{16,128}$/.test(registrationKey)) return { ok: false, error: 'invalid-payload-update' };
+    if (![4, 6].includes(input.payloadVersion) || input.paused !== true || !/^[A-Za-z0-9_-]{16,128}$/.test(registrationKey)) return { ok: false, error: 'invalid-payload-update' };
     const target = await targetForProject(tx, access.project);
     if (!target) return { ok: false, error: 'automation-target-unavailable' };
     const keyError = validateKeyVersions(access.project, target, input);
@@ -423,7 +430,7 @@ export async function createRegisteredAutomation(tx: Tx, actorId: string, projec
     const created = await tx.automation.createMany({ data: [{ id, projectId, ownerAccountId: actorId,
         machineAccountId: target.machineAccountId, machineId: target.machineId, ...input }], skipDuplicates: true });
     const row = await tx.automation.findUnique({ where: { id } });
-    if (!row || row.projectId !== projectId || row.ownerAccountId !== actorId || row.deletedAt || row.payloadVersion !== 4
+    if (!row || row.projectId !== projectId || row.ownerAccountId !== actorId || row.deletedAt || row.payloadVersion !== input.payloadVersion
         || row.machineAccountId !== target.machineAccountId || row.machineId !== target.machineId) return { ok: false, error: 'registration-conflict' };
     if (created.count === 1) await appendChange(tx, row, target, 'UPSERT');
     // Existing ciphertext/state is returned unchanged. Only the viewer can compare decrypted retry intent.
@@ -564,10 +571,15 @@ export async function updateAutomation(
     if (current.payloadVersion === 3) return { ok: false, error: 'invalid-payload-update' };
 
     const payloadUpdate = hasPayloadUpdate(input);
+    if (current.payloadVersion === 6 && payloadUpdate && input.payloadVersion !== 6) return { ok: false, error: 'automation-run-unsupported' };
     if (!payloadUpdate && input.paused === undefined) {
         return { ok: false, error: 'invalid-payload-update' };
     }
     let target: AutomationTarget | null = null;
+    if (current.payloadVersion === 6 && !payloadUpdate && input.paused === false) {
+        target = await targetForProject(tx, access.project);
+        if (target?.contextIsolationVersion !== 1) return { ok: false, error: 'automation-run-unsupported' };
+    }
     if (payloadUpdate) {
         if (!completePayloadUpdate(input)) return { ok: false, error: 'invalid-payload-update' };
         target = await targetForProject(tx, access.project);

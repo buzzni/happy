@@ -49,6 +49,7 @@ type Child = {
     role: string | null;
     agentPath: string | null;
     running: boolean;
+    stateKnown: boolean;
     /** Closed or unloaded; only the child's own next turn reopens it (app-server sends `notLoaded` before the
      *  closeAgent item that still carries the pre-close `running`). */
     gone: boolean;
@@ -88,6 +89,8 @@ export class CodexSubagentTracker {
     private pollTimer: Timer | null = null;
     private polling = false;
     private disposed = false;
+    private writerEpochKnown = false;
+    private retiredWritersUnconfirmed = false;
 
     constructor(deps: {
         request: (method: string, params: unknown) => Promise<unknown>;
@@ -117,8 +120,10 @@ export class CodexSubagentTracker {
 
     setMainThread(threadId: string | null): void {
         this.safely('setMainThread', undefined, () => {
+            if (this.mainThreadId && !this.confirmedIdle) this.retiredWritersUnconfirmed = true;
             this.reset();
             this.mainThreadId = id(threadId);
+            this.writerEpochKnown = this.mainThreadId !== null;
             if (this.mainThreadId) this.retired.delete(this.mainThreadId);
             this.sync();
         });
@@ -174,6 +179,8 @@ export class CodexSubagentTracker {
 
     invalidate(): void {
         this.safely('invalidate', undefined, () => {
+            if (this.mainThreadId && !this.confirmedIdle) this.retiredWritersUnconfirmed = true;
+            this.writerEpochKnown = false;
             this.reset();
             this.sync();
         });
@@ -181,6 +188,13 @@ export class CodexSubagentTracker {
 
     get running(): ReadonlyArray<{ threadId: string; label: string }> {
         return this.shown().map(([threadId, child]) => ({ threadId, label: formatCodexAgentLabel(child) }));
+    }
+
+    /** All observed children, including hidden/unclassified/internal ones; the display list is not an exit proof. */
+    get confirmedIdle(): boolean {
+        return !this.disposed && this.available === true && this.writerEpochKnown && !!this.mainThreadId
+            && !this.retiredWritersUnconfirmed && [...this.children.values()].every(child =>
+                child.gone || child.classified && child.stateKnown && !child.running);
     }
 
     /** Stops every timer and read for good; nothing is published afterwards. */
@@ -231,7 +245,7 @@ export class CodexSubagentTracker {
         if (!child) {
             child = {
                 classified: false, readFailed: false, internal: false, parentId: null, spawnedBy: null, nickname: null, role: null, agentPath: null,
-                running: false, gone: false, listing: 'new', spawned: false, seq: 0,
+                running: false, stateKnown: false, gone: false, listing: 'new', spawned: false, seq: 0,
             };
             this.children.set(threadId, child);
             this.unread.set(threadId, child);
@@ -270,6 +284,7 @@ export class CodexSubagentTracker {
     private apply(child: Child | undefined, input: unknown, inputs: ReadonlyMap<string, Transition>, own = false): void {
         const next = typeof input === 'string' ? inputs.get(input) : undefined;
         if (!child || !next) return;
+        child.stateKnown = true;
         child.seq++;
         child.running = next === 'run';
         if (next === 'close') child.gone = true;

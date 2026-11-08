@@ -17,6 +17,7 @@ import {
     canonicalWorktreeJson,
     readWorktreeTicket,
     worktreeAttestationPayload,
+    worktreeOpMethod,
     type WorktreeOp,
 } from '@slopus/happy-wire';
 import { deriveServerRpcKey } from '@/api/encryption';
@@ -24,10 +25,22 @@ import { sealForMachine } from '@/modules/common/machineSeal';
 import { createWorktreeOpsHandlers, prepareGitCredential, WORKTREE_OPS_METHODS } from './worktreeOps';
 import type { NativeStopResult } from './projectNativeProcesses';
 import { worktreeRemovalReservations } from './worktreeRemovalReservations';
+import { createLegacyDispatchAdmission, createSubprocessWriteAdmission, createWorkspaceTurnAdmission } from '@/utils/workspaceTurnAdmission';
 
 const machineKey = new Uint8Array(32).fill(7);
 const machine = { id: 'm1', encryptionKey: machineKey, encryptionVariant: 'dataKey' as 'dataKey' | 'legacy' };
 const NOW = 1_790_000_000_000;
+const cleanupFailure = vi.hoisted(() => ({ enabled: false, directories: [] as string[] }));
+vi.mock('node:fs/promises', async importOriginal => {
+    const original = await importOriginal<typeof import('node:fs/promises')>();
+    return { ...original, rm: async (...args: Parameters<typeof original.rm>) => {
+        if (cleanupFailure.enabled && String(args[0]).includes('happy-git-askpass-')) {
+            cleanupFailure.directories.push(String(args[0]));
+            throw new Error('askpass cleanup denied');
+        }
+        return original.rm(...args);
+    } };
+});
 
 let root: string;
 let home: string;
@@ -55,7 +68,7 @@ function ticket(op: WorktreeOp, params: Record<string, unknown>, over: Record<st
 }
 
 async function call(op: WorktreeOp, params: Record<string, unknown>, over: Record<string, unknown> = {}, set = handlers()) {
-    return set[`worktree:${op}`]({ ticket: ticket(op, params, over) }) as Promise<any>;
+    return set[worktreeOpMethod(op)]({ ticket: ticket(op, params, over) }) as Promise<any>;
 }
 
 function write(dir: string, file: string, content: string) {
@@ -101,11 +114,136 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+    cleanupFailure.enabled = false;
+    for (const directory of cleanupFailure.directories.splice(0)) rmSync(directory, { recursive: true, force: true });
+    vi.unstubAllEnvs();
     rmSync(root, { recursive: true, force: true });
     rmSync(home, { recursive: true, force: true });
 });
 
 describe('worktree ops tickets', () => {
+    it('does not retain a rejected branch-name check as an unknown writer', async () => {
+        const set = createWorktreeOpsHandlers({ machine: () => machine, allowedRoot: root, happyHomeDir: home, now: () => NOW,
+            reserveLegacyDispatch: createLegacyDispatchAdmission({ home }), admitSubprocess: createSubprocessWriteAdmission({ home }) });
+        expect(await call('create-branch', { workspaceDir: repo, branchName: 'bad..branch' }, {}, set))
+            .toMatchObject({ success: false, errorCode: 'WORKSPACE_BRANCH_INVALID' });
+        expect(await createWorkspaceTurnAdmission({ home, roots: [repo], kind: 'automation', sessionId: 'auto-after-invalid-ref' }).tryAcquire())
+            .toEqual({ acquired: true });
+    });
+
+    it('releases a temporary workspace reservation even when credential cleanup fails before a Git writer', async () => {
+        const finish = vi.fn(async () => {});
+        const admitSubprocess = vi.fn(async () => {});
+        const set = createWorktreeOpsHandlers({ machine: () => machine, allowedRoot: root, happyHomeDir: home, now: () => NOW,
+            reserveLegacyDispatch: async () => ({ acquired: true, finish }), admitSubprocess, repositoryLockWaitMs: 0 });
+        const sent = ticket('create', create({ expectedRepoRoot: null, name: 'cleanup-refusal' }));
+        // The request is valid, but the operation cannot acquire the existing repository write lock.
+        mkdirSync(join(repo, '.git', 'saycode-desktop-write.lock'));
+        const sealedCredential = sealForMachine(deriveServerRpcKey(machineKey), GIT_CREDENTIAL_SEAL_KEY_LABEL, {
+            v: 1, purpose: 'git-credential', machineId: machine.id, opId: sent.opId, username: 'fixture', token: 'fixture-token',
+        });
+        cleanupFailure.enabled = true;
+        await expect(set['worktree:create']({ ticket: sent, sealedCredential })).rejects.toThrow('askpass cleanup denied');
+        expect(admitSubprocess).not.toHaveBeenCalled();
+        expect(finish).toHaveBeenCalledOnce();
+    });
+
+    it('does not consume a blocked ticket and tracks the Git writer after retrying that same ticket', async () => {
+        const owner = createWorkspaceTurnAdmission({ home, sessionId: 'auto-ticket', kind: 'automation', roots: [repo] });
+        expect(await owner.tryAcquire()).toEqual({ acquired: true });
+        const set = createWorktreeOpsHandlers({ machine: () => machine, allowedRoot: root, happyHomeDir: home, now: () => NOW,
+            reserveLegacyDispatch: createLegacyDispatchAdmission({ home }), admitSubprocess: createSubprocessWriteAdmission({ home }) } as any);
+        const request = { ticket: ticket('create', create()) };
+        expect(await set['worktree:create'](request)).toMatchObject({ success: false, errorCode: 'WORKSPACE_BUSY' });
+        expect(git(repo, 'branch', '--list', 'bright-fox')).toBe('');
+        expect(await owner.release(true)).toBe(true);
+        expect(await set['worktree:create'](request)).toMatchObject({ success: true });
+        expect(await owner.tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+    });
+
+    it('does not retain query and dry-run operations as unknown writers', async () => {
+        const path = await worktree();
+        const admitSubprocess = vi.fn(async () => {});
+        const finish = vi.fn(async () => {});
+        const set = createWorktreeOpsHandlers({ machine: () => machine, allowedRoot: root, happyHomeDir: home, now: () => NOW,
+            reserveLegacyDispatch: vi.fn(async () => ({ acquired: true, finish })), admitSubprocess } as any);
+        expect(await call('capability', { workspaceDir: repo }, {}, set)).toMatchObject({ success: true });
+        expect(await call('status', { worktreePath: path, branch: 'bright-fox', baseBranch: 'main' }, {}, set)).toMatchObject({ success: true });
+        expect(await call('adopt-check', { workspaceDir: repo, worktreePath: path, expectedRepoRoot: null }, {}, set)).toMatchObject({ success: true });
+        expect(admitSubprocess).not.toHaveBeenCalled();
+        expect(await call('remove', { worktreePath: path, branch: 'bright-fox', force: false, dryRun: true }, {}, set)).toMatchObject({ success: true });
+        expect(await call('sync-remote', { workspaceDir: repo, kind: 'deploy', remoteUrl: 'https://github.com/acme/app.git', branch: 'main',
+            commitMessage: 'fixture', authorName: 'fixture', authorEmail: 'fixture@example.invalid', sizeCapBytes: 1024 * 1024,
+            confirmFirstRemote: false, dryRun: true }, {}, set)).toMatchObject({ success: true });
+        expect(admitSubprocess).not.toHaveBeenCalled();
+        expect(finish).toHaveBeenCalledTimes(5);
+    });
+
+    it('recovers a missing managed worktree while recording only existing writer roots', async () => {
+        const path = await worktree();
+        rmSync(path, { recursive: true, force: true });
+        const admit = createSubprocessWriteAdmission({ home });
+        const admitSubprocess = vi.fn(async (roots: readonly string[]) => {
+            for (const directory of roots) expect(statSync(directory).isDirectory()).toBe(true);
+            await admit(roots);
+        });
+        const set = createWorktreeOpsHandlers({ machine: () => machine, allowedRoot: root, happyHomeDir: home, now: () => NOW,
+            reserveLegacyDispatch: createLegacyDispatchAdmission({ home }), admitSubprocess });
+        expect(await call('recover', { worktreePath: path, branch: 'bright-fox' }, {}, set)).toMatchObject({ success: true, result: { recovered: true } });
+        expect(admitSubprocess).toHaveBeenCalledWith([repo]);
+    });
+
+    it('creates a missing clone folder before recording its actual Git writer', async () => {
+        const { bare } = withOrigin();
+        const remoteUrl = 'https://github.com/acme/app.git';
+        const config = join(root, 'gitconfig');
+        writeFileSync(config, `[url "${bare}"]\n\tinsteadOf = ${remoteUrl}\n`);
+        vi.stubEnv('GIT_CONFIG_GLOBAL', config);
+        const path = join(root, 'aplus-dev-studio-workspace', 'u1', 'p1');
+        const set = createWorktreeOpsHandlers({ machine: () => machine, allowedRoot: root, happyHomeDir: home, now: () => NOW,
+            reserveLegacyDispatch: createLegacyDispatchAdmission({ home }), admitSubprocess: createSubprocessWriteAdmission({ home }) });
+        expect(await call('clone', { workspaceDir: path, remoteUrl, branch: 'main' }, {}, set)).toMatchObject({ success: true, result: { changed: true } });
+        expect(await createWorkspaceTurnAdmission({ home, roots: [path], kind: 'automation', sessionId: 'auto-after-clone' }).tryAcquire())
+            .toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+    });
+
+    it('keeps the original workspace in writer scope when a deploy save runs Git in a private scratch folder', async () => {
+        const { bare } = withOrigin();
+        const remoteUrl = 'https://github.com/acme/app.git';
+        const config = join(root, 'gitconfig');
+        writeFileSync(config, `[url "${bare}"]\n\tinsteadOf = ${remoteUrl}\n`);
+        vi.stubEnv('GIT_CONFIG_GLOBAL', config);
+        const admitSubprocess = vi.fn(createSubprocessWriteAdmission({ home }));
+        const set = createWorktreeOpsHandlers({ machine: () => machine, allowedRoot: root, happyHomeDir: home, now: () => NOW,
+            reserveLegacyDispatch: createLegacyDispatchAdmission({ home }), admitSubprocess });
+        expect(await call('sync-remote', { workspaceDir: repo, kind: 'deploy', remoteUrl, branch: 'main',
+            commitMessage: 'fixture', authorName: 'fixture', authorEmail: 'fixture@example.invalid', sizeCapBytes: 1024 * 1024,
+            confirmFirstRemote: true, dryRun: false }, {}, set)).toMatchObject({ success: true });
+        expect(admitSubprocess.mock.calls.some(([roots]) => roots.includes(repo) && roots.some(path => path.includes('happy-workspace-sync-')))).toBe(true);
+    });
+
+    it('rechecks ticket expiry after waiting for workspace admission without consuming the ticket', async () => {
+        let at = NOW;
+        const finish = vi.fn(async () => {});
+        const reserve = vi.fn(async () => { at = NOW + 120_000; return { acquired: true, finish }; });
+        const set = createWorktreeOpsHandlers({ machine: () => machine, allowedRoot: root, happyHomeDir: home, now: () => at,
+            reserveLegacyDispatch: reserve, admitSubprocess: vi.fn(async () => {}) } as any);
+        const request = { ticket: ticket('capability', { workspaceDir: repo }) };
+        expect(await set['worktree:capability'](request)).toMatchObject({ errorCode: 'TICKET_EXPIRED' });
+        expect(finish).toHaveBeenCalledOnce();
+        at = NOW;
+        reserve.mockImplementationOnce(async () => ({ acquired: true, finish }));
+        expect(await set['worktree:capability'](request)).toMatchObject({ success: true });
+    });
+
+    it('rejects invalid paths before asking for workspace admission', async () => {
+        const reserve = vi.fn(async () => ({ acquired: false, reason: 'workspace-busy', sessions: [] }));
+        const set = createWorktreeOpsHandlers({ machine: () => machine, allowedRoot: root, happyHomeDir: home, now: () => NOW,
+            reserveLegacyDispatch: reserve, admitSubprocess: vi.fn(async () => {}) } as any);
+        expect(await call('capability', { workspaceDir: home }, {}, set)).toMatchObject({ errorCode: 'PATH_DENIED' });
+        expect(reserve).not.toHaveBeenCalled();
+    });
+
     it('refuses a Desktop-held common Git lock that outlasts the wait before creating a worktree', async () => {
         const lock = join(repo, '.git', 'saycode-desktop-write.lock');
         mkdirSync(lock);
@@ -114,6 +252,27 @@ describe('worktree ops tickets', () => {
         expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
         expect(git(repo, 'branch', '--list', 'bright-fox')).toBe('');
         expect(existsSync(lock)).toBe(true);
+    });
+
+    it.each([false, true])('refuses an expired ticket after waiting for the Git lock and releases its own lock (workspace admission=%s)', async withAdmission => {
+        let at = NOW;
+        const finish = vi.fn(async () => {}), admitSubprocess = vi.fn(async () => {});
+        const set = createWorktreeOpsHandlers({ machine: () => machine, allowedRoot: root, happyHomeDir: home,
+            now: () => at, repositoryLockWaitMs: 10_000,
+            ...(withAdmission ? { reserveLegacyDispatch: async () => ({ acquired: true as const, finish }), admitSubprocess } : {}) });
+        const lock = join(repo, '.git', 'saycode-desktop-write.lock');
+        mkdirSync(lock);
+        const request = { ticket: ticket('create', create(), { expiresAt: NOW + 100 }) };
+        const released = setTimeout(() => { at = NOW + 200; rmSync(lock, { recursive: true }); }, 300);
+        try {
+            expect(await set['worktree:create'](request)).toMatchObject({ success: false, errorCode: 'TICKET_EXPIRED' });
+        } finally { clearTimeout(released); }
+        expect(git(repo, 'branch', '--list', 'bright-fox')).toBe('');
+        expect(existsSync(join(repo, '.aplus', 'worktrees', 'p1', 'bright-fox'))).toBe(false);
+        expect(existsSync(lock)).toBe(false);
+        expect(admitSubprocess).not.toHaveBeenCalled();
+        expect(finish).toHaveBeenCalledTimes(withAdmission ? 1 : 0);
+        expect(await set['worktree:create'](request)).toMatchObject({ success: false, errorCode: 'TICKET_EXPIRED' });
     });
 
     it('waits for a Desktop-held common Git lock and creates the worktree once it is released', async () => {

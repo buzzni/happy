@@ -1,13 +1,15 @@
-import { createHash } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager';
 import { configuration } from '@/configuration';
+import { createWorkspaceTurnAdmission, createFilesystemWriteAdmission } from '@/utils/workspaceTurnAdmission';
 import { registerCommonHandlers, type CommonHandlerOptions } from './registerCommonHandlers';
 import { createManagedProjectWriteScopePolicy, createTrustedMachineRunProfileResolver } from './machineRunProfile';
 import { managedMachineToolPlatform } from './managedMachineTool';
+import { drainBashRpcs } from './bashRpcScheduler';
 
 type Handler = (data: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
@@ -43,6 +45,73 @@ afterEach(async () => {
 });
 
 describe('registerCommonHandlers bash scheduling', () => {
+    it('forwards host admission to the explicitly enabled raw machine-run adapter', async () => {
+        const admitSubprocess = vi.fn(async (_roots: readonly string[]) => { throw new Error('WORKSPACE_BUSY'); });
+        const { handlers, workingDirectory } = await createHandlers(undefined, { admitSubprocess,
+            machineRun: { allowLegacyRaw: true, profileRegistry: createTrustedMachineRunProfileResolver([]) } });
+        await expect(handlers.get('machine-run')!({ version: 1, action: 'start', executable: 'printf', args: ['blocked'], cwd: workingDirectory }))
+            .rejects.toThrow('WORKSPACE_BUSY');
+        expect(admitSubprocess).toHaveBeenCalledWith([await realpath(workingDirectory)]);
+    });
+    it.each(['machine.run', 'machine-run'])('forwards host admission through the %s profile adapter', async method => {
+        const registry = createTrustedMachineRunProfileResolver([{
+            id: 'buzzni.test.admission', executable: 'printf', argv: ['{{message}}'],
+            parameters: { message: { type: 'string', maxLength: 32 } }, cwd: 'workspaceRoot',
+            envAllowlist: [], timeoutMs: 1000, outputLimitBytes: 1024, stdin: 'none',
+        }]);
+        const admitSubprocess = vi.fn(async (_roots: readonly string[]) => { throw new Error('WORKSPACE_OWNER_UNCONFIRMED'); });
+        const { handlers, workingDirectory } = await createHandlers(undefined, { admitSubprocess, machineRun: { profileRegistry: registry } });
+        await expect(handlers.get(method)!({ action: 'start', profileId: 'buzzni.test.admission',
+            profileDigest: registry.resolve('buzzni.test.admission')!.profileDigest, workspaceRoot: workingDirectory, parameters: { message: 'blocked' } }))
+            .rejects.toThrow('WORKSPACE_OWNER_UNCONFIRMED');
+        const canonical = await realpath(workingDirectory);
+        expect(admitSubprocess).toHaveBeenCalledWith([canonical, canonical]);
+    });
+    it('checks host workspace admission before a legacy shell effect and ignores request-supplied admission', async () => {
+        const admitSubprocess = vi.fn(async (_roots: readonly string[]) => { throw new Error('WORKSPACE_OWNER_UNCONFIRMED'); });
+        const options = { childEnvBoundary: 'session' as const, admitSubprocess };
+        const { handlers, workingDirectory } = await createHandlers(undefined, options);
+        await expect(handlers.get('bash')!({ command: 'printf unsafe > untracked-shell.txt', cwd: workingDirectory,
+            admitSubprocess: async () => undefined })).resolves.toMatchObject({ success: false, error: 'WORKSPACE_OWNER_UNCONFIRMED' });
+        expect(admitSubprocess).toHaveBeenCalledWith([workingDirectory]);
+        await expect(readFile(join(workingDirectory, 'untracked-shell.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
+    });
+    it.each([undefined, '/'])('uses the actual process cwd for default-shell admission (%s)', async cwd => {
+        const admitSubprocess = vi.fn(async (_roots: readonly string[]) => undefined);
+        const { handlers } = await createHandlers(undefined, { childEnvBoundary: 'session', admitSubprocess } as CommonHandlerOptions);
+        await expect(handlers.get('bash')!({ command: 'printf admitted', ...(cwd ? { cwd } : {}) }))
+            .resolves.toMatchObject({ success: true, stdout: 'admitted' });
+        expect(admitSubprocess).toHaveBeenCalledWith([process.cwd()]);
+    });
+    it.each(['ripgrep', 'difftastic'])('checks host admission before starting a legacy raw %s process', async method => {
+        const runner = method === 'ripgrep' ? await import('@/modules/ripgrep/index') : await import('@/modules/difftastic/index');
+        const execute = vi.spyOn(runner, 'run').mockRejectedValue(new Error('untracked process invoked'));
+        const admitSubprocess = vi.fn(async (_roots: readonly string[]) => { throw new Error('WORKSPACE_BUSY'); });
+        try {
+            const options = { childEnvBoundary: 'session' as const, admitSubprocess };
+            const { handlers, workingDirectory } = await createHandlers(undefined, options);
+            await expect(handlers.get(method)!({ args: ['--version'], cwd: workingDirectory }))
+                .resolves.toMatchObject({ success: false, error: 'WORKSPACE_BUSY' });
+            expect(admitSubprocess).toHaveBeenCalledWith([workingDirectory]);
+            expect(execute).not.toHaveBeenCalled();
+        } finally { execute.mockRestore(); }
+    });
+    it.each(['ripgrep', 'difftastic'])('refuses internal raw %s before starting any process', async method => {
+        const runner = method === 'ripgrep' ? await import('@/modules/ripgrep/index') : await import('@/modules/difftastic/index');
+        const execute = vi.spyOn(runner, 'run').mockRejectedValue(new Error('untracked process invoked'));
+        try {
+            const { handlers, workingDirectory } = await createHandlers(undefined, { processExecution: 'disabled' });
+            await expect(handlers.get(method)!({ args: ['--version'], cwd: workingDirectory }))
+                .resolves.toMatchObject({ success: false, error: 'AUTOMATION_PROCESS_RPC_UNSUPPORTED' });
+            expect(execute).not.toHaveBeenCalled();
+        } finally { execute.mockRestore(); }
+    });
+    it('refuses an internal execution shell before it can start an untracked writer', async () => {
+        const { handlers, workingDirectory } = await createHandlers(undefined, { processExecution: 'disabled' } as CommonHandlerOptions);
+        await expect(handlers.get('bash')!({ command: 'printf unsafe > forbidden.txt', cwd: workingDirectory,
+            processExecution: 'enabled' })).resolves.toMatchObject({ success: false, error: 'AUTOMATION_PROCESS_RPC_UNSUPPORTED' });
+        await expect(readFile(join(workingDirectory, 'forbidden.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
+    });
     it('drops another session from machine-scope commands and keeps a session its own scope (utils/childEnv)', async () => {
         const injected = { HAPPY_RECONNECT_SESSION_ID: 'cmr-poisoned', APLUS_SESSION_ID: 'self-session' };
         Object.assign(process.env, injected);
@@ -78,7 +147,34 @@ describe('registerCommonHandlers bash scheduling', () => {
     });
 });
 
+describe('registerCommonHandlers bash at daemon shutdown', () => {
+    it('answers a command that arrives after shutdown began with the retryable busy error and does not run it', async () => {
+        const { handlers, workingDirectory } = await createHandlers();
+        await drainBashRpcs({ waitMs: 10 });
+
+        await expect(handlers.get('bash')!({ command: 'printf ran > ran.txt', cwd: workingDirectory }))
+            .resolves.toMatchObject({ success: false, errorCode: 'DAEMON_BUSY' });
+        await expect(readdir(workingDirectory)).resolves.not.toContain('ran.txt');
+    });
+
+});
+
 describe('registerCommonHandlers machine.run capability', () => {
+    it.each(['machine-run', 'machine.run'])('refuses untracked internal %s execution and capability advertising', async method => {
+        const registry = createTrustedMachineRunProfileResolver([{
+            id: 'buzzni.test.echo', executable: 'printf', argv: ['{{message}}'],
+            parameters: { message: { type: 'string', maxLength: 32 } }, cwd: 'workspaceRoot',
+            envAllowlist: [], timeoutMs: 1000, outputLimitBytes: 1024, stdin: 'none',
+        }]);
+        const { handlers, workingDirectory } = await createHandlers(undefined, {
+            processExecution: 'disabled', machineRun: { allowLegacyRaw: true, profileRegistry: registry },
+        } as CommonHandlerOptions);
+        const request = method === 'machine-run' ? { version: 1, action: 'start', executable: 'printf', args: ['raw'] }
+            : { action: 'start', profileId: 'buzzni.test.echo', profileDigest: registry.resolve('buzzni.test.echo')!.profileDigest,
+                workspaceRoot: workingDirectory, parameters: { message: 'raw' } };
+        await expect(handlers.get(method)!({ ...request, processExecution: 'enabled' })).rejects.toThrow('AUTOMATION_PROCESS_RPC_UNSUPPORTED');
+        await expect(handlers.get(method)!({ action: 'capabilities' })).rejects.toThrow('AUTOMATION_PROCESS_RPC_UNSUPPORTED');
+    });
     it('keeps the raw RPC and exposes profile capability negotiation on both method names', async () => {
         const { handlers } = await createHandlers(undefined, {
             machineRun: {
@@ -633,6 +729,49 @@ describe('file RPCs under strict machine control', () => {
     });
 });
 
+describe.skipIf(process.platform === 'win32')('common filesystem mutation admission', () => {
+    const mutation = createFilesystemWriteAdmission({ home: configuration.happyHomeDir });
+    it.each(['writeFile', 'writeWorkspaceFile', 'renameFile', 'deleteFile', 'copyFile', 'ensureDirectory'])(
+        'does not mutate files through %s while an automatic writer owns the workspace', async method => {
+            const f = await createHandlers(undefined, Object.assign({ childEnvBoundary: 'session' as const }, { withFilesystemMutation: mutation }));
+            const original = join(f.workingDirectory, 'original.txt'); await writeFile(original, 'original');
+            const auto = createWorkspaceTurnAdmission({ home: configuration.happyHomeDir,
+                sessionId: `automation-run:${randomUUID()}`, kind: 'automation', roots: [f.workingDirectory] });
+            await auto.tryAcquire();
+            const requests: Record<string, Record<string, unknown>> = {
+                writeFile: { path: join(f.workingDirectory, 'created.txt'), content: Buffer.from('new').toString('base64') },
+                writeWorkspaceFile: { workspaceRoot: f.workingDirectory, path: join(f.workingDirectory, 'created.txt'), content: Buffer.from('new').toString('base64') },
+                renameFile: { path: original, newName: 'renamed.txt' }, deleteFile: { path: original },
+                copyFile: { path: original, newName: 'copied.txt' }, ensureDirectory: { path: join(f.workingDirectory, 'created-dir') },
+            };
+            try {
+                const result = await f.handlers.get(method)!(requests[method]);
+                expect(result).toMatchObject({ success: false, error: expect.stringContaining('WORKSPACE_BUSY') });
+                expect(await readFile(original, 'utf8')).toBe('original');
+                expect(await readdir(f.workingDirectory)).toEqual(['original.txt']);
+            } finally { await auto.release(true); }
+            expect(await f.handlers.get(method)!(requests[method])).toHaveProperty('success', true);
+        });
+    it('keeps a refused write retryable and replays its original receipt without overwriting later automatic changes', async () => {
+        const f = await createHandlers(undefined, { withFilesystemMutation: mutation });
+        const path = join(f.workingDirectory, 'saved.txt');
+        const request = { path, content: Buffer.from('saved').toString('base64'), expectedHash: null, attemptId: 'same-write-attempt' };
+        const auto = createWorkspaceTurnAdmission({ home: configuration.happyHomeDir,
+            sessionId: `automation-run:${randomUUID()}`, kind: 'automation', roots: [f.workingDirectory] });
+        await auto.tryAcquire();
+        try { expect(await f.handlers.get('writeFile')!(request)).toMatchObject({ success: false, error: 'WORKSPACE_BUSY' }); }
+        finally { await auto.release(true); }
+        const first = await f.handlers.get('writeFile')!(request);
+        expect(first).toHaveProperty('success', true);
+        await auto.tryAcquire();
+        try {
+            await writeFile(path, 'later automatic change');
+            expect(await f.handlers.get('writeFile')!(request)).toEqual({ ...first, replayed: true });
+            expect(await readFile(path, 'utf8')).toBe('later automatic change');
+        } finally { await auto.release(true); }
+    });
+
+});
 /*
  * aplus-dev-studio specs/approved-folder-roots — a folder outside the machine's
  * allowed root (e.g. C:\workspace beside C:\Users\me) opens only once the

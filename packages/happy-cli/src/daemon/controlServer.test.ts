@@ -1,5 +1,5 @@
 import { createLaunchReadinessGate } from './resumeGuards'
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -627,6 +627,7 @@ describe('controlServer POST /start-server', () => {
   let stopServer: () => Promise<void>
   const spawnedPids: number[] = []
   let controlSecret = ''
+  let admitSubprocess = vi.fn(async (_roots: readonly string[]) => undefined)
   const fetch = makeAuthedFetch(() => controlSecret)
 
   const kill = (pid: number) => {
@@ -634,6 +635,7 @@ describe('controlServer POST /start-server', () => {
   }
 
   beforeEach(async () => {
+    admitSubprocess = vi.fn(async (_roots: readonly string[]) => undefined)
     dir = mkdtempSync(path.join(tmpdir(), 'control-server-'))
     const registry = createPortRegistry({
       filePath: path.join(dir, 'port-registry.json'),
@@ -641,14 +643,16 @@ describe('controlServer POST /start-server', () => {
       portMax: 30010,
       isPortBindable: async () => true,
     })
-    const { port, stop, controlSecret: secret } = await startDaemonControlServer({
+    const input = {
       getChildren: () => [],
-      stopSession: () => ({ stopped: false, reason: 'not-found' }),
-      spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
+      stopSession: () => ({ stopped: false as const, reason: 'not-found' as const }),
+      spawnSession: async () => ({ type: 'error' as const, errorMessage: 'unused' }),
       requestShutdown: () => {},
       onHappySessionWebhook: () => {},
       portRegistry: registry,
-    })
+      admitSubprocess,
+    }
+    const { port, stop, controlSecret: secret } = await startDaemonControlServer(input)
     baseUrl = `http://127.0.0.1:${port}`
     stopServer = stop
     controlSecret = secret
@@ -673,6 +677,22 @@ describe('controlServer POST /start-server', () => {
     require('node:fs').writeFileSync(p, `setTimeout(() => process.exit(0), ${ms})`)
     return p
   }
+
+  it('returns the workspace refusal without spawning and permits a later admitted retry', async () => {
+    const script = writeSleepScript(1000)
+    admitSubprocess.mockRejectedValueOnce(new Error('WORKSPACE_BUSY'))
+    const refused = await post({ command: `node ${script}`, cwd: dir })
+    const first = await refused.json() as { pid?: number; code?: string; error?: string }
+    if (first.pid) spawnedPids.push(first.pid)
+    expect(refused.status).toBe(500)
+    expect(first).toEqual({ code: 'WORKSPACE_UNAVAILABLE', error: 'WORKSPACE_BUSY' })
+    expect(admitSubprocess).toHaveBeenCalledWith([dir])
+    const accepted = await post({ command: `node ${script}`, cwd: dir })
+    const second = await accepted.json() as { success: boolean; pid: number }
+    spawnedPids.push(second.pid)
+    expect(accepted.status).toBe(200)
+    expect(second.success).toBe(true)
+  })
 
   it('spawns and returns 200 with the pid', async () => {
     const script = writeSleepScript(1500)

@@ -3,10 +3,12 @@ import { registerOwnedSpawnRpc, type OwnedSpawnRpc } from '@/daemon/ownedSpawnRp
 import { z } from 'zod';
 import type { createDeviceEnrollment } from '@/daemon/deviceEnrollment';
 import type { DeviceKeys } from '@/daemon/deviceKeys';
-import type { AutomationConversationDeliverRequest } from '@slopus/happy-wire';
+import type { AutomationConversationDeliverRequest, AutomationRunHeartbeatRequest } from '@slopus/happy-wire';
 import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { createWorktreeReclaimHandler } from '@/daemon/worktreeDependencyReclaimRpc';
 import { createSealedSpawnEnvHandler } from '@/modules/common/sealedSpawnEnv';
+import type { LegacyDispatchReservation } from '@/utils/workspaceTurnAdmission';
+import { createSerialLock } from '@/utils/refreshRecovery';
 import { createWorktreeOpsHandlers } from '@/daemon/worktreeOps';
 /**
  * WebSocket client for machine/daemon communication with Happy server
@@ -18,10 +20,12 @@ import { logger } from '@/ui/logger';
 import { configuration } from '@/configuration';
 import { MachineMetadata, DaemonState, Machine, Update, UpdateMachineBody } from './types';
 import type { DaemonRestartLifecycle } from './types';
-import { DAEMON_RESTARTING_CODE, withRestartLifecycle } from '@/daemon/restartDrainLifecycle';
+import { DAEMON_RESTARTING_CODE, withRestartLifecycle, withTerminalSurvival } from '@/daemon/restartDrainLifecycle';
+import type { TerminalSurvivalState } from '@/daemon/terminalWorker/workerHost';
 import type { DaemonSessionStateResponse } from '@/daemon/daemonSessionState';
 import {
     registerCommonHandlers,
+    type CommonHandlerOptions,
     type RecoverSessionOptions,
     type RecoverSessionResult,
     type ResumeSessionResult,
@@ -37,7 +41,8 @@ import { REMOTE_TERMINAL_DISABLED_ERROR, resolveMachineLockdownPolicy } from '..
 import { homedir } from 'node:os';
 import { encodeBase64, decodeBase64, encrypt, decrypt, tryDecrypt } from './encryption';
 import { machineKeyTerminalCipher } from '@/daemon/terminalCipher';
-import { bindTerminal, createTerminalOpenNonceGuard, decideTerminalOpen, receiveBoundTerminalFrame, type BoundTerminal } from '@/daemon/terminalBindingSession';
+import { bindTerminal, createTerminalOpenNonceGuard, inspectTerminalOpen, receiveBoundTerminalFrame, type BoundTerminal } from '@/daemon/terminalBindingSession';
+import { prepareTerminalOpen, type TerminalOpenPreparation } from '@/daemon/terminalOpenAdmission';
 import { createTerminalOutputCoalescer } from '@/daemon/terminalOutputCoalescer';
 import {
     MACHINE_RESOURCE_METRICS_RPC,
@@ -71,6 +76,7 @@ import {
     type SessionExitVerification,
 } from '@/daemon/sessionExitVerification';
 import { proxyHttp, PreviewProxyError } from '@/daemon/previewProxy';
+import { AGENT_BROWSER_CONSOLE_METHOD, forwardSealedConsoleRequest, sealedConsoleRuntimeUrl } from '@/daemon/agentBrowserSealedConsole';
 /**
  * Bound preview requests travel on their own Socket.IO event. Kept as a
  * constant so the daemon and happy-server cannot drift apart silently — a
@@ -152,7 +158,7 @@ import packageJson from '../../package.json';
 import { AUTOMATION_PROTOCOL_VERSION, AUTOMATION_SCHEDULE_KINDS, COMPANY_KEY_RESEED_CAPABILITY, COMPANY_KEY_RESEED_METHOD, PROJECT_PURGE_CAPABILITY, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, TERMINAL_BINDING_CAPABILITY, WORKSPACE_SYNC_CAPABILITY, WORKTREE_OPS_CAPABILITY, type AuthenticatedEnvelopesCapability } from '@slopus/happy-wire';
 import { stopServerProcess, StopServerError } from '@/daemon/stopServer';
 import { createPtySession } from '@/daemon/remoteTerminal';
-import { decideTerminalCwd, formatCwdFallbackBanner } from '@/daemon/decideTerminalCwd';
+import { formatCwdFallbackBanner } from '@/daemon/decideTerminalCwd';
 import { validatePath } from '@/modules/common/pathSecurity';
 import { existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -411,9 +417,10 @@ interface DaemonToServerEvents {
         expectedKeyVersion: number;
         publicKey: string;
         protocolVersion: number;
+        contextIsolationVersion: 0 | 1;
     }, cb: (answer: {
         ok: boolean;
-        value?: { keyVersion: number };
+        value?: { keyVersion: number; contextIsolationVersion?: 1; syncFromStart?: true };
         error?: string;
     }) => void) => void;
     'automation-sync': (data: { afterSeq: string; limit: number; payloadVersions?: number[] }, cb: (answer: {
@@ -432,6 +439,7 @@ interface DaemonToServerEvents {
         automationId: string;
         generation: number;
         scheduledFor: number;
+        catchUp?: true;
     }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
     'automation-run-start': (data: {
         runId: string;
@@ -442,12 +450,9 @@ interface DaemonToServerEvents {
         generation: number;
         firstMissedAt: number;
         missedCount: number;
-        failureCode: 'MISSED_OFFLINE';
+        failureCode: 'MISSED_OFFLINE' | 'MISSED_COLLAPSED';
     }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
-    'automation-run-heartbeat': (data: {
-        runId: string;
-        claimToken: string;
-    }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
+    'automation-run-heartbeat': (data: AutomationRunHeartbeatRequest, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
     'automation-conversation-deliver': (data: AutomationConversationDeliverRequest, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
     'automation-run-report': (data: PendingAutomationReport, cb: (answer: {
         ok: boolean;
@@ -808,6 +813,8 @@ export class ApiMachineClient {
     }) | null = null;
     /** aplus codexcli-daemon-restart-drain R6·R22 — current drain / pending handoff, null while running normally. */
     private restartLifecycleProvider: (() => DaemonRestartLifecycle | null) | null = null;
+    /** aplus terminal-survive-runner-restart HR4·HR10 — null while terminal workers are off. */
+    private terminalSurvivalProvider: (() => TerminalSurvivalState | null) | null = null;
     private lastKnownCLIAvailability: CLIAvailability | null = null;
     private lastKnownResumeSupport: ResumeSupport | null = null;
     // specs/20260521-happy-cli-version-republish — daemon 재시작 후 새 cli
@@ -832,8 +839,14 @@ export class ApiMachineClient {
     /** Set once the daemon can resolve projects to workspaces. */
     private lessonHosts: LessonHostSupervisor | null = null;
     private automationProtocolVersion: number = AUTOMATION_PROTOCOL_VERSION;
+    private automationContextHostReady = false;
+    private automationContextIsolationVersion: 0 | 1 = 0;
+    private automationContextReadinessEpoch = 0;
+    private readonly automationKeyRegistration = createSerialLock();
     private scriptRuntimeReadiness: ScriptRuntimeReadiness | null = null;
     private lastKnownScriptRuntimeKey: string | null = null;
+    /** specs/scheduled-missed-run-policy R14 — the last automation sync said the server honours `catchUp` claims. */
+    private automationCatchUpClaim = false;
     private persistAutomationKeyVersion: ((version: number) => void) | null = null;
     private automationServerKeyVersion: number | null = null;
     // Fail closed while server-backed ownership is unresolved. Legacy file ticks
@@ -853,6 +866,7 @@ export class ApiMachineClient {
     private readonly machineResourceService = createMachineResourceService();
     /** Remembers bound terminal opens across reconnects, so one recorded open opens one shell. */
     private readonly terminalOpenNonceGuard = createTerminalOpenNonceGuard();
+    private readonly openingTerminals = new Map<string, { cancelled: boolean }>();
     // Live raw-TCP tunnels for preview WebSocket upgrades (previewWsProxy.ts).
     private previewWsProxy: PreviewWsProxy | null = null;
     /**
@@ -996,6 +1010,9 @@ export class ApiMachineClient {
         private readonly deviceKeys?: DeviceKeys,
         private readonly deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>,
         processState: DaemonState | null = machine.daemonState,
+        withFilesystemMutation?: CommonHandlerOptions['withFilesystemMutation'],
+        private readonly admitSubprocess?: CommonHandlerOptions['admitSubprocess'],
+        private readonly reserveLegacyDispatch?: (roots: readonly string[]) => Promise<LegacyDispatchReservation>,
     ) {
         this.setupTokenAssignmentRecipient = createSetupTokenAssignmentRecipient(deviceKeys?.recipient.secretKey);
         this.processState = Object.freeze({
@@ -1048,6 +1065,8 @@ export class ApiMachineClient {
         this.allowedRoot = allowedRoot;
         this.approvedRoots = resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir);
         registerCommonHandlers(this.rpcHandlerManager, allowedRoot, {
+            ...(withFilesystemMutation ? { withFilesystemMutation } : {}),
+            ...(admitSubprocess ? { admitSubprocess } : {}),
             approvedRoots: this.approvedRoots,
             // Machine scope is the Desktop machine.run path and the only one that
             // may run managed writes; its lock is per daemon process.
@@ -1059,18 +1078,29 @@ export class ApiMachineClient {
             },
         });
         this.rpcHandlerManager.registerHandler(
-            'worktree-dependencies:reclaim', createWorktreeReclaimHandler(allowedRoot),
+            'worktree-dependencies:reclaim', createWorktreeReclaimHandler(allowedRoot, {}, undefined, withFilesystemMutation),
         );
+        // aplus-dev-studio-desktop ADR-085: the AI browser console of a strict machine, sealed end to end. Read at call
+        // time: a personal runtime Desktop sets up after sign-in exports its address into this process then. Its own
+        // nonce budget: a console polls page frames, and must not refuse the machine's other control requests.
+        this.rpcHandlerManager.registerHandler(AGENT_BROWSER_CONSOLE_METHOD,
+            params => forwardSealedConsoleRequest(params, sealedConsoleRuntimeUrl(process.env)), { customerBound: true, ownNonceBudget: true });
         // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 preview stage 2: a preview the
         // browser starts with the env the server sealed for this machine. Customer lane only.
         this.rpcHandlerManager.registerHandler(
             'spawn-with-sealed-env',
-            createSealedSpawnEnvHandler({ machine: () => this.machine, allowedRoot }),
+            createSealedSpawnEnvHandler({ machine: () => this.machine, allowedRoot,
+                ...(admitSubprocess ? { admitSubprocess } : {}),
+                ...(reserveLegacyDispatch ? { reserveLegacyDispatch } : {}),
+            }),
             { customerBound: true },
         );
         // aplus 4b-3 worktree: worktrees on a strict machine, run here from a server-issued ticket
         // and signed for the server. Customer lane only.
-        const worktreeOps = createWorktreeOpsHandlers({ machine: () => this.machine, allowedRoot, happyHomeDir: configuration.happyHomeDir });
+        const worktreeOps = createWorktreeOpsHandlers({ machine: () => this.machine, allowedRoot, happyHomeDir: configuration.happyHomeDir,
+            ...(admitSubprocess ? { admitSubprocess } : {}),
+            ...(reserveLegacyDispatch ? { reserveLegacyDispatch } : {}),
+        });
         for (const [method, handler] of Object.entries(worktreeOps)) {
             this.rpcHandlerManager.registerHandler(method, handler, { customerBound: true });
         }
@@ -2175,6 +2205,7 @@ export class ApiMachineClient {
                     { command, cwd, env },
                     {
                         fastFailDelayMs: 50,
+                        ...(this.admitSubprocess ? { admitSubprocess: this.admitSubprocess } : {}),
                         onSpawn: (child) => {
                             if (child.pid) {
                                 spawnedServers.set(child.pid, child);
@@ -2629,10 +2660,40 @@ export class ApiMachineClient {
         return this.scriptRuntimeReadiness ? { scriptRuntime: this.scriptRuntimeReadiness } : {};
     }
 
+    /**
+     * specs/scheduled-missed-run-policy R14 — Desktop offers the per-schedule missed-run choice only on this.
+     * Advertised only when this daemon runs server-backed automations against a server that accepts late
+     * `catchUp` claims; an old server ignores the field, so "run once when back" would quietly do nothing.
+     */
+    private automationMissedRunPolicyField(): { missedRunPolicy?: 1 } {
+        return this.automationServerKeyVersion !== null && this.automationCatchUpClaim ? { missedRunPolicy: 1 } : {};
+    }
+
+    private refreshAutomationCatchUpClaim(): void {
+        try {
+            this.automationCatchUpClaim = this.serverAutomationCache?.read().catchUpClaim === true;
+        } catch (error) {
+            logger.debug(`[API MACHINE] Automation cache unreadable for catch-up support: ${error}`);
+        }
+    }
+
     setAutomationKey(key: MachineAutomationKey, persistVersion: (version: number) => void, protocolVersion: number = AUTOMATION_PROTOCOL_VERSION): void {
         this.automationKey = key;
         this.automationProtocolVersion = protocolVersion;
         this.persistAutomationKeyVersion = persistVersion;
+    }
+
+    /** Trusted daemon composition, before connect. A protocol number cannot enable the private host. */
+    setAutomationContextIsolationReady(ready: boolean): void {
+        const changed = this.automationContextHostReady !== ready;
+        this.automationContextHostReady = ready;
+        if (changed) this.automationContextReadinessEpoch++;
+        if (!ready) this.automationContextIsolationVersion = 0;
+        if (changed && this.automationKey && this.socket?.connected) {
+            void this.registerAutomationKey().catch(() => {
+                logger.debug('[API MACHINE] Context host registration remains unconfirmed');
+            });
+        }
     }
 
     /**
@@ -2663,6 +2724,7 @@ export class ApiMachineClient {
 
     setServerAutomationCache(cache: ServerAutomationCache): void {
         this.serverAutomationCache = cache;
+        this.refreshAutomationCatchUpClaim();
     }
 
     shouldRunLegacyAutomationScheduler(): boolean {
@@ -3458,10 +3520,12 @@ export class ApiMachineClient {
         if (!this.serverAutomationCache || this.serverAutomationSyncInFlight) return;
         const sync = syncServerAutomationDeltas({
             cache: this.serverAutomationCache,
-            sync: (request) => this.socket.emitWithAck('automation-sync', { ...request, payloadVersions: [1, 4] }),
-            ack: (request) => this.socket.emitWithAck('automation-sync-ack', request),
+            sync: (request) => this.socket.timeout(AUTOMATION_ACK_TIMEOUT_MS).emitWithAck('automation-sync', { ...request,
+                payloadVersions: this.automationContextIsolationVersion === 1 ? [1, 4, 6] : [1, 4] }),
+            ack: (request) => this.socket.timeout(AUTOMATION_ACK_TIMEOUT_MS).emitWithAck('automation-sync-ack', request),
         }).then((result) => {
             if (result.changed > 0) logger.debug(`[API MACHINE] Applied ${result.changed} automation delta(s)`);
+            this.refreshAutomationCatchUpClaim();
         }).catch((error) => {
             logger.debug(`[API MACHINE] Automation sync failed: ${error}`);
         }).finally(() => {
@@ -3476,13 +3540,40 @@ export class ApiMachineClient {
     }
 
     private async registerAutomationKey(): Promise<void> {
+        const registered = await this.automationKeyRegistration(() => this.performAutomationKeyRegistration());
+        if (!registered || registered.readinessEpoch !== this.automationContextReadinessEpoch) return;
+        // Display metadata must not hold the authoritative key-registration queue while its ACK is lost.
+        await this.updateMachineMetadata((metadata) => ({
+            ...(metadata || {} as any),
+            automationSupport: {
+                rpcAvailable: this.automationRpcAvailable,
+                serverBacked: this.automationServerKeyVersion !== null,
+                keyVersion: this.automationServerKeyVersion ?? registered.keyVersion,
+                sessionFollowup: true,
+                conversation: true,
+                protocolVersion: this.automationProtocolVersion,
+                contextIsolationVersion: this.automationContextIsolationVersion,
+                scheduleKinds: [...AUTOMATION_SCHEDULE_KINDS],
+                delivery: 1,
+                ...this.automationMissedRunPolicyField(),
+                ...this.automationHostCommandsField(),
+                ...this.authenticatedEnvelopesField(),
+                ...this.scriptRuntimeField(),
+            },
+        }));
+    }
+
+    private async performAutomationKeyRegistration(): Promise<{ keyVersion: number; readinessEpoch: number } | undefined> {
+        const readinessEpoch = this.automationContextReadinessEpoch;
         this.automationLegacyFallbackEnabled = false;
+        this.automationContextIsolationVersion = 0;
         const key = this.automationKey;
         if (!key) return;
-        const answer = await this.socket.emitWithAck('automation-key-register', {
+        const answer = await this.socket.timeout(AUTOMATION_ACK_TIMEOUT_MS).emitWithAck('automation-key-register', {
             expectedKeyVersion: key.registeredKeyVersion,
             publicKey: Buffer.from(key.publicKey).toString('base64'),
             protocolVersion: this.automationProtocolVersion,
+            contextIsolationVersion: this.automationContextHostReady ? 1 : 0,
         });
         if (!answer.ok || !answer.value || !Number.isSafeInteger(answer.value.keyVersion)) {
             if (answer.error === 'feature-disabled') {
@@ -3498,23 +3589,18 @@ export class ApiMachineClient {
             this.automationKey = { ...key, registeredKeyVersion: keyVersion };
         }
         this.automationServerKeyVersion = keyVersion;
+        if (readinessEpoch !== this.automationContextReadinessEpoch) return;
+        if (this.automationContextHostReady && answer.value.contextIsolationVersion === 1 && answer.value.syncFromStart === true) {
+            // A previous unsupported response may already have consumed v6 tombstones. Drain that
+            // page before durably resetting, including when the previous registration ACK was lost.
+            await this.serverAutomationSyncInFlight;
+            if (readinessEpoch !== this.automationContextReadinessEpoch || !this.automationContextHostReady) return;
+            if (!this.serverAutomationCache?.resetCursor) throw new Error('AUTOMATION_CONTEXT_CACHE_UNAVAILABLE');
+            this.serverAutomationCache.resetCursor();
+            this.automationContextIsolationVersion = 1;
+        }
         this.requestServerAutomationSync();
-        await this.updateMachineMetadata((metadata) => ({
-            ...(metadata || {} as any),
-            automationSupport: {
-                rpcAvailable: this.automationRpcAvailable,
-                serverBacked: true,
-                keyVersion,
-                sessionFollowup: true,
-                conversation: true,
-                protocolVersion: this.automationProtocolVersion,
-                scheduleKinds: [...AUTOMATION_SCHEDULE_KINDS],
-                delivery: 1,
-                ...this.automationHostCommandsField(),
-                ...this.authenticatedEnvelopesField(),
-                ...this.scriptRuntimeField(),
-            },
-        }));
+        return { keyVersion, readinessEpoch };
     }
 
     private syncResumeSessionRpcRegistration(): void {
@@ -3893,12 +3979,12 @@ export class ApiMachineClient {
             this.stopSmartReconnect();
             this.reconnectAttempts = 0;
 
-            this.updateDaemonState((state) => ({
+            this.updateDaemonState((state) => withTerminalSurvival({
                 ...state,
                 status: 'running',
                 pid: process.pid,
                 ...this.processState
-            }));
+            }, this.terminalSurvivalProvider?.() ?? null));
             void this.registerAutomationKey().catch((error) => {
                 logger.debug(`[API MACHINE] Failed to register automation key: ${error}`);
             });
@@ -4028,6 +4114,8 @@ export class ApiMachineClient {
         // trial does attach it: its runtime roots every shell in the verified pty host and closes
         // terminals on drain (Desktop specs/windows-build-support W0-5h).
         if (!this.managedHandlers) this.onAcked('terminal-open-fwd', async (msg, ack) => {
+            let openingId: string | undefined;
+            let preparation: Extract<TerminalOpenPreparation, { kind: 'ready' }> | undefined;
             try {
                 const { sessionId, params } = msg || {};
                 if (!sessionId || typeof sessionId !== 'string') {
@@ -4054,16 +4142,40 @@ export class ApiMachineClient {
                 }
                 // terminal-binding-strict-design §4-2: a bound open with a terminal key is a v2
                 // terminal; the v1 open stays on compat and is refused under strict.
-                const decision = decideTerminalOpen(opened.value, {
+                const preview = inspectTerminalOpen(opened.value, {
                     machineId,
                     strict: configuration.machineControl === 'strict',
-                    nonceGuard: this.terminalOpenNonceGuard,
                 });
-                if (decision.kind === 'refused') {
-                    logger.debug(`[API MACHINE] terminal-open-fwd refused: ${decision.code}`);
-                    ack({ ok: false, error: decision.error, code: decision.code });
+                if (preview.kind === 'refused') {
+                    ack({ ok: false, error: preview.error, code: preview.code });
                     return;
                 }
+                if (this.openingTerminals.has(sessionId)) {
+                    ack({ ok: false, code: 'TERMINAL_OPEN_PENDING', error: 'Terminal opening is already pending' });
+                    return;
+                }
+                const opening = { cancelled: false };
+                this.openingTerminals.set(sessionId, opening);
+                openingId = sessionId;
+                const prepared = await prepareTerminalOpen({ opened: opened.value, machineId,
+                    strict: configuration.machineControl === 'strict', nonceGuard: this.terminalOpenNonceGuard,
+                    reserveLegacyDispatch: this.reserveLegacyDispatch, admitSubprocess: this.admitSubprocess,
+                    cwd: { allowedRoot: this.allowedRoot, homedir: homedir(), fsExists: existsSync,
+                        fsMkdir: path => { mkdirSync(path, { recursive: true }); },
+                        validate: (path, root) => validatePath(path, root, this.approvedRoots?.()) },
+                });
+                if (prepared.kind === 'refused') {
+                    ack({ ok: false, error: prepared.error, code: prepared.code });
+                    return;
+                }
+                preparation = prepared;
+                if (opening.cancelled) {
+                    await prepared.cancel();
+                    ack({ ok: false, code: 'TERMINAL_OPEN_CANCELLED', error: 'Terminal opening was cancelled' });
+                    return;
+                }
+                const { decision, cwdDecision } = prepared;
+                await prepared.submit(() => {
                 const opts: any = decision.params;
                 const auditUserId = typeof opts?.userId === 'string' ? opts.userId : 'remote-client';
                 // specs/remote-terminal-cwd-fallback/ — never let
@@ -4072,14 +4184,6 @@ export class ApiMachineClient {
                 // when safe, and falls back to homedir otherwise so the
                 // user always gets a working shell instead of node-pty's
                 // raw `chdir(2) failed.: No such file or directory`.
-                const cwdDecision = decideTerminalCwd({
-                    requested: typeof opts?.cwd === 'string' ? opts.cwd : undefined,
-                    allowedRoot: this.allowedRoot,
-                    homedir: homedir(),
-                    fsExists: existsSync,
-                    fsMkdir: (path) => mkdirSync(path, { recursive: true }),
-                    validate: (path, root) => validatePath(path, root, this.approvedRoots?.()),
-                });
                 let pty: ReturnType<typeof createPtySession>;
                 try {
                     pty = createPtySession({
@@ -4209,10 +4313,14 @@ export class ApiMachineClient {
                         ? { ...RELAY_TERMINAL_CAPS, terminalBinding: { version: 1, proof: bound.proof } }
                         : RELAY_TERMINAL_CAPS,
                 });
+                });
             } catch (e) {
                 const message = e instanceof Error ? e.message : String(e);
                 logger.debug(`[API MACHINE] terminal-open-fwd internal error: ${message}`);
                 ack({ ok: false, error: 'Internal error' });
+            } finally {
+                await preparation?.cancel();
+                if (openingId) this.openingTerminals.delete(openingId);
             }
         });
 
@@ -4312,6 +4420,8 @@ export class ApiMachineClient {
 
         this.socket.on('terminal-close-fwd', (msg) => {
             const { sessionId } = msg || {};
+            const opening = this.openingTerminals.get(sessionId);
+            if (opening) opening.cancelled = true;
             const entry = getDaemonTerminalSession(sessionId);
             if (!entry) return;
             // terminal-binding-strict-design decision b: the relay can end a terminal anyway (it can
@@ -4409,7 +4519,7 @@ export class ApiMachineClient {
             this.socket.emit('machine-alive', payload);
             const activity = this.runtimeActivityProvider?.();
             if (activity) {
-                this.updateDaemonState((state) => withRestartLifecycle({
+                this.updateDaemonState((state) => withRestartLifecycle(withTerminalSurvival({
                     ...state,
                     status: state?.status ?? 'running',
                     activity: {
@@ -4418,7 +4528,7 @@ export class ApiMachineClient {
                         ...(typeof activity.inTurnCount === 'number' ? { inTurnCount: Math.max(0, Math.floor(activity.inTurnCount)) } : {}),
                         reportedAt: Date.now(),
                     },
-                }, this.restartLifecycleProvider?.() ?? null)).catch((err) => {
+                }, this.terminalSurvivalProvider?.() ?? null), this.restartLifecycleProvider?.() ?? null)).catch((err) => {
                     logger.debug('[API MACHINE] Failed to publish runtime activity:', err);
                 });
             }
@@ -4438,7 +4548,9 @@ export class ApiMachineClient {
             const cliVersionChanged = prevCliVersion !== newCliVersion;
             const scriptRuntimeKey = this.scriptRuntimeReadiness ? scriptRuntimeReadinessKey(this.scriptRuntimeReadiness) : null;
             const automationSupportChanged = this.lastKnownAutomationRpcAvailable !== this.automationRpcAvailable
-                || this.lastKnownScriptRuntimeKey !== scriptRuntimeKey;
+                || this.lastKnownScriptRuntimeKey !== scriptRuntimeKey
+                || this.machine.metadata?.automationSupport?.contextIsolationVersion !== this.automationContextIsolationVersion
+                || this.machine.metadata?.automationSupport?.missedRunPolicy !== this.automationMissedRunPolicyField().missedRunPolicy;
             const autonomousQualityGateSupportChanged = this.lastKnownAutonomousQualityGateRpcAvailable !== this.autonomousQualityGateRpcAvailable;
             const automationServerKeyChanged = this.lastKnownAutomationServerKeyVersion !== this.automationServerKeyVersion;
             const daemonSessionStateAvailable = this.daemonSessionStateRpcAvailable && !this.managedHandlers;
@@ -4545,8 +4657,10 @@ export class ApiMachineClient {
                         sessionFollowup: true,
                 conversation: true,
                         protocolVersion: this.automationProtocolVersion,
+                        contextIsolationVersion: this.automationContextIsolationVersion,
                         // 새 종류는 서버 자동화 실행기만 계산한다(레거시 RPC 저장소는 받지 않는다).
                         ...(this.automationServerKeyVersion !== null ? { scheduleKinds: [...AUTOMATION_SCHEDULE_KINDS], delivery: 1 as const } : {}),
+                        ...this.automationMissedRunPolicyField(),
                         ...this.automationHostCommandsField(),
                         ...this.authenticatedEnvelopesField(),
                         ...this.scriptRuntimeField(),
@@ -4598,10 +4712,14 @@ export class ApiMachineClient {
         this.restartLifecycleProvider = provider;
     }
 
+    setTerminalSurvivalProvider(provider: () => TerminalSurvivalState | null): void {
+        this.terminalSurvivalProvider = provider;
+    }
+
     /** Push the drain state now instead of waiting for the next keep-alive (R6). */
     publishRestartLifecycle(): void {
         const lifecycle = this.restartLifecycleProvider?.() ?? null;
-        this.updateDaemonState((state) => withRestartLifecycle({ ...state, status: state?.status ?? 'running' }, lifecycle))
+        this.updateDaemonState((state) => withRestartLifecycle(withTerminalSurvival({ ...state, status: state?.status ?? 'running' }, this.terminalSurvivalProvider?.() ?? null), lifecycle))
             .catch((err) => logger.debug('[API MACHINE] Failed to publish restart lifecycle:', err));
     }
 
@@ -4609,8 +4727,8 @@ export class ApiMachineClient {
      * R23: close every daemon terminal before a restart, while the socket is still
      * up so each `terminal-closed` carries `reason: 'daemon-restart'`.
      */
-    async closeDaemonTerminalsForRestart(): Promise<number> {
-        const closed = await closeAllDaemonTerminalSessionsForRestart();
+    async closeDaemonTerminalsForRestart(survives?: Parameters<typeof closeAllDaemonTerminalSessionsForRestart>[0]): Promise<number> {
+        const closed = await closeAllDaemonTerminalSessionsForRestart(survives);
         // The close frames are emitted from each PTY's exit handler; give them a beat to leave.
         if (closed > 0) await new Promise((resolve) => setTimeout(resolve, 200));
         return closed;

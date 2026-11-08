@@ -613,6 +613,7 @@ describe('the Claude steer handler', () => {
                 },
                 sendSessionEvent: vi.fn(),
                 updateAgentState: vi.fn(),
+                updateMetadata: vi.fn(),
                 getMetadata: vi.fn(() => ({})),
             },
             onActiveUserInputAccepted: vi.fn(),

@@ -1,9 +1,9 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { realpathSync } from 'node:fs'
 
-import { afterAll, describe, expect, it } from 'vitest'
+import { afterAll, describe, expect, it, vi } from 'vitest'
 
 import { runAutomationScript } from './runAutomationScript'
 
@@ -16,6 +16,23 @@ afterAll(() => {
 })
 
 describe('runAutomationScript', () => {
+  it('does not submit a script when host workspace admission refuses it', async () => {
+    const marker = join(root, 'admission-marker')
+    const admitSubprocess = vi.fn(async () => { throw new Error('WORKSPACE_BUSY') })
+    const input = { command: `touch '${marker}'`, cwd: root, timeout: 5_000, allowedRoot: root, admitSubprocess }
+    const result = await runAutomationScript(input)
+    expect(admitSubprocess).toHaveBeenCalledWith([root])
+    expect(result).toEqual({ ok: false, stdout: '', error: 'WORKSPACE_BUSY' })
+    expect(existsSync(marker)).toBe(false)
+  })
+
+  it('rejects an invalid directory before requesting subprocess admission', async () => {
+    const admitSubprocess = vi.fn(async () => undefined)
+    const input = { command: 'echo should-not-run', cwd: '/', timeout: 5_000, allowedRoot: root, admitSubprocess }
+    expect((await runAutomationScript(input)).ok).toBe(false)
+    expect(admitSubprocess).not.toHaveBeenCalled()
+  })
+
   it('shouldReturnFullStdoutOnExitZero', async () => {
     const result = await runAutomationScript({
       command: 'printf "line1\\n{\\"wakeAgent\\": false}"',

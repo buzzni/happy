@@ -24,7 +24,7 @@ describe('restart drain admission wiring', () => {
         expect(source).toContain('resumeSessionAdmitted,')
         expect(source).toContain("restartRefusal('resume') ?? admittedLaunches.track(() => recoverSession(sessionId, options))")
         // Cross review H4: an admitted launch still preparing counts as activity until it settles.
-        expect(source).toContain("restartRefusal('launch') ?? admittedLaunches.track(() => spawnSession(options))")
+        expect(source).toContain("restartRefusal('launch') ?? admittedLaunches.track(() => spawnSession(options, trustedMcpContext))")
         expect(source).toContain("restartRefusal('resume') ?? admittedLaunches.track(() => resumeSession(happySessionId, options))")
         expect(body(source, 'const getRestartDrainActivity = ', 'const handOffToInstalledBundle')).toContain(') + admittedLaunches.count(),')
         const channel = body(source, 'spawnSession: (options) => spawnSessionAdmitted(options),', 'channelHost = createChannelHostSupervisor')

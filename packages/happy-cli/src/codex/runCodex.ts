@@ -1,11 +1,15 @@
 import { installCodexUserInputBoundary } from './utils/codexUserInput';
 /** Orchestrates Codex sessions, initial prompts, MCP tools and session lifecycle. */
 import type { CodexBackgroundTask } from './codexBackgroundTasks';
+import { advertiseBackgroundTaskStop, registerBackgroundTaskStopHandler } from '@/utils/backgroundTaskStop';
 import type { CodexSubagentSnapshot } from './codexSubagentTracker';
 import { SessionLaunchControl } from '../sessionDrain/sessionLaunchControl';
 import type { StandaloneLaunchBootstrap } from '../daemon/standaloneLaunchProtocol';
 import { RuntimeProducerGate } from '../sessionDrain/runtimeProducerGate';
 import { createLessonProposalTurn } from '@/utils/lessonProposalTurn';
+import { reportAutomationContextExit, type AutomationContextExitEvidence } from '@/utils/automationContextExit';
+import { createFilesystemWriteAdmission, createSubprocessWriteAdmission } from '@/utils/workspaceTurnAdmission';
+import { takeWorkspaceContextControl } from '@/utils/workspaceContextControl';
 import { CodexAuthRecovery, describeCodexAuthRecoveryFailure } from './codexAuthRecovery';
 import { render } from "ink";
 import {
@@ -114,7 +118,7 @@ import {
 import { emitReadyIfIdle } from './emitReadyIfIdle';
 import { reportAgentTaskCapacityFailure } from './reportAgentTaskCapacityFailure';
 import { enqueueCodexUserText, isCodexClearText, shouldHandleCodexClear } from './codexClearCommand';
-import { createEnvelope, type McpRuntimeServerStatus } from '@slopus/happy-wire';
+import { createEnvelope, isAutomationExecutionSessionId, type McpRuntimeServerStatus } from '@slopus/happy-wire';
 import { createManagedFollowUpHandler } from '@/managed/managedFollowUp';
 import { downloadCodexFileEventAttachment } from './utils/attachmentEvents';
 import { prepareCodexImageInputItems } from './utils/imageInput';
@@ -263,9 +267,17 @@ export async function runCodex(opts: {
     const recallProjectPath = process.cwd();
     const recallHostEnvironment = { ...process.env };
     if (standaloneLaunch && (managedStartup || opts.startedBy !== 'daemon')) throw new Error('Standalone launch requires an unmanaged daemon session');
+    const workspaceControl = takeWorkspaceContextControl();
+    if (workspaceControl && (standaloneLaunch || managedStartup || opts.startedBy !== 'daemon')) {
+        workspaceControl.close(); throw new Error('WORKSPACE_CONTROL_UNAVAILABLE');
+    }
     const launchControl = standaloneLaunch ? await SessionLaunchControl.connect(standaloneLaunch) : undefined;
     // aplus specs/org-agent-plan §6.3-2: the plan's local proxy, closed with the runner.
     let agentPlanSession: AgentPlanSession | null = null;
+    let automationExit: Parameters<typeof reportAutomationContextExit>[0] | null = null;
+    let workspaceExit: AutomationContextExitEvidence | null = null;
+    let workspaceStorageClosed = false;
+    let automationStorageConfirmed = false;
     try {
     const accountToken = opts.principal?.kind === 'account' ? opts.principal.credentials.token : null;
     if (managedStartup) {
@@ -473,6 +485,19 @@ export async function runCodex(opts: {
 
     // Handle server unreachable case - create offline stub with hot reconnection
     let session: ApiSessionClient;
+    let runtimeGate: RuntimeProducerGate | undefined;
+    const automationExecution = response !== null && isAutomationExecutionSessionId(response.id);
+    const filesystemAdmission = workspaceControl ? createFilesystemWriteAdmission({ home: configuration.happyHomeDir }) : undefined;
+    const subprocessAdmission = workspaceControl ? createSubprocessWriteAdmission({ home: configuration.happyHomeDir }) : undefined;
+    const admitSubprocess = subprocessAdmission ? (roots: readonly string[]) => runtimeGate
+        ? runtimeGate.admit(() => subprocessAdmission(roots), 'writer')
+        : Promise.reject(new Error('Runtime input is not open')) : undefined;
+    // No interactive file editor belongs to this internal run; legacy RPC paths can escape via symlinks.
+    const withFilesystemMutation = automationExecution ? <T,>(_operation: () => Promise<T>): Promise<T> =>
+        Promise.reject(new Error('AUTOMATION_FILESYSTEM_RPC_UNSUPPORTED'))
+        : workspaceControl ? <T,>(operation: () => Promise<T>): Promise<T> => runtimeGate
+        ? runtimeGate.admit(() => filesystemAdmission ? filesystemAdmission(operation) : operation(), 'writer')
+        : Promise.reject(new Error('Runtime input is not open')) : undefined;
     // Permission handler declared here so it can be updated in onSessionSwap callback
     // (assigned later at line ~385 after client setup)
     let permissionHandler: CodexPermissionHandler;
@@ -493,7 +518,10 @@ export async function runCodex(opts: {
         metadata,
         state,
         response,
-        sessionOptions: standaloneLaunch ? { trackShutdownStorage: true } : undefined,
+        sessionOptions: standaloneLaunch || workspaceControl || automationExecution ? {
+            trackShutdownStorage: true, ...(withFilesystemMutation ? { withFilesystemMutation } : {}),
+            ...(admitSubprocess ? { admitSubprocess } : {}),
+        } : undefined,
         onSessionSwap: (newSession) => {
             session = newSession;
             newSession.configureInputQueue(messageQueue, 'remote', inputEvidenceEnabled);
@@ -505,6 +533,9 @@ export async function runCodex(opts: {
             if (onSessionArchived) {
                 newSession.on('archived', onSessionArchived);
             }
+            // The handler moves with the RPC registrations; the capability lives in metadata, which an
+            // offline stub could not write (specs/agent-background-work-panel R4).
+            if (managedStartup === null) advertiseBackgroundTaskStop(newSession);
         }
     });
     session = initialSession;
@@ -551,7 +582,7 @@ export async function runCodex(opts: {
     let shouldExit = false;
     let pending: CollectedBatch<EnhancedMode> | null = null;
     // Only a launch-bound local channel can invoke drain; never a session RPC.
-    const runtimeGate = session.tracksShutdownStorage && !managedStartup ? new RuntimeProducerGate({
+    runtimeGate = session.tracksShutdownStorage && !managedStartup ? new RuntimeProducerGate({
         hasUndeliveredInput: () => pending !== null || messageQueue.size() > 0,
         canFreezeInbound: () => !reconnectionHandle && session === initialSession && session.canFreezeInboundMessagesForShutdown(),
         freezeInbound: () => session.freezeInboundMessagesForShutdown(),
@@ -1240,6 +1271,7 @@ export async function runCodex(opts: {
         hasTitle: () => session.hasTitle(),
         log: (message, detail) => logger.warn(message, detail),
     });
+    let workspaceTitleObserved = false;
     // `/btw` (Desktop specs/codexcli-side-question): an ephemeral fork on its own app-server process.
     // It reads plain data off the session client and never calls into it.
     const sideQuestion = new CodexSideQuestionBridge({
@@ -1474,6 +1506,8 @@ export async function runCodex(opts: {
         recallHost !== null,
         undefined,
         agentPlanSession?.providerArgs ?? null,
+        isAutomationExecutionSessionId(session.sessionId),
+        workspaceControl !== undefined,
     );
 
     let ingestThreadMetadata: { threadId: string; path: Promise<string | null> } | null = null;
@@ -1577,9 +1611,15 @@ export async function runCodex(opts: {
     session.rpcHandlerManager.registerHandler('codex-auth-status', async () => authRecovery.status());
     session.rpcHandlerManager.registerHandler('codex-auth-recover', async (params: Record<string, unknown>) =>
         runtimeGate?.isClosed() ? authRecovery.recover(params) : admitRpc(() => authRecovery.recover(params)));
+    // One listed background terminal (aplus-dev-studio-desktop specs/agent-background-work-panel R2). Not for a
+    // managed run: the server's managed scope does not admit this RPC name, so it is neither registered nor advertised.
+    if (managedStartup === null) {
+        registerBackgroundTaskStopHandler(session.rpcHandlerManager, (taskId) => client.terminateBackgroundTask(taskId));
+        advertiseBackgroundTaskStop(session);
+    }
     session.rpcHandlerManager.registerHandler('side-question', createCodexSideQuestionRpcHandler({
         bridge: sideQuestion,
-        isManagedRun: () => managedStartup !== null,
+        isManagedRun: () => managedStartup !== null || automationExecution,
         gate: () => runtimeGate,
         reportUsage: ({ requestId, usage, model }) => {
             try {
@@ -2100,7 +2140,7 @@ export async function runCodex(opts: {
                 currentRequestId: codexCurrentRequestId,
                 providerTurnToProtocol: codexProviderTurnToProtocol,
             };
-            const mapped = mapCodexMcpMessageToSessionEnvelopes(msg, turnState, inputEvidenceEnabled);
+            const mapped = mapCodexMcpMessageToSessionEnvelopes(msg, turnState, inputEvidenceEnabled, isAutomationExecutionSessionId(session.sessionId));
             if (mapped.envelopes.some(envelope => envelope.ev.t === 'turn-start' || envelope.ev.t === 'turn-end')) dispatchedWithoutStart = false;
             codexPendingRequestId = turnState.pendingRequestId ?? null;
             codexCurrentRequestId = turnState.currentRequestId ?? null;
@@ -2422,16 +2462,22 @@ export async function runCodex(opts: {
             );
         };
 
-        if (standaloneLaunch) {
+        if (standaloneLaunch || workspaceControl) {
             if (!runtimeGate) throw new Error('Standalone runtime storage gate unavailable');
-            const provider = scopeLaunch ? {
+            const provider = scopeLaunch || workspaceControl ? {
                 freezeInputForShutdown: () => !thinking && !pending && messageQueue.size() === 0 && client.freezeInputForShutdown(),
                 interruptTurn: () => client.interruptTurn(),
-                endInputAndAwaitExit: (budget: number, signal?: AbortSignal) => client.endInputAndAwaitExit(budget, signal),
+                endInputAndAwaitExit: async (budget: number, signal?: AbortSignal) => {
+                    if (!workspaceControl) return client.endInputAndAwaitExit(budget, signal);
+                    const native = await client.finishWorkspaceContext(budget);
+                    workspaceExit = { ...native, writeProducersDrained: false };
+                    return native.foregroundDrained && native.backgroundDrained && native.providerExitedCleanly
+                        ? { exited: true, code: 0, signal: null } : { exited: false, code: null, signal: null };
+                },
                 waitForOutputDrain: () => client.waitForOutputDrain(), cancelOutputDrain: () => client.cancelOutputDrain(),
                 finishShutdownObservation: () => client.finishShutdownObservation(),
             } : client;
-            const storage = scopeLaunch ? {
+            const storage = scopeLaunch || workspaceControl ? {
                 tracksShutdownStorage: session.tracksShutdownStorage,
                 flushForShutdown: async (budget: number, signal?: AbortSignal) => {
                     const proof = await session.flushForShutdown(budget, signal);
@@ -2440,7 +2486,9 @@ export async function runCodex(opts: {
                 },
                 isStorageConfirmationCurrent: (proof: Parameters<typeof session.isStorageConfirmationCurrent>[0]) => session.isStorageConfirmationCurrent(proof),
             } : session;
-            launchControl!.bind(provider, storage, runtimeGate);
+            if (workspaceControl) workspaceControl.bind({ provider, storage, runtime: runtimeGate,
+                prepareWorkspaceDrain: async signal => !signal.aborted && await client.canDrainWorkspace() });
+            else launchControl!.bind(provider, storage, runtimeGate);
         }
 
         while (!shouldExit) {
@@ -2853,6 +2901,10 @@ export async function runCodex(opts: {
                         ...(lessonRecall?.outcome === 'selected' ? { lessonBlock: lessonRecall.block } : {}),
                         ...(memoryRecall?.reason === 'context_returned' ? { memoryBlock: buildCodexMemoryReferenceBlock(memoryRecall.context) } : {}),
                     });
+                    if ((workspaceControl || automationExecution) && runtimeGate && !workspaceTitleObserved && offTurnTitle.covers()) {
+                        workspaceTitleObserved = true;
+                        void runtimeGate.admit(() => offTurnTitle.settled(), 'writer').catch(() => logger.warn('[workspace-context] Title writer unconfirmed'));
+                    }
                     // The worker awaited after the permit was granted. Keep consumption at
                     // the synchronous dispatch boundary so channel cancellation still wins.
                     if (!isCurrentCapacityContinuation(message.mode)) { lessonProposalTurn.cancel(); continue; }
@@ -3169,6 +3221,18 @@ export async function runCodex(opts: {
             await Promise.all([...pendingMemoryIngest]);
             await closeMemoryIngest();
             await reportManagedStop();
+            if (isAutomationExecutionSessionId(session.sessionId)) {
+                let native = { foregroundDrained: false, backgroundDrained: false, providerExitedCleanly: false };
+                try { native = await client.finishAutomationContext(10_000); }
+                catch { logger.warn('[automation-context] Native writer exit unconfirmed'); }
+                automationExit = { sessionId: session.sessionId, provider: 'codex', evidence: { ...native, writeProducersDrained: false } };
+            }
+            if (workspaceControl && !workspaceExit) {
+                let native = { foregroundDrained: false, backgroundDrained: false, providerExitedCleanly: false };
+                try { native = await client.finishWorkspaceContext(10_000); }
+                catch { logger.warn('[workspace-context] Native writer exit unconfirmed'); }
+                workspaceExit = { ...native, writeProducersDrained: false };
+            }
             /*
              * The bridge points at this run's loop. Left registered, a stop
              * arriving later would be applied to a loop that has ended, or handed
@@ -3191,9 +3255,14 @@ export async function runCodex(opts: {
                 logger.debug('[codex]: flush begin');
                 await session.flush();
                 logger.debug('[codex]: flush done');
+                if (automationExecution) {
+                    const proof = await session.flushForShutdown(10_000);
+                    automationStorageConfirmed = proof.stored && session.isStorageConfirmationCurrent(proof);
+                }
                 logger.debug('[codex]: session.close begin');
                 await session.close();
                 logger.debug('[codex]: session.close done');
+                workspaceStorageClosed = true;
             } catch (e) {
                 logger.debug('[codex]: Error while closing session', e);
             }
@@ -3202,7 +3271,8 @@ export async function runCodex(opts: {
             await client.disconnect();
             // Closes the project store this session opened. Its own catch: memory
             // cleanup must not be the thing that fails a shutdown.
-            await lessonSession?.close().catch(() => undefined);
+            let lessonClosed = true;
+            await lessonSession?.close().catch(() => { lessonClosed = false; });
             await checkpointComposition.dispose?.();
             logger.debug('[codex]: client.disconnect done');
             // Stop Happy MCP server
@@ -3230,16 +3300,30 @@ export async function runCodex(opts: {
             messageBuffer.clear();
 
             logActiveHandles('cleanup-end');
+            if (automationExit) automationExit.evidence.writeProducersDrained = lessonClosed && workspaceStorageClosed && automationStorageConfirmed;
+            if (workspaceExit) workspaceExit.writeProducersDrained = lessonClosed && workspaceStorageClosed
+                && !!runtimeGate && !runtimeGate.hasLiveProducers() && !runtimeGate.isShutdownBlocked();
             logger.debug('[codex]: Final cleanup completed');
         } finally {
             clearInterval(keepAliveInterval);
             stopCallerGrantRefresh();
             stopCallerGrantExpiryNotice();
             if (!loopExitRecorded) runtimeGate?.loopExited();
+            if (automationExit) automationExit.evidence.writeProducersDrained &&= !!runtimeGate
+                && !runtimeGate.hasLiveProducers() && !runtimeGate.isShutdownBlocked();
         }
     }
     } finally {
         launchControl?.close();
-        await agentPlanSession?.close().catch(() => undefined);
+        await agentPlanSession?.close().catch(() => {
+            if (automationExit) automationExit.evidence.writeProducersDrained = false;
+            if (workspaceExit) workspaceExit.writeProducersDrained = false;
+        });
+        if (automationExit) await reportAutomationContextExit(automationExit);
+        if (workspaceControl) {
+            try { await workspaceControl.reportExit(workspaceExit ?? { foregroundDrained: false, backgroundDrained: false,
+                providerExitedCleanly: false, writeProducersDrained: false }); }
+            finally { workspaceControl.close(); }
+        }
     }
 }

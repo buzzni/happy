@@ -320,6 +320,7 @@ model Machine {
     automationPublicKey Bytes?
     automationKeyVersion Int       @default(0)
     automationProtocolVersion Int  @default(1)
+    automationContextIsolationVersion Int @default(0)
     automations        Automation[] @relation("AutomationTargetMachine")
 
     executionBindings SessionExecutionBinding[]
@@ -540,6 +541,11 @@ enum AutomationChangeKind {
     TOMBSTONE
 }
 
+enum AutomationRunKind {
+    SCHEDULED
+    QUESTION
+}
+
 enum AutomationRunStatus {
     CLAIMED
     RUNNING
@@ -591,7 +597,10 @@ model Automation {
     legacyDesiredPaused     Boolean?
     createdAt          DateTime  @default(now())
     updatedAt          DateTime  @updatedAt
+    /// Persistent history head; no FK so pruned runs are unavailable, never an empty history.
+    lastExecutionRunId String?
     runs               AutomationRun[]
+    executionQuestions AutomationExecutionQuestion[]
     scriptRevisions    ScriptAutomationRevision[]
     scriptKeys         ScriptAutomationKeyEpoch[]
     scriptInvocations  ScriptInvocation[]
@@ -623,9 +632,12 @@ model AutomationChange {
 // A run row is both the atomic execution claim and the shared run history.
 model AutomationRun {
     id                String                @id @default(cuid())
+    kind              AutomationRunKind     @default(SCHEDULED)
     automationId      String
     automation        Automation            @relation(fields: [automationId], references: [id], onDelete: Cascade)
     generation        Int
+    /// Immutable claim-time version; null denotes a run created before this snapshot existed.
+    executionPayloadVersion Int?
     scheduledFor      DateTime
     machineAccountId  String
     machineId         String
@@ -635,9 +647,18 @@ model AutomationRun {
     runLeaseExpiresAt DateTime?
     reportId          String?               @unique
     sessionId         String?
+    /// Immutable result destination for isolated execution; sessionId owns the provider run.
+    displaySessionId  String?
+    executionCreateBodyHash String?
+    executionSeedMetadata String?
+    /// Machine-attested quiescence, independent of scheduler dispatch completion.
+    executionExitReceipt Json?
+    previousExecutionRunId String?
     outcome           AutomationRunOutcome?
     detailCiphertext  Bytes?
     failureCode       String?
+    /// Bounded public waiting state; cleared when the scheduler claim becomes terminal.
+    holdCode          String?
     degradedCode      String?
     // Slots one missed-run row stands for (scheduled-missed-run-policy); null on ordinary runs.
     missedCount       Int?
@@ -652,9 +673,34 @@ model AutomationRun {
     createdAt         DateTime              @default(now())
     updatedAt         DateTime              @updatedAt
 
-    @@unique([automationId, generation, scheduledFor])
+    // The SCHEDULED-only unique slot is maintained by a partial index in the migration.
+    @@index([automationId, generation, scheduledFor])
     @@index([automationId, status])
     @@index([machineAccountId, machineId, status])
+    @@index([displaySessionId, createdAt])
+}
+
+// Explicit one-off followups have their own immutable encrypted input and idempotency identity.
+// Source runs may be pruned: retaining the source ID must produce unavailable, never another source.
+model AutomationExecutionQuestion {
+    id String @id
+    requestedByAccountId String
+    automationId String
+    automation Automation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+    sourceRunId String
+    generation Int
+    revision Int
+    displaySessionId String
+    machineAccountId String
+    machineId String
+    encrypted Json
+    requestHash String
+    holdCode String?
+    runId String? @unique
+    cancelledAt DateTime?
+    createdAt DateTime @default(now())
+
+    @@index([machineAccountId, machineId, createdAt, id], map: "AutomationExecutionQuestion_machine_fifo")
 }
 
 model ScriptArtifact {

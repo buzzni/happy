@@ -409,6 +409,19 @@ describe('bound customer-lane requests', () => {
         expect(calls).toBe(1);
     });
 
+    // aplus-dev-studio-desktop ADR-085: a polling console must not spend the nonces other control RPCs need.
+    it('keeps a method with its own nonce budget from exhausting the shared customer-bound one', async () => {
+        const { manager } = makeBound(true, undefined, 1);
+        let console = 0, control = 0;
+        manager.registerHandler('console', () => { console++; return {}; }, { customerBound: true, ownNonceBudget: true });
+        manager.registerHandler('control', () => { control++; return {}; }, { customerBound: true });
+        await send(manager, 'console', bound('console', {}, { nonce: nonce(70) }));
+        expect(await send(manager, 'console', bound('console', {}, { nonce: nonce(71) }))).toMatchObject({ result: { code: 'RPC_TOO_MANY_REQUESTS' } });
+        await send(manager, 'control', bound('control', {}, { nonce: nonce(72) }));
+        expect(await send(manager, 'console', bound('console', {}, { nonce: nonce(70) }))).toMatchObject({ result: { code: 'RPC_REQUEST_REPLAYED' } });
+        expect([console, control]).toEqual([1, 1]);
+    });
+
     it('runs the handler with the bound params and binds the reply to the nonce', async () => {
         const { manager, calls } = makeBound();
         expect(await send(manager, 'readFile', bound('readFile', { path: '/w/a' }, { nonce: nonce(2) })))

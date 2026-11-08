@@ -8,6 +8,7 @@ import {
     createTerminalOpenNonceGuard,
     decideTerminalOpen,
     receiveBoundTerminalFrame,
+    restoreBoundTerminal,
     TERMINAL_IN_REORDER_MAX_HELD,
     TERMINAL_IN_REORDER_WINDOW_MS,
 } from './terminalBindingSession';
@@ -142,6 +143,21 @@ describe('bindTerminal', () => {
         expect(terminal.openAttach(sealIn(params, opened.daemonNonce, { seq: 9, kind: 'input', data: 'x' }))).toEqual({ kind: 'unreadable' });
         // Input after it continues from the attach's seq.
         expect(terminal.openIn(sealIn(params, opened.daemonNonce, { seq: 4, kind: 'input', data: 'x' })).kind).toBe('frames');
+    });
+
+    it('restores from its exported state with the same keys and input position (a daemon adopting it)', () => {
+        const { params, terminal, opened } = bind();
+        const input = (seq: number) => sealIn(params, opened.daemonNonce, { seq, kind: 'input', data: `k${seq}` });
+        expect(terminal.openIn(input(1)).kind).toBe('frames');
+        expect(terminal.openIn(input(2)).kind).toBe('frames');
+        const state = terminal.exportState();
+        expect(state).toEqual({ terminalId: params.terminalId, terminalKey: params.terminalKey, daemonNonce: opened.daemonNonce, lastInSeq: 2 });
+
+        const restored = restoreBoundTerminal({ sessionId, state });
+        expect(restored.openIn(input(2))).toEqual({ kind: 'replayed' });
+        expect(restored.openIn(input(3)).kind).toBe('frames');
+        const sealed = restored.sealOut({ kind: 'output', seq: 9, data: 'x' });
+        expect(decryptWithDataKey(decodeBase64(sealed), frameKey(params, opened.daemonNonce, 'out'))).toMatchObject({ seq: 9, data: 'x' });
     });
 
     it('does not open frames sealed for another direction, terminal or open', () => {

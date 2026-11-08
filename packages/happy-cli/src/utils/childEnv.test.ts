@@ -258,6 +258,14 @@ describe('organization agent plan proxy key', () => {
     })
 })
 
+
+it('never inherits a private workspace control identity into another session or a native tool child', () => {
+    const env = { HAPPY_WORKSPACE_CONTEXT_CONTROL_V1: 'owned-root', SAFE: 'kept' }
+    expect(sanitizeChildEnv(env)).toEqual({ SAFE: 'kept' })
+    expect(sanitizeChildEnv(env, { boundary: 'in-session' })).toEqual({ SAFE: 'kept' })
+    expect(env.HAPPY_WORKSPACE_CONTEXT_CONTROL_V1).toBe('owned-root')
+})
+
 describe('upstream session-scoped keys (specs/cli-plugin-dir-and-env-scrub R5-b)', () => {
     // upstream daemon/sessionEnvironment.ts scrubs these by exact name; here each one sits under a prefix entry.
     const foreign = {

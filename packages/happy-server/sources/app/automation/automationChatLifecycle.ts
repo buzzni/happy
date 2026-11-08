@@ -39,7 +39,7 @@ export async function transitionChatAutomations(tx: Tx, accountId: string, proje
     if (row.payloadVersion !== 3 && row.machineAccountId && row.machineId) await appendChange(tx, updated, { machineAccountId: row.machineAccountId, machineId: row.machineId }, state === 'deleted' ? 'TOMBSTONE' : 'UPSERT');
   }
   const ids = rows.map(row => row.id);
-  await tx.automationRun.updateMany({ where: { automationId: { in: ids }, status: { in: ['CLAIMED', 'RUNNING'] } }, data: { status: 'CANCELLED', completedAt: now, failureCode: state === 'deleted' ? 'CHAT_DELETED' : 'CHAT_ARCHIVED' } });
+  await tx.automationRun.updateMany({ where: { automationId: { in: ids }, status: { in: ['CLAIMED', 'RUNNING'] } }, data: { status: 'CANCELLED', completedAt: now, holdCode: null, failureCode: state === 'deleted' ? 'CHAT_DELETED' : 'CHAT_ARCHIVED' } });
   await tx.scriptInvocation.updateMany({ where: { automationId: { in: ids }, status: { in: ['QUEUED', 'CLAIMED'] } }, data: { status: 'CANCELLED', completedAt: now.getTime() } });
   if (state === 'deleted') await tx.scriptInvocation.updateMany({ where: { automationId: { in: ids }, status: 'RUNNING' }, data: { cancelRequestedAt: now.getTime() } });
   return readChatAutomationImpact(tx, accountId, projectId);

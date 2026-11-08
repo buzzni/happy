@@ -53,6 +53,16 @@ describe('exchangeAutomationMcpCallerGrant', () => {
     )
   })
 
+  it('carries the original question display and directory into grant exchange without putting them in a URL', async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response(JSON.stringify({ grant: null, projectId: 'chat:c1',
+      bindingStatus: 'BOUND', connectorPolicy: 'optional', requiredConnectors: [] }), { status: 200 }))
+    vi.stubGlobal('fetch', fetch)
+    expect(await exchangeAutomationMcpCallerGrant({ configUrl: 'https://studio.test/api/me/mcp-config', machineToken: 'machine-token',
+      machineId: 'm1', runId: 'question1', claimToken: 'claim', conversationSessionId: 'old-display', conversationDirectory: '/work/chat' })).toHaveProperty('ok', true)
+    expect(fetch).toHaveBeenCalledWith('https://studio.test/api/automation/mcp-caller-grant', expect.objectContaining({
+      body: JSON.stringify({ machineId: 'm1', runId: 'question1', claimToken: 'claim', conversationSessionId: 'old-display', conversationDirectory: '/work/chat' }) }))
+  })
+
   // specs/agent-browser-shared-profiles — on a shared Agent Browser machine Studio adds the session-user
   // attestation of the run's principal, so the run uses that user's browser profile.
   it("carries Studio's session-user attestation for the run, and drops a malformed one", async () => {

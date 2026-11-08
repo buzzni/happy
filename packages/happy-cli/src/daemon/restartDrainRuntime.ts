@@ -22,6 +22,7 @@ import {
 import { buildRestartLifecycle } from './restartDrainLifecycle'
 import { appendRestartDrainOutcome, buildRestartDrainOutcomeRecord } from './restartDrainOutcomes'
 import type { RestartDrainControlPort } from './restartDrainRoutes'
+import type { TerminalSurvivalDecision } from './terminalWorker/survivalDecision'
 
 export type ForceHandoffResult =
     | { ok: true; deadlineAt: number }
@@ -34,7 +35,10 @@ export interface DaemonRestartDrainRuntimeInput {
     /** Close/reopen spawn·resume admission and pause/resume the automation runners. */
     closeAdmission: (deadlineAt: number) => void
     reopenAdmission: () => void
-    closeTerminalsForRestart: () => Promise<number>
+    /** `view` is the ready drain whose terminals are closing — its intent and reason decide what survives. */
+    closeTerminalsForRestart: (view: RestartDrainView) => Promise<number>
+    /** aplus terminal-survive-runner-restart HR3: what a drain would do with worker terminals; null when workers are off. */
+    terminalSurvival?: (view: RestartDrainView) => TerminalSurvivalDecision | null
     /** Can the installed bundle start a daemon? Run before a self-started handoff. */
     preflightReplacement: () => Promise<boolean>
     /** Tear this daemon down and start the installed bundle's daemon. */
@@ -119,7 +123,7 @@ export function createDaemonRestartDrainRuntime(input: DaemonRestartDrainRuntime
         finalizing ??= (async () => {
             let closed = 0
             try {
-                closed = await input.closeTerminalsForRestart()
+                closed = await input.closeTerminalsForRestart(settlement.view)
             } catch (error) {
                 input.log(`[RESTART_DRAIN] closing terminals failed: ${(error as Error)?.message ?? 'unknown'}`)
             }
@@ -180,7 +184,10 @@ export function createDaemonRestartDrainRuntime(input: DaemonRestartDrainRuntime
         finalizeReady,
         isAdmissionClosed: () => controller.isAdmissionClosed(),
         pendingHandoff: () => pendingHandoff,
-        lifecycle: (): DaemonRestartLifecycle => buildRestartLifecycle(controller.current(), pendingHandoff),
+        lifecycle: (): DaemonRestartLifecycle => {
+            const view = controller.current()
+            return buildRestartLifecycle(view, pendingHandoff, view ? input.terminalSurvival?.(view) ?? null : null)
+        },
 
         /**
          * One heartbeat of the bundle handoff (R4·R25), before this beat's automation

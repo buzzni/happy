@@ -49,9 +49,11 @@ import { mergeUsageLimits } from "./utils/usageLimits";
 import { getAskUserQuestionToolCallIds } from "./utils/questionNotification";
 import { cleanupStdinAfterInk } from "@/utils/terminalStdinCleanup";
 import type { ContentBlockParam } from '@anthropic-ai/sdk/resources';
-import { createEnvelope, type McpRuntimeServerStatus } from '@slopus/happy-wire';
+import { createEnvelope, isAutomationExecutionSessionId, type McpRuntimeServerStatus } from '@slopus/happy-wire';
 import type { McpRuntimeRecovery } from './mcpRuntimeRecovery';
 import { registerMcpReconnectHandler } from './registerMcpReconnectHandler';
+import { createClaudeBackgroundTaskDetails } from './claudeBackgroundTaskDetails';
+import { advertiseBackgroundTaskStop, registerBackgroundTaskStopHandler } from '@/utils/backgroundTaskStop';
 import { publishClaudePromptSuggestion } from './promptSuggestionMetadata';
 import { createStreamDeltaRelay } from './streamDeltaRelay';
 import { contextUsageBreakdownRequestItem, contextUsageSignalItem, withContextUsageSignals, type ClaudeControlRequest } from './claudeContextUsage';
@@ -91,6 +93,8 @@ const usageLimitsQueries = new WeakMap<object, number>();
 
 export async function claudeRemoteLauncher(session: Session): Promise<'switch' | 'exit'> {
     logger.debug('[claudeRemoteLauncher] Starting remote launcher');
+    const isolatedAutomation = isAutomationExecutionSessionId(session.client.sessionId);
+    const observeWorkspaceExit = isolatedAutomation || session.standaloneDrain?.workspaceExitObservation === true;
 
     // Survives generation restarts within this session; see the call below.
     const lessonObservations = createLessonTurnObservations();
@@ -288,6 +292,18 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         () => mcpController,
         () => mcpStatusReader,
     );
+    // Stops one listed background task through the live query (specs/agent-background-work-panel R2). Not for a
+    // managed run: the server's managed scope does not admit this RPC name, so it is neither registered nor advertised.
+    let stopBackgroundTask: ((taskId: string) => Promise<void>) | null = null;
+    if (!session.managedRun) {
+        registerBackgroundTaskStopHandler(session.client.rpcHandlerManager, async (taskId) => {
+            if (!backgroundTasks?.available || !backgroundTasks.tasks?.some(task => task.taskId === taskId)) return 'not_found';
+            if (!stopBackgroundTask) return 'unavailable';
+            await stopBackgroundTask(taskId);
+            return 'requested';
+        });
+        advertiseBackgroundTaskStop(session.client);
+    }
 
     // Drop any permission requests left over in agent state from a
     // previous CLI process that died while a tool prompt was open. The
@@ -631,6 +647,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         });
     };
     let backgroundTasks: NonNullable<Metadata['claudeBackgroundTasks']> | undefined;
+    const backgroundTaskDetails = createClaudeBackgroundTaskDetails();
     function publishBackgroundTasks(next: NonNullable<Metadata['claudeBackgroundTasks']>) {
         backgroundTasks = next;
         session.client.updateMetadata(current => ({ ...current, claudeBackgroundTasks: next }));
@@ -666,14 +683,15 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 available: true,
                 // REPLACE, including empty: edge bookends can arrive out of
                 // order and must never resurrect a task removed by this list.
-                tasks: message.tasks.filter(task => !task.ambient).map(task => ({
-                    taskId: task.task_id,
-                    label: task.description,
-                    kind: task.task_type.includes('bash') ? 'shell' : 'agent',
-                })),
+                tasks: backgroundTaskDetails.list(message.tasks.filter(task => !task.ambient)),
             });
             if (!message.tasks.some(task => !task.ambient) && ongoingToolCalls.size === 0) queueCapacity(() => capacity.idle());
             return;
+        }
+        // The command of a task already listed (its `task_started` usually follows the list).
+        const commandKnown = backgroundTaskDetails.observe(message);
+        if (commandKnown && backgroundTasks?.tasks?.some(task => task.taskId === commandKnown && !task.command)) {
+            publishBackgroundTasks({ ...backgroundTasks, tasks: backgroundTaskDetails.withCommands(backgroundTasks.tasks) });
         }
 
 
@@ -949,7 +967,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
              * actually starts.
              */
             const proof = generationProofs.begin((onStarted) => (
-                session.managedRun || drain || runningAuthority() ? createProviderExitObserver(() => { onStarted(); capacity.providerStarted(); }) : null
+                session.managedRun || drain || isolatedAutomation || runningAuthority() ? createProviderExitObserver(() => { onStarted(); capacity.providerStarted(); }) : null
             ));
             const sdkExit = proof?.observer ?? null;
             messageBuffer.addMessage('═'.repeat(40), 'status');
@@ -1074,6 +1092,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     managedSettingsLockdown: session.managedSettingsLockdown,
                     personalClaudeAuth: personalFallback?.identity() ? { oauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? '' } : undefined,
                     managedRun: session.managedRun,
+                    workspaceExitObservation: session.standaloneDrain?.workspaceExitObservation,
+                    onWorkspaceReadinessReady: reader => session.standaloneDrain?.setWorkspaceReadiness(reader),
                     /*
                      * A fresh observer for **this** generation.
                      *
@@ -1083,6 +1103,14 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                      * process and gets a different observer.
                      */
                     ...(sdkExit ? { providerExitObserver: sdkExit } : {}),
+                    ...(observeWorkspaceExit ? { onAutomationContextExit: (evidence: NonNullable<Session['automationContextExitEvidence']>) => {
+                        const previous = session.automationContextExitEvidence;
+                        session.automationContextExitEvidence = {
+                            foregroundDrained: (previous?.foregroundDrained ?? true) && evidence.foregroundDrained,
+                            backgroundDrained: (previous?.backgroundDrained ?? true) && evidence.backgroundDrained,
+                            providerExitedCleanly: (previous?.providerExitedCleanly ?? true) && evidence.providerExitedCleanly,
+                        };
+                    } } : {}),
                     /*
                      * `completeTurn` and `exitAfterFirstTurn` return without
                      * ever calling `nextMessage`, so the exhaustion they do
@@ -1514,6 +1542,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     },
                     onQueryReady: (q) => {
                         drain?.setQuery({ interrupt: q.interrupt });
+                        stopBackgroundTask = q.stopTask;
                         permissionHandler.setPermissionModeUpdater(async (mode) => {
                             await q.setPermissionMode(mode);
                         });
@@ -1712,6 +1741,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 logger.debug('[remote]: launch done');
                 // This generation is gone; no turn of it can still be running.
                 drain?.setQuery(null);
+                stopBackgroundTask = null;
                 drain?.turnEnded();
                 permissionHandler.reset(undefined, 'generation-ended');
                 modeHash = null;

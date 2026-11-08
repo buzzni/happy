@@ -25,6 +25,8 @@ import { startServerProcess, StartServerError } from './startServer';
 import { stopServerProcess, StopServerError } from './stopServer';
 import { BrowserBridge, BridgeRequestError } from './browserBridge';
 import { attachTerminalWsRoute, type TerminalRouteMachine as TerminalMachineEncryption } from './controlServerTerminalWs';
+import type { AdoptedWorkerTerminal, TerminalWorkerHost } from './terminalWorker/workerHost';
+import type { TerminalOpenAdmissionInput } from './terminalOpenAdmission';
 import { scopeErrorCode } from './sessionWriteScopeErrors';
 import type { SessionWriteScopeRuntime } from './sessionWriteScopeRuntime';
 import { SetupTokenActivitySchema } from '@slopus/happy-wire';
@@ -121,7 +123,14 @@ export function startDaemonControlServer({
   getDeviceEnrollment = () => null,
   getSetupTokenAccountSwitch = () => null,
   getCallerLaunches = () => null,
+  admitSubprocess,
+  reserveLegacyDispatch,
+  terminalWorkers,
 }: {
+  admitSubprocess?: (roots: readonly string[]) => Promise<void>;
+  /** aplus terminal-survive-runner-restart — terminal workers for the direct terminal route. */
+  terminalWorkers?: TerminalWorkerHost;
+  reserveLegacyDispatch?: TerminalOpenAdmissionInput['reserveLegacyDispatch'];
   sessionRetention?: SessionRetention;
   /** T1c-b2 H2 owner-contact launch bootstrap; null while the rollout switch is off. */
   getCallerLaunches?: () => { issue(raw: unknown): Promise<unknown>; current(raw: unknown): Promise<{ current: boolean }> } | null;
@@ -175,7 +184,7 @@ export function startDaemonControlServer({
    */
   verifyManagedReport?: (input: ManagedReportClaim) =>
     Promise<{ ok: true } | { ok: false; reason: string }>;
-}): Promise<{ port: number; stop: () => Promise<void>; controlSecret: string }> {
+}): Promise<{ port: number; stop: () => Promise<void>; controlSecret: string; adoptTerminals: (terminals: AdoptedWorkerTerminal[]) => void }> {
   return new Promise((resolve) => {
     const app = fastify({
       logger: false // We use our own logger
@@ -312,6 +321,9 @@ export function startDaemonControlServer({
       allowedRoot,
       approvedRoots,
       getMachineEncryption,
+      ...(admitSubprocess ? { admitSubprocess } : {}),
+      ...(reserveLegacyDispatch ? { reserveLegacyDispatch } : {}),
+      ...(terminalWorkers ? { terminalWorkers } : {}),
     });
 
     // Set up Zod type provider
@@ -884,6 +896,7 @@ export function startDaemonControlServer({
     }, async (request, reply) => {
       try {
         const result = await startServerProcess(request.body, {
+          ...(admitSubprocess ? { admitSubprocess } : {}),
           // Give Node's ChildProcess 'error' event (ENOENT) time to fire
           // before we claim success. Matches the web-ui handler's
           // setImmediate+error-once pattern.
@@ -1148,6 +1161,11 @@ export function startDaemonControlServer({
       resolve({
         port,
         controlSecret,
+        // No route (a managed runtime) means nobody to hand them to: they close.
+        adoptTerminals: (terminals) => {
+          if (terminalWs) terminalWs.adopt(terminals);
+          else for (const { session } of terminals) void session.terminate().finally(() => session.forget());
+        },
         stop: async () => {
           logger.debug('[CONTROL SERVER] Stopping server');
           await terminalWs?.close();

@@ -6,7 +6,7 @@ import type { DeviceKeys } from '@/daemon/deviceKeys';
 import axios from 'axios'
 import { logger } from '@/ui/logger'
 import type { AgentState, CreateSessionResponse, Metadata, Session, Machine, MachineMetadata, DaemonState } from '@/api/types'
-import { ApiSessionClient } from './apiSession';
+import { ApiSessionClient, type ApiSessionClientOptions } from './apiSession';
 import { ApiMachineClient } from './apiMachine';
 import { decodeBase64, encodeBase64, getRandomBytes, encrypt, decrypt, wrapDataEncryptionKey, buildMachineKeyEnvelopes } from './encryption';
 import { PushNotificationClient } from './pushNotifications';
@@ -16,6 +16,8 @@ import { Credentials } from '@/persistence';
 import { connectionState, isNetworkError, isConnectivityError, connectionErrorCode } from '@/utils/serverConnectionErrors';
 import { applySessionUrlEnv } from '@/utils/sessionUrlEnv';
 import type { ManagedAttachment } from '@/managed/managedSessionAttach';
+import type { CommonHandlerOptions } from '@/modules/common/registerCommonHandlers';
+import type { LegacyDispatchReservation } from '@/utils/workspaceTurnAdmission';
 
 /**
  * Who this client is.
@@ -691,9 +693,11 @@ export class ApiClient {
     }
   }
 
-  sessionSyncClient(session: Session, options: { trackShutdownStorage?: boolean } = {}): ApiSessionClient {
+  sessionSyncClient(session: Session, options: ApiSessionClientOptions = {}): ApiSessionClient {
     if (this.principal.kind === 'managed-session') {
       if (options.trackShutdownStorage) throw new Error('Standalone storage tracking is not a managed runtime capability');
+      if (options.withFilesystemMutation) throw new Error('Host filesystem admission is not a managed runtime capability');
+      if (options.admitSubprocess) throw new Error('Host subprocess admission is not a managed runtime capability');
       applySessionUrlEnv(process.env, session.id, configuration.webappUrl);
       // The explicit mode, never inferred: it decides whether redirects are
       // followed and which origin may see this bearer.
@@ -711,8 +715,12 @@ export class ApiClient {
     return new ApiSessionClient(this.bearer(), session, undefined, options);
   }
 
-  machineSyncClient(machine: Machine, deviceKeys?: DeviceKeys, deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>, processState?: DaemonState): ApiMachineClient {
-    return new ApiMachineClient(this.bearer(), machine, deviceKeys, deviceEnrollment, processState);
+  machineSyncClient(machine: Machine, deviceKeys?: DeviceKeys, deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>, processState?: DaemonState,
+    withFilesystemMutation?: CommonHandlerOptions['withFilesystemMutation'], admitSubprocess?: CommonHandlerOptions['admitSubprocess'],
+    reserveLegacyDispatch?: (roots: readonly string[]) => Promise<LegacyDispatchReservation>): ApiMachineClient {
+    return withFilesystemMutation || admitSubprocess || reserveLegacyDispatch
+      ? new ApiMachineClient(this.bearer(), machine, deviceKeys, deviceEnrollment, processState, withFilesystemMutation, admitSubprocess, reserveLegacyDispatch)
+      : new ApiMachineClient(this.bearer(), machine, deviceKeys, deviceEnrollment, processState);
   }
 
   /**

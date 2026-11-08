@@ -157,6 +157,46 @@ export const automationDeliverySchema = z.object({
 });
 export type AutomationDelivery = z.infer<typeof automationDeliverySchema>;
 
+export const AUTOMATION_CONTEXT_INPUT_MAX_BYTES = 64 * 1024;
+export const AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES = 16 * 1024;
+export const AUTOMATION_EXECUTION_SESSION_PREFIX = 'automation-run:';
+export function automationExecutionSessionId(runId: string): string {
+  return AUTOMATION_EXECUTION_SESSION_PREFIX + z.string().regex(/^[A-Za-z0-9_-]{1,160}$/).parse(runId);
+}
+/** A visibility namespace, never an authorization check. Only the server mints these IDs. */
+export function isAutomationExecutionSessionId(sessionId: unknown): sessionId is string {
+  return typeof sessionId === 'string' && sessionId.startsWith(AUTOMATION_EXECUTION_SESSION_PREFIX);
+}
+
+export const automationContextPolicySchema = z.object({
+  kind: z.literal('isolated'),
+  reference: z.discriminatedUnion('kind', [z.strictObject({
+    kind: z.literal('previous-result'),
+    maxBytes: z.number().int().min(1).max(AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES),
+  }), z.strictObject({
+    kind: z.literal('memo'), memoId: z.string().uuid(), revision: z.number().int().positive(),
+    title: z.string().min(1).max(120).refine(text => text.trim().length > 0),
+    text: z.string().min(1).max(AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES)
+      .refine(text => text.trim().length > 0 && new TextEncoder().encode(text).byteLength <= AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES),
+    maxBytes: z.number().int().min(1).max(AUTOMATION_CONTEXT_REFERENCE_MAX_BYTES),
+  })]).nullable(),
+}).strict();
+export type AutomationContextPolicy = z.infer<typeof automationContextPolicySchema>;
+
+export const automationExecutionQuestionIdentitySchema = z.strictObject({ requestId: z.string().uuid(),
+  sourceRunId: z.string().regex(/^[A-Za-z0-9_-]{1,160}$/) }).refine(value => value.requestId !== value.sourceRunId);
+export type AutomationExecutionQuestionIdentity = z.infer<typeof automationExecutionQuestionIdentitySchema>;
+
+/**
+ * aplus-dev-studio specs/scheduled-missed-run-policy R10~R14 — what the daemon does with slots it missed
+ * while the machine was off or asleep. Absent and 'default' keep the current rule (missed slots are
+ * recorded, never run); 'skip' is the same today but stays put if the default ever changes;
+ * 'catch_up_once' runs the latest missed slot once when the machine is back. Older daemons strip the key.
+ */
+export const AUTOMATION_MISSED_RUN_POLICIES = ['default', 'catch_up_once', 'skip'] as const;
+export const automationMissedRunPolicySchema = z.enum(AUTOMATION_MISSED_RUN_POLICIES);
+export type AutomationMissedRunPolicy = z.infer<typeof automationMissedRunPolicySchema>;
+
 export const automationPayloadSchema = z.object({
   name: z.string().trim().min(1).max(200),
   schedule: automationScheduleSchema,
@@ -171,10 +211,24 @@ export const automationPayloadSchema = z.object({
   effort: z.string().nullable().optional(),
   githubTrigger: githubTriggerSchema.optional(),
   conversation: z.object({ sessionId: z.string().trim().min(1).max(200) }).optional(),
+  contextPolicy: automationContextPolicySchema.optional(),
+  executionQuestion: automationExecutionQuestionIdentitySchema.optional(),
   // A delivery this daemon cannot read is dropped, never a reason to skip the run itself.
   delivery: automationDeliverySchema.optional().catch(undefined),
+  // A value this daemon does not know falls back to the default rule instead of refusing the automation.
+  missedRunPolicy: automationMissedRunPolicySchema.optional().catch(undefined),
   seal: automationSealSchema.optional(),
 }).superRefine((payload, context) => {
+  if (payload.executionQuestion && payload.contextPolicy?.reference?.kind !== 'previous-result') {
+    context.addIssue({ code: 'custom', path: ['executionQuestion'], message: 'a question must reference its selected result in a fresh context' });
+  }
+  if (payload.contextPolicy && new TextEncoder().encode(payload.prompt).byteLength > AUTOMATION_CONTEXT_INPUT_MAX_BYTES) {
+    context.addIssue({ code: 'custom', path: ['prompt'], message: 'isolated context input exceeds its byte budget' });
+  }
+  if (payload.contextPolicy && (!payload.conversation || payload.githubTrigger || payload.scriptCommand !== null
+    || (payload.agent !== 'claude' && payload.agent !== 'codex'))) {
+    context.addIssue({ code: 'custom', path: ['contextPolicy'], message: 'isolated context requires a Claude/Codex conversation without code or GitHub execution' });
+  }
   if (payload.conversation && payload.githubTrigger) context.addIssue({ code: 'custom', path: ['conversation'], message: 'conversation delivery cannot use GitHub triggers' });
   const isGithubSchedule = payload.schedule.kind === 'github';
   if (isGithubSchedule !== (payload.githubTrigger !== undefined)) {
@@ -195,7 +249,7 @@ export const automationPublicSchema = z.object({
   machineId: z.string().min(1).nullable(),
   revision: positiveInteger,
   generation: positiveInteger,
-  payloadVersion: z.union([z.literal(1), z.literal(4)]),
+  payloadVersion: z.union([z.literal(1), z.literal(4), z.literal(6)]),
   payloadCiphertext: payloadCiphertextSchema,
   viewerKeyId: z.string().min(1).max(128),
   viewerKeyVersion: positiveInteger,
@@ -219,6 +273,7 @@ export const automationTargetSchema = z.object({
   viewerPublicKey: publicKeySchema.nullable(),
   viewerKeyVersion: z.number().int().min(0),
   automationProtocolVersion: positiveInteger.default(1),
+  contextIsolationVersion: z.union([z.literal(0), z.literal(1)]).default(0),
   sessionFollowupSupported: z.boolean().default(false),
 });
 export type AutomationTarget = z.infer<typeof automationTargetSchema>;
@@ -227,6 +282,22 @@ export const automationRunStatusSchema = z.enum([
   'CLAIMED', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED', 'EXPIRED', 'ABANDONED',
 ]);
 export const automationRunOutcomeSchema = z.enum(['WOKE', 'SILENT', 'SKIPPED_GATE', 'ERROR', 'NO_CHANGE']);
+/** Public state codes only; provider/HTTP diagnostics and task text never enter run history. */
+export const automationExecutionHoldCodeSchema = z.enum([
+  'WORKSPACE_BUSY', 'WORKSPACE_OWNER_UNCONFIRMED', 'WORKSPACE_REGISTRY_BUSY',
+  'AUTOMATION_REFERENCE_UNAVAILABLE', 'AUTOMATION_REFERENCE_UNCONFIRMED',
+  'AUTOMATION_REFERENCE_TOO_LARGE', 'AUTOMATION_REFERENCE_CHANGED',
+  'AUTOMATION_INPUT_TOO_LARGE',
+  'AUTOMATION_AUTHORIZATION_UNCONFIRMED', 'AUTOMATION_START_UNCONFIRMED', 'AUTOMATION_HOLD_UNCONFIRMED',
+]);
+export type AutomationExecutionHoldCode = z.infer<typeof automationExecutionHoldCodeSchema>;
+export const automationRunHeartbeatRequestSchema = z.object({
+  runId: z.string().min(1).max(160),
+  claimToken: z.string().min(1).max(256),
+  // Omission preserves state; explicit null clears a previous hold.
+  holdCode: automationExecutionHoldCodeSchema.nullable().optional(),
+});
+export type AutomationRunHeartbeatRequest = z.infer<typeof automationRunHeartbeatRequestSchema>;
 export const automationRunSchema = z.object({
   id: z.string().min(1),
   automationId: z.string().min(1),
@@ -238,6 +309,7 @@ export const automationRunSchema = z.object({
   outcome: automationRunOutcomeSchema.nullable(),
   detailCiphertext: base64Schema(PAYLOAD_MAX_BYTES).nullable(),
   failureCode: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/).nullable().optional(),
+  holdCode: automationExecutionHoldCodeSchema.nullable().optional(),
   degradedCode: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/).nullable().optional(),
   queueDepth: z.number().int().min(0).max(10_000).nullable().optional(),
   queuePosition: z.number().int().min(0).max(10_000).nullable().optional(),
@@ -251,7 +323,7 @@ export const automationRunSchema = z.object({
 export type AutomationRun = z.infer<typeof automationRunSchema>;
 
 export const automationEncryptedFieldsSchema = z.object({
-  payloadVersion: z.union([z.literal(1), z.literal(4)]),
+  payloadVersion: z.union([z.literal(1), z.literal(4), z.literal(6)]),
   payloadCiphertext: payloadCiphertextSchema,
   viewerKeyId: z.string().min(1).max(128),
   viewerKeyVersion: positiveInteger,
@@ -260,6 +332,18 @@ export const automationEncryptedFieldsSchema = z.object({
   machineKeyEnvelope: machineEnvelopeSchema,
 });
 export type AutomationEncryptedFields = z.infer<typeof automationEncryptedFieldsSchema>;
+
+/** One explicit question about an immutable run; never a definition update or a scheduled run-now. */
+export const automationExecutionQuestionRequestSchema = z.strictObject({
+  ...automationExecutionQuestionIdentitySchema.shape,
+  expectedRevision: positiveInteger, generation: positiveInteger,
+  displaySessionId: z.string().min(1).max(200).refine(id => !isAutomationExecutionSessionId(id)),
+  encrypted: automationEncryptedFieldsSchema.extend({ payloadVersion: z.literal(6) }).strict(),
+}).refine(value => value.requestId !== value.sourceRunId);
+export type AutomationExecutionQuestionRequest = z.infer<typeof automationExecutionQuestionRequestSchema>;
+export function automationExecutionQuestionBindingId(requestId: string): string {
+  return `automation-question:${z.string().uuid().parse(requestId)}`;
+}
 
 export const automationCreateRequestSchema = automationEncryptedFieldsSchema.extend({ paused: z.boolean().default(false) });
 export type AutomationCreateRequest = z.input<typeof automationCreateRequestSchema>;
@@ -280,7 +364,7 @@ export interface AutomationAdoption {
 export const automationUpdateRequestSchema = z.object({
   expectedRevision: positiveInteger,
   paused: z.boolean().optional(),
-  payloadVersion: z.union([z.literal(1), z.literal(4)]).optional(),
+  payloadVersion: z.union([z.literal(1), z.literal(4), z.literal(6)]).optional(),
   payloadCiphertext: payloadCiphertextSchema.optional(),
   viewerKeyId: z.string().min(1).max(128).optional(),
   viewerKeyVersion: positiveInteger.optional(),
@@ -358,7 +442,7 @@ export async function encryptAutomationPayload(input: {
   const plaintext = new TextEncoder().encode(JSON.stringify(payload));
   const ciphertext = versioned(input.crypto.secretBoxSeal(plaintext, dek));
   const result = {
-    payloadVersion: payload.conversation ? 4 as const : 1 as const,
+    payloadVersion: payload.contextPolicy ? 6 as const : payload.conversation ? 4 as const : 1 as const,
     payloadCiphertext: input.crypto.encodeBase64(ciphertext),
     viewerKeyId: input.crypto.encodeBase64(await input.crypto.sha256(input.viewer.publicKey), true),
     viewerKeyVersion: input.viewer.keyVersion,
@@ -394,16 +478,17 @@ function sealMachineKey(input: {
  * Whether to trust the sender, and what to check in `seal`, is the caller's.
  */
 export function openAutomationPayloadForMachine(input: {
-  payloadVersion: 1 | 4;
+  payloadVersion: 1 | 4 | 6;
   payloadCiphertext: string;
   machineKeyEnvelope: string;
   recipientSecretKey: Uint8Array;
   crypto: AutomationCryptoAdapter;
+  questionIdentity?: AutomationExecutionQuestionIdentity;
 }): MachinePayloadOpening<AutomationPayload> {
   let ciphertext: Uint8Array;
   let envelope: Uint8Array;
   try {
-    if ((input.payloadVersion !== 1 && input.payloadVersion !== 4) || input.recipientSecretKey.length !== 32) return { ok: false, reason: 'malformed' };
+    if (![1, 4, 6].includes(input.payloadVersion) || input.recipientSecretKey.length !== 32) return { ok: false, reason: 'malformed' };
     ciphertext = input.crypto.decodeBase64(input.payloadCiphertext);
     envelope = input.crypto.decodeBase64(input.machineKeyEnvelope);
   } catch {
@@ -424,7 +509,9 @@ export function openAutomationPayloadForMachine(input: {
     const plaintext = input.crypto.secretBoxOpen(ciphertext.slice(1), opened.key);
     if (!plaintext) return { ok: false, reason: 'malformed' };
     const payload = automationPayloadSchema.safeParse(JSON.parse(new TextDecoder().decode(plaintext)));
-    if (!payload.success || (input.payloadVersion === 4) !== !!payload.data.conversation) return { ok: false, reason: 'malformed' };
+    if (!payload.success || input.payloadVersion !== (payload.data.contextPolicy ? 6 : payload.data.conversation ? 4 : 1)) return { ok: false, reason: 'malformed' };
+    if (payload.data.executionQuestion?.requestId !== input.questionIdentity?.requestId
+      || payload.data.executionQuestion?.sourceRunId !== input.questionIdentity?.sourceRunId) return { ok: false, reason: 'malformed' };
     return { ok: true, payload: payload.data, authentication: opened.authentication };
   } catch {
     return { ok: false, reason: 'malformed' };
@@ -434,14 +521,14 @@ export function openAutomationPayloadForMachine(input: {
 }
 
 export async function decryptAutomationPayload(input: {
-  payloadVersion: 1 | 4;
+  payloadVersion: 1 | 4 | 6;
   payloadCiphertext: string;
   keyEnvelope: string;
   recipientSecretKey: Uint8Array;
   crypto: AutomationCryptoAdapter;
 }): Promise<AutomationPayload> {
   try {
-    if ((input.payloadVersion !== 1 && input.payloadVersion !== 4) || input.recipientSecretKey.length !== 32) throw new Error();
+    if (![1, 4, 6].includes(input.payloadVersion) || input.recipientSecretKey.length !== 32) throw new Error();
     const encryptedDek = openVersioned(input.keyEnvelope, input.crypto, ENVELOPE_BYTES);
     const dek = input.crypto.boxOpen(encryptedDek, input.recipientSecretKey);
     if (!dek || dek.length !== 32) throw new Error();
@@ -449,7 +536,7 @@ export async function decryptAutomationPayload(input: {
     const plaintext = input.crypto.secretBoxOpen(encryptedPayload, dek);
     if (!plaintext) throw new Error();
     const payload = automationPayloadSchema.parse(JSON.parse(new TextDecoder().decode(plaintext)));
-    if ((input.payloadVersion === 4) !== !!payload.conversation) throw new Error();
+    if (input.payloadVersion !== (payload.contextPolicy ? 6 : payload.conversation ? 4 : 1)) throw new Error();
     return payload;
   } catch {
     throw new Error('automation-decrypt-failed');

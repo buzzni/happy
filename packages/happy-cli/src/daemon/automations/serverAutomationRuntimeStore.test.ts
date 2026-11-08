@@ -42,6 +42,14 @@ describe('serverAutomationRuntimeStore', () => {
     expect(createServerAutomationRuntimeStore({ filePath: file }).read().schedules[0]).toMatchObject({ deferredRunRequestAt: 900 })
   })
 
+  it('keeps a held once admission occurrence across reload without turning it into an offline miss', () => {
+    const store = createServerAutomationRuntimeStore({ filePath: file })
+    const schedule = { automationId: 'automation-1', generation: 2, nextRunAt: 900, lastSessionId: null,
+      contextAdmissionDeferred: { revision: 3, scheduledFor: 900 } }
+    store.write({ schedules: [schedule], pendingReports: [] })
+    expect(createServerAutomationRuntimeStore({ filePath: file }).read().schedules[0]).toEqual(schedule)
+  })
+
   it('atomically persists schedule state and pending idempotent reports as owner-only', () => {
     const store = createServerAutomationRuntimeStore({ filePath: file })
     store.write({
@@ -153,4 +161,13 @@ describe('serverAutomationRuntimeStore', () => {
     expect(readdirSync(dir)).toEqual(['server-automation-runtime.v1.json'])
     if (process.platform !== 'win32') expect(statSync(file).mode & 0o777).toBe(0o600)
   })
+
+  it('preserves an unconsumed once claim reconfirmation across runtime restart', () => {
+    const store = createServerAutomationRuntimeStore({ filePath: file })
+    const schedule = { automationId: 'a1', generation: 2, nextRunAt: 100, lastSessionId: null,
+      contextAdmissionHold: { code: 'CLAIM_RECONFIRMATION_REQUIRED' as const, revision: 3, scheduledFor: 100 } }
+    store.write({ schedules: [schedule], pendingReports: [] })
+    expect(createServerAutomationRuntimeStore({ filePath: file }).read().schedules[0]).toMatchObject(schedule)
+  })
+
 })

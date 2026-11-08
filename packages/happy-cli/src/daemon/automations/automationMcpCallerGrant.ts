@@ -67,6 +67,8 @@ export async function exchangeAutomationMcpCallerGrant(input: {
   machineId: string
   runId: string
   claimToken: string
+  conversationSessionId?: string
+  conversationDirectory?: string
   logDebug?: (message: string) => void
 }): Promise<AutomationMcpCallerGrantResult> {
   if (!input.configUrl) {
@@ -94,6 +96,8 @@ export async function exchangeAutomationMcpCallerGrant(input: {
         machineId: input.machineId,
         runId: input.runId,
         claimToken: input.claimToken,
+        ...(input.conversationSessionId !== undefined ? { conversationSessionId: input.conversationSessionId } : {}),
+        ...(input.conversationDirectory !== undefined ? { conversationDirectory: input.conversationDirectory } : {}),
       }),
       signal: controller.signal,
     })

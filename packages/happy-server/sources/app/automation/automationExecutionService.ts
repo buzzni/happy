@@ -1,7 +1,8 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { Prisma, type AutomationRunOutcome, type Prisma as PrismaTypes } from '@prisma/client';
-import { AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION } from '@slopus/happy-wire';
+import { AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION, automationExecutionSessionId, isAutomationExecutionSessionId, automationRunHeartbeatRequestSchema, automationExecutionQuestionBindingId } from '@slopus/happy-wire';
 import { invalidateSessionFollowups } from './sessionFollowupInvalidationService';
+import { readAutomationExecutionQuestionForRun } from './automationExecutionQuestionAdmission';
 
 type Tx = PrismaTypes.TransactionClient;
 type Binary = Uint8Array<ArrayBuffer>;
@@ -16,6 +17,7 @@ export type AutomationExecutionError =
     | 'claim-cancelled'
     | 'claim-expired'
     | 'run-not-running'
+    | 'invalid-heartbeat'
     | 'report-conflict';
 
 type Result<T> = { ok: true; value: T } | { ok: false; error: AutomationExecutionError };
@@ -28,25 +30,29 @@ export async function registerAutomationMachineKey(
     tx: Tx,
     accountId: string,
     machineId: string,
-    input: { expectedKeyVersion: number; publicKey: Binary; protocolVersion: number },
-): Promise<Result<{ keyVersion: number; invalidatedProjectIds: string[]; targetChanged: boolean }>> {
+    input: { expectedKeyVersion: number; publicKey: Binary; protocolVersion: number; contextIsolationVersion?: 0 | 1 },
+): Promise<Result<{ keyVersion: number; invalidatedProjectIds: string[]; targetChanged: boolean; contextIsolationVersion?: 1; syncFromStart?: true }>> {
+    // Repeat on every registration: an earlier ACK may have been lost after capability was committed.
+    const contextSync = input.contextIsolationVersion === 1 ? { contextIsolationVersion: 1 as const, syncFromStart: true as const } : {};
     const current = await tx.machine.findFirst({
         where: { id: machineId, accountId },
         select: {
             automationPublicKey: true,
             automationKeyVersion: true,
             automationProtocolVersion: true,
+            automationContextIsolationVersion: true,
         },
     });
     if (current?.automationPublicKey
         && Buffer.from(current.automationPublicKey).equals(Buffer.from(input.publicKey))) {
         // 데몬은 재접속마다 같은 키를 다시 등록한다. 키도 프로토콜도 그대로면 target 은
         // 바뀌지 않았으므로 호출자가 계정 전체 무효화를 보내지 않게 알린다.
-        const protocolChanged = current.automationProtocolVersion !== input.protocolVersion;
+        const protocolChanged = current.automationProtocolVersion !== input.protocolVersion
+            || (current.automationContextIsolationVersion ?? 0) !== (input.contextIsolationVersion ?? 0);
         if (protocolChanged) {
             const changed = await tx.machine.updateMany({
                 where: { id: machineId, accountId, automationKeyVersion: current.automationKeyVersion },
-                data: { automationProtocolVersion: input.protocolVersion },
+                data: { automationProtocolVersion: input.protocolVersion, automationContextIsolationVersion: input.contextIsolationVersion ?? 0 },
             });
             if (changed.count === 0) return { ok: false, error: 'key-version-conflict' };
         }
@@ -63,6 +69,7 @@ export async function registerAutomationMachineKey(
                 keyVersion: current.automationKeyVersion,
                 invalidatedProjectIds: [...new Set(invalidated.map((followup) => followup.projectId as string))],
                 targetChanged: protocolChanged,
+                ...contextSync,
             },
         };
     }
@@ -72,6 +79,7 @@ export async function registerAutomationMachineKey(
             automationPublicKey: input.publicKey,
             automationKeyVersion: { increment: 1 },
             automationProtocolVersion: input.protocolVersion,
+            automationContextIsolationVersion: input.contextIsolationVersion ?? 0,
         },
     });
     if (changed.count === 0) return { ok: false, error: 'key-version-conflict' };
@@ -86,6 +94,7 @@ export async function registerAutomationMachineKey(
             keyVersion: input.expectedKeyVersion + 1,
             invalidatedProjectIds: [...new Set(invalidated.map((followup) => followup.projectId as string))],
             targetChanged: true,
+            ...contextSync,
         },
     };
 }
@@ -96,7 +105,7 @@ export async function syncAutomations(
     machineId: string,
     input: { afterSeq: bigint; limit: number; payloadVersions?: number[] },
     now: Date = new Date(),
-): Promise<Result<{ serverTime: Date; nextSeq: bigint; changes: Array<Record<string, unknown>>; missedRunRecord: 1 }>> {
+): Promise<Result<{ serverTime: Date; nextSeq: bigint; changes: Array<Record<string, unknown>>; missedRunRecord: 1; catchUpClaim: 1 }>> {
     const rows = await tx.automationChange.findMany({
         where: { machineAccountId: accountId, machineId, seq: { gt: input.afterSeq } },
         orderBy: { seq: 'asc' },
@@ -105,7 +114,11 @@ export async function syncAutomations(
     const changes: Array<Record<string, unknown>> = [];
     // Only codecs the daemon advertises (v1 always). Legacy monitor v2, retired native v5 and unknown versions
     // are tombstoned: an UPSERT the daemon cache rejects would stall that machine's sync cursor.
-    const supportsPayload = (version: number) => version === 1 || ((version === 2 || version === 4) && !!input.payloadVersions?.includes(version));
+    const isolatedMachine = input.payloadVersions?.includes(6) ? await tx.machine.findFirst({
+        where: { id: machineId, accountId }, select: { automationContextIsolationVersion: true },
+    }) : null;
+    const supportsPayload = (version: number) => version === 1 || ((version === 2 || version === 4
+        || version === 6 && isolatedMachine?.automationContextIsolationVersion === 1) && !!input.payloadVersions?.includes(version));
     for (const change of rows) {
         if (change.kind === 'TOMBSTONE') {
             const deleted = await tx.automation.findFirst({ where: { id: change.automationId, machineAccountId: accountId, machineId }, include: { project: true } });
@@ -154,6 +167,9 @@ export async function syncAutomations(
             // Tells the daemon this server records missed slots (`automation-missed-record`).
             // An old server never acks that event, so the daemon must not wait on it there.
             missedRunRecord: 1,
+            // Tells the daemon this server honours `catchUp` on a claim. An old server ignores the
+            // field and denies the late slot, so the daemon only offers the policy where it works.
+            catchUpClaim: 1,
         },
     };
 }
@@ -205,7 +221,8 @@ export async function ackAutomationSync(
 
 function executable(automation: any, accountId: string, machineId: string, generation: number): boolean {
     return automation
-        && [1, 2, 4].includes(automation.payloadVersion)
+        && ([1, 2, 4].includes(automation.payloadVersion)
+            || automation.payloadVersion === 6 && automation.targetMachine?.automationContextIsolationVersion === 1)
         && automation.machineAccountId === accountId
         && automation.machineId === machineId
         && automation.generation === generation
@@ -217,23 +234,34 @@ function executable(automation: any, accountId: string, machineId: string, gener
 }
 
 const AUTOMATION_RUN_NOW_MAX_AGE_MS = 15 * 60_000;
+/**
+ * aplus-dev-studio specs/scheduled-missed-run-policy R11·R13 — how late an opted-in "run once when
+ * back" claim may be. The policy lives in the encrypted payload, so the server cannot check it;
+ * this bound, enabledAt, the generation and the slot fence are what keep a late claim honest.
+ */
+export const AUTOMATION_CATCH_UP_MAX_AGE_MS = 8 * 24 * 60 * 60_000;
+
+function inRegularWindow(scheduledFor: Date, now: Date): boolean {
+    return scheduledFor.getTime() >= now.getTime() - 90_000 && scheduledFor.getTime() <= now.getTime() + 15_000;
+}
 
 export async function claimAutomationRun(
     tx: Tx,
     accountId: string,
     machineId: string,
-    input: { automationId: string; generation: number; scheduledFor: Date },
+    input: { automationId: string; generation: number; scheduledFor: Date; catchUp?: boolean },
     now: Date = new Date(),
 ): Promise<Result<{ runId: string; claimToken: string; claimExpiresAt: Date; serverTime: Date; projectId: string }>> {
     const automation = await tx.automation.findFirst({
         where: { id: input.automationId, machineAccountId: accountId, machineId, deletedAt: null },
         include: {
             project: { select: { automationViewerKeyVersion: true } },
-            targetMachine: { select: { automationKeyVersion: true } },
+            targetMachine: { select: { automationKeyVersion: true, automationContextIsolationVersion: true } },
         },
     });
-    const inClaimWindow = input.scheduledFor.getTime() >= now.getTime() - 90_000
-        && input.scheduledFor.getTime() <= now.getTime() + 15_000;
+    const inClaimWindow = input.catchUp === true
+        ? input.scheduledFor.getTime() >= now.getTime() - AUTOMATION_CATCH_UP_MAX_AGE_MS && input.scheduledFor.getTime() <= now.getTime() + 15_000
+        : inRegularWindow(input.scheduledFor, now);
     const durableRunNowRequest = automation?.runRequestedAt?.getTime() === input.scheduledFor.getTime()
         && input.scheduledFor.getTime() >= now.getTime() - AUTOMATION_RUN_NOW_MAX_AGE_MS;
     if (!inClaimWindow && !durableRunNowRequest) return { ok: false, error: 'claim-denied' };
@@ -241,14 +269,24 @@ export async function claimAutomationRun(
         || input.scheduledFor < automation.enabledAt) {
         return { ok: false, error: 'claim-denied' };
     }
+    // A slot only the widened window admits must belong to this generation: a pause, resume or edit bumps the
+    // generation but keeps enabledAt, so without this a slot that passed while paused could still run (R7).
+    if (input.catchUp === true && !inRegularWindow(input.scheduledFor, now) && !durableRunNowRequest) {
+        const generationStart = await tx.automationChange.findFirst({
+            where: { automationId: automation.id, generation: input.generation },
+            orderBy: { seq: 'asc' },
+            select: { createdAt: true },
+        });
+        if (!generationStart || input.scheduledFor < generationStart.createdAt) return { ok: false, error: 'claim-denied' };
+    }
 
     await tx.automationRun.updateMany({
         where: { automationId: input.automationId, status: 'CLAIMED', claimExpiresAt: { lt: now } },
-        data: { status: 'EXPIRED', completedAt: now },
+        data: { status: 'EXPIRED', completedAt: now, holdCode: null },
     });
     await tx.automationRun.updateMany({
         where: { automationId: input.automationId, status: 'RUNNING', runLeaseExpiresAt: { lt: now } },
-        data: { status: 'ABANDONED', completedAt: now },
+        data: { status: 'ABANDONED', completedAt: now, holdCode: null },
     });
 
     const claimToken = randomBytes(32).toString('base64url');
@@ -259,6 +297,7 @@ export async function claimAutomationRun(
             id: runId,
             automationId: automation.id,
             generation: input.generation,
+            executionPayloadVersion: automation.payloadVersion,
             scheduledFor: input.scheduledFor,
             machineAccountId: accountId,
             machineId,
@@ -274,6 +313,7 @@ export async function claimAutomationRun(
                 automationId: automation.id,
                 generation: input.generation,
                 scheduledFor: input.scheduledFor,
+                kind: 'SCHEDULED',
             },
             select: { id: true },
         });
@@ -320,7 +360,7 @@ export async function recordMissedAutomationRuns(
         where: { id: input.automationId, machineAccountId: accountId, machineId, deletedAt: null },
         include: {
             project: { select: { automationViewerKeyVersion: true } },
-            targetMachine: { select: { automationKeyVersion: true } },
+            targetMachine: { select: { automationKeyVersion: true, automationContextIsolationVersion: true } },
         },
     });
     if (!automation || !executable(automation, accountId, machineId, input.generation)
@@ -350,7 +390,7 @@ export async function recordMissedAutomationRuns(
         return { ok: true, value: { runId, idempotent: false, countRaised: false, projectId: automation.projectId } };
     }
     const sameSlot = await tx.automationRun.findFirst({
-        where: { automationId: automation.id, generation: input.generation, scheduledFor: input.firstMissedAt },
+        where: { automationId: automation.id, generation: input.generation, scheduledFor: input.firstMissedAt, kind: 'SCHEDULED' },
         select: { id: true, failureCode: true, missedCount: true },
     });
     if (!sameSlot) return { ok: false, error: 'report-conflict' };
@@ -368,17 +408,18 @@ export async function recordMissedAutomationRuns(
 }
 
 async function claimedRun(tx: Tx, accountId: string, machineId: string, runId: string, claimToken: string) {
-    return tx.automationRun.findFirst({
+    const run = await tx.automationRun.findFirst({
         where: { id: runId, machineAccountId: accountId, machineId, claimTokenHash: tokenHash(claimToken) },
         include: {
             automation: {
                 include: {
                     project: { select: { automationViewerKeyVersion: true } },
-                    targetMachine: { select: { automationKeyVersion: true } },
+                    targetMachine: { select: { automationKeyVersion: true, automationContextIsolationVersion: true } },
                 },
             },
         },
     });
+    return run ? { ...run, executionQuestion: await readAutomationExecutionQuestionForRun(tx, run) } : null;
 }
 
 export async function startAutomationRun(
@@ -392,11 +433,11 @@ export async function startAutomationRun(
     if (!run) return { ok: false, error: 'claim-not-found' };
     if (run.status !== 'CLAIMED') return { ok: false, error: 'claim-cancelled' };
     if (run.claimExpiresAt < now) {
-        await tx.automationRun.updateMany({ where: { id: run.id, status: 'CLAIMED' }, data: { status: 'EXPIRED', completedAt: now } });
+        await tx.automationRun.updateMany({ where: { id: run.id, status: 'CLAIMED' }, data: { status: 'EXPIRED', completedAt: now, holdCode: null } });
         return { ok: false, error: 'claim-expired' };
     }
-    if (!executable(run.automation, accountId, machineId, run.generation)) {
-        await tx.automationRun.updateMany({ where: { id: run.id, status: 'CLAIMED' }, data: { status: 'CANCELLED', completedAt: now } });
+    if (run.kind === 'QUESTION' ? !run.executionQuestion : !executable(run.automation, accountId, machineId, run.generation)) {
+        await tx.automationRun.updateMany({ where: { id: run.id, status: 'CLAIMED' }, data: { status: 'CANCELLED', completedAt: now, holdCode: null } });
         return { ok: false, error: 'claim-cancelled' };
     }
     const runLeaseExpiresAt = new Date(now.getTime() + 5 * 60_000);
@@ -413,7 +454,7 @@ export async function resolveAutomationRunMcpContext(
     tx: Tx,
     accountId: string,
     machineId: string,
-    input: { runId: string; claimToken: string; sessionId?: string },
+    input: { runId: string; claimToken: string; sessionId?: string; executionAdmission?: true; questionProtocol?: 1 },
     now: Date = new Date(),
 ): Promise<Result<{
     automationId: string;
@@ -421,12 +462,25 @@ export async function resolveAutomationRunMcpContext(
     projectId: string;
     machineId: string;
     runLeaseExpiresAt: number | null;
+    questionRequestId?: string;
+    questionDisplaySessionId?: string;
+    executionBindingId?: string;
+    executionAdmission?: { payloadVersion: 6; generation: number; revision: number; machineAccountId: string };
 }>> {
     const run = await claimedRun(tx, accountId, machineId, input.runId, input.claimToken);
     if (!run) return { ok: false, error: 'claim-not-found' };
+    if (run.kind === 'QUESTION' && (!run.executionQuestion || input.questionProtocol !== 1)) return { ok: false, error: 'claim-cancelled' };
     const activelyRunning = run.status === 'RUNNING'
         && run.runLeaseExpiresAt !== null
         && run.runLeaseExpiresAt >= now;
+    const a = run.automation;
+    if (input.executionAdmission && (!activelyRunning || input.sessionId || a.payloadVersion !== 6
+        || a.generation !== run.generation || a.paused && !run.executionQuestion || a.deletedAt || a.legacyMigrationPending
+        || a.machineAccountId !== accountId || a.machineId !== machineId
+        || a.machineKeyVersion !== a.targetMachine?.automationKeyVersion
+        || a.viewerKeyVersion !== a.project.automationViewerKeyVersion)) {
+        return { ok: false, error: 'claim-cancelled' };
+    }
     if (input.sessionId) {
         const terminalSessionMatch = run.status === 'COMPLETED'
             && run.reportId !== null
@@ -446,10 +500,14 @@ export async function resolveAutomationRunMcpContext(
         ok: true,
         value: {
             automationId: run.automationId,
-            ownerAccountId: run.automation.ownerAccountId,
+            ownerAccountId: run.executionQuestion?.requestedByAccountId ?? run.automation.ownerAccountId,
             projectId: run.automation.projectId,
             machineId: run.machineId,
             runLeaseExpiresAt: activelyRunning ? run.runLeaseExpiresAt!.getTime() : null,
+            ...(run.executionQuestion ? { questionRequestId: run.executionQuestion.id, questionDisplaySessionId: run.executionQuestion.displaySessionId,
+                executionBindingId: automationExecutionQuestionBindingId(run.executionQuestion.id) } : {}),
+            ...(input.executionAdmission ? { executionAdmission: { payloadVersion: 6 as const,
+                generation: run.generation, revision: a.revision, machineAccountId: run.machineAccountId } } : {}),
         },
     };
 }
@@ -458,20 +516,26 @@ export async function heartbeatAutomationRun(
     tx: Tx,
     accountId: string,
     machineId: string,
-    input: { runId: string; claimToken: string },
+    input: { runId: string; claimToken: string; holdCode?: string | null },
     now: Date = new Date(),
 ): Promise<Result<{ runLeaseExpiresAt: Date }>> {
+    const parsed = automationRunHeartbeatRequestSchema.safeParse(input);
+    if (!parsed.success) return { ok: false, error: 'invalid-heartbeat' };
+    const request = parsed.data;
     const runLeaseExpiresAt = new Date(now.getTime() + 5 * 60_000);
     const changed = await tx.automationRun.updateMany({
         where: {
-            id: input.runId,
+            id: request.runId,
             machineAccountId: accountId,
             machineId,
-            claimTokenHash: tokenHash(input.claimToken),
+            claimTokenHash: tokenHash(request.claimToken),
             status: 'RUNNING',
             runLeaseExpiresAt: { gte: now },
+            ...(request.holdCode !== undefined ? {
+                OR: [{ automation: { payloadVersion: 6 } }, { executionCreateBodyHash: { not: null } }],
+            } : {}),
         },
-        data: { runLeaseExpiresAt },
+        data: { runLeaseExpiresAt, ...(request.holdCode !== undefined ? { holdCode: request.holdCode } : {}) },
     });
     return changed.count === 1
         ? { ok: true, value: { runLeaseExpiresAt } }
@@ -502,6 +566,21 @@ export async function reportAutomationRun(
 ): Promise<Result<{ idempotent: boolean; status: string; outcome: AutomationRunOutcome | null; projectId: string }>> {
     const run = await claimedRun(tx, accountId, machineId, input.runId, input.claimToken);
     if (!run) return { ok: false, error: 'claim-not-found' };
+    const isolatedRun = run.executionPayloadVersion === 6
+        || (run.executionPayloadVersion == null && run.automation.payloadVersion === 6 && run.generation === run.automation.generation)
+        || run.kind === 'QUESTION' || !!run.displaySessionId
+        || !!run.executionCreateBodyHash || isAutomationExecutionSessionId(run.sessionId);
+    if (isolatedRun) {
+        // Registration, not a completion report, fixes the run's execution identity.
+        // Keep this check before ACK replay and after subsequent definition edits.
+        if (input.sessionId !== run.sessionId || (input.sessionId !== null
+            && (input.sessionId !== automationExecutionSessionId(run.id)
+                || !run.displaySessionId || !run.executionCreateBodyHash))) {
+            return { ok: false, error: 'report-conflict' };
+        }
+    } else if (isAutomationExecutionSessionId(input.sessionId)) {
+        return { ok: false, error: 'report-conflict' };
+    }
     if (run.reportId) {
         return run.reportId === input.reportId
             ? {
@@ -553,7 +632,11 @@ export async function reportAutomationRun(
     let changed;
     try {
         changed = await tx.automationRun.updateMany({
-            where: { id: run.id, reportId: null, status: { in: ['RUNNING', 'ABANDONED'] } },
+            where: { id: run.id, reportId: null, status: { in: ['RUNNING', 'ABANDONED'] },
+                displaySessionId: run.displaySessionId ?? null,
+                executionCreateBodyHash: run.executionCreateBodyHash ?? null,
+                ...(isolatedRun ? { sessionId: run.sessionId } : {}),
+            },
             data: {
                 reportId: input.reportId,
                 status: input.status,
@@ -561,6 +644,7 @@ export async function reportAutomationRun(
                 sessionId: input.sessionId,
                 detailCiphertext: input.detailCiphertext,
                 failureCode: input.failureCode,
+                holdCode: null,
                 degradedCode,
                 queueDepth,
                 queuePosition,

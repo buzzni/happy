@@ -61,6 +61,70 @@ function makeTx() {
 }
 
 describe('automationExecutionService', () => {
+    it('starts only a question-bound claim while preserving a paused schedule and exposes its separate requester binding', async () => {
+        const tx = makeTx(), id = '9cc41d26-562e-4b48-8e2f-a38dc2c85a78';
+        const definition = automation({ payloadVersion: 6, paused: true, project: { id: 'project-1', accountId: 'account-1',
+            config: { machineId: 'machine-1' }, automationViewerKeyVersion: 5 }, targetMachine: { automationKeyVersion: 4, automationContextIsolationVersion: 1 } });
+        const one = (size: number) => Buffer.concat([Buffer.from([1]), Buffer.alloc(size - 1)]).toString('base64');
+        const question = { id, requestedByAccountId: 'account-1', automationId: definition.id, generation: 3, revision: 2, displaySessionId: 'manual', sourceRunId: 'source',
+            machineAccountId: 'account-1', machineId: 'machine-1', cancelledAt: null, runId: id, automation: definition,
+            encrypted: { payloadVersion: 6, payloadCiphertext: one(41), viewerKeyId: 'k', viewerKeyVersion: 5, machineKeyVersion: 4,
+                viewerKeyEnvelope: one(105), machineKeyEnvelope: one(105) } };
+        Object.assign(tx, { automationExecutionQuestion: { findUnique: vi.fn(async () => question) },
+            project: { findUnique: vi.fn(async () => definition.project) }, projectMember: { findUnique: vi.fn(async () => null) } });
+        const run = { id, kind: 'QUESTION', automationId: definition.id, machineAccountId: 'account-1', machineId: 'machine-1',
+            generation: 3, previousExecutionRunId: 'source', status: 'CLAIMED', claimExpiresAt: new Date(now.getTime() + 60_000), automation: definition };
+        tx.automationRun.findFirst.mockResolvedValue(run);
+        expect(await startAutomationRun(tx as never, 'account-1', 'machine-1', { runId: id, claimToken: 'token' }, now)).toMatchObject({ ok: true });
+        tx.automationRun.findFirst.mockResolvedValue({ ...run, status: 'RUNNING', runLeaseExpiresAt: new Date(now.getTime() + 60_000) });
+        expect(await resolveAutomationRunMcpContext(tx as never, 'account-1', 'machine-1', { runId: id, claimToken: 'token', executionAdmission: true }, now))
+            .toEqual({ ok: false, error: 'claim-cancelled' });
+        expect(await resolveAutomationRunMcpContext(tx as never, 'account-1', 'machine-1', { runId: id, claimToken: 'token', executionAdmission: true, questionProtocol: 1 }, now))
+            .toMatchObject({ ok: true, value: { ownerAccountId: 'account-1', questionRequestId: id, executionBindingId: `automation-question:${id}` } });
+        expect(tx.automation.updateMany).not.toHaveBeenCalled();
+        question.requestedByAccountId = 'revoked-requester';
+        expect(await resolveAutomationRunMcpContext(tx as never, 'account-1', 'machine-1', { runId: id, claimToken: 'token', executionAdmission: true, questionProtocol: 1 }, now))
+            .toEqual({ ok: false, error: 'claim-cancelled' });
+    });
+    it('does not mistake a question at the same timestamp for a claimed scheduled slot', async () => {
+        const tx = makeTx();
+        tx.automationRun.createMany.mockResolvedValue({ count: 0 });
+        tx.automationRun.findFirst.mockImplementation(async query => query.where.kind === 'SCHEDULED' ? null : { id: 'question-run' });
+        await expect(claimAutomationRun(tx as never, 'account-1', 'machine-1', { automationId: 'automation-1', generation: 3, scheduledFor: now }, now))
+            .resolves.toEqual({ ok: false, error: 'active-run' });
+        expect(tx.automationRun.findFirst).toHaveBeenCalledWith({ where: { automationId: 'automation-1', generation: 3, scheduledFor: now, kind: 'SCHEDULED' }, select: { id: true } });
+    });
+    it.each([0, 1])('requires a full sync on every ready registration including a lost previous ACK (%s)', async previousVersion => {
+        const tx = makeTx(), publicKey = new Uint8Array(32);
+        tx.machine.findFirst.mockResolvedValue({ automationPublicKey: publicKey, automationKeyVersion: 4,
+            automationProtocolVersion: 4, automationContextIsolationVersion: previousVersion });
+        await expect(Reflect.apply(registerAutomationMachineKey, null, [tx, 'account-1', 'machine-1', {
+            expectedKeyVersion: 4, publicKey, protocolVersion: 4, contextIsolationVersion: 1,
+        }])).resolves.toMatchObject({ ok: true, value: { contextIsolationVersion: 1, syncFromStart: true } });
+        expect(tx.automation.updateMany).not.toHaveBeenCalled();
+    });
+    it.each([undefined, 1])('registers explicit isolation readiness and clears it for an older daemon (%s)', async contextIsolationVersion => {
+        const tx = makeTx(), publicKey = new Uint8Array(32);
+        tx.machine.findFirst.mockResolvedValue({ automationPublicKey: publicKey, automationKeyVersion: 4,
+            automationProtocolVersion: 4, automationContextIsolationVersion: contextIsolationVersion === 1 ? 0 : 1 });
+        await expect(Reflect.apply(registerAutomationMachineKey, null, [tx, 'account-1', 'machine-1', {
+            expectedKeyVersion: 4, publicKey, protocolVersion: 4, ...(contextIsolationVersion === undefined ? {} : { contextIsolationVersion }),
+        }])).resolves.toMatchObject({ ok: true, value: { keyVersion: 4, targetChanged: true } });
+        expect(tx.machine.updateMany).toHaveBeenCalledWith({ where: { id: 'machine-1', accountId: 'account-1', automationKeyVersion: 4 },
+            data: { automationProtocolVersion: 4, automationContextIsolationVersion: contextIsolationVersion ?? 0 } });
+    });
+
+    it.each([0, 1])('syncs and claims isolated runs only with explicit machine readiness (%s)', async contextIsolationVersion => {
+        const tx = makeTx();
+        tx.machine.findFirst.mockResolvedValue({ automationContextIsolationVersion: contextIsolationVersion });
+        tx.automation.findFirst.mockResolvedValue(automation({ payloadVersion: 6,
+            targetMachine: { automationKeyVersion: 4, automationContextIsolationVersion: contextIsolationVersion } }));
+        await expect(syncAutomations(tx as never, 'account-1', 'machine-1', { afterSeq: 0n, limit: 100, payloadVersions: [1, 4, 6] }))
+            .resolves.toMatchObject({ ok: true, value: { changes: [{ kind: contextIsolationVersion === 1 ? 'UPSERT' : 'TOMBSTONE' }] } });
+        await expect(claimAutomationRun(tx as never, 'account-1', 'machine-1', { automationId: 'automation-1', generation: 3, scheduledFor: now }, now))
+            .resolves.toMatchObject({ ok: contextIsolationVersion === 1 });
+        if (contextIsolationVersion === 0) expect(tx.automationRun.createMany).not.toHaveBeenCalled();
+    });
     it.each([3, 5, 6, 99])('tombstones removed or unknown payload %s even when advertised', async (payloadVersion) => {
         const tx = makeTx();
         tx.automation.findFirst.mockResolvedValue(automation({ payloadVersion }));
@@ -128,6 +192,7 @@ describe('automationExecutionService', () => {
                 automationPublicKey: new Uint8Array(32),
                 automationKeyVersion: { increment: 1 },
                 automationProtocolVersion: 2,
+                automationContextIsolationVersion: 0,
             },
         });
         expect(tx.sessionFollowup.findMany).toHaveBeenCalledWith({ where: expect.objectContaining({
@@ -151,7 +216,7 @@ describe('automationExecutionService', () => {
         })).resolves.toEqual({ ok: true, value: { keyVersion: 4, invalidatedProjectIds: [], targetChanged: true } });
         expect(tx.machine.updateMany).toHaveBeenCalledWith({
             where: { id: 'machine-1', accountId: 'account-1', automationKeyVersion: 4 },
-            data: { automationProtocolVersion: 2 },
+            data: { automationProtocolVersion: 2, automationContextIsolationVersion: 0 },
         });
     });
 
@@ -262,6 +327,18 @@ describe('automationExecutionService', () => {
         }, now)).resolves.toEqual({ ok: false, error: 'claim-denied' });
     });
 
+    it('keeps the original replay window for executable definitions after input holding', async () => {
+        const tx = makeTx();
+        tx.automation.findFirst.mockResolvedValue(automation({ payloadVersion: 4 }));
+        await expect(claimAutomationRun(tx as never, 'account-1', 'machine-1', {
+            automationId: 'automation-1', generation: 3, scheduledFor: new Date(now.getTime() - 91_000),
+        }, now)).resolves.toEqual({ ok: false, error: 'claim-denied' });
+        expect(tx.automationRun.createMany).not.toHaveBeenCalled();
+        await expect(claimAutomationRun(tx as never, 'account-1', 'machine-1', {
+            automationId: 'automation-1', generation: 3, scheduledFor: now,
+        }, now)).resolves.toMatchObject({ ok: true });
+    });
+
     it('accepts an older due time only when it exactly matches the durable run-now request', async () => {
         const tx = makeTx();
         const requestedAt = new Date(now.getTime() - 10 * 60_000);
@@ -333,7 +410,7 @@ describe('automationExecutionService', () => {
         await expect(startAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token',
         }, now)).resolves.toEqual({ ok: false, error: 'claim-cancelled' });
-        expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: { status: 'CANCELLED', completedAt: now } }));
+        expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: { status: 'CANCELLED', completedAt: now, holdCode: null } }));
     });
 
     it('does not resurrect a run after its heartbeat lease expires', async () => {
@@ -345,6 +422,67 @@ describe('automationExecutionService', () => {
         }, now)).resolves.toEqual({ ok: false, error: 'run-not-running' });
         expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
             where: expect.objectContaining({ runLeaseExpiresAt: { gte: now } }),
+        }));
+    });
+
+    it.each(['WORKSPACE_BUSY', null])('updates only the original live isolated claim hold (%s)', async holdCode => {
+        const tx = makeTx(), input = { runId: 'run-1', claimToken: 'token', holdCode };
+        expect(await heartbeatAutomationRun(tx as never, 'account-1', 'machine-1', input, now)).toMatchObject({ ok: true });
+        expect(tx.automationRun.updateMany).toHaveBeenCalledWith({
+            where: expect.objectContaining({ id: 'run-1', machineAccountId: 'account-1', machineId: 'machine-1',
+                claimTokenHash: expect.any(Uint8Array), status: 'RUNNING', runLeaseExpiresAt: { gte: now },
+                OR: [{ automation: { payloadVersion: 6 } }, { executionCreateBodyHash: { not: null } }],
+            }), data: { runLeaseExpiresAt: new Date(now.getTime() + 5 * 60_000), holdCode },
+        });
+    });
+
+    it('preserves a deferred hold when a generic heartbeat omits its state', async () => {
+        const tx = makeTx();
+        await heartbeatAutomationRun(tx as never, 'account-1', 'machine-1', { runId: 'run-1', claimToken: 'token' }, now);
+        expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+            data: { runLeaseExpiresAt: new Date(now.getTime() + 5 * 60_000) },
+        }));
+    });
+
+    it('refuses an unbounded heartbeat reason before any database mutation', async () => {
+        const tx = makeTx(), input = { runId: 'run-1', claimToken: 'token', holdCode: 'private raw diagnostic' };
+        expect(await heartbeatAutomationRun(tx as never, 'account-1', 'machine-1', input, now))
+            .toEqual({ ok: false, error: 'invalid-heartbeat' });
+        expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('cannot restore a hold after the original claim has expired or reached a terminal state', async () => {
+        const tx = makeTx(), input = { runId: 'run-1', claimToken: 'token', holdCode: 'WORKSPACE_OWNER_UNCONFIRMED' };
+        tx.automationRun.updateMany.mockResolvedValue({ count: 0 });
+        expect(await heartbeatAutomationRun(tx as never, 'account-1', 'machine-1', input, now))
+            .toEqual({ ok: false, error: 'run-not-running' });
+        expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({
+            id: 'run-1', machineAccountId: 'account-1', machineId: 'machine-1', claimTokenHash: expect.any(Uint8Array),
+            status: 'RUNNING', runLeaseExpiresAt: { gte: now },
+        }) }));
+    });
+
+    it.each(['COMPLETED', 'FAILED'] as const)('clears a hold on terminal dispatch report while retaining the %s result', async status => {
+        const tx = makeTx(), sessionId = 'automation-run:run-1';
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', automation: automation({ payloadVersion: 6 }), status: 'RUNNING',
+            reportId: null, sessionId, displaySessionId: 'manual', executionCreateBodyHash: 'hash', holdCode: 'WORKSPACE_BUSY',
+            runLeaseExpiresAt: new Date(now.getTime() + 60_000) });
+        tx.session.findFirst.mockResolvedValue({ id: sessionId });
+        const failureCode = status === 'FAILED' ? 'AUTOMATION_START_UNCONFIRMED' : null;
+        expect(await reportAutomationRun(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', reportId: 'report-1', status,
+            outcome: status === 'FAILED' ? 'ERROR' : 'WOKE', sessionId, detailCiphertext: null, failureCode,
+        }, now)).toMatchObject({ ok: true });
+        expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ status, holdCode: null, failureCode }),
+        }));
+    });
+
+    it('clears held state when maintenance expires or abandons a claim', async () => {
+        const tx = makeTx();
+        await claimAutomationRun(tx as never, 'account-1', 'machine-1', { automationId: 'automation-1', generation: 3, scheduledFor: now }, now);
+        for (const status of ['EXPIRED', 'ABANDONED']) expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ status, holdCode: null }),
         }));
     });
 
@@ -385,6 +523,41 @@ describe('automationExecutionService', () => {
         }, now)).resolves.toEqual({ ok: false, error: 'run-not-running' });
         expect(tx.session.findFirst).not.toHaveBeenCalled();
     });
+
+    it('attests the current isolated definition generation and revision only for a running machine claim', async () => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', automationId: 'automation-1', generation: 3,
+            machineId: 'machine-1', machineAccountId: 'account-1', status: 'RUNNING',
+            runLeaseExpiresAt: new Date(now.getTime() + 60_000), automation: automation({ payloadVersion: 6 }) });
+        await expect(resolveAutomationRunMcpContext(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', executionAdmission: true,
+        }, now)).resolves.toMatchObject({ ok: true, value: { executionAdmission: {
+            payloadVersion: 6, generation: 3, revision: 2, machineAccountId: 'account-1',
+        } } });
+    });
+
+    it.each(['paused', 'deleted', 'migration', 'generation', 'machine', 'account', 'machine-key', 'viewer-key', 'legacy', 'terminal', 'session-link'])(
+        'refuses isolated target admission after %s changes without changing legacy MCP context semantics', async reason => {
+            const tx = makeTx(), a = automation({ payloadVersion: 6 });
+            const row = { id: 'run-1', automationId: a.id, generation: 3, machineId: 'machine-1', machineAccountId: 'account-1',
+                status: 'RUNNING', runLeaseExpiresAt: new Date(now.getTime() + 60_000), automation: a };
+            if (reason === 'paused') a.paused = true;
+            if (reason === 'deleted') a.deletedAt = new Date(0) as any;
+            if (reason === 'migration') a.legacyMigrationPending = true;
+            if (reason === 'generation') a.generation++;
+            if (reason === 'machine') a.machineId = 'other';
+            if (reason === 'account') a.machineAccountId = 'other';
+            if (reason === 'machine-key') a.targetMachine.automationKeyVersion++;
+            if (reason === 'viewer-key') a.project.automationViewerKeyVersion++;
+            if (reason === 'legacy') a.payloadVersion = 4;
+            if (reason === 'terminal') row.status = 'COMPLETED';
+            tx.automationRun.findFirst.mockResolvedValue(row);
+            const result = await resolveAutomationRunMcpContext(tx as never, 'account-1', 'machine-1', {
+                runId: 'run-1', claimToken: 'token', executionAdmission: true,
+                ...(reason === 'session-link' ? { sessionId: 'session-1' } : {}),
+            }, now);
+            expect(result).toEqual({ ok: false, error: 'claim-cancelled' });
+        });
 
     it('allows a durable project link retry after the matching run report is terminal', async () => {
         const tx = makeTx();
@@ -474,9 +647,24 @@ describe('automationExecutionService', () => {
         expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
     });
 
+    it('keeps a prior legacy generation reportable after the current definition switches to v6', async () => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', generation: 3, kind: 'SCHEDULED',
+            status: 'RUNNING', reportId: null, sessionId: null, displaySessionId: null, executionCreateBodyHash: null,
+            automation: automation({ payloadVersion: 6, generation: 4 }) });
+        tx.session.findFirst.mockResolvedValue({ id: 'session-1' });
+        expect(await reportAutomationRun(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
+            outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null, failureCode: null,
+        }, now)).toMatchObject({ ok: true, value: { idempotent: false } });
+        expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ sessionId: 'session-1', reportId: 'report-1' }),
+        }));
+    });
+
     it('rejects a first completion report linked to a foreign session', async () => {
         const tx = makeTx();
-        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null });
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null, automation: automation() });
         await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
             outcome: 'WOKE', sessionId: 'foreign-session', detailCiphertext: null, failureCode: null,
@@ -489,7 +677,7 @@ describe('automationExecutionService', () => {
 
     it.each(['WOKE', 'SILENT'] as const)('rejects a %s report without a session link', async (outcome) => {
         const tx = makeTx();
-        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null });
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null, automation: automation() });
 
         await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
@@ -541,7 +729,7 @@ describe('automationExecutionService', () => {
     });
     it('rejects inconsistent GitHub queue progress', async () => {
         const tx = makeTx();
-        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null });
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null, automation: automation() });
 
         await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
@@ -553,7 +741,7 @@ describe('automationExecutionService', () => {
 
     it('maps a cross-run report id uniqueness conflict to report-conflict', async () => {
         const tx = makeTx();
-        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null });
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null, automation: automation() });
         tx.automationRun.updateMany.mockRejectedValue(new Prisma.PrismaClientKnownRequestError('duplicate report', {
             code: 'P2002',
             clientVersion: 'test',
@@ -622,7 +810,7 @@ describe('automationExecutionService', () => {
 
     it('rejects a degraded code on a non-WOKE run', async () => {
         const tx = makeTx();
-        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null });
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null, automation: automation() });
 
         await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'FAILED',
@@ -637,7 +825,7 @@ describe('automationExecutionService', () => {
         { status: 'FAILED', outcome: 'WOKE' },
     ] as const)('rejects an invalid $status and $outcome report pair', async ({ status, outcome }) => {
         const tx = makeTx();
-        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null });
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null, automation: automation() });
         await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token', reportId: 'report-1', status,
             outcome, sessionId: null, detailCiphertext: null, failureCode: null,

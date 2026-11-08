@@ -1,4 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import type { LegacyDispatchReservation } from '@/utils/workspaceTurnAdmission';
+import { logger } from '@/ui/logger';
 import type { AutonomousQualityGateStartRequestV1 } from '../api/autonomousQualityGateProtocol';
 
 export const MAX_AUTONOMOUS_GATE_OUTPUT_BYTES = 8 * 1_024;
@@ -18,22 +20,33 @@ export interface AutonomousQualityGatePhaseResult {
     outputTruncated: boolean;
 }
 
-export function runAutonomousQualityGatePhase(
+export async function runAutonomousQualityGatePhase(
     phase: AutonomousQualityGatePhasePlan,
     options: {
         cwd: string;
         signal?: AbortSignal;
         killGraceMs?: number;
         now?: () => number;
+        reserveLegacyDispatch?: (roots: readonly string[]) => Promise<LegacyDispatchReservation>;
+        admitSubprocess?: (roots: readonly string[]) => Promise<void>;
     },
 ): Promise<AutonomousQualityGatePhaseResult> {
     const now = options.now ?? Date.now;
     const startedAt = now();
     if (options.signal?.aborted) {
-        return Promise.resolve(emptyResult(phase.name, 'aborted', startedAt, now));
+        return emptyResult(phase.name, 'aborted', startedAt, now);
     }
-
-    return new Promise((resolve) => {
+    if (!!options.reserveLegacyDispatch !== !!options.admitSubprocess) throw new Error('WORKSPACE_ADMISSION_UNAVAILABLE');
+    let reservation: Extract<LegacyDispatchReservation, { acquired: true }> | undefined;
+    let submitted = false, retained = false;
+    if (options.reserveLegacyDispatch) {
+        const admitted = await options.reserveLegacyDispatch([options.cwd]);
+        if (!admitted.acquired) throw new Error({ 'workspace-busy': 'WORKSPACE_BUSY', 'workspace-owner-unconfirmed': 'WORKSPACE_OWNER_UNCONFIRMED', 'registry-busy': 'WORKSPACE_REGISTRY_BUSY' }[admitted.reason]);
+        reservation = admitted;
+    }
+    try {
+    if (options.signal?.aborted) return emptyResult(phase.name, 'aborted', startedAt, now);
+    const completion = new Promise<AutonomousQualityGatePhaseResult>((resolve) => {
         const stdout = new OutputTail(MAX_AUTONOMOUS_GATE_OUTPUT_BYTES);
         const stderr = new OutputTail(MAX_AUTONOMOUS_GATE_OUTPUT_BYTES);
         let forcedStatus: 'timed-out' | 'aborted' | undefined;
@@ -112,6 +125,7 @@ export function runAutonomousQualityGatePhase(
                 stdio: ['ignore', 'pipe', 'pipe'],
                 windowsHide: true,
             });
+            submitted = true;
         } catch (error) {
             finish(null, error instanceof Error ? error : new Error(String(error)));
             return;
@@ -149,6 +163,17 @@ export function runAutonomousQualityGatePhase(
             }
         }
     });
+    if (submitted && options.admitSubprocess) {
+        try { await options.admitSubprocess([options.cwd]); retained = true; }
+        catch { logger.debug('[quality-gate] Submitted writer retention unconfirmed; temporary ownership retained'); }
+    }
+    return await completion;
+    } finally {
+        if (!submitted || retained || !options.admitSubprocess) {
+            try { await reservation?.finish(); }
+            catch { logger.debug('[quality-gate] Workspace handoff unconfirmed; temporary ownership retained'); }
+        }
+    }
 }
 
 class OutputTail {

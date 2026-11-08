@@ -1,6 +1,7 @@
 {
   "name": "@buzzni/happy-cli",
-  "version": "1.1.10-aplus.396",
+  "version": "1.1.10-aplus.400",
+  "happyTerminalWorkerProtocol": 1,
   "description": "A+ Dev Studio fork of slopus/happy. Mobile and Web client for Claude Code and Codex.",
   "author": "Kirill Dubovitskiy (upstream), justinbuzzni (aplus fork)",
   "license": "MIT",
@@ -106,6 +107,7 @@
     "build": "shx rm -rf dist && tsc --noEmit && pkgroll && node scripts/copy-browser-extension.cjs",
     "test": "pnpm run build && vitest run --project unit",
     "test:integration": "pnpm run build && vitest run --project integration-empty --project integration-plan-mode --project integration-authenticated",
+    "test:context-isolation-native": "vitest run --project integration-automation-context",
     "test:integration:write-scope": "cross-env HAPPY_SCOPE_SERVER_INTEGRATION=1 vitest run --project integration-write-scope",
     "cli:install": "node scripts/install-local.cjs",
     "cli:install:isolated": "node scripts/install-isolated.cjs",

@@ -40,6 +40,20 @@ async function waitForStatus(handler: (input: unknown) => Promise<any>, operatio
 }
 
 describe('profile-aware machine.run adapter', () => {
+    it('includes the requested workspace when a trusted profile executes from a temporary cwd', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-profile-admission-'));
+        try {
+            const temporary = join(root, 'temporary'); await mkdir(temporary);
+            const source = profile({ cwd: 'temp' });
+            const resolver = createTrustedMachineRunProfileResolver([source]);
+            const admitSubprocess = vi.fn(async (_roots: readonly string[]) => { throw new Error('WORKSPACE_OWNER_UNCONFIRMED'); });
+            const options = { platform: process.platform, tempDirectory: temporary, admitSubprocess };
+            const handler = createProfileAwareMachineRunHandler(root, resolver, options);
+            await expect(handler({ action: 'start', profileId: source.id, profileDigest: resolver.resolve(source.id)!.profileDigest,
+                workspaceRoot: root, parameters: { message: 'blocked' } })).rejects.toThrow('WORKSPACE_OWNER_UNCONFIRMED');
+            expect(admitSubprocess).toHaveBeenCalledWith([await realpath(temporary), await realpath(root)]);
+        } finally { await rm(root, { recursive: true, force: true }); }
+    });
     it('validates and freezes trusted profiles before resolving them', () => {
         const source = profile({
             parameters: { message: { type: 'string', maxLength: 128, values: ['safe'] } },
