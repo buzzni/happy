@@ -731,7 +731,7 @@ function pageCapability(token){var parts=token.split('.'),c=parts.length===4?dec
  return true}
 /** The screen area follows the capability: the page view with a page capability, the Chrome window guidance otherwise. */
 function pageMode(renewal){var on=!!S.pageScope;document.body.classList.toggle('page-view',on);$('viewGroup').hidden=!on&&NATIVE_SCREEN;$('pageRetry').hidden=true;
- $('spaceToggle').hidden=false;if(on&&!$('spacePanel').hidden)spaceToggle(false);
+ $('spaceToggle').hidden=!$('consoleBack').hidden;if(on&&!$('spacePanel').hidden)spaceToggle(false);
  var b=$('screenEmpty').querySelector('b'),span=$('screenEmpty').querySelector('span');b.textContent=on?PT.emptyTitle:T.screenEmptyTitle;span.textContent=on?PT.emptyBody:T.screenEmptyBody;
  if(!on){pageStatus(T.screenHint,false);if(pageViewer){++pageGen;pageKey='';void pageViewer.close().catch(function(){})}}else syncPage(renewal&&!pageViewer.lost())}
 /** Opens the view of the shown task's tab when it changed (force: also when unchanged), closing the previous one first. */
@@ -759,7 +759,7 @@ if(PAGE_VIEW){
 var ordinarySpaces=$('spaceToggle').onclick;
 $('spaceToggle').onclick=function(){if(!S.pageScope)return ordinarySpaces();var u=new URL(location.href);u.searchParams.delete('agentSessionId');u.searchParams.delete('remotePage');u.searchParams.set('spaces','1');u.searchParams.set('returnToSession',taskSession);var theme=document.documentElement.dataset.theme;if(theme==='light'||theme==='dark')u.searchParams.set('theme',theme);u.hash='';location.href=u.href};
 var returnSession=Q.get('returnToSession');
-if(!taskSession&&Q.get('spaces')==='1'){spaceToggle(true);if(returnSession&&returnSession.length<=256){$('consoleBack').hidden=false;$('consoleBack').textContent=LANG==='ko'?'대화 화면으로':'Back to conversation';
+if(!taskSession&&Q.get('spaces')==='1'){spaceToggle(true);if(returnSession&&returnSession.length<=256){$('consoleBack').hidden=false;menu.hidden=true;$('spaceToggle').hidden=true;$('consoleBack').textContent=LANG==='ko'?'대화 화면으로':'Back to conversation';
  $('consoleBack').onclick=function(){var u=new URL(location.href);u.searchParams.delete('spaces');u.searchParams.delete('returnToSession');u.searchParams.set('agentSessionId',returnSession);u.hash='';location.href=u.href}}}
 // Reload, back navigation or a restored panel arrive without a fragment: ask the host now.
 if(S.token)listTasks();else askHost();

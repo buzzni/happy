@@ -504,6 +504,9 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
             await hand(target, capability('management', { operations: ['listTasks', 'listSpaces', 'closeSpace', 'setSpaceQuota'] }))
             await until(() => ops.find((o) => o.op === 'listSpaces'), Boolean)
             expect(ops.filter((o) => o.op === 'listSpaces').every((o) => o.bearer.endsWith('.sig-management'))).toBe(true)
+            // A single-purpose document: only the way back, no task menu or Spaces toggle crowding a narrow header.
+            expect(JSON.parse(await harness.evaluate(target, `JSON.stringify(['consoleBack', 'taskMenu', 'spaceToggle']
+                .map((id) => !!document.getElementById(id).getClientRects().length))`))).toEqual([true, false, false])
             await harness.evaluate(target, `document.getElementById('consoleBack').click()`)
             await until(() => harness.evaluate(target, 'location.search'), (s) => s.includes(`agentSessionId=${SESSION}`))
             await until(() => harness.evaluate(target, 'window.__abpPageView'), (v) => v === 1)
