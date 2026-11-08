@@ -717,9 +717,6 @@ class Sync {
                 sentFrom,
                 ...(appendSystemPrompt !== undefined ? { appendSystemPrompt } : {}),
                 saycodeSystemPromptEnabled,
-                ...(saycodeTurnMeta.saycodePromptBlocks !== undefined
-                    ? { saycodePromptBlocks: saycodeTurnMeta.saycodePromptBlocks }
-                    : {}),
                 ...(modeMeta.permissionMode !== undefined ? { permissionMode: modeMeta.permissionMode } : {}),
                 ...(modeMeta.model !== undefined ? { model: modeMeta.model } : {}),
                 ...(modeMeta.effort !== undefined ? { effort: modeMeta.effort } : {}),

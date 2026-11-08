@@ -26,7 +26,8 @@ export type MobileSaycodePromptBlock = {
     /**
      * Which layer applies the block: `app-composed` is this app's own options/plan
      * guidance (gated locally, never sent on the wire — happy-cli does not know the
-     * id); `cli-wire` blocks travel in message meta for happy-cli to gate.
+     * id); `cli-wire` blocks are gated by happy-cli, which follows only the master
+     * value, so they have no per-block setting here.
      */
     layer: 'app-composed' | 'cli-wire';
     titleKey: TranslationKey;
@@ -75,15 +76,14 @@ export type SaycodeTurnMeta = {
     saycodeSystemPromptEnabled: boolean;
     /** App-composed guidance is client-turn scoped; omission removes only its cached envelope. */
     appendSystemPrompt: string | undefined;
-    /** CLI-wire overrides only; undefined when empty so the payload stays byte-identical for untouched accounts. */
-    saycodePromptBlocks: Record<string, boolean> | undefined;
 };
 
 /**
  * Computes the saycode-related fields of one outgoing turn from the account
- * preference and per-block overrides. Ids this build does not know are dropped
- * rather than forwarded: happy-cli would silently ignore them while the settings
- * screen says nothing about it.
+ * preference and per-block overrides. No per-block values go on the wire:
+ * happy-cli follows only the master value (aplus-dev-studio
+ * specs/saycode-security-hardening D1), and `nextSteps` is a card capability this
+ * app does not have.
  */
 export function buildSaycodeTurnMeta({
     preference,
@@ -101,22 +101,6 @@ export function buildSaycodeTurnMeta({
         preference,
         surface,
     });
-    const cliWire: Record<string, boolean> = {};
-    for (const block of MOBILE_SAYCODE_PROMPT_BLOCKS) {
-        if (block.layer !== 'cli-wire') continue;
-        const value = overrides?.[block.id];
-        if (typeof value === 'boolean') {
-            cliWire[block.id] = value;
-            continue;
-        }
-        const enabled = resolveSaycodePromptBlockEnabled({
-            blockId: block.id,
-            overrides,
-            preference,
-            surface,
-        });
-        if (enabled !== saycodeSystemPromptEnabled) cliWire[block.id] = enabled;
-    }
     const appendSystemPrompt = resolveSaycodeAppendSystemPrompt({
         enabled: optionsGuidanceEnabled,
         prompt: systemPrompt,
@@ -124,6 +108,5 @@ export function buildSaycodeTurnMeta({
     return {
         saycodeSystemPromptEnabled,
         appendSystemPrompt,
-        saycodePromptBlocks: Object.keys(cliWire).length > 0 ? cliWire : undefined,
     };
 }

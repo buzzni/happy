@@ -195,7 +195,7 @@ export const ja: TranslationStructure = {
 
     settingsFeatures: {
         saycodeGroupTitle: "Saycode の指示",
-        saycodeGroupFooter: "子 Agent の呼び出しと内部作業の委任は、Saycode の指示をオフにしても既定で有効です。チャットタイトルの生成は常に有効で、オフにできません。",
+        saycodeGroupFooter: "子 Agent の呼び出し、内部作業の委任、計画から始めるワークフロー、コミットのクレジットは Saycode の指示のスイッチに従います。チャットタイトルの生成は常に有効で、オフにできません。",
         saycodeMaster: "Saycode の指示を使用",
         saycodeMasterSubtitle: "Saycode が追加する動作指示です。自分のプロンプト、プロジェクトの指示、スキルは常に維持されます。",
         saycodeBlockOptionsGuidance: "回答の選択肢",

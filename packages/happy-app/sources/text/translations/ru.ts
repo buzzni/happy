@@ -180,7 +180,7 @@ export const ru: TranslationStructure = {
 
     settingsFeatures: {
         saycodeGroupTitle: "Инструкции Saycode",
-        saycodeGroupFooter: "Вызов дочернего Agent и внутреннее делегирование задач включены по умолчанию, даже если инструкции Saycode отключены. Генерация названия чата всегда включена.",
+        saycodeGroupFooter: "Вызов дочернего Agent, внутреннее делегирование задач, процесс планирования и подписи соавторов в коммитах следуют переключателю инструкций Saycode. Генерация названия чата всегда включена.",
         saycodeMaster: "Использовать инструкции Saycode",
         saycodeMasterSubtitle: "Поведенческие инструкции, добавляемые Saycode. Ваши собственные промпты, инструкции проекта и навыки всегда сохраняются.",
         saycodeBlockOptionsGuidance: "Варианты ответа",

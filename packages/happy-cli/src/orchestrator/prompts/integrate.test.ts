@@ -182,7 +182,8 @@ describe('applyAxOrchestration', () => {
         expect(disabled!.appendSystemPrompt).toMatch(/CUSTOM USER PROMPT/);
     });
 
-    it('keeps the AX base when saycodePromptBlocks.axBase overrides a disabled legacy value', async () => {
+    // aplus-dev-studio specs/saycode-security-hardening D1 — per-block overrides no longer decide.
+    it('drops the AX base under a disabled master even when an older client sends axBase: true', async () => {
         await bootstrapWorkspace(workspace, 'plan');
         const result = await applyAxOrchestration({
             workspaceRoot: workspace,
@@ -190,10 +191,10 @@ describe('applyAxOrchestration', () => {
             saycodeSystemPromptEnabled: false,
             saycodePromptBlocks: { axBase: true },
         });
-        expect(result!.appendSystemPrompt).toMatch(/Saycode AI assistant/);
+        expect(result!.appendSystemPrompt).not.toMatch(/Saycode AI assistant/);
     });
 
-    it('removes the AX base when saycodePromptBlocks.axBase overrides an enabled legacy value', async () => {
+    it('keeps the AX base under an enabled master even when an older client sends axBase: false', async () => {
         await bootstrapWorkspace(workspace, 'plan');
         const result = await applyAxOrchestration({
             workspaceRoot: workspace,
@@ -201,7 +202,7 @@ describe('applyAxOrchestration', () => {
             saycodeSystemPromptEnabled: true,
             saycodePromptBlocks: { axBase: false },
         });
-        expect(result!.appendSystemPrompt).not.toMatch(/Saycode AI assistant/);
+        expect(result!.appendSystemPrompt).toMatch(/Saycode AI assistant/);
         expect(result!.appendSystemPrompt).toMatch(/Step: plan/);
     });
 

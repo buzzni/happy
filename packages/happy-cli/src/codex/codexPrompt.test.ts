@@ -49,7 +49,7 @@ describe('buildCodexDeveloperInstructions', () => {
                 appendSystemPrompt: 'USER AND PROJECT CONTEXT',
                 saycodeSystemPromptEnabled: false,
             },
-        })).toBe('CONNECTOR FACTS\n\nAGENT ORCHESTRATION: happy agent spawn\n\nUSER AND PROJECT CONTEXT');
+        })).toBe('USER AND PROJECT CONTEXT');
     });
 
     it('keeps legacy client append prompts in the original user-turn position', () => {
@@ -60,15 +60,16 @@ describe('buildCodexDeveloperInstructions', () => {
         })).toBe('CONNECTOR FACTS\n\nAGENT ORCHESTRATION: happy agent spawn\n\n' + SAYCODE_API_GATEWAY_PROMPT);
     });
 
-    it('keeps default-on orchestration when Saycode prompts are off', () => {
+    it('injects no Saycode guidance when Saycode prompts are off, whatever an older client overrides', () => {
         expect(buildCodexDeveloperInstructions({
             connectorGuidance: 'CONNECTOR FACTS',
+            checkpointGuidance: 'ACTIVE CHECKPOINT FACTS',
             agentOrchestrationPrompt: 'AGENT ORCHESTRATION: happy agent spawn',
-            mode: { saycodeSystemPromptEnabled: false },
-        })).toBe('CONNECTOR FACTS\n\nAGENT ORCHESTRATION: happy agent spawn');
+            mode: { saycodeSystemPromptEnabled: false, saycodePromptBlocks: { agentOrchestration: true } },
+        })).toBeUndefined();
     });
 
-    it('does not inject orchestration when its block is explicitly off', () => {
+    it('keeps orchestration on with the master even when an older client turned its block off', () => {
         expect(buildCodexDeveloperInstructions({
             connectorGuidance: 'CONNECTOR FACTS',
             agentOrchestrationPrompt: 'AGENT ORCHESTRATION: happy agent spawn',
@@ -76,7 +77,7 @@ describe('buildCodexDeveloperInstructions', () => {
                 saycodeSystemPromptEnabled: true,
                 saycodePromptBlocks: { agentOrchestration: false },
             },
-        })).toBe('CONNECTOR FACTS\n\n' + SAYCODE_API_GATEWAY_PROMPT);
+        })).toBe('CONNECTOR FACTS\n\nAGENT ORCHESTRATION: happy agent spawn\n\n' + SAYCODE_API_GATEWAY_PROMPT);
     });
 });
 

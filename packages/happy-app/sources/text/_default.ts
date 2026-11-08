@@ -192,7 +192,7 @@ export const en = {
 
     settingsFeatures: {
         saycodeGroupTitle: "Saycode Instructions",
-        saycodeGroupFooter: "Child Agent calls and internal task delegation stay on by default even when Saycode instructions are off. Chat title generation is always on and cannot be turned off.",
+        saycodeGroupFooter: "Child Agent calls, internal task delegation, the planning workflow, and commit credits follow the Saycode instructions switch. Chat title generation is always on and cannot be turned off.",
         saycodeMaster: "Use Saycode instructions",
         saycodeMasterSubtitle: "Behavior instructions Saycode adds. Your own prompts, project instructions, and skills always remain.",
         saycodeBlockOptionsGuidance: "Answer options",
