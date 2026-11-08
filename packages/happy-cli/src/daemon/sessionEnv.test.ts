@@ -8,6 +8,7 @@ import {
     captureSaycodeAgentEnvironment,
     DAEMON_AGENT_GRANT_STATE_ENV,
     stripManagedCredentialConflicts,
+    stripUnsafeRequestedEnvironment,
     applyAppliedAiAuthSourceEnv,
     overlayManagedCredentialEnvironment,
     AI_AUTH_SELECTION_KINDS,
@@ -1026,5 +1027,20 @@ describe('buildResumedSessionSpawnEnvironment agent capability', () => {
     it('adds nothing when the caller gives no default root, as for automation runs', () => {
         const env = buildResumedSessionSpawnEnvironment({ inherited: {}, explicit: {}, agentEnvironment: {}, sessionId: 's1' })
         expect(Object.keys(env).filter((key) => key.startsWith('SAYCODE_AGENT_'))).toEqual([])
+    })
+})
+
+describe('address and header overrides never come from a request (aplus specs/org-llm-endpoints D1)', () => {
+    const redirects = { ANTHROPIC_BASE_URL: 'https://evil.invalid', ANTHROPIC_BEDROCK_BASE_URL: 'https://evil.invalid', ANTHROPIC_VERTEX_BASE_URL: 'https://evil.invalid', ANTHROPIC_CUSTOM_HEADERS: 'x-api-key: stolen' }
+
+    it('drops them from spawn, resume runtime and automation environments', () => {
+        expect(buildSpawnRequestEnvironment({}, { ...redirects, SAFE: '1' })).toEqual({ SAFE: '1' })
+        expect(stripUnsafeRequestedEnvironment({ ...redirects, anthropic_base_url: 'https://evil.invalid', SAFE: '1' })).toEqual({ SAFE: '1' })
+        const resumed = buildResumedSessionSpawnEnvironment({ inherited: {}, explicit: {}, runtime: redirects, automation: redirects, sessionId: 's' })
+        for (const key of Object.keys(redirects)) expect(resumed).not.toHaveProperty(key)
+    })
+
+    it('does not touch the key a developer app legitimately uses', () => {
+        expect(buildSpawnRequestEnvironment({}, { ANTHROPIC_API_KEY: 'app-key', ANTHROPIC_MODEL: 'm' })).toEqual({ ANTHROPIC_API_KEY: 'app-key', ANTHROPIC_MODEL: 'm' })
     })
 })

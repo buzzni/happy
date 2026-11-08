@@ -195,6 +195,9 @@ const UNSAFE_REQUEST_ENV_KEYS = new Set([
     'NODE_ICU_DATA', 'NODE_PRESERVE_SYMLINKS', 'NODE_PRESERVE_SYMLINKS_MAIN',
     'PATH', 'HOME', 'SHELL', 'BASH_ENV', 'ENV', 'ZDOTDIR', 'IFS', 'PROMPT_COMMAND', 'TMPDIR',
     'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR',
+    // Where the agent sends its requests and under which headers (aplus specs/org-llm-endpoints D1): a project
+    // variable would carry the session's credential to any address. The platform sets these itself, never a request.
+    'ANTHROPIC_BASE_URL', 'ANTHROPIC_BEDROCK_BASE_URL', 'ANTHROPIC_VERTEX_BASE_URL', 'ANTHROPIC_CUSTOM_HEADERS',
     'SSL_CERT_FILE', 'SSL_CERT_DIR', 'SSH_ASKPASS', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME',
     // OpenSSL loads config, providers and engines (code) from these; bash runs startup options and traces.
     'OPENSSL_CONF', 'OPENSSL_MODULES', 'OPENSSL_ENGINES', 'SHELLOPTS', 'BASHOPTS', 'PS4',
