@@ -38,7 +38,7 @@ describe('ApiMachineClient agent delegation', () => {
         const handlers = rpcHandlers(overrides);
         instance.setRPCHandlers({
             ...handlers,
-            ...(withHost ? { agentDelegation: { store, isSessionLive: () => false, readSessionKey: () => null, concurrencyLimit: 4, directoryExists: async () => true } } : {}),
+            ...(withHost ? { agentDelegation: { store, isSessionLive: () => false, readSessionVariant: () => null, concurrencyLimit: 4, directoryExists: async () => true } } : {}),
         });
         return { instance, handlers };
     };
@@ -54,7 +54,7 @@ describe('ApiMachineClient agent delegation', () => {
     it('starts a delegated child through the same spawn path the machine uses', async () => {
         const { instance, handlers } = await client(true);
         const reply = await sendAsPeer(instance, 'agent-delegation:spawn', {
-            parentSessionId: 'parent-1', directory: '/work/app', initialPrompt: 'go', agentGrant: { depth: 1, maxSpawn: 2, agentId: 'a1' },
+            requestId: 'request-0001', parentSessionId: 'parent-1', directory: '/work/app', initialPrompt: 'go', agentGrant: { depth: 1, maxSpawn: 2, agentId: 'a1' },
         });
         expect(reply.result).toEqual({ type: 'success', sessionId: 'child-1' });
         expect(handlers.spawnSession).toHaveBeenCalledWith(expect.objectContaining({ delegatedFrom: { machineId: 'machine-a', sessionId: 'parent-1' }, createdByAccountId: 'linker' }));

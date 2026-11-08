@@ -5823,11 +5823,8 @@ export async function startDaemon(): Promise<void> {
       ...(managedRuntimeActive || standaloneWindows ? {} : { agentDelegation: {
         store: createAgentDelegationStore({ path: join(configuration.happyHomeDir, 'agent-delegation.json'), log: message => logger.debug(message) }),
         isSessionLive: sessionId => hasLiveDaemonChild(sessionId, pidToTrackedSession.values(), isPidAlive, ownsUnresolvedJob),
-        readSessionKey: sessionId => {
-          const persisted = readPersistedSessions()[sessionId];
-          if (!persisted) return null;
-          return persisted.encryptionVariant === 'dataKey' ? { variant: 'dataKey' as const, key: persisted.encryptionKey } : { variant: 'legacy' as const };
-        },
+        readSessionVariant: sessionId => readPersistedSessions()[sessionId]?.encryptionVariant ?? null,
+        stopSession: sessionId => stopSession(sessionId, { source: 'agent-delegation', reason: 'record-failed', mode: 'force' }),
         concurrencyLimit: delegationConcurrencyLimit({ cpuCount: os.cpus().length, totalMemoryBytes: os.totalmem() }),
       } }),
       ownedSpawn,

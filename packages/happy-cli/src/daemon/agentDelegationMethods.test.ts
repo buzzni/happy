@@ -17,13 +17,16 @@ describe('agent-delegation RPCs', () => {
     let live: Set<string>;
     let existing: Set<string>;
     let afterSpawn: ReturnType<typeof vi.fn>;
+    let stopSession: ReturnType<typeof vi.fn>;
+    let requestSeq = 0;
 
     const setup = (host: Partial<AgentDelegationHost> = {}) => {
         handlers = new Map();
         registerAgentDelegationRpc((method, handler) => handlers.set(method, handler), {
             store,
             isSessionLive: (sessionId) => live.has(sessionId),
-            readSessionKey: (sessionId) => sessionId === 'legacy-child' ? { variant: 'legacy' } : { variant: 'dataKey', key: key(9) },
+            readSessionVariant: (sessionId) => sessionId === 'legacy-child' ? 'legacy' : 'dataKey',
+            stopSession,
             concurrencyLimit: 2,
             directoryExists: async (path) => existing.has(path),
             ...host,
@@ -31,6 +34,7 @@ describe('agent-delegation RPCs', () => {
     };
     const call = (method: string, params: unknown, context?: RpcCallContext) => handlers.get(method)!(params, context);
     const spawnRequest = (overrides: Record<string, unknown> = {}) => ({
+        requestId: `request-${String(++requestSeq).padStart(4, '0')}`,
         parentSessionId: 'parent-1',
         directory: '/work/app',
         agent: 'claude',
@@ -45,6 +49,7 @@ describe('agent-delegation RPCs', () => {
         await store.installTarget({ sourceMachineId: 'machine-a', keyId: 'k1', key: key(1), createdBy: { accountId: 'linker', displayName: 'Lee' } });
         spawn = vi.fn(async () => ({ type: 'success', sessionId: 'child-1' }));
         afterSpawn = vi.fn();
+        stopSession = vi.fn();
         live = new Set();
         existing = new Set(['/work/app']);
         setup();
@@ -84,6 +89,39 @@ describe('agent-delegation RPCs', () => {
         expect(spawn).not.toHaveBeenCalled();
     });
 
+    it('takes two requests that arrive together as two slots, not one', async () => {
+        setup({ concurrencyLimit: 1 });
+        let release: () => void = () => {};
+        spawn.mockImplementationOnce(() => new Promise((resolve) => { release = () => resolve({ type: 'success', sessionId: 'child-1' }); }));
+        const first = call('agent-delegation:spawn', spawnRequest(), PEER);
+        const second = await call('agent-delegation:spawn', spawnRequest(), PEER);
+        expect(second).toMatchObject({ code: 'target_busy' });
+        await vi.waitFor(() => expect(spawn).toHaveBeenCalledTimes(1));
+        release();
+        expect(await first).toMatchObject({ type: 'success' });
+    });
+
+    it('refuses the same request id again, even from a store read after a restart', async () => {
+        const request = spawnRequest();
+        expect(await call('agent-delegation:spawn', request, PEER)).toMatchObject({ type: 'success' });
+        store = createAgentDelegationStore({ path: join(dir, 'agent-delegation.json') });
+        setup();
+        expect(await call('agent-delegation:spawn', request, PEER)).toMatchObject({ code: 'request_replayed' });
+        expect(spawn).toHaveBeenCalledTimes(1);
+    });
+
+    it('stops a child it cannot record instead of leaving it running unaccounted', async () => {
+        const failing = { ...store, recordChild: async () => { throw new Error('disk full'); } } as AgentDelegationStore;
+        setup({ store: failing });
+        expect(await call('agent-delegation:spawn', spawnRequest(), PEER)).toMatchObject({ type: 'error', code: 'spawn_failed' });
+        expect(stopSession).toHaveBeenCalledWith('child-1');
+    });
+
+    it('accepts a Windows UNC directory', async () => {
+        existing.add('\\\\build\\share\\app');
+        expect(await call('agent-delegation:spawn', spawnRequest({ directory: '\\\\build\\share\\app' }), PEER)).toMatchObject({ type: 'success' });
+    });
+
     it('refuses a missing directory without creating it', async () => {
         expect(await call('agent-delegation:spawn', spawnRequest({ directory: '/work/missing' }), PEER)).toMatchObject({ code: 'project_not_found' });
         expect(await call('agent-delegation:spawn', spawnRequest({ directory: 'relative/path' }), PEER)).toMatchObject({ code: 'invalid_request' });
@@ -120,10 +158,10 @@ describe('agent-delegation RPCs', () => {
         expect(spawn).not.toHaveBeenCalled();
     });
 
-    it('hands a session key only for the peer that started the session', async () => {
+    it('never hands out a data key — it is also the session RPC key — and answers only for the starting peer', async () => {
         await store.recordChild({ sessionId: 'child-1', peer: 'machine-a', parentSessionId: 'p' });
         await store.recordChild({ sessionId: 'legacy-child', peer: 'machine-a', parentSessionId: 'p' });
-        expect(await call('agent-delegation:session-key', { sessionId: 'child-1' }, PEER)).toEqual({ type: 'success', sessionId: 'child-1', variant: 'dataKey', key: key(9) });
+        expect(await call('agent-delegation:session-key', { sessionId: 'child-1' }, PEER)).toEqual({ type: 'success', sessionId: 'child-1', variant: 'dataKey' });
         expect(await call('agent-delegation:session-key', { sessionId: 'legacy-child' }, PEER)).toEqual({ type: 'success', sessionId: 'legacy-child', variant: 'legacy' });
         expect(await call('agent-delegation:session-key', { sessionId: 'child-1' }, { lane: 'delegation', peer: 'machine-c' })).toMatchObject({ code: 'session_not_found' });
         expect(await call('agent-delegation:session-key', { sessionId: 'someone-elses' }, PEER)).toMatchObject({ code: 'session_not_found' });

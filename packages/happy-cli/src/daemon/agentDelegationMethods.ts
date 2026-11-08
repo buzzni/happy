@@ -7,6 +7,12 @@
  * `session-key` are delegation-lane calls and need the peer the lane names; on any other lane they
  * refuse rather than guess one.
  *
+ * `session-key` never hands out a session's data key. That key is also the session's RPC key, which
+ * reaches `bash`, file and permission RPCs — handing it to a linked machine would step around the
+ * lane's allowlist and around the person who answers this machine's permission prompts. It answers
+ * only the session's encryption variant; reading a dataKey child from the linked machine needs a
+ * restricted relay (cross-machine-agent-delegation, pending approval).
+ *
  * A delegated spawn takes a narrow request and builds the child's environment here. The requester's
  * environment, sandbox configuration and credentials are not accepted: the child runs under this
  * machine's policy.
@@ -31,8 +37,10 @@ export interface AgentDelegationHost {
     store: AgentDelegationStore;
     /** Whether the session still has a live process here (counts toward `target_busy`). */
     isSessionLive: (sessionId: string) => boolean;
-    /** The session's data key as this machine persisted it, or legacy; null when unknown here. */
-    readSessionKey: (sessionId: string) => { variant: 'dataKey'; key: string } | { variant: 'legacy' } | null;
+    /** The session's encryption variant as this machine persisted it; null when unknown here. */
+    readSessionVariant: (sessionId: string) => 'dataKey' | 'legacy' | null;
+    /** Stops a session this machine started; used when its record cannot be kept. */
+    stopSession?: (sessionId: string) => unknown;
     /** How many delegated children may run here at once (D-5). */
     concurrencyLimit: number;
     directoryExists?: (path: string) => Promise<boolean>;
@@ -52,9 +60,12 @@ export function delegationConcurrencyLimit(capacity: { cpuCount: number; totalMe
 
 type Register = (method: string, handler: (params: unknown, context?: RpcCallContext) => unknown) => void;
 
-const ABSOLUTE_DIRECTORY = /^(\/|[A-Za-z]:[\\/])/;
+// POSIX, a Windows drive, or a Windows UNC share (\\server\share).
+const ABSOLUTE_DIRECTORY = /^(\/|[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)/;
 
 const SpawnRequestSchema = z.object({
+    /** Fresh per attempt; remembered on disk so a sealed request replayed after a restart starts nothing. */
+    requestId: z.string().regex(/^[A-Za-z0-9_-]{8,128}$/),
     parentSessionId: z.string().min(1).max(128),
     directory: z.string().min(1).max(4096).regex(ABSOLUTE_DIRECTORY),
     agent: z.enum(['claude', 'codex', 'gemini', 'grok', 'openclaw', 'opencode']).default('claude'),
@@ -103,6 +114,8 @@ export function registerAgentDelegationRpc(
 ): void {
     const { store } = host;
     const directoryExists = host.directoryExists ?? isDirectory;
+    // Spawns admitted but not yet recorded: two requests that arrive together must not both see a free slot.
+    let starting = 0;
 
     register('agent-delegation:install-target', async (params) => { await store.installTarget(params); return { ok: true }; });
     register('agent-delegation:install-source', async (params) => { await store.installSource(params); return { ok: true }; });
@@ -127,9 +140,22 @@ export function registerAgentDelegationRpc(
         if (!await directoryExists(request.directory)) {
             return refuse('project_not_found', `${request.directory} is not an existing directory on this machine`);
         }
-        const running = store.children().filter((child) => host.isSessionLive(child.sessionId)).length;
+        // Counted and reserved with no await in between, so concurrent requests take distinct slots.
+        const running = store.children().filter((child) => host.isSessionLive(child.sessionId)).length + starting;
         if (running >= host.concurrencyLimit) {
             return refuse('target_busy', `${running} delegated sessions are already running here (limit ${host.concurrencyLimit})`);
+        }
+        starting++;
+        try {
+            return await startDelegated(request, context.peer, link);
+        } finally {
+            starting--;
+        }
+    });
+
+    async function startDelegated(request: z.infer<typeof SpawnRequestSchema>, peer: string, link: NonNullable<ReturnType<AgentDelegationStore['targetLink']>>): Promise<SpawnReply> {
+        if (!await store.claimRequest(peer, request.requestId)) {
+            return refuse('request_replayed', 'This spawn request was already received');
         }
         let outputFormat: ReturnType<typeof parseOutputFormat>;
         let aiAuthSelection: ReturnType<typeof parseAiAuthSelection>;
@@ -158,15 +184,15 @@ export function registerAgentDelegationRpc(
                     SAYCODE_AGENT_DEPTH: String(request.agentGrant.depth),
                     SAYCODE_AGENT_MAX_SPAWN: String(request.agentGrant.maxSpawn),
                     SAYCODE_AGENT_ID: request.agentGrant.agentId,
-                    [DELEGATED_FROM_ENV]: context.peer,
+                    [DELEGATED_FROM_ENV]: peer,
                 },
                 // D-6: the person who linked the machines, recorded when the link was installed.
                 createdByAccountId: link.createdBy.accountId,
                 ...(link.createdBy.displayName ? { createdByDisplayName: link.createdBy.displayName } : {}),
-                delegatedFrom: { machineId: context.peer, sessionId: request.parentSessionId },
+                delegatedFrom: { machineId: peer, sessionId: request.parentSessionId },
             });
         } catch (error) {
-            logger.debug('[AGENT DELEGATION] Delegated spawn refused', { peer: context.peer });
+            logger.debug('[AGENT DELEGATION] Delegated spawn refused', { peer: peer });
             return refuse('target_refused', error instanceof Error ? error.message : String(error));
         }
         if (result.type === 'error') {
@@ -177,25 +203,28 @@ export function registerAgentDelegationRpc(
         if (result.type !== 'success') return refuse('target_refused', 'This machine needs approval to create the directory');
 
         try {
-            await store.recordChild({ sessionId: result.sessionId, peer: context.peer, parentSessionId: request.parentSessionId });
+            await store.recordChild({ sessionId: result.sessionId, peer, parentSessionId: request.parentSessionId }, host.isSessionLive);
         } catch (error) {
-            // The session runs; only the peer's later stop/key requests will not find it.
-            logger.debug('[AGENT DELEGATION] Could not record a delegated child', { error: String(error) });
+            // The record is what lets the peer stop it and what counts it against the limit: a child that
+            // cannot be recorded is not left running unaccounted.
+            logger.debug('[AGENT DELEGATION] Could not record a delegated child; stopping it', { error: String(error) });
+            try { await host.stopSession?.(result.sessionId); } catch { /* reported below either way */ }
+            return refuse('spawn_failed', 'This machine could not record the delegated session, so it was stopped');
         }
         try {
             await deps.afterSpawn?.({ sessionId: result.sessionId, directory: request.directory });
         } catch (error) {
             logger.debug('[AGENT DELEGATION] Project link for a delegated child failed', { error: String(error) });
         }
-        logger.debug('[AGENT DELEGATION] Delegated session started', { peer: context.peer, sessionId: result.sessionId });
+        logger.debug('[AGENT DELEGATION] Delegated session started', { peer, sessionId: result.sessionId });
         return { type: 'success', sessionId: result.sessionId };
-    });
+    }
 
     register('agent-delegation:session-key', async (params, context) => {
         const sessionId = (params as { sessionId?: unknown } | null)?.sessionId;
         const notFound = { type: 'error' as const, code: 'session_not_found', errorMessage: 'No such session was started by this machine' };
         if (context?.lane !== 'delegation' || typeof sessionId !== 'string' || !store.childOf(sessionId, context.peer)) return notFound;
-        const key = host.readSessionKey(sessionId);
-        return key ? { type: 'success' as const, sessionId, ...key } : notFound;
+        const variant = host.readSessionVariant(sessionId);
+        return variant ? { type: 'success' as const, sessionId, variant } : notFound;
     });
 }

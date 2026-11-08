@@ -70,13 +70,14 @@ describe('agent delegation store', () => {
         expect(store.sourceLinks()).toEqual([{ targetMachineId: 'machine-b', keyId: 'k4', key: key(4), name: 'Build PC', platform: 'win32' }]);
     });
 
-    it('drops the lane key at once on revoke, with the children it created', async () => {
+    it('drops the lane key at once on revoke but keeps the children it started, which may still run', async () => {
         const store = createAgentDelegationStore({ path });
         await store.installTarget(target('machine-a'));
         await store.recordChild({ sessionId: 's1', peer: 'machine-a', parentSessionId: 'p1' });
         expect(await store.revoke('target', 'machine-a')).toEqual({ removed: true });
         expect(store.laneLinks()).toEqual([]);
-        expect(store.childOf('s1', 'machine-a')).toBe(false);
+        // Unreachable without the key; still counted against the limit while it runs.
+        expect(store.children().map((child) => child.sessionId)).toEqual(['s1']);
         expect(createAgentDelegationStore({ path }).laneLinks()).toEqual([]);
         expect(await store.revoke('target', 'machine-a')).toEqual({ removed: false });
     });
@@ -104,6 +105,26 @@ describe('agent delegation store', () => {
         expect(store.childOf('s1', 'machine-c')).toBe(false);
         expect(store.childOf('s2', 'machine-a')).toBe(false);
         expect(createAgentDelegationStore({ path }).children()).toEqual([expect.objectContaining({ sessionId: 's1', peer: 'machine-a', parentSessionId: 'p1' })]);
+    });
+
+    it('forgets finished children first and never a running one', async () => {
+        const store = createAgentDelegationStore({ path });
+        await store.recordChild({ sessionId: 'long-runner', peer: 'machine-a', parentSessionId: 'p' });
+        for (let i = 0; i < 260; i++) await store.recordChild({ sessionId: `s${i}`, peer: 'machine-a', parentSessionId: 'p' }, (id) => id === 'long-runner');
+        expect(store.children()).toHaveLength(256);
+        expect(store.childOf('long-runner', 'machine-a')).toBe(true);
+        expect(store.childOf('s0', 'machine-a')).toBe(false);
+    });
+
+    it('claims a spawn request id once, across a restart, and forgets it after the window', async () => {
+        let clock = 1_000;
+        const store = createAgentDelegationStore({ path, now: () => clock });
+        expect(await store.claimRequest('machine-a', 'r1')).toBe(true);
+        expect(await store.claimRequest('machine-a', 'r1')).toBe(false);
+        expect(await store.claimRequest('machine-c', 'r1')).toBe(true);
+        expect(await createAgentDelegationStore({ path, now: () => clock }).claimRequest('machine-a', 'r1')).toBe(false);
+        clock += 16 * 60_000;
+        expect(await createAgentDelegationStore({ path, now: () => clock }).claimRequest('machine-a', 'r1')).toBe(true);
     });
 
     it('reads an unreadable or foreign file as empty rather than trusting part of it', () => {

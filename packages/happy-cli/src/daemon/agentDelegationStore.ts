@@ -4,7 +4,9 @@
  *
  * `asTarget`: machines allowed to start agents here, each with the key its requests are sealed with.
  * `asSource`: machines this one may start agents on. `children`: sessions a linked machine started
- * here, so a stop or a key request is answered only for the peer that created the session.
+ * here, so a stop is answered only for the peer that created the session; kept apart from the links,
+ * so revoking a link neither forgets a running child nor frees its slot. `requests`: spawn request ids
+ * seen recently, so a sealed request replayed after a daemon restart does not start a second agent.
  *
  * Keys leave this module only as the lane's decoded keys and through `sourceLinks` (the local CLI
  * asks for them over the customer lane). `list` never carries one.
@@ -16,6 +18,9 @@ import type { DelegationLink } from '@/api/rpc/types';
 
 export const AGENT_DELEGATION_MAX_LINKS = 16;
 const MAX_CHILDREN = 256;
+const MAX_REQUESTS = 512;
+/** Longer than the binding window (5 min) plus clock skew: past it the lane refuses the request as stale. */
+export const SPAWN_REQUEST_MEMORY_MS = 15 * 60_000;
 
 const machineId = z.string().min(1).max(128);
 const keyId = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
@@ -42,17 +47,20 @@ export const SourceLinkInputSchema = z.object({
 const TargetLinkSchema = TargetLinkInputSchema.extend({ createdAt: z.number() });
 const SourceLinkSchema = SourceLinkInputSchema.extend({ createdAt: z.number() });
 const ChildSchema = z.object({ sessionId: z.string().min(1), peer: machineId, parentSessionId: z.string().min(1), createdAt: z.number() });
+const RequestSchema = z.object({ peer: machineId, requestId: z.string().min(1).max(128), at: z.number() });
 const FileSchema = z.object({
     version: z.literal(1),
     asTarget: z.array(TargetLinkSchema).max(AGENT_DELEGATION_MAX_LINKS),
     asSource: z.array(SourceLinkSchema).max(AGENT_DELEGATION_MAX_LINKS),
     children: z.array(ChildSchema).max(MAX_CHILDREN),
+    // Optional so a file written before it still reads.
+    requests: z.array(RequestSchema).max(MAX_REQUESTS).optional(),
 });
 
 type DelegationFile = z.infer<typeof FileSchema>;
 export type DelegatedChild = z.infer<typeof ChildSchema>;
 
-const EMPTY: DelegationFile = { version: 1, asTarget: [], asSource: [], children: [] };
+const EMPTY: DelegationFile = { version: 1, asTarget: [], asSource: [], children: [], requests: [] };
 
 function readFileState(path: string, log: (message: string) => void): DelegationFile {
     let raw: string;
@@ -115,7 +123,7 @@ export function createAgentDelegationStore(input: { path: string; now?: () => nu
                 if (role === 'target') {
                     const asTarget = current.asTarget.filter((entry) => entry.sourceMachineId !== peerMachineId);
                     if (asTarget.length === current.asTarget.length) return { next: null, result: { removed: false } };
-                    return { next: { ...current, asTarget, children: current.children.filter((child) => child.peer !== peerMachineId) }, result: { removed: true } };
+                    return { next: { ...current, asTarget }, result: { removed: true } };
                 }
                 const asSource = current.asSource.filter((entry) => entry.targetMachineId !== peerMachineId);
                 if (asSource.length === current.asSource.length) return { next: null, result: { removed: false } };
@@ -138,10 +146,28 @@ export function createAgentDelegationStore(input: { path: string; now?: () => nu
             const link = state.asTarget.find((entry) => entry.sourceMachineId === peerMachineId);
             return link ? { createdBy: link.createdBy } : null;
         },
-        recordChild(child: { sessionId: string; peer: string; parentSessionId: string }): Promise<void> {
+        /**
+         * Over the limit, the oldest children that are no longer running go first; a running child is
+         * never forgotten (its stop and its slot depend on this record).
+         */
+        recordChild(child: { sessionId: string; peer: string; parentSessionId: string }, isLive: (sessionId: string) => boolean = () => false): Promise<void> {
             return mutate((current) => {
-                const children = [...current.children.filter((entry) => entry.sessionId !== child.sessionId), { ...child, createdAt: now() }];
-                return { next: { ...current, children: children.slice(-MAX_CHILDREN) }, result: undefined };
+                let children = [...current.children.filter((entry) => entry.sessionId !== child.sessionId), { ...child, createdAt: now() }];
+                for (let index = 0; children.length > MAX_CHILDREN && index < children.length - 1;) {
+                    if (isLive(children[index]!.sessionId)) index++;
+                    else children = [...children.slice(0, index), ...children.slice(index + 1)];
+                }
+                if (children.length > MAX_CHILDREN) throw new Error(`more than ${MAX_CHILDREN} delegated sessions are running here`);
+                return { next: { ...current, children }, result: undefined };
+            });
+        },
+        /** True the first time a peer's request id is seen within the memory window; false for a repeat. */
+        claimRequest(peer: string, requestId: string): Promise<boolean> {
+            return mutate<boolean>((current) => {
+                const at = now();
+                const recent = (current.requests ?? []).filter((entry) => at - entry.at < SPAWN_REQUEST_MEMORY_MS);
+                if (recent.some((entry) => entry.peer === peer && entry.requestId === requestId)) return { next: null, result: false };
+                return { next: { ...current, requests: [...recent, { peer, requestId, at }].slice(-MAX_REQUESTS) }, result: true };
             });
         },
         childOf(sessionId: string, peerMachineId: string): boolean {
