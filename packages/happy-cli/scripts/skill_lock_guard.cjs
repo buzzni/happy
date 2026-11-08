@@ -404,10 +404,16 @@ const operands = (args) => args.filter((arg) => arg && !arg.startsWith('-'));
 /** Every path operand is written, removed or renamed. */
 const WRITES_EVERY_OPERAND = new Set([
     'rm', 'rmdir', 'unlink', 'truncate', 'shred', 'touch', 'chmod', 'chown', 'chgrp', 'chattr', 'chflags',
-    'setfacl', 'mkdir', 'mv', 'patch', 'dos2unix', 'unix2dos', 'xattr', 'ed', 'ex', 'vi', 'vim', 'nvim', 'nano',
+    'setfacl', 'mkdir', 'patch', 'dos2unix', 'unix2dos', 'xattr', 'ed', 'ex', 'vi', 'vim', 'nvim', 'nano',
     'emacs', 'tee', 'srm', 'trash']);
 /** Only the last operand (the destination) is written. */
-const WRITES_LAST_OPERAND = new Set(['cp', 'install', 'ln', 'rsync', 'scp', 'ditto']);
+const WRITES_LAST_OPERAND = new Set(['cp', 'mv', 'install', 'ln', 'rsync', 'scp', 'ditto']);
+/** Options whose value is a file the command writes (`curl -o f`, `wget -O f`, `sort -o f`), or a directory it writes into. */
+const OPTION_WRITES = {
+    curl: { file: ['-o', '--output'], dir: ['--output-dir'], cwdFlag: ['-O', '--remote-name', '--remote-name-all'] },
+    wget: { file: ['-O', '--output-document'], dir: ['-P', '--directory-prefix'], cwdDefault: true },
+    sort: { file: ['-o', '--output'], dir: [] },
+};
 /** Reach into a directory operand recursively: a directory above a locked skill counts. */
 const RECURSIVE = new Set(['rm', 'mv', 'chmod', 'chown', 'chgrp', 'chattr', 'chflags', 'setfacl', 'rsync', 'srm', 'trash']);
 const INPLACE_EDITORS = new Set(['sed', 'gsed', 'perl', 'ruby']);
@@ -459,6 +465,7 @@ function createChecker(scope, env) {
         // `install -d a b` creates every operand as a directory.
         if (verb === 'install' && args.some((arg) => arg === '-d' || arg === '--directory' || /^-[A-Za-z]*d[A-Za-z]*$/.test(arg))) return firstHit(operands(args), cwd, vars, '');
         if (verb === 'dd') return firstHit(args.filter((arg) => arg.startsWith('of=')).map((arg) => arg.slice(3)), cwd, vars, '');
+        if (OPTION_WRITES[verb]) return optionWrites(OPTION_WRITES[verb], args, cwd, vars);
         if (!WRITES_LAST_OPERAND.has(verb)) return null;
         let target = null;
         const rest = [];
@@ -473,11 +480,44 @@ function createChecker(scope, env) {
         // `ln -s <target>` alone links into the working directory.
         const dest = target !== null ? target : ops.length > 1 ? ops[ops.length - 1] : verb === 'ln' && ops.length === 1 ? '.' : null;
         if (dest === null) return null;
-        const merges = verb === 'rsync' || verb === 'ditto' || rest.some((arg) => RECURSIVE_COPY_FLAG.test(arg));
+        // `mv` also removes its sources, a directory above a locked skill included; its destination is checked like cp's.
+        if (verb === 'mv') {
+            const moved = firstHit(target !== null ? ops : ops.slice(0, -1), cwd, vars, 'any');
+            if (moved) return moved;
+        }
+        const merges = verb === 'mv' || verb === 'rsync' || verb === 'ditto' || rest.some((arg) => RECURSIVE_COPY_FLAG.test(arg));
         return scope.hit(dest, cwd, vars, merges ? 'skills' : '');
     }
 
+    function optionWrites(spec, args, cwd, vars) {
+        const files = [];
+        const dirs = [];
+        let intoCwd = spec.cwdDefault === true;
+        for (let i = 0; i < args.length; i++) {
+            const arg = args[i];
+            const eq = arg.indexOf('=');
+            const flag = arg.startsWith('--') && eq > 0 ? arg.slice(0, eq) : arg;
+            const inline = arg.startsWith('--') && eq > 0 ? arg.slice(eq + 1) : null;
+            const value = () => (inline !== null ? inline : args[++i]);
+            if (spec.file.includes(flag)) { files.push(value()); intoCwd = false; }
+            else if (spec.dir.includes(flag)) { dirs.push(value()); intoCwd = false; }
+            else if ((spec.cwdFlag || []).includes(flag)) intoCwd = true;
+            // Short options with the value attached: `-ofile`, `-Ofile`, `-Pdir`.
+            else if (/^-[A-Za-z]./.test(arg) && !arg.startsWith('--')) {
+                const short = arg.slice(0, 2);
+                if (spec.file.includes(short)) { files.push(arg.slice(2)); intoCwd = false; }
+                else if (spec.dir.includes(short)) { dirs.push(arg.slice(2)); intoCwd = false; }
+            }
+        }
+        return firstHit(files.filter((file) => file && file !== '-'), cwd, vars, '') || firstHit(dirs, cwd, vars, '')
+            || (intoCwd ? scope.hitResolved(cwd, '') : null);
+    }
+
     function inplace(verb, args, cwd, vars) {
+        if ((verb === 'awk' || verb === 'gawk') && args.some((arg, i) => (arg === '-i' && args[i + 1] === 'inplace') || arg === '-iinplace' || arg === '--include=inplace'
+            || (arg === '--include' && args[i + 1] === 'inplace'))) {
+            return firstHit(operands(args.filter((arg) => arg !== 'inplace')).slice(1), cwd, vars, '');
+        }
         if (!INPLACE_EDITORS.has(verb)) return null;
         if (!args.some((arg) => arg.startsWith('--in-place') || (/^-[A-Za-z]*i/.test(arg) && !arg.startsWith('--')))) return null;
         return firstHit(operands(args), cwd, vars, '');
@@ -520,6 +560,9 @@ function createChecker(scope, env) {
         }
         const sub = rest.shift();
         if (!sub || !GIT_PATH_WRITES.has(sub)) return null;
+        // Index only: the working tree is not touched.
+        if (sub === 'rm' && rest.includes('--cached')) return null;
+        if (sub === 'restore' && rest.some((arg) => arg === '--staged' || arg === '-S') && !rest.some((arg) => arg === '--worktree' || arg === '-W')) return null;
         const inSkill = scope.hitResolved(where, '');
         if (inSkill) return inSkill;
         const dashDash = rest.indexOf('--');
@@ -540,8 +583,11 @@ function createChecker(scope, env) {
         let dest = cwd;
         for (let i = 0; i < args.length - 1; i++) {
             if (['-C', '--directory', '-d'].includes(args[i])) dest = joinPath(cwd, expand(args[i + 1], vars, env.home));
+            if (args[i].startsWith('--directory=')) dest = joinPath(cwd, expand(args[i].slice('--directory='.length), vars, env.home));
             if (args[i].startsWith('-o') && (verb === '7z' || verb === '7za')) dest = joinPath(cwd, expand(args[i].slice(2), vars, env.home));
         }
+        const last = args[args.length - 1];
+        if (last && last.startsWith('--directory=')) dest = joinPath(cwd, expand(last.slice('--directory='.length), vars, env.home));
         const bundled = args.length > 0 && !args[0].startsWith('-') && args[0].includes('x');
         // `unzip -p|-l|-t|-v|-Z` print, list or test; nothing is written.
         const extracting = (verb === 'unzip' && !args.some((arg) => /^-[A-Za-z]*[pltvZ]/.test(arg))) || ((verb === '7z' || verb === '7za') && args[0] === 'x') || bundled

@@ -91,6 +91,17 @@ describe('skillLockRefusal — terminal writes into a locked skill', () => {
         'cp -t~/.claude/skills/deep-research /tmp/a',
         'install -d ~/.claude/skills/deep-research/new',
         'rm ~/.claude/skills/[!a]*/SKILL.md',
+        // review bot (#1184): option-valued outputs, awk in place, tar --directory=
+        'curl -o ~/.claude/skills/deep-research/SKILL.md https://example.com/x',
+        'curl --output-dir ~/.claude/skills/deep-research -O https://example.com/SKILL.md',
+        'cd ~/.claude/skills/deep-research && curl -O https://example.com/SKILL.md',
+        'wget -O ~/.claude/skills/deep-research/SKILL.md https://example.com/x',
+        'wget --directory-prefix=.claude/skills/review https://example.com/x',
+        'cd ~/.claude/skills/deep-research && wget https://example.com/x',
+        'sort -o ~/.claude/skills/deep-research/list.txt /tmp/a',
+        "gawk -i inplace '{print}' ~/.claude/skills/deep-research/SKILL.md",
+        'tar xzf /tmp/a.tgz --directory=~/.claude/skills',
+        'mv ~/.claude/skills/deep-research/SKILL.md /tmp/x',
     ])('refuses %s', (command) => {
         const reason = refusal(bash(command));
         expect(reason).toContain('스킬 잠금으로 막힘');
@@ -137,6 +148,13 @@ describe('skillLockRefusal — what stays allowed', () => {
         'for f in ~/.claude/skills/deep-research/*.md; do cat $f; done',
         'env -C /tmp rm SKILL.md',
         'rm ~/.claude/skills/[!d]*/SKILL.md',
+        'mv src/a.ts .',
+        'mv /tmp/f ~/',
+        'curl -o /tmp/x https://example.com/x',
+        'wget -O - https://example.com/x | head',
+        'sort ~/.claude/skills/deep-research/list.txt',
+        'git rm --cached .claude/skills/review/SKILL.md',
+        'git restore --staged .claude/skills/review/SKILL.md',
     ])('allows %s', (command) => {
         expect(refusal(bash(command))).toBeNull();
     });
