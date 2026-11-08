@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { assertRemoteOnlyForOrgEndpoint, orgEndpointLocalModeRefusal } from './orgEndpointLocalMode'
 
@@ -16,6 +18,16 @@ describe('orgEndpointLocalModeRefusal', () => {
 
     it('lets a session with no recorded source switch', () => {
         expect(orgEndpointLocalModeRefusal({})).toBeUndefined()
+    })
+})
+
+// The two entries into local mode that have no test harness of their own: the runner's start and the mode loop.
+describe('every way into local mode asks the same refusal', () => {
+    const source = (file: string) => readFileSync(join(__dirname, '..', file), 'utf8')
+
+    it('stops a start in local mode and a loop turning local, before the terminal\'s Claude could run', () => {
+        expect(source('runClaude.ts')).toMatch(/assertRemoteOnlyForOrgEndpoint\(process\.env, options\.startingMode \?\? 'local'\);/)
+        expect(source('loop.ts')).toMatch(/assertRemoteOnlyForOrgEndpoint\(process\.env, mode\);\s*switch \(mode\) \{/)
     })
 })
 
