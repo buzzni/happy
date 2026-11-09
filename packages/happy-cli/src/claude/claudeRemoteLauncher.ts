@@ -454,6 +454,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     let organizationRecoveryWake = new AbortController();
     /** The drain reads it: after its interrupt Claude Code exits 1, which only an interrupted turn explains. */
     let lastResultInterrupted = false;
+    /** The dispatched turn already succeeded: a provider exit after that leaves no refused input to continue. */
+    let dispatchedTurnAnswered = false;
     /*
      * Saycode specs/claude-transient-retry — a turn a temporary API failure ended before it produced
      * anything is asked again after a short wait, unless the user acts first. Survives provider
@@ -720,6 +722,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             const result = message as unknown as { subtype?: unknown; is_error?: unknown; result?: unknown };
             lastResultSucceeded = result.subtype === 'success' && result.is_error !== true;
             lastResultInterrupted = result.subtype === 'error_during_execution';
+            dispatchedTurnAnswered = lastResultSucceeded;
             const notSignedIn = claudeNotSignedInNotice(result);
             if (lastResultSucceeded) { lastOrganizationAuthenticationFailed = false; personalFallback?.noteOrganizationAuthentication(false); }
             if (notSignedIn) session.client.sendSessionEvent({ type: 'message', message: notSignedIn });
@@ -943,7 +946,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             lastResultInterrupted: () => lastResultInterrupted,
         });
         // A dispatched turn has no result yet: an earlier turn's interrupt must not answer for it.
-        const dispatchTurn = () => { lastResultInterrupted = false; transientRetry.turnStarted(); drain?.dispatched(); };
+        const dispatchTurn = () => { lastResultInterrupted = false; dispatchedTurnAnswered = false; transientRetry.turnStarted(); drain?.dispatched(); };
 
         // Track session ID to detect when it actually changes
         // This prevents context loss when mode changes (permission mode, model, etc.)
@@ -1675,7 +1678,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     // Reported after `finally` has flushed what the run already produced, so the
                     // failure is the last thing in the turn and closes it exactly once.
                     if (e instanceof PersonalClaudeRecheckRequired) { launchFailure = PERSONAL_RECHECK_NOTICE; }
-                    else if (setupTokenSwitching?.hasAccountRefusal()) {
+                    else if (setupTokenSwitching?.hasAccountRefusal() && !dispatchedTurnAnswered) {
                         // Observe after queued assistant activity; main keeps this native turn open.
                         if (!lastTurnChannel) messageQueue.enqueue({ __inputContinuation: 'claude-account-switch' });
                         lastResultSucceeded = false;
