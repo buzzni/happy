@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { mkdir, open, readdir, rename, rm, stat } from 'node:fs/promises';
 import { validatePath } from '@/modules/common/pathSecurity';
+import { isOrgEndpointConversation } from './orgEndpointConversation';
 import { getProjectPath } from './path';
 
 export const CLAUDE_SESSION_TRANSFER_CHUNK_MAX_BYTES = 3 * 1024 * 1024;
@@ -31,6 +32,19 @@ export function resolveClaudeSessionTransferPath(input: {
         throw new Error(validation.error ?? 'directory is outside the working directory');
     }
     return join(getProjectPath(validation.resolvedPath), `${input.claudeSessionId}.jsonl`);
+}
+
+/**
+ * The source of a transfer out of this machine. An endpoint conversation stays: its mark does not travel, so on the
+ * other machine nothing would stop it from going on under another source (aplus specs/org-llm-endpoints r3).
+ */
+function resolveTransferSourcePath(input: { directory: string; claudeSessionId: string; allowedRoot: string }): string {
+    const path = resolveClaudeSessionTransferPath(input);
+    if (isOrgEndpointConversation(dirname(path), input.claudeSessionId)) {
+        throw new Error('ORG_LLM_ENDPOINT_PARENT_BOUND: this conversation ran on an organization LLM endpoint and cannot be moved to another machine; '
+            + 'resume the same session, or start a new conversation.');
+    }
+    return path;
 }
 
 export function assertValidClaudeSessionChunk(input: {
@@ -83,7 +97,7 @@ export async function inspectClaudeSessionTransferSource(input: {
     claudeSessionId: string;
     allowedRoot: string;
 }): Promise<ClaudeSessionTransferSourceSnapshot> {
-    const path = resolveClaudeSessionTransferPath(input);
+    const path = resolveTransferSourcePath(input);
     const before = await stat(path);
     if (!before.isFile()) throw new Error('Claude session source must be a file');
     assertValidTransferSize(before.size);
@@ -114,7 +128,7 @@ export async function readClaudeSessionTransferSourceChunk(input: {
         throw new Error('Expected modified time must be a non-negative number');
     }
 
-    const path = resolveClaudeSessionTransferPath(input);
+    const path = resolveTransferSourcePath(input);
     assertUnchangedSource(await stat(path), input);
     const file = await open(path, 'r');
     try {

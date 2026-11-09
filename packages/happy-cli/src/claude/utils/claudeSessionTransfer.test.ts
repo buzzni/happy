@@ -14,6 +14,7 @@ import {
     readClaudeSessionTransferSourceChunk,
     resolveClaudeSessionTransferPath,
 } from './claudeSessionTransfer';
+import { markOrgEndpointConversation } from './orgEndpointConversation';
 
 const SESSION_ID = '93a9705e-bc6a-406d-8dce-8acc014dedbd';
 
@@ -125,6 +126,20 @@ describe('Claude session transfer input validation', () => {
         ])).toEqual(content);
         expect(first.eof).toBe(false);
         expect(second.eof).toBe(true);
+    });
+
+    // aplus specs/org-llm-endpoints r3 — the mark does not travel; on another machine nothing would hold the conversation.
+    it('refuses to inspect or read an endpoint conversation for a transfer', async () => {
+        const source = { directory: projectDirectory, claudeSessionId: SESSION_ID, allowedRoot: root };
+        const path = resolveClaudeSessionTransferPath(source);
+        await mkdir(dirname(path), { recursive: true });
+        await writeFile(path, '{"type":"user"}\n');
+        const snapshot = await inspectClaudeSessionTransferSource(source);
+        markOrgEndpointConversation(dirname(path), SESSION_ID, { version: 1, bindingId: 'b', endpointId: 'e' });
+
+        await expect(inspectClaudeSessionTransferSource(source)).rejects.toThrow(/ORG_LLM_ENDPOINT_PARENT_BOUND/);
+        await expect(readClaudeSessionTransferSourceChunk({ ...source, expectedSize: snapshot.size, expectedModified: snapshot.modified, offset: 0, length: 1 }))
+            .rejects.toThrow(/ORG_LLM_ENDPOINT_PARENT_BOUND/);
     });
 
     it('rejects an oversized source before hashing it', async () => {
