@@ -812,6 +812,104 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         } finally { await handlers.get('switch')?.(); await launched; }
     });
 
+    // walter-gpu 2026-11-09 17:35: the turn succeeded, then the provider died on a background-task
+    // notification while the account was refused. Continuing it re-sent an answered input.
+    it('does not continue an answered turn when the provider exits after its successful result under a refusal', async () => {
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const client = {
+            sessionId: 'happy-session-1',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+            failClaudeLaunchTurn: vi.fn(),
+        };
+        const generations: Array<{ prompts: string[] }> = [];
+        vi.mocked(query).mockImplementation(({ prompt }) => {
+            const generation = { prompts: [] as string[] };
+            generations.push(generation);
+            const first = generations.length === 1;
+            return Object.assign((async function* () {
+                yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+                for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                    generation.prompts.push(JSON.stringify(message.message.content));
+                    yield assistant(`msg-${generations.length}`);
+                    if (first) yield refused;
+                    yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: `result-${generations.length}` };
+                    if (first) throw new Error('Claude Code process exited with code 1');
+                }
+            })(), { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+        });
+        queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 }, cancelLessonReview: vi.fn(),
+            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
+        };
+        const launched = claudeRemoteLauncher(session as unknown as Session);
+        try {
+            // The refusal still moves the session to another account.
+            await vi.waitFor(() => expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1));
+            queue.push('next', { permissionMode: 'default', model: 'claude-sonnet-5' });
+            await vi.waitFor(() => expect(generations[1]?.prompts.join('\n')).toContain('next'));
+            expect(generations[1].prompts[0]).toContain('next');
+            expect(generations.flatMap(generation => generation.prompts).join('\n')).not.toContain(CONTINUE_PROMPT);
+            // The answered turn is not followed by a launch failure or an empty failed turn.
+            expect(client.failClaudeLaunchTurn).not.toHaveBeenCalled();
+            expect(client.sendSessionEvent).not.toHaveBeenCalledWith({ type: 'message',
+                message: describeClaudeLaunchFailure(new Error('Claude Code process exited with code 1')) });
+        } finally { await handlers.get('switch')?.(); await launched; }
+    });
+
+    it('still continues a refused turn whose provider exits mid-turn after an earlier turn was answered', async () => {
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const client = {
+            sessionId: 'happy-session-1',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+            failClaudeLaunchTurn: vi.fn(),
+        };
+        const generations: Array<{ prompts: string[] }> = [];
+        vi.mocked(query).mockImplementation(({ prompt }) => {
+            const generation = { prompts: [] as string[] };
+            generations.push(generation);
+            const first = generations.length === 1;
+            return Object.assign((async function* () {
+                yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+                for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                    generation.prompts.push(JSON.stringify(message.message.content));
+                    if (first && generation.prompts.length === 2) {
+                        yield refused;
+                        throw new Error('Claude Code process exited with code 1');
+                    }
+                    yield assistant(`msg-${generations.length}-${generation.prompts.length}`);
+                    yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: `result-${generations.length}-${generation.prompts.length}` };
+                    if (!first) return;
+                }
+            })(), { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+        });
+        queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 }, cancelLessonReview: vi.fn(),
+            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
+        };
+        const launched = claudeRemoteLauncher(session as unknown as Session);
+        try {
+            await vi.waitFor(() => expect(generations[0]?.prompts).toHaveLength(1));
+            queue.push('again', { permissionMode: 'default', model: 'claude-sonnet-5' });
+            await vi.waitFor(() => expect(generations[1]?.prompts[0]).toContain(CONTINUE_PROMPT));
+        } finally { await handlers.get('switch')?.(); await launched; }
+    });
+
     it('hands a message that arrives after a switch to a provider restarted on the new account', async () => {
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
         const handlers = new Map<string, () => Promise<unknown>>();
