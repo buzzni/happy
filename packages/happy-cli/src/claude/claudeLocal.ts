@@ -8,7 +8,8 @@ import { ensureLocalProxyBypass } from "./utils/proxyBypass";
 import { claudeCheckSession } from "./utils/claudeCheckSession";
 import { claudeFindLastSession } from "./utils/claudeFindLastSession";
 import { getProjectPath } from "./utils/path";
-import { assertRemoteOnlyForOrgEndpoint } from "./utils/orgEndpointLocalMode";
+import { assertRemoteOnlyForOrgEndpoint, ORG_ENDPOINT_LOCAL_MODE_REFUSAL } from "./utils/orgEndpointLocalMode";
+import { isOrgEndpointConversation } from "./utils/orgEndpointConversation";
 import { projectPath } from "@/projectPath";
 import { CHAT_TITLE_SYSTEM_PROMPT, saycodeOwnedSystemPrompt } from "./utils/systemPrompt";
 import { SAYCODE_API_GATEWAY_PROMPT } from '@/prompt/saycodeApiGatewayPrompt';
@@ -152,6 +153,9 @@ export async function claudeLocal(opts: {
             }
         }
     }
+    // Checked where it is picked: another session's conversation can become this directory's last after runClaude's
+    // check, and an endpoint conversation must not go on under this machine's login (aplus specs/org-llm-endpoints r3).
+    if (startFrom && isOrgEndpointConversation(projectDir, startFrom)) throw new Error(ORG_ENDPOINT_LOCAL_MODE_REFUSAL);
     // Session ID handling depends on whether we have a hook server
     // - With hookSettingsPath: Session ID comes from Claude via hook (normal mode)
     // - Without hookSettingsPath: We generate session ID ourselves (offline mode)

@@ -9,7 +9,7 @@ import { hasOrgEndpointConversation, isOrgEndpointConversation, isOrgEndpointCon
 
 export const ORG_ENDPOINT_LOCAL_MODE_REFUSAL = '사내 LLM 엔드포인트로 시작한 대화는 터미널(로컬) 모드로 전환할 수 없습니다. 원격 모드에서 계속하세요.'
 
-const CLAUDE_SESSION_ID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi
+const CLAUDE_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /** The sentence to show when this session may not use the terminal; undefined when it may. */
 export function orgEndpointLocalModeRefusal(env: Record<string, string | undefined>): string | undefined {
@@ -38,9 +38,15 @@ export function orgEndpointContinuationRefusal(input: {
 }): string | undefined {
     if (input.env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint') return undefined
     const args = input.claudeArgs ?? []
-    // Every spelling Claude accepts (`--resume <id>`, `--resume=<id>`, `-r <id>`) carries the id within one argument.
-    const named = args.flatMap((arg) => arg.match(CLAUDE_SESSION_ID) ?? [])
-    const picker = args.some((arg, i) => (arg === '--resume' || arg === '-r') && (args[i + 1] === undefined || args[i + 1].startsWith('-')))
+    // `--resume <value>`, `--resume=<value>`, `-r <value>`; a value that is not an id is the picker's search term.
+    const operands = args.flatMap((arg, i) => {
+        const joined = /^(?:--resume|-r)=(.*)$/.exec(arg)
+        if (joined) return [joined[1]]
+        if (arg !== '--resume' && arg !== '-r') return []
+        return [args[i + 1] === undefined || args[i + 1].startsWith('-') ? '' : args[i + 1]]
+    })
+    const named = operands.filter((value) => CLAUDE_SESSION_ID.test(value)).map((id) => id.toLowerCase())
+    const picker = operands.some((value) => !CLAUDE_SESSION_ID.test(value))
     const last = args.includes('--continue') || args.includes('-c') ? input.lastConversation() : null
     const bound = named.some((id) => isOrgEndpointConversationAnywhere(input.projectDir, id))
         || (picker && hasOrgEndpointConversation(input.projectDir))

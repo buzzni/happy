@@ -87,6 +87,16 @@ describe('orgEndpointContinuationRefusal', () => {
         expect(refusal(args, null, {}, otherRepo)).toBeUndefined()
     })
 
+    it.each([[['--resume', 'login bug']], [['--resume=login']]])('treats a value that is not an id (%j) as the picker\'s search', (args) => {
+        expect(refusal(args)).toMatch(/사내 LLM/)
+        expect(refusal(args, null, {}, otherRepo)).toBeUndefined()
+    })
+
+    it('does not read an id given for anything but resuming as a resume', () => {
+        expect(refusal(['--append-system-prompt', `작업 식별자: ${ENDPOINT}`])).toBeUndefined()
+        expect(refusal([`${ENDPOINT} 요약해줘`])).toBeUndefined()
+    })
+
     it('lets a launch continue any other conversation, or none', () => {
         expect(refusal(['--resume', PLAIN], ENDPOINT)).toBeUndefined()
         expect(refusal([], ENDPOINT)).toBeUndefined()
