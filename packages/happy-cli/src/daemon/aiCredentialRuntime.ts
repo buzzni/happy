@@ -840,6 +840,22 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     } catch { return false }
   }
 
+  /**
+   * Whether Claude Code's default Keychain items (OAuth login, managed API key) are both absent. Attribute-only
+   * lookups: nothing is decrypted, so no prompt. Only exit 44 ("no such item") counts; a locked or denied
+   * Keychain, a timeout and a redirected store (hashed service names) answer false.
+   */
+  async function claudeKeychainEmpty(): Promise<boolean> {
+    const secure = deps.env.CLAUDE_SECURESTORAGE_CONFIG_DIR
+    if (secure || (secure === undefined && deps.env.CLAUDE_CONFIG_DIR)) return false
+    for (const service of ['Claude Code-credentials', 'Claude Code']) {
+      const result = await deps.execFile('/usr/bin/security', ['find-generic-password', '-s', service], {
+        acceptNonZeroExit: true, maxOutputBytes: 64 * 1024, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS }).catch(() => null)
+      if (result?.exitCode !== 44) return false
+    }
+    return true
+  }
+
   async function applyClaudeAdditive(payload: string, knownCompanyIdentities: Set<string>, groupOwned: ReadonlySet<string> = new Set()) {
     const incoming = claudeImportedAccountIdentities(payload)
     if (!incoming) throw new AiCredentialRuntimeError('AI_CREDENTIAL_MERGE_UNSUPPORTED')
@@ -901,10 +917,18 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       const live = await readOptionalJson(join(credentialHome || join(deps.homeDir, '.claude'), '.credentials.json'))
       // Windows has no macOS Keychain fallback. ENOENT alone proves this is only a stale identity;
       // unreadable/malformed/existing stores still require capture, as do explicit environment credentials.
-      const staleWindowsIdentity = (deps.platform ?? process.platform) === 'win32' && live === null
+      // A Mac also needs the Keychain to say so (claudeKeychainEmpty); otherwise every apply stopped here (2026-11-09).
+      const platform = deps.platform ?? process.platform
+      const staleIdentity = async () => live === null
         && !['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN'].some(key => deps.env[key])
-      if ((unregistered && !staleWindowsIdentity) || isObject(live?.claudeAiOauth)) {
-        await deps.execFile('cswap', ['add'], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
+        && (platform === 'win32' || (platform === 'darwin' && config?.primaryApiKey === undefined && await claudeKeychainEmpty()))
+      if ((unregistered && !await staleIdentity()) || isObject(live?.claudeAiOauth)) {
+        await deps.execFile('cswap', ['add'], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS }).catch((error: unknown) => {
+          // Not saved, so nothing may replace the live login; name the step instead of a bare command failure.
+          const required = new AiCredentialRuntimeError('AI_CREDENTIAL_PERSONAL_CAPTURE_REQUIRED')
+          required.failureCause = error instanceof AiCredentialRuntimeError ? error.kind : safeFailureCause(error)
+          throw required
+        })
         before = await list()
         if (before.activeAccountNumber === null) throw new AiCredentialRuntimeError('AI_CREDENTIAL_PERSONAL_CAPTURE_REQUIRED')
       }
