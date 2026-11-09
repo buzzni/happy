@@ -32,6 +32,15 @@ describe('agentPlan capability', () => {
 })
 
 describe('spawn wiring', () => {
+    it('restores the daemon trusted Studio origin after scrubbing a resumed session environment', async () => {
+        const text = await runSource()
+        const start = text.indexOf('const mcpEnvironment = prepareMcpChildEnvironment({')
+        const end = text.indexOf('}, mcpCallerGrantConsumer);', start)
+        expect(start).toBeGreaterThan(0)
+        expect(end).toBeGreaterThan(start)
+        expect(text.slice(start, end)).toContain('trustedStudioOrigin: readTrustedStudioOrigin(process.env)')
+    })
+
     it('opens the envelope with the published grant key, refusing before anything launches', async () => {
         const text = await runSource()
         expect(text).toMatch(/new AgentPlanGrantEnvelopeConsumer\(\{\s*machineId,\s*secretKey: mcpCallerGrantKeyPair\.secretKey,/)
