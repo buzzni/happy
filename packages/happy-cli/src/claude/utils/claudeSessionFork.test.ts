@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdir, writeFile, readFile, rm } from 'node:fs/promises';
+import { mkdir, readdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { existsSync } from 'node:fs';
@@ -9,6 +9,7 @@ import {
     ForkTruncateUuidNotFoundError,
     ForkSourceMissingError,
 } from './claudeSessionFork';
+import { markOrgEndpointConversation } from './orgEndpointConversation';
 
 describe('claudeSessionFork', () => {
     let projectDir: string;
@@ -171,5 +172,13 @@ describe('claudeSessionFork', () => {
             await expect(forkAndTruncateSession(projectDir, 'does-not-exist', 'u1'))
                 .rejects.toBeInstanceOf(ForkSourceMissingError);
         });
+    });
+    // aplus specs/org-llm-endpoints r3 — the copy would be continued in a new session, under another source.
+    it.each(['plain', 'truncated'])('refuses a %s fork of an endpoint conversation before writing anything', async (kind) => {
+        await writeSource([{ type: 'user', uuid: 'u1', message: { content: 'hi' } }]);
+        markOrgEndpointConversation(projectDir, sourceId, { version: 1, bindingId: 'b', endpointId: 'e' });
+        const fork = kind === 'plain' ? forkSession(projectDir, sourceId) : forkAndTruncateSession(projectDir, sourceId, 'u1');
+        await expect(fork).rejects.toThrow(/ORG_LLM_ENDPOINT_PARENT_BOUND/);
+        expect((await readdir(projectDir)).filter((name) => name.endsWith('.jsonl'))).toEqual([`${sourceId}.jsonl`]);
     });
 });

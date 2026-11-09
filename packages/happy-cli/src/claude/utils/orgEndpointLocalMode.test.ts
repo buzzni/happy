@@ -1,8 +1,9 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import type { PersistedSession } from '@/persistence'
-import { ORG_ENDPOINT_BINDING_ENV } from '@/utils/childEnv'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { markOrgEndpointConversation } from './orgEndpointConversation'
 import { assertRemoteOnlyForOrgEndpoint, orgEndpointContinuationRefusal, orgEndpointLocalModeRefusal } from './orgEndpointLocalMode'
 
 // aplus specs/org-llm-endpoints r3 — the terminal's Claude is a global install the daemon cannot pin or verify.
@@ -32,8 +33,12 @@ describe('every way into local mode asks the same refusal', () => {
         expect(source('loop.ts')).toMatch(/assertRemoteOnlyForOrgEndpoint\(process\.env, mode\);\s*switch \(mode\) \{/)
     })
 
+    it('stops the terminal\'s Claude itself, so the offline fallback that calls it directly is covered too', () => {
+        expect(source('claudeLocal.ts')).toMatch(/\}\) \{\s*\/\/[^\n]*\n\s*assertRemoteOnlyForOrgEndpoint\(process\.env, 'local'\);\s*\/\/ Ensure project directory exists/)
+    })
+
     it('stops a start that would continue an endpoint conversation, before the session or Claude exists', () => {
-        expect(source('runClaude.ts')).toMatch(/assertRemoteOnlyForOrgEndpoint\(process\.env, options\.startingMode \?\? 'local'\);\s*const continuationRefusal = orgEndpointContinuationRefusal\(\{\s*env: process\.env, claudeArgs: options\.claudeArgs,\s*lastConversation: \(\) => claudeFindLastSession\(workingDirectory\), records: readPersistedSessions\(\),\s*\}\);\s*if \(continuationRefusal\) throw new Error\(continuationRefusal\);/)
+        expect(source('runClaude.ts')).toMatch(/assertRemoteOnlyForOrgEndpoint\(process\.env, options\.startingMode \?\? 'local'\);\s*const continuationRefusal = orgEndpointContinuationRefusal\(\{\s*env: process\.env, claudeArgs: options\.claudeArgs, projectDir: getProjectPath\(workingDirectory\),\s*lastConversation: \(\) => claudeFindLastSession\(workingDirectory\),\s*\}\);\s*if \(continuationRefusal\) throw new Error\(continuationRefusal\);/)
     })
 })
 
@@ -51,39 +56,44 @@ describe('assertRemoteOnlyForOrgEndpoint', () => {
 
 // `happy claude --resume <id>` (what `happy resume` runs) carries no endpoint env, so the guard above cannot see it.
 describe('orgEndpointContinuationRefusal', () => {
-    const record = (claudeSessionId: string, env?: Record<string, string>): PersistedSession => ({
-        encryptionKey: 'k', encryptionVariant: 'dataKey', seq: 1, metadataVersion: 1, agentStateVersion: 1, savedAt: 1,
-        metadata: { path: '/p', host: 'h', claudeSessionId }, ...(env ? { agentEnvironment: env } : {}),
-    } as PersistedSession)
-    const records = {
-        bound: record('aaaa-endpoint', { [ORG_ENDPOINT_BINDING_ENV]: 'b:e:t:1' }),
-        // A corrupt binding is still a binding.
-        corrupt: record('cccc-corrupt', { [ORG_ENDPOINT_BINDING_ENV]: '' }),
-        plain: record('bbbb-plain'),
-    }
-    const refusal = (claudeArgs: string[] | undefined, last: string | null = null, env: Record<string, string> = {}) =>
-        orgEndpointContinuationRefusal({ env, claudeArgs, lastConversation: () => last, records })
+    const ENDPOINT = 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa'
+    const PLAIN = 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb'
+    const projects = mkdtempSync(join(tmpdir(), 'org-endpoint-continuation-'))
+    const repo = join(projects, '-work-repo')
+    const otherRepo = join(projects, '-work-other')
+    markOrgEndpointConversation(repo, ENDPOINT, { version: 1, bindingId: 'b', endpointId: 'e' })
+    const refusal = (claudeArgs: string[] | undefined, last: string | null = null, env: Record<string, string> = {}, projectDir = repo) =>
+        orgEndpointContinuationRefusal({ env, claudeArgs, projectDir, lastConversation: () => last })
 
     it.each([
-        [['--resume', 'aaaa-endpoint']], [['-r', 'aaaa-endpoint']], [['--resume=aaaa-endpoint']],
-        [['--happy-starting-mode', 'remote', '--resume', 'aaaa-endpoint']], [['--resume', 'cccc-corrupt']],
+        [['--resume', ENDPOINT]], [['-r', ENDPOINT]], [[`--resume=${ENDPOINT}`]], [['--resume', ENDPOINT.toUpperCase()]],
+        [['--happy-starting-mode', 'remote', '--resume', ENDPOINT]], [['--resume', ENDPOINT, '--fork-session']],
     ])('refuses a launch naming an endpoint conversation (%j), in either mode', (args) => {
         expect(refusal(args)).toMatch(/사내 LLM/)
     })
 
-    it.each([[['--continue']], [['-c']], [['--resume']], [['-r', '--verbose']]])('refuses %j when it picks an endpoint conversation as the last one', (args) => {
-        expect(refusal(args, 'aaaa-endpoint')).toMatch(/사내 LLM/)
-        expect(refusal(args, 'bbbb-plain')).toBeUndefined()
+    it('refuses a named endpoint conversation from another project directory too', () => {
+        expect(refusal(['--resume', ENDPOINT], null, {}, otherRepo)).toMatch(/사내 LLM/)
+    })
+
+    it.each([[['--continue']], [['-c']]])('refuses %j when it picks an endpoint conversation as the last one', (args) => {
+        expect(refusal(args, ENDPOINT)).toMatch(/사내 LLM/)
+        expect(refusal(args, PLAIN)).toBeUndefined()
         expect(refusal(args, null)).toBeUndefined()
     })
 
+    it.each([[['--resume']], [['-r']], [['--resume', '--verbose']]])('refuses Claude\'s own picker (%j) where it would list an endpoint conversation', (args) => {
+        expect(refusal(args)).toMatch(/사내 LLM/)
+        expect(refusal(args, null, {}, otherRepo)).toBeUndefined()
+    })
+
     it('lets a launch continue any other conversation, or none', () => {
-        expect(refusal(['--resume', 'bbbb-plain'], 'aaaa-endpoint')).toBeUndefined()
-        expect(refusal([], 'aaaa-endpoint')).toBeUndefined()
-        expect(refusal(undefined, 'aaaa-endpoint')).toBeUndefined()
+        expect(refusal(['--resume', PLAIN], ENDPOINT)).toBeUndefined()
+        expect(refusal([], ENDPOINT)).toBeUndefined()
+        expect(refusal(undefined, ENDPOINT)).toBeUndefined()
     })
 
     it('lets the endpoint session itself continue its conversation', () => {
-        expect(refusal(['--resume', 'aaaa-endpoint'], null, { HAPPY_AI_AUTH_SOURCE: 'org-endpoint' })).toBeUndefined()
+        expect(refusal(['--resume', ENDPOINT], null, { HAPPY_AI_AUTH_SOURCE: 'org-endpoint' })).toBeUndefined()
     })
 })

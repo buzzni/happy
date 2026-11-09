@@ -8,6 +8,7 @@
  */
 import type { PersistedSession } from '@/persistence'
 import { ORG_ENDPOINT_BINDING_ENV } from '@/utils/childEnv'
+import { isOrgEndpointConversationAnywhere } from '@/claude/utils/orgEndpointConversation'
 import { parseOrgEndpointBinding } from './sessionEnv'
 
 /** `Metadata.orgLlmEndpoint`: only ids, never an address, a target or a token. */
@@ -35,18 +36,22 @@ export function isOrgEndpointBoundRecord(record: PersistedSession): boolean {
  * The refusal for a spawn that continues a conversation (`parentSessionId`, or a native `resumeClaudeSessionId` that
  * some recorded session ran) when that conversation ran on an endpoint. No selection excuses it, not even one of the same
  * endpoint: a new binding would carry the conversation to another URL or generation. Continuing the same session goes
- * through the resume path, whose resume-check pins both. Only this machine's records are visible here: a parent
- * on another machine is the requester's check, through the metadata marker.
+ * through the resume path, whose resume-check pins both. Only this machine is visible here: a parent on another
+ * machine is the requester's check, through the metadata marker. A native id is known by the conversation's mark
+ * beside its transcript (orgEndpointConversation) — the record learns no Claude id until a resume, and a fork has a new one.
  */
 export function orgEndpointParentRefusal(input: {
     parentSessionId?: string
     resumeClaudeSessionId?: string
     records: Record<string, PersistedSession>
+    /** The spawn directory's Claude project directory, where a resumed transcript is looked for. */
+    projectDir: string
 }): string | undefined {
     const parent = input.parentSessionId ? input.records[input.parentSessionId] : undefined
     const bound = (parent !== undefined && isOrgEndpointBoundRecord(parent))
-        || (input.resumeClaudeSessionId !== undefined && Object.values(input.records).some((record) =>
-            (record.metadata as { claudeSessionId?: unknown }).claudeSessionId === input.resumeClaudeSessionId && isOrgEndpointBoundRecord(record)))
+        || (input.resumeClaudeSessionId !== undefined && (isOrgEndpointConversationAnywhere(input.projectDir, input.resumeClaudeSessionId)
+            || Object.values(input.records).some((record) =>
+                (record.metadata as { claudeSessionId?: unknown }).claudeSessionId === input.resumeClaudeSessionId && isOrgEndpointBoundRecord(record))))
     if (!bound) return undefined
     return 'ORG_LLM_ENDPOINT_PARENT_BOUND: this conversation ran on an organization LLM endpoint and cannot be continued in a new session; '
         + 'resume the same session, or start a new conversation.'

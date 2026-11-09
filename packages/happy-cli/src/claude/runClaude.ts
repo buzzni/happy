@@ -17,7 +17,7 @@ import { consumeInputEvidenceOption, inputEvidenceMetadata, resolveInputEvidence
 import { logger } from '@/ui/logger';
 import { loop } from '@/claude/loop';
 import { AgentGoalStatus, AgentState } from '@/api/types';
-import { Credentials, readPersistedSessions, readSettings } from '@/persistence';
+import { Credentials, readSettings } from '@/persistence';
 import { resolveSessionSandboxConfig } from '@/sandbox/resolveSessionSandboxConfig';
 import { resolveSessionSandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import { EnhancedMode, PermissionMode } from './loop';
@@ -306,8 +306,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // nor its conversation continued by a launch that is not that session.
     assertRemoteOnlyForOrgEndpoint(process.env, options.startingMode ?? 'local');
     const continuationRefusal = orgEndpointContinuationRefusal({
-        env: process.env, claudeArgs: options.claudeArgs,
-        lastConversation: () => claudeFindLastSession(workingDirectory), records: readPersistedSessions(),
+        env: process.env, claudeArgs: options.claudeArgs, projectDir: getProjectPath(workingDirectory),
+        lastConversation: () => claudeFindLastSession(workingDirectory),
     });
     if (continuationRefusal) throw new Error(continuationRefusal);
 

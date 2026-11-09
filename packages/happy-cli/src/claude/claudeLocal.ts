@@ -8,6 +8,7 @@ import { ensureLocalProxyBypass } from "./utils/proxyBypass";
 import { claudeCheckSession } from "./utils/claudeCheckSession";
 import { claudeFindLastSession } from "./utils/claudeFindLastSession";
 import { getProjectPath } from "./utils/path";
+import { assertRemoteOnlyForOrgEndpoint } from "./utils/orgEndpointLocalMode";
 import { projectPath } from "@/projectPath";
 import { CHAT_TITLE_SYSTEM_PROMPT, saycodeOwnedSystemPrompt } from "./utils/systemPrompt";
 import { SAYCODE_API_GATEWAY_PROMPT } from '@/prompt/saycodeApiGatewayPrompt';
@@ -62,6 +63,8 @@ export async function claudeLocal(opts: {
     /** False under an organization permission ceiling (codexcli-org-requirements R10.10): the sandbox adds no bypass flag. */
     allowBypass?: boolean,
 }) {
+    // Every way to the terminal's Claude, the offline fallback included (aplus specs/org-llm-endpoints r3).
+    assertRemoteOnlyForOrgEndpoint(process.env, 'local');
 
     // Ensure project directory exists
     const projectDir = getProjectPath(opts.path);

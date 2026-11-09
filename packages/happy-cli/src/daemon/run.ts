@@ -149,7 +149,7 @@ import { resolveRecoveredInputEvidenceEnvironment } from '@/utils/inputEvidenceS
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
 import { createOrgLlmEndpointStudioClient } from './orgLlmEndpointStudio';
 import { createOrgEndpointStartReporter } from './orgLlmEndpointStartReport';
-import { orgEndpointParentRefusal } from './orgEndpointSessionMarker';
+import { isOrgEndpointBoundMetadata, orgEndpointParentRefusal } from './orgEndpointSessionMarker';
 import { createSetupTokenCapacityFence, proveCapacityProcessesStopped } from './setupTokenCapacityFence';
 import { createCollectorSchedule } from './collectorSchedule';
 import { organizationResumeRefusal, resumeSetupTokenEnvironment, shareResumeInFlight, type ResumeAuthRequirement } from './resumeSetupTokenRebind';
@@ -2094,7 +2094,7 @@ export async function startDaemon(): Promise<void> {
         ? orgEndpointParentRefusal({
           ...(options.parentSessionId ? { parentSessionId: options.parentSessionId } : {}),
           ...(options.resumeClaudeSessionId ? { resumeClaudeSessionId: options.resumeClaudeSessionId } : {}),
-          records: readPersistedSessions(),
+          records: readPersistedSessions(), projectDir: getProjectPath(options.directory),
         })
         : undefined;
       if (endpointParentRefusal) return { type: 'error', errorMessage: endpointParentRefusal };
@@ -3299,6 +3299,15 @@ export async function startDaemon(): Promise<void> {
         // generation or not at all (a corrupt record throws here); no other address or source stands in.
         const resumeOrgEndpoint = readOrgEndpointResumeSelection(tracked.agentEnvironment);
         if (resumeOrgEndpoint && resumeBinding) throw new Error('Recorded org endpoint and setup-token bindings conflict; the session is not resumed');
+        // The session's own metadata says it ran on an endpoint, but this record has no binding (lost to a webhook the
+        // daemon did not track, for one): whatever source would resume it now is another one.
+        if (!resumeOrgEndpoint && isOrgEndpointBoundMetadata(metadata)) {
+          return {
+            type: 'error',
+            code: 'SESSION_RESUME_FAILED',
+            errorMessage: 'This session ran on an organization LLM endpoint and its binding is not recorded on this machine; the session is not resumed on another source.',
+          };
+        }
         // The local copy of the endpoint can be older than the administrator's last change (a removed address, a rotated
         // token, a stopped endpoint, a revoked assignment). Studio confirms the binding, or the session is not resumed.
         if (resumeOrgEndpoint) {

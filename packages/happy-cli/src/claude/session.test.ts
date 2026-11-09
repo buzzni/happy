@@ -1,8 +1,13 @@
-import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { Session } from './session';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import type { ApiSessionClient } from '@/api/apiSession';
 import type { EnhancedMode } from './loop';
+import { isOrgEndpointConversation } from './utils/orgEndpointConversation';
+import { getProjectPath } from './utils/path';
 
 function createSession(overrides: { startingMode?: 'local' | 'remote' } = {}) {
     const keepAlive = vi.fn();
@@ -49,6 +54,36 @@ describe('Session mode', () => {
         expect(session.mode).toBe('local');
         expect(keepAlive).toHaveBeenCalledWith(false, 'local');
         expect(onModeChange).toHaveBeenCalledWith('local');
+        session.cleanup();
+    });
+});
+
+// aplus specs/org-llm-endpoints r3 — what continues a transcript finds the mark beside it (orgEndpointConversation).
+describe('Session marks the conversations of an organization LLM endpoint session', () => {
+    afterEach(() => { vi.unstubAllEnvs(); });
+
+    it('marks every Claude id it learns, with ids only, beside the transcript', () => {
+        vi.stubEnv('CLAUDE_CONFIG_DIR', mkdtempSync(join(tmpdir(), 'org-endpoint-session-mark-')));
+        vi.stubEnv('HAPPY_AI_AUTH_SOURCE', 'org-endpoint');
+        vi.stubEnv('HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING', 'binding-1:endpoint-1:target-a:3');
+        const { session } = createSession({ startingMode: 'remote' });
+        session.onSessionFound('aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa');
+        // A resume mints a new id for the same conversation.
+        session.onSessionFound('bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb');
+        const projectDir = getProjectPath('/tmp');
+        expect(isOrgEndpointConversation(projectDir, 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa')).toBe(true);
+        expect(isOrgEndpointConversation(projectDir, 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb')).toBe(true);
+        expect(JSON.parse(readFileSync(join(projectDir, 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa.org-endpoint'), 'utf8')))
+            .toEqual({ version: 1, bindingId: 'binding-1', endpointId: 'endpoint-1' });
+        session.cleanup();
+    });
+
+    it('marks nothing for any other session', () => {
+        vi.stubEnv('CLAUDE_CONFIG_DIR', mkdtempSync(join(tmpdir(), 'org-endpoint-session-mark-')));
+        vi.stubEnv('HAPPY_AI_AUTH_SOURCE', 'org-bundle');
+        const { session } = createSession({ startingMode: 'remote' });
+        session.onSessionFound('aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa');
+        expect(isOrgEndpointConversation(getProjectPath('/tmp'), 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa')).toBe(false);
         session.cleanup();
     });
 });

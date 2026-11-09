@@ -203,12 +203,19 @@ describe('org-endpoint wiring (aplus specs/org-llm-endpoints C5)', () => {
     expect(text).toMatch(/if \(tracked\) tracked\.agentEnvironment = agentEnvironment;\s*const saved = readPersistedSessions\(\)\[sessionId\];\s*if \(saved\) persistSession\(sessionId, \{ \.\.\.saved, agentEnvironment, savedAt: Date\.now\(\) \}\);/)
   })
 
+  it('a resume of a session whose metadata carries the endpoint marker but whose record has no binding is refused', async () => {
+    const text = await runSource()
+    expect(text).toMatch(/const resumeOrgEndpoint = readOrgEndpointResumeSelection\(tracked\.agentEnvironment\);[\s\S]{0,400}if \(!resumeOrgEndpoint && isOrgEndpointBoundMetadata\(metadata\)\) \{\s*return \{\s*type: 'error',\s*code: 'SESSION_RESUME_FAILED',/)
+    // Before any other source is prepared for the resume.
+    expect(text.indexOf('isOrgEndpointBoundMetadata(metadata)')).toBeLessThan(text.indexOf('const resumeMachineRuntime = resumeBinding'))
+  })
+
   it('a spawn that continues another conversation is refused for an endpoint parent before anything is created, whatever selection the requester sent', async () => {
     const text = await runSource()
     const guard = text.indexOf('orgEndpointParentRefusal({')
     expect(guard).toBeGreaterThan(0)
     expect(guard).toBeLessThan(text.indexOf('await fs.access(directory);'))
-    expect(text).toMatch(/options\.parentSessionId \|\| options\.resumeClaudeSessionId\s*\?\s*orgEndpointParentRefusal\(\{[\s\S]*?records: readPersistedSessions\(\),\s*\}\)/)
+    expect(text).toMatch(/options\.parentSessionId \|\| options\.resumeClaudeSessionId\s*\?\s*orgEndpointParentRefusal\(\{[\s\S]*?records: readPersistedSessions\(\), projectDir: getProjectPath\(options\.directory\),\s*\}\)/)
     // No selection reaches the check: a same-endpoint selection must not excuse a parent that has a binding record or marker.
     expect(text.slice(guard, text.indexOf('if (endpointParentRefusal)'))).not.toMatch(/selection/)
     expect(text).toMatch(/if \(endpointParentRefusal\) return \{ type: 'error', errorMessage: endpointParentRefusal \};/)
