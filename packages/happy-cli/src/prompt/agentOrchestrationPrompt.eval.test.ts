@@ -49,6 +49,18 @@ describe('natural-language child orchestration routing eval (T14)', () => {
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('A session started by delegation never uses `--machine` again');
   });
 
+  // saycode-cli agentRemoteReach: a child sealed to its own PC answers only stop; other verbs fail remote_session_sealed.
+  it('tells the model a sealed remote child answers only stop and cannot be collected before reporting', () => {
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).not.toContain('then use the same wait/read/prompt/steer/stop');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('If `ls` marks the child sealed (end-to-end encrypted on that PC), only `stop` reaches it');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('`read`/`prompt`/`steer`/`wait` fail with remote_session_sealed');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('tell the user to open it in Desktop');
+    const collect = AGENT_ORCHESTRATION_SYSTEM_PROMPT.indexOf('to collect the result before reporting completion');
+    const sealedException = AGENT_ORCHESTRATION_SYSTEM_PROMPT.indexOf('(not possible for a sealed remote child — see delegation)');
+    expect(collect).toBeGreaterThan(-1);
+    expect(sealedException).toBe(collect + 'to collect the result before reporting completion '.length);
+  });
+
   it('routes an explicitly durable child away from provider-native subagents', () => {
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('visible, reopenable, or controllable later');
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('MUST use `happy agent`');
