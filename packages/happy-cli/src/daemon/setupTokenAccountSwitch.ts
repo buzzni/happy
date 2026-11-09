@@ -18,6 +18,7 @@ import { parseSharedMachineSetupTokenAuthority, readSetupTokenResumeSelection, S
 import type { TrackedSession } from './types'
 import type { SessionPersistenceResult } from '@/persistence'
 import { logger } from '@/ui/logger'
+import { studioMachineRouteUrl, type StudioCapacityOperation, type StudioDaemonRoute } from './studioMachineRoutes'
 
 export type SetupTokenUsageObservation = {
   observationId?: string
@@ -103,7 +104,7 @@ const refusal = (status: number) => status === 401 || status === 403 ? 'FORBIDDE
 
 export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps) {
   const capacityTargets = new Map<string, { requestId: string; target: string }>();
-  const post = (route: string, body: object) => deps.fetch(`${deps.studioOrigin}/api/claude-setup-token/daemon/${route}`, {
+  const post = (route: StudioDaemonRoute, body: object) => deps.fetch(studioMachineRouteUrl(String(deps.studioOrigin), `daemon/${route}`), {
     method: 'POST', redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     headers: { Authorization: `Bearer ${deps.bearer()}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   })
@@ -354,7 +355,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
   }
 
   return {
-    async capacity(sessionId: string, running: string, operation: string, actor: import('../claude/setupTokenUserCapacity').SetupTokenCapacityActor, runtimeId: string, extra?: Record<string, unknown>, signal?: AbortSignal) {
+    async capacity(sessionId: string, running: string, operation: StudioCapacityOperation, actor: import('../claude/setupTokenUserCapacity').SetupTokenCapacityActor, runtimeId: string, extra?: Record<string, unknown>, signal?: AbortSignal) {
       if (!deps.studioOrigin || actor.machineId !== deps.machineId || actor.sessionId !== sessionId) return { ok: false as const, reason: 'CAPACITY_ACTOR_FORBIDDEN' };
       const parsed = parseBinding(running);
       const shared = sharedSession(sessionId, running);
@@ -372,13 +373,17 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
           if (operation === 'claim' && (extra?.managedAccountId !== currentId || extra?.credentialGeneration !== generation || disabled.includes(currentId))) return { ok: false as const, reason: 'CAPACITY_BINDING_FORBIDDEN' };
           if (operation === 'reserve') extra = { ...extra, excludeManagedAccountIds: disabled };
         }
-        const response = await deps.fetch(`${deps.studioOrigin}/api/claude-setup-token/capacity/${operation}`, {
+        const response = await deps.fetch(studioMachineRouteUrl(deps.studioOrigin, `capacity/${operation}`), {
           method: 'POST', redirect: 'error', signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
           headers: { Authorization: `Bearer ${deps.bearer()}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ ...extra, companyId: actor.companyId, machineId: deps.machineId, sessionId, requestId: actor.requestId, contentHash: actor.contentHash, actorProof: actor.proof, runtimeId }),
         });
+        if (!response.ok) {
+          // Only the capacity handler speaks CAPACITY_*; anything else (the global auth gate, a proxy) is named by its status.
+          const refusal = await response.json().catch(() => null) as { error?: unknown } | null;
+          return { ok: false as const, reason: typeof refusal?.error === 'string' && /^CAPACITY_[A-Z0-9_]+$/.test(refusal.error) ? refusal.error : `CAPACITY_HTTP_${response.status}` };
+        }
         const admission = await response.json() as Record<string, unknown>;
-        if (!response.ok) return { ok: false as const, reason: typeof admission.error === 'string' ? admission.error : 'CAPACITY_UNAVAILABLE' };
         if (operation === 'reserve' && admission.state !== 'reserved' || ['claim', 'finish', 'cancel', 'lost'].includes(operation) && capacityTargets.get(sessionId)?.requestId === admission.executionRequestId) {
           capacityTargets.delete(sessionId);
           if (shared) sharedStartPreferred.delete(shared.session);

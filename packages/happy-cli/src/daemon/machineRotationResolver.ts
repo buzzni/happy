@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { rotationDecodeBinary, rotationSha256 } from '@slopus/happy-wire';
 import type { MachineRotationConfig } from './machineSetupTokenProtocol';
+import { studioMachineRoutePath, studioMachineRouteUrl } from './studioMachineRoutes';
 
 /**
  * aplus specs/shared-machine-server-signing Phase 3c — machine setup-token rotation without hand-set environment.
@@ -44,7 +45,7 @@ export function createMachineRotationResolver<R>(deps: {
     const runtimes = new Map<string, { runtime: R; config: MachineRotationConfig }>();
 
     const studioKey = cachedLookup(now, async (origin: string) => {
-        const response = await fetcher(origin + '/api/claude-setup-token/daemon/v2/public-key', {
+        const response = await fetcher(studioMachineRouteUrl(origin, 'daemon/v2/public-key'), {
             redirect: 'error', signal: AbortSignal.timeout(5_000), headers: { accept: 'application/json' } });
         if (!response.ok) throw new Error('STUDIO_KEY_UNAVAILABLE');
         const text = await response.text();
@@ -55,7 +56,7 @@ export function createMachineRotationResolver<R>(deps: {
         return { publicKey: value.publicKey, keyId: value.keyId };
     });
     const accepted = cachedLookup(now, async (companyId: string) => {
-        const url = new URL('/api/claude-setup-token/daemon/v2/acceptance', deps.studioOrigin!);
+        const url = new URL(studioMachineRoutePath('daemon/v2/acceptance'), deps.studioOrigin!);
         url.searchParams.set('companyId', companyId);
         url.searchParams.set('machineId', deps.machineId);
         const response = await fetcher(url, { redirect: 'error', signal: AbortSignal.timeout(5_000), headers: { Authorization: `Bearer ${deps.bearer()}` } });

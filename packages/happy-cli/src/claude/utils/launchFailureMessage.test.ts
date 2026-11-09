@@ -9,6 +9,13 @@ describe('describeClaudeLaunchFailure', () => {
         expect(describeClaudeLaunchFailure(new Error('CLAUDE_PERSONAL_AUTH_NOT_VERIFIED'))).toMatch(/Personal Claude stopped.*account or policy/);
     });
 
+    it('reports a capacity check Studio refused before its handler as an organization account problem, not a machine failure', () => {
+        // The daemon names such a refusal CAPACITY_HTTP_<status> (aplus #5930: the global auth gate answered 401).
+        const text = describeClaudeLaunchFailure(new Error('CAPACITY_HTTP_401'));
+        expect(text).toMatch(/조직 AI 계정/);
+        expect(text).not.toMatch(/could not start on this machine/);
+    });
+
     it('explains a refused organization credential without asking for a personal login', () => {
         const text = describeClaudeLaunchFailure(new Error('CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED'));
         expect(text).toMatch(/Organization Claude stopped.*assigned account or policy/);

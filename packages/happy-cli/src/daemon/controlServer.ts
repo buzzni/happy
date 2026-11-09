@@ -33,6 +33,7 @@ import { SetupTokenActivitySchema } from '@slopus/happy-wire';
 import type { SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
 import type { AutomationTurnResult } from '@/api/automationTurnTracker';
 import type { SessionRetention } from './sessionRetention';
+import { STUDIO_CAPACITY_OPERATIONS } from './studioMachineRoutes';
 
 /**
  * The only control-server paths a managed runtime may serve, and even these
@@ -517,7 +518,7 @@ export function startDaemonControlServer({
     typed.post('/setup-token/capacity', {
       bodyLimit: 16384,
       schema: { body: z.object({ sessionId: z.string().min(1).max(128), binding: z.string().min(1).max(8192),
-        operation: z.enum(['reserve', 'observe', 'claim', 'heartbeat', 'finish', 'cancel', 'recover', 'lost', 'delivery']), runtimeId: z.string().min(1).max(128),
+        operation: z.enum(STUDIO_CAPACITY_OPERATIONS), runtimeId: z.string().min(1).max(128),
         actor: z.object({ companyId: z.string(), machineId: z.string(), sessionId: z.string(), requestId: z.string(), contentHash: z.string(), proof: z.string().max(4096) }).strict(),
         extra: z.record(z.string(), z.unknown()).optional() }).strict() },
     }, async (request, reply) => {
