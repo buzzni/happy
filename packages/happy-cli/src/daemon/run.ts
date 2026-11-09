@@ -3270,6 +3270,8 @@ export async function startDaemon(): Promise<void> {
             claudeStartingMode: 'remote',
             automationPrompt: options?.automation !== undefined,
             emptyCodexSession: { serverSeq: serverSnapshot.seq, processedSeq: baselineSeq },
+            // A machine setup-token execution proves an unused session only through its launch journal.
+            ...(resumeBinding && isMachineSetupTokenBinding(resumeBinding.binding) ? {} : { emptyClaudeSession: { serverSeq: serverSnapshot.seq, processedSeq: baselineSeq } }),
             ...(unstartedMachineExecution ? { emptyMachineClaudeSession: { sessionId: happySessionId, serverSeq: serverSnapshot.seq, processedSeq: baselineSeq, startNeverSubmitted: true as const } } : {}),
           },
         );

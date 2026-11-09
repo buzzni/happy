@@ -96,6 +96,10 @@ the command's `--model` overrides `HAPPY_INITIAL_MODEL`, which overrides the
 stored model pin. The one-shot environment seed is consumed even when the
 command model wins, preventing inheritance by child processes. Revisit the
 zero-sequence proof if session creation begins writing durable messages.
+Claude follows the same zero-sequence proof (without `--resume`) when it has no
+Claude session ID, e.g. its first send was refused before it reached the server.
+A machine setup-token execution instead proves an unused session only through
+its launch journal (`startSubmitted`), so it is not given the zero-sequence proof.
 
 This document describes the Happy CLI (`packages/happy-cli`) and its daemon. The CLI is both an interactive tool and a background session manager that keeps machine state in sync with the server.
 
