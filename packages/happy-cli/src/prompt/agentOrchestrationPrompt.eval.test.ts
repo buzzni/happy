@@ -53,12 +53,14 @@ describe('natural-language child orchestration routing eval (T14)', () => {
   it('tells the model a sealed remote child answers only stop and cannot be collected before reporting', () => {
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).not.toContain('then use the same wait/read/prompt/steer/stop');
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('If `ls` marks the child sealed (end-to-end encrypted on that PC), only `stop` reaches it');
-    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('`read`/`prompt`/`steer`/`wait` fail with remote_session_sealed');
+    // Seq observation and multi-id wait take other paths, and broker gates may refuse first, so the reason is not guaranteed.
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('`read`/`prompt`/`steer`/`wait` cannot reach it (usually remote_session_sealed)');
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('tell the user to open it in Desktop');
-    const collect = AGENT_ORCHESTRATION_SYSTEM_PROMPT.indexOf('to collect the result before reporting completion');
-    const sealedException = AGENT_ORCHESTRATION_SYSTEM_PROMPT.indexOf('(not possible for a sealed remote child — see delegation)');
-    expect(collect).toBeGreaterThan(-1);
-    expect(sealedException).toBe(collect + 'to collect the result before reporting completion '.length);
+    // A remote child that is not sealed keeps every verb.
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('then control it with the usual verbs');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain(
+      'to collect the result before reporting completion (not possible for a sealed remote child — see delegation)',
+    );
   });
 
   it('routes an explicitly durable child away from provider-native subagents', () => {
