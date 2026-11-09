@@ -88,7 +88,13 @@ export function createSetupTokenCapacityRuntime(deps: {
     try { files = await readdir(deps.directory) } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; files = [] }
     for (const name of files.filter(name => /^[a-f0-9]{64}\.json$/.test(name))) {
       const entry: Entry = JSON.parse(await readFile(join(deps.directory, name), 'utf8'))
-      if (['claiming', 'attempting', 'result'].includes(entry.phase)) await send(entry, 'lost')
+      if (!['claiming', 'attempting', 'result'].includes(entry.phase)) continue
+      try { await send(entry, 'lost') } catch (error) {
+        // The server holds no execution for this input (its claim was rejected or never arrived): nothing is left to
+        // reconcile. Settle it here, or every later input in this session fails on the same answer.
+        if (!(error instanceof Error && error.message === 'CAPACITY_NOT_FOUND')) throw error
+        entry.phase = 'finished'; await save(entry)
+      }
     }
     recovered = true
   }

@@ -67,6 +67,41 @@ it('does not release provider background work on result and releases it on autho
   await runtime.providerStopped(true)
   expect(operations.at(-1)).toBe('finish')
 })
+it('settles a claim the server never recorded so later inputs in the session run, without redelivering that input', async () => {
+  const dir = await directory()
+  const request = vi.fn(async (operation: string) => {
+    if (operation === 'reserve') return { state: 'off' }
+    if (operation === 'observe') throw new Error('CAPACITY_ASSIGNMENT_CHANGED')
+    if (operation === 'lost') throw new Error('CAPACITY_NOT_FOUND')
+    return { state: 'delivery_unknown' }
+  })
+  const deps = { directory: dir, request, notify: () => {}, move: async () => false }
+  const runtime = createSetupTokenCapacityRuntime(deps)
+  await runtime.admit(actor, new AbortController().signal)
+  await expect(runtime.observe(actor, new AbortController().signal)).rejects.toThrow('CAPACITY_ASSIGNMENT_CHANGED')
+  const next = { ...actor, requestId: 'next' }
+  expect(await createSetupTokenCapacityRuntime(deps).admit(next, new AbortController().signal)).toMatchObject({ state: 'off' })
+  request.mockClear()
+  expect(await createSetupTokenCapacityRuntime(deps).admit({ ...actor, requestId: 'later' }, new AbortController().signal)).toMatchObject({ state: 'off' })
+  expect(request.mock.calls.map(call => call[0])).not.toContain('lost')
+  await expect(createSetupTokenCapacityRuntime(deps).admit(actor, new AbortController().signal)).rejects.toThrow('CAPACITY_DELIVERY_UNKNOWN')
+})
+it('keeps reconciling an unconfirmed claim while the server cannot answer for it', async () => {
+  const dir = await directory()
+  const request = vi.fn(async (operation: string) => {
+    if (operation === 'reserve') return { state: 'off' }
+    if (operation === 'observe' || operation === 'lost') throw new Error('CAPACITY_UNAVAILABLE')
+    return { state: 'cancelled' }
+  })
+  const deps = { directory: dir, request, notify: () => {}, move: async () => false }
+  const runtime = createSetupTokenCapacityRuntime(deps)
+  await runtime.admit(actor, new AbortController().signal)
+  await expect(runtime.observe(actor, new AbortController().signal)).rejects.toThrow('CAPACITY_UNAVAILABLE')
+  await expect(createSetupTokenCapacityRuntime(deps).admit({ ...actor, requestId: 'next' }, new AbortController().signal)).rejects.toThrow('CAPACITY_UNAVAILABLE')
+  request.mockClear()
+  await expect(createSetupTokenCapacityRuntime(deps).admit({ ...actor, requestId: 'later' }, new AbortController().signal)).rejects.toThrow('CAPACITY_UNAVAILABLE')
+  expect(request.mock.calls.map(call => call[0])).toContain('lost')
+})
 it('restores a result cached just before a journal crash without submitting the input again', async () => {
   const dir = await directory()
   const request = vi.fn(async (operation: string, _actor: unknown, _runtime: string, extra?: Record<string, unknown>) => operation === 'reserve'
