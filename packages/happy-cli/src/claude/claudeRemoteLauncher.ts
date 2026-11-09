@@ -1678,12 +1678,15 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     // Reported after `finally` has flushed what the run already produced, so the
                     // failure is the last thing in the turn and closes it exactly once.
                     if (e instanceof PersonalClaudeRecheckRequired) { launchFailure = PERSONAL_RECHECK_NOTICE; }
-                    else if (setupTokenSwitching?.hasAccountRefusal() && !dispatchedTurnAnswered) {
-                        // Observe after queued assistant activity; main keeps this native turn open.
-                        if (!lastTurnChannel) messageQueue.enqueue({ __inputContinuation: 'claude-account-switch' });
-                        lastResultSucceeded = false;
+                    else if (setupTokenSwitching?.hasAccountRefusal()) {
+                        // An answered turn still moves accounts, but leaves no refused input to continue.
+                        if (!dispatchedTurnAnswered) {
+                            // Observe after queued assistant activity; main keeps this native turn open.
+                            if (!lastTurnChannel) messageQueue.enqueue({ __inputContinuation: 'claude-account-switch' });
+                            lastResultSucceeded = false;
+                        }
                         const switched = await setupTokenSwitching.switchIfWanted();
-                        if (switched.switched && switched.continueAfter && !lastTurnChannel && !controller.signal.aborted) continuation = mode ?? lastTurnMode;
+                        if (!dispatchedTurnAnswered && switched.switched && switched.continueAfter && !lastTurnChannel && !controller.signal.aborted) continuation = mode ?? lastTurnMode;
                         launchFailure = switched.switched ? null : describeCheckpointFailure(e) ?? describeClaudeLaunchFailure(e);
                     } else launchFailure = describeCheckpointFailure(e) ?? describeClaudeLaunchFailure(e);
                     continue;
