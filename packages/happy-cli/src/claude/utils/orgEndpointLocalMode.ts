@@ -38,9 +38,9 @@ export function orgEndpointContinuationRefusal(input: {
 }): string | undefined {
     if (input.env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint') return undefined
     const args = input.claudeArgs ?? []
-    // `--resume <value>`, `--resume=<value>`, `-r <value>`; a value that is not an id is the picker's search term.
+    // `--resume <value>`, `--resume=<value>`, `-r <value>`, `-r<value>`; a value that is not an id is the picker's search term.
     const operands = args.flatMap((arg, i) => {
-        const joined = /^(?:--resume|-r)=(.*)$/.exec(arg)
+        const joined = /^(?:--resume=|-r=?)(.+)$/.exec(arg)
         if (joined) return [joined[1]]
         if (arg !== '--resume' && arg !== '-r') return []
         return [args[i + 1] === undefined || args[i + 1].startsWith('-') ? '' : args[i + 1]]

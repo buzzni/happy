@@ -66,7 +66,7 @@ describe('orgEndpointContinuationRefusal', () => {
         orgEndpointContinuationRefusal({ env, claudeArgs, projectDir, lastConversation: () => last })
 
     it.each([
-        [['--resume', ENDPOINT]], [['-r', ENDPOINT]], [[`--resume=${ENDPOINT}`]], [['--resume', ENDPOINT.toUpperCase()]],
+        [['--resume', ENDPOINT]], [['-r', ENDPOINT]], [[`--resume=${ENDPOINT}`]], [[`-r${ENDPOINT}`]], [[`-r=${ENDPOINT}`]], [['--resume', ENDPOINT.toUpperCase()]],
         [['--happy-starting-mode', 'remote', '--resume', ENDPOINT]], [['--resume', ENDPOINT, '--fork-session']],
     ])('refuses a launch naming an endpoint conversation (%j), in either mode', (args) => {
         expect(refusal(args)).toMatch(/사내 LLM/)
