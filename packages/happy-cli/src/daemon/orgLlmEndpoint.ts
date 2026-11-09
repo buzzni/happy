@@ -39,7 +39,12 @@ export type OrgLlmEndpointEntry = {
     userId: string
 }
 
-export type OrgLlmEndpointStore = { version: 1; endpoints: Record<string, OrgLlmEndpointEntry> }
+export type OrgLlmEndpointStore = {
+    version: 1
+    endpoints: Record<string, OrgLlmEndpointEntry>
+    /** Per endpoint, the address of every target a sync has since dropped: a target id never changes its address. */
+    retiredTargets?: Record<string, Record<string, string>>
+}
 
 /** What an endpoint without a token hands the agent: Claude Code insists on some auth value. Not a secret. */
 export const ORG_LLM_ENDPOINT_NO_AUTH_TOKEN = 'saycode-org-endpoint-no-auth'
@@ -125,7 +130,7 @@ export function parseOrgLlmEndpointStore(raw: string): OrgLlmEndpointStore {
     let parsed: unknown
     try { parsed = JSON.parse(raw) } catch { throw new OrgLlmEndpointError(STORE_INVALID) }
     if (!isRecord(parsed) || parsed.version !== 1 || !isRecord(parsed.endpoints)) throw new OrgLlmEndpointError(STORE_INVALID)
-    closedKeys(parsed, ['version', 'endpoints'], STORE_INVALID)
+    closedKeys(parsed, ['version', 'endpoints', 'retiredTargets'], STORE_INVALID)
     const endpoints: Record<string, OrgLlmEndpointEntry> = {}
     for (const [id, row] of Object.entries(parsed.endpoints)) {
         if (!isRecord(row) || !isOrgEndpointId(row.companyId) || !isOrgEndpointId(row.userId)) throw new OrgLlmEndpointError(STORE_INVALID)
@@ -134,27 +139,49 @@ export function parseOrgLlmEndpointStore(raw: string): OrgLlmEndpointStore {
         if (entry.id !== id) throw new OrgLlmEndpointError(STORE_INVALID)
         endpoints[id] = entry
     }
-    return { version: 1, endpoints }
+    if (parsed.retiredTargets === undefined) return { version: 1, endpoints }
+    if (!isRecord(parsed.retiredTargets)) throw new OrgLlmEndpointError(STORE_INVALID)
+    const retiredTargets: Record<string, Record<string, string>> = {}
+    for (const [endpointId, targets] of Object.entries(parsed.retiredTargets)) {
+        if (!isOrgEndpointId(endpointId) || !isRecord(targets)) throw new OrgLlmEndpointError(STORE_INVALID)
+        retiredTargets[endpointId] = {}
+        for (const [targetId, url] of Object.entries(targets)) {
+            if (!isOrgEndpointId(targetId)) throw new OrgLlmEndpointError(STORE_INVALID)
+            retiredTargets[endpointId][targetId] = normalizeTargetUrl(url, STORE_INVALID)
+        }
+    }
+    return { version: 1, endpoints, retiredTargets }
 }
 
 /**
- * Whether a sync at the stored generation changes what a session of that generation connects with. The server raises
- * the generation for every such change (an address, the token or auth mode, a model, a limit), so a sync that does not
- * is no administrator's change: a session bound to `<target>:<generation>` would resume on another address or token.
- * Targets may still come and go at one generation (enabling one does not raise it); a target that stays keeps its address.
+ * Whether a sync would change what a session bound to `<target>:<generation>` connects with, without the server having
+ * raised the generation. Studio raises it for every such change (an address, the token or auth mode, a model, a limit)
+ * and gives a changed address a new target id, so a target id keeps its address for good — across generations and
+ * after a sync dropped it (a target can be disabled and enabled again at one generation). Anything else is no
+ * administrator's change: the session would resume on another address or token after resume-check approved its ids.
  */
-export function isOrgLlmEndpointGenerationConflict(stored: OrgLlmEndpointEntry, entry: OrgLlmEndpointEntry): boolean {
-    if (stored.generation !== entry.generation) return false
+export function isOrgLlmEndpointSyncConflict(store: OrgLlmEndpointStore | undefined, entry: OrgLlmEndpointEntry): boolean {
+    const stored = store?.endpoints[entry.id]
+    const known = new Map(Object.entries(store?.retiredTargets?.[entry.id] ?? {}))
+    for (const target of stored?.targets ?? []) known.set(target.id, target.url)
+    if (entry.targets.some((target) => known.has(target.id) && known.get(target.id) !== target.url)) return true
+    if (!stored || stored.generation !== entry.generation) return false
     const tiers = (models: OrgLlmEndpointEntry['models']) => TIERS.map((tier) => models[tier] ?? '').join('\n')
     return stored.model !== entry.model || tiers(stored.models) !== tiers(entry.models)
         || stored.maxContextTokens !== entry.maxContextTokens || stored.apiTimeoutMs !== entry.apiTimeoutMs
         || stored.authMode !== entry.authMode || stored.token !== entry.token
-        || entry.targets.some((target) => stored.targets.some((kept) => kept.id === target.id && kept.url !== target.url))
 }
 
-/** A new store with only that endpoint's entry replaced. */
+/** A new store with only that endpoint's entry replaced; the targets it drops are kept as retired addresses. */
 export function replaceOrgLlmEndpoint(store: OrgLlmEndpointStore | undefined, entry: OrgLlmEndpointEntry): OrgLlmEndpointStore {
-    return { version: 1, endpoints: { ...store?.endpoints, [entry.id]: entry } }
+    const current = new Set(entry.targets.map((target) => target.id))
+    const retired = Object.fromEntries([
+        ...Object.entries(store?.retiredTargets?.[entry.id] ?? {}),
+        ...(store?.endpoints[entry.id]?.targets ?? []).map((target) => [target.id, target.url] as const),
+    ].filter(([id]) => !current.has(id)))
+    const { [entry.id]: _previous, ...otherRetired } = store?.retiredTargets ?? {}
+    const retiredTargets = Object.keys(retired).length > 0 ? { ...otherRetired, [entry.id]: retired } : otherRetired
+    return { version: 1, endpoints: { ...store?.endpoints, [entry.id]: entry }, ...(Object.keys(retiredTargets).length > 0 ? { retiredTargets } : {}) }
 }
 
 const PROBE_BODY_LIMIT = 16 * 1024

@@ -4441,6 +4441,20 @@ describe('organization LLM endpoint', () => {
     expect(files.get(storePath)).toBe(before)
   })
 
+  it('refuses a target that comes back under its id with another address, after a sync dropped it, at any generation', async () => {
+    const { runtime } = setup()
+    await runtime.orgLlmEndpointSync(syncParams({}, { generation: 5 }))
+    // Disabled at the same generation: Studio syncs enabled targets only.
+    await expect(runtime.orgLlmEndpointSync(syncParams({}, { generation: 5, targets: [{ id: 'target-b', url: 'https://llm-b.corp.example' }] })))
+      .resolves.toEqual({ ok: true, generation: 5 })
+    for (const generation of [5, 6]) {
+      await expect(runtime.orgLlmEndpointSync(syncParams({}, { generation, targets: [{ id: 'target-a', url: 'https://elsewhere.example' }] })))
+        .rejects.toMatchObject({ kind: 'ORG_LLM_ENDPOINT_GENERATION_CONFLICT' })
+    }
+    // Enabled again where it was: taken.
+    await expect(runtime.orgLlmEndpointSync(syncParams({}, { generation: 5 }))).resolves.toEqual({ ok: true, generation: 5 })
+  })
+
   it('takes the same entry again, and a newer generation that changes anything', async () => {
     const { runtime } = setup()
     await runtime.orgLlmEndpointSync(syncParams({}, { generation: 5 }))

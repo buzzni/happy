@@ -121,6 +121,15 @@ describe('local store', () => {
     expect(before.endpoints['endpoint-1']!.generation).toBe(3)
   })
 
+  it('keeps the address of a target a sync dropped, forgets it when the target is back, and round-trips it', () => {
+    const both = replaceOrgLlmEndpoint(undefined, entry())
+    const urlOf = (id: string) => both.endpoints['endpoint-1']!.targets.find((target) => target.id === id)!.url
+    const dropped = replaceOrgLlmEndpoint(both, entry({ targets: both.endpoints['endpoint-1']!.targets.filter((target) => target.id !== 'target-a') }))
+    expect(dropped.retiredTargets).toEqual({ 'endpoint-1': { 'target-a': urlOf('target-a') } })
+    expect(parseOrgLlmEndpointStore(JSON.stringify(dropped))).toEqual(dropped)
+    expect(replaceOrgLlmEndpoint(dropped, entry()).retiredTargets).toBeUndefined()
+  })
+
   it('round-trips through its file text', () => {
     const store = replaceOrgLlmEndpoint(undefined, entry())
     expect(parseOrgLlmEndpointStore(JSON.stringify(store))).toEqual(store)
@@ -132,6 +141,8 @@ describe('local store', () => {
     { label: 'extra key', raw: JSON.stringify({ version: 1, endpoints: {}, extra: 1 }) },
     { label: 'an entry under another id', raw: JSON.stringify({ version: 1, endpoints: { other: entry() } }) },
     { label: 'an entry that is no longer valid', raw: JSON.stringify({ version: 1, endpoints: { 'endpoint-1': { ...entry(), generation: 0 } } }) },
+    { label: 'a retired target that is no address', raw: JSON.stringify({ version: 1, endpoints: {}, retiredTargets: { 'endpoint-1': { 'target-a': 'ftp://x' } } }) },
+    { label: 'retired targets that are no map', raw: JSON.stringify({ version: 1, endpoints: {}, retiredTargets: [] }) },
   ])('refuses a store with $label', ({ raw }) => {
     expect(failure(() => parseOrgLlmEndpointStore(raw))).toBe('ORG_LLM_ENDPOINT_STORE_INVALID')
   })
