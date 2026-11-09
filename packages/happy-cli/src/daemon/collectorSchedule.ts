@@ -5,6 +5,7 @@
  * through the same signed collector boundary as every other collection.
  */
 import { logger } from '@/ui/logger'
+import { studioMachineRouteUrl } from './studioMachineRoutes'
 
 const REQUEST_TIMEOUT_MS = 15_000
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
@@ -22,7 +23,7 @@ export type CollectorScheduleDeps = {
 type DueAccount = { managedAccountId: string; credentialGeneration: number; policyRevision: number }
 
 export function createCollectorSchedule(deps: CollectorScheduleDeps) {
-  const post = (route: string, body: object) => deps.fetch(`${deps.studioOrigin}/api/claude-setup-token/daemon/collect/${route}`, {
+  const post = (route: 'due' | 'reserve' | 'publish', body: object) => deps.fetch(studioMachineRouteUrl(String(deps.studioOrigin), `daemon/collect/${route}`), {
     method: 'POST', redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     headers: { Authorization: `Bearer ${deps.bearer()}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   })

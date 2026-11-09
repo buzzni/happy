@@ -9,6 +9,7 @@ import {
   type DaemonRotationRequestBody, type MachineSetupTokenBindingV2Document,
 } from '@slopus/happy-wire'
 import type { DeviceKeys } from './deviceKeys'
+import { studioMachineRouteUrl } from './studioMachineRoutes'
 import type { DeviceOrgPin } from './deviceOrgPinStore'
 
 export class MachineRotationError extends Error {
@@ -94,7 +95,7 @@ export function createMachineSetupTokenProtocol(deps: {
       const result = tail.then(() => postOnce(body, recovered, signal)); tail = result.catch(() => undefined); return result
     },
     async checkPublicKey() {
-      const response = await fetcher(config.studioOrigin + '/api/claude-setup-token/daemon/v2/public-key', {
+      const response = await fetcher(studioMachineRouteUrl(config.studioOrigin, 'daemon/v2/public-key'), {
         redirect: 'error', signal: AbortSignal.timeout(15000), headers: { accept: 'application/json' } })
       const value = await boundedJson(response) as Record<string, unknown>
       if (!response.ok || value.version !== 2 || value.algorithm !== 'Ed25519' || value.publicKey !== config.studioPublicKey

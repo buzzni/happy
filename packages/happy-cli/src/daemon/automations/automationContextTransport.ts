@@ -9,6 +9,7 @@ import { decodeBase64, decrypt } from '@/api/encryption'
 import type { AutomationContextLaunchDependencies, AutomationContextLaunchRecord, AutomationContextLaunchJournal } from './automationContextLaunch'
 import { readTrustedStudioOrigin } from '../setupTokenBindingProof'
 import type { DeviceKeys } from '../deviceKeys'
+import { studioMachineRoutePath } from '../studioMachineRoutes'
 import type { DeviceOrgPin } from '../deviceOrgPinStore'
 
 const admissionSchema = z.strictObject({ targetProof: z.string().min(1).max(8192), executionBindingRequired: z.boolean(),
@@ -124,7 +125,7 @@ export function createAutomationContextAuthorizer(input: {
     const authority = record.executionAuthority!
     if ((Object.keys(fixed) as Array<keyof typeof fixed>).some(key => authority[key] !== fixed[key])) return conflict()
     const publicKey = z.strictObject({ version: z.literal(2), algorithm: z.literal('Ed25519'), keyId: z.string(), publicKey: z.string(),
-      studioOrigin: z.string(), happyOrigin: z.string() }).parse(await json('/api/claude-setup-token/daemon/v2/public-key'))
+      studioOrigin: z.string(), happyOrigin: z.string() }).parse(await json(studioMachineRoutePath('daemon/v2/public-key')))
     const issuerKey = rotationDecodeBinary(publicKey.publicKey, 32)
     if (publicKey.studioOrigin !== origin || publicKey.happyOrigin !== challenge.happyOrigin || publicKey.keyId !== challenge.keyId
       || await rotationSha256(issuerKey) !== challenge.keyId) return conflict()
