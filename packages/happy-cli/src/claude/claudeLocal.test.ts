@@ -10,7 +10,9 @@ const {
     mockWrapCommand,
     mockSandboxCleanup,
     mockLoggerDebug,
+    markedConversations,
 } = vi.hoisted(() => ({
+    markedConversations: new Set<string>(),
     mockSpawn: vi.fn(),
     mockClaudeFindLastSession: vi.fn(),
     mockInitializeSandbox: vi.fn(),
@@ -51,7 +53,8 @@ vi.mock('@/prompt/agentOrchestrationPrompt', () => ({
 
 vi.mock('node:fs', () => ({
     mkdirSync: vi.fn(),
-    existsSync: vi.fn(() => true)
+    // Every transcript exists; an endpoint conversation's mark only where a test puts one.
+    existsSync: vi.fn((path: string) => !path.endsWith('.org-endpoint') || markedConversations.has(path))
 }));
 
 vi.mock('./utils/claudeCheckSession', () => ({
@@ -113,6 +116,23 @@ describe('claudeLocal --continue handling', () => {
             expect(env.APLUS_SESSION_ID).toBe('self-session');
         } finally {
             for (const key of Object.keys(injected)) delete process.env[key]
+        }
+    });
+
+    // aplus specs/org-llm-endpoints r3 — another session's conversation can become the last one after runClaude checked.
+    it.each([
+        ['--continue picks', ['--continue']],
+        ['--resume names', ['--resume', '123e4567-e89b-12d3-a456-426614174000']],
+    ])('refuses before spawning when %s an endpoint conversation', async (_label, claudeArgs) => {
+        mockClaudeFindLastSession.mockReturnValue('123e4567-e89b-12d3-a456-426614174000');
+        markedConversations.add('/tmp/123e4567-e89b-12d3-a456-426614174000.org-endpoint');
+        try {
+            await expect(claudeLocal({ abort: new AbortController().signal, sessionId: null, path: '/tmp', onSessionFound, claudeArgs }))
+                .rejects.toThrow(/사내 LLM/);
+            expect(mockSpawn).not.toHaveBeenCalled();
+            expect(onSessionFound).not.toHaveBeenCalled();
+        } finally {
+            markedConversations.clear();
         }
     });
 

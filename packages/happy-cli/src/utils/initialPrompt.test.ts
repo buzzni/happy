@@ -18,6 +18,7 @@ import {
   consumePendingInitialSaycodeSystemPromptEnabled,
   defaultClaudeModelForRuntime,
   normalizeClaudeModelForRuntime,
+  resolveClaudeModelForRuntime,
   stageInitialPromptEnvironment,
 } from './initialPrompt'
 
@@ -200,6 +201,59 @@ describe('normalizeClaudeModelForRuntime', () => {
     expect(normalizeClaudeModelForRuntime('glm-5.3-flash', {
       ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
     })).toBe('glm-5.3-flash')
+  })
+})
+
+// aplus specs/org-llm-endpoints r2 — an endpoint session runs only the endpoint's own model names.
+describe('model names in an organization LLM endpoint runtime', () => {
+  const endpoint = {
+    HAPPY_AI_AUTH_SOURCE: 'org-endpoint', ANTHROPIC_BASE_URL: 'https://llm.corp.example', ANTHROPIC_MODEL: 'corp-model',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'corp-big', ANTHROPIC_DEFAULT_SONNET_MODEL: 'corp-model', ANTHROPIC_DEFAULT_HAIKU_MODEL: 'corp-small',
+  }
+
+  it('folds a requested Claude model, an alias and Default onto the endpoint names', () => {
+    expect(normalizeClaudeModelForRuntime('claude-sonnet-5-5', endpoint)).toBe('corp-model')
+    expect(normalizeClaudeModelForRuntime('claude-fable-5', endpoint)).toBe('corp-model')
+    expect(normalizeClaudeModelForRuntime('opus', endpoint)).toBe('corp-big')
+    expect(normalizeClaudeModelForRuntime('haiku', endpoint)).toBe('corp-small')
+    expect(normalizeClaudeModelForRuntime('default', endpoint)).toBe('corp-model')
+  })
+
+  it('keeps an unpicked model unpicked, and gives the spawn that named none the endpoint model', () => {
+    expect(normalizeClaudeModelForRuntime(undefined, endpoint)).toBeUndefined()
+    expect(defaultClaudeModelForRuntime(endpoint, 'opus')).toBe('corp-model')
+    expect(defaultClaudeModelForRuntime({ ...endpoint, ANTHROPIC_MODEL: '' }, 'opus')).toBe('opus')
+  })
+
+  it('leaves every other runtime as it was', () => {
+    expect(normalizeClaudeModelForRuntime('claude-sonnet-5-5', { ...endpoint, HAPPY_AI_AUTH_SOURCE: 'org-bundle' })).toBe('claude-sonnet-5-5')
+    expect(defaultClaudeModelForRuntime({}, 'opus')).toBe('opus')
+  })
+
+  // The way every turn resolves its model (runClaude): normalize, then give a turn that named none the default.
+  // Applying the default to an already-normalized value used to overwrite the tier mapping with ANTHROPIC_MODEL.
+  describe('a turn\'s model, normalized and then defaulted as runClaude does', () => {
+    const resolved = (model: string | undefined, env: NodeJS.ProcessEnv) => resolveClaudeModelForRuntime(model, env)
+
+    it.each([
+      ['opus', 'corp-big'], ['claude-opus-5-5', 'corp-model'], ['haiku', 'corp-small'], ['claude-sonnet-5-5', 'corp-model'],
+      ['corp-small', 'corp-small'], ['corp-big', 'corp-big'],
+    ])('keeps the endpoint mapping %s -> %s instead of the plain endpoint model', (requested, expected) => {
+      expect(resolved(requested, endpoint)).toBe(expected)
+    })
+
+    it('gives a turn that named no model the endpoint model, and nothing else', () => {
+      expect(resolved(undefined, endpoint)).toBe('corp-model')
+      expect(resolved('', endpoint)).toBe('corp-model')
+    })
+
+    it.each([
+      ['claude-opus-5', { ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic' }],
+      [undefined, { ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic' }],
+      ['claude-sonnet-5', {}], [undefined, {}], ['opus', { HAPPY_AI_AUTH_SOURCE: 'org-bundle' }],
+    ])('is exactly the earlier normalize-then-default for every other runtime (%s, %j)', (model, env) => {
+      expect(resolved(model, env)).toBe(defaultClaudeModelForRuntime(env, normalizeClaudeModelForRuntime(model, env)))
+    })
   })
 })
 

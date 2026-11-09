@@ -102,7 +102,7 @@ import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { createManagedFollowUpHandler } from '@/managed/managedFollowUp';
 import { consumeOutputFormatSeed } from './structuredOutput';
 import { claudeLaunchMcpServers, consumeLaunchMcpServersSeed, launchMcpServersBeside, readClaudeMcpServerNames } from '@/aplus/launchMcpServers';
-import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodePromptBlocks, consumePendingInitialSaycodeSystemPromptEnabled, defaultClaudeModelForRuntime, normalizeClaudeModelForRuntime, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
+import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodePromptBlocks, consumePendingInitialSaycodeSystemPromptEnabled, defaultClaudeModelForRuntime, normalizeClaudeModelForRuntime, resolveClaudeModelForRuntime, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
 import {
     createSessionModelPinPublisher,
     publishedSessionModelPin,
@@ -142,6 +142,8 @@ import { createSessionOrgRequirementsGate } from '@/orgRequirements/sessionGate'
 import { orgRequirementsDirectory } from '@/orgRequirements/store';
 import { createClaudeOrgRequirements, orgTitleModel, stripModelSelectionEnv, type OrgModelRequest } from './claudeOrgRequirements';
 import { messageModelOrigin } from '@/orgRequirements/resolve';
+import { assertRemoteOnlyForOrgEndpoint, orgEndpointContinuationRefusal } from './utils/orgEndpointLocalMode';
+import { claudeFindLastSession } from './utils/claudeFindLastSession';
 
 /**
  * How long a confirmed initial prompt waits for its acknowledgement before the
@@ -299,6 +301,15 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     if (options.startedBy === 'daemon' && options.startingMode === 'local') {
         throw new Error('Daemon-spawned sessions cannot use local/interactive mode. Use --happy-starting-mode remote or spawn sessions directly from terminal.');
     }
+
+    // An organization LLM endpoint session cannot be handed to the terminal's Claude (aplus specs/org-llm-endpoints r3),
+    // nor its conversation continued by a launch that is not that session.
+    assertRemoteOnlyForOrgEndpoint(process.env, options.startingMode ?? 'local');
+    const continuationRefusal = orgEndpointContinuationRefusal({
+        env: process.env, claudeArgs: options.claudeArgs, projectDir: getProjectPath(workingDirectory),
+        lastConversation: () => claudeFindLastSession(workingDirectory),
+    });
+    if (continuationRefusal) throw new Error(continuationRefusal);
 
     // Set backend for offline warnings (before any API calls)
     connectionState.setBackend('Claude');
@@ -1398,15 +1409,11 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         if (message.meta?.hasOwnProperty('model')) {
             messageOrgModel = { requested: message.meta.model || null, origin: messageModelOrigin(message.meta.model, message.meta.modelSource) };
             if (!delegatedDifficultyRoutingMessage) currentOrgModel = messageOrgModel;
-            messageModel = normalizeClaudeModelForRuntime(
-                message.meta.model || undefined,
-                process.env,
-            ); // null and Z.AI-incompatible Fable become undefined
-            // A cleared model means "the default" — and on Z.AI the default is
-            // the flash model, not the SDK's own sonnet tier (= glm-4.7 there).
-            // happy-app sends exactly this for a Default selection, so without
-            // it the first mobile turn silently changes the session's model.
-            messageModel = defaultClaudeModelForRuntime(process.env, messageModel);
+            // null and Z.AI-incompatible Fable become undefined, and a cleared model means "the default" — and on
+            // Z.AI the default is the flash model, not the SDK's own sonnet tier (= glm-4.7 there). happy-app sends
+            // exactly this for a Default selection, so without it the first mobile turn silently changes the
+            // session's model. One call, so an endpoint's tier mapping is not replaced by its plain model.
+            messageModel = resolveClaudeModelForRuntime(message.meta.model || undefined, process.env);
             if (!delegatedDifficultyRoutingMessage) {
                 currentModel = messageModel;
                 logger.debug(`[loop] Model updated from user message: ${messageModel || 'reset to default'}`);
@@ -1698,10 +1705,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         if (routed) {
             if (routed.route.model) {
                 messageOrgModel = { requested: routed.route.model, origin: 'auto' };
-                messageModel = defaultClaudeModelForRuntime(
-                    process.env,
-                    normalizeClaudeModelForRuntime(routed.route.model, process.env),
-                );
+                messageModel = resolveClaudeModelForRuntime(routed.route.model, process.env);
                 routed.route.model = messageModel;
             }
             if (routed.route.effort && VALID_CLAUDE_EFFORTS.has(routed.route.effort)) {
@@ -2071,7 +2075,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
      * the SDK lose the way into it, and a request's model variables go when models are restricted (R10.8).
      */
     const claudeOrgRequirements = orgGate ? createClaudeOrgRequirements(orgGate, {
-        normalizeModel: (model) => defaultClaudeModelForRuntime(process.env, normalizeClaudeModelForRuntime(model, process.env)),
+        normalizeModel: (model) => resolveClaudeModelForRuntime(model, process.env),
         attendance: () => turnAttendance.current(),
         initialPermissionMode: () => initialPermissionMode ?? 'default',
     }) : undefined;
@@ -2182,10 +2186,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         // Run the revision through the same runtime normalization an
         // accepted turn gets, or a Z.AI-style substitution would be skipped
         // for exactly the turns the boundary repaired.
-        const model = defaultClaudeModelForRuntime(
-            process.env,
-            normalizeClaudeModelForRuntime(revised.model, process.env),
-        );
+        const model = resolveClaudeModelForRuntime(revised.model, process.env);
         if (!model) return null;
         const effort = revised.effort && VALID_CLAUDE_EFFORTS.has(revised.effort)
             ? revised.effort

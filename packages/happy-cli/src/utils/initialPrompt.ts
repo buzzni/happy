@@ -7,6 +7,7 @@ import type { RawJSONLines } from '@/claude/types'
 import { configuration } from '@/configuration'
 import type { PermissionMode } from '@/api/types'
 import { ZAI_CLAUDE_DEFAULT_MODEL } from '@/managed/zaiClaudeEnvironment'
+import { foldModelToOrgEndpoint, isOrgEndpointRuntime } from '@/claude/utils/orgEndpointModel'
 
 /**
  * Largest prompt we still pass inline as an environment value.
@@ -116,6 +117,8 @@ export function normalizeClaudeModelForRuntime(
   model: string | undefined,
   env: NodeJS.ProcessEnv,
 ): string | undefined {
+  // The endpoint serves its own model names only (aplus specs/org-llm-endpoints r2).
+  if (isOrgEndpointRuntime(env)) return foldModelToOrgEndpoint(model, env)
   if (!isZaiClaudeRuntime(env) || !model) return model
   if (model === 'fable' || model.startsWith('claude-fable-')) return undefined
   if (model === 'default') return ZAI_CLAUDE_DEFAULT_MODEL
@@ -139,7 +142,23 @@ export function defaultClaudeModelForRuntime(
   env: NodeJS.ProcessEnv,
   fallback: string | undefined,
 ): string | undefined {
+  if (isOrgEndpointRuntime(env)) return env.ANTHROPIC_MODEL
   return isZaiClaudeRuntime(env) ? ZAI_CLAUDE_DEFAULT_MODEL : fallback
+}
+
+/**
+ * A turn's model as the runtime runs it: `normalizeClaudeModelForRuntime`, then the default for a turn that named none.
+ *
+ * Every per-turn caller needs both steps and neither alone: `defaultClaudeModelForRuntime` on an already-normalized
+ * value would replace an endpoint's tier mapping (opus -> corp-big) with its plain model. Z.AI and the other runtimes
+ * keep exactly the earlier composition.
+ */
+export function resolveClaudeModelForRuntime(
+  model: string | undefined,
+  env: NodeJS.ProcessEnv,
+): string | undefined {
+  if (isOrgEndpointRuntime(env)) return foldModelToOrgEndpoint(model || undefined, env) ?? env.ANTHROPIC_MODEL
+  return defaultClaudeModelForRuntime(env, normalizeClaudeModelForRuntime(model, env))
 }
 
 /**

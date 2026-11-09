@@ -27,6 +27,21 @@ describe('trusted session agent execution', () => {
     expect(output.response).toEqual({ type: 'owner-contact-v1-result', requestId: 'request', error: 'owner-contact-unavailable' })
     expect(JSON.stringify(output)).not.toContain('secret-bearer')
   })
+  // aplus specs/org-llm-endpoints r3 — a child would start under the machine's default source.
+  it('refuses a spawn from an organization LLM endpoint session without running the CLI, and runs every other verb', async () => {
+    const root = await fixture(), entrypoint = join(root, 'cli.mjs')
+    await writeFile(entrypoint, `console.log(JSON.stringify({exitCode:0,stdout:JSON.stringify({ok:true,argv:process.argv.slice(2)})}))`)
+    const execute = createAgentHostExecutor({ sessionId: 'current', directory: root, env: { HAPPY_AI_AUTH_SOURCE: 'org-endpoint' }, entrypoint })
+    for (const argv of [['spawn', '--prompt', 'x'], ['spawn', '--handoff']]) {
+      const refused = await execute(argv, new AbortController().signal)
+      expect(refused.exitCode).toBe(3)
+      expect(JSON.parse(refused.stdout)).toMatchObject({ ok: false, error: 'org_endpoint_spawn_refused' })
+    }
+    expect(JSON.parse((await execute(['ls'], new AbortController().signal)).stdout)).toMatchObject({ ok: true })
+    const ordinary = createAgentHostExecutor({ sessionId: 'current', directory: root, env: { HAPPY_AI_AUTH_SOURCE: 'org-bundle' }, entrypoint })
+    expect(JSON.parse((await ordinary(['spawn', '--prompt', 'x'], new AbortController().signal)).stdout)).toMatchObject({ ok: true })
+  })
+
   it('fixes identity, cwd and environment before caller execution and preserves the session capability through filtering', async () => {
     const root = await fixture(), entrypoint = join(root, 'cli.mjs')
     await writeFile(entrypoint, `console.log(JSON.stringify({exitCode:0,stdout:JSON.stringify({ok:true,id:process.env.APLUS_SESSION_ID,root:process.env.SAYCODE_AGENT_ROOT,args:process.argv.slice(2),broker:process.env.SAYCODE_AGENT_BROKER_CAPABILITY})}))`)

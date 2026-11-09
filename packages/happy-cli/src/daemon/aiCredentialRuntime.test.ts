@@ -17,6 +17,7 @@ import {
   type AiCredentialRuntimeDependencies,
 } from './aiCredentialRuntime'
 import { withUvToolBinOnPath } from './uvToolBin'
+import { applyAppliedAiAuthSourceEnv, buildManagedSessionSpawnEnvironment, buildSpawnRequestEnvironment, captureSaycodeAgentEnvironment, readOrgEndpointResumeSelection, verifyAiAuthSelection } from './sessionEnv'
 
 describe('timeAiCredentialCommand', () => {
   it('logs each helper duration with word-shaped subcommands only', async () => {
@@ -4274,5 +4275,243 @@ describe('third-party credential file compare-and-swap (aplus D4 C3)', () => {
     await configured.runtime.apply({ provider: 'codex', payload: JSON.stringify(codexMultiAuthBundle()) })
     expect(heldAtPoolWrite.length).toBeGreaterThan(0)
     expect(heldAtPoolWrite.every(Boolean)).toBe(true)
+  })
+})
+
+// aplus specs/org-llm-endpoints C4·C5 — the machine RPC that stores an organization LLM endpoint and the
+// session environment built from that local copy.
+describe('organization LLM endpoint', () => {
+  const storePath = '/home/operator/.happy/org-llm-endpoints.json'
+  const syncParams = (patch: Record<string, unknown> = {}, endpoint: Record<string, unknown> = {}) => ({
+    version: 1, companyId: 'company-1', userId: 'user-1',
+    endpoint: {
+      id: 'endpoint-1', generation: 2, model: 'corp-model-v1', models: { opus: 'corp-big' }, maxContextTokens: 200_000, apiTimeoutMs: 600_000,
+      authMode: 'static-token', token: 'corp-token-123',
+      targets: [{ id: 'target-a', url: 'https://llm-a.corp.example' }, { id: 'target-b', url: 'https://llm-b.corp.example' }],
+      ...endpoint,
+    },
+    ...patch,
+  })
+  const selection = (patch: Record<string, unknown> = {}) => ({
+    kind: 'org-endpoint' as const, bindingId: 'binding-1', endpointId: 'endpoint-1', generation: 2, candidates: ['target-b', 'target-a'], ...patch,
+  })
+  const answering = (...hosts: string[]) => vi.fn(async (url: string, _init?: RequestInit) =>
+    new Response('{"data":[]}', { status: hosts.some((host) => url.includes(host)) ? 200 : 503 }))
+
+  it('advertises the sync capability beside the others', async () => {
+    expect(await setup().runtime.capabilities('m')).toMatchObject({ orgLlmEndpointVersion: 1 })
+  })
+
+  it('stores the endpoint owner-only through a temp file and answers with the generation', async () => {
+    const { runtime, files, writeFile } = setup()
+    await expect(runtime.orgLlmEndpointSync(syncParams())).resolves.toEqual({ ok: true, generation: 2 })
+    expect(writeFile).toHaveBeenCalledWith(`${storePath}.happy-tmp`, expect.any(String), { mode: 0o600 })
+    expect(files.has(`${storePath}.happy-tmp`)).toBe(false)
+    expect(JSON.parse(files.get(storePath)!)).toEqual({
+      version: 1,
+      endpoints: { 'endpoint-1': {
+        id: 'endpoint-1', generation: 2, model: 'corp-model-v1', models: { opus: 'corp-big' }, maxContextTokens: 200_000, apiTimeoutMs: 600_000,
+        authMode: 'static-token', token: 'corp-token-123',
+        targets: [{ id: 'target-a', url: 'https://llm-a.corp.example' }, { id: 'target-b', url: 'https://llm-b.corp.example' }],
+        companyId: 'company-1', userId: 'user-1',
+      } },
+    })
+  })
+
+  it('replaces only the synced endpoint and serializes concurrent syncs', async () => {
+    const { runtime, files } = setup()
+    await Promise.all([
+      runtime.orgLlmEndpointSync(syncParams({}, { id: 'endpoint-1' })),
+      runtime.orgLlmEndpointSync(syncParams({}, { id: 'endpoint-2', token: 'second-token' })),
+    ])
+    await runtime.orgLlmEndpointSync(syncParams({}, { id: 'endpoint-1', generation: 3, token: 'rotated-token' }))
+    const stored = JSON.parse(files.get(storePath)!).endpoints
+    expect(Object.keys(stored).sort()).toEqual(['endpoint-1', 'endpoint-2'])
+    expect(stored['endpoint-1']).toMatchObject({ generation: 3, token: 'rotated-token' })
+    expect(stored['endpoint-2']).toMatchObject({ generation: 2, token: 'second-token' })
+  })
+
+  it('writes nothing and leaks no value for an invalid payload', async () => {
+    const { runtime, files, writeFile } = setup()
+    const rejected = await runtime.orgLlmEndpointSync(syncParams({}, { token: 'bad token with space' })).catch((error: unknown) => error)
+    expect(rejected).toBeInstanceOf(AiCredentialRuntimeError)
+    expect(rejected).toMatchObject({ kind: 'ORG_LLM_ENDPOINT_PAYLOAD_INVALID' })
+    expect(String(rejected)).not.toContain('bad token')
+    expect(writeFile).not.toHaveBeenCalled()
+    expect(files.has(storePath)).toBe(false)
+  })
+
+  it('starts a fresh store, and says so, when the old file is unreadable', async () => {
+    const warn = vi.fn()
+    const { runtime, files } = setup({ warn })
+    files.set(storePath, '{broken')
+    await runtime.orgLlmEndpointSync(syncParams())
+    expect(Object.keys(JSON.parse(files.get(storePath)!).endpoints)).toEqual(['endpoint-1'])
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('org-llm-endpoints'))
+  })
+
+  it('builds the closed environment from the first answering candidate and records its target', async () => {
+    const fetch = answering('llm-a')
+    const { runtime } = setup({ fetch })
+    await runtime.orgLlmEndpointSync(syncParams())
+    const env = await runtime.sessionEnvironment('claude', selection())
+    expect(env).toMatchObject({
+      ANTHROPIC_BASE_URL: 'https://llm-a.corp.example', ANTHROPIC_AUTH_TOKEN: 'corp-token-123', ANTHROPIC_MODEL: 'corp-model-v1',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'corp-big', ANTHROPIC_DEFAULT_SONNET_MODEL: 'corp-model-v1',
+      HAPPY_AI_AUTH_SOURCE: 'org-endpoint', HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING: 'binding-1:endpoint-1:target-a:2',
+    })
+    expect(fetch.mock.calls.map(([url]) => url)).toEqual(['https://llm-b.corp.example/v1/models', 'https://llm-a.corp.example/v1/models'])
+    expect(fetch.mock.calls[0]![1]).toMatchObject({ redirect: 'error', headers: expect.objectContaining({ 'x-api-key': 'corp-token-123' }) })
+  })
+
+  it('also serves an unspecified agent but never Codex', async () => {
+    const { runtime } = setup({ fetch: answering('llm-') })
+    await runtime.orgLlmEndpointSync(syncParams())
+    await expect(runtime.sessionEnvironment(undefined, selection())).resolves.toMatchObject({ HAPPY_AI_AUTH_SOURCE: 'org-endpoint' })
+    await expect(runtime.sessionEnvironment('codex', selection())).rejects.toMatchObject({ kind: 'ORG_LLM_ENDPOINT_AGENT_UNSUPPORTED' })
+  })
+
+  it('refuses the spawn when no candidate answers, naming a code and no address', async () => {
+    const { runtime } = setup({ fetch: answering() })
+    await runtime.orgLlmEndpointSync(syncParams())
+    const rejected = await runtime.sessionEnvironment('claude', selection()).catch((error: unknown) => error)
+    expect(rejected).toMatchObject({ kind: 'ORG_LLM_ENDPOINT_UNREACHABLE' })
+    expect(String(rejected)).not.toMatch(/corp\.example|corp-token/)
+  })
+
+  it.each([
+    { label: 'an unsynced endpoint', sync: false, patch: {}, kind: 'ORG_LLM_ENDPOINT_NOT_SYNCED' },
+    { label: 'another generation', sync: true, patch: { generation: 1 }, kind: 'ORG_LLM_ENDPOINT_GENERATION_MISMATCH' },
+    { label: 'an unknown candidate', sync: true, patch: { candidates: ['target-a', 'target-zzz'] }, kind: 'ORG_LLM_ENDPOINT_TARGET_UNKNOWN' },
+  ])('refuses $label without any request', async ({ sync, patch, kind }) => {
+    const fetch = answering('llm-')
+    const { runtime } = setup({ fetch })
+    if (sync) await runtime.orgLlmEndpointSync(syncParams())
+    await expect(runtime.sessionEnvironment('claude', selection(patch))).rejects.toMatchObject({ kind })
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('refuses when the local store itself is unreadable instead of choosing something else', async () => {
+    const { runtime, files } = setup({ fetch: answering('llm-') })
+    files.set(storePath, '{broken')
+    await expect(runtime.sessionEnvironment('claude', selection())).rejects.toMatchObject({ kind: 'ORG_LLM_ENDPOINT_STORE_INVALID' })
+  })
+
+  it('rebuilds the recorded target on resume without a request, and refuses when it is gone', async () => {
+    const fetch = answering()
+    const { runtime } = setup({ fetch })
+    await runtime.orgLlmEndpointSync(syncParams())
+    const resume = selection({ candidates: ['target-a'], resume: true })
+    await expect(runtime.sessionEnvironment('claude', resume)).resolves.toMatchObject({
+      ANTHROPIC_BASE_URL: 'https://llm-a.corp.example', HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING: 'binding-1:endpoint-1:target-a:2' })
+    expect(fetch).not.toHaveBeenCalled()
+    await runtime.orgLlmEndpointSync(syncParams({}, { generation: 3, targets: [{ id: 'target-b', url: 'https://llm-b.corp.example' }] }))
+    await expect(runtime.sessionEnvironment('claude', resume)).rejects.toMatchObject({ kind: 'ORG_LLM_ENDPOINT_GENERATION_MISMATCH' })
+    // Same generation, other targets: an idempotent re-sync may replace the entry (a lower one may not, below).
+    await runtime.orgLlmEndpointSync(syncParams({}, { generation: 3, targets: [{ id: 'target-b', url: 'https://llm-b.corp.example' }] }))
+    await expect(runtime.sessionEnvironment('claude', { ...resume, generation: 3 })).rejects.toMatchObject({ kind: 'ORG_LLM_ENDPOINT_TARGET_UNKNOWN' })
+  })
+
+  it('refuses a sync of a lower generation, keeps the stored entry and says which generation it holds', async () => {
+    const { runtime, files, writeFile } = setup()
+    await runtime.orgLlmEndpointSync(syncParams({}, { generation: 5, token: 'newer-token' }))
+    writeFile.mockClear()
+    const rejected = await runtime.orgLlmEndpointSync(syncParams({}, { generation: 4, token: 'older-token' })).catch((error: unknown) => error)
+    expect(rejected).toMatchObject({ kind: 'ORG_LLM_ENDPOINT_STALE_GENERATION', storedGeneration: 5 })
+    expect(String((rejected as Error).message)).toContain('storedGeneration=5')
+    expect(String((rejected as Error).message)).not.toContain('token')
+    expect(writeFile).not.toHaveBeenCalled()
+    expect(JSON.parse(files.get(storePath)!).endpoints['endpoint-1']).toMatchObject({ generation: 5, token: 'newer-token' })
+  })
+
+  it.each([
+    ['an address of a target it keeps', { targets: [{ id: 'target-a', url: 'https://elsewhere.example' }] }],
+    ['the token', { token: 'other-token' }],
+    ['the auth mode', { authMode: 'none', token: undefined }],
+    ['the model', { model: 'other-model' }],
+    ['a tier model', { models: { opus: 'other-big' } }],
+    ['a limit', { maxContextTokens: 4096 }],
+  ])('refuses a sync that changes %s without raising the generation, and keeps the stored entry', async (_label, change) => {
+    const { runtime, files, writeFile } = setup()
+    await runtime.orgLlmEndpointSync(syncParams({}, { generation: 5 }))
+    const before = files.get(storePath)
+    writeFile.mockClear()
+    await expect(runtime.orgLlmEndpointSync(syncParams({}, { generation: 5, ...change }))).rejects.toMatchObject({ kind: 'ORG_LLM_ENDPOINT_GENERATION_CONFLICT' })
+    expect(writeFile).not.toHaveBeenCalled()
+    expect(files.get(storePath)).toBe(before)
+  })
+
+  it('refuses a target that comes back under its id with another address, after a sync dropped it, at any generation', async () => {
+    const { runtime } = setup()
+    await runtime.orgLlmEndpointSync(syncParams({}, { generation: 5 }))
+    // Disabled at the same generation: Studio syncs enabled targets only.
+    await expect(runtime.orgLlmEndpointSync(syncParams({}, { generation: 5, targets: [{ id: 'target-b', url: 'https://llm-b.corp.example' }] })))
+      .resolves.toEqual({ ok: true, generation: 5 })
+    for (const generation of [5, 6]) {
+      await expect(runtime.orgLlmEndpointSync(syncParams({}, { generation, targets: [{ id: 'target-a', url: 'https://elsewhere.example' }] })))
+        .rejects.toMatchObject({ kind: 'ORG_LLM_ENDPOINT_GENERATION_CONFLICT' })
+    }
+    // Enabled again where it was: taken.
+    await expect(runtime.orgLlmEndpointSync(syncParams({}, { generation: 5 }))).resolves.toEqual({ ok: true, generation: 5 })
+  })
+
+  it('takes the same entry again, and a newer generation that changes anything', async () => {
+    const { runtime } = setup()
+    await runtime.orgLlmEndpointSync(syncParams({}, { generation: 5 }))
+    await expect(runtime.orgLlmEndpointSync(syncParams({}, { generation: 5 }))).resolves.toEqual({ ok: true, generation: 5 })
+    await expect(runtime.orgLlmEndpointSync(syncParams({}, { generation: 6, token: 'rotated-token' }))).resolves.toEqual({ ok: true, generation: 6 })
+  })
+
+  it('lets a lower generation of another endpoint through', async () => {
+    const { runtime } = setup()
+    await runtime.orgLlmEndpointSync(syncParams({}, { generation: 5 }))
+    await expect(runtime.orgLlmEndpointSync(syncParams({}, { id: 'endpoint-2', generation: 1 }))).resolves.toEqual({ ok: true, generation: 1 })
+  })
+
+  it('serializes a late older sync behind a newer one so the older cannot win the race', async () => {
+    const { runtime, files } = setup()
+    const results = await Promise.allSettled([
+      runtime.orgLlmEndpointSync(syncParams({}, { generation: 6 })),
+      runtime.orgLlmEndpointSync(syncParams({}, { generation: 5 })),
+    ])
+    expect(results.map((result) => result.status)).toEqual(['fulfilled', 'rejected'])
+    expect(JSON.parse(files.get(storePath)!).endpoints['endpoint-1'].generation).toBe(6)
+  })
+
+  it('wins the whole spawn composition and its record survives a capture-resume round trip', async () => {
+    const { runtime } = setup({ fetch: answering('llm-a') })
+    await runtime.orgLlmEndpointSync(syncParams())
+    const chosen = selection({ candidates: ['target-a'] })
+    const managed = await runtime.sessionEnvironment('claude', chosen)
+    const requested = buildSpawnRequestEnvironment({}, {
+      ANTHROPIC_BASE_URL: 'https://evil.invalid', ANTHROPIC_MODEL: 'claude-opus-5', ANTHROPIC_SMALL_FAST_MODEL: 'claude-haiku-4-5',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'requested-haiku', CLAUDE_CODE_MAX_CONTEXT_TOKENS: '1', ANTHROPIC_API_KEY: 'app-key', KEEP: 'yes',
+    })
+    const inherited = { PATH: '/usr/bin', ANTHROPIC_API_KEY: 'machine-key', CLAUDE_CODE_OAUTH_TOKEN: 'machine-oauth', CLAUDE_CODE_USE_BEDROCK: '1', ANTHROPIC_SMALL_FAST_MODEL: 'inherited-small' }
+    const env = applyAppliedAiAuthSourceEnv(buildManagedSessionSpawnEnvironment(inherited, requested, managed), true)
+
+    expect(env).toMatchObject({
+      PATH: '/usr/bin', KEEP: 'yes',
+      ANTHROPIC_BASE_URL: 'https://llm-a.corp.example', ANTHROPIC_AUTH_TOKEN: 'corp-token-123', ANTHROPIC_MODEL: 'corp-model-v1',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'corp-model-v1', CLAUDE_CODE_MAX_CONTEXT_TOKENS: '200000',
+      ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', CLAUDE_CODE_USE_BEDROCK: '', ANTHROPIC_SMALL_FAST_MODEL: '',
+      HAPPY_AI_AUTH_SOURCE: 'org-endpoint',
+    })
+    expect(verifyAiAuthSelection(chosen, env).rejection).toBeUndefined()
+
+    const resume = readOrgEndpointResumeSelection(captureSaycodeAgentEnvironment(env))!
+    await expect(runtime.sessionEnvironment('claude', resume)).resolves.toEqual(managed)
+  })
+
+  it('does not hold the credential queue while it probes', async () => {
+    let release: () => void = () => undefined
+    const hold = new Promise<void>((resolve) => { release = resolve })
+    const fetch = vi.fn(async () => { await hold; return new Response('{}', { status: 200 }) })
+    const { runtime } = setup({ fetch })
+    await runtime.orgLlmEndpointSync(syncParams())
+    const launch = runtime.sessionEnvironment('claude', selection({ candidates: ['target-a'] }))
+    await expect(runtime.orgLlmEndpointSync(syncParams({}, { id: 'endpoint-2' }))).resolves.toMatchObject({ ok: true })
+    release()
+    await expect(launch).resolves.toMatchObject({ HAPPY_AI_AUTH_SOURCE: 'org-endpoint' })
   })
 })

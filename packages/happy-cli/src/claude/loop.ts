@@ -25,6 +25,7 @@ import type { PermissionMode } from "@/api/types"
 import type { ClaudeTitleBridge } from './claudeOffTurnTitle'
 import type { ClaudeOutputFormat } from './structuredOutput'
 import type { ClaudeOrgRequirements, OrgModelRequest } from './claudeOrgRequirements'
+import { assertRemoteOnlyForOrgEndpoint } from './utils/orgEndpointLocalMode'
 
 export type ClaudeEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
@@ -168,6 +169,8 @@ export async function loop(opts: LoopOptions): Promise<number> {
         }
 
         if (opts.scopeProcessSandbox && mode !== 'remote') throw new Error('Scope approval supports Claude remote mode only');
+        // Backstop behind the switch refusal and the start check: an endpoint session never runs the terminal's Claude.
+        assertRemoteOnlyForOrgEndpoint(process.env, mode);
         switch (mode) {
             case 'local': {
                 // The terminal draws no card and archives nothing.

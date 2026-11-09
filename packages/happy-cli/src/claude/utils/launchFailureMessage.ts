@@ -3,6 +3,7 @@ import { PluginDirArgumentError } from './pluginsFromArgs';
 
 export const PERSONAL_CLAUDE_AUTH_FAILURE = 'CLAUDE_PERSONAL_AUTH_NOT_VERIFIED';
 export const ORGANIZATION_CLAUDE_AUTH_FAILURE = 'CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED';
+export const ORG_ENDPOINT_CLAUDE_AUTH_FAILURE = 'CLAUDE_ORG_ENDPOINT_NOT_VERIFIED';
 
 export type ClaudeAuthCheckStage = 'initialize' | 'settings' | 'apply' | 'recheck';
 export type ClaudeAuthCheckReason = 'timeout' | 'unsupported' | 'mismatch' | 'policy' | 'control_failed';
@@ -36,6 +37,7 @@ export function describeClaudeLaunchFailure(error: unknown): string {
     if (text === 'SETUP_TOKEN_START_WAIT_EXHAUSTED') return 'No organization Claude account became available after repeated checks. Ask your organization administrator to check the assigned accounts, then send again.';
     if (text === 'SETUP_TOKEN_START_UNAVAILABLE') return 'The organization Claude account could not be authorized to start. Ask your organization administrator to check the assigned accounts, then send again.';
     if (text === ORGANIZATION_CLAUDE_AUTH_FAILURE) return 'Organization Claude stopped because the assigned account or policy could not be verified. Check this machine’s CLI and assigned account, then send again.';
+    if (text === ORG_ENDPOINT_CLAUDE_AUTH_FAILURE) return 'The organization LLM endpoint could not be verified for this session (a settings file or policy on this machine may point Claude Code elsewhere), so the request was not sent. Check this machine\u2019s Claude settings, then send again.';
     if (text === PERSONAL_CLAUDE_AUTH_FAILURE) return 'Personal Claude stopped because the selected account or policy could not be verified. Check the account and send again.';
     if (error instanceof PluginDirArgumentError) {
         return `Claude Code could not start: ${text}. Start this session again with a valid --plugin-dir.`;

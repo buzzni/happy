@@ -760,6 +760,13 @@ export type Metadata = {
    */
   delegatedFrom?: { machineId: string; sessionId: string }
   /**
+   * The session runs on an organization LLM endpoint (aplus specs/org-llm-endpoints r3): written once by the daemon's
+   * spawn, non-secret — ids only, never an address, a target or a token. A client reads it to know the conversation is
+   * tied to that endpoint (and must not be continued in a new session under another source); a recovery with no local
+   * record refuses a new session when it is present. Absent on every other session and on older runtimes.
+   */
+  orgLlmEndpoint?: { version: 1; bindingId: string; endpointId: string }
+  /**
    * Who started the session (`user`, `schedule`, `github-trigger`, …). An open
    * enum written once at creation; absent on older sessions and on spawns that
    * don't supply it, which readers treat as unknown — never as `user`

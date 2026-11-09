@@ -137,6 +137,8 @@ import {
   type AiAuthSelection,
   type SetupTokenBinding,
   readSetupTokenResumeSelection,
+  readOrgEndpointResumeSelection,
+  readAppliedOrgLlmEndpoint,
   isMachineSetupTokenBinding,
   sharedMachineSetupTokenAccount,
   SETUP_TOKEN_BINDING_ENV,
@@ -145,6 +147,9 @@ import {
 import { sanitizeChildEnv } from '@/utils/childEnv';
 import { resolveRecoveredInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings';
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
+import { createOrgLlmEndpointStudioClient } from './orgLlmEndpointStudio';
+import { createOrgEndpointStartReporter } from './orgLlmEndpointStartReport';
+import { isOrgEndpointBoundMetadata, orgEndpointParentRefusal } from './orgEndpointSessionMarker';
 import { createSetupTokenCapacityFence, proveCapacityProcessesStopped } from './setupTokenCapacityFence';
 import { createCollectorSchedule } from './collectorSchedule';
 import { organizationResumeRefusal, resumeSetupTokenEnvironment, shareResumeInFlight, type ResumeAuthRequirement } from './resumeSetupTokenRebind';
@@ -2025,7 +2030,8 @@ export async function startDaemon(): Promise<void> {
       if (chosen) return chosen;
       const runtime = await chooseLaunchRotation({
         managedClaude: (!options.agent || options.agent === 'claude') && honorsManagedAiCredentials(options.aiAuthSelection),
-        explicitUserGrant: options.aiAuthSelection?.kind === 'claude-setup-token',
+        // An endpoint launch spends no company account either: rotation would reserve one before the selection is verified.
+        explicitUserGrant: options.aiAuthSelection?.kind === 'claude-setup-token' || options.aiAuthSelection?.kind === 'org-endpoint',
         precreatedSession: !!options.reconnectEnvironment,
         resolver: machineRotation, scope: sharedMachineScope,
         log: (reason, unexpected) => {
@@ -2046,6 +2052,22 @@ export async function startDaemon(): Promise<void> {
     };
 
     const applyManualPersonal = createManualPersonalSpawn(readTrustedStudioOrigin(process.env), machineId);
+    // aplus specs/org-llm-endpoints r2 — tells Studio an endpoint session started, and asks it before a resume rebuilds one.
+    const orgEndpointStudio = createOrgLlmEndpointStudioClient({
+      studioOrigin: readTrustedStudioOrigin(process.env), bearer: () => credentials.token, fetch, warn: (message) => logger.warn(message),
+    });
+    // r3: a start report Studio never took stays pending in the session's record and is sent again before a resume.
+    const orgEndpointStartReports = createOrgEndpointStartReporter({
+      send: (report) => orgEndpointStudio.reportSessionStarted(report),
+      readEnvironment: (sessionId) => findTrackedSessionById(sessionId)?.agentEnvironment,
+      writeEnvironment: (sessionId, agentEnvironment) => {
+        const tracked = findTrackedSessionById(sessionId);
+        if (tracked) tracked.agentEnvironment = agentEnvironment;
+        const saved = readPersistedSessions()[sessionId];
+        if (saved) persistSession(sessionId, { ...saved, agentEnvironment, savedAt: Date.now() });
+      },
+      warn: (message) => logger.warn(message),
+    });
     type WorkspaceLaunchObservation = { submitted: boolean; tracked: boolean; onObservedExit?: () => Promise<void> };
     const spawnSessionUnchecked = async (
       options: SpawnSessionOptions,
@@ -2064,6 +2086,18 @@ export async function startDaemon(): Promise<void> {
         `[DAEMON RUN] Spawning session agent=${options.agent} directory=${options.directory}`
         + ` callerGrant=${trustedMcpContext ? 'automation' : options.mcpCallerGrantEnvelope ? 'envelope' : 'absent'}`,
       );
+
+      // A spawn that continues a conversation (a fork, a session-gone continuation, a move to another machine) of an
+      // organization LLM endpoint session would carry what was said there to another model source (org-llm-endpoints r3).
+      // Before anything is created: nothing of a refused spawn should exist.
+      const endpointParentRefusal = options.parentSessionId || options.resumeClaudeSessionId
+        ? orgEndpointParentRefusal({
+          ...(options.parentSessionId ? { parentSessionId: options.parentSessionId } : {}),
+          ...(options.resumeClaudeSessionId ? { resumeClaudeSessionId: options.resumeClaudeSessionId } : {}),
+          records: readPersistedSessions(), projectDir: getProjectPath(options.directory),
+        })
+        : undefined;
+      if (endpointParentRefusal) return { type: 'error', errorMessage: endpointParentRefusal };
 
       // Lesson eligibility uses the registered daemon machine, not an optional RPC field.
       const { directory, sessionId, approvedNewDirectoryCreation = true } = options;
@@ -2134,6 +2168,8 @@ export async function startDaemon(): Promise<void> {
           allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
         });
         let launchMcp: PreparedLaunchMcpServers | undefined;
+        // Set once the managed environment is resolved; stays undefined for every selection but `org-endpoint`.
+        let appliedOrgLlmEndpoint: { bindingId: string; targetId: string } | undefined;
         const finishSpawn = async (
           spawn: Promise<SpawnSessionResult>,
           appliedAiAuthSource?: AiAuthSource,
@@ -2155,7 +2191,10 @@ export async function startDaemon(): Promise<void> {
             const withAuthSource: SpawnSessionResult = appliedAiAuthSource === undefined
               ? result
               : { ...result, appliedAiAuthSource };
-            const reported: SpawnSessionResult = launchMcpDropped ? { ...withAuthSource, launchMcpDropped } : withAuthSource;
+            const withEndpoint: SpawnSessionResult = { ...withAuthSource, ...(appliedOrgLlmEndpoint ? { appliedOrgLlmEndpoint } : {}) };
+            // Not awaited, never fails the spawn: the session already runs, and Studio learns of it on its own clock.
+            if (appliedOrgLlmEndpoint) void orgEndpointStartReports.reportAfterSpawn(result.sessionId, appliedOrgLlmEndpoint);
+            const reported: SpawnSessionResult = launchMcpDropped ? { ...withEndpoint, launchMcpDropped } : withEndpoint;
             if (options.additionalDirectories === undefined) return reported;
             return {
               ...reported,
@@ -2298,6 +2337,7 @@ export async function startDaemon(): Promise<void> {
         const personalAnchor = readSetupTokenResumeSelection(launchAuthorityEnvironment)?.binding;
         const managedAiCredentialEnvironment = await applyManualPersonal(options.aiAuthSelection, launchAuthorityEnvironment,
           personalAnchor && !isMachineSetupTokenBinding(personalAnchor) ? personalAnchor : undefined);
+        appliedOrgLlmEndpoint = readAppliedOrgLlmEndpoint(managedAiCredentialEnvironment);
         logger.debug(`[timing] spawn managed-credential-environment ${Date.now() - credentialStartedAt}ms`);
         let extraEnv: Record<string, string> = injectMcpCallerGrant(
           stripManagedCredentialConflicts(
@@ -3255,6 +3295,36 @@ export async function startDaemon(): Promise<void> {
         });
 
         const resumeBinding = readSetupTokenResumeSelection(tracked.agentEnvironment);
+        // aplus specs/org-llm-endpoints C5: an endpoint session resumes on its recorded target at its recorded
+        // generation or not at all (a corrupt record throws here); no other address or source stands in.
+        const resumeOrgEndpoint = readOrgEndpointResumeSelection(tracked.agentEnvironment);
+        if (resumeOrgEndpoint && resumeBinding) throw new Error('Recorded org endpoint and setup-token bindings conflict; the session is not resumed');
+        // The session's own metadata says it ran on an endpoint, but this record has no binding (lost to a webhook the
+        // daemon did not track, for one): whatever source would resume it now is another one.
+        if (!resumeOrgEndpoint && isOrgEndpointBoundMetadata(metadata)) {
+          return {
+            type: 'error',
+            code: 'SESSION_RESUME_FAILED',
+            errorMessage: 'This session ran on an organization LLM endpoint and its binding is not recorded on this machine; the session is not resumed on another source.',
+          };
+        }
+        // The local copy of the endpoint can be older than the administrator's last change (a removed address, a rotated
+        // token, a stopped endpoint, a revoked assignment). Studio confirms the binding, or the session is not resumed.
+        if (resumeOrgEndpoint) {
+          // A start report Studio never took is sent first; resume-check is still the authority, so a failure here only logs.
+          await orgEndpointStartReports.resendIfPending(happySessionId, { bindingId: resumeOrgEndpoint.bindingId, targetId: resumeOrgEndpoint.candidates[0]! });
+          const endpointVerdict = await orgEndpointStudio.checkResume({
+            bindingId: resumeOrgEndpoint.bindingId, sessionId: happySessionId, endpointId: resumeOrgEndpoint.endpointId,
+            targetId: resumeOrgEndpoint.candidates[0]!, generation: resumeOrgEndpoint.generation,
+          });
+          if (!endpointVerdict.ok) {
+            return {
+              type: 'error',
+              code: 'SESSION_RESUME_FAILED',
+              errorMessage: `The organization LLM endpoint of this session could not be confirmed (${endpointVerdict.reason}); the session is not resumed on another source.`,
+            };
+          }
+        }
         const resumeMachineRuntime = resumeBinding && isMachineSetupTokenBinding(resumeBinding.binding)
           ? await machineRuntimeFor(resumeBinding.binding.companyId) : undefined;
         const recoveredMachineEnvironment = resumeMachineRuntime && resumeBinding
@@ -3371,7 +3441,9 @@ export async function startDaemon(): Promise<void> {
         resumingSetupTokenSessions.set(happySessionId, tracked);
         let resumedCredentials: { environment: Record<string, string>; rebound: boolean };
         try {
-          resumedCredentials = recoveredMachineEnvironment ? { environment: recoveredMachineEnvironment, rebound: false } : await resumeSetupTokenEnvironment({
+          resumedCredentials = recoveredMachineEnvironment ? { environment: recoveredMachineEnvironment, rebound: false } : resumeOrgEndpoint
+            ? { environment: await resolveManagedAiCredentialEnvironment(resumeAgent, resumeOrgEndpoint), rebound: false }
+            : await resumeSetupTokenEnvironment({
             sessionId: happySessionId,
             recorded: tracked.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV],
             manualChoice: restoreManualToOrganization ? undefined : tracked.agentEnvironment?.[MANUAL_PERSONAL_ENV],

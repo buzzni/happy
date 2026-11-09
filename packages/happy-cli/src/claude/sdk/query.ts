@@ -11,7 +11,9 @@ import type { QueryOptions, QueryPrompt, SDKMessage } from './types'
 import type { SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
 import { ensureLocalProxyBypass } from '../utils/proxyBypass'
 import { resolveHappyEntrypoint } from './happyEntrypoint'
-import { queryWithPinnedCredential } from './credentialPin'
+import { queryWithPinnedCredential, queryWithPinnedEndpoint } from './credentialPin'
+import { foldModelToOrgEndpoint } from '../utils/orgEndpointModel'
+import { orgEndpointRoutingSettingsEnv } from '../utils/orgEndpointEnvKeys'
 import { sanitizeChildEnv } from '@/utils/childEnv'
 import { RECALL_OWNER_ENV } from '@/memory/recallOwnerMarker'
 import { LESSON_OWNER_ENV } from '@/memory/lessonOwnerMarker'
@@ -25,7 +27,8 @@ const isolatedMemoryEnvironment = Object.freeze({
  */
 export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): Query {
     const opts = params.options
-    const settings = resolveSettings(opts)
+    const endpointRouting = orgEndpointRoutingSettingsEnv(process.env)
+    const settings = resolveSettings(opts, endpointRouting)
 
     // Build system prompt
     let systemPrompt: Options['systemPrompt'] = undefined
@@ -95,6 +98,12 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
         ensureLocalProxyBypass(env)
     }
     sdkOptions.env = env
+    // An endpoint serves its own model names only; this is the last place every query — the title job's and the
+    // sub-agents' included — passes, so a Claude ID some caller kept cannot reach it.
+    sdkOptions.model = foldModelToOrgEndpoint(sdkOptions.model, env)
+    // No fallback in an endpoint session: it has no second model, and the SDK refuses a fallback equal to the main model
+    // (which folding produces whenever the endpoint maps no tiers) by not creating the query at all.
+    if (env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint') sdkOptions.fallbackModel = undefined
 
     // Map canCallTool -> canUseTool
     if (opts?.canCallTool) {
@@ -115,19 +124,25 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
         prompt: params.prompt as string | AsyncIterable<SDKUserMessage>, options: sdkOptions,
     }, env.CLAUDE_CODE_OAUTH_TOKEN, 'organization')
 
+    // An organization LLM endpoint's address, token and models would otherwise be replaced by the same keys in a
+    // user or project settings file. No fallback: a session whose environment the pin cannot read does not start.
+    if (env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint') return queryWithPinnedEndpoint(sdkQuery, {
+        prompt: params.prompt as string | AsyncIterable<SDKUserMessage>, options: sdkOptions,
+    }, env)
+
     return sdkQuery({
         prompt: params.prompt as string | AsyncIterable<SDKUserMessage>,
         options: sdkOptions,
     })
 }
 
-function resolveSettings(opts: QueryOptions | undefined): string | undefined {
+function resolveSettings(opts: QueryOptions | undefined, endpointRouting?: Record<string, string>): string | undefined {
     const denyRules = opts?.permissionsDeny ?? []
     const emptyPluginServers = findEmptySyncedPluginServers().filter(name => !opts?.mcpServers?.[name])
     // SDK 는 settings 파일 경로와 sandbox 옵션의 동시 사용을 거부한다. 우리 규칙을
     // 경로로 넘기면 CLI 가 그 파일만 읽고 여기서 더한 것은 사라지므로, 합쳐야 할
     // 것이 하나라도 있으면 인라인한다.
-    if (!opts?.isolatedAutomationContext && emptyPluginServers.length === 0 && (!opts?.settingsPath || (!opts.sandbox && denyRules.length === 0))) return opts?.settingsPath
+    if (!opts?.isolatedAutomationContext && !endpointRouting && emptyPluginServers.length === 0 && (!opts?.settingsPath || (!opts.sandbox && denyRules.length === 0))) return opts?.settingsPath
     const rawSettings = opts?.settingsPath ? readFileSync(opts.settingsPath, 'utf8') : '{}'
     let parsedSettings: unknown
     try {
@@ -144,6 +159,13 @@ function resolveSettings(opts: QueryOptions | undefined): string | undefined {
         if (typeof settingsEnv !== 'object' || Array.isArray(settingsEnv)) throw new Error('Claude hook environment must be a JSON object')
         settings.autoMemoryEnabled = false
         settings.env = { ...settingsEnv, ...isolatedMemoryEnvironment }
+    }
+    if (endpointRouting) {
+        // The routing is the daemon's: it wins over whatever env the hook settings file carried for the same keys.
+        const settings = parsedSettings as Record<string, unknown>
+        const settingsEnv = settings.env ?? {}
+        if (typeof settingsEnv !== 'object' || Array.isArray(settingsEnv)) throw new Error('Claude hook environment must be a JSON object')
+        settings.env = { ...settingsEnv, ...endpointRouting }
     }
     if (emptyPluginServers.length > 0) {
         const settings = parsedSettings as { deniedMcpServers?: { serverName?: string }[] }

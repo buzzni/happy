@@ -489,6 +489,11 @@ export type SpawnSessionResult =
          * asked for; `unknown` is an answer, not a missing value.
          */
         appliedAiAuthSource?: AiAuthSource;
+        /**
+         * aplus specs/org-llm-endpoints C5 — the endpoint target the daemon actually pointed the session at,
+         * present only for an `org-endpoint` selection. Studio records it as the session's URL binding.
+         */
+        appliedOrgLlmEndpoint?: { bindingId: string; targetId: string };
         additionalDirectories?: {
             version: 1;
             accepted: string[];

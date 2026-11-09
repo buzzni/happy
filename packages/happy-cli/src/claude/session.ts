@@ -9,6 +9,10 @@ import { ApiClient, ApiSessionClient } from "@/lib";
 import { MessageQueue2 } from "@/utils/MessageQueue2";
 import { EnhancedMode } from "./loop";
 import { logger } from "@/ui/logger";
+import { orgEndpointMarker } from "@/daemon/orgEndpointSessionMarker";
+import { ORG_ENDPOINT_BINDING_ENV } from "@/utils/childEnv";
+import { markOrgEndpointConversation } from "./utils/orgEndpointConversation";
+import { getProjectPath } from "./utils/path";
 import type { JsRuntime } from "./runClaude";
 import type { SandboxConfig } from "@/persistence";
 import type { SandboxPolicyMode } from "@/sandbox/sandboxPolicy";
@@ -253,6 +257,9 @@ export class Session {
         // The first id, the same id again, and the id after a /clear (already reset) are not a change.
         if (this.sessionId !== null && this.sessionId !== sessionId) this.client.resetContextUsage();
         this.sessionId = sessionId;
+        // Before anything could continue it elsewhere: the conversation is marked as an endpoint one (orgEndpointConversation).
+        const endpointMarker = process.env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint' ? orgEndpointMarker(process.env[ORG_ENDPOINT_BINDING_ENV]) ?? {} : undefined;
+        if (endpointMarker) markOrgEndpointConversation(getProjectPath(this.path), sessionId, endpointMarker);
         
         // Update metadata with Claude Code session ID
         this.client.updateMetadata((metadata) => ({

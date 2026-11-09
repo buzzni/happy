@@ -5,7 +5,8 @@ import { join } from 'node:path';
 
 const sdkQuery = vi.hoisted(() => vi.fn(() => ({ mocked: true })));
 const pinnedQuery = vi.hoisted(() => vi.fn(() => ({ pinned: true })));
-vi.mock('./credentialPin', () => ({ queryWithPinnedCredential: pinnedQuery }));
+const pinnedEndpointQuery = vi.hoisted(() => vi.fn(() => ({ pinnedEndpoint: true })));
+vi.mock('./credentialPin', () => ({ queryWithPinnedCredential: pinnedQuery, queryWithPinnedEndpoint: pinnedEndpointQuery }));
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
     query: sdkQuery,
@@ -18,6 +19,7 @@ describe('query adapter', () => {
     beforeEach(() => {
         sdkQuery.mockClear();
         pinnedQuery.mockClear();
+        pinnedEndpointQuery.mockClear();
         vi.stubEnv('HAPPY_AI_AUTH_SOURCE', undefined);
         vi.stubEnv('CLAUDE_CODE_OAUTH_TOKEN', undefined);
         configDirectory = mkdtempSync(join(tmpdir(), 'happy-plugin-config-'));
@@ -61,6 +63,117 @@ describe('query adapter', () => {
             }), token, 'organization');
         }
         expect(sdkQuery).not.toHaveBeenCalled();
+    });
+
+    // aplus specs/org-llm-endpoints r2 — an endpoint session is pinned after the settings files load too.
+    describe('organization LLM endpoint session', () => {
+        const endpointEnvironment = {
+            HAPPY_AI_AUTH_SOURCE: 'org-endpoint', ANTHROPIC_BASE_URL: 'https://llm.corp.example', ANTHROPIC_AUTH_TOKEN: 'corp-token',
+            ANTHROPIC_MODEL: 'corp-model', ANTHROPIC_DEFAULT_OPUS_MODEL: 'corp-big', ANTHROPIC_DEFAULT_SONNET_MODEL: 'corp-model',
+            ANTHROPIC_DEFAULT_HAIKU_MODEL: 'corp-small', ANTHROPIC_DEFAULT_FABLE_MODEL: 'corp-big',
+        };
+        beforeEach(() => { for (const [key, value] of Object.entries(endpointEnvironment)) vi.stubEnv(key, value); });
+
+        it('goes through the endpoint pin with the daemon environment on every query, resume and title call included', () => {
+            for (const options of [{ resume: 'session', settingSources: ['user', 'project'] as ('user' | 'project')[] }, undefined]) {
+                query({ prompt: 'continue', options });
+                expect(pinnedEndpointQuery).toHaveBeenLastCalledWith(sdkQuery, expect.objectContaining({
+                    options: expect.objectContaining({ env: expect.objectContaining(endpointEnvironment) }),
+                }), expect.objectContaining(endpointEnvironment));
+            }
+            expect(sdkQuery).not.toHaveBeenCalled();
+            expect(pinnedQuery).not.toHaveBeenCalled();
+        });
+
+        it('folds the requested model onto the endpoint names and drops the fallback model before the SDK sees them', () => {
+            query({ prompt: 'hello', options: { model: 'claude-opus-5-5', fallbackModel: 'haiku' } });
+            expect(pinnedEndpointQuery.mock.calls.at(-1)).toBeDefined();
+            const options = (pinnedEndpointQuery.mock.calls.at(-1) as unknown as [unknown, { options: Record<string, unknown> }])[1].options;
+            expect(options).toMatchObject({ model: 'corp-model' });
+            // An endpoint has no second model to fall back to, and the SDK refuses a fallback equal to the main model
+            // (which folding produces whenever the endpoint maps no tiers).
+            expect(options.fallbackModel).toBeUndefined();
+        });
+
+        it.each(['claude-sonnet-5', 'sonnet', 'corp-model', 'corp-small'])('never hands the SDK a fallback model equal to the main one (%s)', fallback => {
+            query({ prompt: 'hello', options: { model: 'claude-opus-5-5', fallbackModel: fallback } });
+            const options = (pinnedEndpointQuery.mock.calls.at(-1) as unknown as [unknown, { options: Record<string, unknown> }])[1].options;
+            expect(options.fallbackModel).toBeUndefined();
+        });
+
+        // The pin applies its flag layer after Claude Code started; the settings files' env is read at startup (telemetry
+        // is initialised from it), so the startup flag layer must carry the closed routes too — token excluded.
+        it('starts Claude Code with the closed routes in the flag settings even without a hook settings file, never the token', () => {
+            query({ prompt: 'hello' });
+            const options = (pinnedEndpointQuery.mock.calls.at(-1) as unknown as [unknown, { options: { settings?: string } }])[1].options;
+            const settings = JSON.parse(options.settings!);
+            expect(settings.env).toMatchObject({ ANTHROPIC_BASE_URL: 'https://llm.corp.example', ANTHROPIC_MODEL: 'corp-model', CLAUDE_CODE_ENABLE_TELEMETRY: '', ANTHROPIC_UNIX_SOCKET: '' });
+            expect(options.settings).not.toContain('corp-token');
+        });
+
+        it('holds the machine\'s own proxy and TLS trust above the settings files, empty where it has none', () => {
+            vi.stubEnv('HTTPS_PROXY', 'http://proxy.corp.example:3128');
+            for (const key of ['HTTP_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy', 'NODE_TLS_REJECT_UNAUTHORIZED', 'NODE_EXTRA_CA_CERTS']) vi.stubEnv(key, undefined);
+            query({ prompt: 'hello' });
+            const options = (pinnedEndpointQuery.mock.calls.at(-1) as unknown as [unknown, { options: { settings?: string } }])[1].options;
+            expect(JSON.parse(options.settings!).env).toMatchObject({ HTTPS_PROXY: 'http://proxy.corp.example:3128', HTTP_PROXY: '', ALL_PROXY: '', https_proxy: '',
+                NODE_TLS_REJECT_UNAUTHORIZED: '', NODE_EXTRA_CA_CERTS: '' });
+        });
+
+        it('keeps a proxy that carries its credentials out of the settings, which travel in argv', () => {
+            vi.stubEnv('HTTPS_PROXY', 'http://user:secret@proxy.corp.example:3128');
+            vi.stubEnv('HTTP_PROXY', 'http://proxy.corp.example:3128');
+            query({ prompt: 'hello' });
+            const options = (pinnedEndpointQuery.mock.calls.at(-1) as unknown as [unknown, { options: { settings?: string } }])[1].options;
+            expect(options.settings).not.toContain('secret');
+            expect(JSON.parse(options.settings!).env).toMatchObject({ HTTP_PROXY: 'http://proxy.corp.example:3128', NODE_TLS_REJECT_UNAUTHORIZED: '' });
+            expect(JSON.parse(options.settings!).env).not.toHaveProperty('HTTPS_PROXY');
+        });
+
+        it('keeps loopback off the proxy in the layer that outranks the SDK\'s own environment, the machine\'s exceptions included', () => {
+            vi.stubEnv('HTTPS_PROXY', 'http://proxy.corp.example:3128');
+            vi.stubEnv('NO_PROXY', '.corp.example');
+            vi.stubEnv('no_proxy', undefined);
+            query({ prompt: 'hello' });
+            const options = (pinnedEndpointQuery.mock.calls.at(-1) as unknown as [unknown, { options: { settings?: string } }])[1].options;
+            const env = JSON.parse(options.settings!).env;
+            expect(env.NO_PROXY).toBe('.corp.example,127.0.0.1,localhost,::1');
+            expect(env.no_proxy).toBe(env.NO_PROXY);
+        });
+
+        it('adds the closed routes to a hook settings file\'s own env and keeps its hooks', () => {
+            const settingsPath = join(configDirectory, 'hooks.json');
+            const hooks = { SessionStart: [{ matcher: '*' }] };
+            writeFileSync(settingsPath, JSON.stringify({ hooks, env: { KEEP: 'yes', ANTHROPIC_MODEL: 'corp-model' } }));
+            query({ prompt: 'hello', options: { settingsPath } });
+            const options = (pinnedEndpointQuery.mock.calls.at(-1) as unknown as [unknown, { options: { settings?: string } }])[1].options;
+            expect(JSON.parse(options.settings!)).toMatchObject({ hooks, env: { KEEP: 'yes', ANTHROPIC_MODEL: 'corp-model', CLAUDE_CODE_ENABLE_TELEMETRY: '' } });
+        });
+
+        it('leaves the settings of every other source as they were', () => {
+            vi.stubEnv('HAPPY_AI_AUTH_SOURCE', 'org-bundle');
+            query({ prompt: 'hello' });
+            expect(lastOptions().settings).toBeUndefined();
+        });
+
+        it('leaves a query with no model naming none, for the pinned environment to answer', () => {
+            query({ prompt: 'hello' });
+            const options = (pinnedEndpointQuery.mock.calls.at(-1) as unknown as [unknown, { options: Record<string, unknown> }])[1].options;
+            expect(options.model).toBeUndefined();
+        });
+
+        it('keeps every other source off the endpoint pin and its model untouched', () => {
+            vi.stubEnv('HAPPY_AI_AUTH_SOURCE', 'org-bundle');
+            query({ prompt: 'hello', options: { model: 'claude-opus-5-5' } });
+            expect(pinnedEndpointQuery).not.toHaveBeenCalled();
+            expect(lastOptions().model).toBe('claude-opus-5-5');
+        });
+
+        it('leaves every other source\'s fallback model alone', () => {
+            vi.stubEnv('HAPPY_AI_AUTH_SOURCE', 'org-bundle');
+            query({ prompt: 'hello', options: { model: 'claude-opus-5-5', fallbackModel: 'claude-sonnet-5' } });
+            expect(lastOptions().fallbackModel).toBe('claude-sonnet-5');
+        });
     });
 
     it.each(['personal-subscription', 'org-bundle-observed', undefined])('keeps ordinary token source %s on the existing route', source => {

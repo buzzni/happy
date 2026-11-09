@@ -45,6 +45,34 @@ describe('handleResumeCommand', () => {
     });
 });
 
+// aplus specs/org-llm-endpoints r3 — the resumed runner would carry no endpoint env and run on this machine's own login.
+describe('happy resume of an organization LLM endpoint conversation', () => {
+    beforeEach(() => { vi.clearAllMocks(); });
+
+    const metadata = { path: tmpdir(), flavor: 'claude', claudeSessionId: 'native-endpoint' };
+    const record = (agentEnvironment: Record<string, string>): PersistedSession => ({
+        encryptionKey: Buffer.alloc(32).toString('base64'), encryptionVariant: 'dataKey',
+        seq: 20, metadataVersion: 1, agentStateVersion: 1, savedAt: 1, metadata: metadata as never, agentEnvironment,
+    });
+
+    it('is refused when the session metadata carries the endpoint marker, even with no local record', async () => {
+        vi.mocked(resolveHappySession).mockResolvedValue({ id: 'endpoint', active: false,
+            metadata: { ...metadata, orgLlmEndpoint: { version: 1, bindingId: 'b', endpointId: 'e' } } as never });
+        vi.mocked(readPersistedSessions).mockReturnValue({});
+
+        await expect(handleResumeCommand(['endpoint'])).rejects.toThrow(/사내 LLM.*터미널/);
+        expect(spawnHappyCLI).not.toHaveBeenCalled();
+    });
+
+    it.each(['b:e:t:1', ''])('is refused when this machine recorded a binding (%j), even with no marker', async binding => {
+        vi.mocked(resolveHappySession).mockResolvedValue({ id: 'endpoint', active: false, metadata: metadata as never });
+        vi.mocked(readPersistedSessions).mockReturnValue({ endpoint: record({ HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING: binding }) });
+
+        await expect(handleResumeCommand(['endpoint'])).rejects.toThrow(/사내 LLM.*터미널/);
+        expect(spawnHappyCLI).not.toHaveBeenCalled();
+    });
+});
+
 describe.each(['claude', 'codex'] as const)('T2RT-28 standalone %s resume evidence', agent => {
     beforeEach(() => { vi.clearAllMocks(); });
     afterEach(() => { vi.unstubAllEnvs(); });

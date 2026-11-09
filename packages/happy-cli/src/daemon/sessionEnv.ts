@@ -23,7 +23,7 @@ import { ADDITIONAL_DIRECTORIES_ENV, readAdditionalDirectoriesEnvironment } from
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars'
 import { normalizeSessionSource, SESSION_SOURCE_ENV } from '@/utils/sessionSource'
 import { DELEGATED_ATTENDANCE_ENV, parseDelegatedAttendance } from '@/api/turnAttendance'
-import { sanitizeChildEnv, SETUP_TOKEN_BINDING_ENV } from '@/utils/childEnv'
+import { ORG_ENDPOINT_BINDING_ENV, ORG_ENDPOINT_UNREPORTED_ENV, sanitizeChildEnv, SETUP_TOKEN_BINDING_ENV } from '@/utils/childEnv'
 import { OUTPUT_FORMAT_ENV, parseOutputFormat } from '@/claude/structuredOutput'
 import { INPUT_EVIDENCE_ENV, requestedInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings'
 import { AGENT_PLAN_DESCRIPTOR_ENV, AGENT_PLAN_SECRET_ENV } from '@/launcher/agentPlanLaunch'
@@ -38,7 +38,7 @@ function isValidOutputFormatSeed(raw: string): boolean {
     }
 }
 
-export { SETUP_TOKEN_BINDING_ENV }
+export { ORG_ENDPOINT_BINDING_ENV, ORG_ENDPOINT_UNREPORTED_ENV, SETUP_TOKEN_BINDING_ENV }
 
 const SAYCODE_AGENT_ENV_KEYS = [
     'SAYCODE_AGENT_ENV',
@@ -68,7 +68,7 @@ export const BROWSER_CONTINUATION_ENV = 'HAPPY_AUTOMATION_BROWSER_CONTINUATION'
  */
 const AGENT_PLAN_SEED_KEYS = [AGENT_PLAN_DESCRIPTOR_ENV, AGENT_PLAN_SECRET_ENV, AGENT_PLAN_THREADS_DIR_ENV] as const
 type AgentPlanSeedKey = typeof AGENT_PLAN_SEED_KEYS[number]
-type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV | AgentPlanSeedKey
+type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | typeof ORG_ENDPOINT_BINDING_ENV | typeof ORG_ENDPOINT_UNREPORTED_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV | AgentPlanSeedKey
 
 export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey | typeof DAEMON_AGENT_GRANT_STATE_ENV, string>>
 
@@ -195,6 +195,11 @@ const UNSAFE_REQUEST_ENV_KEYS = new Set([
     'NODE_ICU_DATA', 'NODE_PRESERVE_SYMLINKS', 'NODE_PRESERVE_SYMLINKS_MAIN',
     'PATH', 'HOME', 'SHELL', 'BASH_ENV', 'ENV', 'ZDOTDIR', 'IFS', 'PROMPT_COMMAND', 'TMPDIR',
     'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR',
+    // Where the agent sends its requests and under which headers (aplus specs/org-llm-endpoints D1): a project
+    // variable would carry the session's credential to any address. The platform sets these itself, never a request.
+    'ANTHROPIC_BASE_URL', 'ANTHROPIC_BEDROCK_BASE_URL', 'ANTHROPIC_VERTEX_BASE_URL', 'ANTHROPIC_CUSTOM_HEADERS',
+    // The transport itself: a socket path sends every request to a local listener under an unchanged address and token (r3).
+    'ANTHROPIC_UNIX_SOCKET',
     'SSL_CERT_FILE', 'SSL_CERT_DIR', 'SSH_ASKPASS', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME',
     // OpenSSL loads config, providers and engines (code) from these; bash runs startup options and traces.
     'OPENSSL_CONF', 'OPENSSL_MODULES', 'OPENSSL_ENGINES', 'SHELLOPTS', 'BASHOPTS', 'PS4',
@@ -266,18 +271,25 @@ export function overlayManagedCredentialEnvironment(
     return { ...stripManagedCredentialConflicts(requested, managed), ...managed }
 }
 
+const MANAGED_BASE_URL_OWNED_ENV_KEYS = [
+    'ANTHROPIC_MODEL', 'ANTHROPIC_SMALL_FAST_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
+] as const
+
 export function stripManagedCredentialConflicts(
     requested: Record<string, string>,
     managed: Record<string, string>,
 ): Record<string, string> {
     const effectiveRequested = { ...requested }
     for (const key of Object.keys(managed)) delete effectiveRequested[key]
-    if (managed.ANTHROPIC_BASE_URL === 'https://api.z.ai/api/anthropic') {
+    // A managed environment that names the address owns the whole routing (the Z.AI lease, an organization LLM
+    // endpoint): a requested model or context limit was chosen for another backend. An empty value is a cleared
+    // key, not an owner.
+    if (managed.ANTHROPIC_BASE_URL) {
         // ANTHROPIC_AUTH_TOKEN and ANTHROPIC_BASE_URL are in the shared list but
-        // are set by the Z.AI lease itself, so the loop above already removed them.
+        // are set by the managed environment itself, so the loop above already removed them.
         for (const key of CLAUDE_AUTH_OVERRIDE_ENV_KEYS) delete effectiveRequested[key]
-        delete effectiveRequested.ANTHROPIC_MODEL
-        delete effectiveRequested.ANTHROPIC_SMALL_FAST_MODEL
+        for (const key of MANAGED_BASE_URL_OWNED_ENV_KEYS) delete effectiveRequested[key]
     }
     // A bound setup-token session spends only that token; the model choice stays the user's.
     if (managed.CLAUDE_CODE_OAUTH_TOKEN) {
@@ -333,6 +345,11 @@ export function captureSaycodeAgentEnvironment(
     // A malformed record must stay bound-but-invalid through every capture/persistence
     // path. Keep no corrupt bytes; the resume guard rejects this bounded marker.
     if (binding !== undefined) captured[SETUP_TOKEN_BINDING_ENV] = parseSetupTokenBinding(binding) ? binding : ''
+    // Same sentinel rule as the setup-token binding: a corrupt record stays bound-but-invalid and the resume refuses it.
+    const orgEndpointBinding = env[ORG_ENDPOINT_BINDING_ENV]
+    if (orgEndpointBinding !== undefined) captured[ORG_ENDPOINT_BINDING_ENV] = parseOrgEndpointBinding(orgEndpointBinding) ? orgEndpointBinding : ''
+    // An undelivered start report travels with the record until Studio has it (r3); any other value is dropped.
+    if (env[ORG_ENDPOINT_UNREPORTED_ENV] === '1') captured[ORG_ENDPOINT_UNREPORTED_ENV] = '1'
     if (env[AGENT_PLAN_DESCRIPTOR_ENV] && env[AGENT_PLAN_SECRET_ENV]) {
         for (const key of AGENT_PLAN_SEED_KEYS) if (env[key]) captured[key] = env[key]
     }
@@ -559,7 +576,7 @@ export function applyConfirmedPromptDeliveryFlag(
  * machine would have used anyway, which is the outcome the person was trying
  * to avoid by choosing.
  */
-export const AI_AUTH_SELECTION_KINDS = ['machine-personal', 'org-bundle', 'claude-setup-token'] as const
+export const AI_AUTH_SELECTION_KINDS = ['machine-personal', 'org-bundle', 'claude-setup-token', 'org-endpoint'] as const
 
 export type AiAuthSelectionKind = (typeof AI_AUTH_SELECTION_KINDS)[number]
 
@@ -572,6 +589,12 @@ export type AiAuthSelection =
     | { kind: 'machine-personal' | 'org-bundle' }
     /** `bindingGrant` is required on a new spawn; a resume rebuilds the selection from the recorded binding. */
     | { kind: 'claude-setup-token'; managedAccountId: string; groupScope: string; credentialGeneration: number; bindingGrant?: string; credentialProofVersion?: 1; personalSelection?: ManualPersonalSelection }
+    /**
+     * An organization LLM endpoint (aplus specs/org-llm-endpoints C5): the daemon tries `candidates` (target ids,
+     * the server's order) against its locally stored entry. `resume` is daemon-internal — set only when a resume
+     * rebuilds the recorded target — and never read from a request.
+     */
+    | { kind: 'org-endpoint'; bindingId: string; endpointId: string; generation: number; candidates: string[]; resume?: true }
 
 /**
  * Advertised in `MachineMetadataSchema` so a client can tell this daemon
@@ -621,7 +644,60 @@ export function parseAiAuthSelection(value: unknown): AiAuthSelection | undefine
         return { ...(personalSelection ? { personalSelection } : {}), kind, managedAccountId, groupScope, credentialGeneration: Number(credentialGeneration), bindingGrant,
             ...(credentialProofVersion === 1 ? { credentialProofVersion } : {}) }
     }
+    if (kind === 'org-endpoint') {
+        const { bindingId, endpointId, generation, candidates } = value as Record<string, unknown>
+        if (!isOrgEndpointId(bindingId)) throw new Error('AI auth selection org-endpoint requires a bindingId')
+        if (!isOrgEndpointId(endpointId)) throw new Error('AI auth selection org-endpoint requires an endpointId')
+        if (!Number.isSafeInteger(generation) || Number(generation) < 1) {
+            throw new Error('AI auth selection org-endpoint generation must be a positive integer')
+        }
+        if (!Array.isArray(candidates) || candidates.length < 1 || candidates.length > ORG_ENDPOINT_MAX_TARGETS
+            || !candidates.every(isOrgEndpointId) || new Set(candidates).size !== candidates.length) {
+            throw new Error(`AI auth selection org-endpoint requires 1..${ORG_ENDPOINT_MAX_TARGETS} distinct candidates`)
+        }
+        return { kind, bindingId, endpointId, generation: Number(generation), candidates: [...candidates] }
+    }
     return { kind: kind as 'machine-personal' | 'org-bundle' }
+}
+
+/**
+ * Ids the server hands out (binding, endpoint, target). They join into the binding record with ':', so a
+ * separator can never be part of one.
+ */
+const ORG_ENDPOINT_ID = /^[A-Za-z0-9_-]{1,128}$/
+export const ORG_ENDPOINT_MAX_TARGETS = 16
+export const isOrgEndpointId = (value: unknown): value is string => typeof value === 'string' && ORG_ENDPOINT_ID.test(value)
+
+export type OrgEndpointBinding = { bindingId: string; endpointId: string; targetId: string; generation: number }
+
+export function formatOrgEndpointBinding(binding: OrgEndpointBinding): string {
+    return `${binding.bindingId}:${binding.endpointId}:${binding.targetId}:${binding.generation}`
+}
+
+export function parseOrgEndpointBinding(value: string): OrgEndpointBinding | null {
+    const parts = value.split(':')
+    if (parts.length !== 4 || !parts.slice(0, 3).every(isOrgEndpointId) || !/^[1-9]\d{0,14}$/.test(parts[3]!)) return null
+    return { bindingId: parts[0]!, endpointId: parts[1]!, targetId: parts[2]!, generation: Number(parts[3]) }
+}
+
+/** Which binding and target the daemon applied to a finished managed environment; what the spawn result reports. */
+export function readAppliedOrgLlmEndpoint(env: Record<string, string | undefined>): { bindingId: string; targetId: string } | undefined {
+    const binding = parseOrgEndpointBinding(env[ORG_ENDPOINT_BINDING_ENV] ?? '')
+    return binding ? { bindingId: binding.bindingId, targetId: binding.targetId } : undefined
+}
+
+/**
+ * What a resume must rebuild: the recorded target of the recorded generation, nothing else. No other target
+ * is a candidate, so a resume can never move to another URL. A corrupt record refuses the resume.
+ */
+export function readOrgEndpointResumeSelection(agentEnvironment: SaycodeAgentEnvironment | undefined):
+    Extract<AiAuthSelection, { kind: 'org-endpoint' }> | undefined {
+    const raw = agentEnvironment?.[ORG_ENDPOINT_BINDING_ENV]
+    if (raw === undefined) return undefined
+    const binding = parseOrgEndpointBinding(raw)
+    if (!binding) throw new Error('Recorded org endpoint binding is invalid; the session is not resumed with another endpoint')
+    return { kind: 'org-endpoint', bindingId: binding.bindingId, endpointId: binding.endpointId, generation: binding.generation,
+        candidates: [binding.targetId], resume: true }
 }
 
 /**
@@ -646,6 +722,7 @@ const DAEMON_APPLIED_AI_AUTH_SOURCES: readonly AiAuthSource[] = [
     'org-bundle',
     'platform-glm',
     'platform-gateway',
+    'org-endpoint',
 ]
 
 export type AiAuthSelectionVerdict = {
@@ -702,5 +779,6 @@ export function verifyAiAuthSelection(
 
 /** The applied source that would prove a selection was honoured. */
 function selectionAppliedSource(kind: AiAuthSelectionKind): AiAuthSource {
+    if (kind === 'org-endpoint') return 'org-endpoint'
     return kind === 'org-bundle' || kind === 'claude-setup-token' ? 'org-bundle' : 'personal-subscription'
 }

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { ORG_ENDPOINT_OWNED_ENV_KEYS } from '../claude/utils/orgEndpointEnvKeys'
 import { buildManagedSessionSpawnEnvironment, buildSpawnRequestEnvironment } from '../daemon/sessionEnv'
 import { clearInheritedSessionLineage, NON_INHERITABLE_ENV, nonInheritableEnvEntry, sanitizeChildEnv } from './childEnv'
 
@@ -305,5 +306,28 @@ describe('upstream session-scoped keys (specs/cli-plugin-dir-and-env-scrub R5-b)
     it('are not accepted from a spawn request environment', () => {
         expect(buildSpawnRequestEnvironment({}, { HAPPY_SIDE_CHAT: '1', CODEX_THREAD_ID: 'made-up' })).not.toHaveProperty('HAPPY_SIDE_CHAT')
         expect(buildSpawnRequestEnvironment({}, { HAPPY_SIDE_CHAT: '1', CODEX_THREAD_ID: 'made-up' })).not.toHaveProperty('CODEX_THREAD_ID')
+    })
+})
+
+describe('organization LLM endpoint session environment (aplus specs/org-llm-endpoints r2)', () => {
+    const endpointSession = (): NodeJS.ProcessEnv => {
+        const env: NodeJS.ProcessEnv = { PATH: '/usr/bin', HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING: 'b:e:t:1', HAPPY_AI_AUTH_SOURCE: 'org-endpoint' }
+        for (const key of ORG_ENDPOINT_OWNED_ENV_KEYS) env[key] = ''
+        env.ANTHROPIC_AUTH_TOKEN = 'endpoint-token'
+        return env
+    }
+
+    it('hands a daemon restarted by an endpoint session none of the keys that session owns, blank ones included', () => {
+        expect(sanitizeChildEnv(endpointSession())).toEqual({ PATH: '/usr/bin' })
+    })
+
+    it('keeps them inside the session, where the agent needs them', () => {
+        const kept = sanitizeChildEnv(endpointSession(), { boundary: 'in-session' })
+        for (const key of ORG_ENDPOINT_OWNED_ENV_KEYS) expect(kept).toHaveProperty(key)
+    })
+
+    it('leaves the same keys alone when no endpoint binding is present', () => {
+        const env = { ANTHROPIC_API_KEY: 'personal-key', ANTHROPIC_PROFILE: 'work' }
+        expect(sanitizeChildEnv(env)).toEqual(env)
     })
 })

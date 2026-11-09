@@ -163,6 +163,71 @@ describe('배선 가드: spawn 이 선택을 존중하고 검증하는가', () =
   })
 })
 
+describe('org-endpoint wiring (aplus specs/org-llm-endpoints C5)', () => {
+  it('a resume rebuilds the recorded target and never falls into the setup-token rebind that may move an account', async () => {
+    const text = await runSource()
+    expect(text).toMatch(/const resumeOrgEndpoint = readOrgEndpointResumeSelection\(tracked\.agentEnvironment\);/)
+    expect(text).toMatch(/resumeOrgEndpoint\s*\?\s*\{ environment: await resolveManagedAiCredentialEnvironment\(resumeAgent, resumeOrgEndpoint\), rebound: false \}\s*:\s*await resumeSetupTokenEnvironment\(/)
+  })
+
+  it('an endpoint launch never takes the shared-machine rotation: it spends no company account', async () => {
+    const text = await runSource()
+    expect(text).toMatch(/explicitUserGrant: options\.aiAuthSelection\?\.kind === 'claude-setup-token' \|\| options\.aiAuthSelection\?\.kind === 'org-endpoint',/)
+  })
+
+  it('a resume asks Studio about the recorded binding before it rebuilds the endpoint, and a refusal ends the resume', async () => {
+    const text = await runSource()
+    const check = text.indexOf('orgEndpointStudio.checkResume({')
+    const rebuild = text.indexOf('resolveManagedAiCredentialEnvironment(resumeAgent, resumeOrgEndpoint)')
+    expect(check).toBeGreaterThan(0)
+    expect(check).toBeLessThan(rebuild)
+    expect(text).toMatch(/if \(!endpointVerdict\.ok\) \{\s*return \{\s*type: 'error',\s*code: 'SESSION_RESUME_FAILED',/)
+    expect(text).toMatch(/bindingId: resumeOrgEndpoint\.bindingId, sessionId: happySessionId, endpointId: resumeOrgEndpoint\.endpointId,\s*targetId: resumeOrgEndpoint\.candidates\[0\]!, generation: resumeOrgEndpoint\.generation,/)
+  })
+
+  it('a started endpoint session is reported to Studio without holding the spawn result', async () => {
+    const text = await runSource()
+    expect(text).toMatch(/if \(appliedOrgLlmEndpoint\) void orgEndpointStartReports\.reportAfterSpawn\(result\.sessionId, appliedOrgLlmEndpoint\);/)
+    expect(text).toMatch(/send: \(report\) => orgEndpointStudio\.reportSessionStarted\(report\),/)
+    // The client authenticates with the daemon's own token and trusted origin, like its other Studio calls.
+    expect(text).toMatch(/createOrgLlmEndpointStudioClient\(\{\s*studioOrigin: readTrustedStudioOrigin\(process\.env\), bearer: \(\) => credentials\.token, fetch,/)
+  })
+
+  it('a resume sends a start report Studio never took before it asks Studio, and the record it updates is the tracked one and the persisted one', async () => {
+    const text = await runSource()
+    const resend = text.indexOf('orgEndpointStartReports.resendIfPending(happySessionId,')
+    const check = text.indexOf('orgEndpointStudio.checkResume({')
+    expect(resend).toBeGreaterThan(0)
+    expect(resend).toBeLessThan(check)
+    // Both copies: the cursor writers persist the tracked session's environment, so updating only the file would be undone.
+    expect(text).toMatch(/if \(tracked\) tracked\.agentEnvironment = agentEnvironment;\s*const saved = readPersistedSessions\(\)\[sessionId\];\s*if \(saved\) persistSession\(sessionId, \{ \.\.\.saved, agentEnvironment, savedAt: Date\.now\(\) \}\);/)
+  })
+
+  it('a resume of a session whose metadata carries the endpoint marker but whose record has no binding is refused', async () => {
+    const text = await runSource()
+    expect(text).toMatch(/const resumeOrgEndpoint = readOrgEndpointResumeSelection\(tracked\.agentEnvironment\);[\s\S]{0,400}if \(!resumeOrgEndpoint && isOrgEndpointBoundMetadata\(metadata\)\) \{\s*return \{\s*type: 'error',\s*code: 'SESSION_RESUME_FAILED',/)
+    // Before any other source is prepared for the resume.
+    expect(text.indexOf('isOrgEndpointBoundMetadata(metadata)')).toBeLessThan(text.indexOf('const resumeMachineRuntime = resumeBinding'))
+  })
+
+  it('a spawn that continues another conversation is refused for an endpoint parent before anything is created, whatever selection the requester sent', async () => {
+    const text = await runSource()
+    const guard = text.indexOf('orgEndpointParentRefusal({')
+    expect(guard).toBeGreaterThan(0)
+    expect(guard).toBeLessThan(text.indexOf('await fs.access(directory);'))
+    expect(text).toMatch(/options\.parentSessionId \|\| options\.resumeClaudeSessionId\s*\?\s*orgEndpointParentRefusal\(\{[\s\S]*?records: readPersistedSessions\(\), projectDir: getProjectPath\(options\.directory\),\s*\}\)/)
+    // No selection reaches the check: a same-endpoint selection must not excuse a parent that has a binding record or marker.
+    expect(text.slice(guard, text.indexOf('if (endpointParentRefusal)'))).not.toMatch(/selection/)
+    expect(text).toMatch(/if \(endpointParentRefusal\) return \{ type: 'error', errorMessage: endpointParentRefusal \};/)
+  })
+
+  it('the applied target reaches the spawn result', async () => {
+    const text = await runSource()
+    expect(text).toMatch(/appliedOrgLlmEndpoint = readAppliedOrgLlmEndpoint\(managedAiCredentialEnvironment\)/)
+    expect(text).toMatch(/\.\.\.\(appliedOrgLlmEndpoint \? \{ appliedOrgLlmEndpoint \} : \{\}\)/)
+  })
+})
+
 describe('setup-token account switch wiring (Saycode specs/claude-setup-token-account-selection)', () => {
   it("hands the switch the runtime's own session environment, recorded binding included", async () => {
     const block = (await runSource()).match(/createSetupTokenAccountSwitch\(\{[\s\S]*?\n {4}\}\);/)?.[0] ?? ''

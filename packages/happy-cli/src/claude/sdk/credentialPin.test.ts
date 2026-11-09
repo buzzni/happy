@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Options, Query, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
-import { queryWithPinnedCredential } from './credentialPin';
+import { queryWithPinnedCredential, queryWithPinnedEndpoint } from './credentialPin';
+import { buildOrgLlmEndpointEnvironment, parseOrgLlmEndpointSync } from '@/daemon/orgLlmEndpoint';
+import { ORG_ENDPOINT_CLEARED_ENV_KEYS, ORG_ENDPOINT_OWNED_ENV_KEYS } from '../utils/orgEndpointEnvKeys';
+import { describeClaudeLaunchFailure } from '../utils/launchFailureMessage';
 import { logger } from '@/lib';
 const TOKEN = 'fixture-owner-token';
 function fixture() {
@@ -17,7 +20,10 @@ function fixture() {
     const create = vi.fn(({ prompt }: { prompt: AsyncIterable<SDKUserMessage> }) => Object.assign((async function* () {
         for await (const message of prompt) { received.push(message); yield { type: 'result', subtype: 'success' }; }
     })(), controls) as unknown as Query);
-    return { controls, create, received, tamper: () => { effective.env.ANTHROPIC_BASE_URL = 'https://wrong.example.test'; }, restrictOrganization: () => { effective.forceLoginOrgUUID = 'fixture-org'; } };
+    return { controls, create, received, tamper: () => { effective.env.ANTHROPIC_BASE_URL = 'https://wrong.example.test'; },
+        setEffective: (value: Record<string, any>) => { effective = { ...effective, ...value }; },
+        setEnv: (patch: Record<string, string>) => { effective.env = { ...effective.env, ...patch }; },
+        setAllowedProviders: (value: string[]) => { effective.allowedProviders = value; }, restrictOrganization: () => { effective.forceLoginOrgUUID = 'fixture-org'; } };
 }
 const options: Options = { env: { CLAUDE_CODE_OAUTH_TOKEN: TOKEN }, settingSources: ['user', 'project', 'local'] };
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
@@ -28,6 +34,8 @@ describe('pinned credential at the SDK request boundary', () => {
         expect(f.controls.applyFlagSettings).toHaveBeenCalledOnce();
         expect(f.controls.applyFlagSettings.mock.calls[0][0]).toMatchObject({ apiKeyHelper: '', env: { CLAUDE_CODE_OAUTH_TOKEN: TOKEN, ANTHROPIC_API_KEY: '', KEEP_FLAG_ENV: 'yes' } });
         expect(Object.keys(f.controls.applyFlagSettings.mock.calls[0][0]).sort()).toEqual(['apiKeyHelper', 'env']);
+        // The socket route changes the transport under an unchanged address and token; it is forced empty like the other routes.
+        expect(f.controls.applyFlagSettings.mock.calls[0][0]).toMatchObject({ env: { ANTHROPIC_UNIX_SOCKET: '' } });
         expect(f.create.mock.calls[0][0]).toMatchObject({ options });
         expect(f.received).toHaveLength(1); expect(f.received[0].message.content).toBe('hello');
     });
@@ -187,5 +195,122 @@ describe('pinned credential at the SDK request boundary', () => {
         expect(error).toMatchObject({ message: 'CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED', stage, reason });
         expect(JSON.stringify({ ...error, message: error.message })).not.toContain(TOKEN);
         expect(f.received).toEqual([]);
+    });
+});
+
+// aplus specs/org-llm-endpoints r2 — an endpoint session's address, token and models must survive the settings files.
+describe('pinned organization LLM endpoint at the SDK request boundary', () => {
+    const entry = parseOrgLlmEndpointSync({
+        version: 1, companyId: 'company-1', userId: 'user-1',
+        endpoint: { id: 'endpoint-1', generation: 2, model: 'corp-model', models: { opus: 'corp-big' }, maxContextTokens: 200_000, apiTimeoutMs: 600_000,
+            authMode: 'static-token', token: 'corp-endpoint-token', targets: [{ id: 'target-a', url: 'https://llm-a.corp.example' }] },
+    });
+    // The daemon's own builder: the pin must accept what the daemon really hands a session.
+    const daemonEnv = buildOrgLlmEndpointEnvironment({ entry, target: entry.targets[0]!, bindingId: 'binding-1' });
+    const endpointOptions: Options = { env: daemonEnv, settingSources: ['user', 'project', 'local'] };
+    const CODE = 'CLAUDE_ORG_ENDPOINT_NOT_VERIFIED';
+    const endpointAccount = { account: { apiProvider: 'firstParty', tokenSource: 'ANTHROPIC_AUTH_TOKEN' } };
+    // Claude Code reports a bearer-token endpoint this way (observed with the real SDK).
+    const endpointFixture = () => { const f = fixture(); f.controls.reinitialize.mockResolvedValue(endpointAccount as never); return f; };
+
+    it('forces the address, token, models and every cleared route above the settings files, keeping flag env', async () => {
+        const f = endpointFixture(); const q = queryWithPinnedEndpoint(f.create as never, { prompt: 'hello', options: endpointOptions }, daemonEnv);
+        await q.next();
+        const applied = f.controls.applyFlagSettings.mock.calls[0][0] as { apiKeyHelper: string; env: Record<string, string> };
+        expect(applied.apiKeyHelper).toBe('');
+        expect(applied.env).toMatchObject({
+            KEEP_FLAG_ENV: 'yes', ANTHROPIC_BASE_URL: 'https://llm-a.corp.example', ANTHROPIC_AUTH_TOKEN: 'corp-endpoint-token',
+            ANTHROPIC_MODEL: 'corp-model', ANTHROPIC_DEFAULT_OPUS_MODEL: 'corp-big', CLAUDE_CODE_SUBAGENT_MODEL: 'corp-model',
+            CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1', ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', CLAUDE_CODE_USE_MANTLE: '', ANTHROPIC_PROFILE: '', ANTHROPIC_UNIX_SOCKET: '',
+        });
+        // Exactly the daemon's non-marker keys, nothing the settings files could add.
+        expect(Object.keys(applied.env).filter(key => key !== 'KEEP_FLAG_ENV').sort()).toEqual([...ORG_ENDPOINT_OWNED_ENV_KEYS].sort());
+        expect((f.create.mock.calls[0][0] as unknown as { options: Options }).options.env).toMatchObject(daemonEnv);
+        expect(f.received).toHaveLength(1);
+    });
+
+    it.each([
+        ['another address', { ANTHROPIC_BASE_URL: 'https://attacker.example' }],
+        ['another token', { ANTHROPIC_AUTH_TOKEN: 'project-file-token' }],
+        ['another model', { ANTHROPIC_MODEL: 'claude-opus-5' }],
+        ['a tier model', { ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5' }],
+        ['the sub-agent model', { CLAUDE_CODE_SUBAGENT_MODEL: 'claude-sonnet-5' }],
+        ['a re-enabled provider', { CLAUDE_CODE_USE_MANTLE: '1' }],
+        ['a header', { ANTHROPIC_CUSTOM_HEADERS: 'Authorization: Bearer other' }],
+        ['a unix socket', { ANTHROPIC_UNIX_SOCKET: '/tmp/attacker.sock' }],
+        ['telemetry switched on', { CLAUDE_CODE_ENABLE_TELEMETRY: '1' }],
+        ['host routing turned off', { CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '0' }],
+    ])('refuses a settings layer that wins with %s before any input, naming no value', async (_label, override) => {
+        const f = endpointFixture();
+        // A managed policy (or a hook-time reload) wins over the flag layer: the applied settings do not stick.
+        f.controls.applyFlagSettings.mockImplementation(async (settings: Record<string, any>) => { f.setEffective({ ...settings, env: { ...settings.env, ...override } }); });
+        const q = queryWithPinnedEndpoint(f.create as never, { prompt: 'hello', options: endpointOptions }, daemonEnv);
+        const error = await q.next().catch((e: unknown) => e) as Error & { stage?: string; reason?: string };
+        expect(error).toMatchObject({ message: CODE, stage: 'recheck', reason: 'mismatch' });
+        expect(JSON.stringify({ ...error, message: error.message })).not.toMatch(/corp-endpoint-token|attacker|project-file-token/);
+        expect(f.received).toEqual([]); expect(f.controls.close).toHaveBeenCalled();
+    });
+
+    it('refuses the next input when a project settings file reloads another address or token between two inputs', async () => {
+        for (const change of [{ ANTHROPIC_BASE_URL: 'https://attacker.example' }, { ANTHROPIC_AUTH_TOKEN: 'project-file-token' }] as Record<string, string>[]) {
+            const f = endpointFixture();
+            async function* prompt() { for (const content of ['one', 'two']) yield { type: 'user' as const, parent_tool_use_id: null, message: { role: 'user' as const, content } }; }
+            const q = queryWithPinnedEndpoint(f.create as never, { prompt: prompt(), options: endpointOptions }, daemonEnv);
+            await q.next(); f.setEnv(change);
+            await expect(q.next()).rejects.toThrow(CODE);
+            expect(f.received).toHaveLength(1);
+        }
+    });
+
+    it('checks side questions too, which carry the conversation outside the input stream', async () => {
+        const f = endpointFixture(); const q = queryWithPinnedEndpoint(f.create as never, { prompt: 'hello', options: endpointOptions }, daemonEnv);
+        await q.next(); f.setEnv({ ANTHROPIC_BASE_URL: 'https://attacker.example' });
+        const request = (q as unknown as { request(body: unknown): Promise<unknown> }).request;
+        await expect(request({ subtype: 'side_question', prompt: 'two' })).rejects.toThrow(CODE);
+        expect(f.controls.request).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ['missing-control', (f: ReturnType<typeof fixture>) => { f.controls.getSettings = undefined as never; }],
+        ['old-version', (f: ReturnType<typeof fixture>) => { f.controls.initializationResult.mockResolvedValue({ claude_code_version: '2.1.100', hooks_applied: true }); }],
+        ['provider-allow-list', (f: ReturnType<typeof fixture>) => { f.setAllowedProviders(['anthropic', 'customEndpoint']); }],
+        ['cloud-account', (f: ReturnType<typeof fixture>) => { f.controls.reinitialize.mockResolvedValue({ account: { apiProvider: 'bedrock' } } as never); }],
+        ['login-account', (f: ReturnType<typeof fixture>) => { f.controls.reinitialize.mockResolvedValue({ account: { apiProvider: 'firstParty', tokenSource: 'CLAUDE_CODE_OAUTH_TOKEN' } } as never); }],
+        ['api-key-account', (f: ReturnType<typeof fixture>) => { f.controls.reinitialize.mockResolvedValue({ account: { apiProvider: 'firstParty', tokenSource: 'ANTHROPIC_AUTH_TOKEN', apiKeySource: 'ANTHROPIC_API_KEY' } } as never); }],
+        ['no-account', (f: ReturnType<typeof fixture>) => { f.controls.reinitialize.mockResolvedValue({} as never); }],
+    ])('refuses %s before input', async (_kind, arrange) => {
+        const f = endpointFixture(); arrange(f);
+        const q = queryWithPinnedEndpoint(f.create as never, { prompt: 'hello', options: endpointOptions }, daemonEnv);
+        await expect(q.next()).rejects.toThrow(CODE);
+        expect(f.received).toEqual([]); expect(f.controls.close).toHaveBeenCalled();
+    });
+
+    it.each([
+        ['a value key missing', (env: Record<string, string>) => { delete env.ANTHROPIC_DEFAULT_OPUS_MODEL; }],
+        ['no address', (env: Record<string, string>) => { env.ANTHROPIC_BASE_URL = ''; }],
+        ['no token', (env: Record<string, string>) => { env.ANTHROPIC_AUTH_TOKEN = ''; }],
+        ['host routing off', (env: Record<string, string>) => { env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = ''; }],
+        ['a newline in a value', (env: Record<string, string>) => { env.ANTHROPIC_MODEL = 'a\nb'; }],
+    ])('throws at once, with the sanitized code, for %s in the session environment', (_label, damage) => {
+        const f = endpointFixture(); const env = { ...daemonEnv }; damage(env);
+        expect(() => queryWithPinnedEndpoint(f.create as never, { prompt: 'hello', options: endpointOptions }, env)).toThrow(CODE);
+        expect(f.create).not.toHaveBeenCalled();
+    });
+
+    it('forces every closed route empty whatever the session environment holds, even when a daemon that predates the key left it out', async () => {
+        const f = endpointFixture();
+        const env: Record<string, string> = { ...daemonEnv, ANTHROPIC_UNIX_SOCKET: '/tmp/attacker.sock', CLAUDE_CODE_ENABLE_TELEMETRY: '1', CLAUDE_CODE_USE_MANTLE: '1' };
+        delete env.ANTHROPIC_PROFILE;
+        const q = queryWithPinnedEndpoint(f.create as never, { prompt: 'hello', options: { ...endpointOptions, env } }, env);
+        await q.next();
+        const applied = f.controls.applyFlagSettings.mock.calls[0][0] as { env: Record<string, string> };
+        for (const key of ORG_ENDPOINT_CLEARED_ENV_KEYS) expect(applied.env[key], key).toBe('');
+        expect((f.create.mock.calls[0][0] as unknown as { options: Options }).options.env).toMatchObject({ ANTHROPIC_UNIX_SOCKET: '', CLAUDE_CODE_ENABLE_TELEMETRY: '' });
+        expect(f.received).toHaveLength(1);
+    });
+
+    it('tells the user a sentence, not the code', () => {
+        expect(describeClaudeLaunchFailure(new Error(CODE))).toMatch(/organization LLM endpoint could not be verified/);
+        expect(describeClaudeLaunchFailure(new Error(CODE))).not.toContain(CODE);
     });
 });

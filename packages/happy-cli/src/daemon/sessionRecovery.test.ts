@@ -86,6 +86,66 @@ describe('decideUntrackedSessionRecovery', () => {
     });
   });
 
+  // aplus specs/org-llm-endpoints r2 — a new Happy session carries none of the old session's endpoint binding, so the
+  // old conversation would continue on whatever source this machine defaults to (another URL, or another company's account).
+  it.each([
+    ['a recorded endpoint binding', 'binding-1:endpoint-1:target-a:3'],
+    ['a corrupt endpoint binding record', ''],
+  ])('refuses to continue into a new Happy session with %s, whatever the agent', (_label, binding) => {
+    for (const agentMetadata of [{}, { flavor: 'codex' as const, claudeSessionId: undefined, codexThreadId: 'codex-old' }]) {
+      const decision = decideUntrackedSessionRecovery({
+        serverSession: serverSession({ metadata: { ...serverSession().metadata, ...agentMetadata } }),
+        persistedSession: { ...persisted(), agentEnvironment: { HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING: binding } },
+        pathExists: true,
+        nativeSessionExists: true,
+      })
+      expect(decision).toEqual({ kind: 'refuse', code: 'SESSION_RESUME_FAILED', reason: expect.stringContaining('organization LLM endpoint') })
+    }
+  })
+
+  // r3 — the local record can be gone (a lost store, another daemon home); the session's own metadata still says it.
+  it.each([
+    ['no local record', undefined],
+    ['a local record without the binding', persisted()],
+  ])('refuses to continue into a new Happy session when the server metadata carries the endpoint marker and there is %s', (_label, persistedSession) => {
+    for (const agentMetadata of [{}, { flavor: 'codex' as const, claudeSessionId: undefined, codexThreadId: 'codex-old' }]) {
+      const decision = decideUntrackedSessionRecovery({
+        serverSession: serverSession({ metadata: { ...serverSession().metadata, ...agentMetadata, orgLlmEndpoint: { version: 1, bindingId: 'binding-1', endpointId: 'endpoint-1' } } }),
+        persistedSession,
+        pathExists: true,
+        nativeSessionExists: true,
+      });
+      expect(decision).toEqual({ kind: 'refuse', code: 'SESSION_RESUME_FAILED', reason: expect.stringContaining('organization LLM endpoint') });
+    }
+  });
+
+  it('refuses on a marker whose shape this build cannot read, too', () => {
+    expect(decideUntrackedSessionRecovery({
+      serverSession: serverSession({ metadata: { ...serverSession().metadata, orgLlmEndpoint: { version: 2, unknown: true } as never } }),
+      persistedSession: undefined,
+      pathExists: true,
+      nativeSessionExists: true,
+    })).toMatchObject({ kind: 'refuse', code: 'SESSION_RESUME_FAILED' });
+  });
+
+  it('still reconnects the same Happy session of a marked session when its record has a reliable cursor, which Studio confirms on resume', () => {
+    expect(decideUntrackedSessionRecovery({
+      serverSession: serverSession({ metadata: { ...serverSession().metadata, orgLlmEndpoint: { version: 1, bindingId: 'binding-1', endpointId: 'endpoint-1' } } }),
+      persistedSession: persisted(17),
+      pathExists: true,
+      nativeSessionExists: true,
+    })).toEqual({ kind: 'same-session', baselineSeq: 17 });
+  });
+
+  it('still reconnects the same Happy session of an endpoint session, whose resume Studio confirms', () => {
+    expect(decideUntrackedSessionRecovery({
+      serverSession: serverSession(),
+      persistedSession: { ...persisted(17), agentEnvironment: { HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING: 'binding-1:endpoint-1:target-a:3' } },
+      pathExists: true,
+      nativeSessionExists: true,
+    })).toEqual({ kind: 'same-session', baselineSeq: 17 });
+  });
+
   it('continues a verified Codex thread into a new Happy session', () => {
     expect(decideUntrackedSessionRecovery({
       serverSession: serverSession({

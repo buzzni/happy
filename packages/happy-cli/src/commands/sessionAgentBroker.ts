@@ -37,6 +37,12 @@ export function createAgentHostExecutor(input: {
   const entrypoint = input.entrypoint ?? resolve(dirname(manifestPath!), manifest.bin.saycode)
   const identityAuthority = input.identityAuthority ?? unavailableAgentIdentityAuthority
   return (argv: string[], signal: AbortSignal): Promise<AgentBrokerResult> => {
+    // An organization LLM endpoint session's work stays on its endpoint: a child would start under this machine's default
+    // source, which no endpoint binding covers (aplus specs/org-llm-endpoints r3). Reading and steering existing sessions stay.
+    if (argv[0] === 'spawn' && env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint') {
+      return Promise.resolve({ exitCode: 3, stdout: JSON.stringify({ ok: false, error: 'org_endpoint_spawn_refused',
+        detail: 'This conversation runs on an organization LLM endpoint; a new session would start on another source. Do the work in this session.' }) + '\n' })
+    }
     const attendance = input.delegatedAttendance?.() ?? null
     const callEnv = attendance ? { ...env, [DELEGATED_ATTENDANCE_ENV]: attendance } : env
     return runAgentHostProcess({ entrypoint, argv, directory, env: callEnv, signal,

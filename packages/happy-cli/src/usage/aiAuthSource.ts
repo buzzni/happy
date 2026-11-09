@@ -52,6 +52,11 @@ export const AI_AUTH_SOURCES = [
      * after the plan provider actually reached the Codex launch — never by the daemon (§6.3-3).
      */
     'platform-plan',
+    /**
+     * An organization LLM endpoint the admin registered (aplus specs/org-llm-endpoints). Written only by the
+     * daemon, after it actually injected that endpoint's address and token into the session.
+     */
+    'org-endpoint',
     /** Not established. Never inferred. */
     'unknown',
     // `org-bundle-observed` is deliberately absent: it is an in-process

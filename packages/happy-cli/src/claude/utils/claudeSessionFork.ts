@@ -19,6 +19,7 @@ import { createReadStream, createWriteStream } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { logger } from "@/ui/logger";
+import { isOrgEndpointConversation } from "./orgEndpointConversation";
 
 export type ClaudeRewindPoint = {
     uuid: string;
@@ -37,6 +38,14 @@ export class ForkSourceMissingError extends Error {
     constructor(public readonly sourcePath: string) {
         super(`Source Claude session JSONL not found: ${sourcePath}`);
         this.name = 'ForkSourceMissingError';
+    }
+}
+
+/** A copy of an endpoint conversation would be continued in a new session, under another source (aplus specs/org-llm-endpoints r3). */
+function assertForkable(projectDir: string, sourceClaudeSessionId: string): void {
+    if (isOrgEndpointConversation(projectDir, sourceClaudeSessionId)) {
+        throw new Error('ORG_LLM_ENDPOINT_PARENT_BOUND: this conversation ran on an organization LLM endpoint and cannot be forked; '
+            + 'resume the same session, or start a new conversation.');
     }
 }
 
@@ -63,6 +72,7 @@ function isUserPrompt(parsed: any): boolean {
  * source do not corrupt the destination.
  */
 export async function forkSession(projectDir: string, sourceClaudeSessionId: string): Promise<string> {
+    assertForkable(projectDir, sourceClaudeSessionId);
     const newId = randomUUID();
     const src = jsonlPath(projectDir, sourceClaudeSessionId);
     const dst = jsonlPath(projectDir, newId);
@@ -102,6 +112,7 @@ export async function forkAndTruncateSession(
     sourceClaudeSessionId: string,
     cutAfterUuid: string,
 ): Promise<string> {
+    assertForkable(projectDir, sourceClaudeSessionId);
     const newId = randomUUID();
     const src = jsonlPath(projectDir, sourceClaudeSessionId);
     const finalDst = jsonlPath(projectDir, newId);

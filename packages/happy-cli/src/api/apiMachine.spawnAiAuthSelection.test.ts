@@ -53,6 +53,34 @@ describe('spawn 의 AI 인증 원천 선택', () => {
         }));
     });
 
+    it('org-endpoint 선택을 닫힌 모양 그대로 daemon 까지 전달하고 적용된 target 을 응답에 싣는다', async () => {
+        const spawnSession = vi.fn().mockResolvedValue({
+            type: 'success', sessionId: 'happy-1', appliedAiAuthSource: 'org-endpoint',
+            appliedOrgLlmEndpoint: { bindingId: 'binding-1', targetId: 'target-a' },
+        });
+        const handler = await spawnHandler(spawnSession);
+        const aiAuthSelection = { kind: 'org-endpoint', bindingId: 'binding-1', endpointId: 'endpoint-1', generation: 2, candidates: ['target-b', 'target-a'] };
+
+        const response = await handler({ directory: '/tmp/project', agent: 'claude', aiAuthSelection });
+
+        expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({ aiAuthSelection }));
+        expect(response).toEqual({
+            type: 'success', sessionId: 'happy-1', appliedAiAuthSource: 'org-endpoint',
+            appliedOrgLlmEndpoint: { bindingId: 'binding-1', targetId: 'target-a' },
+        });
+    });
+
+    it('후보가 없는 org-endpoint 선택은 spawn 전에 거절한다', async () => {
+        const spawnSession = vi.fn();
+        const handler = await spawnHandler(spawnSession);
+
+        await expect(handler({
+            directory: '/tmp/project', agent: 'claude',
+            aiAuthSelection: { kind: 'org-endpoint', bindingId: 'binding-1', endpointId: 'endpoint-1', generation: 2, candidates: [] },
+        })).rejects.toThrow(/org-endpoint/);
+        expect(spawnSession).not.toHaveBeenCalled();
+    });
+
     it('선택이 없으면 기존 동작 그대로다 — 선택 필드를 지어내지 않는다', async () => {
         const spawnSession = vi.fn().mockResolvedValue({ type: 'success', sessionId: 'happy-1' });
         const handler = await spawnHandler(spawnSession);

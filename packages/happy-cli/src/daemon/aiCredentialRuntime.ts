@@ -43,6 +43,17 @@ import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS } from '@/claude/utils/claudeAuthOverride
 import { setupTokenWindowUsedUp } from '@/claude/setupTokenUsageTracker'
 import { openSetupTokenAssignment, type SetupTokenAssignmentRecipient } from './setupTokenAssignmentWire'
 import { HAPPY_AI_AUTH_SOURCE_ENV } from '@/usage/aiAuthSource'
+import {
+  isOrgLlmEndpointSyncConflict,
+  OrgLlmEndpointError,
+  parseOrgLlmEndpointStore,
+  parseOrgLlmEndpointSync,
+  probeOrgLlmEndpointTarget,
+  replaceOrgLlmEndpoint,
+  resolveOrgLlmEndpointLaunch,
+  type OrgLlmEndpointFetch,
+  type OrgLlmEndpointStore,
+} from './orgLlmEndpoint'
 import { CODEX_LOGIN_REFRESH_DRIVER } from './codexLoginRefreshDriver'
 import { CODEX_OWNER_MANAGED_REFRESH_TOKEN } from '@/codex/codexOwnerManagedLogin'
 
@@ -188,6 +199,8 @@ export type AiCredentialRuntimeDependencies = {
   syncDirectory?(path: string): Promise<void>
   /** Unexpected but non-fatal conditions, e.g. a provenance record that could not be written. */
   warn?(message: string): void
+  /** The organization LLM endpoint status probe (aplus specs/org-llm-endpoints C5); defaults to the global fetch. */
+  fetch?: OrgLlmEndpointFetch
   supervisor: Supervisor
   codexProxyStatus?: () => { activeRoutes: number }
   /** Present only when the daemon has a trusted Studio origin configured. */
@@ -219,6 +232,14 @@ export class AiCredentialRuntimeError extends Error {
       + (applyGeneration === undefined ? '' : ` [applyGeneration=${applyGeneration}]`),
     )
     if (probe) this.probe = probe
+  }
+}
+
+/** A sync older than the stored endpoint; `storedGeneration` tells the sender what this machine holds. */
+class OrgLlmEndpointStaleGenerationError extends AiCredentialRuntimeError {
+  constructor(readonly storedGeneration: number) {
+    super('ORG_LLM_ENDPOINT_STALE_GENERATION')
+    this.message += ` [storedGeneration=${storedGeneration}]`
   }
 }
 
@@ -2731,7 +2752,80 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (pending) throw unresolved()
   }
 
+  /**
+   * aplus specs/org-llm-endpoints C4 — the organization LLM endpoints Studio pushed here. One owner-only file
+   * beside the other managed credentials; a sync replaces only its own endpoint's entry.
+   */
+  function orgLlmEndpointStorePath(): string {
+    return join(deps.homeDir, '.happy', 'org-llm-endpoints.json')
+  }
+
+  async function readOrgLlmEndpointStore(): Promise<OrgLlmEndpointStore | undefined> {
+    let raw: string
+    try {
+      raw = await deps.readFile(orgLlmEndpointStorePath())
+    } catch (error) {
+      if ((error as { code?: unknown } | null)?.code === 'ENOENT') return undefined
+      throw error
+    }
+    return parseOrgLlmEndpointStore(raw)
+  }
+
+  /** The endpoint module's fixed codes become this runtime's error kind; anything else stays unexpected. */
+  function withOrgLlmEndpointErrors<T>(kind: string, operation: () => Promise<T>): Promise<T> {
+    return withSafeErrors(kind, async () => {
+      try {
+        return await operation()
+      } catch (error) {
+        if (error instanceof OrgLlmEndpointError) throw new AiCredentialRuntimeError(error.code)
+        throw error
+      }
+    })
+  }
+
+  function orgLlmEndpointSync(params: unknown) {
+    return withOrgLlmEndpointErrors('ORG_LLM_ENDPOINT_SYNC_FAILED', async () => {
+      const entry = parseOrgLlmEndpointSync(params)
+      return serialize(async () => {
+        let current: OrgLlmEndpointStore | undefined
+        try {
+          current = await readOrgLlmEndpointStore()
+        } catch (error) {
+          // The server re-sends an endpoint on every session start, so an unreadable file is replaced rather than
+          // left to refuse every later sync. Say so: other endpoints' sessions can no longer resume from it.
+          if (!(error instanceof OrgLlmEndpointError)) throw error
+          deps.warn?.('org-llm-endpoints store was unreadable and is replaced by the synced endpoint only')
+        }
+        // A prepare that read the endpoint before an admin change can arrive after the one that read it after:
+        // the older view must not bring back a removed address or a replaced token.
+        const stored = current?.endpoints[entry.id]
+        if (stored && entry.generation < stored.generation) throw new OrgLlmEndpointStaleGenerationError(stored.generation)
+        if (isOrgLlmEndpointSyncConflict(current, entry)) throw new OrgLlmEndpointError('ORG_LLM_ENDPOINT_GENERATION_CONFLICT')
+        await deps.mkdir(join(deps.homeDir, '.happy'), { recursive: true, mode: 0o700 })
+        await writeAtomicFile(deps, orgLlmEndpointStorePath(), JSON.stringify(replaceOrgLlmEndpoint(current, entry)))
+        return { ok: true as const, generation: entry.generation }
+      })
+    })
+  }
+
+  /**
+   * A spawn (or a resume, `selection.resume`) on an organization LLM endpoint. Reads the local copy and probes
+   * the candidates outside the credential queue: a probe can take seconds and must not hold group sync or other
+   * launches behind it. Claude only; never a substitute credential.
+   */
+  function orgLlmEndpointSessionEnvironment(agent: string | undefined, selection: Extract<AiAuthSelection, { kind: 'org-endpoint' }>) {
+    if (agent !== undefined && agent !== 'claude') throw new AiCredentialRuntimeError('ORG_LLM_ENDPOINT_AGENT_UNSUPPORTED')
+    return withOrgLlmEndpointErrors('ORG_LLM_ENDPOINT_UNAVAILABLE', async () => resolveOrgLlmEndpointLaunch({
+      store: await readOrgLlmEndpointStore(),
+      selection,
+      probe: ({ url, token }) => probeOrgLlmEndpointTarget({ fetch: deps.fetch ?? fetch, url, ...(token ? { token } : {}) }),
+      // Target ids and a reason only: the address and the token stay out of the log.
+      onProbeFailure: (targetId, reason) => deps.warn?.(`org-llm-endpoint target ${targetId} did not answer (${reason})`),
+    }))
+  }
+
   async function sessionEnvironment(agent: string | undefined, selection?: AiAuthSelection, recorded?: SetupTokenBinding): Promise<Record<string, string>> {
+    if (selection?.kind === 'org-endpoint') return orgLlmEndpointSessionEnvironment(agent, selection)
     if (selection?.kind === 'claude-setup-token') return serializeLaunch('prepare', () => withSafeErrors('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE',
       () => setupTokenSessionEnvironment(agent, selection, recorded)))
     if (agent !== undefined && agent !== 'claude') return {}
@@ -2875,7 +2969,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (entries.length !== 1 || entries[0].pending) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_ASSIGNMENT_UNRESOLVED')
     return entries[0].scope
   })
-  return { sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, sharedMachineAccountEnvironment, sharedMachineStartProof, sharedMachineStartBudgetMove, measureWithPermit, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, refreshCodexOwner, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
+  return { orgLlmEndpointSync, sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, sharedMachineAccountEnvironment, sharedMachineStartProof, sharedMachineStartBudgetMove, measureWithPermit, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, refreshCodexOwner, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
     // One fresh runtime observation per RPC: launching cswap repeatedly can block a secured Windows host.
     let stdout = ''
     try { stdout = (await deps.execFile('cswap', ['token-runtime', 'capabilities'], { maxOutputBytes: 64 * 1024, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })).stdout } catch {}
@@ -2886,7 +2980,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (machineId && origin && metadata.artifact === 'saycode-setup-token-runtime-v1' && metadata.organizationCollectorVersion === 1) {
       try { collector = await collectorVerificationReady(origin) } catch {}
     }
-    return { version: 1, codexRecoveryVersion: 1, codexRefreshOwnerVersion: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1, collectorMachinePrincipalVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, setupTokenResumeRequirementVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
+    return { version: 1, codexRecoveryVersion: 1, codexRefreshOwnerVersion: 1, orgLlmEndpointVersion: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1, collectorMachinePrincipalVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, setupTokenResumeRequirementVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
     // Managed setup-token import with metadata verification, only on the marked cswap token runtime.
     ...(setupToken ? { setupTokenVersion: 1, setupTokenStatusVersion: 1 } : {}),
     // Advertised only when a server-signed binding proof can actually be verified here.
