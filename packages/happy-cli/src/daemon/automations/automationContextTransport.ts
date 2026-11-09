@@ -28,6 +28,36 @@ export type AutomationContextTargetRequest = {
   displaySessionId: string; conversationDirectory: string; agent: 'claude' | 'codex'; questionRequestId?: string; body: Readonly<SessionExecutionCreateBody>
 }
 
+const admissionErrorCodes = new Set([
+  'AUTOMATION_INVALID_CLAIM', 'AUTOMATION_RUN_LEASE_EXPIRED', 'AUTOMATION_QUESTION_IDENTITY_MISMATCH',
+  'AUTOMATION_RUN_CHANGED', 'EXECUTION_PRINCIPAL_ACCESS_REVOKED', 'QUESTION_DISPLAY_CHANGED',
+  'AUTOMATION_CONTEXT_UNSUPPORTED', 'AUTOMATION_EXECUTION_UNBOUND', 'AUTOMATION_EXECUTION_COMPANY_MISMATCH',
+  'AUTOMATION_DEVICE_AUTHORITY_REQUIRED', 'AUTOMATION_COMPANY_INACTIVE', 'AUTOMATION_EXECUTION_AUTHORITY_DENIED',
+  'AUTOMATION_EXECUTION_AUTHORITY_CHANGED', 'AUTOMATION_EXECUTION_SIGNER_UNAVAILABLE', 'AUTOMATION_EXECUTION_COMPANY_UNRESOLVED',
+])
+
+/** Rejections may contain secrets. Preserve only known codes from a bounded body, never its raw text. */
+async function admissionFailureCode(response: Response): Promise<string> {
+  const reader = response.body?.getReader()
+  if (!reader) return ''
+  const chunks: Uint8Array[] = []; let bytes = 0
+  try {
+    while (true) {
+      const next = await reader.read()
+      if (next.done) break
+      bytes += next.value.byteLength
+      if (bytes > 4096) return ''
+      chunks.push(next.value)
+    }
+    const body: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)))
+    if (!body || typeof body !== 'object' || Array.isArray(body) || !('error' in body)) return ''
+    const code = body.error === 'Invalid automation claim' ? 'AUTOMATION_INVALID_CLAIM'
+      : body.error === 'Automation run lease expired' ? 'AUTOMATION_RUN_LEASE_EXPIRED' : body.error
+    return typeof code === 'string' && admissionErrorCodes.has(code) ? `:${code}` : ''
+  } catch { return '' }
+  finally { await reader.cancel().catch(() => undefined); reader.releaseLock() }
+}
+
 /** The daemon's explicit trust configuration is the only destination. Payloads supply no URLs or downgrade flags. */
 export function createAutomationContextAuthorizer(input: {
   studioOrigin: string | null; token: string; machineId: string; runId: string; claimToken: string
@@ -45,7 +75,7 @@ export function createAutomationContextAuthorizer(input: {
         signal: AbortSignal.timeout(10_000), headers: { Authorization: `Bearer ${input.token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify(body) })
     } catch { throw new Error('AUTOMATION_STUDIO_ADMISSION_UNCONFIRMED') }
-    if (!response.ok) { await response.body?.cancel(); throw new Error(`AUTOMATION_STUDIO_ADMISSION_HTTP_${response.status}`) }
+    if (!response.ok) throw new Error(`AUTOMATION_STUDIO_ADMISSION_HTTP_${response.status}${await admissionFailureCode(response)}`)
     const reader = response.body?.getReader()
     if (!reader) throw new Error('AUTOMATION_STUDIO_ADMISSION_INVALID')
     const chunks: Uint8Array[] = []; let bytes = 0
