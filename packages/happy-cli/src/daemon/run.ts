@@ -4516,7 +4516,8 @@ export async function startDaemon(): Promise<void> {
       browserBridge,
       browserLocalSetup,
       ...(personalBrowserWatch ? { desktopBrowserLogin: {
-        status: () => ({ protocol: 1, machineId, loginId: personalDesktopLogin?.loginId ?? null }),
+        status: () => ({ protocol: 1, machineId, loginId: personalDesktopLogin?.loginId ?? null, cookieImport: 1 }),
+        adminSocket: () => readPersonalBrowserRuntime({ machineId, studioOrigin: readTrustedStudioOrigin(process.env), token: () => credentials.token, log: () => {} })?.adminSocket,
         attach: async (input: unknown) => {
           const descriptor = desktopBrowserLoginDescriptor.parse(input);
           const runtime = readPersonalBrowserRuntime({ machineId, studioOrigin: readTrustedStudioOrigin(process.env), token: () => credentials.token, log: () => {} });

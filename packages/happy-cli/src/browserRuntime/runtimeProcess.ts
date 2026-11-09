@@ -44,6 +44,7 @@ import { open, readFile, statfs } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { join } from 'node:path'
 import { collectRuntimeMetrics, startAdminServer, type AdminServer } from './admin'
+import { createCookieImports } from './cookieImports'
 import { AttentionOutbox } from './attention'
 import { verifyToken, type AuthKeys, type VerifyPolicy } from './auth'
 import { listenOnSocket, startBroker, withRevokingGrants, type Broker } from './broker'
@@ -692,6 +693,11 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
             runtime.pageViews.revoke(capabilityId)
             return store.revoke(capabilityId)
         },
+        // The personal profile only: imported site cookies start the browser like a task does (ADR-087).
+        ...(config?.personalDesktop && ensureBrowser ? { cookies: createCookieImports({ stateDir, browser: async () => {
+            await ensureBrowser(profiles[0].profileId)
+            return drivers.get(profiles[0].profileId)!
+        } }) } : {}),
         ...(broker && config?.tenancyMode === 'shared' ? { profileRequests: {
             list: () => broker!.profileRequests(),
             refuse: (principalId: string, reason: ProfileRefusal, retryAfterMs: number) => broker!.refuseProfileRequest(principalId, reason, retryAfterMs),

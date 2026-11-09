@@ -3,6 +3,7 @@ import { attachLocalToolAgentRelayRoutes } from './localToolAgentRelay';
 import { attachStandaloneDrain, type StandaloneDrain } from './standaloneDrain';
 import { attachRestartDrainRoutes, RESTART_DRAIN_HANDING_OFF, type RestartDrainControlPort } from './restartDrainRoutes';
 import { attachBrowserLocalSetupRoutes } from './browserLocalSetupRoutes';
+import { attachBrowserCookieImportRoutes } from './browserCookieImportRoutes';
 import type { BrowserLocalSetup } from './browserLocalSetup';
 /**
  * HTTP control server for daemon management
@@ -143,7 +144,7 @@ export function startDaemonControlServer({
   /** aplus codexcli-daemon-restart-drain — absent on preflight and in tests that do not drain. */
   restartDrain?: RestartDrainControlPort;
   browserLocalSetup?: BrowserLocalSetup;
-  desktopBrowserLogin?: { status(): unknown; attach(input: unknown): Promise<void> };
+  desktopBrowserLogin?: { status(): unknown; attach(input: unknown): Promise<void>; adminSocket(): string | undefined };
   getChildren: () => TrackedSession[];
   stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
   spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
@@ -1119,6 +1120,7 @@ export function startDaemonControlServer({
         try { await desktopBrowserLogin.attach(request.body); return { protocol: 1, attached: true }; }
         catch { return reply.code(403).send({ error: 'DESKTOP_BROWSER_LOGIN_REQUIRED' }); }
       });
+      attachBrowserCookieImportRoutes(app, desktopBrowserLogin);
     }
     attachLocalToolAgentRelayRoutes(app);
     if (browserLocalSetup && browserBridge) attachBrowserLocalSetupRoutes(app, browserLocalSetup, browserBridge);

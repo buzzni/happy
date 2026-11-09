@@ -1435,13 +1435,16 @@ describe('scope approval diagnostic transport', () => {
 it('protects Desktop-login capability and attach and does not expose issuer errors', async () => {
   const server = await startDaemonControlServer({ getChildren: () => [], stopSession: () => ({ stopped: false, reason: 'not-found' }),
     spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }), requestShutdown: () => {}, onHappySessionWebhook: () => {},
-    portRegistry: {} as any, desktopBrowserLogin: { status: () => ({ protocol: 1, machineId: 'm' }), attach: async () => { throw Error('private issuer detail') } } })
+    portRegistry: {} as any, desktopBrowserLogin: { status: () => ({ protocol: 1, machineId: 'm' }), attach: async () => { throw Error('private issuer detail') }, adminSocket: () => undefined } })
   const url = `http://127.0.0.1:${server.port}/browser/desktop-login/`
   try {
-    for (const path of ['capability', 'attach']) expect((await realFetch(url + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status).toBe(401)
+    for (const path of ['capability', 'attach', 'cookies/list', 'cookies/remove']) expect((await realFetch(url + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status).toBe(401)
     const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${server.controlSecret}` }
     expect(await (await realFetch(url + 'capability', { method: 'POST', headers, body: '{}' })).json()).toMatchObject({ protocol: 1, machineId: 'm' })
     const reply = await realFetch(url + 'attach', { method: 'POST', headers, body: '{}' })
     expect(reply.status).toBe(403); expect(await reply.text()).not.toContain('private issuer detail')
+    // Without a configured personal runtime the cookie routes say so instead of failing open.
+    const cookies = await realFetch(url + 'cookies/list', { method: 'POST', headers, body: '{}' })
+    expect(cookies.status).toBe(503); expect(await cookies.json()).toEqual({ error: 'AI_BROWSER_UNAVAILABLE' })
   } finally { await server.stop() }
 })
