@@ -17,7 +17,7 @@ import { consumeInputEvidenceOption, inputEvidenceMetadata, resolveInputEvidence
 import { logger } from '@/ui/logger';
 import { loop } from '@/claude/loop';
 import { AgentGoalStatus, AgentState } from '@/api/types';
-import { Credentials, readSettings } from '@/persistence';
+import { Credentials, readPersistedSessions, readSettings } from '@/persistence';
 import { resolveSessionSandboxConfig } from '@/sandbox/resolveSessionSandboxConfig';
 import { resolveSessionSandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import { EnhancedMode, PermissionMode } from './loop';
@@ -142,7 +142,8 @@ import { createSessionOrgRequirementsGate } from '@/orgRequirements/sessionGate'
 import { orgRequirementsDirectory } from '@/orgRequirements/store';
 import { createClaudeOrgRequirements, orgTitleModel, stripModelSelectionEnv, type OrgModelRequest } from './claudeOrgRequirements';
 import { messageModelOrigin } from '@/orgRequirements/resolve';
-import { assertRemoteOnlyForOrgEndpoint } from './utils/orgEndpointLocalMode';
+import { assertRemoteOnlyForOrgEndpoint, orgEndpointContinuationRefusal } from './utils/orgEndpointLocalMode';
+import { claudeFindLastSession } from './utils/claudeFindLastSession';
 
 /**
  * How long a confirmed initial prompt waits for its acknowledgement before the
@@ -301,8 +302,14 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         throw new Error('Daemon-spawned sessions cannot use local/interactive mode. Use --happy-starting-mode remote or spawn sessions directly from terminal.');
     }
 
-    // An organization LLM endpoint session cannot be handed to the terminal's Claude (aplus specs/org-llm-endpoints r3).
+    // An organization LLM endpoint session cannot be handed to the terminal's Claude (aplus specs/org-llm-endpoints r3),
+    // nor its conversation continued by a launch that is not that session.
     assertRemoteOnlyForOrgEndpoint(process.env, options.startingMode ?? 'local');
+    const continuationRefusal = orgEndpointContinuationRefusal({
+        env: process.env, claudeArgs: options.claudeArgs,
+        lastConversation: () => claudeFindLastSession(workingDirectory), records: readPersistedSessions(),
+    });
+    if (continuationRefusal) throw new Error(continuationRefusal);
 
     // Set backend for offline warnings (before any API calls)
     connectionState.setBackend('Claude');

@@ -1,6 +1,8 @@
 import { existsSync } from 'node:fs';
 
 import type { Metadata } from '@/api/types';
+import { ORG_ENDPOINT_LOCAL_MODE_REFUSAL } from '@/claude/utils/orgEndpointLocalMode';
+import { isOrgEndpointBoundMetadata, isOrgEndpointBoundRecord } from '@/daemon/orgEndpointSessionMarker';
 import { readPersistedSessions } from '@/persistence';
 import { INPUT_EVIDENCE_ENV, resolveRecoveredInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings';
 import { sanitizeChildEnv } from '@/utils/childEnv';
@@ -179,6 +181,12 @@ export async function handleResumeCommand(args: string[]): Promise<void> {
     }
 
     const session = await resolveHappySession(parsed.sessionId);
+    const record = readPersistedSessions()[session.id];
+    // The runner below would carry no endpoint env and continue the conversation on this machine's own login
+    // (aplus specs/org-llm-endpoints r3). The marker covers a session this machine has no record of.
+    if (isOrgEndpointBoundMetadata(session.metadata) || (record !== undefined && isOrgEndpointBoundRecord(record))) {
+        throw new Error(ORG_ENDPOINT_LOCAL_MODE_REFUSAL);
+    }
     const launch = buildResumeLaunch(session);
 
     if (!existsSync(launch.cwd)) {
@@ -186,7 +194,7 @@ export async function handleResumeCommand(args: string[]): Promise<void> {
     }
 
     const evidenceEnvironment = resolveRecoveredInputEvidenceEnvironment({
-        savedEnvironment: readPersistedSessions()[session.id]?.agentEnvironment,
+        savedEnvironment: record?.agentEnvironment,
         metadata: session.metadata,
         requestedEnvironment: parsed.inputEvidence === undefined ? undefined : { [INPUT_EVIDENCE_ENV]: parsed.inputEvidence },
     });
