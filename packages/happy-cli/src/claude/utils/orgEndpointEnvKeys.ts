@@ -78,6 +78,11 @@ export function orgEndpointRoutingSettingsEnv(env: Record<string, string | undef
     // Loopback stays direct, as it does for the SDK's own environment: Happy's MCP and hook servers listen there.
     const machine = { ...env }
     ensureLocalProxyBypass(machine)
-    for (const key of ORG_ENDPOINT_MACHINE_ENV_KEYS) block[key] = machine[key] ?? ''
+    for (const key of ORG_ENDPOINT_MACHINE_ENV_KEYS) {
+        const value = machine[key] ?? ''
+        // This block travels in Claude Code's argv, readable by every account on the machine. A proxy that carries its
+        // credentials stays in the process environment only; TLS trust is still held, so an https endpoint stays private.
+        if (!/^[a-z][a-z0-9+.-]*:\/\/[^/?#]*@/i.test(value)) block[key] = value
+    }
     return block
 }

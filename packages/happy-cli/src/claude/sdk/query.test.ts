@@ -120,6 +120,16 @@ describe('query adapter', () => {
                 NODE_TLS_REJECT_UNAUTHORIZED: '', NODE_EXTRA_CA_CERTS: '' });
         });
 
+        it('keeps a proxy that carries its credentials out of the settings, which travel in argv', () => {
+            vi.stubEnv('HTTPS_PROXY', 'http://user:secret@proxy.corp.example:3128');
+            vi.stubEnv('HTTP_PROXY', 'http://proxy.corp.example:3128');
+            query({ prompt: 'hello' });
+            const options = (pinnedEndpointQuery.mock.calls.at(-1) as unknown as [unknown, { options: { settings?: string } }])[1].options;
+            expect(options.settings).not.toContain('secret');
+            expect(JSON.parse(options.settings!).env).toMatchObject({ HTTP_PROXY: 'http://proxy.corp.example:3128', NODE_TLS_REJECT_UNAUTHORIZED: '' });
+            expect(JSON.parse(options.settings!).env).not.toHaveProperty('HTTPS_PROXY');
+        });
+
         it('keeps loopback off the proxy in the layer that outranks the SDK\'s own environment, the machine\'s exceptions included', () => {
             vi.stubEnv('HTTPS_PROXY', 'http://proxy.corp.example:3128');
             vi.stubEnv('NO_PROXY', '.corp.example');
