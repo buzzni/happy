@@ -111,6 +111,14 @@ describe('query adapter', () => {
             expect(options.settings).not.toContain('corp-token');
         });
 
+        it('holds the machine\'s own proxy and TLS trust above the settings files, empty where it has none', () => {
+            vi.stubEnv('HTTPS_PROXY', 'http://proxy.corp.example:3128');
+            for (const key of ['HTTP_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy', 'NODE_TLS_REJECT_UNAUTHORIZED', 'NODE_EXTRA_CA_CERTS']) vi.stubEnv(key, undefined);
+            query({ prompt: 'hello' });
+            const options = (pinnedEndpointQuery.mock.calls.at(-1) as unknown as [unknown, { options: { settings?: string } }])[1].options;
+            expect(JSON.parse(options.settings!).env).toMatchObject({ HTTPS_PROXY: 'http://proxy.corp.example:3128', HTTP_PROXY: '', ALL_PROXY: '', https_proxy: '', NO_PROXY: '', NODE_TLS_REJECT_UNAUTHORIZED: '', NODE_EXTRA_CA_CERTS: '' });
+        });
+
         it('adds the closed routes to a hook settings file\'s own env and keeps its hooks', () => {
             const settingsPath = join(configDirectory, 'hooks.json');
             const hooks = { SessionStart: [{ matcher: '*' }] };

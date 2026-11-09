@@ -46,6 +46,18 @@ export const ORG_ENDPOINT_CLEARED_ENV_KEYS = [
 export const ORG_ENDPOINT_OWNED_ENV_KEYS: readonly string[] = [...ORG_ENDPOINT_VALUE_ENV_KEYS, ...ORG_ENDPOINT_CLEARED_ENV_KEYS]
 
 /**
+ * The transport the machine itself chose: its proxy and TLS trust. A project's settings file must not route the
+ * endpoint's requests through a proxy of its own (with the token, and the conversation in plain text to an http target),
+ * so these hold the session's own values — empty when it has none — above the settings files. They stay out of the
+ * pinned set: a managed policy that sets a proxy outranks the flag layer and is the administrator's to set, and the
+ * daemon has no reason to drop them from a restarted daemon either. Requests cannot carry them (sessionEnv drops them).
+ */
+export const ORG_ENDPOINT_MACHINE_ENV_KEYS = [
+    'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy',
+    'NODE_TLS_REJECT_UNAUTHORIZED', 'NODE_EXTRA_CA_CERTS',
+] as const
+
+/**
  * The routing part of an endpoint session's environment as a settings `env` block, or undefined outside one.
  *
  * Passed to Claude Code as flag settings at startup (`--settings`), which outrank the user's and the project's settings
@@ -62,5 +74,6 @@ export function orgEndpointRoutingSettingsEnv(env: Record<string, string | undef
         if (key !== 'ANTHROPIC_AUTH_TOKEN' && value !== undefined) block[key] = value
     }
     for (const key of ORG_ENDPOINT_CLEARED_ENV_KEYS) block[key] = ''
+    for (const key of ORG_ENDPOINT_MACHINE_ENV_KEYS) block[key] = env[key] ?? ''
     return block
 }
