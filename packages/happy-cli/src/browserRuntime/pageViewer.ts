@@ -13,6 +13,10 @@ function createPageViewer(o) {
     // interval (or over the profile's byte budget, reset each second) is refused, so the next one waits that long.
     let lastRead = -Infinity, retryAt = -Infinity;
     let wheelRefresh = false, compositionView = null;
+    // awaitFrame: after input that never reached the page, wait for a new frame before sending more. held: keys and
+    // buttons this viewer has pressed in the page and not released yet. noticeUntil: keep the "not sent" notice briefly.
+    let awaitFrame = false, noticeUntil = -Infinity;
+    const held = new Set();
     const queue = [];
     const keys = new Set();
     const clearImage = () => { frame = null; image.hidden = true; image.removeAttribute('src'); o.empty.hidden = false; confirmedAt = -Infinity; };
@@ -29,7 +33,7 @@ function createPageViewer(o) {
     async function close() {
         const old = view;
         view = null;
-        wheelRefresh = false;
+        wheelRefresh = false; awaitFrame = false; held.clear();
         compositionView = null; composing = false; input.value = '';
         queue.length = 0;
         keys.clear();
@@ -39,7 +43,7 @@ function createPageViewer(o) {
             await o.request('closePageView', { schemaVersion: 1, viewId: old.viewId });
     }
     async function open(scope, tabId, stillCurrent) {
-        sequence = 0;
+        sequence = 0; held.clear(); awaitFrame = false;
         const opened = await o.request('openPageView', { schemaVersion: 1, ...scope, tabId });
         if (!stillCurrent()) {
             await o.request('closePageView', { schemaVersion: 1, viewId: opened.viewId });
@@ -61,6 +65,28 @@ function createPageViewer(o) {
         }
         if (!result.status.draining && result.status.lastSettled >= sequence)
             status(text.confirmed);
+    }
+    function track(event) {
+        if (event.kind === 'key') event.type === 'keyDown' ? held.add('key:' + event.code) : held.delete('key:' + event.code);
+        else if (event.kind === 'pointer' && event.type !== 'mouseMoved')
+            event.type === 'mousePressed' ? held.add('button:' + event.button) : held.delete('button:' + event.button);
+    }
+    /**
+     * Input that never reached the page (Runtime refused its frame before acceptance, answered 'rejected', or it was still
+     * queued when the page changed) is dropped with everything queued behind it, never replayed, and input resumes on
+     * the next frame. A key or button this viewer left down in the page is released only by Runtime's drain, which
+     * closing the view starts; the host then opens a new view. Unknown outcomes keep their stop (lost) elsewhere.
+     */
+    async function discard(dropped) {
+        queue.length = 0;
+        awaitFrame = true;
+        if (dropped.some((e) => !(e.kind === 'pointer' && e.type === 'mouseMoved'))) {
+            noticeUntil = performance.now() + 2500;
+            status(text.discarded);
+        }
+        if (held.size)
+            await close();
+        o.render();
     }
     /** gate: the host's own checks before a read (false skips it); beforeFrame: its task refresh (false stops). */
     async function poll(gate, beforeFrame) {
@@ -117,9 +143,11 @@ function createPageViewer(o) {
                     for (let i = queue.length - 1; i >= 0; --i) if (queue[i].kind === 'pointer') queue.splice(i, 1);
                 }
                 if (queue.length && frame && !scrollOnly && (frame.documentGeneration !== next.documentGeneration || JSON.stringify(frame.viewport) !== JSON.stringify(next.viewport))) {
-                    lost = true; queue.length = 0; status(text.confirmed, true); await close(); o.render(); return;
+                    await discard(queue.slice());
+                    if (view !== owner)
+                        return;
                 }
-                wheelRefresh = false;
+                wheelRefresh = false; awaitFrame = false;
                 frame = next;
                 confirmedAt = performance.now();
                 captureAge = next.ageMs + performance.now() - started;
@@ -128,7 +156,8 @@ function createPageViewer(o) {
                 o.empty.hidden = true;
                 image.style.width = fitted ? '' : next.viewport.width + 'px';
                 image.style.height = fitted ? '' : next.viewport.height + 'px';
-                status(fresh() ? own() ? text.control : text.observe : text.stale);
+                if (performance.now() >= noticeUntil)
+                    status(fresh() ? own() ? text.control : text.observe : text.stale);
                 o.render();
             }
         }
@@ -145,7 +174,7 @@ function createPageViewer(o) {
         }
     }
     async function flush() {
-        if (wheelRefresh || polling || inputBusy || !queue.length || !canInput())
+        if (wheelRefresh || awaitFrame || polling || inputBusy || !queue.length || !canInput())
             return;
         const event = queue.shift(), owner = view, lease = own(), gen = o.generation();
         const current = frame;
@@ -156,16 +185,28 @@ function createPageViewer(o) {
             const result = await o.request('dispatchPageInput', { schemaVersion: 1, viewId: owner.viewId, frameId: current.frameId, leaseEpoch: lease.leaseEpoch, sequence: n, event });
             if (view !== owner || gen !== o.generation())
                 return;
-            if (result.state !== 'applied') {
+            if (result.state === 'applied') {
+                track(event);
+                if (event.kind === 'wheel') wheelRefresh = true;
+            }
+            else if (result.state === 'rejected')
+                await discard([event, ...queue]);
+            else {
                 lost = true;
                 queue.length = 0;
                 status(result.state === 'unknown' ? text.unresolved : text.confirmed, true);
                 o.render();
             }
-            else if (event.kind === 'wheel') wheelRefresh = true;
         }
         catch (e) {
             if (view !== owner || gen !== o.generation()) return;
+            if (e?.known && e.code === 'STALE_REF') {
+                // The frame was not the view's latest: refused before acceptance, so Runtime did not use this sequence and
+                // the next input carries it again. A changed lease (STALE_LEASE) is not a page change: it stops below.
+                sequence = n - 1;
+                await discard([event, ...queue]);
+                return;
+            }
             queue.length = 0;
             if (!e?.known) {
                 lost = true;

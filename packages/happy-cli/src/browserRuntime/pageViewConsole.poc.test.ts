@@ -43,6 +43,16 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
     let dropInput = false, inputDelayMs = 0
     /** A second open task of this conversation, for switching while input is under way. */
     let secondTask = false
+    /**
+     * realInput: the Runtime's own input checks. A sequence must follow the last accepted one; an input on a frame other
+     * than the view's latest is refused before it is accepted (STALE_REF, sequence not used); one on a frame of an older
+     * document is accepted and answered 'rejected' (nothing reaches the page). navigateOnRelease: a released click
+     * navigates (a new document). refuseInputs: button presses refused before acceptance. leaseRefusals: inputs refused
+     * before acceptance because this viewer's control changed (STALE_LEASE). unknownInputs: answered 'unknown'.
+     */
+    let realInput = false, navigateOnRelease = false, refuseInputs = 0, unknownInputs = 0, leaseRefusals = 0, docGen = 1
+    const accepted = new Map<string, number>(), latestFrame = new Map<string, string>(), frameGen = new Map<string, number>()
+    const applied: Array<{ type: string; gen: number; sequence: number }> = []
     /** A bootstrap the fake Runtime refuses with this code, and input answers held until the test releases them. */
     let bootstrapError: string | null = null
     let inputGate: { promise: Promise<void>; release(): void } | undefined
@@ -97,6 +107,22 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
                     res.end(JSON.stringify({ ok: false, error: { code: frameError, message: 'refused' } }))
                     return
                 }
+                if (m[1] === 'dispatchPageInput' && realInput) {
+                    const viewId = String(body.viewId), last = accepted.get(viewId) ?? 0
+                    const refuse = (code: string) => { res.writeHead(409, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: { code, message: 'refused' } })) }
+                    if (body.sequence !== last + 1) { refuse('CONFLICT'); return }
+                    if (leaseRefusals > 0) { leaseRefusals--; refuse('STALE_LEASE'); return }
+                    if (refuseInputs > 0 && body.event.type === 'mousePressed' || latestFrame.get(viewId) !== body.frameId) { refuseInputs = Math.max(0, refuseInputs - 1); refuse('STALE_REF'); return }
+                    accepted.set(viewId, body.sequence)
+                    const gen = frameGen.get(body.frameId) ?? 0
+                    const state = unknownInputs > 0 ? (unknownInputs--, 'unknown') : gen !== docGen ? 'rejected' : 'applied'
+                    if (state === 'applied') applied.push({ type: body.event.type ?? body.event.kind, gen, sequence: body.sequence })
+                    if (state === 'applied' && navigateOnRelease && body.event.type === 'mouseReleased') docGen++
+                    res.writeHead(200, { 'content-type': 'application/json' })
+                    res.end(JSON.stringify({ ok: true, result: { sequence: body.sequence, state } }))
+                    return
+                }
+                if (m[1] === 'getPageFrame' && !body.statusOnly) { latestFrame.set(String(body.viewId), 'frame-' + (frames + 1)); frameGen.set('frame-' + (frames + 1), docGen) }
                 const bearer = ops[ops.length - 1]!.bearer
                 if (m[1] === 'openPageView') views.set('view-' + ops.length, { bearer, binding: body.runtimeBindingId })
                 const result = m[1] === 'pageViewInfo' ? { schemaVersion: 1, supported: true, input: true, runtimeBindingId: binding }
@@ -105,7 +131,7 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
                             : m[1] === 'openPageView' ? { schemaVersion: 1, viewId: 'view-' + ops.length, expiresAtMs: Date.now() + 600_000, input: true }
                                 : m[1] === 'getPageFrame' ? body.statusOnly ? { schemaVersion: 1, status } : { schemaVersion: 1, status, frame: {
                                     data: jpeg, mimeType: 'image/jpeg', pixelWidth: 64, pixelHeight: 48, frameId: 'frame-' + ++frames, ageMs: 0, capturedAtMs: Date.now(), captureDurationMs: 1,
-                                    documentGeneration: 1, viewport: { width: 640, height: 480, offsetX: 0, offsetY: 0, scale: 1 } } }
+                                    documentGeneration: docGen, viewport: { width: 640, height: 480, offsetX: 0, offsetY: 0, scale: 1 } } }
                                     : m[1] === 'dispatchPageInput' ? { sequence: body.sequence, state: 'applied' }
                                         : m[1] === 'releaseControl' ? { owner: 'none', task: task() }
                                         : m[1] === 'closePageView' ? status : {}
@@ -511,6 +537,112 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
             await until(() => harness.evaluate(target, 'location.search'), (s) => s.includes(`agentSessionId=${SESSION}`))
             await until(() => harness.evaluate(target, 'window.__abpPageView'), (v) => v === 1)
         } finally { await harness.closeTarget(target) }
+    })
+
+    const resetInput = () => { realInput = navigateOnRelease = false; refuseInputs = unknownInputs = leaseRefusals = 0; docGen = 1; refuseFrames = 0
+        accepted.clear(); latestFrame.clear(); frameGen.clear(); applied.length = 0 }
+    const hintText = (target: string) => harness.evaluate(target, `document.getElementById('screenHintText').textContent`)
+    const reconnectShown = (target: string) => harness.evaluate(target, `!!document.getElementById('pageRetry').getClientRects().length`)
+
+    it('local console: a click that opens another page keeps input going; pointer moves meant for the old page are dropped', async () => {
+        ops.length = 0; resetInput(); realInput = navigateOnRelease = true
+        const { target, x, y } = await controlLocal()
+        try {
+            await click(target, x, y)
+            await until(() => applied.filter((a) => a.type === 'mouseReleased').length, (n) => n === 1)
+            // The user keeps moving and clicking while the opened page is captured.
+            navigateOnRelease = false
+            for (let i = 0; i < 10; i++) { await click(target, x + i, y + i); await wait(target, 60) }
+            await until(() => applied.some((a) => a.type === 'mousePressed' && a.gen === 2), Boolean, 5_000)
+            expect(await reconnectShown(target)).toBe(false)
+            await until(() => hintText(target), (s) => s === 'You have control. Input reaches the page.', 5_000)
+            expect(ops.filter((o) => o.op === 'closePageView')).toHaveLength(0)
+        } finally { resetInput(); await harness.closeTarget(target) }
+    })
+
+    it('local console: an input refused before acceptance is not counted; the next one keeps the sequence and is applied', async () => {
+        ops.length = 0; resetInput(); realInput = true
+        const { target, x, y } = await controlLocal()
+        try {
+            refuseInputs = 1
+            await click(target, x, y)
+            await until(() => hintText(target), (s) => s === 'The page changed, so your last input was not sent.', 5_000)
+            expect(await reconnectShown(target)).toBe(false)
+            const refused = inputs().find((o) => o.body.event.type === 'mousePressed')!.body.sequence
+            await wait(target, 600)
+            await click(target, x, y)
+            await until(() => applied.length, (n) => n >= 3, 5_000)
+            // The refused sequence was never used, so the next input carries it again.
+            expect(applied.find((a) => a.sequence === refused)).toBeTruthy()
+            expect(ops.filter((o) => o.op === 'dispatchPageInput' && o.body.sequence === refused)).toHaveLength(2)
+            expect(ops.filter((o) => o.op === 'dispatchPageInput').length).toBe(applied.length + 1)
+        } finally { resetInput(); await harness.closeTarget(target) }
+    })
+
+    it('local console: a key still held when its release is dropped is let go by reopening the view, not left pressed', async () => {
+        ops.length = 0; resetInput(); realInput = true
+        const { target } = await controlLocal()
+        try {
+            await harness.evaluate(target, `(() => { const e = document.getElementById('pageInput'); e.focus(); e.dispatchEvent(new KeyboardEvent('keydown', { key: 'Shift', code: 'ShiftLeft', bubbles: true })) })()`)
+            await until(() => applied.filter((a) => a.type === 'keyDown').length, (n) => n === 1)
+            const first = inputs()[0]!.body.viewId
+            // The page changes while no new frame arrives (reads rate limited), so the release goes on the old document.
+            refuseFrames = 20; docGen++
+            await harness.evaluate(target, `document.getElementById('pageInput').dispatchEvent(new KeyboardEvent('keyup', { key: 'Shift', code: 'ShiftLeft', bubbles: true }))`)
+            // Closing the view is what makes Runtime release the key; the console opens a new view and carries on.
+            await until(() => ops.some((o) => o.op === 'closePageView' && o.body.viewId === first), Boolean, 5_000)
+            refuseFrames = 0
+            await until(() => ops.filter((o) => o.op === 'openPageView').length, (n) => n >= 2, 5_000)
+            await until(() => hintText(target), (s) => s === 'You have control. Input reaches the page.', 10_000)
+            expect(await reconnectShown(target)).toBe(false)
+        } finally { resetInput(); await harness.closeTarget(target) }
+    })
+
+    it('local console: an input whose outcome is unknown still stops input and needs Reconnect', async () => {
+        ops.length = 0; resetInput(); realInput = true
+        const { target, x, y } = await controlLocal()
+        try {
+            unknownInputs = 1
+            await click(target, x, y)
+            await until(() => hintText(target), (s) => s === 'Input outcome is unknown. Resuming the agent is blocked.', 5_000)
+            expect(await reconnectShown(target)).toBe(true)
+            const sent = inputs().length
+            await click(target, x, y)
+            await wait(target, 600)
+            expect(inputs().length).toBe(sent)
+        } finally { resetInput(); await harness.closeTarget(target) }
+    })
+
+    it('local console: an input refused because control changed stops input and needs Reconnect, not a page-change notice', async () => {
+        ops.length = 0; resetInput(); realInput = true
+        const { target, x, y } = await controlLocal()
+        try {
+            leaseRefusals = 1
+            await click(target, x, y)
+            await until(() => hintText(target), (s) => s === 'Input receipt checked. Press Reconnect to continue.', 5_000)
+            expect(await reconnectShown(target)).toBe(true)
+            const sent = inputs().length
+            await click(target, x, y)
+            await wait(target, 600)
+            expect(inputs().length).toBe(sent)
+        } finally { resetInput(); await harness.closeTarget(target) }
+    })
+
+    it('remote console: a click that opens another page keeps input going without Reconnect', async () => {
+        ops.length = 0; resetInput(); realInput = navigateOnRelease = true
+        leaseOwner = { kind: 'user', principalId: 'user-1', viewerSessionId: 'viewer-this' }
+        const target = await openRemote()
+        try {
+            await until(() => harness.evaluate(target, `document.getElementById('status').textContent`), (s) => s === 'You have control', 10_000)
+            const box = JSON.parse(await harness.evaluate(target, `JSON.stringify(document.getElementById('page').getBoundingClientRect())`))
+            const x = box.x + box.width / 2, y = box.y + box.height / 2
+            await click(target, x, y)
+            await until(() => applied.filter((a) => a.type === 'mouseReleased').length, (n) => n === 1)
+            navigateOnRelease = false
+            for (let i = 0; i < 10; i++) { await click(target, x + i, y + i); await wait(target, 60) }
+            await until(() => applied.some((a) => a.type === 'mousePressed' && a.gen === 2), Boolean, 5_000)
+            expect(await harness.evaluate(target, `document.getElementById('status').dataset.error`)).not.toBe('true')
+        } finally { resetInput(); leaseOwner = { kind: 'none' }; await harness.closeTarget(target) }
     })
 
     it('local console: a capability without the page scope keeps the Chrome window guidance and the spaces', async () => {

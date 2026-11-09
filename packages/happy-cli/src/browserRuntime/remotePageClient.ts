@@ -16,28 +16,28 @@ function remotePageClient() {
         waiting: 'この会話のブラウザページを待っています。', connecting: 'リモートMacに接続中…', observe: '閲覧中', control: '操作中', returning: '入力を終了しています…',
         stale: '画面の更新が遅れています。入力は停止中です。', expired: 'アクセス権が期限切れです。再接続してください。', forbidden: 'この会話のページにアクセスできません。',
         offline: '接続が切れました。以前の画面には入力できません。', unsupported: 'このMacはアプリ内の画面表示にまだ対応していません。', unknown: '入力結果を確認中です。同じ入力を繰り返さないでください。',
-        unresolved: '入力結果を確認できないため、AIの続行を停止しました。', confirmed: '入力の処理状況を確認しました。再接続してください。', ended: 'タスクは終了しました。',
+        unresolved: '入力結果を確認できないため、AIの続行を停止しました。', confirmed: '入力の処理状況を確認しました。再接続してください。', discarded: '画面が変わったため、最後の入力は送信していません。', ended: 'タスクは終了しました。',
         hint: '操作権を取得してページをクリックすると入力できます。操作権を返して続行を押すとAIが再開します。', machine: 'リモートMac', image: 'この会話のリモートブラウザページ', input: 'ページへのテキスト入力',
     } : lang === 'zh' ? {
         task: '当前对话的任务', tab: '页面', take: '接管控制', release: '交还控制', resume: '继续', approve: '允许', reject: '拒绝', fit: '适应屏幕', retry: '重新连接', stop: '停止任务',
         waiting: '正在等待当前对话的浏览器页面。', connecting: '正在连接远程 Mac…', observe: '正在查看', control: '正在手动操作', returning: '正在结束输入…',
         stale: '画面更新延迟，已停止输入。', expired: '访问权限已过期，请重新连接。', forbidden: '无法访问当前对话的页面。',
         offline: '连接已断开，无法在旧画面上输入。', unsupported: '此 Mac 尚不支持在应用中显示页面。', unknown: '正在确认输入结果，请勿重复输入。',
-        unresolved: '无法确认输入结果，已阻止 AI 继续。', confirmed: '已确认输入处理状态，请重新连接。', ended: '任务已结束。',
+        unresolved: '无法确认输入结果，已阻止 AI 继续。', confirmed: '已确认输入处理状态，请重新连接。', discarded: '页面已变化，最后的输入未发送。', ended: '任务已结束。',
         hint: '接管控制后点击页面即可输入。交还控制并点击继续后，AI 将恢复工作。', machine: '远程 Mac', image: '当前对话的远程浏览器页面', input: '页面文本输入',
     } : ko ? {
         task: '현재 대화의 작업', tab: '페이지', take: '제어권 가져오기', release: '제어권 반납', resume: '계속 진행', approve: '허용', reject: '거절', fit: '화면 맞춤', retry: '다시 연결', stop: '작업 중단',
         waiting: '현재 대화의 브라우저 페이지를 기다리고 있어요.', connecting: '원격 Mac 화면에 연결 중…', observe: '관찰 중', control: '직접 조작 중', returning: '입력을 정리하는 중…',
         stale: '화면 갱신이 지연되고 있어요. 입력이 중지됐어요.', expired: '접근 권한이 만료됐어요. 다시 연결해 주세요.', forbidden: '이 대화의 페이지에 접근할 수 없어요.',
         offline: '연결이 끊겼어요. 이전 화면에서는 입력할 수 없어요.', unsupported: '이 원격 Mac은 앱 안 화면을 아직 지원하지 않아요.', unknown: '입력 결과를 확인 중이에요. 같은 입력을 다시 보내지 마세요.',
-        unresolved: '입력 결과를 확인할 수 없어 AI 재개가 중지됐어요.', confirmed: '입력 처리 상태를 확인했어요. 다시 연결해 주세요.', ended: '작업이 종료됐어요.',
+        unresolved: '입력 결과를 확인할 수 없어 AI 재개가 중지됐어요.', confirmed: '입력 처리 상태를 확인했어요. 다시 연결해 주세요.', discarded: '화면이 바뀌어 마지막 입력은 보내지 않았어요.', ended: '작업이 종료됐어요.',
         hint: '제어권을 가져온 뒤 페이지를 클릭해 입력하세요. 반납 후 계속 진행을 누르면 AI가 이어서 작업해요.', machine: '원격 Mac', image: '현재 대화의 원격 브라우저 페이지', input: '페이지 텍스트 입력',
     } : {
         task: 'Current conversation task', tab: 'Page', take: 'Take control', release: 'Release control', resume: 'Continue', approve: 'Allow', reject: 'Reject', fit: 'Fit screen', retry: 'Reconnect', stop: 'Stop task',
         waiting: 'Waiting for a browser page in this conversation.', connecting: 'Connecting to remote Mac…', observe: 'Observing', control: 'You have control', returning: 'Draining page input…',
         stale: 'Page updates are delayed. Input is stopped.', expired: 'Access expired. Reconnect to continue.', forbidden: 'This conversation cannot access the page.',
         offline: 'Disconnected. Input on the previous image is stopped.', unsupported: 'This remote Mac does not support the in-app page view yet.', unknown: 'Checking input receipt. Do not repeat the input.',
-        unresolved: 'Input outcome is unknown. AI continuation is blocked.', confirmed: 'Input receipt checked. Reconnect to continue.', ended: 'Task ended.',
+        unresolved: 'Input outcome is unknown. AI continuation is blocked.', confirmed: 'Input receipt checked. Reconnect to continue.', discarded: 'The page changed, so your last input was not sent.', ended: 'Task ended.',
         hint: 'Take control, then click the page to type. Release control and press Continue for AI to resume.', machine: 'Remote Mac', image: 'Remote browser page for this conversation', input: 'Page text input',
     };
     const $ = (id) => document.getElementById(id);
