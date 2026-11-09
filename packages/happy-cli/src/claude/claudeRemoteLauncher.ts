@@ -1726,7 +1726,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 messageQueue.destroy();
                 logger.debug('[remote]: message queue flushed');
                 if (launchFailure) {
-                    session.client.sendSessionEvent({ type: 'message', message: launchFailure });
+                    session.client.sendSessionEvent({ type: 'message', message: launchFailure, isError: true });
                     // A launch that died before its first message opened no turn; this opens one if needed.
                     session.client.failClaudeLaunchTurn();
                     launchFailure = null;

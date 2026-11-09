@@ -455,7 +455,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         expect(prompts[0]).toContain('first message');
         expect(requestSetupTokenStart).toHaveBeenCalledTimes(2);
         expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message',
-            message: describeClaudeLaunchFailure(new Error('SETUP_TOKEN_START_UNAVAILABLE')) });
+            message: describeClaudeLaunchFailure(new Error('SETUP_TOKEN_START_UNAVAILABLE')), isError: true });
     });
     it('queues a batch held back after start admission once when switching to local mode', async () => {
         vi.mocked(requestSetupTokenStart)

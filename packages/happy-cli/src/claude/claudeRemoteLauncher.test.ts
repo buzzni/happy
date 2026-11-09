@@ -374,6 +374,36 @@ describe('Claude model changes across provider restarts', () => {
         await running;
     });
 
+    it('marks the notice of a failed launch as the turn failure, so clients can report it with its reason', async () => {
+        // aplus specs/conversation-incident-alerts: walter-gpu 2026-11-09 capacity failures reached the
+        // incident channel as "no error text" because the notice looked like any other status message.
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const client = {
+            sessionId: 'launch-failure-marker-test',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(),
+            failClaudeLaunchTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        vi.mocked(query).mockReset();
+        queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+            cancelLessonReview: vi.fn(),
+            sessionId: null, path: process.cwd(), queue, client, mcpServers: {}, claudeArgs: ['--plugin-dir'],
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+        } as unknown as Session;
+        const running = claudeRemoteLauncher(session);
+        await vi.waitFor(() => expect(client.failClaudeLaunchTurn).toHaveBeenCalled());
+        expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message', message: expect.stringContaining('--plugin-dir requires'), isError: true });
+        void handlers.get('switch')!();
+        await running;
+    });
+
     it('tells the user to sign in to Claude Code on this machine when it answers "Not logged in"', async () => {
         // Desktop specs/headless-standalone-server R36 (M1): without a Claude login Claude Code answers with a
         // synthetic "Not logged in · Please run /login" (shape captured from claude-code 2.1.296), which said

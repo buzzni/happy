@@ -2034,6 +2034,8 @@ export class ApiSessionClient extends EventEmitter {
         type: 'switch', mode: 'local' | 'remote'
     } | {
         type: 'message', message: string, setupTokenRotation?: { version: 1; state: SetupTokenRotationState }
+        /** This notice is why the turn failed; clients report it as the failure reason. */
+        isError?: true
     } | {
         type: 'permission-mode-changed', mode: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan'
     } | {

@@ -16,6 +16,12 @@ describe('describeClaudeLaunchFailure', () => {
         expect(text).not.toMatch(/could not start on this machine/);
     });
 
+    it('names which capacity check refused the input, so an administrator can tell the causes apart', () => {
+        // walter-gpu 2026-11-09: UNAVAILABLE, ASSIGNMENT_CHANGED and NOT_FOUND all read as one sentence.
+        expect(describeClaudeLaunchFailure(new Error('CAPACITY_NOT_FOUND'))).toMatch(/조직 AI 계정.*\(CAPACITY_NOT_FOUND\)/);
+        expect(describeClaudeLaunchFailure(new Error('CAPACITY_DELIVERY_UNKNOWN'))).toMatch(/\(CAPACITY_DELIVERY_UNKNOWN\)/);
+    });
+
     it('explains a refused organization credential without asking for a personal login', () => {
         const text = describeClaudeLaunchFailure(new Error('CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED'));
         expect(text).toMatch(/Organization Claude stopped.*assigned account or policy/);
