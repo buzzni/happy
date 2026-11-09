@@ -1,4 +1,5 @@
 import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS } from './claudeAuthOverrideEnv'
+import { ensureLocalProxyBypass } from './proxyBypass'
 
 /**
  * The closed key set of an organization LLM endpoint session (aplus specs/org-llm-endpoints C5·r2).
@@ -74,6 +75,9 @@ export function orgEndpointRoutingSettingsEnv(env: Record<string, string | undef
         if (key !== 'ANTHROPIC_AUTH_TOKEN' && value !== undefined) block[key] = value
     }
     for (const key of ORG_ENDPOINT_CLEARED_ENV_KEYS) block[key] = ''
-    for (const key of ORG_ENDPOINT_MACHINE_ENV_KEYS) block[key] = env[key] ?? ''
+    // Loopback stays direct, as it does for the SDK's own environment: Happy's MCP and hook servers listen there.
+    const machine = { ...env }
+    ensureLocalProxyBypass(machine)
+    for (const key of ORG_ENDPOINT_MACHINE_ENV_KEYS) block[key] = machine[key] ?? ''
     return block
 }

@@ -116,7 +116,19 @@ describe('query adapter', () => {
             for (const key of ['HTTP_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy', 'NODE_TLS_REJECT_UNAUTHORIZED', 'NODE_EXTRA_CA_CERTS']) vi.stubEnv(key, undefined);
             query({ prompt: 'hello' });
             const options = (pinnedEndpointQuery.mock.calls.at(-1) as unknown as [unknown, { options: { settings?: string } }])[1].options;
-            expect(JSON.parse(options.settings!).env).toMatchObject({ HTTPS_PROXY: 'http://proxy.corp.example:3128', HTTP_PROXY: '', ALL_PROXY: '', https_proxy: '', NO_PROXY: '', NODE_TLS_REJECT_UNAUTHORIZED: '', NODE_EXTRA_CA_CERTS: '' });
+            expect(JSON.parse(options.settings!).env).toMatchObject({ HTTPS_PROXY: 'http://proxy.corp.example:3128', HTTP_PROXY: '', ALL_PROXY: '', https_proxy: '',
+                NODE_TLS_REJECT_UNAUTHORIZED: '', NODE_EXTRA_CA_CERTS: '' });
+        });
+
+        it('keeps loopback off the proxy in the layer that outranks the SDK\'s own environment, the machine\'s exceptions included', () => {
+            vi.stubEnv('HTTPS_PROXY', 'http://proxy.corp.example:3128');
+            vi.stubEnv('NO_PROXY', '.corp.example');
+            vi.stubEnv('no_proxy', undefined);
+            query({ prompt: 'hello' });
+            const options = (pinnedEndpointQuery.mock.calls.at(-1) as unknown as [unknown, { options: { settings?: string } }])[1].options;
+            const env = JSON.parse(options.settings!).env;
+            expect(env.NO_PROXY).toBe('.corp.example,127.0.0.1,localhost,::1');
+            expect(env.no_proxy).toBe(env.NO_PROXY);
         });
 
         it('adds the closed routes to a hook settings file\'s own env and keeps its hooks', () => {
