@@ -59,6 +59,17 @@ describe('setup-token account switch (specs/claude-setup-token-account-selection
     expect(await switcher.capacity('session-a', RUNNING_A, 'reserve', { ...actor, machineId: 'other' }, 'runtime')).toEqual({ ok: false, reason: 'CAPACITY_ACTOR_FORBIDDEN' })
     expect(deps.fetch).not.toHaveBeenCalled()
   })
+  it('passes the capacity handler code through but names any other Studio refusal by its HTTP status', async () => {
+    const { switcher, deps } = setup()
+    const actor = { companyId: 'org-a', machineId: 'pc-a', sessionId: 'session-a', requestId: 'input-r', contentHash: 'a'.repeat(64), proof: 'signed.proof' }
+    vi.mocked(deps.fetch).mockResolvedValueOnce(Response.json({ error: 'CAPACITY_SESSION_UNMAPPED' }, { status: 403 }))
+    expect(await switcher.capacity('session-a', RUNNING_A, 'reserve', actor, 'runtime')).toEqual({ ok: false, reason: 'CAPACITY_SESSION_UNMAPPED' })
+    // Studio's global auth gate answers before the handler (aplus #5930): its 'Unauthorized' must not read as a capacity code.
+    vi.mocked(deps.fetch).mockResolvedValueOnce(Response.json({ error: 'Unauthorized' }, { status: 401 }))
+    expect(await switcher.capacity('session-a', RUNNING_A, 'reserve', actor, 'runtime')).toEqual({ ok: false, reason: 'CAPACITY_HTTP_401' })
+    vi.mocked(deps.fetch).mockResolvedValueOnce(new Response('<html>Bad Gateway</html>', { status: 502 }))
+    expect(await switcher.capacity('session-a', RUNNING_A, 'reserve', actor, 'runtime')).toEqual({ ok: false, reason: 'CAPACITY_HTTP_502' })
+  })
   it('keeps token-value verification negotiated across an account switch and refuses a downgraded response', async () => {
     const { switcher, session, deps } = setup()
     const running = formatSetupTokenBinding({ ...binding(A), tokenProof: 'a'.repeat(64) })

@@ -378,8 +378,12 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
           headers: { Authorization: `Bearer ${deps.bearer()}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ ...extra, companyId: actor.companyId, machineId: deps.machineId, sessionId, requestId: actor.requestId, contentHash: actor.contentHash, actorProof: actor.proof, runtimeId }),
         });
+        if (!response.ok) {
+          // Only the capacity handler speaks CAPACITY_*; anything else (the global auth gate, a proxy) is named by its status.
+          const refusal = await response.json().catch(() => null) as { error?: unknown } | null;
+          return { ok: false as const, reason: typeof refusal?.error === 'string' && /^CAPACITY_[A-Z0-9_]+$/.test(refusal.error) ? refusal.error : `CAPACITY_HTTP_${response.status}` };
+        }
         const admission = await response.json() as Record<string, unknown>;
-        if (!response.ok) return { ok: false as const, reason: typeof admission.error === 'string' ? admission.error : 'CAPACITY_UNAVAILABLE' };
         if (operation === 'reserve' && admission.state !== 'reserved' || ['claim', 'finish', 'cancel', 'lost'].includes(operation) && capacityTargets.get(sessionId)?.requestId === admission.executionRequestId) {
           capacityTargets.delete(sessionId);
           if (shared) sharedStartPreferred.delete(shared.session);
