@@ -202,6 +202,20 @@ describe('personal browser runtime (daemon side)', () => {
         expect(options.env).toEqual({ HOME: '/Users/u', TMPDIR: '/tmp/u', PATH: '/usr/bin:/bin', ABP_CONFIG_FILE: paths.configFile, ABP_STATE_DIR: paths.stateDir })
     })
 
+    it('reads and runs a named runtime instance from its own directory', () => {
+        const instanceEnv = { ...env, SAYCODE_BROWSER_RUNTIME_INSTANCE: 'standalone' }
+        const local = personalRuntimePaths('darwin', instanceEnv, '/Users/u')
+        const child = fakeChild()
+        const spawnImpl = vi.fn(() => child)
+        const runtime = readPersonalBrowserRuntime(base({ env: instanceEnv, spawnImpl, runtimeEntry: '/pkg/dist/browserRuntime/runtimeMain.mjs',
+            readConfig: (path: string) => { expect(path).toBe(local.configFile); return config() } }))!
+        expect(runtime.sessionEnv.HAPPY_BROWSER_TASK_BROKER_SOCKET).toBe(local.brokerSocket)
+        runtime.start()
+        const [, , options] = spawnImpl.mock.calls[0] as unknown as [string, string[], { env: Record<string, string> }]
+        // The runtime resolves the same directory, so it must see the same instance.
+        expect(options.env).toMatchObject({ SAYCODE_BROWSER_RUNTIME_INSTANCE: 'standalone', ABP_CONFIG_FILE: local.configFile, ABP_STATE_DIR: local.stateDir })
+    })
+
     it('restarts a crashed runtime with backoff, gives up on a crash loop, and stops it through its pipe', async () => {
         const children: ReturnType<typeof fakeChild>[] = []
         const timers: Array<{ work: () => void; ms: number }> = []
