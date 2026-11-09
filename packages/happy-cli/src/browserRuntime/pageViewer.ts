@@ -72,7 +72,7 @@ function createPageViewer(o) {
             event.type === 'mousePressed' ? held.add('button:' + event.button) : held.delete('button:' + event.button);
     }
     /**
-     * Input that never reached the page (Runtime refused it before acceptance, answered 'rejected', or it was still
+     * Input that never reached the page (Runtime refused its frame before acceptance, answered 'rejected', or it was still
      * queued when the page changed) is dropped with everything queued behind it, never replayed, and input resumes on
      * the next frame. A key or button this viewer left down in the page is released only by Runtime's drain, which
      * closing the view starts; the host then opens a new view. Unknown outcomes keep their stop (lost) elsewhere.
@@ -200,8 +200,9 @@ function createPageViewer(o) {
         }
         catch (e) {
             if (view !== owner || gen !== o.generation()) return;
-            if (e?.known && (e.code === 'STALE_REF' || e.code === 'STALE_LEASE')) {
-                // Refused before acceptance: Runtime did not use this sequence, so the next input carries it again.
+            if (e?.known && e.code === 'STALE_REF') {
+                // The frame was not the view's latest: refused before acceptance, so Runtime did not use this sequence and
+                // the next input carries it again. A changed lease (STALE_LEASE) is not a page change: it stops below.
                 sequence = n - 1;
                 await discard([event, ...queue]);
                 return;

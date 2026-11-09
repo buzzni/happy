@@ -47,9 +47,10 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
      * realInput: the Runtime's own input checks. A sequence must follow the last accepted one; an input on a frame other
      * than the view's latest is refused before it is accepted (STALE_REF, sequence not used); one on a frame of an older
      * document is accepted and answered 'rejected' (nothing reaches the page). navigateOnRelease: a released click
-     * navigates (a new document). refuseInputs: button presses refused before acceptance. unknownInputs: answered 'unknown'.
+     * navigates (a new document). refuseInputs: button presses refused before acceptance. leaseRefusals: inputs refused
+     * before acceptance because this viewer's control changed (STALE_LEASE). unknownInputs: answered 'unknown'.
      */
-    let realInput = false, navigateOnRelease = false, refuseInputs = 0, unknownInputs = 0, docGen = 1
+    let realInput = false, navigateOnRelease = false, refuseInputs = 0, unknownInputs = 0, leaseRefusals = 0, docGen = 1
     const accepted = new Map<string, number>(), latestFrame = new Map<string, string>(), frameGen = new Map<string, number>()
     const applied: Array<{ type: string; gen: number; sequence: number }> = []
     /** A bootstrap the fake Runtime refuses with this code, and input answers held until the test releases them. */
@@ -110,6 +111,7 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
                     const viewId = String(body.viewId), last = accepted.get(viewId) ?? 0
                     const refuse = (code: string) => { res.writeHead(409, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: { code, message: 'refused' } })) }
                     if (body.sequence !== last + 1) { refuse('CONFLICT'); return }
+                    if (leaseRefusals > 0) { leaseRefusals--; refuse('STALE_LEASE'); return }
                     if (refuseInputs > 0 && body.event.type === 'mousePressed' || latestFrame.get(viewId) !== body.frameId) { refuseInputs = Math.max(0, refuseInputs - 1); refuse('STALE_REF'); return }
                     accepted.set(viewId, body.sequence)
                     const gen = frameGen.get(body.frameId) ?? 0
@@ -537,7 +539,7 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
         } finally { await harness.closeTarget(target) }
     })
 
-    const resetInput = () => { realInput = navigateOnRelease = false; refuseInputs = unknownInputs = 0; docGen = 1; refuseFrames = 0
+    const resetInput = () => { realInput = navigateOnRelease = false; refuseInputs = unknownInputs = leaseRefusals = 0; docGen = 1; refuseFrames = 0
         accepted.clear(); latestFrame.clear(); frameGen.clear(); applied.length = 0 }
     const hintText = (target: string) => harness.evaluate(target, `document.getElementById('screenHintText').textContent`)
     const reconnectShown = (target: string) => harness.evaluate(target, `!!document.getElementById('pageRetry').getClientRects().length`)
@@ -603,6 +605,21 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
             unknownInputs = 1
             await click(target, x, y)
             await until(() => hintText(target), (s) => s === 'Input outcome is unknown. Resuming the agent is blocked.', 5_000)
+            expect(await reconnectShown(target)).toBe(true)
+            const sent = inputs().length
+            await click(target, x, y)
+            await wait(target, 600)
+            expect(inputs().length).toBe(sent)
+        } finally { resetInput(); await harness.closeTarget(target) }
+    })
+
+    it('local console: an input refused because control changed stops input and needs Reconnect, not a page-change notice', async () => {
+        ops.length = 0; resetInput(); realInput = true
+        const { target, x, y } = await controlLocal()
+        try {
+            leaseRefusals = 1
+            await click(target, x, y)
+            await until(() => hintText(target), (s) => s === 'Input receipt checked. Press Reconnect to continue.', 5_000)
             expect(await reconnectShown(target)).toBe(true)
             const sent = inputs().length
             await click(target, x, y)
