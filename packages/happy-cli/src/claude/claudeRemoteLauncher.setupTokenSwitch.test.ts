@@ -851,12 +851,16 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         };
         const launched = claudeRemoteLauncher(session as unknown as Session);
         try {
-            // The exit is handled: either reported, or (the defect) answered by a continuation provider.
-            await vi.waitFor(() => expect(client.failClaudeLaunchTurn.mock.calls.length + generations.length).toBeGreaterThan(1));
+            // The refusal still moves the session to another account.
+            await vi.waitFor(() => expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1));
             queue.push('next', { permissionMode: 'default', model: 'claude-sonnet-5' });
             await vi.waitFor(() => expect(generations[1]?.prompts.join('\n')).toContain('next'));
             expect(generations[1].prompts[0]).toContain('next');
             expect(generations.flatMap(generation => generation.prompts).join('\n')).not.toContain(CONTINUE_PROMPT);
+            // The answered turn is not followed by a launch failure or an empty failed turn.
+            expect(client.failClaudeLaunchTurn).not.toHaveBeenCalled();
+            expect(client.sendSessionEvent).not.toHaveBeenCalledWith({ type: 'message',
+                message: describeClaudeLaunchFailure(new Error('Claude Code process exited with code 1')) });
         } finally { await handlers.get('switch')?.(); await launched; }
     });
 
