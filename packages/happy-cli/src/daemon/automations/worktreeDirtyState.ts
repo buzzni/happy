@@ -79,6 +79,13 @@ export function describeUnsavedWorktreeChanges(porcelainStatus: string): string[
     .map((line) => line.slice(3).trim());
 }
 
+/** 보관해야 할 새 파일들. 무시 목록(에이전트 산출물·node_modules 등)은 빠진다. */
+export function unsavedUntrackedPaths(porcelainStatus: string): string[] {
+  return unsavedEntries(porcelainStatus)
+    .filter((line) => line.startsWith('?? '))
+    .map((line) => line.slice(3).trim());
+}
+
 function unsavedEntries(porcelainStatus: string): string[] {
   // A lockfile-only change can be an intentional resolution update even when
   // package.json is unchanged. Preserve it unless its generated content is known.

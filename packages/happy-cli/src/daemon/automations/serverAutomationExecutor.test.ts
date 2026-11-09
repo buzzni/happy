@@ -15,6 +15,7 @@ import {
   NEVER_RUN_AT,
   runServerAutomationTick,
   type ServerAutomationExecutorInput,
+  DIRTY_WORKTREE_RETENTION_MS,
   DIRTY_WORKTREE_WARN_AFTER_ATTEMPTS,
   MAX_GITHUB_WORKER_RUNTIME_MS,
   RUN_HEARTBEAT_MAX_MS,
@@ -4189,6 +4190,64 @@ describe('runServerAutomationTick', () => {
     expect(store.state().githubWorktrees).toEqual([expect.objectContaining({
       worktreePath: '/isolated/run-old', cleanupRetryAt: now + 15 * 60_000,
     })])
+  })
+
+  // 2026-11-09 프로덕션 — "사람이 회수할 때까지" 지키던 dirty worktree 가 최장 59일, 63개
+  // (38GB)까지 쌓였고 아무도 회수하지 않았다. 기한이 지나면 변경을 보관하고 지운다.
+  it('archives and removes a dirty worktree kept past the retention window', async () => {
+    const { input, store, discardGithubWorktree, logDebug, now } = setup()
+    input.cache = { read: () => ({
+      cursor: 0n, serverTime: 0, syncedAt: 0, pendingAcknowledgements: [], automations: [],
+    }) }
+    store.write({
+      ...store.read(),
+      githubWorktrees: [{
+        automationId: 'automation-1', generation: 2, runId: 'run-old',
+        repositoryRoot: '/repo', worktreePath: '/isolated/run-old', directory: '/isolated/run-old',
+        sessionId: 'ended-session', createdAt: now - DIRTY_WORKTREE_RETENTION_MS, cleanupAttempts: 600,
+      }],
+    })
+    discardGithubWorktree.mockImplementation(async (request) => (
+      request.archive ? { ok: true } : { ok: false, dirty: true, error: 'worktree is dirty' }
+    ))
+
+    await runServerAutomationTick(input)
+
+    expect(discardGithubWorktree).toHaveBeenCalledWith({
+      repositoryRoot: '/repo', worktreePath: '/isolated/run-old', archive: true,
+    })
+    expect(store.state().githubWorktrees).toEqual([])
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('archived'))
+  })
+
+  it('archives a worktree the attempt budget gave up on instead of abandoning it on disk', async () => {
+    // 서브모듈 저장소가 깨져 `git status` 부터 실패하던 worktree 58개가 예산을 다 쓰고
+    // journal 에서만 빠져 디스크에 남았다. 버리기 전에 서브모듈을 보지 않는 보관 정리를 한 번 해 본다.
+    const { input, store, discardGithubWorktree, logDebug } = setup()
+    input.cache = { read: () => ({
+      cursor: 0n, serverTime: 0, syncedAt: 0, pendingAcknowledgements: [], automations: [],
+    }) }
+    store.write({
+      ...store.read(),
+      githubWorktrees: [{
+        automationId: 'automation-1', generation: 2, runId: 'run-old',
+        repositoryRoot: '/repo', worktreePath: '/isolated/run-old', directory: '/isolated/run-old',
+        sessionId: 'ended-session', createdAt: 1,
+        cleanupAttempts: MAX_WORKTREE_CLEANUP_ATTEMPTS - 1,
+      }],
+    })
+    discardGithubWorktree.mockImplementation(async (request) => (
+      request.archive ? { ok: true } : { ok: false, dirty: false, error: 'status failed' }
+    ))
+
+    await runServerAutomationTick(input)
+
+    expect(discardGithubWorktree).toHaveBeenLastCalledWith({
+      repositoryRoot: '/repo', worktreePath: '/isolated/run-old', archive: true,
+    })
+    expect(store.state().githubWorktrees).toEqual([])
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('archived'))
+    expect(logDebug).not.toHaveBeenCalledWith(expect.stringContaining('giving up'))
   })
 
   it('gives up loudly once the cleanup attempt budget is spent', async () => {

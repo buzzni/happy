@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { access, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -380,6 +380,27 @@ describe.skipIf(process.platform === 'win32')('automation worktree with submodul
       await rm(fixtureRoot, { recursive: true, force: true })
     }
   })
+
+  it('archives and removes a half-checked-out worktree whose git status cannot run', async () => {
+    // 수정 전 데몬이 남긴 58개가 이 모양이다 — 예산을 다 써도 지울 길이 없었다.
+    const fixtureRoot = await realpath(await mkdtemp(join(tmpdir(), 'happy-worktree-half-checkout-')))
+    try {
+      const { repositoryRoot, pullRequestHead, git } = await createRepositoryWithUnusableSubmodule(fixtureRoot)
+      const worktreePath = join(fixtureRoot, 'automation-worktrees', 'half')
+      await git(['worktree', 'add', '--detach', worktreePath, 'HEAD'])
+      await git(['checkout', '--detach', pullRequestHead], worktreePath).catch(() => undefined)
+      await expect(git(['status', '--porcelain'], worktreePath)).rejects.toThrow()
+
+      expect(await removeGithubTriggerWorktree({ repositoryRoot, worktreePath }))
+        .toMatchObject({ ok: false, dirty: false })
+      expect(await removeGithubTriggerWorktree({
+        repositoryRoot, worktreePath, archiveTo: join(fixtureRoot, 'archive', 'half'),
+      })).toEqual({ ok: true })
+      expect(await git(['worktree', 'list', '--porcelain'])).not.toContain(worktreePath)
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('removeGithubTriggerWorktree', () => {
@@ -424,6 +445,44 @@ describe('removeGithubTriggerWorktree', () => {
       expect(await readFile(join(worktreePath, 'package-lock.json'), 'utf8')).toBe(updatedLockfile)
       expect(await git(['status', '--porcelain'], worktreePath)).toBe(expectedStatus)
       expect(await git(['worktree', 'list', '--porcelain'])).toContain(`worktree ${worktreePath}\n`)
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('archives unsaved changes before removing a worktree it no longer keeps', async () => {
+    const fixtureRoot = await realpath(await mkdtemp(join(tmpdir(), 'happy-worktree-archive-')))
+    const repositoryRoot = join(fixtureRoot, 'repo')
+    const worktreePath = join(fixtureRoot, 'worktree')
+    const archiveTo = join(fixtureRoot, 'archive', 'worktree')
+    const git = (args: string[], cwd = repositoryRoot) => fixtureGit(args, cwd)
+
+    try {
+      await mkdir(repositoryRoot)
+      await git(['init'])
+      await writeFile(join(repositoryRoot, 'app.ts'), 'export const a = 1\n')
+      await git(['add', '.'])
+      await git(['commit', '-m', 'base'])
+      const head = (await git(['rev-parse', 'HEAD'])).trim()
+      await git(['worktree', 'add', '--detach', worktreePath, 'HEAD'])
+      await writeFile(join(worktreePath, 'app.ts'), 'export const a = 2\n')
+      await mkdir(join(worktreePath, 'notes'))
+      await writeFile(join(worktreePath, 'notes', 'fix.md'), 'unfinished fix\n')
+      await mkdir(join(worktreePath, 'node_modules', 'pkg'), { recursive: true })
+      await writeFile(join(worktreePath, 'node_modules', 'pkg', 'index.js'), 'generated\n')
+
+      expect(await removeGithubTriggerWorktree({ repositoryRoot, worktreePath, archiveTo })).toEqual({ ok: true })
+
+      expect(await git(['worktree', 'list', '--porcelain'])).not.toContain(worktreePath)
+      expect(JSON.parse(await readFile(join(archiveTo, 'info.json'), 'utf8')))
+        .toMatchObject({ repositoryRoot, worktreePath, head })
+      expect(await readFile(join(archiveTo, 'untracked', 'notes', 'fix.md'), 'utf8')).toBe('unfinished fix\n')
+      await expect(access(join(archiveTo, 'untracked', 'node_modules'))).rejects.toThrow()
+      // 보관한 패치는 같은 HEAD 위에 그대로 다시 얹힌다 — 사용자 diff 설정(noprefix 등)과 무관하게.
+      const restored = join(fixtureRoot, 'restored')
+      await git(['worktree', 'add', '--detach', restored, head])
+      await git(['apply', '--index', join(archiveTo, 'changes.patch')], restored)
+      expect(await readFile(join(restored, 'app.ts'), 'utf8')).toBe('export const a = 2\n')
     } finally {
       await rm(fixtureRoot, { recursive: true, force: true })
     }

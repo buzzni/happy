@@ -274,6 +274,8 @@ export interface ServerAutomationExecutorInput {
   discardGithubWorktree: (input: {
     repositoryRoot: string
     worktreePath: string
+    /** 보존을 그만둔다: 남은 변경을 보관한 뒤 지운다(서브모듈은 보지 않는다). */
+    archive?: true
   }) => Promise<{ ok: true } | { ok: false; dirty: boolean; error: string }>
   isSessionRunning: (sessionId: string) => boolean
   /**
@@ -354,6 +356,11 @@ const DIRTY_WORKTREE_RETRY_MS = 15 * 60_000
  * 프로세스였고 dirty 는 누적 원인이었을 뿐이다.
  */
 export const DIRTY_WORKTREE_WARN_AFTER_ATTEMPTS = 4
+/**
+ * dirty 보류의 기한. 2026-11-09 프로덕션 — 기한이 없어 최장 59일, 63개(38GB)가 쌓였고
+ * 회수한 사람은 없었다. 넘기면 변경을 보관하고 지운다(보관본은 데몬 홈에 남는다).
+ */
+export const DIRTY_WORKTREE_RETENTION_MS = 7 * 24 * 60 * 60_000
 const WORKTREE_CLEANUP_RETRY_MS = 60_000
 // 리뷰 worktree 는 대상 head 로만 체크아웃된 일회용 디렉토리다. 'strict' 는 그
 // 세션 경로만 쓰기 가능하게 하므로, 워커가 여기에 의존성을 설치해 대상 SHA 의
@@ -1421,11 +1428,17 @@ async function cleanupInactiveGithubWorktrees(input: ServerAutomationExecutorInp
       }
     }
     try {
-    const discarded = await input.discardGithubWorktree({
-      repositoryRoot: worktree.repositoryRoot,
-      worktreePath: worktree.worktreePath,
-    })
+    const location = { repositoryRoot: worktree.repositoryRoot, worktreePath: worktree.worktreePath }
+    const expired = input.now - worktree.createdAt >= DIRTY_WORKTREE_RETENTION_MS
+    const discarded = await input.discardGithubWorktree(expired ? { ...location, archive: true } : location)
     if (discarded.ok) {
+      if (expired) {
+        input.logDebug?.(
+          `[server-automation] ${worktree.automationId} removed a GitHub worktree kept past`
+          + ` ${Math.round(DIRTY_WORKTREE_RETENTION_MS / 86_400_000)} days; unsaved changes, if any, were archived:`
+          + ` ${worktree.worktreePath}`,
+        )
+      }
       removeGithubWorktreeJournal(input, worktree.runId)
       continue
     }
@@ -1444,6 +1457,17 @@ async function cleanupInactiveGithubWorktrees(input: ServerAutomationExecutorInp
       )
     }
     if (!discarded.dirty && shouldGiveUpWorktreeCleanup(attempts)) {
+      // 2026-11-09 — 여기서 journal 만 빠진 worktree 58개(11GB)가 디스크에 버려졌다. 원인은
+      // 깨진 서브모듈이라 서브모듈을 보지 않는 보관 정리로는 지워진다. 그것도 안 될 때만 포기한다.
+      const archived = expired ? discarded : await input.discardGithubWorktree({ ...location, archive: true })
+      if (archived.ok) {
+        input.logDebug?.(
+          `[server-automation] archived and removed GitHub worktree ${worktree.worktreePath}`
+          + ` after ${attempts} failed cleanup attempts: ${discarded.error}`,
+        )
+        removeGithubWorktreeJournal(input, worktree.runId)
+        continue
+      }
       input.logDebug?.(
         `[server-automation] giving up on GitHub worktree cleanup for ${worktree.worktreePath}`
         + ` after ${attempts} attempts; remove it manually: ${discarded.error}`,

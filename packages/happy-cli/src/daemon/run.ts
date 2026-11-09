@@ -290,6 +290,7 @@ import {
   removeGithubTriggerWorktree,
 } from './automations/githubTriggerWorktree';
 import { createGithubArtifactReclaimer } from './automations/githubWorktreeArtifactReclaim';
+import { pruneGithubWorktreeArchives } from './automations/githubWorktreeArchive';
 import {
   createGithubWorktreeTombstoneStore,
   readWorktreeHead,
@@ -3157,16 +3158,28 @@ export async function startDaemon(): Promise<void> {
       isDirectoryInUse: directory => !launchReadiness.isReady() || pendingMachineStarts.size > 0
         || resumingSetupTokenSessions.size > 0 || isAutomationDirectoryInUse(directory),
     });
-    const discardRememberedGithubWorktree = rememberGithubWorktreeRemoval(input => removeGithubTriggerWorktree({
-      ...input,
-      ...(admitSubprocess ? { admitSubprocess } : {}),
-      reclaimArtifacts: async () => {
-        const reclaim = () => reclaimGithubArtifacts(input);
-        const report = await (contextIsolationHostEnabled
-          ? createFilesystemWriteAdmission({ home: configuration.happyHomeDir })(reclaim) : reclaim());
-        if (report.status !== 'deferred') logger.debug(`[DAEMON RUN] [github-artifact-reclaim] ${JSON.stringify(report)}`);
-      },
-    }), {
+    const githubWorktreeArchiveRoot = join(configuration.happyHomeDir, 'automation-worktree-archive');
+    const discardRememberedGithubWorktree = rememberGithubWorktreeRemoval(async ({ archive, ...input }: {
+      repositoryRoot: string; worktreePath: string; archive?: true;
+    }) => {
+      if (archive) {
+        const prune = () => pruneGithubWorktreeArchives(githubWorktreeArchiveRoot, Date.now());
+        await (contextIsolationHostEnabled
+          ? createFilesystemWriteAdmission({ home: configuration.happyHomeDir })(prune) : prune())
+          .catch(error => logger.debug(`[DAEMON RUN] GitHub worktree archive pruning failed: ${error instanceof Error ? error.message : error}`));
+      }
+      return removeGithubTriggerWorktree({
+        ...input,
+        ...(archive ? { archiveTo: join(githubWorktreeArchiveRoot, basename(input.worktreePath)) } : {}),
+        ...(admitSubprocess ? { admitSubprocess } : {}),
+        reclaimArtifacts: async () => {
+          const reclaim = () => reclaimGithubArtifacts(input);
+          const report = await (contextIsolationHostEnabled
+            ? createFilesystemWriteAdmission({ home: configuration.happyHomeDir })(reclaim) : reclaim());
+          if (report.status !== 'deferred') logger.debug(`[DAEMON RUN] [github-artifact-reclaim] ${JSON.stringify(report)}`);
+        },
+      });
+    }, {
       readHead: readWorktreeHead,
       record: (removed) => githubWorktreeTombstones.record(removed),
     });
