@@ -20,6 +20,8 @@ export type ResumeLaunchOptions = {
     emptyCodexSession?: { serverSeq?: number; processedSeq: number };
     /** The launch carries an automation prompt and run-once flag (daemon automation resume). */
     automationPrompt?: boolean;
+    /** Fresh authenticated server head and the prior child's processed cursor, for a session without a machine setup-token execution. */
+    emptyClaudeSession?: { serverSeq?: number; processedSeq: number };
     /** Daemon-only durable machine execution proof: no provider start was ever submitted. */
     emptyMachineClaudeSession?: { sessionId: string; serverSeq?: number; processedSeq: number; startNeverSubmitted: true };
 };
@@ -89,7 +91,10 @@ export function buildResumeLaunch(session: ResumableHappySession, options: Resum
         const fresh = options.emptyMachineClaudeSession;
         const unused = options.startedBy === 'daemon' && fresh?.startNeverSubmitted === true && fresh.sessionId === session.id
             && Number.isSafeInteger(fresh.serverSeq) && (fresh.serverSeq ?? -1) >= 0 && fresh.processedSeq === 0;
-        if (!metadata.claudeSessionId && !unused) {
+        const empty = options.startedBy === 'daemon'
+            && options.emptyClaudeSession?.serverSeq === 0
+            && options.emptyClaudeSession.processedSeq === 0;
+        if (!metadata.claudeSessionId && !unused && !empty) {
             throw new Error(`Happy session ${session.id} is missing its Claude session ID.`);
         }
         const args = ['claude'];

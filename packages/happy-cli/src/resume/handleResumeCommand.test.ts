@@ -149,6 +149,25 @@ describe('buildResumeLaunch', () => {
         expect(() => buildResumeLaunch(session, { startedBy: 'daemon', emptyMachineClaudeSession: { sessionId: 'another-session', serverSeq: 0, processedSeq: 0, startNeverSubmitted: true } })).toThrow();
     });
 
+    // 2026-11-09: a first send blocked before reaching the server left a Claude session
+    // with no messages and no Claude session ID; every later send refused to reconnect.
+    it('starts Claude without a provider resume for a daemon-confirmed unused Happy session', () => {
+        const options = { startedBy: 'daemon' as const, emptyClaudeSession: { serverSeq: 0, processedSeq: 0 } };
+        expect(buildResumeLaunch({ id: 'unused', active: false, metadata: { path: '/chat', flavor: 'claude' } as never }, options)).toEqual({
+            cwd: '/chat', args: ['claude', '--started-by', 'daemon'],
+        });
+    });
+
+    it.each([{ serverSeq: 1, processedSeq: 0 }, { serverSeq: 0, processedSeq: 1 }, { serverSeq: -1, processedSeq: 0 }, { serverSeq: undefined, processedSeq: 0 }, { serverSeq: 0, processedSeq: Number.NaN }])('refuses a missing Claude session ID when the session is not proven unused (%j)', emptyClaudeSession => {
+        const options = { startedBy: 'daemon' as const, emptyClaudeSession };
+        expect(() => buildResumeLaunch({ id: 'used', active: false, metadata: { path: '/chat', flavor: 'claude' } as never }, options)).toThrow('missing its Claude session ID');
+    });
+
+    it('does not accept unused Claude session evidence for a terminal launch', () => {
+        const options = { startedBy: 'terminal' as const, emptyClaudeSession: { serverSeq: 0, processedSeq: 0 } };
+        expect(() => buildResumeLaunch({ id: 'unused', active: false, metadata: { path: '/chat', flavor: 'claude' } as never }, options)).toThrow('missing its Claude session ID');
+    });
+
     it('starts Codex without a provider resume only for a daemon-confirmed unused Happy session', () => {
         const options = { startedBy: 'daemon' as const, emptyCodexSession: { serverSeq: 0, processedSeq: 0 } };
         expect(buildResumeLaunch({ id: 'unused', active: false, metadata: { path: '/chat', flavor: 'codex' } as never }, options)).toEqual({

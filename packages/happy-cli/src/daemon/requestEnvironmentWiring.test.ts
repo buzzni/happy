@@ -19,6 +19,12 @@ describe('request environment wiring', () => {
     const launch = resume.slice(resume.indexOf('const launch = buildResumeLaunch('), resume.indexOf('// The managed worktree'))
     expect(launch).toContain('emptyCodexSession: { serverSeq: serverSnapshot.seq, processedSeq: baselineSeq },')
   })
+  it('offers unused Claude session evidence only outside machine setup-token executions, which prove it by journal', async () => {
+    const source = await runSource()
+    const resume = source.slice(source.indexOf('const spawnResumedSession = async'))
+    const launch = resume.slice(resume.indexOf('const launch = buildResumeLaunch('), resume.indexOf('// The managed worktree'))
+    expect(launch).toContain('...(resumeBinding && isMachineSetupTokenBinding(resumeBinding.binding) ? {} : { emptyClaudeSession: { serverSeq: serverSnapshot.seq, processedSeq: baselineSeq } }),')
+  })
   it('tells the resume launch an automation prompt rides along, so an OpenCode session refuses it', async () => {
     const source = await runSource()
     const resume = source.slice(source.indexOf('const spawnResumedSession = async'))
