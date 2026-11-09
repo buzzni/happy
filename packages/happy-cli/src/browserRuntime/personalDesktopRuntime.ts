@@ -27,12 +27,17 @@ export interface PersonalRuntimePaths {
     adminSocket: string
 }
 
+/** Names a separate runtime of the same user, e.g. Desktop's local (standalone) mode beside the cloud one. */
+export const PERSONAL_RUNTIME_INSTANCE_ENV = 'SAYCODE_BROWSER_RUNTIME_INSTANCE'
+
 /** The one place a personal runtime keeps its files, for the runtime and the daemon alike. */
 export function personalRuntimePaths(platform: 'darwin' | 'win32', env: NodeJS.ProcessEnv = process.env, home = homedir()): PersonalRuntimePaths {
     const path = platform === 'win32' ? win32 : posix
     const base = platform === 'win32' ? env.LOCALAPPDATA : path.join(home, 'Library', 'Application Support')
     if (!base || !path.isAbsolute(base)) throw new Error('ABP personal runtime has no user application directory')
-    const root = path.join(base, 'Saycode', 'browser-runtime'), runDir = path.join(root, 'run')
+    const instance = env[PERSONAL_RUNTIME_INSTANCE_ENV]
+    if (instance !== undefined && !/^[a-z][a-z0-9-]{0,31}$/.test(instance)) throw new Error('ABP personal runtime instance name is invalid')
+    const root = path.join(base, 'Saycode', instance ? `browser-runtime-${instance}` : 'browser-runtime'), runDir = path.join(root, 'run')
     // Windows sockets are named pipes, one pair per user directory.
     const pipe = `\\\\.\\pipe\\saycode-browser-runtime-${createHash('sha256').update(root.toLowerCase()).digest('hex').slice(0, 16)}`
     return { root, runDir, configFile: path.join(root, 'runtime.json'), stateDir: path.join(root, 'state'),

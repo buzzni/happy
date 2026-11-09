@@ -11,14 +11,16 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { NativeBrokerRequestOptions } from '@/browserRuntime/brokerGrantSource'
 import { openServerEnvelope } from '@/browserRuntime/auth'
-import { personalRuntimePaths } from '@/browserRuntime/personalDesktopRuntime'
+import { PERSONAL_RUNTIME_INSTANCE_ENV, personalRuntimePaths } from '@/browserRuntime/personalDesktopRuntime'
 import { parseRuntimeConfig } from '@/browserRuntime/runtimeConfig'
 import { projectPath } from '@/projectPath'
 import type { BrowserNativeDeviceSigner } from './browserNativeDeviceProof'
 
 /** Variables the runtime process may see besides its own two; never credentials or HAPPY_*. */
 const RUNTIME_ENV = ['HOME', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'SystemRoot', 'windir', 'SystemDrive', 'USERPROFILE', 'LOCALAPPDATA',
-    'APPDATA', 'TEMP', 'TMP', 'USERNAME', 'USERDOMAIN', 'COMPUTERNAME', 'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432', 'ProgramData', 'PUBLIC', 'PATHEXT', 'ComSpec'] as const
+    'APPDATA', 'TEMP', 'TMP', 'USERNAME', 'USERDOMAIN', 'COMPUTERNAME', 'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432', 'ProgramData', 'PUBLIC', 'PATHEXT', 'ComSpec',
+    // The runtime resolves its own directory, so it must see the daemon's instance.
+    PERSONAL_RUNTIME_INSTANCE_ENV] as const
 const RESTART_DELAYS_MS = [1_000, 5_000, 30_000, 60_000, 120_000]
 /** A run this long counts as healthy and resets the restart backoff. */
 const HEALTHY_RUN_MS = 5 * 60_000

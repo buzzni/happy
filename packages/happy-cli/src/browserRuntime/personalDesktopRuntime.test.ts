@@ -51,6 +51,20 @@ describe('personal desktop runtime bootstrap', () => {
         expect(windows.adminSocket).toBe(windows.brokerSocket.replace(/-broker$/, '-admin'))
         expect(personalRuntimePaths('win32', { LOCALAPPDATA: 'C:\\Users\\other\\AppData\\Local' }).brokerSocket).not.toBe(windows.brokerSocket)
     })
+    it('keeps a named runtime instance in its own directory, pipes and sockets', () => {
+        // Desktop's local (standalone) mode runs its own runtime beside the cloud one.
+        const local = personalRuntimePaths('darwin', { SAYCODE_BROWSER_RUNTIME_INSTANCE: 'standalone' }, '/Users/u')
+        expect(local).toMatchObject({ root: '/Users/u/Library/Application Support/Saycode/browser-runtime-standalone',
+            configFile: '/Users/u/Library/Application Support/Saycode/browser-runtime-standalone/runtime.json',
+            brokerSocket: '/Users/u/Library/Application Support/Saycode/browser-runtime-standalone/run/broker.sock' })
+        const windows = personalRuntimePaths('win32', { LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local', SAYCODE_BROWSER_RUNTIME_INSTANCE: 'standalone' })
+        expect(windows.root).toBe('C:\\Users\\u\\AppData\\Local\\Saycode\\browser-runtime-standalone')
+        // Vector shared with Desktop tests/personalBrowserSetupBackend.test.ts.
+        expect(windows.brokerSocket).toBe('\\\\.\\pipe\\saycode-browser-runtime-a946b4276e51a00f-broker')
+        expect(windows.brokerSocket).not.toBe(personalRuntimePaths('win32', { LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local' }).brokerSocket)
+        for (const instance of ['', '../x', 'Standalone', 'a/b', 'x'.repeat(33)])
+            expect(() => personalRuntimePaths('darwin', { SAYCODE_BROWSER_RUNTIME_INSTANCE: instance }, '/Users/u')).toThrow(/instance/)
+    })
 
     it('runs a Windows browser as the runtime token user, with named pipes and no POSIX ownership checks', async () => {
         const windowsPaths = personalRuntimePaths('win32', { LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local' })
