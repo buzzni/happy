@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import tweetnacl from 'tweetnacl';
+import { readTrustedStudioOrigin } from './setupTokenBindingProof';
 
 const EPHEMERAL_PUBLIC_KEY_BYTES = tweetnacl.box.publicKeyLength;
 const NONCE_BYTES = tweetnacl.box.nonceLength;
@@ -40,6 +41,7 @@ export function injectMcpCallerGrant(
     projectId: string | null = null,
     expectedConnectors: string[] = [],
     lifecycle?: 'spawn' | 'resume',
+    trustedStudioOrigin?: string | null,
 ): Record<string, string> {
     const sanitized = Object.fromEntries(
         Object.entries(environmentVariables)
@@ -73,6 +75,9 @@ export function injectMcpCallerGrant(
                 && !key.startsWith('CLAUDE_MEMORY_')
             )),
     );
+    // Restore only the daemon's trust source, never the caller's stripped value or the MCP URL.
+    const studioOrigin = readTrustedStudioOrigin({ HAPPY_APLUS_STUDIO_ORIGIN: trustedStudioOrigin ?? undefined });
+    if (studioOrigin) sanitized.HAPPY_APLUS_STUDIO_ORIGIN = studioOrigin;
     if (trustedConfigUrl) {
         try {
             const configUrl = new URL(trustedConfigUrl);
@@ -239,6 +244,8 @@ export function prepareMcpChildEnvironment(
         expectedConnectors?: string[];
         lifecycle?: 'spawn' | 'resume';
         trustedConfigUrl?: string;
+        /** The daemon's own Studio origin; request environment values are always stripped. */
+        trustedStudioOrigin?: string | null;
     },
     consumer: Pick<McpCallerGrantEnvelopeConsumer, 'consume'>,
 ): { ok: true; environmentVariables: Record<string, string> }
@@ -259,6 +266,7 @@ export function prepareMcpChildEnvironment(
             projectId,
             input.expectedConnectors,
             input.lifecycle,
+            input.trustedStudioOrigin,
         ),
     };
 }

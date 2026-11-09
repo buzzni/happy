@@ -23,6 +23,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createCodexUsageEvent } from '@/usage/providerUsageAdapters'
 import { startAgentPlanProxy } from './agentPlanProxy'
+import { buildResumedSessionSpawnEnvironment, captureSaycodeAgentEnvironment } from '@/daemon/sessionEnv'
+import { prepareMcpChildEnvironment } from '@/daemon/mcpCallerGrantEnvelope'
 
 const GRANT = '3f1c2a4e-1b2c-4d5e-8f90-123456789abc'
 const SECRET = 'c2VjcmV0LXZhbHVlLWZvci10aGUtZ3JhbnQtMzItYnl0ZXM'
@@ -166,6 +168,53 @@ describe('createAgentPlanKeySource', () => {
 })
 
 describe('startAgentPlanSession', () => {
+    it('rebinds the same plan session and forwards a follow-up after its first runner has closed', async () => {
+        const studio = await fakeStudio()
+        const initialEnv = launchEnv(studio.origin)
+        const savedEnvironment = captureSaycodeAgentEnvironment(initialEnv)
+        expect(savedEnvironment).toHaveProperty(AGENT_PLAN_DESCRIPTOR_ENV)
+
+        async function sendTurn(env: NodeJS.ProcessEnv, prompt: string) {
+            const session = await startAgentPlanSession({ launch: consumeAgentPlanLaunch(env)!, sessionId: 'happy-resume', env })
+            try {
+                const response = await fetch(`${proxyBase(session.providerArgs)}/responses`, {
+                    method: 'POST',
+                    headers: { authorization: `Bearer ${env[AGENT_PLAN_PROXY_KEY_ENV]}`, 'content-type': 'application/json' },
+                    body: JSON.stringify({ model: 'gpt-6-luna', stream: true, input: prompt }),
+                })
+                expect(response.status).toBe(200)
+                expect(await response.text()).toContain('response.completed')
+            } finally {
+                await session.close()
+            }
+        }
+
+        await sendTurn(initialEnv, 'first message')
+        const resumed = prepareMcpChildEnvironment({
+            environmentVariables: buildResumedSessionSpawnEnvironment({
+                inherited: { HAPPY_APLUS_STUDIO_ORIGIN: studio.origin },
+                explicit: {},
+                agentEnvironment: savedEnvironment,
+                sessionId: 'happy-resume',
+            }),
+            trustedStudioOrigin: studio.origin,
+            trustedConfigUrl: `${studio.origin}/api/me/mcp-config`,
+            lifecycle: 'resume',
+        }, { consume: () => { throw new Error('resume has no new envelope'); } })
+        expect(resumed.ok).toBe(true)
+        if (!resumed.ok) throw new Error(resumed.reason)
+        await sendTurn(resumed.environmentVariables, 'follow-up message')
+
+        const bindings = studio.requests.filter(request => request.url === '/api/agent-plan/session-keys')
+        expect(bindings.map(request => JSON.parse(request.body))).toEqual([
+            { grantId: GRANT, secret: SECRET, sessionId: 'happy-resume' },
+            { grantId: GRANT, secret: SECRET, sessionId: 'happy-resume' },
+        ])
+        const calls = studio.requests.filter(request => request.url === '/api/agent-plan/v1/responses')
+        expect(calls.map(request => request.authorization)).toEqual(['Bearer agps_1', 'Bearer agps_3'])
+        expect(calls.map(request => JSON.parse(request.body).input)).toEqual(['first message', 'follow-up message'])
+    })
+
     it('binds the Happy session id with the grant before Codex is configured', async () => {
         const studio = await fakeStudio()
         const env = launchEnv(studio.origin)

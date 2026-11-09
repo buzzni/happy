@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import tweetnacl from 'tweetnacl';
 import { encodeBase64, libsodiumEncryptForPublicKey } from '@/api/encryption';
+import { consumeAgentPlanLaunch } from '@/codex/agentPlanSession';
+import { buildAgentPlanDescriptor, serializeAgentPlanDescriptor } from '@/launcher/agentPlanLaunch';
 import {
     injectMcpCallerGrant,
     McpCallerGrantEnvelopeConsumer,
@@ -35,6 +37,53 @@ function envelope(token: string, publicKey: Uint8Array): string {
 }
 
 describe('McpCallerGrantEnvelopeConsumer', () => {
+    it('resumes a saved plan launch with the daemon Studio origin after scrubbing request settings', () => {
+        const origin = 'https://saycode.ai';
+        const descriptor = buildAgentPlanDescriptor({ origin, grantId: 'plan-grant', model: 'gpt-6-luna' })!;
+        const input = {
+            environmentVariables: {
+                HAPPY_APLUS_STUDIO_ORIGIN: 'https://attacker.test',
+                HAPPY_INITIAL_AGENT_PLAN_DESCRIPTOR: serializeAgentPlanDescriptor(descriptor),
+                HAPPY_INITIAL_AGENT_PLAN_SECRET: 'synthetic-plan-secret',
+            },
+            trustedStudioOrigin: origin,
+            trustedConfigUrl: 'https://different-mcp.example/api/me/mcp-config',
+            lifecycle: 'resume' as const,
+        };
+        const result = prepareMcpChildEnvironment(input, {
+            consume: () => { throw new Error('no envelope to consume'); },
+        });
+
+        expect(result.ok).toBe(true);
+        if (!result.ok) throw new Error(result.reason);
+        expect(consumeAgentPlanLaunch(result.environmentVariables)).toMatchObject({ descriptor });
+        expect(result.environmentVariables.HAPPY_APLUS_STUDIO_ORIGIN).toBe(origin);
+    });
+
+    it.each([undefined, null, 'http://attacker.test', 'https://saycode.ai/untrusted', 'https://user:pass@saycode.ai'])(
+        'refuses a plan resume without a valid daemon origin (%s), even when the caller and MCP URL match',
+        trustedStudioOrigin => {
+            const origin = 'https://saycode.ai';
+            const descriptor = buildAgentPlanDescriptor({ origin, grantId: 'plan-grant', model: 'gpt-6-luna' })!;
+            const result = prepareMcpChildEnvironment({
+                environmentVariables: {
+                    HAPPY_APLUS_STUDIO_ORIGIN: origin,
+                    HAPPY_INITIAL_AGENT_PLAN_DESCRIPTOR: serializeAgentPlanDescriptor(descriptor),
+                    HAPPY_INITIAL_AGENT_PLAN_SECRET: 'synthetic-plan-secret',
+                },
+                trustedStudioOrigin,
+                trustedConfigUrl: `${origin}/api/me/mcp-config`,
+                lifecycle: 'resume',
+            }, { consume: () => { throw new Error('no envelope to consume'); } });
+
+            expect(result.ok).toBe(true);
+            if (!result.ok) throw new Error(result.reason);
+            expect(result.environmentVariables).not.toHaveProperty('HAPPY_APLUS_STUDIO_ORIGIN');
+            expect(() => consumeAgentPlanLaunch(result.environmentVariables))
+                .toThrow('agent_plan_descriptor_invalid: origin is not this runner\'s Studio');
+        },
+    );
+
     it('resume child용 envelope를 검증하고 project-aware MCP env를 만든다', () => {
         const keyPair = tweetnacl.box.keyPair();
         const consumer = new McpCallerGrantEnvelopeConsumer({

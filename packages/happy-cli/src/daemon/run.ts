@@ -3435,6 +3435,7 @@ export async function startDaemon(): Promise<void> {
           expectedConnectors: options?.expectedConnectors,
           lifecycle: 'resume',
           trustedConfigUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
+          trustedStudioOrigin: readTrustedStudioOrigin(process.env),
         }, mcpCallerGrantConsumer);
         if (!mcpEnvironment.ok) {
           return {
