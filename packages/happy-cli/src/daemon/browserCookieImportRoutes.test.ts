@@ -83,6 +83,10 @@ describe('Desktop cookie import routes', () => {
         attachBrowserCookieImportRoutes(app, { adminSocket: () => socketPath }); cleanups.push(() => app.close())
         const unsupported = await app.inject({ method: 'POST', url: '/browser/desktop-login/cookies/set', payload: request })
         expect([unsupported.statusCode, unsupported.json()]).toEqual([501, { error: 'COOKIE_IMPORT_UNSUPPORTED' }])
+        // Above the runtime's default 64 KiB body limit it is still "unsupported", not a malformed request.
+        const large = { ...request, cookies: Array.from({ length: 30 }, (_, index) => ({ ...request.cookies[0], name: `c${index}`, value: 'v'.repeat(4000) })) }
+        const unsupportedLarge = await app.inject({ method: 'POST', url: '/browser/desktop-login/cookies/set', payload: large })
+        expect([unsupportedLarge.statusCode, unsupportedLarge.json()]).toEqual([501, { error: 'COOKIE_IMPORT_UNSUPPORTED' }])
     })
 
     it('rejects malformed requests before reaching the runtime', async () => {

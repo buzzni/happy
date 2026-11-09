@@ -30,6 +30,8 @@ function callAdmin(socketPath: string | undefined, method: 'GET' | 'POST', path:
         })
         // No socket, a dead runtime or a timeout: the same.
         req.on('error', () => resolve(undefined))
+        // The runtime may answer and close before the whole body is written; the answer stands, so a late EPIPE is ignored.
+        req.on('socket', socket => socket.on('error', () => {}))
         req.on('timeout', () => req.destroy())
         req.end(body === undefined ? undefined : JSON.stringify(body))
     })

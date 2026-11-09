@@ -96,6 +96,8 @@ export async function startAdminServer(input: AdminServerInput): Promise<AdminSe
                 if (req.method === 'GET' && path === '/admin/cookies' && input.cookies)
                     return sendJson(res, 200, { ok: true, result: { imports: await input.cookies.list() } })
                 if (req.method !== 'POST') return sendJson(res, 404, { ok: false, error: { code: 'UNSUPPORTED_OPERATION' } })
+                // Before reading a body that may exceed the default limit: no cookie support is "unsupported", not "too large".
+                if (path.startsWith('/admin/cookies/') && !input.cookies) return sendJson(res, 404, { ok: false, error: { code: 'UNSUPPORTED_OPERATION' } })
                 if (path === '/admin/cookies/set' && input.cookies)
                     return sendJson(res, 200, { ok: true, result: await input.cookies.set(await readBody(req, COOKIE_BODY_LIMIT)) })
                 const body = await readBody(req)
