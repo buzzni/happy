@@ -10,6 +10,10 @@ import { describeUnsavedWorktreeChanges, hasUnsavedWorktreeChanges } from './wor
 const execFileAsync = promisify(execFile)
 const COMMAND_TIMEOUT_MS = 60_000
 const COMMAND_MAX_BUFFER = 2 * 1024 * 1024
+// 사용자 전역의 submodule.recurse=true 가 `gh pr checkout` 안의 git 까지 서브모듈을 갱신하게
+// 해, 서브모듈 저장소가 쓸 수 없을 때 checkout 이 반쯤 끝나고 worktree 가 버려졌다(2026-11-09).
+// `gh` 에는 -c 를 넘길 수 없으므로 환경으로 준다. GIT_CONFIG_COUNT 는 git 2.31+ 라 쓰지 않는다.
+const NO_SUBMODULE_RECURSION = "'submodule.recurse=false'"
 
 export interface GithubTriggerWorktreeCommand {
   executable: 'git' | 'gh'
@@ -47,9 +51,14 @@ async function defaultRunCommand(command: GithubTriggerWorktreeCommand): Promise
   try {
     const args = command.executable === 'git'
       ? ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...command.args] : command.args
+    const env = { ...process.env, ...command.environmentVariables }
     const result = await execFileAsync(command.executable, args, {
       cwd: command.cwd,
-      env: { ...process.env, ...command.environmentVariables, GIT_OPTIONAL_LOCKS: '0' },
+      env: {
+        ...env,
+        GIT_OPTIONAL_LOCKS: '0',
+        GIT_CONFIG_PARAMETERS: [env.GIT_CONFIG_PARAMETERS, NO_SUBMODULE_RECURSION].filter(Boolean).join(' '),
+      },
       timeout: COMMAND_TIMEOUT_MS,
       maxBuffer: COMMAND_MAX_BUFFER,
       encoding: 'utf8',

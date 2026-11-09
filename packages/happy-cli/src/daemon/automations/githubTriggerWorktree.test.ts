@@ -292,6 +292,82 @@ describe('prepareGithubTriggerWorktree', () => {
     expect(order.indexOf('release')).toBeLessThan(order.indexOf('git worktree add'))
   })
 
+// 2026-11-09 프로덕션 — 사용자 전역 설정의 submodule.recurse=true 때문에 `gh pr checkout`
+// 이 PR 이 바꾼 서브모듈까지 갱신하려다 실패했다(서브모듈 저장소가 받아진 적 없이 config
+// 만 남은 상태). 파일만 PR head 로 바뀌고 HEAD 는 그대로라 리뷰는 한 번도 돌지 못했고,
+// 남은 worktree 는 `git status` 부터 실패해 정리 예산을 다 쓰고 버려졌다 — 열흘에 58개(11GB).
+// 자동화 worktree 는 서브모듈이 필요 없으므로 데몬은 사용자 설정과 무관하게 재귀하지 않는다.
+describe.skipIf(process.platform === 'win32')('automation worktree with submodule.recurse=true', () => {
+  it('reviews the PR head and cleans up even when the shared submodule repository is unusable', async () => {
+    const fixtureRoot = await realpath(await mkdtemp(join(tmpdir(), 'happy-worktree-submodule-')))
+    const submoduleRoot = join(fixtureRoot, 'sub')
+    const repositoryRoot = join(fixtureRoot, 'repo')
+    const fakeGhDirectory = join(fixtureRoot, 'bin')
+    const git = async (args: string[], cwd = repositoryRoot) => (await execFileAsync('git', [
+      '-c', 'user.name=Test', '-c', 'user.email=test@example.com', '-c', 'protocol.file.allow=always', ...args,
+    ], { cwd, encoding: 'utf8' })).stdout
+    const originalPath = process.env.PATH
+
+    try {
+      await mkdir(submoduleRoot)
+      await git(['init'], submoduleRoot)
+      await writeFile(join(submoduleRoot, 'a.txt'), 'a\n')
+      await git(['add', '.'], submoduleRoot)
+      await git(['commit', '-m', 'sub 1'], submoduleRoot)
+      const firstSubmoduleCommit = (await git(['rev-parse', 'HEAD'], submoduleRoot)).trim()
+      await writeFile(join(submoduleRoot, 'b.txt'), 'b\n')
+      await git(['add', '.'], submoduleRoot)
+      await git(['commit', '-m', 'sub 2'], submoduleRoot)
+      const secondSubmoduleCommit = (await git(['rev-parse', 'HEAD'], submoduleRoot)).trim()
+
+      await mkdir(repositoryRoot)
+      await git(['init'])
+      await writeFile(join(repositoryRoot, 'README.md'), 'base\n')
+      await git(['submodule', 'add', submoduleRoot, 'sub'])
+      await git(['checkout', '--detach', firstSubmoduleCommit], join(repositoryRoot, 'sub'))
+      await git(['add', '.'])
+      await git(['commit', '-m', 'base pins sub 1'])
+      const baseHead = (await git(['rev-parse', 'HEAD'])).trim()
+      await git(['checkout', '--detach', secondSubmoduleCommit], join(repositoryRoot, 'sub'))
+      await git(['add', 'sub'])
+      await git(['commit', '-m', 'pull request moves sub to sub 2'])
+      const pullRequestHead = (await git(['rev-parse', 'HEAD'])).trim()
+      await git(['-c', 'submodule.recurse=true', 'checkout', '--detach', baseHead])
+
+      // 서브모듈 저장소를 config 한 줄만 남은 껍데기로 만들고, 재귀를 켠다.
+      const moduleDirectory = join(repositoryRoot, '.git', 'modules', 'sub')
+      await rm(moduleDirectory, { recursive: true, force: true })
+      await mkdir(moduleDirectory)
+      await writeFile(join(moduleDirectory, 'config'), '[core]\n\tworktree = ../../../sub\n')
+      await git(['config', 'submodule.recurse', 'true'])
+
+      // `gh pr checkout` 은 결국 git checkout 이다. 같은 프로세스 환경을 물려받는지 본다.
+      await mkdir(fakeGhDirectory)
+      await writeFile(join(fakeGhDirectory, 'gh'), `#!/bin/sh\nexec git checkout --detach ${pullRequestHead}\n`, { mode: 0o755 })
+      process.env.PATH = `${fakeGhDirectory}:${originalPath}`
+
+      const prepared = await prepareGithubTriggerWorktree({
+        runId: 'run-submodule',
+        directory: repositoryRoot,
+        managedRoot: join(fixtureRoot, 'automation-worktrees'),
+        pullRequest: { number: 7, expectedHeadSha: pullRequestHead },
+        onPlanned: () => undefined,
+      })
+
+      expect(prepared).toMatchObject({ ok: true })
+      if (!prepared.ok) return
+      expect((await git(['rev-parse', 'HEAD'], prepared.worktreePath)).trim()).toBe(pullRequestHead)
+
+      expect(await removeGithubTriggerWorktree({ repositoryRoot, worktreePath: prepared.worktreePath }))
+        .toEqual({ ok: true })
+      expect(await git(['worktree', 'list', '--porcelain'])).not.toContain(prepared.worktreePath)
+    } finally {
+      process.env.PATH = originalPath
+      await rm(fixtureRoot, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('removeGithubTriggerWorktree', () => {
   it.each([false, true])('preserves an intentional lockfile-only update in a real worktree (staged=%s)', async (staged) => {
     const fixtureRoot = await realpath(await mkdtemp(join(tmpdir(), 'happy-worktree-lockfile-')))
