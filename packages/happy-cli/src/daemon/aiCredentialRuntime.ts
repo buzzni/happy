@@ -44,6 +44,7 @@ import { setupTokenWindowUsedUp } from '@/claude/setupTokenUsageTracker'
 import { openSetupTokenAssignment, type SetupTokenAssignmentRecipient } from './setupTokenAssignmentWire'
 import { HAPPY_AI_AUTH_SOURCE_ENV } from '@/usage/aiAuthSource'
 import {
+  isOrgLlmEndpointGenerationConflict,
   OrgLlmEndpointError,
   parseOrgLlmEndpointStore,
   parseOrgLlmEndpointSync,
@@ -2775,6 +2776,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         // the older view must not bring back a removed address or a replaced token.
         const stored = current?.endpoints[entry.id]
         if (stored && entry.generation < stored.generation) throw new OrgLlmEndpointStaleGenerationError(stored.generation)
+        if (stored && isOrgLlmEndpointGenerationConflict(stored, entry)) throw new OrgLlmEndpointError('ORG_LLM_ENDPOINT_GENERATION_CONFLICT')
         await deps.mkdir(join(deps.homeDir, '.happy'), { recursive: true, mode: 0o700 })
         await writeAtomicFile(deps, orgLlmEndpointStorePath(), JSON.stringify(replaceOrgLlmEndpoint(current, entry)))
         return { ok: true as const, generation: entry.generation }

@@ -4424,6 +4424,30 @@ describe('organization LLM endpoint', () => {
     expect(JSON.parse(files.get(storePath)!).endpoints['endpoint-1']).toMatchObject({ generation: 5, token: 'newer-token' })
   })
 
+  it.each([
+    ['an address of a target it keeps', { targets: [{ id: 'target-a', url: 'https://elsewhere.example' }] }],
+    ['the token', { token: 'other-token' }],
+    ['the auth mode', { authMode: 'none', token: undefined }],
+    ['the model', { model: 'other-model' }],
+    ['a tier model', { models: { opus: 'other-big' } }],
+    ['a limit', { maxContextTokens: 4096 }],
+  ])('refuses a sync that changes %s without raising the generation, and keeps the stored entry', async (_label, change) => {
+    const { runtime, files, writeFile } = setup()
+    await runtime.orgLlmEndpointSync(syncParams({}, { generation: 5 }))
+    const before = files.get(storePath)
+    writeFile.mockClear()
+    await expect(runtime.orgLlmEndpointSync(syncParams({}, { generation: 5, ...change }))).rejects.toMatchObject({ kind: 'ORG_LLM_ENDPOINT_GENERATION_CONFLICT' })
+    expect(writeFile).not.toHaveBeenCalled()
+    expect(files.get(storePath)).toBe(before)
+  })
+
+  it('takes the same entry again, and a newer generation that changes anything', async () => {
+    const { runtime } = setup()
+    await runtime.orgLlmEndpointSync(syncParams({}, { generation: 5 }))
+    await expect(runtime.orgLlmEndpointSync(syncParams({}, { generation: 5 }))).resolves.toEqual({ ok: true, generation: 5 })
+    await expect(runtime.orgLlmEndpointSync(syncParams({}, { generation: 6, token: 'rotated-token' }))).resolves.toEqual({ ok: true, generation: 6 })
+  })
+
   it('lets a lower generation of another endpoint through', async () => {
     const { runtime } = setup()
     await runtime.orgLlmEndpointSync(syncParams({}, { generation: 5 }))

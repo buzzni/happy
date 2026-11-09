@@ -137,6 +137,21 @@ export function parseOrgLlmEndpointStore(raw: string): OrgLlmEndpointStore {
     return { version: 1, endpoints }
 }
 
+/**
+ * Whether a sync at the stored generation changes what a session of that generation connects with. The server raises
+ * the generation for every such change (an address, the token or auth mode, a model, a limit), so a sync that does not
+ * is no administrator's change: a session bound to `<target>:<generation>` would resume on another address or token.
+ * Targets may still come and go at one generation (enabling one does not raise it); a target that stays keeps its address.
+ */
+export function isOrgLlmEndpointGenerationConflict(stored: OrgLlmEndpointEntry, entry: OrgLlmEndpointEntry): boolean {
+    if (stored.generation !== entry.generation) return false
+    const tiers = (models: OrgLlmEndpointEntry['models']) => TIERS.map((tier) => models[tier] ?? '').join('\n')
+    return stored.model !== entry.model || tiers(stored.models) !== tiers(entry.models)
+        || stored.maxContextTokens !== entry.maxContextTokens || stored.apiTimeoutMs !== entry.apiTimeoutMs
+        || stored.authMode !== entry.authMode || stored.token !== entry.token
+        || entry.targets.some((target) => stored.targets.some((kept) => kept.id === target.id && kept.url !== target.url))
+}
+
 /** A new store with only that endpoint's entry replaced. */
 export function replaceOrgLlmEndpoint(store: OrgLlmEndpointStore | undefined, entry: OrgLlmEndpointEntry): OrgLlmEndpointStore {
     return { version: 1, endpoints: { ...store?.endpoints, [entry.id]: entry } }
