@@ -25,7 +25,7 @@ export function isOrgEndpointBoundMetadata(metadata: { orgLlmEndpoint?: unknown 
 }
 
 /** Whether the record proves an endpoint binding, even a corrupt one (which endpoint it was is no longer relevant). */
-function isEndpointBound(record: PersistedSession): boolean {
+export function isOrgEndpointBoundRecord(record: PersistedSession): boolean {
     if (record.agentEnvironment?.[ORG_ENDPOINT_BINDING_ENV] !== undefined) return true
     const marked = (record.metadata as { orgLlmEndpoint?: unknown }).orgLlmEndpoint
     return marked !== undefined && marked !== null
@@ -44,9 +44,9 @@ export function orgEndpointParentRefusal(input: {
     records: Record<string, PersistedSession>
 }): string | undefined {
     const parent = input.parentSessionId ? input.records[input.parentSessionId] : undefined
-    const bound = (parent !== undefined && isEndpointBound(parent))
+    const bound = (parent !== undefined && isOrgEndpointBoundRecord(parent))
         || (input.resumeClaudeSessionId !== undefined && Object.values(input.records).some((record) =>
-            (record.metadata as { claudeSessionId?: unknown }).claudeSessionId === input.resumeClaudeSessionId && isEndpointBound(record)))
+            (record.metadata as { claudeSessionId?: unknown }).claudeSessionId === input.resumeClaudeSessionId && isOrgEndpointBoundRecord(record)))
     if (!bound) return undefined
     return 'ORG_LLM_ENDPOINT_PARENT_BOUND: this conversation ran on an organization LLM endpoint and cannot be continued in a new session; '
         + 'resume the same session, or start a new conversation.'
