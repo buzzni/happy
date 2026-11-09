@@ -376,13 +376,13 @@ if(NATIVE_SCREEN){document.body.classList.add('native-window');$('openScreen').h
 /** Personal PC page view (see renderConsolePage): only in a conversation console of a Runtime that serves it. */
 var PAGE_VIEW=NATIVE_SCREEN&&${opts.pageView === true}&&!!taskSession;
 var PT=LANG==='ko'?{connecting:'페이지 화면에 연결 중…',observe:'페이지를 보고 있어요. 직접 조작하려면 제어권을 가져오세요.',control:'직접 조작 중이에요. 입력이 페이지에 전달돼요.',
- stale:'화면 갱신이 늦어지고 있어요. 입력을 멈췄어요.',unresolved:'입력 결과를 확인할 수 없어 에이전트 계속 진행을 막았어요.',confirmed:'입력 처리 상태를 확인했어요. 다시 연결을 눌러 이어가세요.',
+ stale:'화면 갱신이 늦어지고 있어요. 입력을 멈췄어요.',unresolved:'입력 결과를 확인할 수 없어 에이전트 계속 진행을 막았어요.',confirmed:'입력 처리 상태를 확인했어요. 다시 연결을 눌러 이어가세요.',discarded:'화면이 바뀌어 마지막 입력은 보내지 않았어요.',
  unknown:'입력 결과를 확인 중이에요. 같은 입력을 다시 보내지 마세요.',expired:'접근 권한이 만료됐어요. Saycode가 갱신하기를 기다리고 있어요.',forbidden:'이 대화의 페이지에 접근할 수 없어요.',
  offline:'연결이 끊겼어요. 이전 화면에서는 입력할 수 없어요.',unsupported:'이 런타임은 여기서 페이지를 보여줄 수 없어요. 작업 PC의 Chrome 창을 사용하세요.',
  emptyTitle:'페이지를 기다리고 있어요',emptyBody:'에이전트가 이 대화에서 페이지를 열면 여기에 보여요. 작업 PC의 전용 Chrome 창에서도 같은 페이지를 볼 수 있어요. 창에서 직접 조작할 때도 먼저 제어권을 가져오고, 마친 뒤 반납하고 계속 진행하세요.',
  image:'현재 대화의 브라우저 페이지',input:'페이지 텍스트 입력'}
  :{connecting:'Connecting to the page…',observe:'Observing the page. Take over to use it.',control:'You have control. Input reaches the page.',
- stale:'Page updates are delayed. Input is stopped.',unresolved:'Input outcome is unknown. Resuming the agent is blocked.',confirmed:'Input receipt checked. Press Reconnect to continue.',
+ stale:'Page updates are delayed. Input is stopped.',unresolved:'Input outcome is unknown. Resuming the agent is blocked.',confirmed:'Input receipt checked. Press Reconnect to continue.',discarded:'The page changed, so your last input was not sent.',
  unknown:'Checking input receipt. Do not repeat the input.',expired:'Access expired. Waiting for Saycode to renew it.',forbidden:'This conversation cannot access the page.',
  offline:'Disconnected. Input on the previous image is stopped.',unsupported:'This runtime cannot show the page here. Use the Chrome window on the task PC.',
  emptyTitle:'Waiting for the page',emptyBody:'When the agent opens a page in this conversation, it shows here. The dedicated Chrome window on the task PC shows the same page; take over before using it there too, then release control and resume when finished.',
