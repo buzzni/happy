@@ -33,6 +33,8 @@ export interface PersonalBrowserRuntime {
     /** Session environment: where the runtime and its broker are. */
     sessionEnv: Record<string, string>
     native: NativeBrokerRequestOptions
+    /** The runtime's 0600 admin socket (Desktop cookie import, ADR-087). */
+    adminSocket: string
     start(): PersonalBrowserRuntimeProcess
 }
 export interface PersonalBrowserRuntimeProcess { stop(): Promise<void> }
@@ -176,6 +178,7 @@ export function readPersonalBrowserRuntime(options: PersonalBrowserRuntimeOption
             HAPPY_BROWSER_TASK_SEALED_CONSOLE: '1',
         },
         native: { socketPath: paths.brokerSocket, machineId: config.machineId, workspaceId: config.workspaceId, issue },
+        adminSocket: paths.adminSocket,
         start: () => superviseRuntime(options, runtimeEnv),
     }
 }

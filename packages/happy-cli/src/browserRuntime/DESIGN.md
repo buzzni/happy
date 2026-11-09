@@ -168,6 +168,15 @@ Saydo `specs/agent-browser-deploy/` D3 (verify), D4, D8, D9, D10 (Runtime side).
     also closes a space with unknown-outcome tasks, whose records stay for reconcile, and
     tabs kept for the user).
     TODO (S6 installer stream): wire `abp-stack spaces list|close <id> [--force]` to these.
+- Imported site cookies (personal desktop only, 2026-11-10, Desktop ADR-087): Saycode Desktop
+  decrypts the cookies its user chose for one host and sends them through the daemon's
+  Desktop-only control routes `/browser/desktop-login/cookies/{set,remove,list}` (capability
+  `cookieImport: 1`) to the admin socket's `POST /admin/cookies/set|remove` and
+  `GET /admin/cookies`. The runtime starts the browser if needed and writes each cookie with
+  `Storage.setCookies` into the default context (host-only cookies by URL so they stay
+  host-only), and keeps `cookie-imports.json` in the state dir with keys only, never values.
+  Removal writes the recorded keys expired. No agent grant, interactive capability or
+  `/v1/ops` operation reaches these; values go in and never come back out.
 - Retention (`retentionDays`, config mode, at start and hourly): terminal tasks without
   uncertain actions whose last change is older than the retention are deleted
   (`BrowserRuntime.purgeExpiredTasks`). Their still-open browser tabs are closed first and

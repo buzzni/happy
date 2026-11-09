@@ -39,6 +39,7 @@ import {
     type TabId,
     type WaitPredicate,
 } from '../contracts'
+import type { CdpCookieParam } from '../cookieImports'
 import { formDigest, originAllowed } from '../policy'
 import { CdpPageViewDriver } from './pageViewDriver'
 import { CdpConnection, CdpProtocolError, connectionClosedError } from './cdpConnection'
@@ -436,6 +437,11 @@ export class CdpDriver implements BrowserDriver {
 
     isConnected(): boolean {
         return this.conn !== undefined && !this.conn.closed && this.instanceId !== undefined
+    }
+
+    /** Writes cookies into the browser's default context, shared by every tab (personal cookie import, ADR-087). */
+    async setCookies(cookies: CdpCookieParam[]): Promise<void> {
+        await this.requireConn().send('Storage.setCookies', { cookies })
     }
 
     browserInstanceId(): BrowserInstanceId {

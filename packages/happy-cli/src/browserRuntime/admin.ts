@@ -14,6 +14,7 @@ import type { AddressInfo } from 'node:net'
 import { listenOnSocket } from './broker'
 import { PROFILE_REFUSALS, type ProfileRefusal } from './brokerLedger'
 import { BrowserRuntimeError, type ActionId, type GrantId, type ProfileId, type TaskId, type TaskSpaceId } from './contracts'
+import type { CookieImports } from './cookieImports'
 import type { CdpDriver } from './drivers/cdpDriver'
 import type { BrowserRuntime } from './runtime'
 import type { TaskStore } from './taskStore'
@@ -25,11 +26,14 @@ function adminAuthorized(req: IncomingMessage, adminToken: string): boolean {
     return supplied.length === expected.length && timingSafeEqual(supplied, expected)
 }
 
-async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+/** A site's imported cookies (up to 300 of 4 KiB each) need more than the default limit. */
+const COOKIE_BODY_LIMIT = 2 * 1024 * 1024
+
+async function readBody(req: IncomingMessage, limit = 64 * 1024): Promise<Record<string, unknown>> {
     let raw = ''
     for await (const chunk of req) {
         raw += chunk
-        if (raw.length > 64 * 1024) throw new BrowserRuntimeError('INVALID_REQUEST', 'body too large')
+        if (raw.length > limit) throw new BrowserRuntimeError('INVALID_REQUEST', 'body too large')
     }
     const value = raw ? JSON.parse(raw) as unknown : {}
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new BrowserRuntimeError('INVALID_REQUEST', 'body must be an object')
@@ -61,6 +65,9 @@ export interface AdminServerInput {
         list(): Array<{ principalId: string; requestedAtMs: number }>
         refuse(principalId: string, reason: ProfileRefusal, retryAfterMs: number): Promise<void>
     }
+    /** Personal desktop runtime: site cookies the user imported through Saycode Desktop (`GET /admin/cookies`,
+     * `POST /admin/cookies/set`, `POST /admin/cookies/remove { host }`). Values go in, never out. */
+    cookies?: Pick<CookieImports, 'set' | 'remove' | 'list'>
 }
 
 export interface AdminServer { port?: number; close(): Promise<void> }
@@ -86,8 +93,15 @@ export async function startAdminServer(input: AdminServerInput): Promise<AdminSe
                     return sendJson(res, 200, { ok: true, result: { spaces: input.runtime.spaceReport() } })
                 if (req.method === 'GET' && path === '/admin/profile-requests' && input.profileRequests)
                     return sendJson(res, 200, { ok: true, result: { requests: input.profileRequests.list() } })
+                if (req.method === 'GET' && path === '/admin/cookies' && input.cookies)
+                    return sendJson(res, 200, { ok: true, result: { imports: await input.cookies.list() } })
                 if (req.method !== 'POST') return sendJson(res, 404, { ok: false, error: { code: 'UNSUPPORTED_OPERATION' } })
+                // Before reading a body that may exceed the default limit: no cookie support is "unsupported", not "too large".
+                if (path.startsWith('/admin/cookies/') && !input.cookies) return sendJson(res, 404, { ok: false, error: { code: 'UNSUPPORTED_OPERATION' } })
+                if (path === '/admin/cookies/set' && input.cookies)
+                    return sendJson(res, 200, { ok: true, result: await input.cookies.set(await readBody(req, COOKIE_BODY_LIMIT)) })
                 const body = await readBody(req)
+                if (path === '/admin/cookies/remove' && input.cookies) return sendJson(res, 200, { ok: true, result: await input.cookies.remove(body.host) })
                 if (path === '/admin/open-admission' && input.openAdmission) {
                     const assignments = body.assignments
                     if (!assignments || typeof assignments !== 'object' || Array.isArray(assignments) || Object.values(assignments).some((value) => typeof value !== 'string'))

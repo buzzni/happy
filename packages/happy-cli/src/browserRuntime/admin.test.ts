@@ -121,6 +121,32 @@ describe('admin server', () => {
         expect((await call({ port }, 'GET', '/admin/metrics')).status).toBe(401)
         expect((await call({ port }, 'GET', '/admin/metrics', { authorization: 'Bearer synthetic-admin-token-0123456789abcdef' })).status).toBe(200)
     })
+
+    it('imports, lists and removes site cookies only where the runtime offers them', async () => {
+        const dir = await mkdtemp(join(tmpdir(), 'abp-admin-')); cleanups.push(() => rm(dir, { recursive: true, force: true }))
+        const seen: unknown[] = []
+        const cookies = {
+            set: async (input: unknown) => { seen.push(input); return { host: 'example.com', imported: 1, skipped: 0 } },
+            remove: async (host: unknown) => { seen.push(host); return { host: 'example.com', removed: 1, failed: 0 } },
+            list: async () => [{ host: 'example.com', source: { browser: 'Google Chrome', profile: 'Default' }, importedAtMs: 1, count: 1 }],
+        }
+        const socketPath = join(dir, 'admin.sock')
+        const server = await startAdminServer({ runtime: fakeRuntime([]), drivers: new Map(), listen: { socketPath }, metrics: async () => ({}), revokeCapability: async () => undefined, cookies })
+        cleanups.push(() => server.close())
+        // A site's cookies can exceed the 64 KiB admin body limit.
+        const large = { host: 'example.com', cookies: [{ value: 'v'.repeat(200 * 1024) }] }
+
+        expect(await call({ socketPath }, 'POST', '/admin/cookies/set', {}, large)).toEqual({ status: 200, body: { ok: true, result: { host: 'example.com', imported: 1, skipped: 0 } } })
+        expect(await call({ socketPath }, 'GET', '/admin/cookies')).toEqual({ status: 200, body: { ok: true, result: { imports: await cookies.list() } } })
+        expect((await call({ socketPath }, 'POST', '/admin/cookies/remove', {}, { host: 'example.com' })).body.result).toEqual({ host: 'example.com', removed: 1, failed: 0 })
+        expect(seen).toEqual([large, 'example.com'])
+
+        const plainPath = join(dir, 'plain.sock')
+        const plain = await startAdminServer({ runtime: fakeRuntime([]), drivers: new Map(), listen: { socketPath: plainPath }, metrics: async () => ({}), revokeCapability: async () => undefined })
+        cleanups.push(() => plain.close())
+        expect((await call({ socketPath: plainPath }, 'GET', '/admin/cookies')).status).toBe(404)
+        expect((await call({ socketPath: plainPath }, 'POST', '/admin/cookies/set', {}, { host: 'example.com' })).status).toBe(404)
+    })
 })
 
 describe('collectRuntimeMetrics', () => {
