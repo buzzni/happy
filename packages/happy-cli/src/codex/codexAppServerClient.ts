@@ -2066,7 +2066,7 @@ export class CodexAppServerClient {
             baseInstructions: null,
             developerInstructions,
             persistExtendedHistory: true,
-            // Only the thread identity is read; inlined history can outgrow one output line on long threads.
+            // Only id, path and model are read; inlined history can outgrow one output line on long threads.
             excludeTurns: true,
         };
 
@@ -2230,7 +2230,8 @@ export class CodexAppServerClient {
             try {
                 page = await this.request('thread/turns/list', params) as typeof page;
             } catch (error) {
-                if (cursor !== null) throw error;
+                // Any other failure must not retry as the oversized whole-thread read.
+                if (cursor !== null || !(error instanceof Error && error.message.includes('unknown variant `thread/turns/list`'))) throw error;
                 return (await this.readThread({ threadId, includeTurns: true })).thread.turns ?? [];
             }
             turns.push(...page.data);

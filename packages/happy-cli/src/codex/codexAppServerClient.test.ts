@@ -2018,6 +2018,25 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('does not fall back to a whole-thread read when turn paging fails for another reason', async () => {
+        const requests: MockRpcMessage[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                if (msg.id == null || msg.method === 'initialize') return;
+                requests.push(msg);
+                setTimeout(() => pushJsonLine(stdout, { id: msg.id, error: { code: -32603, message: 'internal error' } }), 0);
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+
+        await expect(client.readThreadTurns('thread-long')).rejects.toThrow('internal error');
+        expect(requests.map(({ method }) => method)).toEqual(['thread/turns/list']);
+
+        await client.disconnect();
+    });
+
     it('logs why the output stream failed', async () => {
         let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
         mockSpawn.mockImplementation(() => createMockProcess({
