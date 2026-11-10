@@ -1016,6 +1016,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             let providerEnded = false;
             /** Aborted with `providerEnded`: an input wait this generation left behind frees the queue's single waiter slot. */
             const generationEnded = new AbortController();
+            /** Capacity refused the authority this process holds: end it once this generation ends with nothing waiting. */
+            let capacityRestart = false;
             const capacityHeartbeat = setInterval(() => queueCapacity(() => capacity.heartbeat()), 15000);
             capacityHeartbeat.unref();
             const admitTurn = async (message: { channelRequestId?: string; mode?: EnhancedMode } | null) => {
@@ -1067,7 +1069,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     // same way. End it once nothing waits: the next message starts a new one that resolves the account.
                     if (isProcessBoundCapacityRefusal(error) && !pending && session.queue.size() === 0) {
                         launchFailure = `${launchFailure} ${CAPACITY_RESTART_NOTICE}`;
-                        exitReason = 'exit';
+                        capacityRestart = true;
                     }
                     if (message) {
                         messageQueue.enqueue(pendingRequestItem(message.channelRequestId ?? null));
@@ -1704,7 +1706,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     personalFallback?.noteOrganizationAuthentication(true);
                     setupTokenSwitching?.onAuthenticationFailure(isClaudeRevokedTokenFailure(authenticationError));
                 }
-                if (!exitReason) {
+                if (!exitReason && !capacityRestart) {
                     // Reported after `finally` has flushed what the run already produced, so the
                     // failure is the last thing in the turn and closes it exactly once.
                     if (e instanceof PersonalClaudeRecheckRequired) { launchFailure = PERSONAL_RECHECK_NOTICE; }
@@ -1780,6 +1782,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 await messageQueue.flush();
                 messageQueue.destroy();
                 logger.debug('[remote]: message queue flushed');
+                // After the last await: input that arrived while this generation ended runs first and is refused
+                // (and answered) the same way, which ends the process then.
+                if (capacityRestart && !exitReason && !pending && session.queue.size() === 0) exitReason = 'exit';
                 if (launchFailure) {
                     session.client.sendSessionEvent({ type: 'message', message: launchFailure, isError: true });
                     // A launch that died before its first message opened no turn; this opens one if needed.

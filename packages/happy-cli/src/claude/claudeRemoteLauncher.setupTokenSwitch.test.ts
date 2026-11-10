@@ -278,6 +278,26 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
         }
     });
+    it('answers a message that arrives while the refused generation ends before ending this process', async () => {
+        try {
+            const session = capacityRefusedSession('CAPACITY_HTTP_403');
+            const actor = { companyId: 'org-a', machineId: 'pc-a', sessionId: session.client.sessionId,
+                requestId: randomUUID(), contentHash: createHash('sha256').update('two').digest('hex'), proof: 'signed.proof' };
+            // Delivered after the refusal of 'hello' was decided, while its generation is still reporting it.
+            const setPendingTurnRequestId = vi.fn(() => {
+                if (setPendingTurnRequestId.mock.calls.length === 1) session.queue.push('two', { permissionMode: 'default', setupTokenCapacityActor: actor });
+            });
+            Object.assign(session.client, { setPendingTurnRequestId, failClaudeLaunchTurn: vi.fn() });
+            await expect(claudeRemoteLauncher(session as unknown as Session)).resolves.toBe('exit');
+            expect(session.queue.size()).toBe(0);
+            expect(session.client.failClaudeLaunchTurn).toHaveBeenCalledTimes(2);
+            expect(vi.mocked(requestSetupTokenCapacity).mock.calls.filter(([, , operation, refused]) =>
+                operation === 'reserve' && refused.contentHash === actor.contentHash)).toHaveLength(1);
+        } finally {
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED;
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
+        }
+    });
     it('keeps this process after a capacity refusal that the same authority may pass later', async () => {
         try {
             const session = capacityRefusedSession('CAPACITY_UNAVAILABLE');
