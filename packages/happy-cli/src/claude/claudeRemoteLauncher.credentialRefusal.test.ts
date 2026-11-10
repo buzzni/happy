@@ -23,13 +23,14 @@ const textOf = (message: SDKUserMessage) => typeof message.message.content === '
     : message.message.content.map(block => block.type === 'text' ? block.text : '').join('');
 
 /** An old conversation (it has a Claude session id) whose provider the account check may refuse. */
-function harness(launches: Array<'refuse' | 'refuse-delivered' | 'refuse-policy' | 'answer'>) {
+function harness(launches: Array<'refuse' | 'refuse-delivered' | 'refuse-policy' | 'refuse-queued' | 'refuse-steer' | 'answer'>) {
     const queue = new MessageQueue2<EnhancedMode>(hashObject);
-    const handlers = new Map<string, () => Promise<unknown>>();
+    const handlers = new Map<string, (params?: Record<string, unknown>) => Promise<unknown>>();
     const received: string[] = [];
+    const steers: unknown[] = [];
     const client = {
         sessionId: 'happy-session-1',
-        rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+        rpcHandlerManager: { registerHandler: (name: string, handler: (params?: Record<string, unknown>) => Promise<unknown>) => handlers.set(name, handler) },
         updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
         setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
         setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
@@ -41,8 +42,20 @@ function harness(launches: Array<'refuse' | 'refuse-delivered' | 'refuse-policy'
         const kind = launches[Math.min(launch++, launches.length - 1)];
         return Object.assign((async function* () {
             if (kind === 'refuse-policy') throw new ClaudeAuthNotVerifiedError(ORGANIZATION_CLAUDE_AUTH_FAILURE, 'recheck', 'policy', true);
+            // Input the user sent while the refused provider was still starting.
+            if (kind === 'refuse-queued') queue.push('second', MODE);
+            if (kind === 'refuse-steer') {
+                // The turn's request reached Claude; the account recheck then refuses the steer that follows it.
+                yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+                const input = (prompt as AsyncIterable<SDKUserMessage>)[Symbol.asyncIterator]();
+                received.push(textOf((await input.next()).value as SDKUserMessage));
+                yield answer;
+                steers.push(await handlers.get('steer')!({ text: 'more' }));
+                await input.next();
+                throw new ClaudeAuthNotVerifiedError(ORGANIZATION_CLAUDE_AUTH_FAILURE, 'recheck', 'timeout', true);
+            }
             if (kind !== 'answer') {
-                throw new ClaudeAuthNotVerifiedError(ORGANIZATION_CLAUDE_AUTH_FAILURE, 'initialize', 'timeout', kind === 'refuse');
+                throw new ClaudeAuthNotVerifiedError(ORGANIZATION_CLAUDE_AUTH_FAILURE, 'initialize', 'timeout', kind !== 'refuse-delivered');
             }
             yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
             for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
@@ -62,7 +75,7 @@ function harness(launches: Array<'refuse' | 'refuse-delivered' | 'refuse-policy'
         consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
     };
     const errors = () => client.sendSessionEvent.mock.calls.map(([event]) => event).filter(event => event.isError);
-    return { session: session as unknown as Session, client, handlers, received, errors };
+    return { session: session as unknown as Session, client, handlers, received, steers, errors };
 }
 
 describe('organization account check refusals in the remote launcher', () => {
@@ -76,6 +89,28 @@ describe('organization account check refusals in the remote launcher', () => {
         expect(h.received).toEqual(['hello']);
         expect(h.errors()).toEqual([]);
         expect(h.client.failClaudeLaunchTurn).not.toHaveBeenCalled();
+    });
+
+    it('sends a held request before input queued during the refusal', async () => {
+        const h = harness(['refuse-queued', 'answer']);
+
+        await expect(claudeRemoteLauncher(h.session)).resolves.toBe('switch');
+
+        expect(query).toHaveBeenCalledTimes(2);
+        expect(h.received).toEqual(['hello']);
+        expect(h.errors()).toEqual([]);
+        expect(h.client.failClaudeLaunchTurn).not.toHaveBeenCalled();
+    });
+
+    it('reports a refused steer instead of sending the request Claude already received again', async () => {
+        const h = harness(['refuse-steer', 'answer']);
+        const launched = claudeRemoteLauncher(h.session);
+        try {
+            await vi.waitFor(() => expect(h.client.failClaudeLaunchTurn).toHaveBeenCalledTimes(1));
+            expect(h.steers).toEqual([{ success: true }]);
+            expect(query).toHaveBeenCalledTimes(1);
+            expect(h.received).toEqual(['hello']);
+        } finally { await h.handlers.get('switch')?.(); await launched; }
     });
 
     it('reports the failure and ends this process when the retried request is held back again', async () => {
