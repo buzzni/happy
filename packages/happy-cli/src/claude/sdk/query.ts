@@ -104,6 +104,9 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
     // No fallback in an endpoint session: it has no second model, and the SDK refuses a fallback equal to the main model
     // (which folding produces whenever the endpoint maps no tiers) by not creating the query at all.
     if (env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint') sdkOptions.fallbackModel = undefined
+    // Outside an endpoint the two can still meet: a stored fallback migrates onto the same successor as the main model
+    // (claude-fable-5-1 → claude-fable-5-2). Run without a fallback rather than have the SDK refuse the query.
+    if (sdkOptions.fallbackModel && sdkOptions.fallbackModel === sdkOptions.model) sdkOptions.fallbackModel = undefined
 
     // Map canCallTool -> canUseTool
     if (opts?.canCallTool) {

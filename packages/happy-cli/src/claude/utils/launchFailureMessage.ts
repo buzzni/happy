@@ -8,9 +8,12 @@ export const ORG_ENDPOINT_CLAUDE_AUTH_FAILURE = 'CLAUDE_ORG_ENDPOINT_NOT_VERIFIE
 export type ClaudeAuthCheckStage = 'initialize' | 'settings' | 'apply' | 'recheck';
 export type ClaudeAuthCheckReason = 'timeout' | 'unsupported' | 'mismatch' | 'policy' | 'control_failed';
 
-/** A sanitized pinned-credential refusal: the message stays the code; only fixed values say where and why. */
+/**
+ * A sanitized pinned-credential refusal: the message stays the code; only fixed values say where and why.
+ * `requestHeld`: the refused request never reached Claude, so sending it again cannot duplicate it.
+ */
 export class ClaudeAuthNotVerifiedError extends Error {
-    constructor(code: string, readonly stage: ClaudeAuthCheckStage, readonly reason: ClaudeAuthCheckReason) { super(code); }
+    constructor(code: string, readonly stage: ClaudeAuthCheckStage, readonly reason: ClaudeAuthCheckReason, readonly requestHeld = false) { super(code); }
 }
 
 /**
@@ -22,6 +25,17 @@ export class ClaudeAuthNotVerifiedError extends Error {
 export const CLAUDE_STARTUP_TIMEOUT_NOTICE = 'Claude Code took too long to start on this machine, so the request was not sent. The account was not rejected. '
     + 'Send again; if this repeats, check this project\'s SessionStart hooks.';
 export const CLAUDE_AUTH_CHECK_TIMEOUT_NOTICE = 'Claude Code did not answer the account check in time, so the request was not sent. The account was not rejected. Send again.';
+/** Appended when a held request was refused again on its automatic resend and the session process ends. */
+export const ORGANIZATION_CLAUDE_AUTH_RESTART_NOTICE = 'This conversation was stopped on this machine so that the next message restarts it; its history is kept.';
+
+/**
+ * An organization account check refused a request Claude never received. An administrator's policy is not
+ * retried: it refuses again until the administrator changes it.
+ */
+export function isHeldOrganizationRefusal(error: unknown): error is ClaudeAuthNotVerifiedError {
+    return error instanceof ClaudeAuthNotVerifiedError && error.message === ORGANIZATION_CLAUDE_AUTH_FAILURE
+        && error.requestHeld && error.reason !== 'policy';
+}
 
 export function describeClaudeLaunchFailure(error: unknown): string {
     if (error instanceof ClaudeAuthNotVerifiedError && error.reason === 'timeout') {

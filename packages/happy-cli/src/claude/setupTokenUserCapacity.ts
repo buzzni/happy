@@ -40,7 +40,8 @@ export function createSetupTokenCapacityRuntime(deps: {
   }
   const send = (entry: Entry, operation: string, extra?: Record<string, unknown>, signal?: AbortSignal) => deps.request(operation, entry.actor, entry.runtimeId, { ...extra, attempt: entry.attempt ?? 0 }, signal)
   async function save(entry: Entry) {
-    const pending = (writes.get(entry) ?? Promise.resolve()).then(() => write(entry))
+    // After the previous write whatever its outcome: one failed write must not fail every later one.
+    const pending = (writes.get(entry) ?? Promise.resolve()).catch(() => undefined).then(() => write(entry))
     writes.set(entry, pending)
     return pending
   }
@@ -59,7 +60,7 @@ export function createSetupTokenCapacityRuntime(deps: {
     }
   }
   async function report(entry: Entry, operation: string, extra: Record<string, unknown> = {}) {
-    // After the previous report whatever its outcome: one failed report must not fail every later one.
+    // Same isolation as save(): a failed heartbeat must not fail the delivery and finish reports after it.
     const pending = (reports.get(entry) ?? Promise.resolve()).catch(() => undefined).then(async () => {
       const seq = ++entry.seq; await save(entry)
       return send(entry, operation, { ...extra, seq })

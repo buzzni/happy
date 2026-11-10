@@ -79,6 +79,17 @@ export function describeUnsavedWorktreeChanges(porcelainStatus: string): string[
     .map((line) => line.slice(3).trim());
 }
 
+/**
+ * 보관해야 할 새 파일들. 무시 목록(에이전트 산출물·node_modules 등)은 빠진다.
+ * 입력은 `git ls-files --others --exclude-standard -z` 출력이다 — `git status` 는 한글·따옴표·탭이
+ * 든 이름을 C 따옴표로 감싸 내놓아, 그 문자열로는 파일을 찾지 못하고 보관이 실패한다.
+ */
+export function unsavedUntrackedPaths(untrackedFiles: string): string[] {
+  return untrackedFiles
+    .split('\0')
+    .filter((path) => path.length > 0 && !isIgnorableEntry(`?? ${path}`));
+}
+
 function unsavedEntries(porcelainStatus: string): string[] {
   // A lockfile-only change can be an intentional resolution update even when
   // package.json is unchanged. Preserve it unless its generated content is known.

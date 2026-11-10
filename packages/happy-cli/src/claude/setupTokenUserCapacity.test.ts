@@ -1,4 +1,4 @@
-import { mkdtemp, rm, readdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, readdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
@@ -133,5 +133,39 @@ it('sends later reports of a run after one of its reports failed, and releases t
   await runtime.heartbeat()
   await runtime.providerStopped(true)
   expect(request.mock.calls.map(call => call[0])).toEqual(['reserve', 'claim', 'delivery', 'heartbeat', 'heartbeat', 'finish'])
+  expect(runtime.hasActive()).toBe(false)
+})
+// A journal write that failed once (full disk, permission, fsync) failed every later write of the run, so it never reported finish.
+it('writes the journal again after one of its writes failed, and releases the run', async () => {
+  const dir = await directory()
+  const request = vi.fn(async (operation: string, _actor: unknown, _runtime: string, extra?: Record<string, unknown>) => operation === 'reserve'
+    ? { state: 'reserved', managedAccountId: 'a', credentialGeneration: 1, epoch: 1, validForMs: 15000 }
+    : { state: operation === 'claim' ? 'claimed' : operation === 'finish' ? 'finished' : String(extra?.deliveryState) })
+  const runtime = createSetupTokenCapacityRuntime({ directory: dir, request, notify: () => {}, move: async () => false })
+  await runtime.admit(actor, new AbortController().signal)
+  // A directory in place of the journal file makes the next journal write fail.
+  const journal = join(dir, (await readdir(dir)).find(name => /^[a-f0-9]{64}\.json$/.test(name))!)
+  await rm(journal); await mkdir(journal)
+  await expect(runtime.result({ type: 'result', subtype: 'success', result: 'done' }, true)).rejects.toThrow()
+  await rm(journal, { recursive: true })
+  await runtime.idle()
+  expect(request.mock.calls.map(call => call[0])).toEqual(['reserve', 'claim', 'delivery', 'finish'])
+  expect(runtime.hasActive()).toBe(false)
+  expect(JSON.parse(await readFile(journal, 'utf8'))).toMatchObject({ phase: 'finished' })
+})
+// A heartbeat report that failed once (dropped connection, journal write) failed every later report, so finish never left.
+it('still reports finish after one heartbeat report failed, and releases the run', async () => {
+  let heartbeats = 0
+  const request = vi.fn(async (operation: string, _actor: unknown, _runtime: string, extra?: Record<string, unknown>) => {
+    if (operation === 'heartbeat' && heartbeats++ === 0) throw new Error('ECONNRESET')
+    return operation === 'reserve'
+      ? { state: 'reserved', managedAccountId: 'a', credentialGeneration: 1, epoch: 1, validForMs: 15000 }
+      : { state: operation === 'claim' ? 'claimed' : operation === 'finish' ? 'finished' : String(extra?.deliveryState ?? operation) }
+  })
+  const runtime = createSetupTokenCapacityRuntime({ directory: await directory(), request, notify: () => {}, move: async () => false })
+  await runtime.admit(actor, new AbortController().signal)
+  await expect(runtime.heartbeat()).rejects.toThrow('ECONNRESET')
+  await runtime.result({ type: 'result', subtype: 'success', result: 'done' }, false)
+  expect(request.mock.calls.map(call => call[0])).toEqual(['reserve', 'claim', 'delivery', 'heartbeat', 'delivery', 'finish'])
   expect(runtime.hasActive()).toBe(false)
 })

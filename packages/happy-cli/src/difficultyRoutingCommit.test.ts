@@ -316,9 +316,9 @@ describe('boundary escalation through the committer (R4)', () => {
     // and the escalation it just earned is skipped.
     const revised = committer.commitApplied(['waited'], 'exec-e')
 
-    expect(revised).toEqual({ model: 'claude-fable-5-1', effort: 'medium' })
+    expect(revised).toEqual({ model: 'claude-fable-5-2', effort: 'medium' })
     expect(committer.current().base).toMatchObject({ difficulty: 'hard', model: 'claude-opus-5' })
-    expect(resultOf(emitted.at(-1)!)).toMatchObject({ model: 'claude-fable-5-1', difficulty: 'escalated' })
+    expect(resultOf(emitted.at(-1)!)).toMatchObject({ model: 'claude-fable-5-2', difficulty: 'escalated' })
   })
 })
 
@@ -349,7 +349,7 @@ describe('applied event accuracy at the boundary (R4, R8)', () => {
     committer.commitApplied(['waited'], 'exec-e')
 
     expect(resultOf(emitted.at(-1)!)).toMatchObject({
-      model: 'claude-fable-5-1',
+      model: 'claude-fable-5-2',
       difficulty: 'escalated',
       temporaryEscalation: true,
       baseRoute: { difficulty: 'hard', model: 'claude-opus-5', effort: 'high' },
@@ -399,7 +399,7 @@ describe('applied event accuracy at the boundary (R4, R8)', () => {
     expect(resultOf(emitted.at(-1)!)).toMatchObject({
       model: 'claude-opus-5',
       temporaryEscalation: false,
-      previousApplied: { model: 'claude-fable-5-1', difficulty: 'escalated' },
+      previousApplied: { model: 'claude-fable-5-2', difficulty: 'escalated' },
     })
   })
 
@@ -412,7 +412,7 @@ describe('applied event accuracy at the boundary (R4, R8)', () => {
     committer.recordPending(recordPendingDecision(committer.current(), hard('again')))
     const revised = committer.commitApplied(['again'], 'exec-again')
 
-    expect(revised).toEqual({ model: 'claude-fable-5-1', effort: 'medium' })
+    expect(revised).toEqual({ model: 'claude-fable-5-2', effort: 'medium' })
     expect(committer.current().base).toMatchObject({ difficulty: 'hard', model: 'claude-opus-5' })
   })
 

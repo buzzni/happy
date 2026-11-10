@@ -375,7 +375,8 @@ describe('difficulty routing runtime', () => {
     expect(asDecision(decision).pending.decisionReasons).toContain('sticky-floor-maintained')
   })
 
-  it('retains the exact supported base pair even when its catalog tier changes', async () => {
+  // Fable 5.2 교체(2026-11-10): 은퇴한 Fable id 만 후속 모델로 옮기고 tier·effort 는 그대로 이어 간다.
+  it('retains the supported base pair across a tier change, moving a retired Fable id to its successor', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
     const decision = await resolveDifficultyRouting({
       ...baseInput,
@@ -384,9 +385,30 @@ describe('difficulty routing runtime', () => {
         provenance: 'engine-applied', policyVersion: 'prior-policy', policyRevision: 1, appliedAt: 1,
       } },
     })
-    expect(asDecision(decision).route.model).toBe('claude-fable-5-1')
-    expect(asDecision(decision).pending.base.model).toBe('claude-fable-5-1')
+    expect(asDecision(decision).route).toMatchObject({ model: 'claude-fable-5-2', effort: 'high' })
+    expect(asDecision(decision).pending.base).toMatchObject({ difficulty: 'hard', model: 'claude-fable-5-2', effort: 'high' })
     expect(asDecision(decision).pending.temporaryEscalation).toBe(false)
+  })
+
+  it('reads a model policy saved before Fable 5.2 as allowing its successor', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+      ...grantResponse(),
+      aiModelPolicy: {
+        source: 'organization',
+        allowedSelectionKeys: ['claude:claude-opus-5-5', 'claude:claude-fable-5-1'],
+        defaultSelectionKey: 'claude:claude-opus-5-5',
+      },
+    })))
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      state: { stateVersion: 2, revision: 3, base: {
+        difficulty: 'hard', model: 'claude-fable-5-1', effort: 'high',
+        provenance: 'engine-applied', policyVersion: 'prior-policy', policyRevision: 1, appliedAt: 1,
+      } },
+    })
+    expect(asDecision(decision).route).toMatchObject({ model: 'claude-fable-5-2', effort: 'high' })
+    // Read as forbidden, the policy would swap in its default (Opus 5.5) instead.
+    expect(asDecision(decision).pending.base).toMatchObject({ model: 'claude-fable-5-2', effort: 'high' })
   })
 
   it('does not silently replace an unsupported stored base with a cheaper catalog model', async () => {
@@ -511,7 +533,7 @@ describe('difficulty routing runtime', () => {
       state: { difficulty: 'hard', hardTurns: 3, updatedAt: Date.now() - 1000 },
     })
 
-    expect(asDecision(decision).route.model).toBe('claude-fable-5-1')
+    expect(asDecision(decision).route.model).toBe('claude-fable-5-2')
     expect(asDecision(decision).pending.temporaryEscalation).toBe(true)
     expect(asDecision(decision).pending.base).toMatchObject({ difficulty: 'hard', model: 'claude-opus-5-5' })
     expect(asDecision(decision).pending.decisionReasons).toContain('temporary-escalation')
@@ -1638,7 +1660,7 @@ describe('previous actual applied route on the wire (R8)', () => {
       ...baseInput,
       contentText: 'refactor the auth module',
       state: stateWith({
-        model: 'claude-fable-5-1',
+        model: 'claude-fable-5-2',
         effort: 'high',
         difficulty: 'escalated',
         kind: 'auto',
@@ -1649,7 +1671,7 @@ describe('previous actual applied route on the wire (R8)', () => {
     // The base underneath the escalation was opus; what actually ran was fable.
     expect(asDecision(decision).event.ev).toMatchObject({
       t: 'difficulty-routing',
-      result: { previousApplied: { model: 'claude-fable-5-1', effort: 'high', difficulty: 'escalated' } },
+      result: { previousApplied: { model: 'claude-fable-5-2', effort: 'high', difficulty: 'escalated' } },
     })
   })
 
@@ -1728,7 +1750,7 @@ describe('org allowlist written before a table change', () => {
   // floor, so the whole conversation would stay there.
   it('shouldSubstituteAtThePairTheModelRanForTheRoutedTier (claude)', async () => {
     vi.stubGlobal('fetch', allowlistFetch(
-      ['claude:claude-haiku-4-5', 'claude:claude-opus-5-5', 'claude:claude-fable-5-1'],
+      ['claude:claude-haiku-4-5', 'claude:claude-opus-5-5', 'claude:claude-fable-5-2'],
       'claude:claude-opus-5-5',
     ))
 

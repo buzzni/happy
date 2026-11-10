@@ -15,7 +15,7 @@ describe('difficulty routing policy parity snapshot', () => {
         trivial: { model: 'claude-haiku-5-5', effort: 'low' },
         routine: { model: 'claude-sonnet-5-5', effort: 'medium' },
         hard: { model: 'claude-opus-5-5', effort: 'high' },
-        escalated: { model: 'claude-fable-5-1', effort: 'medium' },
+        escalated: { model: 'claude-fable-5-2', effort: 'medium' },
       },
       codex: {
         trivial: { model: 'gpt-6-luna', effort: 'low' },
@@ -66,6 +66,11 @@ describe('difficulty routing policy parity snapshot', () => {
   })
 
   it('reads both claude escalated efforts as escalated', () => {
+    expect(tierForKnownRoutePair('claude', 'claude-fable-5-2', 'medium')).toBe('escalated')
+    expect(tierForKnownRoutePair('claude', 'claude-fable-5-2', 'high')).toBe('escalated')
+  })
+
+  it('still reads the retired Fable 5.1 escalated pairs as escalated', () => {
     expect(tierForKnownRoutePair('claude', 'claude-fable-5-1', 'medium')).toBe('escalated')
     expect(tierForKnownRoutePair('claude', 'claude-fable-5-1', 'high')).toBe('escalated')
   })
@@ -113,7 +118,7 @@ describe('difficulty routing policy parity snapshot', () => {
       routed: {
         ...routed,
         difficulty: 'escalated',
-        model: 'claude-fable-5-1',
+        model: 'claude-fable-5-2',
         effort: 'medium',
       },
       hardTurns: 3,

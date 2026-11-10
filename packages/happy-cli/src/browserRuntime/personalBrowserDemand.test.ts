@@ -1,7 +1,7 @@
 import { expect, it, vi } from 'vitest'
 import { CdpDriver } from './drivers/cdpDriver'
 import type { NativeBrowserSession } from './nativeBrowserSession'
-import { createPersonalBrowserDemand } from './personalBrowserDemand'
+import { createPersonalBrowserDemand, createPersonalBrowserIdleStop } from './personalBrowserDemand'
 
 function session() {
     let stopped!: (value: { terminated: boolean }) => void
@@ -74,6 +74,59 @@ it('closes a late start after shutdown and refuses unconfirmed process cleanup',
     await expect(blocked.start()).rejects.toThrow(/termination|confirmed/)
     expect(open).toHaveBeenCalledOnce()
     await blocked.close()
+})
+
+it('ends an idle lifetime through disconnect fencing once, and a later request starts a fresh browser', async () => {
+    const first = session(), second = session()
+    const open = vi.fn().mockResolvedValueOnce(first.value).mockResolvedValueOnce(second.value)
+    const demand = createPersonalBrowserDemand(open)
+    expect(await demand.stopIdle()).toBe(false)
+    await demand.start()
+    const retired = vi.fn(async () => {})
+    demand.onBrowserStopped(retired)
+    const stopping = demand.stopIdle()
+    // A request arriving during the stop waits for it instead of reusing the closing browser.
+    const next = demand.start()
+    expect(await stopping).toBe(true)
+    expect(first.value.close).toHaveBeenCalledOnce()
+    expect(await next).toBe(second.value)
+    expect(retired).toHaveBeenCalledOnce()
+    expect(open).toHaveBeenCalledTimes(2)
+    await demand.close()
+})
+
+it('does not stop a browser that is still starting', async () => {
+    const started = session()
+    let finish!: (value: NativeBrowserSession) => void
+    const demand = createPersonalBrowserDemand(() => new Promise(resolve => { finish = resolve }))
+    const pending = demand.start()
+    expect(await demand.stopIdle()).toBe(false)
+    finish(started.value)
+    expect(await pending).toBe(started.value)
+    expect(started.value.close).not.toHaveBeenCalled()
+    await demand.close()
+})
+
+it('stops only after the browser stayed unused for the whole idle period', async () => {
+    let now = 0, unused = true
+    const stop = vi.fn(async () => true)
+    const tick = createPersonalBrowserIdleStop({ idleMs: 60_000, now: () => now, unused: async () => unused, stop })
+    expect(await tick()).toBe(false)
+    now = 59_999
+    expect(await tick()).toBe(false)
+    unused = false
+    now = 60_000
+    expect(await tick()).toBe(false)
+    unused = true
+    now = 70_000
+    expect(await tick()).toBe(false)
+    now = 130_000
+    expect(await tick()).toBe(true)
+    expect(stop).toHaveBeenCalledOnce()
+    // The next lifetime counts its own idle period.
+    now = 140_000
+    expect(await tick()).toBe(false)
+    expect(stop).toHaveBeenCalledOnce()
 })
 
 it('keeps an unconfirmed startup cleanup blocked and can close without ever launching', async () => {

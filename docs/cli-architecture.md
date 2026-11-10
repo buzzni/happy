@@ -32,6 +32,15 @@ incarnation, dedicated profile and private-pipe checks. Protected/shared runtime
 retain their existing lifecycle. Revisit this boundary if browser start gains a
 second caller or the runtime exposes a public lifecycle command.
 
+A Mac Chrome started with `--no-startup-window` under a debugging pipe ignores
+the user's Quit (Dock, ⌘Q), so on macOS the personal browser opens its startup
+window and the session closes it before any tab is owned; Windows keeps opening
+none. A finished task leaves no window, so the runtime also ends a browser that
+stayed unused for 60 seconds (no open task space and no page, checked every 10
+seconds) through the same fencing path as the user's Quit; the next new task
+starts a fresh lifetime. Revisit the period if agents commonly leave a gap of
+more than a minute between closing one space and opening the next.
+
 `daemon/personalBrowserRuntime` verifies the issuer envelope against the installed
 runtime's public trust and waits until its signed issuance time before returning
 the command for dispatch. This tolerates an issuer slightly ahead of the local

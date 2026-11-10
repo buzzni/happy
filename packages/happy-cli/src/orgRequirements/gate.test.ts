@@ -174,6 +174,17 @@ describe('organization requirements session gate', () => {
             expect(gate.restrictsModels()).toBe(true);
         });
 
+        it('reads a policy saved before Fable 5.2 as allowing its successor', () => {
+            const gate = make();
+            const legacy = { 'ai.models': { kind: 'allowedSet', values: ['claude:claude-opus-5-5', 'claude:claude-fable-5-1'], default: 'claude:claude-fable-5-1', source: 'organization' } };
+            gate.onRequirements({ kind: 'response', status: 'ok', requirements: doc(legacy) });
+            expect(gate.checkTurn({ permissionMode: 'default', model: 'claude-fable-5-1', modelOrigin: 'explicit', fallbackModel: 'claude-fable-5-1' }))
+                .toMatchObject({ kind: 'run', dropFallbackModel: false });
+            expect(gate.checkTurn({ permissionMode: 'default', model: undefined, modelOrigin: 'none' }))
+                .toMatchObject({ kind: 'run', substituteModel: 'claude-fable-5-2' });
+            expect(gate.modelAllowed('claude-fable-5-2')).toBe(true);
+        });
+
         it('judges a model chosen after the check, as an explicit choice', () => {
             const gate = make();
             expect(gate.modelAllowed('claude-opus-5-5')).toBe(true);

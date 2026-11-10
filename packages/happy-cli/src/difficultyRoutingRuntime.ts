@@ -2,6 +2,7 @@ import tweetnacl from 'tweetnacl'
 import { createEnvelope, type SessionEnvelope } from '@slopus/happy-wire'
 import { configuration } from '@/configuration'
 import { logger } from '@/ui/logger'
+import { migrateRetiredClaudeModel, migrateRetiredSelectionKey } from '@/utils/retiredClaudeModels'
 import { decodeBase64, encodeBase64, getRandomBytes } from '@/api/encryption'
 import {
   DIFFICULTY_ROUTING_POLICY_VERSION,
@@ -455,7 +456,8 @@ function buildDecision(args: {
       logRoutingOutcome('decision-discarded', { reason: 'stored-base-pair-unsupported', clientRequestId })
       return { protect: 'keep-current', reason: 'stored-base-pair-unsupported' }
     }
-    baseRoute = { ...baseRoute, model: state.base.model, effort: state.base.effort }
+    // The pair is kept, except a model the catalog retired: it runs as its successor at the same effort.
+    baseRoute = { ...baseRoute, model: migrateRetiredClaudeModel(state.base.model), effort: state.base.effort }
   }
   const escalated = resolveEscalation(input.agent, prompt, baseRoute, {
     hardTurns: priorHardTurns,
@@ -1106,15 +1108,15 @@ function isModelAllowedByAiPolicy(
   model: string,
 ): boolean {
   if (policy.allowedSelectionKeys === null) return true
-  return policy.allowedSelectionKeys.includes(`${agent}:${model}`)
+  const key = migrateRetiredSelectionKey(`${agent}:${model}`)
+  return policy.allowedSelectionKeys.some((allowed) => migrateRetiredSelectionKey(allowed) === key)
 }
 
 function defaultModelForAgent(policy: DifficultyRoutingAiModelPolicy, agent: RoutableAgent): string | null {
   if (!policy.defaultSelectionKey) return null
   const prefix = `${agent}:`
-  return policy.defaultSelectionKey.startsWith(prefix)
-    ? policy.defaultSelectionKey.slice(prefix.length)
-    : null
+  const key = migrateRetiredSelectionKey(policy.defaultSelectionKey)
+  return key.startsWith(prefix) ? key.slice(prefix.length) : null
 }
 
 function hasManualModelOverride(meta: Record<string, unknown> | undefined): boolean {
