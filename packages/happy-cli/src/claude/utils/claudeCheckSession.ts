@@ -11,14 +11,21 @@ function someLine(file: string, matches: (line: string, index: number) => boolea
     try {
         const buffer = Buffer.alloc(64 * 1024);
         const decoder = new StringDecoder('utf8');
-        let pending = '';
+        // The unfinished line's pieces, joined once it ends: re-splitting it on every read is quadratic in its length.
+        let parts: string[] = [];
         let index = 0;
         for (let read; (read = readSync(fd, buffer, 0, buffer.length, null)) > 0;) {
-            const lines = (pending + decoder.write(buffer.subarray(0, read))).split('\n');
-            pending = lines.pop()!;
-            for (const line of lines) if (matches(line, index++)) return true;
+            const text = decoder.write(buffer.subarray(0, read));
+            let start = 0;
+            for (let newline; (newline = text.indexOf('\n', start)) >= 0; start = newline + 1) {
+                parts.push(text.slice(start, newline));
+                const line = parts.join('');
+                parts = [];
+                if (matches(line, index++)) return true;
+            }
+            parts.push(text.slice(start));
         }
-        return matches(pending + decoder.end(), index);
+        return matches(parts.join('') + decoder.end(), index);
     } finally {
         closeSync(fd);
     }
