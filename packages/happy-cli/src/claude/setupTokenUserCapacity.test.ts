@@ -137,3 +137,19 @@ it('writes the journal again after one of its writes failed, and releases the ru
   expect(runtime.hasActive()).toBe(false)
   expect(JSON.parse(await readFile(journal, 'utf8'))).toMatchObject({ phase: 'finished' })
 })
+// A heartbeat report that failed once (dropped connection, journal write) failed every later report, so finish never left.
+it('still reports finish after one heartbeat report failed, and releases the run', async () => {
+  let heartbeats = 0
+  const request = vi.fn(async (operation: string, _actor: unknown, _runtime: string, extra?: Record<string, unknown>) => {
+    if (operation === 'heartbeat' && heartbeats++ === 0) throw new Error('ECONNRESET')
+    return operation === 'reserve'
+      ? { state: 'reserved', managedAccountId: 'a', credentialGeneration: 1, epoch: 1, validForMs: 15000 }
+      : { state: operation === 'claim' ? 'claimed' : operation === 'finish' ? 'finished' : String(extra?.deliveryState ?? operation) }
+  })
+  const runtime = createSetupTokenCapacityRuntime({ directory: await directory(), request, notify: () => {}, move: async () => false })
+  await runtime.admit(actor, new AbortController().signal)
+  await expect(runtime.heartbeat()).rejects.toThrow('ECONNRESET')
+  await runtime.result({ type: 'result', subtype: 'success', result: 'done' }, false)
+  expect(request.mock.calls.map(call => call[0])).toEqual(['reserve', 'claim', 'delivery', 'heartbeat', 'delivery', 'finish'])
+  expect(runtime.hasActive()).toBe(false)
+})
