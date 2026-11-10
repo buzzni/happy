@@ -2067,7 +2067,14 @@ export class CodexAppServerClient {
             persistExtendedHistory: true,
         };
 
-        const result = await this.request('thread/resume', params) as ResumeConversationResponse;
+        const result = await this.request('thread/resume', params).catch(async (error: unknown) => {
+            // Another client on the same CODEX_HOME (e.g. the Codex app) can archive the thread, and Codex
+            // refuses to resume an archived thread. Continuing the conversation means it is wanted again.
+            if (!(error instanceof Error && /\bis archived\b/.test(error.message))) throw error;
+            logger.debug(`[CodexAppServer] Unarchiving thread ${threadId} before resuming it`);
+            await this.request('thread/unarchive', { threadId });
+            return this.request('thread/resume', params);
+        }) as ResumeConversationResponse;
         this._threadId = result.thread.id;
         this.pointSubagentsAtMainThread();
         this.rememberNativeThreadMetadata(result.thread);
