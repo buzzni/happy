@@ -145,6 +145,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     let exitReason: 'switch' | 'exit' | null = null;
     let abortController: AbortController | null = null;
     let launchFailure: string | null = null;
+    /** Capacity refused the authority this process holds; the generation's end decides whether the process ends. */
+    let capacityRestartWanted = false;
     let abortFuture: Future<void> | null = null;
     let activeInputSender: ClaudeActiveInputSender | null = null;
     let pending: CollectedBatch<EnhancedMode> | null = null;
@@ -1063,12 +1065,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     if (controller.signal.aborted || generationEnded.signal.aborted) return false;
                     // A later turn's rejection never reaches the launch catch (claudeRemote ends the input), so report it here.
                     launchFailure = describeClaudeLaunchFailure(error);
-                    // This process holds the refused authority in its environment, so every later turn is refused the
-                    // same way. End it once nothing waits: the next message starts a new one that resolves the account.
-                    if (isProcessBoundCapacityRefusal(error) && !pending && session.queue.size() === 0) {
-                        launchFailure = `${launchFailure} ${CAPACITY_RESTART_NOTICE}`;
-                        exitReason = 'exit';
-                    }
+                    // Decided when this generation ends, not here: input can still arrive while it tears down.
+                    if (isProcessBoundCapacityRefusal(error)) capacityRestartWanted = true;
                     if (message) {
                         messageQueue.enqueue(pendingRequestItem(message.channelRequestId ?? null));
                         if (message.channelRequestId) messageQueue.enqueue(finalAnswerItem(launchFailure));
@@ -1780,6 +1778,16 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 await messageQueue.flush();
                 messageQueue.destroy();
                 logger.debug('[remote]: message queue flushed');
+                if (capacityRestartWanted) {
+                    capacityRestartWanted = false;
+                    // This process holds the refused authority in its environment, so every later turn is refused the
+                    // same way. End it once nothing waits: the next message starts a new one that resolves the account.
+                    // Input that arrived meanwhile keeps it for one more generation, which admits (and reports) that input.
+                    if (!exitReason && !pending && session.queue.size() === 0) {
+                        launchFailure = launchFailure ? `${launchFailure} ${CAPACITY_RESTART_NOTICE}` : CAPACITY_RESTART_NOTICE;
+                        exitReason = 'exit';
+                    }
+                }
                 if (launchFailure) {
                     session.client.sendSessionEvent({ type: 'message', message: launchFailure, isError: true });
                     // A launch that died before its first message opened no turn; this opens one if needed.
