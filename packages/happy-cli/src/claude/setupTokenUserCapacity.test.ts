@@ -1,4 +1,4 @@
-import { mkdtemp, rm, readdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, readdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
@@ -118,4 +118,22 @@ it('restores a result cached just before a journal crash without submitting the 
   request.mockClear()
   expect(await createSetupTokenCapacityRuntime(deps).admit(actor, new AbortController().signal)).toMatchObject({ state: 'result', result: { result: 'durable answer' } })
   expect(request.mock.calls.every(call => call[0] === 'lost')).toBe(true)
+})
+// A journal write that failed once (full disk, permission, fsync) failed every later write of the run, so it never reported finish.
+it('writes the journal again after one of its writes failed, and releases the run', async () => {
+  const dir = await directory()
+  const request = vi.fn(async (operation: string, _actor: unknown, _runtime: string, extra?: Record<string, unknown>) => operation === 'reserve'
+    ? { state: 'reserved', managedAccountId: 'a', credentialGeneration: 1, epoch: 1, validForMs: 15000 }
+    : { state: operation === 'claim' ? 'claimed' : operation === 'finish' ? 'finished' : String(extra?.deliveryState) })
+  const runtime = createSetupTokenCapacityRuntime({ directory: dir, request, notify: () => {}, move: async () => false })
+  await runtime.admit(actor, new AbortController().signal)
+  // A directory in place of the journal file makes the next journal write fail.
+  const journal = join(dir, (await readdir(dir)).find(name => /^[a-f0-9]{64}\.json$/.test(name))!)
+  await rm(journal); await mkdir(journal)
+  await expect(runtime.result({ type: 'result', subtype: 'success', result: 'done' }, true)).rejects.toThrow()
+  await rm(journal, { recursive: true })
+  await runtime.idle()
+  expect(request.mock.calls.map(call => call[0])).toEqual(['reserve', 'claim', 'delivery', 'finish'])
+  expect(runtime.hasActive()).toBe(false)
+  expect(JSON.parse(await readFile(journal, 'utf8'))).toMatchObject({ phase: 'finished' })
 })

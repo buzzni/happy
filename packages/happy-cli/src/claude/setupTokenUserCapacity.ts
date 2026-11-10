@@ -40,7 +40,8 @@ export function createSetupTokenCapacityRuntime(deps: {
   }
   const send = (entry: Entry, operation: string, extra?: Record<string, unknown>, signal?: AbortSignal) => deps.request(operation, entry.actor, entry.runtimeId, { ...extra, attempt: entry.attempt ?? 0 }, signal)
   async function save(entry: Entry) {
-    const pending = (writes.get(entry) ?? Promise.resolve()).then(() => write(entry))
+    // After the previous write whatever its outcome: one failed write must not fail every later one.
+    const pending = (writes.get(entry) ?? Promise.resolve()).catch(() => undefined).then(() => write(entry))
     writes.set(entry, pending)
     return pending
   }
