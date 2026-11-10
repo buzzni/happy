@@ -27,6 +27,17 @@ export const CLAUDE_STARTUP_TIMEOUT_NOTICE = 'Claude Code took too long to start
 export const CLAUDE_AUTH_CHECK_TIMEOUT_NOTICE = 'Claude Code did not answer the account check in time, so the request was not sent. The account was not rejected. Send again.';
 /** Appended when a held request was refused again on its automatic resend and the session process ends. */
 export const ORGANIZATION_CLAUDE_AUTH_RESTART_NOTICE = 'This conversation was stopped on this machine so that the next message restarts it; its history is kept.';
+/** Appended when a capacity refusal ends the session process (see isProcessBoundCapacityRefusal). */
+export const CAPACITY_RESTART_NOTICE = '이 PC에서 대화 실행을 다시 시작하도록 멈췄습니다. 다음 메시지를 보내면 바뀐 계정 설정으로 다시 시작하며, 대화 기록은 유지됩니다.';
+
+/**
+ * Capacity refused the authority this process holds in its environment (the PC's organization assignment, its
+ * account or credential generation changed). The same process is refused every time; a new one resolves again.
+ */
+export function isProcessBoundCapacityRefusal(error: unknown): boolean {
+    return error instanceof Error
+        && /^CAPACITY_(HTTP_401|HTTP_403|STALE_BINDING|BINDING_FORBIDDEN|GENERATION_CHANGED)$/.test(error.message);
+}
 
 /**
  * An organization account check refused a request Claude never received. An administrator's policy is not

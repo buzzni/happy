@@ -17,7 +17,7 @@ import { requestSetupTokenCapacity, requestSetupTokenStart, requestSetupTokenReb
 import { APPLY_REQUIRED_NOTICE, CONTINUE_PROMPT, RESUME_REBOUND_NOTICE, START_BUDGET_SWITCHED_NOTICE, SWITCHED_NOTICE } from './setupTokenAccountSwitching';
 import { PERSONAL_RECHECK_NOTICE } from './personalClaudeFallback';
 import { claudeCheckSession } from './utils/claudeCheckSession';
-import { describeClaudeLaunchFailure } from './utils/launchFailureMessage';
+import { CAPACITY_RESTART_NOTICE, describeClaudeLaunchFailure } from './utils/launchFailureMessage';
 
 vi.mock('@anthropic-ai/claude-agent-sdk', async (original) => ({
     ...await original<typeof import('@anthropic-ai/claude-agent-sdk')>(),
@@ -287,6 +287,107 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             expect(inputs).not.toHaveBeenCalled();
             expect(query).not.toHaveBeenCalled();
             expect(session.client.failClaudeLaunchTurn).toHaveBeenCalledOnce();
+        } finally {
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED;
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
+        }
+    });
+    // 2026-11-10: the PC's organization assignment was removed. Every running conversation kept the old authority in
+    // its environment and failed each message with CAPACITY_HTTP_403 until its process was killed by hand.
+    const capacityActor = (text: string) => ({ companyId: 'org-a', machineId: 'pc-a', sessionId: 'happy-session-1',
+        requestId: randomUUID(), contentHash: createHash('sha256').update(text).digest('hex'), proof: 'signed.proof' });
+    const actorMode = (actor: ReturnType<typeof capacityActor>): EnhancedMode => ({ permissionMode: 'default', setupTokenCapacityActor: actor });
+    function capacityRefusedSession(reason: string) {
+        const session = sharedSessionFixture(vi.fn());
+        session.queue.queue.length = 0;
+        session.queue.push('hello', actorMode(capacityActor('hello')));
+        vi.mocked(requestSetupTokenCapacity).mockRejectedValue(new Error(reason));
+        return session;
+    }
+    const refusedRequestIds = () => vi.mocked(requestSetupTokenCapacity).mock.calls.map(call => (call[3] as { requestId: string }).requestId);
+    it('admits input that arrives while a refused generation ends, and ends the process after refusing it', async () => {
+        try {
+            const session = capacityRefusedSession('CAPACITY_HTTP_403');
+            session.client.failClaudeLaunchTurn = vi.fn();
+            const second = capacityActor('second');
+            // Flushing the refused turn's pending request is part of the generation's teardown.
+            session.client.setPendingTurnRequestId = vi.fn(() => {
+                if (session.queue.size() === 0 && !refusedRequestIds().includes(second.requestId)) session.queue.push('second', actorMode(second));
+            });
+            await expect(claudeRemoteLauncher(session as unknown as Session)).resolves.toBe('exit');
+            expect(refusedRequestIds()).toContain(second.requestId);
+            expect(session.queue.size()).toBe(0);
+            expect(session.client.failClaudeLaunchTurn).toHaveBeenCalledTimes(2);
+        } finally {
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED;
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
+        }
+    });
+    it('refuses each queued input once before ending the process', async () => {
+        try {
+            const session = capacityRefusedSession('CAPACITY_HTTP_403');
+            session.client.failClaudeLaunchTurn = vi.fn();
+            session.queue.push('second', actorMode(capacityActor('second')));
+            await expect(claudeRemoteLauncher(session as unknown as Session)).resolves.toBe('exit');
+            expect(session.queue.size()).toBe(0);
+            expect(session.client.failClaudeLaunchTurn).toHaveBeenCalledTimes(2);
+            expect(session.client.sendSessionEvent.mock.calls.filter(([event]) => event.message?.includes(CAPACITY_RESTART_NOTICE))).toHaveLength(1);
+        } finally {
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED;
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
+        }
+    });
+    it('ends a running conversation whose next input is refused after the PC assignment changed', async () => {
+        try {
+            const inputs = vi.fn();
+            const session = sharedSessionFixture(inputs);
+            session.client.failClaudeLaunchTurn = vi.fn();
+            const second = capacityActor('second');
+            session.queue.queue.length = 0;
+            session.queue.push('hello', actorMode(capacityActor('hello')));
+            vi.mocked(requestSetupTokenCapacity).mockImplementation(async (_session, _binding, operation, actor, _runtime, extra) => {
+                if ((actor as { requestId: string }).requestId === second.requestId) throw new Error('CAPACITY_HTTP_403');
+                if (operation === 'reserve') return { state: 'reserved', managedAccountId: '00000000-0000-4000-8000-00000000000a', credentialGeneration: 1, epoch: 1, validForMs: 15000 };
+                return { state: operation === 'claim' ? 'claimed' : operation === 'finish' ? 'finished' : String(extra?.deliveryState) };
+            });
+            vi.mocked(query).mockImplementation(({ prompt }) => Object.assign((async function* () {
+                yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+                for await (const _message of prompt as AsyncIterable<SDKUserMessage>) {
+                    inputs();
+                    yield assistant('msg-1');
+                    yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: 'result-1' };
+                    session.queue.push('second', actorMode(second));
+                }
+            })(), { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>);
+            await expect(claudeRemoteLauncher(session as unknown as Session)).resolves.toBe('exit');
+            expect(inputs).toHaveBeenCalledOnce();
+            expect(session.client.failClaudeLaunchTurn).toHaveBeenCalledOnce();
+            expect(session.client.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+                isError: true, message: expect.stringContaining(CAPACITY_RESTART_NOTICE) }));
+        } finally {
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED;
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
+        }
+    });
+    it.each(['CAPACITY_HTTP_403', 'CAPACITY_STALE_BINDING'])('ends this process after a %s refusal so the next message resolves the account again', async (reason) => {
+        try {
+            const session = capacityRefusedSession(reason);
+            await expect(claudeRemoteLauncher(session as unknown as Session)).resolves.toBe('exit');
+            expect(query).not.toHaveBeenCalled();
+            expect(session.client.failClaudeLaunchTurn).toHaveBeenCalledOnce();
+            expect(session.client.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+                isError: true, message: expect.stringContaining(CAPACITY_RESTART_NOTICE) }));
+        } finally {
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED;
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
+        }
+    });
+    it('keeps this process after a capacity refusal that the same authority may pass later', async () => {
+        try {
+            const session = capacityRefusedSession('CAPACITY_UNAVAILABLE');
+            await expect(claudeRemoteLauncher(session as unknown as Session)).resolves.toBe('switch');
+            expect(session.client.sendSessionEvent).not.toHaveBeenCalledWith(expect.objectContaining({
+                message: expect.stringContaining(CAPACITY_RESTART_NOTICE) }));
         } finally {
             delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED;
             delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
