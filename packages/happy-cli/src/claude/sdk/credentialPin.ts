@@ -107,8 +107,9 @@ function pinQuery(
     const fail = (stage: ClaudeAuthCheckStage, reason: ClaudeAuthCheckReason): never => {
         throw new ClaudeAuthNotVerifiedError(failureCode, stage, reason);
     };
-    const diagnosis = (error: unknown, stage: ClaudeAuthCheckStage) => error instanceof ClaudeAuthNotVerifiedError
-        ? error : new ClaudeAuthNotVerifiedError(failureCode, stage, 'control_failed');
+    const diagnosis = (error: unknown, stage: ClaudeAuthCheckStage, requestHeld = false) => error instanceof ClaudeAuthNotVerifiedError
+        ? (requestHeld && !error.requestHeld ? new ClaudeAuthNotVerifiedError(failureCode, error.stage, error.reason, true) : error)
+        : new ClaudeAuthNotVerifiedError(failureCode, stage, 'control_failed', requestHeld);
     let response: Query;
     let loggedRefusal: Error | undefined;
     let rejectFailure!: (error: Error) => void;
@@ -126,7 +127,7 @@ function pinQuery(
         try { response.close(); } catch { /* already closed */ }
         throw error;
     }
-    async function checked() { try { await verify(); } catch (error) { refuse(undefined, diagnosis(error, 'recheck')); } }
+    async function checked(requestHeld = false) { try { await verify(); } catch (error) { refuse(undefined, diagnosis(error, 'recheck', requestHeld)); } }
     async function control<T>(stage: ClaudeAuthCheckStage, call: () => Promise<T>, timeoutMs = CONTROL_TIMEOUT_MS): Promise<T> {
         if (signal?.aborted) fail(stage, 'control_failed');
         const began = Date.now();
@@ -185,11 +186,12 @@ function pinQuery(
                 ? (async function* () { yield { type: 'user' as const, parent_tool_use_id: null, message: { role: 'user' as const, content: params.prompt as string } }; })()
                 : params.prompt;
             readingInput = true;
-            for await (const message of input) { await checked(); yield message; }
+            // Every refusal in this generator comes before its request is yielded: the request is held.
+            for await (const message of input) { await checked(true); yield message; }
         } catch (error) {
             // Only trusted input-producer errors retain their identity (authority refusal/abort).
             // Control errors are sanitized by checked() or by this initialization catch.
-            refuse(readingInput && error instanceof Error ? error : undefined, diagnosis(error, 'initialize'));
+            refuse(readingInput && error instanceof Error ? error : undefined, diagnosis(error, 'initialize', true));
         }
     }
     response = create({ prompt: guardedInput(), options: {
