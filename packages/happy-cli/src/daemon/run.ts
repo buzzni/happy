@@ -1325,6 +1325,9 @@ export async function startDaemon(): Promise<void> {
     // idle guard's grace window — an adopted session keeps its real age, so it
     // can be reap-eligible the instant it is adopted.
     const pidToAdoptedAt = new Map<number, number>();
+    // Session a stop signal was sent to, keyed by PID, until that process exits.
+    // An exiting process still reports, and must not be adopted back.
+    const pidToStoppedSessionId = new Map<number, string>();
     const deadSessionsToCleanup: PersistedTrackedSession[] = [];
 
     // Read once and share: session recovery, the orphan home-dir sweep and the
@@ -1756,6 +1759,7 @@ export async function startDaemon(): Promise<void> {
         persistedSessions: readPersistedSessions(),
         isPidAlive,
         trackedPidOwner: (pid) => resolveTrackedPidOwner(pidToTrackedSession.get(pid)),
+        stoppedPidOwner: (pid) => pidToStoppedSessionId.get(pid),
         now: Date.now(),
       });
 
@@ -4129,9 +4133,12 @@ export async function startDaemon(): Promise<void> {
             return { stopped: false, reason: 'standalone-drain', detail: 'native-exit-pending' };
           }
 
+          // Only a process that was actually signalled is on its way out; one the
+          // signal missed keeps running and must stay adoptable.
+          let signalSent = false;
           if (session.startedBy === 'daemon' && session.childProcess) {
             try {
-              session.childProcess.kill('SIGTERM');
+              signalSent = session.childProcess.kill('SIGTERM');
               logger.debug(`[DAEMON RUN] Sent SIGTERM to daemon-spawned session ${sessionId}`);
             } catch (error) {
               logger.debug(`[DAEMON RUN] Failed to kill session ${sessionId}:`, error);
@@ -4140,12 +4147,14 @@ export async function startDaemon(): Promise<void> {
             // For externally started sessions, try to kill by PID
             try {
               process.kill(pid, 'SIGTERM');
+              signalSent = true;
               logger.debug(`[DAEMON RUN] Sent SIGTERM to external session PID ${pid}`);
             } catch (error) {
               logger.debug(`[DAEMON RUN] Failed to kill external session PID ${pid}:`, error);
             }
           }
 
+          if (signalSent && session.happySessionId) pidToStoppedSessionId.set(pid, session.happySessionId);
           pidToTrackedSession.delete(pid);
           recoveredPendingSpawnStartedAt.delete(pid);
           sessionStartTimes.delete(pid);
@@ -4229,6 +4238,7 @@ export async function startDaemon(): Promise<void> {
       recoveredPendingSpawnStartedAt.delete(pid);
       sessionStartTimes.delete(pid);
       pidToAdoptedAt.delete(pid);
+      pidToStoppedSessionId.delete(pid);
       if (tracked?.happySessionId) resumeCursorPersistedAt.delete(tracked.happySessionId);
       persistTrackedSessions();
       const heldAttention = tracked?.happySessionId ? heldBrowserAttentions.take(tracked.happySessionId) : undefined;
@@ -6356,6 +6366,10 @@ export async function startDaemon(): Promise<void> {
           logger.debug(`[DAEMON RUN] Removing stale session with PID ${pid} (process no longer exists)`);
           onChildExited(pid);
         }
+      }
+      // Externally started sessions have no exit event to clear their entry.
+      for (const pid of pidToStoppedSessionId.keys()) {
+        if (!isPidAlive(pid)) pidToStoppedSessionId.delete(pid);
       }
 
       // Reclaim sessions whose runtime stopped reporting entirely (dead process
