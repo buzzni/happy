@@ -827,4 +827,24 @@ describe('file RPCs for a folder the machine owner approved', () => {
         await expect(handlers.get('readWorkspaceFile')?.({ workspaceRoot: project, path: join(project, 'README.md') })).resolves.toMatchObject({ success: false });
         await expect(handlers.get('writeWorkspaceFile')?.({ workspaceRoot: project, path: join(project, 'other.md'), content: 'eA==', expectedHash: null })).resolves.toMatchObject({ success: false });
     });
+
+    // The discovery worker reads only on macOS (fileDiscovery.ts).
+    it.skipIf(process.platform !== 'darwin')('searches file contents under an approved folder, until revoked', async () => {
+        const outside = await mkdtemp(join(tmpdir(), 'happy-approved-discovery-'));
+        temporaryDirectories.push(outside);
+        const project = join(outside, 'hmall_ui');
+        await mkdir(project);
+        await writeFile(join(project, 'README.md'), 'needle');
+
+        let approved: string[] = [outside];
+        const { handlers } = await createHandlers(undefined, { approvedRoots: () => approved });
+        await expect(handlers.get('file-discovery')?.({ version: 1, operation: 'search', root: project, query: 'needle' })).resolves.toMatchObject({
+            success: true, matches: [{ path: 'README.md', line: 1, text: 'needle' }],
+        });
+
+        approved = [];
+        await expect(handlers.get('file-discovery')?.({ version: 1, operation: 'search', root: project, query: 'needle' })).resolves.toMatchObject({
+            success: false, error: 'outside-root',
+        });
+    });
 });

@@ -625,7 +625,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         const encloses = (folder: string) => root === resolve(folder) || root.startsWith(resolve(folder) + sep);
         return encloses(workingDirectory) ? workingDirectory : options.approvedRoots?.().find(encloses) ?? workingDirectory;
     };
-    rpcHandlerManager.registerHandler('file-discovery', (request: unknown) => fileDiscovery(workingDirectory, request));
+    rpcHandlerManager.registerHandler('file-discovery', (request: unknown) => fileDiscovery(workspaceAnchor((request as { root?: unknown } | null)?.root), request));
     const bashScheduler = createBashRpcScheduler();
     const bashEnvBoundary = options.childEnvBoundary ?? 'session';
     const rawMachineRunHandler = createTypedMachineRunHandler(workingDirectory, { admitSubprocess });
