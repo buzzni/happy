@@ -1193,8 +1193,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     /**
      * One reclamation pass: spaces marked for reclamation, and (with spaceIdleReclaimMs)
      * spaces whose tasks are all finished and that saw no activity for that long, are
-     * closed tab by tab. A task with an unknown write outcome keeps its space for the user;
-     * a tab blocking unload stays open and is reported. Passes are serialized.
+     * closed tab by tab. A task with an unknown write outcome keeps its space for the user
+     * while the space still has a tab (its record stays either way); a tab blocking unload stays open and is reported. Passes are serialized.
      */
     reclaimSpaces(): Promise<SpaceReclaimReport[]> {
         const run = this.reclaimTail.then(() => this.reclaimPass(), () => this.reclaimPass())
@@ -1258,7 +1258,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     }
     /**
      * Operator close (admin socket): cancels the space's tasks and closes it. A task with an
-     * unknown write outcome keeps the space unless `force` (its record stays for reconcile).
+     * unknown write outcome keeps a space that still has a tab unless `force` (its record stays for reconcile).
      */
     async closeSpaceAsOperator(taskSpaceId: TaskSpaceId, options: { force?: boolean } = {}): Promise<SpaceReclaimReport> {
         await this.recovery
@@ -1296,7 +1296,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             || (!FINISHED_STATUSES.has(task.status) && !task.uncertainActions.length)).map((task) => task.taskId)
         if (waiting.length)
             return { ...report, waiting }
-        if (retained.length && !force)
+        // A space is kept for the user only while it still has a tab to review; without one it would hold a slot forever.
+        if (retained.length && !force && space.tabs.length)
             return { ...report, retained }
         const blockedTabs: TabId[] = []
         const failedTabs: TabId[] = []
@@ -2075,8 +2076,11 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             return duplicate as {
                 closedTabs: TabId[]
             }
-        if (this.options.store.listTasks().some((task) => task.taskSpaceId === req.taskSpaceId && (!['succeeded', 'failed',
-            'cancelled'].includes(task.status) || this.workers.has(task.taskId))))
+        // A cancelled task with an unknown write outcome never finishes on its own; the user closing the space after
+        // the console's warning accepts that outcome (an agent never does). Its record stays for reconcile.
+        const userAccepts = auth.credential.kind === 'interactive'
+        if (this.options.store.listTasks().some((task) => task.taskSpaceId === req.taskSpaceId && (this.workers.has(task.taskId)
+            || !FINISHED_STATUSES.has(task.status) && !(userAccepts && task.cancelRequested && task.uncertainActions.length))))
             throw new BrowserRuntimeError('CONFLICT', 'Task space has non-terminal or in-flight tasks')
         if (space.tabs.some((tab) => this.isRetained(space, tab)))
             throw new BrowserRuntimeError('CONFLICT', 'Task space has a tab kept for the user')

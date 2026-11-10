@@ -190,6 +190,19 @@ describe('session-end reclamation', () => {
         await h.store.close()
     })
 
+    it('closes an ended session\'s space with no tabs left even when a write outcome is unknown, keeping the task record', async () => {
+        const h = await start(await tempDir(), undefined, { maxSpacesPerProfile: 1 })
+        const s = await h.openSpace()
+        await h.store.commit(s.taskId, { status: 'paused', pauseReason: 'cancelled-with-unknown-effect', cancelRequested: true, uncertainActions: ['w' as never] },
+            { type: 'state-changed', atMs: h.clock.now(), leaseEpoch: 0, data: {} })
+        // The tab is already gone (the browser was replaced): nothing is left in the space for the user to review.
+        await h.store.updateSpace(s.taskSpaceId, { tabs: [] })
+        await h.runtime.endSession('session-a')
+        expect(await h.runtime.reclaimSpaces()).toEqual([expect.objectContaining({ taskSpaceId: s.taskSpaceId, closed: true, reason: 'session-ended' })])
+        expect(h.store.getTask(s.taskId)).toMatchObject({ status: 'paused', uncertainActions: ['w'] })
+        await h.store.close()
+    })
+
     it('finishes the reclamation after a restart', async () => {
         const dir = await tempDir()
         const driver = new FakeBrowserDriver()
