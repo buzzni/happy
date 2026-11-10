@@ -151,6 +151,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     // A dequeued batch can still be awaiting lessons/checkpoints before the SDK write.
     let preparingBatch: CollectedBatch<EnhancedMode> | null = null;
     let lastCommittedBatch: CollectedBatch<EnhancedMode> | null = null;
+    /** A steer followed the last committed batch on the input stream: a refusal held back the steer, not that batch. */
+    let steeredSinceCommit = false;
 
     /**
      * This generation's SDK exit observer, reachable from the abort path.
@@ -260,6 +262,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             await messageQueue.flush(); // Bind against the transcript already emitted before writing again.
             const attempt = session.client.inputEvidence?.attempt('steer');
             try {
+                // Set before the write: the account recheck can refuse the steer before this call returns.
+                steeredSinceCommit = true;
                 if (!await activeInputSender?.(text)) {
                     attempt?.settle('rejected');
                     return { success: false, error: 'No active Claude turn' };
@@ -399,6 +403,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 ? session.client.inputEvidence.claimContinuation(batch.continuation) : batch.continuation;
             if (batch.continuation && !continuation) return false;
             lastCommittedBatch = batch;
+            steeredSinceCommit = false;
             messageQueue.enqueue(pendingRequestItem(batch.channelRequestId ?? null, {
                 inputs: batch.inputs ?? [], inputCount: batch.inputCount, continuation,
             }));
@@ -1195,7 +1200,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         if (providerOptionsStale()) return null;
                         // The next provider's first turn: ahead of anything the user queued meanwhile, and alone.
                         if (!providerRunning && continuation) {
-                            if (!pending && session.queue.size() === 0 && !session.queue.isClosed()) {
+                            // A held request never reached the transcript: input queued meanwhile waits behind it, not in its place.
+                            if (!pending && !session.queue.isClosed() && (heldRequest || session.queue.size() === 0)) {
                                 enqueueAccountContinuation(continuation);
                             }
                             continuation = null;
@@ -1323,7 +1329,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 }
                                 if (providerOptionsStale()) return null;
                                 if (!providerRunning && continuation) {
-                                    if (!pending && session.queue.size() === 0 && !session.queue.isClosed()) {
+                                    // A held request never reached the transcript: input queued meanwhile waits behind it, not in its place.
+                                    if (!pending && !session.queue.isClosed() && (heldRequest || session.queue.size() === 0)) {
                                         enqueueAccountContinuation(continuation);
                                     }
                                     continuation = null;
@@ -1695,7 +1702,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     // Reported after `finally` has flushed what the run already produced, so the
                     // failure is the last thing in the turn and closes it exactly once.
                     if (e instanceof PersonalClaudeRecheckRequired) { launchFailure = PERSONAL_RECHECK_NOTICE; }
-                    else if (isHeldOrganizationRefusal(e) && lastCommittedBatch && !lastTurnChannel && !controller.signal.aborted && (mode ?? lastTurnMode)) {
+                    else if (isHeldOrganizationRefusal(e) && lastCommittedBatch && !steeredSinceCommit && !lastTurnChannel && !controller.signal.aborted && (mode ?? lastTurnMode)) {
                         if (!heldRequestRetried) {
                             // Claude never received the request: a fresh provider sends it once more.
                             logger.debug(`[remote]: organization account check refused a held request (stage=${e.stage} reason=${e.reason}); sending it again`);
