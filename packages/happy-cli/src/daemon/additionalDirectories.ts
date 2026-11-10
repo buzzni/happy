@@ -52,17 +52,22 @@ export async function prepareAdditionalDirectories(input: {
   requested: readonly string[] | undefined
   primaryDirectory: string
   allowedRoot: string
+  /** Folders the machine owner approved outside it (modules/common/approvedFolders). */
+  approvedRoots?: readonly string[]
 }): Promise<{ accepted: string[]; skipped: AdditionalDirectorySkipCounts }> {
   if (!input.requested?.length) return { accepted: [], skipped: {} }
 
-  const [canonicalRoot, canonicalPrimary] = await Promise.all([
+  const [canonicalRoot, canonicalPrimary, ...canonicalApproved] = await Promise.all([
     fs.realpath(input.allowedRoot),
     fs.realpath(input.primaryDirectory),
+    // A revoked or missing approved folder simply stops counting.
+    ...(input.approvedRoots ?? []).map((root) => fs.realpath(root).catch(() => null)),
   ])
+  const canonicalRoots = [canonicalRoot, ...canonicalApproved.filter((root): root is string => root !== null)]
   const inspected = await Promise.all(input.requested.map(async (requested) => {
     try {
       const canonical = await fs.realpath(requested)
-      if (!isWithinRoot(canonicalRoot, canonical)) {
+      if (!canonicalRoots.some((root) => isWithinRoot(root, canonical))) {
         throw new Error('Additional directory violates the canonical boundary')
       }
       const entry = await fs.stat(canonical)
@@ -111,7 +116,7 @@ export async function prepareAdditionalDirectories(input: {
  */
 export async function reapplyAdditionalDirectoriesOnResume(
   env: Record<string, string>,
-  input: { requested: readonly string[]; primaryDirectory: string; allowedRoot: string },
+  input: { requested: readonly string[]; primaryDirectory: string; allowedRoot: string; approvedRoots?: readonly string[] },
 ): Promise<{ applied: boolean }> {
   try {
     const { accepted } = await prepareAdditionalDirectories(input)

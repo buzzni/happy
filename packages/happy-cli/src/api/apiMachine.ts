@@ -1108,7 +1108,7 @@ export class ApiMachineClient {
         );
         // aplus 4b-3 worktree: worktrees on a strict machine, run here from a server-issued ticket
         // and signed for the server. Customer lane only.
-        const worktreeOps = createWorktreeOpsHandlers({ machine: () => this.machine, allowedRoot, happyHomeDir: configuration.happyHomeDir,
+        const worktreeOps = createWorktreeOpsHandlers({ machine: () => this.machine, allowedRoot, approvedRoots: this.approvedRoots, happyHomeDir: configuration.happyHomeDir,
             ...(admitSubprocess ? { admitSubprocess } : {}),
             ...(reserveLegacyDispatch ? { reserveLegacyDispatch } : {}),
         });
@@ -1137,12 +1137,13 @@ export class ApiMachineClient {
         }
         this.rpcHandlerManager.registerHandler(
             'claude-session-transfer',
-            createClaudeSessionTransferHandler({ allowedRoot }),
+            createClaudeSessionTransferHandler({ allowedRoot, approvedRoots: this.approvedRoots }),
         );
         this.rpcHandlerManager.registerHandler(
             'codex-thread-transfer',
             createCodexThreadTransferHandler({
                 allowedRoot,
+                approvedRoots: this.approvedRoots,
                 codexHome: process.env.CODEX_HOME ?? join(homedir(), '.codex'),
                 readThreadPath: async (threadId) => withCodexAppServerClient(async (client) => {
                     const { thread } = await client.readThread({ threadId, includeTurns: false });

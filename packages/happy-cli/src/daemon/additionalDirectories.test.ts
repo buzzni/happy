@@ -90,6 +90,24 @@ describe('prepareAdditionalDirectories', () => {
     })).rejects.toThrow('canonical boundary')
   })
 
+  // aplus-dev-studio specs/approved-folder-roots R10.
+  it('accepts a directory in a folder the machine owner approved, and still refuses one beside it', async () => {
+    const allowedRoot = await mkdtemp(join(tmpdir(), 'happy-additional-home-'))
+    const approvedFolder = await mkdtemp(join(tmpdir(), 'happy-additional-approved-'))
+    const besideFolder = await mkdtemp(join(tmpdir(), 'happy-additional-beside-'))
+    const primaryDirectory = join(allowedRoot, 'primary')
+    const shared = join(approvedFolder, 'shared')
+    await mkdir(primaryDirectory)
+    await mkdir(shared)
+
+    await expect(prepareAdditionalDirectories({
+      requested: [shared], primaryDirectory, allowedRoot, approvedRoots: [approvedFolder],
+    })).resolves.toMatchObject({ accepted: [await realpath(shared)] })
+    await expect(prepareAdditionalDirectories({
+      requested: [besideFolder], primaryDirectory, allowedRoot, approvedRoots: [approvedFolder],
+    })).rejects.toThrow('canonical boundary')
+  })
+
   it('swaps the granted roots for the canonical current list on resume', async () => {
     const allowedRoot = await realpath(await mkdtemp(join(tmpdir(), 'happy-additional-resume-')))
     const primaryDirectory = join(allowedRoot, 'primary')

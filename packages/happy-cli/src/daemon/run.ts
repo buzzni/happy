@@ -2173,6 +2173,7 @@ export async function startDaemon(): Promise<void> {
           requested: options.additionalDirectories,
           primaryDirectory: directory,
           allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
+          approvedRoots: resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir)?.(),
         });
         let launchMcp: PreparedLaunchMcpServers | undefined;
         // Set once the managed environment is resolved; stays undefined for every selection but `org-endpoint`.
@@ -3604,6 +3605,7 @@ export async function startDaemon(): Promise<void> {
             requested: options.additionalDirectories,
             primaryDirectory: launch.cwd,
             allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
+            approvedRoots: resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir)?.(),
           });
           if (!reapplied.applied) {
             logger.debug(`[DAEMON RUN] Kept the granted additional directories for ${happySessionId}: the requested list was rejected`);
