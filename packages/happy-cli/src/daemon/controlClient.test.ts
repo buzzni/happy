@@ -297,3 +297,19 @@ it('names a capacity failure that never reached the daemon apart from one the da
     await expect(capacity()).rejects.toThrow('CAPACITY_UNAVAILABLE')
   } finally { fetchSpy.mockRestore() }
 })
+
+it('waits for the daemon to report a Studio that never answered instead of calling the daemon unreachable', async () => {
+  const actor = { companyId: 'org-a', machineId: 'pc-a', sessionId: 's', requestId: 'input-r', contentHash: 'a'.repeat(64), proof: 'signed.proof' }
+  const state = stateWithPid(process.pid)
+  mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state, raw: JSON.stringify(state) })
+  // Both sides run on one clock, 100x faster: the daemon starts its 15 s Studio timer only once the session's request reached it.
+  const timeout = AbortSignal.timeout.bind(AbortSignal)
+  const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockImplementation(ms => timeout(ms / 100))
+  const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) => new Promise((resolve, reject) => {
+    init?.signal?.addEventListener('abort', () => reject(init.signal?.reason))
+    AbortSignal.timeout(15000).addEventListener('abort', () => resolve(Response.json({ ok: false, reason: 'CAPACITY_STUDIO_TIMEOUT' })))
+  }))
+  try {
+    await expect(requestSetupTokenCapacity('s', 'binding', 'reserve', actor, 'runtime')).rejects.toThrow('CAPACITY_STUDIO_TIMEOUT')
+  } finally { fetchSpy.mockRestore(); timeoutSpy.mockRestore() }
+})
