@@ -290,7 +290,7 @@ import {
   removeGithubTriggerWorktree,
 } from './automations/githubTriggerWorktree';
 import { createGithubArtifactReclaimer } from './automations/githubWorktreeArtifactReclaim';
-import { pruneGithubWorktreeArchives } from './automations/githubWorktreeArchive';
+import { pruneGithubWorktreeArchives, restoreArchivedGithubWorktreeChanges } from './automations/githubWorktreeArchive';
 import {
   createGithubWorktreeTombstoneStore,
   readWorktreeHead,
@@ -3387,6 +3387,16 @@ export async function startDaemon(): Promise<void> {
         if (restoredWorktree.kind === 'recreated' && restoredWorktree.source === 'recorded-head') {
           // Owned again by the daemon: removed once no session works in it, even if this resume is refused below.
           githubWorktreeTombstones.markRestored({ worktreePath: restoredWorktree.worktreePath, directory: launch.cwd });
+          // A worktree kept dirty past its retention was archived before removal; without this the
+          // agent resumes in a clean tree while its transcript says the edits were made.
+          const worktreePath = restoredWorktree.worktreePath;
+          const archive = join(githubWorktreeArchiveRoot, basename(worktreePath));
+          await (admitSubprocess?.([worktreePath]) ?? Promise.resolve())
+            .then(() => restoreArchivedGithubWorktreeChanges({ archiveFrom: archive, worktreePath }))
+            .then(
+              restored => restored && logger.debug(`[DAEMON RUN] Put archived changes back into ${worktreePath}`),
+              error => logger.debug(`[DAEMON RUN] Archived changes for ${worktreePath} could not be put back; they remain in ${archive}: ${error instanceof Error ? error.message : error}`),
+            );
         }
 
         // After the restore: this resolves the session directory, which a
