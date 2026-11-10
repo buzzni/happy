@@ -1961,6 +1961,63 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('reads a long thread history one turn per output line', async () => {
+        const requests: MockRpcMessage[] = [];
+        const turns = ['turn-1', 'turn-2'].map(id => ({ id, items: [
+            { type: 'commandExecution', id: `exec-${id}`, command: 'cat big.log', aggregatedOutput: 'x'.repeat(5 * 1024 * 1024) },
+        ] }));
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                if (msg.id == null || msg.method === 'initialize') return;
+                requests.push(msg);
+                const result = msg.method === 'thread/read'
+                    ? { thread: { id: 'thread-long', turns } }
+                    : (() => {
+                        const start = Number(msg.params.cursor ?? 0);
+                        const data = turns.slice(start, start + msg.params.limit);
+                        const next = start + data.length;
+                        return { data, nextCursor: next < turns.length ? String(next) : null, backwardsCursor: null };
+                    })();
+                setTimeout(() => pushJsonLine(stdout, { id: msg.id, result }), 0);
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        client.setOutputStorageGate({ wait: async () => {}, onFailure: vi.fn() });
+        await client.connect();
+
+        const read = await client.readThreadTurns('thread-long');
+
+        expect(read.map(({ id }) => id)).toEqual(['turn-1', 'turn-2']);
+        expect(read[1].items[0]).toEqual(turns[1].items[0]);
+        expect(requests.map(({ method }) => method)).toEqual(['thread/turns/list', 'thread/turns/list']);
+        expect(requests[0].params).toEqual(expect.objectContaining({ threadId: 'thread-long', sortDirection: 'asc', itemsView: 'full' }));
+
+        await client.disconnect();
+    });
+
+    it('reads the whole thread when Codex cannot page turns', async () => {
+        const requests: MockRpcMessage[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                if (msg.id == null || msg.method === 'initialize') return;
+                requests.push(msg);
+                setTimeout(() => pushJsonLine(stdout, msg.method === 'thread/turns/list'
+                    ? { id: msg.id, error: { code: -32600, message: 'Invalid request: unknown variant `thread/turns/list`' } }
+                    : { id: msg.id, result: { thread: { id: 'thread-old', turns: [{ id: 'turn-1', items: [] }] } } }), 0);
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+
+        await expect(client.readThreadTurns('thread-old')).resolves.toEqual([{ id: 'turn-1', items: [] }]);
+        expect(requests.map(({ method }) => method)).toEqual(['thread/turns/list', 'thread/read']);
+        expect(requests[1].params).toEqual({ threadId: 'thread-old', includeTurns: true });
+
+        await client.disconnect();
+    });
+
     it('logs why the output stream failed', async () => {
         let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
         mockSpawn.mockImplementation(() => createMockProcess({

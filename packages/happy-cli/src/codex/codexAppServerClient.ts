@@ -50,6 +50,7 @@ import type {
     ThreadGoalClearParams,
     ThreadGoalClearResponse,
     Thread,
+    ThreadTurn,
     InterruptConversationParams,
     SteerConversationParams,
     ReviewDecision,
@@ -2214,6 +2215,28 @@ export class CodexAppServerClient {
             includeTurns: opts.includeTurns ?? true,
         };
         return await this.request('thread/read', params) as ReadConversationResponse;
+    }
+
+    /**
+     * Full history, oldest first, one turn per response: a whole-thread read arrives as a single output
+     * line and a long thread outgrows the reader's line limit. Codex without turn paging gets the whole read.
+     */
+    async readThreadTurns(threadId: string): Promise<ThreadTurn[]> {
+        const turns: ThreadTurn[] = [];
+        let cursor: string | null = null;
+        do {
+            const params = { threadId, cursor, limit: 1, sortDirection: 'asc', itemsView: 'full' };
+            let page: { data: ThreadTurn[]; nextCursor: string | null };
+            try {
+                page = await this.request('thread/turns/list', params) as typeof page;
+            } catch (error) {
+                if (cursor !== null) throw error;
+                return (await this.readThread({ threadId, includeTurns: true })).thread.turns ?? [];
+            }
+            turns.push(...page.data);
+            cursor = page.nextCursor;
+        } while (cursor);
+        return turns;
     }
 
     async listMcpServerStatus(opts: { threadId: string; serverNames?: string[]; measureServer?: <T>(action: () => Promise<T>) => Promise<T> }): Promise<ListMcpServerStatusResponse> {
