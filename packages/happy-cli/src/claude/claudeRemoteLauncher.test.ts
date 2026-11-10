@@ -45,7 +45,7 @@ describe('Claude model changes across provider restarts', () => {
 
     it.each(['model', 'effort', 'boundary-model', 'boundary-effort'] as const)('applies consecutive %s changes at the SDK boundary', async (field) => {
         const modes: EnhancedMode[] = field.endsWith('model')
-            ? ['claude-sonnet-5', 'claude-fable-5-1', 'claude-opus-5', 'claude-opus-5'].map(model => ({ permissionMode: 'default', model }))
+            ? ['claude-sonnet-5', 'claude-fable-5-2', 'claude-opus-5', 'claude-opus-5'].map(model => ({ permissionMode: 'default', model }))
             : ['low', 'high', 'medium', 'medium'].map(effort => ({ permissionMode: 'default', model: 'claude-opus-5', effort: effort as EnhancedMode['effort'] }));
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
         const handlers = new Map<string, () => Promise<unknown>>();
@@ -130,7 +130,7 @@ describe('Claude model changes across provider restarts', () => {
         // A provider with live background work does not exit when its input ends, so a restart
         // for new settings used to leave every later message unanswered until that work ended.
         const before: EnhancedMode = { permissionMode: 'default', model: 'claude-sonnet-5', effort: 'low', appendSystemPrompt: 'turn context A' };
-        const after: EnhancedMode = { ...before, model: 'claude-fable-5-1', effort: 'high', appendSystemPrompt: 'turn context B' };
+        const after: EnhancedMode = { ...before, model: 'claude-fable-5-2', effort: 'high', appendSystemPrompt: 'turn context B' };
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
         const handlers = new Map<string, () => Promise<unknown>>();
         const received: Array<{ text: unknown; generation: number }> = [];
@@ -191,15 +191,15 @@ describe('Claude model changes across provider restarts', () => {
             { text: 'turn-1', generation: 1 },
             { text: 'turn-2', generation: 2 },
         ]);
-        expect(engineChanges).toEqual([{ model: 'claude-fable-5-1' }, { effortLevel: 'high' }]);
+        expect(engineChanges).toEqual([{ model: 'claude-fable-5-2' }, { effortLevel: 'high' }]);
         // Once the work is done, the next message restarts the provider with every setting applied.
         expect(launches).toHaveLength(2);
-        expect(launches[1]).toMatchObject({ model: 'claude-fable-5-1', effort: 'high', systemPrompt: { append: expect.stringContaining('turn context B') } });
+        expect(launches[1]).toMatchObject({ model: 'claude-fable-5-2', effort: 'high', systemPrompt: { append: expect.stringContaining('turn context B') } });
     }, 15_000);
 
     it('tries a failed in-place model switch again on the next turn', async () => {
         const before: EnhancedMode = { permissionMode: 'default', model: 'claude-sonnet-5', appendSystemPrompt: 'turn context A' };
-        const after: EnhancedMode = { ...before, model: 'claude-fable-5-1', appendSystemPrompt: 'turn context B' };
+        const after: EnhancedMode = { ...before, model: 'claude-fable-5-2', appendSystemPrompt: 'turn context B' };
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
         const handlers = new Map<string, () => Promise<unknown>>();
         const received: string[] = [];
@@ -243,7 +243,7 @@ describe('Claude model changes across provider restarts', () => {
         await claudeRemoteLauncher(session);
         // The failed switch still answers, and the next turn asks for the model again.
         expect(received).toEqual(['turn-0', 'turn-1', 'turn-2']);
-        expect(setModel.mock.calls).toEqual([['claude-fable-5-1'], ['claude-fable-5-1']]);
+        expect(setModel.mock.calls).toEqual([['claude-fable-5-2'], ['claude-fable-5-2']]);
     });
 
     it.each([

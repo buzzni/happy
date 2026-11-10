@@ -28,6 +28,7 @@ import { isToolPolicyEnabled } from '@/toolPolicy/claudeHook';
 import { createOrgRequirementsAuditLog, type OrgRequirementsAuditRecord } from './audit';
 import {
     clampPermissionMode,
+    currentAllowedModels,
     judgeModel,
     normalizeModelSelection,
     permissionModeRank,
@@ -306,7 +307,7 @@ export function createOrgRequirementsGate(options: {
             let dropFallbackModel = false;
             if (allowed && input.fallbackModel) {
                 const key = normalizeModelSelection(agent, input.fallbackModel);
-                if (key === null || !allowed.values.includes(key)) {
+                if (key === null || !currentAllowedModels(allowed).values.includes(key)) {
                     dropFallbackModel = true;
                     enforce('ai.models', input.fallbackModel, null, 'requirement_fallback_removed', true);
                 }

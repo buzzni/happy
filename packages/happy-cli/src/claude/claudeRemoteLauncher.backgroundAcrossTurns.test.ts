@@ -68,7 +68,7 @@ describe('background work across the turns of one Claude process', () => {
         ['background command', SERVER, SERVER_RUNNING],
     ] as const)('keeps a running %s listed and answers in place every message it outlives', async (_work, task, running) => {
         const before: EnhancedMode = { permissionMode: 'default', model: 'claude-sonnet-5' };
-        const after: EnhancedMode = { ...before, model: 'claude-fable-5-1' };
+        const after: EnhancedMode = { ...before, model: 'claude-fable-5-2' };
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
         const handlers = new Map<string, () => Promise<unknown>>();
         const { client, current } = recordingClient('work-across-turns', handlers);
@@ -111,9 +111,9 @@ describe('background work across the turns of one Claude process', () => {
             { text: 'turn-2', generation: 1 },
             { text: 'turn-3', generation: 2 },
         ]);
-        expect.soft(engineChanges).toEqual([{ model: 'claude-fable-5-1' }]);
+        expect.soft(engineChanges).toEqual([{ model: 'claude-fable-5-2' }]);
         expect.soft(launches).toHaveLength(2);
-        expect.soft(launches[1]).toMatchObject({ model: 'claude-fable-5-1' });
+        expect.soft(launches[1]).toMatchObject({ model: 'claude-fable-5-2' });
     }, 15_000);
 
     it('starts every provider process from an unknown list, even when the last one ended with work listed', async () => {
@@ -159,7 +159,7 @@ describe('background work across the turns of one Claude process', () => {
 
     it('without background work the list stays unknown across turns and a settings change still restarts', async () => {
         const before: EnhancedMode = { permissionMode: 'default', model: 'claude-sonnet-5' };
-        const after: EnhancedMode = { ...before, model: 'claude-fable-5-1' };
+        const after: EnhancedMode = { ...before, model: 'claude-fable-5-2' };
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
         const handlers = new Map<string, () => Promise<unknown>>();
         const { client, published, current } = recordingClient('no-background-work', handlers);
@@ -199,7 +199,7 @@ describe('background work across the turns of one Claude process', () => {
             expect.objectContaining({ ...UNKNOWN, available: false }),
         ]);
         expect(engineChanges).toEqual([]);
-        expect(launches[1]).toMatchObject({ model: 'claude-fable-5-1' });
+        expect(launches[1]).toMatchObject({ model: 'claude-fable-5-2' });
     }, 15_000);
 
     it('starts the turn after the work ended from an unknown list, not from the empty one', async () => {

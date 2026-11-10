@@ -287,7 +287,7 @@ describe('commitAppliedRouting', () => {
   it('shouldCommitTheBaseTierNotTheTemporarilyEscalatedOne', () => {
     const queued = recordPendingDecision(normalizeRoutingSessionState(undefined, 'claude'), pending({
       selectedDifficulty: 'escalated',
-      selected: { model: 'claude-fable-5-1', effort: 'high' },
+      selected: { model: 'claude-fable-5-2', effort: 'high' },
       base: { difficulty: 'hard', model: 'claude-opus-5', effort: 'high' },
       temporaryEscalation: true,
       hardTurns: 3,
@@ -298,7 +298,7 @@ describe('commitAppliedRouting', () => {
       executionId: 'exec-1',
       now: NOW,
     })
-    expect(applied?.selected.model).toBe('claude-fable-5-1')
+    expect(applied?.selected.model).toBe('claude-fable-5-2')
     expect(state.base).toMatchObject({ difficulty: 'hard', model: 'claude-opus-5', effort: 'high' })
   })
 
@@ -489,7 +489,7 @@ describe('stale queued decisions at the engine boundary (R7)', () => {
     const escalatedTurn = pending({
       clientRequestId: 'esc',
       selectedDifficulty: 'escalated',
-      selected: { model: 'claude-fable-5-1', effort: 'high' },
+      selected: { model: 'claude-fable-5-2', effort: 'high' },
       temporaryEscalation: true,
     })
 
@@ -963,14 +963,14 @@ describe('previous actual applied route (R8)', () => {
     const state = commitAppliedRouting(
       recordPendingDecision(normalizeRoutingSessionState(undefined, 'claude'), pending({
         selectedDifficulty: 'escalated',
-        selected: { model: 'claude-fable-5-1', effort: 'high' },
+        selected: { model: 'claude-fable-5-2', effort: 'high' },
         base: { difficulty: 'hard', model: 'claude-opus-5', effort: 'high' },
         temporaryEscalation: true,
       })),
       { clientRequestIds: ['req-1'], executionId: 'exec-1', now: NOW },
     ).state
 
-    expect(state.lastAppliedRoute).toMatchObject({ model: 'claude-fable-5-1', difficulty: 'escalated' })
+    expect(state.lastAppliedRoute).toMatchObject({ model: 'claude-fable-5-2', difficulty: 'escalated' })
     expect(state.base?.model).toBe('claude-opus-5')
   })
 
@@ -1075,7 +1075,7 @@ describe('stale re-escalation judgement at the engine boundary (R4, R7)', () => 
 
     const revised = resolveEngineBoundaryRoute(state, hardTurn('waited'), 'claude', NOW)
 
-    expect(revised).toMatchObject({ model: 'claude-fable-5-1', difficulty: 'escalated' })
+    expect(revised).toMatchObject({ model: 'claude-fable-5-2', difficulty: 'escalated' })
     expect(revised?.reasons).toContain('temporary-escalation')
   })
 
@@ -1090,7 +1090,7 @@ describe('stale re-escalation judgement at the engine boundary (R4, R7)', () => 
     })
 
     expect(after.state.base).toMatchObject({ difficulty: 'hard', model: 'claude-opus-5' })
-    expect(after.state.lastAppliedRoute).toMatchObject({ model: 'claude-fable-5-1', difficulty: 'escalated' })
+    expect(after.state.lastAppliedRoute).toMatchObject({ model: 'claude-fable-5-2', difficulty: 'escalated' })
     expect(after.state.lastEscalatedExecutionId).toBe('exec-e')
   })
 
@@ -1112,7 +1112,7 @@ describe('stale re-escalation judgement at the engine boundary (R4, R7)', () => 
   it('shouldNotEscalateATurnThatIsAlreadyEscalated', () => {
     const already = hardTurn('already', {
       selectedDifficulty: 'escalated',
-      selected: { model: 'claude-fable-5-1', effort: 'high' },
+      selected: { model: 'claude-fable-5-2', effort: 'high' },
       temporaryEscalation: true,
     })
 
@@ -1148,7 +1148,7 @@ describe('stale re-escalation judgement at the engine boundary (R4, R7)', () => 
     })
 
     expect(resolveEngineBoundaryRoute(recordPendingDecision(state, staleCheap), staleCheap, 'claude', NOW))
-      .toMatchObject({ model: 'claude-fable-5-1', difficulty: 'escalated' })
+      .toMatchObject({ model: 'claude-fable-5-2', difficulty: 'escalated' })
   })
 })
 
