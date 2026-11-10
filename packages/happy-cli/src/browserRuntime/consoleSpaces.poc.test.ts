@@ -42,7 +42,7 @@ describe.skipIf(!findChrome())('console spaces panel (real Chrome, fake Runtime)
             req.on('end', () => {
                 const result = m[1] === 'listSpaces' ? {
                     quota: { used: 2, reclaimingReserve: 0, hidden: 0, limit: 4, mode: 'fixed', reason: 'fixed', preference: { ceiling: null, revision: 0 } },
-                    spaces: [space('space-aaaaaaaaaaaa', KNOWN), space('space-bbbbbbbbbbbb', UNKNOWN)],
+                    spaces: [space('space-aaaaaaaaaaaa', KNOWN), space('space-bbbbbbbbbbbb', UNKNOWN), { ...space('space-cccccccccccc', KNOWN), memberSessionIds: [KNOWN, UNKNOWN] }],
                 } : m[1] === 'listTasks' ? { tasks: [] } : {}
                 res.writeHead(200, { 'content-type': 'application/json' })
                 res.end(JSON.stringify({ ok: true, result }))
@@ -68,13 +68,32 @@ describe.skipIf(!findChrome())('console spaces panel (real Chrome, fake Runtime)
             await until(() => harness.evaluate(target, 'window.__abpSpaceManagement'), (v) => v === 1)
             await harness.evaluate(target, `window.postMessage({ type: 'abp-capability', token: ${JSON.stringify(capability)}, expiresAtMs: Date.now() + 600_000 }, location.origin)`)
             await harness.evaluate(target, `document.getElementById('spaceToggle').click()`)
-            expect(await until(() => names(target), (list) => list.length === 2)).toEqual(['Conversation session-know', 'Conversation session-othe'])
+            expect(await until(() => names(target), (list) => list.length === 3)).toEqual(['Conversation session-know', 'Conversation session-othe', 'Conversation session-know, session-othe'])
             await harness.evaluate(target, `window.postMessage({ type: 'abp-session-titles', titles: { ${JSON.stringify(KNOWN)}: 'Open the GA report' } }, location.origin)`)
-            expect(await until(() => names(target), (list) => list[0] === 'Open the GA report')).toEqual(['Open the GA report', 'Conversation session-othe'])
+            // A shared space keeps its untitled member visible.
+            expect(await until(() => names(target), (list) => list[0] === 'Open the GA report')).toEqual(['Open the GA report', 'Conversation session-othe', 'Open the GA report, Conversation session-othe'])
             // Malformed titles are ignored rather than shown.
             await harness.evaluate(target, `window.postMessage({ type: 'abp-session-titles', titles: { ${JSON.stringify(UNKNOWN)}: 42 } }, location.origin)`)
             await harness.evaluate(target, 'new Promise(r => setTimeout(r, 300))')
             expect((await names(target))[1]).toBe('Conversation session-othe')
+        } finally { await harness.closeTarget(target) }
+    }, 30_000)
+
+    it('does not redraw the panel for titles while the usage-limit settings are being edited', async () => {
+        const target = await harness.openFrontTab(`${origin}/console?lang=en`)
+        try {
+            await until(() => harness.evaluate(target, 'window.__abpSpaceManagement'), (v) => v === 1)
+            await harness.evaluate(target, `window.postMessage({ type: 'abp-capability', token: ${JSON.stringify(capability)}, expiresAtMs: Date.now() + 600_000 }, location.origin)`)
+            await harness.evaluate(target, `document.getElementById('spaceToggle').click()`)
+            await until(() => names(target), (list) => list.length === 3)
+            await harness.evaluate(target, `(() => { const s = document.getElementById('spaceSettings'); s.open = true; const m = document.getElementById('spaceMode'); m.value = 'manual'; m.onchange(); })()`)
+            await harness.evaluate(target, `window.postMessage({ type: 'abp-session-titles', titles: { ${JSON.stringify(KNOWN)}: 'Open the GA report' } }, location.origin)`)
+            await harness.evaluate(target, 'new Promise(r => setTimeout(r, 300))')
+            expect(await harness.evaluate(target, `document.getElementById('spaceMode').value`)).toBe('manual')
+            expect((await names(target))[0]).toBe('Conversation session-know')
+            // Once the settings are closed, the next refresh shows the titles.
+            await harness.evaluate(target, `(() => { document.getElementById('spaceSettings').open = false; document.getElementById('spaceRefresh').click(); })()`)
+            expect(await until(() => names(target), (list) => list[0] === 'Open the GA report')).toHaveLength(3)
         } finally { await harness.closeTarget(target) }
     }, 30_000)
 })
