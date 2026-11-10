@@ -288,8 +288,10 @@ async function runClaudeRemote(
 ) {
     // Check if session is valid
     const canCheckTranscript = opts.sandboxPolicyMode !== 'mandatory' && !opts.completeTurn;
+    // Claude reads transcripts from the config dir it is started with, including one set by --claude-env.
+    const transcriptConfigDirectory = opts.claudeEnvVars?.CLAUDE_CONFIG_DIR;
     let startFrom = opts.sessionId;
-    if (canCheckTranscript && opts.sessionId && !claudeCheckSession(opts.sessionId, opts.path)) {
+    if (canCheckTranscript && opts.sessionId && !claudeCheckSession(opts.sessionId, opts.path, transcriptConfigDirectory)) {
         startFrom = null;
     }
     
@@ -303,7 +305,7 @@ async function runClaudeRemote(
                     // If next arg doesn't start with dash and contains dashes, it's likely a UUID
                     if (!nextArg.startsWith('-') && nextArg.includes('-')) {
                         // Claude refuses to resume a transcript it no longer has (e.g. removed by cleanupPeriodDays).
-                        if (canCheckTranscript && !claudeCheckSession(nextArg, opts.path)) {
+                        if (canCheckTranscript && !claudeCheckSession(nextArg, opts.path, transcriptConfigDirectory)) {
                             logger.debug(`[claudeRemote] --resume ${nextArg} has no transcript on this machine - starting a new Claude session`);
                             break;
                         }

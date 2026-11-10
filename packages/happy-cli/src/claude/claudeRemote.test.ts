@@ -24,12 +24,14 @@ const mode: EnhancedMode = {
     permissionMode: 'default',
 };
 
-/** Gives this machine a Claude transcript for `sessionId` in `path`'s project. */
-function keepTranscript(path: string, sessionId: string) {
-    vi.stubEnv('CLAUDE_CONFIG_DIR', mkdtempSync(join(tmpdir(), 'claude-remote-transcript-')));
-    const projectDir = getProjectPath(path);
+/** Gives this machine a Claude transcript for `sessionId` in `path`'s project; returns its config dir. */
+function keepTranscript(path: string, sessionId: string, { stub = true } = {}) {
+    const configDirectory = mkdtempSync(join(tmpdir(), 'claude-remote-transcript-'));
+    if (stub) vi.stubEnv('CLAUDE_CONFIG_DIR', configDirectory);
+    const projectDir = getProjectPath(path, configDirectory);
     mkdirSync(projectDir, { recursive: true });
     writeFileSync(join(projectDir, `${sessionId}.jsonl`), `${JSON.stringify({ uuid: 'synthetic-message' })}\n`);
+    return configDirectory;
 }
 
 describe('claudeRemote', () => {
@@ -129,14 +131,14 @@ describe('claudeRemote', () => {
     describe('a Claude session named by --resume in the arguments', () => {
         const sessionPath = resolve('fixture session');
         const resumeId = '22222222-3333-4444-8555-666666666666';
-        const start = async () => {
+        const start = async (overrides: Record<string, unknown> = {}) => {
             vi.mocked(query).mockReturnValue({ async *[Symbol.asyncIterator]() { yield { type: 'result', subtype: 'success' }; } } as any);
             let count = 0;
             await claudeRemote({ sessionId: null, path: sessionPath, allowedTools: [], hookSettingsPath: '/tmp/synthetic-settings.json',
                 claudeArgs: ['--resume', resumeId],
                 nextMessage: async () => count++ === 0 ? { message: 'synthetic', mode } : null,
                 onReady: vi.fn(), canCallTool: async () => ({ behavior: 'allow' }) as any, isAborted: () => false,
-                onSessionFound: vi.fn(), onThinkingChange: vi.fn(), onMessage: vi.fn() });
+                onSessionFound: vi.fn(), onThinkingChange: vi.fn(), onMessage: vi.fn(), ...overrides } as any);
             return vi.mocked(query).mock.calls[0][0].options!;
         };
 
@@ -148,6 +150,16 @@ describe('claudeRemote', () => {
         it('resumes it while this machine has its transcript', async () => {
             keepTranscript(sessionPath, resumeId);
             expect((await start()).resume).toBe(resumeId);
+        });
+
+        it.each([
+            ['the arguments', { claudeArgs: ['--resume', resumeId] }],
+            ['the runner', { sessionId: resumeId, claudeArgs: [] }],
+        ])('resumes it from the config dir --claude-env gives Claude when the session comes from %s', async (_by, overrides) => {
+            vi.stubEnv('CLAUDE_CONFIG_DIR', mkdtempSync(join(tmpdir(), 'claude-remote-transcript-')));
+            const configDirectory = keepTranscript(sessionPath, resumeId, { stub: false });
+            const options = await start({ ...overrides, claudeEnvVars: { CLAUDE_CONFIG_DIR: configDirectory } });
+            expect(options.resume).toBe(resumeId);
         });
     });
 
