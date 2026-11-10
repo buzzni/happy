@@ -24,7 +24,7 @@ vi.mock('@/ui/logger', () => ({
   logger: { debug: mocks.mockLoggerDebug },
 }))
 
-import { checkIfDaemonRunningAndCleanupStaleState, requestSetupTokenRebind, requestSetupTokenStart, stopDaemon } from './controlClient'
+import { checkIfDaemonRunningAndCleanupStaleState, requestSetupTokenCapacity, requestSetupTokenRebind, requestSetupTokenStart, stopDaemon } from './controlClient'
 
 const DEAD_PID = 3058947
 const HTTP_PORT = 33417
@@ -276,4 +276,24 @@ it('preserves start exhaustion through local control and sends a distinct rebind
   expect(await requestSetupTokenRebind('s','binding',undefined,undefined,{startExhausted:true})).toEqual({ok:true,environment:{TOKEN:'synthetic'}})
   expect(JSON.parse(String(fetchSpy.mock.calls[1][1]?.body))).toEqual({sessionId:'s',binding:'binding',startExhausted:true})
  }finally{fetchSpy.mockRestore()}
+})
+
+it('names a capacity failure that never reached the daemon apart from one the daemon reported', async () => {
+  const actor = { companyId: 'org-a', machineId: 'pc-a', sessionId: 's', requestId: 'input-r', contentHash: 'a'.repeat(64), proof: 'signed.proof' }
+  const capacity = () => requestSetupTokenCapacity('s', 'binding', 'reserve', actor, 'runtime')
+  mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state: null, raw: null })
+  await expect(capacity()).rejects.toThrow('CAPACITY_DAEMON_UNREACHABLE')
+  const state = stateWithPid(process.pid)
+  mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state, raw: JSON.stringify(state) })
+  const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    .mockRejectedValueOnce(new TypeError('fetch failed'))
+    .mockResolvedValueOnce(Response.json({ code: 'INVALID_BODY' }, { status: 400 }))
+    .mockResolvedValueOnce(Response.json({ ok: false, reason: 'CAPACITY_STUDIO_TIMEOUT' }))
+    .mockResolvedValueOnce(Response.json({ ok: true, admission: {} }))
+  try {
+    await expect(capacity()).rejects.toThrow('CAPACITY_DAEMON_UNREACHABLE')
+    await expect(capacity()).rejects.toThrow('CAPACITY_DAEMON_HTTP_400')
+    await expect(capacity()).rejects.toThrow('CAPACITY_STUDIO_TIMEOUT')
+    await expect(capacity()).rejects.toThrow('CAPACITY_UNAVAILABLE')
+  } finally { fetchSpy.mockRestore() }
 })

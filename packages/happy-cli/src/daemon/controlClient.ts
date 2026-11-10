@@ -599,6 +599,8 @@ export async function requestSetupTokenStart(sessionId: string, binding: string,
 export async function requestSetupTokenCapacity(sessionId: string, binding: string, operation: string,
   actor: import('../claude/setupTokenUserCapacity').SetupTokenCapacityActor, runtimeId: string, extra?: Record<string, unknown>, signal?: AbortSignal) {
   const result = await daemonPost('/setup-token/capacity', { sessionId, binding, operation, actor, runtimeId, extra }, undefined, 15_000, signal);
+  // daemonPost answers { error } when the daemon was never reached and { error, status } when it refused; neither carries a reason.
+  if (result?.ok !== true && result?.error) throw new Error(result.status ? `CAPACITY_DAEMON_HTTP_${result.status}` : 'CAPACITY_DAEMON_UNREACHABLE');
   if (result?.ok !== true || typeof result.admission?.state !== 'string') throw new Error(result?.reason ?? 'CAPACITY_UNAVAILABLE');
   return result.admission as { state: string; managedAccountId?: string; credentialGeneration?: number; epoch?: number; validForMs?: number; retryAfterMs?: number; requiresMove?: boolean; reason?: string };
 }
