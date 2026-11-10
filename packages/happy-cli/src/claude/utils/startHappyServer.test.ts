@@ -660,6 +660,33 @@ describe('foreground lesson proposal tool', () => {
     });
 });
 
+// aplus-dev-studio specs/agent-plan-full-capability P3 — Codex sends no hosted search for plan models.
+describe('Saycode plan web search tool', () => {
+    it('only exposes web_search to a plan session, and answers with the summary and its sources', async () => {
+        const without = await startHappyServer(makeFakeClient(false));
+        try { expect(without.toolNames).not.toContain('web_search'); } finally { without.stop(); }
+        const webSearch = vi.fn(async () => ({ ok: true as const, answer: 'Node 24.', sources: [{ title: 'Node', url: 'https://nodejs.org' }], complete: true }));
+        const server = await startHappyServer(makeFakeClient(false), { webSearch });
+        try {
+            expect(server.toolNames).toContain('web_search');
+            const response = await callTool(server, 1, 'web_search', { query: 'latest node lts' });
+            expect(webSearch).toHaveBeenCalledWith('latest node lts');
+            expect(response.result.isError).toBeFalsy();
+            expect(response.result.content[0].text).toBe('Node 24.\n\nSources:\n- Node — https://nodejs.org');
+        } finally { server.stop(); }
+    });
+
+    it('reports a plan refusal as a tool error the model can explain', async () => {
+        const webSearch = vi.fn(async () => ({ ok: false as const, code: 'agent_plan_5h_limit' }));
+        const server = await startHappyServer(makeFakeClient(false), { webSearch });
+        try {
+            const response = await callTool(server, 1, 'web_search', { query: 'x' });
+            expect(response.result.isError).toBe(true);
+            expect(response.result.content[0].text).toBe('Web search unavailable: agent_plan_5h_limit.');
+        } finally { server.stop(); }
+    });
+});
+
 describe('browser task runtime PoC flag', () => {
     async function listNames(server: McpServerHandle): Promise<string[]> {
         const response = await mcpFetch(server)(server.url, {

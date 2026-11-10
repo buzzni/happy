@@ -43,6 +43,7 @@ import { MandatorySandboxError } from '@/sandbox/sandboxPolicy';
 import { registerBrowserTaskTools, BROWSER_TASK_TOOL_NAMES } from '@/browserRuntime/agentTools';
 import { createSiteHints, siteSkillRoots, type SiteHints } from '@/browserRuntime/siteHints';
 import { registerCheckpointAgentTools } from '@/checkpoint/checkpointAgentTools';
+import { formatAgentPlanWebSearchResult, type AgentPlanWebSearchResult } from '@/codex/agentPlanWebSearch';
 import type { CheckpointAgentReader } from '@/checkpoint/checkpointAgentReader';
 import { RuntimeClient } from '@/browserRuntime/runtimeClient';
 import { createBrokerGrantSource } from '@/browserRuntime/brokerGrantSource';
@@ -84,6 +85,8 @@ export interface HappyServerHandlers {
     browserHostContinues?: boolean;
     mandatorySandbox?: boolean;
     linkedPullRequestTools?: boolean;
+    /** Saycode plan sessions only: hosted search through the plan gateway (Codex sends none for plan models). */
+    webSearch?: (query: string) => Promise<AgentPlanWebSearchResult>;
 }
 
 // The first title generated through change_title is the one users rely on to
@@ -167,6 +170,20 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
     if (!handlers.mandatorySandbox) registerTurnCardTools(mcp, { client: handlers.client, turnCards: handlers.turnCards, runTool });
 
     if (handlers.linkedPullRequestTools) registerLinkedPullRequestTools(mcp, { client: handlers.client, runTool });
+
+    // Not in a mandatory sandbox: that boundary keeps its fixed minimal tool set.
+    if (handlers.webSearch && !handlers.mandatorySandbox) {
+        const webSearch = handlers.webSearch;
+        mcp.registerTool('web_search', {
+            title: 'Web Search',
+            description: 'Search the web for current information and get a short answer with source URLs. Use it when the task needs facts that may have changed or that are not in the workspace. Each call is billed to this session\'s Saycode plan usage; search once per question rather than repeating similar queries.',
+            inputSchema: { query: z.string().min(1).max(1000).describe('What to find, as a natural-language question or search query.') },
+            annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+        }, async ({ query }) => runTool(async () => {
+            const result = await webSearch(query);
+            return { ...(result.ok ? {} : { isError: true }), content: [{ type: 'text' as const, text: formatAgentPlanWebSearchResult(result) }] };
+        }));
+    }
 
     if (!handlers.mandatorySandbox && !scopedSession) mcp.registerTool('script_automations', {
         title: 'Manage Script Automations',
@@ -604,6 +621,8 @@ export async function startHappyServer(
         protectedBashCwd?: () => string | null;
         trackProtectedBashProcess?: (child: ChildProcess) => void;
         currentTurnId?: () => number | null;
+        /** Saycode plan sessions only (`AgentPlanSession.webSearch`). */
+        webSearch?: (query: string) => Promise<AgentPlanWebSearchResult>;
         /**
          * The runner's `linkedPullRequestToolsAllowed()`, the value it advertised at creation. Given, it
          * also corrects the advertisement on metadata the server kept from an earlier run (managed
@@ -704,6 +723,7 @@ export async function startHappyServer(
             client,
             mandatorySandbox: options.mandatorySandbox,
             linkedPullRequestTools,
+            webSearch: options.webSearch,
             proposeLesson: options.proposeLesson,
             turnCards: options.turnCards,
             protectedBashCwd: options.protectedBashCwd,
@@ -792,7 +812,7 @@ export async function startHappyServer(
         socketPath,
         mcpConfig,
         bridgeEnv,
-        toolNames: [...(browserTask?.localClients ? LOCAL_CLIENT_TOOL_NAMES : []), ...(options.mandatorySandbox ? [] : TURN_CARD_TOOL_NAMES), ...(linkedPullRequestTools ? LINKED_PULL_REQUEST_TOOL_NAMES : []), ...(initialComputerAvailable ? ['local_tool_capabilities', 'local_tool_control'] : []), ...(options.checkpointReader ? ['checkpoint_status', 'checkpoint_list', 'checkpoint_preview', 'checkpoint_diff'] : []), ...(options.mandatorySandbox
+        toolNames: [...(browserTask?.localClients ? LOCAL_CLIENT_TOOL_NAMES : []), ...(options.mandatorySandbox ? [] : TURN_CARD_TOOL_NAMES), ...(linkedPullRequestTools ? LINKED_PULL_REQUEST_TOOL_NAMES : []), ...(options.webSearch && !options.mandatorySandbox ? ['web_search'] : []), ...(initialComputerAvailable ? ['local_tool_capabilities', 'local_tool_control'] : []), ...(options.checkpointReader ? ['checkpoint_status', 'checkpoint_list', 'checkpoint_preview', 'checkpoint_diff'] : []), ...(options.mandatorySandbox
             ? ['change_title', ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : [])]
             : [...(options.proposeLesson ? ['propose_lesson'] : []), 'change_title', 'bash_stream', 'script_automations', ...(process.env.HAPPY_WRITE_SCOPE_SESSION === '1' ? [] : ['scheduled_tasks']), ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : BROWSER_TOOL_NAMES)])],
         stop: () => {

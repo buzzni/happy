@@ -2170,6 +2170,7 @@ export async function runCodex(opts: {
     // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
     const happyServer = await startHappyServer(session, {
         linkedPullRequestTools,
+        ...(agentPlanSession ? { webSearch: agentPlanSession.webSearch } : {}),
         browserClientApprover: () => permissionHandler,
         agentControl: accountToken !== null,
         exitAfterFirstTurn,
