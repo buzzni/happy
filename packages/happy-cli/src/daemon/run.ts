@@ -30,6 +30,8 @@ import fs from 'fs/promises';
 import os from 'os';
 import { createAgentDelegationStore } from './agentDelegationStore';
 import { delegationConcurrencyLimit } from './agentDelegationMethods';
+import { createAgentDelegationRelayHost } from './agentDelegationRelayHost';
+import { readAgentRelationHost } from './agentRelationAuthority';
 import * as tmp from 'tmp';
 import axios from 'axios';
 import * as z from 'zod';
@@ -115,7 +117,7 @@ import type { RestartDrainControlPort } from './restartDrainRoutes';
 import { resolveDaemonStateOwnership } from './daemonStateOwnership';
 import { createPortRegistry } from './portRegistry';
 import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs } from './stageUserCredentials';
-import { existsSync } from 'fs';
+import { existsSync, statSync } from 'fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path';
 import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
@@ -5973,6 +5975,16 @@ export async function startDaemon(): Promise<void> {
         readSessionVariant: sessionId => readPersistedSessions()[sessionId]?.encryptionVariant ?? null,
         stopSession: sessionId => stopSession(sessionId, { source: 'agent-delegation', reason: 'record-failed', mode: 'force' }),
         concurrencyLimit: delegationConcurrencyLimit({ cpuCount: os.cpus().length, totalMemoryBytes: os.totalmem() }),
+        // R17–R22: the linked machine reads and prompts through here; the session key never leaves this machine.
+        relay: createAgentDelegationRelayHost({
+          serverUrl: configuration.serverUrl,
+          machineId,
+          token: async () => credentials.token,
+          readSessions: readPersistedSessions,
+          sessionsStamp: () => { try { const stat = statSync(configuration.sessionsFile); return `${stat.mtimeMs}:${stat.size}`; } catch { return null; } },
+          isSessionLive: sessionId => hasLiveDaemonChild(sessionId, pidToTrackedSession.values(), isPidAlive, ownsUnresolvedJob),
+          relationHost: () => readAgentRelationHost({ serverUrl: configuration.serverUrl, settings: () => readSettings(), credentials: readCredentials }),
+        }),
       } }),
       ownedSpawn,
       daemonSessionState: createDaemonSessionStateHandler(getCurrentChildren),

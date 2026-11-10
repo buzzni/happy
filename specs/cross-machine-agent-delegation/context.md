@@ -1,7 +1,7 @@
 ---
 기능: cross-machine-agent-delegation
-상태: 진행중 — 구현·교차 리뷰 반영 완료, PR 단계(H9). 새 승인 항목 A7(dataKey 원격 자식 읽기용 제한 relay) 대기, 릴리스·Desktop pin은 지휘 세션
-마지막 갱신: 2026-11-08
+상태: 진행중 — 위임 lane #1183 머지됨. Phase 5 제한 relay(A7·A8, 2026-11-10 승인) 구현, PR 단계(H13)
+마지막 갱신: 2026-11-10
 ---
 
 # 다른 작업PC로 위임 — 데몬 위임 lane Context
