@@ -96,6 +96,34 @@ describe('sandbox manager', () => {
         expect(mockInitialize).toHaveBeenCalledWith(runtimeConfig);
     });
 
+    // bwrap 0.4.0 은 없는 경로에 /dev/null 을 두 번 덮으면 "Can't create file ... Permission denied"
+    // 로 죽는다. 런타임이 cwd 기준으로 스스로 막는 경로를 denyWrite 로 다시 넘기지 않아야 한다.
+    it('drops denyWrite entries the runtime already denies in the cwd', async () => {
+        const cwd = process.cwd();
+        mockBuildSandboxRuntimeConfig.mockReturnValue({
+            ...runtimeConfig,
+            filesystem: {
+                ...runtimeConfig.filesystem,
+                denyWrite: [
+                    `${cwd}/.env`,
+                    `${cwd}/.vscode`,
+                    `${cwd}/.idea`,
+                    `${cwd}/*.code-workspace`,
+                    `${cwd}/.mcp.json`,
+                    '/elsewhere/.vscode',
+                ],
+            },
+        } satisfies SandboxRuntimeConfig);
+
+        await initializeSandbox({} as SandboxConfig, cwd);
+
+        expect(mockInitialize.mock.calls[0][0].filesystem.denyWrite).toEqual([
+            `${cwd}/.env`,
+            `${cwd}/*.code-workspace`,
+            '/elsewhere/.vscode',
+        ]);
+    });
+
     it('wrapCommand delegates to SandboxManager.wrapWithSandbox', async () => {
         const wrapped = await wrapCommand('node script.js');
 
