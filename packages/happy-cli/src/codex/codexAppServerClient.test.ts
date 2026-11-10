@@ -1904,6 +1904,86 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('unarchives a thread archived elsewhere and resumes it', async () => {
+        const requests: MockRpcMessage[] = [];
+        let archived = true;
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                if (msg.id == null || msg.method === 'initialize') return;
+                requests.push(msg);
+                if (msg.method === 'thread/unarchive') archived = false;
+                const refused = msg.method === 'thread/resume' && archived;
+                setTimeout(() => pushJsonLine(stdout, refused ? {
+                    id: msg.id,
+                    error: { code: -32600, message: 'session thread-archived is archived. Run `codex unarchive thread-archived` to unarchive it first.' },
+                } : {
+                    id: msg.id,
+                    result: { thread: { id: 'thread-archived' }, model: 'gpt-test' },
+                }), 0);
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+
+        await expect(client.resumeThread({ threadId: 'thread-archived', cwd: '/work' }))
+            .resolves.toEqual({ threadId: 'thread-archived', model: 'gpt-test' });
+        expect(requests.map(({ method }) => method)).toEqual(['thread/resume', 'thread/unarchive', 'thread/resume']);
+        expect(requests[1].params).toEqual({ threadId: 'thread-archived' });
+
+        await client.disconnect();
+    });
+
+    it('unarchives a thread archived elsewhere and forks it', async () => {
+        const requests: MockRpcMessage[] = [];
+        let archived = true;
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                if (msg.id == null || msg.method === 'initialize') return;
+                requests.push(msg);
+                if (msg.method === 'thread/unarchive') archived = false;
+                const refused = msg.method === 'thread/fork' && archived;
+                setTimeout(() => pushJsonLine(stdout, refused ? {
+                    id: msg.id,
+                    error: { code: -32600, message: 'session thread-archived is archived. Run `codex unarchive thread-archived` to unarchive it first.' },
+                } : {
+                    id: msg.id,
+                    result: { thread: { id: 'thread-forked' }, model: 'gpt-test' },
+                }), 0);
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+
+        await expect(client.forkThread({ threadId: 'thread-archived', cwd: '/work' }))
+            .resolves.toMatchObject({ threadId: 'thread-forked' });
+        expect(requests.map(({ method }) => method)).toEqual(['thread/fork', 'thread/unarchive', 'thread/fork']);
+        expect(requests[1].params).toEqual({ threadId: 'thread-archived' });
+
+        await client.disconnect();
+    });
+
+    it('does not unarchive when resume fails for another reason', async () => {
+        const requests: MockRpcMessage[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                if (msg.id == null || msg.method === 'initialize') return;
+                requests.push(msg);
+                setTimeout(() => pushJsonLine(stdout, { id: msg.id, error: { code: -32600, message: 'thread not found' } }), 0);
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+
+        await expect(client.resumeThread({ threadId: 'thread-gone', cwd: '/work' }))
+            .rejects.toThrow('thread/resume: thread not found (code=-32600)');
+        expect(requests.map(({ method }) => method)).toEqual(['thread/resume']);
+
+        await client.disconnect();
+    });
+
     it('persists additional writable roots across thread start, resume, and every workspace-write turn', async () => {
         const requests: MockRpcMessage[] = [];
         mockSpawn.mockImplementation(() => createMockProcess({
