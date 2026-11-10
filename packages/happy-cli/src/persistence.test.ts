@@ -172,6 +172,14 @@ describe('session persistence retention', () => {
             new: expect.objectContaining({ savedAt: expect.any(Number) }),
         });
     });
+
+    it('writes the store without indentation', () => {
+        // The daemon rewrites the whole store synchronously on every cursor and webhook update, and
+        // retention keeps every session. Indentation made a 36MB store 48MB and each write that slower.
+        persistSession('new', session(Date.now()));
+
+        expect(readFileSync(configuration.sessionsFile, 'utf8')).not.toContain('\n');
+    });
 });
 
 describe('daemon state compare-and-set', () => {
