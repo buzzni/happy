@@ -1934,6 +1934,33 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('resumes a thread whose full history would not fit in one output line', async () => {
+        const onFailure = vi.fn();
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                if (msg.id == null || msg.method !== 'thread/resume') return;
+                // Codex inlines every turn into the resume response unless asked not to.
+                const turns = msg.params.excludeTurns === true ? [] : [{ id: 'turn-1', items: [
+                    { type: 'commandExecution', id: 'exec-1', command: 'cat big.log', aggregatedOutput: 'x'.repeat(9 * 1024 * 1024) },
+                ] }];
+                setTimeout(() => pushJsonLine(stdout, {
+                    id: msg.id,
+                    result: { thread: { id: 'thread-long', turns }, model: 'gpt-test' },
+                }), 0);
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        client.setOutputStorageGate({ wait: async () => {}, onFailure });
+        await client.connect();
+
+        await expect(client.resumeThread({ threadId: 'thread-long', cwd: '/work' }))
+            .resolves.toEqual({ threadId: 'thread-long', model: 'gpt-test' });
+        expect(onFailure).not.toHaveBeenCalled();
+
+        await client.disconnect();
+    });
+
     it('unarchives a thread archived elsewhere and forks it', async () => {
         const requests: MockRpcMessage[] = [];
         let archived = true;

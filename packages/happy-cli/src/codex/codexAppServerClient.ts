@@ -2065,6 +2065,8 @@ export class CodexAppServerClient {
             baseInstructions: null,
             developerInstructions,
             persistExtendedHistory: true,
+            // Only the thread identity is read; inlined history can outgrow one output line on long threads.
+            excludeTurns: true,
         };
 
         const result = await this.requestUnarchivingThread('thread/resume', params) as ResumeConversationResponse;
