@@ -37,7 +37,8 @@ export async function archiveGithubWorktreeChanges(input: {
     '--src-prefix=a/', '--dst-prefix=b/', '--ignore-submodules=all',
     `--output=${join(archiveTo, 'changes.patch')}`, 'HEAD',
   ], worktreePath)
-  for (const path of unsavedUntrackedPaths(input.porcelainStatus)) {
+  const untracked = await input.runGit(['ls-files', '--others', '--exclude-standard', '-z'], worktreePath)
+  for (const path of unsavedUntrackedPaths(untracked)) {
     await cp(join(worktreePath, path), join(archiveTo, 'untracked', path), { recursive: true })
   }
   await writeFile(join(archiveTo, 'status.txt'), input.porcelainStatus)
