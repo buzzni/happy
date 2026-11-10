@@ -4,12 +4,17 @@ import { access, chmod, mkdir, realpath } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 
+import { archiveGithubWorktreeChanges } from './githubWorktreeArchive'
 import { releaseDanglingSubmoduleWorktreePointers } from './submoduleWorktreePointer'
 import { describeUnsavedWorktreeChanges, hasUnsavedWorktreeChanges } from './worktreeDirtyState'
 
 const execFileAsync = promisify(execFile)
 const COMMAND_TIMEOUT_MS = 60_000
 const COMMAND_MAX_BUFFER = 2 * 1024 * 1024
+// 사용자 전역의 submodule.recurse=true 가 `gh pr checkout` 안의 git 까지 서브모듈을 갱신하게
+// 해, 서브모듈 저장소가 쓸 수 없을 때 checkout 이 반쯤 끝나고 worktree 가 버려졌다(2026-11-09).
+// `gh` 에는 -c 를 넘길 수 없으므로 환경으로 준다. GIT_CONFIG_COUNT 는 git 2.31+ 라 쓰지 않는다.
+const NO_SUBMODULE_RECURSION = "'submodule.recurse=false'"
 
 export interface GithubTriggerWorktreeCommand {
   executable: 'git' | 'gh'
@@ -47,9 +52,14 @@ async function defaultRunCommand(command: GithubTriggerWorktreeCommand): Promise
   try {
     const args = command.executable === 'git'
       ? ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...command.args] : command.args
+    const env = { ...process.env, ...command.environmentVariables }
     const result = await execFileAsync(command.executable, args, {
       cwd: command.cwd,
-      env: { ...process.env, ...command.environmentVariables, GIT_OPTIONAL_LOCKS: '0' },
+      env: {
+        ...env,
+        GIT_OPTIONAL_LOCKS: '0',
+        GIT_CONFIG_PARAMETERS: [env.GIT_CONFIG_PARAMETERS, NO_SUBMODULE_RECURSION].filter(Boolean).join(' '),
+      },
       timeout: COMMAND_TIMEOUT_MS,
       maxBuffer: COMMAND_MAX_BUFFER,
       encoding: 'utf8',
@@ -88,6 +98,11 @@ export async function removeGithubTriggerWorktree(input: {
   /** Daemon-owned generated artifacts only; source preservation still returns dirty. */
   reclaimArtifacts?: () => Promise<void>
   admitSubprocess?: (roots: readonly string[]) => Promise<void>
+  /**
+   * 더는 보존하지 않을 때: 남은 변경을 여기 보관한 뒤 지운다. 서브모듈은 보지 않는다 —
+   * 서브모듈 저장소가 깨져 `git status` 조차 못 돌던 worktree 도 이 경로로는 정리된다.
+   */
+  archiveTo?: string
 }): Promise<
   | { ok: true }
   | { ok: false; dirty: boolean; error: string }
@@ -104,14 +119,14 @@ export async function removeGithubTriggerWorktree(input: {
   if (!await pathExists(input.worktreePath)) return { ok: true }
   const status = await commandOrError(runCommand, {
     executable: 'git',
-    args: ['status', '--porcelain', '--untracked-files=all'],
+    args: ['status', '--porcelain', '--untracked-files=all', ...(input.archiveTo ? ['--ignore-submodules=all'] : [])],
     cwd: input.worktreePath,
   }, 'GitHub automation worktree status failed')
   if (!status.ok) return { ok: false, dirty: false, error: status.error }
   // 한 줄이라도 있으면 보존하던 것이 worktree 45개(23GB)를 쌓았다. 사유가 작업물이
   // 아니라 에이전트 산출물(?? memory/)과 서브모듈 gitlink( M vendor/happy)였기 때문이다.
   // 무해하다고 아는 것만 무시하고, 하나라도 진짜 변경이 섞이면 그대로 지킨다.
-  if (hasUnsavedWorktreeChanges(status.stdout)) {
+  if (!input.archiveTo && hasUnsavedWorktreeChanges(status.stdout)) {
     // 무엇이 막고 있는지 말한다 — 원인을 알려고 사람이 git status 를 다시 치게
     // 만들면 그만큼 worktree 가 더 오래 남는다.
     const blocking = describeUnsavedWorktreeChanges(status.stdout).join(', ')
@@ -122,6 +137,28 @@ export async function removeGithubTriggerWorktree(input: {
   }
   try { await input.admitSubprocess?.([input.repositoryRoot, input.worktreePath]) }
   catch (error) { return { ok: false, dirty: false, error: error instanceof Error ? error.message : 'WORKSPACE_UNAVAILABLE' } }
+  // 보존을 그만두는 경우에도 변경은 잃지 않는다 — 보관에 실패하면 지우지 않고 dirty 로 남는다.
+  if (input.archiveTo && hasUnsavedWorktreeChanges(status.stdout)) {
+    try {
+      await archiveGithubWorktreeChanges({
+        repositoryRoot: input.repositoryRoot,
+        worktreePath: input.worktreePath,
+        archiveTo: input.archiveTo,
+        porcelainStatus: status.stdout,
+        runGit: async (args, cwd) => {
+          const result = await runCommand({ executable: 'git', args, cwd })
+          if (!result.ok) throw new Error(result.error)
+          return result.stdout
+        },
+      })
+    } catch (error) {
+      return {
+        ok: false,
+        dirty: true,
+        error: `GitHub automation worktree archive failed: ${error instanceof Error ? error.message : String(error)}`,
+      }
+    }
+  }
   const removed = await commandOrError(runCommand, {
     executable: 'git',
     // --force 없이는 서브모듈을 가진 worktree 를 git 이 거부한다
