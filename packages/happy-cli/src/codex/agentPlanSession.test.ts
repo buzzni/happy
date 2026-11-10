@@ -271,6 +271,26 @@ describe('startAgentPlanSession', () => {
         expect(JSON.parse(forwarded.body)).toEqual({ model: 'gpt-6-luna', stream: true, input: [] })
     })
 
+    // aplus-dev-studio specs/agent-plan-full-capability P3 — the runner's own search tool, billed by the gateway.
+    it('searches the web through the gateway with the current agps_ key', async () => {
+        const studio = await fakeStudio({
+            responses: (_req, _body, res) => {
+                res.writeHead(200, { 'content-type': 'application/json' })
+                res.end(JSON.stringify({
+                    object: 'response', status: 'completed',
+                    output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'found it', annotations: [] }] }],
+                }))
+            },
+        })
+        const env = launchEnv(studio.origin)
+        const session = await startAgentPlanSession({ launch: consumeAgentPlanLaunch(env)!, sessionId: 'happy-1', env })
+        closers.push(() => session.close())
+        expect(await session.webSearch('latest node lts')).toEqual({ ok: true, answer: 'found it', sources: [], complete: true })
+        const search = studio.requests.find(request => request.url === '/api/agent-plan/v1/responses')!
+        expect(search.authorization).toBe('Bearer agps_1')
+        expect(JSON.parse(search.body)).toMatchObject({ tools: [{ type: 'web_search' }], stream: false })
+    })
+
     it('passes a gateway limit refusal through unchanged so Codex can show it', async () => {
         const limit = { error: { code: 'agent_plan_period_limit', message: 'limit', resetsAt: 1_800_000_000_000 } }
         const studio = await fakeStudio({

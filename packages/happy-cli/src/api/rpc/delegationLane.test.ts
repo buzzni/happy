@@ -71,6 +71,9 @@ describe('delegation lane', () => {
 
     it('lists exactly the reviewed methods', () => {
         expect([...DELEGATION_LANE_METHODS].sort()).toEqual([
+            'agent-delegation:relay-prompt',
+            'agent-delegation:relay-read',
+            'agent-delegation:relay-sessions',
             'agent-delegation:session-key',
             'agent-delegation:spawn',
             'ai-credential:capabilities',

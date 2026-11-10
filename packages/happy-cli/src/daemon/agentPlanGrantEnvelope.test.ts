@@ -43,10 +43,12 @@ function setup() {
 }
 
 describe('agentPlan capability', () => {
-    it('is published on macOS and Linux daemons only (spec §6.3-5)', () => {
+    // aplus-dev-studio specs/agent-plan-full-capability R4 — the grant path no longer needs a named pipe: the token
+    // travels through a 127.0.0.1 TCP proxy, which Windows has, so Windows daemons publish the plan too.
+    it('is published on macOS, Linux and Windows daemons', () => {
         expect(agentPlanCapabilityForPlatform('darwin')).toEqual({ version: 1 })
         expect(agentPlanCapabilityForPlatform('linux')).toEqual({ version: 1 })
-        expect(agentPlanCapabilityForPlatform('win32')).toBeUndefined()
+        expect(agentPlanCapabilityForPlatform('win32')).toEqual({ version: 1 })
     })
 })
 
@@ -155,7 +157,7 @@ describe('prepareAgentPlanLaunch', () => {
         expect(result.environment[AGENT_PLAN_SECRET_ENV]).toBe(SECRET)
         // The runner's own canonical read accepts it.
         expect(readAgentPlanDescriptor(result.environment[AGENT_PLAN_DESCRIPTOR_ENV]!, ORIGIN)).toMatchObject({
-            grantId: GRANT, model: 'gpt-6-luna', contextWindow: 128000,
+            grantId: GRANT, model: 'gpt-6-luna', contextWindow: 1050000,
         })
     })
 
@@ -172,10 +174,10 @@ describe('prepareAgentPlanLaunch', () => {
         }, consumer)).toEqual({ ok: false, reason: 'agent_plan_conflicting_selection' })
     })
 
-    it('refuses on Windows, which does not publish the capability', () => {
+    it('accepts a plan launch on Windows', () => {
         const { keyPair, consumer } = setup()
         expect(prepareAgentPlanLaunch({ ...base, platform: 'win32', agentPlan: { grantEnvelope: seal(plaintext(), keyPair.publicKey) } }, consumer))
-            .toEqual({ ok: false, reason: 'agent_plan_unavailable' })
+            .toMatchObject({ ok: true })
     })
 
     it('refuses without a trusted Studio origin to exchange the grant with', () => {

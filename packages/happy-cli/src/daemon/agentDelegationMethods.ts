@@ -10,8 +10,8 @@
  * `session-key` never hands out a session's data key. That key is also the session's RPC key, which
  * reaches `bash`, file and permission RPCs — handing it to a linked machine would step around the
  * lane's allowlist and around the person who answers this machine's permission prompts. It answers
- * only the session's encryption variant; reading a dataKey child from the linked machine needs a
- * restricted relay (cross-machine-agent-delegation, pending approval).
+ * only the session's encryption variant; a dataKey child is read and prompted through the restricted
+ * relay instead (`agentDelegationRelay.ts`).
  *
  * A delegated spawn takes a narrow request and builds the child's environment here. The requester's
  * environment, sandbox configuration and credentials are not accepted: the child runs under this
@@ -26,6 +26,7 @@ import { parseOutputFormat } from '@/claude/structuredOutput';
 import { parseAiAuthSelection } from './sessionEnv';
 import { DAEMON_RESTARTING_CODE } from './restartDrainLifecycle';
 import type { AgentDelegationStore } from './agentDelegationStore';
+import { registerAgentDelegationRelay, type AgentDelegationRelayHost } from './agentDelegationRelay';
 
 export const AGENT_DELEGATION_CAPABILITY = { version: 1 } as const;
 /** Same ceiling as the CLI's AGENT_MAX_DEPTH: a delegated child is a generation like any other. */
@@ -44,6 +45,8 @@ export interface AgentDelegationHost {
     /** How many delegated children may run here at once (D-5). */
     concurrencyLimit: number;
     directoryExists?: (path: string) => Promise<boolean>;
+    /** Reading and prompting over the link (`agentDelegationRelay.ts`); absent = the relay methods are not registered. */
+    relay?: Omit<AgentDelegationRelayHost, 'store'>;
 }
 
 /**
@@ -219,6 +222,8 @@ export function registerAgentDelegationRpc(
         logger.debug('[AGENT DELEGATION] Delegated session started', { peer, sessionId: result.sessionId });
         return { type: 'success', sessionId: result.sessionId };
     }
+
+    if (host.relay) registerAgentDelegationRelay(register, { store, ...host.relay });
 
     register('agent-delegation:session-key', async (params, context) => {
         const sessionId = (params as { sessionId?: unknown } | null)?.sessionId;

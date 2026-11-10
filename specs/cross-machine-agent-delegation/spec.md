@@ -56,6 +56,21 @@
   (위임 키로 봉인된 응답 안에) 돌려주고, legacy 세션이면 `{ variant: 'legacy' }`만. 아니면 `session_not_found`(존재 비노출).
 - R10. 위임 lane의 `stop-session`은 `delegatedFrom.machineId == peer`인 세션에만 동작한다. 아니면 `session_not_found`.
 
+### 제한 relay (A7·A8, 2026-11-10 사용자 승인 — Desktop spec R17~R23이 CLI 계약 정본)
+
+- R16. 위임 lane 허용 목록에 `agent-delegation:relay-sessions`·`relay-read`·`relay-prompt`를 더한다. 세 메서드 모두 요청마다
+  (a) 연결이 살아 있고 (b) 이 PC가 그 세션의 키를 갖고 있으며(`sessions.json`, 이 PC의 machineId로 기록된 세션) (c) 그 세션이 요청 PC가 만든
+  위임 자식이거나 **이 PC가 서버에 물은 소유 판정**(`/v1/session-ownership/relation`, callerSessionId=요청 세션, machineId=이 PC)이 `own`일 때만 답한다.
+  요청 세션 자신은 대상이 아니다. 하나라도 아니면 같은 `session_not_found`(존재 비노출). 긍정 판정은 같은 (연결, 요청 세션, 대상)에 60초만 재사용한다.
+  서버 판정은 한 번에 100개(`SESSION_OWNERSHIP_RELATION_MAX_TARGETS`)까지, 목록 한 번에 최대 3번만 묻는다(relation 한도 계정당 분당 120). 목록은 최근 순으로 100개가 차면 멈춘다.
+- R17. `relay-sessions { requesterSessionId }` → 닿는 세션 최대 100개 `{ id, directory, title, active, updatedAt, delegated }`(최근 순).
+  `relay-read { requesterSessionId, sessionId, limit≤200, beforeSeq? | afterSeq? }` → 서버 메시지 한 페이지를 **이 PC에서 복호화**해
+  `{ session: { id, directory, active }, messages: [{ seq, localId, createdAt, content }] }`(오래된 순, 복호화 실패 줄은 뺌). 서버 읽기 실패는 `relay_failed`.
+- R18. `relay-prompt { requesterSessionId, sessionId, localId, text }` → 살아 있는 세션에만 사용자 메시지를 세션 키로 암호화해 보낸다
+  (`meta.sentFrom: "agent-delegation"`, `meta.delegatedFrom: { machineId: peer, sessionId: requester }`). 살아 있지 않으면 `session_not_running`(재개 없음).
+  steer·stop·권한 응답·재개는 relay에 없다. 세션 데이터 키는 여전히 이 PC를 떠나지 않는다(R9).
+- R19. 오케스트레이션 안내의 "연결한 PC의 내 대화" 줄(조회·`read`·`wait`·`prompt`만, seq 관찰 대신 일반 `wait`/`read`)은 relay를 쓰는 saycode-cli(0.9.17)를 묶는 핀 갱신에서 함께 넣는다 — 프롬프트 테스트가 묶음 버전과 줄의 유무를 맞춘다.
+
 ### 광고·안내
 
 - R11. 위임을 지원하는 데몬은 머신 metadata에 `agentDelegation: { version: 1 }`을 광고한다(`MachineMetadataSchema`에 추가 — 없으면 strip).

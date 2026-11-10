@@ -31,6 +31,13 @@
 - [x] H8. `agentOrchestrationPrompt.ts` 한 줄(R12). 묶음 saycode-cli 핀(R13)은 Desktop CLI 릴리스 후 지휘 세션 → 검증: 프롬프트 테스트, `pnpm test`
 - [ ] H9. 교차 리뷰·PR·리뷰봇·rebase → 검증: PR MERGEABLE·CI 초록 (릴리스는 지휘 세션)
 
+## Phase 5: 제한 relay (A7·A8, 2026-11-10 승인)
+
+- [x] H10. relay 세 메서드와 허용 목록, 요청마다 연결·키·(자식 또는 서버 소유 판정) 집행, 같은 `session_not_found` → 검증: `agentDelegationRelay.test.ts`·`delegationLane.test.ts`
+- [x] H11. 데몬 glue(세션 키 목록·서버 페이지·암호화·이 PC로 묻는 소유 판정) → 검증: `agentDelegationRelayHost.test.ts`
+- [x] H12. 오케스트레이션 안내 줄의 버전 게이트(0.9.17) → 검증: `agentOrchestrationPrompt.eval.test.ts`
+- [ ] H13. PR·CI·리뷰봇 → 검증: PR MERGEABLE (릴리스·saycode-cli 핀은 Desktop CLI 머지 뒤)
+
 ## 승인 필요한 변경 (해당 시)
 
 - [x] Desktop Draft PR 승인 항목 A2·A4와 결정 D-1·D-5·D-6 — 2026-11-08 승인

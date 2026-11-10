@@ -144,6 +144,16 @@ describe('browser task agent tools', () => {
         expect(out.hint).toContain('same requestId')
     })
 
+    it('sends the user to the console Spaces panel on a full space limit instead of asking for a taskSpaceId', async () => {
+        const createSpace = vi.fn(async () => { throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Profile has reached its space limit', true, false, 'spaces') })
+        const out = parse(await (await connect({ createSpace })).callTool({ name: 'browser_task_create_space', arguments: {} }))
+        expect(out.error).toMatchObject({ code: 'QUOTA_EXCEEDED', quotaKind: 'spaces' })
+        for (const text of ['Spaces', '작업 공간', 'close', 'taskSpaceId', 'browser_task_join_space'])
+            expect(out.userAction).toContain(text)
+        const other = vi.fn(async () => { throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Profile has reached its active tab limit', true, false, 'tabs') })
+        expect(parse(await (await connect({ createTask: other })).callTool({ name: 'browser_task_create', arguments: { taskSpaceId: 's' } })).userAction).toBeUndefined()
+    })
+
     it('submit_batch defaults waitMs, fills step ids and timeouts', async () => {
         const submitBatch = vi.fn(async () => ({ batchId: 'b', accepted: true, task: {} }))
         const client = await connect({ submitBatch })

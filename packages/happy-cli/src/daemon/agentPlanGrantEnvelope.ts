@@ -43,9 +43,13 @@ export type AgentPlanGrant = { grantId: string; secret: string; model: AgentPlan
 
 export type AgentPlanSpawnParam = { grantEnvelope: string }
 
-/** `undefined` on Windows: the plan path is designed for macOS/Linux daemons only (spec §6.3-5). */
-export function agentPlanCapabilityForPlatform(platform: NodeJS.Platform): typeof AGENT_PLAN_CAPABILITY | undefined {
-    return platform === 'win32' ? undefined : AGENT_PLAN_CAPABILITY
+/**
+ * Every daemon platform publishes the plan. Windows was left out while the token path was a Unix socket (spec §6.3-5);
+ * it is now a 127.0.0.1 TCP proxy, the same transport the codex-multi-auth proxy already uses on Windows
+ * (aplus-dev-studio specs/agent-plan-full-capability R4). Kept as a function so a platform can be withdrawn in one place.
+ */
+export function agentPlanCapabilityForPlatform(_platform: NodeJS.Platform): typeof AGENT_PLAN_CAPABILITY | undefined {
+    return AGENT_PLAN_CAPABILITY
 }
 
 /**

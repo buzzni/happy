@@ -13,7 +13,7 @@
  */
 import { readTrustedStudioOrigin } from '@/daemon/setupTokenBindingProof'
 
-/** Advertised in machine metadata as `agentPlan`. Only macOS/Linux daemons publish it (spec §6.3-5). */
+/** Advertised in machine metadata as `agentPlan` by every daemon platform (see `agentPlanCapabilityForPlatform`). */
 export const AGENT_PLAN_CAPABILITY = { version: 1 as const }
 
 /** Spawn seeds: read and deleted by the runner, never inherited (childEnv `HAPPY_INITIAL_`). */
@@ -31,10 +31,19 @@ export const AGENT_PLAN_PROVIDER_ID = 'saycode-plan'
 export const AGENT_PLAN_DESCRIPTOR_VERSION = 1
 
 /**
- * Plan models and their Codex context settings. The window matches the gateway's per-model input cap
- * (web-ui `AGENT_PLAN_MODEL_CAPS`); compaction leaves room for instructions and tool definitions.
+ * Provider API context (1,050,000) for all four plan models, verified 2026-11-10:
+ * https://developers.openai.com/api/docs/models/gpt-6.1-sol (also Luna, Terra and Astra).
+ * Compaction leaves the provider's 128k output budget plus 22k for framing/tool definitions.
  */
 const AGENT_PLAN_MODEL_CONTEXT = {
+    'gpt-6-luna': { contextWindow: 1050000, autoCompactTokenLimit: 900000 },
+    'gpt-6.1-terra': { contextWindow: 1050000, autoCompactTokenLimit: 900000 },
+    'gpt-6.1-sol': { contextWindow: 1050000, autoCompactTokenLimit: 900000 },
+    'gpt-6-astra': { contextWindow: 1050000, autoCompactTokenLimit: 900000 },
+} as const
+
+// Read compatibility only: saved sessions are validated here, then upgraded to provider settings.
+const LEGACY_AGENT_PLAN_MODEL_CONTEXT = {
     'gpt-6-luna': { contextWindow: 128000, autoCompactTokenLimit: 100000 },
     'gpt-6.1-terra': { contextWindow: 128000, autoCompactTokenLimit: 100000 },
     'gpt-6.1-sol': { contextWindow: 64000, autoCompactTokenLimit: 48000 },
@@ -129,7 +138,8 @@ export function readAgentPlanDescriptor(raw: string, trustedOrigin: string | nul
         grantId: String(fields.grantId),
         model: String(fields.model),
     })
-    if (!rebuilt || serializeAgentPlanDescriptor(rebuilt) !== raw) {
+    if (!rebuilt || (serializeAgentPlanDescriptor(rebuilt) !== raw
+        && serializeAgentPlanDescriptor({ ...rebuilt, ...LEGACY_AGENT_PLAN_MODEL_CONTEXT[rebuilt.model] }) !== raw)) {
         throw new AgentPlanLaunchError('agent_plan_descriptor_invalid', 'not the descriptor this contract writes')
     }
     return rebuilt

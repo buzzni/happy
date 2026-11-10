@@ -63,6 +63,17 @@ describe('natural-language child orchestration routing eval (T14)', () => {
     );
   });
 
+  // aplus-dev-studio specs/cross-machine-agent-delegation R17–R20 (A8) — own conversations on a linked PC: read and prompt only.
+  // The line arrives with the saycode-cli that lists and relays them (0.9.17); the bump that bundles it must add it.
+  it('lets the model read and prompt the user\'s own conversations on a linked PC only with a bundled saycode-cli that relays them', () => {
+    const [major, minor, patch] = BUNDLED_SAYCODE_CLI_VERSION.split('.').map(Number);
+    const atLeast0917 = major > 0 || minor > 9 || (minor === 9 && patch >= 17);
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT.includes('`reach: "owned-remote"`')).toBe(atLeast0917);
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT.includes('you may `read`, `wait` and `prompt` it, but never `steer` or `stop` it')).toBe(atLeast0917);
+    // Seq observation reads committed server history, which a relayed session cannot offer (Desktop R19).
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT.includes('use plain `wait`/`read` for it, not `--after-seq`')).toBe(atLeast0917);
+  });
+
   it('routes an explicitly durable child away from provider-native subagents', () => {
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('visible, reopenable, or controllable later');
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('MUST use `happy agent`');

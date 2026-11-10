@@ -25,6 +25,7 @@ import {
 import { HAPPY_AI_AUTH_CONNECTION_VERSION_ENV, HAPPY_AI_AUTH_SOURCE_ENV } from '@/usage/aiAuthSource'
 import { AGENT_PLAN_THREADS_DIR_ENV, isAgentPlanThread } from '@/launcher/agentPlanThreads'
 import { startAgentPlanProxy } from './agentPlanProxy'
+import { createAgentPlanWebSearch, type AgentPlanWebSearchResult } from './agentPlanWebSearch'
 
 const SECRET = /^[A-Za-z0-9_-]{16,200}$/
 const KEY_EXCHANGE_TIMEOUT_MS = 15_000
@@ -156,6 +157,8 @@ export function createAgentPlanKeySource(options: {
 export type AgentPlanSession = {
     /** The Codex `-c` arguments: plan provider through the local proxy, grant model, context, web search off. */
     providerArgs: string[]
+    /** Hosted web search through the gateway, for the runner's Happy MCP `web_search` tool (Codex sends none for plan models). */
+    webSearch: (query: string) => Promise<AgentPlanWebSearchResult>
     close(): Promise<void>
 }
 
@@ -199,6 +202,11 @@ export async function startAgentPlanSession(input: {
     input.env[AGENT_PLAN_PROXY_KEY_ENV] = clientKey
     return {
         providerArgs: agentPlanCodexArgs(descriptor, `${proxy.baseUrl}/v1`),
+        webSearch: createAgentPlanWebSearch({
+            url: agentPlanGatewayResponsesUrl(descriptor),
+            sessionKey: () => keys.current(),
+            fetchImpl: input.fetchImpl,
+        }),
         close: () => proxy.close(),
     }
 }

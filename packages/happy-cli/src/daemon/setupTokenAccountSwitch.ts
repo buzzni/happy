@@ -362,6 +362,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       const session = deps.findSession(sessionId);
       const currentId = parsed?.binding.managedAccountId ?? (shared ? shared.recorded : undefined);
       if (!session || !currentId || parsed && session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV] !== running) return { ok: false as const, reason: 'CAPACITY_STALE_BINDING' };
+      let stage: 'prepare' | 'request' | 'response' = 'prepare';
       try {
         let generation: number | undefined;
         if (operation === 'reserve' || operation === 'claim' || operation === 'observe') {
@@ -373,11 +374,15 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
           if (operation === 'claim' && (extra?.managedAccountId !== currentId || extra?.credentialGeneration !== generation || disabled.includes(currentId))) return { ok: false as const, reason: 'CAPACITY_BINDING_FORBIDDEN' };
           if (operation === 'reserve') extra = { ...extra, excludeManagedAccountIds: disabled };
         }
+        const body = JSON.stringify({ ...extra, companyId: actor.companyId, machineId: deps.machineId, sessionId, requestId: actor.requestId, contentHash: actor.contentHash, actorProof: actor.proof, runtimeId });
+        const authorization = `Bearer ${deps.bearer()}`;
+        stage = 'request';
         const response = await deps.fetch(studioMachineRouteUrl(deps.studioOrigin, `capacity/${operation}`), {
           method: 'POST', redirect: 'error', signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
-          headers: { Authorization: `Bearer ${deps.bearer()}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...extra, companyId: actor.companyId, machineId: deps.machineId, sessionId, requestId: actor.requestId, contentHash: actor.contentHash, actorProof: actor.proof, runtimeId }),
+          headers: { Authorization: authorization, 'Content-Type': 'application/json' },
+          body,
         });
+        stage = 'response';
         if (!response.ok) {
           // Only the capacity handler speaks CAPACITY_*; anything else (the global auth gate, a proxy) is named by its status.
           const refusal = await response.json().catch(() => null) as { error?: unknown } | null;
@@ -395,7 +400,15 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
           admission.requiresMove = admission.managedAccountId !== currentId;
         }
         return { ok: true as const, admission };
-      } catch { return { ok: false as const, reason: 'CAPACITY_UNAVAILABLE' }; }
+      } catch (error) {
+        // Only a request that left this PC can blame Studio; the caller giving up is not Studio being slow.
+        const reason = stage !== 'request' || signal?.aborted ? 'CAPACITY_UNAVAILABLE'
+          : (error as Error)?.name === 'TimeoutError' ? 'CAPACITY_STUDIO_TIMEOUT' : 'CAPACITY_STUDIO_UNREACHABLE';
+        // fetch's own message is just "fetch failed"; the socket error code (ECONNRESET, ENOTFOUND...) is on its cause.
+        const cause = (error as { cause?: { code?: unknown } })?.cause?.code;
+        logger.debug(`[setup-token-switch] capacity ${operation} for ${sessionId} failed at ${stage}: ${(error as Error)?.name ?? 'error'}: ${(error as Error)?.message ?? ''}${typeof cause === 'string' ? ` (${cause})` : ''} -> ${reason}`);
+        return { ok: false as const, reason };
+      }
     },
     async requestStart(sessionId: string, running: string, requestId: string, signal?: AbortSignal) {
       const shared = sharedSession(sessionId, running)

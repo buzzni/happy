@@ -17,8 +17,7 @@ async function runSource(): Promise<string> {
 }
 
 describe('agentPlan capability', () => {
-    it('is advertised by this (non-Windows) daemon next to the untouched aiAuthSelection', () => {
-        expect(process.platform).not.toBe('win32')
+    it('is advertised by this daemon next to the untouched aiAuthSelection', () => {
         expect(initialMachineMetadata.agentPlan).toEqual({ version: 1 })
         expect(initialMachineMetadata.aiAuthSelection).toEqual({ version: 1 })
     })
