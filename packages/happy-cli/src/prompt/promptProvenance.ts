@@ -81,13 +81,18 @@ const CLIENT_TURN_BLOCK_CANDIDATE = /^<!-- saycode:client-turn-prompt:([a-z0-9]+
  */
 export function splitClientTurnPromptBlocks(prompt: string | undefined): { standing: string | undefined; turn: string | undefined } {
   if (!prompt) return { standing: prompt, turn: undefined };
-  const blocks = [...prompt.matchAll(CLIENT_TURN_BLOCK_CANDIDATE)]
-    .map((match) => match[0])
-    .filter((block) => stripClientTurnPromptBlocks(block) === undefined);
+  const blocks = clientTurnPromptBlocks(prompt);
   return {
     standing: stripClientTurnPromptBlocks(prompt),
     turn: blocks.length > 0 ? blocks.join('\n\n') : undefined,
   };
+}
+
+function clientTurnPromptBlocks(prompt: string | undefined): string[] {
+  if (!prompt) return [];
+  return [...prompt.matchAll(CLIENT_TURN_BLOCK_CANDIDATE)]
+    .map((match) => match[0])
+    .filter((block) => stripClientTurnPromptBlocks(block) === undefined);
 }
 
 /**
