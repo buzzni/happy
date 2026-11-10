@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, parse, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager';
 import { configuration } from '@/configuration';
@@ -826,6 +826,27 @@ describe('file RPCs for a folder the machine owner approved', () => {
         await expect(handlers.get('listWorkspaceDirectory')?.({ workspaceRoot: project, path: project })).resolves.toMatchObject({ success: false, errorCode: 'WORKSPACE_PATH_DENIED' });
         await expect(handlers.get('readWorkspaceFile')?.({ workspaceRoot: project, path: join(project, 'README.md') })).resolves.toMatchObject({ success: false });
         await expect(handlers.get('writeWorkspaceFile')?.({ workspaceRoot: project, path: join(project, 'other.md'), content: 'eA==', expectedHash: null })).resolves.toMatchObject({ success: false });
+    });
+
+    // specs/approved-folder-roots R9: an approved drive opens everything below it, but never deletes it or what holds home.
+    it('opens an approved filesystem root and refuses to delete it or an ancestor of the working directory', async () => {
+        // Real path: the workspace RPCs refuse a link on the way down from the anchor (macOS /var is one).
+        const outside = await realpath(await mkdtemp(join(tmpdir(), 'happy-approved-drive-')));
+        temporaryDirectories.push(outside);
+        await writeFile(join(outside, 'README.md'), 'hello');
+        const root = parse(resolve(outside)).root;
+        // A parent this test owns, so a failing refusal can only remove its own fixture.
+        const parent = await mkdtemp(join(tmpdir(), 'happy-approved-home-parent-'));
+        temporaryDirectories.push(parent);
+        const home = join(parent, 'home');
+        await mkdir(home);
+        await writeFile(join(home, 'keep.txt'), 'keep');
+
+        const { handlers } = await createHandlers(home, { approvedRoots: () => [root] });
+        await expect(handlers.get('listDirectory')?.({ path: outside })).resolves.toMatchObject({ success: true });
+        await expect(handlers.get('listWorkspaceDirectory')?.({ workspaceRoot: outside, path: outside })).resolves.toMatchObject({ success: true });
+        await expect(handlers.get('deleteFile')?.({ path: parent })).resolves.toMatchObject({ success: false });
+        expect(await readdir(home)).toEqual(['keep.txt']);
     });
 
     // The discovery worker reads only on macOS (fileDiscovery.ts).

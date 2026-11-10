@@ -41,6 +41,7 @@ export function validatePath(targetPath: string, workingDirectory: string, appro
     return { valid: true, resolvedPath: resolvedTarget };
 }
 
-function isWithin(target: string, root: string): boolean {
-    return target === root || target.startsWith(root + sep);
+/** A drive or filesystem root (`C:\\`, `/`) already ends with the separator. */
+export function isWithin(target: string, root: string): boolean {
+    return target === root || target.startsWith(root.endsWith(sep) ? root : root + sep);
 }

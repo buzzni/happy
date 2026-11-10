@@ -6,7 +6,7 @@ import { exec, ExecOptions } from 'child_process';
 import { promisify } from 'util';
 import { open, readFile, writeFile, readdir, stat, mkdir, rename, rm, cp } from 'fs/promises';
 import { createHash } from 'crypto';
-import { dirname, join, basename, extname, isAbsolute, resolve, sep } from 'path';
+import { dirname, join, basename, extname, isAbsolute, resolve } from 'path';
 import { run as runRipgrep } from '@/modules/ripgrep/index';
 import { run as runDifftastic } from '@/modules/difftastic/index';
 import { RpcHandlerManager } from '../../api/rpc/RpcHandlerManager';
@@ -14,7 +14,7 @@ import type { AiAuthSelection } from '@/daemon/sessionEnv';
 import type { ReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
 import type { AiAuthSource } from '@/usage/aiAuthSource';
 import type { AgentPlanSpawnParam } from '@/daemon/agentPlanGrantEnvelope';
-import { validatePath } from './pathSecurity';
+import { isWithin, validatePath } from './pathSecurity';
 import { isStrictlyGuardedPath } from './happyHomeGuard';
 import { ensureDirectory } from './ensureDirectory';
 import { createWriteFileAttemptStore, isValidWriteFileAttemptId } from './writeFileAttempts';
@@ -622,7 +622,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
     const workspaceAnchor = (workspaceRoot: unknown) => {
         if (typeof workspaceRoot !== 'string' || !isAbsolute(workspaceRoot)) return workingDirectory;
         const root = resolve(workspaceRoot);
-        const encloses = (folder: string) => root === resolve(folder) || root.startsWith(resolve(folder) + sep);
+        const encloses = (folder: string) => isWithin(root, resolve(folder));
         return encloses(workingDirectory) ? workingDirectory : options.approvedRoots?.().find(encloses) ?? workingDirectory;
     };
     rpcHandlerManager.registerHandler('file-discovery', (request: unknown) => fileDiscovery(workspaceAnchor((request as { root?: unknown } | null)?.root), request));
@@ -1089,8 +1089,9 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
 
         try {
             // Prevent deletion of the project root directory
+            // ...or anything holding it or an approved folder: an approved drive reaches the folders above home.
             const resolvedWorkingDir = resolve(workingDirectory);
-            if (validation.resolvedPath === resolvedWorkingDir || options.approvedRoots?.().some((root) => resolve(root) === validation.resolvedPath)) {
+            if ([resolvedWorkingDir, ...(options.approvedRoots?.() ?? []).map((root) => resolve(root))].some((root) => isWithin(root, validation.resolvedPath!))) {
                 return { success: false, error: 'Cannot delete the project root directory' };
             }
 
