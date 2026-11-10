@@ -287,8 +287,9 @@ async function runClaudeRemote(
     prepareSandbox: typeof prepareClaudeProcessSandbox,
 ) {
     // Check if session is valid
+    const canCheckTranscript = opts.sandboxPolicyMode !== 'mandatory' && !opts.completeTurn;
     let startFrom = opts.sessionId;
-    if (opts.sandboxPolicyMode !== 'mandatory' && opts.sessionId && !opts.completeTurn && !claudeCheckSession(opts.sessionId, opts.path)) {
+    if (canCheckTranscript && opts.sessionId && !claudeCheckSession(opts.sessionId, opts.path)) {
         startFrom = null;
     }
     
