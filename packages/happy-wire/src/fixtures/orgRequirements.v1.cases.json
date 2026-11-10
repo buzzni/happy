@@ -1107,7 +1107,7 @@
     ]
   },
   "modelNormalization": {
-    "about": "spec R10.2: the model a turn asked for (meta.model, else the spawn seed) as a Studio selection key <agent>:<model id>. Values each client really sends (T11 4, 2026-10-31): Desktop sends catalog ids and omits model for Default/Auto; happy-app sends aliases opus/sonnet/haiku and null for Default; automations send catalog ids or null; Studio keeps claude-fable-5 as an alias of claude-fable-5-1. null means no model was chosen (R10.2a decides); unknown cannot be normalized (requirement_model_unknown). Aliases follow the newest catalog model of each tier and are re-checked when the Claude CLI alias resolution or the Studio catalog moves.",
+    "about": "spec R10.2: the model a turn asked for (meta.model, else the spawn seed) as a Studio selection key <agent>:<model id>. Values each client really sends (T11 4, 2026-10-31): Desktop sends catalog ids and omits model for Default/Auto; happy-app sends aliases opus/sonnet/haiku and null for Default; automations send catalog ids or null; Studio keeps the retired claude-fable-5 and claude-fable-5-1 as aliases of claude-fable-5-2. null means no model was chosen (R10.2a decides); unknown cannot be normalized (requirement_model_unknown). Aliases follow the newest catalog model of each tier and are re-checked when the Claude CLI alias resolution or the Studio catalog moves.",
     "cases": [
       {
         "name": "Desktop sends the catalog key",
@@ -1155,7 +1155,7 @@
         "name": "fable alias names the newest fable",
         "agent": "claude",
         "model": "fable",
-        "expect": "claude:claude-fable-5-1"
+        "expect": "claude:claude-fable-5-2"
       },
       {
         "name": "an alias with a context suffix is still the alias",
@@ -1164,10 +1164,16 @@
         "expect": "claude:claude-sonnet-5-5"
       },
       {
-        "name": "retired claude-fable-5 is the Studio alias of claude-fable-5-1",
+        "name": "retired claude-fable-5 is the Studio alias of claude-fable-5-2",
         "agent": "claude",
         "model": "claude-fable-5",
-        "expect": "claude:claude-fable-5-1"
+        "expect": "claude:claude-fable-5-2"
+      },
+      {
+        "name": "retired claude-fable-5-1 is the Studio alias of claude-fable-5-2",
+        "agent": "claude",
+        "model": "claude-fable-5-1",
+        "expect": "claude:claude-fable-5-2"
       },
       {
         "name": "a Z.AI model a Studio machine offers keeps its id",

@@ -511,7 +511,7 @@ describe('difficulty routing runtime', () => {
       state: { difficulty: 'hard', hardTurns: 3, updatedAt: Date.now() - 1000 },
     })
 
-    expect(asDecision(decision).route.model).toBe('claude-fable-5-1')
+    expect(asDecision(decision).route.model).toBe('claude-fable-5-2')
     expect(asDecision(decision).pending.temporaryEscalation).toBe(true)
     expect(asDecision(decision).pending.base).toMatchObject({ difficulty: 'hard', model: 'claude-opus-5-5' })
     expect(asDecision(decision).pending.decisionReasons).toContain('temporary-escalation')
@@ -1638,7 +1638,7 @@ describe('previous actual applied route on the wire (R8)', () => {
       ...baseInput,
       contentText: 'refactor the auth module',
       state: stateWith({
-        model: 'claude-fable-5-1',
+        model: 'claude-fable-5-2',
         effort: 'high',
         difficulty: 'escalated',
         kind: 'auto',
@@ -1649,7 +1649,7 @@ describe('previous actual applied route on the wire (R8)', () => {
     // The base underneath the escalation was opus; what actually ran was fable.
     expect(asDecision(decision).event.ev).toMatchObject({
       t: 'difficulty-routing',
-      result: { previousApplied: { model: 'claude-fable-5-1', effort: 'high', difficulty: 'escalated' } },
+      result: { previousApplied: { model: 'claude-fable-5-2', effort: 'high', difficulty: 'escalated' } },
     })
   })
 
@@ -1728,7 +1728,7 @@ describe('org allowlist written before a table change', () => {
   // floor, so the whole conversation would stay there.
   it('shouldSubstituteAtThePairTheModelRanForTheRoutedTier (claude)', async () => {
     vi.stubGlobal('fetch', allowlistFetch(
-      ['claude:claude-haiku-4-5', 'claude:claude-opus-5-5', 'claude:claude-fable-5-1'],
+      ['claude:claude-haiku-4-5', 'claude:claude-opus-5-5', 'claude:claude-fable-5-2'],
       'claude:claude-opus-5-5',
     ))
 

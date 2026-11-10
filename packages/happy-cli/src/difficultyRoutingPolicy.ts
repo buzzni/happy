@@ -17,6 +17,8 @@
 // (escalated 는 한 턴짜리이지 floor 가 아니다 — Desktop difficultyForModel 과 같다).
 // 옛 opus-5-5/low · gpt-6-sol/low·high · gpt-6-astra/medium 도 계속 인식한다.
 // 두 모델은 Claude Code 2.1.284+ · Codex 0.159+ 에서만 실행된다.
+// 2026-11-10: claude escalated 를 Fable 5.2(claude-fable-5-2)/medium 으로 옮긴다. 옛
+// fable-5-1 의 high/medium 은 escalated 로 계속 인식한다. Claude Code 2.1.290+ 에서만 실행된다.
 
 export type RoutableAgent = 'claude' | 'codex'
 export type Difficulty = 'trivial' | 'routine' | 'hard' | 'escalated'
@@ -40,7 +42,7 @@ export const USER_REQUEST_MODELS: Record<RoutableAgent, Record<Difficulty, Route
     trivial: { model: 'claude-haiku-5-5', effort: 'low' },
     routine: { model: 'claude-sonnet-5-5', effort: 'medium' },
     hard: { model: 'claude-opus-5-5', effort: 'high' },
-    escalated: { model: 'claude-fable-5-1', effort: 'medium' },
+    escalated: { model: 'claude-fable-5-2', effort: 'medium' },
   },
   codex: {
     trivial: { model: 'gpt-6-luna', effort: 'low' },
@@ -98,6 +100,10 @@ export const KNOWN_ROUTE_TIERS: ReadonlyArray<{
   { agent: 'claude', model: 'claude-fable-5-1', effort: 'medium', tier: 'escalated' },
   // --- claude, 2026-09-30 table (Claude Code 2.1.284+) ---
   { agent: 'claude', model: 'claude-sonnet-5-5', effort: 'medium', tier: 'routine' },
+  // --- claude, 2026-11-10 table (Fable 5.2, Claude Code 2.1.290+). high is kept
+  //     readable like the 5.1 pair before it. ---
+  { agent: 'claude', model: 'claude-fable-5-2', effort: 'medium', tier: 'escalated' },
+  { agent: 'claude', model: 'claude-fable-5-2', effort: 'high', tier: 'escalated' },
   // --- codex, generation shipped by this CLI ---
   { agent: 'codex', model: 'gpt-5.6-luna', effort: 'low', tier: 'trivial' },
   { agent: 'codex', model: 'gpt-5.6-terra', effort: 'high', tier: 'routine' },

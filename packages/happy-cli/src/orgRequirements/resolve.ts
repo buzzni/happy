@@ -176,15 +176,16 @@ export function clampPermissionMode(agent: OrgAgent, mode: string, ceiling: stri
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Claude CLI tier aliases (happy-app sends them) and the Studio alias of the retired Fable key, as
+ * Claude CLI tier aliases (happy-app sends them) and the Studio aliases of the retired Fable keys, as
  * the newest catalog model of each tier. Re-checked when the Claude CLI or the Studio catalog moves.
  */
 const CLAUDE_MODEL_ALIASES: ReadonlyMap<string, string> = new Map([
     ['opus', 'claude-opus-5-5'],
     ['sonnet', 'claude-sonnet-5-5'],
     ['haiku', 'claude-haiku-5-5'],
-    ['fable', 'claude-fable-5-1'],
-    ['claude-fable-5', 'claude-fable-5-1'],
+    ['fable', 'claude-fable-5-2'],
+    ['claude-fable-5', 'claude-fable-5-2'],
+    ['claude-fable-5-1', 'claude-fable-5-2'],
 ]);
 /** Agents Studio keys by agent alone: any model is `<agent>:*`. */
 const WILDCARD_AGENTS: ReadonlySet<OrgAgent> = new Set(['grok', 'openclaw', 'opencode']);

@@ -477,7 +477,7 @@ describe('difficultyRouting previousApplied contract', () => {
   it('accepts a previous applied route for every producing kind', () => {
     for (const kind of ['auto', 'local-auto-bootstrap', 'manual']) {
       const parsed = parse({
-        previousApplied: { model: 'claude-fable-5-1', effort: 'high', difficulty: 'escalated', kind },
+        previousApplied: { model: 'claude-fable-5-2', effort: 'high', difficulty: 'escalated', kind },
       });
       expect(parsed.success, kind).toBe(true);
     }
