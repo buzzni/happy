@@ -23,8 +23,10 @@ describe('personal browser launch', () => {
         expect(args).toContain('--remote-debugging-pipe')
         expect(args).toContain('--user-data-dir=/p/profile')
         expect(args.some(arg => arg.startsWith('--remote-debugging-port') || arg.startsWith('--headless'))).toBe(false)
-        // No window until an agent opens a page: a prepared PC does not show an empty browser.
-        expect(args).toContain('--no-startup-window')
+        // A Mac Chrome started without a startup window under a debugging pipe ignores the user's Quit;
+        // the session closes the startup window instead. Windows keeps opening none.
+        expect(args).not.toContain('--no-startup-window')
+        expect(personalBrowserArgs('win32', 'C:\\p')).toContain('--no-startup-window')
         expect(args).not.toContain('about:blank')
     })
 
