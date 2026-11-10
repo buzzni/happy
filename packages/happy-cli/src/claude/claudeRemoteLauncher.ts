@@ -1,3 +1,5 @@
+import { claudeOwnerEnvironment } from '../daemon/claudeOwnerBundle'
+import { runAiCredentialCommand } from '../daemon/aiCredentialRuntime'
 import { waitForSetupTokenStart, waitForSharedSetupTokenStart } from './setupTokenStartBudget';
 import { requestSetupTokenStart, requestSetupTokenCapacity } from '../daemon/controlClient';
 import { createSetupTokenCapacityRuntime } from './setupTokenUserCapacity';
@@ -676,7 +678,16 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     }
 
     function onMessage(message: SDKMessage) {
-        if (isClaudeAuthenticationFailure(message) && !personalFallback?.identity() && !providerStale()) {
+        if (process.env.HAPPY_CLAUDE_OWNER_IDENTITY && isClaudeAuthenticationFailure(message)) {
+            session.client.sendSessionEvent({ type: 'message', message: 'Claude error: [CLAUDE_OWNER_REFRESH_REQUIRED] Check the source PC.', isError: true });
+            // Keep the provider lifecycle event, but suppress local-login recovery for an owner-managed account.
+            const notice = 'Claude error: [CLAUDE_OWNER_REFRESH_REQUIRED] Check the source PC.';
+            if (message.type === 'result' && message.subtype === 'success') message = { ...message, result: notice };
+            else if (message.type === 'result') message = { ...message, errors: [notice] };
+            else if (message.type === 'assistant') message = { ...message, message: { ...message.message,
+                content: message.message.content.map(block => block.type === 'text' ? { ...block, text: notice } : block) } };
+        }
+        if (!process.env.HAPPY_CLAUDE_OWNER_IDENTITY && isClaudeAuthenticationFailure(message) && !personalFallback?.identity() && !providerStale()) {
             lastOrganizationAuthenticationFailed = true; personalFallback?.noteOrganizationAuthentication(true);
             setupTokenSwitching?.onAuthenticationFailure(isClaudeRevokedTokenFailure(message));
         }
@@ -977,6 +988,15 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         // See: https://github.com/anthropics/happy-cli/issues/143
         let previousSessionId: string | null = null;
         while (!exitReason) {
+            if (process.env.HAPPY_CLAUDE_OWNER_IDENTITY) {
+                try {
+                    const exported = await runAiCredentialCommand('cswap', ['oauth-owner', 'active'], { maxOutputBytes: 1024 * 1024, timeoutMs: 120_000 });
+                    Object.assign(process.env, claudeOwnerEnvironment(exported.stdout, Date.now(), process.env.HAPPY_CLAUDE_OWNER_IDENTITY));
+                } catch {
+                    session.client.sendSessionEvent({ type: 'message', message: 'Claude error: [CLAUDE_OWNER_REFRESH_REQUIRED] Check the source PC.', isError: true });
+                    break;
+                }
+            }
             logger.debug('[remote]: launch');
             // Per generation, not per session — see the note at the call.
             /*
@@ -1434,6 +1454,23 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             return null;
                         }
 
+                        // A new owner bearer belongs to the next uncommitted input, never a replay of a failed turn.
+                        if (msg && process.env.HAPPY_CLAUDE_OWNER_IDENTITY) {
+                            try {
+                                const exported = await runAiCredentialCommand('cswap', ['oauth-owner', 'active'], { maxOutputBytes: 1024 * 1024, timeoutMs: 120_000 });
+                                const environment = claudeOwnerEnvironment(exported.stdout, Date.now(), process.env.HAPPY_CLAUDE_OWNER_IDENTITY);
+                                if (environment.CLAUDE_CODE_OAUTH_TOKEN !== process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+                                    Object.assign(process.env, environment);
+                                    pending = msg;
+                                    drain?.releaseClaim();
+                                    return null;
+                                }
+                            } catch {
+                                session.client.sendSessionEvent({ type: 'message', message: 'Claude error: [CLAUDE_OWNER_REFRESH_REQUIRED] Check the source PC.', isError: true });
+                                drain?.releaseClaim();
+                                return null;
+                            }
+                        }
                         // Check if mode has changed
                         if (msg) {
                             // Preview without committing: a changed engine setting needs a
@@ -1696,7 +1733,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 logger.debug('[remote]: launch error', e);
                 const authenticationError = { is_error: true, result: e instanceof Error ? e.message : '' };
                 if (!exitReason && !controller.signal.aborted && !personalFallback?.identity() && !providerStale()
-                    && isClaudeAuthenticationFailure(authenticationError)) {
+                    && !process.env.HAPPY_CLAUDE_OWNER_IDENTITY && isClaudeAuthenticationFailure(authenticationError)) {
                     lastOrganizationAuthenticationFailed = true;
                     personalFallback?.noteOrganizationAuthentication(true);
                     setupTokenSwitching?.onAuthenticationFailure(isClaudeRevokedTokenFailure(authenticationError));
