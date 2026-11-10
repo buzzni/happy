@@ -59,7 +59,8 @@ export function createSetupTokenCapacityRuntime(deps: {
     }
   }
   async function report(entry: Entry, operation: string, extra: Record<string, unknown> = {}) {
-    const pending = (reports.get(entry) ?? Promise.resolve()).then(async () => {
+    // After the previous report whatever its outcome: one failed report must not fail every later one.
+    const pending = (reports.get(entry) ?? Promise.resolve()).catch(() => undefined).then(async () => {
       const seq = ++entry.seq; await save(entry)
       return send(entry, operation, { ...extra, seq })
     })
