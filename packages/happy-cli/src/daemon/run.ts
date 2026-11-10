@@ -4133,9 +4133,12 @@ export async function startDaemon(): Promise<void> {
             return { stopped: false, reason: 'standalone-drain', detail: 'native-exit-pending' };
           }
 
+          // Only a process that was actually signalled is on its way out; one the
+          // signal missed keeps running and must stay adoptable.
+          let signalSent = false;
           if (session.startedBy === 'daemon' && session.childProcess) {
             try {
-              session.childProcess.kill('SIGTERM');
+              signalSent = session.childProcess.kill('SIGTERM');
               logger.debug(`[DAEMON RUN] Sent SIGTERM to daemon-spawned session ${sessionId}`);
             } catch (error) {
               logger.debug(`[DAEMON RUN] Failed to kill session ${sessionId}:`, error);
@@ -4144,13 +4147,14 @@ export async function startDaemon(): Promise<void> {
             // For externally started sessions, try to kill by PID
             try {
               process.kill(pid, 'SIGTERM');
+              signalSent = true;
               logger.debug(`[DAEMON RUN] Sent SIGTERM to external session PID ${pid}`);
             } catch (error) {
               logger.debug(`[DAEMON RUN] Failed to kill external session PID ${pid}:`, error);
             }
           }
 
-          if (session.happySessionId) pidToStoppedSessionId.set(pid, session.happySessionId);
+          if (signalSent && session.happySessionId) pidToStoppedSessionId.set(pid, session.happySessionId);
           pidToTrackedSession.delete(pid);
           recoveredPendingSpawnStartedAt.delete(pid);
           sessionStartTimes.delete(pid);
