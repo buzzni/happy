@@ -91,7 +91,8 @@ export async function launchChrome(): Promise<LaunchedChrome> {
         kill,
         async stop() {
             await kill()
-            rmSync(userDataDir, { recursive: true, force: true })
+            // Chrome's helper processes can still write to the profile for a moment after the browser is killed (ENOTEMPTY).
+            rmSync(userDataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
         },
     }
 }

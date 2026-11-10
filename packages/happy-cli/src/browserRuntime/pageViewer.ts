@@ -7,7 +7,9 @@ export const pageViewerScript = String.raw`/** o: request, image, input, viewpor
 function createPageViewer(o) {
     const { image, input, text, status } = o;
     let view = null, frame = null;
-    let sequence = 0, polling = false, inputBusy = false, lost = false, composing = false, fitted = true;
+    // unanswered: the view whose input's answer never reached this console, when that (not a refusal) is the stop (lost).
+    // Only that view's receipt can lift the stop; a view opened since knows nothing of the input.
+    let sequence = 0, polling = false, inputBusy = false, lost = false, unanswered = null, composing = false, fitted = true;
     let confirmedAt = -Infinity, captureAge = 0, keyModifiers = 0;
     // Runtime serves a view one frame per 500 ms, or per 200 ms while this viewer holds the tab; a read inside that
     // interval (or over the profile's byte budget, reset each second) is refused, so the next one waits that long.
@@ -40,7 +42,7 @@ function createPageViewer(o) {
         keyModifiers = 0;
         clearImage();
         if (old && o.token())
-            await o.request('closePageView', { schemaVersion: 1, viewId: old.viewId });
+            return await o.request('closePageView', { schemaVersion: 1, viewId: old.viewId });
     }
     async function open(scope, tabId, stillCurrent) {
         sequence = 0; held.clear(); awaitFrame = false;
@@ -63,8 +65,24 @@ function createPageViewer(o) {
             status(text.unresolved, true);
             return;
         }
-        if (!result.status.draining && result.status.lastSettled >= sequence)
+        const answerLost = unanswered === owner;
+        if (result.status.draining || result.status.lastSettled < (answerLost ? result.status.lastAccepted : sequence))
+            return;
+        if (!answerLost) {
             status(text.confirmed);
+            return;
+        }
+        // An input whose answer never came back, and every input Runtime accepted has an outcome. Closing the view
+        // drains it (held keys and buttons are let go, an input still on its way is refused) and the host opens a new
+        // one; nothing is sent again. Only an unknown outcome keeps the stop.
+        const closed = await close();
+        if (!closed || closed.unknown) {
+            status(text.unresolved, true);
+            return;
+        }
+        lost = false; unanswered = null;
+        status(text.connecting);
+        o.render();
     }
     function track(event) {
         if (event.kind === 'key') event.type === 'keyDown' ? held.add('key:' + event.code) : held.delete('key:' + event.code);
@@ -192,7 +210,8 @@ function createPageViewer(o) {
             else if (result.state === 'rejected')
                 await discard([event, ...queue]);
             else {
-                lost = true;
+                // 'pending': a resent request answered from the receipt of one still running; its outcome is not here.
+                lost = true; unanswered = result.state === 'unknown' ? null : owner;
                 queue.length = 0;
                 status(result.state === 'unknown' ? text.unresolved : text.confirmed, true);
                 o.render();
@@ -209,7 +228,7 @@ function createPageViewer(o) {
             }
             queue.length = 0;
             if (!e?.known) {
-                lost = true;
+                lost = true; unanswered = owner;
                 status(text.unknown, true);
                 o.render();
                 void receipt().catch(o.fail);
@@ -342,7 +361,7 @@ function createPageViewer(o) {
         view: () => view,
         lost: () => lost,
         inputBusy: () => inputBusy,
-        clearLost: () => { lost = false; },
+        clearLost: () => { lost = false; unanswered = null; },
         clearQueue: () => { queue.length = 0; },
         /** A refused or failed request: nothing queued survives and the shown frame no longer counts as current. */
         halt: () => { queue.length = 0; confirmedAt = -Infinity; },
