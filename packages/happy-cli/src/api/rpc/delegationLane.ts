@@ -5,8 +5,10 @@ import type { DelegationLaneConfig, DelegationLink } from './types';
  * another machine may call with a delegation link key a person installed from Desktop.
  *
  * Enough to start an agent here under this machine's own policy, read that agent's session key, stop
- * it, and ask which Claude credentials this machine would use. Nothing that reads or writes a file,
- * runs a command, opens a terminal or touches a session this link did not create.
+ * it, and ask which Claude credentials this machine would use. The relay (R17–R22) reads and prompts
+ * that agent, or a session the server says is the requesting person's own — decrypted here, never by
+ * handing out a key. Nothing that reads or writes a file, runs a command, opens a terminal, steers,
+ * or stops a session this link did not create.
  *
  * An allowlist, not a denylist: a method added later stays closed to the lane until it is reviewed
  * and listed here.
@@ -14,6 +16,10 @@ import type { DelegationLaneConfig, DelegationLink } from './types';
 export const DELEGATION_LANE_METHODS: ReadonlySet<string> = new Set([
     'agent-delegation:spawn',
     'agent-delegation:session-key',
+    // Each checks the link, the key and (child or server-proven owner) again (`agentDelegationRelay.ts`).
+    'agent-delegation:relay-sessions',
+    'agent-delegation:relay-read',
+    'agent-delegation:relay-prompt',
     // Only for a session this link created (`admit`, wired by the daemon).
     'stop-session',
     'ai-credential:status',

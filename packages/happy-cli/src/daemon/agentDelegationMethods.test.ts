@@ -178,6 +178,21 @@ describe('agent-delegation RPCs', () => {
         expect(admit('ai-credential:status', {}, 'machine-a')).toBeNull();
     });
 
+    it('registers the relay only for a host that serves it, against the same link store', async () => {
+        expect(handlers.has('agent-delegation:relay-read')).toBe(false);
+        setup({ relay: {
+            sessions: () => [{ sessionId: 'child-1', directory: '/work/app', title: null, updatedAt: 1, encryptionKey: new Uint8Array(32), encryptionVariant: 'dataKey' }],
+            isSessionLive: () => true,
+            ownedBy: async () => new Set(),
+            fetchPage: async () => [],
+            decrypt: () => null,
+            postUserMessage: async () => undefined,
+        } });
+        expect(await call('agent-delegation:relay-sessions', { requesterSessionId: 'parent-1' }, PEER)).toEqual({ type: 'success', sessions: [] });
+        await call('agent-delegation:spawn', spawnRequest(), PEER);
+        expect((await call('agent-delegation:relay-sessions', { requesterSessionId: 'parent-1' }, PEER)).sessions.map((session: { id: string }) => session.id)).toEqual(['child-1']);
+    });
+
     it('installs, lists without keys, serves targets with keys, and revokes', async () => {
         expect(await call('agent-delegation:install-source', { targetMachineId: 'machine-b', keyId: 'k2', key: key(2), name: 'GPU PC', platform: 'linux' })).toEqual({ ok: true });
         const listed = await call('agent-delegation:list', {});
