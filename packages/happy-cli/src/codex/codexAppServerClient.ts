@@ -2090,7 +2090,7 @@ export class CodexAppServerClient {
      * Another client on the same CODEX_HOME (e.g. the Codex app) can archive a thread, and Codex refuses to
      * use an archived thread until it is unarchived. Using the thread from here means it is wanted again.
      */
-    private async requestUnarchivingThread(method: 'thread/resume', params: { threadId: string }): Promise<unknown> {
+    private async requestUnarchivingThread(method: 'thread/resume' | 'thread/fork', params: { threadId: string }): Promise<unknown> {
         return this.request(method, params).catch(async (error: unknown) => {
             if (!(error instanceof Error && /\bis archived\b/.test(error.message))) throw error;
             logger.debug(`[CodexAppServer] Unarchiving thread ${params.threadId} before ${method}`);
@@ -2133,7 +2133,7 @@ export class CodexAppServerClient {
             threadSource: null,
         };
 
-        const result = await this.request('thread/fork', params) as ForkConversationResponse;
+        const result = await this.requestUnarchivingThread('thread/fork', params) as ForkConversationResponse;
         this._threadId = result.thread.id;
         this.pointSubagentsAtMainThread();
         this.rememberNativeThreadMetadata(result.thread);
