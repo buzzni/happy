@@ -41,6 +41,7 @@ async function defaultRunCommand(command: ReviewObjectCommand): Promise<ReviewOb
   try {
     const result = await execFileAsync(command.executable, command.args, {
       cwd: command.cwd,
+      windowsHide: true,
       env: command.environmentVariables
         ? { ...process.env, ...command.environmentVariables }
         : process.env,

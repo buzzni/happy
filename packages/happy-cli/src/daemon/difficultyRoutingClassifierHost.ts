@@ -329,5 +329,5 @@ function spawnWorkerProcess(modelDirectory?: string): ChildProcess {
   if (!entry) throw new Error('difficulty routing worker cannot resolve happy entrypoint')
   // Native inference receives only explicit artifact/process settings, never CLI tokens.
   const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR, HOME: '/nonexistent', NODE_ENV: 'production', HAPPY_DIFFICULTY_ROUTING_MODEL_DIR: modelDirectory }
-  return spawn(process.execPath, [...process.execArgv, entry, 'difficulty-routing-worker'], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'], env })
+  return spawn(process.execPath, [...process.execArgv, entry, 'difficulty-routing-worker'], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'], env, windowsHide: true })
 }

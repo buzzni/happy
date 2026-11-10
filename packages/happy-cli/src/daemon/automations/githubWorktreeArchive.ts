@@ -65,10 +65,10 @@ export async function restoreArchivedGithubWorktreeChanges(input: {
   const info = await readFile(join(archiveFrom, 'info.json'), 'utf8')
     .then((text) => JSON.parse(text) as { worktreePath?: unknown; head?: unknown }, () => null)
   if (typeof info?.worktreePath !== 'string' || resolve(info.worktreePath) !== resolve(worktreePath)) return false
-  const { stdout: head } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worktreePath, encoding: 'utf8' })
+  const { stdout: head } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worktreePath, encoding: 'utf8', windowsHide: true })
   if (info.head !== head.trim()) return false
   const patch = join(archiveFrom, 'changes.patch')
-  if ((await stat(patch)).size > 0) await execFileAsync('git', ['apply', '--index', patch], { cwd: worktreePath })
+  if ((await stat(patch)).size > 0) await execFileAsync('git', ['apply', '--index', patch], { cwd: worktreePath, windowsHide: true })
   const untracked = join(archiveFrom, 'untracked')
   if (await stat(untracked).then(() => true, () => false)) await cp(untracked, worktreePath, { recursive: true })
   await rm(archiveFrom, { recursive: true, force: true })

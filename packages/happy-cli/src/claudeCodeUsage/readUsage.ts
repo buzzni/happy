@@ -43,6 +43,7 @@ async function detectInstalled(): Promise<{ installed: boolean; version?: string
     try {
         const { stdout } = await execFileAsync('claude', ['--version'], {
             timeout: SPAWN_TIMEOUT_MS,
+            windowsHide: true,
         });
         const versionMatch = stdout.trim().match(/^(\S+)/);
         return { installed: true, version: versionMatch?.[1] };
@@ -55,6 +56,7 @@ async function fetchAuthStatus(): Promise<AuthStatus | null> {
     try {
         const { stdout } = await execFileAsync('claude', ['auth', 'status', '--json'], {
             timeout: SPAWN_TIMEOUT_MS,
+            windowsHide: true,
         });
         return JSON.parse(stdout) as AuthStatus;
     } catch (err) {
@@ -68,7 +70,7 @@ async function fetchUsageText(): Promise<{ result?: string; usedTokens?: number;
         const { stdout } = await execFileAsync(
             'claude',
             ['--print', '--output-format', 'json', '/usage'],
-            { timeout: SPAWN_TIMEOUT_MS, maxBuffer: 1024 * 1024 },
+            { timeout: SPAWN_TIMEOUT_MS, maxBuffer: 1024 * 1024, windowsHide: true },
         );
         const parsed = JSON.parse(stdout) as UsageSdkResponse;
         return {

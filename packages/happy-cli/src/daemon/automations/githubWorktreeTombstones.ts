@@ -159,7 +159,7 @@ export function rememberGithubWorktreeRemoval<Input extends { repositoryRoot: st
 
 export async function readWorktreeHead(worktreePath: string): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync('git', ['-C', worktreePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' })
+    const { stdout } = await execFileAsync('git', ['-C', worktreePath, 'rev-parse', 'HEAD'], { encoding: 'utf8', windowsHide: true })
     const sha = stdout.trim().toLowerCase()
     return /^[0-9a-f]{40,64}$/.test(sha) ? sha : null
   } catch {

@@ -119,7 +119,7 @@ export async function resolveServiceEntry(env: NodeJS.ProcessEnv): Promise<strin
         const { stdout } = await run(
             env.CLAUDE_MEMORY_NPM_BIN?.trim() || 'npm',
             ['root', '-g'],
-            { timeout: 5_000 },
+            { timeout: 5_000, windowsHide: true },
         );
         const globalRoot = stdout.split('\n')[0]?.trim();
         if (!globalRoot) return null;

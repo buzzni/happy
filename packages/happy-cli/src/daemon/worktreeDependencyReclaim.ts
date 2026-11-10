@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 const exec = promisify(execFile);
 const GiB = 1024 ** 3;
 const DAY = 86400_000;
-const commandOptions = { maxBuffer: 16 * 1024 * 1024, timeout: 30_000,
+const commandOptions = { maxBuffer: 16 * 1024 * 1024, timeout: 30_000, windowsHide: true,
     env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0' } };
 export interface Storage { totalBytes: number; availableBytes: number }
 export interface ReclaimResult {

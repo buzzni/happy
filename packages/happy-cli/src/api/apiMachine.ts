@@ -5004,7 +5004,7 @@ async function waitForCdp(cdpPort: number, timeoutMs: number): Promise<boolean> 
 
 function runShell(command: string): Promise<{ ok: boolean; output: string }> {
     return new Promise((resolve) => {
-        exec(command, { timeout: 300_000 }, (error, stdout, stderr) => {
+        exec(command, { timeout: 300_000, windowsHide: true }, (error, stdout, stderr) => {
             resolve({ ok: !error, output: `${stdout}${stderr}`.trim() });
         });
     });
