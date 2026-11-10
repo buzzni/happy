@@ -31,16 +31,16 @@ function codeOf(run: () => unknown): string | undefined {
 describe('buildAgentPlanDescriptor', () => {
     it('fixes the per-model context settings from the grant model (spec §6.3-2)', () => {
         expect(buildAgentPlanDescriptor({ origin: ORIGIN, grantId: GRANT, model: 'gpt-6-luna' })).toMatchObject({
-            contextWindow: 128000, autoCompactTokenLimit: 100000,
+            contextWindow: 1050000, autoCompactTokenLimit: 900000,
         })
         expect(buildAgentPlanDescriptor({ origin: ORIGIN, grantId: GRANT, model: 'gpt-6.1-terra' })).toMatchObject({
-            contextWindow: 128000, autoCompactTokenLimit: 100000,
+            contextWindow: 1050000, autoCompactTokenLimit: 900000,
         })
         expect(buildAgentPlanDescriptor({ origin: ORIGIN, grantId: GRANT, model: 'gpt-6.1-sol' })).toMatchObject({
-            contextWindow: 64000, autoCompactTokenLimit: 48000,
+            contextWindow: 1050000, autoCompactTokenLimit: 900000,
         })
         expect(buildAgentPlanDescriptor({ origin: ORIGIN, grantId: GRANT, model: 'gpt-6-astra' })).toMatchObject({
-            contextWindow: 64000, autoCompactTokenLimit: 48000,
+            contextWindow: 1050000, autoCompactTokenLimit: 900000,
         })
     })
 
@@ -64,12 +64,21 @@ describe('readAgentPlanDescriptor (canonical shape)', () => {
     it('accepts exactly what the daemon serialized for the trusted origin', () => {
         const descriptor = readAgentPlanDescriptor(serialized(), ORIGIN)
         expect(descriptor).toEqual({
-            version: 1, origin: ORIGIN, grantId: GRANT, model: 'gpt-6-luna', contextWindow: 128000, autoCompactTokenLimit: 100000,
+            version: 1, origin: ORIGIN, grantId: GRANT, model: 'gpt-6-luna', contextWindow: 1050000, autoCompactTokenLimit: 900000,
         })
     })
 
+    it.each([
+        ['gpt-6-luna', 128000, 100000], ['gpt-6.1-terra', 128000, 100000],
+        ['gpt-6.1-sol', 64000, 48000], ['gpt-6-astra', 64000, 48000],
+    ])('upgrades the saved legacy descriptor for %s without changing its grant', (model, contextWindow, autoCompactTokenLimit) => {
+        const legacy = JSON.stringify({ version: 1, origin: ORIGIN, grantId: GRANT, model, contextWindow, autoCompactTokenLimit })
+        expect(readAgentPlanDescriptor(legacy, ORIGIN)).toEqual(buildAgentPlanDescriptor({ origin: ORIGIN, grantId: GRANT, model }))
+        expect(readAgentPlanDescriptor(legacy, ORIGIN).contextWindow).toBe(1050000)
+    })
+
     it('refuses a descriptor whose context settings were raised by hand', () => {
-        const tampered = serialized().replace('"contextWindow":128000', '"contextWindow":400000')
+        const tampered = serialized().replace('"contextWindow":1050000', '"contextWindow":400000')
         expect(codeOf(() => readAgentPlanDescriptor(tampered, ORIGIN))).toBe('agent_plan_descriptor_invalid')
     })
 
@@ -103,8 +112,8 @@ describe('agentPlanCodexArgs', () => {
             '-c', `model_providers.${AGENT_PLAN_PROVIDER_ID}.requires_openai_auth=false`,
             '-c', `model_providers.${AGENT_PLAN_PROVIDER_ID}.env_key="HAPPY_AGENT_PLAN_PROXY_KEY"`,
             '-c', 'model="gpt-6.1-sol"',
-            '-c', 'model_context_window=64000',
-            '-c', 'model_auto_compact_token_limit=48000',
+            '-c', 'model_context_window=1050000',
+            '-c', 'model_auto_compact_token_limit=900000',
             '-c', 'disable_response_storage=true',
             '-c', 'web_search="disabled"',
         ])

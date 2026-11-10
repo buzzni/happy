@@ -155,7 +155,7 @@ describe('prepareAgentPlanLaunch', () => {
         expect(result.environment[AGENT_PLAN_SECRET_ENV]).toBe(SECRET)
         // The runner's own canonical read accepts it.
         expect(readAgentPlanDescriptor(result.environment[AGENT_PLAN_DESCRIPTOR_ENV]!, ORIGIN)).toMatchObject({
-            grantId: GRANT, model: 'gpt-6-luna', contextWindow: 128000,
+            grantId: GRANT, model: 'gpt-6-luna', contextWindow: 1050000,
         })
     })
 
