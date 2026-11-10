@@ -1,4 +1,4 @@
-import { resolve, sep } from 'path';
+import { isAbsolute, resolve, sep } from 'path';
 import { isStrictlyGuardedPath } from './happyHomeGuard';
 
 export interface PathValidationResult {
@@ -39,6 +39,17 @@ export function validatePath(targetPath: string, workingDirectory: string, appro
     }
 
     return { valid: true, resolvedPath: resolvedTarget };
+}
+
+/**
+ * The root a path is checked against: the allowed root when it holds the path, else the approved
+ * folder that does. Falls back to the allowed root, so a path inside neither is still refused.
+ */
+export function approvedAnchor(path: unknown, allowedRoot: string, approvedRoots: readonly string[] = []): string {
+    if (typeof path !== 'string' || !isAbsolute(path)) return allowedRoot;
+    const target = resolve(path);
+    const encloses = (folder: string) => isWithin(target, resolve(folder));
+    return encloses(allowedRoot) ? allowedRoot : approvedRoots.find(encloses) ?? allowedRoot;
 }
 
 /** A drive or filesystem root (`C:\\`, `/`) already ends with the separator. */

@@ -6,7 +6,7 @@ import { exec, ExecOptions } from 'child_process';
 import { promisify } from 'util';
 import { open, readFile, writeFile, readdir, stat, mkdir, rename, rm, cp } from 'fs/promises';
 import { createHash } from 'crypto';
-import { dirname, join, basename, extname, isAbsolute, resolve } from 'path';
+import { dirname, join, basename, extname, resolve } from 'path';
 import { run as runRipgrep } from '@/modules/ripgrep/index';
 import { run as runDifftastic } from '@/modules/difftastic/index';
 import { RpcHandlerManager } from '../../api/rpc/RpcHandlerManager';
@@ -14,7 +14,7 @@ import type { AiAuthSelection } from '@/daemon/sessionEnv';
 import type { ReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
 import type { AiAuthSource } from '@/usage/aiAuthSource';
 import type { AgentPlanSpawnParam } from '@/daemon/agentPlanGrantEnvelope';
-import { isWithin, validatePath } from './pathSecurity';
+import { approvedAnchor, isWithin, validatePath } from './pathSecurity';
 import { isStrictlyGuardedPath } from './happyHomeGuard';
 import { ensureDirectory } from './ensureDirectory';
 import { createWriteFileAttemptStore, isValidWriteFileAttemptId } from './writeFileAttempts';
@@ -619,12 +619,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
     const admitSubprocess = options.admitSubprocess;
     const checkPath = (path: string) => validatePath(path, workingDirectory, options.approvedRoots?.());
     // The root a workspace RPC is anchored to: the working directory, or the approved folder enclosing workspaceRoot.
-    const workspaceAnchor = (workspaceRoot: unknown) => {
-        if (typeof workspaceRoot !== 'string' || !isAbsolute(workspaceRoot)) return workingDirectory;
-        const root = resolve(workspaceRoot);
-        const encloses = (folder: string) => isWithin(root, resolve(folder));
-        return encloses(workingDirectory) ? workingDirectory : options.approvedRoots?.().find(encloses) ?? workingDirectory;
-    };
+    const workspaceAnchor = (workspaceRoot: unknown) => approvedAnchor(workspaceRoot, workingDirectory, options.approvedRoots?.());
     rpcHandlerManager.registerHandler('file-discovery', (request: unknown) => fileDiscovery(workspaceAnchor((request as { root?: unknown } | null)?.root), request));
     const bashScheduler = createBashRpcScheduler();
     const bashEnvBoundary = options.childEnvBoundary ?? 'session';
