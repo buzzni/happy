@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
-import { AGENT_PLAN_WEB_SEARCH_INSTRUCTIONS, createAgentPlanWebSearch, formatAgentPlanWebSearchResult } from './agentPlanWebSearch'
+import { DEFAULT_REQUEST_TIMEOUT_MSEC } from '@modelcontextprotocol/sdk/shared/protocol.js'
+import {
+    AGENT_PLAN_WEB_SEARCH_INSTRUCTIONS,
+    AGENT_PLAN_WEB_SEARCH_TIMEOUT_MS,
+    createAgentPlanWebSearch,
+    formatAgentPlanWebSearchResult,
+} from './agentPlanWebSearch'
 
 const URL_ = 'https://studio.test/api/agent-plan/v1/responses'
 
@@ -79,6 +85,12 @@ describe('createAgentPlanWebSearch', () => {
         const search = createAgentPlanWebSearch({ url: URL_, sessionKey: async () => { throw Object.assign(new Error('x'), { code: 'agent_plan_unreachable' }) }, fetchImpl })
         expect(await search('node lts')).toEqual({ ok: false, code: 'agent_plan_unreachable' })
         expect(fetchImpl).not.toHaveBeenCalled()
+    })
+
+    // The bridge's callTool and Codex's MCP call both give up at the SDK default (60s). Ending first returns a
+    // typed failure the model can explain, instead of a bare timeout while the gateway still bills the search.
+    it('shouldGiveUpBeforeTheMcpCallTimesOut', () => {
+        expect(AGENT_PLAN_WEB_SEARCH_TIMEOUT_MS).toBeLessThan(DEFAULT_REQUEST_TIMEOUT_MSEC)
     })
 
     it('shouldFailWhenTheGatewayCannotBeReached', async () => {

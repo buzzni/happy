@@ -11,7 +11,13 @@
 export const AGENT_PLAN_WEB_SEARCH_INSTRUCTIONS = 'Search the web to answer the request. Reply with a concise, factual summary '
     + 'in the language of the request and cite the pages you used. Do not invent sources.'
 
-const DEFAULT_TIMEOUT_MS = 3 * 60_000
+/**
+ * Below the MCP request timeout (SDK default 60s) that both the Happy stdio bridge's `callTool` and Codex apply to
+ * this tool. A search the gateway is still answering past that is billed either way (it reads upstream to the end);
+ * ending here first gives the model `agent_plan_gateway_unreachable` to explain instead of a bare tool timeout.
+ * Measured searches took 2–18s; the margin covers the gateway waiting for the user's busy agent slot.
+ */
+export const AGENT_PLAN_WEB_SEARCH_TIMEOUT_MS = 50_000
 
 export type AgentPlanWebSearchSource = { title: string; url: string }
 
@@ -83,7 +89,7 @@ export function createAgentPlanWebSearch(options: {
                     store: false,
                 }),
                 redirect: 'error',
-                signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS),
+                signal: AbortSignal.timeout(options.timeoutMs ?? AGENT_PLAN_WEB_SEARCH_TIMEOUT_MS),
             })
         } catch {
             return { ok: false, code: 'agent_plan_gateway_unreachable' }
