@@ -1434,7 +1434,7 @@ export class CodexAppServerClient {
                 onLine: line => { if (this.process === proc && this.processEpoch === epoch) this.handleLine(line, epoch); },
             }).then(() => this.flushAgentMessageDeltas());
             epochOutputDrain = this.outputDrain;
-            void this.outputDrain.then(() => { this.outputSettled = true; }, () => {
+            void this.outputDrain.then(() => { this.outputSettled = true; }, (error: unknown) => {
                 this.outputSettled = true;
                 this.failOutputStorage();
                 if (this.process !== proc || this.processEpoch !== epoch || this.disconnectingEpoch === epoch) return;
@@ -1444,7 +1444,7 @@ export class CodexAppServerClient {
                     request.reject(new Error('Codex output could not be drained')); this.pending.delete(id);
                 }
                 this.resolvePendingTurn(true);
-                logger.warn('[CodexAppServer] Output storage stream failed; completion is unconfirmed');
+                logger.warn('[CodexAppServer] Output storage stream failed; completion is unconfirmed', error);
             });
         } else {
             this.readline = createInterface({ input: proc.stdout! });

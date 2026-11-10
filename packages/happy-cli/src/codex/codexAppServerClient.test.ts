@@ -1961,6 +1961,29 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('logs why the output stream failed', async () => {
+        let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (_msg, stdout) => { appServerStdout = stdout; },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const { logger } = await import('@/ui/logger');
+        const client = new CodexAppServerClient();
+        client.setOutputStorageGate({ wait: async () => {}, onFailure: vi.fn() });
+        await client.connect();
+        if (!appServerStdout) throw new Error('app-server stdout unavailable');
+
+        pushJsonLine(appServerStdout, { method: 'warning', params: { message: 'x'.repeat(9 * 1024 * 1024) } });
+
+        await waitFor(() => vi.mocked(logger.warn).mock.calls.some(([message]) => (
+            String(message).includes('Output storage stream failed')
+        )), 5000);
+        expect(vi.mocked(logger.warn).mock.calls.find(([message]) => String(message).includes('Output storage stream failed')))
+            .toEqual([expect.stringContaining('Output storage stream failed'), expect.objectContaining({ message: 'Codex output line exceeds limit' })]);
+
+        await client.disconnect();
+    });
+
     it('unarchives a thread archived elsewhere and forks it', async () => {
         const requests: MockRpcMessage[] = [];
         let archived = true;
