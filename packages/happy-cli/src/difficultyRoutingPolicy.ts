@@ -18,7 +18,10 @@
 // 옛 opus-5-5/low · gpt-6-sol/low·high · gpt-6-astra/medium 도 계속 인식한다.
 // 두 모델은 Claude Code 2.1.284+ · Codex 0.159+ 에서만 실행된다.
 // 2026-11-10: claude escalated 를 Fable 5.2(claude-fable-5-2)/medium 으로 옮긴다. 옛
-// fable-5-1 의 high/medium 은 escalated 로 계속 인식한다. Claude Code 2.1.290+ 에서만 실행된다.
+// fable-5-1 의 high/medium 은 escalated 로 계속 인식한다. API 가 Claude Code 2.1.290 미만을
+// 거절한다. 내장 2.1.308 은 카탈로그에 5.2 가 없어 `unrecognized_model` 경고를 남기지만 실행한다
+// (2026-11-10 실측: 응답 모델 claude-fable-5-2, context 1M · max output 128k 로 카탈로그에 5.2 가
+// 있는 2.1.322 와 같다). 카탈로그 항목은 SDK 0.3.321(Claude Code 2.1.321)부터 들어 있다.
 
 export type RoutableAgent = 'claude' | 'codex'
 export type Difficulty = 'trivial' | 'routine' | 'hard' | 'escalated'

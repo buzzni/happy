@@ -65,6 +65,17 @@ describe('query adapter', () => {
         expect(sdkQuery).not.toHaveBeenCalled();
     });
 
+    // A stored fallback written before a catalog swap migrates onto the same successor as the main model
+    // (claude-fable-5-1 → claude-fable-5-2). The SDK refuses a fallback equal to the main model by not creating the
+    // query at all, so the duplicate is dropped instead.
+    it('drops a fallback model that equals the main model outside an endpoint session too', () => {
+        query({ prompt: 'hello', options: { model: 'claude-fable-5-2', fallbackModel: 'claude-fable-5-2' } });
+        expect(lastOptions()).toMatchObject({ model: 'claude-fable-5-2' });
+        expect(lastOptions().fallbackModel).toBeUndefined();
+        query({ prompt: 'hello', options: { model: 'claude-fable-5-2', fallbackModel: 'claude-opus-5-5' } });
+        expect(lastOptions().fallbackModel).toBe('claude-opus-5-5');
+    });
+
     // aplus specs/org-llm-endpoints r2 — an endpoint session is pinned after the settings files load too.
     describe('organization LLM endpoint session', () => {
         const endpointEnvironment = {
