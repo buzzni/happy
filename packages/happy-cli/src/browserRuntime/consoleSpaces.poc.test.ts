@@ -126,4 +126,13 @@ describe.skipIf(!findChrome())('console spaces panel (real Chrome, fake Runtime)
             expect(await until(() => names(target), (list) => list[0] === 'Open the GA report')).toHaveLength(3)
         } finally { await harness.closeTarget(target) }
     }, 30_000)
+
+    it('keeps only View task for a space that is reclaiming without an unknown outcome', async () => {
+        spaces = [{ ...space('space-reclaiming0', KNOWN, [{ taskId: 'task-r', status: 'running', pendingApproval: false, uncertain: false, inFlight: true }]), reclaiming: true }]
+        const target = await open('ko')
+        try {
+            const buttons = () => harness.evaluate(target, `[...document.querySelectorAll('#spaceRows .space-row button')].map(b => b.textContent)`) as Promise<string[]>
+            expect(await until(buttons, (list) => list.length > 0)).toEqual(['작업 보기'])
+        } finally { await harness.closeTarget(target); spaces = defaultSpaces() }
+    }, 30_000)
 })

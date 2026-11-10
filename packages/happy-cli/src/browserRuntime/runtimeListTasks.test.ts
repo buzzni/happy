@@ -105,6 +105,18 @@ describe('space management (interactive)', () => {
         await h.store.close()
     })
 
+    it('keeps refusing an agent that closes a space kept for an unknown write outcome: only the warned user may', async () => {
+        const h = await createHarness()
+        const { task } = await h.newTask('p', h.profileA, 'uncertain-agent')
+        await h.store.commit(task.taskId, { status: 'paused', pauseReason: 'cancelled-with-unknown-effect', cancelRequested: true, uncertainActions: ['w' as never] },
+            { type: 'state-changed', atMs: 0, leaseEpoch: 0, data: {} })
+        const agent = h.agent('p', h.profileA)
+        const grant = { ...agent, credential: { ...agent.credential, operations: [...agent.credential.operations, 'closeSpace'], taskSpaceIds: [task.taskSpaceId] } } as typeof agent
+        await expect(h.runtime.closeSpace(grant, { taskSpaceId: task.taskSpaceId, requestId: 'agent-close' as RequestId })).rejects.toMatchObject({ code: 'CONFLICT' })
+        expect(h.store.getSpace(task.taskSpaceId)?.closed).not.toBe(true)
+        await h.store.close()
+    })
+
     it('persists a ceiling with compare-and-set, refuses agents and other profiles', async () => {
         const h = await createHarness()
         const ui = h.ui(h.profileA, ['listSpaces','setSpaceQuota'])

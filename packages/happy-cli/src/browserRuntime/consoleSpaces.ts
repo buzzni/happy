@@ -50,10 +50,12 @@ function spaceRender(){var data=SP.data;if(!data)return;var q=data.quota;
  name.textContent=!members.length?SM.space+' '+s.taskSpaceId.slice(-12):titled?members.map(function(id){return SP.titles[id]||SM.conversation+' '+id.slice(0,12)}).join(', '):SM.conversation+' '+members.map(function(id){return id.slice(0,12)}).join(', ');name.title=members.join(', ');
  var meta=document.createElement('div');meta.className='space-meta';meta.textContent=(uncertain?SM.uncertain:s.reclaiming?SM.reclaiming:active.some(function(t){return t.pendingApproval})?SM.approval:active.length?SM.active:SM.idle)+' · '+new Date(s.lastActivityAtMs||s.createdAtMs).toLocaleString(LANG==='ko'?'ko-KR':'en-US');
  info.append(name,meta);row.appendChild(info);
- // A space kept for review (unknown write outcome, or reclaiming) offers its task and a warned close: stopping never finishes such a task.
- var review=uncertain||s.reclaiming,mode=review?'review':active.length?'stop':'close';
- if(review){var view=document.createElement('button');view.type='button';view.textContent=SM.view;view.setAttribute('aria-label',name.textContent+' '+SM.view);
+ // A space kept for an unknown write outcome offers its task and a warned close: stopping never finishes such a task.
+ // One that is only reclaiming is the Runtime's to finish, so it keeps just its task.
+ var review=uncertain,mode=review?'review':s.reclaiming?'view':active.length?'stop':'close';
+ if(review||s.reclaiming){var view=document.createElement('button');view.type='button';view.textContent=SM.view;view.setAttribute('aria-label',name.textContent+' '+SM.view);
   view.onclick=function(){if(tasks[0]){$('taskId').value=tasks[0].taskId;spaceToggle(false);watch()}else $('spaceError').textContent=SM.unknown};row.appendChild(view)}
+ if(mode==='view'){box.appendChild(row);return}
  var button=document.createElement('button');button.type='button';button.textContent=mode==='stop'?SM.stop:SM.close;button.setAttribute('aria-label',name.textContent+' '+button.textContent);
  button.onclick=function(){
  spaceFocus=button;var scope=SP.scope,profile=S.profileId,token=S.token,stop=mode==='stop';$('spaceConfirmTitle').textContent=stop?SM.stopTitle:SM.closeTitle;$('spaceConfirmBody').textContent=name.textContent+' — '+(stop?SM.stopBody:review?SM.reviewCloseBody:SM.closeBody);$('spaceConfirmYes').textContent=stop?SM.stop:SM.close;$('spaceConfirmYes').className=stop||review?'danger':'primary';

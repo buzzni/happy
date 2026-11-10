@@ -2077,9 +2077,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 closedTabs: TabId[]
             }
         // A cancelled task with an unknown write outcome never finishes on its own; the user closing the space after
-        // the console's warning accepts that outcome. Its record stays for reconcile.
+        // the console's warning accepts that outcome (an agent never does). Its record stays for reconcile.
+        const userAccepts = auth.credential.kind === 'interactive'
         if (this.options.store.listTasks().some((task) => task.taskSpaceId === req.taskSpaceId && (this.workers.has(task.taskId)
-            || !FINISHED_STATUSES.has(task.status) && !(task.cancelRequested && task.uncertainActions.length))))
+            || !FINISHED_STATUSES.has(task.status) && !(userAccepts && task.cancelRequested && task.uncertainActions.length))))
             throw new BrowserRuntimeError('CONFLICT', 'Task space has non-terminal or in-flight tasks')
         if (space.tabs.some((tab) => this.isRetained(space, tab)))
             throw new BrowserRuntimeError('CONFLICT', 'Task space has a tab kept for the user')
