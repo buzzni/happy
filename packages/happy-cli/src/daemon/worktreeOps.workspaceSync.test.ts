@@ -30,6 +30,10 @@ let previousGlobalConfig: string | undefined;
 let previousPath: string | undefined;
 
 /** Keep URL resolution real; substitute local transport only after Git selects fetch/push. */
+// Every git call in a test using this shim (setup and the code under test) starts one more Node process. About 4–6 s on a
+// loaded macOS runner (the whole file took 36 s there vs 15 s normally) — slow, not a correctness limit.
+const SHIM_TIMEOUT_MS = 30_000;
+
 function useLocalHttpsTransport() {
     const executable = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
     const bin = join(root, 'bin');
@@ -146,7 +150,7 @@ describe('workspace operations with an SSH origin and a sealed HTTPS credential'
         expect(existsSync(sshCalls)).toBe(false);
         expect(git(repo, 'config', '--get', 'remote.origin.url')).toBe('git@github.com:acme/app.git');
         expect(pins()).toEqual({ v: 1, workspaces: { [repo]: { workspace: 'github.com/acme/app' } } });
-    });
+    }, SHIM_TIMEOUT_MS);
 
     it.each(['remote-status', 'pull-remote'] as const)('%s refuses an HTTPS-only rewrite to another repository', async (op) => {
         pushOnline('untrusted.txt', 'other repository');
@@ -184,7 +188,7 @@ describe('workspace operations with an SSH origin and a sealed HTTPS credential'
         expect(git(bare, 'rev-parse', 'collab-x')).toBe(git(bare, 'rev-parse', 'main'));
         expect(existsSync(sshCalls)).toBe(false);
         expect(git(repo, 'config', '--get', 'remote.origin.url')).toBe('git@github.com:acme/app.git');
-    });
+    }, SHIM_TIMEOUT_MS);
 
     it('checks network-only global rewrites before fetching with a sealed credential', async () => {
         git(repo, 'remote', 'set-url', 'origin', 'git@github.com:acme/app.git');
@@ -206,7 +210,7 @@ describe('workspace operations with an SSH origin and a sealed HTTPS credential'
         }, true)).toMatchObject({ success: false, errorCode: 'WORKTREE_REMOTE_MISMATCH' });
         expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
         expect(existsSync(join(repo, 'online.txt'))).toBe(false);
-    });
+    }, SHIM_TIMEOUT_MS);
 });
 
 describe('workspace:remote-status', () => {
