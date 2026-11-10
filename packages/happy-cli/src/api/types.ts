@@ -485,6 +485,10 @@ export const MessageMetaSchema = z.object({
   customSystemPrompt: z.string().nullable().optional(), // Custom system prompt for this message (null = reset)
   appendSystemPrompt: z.string().nullable().optional(), // Append to system prompt for this message (null = reset)
   saycodeSystemPromptEnabled: z.boolean().optional(), // Explicit policy for Saycode-owned instructions (missing = enabled for compatibility)
+  // Envelope tokens of the client-turn blocks in appendSystemPrompt that belong to this one turn (a guide for
+  // this question). Claude gets those with the turn input, never in the system prompt, so they cannot force a
+  // provider restart (Saycode specs/claude-turn-relaunch-latency). .catch(): a malformed list is "none marked".
+  turnOnlyPromptTokens: z.array(z.string().max(64)).max(32).optional().catch(undefined),
   // Per-block overrides for individually toggleable Saycode-owned blocks. Delegation
   // blocks default on; other missing entries inherit saycodeSystemPromptEnabled. The
   // chat title instruction is deliberately excluded because it is always on.

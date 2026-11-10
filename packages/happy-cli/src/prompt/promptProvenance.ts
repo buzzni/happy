@@ -121,10 +121,34 @@ export function clientTurnPromptChange(
   };
 }
 
+const clientTurnBlockToken = (block: string) => /^<!-- saycode:client-turn-prompt:([a-z0-9]+-[a-z0-9]+):start -->/.exec(block)?.[1] ?? '?';
+
+/**
+ * Takes out the client-turn blocks the client marked as belonging to one turn (`turnOnlyPromptTokens`).
+ *
+ * `provider` is what a provider's system prompt may hold and what a restart is decided on; `turnOnly`
+ * always travels with its turn. Without this a provider *started* by such a turn would hold the block
+ * and need a restart on the very next turn, which no longer carries it.
+ */
+export function splitTurnOnlyPromptBlocks(
+  prompt: string | undefined,
+  tokens: readonly string[] | undefined,
+): { provider: string | undefined; turnOnly: string | undefined } {
+  const marked = tokens?.length ? clientTurnPromptBlocks(prompt).filter((block) => tokens.includes(clientTurnBlockToken(block))) : [];
+  if (!prompt || marked.length === 0) return { provider: prompt, turnOnly: undefined };
+  let provider = prompt;
+  for (const block of marked) {
+    const at = provider.indexOf(block);
+    const before = provider.slice(0, at).replace(/\n+$/, '');
+    const after = provider.slice(at + block.length).replace(/^\n+/, '');
+    provider = before && after ? `${before}\n\n${after}` : before || after;
+  }
+  return { provider: provider || undefined, turnOnly: marked.join('\n\n') };
+}
+
 /** For a log line: which part of the prompt differs. Block tokens are envelope checksums, never prompt text. */
 export function describeClientPromptChange(launched: string | undefined, next: string | undefined): string {
-  const tokens = (prompt: string | undefined) => clientTurnPromptBlocks(prompt)
-    .map((block) => /^<!-- saycode:client-turn-prompt:([a-z0-9]+-[a-z0-9]+):start -->/.exec(block)?.[1] ?? '?');
+  const tokens = (prompt: string | undefined) => clientTurnPromptBlocks(prompt).map(clientTurnBlockToken);
   const before = tokens(launched);
   const after = tokens(next);
   return [

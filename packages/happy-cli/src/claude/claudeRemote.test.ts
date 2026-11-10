@@ -2196,6 +2196,20 @@ describe('client-turn prompt blocks on a running provider', () => {
         expect(sent).toEqual(['first', `${guide}\n\nhow do I open settings?`, 'thanks']);
     });
 
+    it('never puts a block marked for one turn into the system prompt, even on the turn that starts the provider', async () => {
+        const token = guide.split('\n')[0].replace('<!-- saycode:client-turn-prompt:', '').replace(':start -->', '');
+        const marked: EnhancedMode = { ...withGuide, turnOnlyPromptTokens: [token] };
+        const { sent, options } = await sentFor([
+            { message: 'how do I open settings?', mode: marked },
+            { message: 'thanks', mode: started },
+            { message: 'and the theme?', mode: marked },
+        ]);
+
+        expect(options.appendSystemPrompt).toContain(preview);
+        expect(options.appendSystemPrompt).not.toContain(guide);
+        expect(sent).toEqual([`${guide}\n\nhow do I open settings?`, 'thanks', `${guide}\n\nand the theme?`]);
+    });
+
     it('keeps an attachment turn structured and a slash command first', async () => {
         const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAA' } };
         const { sent } = await sentFor([

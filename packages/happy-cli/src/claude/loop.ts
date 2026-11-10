@@ -37,6 +37,8 @@ export interface EnhancedMode {
     fallbackModel?: string;
     customSystemPrompt?: string;
     appendSystemPrompt?: string;
+    /** Tokens of the client-turn blocks in `appendSystemPrompt` that belong to this turn only; not part of the mode hash. */
+    turnOnlyPromptTokens?: string[];
     saycodeSystemPromptEnabled?: boolean;
     /** Per-block overrides; default-on blocks stay enabled, while other missing blocks inherit the master. */
     saycodePromptBlocks?: SaycodePromptBlockOverrides;

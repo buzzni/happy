@@ -49,8 +49,7 @@ describe('client-turn prompt blocks across the turns of one Claude process', () 
     const withGuide: EnhancedMode = { ...started, appendSystemPrompt: `USER CONTEXT\n\n${preview}\n\n${guide}` };
     const withoutPreview: EnhancedMode = { ...started, appendSystemPrompt: 'USER CONTEXT' };
 
-    it('answers a turn that only adds a block on the running provider, and restarts once a block it started with is gone', async () => {
-        const turns: EnhancedMode[] = [started, withGuide, started, withoutPreview];
+    async function run(turns: EnhancedMode[]) {
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
         const handlers = new Map<string, () => Promise<unknown>>();
         const received: Array<{ text: string; generation: number }> = [];
@@ -70,6 +69,11 @@ describe('client-turn prompt blocks across the turns of one Claude process', () 
         });
         queue.push('turn-0', turns[0]);
         await claudeRemoteLauncher(sessionOf(queue, handlers));
+        return { received, launches };
+    }
+
+    it('answers a turn that only adds a block on the running provider, and restarts once a block it started with is gone', async () => {
+        const { received, launches } = await run([started, withGuide, started, withoutPreview]);
 
         expect(received).toEqual([
             { text: 'turn-0', generation: 1 },
@@ -81,5 +85,22 @@ describe('client-turn prompt blocks across the turns of one Claude process', () 
         expect(appended(launches[0])).toContain(preview);
         expect(appended(launches[0])).not.toContain(guide);
         expect(appended(launches[1])).not.toContain(preview);
+    }, 15_000);
+
+    // The client knows which block belongs to one turn (`turnOnlyPromptTokens`): that one never
+    // enters the system prompt, so the turn after the one that started the provider needs no restart.
+    it('keeps the provider across a one-turn block carried by the very turn that started it', async () => {
+        const token = guide.split('\n')[0].replace('<!-- saycode:client-turn-prompt:', '').replace(':start -->', '');
+        const marked: EnhancedMode = { ...withGuide, turnOnlyPromptTokens: [token] };
+        const { received, launches } = await run([marked, started, marked]);
+
+        expect(received).toEqual([
+            { text: `${guide}\n\nturn-0`, generation: 1 },
+            { text: 'turn-1', generation: 1 },
+            { text: `${guide}\n\nturn-2`, generation: 1 },
+        ]);
+        expect(launches).toHaveLength(1);
+        expect(appended(launches[0])).toContain(preview);
+        expect(appended(launches[0])).not.toContain(guide);
     }, 15_000);
 });
