@@ -20,6 +20,7 @@ let home: string, server: Server, origin: string, fixtureRunId: string
 let seed: { localId: string; content: string } | null, stored: Record<string, unknown> | null
 let loseSeedAck: boolean, redirectLookup: boolean, wrongKey: boolean
 let issuerMode: 'personal' | 'company' | 'signed-company' | 'redirect' | 'malformed' | 'denied'
+let denialResponse: string
 const companyDevice = nacl.sign.keyPair.fromSeed(new Uint8Array(32).fill(12))
 const companyIssuer = nacl.sign.keyPair.fromSeed(new Uint8Array(32).fill(13))
 const companyOrg = nacl.sign.keyPair.fromSeed(new Uint8Array(32).fill(14))
@@ -34,6 +35,7 @@ beforeEach(async () => {
   home = await mkdtemp(join(tmpdir(), 'automation-context-http-'))
   requests.length = 0; seed = null; stored = null; loseSeedAck = false; redirectLookup = false; wrongKey = false
   issuerMode = 'personal'
+  denialResponse = '{}'
   loseRegistrationAck = false; failRegistrationBeforeCommit = false; corruptCompanyNonce = false; foreignCompanyAccount = false
   registeredBodyHash = null; registeredAuthorityDigest = null; registeredProofDigest = null
   pendingRegistration = null; commitAfterAbsent = 0; absentCount = 0
@@ -52,7 +54,7 @@ beforeEach(async () => {
     res.setHeader('Content-Type', 'application/json')
     if (requestPath === '/api/automation/execution-target') {
       if (issuerMode === 'redirect') { res.writeHead(307, { Location: '/unexpected-redirect' }).end(); return }
-      if (issuerMode === 'denied') { res.writeHead(403).end('{}'); return }
+      if (issuerMode === 'denied') { res.writeHead(403).end(denialResponse); return }
       if (issuerMode === 'signed-company') {
         const executionAuthority = { companyId: 'company-1', machineId: 'm1', approvalId: 'approval-1',
           deviceKeyId: await rotationSha256(companyDevice.publicKey), machineAccountId: foreignCompanyAccount ? 'foreign-owner' : 'owner',
@@ -479,6 +481,58 @@ it('requests scoped admission only from the configured Studio origin without sen
   } })
   for (const secret of [f.input.payload.prompt, 'encryptionKey', 'seedMessage']) expect(JSON.stringify(requests[0])).not.toContain(secret)
   expect(f.start).toHaveBeenCalledOnce()
+})
+
+it.each([
+  ['AUTOMATION_DEVICE_AUTHORITY_REQUIRED', 'AUTOMATION_DEVICE_AUTHORITY_REQUIRED'],
+  ['Invalid automation claim', 'AUTOMATION_INVALID_CLAIM'],
+  ['Automation run lease expired', 'AUTOMATION_RUN_LEASE_EXPIRED'],
+  ['EXECUTION_PRINCIPAL_ACCESS_REVOKED', 'EXECUTION_PRINCIPAL_ACCESS_REVOKED'],
+] as const)('preserves the safe admission reason %s without dispatching native work', async (reason, code) => {
+  const f = await setup(); issuerMode = 'denied'
+  denialResponse = JSON.stringify({ error: reason, token: 'private-response-token', claimToken: 'private-response-claim' })
+  const authorize = createAutomationContextAuthorizer({ studioOrigin: origin, token: 'fixture-account-token', machineId: 'm1', runId: 'r1', claimToken: 'fixture-claim' })
+  const transport = createAutomationContextTransport({ serverUrl: origin, token: 'fixture-account-token', machineId: 'm1', runId: 'r1', claimToken: 'fixture-claim', authorize })
+  await expect(createAutomationContextLauncher({ ...f.deps, ...transport }).launch(f.input)).rejects.toThrow(
+    new Error(`AUTOMATION_STUDIO_ADMISSION_HTTP_403:${code}`))
+  expect(requests.map(row => row.path)).toEqual(['/api/automation/execution-target'])
+  expect(f.start).not.toHaveBeenCalled()
+})
+
+it.each([
+  JSON.stringify({ error: 'private-response-token' }),
+  JSON.stringify({ error: 'AUTOMATION_DEVICE_AUTHORITY_REQUIRED\nprivate-response-token' }),
+  JSON.stringify({ error: { token: 'private-response-token' } }),
+  JSON.stringify([{ error: 'AUTOMATION_DEVICE_AUTHORITY_REQUIRED' }]),
+  JSON.stringify({ error: 'AUTOMATION_DEVICE_AUTHORITY_REQUIRED', padding: 'x'.repeat(4096) }),
+  '<html>private-response-token</html>',
+  '{"error":"AUTOMATION_DEVICE_AUTHORITY_REQUIRED"',
+])('keeps the HTTP failure without exposing an unsafe admission body (%#)', async body => {
+  const f = await setup(); issuerMode = 'denied'; denialResponse = body
+  const authorize = createAutomationContextAuthorizer({ studioOrigin: origin, token: 'fixture-account-token', machineId: 'm1', runId: 'r1', claimToken: 'fixture-claim' })
+  const transport = createAutomationContextTransport({ serverUrl: origin, token: 'fixture-account-token', machineId: 'm1', runId: 'r1', claimToken: 'fixture-claim', authorize })
+  await expect(createAutomationContextLauncher({ ...f.deps, ...transport }).launch(f.input)).rejects.toThrow(
+    new Error('AUTOMATION_STUDIO_ADMISSION_HTTP_403'))
+  expect(requests.map(row => row.path)).toEqual(['/api/automation/execution-target'])
+  expect(f.start).not.toHaveBeenCalled()
+})
+
+it.each(['oversized', 'unreadable'] as const)('preserves HTTP status and stops reading a %s rejection stream', async mode => {
+  const cancel = vi.fn(), pull = vi.fn((controller: ReadableStreamDefaultController<Uint8Array>) => {
+    if (mode === 'unreadable') controller.error(new Error('private-response-token'))
+    else controller.enqueue(new Uint8Array(4097))
+  })
+  const response = new Response(new ReadableStream({ pull, cancel }), { status: 403 })
+  const request = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(response)
+  try {
+    const authorize = createAutomationContextAuthorizer({ studioOrigin: origin, token: 'fixture-account-token', machineId: 'm1', runId: 'r1', claimToken: 'fixture-claim' })
+    await expect(authorize({ automationId: 'a1', runId: 'r1', generation: 1, revision: 1, machineId: 'm1',
+      displaySessionId: 'manual', conversationDirectory: '/work', agent: 'codex', body: { tag: 'automation-run:r1', metadata: 'ciphertext', agentState: 'ciphertext' } }))
+      .rejects.toThrow(new Error('AUTOMATION_STUDIO_ADMISSION_HTTP_403'))
+    expect(request).toHaveBeenCalledOnce()
+    expect(response.body?.locked).toBe(false)
+    if (mode === 'oversized') expect(cancel).toHaveBeenCalledOnce()
+  } finally { request.mockRestore() }
 })
 
 it.each(['company', 'redirect', 'malformed', 'denied'] as const)('never falls back to legacy admission after a %s response', async mode => {
