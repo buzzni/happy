@@ -488,6 +488,36 @@ describe('removeGithubTriggerWorktree', () => {
     }
   })
 
+  it('archives untracked files whose names git status quotes', async () => {
+    const fixtureRoot = await realpath(await mkdtemp(join(tmpdir(), 'happy-worktree-archive-quoted-')))
+    const repositoryRoot = join(fixtureRoot, 'repo')
+    const worktreePath = join(fixtureRoot, 'worktree')
+    const archiveTo = join(fixtureRoot, 'archive', 'worktree')
+    const git = (args: string[], cwd = repositoryRoot) => fixtureGit(args, cwd)
+    const names = ['리뷰-메모.md', 'say "hi".md', 'tab\tname.md']
+
+    try {
+      await mkdir(repositoryRoot)
+      await git(['init'])
+      // git 의 기본값. 이 머신의 전역 설정이 꺼 두었어도 저장소 설정이 이긴다.
+      await git(['config', 'core.quotePath', 'true'])
+      await writeFile(join(repositoryRoot, 'app.ts'), 'export const a = 1\n')
+      await git(['add', '.'])
+      await git(['commit', '-m', 'base'])
+      await git(['worktree', 'add', '--detach', worktreePath, 'HEAD'])
+      await mkdir(join(worktreePath, 'docs'))
+      for (const name of names) await writeFile(join(worktreePath, 'docs', name), `${name}\n`)
+
+      expect(await removeGithubTriggerWorktree({ repositoryRoot, worktreePath, archiveTo })).toEqual({ ok: true })
+
+      for (const name of names) {
+        expect(await readFile(join(archiveTo, 'untracked', 'docs', name), 'utf8')).toBe(`${name}\n`)
+      }
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true })
+    }
+  })
+
   it('releases dangling submodule worktree pointers after removing the worktree', async () => {
     const runCommand = vi.fn(async () => ({ ok: true as const, stdout: '' }))
     const releaseSubmodulePointers = vi.fn(async () => ({ released: [] }))
