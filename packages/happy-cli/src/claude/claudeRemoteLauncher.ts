@@ -58,7 +58,8 @@ import { publishClaudePromptSuggestion } from './promptSuggestionMetadata';
 import { createStreamDeltaRelay } from './streamDeltaRelay';
 import { contextUsageBreakdownRequestItem, contextUsageSignalItem, withContextUsageSignals, type ClaudeControlRequest } from './claudeContextUsage';
 import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
-import { claudeNotSignedInNotice, isClaudeAuthenticationFailure, isClaudeRevokedTokenFailure, isClaudeTokenRefreshFailure, describeClaudeLaunchFailure } from './utils/launchFailureMessage';
+import { claudeNotSignedInNotice, isClaudeAuthenticationFailure, isClaudeRevokedTokenFailure, isClaudeTokenRefreshFailure, describeClaudeLaunchFailure,
+    isHeldOrganizationRefusal, ORGANIZATION_CLAUDE_AUTH_RESTART_NOTICE } from './utils/launchFailureMessage';
 import { buildMandatoryRemoteDenyRules, resolveClaudeRemoteSandbox } from '@/sandbox/claudeSdkSandbox';
 
 interface PermissionsField {
@@ -622,11 +623,17 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     let lastTurnChannel = false;
     /** A refused turn to continue as the first turn of the next provider (set by a switch). */
     let continuation: EnhancedMode | null = null;
+    /** A request the organization account check held back from Claude; the continuation sends it, not a note. */
+    let heldRequest: CollectedBatch<EnhancedMode> | null = null;
+    /** The one automatic resend of a held request is spent until a provider starts. */
+    let heldRequestRetried = false;
     function enqueueAccountContinuation(mode: EnhancedMode) {
         if (mode.setupTokenCapacityActor) mode = { ...mode, setupTokenCapacityRetry: true };
-        // No native transcript exists yet: retain the actual request, attachments and authority.
-        if (!session.sessionId && lastCommittedBatch) {
-            pending = { ...lastCommittedBatch, mode, continuation: session.client.inputEvidence?.takeContinuation() };
+        // No native transcript exists yet, or the request never reached it: retain the actual request, attachments and authority.
+        const request = heldRequest ?? (!session.sessionId ? lastCommittedBatch : null);
+        heldRequest = null;
+        if (request) {
+            pending = { ...request, mode, continuation: session.client.inputEvidence?.takeContinuation() };
             return;
         }
         session.queue.unshiftIsolated(CONTINUE_PROMPT, mode, undefined, session.turnAttendance?.continuationInput(), {
@@ -675,6 +682,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         }
         if (message.type === 'system' && message.subtype === 'init') {
             providerRunning = true;
+            heldRequest = null;
+            heldRequestRetried = false;
             providerBinding = runningAuthority();
             providerCredentialGeneration = personalFallback?.generation() ?? 0;
             if (personalFallback && initialPersonalAuthority) session.client.setPersonalClaudeFallback({ companyId: initialPersonalAuthority.companyId,
@@ -1686,6 +1695,25 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     // Reported after `finally` has flushed what the run already produced, so the
                     // failure is the last thing in the turn and closes it exactly once.
                     if (e instanceof PersonalClaudeRecheckRequired) { launchFailure = PERSONAL_RECHECK_NOTICE; }
+                    else if (isHeldOrganizationRefusal(e) && lastCommittedBatch && !lastTurnChannel && !controller.signal.aborted && (mode ?? lastTurnMode)) {
+                        if (!heldRequestRetried) {
+                            // Claude never received the request: a fresh provider sends it once more.
+                            logger.debug(`[remote]: organization account check refused a held request (stage=${e.stage} reason=${e.reason}); sending it again`);
+                            heldRequestRetried = true;
+                            heldRequest = lastCommittedBatch;
+                            messageQueue.enqueue({ __inputContinuation: 'claude-account-switch' });
+                            lastResultSucceeded = false;
+                            continuation = mode ?? lastTurnMode;
+                        } else {
+                            launchFailure = describeClaudeLaunchFailure(e);
+                            // Refused again in this process: end it so the next message starts the conversation on a
+                            // new one (the installed CLI and the account resolved then). Waiting input keeps it running.
+                            if (!pending && session.queue.size() === 0) {
+                                launchFailure = `${launchFailure} ${ORGANIZATION_CLAUDE_AUTH_RESTART_NOTICE}`;
+                                exitReason = 'exit';
+                            }
+                        }
+                    }
                     else if (setupTokenSwitching?.hasAccountRefusal()) {
                         // An answered turn still moves accounts, but leaves no refused input to continue.
                         if (!dispatchedTurnAnswered) {

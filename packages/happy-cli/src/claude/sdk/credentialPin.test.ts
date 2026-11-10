@@ -91,6 +91,21 @@ describe('pinned credential at the SDK request boundary', () => {
         expect(f.received).toHaveLength(kind === 'later-change' ? 1 : 0);
         expect(f.controls.close).toHaveBeenCalled();
     });
+    // The launcher may send a refused request again only when Claude never received it.
+    it.each([['startup', true], ['later-input', true], ['side-question', false]] as const)(
+        'says whether a %s refusal held the request back from Claude', async (kind, held) => {
+            const f = fixture();
+            async function* prompt() { for (const content of ['one', 'two']) yield { type: 'user' as const, parent_tool_use_id: null, message: { role: 'user' as const, content } }; }
+            const q = queryWithPinnedCredential(f.create as never, { prompt: prompt(), options }, TOKEN, 'organization');
+            if (kind === 'startup') f.controls.initializationResult.mockResolvedValue({ claude_code_version: '2.1.100', hooks_applied: true });
+            else { await q.next(); f.tamper(); }
+            const refused = kind === 'side-question'
+                ? (q as unknown as {request(body: unknown): Promise<unknown>}).request({ subtype: 'side_question' })
+                : q.next();
+            await expect(refused).rejects.toMatchObject({ message: 'CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED', requestHeld: held });
+            expect(f.received).toHaveLength(kind === 'startup' ? 0 : 1);
+        },
+    );
     it('bounds a hung control call without sending input', async () => {
         vi.useFakeTimers(); const f = fixture();
         f.controls.getSettings.mockImplementation(() => new Promise(() => {}));
