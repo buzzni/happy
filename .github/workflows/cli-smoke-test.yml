@@ -228,6 +228,16 @@ jobs:
         pnpm --filter @buzzni/happy-cli exec vitest run --project unit
         src/utils/happyCommandShim.test.ts
 
+    # Saycode plan on Windows (aplus-dev-studio specs/agent-plan-full-capability R4): the grant envelope,
+    # the loopback key proxy, and the quoted Codex -c arguments through a codex.cmd shim.
+    - name: Verify the Saycode plan launch path on Windows
+      timeout-minutes: 5
+      run: >-
+        pnpm --filter @buzzni/happy-cli exec vitest run --project unit
+        src/daemon/agentPlanGrantEnvelope.test.ts
+        src/launcher/agentPlanLaunch.argv.test.ts
+        src/codex/agentPlanSession.test.ts
+
     - name: Pack package
       run: |
         $publishDir = Join-Path $env:RUNNER_TEMP "happy-cli-publish"
