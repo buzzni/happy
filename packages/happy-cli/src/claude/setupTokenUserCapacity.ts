@@ -60,7 +60,8 @@ export function createSetupTokenCapacityRuntime(deps: {
     }
   }
   async function report(entry: Entry, operation: string, extra: Record<string, unknown> = {}) {
-    const pending = (reports.get(entry) ?? Promise.resolve()).then(async () => {
+    // Same isolation as save(): a failed heartbeat must not fail the delivery and finish reports after it.
+    const pending = (reports.get(entry) ?? Promise.resolve()).catch(() => undefined).then(async () => {
       const seq = ++entry.seq; await save(entry)
       return send(entry, operation, { ...extra, seq })
     })
