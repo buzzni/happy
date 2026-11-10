@@ -110,6 +110,8 @@ describe('sandbox manager', () => {
                     `${cwd}/.idea`,
                     `${cwd}/*.code-workspace`,
                     `${cwd}/.mcp.json`,
+                    `${cwd}/.vscode/settings.json`,
+                    `${cwd}/.vscode-extra`,
                     '/elsewhere/.vscode',
                 ],
             },
@@ -120,6 +122,7 @@ describe('sandbox manager', () => {
         expect(mockInitialize.mock.calls[0][0].filesystem.denyWrite).toEqual([
             `${cwd}/.env`,
             `${cwd}/*.code-workspace`,
+            `${cwd}/.vscode-extra`,
             '/elsewhere/.vscode',
         ]);
     });
