@@ -13,7 +13,7 @@
  */
 import { readTrustedStudioOrigin } from '@/daemon/setupTokenBindingProof'
 
-/** Advertised in machine metadata as `agentPlan`. Only macOS/Linux daemons publish it (spec §6.3-5). */
+/** Advertised in machine metadata as `agentPlan` by every daemon platform (see `agentPlanCapabilityForPlatform`). */
 export const AGENT_PLAN_CAPABILITY = { version: 1 as const }
 
 /** Spawn seeds: read and deleted by the runner, never inherited (childEnv `HAPPY_INITIAL_`). */
