@@ -444,6 +444,30 @@ export class CdpDriver implements BrowserDriver {
         await this.requireConn().send('Storage.setCookies', { cookies })
     }
 
+    /** Closes the window Chrome opened at start-up (every page that exists before a tab is owned)
+     * and resolves once the browser reports it gone or after the close confirmation period. */
+    async closeStartupPages(): Promise<void> {
+        const conn = this.requireConn()
+        const { targetInfos } = await conn.send('Target.getTargets', {}) as { targetInfos: Array<{ targetId: string; type: string }> }
+        await Promise.all(targetInfos.filter(info => info.type === 'page' && !this.tabsByTarget.has(info.targetId)).map(async ({ targetId }) => {
+            const gone = new Promise<void>((resolve) => {
+                const waiters = this.destroyedWaiters.get(targetId) ?? new Set()
+                this.destroyedWaiters.set(targetId, waiters)
+                const done = () => { clearTimeout(timer); waiters.delete(done); resolve() }
+                const timer = setTimeout(done, CLOSE_CONFIRM_MS)
+                waiters.add(done)
+            })
+            await conn.send('Target.closeTarget', { targetId })
+            await gone
+        }))
+    }
+
+    /** Open pages of the whole browser, owned or not: a window the user opened counts as use. */
+    async pageCount(): Promise<number> {
+        const { targetInfos } = await this.requireConn().send('Target.getTargets', {}) as { targetInfos: Array<{ type: string }> }
+        return targetInfos.filter(info => info.type === 'page').length
+    }
+
     browserInstanceId(): BrowserInstanceId {
         if (!this.isConnected()) throw new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'driver is not connected', true, false)
         return this.instanceId!

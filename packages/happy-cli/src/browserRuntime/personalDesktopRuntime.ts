@@ -100,6 +100,7 @@ export interface PersonalDesktopRuntime {
     session: NativeBrowserSession
     startBrowser(): Promise<NativeBrowserSession>
     onBrowserStopped(listener: () => Promise<void>): void
+    stopIdleBrowser(): Promise<boolean>
     sockets: { broker: string; admin: string }
     onParentLost(listener: () => void): void
     close(): Promise<void>
@@ -135,8 +136,10 @@ export async function bootstrapPersonalDesktopRuntime(config: RuntimeConfig, sta
             browser = await (dependencies.launch ?? launchPersonalBrowser)({ platform, executable: personal.browserExecutable, profileDir: paths.profileDir, env })
             const owner = (dependencies.readOwner ?? readNativeSessionOwner)(browser.pid)
             if (!owner) throw new Error('PERSONAL_BROWSER_EXITED')
-            return await (dependencies.openSession ?? openNativeBrowserSession)({ input: browser.input, output: browser.output, owner,
+            const session = await (dependencies.openSession ?? openNativeBrowserSession)({ input: browser.input, output: browser.output, owner,
                 protection: { mode: 'basic', identity }, terminate: browser.terminate, maxAgentWindows: config.maxAgentWindows })
+            if (platform === 'darwin') await session.driver.closeStartupPages().catch(async error => { await session.close(); throw error })
+            return session
         } catch (error) {
             try { await browser?.terminate() } catch { throw new Error('ABP personal startup cleanup is unconfirmed') }
             throw error
@@ -154,7 +157,7 @@ export async function bootstrapPersonalDesktopRuntime(config: RuntimeConfig, sta
         parent.once('error', lose)
         parent.resume()
         return { session, sockets: { broker: paths.brokerSocket, admin: paths.adminSocket },
-            startBrowser: session.start, onBrowserStopped: session.onBrowserStopped,
+            startBrowser: session.start, onBrowserStopped: session.onBrowserStopped, stopIdleBrowser: session.stopIdle,
             onParentLost(listener) { if (parentLost) listener(); else parentListeners.push(listener) },
             close: () => closing ??= (async () => {
                 const result = await session.close()

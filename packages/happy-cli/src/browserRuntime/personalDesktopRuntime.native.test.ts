@@ -81,6 +81,25 @@ describe.skipIf(process.platform !== 'darwin')('personal desktop runtime on macO
         } finally { await runtime.close().catch(() => undefined) }
     }, 40_000)
 
+    it('shows no startup window and ends the lifetime when the user quits Chrome from the Dock', async () => {
+        const paths = personalRuntimePaths('darwin', {}, home)
+        let browser: PersonalBrowser | undefined
+        const runtime = await bootstrapPersonalDesktopRuntime(parseRuntimeConfig(configJson(1)), paths.stateDir, {
+            env: { HOME: home, TMPDIR: process.env.TMPDIR, ABP_CONFIG_FILE: paths.configFile }, home,
+            parent: new PassThrough(), launch: async options => browser = await launchPersonalBrowser(options),
+        })
+        try {
+            const first = await runtime.startBrowser()
+            expect(await first.driver.pageCount()).toBe(0)
+            // The Dock's Quit and ⌘Q send this AppKit quit request, not a CDP command.
+            await run('/usr/bin/osascript', ['-l', 'JavaScript', '-e',
+                `ObjC.import('AppKit'); $.NSRunningApplication.runningApplicationWithProcessIdentifier(${browser!.pid}).terminate`])
+            expect(await first.stopped).toEqual({ terminated: true })
+            expect(await until(() => profileProcesses(paths.profileDir).length === 0, 10000)).toBe(true)
+            await runtime.session.check()
+        } finally { await runtime.close().catch(() => undefined) }
+    }, 40_000)
+
     it('opens pages in the dedicated profile over pipes with no listening port, then ends the whole tree', async () => {
         const paths = personalRuntimePaths('darwin', {}, home)
         const site = createServer((_req, res) => { res.setHeader('Content-Type', 'text/html'); res.end('<title>Personal</title><p>Personal mode canary</p>') })

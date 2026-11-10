@@ -14,7 +14,7 @@ const paths = personalRuntimePaths('darwin', {}, '/Users/u')
 function harness(overrides: Record<string, unknown> = {}) {
     const events: string[] = []
     const parent = new PassThrough()
-    const session = { driver: {}, stopped: new Promise(() => {}), check: vi.fn(), close: vi.fn(async () => { events.push('session.close'); return { terminated: true } }) }
+    const session = { driver: { closeStartupPages: vi.fn(async () => { events.push('startup.close') }) }, stopped: new Promise(() => {}), check: vi.fn(), close: vi.fn(async () => { events.push('session.close'); return { terminated: true } }) }
     const deps = {
         platform: 'darwin' as const, uid: 501, home: '/Users/u', parent,
         env: { ABP_CONFIG_FILE: paths.configFile, HOME: '/Users/u', HAPPY_ACCESS_KEY: 'secret' },
@@ -69,7 +69,7 @@ describe('personal desktop runtime bootstrap', () => {
     it('runs a Windows browser as the runtime token user, with named pipes and no POSIX ownership checks', async () => {
         const windowsPaths = personalRuntimePaths('win32', { LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local' })
         const windowsConfig = { ...config(), personalDesktop: { platform: 'win32' as const, browserExecutable: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe' } }
-        const { deps } = harness({ platform: 'win32', uid: undefined, identity: 'S-1-5-21-1-2-3-1001',
+        const { deps, session } = harness({ platform: 'win32', uid: undefined, identity: 'S-1-5-21-1-2-3-1001',
             env: { ABP_CONFIG_FILE: windowsPaths.configFile, LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local' } })
         const runtime = await bootstrapPersonalDesktopRuntime(windowsConfig, windowsPaths.stateDir, deps)
         expect(runtime.sockets).toEqual({ broker: windowsPaths.brokerSocket, admin: windowsPaths.adminSocket })
@@ -77,6 +77,8 @@ describe('personal desktop runtime bootstrap', () => {
         expect(deps.launch).not.toHaveBeenCalled()
         await runtime.startBrowser()
         expect(deps.openSession).toHaveBeenCalledWith(expect.objectContaining({ protection: { mode: 'basic', identity: 'S-1-5-21-1-2-3-1001' } }))
+        // Windows Chrome opens no startup window.
+        expect(session.driver.closeStartupPages).not.toHaveBeenCalled()
         await runtime.close()
     })
 
@@ -84,7 +86,7 @@ describe('personal desktop runtime bootstrap', () => {
         const { deps, events } = harness()
         const runtime = await bootstrapPersonalDesktopRuntime(config(), paths.stateDir, deps)
         await runtime.startBrowser()
-        expect(events).toEqual([`dir ${paths.root}`, `dir ${paths.stateDir}`, `dir ${paths.profileDir}`, `dir ${paths.runDir}`, 'verify', 'lock', 'verify', 'launch', 'session'])
+        expect(events).toEqual([`dir ${paths.root}`, `dir ${paths.stateDir}`, `dir ${paths.profileDir}`, `dir ${paths.runDir}`, 'verify', 'lock', 'verify', 'launch', 'session', 'startup.close'])
         expect(deps.launch).toHaveBeenCalledWith(expect.objectContaining({ platform: 'darwin', executable: CHROME, profileDir: paths.profileDir }))
         expect(deps.openSession).toHaveBeenCalledWith(expect.objectContaining({ protection: { mode: 'basic', identity: '501' }, owner: { bootId: 'b', pid: 900, pidStartTime: '1' } }))
         expect(runtime.sockets).toEqual({ broker: paths.brokerSocket, admin: paths.adminSocket })

@@ -61,6 +61,7 @@ import { ViewerProxy, type ViewerEndpoint } from './viewerProxy'
 import { holdsWriterFlock } from './writerFlock'
 import { bootstrapMacNativeRuntime } from './macNativeRuntime'
 import { bootstrapPersonalDesktopRuntime } from './personalDesktopRuntime'
+import { createPersonalBrowserIdleStop } from './personalBrowserDemand'
 import type { NativeBrowserSession } from './nativeBrowserSession'
 
 /** A browser lifetime the runtime owns over pipes (installed service or personal desktop). */
@@ -68,6 +69,8 @@ interface NativeRuntime {
     session: NativeBrowserSession
     startBrowser?(): Promise<NativeBrowserSession>
     onBrowserStopped?(listener: () => Promise<void>): void
+    /** Ends an unused browser lifetime; the next new task starts another. */
+    stopIdleBrowser?(): Promise<boolean>
     close(): Promise<void>
     /** Personal desktop: sockets in the user's directory instead of the config's. */
     sockets?: { broker: string; admin: string }
@@ -118,6 +121,9 @@ const RECONNECT_BACKOFF_MS = [250, 500, 1_000, 2_000, 5_000]
 const SWEEP_INTERVAL_MS = 1_000
 const RETENTION_INTERVAL_MS = 60 * 60_000
 const SPACE_RECLAIM_INTERVAL_MS = 30_000
+/** A personal browser with no open space and no page is quit after this long. */
+const PERSONAL_BROWSER_IDLE_STOP_MS = 60_000
+const PERSONAL_BROWSER_IDLE_CHECK_MS = 10_000
 const DAY_MS = 24 * 60 * 60_000
 const LOCK_HEARTBEAT_MS = 5_000
 
@@ -563,6 +569,19 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     const reclaimTimer = setInterval(reclaim, SPACE_RECLAIM_INTERVAL_MS)
     reclaimTimer.unref()
 
+    // A finished task closes its space and tabs; the windowless Chrome it leaves is quit, not kept forever.
+    const stopIdleBrowser = native?.stopIdleBrowser
+    const spaceOpen = () => store.listSpaces().some(space => !space.closed)
+    const idleBrowserCheck = stopIdleBrowser && createPersonalBrowserIdleStop({ idleMs: PERSONAL_BROWSER_IDLE_STOP_MS, now: Date.now,
+        unused: async () => !spaceOpen() && await native.session.driver.pageCount().then(count => count === 0, () => false),
+        // Rechecked synchronously: a space created during the page count keeps the browser.
+        stop: async () => !spaceOpen() && stopIdleBrowser() })
+    const idleBrowserTimer = idleBrowserCheck ? setInterval(() => {
+        void idleBrowserCheck().then(stopped => { if (stopped) log('personal browser idle; stopped until a new browser task') },
+            () => log('personal browser idle stop failed'))
+    }, PERSONAL_BROWSER_IDLE_CHECK_MS) : undefined
+    idleBrowserTimer?.unref()
+
     const fenceAcksMs: number[] = []
     // Records cancel fence ACK latency for metrics; every other operation goes straight to the Runtime.
     const api = new Proxy(runtime, {
@@ -729,6 +748,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
         clearInterval(sweep)
         clearInterval(retention)
         clearInterval(reclaimTimer)
+        clearInterval(idleBrowserTimer)
         clearInterval(heartbeat)
         if (quotaTimer) clearInterval(quotaTimer)
         await server.close()
