@@ -11,7 +11,9 @@ import { pageViewerScript } from './pageViewer'
  * token in memory only. About a minute before expiry it asks its host with
  * `postMessage({ type: 'abp-capability-request' }, location.origin)` (every 10 s
  * until answered) and accepts `{ type: 'abp-capability', token, expiresAtMs }`
- * only from `window.parent` on its own origin. Desktop hosts the page in a
+ * only from `window.parent` on its own origin. The same host may post
+ * `{ type: 'abp-session-titles', titles: { [agentSessionId]: title } }` so the Spaces
+ * panel names a space after its conversation. Desktop hosts the page in a
  * `<webview>` without preload, so `window.parent === window` and the answer is
  * posted into the page by the host. A load without a fragment (reload, back
  * navigation, restored panel) asks the host at once and every 10 s until answered;
