@@ -639,7 +639,6 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     const providerStale = () => providerRunning && (providerCredentialGeneration !== (personalFallback?.generation() ?? 0) || providerBinding !== undefined && providerBinding !== runningAuthority());
 
     let capacityWork: Promise<void> = Promise.resolve();
-    let capacityFailure: unknown;
     const capacity = createSetupTokenCapacityRuntime({
         directory: join(configuration.happyHomeDir, 'setup-token-capacity', session.client.sessionId),
         request: (operation, actor, runtimeId, extra, signal) => {
@@ -652,7 +651,6 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     });
     const queueCapacity = (action: () => Promise<void>) => {
         capacityWork = capacityWork.then(action).catch(error => {
-            capacityFailure = error;
             logger.warn(`[setup-token-capacity] ${error instanceof Error ? error.message : 'lifecycle unavailable'}`);
         });
     };
@@ -1011,8 +1009,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 try {
                     const sessionId = session.client.sessionId;
                     if (!sessionId) throw new Error('SETUP_TOKEN_START_SESSION_MISSING');
+                    // Background reports go first. Their failures are logged, not held against this turn: admission
+                    // below asks the server again, and a held failure blocked every later turn of the process.
                     await capacityWork;
-                    if (capacityFailure) throw capacityFailure;
                     const actor = message?.mode?.setupTokenCapacityActor;
                     let legacyRequestId: string | undefined;
                     if (actor) {

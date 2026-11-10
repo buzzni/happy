@@ -223,6 +223,44 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
         }
     });
+    // A daemon restart made one background capacity report fail; every later turn of the conversation failed on it.
+    it('admits the next turn after a background capacity report failed once', async () => {
+        const inputs = vi.fn(), session = sharedSessionFixture(inputs);
+        const actor = (text: string) => ({ companyId: 'org-a', machineId: 'pc-a', sessionId: session.client.sessionId,
+            requestId: randomUUID(), contentHash: createHash('sha256').update(text).digest('hex'), proof: 'signed.proof' });
+        session.queue.queue.length = 0;
+        session.queue.push('hello', { permissionMode: 'default', setupTokenCapacityActor: actor('hello') });
+        let reportFailed = false;
+        vi.mocked(requestSetupTokenCapacity).mockImplementation(async (_session, _binding, operation, _actor, _runtime, extra) => {
+            if (operation === 'reserve') return { state: 'reserved', managedAccountId: '00000000-0000-4000-8000-00000000000a', credentialGeneration: 1, epoch: 1, validForMs: 15000 };
+            if (operation === 'delivery' && extra?.deliveryState === 'result' && !reportFailed) { reportFailed = true; throw new Error('CAPACITY_UNAVAILABLE'); }
+            return { state: operation === 'claim' ? 'claimed' : operation === 'finish' ? 'finished' : String(extra?.deliveryState) };
+        });
+        vi.mocked(query).mockImplementation(({ prompt }) => Object.assign((async function* () {
+            yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+            for await (const _message of prompt as AsyncIterable<SDKUserMessage>) {
+                inputs();
+                yield assistant(`msg-${inputs.mock.calls.length}`);
+                yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: `result-${inputs.mock.calls.length}` };
+                // Claude Code is idle again: the turn's capacity run is finished.
+                yield { type: 'system', subtype: 'background_tasks_changed', tasks: [] };
+                if (inputs.mock.calls.length === 1) session.queue.push('next', { permissionMode: 'default', setupTokenCapacityActor: actor('next') });
+                else { void handlers.get('switch')!(); return; }
+            }
+        })(), { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        session.client.rpcHandlerManager = { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) };
+        session.client.failClaudeLaunchTurn = vi.fn(() => { void handlers.get('switch')!(); });
+        try {
+            await claudeRemoteLauncher(session as unknown as Session);
+            expect(reportFailed).toBe(true);
+            expect(inputs).toHaveBeenCalledTimes(2);
+            expect(session.client.failClaudeLaunchTurn).not.toHaveBeenCalled();
+        } finally {
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED;
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
+        }
+    });
     it('holds a shared-PC turn until Studio admits its start, asked with the shared-account authority', async () => {
         let admit!: (value: { state: 'allowed'; validForMs: number }) => void;
         vi.mocked(requestSetupTokenStart).mockImplementationOnce(() => new Promise(resolve => { admit = resolve; }));
