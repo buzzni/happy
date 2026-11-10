@@ -17,7 +17,7 @@ import { requestSetupTokenCapacity, requestSetupTokenStart, requestSetupTokenReb
 import { APPLY_REQUIRED_NOTICE, CONTINUE_PROMPT, RESUME_REBOUND_NOTICE, START_BUDGET_SWITCHED_NOTICE, SWITCHED_NOTICE } from './setupTokenAccountSwitching';
 import { PERSONAL_RECHECK_NOTICE } from './personalClaudeFallback';
 import { claudeCheckSession } from './utils/claudeCheckSession';
-import { describeClaudeLaunchFailure } from './utils/launchFailureMessage';
+import { CAPACITY_RESTART_NOTICE, describeClaudeLaunchFailure } from './utils/launchFailureMessage';
 
 vi.mock('@anthropic-ai/claude-agent-sdk', async (original) => ({
     ...await original<typeof import('@anthropic-ai/claude-agent-sdk')>(),
@@ -249,6 +249,41 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             expect(inputs).not.toHaveBeenCalled();
             expect(query).not.toHaveBeenCalled();
             expect(session.client.failClaudeLaunchTurn).toHaveBeenCalledOnce();
+        } finally {
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED;
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
+        }
+    });
+    // 2026-11-10: the PC's organization assignment was removed. Every running conversation kept the old authority in
+    // its environment and failed each message with CAPACITY_HTTP_403 until its process was killed by hand.
+    function capacityRefusedSession(reason: string) {
+        const session = sharedSessionFixture(vi.fn());
+        const actor = { companyId: 'org-a', machineId: 'pc-a', sessionId: session.client.sessionId,
+            requestId: randomUUID(), contentHash: createHash('sha256').update('hello').digest('hex'), proof: 'signed.proof' };
+        session.queue.queue.length = 0;
+        session.queue.push('hello', { permissionMode: 'default', setupTokenCapacityActor: actor });
+        vi.mocked(requestSetupTokenCapacity).mockRejectedValue(new Error(reason));
+        return session;
+    }
+    it.each(['CAPACITY_HTTP_403', 'CAPACITY_STALE_BINDING'])('ends this process after a %s refusal so the next message resolves the account again', async (reason) => {
+        try {
+            const session = capacityRefusedSession(reason);
+            await expect(claudeRemoteLauncher(session as unknown as Session)).resolves.toBe('exit');
+            expect(query).not.toHaveBeenCalled();
+            expect(session.client.failClaudeLaunchTurn).toHaveBeenCalledOnce();
+            expect(session.client.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+                isError: true, message: expect.stringContaining(CAPACITY_RESTART_NOTICE) }));
+        } finally {
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED;
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
+        }
+    });
+    it('keeps this process after a capacity refusal that the same authority may pass later', async () => {
+        try {
+            const session = capacityRefusedSession('CAPACITY_UNAVAILABLE');
+            await expect(claudeRemoteLauncher(session as unknown as Session)).resolves.toBe('switch');
+            expect(session.client.sendSessionEvent).not.toHaveBeenCalledWith(expect.objectContaining({
+                message: expect.stringContaining(CAPACITY_RESTART_NOTICE) }));
         } finally {
             delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED;
             delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;

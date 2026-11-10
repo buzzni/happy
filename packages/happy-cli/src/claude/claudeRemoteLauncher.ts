@@ -59,7 +59,7 @@ import { createStreamDeltaRelay } from './streamDeltaRelay';
 import { contextUsageBreakdownRequestItem, contextUsageSignalItem, withContextUsageSignals, type ClaudeControlRequest } from './claudeContextUsage';
 import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
 import { claudeNotSignedInNotice, isClaudeAuthenticationFailure, isClaudeRevokedTokenFailure, isClaudeTokenRefreshFailure, describeClaudeLaunchFailure,
-    isHeldOrganizationRefusal, ORGANIZATION_CLAUDE_AUTH_RESTART_NOTICE } from './utils/launchFailureMessage';
+    isHeldOrganizationRefusal, ORGANIZATION_CLAUDE_AUTH_RESTART_NOTICE, isProcessBoundCapacityRefusal, CAPACITY_RESTART_NOTICE } from './utils/launchFailureMessage';
 import { buildMandatoryRemoteDenyRules, resolveClaudeRemoteSandbox } from '@/sandbox/claudeSdkSandbox';
 
 interface PermissionsField {
@@ -1063,6 +1063,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     if (controller.signal.aborted || generationEnded.signal.aborted) return false;
                     // A later turn's rejection never reaches the launch catch (claudeRemote ends the input), so report it here.
                     launchFailure = describeClaudeLaunchFailure(error);
+                    // This process holds the refused authority in its environment, so every later turn is refused the
+                    // same way. End it once nothing waits: the next message starts a new one that resolves the account.
+                    if (isProcessBoundCapacityRefusal(error) && !pending && session.queue.size() === 0) {
+                        launchFailure = `${launchFailure} ${CAPACITY_RESTART_NOTICE}`;
+                        exitReason = 'exit';
+                    }
                     if (message) {
                         messageQueue.enqueue(pendingRequestItem(message.channelRequestId ?? null));
                         if (message.channelRequestId) messageQueue.enqueue(finalAnswerItem(launchFailure));
