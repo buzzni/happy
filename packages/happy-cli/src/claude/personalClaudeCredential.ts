@@ -69,7 +69,8 @@ export async function readPersonalClaudeCredentials(): Promise<PersonalClaudeCre
             }
         }
         // An app opened from the Dock has no shell PATH: find cswap where the daemon installed it.
-        const result = await promisify(execFile)('cswap', ['export', '-'], { timeout: 15_000, maxBuffer: 1024 * 1024, env: withUvToolBinOnPath() })
+        // The daemon has no console: without windowsHide, Windows shows a cswap.exe window each time the usage popover opens.
+        const result = await promisify(execFile)('cswap', ['export', '-'], { timeout: 15_000, maxBuffer: 1024 * 1024, env: withUvToolBinOnPath(), windowsHide: true })
         if (before !== await readFile(path, 'utf8') || provenance !== await readProvenance()) return []
         return personalClaudeCredentials(JSON.parse(result.stdout), JSON.parse(before), Date.now(), legacyIdentities)
     } catch { return [] }

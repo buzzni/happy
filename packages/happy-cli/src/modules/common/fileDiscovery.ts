@@ -18,7 +18,10 @@ export interface FileDiscoveryResponse {
 }
 let running = 0;
 /** One worker owns each operation so blocked filesystem IO cannot hang the daemon. */
-export async function fileDiscovery(allowedRoot: string, request: unknown): Promise<FileDiscoveryResponse> {
+export async function fileDiscovery(allowedRoot: string, request: unknown, platform: NodeJS.Platform = process.platform): Promise<FileDiscoveryResponse> {
+    // The worker answers only this off macOS. Starting it anyway showed a node.exe console on
+    // Windows each time the app asked, which it does on every project switch.
+    if (platform !== 'darwin') return { version: 1, success: false, error: 'unsupported' };
     if (running >= 2) return { version: 1, success: false, error: 'busy' };
     running++;
     try {
