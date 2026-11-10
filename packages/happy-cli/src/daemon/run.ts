@@ -1325,6 +1325,9 @@ export async function startDaemon(): Promise<void> {
     // idle guard's grace window — an adopted session keeps its real age, so it
     // can be reap-eligible the instant it is adopted.
     const pidToAdoptedAt = new Map<number, number>();
+    // Session a stop signal was sent to, keyed by PID, until that process exits.
+    // An exiting process still reports, and must not be adopted back.
+    const pidToStoppedSessionId = new Map<number, string>();
     const deadSessionsToCleanup: PersistedTrackedSession[] = [];
 
     // Read once and share: session recovery, the orphan home-dir sweep and the
@@ -1756,6 +1759,7 @@ export async function startDaemon(): Promise<void> {
         persistedSessions: readPersistedSessions(),
         isPidAlive,
         trackedPidOwner: (pid) => resolveTrackedPidOwner(pidToTrackedSession.get(pid)),
+        stoppedPidOwner: (pid) => pidToStoppedSessionId.get(pid),
         now: Date.now(),
       });
 
@@ -4146,6 +4150,7 @@ export async function startDaemon(): Promise<void> {
             }
           }
 
+          if (session.happySessionId) pidToStoppedSessionId.set(pid, session.happySessionId);
           pidToTrackedSession.delete(pid);
           recoveredPendingSpawnStartedAt.delete(pid);
           sessionStartTimes.delete(pid);
@@ -4229,6 +4234,7 @@ export async function startDaemon(): Promise<void> {
       recoveredPendingSpawnStartedAt.delete(pid);
       sessionStartTimes.delete(pid);
       pidToAdoptedAt.delete(pid);
+      pidToStoppedSessionId.delete(pid);
       if (tracked?.happySessionId) resumeCursorPersistedAt.delete(tracked.happySessionId);
       persistTrackedSessions();
       const heldAttention = tracked?.happySessionId ? heldBrowserAttentions.take(tracked.happySessionId) : undefined;
@@ -6356,6 +6362,10 @@ export async function startDaemon(): Promise<void> {
           logger.debug(`[DAEMON RUN] Removing stale session with PID ${pid} (process no longer exists)`);
           onChildExited(pid);
         }
+      }
+      // Externally started sessions have no exit event to clear their entry.
+      for (const pid of pidToStoppedSessionId.keys()) {
+        if (!isPidAlive(pid)) pidToStoppedSessionId.delete(pid);
       }
 
       // Reclaim sessions whose runtime stopped reporting entirely (dead process

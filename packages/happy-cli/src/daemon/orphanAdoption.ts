@@ -24,7 +24,7 @@ export const EXTERNAL_SESSION_STARTED_BY = 'happy directly - likely by user from
 
 export type OrphanAdoptionResult =
   | { adopted: true; session: TrackedSession; startedAt: number }
-  | { adopted: false; reason: 'no-pid' | 'pid-dead' | 'pid-conflict' };
+  | { adopted: false; reason: 'no-pid' | 'pid-dead' | 'pid-conflict' | 'pid-stopping' };
 
 /** trackedPidOwner sentinel for a pid the daemon just spawned but whose
  *  session-started webhook hasn't arrived yet (happySessionId still unset).
@@ -161,9 +161,11 @@ export function resolveOrphanAdoption(input: {
   /** Session currently tracked under a PID, if any. The daemon's tracked map is
    *  keyed by PID, so adopting over a claimed one would evict its owner. */
   trackedPidOwner?: (pid: number) => string | undefined;
+  /** Session this daemon sent a stop signal to under a PID that has not exited yet. */
+  stoppedPidOwner?: (pid: number) => string | undefined;
   now: number;
 }): OrphanAdoptionResult {
-  const { sessionId, hostPid, persistedSessions, isPidAlive, trackedPidOwner, now } = input;
+  const { sessionId, hostPid, persistedSessions, isPidAlive, trackedPidOwner, stoppedPidOwner, now } = input;
   const persisted = persistedSessions[sessionId];
 
   // Prefer the self-announced PID: a process reporting its own pid cannot be a
@@ -181,6 +183,11 @@ export function resolveOrphanAdoption(input: {
   const owner = trackedPidOwner?.(pid);
   if (owner !== undefined && owner !== sessionId) {
     return { adopted: false, reason: 'pid-conflict' };
+  }
+  // A process keeps reporting while it shuts down. Adopting it would make the
+  // next resume reuse a process that is about to exit (2026-11-10 incident).
+  if (stoppedPidOwner?.(pid) === sessionId) {
+    return { adopted: false, reason: 'pid-stopping' };
   }
 
   const session: TrackedSession = {

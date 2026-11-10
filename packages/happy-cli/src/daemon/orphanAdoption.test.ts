@@ -292,6 +292,38 @@ describe('resolveOrphanAdoption — PID already claimed', () => {
   })
 })
 
+describe('resolveOrphanAdoption — process this daemon is stopping', () => {
+  // 2026-11-10 incident: stop-session sent SIGTERM and dropped the session from
+  // tracking, but the exiting process sent one more runtime report. Adopting it
+  // made the next resume reuse a process that was already shutting down, and
+  // the user's message was lost with it.
+  it('refuses to re-adopt a session it just stopped under the same PID', () => {
+    const result = resolveOrphanAdoption({
+      sessionId: 'sess-1',
+      hostPid: 4242,
+      persistedSessions: {},
+      isPidAlive: () => true,
+      stoppedPidOwner: (pid) => (pid === 4242 ? 'sess-1' : undefined),
+      now: NOW,
+    })
+
+    expect(result).toEqual({ adopted: false, reason: 'pid-stopping' })
+  })
+
+  it('still adopts a different session that reports under a stopped PID', () => {
+    const result = resolveOrphanAdoption({
+      sessionId: 'sess-new',
+      hostPid: 4242,
+      persistedSessions: {},
+      isPidAlive: () => true,
+      stoppedPidOwner: (pid) => (pid === 4242 ? 'sess-1' : undefined),
+      now: NOW,
+    })
+
+    expect(result.adopted).toBe(true)
+  })
+})
+
 describe('resolveTrackedPidOwner', () => {
   it('reports no owner for an untracked pid', () => {
     expect(resolveTrackedPidOwner(undefined)).toBeUndefined()
