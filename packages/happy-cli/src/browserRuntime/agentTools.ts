@@ -77,6 +77,9 @@ function wrapSteps(steps: StepResult[]) {
     }))
 }
 
+/** A full space limit is the user's to clear: the agent cannot tell which spaces are safe to close. */
+const SPACE_LIMIT_USER_ACTION = 'The browser space limit is full. Tell the user to open the Agent Browser console, press its Spaces (작업 공간) button and close spaces they no longer need, then retry. Do not ask the user for a taskSpaceId, and do not close spaces or call browser_task_join_space on your own.'
+
 /**
  * `hint` adds a Core-provided `siteHint` beside the result (specs/browser-site-hints R6) — never inside the
  * page data — and a failure there never fails the tool.
@@ -91,7 +94,8 @@ async function run<T>(requestId: string | undefined, fn: () => Promise<T>, hint?
             ? err.toBody()
             : { code: 'RUNTIME_UNAVAILABLE', message: 'unexpected tool error', retryable: true, mayHaveSideEffects: requestId !== undefined }
         const hint = requestId ? 'Retry with the same requestId to avoid duplicating side effects.' : undefined
-        return { ...text({ ...(requestId ? { requestId } : {}), error, ...(hint ? { hint } : {}) }), isError: true }
+        const userAction = 'quotaKind' in error && error.quotaKind === 'spaces' ? SPACE_LIMIT_USER_ACTION : undefined
+        return { ...text({ ...(requestId ? { requestId } : {}), error, ...(hint ? { hint } : {}), ...(userAction ? { userAction } : {}) }), isError: true }
     }
 }
 
