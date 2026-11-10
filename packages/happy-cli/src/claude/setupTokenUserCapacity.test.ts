@@ -119,6 +119,22 @@ it('restores a result cached just before a journal crash without submitting the 
   expect(await createSetupTokenCapacityRuntime(deps).admit(actor, new AbortController().signal)).toMatchObject({ state: 'result', result: { result: 'durable answer' } })
   expect(request.mock.calls.every(call => call[0] === 'lost')).toBe(true)
 })
+// A daemon restart failed one heartbeat; every later report of the run failed with it and the seat was never released.
+it('sends later reports of a run after one of its reports failed, and releases the run', async () => {
+  let heartbeatFailed = false
+  const request = vi.fn(async (operation: string, _actor: unknown, _runtime: string, extra?: Record<string, unknown>) => {
+    if (operation === 'reserve') return { state: 'reserved', managedAccountId: 'a', credentialGeneration: 1, epoch: 1, validForMs: 15000 }
+    if (operation === 'heartbeat' && !heartbeatFailed) { heartbeatFailed = true; throw new Error('CAPACITY_UNAVAILABLE') }
+    return { state: operation === 'claim' ? 'claimed' : operation === 'finish' ? 'finished' : String(extra?.deliveryState ?? operation) }
+  })
+  const runtime = createSetupTokenCapacityRuntime({ directory: await directory(), request, notify: () => {}, move: async () => false })
+  await runtime.admit(actor, new AbortController().signal)
+  await expect(runtime.heartbeat()).rejects.toThrow('CAPACITY_UNAVAILABLE')
+  await runtime.heartbeat()
+  await runtime.providerStopped(true)
+  expect(request.mock.calls.map(call => call[0])).toEqual(['reserve', 'claim', 'delivery', 'heartbeat', 'heartbeat', 'finish'])
+  expect(runtime.hasActive()).toBe(false)
+})
 // A journal write that failed once (full disk, permission, fsync) failed every later write of the run, so it never reported finish.
 it('writes the journal again after one of its writes failed, and releases the run', async () => {
   const dir = await directory()
