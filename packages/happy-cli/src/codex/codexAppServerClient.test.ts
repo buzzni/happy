@@ -2053,7 +2053,7 @@ describe('CodexAppServerClient sandbox integration', () => {
 
         await waitFor(() => vi.mocked(logger.warn).mock.calls.some(([message]) => (
             String(message).includes('Output storage stream failed')
-        )), 5000);
+        )));
         expect(vi.mocked(logger.warn).mock.calls.find(([message]) => String(message).includes('Output storage stream failed')))
             .toEqual([expect.stringContaining('Output storage stream failed'), expect.objectContaining({ message: 'Codex output line exceeds limit' })]);
 
