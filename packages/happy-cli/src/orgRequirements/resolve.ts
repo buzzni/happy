@@ -14,6 +14,7 @@ import {
     ORG_PERMISSION_MODE_ORDER,
     type OrgToolRuleV1,
 } from '@slopus/happy-wire';
+import { migrateRetiredClaudeModel, migrateRetiredSelectionKey } from '@/utils/retiredClaudeModels';
 
 /** `acp`: an ACP agent Studio has no key for, so a restriction never allows it. */
 export type OrgAgent = 'claude' | 'codex' | 'gemini' | 'grok' | 'openclaw' | 'opencode' | 'acp';
@@ -176,16 +177,14 @@ export function clampPermissionMode(agent: OrgAgent, mode: string, ceiling: stri
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Claude CLI tier aliases (happy-app sends them) and the Studio aliases of the retired Fable keys, as
- * the newest catalog model of each tier. Re-checked when the Claude CLI or the Studio catalog moves.
+ * Claude CLI tier aliases (happy-app sends them), as the newest catalog model of each tier. Retired
+ * catalog ids go through `migrateRetiredClaudeModel`. Re-checked when the Claude CLI or the Studio catalog moves.
  */
 const CLAUDE_MODEL_ALIASES: ReadonlyMap<string, string> = new Map([
     ['opus', 'claude-opus-5-5'],
     ['sonnet', 'claude-sonnet-5-5'],
     ['haiku', 'claude-haiku-5-5'],
     ['fable', 'claude-fable-5-2'],
-    ['claude-fable-5', 'claude-fable-5-2'],
-    ['claude-fable-5-1', 'claude-fable-5-2'],
 ]);
 /** Agents Studio keys by agent alone: any model is `<agent>:*`. */
 const WILDCARD_AGENTS: ReadonlySet<OrgAgent> = new Set(['grok', 'openclaw', 'opencode']);
@@ -205,7 +204,16 @@ export function normalizeModelSelection(agent: OrgAgent, model: string | null | 
     const id = trimmed.replace(/\[[^\]]*\]$/, '').toLowerCase();
     if (id.length === 0) return 'unknown';
     if (id === 'default') return null;
-    return `${agent}:${agent === 'claude' ? CLAUDE_MODEL_ALIASES.get(id) ?? id : id}`;
+    return `${agent}:${agent === 'claude' ? CLAUDE_MODEL_ALIASES.get(id) ?? migrateRetiredClaudeModel(id) : id}`;
+}
+
+/** An allowed set as this build's catalog keys: a policy saved before a catalog swap names the retired ids. */
+export function currentAllowedModels(allowed: OrgAiModelsItem): OrgAiModelsItem {
+    return {
+        ...allowed,
+        values: allowed.values.map(migrateRetiredSelectionKey),
+        default: allowed.default ? migrateRetiredSelectionKey(allowed.default) : allowed.default,
+    };
 }
 
 /**
@@ -238,8 +246,9 @@ export type ModelJudgment =
  * agent's first allowed model; with none the turn is refused.
  */
 export function judgeModel(input: { agent: OrgAgent; model: string | null | undefined; origin: ModelOrigin; allowed: OrgAiModelsItem | null }): ModelJudgment {
-    const { agent, allowed } = input;
-    if (!allowed) return { kind: 'allow' };
+    const { agent } = input;
+    if (!input.allowed) return { kind: 'allow' };
+    const allowed = currentAllowedModels(input.allowed);
     const key = normalizeModelSelection(agent, input.origin === 'none' ? null : input.model);
     if (key !== null && allowed.values.includes(key)) return { kind: 'allow' };
     if (key === 'unknown' && input.origin === 'explicit') return { kind: 'deny', reason: 'requirement_model_unknown', key: null };

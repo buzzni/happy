@@ -1541,6 +1541,54 @@
         "expect": {
           "kind": "allow"
         }
+      },
+      {
+        "name": "a policy saved before Fable 5.2 allows the successor of its retired Fable key",
+        "agent": "claude",
+        "model": "claude-fable-5-2",
+        "origin": "explicit",
+        "allowed": {
+          "values": [
+            "claude:claude-opus-5-5",
+            "claude:claude-fable-5-1"
+          ],
+          "default": "claude:claude-opus-5-5"
+        },
+        "expect": {
+          "kind": "allow"
+        }
+      },
+      {
+        "name": "a resumed retired Fable key stays on Fable under a policy saved before Fable 5.2",
+        "agent": "claude",
+        "model": "claude-fable-5-1",
+        "origin": "resume",
+        "allowed": {
+          "values": [
+            "claude:claude-opus-5-5",
+            "claude:claude-fable-5-1"
+          ],
+          "default": "claude:claude-opus-5-5"
+        },
+        "expect": {
+          "kind": "allow"
+        }
+      },
+      {
+        "name": "a retired Fable policy default substitutes as its successor",
+        "agent": "claude",
+        "model": null,
+        "origin": "none",
+        "allowed": {
+          "values": [
+            "claude:claude-fable-5-1"
+          ],
+          "default": "claude:claude-fable-5-1"
+        },
+        "expect": {
+          "kind": "substitute",
+          "model": "claude-fable-5-2"
+        }
       }
     ]
   },

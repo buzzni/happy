@@ -8,6 +8,7 @@ import { configuration } from '@/configuration'
 import type { PermissionMode } from '@/api/types'
 import { ZAI_CLAUDE_DEFAULT_MODEL } from '@/managed/zaiClaudeEnvironment'
 import { foldModelToOrgEndpoint, isOrgEndpointRuntime } from '@/claude/utils/orgEndpointModel'
+import { migrateRetiredClaudeModel } from '@/utils/retiredClaudeModels'
 
 /**
  * Largest prompt we still pass inline as an environment value.
@@ -119,6 +120,7 @@ export function normalizeClaudeModelForRuntime(
 ): string | undefined {
   // The endpoint serves its own model names only (aplus specs/org-llm-endpoints r2).
   if (isOrgEndpointRuntime(env)) return foldModelToOrgEndpoint(model, env)
+  if (model) model = migrateRetiredClaudeModel(model)
   if (!isZaiClaudeRuntime(env) || !model) return model
   if (model === 'fable' || model.startsWith('claude-fable-')) return undefined
   if (model === 'default') return ZAI_CLAUDE_DEFAULT_MODEL

@@ -186,7 +186,18 @@ describe('normalizeClaudeModelForRuntime', () => {
     expect(normalizeClaudeModelForRuntime('claude-haiku-4-5', {
       ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
     })).toBe('haiku')
-    expect(normalizeClaudeModelForRuntime('claude-fable-5', {})).toBe('claude-fable-5')
+    expect(normalizeClaudeModelForRuntime('claude-fable-5-1', {
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+    })).toBeUndefined()
+  })
+
+  // Fable 5.2 교체(2026-11-10): 저장된 핀·스폰 시드·meta.model 의 은퇴 키가 그대로 SDK 로 가지 않는다.
+  it('sends a retired Fable id as its successor on an ordinary Claude runtime', () => {
+    expect(normalizeClaudeModelForRuntime('claude-fable-5', {})).toBe('claude-fable-5-2')
+    expect(normalizeClaudeModelForRuntime('claude-fable-5-1', {})).toBe('claude-fable-5-2')
+    expect(normalizeClaudeModelForRuntime('claude-fable-5-1[1m]', {})).toBe('claude-fable-5-2[1m]')
+    expect(resolveClaudeModelForRuntime('claude-fable-5-1', {})).toBe('claude-fable-5-2')
+    expect(normalizeClaudeModelForRuntime('claude-fable-5-2', {})).toBe('claude-fable-5-2')
   })
 
   it('resolves an unpicked Default to GLM-5.3-Flash on the Z.AI runtime', () => {
