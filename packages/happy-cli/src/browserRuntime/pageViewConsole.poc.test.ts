@@ -340,24 +340,25 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
     }
     const inputs = () => ops.filter((o) => o.op === 'dispatchPageInput')
 
-    it('local console: an input whose answer is lost is never sent again, and Reconnect is offered', async () => {
+    it('local console: an input whose answer is lost is never sent again; once its receipt is checked the view is reopened', async () => {
         ops.length = 0
         const { target, x, y } = await controlLocal()
         try {
             dropInput = true
             await click(target, x, y)
-            await until(() => harness.evaluate(target, `document.getElementById('screenHintText').textContent`), (s) => s === 'Checking input receipt. Do not repeat the input.', 5_000)
-            await wait(target, 1500)
+            await until(() => inputs().length, (n) => n >= 1, 5_000)
+            const first = inputs()[0]!.body.viewId
+            // Nothing pending or unknown (the receipt): the view is closed and a new one opened, without Reconnect.
+            await until(() => ops.some((o) => o.op === 'closePageView' && o.body.viewId === first), Boolean, 5_000)
+            await until(() => ops.filter((o) => o.op === 'openPageView').length, (n) => n >= 2, 5_000)
+            expect(ops.some((o) => o.op === 'getPageFrame' && o.body.statusOnly)).toBe(true)
+            expect(await harness.evaluate(target, `!!document.getElementById('pageRetry').getClientRects().length`)).toBe(false)
             // One press reached the Runtime; neither it nor the release queued behind it was sent again.
             // One input left the console. Chrome itself may replay a POST whose connection dropped unanswered (the same body,
             // which the Runtime answers from its receipt); the console never sent a new sequence or the rest of the click.
-            expect(new Set(inputs().map((o) => JSON.stringify(o.body))).size).toBe(1)
-            expect(inputs()[0]!.body).toMatchObject({ sequence: 1, event: { type: 'mouseMoved' } })
-            expect(ops.some((o) => o.op === 'getPageFrame' && o.body.statusOnly)).toBe(true)
-            expect(await harness.evaluate(target, `!!document.getElementById('pageRetry').getClientRects().length`)).toBe(true)
-            await click(target, x, y)
-            await wait(target, 600)
-            expect(new Set(inputs().map((o) => o.body.sequence))).toEqual(new Set([1]))
+            const firstView = inputs().filter((o) => o.body.viewId === first)
+            expect(new Set(firstView.map((o) => JSON.stringify(o.body))).size).toBe(1)
+            expect(firstView[0]!.body).toMatchObject({ sequence: 1, event: { type: 'mouseMoved' } })
         } finally { dropInput = false; await harness.closeTarget(target) }
     })
 
