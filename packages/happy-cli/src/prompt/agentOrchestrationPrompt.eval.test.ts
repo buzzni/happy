@@ -70,6 +70,8 @@ describe('natural-language child orchestration routing eval (T14)', () => {
     const atLeast0917 = major > 0 || minor > 9 || (minor === 9 && patch >= 17);
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT.includes('`reach: "owned-remote"`')).toBe(atLeast0917);
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT.includes('you may `read`, `wait` and `prompt` it, but never `steer` or `stop` it')).toBe(atLeast0917);
+    // Seq observation reads committed server history, which a relayed session cannot offer (Desktop R19).
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT.includes('use plain `wait`/`read` for it, not `--after-seq`')).toBe(atLeast0917);
   });
 
   it('routes an explicitly durable child away from provider-native subagents', () => {

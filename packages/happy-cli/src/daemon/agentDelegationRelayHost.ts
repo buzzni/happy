@@ -7,7 +7,7 @@ import axios from 'axios';
 import { decodeBase64, decrypt, encodeBase64, encrypt } from '@/api/encryption';
 import type { PersistedSession } from '@/persistence';
 import { createAgentRelationAuthority, type AgentRelationHost } from './agentRelationAuthority';
-import type { AgentDelegationRelayHost, RelaySessionBinding } from './agentDelegationRelay';
+import type { AgentDelegationRelayHost, RelaySessionEntry } from './agentDelegationRelay';
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -20,6 +20,8 @@ export function createAgentDelegationRelayHost(input: {
     machineId: string;
     token: () => Promise<string | null>;
     readSessions: () => Record<string, PersistedSession>;
+    /** Changes whenever the session store file does (mtime and size); absent = parse it on every call. */
+    sessionsStamp?: () => string | null;
     isSessionLive: (sessionId: string) => boolean;
     /** This machine's server-confirmed identity (`readAgentRelationHost`); null proves no ownership. */
     relationHost: () => Promise<AgentRelationHost | null>;
@@ -29,6 +31,19 @@ export function createAgentDelegationRelayHost(input: {
 }): Omit<AgentDelegationRelayHost, 'store'> {
     const get: Get = input.get ?? ((url, options) => axios.get(url, options));
     const post: Post = input.post ?? ((url, body, options) => axios.post(url, body, options));
+    let cached: { stamp: string; sessions: Record<string, PersistedSession> } | null = null;
+    /** The store parsed once per file change: a polling wait must not re-parse it on the event loop every few seconds. */
+    function persisted(): Record<string, PersistedSession> {
+        const stamp = input.sessionsStamp?.() ?? null;
+        if (stamp !== null && cached?.stamp === stamp) return cached.sessions;
+        const sessions = input.readSessions();
+        cached = stamp === null ? null : { stamp, sessions };
+        return sessions;
+    }
+    function entry(sessionId: string, session: PersistedSession | undefined): RelaySessionEntry | null {
+        if (session?.metadata?.machineId !== input.machineId || typeof session.metadata.path !== 'string') return null;
+        return { sessionId, directory: session.metadata.path, title: session.metadata.summary?.text || session.metadata.name || null, updatedAt: session.savedAt };
+    }
     const messagesUrl = (sessionId: string) => `${input.serverUrl}/v3/sessions/${encodeURIComponent(sessionId)}/messages`;
     async function headers(): Promise<Record<string, string>> {
         const token = await input.token();
@@ -37,20 +52,15 @@ export function createAgentDelegationRelayHost(input: {
     }
 
     return {
-        sessions: () => Object.entries(input.readSessions()).flatMap(([sessionId, session]): RelaySessionBinding[] => {
-            if (session.metadata?.machineId !== input.machineId || typeof session.metadata.path !== 'string') return [];
+        sessions: () => Object.entries(persisted()).flatMap(([sessionId, session]) => entry(sessionId, session) ?? []),
+        binding: (sessionId) => {
+            const session = persisted()[sessionId];
+            const found = entry(sessionId, session);
+            if (!found || !session) return null;
             let encryptionKey: Uint8Array;
-            try { encryptionKey = decodeBase64(session.encryptionKey); } catch { return []; }
-            if (encryptionKey.length !== 32) return [];
-            return [{
-                sessionId,
-                directory: session.metadata.path,
-                title: session.metadata.summary?.text || session.metadata.name || null,
-                updatedAt: session.savedAt,
-                encryptionKey,
-                encryptionVariant: session.encryptionVariant,
-            }];
-        }),
+            try { encryptionKey = decodeBase64(session.encryptionKey); } catch { return null; }
+            return encryptionKey.length === 32 ? { ...found, encryptionKey, encryptionVariant: session.encryptionVariant } : null;
+        },
         isSessionLive: input.isSessionLive,
         async ownedBy(requesterSessionId, sessionIds) {
             const host = await input.relationHost();

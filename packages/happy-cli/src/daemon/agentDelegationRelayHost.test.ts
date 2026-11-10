@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { SessionOwnershipRelationRequestSchema } from '@slopus/happy-wire';
 import { decodeBase64, decrypt, encodeBase64, encrypt } from '@/api/encryption';
 import type { PersistedSession } from '@/persistence';
 import { createAgentDelegationRelayHost } from './agentDelegationRelayHost';
@@ -26,14 +27,43 @@ const host = (input: Partial<Parameters<typeof createAgentDelegationRelayHost>[0
 });
 
 describe('agent-delegation relay host', () => {
-    it('offers only well-formed sessions this machine ran, titled by their summary', () => {
-        expect(host().sessions()).toEqual([{ sessionId: 's1', directory: '/work/app', title: 'Fix login', updatedAt: 500, encryptionKey: key, encryptionVariant: 'dataKey' }]);
+    it('lists sessions this machine ran without decoding their keys, and binds one key on request', () => {
+        const relay = host();
+        expect(relay.sessions()).toEqual([
+            { sessionId: 's1', directory: '/work/app', title: 'Fix login', updatedAt: 500 },
+            { sessionId: 'broken', directory: '/work/app', title: 'Fix login', updatedAt: 500 },
+        ]);
+        expect(relay.binding('s1')).toEqual({ sessionId: 's1', directory: '/work/app', title: 'Fix login', updatedAt: 500, encryptionKey: key, encryptionVariant: 'dataKey' });
+        expect(relay.binding('broken')).toBeNull();
+        expect(relay.binding('elsewhere')).toBeNull();
+    });
+
+    it('parses the session store again only when its file changed', () => {
+        let stamp = 'a';
+        const readSessions = vi.fn(() => ({ s1: persisted() }));
+        const relay = host({ readSessions, sessionsStamp: () => stamp });
+        relay.sessions(); relay.binding('s1'); relay.binding('s1');
+        expect(readSessions).toHaveBeenCalledTimes(1);
+        stamp = 'b';
+        relay.binding('s1');
+        expect(readSessions).toHaveBeenCalledTimes(2);
+    });
+
+    it('asks the relation route in the shape the server accepts', async () => {
+        const bodies: unknown[] = [];
+        const fetch = vi.fn(async (url: string, init?: RequestInit) => {
+            if (String(url).endsWith('/v1/session-ownership/relation')) bodies.push(JSON.parse(String(init?.body)));
+            return new Response(String(url).endsWith('/v1/account/profile') ? JSON.stringify({ id: 'account-1' })
+                : JSON.stringify({ v: 1, callerAccountId: 'account-1', proof: 'personal-same-account', relations: { s1: 'own' } }));
+        });
+        await host({ fetch: fetch as never }).ownedBy('requester', ['s1']);
+        expect(SessionOwnershipRelationRequestSchema.safeParse(bodies[0]).success).toBe(true);
     });
 
     it('reads one server page with the same cursor the CLI uses and hands back the ciphertext', async () => {
         const get = vi.fn(async () => ({ data: { messages: [{ seq: 2, localId: 'x', createdAt: 9, content: { t: 'encrypted', c: 'cipher' } }, { seq: 3, content: { t: 'plain' } }] } }));
         const relay = host({ get: get as never });
-        const binding = relay.sessions()[0]!;
+        const binding = relay.binding('s1')!;
         expect(await relay.fetchPage(binding, { limit: 20, beforeSeq: 10 })).toEqual([{ seq: 2, localId: 'x', createdAt: 9, ciphertext: 'cipher' }]);
         expect(get).toHaveBeenCalledWith('https://server.test/v3/sessions/s1/messages', expect.objectContaining({
             params: { limit: 20, before_seq: 10 }, headers: { Authorization: 'Bearer token-b' },
@@ -43,7 +73,7 @@ describe('agent-delegation relay host', () => {
     it('encrypts a prompt with the session key and posts it under its local id', async () => {
         const post = vi.fn(async () => ({}));
         const relay = host({ post: post as never });
-        const binding = relay.sessions()[0]!;
+        const binding = relay.binding('s1')!;
         await relay.postUserMessage(binding, { localId: 'local-1', content: { role: 'user', content: { type: 'text', text: 'hi' } } });
         const [url, body] = post.mock.calls[0] as unknown as [string, { messages: Array<{ localId: string; content: string }> }];
         expect(url).toBe('https://server.test/v3/sessions/s1/messages');

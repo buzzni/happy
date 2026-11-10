@@ -15,6 +15,7 @@
  * Only reading and a plain user prompt: no steer, no stop, no permission answers, no resume.
  */
 import { z } from 'zod';
+import { SESSION_OWNERSHIP_RELATION_MAX_TARGETS } from '@slopus/happy-wire';
 import type { RpcCallContext } from '@/api/rpc/types';
 import type { AgentDelegationStore } from './agentDelegationStore';
 
@@ -24,12 +25,18 @@ export const AGENT_DELEGATION_RELAY_VERSION = 1;
 const OWNERSHIP_REUSE_MS = 60_000;
 const MAX_LISTED = 100;
 const MAX_PAGE = 200;
+/** One listing spends at most this many server lookups (the relation route allows 120 a minute per account). */
+const MAX_OWNERSHIP_LOOKUPS = 3;
 
-export interface RelaySessionBinding {
+/** What a listing needs; the key is decoded only for the one session a read or prompt names. */
+export interface RelaySessionEntry {
     sessionId: string;
     directory: string;
     title: string | null;
     updatedAt: number;
+}
+
+export interface RelaySessionBinding extends RelaySessionEntry {
     encryptionKey: Uint8Array;
     encryptionVariant: 'legacy' | 'dataKey';
 }
@@ -39,7 +46,9 @@ export type RelayCursor = { limit: number } & ({ beforeSeq: number } | { afterSe
 export interface AgentDelegationRelayHost {
     store: Pick<AgentDelegationStore, 'targetLink' | 'childOf'>;
     /** Sessions this machine holds a key for. */
-    sessions: () => readonly RelaySessionBinding[];
+    sessions: () => readonly RelaySessionEntry[];
+    /** One of them with its key; null when this machine holds no usable key for it. */
+    binding: (sessionId: string) => RelaySessionBinding | null;
     isSessionLive: (sessionId: string) => boolean;
     /** The ids among `sessionIds` the server says belong to the person behind `requesterSessionId`; empty when it cannot say. */
     ownedBy: (requesterSessionId: string, sessionIds: string[]) => Promise<ReadonlySet<string>>;
@@ -76,24 +85,36 @@ export function registerAgentDelegationRelay(register: Register, host: AgentDele
     const now = host.now ?? Date.now;
     const proven = new Map<string, number>();
 
-    /** Which of `bindings` the requester may reach: this link's children, then what the server calls theirs. */
-    async function reachable(peer: string, requester: string, bindings: readonly RelaySessionBinding[]): Promise<Map<string, boolean>> {
+    /**
+     * Which of `entries` (newest first) the requester may reach: this link's children, then what the server calls theirs —
+     * asked at most a hundred at a time and no more than `MAX_OWNERSHIP_LOOKUPS` times, stopping once `want` are found.
+     * `true` marks a child.
+     */
+    async function reachable(peer: string, requester: string, entries: readonly RelaySessionEntry[], want: number): Promise<Map<string, boolean>> {
         const reach = new Map<string, boolean>();
-        const ask: string[] = [];
-        for (const binding of bindings) {
-            if (binding.sessionId === requester) continue;
-            if (host.store.childOf(binding.sessionId, peer)) { reach.set(binding.sessionId, true); continue; }
-            const at = proven.get(`${peer}\0${requester}\0${binding.sessionId}`);
-            if (at !== undefined && now() - at < OWNERSHIP_REUSE_MS) reach.set(binding.sessionId, false);
-            else ask.push(binding.sessionId);
-        }
-        if (ask.length) {
-            const owned = await host.ownedBy(requester, ask).catch(() => new Set<string>());
-            for (const id of ask) {
+        let pending: string[] = [];
+        let lookups = 0;
+        const ask = async () => {
+            const ids = pending;
+            pending = [];
+            lookups++;
+            const owned = await host.ownedBy(requester, ids).catch(() => new Set<string>());
+            for (const id of ids) {
                 const key = `${peer}\0${requester}\0${id}`;
                 if (owned.has(id)) { proven.set(key, now()); reach.set(id, false); } else proven.delete(key);
             }
+        };
+        for (const entry of entries) {
+            if (reach.size >= want) break;
+            if (entry.sessionId === requester) continue;
+            if (host.store.childOf(entry.sessionId, peer)) { reach.set(entry.sessionId, true); continue; }
+            const at = proven.get(`${peer}\0${requester}\0${entry.sessionId}`);
+            if (at !== undefined && now() - at < OWNERSHIP_REUSE_MS) { reach.set(entry.sessionId, false); continue; }
+            if (lookups >= MAX_OWNERSHIP_LOOKUPS) continue;
+            pending.push(entry.sessionId);
+            if (pending.length === SESSION_OWNERSHIP_RELATION_MAX_TARGETS) await ask();
         }
+        if (pending.length && lookups < MAX_OWNERSHIP_LOOKUPS) await ask();
         return reach;
     }
 
@@ -103,8 +124,8 @@ export function registerAgentDelegationRelay(register: Register, host: AgentDele
         if (context?.lane !== 'delegation') return { ok: false, reply: refuse('delegation_lane_required', 'Only a linked machine can use the relay') };
         // The lane opened the request with this link's key a moment ago; a revoke may have landed since.
         if (!host.store.targetLink(context.peer)) return { ok: false, reply: refuse('machine_not_delegatable', 'This machine no longer accepts requests from the requesting machine') };
-        const binding = host.sessions().find((candidate) => candidate.sessionId === target);
-        if (!binding || !(await reachable(context.peer, requester, [binding])).has(target)) return { ok: false, reply: NOT_REACHABLE };
+        const binding = host.binding(target);
+        if (!binding || !(await reachable(context.peer, requester, [binding], 1)).has(target)) return { ok: false, reply: NOT_REACHABLE };
         return { ok: true, binding, peer: context.peer };
     }
 
@@ -113,15 +134,15 @@ export function registerAgentDelegationRelay(register: Register, host: AgentDele
         if (!host.store.targetLink(context.peer)) return refuse('machine_not_delegatable', 'This machine no longer accepts requests from the requesting machine');
         const parsed = ListSchema.safeParse(params);
         if (!parsed.success) return refuse('invalid_request', parsed.error.issues.map((issue) => issue.message).join('; '));
-        const bindings = [...host.sessions()].sort((a, b) => b.updatedAt - a.updatedAt);
-        const reach = await reachable(context.peer, parsed.data.requesterSessionId, bindings);
-        const sessions = bindings.filter((binding) => reach.has(binding.sessionId)).slice(0, MAX_LISTED).map((binding) => ({
-            id: binding.sessionId,
-            directory: binding.directory,
-            title: binding.title,
-            active: host.isSessionLive(binding.sessionId),
-            updatedAt: binding.updatedAt,
-            delegated: reach.get(binding.sessionId) === true,
+        const entries = [...host.sessions()].sort((a, b) => b.updatedAt - a.updatedAt);
+        const reach = await reachable(context.peer, parsed.data.requesterSessionId, entries, MAX_LISTED);
+        const sessions = entries.filter((entry) => reach.has(entry.sessionId)).slice(0, MAX_LISTED).map((entry) => ({
+            id: entry.sessionId,
+            directory: entry.directory,
+            title: entry.title,
+            active: host.isSessionLive(entry.sessionId),
+            updatedAt: entry.updatedAt,
+            delegated: reach.get(entry.sessionId) === true,
         }));
         return { type: 'success', sessions };
     });

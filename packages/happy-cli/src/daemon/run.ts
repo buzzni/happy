@@ -117,7 +117,7 @@ import type { RestartDrainControlPort } from './restartDrainRoutes';
 import { resolveDaemonStateOwnership } from './daemonStateOwnership';
 import { createPortRegistry } from './portRegistry';
 import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs } from './stageUserCredentials';
-import { existsSync } from 'fs';
+import { existsSync, statSync } from 'fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path';
 import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
@@ -5981,6 +5981,7 @@ export async function startDaemon(): Promise<void> {
           machineId,
           token: async () => credentials.token,
           readSessions: readPersistedSessions,
+          sessionsStamp: () => { try { const stat = statSync(configuration.sessionsFile); return `${stat.mtimeMs}:${stat.size}`; } catch { return null; } },
           isSessionLive: sessionId => hasLiveDaemonChild(sessionId, pidToTrackedSession.values(), isPidAlive, ownsUnresolvedJob),
           relationHost: () => readAgentRelationHost({ serverUrl: configuration.serverUrl, settings: () => readSettings(), credentials: readCredentials }),
         }),

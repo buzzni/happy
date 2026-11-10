@@ -181,7 +181,8 @@ describe('agent-delegation RPCs', () => {
     it('registers the relay only for a host that serves it, against the same link store', async () => {
         expect(handlers.has('agent-delegation:relay-read')).toBe(false);
         setup({ relay: {
-            sessions: () => [{ sessionId: 'child-1', directory: '/work/app', title: null, updatedAt: 1, encryptionKey: new Uint8Array(32), encryptionVariant: 'dataKey' }],
+            sessions: () => [{ sessionId: 'child-1', directory: '/work/app', title: null, updatedAt: 1 }],
+            binding: () => null,
             isSessionLive: () => true,
             ownedBy: async () => new Set(),
             fetchPage: async () => [],

@@ -33,7 +33,8 @@ describe('agent-delegation relay', () => {
                 targetLink: (peer) => links.has(peer) ? { createdBy: { accountId: 'linker' } } : null,
                 childOf: (sessionId, peer) => children.get(sessionId) === peer,
             },
-            sessions: () => bindings,
+            sessions: () => bindings.map(({ encryptionKey: _key, encryptionVariant: _variant, ...entry }) => entry),
+            binding: (sessionId) => bindings.find((candidate) => candidate.sessionId === sessionId) ?? null,
             isSessionLive: (sessionId) => live.has(sessionId),
             ownedBy: ownedBy as never,
             fetchPage: fetchPage as never,
@@ -72,6 +73,24 @@ describe('agent-delegation relay', () => {
             ] });
             // Ownership is asked of the server for everything that is not this link's child.
             expect(ownedBy).toHaveBeenCalledWith('requester', ['mine-1', 'mine-2', 'theirs', 'child-of-other']);
+        });
+
+        it('asks the server at most a hundred sessions at a time, newest first, and stops once enough are found', async () => {
+            bindings = Array.from({ length: 450 }, (_, index) => binding(`s${index}`, { updatedAt: 10_000 - index }));
+            owned = new Set(bindings.map((entry) => entry.sessionId).filter((id) => Number(id.slice(1)) >= 150));
+            const reply = await call('agent-delegation:relay-sessions', { requesterSessionId: 'requester' });
+            // The first chunk (s0..s99) proves nothing; the second proves s150..s199, the third fills the list to 100.
+            expect(reply.sessions).toHaveLength(100);
+            expect(reply.sessions[0].id).toBe('s150');
+            for (const [, ids] of ownedBy.mock.calls) expect((ids as string[]).length).toBeLessThanOrEqual(100);
+            expect(ownedBy).toHaveBeenCalledTimes(3);
+        });
+
+        it('spends at most three server lookups on one listing, so a large store cannot exhaust the relation limit', async () => {
+            bindings = Array.from({ length: 900 }, (_, index) => binding(`s${index}`, { updatedAt: 10_000 - index }));
+            owned = new Set();
+            await call('agent-delegation:relay-sessions', { requesterSessionId: 'requester' });
+            expect(ownedBy).toHaveBeenCalledTimes(3);
         });
 
         it('lists only the link\'s children when ownership cannot be proven', async () => {
