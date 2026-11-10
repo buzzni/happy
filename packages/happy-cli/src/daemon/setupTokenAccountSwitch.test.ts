@@ -70,6 +70,29 @@ describe('setup-token account switch (specs/claude-setup-token-account-selection
     vi.mocked(deps.fetch).mockResolvedValueOnce(new Response('<html>Bad Gateway</html>', { status: 502 }))
     expect(await switcher.capacity('session-a', RUNNING_A, 'reserve', actor, 'runtime')).toEqual({ ok: false, reason: 'CAPACITY_HTTP_502' })
   })
+  it('names a Studio timeout or network failure apart from a local failure and logs the cause', async () => {
+    const debug = vi.spyOn(logger, 'debug')
+    try {
+      const actor = { companyId: 'org-a', machineId: 'pc-a', sessionId: 'session-a', requestId: 'input-r', contentHash: 'a'.repeat(64), proof: 'signed.proof' }
+      const reset = Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' })
+      const unreachable = setup({ fetch: vi.fn(async () => { throw new TypeError('fetch failed', { cause: reset }) }) as unknown as typeof fetch })
+      expect(await unreachable.switcher.capacity('session-a', RUNNING_A, 'reserve', actor, 'runtime')).toEqual({ ok: false, reason: 'CAPACITY_STUDIO_UNREACHABLE' })
+      expect(debug.mock.calls.flat().join(' ')).toMatch(/capacity reserve .*session-a.*fetch failed.*ECONNRESET/)
+      const slow = setup({ fetch: vi.fn(async () => { throw new DOMException('The operation was aborted due to timeout', 'TimeoutError') }) as unknown as typeof fetch })
+      expect(await slow.switcher.capacity('session-a', RUNNING_A, 'reserve', actor, 'runtime')).toEqual({ ok: false, reason: 'CAPACITY_STUDIO_TIMEOUT' })
+      // A failure before any request reached Studio is not a network failure, whatever its error type.
+      debug.mockClear()
+      const local = setup({ disabledSetupTokenAccounts: async () => { throw new TypeError('cswap list unreadable') } })
+      expect(await local.switcher.capacity('session-a', RUNNING_A, 'reserve', actor, 'runtime')).toEqual({ ok: false, reason: 'CAPACITY_UNAVAILABLE' })
+      expect(local.deps.fetch).not.toHaveBeenCalled()
+      expect(debug.mock.calls.flat().join(' ')).toContain('cswap list unreadable')
+      // The caller giving up is not Studio being slow.
+      const cancelled = new AbortController()
+      cancelled.abort()
+      const aborted = setup({ fetch: vi.fn(async (_url: string | URL | Request, init?: RequestInit) => { throw init?.signal?.reason }) as unknown as typeof fetch })
+      expect(await aborted.switcher.capacity('session-a', RUNNING_A, 'reserve', actor, 'runtime', undefined, cancelled.signal)).toEqual({ ok: false, reason: 'CAPACITY_UNAVAILABLE' })
+    } finally { debug.mockRestore() }
+  })
   it('keeps token-value verification negotiated across an account switch and refuses a downgraded response', async () => {
     const { switcher, session, deps } = setup()
     const running = formatSetupTokenBinding({ ...binding(A), tokenProof: 'a'.repeat(64) })
