@@ -302,6 +302,11 @@ async function runClaudeRemote(
                     const nextArg = opts.claudeArgs[i + 1];
                     // If next arg doesn't start with dash and contains dashes, it's likely a UUID
                     if (!nextArg.startsWith('-') && nextArg.includes('-')) {
+                        // Claude refuses to resume a transcript it no longer has (e.g. removed by cleanupPeriodDays).
+                        if (canCheckTranscript && !claudeCheckSession(nextArg, opts.path)) {
+                            logger.debug(`[claudeRemote] --resume ${nextArg} has no transcript on this machine - starting a new Claude session`);
+                            break;
+                        }
                         startFrom = nextArg;
                         logger.debug(`[claudeRemote] Found --resume with session ID: ${startFrom}`);
                         break;
