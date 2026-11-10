@@ -1034,10 +1034,12 @@ export function persistSession(sessionId: string, session: PersistedSession): vo
       }
     }
     if (envelope.corruptStoreBackup && session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV]) return;
-    const existing = readPersistedSessions();
+    // Reuse the envelope parsed above. Reading the store again doubled each write's synchronous cost.
+    const existing = envelope.sessions && typeof envelope.sessions === 'object'
+      ? envelope.sessions as Record<string, PersistedSession> : {};
     existing[sessionId] = retainMachineBinding(existing[sessionId], session, false);
     const tmpFile = configuration.sessionsFile + '.tmp';
-    writePrivateFileSync(tmpFile, JSON.stringify({ ...envelope, sessions: existing }, null, 2));
+    writePrivateFileSync(tmpFile, JSON.stringify({ ...envelope, sessions: existing }));
     renameSync(tmpFile, configuration.sessionsFile);
   } catch (error) {
     logger.debug(`[PERSISTENCE] Failed to persist session ${sessionId}:`, error);

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { claudeCheckSession } from './claudeCheckSession';
-import { mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync, existsSync, truncateSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -180,6 +180,40 @@ describe('claudeCheckSession', () => {
                 '{}\n' +
                 JSON.stringify({ type: 'other' }) + '\n' +
                 JSON.stringify({ messageId: 'found-it', type: 'user' }) + '\n'
+            );
+
+            expect(claudeCheckSession(sessionId, testDir)).toBe(true);
+        });
+    });
+
+    describe('Large transcripts', () => {
+        it('should accept a transcript larger than the maximum string length', () => {
+            // 2026-11-10: a 590MB transcript made every resume throw ERR_STRING_TOO_LONG,
+            // and four session processes relaunched it in a tight loop for days.
+            const sessionId = '12345678-1234-1234-1234-123456789abc';
+            const sessionFile = join(testDir, `${sessionId}.jsonl`);
+            writeFileSync(sessionFile, JSON.stringify({ uuid: 'msg-1', type: 'user' }) + '\n');
+            truncateSync(sessionFile, 600 * 1024 * 1024); // sparse: no real disk use
+
+            expect(claudeCheckSession(sessionId, testDir)).toBe(true);
+        });
+
+        it('should judge a very long first line in time linear in its length', () => {
+            // Re-splitting the unfinished line on every read took ~13s for a 50MB line; one pass takes well under 1s.
+            const sessionId = '12345678-1234-1234-1234-123456789abc';
+            const sessionFile = join(testDir, `${sessionId}.jsonl`);
+            writeFileSync(sessionFile, JSON.stringify({ uuid: 'msg-1', text: 'x'.repeat(50 * 1024 * 1024) }) + '\n');
+
+            const started = performance.now();
+            expect(claudeCheckSession(sessionId, testDir)).toBe(true);
+            expect(performance.now() - started).toBeLessThan(5000);
+        });
+
+        it('should accept a valid line with multi-byte text spanning several reads', () => {
+            const sessionId = '12345678-1234-1234-1234-123456789abc';
+            const sessionFile = join(testDir, `${sessionId}.jsonl`);
+            writeFileSync(sessionFile,
+                '{}\n' + JSON.stringify({ uuid: 'msg-1', text: '대화'.repeat(50_000) }) + '\n'
             );
 
             expect(claudeCheckSession(sessionId, testDir)).toBe(true);
