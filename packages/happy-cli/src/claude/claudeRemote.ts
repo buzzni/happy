@@ -5,7 +5,7 @@ import type { SandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import type { ClaudeLessonReviewLifecycle } from './session';
 import type { LessonProposalTurn } from '@/utils/lessonProposalTurn';
 import type { TurnCardSwitch } from './utils/turnCardTools';
-import { isSaycodePromptBlockEnabled } from '@/prompt/promptProvenance';
+import { clientTurnPromptChange, isSaycodePromptBlockEnabled } from '@/prompt/promptProvenance';
 import { EnhancedMode } from "./loop";
 import { endManagedTurnInput } from '@/managed/managedGracefulStop';
 
@@ -1323,7 +1323,20 @@ function readTurnText(content: unknown): string {
                          * result that arrives from the previous turn must not
                          * be attached to this one.
                          */
-                        const withBlock = await withLessons(next.message, preparation);
+                        const recalledMessage = await withLessons(next.message, preparation);
+                        /*
+                         * This provider's system prompt is the first message's. A
+                         * client-turn block only this message carries rides with the
+                         * turn instead — the launcher no longer restarts for one — in
+                         * front of the lessons, which are reference for the request
+                         * rather than instructions for the turn.
+                         */
+                        const turnPrompt = isCommandInput(next.message) || next.message === CLAUDE_TRANSIENT_CONTINUE_PROMPT
+                            ? undefined
+                            : clientTurnPromptChange(initial.mode.appendSystemPrompt, next.mode.appendSystemPrompt).added;
+                        const withBlock = !turnPrompt ? recalledMessage
+                            : typeof recalledMessage === 'string' ? `${turnPrompt}\n\n${recalledMessage}`
+                            : [{ type: 'text' as const, text: turnPrompt }, ...recalledMessage];
                         if (queryClosed || messages.done || opts.signal?.aborted) return;
                         if (next.commitInput?.() === false) { messages.end(); return; }
                         activateTurnLatency(next.latency, preparation);

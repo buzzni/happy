@@ -96,6 +96,45 @@ function clientTurnPromptBlocks(prompt: string | undefined): string[] {
 }
 
 /**
+ * What a provider that started with `launched` still lacks for a message carrying `next`.
+ *
+ * A system prompt is fixed when its provider starts, so a different prompt used to mean a new
+ * provider — seconds of startup on a turn whose only difference was one client-turn block (a
+ * guide for this question, a hint for this turn's difficulty). Those blocks can travel with the
+ * turn input instead, as they already do for Codex (`buildCodexTurnPrompt`).
+ *
+ * `added` is the client-turn blocks only `next` has, to send with the turn. `restart` is true
+ * when that is not enough: the standing context differs, or `next` dropped a block the provider
+ * started with and would keep following.
+ */
+export function clientTurnPromptChange(
+  launched: string | undefined,
+  next: string | undefined,
+): { restart: boolean; added: string | undefined } {
+  const launchedBlocks = clientTurnPromptBlocks(launched);
+  const nextBlocks = clientTurnPromptBlocks(next);
+  const added = nextBlocks.filter((block) => !launchedBlocks.includes(block));
+  return {
+    restart: (stripClientTurnPromptBlocks(launched) ?? '') !== (stripClientTurnPromptBlocks(next) ?? '')
+      || launchedBlocks.some((block) => !nextBlocks.includes(block)),
+    added: added.length > 0 ? added.join('\n\n') : undefined,
+  };
+}
+
+/** For a log line: which part of the prompt differs. Block tokens are envelope checksums, never prompt text. */
+export function describeClientPromptChange(launched: string | undefined, next: string | undefined): string {
+  const tokens = (prompt: string | undefined) => clientTurnPromptBlocks(prompt)
+    .map((block) => /^<!-- saycode:client-turn-prompt:([a-z0-9]+-[a-z0-9]+):start -->/.exec(block)?.[1] ?? '?');
+  const before = tokens(launched);
+  const after = tokens(next);
+  return [
+    (stripClientTurnPromptBlocks(launched) ?? '') !== (stripClientTurnPromptBlocks(next) ?? '') ? 'standing context' : undefined,
+    ...after.filter((token) => !before.includes(token)).map((token) => `+${token}`),
+    ...before.filter((token) => !after.includes(token)).map((token) => `-${token}`),
+  ].filter(Boolean).join(' ') || 'same';
+}
+
+/**
  * Individually toggleable Saycode-owned prompt blocks. Provider title blocks
  * are deliberately excluded — they are `always-on` (see
  * PROMPT_BLOCK_PROVENANCE) and never represented as a preference here.

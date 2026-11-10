@@ -82,6 +82,7 @@ import {
 } from './claudeTransientRetry';
 import { SETUP_TOKEN_BINDING_ENV, SETUP_TOKEN_RESUME_REBOUND_ENV, sharedMachineSetupTokenAuthority } from '@/daemon/sessionEnv';
 import { orgEndpointLocalModeRefusal } from './utils/orgEndpointLocalMode';
+import { clientTurnPromptChange, describeClientPromptChange } from '@/prompt/promptProvenance';
 
 /** Sent when the member retries a turn the organization account refused to authenticate (Saycode specs/org-auth-failure-account-switch). */
 const AUTHENTICATION_RETRY_PROMPT = 'The previous request stopped because the organization Claude account could not authenticate. Try the request again from where you stopped.';
@@ -1076,6 +1077,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
             abortFuture = new Future<void>();
             let modeHash: string | null = null;
+            // The prompt `modeHash` was taken from: what this provider's system prompt was built with.
+            let launchedPrompt: string | undefined;
             let mode: EnhancedMode | null = null;
             providerRunning = false;
             // Capture authority before the first thinking callback, which can precede system/init.
@@ -1238,6 +1241,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // This message starts the new provider. Seed its comparison
                             // baseline too, or the next model/effort change is missed.
                             modeHash = p.hash;
+                            launchedPrompt = p.mode.appendSystemPrompt;
                             mode = p.mode;
                             permissionHandler.handleModeChange(p.mode.permissionMode);
                             if (orgClampedBatches.has(p)) permissionHandler.applyModeToRunningQuery(p.mode.permissionMode);
@@ -1447,7 +1451,19 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // after its hash was taken: a change reaches the SDK only with a new provider.
                             const engineModeChanged = mode && (mode.model !== msg.mode.model || mode.effort !== msg.mode.effort
                                 || !isDeepStrictEqual(mode.disallowedTools, msg.mode.disallowedTools));
-                            if ((modeHash && msg.hash !== modeHash) || engineModeChanged || msg.isolate) {
+                            /*
+                             * A different hash used to mean a new provider. Desktop composes the
+                             * prompt again for every turn, though, and most differences are one
+                             * client-turn block — a guide for this question — which `claudeRemote`
+                             * sends with the turn instead. The provider stays when that is the whole
+                             * difference: every other hashed setting matches the one it started with,
+                             * the standing context is the same, and no block it started with is gone.
+                             */
+                            const hashChanged = Boolean(modeHash) && msg.hash !== modeHash;
+                            const promptChange = hashChanged ? clientTurnPromptChange(launchedPrompt, msg.mode.appendSystemPrompt) : null;
+                            const turnBlocksOnly = promptChange !== null && !promptChange.restart
+                                && session.queue.modeHasher({ ...msg.mode, appendSystemPrompt: launchedPrompt }) === modeHash;
+                            if ((hashChanged && !turnBlocksOnly) || engineModeChanged || msg.isolate) {
                                 /*
                                  * A restart ends this provider's input and waits for it to
                                  * exit, but live background work keeps Claude Code running:
@@ -1469,15 +1485,23 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                     && isDeepStrictEqual(mode?.disallowedTools, msg.mode.disallowedTools)
                                     && (mode?.permissionMode === 'plan') === (msg.mode.permissionMode === 'plan');
                                 if (!keepForBackgroundWork) {
-                                    logger.debug('[remote]: mode has changed, pending message');
+                                    // Which part asked for the restart; block tokens are checksums, never prompt text.
+                                    logger.debug(`[remote]: mode has changed, pending message (${[
+                                        msg.isolate && 'isolated turn',
+                                        engineModeChanged && 'model, effort or blocked tools',
+                                        hashChanged && !turnBlocksOnly && (promptChange?.restart
+                                            ? `prompt: ${describeClientPromptChange(launchedPrompt, msg.mode.appendSystemPrompt)}`
+                                            : 'another launch setting'),
+                                    ].filter(Boolean).join('; ')})`);
                                     pending = msg;
                                     if (orgClamped) orgClampedBatches.add(msg);
                                     drain?.releaseClaim();
                                     return null;
                                 }
                                 logger.debug('[remote]: mode has changed, kept provider for its background work');
-                            } else {
+                            } else if (!turnBlocksOnly) {
                                 modeHash = msg.hash;
+                                launchedPrompt = msg.mode.appendSystemPrompt;
                             }
                             mode = msg.mode;
                             // The batch about to run is what answers the request, so the handle is

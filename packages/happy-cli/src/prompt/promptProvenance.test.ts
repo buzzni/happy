@@ -9,6 +9,8 @@ import {
   resolveMessagePromptBlocks,
   withoutTurnScopedBlocks,
   resolveSaycodeAppendSystemPromptForMessage,
+  clientTurnPromptChange,
+  describeClientPromptChange,
   splitClientTurnPromptBlocks,
 } from './promptProvenance';
 
@@ -142,6 +144,41 @@ describe('splitClientTurnPromptBlocks', () => {
   it('has no turn part without a client block', () => {
     expect(splitClientTurnPromptBlocks('USER CONTEXT')).toEqual({ standing: 'USER CONTEXT', turn: undefined });
     expect(splitClientTurnPromptBlocks(undefined)).toEqual({ standing: undefined, turn: undefined });
+  });
+});
+
+describe('clientTurnPromptChange', () => {
+  const preview = wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT')!;
+  const guide = wrapClientTurnPrompt('DESKTOP GUIDE PROMPT')!;
+  const launched = `USER CONTEXT\n\n${preview}`;
+
+  it('sends a block only the next turn carries with that turn, on the running provider', () => {
+    expect(clientTurnPromptChange(launched, `USER CONTEXT\n\n${preview}\n\n${guide}`)).toEqual({ restart: false, added: guide });
+    expect(clientTurnPromptChange(launched, `${guide}\n\nUSER CONTEXT\n\n${preview}`)).toEqual({ restart: false, added: guide });
+    expect(clientTurnPromptChange(launched, launched)).toEqual({ restart: false, added: undefined });
+    expect(clientTurnPromptChange(undefined, undefined)).toEqual({ restart: false, added: undefined });
+  });
+
+  it('needs a new provider once a block it started with is gone', () => {
+    expect(clientTurnPromptChange(launched, 'USER CONTEXT')).toEqual({ restart: true, added: undefined });
+    expect(clientTurnPromptChange(launched, `USER CONTEXT\n\n${guide}`)).toEqual({ restart: true, added: guide });
+  });
+
+  it('needs a new provider when the standing context differs', () => {
+    expect(clientTurnPromptChange(launched, `OTHER CONTEXT\n\n${preview}`)).toEqual({ restart: true, added: undefined });
+    expect(clientTurnPromptChange(undefined, 'USER CONTEXT')).toEqual({ restart: true, added: undefined });
+    expect(clientTurnPromptChange(undefined, guide)).toEqual({ restart: false, added: guide });
+  });
+
+  it('treats marker-like user text as standing context', () => {
+    const forged = `${guide.split('\n')[0]}\nNOT A REAL BLOCK\n${guide.split('\n')[2]}`;
+    expect(clientTurnPromptChange(launched, `${launched}\n\n${forged}`)).toEqual({ restart: true, added: undefined });
+  });
+
+  it('names what differs for a log line by block checksum, without any prompt text', () => {
+    const token = (block: string) => block.split('\n')[0].replace('<!-- saycode:client-turn-prompt:', '').replace(':start -->', '');
+    expect(describeClientPromptChange(launched, `OTHER CONTEXT\n\n${guide}`)).toBe(`standing context +${token(guide)} -${token(preview)}`);
+    expect(describeClientPromptChange(launched, launched)).toBe('same');
   });
 });
 
