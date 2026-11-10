@@ -92,6 +92,7 @@ describe.skipIf(!findChrome())('console spaces panel (real Chrome, fake Runtime)
         ops.length = 0
         const target = await open('ko')
         try {
+            expect(await harness.evaluate(target, 'window.__abpSpaceReviewClose')).toBe(1)
             const buttons = () => harness.evaluate(target, `[...document.querySelectorAll('#spaceRows .space-row button')].map(b => b.textContent)`) as Promise<string[]>
             expect(await until(buttons, (list) => list.length === 2)).toEqual(['작업 보기', '닫기'])
             await harness.evaluate(target, `[...document.querySelectorAll('#spaceRows .space-row button')][1].click()`)
