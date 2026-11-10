@@ -41,6 +41,9 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
     let frameError: string | null = null
     /** Input answers the fake Runtime loses (the connection drops before the receipt) or holds back. */
     let dropInput = false, inputDelayMs = 0
+    /** Views whose receipt says an input outcome is unknown; unknownOnDrop adds the view of an input whose answer is lost. */
+    const unknownViews = new Set<string>()
+    let unknownOnDrop = false
     /** A second open task of this conversation, for switching while input is under way. */
     let secondTask = false
     /**
@@ -81,7 +84,7 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
             req.on('end', () => {
                 const body = JSON.parse(raw || '{}')
                 ops.push({ op: m[1], bearer: String(req.headers.authorization ?? '').replace(/^Bearer /, ''), body, at: Date.now() })
-                const status = { closed: false, draining: false, unknown: false, lastAccepted: 0, lastSettled: 0, receipts: [] }
+                const status = { closed: false, draining: false, unknown: unknownViews.has(String(body.viewId)), lastAccepted: 0, lastSettled: 0, receipts: [] }
                 if (m[1] === 'getPageFrame' && !body.statusOnly && refuseFrames > 0) {
                     refuseFrames--
                     res.writeHead(429, { 'content-type': 'application/json' })
@@ -93,7 +96,7 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
                     res.end(JSON.stringify({ ok: false, error: { code: bootstrapError, message: 'refused' } }))
                     return
                 }
-                if (m[1] === 'dispatchPageInput' && dropInput && !inputGate) { req.socket.destroy(); return }
+                if (m[1] === 'dispatchPageInput' && dropInput && !inputGate) { if (unknownOnDrop) unknownViews.add(String(body.viewId)); req.socket.destroy(); return }
                 const view = views.get(String(body.viewId))
                 const refused = m[1] === 'openPageView' && body.runtimeBindingId !== binding ? 'SCOPE_DENIED'
                     : ['getPageFrame', 'dispatchPageInput'].includes(m[1]) && view && (expired.has(view.bearer) || view.binding !== binding) ? 'UNAUTHORIZED' : null
@@ -597,6 +600,27 @@ describe.skipIf(!findChrome())('page view in the consoles (real Chrome, fake Run
             await until(() => hintText(target), (s) => s === 'You have control. Input reaches the page.', 10_000)
             expect(await reconnectShown(target)).toBe(false)
         } finally { resetInput(); await harness.closeTarget(target) }
+    })
+
+    it('local console: an input whose lost answer turns out unknown keeps the stop, even on a view reopened meanwhile', async () => {
+        ops.length = 0
+        const { target, x, y } = await controlLocal()
+        try {
+            unknownOnDrop = dropInput = true
+            await click(target, x, y)
+            await until(() => hintText(target), (s) => s === 'Input outcome is unknown. Resuming the agent is blocked.', 5_000)
+            dropInput = unknownOnDrop = false
+            // Coming back to the window reopens the view; the new view's clean receipt is not the lost input's outcome.
+            const opened = ops.filter((o) => o.op === 'openPageView').length
+            await harness.evaluate(target, `document.dispatchEvent(new Event('visibilitychange'))`)
+            await until(() => ops.filter((o) => o.op === 'openPageView').length, (n) => n > opened, 5_000)
+            await wait(target, 1500)
+            expect(await reconnectShown(target)).toBe(true)
+            const sent = inputs().length
+            await click(target, x, y)
+            await wait(target, 600)
+            expect(inputs().length).toBe(sent)
+        } finally { dropInput = unknownOnDrop = false; unknownViews.clear(); await harness.closeTarget(target) }
     })
 
     it('local console: an input whose outcome is unknown still stops input and needs Reconnect', async () => {

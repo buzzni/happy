@@ -7,8 +7,9 @@ export const pageViewerScript = String.raw`/** o: request, image, input, viewpor
 function createPageViewer(o) {
     const { image, input, text, status } = o;
     let view = null, frame = null;
-    // unanswered: the stop (lost) came from an input whose answer never reached this console, not from a refusal.
-    let sequence = 0, polling = false, inputBusy = false, lost = false, unanswered = false, composing = false, fitted = true;
+    // unanswered: the view whose input's answer never reached this console, when that (not a refusal) is the stop (lost).
+    // Only that view's receipt can lift the stop; a view opened since knows nothing of the input.
+    let sequence = 0, polling = false, inputBusy = false, lost = false, unanswered = null, composing = false, fitted = true;
     let confirmedAt = -Infinity, captureAge = 0, keyModifiers = 0;
     // Runtime serves a view one frame per 500 ms, or per 200 ms while this viewer holds the tab; a read inside that
     // interval (or over the profile's byte budget, reset each second) is refused, so the next one waits that long.
@@ -64,9 +65,10 @@ function createPageViewer(o) {
             status(text.unresolved, true);
             return;
         }
-        if (result.status.draining || result.status.lastSettled < (unanswered ? result.status.lastAccepted : sequence))
+        const answerLost = unanswered === owner;
+        if (result.status.draining || result.status.lastSettled < (answerLost ? result.status.lastAccepted : sequence))
             return;
-        if (!unanswered) {
+        if (!answerLost) {
             status(text.confirmed);
             return;
         }
@@ -78,7 +80,7 @@ function createPageViewer(o) {
             status(text.unresolved, true);
             return;
         }
-        lost = unanswered = false;
+        lost = false; unanswered = null;
         status(text.connecting);
         o.render();
     }
@@ -209,7 +211,7 @@ function createPageViewer(o) {
                 await discard([event, ...queue]);
             else {
                 // 'pending': a resent request answered from the receipt of one still running; its outcome is not here.
-                lost = true; unanswered = result.state !== 'unknown';
+                lost = true; unanswered = result.state === 'unknown' ? null : owner;
                 queue.length = 0;
                 status(result.state === 'unknown' ? text.unresolved : text.confirmed, true);
                 o.render();
@@ -226,7 +228,7 @@ function createPageViewer(o) {
             }
             queue.length = 0;
             if (!e?.known) {
-                lost = unanswered = true;
+                lost = true; unanswered = owner;
                 status(text.unknown, true);
                 o.render();
                 void receipt().catch(o.fail);
@@ -359,7 +361,7 @@ function createPageViewer(o) {
         view: () => view,
         lost: () => lost,
         inputBusy: () => inputBusy,
-        clearLost: () => { lost = unanswered = false; },
+        clearLost: () => { lost = false; unanswered = null; },
         clearQueue: () => { queue.length = 0; },
         /** A refused or failed request: nothing queued survives and the shown frame no longer counts as current. */
         halt: () => { queue.length = 0; confirmedAt = -Infinity; },
