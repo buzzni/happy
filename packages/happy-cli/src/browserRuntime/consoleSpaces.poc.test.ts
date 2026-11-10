@@ -29,7 +29,8 @@ describe.skipIf(!findChrome())('console spaces panel (real Chrome, fake Runtime)
     const ops: Array<{ op: string; body: Record<string, unknown> }> = []
     const space = (taskSpaceId: string, sessionId: string, tasks: unknown[] = []) => ({ taskSpaceId, profileId: 'profile-a', createdAtMs: Date.now(), closed: false, tabs: [],
         memberSessionIds: [sessionId], membershipEvents: [], reclaiming: false, lastActivityAtMs: Date.now(), tasks })
-    let spaces = [space('space-aaaaaaaaaaaa', KNOWN), space('space-bbbbbbbbbbbb', UNKNOWN)]
+    const defaultSpaces = () => [space('space-aaaaaaaaaaaa', KNOWN), space('space-bbbbbbbbbbbb', UNKNOWN), { ...space('space-cccccccccccc', KNOWN), memberSessionIds: [KNOWN, UNKNOWN] }]
+    let spaces = defaultSpaces()
 
     beforeAll(async () => {
         server = http.createServer((req, res) => {
@@ -77,9 +78,10 @@ describe.skipIf(!findChrome())('console spaces panel (real Chrome, fake Runtime)
     it('names a space after its conversation title once the host hands the titles over', async () => {
         const target = await open()
         try {
-            expect(await until(() => names(target), (list) => list.length === 2)).toEqual(['Conversation session-know', 'Conversation session-othe'])
+            expect(await until(() => names(target), (list) => list.length === 3)).toEqual(['Conversation session-know', 'Conversation session-othe', 'Conversation session-know, session-othe'])
             await harness.evaluate(target, `window.postMessage({ type: 'abp-session-titles', titles: { ${JSON.stringify(KNOWN)}: 'Open the GA report' } }, location.origin)`)
-            expect(await until(() => names(target), (list) => list[0] === 'Open the GA report')).toEqual(['Open the GA report', 'Conversation session-othe'])
+            // A shared space keeps its untitled member visible.
+            expect(await until(() => names(target), (list) => list[0] === 'Open the GA report')).toEqual(['Open the GA report', 'Conversation session-othe', 'Open the GA report, Conversation session-othe'])
             // Malformed titles are ignored rather than shown.
             await harness.evaluate(target, `window.postMessage({ type: 'abp-session-titles', titles: { ${JSON.stringify(UNKNOWN)}: 42 } }, location.origin)`)
             await harness.evaluate(target, 'new Promise(r => setTimeout(r, 300))')
@@ -104,6 +106,24 @@ describe.skipIf(!findChrome())('console spaces panel (real Chrome, fake Runtime)
             await harness.evaluate(target, `document.getElementById('spaceConfirmYes').click()`)
             const sent = await until(() => ops.filter((o) => ['cancel', 'closeSpace'].includes(o.op)), (list) => list.length === 2)
             expect(sent.map((o) => [o.op, o.body.taskId ?? o.body.taskSpaceId])).toEqual([['cancel', 'task-u'], ['closeSpace', 'space-uncertain00']])
-        } finally { await harness.closeTarget(target); spaces = [space('space-aaaaaaaaaaaa', KNOWN), space('space-bbbbbbbbbbbb', UNKNOWN)] }
+        } finally { await harness.closeTarget(target); spaces = defaultSpaces() }
+    }, 30_000)
+
+    it('does not redraw the panel for titles while the usage-limit settings are being edited', async () => {
+        const target = await harness.openFrontTab(`${origin}/console?lang=en`)
+        try {
+            await until(() => harness.evaluate(target, 'window.__abpSpaceManagement'), (v) => v === 1)
+            await harness.evaluate(target, `window.postMessage({ type: 'abp-capability', token: ${JSON.stringify(capability)}, expiresAtMs: Date.now() + 600_000 }, location.origin)`)
+            await harness.evaluate(target, `document.getElementById('spaceToggle').click()`)
+            await until(() => names(target), (list) => list.length === 3)
+            await harness.evaluate(target, `(() => { const s = document.getElementById('spaceSettings'); s.open = true; const m = document.getElementById('spaceMode'); m.value = 'manual'; m.onchange(); })()`)
+            await harness.evaluate(target, `window.postMessage({ type: 'abp-session-titles', titles: { ${JSON.stringify(KNOWN)}: 'Open the GA report' } }, location.origin)`)
+            await harness.evaluate(target, 'new Promise(r => setTimeout(r, 300))')
+            expect(await harness.evaluate(target, `document.getElementById('spaceMode').value`)).toBe('manual')
+            expect((await names(target))[0]).toBe('Conversation session-know')
+            // Once the settings are closed, the next refresh shows the titles.
+            await harness.evaluate(target, `(() => { document.getElementById('spaceSettings').open = false; document.getElementById('spaceRefresh').click(); })()`)
+            expect(await until(() => names(target), (list) => list[0] === 'Open the GA report')).toHaveLength(3)
+        } finally { await harness.closeTarget(target) }
     }, 30_000)
 })

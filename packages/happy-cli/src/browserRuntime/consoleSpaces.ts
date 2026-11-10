@@ -45,8 +45,9 @@ function spaceRender(){var data=SP.data;if(!data)return;var q=data.quota;
  var box=$('spaceRows');box.textContent='';var spaces=data.spaces.filter(function(s){return !s.closed});if(!spaces.length)box.textContent=SM.none;
  spaces.forEach(function(s){var tasks=s.tasks||[],active=tasks.filter(function(t){return !['succeeded','failed','cancelled'].includes(t.status)||t.inFlight}),uncertain=tasks.some(function(t){return t.uncertain});
  var row=document.createElement('div');row.className='space-row';var info=document.createElement('div');info.className='space-info';var name=document.createElement('div');name.className='space-name';
- var members=s.memberSessionIds||[],titled=members.map(function(id){return SP.titles[id]}).filter(Boolean);
- name.textContent=titled.length?titled.join(', '):members.length?SM.conversation+' '+members.map(function(id){return id.slice(0,12)}).join(', '):SM.space+' '+s.taskSpaceId.slice(-12);name.title=members.join(', ');
+ var members=s.memberSessionIds||[],titled=members.some(function(id){return SP.titles[id]});
+ // Each member by its title, an untitled one by its short id, so no conversation of a shared space drops out of the row.
+ name.textContent=!members.length?SM.space+' '+s.taskSpaceId.slice(-12):titled?members.map(function(id){return SP.titles[id]||SM.conversation+' '+id.slice(0,12)}).join(', '):SM.conversation+' '+members.map(function(id){return id.slice(0,12)}).join(', ');name.title=members.join(', ');
  var meta=document.createElement('div');meta.className='space-meta';meta.textContent=(uncertain?SM.uncertain:s.reclaiming?SM.reclaiming:active.some(function(t){return t.pendingApproval})?SM.approval:active.length?SM.active:SM.idle)+' · '+new Date(s.lastActivityAtMs||s.createdAtMs).toLocaleString(LANG==='ko'?'ko-KR':'en-US');
  info.append(name,meta);row.appendChild(info);
  // A space kept for review (unknown write outcome, or reclaiming) offers its task and a warned close: stopping never finishes such a task.
@@ -64,7 +65,9 @@ function spaceRender(){var data=SP.data;if(!data)return;var q=data.quota;
 function spaceToggle(open){$('spacePanel').hidden=!open;document.querySelector('main').hidden=open;$('spaceToggle').setAttribute('aria-expanded',String(open));if(open)spaceRefresh();else $('spaceToggle').focus()}
 /** Conversation titles come from the host only (the Runtime does not know them); a malformed entry is dropped, never shown. */
 window.addEventListener('message',function(event){var d=event.data;if(!fromHost(event)||!d||d.type!=='abp-session-titles'||!d.titles||typeof d.titles!=='object')return;
- Object.keys(d.titles).slice(0,500).forEach(function(id){var t=d.titles[id];if(typeof t==='string'&&t.trim()&&t.length<=200)SP.titles[id]=t.trim()});if(SP.data)spaceRender()});
+ Object.keys(d.titles).slice(0,500).forEach(function(id){var t=d.titles[id];if(typeof t==='string'&&t.trim()&&t.length<=200)SP.titles[id]=t.trim()});
+ // A redraw would drop an unsaved limit choice or an open confirmation; the next refresh picks the titles up.
+ if(SP.data&&!SP.pending&&!$('spaceSettings').open&&!$('spaceConfirm').open)spaceRender()});
 $('spaceToggle').onclick=function(){spaceToggle($('spacePanel').hidden)};$('spaceRefresh').onclick=spaceRefresh;
 $('spaceConfirmCancel').onclick=function(){$('spaceConfirm').close()};$('spaceConfirmYes').onclick=function(){$('spaceConfirm').close();if(spaceConfirmAction)spaceConfirmAction()};
 $('spaceConfirm').addEventListener('close',function(){if(spaceFocus&&spaceFocus.isConnected)spaceFocus.focus()});
