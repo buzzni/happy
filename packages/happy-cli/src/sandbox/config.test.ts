@@ -8,7 +8,7 @@ import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { buildSandboxRuntimeConfig, filterCredentialsFromEnv } from './config';
-import type { SandboxConfig } from '@/persistence';
+import { SandboxConfigSchema, type SandboxConfig } from '@/persistence';
 import { configuration } from '@/configuration';
 import { macGetMandatoryDenyPatterns, wrapCommandWithSandboxMacOS } from '@anthropic-ai/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js';
 
@@ -479,5 +479,23 @@ describe('buildSandboxRuntimeConfig on a mandatory machine', () => {
             .toEqual(buildSandboxRuntimeConfig(config, sessionPath, 'owner-choice'));
         expect(buildSandboxRuntimeConfig(config, sessionPath).filesystem.denyRead)
             .toEqual([]);
+    });
+});
+
+// aplus-dev-studio specs/approved-folder-roots R11: an approved startup disk or home must not stop a mandatory session.
+describe('approved folders in a mandatory sandbox', () => {
+    it('starts with an approved filesystem root and home, granting writes only to the other approved folders', async () => {
+        const { replaceApprovedWriteRootsInEnvironment } = await import('@/utils/additionalDirectoriesEnv');
+        const project = mkdtempSync(join(tmpdir(), 'happy-approved-mandatory-'));
+        try {
+            const env: Record<string, string> = { HAPPY_PROJECT_SANDBOX_CONFIG: JSON.stringify({ extraWritePaths: ['/tmp'], denyWritePaths: ['.env'] }) };
+            replaceApprovedWriteRootsInEnvironment(env, ['/', homedir(), '/Volumes/work'], [join(homedir(), '.happy')], homedir());
+            const config = SandboxConfigSchema.parse(JSON.parse(env.HAPPY_PROJECT_SANDBOX_CONFIG));
+
+            expect(config.extraWritePaths).toEqual(['/tmp', '/Volumes/work']);
+            expect(() => buildSandboxRuntimeConfig(config, project, 'mandatory')).not.toThrow();
+        } finally {
+            rmSync(project, { recursive: true, force: true });
+        }
     });
 });

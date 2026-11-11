@@ -1,4 +1,5 @@
 import { isAbsolute } from 'node:path'
+import { isUnsafeMandatoryWriteScope } from '@/sandbox/sandboxPolicy'
 
 export const ADDITIONAL_DIRECTORIES_ENV = 'HAPPY_ADDITIONAL_DIRECTORIES'
 
@@ -73,13 +74,16 @@ export const APPROVED_WRITE_ROOTS_ENV = 'HAPPY_APPROVED_WRITE_ROOTS'
  * aplus-dev-studio specs/approved-folder-roots R11: folders the machine owner approved are writable in the
  * session sandbox without a per-chat approval, and the credential homes in `denied` stay unwritable.
  * Records exactly what it added, so the next spawn or resume swaps it for the current list and never
- * removes an entry the project policy already had.
+ * removes an entry the project policy already had. A filesystem root or the home folder is not granted:
+ * writing anywhere there is no sandbox at all, and a mandatory session refuses to start with it.
  */
 export function replaceApprovedWriteRootsInEnvironment(
   env: Record<string, string>,
-  roots: readonly string[],
+  approved: readonly string[],
   denied: readonly string[],
+  homeDir: string,
 ): void {
+  const roots = approved.filter((root) => !isUnsafeMandatoryWriteScope([root], homeDir))
   if (env.HAPPY_PROJECT_SANDBOX_CONFIG === undefined) return
   const config = JSON.parse(env.HAPPY_PROJECT_SANDBOX_CONFIG) as Record<string, unknown>
   if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('Invalid project sandbox config')

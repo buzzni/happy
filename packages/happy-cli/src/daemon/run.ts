@@ -2560,7 +2560,7 @@ export async function startDaemon(): Promise<void> {
             additionalDirectoryResult.accepted,
           );
         }
-        replaceApprovedWriteRootsInEnvironment(extraEnv, resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir)?.() ?? [], resolveSandboxTrustFloor());
+        replaceApprovedWriteRootsInEnvironment(extraEnv, resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir)?.() ?? [], resolveSandboxTrustFloor(), os.userInfo().homedir);
         // A fork or recovery continues an existing conversation under a new session id: say which, so the
         // Runtime refuses a conversation of an earlier profile assignment.
         // Studio's session-user attestation (a new chat on a shared machine) goes to the broker only.
@@ -3603,7 +3603,7 @@ export async function startDaemon(): Promise<void> {
         // Approvals and revocations made while the session was stopped, like additional directories below.
         // A resume never fails on this: the person is continuing the chat (reapplyAdditionalDirectoriesOnResume).
         try {
-          replaceApprovedWriteRootsInEnvironment(resumedEnvironment, resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir)?.() ?? [], resolveSandboxTrustFloor());
+          replaceApprovedWriteRootsInEnvironment(resumedEnvironment, resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir)?.() ?? [], resolveSandboxTrustFloor(), os.userInfo().homedir);
         } catch {
           logger.debug(`[DAEMON RUN] Kept the approved write roots for ${happySessionId}: the sandbox config was unreadable`);
         }
