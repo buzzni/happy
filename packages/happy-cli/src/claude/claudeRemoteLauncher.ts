@@ -564,7 +564,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 pending = { ...lastCommittedBatch, mode: lastTurnMode, continuation: session.client.inputEvidence?.takeContinuation() };
                 wakeOrganizationRecovery();
             } else {
-                session.queue.unshiftIsolated(AUTHENTICATION_RETRY_PROMPT, lastTurnMode, undefined, session.turnAttendance?.continuationInput(), {
+                session.queue.unshiftIsolated(AUTHENTICATION_RETRY_PROMPT, withoutTurnOnlyBlocks(lastTurnMode), undefined, session.turnAttendance?.continuationInput(), {
                     ref: { kind: 'unidentified', runtimeInputId: randomUUID() },
                     continuation: session.client.inputEvidence?.takeContinuation(),
                 });
@@ -644,7 +644,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             pending = { ...request, mode, continuation: session.client.inputEvidence?.takeContinuation() };
             return;
         }
-        session.queue.unshiftIsolated(CONTINUE_PROMPT, mode, undefined, session.turnAttendance?.continuationInput(), {
+        session.queue.unshiftIsolated(CONTINUE_PROMPT, withoutTurnOnlyBlocks(mode), undefined, session.turnAttendance?.continuationInput(), {
             ref: { kind: 'unidentified', runtimeInputId: randomUUID() },
             continuation: session.client.inputEvidence?.takeContinuation(),
         });
@@ -1077,9 +1077,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
             abortFuture = new Future<void>();
             let modeHash: string | null = null;
-            // The mode `modeHash` was taken from: what this provider's system prompt was built with.
+            // The mode this provider started with: what its system prompt was built from.
             let launched: EnhancedMode | null = null;
-            const providerPrompt = (of: EnhancedMode | null) => splitTurnOnlyPromptBlocks(of?.appendSystemPrompt, of?.turnOnlyPromptTokens).provider;
             let mode: EnhancedMode | null = null;
             providerRunning = false;
             // Capture authority before the first thinking callback, which can precede system/init.
@@ -1386,7 +1385,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // The failed turn again keeps its attendance and its spent wait budget (R10a, Q6).
                             // The failed turn's own settings, unchanged — no provider restart.
                             mode = due.mode.mode;
-                            modeHash = due.mode.hash ?? modeHash;
+                            // A retry that has to start the next provider starts it with the failed turn's own mode,
+                            // which a kept turn's differs from the hash recorded for it: that mode is the baseline.
+                            if (!launched) { launched = mode; modeHash = session.queue.modeHasher(mode); }
+                            else modeHash = due.mode.hash ?? modeHash;
                             permissionHandler.handleModeChange(mode.permissionMode);
                             logger.debug(`[remote]: transient API failure retry ${due.attempt}`);
                             dispatchTurn();
@@ -1462,9 +1464,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                              * A block the client marked for one turn was never in the provider's prompt.
                              */
                             const hashChanged = Boolean(modeHash) && msg.hash !== modeHash;
-                            const promptChange = hashChanged ? clientTurnPromptChange(providerPrompt(launched), providerPrompt(msg.mode)) : null;
-                            const turnBlocksOnly = promptChange !== null && !promptChange.restart
-                                && session.queue.modeHasher({ ...msg.mode, appendSystemPrompt: launched?.appendSystemPrompt, turnOnlyPromptTokens: launched?.turnOnlyPromptTokens }) === modeHash;
+                            const promptChange = hashChanged ? clientTurnPromptChange(providerPromptOf(launched), providerPromptOf(msg.mode)) : null;
+                            // Both sides as the organization gate rewrote them: the queue hashed this batch before that.
+                            // A turn that starts like a command cannot carry a block in front of its text.
+                            const turnBlocksOnly = promptChange !== null && !promptChange.restart && launched !== null
+                                && !(promptChange.added && isCommandText(msg.message))
+                                && session.queue.modeHasher({ ...msg.mode, appendSystemPrompt: launched.appendSystemPrompt, turnOnlyPromptTokens: launched.turnOnlyPromptTokens })
+                                    === session.queue.modeHasher(launched);
                             if ((hashChanged && !turnBlocksOnly) || engineModeChanged || msg.isolate) {
                                 /*
                                  * A restart ends this provider's input and waits for it to
@@ -1492,7 +1498,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                         msg.isolate && 'isolated turn',
                                         engineModeChanged && 'model, effort or blocked tools',
                                         hashChanged && !turnBlocksOnly && (promptChange?.restart
-                                            ? `prompt: ${describeClientPromptChange(providerPrompt(launched), providerPrompt(msg.mode))}`
+                                            ? `prompt: ${describeClientPromptChange(providerPromptOf(launched), providerPromptOf(msg.mode))}`
                                             : 'another launch setting'),
                                     ].filter(Boolean).join('; ')})`);
                                     pending = msg;
@@ -1502,8 +1508,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 }
                                 logger.debug('[remote]: mode has changed, kept provider for its background work');
                             } else if (!turnBlocksOnly) {
+                                // Only the message that starts the provider: a later one of the same hash may
+                                // mark its blocks differently, and the provider's prompt does not change with it.
+                                if (!modeHash) launched = msg.mode;
                                 modeHash = msg.hash;
-                                launched = msg.mode;
                             }
                             mode = msg.mode;
                             // The batch about to run is what answers the request, so the handle is
@@ -1971,6 +1979,16 @@ function detectClaudeImageMime(bytes: Uint8Array): 'image/jpeg' | 'image/png' | 
 }
 
 /** Both freshly dequeued and replayed input retain their own decrypted attachments. */
+/** What a provider's system prompt may hold of a mode's prompt: everything but the blocks marked for one turn. */
+function providerPromptOf(mode: EnhancedMode | null): string | undefined {
+    return splitTurnOnlyPromptBlocks(mode?.appendSystemPrompt, mode?.turnOnlyPromptTokens).provider;
+}
+
+/** For a note sent in a turn's place: it is not the turn that turn's one-turn blocks were written for. */
+function withoutTurnOnlyBlocks(mode: EnhancedMode): EnhancedMode {
+    return { ...mode, appendSystemPrompt: providerPromptOf(mode), turnOnlyPromptTokens: undefined };
+}
+
 function claudeBatchMessage(batch: CollectedBatch<EnhancedMode>): string | ContentBlockParam[] {
     if (!batch.attachments?.length) return batch.message;
     const content: ContentBlockParam[] = [];
