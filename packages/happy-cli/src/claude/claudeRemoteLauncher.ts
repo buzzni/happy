@@ -1022,9 +1022,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 try {
                     const exported = await runAiCredentialCommand('cswap', ['oauth-owner', 'active'], { maxOutputBytes: 1024 * 1024, timeoutMs: 120_000 });
                     Object.assign(process.env, claudeOwnerEnvironment(exported.stdout, Date.now(), process.env.HAPPY_CLAUDE_OWNER_IDENTITY));
-                } catch {
-                    session.client.sendSessionEvent({ type: 'message', message: 'Claude error: [CLAUDE_OWNER_REFRESH_REQUIRED] Check the source PC.', isError: true });
-                    break;
+                } catch (error) {
+                    // Keep the current bearer: an expired one fails at the provider, which reports the source PC notice.
+                    logger.debug('[remote]: owner bearer check failed before launch', error);
                 }
             }
             logger.debug('[remote]: launch');
@@ -1501,10 +1501,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                     drain?.releaseClaim();
                                     return null;
                                 }
-                            } catch {
-                                session.client.sendSessionEvent({ type: 'message', message: 'Claude error: [CLAUDE_OWNER_REFRESH_REQUIRED] Check the source PC.', isError: true });
-                                drain?.releaseClaim();
-                                return null;
+                            } catch (error) {
+                                // The input still goes out on the current bearer; dropping it here would lose the user's message.
+                                logger.debug('[remote]: owner bearer check failed before input', error);
                             }
                         }
                         // Check if mode has changed
