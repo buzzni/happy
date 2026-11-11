@@ -45,6 +45,7 @@ import { DurableTicketGuard } from './usedWorktreeTickets';
 import { workspaceRemotePins, type WorkspaceRemotePins } from './workspaceRemotePins';
 import { stopProjectNativeProcesses, type NativeStopResult } from './projectNativeProcesses';
 import { isWithinDirectory } from '@/modules/common/happyHomeGuard';
+import { approvedAnchor } from '@/modules/common/pathSecurity';
 import { openSealedForMachine } from '@/modules/common/machineSeal';
 import { logger } from '@/ui/logger';
 import type { LegacyDispatchReservation } from '@/utils/workspaceTurnAdmission';
@@ -86,6 +87,8 @@ export type ProjectPurgeIo = {
 export type WorktreeOpsDeps = {
     machine: () => MachineKeyView;
     allowedRoot: string;
+    /** Folders the machine owner approved outside it (modules/common/approvedFolders), asked on every check. */
+    approvedRoots?: () => readonly string[];
     happyHomeDir: string;
     now?: () => number;
     purge?: ProjectPurgeIo;
@@ -296,13 +299,15 @@ type PathGuard = {
     missing(path: string): Promise<void>;
 };
 
-function pathGuard(allowedRoot: string, happyHomeDir: string): PathGuard {
+function pathGuard(allowedRoot: string, happyHomeDir: string, approvedRoots: () => readonly string[] = () => []): PathGuard {
     let allowed: Promise<string> | null = null;
     return {
         async directory(path) {
             // A path only another platform calls absolute would resolve against the daemon's cwd.
             if (!isAbsolute(path)) throw new OpFailure('PATH_DENIED', 'Not an absolute path on this machine');
-            allowed ??= realpath(allowedRoot);
+            const anchor = approvedAnchor(path, allowedRoot, approvedRoots());
+            // The allowed root is fixed for the daemon's life; an approved folder can be revoked, so it is resolved each time.
+            const realAnchor = anchor === allowedRoot ? (allowed ??= realpath(allowedRoot)) : realpath(anchor).catch(() => anchor);
             let real: string;
             try {
                 real = await realpath(path);
@@ -310,7 +315,7 @@ function pathGuard(allowedRoot: string, happyHomeDir: string): PathGuard {
                 if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new OpFailure('WORKSPACE_MISSING', 'The folder does not exist');
                 throw new OpFailure('PATH_DENIED', 'The folder cannot be read');
             }
-            if (!inside(await allowed, real) || isWithinDirectory(real, happyHomeDir)) {
+            if (!inside(await realAnchor, real) || isWithinDirectory(real, happyHomeDir)) {
                 throw new OpFailure('PATH_DENIED', 'The folder is outside the allowed root');
             }
             if (!(await stat(real)).isDirectory()) throw new OpFailure('PATH_DENIED', 'Not a folder');
@@ -318,7 +323,7 @@ function pathGuard(allowedRoot: string, happyHomeDir: string): PathGuard {
         },
         async missing(path) {
             if (!isAbsolute(path)) throw new OpFailure('PATH_DENIED', 'Not an absolute path on this machine');
-            if (!isWithinDirectory(path, allowedRoot) || isWithinDirectory(path, happyHomeDir)) {
+            if (!isWithinDirectory(path, approvedAnchor(path, allowedRoot, approvedRoots())) || isWithinDirectory(path, happyHomeDir)) {
                 throw new OpFailure('PATH_DENIED', 'The folder is outside the allowed root');
             }
         },
@@ -1691,7 +1696,7 @@ function remotePins(happyHomeDir: string): WorkspaceRemotePins {
 export function createWorktreeOpsHandlers(deps: WorktreeOpsDeps): Record<WorktreeOpsMethod, (request: unknown) => Promise<WorktreeOpAnswer>> {
     const now = deps.now ?? Date.now;
     repositoryLockWaitMs = deps.repositoryLockWaitMs ?? REPOSITORY_LOCK_WAIT_MS;
-    const guard = pathGuard(deps.allowedRoot, deps.happyHomeDir);
+    const guard = pathGuard(deps.allowedRoot, deps.happyHomeDir, deps.approvedRoots);
     const pins = remotePins(deps.happyHomeDir);
 
     async function admissionRoots(ticket: WorktreeTicket): Promise<{ candidates: string[]; writers: string[] }> {

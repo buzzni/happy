@@ -437,6 +437,7 @@ function runGit(
     return new Promise((resolvePromise, rejectPromise) => {
         execFile('git', args, {
             cwd,
+            windowsHide: true,
             env: environment,
             encoding: 'utf8',
             maxBuffer: 10 * 1024 * 1024,

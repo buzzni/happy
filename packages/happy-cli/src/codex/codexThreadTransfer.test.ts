@@ -206,6 +206,28 @@ describe('Codex native thread transfer', () => {
         expect(await readdir(outsideStaging)).toEqual([]);
     });
 
+    // aplus-dev-studio specs/approved-folder-roots R10.
+    it('imports into a folder the machine owner approved outside the allowed root, until revoked', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-codex-transfer-home-'));
+        const approvedFolder = await mkdtemp(join(tmpdir(), 'happy-codex-transfer-approved-'));
+        roots.push(root, approvedFolder);
+        const targetDirectory = join(approvedFolder, 'target');
+        await mkdir(targetDirectory, { recursive: true });
+        await mkdir(join(root, '.codex'), { recursive: true });
+        let approved = [approvedFolder];
+        const runtime = createCodexThreadTransferRuntime({
+            allowedRoot: root, approvedRoots: () => approved, codexHome: join(root, '.codex'),
+            readThreadPath: vi.fn(), forkThreadFromPath: vi.fn(),
+        });
+        const begin = (requestId: string) => runtime.beginImport({
+            directory: targetDirectory, sourceCodexThreadId: 'thread-source', requestId, size: 1, sha256: 'a'.repeat(64),
+        });
+
+        await expect(begin('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')).resolves.toMatchObject({ status: 'ready' });
+        approved = [];
+        await expect(begin('cccccccc-cccc-4ccc-8ccc-cccccccccccc')).rejects.toThrow('outside the working directory');
+    });
+
     it('rejects a Codex home inside the target directory', async () => {
         const root = await mkdtemp(join(tmpdir(), 'happy-codex-transfer-home-security-'));
         roots.push(root);

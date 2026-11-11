@@ -30,14 +30,15 @@ describe('readApprovedFolders', () => {
         expect(readApprovedFolders(home)).toEqual([]);
     });
 
-    it('never widens to a drive or filesystem root, a relative path or an unknown file version', async () => {
+    // aplus-dev-studio specs/approved-folder-roots R9: the owner may approve a whole drive.
+    it('keeps a drive or filesystem root the owner approved, never a relative path or an unknown file version', async () => {
         const home = await happyHome();
         const root = parse(resolve('/')).root;
         await writeFile(join(home, APPROVED_FOLDERS_FILE), JSON.stringify({
             version: 1,
             folders: [root, 'workspace', 7, resolve('/srv/ok')],
         }));
-        expect(readApprovedFolders(home)).toEqual([resolve('/srv/ok')]);
+        expect(readApprovedFolders(home)).toEqual([root, resolve('/srv/ok')]);
 
         await writeFile(join(home, APPROVED_FOLDERS_FILE), JSON.stringify({ version: 2, folders: [resolve('/srv/ok')] }));
         expect(readApprovedFolders(home)).toEqual([]);

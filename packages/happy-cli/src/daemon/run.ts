@@ -369,7 +369,8 @@ import {
   prepareAdditionalDirectories,
   reapplyAdditionalDirectoriesOnResume,
 } from './additionalDirectories';
-import { mergeAdditionalDirectoriesIntoSandboxEnvironment, readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv';
+import { mergeAdditionalDirectoriesIntoSandboxEnvironment, readAdditionalDirectoriesEnvironment, replaceApprovedWriteRootsInEnvironment } from '@/utils/additionalDirectoriesEnv';
+import { resolveSandboxTrustFloor } from '@/sandbox/config';
 import { createAutomationContextWorkspace } from './automations/automationContextWorkspace';
 import { createAutomationContextHost, prepareAutomationContextTick } from './automations/automationContextHost';
 import { createAutomationContextReferenceReader } from './automations/automationContextReference';
@@ -2173,6 +2174,7 @@ export async function startDaemon(): Promise<void> {
           requested: options.additionalDirectories,
           primaryDirectory: directory,
           allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
+          approvedRoots: resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir)?.(),
         });
         let launchMcp: PreparedLaunchMcpServers | undefined;
         // Set once the managed environment is resolved; stays undefined for every selection but `org-endpoint`.
@@ -2558,6 +2560,7 @@ export async function startDaemon(): Promise<void> {
             additionalDirectoryResult.accepted,
           );
         }
+        replaceApprovedWriteRootsInEnvironment(extraEnv, resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir)?.() ?? [], resolveSandboxTrustFloor(), os.userInfo().homedir);
         // A fork or recovery continues an existing conversation under a new session id: say which, so the
         // Runtime refuses a conversation of an earlier profile assignment.
         // Studio's session-user attestation (a new chat on a shared machine) goes to the broker only.
@@ -3597,6 +3600,13 @@ export async function startDaemon(): Promise<void> {
             }
             : undefined,
         ), Object.keys(managedAiCredentialEnvironment).length > 0);
+        // Approvals and revocations made while the session was stopped, like additional directories below.
+        // A resume never fails on this: the person is continuing the chat (reapplyAdditionalDirectoriesOnResume).
+        try {
+          replaceApprovedWriteRootsInEnvironment(resumedEnvironment, resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir)?.() ?? [], resolveSandboxTrustFloor(), os.userInfo().homedir);
+        } catch {
+          logger.debug(`[DAEMON RUN] Kept the approved write roots for ${happySessionId}: the sandbox config was unreadable`);
+        }
         if (options?.additionalDirectories !== undefined) {
           // Roots registered while the session was stopped only reach the sandbox here:
           // the OS sandbox profile is fixed for the life of the child process.
@@ -3604,6 +3614,7 @@ export async function startDaemon(): Promise<void> {
             requested: options.additionalDirectories,
             primaryDirectory: launch.cwd,
             allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
+            approvedRoots: resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir)?.(),
           });
           if (!reapplied.applied) {
             logger.debug(`[DAEMON RUN] Kept the granted additional directories for ${happySessionId}: the requested list was rejected`);
@@ -5264,6 +5275,11 @@ export async function startDaemon(): Promise<void> {
         const status = await aiCredentialRuntime.status({ provider: 'claude' });
         return 'setupToken' in status ? (status.setupToken?.accounts ?? [])
           .filter(account => account.disabled).map(account => account.managedAccountId) : [];
+      },
+      // Saycode specs/usage-org-account-current-chat — a move to the member's choice excludes every other account held here.
+      setupTokenAccountIds: async () => {
+        const status = await aiCredentialRuntime.status({ provider: 'claude' });
+        return 'setupToken' in status ? (status.setupToken?.accounts ?? []).map(account => account.managedAccountId) : [];
       },
       recordAgentEnvironment: persistSetupTokenBinding,
       // Saycode specs/setup-token-switch-usage-check — check a candidate nobody measured recently before moving onto it.

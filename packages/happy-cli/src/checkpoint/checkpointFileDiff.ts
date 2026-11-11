@@ -130,7 +130,7 @@ function isolatedEnvironment(gitDirectory: string): NodeJS.ProcessEnv {
 }
 function git(args: string[], cwd: string, env: NodeJS.ProcessEnv, diff = false): Promise<Buffer> {
     return new Promise((resolve, reject) => execFile('git', args,
-        { cwd, env, encoding: 'buffer', maxBuffer: MAX_DIFF_BYTES, timeout: 30_000 },
+        { cwd, env, encoding: 'buffer', maxBuffer: MAX_DIFF_BYTES, timeout: 30_000, windowsHide: true },
         (error, stdout) => {
             if (error && !(diff && error.code === 1)) reject(error);
             else resolve(stdout);

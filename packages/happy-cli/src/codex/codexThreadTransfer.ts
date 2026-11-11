@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat } from 'node:fs/promises';
 import { isAbsolute, join, relative, sep } from 'node:path';
-import { validatePath } from '@/modules/common/pathSecurity';
+import { approvedAnchor, validatePath } from '@/modules/common/pathSecurity';
 
 export const CODEX_THREAD_TRANSFER_CHUNK_MAX_BYTES = 3 * 1024 * 1024;
 export const CODEX_THREAD_TRANSFER_MAX_BYTES = 512 * 1024 * 1024;
@@ -33,6 +33,8 @@ type PendingImport = {
 
 type CodexThreadTransferDeps = {
     allowedRoot: string;
+    /** Folders the machine owner approved outside the allowed root (modules/common/approvedFolders). */
+    approvedRoots?: () => readonly string[];
     codexHome: string;
     readThreadPath: (threadId: string) => Promise<string>;
     forkThreadFromPath: (input: { path: string; cwd: string }) => Promise<{ threadId: string }>;
@@ -312,13 +314,14 @@ export function createCodexThreadTransferRuntime(deps: CodexThreadTransferDeps) 
             if (!/^[0-9a-f]{64}$/i.test(input.sha256)) {
                 throw new Error('Codex thread sha256 must be a 64-character hexadecimal digest');
             }
-            const validation = validatePath(input.directory, deps.allowedRoot);
+            const approved = deps.approvedRoots?.() ?? [];
+            const validation = validatePath(input.directory, deps.allowedRoot, approved);
             if (!validation.valid || !validation.resolvedPath) {
                 throw new Error(validation.error ?? 'directory is outside the working directory');
             }
             const { canonicalTarget, stagingDir } = await ensureTransferDirectory({
                 directory: validation.resolvedPath,
-                allowedRoot: deps.allowedRoot,
+                allowedRoot: approvedAnchor(validation.resolvedPath, deps.allowedRoot, approved),
                 codexHome: deps.codexHome,
             });
             await removeOrphanedTransferFiles(stagingDir);

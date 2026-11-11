@@ -121,6 +121,26 @@ afterEach(() => {
     rmSync(home, { recursive: true, force: true });
 });
 
+// aplus-dev-studio specs/approved-folder-roots R10: a chat in a repository outside home starts in its worktree.
+describe('worktree ops in a folder the machine owner approved', () => {
+    it('creates a worktree outside the allowed root only while its folder is approved', async () => {
+        const elsewhere = realpathSync(mkdtempSync(join(tmpdir(), 'worktree-ops-allowed-')));
+        try {
+            let approved: string[] = [root];
+            const set = createWorktreeOpsHandlers({ machine: () => machine, allowedRoot: elsewhere, happyHomeDir: home, now: () => NOW,
+                approvedRoots: () => approved });
+            const answer = await call('create', create(), {}, set);
+            expect(answer).toMatchObject({ success: true });
+            expect(answer.result.path.startsWith(repo)).toBe(true);
+
+            approved = [];
+            expect(await call('create', create({ name: 'calm-owl' }), {}, set)).toMatchObject({ success: false, errorCode: 'PATH_DENIED' });
+        } finally {
+            rmSync(elsewhere, { recursive: true, force: true });
+        }
+    });
+});
+
 describe('worktree ops tickets', () => {
     it('does not retain a rejected branch-name check as an unknown writer', async () => {
         const set = createWorktreeOpsHandlers({ machine: () => machine, allowedRoot: root, happyHomeDir: home, now: () => NOW,

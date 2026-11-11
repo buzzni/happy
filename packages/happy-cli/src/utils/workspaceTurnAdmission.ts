@@ -135,7 +135,7 @@ export async function canonicalWorkspaceAdmissionRoots(roots: readonly string[],
         const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
         try {
           const result = await git('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-C', value.existing,
-            'rev-parse', '--git-common-dir'], { env: { ...env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' }, timeout: 10000, maxBuffer: 8192 });
+            'rev-parse', '--git-common-dir'], { env: { ...env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' }, timeout: 10000, maxBuffer: 8192, windowsHide: true });
           paths.push((await canonical(resolve(value.existing, result.stdout.trim()))).path);
           if (requireGitIdentity) {
             // The common directory also knows registered checkouts whose own .git pointer is
@@ -143,7 +143,7 @@ export async function canonicalWorkspaceAdmissionRoots(roots: readonly string[],
             // repair cannot hide an unknown writer in another checkout of this repository.
             const listed = await git('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-C', value.existing,
               'worktree', 'list', '--porcelain', '-z'], { env: { ...env, GIT_OPTIONAL_LOCKS: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
-              timeout: 10000, maxBuffer: 128 * 1024, encoding: 'buffer' });
+              timeout: 10000, maxBuffer: 128 * 1024, encoding: 'buffer', windowsHide: true });
             const checkouts = new TextDecoder('utf-8', { fatal: true }).decode(listed.stdout).split('\0').filter(field => field.startsWith('worktree '));
             if (!checkouts.length) throw new Error('WORKSPACE_REPOSITORY_IDENTITY_UNCONFIRMED');
             for (const field of checkouts) {

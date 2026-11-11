@@ -23,11 +23,13 @@ export function resolveClaudeSessionTransferPath(input: {
     directory: string;
     claudeSessionId: string;
     allowedRoot: string;
+    /** Folders the machine owner approved outside the allowed root (modules/common/approvedFolders). */
+    approvedRoots?: readonly string[];
 }): string {
     if (!UUID_RE.test(input.claudeSessionId)) {
         throw new Error('claudeSessionId must be a valid UUID');
     }
-    const validation = validatePath(input.directory, input.allowedRoot);
+    const validation = validatePath(input.directory, input.allowedRoot, input.approvedRoots);
     if (!validation.valid || !validation.resolvedPath) {
         throw new Error(validation.error ?? 'directory is outside the working directory');
     }
@@ -38,7 +40,7 @@ export function resolveClaudeSessionTransferPath(input: {
  * The source of a transfer out of this machine. An endpoint conversation stays: its mark does not travel, so on the
  * other machine nothing would stop it from going on under another source (aplus specs/org-llm-endpoints r3).
  */
-function resolveTransferSourcePath(input: { directory: string; claudeSessionId: string; allowedRoot: string }): string {
+function resolveTransferSourcePath(input: { directory: string; claudeSessionId: string; allowedRoot: string; approvedRoots?: readonly string[] }): string {
     const path = resolveClaudeSessionTransferPath(input);
     if (isOrgEndpointConversation(dirname(path), input.claudeSessionId)) {
         throw new Error('ORG_LLM_ENDPOINT_PARENT_BOUND: this conversation ran on an organization LLM endpoint and cannot be moved to another machine; '
@@ -96,6 +98,7 @@ export async function inspectClaudeSessionTransferSource(input: {
     directory: string;
     claudeSessionId: string;
     allowedRoot: string;
+    approvedRoots?: readonly string[];
 }): Promise<ClaudeSessionTransferSourceSnapshot> {
     const path = resolveTransferSourcePath(input);
     const before = await stat(path);
@@ -114,6 +117,7 @@ export async function readClaudeSessionTransferSourceChunk(input: {
     directory: string;
     claudeSessionId: string;
     allowedRoot: string;
+    approvedRoots?: readonly string[];
     expectedSize: number;
     expectedModified: number;
     offset: number;
@@ -222,7 +226,7 @@ async function removeOrphanedTransferFiles(projectsPath: string): Promise<void> 
     }));
 }
 
-export function createClaudeSessionTransferRuntime(input: { allowedRoot: string }) {
+export function createClaudeSessionTransferRuntime(input: { allowedRoot: string; approvedRoots?: () => readonly string[] }) {
     const pending = new Map<string, PendingClaudeSessionImport>();
     const pendingFinalPaths = new Set<string>();
     const reservations = new Map<string, ClaudeSessionImportReservation>();
@@ -252,7 +256,7 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
             if (request.requestId !== undefined && !UUID_RE.test(request.requestId)) {
                 throw new Error('Claude session import requestId must be a valid UUID');
             }
-            const finalPath = resolveClaudeSessionTransferPath({ ...request, allowedRoot: input.allowedRoot });
+            const finalPath = resolveClaudeSessionTransferPath({ ...request, allowedRoot: input.allowedRoot, approvedRoots: input.approvedRoots?.() });
             // Request IDs were added with cancellable reservations. An older
             // web client cannot release a begin whose acknowledgement is lost,
             // so locking its request here would make retry impossible for the
@@ -466,7 +470,7 @@ export type ClaudeSessionTransferResponse =
     | { action: 'commit-import'; status: 'imported' | 'already-present' }
     | { action: 'abort-import'; aborted: boolean };
 
-export function createClaudeSessionTransferHandler(input: { allowedRoot: string }) {
+export function createClaudeSessionTransferHandler(input: { allowedRoot: string; approvedRoots?: () => readonly string[] }) {
     const runtime = createClaudeSessionTransferRuntime(input);
 
     return async (value: unknown): Promise<ClaudeSessionTransferResponse> => {
@@ -478,12 +482,12 @@ export function createClaudeSessionTransferHandler(input: { allowedRoot: string 
             case 'inspect-source':
                 return {
                     action: request.action,
-                    ...await inspectClaudeSessionTransferSource({ ...request, allowedRoot: input.allowedRoot }),
+                    ...await inspectClaudeSessionTransferSource({ ...request, allowedRoot: input.allowedRoot, approvedRoots: input.approvedRoots?.() }),
                 };
             case 'read-source-chunk':
                 return {
                     action: request.action,
-                    ...await readClaudeSessionTransferSourceChunk({ ...request, allowedRoot: input.allowedRoot }),
+                    ...await readClaudeSessionTransferSourceChunk({ ...request, allowedRoot: input.allowedRoot, approvedRoots: input.approvedRoots?.() }),
                 };
             case 'begin-import':
                 return { action: request.action, ...await runtime.beginImport(request) };

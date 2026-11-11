@@ -58,6 +58,7 @@ export type ResumeConversationParams = {
     baseInstructions: string | null;
     developerInstructions: string | null;
     persistExtendedHistory: boolean;
+    excludeTurns?: boolean;
 };
 
 export type ResumeConversationResponse = NewConversationResponse;

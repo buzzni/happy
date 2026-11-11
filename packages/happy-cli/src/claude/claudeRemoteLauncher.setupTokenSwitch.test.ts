@@ -14,6 +14,7 @@ import type { EnhancedMode } from './loop';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
 import { requestSetupTokenCapacity, requestSetupTokenStart, requestSetupTokenRebind, reportSetupTokenActivity, reportSetupTokenUsage, requestSetupTokenAvailability, returnFromPersonalClaude } from '@/daemon/controlClient';
+import { wrapClientTurnPrompt } from '@slopus/happy-wire';
 import { APPLY_REQUIRED_NOTICE, CONTINUE_PROMPT, RESUME_REBOUND_NOTICE, START_BUDGET_SWITCHED_NOTICE, SWITCHED_NOTICE } from './setupTokenAccountSwitching';
 import { PERSONAL_RECHECK_NOTICE } from './personalClaudeFallback';
 import { claudeCheckSession } from './utils/claudeCheckSession';
@@ -916,6 +917,61 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         }
     });
 
+    // The note that continues a refused turn is not the turn its one-turn block was written for: the block
+    // (a guide for that question) goes neither in front of the note nor into the next provider's prompt.
+    it('continues a refused turn without the one-turn prompt block that turn carried', async () => {
+        const guide = wrapClientTurnPrompt('DESKTOP GUIDE PROMPT')!;
+        const token = guide.split('\n')[0].replace('<!-- saycode:client-turn-prompt:', '').replace(':start -->', '');
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const client = {
+            sessionId: 'happy-session-1',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        attachInputEvidence(client);
+        const generations: Array<{ appended: string; prompts: string[] }> = [];
+        vi.mocked(query).mockImplementation(({ prompt, options }) => {
+            const generation = { appended: (options?.systemPrompt as { append?: string } | undefined)?.append ?? '', prompts: [] as string[] };
+            generations.push(generation);
+            const first = generations.length === 1;
+            const response = (async function* () {
+                yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+                for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                    generation.prompts.push(String(message.message.content));
+                    if (first) {
+                        yield refused;
+                        yield { type: 'result', subtype: 'success', result: 'Claude AI usage limit reached', is_error: true, uuid: 'result-1' };
+                        continue;
+                    }
+                    yield assistant('msg-2');
+                    yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: 'result-2' };
+                    void handlers.get('switch')!();
+                    return;
+                }
+            })();
+            return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+        });
+        queue.push('how do I open settings?', { permissionMode: 'default', model: 'claude-sonnet-5', appendSystemPrompt: `USER CONTEXT\n\n${guide}`, turnOnlyPromptTokens: [token] },
+            undefined, undefined, undefined, undefined, { ref: { kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 } });
+
+        await claudeRemoteLauncher({
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+            cancelLessonReview: vi.fn(),
+            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
+        } as unknown as Session);
+
+        expect(generations[0].prompts).toEqual([`${guide}\n\nhow do I open settings?`]);
+        expect(generations[1].prompts).toEqual([CONTINUE_PROMPT]);
+        expect(generations.map(generation => generation.appended.includes('DESKTOP GUIDE PROMPT'))).toEqual([false, false]);
+        expect(generations[1].appended).toContain('USER CONTEXT');
+    });
+
     it('closes a refused turn as failed when the provider throws and rebind fails', async () => {
         vi.mocked(requestSetupTokenRebind).mockResolvedValueOnce({ ok: false, reason: 'FORBIDDEN' });
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
@@ -1725,5 +1781,111 @@ describe('organization authentication failure recovery the member can take', () 
         await h.run();
         expect(offer).toMatchObject({ state: 'offer' });
         expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('moving the conversation to the organization account the member chose (Saycode specs/usage-org-account-current-chat)', () => {
+    const CHOSEN = '33333333-3333-4333-8333-333333333333';
+    const dedicated = () => formatSetupTokenBinding({ companyId:'org',groupScope:'org',userId:'owner',machineId:'pc',managedAccountId:'11111111-1111-4111-8111-111111111111',credentialGeneration:1,keyId:'f'.repeat(64),nonce:'22222222-2222-4222-8222-222222222222',issuedAt:1 });
+    const mode = { permissionMode: 'default', model: 'claude-sonnet-5' } as EnhancedMode;
+    beforeEach(() => {
+        vi.mocked(requestSetupTokenRebind).mockReset().mockResolvedValue({ ok: true, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-second', HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: '{"account":"second"}' } });
+        vi.mocked(readPersonalClaudeCredential).mockResolvedValue(null);
+    });
+    /**
+     * `answering`: the member chooses while the first turn runs; `starting`: after its input was taken, before the
+     * provider's per-turn `init`; `near-limit`: while it runs, after which the old account reports it is nearly used up;
+     * `idle`: after it answered. Once the choice is answered the member sends another message; the provider answering it
+     * ends the run.
+     */
+    const OTHER = '44444444-4444-4444-8444-444444444444';
+    function harness(when: 'answering' | 'starting' | 'near-limit' | 'idle', params: Record<string, unknown> = { action: 'select-organization', managedAccountId: CHOSEN, excludeManagedAccountIds: [OTHER] }) {
+        process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING = dedicated();
+        const queue = new MessageQueue2<EnhancedMode>(hashObject), handlers = new Map<string, (params?: any) => Promise<any>>();
+        const client = { sessionId:'happy-session-1',rpcHandlerManager:{registerHandler:(name:string,handler:any)=>handlers.set(name,handler)},
+            updateAgentState:vi.fn(),updateMetadata:vi.fn(),getMetadata:()=>({}),setPersonalClaudeFallback:vi.fn(),setClaudeRuntimeAccount:vi.fn(),
+            sendClaudeSessionMessage:vi.fn(),sendStreamDelta:vi.fn(),setPendingTurnRequestId:vi.fn(),sendFinalAnswerForChannelTurn:vi.fn(),
+            applyClaudeTurnResult:vi.fn(),noteContextUsageSignal:vi.fn(),closeClaudeSessionTurn:vi.fn(),sendSessionEvent:vi.fn() };
+        const generations: Array<{ token: string | undefined; resume: string | undefined; prompts: string[]; accountsAtStart: unknown[] }> = [];
+        const outcome: { answer?: any; error?: unknown; accountsAtAnswer?: unknown[] } = {};
+        const end = () => { void handlers.get('switch')!(); };
+        const choose = () => handlers.get('personal-claude-fallback')!(params).then(answer => {
+            outcome.answer = answer;
+            outcome.accountsAtAnswer = client.setClaudeRuntimeAccount.mock.calls.map(call => call[0]);
+        }, error => { outcome.error = error; });
+        const next = () => setTimeout(() => { if (outcome.answer?.switched === true) queue.push('and the tests', mode); else end(); }, 0);
+        vi.mocked(query).mockImplementation(({ prompt, options }) => {
+            const generation = { token: process.env.CLAUDE_CODE_OAUTH_TOKEN, resume: options?.resume, prompts: [] as string[], accountsAtStart: client.setClaudeRuntimeAccount.mock.calls.map(call => call[0]) };
+            generations.push(generation);
+            return Object.assign((async function* () {
+                yield { type:'system',subtype:'init',session_id:'',tools:[],mcp_servers:[],apiKeySource:'none' };
+                for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                    generation.prompts.push(JSON.stringify(message.message.content));
+                    const first = generations.length === 1 && generation.prompts.length === 1;
+                    if (first && when === 'starting') {
+                        await choose();
+                        // Claude Code opens every turn with `init`; this process still holds the first token.
+                        yield { type:'system',subtype:'init',session_id:'',tools:[],mcp_servers:[],apiKeySource:'none' };
+                    }
+                    if (first && when === 'answering') await choose();
+                    if (first && when === 'near-limit') {
+                        await choose();
+                        yield { type:'rate_limit_event',uuid:'rl-old',session_id:'claude-1',rate_limit_info:{ status:'allowed',rateLimitType:'five_hour',utilization:0.97,resetsAt:Math.floor(Date.now() / 1000) + 3600 } };
+                    }
+                    yield assistant(`answered-${generations.length}-${generation.prompts.length}`);
+                    yield { type:'result',subtype:'success',result:'done',is_error:false,uuid:`done-${generations.length}-${generation.prompts.length}` };
+                    if (!first) { end(); return; }
+                    if (when === 'idle') setTimeout(() => { void choose().then(next); }, 0);
+                    else next();
+                }
+            })(), { ...pinnedSdkControls(), mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+        });
+        queue.push('review and open a PR', mode);
+        const session = { lessonReviewLifecycle:{controller:new AbortController(),completedAssistantTurns:0},cancelLessonReview:vi.fn(),sessionId:'claude-1',path:process.cwd(),queue,client,mcpServers:{},
+            api:{push:()=>({sendSessionNotification:vi.fn()})},consumeOneTimeFlags:vi.fn(),thinking:false,onThinkingChange:(thinking: boolean) => { session.thinking = thinking; },onAbort:vi.fn() };
+        return { generations, client, outcome, run: () => claudeRemoteLauncher(session as unknown as Session) };
+    }
+
+    it.each(['idle', 'starting', 'answering'] as const)('runs the next message of the same conversation on the chosen account when chosen %s', async when => {
+        const h = harness(when);
+        await h.run();
+        expect(h.outcome.answer).toEqual({ version: 1, supported: true, switched: true });
+        expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', dedicated(), undefined, undefined, { managedAccountId: CHOSEN, excludeManagedAccountIds: [OTHER] });
+        expect(h.generations.map(g => g.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
+        expect(h.generations.map(g => g.resume)).toEqual(['claude-1', 'claude-1']);
+        // Nothing is sent again: the chosen account answers only what the member sends next.
+        expect(h.generations[1].prompts).toEqual([JSON.stringify('and the tests')]);
+        expect(h.client.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({ setupTokenRotation: { version: 1, state: 'switched' } }));
+    });
+
+    it.each(['idle', 'starting', 'answering'] as const)('names the chosen account once the old provider ends, not while it still answers (chosen %s)', async when => {
+        const h = harness(when);
+        await h.run();
+        if (when !== 'idle') expect(h.outcome.accountsAtAnswer).not.toContain('{"account":"second"}');
+        // Before the member's next message starts a provider, the conversation already names the chosen account.
+        expect(h.generations[1].accountsAtStart.at(-1)).toBe('{"account":"second"}');
+    });
+
+    it('does not switch away on its own when the old account reports it is nearly used up after the choice', async () => {
+        const h = harness('near-limit');
+        await h.run();
+        expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1);
+        expect(h.generations.map(g => g.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
+        expect(h.client.sendSessionEvent.mock.calls.map(call => call[0].message)).not.toContain(SWITCHED_NOTICE);
+    });
+
+    it('answers why the chosen account could not be bound and keeps the provider', async () => {
+        vi.mocked(requestSetupTokenRebind).mockReset().mockResolvedValue({ ok: false, reason: 'NO_ACCOUNT' });
+        const h = harness('idle');
+        await h.run();
+        expect(h.outcome.answer).toEqual({ version: 1, supported: true, switched: false, reason: 'NO_ACCOUNT' });
+        expect(h.generations.map(g => g.token)).toEqual(['sk-ant-oat01-first']);
+    });
+
+    it.each([{ managedAccountId: 'second' }, { managedAccountId: CHOSEN, excludeManagedAccountIds: ['other'] }, { managedAccountId: CHOSEN, excludeManagedAccountIds: Array(51).fill(OTHER) }])('refuses a choice whose account ids are not ones: %j', async choice => {
+        const h = harness('idle', { action: 'select-organization', ...choice });
+        await h.run();
+        expect(h.outcome.error).toEqual(new Error('CLAUDE_ORGANIZATION_SELECTION_INVALID'));
+        expect(requestSetupTokenRebind).not.toHaveBeenCalled();
     });
 });

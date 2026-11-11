@@ -2412,12 +2412,9 @@ export async function runCodex(opts: {
         const forkCodexThreadId = process.env.HAPPY_FORK_CODEX_THREAD_ID;
         if (!reconnectSessionId && forkCodexThreadId) {
             try {
-                const { thread } = await client.readThread({
-                    threadId: forkCodexThreadId,
-                    includeTurns: true,
-                });
+                const turns = await client.readThreadTurns(forkCodexThreadId);
                 const envelopes = await buildCodexThreadBackfillEnvelopes({
-                    thread,
+                    thread: { turns },
                     uploadLocalImage: (attachment, imageOpts) => (
                         session.uploadLocalImageAttachmentEnvelope(attachment, imageOpts)
                     ),

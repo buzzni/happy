@@ -1,4 +1,7 @@
 import { EventEmitter } from 'node:events';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { beforeEach, expect, it, vi } from 'vitest';
 
@@ -14,6 +17,7 @@ vi.mock('node:child_process', async (importOriginal) => ({
 import { probeManagedScriptEngine } from './automations/managedScriptRuntime';
 import { createEvidenceIo } from './previewRuntimeEvidence';
 import { runBashStream } from '@/claude/utils/bashStream';
+import { readPersonalClaudeCredentials } from '@/claude/personalClaudeCredential';
 
 beforeEach(() => {
   mocks.execFile.mockReset();
@@ -46,4 +50,22 @@ it('hides the shell that bash_stream starts for each command', async () => {
   await runBashStream({ command: 'true', onProgress: () => {} });
 
   expect(mocks.spawn).toHaveBeenCalledWith('bash', ['-c', 'true'], expect.objectContaining({ windowsHide: true }));
+});
+
+// homedir() follows HOME only off Windows.
+it.skipIf(process.platform === 'win32')('hides the cswap export behind the personal accounts in the usage popover', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'hidden-cswap-')), saved = process.env.HOME;
+  try {
+    await mkdir(join(home, '.happy'), { recursive: true });
+    await writeFile(join(home, '.happy', 'ai-credential-groups.json'), JSON.stringify({ version: 1, entries: [] }));
+    process.env.HOME = home;
+    mocks.execFile.mockImplementation((_file, _args, _options, callback) => callback(null, { stdout: '{}', stderr: '' }));
+
+    await readPersonalClaudeCredentials();
+
+    expect(mocks.execFile).toHaveBeenCalledWith('cswap', ['export', '-'], expect.objectContaining({ windowsHide: true }), expect.any(Function));
+  } finally {
+    process.env.HOME = saved;
+    await rm(home, { recursive: true, force: true });
+  }
 });

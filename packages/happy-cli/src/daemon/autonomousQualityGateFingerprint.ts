@@ -95,6 +95,7 @@ async function readGitHead(cwd: string): Promise<string> {
     return new Promise((resolve, reject) => {
         execFile('git', ['rev-parse', '--verify', 'HEAD'], {
             cwd,
+            windowsHide: true,
             encoding: 'utf8',
             maxBuffer: 256,
         }, (error, output, stderr) => {
@@ -114,7 +115,7 @@ async function readGitChanges(cwd: string): Promise<Array<{ status: string; path
             '-z',
             '--untracked-files=all',
             '--no-renames',
-        ], { cwd, encoding: 'utf8', maxBuffer: MAX_GIT_STATUS_BYTES }, (error, output) => {
+        ], { cwd, encoding: 'utf8', maxBuffer: MAX_GIT_STATUS_BYTES, windowsHide: true }, (error, output) => {
             if (error) reject(error);
             else resolve(output);
         });

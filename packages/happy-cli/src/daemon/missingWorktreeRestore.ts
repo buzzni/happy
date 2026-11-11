@@ -43,7 +43,7 @@ const execFileAsync = promisify(execFile);
 
 async function git(cwd: string, args: string[]): Promise<{ ok: true; stdout: string } | { ok: false; error: string }> {
     try {
-        const { stdout } = await execFileAsync('git', ['-C', cwd, ...args]);
+        const { stdout } = await execFileAsync('git', ['-C', cwd, ...args], { windowsHide: true });
         return { ok: true, stdout: stdout.trim() };
     } catch (error) {
         const stderr = (error as { stderr?: unknown }).stderr;

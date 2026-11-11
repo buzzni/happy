@@ -5,7 +5,7 @@ import type { SandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import type { ClaudeLessonReviewLifecycle } from './session';
 import type { LessonProposalTurn } from '@/utils/lessonProposalTurn';
 import type { TurnCardSwitch } from './utils/turnCardTools';
-import { isSaycodePromptBlockEnabled } from '@/prompt/promptProvenance';
+import { clientTurnPromptChange, isSaycodePromptBlockEnabled, splitTurnOnlyPromptBlocks } from '@/prompt/promptProvenance';
 import { EnhancedMode } from "./loop";
 import { endManagedTurnInput } from '@/managed/managedGracefulStop';
 
@@ -516,9 +516,11 @@ async function runClaudeRemote(
     opts.turnCards?.set(turnCardsDrawn);
     // A capability of this turn's client, not under the Saycode instructions switch.
     opts.turnCards?.setArchives(initial.mode.saycodePromptBlocks?.archiveRequest === true);
+    // A block marked for one turn goes with that turn's input, never into the prompt this provider keeps.
+    const launchedPrompt = splitTurnOnlyPromptBlocks(initial.mode.appendSystemPrompt, initial.mode.turnOnlyPromptTokens);
     const promptOptions = buildClaudeSystemPromptOptions({
         customSystemPrompt: initial.mode.customSystemPrompt,
-        appendSystemPrompt: initial.mode.appendSystemPrompt,
+        appendSystemPrompt: launchedPrompt.provider,
         chatTitlePrompt: CHAT_TITLE_SYSTEM_PROMPT,
         saycodeSystemPrompt: saycodeOwnedSystemPrompt,
         agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
@@ -765,7 +767,21 @@ function readTurnText(content: unknown): string {
 
     // Push initial message
     let messages = new PushableAsyncIterable<SDKUserMessage>();
-    const initialContent = await withLessons(initial.message, preparation);
+    /*
+     * The client-turn blocks of a turn that this provider's system prompt does not hold, in front of
+     * that turn: the ones marked for one turn, and the ones it was not started with — the launcher no
+     * longer restarts for those. In front of the lessons, which are reference for the request rather
+     * than instructions for the turn. A slash command stays the first input token (the launcher
+     * restarts rather than keep a provider for a block such a turn adds), and the transient retry note
+     * joins a request that already carried its blocks.
+     */
+    const withTurnPrompt = (raw: string | ContentBlockParam[], content: string | ContentBlockParam[], turnMode: EnhancedMode) => {
+        if (isCommandInput(raw) || raw === CLAUDE_TRANSIENT_CONTINUE_PROMPT) return content;
+        const turnPrompt = clientTurnPromptChange(launchedPrompt.provider, turnMode.appendSystemPrompt).added;
+        if (!turnPrompt) return content;
+        return typeof content === 'string' ? `${turnPrompt}\n\n${content}` : [{ type: 'text' as const, text: turnPrompt }, ...content];
+    };
+    const initialContent = withTurnPrompt(initial.message, await withLessons(initial.message, preparation), initial.mode);
     activateTurnLatency(initial.latency, preparation);
     messages.push({
         type: 'user',
@@ -1323,7 +1339,7 @@ function readTurnText(content: unknown): string {
                          * result that arrives from the previous turn must not
                          * be attached to this one.
                          */
-                        const withBlock = await withLessons(next.message, preparation);
+                        const withBlock = withTurnPrompt(next.message, await withLessons(next.message, preparation), next.mode);
                         if (queryClosed || messages.done || opts.signal?.aborted) return;
                         if (next.commitInput?.() === false) { messages.end(); return; }
                         activateTurnLatency(next.latency, preparation);

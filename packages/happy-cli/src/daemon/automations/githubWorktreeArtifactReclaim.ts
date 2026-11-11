@@ -7,7 +7,7 @@ import { promisify } from 'node:util'
 const exec = promisify(execFile)
 const DAY = 86_400_000
 const TARGETS = new Set(['node_modules', '.next', '.vite', '.turbo', 'coverage', 'playwright-report', 'test-results'])
-const commandOptions = { timeout: 30_000, maxBuffer: 32 * 1024 * 1024,
+const commandOptions = { timeout: 30_000, maxBuffer: 32 * 1024 * 1024, windowsHide: true,
   env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1' } }
 const inside = (root: string, path: string) => path === root || path.startsWith(root + sep)
 

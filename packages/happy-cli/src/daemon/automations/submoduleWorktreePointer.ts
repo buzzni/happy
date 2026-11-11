@@ -17,6 +17,7 @@ async function defaultRunCommand(command: SubmoduleWorktreePointerCommand): Prom
   try {
     const result = await execFileAsync('git', command.args, {
       cwd: command.cwd,
+      windowsHide: true,
       timeout: COMMAND_TIMEOUT_MS,
       encoding: 'utf8',
     })

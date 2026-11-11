@@ -584,6 +584,7 @@ function runGitRefTransaction(
     return new Promise((resolvePromise, rejectPromise) => {
         const child = spawn('git', ['update-ref', '--stdin'], {
             cwd,
+            windowsHide: true,
             env: environment,
             stdio: ['pipe', 'ignore', 'pipe'],
         });
@@ -735,6 +736,7 @@ function runGit(
     return new Promise((resolvePromise, rejectPromise) => {
         execFile('git', args, {
             cwd,
+            windowsHide: true,
             env: environment,
             encoding: 'utf8',
             maxBuffer: 256 * 1024 * 1024,

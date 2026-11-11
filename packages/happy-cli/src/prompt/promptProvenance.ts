@@ -81,13 +81,88 @@ const CLIENT_TURN_BLOCK_CANDIDATE = /^<!-- saycode:client-turn-prompt:([a-z0-9]+
  */
 export function splitClientTurnPromptBlocks(prompt: string | undefined): { standing: string | undefined; turn: string | undefined } {
   if (!prompt) return { standing: prompt, turn: undefined };
-  const blocks = [...prompt.matchAll(CLIENT_TURN_BLOCK_CANDIDATE)]
-    .map((match) => match[0])
-    .filter((block) => stripClientTurnPromptBlocks(block) === undefined);
+  const blocks = clientTurnPromptBlocks(prompt);
   return {
     standing: stripClientTurnPromptBlocks(prompt),
     turn: blocks.length > 0 ? blocks.join('\n\n') : undefined,
   };
+}
+
+function clientTurnPromptBlockMatches(prompt: string | undefined): Array<{ block: string; at: number }> {
+  if (!prompt) return [];
+  return [...prompt.matchAll(CLIENT_TURN_BLOCK_CANDIDATE)]
+    .map((match) => ({ block: match[0], at: match.index }))
+    .filter(({ block }) => stripClientTurnPromptBlocks(block) === undefined);
+}
+
+function clientTurnPromptBlocks(prompt: string | undefined): string[] {
+  return clientTurnPromptBlockMatches(prompt).map(({ block }) => block);
+}
+
+/**
+ * What a provider that started with `launched` still lacks for a message carrying `next`.
+ *
+ * A system prompt is fixed when its provider starts, so a different prompt used to mean a new
+ * provider — seconds of startup on a turn whose only difference was one client-turn block (a
+ * guide for this question, a hint for this turn's difficulty). Those blocks can travel with the
+ * turn input instead, as they already do for Codex (`buildCodexTurnPrompt`).
+ *
+ * `added` is the client-turn blocks only `next` has, to send with the turn. `restart` is true
+ * when that is not enough: the standing context differs, or `next` dropped a block the provider
+ * started with and would keep following.
+ */
+export function clientTurnPromptChange(
+  launched: string | undefined,
+  next: string | undefined,
+): { restart: boolean; added: string | undefined } {
+  const launchedBlocks = clientTurnPromptBlocks(launched);
+  const nextBlocks = clientTurnPromptBlocks(next);
+  const added = nextBlocks.filter((block) => !launchedBlocks.includes(block));
+  return {
+    restart: (stripClientTurnPromptBlocks(launched) ?? '') !== (stripClientTurnPromptBlocks(next) ?? '')
+      || launchedBlocks.some((block) => !nextBlocks.includes(block)),
+    added: added.length > 0 ? added.join('\n\n') : undefined,
+  };
+}
+
+const clientTurnBlockToken = (block: string) => /^<!-- saycode:client-turn-prompt:([a-z0-9]+-[a-z0-9]+):start -->/.exec(block)?.[1] ?? '?';
+
+/**
+ * Takes out the client-turn blocks the client marked as belonging to one turn (`turnOnlyPromptTokens`).
+ *
+ * `provider` is what a provider's system prompt may hold and what a restart is decided on; `turnOnly`
+ * always travels with its turn. Without this a provider *started* by such a turn would hold the block
+ * and need a restart on the very next turn, which no longer carries it.
+ */
+export function splitTurnOnlyPromptBlocks(
+  prompt: string | undefined,
+  tokens: readonly string[] | undefined,
+): { provider: string | undefined; turnOnly: string | undefined } {
+  const marked = tokens?.length
+    ? clientTurnPromptBlockMatches(prompt).filter(({ block }) => tokens.includes(clientTurnBlockToken(block)))
+    : [];
+  if (!prompt || marked.length === 0) return { provider: prompt, turnOnly: undefined };
+  let provider = prompt;
+  // Last block first, by position: earlier positions stay valid, and a copy of a block's text quoted
+  // inside a line is never taken for the block.
+  for (const { block, at } of [...marked].reverse()) {
+    const before = provider.slice(0, at).replace(/\n+$/, '');
+    const after = provider.slice(at + block.length).replace(/^\n+/, '');
+    provider = before && after ? `${before}\n\n${after}` : before || after;
+  }
+  return { provider: provider || undefined, turnOnly: marked.map(({ block }) => block).join('\n\n') };
+}
+
+/** For a log line: which part of the prompt differs. Block tokens are envelope checksums, never prompt text. */
+export function describeClientPromptChange(launched: string | undefined, next: string | undefined): string {
+  const tokens = (prompt: string | undefined) => clientTurnPromptBlocks(prompt).map(clientTurnBlockToken);
+  const before = tokens(launched);
+  const after = tokens(next);
+  return [
+    (stripClientTurnPromptBlocks(launched) ?? '') !== (stripClientTurnPromptBlocks(next) ?? '') ? 'standing context' : undefined,
+    ...after.filter((token) => !before.includes(token)).map((token) => `+${token}`),
+    ...before.filter((token) => !after.includes(token)).map((token) => `-${token}`),
+  ].filter(Boolean).join(' ') || 'same';
 }
 
 /**

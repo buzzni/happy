@@ -84,6 +84,7 @@ import {
 } from './claudeTransientRetry';
 import { SETUP_TOKEN_BINDING_ENV, SETUP_TOKEN_RESUME_REBOUND_ENV, sharedMachineSetupTokenAuthority } from '@/daemon/sessionEnv';
 import { orgEndpointLocalModeRefusal } from './utils/orgEndpointLocalMode';
+import { clientTurnPromptChange, describeClientPromptChange, splitTurnOnlyPromptBlocks } from '@/prompt/promptProvenance';
 
 /** Sent when the member retries a turn the organization account refused to authenticate (Saycode specs/org-auth-failure-account-switch). */
 const AUTHENTICATION_RETRY_PROMPT = 'The previous request stopped because the organization Claude account could not authenticate. Try the request again from where you stopped.';
@@ -526,7 +527,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             throw error;
         }
     };
-    session.client.rpcHandlerManager.registerHandler('personal-claude-fallback', async (params: { action?: unknown; accountRef?: unknown; nonce?: unknown; consentProof?: unknown; personal?: unknown }) => {
+    session.client.rpcHandlerManager.registerHandler('personal-claude-fallback', async (params: { action?: unknown; accountRef?: unknown; nonce?: unknown; consentProof?: unknown; personal?: unknown; managedAccountId?: unknown; excludeManagedAccountIds?: unknown }) => {
         if (!personalFallback) return { version: 1, supported: false };
         if (params.action === 'prepare-manual') {
             if (typeof params.accountRef !== 'string' || !/^[a-f0-9]{64}$/.test(params.accountRef)) throw new Error('CLAUDE_PERSONAL_SELECTION_INVALID');
@@ -558,6 +559,23 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             wakeOrganizationRecovery();
             return { version: 1, supported: true, switched: true };
         }
+        // Saycode specs/usage-org-account-current-chat — the member picked an organization account for this conversation.
+        if (params.action === 'select-organization') {
+            const accountId = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+            const exclude = params.excludeManagedAccountIds ?? [];
+            if (!accountId(params.managedAccountId) || !Array.isArray(exclude) || exclude.length > 50 || !exclude.every(accountId)) throw new Error('CLAUDE_ORGANIZATION_SELECTION_INVALID');
+            if (!setupTokenSwitching) return { version: 1, supported: true, switched: false, reason: 'UNAVAILABLE' };
+            const continueRefusal = !session.thinking && !lastResultSucceeded && !lastTurnChannel && (setupTokenSwitching.hasAccountRefusal() || lastOrganizationAuthenticationFailed);
+            const result = await setupTokenSwitching.switchTo(params.managedAccountId, exclude);
+            if (!result.switched) return { version: 1, supported: true, switched: false, reason: result.reason };
+            if (continueRefusal) continuation = lastTurnMode;
+            clearAuthenticationFailure();
+            chosenAccountPending = true;
+            // A waiting provider ends now and a running one at its turn's end (`nextMessage` sees it stale); either way
+            // the conversation names the chosen account as it ends, and the next message starts one on it.
+            wakeOrganizationRecovery();
+            return { version: 1, supported: true, switched: true };
+        }
         if (params.action === 'retry') {
             if (!authenticationRefused() || !lastTurnMode || pending || session.queue.size() !== 0 || session.queue.isClosed()) return { version: 1, supported: true, retried: false };
             // No native transcript yet: send the actual request again, with its attachments and authority.
@@ -565,7 +583,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 pending = { ...lastCommittedBatch, mode: lastTurnMode, continuation: session.client.inputEvidence?.takeContinuation() };
                 wakeOrganizationRecovery();
             } else {
-                session.queue.unshiftIsolated(AUTHENTICATION_RETRY_PROMPT, lastTurnMode, undefined, session.turnAttendance?.continuationInput(), {
+                session.queue.unshiftIsolated(AUTHENTICATION_RETRY_PROMPT, withoutTurnOnlyBlocks(lastTurnMode), undefined, session.turnAttendance?.continuationInput(), {
                     ref: { kind: 'unidentified', runtimeInputId: randomUUID() },
                     continuation: session.client.inputEvidence?.takeContinuation(),
                 });
@@ -594,6 +612,14 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
      */
     const organizationSwitchOffered = () => authenticationRefused() && !!setupTokenSwitching?.canSwitch()
         && setupTokenSwitching.lastFailureMayPass();
+    /** The member's chosen account waits for the provider that holds the old token to end (Saycode specs/usage-org-account-current-chat). */
+    let chosenAccountPending = false;
+    /** That provider ends: the conversation runs on the chosen account from now on, so it is named before the next message. */
+    const reportMovedAccount = () => {
+        if (!chosenAccountPending || !providerStale() || personalFallback?.identity()) return;
+        chosenAccountPending = false;
+        session.client.setClaudeRuntimeAccount(process.env[SETUP_TOKEN_BINDING_ENV]);
+    };
     const wakeOrganizationRecovery = () => { organizationRecoveryWake.abort(); organizationRecoveryWake = new AbortController(); };
     let providerCredentialGeneration = 0;
     const setupTokenSwitching = (runningAuthority() || initialPersonalAuthority) ? createSetupTokenAccountSwitching({
@@ -645,7 +671,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             pending = { ...request, mode, continuation: session.client.inputEvidence?.takeContinuation() };
             return;
         }
-        session.queue.unshiftIsolated(CONTINUE_PROMPT, mode, undefined, session.turnAttendance?.continuationInput(), {
+        session.queue.unshiftIsolated(CONTINUE_PROMPT, withoutTurnOnlyBlocks(mode), undefined, session.turnAttendance?.continuationInput(), {
             ref: { kind: 'unidentified', runtimeInputId: randomUUID() },
             continuation: session.client.inputEvidence?.takeContinuation(),
         });
@@ -693,18 +719,22 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         }
         sideQuestion.noteMainMessage(message);
         transientRetry.observe(message);
-        if (!personalFallback?.identity() && (message as { type?: unknown }).type === 'rate_limit_event') {
+        // A provider still on the account the session switched away from (e.g. the member's choice mid-turn) speaks for
+        // that account: its quota must not move the session off the one it now runs on.
+        if (!personalFallback?.identity() && !providerStale() && (message as { type?: unknown }).type === 'rate_limit_event') {
             setupTokenSwitching?.onRateLimitEvent((message as { rate_limit_info?: unknown }).rate_limit_info);
         }
         if (message.type === 'system' && message.subtype === 'init') {
             providerRunning = true;
             heldRequest = null;
             heldRequestRetried = false;
-            providerBinding = runningAuthority();
+            if (!providerStale()) chosenAccountPending = false;
+            // `providerBinding` stays what this process was started with (set at launch): `init` opens every turn, and a
+            // switch since then has not reached this process's token.
             providerCredentialGeneration = personalFallback?.generation() ?? 0;
             if (personalFallback && initialPersonalAuthority) session.client.setPersonalClaudeFallback({ companyId: initialPersonalAuthority.companyId,
                 machineId: initialPersonalAuthority.machineId, generation: personalFallback.generation(), personal: personalFallback.identity() });
-            session.client.setClaudeRuntimeAccount(process.env[SETUP_TOKEN_BINDING_ENV]);
+            session.client.setClaudeRuntimeAccount(personalFallback?.identity() ? process.env[SETUP_TOKEN_BINDING_ENV] : providerActivityBinding);
             // The level signal is per provider process and comes only when its set
             // changes, but `init` opens every turn: a list naming live work is kept,
             // or that work would vanish until it ends (`finally` drops it with the
@@ -1096,6 +1126,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
             abortFuture = new Future<void>();
             let modeHash: string | null = null;
+            // The mode this provider started with: what its system prompt was built from.
+            let launched: EnhancedMode | null = null;
             let mode: EnhancedMode | null = null;
             providerRunning = false;
             // Capture authority before the first thinking callback, which can precede system/init.
@@ -1220,7 +1252,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             session.client.inputEvidence.cancelContinuation('cancelled');
                         }
                         // A running provider keeps the token it started with: end it, the loop resumes the conversation.
-                        if (providerOptionsStale()) return null;
+                        if (providerOptionsStale()) { reportMovedAccount(); return null; }
                         // The next provider's first turn: ahead of anything the user queued meanwhile, and alone.
                         if (!providerRunning && continuation) {
                             // A held request never reached the transcript: input queued meanwhile waits behind it, not in its place.
@@ -1258,6 +1290,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // This message starts the new provider. Seed its comparison
                             // baseline too, or the next model/effort change is missed.
                             modeHash = p.hash;
+                            launched = p.mode;
                             mode = p.mode;
                             permissionHandler.handleModeChange(p.mode.permissionMode);
                             if (orgClampedBatches.has(p)) permissionHandler.applyModeToRunningQuery(p.mode.permissionMode);
@@ -1340,7 +1373,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             );
                             if (!msg && personalWake?.aborted && !controller.signal.aborted && providerStale()) return null;
                             // The member took another account (a stale provider) or asked to resend a first turn (pending).
-                            if (!msg && organizationWake.aborted && !controller.signal.aborted && (providerStale() || pending)) return null;
+                            if (!msg && organizationWake.aborted && !controller.signal.aborted && (providerStale() || pending)) { reportMovedAccount(); return null; }
                             if (!msg && switchWake?.aborted && !controller.signal.aborted) {
                                 // A wait an ended provider left behind leaves the finished switch to the live generation.
                                 if (providerEnded) return null;
@@ -1401,7 +1434,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // The failed turn again keeps its attendance and its spent wait budget (R10a, Q6).
                             // The failed turn's own settings, unchanged — no provider restart.
                             mode = due.mode.mode;
-                            modeHash = due.mode.hash ?? modeHash;
+                            // A retry that has to start the next provider starts it with the failed turn's own mode,
+                            // which a kept turn's differs from the hash recorded for it: that mode is the baseline.
+                            if (!launched) { launched = mode; modeHash = session.queue.modeHasher(mode); }
+                            else modeHash = due.mode.hash ?? modeHash;
                             permissionHandler.handleModeChange(mode.permissionMode);
                             logger.debug(`[remote]: transient API failure retry ${due.attempt}`);
                             dispatchTurn();
@@ -1484,7 +1520,24 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // after its hash was taken: a change reaches the SDK only with a new provider.
                             const engineModeChanged = mode && (mode.model !== msg.mode.model || mode.effort !== msg.mode.effort
                                 || !isDeepStrictEqual(mode.disallowedTools, msg.mode.disallowedTools));
-                            if ((modeHash && msg.hash !== modeHash) || engineModeChanged || msg.isolate) {
+                            /*
+                             * A different hash used to mean a new provider. Desktop composes the
+                             * prompt again for every turn, though, and most differences are one
+                             * client-turn block — a guide for this question — which `claudeRemote`
+                             * sends with the turn instead. The provider stays when that is the whole
+                             * difference: every other hashed setting matches the one it started with,
+                             * the standing context is the same, and no block it started with is gone.
+                             * A block the client marked for one turn was never in the provider's prompt.
+                             */
+                            const hashChanged = Boolean(modeHash) && msg.hash !== modeHash;
+                            const promptChange = hashChanged ? clientTurnPromptChange(providerPromptOf(launched), providerPromptOf(msg.mode)) : null;
+                            // Both sides as the organization gate rewrote them: the queue hashed this batch before that.
+                            // A turn that starts like a command cannot carry a block in front of its text.
+                            const turnBlocksOnly = promptChange !== null && !promptChange.restart && launched !== null
+                                && !(promptChange.added && isCommandText(msg.message))
+                                && session.queue.modeHasher({ ...msg.mode, appendSystemPrompt: launched.appendSystemPrompt, turnOnlyPromptTokens: launched.turnOnlyPromptTokens })
+                                    === session.queue.modeHasher(launched);
+                            if ((hashChanged && !turnBlocksOnly) || engineModeChanged || msg.isolate) {
                                 /*
                                  * A restart ends this provider's input and waits for it to
                                  * exit, but live background work keeps Claude Code running:
@@ -1506,14 +1559,24 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                     && isDeepStrictEqual(mode?.disallowedTools, msg.mode.disallowedTools)
                                     && (mode?.permissionMode === 'plan') === (msg.mode.permissionMode === 'plan');
                                 if (!keepForBackgroundWork) {
-                                    logger.debug('[remote]: mode has changed, pending message');
+                                    // Which part asked for the restart; block tokens are checksums, never prompt text.
+                                    logger.debug(`[remote]: mode has changed, pending message (${[
+                                        msg.isolate && 'isolated turn',
+                                        engineModeChanged && 'model, effort or blocked tools',
+                                        hashChanged && !turnBlocksOnly && (promptChange?.restart
+                                            ? `prompt: ${describeClientPromptChange(providerPromptOf(launched), providerPromptOf(msg.mode))}`
+                                            : 'another launch setting'),
+                                    ].filter(Boolean).join('; ')})`);
                                     pending = msg;
                                     if (orgClamped) orgClampedBatches.add(msg);
                                     drain?.releaseClaim();
                                     return null;
                                 }
                                 logger.debug('[remote]: mode has changed, kept provider for its background work');
-                            } else {
+                            } else if (!turnBlocksOnly) {
+                                // Only the message that starts the provider: a later one of the same hash may
+                                // mark its blocks differently, and the provider's prompt does not change with it.
+                                if (!modeHash) launched = msg.mode;
                                 modeHash = msg.hash;
                             }
                             mode = msg.mode;
@@ -1982,6 +2045,16 @@ function detectClaudeImageMime(bytes: Uint8Array): 'image/jpeg' | 'image/png' | 
 }
 
 /** Both freshly dequeued and replayed input retain their own decrypted attachments. */
+/** What a provider's system prompt may hold of a mode's prompt: everything but the blocks marked for one turn. */
+function providerPromptOf(mode: EnhancedMode | null): string | undefined {
+    return splitTurnOnlyPromptBlocks(mode?.appendSystemPrompt, mode?.turnOnlyPromptTokens).provider;
+}
+
+/** For a note sent in a turn's place: it is not the turn that turn's one-turn blocks were written for. */
+function withoutTurnOnlyBlocks(mode: EnhancedMode): EnhancedMode {
+    return { ...mode, appendSystemPrompt: providerPromptOf(mode), turnOnlyPromptTokens: undefined };
+}
+
 function claudeBatchMessage(batch: CollectedBatch<EnhancedMode>): string | ContentBlockParam[] {
     if (!batch.attachments?.length) return batch.message;
     const content: ContentBlockParam[] = [];

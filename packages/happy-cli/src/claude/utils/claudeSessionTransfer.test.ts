@@ -62,6 +62,14 @@ describe('Claude session transfer input validation', () => {
         })).toThrow('outside the working directory');
     });
 
+    // aplus-dev-studio specs/approved-folder-roots R10: a chat moves into a project outside home once its folder is approved.
+    it('accepts a cwd in a folder the machine owner approved outside the allowed root', () => {
+        const outside = join(root, '..', 'approved-elsewhere', 'project');
+        expect(resolveClaudeSessionTransferPath({
+            directory: outside, claudeSessionId: SESSION_ID, allowedRoot: root, approvedRoots: [join(root, '..', 'approved-elsewhere')],
+        })).toContain(`${SESSION_ID}.jsonl`);
+    });
+
     it('rejects a non-UUID native session id', () => {
         expect(() => resolveClaudeSessionTransferPath({
             directory: projectDirectory,
