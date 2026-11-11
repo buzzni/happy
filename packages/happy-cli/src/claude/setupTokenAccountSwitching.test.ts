@@ -427,8 +427,8 @@ describe('switching to the account the member chose', () => {
   it('moves onto that account and says so as a switch', async () => {
     const notifyState = vi.fn()
     const { deps, switching } = setup({ notifyState })
-    expect(await switching.switchTo(CHOSEN)).toEqual({ switched: true })
-    expect(deps.rebind).toHaveBeenCalledWith('session-a', 'binding-a', undefined, undefined, { managedAccountId: CHOSEN })
+    expect(await switching.switchTo(CHOSEN, ['22222222-2222-4222-8222-222222222222'])).toEqual({ switched: true })
+    expect(deps.rebind).toHaveBeenCalledWith('session-a', 'binding-a', undefined, undefined, { managedAccountId: CHOSEN, excludeManagedAccountIds: ['22222222-2222-4222-8222-222222222222'] })
     expect(deps.applyEnvironment).toHaveBeenCalledWith({ CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next' })
     expect(notifyState).toHaveBeenCalledOnce()
     expect(notifyState).toHaveBeenCalledWith(expect.any(String), 'switched')

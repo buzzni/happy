@@ -22,7 +22,7 @@ export type SetupTokenAccountSwitchingDeps = {
   /** The binding record the running provider started with; the daemon books usage and switches against exactly it. */
   binding(): string | undefined
   report(sessionId: string, binding: string, observation: SetupTokenUsageObservation, signal?: AbortSignal): Promise<Outcome>
-  rebind(sessionId: string, binding: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal, options?: { startBudget: true } | { startExhausted: true } | { managedAccountId: string }): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string; retryAfterMs?: number }>
+  rebind(sessionId: string, binding: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal, options?: { startBudget: true } | { startExhausted: true } | { managedAccountId: string; excludeManagedAccountIds?: string[] }): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string; retryAfterMs?: number }>
   applyEnvironment(environment: Record<string, string>): void
   notify(message: string): void
   notifyState?(message: string, state: SetupTokenRotationState): void
@@ -291,12 +291,13 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
     /**
      * The member chose this organization account for the conversation (Saycode specs/usage-org-account-current-chat).
      * Not an automatic move: it spends no allowance and runs after a stop too. Continuing a refused turn is the launcher's call.
+     * `exclude`: other assigned accounts the member's app knows, which Studio must not pick instead.
      */
-    async switchTo(managedAccountId: string): Promise<{ switched: boolean; reason?: string }> {
+    async switchTo(managedAccountId: string, exclude: string[] = []): Promise<{ switched: boolean; reason?: string }> {
       while (inFlight) await inFlight
       const sessionId = deps.sessionId(), binding = deps.binding()
       if (disposed || !sessionId || !binding) return { switched: false, reason: 'UNAVAILABLE' }
-      const move = deps.rebind(sessionId, binding, undefined, undefined, { managedAccountId })
+      const move = deps.rebind(sessionId, binding, undefined, undefined, { managedAccountId, ...(exclude.length ? { excludeManagedAccountIds: exclude } : {}) })
         .catch(() => ({ ok: false as const, reason: 'REQUEST_FAILED' }))
         .then((result): { switched: boolean; reason?: string } => {
           if (disposed) return { switched: false, reason: 'UNAVAILABLE' }

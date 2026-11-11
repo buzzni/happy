@@ -63,6 +63,9 @@ describe('setup-token control routes (specs/claude-setup-token-account-selection
       expect(switcher.rebind).toHaveBeenLastCalledWith('session-a', '{}', undefined, expect.any(AbortSignal), { managedAccountId: chosen });
       expect((await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}', managedAccountId: 'not-an-account' })).status).toBe(400);
       expect((await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}', managedAccountId: chosen, startBudget: true })).status).toBe(400);
+      expect((await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}', managedAccountId: chosen, excludeManagedAccountIds: [chosen] })).status).toBe(200);
+      expect(switcher.rebind).toHaveBeenLastCalledWith('session-a', '{}', undefined, expect.any(AbortSignal), { managedAccountId: chosen, excludeManagedAccountIds: [chosen] });
+      expect((await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}', excludeManagedAccountIds: [chosen] })).status).toBe(400);
       expect((await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}', managedAccountId: chosen, observation: finalRefusal })).status).toBe(400);
 
       expect((await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}', observation: finalRefusal })).status).toBe(200);

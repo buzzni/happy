@@ -873,6 +873,23 @@ describe('moving to the account the member chose (Saycode specs/usage-org-accoun
     expect(deps.recordAgentEnvironment).not.toHaveBeenCalled()
   })
 
+  it('also excludes the other assigned accounts the member\'s app knows, so Studio cannot pick one not on this PC yet', async () => {
+    const D = '00000000-0000-4000-8000-00000000000d'
+    const { switcher, requests } = setup(held)
+    expect(await switcher.rebind('session-a', RUNNING_A, undefined, undefined, { managedAccountId: B, excludeManagedAccountIds: [B, D] })).toHaveProperty('ok', true)
+    expect(new Set(requests[0].body.excludeManagedAccountIds as string[])).toEqual(new Set([A, C, D]))
+  })
+
+  it('saves the chosen account again when it is chosen again after its save failed, and refuses another choice meanwhile', async () => {
+    const record = vi.fn().mockReturnValueOnce({ status: 'failed' }).mockReturnValue({ status: 'committed' })
+    const { switcher, deps } = setup({ ...held, recordAgentEnvironment: record })
+    expect(await switcher.rebind('session-a', RUNNING_A, undefined, undefined, { managedAccountId: B })).toEqual({ ok: false, reason: 'PERSISTENCE_FAILED' })
+    expect(await switcher.rebind('session-a', RUNNING_A, undefined, undefined, { managedAccountId: C })).toEqual({ ok: false, reason: 'STALE' })
+    expect(await switcher.rebind('session-a', RUNNING_A, undefined, undefined, { managedAccountId: B })).toHaveProperty('ok', true)
+    // The grant Studio issued once is saved again, not asked for twice.
+    expect(deps.fetch).toHaveBeenCalledTimes(1)
+  })
+
   it('cannot choose for a shared-PC session or without the held account list', async () => {
     const sharedRunning = sharedMachineSetupTokenAuthority({ HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1', [SETUP_TOKEN_SHARED_ACCOUNT_ENV]: A })!
     const shared = setup({ ...held, sharedMachine: { reportUsage: vi.fn(), rebind: vi.fn(), environment: vi.fn(), moved: vi.fn() } })

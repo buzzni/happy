@@ -525,7 +525,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             throw error;
         }
     };
-    session.client.rpcHandlerManager.registerHandler('personal-claude-fallback', async (params: { action?: unknown; accountRef?: unknown; nonce?: unknown; consentProof?: unknown; personal?: unknown; managedAccountId?: unknown }) => {
+    session.client.rpcHandlerManager.registerHandler('personal-claude-fallback', async (params: { action?: unknown; accountRef?: unknown; nonce?: unknown; consentProof?: unknown; personal?: unknown; managedAccountId?: unknown; excludeManagedAccountIds?: unknown }) => {
         if (!personalFallback) return { version: 1, supported: false };
         if (params.action === 'prepare-manual') {
             if (typeof params.accountRef !== 'string' || !/^[a-f0-9]{64}$/.test(params.accountRef)) throw new Error('CLAUDE_PERSONAL_SELECTION_INVALID');
@@ -559,17 +559,19 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         }
         // Saycode specs/usage-org-account-current-chat — the member picked an organization account for this conversation.
         if (params.action === 'select-organization') {
-            if (typeof params.managedAccountId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(params.managedAccountId)) throw new Error('CLAUDE_ORGANIZATION_SELECTION_INVALID');
+            const accountId = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+            const exclude = params.excludeManagedAccountIds ?? [];
+            if (!accountId(params.managedAccountId) || !Array.isArray(exclude) || exclude.length > 50 || !exclude.every(accountId)) throw new Error('CLAUDE_ORGANIZATION_SELECTION_INVALID');
             if (!setupTokenSwitching) return { version: 1, supported: true, switched: false, reason: 'UNAVAILABLE' };
             const continueRefusal = !session.thinking && !lastResultSucceeded && !lastTurnChannel && (setupTokenSwitching.hasAccountRefusal() || lastOrganizationAuthenticationFailed);
-            const result = await setupTokenSwitching.switchTo(params.managedAccountId);
+            const result = await setupTokenSwitching.switchTo(params.managedAccountId, exclude);
             if (!result.switched) return { version: 1, supported: true, switched: false, reason: result.reason };
             if (continueRefusal) continuation = lastTurnMode;
             clearAuthenticationFailure();
-            // A waiting provider ends now and a running one at its turn's end (`nextMessage` sees it stale); the next
-            // message starts one on the chosen account. Nothing runs on the old account any more when nothing is running.
+            chosenAccountPending = true;
+            // A waiting provider ends now and a running one at its turn's end (`nextMessage` sees it stale); either way
+            // the conversation names the chosen account as it ends, and the next message starts one on it.
             wakeOrganizationRecovery();
-            if (!session.thinking) session.client.setClaudeRuntimeAccount(process.env[SETUP_TOKEN_BINDING_ENV]);
             return { version: 1, supported: true, switched: true };
         }
         if (params.action === 'retry') {
@@ -608,6 +610,14 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
      */
     const organizationSwitchOffered = () => authenticationRefused() && !!setupTokenSwitching?.canSwitch()
         && setupTokenSwitching.lastFailureMayPass();
+    /** The member's chosen account waits for the provider that holds the old token to end (Saycode specs/usage-org-account-current-chat). */
+    let chosenAccountPending = false;
+    /** That provider ends: the conversation runs on the chosen account from now on, so it is named before the next message. */
+    const reportMovedAccount = () => {
+        if (!chosenAccountPending || !providerStale() || personalFallback?.identity()) return;
+        chosenAccountPending = false;
+        session.client.setClaudeRuntimeAccount(process.env[SETUP_TOKEN_BINDING_ENV]);
+    };
     const wakeOrganizationRecovery = () => { organizationRecoveryWake.abort(); organizationRecoveryWake = new AbortController(); };
     let providerCredentialGeneration = 0;
     const setupTokenSwitching = (runningAuthority() || initialPersonalAuthority) ? createSetupTokenAccountSwitching({
@@ -705,11 +715,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             providerRunning = true;
             heldRequest = null;
             heldRequestRetried = false;
-            providerBinding = runningAuthority();
+            if (!providerStale()) chosenAccountPending = false;
+            // `providerBinding` stays what this process was started with (set at launch): `init` opens every turn, and a
+            // switch since then has not reached this process's token.
             providerCredentialGeneration = personalFallback?.generation() ?? 0;
             if (personalFallback && initialPersonalAuthority) session.client.setPersonalClaudeFallback({ companyId: initialPersonalAuthority.companyId,
                 machineId: initialPersonalAuthority.machineId, generation: personalFallback.generation(), personal: personalFallback.identity() });
-            session.client.setClaudeRuntimeAccount(process.env[SETUP_TOKEN_BINDING_ENV]);
+            session.client.setClaudeRuntimeAccount(personalFallback?.identity() ? process.env[SETUP_TOKEN_BINDING_ENV] : providerActivityBinding);
             // The level signal is per provider process and comes only when its set
             // changes, but `init` opens every turn: a list naming live work is kept,
             // or that work would vanish until it ends (`finally` drops it with the
@@ -1218,7 +1230,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             session.client.inputEvidence.cancelContinuation('cancelled');
                         }
                         // A running provider keeps the token it started with: end it, the loop resumes the conversation.
-                        if (providerOptionsStale()) return null;
+                        if (providerOptionsStale()) { reportMovedAccount(); return null; }
                         // The next provider's first turn: ahead of anything the user queued meanwhile, and alone.
                         if (!providerRunning && continuation) {
                             // A held request never reached the transcript: input queued meanwhile waits behind it, not in its place.
@@ -1339,7 +1351,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             );
                             if (!msg && personalWake?.aborted && !controller.signal.aborted && providerStale()) return null;
                             // The member took another account (a stale provider) or asked to resend a first turn (pending).
-                            if (!msg && organizationWake.aborted && !controller.signal.aborted && (providerStale() || pending)) return null;
+                            if (!msg && organizationWake.aborted && !controller.signal.aborted && (providerStale() || pending)) { reportMovedAccount(); return null; }
                             if (!msg && switchWake?.aborted && !controller.signal.aborted) {
                                 // A wait an ended provider left behind leaves the finished switch to the live generation.
                                 if (providerEnded) return null;

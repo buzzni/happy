@@ -282,8 +282,8 @@ it('asks the daemon for the account the member chose', async () => {
   const state = stateWithPid(process.pid); mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state, raw: JSON.stringify(state) })
   const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(Response.json({ ok: true, environment: { TOKEN: 'synthetic' } }))
   try {
-    expect(await requestSetupTokenRebind('s', 'binding', undefined, undefined, { managedAccountId: 'chosen' })).toEqual({ ok: true, environment: { TOKEN: 'synthetic' } })
-    expect(JSON.parse(String(fetchSpy.mock.calls[0][1]?.body))).toEqual({ sessionId: 's', binding: 'binding', managedAccountId: 'chosen' })
+    expect(await requestSetupTokenRebind('s', 'binding', undefined, undefined, { managedAccountId: 'chosen', excludeManagedAccountIds: ['other'] })).toEqual({ ok: true, environment: { TOKEN: 'synthetic' } })
+    expect(JSON.parse(String(fetchSpy.mock.calls[0][1]?.body))).toEqual({ sessionId: 's', binding: 'binding', managedAccountId: 'chosen', excludeManagedAccountIds: ['other'] })
   } finally { fetchSpy.mockRestore() }
 })
 

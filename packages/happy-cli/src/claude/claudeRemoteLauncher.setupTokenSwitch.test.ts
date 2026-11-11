@@ -1793,17 +1793,19 @@ describe('moving the conversation to the organization account the member chose (
         vi.mocked(readPersonalClaudeCredential).mockResolvedValue(null);
     });
     /**
-     * `answering`: the member chooses while the first turn runs; `idle`: after it answered. Once the choice is answered
-     * the member sends another message; the provider answering it ends the run.
+     * `answering`: the member chooses while the first turn runs; `starting`: after its input was taken, before the
+     * provider's per-turn `init`; `idle`: after it answered. Once the choice is answered the member sends another
+     * message; the provider answering it ends the run.
      */
-    function harness(when: 'answering' | 'idle', params: Record<string, unknown> = { action: 'select-organization', managedAccountId: CHOSEN }) {
+    const OTHER = '44444444-4444-4444-8444-444444444444';
+    function harness(when: 'answering' | 'starting' | 'idle', params: Record<string, unknown> = { action: 'select-organization', managedAccountId: CHOSEN, excludeManagedAccountIds: [OTHER] }) {
         process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING = dedicated();
         const queue = new MessageQueue2<EnhancedMode>(hashObject), handlers = new Map<string, (params?: any) => Promise<any>>();
         const client = { sessionId:'happy-session-1',rpcHandlerManager:{registerHandler:(name:string,handler:any)=>handlers.set(name,handler)},
             updateAgentState:vi.fn(),updateMetadata:vi.fn(),getMetadata:()=>({}),setPersonalClaudeFallback:vi.fn(),setClaudeRuntimeAccount:vi.fn(),
             sendClaudeSessionMessage:vi.fn(),sendStreamDelta:vi.fn(),setPendingTurnRequestId:vi.fn(),sendFinalAnswerForChannelTurn:vi.fn(),
             applyClaudeTurnResult:vi.fn(),noteContextUsageSignal:vi.fn(),closeClaudeSessionTurn:vi.fn(),sendSessionEvent:vi.fn() };
-        const generations: Array<{ token: string | undefined; resume: string | undefined; prompts: string[] }> = [];
+        const generations: Array<{ token: string | undefined; resume: string | undefined; prompts: string[]; accountsAtStart: unknown[] }> = [];
         const outcome: { answer?: any; error?: unknown; accountsAtAnswer?: unknown[] } = {};
         const end = () => { void handlers.get('switch')!(); };
         const choose = () => handlers.get('personal-claude-fallback')!(params).then(answer => {
@@ -1812,13 +1814,18 @@ describe('moving the conversation to the organization account the member chose (
         }, error => { outcome.error = error; });
         const next = () => setTimeout(() => { if (outcome.answer?.switched === true) queue.push('and the tests', mode); else end(); }, 0);
         vi.mocked(query).mockImplementation(({ prompt, options }) => {
-            const generation = { token: process.env.CLAUDE_CODE_OAUTH_TOKEN, resume: options?.resume, prompts: [] as string[] };
+            const generation = { token: process.env.CLAUDE_CODE_OAUTH_TOKEN, resume: options?.resume, prompts: [] as string[], accountsAtStart: client.setClaudeRuntimeAccount.mock.calls.map(call => call[0]) };
             generations.push(generation);
             return Object.assign((async function* () {
                 yield { type:'system',subtype:'init',session_id:'',tools:[],mcp_servers:[],apiKeySource:'none' };
                 for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
                     generation.prompts.push(JSON.stringify(message.message.content));
                     const first = generations.length === 1 && generation.prompts.length === 1;
+                    if (first && when === 'starting') {
+                        await choose();
+                        // Claude Code opens every turn with `init`; this process still holds the first token.
+                        yield { type:'system',subtype:'init',session_id:'',tools:[],mcp_servers:[],apiKeySource:'none' };
+                    }
                     if (first && when === 'answering') await choose();
                     yield assistant(`answered-${generations.length}-${generation.prompts.length}`);
                     yield { type:'result',subtype:'success',result:'done',is_error:false,uuid:`done-${generations.length}-${generation.prompts.length}` };
@@ -1834,11 +1841,11 @@ describe('moving the conversation to the organization account the member chose (
         return { generations, client, outcome, run: () => claudeRemoteLauncher(session as unknown as Session) };
     }
 
-    it.each(['idle', 'answering'] as const)('runs the next message of the same conversation on the chosen account when chosen %s', async when => {
+    it.each(['idle', 'starting', 'answering'] as const)('runs the next message of the same conversation on the chosen account when chosen %s', async when => {
         const h = harness(when);
         await h.run();
         expect(h.outcome.answer).toEqual({ version: 1, supported: true, switched: true });
-        expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', dedicated(), undefined, undefined, { managedAccountId: CHOSEN });
+        expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', dedicated(), undefined, undefined, { managedAccountId: CHOSEN, excludeManagedAccountIds: [OTHER] });
         expect(h.generations.map(g => g.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
         expect(h.generations.map(g => g.resume)).toEqual(['claude-1', 'claude-1']);
         // Nothing is sent again: the chosen account answers only what the member sends next.
@@ -1846,16 +1853,12 @@ describe('moving the conversation to the organization account the member chose (
         expect(h.client.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({ setupTokenRotation: { version: 1, state: 'switched' } }));
     });
 
-    it('names the chosen account as the conversation\'s at once when nothing is running', async () => {
-        const h = harness('idle');
+    it.each(['idle', 'starting', 'answering'] as const)('names the chosen account once the old provider ends, not while it still answers (chosen %s)', async when => {
+        const h = harness(when);
         await h.run();
-        expect(h.outcome.accountsAtAnswer?.at(-1)).toBe('{"account":"second"}');
-    });
-
-    it('keeps naming the answering account until that answer ends', async () => {
-        const h = harness('answering');
-        await h.run();
-        expect(h.outcome.accountsAtAnswer).not.toContain('{"account":"second"}');
+        if (when !== 'idle') expect(h.outcome.accountsAtAnswer).not.toContain('{"account":"second"}');
+        // Before the member's next message starts a provider, the conversation already names the chosen account.
+        expect(h.generations[1].accountsAtStart.at(-1)).toBe('{"account":"second"}');
     });
 
     it('answers why the chosen account could not be bound and keeps the provider', async () => {
@@ -1866,8 +1869,8 @@ describe('moving the conversation to the organization account the member chose (
         expect(h.generations.map(g => g.token)).toEqual(['sk-ant-oat01-first']);
     });
 
-    it('refuses an account id that is not one', async () => {
-        const h = harness('idle', { action: 'select-organization', managedAccountId: 'second' });
+    it.each([{ managedAccountId: 'second' }, { managedAccountId: CHOSEN, excludeManagedAccountIds: ['other'] }, { managedAccountId: CHOSEN, excludeManagedAccountIds: Array(51).fill(OTHER) }])('refuses a choice whose account ids are not ones: %j', async choice => {
+        const h = harness('idle', { action: 'select-organization', ...choice });
         await h.run();
         expect(h.outcome.error).toEqual(new Error('CLAUDE_ORGANIZATION_SELECTION_INVALID'));
         expect(requestSetupTokenRebind).not.toHaveBeenCalled();

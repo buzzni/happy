@@ -171,8 +171,11 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
   }
 
   const selectionRequests = new Map<string, {id:string; expiresAt:number}>()
-  /** `target`: the account the member chose (Saycode specs/usage-org-account-current-chat); Studio may answer only that one. */
-  async function rebindOnce(sessionId: string, running: string, confirmedOnly = false, organizationFailure?: { kind: 'authentication'; observedAt: number }, startBudget = false, startExhausted = false, target?: string): Promise<RebindResult> {
+  /**
+   * `target`: the account the member chose (Saycode specs/usage-org-account-current-chat); Studio may answer only that one.
+   * `targetExclude`: other assigned accounts the member's app knows, which this PC may not hold yet.
+   */
+  async function rebindOnce(sessionId: string, running: string, confirmedOnly = false, organizationFailure?: { kind: 'authentication'; observedAt: number }, startBudget = false, startExhausted = false, target?: string, targetExclude: readonly string[] = []): Promise<RebindResult> {
     const bound = boundSession(deps, sessionId, running)
     if (!bound) return failure('NOT_BOUND', `rebind: no binding recorded for session ${sessionId}`)
     const { session, recorded } = bound
@@ -181,8 +184,12 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     if (pending) {
       // Do not apply a retained grant to a replacement session or a different running authority.
       if (pending.running !== running || pending.committed !== session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV]) return failure('STALE', 'pending save belongs to another session authority')
-      // The retained grant is for an account nobody chose now.
-      if (target) return failure('STALE', 'an earlier switch is still being saved')
+      // The retained grant is saved again when its account is chosen again; another choice waits for it.
+      if (target) {
+        const retained = parseBinding(pending.nextBinding)?.binding
+        if (pending.clearManual || !retained || isMachineSetupTokenBinding(retained) || retained.managedAccountId !== target) return failure('STALE', 'an earlier switch is still being saved')
+        return savePending(sessionId, session)
+      }
       if (pending.clearManual === confirmedOnly) return savePending(sessionId, session)
       if (!confirmedOnly) return failure('STALE', 'pending save belongs to another source transition')
       if (pending.indeterminate) return failure('PERSISTENCE_INDETERMINATE', 'resume authority requires recovery')
@@ -221,7 +228,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
         const held = await deps.setupTokenAccountIds!()
         if (!held.includes(target)) return { ok: false, reason: 'APPLY_REQUIRED' }
         if (disabled.includes(target)) return failure('NO_ACCOUNT', 'rebind: the chosen account is disabled on this PC')
-        exclude = [...new Set([...disabled, ...held.filter(id => id !== target)])]
+        exclude = [...new Set([...disabled, ...held, ...targetExclude].filter(id => id !== target))]
       }
       let response: Response, body: Record<string, unknown> | null
       while (true) {
@@ -555,7 +562,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       }
     },
     /** One switch per session at a time; a second request while one runs gets that one's answer. */
-    rebind(sessionId: string, running: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal, options: { startBudget?: true; startExhausted?: true; managedAccountId?: string } = {}): Promise<RebindResult> {
+    rebind(sessionId: string, running: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal, options: { startBudget?: true; startExhausted?: true; managedAccountId?: string; excludeManagedAccountIds?: string[] } = {}): Promise<RebindResult> {
       const shared = sharedSession(sessionId, running)
       if (shared === undefined) return Promise.resolve(failure('NOT_BOUND', `rebind: session ${sessionId} is not an unbound shared-PC session`))
       const parsed = parseBinding(running)
@@ -575,7 +582,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       // The running switch is not for the account the member chose: they ask again once it ends.
       if (pending) return options.managedAccountId ? Promise.resolve(failure('STALE', `rebind: session ${sessionId} is already switching`)) : pending
       const started = (shared ? sharedRebindOnce(sessionId, shared, options.startBudget ? () => sharedStartBudgetMove(sessionId, shared)
-        : () => shared.sharedMachine.rebind(shared.recorded, shared.behind ? undefined : observation)) : rebindOnce(sessionId, running, false, observation?.reason === 'authentication-failed' ? { kind: 'authentication', observedAt: observation.observedAt } : undefined, !!options.startBudget, !!options.startExhausted, options.managedAccountId)).finally(() => inFlight.delete(sessionId))
+        : () => shared.sharedMachine.rebind(shared.recorded, shared.behind ? undefined : observation)) : rebindOnce(sessionId, running, false, observation?.reason === 'authentication-failed' ? { kind: 'authentication', observedAt: observation.observedAt } : undefined, !!options.startBudget, !!options.startExhausted, options.managedAccountId, options.excludeManagedAccountIds)).finally(() => inFlight.delete(sessionId))
       inFlight.set(sessionId, started)
       return started
     },
