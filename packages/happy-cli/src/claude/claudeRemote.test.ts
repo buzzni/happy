@@ -2210,6 +2210,17 @@ describe('client-turn prompt blocks on a running provider', () => {
         expect(sent).toEqual([`${guide}\n\nhow do I open settings?`, 'thanks', `${guide}\n\nand the theme?`]);
     });
 
+    it('does not send a block the provider already holds in its system prompt', async () => {
+        const token = guide.split('\n')[0].replace('<!-- saycode:client-turn-prompt:', '').replace(':start -->', '');
+        const { sent, options } = await sentFor([
+            { message: 'first', mode: withGuide },
+            { message: 'again', mode: { ...withGuide, turnOnlyPromptTokens: [token] } },
+        ]);
+
+        expect(options.appendSystemPrompt).toContain(guide);
+        expect(sent).toEqual(['first', 'again']);
+    });
+
     it('keeps an attachment turn structured and a slash command first', async () => {
         const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAA' } };
         const { sent } = await sentFor([

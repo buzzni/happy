@@ -768,21 +768,20 @@ function readTurnText(content: unknown): string {
     // Push initial message
     let messages = new PushableAsyncIterable<SDKUserMessage>();
     /*
-     * Client-turn blocks this provider's system prompt does not hold, in front of the turn that carries
-     * them: the ones marked for one turn, and after the first turn the ones it was not started with — the
-     * launcher no longer restarts for those. In front of the lessons, which are reference for the request
-     * rather than instructions for the turn. A slash command stays the first input token, and the
-     * transient retry note joins a request that already carried its blocks.
+     * The client-turn blocks of a turn that this provider's system prompt does not hold, in front of
+     * that turn: the ones marked for one turn, and the ones it was not started with — the launcher no
+     * longer restarts for those. In front of the lessons, which are reference for the request rather
+     * than instructions for the turn. A slash command stays the first input token (the launcher
+     * restarts rather than keep a provider for a block such a turn adds), and the transient retry note
+     * joins a request that already carried its blocks.
      */
-    const withTurnPrompt = (raw: string | ContentBlockParam[], content: string | ContentBlockParam[], turnMode: EnhancedMode, first = false) => {
+    const withTurnPrompt = (raw: string | ContentBlockParam[], content: string | ContentBlockParam[], turnMode: EnhancedMode) => {
         if (isCommandInput(raw) || raw === CLAUDE_TRANSIENT_CONTINUE_PROMPT) return content;
-        const next = splitTurnOnlyPromptBlocks(turnMode.appendSystemPrompt, turnMode.turnOnlyPromptTokens);
-        const added = first ? undefined : clientTurnPromptChange(launchedPrompt.provider, next.provider).added;
-        const turnPrompt = [added, next.turnOnly].filter(Boolean).join('\n\n');
+        const turnPrompt = clientTurnPromptChange(launchedPrompt.provider, turnMode.appendSystemPrompt).added;
         if (!turnPrompt) return content;
         return typeof content === 'string' ? `${turnPrompt}\n\n${content}` : [{ type: 'text' as const, text: turnPrompt }, ...content];
     };
-    const initialContent = withTurnPrompt(initial.message, await withLessons(initial.message, preparation), initial.mode, true);
+    const initialContent = withTurnPrompt(initial.message, await withLessons(initial.message, preparation), initial.mode);
     activateTurnLatency(initial.latency, preparation);
     messages.push({
         type: 'user',

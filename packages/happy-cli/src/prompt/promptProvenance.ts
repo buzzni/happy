@@ -88,11 +88,15 @@ export function splitClientTurnPromptBlocks(prompt: string | undefined): { stand
   };
 }
 
-function clientTurnPromptBlocks(prompt: string | undefined): string[] {
+function clientTurnPromptBlockMatches(prompt: string | undefined): Array<{ block: string; at: number }> {
   if (!prompt) return [];
   return [...prompt.matchAll(CLIENT_TURN_BLOCK_CANDIDATE)]
-    .map((match) => match[0])
-    .filter((block) => stripClientTurnPromptBlocks(block) === undefined);
+    .map((match) => ({ block: match[0], at: match.index }))
+    .filter(({ block }) => stripClientTurnPromptBlocks(block) === undefined);
+}
+
+function clientTurnPromptBlocks(prompt: string | undefined): string[] {
+  return clientTurnPromptBlockMatches(prompt).map(({ block }) => block);
 }
 
 /**
@@ -134,16 +138,19 @@ export function splitTurnOnlyPromptBlocks(
   prompt: string | undefined,
   tokens: readonly string[] | undefined,
 ): { provider: string | undefined; turnOnly: string | undefined } {
-  const marked = tokens?.length ? clientTurnPromptBlocks(prompt).filter((block) => tokens.includes(clientTurnBlockToken(block))) : [];
+  const marked = tokens?.length
+    ? clientTurnPromptBlockMatches(prompt).filter(({ block }) => tokens.includes(clientTurnBlockToken(block)))
+    : [];
   if (!prompt || marked.length === 0) return { provider: prompt, turnOnly: undefined };
   let provider = prompt;
-  for (const block of marked) {
-    const at = provider.indexOf(block);
+  // Last block first, by position: earlier positions stay valid, and a copy of a block's text quoted
+  // inside a line is never taken for the block.
+  for (const { block, at } of [...marked].reverse()) {
     const before = provider.slice(0, at).replace(/\n+$/, '');
     const after = provider.slice(at + block.length).replace(/^\n+/, '');
     provider = before && after ? `${before}\n\n${after}` : before || after;
   }
-  return { provider: provider || undefined, turnOnly: marked.join('\n\n') };
+  return { provider: provider || undefined, turnOnly: marked.map(({ block }) => block).join('\n\n') };
 }
 
 /** For a log line: which part of the prompt differs. Block tokens are envelope checksums, never prompt text. */

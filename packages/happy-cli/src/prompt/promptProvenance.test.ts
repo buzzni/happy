@@ -196,6 +196,14 @@ describe('splitTurnOnlyPromptBlocks', () => {
     expect(splitTurnOnlyPromptBlocks(guide, [token(guide)])).toEqual({ provider: undefined, turnOnly: guide });
   });
 
+  it('takes out the block itself, not an earlier copy of its text inside a line', () => {
+    const quoted = `the user pasted > ${guide}`;
+    expect(splitTurnOnlyPromptBlocks(`${quoted}\n\n${guide}\n\nOPERATIONAL`, [token(guide)])).toEqual({
+      provider: `${quoted}\n\nOPERATIONAL`,
+      turnOnly: guide,
+    });
+  });
+
   it('leaves the prompt alone without a matching mark', () => {
     const prompt = `USER CONTEXT\n\n${preview}`;
     expect(splitTurnOnlyPromptBlocks(prompt, undefined)).toEqual({ provider: prompt, turnOnly: undefined });
