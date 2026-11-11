@@ -4554,6 +4554,32 @@ it('refuses owner rotation with a Claude CLI whose refresh lock protocol is not 
   await expect(state.runtime.refreshClaudeOwner({ provider: 'claude' })).rejects.toThrow('CLAUDE_REFRESH_OWNER_UNSUPPORTED')
 })
 
+it.each(['2.1.218 (Claude Code)', '2.2.0 (Claude Code)', '3.0.1 (Claude Code)'])('accepts owner rotation on Claude CLI %s, at or after the verified lock protocol', async (version) => {
+  const ownerPayload = JSON.stringify({ version: 1, encrypted: false, accounts: [{ number: 1, email: 'a@example.com',
+    credentials: { claudeAiOauth: { accessToken: 'fake-access', expiresAt: 9999999999999, saycodeRefreshOwnerVersion: 1 } } }] })
+  const state = setup({ execFile: vi.fn(async (command, args) => ({ stdout: command === 'claude' ? version
+    : args[1] === 'capabilities' ? JSON.stringify({ claudeRefreshOwnerVersion: 1 }) : ownerPayload, stderr: '' })) })
+  await expect(state.runtime.refreshClaudeOwner({ provider: 'claude' })).resolves.toEqual({ provider: 'claude', payload: ownerPayload })
+})
+
+it('refuses owner rotation on 2.0.x even with a later patch number', async () => {
+  const state = setup({ execFile: vi.fn(async (command) => ({ stdout: command === 'claude' ? '2.0.999 (Claude Code)' : JSON.stringify({ claudeRefreshOwnerVersion: 1 }), stderr: '' })) })
+  await expect(state.runtime.refreshClaudeOwner({ provider: 'claude' })).rejects.toThrow('CLAUDE_REFRESH_OWNER_UNSUPPORTED')
+})
+
+it('captures API keys and setup tokens without requiring a Claude CLI, since nothing is rotated', async () => {
+  const payload = JSON.stringify({ version: 1, encrypted: false, accounts: [
+    { number: 1, email: 'api@example.com', credentials: 'sk-ant-api-fake' },
+    { number: 2, email: 'setup@example.com', credentials: { claudeAiOauth: { accessToken: 'sk-ant-oat01-fake' } } }] })
+  const execFile = vi.fn(async (command: string, args: string[]) => {
+    if (command === 'claude') throw Object.assign(new Error('not found'), { kind: 'COMMAND_NOT_AVAILABLE' })
+    return { stdout: args[1] === 'capabilities' ? JSON.stringify({ claudeRefreshOwnerVersion: 1 }) : payload, stderr: '' }
+  })
+  const state = setup({ execFile })
+  await expect(state.runtime.capture({ provider: 'claude', refreshOwner: true })).resolves.toMatchObject({ provider: 'claude', payload })
+  expect(execFile.mock.calls.some(([command]) => command === 'claude')).toBe(false)
+})
+
 it('updates an installed owner bearer without probing or changing a personal account and keeps its disabled flag', async () => {
   const owner = (expiresAt: number) => ({ number: 1, email: 'owner@example.com', organizationUuid: '',
     credentials: { claudeAiOauth: { accessToken: `fake-${expiresAt}`, expiresAt, saycodeRefreshOwnerVersion: 1 } },

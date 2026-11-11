@@ -507,9 +507,11 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     }
     let payload: string
     if (selected === 'claude') {
-      if (input.refreshOwner) { await assertClaudeRefreshOwner(); await assertClaudeOwnerCli() }
+      if (input.refreshOwner) await assertClaudeRefreshOwner()
       const result = await deps.execFile('cswap', input.refreshOwner ? ['oauth-owner', 'export'] : ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES })
       payload = result.stdout
+      // Only subscription logins are rotated on this source; API keys and setup tokens need no Claude CLI.
+      if (input.refreshOwner && hasClaudeOwnerAccounts(payload)) await assertClaudeOwnerCli()
       // A subscription login's access token shares the setup-token prefix, so the refresh grant itself decides.
       if (!input.refreshOwner && (hasClaudeSubscriptionAccounts(payload) || containsClaudeRefreshSecret(payload))) throw new AiCredentialRuntimeError('CLAUDE_REFRESH_OWNER_UNSUPPORTED')
       if (input.refreshOwner && !holdsNoClaudeRefreshToken(payload)) throw new AiCredentialRuntimeError('CLAUDE_REFRESH_TOKEN_EXPORTED')
@@ -643,8 +645,10 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   }
 
   async function assertClaudeOwnerCli(): Promise<void> {
-    const version = (await deps.execFile('claude', ['--version'], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })).stdout.match(/\b2\.1\.(\d+)\b/)
-    if (!version || Number(version[1]) < 218) throw new AiCredentialRuntimeError('CLAUDE_REFRESH_OWNER_UNSUPPORTED')
+    // cswap's credential locks follow the protocol verified in 2.1.218; later releases keep rotating rather than stopping every source.
+    const version = (await deps.execFile('claude', ['--version'], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })).stdout.match(/\b(\d+)\.(\d+)\.(\d+)\b/)
+    const [major, minor, patch] = version ? version.slice(1).map(Number) : []
+    if (!version || major! < 2 || major === 2 && (minor! < 1 || minor === 1 && patch! < 218)) throw new AiCredentialRuntimeError('CLAUDE_REFRESH_OWNER_UNSUPPORTED')
   }
 
   async function refreshClaudeOwner(input: { provider: 'claude'; thresholdMs?: number }) {
