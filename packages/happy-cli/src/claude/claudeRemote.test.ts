@@ -14,6 +14,7 @@ import { CLAUDE_TRANSIENT_CONTINUE_PROMPT } from './claudeTransientRetry';
 import { mergeUsageLimits, type UsageLimitsPatch } from './utils/usageLimits';
 import type { UsageLimits } from '@/api/types';
 import { getProjectPath } from './utils/path';
+import { wrapClientTurnPrompt } from '@slopus/happy-wire';
 
 vi.mock('@/claude/sdk', () => ({
     query: vi.fn(),
@@ -2134,6 +2135,93 @@ describe('lessons at the provider boundary', () => {
     });
 });
 
+
+describe('client-turn prompt blocks on a running provider', () => {
+    /*
+     * The system prompt is fixed when the provider starts. A block that only a later
+     * turn carries has to reach the model with that turn, or the launcher would have to
+     * restart the provider for it — seconds before the first token of that turn.
+     */
+    const preview = wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT')!;
+    const guide = wrapClientTurnPrompt('DESKTOP GUIDE PROMPT')!;
+    const started: EnhancedMode = { permissionMode: 'default', appendSystemPrompt: `USER CONTEXT\n\n${preview}` };
+    const withGuide: EnhancedMode = { ...started, appendSystemPrompt: `USER CONTEXT\n\n${preview}\n\n${guide}` };
+
+    async function sentFor(inputs: Array<{ message: unknown; mode: EnhancedMode }>) {
+        const sent: unknown[] = [];
+        let options: any;
+        vi.mocked(query).mockImplementation((args: any) => {
+            options = args.options;
+            return {
+                setPermissionMode: vi.fn(),
+                mcpServerStatus: vi.fn(async () => []),
+                async *[Symbol.asyncIterator]() {
+                    for await (const message of args.prompt) {
+                        sent.push((message as any).message.content);
+                        yield { type: 'result', subtype: 'success' } as any;
+                    }
+                },
+            } as any;
+        });
+        let index = 0;
+        await claudeRemote({
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            nextMessage: async () => (inputs[index++] as any) ?? null,
+            onReady: vi.fn(),
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage: vi.fn(),
+        });
+        return { sent, options };
+    }
+
+    beforeEach(() => {
+        vi.mocked(query).mockReset();
+    });
+
+    it('sends a block the provider did not start with along with the turn that carries it', async () => {
+        const { sent, options } = await sentFor([
+            { message: 'first', mode: started },
+            { message: 'how do I open settings?', mode: withGuide },
+            { message: 'thanks', mode: started },
+        ]);
+
+        expect(options.appendSystemPrompt).toContain(preview);
+        expect(options.appendSystemPrompt).not.toContain(guide);
+        expect(sent).toEqual(['first', `${guide}\n\nhow do I open settings?`, 'thanks']);
+    });
+
+    it('never puts a block marked for one turn into the system prompt, even on the turn that starts the provider', async () => {
+        const token = guide.split('\n')[0].replace('<!-- saycode:client-turn-prompt:', '').replace(':start -->', '');
+        const marked: EnhancedMode = { ...withGuide, turnOnlyPromptTokens: [token] };
+        const { sent, options } = await sentFor([
+            { message: 'how do I open settings?', mode: marked },
+            { message: 'thanks', mode: started },
+            { message: 'and the theme?', mode: marked },
+        ]);
+
+        expect(options.appendSystemPrompt).toContain(preview);
+        expect(options.appendSystemPrompt).not.toContain(guide);
+        expect(sent).toEqual([`${guide}\n\nhow do I open settings?`, 'thanks', `${guide}\n\nand the theme?`]);
+    });
+
+    it('keeps an attachment turn structured and a slash command first', async () => {
+        const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAA' } };
+        const { sent } = await sentFor([
+            { message: 'first', mode: started },
+            { message: [{ type: 'text', text: 'what is this?' }, image], mode: withGuide },
+            { message: '/compact', mode: withGuide },
+        ]);
+
+        expect(sent[1]).toEqual([{ type: 'text', text: guide }, { type: 'text', text: 'what is this?' }, image]);
+        expect(sent[2]).toBe('/compact');
+    });
+});
 
 describe('claudeRemote channel-origin slash handling', () => {
     beforeEach(() => {

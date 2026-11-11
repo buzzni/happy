@@ -1727,6 +1727,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             fallbackModel: messageFallbackModel,
             customSystemPrompt: messageCustomSystemPrompt,
             appendSystemPrompt: messageAppendSystemPrompt,
+            turnOnlyPromptTokens: message.meta?.turnOnlyPromptTokens,
             saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
             saycodePromptBlocks: messagePromptBlocks.turn,
             allowedTools: messageAllowedTools,
