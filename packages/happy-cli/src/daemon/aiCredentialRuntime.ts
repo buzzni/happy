@@ -510,7 +510,8 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       if (input.refreshOwner) { await assertClaudeRefreshOwner(); await assertClaudeOwnerCli() }
       const result = await deps.execFile('cswap', input.refreshOwner ? ['oauth-owner', 'export'] : ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES })
       payload = result.stdout
-      if (!input.refreshOwner && hasClaudeSubscriptionAccounts(payload)) throw new AiCredentialRuntimeError('CLAUDE_REFRESH_OWNER_UNSUPPORTED')
+      // A subscription login's access token shares the setup-token prefix, so the refresh grant itself decides.
+      if (!input.refreshOwner && (hasClaudeSubscriptionAccounts(payload) || containsClaudeRefreshSecret(payload))) throw new AiCredentialRuntimeError('CLAUDE_REFRESH_OWNER_UNSUPPORTED')
       if (input.refreshOwner && !holdsNoClaudeRefreshToken(payload)) throw new AiCredentialRuntimeError('CLAUDE_REFRESH_TOKEN_EXPORTED')
     } else {
       const packageVersion = await assertSupportedCodexMultiAuthInstalled()

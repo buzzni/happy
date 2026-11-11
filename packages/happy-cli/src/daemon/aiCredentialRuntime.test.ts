@@ -4525,6 +4525,13 @@ describe('Claude OAuth refresh owner', () => {
     await expect(state.runtime.capture({ provider: 'claude', refreshOwner: true })).rejects.toThrow('CLAUDE_REFRESH_OWNER_UNSUPPORTED')
     expect(state.calls.some(call => call.args[0] === 'export')).toBe(false)
   })
+  it('refuses a legacy capture of a subscription login whose access token shares the setup-token prefix', async () => {
+    const payload = JSON.stringify({ version: 1, encrypted: false, activeAccountNumber: 1, accounts: [{ number: 1, email: 'a@example.com',
+      credentials: { claudeAiOauth: { accessToken: 'sk-ant-oat01-fake-access', refreshToken: 'sk-ant-ort01-fake-refresh', expiresAt: 9999999999999, subscriptionType: 'max' } },
+      config: { oauthAccount: { emailAddress: 'a@example.com' } } }] })
+    const state = setup({ execFile: vi.fn(async () => ({ stdout: payload, stderr: '' })) })
+    await expect(state.runtime.capture({ provider: 'claude' })).rejects.toThrow('CLAUDE_REFRESH_OWNER_UNSUPPORTED')
+  })
   it('checks access-only output on both collection and renewal', async () => {
     const execFile = vi.fn(async (_command: string, args: string[]) => ({ stdout: _command === 'claude' ? '2.1.323 (Claude Code)' : args[1] === 'capabilities'
       ? JSON.stringify({ claudeRefreshOwnerVersion: 1 }) : ownerPayload, stderr: '' }))
