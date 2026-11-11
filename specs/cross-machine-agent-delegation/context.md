@@ -1,7 +1,7 @@
 ---
 기능: cross-machine-agent-delegation
-상태: 진행중 — 위임 lane #1183 머지됨. Phase 5 제한 relay(A7·A8, 2026-11-10 승인) 구현, PR 단계(H13)
-마지막 갱신: 2026-11-10
+상태: 진행중 — 위임 lane #1183·제한 relay #1232 머지됨. saycode-cli 0.9.17 묶음과 안내 줄(H14)은 .410 릴리스 PR #1237
+마지막 갱신: 2026-11-11
 ---
 
 # 다른 작업PC로 위임 — 데몬 위임 lane Context
