@@ -28,6 +28,9 @@ import { pageViewerScript } from './pageViewer'
  * on the Studio origin: requests go to it addressed to each configured
  * `hostOrigins` entry (so another opener never hears them), and an answer is
  * accepted only from `window.opener` on one of those origins.
+ * Web protocol v1 also supports an allowlisted cross-origin parent: ready → scope → scoped → capability.
+ * Each document has a fresh connectionId; scope arrives over postMessage because the relay removes queries.
+ * The session is a display filter only. Runtime capability/profile checks remain the authority boundary.
  *
  * Look and language follow Saycode Desktop (docs/STYLEGUIDE.md): the same semantic colour
  * tokens, type scale, radii and shadows, light or dark by `?theme=` or the system scheme, and
@@ -369,6 +372,20 @@ Object.assign(M.en,{modeLabel:'Approval mode',manualMode:'Manual',autoOff:'Turn 
 Object.assign(M.ko,{modeLabel:'승인 방식',manualMode:'수동',autoOff:'Auto 끄기',autoTitle:'이 작업에서 Auto를 켤까요?',autoExplanation:'접기·펼치기와 탭 전환은 자동으로 진행해요. 전송·삭제·불명확한 조작은 계속 확인하고, 이미 대기 중인 승인은 그대로 둬요.',autoExpiry:'현재 작업과 선택한 사이트에만 연결 만료까지 적용해요. 런타임을 다시 시작하면 꺼져요.',autoCancel:'취소',autoConfirm:'Auto 켜기',autoUnavailable:'이 런타임에서는 Auto를 사용할 수 없어요.',autoNoSites:'이 작업에서 페이지를 먼저 확인한 뒤 Auto를 켜세요.',autoFailed:'Auto를 바꾸지 못했어요. 작업을 확인하고 다시 시도하세요.',autoScope:'사이트',autoTaskEntry:'이 작업에서 Auto 켜기'});
 var modeBusy=false,modeDialogTask=null,modeTimer=null,modeTrigger='autoMode';
 var taskSession=new URLSearchParams(location.search).get('agentSessionId');
+// Web relay removes query parameters before this script runs. Bind scope explicitly before handing off authority.
+var hostConnectionId=crypto.randomUUID(),hostScope=null;
+function webHost(event){return HOST_ORIGINS.indexOf(event.origin)>=0&&
+ ((window.parent!==window&&event.source===window.parent)||(!!window.opener&&event.source===window.opener))}
+function announceWebHost(){HOST_ORIGINS.forEach(function(origin){var msg={type:'abp-console-ready',protocolVersion:1,connectionId:hostConnectionId};
+ if(window.parent!==window)window.parent.postMessage(msg,origin);
+ if(window.opener)window.opener.postMessage(msg,origin)})}
+window.addEventListener('message',function(event){var d=event.data;
+ if(!webHost(event)||!d||d.type!=='abp-console-scope'||d.protocolVersion!==1||d.connectionId!==hostConnectionId
+ ||typeof d.agentSessionId!=='string'||!d.agentSessionId.trim()||d.agentSessionId.length>256)return;
+ if(hostScope&&hostScope!==d.agentSessionId)return;
+ hostScope=d.agentSessionId;taskSession=hostScope;
+ event.source.postMessage({type:'abp-console-scoped',protocolVersion:1,connectionId:hostConnectionId,agentSessionId:hostScope},event.origin)
+});
 var T=M[LANG];document.documentElement.lang=LANG;
 if(NATIVE_SCREEN){document.body.classList.add('native-window');$('openScreen').hidden=true;$('viewGroup').hidden=true;
  Object.assign(T,LANG==='ko'?{screenHint:'직접 조작하기 전 제어권을 가져오세요.',screenEmptyTitle:'작업 PC의 Chrome 창에서 확인하세요',
@@ -421,11 +438,11 @@ menuName();
 capPill(T.notConnected);$('tasks').textContent=T.notConnected;$('task').textContent=T.notConnected;
 function rid(){return (crypto.randomUUID?crypto.randomUUID():String(Date.now())+Math.random())}
 function decodePart(p){try{return JSON.parse(atob(p.replace(/-/g,'+').replace(/_/g,'/')))}catch(e){return null}}
-function askHost(){clearTimeout(S.renewTimer);window.parent.postMessage({type:'abp-capability-request'},location.origin);
+function askHost(){clearTimeout(S.renewTimer);announceWebHost();window.parent.postMessage({type:'abp-capability-request'},location.origin);
  if(window.opener)HOST_ORIGINS.forEach(function(o){try{window.opener.postMessage({type:'abp-capability-request'},o)}catch(e){}});
  if(!S.token)capPill(T.waitingHost);
  S.renewTimer=setTimeout(askHost,RENEW_RETRY_MS)}
-function fromHost(event){return (event.source===window.parent&&event.origin===location.origin)
+function fromHost(event){return (webHost(event)&&!!hostScope)||(event.source===window.parent&&event.origin===location.origin)
  ||(!!window.opener&&event.source===window.opener&&HOST_ORIGINS.indexOf(event.origin)>=0)}
 function hhmm(ms){var d=new Date(ms);return isFinite(d.getTime())?d.toLocaleTimeString(LANG==='ko'?'ko-KR':'en-US',{hour:'2-digit',minute:'2-digit'}):''}
 function setCapability(token,expiresAtMs){var renewal=!!S.token&&S.token!==token;
@@ -445,6 +462,7 @@ function scheduleRenewal(){clearTimeout(S.renewTimer);if(!S.expiresAtMs)return;
 window.addEventListener('message',function(event){
  if(!fromHost(event))return;
  var d=event.data;if(!d||d.type!=='abp-capability'||typeof d.token!=='string'||typeof d.expiresAtMs!=='number')return;
+ if(webHost(event)&&hostScope&&(d.protocolVersion!==1||d.connectionId!==hostConnectionId||d.agentSessionId!==hostScope))return;
  // The first capability lists the tasks; a renewal lists them again only when the last attempt failed (the alert is up).
  if(PAGE_VIEW&&pageViewer&&pageViewer.inputBusy())return; // Host retries renewal; pending input keeps its original authority.
  if(PAGE_VIEW&&pageCapability(d.token))return;

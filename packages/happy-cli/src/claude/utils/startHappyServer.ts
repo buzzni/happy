@@ -563,6 +563,10 @@ const BROWSER_TASK_UNAVAILABLE_ACTIONS: Record<string, string> = {
 };
 
 function createBrowserTaskRuntimeClient(client: ApiSessionClient, profileId: string, approver?: () => PolicyApprover | null): { runtime: RuntimeClient; profileId: string | (() => Promise<string>); localClients?: LocalClientSession } | undefined {
+    const onTaskCreated = () => {
+        if (client.getMetadata()?.agentBrowserUsed === true) return;
+        client.updateMetadata((metadata) => ({ ...metadata, agentBrowserUsed: true }));
+    };
     const baseUrl = process.env.HAPPY_BROWSER_TASK_RUNTIME_URL;
     if (!baseUrl) return undefined;
     const socketPath = process.env.HAPPY_BROWSER_TASK_BROKER_SOCKET;
@@ -577,7 +581,7 @@ function createBrowserTaskRuntimeClient(client: ApiSessionClient, profileId: str
             agentSessionId: () => client.sessionId,
             profileId,
         });
-        return { runtime: new RuntimeClient({ baseUrl, token: grants }), profileId: grants.grantedProfileId,
+        return { runtime: new RuntimeClient({ baseUrl, token: grants, onTaskCreated }), profileId: grants.grantedProfileId,
             ...(approver ? { localClients: createLocalClientSession({ socketPath, sessionSecret, runtimeUrl: baseUrl,
                 cwd: client.getMetadata()?.path ?? process.cwd(), profileId: grants.grantedProfileId, approver }) } : {}) };
     }
@@ -592,7 +596,7 @@ function createBrowserTaskRuntimeClient(client: ApiSessionClient, profileId: str
         if (!grant.trim()) throw new BrowserRuntimeError('UNAUTHORIZED', unavailable);
         return grant.trim();
     };
-    return { runtime: new RuntimeClient({ baseUrl, token }), profileId };
+    return { runtime: new RuntimeClient({ baseUrl, token, onTaskCreated }), profileId };
 }
 
 /** Env var Claude expands in the TCP MCP header; the name avoids the credential filter's `_TOKEN` suffix. */

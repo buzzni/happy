@@ -181,6 +181,7 @@
     "dotenv": "^16.6.1",
     "eslint": "^9",
     "eslint-config-prettier": "^10",
+    "jsdom": "29.1.1",
     "pkgroll": "^2.14.2",
     "shx": "^0.3.3",
     "ts-node": "^10",
