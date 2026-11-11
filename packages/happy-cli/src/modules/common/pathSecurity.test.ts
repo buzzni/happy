@@ -1,5 +1,5 @@
 import { afterEach, describe, it, expect } from 'vitest';
-import { dirname, join, resolve } from 'path';
+import { dirname, join, parse, resolve } from 'path';
 import { configuration } from '@/configuration';
 import { validatePath } from './pathSecurity';
 
@@ -44,6 +44,13 @@ describe('validatePath', () => {
         expect(validatePath(resolve('/srv/workspace-other'), workingDir, approved).valid).toBe(false);
         expect(validatePath(resolve('/srv/workspace/../secrets'), workingDir, approved).valid).toBe(false);
         expect(validatePath('../../../srv/workspace/x', workingDir, approved).valid).toBe(true);
+    });
+
+    it('should allow every path below an approved drive or filesystem root', () => {
+        const root = parse(resolve('/')).root;
+
+        expect(validatePath(resolve('/srv/workspace/x'), workingDir, [root]).valid).toBe(true);
+        expect(validatePath(root, workingDir, [root]).valid).toBe(true);
     });
 
     it('should allow the working directory itself', () => {

@@ -1,6 +1,7 @@
 import { manualPersonalSelectionSchema, MANUAL_PERSONAL_ENV, type ManualPersonalSelection } from './manualPersonalClaude'
 import { MachineSetupTokenBindingV2Schema, parseCanonicalOrgSetupTokenJson, type MachineSetupTokenBindingV2 } from '@slopus/happy-wire'
 import { randomBytes } from 'node:crypto'
+import { isAbsolute } from 'node:path'
 import { z } from 'zod'
 /**
  * Session spawn environments: what a daemon-spawned child gets explicitly on
@@ -19,7 +20,7 @@ import {
     resolveAppliedAiAuthSource,
     type AiAuthSource,
 } from '@/usage/aiAuthSource'
-import { ADDITIONAL_DIRECTORIES_ENV, readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv'
+import { ADDITIONAL_DIRECTORIES_ENV, APPROVED_WRITE_ROOTS_ENV, readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv'
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars'
 import { normalizeSessionSource, SESSION_SOURCE_ENV } from '@/utils/sessionSource'
 import { DELEGATED_ATTENDANCE_ENV, parseDelegatedAttendance } from '@/api/turnAttendance'
@@ -68,7 +69,7 @@ export const BROWSER_CONTINUATION_ENV = 'HAPPY_AUTOMATION_BROWSER_CONTINUATION'
  */
 const AGENT_PLAN_SEED_KEYS = [AGENT_PLAN_DESCRIPTOR_ENV, AGENT_PLAN_SECRET_ENV, AGENT_PLAN_THREADS_DIR_ENV] as const
 type AgentPlanSeedKey = typeof AGENT_PLAN_SEED_KEYS[number]
-type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | typeof ORG_ENDPOINT_BINDING_ENV | typeof ORG_ENDPOINT_UNREPORTED_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV | AgentPlanSeedKey
+type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | typeof ORG_ENDPOINT_BINDING_ENV | typeof ORG_ENDPOINT_UNREPORTED_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof APPROVED_WRITE_ROOTS_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV | AgentPlanSeedKey
 
 export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey | typeof DAEMON_AGENT_GRANT_STATE_ENV, string>>
 
@@ -335,6 +336,9 @@ export function captureSaycodeAgentEnvironment(
     if (additionalDirectories !== undefined && isValidAdditionalDirectories(additionalDirectories)) {
         captured[ADDITIONAL_DIRECTORIES_ENV] = additionalDirectories
     }
+    // Likewise the folders the machine owner approved, so a resume withdraws a revoked one (aplus specs/approved-folder-roots R11).
+    const approvedWriteRoots = env[APPROVED_WRITE_ROOTS_ENV]
+    if (approvedWriteRoots !== undefined && isValidApprovedWriteRoots(approvedWriteRoots)) captured[APPROVED_WRITE_ROOTS_ENV] = approvedWriteRoots
     // A structured session keeps its schema across a resume (claude-cli-benchmark-followups R2); the
     // runner consumes the seed again. Only a format that still parses is kept.
     const outputFormat = env[OUTPUT_FORMAT_ENV]
@@ -452,6 +456,16 @@ export function readSetupTokenResumeSelection(agentEnvironment: SaycodeAgentEnvi
     const { managedAccountId, credentialGeneration, groupScope } = binding
     return { selection: { kind: 'claude-setup-token', managedAccountId, groupScope, credentialGeneration,
         ...(!isMachineSetupTokenBinding(binding) && binding.tokenProof ? { credentialProofVersion: 1 as const } : {}) }, binding }
+}
+
+function isValidApprovedWriteRoots(value: string): boolean {
+    try {
+        const parsed = JSON.parse(value) as unknown
+        const paths = (field: unknown) => Array.isArray(field) && field.length <= 64 && field.every((path) => typeof path === 'string' && isAbsolute(path))
+        return !!parsed && typeof parsed === 'object' && paths((parsed as { write?: unknown }).write) && paths((parsed as { deny?: unknown }).deny)
+    } catch {
+        return false
+    }
 }
 
 function isValidAdditionalDirectories(value: string): boolean {

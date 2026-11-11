@@ -3,6 +3,7 @@ import {
   mergeAdditionalDirectoriesIntoSandboxEnvironment,
   readAdditionalDirectoriesEnvironment,
   replaceAdditionalDirectoriesInEnvironment,
+  replaceApprovedWriteRootsInEnvironment,
 } from './additionalDirectoriesEnv'
 
 describe('additional directories child environment', () => {
@@ -68,5 +69,36 @@ describe('additional directories child environment', () => {
     replaceAdditionalDirectoriesInEnvironment(env, ['/repo/app'])
 
     expect(JSON.parse(env.HAPPY_PROJECT_SANDBOX_CONFIG).extraWritePaths).toEqual(['/tmp', '/repo/old', '/repo/app'])
+  })
+})
+
+// aplus-dev-studio specs/approved-folder-roots R11: approved folders are writable without a per-chat approval.
+describe('approved folders in the session sandbox', () => {
+  const sandbox = (config: object) => ({ HAPPY_PROJECT_SANDBOX_CONFIG: JSON.stringify(config) } as Record<string, string>)
+  const config = (env: Record<string, string>) => JSON.parse(env.HAPPY_PROJECT_SANDBOX_CONFIG)
+
+  it('makes approved folders writable while keeping the credential homes unwritable', () => {
+    const env = sandbox({ extraWritePaths: ['/tmp'], denyWritePaths: ['.env'] })
+
+    replaceApprovedWriteRootsInEnvironment(env, ['/Volumes/work'], ['/Users/me/.happy'], '/Users/me')
+
+    expect(config(env)).toMatchObject({ extraWritePaths: ['/tmp', '/Volumes/work'], denyWritePaths: ['.env', '/Users/me/.happy'] })
+  })
+
+  it('swaps only what it added for the current list on resume, and leaves project policy alone', () => {
+    const env = sandbox({ extraWritePaths: ['/tmp', '/shared'], denyWritePaths: ['.env'] })
+    replaceApprovedWriteRootsInEnvironment(env, ['/shared', '/Volumes/old'], ['/Users/me/.happy'], '/Users/me')
+
+    replaceApprovedWriteRootsInEnvironment(env, ['/Volumes/new'], ['/Users/me/.happy'], '/Users/me')
+    expect(config(env)).toMatchObject({ extraWritePaths: ['/tmp', '/shared', '/Volumes/new'], denyWritePaths: ['.env', '/Users/me/.happy'] })
+
+    replaceApprovedWriteRootsInEnvironment(env, [], ['/Users/me/.happy'], '/Users/me')
+    expect(config(env)).toMatchObject({ extraWritePaths: ['/tmp', '/shared'], denyWritePaths: ['.env'] })
+  })
+
+  it('changes nothing for a session without a sandbox', () => {
+    const env: Record<string, string> = {}
+    replaceApprovedWriteRootsInEnvironment(env, ['/Volumes/work'], ['/Users/me/.happy'], '/Users/me')
+    expect(env).toEqual({})
   })
 })

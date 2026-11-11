@@ -55,6 +55,7 @@ async function defaultRunCommand(command: GithubTriggerWorktreeCommand): Promise
     const env = { ...process.env, ...command.environmentVariables }
     const result = await execFileAsync(command.executable, args, {
       cwd: command.cwd,
+      windowsHide: true,
       env: {
         ...env,
         GIT_OPTIONAL_LOCKS: '0',

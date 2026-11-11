@@ -10,7 +10,7 @@
  * must apply to the running daemon without a restart.
  */
 import { readFileSync } from 'node:fs';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 
 export const APPROVED_FOLDERS_FILE = 'approved-folders.json';
 
@@ -26,7 +26,6 @@ export function readApprovedFolders(happyHomeDir: string): string[] {
     if (!Array.isArray(folders)) return [];
     return folders
         .filter((folder): folder is string => typeof folder === 'string' && isAbsolute(folder))
-        .map((folder) => resolve(folder))
-        // A drive or filesystem root would open the whole disk.
-        .filter((folder) => dirname(folder) !== folder);
+        // A drive or filesystem root is kept: the owner chose it in Saycode settings (specs/approved-folder-roots R9).
+        .map((folder) => resolve(folder));
 }

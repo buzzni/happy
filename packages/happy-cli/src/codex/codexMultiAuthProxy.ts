@@ -95,7 +95,7 @@ async function startSupportedRuntimeRotationProxy(options: {
   clientApiKey: string
   quotaRemainingPercentThreshold: number
 }): Promise<ProxyServer> {
-  const { stdout } = await execFile('npm', ['root', '--global'])
+  const { stdout } = await execFile('npm', ['root', '--global'], { windowsHide: true })
   const globalRoot = nonEmpty(stdout)
   if (!globalRoot) throw new Error('npm global package root is unavailable')
   const packageRoot = join(globalRoot, 'codex-multi-auth')

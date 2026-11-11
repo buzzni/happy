@@ -1,4 +1,5 @@
 import { isAbsolute } from 'node:path'
+import { isUnsafeMandatoryWriteScope } from '@/sandbox/sandboxPolicy'
 
 export const ADDITIONAL_DIRECTORIES_ENV = 'HAPPY_ADDITIONAL_DIRECTORIES'
 
@@ -65,4 +66,42 @@ export function replaceAdditionalDirectoriesInEnvironment(
   }
   env[ADDITIONAL_DIRECTORIES_ENV] = JSON.stringify(next)
   mergeAdditionalDirectoriesIntoSandboxEnvironment(env, next)
+}
+
+export const APPROVED_WRITE_ROOTS_ENV = 'HAPPY_APPROVED_WRITE_ROOTS'
+
+/**
+ * aplus-dev-studio specs/approved-folder-roots R11: folders the machine owner approved are writable in the
+ * session sandbox without a per-chat approval, and the credential homes in `denied` stay unwritable.
+ * Records exactly what it added, so the next spawn or resume swaps it for the current list and never
+ * removes an entry the project policy already had. A filesystem root or the home folder is not granted:
+ * writing anywhere there is no sandbox at all, and a mandatory session refuses to start with it.
+ */
+export function replaceApprovedWriteRootsInEnvironment(
+  env: Record<string, string>,
+  approved: readonly string[],
+  denied: readonly string[],
+  homeDir: string,
+): void {
+  const roots = approved.filter((root) => !isUnsafeMandatoryWriteScope([root], homeDir))
+  if (env.HAPPY_PROJECT_SANDBOX_CONFIG === undefined) return
+  const config = JSON.parse(env.HAPPY_PROJECT_SANDBOX_CONFIG) as Record<string, unknown>
+  if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('Invalid project sandbox config')
+  const strings = (value: unknown) => Array.isArray(value) ? value.filter((path): path is string => typeof path === 'string') : []
+  let previous: { write: string[]; deny: string[] } = { write: [], deny: [] }
+  try {
+    const parsed = JSON.parse(env[APPROVED_WRITE_ROOTS_ENV] ?? '{}') as Record<string, unknown>
+    previous = { write: strings(parsed.write), deny: strings(parsed.deny) }
+  } catch { /* An unreadable record withdraws nothing. */ }
+  const write = strings(config.extraWritePaths).filter((path) => !previous.write.includes(path))
+  const deny = strings(config.denyWritePaths).filter((path) => !previous.deny.includes(path))
+  const added = {
+    write: roots.filter((path, index) => !write.includes(path) && roots.indexOf(path) === index),
+    deny: roots.length ? denied.filter((path, index) => !deny.includes(path) && denied.indexOf(path) === index) : [],
+  }
+  config.extraWritePaths = [...write, ...added.write]
+  config.denyWritePaths = [...deny, ...added.deny]
+  env.HAPPY_PROJECT_SANDBOX_CONFIG = JSON.stringify(config)
+  if (added.write.length || added.deny.length) env[APPROVED_WRITE_ROOTS_ENV] = JSON.stringify(added)
+  else delete env[APPROVED_WRITE_ROOTS_ENV]
 }
