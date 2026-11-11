@@ -2234,6 +2234,10 @@ export class CodexAppServerClient {
                 if (cursor !== null || !(error instanceof Error && error.message.includes('unknown variant `thread/turns/list`'))) throw error;
                 return (await this.readThread({ threadId, includeTurns: true })).thread.turns ?? [];
             }
+            // A Codex that ignores itemsView silently pages its summary view, which drops items.
+            if (cursor === null && page.data.some(turn => turn.itemsView !== 'full')) {
+                return (await this.readThread({ threadId, includeTurns: true })).thread.turns ?? [];
+            }
             turns.push(...page.data);
             cursor = page.nextCursor;
         } while (cursor);

@@ -1963,7 +1963,7 @@ describe('CodexAppServerClient sandbox integration', () => {
 
     it('reads a long thread history one turn per output line', async () => {
         const requests: MockRpcMessage[] = [];
-        const turns = ['turn-1', 'turn-2'].map(id => ({ id, items: [
+        const turns = ['turn-1', 'turn-2'].map(id => ({ id, itemsView: 'full', items: [
             { type: 'commandExecution', id: `exec-${id}`, command: 'cat big.log', aggregatedOutput: 'x'.repeat(5 * 1024 * 1024) },
         ] }));
         mockSpawn.mockImplementation(() => createMockProcess({
@@ -2014,6 +2014,29 @@ describe('CodexAppServerClient sandbox integration', () => {
         await expect(client.readThreadTurns('thread-old')).resolves.toEqual([{ id: 'turn-1', items: [] }]);
         expect(requests.map(({ method }) => method)).toEqual(['thread/turns/list', 'thread/read']);
         expect(requests[1].params).toEqual({ threadId: 'thread-old', includeTurns: true });
+
+        await client.disconnect();
+    });
+
+    it('reads the whole thread when Codex pages only turn summaries', async () => {
+        const requests: MockRpcMessage[] = [];
+        const full = { id: 'turn-1', items: [{ type: 'userMessage', id: 'user-1', content: [] }, { type: 'commandExecution', id: 'exec-1', command: 'ls' }] };
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                if (msg.id == null || msg.method === 'initialize') return;
+                requests.push(msg);
+                // A Codex that ignores itemsView pages its default summary view.
+                setTimeout(() => pushJsonLine(stdout, msg.method === 'thread/turns/list'
+                    ? { id: msg.id, result: { data: [{ ...full, items: full.items.slice(0, 1), itemsView: 'summary' }], nextCursor: null, backwardsCursor: null } }
+                    : { id: msg.id, result: { thread: { id: 'thread-old', turns: [full] } } }), 0);
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+
+        await expect(client.readThreadTurns('thread-old')).resolves.toEqual([full]);
+        expect(requests.map(({ method }) => method)).toEqual(['thread/turns/list', 'thread/read']);
 
         await client.disconnect();
     });
