@@ -567,12 +567,14 @@ export function startDaemonControlServer({
     });
     typed.post('/setup-token/rebind', {
       bodyLimit: 4096,
-      schema: { body: z.object({ sessionId: z.string().min(1).max(128), binding: z.string().min(1).max(8192), observation: setupTokenObservation.optional(), startBudget: z.literal(true).optional(), startExhausted: z.literal(true).optional() }).strict().refine(v => !v.startExhausted || (!v.startBudget && !v.observation)) },
+      schema: { body: z.object({ sessionId: z.string().min(1).max(128), binding: z.string().min(1).max(8192), observation: setupTokenObservation.optional(), startBudget: z.literal(true).optional(), startExhausted: z.literal(true).optional(), managedAccountId: z.string().uuid().optional(), excludeManagedAccountIds: z.array(z.string().uuid()).max(50).optional() }).strict()
+        .refine(v => !v.startExhausted || (!v.startBudget && !v.observation)).refine(v => !v.managedAccountId || (!v.startBudget && !v.startExhausted && !v.observation)).refine(v => !v.excludeManagedAccountIds || !!v.managedAccountId) },
     }, async (request, reply) => {
       const signal = rotationSignal(reply.raw);
       const switcher = getSetupTokenAccountSwitch();
       if (!switcher) return { ok: false as const, reason: 'STUDIO_UNAVAILABLE' as const };
-      const { sessionId, binding, observation, startBudget, startExhausted } = request.body;
+      const { sessionId, binding, observation, startBudget, startExhausted, managedAccountId, excludeManagedAccountIds } = request.body;
+      if (managedAccountId) return switcher.rebind(sessionId, binding, undefined, signal, { managedAccountId, ...(excludeManagedAccountIds ? { excludeManagedAccountIds } : {}) });
       return startExhausted ? switcher.rebind(sessionId, binding, observation, signal, { startExhausted }) : startBudget ? switcher.rebind(sessionId, binding, observation, signal, { startBudget }) : switcher.rebind(sessionId, binding, observation, signal);
     });
 

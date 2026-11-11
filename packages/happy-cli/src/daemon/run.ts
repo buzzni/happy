@@ -5276,6 +5276,11 @@ export async function startDaemon(): Promise<void> {
         return 'setupToken' in status ? (status.setupToken?.accounts ?? [])
           .filter(account => account.disabled).map(account => account.managedAccountId) : [];
       },
+      // Saycode specs/usage-org-account-current-chat — a move to the member's choice excludes every other account held here.
+      setupTokenAccountIds: async () => {
+        const status = await aiCredentialRuntime.status({ provider: 'claude' });
+        return 'setupToken' in status ? (status.setupToken?.accounts ?? []).map(account => account.managedAccountId) : [];
+      },
       recordAgentEnvironment: persistSetupTokenBinding,
       // Saycode specs/setup-token-switch-usage-check — check a candidate nobody measured recently before moving onto it.
       measure: aiCredentialRuntime.measureWithPermit,

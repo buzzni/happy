@@ -556,8 +556,8 @@ export async function reportSetupTokenUsage(sessionId: string, binding: string, 
 }
 /** Longer than the daemon's whole switch (Studio call, grant verification, token slot reads). */
 const SETUP_TOKEN_REBIND_TIMEOUT_MS = 90_000;
-export async function requestSetupTokenRebind(sessionId: string, binding: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal, options?: { startBudget: true } | { startExhausted: true }): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string; retryAfterMs?: number }> {
-  const result = await daemonPost('/setup-token/rebind', { sessionId, binding, ...(observation ? { observation } : {}), ...(options && 'startBudget' in options ? { startBudget: true } : {}), ...(options && 'startExhausted' in options ? { startExhausted: true } : {}) }, undefined, SETUP_TOKEN_REBIND_TIMEOUT_MS, signal);
+export async function requestSetupTokenRebind(sessionId: string, binding: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal, options?: { startBudget: true } | { startExhausted: true } | { managedAccountId: string; excludeManagedAccountIds?: string[] }): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string; retryAfterMs?: number }> {
+  const result = await daemonPost('/setup-token/rebind', { sessionId, binding, ...(observation ? { observation } : {}), ...(options && 'startBudget' in options ? { startBudget: true } : {}), ...(options && 'startExhausted' in options ? { startExhausted: true } : {}), ...(options && 'managedAccountId' in options ? { managedAccountId: options.managedAccountId, ...(options.excludeManagedAccountIds ? { excludeManagedAccountIds: options.excludeManagedAccountIds } : {}) } : {}) }, undefined, SETUP_TOKEN_REBIND_TIMEOUT_MS, signal);
   if (result?.ok === true && result.environment && typeof result.environment === 'object'
     && Object.values(result.environment).every((value) => typeof value === 'string')) return { ok: true, environment: result.environment };
   // A recovery later than the session's 30-minute background wait still holds the session off until that wait ends.

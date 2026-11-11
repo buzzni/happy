@@ -420,3 +420,48 @@ it('does not retry a failed start-exhausted move in the background',async()=>{
  expect(deps.rebind).toHaveBeenCalledOnce()
  switching.dispose()
 })
+
+describe('switching to the account the member chose', () => {
+  const CHOSEN = '11111111-1111-4111-8111-111111111111'
+
+  it('moves onto that account and says so as a switch', async () => {
+    const notifyState = vi.fn()
+    const { deps, switching } = setup({ notifyState })
+    expect(await switching.switchTo(CHOSEN, ['22222222-2222-4222-8222-222222222222'])).toEqual({ switched: true })
+    expect(deps.rebind).toHaveBeenCalledWith('session-a', 'binding-a', undefined, undefined, { managedAccountId: CHOSEN, excludeManagedAccountIds: ['22222222-2222-4222-8222-222222222222'] })
+    expect(deps.applyEnvironment).toHaveBeenCalledWith({ CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next' })
+    expect(notifyState).toHaveBeenCalledOnce()
+    expect(notifyState).toHaveBeenCalledWith(expect.any(String), 'switched')
+  })
+
+  it('does not spend the automatic switch allowance', async () => {
+    const { deps, switching } = setup()
+    for (let i = 0; i < 6; i++) expect(await switching.switchTo(CHOSEN)).toEqual({ switched: true })
+    switching.onRateLimitEvent(near)
+    expect(await switching.switchIfWanted()).toEqual({ switched: true, continueAfter: false })
+    expect(deps.rebind).toHaveBeenCalledTimes(7)
+  })
+
+  it('answers why the chosen account could not be bound, and keeps the session as it was', async () => {
+    const notifyState = vi.fn()
+    const { deps, switching } = setup({ notifyState, rebind: vi.fn(async () => ({ ok: false as const, reason: 'NO_ACCOUNT' })) })
+    expect(await switching.switchTo(CHOSEN)).toEqual({ switched: false, reason: 'NO_ACCOUNT' })
+    expect(deps.applyEnvironment).not.toHaveBeenCalled()
+    expect(notifyState).not.toHaveBeenCalled()
+    expect(switching.backgroundSignal()).toBeNull()
+  })
+
+  it('still moves after the member stopped a response', async () => {
+    const { deps, switching } = setup()
+    switching.cancelForStop()
+    expect(await switching.switchTo(CHOSEN)).toEqual({ switched: true })
+    expect(deps.applyEnvironment).toHaveBeenCalledOnce()
+  })
+
+  it('does not move an ended session', async () => {
+    const { deps, switching } = setup()
+    switching.dispose()
+    expect(await switching.switchTo(CHOSEN)).toEqual({ switched: false, reason: 'UNAVAILABLE' })
+    expect(deps.rebind).not.toHaveBeenCalled()
+  })
+})
