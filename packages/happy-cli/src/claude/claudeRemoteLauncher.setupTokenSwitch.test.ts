@@ -1794,11 +1794,12 @@ describe('moving the conversation to the organization account the member chose (
     });
     /**
      * `answering`: the member chooses while the first turn runs; `starting`: after its input was taken, before the
-     * provider's per-turn `init`; `idle`: after it answered. Once the choice is answered the member sends another
-     * message; the provider answering it ends the run.
+     * provider's per-turn `init`; `near-limit`: while it runs, after which the old account reports it is nearly used up;
+     * `idle`: after it answered. Once the choice is answered the member sends another message; the provider answering it
+     * ends the run.
      */
     const OTHER = '44444444-4444-4444-8444-444444444444';
-    function harness(when: 'answering' | 'starting' | 'idle', params: Record<string, unknown> = { action: 'select-organization', managedAccountId: CHOSEN, excludeManagedAccountIds: [OTHER] }) {
+    function harness(when: 'answering' | 'starting' | 'near-limit' | 'idle', params: Record<string, unknown> = { action: 'select-organization', managedAccountId: CHOSEN, excludeManagedAccountIds: [OTHER] }) {
         process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING = dedicated();
         const queue = new MessageQueue2<EnhancedMode>(hashObject), handlers = new Map<string, (params?: any) => Promise<any>>();
         const client = { sessionId:'happy-session-1',rpcHandlerManager:{registerHandler:(name:string,handler:any)=>handlers.set(name,handler)},
@@ -1827,6 +1828,10 @@ describe('moving the conversation to the organization account the member chose (
                         yield { type:'system',subtype:'init',session_id:'',tools:[],mcp_servers:[],apiKeySource:'none' };
                     }
                     if (first && when === 'answering') await choose();
+                    if (first && when === 'near-limit') {
+                        await choose();
+                        yield { type:'rate_limit_event',uuid:'rl-old',session_id:'claude-1',rate_limit_info:{ status:'allowed',rateLimitType:'five_hour',utilization:0.97,resetsAt:Math.floor(Date.now() / 1000) + 3600 } };
+                    }
                     yield assistant(`answered-${generations.length}-${generation.prompts.length}`);
                     yield { type:'result',subtype:'success',result:'done',is_error:false,uuid:`done-${generations.length}-${generation.prompts.length}` };
                     if (!first) { end(); return; }
@@ -1859,6 +1864,14 @@ describe('moving the conversation to the organization account the member chose (
         if (when !== 'idle') expect(h.outcome.accountsAtAnswer).not.toContain('{"account":"second"}');
         // Before the member's next message starts a provider, the conversation already names the chosen account.
         expect(h.generations[1].accountsAtStart.at(-1)).toBe('{"account":"second"}');
+    });
+
+    it('does not switch away on its own when the old account reports it is nearly used up after the choice', async () => {
+        const h = harness('near-limit');
+        await h.run();
+        expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1);
+        expect(h.generations.map(g => g.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
+        expect(h.client.sendSessionEvent.mock.calls.map(call => call[0].message)).not.toContain(SWITCHED_NOTICE);
     });
 
     it('answers why the chosen account could not be bound and keeps the provider', async () => {

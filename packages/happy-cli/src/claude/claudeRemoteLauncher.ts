@@ -708,7 +708,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         }
         sideQuestion.noteMainMessage(message);
         transientRetry.observe(message);
-        if (!personalFallback?.identity() && (message as { type?: unknown }).type === 'rate_limit_event') {
+        // A provider still on the account the session switched away from (e.g. the member's choice mid-turn) speaks for
+        // that account: its quota must not move the session off the one it now runs on.
+        if (!personalFallback?.identity() && !providerStale() && (message as { type?: unknown }).type === 'rate_limit_event') {
             setupTokenSwitching?.onRateLimitEvent((message as { rate_limit_info?: unknown }).rate_limit_info);
         }
         if (message.type === 'system' && message.subtype === 'init') {
