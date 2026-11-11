@@ -14,6 +14,7 @@ import type { EnhancedMode } from './loop';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
 import { requestSetupTokenCapacity, requestSetupTokenStart, requestSetupTokenRebind, reportSetupTokenActivity, reportSetupTokenUsage, requestSetupTokenAvailability, returnFromPersonalClaude } from '@/daemon/controlClient';
+import { wrapClientTurnPrompt } from '@slopus/happy-wire';
 import { APPLY_REQUIRED_NOTICE, CONTINUE_PROMPT, RESUME_REBOUND_NOTICE, START_BUDGET_SWITCHED_NOTICE, SWITCHED_NOTICE } from './setupTokenAccountSwitching';
 import { PERSONAL_RECHECK_NOTICE } from './personalClaudeFallback';
 import { claudeCheckSession } from './utils/claudeCheckSession';
@@ -914,6 +915,61 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED;
             delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
         }
+    });
+
+    // The note that continues a refused turn is not the turn its one-turn block was written for: the block
+    // (a guide for that question) goes neither in front of the note nor into the next provider's prompt.
+    it('continues a refused turn without the one-turn prompt block that turn carried', async () => {
+        const guide = wrapClientTurnPrompt('DESKTOP GUIDE PROMPT')!;
+        const token = guide.split('\n')[0].replace('<!-- saycode:client-turn-prompt:', '').replace(':start -->', '');
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const client = {
+            sessionId: 'happy-session-1',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        attachInputEvidence(client);
+        const generations: Array<{ appended: string; prompts: string[] }> = [];
+        vi.mocked(query).mockImplementation(({ prompt, options }) => {
+            const generation = { appended: (options?.systemPrompt as { append?: string } | undefined)?.append ?? '', prompts: [] as string[] };
+            generations.push(generation);
+            const first = generations.length === 1;
+            const response = (async function* () {
+                yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+                for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                    generation.prompts.push(String(message.message.content));
+                    if (first) {
+                        yield refused;
+                        yield { type: 'result', subtype: 'success', result: 'Claude AI usage limit reached', is_error: true, uuid: 'result-1' };
+                        continue;
+                    }
+                    yield assistant('msg-2');
+                    yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: 'result-2' };
+                    void handlers.get('switch')!();
+                    return;
+                }
+            })();
+            return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+        });
+        queue.push('how do I open settings?', { permissionMode: 'default', model: 'claude-sonnet-5', appendSystemPrompt: `USER CONTEXT\n\n${guide}`, turnOnlyPromptTokens: [token] },
+            undefined, undefined, undefined, undefined, { ref: { kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 } });
+
+        await claudeRemoteLauncher({
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+            cancelLessonReview: vi.fn(),
+            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
+        } as unknown as Session);
+
+        expect(generations[0].prompts).toEqual([`${guide}\n\nhow do I open settings?`]);
+        expect(generations[1].prompts).toEqual([CONTINUE_PROMPT]);
+        expect(generations.map(generation => generation.appended.includes('DESKTOP GUIDE PROMPT'))).toEqual([false, false]);
+        expect(generations[1].appended).toContain('USER CONTEXT');
     });
 
     it('closes a refused turn as failed when the provider throws and rebind fails', async () => {
