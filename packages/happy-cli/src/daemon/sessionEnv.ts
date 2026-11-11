@@ -19,7 +19,7 @@ import {
     resolveAppliedAiAuthSource,
     type AiAuthSource,
 } from '@/usage/aiAuthSource'
-import { ADDITIONAL_DIRECTORIES_ENV, readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv'
+import { ADDITIONAL_DIRECTORIES_ENV, APPROVED_WRITE_ROOTS_ENV, readAdditionalDirectoriesEnvironment, readApprovedWriteRootsEnvironment } from '@/utils/additionalDirectoriesEnv'
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars'
 import { normalizeSessionSource, SESSION_SOURCE_ENV } from '@/utils/sessionSource'
 import { DELEGATED_ATTENDANCE_ENV, parseDelegatedAttendance } from '@/api/turnAttendance'
@@ -68,7 +68,7 @@ export const BROWSER_CONTINUATION_ENV = 'HAPPY_AUTOMATION_BROWSER_CONTINUATION'
  */
 const AGENT_PLAN_SEED_KEYS = [AGENT_PLAN_DESCRIPTOR_ENV, AGENT_PLAN_SECRET_ENV, AGENT_PLAN_THREADS_DIR_ENV] as const
 type AgentPlanSeedKey = typeof AGENT_PLAN_SEED_KEYS[number]
-type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | typeof ORG_ENDPOINT_BINDING_ENV | typeof ORG_ENDPOINT_UNREPORTED_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV | AgentPlanSeedKey
+type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | typeof ORG_ENDPOINT_BINDING_ENV | typeof ORG_ENDPOINT_UNREPORTED_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof APPROVED_WRITE_ROOTS_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV | AgentPlanSeedKey
 
 export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey | typeof DAEMON_AGENT_GRANT_STATE_ENV, string>>
 
@@ -334,6 +334,11 @@ export function captureSaycodeAgentEnvironment(
     const additionalDirectories = env[ADDITIONAL_DIRECTORIES_ENV]
     if (additionalDirectories !== undefined && isValidAdditionalDirectories(additionalDirectories)) {
         captured[ADDITIONAL_DIRECTORIES_ENV] = additionalDirectories
+    }
+    // Likewise the owner-approved roots, so a folder revoked while the session was stopped is withdrawn on resume.
+    const approvedWriteRoots = env[APPROVED_WRITE_ROOTS_ENV]
+    if (approvedWriteRoots !== undefined && readApprovedWriteRootsEnvironment(approvedWriteRoots)) {
+        captured[APPROVED_WRITE_ROOTS_ENV] = approvedWriteRoots
     }
     // A structured session keeps its schema across a resume (claude-cli-benchmark-followups R2); the
     // runner consumes the seed again. Only a format that still parses is kept.

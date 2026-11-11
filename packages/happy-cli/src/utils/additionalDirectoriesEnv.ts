@@ -1,4 +1,6 @@
+import { homedir } from 'node:os'
 import { isAbsolute } from 'node:path'
+import { isUnsafeMandatoryWriteScope, resolveSessionSandboxPolicyMode } from '@/sandbox/sandboxPolicy'
 
 export const ADDITIONAL_DIRECTORIES_ENV = 'HAPPY_ADDITIONAL_DIRECTORIES'
 
@@ -69,6 +71,20 @@ export function replaceAdditionalDirectoriesInEnvironment(
 
 export const APPROVED_WRITE_ROOTS_ENV = 'HAPPY_APPROVED_WRITE_ROOTS'
 
+const strings = (value: unknown) => Array.isArray(value) ? value.filter((path): path is string => typeof path === 'string') : []
+
+/** The record replaceApprovedWriteRootsInEnvironment leaves behind, or null when it does not parse. */
+export function readApprovedWriteRootsEnvironment(raw: string): { write: string[]; deny: string[] } | null {
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    const record = parsed as Record<string, unknown>
+    return { write: strings(record.write), deny: strings(record.deny) }
+  } catch {
+    return null
+  }
+}
+
 /**
  * aplus-dev-studio specs/approved-folder-roots R11: folders the machine owner approved are writable in the
  * session sandbox without a per-chat approval, and the credential homes in `denied` stay unwritable.
@@ -83,12 +99,8 @@ export function replaceApprovedWriteRootsInEnvironment(
   if (env.HAPPY_PROJECT_SANDBOX_CONFIG === undefined) return
   const config = JSON.parse(env.HAPPY_PROJECT_SANDBOX_CONFIG) as Record<string, unknown>
   if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('Invalid project sandbox config')
-  const strings = (value: unknown) => Array.isArray(value) ? value.filter((path): path is string => typeof path === 'string') : []
-  let previous: { write: string[]; deny: string[] } = { write: [], deny: [] }
-  try {
-    const parsed = JSON.parse(env[APPROVED_WRITE_ROOTS_ENV] ?? '{}') as Record<string, unknown>
-    previous = { write: strings(parsed.write), deny: strings(parsed.deny) }
-  } catch { /* An unreadable record withdraws nothing. */ }
+  // An unreadable record withdraws nothing.
+  const previous = readApprovedWriteRootsEnvironment(env[APPROVED_WRITE_ROOTS_ENV] ?? '{}') ?? { write: [], deny: [] }
   const write = strings(config.extraWritePaths).filter((path) => !previous.write.includes(path))
   const deny = strings(config.denyWritePaths).filter((path) => !previous.deny.includes(path))
   const added = {
@@ -100,4 +112,22 @@ export function replaceApprovedWriteRootsInEnvironment(
   env.HAPPY_PROJECT_SANDBOX_CONFIG = JSON.stringify(config)
   if (added.write.length || added.deny.length) env[APPROVED_WRITE_ROOTS_ENV] = JSON.stringify(added)
   else delete env[APPROVED_WRITE_ROOTS_ENV]
+  if (resolveSessionSandboxPolicyMode(env) === 'mandatory') withdrawUnsafeApprovedWriteRoots(env)
+}
+
+/**
+ * A mandatory sandbox refuses a filesystem or home root as write scope (isUnsafeMandatoryWriteScope), so an
+ * approved drive is left out of such a session instead of failing its every start. Call it once the session's
+ * policy mode is settled; the record keeps only what stays, so the next swap withdraws exactly that.
+ */
+export function withdrawUnsafeApprovedWriteRoots(env: Record<string, string>, homeDir: string = homedir()): void {
+  const added = env.HAPPY_PROJECT_SANDBOX_CONFIG === undefined || env[APPROVED_WRITE_ROOTS_ENV] === undefined
+    ? null
+    : readApprovedWriteRootsEnvironment(env[APPROVED_WRITE_ROOTS_ENV])
+  const unsafe = added?.write.filter((path) => isUnsafeMandatoryWriteScope([path], homeDir)) ?? []
+  if (!added || unsafe.length === 0) return
+  const config = JSON.parse(env.HAPPY_PROJECT_SANDBOX_CONFIG!) as Record<string, unknown>
+  config.extraWritePaths = strings(config.extraWritePaths).filter((path) => !unsafe.includes(path))
+  env.HAPPY_PROJECT_SANDBOX_CONFIG = JSON.stringify(config)
+  env[APPROVED_WRITE_ROOTS_ENV] = JSON.stringify({ ...added, write: added.write.filter((path) => !unsafe.includes(path)) })
 }

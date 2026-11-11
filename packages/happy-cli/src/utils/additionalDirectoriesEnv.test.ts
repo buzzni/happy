@@ -4,7 +4,10 @@ import {
   readAdditionalDirectoriesEnvironment,
   replaceAdditionalDirectoriesInEnvironment,
   replaceApprovedWriteRootsInEnvironment,
+  withdrawUnsafeApprovedWriteRoots,
 } from './additionalDirectoriesEnv'
+import { SandboxConfigSchema } from '@/persistence'
+import { buildSandboxRuntimeConfig } from '@/sandbox/config'
 
 describe('additional directories child environment', () => {
   it('reads only a bounded JSON array of absolute canonical roots', () => {
@@ -100,5 +103,27 @@ describe('approved folders in the session sandbox', () => {
     const env: Record<string, string> = {}
     replaceApprovedWriteRootsInEnvironment(env, ['/Volumes/work'], ['/Users/me/.happy'])
     expect(env).toEqual({})
+  })
+
+  it('leaves an approved drive out of a mandatory sandbox, which refuses a filesystem root as write scope', () => {
+    const env = { ...sandbox({ enabled: true, extraWritePaths: ['/tmp'] }), HAPPY_SANDBOX_POLICY_MODE: 'mandatory' }
+
+    replaceApprovedWriteRootsInEnvironment(env, ['/Volumes/work', '/'], ['/Users/me/.happy'])
+
+    expect(config(env).extraWritePaths).toEqual(['/tmp', '/Volumes/work'])
+    expect(() => buildSandboxRuntimeConfig(SandboxConfigSchema.parse(config(env)), '/home/me/proj', 'mandatory')).not.toThrow()
+    replaceApprovedWriteRootsInEnvironment(env, [], ['/Users/me/.happy'])
+    expect(config(env)).toMatchObject({ extraWritePaths: ['/tmp'], denyWritePaths: [] })
+  })
+
+  it('withdraws the approved drive once a spawn turns out to be a mandatory write-scope session', () => {
+    const env = sandbox({ enabled: true, extraWritePaths: ['/tmp'] })
+    replaceApprovedWriteRootsInEnvironment(env, ['/Volumes/work', '/'], ['/Users/me/.happy'])
+
+    withdrawUnsafeApprovedWriteRoots(env, '/home/me')
+
+    expect(config(env)).toMatchObject({ extraWritePaths: ['/tmp', '/Volumes/work'], denyWritePaths: ['/Users/me/.happy'] })
+    replaceApprovedWriteRootsInEnvironment(env, ['/'], ['/Users/me/.happy'])
+    expect(config(env)).toMatchObject({ extraWritePaths: ['/tmp', '/'], denyWritePaths: ['/Users/me/.happy'] })
   })
 })

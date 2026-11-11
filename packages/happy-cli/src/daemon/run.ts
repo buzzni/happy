@@ -369,7 +369,7 @@ import {
   prepareAdditionalDirectories,
   reapplyAdditionalDirectoriesOnResume,
 } from './additionalDirectories';
-import { mergeAdditionalDirectoriesIntoSandboxEnvironment, readAdditionalDirectoriesEnvironment, replaceApprovedWriteRootsInEnvironment } from '@/utils/additionalDirectoriesEnv';
+import { mergeAdditionalDirectoriesIntoSandboxEnvironment, readAdditionalDirectoriesEnvironment, replaceApprovedWriteRootsInEnvironment, withdrawUnsafeApprovedWriteRoots } from '@/utils/additionalDirectoriesEnv';
 import { resolveSandboxTrustFloor } from '@/sandbox/config';
 import { createAutomationContextWorkspace } from './automations/automationContextWorkspace';
 import { createAutomationContextHost, prepareAutomationContextTick } from './automations/automationContextHost';
@@ -2796,6 +2796,7 @@ export async function startDaemon(): Promise<void> {
             sandboxConfig: spawnEnvironment.HAPPY_PROJECT_SANDBOX_CONFIG })) {
             spawnEnvironment.HAPPY_WRITE_SCOPE_SESSION = '1';
             spawnEnvironment.HAPPY_SANDBOX_POLICY_MODE = 'mandatory';
+            withdrawUnsafeApprovedWriteRoots(spawnEnvironment);
           }
           return finishSpawn(spawnTrackedHappyProcess({
             onOwnedChild: contextOwnedChildren.get(options),

@@ -27,6 +27,7 @@ import { buildZaiClaudeEnvironment } from '../managed/zaiClaudeEnvironment'
 import { injectMcpCallerGrant } from './mcpCallerGrantEnvelope'
 import { readAiAuthConnectionVersion } from '../usage/aiAuthSource'
 import { sanitizeChildEnv } from '../utils/childEnv'
+import { replaceApprovedWriteRootsInEnvironment } from '../utils/additionalDirectoriesEnv'
 import { ORG_REQUIREMENTS_ENV, ORG_SCOPE_HINT_ENV, orgScopeHintEnvironment } from '../orgRequirements/gate'
 import { expandEnvironmentVariables } from '../utils/expandEnvVars'
 
@@ -331,6 +332,19 @@ describe('Saycode agent resume environment', () => {
         expect(captureSaycodeAgentEnvironment({
             HAPPY_ADDITIONAL_DIRECTORIES: 'not-json',
         })).toBeUndefined()
+    })
+
+    it('keeps the approved-folder record so a folder revoked while the session was stopped is withdrawn on resume', () => {
+        const spawned: Record<string, string> = { HAPPY_PROJECT_SANDBOX_CONFIG: JSON.stringify({ extraWritePaths: ['/tmp'] }) }
+        replaceApprovedWriteRootsInEnvironment(spawned, ['/Volumes/work'], ['/Users/me/.happy'])
+
+        const resumed = buildResumedSessionSpawnEnvironment({ inherited: {}, explicit: {}, sessionId: 's1',
+            agentEnvironment: captureSaycodeAgentEnvironment(spawned) })
+        replaceApprovedWriteRootsInEnvironment(resumed, [], ['/Users/me/.happy'])
+
+        expect(JSON.parse(resumed.HAPPY_PROJECT_SANDBOX_CONFIG)).toMatchObject({ extraWritePaths: ['/tmp'], denyWritePaths: [] })
+        expect(captureSaycodeAgentEnvironment({ HAPPY_APPROVED_WRITE_ROOTS: 'not-json' })).toBeUndefined()
+        expect(sanitizeChildEnv({ HAPPY_APPROVED_WRITE_ROOTS: '{"write":[],"deny":[".env"]}' })).toEqual({})
     })
 
     it('captures a valid output format so a resumed structured session keeps its schema (claude-cli-benchmark-followups R2)', () => {

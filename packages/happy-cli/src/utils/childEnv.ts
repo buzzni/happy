@@ -73,6 +73,7 @@ export const NON_INHERITABLE_ENV: readonly NonInheritableEnvEntry[] = [
     { prefix: 'HAPPY_SCOPE_REPORT_', kind: 'session-scope' },
     { prefix: 'HAPPY_WRITE_SCOPE_', kind: 'session-scope' },
     { prefix: 'HAPPY_ADDITIONAL_DIRECTORIES', kind: 'session-scope' },
+    { prefix: 'HAPPY_APPROVED_WRITE_ROOTS', kind: 'session-scope' },
     { prefix: 'HAPPY_INPUT_EVIDENCE', kind: 'session-scope' },
     { prefix: 'HAPPY_CHECKPOINT_', kind: 'session-scope' },
     { prefix: 'HAPPY_AI_AUTH_', kind: 'session-scope' },
