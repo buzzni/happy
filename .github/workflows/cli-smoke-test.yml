@@ -78,8 +78,12 @@ jobs:
       env:
         HAPPY_CLAUDE_AUTH_PIN_INTEGRATION: '1'
       run: |
-        sudo apt-get update
-        sudo apt-get install -y bubblewrap
+        # Azure's runner-local mirror repeatedly failed DNS during this smoke.
+        # Keep APT's signed sources and use the public Ubuntu mirror endpoints.
+        printf '%s\n' 'https://security.ubuntu.com/ubuntu/' 'https://archive.ubuntu.com/ubuntu/' \
+          | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+        sudo apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 update
+        sudo apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 install -y bubblewrap
         # Ubuntu's AppArmor user-namespace restriction prevents unprivileged bwrap
         # before the SDK starts. Relax it only in this disposable CI runner;
         # policies remain inside the test's private mount namespace.

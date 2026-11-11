@@ -59,3 +59,26 @@ assertion 실패로 검출하고 소스 byte 원복을 확인했다. 새 테스�
 맞춰 호출 횟수와 인자를 각각 검사한다. 모든 origin/main과 merge-tree 충돌 없음.
 Desktop main의 #3240 전진은 이 기능과 겹치지 않아 main 추종만을 위한 병합은 하지 않는다.
 preflight 완료 후 일반 PR을 생성하고 자동 리뷰 및 최신 CI를 확인한다.
+
+2026-11-12 PR #1250 자동 리뷰 approve(69aa93a), Windows20/24·macOS·Linux20 smoke 성공.
+Linux24는 최초/세 번째 시도에서 모두 azure.archive.ubuntu.com DNS 실패로 bubblewrap을
+설치하지 못했다. 두 번째는 의존성 postinstall에서 15분 이상 정체되어, 유일한 실행 중 lane만
+취소하고 새 runner에서 다시 실행했다. 무변경 재시도는 더 하지 않고 해당 Linux24 준비 단계의
+/etc/apt/apt-mirrors.txt를 공개 Ubuntu HTTPS archive/security 목록으로 지정한다.
+APT의 mirror+file 형식은 Ubuntu apt-transport-mirror 공식 문서와 GitHub runner-images의
+configure-apt.sh/ configure-apt-sources.sh를 확인했다. signed source/배포판/키링 설정을
+건드리지 않고 같은 bubblewrap 설치·실제 SDK 검사로 검증한다. 이것은 PR CI 복구용 변경이며
+제품 인증/권한·CLI 버전·외부 dependency·설치본은 바꾸지 않는다.
+근거: https://manpages.ubuntu.com/manpages/tenacious/man1/apt-transport-mirror.1.html
+https://github.com/actions/runner-images/blob/main/images/ubuntu/scripts/build/configure-apt.sh
+로그: 원래 A+ worktree .aplus/verification/pr-prep/session-search/happy-linux24-{ci,third-ci}.log.
+
+검증 중 archive.ubuntu.com도 로컬 DNS timeout을 보인 반면 security.ubuntu.com의 signed
+Release는 HTTP200이었다. security mirror를 먼저 두고 APT acquire timeout10s/retries0으로
+장애 미러에서 수분씩 재시도하지 않고 다음 공식 미러로 전환한다. GitHub runner-images의
+configure-apt.sh도 동일한 이유로 acquire 재시도/timeout을 제한한다. 실 SDK step의5분 상한은 유지한다.
+
+CI 보완 로컬 확인: js-yaml 파싱·전체 run 블록 bash -n·prefix를 임시 파일에 실행해 정확한
+HTTPS mirror2줄 생성 확인. bubblewrap 설치와 integration-claude-auth-pin 명령이 유지됨을
+검사했다. security.ubuntu.com의 noble InRelease와 필요한 bubblewrap .deb HTTP200 확인.
+제품 소스 diff는 없으며 해당 워크플로와 spec plan/context만 수정했다. 새 CI에서 검증한다.

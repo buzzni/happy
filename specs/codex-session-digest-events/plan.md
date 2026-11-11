@@ -21,3 +21,9 @@ Core의 기존 session event만 사용한다. 외부 의존·DB·공개 wire sch
 4. [ ] Happy 병합 → GitHub Actions CLI 발행 → Desktop pin/앱 업데이트 및 MCP 반영 후 실제 계정 수락.
 
 기존 spec의 배포·발행 제한은 유지한다. 설치 앱의 인증정보를 복제하거나 실제 앱을 교체하지 않는다.
+
+## PR #1250의 CI 미러 복구
+
+- [x] Ubuntu mirror+file 목록에서 반복 DNS 실패한 Azure mirror를 공개 Ubuntu HTTPS mirror 두 곳으로 대체한다.
+- [x] YAML·셸 구문과 mirror 파일 생성을 확인했다. 동일한 실제 SDK/bubblewrap 검증을 새 CI에서 실행한다.
+- [ ] 최종 head의 모든 OS·Node 검사 성공과 PR 상태를 확인한다. CLI 버전·릴리스·실사용 설치본은 변경하지 않는다.
