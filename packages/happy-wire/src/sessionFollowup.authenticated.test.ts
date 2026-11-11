@@ -30,7 +30,7 @@ const crypto: AutomationCryptoAdapter = {
     return new Uint8Array([...ephemeral.publicKey, ...nonce, ...nacl.box(plaintext, nonce, publicKey, ephemeral.secretKey)]);
   },
   boxOpen: (bundle, secretKey) => nacl.box.open(bundle.subarray(56), bundle.subarray(32, 56), bundle.subarray(0, 32), secretKey),
-  sha256: async (value) => new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', value)),
+  sha256: async (value) => new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', new Uint8Array(value))),
   encodeBase64: (value, urlSafe = false) => {
     const base64 = Buffer.from(value).toString('base64');
     return urlSafe ? base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '') : base64;

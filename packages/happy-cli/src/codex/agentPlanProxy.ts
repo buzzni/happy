@@ -92,7 +92,7 @@ export async function startAgentPlanProxy(options: {
                 if (typeof value === 'string') headers[name] = value
             }
             const upstream = await fetchImpl(options.upstreamUrl, {
-                method: 'POST', headers, body, signal: controller.signal, redirect: 'error',
+                method: 'POST', headers, body: new Uint8Array(body), signal: controller.signal, redirect: 'error',
             })
             const responseHeaders: Record<string, string> = {}
             for (const name of FORWARDED_RESPONSE_HEADERS) {
