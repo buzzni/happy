@@ -50,6 +50,7 @@ import type {
     ThreadGoalClearParams,
     ThreadGoalClearResponse,
     Thread,
+    ThreadTurn,
     InterruptConversationParams,
     SteerConversationParams,
     ReviewDecision,
@@ -1434,7 +1435,7 @@ export class CodexAppServerClient {
                 onLine: line => { if (this.process === proc && this.processEpoch === epoch) this.handleLine(line, epoch); },
             }).then(() => this.flushAgentMessageDeltas());
             epochOutputDrain = this.outputDrain;
-            void this.outputDrain.then(() => { this.outputSettled = true; }, () => {
+            void this.outputDrain.then(() => { this.outputSettled = true; }, (error: unknown) => {
                 this.outputSettled = true;
                 this.failOutputStorage();
                 if (this.process !== proc || this.processEpoch !== epoch || this.disconnectingEpoch === epoch) return;
@@ -1444,7 +1445,7 @@ export class CodexAppServerClient {
                     request.reject(new Error('Codex output could not be drained')); this.pending.delete(id);
                 }
                 this.resolvePendingTurn(true);
-                logger.warn('[CodexAppServer] Output storage stream failed; completion is unconfirmed');
+                logger.warn('[CodexAppServer] Output storage stream failed; completion is unconfirmed', error);
             });
         } else {
             this.readline = createInterface({ input: proc.stdout! });
@@ -2065,6 +2066,8 @@ export class CodexAppServerClient {
             baseInstructions: null,
             developerInstructions,
             persistExtendedHistory: true,
+            // Only id, path and model are read; inlined history can outgrow one output line on long threads.
+            excludeTurns: true,
         };
 
         const result = await this.requestUnarchivingThread('thread/resume', params) as ResumeConversationResponse;
@@ -2212,6 +2215,33 @@ export class CodexAppServerClient {
             includeTurns: opts.includeTurns ?? true,
         };
         return await this.request('thread/read', params) as ReadConversationResponse;
+    }
+
+    /**
+     * Full history, oldest first, one turn per response: a whole-thread read arrives as a single output
+     * line and a long thread outgrows the reader's line limit. Codex without turn paging gets the whole read.
+     */
+    async readThreadTurns(threadId: string): Promise<ThreadTurn[]> {
+        const turns: ThreadTurn[] = [];
+        let cursor: string | null = null;
+        do {
+            const params = { threadId, cursor, limit: 1, sortDirection: 'asc', itemsView: 'full' };
+            let page: { data: ThreadTurn[]; nextCursor: string | null };
+            try {
+                page = await this.request('thread/turns/list', params) as typeof page;
+            } catch (error) {
+                // Any other failure must not retry as the oversized whole-thread read.
+                if (cursor !== null || !(error instanceof Error && error.message.includes('unknown variant `thread/turns/list`'))) throw error;
+                return (await this.readThread({ threadId, includeTurns: true })).thread.turns ?? [];
+            }
+            // A Codex that ignores itemsView silently pages its summary view, which drops items.
+            if (cursor === null && page.data.some(turn => turn.itemsView !== 'full')) {
+                return (await this.readThread({ threadId, includeTurns: true })).thread.turns ?? [];
+            }
+            turns.push(...page.data);
+            cursor = page.nextCursor;
+        } while (cursor);
+        return turns;
     }
 
     async listMcpServerStatus(opts: { threadId: string; serverNames?: string[]; measureServer?: <T>(action: () => Promise<T>) => Promise<T> }): Promise<ListMcpServerStatusResponse> {
