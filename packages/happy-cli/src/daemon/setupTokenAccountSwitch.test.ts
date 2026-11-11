@@ -843,3 +843,45 @@ it('logs start refusal status and code without logging arbitrary response data',
   expect(debug.mock.calls.flat().join(' ')).not.toContain('do-not-log')
  }finally{debug.mockRestore()}
 })
+
+describe('moving to the account the member chose (Saycode specs/usage-org-account-current-chat)', () => {
+  const held = { setupTokenAccountIds: async () => [A, B, C] }
+
+  it('asks Studio with every other account this PC holds excluded, and binds the chosen one', async () => {
+    const { switcher, requests, deps } = setup({ ...held, disabledSetupTokenAccounts: async () => [] })
+    const result = await switcher.rebind('session-a', RUNNING_A, undefined, undefined, { managedAccountId: B })
+    expect(result).toHaveProperty('ok', true)
+    expect(requests[0].url).toBe('https://studio.test/api/claude-setup-token/daemon/rebind')
+    expect(new Set(requests[0].body.excludeManagedAccountIds as string[])).toEqual(new Set([A, C]))
+    expect(deps.sessionEnvironment).toHaveBeenCalledWith('claude', expect.objectContaining({ managedAccountId: B }))
+  })
+
+  it('answers APPLY_REQUIRED for an account this PC does not hold, and NO_ACCOUNT for a disabled one, without asking Studio', async () => {
+    const missing = setup({ setupTokenAccountIds: async () => [A, C] })
+    expect(await missing.switcher.rebind('session-a', RUNNING_A, undefined, undefined, { managedAccountId: B })).toEqual({ ok: false, reason: 'APPLY_REQUIRED' })
+    const disabled = setup({ ...held, disabledSetupTokenAccounts: async () => [B] })
+    expect(await disabled.switcher.rebind('session-a', RUNNING_A, undefined, undefined, { managedAccountId: B })).toEqual({ ok: false, reason: 'NO_ACCOUNT' })
+    expect(missing.deps.fetch).not.toHaveBeenCalled()
+    expect(disabled.deps.fetch).not.toHaveBeenCalled()
+  })
+
+  it('does not bind another account than the chosen one', async () => {
+    const { switcher, deps } = setup(held)
+    vi.mocked(deps.fetch).mockResolvedValueOnce(Response.json({ version: 1, bindingGrant: 'claims.signature', managedAccountId: C, credentialGeneration: 1, tier: 'available' }))
+    expect(await switcher.rebind('session-a', RUNNING_A, undefined, undefined, { managedAccountId: B })).toEqual({ ok: false, reason: 'NO_ACCOUNT' })
+    expect(deps.sessionEnvironment).not.toHaveBeenCalled()
+    expect(deps.recordAgentEnvironment).not.toHaveBeenCalled()
+  })
+
+  it('cannot choose for a shared-PC session or without the held account list', async () => {
+    const sharedRunning = sharedMachineSetupTokenAuthority({ HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1', [SETUP_TOKEN_SHARED_ACCOUNT_ENV]: A })!
+    const shared = setup({ ...held, sharedMachine: { reportUsage: vi.fn(), rebind: vi.fn(), environment: vi.fn(), moved: vi.fn() } })
+    shared.session.agentEnvironment = {}
+    shared.session.sharedSetupTokenAccount = A
+    expect(await shared.switcher.rebind('session-a', sharedRunning, undefined, undefined, { managedAccountId: B })).toEqual({ ok: false, reason: 'UNSUPPORTED' })
+    expect(shared.deps.sharedMachine!.rebind).not.toHaveBeenCalled()
+    const unknown = setup()
+    expect(await unknown.switcher.rebind('session-a', RUNNING_A, undefined, undefined, { managedAccountId: B })).toEqual({ ok: false, reason: 'UNSUPPORTED' })
+    expect(unknown.deps.fetch).not.toHaveBeenCalled()
+  })
+})

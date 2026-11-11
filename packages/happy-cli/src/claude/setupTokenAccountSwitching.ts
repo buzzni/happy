@@ -22,7 +22,7 @@ export type SetupTokenAccountSwitchingDeps = {
   /** The binding record the running provider started with; the daemon books usage and switches against exactly it. */
   binding(): string | undefined
   report(sessionId: string, binding: string, observation: SetupTokenUsageObservation, signal?: AbortSignal): Promise<Outcome>
-  rebind(sessionId: string, binding: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal, options?: { startBudget: true } | { startExhausted: true }): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string; retryAfterMs?: number }>
+  rebind(sessionId: string, binding: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal, options?: { startBudget: true } | { startExhausted: true } | { managedAccountId: string }): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string; retryAfterMs?: number }>
   applyEnvironment(environment: Record<string, string>): void
   notify(message: string): void
   notifyState?(message: string, state: SetupTokenRotationState): void
@@ -50,7 +50,8 @@ export const FORBIDDEN_NOTICE = 'Saycode can no longer manage this session\'s or
 /** Saycode specs/managed-account-session-continuation — the account this conversation ran on left the PC; it resumed on another. */
 export const RESUME_REBOUND_NOTICE = 'The organization Claude account this conversation used is no longer assigned to this PC, so it continues on another organization account.'
 export const START_BUDGET_SWITCHED_NOTICE = '계정의 작업 시작 한도에 도달해 여유가 있는 다른 조직 계정으로 옮겨 바로 실행합니다.'
-export const CONTINUE_PROMPT = 'The previous request stopped because the organization Claude account was unavailable. The session now uses another account — continue from where you stopped.'
+export const CHOSEN_ACCOUNT_NOTICE = 'The session moved to the organization Claude account the member chose.'
+export const CONTINUE_PROMPT ='The previous request stopped because the organization Claude account was unavailable. The session now uses another account — continue from where you stopped.'
 
 export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchingDeps) {
   const now = deps.now ?? Date.now
@@ -286,6 +287,32 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
         if (result.switched) endBackground()
         return result.switched ? { switched: true } : { switched: false, reason: result.reason ?? 'UNAVAILABLE' }
       })
+    },
+    /**
+     * The member chose this organization account for the conversation (Saycode specs/usage-org-account-current-chat).
+     * Not an automatic move: it spends no allowance and runs after a stop too. Continuing a refused turn is the launcher's call.
+     */
+    async switchTo(managedAccountId: string): Promise<{ switched: boolean; reason?: string }> {
+      while (inFlight) await inFlight
+      const sessionId = deps.sessionId(), binding = deps.binding()
+      if (disposed || !sessionId || !binding) return { switched: false, reason: 'UNAVAILABLE' }
+      const move = deps.rebind(sessionId, binding, undefined, undefined, { managedAccountId })
+        .catch(() => ({ ok: false as const, reason: 'REQUEST_FAILED' }))
+        .then((result): { switched: boolean; reason?: string } => {
+          if (disposed) return { switched: false, reason: 'UNAVAILABLE' }
+          if (!result.ok) return { switched: false, reason: result.reason }
+          if (result.environment.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING === binding) return { switched: false, reason: 'UNAVAILABLE' }
+          deps.applyEnvironment(result.environment)
+          tracker.reset()
+          told.clear(); lastReportAt = -Infinity; lastReportedExhausted = false
+          wanted = false; refused = false; authenticationFailed = false; lastFailure = null; latestObservation = undefined; retryDeadline = null; retryAfterMs = 0
+          endBackground()
+          if (deps.notifyState) deps.notifyState(CHOSEN_ACCOUNT_NOTICE, 'switched'); else deps.notify(CHOSEN_ACCOUNT_NOTICE)
+          return { switched: true }
+        })
+      // A turn boundary meanwhile waits for this move instead of starting its own.
+      inFlight = move.then(result => ({ switched: result.switched, continueAfter: false })).finally(() => { inFlight = null })
+      return move
     },
     /** Aborted when a background switch finished: the launcher stops waiting for input and takes it with `switchIfWanted`. */
     backgroundSignal(): AbortSignal | null {

@@ -525,7 +525,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             throw error;
         }
     };
-    session.client.rpcHandlerManager.registerHandler('personal-claude-fallback', async (params: { action?: unknown; accountRef?: unknown; nonce?: unknown; consentProof?: unknown; personal?: unknown }) => {
+    session.client.rpcHandlerManager.registerHandler('personal-claude-fallback', async (params: { action?: unknown; accountRef?: unknown; nonce?: unknown; consentProof?: unknown; personal?: unknown; managedAccountId?: unknown }) => {
         if (!personalFallback) return { version: 1, supported: false };
         if (params.action === 'prepare-manual') {
             if (typeof params.accountRef !== 'string' || !/^[a-f0-9]{64}$/.test(params.accountRef)) throw new Error('CLAUDE_PERSONAL_SELECTION_INVALID');
@@ -555,6 +555,21 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             if (continueRefusal) continuation = lastTurnMode;
             clearAuthenticationFailure();
             wakeOrganizationRecovery();
+            return { version: 1, supported: true, switched: true };
+        }
+        // Saycode specs/usage-org-account-current-chat — the member picked an organization account for this conversation.
+        if (params.action === 'select-organization') {
+            if (typeof params.managedAccountId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(params.managedAccountId)) throw new Error('CLAUDE_ORGANIZATION_SELECTION_INVALID');
+            if (!setupTokenSwitching) return { version: 1, supported: true, switched: false, reason: 'UNAVAILABLE' };
+            const continueRefusal = !session.thinking && !lastResultSucceeded && !lastTurnChannel && (setupTokenSwitching.hasAccountRefusal() || lastOrganizationAuthenticationFailed);
+            const result = await setupTokenSwitching.switchTo(params.managedAccountId);
+            if (!result.switched) return { version: 1, supported: true, switched: false, reason: result.reason };
+            if (continueRefusal) continuation = lastTurnMode;
+            clearAuthenticationFailure();
+            // A waiting provider ends now and a running one at its turn's end (`nextMessage` sees it stale); the next
+            // message starts one on the chosen account. Nothing runs on the old account any more when nothing is running.
+            wakeOrganizationRecovery();
+            if (!session.thinking) session.client.setClaudeRuntimeAccount(process.env[SETUP_TOKEN_BINDING_ENV]);
             return { version: 1, supported: true, switched: true };
         }
         if (params.action === 'retry') {
