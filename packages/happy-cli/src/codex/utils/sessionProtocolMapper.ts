@@ -1,4 +1,5 @@
 import { browserQuotaFailure } from '../../utils/browserQuotaFailure';
+import { isSessionDigestMcpInvocation } from './sessionDigestMcpInvocation';
 import { randomUUID } from 'node:crypto';
 import { createId } from '@paralleldrive/cuid2';
 import type { ReasoningOutput } from './reasoningProcessor';
@@ -696,17 +697,21 @@ export function mapCodexMcpMessageToSessionEnvelopes(message: Record<string, unk
 
     const invocation = message.invocation as { tool?: unknown; arguments?: unknown; server?: unknown } | undefined;
     if ((type === 'mcp_tool_call_begin' || type === 'mcp_tool_call_end')
-        && typeof invocation?.tool === 'string' && invocation.tool.startsWith('browser_task_')) {
+        && typeof invocation?.tool === 'string'
+        && (invocation.tool.startsWith('browser_task_') || isSessionDigestMcpInvocation(invocation))) {
         const call = pickCallId(message), envelopes: SessionEnvelope[] = [];
+        const browser = invocation.tool.startsWith('browser_task_');
         if (type === 'mcp_tool_call_begin') envelopes.push(createEnvelope('agent', {
-            t: 'tool-call-start', call, name: invocation.tool, title: invocation.tool, description: invocation.tool,
-            args: invocation.arguments && typeof invocation.arguments === 'object' && !Array.isArray(invocation.arguments)
-                ? invocation.arguments as Record<string, unknown> : {},
+            t: 'tool-call-start', call, name: browser ? invocation.tool : 'McpTool',
+            title: browser ? invocation.tool : `${invocation.server}.${invocation.tool}`, description: invocation.tool,
+            args: browser
+                ? (invocation.arguments && typeof invocation.arguments === 'object' && !Array.isArray(invocation.arguments) ? invocation.arguments as Record<string, unknown> : {})
+                : { server: invocation.server, tool: invocation.tool, arguments: invocation.arguments },
         }, opts));
         else {
             const result = message.result as { Ok?: unknown } | undefined;
             envelopes.push(createEnvelope('agent', { t: 'tool-call-end', call,
-                browserQuotaKind: browserQuotaFailure(result?.Ok ?? result),
+                ...(browser ? { browserQuotaKind: browserQuotaFailure(result?.Ok ?? result) } : {}),
             }, opts));
         }
         return { currentTurnId: state.currentTurnId, currentProviderTurnId: state.currentProviderTurnId ?? null,
