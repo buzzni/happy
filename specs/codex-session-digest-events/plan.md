@@ -27,3 +27,13 @@ Core의 기존 session event만 사용한다. 외부 의존·DB·공개 wire sch
 - [x] Ubuntu mirror+file 목록에서 반복 DNS 실패한 Azure mirror를 공개 Ubuntu HTTPS mirror 두 곳으로 대체한다.
 - [x] YAML·셸 구문과 mirror 파일 생성을 확인했다. 동일한 실제 SDK/bubblewrap 검증을 새 CI에서 실행한다.
 - [ ] 최종 head의 모든 OS·Node 검사 성공과 PR 상태를 확인한다. CLI 버전·릴리스·실사용 설치본은 변경하지 않는다.
+
+## PR #1250 재실행의 Chrome 시작 실패 (2026-11-12 사용자 수정 요청)
+
+1. [x] Chrome 즉시 종료를 실제 자식 프로세스로 재현하고 오류 원인·종료 코드·프로필 정리 회귀를 추가한다.
+2. [x] 테스트 도우미가 시작 실패를 즉시 알리고 stderr를 제한된 길이로 보존하도록 최소 수정한다.
+3. [ ] 같은 실제 Chrome/broker 검증을 유지하고 새 원격 CI로 시작 원인과 최종 통과 여부를 확인한다.
+
+재실행 attempt2는 DNS·bubblewrap·실 Claude SDK 검사를 통과했다. 새 실패는
+localClients.poc.test.ts의 Chrome DevToolsActivePort 생성 전 timeout이다.
+기능 검사 생략·Chrome sandbox 비활성화·CLI 릴리스·main 병합은 하지 않는다.

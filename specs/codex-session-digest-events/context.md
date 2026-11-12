@@ -82,3 +82,20 @@ CI 보완 로컬 확인: js-yaml 파싱·전체 run 블록 bash -n·prefix를 �
 HTTPS mirror2줄 생성 확인. bubblewrap 설치와 integration-claude-auth-pin 명령이 유지됨을
 검사했다. security.ubuntu.com의 noble InRelease와 필요한 bubblewrap .deb HTTP200 확인.
 제품 소스 diff는 없으며 해당 워크플로와 spec plan/context만 수정했다. 새 CI에서 검증한다.
+
+## 2026-11-12 재실행 attempt2의 실제 Chrome 실패
+
+사용자가 job130860751958 실패 해결을 요청했다. Happy 전용 체크아웃의 origin이
+buzzni/happy이며 원격 branch head c6829f1과 같고 clean인 것을 확인했다.
+새 job은 apt/bubblewrap와 실제 Claude SDK 검사를 통과했고 localClients.poc.test.ts의
+launchChrome에서 DevToolsActivePort 미생성으로 실패했다. 기존 helper의 stdio:ignore가
+시작 오류와 조기 종료를 숨겨 20초 timeout만 남긴다. 환경 원인은 아직 확정하지 않는다.
+
+테스트 전용 helper가 stderr tail8192자와 spawn/exit 원인을 보존하고 조기 종료 시
+즉시 실패하며 실패 프로필도 정리하도록 보완했다. 실제 자식 프로세스가 exit23과
+synthetic 오류를 남기는 회귀는 기존 코드에서20초 후 실패(Red), 수정 뒤 통과했다.
+생산 build/typecheck를 포함하는 단위 회귀1건 및 실제 Chrome/broker 수집·철회
+왕복1건(macOS, 합성 데이터) 통과. Chrome sandbox/검사 조건은 유지한다.
+의존성이 원래 체크아웃의 삭제된 경로를 가리켜 이 작업 폴더에 frozen-lockfile
+CLI+wire 설치를 복구했다(ignore-scripts, lockfile 변경 없음). CLI 버전/설치본은 안 바꿨다.
+다음은 진단이 보강된 같은 Linux CI에서 실제 시작 실패 원인을 확인하고 해결하는 단계다.
