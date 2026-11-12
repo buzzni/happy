@@ -18,11 +18,14 @@ export function createBrowserSessionReconnect() {
     const prepare = async (options: ReconnectOptions): Promise<ReconnectResult> => {
         const current = async () => { if (!await options.current()) throw Error('DESKTOP_BROWSER_LOGIN_REQUIRED') }
         const verifyExit = async (target: PendingExit) => {
-            for (const deadline = Date.now() + (options.deadlineMs ?? 10_000); Date.now() < deadline;) {
+            // Checked before the deadline is: a deadline already past when the loop starts (a short one on a busy
+            // host) must not turn an exit nobody looked at into UNCONFIRMED.
+            for (const deadline = Date.now() + (options.deadlineMs ?? 10_000); ;) {
                 await current()
                 const next = await options.startTime(target.pid)
                 await current()
                 if (next === undefined ? !options.alive(target.pid) : next !== target.start) return
+                if (Date.now() >= deadline) break
                 await new Promise(resolve => setTimeout(resolve, 50))
             }
             throw Error('BROWSER_SESSION_RECONNECT_UNCONFIRMED')
