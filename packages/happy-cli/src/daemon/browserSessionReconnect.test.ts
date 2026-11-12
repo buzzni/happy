@@ -84,3 +84,14 @@ it('serializes concurrent retries and keeps pending exits ahead of new registrat
     await expect(prepareBrowserSessionReconnect({ ...f, deadlineMs: 1 })).rejects.toThrow('UNCONFIRMED')
     expect(f.stop).toHaveBeenCalledOnce()
 })
+
+it('checks an exit at least once even when the clock passes a short deadline before the first check', async () => {
+    // A loaded runner can cross the millisecond boundary between taking the deadline and checking it.
+    let clock = 1_000
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => clock += 5)
+    try {
+        const f = fixture()
+        expect(await prepareBrowserSessionReconnect({ ...f, deadlineMs: 1 })).toEqual({ supported: true, reconnect: true })
+        expect(f.stop).toHaveBeenCalledOnce()
+    } finally { now.mockRestore() }
+})
