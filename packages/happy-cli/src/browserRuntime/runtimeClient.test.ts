@@ -45,3 +45,20 @@ describe('RuntimeClient', () => {
         expect(JSON.parse(fetchImpl.mock.calls[0][1]!.body as string).waitMs).toBe(500)
     })
 })
+
+
+describe('confirmed browser usage', () => {
+    it('records usage only after createTask succeeds, never on read or refusal', async () => {
+        const onTaskCreated = vi.fn()
+        const fetchImpl = vi.fn().mockResolvedValueOnce(ok({ taskId: 't1' }))
+            .mockResolvedValueOnce(ok({ taskId: 't1' }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({ ok: false, error: { code: 'FORBIDDEN', message: 'no' } })))
+        const client = new RuntimeClient({ baseUrl: 'http://runtime', token: 'grant', fetchImpl, onTaskCreated })
+        await client.getTask({ taskId: 't1' as TaskId })
+        expect(onTaskCreated).not.toHaveBeenCalled()
+        await client.createTask({} as never)
+        expect(onTaskCreated).toHaveBeenCalledTimes(1)
+        await expect(client.createTask({} as never)).rejects.toThrow()
+        expect(onTaskCreated).toHaveBeenCalledTimes(1)
+    })
+})

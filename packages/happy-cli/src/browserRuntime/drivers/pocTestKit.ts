@@ -57,13 +57,20 @@ export async function launchChrome(): Promise<LaunchedChrome> {
         '--use-mock-keychain',
         '--window-size=800,600',
         'about:blank',
-    ], { stdio: 'ignore' })
-    const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()))
+    ], { stdio: ['ignore', 'ignore', 'pipe'] })
+    let diagnostics = ''
+    let failure: string | undefined
+    child.stderr?.on('data', (chunk) => { diagnostics = (diagnostics + String(chunk)).slice(-8192) })
+    const exited = new Promise<void>((resolve) => {
+        child.once('error', (error) => { failure = error.message; resolve() })
+        child.once('exit', (code, signal) => { failure = `exit ${code}, signal ${signal ?? 'none'}`; resolve() })
+    })
 
     const portFile = join(userDataDir, 'DevToolsActivePort')
     const deadline = Date.now() + 20_000
     let content = ''
     while (Date.now() < deadline) {
+        if (failure) break
         if (existsSync(portFile)) {
             content = readFileSync(portFile, 'utf8')
             if (content.split('\n').length >= 2 && content.split('\n')[1]) break
@@ -71,9 +78,11 @@ export async function launchChrome(): Promise<LaunchedChrome> {
         await delay(50)
     }
     const [port, path] = content.trim().split('\n')
-    if (!port || !path) {
+    if (!port || !path || failure) {
         child.kill('SIGKILL')
-        throw new Error('Chrome did not publish DevToolsActivePort')
+        await Promise.race([exited, delay(5_000)])
+        rmSync(userDataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+        throw new Error(`Chrome did not publish DevToolsActivePort (${failure ?? 'startup timeout'}): ${diagnostics.trim() || 'no stderr'}`)
     }
     const versionInfo = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json() as { Browser: string; webSocketDebuggerUrl: string }
 

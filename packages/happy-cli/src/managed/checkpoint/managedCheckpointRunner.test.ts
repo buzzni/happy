@@ -54,7 +54,7 @@ function fakeStore() {
                 },
             });
         }
-        return new Response(stored, {
+        return new Response(new Uint8Array(stored), {
             status: 200,
             headers: { etag: `"${createHash('md5').update(stored).digest('hex')}"` },
         });
