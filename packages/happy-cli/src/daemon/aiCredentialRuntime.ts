@@ -67,7 +67,7 @@ import {
 
 const MAX_PAYLOAD_BYTES = 1024 * 1024
 const CLAUDE_SWAP_PACKAGE = 'saycode-claude-swap'
-const CLAUDE_SWAP_VERSION = '0.27.0b3'
+const CLAUDE_SWAP_VERSION = '0.27.0b4'
 /** Windows: the daemon's claude-swap calls and `cswap auto` run through this verified base Python (RE8). */
 export const claudeSwapPython = createClaudeSwapPythonResolver({ platform: process.platform, find: () => findClaudeSwapPython(CLAUDE_SWAP_PACKAGE, process.env), verify: verifyClaudeSwapPython })
 const CLAUDE_STATUS_TIMEOUT_MS = 120_000
@@ -637,6 +637,8 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
    * running sessions read it on their next 401); the result is the access-only bundle to deliver.
    */
   async function assertClaudeRefreshOwner(): Promise<void> {
+    // Desktop never upgrades an installed claude-swap, so every owner operation brings it up to the pin first.
+    try { await ensureClaudeSwap(true, CLAUDE_SWAP_VERSION) } catch { /* The capability check below reports it. */ }
     let supported = false
     try { supported = JSON.parse((await deps.execFile('cswap', ['oauth-owner', 'capabilities'], {
       maxOutputBytes: 64 * 1024, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
@@ -874,10 +876,10 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     try { return parseCswapVersion((await deps.execFile('cswap', ['--version'])).stdout) } catch { return null }
   }
 
-  async function ensureClaudeSwap(preserveSettings = false): Promise<void> {
+  async function ensureClaudeSwap(preserveSettings = false, minimum?: string): Promise<void> {
     await deps.execFile('uv', ['--version'])
     // A newer installed build is kept: replacing it with the pin would be a silent downgrade.
-    if (!cswapAtLeastPinned(await installedClaudeSwapVersion())) {
+    if (!cswapAtLeastPinned(await installedClaudeSwapVersion(), minimum)) {
       // Only an install needs a Python. Desktop installs cswap on its own pinned Windows Python, which uv cannot discover;
       // looking for one before every apply failed every group sync there (2026-10-12 hmrepo, Error:ENOENT).
       const python = await claudeSwapPython()
@@ -3071,8 +3073,8 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (machineId && origin && metadata.artifact === 'saycode-setup-token-runtime-v1' && metadata.organizationCollectorVersion === 1) {
       try { collector = await collectorVerificationReady(origin) } catch {}
     }
-    const claudeOwner = metadata.claudeRefreshOwnerVersion === 1
-    return { version: 1, codexRecoveryVersion: 1, codexRefreshOwnerVersion: 1, ...(claudeOwner ? { claudeRefreshOwnerVersion: 1 } : {}), orgLlmEndpointVersion: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1, collectorMachinePrincipalVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, setupTokenResumeRequirementVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
+    // claudeRefreshOwnerVersion: this daemon brings claude-swap up to the owner contract before any owner operation.
+    return { version: 1, codexRecoveryVersion: 1, codexRefreshOwnerVersion: 1, claudeRefreshOwnerVersion: 1, orgLlmEndpointVersion: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1, collectorMachinePrincipalVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, setupTokenResumeRequirementVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
     // Managed setup-token import with metadata verification, only on the marked cswap token runtime.
     ...(setupToken ? { setupTokenVersion: 1, setupTokenStatusVersion: 1 } : {}),
     // Advertised only when a server-signed binding proof can actually be verified here.

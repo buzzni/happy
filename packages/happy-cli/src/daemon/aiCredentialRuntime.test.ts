@@ -2871,7 +2871,7 @@ describe('AI credential machine runtime', () => {
     await runtime.apply({ provider: 'claude', payload: '{}' })
 
     expect(execFile).toHaveBeenCalledWith('uv', [
-      'tool', 'install', 'saycode-claude-swap==0.27.0b3', '--python', '>=3.12', '--force',
+      'tool', 'install', 'saycode-claude-swap==0.27.0b4', '--python', '>=3.12', '--force',
     ], expect.anything())
   })
 
@@ -2905,7 +2905,7 @@ describe('AI credential machine runtime', () => {
     await runtime.apply({ provider: 'claude', payload: '{}' })
 
     expect(execFile).toHaveBeenCalledWith('uv', [
-      'tool', 'install', 'saycode-claude-swap==0.27.0b3', '--python', physical, '--force',
+      'tool', 'install', 'saycode-claude-swap==0.27.0b4', '--python', physical, '--force',
     ], expect.anything())
   })
 
@@ -2953,7 +2953,7 @@ describe('AI credential machine runtime', () => {
     await runtime.apply({ provider: 'claude', payload: '{}' })
 
     expect(execFile).toHaveBeenCalledWith('uv', [
-      'tool', 'install', 'saycode-claude-swap==0.27.0b3', '--python', '>=3.12', '--force',
+      'tool', 'install', 'saycode-claude-swap==0.27.0b4', '--python', '>=3.12', '--force',
     ], expect.anything())
   })
 
@@ -4538,7 +4538,8 @@ describe('Claude OAuth refresh owner', () => {
     const state = setup({ execFile })
     await expect(state.runtime.capture({ provider: 'claude', refreshOwner: true })).resolves.toMatchObject({ provider: 'claude', payload: ownerPayload })
     await expect(state.runtime.refreshClaudeOwner({ provider: 'claude' })).resolves.toEqual({ provider: 'claude', payload: ownerPayload })
-    expect(execFile.mock.calls.filter(([command]) => command === 'cswap').every(([, args]) => args[0] === 'oauth-owner')).toBe(true)
+    // The secret-bearing roster export never runs on an owner path.
+    expect(execFile.mock.calls.some(([command, args]) => command === 'cswap' && args[0] === 'export')).toBe(false)
   })
   it('refuses helper output that retains a refresh secret', async () => {
     const payload = JSON.parse(ownerPayload)
@@ -4560,6 +4561,29 @@ it.each(['2.1.218 (Claude Code)', '2.2.0 (Claude Code)', '3.0.1 (Claude Code)'])
   const state = setup({ execFile: vi.fn(async (command, args) => ({ stdout: command === 'claude' ? version
     : args[1] === 'capabilities' ? JSON.stringify({ claudeRefreshOwnerVersion: 1 }) : ownerPayload, stderr: '' })) })
   await expect(state.runtime.refreshClaudeOwner({ provider: 'claude' })).resolves.toEqual({ provider: 'claude', payload: ownerPayload })
+})
+
+it.each(['capture', 'refresh'] as const)('upgrades an older claude-swap on the source before an owner %s, keeping its settings', async (operation) => {
+  const ownerPayload = JSON.stringify({ version: 1, encrypted: false, accounts: [{ number: 1, email: 'a@example.com',
+    credentials: { claudeAiOauth: { accessToken: 'fake-access', expiresAt: 9999999999999, saycodeRefreshOwnerVersion: 1 } } }] })
+  let installed = '0.27.0b3'
+  const execFile = vi.fn(async (command: string, args: string[]) => {
+    if (command === 'claude') return { stdout: '2.1.323 (Claude Code)', stderr: '' }
+    if (command === 'cswap' && args[0] === '--version') return { stdout: `claude-swap ${installed}`, stderr: '' }
+    if (command === 'uv' && args[0] === 'tool') { installed = '0.27.0b4'; return { stdout: '', stderr: '' } }
+    if (command === 'cswap' && args[1] === 'capabilities') return { stdout: installed === '0.27.0b4' ? JSON.stringify({ claudeRefreshOwnerVersion: 1 }) : '', stderr: '' }
+    return { stdout: command === 'cswap' ? ownerPayload : '', stderr: '' }
+  })
+  const state = setup({ execFile })
+  await expect(operation === 'capture' ? state.runtime.capture({ provider: 'claude', refreshOwner: true })
+    : state.runtime.refreshClaudeOwner({ provider: 'claude' })).resolves.toMatchObject({ provider: 'claude', payload: ownerPayload })
+  expect(execFile).toHaveBeenCalledWith('uv', expect.arrayContaining(['tool', 'install', 'saycode-claude-swap==0.27.0b4']), expect.anything())
+  expect(execFile.mock.calls.some(([command, args]) => command === 'cswap' && args[0] === 'config')).toBe(false)
+})
+
+it('advertises Claude owner refresh on an older claude-swap, which owner operations upgrade first', async () => {
+  const state = setup({ execFile: vi.fn(async () => ({ stdout: '', stderr: '' })) })
+  await expect(state.runtime.capabilities()).resolves.toMatchObject({ claudeRefreshOwnerVersion: 1 })
 })
 
 it('refuses owner rotation on 2.0.x even with a later patch number', async () => {
@@ -4591,7 +4615,7 @@ it('updates an installed owner bearer without probing or changing a personal acc
   const personalBefore = JSON.stringify(personal)
   let state: ReturnType<typeof setup>
   const execFile = vi.fn(async (command: string, args: string[]) => {
-    if (command === 'cswap' && args[0] === '--version') return { stdout: 'claude-swap 0.27.0b3', stderr: '' }
+    if (command === 'cswap' && args[0] === '--version') return { stdout: 'claude-swap 0.27.0b4', stderr: '' }
     if (command === 'cswap' && args[0] === 'oauth-owner' && args[1] === 'capabilities') return { stdout: JSON.stringify({ claudeRefreshOwnerVersion: 1 }), stderr: '' }
     if (command === 'cswap' && args[0] === 'list') return { stdout: JSON.stringify({ schemaVersion: 1, activeAccountNumber: 1,
       accounts: [{ number: 1, email: 'owner@example.com', disabled: true }, { number: 2, email: 'personal@example.com' }] }), stderr: '' }
