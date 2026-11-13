@@ -1488,6 +1488,21 @@ describe('ApiMachineClient socket reconnection', () => {
         expect(JSON.stringify([vi.mocked(logger.debug).mock.calls, vi.mocked(logger.debugLargeJson).mock.calls])).not.toContain(result.payload);
     });
 
+    it('routes the Claude owner refresh through the credential runtime without logging its payload', async () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        const result = { provider: 'claude', payload: 'access-only-bundle-secret' };
+        const refreshClaudeOwner = vi.fn(async () => result);
+        client.setRPCHandlers({ spawnSession: vi.fn(), stopSession: vi.fn(), requestShutdown: vi.fn(),
+            portRegistry: {} as any, aiCredentialRuntime: { refreshClaudeOwner } as any });
+        const handler = (client as any).rpcHandlerManager.registerHandler.mock.calls
+            .find(([method]: [string]) => method === 'ai-credential:refresh-claude-owner')?.[1];
+        expect(handler).toBeTypeOf('function');
+        const input = { provider: 'claude', thresholdMs: 1000 };
+        await expect(handler(input)).resolves.toEqual(result);
+        expect(refreshClaudeOwner).toHaveBeenCalledExactlyOnceWith(input);
+        expect(JSON.stringify([vi.mocked(logger.debug).mock.calls, vi.mocked(logger.debugLargeJson).mock.calls])).not.toContain(result.payload);
+    });
+
     it('exposes additive credential capability without receiving credentials', async () => {
         const client = new ApiMachineClient('fake-token', makeMachine());
         const capabilities = vi.fn(() => ({ version: 1, applyModes: ['merge', 'replace'] }));

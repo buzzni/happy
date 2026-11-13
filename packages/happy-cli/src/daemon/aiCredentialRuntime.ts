@@ -1,3 +1,4 @@
+import { containsClaudeRefreshSecret, hasClaudeSubscriptionAccounts, claudeOwnerEnvironment, holdsNoClaudeRefreshToken, hasClaudeOwnerAccounts, isClaudeOwnerAccount, newerClaudeOwnerAccounts } from './claudeOwnerBundle'
 import { createHash } from 'node:crypto'
 import { createPersonalProbeScheduler } from './personalProbeScheduler'
 import { createTokenProbe, personalProbeSupported, readTokenRuntime } from './tokenProbe'
@@ -66,7 +67,7 @@ import {
 
 const MAX_PAYLOAD_BYTES = 1024 * 1024
 const CLAUDE_SWAP_PACKAGE = 'saycode-claude-swap'
-const CLAUDE_SWAP_VERSION = '0.27.0b3'
+const CLAUDE_SWAP_VERSION = '0.27.0b4'
 /** Windows: the daemon's claude-swap calls and `cswap auto` run through this verified base Python (RE8). */
 export const claudeSwapPython = createClaudeSwapPythonResolver({ platform: process.platform, find: () => findClaudeSwapPython(CLAUDE_SWAP_PACKAGE, process.env), verify: verifyClaudeSwapPython })
 const CLAUDE_STATUS_TIMEOUT_MS = 120_000
@@ -506,8 +507,14 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     }
     let payload: string
     if (selected === 'claude') {
-      const result = await deps.execFile('cswap', ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES })
+      if (input.refreshOwner) await assertClaudeRefreshOwner()
+      const result = await deps.execFile('cswap', input.refreshOwner ? ['oauth-owner', 'export'] : ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES })
       payload = result.stdout
+      // Only subscription logins are rotated on this source; API keys and setup tokens need no Claude CLI.
+      if (input.refreshOwner && hasClaudeOwnerAccounts(payload)) await assertClaudeOwnerCli()
+      // A subscription login's access token shares the setup-token prefix, so the refresh grant itself decides.
+      if (!input.refreshOwner && (hasClaudeSubscriptionAccounts(payload) || containsClaudeRefreshSecret(payload))) throw new AiCredentialRuntimeError('CLAUDE_REFRESH_OWNER_UNSUPPORTED')
+      if (input.refreshOwner && !holdsNoClaudeRefreshToken(payload)) throw new AiCredentialRuntimeError('CLAUDE_REFRESH_TOKEN_EXPORTED')
     } else {
       const packageVersion = await assertSupportedCodexMultiAuthInstalled()
       let accounts: unknown
@@ -629,6 +636,38 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
    * stale copy back; accounts close to expiry are rotated by Codex itself (the active one in the live home, so
    * running sessions read it on their next 401); the result is the access-only bundle to deliver.
    */
+  async function assertClaudeRefreshOwner(): Promise<void> {
+    // Desktop never upgrades an installed claude-swap, so every owner operation brings it up to the pin first.
+    try { await ensureClaudeSwap(true, CLAUDE_SWAP_VERSION) } catch { /* The capability check below reports it. */ }
+    let supported = false
+    try { supported = JSON.parse((await deps.execFile('cswap', ['oauth-owner', 'capabilities'], {
+      maxOutputBytes: 64 * 1024, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+    })).stdout).claudeRefreshOwnerVersion === 1 } catch {}
+    if (!supported) throw new AiCredentialRuntimeError('CLAUDE_REFRESH_OWNER_UNSUPPORTED')
+  }
+
+  async function assertClaudeOwnerCli(): Promise<void> {
+    // cswap's credential locks follow the protocol verified in 2.1.218; later releases keep rotating rather than stopping every source.
+    const version = (await deps.execFile('claude', ['--version'], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })).stdout.match(/\b(\d+)\.(\d+)\.(\d+)\b/)
+    const [major, minor, patch] = version ? version.slice(1).map(Number) : []
+    if (!version || major! < 2 || major === 2 && (minor! < 1 || minor === 1 && patch! < 218)) throw new AiCredentialRuntimeError('CLAUDE_REFRESH_OWNER_UNSUPPORTED')
+  }
+
+  async function refreshClaudeOwner(input: { provider: 'claude'; thresholdMs?: number }) {
+    return serialize(() => withSafeErrors('CLAUDE_OWNER_REFRESH_FAILED', async () => {
+      if (input?.provider !== 'claude') throw new AiCredentialRuntimeError('INVALID_PROVIDER')
+      const threshold = input.thresholdMs ?? 3_600_000
+      if (!Number.isInteger(threshold) || threshold < 0 || threshold > 86_400_000) throw new AiCredentialRuntimeError('INVALID_THRESHOLD')
+      await assertClaudeRefreshOwner()
+      await assertClaudeOwnerCli()
+      const { stdout } = await deps.execFile('cswap', ['oauth-owner', 'refresh', '--threshold-ms', String(threshold)], {
+        maxOutputBytes: MAX_PAYLOAD_BYTES, timeoutMs: 300_000,
+      })
+      if (!holdsNoClaudeRefreshToken(stdout)) throw new AiCredentialRuntimeError('CLAUDE_REFRESH_TOKEN_EXPORTED')
+      return { provider: 'claude' as const, payload: stdout }
+    }))
+  }
+
   async function refreshCodexOwner(input: { provider: 'codex'; thresholdMs?: number }) {
     if (provider(input?.provider) !== 'codex') throw new AiCredentialRuntimeError('CODEX_OWNER_REFRESH_UNSUPPORTED')
     const thresholdMs = typeof input.thresholdMs === 'number' && Number.isFinite(input.thresholdMs) && input.thresholdMs > 0
@@ -837,10 +876,10 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     try { return parseCswapVersion((await deps.execFile('cswap', ['--version'])).stdout) } catch { return null }
   }
 
-  async function ensureClaudeSwap(preserveSettings = false): Promise<void> {
+  async function ensureClaudeSwap(preserveSettings = false, minimum?: string): Promise<void> {
     await deps.execFile('uv', ['--version'])
     // A newer installed build is kept: replacing it with the pin would be a silent downgrade.
-    if (!cswapAtLeastPinned(await installedClaudeSwapVersion())) {
+    if (!cswapAtLeastPinned(await installedClaudeSwapVersion(), minimum)) {
       // Only an install needs a Python. Desktop installs cswap on its own pinned Windows Python, which uv cannot discover;
       // looking for one before every apply failed every group sync there (2026-10-12 hmrepo, Error:ENOENT).
       const python = await claudeSwapPython()
@@ -878,6 +917,11 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   }
 
   async function applyClaudeAdditive(payload: string, knownCompanyIdentities: Set<string>, groupOwned: ReadonlySet<string> = new Set()) {
+    if (containsClaudeRefreshSecret(payload)) throw new AiCredentialRuntimeError('CLAUDE_REFRESH_TOKEN_EXPORTED')
+    if (hasClaudeOwnerAccounts(payload)) {
+      await assertClaudeRefreshOwner()
+      if (!holdsNoClaudeRefreshToken(payload)) throw new AiCredentialRuntimeError('CLAUDE_REFRESH_TOKEN_EXPORTED')
+    }
     const incoming = claudeImportedAccountIdentities(payload)
     if (!incoming) throw new AiCredentialRuntimeError('AI_CREDENTIAL_MERGE_UNSUPPORTED')
     let managed: Array<Record<string, unknown> & { email: string }>
@@ -958,8 +1002,42 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     let repairRequestedAccountCount = 0
     const repairedIdentities = new Set<string>()
     // Managed setup-token slots are replaced by generation below; they never take the inference repair path.
+    const owners = envelope.accounts.filter(isClaudeOwnerAccount)
+    if (owners.length > 0) {
+      const local = await exportedAccounts()
+      const updates = newerClaudeOwnerAccounts(owners, local).filter(account => {
+        const stored = local.find(slot => claudeListAccountIdentity(slot as { email: string }) === claudeListAccountIdentity(account as { email: string }))
+        if (stored && !isClaudeOwnerAccount(stored) && ![...knownCompanyIdentities].some(identity => {
+          const [email, org] = JSON.parse(identity)
+          return email === account.email && (org || '') === (account.organizationUuid || '')
+        }) && !groupOwned.has(groupAccountIdentity('claude', account))) {
+          throw new AiCredentialRuntimeError('AI_GROUP_CREDENTIAL_CONFLICT')
+        }
+        return !!stored
+      })
+      await deps.mkdir(join(deps.homeDir, '.happy'), { recursive: true, mode: 0o700 })
+      await writeAtomicFile(deps, join(deps.homeDir, '.happy', 'claude-owner-target.v1.json'), JSON.stringify({ version: 1 }))
+      if (updates.length) {
+        const directory = await deps.makeTempDir()
+        try {
+          const file = join(directory, 'claude-owner.json')
+          await deps.writeFile(file, JSON.stringify({ ...envelope, accounts: updates }), { mode: 0o600 })
+          await deps.execFile('cswap', ['oauth-owner', 'import', '--file', file])
+          const active = before.accounts.find(slot => slot.number === before.activeAccountNumber)
+          if (active && updates.some(account => claudeListAccountIdentity(account as { email: string }) === claudeListAccountIdentity(active))) {
+            await deps.execFile('cswap', ['switch', String(active.number), '--force', '--json'], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
+          }
+          const installed = await exportedAccounts()
+          for (const account of updates) {
+            const actual = installed.find(slot => claudeListAccountIdentity(slot as { email: string }) === claudeListAccountIdentity(account as { email: string }))
+            if (!actual || !isClaudeOwnerAccount(actual) || newerClaudeOwnerAccounts([account], [actual]).length) throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+            knownCompanyIdentities.add(JSON.stringify([account.email, account.organizationUuid ?? '', account.organizationName ?? '']))
+          }
+        } finally { await deps.rm(directory, { recursive: true, force: true }) }
+      }
+    }
     const duplicates: Array<Record<string, unknown> & { email: string }> = envelope.accounts.filter((account: { email: string }) =>
-      managedSetupTokenId(account.email) === null && before.accounts.some(local => claudeListAccountIdentity(local) === claudeListAccountIdentity(account) && local.disabled !== true))
+      !isClaudeOwnerAccount(account) && managedSetupTokenId(account.email) === null && before.accounts.some(local => claudeListAccountIdentity(local) === claudeListAccountIdentity(account) && local.disabled !== true))
     if (duplicates.length > 0) {
       const exported = JSON.parse((await deps.execFile('cswap', ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES })).stdout)
       if (exported.version !== 1 || exported.encrypted === true || !Array.isArray(exported.accounts)) throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
@@ -1150,6 +1228,13 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       maxOutputBytes: MAX_PAYLOAD_BYTES, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
     })).stdout)
     const { before, envelope, requested, verification } = prepared
+    const ownerRepair = envelope.accounts.some(isClaudeOwnerAccount)
+    if (ownerRepair) {
+      await assertClaudeRefreshOwner()
+      if (!holdsNoClaudeRefreshToken(JSON.stringify(envelope))) throw new AiCredentialRuntimeError('CLAUDE_REFRESH_TOKEN_EXPORTED')
+      await deps.mkdir(join(deps.homeDir, '.happy'), { recursive: true, mode: 0o700 })
+      await writeAtomicFile(deps, join(deps.homeDir, '.happy', 'claude-owner-target.v1.json'), JSON.stringify({ version: 1 }))
+    }
     const restoreRotation = deps.supervisor.status().state !== 'stopped'
     let rotationStopped = false
     const tempDir = await deps.makeTempDir()
@@ -1175,7 +1260,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       const file = join(tempDir, 'claude-swap.json')
       await deps.writeFile(file, JSON.stringify(envelope), { mode: 0o600 })
       await deps.chmod(file, 0o600)
-      await deps.execFile('cswap', ['import', file, '--force'])
+      await deps.execFile('cswap', ownerRepair ? ['oauth-owner', 'import', '--file', file] : ['import', file, '--force'])
       const repairedIdentities = new Set(envelope.accounts.map(claudeListAccountIdentity))
       const active = before.accounts.find(account => account.number === before.activeAccountNumber)
       if (active && repairedIdentities.has(claudeListAccountIdentity(active))) {
@@ -1210,6 +1295,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   }
 
   async function applyClaude(payload: string) {
+    if (hasClaudeOwnerAccounts(payload)) return applyClaudeAdditive(payload, new Set())
     await purgeManagedProvider('zai')
     const apiKeyTargetEmail = claudeApiKeyTargetEmail(payload)
     const importedAccountIdentities = claudeImportedAccountIdentities(payload)
@@ -1883,6 +1969,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       throw new AiCredentialRuntimeError('INVALID_PAYLOAD')
     }
     assertPayloadSize(input.payload)
+    if (selected === 'claude' && containsClaudeRefreshSecret(input.payload)) throw new AiCredentialRuntimeError('CLAUDE_REFRESH_TOKEN_EXPORTED')
     const applyMode = input.applyMode ?? 'replace'
     if (applyMode !== 'merge' && applyMode !== 'replace' && applyMode !== 'repair') throw new AiCredentialRuntimeError('INVALID_PAYLOAD')
     if (input.activeAccountIndex !== undefined && (applyMode !== 'merge' || selected === 'zai')) throw new AiCredentialRuntimeError('INVALID_PAYLOAD')
@@ -2839,7 +2926,13 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         return shared
       }
       await refuseUnboundManagedDefault()
-      const environment = {}
+      let environment: Record<string, string> = {}
+      if (await readOptionalJson(join(deps.homeDir, '.happy', 'claude-owner-target.v1.json'))) {
+        try {
+        const exported = await deps.execFile('cswap', ['oauth-owner', 'active'], { maxOutputBytes: MAX_PAYLOAD_BYTES, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
+        environment = claudeOwnerEnvironment(exported.stdout, deps.now())
+        } catch { throw new AiCredentialRuntimeError('CLAUDE_OWNER_REFRESH_REQUIRED') }
+      }
       defaultSessionLaunches.add(environment)
       return environment
     })
@@ -2969,7 +3062,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (entries.length !== 1 || entries[0].pending) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_ASSIGNMENT_UNRESOLVED')
     return entries[0].scope
   })
-  return { orgLlmEndpointSync, sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, sharedMachineAccountEnvironment, sharedMachineStartProof, sharedMachineStartBudgetMove, measureWithPermit, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, refreshCodexOwner, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
+  return { orgLlmEndpointSync, sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, sharedMachineAccountEnvironment, sharedMachineStartProof, sharedMachineStartBudgetMove, measureWithPermit, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, refreshCodexOwner, refreshClaudeOwner, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
     // One fresh runtime observation per RPC: launching cswap repeatedly can block a secured Windows host.
     let stdout = ''
     try { stdout = (await deps.execFile('cswap', ['token-runtime', 'capabilities'], { maxOutputBytes: 64 * 1024, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })).stdout } catch {}
@@ -2980,7 +3073,8 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (machineId && origin && metadata.artifact === 'saycode-setup-token-runtime-v1' && metadata.organizationCollectorVersion === 1) {
       try { collector = await collectorVerificationReady(origin) } catch {}
     }
-    return { version: 1, codexRecoveryVersion: 1, codexRefreshOwnerVersion: 1, orgLlmEndpointVersion: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1, collectorMachinePrincipalVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, setupTokenResumeRequirementVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
+    // claudeRefreshOwnerVersion: this daemon brings claude-swap up to the owner contract before any owner operation.
+    return { version: 1, codexRecoveryVersion: 1, codexRefreshOwnerVersion: 1, claudeRefreshOwnerVersion: 1, orgLlmEndpointVersion: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1, collectorMachinePrincipalVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, setupTokenResumeRequirementVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
     // Managed setup-token import with metadata verification, only on the marked cswap token runtime.
     ...(setupToken ? { setupTokenVersion: 1, setupTokenStatusVersion: 1 } : {}),
     // Advertised only when a server-signed binding proof can actually be verified here.
@@ -3430,7 +3524,7 @@ async function writeAtomicFile(
 }
 
 // Group journal and provider adapters throw their own fixed codes as plain Errors; those name the real failure.
-const GROUP_FAILURE_CODE = /^AI_GROUP_[A-Z0-9_]{1,64}$/
+const GROUP_FAILURE_CODE = /^(?:AI_GROUP_|CLAUDE_OWNER_)[A-Z0-9_]{1,64}$/
 
 async function withSafeErrors<T>(kind: string, operation: () => Promise<T>): Promise<T> {
   try {

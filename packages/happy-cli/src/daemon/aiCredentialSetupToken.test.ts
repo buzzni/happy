@@ -98,6 +98,13 @@ function fakeMachine(initial: Slot[], activeAccountNumber: number | null, option
       accounts: state.slots.map(({ credentials: _c, config: _f, ...row }) => ({ ...row, active: row.number === state.active })) }), stderr: '' }
     if (command === 'cswap' && args[0] === 'export' && options.clock && options.advanceOnExport) options.clock.now += options.advanceOnExport
     if (command === 'cswap' && args[0] === 'export') return { stdout: JSON.stringify({ version: 1, encrypted: false, accounts: state.slots }), stderr: '' }
+    if (command === 'cswap' && args[0] === 'oauth-owner' && args[1] === 'capabilities') return { stdout: JSON.stringify({ version: 1, claudeRefreshOwnerVersion: 1 }), stderr: '' }
+    if (command === 'cswap' && args[0] === 'oauth-owner' && args[1] === 'active') {
+      // Like cswap oauth_owner.active_snapshot: only an owner-managed active slot leaves the command.
+      const active = state.slots.find(slot => slot.number === state.active)
+      const owned = active && (active.credentials as { claudeAiOauth?: { saycodeRefreshOwnerVersion?: unknown } } | undefined)?.claudeAiOauth?.saycodeRefreshOwnerVersion === 1
+      return { stdout: JSON.stringify({ version: 1, encrypted: false, activeAccountNumber: owned ? active.number : null, accounts: owned ? [active] : [] }), stderr: '' }
+    }
     if (command === 'cswap' && args[0] === 'import') {
       const envelope = JSON.parse(files.get(args[1]!)!)
       for (const account of envelope.accounts) {
@@ -1471,7 +1478,11 @@ describe('managed Claude setup-token runtime', () => {
     it('leaves ordinary OAuth group assignments and personal defaults unchanged', async () => {
       const personal: Slot = { number: 1, email: 'me@example.com', usageStatus: 'ok', credentials: { claudeAiOauth: { accessToken: 'personal', refreshToken: 'r' } } }
       const { runtime } = fakeMachine([personal], 1)
-      await runtime.groupSync(sync(1, payload({ number: 1, email: 'shared@example.com', organizationUuid: '', credentials: { claudeAiOauth: { accessToken: 'oauth', refreshToken: 'r' } }, config: {} })))
+      // specs/claude-oauth-refresh-owner: a copied refresh grant never reaches a target; the source keeps it.
+      await expect(runtime.groupSync(sync(1, payload({ number: 1, email: 'shared@example.com', organizationUuid: '', credentials: { claudeAiOauth: { accessToken: 'oauth', refreshToken: 'r' } }, config: {} }))))
+        .rejects.toThrow('CLAUDE_REFRESH_TOKEN_EXPORTED')
+      await runtime.groupSync(sync(2, payload({ number: 1, email: 'shared@example.com', organizationUuid: '', config: {},
+        credentials: { claudeAiOauth: { accessToken: 'oauth', expiresAt: 9_999_999_999_999, saycodeRefreshOwnerVersion: 1 } } })))
       expect(await runtime.sessionEnvironment('claude')).toEqual({})
     })
 
