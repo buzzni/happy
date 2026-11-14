@@ -25,6 +25,11 @@ vi.mock('@anthropic-ai/claude-agent-sdk', async (original) => ({
     query: vi.fn(),
 }));
 vi.mock('./utils/claudeCheckSession', () => ({ claudeCheckSession: () => true }));
+// This suite exercises launcher scheduling; credentialPin's real SDK boundary has separate integration coverage.
+vi.mock('./sdk/credentialPin', async original => ({
+    ...await original<typeof import('./sdk/credentialPin')>(),
+    queryWithPinnedEndpoint: (create: typeof query, params: Parameters<typeof query>[0]) => create(params),
+}));
 // Real ladder, test-sized waits. `delay` is read when a test configures it.
 const ladder = vi.hoisted(() => ({ delays: [20, 20, 20, 20, 20] as number[] }));
 vi.mock('./claudeTransientRetry', async (original) => {
@@ -35,6 +40,7 @@ vi.mock('./claudeTransientRetry', async (original) => {
 afterEach(() => {
     ladder.delays = [20, 20, 20, 20, 20];
     vi.clearAllMocks();
+    vi.unstubAllEnvs();
 });
 
 const MODE: EnhancedMode = { permissionMode: 'default', model: 'claude-sonnet-5' };
@@ -55,6 +61,7 @@ const okResult = (uuid: string) => ({ type: 'result', subtype: 'success', is_err
 
 type Step = (prompt: string, index: number) => Promise<'fail' | 'fail-then-exit' | 'answer' | 'answer-then-fail'>;
 type Options = {
+    beforeSwitch?: () => void;
     /** Queues the first input; a plain 'hello' otherwise. */
     first?: (queue: MessageQueue2<EnhancedMode>) => void;
     session?: (queue: MessageQueue2<EnhancedMode>) => Record<string, unknown>;
@@ -129,6 +136,7 @@ async function runLauncher(step: Step, done: (prompts: string[]) => boolean, set
                 }
                 if (done(prompts)) {
                     await sleep(settleMs);
+                    options.beforeSwitch?.();
                     void handlers.get('switch')!();
                     return;
                 }
@@ -379,6 +387,18 @@ describe('Claude transient API failure retry in the remote launcher (specs/claud
         } finally {
             readAccount.mockRestore();
         }
+    });
+
+    it.each(['platform-plan', 'platform-plan-pending'])('does not re-dispatch a %s 503 turn outside the gateway', async source => {
+        vi.stubEnv('HAPPY_AI_AUTH_SOURCE', source);
+        const harness = await runLauncher(async () => 'fail', prompts => prompts.length === 1, 100, {
+            // End the fixture without the production plan-to-terminal refusal. Keep the pin until after its turn.
+            beforeSwitch: () => vi.stubEnv('HAPPY_AI_AUTH_SOURCE', ''),
+        });
+        await harness.run;
+        expect(harness.prompts).toEqual(['hello']);
+        expect(retryStates(harness.client)).toEqual([]);
+        expect(harness.client.noteTransientRetryDispatched).not.toHaveBeenCalled();
     });
 
     it('does not retry a channel request', async () => {
