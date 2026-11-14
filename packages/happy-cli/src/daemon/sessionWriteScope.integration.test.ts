@@ -12,6 +12,39 @@ describe.skipIf(process.env.HAPPY_SCOPE_SERVER_INTEGRATION !== '1' || !['darwin'
     { provider: 'claude' as const, encryptionVariant: 'dataKey' as const },
 // Linux same-UID Claude launches fail closed until Happy MCP can cross the protected boundary.
 ].filter(({ provider }) => provider !== 'claude' || process.platform !== 'linux'))('real standalone/daemon/$provider/$encryptionVariant scope replacement', ({ provider, encryptionVariant }) => {
+    it('continues once after approval without another user message on an opted-in host', async () => {
+        let request: ScopeRequest | undefined, id = '';
+        const fixture = new SessionWriteScopeFixture({ provider, encryptionVariant, scopeContinuation: true,
+            beforeModelResponse: async body => {
+                // The MCP tool uses this same control boundary. Request while the provider turn
+                // is still open, then park it with the response, as the real agent does.
+                if (!request && id && body.includes('scope-marker-before')) request = await fixture.scopeRequest(id, fixture.tools);
+            } });
+        try {
+            await fixture.start();
+            const config = SandboxConfigSchema.parse({ sessionIsolation: 'strict', networkMode: 'custom', allowedDomains: ['127.0.0.1', 'localhost', fixture.modelHost] });
+            id = await fixture.spawnSession(fixture.project, config);
+            await fixture.send(id, 'scope-marker-before'); await fixture.waitReply(id, 'scope-marker-before');
+            if (!request) throw new Error('Provider turn did not request folder access');
+            const accepted = request;
+            const beforeSelection = (await fixture.session(id)).metadata;
+            await fixture.control('/session-write-scope/decide', fixture.approval(accepted));
+            await fixture.waitReply(id, 'scope-marker-continuation');
+            const afterSelection = (await fixture.session(id)).metadata;
+            expect(beforeSelection.permissionMode).toBeTruthy();
+            expect(afterSelection.permissionMode).toBe(beforeSelection.permissionMode);
+            expect(afterSelection.currentModelCode).toBe(beforeSelection.currentModelCode);
+            expect(JSON.parse(fixture.modelRequests.at(-1)!).model).toBe(JSON.parse(fixture.modelRequests[0]).model);
+            const messages = await fixture.messages(id);
+            expect(messages.filter(m => m.localId === `write-scope-applied-${accepted.id}`)).toHaveLength(1);
+            const listed = await fixture.control('/session-write-scope', { action: 'list', sessionId: id });
+            expect(listed.body.requests.find((r: ScopeRequest) => r.id === accepted.id)).toMatchObject({ profileApplied: true, grantActive: true });
+            await fixture.control('/session-write-scope/decide', fixture.approval(accepted));
+            expect((await fixture.messages(id)).filter(m => m.localId === `write-scope-applied-${accepted.id}`)).toHaveLength(1);
+            expect(fixture.failures).toEqual([]);
+        } catch (error) { console.error(await fixture.diagnostics()); throw error; }
+        finally { await fixture.close(); }
+    });
     it('preserves identity, encrypted history, queued input and another session across approval/revoke with lost response', async () => {
         const fixture = new SessionWriteScopeFixture({ provider, encryptionVariant });
         try {

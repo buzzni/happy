@@ -1,3 +1,4 @@
+import { createSessionWriteScopeContinuation } from './sessionWriteScopeContinuation';
 import { execFile } from 'node:child_process';
 import { ScopeJournal } from './sessionWriteScopeJournal';
 import { join } from 'node:path';
@@ -38,6 +39,7 @@ export async function createSessionWriteScopeRuntime(input: {
   machineId: string; env: NodeJS.ProcessEnv; managed: boolean;
   findSession: (id: string) => TrackedSession | undefined;
   preserve: (session: TrackedSession) => boolean;
+  readToken?: (session: TrackedSession) => Promise<string | null>;
   resume: (id: string, environment: Record<string, string>, validate: () => Promise<void>) => Promise<{ type: string }>;
 }) {
   if (input.managed || readMachineSandboxPolicyMode() !== 'owner-choice'
@@ -73,7 +75,13 @@ export async function createSessionWriteScopeRuntime(input: {
   const recovered = await journal.recover();
   const launchControl = await StandaloneLaunchControl.open(incarnation);
   const launches = new Map<number, string>();
-  const broker = new SessionWriteScopeBroker({
+  const continuation = input.env.HAPPY_WRITE_SCOPE_HOST_CONTINUATION === '1' && input.readToken
+    ? createSessionWriteScopeContinuation({ serverUrl: configuration.serverUrl,
+      findSession: id => resolveTarget(id)?.session, list: id => broker.list(id), readToken: input.readToken,
+      log: message => logger.debug(message) }) : undefined;
+  const broker: SessionWriteScopeBroker = new SessionWriteScopeBroker({
+    requested: request => continuation?.capture(request),
+    applied: request => continuation?.applied(request),
     changed: requests => journal.write([...recovered, ...requests]),
     accountId, machineId: input.machineId, incarnation, publicKey,
     resolveSession: async id => {
@@ -139,7 +147,7 @@ export async function createSessionWriteScopeRuntime(input: {
     },
   });
   let closed = false;
-  const flush = () => { if (closed) return; void broker.flush().catch(() => logger.debug('[write-scope] status persistence failed')); };
+  const flush = () => { if (closed) return; void broker.flush().then(() => continuation?.flush()).catch(() => logger.debug('[write-scope] status persistence failed')); };
   const watchdog = setInterval(flush, 500); watchdog.unref?.();
   return {
     broker,
@@ -152,7 +160,7 @@ export async function createSessionWriteScopeRuntime(input: {
         child.once('exit', forget); child.once('error', forget);
       } };
     },
-    close: () => { closed = true; clearInterval(watchdog); return launchControl.close(); },
+    close: () => { closed = true; continuation?.close(); clearInterval(watchdog); return launchControl.close(); },
     verifyReport: (claim: ManagedReportClaim) => {
       const verified = reports.verify(claim, input.findSession(claim.sessionId)?.agentEnvironment?.HAPPY_WRITE_SCOPE_SESSION === '1');
       if (verified) setImmediate(flush).unref?.();
@@ -170,7 +178,7 @@ export async function createSessionWriteScopeRuntime(input: {
       claim.resolve(true); confirmations.delete(value.token); return true;
     },
     isApplying(id: string) { return applyingSessions.has(id); },
-    sessionEnded(id: string) { if (!applyingSessions.has(id)) broker.sessionEnded(id); },
+    sessionEnded(id: string) { if (!applyingSessions.has(id)) { broker.sessionEnded(id); continuation?.sessionEnded(id); } },
   };
 }
 export type SessionWriteScopeRuntime = NonNullable<Awaited<ReturnType<typeof createSessionWriteScopeRuntime>>>;

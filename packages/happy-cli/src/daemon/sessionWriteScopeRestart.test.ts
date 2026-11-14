@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
-import { confirmScopeProfile, replaceSessionWriteScope, scopeSandboxEnvironment } from './sessionWriteScopeRestart';
+import { confirmScopeProfile, replaceSessionWriteScope, scopeSandboxEnvironment, scopeResumeSelection } from './sessionWriteScopeRestart';
 import { SandboxConfigSchema } from '@/persistence';
 
 describe('scope provider replacement', () => {
@@ -67,4 +67,12 @@ describe('scope provider replacement', () => {
       .toEqual({ profileApplied: false, cleanup: 'unresolved', error: 'SCOPE_DRAIN_UNCONFIRMED' });
     expect(child.kill).not.toHaveBeenCalled(); expect(resume).not.toHaveBeenCalled();
   });
+});
+
+it('retains the published mode and model pin across a scope replacement', () => {
+  expect(scopeResumeSelection({ permissionMode: 'read-only', currentModelCode: 'chosen-model', currentThoughtLevelCode: 'high' })).toEqual({
+    args: ['--permission-mode', 'read-only'], environment: { HAPPY_INITIAL_MODEL: 'chosen-model', HAPPY_INITIAL_EFFORT: 'high' },
+  });
+  expect(scopeResumeSelection({ permissionMode: 'plan' })).toEqual({ args: ['--permission-mode', 'plan'],
+    environment: { HAPPY_INITIAL_MODEL: '', HAPPY_INITIAL_EFFORT: '' } });
 });

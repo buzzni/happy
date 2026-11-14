@@ -30,6 +30,8 @@ export function decisionBytes(value: ScopeDecision): Buffer {
 }
 type Entry = { request: ScopeRequest; inspected: WriteRoot };
 type Dependencies = {
+  requested?: (request: ScopeRequest) => void;
+  applied?: (request: ScopeRequest) => void;
   readiness?: (request: ScopeRequest) => string | undefined;
   changed?: (requests: ScopeRequest[]) => Promise<void>;
   publicKey: KeyObject; machineId: string; accountId: string; incarnation: string; now?: () => number;
@@ -101,6 +103,7 @@ export class SessionWriteScopeBroker {
     const request: ScopeRequest = { ...descriptor, digest, state: 'pending' };
     await this.persist(request);
     this.entries.set(request.id, { request, inspected });
+    this.deps.requested?.({ ...request });
     return { ...request };
   }
   private persist(staged?: ScopeRequest): Promise<void> {
@@ -231,7 +234,12 @@ export class SessionWriteScopeBroker {
     logger.debug(`[write-scope] request=${request.id} state=${request.state} code=${request.error ?? 'NONE'}`);
     try { await this.persist(); }
     catch { request.error = 'SCOPE_JOURNAL_FAILED'; throw new Error('SCOPE_JOURNAL_FAILED'); }
-    return { ...request, grantActive: this.grantActive(request) };
+    const result = { ...request, grantActive: this.grantActive(request) };
+    if (result.kind === 'grant' && result.profileApplied && result.grantActive) {
+      try { this.deps.applied?.(result); }
+      catch { logger.debug('[write-scope] continuation admission failed'); }
+    }
+    return result;
   }
   sessionEnded(sessionId: string): void { this.grants.delete(sessionId); }
 }

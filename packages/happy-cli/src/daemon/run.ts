@@ -18,6 +18,7 @@ import { createMachineTypeMarker } from './machineTypeMarker';
 import { createSharedPcAutoConfirm } from './sharedPcAutoConfirm';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
 import { deliverAutomationConversation } from './automations/automationConversationRunner';
+import { scopeResumeSelection } from './sessionWriteScopeRestart';
 import { createSessionWriteScopeRuntime, isSessionWriteScopeLaunch, type SessionWriteScopeRuntime } from './sessionWriteScopeRuntime';
 import { CheckpointRetention } from '@/checkpoint/checkpointRetention';
 import { CheckpointRetentionSchedule } from '@/checkpoint/checkpointRetentionSchedule';
@@ -3430,6 +3431,9 @@ export async function startDaemon(): Promise<void> {
           }
         }
 
+        const scopeSelection = options?.writeScopeEnvironment ? scopeResumeSelection(metadata) : undefined;
+        if (scopeSelection) launch.args.push(...scopeSelection.args);
+
         // An ACP agent takes its model with each message; `opencode acp` has no --model flag.
         if (options?.model && resumeLaunchAgent(launch) !== 'opencode') {
           launch.args.push('--model', options.model);
@@ -3641,7 +3645,7 @@ export async function startDaemon(): Promise<void> {
             if (options?.writeScopeEnvironment) {
               if (!options.writeScopeValidate) throw new Error('WRITE_SCOPE_VALIDATION_REQUIRED');
               await options.writeScopeValidate();
-              env = { ...env, ...options.writeScopeEnvironment };
+              env = { ...env, ...options.writeScopeEnvironment, ...scopeSelection?.environment };
             }
             return spawnTrackedHappyProcess({
               args: launch.args,
@@ -4511,6 +4515,7 @@ export async function startDaemon(): Promise<void> {
     let machineEncryptionForTerminalWs: { encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey'; machineId: string; strict: boolean } | null = null;
 
     writeScopeRuntime = await createSessionWriteScopeRuntime({
+      readToken: async session => session.userHomeDir ? readStagedTokenFromHomeDir(session.userHomeDir) : credentials.token,
       machineId, env: writeScopeHostEnvironment, managed: managedIdentity.status === 'active' || Boolean(standaloneWindows),
       findSession: findTrackedSessionById,
       preserve: session => preserveSessionForResume(session, 'session-write-scope'),
