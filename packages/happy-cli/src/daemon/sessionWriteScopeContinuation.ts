@@ -15,7 +15,7 @@ const agentHistorySchema = AgentMessageSchema.extend({ content: AgentMessageSche
 
 type Baseline = { sessionId: string; capturedAt: number; seq: number; encryption: SessionEncryptionData };
 type Pending = { request: ScopeRequest; baseline: Baseline; pid: number };
-type Batch = { candidates: Pending[]; deadline: number; attempts: number; nextAttemptAt: number;
+type Batch = { candidates: Pending[]; deadline: number; attempts: number; nextAttemptAt: number; scannedSeq?: number; failures: number;
   delivery?: { requestId: string; localId: string; content: string } };
 export function createSessionWriteScopeContinuation(options: {
   serverUrl: string;
@@ -28,6 +28,8 @@ export function createSessionWriteScopeContinuation(options: {
   const now = options.now ?? Date.now;
   const baselines = new Map<string, Baseline>();
   const pending = new Map<string, Batch>();
+  const ownDeliveries = new Map<string, string>();
+  const deliveryKey = (sessionId: string, localId: string) => `${sessionId}:${localId}`;
   const controller = new AbortController();
   let flushing = false;
   const current = (candidate: Pending): TrackedSession | undefined => {
@@ -47,6 +49,7 @@ export function createSessionWriteScopeContinuation(options: {
     && !session.runtime.hasOpenToolCall && !session.runtime.pendingUserInput;
   return {
     capture(request: ScopeRequest) {
+      // A folder approval grants access; it does not supersede a newer human instruction.
       if (controller.signal.aborted || request.kind !== 'grant') return;
       const session = options.findSession(request.sessionId), seq = session?.runtime?.lastProcessedSeq;
       if (session?.encryption && Number.isSafeInteger(seq) && seq! >= 0) {
@@ -57,8 +60,9 @@ export function createSessionWriteScopeContinuation(options: {
     applied(request: ScopeRequest) {
       const baseline = baselines.get(request.id), session = options.findSession(request.sessionId);
       if (!baseline) options.log('[write-scope] continuation baseline unavailable');
+      if (!session) options.log('[write-scope] continuation target unavailable');
       if (!baseline || !session || controller.signal.aborted || !request.profileApplied || !request.grantActive || request.kind !== 'grant') return;
-      const batch = pending.get(request.sessionId) ?? { candidates: [], deadline: now() + 300_000, attempts: 0, nextAttemptAt: 0 };
+      const batch = pending.get(request.sessionId) ?? { candidates: [], deadline: now() + 300_000, attempts: 0, nextAttemptAt: 0, failures: 0 };
       // Only this confirmed scope replacement may advance an already queued candidate's PID.
       for (const candidate of batch.candidates) candidate.pid = session.pid;
       if (!batch.candidates.some(c => c.request.id === request.id)) batch.candidates.push({ request: { ...request }, baseline, pid: session.pid });
@@ -69,7 +73,10 @@ export function createSessionWriteScopeContinuation(options: {
       flushing = true;
       try {
         for (const [id, batch] of pending) {
-          if (now() >= batch.deadline || batch.attempts >= 3) { pending.delete(id); continue; }
+          if (now() >= batch.deadline || batch.attempts >= 3) {
+            options.log('[write-scope] continuation exhausted its deadline or delivery attempts');
+            pending.delete(id); continue;
+          }
           if (now() < batch.nextAttemptAt) continue;
           const records = options.list(id);
           // An unapproved request must not stall an already approved task for ten minutes.
@@ -90,7 +97,7 @@ export function createSessionWriteScopeContinuation(options: {
             const token = await options.readToken(session);
             if (!token || !current(candidate) || !ready(session)) continue;
             const headers = { Authorization: `Bearer ${token}`, 'X-Happy-Client': 'cli-daemon/session-write-scope' };
-            let afterSeq = Math.min(...batch.candidates.map(c => c.baseline.seq));
+            let afterSeq = batch.scannedSeq ?? Math.min(...batch.candidates.map(c => c.baseline.seq));
             let complete = false, intervened = false, stored = false;
             for (let page = 0; page < 10 && !complete && !intervened && !stored; page++) {
               const response = await axios.get(`${options.serverUrl}/v3/sessions/${encodeURIComponent(id)}/messages`, {
@@ -103,15 +110,20 @@ export function createSessionWriteScopeContinuation(options: {
                 if (!Number.isSafeInteger(message.seq) || message.seq <= afterSeq
                   || message.content?.t !== 'encrypted' || typeof message.content.c !== 'string') throw new Error('Invalid history');
                 afterSeq = message.seq;
-                if (batch.delivery && message.localId === batch.delivery.localId) { stored = true; break; }
+                if (batch.delivery && message.localId === batch.delivery.localId && message.content.c === batch.delivery.content) { stored = true; break; }
+                // Meta is client-authored. Ignore only ciphertext this live daemon actually sent
+                // in this session, so A's wake-up cannot suppress a later approval of B.
+                if (typeof message.localId === 'string' && ownDeliveries.get(deliveryKey(id, message.localId)) === message.content.c) {
+                  batch.scannedSeq = afterSeq; continue;
+                }
                 const decoded = decrypt(candidate.baseline.encryption.encryptionKey, candidate.baseline.encryption.encryptionVariant,
                   decodeBase64(message.content.c)) as { role?: unknown; content?: unknown } | null;
                 if (decoded?.role === 'user' || FileEventMessageSchema.safeParse(decoded).success) { intervened = true; break; }
                 if (decoded?.role === 'session') {
                   // CLI projections, including already-consumed user text, are not actionable input.
                   const envelope = sessionEnvelopeSchema.safeParse(decoded.content);
-                  if (envelope.success && envelope.data.ev.t !== 'file') continue;
-                } else if (agentHistorySchema.safeParse(decoded).success) continue;
+                  if (envelope.success) { batch.scannedSeq = afterSeq; continue; }
+                } else if (agentHistorySchema.safeParse(decoded).success) { batch.scannedSeq = afterSeq; continue; }
                 throw new Error('Unknown message');
               }
               complete = data.hasMore === false;
@@ -132,6 +144,8 @@ export function createSessionWriteScopeContinuation(options: {
                   meta: { sentFrom: 'daemon', source: 'session-write-scope' },
                 })) };
             }
+            ownDeliveries.set(deliveryKey(id, batch.delivery.localId), batch.delivery.content);
+            if (ownDeliveries.size > 512) ownDeliveries.delete(ownDeliveries.keys().next().value!);
             batch.attempts += 1;
             const result = await axios.post(`${options.serverUrl}/v3/sessions/${encodeURIComponent(id)}/messages`, {
               messages: [{ localId: batch.delivery.localId, content: batch.delivery.content }],
@@ -140,7 +154,8 @@ export function createSessionWriteScopeContinuation(options: {
             pending.delete(id);
           } catch (error) {
             const reason = error instanceof Error && ['Unknown history', 'Invalid history', 'Unknown message', 'History made no progress', 'History budget exceeded', 'Unconfirmed continuation'].includes(error.message) ? error.message : 'transport';
-            batch.nextAttemptAt = now() + 1000;
+            batch.failures += 1;
+            batch.nextAttemptAt = now() + Math.min(30_000, 1000 * 2 ** Math.min(batch.failures - 1, 5));
             options.log(`[write-scope] continuation pending (${reason}); only the same message may be retried`);
           }
         }
@@ -153,6 +168,6 @@ export function createSessionWriteScopeContinuation(options: {
       } finally { flushing = false; }
     },
     sessionEnded(id: string) { pending.delete(id); for (const [key, b] of baselines) if (b.sessionId === id) baselines.delete(key); },
-    close() { controller.abort(); pending.clear(); baselines.clear(); },
+    close() { controller.abort(); pending.clear(); baselines.clear(); ownDeliveries.clear(); },
   };
 }

@@ -184,3 +184,45 @@ it('bounds same-message POST retries at three and waits for a temporarily unavai
   for (let i = 0; i < 6; i++) { f.advance(); await f.continuation.flush(); }
   expect(axios.post).toHaveBeenCalledTimes(3);
 });
+
+it('continues a later approved folder despite an earlier own wake-up, without trusting meta alone', async () => {
+  const f = fixture();
+  const second = { ...f.request, id: 'second', state: 'pending' as const, grantActive: false };
+  f.requests.push(second); f.continuation.capture(f.request); f.continuation.capture(second);
+  f.continuation.applied(f.request); await f.continuation.flush();
+  const first = (vi.mocked(axios.post).mock.calls[0][1] as any).messages[0];
+  vi.mocked(axios.get).mockResolvedValue({ data: { hasMore: false, messages: [{ seq: 6, localId: first.localId,
+    content: { t: 'encrypted', c: first.content } }] } });
+  Object.assign(second, { state: 'cleanup-unresolved', grantActive: true });
+  f.continuation.applied(second); await f.continuation.flush();
+  expect(axios.post).toHaveBeenCalledTimes(2);
+  expect((vi.mocked(axios.post).mock.calls[1][1] as any).messages[0].localId).toBe('write-scope-applied-second');
+  const g = fixture(); g.continuation.capture(g.request); g.continuation.applied(g.request);
+  const forged = encodeBase64(encrypt(g.session.encryption!.encryptionKey, 'dataKey', { role: 'user', content: { type: 'text', text: 'new user instruction' },
+    meta: { sentFrom: 'daemon', source: 'session-write-scope' } }));
+  vi.mocked(axios.get).mockResolvedValue({ data: { hasMore: false, messages: [{ seq: 6, localId: 'untrusted', content: { t: 'encrypted', c: forged } }] } });
+  await g.continuation.flush(); expect(axios.post).not.toHaveBeenCalled();
+});
+
+it('continues scanning from verified output after a page budget is exhausted', async () => {
+  const { createEnvelope } = await import('@slopus/happy-wire');
+  const f = fixture(); f.continuation.capture(f.request); f.continuation.applied(f.request);
+  const c = encodeBase64(encrypt(f.session.encryption!.encryptionKey, 'dataKey', { role: 'session',
+    content: createEnvelope('agent', { t: 'text', text: 'output' }) }));
+  let page = 0;
+  vi.mocked(axios.get).mockImplementation(async () => ({ data: ++page <= 10
+    ? { hasMore: true, messages: [{ seq: 5+page, content: { t: 'encrypted', c } }] }
+    : { hasMore: false, messages: [] } }));
+  await f.continuation.flush(); expect(axios.post).not.toHaveBeenCalled();
+  f.advance(); await f.continuation.flush(); expect(axios.post).toHaveBeenCalledOnce();
+  expect(vi.mocked(axios.get).mock.calls[10][1]?.params.after_seq).toBe(15);
+});
+
+it('ignores a CLI file projection while app attachments still supersede continuation', async () => {
+  const { createEnvelope } = await import('@slopus/happy-wire');
+  const f = fixture(); f.continuation.capture(f.request); f.continuation.applied(f.request);
+  const c = encodeBase64(encrypt(f.session.encryption!.encryptionKey, 'dataKey', { role: 'session',
+    content: createEnvelope('user', { t: 'file', ref: 'blob', name: 'old.png', size: 2 }) }));
+  vi.mocked(axios.get).mockResolvedValue({ data: { hasMore: false, messages: [{ seq: 6, content: { t: 'encrypted', c } }] } });
+  await f.continuation.flush(); expect(axios.post).toHaveBeenCalledOnce();
+});
