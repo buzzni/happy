@@ -86,6 +86,7 @@ jobs:
       run: >-
         pnpm --filter @buzzni/happy-cli exec vitest run --project unit
         src/claude/claudeRemoteLauncher.oauthSwitch.test.ts
+        src/claude/claudeRemoteLauncher.transientRetry.test.ts
         src/claude/claudeRemoteLauncher.setupTokenSwitch.test.ts
         src/claude/aiAuthObservation.test.ts
         src/utils/MessageQueue2.test.ts

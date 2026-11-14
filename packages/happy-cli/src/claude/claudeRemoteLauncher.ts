@@ -1454,8 +1454,11 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             mode = due.mode.mode;
                             // A retry that has to start the next provider starts it with the failed turn's own mode,
                             // which a kept turn's differs from the hash recorded for it: that mode is the baseline.
-                            if (!launched) { launched = mode; modeHash = session.queue.modeHasher(mode); }
-                            else modeHash = due.mode.hash ?? modeHash;
+                            if (!launched) {
+                                providerOauthAccount = await readAmbientAccount();
+                                if (controller.signal.aborted || providerEnded) return null;
+                                launched = mode; modeHash = session.queue.modeHasher(mode);
+                            } else modeHash = due.mode.hash ?? modeHash;
                             permissionHandler.handleModeChange(mode.permissionMode);
                             logger.debug(`[remote]: transient API failure retry ${due.attempt}`);
                             dispatchTurn();
