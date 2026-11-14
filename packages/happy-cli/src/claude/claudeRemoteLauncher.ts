@@ -10,6 +10,8 @@ import { createSetupTokenActivityReporter } from './setupTokenActivity';
 import { MandatorySandboxError } from '@/sandbox/sandboxPolicy';
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import type { Metadata } from '@/api/types';
 import { render } from "ink";
 import { createManagedGracefulStop, registerManagedGracefulStop, type ManagedGracefulStop } from '@/managed/managedGracefulStop'
@@ -23,7 +25,7 @@ import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { RemoteModeDisplay } from "@/ui/ink/RemoteModeDisplay";
 import React from "react";
 import { claudeRemote, type ClaudeActiveInputSender, type ClaudeTurnLatencyInput } from "./claudeRemote";
-import type { ClaudeAuthObservation, ObservedAiAuthSource } from "./aiAuthObservation";
+import { readLiveOauthAccount, type LiveOauthAccount, type ClaudeAuthObservation, type ObservedAiAuthSource } from "./aiAuthObservation";
 import { ClaudeSideQuestionBridge, createSideQuestionRpcHandler } from "./claudeSideQuestion";
 import { PermissionHandler } from "./utils/permissionHandler";
 import { Future } from "@/utils/future";
@@ -696,6 +698,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             logger.warn(`[setup-token-capacity] ${error instanceof Error ? error.message : 'lifecycle unavailable'}`);
         });
     };
+    // Ambient login metadata is only a restart signal, never evidence of billing or authority.
+    // Scoped/managed providers own their credentials and must not follow the PC login.
+    const readAmbientAccount = () => session.managedRun || session.scopeProcessSandbox || setupTokenSwitching
+        ? Promise.resolve(null)
+        : readLiveOauthAccount({ env: process.env, homeDir: homedir(), readFile: path => readFile(path, 'utf8') });
+
     let backgroundTasks: NonNullable<Metadata['claudeBackgroundTasks']> | undefined;
     const backgroundTaskDetails = createClaudeBackgroundTaskDetails();
     function publishBackgroundTasks(next: NonNullable<Metadata['claudeBackgroundTasks']>) {
@@ -1138,6 +1146,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             const providerOptionsStale = () => providerStale() || optionsCredentialGeneration !== (personalFallback?.generation() ?? 0);
             const usageLimitsQuery = (usageLimitsQueries.get(session.client) ?? 0) + 1;
             usageLimitsQueries.set(session.client, usageLimitsQuery);
+            let providerOauthAccount: LiveOauthAccount | null = null;
             try {
                 const remoteResult = await claudeRemote({
                     sessionId: session.sessionId,
@@ -1268,6 +1277,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         if (pending) {
                             // A held-back batch is a turn like any other: refused once input is closed.
                             if (drain && !drain.claimTurn()) { exitReason = 'exit'; return null; }
+                            providerOauthAccount = await readAmbientAccount();
+                            if (controller.signal.aborted) return null;
                             let p = pending;
                             pending = null;
                             await recheckPersonalInput(p);
@@ -1506,6 +1517,22 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 logger.debug('[remote]: owner bearer check failed before input', error);
                             }
                         }
+                        if (msg) {
+                            const liveAccount = await readAmbientAccount();
+                            if (controller.signal.aborted) return null;
+                            if (providerOauthAccount && liveAccount && (
+                                providerOauthAccount.email !== liveAccount.email
+                                || providerOauthAccount.organizationUuid !== liveAccount.organizationUuid
+                            )) {
+                                // Preserve the entire batch (attachments/receipt included). End the old
+                                // query before the queued request reaches its cached OAuth credentials.
+                                pending = msg;
+                                drain?.releaseClaim();
+                                return null;
+                            }
+                            if (!mode) providerOauthAccount = liveAccount;
+                        }
+
                         // Check if mode has changed
                         if (msg) {
                             // Preview without committing: a changed engine setting needs a
