@@ -1802,6 +1802,18 @@ describe('ApiSessionClient v3 messages API migration', () => {
         const closeWarnings = () => vi.mocked(logger.warn).mock.calls
             .filter(([message]) => String(message).includes('unconfirmed at close'));
 
+        it('delivers usage through the API socket despite local disk failure', async () => {
+            const event = usageEvent('disk-failed');
+            const store = { load: () => [], put: vi.fn(() => { throw new Error('disk full'); }), remove: vi.fn() };
+            const acks = answers();
+            const client = new ApiSessionClient('fake-token', session, undefined, { providerUsageStore: store });
+            client.sendProviderUsageEvent(event);
+            expect(sentIds()).toEqual([event.sourceEventId]);
+            acks[0](null, { success: true });
+            await client.close();
+            expect(closeWarnings()).toEqual([]);
+        });
+
         it('recovers persisted usage on connect and removes it only after server acknowledgement', async () => {
             const event = usageEvent('recovered');
             const store = { load: vi.fn(() => [event]), put: vi.fn(), remove: vi.fn() };
@@ -1809,7 +1821,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
             const client = new ApiSessionClient('fake-token', session, undefined, { providerUsageStore: store });
             emitSocketEvent('connect');
             expect(sentIds()).toEqual([event.sourceEventId]);
-            expect(store.put).toHaveBeenCalledWith(event);
+            expect(store.put).not.toHaveBeenCalled();
             expect(store.remove).not.toHaveBeenCalled();
             acks[0](null, { success: true });
             expect(store.remove).toHaveBeenCalledWith(event.sourceEventId);
@@ -1883,7 +1895,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
             }
             expect(mockSocket.close).toHaveBeenCalledTimes(1);
             expect(closeWarnings()).toEqual([[expect.any(String),
-                { count: 1, reasons: { unanswered: 1 }, sourceEventIds: ['test-session-id:openai:resp-lost'] }]]);
+                { count: 1, reasons: { unanswered: 1 }, sourceEventIds: ['test-session-id:openai:resp-lost'], neverPersistedCount: 1, neverPersistedSourceEventIds: ['test-session-id:openai:resp-lost'] }]]);
         });
     });
 

@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync, fsyncSync, fstatSync, readSync, openSync, closeSync, unlinkSync, rmSync } from 'node:fs';
+import { mkdtempSync, opendirSync, readdirSync, readFileSync, writeFileSync, fsyncSync, fstatSync, readSync, openSync, closeSync, unlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -9,7 +9,7 @@ import { createClaudeUsageEvent } from './providerUsageAdapters';
 import { logger } from '@/ui/logger';
 vi.mock('node:fs', async importOriginal => {
     const fs = await importOriginal<typeof import('node:fs')>();
-    return { ...fs, writeFileSync: vi.fn(fs.writeFileSync), fsyncSync: vi.fn(fs.fsyncSync), fstatSync: vi.fn(fs.fstatSync), readSync: vi.fn(fs.readSync), unlinkSync: vi.fn(fs.unlinkSync) };
+    return { ...fs, opendirSync: vi.fn(fs.opendirSync), writeFileSync: vi.fn(fs.writeFileSync), fsyncSync: vi.fn(fs.fsyncSync), fstatSync: vi.fn(fs.fstatSync), readSync: vi.fn(fs.readSync), unlinkSync: vi.fn(fs.unlinkSync) };
 });
 vi.mock('@/ui/logger', () => ({ logger: { warn: vi.fn(), debug: vi.fn() } }));
 const roots: string[] = [];
@@ -48,13 +48,13 @@ it('keeps corrupt files, warns and recovers valid events', () => {
     expect(logger.warn).toHaveBeenCalled();
     expect(readdirSync(root, { recursive: true }).map(String).filter(p => p.endsWith('.json'))).toHaveLength(2);
 });
-it('retains an event in memory without sending when persistence fails', async () => {
+it('sends live and retains an event in memory when persistence fails', async () => {
     const { event } = fixture();
     const emit = vi.fn();
     const store = { load: () => [], put: vi.fn(() => { throw new Error('disk full'); }), remove: vi.fn() };
     const delivery = new ProviderUsageDelivery({ isConnected: () => true, emit }, store);
     delivery.send(event);
-    expect(emit).not.toHaveBeenCalled();
+    expect(emit).toHaveBeenCalledWith(event, expect.any(Function));
     expect(delivery.unconfirmedIds()).toEqual([event.sourceEventId]);
     expect(logger.warn).toHaveBeenCalled();
     await delivery.close();
@@ -168,4 +168,48 @@ it('commits recoverable identity before a first dataKey event even if killed exa
     const identity = readdirSync(root, { recursive: true }).map(String).find(p => p.endsWith('identity.enc'));
     expect(identity).toBeDefined();
     expect(new ProviderUsageSpool({root,server:'https://server.test',sessionId:'session',key:new Uint8Array(32).fill(7),variant:'dataKey'}).load()).toEqual([event]);
+});
+
+it('fills an event batch despite identity and temporary entries', () => {
+    const { scope, event } = fixture();
+    const spool = new ProviderUsageSpool({ ...scope, recoveryKey: new Uint8Array(32).fill(9) });
+    spool.provisionRecovery(); writeFileSync(join(spool.directory, 'pending.tmp'), 'partial');
+    spool.put(event); spool.put({ ...event, sourceEventId: 'second' });
+    expect(spool.readBatch(2).events).toHaveLength(2); spool.closeReader();
+});
+it('does not rewrite identity when persisting another event', () => {
+    const { scope, event } = fixture();
+    const spool = new ProviderUsageSpool({ ...scope, recoveryKey: new Uint8Array(32).fill(9) });
+    spool.put(event); vi.mocked(writeFileSync).mockClear();
+    spool.put({ ...event, sourceEventId: 'second' });
+    expect(writeFileSync).toHaveBeenCalledTimes(1);
+});
+it('removes only completely empty directories after ACK', () => {
+    const { spool, root, event } = fixture(); spool.put(event); spool.remove(event.sourceEventId);
+    expect(readdirSync(root)).toEqual([]);
+    spool.put(event); expect(spool.load()).toEqual([event]);
+});
+
+it('counts accepted events rather than directory entries regardless of order', () => {
+    const { spool, event } = fixture(); spool.put(event);
+    const name = readdirSync(spool.directory).find(name => name.endsWith('.json'))!;
+    const entries = ['identity.enc', 'pending.tmp', name].map(name => ({ name, isFile: () => true }));
+    const closeSync = vi.fn();
+    vi.mocked(opendirSync).mockReturnValueOnce({ readSync: () => entries.shift() ?? null, closeSync } as any);
+    expect(spool.readBatch(1).events).toEqual([event]); spool.closeReader(); expect(closeSync).toHaveBeenCalledOnce();
+});
+it('bounds scanning junk separately and continues the cursor on the next batch', () => {
+    const { spool, event } = fixture(); spool.put(event);
+    const name = readdirSync(spool.directory).find(name => name.endsWith('.json'))!;
+    const entries = [...Array(1000).fill('junk.tmp'), name].map(name => ({ name, isFile: () => true }));
+    const readSync = vi.fn(() => entries.shift() ?? null);
+    vi.mocked(opendirSync).mockReturnValueOnce({ readSync, closeSync: vi.fn() } as any);
+    expect(spool.readBatch(1)).toEqual({ events: [], done: false }); expect(readSync).toHaveBeenCalledTimes(1000);
+    expect(spool.readBatch(1).events).toEqual([event]); spool.closeReader();
+});
+it('preserves recovery identity and concurrent pending files after an ACK', () => {
+    const { scope, event } = fixture();
+    const spool = new ProviderUsageSpool({ ...scope, recoveryKey: new Uint8Array(32).fill(9) });
+    spool.put(event); writeFileSync(join(spool.directory, 'writer.tmp'), 'pending'); spool.remove(event.sourceEventId);
+    expect(readdirSync(spool.directory).sort()).toEqual(['identity.enc', 'writer.tmp']);
 });

@@ -30,6 +30,37 @@ describe('ProviderUsageDelivery', () => {
     beforeEach(() => { vi.useFakeTimers(); vi.mocked(logger.warn).mockClear(); });
     afterEach(() => { vi.useRealTimers(); });
 
+    it('retries persistence without duplicating an in-flight live send and accepts its ACK', async () => {
+        const put = vi.fn().mockImplementationOnce(() => { throw new Error('disk full'); });
+        const remove = vi.fn(); const sent: Ack[] = [];
+        const delivery = new ProviderUsageDelivery({ isConnected: () => true, emit: (_event, ack) => { sent.push(ack); } }, { load: () => [], put, remove });
+        delivery.send(usageEvent('disk'));
+        expect(sent).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(put).toHaveBeenCalledTimes(2); expect(sent).toHaveLength(1);
+        sent[0](null, STORED);
+        await vi.advanceTimersByTimeAsync(60000);
+        expect(delivery.unconfirmedIds()).toEqual([]); expect(put).toHaveBeenCalledTimes(2);
+        await delivery.close();
+    });
+    it('accepts a live ACK even when disk never recovers', async () => {
+        const put = vi.fn(() => { throw new Error('disk full'); });
+        const delivery = new ProviderUsageDelivery({ isConnected: () => true, emit: (_event, ack) => ack(null, STORED) }, { load: () => [], put, remove: vi.fn() });
+        delivery.send(usageEvent('disk'));
+        expect(delivery.unconfirmedIds()).toEqual([]);
+        await vi.advanceTimersByTimeAsync(60000); expect(put).toHaveBeenCalledTimes(1);
+        await delivery.close();
+    });
+    it('identifies never-persisted events separately from durable events at close', async () => {
+        const delivery = new ProviderUsageDelivery({ isConnected: () => false, emit: vi.fn() }, {
+            load: () => [usageEvent('saved')], put: () => { throw new Error('disk full'); }, remove: vi.fn(),
+        });
+        delivery.send(usageEvent('lost')); await delivery.close();
+        expect(logger.warn).toHaveBeenLastCalledWith(expect.stringContaining('never-persisted'), expect.objectContaining({
+            count: 2, neverPersistedCount: 1, neverPersistedSourceEventIds: ['session:anthropic:lost'],
+        }));
+    });
+
     it('forgets an event only when the server confirms it stored it', () => {
         const { delivery, sent } = harness();
         delivery.send(usageEvent('a'));
@@ -198,6 +229,8 @@ describe('ProviderUsageDelivery', () => {
             expect(sent).toHaveLength(2);
             expect(warnings()).toEqual([[expect.stringContaining('unconfirmed at close'), {
                 count: 2,
+                neverPersistedCount: 2,
+                neverPersistedSourceEventIds: ['session:anthropic:refused', 'session:anthropic:silent'],
                 reasons: { 'refused: Invalid provider usage event': 1, unanswered: 1 },
                 sourceEventIds: ['session:anthropic:refused', 'session:anthropic:silent'],
             }]]);
@@ -217,7 +250,7 @@ describe('ProviderUsageDelivery', () => {
             await vi.advanceTimersByTimeAsync(0);
             expect(closed).toBe(true);
             expect(warnings()).toEqual([[expect.stringContaining('unconfirmed at close'),
-                { count: 1, reasons: { unanswered: 1 }, sourceEventIds: ['session:anthropic:a'] }]]);
+                { count: 1, reasons: { unanswered: 1 }, sourceEventIds: ['session:anthropic:a'], neverPersistedCount: 1, neverPersistedSourceEventIds: ['session:anthropic:a'] }]]);
         });
     });
 });

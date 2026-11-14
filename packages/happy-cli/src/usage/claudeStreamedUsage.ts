@@ -71,7 +71,7 @@ export class ClaudeStreamedUsage {
 
     /** Accept only IDs already observed here. Transcript history alone cannot open a request. */
     noteTranscriptFinal(messageId: string, usage: ClaudeUsageLike): void {
-        if (this.reported.has(messageId)) return;
+        if (this.reported.has(messageId) || [...this.streaming.values()].includes(messageId)) return;
         const held = this.held.get(messageId);
         if (!held) return;
         this.held.delete(messageId);
