@@ -97,6 +97,32 @@ export default defineConfig({
             {
                 extends: true,
                 test: {
+                    name: 'integration-provider-usage',
+                    include: ['src/usage/providerUsageFinal.integration.test.ts',
+                        'src/usage/providerUsageRecovery.integration.test.ts'],
+                    setupFiles: ['./src/testing/unit.setup.ts'],
+                    fileParallelism: false,
+                    maxWorkers: 1,
+                    testTimeout: 180_000,
+                    hookTimeout: 60_000,
+                },
+            },
+            {
+                extends: true,
+                test: {
+                    name: 'integration-provider-usage-live',
+                    include: ['src/usage/providerUsageLive.integration.test.ts',
+                        'src/codex/codexUsageLive.integration.test.ts'],
+                    setupFiles: ['./src/testing/unit.setup.ts'],
+                    fileParallelism: false,
+                    maxWorkers: 1,
+                    testTimeout: 180_000,
+                    hookTimeout: 60_000,
+                },
+            },
+            {
+                extends: true,
+                test: {
                     name: 'unit',
                     include: ['src/**/*.test.ts', 'scripts/**/*.test.ts'],
                     exclude: ['src/**/*.integration.test.ts', 'src/**/*.poc.test.ts', 'src/**/*.native.test.ts'],

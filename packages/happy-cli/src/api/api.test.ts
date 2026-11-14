@@ -1,8 +1,12 @@
+import { ApiSessionClient } from './apiSession';
+import { ProviderUsageSpool } from '@/usage/providerUsageSpool';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { ApiClient } from './api';
 import axios from 'axios';
 import { sharedMachineRotationFixture, HappySessionExecutionProofSchema } from '@slopus/happy-wire';
 import { connectionState } from '@/utils/serverConnectionErrors';
+
+vi.mock('./apiSession', () => ({ ApiSessionClient: vi.fn(function () {}) }));
 
 // Use vi.hoisted to ensure mock functions are available when vi.mock factory runs
 const { mockPost, mockIsAxiosError } = vi.hoisted(() => ({
@@ -84,6 +88,13 @@ describe('Api server error handling', () => {
         };
 
         api = await ApiClient.create(mockCredential);
+    });
+
+    it.each(['account', 'managed'] as const)('installs a durable usage store for %s sessions', kind => {
+        const session = { id: 'session', encryptionKey: new Uint8Array(32), encryptionVariant: 'legacy' as const };
+        const client = kind === 'account' ? api : ApiClient.managed({ scopedToken: 'test', managed: { serverOrigin: 'https://server.test' } } as any);
+        client.sessionSyncClient(session as any);
+        expect(ApiSessionClient).toHaveBeenCalledWith(expect.any(String), session, kind === 'account' ? undefined : { serverOrigin: 'https://server.test' }, expect.objectContaining({ providerUsageStore: expect.any(ProviderUsageSpool) }));
     });
 
     describe('getOrCreateSession', () => {

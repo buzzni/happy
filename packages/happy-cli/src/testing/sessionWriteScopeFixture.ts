@@ -74,7 +74,7 @@ export class SessionWriteScopeFixture {
     private readonly processes = new Set<ChildProcess>();
 
     constructor(readonly options: { provider: 'codex' | 'claude'; encryptionVariant: 'legacy' | 'dataKey'; automationStudioUrl?: string; databaseUrl?: string;
-        serverEntry?: string; browserBridgeHost?: string; automationContextHost?: boolean;
+        serverEntry?: string; browserBridgeHost?: string; automationContextHost?: boolean; usageIngest?: { url: string; secret: string };
         beforeModelResponse?(body: string): Promise<void | { name: string; arguments: Record<string, unknown> }> } = { provider: 'codex', encryptionVariant: 'legacy' }) {}
     get modelHost() { return process.platform === 'linux' ? 'scope-model.test' : '127.0.0.1'; }
     get modelName() { return this.options.provider === 'codex' ? 'gpt-5.1-codex' : 'claude-sonnet-4-6'; }
@@ -203,7 +203,9 @@ export class SessionWriteScopeFixture {
             ...(process.env.HAPPY_SCOPE_PACKAGED_PRISMA_ENGINE ? { PRISMA_QUERY_ENGINE_LIBRARY: process.env.HAPPY_SCOPE_PACKAGED_PRISMA_ENGINE } : {}),
             DATA_DIR: join(this.root, 'server'), PGLITE_DIR: join(this.root, 'server/pglite'),
             HOST: '127.0.0.1', PORT: String(serverPort), METRICS_ENABLED: 'false', HAPPY_STANDALONE_CONTROL: 'stdin-v1',
-            ...(this.options.automationStudioUrl ? { SAYCODE_AUTOMATION_ENABLED: 'true' } : {}) };
+            ...(this.options.automationStudioUrl ? { SAYCODE_AUTOMATION_ENABLED: 'true' } : {}),
+            ...(this.options.usageIngest ? { SAYCODE_USAGE_INGEST_URL: this.options.usageIngest.url,
+                SAYCODE_USAGE_INGEST_SECRET: this.options.usageIngest.secret } : {}) };
         const migration = this.options.databaseUrl
             ? this.launch([join(this.serverDirectory, 'node_modules/prisma/build/index.js'), 'migrate', 'deploy', '--schema', 'prisma/schema.prisma'], this.serverDirectory, this.serverEnvironment)
             : this.launchServer('migrate');

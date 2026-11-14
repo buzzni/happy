@@ -37,6 +37,10 @@ function assistant(id: string) {
     };
 }
 
+function streamEvent(event: Record<string, unknown>) {
+    return { type: 'stream_event', uuid: `stream-${String(event.type)}`, session_id: '', parent_tool_use_id: null, event };
+}
+
 async function runOneTurn(onAssistant: () => void) {
     const queue = new MessageQueue2<EnhancedMode>(hashObject);
     const handlers = new Map<string, () => Promise<unknown>>();
@@ -47,13 +51,16 @@ async function runOneTurn(onAssistant: () => void) {
         setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
         setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
         applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        noteClaudeStreamEvent: vi.fn(),
     };
     vi.mocked(query).mockImplementation(({ prompt }) => {
         const response = (async function* () {
             yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
             for await (const _message of prompt as AsyncIterable<SDKUserMessage>) {
                 onAssistant();
+                yield streamEvent({ type: 'message_start', message: { id: 'msg-1' } });
                 yield assistant('msg-1');
+                yield streamEvent({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 5 } });
                 yield { type: 'result', subtype: 'success', result: 'hi', is_error: false, uuid: 'result-1' };
                 void handlers.get('switch')!();
                 return;
@@ -107,5 +114,19 @@ describe('a remote run reports its observed org deployment login (src/claude/aiA
         expect(sentFor(client, 'msg-1')).toBeDefined();
         expect(sentFor(client, 'msg-1')?.[2]).toBeUndefined();
         expect(client.applyClaudeTurnResult).toHaveBeenCalledWith(expect.objectContaining({ uuid: 'result-1' }), undefined);
+    });
+});
+
+describe('a remote run hands the SDK stream to the usage of its messages (src/usage/claudeStreamedUsage.ts)', () => {
+    it('marks an SDK message as streaming and forwards the stream events that end it', async () => {
+        observation.current.mockReset();
+        observation.current.mockReturnValue(undefined);
+        const client = await runOneTurn(() => {});
+
+        expect(sentFor(client, 'msg-1')?.[3]).toBe('streaming');
+        expect(client.noteClaudeStreamEvent.mock.calls.map(([message]) => (message as { event: { type: string } }).event.type))
+            .toEqual(['message_start', 'message_delta']);
+        expect(client.noteClaudeStreamEvent).toHaveBeenLastCalledWith(
+            expect.objectContaining({ parent_tool_use_id: null, event: expect.objectContaining({ usage: { output_tokens: 5 } }) }));
     });
 });

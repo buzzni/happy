@@ -1,3 +1,4 @@
+import { CodexRolloutUsage } from './codexRolloutUsage';
 import { takeScopeConfirmation, confirmSessionWriteScope } from '@/daemon/sessionWriteScopeConfirmation';
 /**
  * Codex App Server Client — drives Codex via the v2 JSON-RPC protocol
@@ -302,6 +303,65 @@ export class CodexAppServerClient {
     private workspaceTurnOperations = 0;
     private nextId = 1;
     private pending = new Map<number, PendingRequest>();
+    private rolloutUsage = new CodexRolloutUsage(params => {
+        this.observeUsageCoverage('rawResponse/completed', params, params.threadId);
+        this.emitCodexUsage(params, true);
+    });
+    private rolloutUsagePaths = new Map<string, string>();
+    private rolloutUsageThreads = new Set<string>();
+    private pendingRolloutTurns = new Map<string, Set<string>>();
+    private rolloutUsageReads = new Map<string, Promise<void>>();
+    private rolloutUsageFailures = new Set<string>();
+    private rolloutUsageTimer: ReturnType<typeof setInterval> | null = null;
+
+    private observeRolloutUsage(method: string, params: any, threadId: string | null): void {
+        if (!threadId) return;
+        if (threadId !== this._threadId && !this.subagents.isTracked(threadId)) {
+            const turn = this.extractTurnId(params);
+            if (method === 'turn/started' && turn) {
+                const turns = this.pendingRolloutTurns.get(threadId) ?? new Set<string>();
+                turns.add(turn); this.pendingRolloutTurns.set(threadId, turns);
+            }
+            return;
+        }
+        if (threadId === this._threadId && !this.rolloutUsagePaths.has(threadId)) return;
+        const turnId = this.extractTurnId(params);
+        if (method === 'turn/started' && turnId) {
+            this.rolloutUsage.allowTurn(threadId, turnId);
+            this.rolloutUsageThreads.add(threadId);
+            if (!this.rolloutUsageTimer) {
+                this.rolloutUsageTimer = setInterval(() => {
+                    for (const thread of this.rolloutUsageThreads) void this.readRolloutUsage(thread);
+                }, 500);
+                this.rolloutUsageTimer.unref();
+            }
+        }
+        if (this.rolloutUsageThreads.has(threadId)) void this.readRolloutUsage(threadId);
+    }
+
+    private readRolloutUsage(threadId: string): Promise<void> {
+        const pending = this.rolloutUsageReads.get(threadId);
+        if (pending) return pending;
+        const read = (async () => {
+            try {
+                let path = this.rolloutUsagePaths.get(threadId);
+                if (!path) return; // Child metadata comes from the tracker's existing authenticated read.
+                await this.rolloutUsage.read(threadId, path);
+                this.rolloutUsageFailures.delete(threadId);
+            } catch {
+                if (!this.rolloutUsageFailures.has(threadId)) {
+                    this.rolloutUsageFailures.add(threadId);
+                    logger.warn('[CodexAppServer] Request usage rollout unavailable or invalid; coverage is unverified', { threadId });
+                }
+            }
+        })();
+        this.rolloutUsageReads.set(threadId, read);
+        void read.finally(() => this.rolloutUsageReads.delete(threadId));
+        return read;
+    }
+
+    private usageCoverage = new Map<string, { snapshot: boolean; response: boolean }>();
+    private usageCoverageGapThreads = new Set<string>();
     private processEpoch = 0;
     private connected = false;
     private sandboxConfig?: SandboxConfig;
@@ -384,8 +444,24 @@ export class CodexAppServerClient {
     );
     // Sub-agent (child thread) list. Publishing never throws: the tracker catches a failing consumer.
     private readonly subagents = new CodexSubagentTracker({
-        request: (method, params) => this.request(method, params, 3000),
-        publish: (snapshot) => this.eventHandler?.({ type: 'subagent_tasks', snapshot }),
+        request: async (method, params) => {
+            const result = await this.request(method, params, 3000);
+            if (method === 'thread/read') {
+                const thread = (result as ReadConversationResponse)?.thread;
+                if (thread?.id === (params as { threadId?: string })?.threadId && thread?.path) {
+                    this.rolloutUsagePaths.set(thread.id, thread.path);
+                }
+            }
+            return result;
+        },
+        publish: (snapshot) => {
+            for (const [threadId, turns] of this.pendingRolloutTurns) {
+                if (!this.subagents.isTracked(threadId)) continue;
+                this.pendingRolloutTurns.delete(threadId);
+                for (const turnId of turns) this.observeRolloutUsage('turn/started', { threadId, turnId }, threadId);
+            }
+            this.eventHandler?.({ type: 'subagent_tasks', snapshot });
+        },
     });
     /** The main thread the tracker was pointed at, and on which app-server process (see `pointSubagentsAtMainThread`). */
     private subagentsMain: { threadId: string | null; epoch: number } = { threadId: null, epoch: -1 };
@@ -939,13 +1015,14 @@ export class CodexAppServerClient {
     }
 
     /** `rawResponse/completed` → `codex_usage` for the thread and turn that reported it. */
-    private emitCodexUsage(params: any): void {
+    private emitCodexUsage(params: any, fromRollout = false): void {
         const responseId = typeof params?.responseId === 'string' ? params.responseId : '';
         const usage = params?.usage;
         if (!responseId || !usage || typeof usage !== 'object') {
             logger.warn('[CodexAppServer] Ignoring malformed rawResponse/completed usage notification');
             return;
         }
+        if (!fromRollout && this.rolloutUsage.hasResponse(responseId)) return;
         const threadId = typeof params?.threadId === 'string' ? params.threadId : undefined;
         const turnId = typeof params?.turnId === 'string' ? params.turnId : undefined;
         this.eventHandler?.({
@@ -955,6 +1032,7 @@ export class CodexAppServerClient {
             response_id: responseId,
             usage,
         });
+        if (!fromRollout) this.rolloutUsage.markResponse(responseId);
     }
 
     /** The turn sendTurnAndWait is waiting on, by provider id; a deferred completion leaves it open. */
@@ -1464,6 +1542,8 @@ export class CodexAppServerClient {
             },
             capabilities: {
                 experimentalApi: true,
+                // Raw events are on for `rawResponse/completed` only; the items they also carry are never read.
+                optOutNotificationMethods: ['rawResponseItem/completed'],
             },
         };
         try {
@@ -1674,11 +1754,16 @@ export class CodexAppServerClient {
          */
         awaitProcessExit?: boolean;
     }): Promise<void> {
+        if (this.rolloutUsageTimer) clearInterval(this.rolloutUsageTimer);
+        this.rolloutUsageTimer = null;
+        this.pendingRolloutTurns.clear();
         this.cancelUserInputRequests();
         if (this.backgroundTimer) clearTimeout(this.backgroundTimer);
         this.backgroundTimer = null;
         this.backgroundTasks.invalidate();
         this.subagents.invalidate();
+        this.usageCoverage.clear();
+        this.usageCoverageGapThreads.clear();
         this.clearAgentMessageDeltas();
         if (!this.connected
             && !this.process
@@ -1692,6 +1777,7 @@ export class CodexAppServerClient {
         logger.debug(`[CodexAppServer] Disconnecting; pid=${pid ?? 'none'}`);
 
         this.disconnectingEpoch = epoch;
+        await Promise.all([...this.rolloutUsageThreads].map(thread => this.readRolloutUsage(thread)));
         this.preserveDisconnectingTurn = opts?.preservePendingTurnCompletion === true;
         try {
             this.turnAdmissionAbort?.abort();
@@ -2013,7 +2099,8 @@ export class CodexAppServerClient {
             developerInstructions: opts.developerInstructions ?? null,
             compactPrompt: null,
             includeApplyPatchTool: null,
-            experimentalRawEvents: false,
+            // Also enables rawResponse/completed, the response-scoped usage source.
+            experimentalRawEvents: true,
             persistExtendedHistory: true,
         };
 
@@ -2178,6 +2265,7 @@ export class CodexAppServerClient {
     }
 
     private rememberNativeThreadMetadata(thread: Thread): void {
+        if (thread.path) this.rolloutUsagePaths.set(thread.id, thread.path);
         this.nativeThreadMetadata = typeof thread.path === 'string' && thread.path.length > 0
             ? { id: thread.id, path: thread.path } : null;
     }
@@ -3346,6 +3434,42 @@ export class CodexAppServerClient {
         return 'denied'; // default: deny if no handler
     }
 
+    private observeUsageCoverage(method: string, params: any, threadId: string | null | undefined): void {
+        if (!threadId || (threadId !== this._threadId && !this.subagents.isTracked(threadId))) return;
+        const turnId = this.extractTurnId(params);
+        if (!turnId) return;
+        const key = JSON.stringify([threadId, turnId]);
+        if ((method === 'turn/completed' || method === 'turn/aborted') && this.rolloutUsageThreads.has(threadId)) {
+            const timer = setTimeout(() => {
+                void this.readRolloutUsage(threadId).then(() => this.observeUsageCoverage('usage/settled', params, threadId));
+            }, 2000);
+            timer.unref();
+            return;
+        }
+        if (method === 'turn/completed' || method === 'turn/aborted' || method === 'usage/settled') {
+            const observed = this.usageCoverage.get(key);
+            this.usageCoverage.delete(key);
+            if (!observed?.snapshot || observed.response) return;
+            // A thread that reports no response usage does so on every turn: one warning names it, the rest are detail.
+            if (this.usageCoverageGapThreads.has(threadId)) {
+                logger.debug('[CodexAppServer] Usage coverage gap repeated', { threadId, turnId });
+                return;
+            }
+            this.usageCoverageGapThreads.add(threadId);
+            logger.warn('[CodexAppServer] Usage coverage gap: token snapshot observed without response usage by turn end', { threadId, turnId });
+            return;
+        }
+        const snapshot = method === 'thread/tokenUsage/updated' && params?.tokenUsage != null;
+        const response = method === 'rawResponse/completed'
+            && typeof params?.responseId === 'string' && params.responseId.length > 0
+            && params?.usage != null && typeof params.usage === 'object';
+        if (!snapshot && !response) return;
+        const observed = this.usageCoverage.get(key) ?? { snapshot: false, response: false };
+        observed.snapshot ||= snapshot;
+        observed.response ||= response;
+        this.usageCoverage.set(key, observed);
+    }
+
     private handleNotification(method: string, params: any): void {
         if (method === 'serverRequest/resolved') {
             const request = this.userInputRequests.get(params?.requestId);
@@ -3358,9 +3482,12 @@ export class CodexAppServerClient {
         // Sub-agent threads report on this connection too. Their lifecycle, items and statuses are not the
         // main thread's (design §1.2): only the tracker sees them; their usage still counts.
         const threadId = this.extractThreadId(params);
+        this.observeRolloutUsage(method, params, threadId);
+        this.observeUsageCoverage(method, params, threadId);
         if (threadId && this.subagents.shouldDivert(threadId, this._threadId)) {
             if (method === 'rawResponse/completed') this.emitCodexUsage(params);
             this.subagents.observeOtherThread(method, params);
+            this.observeRolloutUsage(method, params, threadId);
             // A tracked child's progress is the waiting main turn's too: a parent blocked on `wait_agent` is not hung.
             // Foreign and unclassified threads never count (specs/codex-subagent-activity R1).
             if (this.subagents.isTracked(threadId)

@@ -1,5 +1,5 @@
 import { createHmac } from 'node:crypto';
-import { AiUsageEventV1Schema, type AiUsageEventV1 } from '@slopus/happy-wire';
+import { AiUsageEventV1Schema } from '@slopus/happy-wire';
 import { db } from '@/storage/db';
 import { log } from '@/utils/log';
 
@@ -12,7 +12,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 25_000;
 export type UsageOutboxItem = {
     id: string;
     attemptCount: number;
-    event: AiUsageEventV1;
+    event: unknown;
 };
 
 export interface UsageOutboxRepository {
@@ -63,7 +63,7 @@ export function createPrismaUsageOutboxRepository(): UsageOutboxRepository {
                 claimed.push({
                     id: candidate.id,
                     attemptCount: candidate.attemptCount,
-                    event: AiUsageEventV1Schema.parse(candidate.usageEvent.data),
+                    event: candidate.usageEvent.data,
                 });
             }
             return claimed;
@@ -106,12 +106,13 @@ export async function deliverUsageOutboxBatch(input: {
     now?: Date;
     limit?: number;
     requestTimeoutMs?: number;
-}): Promise<{ claimed: number; delivered: number; failed: number; leaseLost: number }> {
+}): Promise<{ claimed: number; delivered: number; failed: number; invalid: number; leaseLost: number }> {
     const currentTime = () => input.now ?? new Date();
     const limit = input.limit ?? DEFAULT_BATCH_SIZE;
     let claimed = 0;
     let delivered = 0;
     let failed = 0;
+    let invalid = 0;
     let leaseLost = 0;
 
     for (let index = 0; index < limit; index += 1) {
@@ -121,25 +122,34 @@ export async function deliverUsageOutboxBatch(input: {
         if (!item) break;
         claimed += 1;
 
-        const body = JSON.stringify(item.event);
-        const timestamp = String(Math.floor(currentTime().getTime() / 1000));
-        const signature = createHmac('sha256', input.secret)
-            .update(`${timestamp}.${body}`)
-            .digest('hex');
-        const controller = new AbortController();
-        const timeout = setTimeout(
-            () => controller.abort(),
-            input.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
-        );
-        timeout.unref();
         try {
+            // Stored rows can outlive the schema version of this worker.
+            const parsed = AiUsageEventV1Schema.safeParse(item.event);
+            if (!parsed.success) {
+                const error = new Error('invalid-usage-event');
+                error.name = 'UsageDeliverySchemaError';
+                throw error;
+            }
+            const event = parsed.data;
+            // What was validated is what is signed and sent.
+            const body = JSON.stringify(event);
+            const timestamp = String(Math.floor(currentTime().getTime() / 1000));
+            const signature = createHmac('sha256', input.secret)
+                .update(`${timestamp}.${body}`)
+                .digest('hex');
+            const controller = new AbortController();
+            const timeout = setTimeout(
+                () => controller.abort(),
+                input.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+            );
+            timeout.unref();
             let response: { ok: boolean; status: number };
             try {
                 response = await input.fetchImpl(input.endpoint, {
                     method: 'POST',
                     headers: {
                         'content-type': 'application/json',
-                        'x-saycode-usage-event-id': item.event.sourceEventId,
+                        'x-saycode-usage-event-id': event.sourceEventId,
                         'x-saycode-usage-signature': `v1=${signature}`,
                         'x-saycode-usage-timestamp': timestamp,
                     },
@@ -160,21 +170,26 @@ export async function deliverUsageOutboxBatch(input: {
             const failedAt = currentTime();
             const attemptCount = item.attemptCount + 1;
             const retryMs = Math.min(BASE_RETRY_MS * (2 ** Math.min(item.attemptCount, 10)), MAX_RETRY_MS);
+            const isInvalid = error instanceof Error && error.name === 'UsageDeliverySchemaError';
             const safeError = error instanceof Error && error.name === 'UsageDeliveryHttpError'
                 ? error.message
-                : 'network-error';
-            if (await input.repository.markFailed(
+                : isInvalid
+                    ? 'invalid-usage-event'
+                    : 'network-error';
+            if (!await input.repository.markFailed(
                 item.id,
                 leaseUntil,
                 attemptCount,
                 new Date(failedAt.getTime() + retryMs),
                 safeError,
-            )) failed += 1;
-            else leaseLost += 1;
+            )) leaseLost += 1;
+            // Kept for a worker that can read it; retrying here cannot succeed, so it is not a delivery failure.
+            else if (isInvalid) invalid += 1;
+            else failed += 1;
         }
     }
 
-    return { claimed, delivered, failed, leaseLost };
+    return { claimed, delivered, failed, invalid, leaseLost };
 }
 
 export function startUsageOutboxWorker(input: {
@@ -201,6 +216,10 @@ export function startUsageOutboxWorker(input: {
             if (result.failed > 0) {
                 log({ module: 'usage-outbox', level: 'warn' },
                     `Usage delivery batch had ${result.failed} retryable failure(s)`);
+            }
+            if (result.invalid > 0) {
+                log({ module: 'usage-outbox', level: 'warn' },
+                    `Usage delivery batch kept ${result.invalid} event(s) this worker cannot validate`);
             }
             if (result.leaseLost > 0) {
                 log({ module: 'usage-outbox', level: 'warn' },
