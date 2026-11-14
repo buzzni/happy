@@ -680,6 +680,8 @@ export type Metadata = {
     /** English kebab-case slug for the task, supplied alongside the title for use as a git branch name. */
     branchSlug?: string,
   },
+  /** Set after a browser task was successfully created in this Happy session. */
+  agentBrowserUsed?: boolean,
   promptSuggestion?: {
     text: string,
     provider: string,

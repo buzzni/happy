@@ -20,6 +20,8 @@ export interface RuntimeClientOptions {
     /** Token or a getter (e.g. re-read from a grant file on each call). */
     token: string | (() => string | Promise<string>)
     fetchImpl?: typeof fetch
+    /** Successful task creation is evidence of browser use, not merely an attempted tool call. */
+    onTaskCreated?: () => void
     retryDelayMs?: number
 }
 
@@ -33,7 +35,11 @@ export class RuntimeClient {
     setSpaceQuota(req: Req<'setSpaceQuota'>) { return this.call('setSpaceQuota', req) }
     listSpaces(req: Req<'listSpaces'>) { return this.call('listSpaces', req) }
     joinSpace(req: Req<'joinSpace'>) { return this.call('joinSpace', req) }
-    createTask(req: Req<'createTask'>) { return this.call('createTask', req) }
+    async createTask(req: Req<'createTask'>) {
+        const task = await this.call('createTask', req)
+        this.opts.onTaskCreated?.()
+        return task
+    }
     openPage(req: Req<'openPage'>) { return this.call('openPage', req) }
     closePage(req: Req<'closePage'>) { return this.call('closePage', req) }
     observe(req: Req<'observe'>) { return this.call('observe', req) }

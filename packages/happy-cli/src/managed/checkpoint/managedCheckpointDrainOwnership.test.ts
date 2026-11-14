@@ -89,7 +89,7 @@ function fakeStore(onRequest?: (method: string, path: string) => void) {
         if (method === 'HEAD') {
             return new Response(null, { status: 200, headers: { 'content-length': String(stored.length), etag } });
         }
-        return new Response(stored, { status: 200, headers: { etag } });
+        return new Response(new Uint8Array(stored), { status: 200, headers: { etag } });
     };
     return { objects, seen, fetchImpl: fetchImpl as unknown as typeof globalThis.fetch };
 }

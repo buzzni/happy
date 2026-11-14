@@ -64,7 +64,7 @@ function fakeStore() {
                 headers: { 'content-length': String(stored.length), etag: `"${etags.get(key)}"` },
             });
         }
-        return new Response(stored, { status: 200, headers: { etag: `"${etags.get(key)}"` } });
+        return new Response(new Uint8Array(stored), { status: 200, headers: { etag: `"${etags.get(key)}"` } });
     };
     return { objects, etags, calls, fetchImpl: fetchImpl as unknown as typeof globalThis.fetch };
 }

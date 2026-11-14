@@ -1,3 +1,5 @@
+import { claudeOwnerEnvironment } from '../daemon/claudeOwnerBundle'
+import { runAiCredentialCommand } from '../daemon/aiCredentialRuntime'
 import { waitForSetupTokenStart, waitForSharedSetupTokenStart } from './setupTokenStartBudget';
 import { requestSetupTokenStart, requestSetupTokenCapacity } from '../daemon/controlClient';
 import { createSetupTokenCapacityRuntime } from './setupTokenUserCapacity';
@@ -8,6 +10,8 @@ import { createSetupTokenActivityReporter } from './setupTokenActivity';
 import { MandatorySandboxError } from '@/sandbox/sandboxPolicy';
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import type { Metadata } from '@/api/types';
 import { render } from "ink";
 import { createManagedGracefulStop, registerManagedGracefulStop, type ManagedGracefulStop } from '@/managed/managedGracefulStop'
@@ -21,7 +25,7 @@ import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { RemoteModeDisplay } from "@/ui/ink/RemoteModeDisplay";
 import React from "react";
 import { claudeRemote, type ClaudeActiveInputSender, type ClaudeTurnLatencyInput } from "./claudeRemote";
-import type { ClaudeAuthObservation, ObservedAiAuthSource } from "./aiAuthObservation";
+import { readLiveOauthAccount, type LiveOauthAccount, type ClaudeAuthObservation, type ObservedAiAuthSource } from "./aiAuthObservation";
 import { ClaudeSideQuestionBridge, createSideQuestionRpcHandler } from "./claudeSideQuestion";
 import { PermissionHandler } from "./utils/permissionHandler";
 import { Future } from "@/utils/future";
@@ -696,6 +700,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             logger.warn(`[setup-token-capacity] ${error instanceof Error ? error.message : 'lifecycle unavailable'}`);
         });
     };
+    // Ambient login metadata is only a restart signal, never evidence of billing or authority.
+    // Scoped/managed providers own their credentials and must not follow the PC login.
+    const readAmbientAccount = () => session.managedRun || session.scopeProcessSandbox || setupTokenSwitching
+        ? Promise.resolve(null)
+        : readLiveOauthAccount({ env: process.env, homeDir: homedir(), readFile: path => readFile(path, 'utf8') });
+
     let backgroundTasks: NonNullable<Metadata['claudeBackgroundTasks']> | undefined;
     const backgroundTaskDetails = createClaudeBackgroundTaskDetails();
     function publishBackgroundTasks(next: NonNullable<Metadata['claudeBackgroundTasks']>) {
@@ -705,7 +715,16 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
     function onMessage(message: SDKMessage) {
         if (message.type === 'system' && message.subtype === 'task_notification') void session.client.reconcileClaudeTranscriptUsage?.();
-        if (isClaudeAuthenticationFailure(message) && !personalFallback?.identity() && !providerStale()) {
+        if (process.env.HAPPY_CLAUDE_OWNER_IDENTITY && isClaudeAuthenticationFailure(message)) {
+            session.client.sendSessionEvent({ type: 'message', message: 'Claude error: [CLAUDE_OWNER_REFRESH_REQUIRED] Check the source PC.', isError: true });
+            // Keep the provider lifecycle event, but suppress local-login recovery for an owner-managed account.
+            const notice = 'Claude error: [CLAUDE_OWNER_REFRESH_REQUIRED] Check the source PC.';
+            if (message.type === 'result' && message.subtype === 'success') message = { ...message, result: notice };
+            else if (message.type === 'result') message = { ...message, errors: [notice] };
+            else if (message.type === 'assistant') message = { ...message, message: { ...message.message,
+                content: message.message.content.map(block => block.type === 'text' ? { ...block, text: notice } : block) } };
+        }
+        if (!process.env.HAPPY_CLAUDE_OWNER_IDENTITY && isClaudeAuthenticationFailure(message) && !personalFallback?.identity() && !providerStale()) {
             lastOrganizationAuthenticationFailed = true; personalFallback?.noteOrganizationAuthentication(true);
             setupTokenSwitching?.onAuthenticationFailure(isClaudeRevokedTokenFailure(message));
         }
@@ -1010,6 +1029,15 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         // See: https://github.com/anthropics/happy-cli/issues/143
         let previousSessionId: string | null = null;
         while (!exitReason) {
+            if (process.env.HAPPY_CLAUDE_OWNER_IDENTITY) {
+                try {
+                    const exported = await runAiCredentialCommand('cswap', ['oauth-owner', 'active'], { maxOutputBytes: 1024 * 1024, timeoutMs: 120_000 });
+                    Object.assign(process.env, claudeOwnerEnvironment(exported.stdout, Date.now(), process.env.HAPPY_CLAUDE_OWNER_IDENTITY));
+                } catch (error) {
+                    // Keep the current bearer: an expired one fails at the provider, which reports the source PC notice.
+                    logger.debug('[remote]: owner bearer check failed before launch', error);
+                }
+            }
             logger.debug('[remote]: launch');
             // Per generation, not per session — see the note at the call.
             /*
@@ -1121,6 +1149,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             const providerOptionsStale = () => providerStale() || optionsCredentialGeneration !== (personalFallback?.generation() ?? 0);
             const usageLimitsQuery = (usageLimitsQueries.get(session.client) ?? 0) + 1;
             usageLimitsQueries.set(session.client, usageLimitsQuery);
+            let providerOauthAccount: LiveOauthAccount | null = null;
             try {
                 const remoteResult = await claudeRemote({
                     sessionId: session.sessionId,
@@ -1251,6 +1280,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         if (pending) {
                             // A held-back batch is a turn like any other: refused once input is closed.
                             if (drain && !drain.claimTurn()) { exitReason = 'exit'; return null; }
+                            providerOauthAccount = await readAmbientAccount();
+                            if (controller.signal.aborted) return null;
                             let p = pending;
                             pending = null;
                             await recheckPersonalInput(p);
@@ -1340,6 +1371,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                          * the two never both go out.
                          */
                         let msg: Awaited<ReturnType<typeof session.queue.waitForMessagesAndGetAsString>>;
+                        const accountBeforeDequeue: { current: LiveOauthAccount | null } = { current: null };
                         /** The organization ceiling clipped this batch's mode. */
                         let orgClamped = false;
                         while (true) {
@@ -1353,6 +1385,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             msg = await session.queue.waitForMessagesAndGetAsString(
                                 AbortSignal.any([controller.signal, generationEnded.signal, ...wakes]),
                                 drain ? () => drain.claimTurn() : undefined,
+                                async () => {
+                                    // Keep input in the queue while reading: a local-mode switch or
+                                    // provider exit during this await must not lose an uncommitted batch.
+                                    accountBeforeDequeue.current = await readAmbientAccount();
+                                    return true;
+                                },
                             );
                             if (!msg && personalWake?.aborted && !controller.signal.aborted && providerStale()) return null;
                             // The member took another account (a stale provider) or asked to resend a first turn (pending).
@@ -1419,8 +1457,11 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             mode = due.mode.mode;
                             // A retry that has to start the next provider starts it with the failed turn's own mode,
                             // which a kept turn's differs from the hash recorded for it: that mode is the baseline.
-                            if (!launched) { launched = mode; modeHash = session.queue.modeHasher(mode); }
-                            else modeHash = due.mode.hash ?? modeHash;
+                            if (!launched) {
+                                providerOauthAccount = await readAmbientAccount();
+                                if (controller.signal.aborted || providerEnded) return null;
+                                launched = mode; modeHash = session.queue.modeHasher(mode);
+                            } else modeHash = due.mode.hash ?? modeHash;
                             permissionHandler.handleModeChange(mode.permissionMode);
                             logger.debug(`[remote]: transient API failure retry ${due.attempt}`);
                             dispatchTurn();
@@ -1471,6 +1512,37 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             pending = msg;
                             drain?.releaseClaim();
                             return null;
+                        }
+
+                        // A new owner bearer belongs to the next uncommitted input, never a replay of a failed turn.
+                        if (msg && process.env.HAPPY_CLAUDE_OWNER_IDENTITY) {
+                            try {
+                                const exported = await runAiCredentialCommand('cswap', ['oauth-owner', 'active'], { maxOutputBytes: 1024 * 1024, timeoutMs: 120_000 });
+                                const environment = claudeOwnerEnvironment(exported.stdout, Date.now(), process.env.HAPPY_CLAUDE_OWNER_IDENTITY);
+                                if (environment.CLAUDE_CODE_OAUTH_TOKEN !== process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+                                    Object.assign(process.env, environment);
+                                    pending = msg;
+                                    drain?.releaseClaim();
+                                    return null;
+                                }
+                            } catch (error) {
+                                // The input still goes out on the current bearer; dropping it here would lose the user's message.
+                                logger.debug('[remote]: owner bearer check failed before input', error);
+                            }
+                        }
+                        if (msg) {
+                            const liveAccount = accountBeforeDequeue.current;
+                            if (providerOauthAccount && liveAccount && (
+                                providerOauthAccount.email !== liveAccount.email
+                                || providerOauthAccount.organizationUuid !== liveAccount.organizationUuid
+                            )) {
+                                // Preserve the entire batch (attachments/receipt included). End the old
+                                // query before the queued request reaches its cached OAuth credentials.
+                                pending = msg;
+                                drain?.releaseClaim();
+                                return null;
+                            }
+                            if (!mode) providerOauthAccount = liveAccount;
                         }
 
                         // Check if mode has changed
@@ -1764,7 +1836,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 logger.debug('[remote]: launch error', e);
                 const authenticationError = { is_error: true, result: e instanceof Error ? e.message : '' };
                 if (!exitReason && !controller.signal.aborted && !personalFallback?.identity() && !providerStale()
-                    && isClaudeAuthenticationFailure(authenticationError)) {
+                    && !process.env.HAPPY_CLAUDE_OWNER_IDENTITY && isClaudeAuthenticationFailure(authenticationError)) {
                     lastOrganizationAuthenticationFailed = true;
                     personalFallback?.noteOrganizationAuthentication(true);
                     setupTokenSwitching?.onAuthenticationFailure(isClaudeRevokedTokenFailure(authenticationError));

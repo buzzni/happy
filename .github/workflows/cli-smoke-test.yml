@@ -25,6 +25,9 @@ env:
 jobs:
   smoke-test-linux:
     runs-on: ubuntu-latest
+    # The complete CLI type graph exceeds Node 20's ~2 GB default heap.
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
     strategy:
       matrix:
         node-version: [20, 24]
@@ -41,6 +44,21 @@ jobs:
       with:
         node-version: ${{ matrix.node-version }}
         cache: 'pnpm'
+
+    - name: Install Linux SDK sandbox dependency
+      if: matrix.node-version == 24
+      timeout-minutes: 5
+      run: |
+        # Provision the prerequisite before any CLI/daemon test can affect the host.
+        # Fail here rather than report a package-network failure as an SDK authentication failure.
+        getent ahostsv4 archive.ubuntu.com
+        # Azure's runner-local mirror repeatedly failed DNS during this smoke.
+        # Keep APT's signed sources and use the public Ubuntu mirror endpoints.
+        printf '%s\n' 'https://security.ubuntu.com/ubuntu/' 'https://archive.ubuntu.com/ubuntu/' \
+          | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+        sudo apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 update
+        sudo apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 install -y bubblewrap
+        bwrap --version
 
     # npm 10 crashes in Arborist while installing the packed CLI + self-host
     # server together. Keep the Node 20 runtime test with the verified npm 11.
@@ -65,6 +83,17 @@ jobs:
         src/daemon/sessionRetentionControl.test.ts
         src/daemon/sessionIdleReaper.test.ts
 
+    - name: Verify Claude account switches preserve queued input
+      if: matrix.node-version == 24
+      timeout-minutes: 5
+      run: >-
+        pnpm --filter @buzzni/happy-cli exec vitest run --project unit
+        src/claude/claudeRemoteLauncher.oauthSwitch.test.ts
+        src/claude/claudeRemoteLauncher.transientRetry.test.ts
+        src/claude/claudeRemoteLauncher.setupTokenSwitch.test.ts
+        src/claude/aiAuthObservation.test.ts
+        src/utils/MessageQueue2.test.ts
+
     - name: Verify terminals survive a daemon restart (terminal workers)
       timeout-minutes: 5
       run: >-
@@ -78,8 +107,6 @@ jobs:
       env:
         HAPPY_CLAUDE_AUTH_PIN_INTEGRATION: '1'
       run: |
-        sudo apt-get update
-        sudo apt-get install -y bubblewrap
         # Ubuntu's AppArmor user-namespace restriction prevents unprivileged bwrap
         # before the SDK starts. Relax it only in this disposable CI runner;
         # policies remain inside the test's private mount namespace.

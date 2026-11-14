@@ -76,23 +76,25 @@ export function parseCswapVersion(stdout: string): string | null {
   return /^(?:cswap|claude-swap) (\d+\.\d+\.\d+(?:[a-z]+\d+)?)\s*$/.exec(stdout)?.[1] ?? null
 }
 
-/** True when `version` is at least the SayCode 0.27.0b1 runtime pin. */
-export function cswapAtLeastPinned(version: string | null): boolean {
-  const match = version?.match(/^(\d+)\.(\d+)\.(\d+)(?:(a|b|rc)(\d+))?$/)
-  if (!match) return false
+/** True when `version` is at least `pinned`, by default the SayCode 0.27.0b1 runtime pin. */
+export function cswapAtLeastPinned(version: string | null, pinnedVersion = '0.27.0b1'): boolean {
+  const pattern = /^(\d+)\.(\d+)\.(\d+)(?:(a|b|rc)(\d+))?$/
+  const match = version?.match(pattern), minimum = pinnedVersion.match(pattern)
+  if (!match || !minimum) return false
   const [, majorText, minorText, patchText, prereleaseKind, prereleaseNumberText] = match
   const [major, minor, patch] = [majorText, minorText, patchText].map(Number)
   const numeric = [major, minor, patch]
-  const pinned = [0, 27, 0]
+  const pinned = minimum.slice(1, 4).map(Number)
   for (let index = 0; index < numeric.length; index += 1) {
-    if (numeric[index] !== pinned[index]) return numeric[index] > pinned[index]
+    if (numeric[index] !== pinned[index]) return numeric[index] > pinned[index]!
   }
   if (!prereleaseKind) return true
+  if (!minimum[4]) return false
   const rank = { a: 0, b: 1, rc: 2 } as const
   const candidateRank = rank[prereleaseKind as keyof typeof rank]
-  const pinnedRank = rank.b
+  const pinnedRank = rank[minimum[4] as keyof typeof rank]
   if (candidateRank !== pinnedRank) return candidateRank > pinnedRank
-  return Number(prereleaseNumberText) >= 1
+  return Number(prereleaseNumberText) >= Number(minimum[5])
 }
 
 export type SetupTokenAccountStatus = {

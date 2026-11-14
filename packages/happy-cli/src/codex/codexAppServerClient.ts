@@ -1,5 +1,6 @@
 import { CodexRolloutUsage } from './codexRolloutUsage';
 import { takeScopeConfirmation, confirmSessionWriteScope } from '@/daemon/sessionWriteScopeConfirmation';
+import { isSessionDigestMcpInvocation } from './utils/sessionDigestMcpInvocation';
 /**
  * Codex App Server Client — drives Codex via the v2 JSON-RPC protocol
  * (`codex app-server`), replacing the legacy MCP-based CodexMcpClient.
@@ -1187,8 +1188,9 @@ export class CodexAppServerClient {
             this.reopenConsumerLifecycleOnResumedWork(this.extractTurnId(params));
         }
 
-        // Browser quota recovery needs the live receipt, not only a later history backfill.
-        if (item.type === 'mcpToolCall' && typeof item.tool === 'string' && item.tool.startsWith('browser_task_')
+        // Browser recovery and Desktop digests need live receipts, not only history backfill.
+        if (item.type === 'mcpToolCall' && typeof item.tool === 'string'
+            && (item.tool.startsWith('browser_task_') || isSessionDigestMcpInvocation(item))
             && (method === 'item/started' || method === 'item/completed')) {
             this.eventHandler?.({ type: method === 'item/started' ? 'mcp_tool_call_begin' : 'mcp_tool_call_end',
                 call_id: item.id, turn_id: this.extractTurnId(params),
