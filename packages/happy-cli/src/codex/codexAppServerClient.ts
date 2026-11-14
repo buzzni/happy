@@ -1975,6 +1975,15 @@ export class CodexAppServerClient {
 
     private launchMcpServerNames: string[] = [];
 
+    /** Read-only host discovery; credentials remain inside the session host. */
+    async readHostMcpServers(cwd: string): Promise<Record<string, unknown>> {
+        const result = await this.request('config/read', { cwd, includeLayers: false }, 3000) as { config?: { mcp_servers?: unknown } };
+        const servers = result.config?.mcp_servers;
+        if (servers === undefined) return {};
+        if (!servers || typeof servers !== 'object' || Array.isArray(servers)) throw new Error('HOST_TOOL_CONFIG_UNREADABLE');
+        return servers as Record<string, unknown>;
+    }
+
     private async buildThreadConfig(
         mcpServers?: Record<string, unknown>,
         writableRoots?: readonly string[],

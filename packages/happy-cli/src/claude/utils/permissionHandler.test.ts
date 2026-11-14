@@ -948,6 +948,14 @@ describe('PermissionHandler tool policy approvals (aplus-dev-studio specs/agent-
         return handler.requestPolicyApproval({ id: 'toolu_policy', toolName: 'mcp__cua-driver__click', args: { pid: 13 }, policy: POLICY, signal });
     }
 
+    it.each([false, true])('host consent is taken only from the human response (updated=%s)', async updated => {
+        const stub = createRecordingSessionStub(), handler = new PermissionHandler(stub.session);
+        const pending = handler.requestPolicyApproval({ id: 'host-v1', toolName: 'mcp__happy__host_command',
+            args: { hostToolConsentVersion: 1 }, policy: { ...POLICY, reasonCode: 'protected_tool_access', humanOnly: true }, signal: new AbortController().signal });
+        await stub.answer({ id: 'host-v1', approved: true, ...(updated ? { updatedInput: { hostToolConsentVersion: 1 } } : {}) });
+        expect((await pending).hostToolConsentVersion).toBe(updated ? 1 : undefined);
+    });
+
     it('passes browser consent only from the human reply, never the requested arguments', async () => {
         const stub = createRecordingSessionStub(), handler = new PermissionHandler(stub.session);
         const pending = handler.requestPolicyApproval({ id: 'browser-v2', toolName: 'browser_task_create_client', args: { browserClientConsentVersion: 2, browserClientConsent: { leaseMinutes: 1440, rememberSameScope: true } }, policy: { ...POLICY, reasonCode: 'browser_client_delegation', humanOnly: true, grantOffer: 'once' }, signal: new AbortController().signal });

@@ -427,3 +427,14 @@ describe('BrowserBridge', () => {
         })
     })
 })
+
+it('refuses a replacement Chrome connection after approval without sending to it', async () => {
+    const bridge = new BrowserBridge({ authToken: TOKEN });
+    const first = new FakeSocket();
+    bridge.handleConnection(first, { token: TOKEN, profile: 'work' });
+    const identity = bridge.connections(undefined, true)[0].connectionId!;
+    const replacement = new FakeSocket();
+    bridge.handleConnection(replacement, { token: TOKEN, profile: 'work' });
+    await expect(bridge.request('click', { ref: '@e1' }, { profile: 'work', expectedConnectionId: identity })).rejects.toMatchObject({ code: 'BROWSER_CONNECTION_CHANGED' });
+    expect(replacement.sent).toEqual([]);
+});

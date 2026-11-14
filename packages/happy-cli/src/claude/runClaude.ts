@@ -1,3 +1,4 @@
+import { readClaudeHostServers } from '@/toolPolicy/hostToolCatalog';
 import { readSetupTokenResumeSelection, isMachineSetupTokenBinding, SETUP_TOKEN_BINDING_ENV } from '@/daemon/sessionEnv';
 import { initializeScopeReportSigner, takeScopeLaunchBootstrap } from '@/daemon/sessionWriteScopeReports';
 import { takeScopeConfirmation } from '@/daemon/sessionWriteScopeConfirmation';
@@ -838,6 +839,10 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     })?.gate ?? null;
     // Start Happy MCP server
     const happyServer = await startHappyServer(session, {
+        protectedToolAccess: () => toolPolicy?.protectedAccess,
+        hostToolsAllowed: principal.kind === 'account',
+        hostMcpServers: async () => principal.kind === 'account' ? { ...claudeLaunchMcpServers(launchMcpServers),
+            ...await readClaudeHostServers(process.env.CLAUDE_CONFIG_DIR || homedir(), workingDirectory, buildSkillGovernanceOptions(readSkillGovernanceConfigFromEnv(process.env)).settingSources) } : {},
         browserClientApprover: () => currentSession?.policyApprover ?? null,
         // A mandatory scope launch needs the broker most: its trust floor denies access.key (#898). The
         // agent-sbx launcher drops SAYCODE_AGENT_* from the provider env, so it gets none.
@@ -864,7 +869,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // Tool policy (aplus-dev-studio specs/agent-tool-policy I1a): every `mcp__*` call goes through
     // the PreToolUse hook to this gate. The daemon cannot yet tell whether a session was started on
     // this PC, so every conversation grant gets the remote-session TTL until Desktop reports it.
-    const toolPolicy = isToolPolicyEnabled(process.env)
+    const toolPolicy = (isToolPolicyEnabled(process.env) || sandboxPolicyMode === 'mandatory' || process.env.HAPPY_WRITE_SCOPE_SESSION === '1')
         ? createToolPolicyRuntime({
             happyHomeDir: configuration.happyHomeDir,
             sessionId: () => session.sessionId,

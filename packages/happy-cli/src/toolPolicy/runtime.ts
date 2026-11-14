@@ -1,3 +1,5 @@
+import { createProtectedToolAccess } from './protectedToolAccess';
+import { evaluateToolCall } from './evaluate';
 /**
  * One session's tool policy runtime (aplus-dev-studio specs/agent-tool-policy plan "결정: 집행 위치").
  *
@@ -7,7 +9,7 @@
  * session RPCs that list and revoke those grants (grantControl.ts).
  */
 
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createToolPolicyAuditLog, type ToolPolicyAuditRecord } from './audit';
@@ -21,6 +23,7 @@ import { createTargetResolver } from './targetResolver';
 
 export interface ToolPolicyRuntime {
     gate: ToolPolicyGate;
+    protectedAccess: ReturnType<typeof createProtectedToolAccess>;
     grants: PolicyGrantStore;
     secret: string;
     secretFile: string;
@@ -53,8 +56,20 @@ export function createToolPolicyRuntime(input: {
     const policyFile = toolPolicyFilePath(input.happyHomeDir);
     const grants = createPolicyGrantStore({ grantTtlMs: input.grantTtlMs });
     registerToolPolicyGrantRpcs(input.rpc, grants);
+    const loadMachinePolicy = createMachinePolicyLoader(policyFile);
+    const protectedAccess = createProtectedToolAccess({
+        grants, approver: input.approver, unattended: input.unattended,
+        checkPolicy(scope) {
+            const machine = loadMachinePolicy();
+            const org = input.orgRules?.() ?? null;
+            const verdict = evaluateToolCall({ toolName: scope.toolName, args: scope.args ?? {}, platform: process.platform }, machine,
+                { hasGrant: () => false, recentlyDenied: () => false }, undefined, Date.now(), org);
+            if (verdict.decision === 'blocked') throw new Error('TOOL_ACCESS_POLICY_DENIED');
+            return createHash('sha256').update(JSON.stringify([machine, org])).digest('hex');
+        },
+    });
     const gate = createToolPolicyGate({
-        loadMachinePolicy: createMachinePolicyLoader(policyFile),
+        loadMachinePolicy,
         resolver: createTargetResolver(),
         grants,
         audit: createToolPolicyAuditLog({
@@ -73,11 +88,13 @@ export function createToolPolicyRuntime(input: {
 
     return {
         gate,
+        protectedAccess,
         grants,
         secret,
         secretFile,
         policyFile,
         dispose: () => {
+            protectedAccess.dispose();
             grants.clear();
             try { unlinkSync(secretFile); } catch { /* already gone */ }
         },
