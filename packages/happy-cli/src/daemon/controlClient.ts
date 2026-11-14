@@ -289,7 +289,15 @@ export async function notifyDaemonSessionRuntime(
   // session. hostPid is what lets that daemon adopt us instead of dropping the
   // report; taking the PID from a persisted record instead would risk acting on a
   // recycled PID.
-  return daemonPost('/session-runtime', { sessionId, ...runtime, hostPid: process.pid }, 'session-runtime');
+  const payload = { sessionId, ...runtime, hostPid: process.pid };
+  const result = await daemonPost('/session-runtime', payload, 'session-runtime');
+  // A concurrent lifecycle report may overtake this launch's signature sequence.
+  // Re-sign only a definitively refused status report, never an approval or unknown outcome.
+  if (process.env.HAPPY_WRITE_SCOPE_SESSION === '1' && result?.status === 403
+      && result.code === 'SCOPE_REPORT_AUTH_REQUIRED') {
+    return daemonPost('/session-runtime', payload, 'session-runtime');
+  }
+  return result;
 }
 
 /**
