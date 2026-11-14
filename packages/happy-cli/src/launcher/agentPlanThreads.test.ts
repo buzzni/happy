@@ -1,8 +1,8 @@
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { agentPlanThreadsDir, isAgentPlanThread, recordAgentPlanThread } from './agentPlanThreads'
+import { agentPlanThreadsDir, isAgentPlanThread, recordAgentPlanThread, hasClaudeAgentPlanThread, readAgentPlanThread } from './agentPlanThreads'
 
 const homes: string[] = []
 afterEach(() => { while (homes.length) rmSync(homes.pop()!, { recursive: true, force: true }) })
@@ -32,6 +32,20 @@ describe('agent plan thread markers (spec §6.3-4)', () => {
         await recordAgentPlanThread(threads, 'thread-1', { sessionId: 'happy-1', grantId: 'grant-1' })
         await recordAgentPlanThread(threads, 'thread-1', { sessionId: 'happy-2', grantId: 'grant-2' })
         expect(JSON.parse(readFileSync(join(threads, 'thread-1.json'), 'utf8')).sessionId).toBe('happy-1')
+    })
+
+    it('updates Claude authority after an authorized continuation so another continuation validates the latest grant', async () => {
+        const threads = dir()
+        await recordAgentPlanThread(threads, 'claude-1', { sessionId: 'happy-1', grantId: 'grant-1', agent: 'claude' })
+        await recordAgentPlanThread(threads, 'claude-1', { sessionId: 'happy-2', grantId: 'grant-2', agent: 'claude' })
+        expect(JSON.parse(readFileSync(join(threads, 'claude-1.json'), 'utf8')).grantId).toBe('grant-2')
+    })
+
+    it('treats a corrupt marker as guarded without breaking unrelated fresh launches', () => {
+        const threads = dir(); mkdirSync(threads, { recursive: true })
+        writeFileSync(join(threads, 'broken.json'), '{partial')
+        expect(hasClaudeAgentPlanThread(threads)).toBe(true)
+        expect(() => readAgentPlanThread(threads, 'broken')).toThrow()
     })
 
     it('never treats a path-like id as a thread', async () => {

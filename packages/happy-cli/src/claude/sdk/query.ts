@@ -97,13 +97,17 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
     if (opts?.mcpServers && Object.keys(opts.mcpServers).length > 0) {
         ensureLocalProxyBypass(env)
     }
+    if (['platform-plan', 'platform-plan-pending'].includes(env.HAPPY_AI_AUTH_SOURCE ?? '')) {
+        sdkOptions.disallowedTools = [...new Set([...(sdkOptions.disallowedTools ?? []), 'WebSearch'])]
+        sdkOptions.effort = 'medium'
+    }
     sdkOptions.env = env
     // An endpoint serves its own model names only; this is the last place every query — the title job's and the
     // sub-agents' included — passes, so a Claude ID some caller kept cannot reach it.
     sdkOptions.model = foldModelToOrgEndpoint(sdkOptions.model, env)
     // No fallback in an endpoint session: it has no second model, and the SDK refuses a fallback equal to the main model
     // (which folding produces whenever the endpoint maps no tiers) by not creating the query at all.
-    if (env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint') sdkOptions.fallbackModel = undefined
+    if (['org-endpoint', 'platform-plan', 'platform-plan-pending'].includes(env.HAPPY_AI_AUTH_SOURCE ?? '')) sdkOptions.fallbackModel = undefined
     // Outside an endpoint the two can still meet: a stored fallback migrates onto the same successor as the main model
     // (claude-fable-5-1 → claude-fable-5-2). Run without a fallback rather than have the SDK refuse the query.
     if (sdkOptions.fallbackModel && sdkOptions.fallbackModel === sdkOptions.model) sdkOptions.fallbackModel = undefined
@@ -129,7 +133,7 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
 
     // An organization LLM endpoint's address, token and models would otherwise be replaced by the same keys in a
     // user or project settings file. No fallback: a session whose environment the pin cannot read does not start.
-    if (env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint') return queryWithPinnedEndpoint(sdkQuery, {
+    if (['org-endpoint', 'platform-plan', 'platform-plan-pending'].includes(env.HAPPY_AI_AUTH_SOURCE ?? '')) return queryWithPinnedEndpoint(sdkQuery, {
         prompt: params.prompt as string | AsyncIterable<SDKUserMessage>, options: sdkOptions,
     }, env)
 

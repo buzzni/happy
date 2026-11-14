@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 /**
  * aplus-dev-studio specs/org-agent-plan §6.3-4 — which Codex threads belong to organization agent plan sessions.
  *
@@ -7,8 +8,7 @@
  * every launcher that can resume a thread checks it: the daemon for a spawn without a grant envelope, the
  * runner for `happy codex --resume`, and anything else (Desktop's local `codex resume`) can read the same file.
  */
-import { existsSync } from 'node:fs'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { existsSync, readFileSync, readdirSync, mkdirSync, writeFileSync, renameSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { AGENT_PLAN_DESCRIPTOR_VERSION } from './agentPlanLaunch'
 
@@ -34,21 +34,47 @@ export function isAgentPlanThread(dir: string, threadId: string): boolean {
 }
 
 /** Owner-only, no secret: which session and grant ran the thread. Idempotent. */
-export async function recordAgentPlanThread(
+export function recordAgentPlanThreadSync(
     dir: string,
     threadId: string,
-    record: { sessionId: string; grantId: string },
-): Promise<void> {
+    record: { sessionId: string; grantId: string; agent?: 'claude' | 'codex' },
+): void {
     const path = markerPath(dir, threadId)
     if (!path) throw new Error('not a Codex thread id')
-    if (existsSync(path)) return
-    await mkdir(dir, { recursive: true, mode: 0o700 })
-    await writeFile(path, JSON.stringify({
+    if (existsSync(path) && record.agent !== 'claude') return
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const temp = `${path}.${randomUUID()}.tmp`
+    try {
+    writeFileSync(temp, JSON.stringify({
         version: 1,
         source: 'platform-plan',
+        agent: record.agent ?? 'codex',
         sessionId: record.sessionId,
         grantId: record.grantId,
         descriptorVersion: AGENT_PLAN_DESCRIPTOR_VERSION,
         recordedAt: Date.now(),
-    }), { mode: 0o600 })
+    }), { mode: 0o600, flag: 'wx' })
+    renameSync(temp, path)
+    } finally { rmSync(temp, { force: true }) }
+}
+
+/** Read the authority marker; unreadable existing markers refuse a resume. */
+export function readAgentPlanThread(dir: string, threadId: string): { grantId: string; sessionId: string; agent?: string } | null {
+    const path = markerPath(dir, threadId)
+    if (!path || !existsSync(path)) return null
+    const value = JSON.parse(readFileSync(path, 'utf8'))
+    if (value.source !== 'platform-plan' || typeof value.grantId !== 'string' || typeof value.sessionId !== 'string') throw new Error('agent_plan_marker_invalid')
+    return value
+}
+export function hasClaudeAgentPlanThread(dir: string): boolean {
+    if (!existsSync(dir)) return false
+    return readdirSync(dir).some(name => {
+        if (!name.endsWith('.json')) return false
+        try { return readAgentPlanThread(dir, name.slice(0, -5))?.agent === 'claude' }
+        catch { return true } // A picker is guarded; fresh launches never scan this directory.
+    })
+}
+
+export async function recordAgentPlanThread(dir: string, threadId: string, record: { sessionId: string; grantId: string; agent?: 'claude' | 'codex' }): Promise<void> {
+    recordAgentPlanThreadSync(dir, threadId, record)
 }

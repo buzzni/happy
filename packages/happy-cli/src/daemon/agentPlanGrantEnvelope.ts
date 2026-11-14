@@ -11,6 +11,7 @@ import { createHash } from 'node:crypto'
 import tweetnacl from 'tweetnacl'
 import {
     AGENT_PLAN_CAPABILITY,
+    agentPlanAgent,
     AGENT_PLAN_DESCRIPTOR_ENV,
     AGENT_PLAN_SECRET_ENV,
     buildAgentPlanDescriptor,
@@ -181,6 +182,7 @@ export function prepareAgentPlanLaunch(
         /** Where the runner records plan thread markers (the daemon's own home). */
         threadsDir: string
         /** The Codex thread a fork or continuation resumes, if any. */
+        resumeClaudeSessionId?: string
         resumeCodexThreadId?: string
         isPlanThread: (threadId: string) => boolean
     },
@@ -189,16 +191,16 @@ export function prepareAgentPlanLaunch(
     | { ok: false; reason: AgentPlanSpawnRefusal } {
     if (!input.agentPlan) {
         // §6.3-4: a plan thread continued without a fresh grant would run on this machine's own Codex login.
-        if (input.resumeCodexThreadId && input.isPlanThread(input.resumeCodexThreadId)) {
+        if ([input.resumeCodexThreadId, input.resumeClaudeSessionId].some(id => id && input.isPlanThread(id))) {
             return { ok: false, reason: 'agent_plan_resume_requires_grant' }
         }
         return { ok: true, environment: {}, claim: () => null }
     }
-    if (input.agent !== 'codex') return { ok: false, reason: 'agent_plan_agent_unsupported' }
     if (input.aiAuthSelection !== undefined) return { ok: false, reason: 'agent_plan_conflicting_selection' }
     if (!agentPlanCapabilityForPlatform(input.platform) || !input.studioOrigin) return { ok: false, reason: 'agent_plan_unavailable' }
     const opened = consumer.open(input.agentPlan.grantEnvelope)
     if (!opened.ok) return opened
+    if (input.agent !== agentPlanAgent(opened.grant.model)) return { ok: false, reason: 'agent_plan_agent_unsupported' }
     const descriptor = buildAgentPlanDescriptor({
         origin: input.studioOrigin,
         grantId: opened.grant.grantId,

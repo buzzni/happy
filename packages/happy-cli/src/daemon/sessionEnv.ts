@@ -727,7 +727,8 @@ export function readOrgEndpointResumeSelection(agentEnvironment: SaycodeAgentEnv
  * from managed credentials (and is then held to the applied-source proof). The setup-token guard
  * in the AI credential runtime only applies to launches that name no selection.
  */
-export function honorsManagedAiCredentials(selection: AiAuthSelection | undefined): boolean {
+export function honorsManagedAiCredentials(selection: AiAuthSelection | undefined, platformPlan = false): boolean {
+    if (platformPlan) return false
     return selection?.kind !== 'machine-personal'
 }
 

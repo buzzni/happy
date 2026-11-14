@@ -1,3 +1,4 @@
+import { AGENT_PLAN_DESCRIPTOR_ENV } from '@/launcher/agentPlanLaunch';
 import { createBrowserSessionReconnect } from './browserSessionReconnect';
 import { readBrowserTaskPidStartTime } from './browserTaskSessionOwner';
 import { createBrowserNativeDeviceProof, type BrowserNativeDeviceSigner } from './browserNativeDeviceProof';
@@ -2036,10 +2037,11 @@ export async function startDaemon(): Promise<void> {
      * the decision (an unresolved assignment, Studio unreachable) fails the launch.
      */
     const machineRotationFor = async (options: SpawnSessionOptions): Promise<MachineSetupTokenRuntime | null> => {
+      if (options.agentPlan) return null;
       const chosen = channelRotationRuntimes.get(options);
       if (chosen) return chosen;
       const runtime = await chooseLaunchRotation({
-        managedClaude: (!options.agent || options.agent === 'claude') && honorsManagedAiCredentials(options.aiAuthSelection),
+        managedClaude: (!options.agent || options.agent === 'claude') && honorsManagedAiCredentials(options.aiAuthSelection, Boolean(options.agentPlan)),
         // An endpoint launch spends no company account either: rotation would reserve one before the selection is verified.
         explicitUserGrant: options.aiAuthSelection?.kind === 'claude-setup-token' || options.aiAuthSelection?.kind === 'org-endpoint',
         precreatedSession: !!options.reconnectEnvironment,
@@ -2236,6 +2238,7 @@ export async function startDaemon(): Promise<void> {
           platform: process.platform,
           studioOrigin: readTrustedStudioOrigin(process.env),
           threadsDir: agentPlanThreadsDir(configuration.happyHomeDir),
+          resumeClaudeSessionId: options.agent === 'claude' ? options.resumeClaudeSessionId : undefined,
           resumeCodexThreadId: options.agent === 'codex' ? options.resumeCodexThreadId : undefined,
           isPlanThread: (threadId) => isAgentPlanThread(agentPlanThreadsDir(configuration.happyHomeDir), threadId),
         }, agentPlanGrantConsumer);
@@ -2342,7 +2345,7 @@ export async function startDaemon(): Promise<void> {
           preparedMachineSessionId = preparedMachineLaunch.session.id;
           pendingMachineStarts.add(preparedMachineSessionId);
         }
-        const launchAuthorityEnvironment = preparedMachineLaunch?.environment ?? (honorsManagedAiCredentials(options.aiAuthSelection)
+        const launchAuthorityEnvironment = preparedMachineLaunch?.environment ?? (honorsManagedAiCredentials(options.aiAuthSelection, Boolean(options.agentPlan))
           ? await resolveManagedAiCredentialEnvironment(options.agent, options.aiAuthSelection)
           : {});
         const personalAnchor = readSetupTokenResumeSelection(launchAuthorityEnvironment)?.binding;
@@ -3478,7 +3481,7 @@ export async function startDaemon(): Promise<void> {
         resumingSetupTokenSessions.set(happySessionId, tracked);
         let resumedCredentials: { environment: Record<string, string>; rebound: boolean };
         try {
-          resumedCredentials = recoveredMachineEnvironment ? { environment: recoveredMachineEnvironment, rebound: false } : resumeOrgEndpoint
+          resumedCredentials = tracked.agentEnvironment?.[AGENT_PLAN_DESCRIPTOR_ENV] ? { environment: {}, rebound: false } : recoveredMachineEnvironment ? { environment: recoveredMachineEnvironment, rebound: false } : resumeOrgEndpoint
             ? { environment: await resolveManagedAiCredentialEnvironment(resumeAgent, resumeOrgEndpoint), rebound: false }
             : await resumeSetupTokenEnvironment({
             sessionId: happySessionId,
@@ -5990,7 +5993,7 @@ export async function startDaemon(): Promise<void> {
       metadata: options => ({ path: options.directory, host: os.hostname(), version: packageJson.version, os: os.platform(), machineId,
         homeDir: os.homedir(), happyHomeDir: configuration.happyHomeDir, happyLibDir: projectPath(), happyToolsDir: join(projectPath(), 'tools', 'unpacked'),
         flavor: options.agent ?? 'claude', startedFromDaemon: true, startedBy: 'daemon', lifecycleState: 'running', lifecycleStateSince: Date.now() }),
-      rotation: (options, companyId) => companyId ? machineRuntimeFor(companyId) : machineRotationFor(options),
+      rotation: (options, companyId) => options.agentPlan ? Promise.resolve(null) : companyId ? machineRuntimeFor(companyId) : machineRotationFor(options),
       start: (options, launch) => { if (launch) ownedMachineLaunches.set(options, launch); return ownedStartGuard.start(options, () => spawnSessionAdmitted(options)); },
       tracked: sessionId => findTrackedSessionById(sessionId) ?? sessionIdToFinishedSession.get(sessionId), live: liveLaunch,
       persist: async session => {

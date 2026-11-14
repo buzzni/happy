@@ -68,7 +68,7 @@ export const ORG_ENDPOINT_MACHINE_ENV_KEYS = [
  * environment carried it, so a daemon that predates a key still closes it.
  */
 export function orgEndpointRoutingSettingsEnv(env: Record<string, string | undefined>): Record<string, string> | undefined {
-    if (env.HAPPY_AI_AUTH_SOURCE !== 'org-endpoint' || !env.ANTHROPIC_BASE_URL) return undefined
+    if (!['org-endpoint', 'platform-plan', 'platform-plan-pending'].includes(env.HAPPY_AI_AUTH_SOURCE ?? '') || !env.ANTHROPIC_BASE_URL) return undefined
     const block: Record<string, string> = {}
     for (const key of ORG_ENDPOINT_VALUE_ENV_KEYS) {
         const value = env[key]

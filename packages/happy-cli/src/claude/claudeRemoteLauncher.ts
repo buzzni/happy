@@ -1776,6 +1776,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         // Input already waiting replaces it, so it is not announced at all.
                         const retry = transientRetry.afterTurn(turnMode && !lastTurnChannel && !lastTurnCommand
                             && !session.managedRun && !session.exitAfterFirstTurn && !controller.signal.aborted
+                            // The gateway owns retries and may retain unknown-cost holds after a 5xx.
+                            && !['platform-plan', 'platform-plan-pending'].includes(process.env.HAPPY_AI_AUTH_SOURCE ?? '')
                             && !pending && session.queue.size() === 0 && !gracefulStop?.requested()
                             ? { mode: turnMode, hash: modeHash } : null);
                         const accountRetry = !lastResultSucceeded && !lastTurnChannel

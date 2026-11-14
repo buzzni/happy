@@ -34,6 +34,7 @@ type Recorded = { url: string; authorization?: string; body: string }
 /** A stand-in Studio on loopback: session-keys and the gateway's streaming Responses endpoint. */
 async function fakeStudio(handlers: {
     sessionKeys?: (body: Record<string, unknown>, res: ServerResponse) => void
+    messages?: (req: IncomingMessage, body: string, res: ServerResponse) => void
     responses?: (req: IncomingMessage, body: string, res: ServerResponse) => void
 } = {}) {
     const requests: Recorded[] = []
@@ -48,6 +49,7 @@ async function fakeStudio(handlers: {
                 res.end(JSON.stringify({ key: `agps_${requests.length}`, expiresAt: Date.now() + 30 * 60_000 }))
                 return
             }
+            if (req.url === '/api/agent-plan/v1/messages' && handlers.messages) return handlers.messages(req, body, res)
             if (req.url === '/api/agent-plan/v1/responses') {
                 if (handlers.responses) return handlers.responses(req, body, res)
                 res.writeHead(200, { 'content-type': 'text/event-stream' })
@@ -378,3 +380,30 @@ describe('assertNotAgentPlanThreadWithoutPlan (spec §6.3-4)', () => {
     })
 })
 
+
+describe('Claude Messages session proxy', () => {
+    const model = 'deepseek/deepseek-v4.1-flash-eco'
+    it('binds before serving Messages and forwards nonretry quota errors without exposing the grant', async () => {
+        const studio = await fakeStudio({
+            sessionKeys: (_body, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ key: 'agps_eco', expiresAt: Date.now() + 1800000, model, parentGrantId: 'parent-grant' })) },
+            messages: (req, _body, res) => { expect(req.headers['anthropic-version']).toBe('2023-06-01'); res.writeHead(429, { 'content-type': 'application/json', 'x-should-retry': 'false' }); res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'quota' } })) },
+        })
+        const launch = { descriptor: buildAgentPlanDescriptor({ origin: studio.origin, grantId: GRANT, model })!, secret: SECRET, threadsDir: null }
+        const env: NodeJS.ProcessEnv = {}
+        const session = await startAgentPlanSession({ launch, sessionId: 'happy-eco', env, expectedParentGrantId: 'parent-grant' })
+        closers.push(() => session.close())
+        expect(studio.requests).toHaveLength(1)
+        const response = await fetch(`${session.proxyBaseUrl}/v1/messages`, { method: 'POST', headers: { authorization: `Bearer ${session.clientKey}`, 'anthropic-version': '2023-06-01' }, body: '{}' })
+        expect(response.status).toBe(429)
+        expect(response.headers.get('x-should-retry')).toBe('false')
+        expect(await response.text()).toContain('quota')
+        expect(studio.requests[1].authorization).toBe('Bearer agps_eco')
+        expect(JSON.stringify(env)).not.toContain(SECRET)
+    })
+    it('rejects an unrelated grant before opening a proxy for a marked transcript', async () => {
+        const studio = await fakeStudio({ sessionKeys: (_body, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ key: 'agps_eco', expiresAt: Date.now() + 1800000, model, parentGrantId: null })) } })
+        const launch = { descriptor: buildAgentPlanDescriptor({ origin: studio.origin, grantId: GRANT, model })!, secret: SECRET, threadsDir: null }
+        await expect(startAgentPlanSession({ launch, sessionId: 'happy-eco', env: {}, expectedParentGrantId: 'unrelated', retryDelaysMs: [] })).rejects.toThrow('agent_plan_session_mismatch')
+        expect(studio.requests).toHaveLength(1)
+    })
+})

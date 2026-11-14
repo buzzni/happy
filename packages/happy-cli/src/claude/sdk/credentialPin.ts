@@ -20,6 +20,7 @@ type PinControls = { getSettings(): Promise<unknown> };
 /** What differs between the credentials this pin can hold: the values it forces, and what it accepts as proof. */
 type PinSpec = {
     failureCode: string;
+    onVerified?(): void;
     /** Names the pin in debug logs; never a value. */
     label: string;
     /** Forced into the flag settings and re-checked against the live effective settings before every input. */
@@ -84,6 +85,13 @@ export function queryWithPinnedEndpoint(
     if (!authEnv.ANTHROPIC_BASE_URL || !authEnv.ANTHROPIC_AUTH_TOKEN || authEnv.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST !== '1') throw new Error(failureCode);
     return pinQuery(create, params, {
         failureCode, label: 'org-endpoint', authEnv,
+        onVerified: () => {
+            if (environment.HAPPY_AI_AUTH_SOURCE === 'platform-plan-pending') {
+                environment.HAPPY_AI_AUTH_SOURCE = 'platform-plan';
+                process.env.HAPPY_AI_AUTH_SOURCE = 'platform-plan';
+                process.env.HAPPY_AI_AUTH_CONNECTION_VERSION = '';
+            }
+        },
         // A provider allow-list admits a custom endpoint only when the same managed source pins its address, and that
         // address would then differ from the daemon's: nothing a list can say makes this session verifiable.
         policyAllows: effective => effective.allowedProviders === undefined,
@@ -165,6 +173,7 @@ function pinQuery(
             || Object.entries(authEnv).some(([key, value]) => env[key] !== value)) fail('recheck', 'mismatch');
         const info = await control('recheck', () => response.reinitialize());
         if (!spec.accountMatches(info.account as ObjectValue | undefined)) fail('recheck', 'mismatch');
+        spec.onVerified?.();
     }
     async function* guardedInput(): AsyncGenerator<SDKUserMessage> {
         let readingInput = false;

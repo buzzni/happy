@@ -1,3 +1,5 @@
+import { configuration } from '@/configuration';
+import { agentPlanThreadsDir, readAgentPlanThread, recordAgentPlanThreadSync } from '@/launcher/agentPlanThreads';
 /**
  * Fork the on-disk Claude session JSONL so a brand-new Happy session can
  * `claude --resume <newUuid>` against a copy of the prior conversation
@@ -87,6 +89,9 @@ export async function forkSession(projectDir: string, sourceClaudeSessionId: str
     }
 
     logger.debug(`[CLAUDE FORK] Forked ${sourceClaudeSessionId} -> ${newId}`);
+    const threads = agentPlanThreadsDir(configuration.happyHomeDir);
+    const plan = readAgentPlanThread(threads, sourceClaudeSessionId);
+    if (plan) recordAgentPlanThreadSync(threads, newId, { sessionId: plan.sessionId, grantId: plan.grantId, agent: 'claude' });
     return newId;
 }
 
@@ -177,6 +182,9 @@ export async function forkAndTruncateSession(
 
     await rename(tempDst, finalDst);
     logger.debug(`[CLAUDE FORK] Forked ${sourceClaudeSessionId} -> ${newId}, cut after ${cutAfterUuid}`);
+    const threads = agentPlanThreadsDir(configuration.happyHomeDir);
+    const plan = readAgentPlanThread(threads, sourceClaudeSessionId);
+    if (plan) recordAgentPlanThreadSync(threads, newId, { sessionId: plan.sessionId, grantId: plan.grantId, agent: 'claude' });
     return newId;
 }
 
