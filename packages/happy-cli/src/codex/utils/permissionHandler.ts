@@ -199,7 +199,7 @@ export class CodexPermissionHandler extends BasePermissionHandler implements Pol
         const withdrawn = this.withdrawnPolicyRequestIds.delete(request.id);
         if (request.signal.aborted || withdrawn) throw new Error('Tool policy approval withdrawn');
         return result.decision === 'approved' || result.decision === 'approved_for_session'
-            ? { approved: true, policyGrant: result.policyGrant ?? 'once', ...(request.policy.reasonCode === 'browser_client_delegation' && request.args.browserClientConsentVersion === 2 ? { browserClientConsent: parseBrowserClientConsent(result.updatedInput?.browserClientConsent) } : {}) }
+            ? { approved: true, policyGrant: result.policyGrant ?? 'once', ...(request.policy.reasonCode === 'protected_tool_access' && result.updatedInput?.hostToolConsentVersion === 1 ? { hostToolConsentVersion: 1 as const } : {}), ...(request.policy.reasonCode === 'browser_client_delegation' && request.args.browserClientConsentVersion === 2 ? { browserClientConsent: parseBrowserClientConsent(result.updatedInput?.browserClientConsent) } : {}) }
             : { approved: false, policyGrant: 'once' };
     }
 

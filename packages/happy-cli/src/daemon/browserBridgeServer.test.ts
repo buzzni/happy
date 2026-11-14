@@ -204,7 +204,7 @@ describe('controlServer /browser routes', () => {
         await expect.poll(() => bridge.connections().length).toBe(1)
         const after = await fetch(`${baseUrl}/browser/status`)
         expect(await after.json()).toEqual({
-            connections: [{ profile: 'work', pairingId: 'viewer-9222' }],
+            connections: [{ profile: 'work', pairingId: 'viewer-9222', connectionId: expect.any(String) }],
             hasRecentAuthFailure: false,
         })
         ws.close()
@@ -225,11 +225,39 @@ describe('controlServer /browser routes', () => {
 
         const response = await fetch(`${baseUrl}/browser/status?viewerKey=${aliceKey}`)
         expect(await response.json()).toEqual({
-            connections: [{ profile: 'alice', viewerKey: aliceKey }],
+            connections: [{ profile: 'alice', viewerKey: aliceKey, connectionId: expect.any(String) }],
             hasRecentAuthFailure: false,
         })
         alice.ws.close()
         bob.ws.close()
+    })
+
+    it('pins HTTP requests to the exact connection returned by status', async () => {
+        const original = await connectExtension(bridgePort, `token=${TOKEN}&profile=work`)
+        await expect.poll(() => bridge.connections().length).toBe(1)
+        const status = async () => (await (await fetch(`${baseUrl}/browser/status`)).json()) as { connections: Array<{ connectionId: string }> }
+        const approvedId = (await status()).connections[0].connectionId
+        const replacement = await connectExtension(bridgePort, `token=${TOKEN}&profile=work`)
+        await expect.poll(async () => (await status()).connections[0].connectionId).not.toBe(approvedId)
+        let sent = 0
+        replacement.ws.on('message', raw => {
+            const message = JSON.parse(raw.toString())
+            sent++
+            replacement.ws.send(JSON.stringify({ id: message.id, result: 'current' }))
+        })
+        const call = (expectedConnectionId: string) => fetch(`${baseUrl}/browser/request`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ method: 'ping', profile: 'work', expectedConnectionId }),
+        })
+        const stale = await call(approvedId)
+        expect(stale.status).toBe(502)
+        expect(await stale.json()).toMatchObject({ code: 'BROWSER_CONNECTION_CHANGED' })
+        expect(sent).toBe(0)
+        const current = await call((await status()).connections[0].connectionId)
+        expect(await current.json()).toEqual({ result: 'current' })
+        expect(sent).toBe(1)
+        original.ws.close()
+        replacement.ws.close()
     })
 
     it('POST /browser/request relays to the extension and returns its result', async () => {

@@ -1367,6 +1367,9 @@ export class ApiMachineClient {
         this.rpcHandlerManager.registerHandler('ai-credential:repair-codex', (params) => (
             aiCredentialRuntime.repairCodex(params)
         ));
+        this.rpcHandlerManager.registerHandler('ai-credential:refresh-claude-owner', (params) => (
+            aiCredentialRuntime.refreshClaudeOwner(params)
+        ));
         this.rpcHandlerManager.registerHandler('ai-credential:refresh-codex-owner', (params) => (
             aiCredentialRuntime.refreshCodexOwner(params)
         ));

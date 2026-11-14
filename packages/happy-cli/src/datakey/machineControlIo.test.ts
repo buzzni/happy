@@ -12,7 +12,7 @@ vi.mock('axios', () => ({
 }));
 
 import { configuration } from '@/configuration';
-import { readCredentials, readMachineIdentity } from '@/persistence';
+import { readCredentials, readMachineIdentity, replaceCredentialsDataKey } from '@/persistence';
 import { encodeBase64 } from '@/api/encryption';
 import { MachineKeyRotationConflict, type MachineKeyRotationRequest, type PendingMachineKeyRotation } from './machineControl';
 import { createMachineControlIo, pendingMachineKeyRotationFile } from './machineControlIo';
@@ -66,6 +66,7 @@ describe('createMachineControlIo', () => {
         const machineKey = new Uint8Array(32).fill(7);
         const publicKey = new Uint8Array(32).fill(2);
 
+        await replaceCredentialsDataKey({ token: 'token', publicKey, machineKey: new Uint8Array(32).fill(8) });
         await io.writeCredentials({ token: 'token', encryption: { type: 'dataKey', publicKey, machineKey, neverEscrowed: true } });
 
         expect((await readCredentials())!.encryption).toEqual({ type: 'dataKey', publicKey, machineKey, neverEscrowed: true });
@@ -103,5 +104,28 @@ describe('createMachineControlIo', () => {
 
         post.mockRejectedValueOnce(httpError(400));
         await expect(io.rotate('machine-1', request)).rejects.toThrow('400');
+    });
+});
+
+describe('usage recovery migration failures after server key swap', () => {
+    it.each(['corrupt-wrapper', 'permission'])('commits rotated credentials despite %s and warns about retained queue recovery', async fault => {
+        const { join } = await import('node:path'); const { readdirSync } = await import('node:fs');
+        const recovery = await import('@/usage/providerUsageRecoveryKey'); const { logger } = await import('@/ui/logger');
+        const oldKey = new Uint8Array(32).fill(fault === 'permission' ? 31 : 21), nextKey = new Uint8Array(32).fill(22), publicKey = new Uint8Array(32).fill(2);
+        const previous = { token: 'same-account', encryption: { type: 'dataKey' as const, publicKey, machineKey: oldKey } };
+        await replaceCredentialsDataKey({ token: previous.token, publicKey, machineKey: oldKey });
+        const root = join(configuration.happyHomeDir, 'usage-spool'); await recovery.rewrapUsageRecoveryKey(root, previous, previous);
+        const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+        let failure: { mockRestore: () => void } | undefined;
+        if (fault === 'corrupt-wrapper') {
+            const { createHash } = await import('node:crypto');
+            writeFileSync(join(root, `recovery-key-${createHash('sha256').update(oldKey).digest('hex')}.enc`), 'corrupt');
+        } else failure = vi.spyOn(recovery, 'rewrapUsageRecoveryKey').mockRejectedValueOnce(Object.assign(new Error('untrusted detail'), { code: 'EACCES' }));
+        try {
+            await createMachineControlIo({ token: previous.token, machineId: 'machine-1' }).writeCredentials({ ...previous, encryption: { ...previous.encryption, machineKey: nextKey } });
+            expect((await readCredentials())!.encryption).toEqual({ type: 'dataKey', publicKey, machineKey: nextKey });
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining('may require the previous key'));
+            expect(readdirSync(root).length).toBeGreaterThan(0);
+        } finally { failure?.mockRestore(); warn.mockRestore(); }
     });
 });

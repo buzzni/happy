@@ -1,6 +1,6 @@
 {
   "name": "@buzzni/happy-cli",
-  "version": "1.1.10-aplus.412",
+  "version": "1.1.10-aplus.415",
   "happyTerminalWorkerProtocol": 1,
   "description": "A+ Dev Studio fork of slopus/happy. Mobile and Web client for Claude Code and Codex.",
   "author": "Kirill Dubovitskiy (upstream), justinbuzzni (aplus fork)",
@@ -181,6 +181,7 @@
     "dotenv": "^16.6.1",
     "eslint": "^9",
     "eslint-config-prettier": "^10",
+    "jsdom": "29.1.1",
     "pkgroll": "^2.14.2",
     "shx": "^0.3.3",
     "ts-node": "^10",

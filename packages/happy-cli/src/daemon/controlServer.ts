@@ -1050,6 +1050,7 @@ export function startDaemonControlServer({
             200: z.object({
               connections: z.array(z.object({
                 profile: z.string(),
+                connectionId: z.string().optional(),
                 pairingId: z.string().optional(),
                 viewerKey: z.string().optional(),
               })),
@@ -1059,7 +1060,7 @@ export function startDaemonControlServer({
         }
       }, async (request) => {
         return {
-          connections: browserBridge.connections(request.query.viewerKey),
+          connections: browserBridge.connections(request.query.viewerKey, true),
           hasRecentAuthFailure: browserBridge.hasRecentAuthFailure(request.query.viewerKey)
         };
       });
@@ -1071,6 +1072,7 @@ export function startDaemonControlServer({
             params: z.unknown().optional(),
             timeoutMs: z.number().int().positive().optional(),
             profile: z.string().optional(),
+            expectedConnectionId: z.string().uuid().optional(),
             viewerKey: z.string().regex(/^bv1_[A-Za-z0-9_-]{32}$/).optional()
           }),
           response: {
@@ -1092,11 +1094,12 @@ export function startDaemonControlServer({
           }
         }
       }, async (request, reply) => {
-        const { method, params, timeoutMs, profile, viewerKey } = request.body;
+        const { method, params, timeoutMs, profile, viewerKey, expectedConnectionId } = request.body;
         try {
           const result = await browserBridge.request(method, params ?? {}, {
             ...(timeoutMs !== undefined ? { timeoutMs } : {}),
             ...(profile !== undefined ? { profile } : {}),
+            ...(expectedConnectionId !== undefined ? { expectedConnectionId } : {}),
             ...(viewerKey !== undefined ? { viewerKey } : {})
           });
           logger.debug(`[CONTROL SERVER] browser/request ${method} -> ok`);
