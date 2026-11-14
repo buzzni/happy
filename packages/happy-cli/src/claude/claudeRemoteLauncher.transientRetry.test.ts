@@ -6,6 +6,7 @@ import type { RawJSONLines } from './types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { claudeRemoteLauncher } from './claudeRemoteLauncher';
+import * as authObservation from './aiAuthObservation';
 import type { Session } from './session';
 import type { EnhancedMode } from './loop';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
@@ -358,6 +359,26 @@ describe('Claude transient API failure retry in the remote launcher (specs/claud
 
         expect(harness.prompts).toEqual(['hello', CLAUDE_TRANSIENT_CONTINUE_PROMPT]);
         expect(harness.generations()).toBe(2);
+    });
+
+    it('detects an account switch after the first turn of a provider was an automatic retry', async () => {
+        const account = { email: 'first@example.test', organizationUuid: 'org', organizationName: 'Org' };
+        const readAccount = vi.spyOn(authObservation, 'readLiveOauthAccount').mockResolvedValue(account);
+        try {
+            const harness = await runLauncher(async (_prompt, index) => {
+                if (index === 0) return 'fail-then-exit';
+                if (index === 1) setTimeout(() => {
+                    readAccount.mockResolvedValue({ ...account, email: 'second@example.test' });
+                    harness.queue.push('after account switch', MODE);
+                }, 10);
+                return 'answer';
+            }, prompts => prompts.length === 3);
+            await harness.run;
+            expect(harness.prompts).toEqual(['hello', CLAUDE_TRANSIENT_CONTINUE_PROMPT, 'after account switch']);
+            expect(harness.generations()).toBe(3);
+        } finally {
+            readAccount.mockRestore();
+        }
     });
 
     it('does not retry a channel request', async () => {
