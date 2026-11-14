@@ -25,6 +25,9 @@ env:
 jobs:
   smoke-test-linux:
     runs-on: ubuntu-latest
+    # The complete CLI type graph exceeds Node 20's ~2 GB default heap.
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
     strategy:
       matrix:
         node-version: [20, 24]
