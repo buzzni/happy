@@ -1,3 +1,5 @@
+import { createProtectedToolAccess } from '@/toolPolicy/protectedToolAccess';
+import { createPolicyGrantStore } from '@/toolPolicy/grants';
 import { localToolAgentContext, requestLocalToolAgent } from '@/daemon/localToolAgentRelay';
 /** Happy MCP registration, tool routing and session-specific guidance contracts. */
 import { runBashStream } from './bashStream';
@@ -8,12 +10,20 @@ import { tmpdir } from 'node:os';
 import { createServer, request } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createChangeTitleHandler, startHappyServer } from './startHappyServer';
 import { unixMcpFetch } from './unixMcpFetch';
 import { sessionBackgroundProcesses } from '@/utils/sessionBackgroundProcesses';
 import { MandatorySandboxError } from '@/sandbox/sandboxPolicy';
 import type { ApiSessionClient } from '@/api/apiSession';
+
+// These in-process fixtures choose their own protection mode; never inherit the developer session's mode.
+beforeEach(() => {
+    vi.stubEnv('HAPPY_WRITE_SCOPE_SESSION', undefined);
+    vi.stubEnv('HAPPY_SANDBOX_POLICY_MODE', undefined);
+    vi.stubEnv('SAYCODE_MCP_BEARER', undefined);
+});
+afterEach(() => vi.unstubAllEnvs());
 
 vi.mock('@/daemon/localToolAgentRelay', async original => {
     const actual = await original<typeof import('@/daemon/localToolAgentRelay')>();
@@ -849,7 +859,9 @@ describe('session write scope protected tool surface', () => {
             expect(names).not.toContain('bash_stream');
             expect(names).not.toContain('script_automations');
             expect(names).not.toContain('scheduled_tasks');
-            expect(names).not.toContain('browser_open_tab');
+            expect(names).toContain('browser_open_tab');
+            const denied = await callTool(server, 90, 'browser_tabs', {});
+            expect(denied.result.content[0].text).toContain('TOOL_ACCESS_APPROVER_REQUIRED');
             expect(server.toolNames).not.toContain('scheduled_tasks');
         } finally { server.stop(); if (previous === undefined) delete process.env.HAPPY_WRITE_SCOPE_SESSION; else process.env.HAPPY_WRITE_SCOPE_SESSION = previous; }
     });
@@ -1005,7 +1017,7 @@ describe('approved Desktop computer tools in the session MCP', () => {
         }
     });
 
-    it('keeps computer control out of a mandatory sandbox session even with a browser task runtime', async () => {
+    it('offers computer control in a mandatory session but refuses execution without an approver', async () => {
         const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
         const context = { serverUrl: 'https://saycode.test', machineId: 'M1', sessionId: 'S1', projectId: 'P1', callerGrant: 'signed-caller' };
         const client = { ...makeFakeClient(false), sessionId: 'S1', getMetadata: () => ({ machineId: 'M1' }) } as unknown as ApiSessionClient;
@@ -1019,8 +1031,10 @@ describe('approved Desktop computer tools in the session MCP', () => {
             server = await startHappyServer(client, { mandatorySandbox: true, sameUidSandbox: true });
             const names = (await listTools(server)).map(tool => tool.name);
             expect(names).toContain('browser_task_submit_batch');
-            expect(names.filter(name => name.startsWith('local_tool_'))).toEqual([]);
-            expect(server.toolNames.filter(name => name.startsWith('local_tool_'))).toEqual([]);
+            expect(names.filter(name => name.startsWith('local_tool_'))).toEqual(['local_tool_capabilities', 'local_tool_control']);
+            expect(server.toolNames).toContain('local_tool_control');
+            const denied = await callTool(server, 90, 'local_tool_control', { action: 'run', extensionId: 'buzzni.test', operation: 'windows' });
+            expect(denied.result.content[0].text).toBe('TOOL_ACCESS_APPROVER_REQUIRED');
             expect(requestLocalToolAgent).not.toHaveBeenCalled();
         } finally {
             server?.stop();
@@ -1031,4 +1045,25 @@ describe('approved Desktop computer tools in the session MCP', () => {
             vi.mocked(requestLocalToolAgent).mockReset().mockImplementation(actual.requestLocalToolAgent);
         }
     });
+});
+
+// Uses the real authenticated MCP endpoint; no user browser, credentials or external network.
+it('keeps a host command behind human approval at the MCP endpoint', async () => {
+    let approved = false;
+    const approve = vi.fn<import('@/toolPolicy/policyGate').PolicyApprover['requestPolicyApproval']>(async () => ({ approved, hostToolConsentVersion: 1 as const, policyGrant: 'once' }));
+    const access = createProtectedToolAccess({ grants: createPolicyGrantStore(), approver: () => ({ requestPolicyApproval: approve }), unattended: () => false });
+    const client = { ...makeFakeClient(false), sessionId: 'host-fixture', getMetadata: () => ({ path: process.cwd() }) } as unknown as ApiSessionClient;
+    const server = await startHappyServer(client, { protectedToolAccess: () => access, hostToolsAllowed: true, hostMcpServers: async () => ({}) });
+    try {
+        expect(server.toolNames).toContain('host_tool');
+        const denied = await callTool(server, 101, 'host_tool', { action: 'command', command: process.execPath, args: ['-e', 'process.stdout.write("denied-marker")'] });
+        expect(denied.result.isError).toBe(true);
+        expect(denied.result.content[0].text).toContain('TOOL_ACCESS_DENIED');
+        approved = true;
+        const allowed = await callTool(server, 102, 'host_tool', { action: 'command', command: process.execPath, args: ['-e', 'process.stdout.write("approved-marker")'] });
+        expect(allowed.result.isError).not.toBe(true);
+        expect(JSON.parse(allowed.result.content[0].text)).toMatchObject({ exitCode: 0, stdout: 'approved-marker' });
+        expect(approve).toHaveBeenCalledTimes(2);
+        expect(approve.mock.calls[0]?.[0]).toMatchObject({ policy: { humanOnly: true }, args: { boundary: 'host' } });
+    } finally { access.dispose(); server.stop(); }
 });

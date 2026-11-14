@@ -1,3 +1,7 @@
+import { createHostedTools, hostToolInput } from '@/toolPolicy/hostToolExecutor';
+import { protectedBrowserRequest } from '@/toolPolicy/protectedBrowserBridge';
+import type { createProtectedToolAccess } from '@/toolPolicy/protectedToolAccess';
+import { hostBinding } from '@/toolPolicy/hostToolCatalog';
 import { createLocalClientSession, registerLocalClientTools, LOCAL_CLIENT_TOOL_NAMES, type LocalClientSession } from '@/browserRuntime/localClientSession';
 import type { PolicyApprover } from '@/toolPolicy/policyGate';
 import { startSessionAgentBroker } from '@/commands/sessionAgentBroker';
@@ -62,6 +66,9 @@ import { LINKED_PULL_REQUEST_TOOL_NAMES, registerLinkedPullRequestTools, withLin
 export const BASH_STREAM_AGENT_TOOL_NAME = 'mcp__happy__bash_stream';
 
 export interface HappyServerHandlers {
+    protectedToolAccess?: () => ReturnType<typeof createProtectedToolAccess> | null | undefined;
+    hostedTools?: ReturnType<typeof createHostedTools>;
+    chromeAvailable?: boolean;
     localToolAvailable?: boolean;
     checkpointReader?: CheckpointAgentReader;
     admitTool?: <T>(work: () => Promise<T>) => Promise<T>;
@@ -350,27 +357,52 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
         }
     }));
 
-    // Agent Browser PoC: the task runtime replaces the extension-bridge tools,
-    // which fall back to the active tab and would bypass the task lease.
+    // Chrome is an explicit separately approved host capability, never a task-runtime fallback.
     if (handlers.browserTaskRuntime) {
         registerBrowserTaskTools(mcp, handlers.browserTaskRuntime, { agentSessionId: handlers.client.sessionId, profileId: handlers.browserTaskProfileId ?? 'default', exitAfterFirstTurn: handlers.exitAfterFirstTurn, hostContinues: handlers.browserHostContinues, siteHints: handlers.browserSiteHints });
         if (handlers.browserLocalClients) registerLocalClientTools(mcp, handlers.browserLocalClients, runTool);
-    } else if (!handlers.mandatorySandbox && !scopedSession) {
-        registerBrowserTools(mcp, runTool);
     }
+    if (handlers.chromeAvailable) registerBrowserTools(mcp, runTool, handlers);
+    if (handlers.hostedTools) mcp.registerTool('host_tool', {
+        title: 'Use an approved external tool',
+        description: 'Discover configured MCP sources with action=list; inspect their tools with inspect, then call by source/tool. Use command for an installed CLI such as ego-browser with exact argv and optional stdin. Every external execution requires human approval for access outside the project sandbox. This does not install tools, answer OS prompts, change organization policy, or retry uncertain outcomes.',
+        inputSchema: hostToolInput,
+    }, async (input, extra) => {
+        try {
+            const value = await handlers.hostedTools!.invoke(input, extra.signal);
+            const text = JSON.stringify(value);
+            if (text.length > 4 * 1024 * 1024) throw new Error('HOST_TOOL_RESULT_TOO_LARGE');
+            if (input.action === 'call' && value && typeof value === 'object' && Array.isArray((value as { content?: unknown }).content)) return value as import('@modelcontextprotocol/sdk/types.js').CallToolResult;
+            return { content: [{ type: 'text' as const, text }] };
+        } catch (error) {
+            const code = error instanceof Error && /^[A-Z_]{1,100}$/.test(error.message) ? error.message : 'HOST_TOOL_FAILED';
+            return { isError: true, content: [{ type: 'text' as const, text: code + ': No automatic retry. Check tool configuration, connection, approval or host support.' }] };
+        }
+    });
 
-    if (handlers.localToolAvailable && !handlers.mandatorySandbox) {
-        const invoke = async (operation: Record<string, unknown>, signal?: AbortSignal) => runTool(async () => {
+    if (handlers.localToolAvailable) {
+        const invoke = async (operation: Record<string, unknown>, signal: AbortSignal) => {
             try {
                 const context = await localToolAgentContext(handlers.client.sessionId, handlers.client.getMetadata()?.machineId);
                 if (!context) throw new Error('CALLER_REQUIRED');
-                const value = await requestLocalToolAgent(context, operation, signal);
+                let value: Record<string, unknown>;
+                if ((handlers.mandatorySandbox || process.env.HAPPY_SANDBOX_POLICY_MODE === 'mandatory' || scopedSession) && operation.action === 'run') {
+                    const access = handlers.protectedToolAccess?.();
+                    if (!access) throw new Error('TOOL_ACCESS_APPROVER_REQUIRED');
+                    const description = await requestLocalToolAgent(context, { action: 'describe' }, signal);
+                    value = await access.run({ toolName: 'mcp__happy__local_tool_control', binding: hostBinding([context.machineId, context.sessionId, description]),
+                        target: { machine: context.machineId, tool: String(operation.extensionId) }, args: operation }, signal,
+                        async (_scope, assertCurrent, executionSignal) => {
+                            if (hostBinding(await requestLocalToolAgent(context, { action: 'describe' }, executionSignal)) !== hostBinding(description)) throw new Error('TOOL_ACCESS_CHANGED');
+                            return runTool(() => { assertCurrent(); return requestLocalToolAgent(context, operation, executionSignal); }) as Promise<Record<string, unknown>>;
+                        });
+                } else value = await runTool(() => requestLocalToolAgent(context, operation, signal)) as Record<string, unknown>;
                 return { content: [{ type: 'text' as const, text: JSON.stringify(value) }] };
             } catch (error) {
                 const code = error instanceof Error && /^[A-Z_]{1,80}$/.test(error.message) ? error.message : 'LOCAL_TOOL_FAILED';
                 return { isError: true, content: [{ type: 'text' as const, text: code }] };
             }
-        });
+        };
         mcp.registerTool('local_tool_capabilities', {
             title: 'Inspect approved computer tools', description: 'List currently approved local computer tool operations and their bounded input schemas. Inspect before controlling the computer. Native permission prompts and denied/ambiguous input require the user.'
                 + (handlers.browserTaskRuntime ? ' Prefer the browser_task_* tools for web pages; use computer control for other desktop apps.' : ''), inputSchema: {},
@@ -388,7 +420,7 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
  * logged-in Chrome. The session reaches the browser through the daemon
  * (`/browser/request`), which relays to the extension over a loopback socket.
  */
-function registerBrowserTools(mcp: McpServer, runTool: ReturnType<typeof createToolRunner>): void {
+function registerBrowserTools(mcp: McpServer, runTool: ReturnType<typeof createToolRunner>, handlers: HappyServerHandlers): void {
     const bridge: BridgeRequest = async (method, params, opts) => {
         const viewerKey = process.env.HAPPY_BROWSER_VIEWER_KEY
         if (process.env.HAPPY_BROWSER_VIEWER_SCOPE_REQUIRED === '1' && !viewerKey) {
@@ -410,6 +442,10 @@ function registerBrowserTools(mcp: McpServer, runTool: ReturnType<typeof createT
         });
     };
 
+    const guarded = handlers.mandatorySandbox || process.env.HAPPY_SANDBOX_POLICY_MODE === 'mandatory' || process.env.HAPPY_WRITE_SCOPE_SESSION === '1' || !!handlers.browserTaskRuntime;
+    const requestFor = (signal: AbortSignal) => guarded ? protectedBrowserRequest({ access: () => handlers.protectedToolAccess?.(), signal, admit: handlers.admitTool }) : bridge;
+    const browserRun: typeof runTool = work => guarded ? work() : runTool(work);
+
     // Only consulted when a command comes back looking wrong (see runBrowserTool).
     const status = async () => {
         const connection = await readDaemonControlPort();
@@ -425,7 +461,7 @@ function registerBrowserTools(mcp: McpServer, runTool: ReturnType<typeof createT
         inputSchema: {
             profile: z.string().optional().describe('Which connected Chrome profile to act on. Only needed when browser_capabilities or an AMBIGUOUS_PROFILE error says more than one is connected.'),
         },
-    }, async (args) => runTool(async () => runBrowserTool({ request: bridge, status, method: 'tabs_list', params: { profile: args.profile } })));
+    }, async (args, extra) => browserRun(async () => runBrowserTool({ request: requestFor(extra.signal), status, method: 'tabs_list', params: { profile: args.profile } })));
 
     mcp.registerTool('browser_snapshot', {
         description:
@@ -435,7 +471,7 @@ function registerBrowserTools(mcp: McpServer, runTool: ReturnType<typeof createT
             tabId: z.number().optional().describe('Tab to snapshot (defaults to the active tab)'),
             profile: z.string().optional().describe('Which connected Chrome profile to act on. Only needed when browser_capabilities or an AMBIGUOUS_PROFILE error says more than one is connected.'),
         },
-    }, async (args) => runTool(async () => runBrowserTool({ request: bridge, status, method: 'snapshot', params: { profile: args.profile, tabId: args.tabId } })));
+    }, async (args, extra) => browserRun(async () => runBrowserTool({ request: requestFor(extra.signal), status, method: 'snapshot', params: { profile: args.profile, tabId: args.tabId } })));
 
     mcp.registerTool('browser_screenshot', {
         description:
@@ -446,7 +482,7 @@ function registerBrowserTools(mcp: McpServer, runTool: ReturnType<typeof createT
             fullPage: z.boolean().optional().describe('Capture the whole scrollable page instead of just the visible area. Needs the optional debugger permission, which only the user can enable.'),
             profile: z.string().optional().describe('Which connected Chrome profile to act on. Only needed when browser_capabilities or an AMBIGUOUS_PROFILE error says more than one is connected.'),
         },
-    }, async (args) => runTool(async () => runBrowserTool({ request: bridge, status, method: 'screenshot', params: { profile: args.profile, tabId: args.tabId, fullPage: args.fullPage } })));
+    }, async (args, extra) => browserRun(async () => runBrowserTool({ request: requestFor(extra.signal), status, method: 'screenshot', params: { profile: args.profile, tabId: args.tabId, fullPage: args.fullPage } })));
 
     mcp.registerTool('browser_click', {
         description:
@@ -458,7 +494,7 @@ function registerBrowserTools(mcp: McpServer, runTool: ReturnType<typeof createT
             trusted: z.boolean().optional().describe('Dispatch a real (isTrusted) mouse event instead of a scripted click. Only needed when a page ignores scripted clicks. Requires the optional debugger permission, which only the user can enable. Not supported for elements inside an iframe (a @fN:eM ref) — use a normal click there.'),
             profile: z.string().optional().describe('Which connected Chrome profile to act on. Only needed when browser_capabilities or an AMBIGUOUS_PROFILE error says more than one is connected.'),
         },
-    }, async (args) => runTool(async () => runBrowserTool({ request: bridge, status, method: 'click', params: { profile: args.profile, ref: args.ref, tabId: args.tabId, trusted: args.trusted } })));
+    }, async (args, extra) => browserRun(async () => runBrowserTool({ request: requestFor(extra.signal), status, method: 'click', params: { profile: args.profile, ref: args.ref, tabId: args.tabId, trusted: args.trusted } })));
 
     mcp.registerTool('browser_fill', {
         description:
@@ -471,7 +507,7 @@ function registerBrowserTools(mcp: McpServer, runTool: ReturnType<typeof createT
             trusted: z.boolean().optional().describe('Type as real (isTrusted) input instead of setting the value directly. Needed for editors that ignore scripted input. Requires the optional debugger permission, which only the user can enable. Not supported for elements inside an iframe (a @fN:eM ref) — use a normal fill there.'),
             profile: z.string().optional().describe('Which connected Chrome profile to act on. Only needed when browser_capabilities or an AMBIGUOUS_PROFILE error says more than one is connected.'),
         },
-    }, async (args) => runTool(async () => runBrowserTool({ request: bridge, status, method: 'fill', params: { profile: args.profile, ref: args.ref, value: args.value, tabId: args.tabId, trusted: args.trusted } })));
+    }, async (args, extra) => browserRun(async () => runBrowserTool({ request: requestFor(extra.signal), status, method: 'fill', params: { profile: args.profile, ref: args.ref, value: args.value, tabId: args.tabId, trusted: args.trusted } })));
 
     mcp.registerTool('browser_scroll', {
         description:
@@ -486,8 +522,8 @@ function registerBrowserTools(mcp: McpServer, runTool: ReturnType<typeof createT
         }).refine((args) => (args.deltaX ?? 0) !== 0 || (args.deltaY ?? 0) !== 0, {
             message: 'At least one of deltaX or deltaY must be non-zero',
         }),
-    }, async (args) => runTool(async () => runBrowserTool({
-        request: bridge,
+    }, async (args, extra) => browserRun(async () => runBrowserTool({
+        request: requestFor(extra.signal),
         status,
         method: 'scroll',
         params: {
@@ -507,7 +543,7 @@ function registerBrowserTools(mcp: McpServer, runTool: ReturnType<typeof createT
             tabId: z.number().optional().describe('Tab to navigate (defaults to the active tab)'),
             profile: z.string().optional().describe('Which connected Chrome profile to act on. Only needed when browser_capabilities or an AMBIGUOUS_PROFILE error says more than one is connected.'),
         },
-    }, async (args) => runTool(async () => runBrowserTool({ request: bridge, status, method: 'navigate', params: { profile: args.profile, url: args.url, tabId: args.tabId } })));
+    }, async (args, extra) => browserRun(async () => runBrowserTool({ request: requestFor(extra.signal), status, method: 'navigate', params: { profile: args.profile, url: args.url, tabId: args.tabId } })));
 
     mcp.registerTool('browser_open_tab', {
         description: "Open a new tab in the user's Chrome at a URL.",
@@ -516,7 +552,7 @@ function registerBrowserTools(mcp: McpServer, runTool: ReturnType<typeof createT
             url: z.string().describe('URL to open'),
             profile: z.string().optional().describe('Which connected Chrome profile to act on. Only needed when browser_capabilities or an AMBIGUOUS_PROFILE error says more than one is connected.'),
         },
-    }, async (args) => runTool(async () => runBrowserTool({ request: bridge, status, method: 'tabs_open', params: { profile: args.profile, url: args.url } })));
+    }, async (args, extra) => browserRun(async () => runBrowserTool({ request: requestFor(extra.signal), status, method: 'tabs_open', params: { profile: args.profile, url: args.url } })));
 
     mcp.registerTool('browser_capabilities', {
         description:
@@ -525,7 +561,7 @@ function registerBrowserTools(mcp: McpServer, runTool: ReturnType<typeof createT
         inputSchema: {
             profile: z.string().optional().describe('Which connected Chrome profile to act on. Only needed when browser_capabilities or an AMBIGUOUS_PROFILE error says more than one is connected.'),
         },
-    }, async (args) => runTool(async () => runBrowserTool({ request: bridge, status, method: 'capabilities', params: { profile: args.profile } })));
+    }, async (args, extra) => browserRun(async () => runBrowserTool({ request: requestFor(extra.signal), status, method: 'capabilities', params: { profile: args.profile } })));
 
     mcp.registerTool('browser_close_tab', {
         description: "Close a tab in the user's Chrome. Use browser_tabs first to find the tabId.",
@@ -534,7 +570,7 @@ function registerBrowserTools(mcp: McpServer, runTool: ReturnType<typeof createT
             tabId: z.number().describe('Tab id from browser_tabs'),
             profile: z.string().optional().describe('Which connected Chrome profile to act on. Only needed when browser_capabilities or an AMBIGUOUS_PROFILE error says more than one is connected.'),
         },
-    }, async (args) => runTool(async () => runBrowserTool({ request: bridge, status, method: 'tabs_close', params: { profile: args.profile, tabId: args.tabId } })));
+    }, async (args, extra) => browserRun(async () => runBrowserTool({ request: requestFor(extra.signal), status, method: 'tabs_close', params: { profile: args.profile, tabId: args.tabId } })));
 }
 
 /**
@@ -606,6 +642,9 @@ export async function startHappyServer(
     client: ApiSessionClient,
     options: {
         agentControl?: boolean;
+        protectedToolAccess?: HappyServerHandlers['protectedToolAccess'];
+        hostMcpServers?: () => Promise<Record<string, unknown>>;
+        hostToolsAllowed?: boolean;
         browserClientApprover?: () => PolicyApprover | null;
         checkpointReader?: CheckpointAgentReader;
         exitAfterFirstTurn?: boolean;
@@ -648,14 +687,18 @@ export async function startHappyServer(
     const metadata = browserTaskRuntime ? client.getMetadata?.() : undefined;
     const siteHintFlavor = metadata?.flavor === 'codex' ? 'codex' : metadata?.flavor === 'claude' || metadata?.flavor === undefined ? 'claude' : null;
     const browserSiteHints = browserTaskRuntime && siteHintFlavor ? createSiteHints({ roots: siteSkillRoots({ flavor: siteHintFlavor, cwd: metadata?.path }) }) : undefined;
-    if (browserTaskRuntime) {
-        logger.debug('[happyMCP] legacy browser_* tools disabled by HAPPY_BROWSER_TASK_RUNTIME_URL (agent browser PoC)');
-    }
+
 
     // An installer-managed browser host (shared tenancy or browser-only) is not the signed-in person's own PC.
     const managedBrowserHost = !!browserTaskRuntime && (process.env.HAPPY_BROWSER_TASK_TENANCY === 'shared' || process.env.HAPPY_BROWSER_TASK_HOST_MODE === 'browser-only');
+    const protectedSession = options.mandatorySandbox || process.env.HAPPY_SANDBOX_POLICY_MODE === 'mandatory' || process.env.HAPPY_WRITE_SCOPE_SESSION === '1';
+    const chromeAvailable = !managedBrowserHost && (!browserTaskRuntime || !!options.protectedToolAccess);
+    const hostedTools = options.hostMcpServers ? createHostedTools({ access: () => options.protectedToolAccess?.(),
+        servers: options.hostMcpServers, cwd: client.getMetadata?.()?.path ?? process.cwd(),
+        allowed: () => options.hostToolsAllowed === true && !managedBrowserHost, admit: options.admitTool }) : undefined;
     const computerAvailable = async () => {
-        if (options.mandatorySandbox || managedBrowserHost) return false;
+        if (managedBrowserHost) return false;
+        if (protectedSession) return true;
         try {
             const context = await localToolAgentContext(client.sessionId, client.getMetadata()?.machineId);
             if (!context) return false;
@@ -721,6 +764,7 @@ export async function startHappyServer(
             // Keep the advertised tools and stateless request registration in sync.
             // Invocation still resolves the caller and enforces current grants.
             localToolAvailable: initialComputerAvailable,
+            protectedToolAccess: options.protectedToolAccess, hostedTools, chromeAvailable,
             changeTitle,
             checkpointReader: options.checkpointReader,
             admitTool: options.admitTool,
@@ -816,9 +860,9 @@ export async function startHappyServer(
         socketPath,
         mcpConfig,
         bridgeEnv,
-        toolNames: [...(browserTask?.localClients ? LOCAL_CLIENT_TOOL_NAMES : []), ...(options.mandatorySandbox ? [] : TURN_CARD_TOOL_NAMES), ...(linkedPullRequestTools ? LINKED_PULL_REQUEST_TOOL_NAMES : []), ...(options.webSearch && !options.mandatorySandbox ? ['web_search'] : []), ...(initialComputerAvailable ? ['local_tool_capabilities', 'local_tool_control'] : []), ...(options.checkpointReader ? ['checkpoint_status', 'checkpoint_list', 'checkpoint_preview', 'checkpoint_diff'] : []), ...(options.mandatorySandbox
+        toolNames: [...(hostedTools ? ['host_tool'] : []), ...(chromeAvailable ? BROWSER_TOOL_NAMES : []), ...(browserTask?.localClients ? LOCAL_CLIENT_TOOL_NAMES : []), ...(options.mandatorySandbox ? [] : TURN_CARD_TOOL_NAMES), ...(linkedPullRequestTools ? LINKED_PULL_REQUEST_TOOL_NAMES : []), ...(options.webSearch && !options.mandatorySandbox ? ['web_search'] : []), ...(initialComputerAvailable ? ['local_tool_capabilities', 'local_tool_control'] : []), ...(options.checkpointReader ? ['checkpoint_status', 'checkpoint_list', 'checkpoint_preview', 'checkpoint_diff'] : []), ...(options.mandatorySandbox
             ? ['change_title', ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : [])]
-            : [...(options.proposeLesson ? ['propose_lesson'] : []), 'change_title', 'bash_stream', 'script_automations', ...(process.env.HAPPY_WRITE_SCOPE_SESSION === '1' ? [] : ['scheduled_tasks']), ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : BROWSER_TOOL_NAMES)])],
+            : [...(options.proposeLesson ? ['propose_lesson'] : []), 'change_title', ...(process.env.HAPPY_WRITE_SCOPE_SESSION === '1' ? [] : ['bash_stream', 'script_automations', 'scheduled_tasks']), ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : [])])],
         stop: () => {
             logger.debug(`[happyMCP] server:stop sessionId=${client.sessionId}`);
             void agentBroker?.close();

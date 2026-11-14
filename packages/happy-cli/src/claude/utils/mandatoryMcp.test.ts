@@ -35,7 +35,7 @@ it.each([false, true])('authenticates the Unix MCP endpoint and preserves the ma
         const response = await rpc(server.socketPath!, token, 'tools/list');
         expect(response.status).toBe(200);
         const payload = JSON.parse(response.body.startsWith('event:') ? response.body.slice(response.body.indexOf('data: ') + 6) : response.body);
-        expect(payload.result.tools.map((tool: { name: string }) => tool.name).sort()).toEqual(['change_title', ...BROWSER_TASK_TOOL_NAMES,
+        expect(payload.result.tools.map((tool: { name: string }) => tool.name).sort()).toEqual(['change_title', 'local_tool_capabilities', 'local_tool_control', ...BROWSER_TASK_TOOL_NAMES,
             ...(scoped ? ['session_write_scope'] : [])].sort());
         for (const name of ['bash_stream', 'script_automations', 'browser_tabs', 'propose_lesson', ...(!scoped ? ['session_write_scope'] : [])]) {
             const result = await rpc(server.socketPath!, token, 'tools/call', { name, arguments: {} });

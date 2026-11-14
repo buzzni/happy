@@ -19,7 +19,7 @@ export class BrowserClientError extends Error {
 
 const DEFAULT_TIMEOUT_MS = 35_000
 
-export async function requestBrowser({ port, controlSecret, method, params, timeoutMs, profile, viewerKey }: {
+export async function requestBrowser({ port, controlSecret, method, params, timeoutMs, profile, viewerKey, expectedConnectionId, signal }: {
     port: number
     /** ADR-061 — the control server rejects every request without this. */
     controlSecret: string
@@ -27,6 +27,8 @@ export async function requestBrowser({ port, controlSecret, method, params, time
     params?: unknown
     timeoutMs?: number
     profile?: string
+    expectedConnectionId?: string
+    signal?: AbortSignal
     viewerKey?: string
 }): Promise<unknown> {
     let response: Response
@@ -34,8 +36,8 @@ export async function requestBrowser({ port, controlSecret, method, params, time
         response = await fetch(`http://127.0.0.1:${port}/browser/request`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${controlSecret}` },
-            body: JSON.stringify({ method, params: params ?? {}, timeoutMs, profile, viewerKey }),
-            signal: AbortSignal.timeout(timeoutMs ? timeoutMs + 5_000 : DEFAULT_TIMEOUT_MS),
+            body: JSON.stringify({ method, params: params ?? {}, timeoutMs, profile, viewerKey, expectedConnectionId }),
+            signal: AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(timeoutMs ? timeoutMs + 5_000 : DEFAULT_TIMEOUT_MS)]),
         })
     } catch (e) {
         throw new BrowserClientError('DAEMON_UNREACHABLE', `Could not reach the happy daemon on 127.0.0.1:${port}: ${e instanceof Error ? e.message : String(e)}`)
@@ -62,7 +64,7 @@ export async function fetchBrowserStatus(
     /** ADR-061 — the control server rejects every request without this. */
     controlSecret: string,
     viewerKey?: string,
-): Promise<{ connections: Array<{ profile: string; pairingId?: string; viewerKey?: string }>; hasRecentAuthFailure: boolean } | null> {
+): Promise<{ connections: Array<{ profile: string; pairingId?: string; viewerKey?: string; connectionId?: string }>; hasRecentAuthFailure: boolean } | null> {
     try {
         const query = viewerKey ? `?viewerKey=${encodeURIComponent(viewerKey)}` : ''
         const response = await fetch(`http://127.0.0.1:${port}/browser/status${query}`, {
@@ -70,7 +72,7 @@ export async function fetchBrowserStatus(
             signal: AbortSignal.timeout(2_000),
         })
         if (!response.ok) return null
-        const body = await response.json() as { connections?: Array<{ profile: string; pairingId?: string; viewerKey?: string }>; hasRecentAuthFailure?: boolean }
+        const body = await response.json() as { connections?: Array<{ profile: string; pairingId?: string; viewerKey?: string; connectionId?: string }>; hasRecentAuthFailure?: boolean }
         return {
             connections: (body.connections ?? []).filter((connection) => connection.viewerKey === viewerKey),
             hasRecentAuthFailure: body.hasRecentAuthFailure ?? false,

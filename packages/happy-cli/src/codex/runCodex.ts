@@ -2169,6 +2169,9 @@ export async function runCodex(opts: {
     const turnCards = createTurnCardSwitch('codex');
     // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
     const happyServer = await startHappyServer(session, {
+        protectedToolAccess: () => toolPolicy?.protectedAccess,
+        hostToolsAllowed: accountToken !== null,
+        hostMcpServers: async () => accountToken !== null ? { ...launchMcpServers, ...await client.readHostMcpServers(process.cwd()) } : {},
         linkedPullRequestTools,
         ...(agentPlanSession ? { webSearch: agentPlanSession.webSearch } : {}),
         browserClientApprover: () => permissionHandler,
@@ -2237,7 +2240,7 @@ export async function runCodex(opts: {
     // stay unguarded (Q5). The adapters reach this session over loopback HTTP, which a Linux
     // mandatory sandbox may not allow (unmeasured), so that mode keeps the bridge unguarded rather
     // than refusing every Saycode tool.
-    if (isToolPolicyEnabled(process.env)) {
+    if (isToolPolicyEnabled(process.env) || sandboxPolicyMode === 'mandatory' || process.env.HAPPY_WRITE_SCOPE_SESSION === '1') {
         const policy = createToolPolicyRuntime({
             happyHomeDir: configuration.happyHomeDir,
             sessionId: () => session.sessionId,

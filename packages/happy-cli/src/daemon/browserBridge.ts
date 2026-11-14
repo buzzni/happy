@@ -15,7 +15,7 @@
  * send/close/on, so this stays unit-testable (same pattern as PreviewWsProxy).
  */
 
-import { createHmac, timingSafeEqual } from 'node:crypto'
+import { createHmac, timingSafeEqual, randomUUID } from 'node:crypto'
 
 export interface BridgeSocket {
     send(data: string): void
@@ -45,6 +45,7 @@ interface PendingRequest {
 }
 
 interface Connection {
+    connectionId: string
     profile: string
     pairingId?: string
     viewerKey?: string
@@ -185,6 +186,7 @@ export class BrowserBridge {
         }
 
         const connection: Connection = {
+            connectionId: randomUUID(),
             profile,
             ...(params.pairingId ? { pairingId: params.pairingId } : {}),
             ...(params.viewerKey ? { viewerKey: params.viewerKey } : {}),
@@ -225,11 +227,12 @@ export class BrowserBridge {
     getSetupPolicy(): BrowserSetupPolicy { return structuredClone(this.setupPolicy) }
 
     /** Connected extensions (introspection / status endpoint). */
-    connections(viewerKey?: string): Array<{ profile: string; pairingId?: string; viewerKey?: string }> {
+    connections(viewerKey?: string, includeIdentity = false): Array<{ profile: string; pairingId?: string; viewerKey?: string; connectionId?: string }> {
         return Array.from(this.byTarget.values())
             .filter((connection) => connection.viewerKey === viewerKey)
-            .map(({ profile, pairingId, viewerKey }) => ({
+            .map(({ profile, pairingId, viewerKey, connectionId }) => ({
                 profile,
+                ...(includeIdentity ? { connectionId } : {}),
                 ...(pairingId ? { pairingId } : {}),
                 ...(viewerKey ? { viewerKey } : {}),
             }))
@@ -264,7 +267,7 @@ export class BrowserBridge {
     request(
         method: string,
         params: unknown,
-        opts: { timeoutMs?: number; profile?: string; viewerKey?: string } = {},
+        opts: { timeoutMs?: number; profile?: string; viewerKey?: string; expectedConnectionId?: string } = {},
     ): Promise<unknown> {
         const connections = Array.from(this.byTarget.values())
             .filter((connection) => connection.viewerKey === opts.viewerKey)
@@ -303,6 +306,9 @@ export class BrowserBridge {
             return Promise.reject(new BridgeRequestError('NO_EXTENSION_CONNECTED', detail))
         }
 
+        if (opts.expectedConnectionId !== undefined && connection.connectionId !== opts.expectedConnectionId) {
+            return Promise.reject(new BridgeRequestError('BROWSER_CONNECTION_CHANGED', 'Chrome connection changed; request approval again for the current connection'))
+        }
         const id = this.nextRequestId++
         const timeoutMs = opts.timeoutMs ?? this.requestTimeoutMs
         if (connection.viewerKey) this.reportViewerActivity(connection.viewerKey)
