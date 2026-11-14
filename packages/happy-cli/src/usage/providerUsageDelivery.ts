@@ -28,6 +28,7 @@ type Ack = (error: Error | null, response?: unknown) => void;
 type Unconfirmed = {
     event: ProviderUsageEventV1;
     attempts: number;
+    durable: boolean;
     /** Sends still owed an answer; while any is, the event is not sent again by a retry. */
     inFlight: number;
     /** Why it is no longer retried on a timer, or null while it is. */
@@ -47,14 +48,14 @@ export class ProviderUsageDelivery {
         emit: (event: ProviderUsageEventV1, ack: Ack) => void;
     }, private readonly store?: ProviderUsageStore) {
         for (const event of store?.load() ?? []) {
-            this.unconfirmed.set(event.sourceEventId, { event, attempts: 0, inFlight: 0, held: null });
+            this.unconfirmed.set(event.sourceEventId, { event, attempts: 0, inFlight: 0, held: null, durable: true });
         }
     }
 
     send(event: ProviderUsageEventV1): void {
         let entry = this.unconfirmed.get(event.sourceEventId);
         if (!entry) {
-            entry = { event, attempts: 0, inFlight: 0, held: null };
+            entry = { event, attempts: 0, inFlight: 0, held: null, durable: false };
             this.unconfirmed.set(event.sourceEventId, entry);
         }
         this.emit(entry);
@@ -106,21 +107,26 @@ export class ProviderUsageDelivery {
             const reason = entry.held ?? 'unanswered';
             reasons[reason] = (reasons[reason] ?? 0) + 1;
         }
-        logger.warn(this.store ? '[SOCKET] Provider usage events unconfirmed at close; persisted events recover on session resume' : '[SOCKET] Provider usage events left unconfirmed at close; they are held in memory only and are lost with this process', {
+        logger.warn(this.store ? '[SOCKET] Provider usage events unconfirmed at close; only persisted events are recoverable; never-persisted events are lost with this process' : '[SOCKET] Provider usage events left unconfirmed at close; they are held in memory only and are lost with this process', {
             count: this.unconfirmed.size,
             reasons,
+            neverPersistedCount: [...this.unconfirmed.values()].filter(entry => !entry.durable).length,
+            neverPersistedSourceEventIds: [...this.unconfirmed.values()].filter(entry => !entry.durable).slice(0, CLOSE_REPORTED_IDS).map(entry => entry.event.sourceEventId),
             sourceEventIds: this.unconfirmedIds().slice(0, CLOSE_REPORTED_IDS),
         });
     }
 
-    private emit(entry: Unconfirmed): void {
-        // Not connected: `resume` sends it. Emitting now would leave it in the socket's own buffer as well.
-        try { this.store?.put(entry.event); }
+    private persist(entry: Unconfirmed): void {
+        if (!this.store || entry.durable) return;
+        try { this.store.put(entry.event); entry.durable = true; }
         catch {
-            logger.warn('[SOCKET] Provider usage persistence failed; event retained in memory for retry');
+            logger.warn('[SOCKET] Provider usage persistence failed; live delivery remains available', { sourceEventId: entry.event.sourceEventId });
             this.scheduleRetry();
-            return;
         }
+    }
+
+    private emit(entry: Unconfirmed): void {
+        this.persist(entry);
         if (!this.socket.isConnected()) return;
         entry.inFlight += 1;
         this.socket.emit(entry.event, (error, response) => {
@@ -190,6 +196,7 @@ export class ProviderUsageDelivery {
     private sendIdle(): void {
         for (const entry of this.unconfirmed.values()) {
             if (entry.held === null && entry.inFlight === 0) this.emit(entry);
+            else this.persist(entry);
         }
     }
 }

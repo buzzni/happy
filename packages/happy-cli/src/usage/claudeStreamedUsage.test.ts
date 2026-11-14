@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ClaudeStreamedUsage } from './claudeStreamedUsage';
 
 const started = { input_tokens: 10, output_tokens: 0, cache_read_input_tokens: 300 };
@@ -129,4 +129,23 @@ describe('transcript finals without child stream deltas', () => {
         assistant('child');
         expect(reported).toEqual([{ id: 'child', usage: { ...started, output_tokens: 2 }, final: false }]);
     });
+});
+
+it('waits for the actual delta when transcript reconciliation races an open stream', () => {
+    const tracker = new ClaudeStreamedUsage(); const report = vi.fn();
+    tracker.noteStreamEvent({ parent_tool_use_id: null, event: { type: 'message_start', message: { id: 'open' } } });
+    tracker.noteAssistant('open', { input_tokens: 10, output_tokens: 0 }, report);
+    tracker.noteTranscriptFinal('open', { input_tokens: 10, output_tokens: 2 });
+    expect(report).not.toHaveBeenCalled();
+    tracker.noteStreamEvent({ parent_tool_use_id: null, event: { type: 'message_delta', usage: { output_tokens: 9 } } });
+    expect(report).toHaveBeenCalledExactlyOnceWith({ input_tokens: 10, output_tokens: 9 }, true);
+});
+
+it('accepts transcript reconciliation after a child stream has stopped without a delta', () => {
+    const tracker = new ClaudeStreamedUsage(); const report = vi.fn();
+    tracker.noteStreamEvent({ parent_tool_use_id: 'child', event: { type: 'message_start', message: { id: 'stopped' } } });
+    tracker.noteAssistant('stopped', { input_tokens: 10, output_tokens: 0 }, report);
+    tracker.noteStreamEvent({ parent_tool_use_id: 'child', event: { type: 'message_stop' } });
+    tracker.noteTranscriptFinal('stopped', { input_tokens: 10, output_tokens: 9 });
+    expect(report).toHaveBeenCalledExactlyOnceWith({ input_tokens: 10, output_tokens: 9 }, true);
 });

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, fsyncSync, mkdirSync, chmodSync, fchmodSync, openSync, linkSync, renameSync, existsSync, opendirSync, type Dir, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, rmdirSync, fsyncSync, mkdirSync, chmodSync, fchmodSync, openSync, linkSync, renameSync, existsSync, opendirSync, type Dir, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { ProviderUsageEventV1Schema, type ProviderUsageEventV1 } from '@slopus/happy-wire';
 import { decrypt, encrypt } from '@/api/encryption';
@@ -27,7 +27,7 @@ export class ProviderUsageSpool implements ProviderUsageStore {
     }
     /** Trusted parent provisioning: the key remains sealed in the daemon's private directory. */
     provisionRecovery(): void {
-        if (!this.scope.recoveryKey) return;
+        if (!this.scope.recoveryKey || existsSync(join(this.directory, 'identity.enc'))) return;
         mkdirSync(this.directory, { recursive: true, mode: 0o700 });
         this.commit('identity.enc', Buffer.from(encrypt(this.scope.recoveryKey, 'dataKey', {
             version: 1, server: new URL(this.scope.server).origin, sessionId: this.scope.sessionId,
@@ -42,7 +42,9 @@ export class ProviderUsageSpool implements ProviderUsageStore {
         }
         this.observed.clear();
         const events: ProviderUsageEventV1[] = [];
-        for (let i = 0; i < limit; i++) {
+        const eventLimit = Math.max(1, Math.min(100, Math.floor(limit) || 1));
+        // Bound filesystem work independently of the number of accepted events.
+        for (let scanned = 0; scanned < 1000 && events.length < eventLimit; scanned++) {
             const entry = this.reader.readSync();
             if (!entry) { this.closeReader(); return { events, done: true }; }
             if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
@@ -89,7 +91,7 @@ export class ProviderUsageSpool implements ProviderUsageStore {
             const existing = this.readEvent(name);
             if (!existing || JSON.stringify(existing) !== JSON.stringify(parsed)) throw new Error('Usage spool conflicting event retained');
         }
-        this.registerRecovery(name);
+
     }
     private commit(name: string, contents: string, replace = false): boolean {
         const temporary = join(this.directory, `${randomUUID()}.tmp`);
@@ -149,6 +151,14 @@ export class ProviderUsageSpool implements ProviderUsageStore {
         try { unlinkSync(join(this.directory, `${hash(sourceEventId)}.json`)); }
         catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error; }
         this.syncDirectory();
+        // Never unlink identity/hold/temporary files: another writer may need them.
+        // rmdir is atomic and refuses any nonempty directory, including concurrent writes.
+        try { rmdirSync(this.directory); this.closeReader(); }
+        catch (error) {
+            if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes((error as NodeJS.ErrnoException).code ?? '')) {
+                logger.warn('[USAGE] Empty spool directory cleanup failed');
+            }
+        }
     }
     private syncDirectory(): void {
         // Windows cannot open directories for fsync; the event file was flushed before rename.
