@@ -187,6 +187,19 @@ describe('query adapter', () => {
         });
     });
 
+    it.each(['platform-plan', 'platform-plan-pending'])('pins Eco effort, model and tools for %s even when a caller asks for high', source => {
+        vi.stubEnv('HAPPY_AI_AUTH_SOURCE', source);
+        vi.stubEnv('ANTHROPIC_MODEL', 'deepseek/deepseek-v4.1-flash-eco');
+        query({ prompt: 'continue', options: { effort: 'high', model: 'claude-opus-5-5', fallbackModel: 'haiku' } });
+        const options = (pinnedEndpointQuery.mock.calls.at(-1) as unknown as [unknown, { options: Record<string, unknown> }])[1].options;
+        expect(options.effort).toBe('medium');
+        expect(options.model).toBe('deepseek/deepseek-v4.1-flash-eco');
+        expect(options.fallbackModel).toBeUndefined();
+        expect(options.disallowedTools).toContain('WebSearch');
+        expect(pinnedQuery).not.toHaveBeenCalled();
+        expect(sdkQuery).not.toHaveBeenCalled();
+    });
+
     it.each(['personal-subscription', 'org-bundle-observed', undefined])('keeps ordinary token source %s on the existing route', source => {
         vi.stubEnv('HAPPY_AI_AUTH_SOURCE', source);
         vi.stubEnv('CLAUDE_CODE_OAUTH_TOKEN', 'fixture-token');

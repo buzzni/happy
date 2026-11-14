@@ -1,3 +1,5 @@
+import { configuration } from '@/configuration';
+import { agentPlanThreadsDir, isAgentPlanThread } from '@/launcher/agentPlanThreads';
 import { dirname, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
@@ -42,6 +44,7 @@ export function resolveClaudeSessionTransferPath(input: {
  */
 function resolveTransferSourcePath(input: { directory: string; claudeSessionId: string; allowedRoot: string; approvedRoots?: readonly string[] }): string {
     const path = resolveClaudeSessionTransferPath(input);
+    if (isAgentPlanThread(agentPlanThreadsDir(configuration.happyHomeDir), input.claudeSessionId)) throw new Error('agent_plan_resume_requires_grant: plan transcripts must be continued in the app on their original work PC');
     if (isOrgEndpointConversation(dirname(path), input.claudeSessionId)) {
         throw new Error('ORG_LLM_ENDPOINT_PARENT_BOUND: this conversation ran on an organization LLM endpoint and cannot be moved to another machine; '
             + 'resume the same session, or start a new conversation.');

@@ -14,7 +14,7 @@
 import { readTrustedStudioOrigin } from '@/daemon/setupTokenBindingProof'
 
 /** Advertised in machine metadata as `agentPlan` by every daemon platform (see `agentPlanCapabilityForPlatform`). */
-export const AGENT_PLAN_CAPABILITY = { version: 1 as const }
+export const AGENT_PLAN_CAPABILITY = { version: 1 as const, claude: 1 as const }
 
 /** Spawn seeds: read and deleted by the runner, never inherited (childEnv `HAPPY_INITIAL_`). */
 export const AGENT_PLAN_DESCRIPTOR_ENV = 'HAPPY_INITIAL_AGENT_PLAN_DESCRIPTOR'
@@ -36,6 +36,7 @@ export const AGENT_PLAN_DESCRIPTOR_VERSION = 1
  * Compaction leaves the provider's 128k output budget plus 22k for framing/tool definitions.
  */
 const AGENT_PLAN_MODEL_CONTEXT = {
+    'deepseek/deepseek-v4.1-flash-eco': { contextWindow: 200000, autoCompactTokenLimit: 150000 },
     'gpt-6-luna': { contextWindow: 1050000, autoCompactTokenLimit: 900000 },
     'gpt-6.1-terra': { contextWindow: 1050000, autoCompactTokenLimit: 900000 },
     'gpt-6.1-sol': { contextWindow: 1050000, autoCompactTokenLimit: 900000 },
@@ -139,7 +140,7 @@ export function readAgentPlanDescriptor(raw: string, trustedOrigin: string | nul
         model: String(fields.model),
     })
     if (!rebuilt || (serializeAgentPlanDescriptor(rebuilt) !== raw
-        && serializeAgentPlanDescriptor({ ...rebuilt, ...LEGACY_AGENT_PLAN_MODEL_CONTEXT[rebuilt.model] }) !== raw)) {
+        && serializeAgentPlanDescriptor({ ...rebuilt, ...LEGACY_AGENT_PLAN_MODEL_CONTEXT[rebuilt.model as keyof typeof LEGACY_AGENT_PLAN_MODEL_CONTEXT] }) !== raw)) {
         throw new AgentPlanLaunchError('agent_plan_descriptor_invalid', 'not the descriptor this contract writes')
     }
     return rebuilt
@@ -177,4 +178,11 @@ export function agentPlanCodexArgs(descriptor: AgentPlanDescriptor, proxyBaseUrl
         '-c', 'disable_response_storage=true',
         '-c', 'web_search="disabled"',
     ]
+}
+
+export function agentPlanAgent(model: AgentPlanModel): 'codex' | 'claude' {
+    return model === 'deepseek/deepseek-v4.1-flash-eco' ? 'claude' : 'codex'
+}
+export function agentPlanGatewayUrl(descriptor: AgentPlanDescriptor): string {
+    return `${descriptor.origin}/api/agent-plan/v1/${agentPlanAgent(descriptor.model) === 'claude' ? 'messages' : 'responses'}`
 }

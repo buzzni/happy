@@ -15,8 +15,8 @@ import type { ReadableStream as WebReadableStream } from 'node:stream/web'
 
 /** Large enough for a full context of input; images and files are refused by the gateway anyway. */
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024
-const FORWARDED_REQUEST_HEADERS = ['content-type', 'accept', 'user-agent'] as const
-const FORWARDED_RESPONSE_HEADERS = ['content-type', 'cache-control', 'retry-after'] as const
+const FORWARDED_REQUEST_HEADERS = ['content-type', 'accept', 'user-agent', 'anthropic-version'] as const
+const FORWARDED_RESPONSE_HEADERS = ['content-type', 'cache-control', 'retry-after', 'x-should-retry'] as const
 
 export type AgentPlanProxy = { baseUrl: string; close(): Promise<void> }
 
@@ -56,12 +56,13 @@ export async function startAgentPlanProxy(options: {
 }): Promise<AgentPlanProxy> {
     const fetchImpl = options.fetchImpl ?? fetch
     const expectedAuthorization = Buffer.from(`Bearer ${options.clientKey}`, 'utf8')
+    const endpoint = new URL(options.upstreamUrl).pathname.endsWith('/messages') ? '/v1/messages' : '/v1/responses'
     const inFlight = new Set<AbortController>()
 
     const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
         const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
-        if (req.method !== 'POST' || path !== '/v1/responses') {
-            sendError(res, 404, 'agent_plan_proxy_not_found', 'Only POST /v1/responses is served')
+        if (req.method !== 'POST' || path !== endpoint) {
+            sendError(res, 404, 'agent_plan_proxy_not_found', `Only POST ${endpoint} is served`)
             return
         }
         if (!authorized(req, expectedAuthorization)) {

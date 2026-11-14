@@ -49,7 +49,7 @@ describe('배선 가드: spawn 이 선택을 존중하고 검증하는가', () =
     const text = await runSource()
     // 해석 결과를 버리는 것이 아니라 아예 해석하지 않아야 빈 객체가 overlay 된다.
     expect(text).toMatch(
-      /honorsManagedAiCredentials\(options\.aiAuthSelection\)\s*\n?\s*\?\s*await resolveManagedAiCredentialEnvironment\(/,
+      /honorsManagedAiCredentials\(options\.aiAuthSelection, Boolean\(options\.agentPlan\)\)\s*\n?\s*\?\s*await resolveManagedAiCredentialEnvironment\(/,
     )
   })
 
@@ -88,7 +88,7 @@ describe('배선 가드: spawn 이 선택을 존중하고 검증하는가', () =
     // a second selection/precreate; ordinary/channel launches must still use machineRotationFor.
     expect(text).toMatch(/let preparedMachineLaunch = ownedMachineLaunches\.get\(options\);\s*const machineRotationRuntime = preparedMachineLaunch \? null : await machineRotationFor\(options\);/);
     expect(text).toMatch(/if \(preparedMachineLaunch\) \{\s*preparedMachineSessionId = preparedMachineLaunch\.session\.id;\s*pendingMachineStarts\.add\(preparedMachineSessionId\);/);
-    expect(text).toContain('preparedMachineLaunch?.environment ?? (honorsManagedAiCredentials(options.aiAuthSelection)');
+    expect(text).toContain('preparedMachineLaunch?.environment ?? (honorsManagedAiCredentials(options.aiAuthSelection, Boolean(options.agentPlan))');
     expect(text).toContain('if (preparedMachineLaunch) Object.assign(extraEnv, preparedMachineLaunch.reconnectEnvironment);');
     // Review #896 — a channel launch decides once; spawnSession must not decide again and drop the channel data key.
     expect(text).toContain('channelRotationRuntimes.set(options, runtime);');
@@ -99,7 +99,7 @@ describe('배선 가드: spawn 이 선택을 존중하고 검증하는가', () =
     const text = await runSource();
     const owned = await runSource('ownedSpawnRuntime.ts');
     // A company-bound recovery must use its original runtime; new launches use the same selector.
-    expect(text).toContain('rotation: (options, companyId) => companyId ? machineRuntimeFor(companyId) : machineRotationFor(options),');
+    expect(text).toContain('rotation: (options, companyId) => options.agentPlan ? Promise.resolve(null) : companyId ? machineRuntimeFor(companyId) : machineRotationFor(options),');
     expect(text).toContain('start: (options, launch) => { if (launch) ownedMachineLaunches.set(options, launch); return ownedStartGuard.start(options, () => spawnSessionAdmitted(options)); },');
     expect(owned).toMatch(/rotation\.prepareLaunch\(\{ metadata, ownerAccountId: record\.intent\.sessionAccountId,\s*machineOwnerAccountId: record\.intent\.machineAccountId, ownershipPreparation:/);
     expect(owned).toContain('snapshot.executionProof = await input.executionProof(snapshot.body, { encryptionKey: decodeBase64(snapshot.encryptionKey), encryptionVariant: snapshot.encryptionVariant });');

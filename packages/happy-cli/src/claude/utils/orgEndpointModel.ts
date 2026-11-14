@@ -19,7 +19,7 @@ type ModelEnv = Record<string, string | undefined>
 
 /** An endpoint session that names its model; without one there is nothing to fold onto. */
 export function isOrgEndpointRuntime(env: ModelEnv): boolean {
-    return env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint' && !!env.ANTHROPIC_MODEL
+    return ['org-endpoint', 'platform-plan', 'platform-plan-pending'].includes(env.HAPPY_AI_AUTH_SOURCE ?? '') && !!env.ANTHROPIC_MODEL
 }
 
 /** A tier alias maps to the endpoint's tier model, a name the endpoint defines stays, anything else is the endpoint model. */

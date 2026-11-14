@@ -654,6 +654,9 @@ describe('parseAiAuthSelection', () => {
 })
 
 describe('honorsManagedAiCredentials', () => {
+    it('never resolves company credentials for a platform plan, including a Claude plan with no credential choice', () => {
+        expect(honorsManagedAiCredentials(undefined, true)).toBe(false)
+    })
     it('선택이 없으면 기존 동작 그대로 관리 자격이 이긴다', () => {
         expect(honorsManagedAiCredentials(undefined)).toBe(true)
     })

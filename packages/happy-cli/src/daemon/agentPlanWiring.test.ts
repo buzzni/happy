@@ -18,7 +18,7 @@ async function runSource(): Promise<string> {
 
 describe('agentPlan capability', () => {
     it('is advertised by this daemon next to the untouched aiAuthSelection', () => {
-        expect(initialMachineMetadata.agentPlan).toEqual({ version: 1 })
+        expect(initialMachineMetadata.agentPlan).toEqual(AGENT_PLAN_CAPABILITY)
         expect(initialMachineMetadata.aiAuthSelection).toEqual({ version: 1 })
     })
 

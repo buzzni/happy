@@ -14,6 +14,8 @@ import {
     readClaudeSessionTransferSourceChunk,
     resolveClaudeSessionTransferPath,
 } from './claudeSessionTransfer';
+import { configuration } from '@/configuration';
+import { agentPlanThreadsDir, recordAgentPlanThread } from '@/launcher/agentPlanThreads';
 import { markOrgEndpointConversation } from './orgEndpointConversation';
 
 const SESSION_ID = '93a9705e-bc6a-406d-8dce-8acc014dedbd';
@@ -134,6 +136,12 @@ describe('Claude session transfer input validation', () => {
         ])).toEqual(content);
         expect(first.eof).toBe(false);
         expect(second.eof).toBe(true);
+    });
+
+    it('refuses a plan transcript export whose authority marker would be lost on another PC', async () => {
+        const id = '17f957d1-282a-45cc-aeed-c809381c0001';
+        await recordAgentPlanThread(agentPlanThreadsDir(configuration.happyHomeDir), id, { sessionId: 'happy-plan', grantId: 'grant-plan', agent: 'claude' });
+        await expect(inspectClaudeSessionTransferSource({ directory: projectDirectory, claudeSessionId: id, allowedRoot: root })).rejects.toThrow('agent_plan_resume_requires_grant');
     });
 
     // aplus specs/org-llm-endpoints r3 — the mark does not travel; on another machine nothing would hold the conversation.

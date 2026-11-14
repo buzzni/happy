@@ -13,7 +13,7 @@ const CLAUDE_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 
 /** The sentence to show when this session may not use the terminal; undefined when it may. */
 export function orgEndpointLocalModeRefusal(env: Record<string, string | undefined>): string | undefined {
-    return env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint' ? ORG_ENDPOINT_LOCAL_MODE_REFUSAL : undefined
+    return ['org-endpoint', 'platform-plan', 'platform-plan-pending'].includes(env.HAPPY_AI_AUTH_SOURCE ?? '') ? ORG_ENDPOINT_LOCAL_MODE_REFUSAL : undefined
 }
 
 /** Throws the refusal when an endpoint session is about to run in local mode (or reaches the terminal's Claude at all). */
@@ -36,7 +36,7 @@ export function orgEndpointContinuationRefusal(input: {
     projectDir: string
     lastConversation: () => string | null
 }): string | undefined {
-    if (input.env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint') return undefined
+    if (['org-endpoint', 'platform-plan', 'platform-plan-pending'].includes(input.env.HAPPY_AI_AUTH_SOURCE ?? '')) return undefined
     const args = input.claudeArgs ?? []
     // `--resume <value>`, `--resume=<value>`, `-r <value>`, `-r<value>`; a value that is not an id is the picker's search term.
     const operands = args.flatMap((arg, i) => {

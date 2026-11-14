@@ -29,6 +29,11 @@ function codeOf(run: () => unknown): string | undefined {
 }
 
 describe('buildAgentPlanDescriptor', () => {
+    it('accepts Eco only as a canonical Claude Messages descriptor', () => {
+        const descriptor = buildAgentPlanDescriptor({ origin: ORIGIN, grantId: GRANT, model: 'deepseek/deepseek-v4.1-flash-eco' })
+        expect(descriptor).toMatchObject({ model: 'deepseek/deepseek-v4.1-flash-eco', contextWindow: 200000, autoCompactTokenLimit: 150000 })
+        expect(readAgentPlanDescriptor(serializeAgentPlanDescriptor(descriptor!), ORIGIN)).toEqual(descriptor)
+    })
     it('fixes the per-model context settings from the grant model (spec §6.3-2)', () => {
         expect(buildAgentPlanDescriptor({ origin: ORIGIN, grantId: GRANT, model: 'gpt-6-luna' })).toMatchObject({
             contextWindow: 1050000, autoCompactTokenLimit: 900000,

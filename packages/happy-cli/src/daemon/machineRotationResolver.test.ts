@@ -2,6 +2,7 @@ import nacl from 'tweetnacl';
 import { describe, expect, it, vi } from 'vitest';
 import { rotationSha256 } from '@slopus/happy-wire';
 import { chooseLaunchRotation, createMachineRotationResolver } from './machineRotationResolver';
+import { honorsManagedAiCredentials } from './sessionEnv';
 
 // aplus specs/shared-machine-server-signing Phase 3c — machine rotation is on by default: the company is the shared scope,
 // Studio and its rotation key come from the trusted origin, and a PC Studio does not accept runs the current way.
@@ -123,6 +124,16 @@ describe('chooseLaunchRotation', () => {
         const log = vi.fn(), scope = vi.fn(async () => 'co' as string | null);
         return { log, scope, input: { managedClaude: true, explicitUserGrant: false, precreatedSession: false, resolver: resolver(), scope, log, ...overrides } };
     };
+
+    it('never asks or issues a company account for a platform Claude plan on a shared PC', async () => {
+        const issue = vi.fn(() => { throw new Error('NO_ACCOUNT'); });
+        const newLaunch = vi.fn(async (): Promise<Decision> => { issue(); return { runtime: 'runtime' }; });
+        const f = base({ managedClaude: honorsManagedAiCredentials(undefined, true), resolver: resolver(newLaunch) });
+        await expect(chooseLaunchRotation(f.input)).resolves.toBeNull();
+        expect(f.scope).not.toHaveBeenCalled();
+        expect(newLaunch).not.toHaveBeenCalled();
+        expect(issue).not.toHaveBeenCalled();
+    });
 
     it('uses the runtime Studio accepts for the shared scope', async () => {
         const f = base();

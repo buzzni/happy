@@ -1,3 +1,7 @@
+import { consumeAgentPlanLaunch, startAgentPlanSession } from '@/launcher/agentPlanSession';
+import { AgentPlanLaunchError, agentPlanAgent } from '@/launcher/agentPlanLaunch';
+import { agentPlanThreadsDir, hasClaudeAgentPlanThread, readAgentPlanThread, recordAgentPlanThreadSync } from '@/launcher/agentPlanThreads';
+import { configureClaudePlanEnvironment, claudePlanResumeThread } from './agentPlanClaude';
 import { readSetupTokenResumeSelection, isMachineSetupTokenBinding, SETUP_TOKEN_BINDING_ENV } from '@/daemon/sessionEnv';
 import { initializeScopeReportSigner, takeScopeLaunchBootstrap } from '@/daemon/sessionWriteScopeReports';
 import { takeScopeConfirmation } from '@/daemon/sessionWriteScopeConfirmation';
@@ -290,6 +294,21 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     const automationRunOnceRequested = consumeAutomationRunOnce(process.env);
     const deferredContinuation = createDeferredContinuationContextConsumer(process.env);
 
+    const planLaunch = consumeAgentPlanLaunch(process.env);
+    if (planLaunch && agentPlanAgent(planLaunch.descriptor.model) !== 'claude') throw new AgentPlanLaunchError('agent_plan_managed_conflict');
+    const planThreadsDir = planLaunch?.threadsDir ?? agentPlanThreadsDir(configuration.happyHomeDir);
+    const planMarkerDirs = [...new Set([planThreadsDir, agentPlanThreadsDir(configuration.happyHomeDir)])];
+    const readPlanMarker = (id: string) => {
+        for (const dir of planMarkerDirs) {
+            const marker = readAgentPlanThread(dir, id);
+            if (marker) return marker;
+        }
+        return null;
+    };
+    const planResumeId = claudePlanResumeThread(options.claudeArgs, () => claudeFindLastSession(process.cwd()), () => !!planLaunch || planMarkerDirs.some(hasClaudeAgentPlanThread));
+    let planParent = planResumeId ? readPlanMarker(planResumeId) : null;
+    if (planParent && !planLaunch) throw new AgentPlanLaunchError('agent_plan_resume_requires_grant');
+    if (planLaunch && (options.startingMode ?? 'local') !== 'remote') throw new AgentPlanLaunchError('agent_plan_managed_conflict', 'plan requires remote mode');
     const workingDirectory = process.cwd();
     const sessionTag = randomUUID();
 
@@ -403,6 +422,15 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // otherwise pass CAS while deleting the existing summary/title.
     const reconnectSession = consumeReconnectSessionEnvironment(process.env);
     const reconnectSessionId = reconnectSession?.id;
+    for (const id of [process.env.HAPPY_FORK_CLAUDE_SESSION_ID, reconnectSession?.metadata?.claudeSessionId]) {
+        if (!id) continue;
+        const marker = readPlanMarker(id);
+        if (marker && !planLaunch) throw new AgentPlanLaunchError('agent_plan_resume_requires_grant');
+        if (marker) {
+            if (planParent && marker.grantId !== planParent.grantId) throw new AgentPlanLaunchError('agent_plan_managed_conflict');
+            planParent = marker;
+        }
+    }
     const inputEvidenceEnabled = resolveInputEvidenceOption(inputEvidenceOption, reconnectSession?.metadata);
     const metadata = inputEvidenceMetadata(mergeReconnectSessionMetadata(reconnectSession?.metadata, freshMetadata), inputEvidenceEnabled);
     const allowAutomationReconnectPrompt = process.env.HAPPY_AUTOMATION_RESUME_PROMPT === '1';
@@ -444,6 +472,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // Handle server unreachable case - run Claude locally with hot reconnection
     // Note: connectionState.notifyOffline() was already called by api.ts with error details
     if (!response) {
+        if (planLaunch) throw new AgentPlanLaunchError('agent_plan_session_unavailable');
         // The drain proves storage on the server; an offline local run cannot.
         if (launchControl) throw new Error('Standalone launch requires an online session');
         if (sandboxConfig?.checkpointProtection) {
@@ -543,6 +572,11 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     const stage = (code: string) => {
         if (managedStartup) logger.debug(`[managed] startup-stage ${code}`);
     };
+    const planSession = planLaunch ? await startAgentPlanSession({ launch: planLaunch, sessionId: response.id, env: process.env, expectedParentGrantId: planParent?.grantId }) : null;
+    if (planLaunch && planSession) {
+        configureClaudePlanEnvironment(process.env, planLaunch.descriptor, planSession.proxyBaseUrl, planSession.clientKey);
+        process.once('exit', () => { void planSession.close(); });
+    }
     stage('session-created');
     if (sandboxConfig?.checkpointProtection && (options.startingMode ?? 'local') !== 'remote') {
         throw new Error('checkpoint protection supports Claude remote mode only');
@@ -1049,7 +1083,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     const explicitInitialEffort = rawInitialEffortSeed && VALID_CLAUDE_EFFORTS.has(rawInitialEffortSeed)
         ? rawInitialEffortSeed as 'low' | 'medium' | 'high' | 'xhigh' | 'max'
         : undefined;
-    const initialEffortSeed = explicitInitialEffort ?? DEFAULT_CLAUDE_EFFORT;
+    const initialEffortSeed = planLaunch ? 'medium' : explicitInitialEffort ?? DEFAULT_CLAUDE_EFFORT;
     // Session-scoped structured output (specs/claude-cli-benchmark-followups R2). The daemon already
     // validated it; a seed that does not parse is dropped, and the session runs without a format.
     const outputFormat = consumeOutputFormatSeed(process.env) ?? undefined;
@@ -1523,6 +1557,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         } else {
             logger.debug(`[loop] User message received with no effort override, using current: ${currentEffort ?? 'default'}`);
         }
+
+        if (planLaunch) messageEffort = currentEffort = 'medium';
 
         sessionModelPinPublisher.publish({
             specifiesModel: message.meta?.hasOwnProperty('model') ?? false,
@@ -1999,6 +2035,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 }
 
                 await session.flush();
+                await planSession?.close();
                 await session.close();
             }
 
@@ -2088,7 +2125,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         if ((session.getMetadata()?.dangerouslySkipPermissions ?? false) !== skip) {
             session.updateMetadata((current) => ({ ...current, dangerouslySkipPermissions: skip }));
         }
-        if (orgGate.restrictsModels()) {
+        if (orgGate.restrictsModels() && !planLaunch) {
             const removed = stripModelSelectionEnv(process.env, options.claudeEnvVars);
             if (removed.length > 0) logger.debug(`[org-requirements] Model variables removed while models are restricted: ${removed.join(', ')}`);
         }
@@ -2229,6 +2266,11 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         onSessionReady: (sessionInstance) => {
             // Store reference for hook server callback
             currentSession = sessionInstance;
+            if (planLaunch) {
+                const mark = (id: string) => { for (const dir of planMarkerDirs) recordAgentPlanThreadSync(dir, id, { sessionId: response.id, grantId: planLaunch.descriptor.grantId, agent: 'claude' }); };
+                sessionInstance.addSessionFoundCallback(mark);
+                if (sessionInstance.sessionId) mark(sessionInstance.sessionId);
+            }
             // R9: Claude's init message names every MCP tool it loaded (no annotations).
             sessionInstance.policyToolsSeen = toolPolicyGate ? (tools) => toolPolicyGate.toolsListed(tools.map((name) => ({ name }))) : null;
             sessionInstance.prepareChannelExecution = (requestId) => channelAcceptance.prepareExecution(requestId);
@@ -2288,6 +2330,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         getSaycodePromptBlocks: () => currentSaycodePromptBlocks,
     });
     } finally {
+        await planSession?.close();
         stopCallerGrantRefresh();
         stopCallerGrantExpiryNotice();
         await scopeProcessSandbox?.close();

@@ -18,6 +18,8 @@ import {
     AgentPlanLaunchError,
     agentPlanCodexArgs,
     agentPlanGatewayResponsesUrl,
+    agentPlanGatewayUrl,
+    agentPlanAgent,
     agentPlanSessionKeysUrl,
     readAgentPlanDescriptor,
     type AgentPlanDescriptor,
@@ -35,7 +37,7 @@ const DEFAULT_RETRY_DELAYS_MS = [500, 1_500] as const
 
 export type AgentPlanLaunch = { descriptor: AgentPlanDescriptor; secret: string; threadsDir: string | null }
 
-export type AgentPlanSessionKey = { key: string; expiresAt: number }
+export type AgentPlanSessionKey = { key: string; expiresAt: number; model?: string; parentGrantId?: string | null }
 
 /** A refused or failed exchange. `transient` failures are worth retrying; a refusal is final. */
 export class AgentPlanKeyExchangeError extends Error {
@@ -99,7 +101,7 @@ export async function exchangeAgentPlanSessionKey(input: {
         || typeof fields.expiresAt !== 'number' || !Number.isSafeInteger(fields.expiresAt) || fields.expiresAt <= input.now) {
         throw new AgentPlanKeyExchangeError('agent_plan_key_invalid', true)
     }
-    return { key: fields.key, expiresAt: fields.expiresAt }
+    return { key: fields.key, expiresAt: fields.expiresAt, ...(typeof fields.model === 'string' ? { model: fields.model } : {}), ...(fields.parentGrantId === null || typeof fields.parentGrantId === 'string' ? { parentGrantId: fields.parentGrantId } : {}) }
 }
 
 /**
@@ -156,6 +158,8 @@ export function createAgentPlanKeySource(options: {
 
 export type AgentPlanSession = {
     /** The Codex `-c` arguments: plan provider through the local proxy, grant model, context, web search off. */
+    proxyBaseUrl: string
+    clientKey: string
     providerArgs: string[]
     /** Hosted web search through the gateway, for the runner's Happy MCP `web_search` tool (Codex sends none for plan models). */
     webSearch: (query: string) => Promise<AgentPlanWebSearchResult>
@@ -172,18 +176,26 @@ export async function startAgentPlanSession(input: {
     sessionId: string
     env: NodeJS.ProcessEnv
     fetchImpl?: typeof fetch
+    expectedParentGrantId?: string
     retryDelaysMs?: readonly number[]
 }): Promise<AgentPlanSession> {
     const { descriptor, secret } = input.launch
     const keys = createAgentPlanKeySource({
-        exchange: () => exchangeAgentPlanSessionKey({
+        exchange: async () => {
+            const key = await exchangeAgentPlanSessionKey({
             url: agentPlanSessionKeysUrl(descriptor),
             grantId: descriptor.grantId,
             secret,
             sessionId: input.sessionId,
             now: Date.now(),
             fetchImpl: input.fetchImpl,
-        }),
+            })
+            if (agentPlanAgent(descriptor.model) === 'claude' && (key.model !== descriptor.model
+                || (input.expectedParentGrantId && input.expectedParentGrantId !== descriptor.grantId && key.parentGrantId !== input.expectedParentGrantId))) {
+                throw new AgentPlanKeyExchangeError('agent_plan_session_mismatch', false)
+            }
+            return key
+        },
         retryDelaysMs: input.retryDelaysMs,
     })
     await keys.start()
@@ -191,7 +203,7 @@ export async function startAgentPlanSession(input: {
     let proxy: Awaited<ReturnType<typeof startAgentPlanProxy>>
     try {
         proxy = await startAgentPlanProxy({
-            upstreamUrl: agentPlanGatewayResponsesUrl(descriptor),
+            upstreamUrl: agentPlanGatewayUrl(descriptor),
             clientKey,
             sessionKey: () => keys.current(),
             fetchImpl: input.fetchImpl,
@@ -201,7 +213,9 @@ export async function startAgentPlanSession(input: {
     }
     input.env[AGENT_PLAN_PROXY_KEY_ENV] = clientKey
     return {
-        providerArgs: agentPlanCodexArgs(descriptor, `${proxy.baseUrl}/v1`),
+        proxyBaseUrl: proxy.baseUrl,
+        clientKey,
+        providerArgs: agentPlanAgent(descriptor.model) === 'codex' ? agentPlanCodexArgs(descriptor, `${proxy.baseUrl}/v1`) : [],
         webSearch: createAgentPlanWebSearch({
             url: agentPlanGatewayResponsesUrl(descriptor),
             sessionKey: () => keys.current(),
@@ -240,3 +254,4 @@ export function assertNotAgentPlanThreadWithoutPlan(input: {
         }
     }
 }
+
