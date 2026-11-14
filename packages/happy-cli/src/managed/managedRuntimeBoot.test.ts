@@ -1,3 +1,5 @@
+vi.mock('@/usage/managedUsageSpool', () => ({ prepareManagedUsageSpool: vi.fn(),
+    ManagedUsageSpoolCleanup: class { start() {} stop() {} } }));
 /**
  * The root boot stage: order, refusals, and what never leaks.
  *

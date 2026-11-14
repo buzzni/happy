@@ -1,3 +1,11 @@
+import { createHash } from 'node:crypto';
+import { io } from 'socket.io-client';
+import { ProviderUsageRecovery, type UsageRecoverySession } from '@/usage/providerUsageRecovery';
+import { ProviderUsageEventV1Schema } from '@slopus/happy-wire';
+import { join } from 'node:path';
+import { loadUsageRecoveryKey, usageRecoveryMaterial } from '@/usage/providerUsageRecoveryKey';
+import { MANAGED_USAGE_SPOOL_ROOT } from '@/usage/managedUsageSpool';
+import { ProviderUsageSpool } from '@/usage/providerUsageSpool';
 import { z } from 'zod';
 import { SessionOwnershipProofSchema, sessionCreateBodyHash, sessionTagHash, type SessionOwnershipProof } from '@slopus/happy-wire';
 import { HappySessionExecutionProofSchema, type HappySessionExecutionProof, type SessionExecutionCreateBody } from '@slopus/happy-wire';
@@ -48,6 +56,7 @@ type ApiPrincipal =
     token: string;
     /** The raw machine key the parent wrapped. Used to read, never re-wrapped. */
     machineKey: Uint8Array;
+    usageRecoveryRoot?: string;
   };
 
 /** Creation response only; never session metadata, provider state or event wire. */
@@ -111,6 +120,7 @@ export class ApiClient {
     machineKey: Uint8Array;
     /** The Happy this credential was issued for, as the parent recorded it. */
     serverOrigin: string;
+    usageRecoveryRoot?: string;
   }) {
     /*
      * The credential names its server, and this process talks to whatever
@@ -129,6 +139,7 @@ export class ApiClient {
       machineId: input.machineId,
       token: input.token,
       machineKey: input.machineKey,
+      usageRecoveryRoot: input.usageRecoveryRoot,
     });
   }
 
@@ -693,6 +704,146 @@ export class ApiClient {
     }
   }
 
+  /** The encryption identity is stable across bearer refresh; no bearer is written to the spool. */
+  private usageRecoveryKey(): Uint8Array | undefined {
+    if (this.principal.kind === 'managed-machine') return new Uint8Array(createHash('sha256').update('happy-managed-usage-recovery-v1').update(this.principal.machineKey).digest());
+    if (this.principal.kind !== 'account') return undefined;
+    try { return loadUsageRecoveryKey(join(configuration.happyHomeDir, 'usage-spool'), usageRecoveryMaterial(this.principal.credential)); }
+    catch {
+      logger.warn('[USAGE] Encrypted recovery identity unavailable; pending files retained. Session-local delivery remains available; daemon replay may require the previous key.');
+      return undefined;
+    }
+  }
+
+  /** Uses only account-authorized lookup results. Machine bearers cannot impersonate session owners. */
+  startUsageRecovery(isCurrent: () => Promise<boolean> = async () => true,
+    localSession: (id: string) => UsageRecoverySession | null = () => null,
+    managedToken?: () => Promise<string | null>, currentAccount?: () => Promise<Credentials | null>): () => Promise<void> {
+    const recoveryKey = this.usageRecoveryKey();
+    if (!recoveryKey) {
+      logger.warn('[USAGE] Daemon usage recovery needs account authorization; scoped queues retained');
+      return async () => undefined;
+    }
+    if (this.principal.kind === 'managed-machine') {
+      if (!managedToken) {
+        logger.warn('[USAGE] Managed replay requires a current protected daemon credential; queues retained');
+        return async () => undefined;
+      }
+      const machineId = this.principal.machineId;
+      const server = configuration.serverUrl;
+      const origin = new URL(server).origin;
+      let stopped = false;
+      const abort = new AbortController();
+      const worker = new ProviderUsageRecovery({
+        root: this.principal.usageRecoveryRoot ?? join(configuration.happyHomeDir, 'usage-spool'), eventRoot: MANAGED_USAGE_SPOOL_ROOT,
+        server, recoveryKey, batchSize: 10,
+        authorization: async () => { const token = await managedToken(); return token ? createHash('sha256').update(token).digest('hex') : null; },
+        resolve: async (id, sealed) => !stopped && sealed?.sessionId === id ? sealed : null,
+        send: async event => {
+          if (stopped || new URL(configuration.serverUrl).origin !== origin) return false;
+          const token = await managedToken();
+          if (!token) return false;
+          try {
+            const response = await axios.post(`${server}/v1/machines/${encodeURIComponent(machineId)}/usage-replay`, event,
+              { headers: { Authorization: `Bearer ${token}` }, timeout: 10000, maxRedirects: 0, signal: abort.signal });
+            return response.data?.success === true;
+          } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 403) return { held: 'authorization-denied' as const, authorization: createHash('sha256').update(token).digest('hex') };
+            throw error;
+          }
+        },
+      });
+      worker.start();
+      return async () => { stopped = true; abort.abort(); await worker.stop(); };
+    }
+    const server = configuration.serverUrl;
+    const origin = new URL(server).origin;
+    let credential = this.accountCredential();
+    const headers = { Authorization: `Bearer ${credential.token}` };
+    let cursor: string | undefined;
+    let stopped = false;
+    const cancel = new Set<() => void>();
+    const allowed = async () => {
+      if (stopped || new URL(configuration.serverUrl).origin !== origin || !await isCurrent()) return false;
+      if (currentAccount && this.principal.kind === 'account') {
+        const current = await currentAccount();
+        if (!current || !Buffer.from(loadUsageRecoveryKey(join(configuration.happyHomeDir, 'usage-spool'), usageRecoveryMaterial(current))).equals(Buffer.from(recoveryKey))) {
+          logger.warn('[USAGE] Recovery credential key changed without continuity; encrypted queues retained');
+          return false;
+        }
+        credential = current;
+        headers.Authorization = `Bearer ${current.token}`;
+      }
+      return true;
+    };
+    const sessionKey = (raw: any, sealedSession?: UsageRecoverySession): UsageRecoverySession | null => {
+      const encryption = credential.encryption;
+      if (!raw || typeof raw.id !== 'string') return null;
+      if (!raw.dataEncryptionKey) return encryption.type === 'legacy'
+        ? { sessionId: raw.id, key: encryption.secret, variant: 'legacy' } : null;
+      const candidate = sealedSession ?? localSession(raw.id);
+      if (candidate && candidate.sessionId === raw.id && candidate.variant === 'dataKey' && candidate.key.length === 32
+        && typeof raw.metadata === 'string' && decrypt(candidate.key, 'dataKey', decodeBase64(raw.metadata)) !== null) return candidate;
+      // CLI credentials have only the account PUBLIC key. They cannot unwrap historic account
+      // envelopes. Those queues stay pending unless a recoverable manifest supplies the key.
+      return null;
+    };
+    const worker = new ProviderUsageRecovery({
+      root: join(configuration.happyHomeDir, 'usage-spool'), server, recoveryKey, batchSize: 10,
+      resolve: async (id, sealedSession) => {
+        if (!await allowed()) return null;
+        const response = await axios.post(`${server}/v2/sessions/lookup`, { ids: [id] }, { headers, timeout: 10000, maxRedirects: 0 });
+        const rows = response.data?.sessions;
+        if (!Array.isArray(rows) || rows.length !== 1 || rows[0].id !== id) return null;
+        return sessionKey(rows[0], sealedSession);
+      },
+      legacyPage: async () => {
+        if (!await allowed()) throw new Error('credentials unavailable');
+        const response = await axios.get(`${server}/v2/sessions`, { params: { limit: 20, ...(cursor ? { cursor } : {}) }, headers, timeout: 10000, maxRedirects: 0 });
+        if (!Array.isArray(response.data?.sessions)) throw new Error('invalid session page');
+        cursor = response.data.hasNext && typeof response.data.nextCursor === 'string' ? response.data.nextCursor : undefined;
+        return { sessions: response.data.sessions.slice(0, 20).map((row: unknown) => sessionKey(row)).filter((s: UsageRecoverySession | null): s is UsageRecoverySession => s !== null), done: !response.data.hasNext };
+      },
+      send: async event => {
+        if (!await allowed()) return false;
+        ProviderUsageEventV1Schema.parse(event);
+        return new Promise<boolean>(resolve => {
+          const socket = io(server, { path: '/v1/updates', auth: { token: credential.token, clientType: 'session-scoped', sessionId: event.sessionId },
+            transports: ['websocket'], reconnection: false, autoConnect: false });
+          let done = false;
+          const finish = (success: boolean) => { if (done) return; done = true; clearTimeout(timer); cancel.delete(abort); socket.disconnect(); resolve(success); };
+          const abort = () => finish(false);
+          const timer = setTimeout(abort, 10000);
+          cancel.add(abort);
+          socket.once('connect_error', abort);
+          socket.once('disconnect', abort);
+          socket.once('connect', () => socket.emit('provider-usage-report', event, (ack: unknown) => finish(
+            typeof ack === 'object' && ack !== null && 'success' in ack && ack.success === true)));
+          socket.connect();
+        });
+      },
+    });
+    worker.start();
+    return async () => { stopped = true; for (const abort of cancel) abort(); await worker.stop(); };
+  }
+
+  /** Called only by the daemon after validating a parent-signed managed launch envelope. */
+  provisionManagedUsageRecovery(input: { sessionId: string; key: Uint8Array; serverOrigin: string }): void {
+    if (this.principal.kind !== 'managed-machine' || input.key.length !== 32
+      || new URL(input.serverOrigin).origin !== new URL(configuration.serverUrl).origin) throw new Error('managed usage recovery scope mismatch');
+    new ProviderUsageSpool({ root: this.principal.usageRecoveryRoot ?? join(configuration.happyHomeDir, 'usage-spool'), server: configuration.serverUrl,
+      sessionId: input.sessionId, key: input.key, variant: 'dataKey', recoveryKey: this.usageRecoveryKey() }).provisionRecovery();
+  }
+
+  private usageSpool(session: Session): ProviderUsageSpool {
+    if (this.principal.kind === 'managed-machine') throw new Error('machine credentials cannot deliver session usage');
+    return new ProviderUsageSpool({
+      root: this.principal.kind === 'managed-session' ? MANAGED_USAGE_SPOOL_ROOT : join(configuration.happyHomeDir, 'usage-spool'),
+      publicCiphertext: this.principal.kind === 'managed-session', server: configuration.serverUrl,
+      sessionId: session.id, key: session.encryptionKey, variant: session.encryptionVariant, recoveryKey: this.usageRecoveryKey(),
+    });
+  }
+
   sessionSyncClient(session: Session, options: ApiSessionClientOptions = {}): ApiSessionClient {
     if (this.principal.kind === 'managed-session') {
       if (options.trackShutdownStorage) throw new Error('Standalone storage tracking is not a managed runtime capability');
@@ -703,6 +854,7 @@ export class ApiClient {
       // followed and which origin may see this bearer.
       return new ApiSessionClient(
         this.principal.attachment.scopedToken, session, this.principal.attachment.managed,
+        { providerUsageStore: this.usageSpool(session) },
       );
     }
     // The session id is confirmed exactly here for every flavor (claude, codex,
@@ -712,7 +864,7 @@ export class ApiClient {
     // (specs/desktop-issue-pr-session-link R2). The confirmed current id wins
     // over stale values inherited from a parent or an earlier resume process.
     applySessionUrlEnv(process.env, session.id, configuration.webappUrl);
-    return new ApiSessionClient(this.bearer(), session, undefined, options);
+    return new ApiSessionClient(this.bearer(), session, undefined, { ...options, providerUsageStore: this.usageSpool(session) });
   }
 
   machineSyncClient(machine: Machine, deviceKeys?: DeviceKeys, deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>, processState?: DaemonState,

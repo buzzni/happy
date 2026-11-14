@@ -384,6 +384,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 logMessage as Parameters<typeof session.client.sendClaudeSessionMessage>[0],
                 undefined,
                 observedAiAuthByLogMessage.get(logMessage as object),
+                // An SDK message is handed over before its response ends; `onStreamEvent` brings the final usage.
+                'streaming',
             ),
         // Late-bound: the queue needs the target, and the wiring needs the queue.
         bindChannelPermission: (permissionId, toolName, instanceSeq) =>
@@ -712,6 +714,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     }
 
     function onMessage(message: SDKMessage) {
+        if (message.type === 'system' && message.subtype === 'task_notification') void session.client.reconcileClaudeTranscriptUsage?.();
         if (process.env.HAPPY_CLAUDE_OWNER_IDENTITY && isClaudeAuthenticationFailure(message)) {
             session.client.sendSessionEvent({ type: 'message', message: 'Claude error: [CLAUDE_OWNER_REFRESH_REQUIRED] Check the source PC.', isError: true });
             // Keep the provider lifecycle event, but suppress local-login recovery for an owner-managed account.
@@ -1741,9 +1744,11 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     claudeEnvVars: session.claudeEnvVars,
                     claudeArgs: session.claudeArgs,
                     onMessage,
+                    onUsageTranscriptLocation: (projectDir, nativeId) => session.client.setClaudeUsageTranscript?.(projectDir, nativeId),
                     onAiAuthObservationReady: (observation) => { aiAuthObservation = observation; },
                     onStreamEvent: (message) => {
                         transientRetry.observe(message);
+                        session.client.noteClaudeStreamEvent?.(message);
                         streamRelay.handleStreamEvent(message);
                     },
                     onTurnLatency: (diagnostic) => session.client.sendTurnLatency(diagnostic),
@@ -1910,6 +1915,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 // Flush any remaining messages in the queue
                 logger.debug('[remote]: flushing message queue');
                 await messageQueue.flush();
+                await session.client.finishClaudeUsageExecution?.();
                 messageQueue.destroy();
                 logger.debug('[remote]: message queue flushed');
                 if (capacityRestartWanted) {

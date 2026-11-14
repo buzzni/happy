@@ -1,3 +1,4 @@
+import { prepareManagedUsageSpool, ManagedUsageSpoolCleanup } from '@/usage/managedUsageSpool';
 /**
  * specs/managed-cloud-byos §5.36 — the root boot stage of a managed runtime.
  *
@@ -1239,6 +1240,7 @@ export function defaultManagedRuntimeBootDeps(
                         : `[managed] checkpoint consumer armed at ${intervalMs}ms`);
                 },
             });
+            prepareManagedUsageSpool();
             const composition = defaultManagedRunConfig({
                 identity,
                 /*
@@ -1385,12 +1387,23 @@ export function defaultManagedRuntimeBootDeps(
              * 에 넘긴 **그** 객체이고, 게이트가 관측하는 drain 은 그 합성이 만든
              * 바로 그 drain 이다.
              */
-            ownership.registerRuntime({ stop: () => runtime.stop() });
+            const usageCleanup = new ManagedUsageSpoolCleanup({
+                privateRoot: join(managedDaemonStateDir(identity.stateDir), 'usage-spool'),
+                daemonUid: lstatSync(managedDaemonStateDir(identity.stateDir)).uid,
+                providerUid: identity.isolation.provider.uid,
+                warn: () => logger.warn('[USAGE] Managed acknowledged spool cleanup deferred; files retained'),
+            });
+            ownership.registerRuntime({ stop: async () => {
+                const outcome = await runtime.stop();
+                if (outcome.stopped) usageCleanup.stop();
+                return outcome;
+            } });
             checkpointTicks = await checkpointing.startAfterSupervisor({
                 runtime,
                 checkpoint: composition.checkpoint,
                 schedule: identity.checkpointSchedule,
             });
+            usageCleanup.start();
             return {
                 token: runtime.token,
                 checkpointTicks,

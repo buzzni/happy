@@ -97,7 +97,10 @@ describe('ApiSessionClient context-usage frames', () => {
             connect: vi.fn(),
             on: vi.fn((event: string, handler: (...args: any[]) => void) => { (handlers[event] ??= []).push(handler); }),
             off: vi.fn(),
-            emit: vi.fn(),
+            // A server that stores every usage event: `close` waits, bounded, for an answer it is still owed.
+            emit: vi.fn((event: string, _data: unknown, ack?: (error: Error | null, response?: unknown) => void) => {
+                if (event === 'provider-usage-report') ack?.(null, { success: true });
+            }),
             timeout: vi.fn(function (this: unknown) { return this; }),
             emitWithAck: vi.fn(async () => ({ result: 'error' })),
             volatile: { emit: vi.fn() },
