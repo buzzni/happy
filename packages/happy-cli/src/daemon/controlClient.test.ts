@@ -1,3 +1,4 @@
+import * as scopeReports from './sessionWriteScopeReports'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DaemonLocallyPersistedState } from '@/persistence'
@@ -24,7 +25,7 @@ vi.mock('@/ui/logger', () => ({
   logger: { debug: mocks.mockLoggerDebug },
 }))
 
-import { checkIfDaemonRunningAndCleanupStaleState, requestSetupTokenCapacity, requestSetupTokenRebind, requestSetupTokenStart, stopDaemon } from './controlClient'
+import { notifyDaemonSessionRuntime, checkIfDaemonRunningAndCleanupStaleState, requestSetupTokenCapacity, requestSetupTokenRebind, requestSetupTokenStart, stopDaemon } from './controlClient'
 
 const DEAD_PID = 3058947
 const HTTP_PORT = 33417
@@ -322,3 +323,38 @@ it('waits for the daemon to report a Studio that never answered instead of calli
     await expect(requestSetupTokenCapacity('s', 'binding', 'reserve', actor, 'runtime')).rejects.toThrow('CAPACITY_STUDIO_TIMEOUT')
   } finally { fetchSpy.mockRestore(); timeoutSpy.mockRestore() }
 })
+
+
+describe('protected runtime report freshness', () => {
+  it.each(['SCOPE_REPORT_AUTH_REQUIRED', 'MANAGED_LAUNCH_SCOPE_REQUIRED'] as const)('only re-signs a definitive scope report refusal: %s', async code => {
+    const state = stateWithPid(process.pid);
+    mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state, raw: JSON.stringify(state) });
+    vi.stubEnv('HAPPY_WRITE_SCOPE_SESSION', '1');
+    let sequence = 0;
+    const signer = vi.spyOn(scopeReports, 'initializeScopeReportSigner').mockResolvedValue(() => `signed-${++sequence}`);
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code }), { status: 403 }))
+      .mockResolvedValue(new Response(JSON.stringify({ status: 'ok' }), { status: 200 }));
+    try {
+      const result = await notifyDaemonSessionRuntime('session', { reportSeq: 4, thinking: false });
+      expect(fetchSpy).toHaveBeenCalledTimes(code === 'SCOPE_REPORT_AUTH_REQUIRED' ? 2 : 1);
+      if (code === 'SCOPE_REPORT_AUTH_REQUIRED') {
+        expect(result).toEqual({ status: 'ok' });
+        expect(fetchSpy.mock.calls[0][1]?.body).toBe(fetchSpy.mock.calls[1][1]?.body);
+        expect(fetchSpy.mock.calls[0][1]?.headers).not.toEqual(fetchSpy.mock.calls[1][1]?.headers);
+      }
+    } finally { signer.mockRestore(); fetchSpy.mockRestore(); vi.unstubAllEnvs(); }
+  });
+  it('bounds rejection retries and never retries an unknown transport outcome', async () => {
+    const state = stateWithPid(process.pid);
+    mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state, raw: JSON.stringify(state) });
+    vi.stubEnv('HAPPY_WRITE_SCOPE_SESSION', '1');
+    const signer = vi.spyOn(scopeReports, 'initializeScopeReportSigner').mockResolvedValue(() => 'signed');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify({ code: 'SCOPE_REPORT_AUTH_REQUIRED' }), { status: 403 }));
+    try {
+      await notifyDaemonSessionRuntime('session', { thinking: false }); expect(fetchSpy).toHaveBeenCalledTimes(2);
+      fetchSpy.mockClear().mockRejectedValue(new Error('timeout'));
+      await notifyDaemonSessionRuntime('session', { thinking: false }); expect(fetchSpy).toHaveBeenCalledOnce();
+    } finally { signer.mockRestore(); fetchSpy.mockRestore(); vi.unstubAllEnvs(); }
+  });
+});

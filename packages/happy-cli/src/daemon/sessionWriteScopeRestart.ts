@@ -1,4 +1,5 @@
 import { scopeErrorCode } from './sessionWriteScopeErrors';
+import { MessageMetaSchema, type Metadata } from '@/api/types';
 import type { ChildProcess } from 'node:child_process';
 import { homedir } from 'node:os';
 import { isAbsolute, resolve } from 'node:path';
@@ -67,4 +68,16 @@ export async function confirmScopeProfile(child: ChildProcess | undefined, confi
   });
   try { return await Promise.race([confirmation, exit]); }
   finally { child.removeListener('exit', exited); }
+}
+
+/** Use the old runtime's published selection, never a guessed UI value or a new permission. */
+export function scopeResumeSelection(metadata: Pick<Metadata, 'permissionMode' | 'currentModelCode' | 'currentThoughtLevelCode'>): {
+  args: string[]; environment: Record<string, string>;
+} {
+  const mode = MessageMetaSchema.shape.permissionMode.safeParse(metadata.permissionMode);
+  if (!mode.success) throw new Error('SCOPE_RESUME_FAILED');
+  const pin = (value: unknown) => typeof value === 'string' && value.trim() && value.length <= 256
+    && !/[\x00-\x1f\x7f]/.test(value) ? value : '';
+  return { args: mode.data ? ['--permission-mode', mode.data] : [],
+    environment: { HAPPY_INITIAL_MODEL: pin(metadata.currentModelCode), HAPPY_INITIAL_EFFORT: pin(metadata.currentThoughtLevelCode) } };
 }

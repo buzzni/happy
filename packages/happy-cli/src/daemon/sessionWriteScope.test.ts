@@ -8,18 +8,19 @@ function fixture(readiness?: () => string | undefined) {
   const apply = vi.fn(async () => ({ profileApplied: true, cleanup: 'unresolved' as const }));
   const canonicalize = vi.fn(async (path: string) => ({ requestedPath: path, root: path, identity: 'dev:ino', floor: ['/protected'] }));
   const changed = vi.fn(async (_requests: ScopeRequest[]) => {});
+  const requested = vi.fn(); const applied = vi.fn();
   const broker = new SessionWriteScopeBroker({
     publicKey: keys.publicKey, machineId: 'machine', accountId: 'account', incarnation: 'launch',
     now: () => now, resolveSession: async (sessionId) => sessionId === 'session'
       ? { projectRoot: '/project', generation } : null,
-    canonicalize, apply, changed, readiness,
+    canonicalize, apply, changed, readiness, requested, applied,
   });
   const decide = (request: ScopeRequest, action: ScopeDecision['action'] = 'allow', privateKey = keys.privateKey) => {
     const decision: ScopeDecision = { version: 1, requestId: request.id, digest: request.digest, incarnation: 'launch',
       accountId: 'account', machineId: 'machine', sessionId: 'session', action };
     return { decision, signature: sign(null, decisionBytes(decision), privateKey).toString('base64url') };
   };
-  return { broker, apply, decide, canonicalize, changed, advance: (ms = 600001) => { now += ms; }, setGeneration: (value: string) => { generation = value; } };
+  return { broker, apply, requested, applied, decide, canonicalize, changed, advance: (ms = 600001) => { now += ms; }, setGeneration: (value: string) => { generation = value; } };
 }
 
 describe('session write scope approval authority', () => {
@@ -305,4 +306,42 @@ describe('session write scope approval authority', () => {
     ]));
   });
 
+});
+
+
+describe('scope continuation admission', () => {
+  it('notifies only after the applied grant is durably stored, once for duplicate decisions', async () => {
+    const f = fixture(() => undefined);
+    const request = await f.broker.request('session', '/target', 'Install');
+    expect(f.requested).toHaveBeenCalledWith(expect.objectContaining({ id: request.id }));
+    f.applied.mockImplementation(() => {
+      expect(f.changed.mock.calls.at(-1)![0][0]).toMatchObject({ profileApplied: true, grantActive: true });
+    });
+    await f.broker.decide(f.decide(request)); await f.broker.flush();
+    await f.broker.decide(f.decide(request)); await f.broker.flush();
+    expect(f.applied).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: request.id, grantActive: true }));
+  });
+  it('never notifies on profile failure, revocation, cancellation or project-local choice', async () => {
+    for (const action of ['cancel', 'project'] as const) {
+      const f = fixture(); const request = await f.broker.request('session', '/target', 'Install');
+      await f.broker.decide(f.decide(request, action)); expect(f.applied).not.toHaveBeenCalled();
+    }
+    const f = fixture(); f.apply.mockResolvedValueOnce({ profileApplied: false, cleanup: 'unresolved' });
+    const failed = await f.broker.request('session', '/failed', 'Install');
+    await f.broker.decide(f.decide(failed)); expect(f.applied).not.toHaveBeenCalled();
+    const grant = await f.broker.request('session', '/target', 'Install');
+    await f.broker.decide(f.decide(grant)); f.applied.mockClear();
+    const revoke = await f.broker.request('session', '/target', 'Revoke', 'revoke');
+    await f.broker.decide(f.decide(revoke)); expect(f.applied).not.toHaveBeenCalled();
+  });
+  it('does not notify when result storage fails and notification failure never reapplies', async () => {
+    const f = fixture(); const request = await f.broker.request('session', '/target', 'Install');
+    f.changed.mockImplementation(async requests => { if (requests.some(r => r.profileApplied)) throw new Error('disk'); });
+    await expect(f.broker.decide(f.decide(request))).rejects.toThrow('SCOPE_JOURNAL_FAILED');
+    expect(f.applied).not.toHaveBeenCalled();
+    const g = fixture(); const next = await g.broker.request('session', '/target', 'Install');
+    g.applied.mockImplementation(() => { throw new Error('notification'); });
+    expect(await g.broker.decide(g.decide(next))).toMatchObject({ profileApplied: true });
+    expect(g.apply).toHaveBeenCalledOnce();
+  });
 });
