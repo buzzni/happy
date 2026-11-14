@@ -80,6 +80,16 @@ jobs:
         src/daemon/sessionRetentionControl.test.ts
         src/daemon/sessionIdleReaper.test.ts
 
+    - name: Verify Claude account switches preserve queued input
+      if: matrix.node-version == 24
+      timeout-minutes: 5
+      run: >-
+        pnpm --filter @buzzni/happy-cli exec vitest run --project unit
+        src/claude/claudeRemoteLauncher.oauthSwitch.test.ts
+        src/claude/claudeRemoteLauncher.setupTokenSwitch.test.ts
+        src/claude/aiAuthObservation.test.ts
+        src/utils/MessageQueue2.test.ts
+
     - name: Verify terminals survive a daemon restart (terminal workers)
       timeout-minutes: 5
       run: >-

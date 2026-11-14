@@ -1368,6 +1368,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                          * the two never both go out.
                          */
                         let msg: Awaited<ReturnType<typeof session.queue.waitForMessagesAndGetAsString>>;
+                        const accountBeforeDequeue: { current: LiveOauthAccount | null } = { current: null };
                         /** The organization ceiling clipped this batch's mode. */
                         let orgClamped = false;
                         while (true) {
@@ -1381,6 +1382,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             msg = await session.queue.waitForMessagesAndGetAsString(
                                 AbortSignal.any([controller.signal, generationEnded.signal, ...wakes]),
                                 drain ? () => drain.claimTurn() : undefined,
+                                async () => {
+                                    // Keep input in the queue while reading: a local-mode switch or
+                                    // provider exit during this await must not lose an uncommitted batch.
+                                    accountBeforeDequeue.current = await readAmbientAccount();
+                                    return true;
+                                },
                             );
                             if (!msg && personalWake?.aborted && !controller.signal.aborted && providerStale()) return null;
                             // The member took another account (a stale provider) or asked to resend a first turn (pending).
@@ -1518,8 +1525,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             }
                         }
                         if (msg) {
-                            const liveAccount = await readAmbientAccount();
-                            if (controller.signal.aborted) return null;
+                            const liveAccount = accountBeforeDequeue.current;
                             if (providerOauthAccount && liveAccount && (
                                 providerOauthAccount.email !== liveAccount.email
                                 || providerOauthAccount.organizationUuid !== liveAccount.organizationUuid

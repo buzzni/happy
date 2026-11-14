@@ -18,22 +18,28 @@ afterEach(() => vi.clearAllMocks());
 
 const first: LiveOauthAccount = { email: 'first@example.test', organizationUuid: 'org-1', organizationName: 'Org' };
 
-async function runSwitch(next: LiveOauthAccount | null, managedRun = false) {
+async function runSwitch(next: LiveOauthAccount | null, switchDuringRead = false) {
     let live: LiveOauthAccount | null = first;
-    vi.mocked(readLiveOauthAccount).mockImplementation(async () => live);
+    vi.mocked(readLiveOauthAccount).mockImplementation(async () => {
+        if (switchDuringRead && live === next) void handlers.get('switch')!();
+        return live;
+    });
     const queue = new MessageQueue2<EnhancedMode>(hashObject);
     const handlers = new Map<string, () => Promise<unknown>>();
-    const generations: Array<{ resume?: string; prompts: string[] }> = [];
+    const generations: Array<{ resume?: string; model?: string; prompts: string[] }> = [];
+    const onModeApplied = vi.fn();
+    const attachment = { name: 'pixel.png', mimeType: 'image/png', data: new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]) };
     const client = {
         sessionId: 'oauth-switch-test',
         rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
-        updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+        setClaudeRuntimeAccount: vi.fn(), noteContextUsageSignal: vi.fn(),
+        failClaudeLaunchTurn: vi.fn(), updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
         sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
         setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
         applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
     };
     vi.mocked(query).mockImplementation(({ prompt, options }) => {
-        const generation = { resume: options?.resume, prompts: [] as string[] };
+        const generation = { resume: options?.resume, model: options?.model, prompts: [] as string[] };
         generations.push(generation);
         const response = (async function* () {
             for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
@@ -45,7 +51,7 @@ async function runSwitch(next: LiveOauthAccount | null, managedRun = false) {
                     // Switch while the old provider is waiting; keep model and effort identical.
                     setTimeout(() => {
                         live = next;
-                        queue.push('retry on selected account', { permissionMode: 'default', model: 'claude-sonnet-5' });
+                        queue.push('retry on selected account', { permissionMode: 'default', model: 'claude-sonnet-5' }, [attachment], ['request-2']);
                     }, 10);
                 } else {
                     void handlers.get('switch')!();
@@ -55,14 +61,14 @@ async function runSwitch(next: LiveOauthAccount | null, managedRun = false) {
         })();
         return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
     });
-    queue.push('original request', { permissionMode: 'default', model: 'claude-sonnet-5' });
+    queue.push('original request', { permissionMode: 'default', model: 'claude-sonnet-5' }, undefined, ['request-1']);
     await claudeRemoteLauncher({
         lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
         cancelLessonReview: vi.fn(), sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
         api: { push: () => ({ sendSessionNotification: vi.fn() }) },
-        consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), managedRun,
+        consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onModeApplied,
     } as unknown as Session);
-    return generations;
+    return { generations, queue, onModeApplied };
 }
 
 describe('ambient Claude account switching without a model change', () => {
@@ -70,14 +76,27 @@ describe('ambient Claude account switching without a model change', () => {
         { ...first, email: 'second@example.test' },
         { ...first, organizationUuid: 'org-2' },
     ])('resumes on a fresh provider after identity changes: %j', async next => {
-        const generations = await runSwitch(next);
+        const { generations, onModeApplied } = await runSwitch(next);
         expect(generations).toHaveLength(2);
         expect(generations[0].prompts).toHaveLength(1);
         expect(generations[1].resume).toBe('claude-1');
         expect(generations[1].prompts).toHaveLength(1);
         expect(generations[1].prompts[0]).toContain('retry on selected account');
+        expect(generations[1].prompts[0]).toContain('image/png');
+        expect(generations[1].prompts[0]).toContain('iVBORw0KGgo=');
+        expect(generations.map(g => g.model)).toEqual(['claude-sonnet-5', 'claude-sonnet-5']);
+        expect(onModeApplied.mock.calls.map(([ids]) => ids)).toEqual([['request-1'], ['request-2']]);
+    });
+    it('keeps unsubmitted input queued when switching to local mode during the account read', async () => {
+        const { generations, queue } = await runSwitch({ ...first, email: 'second@example.test' }, true);
+        expect(generations).toHaveLength(1);
+        expect(generations[0].prompts).toHaveLength(1);
+        expect(queue.size()).toBe(1);
+        expect(queue.queue[0].message).toBe('retry on selected account');
+        expect(queue.queue[0].requestIds).toEqual(['request-2']);
+        expect(queue.queue[0].attachments?.[0].name).toBe('pixel.png');
     });
     it.each([first, null])('keeps the provider when identity is unchanged or unavailable: %j', async next => {
-        expect(await runSwitch(next)).toHaveLength(1);
+        expect((await runSwitch(next)).generations).toHaveLength(1);
     });
 });
