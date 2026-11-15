@@ -135,6 +135,7 @@ export function createClaudeOrgRequirements(gate: OrgRequirementsGate, deps: {
 }): ClaudeOrgRequirements {
     return {
         checkTurn: (mode) => {
+            if (process.env.HAPPY_AI_AUTH_SOURCE === 'personal-endpoint' && gate.restrictsModels()) return { kind: 'refuse', message: 'PERSONAL_ENDPOINT_POLICY_DENIED' };
             const verdict = gate.checkTurn({
                 permissionMode: mode.permissionMode,
                 model: mode.orgModel?.requested ?? null,

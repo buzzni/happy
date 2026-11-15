@@ -2912,6 +2912,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   }
 
   async function sessionEnvironment(agent: string | undefined, selection?: AiAuthSelection, recorded?: SetupTokenBinding): Promise<Record<string, string>> {
+    if (selection?.kind === 'personal-endpoint') throw new AiCredentialRuntimeError('PERSONAL_ENDPOINT_RUNTIME_REQUIRES_BROKER')
     if (selection?.kind === 'org-endpoint') return orgLlmEndpointSessionEnvironment(agent, selection)
     if (selection?.kind === 'claude-setup-token') return serializeLaunch('prepare', () => withSafeErrors('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE',
       () => setupTokenSessionEnvironment(agent, selection, recorded)))
@@ -3074,7 +3075,8 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       try { collector = await collectorVerificationReady(origin) } catch {}
     }
     // claudeRefreshOwnerVersion: this daemon brings claude-swap up to the owner contract before any owner operation.
-    return { version: 1, codexRecoveryVersion: 1, codexRefreshOwnerVersion: 1, claudeRefreshOwnerVersion: 1, orgLlmEndpointVersion: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1, collectorMachinePrincipalVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, setupTokenResumeRequirementVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
+    return { version: 1, codexRecoveryVersion: 1, codexRefreshOwnerVersion: 1, claudeRefreshOwnerVersion: 1, orgLlmEndpointVersion: 1, personalLlmEndpointVersion: 1, credentialDeliveryVersion: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1, collectorMachinePrincipalVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, setupTokenResumeRequirementVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
+
     // Managed setup-token import with metadata verification, only on the marked cswap token runtime.
     ...(setupToken ? { setupTokenVersion: 1, setupTokenStatusVersion: 1 } : {}),
     // Advertised only when a server-signed binding proof can actually be verified here.

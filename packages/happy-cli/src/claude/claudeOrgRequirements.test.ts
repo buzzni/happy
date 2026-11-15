@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createOrgRequirementsGate, type OrgRequirementsGate } from '@/orgRequirements/gate';
 import type { TurnAttendance } from '@/api/turnAttendance';
 import { createClaudeOrgRequirements, orgTitleModel, stripModelSelectionEnv } from './claudeOrgRequirements';
@@ -55,6 +55,14 @@ describe('Claude runner adapter of the organization gate', () => {
         // Nothing to add: the batch's own mode, unchanged.
         const input = mode({ disallowedTools: ['mcp__gmail', 'mcp__github__delete_repo'] });
         expect(adapter().checkTurn(input)).toEqual({ kind: 'run', mode: input, modeClamped: false });
+    });
+
+    it('rejects a personal endpoint under a restricted model policy even when the remote Claude alias is allowed', () => {
+        vi.stubEnv('HAPPY_AI_AUTH_SOURCE', 'personal-endpoint');
+        try {
+            gate.onRequirements({ kind: 'response', status: 'ok', requirements: doc({ 'ai.models': { kind: 'allowedSet', values: ['claude:claude-sonnet-5-5'], default: null, source: 'organization' } }) });
+            expect(adapter().checkTurn(mode({ orgModel: { requested: 'claude-sonnet-5-5', origin: 'explicit' } }))).toMatchObject({ kind: 'refuse' });
+        } finally { vi.unstubAllEnvs(); }
     });
 
     it('refuses a batch whose explicit model is outside the set', () => {

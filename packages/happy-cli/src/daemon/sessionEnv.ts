@@ -1,3 +1,4 @@
+import { parsePersonalEndpointSelection, PERSONAL_ENDPOINT_BINDING_ENV, PERSONAL_ENDPOINT_LEASE_ENV, personalEndpointMarker, type PersonalEndpointSelection } from './personalLlmEndpoint'
 import { manualPersonalSelectionSchema, MANUAL_PERSONAL_ENV, type ManualPersonalSelection } from './manualPersonalClaude'
 import { MachineSetupTokenBindingV2Schema, parseCanonicalOrgSetupTokenJson, type MachineSetupTokenBindingV2 } from '@slopus/happy-wire'
 import { randomBytes } from 'node:crypto'
@@ -69,7 +70,7 @@ export const BROWSER_CONTINUATION_ENV = 'HAPPY_AUTOMATION_BROWSER_CONTINUATION'
  */
 const AGENT_PLAN_SEED_KEYS = [AGENT_PLAN_DESCRIPTOR_ENV, AGENT_PLAN_SECRET_ENV, AGENT_PLAN_THREADS_DIR_ENV] as const
 type AgentPlanSeedKey = typeof AGENT_PLAN_SEED_KEYS[number]
-type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | typeof ORG_ENDPOINT_BINDING_ENV | typeof ORG_ENDPOINT_UNREPORTED_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof APPROVED_WRITE_ROOTS_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV | AgentPlanSeedKey
+type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | typeof ORG_ENDPOINT_BINDING_ENV | typeof PERSONAL_ENDPOINT_BINDING_ENV | typeof PERSONAL_ENDPOINT_LEASE_ENV | typeof ORG_ENDPOINT_UNREPORTED_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof APPROVED_WRITE_ROOTS_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV | AgentPlanSeedKey
 
 export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey | typeof DAEMON_AGENT_GRANT_STATE_ENV, string>>
 
@@ -350,6 +351,9 @@ export function captureSaycodeAgentEnvironment(
     // path. Keep no corrupt bytes; the resume guard rejects this bounded marker.
     if (binding !== undefined) captured[SETUP_TOKEN_BINDING_ENV] = parseSetupTokenBinding(binding) ? binding : ''
     // Same sentinel rule as the setup-token binding: a corrupt record stays bound-but-invalid and the resume refuses it.
+    if (env[PERSONAL_ENDPOINT_LEASE_ENV] && /^[\w-]{1,128}$/.test(env[PERSONAL_ENDPOINT_LEASE_ENV]!)) captured[PERSONAL_ENDPOINT_LEASE_ENV] = env[PERSONAL_ENDPOINT_LEASE_ENV]
+    const personalBinding = env[PERSONAL_ENDPOINT_BINDING_ENV]
+    if (personalBinding !== undefined) captured[PERSONAL_ENDPOINT_BINDING_ENV] = personalEndpointMarker(personalBinding) ? personalBinding : ''
     const orgEndpointBinding = env[ORG_ENDPOINT_BINDING_ENV]
     if (orgEndpointBinding !== undefined) captured[ORG_ENDPOINT_BINDING_ENV] = parseOrgEndpointBinding(orgEndpointBinding) ? orgEndpointBinding : ''
     // An undelivered start report travels with the record until Studio has it (r3); any other value is dropped.
@@ -590,7 +594,7 @@ export function applyConfirmedPromptDeliveryFlag(
  * machine would have used anyway, which is the outcome the person was trying
  * to avoid by choosing.
  */
-export const AI_AUTH_SELECTION_KINDS = ['machine-personal', 'org-bundle', 'claude-setup-token', 'org-endpoint'] as const
+export const AI_AUTH_SELECTION_KINDS = ['machine-personal', 'org-bundle', 'claude-setup-token', 'org-endpoint', 'personal-endpoint'] as const
 
 export type AiAuthSelectionKind = (typeof AI_AUTH_SELECTION_KINDS)[number]
 
@@ -608,6 +612,7 @@ export type AiAuthSelection =
      * the server's order) against its locally stored entry. `resume` is daemon-internal — set only when a resume
      * rebuilds the recorded target — and never read from a request.
      */
+    | PersonalEndpointSelection
     | { kind: 'org-endpoint'; bindingId: string; endpointId: string; generation: number; candidates: string[]; resume?: true }
 
 /**
@@ -631,6 +636,7 @@ export function parseAiAuthSelection(value: unknown): AiAuthSelection | undefine
             `AI auth selection kind must be one of: ${AI_AUTH_SELECTION_KINDS.join(', ')}`,
         )
     }
+    if (kind === 'personal-endpoint') return parsePersonalEndpointSelection(value)
     if (kind === 'claude-setup-token') {
         const managedAccountId = (value as { managedAccountId?: unknown }).managedAccountId
         if (typeof managedAccountId !== 'string'
@@ -738,6 +744,7 @@ const DAEMON_APPLIED_AI_AUTH_SOURCES: readonly AiAuthSource[] = [
     'platform-glm',
     'platform-gateway',
     'org-endpoint',
+    'personal-endpoint',
 ]
 
 export type AiAuthSelectionVerdict = {
@@ -794,6 +801,7 @@ export function verifyAiAuthSelection(
 
 /** The applied source that would prove a selection was honoured. */
 function selectionAppliedSource(kind: AiAuthSelectionKind): AiAuthSource {
+    if (kind === 'personal-endpoint') return 'personal-endpoint'
     if (kind === 'org-endpoint') return 'org-endpoint'
     return kind === 'org-bundle' || kind === 'claude-setup-token' ? 'org-bundle' : 'personal-subscription'
 }
