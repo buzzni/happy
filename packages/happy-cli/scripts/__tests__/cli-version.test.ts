@@ -65,7 +65,7 @@ describe('happy daemon preflight', () => {
         expect(result.status, result.stderr).toBe(0)
         expect(existsSync(join(happyHome, 'daemon.state.json'))).toBe(false)
         expect(existsSync(join(happyHome, 'sessions.json'))).toBe(false)
-    })
+    }, 35_000) // Keep the test deadline above the subprocess's 30-second bound.
 })
 
 describe.each([
