@@ -39,6 +39,8 @@ import {
   serializeInvalidatedClaudeProvenance,
 } from './aiCredentialProvenance'
 import { SETUP_TOKEN_BINDING_ENV, SETUP_TOKEN_SHARED_ACCOUNT_ENV, formatSetupTokenBinding, overlayManagedCredentialEnvironment, type AiAuthSelection, type SetupTokenBinding, type MachineSetupTokenBindingRecord, isMachineSetupTokenBinding } from './sessionEnv'
+import { parseOrgLlmModelBinding } from './orgLlmModelBinding'
+import { formatOrgEndpointBinding, ORG_ENDPOINT_BINDING_ENV, parseOrgEndpointBinding } from './sessionEnv'
 import { readTrustedStudioOrigin, setupTokenCredentialMatches, type SetupTokenBindingVerifier } from './setupTokenBindingProof'
 import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS } from '@/claude/utils/claudeAuthOverrideEnv'
 import { setupTokenWindowUsedUp } from '@/claude/setupTokenUsageTracker'
@@ -2900,15 +2902,72 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
    * the candidates outside the credential queue: a probe can take seconds and must not hold group sync or other
    * launches behind it. Claude only; never a substitute credential.
    */
+  function orgLlmModelBindingSync(params:unknown) {
+    return withOrgLlmEndpointErrors('ORG_LLM_ENDPOINT_SYNC_FAILED',async()=>{
+      const binding=parseOrgLlmModelBinding(params)
+      if(binding.machineId!==deps.machineId) throw new OrgLlmEndpointError('ORG_LLM_ENDPOINT_BINDING_MISMATCH')
+      return serialize(async()=>{
+        const path=join(deps.homeDir,'.happy','org-llm-model-bindings',`${binding.bindingId}.json`)
+        try {
+          const old=await deps.readFile(path)
+          if(old!==JSON.stringify(params)) throw new OrgLlmEndpointError('ORG_LLM_ENDPOINT_SNAPSHOT_MISMATCH')
+        } catch(error) {if((error as {code?:string}).code!=='ENOENT') throw error}
+        const directory=join(deps.homeDir,'.happy','org-llm-model-bindings')
+        await deps.mkdir(directory,{recursive:true,mode:0o700})
+        const sameEndpoint:{name:string,generation:number}[]=[]
+        for(const name of await deps.readdir(directory)) {
+          if(!/^[A-Za-z0-9_-]{1,128}\.json$/.test(name) || name===`${binding.bindingId}.json`) continue
+          let old:ReturnType<typeof parseOrgLlmModelBinding>
+          try {old=parseOrgLlmModelBinding(JSON.parse(await deps.readFile(join(directory,name))))}
+          catch {deps.warn?.('org-llm-endpoint binding cleanup skipped an unreadable record');continue}
+          if(old.entry.companyId===binding.entry.companyId && old.entry.id===binding.entry.id) sameEndpoint.push({name,generation:old.entry.generation})
+        }
+        // As in orgLlmEndpointSync: a binding prepared before an admin change must not bring back a replaced token.
+        const stored=Math.max(...sameEndpoint.map(record=>record.generation))
+        if(binding.entry.generation<stored) throw new OrgLlmEndpointStaleGenerationError(stored)
+        await writeAtomicFile(deps,path,JSON.stringify(params))
+        for(const record of sameEndpoint) if(record.generation<binding.entry.generation) await deps.rm(join(directory,record.name),{force:true})
+        return {ok:true as const,bindingId:binding.bindingId,snapshotId:binding.snapshotId,selectedModel:binding.selectedModel}
+      })
+    })
+  }
+
   function orgLlmEndpointSessionEnvironment(agent: string | undefined, selection: Extract<AiAuthSelection, { kind: 'org-endpoint' }>) {
     if (agent !== undefined && agent !== 'claude') throw new AiCredentialRuntimeError('ORG_LLM_ENDPOINT_AGENT_UNSUPPORTED')
-    return withOrgLlmEndpointErrors('ORG_LLM_ENDPOINT_UNAVAILABLE', async () => resolveOrgLlmEndpointLaunch({
+    return withOrgLlmEndpointErrors('ORG_LLM_ENDPOINT_UNAVAILABLE', async () => {
+      if(selection.snapshotId) {
+        const raw=await deps.readFile(join(deps.homeDir,'.happy','org-llm-model-bindings',`${selection.bindingId}.json`))
+        const binding=parseOrgLlmModelBinding(JSON.parse(raw))
+        if(binding.snapshotId!==selection.snapshotId || binding.bindingId!==selection.bindingId || binding.entry.id!==selection.endpointId || binding.entry.generation!==selection.generation || binding.machineId!==deps.machineId) throw new OrgLlmEndpointError('ORG_LLM_ENDPOINT_SNAPSHOT_MISMATCH')
+        if(!selection.resume) {
+          const origin=readTrustedStudioOrigin(deps.env)
+          if(!origin) throw new OrgLlmEndpointError('ORG_LLM_ENDPOINT_UNAVAILABLE')
+          const response=await (deps.fetch ?? fetch)(`${origin}/api/org-llm-endpoints/daemon/start-authorize`,{method:'POST',redirect:'error',signal:AbortSignal.timeout(10000),headers:{Authorization:`Bearer ${binding.launchSecret}`,'Content-Type':'application/json'},body:JSON.stringify({bindingId:binding.bindingId,snapshotId:binding.snapshotId,machineId:binding.machineId,targetId:selection.candidates[0]})})
+          if(!response.ok) {
+            let code='ORG_LLM_ENDPOINT_UNAVAILABLE'
+            const reader=response.body?.getReader();let text=''
+            try {if(reader) for(;;){const part=await reader.read();if(part.done)break;text+=new TextDecoder().decode(part.value);if(text.length>4096)break}
+              if(text.length<=4096){const error=JSON.parse(text)?.error;const allowed=['ORG_LLM_ENDPOINT_MODEL_NOT_ALLOWED','ORG_LLM_ENDPOINT_CATALOG_AUTH_FAILED','ORG_LLM_ENDPOINT_CATALOG_RATE_LIMITED','ORG_LLM_ENDPOINT_CATALOG_UNAVAILABLE','ORG_LLM_ENDPOINT_CATALOG_INVALID'];if(allowed.includes(error))code=error}
+            } catch {} finally {await reader?.cancel().catch(()=>undefined)}
+            throw new OrgLlmEndpointError(code)
+          }
+          const result=await response.json() as {ok?:boolean}
+          if(result.ok!==true) throw new OrgLlmEndpointError('ORG_LLM_ENDPOINT_UNAVAILABLE')
+        }
+        const environment=await resolveOrgLlmEndpointLaunch({store:{version:1,endpoints:{[binding.entry.id]:binding.entry}},selection,probe:async()=>({ok:true})})
+        environment.CLAUDE_CODE_MAX_OUTPUT_TOKENS=String(binding.maxOutputTokens)
+        const marker=parseOrgEndpointBinding(environment[ORG_ENDPOINT_BINDING_ENV]!)!
+        environment[ORG_ENDPOINT_BINDING_ENV]=formatOrgEndpointBinding({...marker,snapshotId:binding.snapshotId,selectedModel:binding.selectedModel})
+        return environment
+      }
+      return resolveOrgLlmEndpointLaunch({
       store: await readOrgLlmEndpointStore(),
       selection,
       probe: ({ url, token }) => probeOrgLlmEndpointTarget({ fetch: deps.fetch ?? fetch, url, ...(token ? { token } : {}) }),
       // Target ids and a reason only: the address and the token stay out of the log.
       onProbeFailure: (targetId, reason) => deps.warn?.(`org-llm-endpoint target ${targetId} did not answer (${reason})`),
-    }))
+    })
+    })
   }
 
   async function sessionEnvironment(agent: string | undefined, selection?: AiAuthSelection, recorded?: SetupTokenBinding): Promise<Record<string, string>> {
@@ -3062,7 +3121,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (entries.length !== 1 || entries[0].pending) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_ASSIGNMENT_UNRESOLVED')
     return entries[0].scope
   })
-  return { orgLlmEndpointSync, sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, sharedMachineAccountEnvironment, sharedMachineStartProof, sharedMachineStartBudgetMove, measureWithPermit, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, refreshCodexOwner, refreshClaudeOwner, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
+  return { orgLlmModelBindingSync, orgLlmEndpointSync, sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, sharedMachineAccountEnvironment, sharedMachineStartProof, sharedMachineStartBudgetMove, measureWithPermit, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, refreshCodexOwner, refreshClaudeOwner, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
     // One fresh runtime observation per RPC: launching cswap repeatedly can block a secured Windows host.
     let stdout = ''
     try { stdout = (await deps.execFile('cswap', ['token-runtime', 'capabilities'], { maxOutputBytes: 64 * 1024, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })).stdout } catch {}
@@ -3074,7 +3133,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       try { collector = await collectorVerificationReady(origin) } catch {}
     }
     // claudeRefreshOwnerVersion: this daemon brings claude-swap up to the owner contract before any owner operation.
-    return { version: 1, codexRecoveryVersion: 1, codexRefreshOwnerVersion: 1, claudeRefreshOwnerVersion: 1, orgLlmEndpointVersion: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1, collectorMachinePrincipalVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, setupTokenResumeRequirementVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
+    return { version: 1, codexRecoveryVersion: 1, codexRefreshOwnerVersion: 1, claudeRefreshOwnerVersion: 1, orgLlmEndpointVersion: 1, orgLlmEndpointModelBindingVersion: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1, collectorMachinePrincipalVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, setupTokenResumeRequirementVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
     // Managed setup-token import with metadata verification, only on the marked cswap token runtime.
     ...(setupToken ? { setupTokenVersion: 1, setupTokenStatusVersion: 1 } : {}),
     // Advertised only when a server-signed binding proof can actually be verified here.

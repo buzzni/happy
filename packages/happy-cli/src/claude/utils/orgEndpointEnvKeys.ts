@@ -44,7 +44,8 @@ export const ORG_ENDPOINT_CLEARED_ENV_KEYS = [
     'BETA_TRACING_ENDPOINT',
 ] as const
 
-export const ORG_ENDPOINT_OWNED_ENV_KEYS: readonly string[] = [...ORG_ENDPOINT_VALUE_ENV_KEYS, ...ORG_ENDPOINT_CLEARED_ENV_KEYS]
+export const ORG_ENDPOINT_OPTIONAL_VALUE_ENV_KEYS = ['CLAUDE_CODE_MAX_OUTPUT_TOKENS'] as const
+export const ORG_ENDPOINT_OWNED_ENV_KEYS: readonly string[] = [...ORG_ENDPOINT_VALUE_ENV_KEYS, ...ORG_ENDPOINT_OPTIONAL_VALUE_ENV_KEYS, ...ORG_ENDPOINT_CLEARED_ENV_KEYS]
 
 /**
  * The transport the machine itself chose: its proxy and TLS trust. A project's settings file must not route the
@@ -70,7 +71,7 @@ export const ORG_ENDPOINT_MACHINE_ENV_KEYS = [
 export function orgEndpointRoutingSettingsEnv(env: Record<string, string | undefined>): Record<string, string> | undefined {
     if (!['org-endpoint', 'platform-plan', 'platform-plan-pending'].includes(env.HAPPY_AI_AUTH_SOURCE ?? '') || !env.ANTHROPIC_BASE_URL) return undefined
     const block: Record<string, string> = {}
-    for (const key of ORG_ENDPOINT_VALUE_ENV_KEYS) {
+    for (const key of [...ORG_ENDPOINT_VALUE_ENV_KEYS,...ORG_ENDPOINT_OPTIONAL_VALUE_ENV_KEYS]) {
         const value = env[key]
         if (key !== 'ANTHROPIC_AUTH_TOKEN' && value !== undefined) block[key] = value
     }

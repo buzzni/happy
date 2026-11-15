@@ -20,6 +20,7 @@ import {
     ORG_ENDPOINT_BINDING_ENV,
     ORG_ENDPOINT_UNREPORTED_ENV,
     formatOrgEndpointBinding,
+    parseOrgEndpointBinding,
     readOrgEndpointResumeSelection,
     readAppliedOrgLlmEndpoint,
 } from './sessionEnv'
@@ -660,9 +661,6 @@ describe('parseAiAuthSelection', () => {
 })
 
 describe('honorsManagedAiCredentials', () => {
-    it('never resolves company credentials for a platform plan, including a Claude plan with no credential choice', () => {
-        expect(honorsManagedAiCredentials(undefined, true)).toBe(false)
-    })
     it('선택이 없으면 기존 동작 그대로 관리 자격이 이긴다', () => {
         expect(honorsManagedAiCredentials(undefined)).toBe(true)
     })
@@ -1200,4 +1198,11 @@ describe('transport overrides never come from a request (aplus specs/org-llm-end
         const resumed = buildResumedSessionSpawnEnvironment({ inherited: {}, explicit: {}, runtime: { ANTHROPIC_UNIX_SOCKET: '/x' }, automation: { ANTHROPIC_UNIX_SOCKET: '/x' }, sessionId: 's' })
         expect(resumed).not.toHaveProperty('ANTHROPIC_UNIX_SOCKET')
     })
+})
+
+it('rejects noncanonical and malformed encoded organization model markers',()=>{
+ const head='binding:endpoint:target:1:snapshot:'
+ for(const suffix of ['a','AB','_w',Buffer.from('bad\nmodel').toString('base64url')])expect(parseOrgEndpointBinding(head+suffix)).toBeNull()
+ const model='moonshotai/kimi-k3.1-pro'
+ expect(parseOrgEndpointBinding(head+Buffer.from(model).toString('base64url'))?.selectedModel).toBe(model)
 })

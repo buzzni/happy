@@ -46,9 +46,9 @@ describe('agentPlan capability', () => {
     // aplus-dev-studio specs/agent-plan-full-capability R4 — the grant path no longer needs a named pipe: the token
     // travels through a 127.0.0.1 TCP proxy, which Windows has, so Windows daemons publish the plan too.
     it('is published on macOS, Linux and Windows daemons', () => {
-        expect(agentPlanCapabilityForPlatform('darwin')).toEqual({ version: 1, claude: 1 })
-        expect(agentPlanCapabilityForPlatform('linux')).toEqual({ version: 1, claude: 1 })
-        expect(agentPlanCapabilityForPlatform('win32')).toEqual({ version: 1, claude: 1 })
+        expect(agentPlanCapabilityForPlatform('darwin')).toEqual({ version: 1, claude: 1, claudeModels:['deepseek/deepseek-v4.1-flash-eco','moonshotai/kimi-k3.1-pro'] })
+        expect(agentPlanCapabilityForPlatform('linux')).toEqual({ version: 1, claude: 1, claudeModels:['deepseek/deepseek-v4.1-flash-eco','moonshotai/kimi-k3.1-pro'] })
+        expect(agentPlanCapabilityForPlatform('win32')).toEqual({ version: 1, claude: 1, claudeModels:['deepseek/deepseek-v4.1-flash-eco','moonshotai/kimi-k3.1-pro'] })
     })
 })
 

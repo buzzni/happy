@@ -14,7 +14,7 @@ import { orgEndpointRoutingSettingsEnv } from './utils/orgEndpointEnvKeys'
 const enabled = process.env.HAPPY_CLAUDE_AUTH_PIN_INTEGRATION === '1'
 let server: Server | undefined, q: Query | undefined, root: string | undefined
 let plan: Awaited<ReturnType<typeof startAgentPlanSession>> | undefined
-const model = 'deepseek/deepseek-v4.1-flash-eco'
+const models = ['deepseek/deepseek-v4.1-flash-eco','moonshotai/kimi-k3.1-pro'] as const
 afterEach(async () => {
     q?.close(); q = undefined
     await plan?.close(); plan = undefined
@@ -22,7 +22,7 @@ afterEach(async () => {
     if (root) rmSync(root, { recursive: true, force: true }); root = undefined
 })
 describe.skipIf(!enabled)('real SDK plan credential pin', () => {
-    it.each([200, 429, 503])('verifies project overrides and a single model attempt (status=%s)', async status => {
+    it.each(models.flatMap(model=>[200,429,503].map(status=>({model,status}))))('verifies project overrides and a single model attempt ($model, status=$status)', async ({model,status}) => {
         let calls = 0, wrongRoute = 0
         server = createServer(async (req, res) => {
             let text = ''; for await (const chunk of req) text += chunk
