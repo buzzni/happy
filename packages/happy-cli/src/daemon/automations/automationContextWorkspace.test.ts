@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createAutomationContextWorkspace } from './automationContextWorkspace'
@@ -84,6 +84,68 @@ test('releases a submitted manual owner only with tracking and all positive drai
   }
   expect(await manual.finish({ submitted: true, tracked: true }, finished)).toBe(true)
   expect(await setup().acquireAutomation({ runId: 'r1', roots: [directory] })).toMatchObject({ acquired: true })
+})
+
+test('bounds 600 manual launches without an exit observer while keeping their unknown writers fenced', async () => {
+  const workspace = setup()
+  for (let index = 0; index < 600; index++) {
+    const manual = await workspace.beginManualLaunch([directory])
+    if (!manual.acquired) throw new Error(`Manual launch ${index} refused: ${manual.reason}`)
+    await manual.retainUnconfirmed()
+    await manual.retainUnconfirmed() // A retried handoff cannot lose or duplicate custody.
+    expect(await manual.finish({ submitted: true, tracked: true }, finished)).toBe(false)
+  }
+  const saved = JSON.parse(await readFile(join(home, 'workspace-turn-admission.v1', 'owners.json'), 'utf8'))
+  expect(saved.owners).toEqual([expect.objectContaining({ kind: 'unfenced', roots: [await realpath(directory)] })])
+  expect(await workspace.acquireAutomation({ runId: 'blocked', roots: [directory] })).toMatchObject({ acquired: false })
+  const other = join(home, 'unrelated'); await mkdir(other)
+  expect(await workspace.acquireAutomation({ runId: 'unrelated', roots: [other] })).toMatchObject({ acquired: true })
+}, 90_000)
+
+test('does not manufacture unknown writers when a confirmed manual owner has already released', async () => {
+  const workspace = setup(), manual = await workspace.beginManualLaunch([directory])
+  if (!manual.acquired) throw new Error('Expected manual ownership')
+  expect(await manual.finish({ submitted: true, tracked: true }, finished)).toBe(true)
+  await manual.retainUnconfirmed()
+  expect(await workspace.acquireAutomation({ runId: 'after-confirmed-exit', roots: [directory] })).toMatchObject({ acquired: true })
+})
+
+test('serializes duplicate unknown writer handoffs for the same launch', async () => {
+  const workspace = setup(), manual = await workspace.beginManualLaunch([directory])
+  if (!manual.acquired) throw new Error('Expected manual ownership')
+  await expect(Promise.all([manual.retainUnconfirmed(), manual.retainUnconfirmed()])).resolves.toEqual([undefined, undefined])
+  const saved = JSON.parse(await readFile(join(home, 'workspace-turn-admission.v1', 'owners.json'), 'utf8'))
+  expect(saved.owners).toEqual([expect.objectContaining({ kind: 'unfenced' })])
+})
+
+test('does not reclassify or reject a handoff racing after a successful positive release', async () => {
+  const workspace = setup(), manual = await workspace.beginManualLaunch([directory])
+  if (!manual.acquired) throw new Error('Expected manual ownership')
+  await expect(Promise.all([manual.finish({ submitted: true, tracked: true }, finished), manual.retainUnconfirmed()]))
+    .resolves.toEqual([true, undefined])
+  expect(await workspace.acquireAutomation({ runId: 'after-release-race', roots: [directory] })).toMatchObject({ acquired: true })
+})
+
+test('preserves another manual launch awaiting positive proof when handing off the same folder', async () => {
+  const workspace = setup(), pending = await workspace.beginManualLaunch([directory]), terminal = await workspace.beginManualLaunch([directory])
+  if (!pending.acquired || !terminal.acquired) throw new Error('Expected both manual reservations')
+  const file = join(home, 'workspace-turn-admission.v1', 'owners.json'), original = JSON.parse(await readFile(file, 'utf8')).owners[0]
+  await terminal.retainUnconfirmed()
+  expect(JSON.parse(await readFile(file, 'utf8')).owners).toContainEqual(original)
+  expect(await pending.finish({ submitted: true, tracked: true }, finished)).toBe(true)
+  expect(await terminal.finish({ submitted: true, tracked: true }, finished)).toBe(false)
+  expect(await workspace.acquireAutomation({ runId: 'still-unknown', roots: [directory] })).toMatchObject({ acquired: false })
+})
+
+test('retains the original reservation if unknown writer handoff cannot observe a removed folder', async () => {
+  const workspace = setup(), manual = await workspace.beginManualLaunch([directory])
+  if (!manual.acquired) throw new Error('Expected manual ownership')
+  const file = join(home, 'workspace-turn-admission.v1', 'owners.json'), before = await readFile(file, 'utf8')
+  await rm(directory, { recursive: true })
+  await expect(manual.retainUnconfirmed()).rejects.toThrow('WORKSPACE_PROCESS_ROOT_UNCONFIRMED')
+  expect(await readFile(file, 'utf8')).toBe(before)
+  await mkdir(directory)
+  expect(await manual.finish({ submitted: true, tracked: true }, finished)).toBe(true)
 })
 
 test('keeps an unknown automatic owner across coordinator restart and permits an unrelated workspace', async () => {

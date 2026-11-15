@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createWorkspaceTurnAdmission } from './workspaceTurnAdmission';
 import * as module from './workspaceTurnAdmission';
@@ -150,6 +150,163 @@ test('holds the first automatic candidate after capacity broadens custody and pr
   expect(saved.owners).toHaveLength(2);
   expect(saved.owners.every((owner: any) => owner.kind === 'unfenced' && owner.roots.length === 1 && owner.roots[0] === '/')).toBe(true);
   expect(await admission('automation-run:after-reboot', 'automation', [other], 'another-proven-boot').tryAcquire())
+    .toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+});
+
+test('keeps launches available when exited controllers left manual reservations at capacity, retaining their custody', async () => {
+  const live = admission('live-manual', 'manual'); expect(await live.tryAcquire()).toEqual({ acquired: true });
+  const file = join(home, 'workspace-turn-admission.v1', 'owners.json');
+  const registry = JSON.parse(await readFile(file, 'utf8')), original = registry.owners[0];
+  const exitedPid = spawnSync('true').pid!;
+  registry.owners.push(...Array.from({ length: 511 }, (_, index) => ({ token: randomUUID(), controller: randomUUID(),
+    sessionId: `manual-launch:old-${index}`, kind: 'manual-launch', pid: exitedPid, bootId: fixtureBoot, acquiredAt: 1,
+    roots: [join(home, `old-${index}`)] })));
+  await writeFile(file, JSON.stringify(registry));
+  expect(await admission('manual-after-daemon-restart', 'manual').tryAcquire()).toEqual({ acquired: true });
+  const saved = JSON.parse(await readFile(file, 'utf8'));
+  expect(saved.owners.length).toBeLessThanOrEqual(512);
+  expect(saved.owners.find((owner: any) => owner.token === original.token)).toEqual(original);
+  expect(saved.owners.filter((owner: any) => owner.pid === exitedPid))
+    .toEqual([expect.objectContaining({ kind: 'unfenced', roots: ['/'], bootId: fixtureBoot })]);
+  const other = join(home, 'other-exited'); await mkdir(other);
+  expect(await admission('automation-run:exited', 'automation', [other]).tryAcquire())
+    .toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+});
+
+test('keeps an exited controller reservation folder-scoped while the registry has room', async () => {
+  const directory = join(home, 'workspace-turn-admission.v1'); await mkdir(directory, { mode: 0o700 });
+  const file = join(directory, 'owners.json'), exited = { token: randomUUID(), controller: randomUUID(),
+    sessionId: 'manual-launch:old', kind: 'manual-launch', pid: spawnSync('true').pid!, bootId: fixtureBoot, acquiredAt: 1,
+    roots: [await realpath(workspace)] };
+  await writeFile(file, JSON.stringify({ version: 1, owners: [exited] }), { mode: 0o600 });
+  const other = join(home, 'other-room'); await mkdir(other);
+  expect(await admission('automation-run:room', 'automation', [other]).tryAcquire()).toEqual({ acquired: true });
+  expect(JSON.parse(await readFile(file, 'utf8')).owners[0]).toEqual(exited);
+});
+
+it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('never treats another account\'s live controller as exited at capacity', async () => {
+  const live = admission('live-manual', 'manual'); expect(await live.tryAcquire()).toEqual({ acquired: true });
+  const file = join(home, 'workspace-turn-admission.v1', 'owners.json');
+  const registry = JSON.parse(await readFile(file, 'utf8'));
+  registry.owners.push(...Array.from({ length: 511 }, (_, index) => ({ token: randomUUID(), controller: randomUUID(),
+    sessionId: `manual-launch:foreign-${index}`, kind: 'manual-launch', pid: 1, bootId: fixtureBoot, acquiredAt: 1,
+    roots: [join(home, `foreign-${index}`)] })));
+  await writeFile(file, JSON.stringify(registry));
+  expect(await admission('manual-foreign-capacity', 'manual').tryAcquire()).toMatchObject({ acquired: false, reason: 'registry-busy' });
+  expect(JSON.parse(await readFile(file, 'utf8'))).toEqual(registry);
+});
+
+test.each(['filesystem', 'subprocess'])('executes a %s operation once for the walter capacity snapshot while preserving current launches and its root fence', async kind => {
+  const live = createWorkspaceTurnAdmission({ home, sessionId: 'current-launch', kind: 'manual-launch', roots: [workspace], bootId: fixtureBoot });
+  expect(await live.tryAcquire()).toEqual({ acquired: true });
+  const file = join(home, 'workspace-turn-admission.v1', 'owners.json');
+  const registry = JSON.parse(await readFile(file, 'utf8')), original = registry.owners[0];
+  const current = Array.from({ length: 12 }, (_, index) => ({ ...original, token: randomUUID(), controller: randomUUID(), sessionId: `current-${index}` }));
+  const exitedPid = spawnSync('true').pid!;
+  const fence = { ...original, token: randomUUID(), sessionId: 'unknown-process', kind: 'unfenced', roots: ['/'] };
+  delete fence.controller; delete fence.identities;
+  const historical = Array.from({ length: 499 }, (_, index) => ({ ...original, token: randomUUID(), controller: randomUUID(),
+    sessionId: `manual-launch:historical-${index}`, pid: exitedPid }));
+  await writeFile(file, JSON.stringify({ version: 1, owners: [...current, ...historical, fence] }));
+  const operation = vi.fn(async () => 'written');
+  const execute = kind === 'filesystem' ? () => module.createFilesystemWriteAdmission({ home })(operation)
+    : () => module.createUnfencedSubprocessAdmission({ home, bootId: fixtureBoot })([workspace], operation);
+  expect(await execute()).toBe('written');
+  expect(operation).toHaveBeenCalledOnce();
+  expect(JSON.parse(await readFile(file, 'utf8')).owners).toEqual([...current, fence]);
+  expect(await admission('automation-run:walter', 'automation').tryAcquire())
+    .toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+});
+
+test('preserves a live dispatch handoff when historical launches are compacted under pressure', async () => {
+  const dispatch = await module.createLegacyDispatchAdmission({ home, bootId: fixtureBoot })([workspace]);
+  if (!dispatch.acquired) throw new Error('Expected dispatch reservation');
+  const file = join(home, 'workspace-turn-admission.v1', 'owners.json');
+  const registry = JSON.parse(await readFile(file, 'utf8')), original = registry.owners[0], exitedPid = spawnSync('true').pid!;
+  registry.owners.push(...Array.from({ length: 511 }, (_, index) => ({ ...original, token: randomUUID(), controller: randomUUID(),
+    sessionId: `manual-launch:dispatch-history-${index}`, pid: exitedPid })));
+  await writeFile(file, JSON.stringify(registry));
+  const operation = vi.fn(async () => 'written');
+  expect(await module.createFilesystemWriteAdmission({ home })(operation)).toBe('written');
+  expect(operation).toHaveBeenCalledOnce();
+  expect(JSON.parse(await readFile(file, 'utf8')).owners.find((owner: { token: string }) => owner.token === original.token)).toEqual(original);
+  await expect(dispatch.finish()).resolves.toBeUndefined();
+  expect(JSON.parse(await readFile(file, 'utf8')).owners.some((owner: { token: string }) => owner.token === original.token)).toBe(false);
+});
+
+test('rejects the first automatic candidate when exited launch compaction widens custody into its previously unrelated workspace', async () => {
+  const directory = join(home, 'workspace-turn-admission.v1'); await mkdir(directory, { mode: 0o700 });
+  const file = join(directory, 'owners.json'), exitedPid = spawnSync('true').pid!;
+  const owners = Array.from({ length: 512 }, (_, index) => ({ token: randomUUID(), controller: randomUUID(),
+    sessionId: `manual-launch:old-${index}`, kind: 'manual-launch', pid: exitedPid, bootId: fixtureBoot, acquiredAt: 1,
+    roots: [join(home, `unrelated-${index}`)] }));
+  await writeFile(file, JSON.stringify({ version: 1, owners }), { mode: 0o600 });
+  const candidate = admission('automation-run:first-compaction', 'automation');
+  expect(await candidate.tryAcquire()).toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+  const saved = JSON.parse(await readFile(file, 'utf8')).owners;
+  expect(saved).toEqual([expect.objectContaining({ kind: 'unfenced', roots: ['/'], bootId: fixtureBoot })]);
+  expect(saved.some((owner: { token: string }) => owner.token === candidate.ownerToken)).toBe(false);
+});
+
+test.each(['EPERM', 'EACCES', 'UNKNOWN'])('preserves a controller when PID inspection returns %s instead of ESRCH', async code => {
+  const live = admission('live-manual', 'manual'); expect(await live.tryAcquire()).toEqual({ acquired: true });
+  const file = join(home, 'workspace-turn-admission.v1', 'owners.json');
+  const registry = JSON.parse(await readFile(file, 'utf8')), original = registry.owners[0], unknownPid = 2147483640;
+  registry.owners.push(...Array.from({ length: 511 }, (_, index) => ({ ...original, token: randomUUID(), controller: randomUUID(),
+    sessionId: `manual-launch:unobserved-${index}`, kind: 'manual-launch', pid: unknownPid })));
+  await writeFile(file, JSON.stringify(registry));
+  const kill = process.kill.bind(process), inspect = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+    if (pid === unknownPid) throw Object.assign(new Error('Inspection unavailable'), { code });
+    return kill(pid, signal);
+  });
+  try {
+    expect(await admission('manual-unobserved-capacity', 'manual').tryAcquire()).toMatchObject({ acquired: false, reason: 'registry-busy' });
+    expect(inspect).toHaveBeenCalledWith(unknownPid, 0);
+    expect(JSON.parse(await readFile(file, 'utf8'))).toEqual(registry);
+  } finally { inspect.mockRestore(); }
+});
+
+test('never compacts exited manual or automatic owners as launch reservations', async () => {
+  const directory = join(home, 'workspace-turn-admission.v1'); await mkdir(directory, { mode: 0o700 });
+  const file = join(directory, 'owners.json'), exitedPid = spawnSync('true').pid!;
+  const registry = { version: 1, owners: Array.from({ length: 512 }, (_, index) => ({ token: randomUUID(), controller: randomUUID(),
+    sessionId: `owned-${index}`, kind: index % 2 ? 'manual' : 'automation', pid: exitedPid, bootId: fixtureBoot, acquiredAt: 1,
+    roots: [join(home, `unrelated-${index}`)] })) };
+  await writeFile(file, JSON.stringify(registry), { mode: 0o600 });
+  expect(await admission('manual-typed-capacity', 'manual').tryAcquire()).toMatchObject({ acquired: false, reason: 'registry-busy' });
+  expect(JSON.parse(await readFile(file, 'utf8'))).toEqual(registry);
+});
+
+test('compacts exited launch custody at the byte limit before the owner count is full', async () => {
+  const directory = join(home, 'workspace-turn-admission.v1'); await mkdir(directory, { mode: 0o700 });
+  const file = join(directory, 'owners.json'), exitedPid = spawnSync('true').pid!;
+  const registry = { version: 1, owners: [{ token: randomUUID(), controller: randomUUID(), sessionId: 'manual-launch:large',
+    kind: 'manual-launch', pid: exitedPid, bootId: fixtureBoot, acquiredAt: 1, roots: ['/old-scope'] }] };
+  registry.owners[0].roots[0] += 'x'.repeat(1024 * 1024 - 128 - Buffer.byteLength(JSON.stringify(registry)));
+  await writeFile(file, JSON.stringify(registry), { mode: 0o600 });
+  expect(await admission('manual-after-byte-pressure', 'manual').tryAcquire()).toEqual({ acquired: true });
+  const saved = await readFile(file, 'utf8');
+  expect(Buffer.byteLength(saved)).toBeLessThan(1024 * 1024);
+  expect(JSON.parse(saved).owners).toHaveLength(2);
+  expect(JSON.parse(saved).owners).toEqual(expect.arrayContaining([expect.objectContaining({ kind: 'unfenced', roots: ['/'], bootId: fixtureBoot }),
+    expect.objectContaining({ sessionId: 'manual-after-byte-pressure', kind: 'manual' })]));
+  expect(await admission('automation-run:after-byte-pressure', 'automation').tryAcquire())
+    .toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
+});
+
+test('keeps unknown-boot launch custody separate from known-boot custody through compaction and reboot', async () => {
+  const directory = join(home, 'workspace-turn-admission.v1'); await mkdir(directory, { mode: 0o700 });
+  const file = join(directory, 'owners.json'), exitedPid = spawnSync('true').pid!;
+  const owners = Array.from({ length: 512 }, (_, index) => ({ token: randomUUID(), controller: randomUUID(),
+    sessionId: `manual-launch:boot-${index}`, kind: 'manual-launch', pid: exitedPid, bootId: index % 2 ? fixtureBoot : null,
+    acquiredAt: 1, roots: [join(home, `unrelated-${index}`)] }));
+  await writeFile(file, JSON.stringify({ version: 1, owners }), { mode: 0o600 });
+  expect(await admission('manual-boot-compaction', 'manual').tryAcquire()).toEqual({ acquired: true });
+  const saved = JSON.parse(await readFile(file, 'utf8')).owners.filter((owner: { kind: string }) => owner.kind === 'unfenced');
+  expect(saved).toHaveLength(2);
+  expect(saved).toEqual(expect.arrayContaining([expect.objectContaining({ bootId: null, roots: ['/'] }),
+    expect.objectContaining({ bootId: fixtureBoot, roots: ['/'] })]));
+  expect(await admission('automation-run:after-new-boot', 'automation', [workspace], 'next-known-boot').tryAcquire())
     .toMatchObject({ acquired: false, reason: 'workspace-owner-unconfirmed' });
 });
 

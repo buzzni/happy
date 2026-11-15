@@ -374,6 +374,7 @@ import {
 import { mergeAdditionalDirectoriesIntoSandboxEnvironment, readAdditionalDirectoriesEnvironment, replaceApprovedWriteRootsInEnvironment } from '@/utils/additionalDirectoriesEnv';
 import { resolveSandboxTrustFloor } from '@/sandbox/config';
 import { createAutomationContextWorkspace } from './automations/automationContextWorkspace';
+import { manualLaunchRefusal } from './manualLaunchRefusal';
 import { createAutomationContextHost, prepareAutomationContextTick } from './automations/automationContextHost';
 import { createAutomationContextReferenceReader } from './automations/automationContextReference';
 import { createAutomationQuestionWorker, withAutomationQuestionWorker } from './automations/automationQuestionWorker';
@@ -2008,8 +2009,6 @@ export async function startDaemon(): Promise<void> {
           return 'unconfirmed';
         }
       } }) : null;
-    const workspaceBusy = (): SpawnSessionResult => ({ type: 'error', code: 'workspace-automation-busy',
-      errorMessage: 'This workspace is running a scheduled task. Retry after it finishes.' });
     const manualPreparationRoots = async (roots: string[]) => Promise.all(roots.map(async root => {
       let candidate = resolve(root);
       while (true) {
@@ -2080,7 +2079,8 @@ export async function startDaemon(): Promise<void> {
       },
       warn: (message) => logger.warn(message),
     });
-    type WorkspaceLaunchObservation = { submitted: boolean; tracked: boolean; onObservedExit?: () => Promise<void> };
+    type WorkspaceLaunchObservation = { submitted: boolean; tracked: boolean; exitObserved?: boolean;
+      onObservedExit?: () => Promise<void>; onUnconfirmedExit?: () => Promise<void> };
     const spawnSessionUnchecked = async (
       options: SpawnSessionOptions,
       trustedMcpContext?: AutomationMcpSpawnContext,
@@ -2810,6 +2810,8 @@ export async function startDaemon(): Promise<void> {
             },
             onTracked: () => { if (workspaceLaunch) workspaceLaunch.tracked = true; },
             onWorkspaceExit: workspaceLaunch?.onObservedExit,
+            onWorkspaceObservation: () => { if (workspaceLaunch) workspaceLaunch.exitObserved = true; },
+            onWorkspaceUnconfirmed: workspaceLaunch?.onUnconfirmedExit,
             args,
             cwd: directory,
             env: spawnEnvironment,
@@ -2844,6 +2846,8 @@ export async function startDaemon(): Promise<void> {
       onProcessSubmission,
       onTracked,
       onWorkspaceExit,
+      onWorkspaceObservation,
+      onWorkspaceUnconfirmed,
       args,
       cwd,
       env,
@@ -2859,6 +2863,8 @@ export async function startDaemon(): Promise<void> {
       onProcessSubmission?: () => void;
       onTracked?: () => void;
       onWorkspaceExit?: () => Promise<void>;
+      onWorkspaceObservation?: () => void;
+      onWorkspaceUnconfirmed?: () => Promise<void>;
       args: string[];
       cwd: string;
       env: NodeJS.ProcessEnv;
@@ -2879,8 +2885,9 @@ export async function startDaemon(): Promise<void> {
       }
       const workspaceReservation = contextWorkspace && !onOwnedChild
         ? await contextWorkspace.beginManualLaunch([cwd, ...readAdditionalDirectoriesEnvironment(env)]) : null;
-      if (workspaceReservation && !workspaceReservation.acquired) return workspaceBusy();
+      if (workspaceReservation && !workspaceReservation.acquired) return manualLaunchRefusal(workspaceReservation);
       const workspaceLaunch = { submitted: false, tracked: false };
+      let exitObserved = false;
       try {
       // Native preparation creates a suspended root; authorize execution at resume below.
       const prepareStartedAt = Date.now();
@@ -2924,10 +2931,17 @@ export async function startDaemon(): Promise<void> {
                 await onWorkspaceExit?.();
               } });
               manualWorkspaceChildren.set(pid, owned);
-              void owned.closed.then(confirmed => {
+              exitObserved = true; onWorkspaceObservation?.();
+              void owned.closed.then(async confirmed => {
                 if (manualWorkspaceChildren.get(pid) === owned) manualWorkspaceChildren.delete(pid);
-                if (!confirmed) logger.warn('[workspace-context] Owned manual exit remains unconfirmed');
-              });
+                if (!confirmed) {
+                  logger.warn('[workspace-context] Owned manual exit remains unconfirmed');
+                  const results = await Promise.allSettled([reservation.retainUnconfirmed(), onWorkspaceUnconfirmed?.()]);
+                  for (const result of results) if (result.status === 'rejected') {
+                    logger.warn('[workspace-context] Unknown writer custody handoff unconfirmed', result.reason);
+                  }
+                }
+              }).catch(error => logger.warn('[workspace-context] Manual exit custody observation failed', error));
             }
             onOwnedChild?.(child);
             return child;
@@ -2992,7 +3006,13 @@ export async function startDaemon(): Promise<void> {
       } finally { if (prepared && !resumed) prepared.cancelBeforeResume?.(); }
 
       } finally {
-        if (workspaceReservation?.acquired) await workspaceReservation.finish(workspaceLaunch);
+        if (workspaceReservation?.acquired) {
+          await workspaceReservation.finish(workspaceLaunch);
+          if (workspaceLaunch.submitted && !exitObserved) {
+            try { await workspaceReservation.retainUnconfirmed(); }
+            catch (error) { logger.warn('[workspace-context] Unobserved launch custody handoff unconfirmed', error); }
+          }
+        }
       }
 
     };
@@ -3702,16 +3722,25 @@ export async function startDaemon(): Promise<void> {
         if (removalRefusal) return { type: 'error', errorMessage: removalRefusal };
         if (contextWorkspace && !contextOwnedChildren.has(options)) {
           workspaceReservation = await contextWorkspace.beginManualLaunch(await manualPreparationRoots([options.directory, ...options.additionalDirectories ?? []]));
-          if (!workspaceReservation.acquired) return workspaceBusy();
+          if (!workspaceReservation.acquired) return manualLaunchRefusal(workspaceReservation);
           const reservation = workspaceReservation;
           workspaceLaunch.onObservedExit = async () => {
             if (!await reservation.finish({ submitted: true, tracked: true }, observedWorkspaceExit)) throw new Error('WORKSPACE_CUSTODY_UNCONFIRMED');
           };
+          workspaceLaunch.onUnconfirmedExit = () => reservation.retainUnconfirmed();
           stopSubmissionObservation = ownedStartGuard.observeSubmission(options);
         }
         return await spawnSessionUnchecked(options, trustedMcpContext, workspaceLaunch);
       } finally {
-        try { if (workspaceReservation?.acquired) await workspaceReservation.finish(workspaceLaunch); }
+        try {
+          if (workspaceReservation?.acquired) {
+            await workspaceReservation.finish(workspaceLaunch);
+            if (workspaceLaunch.submitted && !workspaceLaunch.exitObserved) {
+              try { await workspaceReservation.retainUnconfirmed(); }
+              catch (error) { logger.warn('[workspace-context] Unobserved preparation custody handoff unconfirmed', error); }
+            }
+          }
+        }
         finally { stopSubmissionObservation?.(); endLaunch(); }
       }
     };
