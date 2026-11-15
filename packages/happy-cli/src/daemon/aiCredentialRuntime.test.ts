@@ -4675,6 +4675,17 @@ describe('per-binding OpenGateway runtime',()=>{
    expect(ctx.files.has(base+'old.json')).toBe(false)
    for(const id of ['other','same','next'])expect(ctx.files.has(base+id+'.json')).toBe(true)
  })
+ it('refuses a binding older than one already held for the endpoint and does not write its token',async()=>{
+   const base='/home/operator/.happy/org-llm-model-bindings/'
+   const ctx=setup({machineId:'machine',env:{HAPPY_APLUS_STUDIO_ORIGIN:'https://studio.example'},fetch:vi.fn(async()=>Response.json({ok:true})),readdir:async()=>[...ctx.files.keys()].filter(path=>path.startsWith(base)).map(path=>path.slice(base.length))})
+   const newer=sync('newer','deepseek/deepseek-v4.1-flash-eco');newer.endpoint.generation=2;newer.endpoint.token='rotated-token'
+   const older=sync('older','deepseek/deepseek-v4.1-flash-eco');older.endpoint.token='replaced-old-token'
+   await ctx.runtime.orgLlmModelBindingSync(newer)
+   await expect(ctx.runtime.orgLlmModelBindingSync(older)).rejects.toMatchObject({kind:'ORG_LLM_ENDPOINT_STALE_GENERATION',storedGeneration:2})
+   expect(ctx.files.has(base+'older.json')).toBe(false)
+   await expect(ctx.runtime.sessionEnvironment('claude',{kind:'org-endpoint',bindingId:'older',snapshotId:older.snapshotId,endpointId:'endpoint',generation:1,candidates:['target']})).rejects.toThrow()
+   expect(ctx.files.has(base+'newer.json')).toBe(true)
+ })
  it('does not start when the server refuses authorization',async()=>{
    const ctx=setup({machineId:'machine',env:{HAPPY_APLUS_STUDIO_ORIGIN:'https://studio.example'},fetch:vi.fn(async()=>Response.json({error:'ORG_LLM_ENDPOINT_MODEL_NOT_ALLOWED'},{status:409}))})
    const a=sync('a','deepseek/deepseek-v4.1-flash-eco');await ctx.runtime.orgLlmModelBindingSync(a)

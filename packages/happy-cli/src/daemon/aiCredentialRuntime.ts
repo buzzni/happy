@@ -2912,16 +2912,21 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
           const old=await deps.readFile(path)
           if(old!==JSON.stringify(params)) throw new OrgLlmEndpointError('ORG_LLM_ENDPOINT_SNAPSHOT_MISMATCH')
         } catch(error) {if((error as {code?:string}).code!=='ENOENT') throw error}
-        await deps.mkdir(join(deps.homeDir,'.happy','org-llm-model-bindings'),{recursive:true,mode:0o700})
-        await writeAtomicFile(deps,path,JSON.stringify(params))
         const directory=join(deps.homeDir,'.happy','org-llm-model-bindings')
+        await deps.mkdir(directory,{recursive:true,mode:0o700})
+        const sameEndpoint:{name:string,generation:number}[]=[]
         for(const name of await deps.readdir(directory)) {
           if(!/^[A-Za-z0-9_-]{1,128}\.json$/.test(name) || name===`${binding.bindingId}.json`) continue
           let old:ReturnType<typeof parseOrgLlmModelBinding>
           try {old=parseOrgLlmModelBinding(JSON.parse(await deps.readFile(join(directory,name))))}
           catch {deps.warn?.('org-llm-endpoint binding cleanup skipped an unreadable record');continue}
-          if(old.entry.companyId===binding.entry.companyId && old.entry.id===binding.entry.id && old.entry.generation<binding.entry.generation) await deps.rm(join(directory,name),{force:true})
+          if(old.entry.companyId===binding.entry.companyId && old.entry.id===binding.entry.id) sameEndpoint.push({name,generation:old.entry.generation})
         }
+        // As in orgLlmEndpointSync: a binding prepared before an admin change must not bring back a replaced token.
+        const stored=Math.max(...sameEndpoint.map(record=>record.generation))
+        if(binding.entry.generation<stored) throw new OrgLlmEndpointStaleGenerationError(stored)
+        await writeAtomicFile(deps,path,JSON.stringify(params))
+        for(const record of sameEndpoint) if(record.generation<binding.entry.generation) await deps.rm(join(directory,record.name),{force:true})
         return {ok:true as const,bindingId:binding.bindingId,snapshotId:binding.snapshotId,selectedModel:binding.selectedModel}
       })
     })
