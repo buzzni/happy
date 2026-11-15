@@ -25,7 +25,7 @@ import { ADDITIONAL_DIRECTORIES_ENV, APPROVED_WRITE_ROOTS_ENV, readAdditionalDir
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars'
 import { normalizeSessionSource, SESSION_SOURCE_ENV } from '@/utils/sessionSource'
 import { DELEGATED_ATTENDANCE_ENV, parseDelegatedAttendance } from '@/api/turnAttendance'
-import { ORG_ENDPOINT_BINDING_ENV, ORG_ENDPOINT_UNREPORTED_ENV, sanitizeChildEnv, SETUP_TOKEN_BINDING_ENV } from '@/utils/childEnv'
+import { ORG_ENDPOINT_BINDING_ENV, ORG_ENDPOINT_UNREPORTED_ENV, ORG_SUBAGENT_LAUNCH_ENV, ORG_SUBAGENT_OPERATION_ENV, sanitizeChildEnv, SETUP_TOKEN_BINDING_ENV } from '@/utils/childEnv'
 import { OUTPUT_FORMAT_ENV, parseOutputFormat } from '@/claude/structuredOutput'
 import { INPUT_EVIDENCE_ENV, requestedInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings'
 import { AGENT_PLAN_DESCRIPTOR_ENV, AGENT_PLAN_SECRET_ENV } from '@/launcher/agentPlanLaunch'
@@ -70,7 +70,7 @@ export const BROWSER_CONTINUATION_ENV = 'HAPPY_AUTOMATION_BROWSER_CONTINUATION'
  */
 const AGENT_PLAN_SEED_KEYS = [AGENT_PLAN_DESCRIPTOR_ENV, AGENT_PLAN_SECRET_ENV, AGENT_PLAN_THREADS_DIR_ENV] as const
 type AgentPlanSeedKey = typeof AGENT_PLAN_SEED_KEYS[number]
-type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | typeof ORG_ENDPOINT_BINDING_ENV | typeof PERSONAL_ENDPOINT_BINDING_ENV | typeof PERSONAL_ENDPOINT_LEASE_ENV | typeof ORG_ENDPOINT_UNREPORTED_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof APPROVED_WRITE_ROOTS_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV | AgentPlanSeedKey
+type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | typeof ORG_ENDPOINT_BINDING_ENV | typeof PERSONAL_ENDPOINT_BINDING_ENV | typeof PERSONAL_ENDPOINT_LEASE_ENV | typeof ORG_ENDPOINT_UNREPORTED_ENV | typeof ORG_SUBAGENT_LAUNCH_ENV | typeof ORG_SUBAGENT_OPERATION_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof APPROVED_WRITE_ROOTS_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV | AgentPlanSeedKey
 
 export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey | typeof DAEMON_AGENT_GRANT_STATE_ENV, string>>
 
@@ -316,6 +316,9 @@ export function captureSaycodeAgentEnvironment(
     env: NodeJS.ProcessEnv,
 ): SaycodeAgentEnvironment | undefined {
     const captured: SaycodeAgentEnvironment = {}
+    for (const key of [ORG_SUBAGENT_LAUNCH_ENV, ORG_SUBAGENT_OPERATION_ENV] as const) {
+        if (env[key] !== undefined) captured[key] = /^[A-Za-z0-9_-]{1,128}$/.test(env[key]!) ? env[key] : ''
+    }
     const grantState = env[DAEMON_AGENT_GRANT_STATE_ENV]
     if (grantState === 'root' || grantState === 'rejected') captured[DAEMON_AGENT_GRANT_STATE_ENV] = grantState
     if (env[MANUAL_PERSONAL_ENV] !== undefined) captured[MANUAL_PERSONAL_ENV] = /^[a-f0-9]{64}$/.test(env[MANUAL_PERSONAL_ENV]!) ? env[MANUAL_PERSONAL_ENV] : ''
@@ -613,7 +616,7 @@ export type AiAuthSelection =
      * rebuilds the recorded target — and never read from a request.
      */
     | PersonalEndpointSelection
-    | { kind: 'org-endpoint'; bindingId: string; endpointId: string; generation: number; candidates: string[]; resume?: true }
+    | { kind: 'org-endpoint'; bindingId: string; endpointId: string; generation: number; candidates: string[]; snapshotId?: string; resume?: true }
 
 /**
  * Advertised in `MachineMetadataSchema` so a client can tell this daemon
@@ -675,7 +678,9 @@ export function parseAiAuthSelection(value: unknown): AiAuthSelection | undefine
             || !candidates.every(isOrgEndpointId) || new Set(candidates).size !== candidates.length) {
             throw new Error(`AI auth selection org-endpoint requires 1..${ORG_ENDPOINT_MAX_TARGETS} distinct candidates`)
         }
-        return { kind, bindingId, endpointId, generation: Number(generation), candidates: [...candidates] }
+        const snapshotId=(value as Record<string,unknown>).snapshotId
+        if(snapshotId!==undefined && !isOrgEndpointId(snapshotId)) throw new Error('Invalid org endpoint snapshot')
+        return { kind, bindingId, endpointId, generation: Number(generation), candidates: [...candidates], ...(snapshotId ? {snapshotId:snapshotId as string} : {}) }
     }
     return { kind: kind as 'machine-personal' | 'org-bundle' }
 }
@@ -688,16 +693,19 @@ const ORG_ENDPOINT_ID = /^[A-Za-z0-9_-]{1,128}$/
 export const ORG_ENDPOINT_MAX_TARGETS = 16
 export const isOrgEndpointId = (value: unknown): value is string => typeof value === 'string' && ORG_ENDPOINT_ID.test(value)
 
-export type OrgEndpointBinding = { bindingId: string; endpointId: string; targetId: string; generation: number }
+export type OrgEndpointBinding = { bindingId: string; endpointId: string; targetId: string; generation: number; snapshotId?: string; selectedModel?: string }
 
 export function formatOrgEndpointBinding(binding: OrgEndpointBinding): string {
-    return `${binding.bindingId}:${binding.endpointId}:${binding.targetId}:${binding.generation}`
+    return `${binding.bindingId}:${binding.endpointId}:${binding.targetId}:${binding.generation}${binding.snapshotId ? `:${binding.snapshotId}:${Buffer.from(binding.selectedModel ?? '').toString('base64url')}` : ''}`
 }
 
 export function parseOrgEndpointBinding(value: string): OrgEndpointBinding | null {
     const parts = value.split(':')
-    if (parts.length !== 4 || !parts.slice(0, 3).every(isOrgEndpointId) || !/^[1-9]\d{0,14}$/.test(parts[3]!)) return null
-    return { bindingId: parts[0]!, endpointId: parts[1]!, targetId: parts[2]!, generation: Number(parts[3]) }
+    if ((parts.length !== 4 && parts.length !== 6) || !parts.slice(0, 3).every(isOrgEndpointId) || !/^[1-9]\d{0,14}$/.test(parts[3]!)) return null
+    if(parts.length===6 && (!isOrgEndpointId(parts[4]) || !/^[A-Za-z0-9_-]{1,300}$/.test(parts[5]!))) return null
+    const selectedModel=parts.length===6 ? Buffer.from(parts[5]!,'base64url').toString('utf8') : undefined
+    if(selectedModel!==undefined && (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*\/[a-zA-Z0-9][a-zA-Z0-9._-]{0,190}$/.test(selectedModel) || Buffer.from(selectedModel).toString('base64url')!==parts[5])) return null
+    return { bindingId: parts[0]!, endpointId: parts[1]!, targetId: parts[2]!, generation: Number(parts[3]), ...(parts.length===6 ? {snapshotId:parts[4]!,selectedModel} : {}) }
 }
 
 /** Which binding and target the daemon applied to a finished managed environment; what the spawn result reports. */
@@ -717,7 +725,7 @@ export function readOrgEndpointResumeSelection(agentEnvironment: SaycodeAgentEnv
     const binding = parseOrgEndpointBinding(raw)
     if (!binding) throw new Error('Recorded org endpoint binding is invalid; the session is not resumed with another endpoint')
     return { kind: 'org-endpoint', bindingId: binding.bindingId, endpointId: binding.endpointId, generation: binding.generation,
-        candidates: [binding.targetId], resume: true }
+        candidates: [binding.targetId], ...(binding.snapshotId ? {snapshotId:binding.snapshotId} : {}), resume: true }
 }
 
 /**

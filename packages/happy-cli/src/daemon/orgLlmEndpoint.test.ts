@@ -268,7 +268,8 @@ describe('buildOrgLlmEndpointEnvironment', () => {
 
   it('writes every key of the shared owned set, so the scrub list cannot drift from the env', () => {
     const env = buildOrgLlmEndpointEnvironment({ entry: entry(), target, bindingId: 'binding-1' })
-    expect(Object.keys(env).filter((key) => !key.startsWith('HAPPY_')).sort()).toEqual([...ORG_ENDPOINT_OWNED_ENV_KEYS].sort())
+    expect(env.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBeUndefined()
+    expect(Object.keys(env).filter((key) => !key.startsWith('HAPPY_')).sort()).toEqual(ORG_ENDPOINT_OWNED_ENV_KEYS.filter(key=>key!=='CLAUDE_CODE_MAX_OUTPUT_TOKENS').sort())
   })
 
   it('uses a non-secret dummy token for an endpoint without auth', () => {

@@ -4643,3 +4643,52 @@ it('refuses a legacy server payload carrying a Claude refresh token before any l
   await expect(state.runtime.apply({ provider: 'claude', payload: JSON.stringify(payload) })).rejects.toThrow('CLAUDE_REFRESH_TOKEN_EXPORTED')
   expect(state.calls).toEqual([])
 })
+
+
+describe('per-binding OpenGateway runtime',()=>{
+ const sync=(bindingId:string,selectedModel:string)=>({version:1,bindingId,snapshotId:`snap-${bindingId}`,machineId:'machine',maxOutputTokens:8192,selectedModel,launchSecret:'s'.repeat(64),companyId:'co',userId:'user',endpoint:{id:'endpoint',generation:1,model:selectedModel,models:{},maxContextTokens:200000,apiTimeoutMs:600000,authMode:'static-token',token:'key',targets:[{id:'target',url:'https://apis.opengateway.ai'}]}})
+ it('keeps A and B models through reversed sync order and resumes without endpoint cache',async()=>{
+   const fetch=vi.fn(async()=>Response.json({ok:true}))
+   const ctx=setup({machineId:'machine',env:{HAPPY_APLUS_STUDIO_ORIGIN:'https://studio.example'},fetch})
+   const b=sync('b','moonshotai/kimi-k3.1-pro'),a=sync('a','deepseek/deepseek-v4.1-flash-eco')
+   a.maxOutputTokens=4096
+   await ctx.runtime.orgLlmModelBindingSync(b);await ctx.runtime.orgLlmModelBindingSync(a)
+   const selection=(x:ReturnType<typeof sync>)=>({kind:'org-endpoint' as const,bindingId:x.bindingId,snapshotId:x.snapshotId,endpointId:'endpoint',generation:1,candidates:['target']})
+   const envA=await ctx.runtime.sessionEnvironment('claude',selection(a))
+   const envB=await ctx.runtime.sessionEnvironment('claude',selection(b))
+   for(const key of ['ANTHROPIC_MODEL','ANTHROPIC_DEFAULT_OPUS_MODEL','ANTHROPIC_DEFAULT_SONNET_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL','ANTHROPIC_DEFAULT_FABLE_MODEL','CLAUDE_CODE_SUBAGENT_MODEL']) {expect(envA[key]).toBe(a.selectedModel);expect(envB[key]).toBe(b.selectedModel)}
+   expect(envA.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe('4096');expect(envB.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe('8192')
+   const resume=readOrgEndpointResumeSelection(captureSaycodeAgentEnvironment(envA))!
+   expect((await ctx.runtime.sessionEnvironment('claude',resume)).ANTHROPIC_MODEL).toBe(a.selectedModel)
+   expect(fetch).toHaveBeenCalledTimes(2)
+   ctx.files.delete('/home/operator/.happy/org-llm-model-bindings/a.json')
+   await expect(ctx.runtime.sessionEnvironment('claude',resume)).rejects.toThrow()
+ })
+ it('removes older generation secrets while retaining other endpoints and current bindings',async()=>{
+   const ctx=setup({machineId:'machine',readdir:async()=>['old.json','other.json','same.json']})
+   const base='/home/operator/.happy/org-llm-model-bindings/'
+   const old=sync('old','deepseek/deepseek-v4.1-flash-eco'),other=sync('other','deepseek/deepseek-v4.1-flash-eco'),same=sync('same','deepseek/deepseek-v4.1-flash-eco')
+   other.endpoint.id='another';same.endpoint.generation=2
+   for(const b of [old,other,same])ctx.files.set(base+b.bindingId+'.json',JSON.stringify(b))
+   const next=sync('next','deepseek/deepseek-v4.1-flash-eco');next.endpoint.generation=2
+   await ctx.runtime.orgLlmModelBindingSync(next)
+   expect(ctx.files.has(base+'old.json')).toBe(false)
+   for(const id of ['other','same','next'])expect(ctx.files.has(base+id+'.json')).toBe(true)
+ })
+ it('refuses a binding older than one already held for the endpoint and does not write its token',async()=>{
+   const base='/home/operator/.happy/org-llm-model-bindings/'
+   const ctx=setup({machineId:'machine',env:{HAPPY_APLUS_STUDIO_ORIGIN:'https://studio.example'},fetch:vi.fn(async()=>Response.json({ok:true})),readdir:async()=>[...ctx.files.keys()].filter(path=>path.startsWith(base)).map(path=>path.slice(base.length))})
+   const newer=sync('newer','deepseek/deepseek-v4.1-flash-eco');newer.endpoint.generation=2;newer.endpoint.token='rotated-token'
+   const older=sync('older','deepseek/deepseek-v4.1-flash-eco');older.endpoint.token='replaced-old-token'
+   await ctx.runtime.orgLlmModelBindingSync(newer)
+   await expect(ctx.runtime.orgLlmModelBindingSync(older)).rejects.toMatchObject({kind:'ORG_LLM_ENDPOINT_STALE_GENERATION',storedGeneration:2})
+   expect(ctx.files.has(base+'older.json')).toBe(false)
+   await expect(ctx.runtime.sessionEnvironment('claude',{kind:'org-endpoint',bindingId:'older',snapshotId:older.snapshotId,endpointId:'endpoint',generation:1,candidates:['target']})).rejects.toThrow()
+   expect(ctx.files.has(base+'newer.json')).toBe(true)
+ })
+ it('does not start when the server refuses authorization',async()=>{
+   const ctx=setup({machineId:'machine',env:{HAPPY_APLUS_STUDIO_ORIGIN:'https://studio.example'},fetch:vi.fn(async()=>Response.json({error:'ORG_LLM_ENDPOINT_MODEL_NOT_ALLOWED'},{status:409}))})
+   const a=sync('a','deepseek/deepseek-v4.1-flash-eco');await ctx.runtime.orgLlmModelBindingSync(a)
+   await expect(ctx.runtime.sessionEnvironment('claude',{kind:'org-endpoint',bindingId:'a',snapshotId:a.snapshotId,endpointId:'endpoint',generation:1,candidates:['target']})).rejects.toThrow('ORG_LLM_ENDPOINT_MODEL_NOT_ALLOWED')
+ })
+})

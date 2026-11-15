@@ -4,8 +4,9 @@ import { ORG_ENDPOINT_VALUE_ENV_KEYS, ORG_ENDPOINT_CLEARED_ENV_KEYS } from './ut
 import { ensureLocalProxyBypass } from './utils/proxyBypass'
 export function configureClaudePlanEnvironment(env: NodeJS.ProcessEnv, descriptor: AgentPlanDescriptor, baseUrl: string, clientKey: string): void {
     for (const key of ORG_ENDPOINT_CLEARED_ENV_KEYS) env[key] = ''
-    const values: Record<typeof ORG_ENDPOINT_VALUE_ENV_KEYS[number], string> = {
+    const values: Record<typeof ORG_ENDPOINT_VALUE_ENV_KEYS[number], string> & {CLAUDE_CODE_MAX_OUTPUT_TOKENS:string} = {
         ANTHROPIC_BASE_URL: baseUrl, ANTHROPIC_AUTH_TOKEN: clientKey,
+        CLAUDE_CODE_MAX_OUTPUT_TOKENS: descriptor.model==='moonshotai/kimi-k3.1-pro' ? '8192' : '32000',
         CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(descriptor.contextWindow),
         ANTHROPIC_MODEL: descriptor.model, ANTHROPIC_DEFAULT_OPUS_MODEL: descriptor.model,
         ANTHROPIC_DEFAULT_SONNET_MODEL: descriptor.model, ANTHROPIC_DEFAULT_HAIKU_MODEL: descriptor.model,

@@ -27,12 +27,21 @@ export type LegacyDispatchReservation = Exclude<WorkspaceTurnAdmissionResult, { 
   acquired: true; finish(): Promise<void>;
 };
 const MAX_REGISTRY_BYTES = 1024 * 1024;
+/** Only ESRCH proves absence; EPERM is a live process of another account. */
+function controllerExited(pid: number): boolean {
+  try { process.kill(pid, 0); return false; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === 'ESRCH'; }
+}
 /** Unknown descendants cannot be evicted by age or PID. At capacity, retain a broader boot-bound
  * fence instead: legacy work can proceed, while any new automatic workspace needs verification. */
 function boundedOwners(owners: Owner[]): Owner[] {
   const fits = (value: Owner[]) => registrySchema.safeParse({ version: 1, owners: value }).success
     && Buffer.byteLength(JSON.stringify({ version: 1, owners: value })) <= MAX_REGISTRY_BYTES;
   const pressure = !fits(owners), groups = new Map<string | null, Owner[]>();
+  // A launch whose controller exited can no longer be proven quiescent (daemon restart). At capacity it joins
+  // the same unknown-writer fence instead of refusing every later launch until reboot.
+  if (pressure) owners = owners.map(owner => owner.kind === 'manual-launch' && controllerExited(owner.pid)
+    ? { ...owner, kind: 'unfenced' as const } : owner);
   for (const owner of owners) if (owner.kind === 'unfenced') {
     const group = groups.get(owner.bootId) ?? []; group.push(owner); groups.set(owner.bootId, group);
   }

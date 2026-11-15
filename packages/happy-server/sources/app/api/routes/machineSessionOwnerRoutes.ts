@@ -30,6 +30,11 @@ import { ExecutionOwnerRequestSchema, ExecutionOwnerResponseSchema } from "@slop
  * from "route unavailable" (retry). With both outcomes on 200, any non-200 is an outage.
  */
 export function machineSessionOwnerRoutes(app: Fastify) {
+    app.get('/v1/org-endpoint-subagent/capabilities', {
+        preHandler: [app.authenticate, requireAccountPrincipal],
+        schema: { response: { 200: z.object({ orgEndpointSubagentVersion: z.literal(1), executionProofVersion: z.literal(1), relayTimeoutMs: z.literal(630000) }).strict() } },
+    }, async () => ({ orgEndpointSubagentVersion: 1 as const, executionProofVersion: 1 as const, relayTimeoutMs: 630000 as const }));
+
     app.post('/v1/machine-sessions/:sessionId/owner', {
         preHandler: app.authenticate,
         schema: {

@@ -2,6 +2,8 @@ import { testPersonalEndpoint } from '@/daemon/personalEndpointProbe';
 import { callPersonalEndpointBroker, parsePersonalEndpointSelection, type PersonalEndpointSelection } from '@/daemon/personalLlmEndpoint';
 import { readPersonalClaudeCredentials } from '@/claude/personalClaudeCredential';
 import { registerOwnedSpawnRpc, type OwnedSpawnRpc } from '@/daemon/ownedSpawnRpc';
+import { registerOrgSubagentRpc } from '@/daemon/orgEndpointSubagentRpc';
+import type { createOrgSubagentRuntime } from '@/daemon/orgEndpointSubagentRuntime';
 import { z } from 'zod';
 import type { createDeviceEnrollment } from '@/daemon/deviceEnrollment';
 import type { DeviceKeys } from '@/daemon/deviceKeys';
@@ -597,6 +599,7 @@ type MachineRpcHandlers = {
     /** aplus-dev-studio specs/cross-machine-agent-delegation. Absent = no links, no lane, no advertisement. */
     agentDelegation?: AgentDelegationHost;
     ownedSpawn?: OwnedSpawnRpc;
+    orgSubagent?: ReturnType<typeof createOrgSubagentRuntime>;
     daemonSessionState?: (request: unknown) => Promise<DaemonSessionStateResponse>;
     spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
     resumeSession?: (sessionId: string, options?: {
@@ -1247,6 +1250,7 @@ export class ApiMachineClient {
         browserSessionPrepare,
         channelHostCall,
         ownedSpawn,
+        orgSubagent,
         agentDelegation,
     }: MachineRpcHandlers) {
         if (sessionRetention && !this.windowsStandaloneTrial) {
@@ -1254,6 +1258,7 @@ export class ApiMachineClient {
             this.rpcHandlerManager.registerHandler('session-retention-set-v1', sessionRetention.set, { customerBound: true });
         }
         if (!this.windowsStandaloneTrial) registerOwnedSpawnRpc((method, handler) => this.rpcHandlerManager.registerHandler(method, handler), ownedSpawn);
+        registerOrgSubagentRpc((method, handler) => this.rpcHandlerManager.registerHandler(method, handler), this.windowsStandaloneTrial ? undefined : orgSubagent);
         this.daemonSessionStateRpcAvailable = !!daemonSessionState;
         if (daemonSessionState) {
             this.rpcHandlerManager.registerHandler('daemon-session-state', daemonSessionState);
@@ -1343,7 +1348,7 @@ export class ApiMachineClient {
         this.rpcHandlerManager.registerHandler('ai-credential:personal-claude-accounts', async () => ({ version: 1, accounts: (await readPersonalClaudeCredentials()).map(({ accountRef, label, roster }) => ({ accountRef, label, roster })) }), { customerBound: true });
         this.rpcHandlerManager.registerHandler('ai-credential:capabilities', async () => {
             const baseCapabilities = await aiCredentialRuntime.capabilities(this.machine.id);
-            const capabilities = { ...baseCapabilities, ...(setupTokenCapacityBarrier ? { setupTokenUserCapacityVersion: 1 } : {}), ...(baseCapabilities.newSessionProfileBinding ? { personalClaudeSelectionVersion: 1 } : {}) };
+            const capabilities = { ...baseCapabilities, ...(orgSubagent && !this.windowsStandaloneTrial ? { orgEndpointSubagentVersion: 1 } : this.machine.encryptionVariant !== 'dataKey' ? { orgEndpointSubagentReason: 'ORG_LLM_ENDPOINT_MACHINE_KEY_REQUIRED' } : {}), ...(setupTokenCapacityBarrier ? { setupTokenUserCapacityVersion: 1 } : {}), ...(baseCapabilities.newSessionProfileBinding ? { personalClaudeSelectionVersion: 1 } : {}) };
             if (!setupTokenAssignmentKillSwitchEnabled()
                 && capabilities.setupTokenVersion === 1 && capabilities.setupTokenStatusVersion === 1) {
                 return {
@@ -1370,6 +1375,7 @@ export class ApiMachineClient {
             return callPersonalEndpointBroker({ operation: 'enroll', issuer: p.issuer, userId: p.userId, machineId: this.machine.id });
         });
         // aplus specs/org-llm-endpoints C4 — carries the endpoint's token, so it stays off SERVER_LANE_METHODS like group-sync.
+        this.rpcHandlerManager.registerHandler('ai-credential:org-llm-model-binding-sync', (params) => aiCredentialRuntime.orgLlmModelBindingSync(params));
         this.rpcHandlerManager.registerHandler('ai-credential:org-llm-endpoint-sync', (params) => (
             aiCredentialRuntime.orgLlmEndpointSync(params)
         ));

@@ -14,7 +14,7 @@
 import { readTrustedStudioOrigin } from '@/daemon/setupTokenBindingProof'
 
 /** Advertised in machine metadata as `agentPlan` by every daemon platform (see `agentPlanCapabilityForPlatform`). */
-export const AGENT_PLAN_CAPABILITY = { version: 1 as const, claude: 1 as const }
+export const AGENT_PLAN_CAPABILITY = { version: 1 as const, claude: 1 as const, claudeModels:['deepseek/deepseek-v4.1-flash-eco','moonshotai/kimi-k3.1-pro'] }
 
 /** Spawn seeds: read and deleted by the runner, never inherited (childEnv `HAPPY_INITIAL_`). */
 export const AGENT_PLAN_DESCRIPTOR_ENV = 'HAPPY_INITIAL_AGENT_PLAN_DESCRIPTOR'
@@ -36,6 +36,7 @@ export const AGENT_PLAN_DESCRIPTOR_VERSION = 1
  * Compaction leaves the provider's 128k output budget plus 22k for framing/tool definitions.
  */
 const AGENT_PLAN_MODEL_CONTEXT = {
+    'moonshotai/kimi-k3.1-pro': {contextWindow:200000,autoCompactTokenLimit:150000},
     'deepseek/deepseek-v4.1-flash-eco': { contextWindow: 200000, autoCompactTokenLimit: 150000 },
     'gpt-6-luna': { contextWindow: 1050000, autoCompactTokenLimit: 900000 },
     'gpt-6.1-terra': { contextWindow: 1050000, autoCompactTokenLimit: 900000 },
@@ -181,7 +182,7 @@ export function agentPlanCodexArgs(descriptor: AgentPlanDescriptor, proxyBaseUrl
 }
 
 export function agentPlanAgent(model: AgentPlanModel): 'codex' | 'claude' {
-    return model === 'deepseek/deepseek-v4.1-flash-eco' ? 'claude' : 'codex'
+    return model === 'deepseek/deepseek-v4.1-flash-eco' || model === 'moonshotai/kimi-k3.1-pro' ? 'claude' : 'codex'
 }
 export function agentPlanGatewayUrl(descriptor: AgentPlanDescriptor): string {
     return `${descriptor.origin}/api/agent-plan/v1/${agentPlanAgent(descriptor.model) === 'claude' ? 'messages' : 'responses'}`

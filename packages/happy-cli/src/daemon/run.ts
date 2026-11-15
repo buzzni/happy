@@ -17,6 +17,8 @@ import { createMachineSetupTokenRuntime, type MachineSetupTokenRuntime } from '.
 import { createDeviceOrgPinStore, migrateLegacyDeviceState } from './deviceOrgPinStore';
 import { spawnRefusalForRemoval, worktreeRemovalReservations } from './worktreeRemovalReservations';
 import { createDeviceEnrollment } from './deviceEnrollment';
+import { createOrgSubagentRuntime, readOrgSubagentRegistration } from './orgEndpointSubagentRuntime';
+import { ORG_SUBAGENT_OPERATION_ENV } from '@/utils/childEnv';
 import { createMachineTypeMarker } from './machineTypeMarker';
 import { createSharedPcAutoConfirm } from './sharedPcAutoConfirm';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
@@ -376,6 +378,7 @@ import {
 import { mergeAdditionalDirectoriesIntoSandboxEnvironment, readAdditionalDirectoriesEnvironment, replaceApprovedWriteRootsInEnvironment } from '@/utils/additionalDirectoriesEnv';
 import { resolveSandboxTrustFloor } from '@/sandbox/config';
 import { createAutomationContextWorkspace } from './automations/automationContextWorkspace';
+import { manualLaunchRefusal } from './manualLaunchRefusal';
 import { createAutomationContextHost, prepareAutomationContextTick } from './automations/automationContextHost';
 import { createAutomationContextReferenceReader } from './automations/automationContextReference';
 import { createAutomationQuestionWorker, withAutomationQuestionWorker } from './automations/automationQuestionWorker';
@@ -2010,8 +2013,6 @@ export async function startDaemon(): Promise<void> {
           return 'unconfirmed';
         }
       } }) : null;
-    const workspaceBusy = (): SpawnSessionResult => ({ type: 'error', code: 'workspace-automation-busy',
-      errorMessage: 'This workspace is running a scheduled task. Retry after it finishes.' });
     const manualPreparationRoots = async (roots: string[]) => Promise.all(roots.map(async root => {
       let candidate = resolve(root);
       while (true) {
@@ -2065,6 +2066,7 @@ export async function startDaemon(): Promise<void> {
       return value.id;
     };
 
+    let orgSubagent: ReturnType<typeof createOrgSubagentRuntime> | undefined;
     const applyManualPersonal = createManualPersonalSpawn(readTrustedStudioOrigin(process.env), machineId);
     // aplus specs/org-llm-endpoints r2 — tells Studio an endpoint session started, and asks it before a resume rebuilds one.
     const orgEndpointStudio = createOrgLlmEndpointStudioClient({
@@ -2082,7 +2084,8 @@ export async function startDaemon(): Promise<void> {
       },
       warn: (message) => logger.warn(message),
     });
-    type WorkspaceLaunchObservation = { submitted: boolean; tracked: boolean; onObservedExit?: () => Promise<void> };
+    type WorkspaceLaunchObservation = { submitted: boolean; tracked: boolean; exitObserved?: boolean;
+      onObservedExit?: () => Promise<void>; onUnconfirmedExit?: () => Promise<void> };
     const spawnSessionUnchecked = async (
       options: SpawnSessionOptions,
       trustedMcpContext?: AutomationMcpSpawnContext,
@@ -2213,7 +2216,8 @@ export async function startDaemon(): Promise<void> {
               : { ...result, appliedAiAuthSource, ...(appliedPersonalEndpoint ? { personalLlmEndpoint: appliedPersonalEndpoint } : {}) };
             const withEndpoint: SpawnSessionResult = { ...withAuthSource, ...(appliedOrgLlmEndpoint ? { appliedOrgLlmEndpoint } : {}) };
             // Not awaited, never fails the spawn: the session already runs, and Studio learns of it on its own clock.
-            if (appliedOrgLlmEndpoint) void orgEndpointStartReports.reportAfterSpawn(result.sessionId, appliedOrgLlmEndpoint);
+            if (appliedOrgLlmEndpoint && !readPersistedSessions()[result.sessionId]?.agentEnvironment?.[ORG_SUBAGENT_OPERATION_ENV])
+              void orgEndpointStartReports.reportAfterSpawn(result.sessionId, appliedOrgLlmEndpoint);
             const reported: SpawnSessionResult = launchMcpDropped ? { ...withEndpoint, launchMcpDropped } : withEndpoint;
             if (options.additionalDirectories === undefined) return reported;
             return {
@@ -2821,6 +2825,8 @@ export async function startDaemon(): Promise<void> {
             },
             onTracked: () => { if (workspaceLaunch) workspaceLaunch.tracked = true; },
             onWorkspaceExit: workspaceLaunch?.onObservedExit,
+            onWorkspaceObservation: () => { if (workspaceLaunch) workspaceLaunch.exitObserved = true; },
+            onWorkspaceUnconfirmed: workspaceLaunch?.onUnconfirmedExit,
             args,
             cwd: directory,
             env: spawnEnvironment,
@@ -2855,6 +2861,8 @@ export async function startDaemon(): Promise<void> {
       onProcessSubmission,
       onTracked,
       onWorkspaceExit,
+      onWorkspaceObservation,
+      onWorkspaceUnconfirmed,
       args,
       cwd,
       env,
@@ -2870,6 +2878,8 @@ export async function startDaemon(): Promise<void> {
       onProcessSubmission?: () => void;
       onTracked?: () => void;
       onWorkspaceExit?: () => Promise<void>;
+      onWorkspaceObservation?: () => void;
+      onWorkspaceUnconfirmed?: () => Promise<void>;
       args: string[];
       cwd: string;
       env: NodeJS.ProcessEnv;
@@ -2890,8 +2900,9 @@ export async function startDaemon(): Promise<void> {
       }
       const workspaceReservation = contextWorkspace && !onOwnedChild
         ? await contextWorkspace.beginManualLaunch([cwd, ...readAdditionalDirectoriesEnvironment(env)]) : null;
-      if (workspaceReservation && !workspaceReservation.acquired) return workspaceBusy();
+      if (workspaceReservation && !workspaceReservation.acquired) return manualLaunchRefusal(workspaceReservation);
       const workspaceLaunch = { submitted: false, tracked: false };
+      let exitObserved = false;
       try {
       // Native preparation creates a suspended root; authorize execution at resume below.
       const prepareStartedAt = Date.now();
@@ -2935,10 +2946,17 @@ export async function startDaemon(): Promise<void> {
                 await onWorkspaceExit?.();
               } });
               manualWorkspaceChildren.set(pid, owned);
-              void owned.closed.then(confirmed => {
+              exitObserved = true; onWorkspaceObservation?.();
+              void owned.closed.then(async confirmed => {
                 if (manualWorkspaceChildren.get(pid) === owned) manualWorkspaceChildren.delete(pid);
-                if (!confirmed) logger.warn('[workspace-context] Owned manual exit remains unconfirmed');
-              });
+                if (!confirmed) {
+                  logger.warn('[workspace-context] Owned manual exit remains unconfirmed');
+                  const results = await Promise.allSettled([reservation.retainUnconfirmed(), onWorkspaceUnconfirmed?.()]);
+                  for (const result of results) if (result.status === 'rejected') {
+                    logger.warn('[workspace-context] Unknown writer custody handoff unconfirmed', result.reason);
+                  }
+                }
+              }).catch(error => logger.warn('[workspace-context] Manual exit custody observation failed', error));
             }
             onOwnedChild?.(child);
             return child;
@@ -3007,7 +3025,13 @@ export async function startDaemon(): Promise<void> {
       } finally { if (prepared && !resumed) prepared.cancelBeforeResume?.(); }
 
       } finally {
-        if (workspaceReservation?.acquired) await workspaceReservation.finish(workspaceLaunch);
+        if (workspaceReservation?.acquired) {
+          await workspaceReservation.finish(workspaceLaunch);
+          if (workspaceLaunch.submitted && !exitObserved) {
+            try { await workspaceReservation.retainUnconfirmed(); }
+            catch (error) { logger.warn('[workspace-context] Unobserved launch custody handoff unconfirmed', error); }
+          }
+        }
       }
 
     };
@@ -3363,8 +3387,8 @@ export async function startDaemon(): Promise<void> {
         // token, a stopped endpoint, a revoked assignment). Studio confirms the binding, or the session is not resumed.
         if (resumeOrgEndpoint) {
           // A start report Studio never took is sent first; resume-check is still the authority, so a failure here only logs.
-          await orgEndpointStartReports.resendIfPending(happySessionId, { bindingId: resumeOrgEndpoint.bindingId, targetId: resumeOrgEndpoint.candidates[0]! });
-          const endpointVerdict = await orgEndpointStudio.checkResume({
+          if (!orgSubagent?.hasAuthority(happySessionId)) await orgEndpointStartReports.resendIfPending(happySessionId, { bindingId: resumeOrgEndpoint.bindingId, targetId: resumeOrgEndpoint.candidates[0]! });
+          const endpointVerdict = await (orgSubagent?.hasAuthority(happySessionId) ? orgSubagent : orgEndpointStudio).checkResume({
             bindingId: resumeOrgEndpoint.bindingId, sessionId: happySessionId, endpointId: resumeOrgEndpoint.endpointId,
             targetId: resumeOrgEndpoint.candidates[0]!, generation: resumeOrgEndpoint.generation,
           });
@@ -3732,16 +3756,25 @@ export async function startDaemon(): Promise<void> {
         if (removalRefusal) return { type: 'error', errorMessage: removalRefusal };
         if (contextWorkspace && !contextOwnedChildren.has(options)) {
           workspaceReservation = await contextWorkspace.beginManualLaunch(await manualPreparationRoots([options.directory, ...options.additionalDirectories ?? []]));
-          if (!workspaceReservation.acquired) return workspaceBusy();
+          if (!workspaceReservation.acquired) return manualLaunchRefusal(workspaceReservation);
           const reservation = workspaceReservation;
           workspaceLaunch.onObservedExit = async () => {
             if (!await reservation.finish({ submitted: true, tracked: true }, observedWorkspaceExit)) throw new Error('WORKSPACE_CUSTODY_UNCONFIRMED');
           };
+          workspaceLaunch.onUnconfirmedExit = () => reservation.retainUnconfirmed();
           stopSubmissionObservation = ownedStartGuard.observeSubmission(options);
         }
         return await spawnSessionUnchecked(options, trustedMcpContext, workspaceLaunch);
       } finally {
-        try { if (workspaceReservation?.acquired) await workspaceReservation.finish(workspaceLaunch); }
+        try {
+          if (workspaceReservation?.acquired) {
+            await workspaceReservation.finish(workspaceLaunch);
+            if (workspaceLaunch.submitted && !workspaceLaunch.exitObserved) {
+              try { await workspaceReservation.retainUnconfirmed(); }
+              catch (error) { logger.warn('[workspace-context] Unobserved preparation custody handoff unconfirmed', error); }
+            }
+          }
+        }
         finally { stopSubmissionObservation?.(); endLaunch(); }
       }
     };
@@ -6035,6 +6068,34 @@ export async function startDaemon(): Promise<void> {
           savedAt: Date.now(), lastProcessedSeq: 0 });
       },
     });
+    if (!managedRuntimeActive && !standaloneWindows && machine.encryptionVariant === 'dataKey' && deviceKeys && deviceEnrollment && trustedStudioOrigin) {
+      const enrollment = deviceEnrollment;
+      orgSubagent = createOrgSubagentRuntime({ home: configuration.happyHomeDir, machineId, studioOrigin: trustedStudioOrigin,
+        endpointStorePath: join(os.homedir(), '.happy', 'org-llm-endpoints.json'),
+        warn: message => logger.warn(message),
+        happyOrigin: new URL(configuration.serverUrl).origin, keys: deviceKeys, strict: () => configuration.machineControl === 'strict',
+        pin: companyId => enrollment.orgPin(companyId), records: readPersistedSessions,
+        registration: async () => {
+          return readOrgSubagentRegistration({ machineId, credentials, happyOrigin: new URL(configuration.serverUrl).origin,
+            read: async () => { const [credentials, settings] = await Promise.all([readCredentials(), readSettings()]); return { credentials, settings }; } });
+        },
+        metadata: options => ({ path: options.directory, host: os.hostname(), version: packageJson.version, os: os.platform(), machineId,
+          homeDir: os.homedir(), happyHomeDir: configuration.happyHomeDir, happyLibDir: projectPath(), happyToolsDir: join(projectPath(), 'tools', 'unpacked'),
+          flavor: options.agent ?? 'claude', startedFromDaemon: true, startedBy: 'daemon', lifecycleState: 'running', lifecycleStateSince: Date.now() }),
+        sync: raw => aiCredentialRuntime.orgLlmEndpointSync(raw), environment: selection => aiCredentialRuntime.sessionEnvironment('claude', selection),
+        reportParent: async sessionId => {
+          const selection = readOrgEndpointResumeSelection(readPersistedSessions()[sessionId]?.agentEnvironment);
+          if (selection) await orgEndpointStartReports.resendIfPending(sessionId, { bindingId: selection.bindingId, targetId: selection.candidates[0]! });
+        },
+        start: options => spawnSessionAdmitted(options),
+        persist: async (session, agentEnvironment) => {
+          const prior = readPersistedSessions()[session.id];
+          return persistSessionDurably(session.id, { ...prior, encryptionKey: encodeBase64(session.encryptionKey), encryptionVariant: session.encryptionVariant,
+            seq: session.seq, metadataVersion: session.metadataVersion, agentStateVersion: session.agentStateVersion, metadata: session.metadata,
+            agentEnvironment: { ...prior?.agentEnvironment, ...agentEnvironment }, savedAt: Date.now(), lastProcessedSeq: 0 }).status === 'committed';
+        },
+      });
+    }
     // Switch off: no lookup, so every launch is exactly the existing one.
     if (process.env[OWNER_CONTACT_SWITCH] === '1') ownedLaunchLineage = sessionId => ownedSpawn.launchLineage(sessionId);
     ownedPipeOnlyLaunch = options => ownedSpawn.pipeOnlyLaunch(options);
@@ -6061,6 +6122,7 @@ export async function startDaemon(): Promise<void> {
         }),
       } }),
       ownedSpawn,
+      orgSubagent,
       daemonSessionState: createDaemonSessionStateHandler(getCurrentChildren),
       byosOfflineReceive,
       difficultyRouting: difficultyRoutingHost,

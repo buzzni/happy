@@ -239,7 +239,7 @@ describe('pinned organization LLM endpoint at the SDK request boundary', () => {
             CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1', ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', CLAUDE_CODE_USE_MANTLE: '', ANTHROPIC_PROFILE: '', ANTHROPIC_UNIX_SOCKET: '',
         });
         // Exactly the daemon's non-marker keys, nothing the settings files could add.
-        expect(Object.keys(applied.env).filter(key => key !== 'KEEP_FLAG_ENV').sort()).toEqual([...ORG_ENDPOINT_OWNED_ENV_KEYS].sort());
+        expect(Object.keys(applied.env).filter(key => key !== 'KEEP_FLAG_ENV').sort()).toEqual(ORG_ENDPOINT_OWNED_ENV_KEYS.filter(key=>key!=='CLAUDE_CODE_MAX_OUTPUT_TOKENS').sort());
         expect((f.create.mock.calls[0][0] as unknown as { options: Options }).options.env).toMatchObject(daemonEnv);
         expect(f.received).toHaveLength(1);
     });

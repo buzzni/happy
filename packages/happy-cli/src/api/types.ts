@@ -281,7 +281,7 @@ export const MachineMetadataSchema = z.object({
    * A separate field rather than a v2 of `aiAuthSelection`, which clients support at exactly version 1.
    * Windows daemons do not publish it (§6.3-5).
    */
-  agentPlan: z.object({ version: z.literal(1), claude: z.literal(1).optional() }).optional(),
+  agentPlan: z.object({ version: z.literal(1), claude: z.literal(1).optional(), claudeModels:z.array(z.string().min(1).max(200)).max(100).optional() }).optional(),
   /**
    * Saycode specs/claude-cli-benchmark-followups R2 — `spawn-happy-session` accepts `outputFormat`
    * for these agents. Absent on an older daemon, which would drop the field and run the session
@@ -773,7 +773,7 @@ export type Metadata = {
    * record refuses a new session when it is present. Absent on every other session and on older runtimes.
    */
   personalLlmEndpoint?: import('@/daemon/personalLlmEndpoint').PersonalEndpointMarker
-  orgLlmEndpoint?: { version: 1; bindingId: string; endpointId: string }
+  orgLlmEndpoint?: { version: 1; bindingId: string; endpointId: string; selectedModel?: string }
   /**
    * Who started the session (`user`, `schedule`, `github-trigger`, …). An open
    * enum written once at creation; absent on older sessions and on spawns that

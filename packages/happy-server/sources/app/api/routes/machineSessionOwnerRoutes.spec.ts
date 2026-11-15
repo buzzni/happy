@@ -31,6 +31,7 @@ async function createApp() {
             return reply.code(401).send({ error: "Unauthorized" });
         }
         request.userId = userId;
+        request.principal = { kind: 'account', accountId: userId };
     });
     machineSessionOwnerRoutes(typed);
     await typed.ready();
@@ -67,6 +68,13 @@ describe("machineSessionOwnerRoutes — POST /v1/machine-sessions/:sessionId/own
     let app: Fastify;
     beforeEach(() => { resetState(); sessionFindFirst.mockClear(); machineFindFirst.mockClear(); });
     afterEach(async () => { if (app) await app.close(); });
+    it('advertises the execution-proof and relay contract only to authenticated accounts', async () => {
+        app = await createApp();
+        expect((await app.inject({ method: 'GET', url: '/v1/org-endpoint-subagent/capabilities' })).statusCode).toBe(401);
+        const response = await app.inject({ method: 'GET', url: '/v1/org-endpoint-subagent/capabilities', headers: { 'x-user-id': 'account' } });
+        expect(response.statusCode).toBe(200);
+        expect(response.json()).toEqual({ orgEndpointSubagentVersion: 1, executionProofVersion: 1, relayTimeoutMs: 630000 });
+    });
 
     it("reports the owning account when both the session and the machine belong to it", async () => {
         state.session = { id: "S-1", accountId: "acc-1" };
