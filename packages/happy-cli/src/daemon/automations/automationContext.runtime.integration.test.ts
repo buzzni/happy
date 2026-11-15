@@ -21,6 +21,45 @@ import { createAutomationContextHost } from './automationContextHost'
 import { createAutomationContextAuthorizer, createAutomationContextTransport } from './automationContextTransport'
 import { createServerAutomationRuntimeStore } from './serverAutomationRuntimeStore'
 import { createAutomationContextWorkspace } from './automationContextWorkspace'
+import { SandboxConfigSchema } from '@/persistence'
+
+it.skipIf(process.platform !== 'darwin')('coalesces unobserved write-scope launches while their native children remain running', async () => {
+  const fixture = new SessionWriteScopeFixture({ provider: 'codex', encryptionVariant: 'legacy', automationContextHost: true })
+  try {
+    await fixture.start()
+    const config = SandboxConfigSchema.parse({ sessionIsolation: 'strict', networkMode: 'custom', allowedDomains: ['127.0.0.1', 'localhost'] })
+    const first = await fixture.spawnSession(fixture.project, config)
+    const second = await fixture.spawnSession(fixture.project, config)
+    const children = await fixture.children()
+    expect(children.map(child => child.happySessionId)).toEqual(expect.arrayContaining([first, second]))
+    const owners = JSON.parse(await readFile(join(fixture.happyHome, 'workspace-turn-admission.v1', 'owners.json'), 'utf8')).owners
+    expect(owners).toEqual([expect.objectContaining({ kind: 'unfenced', roots: [fixture.project] })])
+    const workspace = createAutomationContextWorkspace({ home: fixture.happyHome, isTracked: async () => false })
+    expect(await workspace.acquireAutomation({ runId: 'unobserved-launch', roots: [fixture.project] })).toMatchObject({ acquired: false })
+    expect(await workspace.acquireAutomation({ runId: 'unrelated-launch', roots: [fixture.otherProject] })).toMatchObject({ acquired: true })
+  } finally { await fixture.close() }
+})
+
+it.each(['claude', 'codex'] as const)('retains both real %s launch reservations as folder-scoped custody after an unconfirmed stop', async provider => {
+  const fixture = new SessionWriteScopeFixture({ provider, encryptionVariant: 'legacy', automationContextHost: true })
+  try {
+    await fixture.start()
+    const sessionId = await fixture.spawnSession(fixture.project, { enabled: false })
+    const file = join(fixture.happyHome, 'workspace-turn-admission.v1', 'owners.json')
+    const readOwners = async () => JSON.parse(await readFile(file, 'utf8')).owners as Array<{ kind: string; roots: string[] }>
+    expect((await readOwners()).filter(owner => owner.kind === 'manual-launch')).toHaveLength(2)
+    expect((await fixture.control('/stop-session', { sessionId })).body.stopped).toBe(true)
+    const owners = await eventually(async () => {
+      const value = await readOwners()
+      return value.every(owner => owner.kind !== 'manual-launch') ? value : undefined
+    }, 'both launch reservations transfer unknown custody after the child closes', 15_000)
+    expect(owners).toHaveLength(1)
+    expect(owners[0]).toMatchObject({ kind: 'unfenced', roots: [fixture.project] })
+    const workspace = createAutomationContextWorkspace({ home: fixture.happyHome, isTracked: async () => false })
+    expect(await workspace.acquireAutomation({ runId: 'stopped-manual', roots: [fixture.project] })).toMatchObject({ acquired: false })
+    expect(await workspace.acquireAutomation({ runId: 'unrelated-manual', roots: [fixture.otherProject] })).toMatchObject({ acquired: true })
+  } finally { await fixture.close() }
+})
 
 it.each(['claude', 'codex'] as const)('runs two publicly registered isolated %s occurrences and a selected follow-up with the manual chat unchanged', async provider => {
   vi.stubEnv('HAPPY_SCOPE_FRESH_PROVIDER_STATE', '1')
