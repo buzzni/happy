@@ -8,7 +8,7 @@ import { HappySessionExecutionProofSchema, SessionExecutionTicketBodySchema, Sig
     rotationDigest, rotationSha256, sessionCreateBodyHash, sessionTagHash, signRotationDocument, verifyRotationDocument,
     verifySubagentRequest, type SessionExecutionTicket } from '@slopus/happy-wire';
 import { configuration } from '@/configuration';
-import { createOrgSubagentRuntime, type OrgSubagentPersisted } from './orgEndpointSubagentRuntime';
+import { createOrgSubagentRuntime, readOrgSubagentRegistration, type OrgSubagentPersisted } from './orgEndpointSubagentRuntime';
 import { buildSpawnRequestEnvironment, captureSaycodeAgentEnvironment, formatOrgEndpointBinding } from './sessionEnv';
 import { ORG_ENDPOINT_BINDING_ENV } from '@/utils/childEnv';
 import { createNodeAiCredentialRuntime } from './aiCredentialRuntime';
@@ -167,5 +167,40 @@ describe('org subagent production adapter', () => {
             await new Promise<void>(resolve => http.close(() => resolve()));
             await rm(home, { recursive: true, force: true });
         }
+    });
+});
+
+
+describe('subagent current registration', () => {
+    it('uses the authenticated server machine instead of the unwritten local confirmation flag, and rejects identity changes', async () => {
+        const credentials = { token: 'registration-test', encryption: { type: 'dataKey' as const, publicKey: new Uint8Array(32), machineKey: new Uint8Array(32) } };
+        let status = 200, returnedId = 'machine', reads = 0, changeDuringLookup = false, requests = 0;
+        const http = createServer((req, res) => {
+            requests++; expect(req.method).toBe('GET'); expect(req.url).toBe('/v1/machines/machine');
+            expect(req.headers.authorization).toBe('Bearer registration-test');
+            res.writeHead(status, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ machine: { id: returnedId, accountId: 'account' } }));
+        });
+        await new Promise<void>(resolve => http.listen(0, '127.0.0.1', resolve));
+        const origin = `http://127.0.0.1:${(http.address() as { port: number }).port}`;
+        const read = async () => { reads++; return { credentials: changeDuringLookup && reads > 1 ? { ...credentials, token: 'replacement' } : credentials,
+            settings: { machineId: 'machine' } }; };
+        const invoke = () => { reads = 0; return readOrgSubagentRegistration({ machineId: 'machine', credentials, happyOrigin: origin, read }); };
+        try {
+            await expect(invoke()).resolves.toMatchObject({ machineId: 'machine', happyAccountId: 'account', credentials });
+            expect(reads).toBe(2); expect(requests).toBe(1);
+            returnedId = 'another-machine';
+            await expect(invoke()).rejects.toMatchObject({ code: 'ORG_LLM_ENDPOINT_MACHINE_FORBIDDEN' });
+            returnedId = 'machine'; changeDuringLookup = true;
+            await expect(invoke()).rejects.toMatchObject({ code: 'ORG_LLM_ENDPOINT_MACHINE_FORBIDDEN' });
+            changeDuringLookup = false; status = 404;
+            await expect(invoke()).rejects.toMatchObject({ code: 'ORG_LLM_ENDPOINT_MACHINE_FORBIDDEN' });
+            status = 503;
+            await expect(invoke()).rejects.toMatchObject({ code: 'ORG_LLM_ENDPOINT_VERIFICATION_UNAVAILABLE' });
+            const before = requests;
+            await expect(readOrgSubagentRegistration({ machineId: 'other', credentials, happyOrigin: origin, read }))
+                .rejects.toMatchObject({ code: 'ORG_LLM_ENDPOINT_MACHINE_FORBIDDEN' });
+            expect(requests).toBe(before);
+        } finally { await new Promise<void>(resolve => http.close(() => resolve())); }
     });
 });

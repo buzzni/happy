@@ -14,7 +14,7 @@ import { createMachineSetupTokenRuntime, type MachineSetupTokenRuntime } from '.
 import { createDeviceOrgPinStore, migrateLegacyDeviceState } from './deviceOrgPinStore';
 import { spawnRefusalForRemoval, worktreeRemovalReservations } from './worktreeRemovalReservations';
 import { createDeviceEnrollment } from './deviceEnrollment';
-import { createOrgSubagentRuntime } from './orgEndpointSubagentRuntime';
+import { createOrgSubagentRuntime, readOrgSubagentRegistration } from './orgEndpointSubagentRuntime';
 import { ORG_SUBAGENT_OPERATION_ENV } from '@/utils/childEnv';
 import { createMachineTypeMarker } from './machineTypeMarker';
 import { createSharedPcAutoConfirm } from './sharedPcAutoConfirm';
@@ -6008,8 +6008,8 @@ export async function startDaemon(): Promise<void> {
         happyOrigin: new URL(configuration.serverUrl).origin, keys: deviceKeys, strict: () => configuration.machineControl === 'strict',
         pin: companyId => enrollment.orgPin(companyId), records: readPersistedSessions,
         registration: async () => {
-          const state = await ownedRegistration(), happyAccountId = accountByToken.get(state.credentials.token) ?? await authenticatedAccountId(state.credentials.token);
-          accountByToken.set(state.credentials.token, happyAccountId); return { ...state, happyAccountId };
+          return readOrgSubagentRegistration({ machineId, credentials, happyOrigin: new URL(configuration.serverUrl).origin,
+            read: async () => { const [credentials, settings] = await Promise.all([readCredentials(), readSettings()]); return { credentials, settings }; } });
         },
         metadata: options => ({ path: options.directory, host: os.hostname(), version: packageJson.version, os: os.platform(), machineId,
           homeDir: os.homedir(), happyHomeDir: configuration.happyHomeDir, happyLibDir: projectPath(), happyToolsDir: join(projectPath(), 'tools', 'unpacked'),

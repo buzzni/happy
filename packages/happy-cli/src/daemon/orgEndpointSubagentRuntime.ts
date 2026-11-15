@@ -1,5 +1,6 @@
 /** Production adapter for user-gated roots and endpoint children. All keys, create snapshots and execution decisions stay in daemon custody. */
 import { readFile, realpath } from 'node:fs/promises';
+import { isDeepStrictEqual } from 'node:util';
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import { z } from 'zod';
 import { ApiClient } from '@/api/api';
@@ -41,6 +42,34 @@ const snapshotSchema = z.object({ options: z.record(z.string(), z.unknown()),
 }).strict();
 type Snapshot = z.infer<typeof snapshotSchema>;
 const code = (name: string): never => { throw new OrgSubagentRefused(`ORG_LLM_ENDPOINT_${name}`); };
+
+/** Current account-authenticated ownership, without the obsolete and unwritten settings confirmation flag. */
+export async function readOrgSubagentRegistration(input: {
+    machineId: string; credentials: Credentials; happyOrigin: string;
+    read(): Promise<{ credentials: Credentials | null; settings: { machineId?: string } }>;
+}) {
+    const current = async () => {
+        const value = await input.read();
+        if (!value.credentials || value.settings.machineId !== input.machineId
+            || !isDeepStrictEqual(value.credentials, input.credentials)) return code('MACHINE_FORBIDDEN');
+        return value.credentials;
+    };
+    const credentials = await current();
+    let response: Response, raw: unknown;
+    try {
+        response = await fetch(input.happyOrigin + '/v1/machines/' + encodeURIComponent(input.machineId), {
+            headers: { Authorization: `Bearer ${credentials.token}` }, redirect: 'error', signal: AbortSignal.timeout(10_000),
+        });
+        if (response.ok) raw = await response.json();
+    } catch { return code('VERIFICATION_UNAVAILABLE'); }
+    if (!response.ok) return code([401, 403, 404].includes(response.status) ? 'MACHINE_FORBIDDEN' : 'VERIFICATION_UNAVAILABLE');
+    const verified = z.object({ machine: z.object({ id, accountId: id }) }).safeParse(raw);
+    if (!verified.success) return code('VERIFICATION_UNAVAILABLE');
+    if (verified.data.machine.id !== input.machineId) return code('MACHINE_FORBIDDEN');
+    // A slow owner lookup must not keep credentials that were replaced while it was pending.
+    await current();
+    return { machineId: input.machineId, credentials, happyAccountId: verified.data.machine.accountId };
+}
 
 export function createOrgSubagentRuntime(deps: Dependencies) {
     const journal = createOrgSubagentJournal(deps.home);
