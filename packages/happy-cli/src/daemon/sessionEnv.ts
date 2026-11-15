@@ -608,7 +608,7 @@ export type AiAuthSelection =
      * the server's order) against its locally stored entry. `resume` is daemon-internal — set only when a resume
      * rebuilds the recorded target — and never read from a request.
      */
-    | { kind: 'org-endpoint'; bindingId: string; endpointId: string; generation: number; candidates: string[]; resume?: true }
+    | { kind: 'org-endpoint'; bindingId: string; endpointId: string; generation: number; candidates: string[]; snapshotId?: string; resume?: true }
 
 /**
  * Advertised in `MachineMetadataSchema` so a client can tell this daemon
@@ -669,7 +669,9 @@ export function parseAiAuthSelection(value: unknown): AiAuthSelection | undefine
             || !candidates.every(isOrgEndpointId) || new Set(candidates).size !== candidates.length) {
             throw new Error(`AI auth selection org-endpoint requires 1..${ORG_ENDPOINT_MAX_TARGETS} distinct candidates`)
         }
-        return { kind, bindingId, endpointId, generation: Number(generation), candidates: [...candidates] }
+        const snapshotId=(value as Record<string,unknown>).snapshotId
+        if(snapshotId!==undefined && !isOrgEndpointId(snapshotId)) throw new Error('Invalid org endpoint snapshot')
+        return { kind, bindingId, endpointId, generation: Number(generation), candidates: [...candidates], ...(snapshotId ? {snapshotId:snapshotId as string} : {}) }
     }
     return { kind: kind as 'machine-personal' | 'org-bundle' }
 }
@@ -682,16 +684,19 @@ const ORG_ENDPOINT_ID = /^[A-Za-z0-9_-]{1,128}$/
 export const ORG_ENDPOINT_MAX_TARGETS = 16
 export const isOrgEndpointId = (value: unknown): value is string => typeof value === 'string' && ORG_ENDPOINT_ID.test(value)
 
-export type OrgEndpointBinding = { bindingId: string; endpointId: string; targetId: string; generation: number }
+export type OrgEndpointBinding = { bindingId: string; endpointId: string; targetId: string; generation: number; snapshotId?: string; selectedModel?: string }
 
 export function formatOrgEndpointBinding(binding: OrgEndpointBinding): string {
-    return `${binding.bindingId}:${binding.endpointId}:${binding.targetId}:${binding.generation}`
+    return `${binding.bindingId}:${binding.endpointId}:${binding.targetId}:${binding.generation}${binding.snapshotId ? `:${binding.snapshotId}:${Buffer.from(binding.selectedModel ?? '').toString('base64url')}` : ''}`
 }
 
 export function parseOrgEndpointBinding(value: string): OrgEndpointBinding | null {
     const parts = value.split(':')
-    if (parts.length !== 4 || !parts.slice(0, 3).every(isOrgEndpointId) || !/^[1-9]\d{0,14}$/.test(parts[3]!)) return null
-    return { bindingId: parts[0]!, endpointId: parts[1]!, targetId: parts[2]!, generation: Number(parts[3]) }
+    if ((parts.length !== 4 && parts.length !== 6) || !parts.slice(0, 3).every(isOrgEndpointId) || !/^[1-9]\d{0,14}$/.test(parts[3]!)) return null
+    if(parts.length===6 && (!isOrgEndpointId(parts[4]) || !/^[A-Za-z0-9_-]{1,300}$/.test(parts[5]!))) return null
+    const selectedModel=parts.length===6 ? Buffer.from(parts[5]!,'base64url').toString('utf8') : undefined
+    if(selectedModel!==undefined && (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*\/[a-zA-Z0-9][a-zA-Z0-9._-]{0,190}$/.test(selectedModel) || Buffer.from(selectedModel).toString('base64url')!==parts[5])) return null
+    return { bindingId: parts[0]!, endpointId: parts[1]!, targetId: parts[2]!, generation: Number(parts[3]), ...(parts.length===6 ? {snapshotId:parts[4]!,selectedModel} : {}) }
 }
 
 /** Which binding and target the daemon applied to a finished managed environment; what the spawn result reports. */
@@ -711,7 +716,7 @@ export function readOrgEndpointResumeSelection(agentEnvironment: SaycodeAgentEnv
     const binding = parseOrgEndpointBinding(raw)
     if (!binding) throw new Error('Recorded org endpoint binding is invalid; the session is not resumed with another endpoint')
     return { kind: 'org-endpoint', bindingId: binding.bindingId, endpointId: binding.endpointId, generation: binding.generation,
-        candidates: [binding.targetId], resume: true }
+        candidates: [binding.targetId], ...(binding.snapshotId ? {snapshotId:binding.snapshotId} : {}), resume: true }
 }
 
 /**

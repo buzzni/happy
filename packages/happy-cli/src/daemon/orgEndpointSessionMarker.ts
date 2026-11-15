@@ -12,12 +12,12 @@ import { isOrgEndpointConversationAnywhere } from '@/claude/utils/orgEndpointCon
 import { parseOrgEndpointBinding } from './sessionEnv'
 
 /** `Metadata.orgLlmEndpoint`: only ids, never an address, a target or a token. */
-export type OrgEndpointSessionMarker = { version: 1; bindingId: string; endpointId: string }
+export type OrgEndpointSessionMarker = { version: 1; bindingId: string; endpointId: string; selectedModel?: string }
 
 /** The marker for a session started with this binding env value, or undefined when there is none. */
 export function orgEndpointMarker(bindingEnv: string | undefined): OrgEndpointSessionMarker | undefined {
     const binding = parseOrgEndpointBinding(bindingEnv ?? '')
-    return binding ? { version: 1, bindingId: binding.bindingId, endpointId: binding.endpointId } : undefined
+    return binding ? { version: 1, bindingId: binding.bindingId, endpointId: binding.endpointId, ...(binding.selectedModel ? {selectedModel:binding.selectedModel} : {}) } : undefined
 }
 
 /** Whether session metadata carries the marker. Presence is enough: a shape this build cannot read still binds. */
