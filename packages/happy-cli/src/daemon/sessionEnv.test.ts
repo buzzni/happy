@@ -1,3 +1,4 @@
+import { PERSONAL_ENDPOINT_BINDING_ENV, personalEndpointMarker } from './personalLlmEndpoint'
 import { describe, expect, it } from 'vitest'
 import {
     buildManagedSessionSpawnEnvironment,
@@ -1205,4 +1206,14 @@ it('rejects noncanonical and malformed encoded organization model markers',()=>{
  for(const suffix of ['a','AB','_w',Buffer.from('bad\nmodel').toString('base64url')])expect(parseOrgEndpointBinding(head+suffix)).toBeNull()
  const model='moonshotai/kimi-k3.1-pro'
  expect(parseOrgEndpointBinding(head+Buffer.from(model).toString('base64url'))?.selectedModel).toBe(model)
+})
+
+
+describe('personal endpoint capture preserves an invalid binding', () => {
+    it.each(['', '{broken', '{}', JSON.stringify({ endpointId: 'ep', generation: 1 })])('captures a corrupt record as a bounded sentinel and still refuses resume: %j', raw => {
+        const captured = captureSaycodeAgentEnvironment({ [PERSONAL_ENDPOINT_BINDING_ENV]: raw })
+        expect(captured).toEqual({ [PERSONAL_ENDPOINT_BINDING_ENV]: '' })
+        const persisted = JSON.parse(JSON.stringify(captured))
+        expect(() => personalEndpointMarker(persisted[PERSONAL_ENDPOINT_BINDING_ENV])).toThrow('PERSONAL_ENDPOINT_INVALID')
+    })
 })

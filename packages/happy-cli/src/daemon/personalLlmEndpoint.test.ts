@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { assertPersonalEndpointWorkspace, buildPersonalEndpointEnvironment, parsePersonalEndpointSelection } from './personalLlmEndpoint'
 import { verifyAiAuthSelection } from './sessionEnv'
 import { foldModelToOrgEndpoint } from '@/claude/utils/orgEndpointModel'
@@ -10,6 +10,19 @@ describe('personal endpoint launches', () => {
     expect(parsePersonalEndpointSelection(selection)).toEqual(selection)
     expect(() => parsePersonalEndpointSelection({ ...selection, token: 'secret' })).toThrow()
     expect(() => parsePersonalEndpointSelection({ ...selection, ticket: '' })).toThrow()
+  })
+  it('preserves machine proxy and extra CA while appending local bypasses for the relay', () => {
+    const machine = { HTTPS_PROXY: 'https://corp.proxy', HTTP_PROXY: 'http://corp.proxy', NODE_EXTRA_CA_CERTS: '/corp/ca.pem', NO_PROXY: 'corp.internal' }
+    for (const [key, value] of Object.entries(machine)) vi.stubEnv(key, value)
+    try {
+      const env = buildPersonalEndpointEnvironment(selection, 'pc', relay)
+      expect(env.HTTPS_PROXY).toBe(machine.HTTPS_PROXY)
+      expect(env.HTTP_PROXY).toBe(machine.HTTP_PROXY)
+      expect(env.NODE_EXTRA_CA_CERTS).toBe(machine.NODE_EXTRA_CA_CERTS)
+      expect(env.NO_PROXY?.split(',')).toEqual(['corp.internal', '127.0.0.1', 'localhost', '::1'])
+      expect(env.no_proxy).toBe(env.NO_PROXY)
+      expect(process.env.NO_PROXY).toBe('corp.internal')
+    } finally { vi.unstubAllEnvs() }
   })
   it('marks only an applied local relay and pins model/remote mode without upstream secrets', () => {
     const env = buildPersonalEndpointEnvironment(selection, 'pc', relay)

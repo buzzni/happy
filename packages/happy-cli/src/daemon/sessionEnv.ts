@@ -356,7 +356,10 @@ export function captureSaycodeAgentEnvironment(
     // Same sentinel rule as the setup-token binding: a corrupt record stays bound-but-invalid and the resume refuses it.
     if (env[PERSONAL_ENDPOINT_LEASE_ENV] && /^[\w-]{1,128}$/.test(env[PERSONAL_ENDPOINT_LEASE_ENV]!)) captured[PERSONAL_ENDPOINT_LEASE_ENV] = env[PERSONAL_ENDPOINT_LEASE_ENV]
     const personalBinding = env[PERSONAL_ENDPOINT_BINDING_ENV]
-    if (personalBinding !== undefined) captured[PERSONAL_ENDPOINT_BINDING_ENV] = personalEndpointMarker(personalBinding) ? personalBinding : ''
+    if (personalBinding !== undefined) {
+        try { captured[PERSONAL_ENDPOINT_BINDING_ENV] = personalEndpointMarker(personalBinding) ? personalBinding : '' }
+        catch { captured[PERSONAL_ENDPOINT_BINDING_ENV] = '' } // Preserve the invalid binding so resume refuses it.
+    }
     const orgEndpointBinding = env[ORG_ENDPOINT_BINDING_ENV]
     if (orgEndpointBinding !== undefined) captured[ORG_ENDPOINT_BINDING_ENV] = parseOrgEndpointBinding(orgEndpointBinding) ? orgEndpointBinding : ''
     // An undelivered start report travels with the record until Studio has it (r3); any other value is dropped.

@@ -2,8 +2,9 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { ORG_ENDPOINT_CLEARED_ENV_KEYS, ORG_ENDPOINT_MACHINE_ENV_KEYS } from '@/claude/utils/orgEndpointEnvKeys'
-export const PERSONAL_ENDPOINT_LEASE_ENV = 'HAPPY_AI_AUTH_PERSONAL_ENDPOINT_LEASE'
+import { ensureLocalProxyBypass } from '@/claude/utils/proxyBypass'
 import { PERSONAL_ENDPOINT_BINDING_ENV } from '@/utils/childEnv'
+export const PERSONAL_ENDPOINT_LEASE_ENV = 'HAPPY_AI_AUTH_PERSONAL_ENDPOINT_LEASE'
 export { PERSONAL_ENDPOINT_BINDING_ENV } from '@/utils/childEnv'
 export type PersonalEndpointSelection = { kind: 'personal-endpoint'; issuer: string; ownerUserId: string; endpointId: string; generation: number; ticket: string }
 export type PersonalEndpointMarker = { endpointId: string; generation: number; ownerUserId: string; issuer: string; machineId: string; name: string; model: string; workspace: Record<string, string> }
@@ -44,9 +45,12 @@ export function buildPersonalEndpointEnvironment(selection: PersonalEndpointSele
   let url: URL; try { url = new URL(String(v.baseUrl)) } catch { return fail() }
   if (v.version !== 1 || url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !/^\/inference\/[\w-]+$/.test(url.pathname) || url.username || url.password || url.search || url.hash || typeof v.relayToken !== 'string' || !/^[\w-]{16,128}$/.test(v.relayToken) || typeof v.model !== 'string' || !/^[!-~]{1,200}$/.test(v.model) || !Number.isSafeInteger(v.maxContextTokens) || Number(v.maxContextTokens) < 1024 || !Number.isSafeInteger(v.apiTimeoutMs) || Number(v.apiTimeoutMs) < 10_000) return fail()
   if (v.purpose !== 'test') assertPersonalEndpointWorkspace(v.workspace, v.workspace)
-  const tiers = object(v.modelTiers), env: Record<string, string> = Object.fromEntries([...ORG_ENDPOINT_CLEARED_ENV_KEYS, ...ORG_ENDPOINT_MACHINE_ENV_KEYS].map(key => [key, '']))
+  const tiers = object(v.modelTiers), env: Record<string, string> = Object.fromEntries(ORG_ENDPOINT_CLEARED_ENV_KEYS.map(key => [key, '']))
+  // Preserve the machine's transport for Happy, MCP and tools; only the relay bypasses its proxy.
+  for (const key of ORG_ENDPOINT_MACHINE_ENV_KEYS) if (process.env[key] !== undefined) env[key] = process.env[key]!
+  ensureLocalProxyBypass(env)
   Object.assign(env, { ANTHROPIC_BASE_URL: url.toString().replace(/\/$/, ''), ANTHROPIC_AUTH_TOKEN: v.relayToken, ANTHROPIC_MODEL: v.model, CLAUDE_CODE_SUBAGENT_MODEL: v.model,
-    CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(v.maxContextTokens), API_TIMEOUT_MS: String(v.apiTimeoutMs), CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1', HAPPY_AI_AUTH_SOURCE: 'personal-endpoint', NO_PROXY: '127.0.0.1,localhost,::1', NODE_TLS_REJECT_UNAUTHORIZED: '1' })
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(v.maxContextTokens), API_TIMEOUT_MS: String(v.apiTimeoutMs), CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1', HAPPY_AI_AUTH_SOURCE: 'personal-endpoint' })
   for (const tier of ['OPUS', 'SONNET', 'HAIKU', 'FABLE']) env[`ANTHROPIC_DEFAULT_${tier}_MODEL`] = typeof tiers[tier.toLowerCase()] === 'string' ? String(tiers[tier.toLowerCase()]) : v.model
   if (typeof v.leaseId !== 'string' || !/^[\w-]{1,128}$/.test(v.leaseId)) return fail()
   env[PERSONAL_ENDPOINT_LEASE_ENV] = v.leaseId

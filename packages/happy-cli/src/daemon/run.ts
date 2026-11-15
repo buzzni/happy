@@ -2178,6 +2178,7 @@ export async function startDaemon(): Promise<void> {
         removeDeferredContinuationContextFile(file);
       };
 
+      let personalLeaseEnvironment: Record<string, string> | undefined;
       try {
         const additionalDirectoryResult = await prepareAdditionalDirectories({
           requested: options.additionalDirectories,
@@ -2186,9 +2187,8 @@ export async function startDaemon(): Promise<void> {
           approvedRoots: resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir)?.(),
         });
         let launchMcp: PreparedLaunchMcpServers | undefined;
-        // Set once the managed environment is resolved; stays undefined for every selection but `org-endpoint`.
-        let personalLeaseEnvironment: Record<string, string> | undefined;
         let appliedPersonalEndpoint: ReturnType<typeof personalEndpointMarker>;
+        // Set once the managed environment is resolved; stays undefined for every selection but `org-endpoint`.
         let appliedOrgLlmEndpoint: { bindingId: string; targetId: string } | undefined;
         const finishSpawn = async (
           spawn: Promise<SpawnSessionResult>,
@@ -2207,9 +2207,9 @@ export async function startDaemon(): Promise<void> {
               await releaseBrowserTaskRegistration();
             }
             if (result.type !== 'success') {
-              if (personalLeaseEnvironment) await releasePersonalEndpointEnvironment(personalLeaseEnvironment).catch(() => logger.warn('[personal-llm] relay cleanup failed'));
               return result;
             }
+            personalLeaseEnvironment = undefined; // The confirmed child now owns release.
             const launchMcpDropped = await launchMcp?.report();
             const withAuthSource: SpawnSessionResult = appliedAiAuthSource === undefined
               ? result
@@ -2361,12 +2361,12 @@ export async function startDaemon(): Promise<void> {
           : preparedMachineLaunch?.environment ?? (honorsManagedAiCredentials(options.aiAuthSelection, Boolean(options.agentPlan))
           ? await resolveManagedAiCredentialEnvironment(options.agent, options.aiAuthSelection)
           : {});
+        if (options.aiAuthSelection?.kind === 'personal-endpoint') personalLeaseEnvironment = launchAuthorityEnvironment;
         const personalAnchor = readSetupTokenResumeSelection(launchAuthorityEnvironment)?.binding;
         const managedAiCredentialEnvironment = await applyManualPersonal(options.aiAuthSelection, launchAuthorityEnvironment,
           personalAnchor && !isMachineSetupTokenBinding(personalAnchor) ? personalAnchor : undefined);
         appliedOrgLlmEndpoint = readAppliedOrgLlmEndpoint(managedAiCredentialEnvironment);
         appliedPersonalEndpoint = personalEndpointMarker(managedAiCredentialEnvironment[PERSONAL_ENDPOINT_BINDING_ENV]);
-        if (appliedPersonalEndpoint) personalLeaseEnvironment = managedAiCredentialEnvironment;
         logger.debug(`[timing] spawn managed-credential-environment ${Date.now() - credentialStartedAt}ms`);
         let extraEnv: Record<string, string> = injectMcpCallerGrant(
           stripManagedCredentialConflicts(
@@ -2605,7 +2605,7 @@ export async function startDaemon(): Promise<void> {
         // same params, and that retry must not read as a replay.
         const agentPlanClaimRefusal = agentPlanLaunch.claim();
         if (agentPlanClaimRefusal) {
-          return finishSpawn(Promise.resolve({ type: 'error', errorMessage: `Agent plan grant rejected (${agentPlanClaimRefusal})` }));
+          return await finishSpawn(Promise.resolve({ type: 'error', errorMessage: `Agent plan grant rejected (${agentPlanClaimRefusal})` }));
         }
 
         // Isolated sessions must not inherit unrelated daemon credentials.
@@ -2653,7 +2653,7 @@ export async function startDaemon(): Promise<void> {
           // Determine agent command - support claude, codex, gemini, openclaw, opencode.
           const agent = resolveTmuxSpawnAgentCommand(options.agent);
           if (!agent) {
-            return finishSpawn(Promise.resolve({
+            return await finishSpawn(Promise.resolve({
               type: 'error',
               errorMessage: `Unsupported agent type: '${options.agent}'. Please update your CLI to the latest version.`
             }));
@@ -2688,7 +2688,7 @@ export async function startDaemon(): Promise<void> {
           // 최종 env 를 만든 **뒤** 선택과 대조한다. 어긋나면 대체하지 않고 멈춘다.
           const tmuxSelection = verifyAiAuthSelection(options.aiAuthSelection, tmuxEnv);
           if (tmuxSelection.rejection) {
-            return finishSpawn(Promise.resolve({
+            return await finishSpawn(Promise.resolve({
               type: 'error',
               errorMessage: tmuxSelection.rejection,
             }));
@@ -2740,7 +2740,7 @@ export async function startDaemon(): Promise<void> {
 
             if (workspaceLaunch) workspaceLaunch.tracked = true;
 
-            return finishSpawn(waitForSessionWebhook({
+            return await finishSpawn(waitForSessionWebhook({
               pid: tmuxResult.pid,
               pidToAwaiter,
               label: '(tmux)',
@@ -2748,7 +2748,7 @@ export async function startDaemon(): Promise<void> {
             }), tmuxSelection.appliedSource);
           } else {
             // An owned tmux dispatch may have succeeded despite a missing PID/ACK. Never launch a second child.
-            if (ownedStartGuard.wasSubmitted(options)) return finishSpawn(Promise.resolve({
+            if (ownedStartGuard.wasSubmitted(options)) return await finishSpawn(Promise.resolve({
               type: 'error', errorMessage: 'Owned tmux start outcome is unknown',
               ...(contextWorkspace ? { code: 'workspace-start-unconfirmed' } : {}),
             }));
@@ -2766,7 +2766,7 @@ export async function startDaemon(): Promise<void> {
           // openclaw, and opencode (opencode runs over ACP: `happy acp opencode`).
           const agentArgs = resolveRegularSpawnAgentArgs(options.agent);
           if (!agentArgs) {
-            return finishSpawn(Promise.resolve({
+            return await finishSpawn(Promise.resolve({
               type: 'error',
               errorMessage: `Unsupported agent type: '${options.agent}'. Please update your CLI to the latest version.`
             }));
@@ -2806,7 +2806,7 @@ export async function startDaemon(): Promise<void> {
           // 최종 env 를 만든 **뒤** 선택과 대조한다. 어긋나면 대체하지 않고 멈춘다.
           const spawnSelection = verifyAiAuthSelection(options.aiAuthSelection, spawnEnvironment);
           if (spawnSelection.rejection) {
-            return finishSpawn(Promise.resolve({
+            return await finishSpawn(Promise.resolve({
               type: 'error',
               errorMessage: spawnSelection.rejection,
             }));
@@ -2817,7 +2817,7 @@ export async function startDaemon(): Promise<void> {
             spawnEnvironment.HAPPY_WRITE_SCOPE_SESSION = '1';
             spawnEnvironment.HAPPY_SANDBOX_POLICY_MODE = 'mandatory';
           }
-          return finishSpawn(spawnTrackedHappyProcess({
+          return await finishSpawn(spawnTrackedHappyProcess({
             onOwnedChild: contextOwnedChildren.get(options),
             onProcessSubmission: () => {
               if (workspaceLaunch) workspaceLaunch.submitted = true;
@@ -2839,7 +2839,7 @@ export async function startDaemon(): Promise<void> {
         }
 
         // This should never be reached, but TypeScript requires a return statement
-        return finishSpawn(Promise.resolve({
+        return await finishSpawn(Promise.resolve({
           type: 'error',
           errorMessage: 'Unexpected error in session spawning'
         }));
@@ -2853,6 +2853,8 @@ export async function startDaemon(): Promise<void> {
           type: 'error',
           errorMessage: `Failed to spawn session: ${errorMessage}`
         };
+      } finally {
+        if (personalLeaseEnvironment) await releasePersonalEndpointEnvironment(personalLeaseEnvironment).catch(() => logger.warn('[personal-llm] relay cleanup failed'));
       }
     };
 

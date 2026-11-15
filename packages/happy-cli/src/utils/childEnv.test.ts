@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { ORG_ENDPOINT_OWNED_ENV_KEYS } from '../claude/utils/orgEndpointEnvKeys'
 import { buildManagedSessionSpawnEnvironment, buildSpawnRequestEnvironment } from '../daemon/sessionEnv'
-import { clearInheritedSessionLineage, NON_INHERITABLE_ENV, nonInheritableEnvEntry, sanitizeChildEnv } from './childEnv'
+import { clearInheritedSessionLineage, PERSONAL_ENDPOINT_BINDING_ENV, NON_INHERITABLE_ENV, nonInheritableEnvEntry, sanitizeChildEnv } from './childEnv'
 
 describe('sanitizeChildEnv', () => {
     it.each(['valid-record', ''])('removes a bound child token before forgetting its lineage (%s)', (binding) => {
@@ -13,6 +13,18 @@ describe('sanitizeChildEnv', () => {
         expect(unrelated).toEqual({ SAFE: 'kept' })
         expect(child.CLAUDE_CODE_OAUTH_TOKEN).toBe('synthetic-bound')
     })
+
+    it.each([['normal', 'bound'], ['empty', ''], ['malformed', '{bad'], ['lowercase', 'bound']])(
+        'drops personal relay routing at a session boundary (%s), keeping it inside the session', (label, binding) => {
+            const key = label === 'lowercase' ? PERSONAL_ENDPOINT_BINDING_ENV.toLowerCase() : PERSONAL_ENDPOINT_BINDING_ENV
+            const env = { [key]: binding, HAPPY_AI_AUTH_SOURCE: 'personal-endpoint', HAPPY_AI_AUTH_PERSONAL_ENDPOINT_LEASE: 'lease',
+                ANTHROPIC_BASE_URL: 'http://127.0.0.1:1234/inference/lease', ANTHROPIC_AUTH_TOKEN: 'relay-secret',
+                ANTHROPIC_MODEL: 'local-model', CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1', HTTPS_PROXY: 'https://corp.proxy', SAFE: 'kept' }
+            expect(sanitizeChildEnv(env)).toEqual({ HTTPS_PROXY: 'https://corp.proxy', SAFE: 'kept' })
+            expect(sanitizeChildEnv(env, { boundary: 'in-session' })).toEqual(env)
+            expect(env.ANTHROPIC_AUTH_TOKEN).toBe('relay-secret')
+        },
+    )
 
     it('removes reconnect and fork lineage variables while keeping everything else', () => {
         // 2026-07-19 incident: a resumed child restarted the daemon, the daemon
