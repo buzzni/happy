@@ -31,3 +31,5 @@ export * from './sessionOwnerRelay';
 export * from './sessionOwnerRelayCodec';
 export { canonicalOwnerRelayJson, OWNER_RELAY_REQUEST_BYTES, OWNER_RELAY_REPLY_BYTES } from './sessionOwnerRelayJson';
 export { default as ownerRelayV1Fixture } from './fixtures/sessionOwnerRelay.v1.json';
+
+export * from './orgLlmSubagent';

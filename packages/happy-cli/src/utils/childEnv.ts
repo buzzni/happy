@@ -53,6 +53,7 @@ export type NonInheritableEnvKind = 'session-lineage' | 'spawn-seed' | 'session-
 export type NonInheritableEnvEntry = { readonly prefix: string; readonly kind: NonInheritableEnvKind }
 
 export const NON_INHERITABLE_ENV: readonly NonInheritableEnvEntry[] = [
+    { prefix: 'HAPPY_ORG_LLM_SUBAGENT_', kind: 'session-scope' },
     { prefix: 'HAPPY_RECONNECT_', kind: 'session-lineage' },
     // Covers both `HAPPY_FORK_*` (the native session or thread to resume and
     // backfill from) and `HAPPY_FORKED_FROM_*` (the lineage recorded in metadata).
@@ -131,6 +132,8 @@ export const SETUP_TOKEN_BINDING_ENV = 'HAPPY_AI_AUTH_SETUP_TOKEN_BINDING'
  * Daemon-written only, scrubbed like the setup-token binding.
  */
 export const ORG_ENDPOINT_BINDING_ENV = 'HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING'
+export const ORG_SUBAGENT_LAUNCH_ENV = 'HAPPY_ORG_LLM_SUBAGENT_LAUNCH_ID'
+export const ORG_SUBAGENT_OPERATION_ENV = 'HAPPY_ORG_LLM_SUBAGENT_OPERATION_ID'
 
 /**
  * `'1'` while the daemon's session-started report for an endpoint session has not reached Studio (r3). Kept in the
