@@ -176,6 +176,8 @@ const shown = (value: string | null | undefined) => (value ?? '').trim().slice(0
 
 export function createOrgRequirementsGate(options: {
     agent: OrgAgent;
+    /** Model from a successfully bound platform-plan descriptor, never a caller-selected model/env flag. */
+    planModel?: string;
     /** The daemon's home: the last known good outlives a staged per-session home. */
     happyHomeDir: string;
     serverUrl: string;
@@ -215,6 +217,10 @@ export function createOrgRequirementsGate(options: {
         return item?.kind === 'ceiling' ? item.max : null;
     };
     const aiModels = (): OrgAiModelsItem | null => {
+        if (options.planModel) {
+            const key = `${agent}:${options.planModel}`;
+            return { kind: 'allowedSet', values: [key], default: key, source: 'organization' };
+        }
         const item = document()?.items['ai.models'];
         return item?.kind === 'allowedSet' ? item : null;
     };
@@ -284,7 +290,7 @@ export function createOrgRequirementsGate(options: {
             }
             republish();
             const current = document();
-            if (!current) {
+            if (!current && !options.planModel) {
                 lastTurn = null;
                 return { kind: 'run', permissionMode: input.permissionMode, modeClamped: false, dropFallbackModel: false };
             }
