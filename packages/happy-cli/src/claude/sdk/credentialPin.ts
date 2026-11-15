@@ -3,7 +3,7 @@ import type { Options, Query, SDKUserMessage, query } from '@anthropic-ai/claude
 import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS } from '../utils/claudeAuthOverrideEnv';
 
 import { logger } from '@/lib';
-import { ORG_ENDPOINT_CLEARED_ENV_KEYS, ORG_ENDPOINT_VALUE_ENV_KEYS, ORG_ENDPOINT_OPTIONAL_VALUE_ENV_KEYS } from '../utils/orgEndpointEnvKeys';
+import { ORG_ENDPOINT_CLEARED_ENV_KEYS, ORG_ENDPOINT_VALUE_ENV_KEYS, ORG_ENDPOINT_OPTIONAL_VALUE_ENV_KEYS, ORG_ENDPOINT_MACHINE_ENV_KEYS } from '../utils/orgEndpointEnvKeys';
 import {
     ClaudeAuthNotVerifiedError, ORG_ENDPOINT_CLAUDE_AUTH_FAILURE, ORGANIZATION_CLAUDE_AUTH_FAILURE, PERSONAL_CLAUDE_AUTH_FAILURE,
     type ClaudeAuthCheckReason, type ClaudeAuthCheckStage,
@@ -82,6 +82,7 @@ export function queryWithPinnedEndpoint(
         if (value === undefined || /[\r\n\0]/.test(value)) throw new Error(failureCode);
         authEnv[key] = value;
     }
+    if (environment.HAPPY_AI_AUTH_SOURCE === 'personal-endpoint') for (const key of ORG_ENDPOINT_MACHINE_ENV_KEYS) authEnv[key] = environment[key] ?? '';
     for(const key of ORG_ENDPOINT_OPTIONAL_VALUE_ENV_KEYS) {const value=environment[key]; if(value!==undefined) {if(!/^[1-9]\d{0,5}$/.test(value)) throw new Error(failureCode); authEnv[key]=value}}
     if (!authEnv.ANTHROPIC_BASE_URL || !authEnv.ANTHROPIC_AUTH_TOKEN || authEnv.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST !== '1') throw new Error(failureCode);
     return pinQuery(create, params, {

@@ -57,6 +57,7 @@ export const AI_AUTH_SOURCES = [
      * daemon, after it actually injected that endpoint's address and token into the session.
      */
     'org-endpoint',
+    'personal-endpoint',
     /** Not established. Never inferred. */
     'unknown',
     // `org-bundle-observed` is deliberately absent: it is an in-process

@@ -144,7 +144,7 @@ export function enableMonitoring(app: Fastify) {
         if (isAutomationReadRoute(route, method)) {
             const source = automationReadSource(request.headers['x-happy-read-source']);
             automationReadRequestsCounter.inc({ route, status, source });
-            const sample = automationReads.observe({ accountId: request.userId, projectId: (request.params as { projectId?: string })?.projectId, route, source, status: reply.statusCode }, end);
+            const sample = automationReads.observe({ accountId: request.userId, projectId: (request.params as { projectId?: string })?.projectId, route, source, status: reply.statusCode, client: request.headers['x-happy-client'] }, end);
             if (sample) warn({ module: 'automation-read', ...sample }, 'Automation read burst (observation only)');
         }
 

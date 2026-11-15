@@ -31,6 +31,8 @@ if (args[0] === 'browser-client') {
 } else if (args[0] === 'terminal-worker') {
   // aplus specs/terminal-survive-runner-restart: a detached PTY owner that outlives the daemon.
   void import('./daemon/terminalWorker/workerMain')
+} else if (args[0] === 'personal-endpoint-probe') {
+  void import('./daemon/personalEndpointProbeWorker')
 } else if (args[0] === 'difficulty-routing-worker') {
   void import('./daemon/difficultyRoutingWorkerProcess')
 } else {

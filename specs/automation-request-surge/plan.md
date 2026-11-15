@@ -1,5 +1,15 @@
 # Plan — server
 
+## 2026-11-15 후속 관측 개선 (사용자 승인)
+
+1. 완료: 실제 HTTP 응답 경계와 순수 집계 테스트에서 클라이언트/경로/프로젝트별
+   폭주 관측 누락을 재현한다.
+2. 완료: 기존 10초 창·60초 cooldown 안에 bounded 집계와 경과 시간을 추가한다.
+   식별자는 로그에만 남기고 metric label·인가·응답·스케줄러 동작은 바꾸지 않는다.
+3. 완료: 관련 테스트·타입 검사·context 동기화. 운영 배포·경보 변경은 수행하지 않는다.
+
+수정 6 / 신규 0: 진단·HTTP 연결·테스트 2개·기존 plan/context만 변경한다.
+
 1. Contract and baseline: inspect applicable instructions and current tests, record file placement before editing.
 2. Red/Green implementation: regressions first, minimal behavior fix, related tests.
 3. Broader verification: appropriate typecheck/build/tests; distinguish existing failures.

@@ -271,6 +271,8 @@ export class ApiClient {
      * exactly these bytes instead of minting its own. Legacy accounts have no per-session key.
      */
     dataKey?: { key: Uint8Array, wrapped: Uint8Array },
+    /** Daemon-owned two-step authorization: retain these exact encrypted bytes while the user gate signs them. */
+    prepared?: ReturnType<ApiClient['prepareSessionCreation']>,
     /** Trusted daemon preparation only: prove the exact already-encrypted create payload. */
     executionProof?: (body: Readonly<SessionExecutionCreateBody>, encryption: { encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey' }) => Promise<HappySessionExecutionProof>,
     /** Trusted daemon only. Seals these exact bytes; a private journal owns prepare/commit. */
@@ -285,7 +287,10 @@ export class ApiClient {
       throw new Error('managed sessions are created by the parent, not by this process');
     }
 
-    const { body, encryptionKey, encryptionVariant } = this.prepareSessionCreation(opts);
+    if (opts.prepared && (!opts.executionProof || opts.prepared.body.tag !== opts.tag)) {
+      throw new Error('Prepared session requires an exact execution-bound create');
+    }
+    const { body, encryptionKey, encryptionVariant } = opts.prepared ?? this.prepareSessionCreation(opts);
     const executionProof = opts.executionProof ? HappySessionExecutionProofSchema.parse(await opts.executionProof(body, { encryptionKey, encryptionVariant })) : undefined;
     let ownershipProof: SessionOwnershipProof | undefined;
     if (opts.ownershipProof) {

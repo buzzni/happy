@@ -1,3 +1,4 @@
+import { isPinnedModelSource } from '@/utils/managedEndpointSource'
 /**
  * Query wrapper around official @anthropic-ai/claude-agent-sdk
  * Maps internal QueryOptions to official SDK Options
@@ -107,7 +108,7 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
     sdkOptions.model = foldModelToOrgEndpoint(sdkOptions.model, env)
     // No fallback in an endpoint session: it has no second model, and the SDK refuses a fallback equal to the main model
     // (which folding produces whenever the endpoint maps no tiers) by not creating the query at all.
-    if (['org-endpoint', 'platform-plan', 'platform-plan-pending'].includes(env.HAPPY_AI_AUTH_SOURCE ?? '')) sdkOptions.fallbackModel = undefined
+    if (isPinnedModelSource(env)) sdkOptions.fallbackModel = undefined
     // Outside an endpoint the two can still meet: a stored fallback migrates onto the same successor as the main model
     // (claude-fable-5-1 → claude-fable-5-2). Run without a fallback rather than have the SDK refuse the query.
     if (sdkOptions.fallbackModel && sdkOptions.fallbackModel === sdkOptions.model) sdkOptions.fallbackModel = undefined
@@ -133,7 +134,7 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
 
     // An organization LLM endpoint's address, token and models would otherwise be replaced by the same keys in a
     // user or project settings file. No fallback: a session whose environment the pin cannot read does not start.
-    if (['org-endpoint', 'platform-plan', 'platform-plan-pending'].includes(env.HAPPY_AI_AUTH_SOURCE ?? '')) return queryWithPinnedEndpoint(sdkQuery, {
+    if (isPinnedModelSource(env)) return queryWithPinnedEndpoint(sdkQuery, {
         prompt: params.prompt as string | AsyncIterable<SDKUserMessage>, options: sdkOptions,
     }, env)
 

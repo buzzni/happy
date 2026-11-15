@@ -1,3 +1,4 @@
+import { isManagedEndpointSource } from '@/utils/managedEndpointSource'
 /**
  * The organization requirements gate, as the Claude runner meets it (aplus-dev-studio-desktop
  * specs/codexcli-org-requirements R10.1–R10.3, R10.10, R10.12).
@@ -87,7 +88,7 @@ const ZAI_TIER_ENV: Partial<Record<typeof MODEL_SELECTION_ENV[number], string>> 
 export function stripModelSelectionEnv(env: Record<string, string | undefined>, extra: Record<string, string> | undefined): string[] {
     const zai = isZaiClaudeRuntime(env as NodeJS.ProcessEnv);
     // An endpoint session's names are the daemon's own and nothing else serves them (org-llm-endpoints r2).
-    const endpoint = env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint';
+    const endpoint = isManagedEndpointSource(env);
     const removed = new Set<string>();
     for (const key of MODEL_SELECTION_ENV) {
         // The endpoint first: an administrator may register the Z.AI address as an endpoint, and its names are not Z.AI's.
@@ -134,6 +135,7 @@ export function createClaudeOrgRequirements(gate: OrgRequirementsGate, deps: {
 }): ClaudeOrgRequirements {
     return {
         checkTurn: (mode) => {
+            if (process.env.HAPPY_AI_AUTH_SOURCE === 'personal-endpoint' && gate.restrictsModels()) return { kind: 'refuse', message: 'PERSONAL_ENDPOINT_POLICY_DENIED' };
             const verdict = gate.checkTurn({
                 permissionMode: mode.permissionMode,
                 model: mode.orgModel?.requested ?? null,

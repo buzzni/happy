@@ -985,7 +985,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // or mandatory policy) and run-once hosts keep the in-turn instruction.
     const offTurnTitleBridge = createClaudeTitleBridge({ titleModel: (requested, launched) => orgTitleModel(orgGate, requested, launched) });
     let workspaceTitleObserved = false;
-    const offTurnTitleEligible = managedStartup === null && !scopeLaunch && !exitAfterFirstTurn
+    const offTurnTitleEligible = process.env.HAPPY_AI_AUTH_SOURCE !== 'personal-endpoint' && managedStartup === null && !scopeLaunch && !exitAfterFirstTurn
         && sandboxPolicyMode !== 'mandatory';
     const offTurnTitle = createOffTurnTitleJob({
         run: offTurnTitleBridge.run,
@@ -1675,7 +1675,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             logger.debug(`[ax] orchestration failed, falling through: ${(err as Error).message}`);
         }
 
-        const outcome = delegatedDifficultyRoutingMessage
+        const outcome = delegatedDifficultyRoutingMessage && process.env.HAPPY_AI_AUTH_SOURCE !== 'personal-endpoint'
             ? await resolveDifficultyRouting({
                 agent: 'claude',
                 sourceMachineId: machineId ?? '',

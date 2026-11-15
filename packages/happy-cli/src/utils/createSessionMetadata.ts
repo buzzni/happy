@@ -1,3 +1,4 @@
+import { PERSONAL_ENDPOINT_BINDING_ENV, personalEndpointMarker } from '@/daemon/personalLlmEndpoint';
 /**
  * Session Metadata Factory
  *
@@ -126,6 +127,7 @@ export function createSessionMetadata(opts: CreateSessionMetadataOptions): Sessi
         ...(delegatedFrom ? { delegatedFrom } : {}),
         // The daemon wrote the binding into this process's environment; the metadata keeps its non-secret half (r3).
         ...(orgLlmEndpoint ? { orgLlmEndpoint } : {}),
+        ...(process.env[PERSONAL_ENDPOINT_BINDING_ENV] ? { personalLlmEndpoint: personalEndpointMarker(process.env[PERSONAL_ENDPOINT_BINDING_ENV]) } : {}),
     };
 
     return { state, metadata };

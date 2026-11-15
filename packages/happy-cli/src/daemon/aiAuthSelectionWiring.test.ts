@@ -119,7 +119,7 @@ describe('배선 가드: spawn 이 선택을 존중하고 검증하는가', () =
     // a lost webhook could be misclassified as a retryable refusal and spawn a duplicate.
     expect(text).toMatch(/onProcessSubmission: \(\) => \{\s*if \(workspaceLaunch\) workspaceLaunch.submitted = true;\s*ownedStartGuard\.submitted\(options\);/);
     expect(text).toContain('if (standaloneWindows) { workspaceLaunch.submitted = true; onProcessSubmission?.(); }');
-    expect(text).toContain('if (ownedStartGuard.wasSubmitted(options)) return finishSpawn(Promise.resolve({');
+    expect(text).toContain('if (ownedStartGuard.wasSubmitted(options)) return await finishSpawn(Promise.resolve({');
     const regular = text.slice(text.indexOf('const happyProcess = prepared?.childProcess'), text.indexOf('scopeReports?.attach(happyProcess);'));
     expect(regular).toMatch(/try \{\s*workspaceLaunch\.submitted = true; onProcessSubmission\?\.\(\);[\s\S]*?const child = spawnHappyCLI\(/);
   });
@@ -130,7 +130,8 @@ describe('배선 가드: spawn 이 선택을 존중하고 검증하는가', () =
       .map((match) => match[1])
     expect(checks).toEqual(['tmuxEnv', 'spawnEnvironment'])
     // 검증 대상이 최종 env 인지: 두 이름 모두 헬퍼가 만든 값이고 자식에게 그대로 간다.
-    expect(text).toContain('const launchAuthorityEnvironment = preparedMachineLaunch?.environment')
+    expect(text).toMatch(/const launchAuthorityEnvironment = options\.aiAuthSelection\?\.kind === 'personal-endpoint'\s*\? await personalEndpointEnvironment\(/)
+    expect(text).toContain(': preparedMachineLaunch?.environment ?? (honorsManagedAiCredentials(options.aiAuthSelection, Boolean(options.agentPlan))')
     expect(text).toContain('const managedAiCredentialEnvironment = await applyManualPersonal(options.aiAuthSelection, launchAuthorityEnvironment,')
     expect(text).toMatch(/const tmuxEnv = applyAppliedAiAuthSourceEnv\(/)
     expect(text).toMatch(/const spawnEnvironment = applyAppliedAiAuthSourceEnv\(/)
@@ -148,7 +149,7 @@ describe('배선 가드: spawn 이 선택을 존중하고 검증하는가', () =
   it('어긋난 선택이 spawn 을 실제로 멈춘다 — 사유와 함께', async () => {
     const text = await runSource()
     const rejections = [...text.matchAll(
-      /if \((\w+)\.rejection\) \{\s*\n\s*return finishSpawn\(Promise\.resolve\(\{\s*\n\s*type: 'error',\s*\n\s*errorMessage: \1\.rejection,/g,
+      /if \((\w+)\.rejection\) \{\s*\n\s*return await finishSpawn\(Promise\.resolve\(\{\s*\n\s*type: 'error',\s*\n\s*errorMessage: \1\.rejection,/g,
     )]
     expect(rejections).toHaveLength(2)
   })
@@ -159,7 +160,7 @@ describe('배선 가드: spawn 이 선택을 존중하고 검증하는가', () =
       .map(match => match[1])
     expect(passes).toEqual(['tmuxSelection', 'spawnSelection'])
     // 넘기기만 하고 결과에 안 합치면 값은 조용히 사라진다 — 뮤테이션으로 확인한 구멍.
-    expect(text).toMatch(/\.\.\.result,\s*appliedAiAuthSource\s*\}/)
+    expect(text).toMatch(/\.\.\.result,\s*appliedAiAuthSource,\s*\.\.\.\(appliedPersonalEndpoint \? \{ personalLlmEndpoint: appliedPersonalEndpoint \} : \{\}\)/)
   })
 })
 
@@ -172,22 +173,24 @@ describe('org-endpoint wiring (aplus specs/org-llm-endpoints C5)', () => {
 
   it('an endpoint launch never takes the shared-machine rotation: it spends no company account', async () => {
     const text = await runSource()
-    expect(text).toMatch(/explicitUserGrant: options\.aiAuthSelection\?\.kind === 'claude-setup-token' \|\| options\.aiAuthSelection\?\.kind === 'org-endpoint',/)
+    expect(text).toMatch(/explicitUserGrant: options\.aiAuthSelection\?\.kind === 'claude-setup-token' \|\| options\.aiAuthSelection\?\.kind === 'org-endpoint' \|\| options\.aiAuthSelection\?\.kind === 'personal-endpoint',/)
   })
 
   it('a resume asks Studio about the recorded binding before it rebuilds the endpoint, and a refusal ends the resume', async () => {
     const text = await runSource()
-    const check = text.indexOf('orgEndpointStudio.checkResume({')
+    const check = text.indexOf('.checkResume({', text.indexOf('const endpointVerdict = await'))
     const rebuild = text.indexOf('resolveManagedAiCredentialEnvironment(resumeAgent, resumeOrgEndpoint)')
     expect(check).toBeGreaterThan(0)
     expect(check).toBeLessThan(rebuild)
+    expect(text).toMatch(/const endpointVerdict = await \(orgSubagent\?\.hasAuthority\(happySessionId\) \? orgSubagent : orgEndpointStudio\)\.checkResume\(/)
     expect(text).toMatch(/if \(!endpointVerdict\.ok\) \{\s*return \{\s*type: 'error',\s*code: 'SESSION_RESUME_FAILED',/)
     expect(text).toMatch(/bindingId: resumeOrgEndpoint\.bindingId, sessionId: happySessionId, endpointId: resumeOrgEndpoint\.endpointId,\s*targetId: resumeOrgEndpoint\.candidates\[0\]!, generation: resumeOrgEndpoint\.generation,/)
   })
 
   it('a started endpoint session is reported to Studio without holding the spawn result', async () => {
     const text = await runSource()
-    expect(text).toMatch(/if \(appliedOrgLlmEndpoint\) void orgEndpointStartReports\.reportAfterSpawn\(result\.sessionId, appliedOrgLlmEndpoint\);/)
+    // A subagent operation owns its signed report; the legacy reporter must not claim that binding.
+    expect(text).toMatch(/if \(appliedOrgLlmEndpoint && !readPersistedSessions\(\)\[result\.sessionId\]\?\.agentEnvironment\?\.\[ORG_SUBAGENT_OPERATION_ENV\]\)\s*void orgEndpointStartReports\.reportAfterSpawn\(result\.sessionId, appliedOrgLlmEndpoint\);/)
     expect(text).toMatch(/send: \(report\) => orgEndpointStudio\.reportSessionStarted\(report\),/)
     // The client authenticates with the daemon's own token and trusted origin, like its other Studio calls.
     expect(text).toMatch(/createOrgLlmEndpointStudioClient\(\{\s*studioOrigin: readTrustedStudioOrigin\(process\.env\), bearer: \(\) => credentials\.token, fetch,/)
@@ -196,16 +199,19 @@ describe('org-endpoint wiring (aplus specs/org-llm-endpoints C5)', () => {
   it('a resume sends a start report Studio never took before it asks Studio, and the record it updates is the tracked one and the persisted one', async () => {
     const text = await runSource()
     const resend = text.indexOf('orgEndpointStartReports.resendIfPending(happySessionId,')
-    const check = text.indexOf('orgEndpointStudio.checkResume({')
+    const check = text.indexOf('.checkResume({', text.indexOf('const endpointVerdict = await'))
     expect(resend).toBeGreaterThan(0)
     expect(resend).toBeLessThan(check)
+    expect(text).toMatch(/if \(!orgSubagent\?\.hasAuthority\(happySessionId\)\) await orgEndpointStartReports\.resendIfPending\(happySessionId,/)
     // Both copies: the cursor writers persist the tracked session's environment, so updating only the file would be undone.
     expect(text).toMatch(/if \(tracked\) tracked\.agentEnvironment = agentEnvironment;\s*const saved = readPersistedSessions\(\)\[sessionId\];\s*if \(saved\) persistSession\(sessionId, \{ \.\.\.saved, agentEnvironment, savedAt: Date\.now\(\) \}\);/)
   })
 
   it('a resume of a session whose metadata carries the endpoint marker but whose record has no binding is refused', async () => {
     const text = await runSource()
-    expect(text).toMatch(/const resumeOrgEndpoint = readOrgEndpointResumeSelection\(tracked\.agentEnvironment\);[\s\S]{0,400}if \(!resumeOrgEndpoint && isOrgEndpointBoundMetadata\(metadata\)\) \{\s*return \{\s*type: 'error',\s*code: 'SESSION_RESUME_FAILED',/)
+    const resume = text.slice(text.indexOf('const resumeOrgEndpoint = readOrgEndpointResumeSelection('), text.indexOf('const resumeMachineRuntime = resumeBinding'))
+    expect(resume).toMatch(/if \(!resumeOrgEndpoint && !resumePersonal && isOrgEndpointBoundMetadata\(metadata\)\) \{\s*return \{\s*type: 'error',\s*code: 'SESSION_RESUME_FAILED',/)
+    expect(resume).toContain("if (pickedPersonal && !resumePersonal) return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: 'PERSONAL_ENDPOINT_SOURCE_CHANGE_FORBIDDEN' }")
     // Before any other source is prepared for the resume.
     expect(text.indexOf('isOrgEndpointBoundMetadata(metadata)')).toBeLessThan(text.indexOf('const resumeMachineRuntime = resumeBinding'))
   })

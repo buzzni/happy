@@ -41,11 +41,13 @@ const RPC_RECONNECT_GRACE_MS = 15_000;
 const RPC_RECONNECT_POLL_MS = 200;
 const MAX_RPC_RELAY_TIMEOUT_MS = 10 * 60 * 1000;
 
-function resolveRpcRelayTimeoutMs(value: unknown): number {
+function resolveRpcRelayTimeoutMs(value: unknown, method: unknown): number {
     if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
         return RPC_CALL_TIMEOUT_MS;
     }
-    return Math.min(Math.floor(value), MAX_RPC_RELAY_TIMEOUT_MS);
+    // The endpoint coordinator has one 620s absolute budget; its caller observes for 650s. Other methods keep their existing ceiling.
+    const endpointCreation = typeof method === 'string' && ['spawn-org-endpoint-subagent', 'org-endpoint-subagent-root-start'].includes(baseMethodName(method));
+    return Math.min(Math.floor(value), endpointCreation ? 630_000 : MAX_RPC_RELAY_TIMEOUT_MS);
 }
 
 const rpcCallCounter = new Counter({
@@ -238,7 +240,7 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
         };
 
         try {
-            const timeoutMs = resolveRpcRelayTimeoutMs(data?.timeoutMs);
+            const timeoutMs = resolveRpcRelayTimeoutMs(data?.timeoutMs, method);
 
             if (!method || typeof method !== 'string') {
                 finish('invalid_params');
