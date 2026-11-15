@@ -867,6 +867,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     const orgRequirementsHome = lessonStateRoot(process.env) ?? configuration.happyHomeDir;
     const orgGate = createSessionOrgRequirementsGate({
         agent: 'claude',
+        planModel: planSession ? planLaunch?.descriptor.model : undefined,
         credentials: principal.kind === 'account' ? principal.credentials : null,
         machineId,
         session,

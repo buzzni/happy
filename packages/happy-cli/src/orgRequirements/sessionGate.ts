@@ -54,6 +54,8 @@ export function createLiteRuntimeTurnGate(org: SessionOrgRequirements | null): (
 
 export function createSessionOrgRequirementsGate(input: {
     agent: OrgAgent;
+    /** Supplied only after the platform-plan session key exchange succeeded. */
+    planModel?: string;
     /** Null for a managed run. */
     credentials: Parameters<typeof orgAccountKey>[0] & { token: string } | null;
     machineId: string | null | undefined;
@@ -76,6 +78,7 @@ export function createSessionOrgRequirementsGate(input: {
     };
     const gate = createOrgRequirementsGate({
         agent: input.agent,
+        planModel: input.planModel,
         happyHomeDir: lessonStateRoot(env) ?? configuration.happyHomeDir,
         serverUrl: configuration.serverUrl,
         accountKey: orgAccountKey(credentials),

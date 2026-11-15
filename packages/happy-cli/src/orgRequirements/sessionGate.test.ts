@@ -44,6 +44,19 @@ describe('session gate assembly', () => {
         await org.lookup();
         expect(s.state().orgRequirements).toEqual({ state: 'ok', revision: 2 });
     });
+
+    it('passes the verified plan model to the session gate without relaxing ordinary sessions', async () => {
+        stubStudio({ 'ai.models': { kind: 'allowedSet', values: ['claude:claude-opus-5-5'], default: null, source: 'member' } });
+        const planModel = 'deepseek/deepseek-v4.1-flash-eco';
+        const input = { agent: 'claude' as const, credentials: { token: 't' }, machineId: 'm', session: session() };
+        const plan = createSessionOrgRequirementsGate({ ...input, planModel })!;
+        const ordinary = createSessionOrgRequirementsGate({ ...input, session: { ...session(), sessionId: 'ordinary' } })!;
+        await plan.lookup();
+        await ordinary.lookup();
+        const turn = { permissionMode: 'default', model: planModel, modelOrigin: 'explicit' as const };
+        expect(plan.gate.checkTurn(turn)).toMatchObject({ kind: 'run' });
+        expect(ordinary.gate.checkTurn(turn)).toMatchObject({ kind: 'refuse' });
+    });
 });
 
 describe('runtimes without a ceiling or tool-rule gate (R10.7)', () => {

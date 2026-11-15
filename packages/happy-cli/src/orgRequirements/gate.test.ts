@@ -25,7 +25,7 @@ describe('organization requirements session gate', () => {
     });
     afterEach(() => { rmSync(home, { recursive: true, force: true }); });
 
-    const make = (agent: OrgAgent = 'claude', overrides: { sessionId?: string | null } = {}): OrgRequirementsGate => createOrgRequirementsGate({
+    const make = (agent: OrgAgent = 'claude', overrides: { sessionId?: string | null; planModel?: string } = {}): OrgRequirementsGate => createOrgRequirementsGate({
         agent,
         happyHomeDir: home,
         serverUrl: 'https://s',
@@ -35,11 +35,32 @@ describe('organization requirements session gate', () => {
         publish: (state) => published.push(state),
         refresh,
         now: () => clock,
+        planModel: overrides.planModel,
     });
     const audit = () => {
         const path = join(home, 'logs', 'org-requirements.jsonl');
         return existsSync(path) ? readFileSync(path, 'utf8').trim().split('\n').map((line) => JSON.parse(line)) : [];
     };
+
+    it.each([
+        ['claude', 'deepseek/deepseek-v4.1-flash-eco'], ['codex', 'gpt-6-luna'],
+    ] as const)('allows only the bound %s plan model while preserving permission and tool rules', (agent, planModel) => {
+        const plan = make(agent, { planModel });
+        const ordinary = make(agent, { sessionId: 'subscription' });
+        const requirements = doc({ ...MODELS, ...CEILING_DEFAULT,
+            'tools.rules': { kind: 'rules', rules: [{ id: 'block-bash', tool: 'Bash', decision: 'blocked', since: 3 }] },
+        });
+        for (const gate of [plan, ordinary]) gate.onRequirements({ kind: 'response', status: 'ok', requirements });
+        const turn = { permissionMode: 'bypassPermissions', model: planModel, modelOrigin: 'explicit' as const };
+        expect(ordinary.checkTurn(turn)).toMatchObject({ kind: 'refuse', reason: 'requirement_model_denied' });
+        expect(plan.checkTurn({ ...turn, fallbackModel: 'other-model' })).toMatchObject({ kind: 'run', permissionMode: 'default', modeClamped: true, dropFallbackModel: true });
+        expect(plan.blockedTools()).toContain('Bash');
+        expect(plan.modelAllowed(planModel)).toBe(true);
+        expect(plan.modelAllowed('other-model')).toBe(false);
+        expect(plan.checkTurn({ ...turn, model: 'other-model' })).toMatchObject({ kind: 'refuse', reason: 'requirement_model_denied' });
+        plan.onRequirements({ kind: 'response', status: 'ok', requirements: doc({ 'ai.models': { kind: 'allowedSet', values: [], default: null, source: 'member' } }, 4) });
+        expect(plan.checkTurn(turn)).toMatchObject({ kind: 'run' });
+    });
 
     describe('without a document (pinned first: nothing changes)', () => {
         it('passes every mode, model and approval answer through untouched and publishes nothing', () => {

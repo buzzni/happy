@@ -1686,6 +1686,7 @@ export async function runCodex(opts: {
      */
     orgGate = createSessionOrgRequirementsGate({
         agent: 'codex',
+        planModel: agentPlanSession ? agentPlanLaunch?.descriptor.model : undefined,
         credentials: opts.principal.kind === 'account' ? opts.principal.credentials : null,
         machineId,
         session,
