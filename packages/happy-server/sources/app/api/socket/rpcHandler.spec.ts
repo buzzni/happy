@@ -63,6 +63,14 @@ function fakeScopedIo(targetsByRoom: Map<string, FakeSocket[]>) {
 }
 
 describe('rpcHandler relay timeout', () => {
+    it('gives only endpoint execution-bound creation the negotiated 630-second relay window', async () => {
+        for (const [method, expected] of [['spawn-org-endpoint-subagent', 630000], ['org-endpoint-subagent-root-start', 630000], ['bash', 600000], ['spawn-happy-session', 600000]]) {
+            const caller = new FakeSocket('caller'), target = new FakeSocket('target');
+            rpcHandler('u1', caller as any, fakeIo([target]) as any);
+            await caller.trigger('rpc-call', { method: `machine-1:${method}`, params: 'encrypted', timeoutMs: 999999 }, vi.fn());
+            expect(target.timeoutCalls).toEqual([expected]);
+        }
+    });
     it('uses caller-provided timeoutMs when forwarding rpc-request to the target socket', async () => {
         const caller = new FakeSocket('caller');
         const target = new FakeSocket('target');

@@ -16,6 +16,13 @@ async function fixture() {
   return root
 }
 describe('trusted session agent execution', () => {
+  it('allows org spawn only with the separate bundle capability and supplies a trusted host mark', async () => {
+    const root = await fixture(), entrypoint = join(root, 'index.mjs')
+    await writeFile(entrypoint, `console.log(JSON.stringify({exitCode:0,stdout:JSON.stringify({ok:true,mark:process.env.SAYCODE_ORG_ENDPOINT_SUBAGENT_HOST})}))`)
+    await writeFile(join(root, 'package.json'), JSON.stringify({ saycodeAgentBrokerProtocol: 1, orgEndpointSubagentVersion: 1, bin: { saycode: './index.mjs' } }))
+    const execute = createAgentHostExecutor({ sessionId: 'current', directory: root, env: { HAPPY_AI_AUTH_SOURCE: 'org-endpoint' }, entrypoint })
+    expect(JSON.parse((await execute(['spawn', '--prompt', 'x'], new AbortController().signal)).stdout)).toEqual({ ok: true, mark: '1' })
+  })
   it('routes only typed owner requests over private IPC without exposing adapter errors', async () => {
     const root = await fixture(), entrypoint = join(root, 'owner-cli.mjs')
     await writeFile(entrypoint, `process.on('message', m => { console.log(JSON.stringify({exitCode:0,stdout:JSON.stringify({ok:true,response:m})})); process.disconnect() }); process.send({type:'owner-contact-v1',requestId:'request',request:{v:1,entry:'chat',operation:'lookup-readable-sessions',payload:{sessionIds:[]}}})`)

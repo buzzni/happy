@@ -1513,9 +1513,23 @@ describe('ApiMachineClient socket reconnection', () => {
         });
         const handler = (client as any).rpcHandlerManager.registerHandler.mock.calls
             .find(([method]: [string]) => method === 'ai-credential:capabilities')?.[1];
-        await expect(handler({})).resolves.toEqual({ version: 1, applyModes: ['merge', 'replace'] });
+        await expect(handler({})).resolves.toEqual({ version: 1, applyModes: ['merge', 'replace'], orgEndpointSubagentReason: 'ORG_LLM_ENDPOINT_MACHINE_KEY_REQUIRED' });
         // The handler passes this machine's id so collector capability can be machine-scoped.
         expect(capabilities).toHaveBeenCalledWith(expect.any(String));
+    });
+
+    it('registers the org coordinator and advertises its separate version without invoking ordinary spawn', async () => {
+        const machine = makeMachine(); machine.encryptionVariant = 'dataKey';
+        const client = new ApiMachineClient('fake-token', machine), spawnSession = vi.fn();
+        const result = { ok: true, operationId: 'operation', sessionId: 'child', endpointId: 'endpoint' };
+        const spawn = vi.fn(async () => result);
+        client.setRPCHandlers({ spawnSession, stopSession: vi.fn(), requestShutdown: vi.fn(), portRegistry: {} as any,
+            aiCredentialRuntime: { capabilities: async () => ({ version: 1, orgLlmEndpointVersion: 1 }) } as any,
+            orgSubagent: { spawn, capabilities: async () => ({ orgEndpointSubagentVersion: 1 }) } as any });
+        const handlers = new Map((client as any).rpcHandlerManager.registerHandler.mock.calls);
+        expect(await (handlers.get('spawn-org-endpoint-subagent') as any)({ operationId: 'operation' })).toEqual(result);
+        expect(spawn).toHaveBeenCalledWith({ operationId: 'operation' }); expect(spawnSession).not.toHaveBeenCalled();
+        expect(await (handlers.get('ai-credential:capabilities') as any)({})).toMatchObject({ orgEndpointSubagentVersion: 1 });
     });
 
     it('advertises a sealed assignment recipient only for supported runtimes and rotates it per client incarnation', async () => {

@@ -35,11 +35,18 @@ export function createAgentHostExecutor(input: {
   const manifest = manifestPath ? JSON.parse(readFileSync(manifestPath, 'utf8')) : null
   if (!input.entrypoint && typeof manifest?.bin?.saycode !== 'string') throw new Error('Missing bundled agent CLI')
   const entrypoint = input.entrypoint ?? resolve(dirname(manifestPath!), manifest.bin.saycode)
+  let supportsOrgSubagent = false
+  try {
+    const bundle = manifest ?? JSON.parse(readFileSync(resolve(dirname(entrypoint), 'package.json'), 'utf8'))
+    supportsOrgSubagent = bundle.saycodeAgentBrokerProtocol === 1 && bundle.orgEndpointSubagentVersion === 1
+  } catch { /* A legacy or test entrypoint has no separate capability. */ }
+  delete env.SAYCODE_ORG_ENDPOINT_SUBAGENT_HOST
+  if (supportsOrgSubagent) env.SAYCODE_ORG_ENDPOINT_SUBAGENT_HOST = '1'
   const identityAuthority = input.identityAuthority ?? unavailableAgentIdentityAuthority
   return (argv: string[], signal: AbortSignal): Promise<AgentBrokerResult> => {
     // An organization LLM endpoint session's work stays on its endpoint: a child would start under this machine's default
     // source, which no endpoint binding covers (aplus specs/org-llm-endpoints r3). Reading and steering existing sessions stay.
-    if (argv[0] === 'spawn' && env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint') {
+    if (argv[0] === 'spawn' && env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint' && !supportsOrgSubagent) {
       return Promise.resolve({ exitCode: 3, stdout: JSON.stringify({ ok: false, error: 'org_endpoint_spawn_refused',
         detail: 'This conversation runs on an organization LLM endpoint; a new session would start on another source. Do the work in this session.' }) + '\n' })
     }

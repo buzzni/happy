@@ -24,7 +24,7 @@ import { ADDITIONAL_DIRECTORIES_ENV, APPROVED_WRITE_ROOTS_ENV, readAdditionalDir
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars'
 import { normalizeSessionSource, SESSION_SOURCE_ENV } from '@/utils/sessionSource'
 import { DELEGATED_ATTENDANCE_ENV, parseDelegatedAttendance } from '@/api/turnAttendance'
-import { ORG_ENDPOINT_BINDING_ENV, ORG_ENDPOINT_UNREPORTED_ENV, sanitizeChildEnv, SETUP_TOKEN_BINDING_ENV } from '@/utils/childEnv'
+import { ORG_ENDPOINT_BINDING_ENV, ORG_ENDPOINT_UNREPORTED_ENV, ORG_SUBAGENT_LAUNCH_ENV, ORG_SUBAGENT_OPERATION_ENV, sanitizeChildEnv, SETUP_TOKEN_BINDING_ENV } from '@/utils/childEnv'
 import { OUTPUT_FORMAT_ENV, parseOutputFormat } from '@/claude/structuredOutput'
 import { INPUT_EVIDENCE_ENV, requestedInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings'
 import { AGENT_PLAN_DESCRIPTOR_ENV, AGENT_PLAN_SECRET_ENV } from '@/launcher/agentPlanLaunch'
@@ -69,7 +69,7 @@ export const BROWSER_CONTINUATION_ENV = 'HAPPY_AUTOMATION_BROWSER_CONTINUATION'
  */
 const AGENT_PLAN_SEED_KEYS = [AGENT_PLAN_DESCRIPTOR_ENV, AGENT_PLAN_SECRET_ENV, AGENT_PLAN_THREADS_DIR_ENV] as const
 type AgentPlanSeedKey = typeof AGENT_PLAN_SEED_KEYS[number]
-type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | typeof ORG_ENDPOINT_BINDING_ENV | typeof ORG_ENDPOINT_UNREPORTED_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof APPROVED_WRITE_ROOTS_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV | AgentPlanSeedKey
+type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | typeof ORG_ENDPOINT_BINDING_ENV | typeof ORG_ENDPOINT_UNREPORTED_ENV | typeof ORG_SUBAGENT_LAUNCH_ENV | typeof ORG_SUBAGENT_OPERATION_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof APPROVED_WRITE_ROOTS_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV | AgentPlanSeedKey
 
 export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey | typeof DAEMON_AGENT_GRANT_STATE_ENV, string>>
 
@@ -315,6 +315,9 @@ export function captureSaycodeAgentEnvironment(
     env: NodeJS.ProcessEnv,
 ): SaycodeAgentEnvironment | undefined {
     const captured: SaycodeAgentEnvironment = {}
+    for (const key of [ORG_SUBAGENT_LAUNCH_ENV, ORG_SUBAGENT_OPERATION_ENV] as const) {
+        if (env[key] !== undefined) captured[key] = /^[A-Za-z0-9_-]{1,128}$/.test(env[key]!) ? env[key] : ''
+    }
     const grantState = env[DAEMON_AGENT_GRANT_STATE_ENV]
     if (grantState === 'root' || grantState === 'rejected') captured[DAEMON_AGENT_GRANT_STATE_ENV] = grantState
     if (env[MANUAL_PERSONAL_ENV] !== undefined) captured[MANUAL_PERSONAL_ENV] = /^[a-f0-9]{64}$/.test(env[MANUAL_PERSONAL_ENV]!) ? env[MANUAL_PERSONAL_ENV] : ''

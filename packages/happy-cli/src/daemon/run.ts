@@ -15,6 +15,8 @@ import { createMachineSetupTokenRuntime, type MachineSetupTokenRuntime } from '.
 import { createDeviceOrgPinStore, migrateLegacyDeviceState } from './deviceOrgPinStore';
 import { spawnRefusalForRemoval, worktreeRemovalReservations } from './worktreeRemovalReservations';
 import { createDeviceEnrollment } from './deviceEnrollment';
+import { createOrgSubagentRuntime, readOrgSubagentRegistration } from './orgEndpointSubagentRuntime';
+import { ORG_SUBAGENT_OPERATION_ENV } from '@/utils/childEnv';
 import { createMachineTypeMarker } from './machineTypeMarker';
 import { createSharedPcAutoConfirm } from './sharedPcAutoConfirm';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
@@ -2062,6 +2064,7 @@ export async function startDaemon(): Promise<void> {
       return value.id;
     };
 
+    let orgSubagent: ReturnType<typeof createOrgSubagentRuntime> | undefined;
     const applyManualPersonal = createManualPersonalSpawn(readTrustedStudioOrigin(process.env), machineId);
     // aplus specs/org-llm-endpoints r2 — tells Studio an endpoint session started, and asks it before a resume rebuilds one.
     const orgEndpointStudio = createOrgLlmEndpointStudioClient({
@@ -2206,7 +2209,8 @@ export async function startDaemon(): Promise<void> {
               : { ...result, appliedAiAuthSource };
             const withEndpoint: SpawnSessionResult = { ...withAuthSource, ...(appliedOrgLlmEndpoint ? { appliedOrgLlmEndpoint } : {}) };
             // Not awaited, never fails the spawn: the session already runs, and Studio learns of it on its own clock.
-            if (appliedOrgLlmEndpoint) void orgEndpointStartReports.reportAfterSpawn(result.sessionId, appliedOrgLlmEndpoint);
+            if (appliedOrgLlmEndpoint && !readPersistedSessions()[result.sessionId]?.agentEnvironment?.[ORG_SUBAGENT_OPERATION_ENV])
+              void orgEndpointStartReports.reportAfterSpawn(result.sessionId, appliedOrgLlmEndpoint);
             const reported: SpawnSessionResult = launchMcpDropped ? { ...withEndpoint, launchMcpDropped } : withEndpoint;
             if (options.additionalDirectories === undefined) return reported;
             return {
@@ -3359,8 +3363,8 @@ export async function startDaemon(): Promise<void> {
         // token, a stopped endpoint, a revoked assignment). Studio confirms the binding, or the session is not resumed.
         if (resumeOrgEndpoint) {
           // A start report Studio never took is sent first; resume-check is still the authority, so a failure here only logs.
-          await orgEndpointStartReports.resendIfPending(happySessionId, { bindingId: resumeOrgEndpoint.bindingId, targetId: resumeOrgEndpoint.candidates[0]! });
-          const endpointVerdict = await orgEndpointStudio.checkResume({
+          if (!orgSubagent?.hasAuthority(happySessionId)) await orgEndpointStartReports.resendIfPending(happySessionId, { bindingId: resumeOrgEndpoint.bindingId, targetId: resumeOrgEndpoint.candidates[0]! });
+          const endpointVerdict = await (orgSubagent?.hasAuthority(happySessionId) ? orgSubagent : orgEndpointStudio).checkResume({
             bindingId: resumeOrgEndpoint.bindingId, sessionId: happySessionId, endpointId: resumeOrgEndpoint.endpointId,
             targetId: resumeOrgEndpoint.candidates[0]!, generation: resumeOrgEndpoint.generation,
           });
@@ -6033,6 +6037,34 @@ export async function startDaemon(): Promise<void> {
           savedAt: Date.now(), lastProcessedSeq: 0 });
       },
     });
+    if (!managedRuntimeActive && !standaloneWindows && machine.encryptionVariant === 'dataKey' && deviceKeys && deviceEnrollment && trustedStudioOrigin) {
+      const enrollment = deviceEnrollment;
+      orgSubagent = createOrgSubagentRuntime({ home: configuration.happyHomeDir, machineId, studioOrigin: trustedStudioOrigin,
+        endpointStorePath: join(os.homedir(), '.happy', 'org-llm-endpoints.json'),
+        warn: message => logger.warn(message),
+        happyOrigin: new URL(configuration.serverUrl).origin, keys: deviceKeys, strict: () => configuration.machineControl === 'strict',
+        pin: companyId => enrollment.orgPin(companyId), records: readPersistedSessions,
+        registration: async () => {
+          return readOrgSubagentRegistration({ machineId, credentials, happyOrigin: new URL(configuration.serverUrl).origin,
+            read: async () => { const [credentials, settings] = await Promise.all([readCredentials(), readSettings()]); return { credentials, settings }; } });
+        },
+        metadata: options => ({ path: options.directory, host: os.hostname(), version: packageJson.version, os: os.platform(), machineId,
+          homeDir: os.homedir(), happyHomeDir: configuration.happyHomeDir, happyLibDir: projectPath(), happyToolsDir: join(projectPath(), 'tools', 'unpacked'),
+          flavor: options.agent ?? 'claude', startedFromDaemon: true, startedBy: 'daemon', lifecycleState: 'running', lifecycleStateSince: Date.now() }),
+        sync: raw => aiCredentialRuntime.orgLlmEndpointSync(raw), environment: selection => aiCredentialRuntime.sessionEnvironment('claude', selection),
+        reportParent: async sessionId => {
+          const selection = readOrgEndpointResumeSelection(readPersistedSessions()[sessionId]?.agentEnvironment);
+          if (selection) await orgEndpointStartReports.resendIfPending(sessionId, { bindingId: selection.bindingId, targetId: selection.candidates[0]! });
+        },
+        start: options => spawnSessionAdmitted(options),
+        persist: async (session, agentEnvironment) => {
+          const prior = readPersistedSessions()[session.id];
+          return persistSessionDurably(session.id, { ...prior, encryptionKey: encodeBase64(session.encryptionKey), encryptionVariant: session.encryptionVariant,
+            seq: session.seq, metadataVersion: session.metadataVersion, agentStateVersion: session.agentStateVersion, metadata: session.metadata,
+            agentEnvironment: { ...prior?.agentEnvironment, ...agentEnvironment }, savedAt: Date.now(), lastProcessedSeq: 0 }).status === 'committed';
+        },
+      });
+    }
     // Switch off: no lookup, so every launch is exactly the existing one.
     if (process.env[OWNER_CONTACT_SWITCH] === '1') ownedLaunchLineage = sessionId => ownedSpawn.launchLineage(sessionId);
     ownedPipeOnlyLaunch = options => ownedSpawn.pipeOnlyLaunch(options);
@@ -6059,6 +6091,7 @@ export async function startDaemon(): Promise<void> {
         }),
       } }),
       ownedSpawn,
+      orgSubagent,
       daemonSessionState: createDaemonSessionStateHandler(getCurrentChildren),
       byosOfflineReceive,
       difficultyRouting: difficultyRoutingHost,

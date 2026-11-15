@@ -32,6 +32,12 @@ import { ORG_REQUIREMENTS_ENV, ORG_SCOPE_HINT_ENV, orgScopeHintEnvironment } fro
 import { expandEnvironmentVariables } from '../utils/expandEnvVars'
 
 describe('buildSessionSpawnEnvironment', () => {
+    it('retains its own org subagent launch selectors for resume but refuses request-supplied selectors', () => {
+        const scoped = { HAPPY_ORG_LLM_SUBAGENT_LAUNCH_ID: 'launch', HAPPY_ORG_LLM_SUBAGENT_OPERATION_ID: 'operation' }
+        expect(captureSaycodeAgentEnvironment(scoped)).toMatchObject(scoped)
+        expect(stripUnsafeRequestedEnvironment(scoped)).toEqual({})
+        expect(sanitizeChildEnv(scoped)).toEqual({})
+    })
     it('T2RT-26 targets one session and never inherits another session opt-in', () => {
         const opted = buildManagedSessionSpawnEnvironment({ HAPPY_INPUT_EVIDENCE: '1' },
             buildSpawnRequestEnvironment({}, { HAPPY_INPUT_EVIDENCE: '1' }), {});

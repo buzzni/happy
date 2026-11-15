@@ -177,17 +177,19 @@ describe('org-endpoint wiring (aplus specs/org-llm-endpoints C5)', () => {
 
   it('a resume asks Studio about the recorded binding before it rebuilds the endpoint, and a refusal ends the resume', async () => {
     const text = await runSource()
-    const check = text.indexOf('orgEndpointStudio.checkResume({')
+    const check = text.indexOf('.checkResume({', text.indexOf('const endpointVerdict = await'))
     const rebuild = text.indexOf('resolveManagedAiCredentialEnvironment(resumeAgent, resumeOrgEndpoint)')
     expect(check).toBeGreaterThan(0)
     expect(check).toBeLessThan(rebuild)
+    expect(text).toMatch(/const endpointVerdict = await \(orgSubagent\?\.hasAuthority\(happySessionId\) \? orgSubagent : orgEndpointStudio\)\.checkResume\(/)
     expect(text).toMatch(/if \(!endpointVerdict\.ok\) \{\s*return \{\s*type: 'error',\s*code: 'SESSION_RESUME_FAILED',/)
     expect(text).toMatch(/bindingId: resumeOrgEndpoint\.bindingId, sessionId: happySessionId, endpointId: resumeOrgEndpoint\.endpointId,\s*targetId: resumeOrgEndpoint\.candidates\[0\]!, generation: resumeOrgEndpoint\.generation,/)
   })
 
   it('a started endpoint session is reported to Studio without holding the spawn result', async () => {
     const text = await runSource()
-    expect(text).toMatch(/if \(appliedOrgLlmEndpoint\) void orgEndpointStartReports\.reportAfterSpawn\(result\.sessionId, appliedOrgLlmEndpoint\);/)
+    // A subagent operation owns its signed report; the legacy reporter must not claim that binding.
+    expect(text).toMatch(/if \(appliedOrgLlmEndpoint && !readPersistedSessions\(\)\[result\.sessionId\]\?\.agentEnvironment\?\.\[ORG_SUBAGENT_OPERATION_ENV\]\)\s*void orgEndpointStartReports\.reportAfterSpawn\(result\.sessionId, appliedOrgLlmEndpoint\);/)
     expect(text).toMatch(/send: \(report\) => orgEndpointStudio\.reportSessionStarted\(report\),/)
     // The client authenticates with the daemon's own token and trusted origin, like its other Studio calls.
     expect(text).toMatch(/createOrgLlmEndpointStudioClient\(\{\s*studioOrigin: readTrustedStudioOrigin\(process\.env\), bearer: \(\) => credentials\.token, fetch,/)
@@ -196,9 +198,10 @@ describe('org-endpoint wiring (aplus specs/org-llm-endpoints C5)', () => {
   it('a resume sends a start report Studio never took before it asks Studio, and the record it updates is the tracked one and the persisted one', async () => {
     const text = await runSource()
     const resend = text.indexOf('orgEndpointStartReports.resendIfPending(happySessionId,')
-    const check = text.indexOf('orgEndpointStudio.checkResume({')
+    const check = text.indexOf('.checkResume({', text.indexOf('const endpointVerdict = await'))
     expect(resend).toBeGreaterThan(0)
     expect(resend).toBeLessThan(check)
+    expect(text).toMatch(/if \(!orgSubagent\?\.hasAuthority\(happySessionId\)\) await orgEndpointStartReports\.resendIfPending\(happySessionId,/)
     // Both copies: the cursor writers persist the tracked session's environment, so updating only the file would be undone.
     expect(text).toMatch(/if \(tracked\) tracked\.agentEnvironment = agentEnvironment;\s*const saved = readPersistedSessions\(\)\[sessionId\];\s*if \(saved\) persistSession\(sessionId, \{ \.\.\.saved, agentEnvironment, savedAt: Date\.now\(\) \}\);/)
   })
