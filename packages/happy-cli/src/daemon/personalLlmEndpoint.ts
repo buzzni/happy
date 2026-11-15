@@ -3,7 +3,8 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { ORG_ENDPOINT_CLEARED_ENV_KEYS, ORG_ENDPOINT_MACHINE_ENV_KEYS } from '@/claude/utils/orgEndpointEnvKeys'
 export const PERSONAL_ENDPOINT_LEASE_ENV = 'HAPPY_AI_AUTH_PERSONAL_ENDPOINT_LEASE'
-export const PERSONAL_ENDPOINT_BINDING_ENV = 'HAPPY_AI_AUTH_PERSONAL_ENDPOINT_BINDING'
+import { PERSONAL_ENDPOINT_BINDING_ENV } from '@/utils/childEnv'
+export { PERSONAL_ENDPOINT_BINDING_ENV } from '@/utils/childEnv'
 export type PersonalEndpointSelection = { kind: 'personal-endpoint'; issuer: string; ownerUserId: string; endpointId: string; generation: number; ticket: string }
 export type PersonalEndpointMarker = { endpointId: string; generation: number; ownerUserId: string; issuer: string; machineId: string; name: string; model: string; workspace: Record<string, string> }
 const object = (v: unknown): Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : {}

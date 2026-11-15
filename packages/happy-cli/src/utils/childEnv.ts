@@ -132,6 +132,9 @@ export const SETUP_TOKEN_BINDING_ENV = 'HAPPY_AI_AUTH_SETUP_TOKEN_BINDING'
  * Daemon-written only, scrubbed like the setup-token binding.
  */
 export const ORG_ENDPOINT_BINDING_ENV = 'HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING'
+
+/** The personal relay binding is session-scoped, like the organization endpoint binding. */
+export const PERSONAL_ENDPOINT_BINDING_ENV = 'HAPPY_AI_AUTH_PERSONAL_ENDPOINT_BINDING'
 export const ORG_SUBAGENT_LAUNCH_ENV = 'HAPPY_ORG_LLM_SUBAGENT_LAUNCH_ID'
 export const ORG_SUBAGENT_OPERATION_ENV = 'HAPPY_ORG_LLM_SUBAGENT_OPERATION_ID'
 
