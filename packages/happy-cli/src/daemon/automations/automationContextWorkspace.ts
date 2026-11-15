@@ -17,11 +17,27 @@ export function createAutomationContextWorkspace(input: {
       const owner = createWorkspaceTurnAdmission({ home: input.home, sessionId: `manual-launch:${randomUUID()}`, kind: 'manual-launch', roots })
       const admitted = await owner.tryAcquire()
       if (!admitted.acquired) return admitted
+      let released = false, retained = false
+      let terminalWork = Promise.resolve()
+      const serialize = <T>(work: () => Promise<T>): Promise<T> => {
+        const result = terminalWork.then(work)
+        terminalWork = result.then(() => undefined, () => undefined)
+        return result
+      }
       return { acquired: true as const,
-        async finish(observed: { submitted: boolean; tracked: boolean }, evidence?: ExitEvidence) {
+        finish(observed: { submitted: boolean; tracked: boolean }, evidence?: ExitEvidence) { return serialize(async () => {
           // Tracking (or later PID disappearance) cannot prove the native/background writers drained.
-          return owner.release(!observed.submitted || observed.tracked && !!evidence && drained(evidence))
-        } }
+          if (retained) return false
+          const completed = await owner.release(!observed.submitted || observed.tracked && !!evidence && drained(evidence))
+          if (completed) released = true
+          return completed
+        }) },
+        /** Only after this launch has no remaining exit observer; this preserves custody, never proves drainage. */
+        retainUnconfirmed() { return serialize(async () => {
+          if (released || retained) return
+          await owner.retainUnconfirmed()
+          retained = true
+        }) } }
     },
     async acquireAutomation(request: { runId: string; roots: readonly string[]; ownerToken?: string }) {
       const busy = { acquired: false as const, reason: 'tracked-session-busy' as const }
