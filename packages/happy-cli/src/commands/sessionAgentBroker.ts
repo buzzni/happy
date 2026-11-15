@@ -1,3 +1,4 @@
+import { isManagedEndpointSource } from '@/utils/managedEndpointSource'
 import type { SessionOwnerContact } from '@/daemon/sessionOwnerContact'
 import { configuration } from '@/configuration'
 import { runAgentHostProcess } from './agentHostProcess'
@@ -44,9 +45,9 @@ export function createAgentHostExecutor(input: {
   if (supportsOrgSubagent) env.SAYCODE_ORG_ENDPOINT_SUBAGENT_HOST = '1'
   const identityAuthority = input.identityAuthority ?? unavailableAgentIdentityAuthority
   return (argv: string[], signal: AbortSignal): Promise<AgentBrokerResult> => {
-    // An organization LLM endpoint session's work stays on its endpoint: a child would start under this machine's default
-    // source, which no endpoint binding covers (aplus specs/org-llm-endpoints r3). Reading and steering existing sessions stay.
-    if (argv[0] === 'spawn' && env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint' && !supportsOrgSubagent) {
+    // Personal endpoints have no child authority. Org children require the separate compatible bundle capability.
+    // Reading and steering existing sessions stay available to both sources.
+    if (argv[0] === 'spawn' && isManagedEndpointSource(env) && (env.HAPPY_AI_AUTH_SOURCE === 'personal-endpoint' || !supportsOrgSubagent)) {
       return Promise.resolve({ exitCode: 3, stdout: JSON.stringify({ ok: false, error: 'org_endpoint_spawn_refused',
         detail: 'This conversation runs on an organization LLM endpoint; a new session would start on another source. Do the work in this session.' }) + '\n' })
     }

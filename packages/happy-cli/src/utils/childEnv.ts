@@ -132,6 +132,9 @@ export const SETUP_TOKEN_BINDING_ENV = 'HAPPY_AI_AUTH_SETUP_TOKEN_BINDING'
  * Daemon-written only, scrubbed like the setup-token binding.
  */
 export const ORG_ENDPOINT_BINDING_ENV = 'HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING'
+
+/** The personal relay binding is session-scoped, like the organization endpoint binding. */
+export const PERSONAL_ENDPOINT_BINDING_ENV = 'HAPPY_AI_AUTH_PERSONAL_ENDPOINT_BINDING'
 export const ORG_SUBAGENT_LAUNCH_ENV = 'HAPPY_ORG_LLM_SUBAGENT_LAUNCH_ID'
 export const ORG_SUBAGENT_OPERATION_ENV = 'HAPPY_ORG_LLM_SUBAGENT_OPERATION_ID'
 
@@ -168,13 +171,13 @@ export function sanitizeChildEnv(
     // Inside the session the bound token is the one the agent must spend.
     const dropBoundBearer = boundary === 'session'
         && Object.keys(env).some((key) => key.toUpperCase() === SETUP_TOKEN_BINDING_ENV && env[key] !== undefined)
-    const dropOrgEndpointRouting = boundary === 'session'
-        && Object.keys(env).some((key) => key.toUpperCase() === ORG_ENDPOINT_BINDING_ENV && env[key] !== undefined)
+    const dropEndpointRouting = boundary === 'session'
+        && Object.keys(env).some((key) => (key.toUpperCase() === ORG_ENDPOINT_BINDING_ENV || key.toUpperCase() === PERSONAL_ENDPOINT_BINDING_ENV) && env[key] !== undefined)
     const sanitized: Record<string, string> = {}
     for (const [key, value] of Object.entries(env)) {
         if (value === undefined || isDropped(key, boundary)) continue
         if (dropBoundBearer && key.toUpperCase() === 'CLAUDE_CODE_OAUTH_TOKEN') continue
-        if (dropOrgEndpointRouting && ORG_ENDPOINT_OWNED_KEYS.has(key.toUpperCase())) continue
+        if (dropEndpointRouting && ORG_ENDPOINT_OWNED_KEYS.has(key.toUpperCase())) continue
         sanitized[key] = value
     }
     return sanitized

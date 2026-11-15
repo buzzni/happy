@@ -361,6 +361,7 @@ export interface SpawnSessionOptions {
     mcpCallerGrantEnvelope?: string;
     /** Project scope appended only to the daemon-owned MCP config URL. */
     mcpConfigProjectId?: string;
+    personalChatId?: string;
     /** Connected provider names expected in the child MCP topology. */
     expectedConnectors?: string[];
     /**
@@ -489,6 +490,7 @@ export type SpawnSessionResult =
          * asked for; `unknown` is an answer, not a missing value.
          */
         appliedAiAuthSource?: AiAuthSource;
+        personalLlmEndpoint?: import('@/daemon/personalLlmEndpoint').PersonalEndpointMarker;
         /**
          * aplus specs/org-llm-endpoints C5 — the endpoint target the daemon actually pointed the session at,
          * present only for an `org-endpoint` selection. Studio records it as the session's URL binding.

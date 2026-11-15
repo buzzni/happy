@@ -1,3 +1,4 @@
+import { PERSONAL_ENDPOINT_BINDING_ENV } from './personalLlmEndpoint'
 /**
  * What ties a conversation to an organization LLM endpoint beyond one daemon's local record (aplus specs/org-llm-endpoints r3).
  *
@@ -21,13 +22,13 @@ export function orgEndpointMarker(bindingEnv: string | undefined): OrgEndpointSe
 }
 
 /** Whether session metadata carries the marker. Presence is enough: a shape this build cannot read still binds. */
-export function isOrgEndpointBoundMetadata(metadata: { orgLlmEndpoint?: unknown } | undefined): boolean {
-    return metadata?.orgLlmEndpoint !== undefined && metadata.orgLlmEndpoint !== null
+export function isOrgEndpointBoundMetadata(metadata: { orgLlmEndpoint?: unknown; personalLlmEndpoint?: unknown } | undefined): boolean {
+    return metadata?.personalLlmEndpoint != null || metadata?.orgLlmEndpoint !== undefined && metadata.orgLlmEndpoint !== null
 }
 
 /** Whether the record proves an endpoint binding, even a corrupt one (which endpoint it was is no longer relevant). */
 export function isOrgEndpointBoundRecord(record: PersistedSession): boolean {
-    if (record.agentEnvironment?.[ORG_ENDPOINT_BINDING_ENV] !== undefined) return true
+    if (record.agentEnvironment?.[ORG_ENDPOINT_BINDING_ENV] !== undefined || record.agentEnvironment?.[PERSONAL_ENDPOINT_BINDING_ENV] !== undefined || (record.metadata as { personalLlmEndpoint?: unknown }).personalLlmEndpoint != null) return true
     const marked = (record.metadata as { orgLlmEndpoint?: unknown }).orgLlmEndpoint
     return marked !== undefined && marked !== null
 }

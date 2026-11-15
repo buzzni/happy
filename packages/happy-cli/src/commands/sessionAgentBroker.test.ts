@@ -23,6 +23,15 @@ describe('trusted session agent execution', () => {
     const execute = createAgentHostExecutor({ sessionId: 'current', directory: root, env: { HAPPY_AI_AUTH_SOURCE: 'org-endpoint' }, entrypoint })
     expect(JSON.parse((await execute(['spawn', '--prompt', 'x'], new AbortController().signal)).stdout)).toEqual({ ok: true, mark: '1' })
   })
+  it('refuses personal endpoint children even when the bundle supports organization subagents', async () => {
+    const root = await fixture(), entrypoint = join(root, 'index.mjs')
+    await writeFile(entrypoint, `console.log(JSON.stringify({exitCode:0,stdout:JSON.stringify({ok:true})}))`)
+    await writeFile(join(root, 'package.json'), JSON.stringify({ saycodeAgentBrokerProtocol: 1, orgEndpointSubagentVersion: 1, bin: { saycode: './index.mjs' } }))
+    const execute = createAgentHostExecutor({ sessionId: 'current', directory: root, env: { HAPPY_AI_AUTH_SOURCE: 'personal-endpoint' }, entrypoint })
+    const refused = await execute(['spawn', '--prompt', 'x'], new AbortController().signal)
+    expect(refused.exitCode).toBe(3)
+    expect(JSON.parse(refused.stdout)).toMatchObject({ ok: false, error: 'org_endpoint_spawn_refused' })
+  })
   it('routes only typed owner requests over private IPC without exposing adapter errors', async () => {
     const root = await fixture(), entrypoint = join(root, 'owner-cli.mjs')
     await writeFile(entrypoint, `process.on('message', m => { console.log(JSON.stringify({exitCode:0,stdout:JSON.stringify({ok:true,response:m})})); process.disconnect() }); process.send({type:'owner-contact-v1',requestId:'request',request:{v:1,entry:'chat',operation:'lookup-readable-sessions',payload:{sessionIds:[]}}})`)

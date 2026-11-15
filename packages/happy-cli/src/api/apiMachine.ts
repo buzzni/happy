@@ -1,3 +1,5 @@
+import { testPersonalEndpoint } from '@/daemon/personalEndpointProbe';
+import { callPersonalEndpointBroker, parsePersonalEndpointSelection, type PersonalEndpointSelection } from '@/daemon/personalLlmEndpoint';
 import { readPersonalClaudeCredentials } from '@/claude/personalClaudeCredential';
 import { registerOwnedSpawnRpc, type OwnedSpawnRpc } from '@/daemon/ownedSpawnRpc';
 import { registerOrgSubagentRpc } from '@/daemon/orgEndpointSubagentRpc';
@@ -606,10 +608,12 @@ type MachineRpcHandlers = {
         environmentVariables?: Record<string, string>;
         mcpCallerGrantEnvelope?: string;
         mcpConfigProjectId?: string;
+        personalChatId?: string;
         expectedConnectors?: string[];
         /** Present = authoritative (empty withdraws every root); absent = keep the session's roots. */
         additionalDirectories?: string[];
         aiAuthRequirement?: ResumeAuthRequirement;
+        personalEndpoint?: PersonalEndpointSelection;
         /** Checked at this boundary (launchMcpServers.ts); absent = no injected MCP servers. */
         launchMcpServers?: LaunchMcpRequest;
     }) => Promise<ResumeSessionResult>;
@@ -952,10 +956,12 @@ export class ApiMachineClient {
         environmentVariables?: Record<string, string>;
         mcpCallerGrantEnvelope?: string;
         mcpConfigProjectId?: string;
+        personalChatId?: string;
         expectedConnectors?: string[];
         /** Present = authoritative (empty withdraws every root); absent = keep the session's roots. */
         additionalDirectories?: string[];
         aiAuthRequirement?: ResumeAuthRequirement;
+        personalEndpoint?: PersonalEndpointSelection;
         /** Checked at this boundary (launchMcpServers.ts); absent = no injected MCP servers. */
         launchMcpServers?: LaunchMcpRequest;
     }) => Promise<ResumeSessionResult>) | null = null;
@@ -1362,6 +1368,12 @@ export class ApiMachineClient {
             }
             return capabilities;
         });
+        this.rpcHandlerManager.registerHandler('personal-llm:test', (params: unknown) => testPersonalEndpoint(parsePersonalEndpointSelection(params), this.machine.id));
+        this.rpcHandlerManager.registerHandler('personal-llm:endpoint', (params: unknown) => {
+            const p = params as Record<string, unknown>;
+            if (!p || p.operation !== 'enroll') throw new Error('PERSONAL_ENDPOINT_RPC_REFUSED');
+            return callPersonalEndpointBroker({ operation: 'enroll', issuer: p.issuer, userId: p.userId, machineId: this.machine.id });
+        });
         // aplus specs/org-llm-endpoints C4 — carries the endpoint's token, so it stays off SERVER_LANE_METHODS like group-sync.
         this.rpcHandlerManager.registerHandler('ai-credential:org-llm-model-binding-sync', (params) => aiCredentialRuntime.orgLlmModelBindingSync(params));
         this.rpcHandlerManager.registerHandler('ai-credential:org-llm-endpoint-sync', (params) => (
@@ -1435,6 +1447,7 @@ export class ApiMachineClient {
                 happySecret,
                 mcpCallerGrantEnvelope,
                 mcpConfigProjectId,
+                personalChatId,
                 expectedConnectors,
                 resumeClaudeSessionId,
                 resumeCodexThreadId,
@@ -1555,6 +1568,7 @@ export class ApiMachineClient {
                 happySecret,
                 mcpCallerGrantEnvelope,
                 mcpConfigProjectId,
+                personalChatId,
                 expectedConnectors: validExpectedConnectors,
                 resumeClaudeSessionId,
                 resumeCodexThreadId,
@@ -1596,6 +1610,7 @@ export class ApiMachineClient {
                         ...(result.appliedAiAuthSource
                             ? { appliedAiAuthSource: result.appliedAiAuthSource }
                             : {}),
+                        ...(result.personalLlmEndpoint ? { personalLlmEndpoint: result.personalLlmEndpoint } : {}),
                         ...(result.appliedOrgLlmEndpoint
                             ? { appliedOrgLlmEndpoint: result.appliedOrgLlmEndpoint }
                             : {}),
@@ -3664,9 +3679,11 @@ export class ApiMachineClient {
                         environmentVariables,
                         mcpCallerGrantEnvelope,
                         mcpConfigProjectId,
+                        personalChatId,
                         expectedConnectors,
                         additionalDirectories,
                         aiAuthRequirement,
+                        personalEndpoint,
                         launchMcpServers,
                     } = params || {};
 
@@ -3709,8 +3726,10 @@ export class ApiMachineClient {
                         environmentVariables,
                         mcpCallerGrantEnvelope,
                         mcpConfigProjectId,
+                        personalChatId,
                         expectedConnectors: validExpectedConnectors,
                         ...(validAdditionalDirectories !== undefined ? { additionalDirectories: validAdditionalDirectories } : {}),
+                        ...(personalEndpoint !== undefined ? { personalEndpoint: parsePersonalEndpointSelection(personalEndpoint) } : {}),
                         ...(validAiAuthRequirement ? { aiAuthRequirement: validAiAuthRequirement } : {}),
                         ...(validLaunchMcpServers ? { launchMcpServers: validLaunchMcpServers } : {}),
                     });

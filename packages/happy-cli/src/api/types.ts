@@ -772,6 +772,7 @@ export type Metadata = {
    * tied to that endpoint (and must not be continued in a new session under another source); a recovery with no local
    * record refuses a new session when it is present. Absent on every other session and on older runtimes.
    */
+  personalLlmEndpoint?: import('@/daemon/personalLlmEndpoint').PersonalEndpointMarker
   orgLlmEndpoint?: { version: 1; bindingId: string; endpointId: string; selectedModel?: string }
   /**
    * Who started the session (`user`, `schedule`, `github-trigger`, …). An open

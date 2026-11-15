@@ -1,3 +1,4 @@
+import { PERSONAL_ENDPOINT_BINDING_ENV, personalEndpointMarker } from './personalLlmEndpoint'
 import { describe, expect, it } from 'vitest'
 import {
     buildManagedSessionSpawnEnvironment,
@@ -620,7 +621,7 @@ describe('parseAiAuthSelection', () => {
         expect(parseAiAuthSelection(undefined)).toBeUndefined()
     })
 
-    it.each(AI_AUTH_SELECTION_KINDS.filter((kind) => kind !== 'claude-setup-token' && kind !== 'org-endpoint'))('닫힌 집합의 %s 를 받는다', (kind) => {
+    it.each(AI_AUTH_SELECTION_KINDS.filter((kind) => kind !== 'claude-setup-token' && kind !== 'org-endpoint' && kind !== 'personal-endpoint'))('닫힌 집합의 %s 를 받는다', (kind) => {
         expect(parseAiAuthSelection({ kind })).toEqual({ kind })
     })
 
@@ -1205,4 +1206,14 @@ it('rejects noncanonical and malformed encoded organization model markers',()=>{
  for(const suffix of ['a','AB','_w',Buffer.from('bad\nmodel').toString('base64url')])expect(parseOrgEndpointBinding(head+suffix)).toBeNull()
  const model='moonshotai/kimi-k3.1-pro'
  expect(parseOrgEndpointBinding(head+Buffer.from(model).toString('base64url'))?.selectedModel).toBe(model)
+})
+
+
+describe('personal endpoint capture preserves an invalid binding', () => {
+    it.each(['', '{broken', '{}', JSON.stringify({ endpointId: 'ep', generation: 1 })])('captures a corrupt record as a bounded sentinel and still refuses resume: %j', raw => {
+        const captured = captureSaycodeAgentEnvironment({ [PERSONAL_ENDPOINT_BINDING_ENV]: raw })
+        expect(captured).toEqual({ [PERSONAL_ENDPOINT_BINDING_ENV]: '' })
+        const persisted = JSON.parse(JSON.stringify(captured))
+        expect(() => personalEndpointMarker(persisted[PERSONAL_ENDPOINT_BINDING_ENV])).toThrow('PERSONAL_ENDPOINT_INVALID')
+    })
 })

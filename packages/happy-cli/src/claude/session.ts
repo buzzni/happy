@@ -1,3 +1,4 @@
+import { PERSONAL_ENDPOINT_BINDING_ENV, personalEndpointMarker } from '@/daemon/personalLlmEndpoint';
 import type { TurnAttendanceState } from '@/api/turnAttendance';
 import type { NativeAutomationContextExitEvidence } from '@/utils/automationContextExit';
 import type { ClaudeOrgRequirements } from './claudeOrgRequirements';
@@ -258,7 +259,7 @@ export class Session {
         if (this.sessionId !== null && this.sessionId !== sessionId) this.client.resetContextUsage();
         this.sessionId = sessionId;
         // Before anything could continue it elsewhere: the conversation is marked as an endpoint one (orgEndpointConversation).
-        const endpointMarker = process.env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint' ? orgEndpointMarker(process.env[ORG_ENDPOINT_BINDING_ENV]) ?? {} : undefined;
+        const endpointMarker = process.env.HAPPY_AI_AUTH_SOURCE === 'personal-endpoint' ? personalEndpointMarker(process.env[PERSONAL_ENDPOINT_BINDING_ENV]) : process.env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint' ? orgEndpointMarker(process.env[ORG_ENDPOINT_BINDING_ENV]) ?? {} : undefined;
         if (endpointMarker) markOrgEndpointConversation(getProjectPath(this.path), sessionId, endpointMarker);
         
         // Update metadata with Claude Code session ID
