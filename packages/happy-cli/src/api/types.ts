@@ -119,7 +119,8 @@ export interface ClientToServerEvents {
       [key: string]: number
     }
   }) => void
-  'provider-usage-report': (data: ProviderUsageEventV1) => void
+  /** Answered `{ success: true }` once stored, `{ success: false, error }` otherwise (happy-server usageHandler). */
+  'provider-usage-report': (data: ProviderUsageEventV1, callback: (response: unknown) => void) => void
   /** Volatile token-level preview frame; `data` is session-key encrypted. */
   'session-stream': (data: { sid: string; time: number; data: string }) => void
 }

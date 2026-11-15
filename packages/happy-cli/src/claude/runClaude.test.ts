@@ -771,6 +771,8 @@ describe('runClaude remote JSONL scanner', () => {
             const { sendClaudeSessionMessageFromLocalTranscript, closeClaudeSessionTurn } = harness.sessionClient;
 
             expect(sendClaudeSessionMessageFromLocalTranscript).toHaveBeenCalledTimes(2);
+            expect(sendClaudeSessionMessageFromLocalTranscript).toHaveBeenNthCalledWith(1, expect.anything(), { historical: true });
+            expect(sendClaudeSessionMessageFromLocalTranscript).toHaveBeenNthCalledWith(2, expect.anything(), { historical: true });
             expect(closeClaudeSessionTurn).toHaveBeenCalledWith('completed');
             expect(closeClaudeSessionTurn.mock.invocationCallOrder[0])
                 .toBeGreaterThan(sendClaudeSessionMessageFromLocalTranscript.mock.invocationCallOrder[1]);

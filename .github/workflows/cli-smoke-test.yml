@@ -25,6 +25,9 @@ env:
 jobs:
   smoke-test-linux:
     runs-on: ubuntu-latest
+    # The complete CLI type graph exceeds Node 20's ~2 GB default heap.
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
     strategy:
       matrix:
         node-version: [20, 24]
@@ -79,6 +82,17 @@ jobs:
         src/daemon/sessionRetention.test.ts
         src/daemon/sessionRetentionControl.test.ts
         src/daemon/sessionIdleReaper.test.ts
+
+    - name: Verify Claude account switches preserve queued input
+      if: matrix.node-version == 24
+      timeout-minutes: 5
+      run: >-
+        pnpm --filter @buzzni/happy-cli exec vitest run --project unit
+        src/claude/claudeRemoteLauncher.oauthSwitch.test.ts
+        src/claude/claudeRemoteLauncher.transientRetry.test.ts
+        src/claude/claudeRemoteLauncher.setupTokenSwitch.test.ts
+        src/claude/aiAuthObservation.test.ts
+        src/utils/MessageQueue2.test.ts
 
     - name: Verify terminals survive a daemon restart (terminal workers)
       timeout-minutes: 5

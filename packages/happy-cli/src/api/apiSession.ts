@@ -47,6 +47,10 @@ import {
     type ProviderUsageEventV1,
 } from '@slopus/happy-wire';
 import { ClaudeTurnUsageTracker } from '@/usage/claudeTurnUsage';
+import { ClaudeTranscriptUsageReader } from '@/usage/claudeTranscriptUsage';
+import { ClaudeStreamedUsage } from '@/usage/claudeStreamedUsage';
+import { PROVIDER_USAGE_ACK_TIMEOUT_MS, ProviderUsageDelivery } from '@/usage/providerUsageDelivery';
+import type { ProviderUsageStore } from '@/usage/providerUsageSpool';
 import { ClaudeRuntimeAccountPublisher } from '@/claude/claudeRuntimeAccount';
 import { ClaudeContextUsageTracker, type ClaudeContextUsageSignal, type ClaudeControlRequest } from '@/claude/claudeContextUsage';
 import { createClaudeTurnUsageEvent, createClaudeUsageEvent } from '@/usage/providerUsageAdapters';
@@ -324,6 +328,15 @@ function buildMultipartUploadBody(
 }
 
 /**
+ * How the usage on a Claude assistant row is treated.
+ * - `final`: the row carries the usage its response ended on (a transcript line) — metered now.
+ * - `streaming`: handed over by the SDK stream before its response ended — metered once the
+ *   stream ends it (src/usage/claudeStreamedUsage.ts).
+ * - `historical`: replayed history — never metered.
+ */
+export type ClaudeMessageUsage = 'final' | 'streaming' | 'historical';
+
+/**
  * The managed relay contract, as the child must enforce it.
  *
  * `serverOrigin` is the exact origin every managed attachment URL must be on.
@@ -396,6 +409,7 @@ export function assertManagedServerOrigin(managed: ManagedCredentialMode): strin
 const MAX_PENDING_CHANNEL_BINDS = 64;
 
 export interface ApiSessionClientOptions {
+    providerUsageStore?: ProviderUsageStore;
     trackShutdownStorage?: boolean;
     storageHighWaterBytes?: number;
     storageHighWaterWrites?: number;
@@ -628,6 +642,8 @@ export class ApiSessionClient extends EventEmitter {
     private providerTokens = 0;
     private providerUsageEventIds = new Set<string>();
     private readonly claudeTurnUsage = new ClaudeTurnUsageTracker();
+    private readonly claudeStreamedUsage = new ClaudeStreamedUsage();
+    private readonly providerUsageDelivery: ProviderUsageDelivery;
     private readonly runtimeAccount = new ClaudeRuntimeAccountPublisher(() => this.sessionId, frame => this.emitSessionStream(frame));
     private personalClaudeFallback: Parameters<ClaudeRuntimeAccountPublisher['update']>[1];
     setPersonalClaudeFallback(value: Parameters<ClaudeRuntimeAccountPublisher['update']>[1]) { this.personalClaudeFallback = value; }
@@ -719,6 +735,10 @@ export class ApiSessionClient extends EventEmitter {
         this.agentStateVersion = session.agentStateVersion;
         this.encryptionKey = session.encryptionKey;
         this.encryptionVariant = session.encryptionVariant;
+        this.providerUsageDelivery = new ProviderUsageDelivery({
+            isConnected: () => this.socket.connected,
+            emit: (event, ack) => { this.socket.timeout(PROVIDER_USAGE_ACK_TIMEOUT_MS).emit('provider-usage-report', event, ack); },
+        }, options.providerUsageStore);
         this.sendSync = new InvalidateSync(() => this.flushOutbox(), (e) => this.onSyncFatal('send', e));
         this.receiveSync = new InvalidateSync(() => this.fetchMessages(), (e) => this.onSyncFatal('receive', e));
 
@@ -781,6 +801,7 @@ export class ApiSessionClient extends EventEmitter {
             logger.debug('Socket connected successfully');
             this.stateRetryDelayMs = 1000;
             this.resumeStateWrites();
+            this.providerUsageDelivery.resume();
             // dial 성공: cadence 를 끝내고 백오프를 첫 단계로 되돌린다.
             this.stopSmartReconnect();
             this.reconnectAttempts = 0;
@@ -1606,43 +1627,60 @@ export class ApiSessionClient extends EventEmitter {
         }
     }
 
-    private applyClaudeSessionMessageSideEffects(body: RawJSONLines, observedAiAuthSource?: ObservedAiAuthSource) {
-        this.noteClaudeContextUsage(body);
-        // Track usage from assistant messages
-        if (body.type === 'assistant' && body.message?.usage) {
-            let sourceEventId: string | undefined;
-            try {
-                const rawMessage = body.message as { id?: unknown; model?: unknown };
-                const rawTimestamp = (body as { timestamp?: unknown }).timestamp;
-                const parsedTimestamp = typeof rawTimestamp === 'string'
-                    ? Date.parse(rawTimestamp)
-                    : rawTimestamp;
-                const occurredAt = typeof parsedTimestamp === 'number' && Number.isFinite(parsedTimestamp)
-                    ? Math.floor(parsedTimestamp)
-                    : Date.now();
-                const providerUsageEvent = createClaudeUsageEvent({
-                    sessionId: this.sessionId,
-                    occurredAt,
-                    messageId: typeof rawMessage.id === 'string' ? rawMessage.id : null,
-                    transcriptUuid: body.uuid,
-                    model: typeof rawMessage.model === 'string' ? rawMessage.model : null,
-                    usage: body.message.usage,
-                    observedAiAuthSource,
-                });
-                sourceEventId = providerUsageEvent.sourceEventId;
-                this.sendProviderUsageEvent(providerUsageEvent);
-                this.claudeTurnUsage.noteAssistant({
-                    usage: body.message.usage,
-                    model: typeof rawMessage.model === 'string' ? rawMessage.model : null,
-                });
-            } catch (error) {
-                logger.warn('[SOCKET] Failed to normalize provider usage data:', error);
-            }
+    private reportClaudeAssistantUsage(
+        body: RawJSONLines & { type: 'assistant' },
+        usage: Usage,
+        quality: 'exact' | 'estimated',
+        observedAiAuthSource?: ObservedAiAuthSource,
+    ) {
+        let sourceEventId: string | undefined;
+        const rawMessage = body.message as { id?: unknown; model?: unknown };
+        try {
+            const rawTimestamp = (body as { timestamp?: unknown }).timestamp;
+            const parsedTimestamp = typeof rawTimestamp === 'string'
+                ? Date.parse(rawTimestamp)
+                : rawTimestamp;
+            const occurredAt = typeof parsedTimestamp === 'number' && Number.isFinite(parsedTimestamp)
+                ? Math.floor(parsedTimestamp)
+                : Date.now();
+            const providerUsageEvent = createClaudeUsageEvent({
+                sessionId: this.sessionId,
+                occurredAt,
+                messageId: typeof rawMessage.id === 'string' ? rawMessage.id : null,
+                transcriptUuid: body.uuid,
+                model: typeof rawMessage.model === 'string' ? rawMessage.model : null,
+                usage,
+                quality,
+                observedAiAuthSource,
+            });
+            sourceEventId = providerUsageEvent.sourceEventId;
+            this.sendProviderUsageEvent(providerUsageEvent);
+            this.claudeTurnUsage.noteAssistant({
+                usage,
+                model: typeof rawMessage.model === 'string' ? rawMessage.model : null,
+            });
+        } catch (error) {
+            logger.warn('[SOCKET] Failed to normalize provider usage data:', error);
+        }
 
-            try {
-                this.sendUsageData(body.message.usage, body.message.model, sourceEventId);
-            } catch (error) {
-                logger.debug('[SOCKET] Failed to send usage data:', error);
+        try {
+            this.sendUsageData(usage, typeof rawMessage.model === 'string' ? rawMessage.model : undefined, sourceEventId);
+        } catch (error) {
+            logger.debug('[SOCKET] Failed to send usage data:', error);
+        }
+    }
+
+    private applyClaudeSessionMessageSideEffects(body: RawJSONLines, observedAiAuthSource?: ObservedAiAuthSource, usage: ClaudeMessageUsage = 'final') {
+        this.noteClaudeContextUsage(body);
+        // Replayed history restores context/summary but must not charge usage or seed the next turn tracker.
+        if (usage !== 'historical' && body.type === 'assistant' && body.message?.usage) {
+            const messageId = (body.message as { id?: unknown }).id;
+            const report = (reported: Usage, final: boolean) =>
+                this.reportClaudeAssistantUsage(body, reported, final ? 'exact' : 'estimated', observedAiAuthSource);
+            if (usage === 'streaming' && typeof messageId === 'string') {
+                this.claudeStreamedUsage.noteAssistant(messageId, body.message.usage, report);
+            } else {
+                report(body.message.usage, usage !== 'streaming');
             }
         }
 
@@ -1805,19 +1843,19 @@ export class ApiSessionClient extends EventEmitter {
      * It is an argument so that nothing else — a local-mode transcript line,
      * a later run — can pick it up.
      */
-    sendClaudeSessionMessage(body: RawJSONLines, localId?: string, observedAiAuthSource?: ObservedAiAuthSource) {
+    sendClaudeSessionMessage(body: RawJSONLines, localId?: string, observedAiAuthSource?: ObservedAiAuthSource, usage: ClaudeMessageUsage = 'final') {
         const mapped = mapClaudeLogMessageToSessionEnvelopes(body, this.claudeSessionProtocolState);
         this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes, true, localId);
-        this.applyClaudeSessionMessageSideEffects(body, observedAiAuthSource);
+        this.applyClaudeSessionMessageSideEffects(body, observedAiAuthSource, usage);
         // A `tool-call-start` may have just named the turn a waiting prompt belongs to.
         this.drainChannelPermissionBinds();
     }
 
-    async sendClaudeSessionMessageFromLocalTranscript(body: RawJSONLines): Promise<void> {
+    async sendClaudeSessionMessageFromLocalTranscript(body: RawJSONLines, options?: { historical?: boolean }): Promise<void> {
         const attachments = extractLocalTranscriptImageAttachments(body);
         if (attachments.length === 0) {
-            this.sendClaudeSessionMessage(body);
+            this.sendClaudeSessionMessage(body, undefined, undefined, options?.historical ? 'historical' : 'final');
             return;
         }
 
@@ -1847,7 +1885,46 @@ export class ApiSessionClient extends EventEmitter {
         if (mapped.envelopes.length === 0) {
             this.sendSync.invalidate();
         }
-        this.applyClaudeSessionMessageSideEffects(body);
+        this.applyClaudeSessionMessageSideEffects(body, undefined, options?.historical ? 'historical' : 'final');
+    }
+
+    private claudeUsageTranscript: { projectDir: string; sessionId: string; reader: ClaudeTranscriptUsageReader } | null = null;
+    private claudeUsageReconciliation: Promise<void> | null = null;
+
+    setClaudeUsageTranscript(projectDir: string, sessionId: string): void {
+        if (this.claudeUsageTranscript?.projectDir === projectDir && this.claudeUsageTranscript.sessionId === sessionId) return;
+        this.claudeUsageTranscript = { projectDir, sessionId, reader: new ClaudeTranscriptUsageReader(projectDir, sessionId) };
+    }
+
+    async reconcileClaudeTranscriptUsage(): Promise<void> {
+        const previous = this.claudeUsageReconciliation ?? Promise.resolve();
+        const work = previous.then(async () => {
+            const source = this.claudeUsageTranscript;
+            if (!source) return;
+            try {
+                for (const [id, usage] of await source.reader.read(this.claudeStreamedUsage.pendingIds())) {
+                    this.claudeStreamedUsage.noteTranscriptFinal(id, usage);
+                }
+            } catch {
+                // Diagnostic only: do not log transcript contents or interrupt the conversation.
+                logger.warn('[usage] Claude transcript final usage unavailable; pending requests remain unconfirmed');
+            }
+        });
+        this.claudeUsageReconciliation = work;
+        await work;
+        if (this.claudeUsageReconciliation === work) this.claudeUsageReconciliation = null;
+    }
+
+    async finishClaudeUsageExecution(): Promise<void> {
+        await this.reconcileClaudeTranscriptUsage();
+        const unresolved = this.claudeStreamedUsage.pendingIds().size;
+        if (unresolved > 0) logger.warn(`[usage] Claude execution ended with ${unresolved} request(s) without confirmed final usage; reporting observed estimates`);
+        this.claudeStreamedUsage.drain();
+    }
+
+    /** The SDK's partial stream: where the usage a response ended on arrives (src/usage/claudeStreamedUsage.ts). */
+    noteClaudeStreamEvent(message: { parent_tool_use_id: string | null; event: unknown }): void {
+        this.claudeStreamedUsage.noteStreamEvent(message);
     }
 
     observeClaudeBackgroundInput(message: RawJSONLines): void {
@@ -1862,6 +1939,8 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     closeClaudeSessionTurn(status: SessionTurnEndStatus = 'completed') {
+        void this.reconcileClaudeTranscriptUsage();
+        this.claudeStreamedUsage.drain(false);
         const mapped = closeClaudeTurnWithStatus(this.claudeSessionProtocolState, status);
         this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
         if (!mapped.envelopes.length) this.inputEvidence.setPending(null);
@@ -2326,7 +2405,12 @@ export class ApiSessionClient extends EventEmitter {
         // The only place the window size arrives. Sent whatever the fallback below decides: a
         // metered turn makes no usage-report, and this frame is what shows its first window.
         if (this.currentMode === 'remote' && !this.contextUsage.noteTurnResult(modelUsage)) this.resendContextUsage();
+        // Before the fallback decides: a message still held is this turn's usage too.
+        void this.reconcileClaudeTranscriptUsage();
+        // Reset turn-local accounting even while a background request is still pending.
         const fallback = this.claudeTurnUsage.resolveResult({ usage, modelUsage });
+        // Background requests can finish in later turns. Never seal their first partial here.
+        if (this.claudeStreamedUsage.pendingIds().size > 0) return;
         if (!fallback || typeof result.uuid !== 'string' || !result.uuid.trim()) return;
         let sourceEventId: string | undefined;
         try {
@@ -2416,7 +2500,7 @@ export class ApiSessionClient extends EventEmitter {
 
     sendProviderUsageEvent(event: ProviderUsageEventV1) {
         const parsed = ProviderUsageEventV1Schema.parse(event);
-        this.socket.emit('provider-usage-report', parsed);
+        this.providerUsageDelivery.send(parsed);
         if (!this.providerUsageEventIds.has(parsed.sourceEventId)) {
             this.providerUsageEventIds.add(parsed.sourceEventId);
             this.providerTokens += parsed.tokens.total;
@@ -2726,6 +2810,7 @@ export class ApiSessionClient extends EventEmitter {
 
     async close() {
         logger.debug('[API] socket.close() called');
+        await this.finishClaudeUsageExecution();
         // socket.close() 가 부를 disconnect 핸들러보다 먼저 세운다.
         this.closed = true;
         this.clearStateRetry();
@@ -2738,6 +2823,8 @@ export class ApiSessionClient extends EventEmitter {
         this.stopSmartReconnect();
         this.syncContextUsageResend();
         this.runtimeAccount.dispose();
+        // The socket stays open, for a bounded time, for the answers usage events are still owed.
+        await this.providerUsageDelivery.close();
         this.socket.close();
     }
 

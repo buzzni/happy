@@ -23,6 +23,7 @@ import { buildInitialPromptUserRecord } from '@/utils/initialPrompt';
 import { decodeBase64, decrypt, decryptBlob, encodeBase64, encrypt } from './encryption';
 import type { Metadata, Update } from './types';
 import { logger } from '@/ui/logger';
+import { createCodexUsageEvent } from '@/usage/providerUsageAdapters';
 import { RECONNECT_NOT_READY_POLL_MS } from './reconnectCadence';
 import { TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
 import { RuntimeProducerGate } from '@/sessionDrain/runtimeProducerGate';
@@ -242,7 +243,10 @@ describe('ApiSessionClient v3 messages API migration', () => {
                 socketHandlers[event].push(handler);
             }),
             off: vi.fn(),
-            emit: vi.fn(),
+            // A server that stores every usage event it is sent; a test that needs another answer replaces this.
+            emit: vi.fn((event: string, _data: unknown, ack?: (error: Error | null, response?: unknown) => void) => {
+                if (event === 'provider-usage-report') ack?.(null, { success: true, eventId: 'stored' });
+            }),
             timeout: vi.fn(function (this: unknown) { return this; }),
             emitWithAck: vi.fn(async () => ({ result: 'error' })),
             volatile: {
@@ -1647,6 +1651,252 @@ describe('ApiSessionClient v3 messages API migration', () => {
             .map(([, event]: [string, unknown]) => event);
         expect(events).toHaveLength(1);
         await client.close();
+    });
+
+    it('restores history without charging it or suppressing the next result fallback', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        const body = {
+            type: 'assistant', uuid: 'history-row', timestamp: 1_788_000_000_000,
+            message: { id: 'history-msg', model: 'claude-sonnet-4-5', content: [],
+                usage: { input_tokens: 5, output_tokens: 3, cache_read_input_tokens: 100 } },
+        } as any;
+        await client.sendClaudeSessionMessageFromLocalTranscript(body, { historical: true });
+        expect((client as any).providerTokens).toBe(0);
+        expect((client as any).contextUsage.hasValue()).toBe(true);
+        const reports = () => mockSocket.emit.mock.calls.filter(([name]: [string]) => name === 'provider-usage-report');
+        expect(reports()).toHaveLength(0);
+        expect(mockSocket.emit.mock.calls.filter(([name]: [string]) => name === 'usage-report')).toHaveLength(0);
+        client.applyClaudeTurnResult({ uuid: 'new-result', usage: { input_tokens: 7, output_tokens: 2 } });
+        expect(reports().map(([, event]: [string, any]) => event.tokens.total)).toEqual([9]);
+        await client.sendClaudeSessionMessageFromLocalTranscript({ ...body, uuid: 'live-row', message: { ...body.message, id: 'live-msg' } });
+        expect(reports().map(([, event]: [string, any]) => event.tokens.total)).toEqual([9, 108]);
+        await client.close();
+    });
+
+    describe('usage of an assistant message handed over by the SDK stream', () => {
+        const streamed = (usage: Record<string, number>) => ({
+            type: 'assistant', uuid: 'stream-row', timestamp: 1_788_000_000_000,
+            message: { id: 'msg-stream', model: 'claude-sonnet-4-5', content: [], usage },
+        }) as any;
+        const stream = (client: ApiSessionClient, event: Record<string, unknown>) =>
+            client.noteClaudeStreamEvent({ parent_tool_use_id: null, event });
+        const reports = (): Array<{ id: string; quality: string; tokens: Record<string, number> }> => mockSocket.emit.mock.calls
+            .filter(([name]: [string]) => name === 'provider-usage-report')
+            .map(([, event]: [string, any]) => ({ id: event.sourceEventId, quality: event.quality, tokens: event.tokens }));
+        const legacy = () => mockSocket.emit.mock.calls
+            .filter(([name]: [string]) => name === 'usage-report')
+            .map(([, report]: [string, any]) => report.tokens.total);
+
+        it('marks a streaming placeholder without a native message ID as estimated', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            const body = streamed({ input_tokens: 10, output_tokens: 0 });
+            delete body.message.id;
+            client.sendClaudeSessionMessage(body, undefined, undefined, 'streaming');
+            expect(reports()).toEqual([{ id: 'test-session-id:anthropic:stream-row', quality: 'estimated',
+                tokens: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 10 } }]);
+            await client.close();
+        });
+
+        it('is reported once the response ends, with the usage it ended on, and the turn result adds nothing', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            stream(client, { type: 'message_start', message: { id: 'msg-stream' } });
+            client.sendClaudeSessionMessage(streamed({ input_tokens: 10, output_tokens: 0 }), undefined, undefined, 'streaming');
+            expect(reports()).toEqual([]);
+            expect(legacy()).toEqual([]);
+            expect((client as any).providerTokens).toBe(0);
+
+            stream(client, { type: 'message_delta', usage: { output_tokens: 5 } });
+            const final = { id: 'test-session-id:anthropic:msg-stream', quality: 'exact',
+                tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 15 } };
+            expect(reports()).toEqual([final]);
+            expect(legacy()).toEqual([15]);
+            expect((client as any).providerTokens).toBe(15);
+
+            client.applyClaudeTurnResult({ uuid: 'stream-result', usage: { input_tokens: 10, output_tokens: 5 } });
+            expect(reports()).toEqual([final]);
+            await client.close();
+        });
+
+        it.each([
+            ['the turn result', (client: ApiSessionClient) => client.applyClaudeTurnResult({ uuid: 'cut-result', usage: { input_tokens: 10, output_tokens: 5 } })],
+            ['the turn closing', (client: ApiSessionClient) => client.closeClaudeSessionTurn('cancelled')],
+            ['the session closing', (client: ApiSessionClient) => client.close()],
+        ])('is reported as an estimate, once, when %s finds its response never ended', async (_name, end) => {
+            const client = new ApiSessionClient('fake-token', session);
+            stream(client, { type: 'message_start', message: { id: 'msg-stream' } });
+            client.sendClaudeSessionMessage(streamed({ input_tokens: 10, output_tokens: 2 }), undefined, undefined, 'streaming');
+
+            await end(client);
+            if (_name !== 'the session closing') {
+                expect(reports()).toEqual([]);
+                await client.finishClaudeUsageExecution();
+            }
+            expect(reports()).toEqual([{ id: 'test-session-id:anthropic:msg-stream', quality: 'estimated',
+                tokens: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 12 } }]);
+            await client.close();
+        });
+
+        it('collects a no-stream background child final across results without recharging history or duplicate blocks', async () => {
+            const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
+            const { tmpdir } = await import('node:os');
+            const { join } = await import('node:path');
+            const root = await mkdtemp(join(tmpdir(), 'api-claude-final-'));
+            const client = new ApiSessionClient('fake-token', session);
+            try {
+                client.setClaudeUsageTranscript(root, 'native');
+                const child = { ...streamed({ input_tokens: 10, output_tokens: 2 }), parent_tool_use_id: 'tool-agent' };
+                client.sendClaudeSessionMessage(child, undefined, undefined, 'streaming');
+                client.applyClaudeTurnResult({ uuid: 'first-turn', usage: { input_tokens: 100, output_tokens: 50 } });
+                client.closeClaudeSessionTurn();
+                expect(reports()).toEqual([]);
+                await mkdir(join(root, 'native', 'subagents'), { recursive: true });
+                // A damaged parent history must not prevent a later background child's final.
+                await writeFile(join(root, 'native.jsonl'), '{interrupted historical row}\n');
+                const row = { ...child, message: { ...child.message, usage: { input_tokens: 12, output_tokens: 7 } } };
+                await writeFile(join(root, 'native', 'subagents', 'agent-child.jsonl'), [
+                    JSON.stringify({ ...row, message: { ...row.message, id: 'historical' } }),
+                    JSON.stringify(row), JSON.stringify(row),
+                ].join('\n'));
+                await client.reconcileClaudeTranscriptUsage();
+                client.applyClaudeTurnResult({ uuid: 'next-turn', usage: { input_tokens: 100, output_tokens: 50 } });
+                client.sendClaudeSessionMessage(child, undefined, undefined, 'streaming');
+                await client.finishClaudeUsageExecution();
+                expect(reports()).toEqual([{ id: 'test-session-id:anthropic:msg-stream', quality: 'exact',
+                    tokens: { input: 12, output: 7, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 19 } }]);
+                expect(legacy()).toEqual([19]);
+            } finally { await client.close(); await rm(root, { recursive: true, force: true }); }
+        });
+
+        it('still falls back to the turn result when the stream reported no tokens at all', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            stream(client, { type: 'message_start', message: { id: 'msg-stream' } });
+            client.sendClaudeSessionMessage(streamed({ input_tokens: 0, output_tokens: 0 }), undefined, undefined, 'streaming');
+            stream(client, { type: 'message_delta', usage: { output_tokens: 0 } });
+
+            client.applyClaudeTurnResult({ uuid: 'zero-result', usage: { input_tokens: 7, output_tokens: 2 } });
+            expect(reports().map(({ id, tokens }) => [id, tokens.total])).toEqual([
+                ['test-session-id:anthropic:msg-stream', 0],
+                ['test-session-id:anthropic:turn:zero-result', 9],
+            ]);
+            await client.close();
+        });
+    });
+
+    describe('a provider usage event the server has not confirmed', () => {
+        type UsageAck = (error: Error | null, response?: unknown) => void;
+        const usageEvent = (responseId: string) => createCodexUsageEvent({
+            sessionId: 'test-session-id', responseId, occurredAt: 1_788_000_000_000, model: 'gpt-test',
+            usage: { totalTokens: 15, inputTokens: 10, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 5, reasoningOutputTokens: 0 },
+        });
+        /** A server whose answers the test gives itself. */
+        const answers = () => {
+            const acks: UsageAck[] = [];
+            mockSocket.emit.mockImplementation((event: string, _data: unknown, ack?: UsageAck) => {
+                if (event === 'provider-usage-report' && ack) acks.push(ack);
+            });
+            return acks;
+        };
+        const sentIds = () => mockSocket.emit.mock.calls
+            .filter(([name]: [string]) => name === 'provider-usage-report')
+            .map(([, event]: [string, { sourceEventId: string }]) => event.sourceEventId);
+        const closeWarnings = () => vi.mocked(logger.warn).mock.calls
+            .filter(([message]) => String(message).includes('unconfirmed at close'));
+
+        it('delivers usage through the API socket despite local disk failure', async () => {
+            const event = usageEvent('disk-failed');
+            const store = { load: () => [], put: vi.fn(() => { throw new Error('disk full'); }), remove: vi.fn() };
+            const acks = answers();
+            const client = new ApiSessionClient('fake-token', session, undefined, { providerUsageStore: store });
+            client.sendProviderUsageEvent(event);
+            expect(sentIds()).toEqual([event.sourceEventId]);
+            acks[0](null, { success: true });
+            await client.close();
+            expect(closeWarnings()).toEqual([]);
+        });
+
+        it('recovers persisted usage on connect and removes it only after server acknowledgement', async () => {
+            const event = usageEvent('recovered');
+            const store = { load: vi.fn(() => [event]), put: vi.fn(), remove: vi.fn() };
+            const acks = answers();
+            const client = new ApiSessionClient('fake-token', session, undefined, { providerUsageStore: store });
+            emitSocketEvent('connect');
+            expect(sentIds()).toEqual([event.sourceEventId]);
+            expect(store.put).not.toHaveBeenCalled();
+            expect(store.remove).not.toHaveBeenCalled();
+            acks[0](null, { success: true });
+            expect(store.remove).toHaveBeenCalledWith(event.sourceEventId);
+            await client.close();
+        });
+
+        it('is sent again on reconnect until it is confirmed, never while its answer is still owed', async () => {
+            const acks = answers();
+            const client = new ApiSessionClient('fake-token', session);
+            client.sendProviderUsageEvent(usageEvent('resp-1'));
+            expect(mockSocket.timeout).toHaveBeenCalledWith(10_000);
+            expect(sentIds()).toEqual(['test-session-id:openai:resp-1']);
+
+            emitSocketEvent('connect');
+            expect(sentIds()).toHaveLength(1);
+
+            acks[0](new Error('operation has timed out'));
+            emitSocketEvent('connect');
+            expect(sentIds()).toEqual(Array(2).fill('test-session-id:openai:resp-1'));
+
+            acks[1](null, { success: true, eventId: 'stored' });
+            emitSocketEvent('connect');
+            expect(sentIds()).toHaveLength(2);
+            await client.close();
+            expect(closeWarnings()).toEqual([]);
+        });
+
+        it('waits with it while disconnected and sends it once the socket is back', async () => {
+            answers();
+            const client = new ApiSessionClient('fake-token', session);
+            mockSocket.connected = false;
+            client.sendProviderUsageEvent(usageEvent('resp-offline'));
+            expect(sentIds()).toEqual([]);
+            expect((client as any).providerTokens).toBe(15);
+
+            mockSocket.connected = true;
+            emitSocketEvent('connect');
+            expect(sentIds()).toEqual(['test-session-id:openai:resp-offline']);
+            mockSocket.connected = false;
+            await client.close();
+        });
+
+        it('keeps the socket open at close for the answer it is owed', async () => {
+            const acks = answers();
+            const client = new ApiSessionClient('fake-token', session);
+            client.sendProviderUsageEvent(usageEvent('resp-closing'));
+
+            const closing = client.close();
+            await Promise.resolve();
+            expect(mockSocket.close).not.toHaveBeenCalled();
+
+            acks[0](null, { success: true, eventId: 'stored' });
+            await closing;
+            expect(mockSocket.close).toHaveBeenCalledTimes(1);
+            expect(closeWarnings()).toEqual([]);
+        });
+
+        it('closes after a bounded wait and reports the event it could not confirm', async () => {
+            answers();
+            const client = new ApiSessionClient('fake-token', session);
+            client.sendProviderUsageEvent(usageEvent('resp-lost'));
+            vi.useFakeTimers();
+            try {
+                const closing = client.close();
+                await vi.advanceTimersByTimeAsync(1999);
+                expect(mockSocket.close).not.toHaveBeenCalled();
+                await vi.advanceTimersByTimeAsync(1);
+                await closing;
+            } finally {
+                vi.useRealTimers();
+            }
+            expect(mockSocket.close).toHaveBeenCalledTimes(1);
+            expect(closeWarnings()).toEqual([[expect.any(String),
+                { count: 1, reasons: { unanswered: 1 }, sourceEventIds: ['test-session-id:openai:resp-lost'], neverPersistedCount: 1, neverPersistedSourceEventIds: ['test-session-id:openai:resp-lost'] }]]);
+        });
     });
 
     it('reports an observed org deployment login only on the events it was handed with', async () => {

@@ -1,3 +1,5 @@
+import { rewrapUsageRecoveryKey } from '@/usage/providerUsageRecoveryKey';
+import { join } from 'node:path';
 /**
  * The file and network side of datakey/machineControl.ts.
  *
@@ -11,6 +13,7 @@ import { configuration } from '@/configuration'
 import { buildMachineIdentity } from '@/machineIdentity'
 import {
   readMachineIdentity,
+  readCredentials,
   replaceCredentialsDataKey,
   replacePrivateFile,
   updateSettings,
@@ -56,6 +59,14 @@ export function createMachineControlIo(input: { token: string; machineId: string
     deletePending: () => rm(file, { force: true }),
     writeCredentials: async (credentials) => {
       if (credentials.encryption.type !== 'dataKey') throw new Error('only dataKey credentials are replaced here')
+      try {
+        const previous = await readCredentials();
+        if (!previous) throw new Error('previous usage identity unavailable');
+        await rewrapUsageRecoveryKey(join(configuration.happyHomeDir, 'usage-spool'), previous, credentials);
+      } catch {
+        // The server has already swapped its key. Telemetry migration cannot strand access.key.
+        logger.warn('[USAGE] Recovery key migration failed; rotated credentials will be committed. Existing encrypted queues may require the previous key and are retained.');
+      }
       await replaceCredentialsDataKey({
         token: credentials.token,
         publicKey: credentials.encryption.publicKey,

@@ -885,6 +885,7 @@ export async function startDaemon(): Promise<void> {
   let stopLogHousekeeping: () => void = () => undefined;
   let stopClaudeSwapSupervisor: () => void = () => undefined;
   let standaloneWindows: Awaited<ReturnType<typeof createStandaloneWindowsRuntime>>;
+  let stopUsageRecovery: () => Promise<void> = async () => undefined;
   let stopScriptWorker: () => Promise<void> = async () => undefined;
   let stopBrowserAttention: () => Promise<void> = async () => undefined;
   try {
@@ -4675,11 +4676,27 @@ export async function startDaemon(): Promise<void> {
         machineId: managedCredential.credential.machineId,
         token: managedCredential.credential.token,
         machineKey: managedCredential.credential.machineKey,
+        usageRecoveryRoot: managedIdentity.status === 'active' ? join(managedDaemonStateDir(managedIdentity.identity.stateDir), 'usage-spool') : undefined,
         // Validated against the server this process actually talks to. A
         // credential for another Happy is refused here rather than sent there.
         serverOrigin: managedCredential.credential.serverOrigin,
       })
       : await ApiClient.create(credentials);
+
+    stopUsageRecovery = api.startUsageRecovery(async () => {
+      const current = await readCredentials();
+      return current !== null;
+    }, id => {
+      const encryption = sessionIdToFinishedSession.get(id)?.encryption;
+      return encryption ? { sessionId: id, key: encryption.encryptionKey, variant: encryption.encryptionVariant } : null;
+    }, async () => {
+      if (managedIdentity.status !== 'active' || !managedCredential?.ok) return null;
+      const current = readManagedDaemonCredential({ stateDir: managedIdentity.identity.stateDir,
+        expectedMachineId: managedIdentity.identity.happyMachineId, now: Date.now(), deps: defaultProvisioningDeps });
+      if (!current.ok || new URL(current.credential.serverOrigin).origin !== new URL(configuration.serverUrl).origin
+        || !Buffer.from(current.credential.machineKey).equals(Buffer.from(managedCredential.credential.machineKey))) return null;
+      return current.credential.token;
+    }, readCredentials);
 
     // Get or create machine.
     //
@@ -4917,6 +4934,8 @@ export async function startDaemon(): Promise<void> {
           logger.debug(
             `[managed] launching run=${context.runId} attempt=${context.attemptId} epoch=${context.epoch}`,
           );
+          api.provisionManagedUsageRecovery({ sessionId: context.envelope.bootstrap.sessionId,
+            key: decodeBase64(context.envelope.bootstrap.rawKeyBase64), serverOrigin: context.envelope.bootstrap.serverOrigin });
           return launchManagedSpawn({
             backend: managedFencingBackend,
             context,
@@ -6202,6 +6221,7 @@ export async function startDaemon(): Promise<void> {
         teardownCurrentDaemon: async () => {
           await drainWorktreeOperations();
           clearInterval(restartOnStaleVersionAndHeartbeat);
+          await stopUsageRecovery();
           await checkpointRetentionSchedule.stop();
 
           // Release ownership BEFORE spawning the new daemon. Otherwise the spawned
@@ -6607,6 +6627,7 @@ export async function startDaemon(): Promise<void> {
       restartDrainRuntime?.dispose();
       await drainWorktreeOperations();
       logger.debug(`[DAEMON RUN] Starting proper cleanup (source: ${source}, errorMessage: ${errorMessage})...`);
+      await stopUsageRecovery();
       await checkpointRetentionSchedule.stop();
 
       stopBrowserTaskReconciliation();
@@ -6714,6 +6735,7 @@ export async function startDaemon(): Promise<void> {
     await cleanupAndShutdown(shutdownRequest.source, shutdownRequest.errorMessage);
   } catch (error) {
     const bashRpcsDrained = drainBashRpcs();
+    await stopUsageRecovery();
     await stopBrowserAttention();
     await standaloneWindows?.owner.close().catch(() => {});
     stopLogHousekeeping();

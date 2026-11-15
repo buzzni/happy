@@ -1540,6 +1540,150 @@ describe('CodexAppServerClient sandbox integration', () => {
         }
     });
 
+    it.each(['missing', 'missing-null', 'response-first', 'snapshot-first', 'foreign', 'no-snapshot'] as const)('reports missing response usage at turn end (%s)', async (order) => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const { logger } = await import('@/ui/logger');
+        const client = new CodexAppServerClient();
+        (client as any)._threadId = order === 'foreign' ? 'other-thread' : 'usage-thread';
+        const notify = (method: string, extra: Record<string, unknown>) =>
+            (client as any).handleNotification(method, { threadId: 'usage-thread', turnId: 'usage-turn', ...extra });
+        const response = () => notify('rawResponse/completed', { responseId: 'response', usage: { totalTokens: 10 } });
+        if (order === 'response-first') response();
+        if (order !== 'no-snapshot') notify('thread/tokenUsage/updated', { tokenUsage: { total: { totalTokens: 10 } } });
+        if (order === 'missing-null') notify('rawResponse/completed', { responseId: 'response', usage: null });
+        if (order === 'snapshot-first') response();
+        notify('turn/completed', { turn: { id: 'usage-turn', status: 'completed' } });
+        notify('turn/completed', { turn: { id: 'usage-turn', status: 'completed' } });
+        const warnings = vi.mocked(logger.warn).mock.calls.filter(([message]) => String(message).includes('Usage coverage gap'));
+        expect(warnings).toHaveLength(order.startsWith('missing') ? 1 : 0);
+        await client.disconnect();
+    });
+
+    describe('usage coverage gaps', () => {
+        const usageGap = async () => {
+            const { CodexAppServerClient } = await import('./codexAppServerClient');
+            const { logger } = await import('@/ui/logger');
+            const client = new CodexAppServerClient();
+            (client as any)._threadId = 'main-thread';
+            const notify = (method: string, threadId: string, turnId: string, extra: Record<string, unknown> = {}) =>
+                (client as any).handleNotification(method, { threadId, turnId, ...extra });
+            return {
+                client,
+                snapshot: (threadId: string, turnId: string) =>
+                    notify('thread/tokenUsage/updated', threadId, turnId, { tokenUsage: { total: { totalTokens: 10 } } }),
+                end: (threadId: string, turnId: string, method = 'turn/completed') =>
+                    notify(method, threadId, turnId, { turn: { id: turnId, status: 'completed' } }),
+                warned: () => vi.mocked(logger.warn).mock.calls
+                    .filter(([message]) => String(message).includes('Usage coverage gap'))
+                    .map(([, detail]) => detail),
+            };
+        };
+
+        it('reports a tracked child thread and leaves an untracked one alone', async () => {
+            const { client, snapshot, end, warned } = await usageGap();
+            vi.spyOn((client as any).subagents, 'isTracked').mockImplementation((threadId) => threadId === 'child-thread');
+            for (const threadId of ['child-thread', 'stranger-thread']) {
+                snapshot(threadId, `${threadId}-turn`);
+                end(threadId, `${threadId}-turn`);
+            }
+            expect(warned()).toEqual([{ threadId: 'child-thread', turnId: 'child-thread-turn' }]);
+            await client.disconnect();
+        });
+
+        it('reports a turn that was aborted after its token snapshot', async () => {
+            const { client, snapshot, end, warned } = await usageGap();
+            snapshot('main-thread', 'turn-1');
+            end('main-thread', 'turn-1', 'turn/aborted');
+            expect(warned()).toEqual([{ threadId: 'main-thread', turnId: 'turn-1' }]);
+            await client.disconnect();
+        });
+
+        it('warns once per thread, and again only after the connection it was observed on is gone', async () => {
+            const { client, snapshot, end, warned } = await usageGap();
+            for (const turnId of ['turn-1', 'turn-2']) {
+                snapshot('main-thread', turnId);
+                end('main-thread', turnId);
+            }
+            expect(warned()).toEqual([{ threadId: 'main-thread', turnId: 'turn-1' }]);
+
+            // Neither the open observation nor the suppression outlives the app-server they were seen on.
+            snapshot('main-thread', 'turn-open');
+            await client.disconnect();
+            (client as any)._threadId = 'main-thread';
+            end('main-thread', 'turn-open');
+            expect(warned()).toHaveLength(1);
+            snapshot('main-thread', 'turn-3');
+            end('main-thread', 'turn-3');
+            expect(warned()).toEqual([
+                { threadId: 'main-thread', turnId: 'turn-1' },
+                { threadId: 'main-thread', turnId: 'turn-3' },
+            ]);
+            await client.disconnect();
+        });
+    });
+
+    it('opts out of raw response items while keeping the capabilities it already declares', async () => {
+        const initialize: MockRpcMessage[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg) => { if (msg.method === 'initialize') initialize.push(msg); },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+        expect(initialize.map((msg) => msg.params?.capabilities)).toEqual([{
+            experimentalApi: true,
+            optOutNotificationMethods: ['rawResponseItem/completed'],
+        }]);
+        await client.disconnect();
+    });
+
+    it('opts new threads into response completion usage instead of accumulating token snapshots', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const request = vi.spyOn(client as any, 'request').mockResolvedValue({ thread: { id: 'usage-thread' }, model: 'test' });
+        await client.startThread({});
+        expect(request).toHaveBeenCalledWith('thread/start', expect.objectContaining({ experimentalRawEvents: true }));
+        await client.disconnect();
+    });
+
+    it.each(['resume', 'fork'])('collects %s usage from the native rollout without copied history or raw duplicates', async (operation) => {
+        const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
+        const { tmpdir } = await import('node:os');
+        const { join } = await import('node:path');
+        const directory = await mkdtemp(join(tmpdir(), 'codex-client-usage-'));
+        const path = join(directory, 'rollout.jsonl');
+        const usage = { input_tokens: 10, cached_input_tokens: 0, cache_write_input_tokens: 0,
+            output_tokens: 5, reasoning_output_tokens: 0, total_tokens: 15 };
+        const record = (thread: string, turn: string, response: string) => JSON.stringify({ type: 'token_usage_record',
+            payload: { thread_id: thread, turn_id: turn, response_id: response, usage } }) + '\n';
+        await writeFile(path, record('parent', 'old', 'history') + record('owned', 'old', 'history2'));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: any[] = []; client.setEventHandler(e => events.push(e));
+        vi.spyOn(client as any, 'request').mockResolvedValue({ thread: { id: 'owned', path }, model: 'test' });
+        try {
+            if (operation === 'resume') await client.resumeThread({ threadId: 'owned' });
+            else await client.forkThread({ threadId: 'parent' });
+            (client as any).handleNotification('turn/started', { threadId: 'owned', turn: { id: 'live' } });
+            await writeFile(path, record('parent', 'old', 'history') + record('owned', 'old', 'history2')
+                + record('owned', 'live', 'response1') + record('owned', 'live', 'response2'));
+            (client as any).handleNotification('thread/tokenUsage/updated', { threadId: 'owned', turnId: 'live', tokenUsage: { total: {} } });
+            (client as any).handleNotification('turn/aborted', { threadId: 'owned', turn: { id: 'live' } });
+            await waitFor(() => events.filter(e => e.type === 'codex_usage').length === 2, 3000);
+            (client as any).handleNotification('rawResponse/completed', { threadId: 'owned', turnId: 'live', responseId: 'response1', usage: {} });
+            expect(events.filter(e => e.type === 'codex_usage').map(e => [e.response_id, e.usage.totalTokens]))
+                .toEqual([['response1', 15], ['response2', 15]]);
+            await client.disconnect();
+            await client.resumeThread({ threadId: 'owned' });
+            (client as any).handleNotification('turn/started', { threadId: 'owned', turn: { id: 'after-reconnect' } });
+            const { appendFile } = await import('node:fs/promises');
+            await appendFile(path, record('owned', 'after-reconnect', 'response3'));
+            (client as any).handleNotification('turn/completed', { threadId: 'owned', turn: { id: 'after-reconnect' } });
+            await waitFor(() => events.filter(e => e.type === 'codex_usage').length === 3, 3000);
+            expect(events.filter(e => e.type === 'codex_usage').map(e => e.response_id)).toEqual(['response1', 'response2', 'response3']);
+        } finally { await client.disconnect(); await rm(directory, { recursive: true, force: true }); }
+    });
+
     it('emits response-scoped usage with the native Codex response id', async () => {
         let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
         mockSpawn.mockImplementation(() => createMockProcess({
@@ -6792,6 +6936,36 @@ describe('sub-agent thread separation', () => {
         s.notify('thread/status/changed', { threadId, status: { type: 'idle' } });
         s.notify('turn/completed', { threadId, turn: { id: CHILD_TURN, status: 'completed', error: null } });
     }
+
+    it.each([false, true])('collects delayed child usage after abort even if classification follows turn/started (early=%s)', async (early) => {
+        const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
+        const { tmpdir } = await import('node:os');
+        const { join } = await import('node:path');
+        const directory = await mkdtemp(join(tmpdir(), 'codex-child-usage-'));
+        const path = join(directory, 'child.jsonl');
+        await writeFile(path, '');
+        const s = await openSession({ readThread: threadId => {
+            const reply = childThread(threadId, 'Child');
+            (reply as any).result.thread.path = path;
+            return reply;
+        } });
+        try {
+            const { done } = await startMainTurn(s);
+            if (early) s.notify('turn/started', { threadId: CHILD, turn: { id: CHILD_TURN } });
+            else spawnV2(s);
+            await until(() => listed(s.events).some(tasks => tasks?.length === 1), 'classified child');
+            s.notify('turn/aborted', { threadId: CHILD, turnId: CHILD_TURN });
+            await vi.advanceTimersByTimeAsync(100);
+            const record = (thread: string, turn: string, response: string) => JSON.stringify({ type: 'token_usage_record', payload: {
+                thread_id: thread, turn_id: turn, response_id: response, usage: { input_tokens: 10, cached_input_tokens: 0,
+                    cache_write_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 0, total_tokens: 15 },
+            } }) + '\n';
+            await writeFile(path, record(MAIN, MAIN_TURN, 'copied') + record(CHILD, 'old', 'old') + record(CHILD, CHILD_TURN, 'child-response'));
+            await until(() => s.events.some(e => e.type === 'codex_usage'), 'child usage');
+            expect(s.events.filter(e => e.type === 'codex_usage').map(e => e.response_id)).toEqual(['child-response']);
+            endMainTurn(s); await settled(done, 'main completion');
+        } finally { await settled(s.client.disconnect(), 'disconnect'); await rm(directory, { recursive: true, force: true }); }
+    });
 
     it('[1] a child idle status during the main turn leaves the turn open; the main turn/completed settles it (P1)', async () => {
         const s = await openSession();

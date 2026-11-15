@@ -241,6 +241,8 @@ export async function claudeRemote(opts: {
     onSessionFound: (id: string) => void,
     onThinkingChange?: (thinking: boolean) => void,
     onMessage: (message: SDKMessage) => void,
+    /** Actual provider transcript location, including the config root of an isolated run. */
+    onUsageTranscriptLocation?: (projectDir: string, sessionId: string) => void,
     /** Token-level partials. Never persisted — see streamDeltaRelay. */
     onStreamEvent?: (message: Extract<SDKMessage, { type: 'stream_event' }>) => void,
     onTurnLatency?: (diagnostic: ClaudeTurnLatencyDiagnostic) => void,
@@ -1045,6 +1047,10 @@ function readTurnText(content: unknown): string {
                 updateThinking(true);
 
                 const systemInit = message as SDKSystemMessage;
+                opts.onUsageTranscriptLocation?.(
+                    getProjectPath(providerPath, processSandbox?.claudeConfigDir ?? transcriptConfigDirectory),
+                    systemInit.session_id,
+                );
                 aiAuthObservation?.noteTurnApiKeySource(systemInit.apiKeySource);
                 // Provider executable start until it is ready to work (first run pays any endpoint scan).
                 logger.debug(`[timing] claude system-init ${Date.now() - queryStartedAt}ms`);

@@ -655,7 +655,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 try { parsed = JSON.parse(line); } catch { continue; }
                 const result = RawJSONLinesSchema.safeParse(parsed);
                 if (!result.success) continue;
-                await session.sendClaudeSessionMessageFromLocalTranscript(result.data as RawJSONLines);
+                await session.sendClaudeSessionMessageFromLocalTranscript(result.data as RawJSONLines, { historical: true });
                 backfilled += 1;
             }
             // Only a later user line closes the mapper's turn, so a transcript that ends on the

@@ -40,7 +40,21 @@
             "whatwg-url": "14.2.0",
             "parse-path": "7.0.3",
             "@types/parse-path": "7.0.3",
-            "pglite-prisma-adapter>@prisma/driver-adapter-utils": "6.19.2"
+            "pglite-prisma-adapter>@prisma/driver-adapter-utils": "6.19.2",
+            "fast-xml-parser@>=4 <4.5.5": "^4.5.7",
+            "engine.io@>=6 <6.6.10": "^6.6.11",
+            "socket.io-parser@>=4 <4.2.7": "^4.2.7",
+            "ws@>=8 <8.21.0": "^8.23.0",
+            "find-my-way@>=9 <9.7.0": "^9.10.0",
+            "fast-uri@>=3 <3.1.7": "^3.1.9",
+            "brace-expansion@>=5 <5.0.11": "^5.0.13",
+            "nanoid@>=3 <3.3.18": "^3.3.20",
+            "postcss@>=8 <8.5.18": "^8.5.33",
+            "vite@>=8 <8.1.6": "^8.3.8",
+            "source-map-js@<1.2.2": "^1.2.2",
+            "lodash@<4.18.0": "^4.18.1",
+            "form-data@>=4 <4.0.6": "^4.0.6",
+            "defu@<6.1.5": "^6.1.7"
         },
         "onlyBuiltDependencies": [
             "@more-tech/react-native-libsodium",

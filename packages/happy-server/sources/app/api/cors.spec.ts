@@ -97,6 +97,28 @@ describe('isAllowedCorsOrigin', () => {
         await app.close();
     });
 
+    it('allows non-simple methods in preflight for every allowed origin kind', async () => {
+        // @fastify/cors 11 narrowed its default methods to GET,HEAD,POST. The API uses PUT/PATCH/DELETE,
+        // so the delegate must keep passing its own method list.
+        const app = fastify();
+        const cors = (await import('@fastify/cors')).default;
+        await app.register(cors, () => fastifyCorsDelegate);
+        app.delete('/v1/sessions/s', async () => ({ ok: true }));
+        await app.ready();
+
+        for (const origin of ['https://saycode.ai', 'null', 'app://renderer']) {
+            const preflight = await app.inject({
+                method: 'OPTIONS',
+                url: '/v1/sessions/s',
+                headers: { origin, 'access-control-request-method': 'DELETE' },
+            });
+            const methods = String(preflight.headers['access-control-allow-methods']).split(',').map((m) => m.trim());
+            expect(methods, origin).toEqual(expect.arrayContaining(['PUT', 'PATCH', 'DELETE']));
+        }
+
+        await app.close();
+    });
+
     it('lets the app:// desktop renderer call the API without credentials, by exact origin only', async () => {
         // A standard custom scheme serializes to an opaque origin in WHATWG URL (`new URL('app://renderer').origin`
         // is "null"), so this origin can never pass the URL-based allow-list. It is matched as an exact string and
