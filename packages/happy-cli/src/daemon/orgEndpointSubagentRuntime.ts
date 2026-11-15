@@ -306,16 +306,22 @@ export function createOrgSubagentRuntime(deps: Dependencies) {
     }
     return { spawn: async (raw: unknown) => {
         const request = orgSubagentInputSchema.parse(raw);
-        await parent(request.sourceSessionId);
-        const source = sourceRecord(request.sourceSessionId);
-        let directory: string, sourceDirectory: string;
-        try { [directory, sourceDirectory] = await Promise.all([realpath(request.directory), realpath(source.metadata.path)]); }
-        catch { return code('PARENT_BOUND'); }
-        if (directory !== sourceDirectory) return code('PARENT_BOUND');
-        // A caller cannot supply or override the daemon-held sandbox/lineage policy commitment.
-        request.sourcePolicyDigest = policyDigest(source);
-        await reportParent(request.sourceSessionId);
-        return engine.spawn(request);
+        try {
+            await parent(request.sourceSessionId);
+            const source = sourceRecord(request.sourceSessionId);
+            let directory: string, sourceDirectory: string;
+            try { [directory, sourceDirectory] = await Promise.all([realpath(request.directory), realpath(source.metadata.path)]); }
+            catch { return code('PARENT_BOUND'); }
+            if (directory !== sourceDirectory) return code('PARENT_BOUND');
+            // A caller cannot supply or override the daemon-held sandbox/lineage policy commitment.
+            request.sourcePolicyDigest = policyDigest(source);
+            await reportParent(request.sourceSessionId);
+            return await engine.spawn(request);
+        } catch (error) {
+            // Without a reservation nothing was submitted and status has nothing to observe: the caller must retry, not wait.
+            if (error instanceof OrgSubagentRefused || await journal.read(request.operationId).catch(() => undefined) !== null) throw error;
+            return code('VERIFICATION_UNAVAILABLE');
+        }
     }, status: engine.status, context, checkResume,
         hasAuthority: (sessionId: string) => deps.records()[sessionId]?.agentEnvironment?.[ORG_SUBAGENT_LAUNCH_ENV] !== undefined,
         capabilities: async (raw: unknown) => {

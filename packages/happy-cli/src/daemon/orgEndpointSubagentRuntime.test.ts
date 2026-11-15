@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { mkdtemp, rm, writeFile, unlink } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, rmdir, writeFile, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -9,6 +9,7 @@ import { HappySessionExecutionProofSchema, SessionExecutionTicketBodySchema, Sig
     verifySubagentRequest, type SessionExecutionTicket } from '@slopus/happy-wire';
 import { configuration } from '@/configuration';
 import { createOrgSubagentRuntime, readOrgSubagentRegistration, type OrgSubagentPersisted } from './orgEndpointSubagentRuntime';
+import { registerOrgSubagentRpc } from './orgEndpointSubagentRpc';
 import { buildSpawnRequestEnvironment, captureSaycodeAgentEnvironment, formatOrgEndpointBinding } from './sessionEnv';
 import { ORG_ENDPOINT_BINDING_ENV } from '@/utils/childEnv';
 import { createNodeAiCredentialRuntime } from './aiCredentialRuntime';
@@ -140,6 +141,13 @@ describe('org subagent production adapter', () => {
             await unlink(endpointStorePath);
             await expect(runtime.spawn(grandchildInput)).rejects.toMatchObject({ code: 'ORG_LLM_ENDPOINT_NOT_SYNCED' });
             expect(starts).toBe(2); expect(operations.size).toBe(1);
+            // A local failure before reservation leaves no operation to resume, so the caller is told to retry instead of waiting.
+            await mkdir(endpointStorePath);
+            const rpc = new Map<string, (raw: unknown) => Promise<unknown>>();
+            registerOrgSubagentRpc((name, handler) => rpc.set(name, handler), runtime);
+            expect(await rpc.get('spawn-org-endpoint-subagent')!(grandchildInput))
+                .toEqual({ ok: false, error: 'ORG_LLM_ENDPOINT_VERIFICATION_UNAVAILABLE', reason: 'ORG_LLM_ENDPOINT_VERIFICATION_UNAVAILABLE' });
+            await rmdir(endpointStorePath);
             await writeFile(endpointStorePath, JSON.stringify({ version: 1, endpoints: { endpoint: { ...sync().endpoint, companyId: 'company', userId: 'user' } } }), { mode: 0o600 });
             expect(await runtime.spawn(grandchildInput)).toMatchObject({ ok: true, sessionId: 'session-3', endpointId: 'endpoint' });
             expect(await runtime.spawn(grandchildInput)).toMatchObject({ ok: true, sessionId: 'session-3' });
