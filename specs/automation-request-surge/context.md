@@ -183,3 +183,28 @@ Reviewed the four-file implementation diff against authoritative service queries
 ## 커밋·PR 준비 (2026-09-17)
 
 사용자의 `commit & pr` 요청에 따라 변경을 저장소별 커밋·브랜치 push·main 대상 PR로 인수인계한다. 앞선 무커밋/무push 기록은 당시 상태다. 머지·배포는 수행하지 않는다. 기존 전체-suite 실패는 PR에 명시한다.
+
+
+## 2026-11-15 후속 진단 보강
+
+사용자 승인에 따라 기존 자동화 조회 폭주 로그를 보강했다. 기준은 origin/main
+6082b39b5, 브랜치는 `fix/automation-read-diagnostics-20261115`다. 통합 작업공간의
+`.aplus/worktrees/automation-read-server`에 독립 Git 체크아웃으로 보관하며 상위
+`vendor/happy` gitlink는 변경하지 않는다.
+
+- 10초 창의 route/source/client별 건수, 서로 다른 프로젝트 수와 상한 여부,
+  창 시작부터 표본까지의 경과 시간을 추가했다. 기존 계정별 30건 기준·60초 cooldown은 유지한다.
+- 계정 최대 1,024개, 프로젝트 최대 256개/창, 클라이언트 최대 16개+other/창으로
+  메모리를 제한한다. 기존 허용 route/source만 집계하고 알려진 클라이언트/버전 형식만
+  기록한다. 임의 헤더·인증·본문·쿼리를 복사하지 않는다. 메트릭 라벨은 추가하지 않는다.
+- 통계는 Pod 하나에서 표본 시점까지 누적된 부분 창이다. 표본의 projectId·route 한 건이
+  전체 건수의 소유자라고 해석하거나, 완성된 클러스터 10초 합계로 해석하면 안 된다.
+- HTTP 경계 테스트와 순수 집계 테스트에서 누락을 먼저 재현했고, 최종 관련 테스트
+  2파일 34개 통과. 서버 typecheck 통과. 프로젝트 상한 가드를 제거하면 테스트가 실패한다.
+- 검증 준비는 lockfile 고정 pnpm filtered install, Prisma generate, happy-wire build로
+  수행했다. server typecheck가 참조하는 happy-app 공유 타입에는 같은 lock의 zod/wire만
+  checkout-local node_modules에서 연결했다. 패키지/lockfile 변경 없음.
+- expo/codium의 미설치 설정을 vite-tsconfig-paths가 스캔하는 경고와 기존 Fastify
+  deprecation 경고가 출력됐다. 관련 테스트/타입은 통과했다.
+- 기존 plan/context/tasks를 포함해 7개 수정, 신규 0. 운영 변경·재시작·push·배포 없음.
+  운영 효과와 경보 baseline 조정은 수정 버전 배포 후 검증할 항목이다.

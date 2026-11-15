@@ -463,12 +463,16 @@ describe("automation read observation", () => {
         });
         try {
             for (let i = 0; i < 35; i++) {
-                const response = await app.inject({ method: "GET", url: `/v1/projects/p-${i}/automations?ignored=private`, headers: { "x-happy-read-source": "socket", "authorization": "Bearer private" } });
+                const response = await app.inject({ method: "GET", url: `/v1/projects/p-${i}/automations?ignored=private`, headers: { "x-happy-client": "desktop/0.1.88", "x-happy-read-source": "socket", "authorization": "Bearer private" } });
                 expect(response.statusCode).toBe(200);
                 expect(response.json()).toEqual({ automations: [] });
             }
             expect(warnMock).toHaveBeenCalledTimes(1);
             expect(warnMock.mock.calls[0][0]).toMatchObject({ module: "automation-read", accountId: "authenticated-account", projectId: "p-29", source: "socket", count: 30 });
+            expect(warnMock.mock.calls[0][0]).toMatchObject({
+                countsByClient: { 'desktop/0.1.88': 30 }, countsByRoute: { '/v1/projects/:projectId/automations': 30 },
+                countsBySource: { socket: 30 }, projectCount: 30, projectCountCapped: false,
+            });
             expect(JSON.stringify(warnMock.mock.calls)).not.toContain("private");
             await app.inject({ method: "GET", url: "/v1/projects/p/automations", headers: { "x-happy-read-source": "unbounded-value" } });
             const samples = (await automationReadRequestsCounter.get()).values;
