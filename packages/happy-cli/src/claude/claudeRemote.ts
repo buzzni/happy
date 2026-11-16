@@ -1159,7 +1159,8 @@ function readTurnText(content: unknown): string {
                 };
                 opts.onMcpControllerReady?.(mcpRecovery);
 
-                await mcpRecovery.recoverFailedServers();
+                // An ended input answers no control request, and no turn of ours will need the servers again.
+                if (!messages.done) await mcpRecovery.recoverFailedServers();
 
                 // Send completion messages
                 if (isCompactCommand) {
@@ -1286,6 +1287,11 @@ function readTurnText(content: unknown): string {
                 // Wait for next user message without blocking the message loop.
                 // Background task messages (task_started, task_progress, task_notification)
                 // continue flowing through while we wait for user input.
+                // An ended input asks for nothing, and its end was handled when it came: this
+                // provider can take no message, and the one held back for the next provider would
+                // be taken and dropped here. Turns the provider opens itself still flow through this
+                // loop until it exits.
+                if (messages.done) continue;
                 opts.nextMessage().then(async (next) => {
                     if (queryClosed) return;
                     if (!next) {

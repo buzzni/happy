@@ -888,6 +888,48 @@ describe('claudeRemote', () => {
         expect(await sendActiveInput('too late')).toBe(false);
     });
 
+    it('ends its input once, though the provider opens turns of its own after the end', async () => {
+        // A provider kept alive by background work still opens a turn when that work reports. Its result must not end
+        // the input again: the exit budget runs from the input's end, and asking the launcher for input there could take
+        // a message held back for the next provider.
+        const init = { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [] };
+        vi.mocked(query).mockImplementation((request) => {
+            const input = (request.prompt as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+            return {
+                setPermissionMode: vi.fn(),
+                mcpServerStatus: vi.fn(async () => []),
+                async *[Symbol.asyncIterator]() {
+                    await input.next();
+                    yield init;
+                    yield { type: 'result', subtype: 'success' };
+                    // Done once the input ends; the work then reports.
+                    await input.next();
+                    yield init;
+                    yield { type: 'result', subtype: 'success' };
+                },
+            } as any;
+        });
+        const onInputExhausted = vi.fn();
+        const nextMessage = vi.fn(async () => (nextMessage.mock.calls.length === 1 ? { message: 'initial request', mode } : null));
+        await claudeRemote({
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            nextMessage,
+            onReady: vi.fn(),
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage: vi.fn(),
+            workspaceExitObservation: true,
+            onInputExhausted,
+        });
+        expect(nextMessage).toHaveBeenCalledTimes(2);
+        expect(onInputExhausted).toHaveBeenCalledTimes(1);
+    });
+
     it('marks /clear as a completed reset turn', async () => {
         const callbackOrder: string[] = [];
         const onCompletionEvent = vi.fn((message: string) => {

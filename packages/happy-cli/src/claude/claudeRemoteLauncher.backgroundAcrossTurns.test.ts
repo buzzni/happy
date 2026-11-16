@@ -389,6 +389,67 @@ describe('background work across the turns of one Claude process', () => {
         expect(launches[1]).toMatchObject({ model: 'claude-sonnet-5', effort: 'medium' });
         expect(engineChanges).toEqual([]);
     }, 15_000);
+
+    it('keeps reading a provider whose input a restart ended while its work runs, and hands the held message to the next one', async () => {
+        // The process stays for its work and opens turns of its own when the work reports. The status check after such
+        // a turn went unanswered, so nothing it said reached the app; and the input request after it would have taken
+        // the held message into a provider that could no longer accept any.
+        const before: EnhancedMode = { permissionMode: 'default', model: 'claude-sonnet-5' };
+        const planned: EnhancedMode = { ...before, permissionMode: 'plan' };
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const { client } = recordingClient('ended-input-own-turns', handlers);
+        const received: Array<{ text: string; generation: number }> = [];
+        const launches: Options[] = [];
+        const report = (id: string) => ({ type: 'assistant', uuid: id, session_id: 'claude-1', parent_tool_use_id: null,
+            message: { id, role: 'assistant', model: 'claude-sonnet-5', content: [{ type: 'text', text: id }], usage: { input_tokens: 1, output_tokens: 1 } } });
+        let endWork!: () => void;
+        const workEnded = new Promise<void>(resolve => { endWork = resolve; });
+        vi.mocked(query).mockImplementation(({ prompt, options }) => {
+            launches.push(options!);
+            const generation = launches.length;
+            const signal = options!.abortController!.signal;
+            let inputEnded = false;
+            const response = engine((async function* () {
+                for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                    received.push({ text: String(message.message.content), generation });
+                    yield INIT;
+                    if (generation === 1) yield listed([SERVER]);
+                    yield result(received.length);
+                    // Plan mode reaches the SDK only at launch, so this message restarts the provider.
+                    if (generation === 1) queue.push('plan this', planned);
+                }
+                inputEnded = true;
+                if (generation > 1) return;
+                for (const id of ['report-1', 'report-2']) {
+                    yield INIT;
+                    yield report(id);
+                    yield result(received.length);
+                }
+                await workEnded;
+                yield listed([]);
+            })(), []);
+            // Like Claude Code: a control request after the input ended is never answered, and fails when the query closes.
+            return Object.assign(response, {
+                mcpServerStatus: () => inputEnded
+                    ? untilAborted(signal).then(() => { throw new Error('Query closed before response received'); })
+                    : Promise.resolve([]),
+            });
+        });
+        queue.push('turn-0', before);
+        const launcher = claudeRemoteLauncher(sessionOf(queue, client));
+        const sentReport = () => client.sendClaudeSessionMessage.mock.calls.some(([body]) => (body as { message?: { id?: string } }).message?.id === 'report-2');
+        try {
+            await vi.waitFor(() => expect(sentReport()).toBe(true), { timeout: 5_000 });
+            endWork();
+            await vi.waitFor(() => expect(received).toContainEqual({ text: 'plan this', generation: 2 }), { timeout: 5_000 });
+        } finally {
+            endWork();
+            await handlers.get('switch')!();
+            await launcher;
+        }
+        expect(received).toEqual([{ text: 'turn-0', generation: 1 }, { text: 'plan this', generation: 2 }]);
+    }, 15_000);
 });
 
 function untilAborted(signal: AbortSignal): Promise<void> {
