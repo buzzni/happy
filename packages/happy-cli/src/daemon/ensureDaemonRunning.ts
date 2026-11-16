@@ -1,5 +1,5 @@
 import { logger } from '@/ui/logger'
-import { checkIfDaemonRunningAndCleanupStaleState, isDaemonRunningCurrentlyInstalledHappyVersion } from './controlClient'
+import { checkIfDaemonRunningAndCleanupStaleState, isDaemonRunningSameOrNewerHappyVersion } from './controlClient'
 import { captureSpawnOutputStdio, spawnHappyCLI } from '@/utils/spawnHappyCLI'
 import { resolveDaemonMcpConfigEnvironment } from './daemonMcpConfig'
 import { configuration } from '@/configuration'
@@ -30,7 +30,7 @@ async function isCurrentVersionRunningAllowingSlowOwner(): Promise<boolean> {
   const deadline = Date.now() + HEALTH_UNCONFIRMED_RETRY_MS
   while (true) {
     try {
-      return await isDaemonRunningCurrentlyInstalledHappyVersion()
+      return await isDaemonRunningSameOrNewerHappyVersion()
     } catch (error) {
       if (!(error instanceof Error) || !error.message.startsWith('DAEMON_HEALTH_UNCONFIRMED') || Date.now() >= deadline) throw error
       logger.debug('[DAEMON CONTROL] Daemon health unconfirmed; checking again')

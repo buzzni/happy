@@ -97,7 +97,7 @@ import {
 import { persistSetupTokenBinding, recoverSetupTokenBindingPersistence } from './setupTokenBindingPersistence';
 import { decideResumeCredentials, readStagedTokenFromHomeDir, tokensShareIdentity } from './resumeCredentials';
 
-import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
+import { cleanupDaemonState, isDaemonRunningSameOrNewerHappyVersion, stopDaemon } from './controlClient';
 import { preflightDaemonControlServer, startDaemonControlServer } from './controlServer';
 import { BrowserBridge } from './browserBridge';
 import { BrowserLocalSetup, shouldEnableBrowserLocalSetup } from './browserLocalSetup';
@@ -847,7 +847,7 @@ export async function startDaemon(): Promise<void> {
   const startupDisposition = await prepareDaemonStartup({
     previousDaemonGone: candidateIdentityApplies && previousCandidatePresence === 'gone',
     preflightCandidate: preflightDaemonControlServer,
-    runningVersionMatches: isDaemonRunningCurrentlyInstalledHappyVersion,
+    runningVersionMatches: isDaemonRunningSameOrNewerHappyVersion,
     stopRunningDaemon: async () => {
       // TODO: This hand-rolled self-restart path is awkward to reason about and awkward to test.
       // We should probably migrate this daemon to native system service management
@@ -871,7 +871,7 @@ export async function startDaemon(): Promise<void> {
     },
   });
   if (startupDisposition === 'already-running') {
-    logger.debug('[DAEMON RUN] Daemon version matches, keeping existing daemon');
+    logger.debug('[DAEMON RUN] Running daemon is the same or a newer version, keeping it');
     console.log('Daemon already running with matching version');
     process.exit(0);
   }
@@ -6296,7 +6296,7 @@ export async function startDaemon(): Promise<void> {
 
           // Release ownership BEFORE spawning the new daemon. Otherwise the spawned
           // `happy daemon start` reads our still-present daemon.state.json, sees
-          // isDaemonRunningCurrentlyInstalledHappyVersion() === true, and exits —
+          // isDaemonRunningSameOrNewerHappyVersion() === true, and exits —
           // leaving nothing running once we also exit.
           stopPersonalProbes();
           claudeSwapSupervisor.shutdown();

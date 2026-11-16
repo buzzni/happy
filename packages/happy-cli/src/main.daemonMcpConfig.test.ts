@@ -18,7 +18,7 @@ vi.mock('@/ui/auth', () => ({}))
 vi.mock('@/daemon/run', () => ({ startDaemon: mocks.startDaemon }))
 vi.mock('@/daemon/controlClient', () => ({
   checkIfDaemonRunningAndCleanupStaleState: async () => true,
-  isDaemonRunningCurrentlyInstalledHappyVersion: mocks.isInstalledVersion,
+  isDaemonRunningSameOrNewerHappyVersion: mocks.isInstalledVersion,
   stopDaemon: mocks.stopDaemon,
 }))
 vi.mock('@/utils/spawnHappyCLI', () => ({

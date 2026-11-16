@@ -25,7 +25,8 @@ vi.mock('@/ui/logger', () => ({
   logger: { debug: mocks.mockLoggerDebug },
 }))
 
-import { notifyDaemonSessionRuntime, checkIfDaemonRunningAndCleanupStaleState, requestSetupTokenCapacity, requestSetupTokenRebind, requestSetupTokenStart, stopDaemon } from './controlClient'
+import { configuration } from '@/configuration'
+import { notifyDaemonSessionRuntime, checkIfDaemonRunningAndCleanupStaleState, isDaemonRunningSameOrNewerHappyVersion, requestSetupTokenCapacity, requestSetupTokenRebind, requestSetupTokenStart, stopDaemon } from './controlClient'
 
 const DEAD_PID = 3058947
 const HTTP_PORT = 33417
@@ -185,6 +186,32 @@ describe('checkIfDaemonRunningAndCleanupStaleState', () => {
     } finally {
       fetchSpy.mockRestore()
     }
+  })
+})
+
+describe('isDaemonRunningSameOrNewerHappyVersion', () => {
+  const current = configuration.currentCliVersion
+  const build = Number(/-aplus\.(\d+)$/.exec(current)?.[1])
+  const withBuild = (n: number) => current.replace(/-aplus\.\d+$/, `-aplus.${n}`)
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  // 2026-11-16: a stale global `happy` (.352) replaced the desktop's bundled .416 daemon, and the
+  // machine lost every feature added since — a newer daemon serves an older CLI, so keep it.
+  it.each([
+    ['the same version', current, true],
+    ['a newer version', withBuild(build + 1), true],
+    ['an older version', withBuild(build - 1), false],
+    ['an unreadable version', 'dev', false],
+  ])('treats a running daemon of %s as %s', async (_label, startedWithCliVersion, expected) => {
+    const state = { ...stateWithPid(process.pid), startedWithCliVersion }
+    mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state, raw: JSON.stringify(state) })
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: true } as Response)
+    try {
+      await expect(isDaemonRunningSameOrNewerHappyVersion()).resolves.toBe(expected)
+    } finally { fetchSpy.mockRestore() }
   })
 })
 
