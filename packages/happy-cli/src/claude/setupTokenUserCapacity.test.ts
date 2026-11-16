@@ -169,3 +169,37 @@ it('still reports finish after one heartbeat report failed, and releases the run
   expect(request.mock.calls.map(call => call[0])).toEqual(['reserve', 'claim', 'delivery', 'heartbeat', 'delivery', 'finish'])
   expect(runtime.hasActive()).toBe(false)
 })
+it('waits out a daemon that is still being replaced after an update instead of refusing the input', async () => {
+  // ryan 2026-11-16: an update rewrote the bundle, so new session processes asked a pre-.401 daemon (still waiting
+  // for a quiet moment to hand off) for a route it never had; every input failed with CAPACITY_DAEMON_HTTP_404.
+  const failures = ['CAPACITY_DAEMON_HTTP_404', 'CAPACITY_DAEMON_UNREACHABLE']
+  const request = vi.fn(async (operation: string) => {
+    if (operation === 'reserve' && failures.length) throw new Error(failures.shift())
+    return operation === 'reserve' ? { state: 'reserved', managedAccountId: 'a', credentialGeneration: 1, epoch: 1, validForMs: 15000 } : { state: operation === 'claim' ? 'claimed' : 'attempting' }
+  })
+  const notify = vi.fn()
+  const wait = vi.fn(async () => {})
+  const runtime = createSetupTokenCapacityRuntime({ directory: await directory(), request, notify, wait, move: async () => false })
+  expect(await runtime.admit(actor, new AbortController().signal)).toEqual({ state: 'admitted' })
+  expect(request.mock.calls.map(call => call[0])).toEqual(['reserve', 'reserve', 'reserve', 'claim', 'delivery'])
+  expect(notify.mock.calls).toEqual([['daemon-updating']])
+  expect(wait).toHaveBeenCalledTimes(2)
+})
+it('reports the daemon failure, not a full account, when the daemon never comes back within the wait', async () => {
+  const request = vi.fn(async (operation: string) => { if (operation === 'reserve') throw new Error('CAPACITY_DAEMON_HTTP_404'); return { state: 'cancelled' } })
+  let now = 0
+  vi.spyOn(performance, 'now').mockImplementation(() => now)
+  try {
+    const runtime = createSetupTokenCapacityRuntime({ directory: await directory(), request, notify: () => {}, wait: async milliseconds => { now += milliseconds }, move: async () => false })
+    await expect(runtime.admit(actor, new AbortController().signal)).rejects.toThrow('CAPACITY_DAEMON_HTTP_404')
+    expect(now).toBeGreaterThanOrEqual(1800000)
+  } finally { vi.restoreAllMocks() }
+})
+it('does not keep waiting for the daemon once the user cancels', async () => {
+  const cancel = new AbortController()
+  const request = vi.fn(async (operation: string) => { if (operation === 'reserve') { cancel.abort(); throw new Error('CAPACITY_DAEMON_UNREACHABLE') } return { state: 'cancelled' } })
+  const wait = vi.fn(async () => {})
+  const runtime = createSetupTokenCapacityRuntime({ directory: await directory(), request, notify: () => {}, wait, move: async () => false })
+  await expect(runtime.admit(actor, cancel.signal)).rejects.toThrow()
+  expect(wait).not.toHaveBeenCalled()
+})

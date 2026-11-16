@@ -22,6 +22,16 @@ describe('describeClaudeLaunchFailure', () => {
         expect(describeClaudeLaunchFailure(new Error('CAPACITY_DELIVERY_UNKNOWN'))).toMatch(/\(CAPACITY_DELIVERY_UNKNOWN\)/);
     });
 
+    it('tells a daemon still finishing an update apart from an account problem', () => {
+        for (const code of ['CAPACITY_DAEMON_HTTP_404', 'CAPACITY_DAEMON_UNREACHABLE']) {
+            const text = describeClaudeLaunchFailure(new Error(code));
+            expect(text).toMatch(/실행기/);
+            expect(text).toMatch(/계정 문제가 아닙니다/);
+            expect(text).not.toMatch(/계정 상태를 확인한 뒤/);
+            expect(text).toContain(`(${code})`);
+        }
+    });
+
     it('explains a refused organization credential without asking for a personal login', () => {
         const text = describeClaudeLaunchFailure(new Error('CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED'));
         expect(text).toMatch(/Organization Claude stopped.*assigned account or policy/);

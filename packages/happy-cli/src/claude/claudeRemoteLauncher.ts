@@ -693,7 +693,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             return requestSetupTokenCapacity(session.client.sessionId, binding, operation, actor, runtimeId, extra, signal);
         },
         move: async () => !!await setupTokenSwitching?.switchForStartBudget(),
-        notify: () => session.client.sendSessionEvent({ type: 'message', message: '조직 AI 계정이 모두 사용 중입니다. 계정당 최대 4명까지 사용할 수 있어 자리가 생길 때까지 기다립니다. 입력과 첨부는 유지되며, 취소할 수 있습니다.' }),
+        notify: reason => session.client.sendSessionEvent({ type: 'message', message: reason === 'daemon-updating'
+            ? '이 PC의 작업 실행기가 업데이트를 마칠 때까지 기다립니다(최대 30분). 입력과 첨부는 유지되며, 취소할 수 있습니다.'
+            : '조직 AI 계정이 모두 사용 중입니다. 계정당 최대 4명까지 사용할 수 있어 자리가 생길 때까지 기다립니다. 입력과 첨부는 유지되며, 취소할 수 있습니다.' }),
     });
     const queueCapacity = (action: () => Promise<void>) => {
         capacityWork = capacityWork.then(action).catch(error => {

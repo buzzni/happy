@@ -11,12 +11,14 @@ export function readSetupTokenCapacityActor(value: unknown, text: string): Setup
   return actor
 }
 type Entry = { actor: SetupTokenCapacityActor; runtimeId: string; seq: number; attempt?: number; started?: boolean; phase: 'waiting' | 'claiming' | 'attempting' | 'result' | 'finished'; result?: unknown }
+/** The daemon lacks the route (an update replaced the bundle but the old daemon has not handed off yet) or is mid-handoff. */
+const isDaemonNotReady = (error: unknown) => error instanceof Error && /^CAPACITY_DAEMON_(HTTP_404|UNREACHABLE)$/.test(error.message)
 type Reply = { state: string; managedAccountId?: string; credentialGeneration?: number; epoch?: number; validForMs?: number; retryAfterMs?: number; requiresMove?: boolean; reason?: string }
 /** Durable input ownership: a lost claim answer never authorizes a second provider delivery. */
 export function createSetupTokenCapacityRuntime(deps: {
   directory: string
   request(operation: string, actor: SetupTokenCapacityActor, runtimeId: string, extra?: Record<string, unknown>, signal?: AbortSignal): Promise<Reply>
-  notify(): void
+  notify(reason?: 'daemon-updating'): void
   move(): Promise<boolean>
   wait?(milliseconds: number, signal: AbortSignal): Promise<void>
 }) {
@@ -127,12 +129,29 @@ export function createSetupTokenCapacityRuntime(deps: {
       }
       const started = performance.now()
       let notified = false
+      let daemonNotified = false
+      let daemonFailure: unknown
+      const pause = async (milliseconds: number) => {
+        if (deps.wait) await deps.wait(milliseconds, signal)
+        else await delay(milliseconds, undefined, { signal })
+      }
       try {
         while (true) {
           signal.throwIfAborted()
-          if (performance.now() - started >= 1800000) throw new Error('CAPACITY_WAIT_EXPIRED')
+          if (performance.now() - started >= 1800000) throw daemonFailure ?? new Error('CAPACITY_WAIT_EXPIRED')
           const sent = performance.now()
-          const decision = await send(entry, 'reserve', undefined, signal)
+          let decision: Reply
+          try { decision = await send(entry, 'reserve', undefined, signal) }
+          catch (error) {
+            signal.throwIfAborted()
+            if (!isDaemonNotReady(error)) throw error
+            // Nothing was reserved, so asking again is safe; the old daemon hands off within its 30-minute pre-wait cap.
+            daemonFailure = error
+            if (!daemonNotified) { daemonNotified = true; deps.notify('daemon-updating') }
+            await pause(Math.min(10000, Math.max(1, 1800000 - (performance.now() - started))))
+            continue
+          }
+          daemonFailure = undefined
           signal.throwIfAborted()
           if (decision.state === 'off') return { state: 'off', legacyRequestId: legacyId(entry) }
           if (decision.state === 'reserved') {
@@ -147,9 +166,7 @@ export function createSetupTokenCapacityRuntime(deps: {
           }
           if (decision.state !== 'wait' || !Number.isFinite(decision.retryAfterMs) || decision.retryAfterMs! <= 0) throw new Error(`CAPACITY_${decision.reason ?? 'UNAVAILABLE'}`)
           if (!notified) { notified = true; deps.notify() }
-          const milliseconds = Math.min(30000, decision.retryAfterMs!, Math.max(1, 1800000 - (performance.now() - started)))
-          if (deps.wait) await deps.wait(milliseconds, signal)
-          else await delay(milliseconds, undefined, { signal })
+          await pause(Math.min(30000, decision.retryAfterMs!, Math.max(1, 1800000 - (performance.now() - started))))
         }
       } catch (error) {
         if (entry.phase === 'waiting') await send(entry, 'cancel').catch(error => console.warn('[setup-token-capacity] cancellation unconfirmed', error instanceof Error ? error.name : 'unknown'))
