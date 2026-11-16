@@ -1077,6 +1077,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             abortController = controller;
             /** This generation's provider has ended; a wait it left behind must not take a due retry. */
             let providerEnded = false;
+            /** A provider turn is running, including one the provider opened itself when its background work reported. */
+            let providerTurnRunning = false;
             /** Aborted with `providerEnded`: an input wait this generation left behind frees the queue's single waiter slot. */
             const generationEnded = new AbortController();
             const capacityHeartbeat = setInterval(() => queueCapacity(() => capacity.heartbeat()), 15000);
@@ -1598,6 +1600,24 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                     && isDeepStrictEqual(mode?.allowedTools, msg.mode.allowedTools)
                                     && isDeepStrictEqual(mode?.disallowedTools, msg.mode.disallowedTools)
                                     && (mode?.permissionMode === 'plan') === (msg.mode.permissionMode === 'plan');
+                                if (!keepForBackgroundWork && providerTurnRunning && msg.items?.length) {
+                                    /*
+                                     * Collected during a turn the provider opened itself: a request made at
+                                     * an earlier result was still waiting when its background work reported.
+                                     * That turn can start new work before it ends, and an input ended now
+                                     * would then wait for the work — the message unanswered until a stop.
+                                     * Back to the queue: the request made at the turn's result collects it
+                                     * again and decides with the work that turn left running. This request
+                                     * is spent, as a replaced queue wait is.
+                                     */
+                                    logger.debug('[remote]: mode has changed during a provider turn, message left for its result');
+                                    const surviving = session.queue.revalidateBatch(msg);
+                                    if (surviving?.items) session.queue.queue.unshift(...surviving.items);
+                                    drain?.releaseClaim();
+                                    const ended = AbortSignal.any([controller.signal, generationEnded.signal]);
+                                    if (!ended.aborted) await new Promise((resolve) => ended.addEventListener('abort', resolve, { once: true }));
+                                    return null;
+                                }
                                 if (!keepForBackgroundWork) {
                                     // Which part asked for the restart; block tokens are checksums, never prompt text.
                                     logger.debug(`[remote]: mode has changed, pending message (${[
@@ -1742,7 +1762,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             ],
                         }));
                     },
-                    onThinkingChange: (thinking) => { activityReporter.thinking(thinking); session.onThinkingChange(thinking); },
+                    onThinkingChange: (thinking) => { providerTurnRunning = thinking; activityReporter.thinking(thinking); session.onThinkingChange(thinking); },
                     claudeEnvVars: session.claudeEnvVars,
                     claudeArgs: session.claudeArgs,
                     onMessage,

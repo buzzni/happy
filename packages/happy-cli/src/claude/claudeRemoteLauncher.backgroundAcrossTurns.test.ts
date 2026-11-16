@@ -266,4 +266,134 @@ describe('background work across the turns of one Claude process', () => {
         // Without a live query (the process ended), a stop is not attempted.
         await expect(stop('server-1')).resolves.toEqual({ status: 'not_found' });
     }, 15_000);
+
+    it('decides a settings change that lands in a turn Claude opened itself at that turn\'s end, where the work it started keeps the provider', async () => {
+        // A background wait reported and Claude opened a turn of its own; the person's reply came in during it with a
+        // routed model. Nothing was listed at that moment, so the reply used to restart the provider - its input ended -
+        // but the turn then started a new wait, the process could not exit, and the reply was held until a stop.
+        const before: EnhancedMode = { permissionMode: 'default', model: 'claude-opus-5', effort: 'max' };
+        const routed: EnhancedMode = { ...before, model: 'claude-sonnet-5', effort: 'medium' };
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const { client } = recordingClient('reply-in-own-turn', handlers);
+        const received: Array<{ text: string; generation: number }> = [];
+        const launches: Options[] = [];
+        const engineChanges: unknown[] = [];
+        // The reply must be taken while the turn runs, however slow the machine: that is the case under test.
+        let replyTaken!: () => void;
+        const taken = new Promise<void>(resolve => { replyTaken = resolve; });
+        const collectBatch = (queue as any).collectBatch.bind(queue);
+        (queue as any).collectBatch = (claim?: () => boolean) => {
+            const batch = collectBatch(claim);
+            if (batch?.message === 'reply') replyTaken();
+            return batch;
+        };
+        vi.mocked(query).mockImplementation(({ prompt, options }) => {
+            launches.push(options!);
+            const generation = launches.length;
+            let workRunning = false;
+            return engine((async function* () {
+                for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                    const text = String(message.message.content);
+                    received.push({ text, generation });
+                    yield INIT;
+                    yield result(received.length);
+                    if (text !== 'turn-0') continue;
+                    // The wait's report: a turn with no prompt of ours.
+                    yield INIT;
+                    queue.push('reply', routed);
+                    await taken;
+                    await new Promise(resolve => setTimeout(resolve, 20));
+                    // That turn starts a new wait before it ends.
+                    workRunning = true;
+                    yield listed([SERVER]);
+                    yield result(received.length);
+                }
+                // Like Claude Code: an ended input does not end a process whose background work runs.
+                if (workRunning) await untilAborted(options!.abortController!.signal);
+            })(), engineChanges);
+        });
+        queue.push('turn-0', before);
+        const launcher = claudeRemoteLauncher(sessionOf(queue, client));
+        try {
+            await vi.waitFor(() => expect(received).toContainEqual({ text: 'reply', generation: 1 }), { timeout: 10_000 });
+        } finally {
+            await handlers.get('switch')!();
+            await launcher;
+        }
+        // Answered by the same process, its engine switched in place.
+        expect(launches).toHaveLength(1);
+        expect(engineChanges).toEqual([{ model: 'claude-sonnet-5' }, { effortLevel: 'medium' }]);
+    }, 15_000);
+
+    it.each([
+        // Nothing keeps the process: the restart the change asks for happens at that turn's end, as it always did.
+        ['the turn starts no work', 'ends'],
+        // A stop ends the turn while it runs: the held reply goes to the next provider, as a held message always has.
+        ['the turn is stopped while it runs', 'stopped'],
+    ] as const)('still hands a settings change that lands in a turn Claude opened itself to a new provider when %s', async (_case, ownTurn) => {
+        const before: EnhancedMode = { permissionMode: 'default', model: 'claude-opus-5', effort: 'max' };
+        const routed: EnhancedMode = { ...before, model: 'claude-sonnet-5', effort: 'medium' };
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const { client } = recordingClient(`reply-in-own-turn-${ownTurn}`, handlers);
+        const received: Array<{ text: string; generation: number }> = [];
+        const launches: Options[] = [];
+        const engineChanges: unknown[] = [];
+        let replyTaken!: () => void;
+        const taken = new Promise<void>(resolve => { replyTaken = resolve; });
+        const collectBatch = (queue as any).collectBatch.bind(queue);
+        (queue as any).collectBatch = (claim?: () => boolean) => {
+            const batch = collectBatch(claim);
+            if (batch?.message === 'reply') replyTaken();
+            return batch;
+        };
+        let markDecided!: () => void;
+        const decided = new Promise<void>(resolve => { markDecided = resolve; });
+        vi.mocked(query).mockImplementation(({ prompt, options }) => {
+            launches.push(options!);
+            const generation = launches.length;
+            return engine((async function* () {
+                for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                    const text = String(message.message.content);
+                    received.push({ text, generation });
+                    yield INIT;
+                    yield result(received.length);
+                    if (text !== 'turn-0') continue;
+                    yield INIT;
+                    queue.push('reply', routed);
+                    await taken;
+                    await new Promise(resolve => setTimeout(resolve, 20));
+                    markDecided();
+                    if (ownTurn === 'stopped') {
+                        await untilAborted(options!.abortController!.signal);
+                        return;
+                    }
+                    yield result(received.length);
+                }
+            })(), engineChanges);
+        });
+        queue.push('turn-0', before);
+        const launcher = claudeRemoteLauncher({ ...sessionOf(queue, client), onAbort: vi.fn() } as unknown as Session);
+        try {
+            if (ownTurn === 'stopped') {
+                await decided;
+                await handlers.get('abort')!();
+            }
+            await vi.waitFor(() => expect(received).toContainEqual({ text: 'reply', generation: 2 }), { timeout: 10_000 });
+        } finally {
+            await handlers.get('switch')!();
+            await launcher;
+        }
+        expect(received).toEqual([{ text: 'turn-0', generation: 1 }, { text: 'reply', generation: 2 }]);
+        expect(launches[1]).toMatchObject({ model: 'claude-sonnet-5', effort: 'medium' });
+        expect(engineChanges).toEqual([]);
+    }, 15_000);
 });
+
+function untilAborted(signal: AbortSignal): Promise<void> {
+    return new Promise(resolve => {
+        if (signal.aborted) resolve();
+        else signal.addEventListener('abort', () => resolve(), { once: true });
+    });
+}
