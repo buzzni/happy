@@ -478,7 +478,9 @@ export async function isDaemonRunningSameOrNewerHappyVersion(): Promise<boolean>
   // correctly detects real npm upgrades (the new bundle has a new baked version).
   const currentCliVersion = configuration.currentCliVersion;
   logger.debug(`[DAEMON CONTROL] Current CLI version: ${currentCliVersion}, Daemon started with version: ${state.startedWithCliVersion}`);
-  return currentCliVersion === state.startedWithCliVersion || isOlderRuntimeVersion(currentCliVersion, state.startedWithCliVersion);
+  // Only an aplus build counts as newer: an upstream plain release (1.1.10, 1.2.0) is still replaced.
+  return currentCliVersion === state.startedWithCliVersion
+    || (/-aplus\.\d+$/.test(state.startedWithCliVersion) && isOlderRuntimeVersion(currentCliVersion, state.startedWithCliVersion));
 }
 
 export async function cleanupDaemonState(): Promise<void> {

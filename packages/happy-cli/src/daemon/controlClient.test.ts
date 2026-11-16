@@ -205,6 +205,9 @@ describe('isDaemonRunningSameOrNewerHappyVersion', () => {
     ['a newer version', withBuild(build + 1), true],
     ['an older version', withBuild(build - 1), false],
     ['an unreadable version', 'dev', false],
+    // An upstream plain release is not an aplus build; ordering it against one says nothing about compatibility.
+    ['a plain release', '1.1.10', false],
+    ['a newer plain release', '1.2.0', false],
   ])('treats a running daemon of %s as %s', async (_label, startedWithCliVersion, expected) => {
     const state = { ...stateWithPid(process.pid), startedWithCliVersion }
     mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state, raw: JSON.stringify(state) })
