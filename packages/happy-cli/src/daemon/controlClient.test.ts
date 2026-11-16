@@ -205,6 +205,9 @@ describe('isDaemonRunningSameOrNewerHappyVersion', () => {
     ['a newer version', withBuild(build + 1), true],
     ['an older version', withBuild(build - 1), false],
     ['an unreadable version', 'dev', false],
+    // Upstream happy-coder shares ~/.happy and sorts after any prerelease; it lacks the aplus runner.
+    ['a plain release of the same base', current.replace(/-aplus\.\d+$/, ''), false],
+    ['a later plain release', '2.0.0', false],
   ])('treats a running daemon of %s as %s', async (_label, startedWithCliVersion, expected) => {
     const state = { ...stateWithPid(process.pid), startedWithCliVersion }
     mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state, raw: JSON.stringify(state) })

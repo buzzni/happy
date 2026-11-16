@@ -443,8 +443,8 @@ export async function checkIfDaemonRunningAndCleanupStaleState(): Promise<boolea
  * Works via the daemon.state.json file.
  *
  * A newer daemon serves an older CLI, so it is kept: replacing it from a stale global `happy`
- * downgraded the desktop's bundled runner (2026-11-16, .416 -> .352). An unreadable version is
- * still replaced, as before.
+ * downgraded the desktop's bundled runner (2026-11-16, .416 -> .352). An unreadable or non-aplus
+ * version is still replaced, as before.
  *
  * @returns true if the running daemon is the same or newer, false if older, unreadable or no daemon running
  */
@@ -478,7 +478,11 @@ export async function isDaemonRunningSameOrNewerHappyVersion(): Promise<boolean>
   // correctly detects real npm upgrades (the new bundle has a new baked version).
   const currentCliVersion = configuration.currentCliVersion;
   logger.debug(`[DAEMON CONTROL] Current CLI version: ${currentCliVersion}, Daemon started with version: ${state.startedWithCliVersion}`);
-  return currentCliVersion === state.startedWithCliVersion || isOlderRuntimeVersion(currentCliVersion, state.startedWithCliVersion);
+  // Only an aplus build counts as newer: upstream happy-coder shares ~/.happy, and its plain
+  // release (1.1.10) sorts after our prerelease (1.1.10-aplus.420) yet lacks the aplus runner.
+  const daemonIsAplusBuild = /-aplus\.\d+$/.test(state.startedWithCliVersion);
+  return currentCliVersion === state.startedWithCliVersion
+    || (daemonIsAplusBuild && isOlderRuntimeVersion(currentCliVersion, state.startedWithCliVersion));
 }
 
 export async function cleanupDaemonState(): Promise<void> {
