@@ -758,6 +758,15 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         return true;
     };
 
+    /*
+     * App prompts queued for Claude and not handed to it yet. `recentAppPrompts` times
+     * a prompt from its arrival, so one held in the queue past that window came back
+     * from the JSONL as a second row; delivery renews its record. Only these: a
+     * continuation the launcher queues itself reaches the transcript through the
+     * scanner, and a follow-up has its own record. Each is consumed once.
+     */
+    const queuedAppPrompts: string[] = [];
+
     let currentRunMode: 'local' | 'remote' = options.startingMode ?? 'local';
     let latestClaudeGoalStatus: AgentGoalStatus | null = null;
     const observedClaudeGoalRevisions = new Set<string>();
@@ -1830,6 +1839,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 inputAttendanceFromMeta(message.meta, session.getMetadata()?.source),
                 session.queueInput(message),
             );
+            queuedAppPrompts.push(queuedText);
             deferredTurn?.commit();
             if (routed) {
                 /*
@@ -2300,6 +2310,16 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         onActiveUserInputAccepted: (text) => {
             recordAppPrompt(text);
             session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text }));
+        },
+        onUserInputDelivered: (text) => {
+            const at = queuedAppPrompts.indexOf(text);
+            if (at < 0) return;
+            queuedAppPrompts.splice(at, 1);
+            // The arrival record answers while it is in its window; only a lapsed or dropped one is made again.
+            const lapsed = recentAppPrompts.findIndex(entry => entry.text === text && entry.addedAt < Date.now() - recentAppPromptsMaxAgeMs);
+            if (lapsed >= 0) recentAppPrompts.splice(lapsed, 1);
+            else if (recentAppPrompts.some(entry => entry.text === text)) return;
+            recordAppPrompt(text);
         },
         mcpServers: mergeAplusMcpServers(baseMcpServers, aplusMcpServers),
         mcpConfig: {

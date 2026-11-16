@@ -555,6 +555,87 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
+    it('does not forward an app prompt Claude received long after it arrived', async () => {
+        // Held in the runtime queue behind a busy provider for 8-42 minutes, each reply came back from the JSONL as
+        // a second row: the dedupe window had started when the prompt arrived, not when Claude got it.
+        const harness = await startRemoteRunClaudeHarness();
+        const now = vi.spyOn(Date, 'now');
+        try {
+            const arrivedAt = Date.now();
+            now.mockReturnValue(arrivedAt);
+            const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+            await userMessageHandler({ content: { text: 'held reply' }, meta: {} });
+            // What the queue hands Claude, as the launcher reports it on delivery.
+            const delivered = harness.loopOptions.messageQueue.queue.at(-1).message;
+
+            now.mockReturnValue(arrivedAt + 42 * 60_000);
+            harness.loopOptions.onUserInputDelivered(delivered);
+            harness.scannerOptions.onMessage({ type: 'user', message: { content: delivered } });
+            expect(harness.sessionClient.sendClaudeSessionMessage).not.toHaveBeenCalled();
+        } finally {
+            now.mockRestore();
+            await harness.finish();
+        }
+    });
+
+    it('does not forward a held app prompt whose record a later prompt dropped', async () => {
+        // 11:28 "했어" was held; the 11:44 question recorded after it dropped the expired record, and 12:10 delivery
+        // still had to find it the app's own.
+        const harness = await startRemoteRunClaudeHarness();
+        const now = vi.spyOn(Date, 'now');
+        try {
+            const arrivedAt = Date.now();
+            now.mockReturnValue(arrivedAt);
+            const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+            await userMessageHandler({ content: { text: 'held reply' }, meta: {} });
+            const delivered = harness.loopOptions.messageQueue.queue.at(-1).message;
+            now.mockReturnValue(arrivedAt + 16 * 60_000);
+            await userMessageHandler({ content: { text: 'a later question' }, meta: {} });
+
+            now.mockReturnValue(arrivedAt + 42 * 60_000);
+            harness.loopOptions.onUserInputDelivered(delivered);
+            harness.scannerOptions.onMessage({ type: 'user', message: { content: delivered } });
+            expect(harness.sessionClient.sendClaudeSessionMessage).not.toHaveBeenCalled();
+        } finally {
+            now.mockRestore();
+            await harness.finish();
+        }
+    });
+
+    it('adds no second record for an app prompt Claude received in time', async () => {
+        // The record made on arrival still answers for a prompt delivered within its window. One more made on delivery
+        // would outlive the prompt's own JSONL copy and hide the same text arriving from a terminal on this session.
+        const harness = await startRemoteRunClaudeHarness();
+        try {
+            const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+            await userMessageHandler({ content: { text: 'run it again' }, meta: {} });
+            const delivered = harness.loopOptions.messageQueue.queue.at(-1).message;
+            expect(delivered.startsWith('run it again')).toBe(true);
+            harness.loopOptions.onUserInputDelivered(delivered);
+            const copy = { type: 'user', message: { content: delivered } };
+            harness.scannerOptions.onMessage(copy);
+            expect(harness.sessionClient.sendClaudeSessionMessage).not.toHaveBeenCalled();
+            harness.scannerOptions.onMessage(copy);
+            expect(harness.sessionClient.sendClaudeSessionMessage).toHaveBeenCalledWith(copy);
+        } finally {
+            await harness.finish();
+        }
+    });
+
+    it('still forwards a delivered prompt the app never sent', async () => {
+        // A continuation the launcher queues itself (an account switch, an authentication retry) reaches the transcript
+        // through the scanner; its delivery must not mark it as the app's own.
+        const harness = await startRemoteRunClaudeHarness();
+        try {
+            const continuation = { type: 'user', message: { content: 'The previous request stopped; continue from where you stopped.' } };
+            harness.loopOptions.onUserInputDelivered(continuation.message.content);
+            harness.scannerOptions.onMessage(continuation);
+            expect(harness.sessionClient.sendClaudeSessionMessage).toHaveBeenCalledWith(continuation);
+        } finally {
+            await harness.finish();
+        }
+    });
+
     it('injects the protected composition into Claude remote before its loop starts', async () => {
         const checkpointProtection = {
             secretPatterns: ['.env*'],
