@@ -849,6 +849,8 @@ function readTurnText(content: unknown): string {
 
     updateThinking(true);
     let acceptsActiveInput = true;
+    /** The next primary prompt is being prepared; a steer must not overtake it. */
+    let preparingInput = false;
     const sendActiveInput: ClaudeActiveInputSender = async (text) => {
         if (!acceptsActiveInput || messages.done || !text.trim()) {
             return false;
@@ -1045,6 +1047,12 @@ function readTurnText(content: unknown): string {
             if (message.type === 'system' && message.subtype === 'init') {
                 // Start thinking when session initializes
                 updateThinking(true);
+                // A turn the provider opened itself, its background work having reported, takes
+                // steering as a prompted one does; the turn's result closes it again.
+                if (!acceptsActiveInput && !preparingInput && !messages.done && !opts.signal?.aborted) {
+                    acceptsActiveInput = true;
+                    opts.onActiveInputReady?.(sendActiveInput);
+                }
 
                 const systemInit = message as SDKSystemMessage;
                 opts.onUsageTranscriptLocation?.(
@@ -1159,7 +1167,8 @@ function readTurnText(content: unknown): string {
                 };
                 opts.onMcpControllerReady?.(mcpRecovery);
 
-                await mcpRecovery.recoverFailedServers();
+                // An ended input answers no control request, and no turn of ours will need the servers again.
+                if (!messages.done) await mcpRecovery.recoverFailedServers();
 
                 // Send completion messages
                 if (isCompactCommand) {
@@ -1286,6 +1295,11 @@ function readTurnText(content: unknown): string {
                 // Wait for next user message without blocking the message loop.
                 // Background task messages (task_started, task_progress, task_notification)
                 // continue flowing through while we wait for user input.
+                // An ended input asks for nothing, and its end was handled when it came: this
+                // provider can take no message, and the one held back for the next provider would
+                // be taken and dropped here. Turns the provider opens itself still flow through this
+                // loop until it exits.
+                if (messages.done) continue;
                 opts.nextMessage().then(async (next) => {
                     if (queryClosed) return;
                     if (!next) {
@@ -1296,6 +1310,13 @@ function readTurnText(content: unknown): string {
                         }
                         messages.end();
                     } else {
+                        // Left set on the exits below: each one ends the input or the query.
+                        preparingInput = true;
+                        // A turn the provider opened itself may have opened steering: the prompt goes first.
+                        if (acceptsActiveInput) {
+                            acceptsActiveInput = false;
+                            opts.onActiveInputReady?.(null);
+                        }
                         preemptReview();
                         const preparation = preparationFor(next.latency);
                         if (mcpConfigSynchronizer) await measurePreparation(preparation, 'mcp-sync', () => mcpConfigSynchronizer.sync(preparation ? (stage, action) => measurePreparation(preparation, stage, action) : undefined));
@@ -1350,6 +1371,7 @@ function readTurnText(content: unknown): string {
                         if (next.commitInput?.() === false) { messages.end(); return; }
                         activateTurnLatency(next.latency, preparation);
                         messages.push({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: withBlock } });
+                        preparingInput = false;
                         // Steering may only follow the primary input, never overtake its recall.
                         acceptsActiveInput = true;
                         opts.onActiveInputReady?.(sendActiveInput);

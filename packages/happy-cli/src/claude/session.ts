@@ -77,6 +77,7 @@ export class Session {
     readonly _onModeChange: (mode: 'local' | 'remote') => void;
     readonly _onAbort?: () => void;
     readonly onActiveUserInputAccepted?: (text: string) => void;
+    readonly onUserInputDelivered?: (text: string) => void;
     readonly onSessionReset?: () => void;
     readonly onModeResolved?: (requestIds: string[] | undefined) => { model: string; effort: string | null } | null;
     readonly onModeApplied?: (requestIds: string[] | undefined, executionId: string) => { model: string; effort: string | null } | null;
@@ -141,6 +142,7 @@ export class Session {
         onModeChange: (mode: 'local' | 'remote') => void,
         onAbort?: () => void,
         onActiveUserInputAccepted?: (text: string) => void,
+        onUserInputDelivered?: (text: string) => void,
         onSessionReset?: () => void,
         onModeResolved?: (requestIds: string[] | undefined) => { model: string; effort: string | null } | null,
         onModeApplied?: (requestIds: string[] | undefined, executionId: string) => { model: string; effort: string | null } | null,
@@ -188,6 +190,7 @@ export class Session {
         this._onModeChange = opts.onModeChange;
         this._onAbort = opts.onAbort;
         this.onActiveUserInputAccepted = opts.onActiveUserInputAccepted;
+        this.onUserInputDelivered = opts.onUserInputDelivered;
         this.onModeResolved = opts.onModeResolved;
         this.onModeApplied = opts.onModeApplied;
         this.onSessionReset = opts.onSessionReset;

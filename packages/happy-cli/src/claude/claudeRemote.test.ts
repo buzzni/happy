@@ -888,6 +888,108 @@ describe('claudeRemote', () => {
         expect(await sendActiveInput('too late')).toBe(false);
     });
 
+    it('accepts active-turn input in a turn the provider opens itself, until that turn\'s result', async () => {
+        // A background task's report makes Claude open a turn with no prompt from us. Steering was refused there
+        // ("No active Claude turn") while the turn visibly ran.
+        const init = { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [] };
+        let openOwnTurn!: () => void;
+        const ownTurnOpens = new Promise<void>((resolve) => { openOwnTurn = resolve; });
+        let endOwnTurn!: () => void;
+        const ownTurnEnds = new Promise<void>((resolve) => { endOwnTurn = resolve; });
+        let endInput!: () => void;
+        const inputEnds = new Promise<null>((resolve) => { endInput = () => resolve(null); });
+        let prompt!: AsyncIterator<unknown>;
+        vi.mocked(query).mockImplementation((request) => {
+            prompt = (request.prompt as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+            return {
+                setPermissionMode: vi.fn(),
+                mcpServerStatus: vi.fn(async () => []),
+                async *[Symbol.asyncIterator]() {
+                    yield init;
+                    yield { type: 'result', subtype: 'success' };
+                    await ownTurnOpens;
+                    yield init;
+                    await ownTurnEnds;
+                    yield { type: 'result', subtype: 'success' };
+                },
+            } as any;
+        });
+        let activeInputSender: ((text: string) => Promise<boolean>) | null = null;
+        let messageCount = 0;
+        const running = claudeRemote({
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            nextMessage: async () => (messageCount++ === 0 ? { message: 'initial request', mode } : inputEnds),
+            onReady: vi.fn(),
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage: vi.fn(),
+            onActiveInputReady: (sender) => { activeInputSender = sender; },
+        });
+
+        await vi.waitFor(() => expect(prompt).toBeDefined());
+        expect(await prompt.next()).toMatchObject({ value: { message: { content: 'initial request' } } });
+        await vi.waitFor(() => expect(messageCount).toBe(2));
+        expect(activeInputSender).toBeNull();
+        openOwnTurn();
+        await vi.waitFor(() => expect(activeInputSender).not.toBeNull());
+        const sendActiveInput = activeInputSender!;
+        expect(await sendActiveInput('look at this')).toBe(true);
+        expect(await prompt.next()).toMatchObject({ value: { message: { content: 'look at this' } } });
+
+        endOwnTurn();
+        await vi.waitFor(() => expect(activeInputSender).toBeNull());
+        expect(await sendActiveInput('too late')).toBe(false);
+        endInput();
+        await running;
+    });
+
+    it('ends its input once, though the provider opens turns of its own after the end', async () => {
+        // A provider kept alive by background work still opens a turn when that work reports. Its result must not end
+        // the input again: the exit budget runs from the input's end, and asking the launcher for input there could take
+        // a message held back for the next provider.
+        const init = { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [] };
+        vi.mocked(query).mockImplementation((request) => {
+            const input = (request.prompt as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+            return {
+                setPermissionMode: vi.fn(),
+                mcpServerStatus: vi.fn(async () => []),
+                async *[Symbol.asyncIterator]() {
+                    await input.next();
+                    yield init;
+                    yield { type: 'result', subtype: 'success' };
+                    // Done once the input ends; the work then reports.
+                    await input.next();
+                    yield init;
+                    yield { type: 'result', subtype: 'success' };
+                },
+            } as any;
+        });
+        const onInputExhausted = vi.fn();
+        const nextMessage = vi.fn(async () => (nextMessage.mock.calls.length === 1 ? { message: 'initial request', mode } : null));
+        await claudeRemote({
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            nextMessage,
+            onReady: vi.fn(),
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage: vi.fn(),
+            workspaceExitObservation: true,
+            onInputExhausted,
+        });
+        expect(nextMessage).toHaveBeenCalledTimes(2);
+        expect(onInputExhausted).toHaveBeenCalledTimes(1);
+    });
+
     it('marks /clear as a completed reset turn', async () => {
         const callbackOrder: string[] = [];
         const onCompletionEvent = vi.fn((message: string) => {
@@ -1994,6 +2096,109 @@ describe('lessons at the provider boundary', () => {
         await running;
         expect(senderDuringPreparation).toBeNull();
         expect(turns.map(value => value.sent)).toEqual(prompts);
+    });
+
+    it('keeps steering closed when the provider opens a turn of its own while the next primary prompt is prepared', async () => {
+        let sender: ((text: string) => Promise<boolean>) | null = null;
+        let releaseRecall!: () => void;
+        const gate = new Promise<void>(resolve => { releaseRecall = resolve; });
+        let markRecallStarted!: () => void;
+        const recallStarted = new Promise<void>(resolve => { markRecallStarted = resolve; });
+        const turn = {
+            recall: vi.fn(async ({ query }: { query: string }) => {
+                if (query === 'next primary') { markRecallStarted(); await gate; }
+                return { outcome: 'disabled' as const };
+            }),
+            acknowledge: vi.fn(async () => true),
+        };
+        const init = { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [] };
+        const sent: unknown[] = [];
+        vi.mocked(query).mockImplementation((args: any) => ({
+            setPermissionMode: vi.fn(), mcpServerStatus: vi.fn(async () => []),
+            async *[Symbol.asyncIterator]() {
+                const input = args.prompt[Symbol.asyncIterator]();
+                sent.push((await input.next()).value.message.content);
+                yield init;
+                yield { type: 'result', subtype: 'success' };
+                await recallStarted;
+                // A background report opens a turn while the next prompt is still being prepared.
+                yield init;
+                sent.push((await input.next()).value.message.content);
+                yield { type: 'result', subtype: 'success' };
+            },
+        }) as any);
+        const onThinkingChange = vi.fn();
+        let index = 0;
+        const prompts = ['initial request', 'next primary'];
+        const running = claudeRemote(baseOptions({
+            nextMessage: async () => index < prompts.length ? { message: prompts[index++], mode } : null,
+            lessons: { sessionId: 's', sessionKind: 'foreground', turn },
+            onThinkingChange,
+            onActiveInputReady: (value: typeof sender) => { sender = value; },
+        }));
+        await recallStarted;
+        // The provider's own turn has started (thinking again after the first result).
+        await vi.waitFor(() => expect(onThinkingChange.mock.calls.map(([value]) => value).slice(-2)).toEqual([false, true]));
+        const senderDuringOwnTurn = sender;
+        releaseRecall();
+        await running;
+        expect(senderDuringOwnTurn).toBeNull();
+        expect(sent).toEqual(prompts);
+    });
+
+    it('closes the steering a turn of its own opened while a primary prompt is prepared during it', async () => {
+        // A request made at the last result can deliver a prompt while the provider runs a turn it opened itself.
+        // That turn opened steering; a steer must still not overtake the prompt being prepared.
+        let sender: ((text: string) => Promise<boolean>) | null = null;
+        let releaseRecall!: () => void;
+        const gate = new Promise<void>(resolve => { releaseRecall = resolve; });
+        let markRecallStarted!: () => void;
+        const recallStarted = new Promise<void>(resolve => { markRecallStarted = resolve; });
+        const turn = {
+            recall: vi.fn(async ({ query }: { query: string }) => {
+                if (query === 'next primary') { markRecallStarted(); await gate; }
+                return { outcome: 'disabled' as const };
+            }),
+            acknowledge: vi.fn(async () => true),
+        };
+        const init = { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [] };
+        let openOwnTurn!: () => void;
+        const ownTurnOpens = new Promise<void>(resolve => { openOwnTurn = resolve; });
+        let deliverPrimary!: (value: { message: string; mode: typeof mode }) => void;
+        const primary = new Promise<{ message: string; mode: typeof mode }>(resolve => { deliverPrimary = resolve; });
+        const sent: unknown[] = [];
+        vi.mocked(query).mockImplementation((args: any) => ({
+            setPermissionMode: vi.fn(), mcpServerStatus: vi.fn(async () => []),
+            async *[Symbol.asyncIterator]() {
+                const input = args.prompt[Symbol.asyncIterator]();
+                sent.push((await input.next()).value.message.content);
+                yield init;
+                yield { type: 'result', subtype: 'success' };
+                await ownTurnOpens;
+                yield init;
+                sent.push((await input.next()).value.message.content);
+                yield { type: 'result', subtype: 'success' };
+            },
+        }) as any);
+        let calls = 0;
+        const running = claudeRemote(baseOptions({
+            nextMessage: async () => {
+                calls++;
+                return calls === 1 ? { message: 'initial request', mode } : calls === 2 ? primary : null;
+            },
+            lessons: { sessionId: 's', sessionKind: 'foreground', turn },
+            onActiveInputReady: (value: typeof sender) => { sender = value; },
+        }));
+        await vi.waitFor(() => expect(calls).toBe(2));
+        openOwnTurn();
+        await vi.waitFor(() => expect(sender).not.toBeNull());
+        deliverPrimary({ message: 'next primary', mode });
+        await recallStarted;
+        const senderDuringPreparation = sender;
+        releaseRecall();
+        await running;
+        expect(senderDuringPreparation).toBeNull();
+        expect(sent).toEqual(['initial request', 'next primary']);
     });
 
     it.each([['recall', 'result'], ['proposal', 'result'], ['recall', 'session-cancel'], ['proposal', 'session-cancel']])('rejects a steer whose %s preparation finishes after %s', async (phase, boundary) => {

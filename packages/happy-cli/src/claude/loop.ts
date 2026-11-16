@@ -94,6 +94,8 @@ interface LoopOptions {
     /** Called after /clear actually resets the provider context. */
     onSessionReset?: () => void
     onActiveUserInputAccepted?: (text: string) => void
+    /** Called when a queued batch is handed to the provider, with the text it carries. */
+    onUserInputDelivered?: (text: string) => void
     /**
      * Called when a collected batch's mode becomes the settings of an engine
      * query — the engine-applied boundary. Carries every client request the
@@ -144,6 +146,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
         onModeChange: opts.onModeChange,
         onAbort: opts.onAbort,
         onActiveUserInputAccepted: opts.onActiveUserInputAccepted,
+        onUserInputDelivered: opts.onUserInputDelivered,
         onModeResolved: opts.onModeResolved,
         onModeApplied: opts.onModeApplied,
         onSessionReset: opts.onSessionReset,
