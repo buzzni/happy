@@ -1964,6 +1964,8 @@ export async function startDaemon(): Promise<void> {
         }
         if (!broker) return false;
         Object.assign(process.env, runtime.sessionEnv);
+        // A runtime that keeps restarting re-activates every few seconds; each replaced broker must stop retrying.
+        browserTaskBroker?.close(broker);
         browserTaskBroker = broker;
         stopBrowserTaskReconciliation();
         stopBrowserTaskReconciliation = startBrowserTaskReconciliation(broker);

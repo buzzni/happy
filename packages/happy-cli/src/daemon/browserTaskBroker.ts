@@ -108,6 +108,13 @@ export interface BrowserTaskSessionBroker {
     revocationRefusal?(target: RevokeTarget): string | undefined
     /** Whether a task of the session waits for the user; throws when the Runtime gives no answer. */
     waiting(agentSessionId: string): Promise<boolean>
+    /**
+     * Stops the pending-revocation retry loop (bind retries end at their own deadline) and hands its revocations,
+     * now and later, to `successor`. The daemon replaces the broker each time the personal runtime is re-activated;
+     * a replaced broker left running keeps its loop, and they pile up. Callers that still hold it (a resumed spawn's
+     * release) keep working through the successor, which owns the queue file from then on.
+     */
+    close(successor: BrowserTaskSessionBroker): void
 }
 
 export interface BrowserTaskSessionBrokerOptions {
@@ -261,7 +268,8 @@ export function createBrowserTaskSessionBroker(
     /** True while the file lags the in-memory queue (a write failed); retried with the revocations. */
     let queueDirty = false
     const savePending = (): boolean => {
-        if (!pendingFile) return true
+        // A replaced broker's round still in flight must not overwrite the successor's file.
+        if (!pendingFile || successor) return true
         try {
             writeQueueFile(pendingFile, JSON.stringify({ schemaVersion: 1, pending }))
             queueDirty = false
@@ -284,7 +292,9 @@ export function createBrowserTaskSessionBroker(
     }
     let retryTimer: NodeJS.Timeout | undefined
     let failedRounds = 0
+    let successor: BrowserTaskSessionBroker | undefined
     const retryPendingRevocations = async (): Promise<number> => {
+        if (successor) return successor.retryPendingRevocations()
         if (queueDirty) savePending()
         for (const target of [...pending]) await attempt(target)
         failedRounds = pending.length || queueDirty ? failedRounds + 1 : 0
@@ -292,7 +302,7 @@ export function createBrowserTaskSessionBroker(
         return pending.length
     }
     const scheduleRetry = (): void => {
-        if (retryTimer || (!pending.length && !queueDirty)) return
+        if (successor || retryTimer || (!pending.length && !queueDirty)) return
         retryTimer = setTimeout(() => { retryTimer = undefined; void retryPendingRevocations() },
             Math.min(retryBaseMs * 2 ** Math.max(0, failedRounds - 1), MAX_RETRY_DELAY_MS))
         retryTimer.unref()
@@ -412,6 +422,8 @@ export function createBrowserTaskSessionBroker(
                     if ('agentSessionId' in target) await broker.revoke({ registrationId: retrying.registrationId })
                 }
             }
+            // Bind retries stay with the broker that started them; the queue belongs to the successor.
+            if (successor) return successor.revoke(target)
             let saved = !queueDirty
             if (!pending.some((entry) => key(entry) === key(target))) {
                 pending = [...pending, target]
@@ -424,8 +436,19 @@ export function createBrowserTaskSessionBroker(
             if (outstanding && !saved) throw new PendingRevocationQueueError('Browser task revocation was neither confirmed nor saved; retrying in memory')
         },
         retryPendingRevocations,
-        isRevocationPending: (target) => pending.some((entry) => key(entry) === key(target)),
-        revocationRefusal: (target) => pending.some((entry) => key(entry) === key(target)) ? refusals.get(key(target)) : undefined,
+        isRevocationPending: (target) => successor ? successor.isRevocationPending(target) : pending.some((entry) => key(entry) === key(target)),
+        revocationRefusal: (target) => successor ? successor.revocationRefusal?.(target)
+            : pending.some((entry) => key(entry) === key(target)) ? refusals.get(key(target)) : undefined,
+        close(next) {
+            successor = next
+            clearTimeout(retryTimer)
+            retryTimer = undefined
+            // The successor loaded the queue file when it was created; it lacks only what this one queued since.
+            for (const target of pending) {
+                if (!next.isRevocationPending(target)) void next.revoke(target).catch((error) => logger.warn(
+                    `[DAEMON RUN] ${error instanceof Error ? error.message : 'Browser task revocation handover failed'}`))
+            }
+        },
     }
     return broker
 }
