@@ -10,7 +10,7 @@ export function readSetupTokenCapacityActor(value: unknown, text: string): Setup
     || typeof actor.proof !== 'string' || !actor.proof.length || actor.proof.length > 4096 || actor.contentHash !== createHash('sha256').update(text).digest('hex')) throw new Error('CAPACITY_INPUT_PROOF_INVALID')
   return actor
 }
-type Entry = { actor: SetupTokenCapacityActor; runtimeId: string; seq: number; attempt?: number; started?: boolean; phase: 'waiting' | 'claiming' | 'attempting' | 'result' | 'finished'; result?: unknown }
+type Entry = { actor: SetupTokenCapacityActor; runtimeId: string; seq: number; attempt?: number; started?: boolean; phase: 'waiting' | 'claiming' | 'attempting' | 'result' | 'finished'; result?: unknown; unobserved?: boolean }
 /** The daemon lacks the route (an update replaced the bundle but the old daemon has not handed off yet) or is mid-handoff. */
 const isDaemonNotReady = (error: unknown) => error instanceof Error && /^CAPACITY_DAEMON_(HTTP_404|UNREACHABLE)$/.test(error.message)
 /** The daemon sent the request but got no answer from Studio: the network between this PC and Studio, not a refusal. */
@@ -74,7 +74,9 @@ export function createSetupTokenCapacityRuntime(deps: {
     return pending
   }
   async function finish(entry: Entry) {
-    if ((await report(entry, 'finish')).state !== 'finished') throw new Error('CAPACITY_FINISH_UNCONFIRMED')
+    // Studio may not know an unobserved run, so its reports are best-effort and never hold its local lifecycle.
+    const finished = entry.unobserved ? await report(entry, 'finish').then(() => true, () => true) : (await report(entry, 'finish')).state === 'finished'
+    if (!finished) throw new Error('CAPACITY_FINISH_UNCONFIRMED')
     entry.phase = 'finished'; await save(entry); active.delete(entry.actor.requestId)
   }
   async function arm(entry: Entry, operation: 'claim' | 'observe', extra: Record<string, unknown>, signal: AbortSignal) {
@@ -148,7 +150,8 @@ export function createSetupTokenCapacityRuntime(deps: {
           try { decision = await send(entry, 'reserve', undefined, signal) }
           catch (error) {
             signal.throwIfAborted()
-            // Studio replays a reservation it already made for this request id, so asking again is safe here too.
+            // Studio replays a live reservation it already made for this request id and reissues an expired one, so
+            // asking again is safe here too. Only consecutive failures count; a reply in between resets the budget.
             if (isStudioUnreachable(error) && studioRetries < STUDIO_RETRIES) {
               studioRetries++
               await pause(3000)
@@ -162,6 +165,7 @@ export function createSetupTokenCapacityRuntime(deps: {
             continue
           }
           daemonFailure = undefined
+          studioRetries = 0
           signal.throwIfAborted()
           if (decision.state === 'off') return { state: 'off', legacyRequestId: legacyId(entry) }
           if (decision.state === 'reserved') {
@@ -191,9 +195,12 @@ export function createSetupTokenCapacityRuntime(deps: {
       catch (error) {
         signal.throwIfAborted()
         // The start was already admitted; observation is shadow accounting and must not stop the turn over a dropped
-        // connection. The journal keeps the claim, so a later recovery settles whatever Studio recorded.
+        // connection. The run is still tracked here so its result, finish and a later retry follow the usual lifecycle.
         if (!isStudioUnreachable(error)) throw error
         console.warn('[setup-token-capacity] observation unconfirmed; running the admitted start', error.message)
+        entry.unobserved = true; entry.started = providerAlive
+        active.set(entry.actor.requestId, entry); current = entry
+        entry.phase = 'attempting'; await save(entry)
       }
     },
     async retry(actor: SetupTokenCapacityActor) {
@@ -201,7 +208,7 @@ export function createSetupTokenCapacityRuntime(deps: {
       if (entry.actor.proof !== actor.proof) throw new Error('CAPACITY_INPUT_CONFLICT')
       if (entry.phase === 'waiting' && (entry.attempt ?? 0) > 0) return
       if (entry.phase !== 'finished' || !failedResult(entry.result)) throw new Error('CAPACITY_RETRY_UNCONFIRMED')
-      entry.attempt = (entry.attempt ?? 0) + 1; entry.phase = 'waiting'; entry.seq = 0; delete entry.result
+      entry.attempt = (entry.attempt ?? 0) + 1; entry.phase = 'waiting'; entry.seq = 0; delete entry.result; delete entry.unobserved
       await save(entry)
     },
     async result(result: unknown, backgroundActive: boolean) {
@@ -210,6 +217,7 @@ export function createSetupTokenCapacityRuntime(deps: {
       await writeJson(resultPath(entry), result)
       entry.result = result; entry.phase = 'result'; await save(entry)
       await report(entry, 'delivery', { deliveryState: 'result', resultRef: resultRef(entry), resultStatus: failedResult(result) ? 'error' : 'success' })
+        .catch(error => { if (!entry.unobserved) throw error })
       if (!backgroundActive) for (const held of [...active.values()]) if (held.result !== undefined) await finish(held)
     },
     async idle() { for (const entry of [...active.values()]) if (entry.result !== undefined) await finish(entry) },

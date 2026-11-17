@@ -232,6 +232,39 @@ it('runs an already admitted start when only its shadow observation could not re
   expect(await createSetupTokenCapacityRuntime(deps).admit({ ...actor, requestId: 'next' }, new AbortController().signal)).toMatchObject({ state: 'off' })
   expect(request.mock.calls.map(call => call[0])).toContain('lost')
 })
+it('lets a turn whose observation never reached Studio fail and be retried like any other run', async () => {
+  let observeFails = true
+  const request = vi.fn(async (operation: string, _actor: unknown, _runtime: string, extra?: Record<string, unknown>) => {
+    if (operation === 'reserve') return { state: 'off' }
+    if (operation === 'observe' && observeFails) throw new Error('CAPACITY_STUDIO_UNREACHABLE')
+    if (operation === 'observe') return { state: 'observed' }
+    // Studio never recorded the first run, so it answers that run's reports with NOT_FOUND.
+    if ((operation === 'finish' || operation === 'delivery') && observeFails) throw new Error('CAPACITY_NOT_FOUND')
+    return { state: operation === 'finish' ? 'finished' : String(extra?.deliveryState) }
+  })
+  const runtime = createSetupTokenCapacityRuntime({ directory: await directory(), request, notify: () => {}, move: async () => false })
+  await runtime.admit(actor, new AbortController().signal)
+  await runtime.observe(actor, new AbortController().signal)
+  expect(runtime.hasActive()).toBe(true)
+  await runtime.result({ type: 'result', subtype: 'error_during_execution', is_error: true }, false)
+  expect(runtime.hasActive()).toBe(false)
+  observeFails = false
+  await runtime.retry(actor)
+  expect(await runtime.admit(actor, new AbortController().signal)).toMatchObject({ state: 'off' })
+  await runtime.observe(actor, new AbortController().signal)
+  expect(request.mock.calls.filter(call => call[0] === 'observe').map(call => call[3]?.attempt)).toEqual([0, 1])
+})
+it('counts only consecutive Studio network failures while waiting for a free account', async () => {
+  const replies: Array<string | { state: string; [key: string]: unknown }> = ['CAPACITY_STUDIO_UNREACHABLE', 'CAPACITY_STUDIO_UNREACHABLE', 'CAPACITY_STUDIO_UNREACHABLE',
+    { state: 'wait', retryAfterMs: 1000 }, 'CAPACITY_STUDIO_UNREACHABLE', 'CAPACITY_STUDIO_UNREACHABLE',
+    { state: 'reserved', managedAccountId: 'a', credentialGeneration: 1, epoch: 1, validForMs: 15000 }]
+  const request = vi.fn(async (operation: string) => {
+    if (operation === 'reserve') { const reply = replies.shift()!; if (typeof reply === 'string') throw new Error(reply); return reply }
+    return { state: operation === 'claim' ? 'claimed' : 'attempting' }
+  })
+  const runtime = createSetupTokenCapacityRuntime({ directory: await directory(), request, notify: () => {}, wait: async () => {}, move: async () => false })
+  expect(await runtime.admit(actor, new AbortController().signal)).toEqual({ state: 'admitted' })
+})
 it('does not keep waiting for the daemon once the user cancels', async () => {
   const cancel = new AbortController()
   const request = vi.fn(async (operation: string) => { if (operation === 'reserve') { cancel.abort(); throw new Error('CAPACITY_DAEMON_UNREACHABLE') } return { state: 'cancelled' } })
