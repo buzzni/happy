@@ -415,7 +415,6 @@ export function createBrowserTaskSessionBroker(
             return waiting
         },
         async revoke(target) {
-            if (successor) return successor.revoke(target)
             // An ended session (or a released registration) must not be bound by a retry still pending.
             for (const [agentSessionId, retrying] of [...retryingBinds]) {
                 if ('agentSessionId' in target ? target.agentSessionId === agentSessionId : target.registrationId === retrying.registrationId) {
@@ -423,6 +422,8 @@ export function createBrowserTaskSessionBroker(
                     if ('agentSessionId' in target) await broker.revoke({ registrationId: retrying.registrationId })
                 }
             }
+            // Bind retries stay with the broker that started them; the queue belongs to the successor.
+            if (successor) return successor.revoke(target)
             let saved = !queueDirty
             if (!pending.some((entry) => key(entry) === key(target))) {
                 pending = [...pending, target]

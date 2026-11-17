@@ -393,6 +393,18 @@ describe('bind while the Runtime holds admission (reassignment being verified)',
         expect(closed.paths().filter((path) => path === '/v1/sessions/bind')).toHaveLength(binds)
     })
 
+    it('stops a replaced broker\'s bind retry when the session ends through it, before handing the revocation over', async () => {
+        const h = await brokerWith([held])
+        const successor = createBrowserTaskSessionBroker({ HAPPY_BROWSER_TASK_BROKER_SOCKET: '/run/abp/broker.sock', HAPPY_BROWSER_TASK_DAEMON_TOKEN_FILE: await tokenFile() },
+            async () => revoked as never, { procRoot: await procRoot() })!
+        expect(await h.broker.bind('reg-4', 'session-4')).toBe(true)
+        h.broker.close(successor)
+        await h.broker.revoke({ agentSessionId: 'session-4' })
+        const binds = h.paths().filter((path) => path === '/v1/sessions/bind').length
+        await new Promise((resolve) => setTimeout(resolve, 40))
+        expect(h.paths().filter((path) => path === '/v1/sessions/bind')).toHaveLength(binds)
+    })
+
     it('returns false at once for a denial (the caller revokes), and stops retrying when the session ends meanwhile', async () => {
         expect(await (await brokerWith([denied])).broker.bind('reg-1', 'session-1')).toBe(false)
 
