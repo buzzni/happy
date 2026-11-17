@@ -79,6 +79,8 @@ export function createSessionOrgRequirementsGate(input: {
     const gate = createOrgRequirementsGate({
         agent: input.agent,
         planModel: input.planModel,
+        // Written by the daemon from a synced binding; a requested or inherited value is scrubbed (utils/childEnv.ts).
+        endpointBound: env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint',
         happyHomeDir: lessonStateRoot(env) ?? configuration.happyHomeDir,
         serverUrl: configuration.serverUrl,
         accountKey: orgAccountKey(credentials),

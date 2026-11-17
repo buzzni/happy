@@ -178,6 +178,12 @@ export function createOrgRequirementsGate(options: {
     agent: OrgAgent;
     /** Model from a successfully bound platform-plan descriptor, never a caller-selected model/env flag. */
     planModel?: string;
+    /**
+     * An organization LLM endpoint session: Studio authorized its model at start (assignment and model policy,
+     * aplus specs/org-llm-endpoint-model-selection) and the runtime folds every requested name onto it, so a
+     * turn's model name is not judged against `ai.models`. Every other requirement still applies.
+     */
+    endpointBound?: boolean;
     /** The daemon's home: the last known good outlives a staged per-session home. */
     happyHomeDir: string;
     serverUrl: string;
@@ -221,6 +227,7 @@ export function createOrgRequirementsGate(options: {
             const key = `${agent}:${options.planModel}`;
             return { kind: 'allowedSet', values: [key], default: key, source: 'organization' };
         }
+        if (options.endpointBound) return null;
         const item = document()?.items['ai.models'];
         return item?.kind === 'allowedSet' ? item : null;
     };

@@ -57,6 +57,25 @@ describe('session gate assembly', () => {
         expect(plan.gate.checkTurn(turn)).toMatchObject({ kind: 'run' });
         expect(ordinary.gate.checkTurn(turn)).toMatchObject({ kind: 'refuse' });
     });
+
+    it('leaves an organization endpoint session model to its binding and still applies the ceiling', async () => {
+        stubStudio({
+            'ai.models': { kind: 'allowedSet', values: ['claude:claude-opus-5-5'], default: null, source: 'member' },
+            'permissions.mode': { kind: 'ceiling', max: 'default' },
+        });
+        const input = { agent: 'claude' as const, credentials: { token: 't' }, machineId: 'm' };
+        const endpoint = createSessionOrgRequirementsGate({ ...input, session: session(), env: { HAPPY_AI_AUTH_SOURCE: 'org-endpoint' } })!;
+        const personal = createSessionOrgRequirementsGate({ ...input, session: { ...session(), sessionId: 'personal' }, env: { HAPPY_AI_AUTH_SOURCE: 'personal-endpoint' } })!;
+        await endpoint.lookup();
+        await personal.lookup();
+        const turn = { permissionMode: 'bypassPermissions', model: 'deepseek/deepseek-v4.1-flash-eco', modelOrigin: 'explicit' as const };
+        const verdict = endpoint.gate.checkTurn(turn);
+        expect(verdict).toMatchObject({ kind: 'run', permissionMode: 'default', modeClamped: true });
+        expect(verdict).not.toHaveProperty('substituteModel');
+        expect(endpoint.gate.modelAllowed('claude-sonnet-5-5')).toBe(true);
+        expect(personal.gate.restrictsModels()).toBe(true);
+        expect(personal.gate.checkTurn(turn)).toMatchObject({ kind: 'refuse' });
+    });
 });
 
 describe('runtimes without a ceiling or tool-rule gate (R10.7)', () => {
