@@ -205,11 +205,32 @@ describe('daemon pending revocation queue', () => {
         const counted = async (): Promise<never> => { attempts++; throw new Error('connect ENOENT') }
         const broker = createBrowserTaskSessionBroker(await env(), counted, { pendingRevocationsFile: file, retryBaseMs: 5 })!
         await vi.waitFor(() => expect(attempts).toBeGreaterThan(0))
-        broker.close()
+        const successor = createBrowserTaskSessionBroker(await env(), unreachable, { pendingRevocationsFile: file, retryBaseMs: 3_600_000 })!
+        broker.close(successor)
         const before = attempts
         await new Promise((resolve) => setTimeout(resolve, 60))
         expect(attempts).toBe(before)
         expect(JSON.parse(readFileSync(file, 'utf8')).pending).toEqual([{ agentSessionId: 'session-1' }])
+    })
+
+    it('hands a closed broker\'s revocations to its successor, including ones a caller still holding it makes later', async () => {
+        const file = join(await queueDir(), 'pending.json')
+        writeFileSync(file, JSON.stringify({ schemaVersion: 1, pending: [{ agentSessionId: 'session-1' }] }))
+        const options = { pendingRevocationsFile: file, retryBaseMs: 3_600_000 }
+        const replaced = createBrowserTaskSessionBroker(await env(), unreachable, options)!
+        const successor = createBrowserTaskSessionBroker(await env(), unreachable, options)!
+        // Queued by the replaced broker after the successor loaded the file: only the replaced one knows it.
+        await replaced.revoke({ agentSessionId: 'session-2' })
+        replaced.close(successor)
+        await vi.waitFor(() => expect(successor.isRevocationPending({ agentSessionId: 'session-2' })).toBe(true))
+        // A resumed spawn's release still holds the replaced broker.
+        await replaced.revoke({ registrationId: 'reg-3' })
+        expect(successor.isRevocationPending({ registrationId: 'reg-3' })).toBe(true)
+        expect(replaced.isRevocationPending({ registrationId: 'reg-3' })).toBe(true)
+        expect(JSON.parse(readFileSync(file, 'utf8')).pending).toEqual([
+            { agentSessionId: 'session-1' }, { agentSessionId: 'session-2' }, { registrationId: 'reg-3' },
+        ])
+        expect(await successor.retryPendingRevocations()).toBe(3)
     })
 
     it('ignores a temp file a crash left before its rename and never overwrites it', async () => {
