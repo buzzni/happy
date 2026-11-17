@@ -265,6 +265,19 @@ it('counts only consecutive Studio network failures while waiting for a free acc
   const runtime = createSetupTokenCapacityRuntime({ directory: await directory(), request, notify: () => {}, wait: async () => {}, move: async () => false })
   expect(await runtime.admit(actor, new AbortController().signal)).toEqual({ state: 'admitted' })
 })
+it('settles a shadow observation Studio recorded although its answer was lost', async () => {
+  const request = vi.fn(async (operation: string, _actor: unknown, _runtime: string, extra?: Record<string, unknown>) => {
+    if (operation === 'reserve') return { state: 'off' }
+    if (operation === 'observe') throw new Error('CAPACITY_STUDIO_TIMEOUT')
+    return { state: operation === 'finish' ? 'finished' : String(extra?.deliveryState) }
+  })
+  const runtime = createSetupTokenCapacityRuntime({ directory: await directory(), request, notify: () => {}, move: async () => false })
+  await runtime.admit(actor, new AbortController().signal)
+  await runtime.observe(actor, new AbortController().signal)
+  await runtime.result({ type: 'result', subtype: 'success' }, false)
+  expect(request.mock.calls.map(call => call[0])).toEqual(['reserve', 'observe', 'delivery', 'finish'])
+  expect(runtime.hasActive()).toBe(false)
+})
 it('does not keep waiting for the daemon once the user cancels', async () => {
   const cancel = new AbortController()
   const request = vi.fn(async (operation: string) => { if (operation === 'reserve') { cancel.abort(); throw new Error('CAPACITY_DAEMON_UNREACHABLE') } return { state: 'cancelled' } })
