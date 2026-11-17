@@ -13,7 +13,9 @@ import type { OrgRequirementsAgentState } from '@slopus/happy-wire';
 import type { AgentState } from '@/api/types';
 import { fetchAplusMcpConfigSnapshot } from '@/aplus/fetchAplusMcpServers';
 import { configuration } from '@/configuration';
+import { orgEndpointMarker } from '@/daemon/orgEndpointSessionMarker';
 import { lessonStateRoot } from '@/memory/lessonSessionHost';
+import { ORG_ENDPOINT_BINDING_ENV } from '@/utils/childEnv';
 import { consumeOrgScopeHint, createOrgRequirementsGate, isOrgRequirementsEnabled, orgAccountKey, type OrgRequirementsGate } from './gate';
 import type { OrgAgent } from './resolve';
 
@@ -80,7 +82,8 @@ export function createSessionOrgRequirementsGate(input: {
         agent: input.agent,
         planModel: input.planModel,
         // Written by the daemon from a synced binding; a requested or inherited value is scrubbed (utils/childEnv.ts).
-        endpointBound: env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint',
+        // Only a model binding names a selected model Studio authorized; a manual tier endpoint keeps `ai.models`.
+        endpointBound: env.HAPPY_AI_AUTH_SOURCE === 'org-endpoint' && orgEndpointMarker(env[ORG_ENDPOINT_BINDING_ENV])?.selectedModel !== undefined,
         happyHomeDir: lessonStateRoot(env) ?? configuration.happyHomeDir,
         serverUrl: configuration.serverUrl,
         accountKey: orgAccountKey(credentials),

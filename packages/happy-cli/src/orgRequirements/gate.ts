@@ -179,9 +179,10 @@ export function createOrgRequirementsGate(options: {
     /** Model from a successfully bound platform-plan descriptor, never a caller-selected model/env flag. */
     planModel?: string;
     /**
-     * An organization LLM endpoint session: Studio authorized its model at start (assignment and model policy,
-     * aplus specs/org-llm-endpoint-model-selection) and the runtime folds every requested name onto it, so a
-     * turn's model name is not judged against `ai.models`. Every other requirement still applies.
+     * An organization LLM endpoint model-binding session: Studio authorized its selected model at start (assignment
+     * and model policy, aplus specs/org-llm-endpoint-model-selection) and the runtime folds every requested name onto
+     * it, so a turn's model name is not judged against `ai.models`. Every other requirement still applies. A manual
+     * tier endpoint is not one: Studio checks no model policy for it and a turn's alias picks its tier model.
      */
     endpointBound?: boolean;
     /** The daemon's home: the last known good outlives a staged per-session home. */
