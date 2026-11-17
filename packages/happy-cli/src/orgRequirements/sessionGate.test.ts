@@ -57,6 +57,32 @@ describe('session gate assembly', () => {
         expect(plan.gate.checkTurn(turn)).toMatchObject({ kind: 'run' });
         expect(ordinary.gate.checkTurn(turn)).toMatchObject({ kind: 'refuse' });
     });
+
+    it('leaves an organization endpoint session model to its binding and still applies the ceiling', async () => {
+        stubStudio({
+            'ai.models': { kind: 'allowedSet', values: ['claude:claude-opus-5-5'], default: null, source: 'member' },
+            'permissions.mode': { kind: 'ceiling', max: 'default' },
+        });
+        const input = { agent: 'claude' as const, credentials: { token: 't' }, machineId: 'm' };
+        const modelBinding = `b1:e1:t1:3:snap1:${Buffer.from('deepseek/deepseek-v4.1-flash-eco').toString('base64url')}`;
+        const endpoint = createSessionOrgRequirementsGate({ ...input, session: session(), env: { HAPPY_AI_AUTH_SOURCE: 'org-endpoint', HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING: modelBinding } })!;
+        const tiered = createSessionOrgRequirementsGate({ ...input, session: { ...session(), sessionId: 'tiered' }, env: { HAPPY_AI_AUTH_SOURCE: 'org-endpoint', HAPPY_AI_AUTH_ORG_ENDPOINT_BINDING: 'b1:e1:t1:3' } })!;
+        const personal = createSessionOrgRequirementsGate({ ...input, session: { ...session(), sessionId: 'personal' }, env: { HAPPY_AI_AUTH_SOURCE: 'personal-endpoint' } })!;
+        await endpoint.lookup();
+        await tiered.lookup();
+        await personal.lookup();
+        const turn = { permissionMode: 'bypassPermissions', model: 'deepseek/deepseek-v4.1-flash-eco', modelOrigin: 'explicit' as const };
+        const verdict = endpoint.gate.checkTurn(turn);
+        expect(verdict).toMatchObject({ kind: 'run', permissionMode: 'default', modeClamped: true });
+        expect(verdict).not.toHaveProperty('substituteModel');
+        expect(endpoint.gate.modelAllowed('claude-sonnet-5-5')).toBe(true);
+        // A manual tier endpoint folds an alias onto its tier model, and Studio checked no model policy for it.
+        expect(tiered.gate.restrictsModels()).toBe(true);
+        expect(tiered.gate.modelAllowed('sonnet')).toBe(false);
+        expect(tiered.gate.checkTurn({ permissionMode: 'default', model: 'sonnet', modelOrigin: 'explicit' })).toMatchObject({ kind: 'refuse' });
+        expect(personal.gate.restrictsModels()).toBe(true);
+        expect(personal.gate.checkTurn(turn)).toMatchObject({ kind: 'refuse' });
+    });
 });
 
 describe('runtimes without a ceiling or tool-rule gate (R10.7)', () => {
