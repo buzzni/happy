@@ -190,6 +190,40 @@ describe('rewriteHtml — interceptor injection', () => {
         expect(baseIdx).toBeLessThan(scriptIdx);
     });
 
+    // An HTML file in a subdirectory (an embedded editor's inner iframe page
+    // such as CrossEditor's config/htmls/crosseditor.html) loads
+    // `../../lib/jquery.min.js`. Pinning its base at the prefix root sent those
+    // requests to /lib/… and the editor rendered as an empty box.
+    it('pins <base href> at the directory of a requested .html file', () => {
+        const out = rewriteHtml('<html><head></head></html>', PREFIX, '/crosseditor/config/htmls/crosseditor.html');
+        expect(out).toContain(`<base href="${PREFIX}/crosseditor/config/htmls/">`);
+    });
+
+    it('pins <base href> at the .html file directory in subdomain mode (empty prefix)', () => {
+        const out = rewriteHtml('<html><head></head></html>', '', '/crosseditor/config/htmls/crosseditor.html?v=1');
+        expect(out).toContain('<base href="/crosseditor/config/htmls/">');
+    });
+
+    // Extensionless paths are SPA routes served by the index fallback; their
+    // relative assets live at the app root, so the base stays at the prefix.
+    it('keeps <base href> at the prefix root for SPA routes', () => {
+        const out = rewriteHtml('<html><head></head></html>', PREFIX, '/notices/new');
+        expect(out).toContain(`<base href="${PREFIX}/">`);
+    });
+
+    // The relay hands over a percent-decoded path (Fastify decodes the `*`
+    // param), so the base re-encodes each segment.
+    it('re-encodes the request path so it cannot break out of the <base> attribute', () => {
+        const out = rewriteHtml('<html><head></head></html>', '', '/x"><script>alert(1)</script>/a.html');
+        expect(out).not.toContain('<script>alert(1)</script>');
+        expect(out).toContain('<base href="/x%22%3E%3Cscript%3Ealert(1)%3C/script%3E/">');
+    });
+
+    it('re-encodes a decoded # or % in a directory name so it stays part of the path', () => {
+        const out = rewriteHtml('<html><head></head></html>', '', '/a#b/p%q/c.html');
+        expect(out).toContain('<base href="/a%23b/p%25q/">');
+    });
+
     it('interceptor embeds the configured prefix', () => {
         const out = rewriteHtml('<html><head></head><body></body></html>', PREFIX);
         expect(out).toContain(`var P='${PREFIX}'`);
