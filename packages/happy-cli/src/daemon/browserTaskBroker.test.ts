@@ -212,6 +212,29 @@ describe('daemon pending revocation queue', () => {
         expect(JSON.parse(readFileSync(file, 'utf8')).pending).toEqual([{ agentSessionId: 'session-1' }])
     })
 
+    it('hands a revocation sent through a closed broker to its successor, so a caller holding the replaced broker loses none', async () => {
+        const file = join(await queueDir(), 'pending.json')
+        let up = false
+        const revoked: unknown[] = []
+        const runtime = async (_socket: string, _method: 'GET' | 'POST', _path: string, _headers: Record<string, string>, body?: unknown) => {
+            if (!up) throw new Error('ECONNREFUSED')
+            revoked.push((body as { registrationId?: string }).registrationId)
+            return { status: 200, body: { ok: true, result: { revoked: true, grants: 0 } } as never }
+        }
+        const replaced = createBrowserTaskSessionBroker(await env(), runtime, { pendingRevocationsFile: file, retryBaseMs: 3_600_000 })!
+        const current = createBrowserTaskSessionBroker(await env(), runtime, { pendingRevocationsFile: file, retryBaseMs: 3_600_000 })!
+        replaced.close(current)
+        // A spawn that captured the replaced broker releases its registration while the runtime is still down.
+        await replaced.revoke({ registrationId: 'reg-late' })
+        expect(current.isRevocationPending({ registrationId: 'reg-late' })).toBe(true)
+        expect(replaced.isRevocationPending({ registrationId: 'reg-late' })).toBe(true)
+        await current.revoke({ registrationId: 'reg-other' })
+        expect(JSON.parse(readFileSync(file, 'utf8')).pending).toEqual([{ registrationId: 'reg-late' }, { registrationId: 'reg-other' }])
+        up = true
+        expect(await current.retryPendingRevocations()).toBe(0)
+        expect(revoked).toEqual(['reg-late', 'reg-other'])
+    })
+
     it('ignores a temp file a crash left before its rename and never overwrites it', async () => {
         const dir = await queueDir()
         const file = join(dir, 'pending.json')

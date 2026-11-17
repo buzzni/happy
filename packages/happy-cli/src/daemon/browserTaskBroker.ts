@@ -111,8 +111,9 @@ export interface BrowserTaskSessionBroker {
     /**
      * Stops the pending-revocation retry loop (bind retries end at their own deadline). The daemon replaces the
      * broker each time the personal runtime is re-activated; a replaced broker left running keeps its loop, and they pile up.
+     * Revocations still sent through it (a spawn or bind retry that captured it) go to `successor`, which owns the queue file.
      */
-    close(): void
+    close(successor?: BrowserTaskSessionBroker): void
 }
 
 export interface BrowserTaskSessionBrokerOptions {
@@ -266,7 +267,8 @@ export function createBrowserTaskSessionBroker(
     /** True while the file lags the in-memory queue (a write failed); retried with the revocations. */
     let queueDirty = false
     const savePending = (): boolean => {
-        if (!pendingFile) return true
+        // A replaced broker's view of the file is stale; its successor owns the file.
+        if (!pendingFile || successor) return true
         try {
             writeQueueFile(pendingFile, JSON.stringify({ schemaVersion: 1, pending }))
             queueDirty = false
@@ -290,6 +292,7 @@ export function createBrowserTaskSessionBroker(
     let retryTimer: NodeJS.Timeout | undefined
     let failedRounds = 0
     let closed = false
+    let successor: BrowserTaskSessionBroker | undefined
     const retryPendingRevocations = async (): Promise<number> => {
         if (queueDirty) savePending()
         for (const target of [...pending]) await attempt(target)
@@ -418,6 +421,7 @@ export function createBrowserTaskSessionBroker(
                     if ('agentSessionId' in target) await broker.revoke({ registrationId: retrying.registrationId })
                 }
             }
+            if (successor) return successor.revoke(target)
             let saved = !queueDirty
             if (!pending.some((entry) => key(entry) === key(target))) {
                 pending = [...pending, target]
@@ -430,13 +434,20 @@ export function createBrowserTaskSessionBroker(
             if (outstanding && !saved) throw new PendingRevocationQueueError('Browser task revocation was neither confirmed nor saved; retrying in memory')
         },
         retryPendingRevocations,
-        isRevocationPending: (target) => pending.some((entry) => key(entry) === key(target)),
-        revocationRefusal: (target) => pending.some((entry) => key(entry) === key(target)) ? refusals.get(key(target)) : undefined,
-        close() {
+        isRevocationPending: (target) => successor ? successor.isRevocationPending(target) : pending.some((entry) => key(entry) === key(target)),
+        revocationRefusal: (target) => successor ? successor.revocationRefusal?.(target) : pending.some((entry) => key(entry) === key(target)) ? refusals.get(key(target)) : undefined,
+        close(next) {
             // The queue file stays: the replacing broker loaded it and retries the same revocations.
             closed = true
             clearTimeout(retryTimer)
             retryTimer = undefined
+            successor = next
+            if (!next) return
+            // An entry the file lacked (its write failed) or one still in flight when the successor loaded it.
+            for (const target of pending) {
+                if (!next.isRevocationPending(target)) void next.revoke(target).catch((error) => logger.debug(`[DAEMON RUN] Browser task revocation hand-over failed: ${error instanceof Error ? error.message : 'unknown'}`))
+            }
+            pending = []
         },
     }
     return broker
