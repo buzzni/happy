@@ -198,6 +198,20 @@ describe('daemon pending revocation queue', () => {
         expect(statSync(file).isDirectory() ? 'dir' : readFileSync(file, 'utf8')).toBe(before)
     })
 
+    it('stops retrying once closed, so a replaced broker (re-activated personal runtime) leaves no retry loop behind', async () => {
+        const file = join(await queueDir(), 'pending.json')
+        writeFileSync(file, JSON.stringify({ schemaVersion: 1, pending: [{ agentSessionId: 'session-1' }] }))
+        let attempts = 0
+        const counted = async (): Promise<never> => { attempts++; throw new Error('connect ENOENT') }
+        const broker = createBrowserTaskSessionBroker(await env(), counted, { pendingRevocationsFile: file, retryBaseMs: 5 })!
+        await vi.waitFor(() => expect(attempts).toBeGreaterThan(0))
+        broker.close()
+        const before = attempts
+        await new Promise((resolve) => setTimeout(resolve, 60))
+        expect(attempts).toBe(before)
+        expect(JSON.parse(readFileSync(file, 'utf8')).pending).toEqual([{ agentSessionId: 'session-1' }])
+    })
+
     it('ignores a temp file a crash left before its rename and never overwrites it', async () => {
         const dir = await queueDir()
         const file = join(dir, 'pending.json')

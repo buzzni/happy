@@ -108,6 +108,11 @@ export interface BrowserTaskSessionBroker {
     revocationRefusal?(target: RevokeTarget): string | undefined
     /** Whether a task of the session waits for the user; throws when the Runtime gives no answer. */
     waiting(agentSessionId: string): Promise<boolean>
+    /**
+     * Stops the pending-revocation retry loop (bind retries end at their own deadline). The daemon replaces the
+     * broker each time the personal runtime is re-activated; a replaced broker left running keeps its loop, and they pile up.
+     */
+    close(): void
 }
 
 export interface BrowserTaskSessionBrokerOptions {
@@ -284,6 +289,7 @@ export function createBrowserTaskSessionBroker(
     }
     let retryTimer: NodeJS.Timeout | undefined
     let failedRounds = 0
+    let closed = false
     const retryPendingRevocations = async (): Promise<number> => {
         if (queueDirty) savePending()
         for (const target of [...pending]) await attempt(target)
@@ -292,7 +298,7 @@ export function createBrowserTaskSessionBroker(
         return pending.length
     }
     const scheduleRetry = (): void => {
-        if (retryTimer || (!pending.length && !queueDirty)) return
+        if (closed || retryTimer || (!pending.length && !queueDirty)) return
         retryTimer = setTimeout(() => { retryTimer = undefined; void retryPendingRevocations() },
             Math.min(retryBaseMs * 2 ** Math.max(0, failedRounds - 1), MAX_RETRY_DELAY_MS))
         retryTimer.unref()
@@ -426,6 +432,12 @@ export function createBrowserTaskSessionBroker(
         retryPendingRevocations,
         isRevocationPending: (target) => pending.some((entry) => key(entry) === key(target)),
         revocationRefusal: (target) => pending.some((entry) => key(entry) === key(target)) ? refusals.get(key(target)) : undefined,
+        close() {
+            // The queue file stays: the replacing broker loaded it and retries the same revocations.
+            closed = true
+            clearTimeout(retryTimer)
+            retryTimer = undefined
+        },
     }
     return broker
 }
