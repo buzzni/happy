@@ -10,7 +10,7 @@ export function readSetupTokenCapacityActor(value: unknown, text: string): Setup
     || typeof actor.proof !== 'string' || !actor.proof.length || actor.proof.length > 4096 || actor.contentHash !== createHash('sha256').update(text).digest('hex')) throw new Error('CAPACITY_INPUT_PROOF_INVALID')
   return actor
 }
-type Entry = { actor: SetupTokenCapacityActor; runtimeId: string; seq: number; attempt?: number; started?: boolean; phase: 'waiting' | 'claiming' | 'attempting' | 'result' | 'finished'; result?: unknown }
+type Entry = { actor: SetupTokenCapacityActor; runtimeId: string; seq: number; attempt?: number; started?: boolean; phase: 'waiting' | 'claiming' | 'attempting' | 'result' | 'finished'; result?: unknown; unobserved?: true }
 /** The daemon lacks the route (an update replaced the bundle but the old daemon has not handed off yet) or is mid-handoff. */
 const isDaemonNotReady = (error: unknown) => error instanceof Error && /^CAPACITY_DAEMON_(HTTP_404|UNREACHABLE)$/.test(error.message)
 /** The daemon sent the request but got no answer from Studio: the network between this PC and Studio, not a refusal. */
@@ -68,7 +68,11 @@ export function createSetupTokenCapacityRuntime(deps: {
     // Same isolation as save(): a failed heartbeat must not fail the delivery and finish reports after it.
     const pending = (reports.get(entry) ?? Promise.resolve()).catch(() => undefined).then(async () => {
       const seq = ++entry.seq; await save(entry)
-      return send(entry, operation, { ...extra, seq })
+      return send(entry, operation, { ...extra, seq }).catch(error => {
+        // An unconfirmed observation may never have reached Studio: with no execution there, nothing is left to settle.
+        if (entry.unobserved && error instanceof Error && error.message === 'CAPACITY_NOT_FOUND') return { state: 'finished' }
+        throw error
+      })
     })
     reports.set(entry, pending)
     return pending
@@ -194,6 +198,13 @@ export function createSetupTokenCapacityRuntime(deps: {
         // connection. The journal keeps the claim, so a later recovery settles whatever Studio recorded.
         if (!isStudioUnreachable(error)) throw error
         console.warn('[setup-token-capacity] observation unconfirmed; running the admitted start', error.message)
+        // Track the turn anyway, so its result is recorded and a failed turn stays retryable.
+        if (!active.has(entry.actor.requestId)) {
+          entry.unobserved = true
+          active.set(entry.actor.requestId, entry); current = entry
+          entry.started = providerAlive
+          entry.phase = 'attempting'; await save(entry)
+        }
       }
     },
     async retry(actor: SetupTokenCapacityActor) {
@@ -201,7 +212,7 @@ export function createSetupTokenCapacityRuntime(deps: {
       if (entry.actor.proof !== actor.proof) throw new Error('CAPACITY_INPUT_CONFLICT')
       if (entry.phase === 'waiting' && (entry.attempt ?? 0) > 0) return
       if (entry.phase !== 'finished' || !failedResult(entry.result)) throw new Error('CAPACITY_RETRY_UNCONFIRMED')
-      entry.attempt = (entry.attempt ?? 0) + 1; entry.phase = 'waiting'; entry.seq = 0; delete entry.result
+      entry.attempt = (entry.attempt ?? 0) + 1; entry.phase = 'waiting'; entry.seq = 0; delete entry.result; delete entry.unobserved
       await save(entry)
     },
     async result(result: unknown, backgroundActive: boolean) {
