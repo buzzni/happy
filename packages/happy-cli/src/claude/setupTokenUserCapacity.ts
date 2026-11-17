@@ -13,6 +13,9 @@ export function readSetupTokenCapacityActor(value: unknown, text: string): Setup
 type Entry = { actor: SetupTokenCapacityActor; runtimeId: string; seq: number; attempt?: number; started?: boolean; phase: 'waiting' | 'claiming' | 'attempting' | 'result' | 'finished'; result?: unknown }
 /** The daemon lacks the route (an update replaced the bundle but the old daemon has not handed off yet) or is mid-handoff. */
 const isDaemonNotReady = (error: unknown) => error instanceof Error && /^CAPACITY_DAEMON_(HTTP_404|UNREACHABLE)$/.test(error.message)
+/** The daemon sent the request but got no answer from Studio: the network between this PC and Studio, not a refusal. */
+const isStudioUnreachable = (error: unknown): error is Error => error instanceof Error && /^CAPACITY_STUDIO_(UNREACHABLE|TIMEOUT)$/.test(error.message)
+const STUDIO_RETRIES = 3
 type Reply = { state: string; managedAccountId?: string; credentialGeneration?: number; epoch?: number; validForMs?: number; retryAfterMs?: number; requiresMove?: boolean; reason?: string }
 /** Durable input ownership: a lost claim answer never authorizes a second provider delivery. */
 export function createSetupTokenCapacityRuntime(deps: {
@@ -131,6 +134,7 @@ export function createSetupTokenCapacityRuntime(deps: {
       let notified = false
       let daemonNotified = false
       let daemonFailure: unknown
+      let studioRetries = 0
       const pause = async (milliseconds: number) => {
         if (deps.wait) await deps.wait(milliseconds, signal)
         else await delay(milliseconds, undefined, { signal })
@@ -144,6 +148,12 @@ export function createSetupTokenCapacityRuntime(deps: {
           try { decision = await send(entry, 'reserve', undefined, signal) }
           catch (error) {
             signal.throwIfAborted()
+            // Studio replays a reservation it already made for this request id, so asking again is safe here too.
+            if (isStudioUnreachable(error) && studioRetries < STUDIO_RETRIES) {
+              studioRetries++
+              await pause(3000)
+              continue
+            }
             if (!isDaemonNotReady(error)) throw error
             // Nothing was reserved, so asking again is safe; the old daemon hands off within its 30-minute pre-wait cap.
             daemonFailure = error
@@ -177,7 +187,14 @@ export function createSetupTokenCapacityRuntime(deps: {
     async observe(actor: SetupTokenCapacityActor, signal: AbortSignal) {
       const entry: Entry = JSON.parse(await readFile(path(actor), 'utf8'))
       if (entry.phase !== 'waiting' || entry.actor.proof !== actor.proof) throw new Error('CAPACITY_INPUT_CONFLICT')
-      await arm(entry, 'observe', { legacyRequestId: legacyId(entry) }, signal)
+      try { await arm(entry, 'observe', { legacyRequestId: legacyId(entry) }, signal) }
+      catch (error) {
+        signal.throwIfAborted()
+        // The start was already admitted; observation is shadow accounting and must not stop the turn over a dropped
+        // connection. The journal keeps the claim, so a later recovery settles whatever Studio recorded.
+        if (!isStudioUnreachable(error)) throw error
+        console.warn('[setup-token-capacity] observation unconfirmed; running the admitted start', error.message)
+      }
     },
     async retry(actor: SetupTokenCapacityActor) {
       const entry: Entry = JSON.parse(await readFile(path(actor), 'utf8'))

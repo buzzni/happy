@@ -32,6 +32,17 @@ describe('describeClaudeLaunchFailure', () => {
         }
     });
 
+    it('tells this PC failing to reach Saycode apart from an account problem', () => {
+        // ryan 2026-11-17: a dropped connection from the wshop PC read as an organization account problem.
+        for (const code of ['CAPACITY_STUDIO_UNREACHABLE', 'CAPACITY_STUDIO_TIMEOUT']) {
+            const text = describeClaudeLaunchFailure(new Error(code));
+            expect(text).toMatch(/Saycode 서버에 연결하지 못해/);
+            expect(text).toMatch(/계정 문제가 아닙니다/);
+            expect(text).not.toMatch(/계정 상태를 확인한 뒤/);
+            expect(text).toContain(`(${code})`);
+        }
+    });
+
     it('explains a refused organization credential without asking for a personal login', () => {
         const text = describeClaudeLaunchFailure(new Error('CLAUDE_ORGANIZATION_AUTH_NOT_VERIFIED'));
         expect(text).toMatch(/Organization Claude stopped.*assigned account or policy/);
