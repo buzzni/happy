@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { APPLY_REQUIRED_NOTICE, createSetupTokenAccountSwitching, FORBIDDEN_NOTICE, NO_ACCOUNT_NOTICE, START_BUDGET_SWITCHED_NOTICE, type SetupTokenAccountSwitchingDeps } from './setupTokenAccountSwitching'
+import { APPLY_REQUIRED_NOTICE, AUTHENTICATION_STOPPED_NOTICE, createSetupTokenAccountSwitching, FORBIDDEN_NOTICE, NO_ACCOUNT_NOTICE, START_BUDGET_SWITCHED_NOTICE, USAGE_LIMIT_STOPPED_NOTICE, type SetupTokenAccountSwitchingDeps } from './setupTokenAccountSwitching'
 
 const NOW = 1_800_000_000_000
 const reset = Math.floor((NOW + 3_600_000) / 1000)
@@ -342,6 +342,14 @@ it('primary review: proactive warning failure does not consume a later refused-t
   expect(deps.rebind).toHaveBeenCalledWith('session-a', 'binding-a', { observedAt: NOW, windows: [], reason: 'authentication-failed', retryAt: null }, expect.any(AbortSignal));
   expect(await switching.switchIfWanted()).toEqual({ switched: false, continueAfter: false });
   expect(deps.rebind).toHaveBeenCalledTimes(1);
+ });
+ it('says why a refused turn stopped: the usage limit, or an authentication failure', () => {
+  const limited = setup().switching;
+  limited.onRateLimitEvent(refused);
+  expect(limited.refusalNotice()).toBe(USAGE_LIMIT_STOPPED_NOTICE);
+  const unauthenticated = setup().switching;
+  unauthenticated.onAuthenticationFailure(false);
+  expect(unauthenticated.refusalNotice()).toBe(AUTHENTICATION_STOPPED_NOTICE);
  });
  it('never resumes an authentication refusal after user stop', async () => {
   const { switching, deps } = setup();
