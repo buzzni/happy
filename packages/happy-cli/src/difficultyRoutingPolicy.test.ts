@@ -41,6 +41,13 @@ describe('difficulty routing policy parity snapshot', () => {
     expect(tierForKnownRoutePair('claude', 'claude-sonnet-5-5', 'medium')).toBe('routine')
   })
 
+  // A client on the GPT-6.2 table can reach this daemon before its own table moves.
+  it('tells gpt-6.2-sol routine, hard and escalated apart by effort alone', () => {
+    expect(tierForKnownRoutePair('codex', 'gpt-6.2-sol', 'low')).toBe('routine')
+    expect(tierForKnownRoutePair('codex', 'gpt-6.2-sol', 'high')).toBe('hard')
+    expect(tierForKnownRoutePair('codex', 'gpt-6.2-sol', 'xhigh')).toBe('escalated')
+  })
+
   // Sessions mid-conversation carry a floor written under the previous table;
   // dropping it would restart them cheap (stored-base-pair-unsupported).
   it('still reads the previous generation pairs as their own tiers', () => {

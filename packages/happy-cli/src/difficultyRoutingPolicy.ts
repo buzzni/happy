@@ -122,6 +122,10 @@ export const KNOWN_ROUTE_TIERS: ReadonlyArray<{
   { agent: 'codex', model: 'gpt-6.1-sol', effort: 'low', tier: 'routine' },
   { agent: 'codex', model: 'gpt-6.1-sol', effort: 'high', tier: 'hard' },
   { agent: 'codex', model: 'gpt-6.1-sol', effort: 'xhigh', tier: 'escalated' },
+  // --- codex, 2026-11-18 table (Codex 0.166+). Same shape on gpt-6.2-sol. ---
+  { agent: 'codex', model: 'gpt-6.2-sol', effort: 'low', tier: 'routine' },
+  { agent: 'codex', model: 'gpt-6.2-sol', effort: 'high', tier: 'hard' },
+  { agent: 'codex', model: 'gpt-6.2-sol', effort: 'xhigh', tier: 'escalated' },
 ]
 
 /**
