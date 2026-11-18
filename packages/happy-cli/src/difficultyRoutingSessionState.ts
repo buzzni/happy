@@ -31,6 +31,7 @@ import {
   HARD_TURNS_BEFORE_ESCALATION,
   USER_REQUEST_MODELS,
   isKnownRoutePair,
+  sameTierRoutePairs,
   type Difficulty,
   type RoutableAgent,
 } from './difficultyRoutingPolicy'
@@ -925,9 +926,12 @@ function resolveBoundaryEscalation(
   const streakAfterThisTurn = applyHardTurnsIntent(effectiveEscalation(state, now).hardTurns, intent)
   if (streakAfterThisTurn < HARD_TURNS_BEFORE_ESCALATION) return null
 
-  const route = USER_REQUEST_MODELS[agent].escalated
-  if (!isKnownRoutePair(agent, route)) return null
-  if (!isAllowedByPolicySnapshot(decision.policySnapshot, agent, route.model)) return null
+  const tableRoute = USER_REQUEST_MODELS[agent].escalated
+  if (!isKnownRoutePair(agent, tableRoute)) return null
+  // A policy that has not allowed the table's model yet runs an allowed pair of the same tier.
+  const route = sameTierRoutePairs(agent, tableRoute.model, tableRoute.effort)
+    .find((pair) => isAllowedByPolicySnapshot(decision.policySnapshot, agent, pair.model))
+  if (!route) return null
 
   return {
     model: route.model,

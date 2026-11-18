@@ -1128,6 +1128,25 @@ describe('stale re-escalation judgement at the engine boundary (R4, R7)', () => 
       .toBeNull()
   })
 
+  // The table escalates to gpt-6.2-sol/xhigh, but an org that only allows 6.1 Sol
+  // still earned the escalation: it runs on 6.1 Sol/xhigh, the same tier.
+  it('shouldEscalateOnAnAllowedPairOfTheSameTierWhenTheTableModelIsForbidden', () => {
+    const codexHard = (id: string) => hardTurn(id, {
+      selected: { model: 'gpt-6.1-sol', effort: 'high' },
+      base: { difficulty: 'hard', model: 'gpt-6.1-sol', effort: 'high' },
+      policySnapshot: { allowedSelectionKeys: ['codex:gpt-6.1-sol'], defaultSelectionKey: null },
+    })
+    let state = normalizeRoutingSessionState(undefined, 'codex')
+    for (let i = 0; i < 2; i += 1) {
+      state = recordPendingDecision(state, codexHard(`seed-${i}`))
+      state = commitAppliedRouting(state, { clientRequestIds: [`seed-${i}`], executionId: `x-${i}`, now: NOW }).state
+    }
+    const waited = codexHard('waited')
+
+    expect(resolveEngineBoundaryRoute(recordPendingDecision(state, waited), waited, 'codex', NOW))
+      .toMatchObject({ model: 'gpt-6.1-sol', effort: 'xhigh', difficulty: 'escalated', temporaryEscalation: true })
+  })
+
   it('shouldNotEscalateAManualPin', () => {
     const manual = hardTurn('manual', { kind: 'manual' })
 
