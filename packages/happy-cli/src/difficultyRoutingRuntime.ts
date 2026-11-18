@@ -17,6 +17,7 @@ import {
   tierForKnownRoutePair,
   resolveEscalation,
   routeSendModelOptionsWithDifficulty,
+  sameTierRoutePairs,
   shouldReusePreviousDifficultyForContinuation,
   type ClassifiableDifficulty,
   type Difficulty,
@@ -1081,6 +1082,10 @@ function resolveRouteAllowedByAiPolicy(
 ): { route: SendModelOptionsResult; substituted: boolean } | null {
   if (!policy || policy.allowedSelectionKeys === null) return { route, substituted: false }
   if (route.model && isModelAllowedByAiPolicy(policy, agent, route.model)) return { route, substituted: false }
+
+  const sameTier = sameTierRoutePairs(agent, route.model, route.effort)
+    .find((pair) => isModelAllowedByAiPolicy(policy, agent, pair.model))
+  if (sameTier) return { route: { ...route, ...sameTier }, substituted: true }
 
   const substitute = current.model && isModelAllowedByAiPolicy(policy, agent, current.model)
     ? current.model

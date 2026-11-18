@@ -272,6 +272,28 @@ describe('difficulty routing runtime', () => {
     expect(asDecision(decision).pending.base).toMatchObject({ difficulty: 'hard', model: 'gpt-6.1-sol', effort: 'high' })
   })
 
+  // A routing table moves to a model before an organization allows it. An allowed
+  // pair of the same tier keeps the tier, ahead of the current or default model.
+  it('substitutes an allowed pair of the routed tier before the current or default model', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+      ...grantResponse(),
+      aiModelPolicy: {
+        source: 'organization',
+        allowedSelectionKeys: ['codex:gpt-5.5', 'codex:gpt-6-sol'],
+        defaultSelectionKey: 'codex:gpt-5.5',
+      },
+    })))
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      agent: 'codex',
+      contentText: 'refactor the payment module',
+      current: { model: 'gpt-5.5', effort: 'high' },
+    })
+
+    expect(asDecision(decision).route).toMatchObject({ model: 'gpt-6-sol', effort: 'high', difficulty: 'hard' })
+  })
+
   it('falls back to the allowed default model when the current model is also disallowed', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json({
       ...grantResponse(),
