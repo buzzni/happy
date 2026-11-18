@@ -98,10 +98,11 @@ describe('claudeRemoteLauncher context-usage delivery', () => {
     /**
      * Runs the recorded session through the launcher; `control` is merged into the mocked SDK `Query`.
      * `labels` keeps only those turns; `delayMs: 0` delivers a turn as one burst, before the queue drains.
+     * `prompts` are the user messages that start each kept turn (`turn-<n>` otherwise).
      */
     async function replayRecording(
         control: Record<string, unknown> = {},
-        { labels, delayMs = 5 }: { labels?: string[]; delayMs?: number } = {},
+        { labels, delayMs = 5, prompts = [] }: { labels?: string[]; delayMs?: number; prompts?: string[] } = {},
     ): Promise<ApiSessionClient> {
         const turns = readRecording().filter((turn) => !labels || labels.includes(turn[0].label));
         const client = new ApiSessionClient('fake-token', {
@@ -128,12 +129,12 @@ describe('claudeRemoteLauncher context-usage delivery', () => {
                         void rpcHandlers.get('switch')!();
                         return;
                     }
-                    queue.push(`turn-${turn}`, { permissionMode: 'default', model: 'claude-haiku-4-5' });
+                    queue.push(prompts[turn] ?? `turn-${turn}`, { permissionMode: 'default', model: 'claude-haiku-4-5' });
                 }
             })();
             return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {}, ...control }) as unknown as ReturnType<typeof query>;
         });
-        queue.push('turn-0', { permissionMode: 'default', model: 'claude-haiku-4-5' });
+        queue.push(prompts[0] ?? 'turn-0', { permissionMode: 'default', model: 'claude-haiku-4-5' });
         const session = {
             lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
             cancelLessonReview: vi.fn(),
@@ -193,6 +194,20 @@ describe('claudeRemoteLauncher context-usage delivery', () => {
         // compact_boundary and the result reach the launcher before the queue drains: the request
         // waits its turn behind the boundary, so the answer is the one shown.
         await vi.waitFor(() => expect(frames().at(-1)).toMatchObject({ used: null, breakdown: { totalTokens: 9000 } }));
+        await client.close();
+    });
+
+    it('ends the recorded /compact turn, which emits no assistant message, with a turn-end', async () => {
+        const sent: string[] = [];
+        const enqueue = vi.spyOn(ApiSessionClient.prototype as any, 'enqueueSessionProtocolEnvelopes')
+            .mockImplementation(function (this: unknown, ...args: unknown[]) {
+                for (const envelope of args[0] as Array<{ role: string; ev: { t: string } }>) sent.push(`${envelope.ev.t}:${envelope.role}`);
+            });
+        const client = await replayRecording({}, { labels: ['compact'], prompts: ['/compact'] });
+
+        // Without the turn-end the Desktop shows "responding" until its 600s stall ceiling.
+        expect(sent.filter((event) => event.startsWith('turn-'))).toEqual(['turn-start:agent', 'turn-end:agent']);
+        enqueue.mockRestore();
         await client.close();
     });
 });

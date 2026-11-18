@@ -55,6 +55,8 @@ export interface StructuredOutputItem {
 export interface ChannelTurnEndItem {
     __channelTurnEnd: true;
     status: SessionTurnEndStatus;
+    /** Open a turn first if nothing did (a `/compact` result), so clients still get a `turn-end`. */
+    opensTurn?: true;
 }
 
 export interface ChannelPermissionBindingItem {
@@ -85,8 +87,8 @@ export function structuredOutputItem(envelope: StructuredOutputEnvelope): Struct
     return { __structuredOutput: true, envelope };
 }
 
-export function turnEndItem(status: SessionTurnEndStatus): ChannelTurnEndItem {
-    return { __channelTurnEnd: true, status };
+export function turnEndItem(status: SessionTurnEndStatus, opensTurn = false): ChannelTurnEndItem {
+    return { __channelTurnEnd: true, status, ...(opensTurn ? { opensTurn: true } : {}) };
 }
 
 export function permissionBindingItem(
@@ -105,7 +107,7 @@ export interface ChannelTurnOrderingTarget {
     continueInputEvidence?(kind: InputEvidenceV1['continuation']['kind']): void;
     sendFinalAnswerForChannelTurn(text: string): void;
     sendStructuredOutput(envelope: StructuredOutputEnvelope): void;
-    closeClaudeSessionTurn(status: SessionTurnEndStatus): void;
+    closeClaudeSessionTurn(status: SessionTurnEndStatus, options?: { opensTurn: true }): void;
     bindChannelPermission(permissionId: string, toolName: string, instanceSeq: number): void;
     sendClaudeSessionMessage(logMessage: unknown): void;
 }
@@ -142,7 +144,9 @@ export function createOrderedTurnDispatcher(
             return;
         }
         if (item && (item as ChannelTurnEndItem).__channelTurnEnd === true) {
-            target.closeClaudeSessionTurn((item as ChannelTurnEndItem).status);
+            const end = item as ChannelTurnEndItem;
+            if (end.opensTurn) target.closeClaudeSessionTurn(end.status, { opensTurn: true });
+            else target.closeClaudeSessionTurn(end.status);
             return;
         }
         if (item && (item as ChannelPermissionBindingItem).__channelPermissionBinding === true) {

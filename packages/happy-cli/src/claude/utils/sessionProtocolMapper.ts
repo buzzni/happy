@@ -829,11 +829,14 @@ export function missingStructuredOutputBeforeClose(
     return [createEnvelope('agent', { t: 'structured-output', v: 1, status: 'missing', reason }, { turn: turnId })];
 }
 
+/** `opensTurn` closes a turn even if nothing opened it: a `/compact` turn may emit no assistant message. */
 export function closeClaudeTurnWithStatus(
     state: ClaudeSessionProtocolState,
     status: SessionTurnEndStatus,
+    opensTurn = false,
 ): ClaudeMapperResult {
     const envelopes: SessionEnvelope[] = [];
+    if (opensTurn) ensureTurn(state, envelopes);
     closeTurn(state, status, envelopes);
     return {
         currentTurnId: state.currentTurnId,
@@ -909,6 +912,9 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
     }
 
     if ((message as any).isCompactSummary) {
+        // A /compact turn answers with nothing but this summary (claudeRemote marks it). Open the
+        // turn without its text so the result closes it: no turn-end leaves clients "responding".
+        if (message.type === 'assistant') ensureTurn(state, envelopes);
         return {
             currentTurnId: state.currentTurnId,
             envelopes,
