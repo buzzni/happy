@@ -1609,6 +1609,29 @@ describe('cross-generation floor preservation (R2, R3)', () => {
     expect(asDecision(decision).pending.base).toMatchObject({ difficulty: 'hard', model: 'gpt-6-sol', effort: 'high' })
   })
 
+  // An org that allows 6.1 Sol but not yet 6.2: the escalation runs on 6.1 Sol/xhigh
+  // for one turn, and the floor stays hard — never an xhigh floor every later turn rides.
+  it('shouldKeepASameTierPolicySwapOfAnEscalationTemporary', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+      ...grantResponse(),
+      aiModelPolicy: { source: 'organization', allowedSelectionKeys: ['codex:gpt-6.1-sol'], defaultSelectionKey: 'codex:gpt-6.1-sol' },
+    })))
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      agent: 'codex',
+      contentText: 'still broken, the same error again',
+      state: {
+        ...storedBase('hard', 'gpt-6.1-sol', 'high'),
+        escalation: { hardTurns: 3, updatedAt: Date.now() - 1000 },
+      },
+    })
+
+    expect(asDecision(decision).route).toMatchObject({ model: 'gpt-6.1-sol', effort: 'xhigh', difficulty: 'escalated' })
+    expect(asDecision(decision).pending.temporaryEscalation).toBe(true)
+    expect(asDecision(decision).pending.base).toMatchObject({ difficulty: 'hard', model: 'gpt-6.1-sol', effort: 'high' })
+  })
+
   it('shouldStillRefuseAPairNoGenerationOffers', () => {
     expect(buildLocalAutoBootstrapDecision({
       agent: 'claude',
