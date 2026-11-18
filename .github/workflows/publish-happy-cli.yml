@@ -147,6 +147,11 @@ jobs:
                   echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
             - name: Build happy-cli
+              # The complete CLI type graph exceeds Node 20's ~2 GB default heap
+              # (same reason as the job-level env in cli-smoke-test.yml); the
+              # default-heap runner OOM'd in `tsc --noEmit` for 1.1.10-aplus.425.
+              env:
+                  NODE_OPTIONS: --max-old-space-size=4096
               run: |
                   PACKAGE_NAME="$(node -p "require('./packages/happy-cli/package.json').name")"
                   pnpm --filter "$PACKAGE_NAME" build
