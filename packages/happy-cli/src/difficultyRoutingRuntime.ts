@@ -759,6 +759,11 @@ function catalogRouteForModel(
   if (match) return match
   for (const entry of KNOWN_ROUTE_TIERS) {
     if (entry.agent !== agent || entry.model !== model) continue
+    // The same escalated exception for a model a previous table shared across tiers (gpt-6.1-sol).
+    if (match && (entry.tier === 'escalated') !== (match.tier === 'escalated')) {
+      if (entry.tier !== 'escalated') match = { tier: entry.tier, pair: { model: entry.model, effort: entry.effort } }
+      continue
+    }
     if (!match || tierRank(entry.tier) > tierRank(match.tier)) {
       match = { tier: entry.tier, pair: { model: entry.model, effort: entry.effort } }
     }

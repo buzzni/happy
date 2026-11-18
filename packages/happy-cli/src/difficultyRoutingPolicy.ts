@@ -22,6 +22,10 @@
 // 거절한다. 내장 2.1.308 은 카탈로그에 5.2 가 없어 `unrecognized_model` 경고를 남기지만 실행한다
 // (2026-11-10 실측: 응답 모델 claude-fable-5-2, context 1M · max output 128k 로 카탈로그에 5.2 가
 // 있는 2.1.322 와 같다). 카탈로그 항목은 SDK 0.3.321(Claude Code 2.1.321)부터 들어 있다.
+// 2026-11-18: Desktop·모바일과 같이 codex routine/hard/escalated 를 gpt-6.2-sol 의
+// low/high/xhigh 로 옮긴다. 옛 gpt-6.1-sol 쌍은 계속 인식한다. Codex 0.166.0 미만은
+// ChatGPT 계정에서 이 모델을 거절한다(2026-11-18 실측: 0.165.0 거절, 0.166.0 성공).
+// 6.2 를 아직 허용하지 않은 조직은 sameTierRoutePairs 로 같은 등급의 6.1 쌍을 쓴다.
 
 export type RoutableAgent = 'claude' | 'codex'
 export type Difficulty = 'trivial' | 'routine' | 'hard' | 'escalated'
@@ -49,9 +53,9 @@ export const USER_REQUEST_MODELS: Record<RoutableAgent, Record<Difficulty, Route
   },
   codex: {
     trivial: { model: 'gpt-6-luna', effort: 'low' },
-    routine: { model: 'gpt-6.1-sol', effort: 'low' },
-    hard: { model: 'gpt-6.1-sol', effort: 'high' },
-    escalated: { model: 'gpt-6.1-sol', effort: 'xhigh' },
+    routine: { model: 'gpt-6.2-sol', effort: 'low' },
+    hard: { model: 'gpt-6.2-sol', effort: 'high' },
+    escalated: { model: 'gpt-6.2-sol', effort: 'xhigh' },
   },
 }
 
