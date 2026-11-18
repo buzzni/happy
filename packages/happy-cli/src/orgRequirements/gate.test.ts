@@ -195,6 +195,24 @@ describe('organization requirements session gate', () => {
             expect(gate.restrictsModels()).toBe(true);
         });
 
+        it('runs a routed pick outside the set on an allowed pair of the same tier, effort included', () => {
+            const gate = make('codex');
+            gate.onRequirements({ kind: 'response', status: 'ok', requirements: doc(MODELS) });
+            expect(gate.checkTurn({ permissionMode: 'default', model: 'gpt-6.2-sol', effort: 'xhigh', modelOrigin: 'auto' }))
+                .toMatchObject({ kind: 'run', substituteModel: 'gpt-6.1-sol', substituteEffort: 'xhigh' });
+            const policyDefault = gate.checkTurn({ permissionMode: 'default', model: 'gpt-6.2-sol', effort: 'xhigh', modelOrigin: 'resume' });
+            expect(policyDefault).toMatchObject({ kind: 'run', substituteModel: 'gpt-6.1-sol' });
+            expect(policyDefault).not.toHaveProperty('substituteEffort');
+        });
+
+        it('applies the daemon route, an allowed pair of its tier, or nothing', () => {
+            const gate = make('codex');
+            gate.onRequirements({ kind: 'response', status: 'ok', requirements: doc(MODELS) });
+            expect(gate.allowedRoute({ model: 'gpt-6.1-sol', effort: 'low' })).toEqual({ model: 'gpt-6.1-sol', effort: 'low' });
+            expect(gate.allowedRoute({ model: 'gpt-6.2-sol', effort: 'high' })).toEqual({ model: 'gpt-6.1-sol', effort: 'high' });
+            expect(gate.allowedRoute({ model: 'gpt-6-luna', effort: 'low' })).toBeNull();
+        });
+
         it('reads a policy saved before Fable 5.2 as allowing its successor', () => {
             const gate = make();
             const legacy = { 'ai.models': { kind: 'allowedSet', values: ['claude:claude-opus-5-5', 'claude:claude-fable-5-1'], default: 'claude:claude-fable-5-1', source: 'organization' } };

@@ -2588,6 +2588,7 @@ export async function runCodex(opts: {
                     const org = orgGate.checkTurn({
                         permissionMode: message.mode.permissionMode,
                         model: message.mode.model ?? null,
+                        effort: message.mode.effort ?? null,
                         modelOrigin: message.mode.orgModelOrigin ?? (message.mode.model ? 'explicit' : 'none'),
                     });
                     if (org.kind === 'refuse') {
@@ -2609,7 +2610,10 @@ export async function runCodex(opts: {
                         message.mode = {
                             ...message.mode,
                             permissionMode: org.permissionMode as PermissionMode,
-                            ...(org.substituteModel ? { model: org.substituteModel, effort: undefined } : {}),
+                            ...(org.substituteModel ? {
+                                model: org.substituteModel,
+                                effort: isSupportedCodexReasoningEffort(org.substituteEffort) ? org.substituteEffort : undefined,
+                            } : {}),
                         };
                     }
                 }
@@ -2946,8 +2950,8 @@ export async function runCodex(opts: {
                      * cancelled mid-flight still ran on this model.
                      */
                     const committedRoute = difficultyRoutingCommitter.commitApplied(message.requestIds, codexTurnId!);
-                    // A routed model the organization does not allow is not applied: the checked model runs.
-                    const appliedRoute = committedRoute && orgGate && !orgGate.modelAllowed(committedRoute.model) ? null : committedRoute;
+                    // A routed model the organization does not allow runs as an allowed pair of its tier, else the checked model runs.
+                    const appliedRoute = committedRoute && orgGate ? orgGate.allowedRoute(committedRoute) : committedRoute;
                     routingApplied = true;
                     latency?.submitted();
                     const memoryIngest = reserveCompletedTurnIngest(activeThreadId);

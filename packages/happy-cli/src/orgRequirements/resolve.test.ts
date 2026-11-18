@@ -60,10 +60,22 @@ describe('judgeModel (shared case table: modelJudgment)', () => {
     for (const entry of cases.modelJudgment.cases) {
         it(entry.name, () => {
             const allowed = entry.allowed ? { kind: 'allowedSet' as const, values: entry.allowed.values, default: entry.allowed.default, source: 'organization' as const } : null;
-            const verdict = judgeModel({ agent: entry.agent as OrgAgent, model: entry.model, origin: entry.origin as ModelOrigin, allowed });
+            const verdict = judgeModel({ agent: entry.agent as OrgAgent, model: entry.model, effort: (entry as { effort?: string }).effort, origin: entry.origin as ModelOrigin, allowed });
             expect(verdict).toMatchObject(entry.expect);
         });
     }
+
+    it('leaves the effort to the substituted model when no pair of the routed tier is allowed (R10.2a)', () => {
+        const allowed = { kind: 'allowedSet' as const, values: ['codex:gpt-5.5'], default: 'codex:gpt-5.5', source: 'organization' as const };
+        const verdict = judgeModel({ agent: 'codex', model: 'gpt-6.2-sol', effort: 'high', origin: 'auto', allowed });
+        expect(verdict).toEqual({ kind: 'substitute', model: 'gpt-5.5', key: 'codex:gpt-5.5' });
+    });
+
+    it('keeps resumed models on the policy default even when a same-tier pair is allowed', () => {
+        const allowed = { kind: 'allowedSet' as const, values: ['codex:gpt-5.5', 'codex:gpt-6.1-sol'], default: 'codex:gpt-5.5', source: 'organization' as const };
+        expect(judgeModel({ agent: 'codex', model: 'gpt-6.2-sol', effort: 'high', origin: 'resume', allowed }))
+            .toEqual({ kind: 'substitute', model: 'gpt-5.5', key: 'codex:gpt-5.5' });
+    });
 });
 
 describe('messageModelOrigin', () => {

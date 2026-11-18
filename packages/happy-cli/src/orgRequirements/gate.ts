@@ -28,6 +28,7 @@ import { isToolPolicyEnabled } from '@/toolPolicy/claudeHook';
 import { createOrgRequirementsAuditLog, type OrgRequirementsAuditRecord } from './audit';
 import {
     clampPermissionMode,
+    allowedSameTierRoute,
     currentAllowedModels,
     judgeModel,
     normalizeModelSelection,
@@ -98,6 +99,8 @@ export interface OrgTurnInput {
     /** The model asked for, before any runtime substitution (Z.AI); `undefined`/`null`: none named. */
     model: string | null | undefined;
     modelOrigin: ModelOrigin;
+    /** The effort asked for with `model`: a router's pick is a model and effort pair (`allowedSameTierRoute`). */
+    effort?: string | null;
     fallbackModel?: string | null;
     /** False for a runtime with no ceiling or tool-rule enforcement (Gemini, ACP agents — R10.7). */
     enforcesCeilingAndTools?: boolean;
@@ -109,8 +112,10 @@ export type OrgTurnVerdict =
         kind: 'run';
         permissionMode: string;
         modeClamped: boolean;
-        /** Run this model id instead, with that model's default effort (R10.2a). */
+        /** Run this model id instead, with that model's default effort (R10.2a) unless `substituteEffort` says otherwise. */
         substituteModel?: string;
+        /** The effort of the same-tier routed pair `substituteModel` comes from. */
+        substituteEffort?: string;
         /** `fallbackModel` is outside the set: leave it out (the turn still runs). */
         dropFallbackModel: boolean;
     };
@@ -132,6 +137,8 @@ export interface OrgRequirementsGate {
     restrictsModels(): boolean;
     /** A model chosen for the turn after it was checked (auto-routing's floor): allowed as an explicit choice? */
     modelAllowed(model: string): boolean;
+    /** A route the daemon chose after the check: itself when allowed, else an allowed pair of its tier, else null. */
+    allowedRoute(route: { model: string; effort: string | null }): { model: string; effort: string | null } | null;
     toolRules(): OrgToolRules | null;
     /** Tool globs of `blocked` rules naming no target or action: blocked whatever the call says (R10.2, R10.3). */
     blockedTools(): string[];
@@ -314,7 +321,7 @@ export function createOrgRequirementsGate(options: {
             }
 
             const allowed = aiModels();
-            const judgment = judgeModel({ agent, model: input.model, origin: input.modelOrigin, allowed });
+            const judgment = judgeModel({ agent, model: input.model, effort: input.effort, origin: input.modelOrigin, allowed });
             if (judgment.kind === 'deny') return refuse(judgment.reason, 'ai.models', input.model ?? null);
             if (judgment.kind === 'substitute') enforce('ai.models', input.model ?? null, judgment.model, 'requirement_model_substituted', true);
 
@@ -335,6 +342,7 @@ export function createOrgRequirementsGate(options: {
                 permissionMode: clamp.mode,
                 modeClamped: clamp.clamped,
                 ...(judgment.kind === 'substitute' ? { substituteModel: judgment.model } : {}),
+                ...(judgment.kind === 'substitute' && judgment.effort ? { substituteEffort: judgment.effort } : {}),
                 dropFallbackModel,
             };
         },
@@ -375,6 +383,11 @@ export function createOrgRequirementsGate(options: {
         },
         restrictsModels: () => aiModels() !== null,
         modelAllowed: (model) => judgeModel({ agent, model, origin: 'explicit', allowed: aiModels() }).kind === 'allow',
+        allowedRoute: (route) => {
+            const allowed = aiModels();
+            if (judgeModel({ agent, model: route.model, origin: 'explicit', allowed }).kind === 'allow') return route;
+            return allowed ? allowedSameTierRoute(agent, route, allowed) : null;
+        },
         blockedTools: () => blanketBlocks().map((rule) => rule.tool),
         toolRules: () => {
             const current = document();

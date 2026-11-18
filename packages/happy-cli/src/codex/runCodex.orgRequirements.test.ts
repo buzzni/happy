@@ -295,6 +295,17 @@ describe('the real Codex consumer loop under organization requirements', () => {
         expect(events().some((ev) => ev?.t === 'turn-end' && ev.status === 'failed')).toBe(false);
     }, 60_000);
 
+    it('runs a routed pair outside the set on an allowed pair of the same tier, keeping its effort', async () => {
+        stubRequirements({ 'ai.models': { kind: 'allowedSet', values: ['codex:gpt-5.5', 'codex:gpt-6.1-sol'], default: 'codex:gpt-5.5', source: 'organization' } });
+        await run(async () => {
+            const queue = queues[0]!;
+            queue.pushIsolated('routed hard', { permissionMode: 'yolo', model: 'gpt-6.2-sol', effort: 'high', orgModelOrigin: 'auto' } as never);
+            queue.close();
+        });
+        expect(turnsSent).toHaveLength(1);
+        expect(turnsSent[0].options).toMatchObject({ model: 'gpt-6.1-sol', effort: 'high' });
+    }, 60_000);
+
     it('ends a run-once automation whose only turn the organization refuses', async () => {
         stubRequirements({ 'ai.models': { kind: 'allowedSet', values: ['codex:gpt-6.1-sol'], default: null, source: 'organization' } });
         vi.stubEnv('HAPPY_AUTOMATION_RUN_ONCE', '1');

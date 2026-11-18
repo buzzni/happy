@@ -15,6 +15,7 @@ import {
     type OrgToolRuleV1,
 } from '@slopus/happy-wire';
 import { migrateRetiredClaudeModel, migrateRetiredSelectionKey } from '@/utils/retiredClaudeModels';
+import { KNOWN_ROUTE_TIERS, isRoutableAgent, tierForKnownRoutePair } from '@/difficultyRoutingPolicy';
 
 /** `acp`: an ACP agent Studio has no key for, so a restriction never allows it. */
 export type OrgAgent = 'claude' | 'codex' | 'gemini' | 'grok' | 'openclaw' | 'opencode' | 'acp';
@@ -236,16 +237,37 @@ export interface OrgModelRequest {
 
 export type ModelJudgment =
     | { kind: 'allow' }
-    /** Run this model id (the key after its agent prefix) with the model's default effort. */
-    | { kind: 'substitute'; model: string; key: string }
+    /** Run this model id (the key after its agent prefix) with `effort` when given, else the model's default effort. */
+    | { kind: 'substitute'; model: string; key: string; effort?: string }
     | { kind: 'deny'; reason: 'requirement_model_denied' | 'requirement_model_unknown'; key: string | null };
+
+/**
+ * A routed pair the set does not allow, run as an allowed pair of the same routing tier (newest table first).
+ * A router's table moves to a new model before an organization can allow it; without this the turn would
+ * lose its tier to the policy default. Null: not a known routed pair, or no pair of its tier is allowed.
+ */
+export function allowedSameTierRoute(
+    agent: OrgAgent,
+    route: { model: string; effort: string | null | undefined },
+    allowed: OrgAiModelsItem,
+): { model: string; effort: string } | null {
+    if (!isRoutableAgent(agent)) return null;
+    const tier = tierForKnownRoutePair(agent, route.model, route.effort);
+    if (!tier) return null;
+    const values = currentAllowedModels(allowed).values;
+    const pair = [...KNOWN_ROUTE_TIERS].reverse().find((entry) => (
+        entry.agent === agent && entry.tier === tier && values.includes(normalizeModelSelection(agent, entry.model) ?? '')
+    ));
+    return pair ? { model: pair.model, effort: pair.effort } : null;
+}
 
 /**
  * spec R10.2: an explicit model outside the set is refused, never swapped. R10.2a: nothing chosen, or a
  * model carried over from an earlier process, runs on the policy default of the same agent or that
- * agent's first allowed model; with none the turn is refused.
+ * agent's first allowed model; with none the turn is refused. A router's pick first tries an allowed
+ * pair of its own routing tier (`allowedSameTierRoute`).
  */
-export function judgeModel(input: { agent: OrgAgent; model: string | null | undefined; origin: ModelOrigin; allowed: OrgAiModelsItem | null }): ModelJudgment {
+export function judgeModel(input: { agent: OrgAgent; model: string | null | undefined; effort?: string | null; origin: ModelOrigin; allowed: OrgAiModelsItem | null }): ModelJudgment {
     const { agent } = input;
     if (!input.allowed) return { kind: 'allow' };
     const allowed = currentAllowedModels(input.allowed);
@@ -253,6 +275,8 @@ export function judgeModel(input: { agent: OrgAgent; model: string | null | unde
     if (key !== null && allowed.values.includes(key)) return { kind: 'allow' };
     if (key === 'unknown' && input.origin === 'explicit') return { kind: 'deny', reason: 'requirement_model_unknown', key: null };
     if (key !== null && input.origin === 'explicit') return { kind: 'deny', reason: 'requirement_model_denied', key };
+    const routed = input.origin === 'auto' && input.model ? allowedSameTierRoute(agent, { model: input.model, effort: input.effort }, allowed) : null;
+    if (routed) return { kind: 'substitute', model: routed.model, key: `${agent}:${routed.model}`, effort: routed.effort };
     // Studio has no key for an agent it does not list, and a wildcard agent outside the set has no model to swap in.
     if (WILDCARD_AGENTS.has(agent)) return { kind: 'deny', reason: 'requirement_model_denied', key };
     const prefix = `${agent}:`;
