@@ -1902,7 +1902,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         const switched = await setupTokenSwitching.switchIfWanted();
                         if (!dispatchedTurnAnswered && switched.switched && switched.continueAfter && !lastTurnChannel && !controller.signal.aborted) continuation = mode ?? lastTurnMode;
                         // The provider exited because the account refused, not because Claude Code could not start here.
-                        launchFailure = switched.switched ? null : describeCheckpointFailure(e) ?? refusalNotice;
+                        // An answered turn already closed; the switch's own notice says why later turns may fail.
+                        launchFailure = switched.switched ? null : describeCheckpointFailure(e) ?? (dispatchedTurnAnswered ? null : refusalNotice);
                     } else launchFailure = describeCheckpointFailure(e) ?? describeClaudeLaunchFailure(e);
                     continue;
                 }
