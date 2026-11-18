@@ -1897,9 +1897,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             if (!lastTurnChannel) messageQueue.enqueue({ __inputContinuation: 'claude-account-switch' });
                             lastResultSucceeded = false;
                         }
+                        // Read before the switch: a stop meanwhile forgets why the account refused.
+                        const refusalNotice = setupTokenSwitching.refusalNotice();
                         const switched = await setupTokenSwitching.switchIfWanted();
                         if (!dispatchedTurnAnswered && switched.switched && switched.continueAfter && !lastTurnChannel && !controller.signal.aborted) continuation = mode ?? lastTurnMode;
-                        launchFailure = switched.switched ? null : describeCheckpointFailure(e) ?? describeClaudeLaunchFailure(e);
+                        // The provider exited because the account refused, not because Claude Code could not start here.
+                        // An answered turn already closed; the switch's own notice says why later turns may fail.
+                        launchFailure = switched.switched ? null : describeCheckpointFailure(e) ?? (dispatchedTurnAnswered ? null : refusalNotice);
                     } else launchFailure = describeCheckpointFailure(e) ?? describeClaudeLaunchFailure(e);
                     continue;
                 }

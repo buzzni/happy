@@ -15,7 +15,7 @@ import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
 import { requestSetupTokenCapacity, requestSetupTokenStart, requestSetupTokenRebind, reportSetupTokenActivity, reportSetupTokenUsage, requestSetupTokenAvailability, returnFromPersonalClaude } from '@/daemon/controlClient';
 import { wrapClientTurnPrompt } from '@slopus/happy-wire';
-import { APPLY_REQUIRED_NOTICE, CONTINUE_PROMPT, RESUME_REBOUND_NOTICE, START_BUDGET_SWITCHED_NOTICE, SWITCHED_NOTICE } from './setupTokenAccountSwitching';
+import { APPLY_REQUIRED_NOTICE, CONTINUE_PROMPT, RESUME_REBOUND_NOTICE, START_BUDGET_SWITCHED_NOTICE, SWITCHED_NOTICE, USAGE_LIMIT_STOPPED_NOTICE } from './setupTokenAccountSwitching';
 import { PERSONAL_RECHECK_NOTICE } from './personalClaudeFallback';
 import { claudeCheckSession } from './utils/claudeCheckSession';
 import { CAPACITY_RESTART_NOTICE, describeClaudeLaunchFailure } from './utils/launchFailureMessage';
@@ -1004,6 +1004,92 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             await vi.waitFor(() => expect(client.failClaudeLaunchTurn).toHaveBeenCalledTimes(1));
             expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1);
             expect(query).toHaveBeenCalledTimes(1);
+        } finally { await handlers.get('switch')?.(); await launched; }
+    });
+
+    // prod 2026-11-18: the org account hit its usage limit, no other account had quota, and the turn closed with
+    // "Claude Code could not start on this machine" — which reads as a broken PC.
+    it('closes a refused turn with the usage-limit notice, not the launch failure, when no account is left', async () => {
+        vi.mocked(requestSetupTokenRebind).mockResolvedValueOnce({ ok: false, reason: 'NO_ACCOUNT' });
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const client = {
+            sessionId: 'happy-session-1',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+            failClaudeLaunchTurn: vi.fn(),
+        };
+        const exit = new Error('Claude Code process exited with code 1');
+        vi.mocked(query).mockImplementation(({ prompt }) => Object.assign((async function* () {
+            yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+            for await (const _message of prompt as AsyncIterable<SDKUserMessage>) {
+                yield refused;
+                throw exit;
+            }
+        })(), { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>);
+        queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 }, cancelLessonReview: vi.fn(),
+            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
+        };
+        const launched = claudeRemoteLauncher(session as unknown as Session);
+        try {
+            await vi.waitFor(() => expect(client.failClaudeLaunchTurn).toHaveBeenCalledTimes(1));
+            const errors = client.sendSessionEvent.mock.calls.map(([event]) => event).filter(event => event.isError);
+            expect(errors).toEqual([{ type: 'message', message: USAGE_LIMIT_STOPPED_NOTICE, isError: true }]);
+            expect(errors[0].message).not.toBe(describeClaudeLaunchFailure(exit));
+        } finally { await handlers.get('switch')?.(); await launched; }
+    });
+
+    // PR #1288 review: with no account left, an answered turn must not gain a second, failed turn saying the request stopped.
+    it('does not close an answered turn as stopped when the refusal finds no other account', async () => {
+        vi.mocked(requestSetupTokenRebind).mockResolvedValueOnce({ ok: false, reason: 'NO_ACCOUNT' });
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const client = {
+            sessionId: 'happy-session-1',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+            failClaudeLaunchTurn: vi.fn(),
+        };
+        const generations: Array<{ prompts: string[] }> = [];
+        vi.mocked(query).mockImplementation(({ prompt }) => {
+            const generation = { prompts: [] as string[] };
+            generations.push(generation);
+            const first = generations.length === 1;
+            return Object.assign((async function* () {
+                yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+                for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                    generation.prompts.push(JSON.stringify(message.message.content));
+                    yield assistant(`msg-${generations.length}`);
+                    if (first) yield refused;
+                    yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: `result-${generations.length}` };
+                    if (first) throw new Error('Claude Code process exited with code 1');
+                }
+            })(), { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+        });
+        queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 }, cancelLessonReview: vi.fn(),
+            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
+        };
+        const launched = claudeRemoteLauncher(session as unknown as Session);
+        try {
+            await vi.waitFor(() => expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1));
+            queue.push('next', { permissionMode: 'default', model: 'claude-sonnet-5' });
+            await vi.waitFor(() => expect(generations[1]?.prompts.join('\n')).toContain('next'));
+            expect(client.failClaudeLaunchTurn).not.toHaveBeenCalled();
+            expect(client.sendSessionEvent.mock.calls.map(([event]) => event).filter(event => event.isError)).toEqual([]);
         } finally { await handlers.get('switch')?.(); await launched; }
     });
 

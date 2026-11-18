@@ -50,6 +50,9 @@ export const FORBIDDEN_NOTICE = 'Saycode can no longer manage this session\'s or
 /** Saycode specs/managed-account-session-continuation — the account this conversation ran on left the PC; it resumed on another. */
 export const RESUME_REBOUND_NOTICE = 'The organization Claude account this conversation used is no longer assigned to this PC, so it continues on another organization account.'
 export const START_BUDGET_SWITCHED_NOTICE = '계정의 작업 시작 한도에 도달해 여유가 있는 다른 조직 계정으로 옮겨 바로 실행합니다.'
+/** Closes a refused turn no switch rescued: why it stopped, whatever the switch attempt has told meanwhile. */
+export const USAGE_LIMIT_STOPPED_NOTICE = '조직 Claude 계정이 사용 한도에 도달해 이번 요청이 중단되었습니다. 이 PC의 문제가 아닙니다.'
+export const AUTHENTICATION_STOPPED_NOTICE = '조직 Claude 계정 인증에 실패해 이번 요청이 중단되었습니다.'
 export const CHOSEN_ACCOUNT_NOTICE = 'The session moved to the organization Claude account the member chose.'
 export const CONTINUE_PROMPT ='The previous request stopped because the organization Claude account was unavailable. The session now uses another account — continue from where you stopped.'
 
@@ -323,6 +326,8 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
     cancelBackground() { userEpoch++; refused = false; endBackground() },
     userTurnStarted() { if (paused) cancellation = new AbortController(); paused = false; userEpoch++; refused = false; lastFailure = null; endBackground() },
     hasAccountRefusal() { return refused && !paused && !disposed },
+    /** Why the refused turn stopped: an authentication failure, or else a provider usage-limit refusal. */
+    refusalNotice: () => authenticationFailed ? AUTHENTICATION_STOPPED_NOTICE : USAGE_LIMIT_STOPPED_NOTICE,
     cancelForStop() { cancellation.abort(); paused = true; cancelEpoch++; userEpoch++; wanted = false; refused = false; authenticationFailed = false; lastFailure = null; latestObservation = undefined; retryDeadline = null; endBackground() },
     /** The session ended: terminal, including for an attempt still in flight. */
     dispose() {
