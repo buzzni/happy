@@ -15,7 +15,7 @@ import {
     type OrgToolRuleV1,
 } from '@slopus/happy-wire';
 import { migrateRetiredClaudeModel, migrateRetiredSelectionKey } from '@/utils/retiredClaudeModels';
-import { KNOWN_ROUTE_TIERS, isRoutableAgent, tierForKnownRoutePair } from '@/difficultyRoutingPolicy';
+import { isRoutableAgent, sameTierRoutePairs } from '@/difficultyRoutingPolicy';
 
 /** `acp`: an ACP agent Studio has no key for, so a restriction never allows it. */
 export type OrgAgent = 'claude' | 'codex' | 'gemini' | 'grok' | 'openclaw' | 'opencode' | 'acp';
@@ -252,13 +252,9 @@ export function allowedSameTierRoute(
     allowed: OrgAiModelsItem,
 ): { model: string; effort: string } | null {
     if (!isRoutableAgent(agent)) return null;
-    const tier = tierForKnownRoutePair(agent, route.model, route.effort);
-    if (!tier) return null;
     const values = currentAllowedModels(allowed).values;
-    const pair = [...KNOWN_ROUTE_TIERS].reverse().find((entry) => (
-        entry.agent === agent && entry.tier === tier && values.includes(normalizeModelSelection(agent, entry.model) ?? '')
-    ));
-    return pair ? { model: pair.model, effort: pair.effort } : null;
+    return sameTierRoutePairs(agent, route.model, route.effort)
+        .find((pair) => values.includes(normalizeModelSelection(agent, pair.model) ?? '')) ?? null;
 }
 
 /**

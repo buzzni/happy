@@ -145,6 +145,24 @@ export function tierForKnownRoutePair(
   ))?.tier ?? null
 }
 
+/**
+ * Every known pair of the tier a routed pair means, later rows (newer tables) first; empty for an
+ * unknown pair. A router's table can move to a model a policy does not allow yet; a caller picks the
+ * first of these it allows instead of dropping the tier.
+ */
+export function sameTierRoutePairs(
+  agent: RoutableAgent,
+  model: string | undefined,
+  effort: string | null | undefined,
+): RouteDecision[] {
+  const tier = tierForKnownRoutePair(agent, model, effort)
+  if (!tier) return []
+  return KNOWN_ROUTE_TIERS
+    .filter((entry) => entry.agent === agent && entry.tier === tier)
+    .reverse()
+    .map((entry) => ({ model: entry.model, effort: entry.effort }))
+}
+
 /** Whether this build recognises the pair at all, in either generation. */
 export function isKnownRoutePair(
   agent: RoutableAgent,
