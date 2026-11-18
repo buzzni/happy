@@ -37,6 +37,7 @@ import { SDKToLogConverter } from "./utils/sdkToLogConverter";
 import { EnhancedMode } from "./loop";
 import { orgRefusalTranscriptRecord } from "./claudeOrgRequirements";
 import { RawJSONLines } from "@/claude/types";
+import { parseCompact } from "@/parsers/specialCommands";
 import { OutgoingMessageQueue } from "./utils/OutgoingMessageQueue";
 import { installChannelPermissionWiring } from '@/channel/channelPermissionWiring';
 import {
@@ -376,7 +377,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         continueInputEvidence: kind => session.client.continueClaudeInputEvidence?.(kind),
         sendFinalAnswerForChannelTurn: (text) => session.client.sendFinalAnswerForChannelTurn(text),
         sendStructuredOutput: (envelope) => session.client.sendStructuredOutput(envelope),
-        closeClaudeSessionTurn: (status) => session.client.closeClaudeSessionTurn(status),
+        closeClaudeSessionTurn: (status, ...options) => session.client.closeClaudeSessionTurn(status, ...options),
         // The dispatcher carries ordinary log messages as `unknown` because it also carries the
         // markers; the client's own signature is the narrower one.
         sendClaudeSessionMessage: (logMessage) =>
@@ -497,6 +498,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     /** Whether the last turn was a slash command: a note in its place would not re-run it. */
     let lastTurnCommand = false;
     const isCommandText = (content: unknown) => typeof content === 'string' && /^\/\S/.test(content.trimStart());
+    /** Whether the last turn was `/compact`: the SDK answers it with no message that opens a turn. */
+    let lastTurnCompact = false;
     let ongoingToolCalls = new Map<string, { parentToolCallId: string | null }>();
     let notifiedQuestionToolCalls = new Set<string>();
 
@@ -1305,6 +1308,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             session.turnAttendance?.startTurn({ allUnattended: p.allUnattended, channel: p.channelRequestId !== undefined });
                             lastTurnChannel = Boolean(p.channelRequestId);
                             lastTurnCommand = isCommandText(p.message);
+                            lastTurnCompact = parseCompact(p.message).isCompact;
                             if (!p.continuation) session.client.inputEvidence?.cancelContinuation('replaced');
                             transientRetry.userTurnStarted();
                             // This message starts the new provider. Seed its comparison
@@ -1458,6 +1462,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             const inherited = session.client.inputEvidence?.takeContinuation();
                             lastTurnChannel = false;
                             lastTurnCommand = false;
+                            lastTurnCompact = false;
                             // The failed turn again keeps its attendance and its spent wait budget (R10a, Q6).
                             // The failed turn's own settings, unchanged — no provider restart.
                             mode = due.mode.mode;
@@ -1653,6 +1658,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             session.turnAttendance?.startTurn({ allUnattended: msg.allUnattended, channel: msg.channelRequestId !== undefined });
                             lastTurnChannel = Boolean(msg.channelRequestId);
                             lastTurnCommand = isCommandText(msg.message);
+                            lastTurnCompact = parseCompact(msg.message).isCompact;
                             permissionHandler.handleModeChange(mode.permissionMode);
                             if (orgClamped) permissionHandler.applyModeToRunningQuery(mode.permissionMode);
                             const latency = toTurnLatency(msg);
@@ -1809,7 +1815,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         if (retry?.kind === 'scheduled' || accountRetry) messageQueue.enqueue({
                             __inputContinuation: accountRetry ? 'claude-account-switch' : 'claude-transient',
                         });
-                        messageQueue.enqueue(turnEndItem(lastResultSucceeded ? 'completed' : 'failed'));
+                        messageQueue.enqueue(turnEndItem(lastResultSucceeded ? 'completed' : 'failed', lastTurnCompact));
                         if (retry) {
                             const notice = retry.kind === 'scheduled'
                                 ? `Temporary API error${retry.state.status === null ? '' : ` (${retry.state.status})`} — retrying automatically in ${Math.round((retry.state.retryAt - retry.state.scheduledAt) / 1000)}s (${retry.state.attempt}/${retry.state.maxAttempts}). Send a message or stop to cancel.`
