@@ -1938,10 +1938,10 @@ export class ApiSessionClient extends EventEmitter {
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes);
     }
 
-    closeClaudeSessionTurn(status: SessionTurnEndStatus = 'completed') {
+    closeClaudeSessionTurn(status: SessionTurnEndStatus = 'completed', options?: { opensTurn: true }) {
         void this.reconcileClaudeTranscriptUsage();
         this.claudeStreamedUsage.drain(false);
-        const mapped = closeClaudeTurnWithStatus(this.claudeSessionProtocolState, status);
+        const mapped = closeClaudeTurnWithStatus(this.claudeSessionProtocolState, status, options?.opensTurn);
         this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
         if (!mapped.envelopes.length) this.inputEvidence.setPending(null);
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes);
