@@ -1425,7 +1425,7 @@ export function previewRoutes(app: Fastify) {
                 let responseBody: Buffer = Buffer.from(rpcResponse.bodyB64, 'base64');
 
                 if (contentType.includes('text/html')) {
-                    responseBody = Buffer.from(rewriteHtml(responseBody.toString('utf-8'), prefix), 'utf-8');
+                    responseBody = Buffer.from(rewriteHtml(responseBody.toString('utf-8'), prefix, upstreamPath), 'utf-8');
                 } else if (
                     contentType.includes('javascript') ||
                     contentType.includes('typescript') ||

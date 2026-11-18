@@ -203,7 +203,19 @@ export function rewriteViteClientForPath(
     );
 }
 
-export function rewriteHtml(html: string, prefix: string): string {
+// A requested .html file resolves its relative URLs against its own
+// directory (e.g. an embedded editor's inner iframe page loading
+// `../../lib/x.js`). Extensionless paths are SPA routes served by the index
+// fallback, whose relative assets live at the app root. The relay passes a
+// percent-decoded path, so each segment is re-encoded: that keeps a `#`/`?`/`%`
+// in a directory name inside the path and keeps quotes out of the attribute.
+function documentBaseHref(prefix: string, documentPath: string): string {
+    const pathname = documentPath.split('?')[0];
+    const dir = /\.html?$/i.test(pathname) ? pathname.slice(0, pathname.lastIndexOf('/') + 1) : '/';
+    return prefix + dir.split('/').map(encodeURIComponent).join('/');
+}
+
+export function rewriteHtml(html: string, prefix: string, documentPath = '/'): string {
     const rep = makeReplacer(prefix);
     let out = html
         .replace(META_REFRESH, (match, head: string, path: string) => {
@@ -227,7 +239,7 @@ export function rewriteHtml(html: string, prefix: string): string {
   
     // <base> pins the document base URL so relative-path resources
     // (`<script src="app.js">`) survive the interceptor's history.replaceState.
-    const baseHref = `<base href="${prefix}/">`;
+    const baseHref = `<base href="${documentBaseHref(prefix, documentPath)}">`;
     // Inspector bridge — listen for `inspector-enable`/`inspector-disable`
     // postMessages from the studio parent window, render a hover overlay,
     // post `inspector-select` back on click. Cross-origin relay 케이스에서
