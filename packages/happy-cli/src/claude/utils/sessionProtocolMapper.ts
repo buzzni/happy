@@ -909,6 +909,9 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
     }
 
     if ((message as any).isCompactSummary) {
+        // A /compact turn answers with nothing but this summary (claudeRemote marks it). Open the
+        // turn without its text so the result closes it: no turn-end leaves clients "responding".
+        if (message.type === 'assistant') ensureTurn(state, envelopes);
         return {
             currentTurnId: state.currentTurnId,
             envelopes,

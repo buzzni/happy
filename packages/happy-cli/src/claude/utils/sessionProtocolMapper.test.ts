@@ -6,6 +6,7 @@ import {
     closeClaudeTurnWithStatus,
     failClaudeLaunchTurn,
     mapClaudeLogMessageToSessionEnvelopes,
+    type ClaudeSessionProtocolState,
 } from './sessionProtocolMapper';
 import { SDKToLogConverter } from './sdkToLogConverter';
 
@@ -794,6 +795,41 @@ describe('closeClaudeTurnWithStatus', () => {
         expect(result.currentTurnId).toBeNull();
         expect(result.envelopes).toHaveLength(1);
         expect(result.envelopes[0].ev).toEqual({ t: 'turn-end', status: 'cancelled' });
+    });
+
+    // /compact 턴의 응답은 compact summary 하나뿐이다(claudeRemote 가 isCompactSummary 로 표시).
+    // 이 턴이 turn-end 없이 끝나면 데스크톱은 종료를 받지 못해 600s 무진행 상한까지 "응답 중"이다
+    // (2026-11-18 cmwija6rr1yieys2oeb3fondy, poll-stall-ceiling).
+    it('closes a /compact turn whose only output is the compact summary with a turn-end', () => {
+        const state: ClaudeSessionProtocolState = { currentTurnId: null };
+        const summary = mapClaudeLogMessageToSessionEnvelopes({
+            type: 'assistant',
+            uuid: 'compact-summary-1',
+            isCompactSummary: true,
+            message: {
+                role: 'assistant',
+                content: [{ type: 'text', text: 'Long compaction summary' }],
+            },
+        } as any, state);
+        state.currentTurnId = summary.currentTurnId;
+
+        const closed = closeClaudeTurnWithStatus(state, 'completed');
+
+        expect([...summary.envelopes, ...closed.envelopes].map((envelope) => envelope.ev.t)).toEqual(['turn-start', 'turn-end']);
+    });
+
+    // Claude Code 가 transcript 에 남기는 자체 요약은 user 줄이다. 기록 재생에서 이 줄이 턴을
+    // 열면 닫아 줄 result 가 없어 턴이 열린 채 남는다.
+    it('does not open a turn for a transcript compact summary user line', () => {
+        const result = mapClaudeLogMessageToSessionEnvelopes({
+            type: 'user',
+            uuid: 'compact-summary-2',
+            isCompactSummary: true,
+            message: { role: 'user', content: 'This session is being continued from a previous conversation.' },
+        } as any, { currentTurnId: null });
+
+        expect(result.currentTurnId).toBeNull();
+        expect(result.envelopes).toHaveLength(0);
     });
 });
 
