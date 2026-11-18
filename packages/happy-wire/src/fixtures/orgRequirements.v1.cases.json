@@ -1262,7 +1262,7 @@
     ]
   },
   "modelJudgment": {
-    "about": "spec R10.2 / R10.2a: what a turn runs under ai.models. origin explicit = chosen for this turn or by the spawn (a person or an automation picked it); resume = carried over from an earlier process (not chosen now); auto = picked by a router, not by the person (the client router's `modelSource: auto`, or the daemon's delegated difficulty routing), judged like resume; none = nothing chosen. allow runs the requested model unchanged; substitute runs the policy default of the same agent, else that agent's first allowed model, with the model's default effort; deny refuses the turn.",
+    "about": "spec R10.2 / R10.2a: what a turn runs under ai.models. origin explicit = chosen for this turn or by the spawn (a person or an automation picked it); resume = carried over from an earlier process (not chosen now); auto = picked by a router, not by the person (the client router's `modelSource: auto`, or the daemon's delegated difficulty routing), judged like resume except that a known routing pair (model + effort) outside the set first runs the newest allowed pair of the same routing tier, with that pair's effort; none = nothing chosen. allow runs the requested model unchanged; substitute runs the policy default of the same agent, else that agent's first allowed model, with the model's default effort; deny refuses the turn.",
     "cases": [
       {
         "name": "no ai.models item allows anything",
@@ -1433,6 +1433,60 @@
         },
         "expect": {
           "kind": "allow"
+        }
+      },
+      {
+        "name": "an Auto pick outside the set runs an allowed pair of the same routing tier, effort included",
+        "agent": "codex",
+        "model": "gpt-6.2-sol",
+        "effort": "high",
+        "origin": "auto",
+        "allowed": {
+          "values": [
+            "codex:gpt-5.5",
+            "codex:gpt-6.1-sol"
+          ],
+          "default": "codex:gpt-5.5"
+        },
+        "expect": {
+          "kind": "substitute",
+          "model": "gpt-6.1-sol",
+          "effort": "high"
+        }
+      },
+      {
+        "name": "an Auto escalated pick falls back to the newest allowed escalated pair",
+        "agent": "codex",
+        "model": "gpt-6.2-sol",
+        "effort": "xhigh",
+        "origin": "auto",
+        "allowed": {
+          "values": [
+            "codex:gpt-6-astra"
+          ],
+          "default": null
+        },
+        "expect": {
+          "kind": "substitute",
+          "model": "gpt-6-astra",
+          "effort": "medium"
+        }
+      },
+      {
+        "name": "an explicit pick outside the set is refused even when a same-tier pair is allowed",
+        "agent": "codex",
+        "model": "gpt-6.2-sol",
+        "effort": "high",
+        "origin": "explicit",
+        "allowed": {
+          "values": [
+            "codex:gpt-6.1-sol"
+          ],
+          "default": "codex:gpt-6.1-sol"
+        },
+        "expect": {
+          "kind": "deny",
+          "reason": "requirement_model_denied"
         }
       },
       {

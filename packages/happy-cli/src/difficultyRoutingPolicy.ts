@@ -22,6 +22,10 @@
 // 거절한다. 내장 2.1.308 은 카탈로그에 5.2 가 없어 `unrecognized_model` 경고를 남기지만 실행한다
 // (2026-11-10 실측: 응답 모델 claude-fable-5-2, context 1M · max output 128k 로 카탈로그에 5.2 가
 // 있는 2.1.322 와 같다). 카탈로그 항목은 SDK 0.3.321(Claude Code 2.1.321)부터 들어 있다.
+// 2026-11-18: Desktop·모바일과 같이 codex routine/hard/escalated 를 gpt-6.2-sol 의
+// low/high/xhigh 로 옮긴다. 옛 gpt-6.1-sol 쌍은 계속 인식한다. Codex 0.166.0 미만은
+// ChatGPT 계정에서 이 모델을 거절한다(2026-11-18 실측: 0.165.0 거절, 0.166.0 성공).
+// 6.2 를 아직 허용하지 않은 조직은 sameTierRoutePairs 로 같은 등급의 6.1 쌍을 쓴다.
 
 export type RoutableAgent = 'claude' | 'codex'
 export type Difficulty = 'trivial' | 'routine' | 'hard' | 'escalated'
@@ -49,9 +53,9 @@ export const USER_REQUEST_MODELS: Record<RoutableAgent, Record<Difficulty, Route
   },
   codex: {
     trivial: { model: 'gpt-6-luna', effort: 'low' },
-    routine: { model: 'gpt-6.1-sol', effort: 'low' },
-    hard: { model: 'gpt-6.1-sol', effort: 'high' },
-    escalated: { model: 'gpt-6.1-sol', effort: 'xhigh' },
+    routine: { model: 'gpt-6.2-sol', effort: 'low' },
+    hard: { model: 'gpt-6.2-sol', effort: 'high' },
+    escalated: { model: 'gpt-6.2-sol', effort: 'xhigh' },
   },
 }
 
@@ -122,6 +126,10 @@ export const KNOWN_ROUTE_TIERS: ReadonlyArray<{
   { agent: 'codex', model: 'gpt-6.1-sol', effort: 'low', tier: 'routine' },
   { agent: 'codex', model: 'gpt-6.1-sol', effort: 'high', tier: 'hard' },
   { agent: 'codex', model: 'gpt-6.1-sol', effort: 'xhigh', tier: 'escalated' },
+  // --- codex, 2026-11-18 table (Codex 0.166+). Same shape on gpt-6.2-sol. ---
+  { agent: 'codex', model: 'gpt-6.2-sol', effort: 'low', tier: 'routine' },
+  { agent: 'codex', model: 'gpt-6.2-sol', effort: 'high', tier: 'hard' },
+  { agent: 'codex', model: 'gpt-6.2-sol', effort: 'xhigh', tier: 'escalated' },
 ]
 
 /**
@@ -139,6 +147,27 @@ export function tierForKnownRoutePair(
   return KNOWN_ROUTE_TIERS.find((entry) => (
     entry.agent === agent && entry.model === model && entry.effort === effort
   ))?.tier ?? null
+}
+
+/**
+ * Every known pair of the tier a routed pair means: the pair itself, then the others later rows
+ * (newer tables) first; empty for an unknown pair. A router's table can move to a model a policy
+ * does not allow yet; a caller picks the first of these it allows instead of dropping the tier.
+ */
+export function sameTierRoutePairs(
+  agent: RoutableAgent,
+  model: string | undefined,
+  effort: string | null | undefined,
+): RouteDecision[] {
+  const tier = tierForKnownRoutePair(agent, model, effort)
+  if (!tier) return []
+  const requested = { model: model as string, effort: effort as string }
+  const others = KNOWN_ROUTE_TIERS
+    .filter((entry) => entry.agent === agent && entry.tier === tier
+      && !(entry.model === requested.model && entry.effort === requested.effort))
+    .reverse()
+    .map((entry) => ({ model: entry.model, effort: entry.effort }))
+  return [requested, ...others]
 }
 
 /** Whether this build recognises the pair at all, in either generation. */

@@ -19,9 +19,9 @@ describe('difficulty routing policy parity snapshot', () => {
       },
       codex: {
         trivial: { model: 'gpt-6-luna', effort: 'low' },
-        routine: { model: 'gpt-6.1-sol', effort: 'low' },
-        hard: { model: 'gpt-6.1-sol', effort: 'high' },
-        escalated: { model: 'gpt-6.1-sol', effort: 'xhigh' },
+        routine: { model: 'gpt-6.2-sol', effort: 'low' },
+        hard: { model: 'gpt-6.2-sol', effort: 'high' },
+        escalated: { model: 'gpt-6.2-sol', effort: 'xhigh' },
       },
     })
   })
@@ -39,6 +39,13 @@ describe('difficulty routing policy parity snapshot', () => {
     expect(tierForKnownRoutePair('codex', 'gpt-6.1-sol', 'high')).toBe('hard')
     expect(tierForKnownRoutePair('codex', 'gpt-6.1-sol', 'xhigh')).toBe('escalated')
     expect(tierForKnownRoutePair('claude', 'claude-sonnet-5-5', 'medium')).toBe('routine')
+  })
+
+  // A client on the GPT-6.2 table can reach this daemon before its own table moves.
+  it('tells gpt-6.2-sol routine, hard and escalated apart by effort alone', () => {
+    expect(tierForKnownRoutePair('codex', 'gpt-6.2-sol', 'low')).toBe('routine')
+    expect(tierForKnownRoutePair('codex', 'gpt-6.2-sol', 'high')).toBe('hard')
+    expect(tierForKnownRoutePair('codex', 'gpt-6.2-sol', 'xhigh')).toBe('escalated')
   })
 
   // Sessions mid-conversation carry a floor written under the previous table;
@@ -106,7 +113,7 @@ describe('difficulty routing policy parity snapshot', () => {
     expect(routed).toMatchObject({
       difficulty: 'hard',
       rawDifficulty: 'hard',
-      model: 'gpt-6.1-sol',
+      model: 'gpt-6.2-sol',
       effort: 'high',
     })
     expect(routed).not.toHaveProperty('source')
@@ -126,10 +133,10 @@ describe('difficulty routing policy parity snapshot', () => {
     })
   })
 
-  it('escalates a stuck codex hard session to gpt-6.1-sol xhigh', () => {
+  it('escalates a stuck codex hard session to gpt-6.2-sol xhigh', () => {
     const routed = routeSendModelOptionsWithDifficulty('codex', 'debug this deadlock', {}, 'hard', 'routine')
     expect(resolveEscalation('codex', 'debug this deadlock', routed, { hardTurns: 2 })).toMatchObject({
-      routed: { difficulty: 'escalated', model: 'gpt-6.1-sol', effort: 'xhigh' },
+      routed: { difficulty: 'escalated', model: 'gpt-6.2-sol', effort: 'xhigh' },
       stickyDifficulty: 'hard',
     })
   })
@@ -141,7 +148,7 @@ describe('difficulty routing policy parity snapshot', () => {
       stickyDifficulty: 'hard',
       routed: {
         difficulty: 'hard',
-        model: 'gpt-6.1-sol',
+        model: 'gpt-6.2-sol',
         effort: 'high',
       },
     })

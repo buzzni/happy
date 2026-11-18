@@ -17,6 +17,7 @@ import {
   tierForKnownRoutePair,
   resolveEscalation,
   routeSendModelOptionsWithDifficulty,
+  sameTierRoutePairs,
   shouldReusePreviousDifficultyForContinuation,
   type ClassifiableDifficulty,
   type Difficulty,
@@ -476,14 +477,14 @@ function buildDecision(args: {
   // The floor this turn would commit. The temporary escalation is dropped here —
   // it is a one-turn override, not a new floor — and a policy substitution is
   // taken at face value, because a floor the org forbids can never be run.
+  // A floor pair the org forbids keeps its tier on an allowed pair of that tier.
   const baseTier: Difficulty = allowed.substituted
     ? (routed.difficulty ?? escalated.stickyDifficulty ?? args.difficulty)
     : (escalated.stickyDifficulty ?? args.difficulty)
-  const base: RoutingRouteSnapshot = {
-    difficulty: baseTier,
-    model: allowed.substituted ? selectedModel : baseRoute.model!,
-    effort: allowed.substituted ? routed.effort ?? null : baseRoute.effort ?? null,
-  }
+  const basePair = allowed.substituted
+    ? { model: selectedModel, effort: routed.effort ?? null }
+    : allowedSameTierPair(input.agent, baseRoute, args.aiModelPolicy) ?? { model: baseRoute.model!, effort: baseRoute.effort ?? null }
+  const base: RoutingRouteSnapshot = { difficulty: baseTier, ...basePair }
 
   const temporaryEscalation = !allowed.substituted && escalated.routed.difficulty === 'escalated'
   const decisionReasons = resolveDecisionReasons({
@@ -758,6 +759,11 @@ function catalogRouteForModel(
   if (match) return match
   for (const entry of KNOWN_ROUTE_TIERS) {
     if (entry.agent !== agent || entry.model !== model) continue
+    // The same escalated exception for a model a previous table shared across tiers (gpt-6.1-sol).
+    if (match && (entry.tier === 'escalated') !== (match.tier === 'escalated')) {
+      if (entry.tier !== 'escalated') match = { tier: entry.tier, pair: { model: entry.model, effort: entry.effort } }
+      continue
+    }
     if (!match || tierRank(entry.tier) > tierRank(match.tier)) {
       match = { tier: entry.tier, pair: { model: entry.model, effort: entry.effort } }
     }
@@ -1065,7 +1071,9 @@ function isAiModelPolicy(value: unknown): value is DifficultyRoutingAiModelPolic
 
 /**
  * Applies the org policy and reports whether a substitution happened, because
- * the caller must not record a refused tier as the conversation's floor.
+ * the caller must not record a refused tier as the conversation's floor. An
+ * allowed pair of the route's own tier is not a substitution: the tier, and so
+ * a one-turn escalation, stays as routed.
  *
  * Every substitution is re-validated as a *pair*. Carrying the previous effort
  * across a model change is how an unrunnable combination used to be produced:
@@ -1081,6 +1089,9 @@ function resolveRouteAllowedByAiPolicy(
 ): { route: SendModelOptionsResult; substituted: boolean } | null {
   if (!policy || policy.allowedSelectionKeys === null) return { route, substituted: false }
   if (route.model && isModelAllowedByAiPolicy(policy, agent, route.model)) return { route, substituted: false }
+
+  const sameTier = allowedSameTierPair(agent, route, policy)
+  if (sameTier) return { route: { ...route, ...sameTier }, substituted: false }
 
   const substitute = current.model && isModelAllowedByAiPolicy(policy, agent, current.model)
     ? current.model
@@ -1100,6 +1111,17 @@ function resolveRouteAllowedByAiPolicy(
     route: { ...route, model: pair.model, effort: pair.effort, difficulty: tier },
     substituted: true,
   }
+}
+
+/** For a pair the policy forbids: the newest allowed pair of the same routing tier, if any. */
+function allowedSameTierPair(
+  agent: RoutableAgent,
+  route: Pick<SendModelOptionsResult, 'model' | 'effort'>,
+  policy: DifficultyRoutingAiModelPolicy | undefined,
+): { model: string; effort: string } | null {
+  if (!policy || !route.model || isModelAllowedByAiPolicy(policy, agent, route.model)) return null
+  return sameTierRoutePairs(agent, route.model, route.effort)
+    .find((pair) => isModelAllowedByAiPolicy(policy, agent, pair.model)) ?? null
 }
 
 function isModelAllowedByAiPolicy(

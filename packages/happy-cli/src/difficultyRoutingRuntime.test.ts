@@ -272,6 +272,49 @@ describe('difficulty routing runtime', () => {
     expect(asDecision(decision).pending.base).toMatchObject({ difficulty: 'hard', model: 'gpt-6.1-sol', effort: 'high' })
   })
 
+  // A routing table moves to a model before an organization allows it. An allowed
+  // pair of the same tier keeps the tier, ahead of the current or default model.
+  it('substitutes an allowed pair of the routed tier before the current or default model', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+      ...grantResponse(),
+      aiModelPolicy: {
+        source: 'organization',
+        allowedSelectionKeys: ['codex:gpt-5.5', 'codex:gpt-6-sol'],
+        defaultSelectionKey: 'codex:gpt-5.5',
+      },
+    })))
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      agent: 'codex',
+      contentText: 'refactor the payment module',
+      current: { model: 'gpt-5.5', effort: 'high' },
+    })
+
+    expect(asDecision(decision).route).toMatchObject({ model: 'gpt-6-sol', effort: 'high', difficulty: 'hard' })
+  })
+
+  // The same rule for the current table's shared model.
+  it('substitutes the current table model shared by hard and escalated at the hard pair', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+      ...grantResponse(),
+      aiModelPolicy: {
+        source: 'member',
+        allowedSelectionKeys: ['codex:gpt-6.2-sol'],
+        defaultSelectionKey: 'codex:gpt-6.2-sol',
+      },
+    })))
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      agent: 'codex',
+      current: { model: 'gpt-6.2-sol', effort: 'low' },
+    })
+
+    expect(asDecision(decision).route).toMatchObject({ model: 'gpt-6.2-sol', effort: 'high' })
+    expect(asDecision(decision).pending.base).toMatchObject({ difficulty: 'hard', model: 'gpt-6.2-sol', effort: 'high' })
+  })
+
   it('falls back to the allowed default model when the current model is also disallowed', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json({
       ...grantResponse(),
@@ -1544,7 +1587,7 @@ describe('cross-generation floor preservation (R2, R3)', () => {
       state: storedBase('routine', 'gpt-6-sol', 'low'),
     })
 
-    expect(asDecision(decision).route).toMatchObject({ model: 'gpt-6.1-sol', effort: 'high', difficulty: 'hard' })
+    expect(asDecision(decision).route).toMatchObject({ model: 'gpt-6.2-sol', effort: 'high', difficulty: 'hard' })
   })
 
   it('shouldEscalateAPreviousTableHardFloorToTheNewEscalatedRoute', async () => {
@@ -1560,10 +1603,33 @@ describe('cross-generation floor preservation (R2, R3)', () => {
       },
     })
 
-    expect(asDecision(decision).route).toMatchObject({ model: 'gpt-6.1-sol', effort: 'xhigh', difficulty: 'escalated' })
+    expect(asDecision(decision).route).toMatchObject({ model: 'gpt-6.2-sol', effort: 'xhigh', difficulty: 'escalated' })
     expect(asDecision(decision).pending.temporaryEscalation).toBe(true)
     // The floor underneath stays the stored pair; the escalation is one turn.
     expect(asDecision(decision).pending.base).toMatchObject({ difficulty: 'hard', model: 'gpt-6-sol', effort: 'high' })
+  })
+
+  // An org that allows 6.1 Sol but not yet 6.2: the escalation runs on 6.1 Sol/xhigh
+  // for one turn, and the floor stays hard — never an xhigh floor every later turn rides.
+  it('shouldKeepASameTierPolicySwapOfAnEscalationTemporary', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+      ...grantResponse(),
+      aiModelPolicy: { source: 'organization', allowedSelectionKeys: ['codex:gpt-6.1-sol'], defaultSelectionKey: 'codex:gpt-6.1-sol' },
+    })))
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      agent: 'codex',
+      contentText: 'still broken, the same error again',
+      state: {
+        ...storedBase('hard', 'gpt-6.1-sol', 'high'),
+        escalation: { hardTurns: 3, updatedAt: Date.now() - 1000 },
+      },
+    })
+
+    expect(asDecision(decision).route).toMatchObject({ model: 'gpt-6.1-sol', effort: 'xhigh', difficulty: 'escalated' })
+    expect(asDecision(decision).pending.temporaryEscalation).toBe(true)
+    expect(asDecision(decision).pending.base).toMatchObject({ difficulty: 'hard', model: 'gpt-6.1-sol', effort: 'high' })
   })
 
   it('shouldStillRefuseAPairNoGenerationOffers', () => {
