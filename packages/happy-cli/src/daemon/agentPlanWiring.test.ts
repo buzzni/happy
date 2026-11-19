@@ -24,6 +24,8 @@ describe('agentPlan capability', () => {
 
     it('passes the metadata schema, and the version is closed', () => {
         expect(MachineMetadataSchema.safeParse({ ...initialMachineMetadata, agentPlan: AGENT_PLAN_CAPABILITY }).success).toBe(true)
+        // codexModels 를 버리면 서버·Desktop 이 이 PC 가 새 플랜 모델을 실행할 수 있는지 모른다.
+        expect(MachineMetadataSchema.parse({ ...initialMachineMetadata, agentPlan: AGENT_PLAN_CAPABILITY }).agentPlan).toEqual(AGENT_PLAN_CAPABILITY)
         expect(MachineMetadataSchema.safeParse({ ...initialMachineMetadata, agentPlan: { version: 2 } }).success).toBe(false)
         const { agentPlan: _omitted, ...without } = initialMachineMetadata
         expect(MachineMetadataSchema.safeParse(without).success).toBe(true)
