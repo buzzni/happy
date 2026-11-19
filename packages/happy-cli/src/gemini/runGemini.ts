@@ -6,8 +6,6 @@
  * communication with the Happy server and mobile app.
  */
 
-import { render } from 'ink';
-import React from 'react';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import { join, resolve } from 'node:path';
@@ -38,7 +36,6 @@ import type { ApiSessionClient } from '@/api/apiSession';
 
 import { createGeminiBackend } from '@/agent/factories/gemini';
 import type { AgentBackend, AgentMessage } from '@/agent';
-import { GeminiDisplay } from '@/ui/ink/GeminiDisplay';
 import { GeminiPermissionHandler } from '@/gemini/utils/permissionHandler';
 import { GeminiReasoningProcessor } from '@/gemini/utils/reasoningProcessor';
 import { GeminiDiffProcessor } from '@/gemini/utils/diffProcessor';
@@ -524,7 +521,7 @@ export async function runGemini(opts: {
 
   const messageBuffer = new MessageBuffer();
   const hasTTY = process.stdout.isTTY && process.stdin.isTTY;
-  let inkInstance: ReturnType<typeof render> | null = null;
+  let inkInstance: ReturnType<typeof import('ink').render> | null = null;
 
   // Track current model for UI display
   // Initialize with env var or default to show correct model from start
@@ -564,6 +561,9 @@ export async function runGemini(opts: {
   };
 
   if (hasTTY) {
+    const [{ render }, { GeminiDisplay }, { default: React }] = await Promise.all([
+        import('ink'), import('@/ui/ink/GeminiDisplay'), import('react'),
+    ]);
     console.clear();
     // Create a React component that reads displayedModel from closure
     // Model will update when UI re-renders (on messageBuffer updates)

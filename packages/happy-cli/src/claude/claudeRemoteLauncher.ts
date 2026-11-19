@@ -13,7 +13,6 @@ import { isDeepStrictEqual } from "node:util";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import type { Metadata } from '@/api/types';
-import { render } from "ink";
 import { createManagedGracefulStop, registerManagedGracefulStop, type ManagedGracefulStop } from '@/managed/managedGracefulStop'
 import { createProviderExitObserver, type ProviderExitObserver } from '@/managed/managedProviderExitObserver'
 import { waitForObservedExit, MANAGED_REPORT_EXIT_BUDGET_MS } from '@/managed/managedProviderExitObserver'
@@ -22,8 +21,6 @@ import { createGenerationProofs, type GenerationProof } from '@/managed/managedG
 import { MANAGED_STOP_CLEAN } from '@/managed/managedControlChannel'
 import { Session } from "./session";
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
-import { RemoteModeDisplay } from "@/ui/ink/RemoteModeDisplay";
-import React from "react";
 import { claudeRemote, type ClaudeActiveInputSender, type ClaudeTurnLatencyInput } from "./claudeRemote";
 import { readLiveOauthAccount, type LiveOauthAccount, type ClaudeAuthObservation, type ObservedAiAuthSource } from "./aiAuthObservation";
 import { ClaudeSideQuestionBridge, createSideQuestionRpcHandler } from "./claudeSideQuestion";
@@ -116,6 +113,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     let inkInstance: any = null;
 
     if (hasTTY) {
+        const [{ render }, { RemoteModeDisplay }, { default: React }] = await Promise.all([
+            import("ink"), import("@/ui/ink/RemoteModeDisplay"), import("react"),
+        ]);
         console.clear();
         inkInstance = render(React.createElement(RemoteModeDisplay, {
             messageBuffer,

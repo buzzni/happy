@@ -11,11 +11,9 @@ import { planDataKeyOnboarding } from "@/datakey/onboarding";
 import { existsSync, readFileSync } from "node:fs";
 import { generateWebAuthUrl } from "@/api/webAuth";
 import { openBrowser } from "@/utils/browser";
-import { AuthSelector, AuthMethod } from "./ink/AuthSelector";
+import type { AuthMethod } from "./ink/AuthSelector";
 import { authMethodWithoutPrompt } from "./authMethodChoice";
 import { authPollStep } from "./authPollRetry";
-import { render } from 'ink';
-import React from 'react';
 import { randomUUID } from 'node:crypto';
 import { logger } from './logger';
 
@@ -69,7 +67,10 @@ export async function doAuth(): Promise<Credentials | null> {
 /**
  * Display authentication method selector and return user choice
  */
-function selectAuthenticationMethod(): Promise<AuthMethod | null> {
+async function selectAuthenticationMethod(): Promise<AuthMethod | null> {
+    const [{ render }, { AuthSelector }, { default: React }] = await Promise.all([
+        import("ink"), import("./ink/AuthSelector"), import("react"),
+    ]);
     return new Promise((resolve) => {
         let hasResolved = false;
 

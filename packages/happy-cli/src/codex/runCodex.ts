@@ -11,7 +11,6 @@ import { reportAutomationContextExit, type AutomationContextExitEvidence } from 
 import { createFilesystemWriteAdmission, createSubprocessWriteAdmission } from '@/utils/workspaceTurnAdmission';
 import { takeWorkspaceContextControl } from '@/utils/workspaceContextControl';
 import { CodexAuthRecovery, describeCodexAuthRecoveryFailure } from './codexAuthRecovery';
-import { render } from "ink";
 import {
     createManagedGracefulStop,
     registerManagedGracefulStop,
@@ -28,7 +27,6 @@ import { MANAGED_STOP_CLEAN } from '@/managed/managedControlChannel';
  * exit — that is how a provider that is still writing gets archived.
  */
 const CODEX_END_INPUT_BUDGET_MS = 10_000;
-import React from "react";
 import { ApiClient } from '@/api/api';
 import { consumeInputEvidenceOption, inputEvidenceMetadata, resolveInputEvidenceOption } from '@/utils/inputEvidenceSettings';
 import { CodexAppServerClient } from './codexAppServerClient';
@@ -84,7 +82,6 @@ import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/con
 import { bridgeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
 import { codexLaunchMcpServers, consumeLaunchMcpServersSeed, launchMcpServersBeside } from '@/aplus/launchMcpServers';
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
-import { CodexDisplay } from "@/ui/ink/CodexDisplay";
 import { trimIdent } from "@/utils/trimIdent";
 import { notifyDaemonSessionStarted } from "@/daemon/controlClient";
 import { initializeScopeReportSigner, takeScopeLaunchBootstrap } from '@/daemon/sessionWriteScopeReports';
@@ -1427,6 +1424,9 @@ export async function runCodex(opts: {
     let inkInstance: any = null;
 
     if (hasTTY) {
+        const [{ render }, { CodexDisplay }, { default: React }] = await Promise.all([
+            import("ink"), import("@/ui/ink/CodexDisplay"), import("react"),
+        ]);
         console.clear();
         inkInstance = render(React.createElement(CodexDisplay, {
             messageBuffer,

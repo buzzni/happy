@@ -31,7 +31,6 @@ import { runDoctorCommand, runDoctorDaemon } from './ui/doctor'
 import { listDaemonSessions, stopDaemonSession } from './daemon/controlClient'
 import { handleAuthCommand } from './commands/auth'
 import { handleConnectCommand } from './commands/connect'
-import { handleSandboxCommand } from './commands/sandbox'
 import { handleBrowserCommand } from './commands/browser'
 import { handleServerCommand } from './commands/server'
 import { handleDeviceCommand } from './commands/device'
@@ -188,6 +187,7 @@ Conversation history is preserved on the server, but in-flight tool calls are in
     return;
   } else if (subcommand === 'sandbox') {
     try {
+      const { handleSandboxCommand } = await import('./commands/sandbox');
       await handleSandboxCommand(args.slice(1));
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
