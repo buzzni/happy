@@ -593,7 +593,11 @@ export async function reportSetupTokenActivity(sessionId: string, binding: strin
 
 /** Mandatory organization execution admission; an old/unreachable daemon cannot grant it. */
 export async function requestSetupTokenStart(sessionId: string, binding: string, requestId: string, signal: AbortSignal): Promise<import('../claude/setupTokenStartBudget').StartDecision> {
+  signal.throwIfAborted();
   const result = await daemonPost('/setup-token/start', { sessionId, binding, requestId }, undefined, 15_000, signal);
+  signal.throwIfAborted();
+  if (result?.timedOut || result?.reason === 'START_TIMEOUT') throw new Error('SETUP_TOKEN_START_TIMEOUT');
+  if (result?.reason === 'FORBIDDEN') throw new Error('SETUP_TOKEN_START_FORBIDDEN');
   if (result?.reason === 'CAPACITY_ACTOR_REQUIRED') throw new Error('CAPACITY_ACTOR_REQUIRED');
   if (result?.ok !== true) throw new Error(result?.reason === 'START_ACCOUNT_EXHAUSTED' ? 'SETUP_TOKEN_START_ACCOUNT_EXHAUSTED' : 'SETUP_TOKEN_START_UNAVAILABLE');
   const value = result.admission;

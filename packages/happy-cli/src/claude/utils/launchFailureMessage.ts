@@ -63,7 +63,9 @@ export function describeClaudeLaunchFailure(error: unknown): string {
     if (/^CAPACITY_STUDIO_(UNREACHABLE|TIMEOUT)$/.test(text)) return `이 PC에서 Saycode 서버에 연결하지 못해 실행을 멈췄습니다. 계정 문제가 아닙니다. 원래 입력과 첨부는 유지되니 네트워크 연결을 확인한 뒤 다시 보내 주세요.${capacityCode}`;
     if (text.startsWith('CAPACITY_')) return `조직 AI 계정의 사용 권한이나 실행 상태를 확인하지 못해 실행을 멈췄습니다. 원래 입력과 첨부는 유지됩니다. 계정 상태를 확인한 뒤 다시 요청해 주세요.${capacityCode}`;
     if (text === 'SETUP_TOKEN_START_WAIT_EXHAUSTED') return 'No organization Claude account became available after repeated checks. Ask your organization administrator to check the assigned accounts, then send again.';
-    if (text === 'SETUP_TOKEN_START_UNAVAILABLE') return 'The organization Claude account could not be authorized to start. Ask your organization administrator to check the assigned accounts, then send again.';
+    if (text === 'SETUP_TOKEN_START_TIMEOUT') return '조직 Claude 계정의 시작 승인 결과가 제시간에 도착하지 않아 대화를 시작하지 못했어요. 잠시 뒤 다시 보내 주세요.';
+    if (text === 'SETUP_TOKEN_START_FORBIDDEN') return '이 조직 Claude 계정으로 대화를 시작할 권한이 없어요. 조직 관리자에게 계정 할당을 확인해 주세요.';
+    if (text === 'SETUP_TOKEN_START_UNAVAILABLE') return '조직 Claude 계정의 시작 승인 결과를 확인하지 못해 대화를 시작하지 못했어요. 잠시 뒤 다시 보내 주세요.';
     if (text === ORGANIZATION_CLAUDE_AUTH_FAILURE) return 'Organization Claude stopped because the assigned account or policy could not be verified. Check this machine’s CLI and assigned account, then send again.';
     if (text === ORG_ENDPOINT_CLAUDE_AUTH_FAILURE) return 'The organization LLM endpoint could not be verified for this session (a settings file or policy on this machine may point Claude Code elsewhere), so the request was not sent. Check this machine\u2019s Claude settings, then send again.';
     if (text === PERSONAL_CLAUDE_AUTH_FAILURE) return 'Personal Claude stopped because the selected account or policy could not be verified. Check the account and send again.';

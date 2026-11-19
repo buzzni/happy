@@ -161,5 +161,7 @@ it('requires explicit provider token revocation before permanently excluding an 
 
 it('explains unavailable organization start admission without suggesting personal authentication', () => {
     expect(describeClaudeLaunchFailure(new Error('SETUP_TOKEN_START_WAIT_EXHAUSTED'))).toContain('organization administrator');
-    expect(describeClaudeLaunchFailure(new Error('SETUP_TOKEN_START_UNAVAILABLE'))).toContain('organization');
+    expect(describeClaudeLaunchFailure(new Error('SETUP_TOKEN_START_UNAVAILABLE'))).toContain('시작 승인 결과');
+    expect(describeClaudeLaunchFailure(new Error('SETUP_TOKEN_START_TIMEOUT'))).toContain('제시간에');
+    expect(describeClaudeLaunchFailure(new Error('SETUP_TOKEN_START_FORBIDDEN'))).toContain('권한');
 });

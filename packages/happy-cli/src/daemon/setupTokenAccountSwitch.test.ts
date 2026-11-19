@@ -51,6 +51,13 @@ describe('setup-token account switch (specs/claude-setup-token-account-selection
     expect(await switcher.rebind('session-a', RUNNING_A, undefined, undefined, { startBudget: true })).toHaveProperty('ok', true)
     expect(requests[1].body).toMatchObject({ startBudget: true, capacityRequestId: 'execution-r' })
   })
+  it('stops before contacting Studio if the caller leaves during local account lookup', async () => {
+    const controller = new AbortController()
+    const { switcher, requests } = setup({ disabledSetupTokenAccounts: async () => { controller.abort(); return [] } })
+    expect((await switcher.requestStart('session-a', RUNNING_A, 'request', controller.signal)).ok).toBe(false)
+    expect(requests).toHaveLength(0)
+  })
+
   it('refuses a disabled or stale local credential before a capacity claim', async () => {
     const { switcher, deps } = setup({ disabledSetupTokenAccounts: async () => [A] })
     const actor = { companyId: 'org-a', machineId: 'pc-a', sessionId: 'session-a', requestId: 'input-r', contentHash: 'a'.repeat(64), proof: 'signed.proof' }

@@ -72,7 +72,7 @@ export type SetupTokenAccountSwitchDeps = {
  * FORBIDDEN: Studio refuses this binding for good (PC reassigned, unknown binding); the session stops asking.
  * APPLY_REQUIRED: the account Studio would choose is not applied on this PC yet (specs/claude-setup-token-managed-sync R6).
  */
-export type SwitchFailure = 'NOT_BOUND' | 'STALE' | 'STUDIO_UNAVAILABLE' | 'NO_ACCOUNT' | 'APPLY_REQUIRED' | 'FORBIDDEN' | 'REQUEST_FAILED' | 'BINDING_REJECTED' | 'PERSISTENCE_FAILED' | 'PERSISTENCE_INDETERMINATE' | 'STUDIO_BUDGET' | 'UNSUPPORTED' | 'ROTATION_LIMIT' | 'START_ACCOUNT_EXHAUSTED' | 'CAPACITY_ACTOR_REQUIRED'
+export type SwitchFailure = 'NOT_BOUND' | 'STALE' | 'STUDIO_UNAVAILABLE' | 'NO_ACCOUNT' | 'APPLY_REQUIRED' | 'FORBIDDEN' | 'REQUEST_FAILED' | 'BINDING_REJECTED' | 'PERSISTENCE_FAILED' | 'PERSISTENCE_INDETERMINATE' | 'STUDIO_BUDGET' | 'UNSUPPORTED' | 'ROTATION_LIMIT' | 'START_ACCOUNT_EXHAUSTED' | 'CAPACITY_ACTOR_REQUIRED' | 'START_TIMEOUT'
 
 const REQUEST_TIMEOUT_MS = 15_000
 /** Studio asks for at most this many checks per switch (its MAX_PROBES_PER_SWITCH); a further ask is not followed. */
@@ -106,10 +106,14 @@ const refusal = (status: number) => status === 401 || status === 403 ? 'FORBIDDE
 
 export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps) {
   const capacityTargets = new Map<string, { requestId: string; target: string }>();
-  const post = (route: StudioDaemonRoute, body: object) => deps.fetch(studioMachineRouteUrl(String(deps.studioOrigin), `daemon/${route}`), {
-    method: 'POST', redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    headers: { Authorization: `Bearer ${deps.bearer()}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-  })
+  const post = (route: StudioDaemonRoute, body: object, signal?: AbortSignal) => {
+    signal?.throwIfAborted()
+    const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+    return deps.fetch(studioMachineRouteUrl(String(deps.studioOrigin), `daemon/${route}`), {
+      method: 'POST', redirect: 'error', signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+      headers: { Authorization: `Bearer ${deps.bearer()}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    })
+  }
   const inFlight = new Map<string, Promise<RebindResult>>()
   // Retain a consumed grant's verified result until saved; retrying storage must not mint more grants.
   // This is process-local recovery only. A crash between nonce consumption and publication needs
@@ -358,7 +362,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
         return open('account not held by this PC')
       }
       const response = await post('shared/start', { machineId: deps.machineId, companyId: proof.companyId, sessionId,
-        managedAccountId: shared.managedAccountId, credentialGeneration: proof.credentialGeneration, requestId })
+        managedAccountId: shared.managedAccountId, credentialGeneration: proof.credentialGeneration, requestId }, signal)
       if (!response.ok) {
         const refusal = await response.json().catch(() => null) as { error?: string } | null;
         if (refusal?.error?.includes('CAPACITY_')) return failure('CAPACITY_ACTOR_REQUIRED', 'An authenticated input actor is required');
@@ -372,6 +376,10 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       return { ok: true as const, admission }
     } catch (error) {
       if (signal?.aborted) { sharedStartPreferred.delete(shared.session); return failure('REQUEST_FAILED', 'shared start cancelled') }
+      if (!fenced && (error as Error)?.name === 'TimeoutError') {
+        sharedStartPreferred.delete(shared.session)
+        return failure('START_TIMEOUT', 'shared start permit timed out')
+      }
       return open(`${(error as Error)?.name ?? 'error'}`)
     }
   }
@@ -448,7 +456,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       try {
         signal?.throwIfAborted()
         const disabled = await deps.disabledSetupTokenAccounts?.() ?? []
-        const response = await post('start', { machineId: deps.machineId, sessionId, companyId: binding.companyId, bindingNonce: binding.nonce, requestId, ...(disabled.length ? { excludeManagedAccountIds: disabled } : {}) })
+        const response = await post('start', { machineId: deps.machineId, sessionId, companyId: binding.companyId, bindingNonce: binding.nonce, requestId, ...(disabled.length ? { excludeManagedAccountIds: disabled } : {}) }, signal)
         if (!response.ok) {
           const body = await response.json().catch(() => null) as { error?: unknown } | null
           const code = typeof body?.error === 'string' && /^SETUP_TOKEN_DAEMON_[A-Z_]+$/.test(body.error) ? body.error : 'UNKNOWN'
@@ -456,7 +464,10 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
           return failure(response.status === 409 && code === 'SETUP_TOKEN_DAEMON_START_ACCOUNT_EXHAUSTED' ? 'START_ACCOUNT_EXHAUSTED' : refusal(response.status), `start refused: HTTP ${response.status} ${code}`)
         }
         return { ok: true as const, admission: await response.json() }
-      } catch { return failure('REQUEST_FAILED', 'start unavailable') }
+      } catch (error) {
+        if ((error as Error)?.name === 'TimeoutError') return failure('START_TIMEOUT', 'start permit timed out')
+        return failure('REQUEST_FAILED', 'start unavailable')
+      }
     },
     async reportActivity(sessionId: string, running: string, activity: SetupTokenActivity, signal?: AbortSignal): Promise<{ ok: true } | { ok: false; reason: SwitchFailure }> {
       const parsed = parseBinding(running)

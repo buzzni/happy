@@ -279,6 +279,23 @@ it('preserves start exhaustion through local control and sends a distinct rebind
  }finally{fetchSpy.mockRestore()}
 })
 
+it('distinguishes a slow start permit from a refused account and preserves cancellation', async () => {
+  const state = stateWithPid(process.pid)
+  mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state, raw: JSON.stringify(state) })
+  const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    .mockRejectedValueOnce(new DOMException('deadline', 'TimeoutError'))
+    .mockResolvedValueOnce(Response.json({ ok: false, reason: 'START_TIMEOUT' }))
+    .mockResolvedValueOnce(Response.json({ ok: false, reason: 'FORBIDDEN' }))
+  const start = (signal = new AbortController().signal) => requestSetupTokenStart('s', 'binding', 'request', signal)
+  try {
+    await expect(start()).rejects.toThrow('SETUP_TOKEN_START_TIMEOUT')
+    await expect(start()).rejects.toThrow('SETUP_TOKEN_START_TIMEOUT')
+    await expect(start()).rejects.toThrow('SETUP_TOKEN_START_FORBIDDEN')
+    await expect(start(AbortSignal.abort(new Error('user cancelled')))).rejects.toThrow('user cancelled')
+    expect(fetchSpy).toHaveBeenCalledTimes(3)
+  } finally { fetchSpy.mockRestore() }
+})
+
 it('asks the daemon for the account the member chose', async () => {
   const state = stateWithPid(process.pid); mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state, raw: JSON.stringify(state) })
   const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(Response.json({ ok: true, environment: { TOKEN: 'synthetic' } }))
