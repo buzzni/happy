@@ -1,4 +1,5 @@
 import { createLaunchReadinessGate } from './resumeGuards'
+import * as codexStartup from './codexStartupHealth'
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -41,9 +42,11 @@ describe('controlServer port allocation endpoints', () => {
   let baseUrl: string
   let stopServer: () => Promise<void>
   let controlSecret = ''
+  let canRefreshCodexRunner: boolean | null
   const fetch = makeAuthedFetch(() => controlSecret)
 
   beforeEach(async () => {
+    canRefreshCodexRunner = null
     dir = mkdtempSync(path.join(tmpdir(), 'control-server-'))
     const registry = createPortRegistry({
       filePath: path.join(dir, 'port-registry.json'),
@@ -58,6 +61,7 @@ describe('controlServer port allocation endpoints', () => {
       requestShutdown: () => {},
       onHappySessionWebhook: () => {},
       portRegistry: registry,
+      canRefreshCodexRunner: () => canRefreshCodexRunner,
     })
     baseUrl = `http://127.0.0.1:${port}`
     stopServer = stop
@@ -91,6 +95,25 @@ describe('controlServer port allocation endpoints', () => {
     const res = await fetch(`${baseUrl}/port-registry`)
     return { status: res.status, body: (await res.json()) as { entries: Array<{ projectId: string; port: number; allocatedAt: number }> } }
   }
+
+  it('requires loopback authentication before checking Codex startup', async () => {
+    expect((await realFetch(`${baseUrl}/codex-startup-health`, { method: 'POST' })).status).toBe(401)
+  })
+
+  it.skipIf(process.platform !== 'darwin')('reports Codex readiness and defers repair while the runner has work', async () => {
+    const probe = vi.spyOn(codexStartup, 'codexStartupHealth').mockResolvedValue('managed-preferences')
+    const check = async () => (await fetch(`${baseUrl}/codex-startup-health`, { method: 'POST' })).json()
+    try {
+      expect(await check()).toEqual({ status: 'starting' })
+      expect(probe).not.toHaveBeenCalled()
+      canRefreshCodexRunner = false
+      expect(await check()).toEqual({ status: 'busy' })
+      canRefreshCodexRunner = true
+      expect(await check()).toEqual({ status: 'managed-preferences' })
+    } finally {
+      probe.mockRestore()
+    }
+  })
 
   it('POST /allocate-port returns a fresh port for a new projectId', async () => {
     const { status, body } = await allocate('proj-a')

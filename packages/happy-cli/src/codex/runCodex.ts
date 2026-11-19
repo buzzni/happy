@@ -2396,6 +2396,7 @@ export async function runCodex(opts: {
                     messageBuffer,
                     threadId: opts.resumeThreadId,
                     cwd: process.cwd(),
+                    canRetry: () => !runtimeGate?.isClosed(),
                     mcpServers: mcpConfigSynchronizer.mcpServers,
                     developerInstructions: currentDeveloperInstructions,
                 });

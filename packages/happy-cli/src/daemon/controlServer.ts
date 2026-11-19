@@ -100,6 +100,7 @@ export type ManagedReportClaim =
     };
 import type { ChildProcess } from 'node:child_process';
 import { homedir } from 'node:os';
+import { codexStartupHealth } from './codexStartupHealth';
 
 export function startDaemonControlServer({
   sessionRetention,
@@ -119,6 +120,7 @@ export function startDaemonControlServer({
   verifyManagedReport,
   standaloneDrain,
   restartDrain,
+  canRefreshCodexRunner,
   writeScopeRuntime,
   browserLocalSetup,
   desktopBrowserLogin,
@@ -143,6 +145,7 @@ export function startDaemonControlServer({
   standaloneDrain?: StandaloneDrain;
   /** aplus codexcli-daemon-restart-drain — absent on preflight and in tests that do not drain. */
   restartDrain?: RestartDrainControlPort;
+  canRefreshCodexRunner?: () => boolean | null;
   browserLocalSetup?: BrowserLocalSetup;
   desktopBrowserLogin?: { status(): unknown; attach(input: unknown): Promise<void>; adminSocket(): string | undefined };
   getChildren: () => TrackedSession[];
@@ -258,6 +261,15 @@ export function startDaemonControlServer({
             code: 'STANDALONE_WINDOWS_TRIAL_UNSUPPORTED' });
         }
       }
+    });
+
+    let codexStartupProbe: ReturnType<typeof codexStartupHealth> | undefined;
+    app.post('/codex-startup-health', async (_request, reply) => {
+      if (!canRefreshCodexRunner || process.platform !== 'darwin') return reply.code(404).send();
+      if (canRefreshCodexRunner() === null) return { status: 'starting' };
+      codexStartupProbe ??= codexStartupHealth().finally(() => { codexStartupProbe = undefined; });
+      const status = await codexStartupProbe;
+      return { status: status === 'managed-preferences' && !canRefreshCodexRunner() ? 'busy' : status };
     });
 
     app.post('/device/status', { bodyLimit: 4096 }, async (request, reply) => {

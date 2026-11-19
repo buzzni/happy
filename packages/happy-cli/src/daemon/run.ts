@@ -4622,6 +4622,12 @@ export async function startDaemon(): Promise<void> {
       ...(managedRuntimeActive ? {} : { sessionRetention }),
       terminalWorkers,
       restartDrain: restartDrainControlPort,
+      canRefreshCodexRunner: () => {
+        if (!launchReadiness.isReady() || !restartDrainRuntime) return null;
+        if (launchReadiness.restartDeadline() !== null || restartDrainRuntime.controller.current()) return false;
+        const { inTurnCount, automationCount, openTerminalCount } = getRestartDrainActivity();
+        return inTurnCount === 0 && automationCount === 0 && openTerminalCount === 0;
+      },
       getCallerLaunches: () => callerLaunches,
       ...(admitSubprocess ? { admitSubprocess, reserveLegacyDispatch } : {}),
       getSetupTokenAccountSwitch: () => setupTokenAccountSwitch,
