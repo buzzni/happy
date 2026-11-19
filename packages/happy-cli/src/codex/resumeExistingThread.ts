@@ -1,4 +1,5 @@
 import { trimIdent } from '@/utils/trimIdent';
+import { setTimeout as delay } from 'node:timers/promises';
 
 type ResumeThreadClient = {
     resumeThread: (opts: {
@@ -26,13 +27,22 @@ export async function resumeExistingThread(opts: {
     cwd: string;
     mcpServers: Record<string, unknown>;
     developerInstructions?: string;
+    canRetry?: () => boolean;
 }): Promise<{ threadId: string; model: string }> {
     try {
-        const resumedThread = await opts.client.resumeThread({
+        const params = {
             threadId: opts.threadId,
             cwd: opts.cwd,
             mcpServers: opts.mcpServers,
             developerInstructions: opts.developerInstructions,
+        };
+        const resume = () => opts.client.resumeThread(params);
+        const resumedThread = await resume().catch(async (error: unknown) => {
+            // Only this definite pre-turn refusal is safe to repeat. Keep waiting local and short.
+            if (!(error instanceof Error) || error.message !== `thread/resume: thread ${opts.threadId} already has an active writer (code=-32600)` || !opts.canRetry?.()) throw error;
+            await delay(350);
+            if (!opts.canRetry()) throw error;
+            return resume();
         });
 
         opts.session.updateMetadata((currentMetadata) => ({
