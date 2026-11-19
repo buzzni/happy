@@ -153,13 +153,25 @@ export function splitTurnOnlyPromptBlocks(
   return { provider: provider || undefined, turnOnly: marked.map(({ block }) => block).join('\n\n') };
 }
 
-/** For a log line: which part of the prompt differs. Block tokens are envelope checksums, never prompt text. */
+/**
+ * For a log line: which part of the prompt differs. Block tokens are envelope checksums, never prompt text.
+ * A standing context change lists the lengths of the paragraphs only one side has, which is enough to
+ * tell which composed block moved (each has a recognisable size) without logging any of it.
+ */
 export function describeClientPromptChange(launched: string | undefined, next: string | undefined): string {
   const tokens = (prompt: string | undefined) => clientTurnPromptBlocks(prompt).map(clientTurnBlockToken);
   const before = tokens(launched);
   const after = tokens(next);
+  const paragraphs = (prompt: string | undefined) => (stripClientTurnPromptBlocks(prompt) ?? '').split(/\n{2,}/).filter(Boolean);
+  const standingBefore = paragraphs(launched);
+  const standingAfter = paragraphs(next);
+  const standingChange = [
+    ...standingBefore.filter((paragraph) => !standingAfter.includes(paragraph)).map((paragraph) => `-${paragraph.length}`),
+    ...standingAfter.filter((paragraph) => !standingBefore.includes(paragraph)).map((paragraph) => `+${paragraph.length}`),
+  ];
   return [
-    (stripClientTurnPromptBlocks(launched) ?? '') !== (stripClientTurnPromptBlocks(next) ?? '') ? 'standing context' : undefined,
+    (stripClientTurnPromptBlocks(launched) ?? '') !== (stripClientTurnPromptBlocks(next) ?? '')
+      ? `standing context${standingChange.length > 0 ? ` [${standingChange.join(' ')}]` : ''}` : undefined,
     ...after.filter((token) => !before.includes(token)).map((token) => `+${token}`),
     ...before.filter((token) => !after.includes(token)).map((token) => `-${token}`),
   ].filter(Boolean).join(' ') || 'same';
