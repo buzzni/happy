@@ -58,6 +58,7 @@ export function describeClaudeLaunchFailure(error: unknown): string {
     // The code tells an administrator which check refused; it is a fixed name, never provider output.
     const capacityCode = /^CAPACITY_[A-Z0-9_]{1,64}$/.test(text) ? ` (${text})` : '';
     if (/^CAPACITY_(DELIVERY_UNKNOWN|PROVIDER_EXIT_UNCONFIRMED|RECOVERY_REQUIRED)$/i.test(text)) return `이전 실행의 전달 또는 종료 상태를 확인할 수 없어 자동 재전송을 멈췄습니다. 원래 입력과 첨부는 유지됩니다. 조직 관리자에게 계정 복구 상태를 확인해 주세요.${capacityCode}`;
+    if (text === 'CAPACITY_DAEMON_TIMEOUT') return `조직 AI 계정 예약 요청에 작업 실행기가 제시간에 응답하지 않아 실행을 멈췄습니다. 입력과 첨부는 유지됩니다. 잠시 뒤 다시 보내 주세요.${capacityCode}`;
     if (/^CAPACITY_DAEMON_(HTTP_404|UNREACHABLE)$/.test(text)) return `이 PC의 작업 실행기가 업데이트를 마치지 못했거나 응답하지 않아 실행을 멈췄습니다. 계정 문제가 아닙니다. 원래 입력과 첨부는 유지되니 잠시 뒤 다시 보내 주세요.${capacityCode}`;
     if (/^CAPACITY_STUDIO_(UNREACHABLE|TIMEOUT)$/.test(text)) return `이 PC에서 Saycode 서버에 연결하지 못해 실행을 멈췄습니다. 계정 문제가 아닙니다. 원래 입력과 첨부는 유지되니 네트워크 연결을 확인한 뒤 다시 보내 주세요.${capacityCode}`;
     if (text.startsWith('CAPACITY_')) return `조직 AI 계정의 사용 권한이나 실행 상태를 확인하지 못해 실행을 멈췄습니다. 원래 입력과 첨부는 유지됩니다. 계정 상태를 확인한 뒤 다시 요청해 주세요.${capacityCode}`;

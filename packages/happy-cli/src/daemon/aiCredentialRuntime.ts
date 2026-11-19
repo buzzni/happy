@@ -2246,6 +2246,21 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     }))
   }
 
+  async function readClaudeStatus() {
+    const result = await deps.execFile('cswap', ['list', '--json'], {
+      maxOutputBytes: MAX_PAYLOAD_BYTES,
+      timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+    })
+    return parseClaudeList(result.stdout)
+  }
+
+  function disabledSetupTokenAccounts() {
+    return serialize(() => withSafeErrors('CLAUDE_STATUS_FAILED', async () => {
+      const status = await readClaudeStatus()
+      return (status.setupToken?.accounts ?? []).filter(account => account.disabled).map(account => account.managedAccountId)
+    }))
+  }
+
   async function status(input: { provider: AiCredentialProvider }) {
     const selected = provider(input?.provider)
     return serialize(() => withSafeErrors(`${selected.toUpperCase()}_STATUS_FAILED`, async () => {
@@ -2355,11 +2370,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
           },
         }
       }
-      const result = await deps.execFile('cswap', ['list', '--json'], {
-        maxOutputBytes: MAX_PAYLOAD_BYTES,
-        timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
-      })
-      const claudeStatus = parseClaudeList(result.stdout)
+      const claudeStatus = await readClaudeStatus()
       const tokenRuntime = await readTokenRuntime({ invoke: async args => (await deps.execFile('cswap', args, {
         timeoutMs: 5000, maxOutputBytes: 65536, environment: deps.env,
       })).stdout })
@@ -3122,7 +3133,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (entries.length !== 1 || entries[0].pending) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_ASSIGNMENT_UNRESOLVED')
     return entries[0].scope
   })
-  return { orgLlmModelBindingSync, orgLlmEndpointSync, sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, sharedMachineAccountEnvironment, sharedMachineStartProof, sharedMachineStartBudgetMove, measureWithPermit, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, refreshCodexOwner, refreshClaudeOwner, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
+  return { orgLlmModelBindingSync, orgLlmEndpointSync, sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, sharedMachineAccountEnvironment, sharedMachineStartProof, sharedMachineStartBudgetMove, measureWithPermit, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, refreshCodexOwner, refreshClaudeOwner, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, disabledSetupTokenAccounts, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
     // One fresh runtime observation per RPC: launching cswap repeatedly can block a secured Windows host.
     let stdout = ''
     try { stdout = (await deps.execFile('cswap', ['token-runtime', 'capabilities'], { maxOutputBytes: 64 * 1024, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })).stdout } catch {}

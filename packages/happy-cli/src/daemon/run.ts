@@ -5366,11 +5366,7 @@ export async function startDaemon(): Promise<void> {
       fetch,
       // Passed as is: catching a session up resumes its recorded binding, the runtime's third argument.
       sessionEnvironment: aiCredentialRuntime.sessionEnvironment,
-      disabledSetupTokenAccounts: async () => {
-        const status = await aiCredentialRuntime.status({ provider: 'claude' });
-        return 'setupToken' in status ? (status.setupToken?.accounts ?? [])
-          .filter(account => account.disabled).map(account => account.managedAccountId) : [];
-      },
+      disabledSetupTokenAccounts: aiCredentialRuntime.disabledSetupTokenAccounts,
       // Saycode specs/usage-org-account-current-chat — a move to the member's choice excludes every other account held here.
       setupTokenAccountIds: async () => {
         const status = await aiCredentialRuntime.status({ provider: 'claude' });

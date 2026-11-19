@@ -1066,6 +1066,15 @@ describe('managed Claude setup-token runtime', () => {
     await expect(runtime.groupSync({ ...machineSync, machineId: 'other-machine' })).rejects.toThrow('AI_GROUP_MACHINE_MISMATCH')
   })
 
+  it('reads the current disabled account IDs with one cswap list for admission', async () => {
+    const { runtime, calls } = fakeMachine([
+      stored(A, 1, fakeToken('a'), { number: 1, disabled: true }),
+      stored(B, 2, fakeToken('b'), { number: 2 }),
+    ], 2)
+    expect(await runtime.disabledSetupTokenAccounts()).toEqual([A])
+    expect(calls).toEqual([{ command: 'cswap', args: ['list', '--json'] }])
+  })
+
   it('reports secret-free setup-token status separately from usage', async () => {
     const { runtime } = fakeMachine([stored(A, 1, fakeToken('a'), { number: 1, usageStatus: 'relogin_required' })], 1)
     const status = await runtime.status({ provider: 'claude' }) as Record<string, unknown>

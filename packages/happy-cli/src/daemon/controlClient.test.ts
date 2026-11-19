@@ -297,11 +297,13 @@ it('names a capacity failure that never reached the daemon apart from one the da
   mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state, raw: JSON.stringify(state) })
   const fetchSpy = vi.spyOn(globalThis, 'fetch')
     .mockRejectedValueOnce(new TypeError('fetch failed'))
+    .mockRejectedValueOnce(new DOMException('The operation was aborted due to timeout', 'TimeoutError'))
     .mockResolvedValueOnce(Response.json({ code: 'INVALID_BODY' }, { status: 400 }))
     .mockResolvedValueOnce(Response.json({ ok: false, reason: 'CAPACITY_STUDIO_TIMEOUT' }))
     .mockResolvedValueOnce(Response.json({ ok: true, admission: {} }))
   try {
     await expect(capacity()).rejects.toThrow('CAPACITY_DAEMON_UNREACHABLE')
+    await expect(capacity()).rejects.toThrow('CAPACITY_DAEMON_TIMEOUT')
     await expect(capacity()).rejects.toThrow('CAPACITY_DAEMON_HTTP_400')
     await expect(capacity()).rejects.toThrow('CAPACITY_STUDIO_TIMEOUT')
     await expect(capacity()).rejects.toThrow('CAPACITY_UNAVAILABLE')

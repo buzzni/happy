@@ -32,6 +32,12 @@ describe('describeClaudeLaunchFailure', () => {
         }
     });
 
+    it('explains a timed out reservation without announcing an update', () => {
+        const text = describeClaudeLaunchFailure(new Error('CAPACITY_DAEMON_TIMEOUT'));
+        expect(text).toMatch(/예약.*응답.*다시/);
+        expect(text).not.toContain('업데이트');
+    });
+
     it('tells this PC failing to reach Saycode apart from an account problem', () => {
         // ryan 2026-11-17: a dropped connection from the wshop PC read as an organization account problem.
         for (const code of ['CAPACITY_STUDIO_UNREACHABLE', 'CAPACITY_STUDIO_TIMEOUT']) {

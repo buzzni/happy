@@ -210,9 +210,7 @@ async function daemonPost(
   } catch (error) {
     const errorMessage = `Request failed: ${path}, ${error instanceof Error ? error.message : 'Unknown error'}`;
     logger.debug(`[CONTROL CLIENT] ${errorMessage}`);
-    return {
-      error: errorMessage
-    }
+    return { error: errorMessage, timedOut: error instanceof Error && error.name === 'TimeoutError' };
   }
 }
 
@@ -608,7 +606,8 @@ export async function requestSetupTokenCapacity(sessionId: string, binding: stri
   actor: import('../claude/setupTokenUserCapacity').SetupTokenCapacityActor, runtimeId: string, extra?: Record<string, unknown>, signal?: AbortSignal) {
   // Outlasts the daemon's 15 s Studio timeout, which starts only once this request reaches it, so a silent Studio comes back as CAPACITY_STUDIO_TIMEOUT.
   const result = await daemonPost('/setup-token/capacity', { sessionId, binding, operation, actor, runtimeId, extra }, undefined, 20_000, signal);
-  // daemonPost answers { error } when the daemon was never reached and { error, status } when it refused; neither carries a reason.
+  signal?.throwIfAborted();
+  if (result?.error && result.timedOut) throw new Error('CAPACITY_DAEMON_TIMEOUT');
   if (result?.ok !== true && result?.error) throw new Error(result.status ? `CAPACITY_DAEMON_HTTP_${result.status}` : 'CAPACITY_DAEMON_UNREACHABLE');
   if (result?.ok !== true || typeof result.admission?.state !== 'string') throw new Error(result?.reason ?? 'CAPACITY_UNAVAILABLE');
   return result.admission as { state: string; managedAccountId?: string; credentialGeneration?: number; epoch?: number; validForMs?: number; retryAfterMs?: number; requiresMove?: boolean; reason?: string };
