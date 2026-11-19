@@ -15,7 +15,6 @@
  *     포워딩하지 않게 한다(앱발 프롬프트와 동일한 dedupe 규약).
  */
 
-import { appendTitleInstruction } from '@/utils/titlePrompt'
 import type { RawJSONLines } from './types'
 import {
     buildInitialPromptUserRecord,
@@ -35,7 +34,6 @@ export {
 
 export interface InitialPromptSink {
   sessionId: string | null
-  hasTitle(): boolean
   sendClaudeSessionMessage(record: RawJSONLines, localId?: string): void
   recordAppPrompt(text: string): void
   pushPrompt(text: string): void
@@ -135,7 +133,7 @@ export async function deliverPreparedClaudeSessionStart(input: {
       input.sink.recordAppPrompt(prompt)
       const ack = await pending
       if (!ack.ok) throw new InitialPromptNotDurableError(ack.reason ?? 'unknown')
-      pushInitialPrompt(prompt, input.sink)
+      input.sink.pushPrompt(prompt)
     } else {
       deliverInitialPrompt(prompt, input.sink, localId)
     }
@@ -144,26 +142,11 @@ export async function deliverPreparedClaudeSessionStart(input: {
   return prompt !== null
 }
 
-/** Starts the turn. Split out so the confirmed path can defer only this half. */
-function pushInitialPrompt(prompt: string, sink: InitialPromptSink): void {
-  let pushText = prompt
-  if (!sink.hasTitle()) {
-    const withTitle = appendTitleInstruction(pushText)
-    if (withTitle !== pushText) {
-      pushText = withTitle
-      sink.recordAppPrompt(pushText)
-    }
-  }
-  sink.pushPrompt(pushText)
-}
-
 export function deliverInitialPrompt(prompt: string, sink: InitialPromptSink, localId?: string): void {
   // (b) 서버 히스토리: 원문 그대로 — 앱은 이 레코드로 사용자 말풍선을 그린다.
   sink.sendClaudeSessionMessage(buildInitialPromptUserRecord(prompt, sink.sessionId), localId)
   // SDK가 곧 같은 텍스트를 JSONL에 쓴다 — 스캐너 이중 포워딩 방지 스탬프.
   sink.recordAppPrompt(prompt)
 
-  // (a) 턴 시작. 새 세션엔 제목이 없으므로 onUserMessage와 동일하게 모델 사본에만
-  // 제목 지시를 덧붙이고, 변형본도 dedupe 스탬프한다.
-  pushInitialPrompt(prompt, sink)
+  sink.pushPrompt(prompt)
 }

@@ -523,7 +523,7 @@ async function runClaudeRemote(
     const promptOptions = buildClaudeSystemPromptOptions({
         customSystemPrompt: initial.mode.customSystemPrompt,
         appendSystemPrompt: launchedPrompt.provider,
-        chatTitlePrompt: CHAT_TITLE_SYSTEM_PROMPT,
+        chatTitlePrompt: opts.offTurnTitle?.afterResponse ? undefined : CHAT_TITLE_SYSTEM_PROMPT,
         saycodeSystemPrompt: saycodeOwnedSystemPrompt,
         agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
         orchestratorPrompt,
@@ -822,9 +822,7 @@ function readTurnText(content: unknown): string {
         prompt: messages,
         options: sdkOptions,
     });
-    // A scoped process sandbox and a managed run keep the in-turn title: their
-    // boundary is the outer process wrapper or the approved plan, which a
-    // second query would not share.
+    // A secondary title query may only share a launch without an outer process sandbox or managed plan.
     if (!processSandbox && opts.managedRun !== true) opts.offTurnTitle?.provide(sdkOptions);
     // A managed run answers only the prompt its envelope admitted; a side question would be a second one.
     const sideQuestionRequest = opts.managedRun === true ? null : sideQuestionRequestOf(response);
@@ -1264,8 +1262,11 @@ function readTurnText(content: unknown): string {
                     });
                 }
                 finishLessonReview();
-                // Send ready event
+                // Publish the completed reply before starting optional title work.
                 opts.onReady();
+                if (message.subtype === 'success' && !message.is_error && !processSandbox && !opts.managedRun) {
+                    opts.offTurnTitle?.afterResponse?.();
+                }
 
                 if (opts.exitAfterFirstTurn) {
                     /*

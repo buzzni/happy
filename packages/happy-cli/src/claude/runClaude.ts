@@ -64,8 +64,7 @@ import { parseSpecialCommand } from '@/parsers/specialCommands';
 import { applyAxOrchestration, removeAxSaycodeBasePrompt } from '@/orchestrator/prompts/integrate';
 import { isSaycodePromptBlockEnabled, resolveMessagePromptBlocks, withoutTurnScopedBlocks, type SaycodePromptBlockOverrides } from '@/prompt/promptProvenance';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
-import { appendTitleInstruction } from '@/utils/titlePrompt';
-import { createOffTurnTitleJob, titleCoveredForTurn } from '@/utils/offTurnTitle';
+import { createOffTurnTitleJob } from '@/utils/offTurnTitle';
 import { createClaudeTitleBridge } from './claudeOffTurnTitle';
 import { registerAxRpcHandlers } from '@/orchestrator/registerAxRpcHandlers';
 import {
@@ -989,11 +988,9 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     );
     const hookSettingsPath = writeHookSettings();
 
-    // Titles a new chat outside the user's turn with claudeRemote's own launch
-    // options (see claudeOffTurnTitle). Managed runs, process sandboxes (scoped
-    // or mandatory policy) and run-once hosts keep the in-turn instruction.
+    // A separate title query may use only a launch whose credential and sandbox support it.
     const offTurnTitleBridge = createClaudeTitleBridge({ titleModel: (requested, launched) => orgTitleModel(orgGate, requested, launched) });
-    let workspaceTitleObserved = false;
+    let pendingTitle: { message: string; model?: string } | undefined;
     const offTurnTitleEligible = process.env.HAPPY_AI_AUTH_SOURCE !== 'personal-endpoint' && managedStartup === null && !scopeLaunch && !exitAfterFirstTurn
         && sandboxPolicyMode !== 'mandatory';
     const offTurnTitle = createOffTurnTitleJob({
@@ -1003,6 +1000,27 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         hasTitle: () => session.hasTitle(),
         log: (message, detail) => logger.warn(message, detail),
     });
+    let firstTitleInputSeen = false;
+    const rememberTitle = (text: string, model?: string) => {
+        if (offTurnTitleEligible && !firstTitleInputSeen && text.trim() && !session.hasTitle()) {
+            firstTitleInputSeen = true;
+            pendingTitle = { message: text.slice(0, 4000), model };
+        }
+    };
+    const afterTitleResponse = () => {
+        const input = pendingTitle;
+        pendingTitle = undefined;
+        if (!input || session.hasTitle()) return;
+        const generate = () => {
+            offTurnTitle.start(input.message, input.model);
+            return offTurnTitle.settled();
+        };
+        if ((workspaceControl || automationExecution) && runtimeGate) {
+            void runtimeGate.admit(generate, 'writer').catch(() => logger.warn('[workspace-context] Title writer unconfirmed'));
+        } else {
+            void generate();
+        }
+    };
     logger.debug(`[START] Generated hook settings file: ${hookSettingsPath}`);
 
     // Print log file path
@@ -1787,36 +1805,6 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             orgModel: messageOrgModel,
         };
 
-        // Until the chat has a title, nudge the model to call `change_title`
-        // by appending the instruction to the turn it actually reads. The base
-        // system prompt carries the same instruction but the model routinely
-        // skips it while a long first turn runs; a message-level nudge (as the
-        // Codex backend already does) makes titling reliable. hasTitle() closes
-        // this once a title exists — including resumed sessions titled earlier —
-        // and the tool locks after the first set, so we never re-title.
-        //
-        // Only the model's copy changes; the app renders its own user bubble.
-        // recordAppPrompt() de-dupes the modified turn so the remote-mode JSONL
-        // scanner doesn't forward it back to the app as a second message.
-        const coveredTitle = titleCoveredForTurn({
-            hasTitle: session.hasTitle(),
-            job: offTurnTitle,
-            eligible: offTurnTitleEligible,
-            message: pushText,
-            model: messageModel,
-        });
-        if ((workspaceControl || automationExecution) && runtimeGate && !workspaceTitleObserved && offTurnTitle.covers()) {
-            workspaceTitleObserved = true;
-            void runtimeGate.admit(() => offTurnTitle.settled(), 'writer').catch(() => logger.warn('[workspace-context] Title writer unconfirmed'));
-        }
-        if (!coveredTitle) {
-            const withTitle = appendTitleInstruction(pushText);
-            if (withTitle !== pushText) {
-                pushText = withTitle;
-                recordAppPrompt(pushText);
-            }
-        }
-
         // The visible user row stays unchanged; only the provider receives the
         // prior transcript on this first accepted turn.
         const deferredTurn = deferredContinuation.prepare(pushText);
@@ -1839,6 +1827,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 inputAttendanceFromMeta(message.meta, session.getMetadata()?.source),
                 session.queueInput(message),
             );
+            rememberTitle(message.content.text, messageModel);
             queuedAppPrompts.push(queuedText);
             deferredTurn?.commit();
             if (routed) {
@@ -1932,7 +1921,6 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             : {}),
         sink: {
             sessionId: session.sessionId,
-            hasTitle: () => session.hasTitle(),
             sendClaudeSessionMessage: (record, localId) => session.sendClaudeSessionMessage(record, localId),
             recordAppPrompt,
             pushPrompt: (text) => {
@@ -1944,6 +1932,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                         allowAutomationReconnectPrompt,
                     ),
                 }, undefined, initialPromptAttendance(delegatedAttendance, source));
+                rememberTitle(text, mode.model);
                 logger.debug('[START] Delivered initial prompt from HAPPY_INITIAL_PROMPT');
             },
         },
@@ -2347,7 +2336,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         sandboxConfig: checkpointComposition.sandboxConfig,
         checkpointComposition,
         hookSettingsPath,
-        offTurnTitle: offTurnTitleBridge,
+        offTurnTitle: { ...offTurnTitleBridge, afterResponse: afterTitleResponse },
         jsRuntime: options.jsRuntime,
         exitAfterFirstTurn,
         outputFormat,

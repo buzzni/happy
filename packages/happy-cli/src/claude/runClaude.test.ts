@@ -937,10 +937,8 @@ describe('runClaude remote JSONL scanner', () => {
             appendSystemPrompt: 'USER PROJECT CONTEXT',
             saycodeSystemPromptEnabled: false,
         });
-        // The recovered turn keeps the chat title nudge: titling is product
-        // plumbing, not a Saycode-owned instruction, so it survives OFF.
         expect(harness.loopOptions.messageQueue.queue[0].message).toContain('복구 후 이어서 작업해줘');
-        expect(harness.loopOptions.messageQueue.queue[0].message).toContain(TITLE_INSTRUCTION);
+        expect(harness.loopOptions.messageQueue.queue[0].message).not.toContain(TITLE_INSTRUCTION);
         expect(process.env.HAPPY_INITIAL_APPEND_SYSTEM_PROMPT).toBeUndefined();
         expect(process.env.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED).toBeUndefined();
 
@@ -1733,7 +1731,7 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
-    it('keeps the change_title instruction for an untitled chat under a mandatory sandbox policy', async () => {
+    it('keeps a sandboxed conversation free of automatic title requests', async () => {
         process.env.HAPPY_SANDBOX_POLICY_MODE = 'mandatory';
         process.env.HAPPY_PROJECT_SANDBOX_CONFIG = JSON.stringify({ enabled: true });
         const harness = await startRemoteRunClaudeHarness();
@@ -1749,7 +1747,7 @@ describe('runClaude remote JSONL scanner', () => {
         const queued = harness.loopOptions.messageQueue.queue;
         expect(queued).toHaveLength(1);
         expect(queued[0].message).toContain('로그인 버튼이 안 눌려');
-        expect(queued[0].message).toContain(TITLE_INSTRUCTION);
+        expect(queued[0].message).not.toContain(TITLE_INSTRUCTION);
         await harness.finish();
     });
 
@@ -2203,7 +2201,7 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
-    it('still appends the change_title instruction on a run-once host, even with Saycode prompts disabled', async () => {
+    it('keeps a run-once host focused on its requested turn', async () => {
         process.env.HAPPY_AUTOMATION_RUN_ONCE = '1';
         process.env.HAPPY_INITIAL_PROMPT = '업무 브리핑';
         const harness = await startRemoteRunClaudeHarness();
@@ -2221,7 +2219,7 @@ describe('runClaude remote JSONL scanner', () => {
 
         const queued = harness.loopOptions.messageQueue.queue;
         const userTurn = queued.find((entry: any) => entry.message.includes('use my own harness'));
-        expect(userTurn.message).toContain(TITLE_INSTRUCTION);
+        expect(userTurn.message).not.toContain(TITLE_INSTRUCTION);
         expect(userTurn.mode.saycodeSystemPromptEnabled).toBe(false);
         await harness.finish();
     });

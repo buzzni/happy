@@ -223,7 +223,7 @@ describe('claudeRemote', () => {
     });
 
     describe('off-turn title bridge', () => {
-        const bridge = () => ({ provide: vi.fn(), clear: vi.fn(), run: vi.fn() });
+        const bridge = () => ({ provide: vi.fn(), clear: vi.fn(), run: vi.fn(), afterResponse: vi.fn() });
         const run = async (overrides: Record<string, unknown>) => {
             vi.mocked(query).mockReturnValue({ async *[Symbol.asyncIterator]() { yield { type: 'result', subtype: 'success' }; } } as any);
             let count = 0;
@@ -235,7 +235,12 @@ describe('claudeRemote', () => {
 
         it('provides the options the main query started with, then withdraws them when the query ends', async () => {
             const offTurnTitle = bridge();
-            await run({ offTurnTitle });
+            const onReady = vi.fn();
+            await run({ offTurnTitle, onReady });
+            expect(offTurnTitle.afterResponse).toHaveBeenCalledOnce();
+            expect(onReady.mock.invocationCallOrder[0]).toBeLessThan(offTurnTitle.afterResponse.mock.invocationCallOrder[0]);
+            expect(offTurnTitle.afterResponse.mock.invocationCallOrder[0]).toBeLessThan(offTurnTitle.clear.mock.invocationCallOrder[0]);
+            expect(vi.mocked(query).mock.calls[0][0].options?.appendSystemPrompt ?? '').not.toContain('mcp__happy__change_title');
             expect(offTurnTitle.provide).toHaveBeenCalledWith(vi.mocked(query).mock.calls[0][0].options);
             expect(offTurnTitle.clear).toHaveBeenCalledOnce();
             expect(offTurnTitle.clear.mock.invocationCallOrder[0]).toBeGreaterThan(offTurnTitle.provide.mock.invocationCallOrder[0]);
@@ -245,6 +250,7 @@ describe('claudeRemote', () => {
             const offTurnTitle = bridge();
             await run({ offTurnTitle, sandboxPolicyMode: 'mandatory', scopeProcessSandbox: { spawn: vi.fn(), close: vi.fn() } });
             expect(offTurnTitle.provide).not.toHaveBeenCalled();
+            expect(offTurnTitle.afterResponse).not.toHaveBeenCalled();
         });
     });
 

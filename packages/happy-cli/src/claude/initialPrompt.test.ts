@@ -8,7 +8,6 @@ import {
   prepareClaudeInitialPrompt,
   type InitialPromptSink,
 } from './initialPrompt'
-import { TITLE_INSTRUCTION } from '@/utils/titlePrompt'
 import { resolveInitialPromptPermissionMode } from '@/utils/initialPrompt'
 
 describe('consumePendingInitialPrompt', () => {
@@ -127,7 +126,6 @@ function makeSink(overrides: Partial<InitialPromptSink> = {}) {
   const pushed: string[] = []
   const sink: InitialPromptSink = {
     sessionId: 'session-1',
-    hasTitle: () => false,
     sendClaudeSessionMessage: (record) => { sent.push(record) },
     recordAppPrompt: (text) => { recorded.push(text) },
     pushPrompt: (text) => { pushed.push(text) },
@@ -137,7 +135,7 @@ function makeSink(overrides: Partial<InitialPromptSink> = {}) {
 }
 
 describe('deliverInitialPrompt', () => {
-  it('shouldSendOriginalPromptToServerHistoryAndPushTitledCopy', () => {
+  it('shouldDeliverTheOriginalPromptWithoutATitleToolRoundTrip', () => {
     const { sink, sent, recorded, pushed } = makeSink()
     deliverInitialPrompt('배포 상태 확인해줘', sink)
 
@@ -145,21 +143,11 @@ describe('deliverInitialPrompt', () => {
     expect(sent).toHaveLength(1)
     expect((sent[0] as any).message.content).toBe('배포 상태 확인해줘')
 
-    // (a) 턴 시작: 제목 지시가 덧붙은 모델 사본 한 건
-    expect(pushed).toHaveLength(1)
-    expect(pushed[0]).toContain('배포 상태 확인해줘')
-    expect(pushed[0]).toContain(TITLE_INSTRUCTION)
-
-    // 스캐너 dedupe 스탬프: 원문 + 변형본 둘 다
-    expect(recorded).toEqual(['배포 상태 확인해줘', pushed[0]])
+    expect(pushed).toEqual(['배포 상태 확인해줘'])
+    expect(recorded).toEqual(pushed)
   })
 
-  it('shouldSkipTitleInstructionWhenSessionAlreadyTitled', () => {
-    const { sink, recorded, pushed } = makeSink({ hasTitle: () => true })
-    deliverInitialPrompt('prompt', sink)
-    expect(pushed).toEqual(['prompt'])
-    expect(recorded).toEqual(['prompt'])
-  })
+
 })
 
 describe('deliverPreparedClaudeSessionStart', () => {

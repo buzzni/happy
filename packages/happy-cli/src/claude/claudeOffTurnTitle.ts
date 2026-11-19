@@ -58,10 +58,8 @@ type RunQuery = (params: { prompt: string; options?: QueryOptions }) => AsyncIte
 export type ClaudeTitleModel = (requested: string | undefined, launched: string | undefined) => string | undefined;
 
 /**
- * Connects the title job, started when a message is queued, to the options
- * claudeRemote settles once it handles that message. `run` waits for
- * `provide` (bounded by `waitMs` and the job's signal); `clear` withdraws the
- * options when that query ends, so a later run never reuses a stale launch.
+ * Supplies the completed foreground query's launch options to the title job.
+ * Clearing them when that query ends prevents later work from using a stale launch.
  */
 export function createClaudeTitleBridge(opts: { runQuery?: RunQuery; waitMs?: number; titleModel?: ClaudeTitleModel } = {}) {
     const runQuery = opts.runQuery ?? (query as RunQuery);
@@ -121,4 +119,4 @@ export function createClaudeTitleBridge(opts: { runQuery?: RunQuery; waitMs?: nu
     };
 }
 
-export type ClaudeTitleBridge = ReturnType<typeof createClaudeTitleBridge>;
+export type ClaudeTitleBridge = ReturnType<typeof createClaudeTitleBridge> & { afterResponse?: () => void };
