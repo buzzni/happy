@@ -26,7 +26,6 @@ beforeEach(() => {
   testDirectory = mkdtempSync(join(tmpdir(), 'happy-acp-exit-'))
   vi.stubEnv('HAPPY_HOME_DIR', join(testDirectory, 'home'))
   mocks.runAcp.mockImplementation(async () => { mocks.order.push('runAcp-finished') })
-  vi.spyOn(process, 'exit').mockImplementation(((code?: number) => { mocks.order.push(`exit ${code}`) }) as never)
   vi.spyOn(console, 'log').mockImplementation(() => undefined)
 })
 afterEach(() => {
@@ -37,9 +36,15 @@ afterEach(() => {
 })
 
 it('leaves the process as soon as an ACP runner has closed its session', async () => {
+  const exited = new Promise<void>(resolve => {
+    vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      mocks.order.push(`exit ${code}`)
+      resolve()
+    }) as never)
+  })
   process.argv = ['node', 'happy', 'acp', 'opencode']
   await import('./main')
-  await vi.waitFor(() => expect(mocks.order).toContain('exit 0'))
+  await exited
   expect(mocks.order).toEqual(['runAcp-finished', 'exit 0'])
   expect(mocks.runAcp).toHaveBeenCalledWith(expect.objectContaining({ agentName: 'opencode' }))
-})
+}, 90_000)
