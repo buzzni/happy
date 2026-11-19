@@ -8,7 +8,8 @@ export async function awaitFileExist(file: string, timeout: number = 10000) {
             await access(file);
             return true;
         } catch (e) {
-            await delay(1000);
+            // Short: the first Claude turn holds its message loop on this wait.
+            await delay(50);
         }
     }
     return false;
