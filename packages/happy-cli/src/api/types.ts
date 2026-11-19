@@ -281,7 +281,7 @@ export const MachineMetadataSchema = z.object({
    * A separate field rather than a v2 of `aiAuthSelection`, which clients support at exactly version 1.
    * Windows daemons do not publish it (§6.3-5).
    */
-  agentPlan: z.object({ version: z.literal(1), claude: z.literal(1).optional(), claudeModels:z.array(z.string().min(1).max(200)).max(100).optional() }).optional(),
+  agentPlan: z.object({ version: z.literal(1), claude: z.literal(1).optional(), claudeModels:z.array(z.string().min(1).max(200)).max(100).optional(), codexModels: z.array(z.string().min(1).max(200)).max(100).optional() }).optional(),
   /**
    * Saycode specs/claude-cli-benchmark-followups R2 — `spawn-happy-session` accepts `outputFormat`
    * for these agents. Absent on an older daemon, which would drop the field and run the session

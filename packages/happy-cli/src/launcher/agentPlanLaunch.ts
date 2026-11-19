@@ -13,8 +13,18 @@
  */
 import { readTrustedStudioOrigin } from '@/daemon/setupTokenBindingProof'
 
-/** Advertised in machine metadata as `agentPlan` by every daemon platform (see `agentPlanCapabilityForPlatform`). */
-export const AGENT_PLAN_CAPABILITY = { version: 1 as const, claude: 1 as const, claudeModels:['deepseek/deepseek-v4.1-flash-eco','moonshotai/kimi-k3.1-pro'] }
+/**
+ * Advertised in machine metadata as `agentPlan` by every daemon platform (see `agentPlanCapabilityForPlatform`).
+ * `codexModels` lists the Codex plan models this daemon can launch, so Studio and Desktop offer a newer plan model
+ * (aplus-dev-studio specs/agent-plan-newer-model-autoupgrade) only to machines that run it. It must match the GPT
+ * keys of `AGENT_PLAN_MODEL_CONTEXT`.
+ */
+export const AGENT_PLAN_CAPABILITY = {
+    version: 1 as const,
+    claude: 1 as const,
+    claudeModels:['deepseek/deepseek-v4.1-flash-eco','moonshotai/kimi-k3.1-pro'],
+    codexModels: ['gpt-6-luna', 'gpt-6.1-terra', 'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6.2-sol', 'gpt-6.2-astra'],
+}
 
 /** Spawn seeds: read and deleted by the runner, never inherited (childEnv `HAPPY_INITIAL_`). */
 export const AGENT_PLAN_DESCRIPTOR_ENV = 'HAPPY_INITIAL_AGENT_PLAN_DESCRIPTOR'
@@ -31,8 +41,9 @@ export const AGENT_PLAN_PROVIDER_ID = 'saycode-plan'
 export const AGENT_PLAN_DESCRIPTOR_VERSION = 1
 
 /**
- * Provider API context (1,050,000) for all four plan models, verified 2026-11-10:
- * https://developers.openai.com/api/docs/models/gpt-6.1-sol (also Luna, Terra and Astra).
+ * Provider API context (1,050,000) for every GPT plan model, verified 2026-11-10:
+ * https://developers.openai.com/api/docs/models/gpt-6.1-sol (also Luna, Terra and Astra), and 2026-11-19 for
+ * https://developers.openai.com/api/docs/models/gpt-6.2-sol and gpt-6.2-astra.
  * Compaction leaves the provider's 128k output budget plus 22k for framing/tool definitions.
  */
 const AGENT_PLAN_MODEL_CONTEXT = {
@@ -42,6 +53,8 @@ const AGENT_PLAN_MODEL_CONTEXT = {
     'gpt-6.1-terra': { contextWindow: 1050000, autoCompactTokenLimit: 900000 },
     'gpt-6.1-sol': { contextWindow: 1050000, autoCompactTokenLimit: 900000 },
     'gpt-6-astra': { contextWindow: 1050000, autoCompactTokenLimit: 900000 },
+    'gpt-6.2-sol': { contextWindow: 1050000, autoCompactTokenLimit: 900000 },
+    'gpt-6.2-astra': { contextWindow: 1050000, autoCompactTokenLimit: 900000 },
 } as const
 
 // Read compatibility only: saved sessions are validated here, then upgraded to provider settings.

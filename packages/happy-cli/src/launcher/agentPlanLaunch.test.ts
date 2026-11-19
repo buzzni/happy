@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
+    AGENT_PLAN_CAPABILITY,
     AGENT_PLAN_PROVIDER_ID,
     AgentPlanLaunchError,
+    agentPlanAgent,
     agentPlanCodexArgs,
     agentPlanGatewayResponsesUrl,
     agentPlanSessionKeysUrl,
@@ -47,6 +49,22 @@ describe('buildAgentPlanDescriptor', () => {
         expect(buildAgentPlanDescriptor({ origin: ORIGIN, grantId: GRANT, model: 'gpt-6-astra' })).toMatchObject({
             contextWindow: 1050000, autoCompactTokenLimit: 900000,
         })
+    })
+
+    // web-ui specs/agent-plan-newer-model-autoupgrade — OpenAI 문서(2026-11-19): 두 모델 모두 context 1,050,000.
+    it.each(['gpt-6.2-sol', 'gpt-6.2-astra'])('accepts the plan model %s with the provider context', (model) => {
+        expect(buildAgentPlanDescriptor({ origin: ORIGIN, grantId: GRANT, model })).toMatchObject({
+            model, contextWindow: 1050000, autoCompactTokenLimit: 900000,
+        })
+    })
+
+    // 서버·Desktop 은 이 목록으로 이 PC 가 새 플랜 모델을 실행하는지 판단한다. 실행 표와 어긋나면 실행이 거부된다.
+    it('advertises only Codex plan models this daemon can launch', () => {
+        for (const model of AGENT_PLAN_CAPABILITY.codexModels) {
+            const descriptor = buildAgentPlanDescriptor({ origin: ORIGIN, grantId: GRANT, model })
+            expect(descriptor, model).not.toBeNull()
+            expect(descriptor && agentPlanAgent(descriptor.model), model).toBe('codex')
+        }
     })
 
     it('refuses a model outside the plan catalog instead of guessing its context', () => {
