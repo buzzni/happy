@@ -74,4 +74,18 @@ describe('resumeExistingThread', () => {
             }),
         ).rejects.toThrow('Failed to resume Codex thread thread-404: thread not found');
     });
+
+    it.each(['released', 'held', 'cancelled'] as const)('reuses the same thread when its writer is %s', async outcome => {
+        const threadId = 'thread-1';
+        const error = new Error(`thread/resume: thread ${threadId} already has an active writer (code=-32600)`);
+        const client = { resumeThread: vi.fn().mockRejectedValue(error) };
+        if (outcome === 'released') client.resumeThread.mockRejectedValueOnce(error).mockResolvedValue({ threadId, model: 'gpt-6.1-sol' });
+        const session = { updateMetadata: vi.fn(), sendSessionEvent: vi.fn() };
+        const canRetry = vi.fn().mockReturnValue(outcome !== 'cancelled').mockReturnValueOnce(true);
+        const pending = resumeExistingThread({ client, session, messageBuffer: { addMessage: vi.fn() }, threadId, cwd: '/tmp/project', mcpServers: {}, canRetry });
+        if (outcome === 'released') await expect(pending).resolves.toMatchObject({ threadId });
+        else await expect(pending).rejects.toThrow('already has an active writer');
+        expect(client.resumeThread.mock.calls).toEqual(Array.from({ length: outcome === 'cancelled' ? 1 : 2 }, () => [{ threadId, cwd: '/tmp/project', mcpServers: {}, developerInstructions: undefined }]));
+        expect(session.updateMetadata).toHaveBeenCalledTimes(outcome === 'released' ? 1 : 0);
+    });
 });
