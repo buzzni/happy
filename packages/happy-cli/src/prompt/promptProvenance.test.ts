@@ -178,8 +178,19 @@ describe('clientTurnPromptChange', () => {
 
   it('names what differs for a log line by block checksum, without any prompt text', () => {
     const token = (block: string) => block.split('\n')[0].replace('<!-- saycode:client-turn-prompt:', '').replace(':start -->', '');
-    expect(describeClientPromptChange(launched, `OTHER CONTEXT\n\n${guide}`)).toBe(`standing context +${token(guide)} -${token(preview)}`);
+    expect(describeClientPromptChange(launched, `OTHER CONTEXT\n\n${guide}`)).toBe(`standing context [-12 +13] +${token(guide)} -${token(preview)}`);
     expect(describeClientPromptChange(launched, launched)).toBe('same');
+  });
+
+  it('names a changed standing paragraph by its length only, so a restart can be traced to the block that moved', () => {
+    expect(describeClientPromptChange('PERSONAL\n\nDIRS A\n\nRULES', 'PERSONAL\n\nDIRS AB\n\nRULES')).toBe('standing context [-6 +7]');
+    expect(describeClientPromptChange('PERSONAL', 'PERSONAL\n\nRULES')).toBe('standing context [+5]');
+  });
+
+  it('falls back to the total lengths when no paragraph is new, and caps a long list', () => {
+    expect(describeClientPromptChange('AA\n\nB', 'B\n\nAA')).toBe('standing context [len 5→5]');
+    const many = Array.from({ length: 25 }, (_, i) => `P${String(i).padStart(2, '0')}`).join('\n\n');
+    expect(describeClientPromptChange(undefined, many)).toBe(`standing context [${Array(20).fill('+3').join(' ')} …+5]`);
   });
 });
 
