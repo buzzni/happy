@@ -10,12 +10,17 @@ export interface AgentRelationHost { serverUrl: string; machineId: string; token
 const MAX_BODY = 65_536;
 const unknown = (reason: string): AgentOwnershipVerdict => ({ relation: 'unknown', proof: null, reason });
 
-/** Read once when the host starts, before the provider: the daemon's server-confirmed machine id and this home's token. */
+/**
+ * Read once when the host starts, before the provider: this home's machine id and token. The relation route answers
+ * 403 unless that machine belongs to the token's account, so the server confirms it on every lookup. A local
+ * `machineIdConfirmedByServer` flag is not required: nothing has written it since upstream 58ff81dff, and requiring
+ * it turned every relation into identity-unavailable.
+ */
 export async function readAgentRelationHost(input: { serverUrl: string;
-    settings(): Promise<{ machineId?: string; machineIdConfirmedByServer?: boolean }>; credentials(): Promise<{ token: string } | null> }): Promise<AgentRelationHost | null> {
+    settings(): Promise<{ machineId?: string }>; credentials(): Promise<{ token: string } | null> }): Promise<AgentRelationHost | null> {
     try {
         const [settings, credentials] = await Promise.all([input.settings(), input.credentials()]);
-        if (!settings.machineId || settings.machineIdConfirmedByServer !== true || !credentials?.token) return null;
+        if (!settings.machineId || !credentials?.token) return null;
         return { serverUrl: input.serverUrl, machineId: settings.machineId, token: credentials.token };
     } catch { return null; }
 }

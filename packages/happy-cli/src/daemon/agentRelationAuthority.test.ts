@@ -79,11 +79,13 @@ describe('broker relation authority (personal-ownership-simplification-plan H-C2
 });
 
 describe('host identity fixed at start', () => {
-    it('uses only a server-confirmed machine id and this home\'s token', async () => {
+    it('uses this home\'s machine id and token; the relation route itself refuses a machine of another account', async () => {
         const credentials = async () => ({ token: 'happy-token' });
         expect(await readAgentRelationHost({ serverUrl: host.serverUrl, settings: async () => ({ machineId: 'machine-1', machineIdConfirmedByServer: true }), credentials }))
             .toEqual(host);
-        expect(await readAgentRelationHost({ serverUrl: host.serverUrl, settings: async () => ({ machineId: 'machine-1' }), credentials })).toBeNull();
+        // Nothing has written machineIdConfirmedByServer since upstream 58ff81dff, so requiring it disabled every relation.
+        expect(await readAgentRelationHost({ serverUrl: host.serverUrl, settings: async () => ({ machineId: 'machine-1' }), credentials })).toEqual(host);
+        expect(await readAgentRelationHost({ serverUrl: host.serverUrl, settings: async () => ({}), credentials })).toBeNull();
         expect(await readAgentRelationHost({ serverUrl: host.serverUrl, settings: async () => ({ machineId: 'machine-1', machineIdConfirmedByServer: true }), credentials: async () => null })).toBeNull();
         expect(await readAgentRelationHost({ serverUrl: host.serverUrl, settings: async () => { throw new Error('unreadable'); }, credentials })).toBeNull();
     });
