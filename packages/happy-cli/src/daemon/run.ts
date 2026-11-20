@@ -71,7 +71,7 @@ import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
 import { normalizeSessionSource, type SessionSource } from '@/utils/sessionSource';
 import packageJson from '../../package.json';
 import { getEnvironmentInfo } from '@/ui/doctor';
-import { captureSpawnOutputStdio, closeCapturedSpawnOutputStdio, preflightInstalledHappyCLI, readCapturedSpawnOutputTail, spawnHappyCLI, startDetachedHappyCLI } from '@/utils/spawnHappyCLI';
+import { captureSpawnOutputStdio, closeCapturedSpawnOutputStdio, preflightInstalledHappyCLI, readCapturedSpawnOutputTail, resolveHappyCliSpawnCommand, spawnHappyCLI, startDetachedHappyCLI } from '@/utils/spawnHappyCLI';
 import {
   writeDaemonState,
   writeDaemonStateDebounced,
@@ -4732,7 +4732,9 @@ export async function startDaemon(): Promise<void> {
     // R18: a changed size/mtime only triggers a hash; identical bytes (a reinstall
     // of the same build) are not a replacement and do not hand off.
     const bundleWatcher = daemonIdentity.executable ? createBundleReplacementWatcher(daemonIdentity.executable) : null;
-    const bundleRemovalWatcher = daemonIdentity.executable ? createBundleRemovalWatcher(bundlePath, { graceMs: BUNDLE_REMOVAL_GRACE_MS }) : null;
+    // Sessions are spawned from this file (dist/index.mjs, or src/index.ts under tsx): losing it is what breaks them.
+    const spawnEntrypoint = resolveHappyCliSpawnCommand([]).entrypoint;
+    const bundleRemovalWatcher = existsSync(spawnEntrypoint) ? createBundleRemovalWatcher(spawnEntrypoint, { graceMs: BUNDLE_REMOVAL_GRACE_MS }) : null;
     if (!bundleWatcher) {
       // dist/index.mjs not present (e.g. dev mode via tsx) — skip upgrade detection.
       logger.debug(`[DAEMON RUN] Bundle at ${bundlePath} not found; self-restart on upgrade disabled`);
@@ -6585,8 +6587,8 @@ export async function startDaemon(): Promise<void> {
       // this process would keep the machine online and fail every start on it. Go offline instead.
       // heartbeatRunning stays set: no later beat runs while the shutdown proceeds.
       if (bundleRemovalWatcher?.check() && !standaloneWindows?.candidateId) {
-        logger.debug(`[DAEMON RUN] Bundle ${bundlePath} has been missing for ${BUNDLE_REMOVAL_GRACE_MS / 1000}s; the install was removed, shutting down`);
-        requestShutdown('exception', `Installed bundle removed: ${bundlePath}`);
+        logger.debug(`[DAEMON RUN] Spawn entrypoint ${spawnEntrypoint} has been missing for ${BUNDLE_REMOVAL_GRACE_MS / 1000}s; the install was removed, shutting down`);
+        requestShutdown('exception', `Installed bundle removed: ${spawnEntrypoint}`);
         return;
       }
       let bundleReplaced = false;
