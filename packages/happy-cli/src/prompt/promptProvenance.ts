@@ -155,23 +155,27 @@ export function splitTurnOnlyPromptBlocks(
 
 /**
  * For a log line: which part of the prompt differs. Block tokens are envelope checksums, never prompt text.
- * A standing context change lists the lengths of the paragraphs only one side has, which is enough to
- * tell which composed block moved (each has a recognisable size) without logging any of it.
+ * A standing context change lists the lengths of the paragraphs only one side has (at most 20), which is
+ * enough to tell which composed block moved (each has a recognisable size) without logging any of it.
+ * A change no paragraph shows (order, repeats, blank lines) gives the two total lengths instead.
  */
 export function describeClientPromptChange(launched: string | undefined, next: string | undefined): string {
   const tokens = (prompt: string | undefined) => clientTurnPromptBlocks(prompt).map(clientTurnBlockToken);
   const before = tokens(launched);
   const after = tokens(next);
-  const paragraphs = (prompt: string | undefined) => (stripClientTurnPromptBlocks(prompt) ?? '').split(/\n{2,}/).filter(Boolean);
-  const standingBefore = paragraphs(launched);
-  const standingAfter = paragraphs(next);
+  const standingLaunched = stripClientTurnPromptBlocks(launched) ?? '';
+  const standingNext = stripClientTurnPromptBlocks(next) ?? '';
+  const standingBefore = standingLaunched.split(/\n{2,}/).filter(Boolean);
+  const standingAfter = standingNext.split(/\n{2,}/).filter(Boolean);
   const standingChange = [
     ...standingBefore.filter((paragraph) => !standingAfter.includes(paragraph)).map((paragraph) => `-${paragraph.length}`),
     ...standingAfter.filter((paragraph) => !standingBefore.includes(paragraph)).map((paragraph) => `+${paragraph.length}`),
   ];
+  const standingDetail = standingChange.length === 0
+    ? `len ${standingLaunched.length}→${standingNext.length}`
+    : [...standingChange.slice(0, 20), ...(standingChange.length > 20 ? [`…+${standingChange.length - 20}`] : [])].join(' ');
   return [
-    (stripClientTurnPromptBlocks(launched) ?? '') !== (stripClientTurnPromptBlocks(next) ?? '')
-      ? `standing context${standingChange.length > 0 ? ` [${standingChange.join(' ')}]` : ''}` : undefined,
+    standingLaunched !== standingNext ? `standing context [${standingDetail}]` : undefined,
     ...after.filter((token) => !before.includes(token)).map((token) => `+${token}`),
     ...before.filter((token) => !after.includes(token)).map((token) => `-${token}`),
   ].filter(Boolean).join(' ') || 'same';
