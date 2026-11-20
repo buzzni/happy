@@ -1,10 +1,11 @@
-import { mkdtempSync, utimesSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import {
     buildDaemonIdentity,
     checkExecutableReplaced,
+    createBundleRemovalWatcher,
     createBundleReplacementWatcher,
     readExecutableDigest,
     verifyDaemonIdentity,
@@ -137,3 +138,36 @@ describe('createBundleReplacementWatcher', () => {
     })
 })
 
+
+describe('createBundleRemovalWatcher', () => {
+    it('reports removal only after the bundle stayed missing for the whole grace period', () => {
+        const path = bundle('installed')
+        let now = 0
+        const watcher = createBundleRemovalWatcher(path, { graceMs: 120_000, now: () => now })
+        expect(watcher.check()).toBe(false)
+        rmSync(path)
+        expect(watcher.check()).toBe(false)
+        now = 119_999
+        expect(watcher.check()).toBe(false)
+        now = 120_000
+        expect(watcher.check()).toBe(true)
+    })
+
+    it('restarts the grace period when the bundle comes back mid-install', () => {
+        const path = bundle('installed')
+        let now = 0
+        const watcher = createBundleRemovalWatcher(path, { graceMs: 120_000, now: () => now })
+        rmSync(path)
+        expect(watcher.check()).toBe(false)
+        now = 60_000
+        writeFileSync(path, 'reinstalled')
+        expect(watcher.check()).toBe(false)
+        rmSync(path)
+        now = 120_000
+        expect(watcher.check()).toBe(false)
+        now = 239_999
+        expect(watcher.check()).toBe(false)
+        now = 240_000
+        expect(watcher.check()).toBe(true)
+    })
+})

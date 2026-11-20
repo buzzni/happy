@@ -115,7 +115,7 @@ import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
 import { prepareBrowserNativeMessaging, registerBrowserNativeHost } from './browserNativeHostRegistration';
 import { resolveExtensionDir, resolveExtensionId } from '@/commands/browser';
 import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation } from './handoff';
-import { createBundleReplacementWatcher, readOwnDaemonIdentity } from './daemonIdentity';
+import { createBundleRemovalWatcher, createBundleReplacementWatcher, readOwnDaemonIdentity } from './daemonIdentity';
 import { daemonRestartingRefusal } from './restartDrainLifecycle';
 import { countInTurnSessions, createAdmittedLaunchCounter, type RestartDrainActivity } from './restartDrain';
 import { createDaemonRestartDrainRuntime, type DaemonRestartDrainRuntime } from './restartDrainRuntime';
@@ -589,6 +589,8 @@ const DIFFICULTY_ROUTING_ELECTION_MAX_POLL_MS = 15 * 60_000;
 const SERVER_AUTOMATION_TICK_STALL_MS = 10 * 60_000;
 /** F8: how long new sessions are told the daemon is restarting while it moves to a new company key. */
 const COMPANY_KEY_RESEED_RESTART_MS = 2 * 60_000;
+/** How long dist/index.mjs may stay missing before the install counts as removed; an install rewrites it in seconds. */
+const BUNDLE_REMOVAL_GRACE_MS = 2 * 60_000;
 
 /**
  * Doubling delay while the route stays unreachable, capped at 15 minutes. A
@@ -4730,6 +4732,7 @@ export async function startDaemon(): Promise<void> {
     // R18: a changed size/mtime only triggers a hash; identical bytes (a reinstall
     // of the same build) are not a replacement and do not hand off.
     const bundleWatcher = daemonIdentity.executable ? createBundleReplacementWatcher(daemonIdentity.executable) : null;
+    const bundleRemovalWatcher = daemonIdentity.executable ? createBundleRemovalWatcher(bundlePath, { graceMs: BUNDLE_REMOVAL_GRACE_MS }) : null;
     if (!bundleWatcher) {
       // dist/index.mjs not present (e.g. dev mode via tsx) — skip upgrade detection.
       logger.debug(`[DAEMON RUN] Bundle at ${bundlePath} not found; self-restart on upgrade disabled`);
@@ -6578,6 +6581,14 @@ export async function startDaemon(): Promise<void> {
       // This must run before automation triggers. Starting a detached tick and
       // then tearing down the control server in the same heartbeat loses the
       // spawned session's webhook, report and project link.
+      // A deleted install (worktree removed, app moved or trashed) can no longer spawn sessions, yet
+      // this process would keep the machine online and fail every start on it. Go offline instead.
+      // heartbeatRunning stays set: no later beat runs while the shutdown proceeds.
+      if (bundleRemovalWatcher?.check() && !standaloneWindows?.candidateId) {
+        logger.debug(`[DAEMON RUN] Bundle ${bundlePath} has been missing for ${BUNDLE_REMOVAL_GRACE_MS / 1000}s; the install was removed, shutting down`);
+        requestShutdown('exception', `Installed bundle removed: ${bundlePath}`);
+        return;
+      }
       let bundleReplaced = false;
       if (bundleWatcher && !standaloneWindows?.candidateId) {
         // A file temporarily missing (mid-install) reads as not replaced — retried next heartbeat.

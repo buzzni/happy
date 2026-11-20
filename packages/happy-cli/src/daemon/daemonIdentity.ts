@@ -11,7 +11,7 @@
  * `dist/index.mjs` from a reinstall that only touched the mtime.
  */
 import { createHash } from 'node:crypto'
-import { readFileSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { getProcessStartedAt, getWindowsProcessStartedAt } from '@/utils/processStartTime'
 import { readCurrentBootIdSync } from '@/utils/bootIdentity'
 
@@ -88,6 +88,30 @@ export function checkExecutableReplaced(
     }
     if (sha256 === baseline.sha256) return { replaced: false, baseline: { ...baseline, size, mtimeMs } }
     return { replaced: true, baseline }
+}
+
+/**
+ * A missing bundle reads as "mid-install" to the replacement watcher, so a daemon
+ * whose install was deleted (worktree removed, app moved or trashed) would stay
+ * online forever while every session spawn fails. This tells the two apart by
+ * time: only a bundle missing for the whole grace period counts as removed.
+ */
+export function createBundleRemovalWatcher(
+    path: string,
+    deps: { graceMs: number; now?: () => number },
+): { check: () => boolean } {
+    const now = deps.now ?? Date.now
+    let missingSince: number | null = null
+    return {
+        check: () => {
+            if (existsSync(path)) {
+                missingSince = null
+                return false
+            }
+            missingSince ??= now()
+            return now() - missingSince >= deps.graceMs
+        },
+    }
 }
 
 export function buildDaemonIdentity(input: {
