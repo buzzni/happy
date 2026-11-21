@@ -12,6 +12,7 @@ import { createOwnedSpawnRuntime, createOwnedStartGuard, ownedSessionAuthorship 
 import { registerOwnedSpawnRpc } from './ownedSpawnRpc';
 import { createOwnedSpawnJournal } from './ownedSpawnJournal';
 import { ownedSpawnRecordSchema } from './ownedSpawn';
+import { withPinnedOwnershipTrust } from './sessionOwnershipTrust';
 const homes: string[] = [];
 afterEach(async () => { vi.restoreAllMocks(); await Promise.all(homes.splice(0).map(home => rm(home, { recursive: true, force: true }))); });
 async function fixture(options: { parent?: string; spawn?: Record<string, unknown> } = {}) {
@@ -456,6 +457,14 @@ describe('owned spawn carries the fields Desktop actually sends (T4RT-03)', () =
     it('drops a malformed session source as the legacy RPC does, without refusing the spawn', async () => {
         const f = await fixture();
         expect(await f.build().capabilities({ spawn: { ...desktopSpawn, sessionSource: 'Not A Source!' } })).toEqual({ ownedSpawnPrepareV1: true });
+    });
+
+    it('offers owned creation on a daemon whose only ownership trust is the pinned table (D5)', async () => {
+        const f = await fixture(), publicKey = Buffer.from(nacl.sign.keyPair().publicKey);
+        const table = { 'https://happy.test': { issuer: 'https://studio.test', audience: 'https://happy.test',
+            publicKeys: { [createHash('sha256').update(publicKey).digest('hex')]: publicKey.toString('base64url') } } };
+        expect(await f.build({ env: {} }).capabilities({ spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: false });
+        expect(await f.build({ env: withPinnedOwnershipTrust({}, 'https://happy.test', table) }).capabilities({ spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: true });
     });
 });
 
