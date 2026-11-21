@@ -164,13 +164,13 @@ describe('message batch writes against the stored rows', () => {
     });
 });
 
-async function observe(query = 'observation_version=1&after_seq=0&limit=1', accountId = 'account-1', sessionId = 'session-1') {
+async function observe(query = 'observation_version=1&after_seq=0&limit=1', accountId = 'account-1', sessionId = 'session-1', headers: Record<string, string> = {}) {
     const app = fastify(); app.setValidatorCompiler(validatorCompiler); app.setSerializerCompiler(serializerCompiler);
     const typed = app.withTypeProvider<ZodTypeProvider>() as unknown as Fastify;
     const authenticate = async (request: any) => { request.userId = accountId; };
     typed.decorate('authenticate', authenticate); typed.decorate('authenticateSessionScope', authenticate);
     v3SessionRoutes(typed); await typed.ready();
-    try { return await typed.inject({ method: 'GET', url: `/v3/sessions/${sessionId}/messages?` + query }); }
+    try { return await typed.inject({ method: 'GET', url: `/v3/sessions/${sessionId}/messages?` + query, headers }); }
     finally { await typed.close(); }
 }
 it('refuses observation until all writers are explicitly opted into a cohort', async () => {
@@ -194,6 +194,17 @@ it('does not expose coverage of another account and preserves the legacy respons
     expect((await observe(undefined, 'other')).statusCode).toBe(404);
     const legacy = (await observe('after_seq=0&limit=1')).json();
     expect(legacy.observation).toBeUndefined(); expect(legacy.messages[0].contentRevision).toBeUndefined();
+})
+it('hides protected-session history from observation reads that do not declare PII support', async () => {
+    process.env.HAPPY_OBSERVATION_COHORT = 'test-cohort';
+    await client.session.create({ data: { id: 'protected-1', tag: 'protected-1', accountId: 'account-1', metadata: '', seq: 1, piiMode: 'host-masking', piiProtection: true } });
+    await client.sessionMessage.create({ data: { sessionId: 'protected-1', seq: 1, content: { t: 'encrypted', c: 'protected-content' } } });
+    const hidden = await observe(undefined, 'account-1', 'protected-1');
+    expect(hidden.statusCode).toBe(404);
+    expect(hidden.body).not.toContain('protected-content');
+    const declared = await observe(undefined, 'account-1', 'protected-1', { 'x-happy-pii-protection': '1' });
+    expect(declared.statusCode).toBe(200);
+    expect(declared.json().messages.map((message: { seq: number }) => message.seq)).toEqual([1]);
 })
 
 it('changes a same-seq content revision without declaring response finality', async () => {

@@ -15,11 +15,11 @@ export function observationCapability() {
 }
 
 /** One repeatable-read snapshot binds the commit watermark, page and encryption generation; no plaintext custody. */
-export async function readSessionObservation(accountId: string, sessionId: string, after: number, through: number | undefined, limit: number) {
+export async function readSessionObservation(accountId: string, sessionId: string, after: number, through: number | undefined, limit: number, visibility: { piiProtection?: false }) {
     const selectedCohort = cohort();
     if (!selectedCohort) return { status: 503, body: { error: 'observation-unavailable' } };
     return db.$transaction(async tx => {
-        const session = await tx.session.findFirst({ where: { id: sessionId, accountId }, select: {
+        const session = await tx.session.findFirst({ where: { id: sessionId, ...visibility, accountId }, select: {
             id: true, seq: true, createdAt: true, dataEncryptionKey: true,
         } });
         if (!session) return { status: 404, body: { error: 'Session not found' } };
