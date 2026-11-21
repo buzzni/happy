@@ -44,6 +44,7 @@ function parseOwnedSpawn(raw: unknown): SpawnSessionOptions {
     if (parsed.aiAuthSelection !== undefined && !aiAuthSelection) throw new Error('invalid-ai-selection');
     const agentPlan = parseAgentPlanSpawnParam(parsed.agentPlan);
     if (agentPlan && aiAuthSelection) throw new Error('Agent plan grant rejected (agent_plan_conflicting_selection)');
+    if (parsed.initialPrompt !== undefined && !parsed.initialPrompt.trim()) throw new Error('Initial prompt must be a non-empty string');
     if (parsed.exitAfterFirstTurn && parsed.initialPrompt === undefined) throw new Error('Run-once session requires a non-empty initial prompt');
     const { sessionSource: rawSource, ...rest } = parsed;
     const sessionSource = normalizeSessionSource(rawSource);

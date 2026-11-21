@@ -442,6 +442,8 @@ describe('owned spawn carries the fields Desktop actually sends (T4RT-03)', () =
         ['a Codex resume', { resumeCodexThreadId: 'x' }],
         ['extension MCP servers, whose values may be secrets the journal would keep', { launchMcpServers: { a: { command: 'x' } } }],
         ['a run-once session without a first prompt', { exitAfterFirstTurn: true, initialPrompt: undefined }],
+        ['an empty first prompt', { initialPrompt: '' }],
+        ['a blank first prompt', { initialPrompt: '   ' }],
         ['an over-long browser attestation', { browserAttestation: 'x'.repeat(4097) }],
         ['an agent plan together with an AI account selection', { aiAuthSelection: { kind: 'machine-personal' } }],
         ['an unknown step', { axStep: 'ship' }],
