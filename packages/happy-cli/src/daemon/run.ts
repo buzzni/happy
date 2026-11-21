@@ -6,7 +6,7 @@ import { readBrowserTaskPidStartTime } from './browserTaskSessionOwner';
 import { createBrowserNativeDeviceProof, type BrowserNativeDeviceSigner } from './browserNativeDeviceProof';
 import { createManualPersonalSpawn, MANUAL_PERSONAL_ENV } from './manualPersonalClaude';
 import { createOwnedSpawnRuntime, createOwnedStartGuard, ownedSessionAuthorship } from './ownedSpawnRuntime';
-import { withPinnedOwnershipTrust } from './sessionOwnershipTrust';
+import { ownershipHappyOrigin, ownershipTrustEnv } from './sessionOwnershipTrust';
 import { createAgentCallerLaunches, OWNER_CONTACT_SWITCH, readOwnerContactTrust, type OwnedLaunchLineage } from './agentCallerLaunches';
 import { drainWorktreeOperations } from './worktreeOps';
 import { drainBashRpcs } from '@/modules/common/bashRpcScheduler';
@@ -6056,7 +6056,7 @@ export async function startDaemon(): Promise<void> {
     // A token's account never changes, so only a confirmed answer is remembered; registration is re-read every time.
     const accountByToken = new Map<string, string>();
     // D5: a released daemon verifies A+ ownership documents with the pinned public trust unless the environment names its own.
-    const ownershipEnv = withPinnedOwnershipTrust(process.env, configuration.serverUrl);
+    const ownershipOrigin = ownershipHappyOrigin(configuration.serverUrl), ownershipEnv = ownershipTrustEnv(process.env, ownershipOrigin);
     callerLaunches = createAgentCallerLaunches({ enabled: process.env[OWNER_CONTACT_SWITCH] === '1',
       identity: async () => {
         try {
@@ -6066,8 +6066,8 @@ export async function startDaemon(): Promise<void> {
           return { machineId: state.machineId, happyAccountId, epoch: state.epoch };
         } catch { return null; }
       },
-      trust: () => readOwnerContactTrust(ownershipEnv, configuration.serverUrl), trackedByPid: pid => pidToTrackedSession.get(pid), live: liveLaunch });
-    const ownedSpawn = createOwnedSpawnRuntime({ home: configuration.happyHomeDir, happyOrigin: configuration.serverUrl, env: ownershipEnv,
+      trust: () => readOwnerContactTrust({ HAPPY_APLUS_STUDIO_ORIGIN: process.env.HAPPY_APLUS_STUDIO_ORIGIN, ...ownershipEnv }, ownershipOrigin), trackedByPid: pid => pidToTrackedSession.get(pid), live: liveLaunch });
+    const ownedSpawn = createOwnedSpawnRuntime({ home: configuration.happyHomeDir, happyOrigin: ownershipOrigin, env: ownershipEnv,
       registration: ownedRegistration,
       // The Windows trial launch carries no capability pipe, so its owned children keep the daemon-held binding.
       launchCallers: { query: raw => callerLaunches!.query(raw), currentCaller: sessionId => callerLaunches!.currentCaller(sessionId),

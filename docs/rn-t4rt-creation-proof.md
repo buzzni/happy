@@ -36,8 +36,8 @@
 소유 전용 서명 신뢰는 서버 계약과 같은 운영 설정 `HAPPY_SESSION_OWNERSHIP_ENABLED=1`,
 `HAPPY_SESSION_OWNERSHIP_ISSUER`, `HAPPY_SESSION_OWNERSHIP_AUDIENCE`,
 `HAPPY_SESSION_OWNERSHIP_PUBLIC_KEYS`의 pinned key 목록을 사용한다. 요청 문서의 URL/key를 신뢰하지 않는다.
-env에 이 값이 하나도 없으면 데몬은 릴리스에 고정한 공개 신뢰 표(`daemon/sessionOwnershipTrust.ts` `PINNED_OWNERSHIP_TRUST`)에서
-자기 Happy origin(`configuration.serverUrl`)의 항목을 쓴다(D5, Desktop `specs/reason-network-adoption/d5-ownership-trust-distribution.md`).
+env에 이 값이 하나도 없으면 데몬은 릴리스에 고정한 공개 신뢰 표(`daemon/sessionOwnershipTrust.v1.json`, Desktop
+`config/session-ownership-trust.v1.json`과 같은 바이트)에서 자기 Happy origin(`configuration.serverUrl`의 끝 `/`를 뗀 origin)의 항목을 쓴다(D5, Desktop `specs/reason-network-adoption/d5-ownership-trust-distribution.md`).
 env에 하나라도 있으면 env 전체가 이기고 표와 섞지 않는다. `HAPPY_SESSION_OWNERSHIP_ENABLED=0`은 머신별 끄기 스위치다.
 둘 다 없으면 owned capability는 false다. 개인 bearer는 받거나 provider env/argv로 전달하지 않는다.
 

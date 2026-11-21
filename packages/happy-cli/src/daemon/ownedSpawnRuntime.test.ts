@@ -12,7 +12,7 @@ import { createOwnedSpawnRuntime, createOwnedStartGuard, ownedSessionAuthorship 
 import { registerOwnedSpawnRpc } from './ownedSpawnRpc';
 import { createOwnedSpawnJournal } from './ownedSpawnJournal';
 import { ownedSpawnRecordSchema } from './ownedSpawn';
-import { withPinnedOwnershipTrust } from './sessionOwnershipTrust';
+import { ownershipTrustEnv } from './sessionOwnershipTrust';
 const homes: string[] = [];
 afterEach(async () => { vi.restoreAllMocks(); await Promise.all(homes.splice(0).map(home => rm(home, { recursive: true, force: true }))); });
 async function fixture(options: { parent?: string; spawn?: Record<string, unknown> } = {}) {
@@ -55,7 +55,8 @@ async function fixture(options: { parent?: string; spawn?: Record<string, unknow
         },
         ...extra,
     });
-    return { home, spawn, intent, build, persist, onStart: (hook: () => Promise<void>) => { onStart = hook; },
+    const trust = { issuer: signed.issuer, audience: signed.audience, publicKeys: { [signed.keyId]: Buffer.from(keys.publicKey).toString('base64url') } };
+    return { home, spawn, intent, trust, build, persist, onStart: (hook: () => Promise<void>) => { onStart = hook; },
         setAlive: (value: boolean) => { alive = value; }, lastStart: () => lastStart, journal: createOwnedSpawnJournal(home), clearAgentState: () => { raw!.agentState = null }, counts: () => ({ posts, starts }), lose: () => { lose = true }, logout: () => { current = false },
         proof: (p: { sessionCreateBodyHash: string; sessionTagHash: string }) => signOwnership({ ...signed, ...scope, type: 'saycode-session-ownership',
             nonce: Buffer.alloc(32, 1).toString('base64url'), createBodyHash: p.sessionCreateBodyHash, tagHash: p.sessionTagHash }, keys.secretKey) };
@@ -460,11 +461,20 @@ describe('owned spawn carries the fields Desktop actually sends (T4RT-03)', () =
     });
 
     it('offers owned creation on a daemon whose only ownership trust is the pinned table (D5)', async () => {
-        const f = await fixture(), publicKey = Buffer.from(nacl.sign.keyPair().publicKey);
-        const table = { 'https://happy.test': { issuer: 'https://studio.test', audience: 'https://happy.test',
-            publicKeys: { [createHash('sha256').update(publicKey).digest('hex')]: publicKey.toString('base64url') } } };
+        const f = await fixture(), env = ownershipTrustEnv({}, 'https://happy.test', { 'https://happy.test': f.trust });
         expect(await f.build({ env: {} }).capabilities({ spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: false });
-        expect(await f.build({ env: withPinnedOwnershipTrust({}, 'https://happy.test', table) }).capabilities({ spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: true });
+        expect(await f.build({ env }).capabilities({ spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: true });
+        // Trust is not the owner-contact switch: without host callers the child-contact capability stays absent.
+        expect(await f.build({ env, launchCallers: hostCallers(false) }).capabilities({ spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: true });
+    });
+
+    it('verifies an intent with the pinned key and refuses one the table does not pin (D5)', async () => {
+        const f = await fixture(), other = Buffer.from(nacl.sign.keyPair().publicKey);
+        const pinned = f.build({ env: ownershipTrustEnv({}, 'https://happy.test', { 'https://happy.test': f.trust }) });
+        expect(await pinned.prepare({ spawn: f.spawn, intent: f.intent })).toHaveProperty('sessionCreateBodyHash');
+        const unpinned = f.build({ env: ownershipTrustEnv({}, 'https://happy.test', { 'https://happy.test': { ...f.trust,
+            publicKeys: { [createHash('sha256').update(other).digest('hex')]: other.toString('base64url') } } }) });
+        await expect(unpinned.prepare({ spawn: f.spawn, intent: f.intent })).rejects.toThrow();
     });
 });
 
