@@ -404,4 +404,57 @@ describe('ApiMachineClient preview relay on a strict machine', () => {
         await client.answerPreviewViewerRuntimeLease({ viewerKey: 'k', port: 6080 }, ack)
         expect(ack).toHaveBeenCalledWith(expect.objectContaining({ type: 'error', code: 'STRICT_VIEWER_UNAVAILABLE' }))
     })
+
+    // viewer-channel-strict-design.md H0. The project binding is built from what happy-server sends,
+    // workspace paths included: naming `/` would claim every listener on the machine. The remote-screen
+    // stack (password-less VNC, its websockify front) and Chrome's debugging port belong to the daemon,
+    // never to a project, so the project relay must not reach them whatever the binding says.
+    const ROOT_CLAIM = { projectId: 'proj-1', leaseId: 'lease-1', workspacePaths: ['/'] }
+
+    it.each([5900, 5902, 6080, 6082, 9222, 9228])('refuses a bound relay to the daemon-owned port %i', async (port) => {
+        const client = await newClient()
+        const probe = vi.fn()
+        client.previewProbe = probe
+        client.setRPCHandlers(rpcHandlers({ readAll: vi.fn().mockResolvedValue({}) }))
+        const open = vi.fn()
+        client.previewWsProxy = { open, close: vi.fn(), closeAll: vi.fn() }
+
+        await expect(client.enforcePreviewBinding(ROOT_CLAIM, port)).resolves.toMatchObject({
+            outcome: 'rejected',
+            code: 'STRICT_RESERVED_PORT',
+        })
+        await expect(client.relayPreviewBoundHttp({ port, method: 'GET', path: '/', binding: ROOT_CLAIM })).resolves.toMatchObject({
+            type: 'error',
+            code: 'STRICT_RESERVED_PORT',
+        })
+        await expect(client.openPreviewWsTunnelBound({ tunnelId: 't', port, dataB64: '', binding: ROOT_CLAIM })).resolves.toMatchObject({
+            ok: false,
+            code: 'STRICT_RESERVED_PORT',
+        })
+        expect(open).not.toHaveBeenCalled()
+        expect(probe).not.toHaveBeenCalled()
+    })
+
+    it('does not mint a project lease on a daemon-owned port', async () => {
+        const client = await newClient()
+        const probe = vi.fn()
+        client.previewProbe = probe
+        client.setRPCHandlers(rpcHandlers({ readAll: vi.fn().mockResolvedValue({}) }))
+        const ack = vi.fn()
+
+        await client.answerPreviewRuntimeLease({ projectId: 'proj-1', port: 9222, workspacePaths: ['/'] }, ack)
+
+        expect(ack).toHaveBeenCalledWith(expect.objectContaining({ type: 'error', code: 'STRICT_RESERVED_PORT' }))
+        expect(probe).not.toHaveBeenCalled()
+    })
+})
+
+describe('ApiMachineClient preview relay to daemon-owned ports on a compat machine', () => {
+    it('verifies a bound request on them as before', async () => {
+        const client = await newClient()
+        client.setRPCHandlers(rpcHandlers({
+            readAll: vi.fn().mockResolvedValue({ 'session:other-project': { port: 9222, projectId: 'other-project' } }),
+        }))
+        await expect(client.enforcePreviewBinding(BINDING, 9222)).resolves.toMatchObject({ code: 'PORT_PROJECT_MISMATCH' })
+    })
 })
