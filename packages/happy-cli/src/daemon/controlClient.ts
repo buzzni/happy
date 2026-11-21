@@ -11,6 +11,7 @@ import type { SetupTokenUsageObservation } from './setupTokenAccountSwitch';
 import { configuration } from '@/configuration';
 import { randomUUID } from 'node:crypto';
 import { verifyDaemonIdentity } from './daemonIdentity';
+import { isOlderRuntimeVersion } from '@/utils/cliVersion';
 import {
     DaemonStopRefusedError,
     stopDaemonWithDrain,
@@ -437,14 +438,18 @@ export async function checkIfDaemonRunningAndCleanupStaleState(): Promise<boolea
 }
 
 /**
- * Check if the running daemon version matches the current CLI version.
+ * Check if the running daemon is this CLI's version or a newer one.
  * This should work from both the daemon itself & a new CLI process.
  * Works via the daemon.state.json file.
- * 
- * @returns true if versions match, false if versions differ or no daemon running
+ *
+ * A newer daemon serves an older CLI, so it is kept: replacing it from a stale global `happy`
+ * downgraded the desktop's bundled runner (2026-11-16, .416 -> .352). An unreadable version is
+ * still replaced, as before.
+ *
+ * @returns true if the running daemon is the same or newer, false if older, unreadable or no daemon running
  */
-export async function isDaemonRunningCurrentlyInstalledHappyVersion(): Promise<boolean> {
-  logger.debug('[DAEMON CONTROL] Checking if daemon is running same version');
+export async function isDaemonRunningSameOrNewerHappyVersion(): Promise<boolean> {
+  logger.debug('[DAEMON CONTROL] Checking if daemon is running the same or a newer version');
   const runningDaemon = await checkIfDaemonRunningAndCleanupStaleState();
   if (!runningDaemon) {
     logger.debug('[DAEMON CONTROL] No daemon running, returning false');
@@ -473,7 +478,9 @@ export async function isDaemonRunningCurrentlyInstalledHappyVersion(): Promise<b
   // correctly detects real npm upgrades (the new bundle has a new baked version).
   const currentCliVersion = configuration.currentCliVersion;
   logger.debug(`[DAEMON CONTROL] Current CLI version: ${currentCliVersion}, Daemon started with version: ${state.startedWithCliVersion}`);
-  return currentCliVersion === state.startedWithCliVersion;
+  // Only an aplus build counts as newer: an upstream plain release (1.1.10, 1.2.0) is still replaced.
+  return currentCliVersion === state.startedWithCliVersion
+    || (/-aplus\.\d+$/.test(state.startedWithCliVersion) && isOlderRuntimeVersion(currentCliVersion, state.startedWithCliVersion));
 }
 
 export async function cleanupDaemonState(): Promise<void> {

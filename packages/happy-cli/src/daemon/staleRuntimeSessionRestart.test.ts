@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   DEFAULT_STALE_RUNTIME_RESTART_QUIET_MS,
-  isOlderRuntimeVersion,
   readStaleRuntimeRestartConfig,
   sweepStaleRuntimeSessions,
 } from './staleRuntimeSessionRestart';
@@ -49,22 +48,6 @@ function sweep(trackedSessions: TrackedSession[], extra: Partial<Parameters<type
   });
   return { stopped, stopSession };
 }
-
-describe('isOlderRuntimeVersion', () => {
-  it('orders aplus builds numerically, not lexically', () => {
-    expect(isOlderRuntimeVersion('1.1.10-aplus.388', '1.1.10-aplus.394')).toBe(true);
-    expect(isOlderRuntimeVersion('1.1.10-aplus.99', '1.1.10-aplus.388')).toBe(true);
-    expect(isOlderRuntimeVersion('1.1.9', '1.1.10-aplus.1')).toBe(true);
-  });
-
-  it('is false for the same, a newer or an unreadable version', () => {
-    expect(isOlderRuntimeVersion('1.1.10-aplus.394', '1.1.10-aplus.394')).toBe(false);
-    expect(isOlderRuntimeVersion('1.1.10-aplus.400', '1.1.10-aplus.394')).toBe(false);
-    expect(isOlderRuntimeVersion(undefined, '1.1.10-aplus.394')).toBe(false);
-    expect(isOlderRuntimeVersion('dev', '1.1.10-aplus.394')).toBe(false);
-    expect(isOlderRuntimeVersion('1.1.10-aplus.388', 'dev')).toBe(false);
-  });
-});
 
 describe('sweepStaleRuntimeSessions', () => {
   it('stops an idle session still running an older runtime so the next input starts the new one', () => {
