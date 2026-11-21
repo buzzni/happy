@@ -27,11 +27,9 @@
 import { hkdfSync, randomBytes } from 'node:crypto';
 import {
     admitInboundSeq,
-    readBoundRpcRequest,
     readTerminalFrame,
     readTerminalOpenParams,
     terminalFrameKeyInfo,
-    RPC_BINDING_WINDOW_MS,
     TERMINAL_BINDING_VERSION,
     TERMINAL_FRAME_KEY_HASH,
     TERMINAL_FRAME_KEY_LENGTH,
@@ -42,15 +40,14 @@ import {
     type TerminalProofCaps,
 } from '@slopus/happy-wire';
 import { decodeBase64, decryptWithDataKey, encodeBase64, encryptWithDataKey } from '@/api/encryption';
-import { RpcNonceGuard } from '@/api/rpc/rpcNonceGuard';
+import type { RpcNonceGuard } from '@/api/rpc/rpcNonceGuard';
 import { logger } from '@/ui/logger';
+import { admitBoundOpenNonce, createBoundOpenNonceGuard, readBoundOpen } from './boundOpen';
 import { recordBytesIn, recordTerminalActivity, type DaemonTerminalEntry, type TerminalExit } from './daemonTerminalSessions';
 import { replyToTerminalResume } from './terminalResumeReply';
 import type { SerializedTerminalBinding } from './terminalWorker/protocol';
 
-export function createTerminalOpenNonceGuard(options: { maxEntries?: number } = {}): RpcNonceGuard {
-    return new RpcNonceGuard({ windowMs: RPC_BINDING_WINDOW_MS, maxEntries: options.maxEntries ?? 10_000, whenFull: 'refuse' });
-}
+export const createTerminalOpenNonceGuard = createBoundOpenNonceGuard;
 
 export type TerminalOpenDecision =
     | { kind: 'legacy'; params: unknown }
@@ -66,16 +63,8 @@ export function inspectTerminalOpen(
     ctx: { machineId: string; strict: boolean; now?: number },
 ): TerminalOpenInspection {
     const now = ctx.now ?? Date.now();
-    const binding = readBoundRpcRequest(opened, { method: TERMINAL_OPEN_METHOD, scope: ctx.machineId, now });
-    if (binding.kind === 'refused') {
-        return {
-            kind: 'refused',
-            code: binding.code,
-            error: binding.code === 'RPC_REQUEST_STALE'
-                ? 'Request was issued outside the allowed time window; check that the clocks of this device and the machine agree'
-                : 'Request binding refused',
-        };
-    }
+    const binding = readBoundOpen(opened, { method: TERMINAL_OPEN_METHOD, machineId: ctx.machineId, now });
+    if (binding.kind === 'refused') return binding;
     if (binding.kind === 'unbound') {
         return ctx.strict
             ? { kind: 'refused', code: 'TERMINAL_BINDING_REQUIRED', error: 'Strict machine control opens only bound terminals; update the app' }
@@ -93,9 +82,8 @@ export function decideTerminalOpen(
     const now = ctx.now ?? Date.now();
     const binding = inspectTerminalOpen(opened, { machineId: ctx.machineId, strict: ctx.strict, now });
     if (binding.kind !== 'bound') return binding;
-    const admission = ctx.nonceGuard.admit(binding.nonce, binding.issuedAt, now);
-    if (admission === 'replayed') return { kind: 'refused', code: 'RPC_REQUEST_REPLAYED', error: 'Request was already received' };
-    if (admission === 'full') return { kind: 'refused', code: 'RPC_TOO_MANY_REQUESTS', error: 'Too many requests within the time window; retry shortly' };
+    const refusal = admitBoundOpenNonce(ctx.nonceGuard, binding, now);
+    if (refusal) return refusal;
     return { kind: 'bound', params: binding.params, nonce: binding.nonce };
 }
 
