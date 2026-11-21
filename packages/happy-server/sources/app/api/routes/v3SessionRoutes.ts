@@ -84,7 +84,7 @@ export function v3SessionRoutes(app: Fastify) {
         const { after_seq, before_seq, limit, observation_version, through_seq } = request.query;
         if (observation_version) {
             if (before_seq !== undefined || (through_seq !== undefined && through_seq < (after_seq ?? 0)) || limit > 200) return reply.code(400).send({ error: 'invalid-observation-range' });
-            const result = await readSessionObservation(userId, sessionId, after_seq ?? 0, through_seq, limit);
+            const result = await readSessionObservation(userId, sessionId, after_seq ?? 0, through_seq, limit, piiSessionVisibility(request));
             return reply.code(result.status).send(result.body);
         }
         if (through_seq !== undefined) return reply.code(400).send({ error: 'observation-version-required' });

@@ -148,6 +148,7 @@ describe("sessionRoutes", () => {
                 createdAt: true,
                 updatedAt: true,
                 piiProtection: true,
+                piiMode: true,
                 metadata: true,
                 metadataVersion: true,
                 agentState: true,
