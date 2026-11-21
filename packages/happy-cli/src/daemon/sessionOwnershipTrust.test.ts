@@ -71,7 +71,7 @@ describe('PINNED_OWNERSHIP_TRUST', () => {
 
     it('ships the same bytes as Desktop config/session-ownership-trust.v1.json', () => {
         // Change both repos together: Desktop tests/sessionOwnershipTrustPins.test.ts pins the same digest.
-        const bytes = readFileSync(join(__dirname, 'sessionOwnershipTrust.v1.json'));
+        const bytes = readFileSync(join(__dirname, 'sessionOwnershipTrust.v1.json'), 'utf8').replace(/\r\n/g, '\n'); // A Windows checkout may use CRLF.
         expect(createHash('sha256').update(bytes).digest('hex')).toBe('e930e56b0dfbb72b6544c09a73a67b0670896ca0e9622f0d23bccb3c40061492');
     });
 });
