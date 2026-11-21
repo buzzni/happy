@@ -13,6 +13,8 @@ import { createOwnedSpawnJournal } from './ownedSpawnJournal';
 import { createAgentCallerBindings } from './agentCallerBinding';
 import type { MachineSetupTokenRuntime } from './machineSetupTokenRuntime';
 import { readSetupTokenResumeSelection, isMachineSetupTokenBinding, parseAiAuthSelection } from './sessionEnv';
+import { parseAgentPlanSpawnParam } from './agentPlanGrantEnvelope';
+import { normalizeSessionSource } from '@/utils/sessionSource';
 import { buildReconnectSessionEnvironment, RECONNECT_FRESH_LAUNCH_ENV } from './reconnectSessionEnv';
 import type { TrackedSession } from './types';
 import type { OwnedSpawnRpc } from './ownedSpawnRpc';
@@ -27,7 +29,35 @@ const spawnSchema = z.object({ directory: z.string().min(1), agent: z.enum(['cla
     additionalDirectories: z.array(z.string()).optional(), environmentVariables: z.record(z.string(), z.string()).optional(),
     mcpConfigProjectId: z.string().optional(), mcpCallerGrantEnvelope: z.string().optional(), expectedConnectors: z.array(z.string()).optional(),
     approvedNewDirectoryCreation: z.boolean().optional(), aiAuthSelection: z.unknown().optional(),
+    // T4RT-03 (aplus-dev-studio specs/reason-network-adoption/t4rt-03-creation-contract.md): what Desktop sends for a project
+    // session. Validated as the legacy spawn RPC does (apiMachine 'spawn-happy-session'). Credentials, continuations and
+    // extension MCP servers (whose values may be secrets this journal would keep) stay on the legacy path.
+    createdByAccountId: z.string().min(1).max(128).optional(), createdByDisplayName: z.string().max(200).optional(),
+    sessionSource: z.unknown().optional(), axStep: z.enum(['plan', 'design', 'free']).optional(),
+    browserAttestation: z.string().min(1).max(4096).optional(), agentPlan: z.unknown().optional(),
+    exitAfterFirstTurn: z.boolean().optional(), filesystemScope: z.unknown().optional(),
 }).strict();
+
+/** The legacy spawn RPC's cross-field checks; a spawn that fails one is not offered as owned. */
+function parseOwnedSpawn(raw: unknown): SpawnSessionOptions {
+    const parsed = spawnSchema.parse(raw), aiAuthSelection = parseAiAuthSelection(parsed.aiAuthSelection);
+    if (parsed.aiAuthSelection !== undefined && !aiAuthSelection) throw new Error('invalid-ai-selection');
+    const agentPlan = parseAgentPlanSpawnParam(parsed.agentPlan);
+    if (agentPlan && aiAuthSelection) throw new Error('Agent plan grant rejected (agent_plan_conflicting_selection)');
+    if (parsed.initialPrompt !== undefined && !parsed.initialPrompt.trim()) throw new Error('Initial prompt must be a non-empty string');
+    if (parsed.exitAfterFirstTurn && parsed.initialPrompt === undefined) throw new Error('Run-once session requires a non-empty initial prompt');
+    const { sessionSource: rawSource, ...rest } = parsed;
+    const sessionSource = normalizeSessionSource(rawSource);
+    return { ...rest, aiAuthSelection, ...(agentPlan ? { agentPlan } : {}), ...(sessionSource ? { sessionSource } : {}) } as SpawnSessionOptions;
+}
+
+/** Who asked for an owned session, written into the metadata the daemon creates, as a legacy child writes it. */
+export function ownedSessionAuthorship(options: SpawnSessionOptions): Partial<Metadata> {
+    return {
+        ...(options.createdByAccountId ? { createdBy: { accountId: options.createdByAccountId, ...(options.createdByDisplayName ? { displayName: options.createdByDisplayName } : {}) } } : {}),
+        ...(options.sessionSource ? { source: options.sessionSource } : {}),
+    } as Partial<Metadata>;
+}
 const rawSessionSchema = z.object({ id: z.string(), seq: z.number().int().nonnegative(), metadata: z.string(), metadataVersion: z.number().int().nonnegative(),
     agentState: z.string().nullable(), agentStateVersion: z.number().int().nonnegative(), dataEncryptionKey: z.string().nullable().optional() });
 type RawSession = z.infer<typeof rawSessionSchema>;
@@ -113,9 +143,7 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
     const pipeLaunches = new WeakSet<SpawnSessionOptions>();
     const realpath = (path: string) => { try { return (deps.realpath ?? realpathSync)(path); } catch { return path; } };
     function options(record: OwnedSpawnRecord): SpawnSessionOptions {
-        const parsed = spawnSchema.parse(record.spawn), aiAuthSelection = parseAiAuthSelection(parsed.aiAuthSelection);
-        if (parsed.aiAuthSelection !== undefined && !aiAuthSelection) throw new Error('invalid-ai-selection');
-        return { ...parsed, aiAuthSelection } as SpawnSessionOptions;
+        return parseOwnedSpawn(record.spawn);
     }
     async function json(path: string, body?: unknown) {
         const state = await deps.registration();
@@ -344,10 +372,11 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
     });
     return { ...coordinator,
         async capabilities(raw) {
-            const parsed = z.object({ spawn: spawnSchema }).strict().safeParse(raw);
+            const parsed = z.object({ spawn: z.unknown() }).strict().safeParse(raw);
+            const spawnOk = parsed.success && (() => { try { parseOwnedSpawn(parsed.data.spawn); return true; } catch { return false; } })();
             const configured = deps.env.HAPPY_SESSION_OWNERSHIP_ENABLED === '1' && !!deps.env.HAPPY_SESSION_OWNERSHIP_PUBLIC_KEYS
                 && !!deps.env.HAPPY_SESSION_OWNERSHIP_ISSUER && deps.env.HAPPY_SESSION_OWNERSHIP_AUDIENCE === deps.happyOrigin;
-            const supported = parsed.success && configured;
+            const supported = spawnOk && configured;
             // Contacting an owned child is advertised apart from creating one; switch off answers exactly as before.
             return hostCallers() ? { ownedSpawnPrepareV1: supported, ownedChildOwnerContactV1: supported } : { ownedSpawnPrepareV1: supported };
         },

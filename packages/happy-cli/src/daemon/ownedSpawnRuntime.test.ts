@@ -8,7 +8,7 @@ import nacl from 'tweetnacl';
 import { signOwnership, ownershipDigest, sessionCreateBodyHash, rotationSha256, sharedMachineRotationFixture, OwnershipCallerBindingSchema } from '@slopus/happy-wire';
 import type { Metadata } from '@/api/types';
 import type { TrackedSession } from './types';
-import { createOwnedSpawnRuntime, createOwnedStartGuard } from './ownedSpawnRuntime';
+import { createOwnedSpawnRuntime, createOwnedStartGuard, ownedSessionAuthorship } from './ownedSpawnRuntime';
 import { registerOwnedSpawnRpc } from './ownedSpawnRpc';
 import { createOwnedSpawnJournal } from './ownedSpawnJournal';
 import { ownedSpawnRecordSchema } from './ownedSpawn';
@@ -410,5 +410,60 @@ describe('launch lineage beside a damaged journal file (PR #1027 review)', () =>
         expect(await runtime.launchLineage('unrelated')).toBe('unknown');
         // A readable record of this session still decides it.
         expect(await runtime.launchLineage('session')).toEqual({ sessionId: 'session', scope: '/project', depth: 0 });
+    });
+});
+
+// aplus-dev-studio specs/reason-network-adoption t4rt-03-creation-contract.md (U-T4RT-03-1, approved 2026-11-21).
+describe('owned spawn carries the fields Desktop actually sends (T4RT-03)', () => {
+    const desktopSpawn = {
+        directory: '/project', agent: 'claude', initialPrompt: 'start', exitAfterFirstTurn: true,
+        createdByAccountId: 'person-account', createdByDisplayName: 'Justin', sessionSource: 'user', axStep: 'plan',
+        browserAttestation: 'attestation', agentPlan: { grantEnvelope: 'sealed' }, filesystemScope: { version: 1, roots: ['/project'] },
+    };
+
+    it('accepts a real project spawn and hands the start the same validated values the legacy RPC would', async () => {
+        const f = await fixture({ spawn: desktopSpawn }), runtime = f.build(), handlers = new Map<string, (raw: unknown) => Promise<any>>();
+        registerOwnedSpawnRpc((name, handler) => handlers.set(name, handler), runtime);
+        const rpc = (name: string, body: unknown) => handlers.get(name)!(body);
+        expect(await rpc('owned-spawn-capabilities', { spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: true });
+        const p = await rpc('prepare-owned-spawn', { intent: f.intent, spawn: desktopSpawn });
+        await rpc('commit-owned-spawn', { creationRequestId: 'creation', preparationId: p.preparationId, ownershipProof: f.proof(p) });
+        await rpc('start-owned-spawn', { creationRequestId: 'creation', preparationId: p.preparationId, sessionId: 'session' });
+        expect(f.lastStart()).toMatchObject({
+            createdByAccountId: 'person-account', createdByDisplayName: 'Justin', sessionSource: 'user', axStep: 'plan',
+            browserAttestation: 'attestation', agentPlan: { grantEnvelope: 'sealed' }, exitAfterFirstTurn: true, initialPrompt: 'start',
+        });
+    });
+
+    it.each([
+        ['the requester\'s Happy credentials', { happyToken: 't', happySecret: 's' }],
+        ['a continuation', { parentSessionId: 'parent' }],
+        ['a Claude resume', { resumeClaudeSessionId: 'c' }],
+        ['a Codex resume', { resumeCodexThreadId: 'x' }],
+        ['extension MCP servers, whose values may be secrets the journal would keep', { launchMcpServers: { a: { command: 'x' } } }],
+        ['a run-once session without a first prompt', { exitAfterFirstTurn: true, initialPrompt: undefined }],
+        ['an empty first prompt', { initialPrompt: '' }],
+        ['a blank first prompt', { initialPrompt: '   ' }],
+        ['an over-long browser attestation', { browserAttestation: 'x'.repeat(4097) }],
+        ['an agent plan together with an AI account selection', { aiAuthSelection: { kind: 'machine-personal' } }],
+        ['an unknown step', { axStep: 'ship' }],
+    ])('leaves %s to the legacy path', async (_name, extra) => {
+        const f = await fixture();
+        const spawn = Object.fromEntries(Object.entries({ ...desktopSpawn, ...extra }).filter(([, value]) => value !== undefined));
+        expect(await f.build().capabilities({ spawn })).toEqual({ ownedSpawnPrepareV1: false });
+    });
+
+    it('drops a malformed session source as the legacy RPC does, without refusing the spawn', async () => {
+        const f = await fixture();
+        expect(await f.build().capabilities({ spawn: { ...desktopSpawn, sessionSource: 'Not A Source!' } })).toEqual({ ownedSpawnPrepareV1: true });
+    });
+});
+
+describe('owned session metadata authorship (T4RT-03)', () => {
+    it('records who asked and the source like a legacy session, and nothing when absent', () => {
+        expect(ownedSessionAuthorship({ createdByAccountId: 'a', createdByDisplayName: 'Justin', sessionSource: 'user' } as never))
+            .toEqual({ createdBy: { accountId: 'a', displayName: 'Justin' }, source: 'user' });
+        expect(ownedSessionAuthorship({ createdByAccountId: 'a' } as never)).toEqual({ createdBy: { accountId: 'a' } });
+        expect(ownedSessionAuthorship({} as never)).toEqual({});
     });
 });
