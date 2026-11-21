@@ -160,8 +160,11 @@ async function dispatch(params: SessionEventPush): Promise<PushOutcome> {
             sessionId = display.id;
             runId = run.id;
         }
+        const session = await db.session.findFirst({ where: { id: sessionId, accountId: userId }, select: { piiProtection: true } });
+        if (!session) return { status: 'suppressed', tokens: 0, sent: 0, failed: 0, reason: 'session-unavailable' };
+        const protectedSession = session.piiProtection !== false;
         try {
-            if (await isUserActive(userId)) {
+            if (await isUserActive(userId, protectedSession)) {
                 log({ module: 'push' }, `Suppressed session-event push for user ${userId} session ${sessionId}: user active`);
                 return { status: 'suppressed', tokens: 0, sent: 0, failed: 0, reason: 'user-active' };
             }
@@ -172,9 +175,9 @@ async function dispatch(params: SessionEventPush): Promise<PushOutcome> {
         return await fetchTokensAndSend({
             userId,
             sessionId,
-            title,
-            body,
-            data: runId ? { ...(data ?? {}), sessionId, runId } : { sessionId, ...(data ?? {}) },
+            title: protectedSession ? '작업이 끝났어요' : title,
+            body: protectedSession ? '작업이 끝났어요' : body,
+            data: protectedSession ? { sessionId } : runId ? { ...(data ?? {}), sessionId, runId } : { sessionId, ...(data ?? {}) },
             channelId: 'messages',
             deadline
         });

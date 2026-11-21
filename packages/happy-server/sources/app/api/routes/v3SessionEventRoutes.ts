@@ -1,3 +1,4 @@
+import { piiSessionVisibility } from "@/app/session/piiSessionVisibility";
 import { persistSessionEvent } from "@/app/events/persistSessionEvent";
 import { checkpointEventEnvelopeSchema } from "@/app/events/checkpointEventEnvelope";
 import { persistCheckpointSessionEvent } from "@/app/events/persistCheckpointSessionEvent";
@@ -105,7 +106,7 @@ export function v3SessionEventRoutes(app: Fastify) {
         const session = await db.session.findFirst({
             where: {
                 id: sessionId,
-                accountId: userId,
+                ...piiSessionVisibility(request), accountId: userId,
             },
             select: { id: true },
         });
@@ -170,7 +171,7 @@ export function v3SessionEventRoutes(app: Fastify) {
         const session = await db.session.findFirst({
             where: {
                 id: sessionId,
-                accountId: userId,
+                ...piiSessionVisibility(request), accountId: userId,
             },
             select: { id: true },
         });

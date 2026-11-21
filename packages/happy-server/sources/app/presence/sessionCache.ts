@@ -3,6 +3,7 @@ import { log } from "@/utils/log";
 import { sessionCacheCounter, databaseUpdatesSkippedCounter } from "@/app/monitoring/metrics2";
 
 interface SessionCacheEntry {
+    piiProtection: boolean;
     validUntil: number;
     lastUpdateSent: number;
     pendingUpdate: number | null;
@@ -46,14 +47,14 @@ class ActivityCache {
         }, this.BATCH_INTERVAL);
     }
 
-    async isSessionValid(sessionId: string, userId: string): Promise<boolean> {
+    async isSessionValid(sessionId: string, userId: string, acceptsProtection = false): Promise<boolean> {
         const now = Date.now();
         const cached = this.sessionCache.get(sessionId);
         
         // Check cache first
         if (cached && cached.validUntil > now && cached.userId === userId) {
             sessionCacheCounter.inc({ operation: 'session_validation', result: 'hit' });
-            return true;
+            return !cached.piiProtection || acceptsProtection;
         }
         
         sessionCacheCounter.inc({ operation: 'session_validation', result: 'miss' });
@@ -67,12 +68,13 @@ class ActivityCache {
             if (session) {
                 // Cache the result
                 this.sessionCache.set(sessionId, {
+                    piiProtection: session.piiProtection,
                     validUntil: now + this.CACHE_TTL,
                     lastUpdateSent: session.lastActiveAt.getTime(),
                     pendingUpdate: null,
                     userId
                 });
-                return true;
+                return !session.piiProtection || acceptsProtection;
             }
             
             return false;

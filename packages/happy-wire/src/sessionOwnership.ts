@@ -24,11 +24,16 @@ export const OwnershipIntentRequestSchema = z.object({
     normalizedSpawnDigest: ownershipHash,
 }).strict();
 export type OwnershipIntentRequest = z.infer<typeof OwnershipIntentRequestSchema>;
+export const OwnershipProtectionModeSchema = z.enum(['none', 'isolated', 'host-masking']);
+export const OwnershipProtectionSchema = z.object({
+    projectId: ownershipId.nullable(), machineId: ownershipId, machineAccountId: ownershipId,
+    companyId: ownershipId.nullable(), piiMode: OwnershipProtectionModeSchema,
+}).strict();
 const scope = { intentId: ownershipId, operationId: ownershipId, creationRequestId: ownershipId,
     ownershipPolicy: z.enum(['prefer-owned', 'require-owned']), subject: OwnershipSubjectSchema,
     companyId: ownershipId.nullable(), projectId: ownershipId.nullable(), machineId: ownershipId,
     machineAccountId: ownershipId, sessionAccountId: ownershipId, parentHubSessionId: ownershipId.nullable(),
-    spawnDigest: ownershipHash };
+    spawnDigest: ownershipHash, piiMode: OwnershipProtectionModeSchema.optional() };
 export const SessionOwnershipIntentSchema = z.object({
     ...signed, type: z.literal('saycode-session-ownership-intent'), ...scope,
 }).strict().refine(bounded(120000));

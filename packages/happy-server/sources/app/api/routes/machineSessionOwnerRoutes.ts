@@ -1,3 +1,4 @@
+import { piiSessionVisibility } from "@/app/session/piiSessionVisibility";
 import { Fastify } from "../types";
 import { z } from "zod";
 import { db } from "@/storage/db";
@@ -50,7 +51,7 @@ export function machineSessionOwnerRoutes(app: Fastify) {
         // Scoped to the authenticated account both ways, so a caller can only ever learn about
         // its own sessions and its own machines.
         const [session, machine] = await Promise.all([
-            db.session.findFirst({ where: { id: request.params.sessionId, accountId: request.userId } }),
+            db.session.findFirst({ where: { ...piiSessionVisibility(request), id: request.params.sessionId, accountId: request.userId } }),
             db.machine.findFirst({ where: { id: request.body.machineId, accountId: request.userId } }),
         ]);
 

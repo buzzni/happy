@@ -138,6 +138,7 @@ describe("sessionRoutes", () => {
         expect(response.statusCode).toBe(200);
         expect(dbMock.session.findMany).toHaveBeenCalledWith({
             where: {
+                piiProtection: false,
                 accountId: "user-1",
                 id: { in: ["session-a", "session-b"] },
             },
@@ -146,6 +147,8 @@ describe("sessionRoutes", () => {
                 seq: true,
                 createdAt: true,
                 updatedAt: true,
+                piiProtection: true,
+                piiMode: true,
                 metadata: true,
                 metadataVersion: true,
                 agentState: true,
@@ -205,7 +208,7 @@ describe("sessionRoutes", () => {
 
         expect(response.statusCode).toBe(200);
         expect(dbMock.session.findMany).toHaveBeenCalledExactlyOnceWith({
-            where: { accountId: "user-1", id: { in: ["session-a", "session-b"] } },
+            where: { piiProtection: false, accountId: "user-1", id: { in: ["session-a", "session-b"] } },
             select: { id: true, seq: true },
         });
         expect(response.json()).toEqual({
@@ -250,7 +253,7 @@ describe("sessionRoutes", () => {
 
         expect(response.statusCode).toBe(200);
         expect(dbMock.session.findMany).toHaveBeenCalledExactlyOnceWith({
-            where: { accountId: "user-1", id: { in: ["session-a", "session-b"] } },
+            where: { piiProtection: false, accountId: "user-1", id: { in: ["session-a", "session-b"] } },
             select: {
                 id: true,
                 seq: true,

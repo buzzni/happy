@@ -47,7 +47,13 @@ async function bind(tx: Prisma.TransactionClient, sessionId: string, created: bo
     if (proof.parentHubSessionId) {
         const parent = await tx.sessionOwnershipBinding.findUnique({ where: { sessionId: proof.parentHubSessionId } });
         if (!parent?.confirmedAt || !parent.sessionRowId || parent.subjectIssuer !== proof.subject.issuer ||
-            parent.ownerUserId !== proof.subject.userId || parent.sessionAccountId !== proof.sessionAccountId) refuse();
+            parent.ownerUserId !== proof.subject.userId || parent.sessionAccountId !== proof.sessionAccountId
+            || parent.originProjectId !== proof.projectId || parent.machineId !== proof.machineId
+            || parent.machineAccountId !== proof.machineAccountId || parent.companyId !== proof.companyId) return refuse();
+        const parentSession = await tx.session.findUnique({ where: { id: parent.sessionRowId } });
+        if (!parentSession || parentSession.accountId !== proof.sessionAccountId
+            || parentSession.piiMode !== (proof.piiMode ?? 'none')
+            || parentSession.piiProtection !== ((proof.piiMode ?? 'none') !== 'none')) refuse();
     }
     const existing = await tx.sessionOwnershipBinding.findFirst({ where: { OR: [
         { subjectIssuer: proof.issuer, intentId: proof.intentId },
@@ -73,6 +79,8 @@ export async function createOwnershipBoundSession(accountId: string, rawBody: un
     const parsed = SessionExecutionCreateBodySchema.safeParse(rawBody);
     if (!parsed.success) throw new OwnershipError(400, 'Invalid ownership create body');
     const body = parsed.data;
+    const piiMode = body.piiMode ?? 'none';
+    if (piiMode !== (proof.piiMode ?? 'none') || (piiMode !== 'none' && !proof.projectId)) refuse();
     if (proof.subject.issuer !== proof.issuer || proof.sessionAccountId !== accountId ||
         proof.createBodyHash !== await sessionCreateBodyHash(body) || proof.tagHash !== await sessionTagHash(body.tag)) refuse();
     const proofDigest = await ownershipDigest(proof);
@@ -85,6 +93,8 @@ export async function createOwnershipBoundSession(accountId: string, rawBody: un
     let binding: SessionOwnershipBinding | undefined;
     const participate = async (tx: Prisma.TransactionClient, session: { id: string }, created: boolean) => {
         binding = await bind(tx, session.id, created, proof, proofDigest);
+        const stored = await tx.session.findUnique({ where: { id: session.id } });
+        if (!stored || stored.piiMode !== piiMode || stored.piiProtection !== (piiMode !== 'none')) conflict();
     };
     for (let attempt = 0; ; attempt++) {
         try {
@@ -95,6 +105,7 @@ export async function createOwnershipBoundSession(accountId: string, rawBody: un
                     const existing = await tx.session.findUnique({ where: { accountId_tag: { accountId, tag: body.tag } } });
                     if (existing) { await participate(tx, existing, false); return existing; }
                     const created = await tx.session.create({ data: { accountId, tag: body.tag, metadata: body.metadata,
+                        piiMode, piiProtection: piiMode !== 'none',
                         agentState: body.agentState, dataEncryptionKey: body.dataEncryptionKey
                             ? new Uint8Array(Buffer.from(body.dataEncryptionKey, 'base64')) : undefined } });
                     await participate(tx, created, true);
@@ -102,7 +113,7 @@ export async function createOwnershipBoundSession(accountId: string, rawBody: un
                     if (!ownershipFresh(proof)) refuse();
                     afterTx(tx, () => eventRouter.emitUpdate({ userId: accountId,
                         payload: buildNewSessionUpdate(created, account.seq, randomKeyNaked(12)),
-                        recipientFilter: { type: 'user-scoped-only' } }));
+                        recipientFilter: { type: 'user-scoped-only' }, sessionProtection: created.piiProtection }));
                     return created;
                 });
             return { session, ownership: { sessionId: session.id, ownershipBindingId: binding!.bindingId,
@@ -153,7 +164,12 @@ export async function lookupOwnership(raw: unknown) {
             const machine = row ? await tx.machine.findUnique({ where: { id: row.machineId } }) : null;
             const available = accessible && (!row || (!!row.sessionRowId && machine?.accountId === row.machineAccountId));
             result.push({ ownership: ownershipView(target.sessionId, row, available),
-                binding: available ? row : null, accountId: accessible ? session.accountId : null });
+                binding: available ? row : null, accountId: accessible ? session.accountId : null,
+                protection: available && row?.confirmedAt && session
+                    && row.ownerUserId === assertion.subject.userId && row.subjectIssuer === assertion.subject.issuer
+                    && session.piiProtection === (session.piiMode !== 'none')
+                    ? { projectId: row.originProjectId, machineId: row.machineId, machineAccountId: row.machineAccountId,
+                        companyId: row.companyId, piiMode: session.piiMode } : null });
         }
         if (!ownershipFresh(assertion)) refuse();
         return result;

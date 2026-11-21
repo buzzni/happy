@@ -161,6 +161,7 @@ async function createApp({ withErrorHandlers = false, managedControl = null }: {
             return reply.code(401).send({ error: "Unauthorized" });
         }
         request.userId = userId;
+        request.principal = { kind: request.headers["x-test-principal"] ?? "account", accountId: userId };
     });
     if (withErrorHandlers) {
         enableErrorHandlers(typed, { skipNotFoundHandler: true });
@@ -1120,4 +1121,15 @@ describe("machinesRoutes — PUT /v1/machines/:id/data-key-attestation (e2ee-mac
         expect(res.statusCode).toBe(200);
         expect(state.existingMachine.dataKeyAttestation).toBeNull();
     });
+});
+
+it.each(['browser-sync', 'managed-daemon', 'account'])('PII receipt authority requires account principal: %s', async kind => {
+    const app = await createApp();
+    state.existingMachine = { id: 'pc', accountId: 'owner' };
+    try {
+        const response = await app.inject({ method: 'GET', url: '/v1/machines/pc/pii-receipt-authority',
+            headers: { 'x-user-id': 'owner', 'x-test-principal': kind } });
+        expect(response.statusCode).toBe(kind === 'account' ? 200 : 403);
+        if (kind === 'account') expect(response.json()).toEqual({ machine: { id: 'pc', accountId: 'owner' } });
+    } finally { await app.close(); }
 });

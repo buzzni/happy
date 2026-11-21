@@ -64,6 +64,9 @@ export async function createExecutionBoundSession(ownerAccountId: string, rawBod
   const ticket = proof.ticket.body;
   const reservedId = automationRunId === undefined ? undefined : automationExecutionSessionId(automationRunId);
   if (reservedId && body.tag !== reservedId) conflict();
+  const piiMode = body.piiMode ?? 'none';
+  // Protected creation also requires the project ownership binding in this transaction.
+  if (piiMode !== 'none' && !participate) refuse();
   for (let attempt = 0; ; attempt++) {
     try {
       return await inTx(async tx => {
@@ -91,6 +94,7 @@ export async function createExecutionBoundSession(ownerAccountId: string, rawBod
         }
         const session = await tx.session.create({ data: {
           ...(reservedId ? { id: reservedId } : {}),
+          piiMode, piiProtection: piiMode !== 'none',
           accountId: ownerAccountId, tag: body.tag, metadata: body.metadata, agentState: body.agentState,
           dataEncryptionKey: body.dataEncryptionKey ? new Uint8Array(Buffer.from(body.dataEncryptionKey, 'base64')) : undefined,
         } });
@@ -107,7 +111,7 @@ export async function createExecutionBoundSession(ownerAccountId: string, rawBod
         fresh(proof);
         checkParticipation?.();
         afterTx(tx, () => eventRouter.emitUpdate({ userId: ownerAccountId,
-          payload: buildNewSessionUpdate(session, account.seq, randomKeyNaked(12)), recipientFilter: { type: 'user-scoped-only' } }));
+          payload: buildNewSessionUpdate(session, account.seq, randomKeyNaked(12)), recipientFilter: { type: 'user-scoped-only' }, sessionProtection: session.piiProtection }));
         return session;
       });
     } catch (error) {

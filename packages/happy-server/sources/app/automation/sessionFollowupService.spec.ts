@@ -82,7 +82,7 @@ describe('sessionFollowupService', () => {
         await expect(createSessionFollowup(tx as never, 'editor-1', 'project-1', createInput))
             .resolves.toEqual({ ok: true, value: created });
         expect(tx.session.findFirst).toHaveBeenCalledWith({
-            where: { id: 'session-1', accountId: 'owner-1', active: true },
+            where: { id: 'session-1', accountId: 'owner-1', active: true, piiProtection: false },
             select: { id: true, accountId: true, seq: true, active: true },
         });
         expect(tx.sessionFollowup.count).toHaveBeenCalledWith({ where: {

@@ -1,3 +1,5 @@
+import type { Prisma } from '@prisma/client';
+import { piiSessionVisibility } from '@/app/session/piiSessionVisibility';
 import { eventRouter, buildUpdateAccountUpdate } from "@/app/events/eventRouter";
 import { db } from "@/storage/db";
 import { Fastify } from "../types";
@@ -248,21 +250,19 @@ export function accountRoutes(app: Fastify) {
 
         try {
             // Build query conditions
-            const where: {
-                accountId: string;
-                sessionId?: string | null;
-                createdAt?: {
-                    gte?: Date;
-                    lte?: Date;
-                };
-            } = {
-                accountId: userId
+            const visibility = piiSessionVisibility(request);
+            const where: Prisma.UsageReportWhereInput = {
+                accountId: userId,
+                ...(visibility.piiProtection === false ? {
+                    OR: [{ sessionId: null }, { session: { is: { piiProtection: false } } }],
+                } : {}),
             };
 
             if (sessionId) {
                 // Verify session belongs to user
                 const session = await db.session.findFirst({
                     where: {
+                        ...visibility,
                         id: sessionId,
                         accountId: userId
                     }

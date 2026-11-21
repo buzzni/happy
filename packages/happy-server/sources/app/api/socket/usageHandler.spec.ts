@@ -77,7 +77,7 @@ describe('provider-usage-report socket handler', () => {
         await handlers.get('provider-usage-report')!(providerEvent, callback);
 
         expect(storage.sessionFindFirst).toHaveBeenCalledWith({
-            where: { id: 'session-1', accountId: 'account-1' },
+            where: { piiProtection: false, id: 'session-1', accountId: 'account-1' },
             select: { id: true },
         });
         expect(storage.providerUsageEventUpsert).toHaveBeenCalledWith({

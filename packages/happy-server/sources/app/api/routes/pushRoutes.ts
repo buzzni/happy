@@ -1,3 +1,4 @@
+import { piiSessionVisibility } from '@/app/session/piiSessionVisibility';
 import { z } from "zod";
 import { type Fastify } from "../types";
 import { db } from "@/storage/db";
@@ -126,8 +127,8 @@ export function pushRoutes(app: Fastify) {
         const { kind, title, body, data } = request.body;
 
         const session = await db.session.findFirst({
-            where: { id: sessionId, accountId: userId },
-            select: { id: true }
+            where: { ...piiSessionVisibility(request), id: sessionId, accountId: userId },
+            select: { id: true, piiProtection: true }
         });
         if (!session) {
             return reply.code(404).send({ error: 'Session not found' });
@@ -162,6 +163,7 @@ export function pushRoutes(app: Fastify) {
         eventRouter.emitEphemeral({
             userId,
             payload: buildSessionEventEphemeral(sessionId, kind, title, body),
+            sessionProtection: session.piiProtection,
             recipientFilter: { type: 'all-interested-in-session', sessionId }
         });
 

@@ -1,3 +1,4 @@
+import { piiSessionVisibility } from "@/app/session/piiSessionVisibility";
 // specs/e2ee-legacy-session-rewrap (aplus-dev-studio) D3 — legacy 세션을
 // 세션별 DEK 로 재암호화(rewrap)하기 위한 최소 쓰기 표면.
 //
@@ -77,7 +78,7 @@ export function sessionRewrapRoutes(app: Fastify) {
         }
 
         const session = await db.session.findFirst({
-            where: { id: sessionId, accountId: userId },
+            where: { ...piiSessionVisibility(request), id: sessionId, accountId: userId },
             select: { id: true, dataEncryptionKey: true }
         });
         if (!session) {
@@ -134,7 +135,7 @@ export function sessionRewrapRoutes(app: Fastify) {
         }
 
         const session = await db.session.findFirst({
-            where: { id: sessionId, accountId: userId },
+            where: { ...piiSessionVisibility(request), id: sessionId, accountId: userId },
             select: { id: true, dataEncryptionKey: true }
         });
         if (!session) {

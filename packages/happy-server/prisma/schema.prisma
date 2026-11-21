@@ -118,6 +118,8 @@ model AccountPushToken {
 //
 
 model Session {
+    piiProtection     Boolean          @default(false)
+    piiMode           String           @default(dbgenerated())
     id                String           @id @default(cuid())
     tag               String
     accountId         String

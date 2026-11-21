@@ -1,3 +1,4 @@
+import { piiSocketVisibility } from "@/app/session/piiSessionVisibility";
 import { getMetricsLabelsFromSocket, sessionAliveEventsCounter, websocketEventsCounter } from "@/app/monitoring/metrics2";
 import { activityCache } from "@/app/presence/sessionCache";
 import { buildNewMessageUpdate, buildSessionActivityEphemeral, buildUpdateSessionUpdate, ClientConnection, eventRouter } from "@/app/events/eventRouter";
@@ -37,7 +38,7 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
 
             // Resolve session
             const session = await db.session.findUnique({
-                where: { id: sid, accountId: userId }
+                where: { ...piiSocketVisibility(socket), id: sid, accountId: userId }
             });
             if (!session) {
                 return;
@@ -72,6 +73,7 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
             eventRouter.emitUpdate({
                 userId,
                 payload: updatePayload,
+                sessionProtection: session.piiProtection,
                 recipientFilter: { type: 'all-interested-in-session', sessionId: sid }
             });
 
@@ -99,7 +101,7 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
 
             // Resolve session
             const session = await db.session.findUnique({
-                where: {
+                where: { ...piiSocketVisibility(socket),
                     id: sid,
                     accountId: userId
                 }
@@ -138,6 +140,7 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
             eventRouter.emitUpdate({
                 userId,
                 payload: updatePayload,
+                sessionProtection: session.piiProtection,
                 recipientFilter: { type: 'all-interested-in-session', sessionId: sid }
             });
 
@@ -176,7 +179,7 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
             const { sid, thinking } = data;
 
             // Check session validity using cache
-            const isValid = await activityCache.isSessionValid(sid, userId);
+            const isValid = await activityCache.isSessionValid(sid, userId, socket.data?.piiProtectionVersion === 1);
             if (!isValid) {
                 return;
             }
@@ -219,7 +222,7 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
             if (!sessionStreamRateLimiter.admit(userId, data.sid)) {
                 return;
             }
-            const isValid = await activityCache.isSessionValid(data.sid, userId);
+            const isValid = await activityCache.isSessionValid(data.sid, userId, socket.data?.piiProtectionVersion === 1);
             if (!isValid) {
                 return;
             }
@@ -244,7 +247,7 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
 
                 // Resolve session
                 const session = await db.session.findUnique({
-                    where: { id: sid, accountId: userId }
+                    where: { ...piiSocketVisibility(socket), id: sid, accountId: userId }
                 });
                 if (!session) {
                     return;
@@ -300,6 +303,7 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                 eventRouter.emitUpdate({
                     userId,
                     payload: updatePayload,
+                sessionProtection: session.piiProtection,
                     recipientFilter: { type: 'all-interested-in-session', sessionId: sid },
                     skipSenderConnection: connection
                 });
@@ -328,7 +332,7 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
 
             // Resolve session
             const session = await db.session.findUnique({
-                where: { id: sid, accountId: userId }
+                where: { ...piiSocketVisibility(socket), id: sid, accountId: userId }
             });
             if (!session) {
                 return;

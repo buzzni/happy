@@ -130,7 +130,7 @@ export async function createSessionFollowup(
         return { ok: false, error: 'machine-key-version-conflict' };
     }
     const session = await tx.session.findFirst({
-        where: { id: input.sessionId, accountId: machine.accountId, active: true },
+        where: { id: input.sessionId, accountId: machine.accountId, active: true, piiProtection: false },
         select: { id: true, accountId: true, seq: true, active: true },
     });
     if (!session || input.responseBoundarySeq > session.seq) {

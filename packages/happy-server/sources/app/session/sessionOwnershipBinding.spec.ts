@@ -1,3 +1,4 @@
+import { withSessionPiiModeMigration } from '@/testing/pgliteSessionModeFixture';
 import { beforeAll, beforeEach, afterEach, afterAll, describe, expect, it, vi } from 'vitest';
 import { PGlite } from '@electric-sql/pglite';
 import { PrismaPGlite } from 'pglite-prisma-adapter';
@@ -25,6 +26,8 @@ vi.mock('@/app/events/eventRouter', () => ({
 }));
 vi.mock('@/app/session/sessionDelete', () => ({ sessionDelete: vi.fn() }));
 vi.mock('@/app/session/sessionArchive', () => ({ sessionArchive: vi.fn() }));
+import { createExecutionBoundSession } from '@/app/session/sessionExecutionBinding';
+import { createOwnershipBoundSession } from '@/app/session/sessionOwnershipBinding';
 import { sessionOwnershipRoutes } from '@/app/api/routes/sessionOwnershipRoutes';
 import { signOwnership, ownershipDigest, ownershipFresh, SessionOwnershipProofSchema, type SessionOwnershipProof } from '@session-ownership';
 import { sessionRoutes } from '@/app/api/routes/sessionRoutes';
@@ -39,6 +42,7 @@ beforeAll(async () => {
   const require = createRequire(resolve('package.json'));
   sql = (await promisify(execFile)(process.execPath, [require.resolve('prisma/build/index.js'), 'migrate', 'diff', '--from-empty', '--to-schema-datamodel', 'prisma/schema.prisma', '--script'],
     { env: { ...process.env, XDG_CACHE_HOME: '/tmp/happy-rotation-prisma-cache', DATABASE_URL: 'postgresql://unused:unused@localhost:5432/unused' }, maxBuffer: 1024 * 1024 })).stdout;
+  sql = await withSessionPiiModeMigration(sql);
   migration = await readFile('prisma/migrations/20261025000000_session_ownership/migration.sql', 'utf8');
 });
 beforeEach(async () => {
@@ -143,18 +147,61 @@ async function empty() {
 }
 
 describe('T4o creation ownership at the HTTP and SQL boundary', () => {
+  it('binds a signed canonical masking mode to the session row and refuses mode substitution', async () => {
+    const body = { ...createBody, piiMode: 'host-masking' as const };
+    const signed = await proof(body, { piiMode: 'host-masking' });
+    const created = await createOwnershipBoundSession('personal-account', body, signed);
+    expect(created.session).toMatchObject({ piiProtection: true, piiMode: 'host-masking' });
+    expect(state.emitted).toEqual([expect.objectContaining({ sessionProtection: true })]);
+    expect((await createOwnershipBoundSession('personal-account', body, signed)).session.id).toBe(created.session.id);
+    await expect(createOwnershipBoundSession('personal-account', { ...body, piiMode: 'isolated' }, signed)).rejects.toThrow();
+    await expect(createOwnershipBoundSession('personal-account', body, await proof(body))).rejects.toThrow();
+    await expect(createOwnershipBoundSession('personal-account', body, await proof(body, { piiMode: 'host-masking', projectId: null }))).rejects.toThrow();
+  });
+
+  it('refuses protection downgrades and scope changes when inheriting a confirmed parent', async () => {
+    const parentBody={...createBody,tag:'protected-parent',piiMode:'host-masking' as const};
+    const parent=await createOwnershipBoundSession('personal-account',parentBody,await proof(parentBody,{piiMode:'host-masking'}));
+    await confirm(parent.session.id,parent.ownership.ownershipBindingId,parent.ownership.createDigest);
+    const childBody={...createBody,tag:'fork-child',piiMode:'none' as const};
+    const changes={parentHubSessionId:parent.session.id,intentId:'child-intent',operationId:'child-op',nonce:rotationBase64url(new Uint8Array(32).fill(9))};
+    expect((await create(await proof(childBody,changes),childBody)).statusCode).toBe(403);
+    const protectedChild={...childBody,piiMode:'host-masking' as const};
+    await expect(createOwnershipBoundSession('personal-account',protectedChild,await proof(protectedChild,{...changes,piiMode:'host-masking',machineId:'machine-2'}))).rejects.toMatchObject({statusCode:403});
+    await expect(createOwnershipBoundSession('personal-account',protectedChild,await proof(protectedChild,{...changes,piiMode:'host-masking',projectId:'other'}))).rejects.toMatchObject({statusCode:403});
+    const child=await createOwnershipBoundSession('personal-account',protectedChild,await proof(protectedChild,{...changes,piiMode:'host-masking'}));
+    expect(child.session.piiMode).toBe('host-masking');
+    expect((await lookup(parent.session.id)).json().sessions[0].protection).toEqual({projectId:'project',machineId:'machine-1',machineAccountId:'company-account',companyId:'company-1',piiMode:'host-masking'});
+  });
+
+  it('requires project ownership alongside the device execution proof for masking', async () => {
+    const body = { ...fixture.createBody, piiMode: 'host-masking' as const };
+    const execution = await signed(body);
+    await expect(createExecutionBoundSession('personal-account', body, execution)).rejects.toThrow();
+    const owned = await proof(body, { piiMode: 'host-masking' });
+    const result = await createOwnershipBoundSession('personal-account', body, owned, execution);
+    expect(result.session).toMatchObject({ piiProtection: true, piiMode: 'host-masking' });
+    expect(await client.sessionExecutionBinding.count()).toBe(1);
+    expect(await client.sessionOwnershipBinding.count()).toBe(1);
+    expect(state.emitted).toEqual([expect.objectContaining({ sessionProtection: true })]);
+  });
+
   it.skipIf(!process.env.OWNERSHIP_PRODUCER_FIXTURE)('accepts the actual A+ intent/seal output without re-signing', async () => {
     const artifact = JSON.parse(await readFile(process.env.OWNERSHIP_PRODUCER_FIXTURE!, 'utf8')) as {
       publicKey: string; body: SessionExecutionCreateBody; proof: SessionOwnershipProof;
     };
     const p = artifact.proof;
+    process.env.HAPPY_SESSION_OWNERSHIP_ISSUER = p.issuer;
+    process.env.HAPPY_SESSION_OWNERSHIP_AUDIENCE = p.audience;
     vi.spyOn(Date, 'now').mockReturnValue(p.issuedAt);
     process.env.HAPPY_SESSION_OWNERSHIP_PUBLIC_KEYS = JSON.stringify({ [p.keyId]: artifact.publicKey });
     await client.machine.create({ data: { id: p.machineId, accountId: p.machineAccountId, metadata: 'synthetic' } });
-    const created = await create(p, artifact.body, {}, p.sessionAccountId);
-    expect(created.statusCode, created.body).toBe(200);
-    expect(created.json().ownership).toMatchObject({ registrationState: 'pending', createDigest: p.createBodyHash });
-    expect((await create(p, artifact.body, {}, p.sessionAccountId)).json().session.id).toBe(created.json().session.id);
+    // Protected HTTP rollout stays closed; exercise the real transactional receiver
+    // with the producer's signature unchanged, not a locally re-signed mock.
+    const created = await createOwnershipBoundSession(p.sessionAccountId, artifact.body, p);
+    expect(created.ownership).toMatchObject({ registrationState: 'pending', createDigest: p.createBodyHash });
+    expect(created.session.piiMode).toBe(artifact.body.piiMode ?? 'none');
+    expect((await createOwnershipBoundSession(p.sessionAccountId, artifact.body, p)).session.id).toBe(created.session.id);
     expect(await ownershipDigest(p)).toBe((await client.sessionOwnershipBinding.findFirstOrThrow()).proofDigest);
   });
   it('leaves legacy creation unowned and refuses malformed proofs instead of unsigned downgrade', async () => {

@@ -14,6 +14,6 @@
 
 import { eventRouter } from "@/app/events/eventRouter";
 
-export async function isUserActive(userId: string): Promise<boolean> {
-    return eventRouter.hasActiveUserScopedSocket(userId);
+export async function isUserActive(userId: string, piiProtection = false): Promise<boolean> {
+    return eventRouter.hasActiveUserScopedSocket(userId, piiProtection);
 }

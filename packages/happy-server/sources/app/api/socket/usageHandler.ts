@@ -1,3 +1,4 @@
+import { piiSocketVisibility } from "@/app/session/piiSessionVisibility";
 import { Socket } from "socket.io";
 import { AsyncLock } from "@/utils/lock";
 import { db } from "@/storage/db";
@@ -20,7 +21,7 @@ export function usageHandler(userId: string, socket: Socket) {
 
             try {
                 const session = await db.session.findFirst({
-                    where: { id: parsed.data.sessionId, accountId: userId },
+                    where: { ...piiSocketVisibility(socket), id: parsed.data.sessionId, accountId: userId },
                     select: { id: true },
                 });
                 if (!session) {
@@ -134,7 +135,7 @@ export function usageHandler(userId: string, socket: Socket) {
                     // If sessionId provided, verify it belongs to the user
                     if (sessionId) {
                         const session = await db.session.findFirst({
-                            where: {
+                            where: { ...piiSocketVisibility(socket),
                                 id: sessionId,
                                 accountId: userId
                             }

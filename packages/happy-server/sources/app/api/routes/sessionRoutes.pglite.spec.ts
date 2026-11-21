@@ -1,3 +1,4 @@
+import { withSessionPiiModeMigration } from '@/testing/pgliteSessionModeFixture';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PGlite } from '@electric-sql/pglite';
 import { PrismaPGlite } from 'pglite-prisma-adapter';
@@ -6,6 +7,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
 import { resolve } from 'node:path';
+import { readFile } from 'node:fs/promises';
 import fastify from 'fastify';
 import { serializerCompiler, validatorCompiler, type ZodTypeProvider } from 'fastify-type-provider-zod';
 import type { Fastify } from '../types';
@@ -35,6 +37,11 @@ import { auth } from '@/app/auth/auth';
 import { createSessionScopedTokenIssuer } from '@/app/auth/sessionScopedToken';
 import { enableAuthentication, enableSessionScopeAuthentication } from '@/app/api/utils/enableAuthentication';
 import { sessionRoutes } from './sessionRoutes';
+import { accountRoutes } from './accountRoutes';
+import { accessKeysRoutes } from './accessKeysRoutes';
+import { pushRoutes } from './pushRoutes';
+import { v3SessionRoutes } from './v3SessionRoutes';
+import { v3SessionEventRoutes } from './v3SessionEventRoutes';
 
 const ACCOUNT = 'account-1';
 const OTHER = 'account-2';
@@ -66,6 +73,7 @@ beforeAll(async () => {
     const require = createRequire(resolve('package.json'));
     sql = (await promisify(execFile)(process.execPath, [require.resolve('prisma/build/index.js'), 'migrate', 'diff', '--from-empty', '--to-schema-datamodel', 'prisma/schema.prisma', '--script'],
         { env: { ...process.env, DATABASE_URL: 'postgresql://unused:unused@localhost:5432/unused' }, maxBuffer: 1024 * 1024 })).stdout;
+    sql = await withSessionPiiModeMigration(sql);
     await auth.init();
     issuer = await createSessionScopedTokenIssuer({ seed: 'test-scoped-seed-not-a-production-key' });
     token = await auth.createToken(ACCOUNT);
@@ -78,6 +86,11 @@ beforeAll(async () => {
     enableAuthentication(typed);
     enableSessionScopeAuthentication(typed, () => issuer);
     sessionRoutes(typed);
+    accountRoutes(typed);
+    accessKeysRoutes(typed);
+    pushRoutes(typed);
+    v3SessionRoutes(typed);
+    v3SessionEventRoutes(typed);
     await typed.ready();
     app = typed;
 });
@@ -104,6 +117,7 @@ async function seed(id: string, updatedAt: number, over: {
     accountId?: string;
     active?: boolean;
     lastActiveAt?: number;
+    piiProtection?: boolean;
     dataEncryptionKey?: Uint8Array<ArrayBuffer>;
 } = {}) {
     await client.session.create({
@@ -119,6 +133,7 @@ async function seed(id: string, updatedAt: number, over: {
             active: over.active ?? true,
             lastActiveAt: new Date(over.lastActiveAt ?? updatedAt),
             createdAt: new Date(T0 - 1000),
+            ...(over.piiProtection ? { piiProtection: true } : {}),
             ...(over.dataEncryptionKey ? { dataEncryptionKey: over.dataEncryptionKey } : {}),
         },
     });
@@ -433,5 +448,93 @@ describe('existing session list routes are unchanged', () => {
         const body = response.json() as { sessions: Array<Record<string, unknown>> };
         expect(body.sessions.map((s) => s.id)).toEqual(['s-1', 's-3']);
         expect(Object.keys(body.sessions[0]).sort()).toEqual(v2Keys);
+    });
+});
+
+describe('PII request-scoped visibility', () => {
+    it('filters every list/projection before pagination and hides messages/events from undeclared clients', async () => {
+        await seed('normal', Date.now());
+        await seed('protected', Date.now(), { piiProtection: true });
+        const headers = { authorization: `Bearer ${token}` };
+        for (const path of ['/v1/sessions', '/v2/sessions', '/v2/sessions/active', '/v2/sessions/recent']) {
+            const old = await app.inject({ method: 'GET', url: path, headers });
+            expect(old.statusCode, path).toBe(200);
+            expect(old.json().sessions.map((s: { id: string }) => s.id), path).toEqual(['normal']);
+            const supported = await app.inject({ method: 'GET', url: path, headers: { ...headers, 'x-happy-pii-protection': '1' } });
+            expect(supported.json().sessions.map((s: { id: string }) => s.id).sort()).toEqual(['normal', 'protected']);
+        }
+        for (const projection of [undefined, 'seq', 'version']) {
+            const result = await app.inject({ method: 'POST', url: '/v2/sessions/lookup', headers,
+                payload: { ids: ['normal', 'protected'], ...(projection ? { projection } : {}) } });
+            expect(result.statusCode).toBe(200);
+            expect(result.json().sessions.map((s: { id: string }) => s.id)).toEqual(['normal']);
+        }
+        for (const path of ['/v1/sessions/protected/messages', '/v3/sessions/protected/messages', '/v3/sessions/protected/events']) {
+            expect((await app.inject({ method: 'GET', url: path, headers })).statusCode, path).toBe(404);
+            expect((await app.inject({ method: 'GET', url: path, headers: { ...headers, 'x-happy-pii-protection': 'true' } })).statusCode, path).toBe(404);
+            expect((await app.inject({ method: 'GET', url: path, headers: { ...headers, 'x-happy-pii-protection': '1' } })).statusCode, path).toBe(200);
+        }
+        const reused = await app.inject({ method: 'POST', url: '/v1/sessions', headers,
+            payload: { tag: 'tag-protected', metadata: 'untrusted' } });
+        expect(reused.statusCode).toBe(409);
+        expect(reused.body).not.toContain('enc-protected');
+        const create = await app.inject({ method: 'POST', url: '/v1/sessions', headers,
+            payload: { tag: 'new-protected', metadata: 'untrusted', piiProtection: true } });
+        expect(create.statusCode).toBe(409);
+    });
+    it('filters protected usage in SQL before aggregate projection', async () => {
+        await seed('normal', Date.now());
+        await seed('protected', Date.now(), { piiProtection: true });
+        for (const [id, sessionId, tokens] of [
+            ['normal-report', 'normal', 2], ['protected-report', 'protected', 100],
+            ['account-report', null, 3],
+        ] as const) {
+            await client.usageReport.create({ data: {
+                id, key: id, accountId: ACCOUNT, sessionId,
+                data: { tokens: { input: tokens, output: 0, total: tokens }, cost: { total: 0 } },
+            } });
+        }
+        const request = (declared: boolean) => app.inject({
+            method: 'POST', url: '/v1/usage/query', payload: {},
+            headers: { authorization: `Bearer ${token}`,
+                ...(declared ? { 'x-happy-pii-protection': '1' } : {}) },
+        });
+        const old = await request(false);
+        expect(old.statusCode).toBe(200);
+        expect(old.json()).toMatchObject({ totalReports: 2, usage: [{ tokens: { input: 5 } }] });
+        const supported = await request(true);
+        expect(supported.statusCode).toBe(200);
+        expect(supported.json()).toMatchObject({ totalReports: 3, usage: [{ tokens: { input: 105 } }] });
+    });
+    it('hides protected access-key conflicts and rejects undeclared write/destroy requests', async () => {
+        await client.session.create({ data: { id: 'protected', accountId: ACCOUNT, tag: 'protected', metadata: 'synthetic', piiProtection: true } });
+        await client.machine.create({ data: { id: 'pc', accountId: ACCOUNT, metadata: '' } });
+        await client.accessKey.create({ data: { accountId: ACCOUNT, sessionId: 'protected', machineId: 'pc', data: 'private-key-envelope' } });
+        const headers = { authorization: `Bearer ${token}` };
+        const key = await app.inject({ method: 'PUT', url: '/v1/access-keys/protected/pc', headers,
+            payload: { data: 'replacement', expectedVersion: 99 } });
+        expect(key.statusCode).toBe(404);
+        expect(key.body).not.toContain('private-key-envelope');
+        expect((await app.inject({ method: 'POST', url: '/v1/sessions/protected/archive', headers })).statusCode).toBe(404);
+        expect((await app.inject({ method: 'POST', url: '/v1/sessions/protected/push-event', headers,
+            payload: { kind: 'done', title: 'injection', body: 'injection' } })).statusCode).toBe(404);
+        expect((await app.inject({ method: 'DELETE', url: '/v1/sessions/protected', headers })).statusCode).toBe(404);
+        expect(await client.session.count({ where: { id: 'protected', active: true } })).toBe(1);
+        const supported = await app.inject({ method: 'PUT', url: '/v1/access-keys/protected/pc',
+            headers: { ...headers, 'x-happy-pii-protection': '1' },
+            payload: { data: 'replacement', expectedVersion: 99 } });
+        expect(supported.statusCode).toBe(200);
+        expect(supported.json()).toMatchObject({ currentData: 'private-key-envelope' });
+    });
+    it('enforces protection immutability beneath metadata writers', async () => {
+        await seed('normal', Date.now());
+        // The schema diff provides the column; the migration supplies the trigger.
+        const migration = await readFile('prisma/migrations/20261030110000_session_pii_protection/migration.sql', 'utf8');
+        await pg.exec(migration.replace('ADD COLUMN "piiProtection"', 'ADD COLUMN IF NOT EXISTS "piiProtection"'));
+        await expect(pg.exec(`UPDATE "Session" SET "piiProtection"=true WHERE id='normal'`)).rejects.toThrow('pii-protection-immutable');
+        await client.session.create({ data: { id: 'protected', accountId: ACCOUNT, tag: 'protected', metadata: 'synthetic', piiProtection: true } });
+        await expect(pg.exec(`UPDATE "Session" SET "piiProtection"=false WHERE id='protected'`)).rejects.toThrow('pii-protection-immutable');
+        await expect(client.session.findUnique({ where: { id: 'protected' } })).resolves.toMatchObject({ piiMode: 'isolated' });
+        await expect(pg.exec(`UPDATE "Session" SET "piiMode"='host-masking' WHERE id='protected'`)).rejects.toThrow('pii-mode-immutable');
     });
 });

@@ -48,7 +48,7 @@ describe('session-stream relay', () => {
 
         await handlers.get('session-stream')!({ sid: 'session-1', time: now, data: 'ciphertext' });
 
-        expect(mocks.isSessionValid).toHaveBeenCalledWith('session-1', 'user-1');
+        expect(mocks.isSessionValid).toHaveBeenCalledWith('session-1', 'user-1', false);
         expect(mocks.emitEphemeral).toHaveBeenCalledTimes(1);
         expect(mocks.emitEphemeral).toHaveBeenCalledWith({
             userId: 'user-1',

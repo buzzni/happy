@@ -19,11 +19,12 @@ import { deleteSessionAttachments } from "@/storage/files";
  * @param sessionId - ID of the session to delete
  * @returns true if deletion was successful, false if session not found or not owned by user
  */
-export async function sessionDelete(ctx: Context, sessionId: string): Promise<boolean> {
+export async function sessionDelete(ctx: Context, sessionId: string, visibility: { piiProtection?: false } = { piiProtection: false }): Promise<boolean> {
     return await inTx(async (tx) => {
         // Verify session exists and belongs to the user
         const session = await tx.session.findFirst({
             where: {
+                ...visibility,
                 id: sessionId,
                 accountId: ctx.uid
             }
@@ -116,6 +117,7 @@ export async function sessionDelete(ctx: Context, sessionId: string): Promise<bo
             eventRouter.emitUpdate({
                 userId: ctx.uid,
                 payload: updatePayload,
+                sessionProtection: session.piiProtection === true,
                 recipientFilter: { type: 'user-scoped-only' }
             });
 

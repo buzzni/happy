@@ -1,3 +1,4 @@
+import { db } from '@/storage/db';
 import { withRpcPeerDiagnostics } from './rpcPeerDiagnostics';
 import { createRpcLatency, parseRpcLatencyRequest, parseRpcLatencySnapshot, type RpcLatencySnapshot } from '@slopus/happy-wire';
 import { log } from "@/utils/log";
@@ -255,7 +256,23 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
             // name now. `isManagedSessionId` is durable for exactly that
             // reason: the answer does not change when the child goes away.
             const parsed = splitRpcMethod(method);
+            const session = parsed ? await db.session.findFirst({
+                where: { id: parsed.sessionId, accountId: userId },
+                select: { piiProtection: true },
+            }) : null;
+            const protectedSession = session?.piiProtection === true;
+            if (protectedSession && socket.data?.piiProtectionVersion !== 1) {
+                finish('not_available');
+                callback?.({ ok: false, error: 'RPC method not available' });
+                return;
+            }
             if (parsed && await (trace ? trace.measure('server-managed-check', () => isManagedSessionId(parsed.sessionId)) : isManagedSessionId(parsed.sessionId))) {
+                // Managed protected execution has no accepted provider boundary yet.
+                if (protectedSession) {
+                    finish('not_available');
+                    callback?.({ ok: false, error: 'RPC method not available' });
+                    return;
+                }
                 const dispatched = await dispatchManagedRpc(managedRpcServer(), {
                     sessionId: parsed.sessionId,
                     accountId: userId,
@@ -325,6 +342,11 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
                 candidate.data?.clientType === 'machine-scoped'
                 && candidate.data.machineId === machineId);
             const target = newestMachineSocket(machineCandidates) ?? targets[0];
+            if (protectedSession && target.data?.piiProtectionVersion !== 1) {
+                finish('not_available');
+                callback?.({ ok: false, error: 'RPC method not available' });
+                return;
+            }
             if (trace && io.sockets?.sockets) targetLocation = io.sockets.sockets.has(target.id) ? 'local' : 'remote';
             if (targets.length > 1) {
                 log({ module: 'websocket', level: 'warn' },
