@@ -4761,10 +4761,11 @@ export class ApiMachineClient {
             const terminalBindingStale = JSON.stringify(this.machine.metadata?.terminalBinding)
                 !== JSON.stringify(advertisedTerminalBinding);
             // viewer-channel-strict-design §4-6: the switch that turns clients to the sealed remote-screen channel.
-            // Only where a viewer tunnel can end at it: the preview tunnel is attached (not managed, not the
-            // Windows trial), the stack is native (a broker's VNC is inside its container), and a machine key
-            // exists to bind the open.
-            const advertisedViewerChannel = this.managedHandlers || this.windowsStandaloneTrial || this.browserSessionBroker
+            // Only where a viewer tunnel can end at it: the machine is strict (under compat the tunnel still
+            // ends at websockify), the preview tunnel is attached (not managed, not the Windows trial), the
+            // stack is native (a broker's VNC is inside its container), and a machine key exists to bind the open.
+            const advertisedViewerChannel = configuration.machineControl !== 'strict'
+                || this.managedHandlers || this.windowsStandaloneTrial || this.browserSessionBroker
                 || this.machine.encryptionVariant !== 'dataKey'
                 ? undefined
                 : VIEWER_CHANNEL_CAPABILITY;

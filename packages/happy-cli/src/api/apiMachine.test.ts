@@ -2234,31 +2234,39 @@ describe('ApiMachineClient socket reconnection', () => {
     });
 
     // aplus-dev-studio viewer-channel-strict-design §4-6 — the switch that turns clients to the sealed
-    // remote-screen channel: only where viewer tunnels can end at it (a native viewer stack the preview
-    // tunnel reaches) and a machine key exists to bind the open.
+    // remote-screen channel: only where viewer tunnels can end at it (a strict machine with a native viewer
+    // stack the preview tunnel reaches) and a machine key exists to bind the open. Under compat the tunnel
+    // still ends at websockify.
     it.each([
-        { variant: 'dataKey' as const, setup: {}, expected: VIEWER_CHANNEL_CAPABILITY },
-        { variant: 'legacy' as const, setup: {}, expected: undefined },
-        { variant: 'dataKey' as const, setup: { managedHandlers: {} }, expected: undefined },
-        { variant: 'dataKey' as const, setup: { browserSessionBroker: {} }, expected: undefined },
-        { variant: 'dataKey' as const, setup: { windowsStandaloneTrial: true }, expected: undefined },
-    ])('advertises the sealed viewer channel on a $variant machine ($setup)', async ({ variant, setup, expected }) => {
-        vi.useFakeTimers();
-        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
-            if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
-            if (event === 'machine-update-state') return { result: 'success', version: 1, daemonState: data.daemonState };
-            return { result: 'success' };
-        });
-        const machine = { ...makeMachine(), encryptionVariant: variant };
-        machine.metadata = { ...machine.metadata!, browserViewerChannel: expected ? undefined : VIEWER_CHANNEL_CAPABILITY };
-        const client = new ApiMachineClient('fake-token', machine);
-        Object.assign(client as any, setup);
-        client.connect();
+        { mode: 'strict' as const, variant: 'dataKey' as const, setup: {}, expected: VIEWER_CHANNEL_CAPABILITY },
+        { mode: 'compat' as const, variant: 'dataKey' as const, setup: {}, expected: undefined },
+        { mode: 'strict' as const, variant: 'legacy' as const, setup: {}, expected: undefined },
+        { mode: 'strict' as const, variant: 'dataKey' as const, setup: { managedHandlers: {} }, expected: undefined },
+        { mode: 'strict' as const, variant: 'dataKey' as const, setup: { browserSessionBroker: {} }, expected: undefined },
+        { mode: 'strict' as const, variant: 'dataKey' as const, setup: { windowsStandaloneTrial: true }, expected: undefined },
+    ])('advertises the sealed viewer channel on a $mode $variant machine ($setup)', async ({ mode, variant, setup, expected }) => {
+        const control = configuration as { machineControl?: 'compat' | 'strict' };
+        control.machineControl = mode;
+        try {
+            vi.useFakeTimers();
+            mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+                if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
+                if (event === 'machine-update-state') return { result: 'success', version: 1, daemonState: data.daemonState };
+                return { result: 'success' };
+            });
+            const machine = { ...makeMachine(), encryptionVariant: variant };
+            machine.metadata = { ...machine.metadata!, browserViewerChannel: expected ? undefined : VIEWER_CHANNEL_CAPABILITY };
+            const client = new ApiMachineClient('fake-token', machine);
+            Object.assign(client as any, setup);
+            client.connect();
 
-        socketHandlers.connect![0]!();
-        await vi.waitFor(() => expect(machine.metadata?.browserViewerChannel).toEqual(expected));
+            socketHandlers.connect![0]!();
+            await vi.waitFor(() => expect(machine.metadata?.browserViewerChannel).toEqual(expected));
 
-        client.shutdown();
+            client.shutdown();
+        } finally {
+            delete control.machineControl;
+        }
     });
 
     // aplus-dev-studio specs/cross-machine-agent-delegation R11 — only a daemon that wired the links advertises them.
