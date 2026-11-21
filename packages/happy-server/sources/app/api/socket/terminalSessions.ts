@@ -31,6 +31,7 @@ export interface TerminalSession {
     clientSocketId: string;
     daemonSocketId: string;
     createdAt: number;
+    ownerKey?: string;
     /**
      * Codex CLI benchmark D4 B-R2 — set once the daemon reports the PTY ended.
      * The record then lives only for CLOSED_SESSION_TTL_SECONDS, so a client
@@ -349,6 +350,35 @@ export async function countActiveSessionsForUser(userId: string): Promise<number
     // The cap is per user, not per replica — a local count silently multiplied
     // the ceiling by the replica count.
     return tolerate<number>('count', () => backend!.scard(userKey(userId)), local());
+}
+
+/** Management reads the same index as admission and never authorizes from a stale cache. */
+export async function listTerminalsForManagement(userId: string, ownerKey: string) {
+    const ids = backend
+        ? await backend.smembers(userKey(userId))
+        : [...cache.values()].filter(row => row.userId === userId && row.closedAt === undefined).map(row => row.id);
+    const sessions = [];
+    for (const id of ids) {
+        const row = await readTerminalForManagement(id);
+        if (row?.userId === userId && row.ownerKey === ownerKey && row.closedAt === undefined) {
+            sessions.push({ sessionId: row.id, machineId: row.machineId, createdAt: row.createdAt });
+        }
+    }
+    sessions.sort((a, b) => a.createdAt - b.createdAt);
+    return { active: ids.length, sessions };
+}
+
+async function readTerminalForManagement(id: string): Promise<TerminalSession | null> {
+    if (!backend) return cache.get(id) ?? null;
+    const value = await backend.get(sessionKey(id));
+    return value ? JSON.parse(value) as TerminalSession : null;
+}
+
+export async function getTerminalForManagement(userId: string, id: string) {
+    const row = await readTerminalForManagement(id);
+    if (!row || row.userId !== userId) return null;
+    const occupiesSlot = backend ? (await backend.smembers(userKey(userId))).includes(id) : row.closedAt === undefined;
+    return { ...row, occupiesSlot };
 }
 
 /** Test-only — clears the process-local cache (models a fresh replica). */
