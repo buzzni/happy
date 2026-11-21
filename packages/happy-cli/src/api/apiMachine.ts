@@ -106,6 +106,17 @@ const STRICT_VIEWER_REFUSAL = {
     code: 'STRICT_VIEWER_UNAVAILABLE',
     message: 'The remote screen is not available on a machine in strict mode',
 };
+/**
+ * viewer-channel-strict-design.md H0. A project binding is built from what happy-server sends — its
+ * workspace paths included — so on a strict machine it cannot keep the server off the daemon's own
+ * remote-screen stack (STRICT_RESERVED_RELAY_PORTS). Those ports are never a project's, so the
+ * project relay refuses them before it looks at the binding.
+ */
+const STRICT_RESERVED_PORT_REFUSAL = {
+    outcome: 'rejected' as const,
+    code: 'STRICT_RESERVED_PORT',
+    message: 'This machine runs in strict mode and does not relay its remote-screen or browser-debugging ports',
+};
 /** What a relay terminal's open ack advertises (specs/desktop-terminal-reliability/ Phase 3). */
 const RELAY_TERMINAL_CAPS = { resume: true, snapshot: true, pagedResume: true };
 /** Upgrade counterpart of PREVIEW_BOUND_PROXY_EVENT — see openPreviewWsTunnelBound. */
@@ -2631,6 +2642,9 @@ export class ApiMachineClient {
         binding: unknown,
         port: number,
     ): Promise<{ outcome: 'enforced' | 'unbound' } | { outcome: 'rejected'; code: string; message: string }> {
+        if (configuration.machineControl === 'strict' && STRICT_RESERVED_RELAY_PORTS.has(port)) {
+            return STRICT_RESERVED_PORT_REFUSAL;
+        }
         if (binding === undefined || binding === null) {
             // A strict machine relays only requests bound to a registered preview runtime: unbound, the
             // relay would let happy-server reach any local port in plaintext.
@@ -2655,6 +2669,10 @@ export class ApiMachineClient {
      * by then is reported as EVIDENCE_BUSY rather than left to ack late.
      */
     private async answerPreviewRuntimeLease(params: any, ack: (response: any) => void): Promise<void> {
+        if (configuration.machineControl === 'strict' && STRICT_RESERVED_RELAY_PORTS.has(params?.port)) {
+            ack({ type: 'error', code: STRICT_RESERVED_PORT_REFUSAL.code, message: STRICT_RESERVED_PORT_REFUSAL.message });
+            return;
+        }
         const deps = this.previewLeaseDeps({ probeDeadlineMs: MINT_LEASE_ANSWER_DEADLINE_MS });
         if (!deps) {
             ack({
@@ -4973,6 +4991,13 @@ const VIEWER_CONFIRM_DEAD_MS = 3_000;
 
 /** Chrome's conventional CDP port, then a small range for extra profiles. */
 const CDP_PORT_RANGE = [9222, 9223, 9224, 9225, 9226, 9227, 9228] as const;
+
+/**
+ * Password-less VNC, its websockify front and Chrome's debugging port: each hands over the screen or
+ * the whole browser to whoever reaches it. Fixed lists rather than the live lease records, so a stack
+ * that outlived a daemon restart is covered too.
+ */
+const STRICT_RESERVED_RELAY_PORTS: ReadonlySet<number> = new Set([...VIEWER_VNC_PORTS, ...VIEWER_WEB_PORTS, ...CDP_PORT_RANGE]);
 
 /**
  * A distinct CDP port per profile. Reusing one port makes the second Chrome
