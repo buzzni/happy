@@ -1,3 +1,4 @@
+import { withSessionPiiModeMigration } from '@/testing/pgliteSessionModeFixture';
 import { afterEach, beforeAll, beforeEach, expect, it } from 'vitest';
 import { PGlite } from '@electric-sql/pglite';
 import { PrismaPGlite } from 'pglite-prisma-adapter';
@@ -16,6 +17,7 @@ beforeAll(async () => {
   const require = createRequire(resolve('package.json'));
   sql = (await promisify(execFile)(process.execPath, [require.resolve('prisma/build/index.js'), 'migrate', 'diff', '--from-empty', '--to-schema-datamodel', 'prisma/schema.prisma', '--script'],
     { env: { ...process.env, DATABASE_URL: 'postgresql://unused:unused@localhost:5432/unused' }, maxBuffer: 1024 * 1024 })).stdout;
+  sql = await withSessionPiiModeMigration(sql);
 });
 
 beforeEach(async () => {
@@ -75,4 +77,10 @@ it('keeps supported reservations visible while retaining unsupported v5 cipherte
   expect(result).toMatchObject({ ok: true, value: [expect.objectContaining({ id: 'a1' })] });
   if (result.ok) expect(result.value).toHaveLength(1);
   expect(await client.automation.count()).toBe(2);
+});
+
+it('refuses protected targets before returning replay data or writing a conversation message', async () => {
+  await client.session.create({ data: { id: 'protected', accountId: 'owner', tag: 'protected', metadata: '', piiProtection: true } });
+  expect(await deliver({ sessionId: 'protected' })).toEqual({ ok: false, error: 'target-mismatch' });
+  expect(await client.sessionMessage.count({ where: { sessionId: 'protected' } })).toBe(0);
 });

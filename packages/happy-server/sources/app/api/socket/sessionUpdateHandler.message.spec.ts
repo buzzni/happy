@@ -156,3 +156,16 @@ describe('socket message persistence', () => {
         expect(mocks.emitUpdate).toHaveBeenCalledTimes(1);
     });
 });
+
+it('does not return protected metadata through an undeclared socket version-mismatch callback', async () => {
+    const handlers = new Map<string, Handler>();
+    const socket = { data: {}, on: (event: string, handler: Handler) => handlers.set(event, handler) } as any;
+    mocks.sessionFindUnique.mockImplementation(async ({ where }) => where.piiProtection === false ? null : { id: 'protected', piiProtection: true, metadataVersion: 2, metadata: 'private-metadata' });
+    sessionUpdateHandler('user-1', socket, { connectionType: 'user-scoped', socket, userId: 'user-1' });
+    const callback = vi.fn();
+    await handlers.get('update-metadata')!({ sid: 'protected', metadata: 'new', expectedVersion: 1 }, callback);
+    expect(callback).not.toHaveBeenCalled();
+    socket.data.piiProtectionVersion = 1;
+    await handlers.get('update-metadata')!({ sid: 'protected', metadata: 'new', expectedVersion: 1 }, callback);
+    expect(callback).toHaveBeenCalledWith({ result: 'version-mismatch', version: 2, metadata: 'private-metadata' });
+});

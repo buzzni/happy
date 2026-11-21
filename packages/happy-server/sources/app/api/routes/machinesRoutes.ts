@@ -1,3 +1,4 @@
+import { requireAccountPrincipal } from '../utils/enableAuthentication';
 import { eventRouter } from "@/app/events/eventRouter";
 import { Fastify } from "../types";
 import { z } from "zod";
@@ -449,6 +450,22 @@ export function machinesRoutes(
     });
 
     // GET /v1/machines/:id - Get single machine by ID
+    // Receipt bookkeeping excludes browser and managed-runtime bearers.
+    // This identity check is not a device signature or execution-ready proof.
+    app.get('/v1/machines/:id/pii-receipt-authority', {
+        preHandler: [app.authenticate, requireAccountPrincipal],
+        schema: { params: z.object({ id: z.string().min(1) }) },
+    }, async (request, reply) => {
+        const machine = await db.machine.findFirst({
+            where: { accountId: request.userId, id: request.params.id },
+            select: { id: true, accountId: true },
+        });
+        if (!machine) return reply.code(404).send({ error: 'Machine not found' });
+        return reply.header('Cache-Control', 'no-store').send({
+            machine: { id: machine.id, accountId: machine.accountId },
+        });
+    });
+
     app.get('/v1/machines/:id', {
         preHandler: authenticateMachineRead,
         schema: {

@@ -7,6 +7,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 // intended `lastActiveAt` + `active` columns are touched.
 
 let sessionUpdateMock: any;
+const sessionFindMock = vi.hoisted(() => vi.fn());
 let machineUpdateMock: any;
 let executeRawMock: any;
 let executeRawCalls: Array<{ strings: TemplateStringsArray; values: any[] }>;
@@ -14,7 +15,7 @@ let executeRawCalls: Array<{ strings: TemplateStringsArray; values: any[] }>;
 vi.mock("@/storage/db", () => ({
     db: {
         get session() {
-            return { update: sessionUpdateMock };
+            return { update: sessionUpdateMock, findUnique: sessionFindMock };
         },
         get machine() {
             return { update: machineUpdateMock };
@@ -258,4 +259,12 @@ describe("sessionCache.flushPendingUpdates — lastActiveAt 은 DB 세션 타임
 
         expect(await runCapturedAgainstKstDatabase("Session")).toBe("2026-09-23T14:57:48.397Z");
     });
+});
+
+it('remembers protection in the activity cache without granting it to undeclared senders', async () => {
+    sessionFindMock.mockResolvedValue({ piiProtection: true, lastActiveAt: new Date() });
+    expect(await activityCache.isSessionValid('protected-test', 'owner', true)).toBe(true);
+    sessionFindMock.mockClear();
+    expect(await activityCache.isSessionValid('protected-test', 'owner')).toBe(false);
+    expect(sessionFindMock).not.toHaveBeenCalled();
 });

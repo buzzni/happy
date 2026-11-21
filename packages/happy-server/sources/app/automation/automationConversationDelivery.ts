@@ -12,7 +12,7 @@ export async function deliverAutomationConversationMessage(tx: Prisma.Transactio
     const localId = `happy-automation:${run.id}`;
     // The run owns one target, even after its report or the transport ACK is lost.
     if (run.sessionId && run.sessionId !== input.sessionId) return denied('target-mismatch');
-    const session = await tx.session.findFirst({ where: { id: input.sessionId, accountId } });
+    const session = await tx.session.findFirst({ where: { id: input.sessionId, accountId, piiProtection: false } });
     if (!session) return denied('target-mismatch');
     const existing = await tx.sessionMessage.findUnique({ where: { sessionId_localId: { sessionId: input.sessionId, localId } } });
     if (existing) return { ok: true as const, value: { idempotent: true, message: existing } };
@@ -40,7 +40,7 @@ export async function deliverAutomationConversationMessage(tx: Prisma.Transactio
     if (updated.count !== 1) {
         // Local resume readiness precedes the batched server activity update.
         // Let the daemon wait for activation without spending sequence retries.
-        const latest = await tx.session.findFirst({ where: { id: input.sessionId, accountId }, select: { active: true } });
+        const latest = await tx.session.findFirst({ where: { id: input.sessionId, accountId, piiProtection: false }, select: { active: true } });
         return denied(latest?.active === false ? 'session-inactive' : 'session-changed');
     }
     const message = await tx.sessionMessage.create({ data: { sessionId: input.sessionId, localId, seq: input.expectedSeq + 1, content: { t: 'encrypted', c: input.contentCiphertext } } });

@@ -1,3 +1,4 @@
+import { withSessionPiiModeMigration } from '@/testing/pgliteSessionModeFixture';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PGlite } from '@electric-sql/pglite';
 import { PrismaPGlite } from 'pglite-prisma-adapter';
@@ -41,6 +42,7 @@ beforeAll(async () => {
     const require = createRequire(resolve('package.json'));
     sql = (await promisify(execFile)(process.execPath, [require.resolve('prisma/build/index.js'), 'migrate', 'diff', '--from-empty', '--to-schema-datamodel', 'prisma/schema.prisma', '--script'],
         { env: { ...process.env, DATABASE_URL: 'postgresql://unused:unused@localhost:5432/unused' }, maxBuffer: 1024 * 1024 })).stdout;
+    sql = await withSessionPiiModeMigration(sql);
 });
 beforeEach(async () => {
     if (postgresUrl) {

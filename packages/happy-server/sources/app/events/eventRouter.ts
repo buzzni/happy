@@ -1,3 +1,4 @@
+import { db } from "@/storage/db";
 import { Server, Socket } from "socket.io";
 import { log } from "@/utils/log";
 import { GitHubProfile } from "@/app/api/types";
@@ -224,6 +225,30 @@ export type EphemeralEvent = {
     timestamp: number;
 };
 
+const SESSION_EVENT_IDENTITIES = {
+    'new-message': 'sid',
+    'new-session': 'id',
+    'update-session': 'id',
+    'update-account': null,
+    'new-machine': null,
+    'update-machine': null,
+    'delete-machine': null,
+    'new-artifact': null,
+    'update-artifact': null,
+    'delete-artifact': null,
+    'delete-session': 'sid',
+    'relationship-updated': null,
+    'new-feed-post': null,
+    'kv-batch-update': null,
+    'automation-updated': null,
+    'activity': 'id',
+    'machine-activity': null,
+    'usage': 'id',
+    'machine-status': null,
+    'stream': 'id',
+    'session-event': 'sessionId',
+} satisfies Record<UpdateEvent['type'] | EphemeralEvent['type'], 'id' | 'sid' | 'sessionId' | null>;
+
 // === EVENT PAYLOAD TYPES ===
 
 export interface UpdatePayload {
@@ -245,6 +270,9 @@ export interface EphemeralPayload {
 
 class EventRouter {
     private io!: Server;
+    private deliveryDepth = new Map<string, number>();
+    private deliveryTails = new Map<string, Promise<void>>();
+    private protection = new Map<string, boolean>();
     private userConnections = new Map<string, Set<ClientConnection>>();
 
     // === INITIALIZATION ===
@@ -270,23 +298,37 @@ class EventRouter {
     // === CONNECTION MANAGEMENT (via Socket.IO rooms) ===
 
     addConnection(userId: string, connection: ClientConnection): void {
+        const scope = connection.connectionType === 'session-scoped' ? connection.sessionId
+            : connection.connectionType === 'machine-scoped' ? connection.machineId : undefined;
+        // Recovery can bypass auth middleware and restore old socket data/rooms.
+        // Disconnect invalid restored memberships before registering any receiver.
+        if ((scope !== undefined && (typeof scope !== 'string' || scope.includes(':')))
+            || (connection.socket.data?.managedDaemon && connection.socket.data?.piiProtectionVersion === 1)) {
+            connection.socket.disconnect(true);
+            return;
+        }
+
         if (!this.userConnections.has(userId)) {
             this.userConnections.set(userId, new Set());
         }
         this.userConnections.get(userId)!.add(connection);
 
         const socket = connection.socket;
-        socket.join(`user:${userId}`);
+        const joinRoom = (room: string) => {
+            socket.join(room);
+            if (socket.data?.piiProtectionVersion === 1) socket.join(`${room}:pii-v1`);
+        };
+        joinRoom(`user:${userId}`);
 
         switch (connection.connectionType) {
             case 'user-scoped':
-                if (!connection.transportOnly) socket.join(userScopedRoom(userId));
+                if (!connection.transportOnly) joinRoom(userScopedRoom(userId));
                 break;
             case 'session-scoped':
-                socket.join(`user:${userId}:session:${connection.sessionId}`);
+                joinRoom(`user:${userId}:session:${connection.sessionId}`);
                 break;
             case 'machine-scoped':
-                socket.join(`user:${userId}:machine:${connection.machineId}`);
+                joinRoom(`user:${userId}:machine:${connection.machineId}`);
                 break;
         }
     }
@@ -322,12 +364,14 @@ class EventRouter {
     emitUpdate(params: {
         userId: string;
         payload: UpdatePayload;
+        sessionProtection?: boolean;
         recipientFilter?: RecipientFilter;
         skipSenderConnection?: ClientConnection;
     }): void {
         this.emit({
             userId: params.userId,
             eventName: 'update',
+            sessionProtection: params.sessionProtection,
             payload: params.payload,
             recipientFilter: params.recipientFilter || { type: 'all-user-authenticated-connections' },
             skipSenderConnection: params.skipSenderConnection
@@ -337,12 +381,14 @@ class EventRouter {
     emitEphemeral(params: {
         userId: string;
         payload: EphemeralPayload;
+        sessionProtection?: boolean;
         recipientFilter?: RecipientFilter;
         skipSenderConnection?: ClientConnection;
     }): void {
         this.emit({
             userId: params.userId,
             eventName: 'ephemeral',
+            sessionProtection: params.sessionProtection,
             payload: params.payload,
             recipientFilter: params.recipientFilter || { type: 'all-user-authenticated-connections' },
             skipSenderConnection: params.skipSenderConnection
@@ -357,8 +403,8 @@ class EventRouter {
      * hasActiveUserScopedSocketIn for why session-scoped (CLI/agent) and
      * machine-scoped (daemon) sockets don't count.
      */
-    async hasActiveUserScopedSocket(userId: string): Promise<boolean> {
-        return hasActiveUserScopedSocketIn(this.io, userId);
+    async hasActiveUserScopedSocket(userId: string, piiProtection = false): Promise<boolean> {
+        return hasActiveUserScopedSocketIn(this.io, userId, piiProtection);
     }
 
     async hasMachineSocket(userId: string, machineId: string): Promise<boolean> {
@@ -383,9 +429,61 @@ class EventRouter {
         }
     }
 
-    private emit(params: {
+    private emit(params: Parameters<EventRouter['deliver']>[0]): void {
+        const body = params.eventName === 'update' ? params.payload.body : params.payload;
+        const kind = params.eventName === 'update' ? body?.t : body?.type;
+        if (!Object.prototype.hasOwnProperty.call(SESSION_EVENT_IDENTITIES, kind)) return;
+        const field = SESSION_EVENT_IDENTITIES[kind as keyof typeof SESSION_EVENT_IDENTITIES];
+        const sessionId = params.recipientFilter.type === 'all-interested-in-session' ? params.recipientFilter.sessionId : field ? body[field] : undefined;
+        if (field && typeof sessionId !== 'string') return;
+        const key = typeof sessionId === 'string' ? JSON.stringify([params.userId, sessionId]) : undefined;
+        const remember = (value: boolean) => {
+            if (!key) return;
+            if (this.protection.size >= 10000) this.protection.delete(this.protection.keys().next().value!);
+            this.protection.set(key, value);
+        };
+        const known = params.sessionProtection ?? (key ? this.protection.get(key) : false);
+        if (known !== undefined && !this.deliveryTails.has(params.userId)) {
+            remember(known);
+            this.deliver({ ...params, sessionProtection: known });
+            return;
+        }
+        // Bound retained stream payloads while an uncertain DB lookup is pending.
+        const depth = this.deliveryDepth.get(params.userId) ?? 0;
+        if (depth >= 256) { log({ module: 'pii-session-delivery' }, 'Session delivery withheld: queue limit'); return; }
+        this.deliveryDepth.set(params.userId, depth + 1);
+        const prior = this.deliveryTails.get(params.userId) ?? Promise.resolve();
+        const next = prior.then(async () => {
+            let protectedSession = known ?? (key ? this.protection.get(key) : false);
+            if (protectedSession === undefined) {
+                for (let attempt = 0; attempt < 2; attempt++) {
+                    let timer: ReturnType<typeof setTimeout> | undefined;
+                    try {
+                        const row = await Promise.race([
+                            db.session.findFirst({ where: { id: sessionId, accountId: params.userId }, select: { piiProtection: true } }),
+                            new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('protection unavailable')), 2000); }),
+                        ]);
+                        protectedSession = row?.piiProtection !== false;
+                        if (row) remember(protectedSession);
+                        break;
+                    } catch { if (attempt === 1) throw new Error('protection unavailable'); }
+                    finally { clearTimeout(timer); }
+                }
+            } else remember(protectedSession);
+            this.deliver({ ...params, sessionProtection: protectedSession });
+        }).catch(() => { log({ module: 'pii-session-delivery' }, 'Session delivery withheld: protection unavailable'); });
+        this.deliveryTails.set(params.userId, next);
+        void next.then(() => {
+            const remaining = (this.deliveryDepth.get(params.userId) ?? 1) - 1;
+            if (remaining) this.deliveryDepth.set(params.userId, remaining); else this.deliveryDepth.delete(params.userId);
+            if (this.deliveryTails.get(params.userId) === next) this.deliveryTails.delete(params.userId);
+        });
+    }
+
+    private deliver(params: {
         userId: string;
         eventName: 'update' | 'ephemeral';
+        sessionProtection?: boolean;
         payload: any;
         recipientFilter: RecipientFilter;
         skipSenderConnection?: ClientConnection;
@@ -397,15 +495,16 @@ class EventRouter {
         const internal = isAutomationExecutionSessionId(sessionId);
         // A run owns this session. Ordinary clients read its result through the
         // authorized run projection; generic fan-out must not create another chat.
-        const rooms = internal ? [`user:${params.userId}:session:${sessionId}`]
-            : this.getRoomsForFilter(params.userId, params.recipientFilter);
+        const rooms = (internal ? [`user:${params.userId}:session:${sessionId}`]
+            : this.getRoomsForFilter(params.userId, params.recipientFilter))
+            .map(room => params.sessionProtection ? `${room}:pii-v1` : room);
 
         // Managed children of this session, addressed explicitly. Each packet
         // is released by the replica holding the socket, after that replica
         // re-reads the grant.
         const managedSessionId = internal ? sessionId
             : params.recipientFilter.type === 'all-interested-in-session' ? params.recipientFilter.sessionId : null;
-        if (managedSessionId) {
+        if (!params.sessionProtection && managedSessionId) {
             deliverManagedSession(this.managedIo, {
                 sessionId: managedSessionId,
                 accountId: params.userId,
@@ -414,11 +513,8 @@ class EventRouter {
             });
         }
 
-        if (params.skipSenderConnection) {
-            params.skipSenderConnection.socket.broadcast.to(rooms).emit(params.eventName, params.payload);
-        } else {
-            this.io.to(rooms).emit(params.eventName, params.payload);
-        }
+        const target = params.skipSenderConnection ? params.skipSenderConnection.socket.broadcast.to(rooms) : this.io.to(rooms);
+        target.emit(params.eventName, params.payload);
     }
 }
 
@@ -427,6 +523,8 @@ export const eventRouter = new EventRouter();
 // === EVENT BUILDER FUNCTIONS ===
 
 export function buildNewSessionUpdate(session: {
+    piiProtection?: boolean;
+    piiMode?: string;
     id: string;
     seq: number;
     metadata: string;
@@ -444,6 +542,7 @@ export function buildNewSessionUpdate(session: {
         seq: updateSeq,
         body: {
             t: 'new-session',
+            ...(session.piiProtection ? { piiProtection: true, piiMode: session.piiMode ?? 'isolated' } : {}),
             id: session.id,
             seq: session.seq,
             metadata: session.metadata,

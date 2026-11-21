@@ -108,6 +108,7 @@ export type SessionExecutionTicket = z.infer<typeof SessionExecutionTicketSchema
 export type DaemonRotationRequest = z.infer<typeof DaemonRotationRequestSchema>;
 export type MachineSetupTokenBindingV2Document = z.infer<typeof MachineSetupTokenBindingV2DocumentSchema>;
 export const SessionExecutionCreateBodySchema = z.object({
+  piiMode: z.enum(['none', 'host-masking', 'isolated']).optional(),
   tag: z.string().min(1).max(1024), metadata: z.string().max(60000),
   agentState: z.string().max(60000).nullable().optional(), dataEncryptionKey: z.string().max(1024).nullable().optional(),
 }).strict();

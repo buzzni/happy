@@ -36,8 +36,8 @@ export function userScopedRoom(userId: string): string {
  * Uses fetchSockets() which works cross-replica via the Redis streams
  * adapter.
  */
-export async function hasActiveUserScopedSocketIn(io: Server, userId: string): Promise<boolean> {
-    const sockets = await io.in(userScopedRoom(userId)).fetchSockets();
+export async function hasActiveUserScopedSocketIn(io: Server, userId: string, piiProtection = false): Promise<boolean> {
+    const sockets = await io.in(userScopedRoom(userId) + (piiProtection ? ':pii-v1' : '')).fetchSockets();
     return sockets.some(s => {
         const appState = s.data.appState as string | undefined;
         return appState !== 'background';

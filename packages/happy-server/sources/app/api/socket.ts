@@ -213,6 +213,12 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
         const sessionId = socket.handshake.auth.sessionId as string | undefined;
         const machineId = socket.handshake.auth.machineId as string | undefined;
 
+        // Room suffixes are reserved for server-owned capability memberships.
+        if ([sessionId, machineId].some(id => id !== undefined && (typeof id !== 'string' || id.includes(':')))) {
+            next(new Error('Invalid connection scope'));
+            return;
+        }
+
         if (!token) {
             log({ module: 'websocket' }, `No token provided`);
             next(new Error('Missing authentication token'));
@@ -250,6 +256,7 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             now: Date.now(),
         });
         if (managedDaemon) {
+            socket.data.piiProtectionVersion = undefined;
             socket.data.userId = managedDaemon.accountId;
             socket.data.managedDaemon = managedDaemon;
             socket.data.clientType = clientType;
@@ -280,7 +287,9 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             now: Date.now(),
         });
         if (browserSync) {
-            socket.data.userId = browserSync.accountId;
+            socket.data.piiProtectionVersion = socket.handshake.auth.piiProtectionVersion === 1
+            || socket.handshake.headers['x-happy-pii-protection'] === '1' ? 1 : undefined;
+        socket.data.userId = browserSync.accountId;
             socket.data.clientType = clientType;
             socket.data.sessionId = sessionId;
             socket.data.machineId = machineId;
@@ -314,6 +323,8 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             return;
         }
 
+        socket.data.piiProtectionVersion = socket.handshake.auth.piiProtectionVersion === 1
+            || socket.handshake.headers['x-happy-pii-protection'] === '1' ? 1 : undefined;
         socket.data.userId = verified.userId;
         socket.data.clientType = clientType;
         socket.data.sessionId = sessionId;

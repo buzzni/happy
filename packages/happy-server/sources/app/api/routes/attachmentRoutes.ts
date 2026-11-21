@@ -1,3 +1,4 @@
+import { piiSessionVisibility } from "@/app/session/piiSessionVisibility";
 /**
  * Attachment upload/download routes for image attachments in chat sessions.
  *
@@ -199,7 +200,7 @@ export function attachmentRoutes(
 
         // Verify session ownership
         const session = await db.session.findFirst({
-            where: { id: sessionId, accountId: userId },
+            where: { ...piiSessionVisibility(request), id: sessionId, accountId: userId },
         });
         if (!session) {
             return reply.code(404).send({ error: 'Session not found' });
@@ -347,7 +348,7 @@ export function attachmentRoutes(
 
         // Verify session ownership
         const session = await db.session.findFirst({
-            where: { id: sessionId, accountId: userId },
+            where: { ...piiSessionVisibility(request), id: sessionId, accountId: userId },
         });
         if (!session) {
             return reply.code(404).send({ error: 'Session not found' });
@@ -400,7 +401,7 @@ export function attachmentRoutes(
         const managed = managedPrincipal(request as never);
 
         const session = await db.session.findFirst({
-            where: { id: sessionId, accountId: userId },
+            where: { ...piiSessionVisibility(request), id: sessionId, accountId: userId },
         });
         if (!session) {
             return reply.code(404).send({ error: 'Session not found' });
@@ -557,7 +558,7 @@ export function attachmentRoutes(
 
         // Verify session ownership
         const session = await db.session.findFirst({
-            where: { id: sessionId, accountId: userId },
+            where: { ...piiSessionVisibility(request), id: sessionId, accountId: userId },
         });
         if (!session) {
             return reply.code(404).send({ error: 'Session not found' });

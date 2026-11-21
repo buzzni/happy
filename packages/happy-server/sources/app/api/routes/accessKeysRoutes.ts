@@ -1,3 +1,4 @@
+import { piiSessionVisibility } from "@/app/session/piiSessionVisibility";
 import { Fastify } from "../types";
 import { z } from "zod";
 import { db } from "@/storage/db";
@@ -37,7 +38,7 @@ export function accessKeysRoutes(app: Fastify) {
             // Verify session and machine belong to user
             const [session, machine] = await Promise.all([
                 db.session.findFirst({
-                    where: { id: sessionId, accountId: userId }
+                    where: { ...piiSessionVisibility(request), id: sessionId, accountId: userId }
                 }),
                 db.machine.findFirst({
                     where: { id: machineId, accountId: userId }
@@ -119,7 +120,7 @@ export function accessKeysRoutes(app: Fastify) {
             // Verify session and machine belong to user
             const [session, machine] = await Promise.all([
                 db.session.findFirst({
-                    where: { id: sessionId, accountId: userId }
+                    where: { ...piiSessionVisibility(request), id: sessionId, accountId: userId }
                 }),
                 db.machine.findFirst({
                     where: { id: machineId, accountId: userId }
@@ -213,6 +214,11 @@ export function accessKeysRoutes(app: Fastify) {
         const { data, expectedVersion } = request.body;
 
         try {
+            const session = await db.session.findFirst({
+                where: { ...piiSessionVisibility(request), id: sessionId, accountId: userId },
+                select: { id: true },
+            });
+            if (!session) return reply.code(404).send({ error: 'Access key not found' });
             // Get current access key for version check
             const currentAccessKey = await db.accessKey.findUnique({
                 where: {

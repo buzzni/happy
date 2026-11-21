@@ -1,3 +1,4 @@
+import { piiSocketVisibility } from "@/app/session/piiSessionVisibility";
 import { Socket } from "socket.io";
 import { db } from "@/storage/db";
 import { log } from "@/utils/log";
@@ -22,7 +23,7 @@ export function accessKeyHandler(userId: string, socket: Socket) {
             // Verify session and machine belong to user
             const [session, machine] = await Promise.all([
                 db.session.findFirst({
-                    where: { id: sessionId, accountId: userId }
+                    where: { ...piiSocketVisibility(socket), id: sessionId, accountId: userId }
                 }),
                 db.machine.findFirst({
                     where: { id: machineId, accountId: userId }

@@ -1,3 +1,4 @@
+import { piiSessionVisibility } from "@/app/session/piiSessionVisibility";
 import { Readable } from "node:stream";
 import { AUTOMATION_EXECUTION_SESSION_PREFIX, isAutomationExecutionSessionId, parseCanonicalOrgSetupTokenJson } from "@slopus/happy-wire";
 import { eventRouter, buildNewSessionUpdate } from "@/app/events/eventRouter";
@@ -27,7 +28,7 @@ export function sessionRoutes(app: Fastify) {
         const userId = request.userId;
 
         const sessions = await db.session.findMany({
-            where: visibleSessionScope(userId),
+            where: { ...visibleSessionScope(userId), ...piiSessionVisibility(request) },
             orderBy: { updatedAt: 'desc' },
             take: 150,
             select: {
@@ -35,6 +36,8 @@ export function sessionRoutes(app: Fastify) {
                 seq: true,
                 createdAt: true,
                 updatedAt: true,
+                piiProtection: true,
+                piiMode: true,
                 metadata: true,
                 metadataVersion: true,
                 agentState: true,
@@ -69,6 +72,7 @@ export function sessionRoutes(app: Fastify) {
                     updatedAt: sessionUpdatedAt,
                     active: v.active,
                     activeAt: v.lastActiveAt.getTime(),
+                    ...(v.piiProtection ? { piiProtection: true, piiMode: v.piiMode } : {}),
                     metadata: v.metadata,
                     metadataVersion: v.metadataVersion,
                     agentState: v.agentState,
@@ -94,7 +98,7 @@ export function sessionRoutes(app: Fastify) {
 
         const sessions = await db.session.findMany({
             where: {
-                ...visibleSessionScope(userId),
+                ...visibleSessionScope(userId), ...piiSessionVisibility(request),
                 active: true,
                 lastActiveAt: { gt: new Date(Date.now() - 1000 * 60 * 15) /* 15 minutes */ }
             },
@@ -105,6 +109,8 @@ export function sessionRoutes(app: Fastify) {
                 seq: true,
                 createdAt: true,
                 updatedAt: true,
+                piiProtection: true,
+                piiMode: true,
                 metadata: true,
                 metadataVersion: true,
                 agentState: true,
@@ -123,6 +129,7 @@ export function sessionRoutes(app: Fastify) {
                 updatedAt: v.updatedAt.getTime(),
                 active: v.active,
                 activeAt: v.lastActiveAt.getTime(),
+                ...(v.piiProtection ? { piiProtection: true, piiMode: v.piiMode } : {}),
                 metadata: v.metadata,
                 metadataVersion: v.metadataVersion,
                 agentState: v.agentState,
@@ -148,7 +155,7 @@ export function sessionRoutes(app: Fastify) {
         const order = new Map(uniqueIds.map((id, index) => [id, index]));
         if (request.body.projection === 'seq') {
             const sessions = await db.session.findMany({
-                where: { accountId: userId, id: { in: uniqueIds } },
+                where: { ...piiSessionVisibility(request), accountId: userId, id: { in: uniqueIds } },
                 select: { id: true, seq: true },
             });
             return reply.send({
@@ -204,7 +211,7 @@ export function sessionRoutes(app: Fastify) {
          */
         if (request.body.projection === 'version') {
             const rows = await db.session.findMany({
-                where: { accountId: userId, id: { in: uniqueIds } },
+                where: { ...piiSessionVisibility(request), accountId: userId, id: { in: uniqueIds } },
                 select: {
                     id: true,
                     seq: true,
@@ -235,7 +242,7 @@ export function sessionRoutes(app: Fastify) {
         }
         const sessions = await db.session.findMany({
             where: {
-                accountId: userId,
+                ...piiSessionVisibility(request), accountId: userId,
                 id: { in: uniqueIds }
             },
             select: {
@@ -243,6 +250,8 @@ export function sessionRoutes(app: Fastify) {
                 seq: true,
                 createdAt: true,
                 updatedAt: true,
+                piiProtection: true,
+                piiMode: true,
                 metadata: true,
                 metadataVersion: true,
                 agentState: true,
@@ -262,6 +271,7 @@ export function sessionRoutes(app: Fastify) {
                     updatedAt: v.updatedAt.getTime(),
                     active: v.active,
                     activeAt: v.lastActiveAt.getTime(),
+                    ...(v.piiProtection ? { piiProtection: true, piiMode: v.piiMode } : {}),
                     metadata: v.metadata,
                     metadataVersion: v.metadataVersion,
                     agentState: v.agentState,
@@ -296,7 +306,7 @@ export function sessionRoutes(app: Fastify) {
         }
 
         // Build where clause
-        const where: Prisma.SessionWhereInput = visibleSessionScope(userId);
+        const where: Prisma.SessionWhereInput = { ...visibleSessionScope(userId), ...piiSessionVisibility(request) };
 
         // Add changedSince filter (just a filter, doesn't affect pagination)
         if (changedSince) {
@@ -324,6 +334,8 @@ export function sessionRoutes(app: Fastify) {
                 seq: true,
                 createdAt: true,
                 updatedAt: true,
+                piiProtection: true,
+                piiMode: true,
                 metadata: true,
                 metadataVersion: true,
                 agentState: true,
@@ -353,6 +365,7 @@ export function sessionRoutes(app: Fastify) {
                 updatedAt: v.updatedAt.getTime(),
                 active: v.active,
                 activeAt: v.lastActiveAt.getTime(),
+                ...(v.piiProtection ? { piiProtection: true, piiMode: v.piiMode } : {}),
                 metadata: v.metadata,
                 metadataVersion: v.metadataVersion,
                 agentState: v.agentState,
@@ -405,7 +418,7 @@ export function sessionRoutes(app: Fastify) {
             }
         }
 
-        const where: Prisma.SessionWhereInput = visibleSessionScope(userId);
+        const where: Prisma.SessionWhereInput = { ...visibleSessionScope(userId), ...piiSessionVisibility(request) };
         const and: Prisma.SessionWhereInput[] = [];
         if (since !== undefined) {
             and.push({ updatedAt: { gte: new Date(since) } });
@@ -435,6 +448,8 @@ export function sessionRoutes(app: Fastify) {
                 seq: true,
                 createdAt: true,
                 updatedAt: true,
+                piiProtection: true,
+                piiMode: true,
                 metadata: true,
                 metadataVersion: true,
                 dataEncryptionKey: true,
@@ -458,6 +473,7 @@ export function sessionRoutes(app: Fastify) {
                 updatedAt: v.updatedAt.getTime(),
                 active: v.active,
                 activeAt: v.lastActiveAt.getTime(),
+                ...(v.piiProtection ? { piiProtection: true, piiMode: v.piiMode } : {}),
                 metadata: v.metadata,
                 metadataVersion: v.metadataVersion,
                 dataEncryptionKey: v.dataEncryptionKey ? Buffer.from(v.dataEncryptionKey).toString('base64') : null,
@@ -494,6 +510,8 @@ export function sessionRoutes(app: Fastify) {
         schema: {
             body: z.object({
                 tag: z.string(),
+                piiProtection: z.boolean().optional(),
+                piiMode: z.enum(['none', 'isolated', 'host-masking']).optional(),
                 metadata: z.string(),
                 agentState: z.string().nullish(),
                 dataEncryptionKey: z.string().nullish(),
@@ -508,6 +526,8 @@ export function sessionRoutes(app: Fastify) {
         if (isAutomationExecutionSessionId(tag)) {
             return reply.code(400).send({ error: 'Run-owned sessions require automation admission' });
         }
+        // Socket filtering and the final daemon binding must be accepted before enabling creation.
+        if (request.body.piiProtection === true || (request.body.piiMode !== undefined && request.body.piiMode !== 'none')) return reply.code(409).send({ error: 'pii-protection-not-ready' });
 
         const hasOwnership = Object.prototype.hasOwnProperty.call(request.body, 'ownershipProof');
         if (hasOwnership || Object.prototype.hasOwnProperty.call(request.body, 'executionProof')) {
@@ -516,6 +536,7 @@ export function sessionRoutes(app: Fastify) {
             try {
                 const owned = hasOwnership ? await createOwnershipBoundSession(userId, createBody, ownershipProof, executionProof) : null;
                 const session = owned?.session ?? await createExecutionBoundSession(userId, createBody, executionProof);
+                if (session.piiProtection) return reply.code(409).send({ error: 'pii-protection-not-ready' });
                 return reply.send({ ...(owned ? { ownership: owned.ownership } : {}), session: {
                     id: session.id, seq: session.seq, metadata: session.metadata, metadataVersion: session.metadataVersion,
                     agentState: session.agentState, agentStateVersion: session.agentStateVersion,
@@ -537,6 +558,7 @@ export function sessionRoutes(app: Fastify) {
             }
         });
         if (session) {
+            if (session.piiProtection) return reply.code(409).send({ error: 'pii-protection-not-ready' });
             log({ module: 'session-create', sessionId: session.id, userId, tag }, `Found existing session: ${session.id} for tag ${tag}`);
             return reply.send({
                 session: {
@@ -583,6 +605,7 @@ export function sessionRoutes(app: Fastify) {
             eventRouter.emitUpdate({
                 userId,
                 payload: updatePayload,
+                sessionProtection: session.piiProtection,
                 recipientFilter: { type: 'user-scoped-only' }
             });
 
@@ -620,7 +643,7 @@ export function sessionRoutes(app: Fastify) {
         const session = await db.session.findFirst({
             where: {
                 id: sessionId,
-                accountId: userId
+                ...piiSessionVisibility(request), accountId: userId
             }
         });
 
@@ -666,7 +689,7 @@ export function sessionRoutes(app: Fastify) {
         const userId = request.userId;
         const { sessionId } = request.params;
 
-        const deleted = await sessionDelete({ uid: userId }, sessionId);
+        const deleted = await sessionDelete({ uid: userId }, sessionId, piiSessionVisibility(request));
 
         if (!deleted) {
             return reply.code(404).send({ error: 'Session not found or not owned by user' });
@@ -687,7 +710,7 @@ export function sessionRoutes(app: Fastify) {
         const userId = request.userId;
         const { sessionId } = request.params;
 
-        const archived = await sessionArchive({ uid: userId }, sessionId);
+        const archived = await sessionArchive({ uid: userId }, sessionId, piiSessionVisibility(request));
 
         if (!archived) {
             return reply.code(404).send({ error: 'Session not found or not owned by user' });

@@ -85,7 +85,7 @@ describe("machineSessionOwnerRoutes — POST /v1/machine-sessions/:sessionId/own
 
         expect(res.statusCode).toBe(200);
         expect(res.json()).toEqual({ owner: { ownerAccountId: "acc-1" } });
-        expect(sessionFindFirst).toHaveBeenCalledWith({ where: { id: "S-1", accountId: "acc-1" } });
+        expect(sessionFindFirst).toHaveBeenCalledWith({ where: { piiProtection: false, id: "S-1", accountId: "acc-1" } });
         expect(machineFindFirst).toHaveBeenCalledWith({ where: { id: "M-1", accountId: "acc-1" } });
     });
 
@@ -121,7 +121,7 @@ describe("machineSessionOwnerRoutes — POST /v1/machine-sessions/:sessionId/own
 
         await ask(app, { userId: "attacker", sessionId: "victim-session" });
 
-        expect(sessionFindFirst).toHaveBeenCalledWith({ where: { id: "victim-session", accountId: "attacker" } });
+        expect(sessionFindFirst).toHaveBeenCalledWith({ where: { piiProtection: false, id: "victim-session", accountId: "attacker" } });
         expect(machineFindFirst).toHaveBeenCalledWith({ where: { id: "M-1", accountId: "attacker" } });
     });
 

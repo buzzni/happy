@@ -927,6 +927,18 @@ export async function resolveLiveGrant(input: {
         }
         if (claims.expiresAt > Number(grant.expiresAt)) return { ok: false, reason: 'claims-mismatch' };
 
+        // Every managed HTTP admission, socket event and delivery recheck uses
+        // this gate. Protected managed execution/reading is not accepted yet;
+        // a compatibility header cannot authorize that execution boundary.
+        const session = await tx.session.findUnique({
+            where: { id: claims.sessionId },
+            select: { accountId: true, piiProtection: true },
+        });
+        if (!session || session.piiProtection) return { ok: false, reason: 'session-unknown' };
+        if (session.accountId !== claims.accountId) {
+            return { ok: false, reason: 'session-owner-changed' };
+        }
+
         /*
          * A read token has no run to compare against, and there is nothing to
          * invent: the row it names has no run either. What is compared instead
@@ -1037,17 +1049,6 @@ export async function resolveLiveGrant(input: {
         });
         const mismatch = compareScope(authority as AuthorityRow | null, scope);
         if (mismatch) return { ok: false, reason: mismatch };
-
-        // The account a session belongs to can change under an account merge or
-        // a transfer; a grant minted before that must not keep acting on it.
-        const session = await tx.session.findUnique({
-            where: { id: claims.sessionId },
-            select: { accountId: true },
-        });
-        if (!session) return { ok: false, reason: 'session-unknown' };
-        if (session.accountId !== claims.accountId) {
-            return { ok: false, reason: 'session-owner-changed' };
-        }
 
         /*
          * And the access list, for a bearer that has a viewer.

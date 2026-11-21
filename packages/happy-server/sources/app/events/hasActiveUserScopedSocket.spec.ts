@@ -69,3 +69,8 @@ describe('eventRouter.hasActiveUserScopedSocket', () => {
         expect(seen.room).toBe('user:u1:user-scoped');
     });
 });
+it('counts only protection-capable viewer rooms for protected notification suppression', async () => {
+    const { io, seen } = fakeIo([]);
+    await hasActiveUserScopedSocketIn(io, 'protected-owner', true);
+    expect(seen.room).toBe('user:protected-owner:user-scoped:pii-v1');
+});

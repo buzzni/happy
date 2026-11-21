@@ -54,6 +54,7 @@ describe('dispatchSessionEventPush outcome', () => {
     beforeEach(() => {
         vi.clearAllMocks();
         mocks.isUserActive.mockResolvedValue(false);
+        mocks.session.mockResolvedValue({ piiProtection: false });
         mocks.findTokens.mockResolvedValue(twoTokens);
         mocks.deleteTokens.mockImplementation(lazyQuery);
     });
@@ -179,7 +180,7 @@ beforeEach(() => {
     mocks.findTokens.mockResolvedValue([{ id: 't1', token: 'expo-token' }]);
     mocks.sendPushNotifications.mockResolvedValue([{ status: 'ok' }]);
     mocks.run.mockResolvedValue({ id: 'r1', displaySessionId: 'manual' });
-    mocks.session.mockResolvedValue({ id: 'manual' });
+    mocks.session.mockResolvedValue({ id: 'manual', piiProtection: false });
 });
 
 it('routes an internal execution attention event to its owned display chat with its run identity', async () => {
@@ -216,6 +217,19 @@ it('preserves ordinary session notifications without an automation lookup', asyn
 it('still suppresses a mapped run notification while the user is active', async () => {
     mocks.isUserActive.mockResolvedValue(true);
     await dispatchSessionEventPush({ userId: 'owner', sessionId: 'automation-run:r1', title: 'Done', body: 'Result' });
+    expect(mocks.sendPushNotifications).not.toHaveBeenCalled();
+});
+
+it('removes protected content before provider delivery and refuses unknown protection', async () => {
+    mocks.session.mockResolvedValueOnce({ piiProtection: true });
+    await dispatchSessionEventPush({ userId: 'owner', sessionId: 'manual', title: 'private', body: 'private', data: { path: '/private', sessionId: 'spoof' } });
+    expect(mocks.isUserActive).toHaveBeenCalledWith('owner', true);
+    expect(mocks.sendPushNotifications).toHaveBeenCalledWith([expect.objectContaining({
+        title: '작업이 끝났어요', body: '작업이 끝났어요', data: { sessionId: 'manual' },
+    })], { timeoutMs: expect.any(Number) });
+    mocks.sendPushNotifications.mockClear();
+    mocks.session.mockResolvedValueOnce(null);
+    await dispatchSessionEventPush({ userId: 'owner', sessionId: 'manual', title: 'private', body: 'private' });
     expect(mocks.sendPushNotifications).not.toHaveBeenCalled();
 });
 

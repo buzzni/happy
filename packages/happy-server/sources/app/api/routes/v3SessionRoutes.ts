@@ -1,4 +1,5 @@
 import { readSessionObservation, observationCapability } from '@/app/session/sessionObservation';
+import { piiSessionVisibility } from "@/app/session/piiSessionVisibility";
 import { buildNewMessageUpdate, eventRouter } from "@/app/events/eventRouter";
 import { db } from "@/storage/db";
 import { allocateSessionSeqBatch, allocateUserSeqBatch } from "@/storage/seq";
@@ -91,9 +92,9 @@ export function v3SessionRoutes(app: Fastify) {
         const session = await db.session.findFirst({
             where: {
                 id: sessionId,
-                accountId: userId
+                ...piiSessionVisibility(request), accountId: userId
             },
-            select: { id: true }
+            select: { id: true, piiProtection: true }
         });
 
         if (!session) {
@@ -149,9 +150,9 @@ export function v3SessionRoutes(app: Fastify) {
         const session = await db.session.findFirst({
             where: {
                 id: sessionId,
-                accountId: userId
+                ...piiSessionVisibility(request), accountId: userId
             },
-            select: { id: true }
+            select: { id: true, piiProtection: true }
         });
 
         if (!session) {
@@ -260,6 +261,7 @@ export function v3SessionRoutes(app: Fastify) {
             eventRouter.emitUpdate({
                 userId,
                 payload: updatePayload,
+                sessionProtection: session.piiProtection,
                 recipientFilter: { type: 'all-interested-in-session', sessionId }
             });
         }

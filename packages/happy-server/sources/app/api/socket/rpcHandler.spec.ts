@@ -1,17 +1,20 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { register } from 'prom-client';
 import { rpcHandler } from './rpcHandler';
+
+const sessionLookup = vi.hoisted(() => vi.fn(async (): Promise<{ piiProtection: boolean } | null> => null));
+beforeEach(() => sessionLookup.mockReset().mockResolvedValue(null));
 
 // These cases are about the legacy relay, so the session is not a managed one.
 // The handler now asks the database that question before choosing a path, and
 // answering it here keeps these cases on the path they are written for.
 vi.mock('@/storage/db', () => ({
-    db: { managedSessionGrant: { findFirst: async () => null } },
+    db: { session: { findFirst: sessionLookup }, managedSessionGrant: { findFirst: async () => null } },
 }));
 
 class FakeSocket {
     connected = true;
-    data: { clientType?: string; machineId?: string; connectedAt?: number } = {};
+    data: { clientType?: string; machineId?: string; connectedAt?: number; piiProtectionVersion?: number } = {};
     timeoutCalls: number[] = [];
     emitted: Array<{ event: string; payload: unknown }> = [];
     handlers = new Map<string, (...args: any[]) => unknown>();
@@ -556,3 +559,47 @@ it('delivers completion over a real socket after the caller ACK deadline without
         vi.unstubAllEnvs();
     }
 }, 10_000);
+
+describe('protected session RPC delivery', () => {
+    it('withholds protected RPC from a caller without the receive declaration', async () => {
+        sessionLookup.mockResolvedValue({ piiProtection: true });
+        const caller = new FakeSocket('old-caller');
+        const target = new FakeSocket('new-target');
+        target.data.piiProtectionVersion = 1;
+        const io = fakeIo([target]);
+        rpcHandler('u1', caller as any, io as any);
+        const callback = vi.fn();
+        await caller.trigger('rpc-call', { method: 'protected:read', params: 'encrypted' }, callback);
+        expect(target.timeoutCalls).toEqual([]);
+        expect(io.in).not.toHaveBeenCalled();
+        expect(callback).toHaveBeenCalledWith({ ok: false, error: 'RPC method not available' });
+    });
+
+    it('does not send protected arguments to an undeclared target', async () => {
+        sessionLookup.mockResolvedValue({ piiProtection: true });
+        const caller = new FakeSocket('new-caller');
+        caller.data.piiProtectionVersion = 1;
+        const target = new FakeSocket('old-target');
+        rpcHandler('u1', caller as any, fakeIo([target]) as any);
+        const callback = vi.fn();
+        await caller.trigger('rpc-call', { method: 'protected:read', params: 'encrypted' }, callback);
+        expect(target.timeoutCalls).toEqual([]);
+        expect(callback).toHaveBeenCalledWith({ ok: false, error: 'RPC method not available' });
+    });
+
+    it('preserves supported protected RPC and scopes lookup to the authenticated owner', async () => {
+        sessionLookup.mockResolvedValue({ piiProtection: true });
+        const caller = new FakeSocket('new-caller');
+        caller.data.piiProtectionVersion = 1;
+        const target = new FakeSocket('new-target');
+        target.data.piiProtectionVersion = 1;
+        rpcHandler('u1', caller as any, fakeIo([target]) as any);
+        const callback = vi.fn();
+        await caller.trigger('rpc-call', { method: 'protected:read', params: 'encrypted' }, callback);
+        expect(target.timeoutCalls).toEqual([30000]);
+        expect(sessionLookup).toHaveBeenCalledWith({
+            where: { id: 'protected', accountId: 'u1' }, select: { piiProtection: true },
+        });
+        expect(callback).toHaveBeenCalledWith(expect.objectContaining({ ok: true }));
+    });
+});
