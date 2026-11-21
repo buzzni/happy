@@ -5,7 +5,7 @@ import { createBrowserSessionReconnect } from './browserSessionReconnect';
 import { readBrowserTaskPidStartTime } from './browserTaskSessionOwner';
 import { createBrowserNativeDeviceProof, type BrowserNativeDeviceSigner } from './browserNativeDeviceProof';
 import { createManualPersonalSpawn, MANUAL_PERSONAL_ENV } from './manualPersonalClaude';
-import { createOwnedSpawnRuntime, createOwnedStartGuard } from './ownedSpawnRuntime';
+import { createOwnedSpawnRuntime, createOwnedStartGuard, ownedSessionAuthorship } from './ownedSpawnRuntime';
 import { createAgentCallerLaunches, OWNER_CONTACT_SWITCH, readOwnerContactTrust, type OwnedLaunchLineage } from './agentCallerLaunches';
 import { drainWorktreeOperations } from './worktreeOps';
 import { drainBashRpcs } from '@/modules/common/bashRpcScheduler';
@@ -6071,7 +6071,9 @@ export async function startDaemon(): Promise<void> {
         available: () => !standaloneWindows && callerLaunches!.available() },
       metadata: options => ({ path: options.directory, host: os.hostname(), version: packageJson.version, os: os.platform(), machineId,
         homeDir: os.homedir(), happyHomeDir: configuration.happyHomeDir, happyLibDir: projectPath(), happyToolsDir: join(projectPath(), 'tools', 'unpacked'),
-        flavor: options.agent ?? 'claude', startedFromDaemon: true, startedBy: 'daemon', lifecycleState: 'running', lifecycleStateSince: Date.now() }),
+        flavor: options.agent ?? 'claude', startedFromDaemon: true, startedBy: 'daemon', lifecycleState: 'running', lifecycleStateSince: Date.now(),
+        // T4RT-03: an owned session's creator and source, as a legacy child records them.
+        ...ownedSessionAuthorship(options) }),
       rotation: (options, companyId) => options.agentPlan ? Promise.resolve(null) : companyId ? machineRuntimeFor(companyId) : machineRotationFor(options),
       start: (options, launch) => { if (launch) ownedMachineLaunches.set(options, launch); return ownedStartGuard.start(options, () => spawnSessionAdmitted(options)); },
       tracked: sessionId => findTrackedSessionById(sessionId) ?? sessionIdToFinishedSession.get(sessionId), live: liveLaunch,
