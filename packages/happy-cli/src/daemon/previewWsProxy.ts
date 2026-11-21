@@ -37,6 +37,21 @@ export interface OpenTunnelParams {
     dataB64: string
 }
 
+/**
+ * The far end of a tunnel: a TCP socket to 127.0.0.1:{port} unless `open` is handed another — the
+ * strict remote-screen channel ends in-process (viewer-channel-strict-design.md §4-1). It signals
+ * 'connect' once it takes bytes, as a net socket does.
+ */
+export interface TunnelUpstream {
+    readonly writable: boolean
+    write(chunk: Buffer): unknown
+    destroy(): unknown
+    on(event: 'data', listener: (chunk: Buffer) => void): unknown
+    on(event: 'close', listener: () => void): unknown
+    once(event: 'connect', listener: () => void): unknown
+    once(event: 'error', listener: (err: NodeJS.ErrnoException) => void): unknown
+}
+
 export interface OpenTunnelAck {
     ok: boolean
     code?: string
@@ -57,7 +72,7 @@ export interface PreviewWsProxyOptions {
  * disconnect (call `closeAll`).
  */
 export class PreviewWsProxy {
-    private readonly tunnels = new Map<string, { socket: net.Socket; port: number }>()
+    private readonly tunnels = new Map<string, { socket: TunnelUpstream; port: number }>()
     /**
      * specs/runtime-isolation-hardening (H3, P2) — opens that have not
      * connected yet.
@@ -69,7 +84,7 @@ export class PreviewWsProxy {
      * later into a tunnel with no owner, no expiry timer and no recheck
      * behind it.
      */
-    private readonly connecting = new Map<string, { socket: net.Socket; cancelled: boolean; settle: (ack: OpenTunnelAck) => void }>()
+    private readonly connecting = new Map<string, { socket: TunnelUpstream; cancelled: boolean; settle: (ack: OpenTunnelAck) => void }>()
     private readonly portMin: number
     private readonly portMax: number
     private readonly connectTimeoutMs: number
@@ -89,7 +104,10 @@ export class PreviewWsProxy {
      * request bytes. Resolves the ack once connected (or on failure). Bytes
      * from the upstream are streamed back via the emitter.
      */
-    open(params: OpenTunnelParams): Promise<OpenTunnelAck> {
+    open(
+        params: OpenTunnelParams,
+        connectUpstream: () => TunnelUpstream = () => net.connect({ host: '127.0.0.1', port: params.port }),
+    ): Promise<OpenTunnelAck> {
         const { tunnelId, port, dataB64 } = params ?? ({} as OpenTunnelParams)
         if (!tunnelId || typeof tunnelId !== 'string') {
             return Promise.resolve({ ok: false, code: 'INVALID_TUNNEL', message: 'Missing tunnelId' })
@@ -110,7 +128,7 @@ export class PreviewWsProxy {
                 resolve(ack)
             }
 
-            const upstream = net.connect({ host: '127.0.0.1', port })
+            const upstream = connectUpstream()
             const pending = { socket: upstream, cancelled: false, settle }
             this.connecting.set(tunnelId, pending)
             const timer = setTimeout(() => {
