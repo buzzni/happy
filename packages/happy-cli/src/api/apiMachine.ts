@@ -22,7 +22,7 @@ import { createWorktreeOpsHandlers } from '@/daemon/worktreeOps';
 import { io, Socket } from 'socket.io-client';
 import { logger } from '@/ui/logger';
 import { configuration } from '@/configuration';
-import { MachineMetadata, DaemonState, Machine, Update, UpdateMachineBody } from './types';
+import { MachineMetadata, DaemonState, Machine, Update, UpdateMachineBody, SPAWN_SESSION_KEY_CAPABILITY } from './types';
 import type { DaemonRestartLifecycle } from './types';
 import { DAEMON_RESTARTING_CODE, withRestartLifecycle, withTerminalSurvival } from '@/daemon/restartDrainLifecycle';
 import type { TerminalSurvivalState } from '@/daemon/terminalWorker/workerHost';
@@ -594,6 +594,23 @@ type IsolatedViewerStartResult = {
     reused: boolean;
 } & ViewerBrowserState;
 
+/**
+ * aplus-dev-studio specs/agent-app-api — the session key a server-started session was sealed with, handed back in the
+ * spawn reply (itself sealed to the machine key). On a dataKey account each session has its own key the server never
+ * receives otherwise; a legacy session uses the account secret the server already holds, so none is sent. No field at
+ * all when the session never reported a key: the caller treats that like an older daemon and fails rather than wait.
+ */
+function sessionKeyReply(
+    sessionId: string,
+    encryption: { encryptionKey: string; encryptionVariant: 'legacy' | 'dataKey' } | null,
+): { sessionKey?: { variant: 'dataKey'; key: string } | { variant: 'legacy' } } {
+    if (!encryption) {
+        logger.debug(`[API MACHINE] Session key requested for ${sessionId}, but the session reported none`);
+        return {};
+    }
+    return { sessionKey: encryption.encryptionVariant === 'dataKey' ? { variant: 'dataKey', key: encryption.encryptionKey } : { variant: 'legacy' } };
+}
+
 type MachineRpcHandlers = {
     sessionRetention?: import('@/daemon/sessionRetention').SessionRetention;
     /** aplus-dev-studio specs/cross-machine-agent-delegation. Absent = no links, no lane, no advertisement. */
@@ -602,6 +619,8 @@ type MachineRpcHandlers = {
     orgSubagent?: ReturnType<typeof createOrgSubagentRuntime>;
     daemonSessionState?: (request: unknown) => Promise<DaemonSessionStateResponse>;
     spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
+    /** The key a session reported when it started (persisted sessions), for `returnSessionKey`. Null when it never reported one. */
+    readSessionEncryption?: (sessionId: string) => { encryptionKey: string; encryptionVariant: 'legacy' | 'dataKey' } | null;
     resumeSession?: (sessionId: string, options?: {
         model?: string;
         permissionMode?: string;
@@ -1231,6 +1250,7 @@ export class ApiMachineClient {
         sessionRetention,
         daemonSessionState,
         spawnSession,
+        readSessionEncryption,
         resumeSession,
         recoverSession,
         stopSession,
@@ -1467,6 +1487,7 @@ export class ApiMachineClient {
                 agentPlan,
                 outputFormat,
                 launchMcpServers,
+                returnSessionKey,
             } = params || {};
             logger.debug(`[API MACHINE] Spawning session: dir=${directory}, hasUserCreds=${!!(happyToken && happySecret)}`);
 
@@ -1542,6 +1563,13 @@ export class ApiMachineClient {
             if (browserContinuation !== undefined && typeof browserContinuation !== 'boolean') {
                 throw new Error('Browser continuation must be a boolean');
             }
+            if (returnSessionKey !== undefined && typeof returnSessionKey !== 'boolean') {
+                throw new Error('Return-session-key must be a boolean');
+            }
+            // aplus-dev-studio specs/agent-app-api: a strict machine promises the server cannot read session content.
+            if (returnSessionKey && configuration.machineControl === 'strict') {
+                throw new Error('A strict machine does not hand a session key to the server');
+            }
             if (browserContinuation && !exitAfterFirstTurn) {
                 throw new Error('Browser continuation is only for a run-once session');
             }
@@ -1615,6 +1643,7 @@ export class ApiMachineClient {
                             ? { appliedOrgLlmEndpoint: result.appliedOrgLlmEndpoint }
                             : {}),
                         ...(result.launchMcpDropped?.length ? { launchMcpDropped: result.launchMcpDropped } : {}),
+                        ...(returnSessionKey ? sessionKeyReply(result.sessionId, readSessionEncryption?.(result.sessionId) ?? null) : {}),
                     };
 
                 case 'requestToApproveDirectoryCreation':
@@ -4650,6 +4679,11 @@ export class ApiMachineClient {
             const advertisedAgentPlan = this.managedHandlers ? undefined : agentPlanCapabilityForPlatform(process.platform);
             const agentPlanStale = JSON.stringify(this.machine.metadata?.agentPlan)
                 !== JSON.stringify(advertisedAgentPlan);
+            const advertisedSpawnSessionKey = this.managedHandlers || configuration.machineControl === 'strict'
+                ? undefined
+                : SPAWN_SESSION_KEY_CAPABILITY;
+            const spawnSessionKeyStale = JSON.stringify(this.machine.metadata?.spawnSessionKey)
+                !== JSON.stringify(advertisedSpawnSessionKey);
             // Managed runtimes do not serve `writeFile`, so nothing there would answer an attempt.
             const advertisedWriteFileAttempt = this.managedHandlers ? undefined : WRITE_FILE_ATTEMPT_CAPABILITY;
             const writeFileAttemptStale = JSON.stringify(this.machine.metadata?.writeFileAttempt)
@@ -4714,7 +4748,7 @@ export class ApiMachineClient {
             // Bounded: an acknowledgement that never comes must not block every later change.
             const awaitingServer = this.capabilityUpdateInFlight !== null
                 && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
-            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || agentPlanStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || agentDelegationStale || writeFileAttemptStale || listFilesPageStale || permissionGrantsStale)) {
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || agentPlanStale || spawnSessionKeyStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || agentDelegationStale || writeFileAttemptStale || listFilesPageStale || permissionGrantsStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -4750,6 +4784,7 @@ export class ApiMachineClient {
                     channelSupport: advertisedChannelSupport,
                     aiAuthSelection: advertisedAiAuthSelection,
                     agentPlan: advertisedAgentPlan,
+                    spawnSessionKey: advertisedSpawnSessionKey,
                     structuredOutput: advertisedStructuredOutput,
                     writeFileAttempt: advertisedWriteFileAttempt,
                     listFilesPage: advertisedListFilesPage,

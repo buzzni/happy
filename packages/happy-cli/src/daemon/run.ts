@@ -51,7 +51,7 @@ import { runManagedScript } from './automations/managedScriptRunner';
 
 import { ApiClient } from '@/api/api';
 import { TrackedSession, SessionEncryptionData } from './types';
-import { MachineMetadata, DaemonState, Metadata, Machine } from '@/api/types';
+import { MachineMetadata, DaemonState, Metadata, Machine, SPAWN_SESSION_KEY_CAPABILITY } from '@/api/types';
 import {
   type RecoverSessionOptions,
   type RecoverSessionResult,
@@ -483,6 +483,7 @@ export const initialMachineMetadata: MachineMetadata = {
   channelSupport: CHANNEL_SUPPORT_CAPABILITY,
   aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
   ...(agentPlanCapabilityForPlatform(process.platform) ? { agentPlan: agentPlanCapabilityForPlatform(process.platform) } : {}),
+  ...(configuration.machineControl === 'strict' ? {} : { spawnSessionKey: SPAWN_SESSION_KEY_CAPABILITY }),
   structuredOutput: STRUCTURED_OUTPUT_CAPABILITY,
   writeFileAttempt: WRITE_FILE_ATTEMPT_CAPABILITY,
   listFilesPage: LIST_FILES_PAGE_CAPABILITY,
@@ -6143,6 +6144,10 @@ export async function startDaemon(): Promise<void> {
       } }),
       ownedSpawn,
       orgSubagent,
+      readSessionEncryption: sessionId => {
+        const persisted = readPersistedSessions()[sessionId];
+        return persisted ? { encryptionKey: persisted.encryptionKey, encryptionVariant: persisted.encryptionVariant } : null;
+      },
       daemonSessionState: createDaemonSessionStateHandler(getCurrentChildren),
       byosOfflineReceive,
       difficultyRouting: difficultyRoutingHost,
