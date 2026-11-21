@@ -1,0 +1,42 @@
+{
+  "description": "viewer-channel-strict-design.md §4-3. Frame keys: HKDF-SHA256(ikm=channelKey, salt=daemonNonce, info=viewerFrameKeyInfo(dir, leaseId, channelId)). Proof key: HKDF-SHA256(ikm=channelKey, salt=empty, info=viewerProofKeyInfo(channelId)). Frame: 0x01 | kind | AES-256-GCM(payload) | tag, nonce = dir(4, in=1 out=2) | seq(8), AAD = 0x01 | kind | info. Every implementation (daemon, web) checks itself against these.",
+  "channelKey": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "daemonNonce": "8O/u7ezr6uno5+bl5OPi4Q==",
+  "channelId": "oKGio6SlpqeoqaqrrK2urw==",
+  "leaseId": "c0ffee000000000000000000000000000000000000000000000000000000beef",
+  "frameKeys": {
+    "in": "O4uVIDzMpGpYtFeFL5DBBDu5kqLBf+F4vTpkH1o4Vtg=",
+    "out": "X9ZePtEbcZIzMkKqFXi1SKeuJTG5eLTiHjq5F/t2n5I="
+  },
+  "proofKey": "WSQBR+ATZqmH6pcMS8nT3MnVFAuP4aVcP7qDTOMkkjQ=",
+  "frames": [
+    {
+      "dir": "out",
+      "seq": 1,
+      "kind": 1,
+      "payload": "UkZCIDAwMy4wMDgK",
+      "frame": "AQGvtoycczR3E4Vsb9BcyVSCm/oA364+ZBwGMh3w"
+    },
+    {
+      "dir": "in",
+      "seq": 1,
+      "kind": 1,
+      "payload": "UkZCIDAwMy4wMDgK",
+      "frame": "AQHoDZkx+YCvVNK3XI+dL0+kI+0naLmQEKpkpmaY"
+    },
+    {
+      "dir": "in",
+      "seq": 2,
+      "kind": 2,
+      "payload": "",
+      "frame": "AQLj8Wh/NkilhD/exEfUYQ6G"
+    },
+    {
+      "dir": "out",
+      "seq": 7,
+      "kind": 3,
+      "payload": "dm5jLWNsb3NlZA==",
+      "frame": "AQNZhBwXffI0YCgIPYGeWwtirodpQWBn2zgGBg=="
+    }
+  ]
+}
