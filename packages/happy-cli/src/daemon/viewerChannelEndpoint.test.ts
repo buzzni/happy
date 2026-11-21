@@ -243,9 +243,9 @@ describe('viewer channel endpoint', () => {
 
     it('closes the channel and the VNC connection on a replayed or skipped input frame', async () => {
         for (const seq of [[1, 1], [2]]) {
+            const before = vnc.connections;
             const { ws, channel } = await openChannel();
-            const before = vnc.sockets.length;
-            await waitFor(() => vnc.sockets.length === before + 1 || vnc.connections > before);
+            await waitFor(() => vnc.connections === before + 1);
             for (const s of seq) ws.send(channel.seal(s, VIEWER_FRAME_KIND.rfb, Buffer.from('x')));
             await once(ws, 'close');
             const socket = vnc.sockets[vnc.sockets.length - 1];
