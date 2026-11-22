@@ -86,7 +86,7 @@ export default defineConfig({
                 extends: true,
                 test: {
                     name: 'integration-write-scope',
-                    include: ['src/daemon/sessionWriteScope.integration.test.ts'],
+                    include: ['src/daemon/sessionWriteScope.integration.test.ts', 'src/daemon/workMachineNativeResume.integration.test.ts'],
                     setupFiles: ['./src/testing/unit.setup.ts'],
                     fileParallelism: false,
                     maxWorkers: 1,

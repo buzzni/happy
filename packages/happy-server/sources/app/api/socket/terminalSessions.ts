@@ -31,6 +31,7 @@ export interface TerminalSession {
     clientSocketId: string;
     daemonSocketId: string;
     createdAt: number;
+    workMachineGeneration?: number;
     /**
      * Codex CLI benchmark D4 B-R2 — set once the daemon reports the PTY ended.
      * The record then lives only for CLOSED_SESSION_TTL_SECONDS, so a client

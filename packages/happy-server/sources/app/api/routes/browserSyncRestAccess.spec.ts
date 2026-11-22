@@ -11,6 +11,7 @@
  * 이 기능은 애초에 켤 수 없다. 두 방향을 한 자리에서 고정한다.
  */
 import fastify from 'fastify';
+import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import * as privacyKit from 'privacy-kit';
 import { serializerCompiler, validatorCompiler, ZodTypeProvider } from 'fastify-type-provider-zod';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -53,6 +54,8 @@ vi.mock('@/storage/db', () => {
 });
 
 import { auth } from '@/app/auth/auth';
+import { canonicalDigest } from '@/app/managed/canonicalDigest';
+import { createControlAssertionVerifier } from '@/app/managed/managedControlAssertion';
 import {
     enableAuthentication,
     enableSessionScopeAuthentication,
@@ -65,6 +68,9 @@ import { projectMemberRoutes } from '@/app/api/routes/projectMemberRoutes';
 import type { Fastify } from '@/app/api/types';
 
 const ACCOUNT = 'acc-victim';
+const audience = 'work-machine-test-server';
+const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+const rawPublicKey = publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url');
 /** tweetnacl box public key length: 32 bytes. */
 const ATTACKER_PUBLIC_KEY = privacyKit.encodeBase64(new Uint8Array(32).fill(7));
 
@@ -77,7 +83,11 @@ async function buildApp() {
     // 이 배포에는 managed 세션 발급자가 없다. 그래도 세션 스코프 데코레이터는
     // 켜 둔다 — 브라우저 자격이 그쪽에서도 풀려야 한다는 게 검증 대상이다.
     enableSessionScopeAuthentication(typed, () => null);
-    authRoutes(typed);
+    authRoutes(typed, {
+        workMachineIngressVerifier: createControlAssertionVerifier({
+            audience, verifierKeys: JSON.stringify({ 'test-key': rawPublicKey }),
+        }) ?? undefined,
+    });
     connectRoutes(typed);
     projectMemberRoutes(typed);
     typed.get('/spec/session-scope', {
@@ -113,6 +123,34 @@ beforeEach(() => {
 });
 
 describe('browser sync credential on account-bearer-issuing routes', () => {
+    it('only adds work machine ingress authority to a Studio-signed exchange', async () => {
+        const now = Date.now();
+        const assertion = (bearer: string) => {
+            const body = { accountTokenDigest: createHash('sha256').update(bearer).digest('hex') };
+            const payload = Buffer.from(JSON.stringify({
+                v: 1, kid: 'test-key', aud: audience, purpose: 'happy-managed-control',
+                op: 'work-machine-browser-sync', bodyDigest: canonicalDigest(body),
+                iat: now, exp: now + 1000,
+            }));
+            return `${payload.toString('base64url')}.${sign(null, payload, privateKey).toString('base64url')}`;
+        };
+        const exchange = (proof?: string) => app.inject({
+            method: 'POST', url: '/v1/auth/browser-sync',
+            headers: {
+                authorization: `Bearer ${accountBearer}`,
+                ...(proof ? { 'x-happy-control-assertion': proof } : {}),
+            },
+        });
+        const ordinary = await exchange();
+        expect(ordinary.statusCode).toBe(200);
+        expect(await auth.browserSyncIssuer!.verify(ordinary.json().token, now))
+            .not.toMatchObject({ claims: { workMachineIngress: true } });
+        expect((await exchange(assertion('different-account-token'))).statusCode).toBe(403);
+        const trusted = await exchange(assertion(accountBearer));
+        expect(trusted.statusCode).toBe(200);
+        expect(await auth.browserSyncIssuer!.verify(trusted.json().token, now))
+            .toMatchObject({ ok: true, claims: { workMachineIngress: true } });
+    });
     it('cannot mint its own successor', async () => {
         // 자기 자신을 재발급할 수 있으면 재발급이 더 이상 웹앱의 로그인
         // 세션에 달려 있지 않다. 로그아웃해도 자격이 스스로 연장된다.

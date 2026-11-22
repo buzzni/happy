@@ -78,7 +78,7 @@ export function sessionRewrapRoutes(app: Fastify) {
         }
 
         const session = await db.session.findFirst({
-            where: { ...piiSessionVisibility(request), id: sessionId, accountId: userId },
+            where: { ...piiSessionVisibility(request), id: sessionId, accountId: userId, workMachineId: null },
             select: { id: true, dataEncryptionKey: true }
         });
         if (!session) {
@@ -97,6 +97,7 @@ export function sessionRewrapRoutes(app: Fastify) {
             where: {
                 id: sessionId,
                 accountId: userId,
+                workMachineId: null,
                 dataEncryptionKey: null,
                 metadataVersion: expectedMetadataVersion,
                 agentStateVersion: expectedAgentStateVersion
@@ -135,7 +136,7 @@ export function sessionRewrapRoutes(app: Fastify) {
         }
 
         const session = await db.session.findFirst({
-            where: { ...piiSessionVisibility(request), id: sessionId, accountId: userId },
+            where: { ...piiSessionVisibility(request), id: sessionId, accountId: userId, workMachineId: null },
             select: { id: true, dataEncryptionKey: true }
         });
         if (!session) {
@@ -173,6 +174,7 @@ export function sessionRewrapRoutes(app: Fastify) {
                 where: {
                     sessionId,
                     seq: message.seq,
+                    session: { workMachineId: null },
                     content: { equals: { t: 'encrypted', c: ciphertext } }
                 },
                 data: {

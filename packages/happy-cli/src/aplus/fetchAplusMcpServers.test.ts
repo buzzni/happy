@@ -20,6 +20,7 @@ describe('fetchAplusMcpServersResult', () => {
 
     afterEach(() => {
         vi.unstubAllGlobals();
+        vi.unstubAllEnvs();
         delete process.env.HAPPY_APLUS_MCP_CONFIG_URL;
         delete process.env.HAPPY_APLUS_MCP_CALLER_GRANT;
         delete process.env.HAPPY_APLUS_EXPECTED_CONNECTORS;
@@ -27,6 +28,28 @@ describe('fetchAplusMcpServersResult', () => {
         delete process.env.HAPPY_APLUS_MCP_INITIAL_LIFECYCLE;
         delete process.env.HAPPY_BROWSER_VIEWER_KEY;
         delete process.env.HAPPY_BROWSER_VIEWER_SCOPE_REQUIRED;
+    });
+
+    it('uses the latest session execution proof without forwarding it to redirects or untrusted Studio URLs', async () => {
+        vi.stubEnv('HAPPY_APLUS_STUDIO_ORIGIN', 'https://studio.test');
+        const fetchMock = vi.fn<typeof fetch>()
+            .mockResolvedValueOnce(new Response(null, { status: 503 }))
+            .mockResolvedValueOnce(Response.json({ mcpServers: {} }));
+        vi.stubGlobal('fetch', fetchMock);
+        const liveProof = vi.fn().mockReturnValueOnce('wmx_first').mockReturnValueOnce('wmx_renewed');
+        const workMachineExecution = { sessionId: 'happy-session', token: liveProof };
+        await expect(fetchAplusMcpServersResult('account', 'machine-1', {
+            configUrl: 'https://studio.test/api/me/mcp-config', workMachineExecution,
+        })).resolves.toMatchObject({ ok: true });
+        expect(fetchMock.mock.calls.map(([, init]) => init?.headers)).toEqual([
+            expect.objectContaining({ 'X-Aplus-Work-Machine-Execution': 'wmx_first', 'X-Aplus-Session-Id': 'happy-session' }),
+            expect.objectContaining({ 'X-Aplus-Work-Machine-Execution': 'wmx_renewed', 'X-Aplus-Session-Id': 'happy-session' }),
+        ]);
+        expect(fetchMock.mock.calls.every(([, init]) => init?.redirect === 'error')).toBe(true);
+        await expect(fetchAplusMcpServersResult('account', 'machine-1', {
+            configUrl: 'https://untrusted.test/api/me/mcp-config', workMachineExecution,
+        })).resolves.toMatchObject({ ok: false });
+        expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 
     it('retries a 5xx instead of starting the session with no A+ servers', async () => {

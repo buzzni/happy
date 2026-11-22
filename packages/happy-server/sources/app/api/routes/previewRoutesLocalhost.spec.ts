@@ -10,7 +10,7 @@ import type { Fastify as TypedFastify } from '../types';
 
 const fixture = vi.hoisted(() => ({ fetchSockets: vi.fn(), emit: vi.fn() }));
 vi.mock('@/app/events/eventRouter', () => ({ eventRouter: { server: { in: () => ({ timeout: () => ({ fetchSockets: fixture.fetchSockets }) }) } } }));
-vi.mock('@/storage/db', () => ({ db: {} }));
+vi.mock('@/storage/db', () => ({ db: { workMachineExecution: { findFirst: async () => null } } }));
 vi.mock('@/utils/log', () => ({ log: vi.fn() }));
 
 const mid = '11111111-1111-4111-8111-111111111111';

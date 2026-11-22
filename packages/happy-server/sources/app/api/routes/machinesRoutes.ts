@@ -1,4 +1,4 @@
-import { requireAccountPrincipal } from '../utils/enableAuthentication';
+import { requireAccountPrincipal, verifyWorkMachineDaemonBearer } from '../utils/enableAuthentication';
 import { eventRouter } from "@/app/events/eventRouter";
 import { Fastify } from "../types";
 import { z } from "zod";
@@ -63,6 +63,15 @@ export function machinesRoutes(
     const authenticateMachineRead = async (request: any, reply: any) => {
         const header = request.headers.authorization;
         const token = typeof header === 'string' && header.startsWith('Bearer ') ? header.substring(7) : null;
+        const execution = await verifyWorkMachineDaemonBearer(request);
+        if (execution) {
+            if (execution.machineId !== request.params?.id || !await authorizeWorkMachineExecution(db, execution)) {
+                return reply.code(403).send({ error: 'Work machine grant not authorized' });
+            }
+            request.userId = execution.accountId;
+            request.workMachineDaemonGrant = execution;
+            return;
+        }
         const runtime = getManagedControl();
         if (token && runtime) {
             let result: Awaited<ReturnType<typeof authorizeManagedDaemonRequest>> | null = null;
@@ -113,10 +122,12 @@ export function machinesRoutes(
             where: {
                 accountId: userId,
                 id: id
-            }
+            },
+            include: { workMachineExecution: { select: { generation: true } } },
         });
 
         if (machine) {
+            if (machine.workMachineExecution) return reply.code(409).send({ error: 'work-machine-device-required' });
             // Machine exists - return it, backfilling dataEncryptionKey once
             // if it was registered without one (legacy-mode CLI) and the
             // daemon now submits a wrapped key. Write-once: an existing
@@ -127,7 +138,7 @@ export function machinesRoutes(
             if (!machine.dataEncryptionKey && dataEncryptionKey) {
                 const submitted = new Uint8Array(Buffer.from(dataEncryptionKey, 'base64'));
                 await db.machine.update({
-                    where: { id: machine.id },
+                    where: { id: machine.id, workMachineExecution: { is: null } },
                     data: { dataEncryptionKey: submitted }
                 });
                 effectiveDataEncryptionKey = submitted;
@@ -140,7 +151,7 @@ export function machinesRoutes(
             if (!machine.serverDataEncryptionKey && serverDataEncryptionKey) {
                 const submitted = new Uint8Array(Buffer.from(serverDataEncryptionKey, 'base64'));
                 await db.machine.update({
-                    where: { id: machine.id },
+                    where: { id: machine.id, workMachineExecution: { is: null } },
                     data: { serverDataEncryptionKey: submitted }
                 });
                 effectiveServerDataEncryptionKey = submitted;
@@ -150,7 +161,7 @@ export function machinesRoutes(
             if (!machine.serverRpcKeyEnvelope && submittedServerRpcKey) {
                 const submitted = new Uint8Array(submittedServerRpcKey);
                 await db.machine.update({
-                    where: { id: machine.id },
+                    where: { id: machine.id, workMachineExecution: { is: null } },
                     data: { serverRpcKeyEnvelope: submitted }
                 });
                 effectiveServerRpcKeyEnvelope = submitted;
@@ -266,7 +277,8 @@ export function machinesRoutes(
                 where: {
                     id,
                     accountId: userId,
-                    dataEncryptionKey: new Uint8Array(expected)
+                    dataEncryptionKey: new Uint8Array(expected),
+                    workMachineExecution: { is: null },
                 },
                 data: {
                     dataEncryptionKey: new Uint8Array(replacement)
@@ -279,11 +291,12 @@ export function machinesRoutes(
 
         const machine = await db.machine.findFirst({
             where: { id, accountId: userId },
-            select: { dataEncryptionKey: true }
+            select: { dataEncryptionKey: true, workMachineExecution: { select: { generation: true } } }
         });
         if (!machine) {
             return reply.code(404).send({ error: 'Machine not found' });
         }
+        if (machine.workMachineExecution) return reply.code(409).send({ error: 'work-machine-device-required' });
         if (machine.dataEncryptionKey
             && machineDataKeyEnvelopesEqual(machine.dataEncryptionKey, replacement)) {
             return reply.send({ ok: true, changed: false });
@@ -317,13 +330,24 @@ export function machinesRoutes(
         if (!expected || (request.body.attestation !== null && !attestation)) {
             return reply.code(400).send({ error: 'invalid-data-key-attestation' });
         }
+        const canAttestWorkMachine =
+            request.principal?.kind === 'browser-sync' && request.principal.workMachineIngress === true;
         const updated = await db.machine.updateMany({
-            where: { id, accountId: userId, dataEncryptionKey: new Uint8Array(expected) },
+            where: {
+                id, accountId: userId, dataEncryptionKey: new Uint8Array(expected),
+                ...(!canAttestWorkMachine ? { workMachineExecution: { is: null } } : {}),
+            },
             data: { dataKeyAttestation: attestation ? new Uint8Array(attestation) : null },
         });
         if (updated.count > 0) return reply.send({ ok: true });
-        const machine = await db.machine.findFirst({ where: { id, accountId: userId }, select: { id: true } });
+        const machine = await db.machine.findFirst({
+            where: { id, accountId: userId },
+            select: { id: true, workMachineExecution: { select: { generation: true } } },
+        });
         if (!machine) return reply.code(404).send({ error: 'Machine not found' });
+        if (machine.workMachineExecution && !canAttestWorkMachine) {
+            return reply.code(409).send({ error: 'work-machine-device-required' });
+        }
         return reply.code(409).send({ error: 'data-encryption-key-conflict' });
     });
 
@@ -364,9 +388,15 @@ export function machinesRoutes(
             return reply.code(400).send({ error: 'invalid-data-encryption-key-envelope' });
         }
 
-        const machine = await db.machine.findFirst({ where: { id, accountId: userId } });
+        const machine = await db.machine.findFirst({
+            where: { id, accountId: userId },
+            include: { workMachineExecution: { select: { generation: true } } },
+        });
         if (!machine) {
             return reply.code(404).send({ error: 'Machine not found' });
+        }
+        if (machine.workMachineExecution) {
+            return reply.code(409).send({ error: 'work-machine-device-required' });
         }
 
         const sameEnvelope = (stored: Uint8Array | null, wanted: Uint8Array | null) => stored === null || wanted === null
@@ -389,6 +419,7 @@ export function machinesRoutes(
                 dataEncryptionKey: new Uint8Array(expected),
                 metadataVersion: body.expectedMetadataVersion,
                 daemonStateVersion: machine.daemonStateVersion,
+                workMachineExecution: { is: null },
             },
             data: {
                 dataEncryptionKey: new Uint8Array(replacement),
@@ -481,11 +512,20 @@ export function machinesRoutes(
             where: {
                 accountId: userId,
                 id: id
-            }
+            },
+            include: { workMachineExecution: { select: { deviceId: true, generation: true, frozenAt: true } } },
         });
 
         if (!machine) {
             return reply.code(404).send({ error: 'Machine not found' });
+        }
+
+        const authority = machine.workMachineExecution;
+        const grant = request.workMachineDaemonGrant;
+        const browser = request.principal?.kind === 'browser-sync' && request.principal.workMachineIngress === true;
+        if (authority && !browser && (authority.frozenAt || !grant || grant.expiresAt <= Date.now()
+            || grant.deviceId !== authority.deviceId || grant.generation !== authority.generation)) {
+            return reply.code(403).send({ error: 'Work machine device authorization required' });
         }
 
         return {
@@ -524,11 +564,13 @@ export function machinesRoutes(
 
         const deleted = await inTx(async (tx) => {
             const machine = await tx.machine.findFirst({
-                where: { accountId: userId, id }
+                where: { accountId: userId, id },
+                include: { workMachineExecution: { select: { generation: true } } },
             });
             if (!machine) {
                 return false;
             }
+            if (machine.workMachineExecution) return 'work-machine-device-required' as const;
 
             // Session follow-ups deliberately retain historical machine IDs
             // instead of holding a foreign key. Fence active work before the
@@ -568,6 +610,9 @@ export function machinesRoutes(
             return true;
         });
 
+        if (deleted === 'work-machine-device-required') {
+            return reply.code(409).send({ error: deleted });
+        }
         if (!deleted) {
             return reply.code(404).send({ error: 'Machine not found' });
         }
@@ -576,3 +621,5 @@ export function machinesRoutes(
     });
 
 }
+import { auth } from '@/app/auth/auth';
+import { authorizeWorkMachineExecution } from '@/app/machine/workMachineExecution';

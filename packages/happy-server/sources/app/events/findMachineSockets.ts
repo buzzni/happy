@@ -1,5 +1,9 @@
 import type { RemoteSocket, Server } from 'socket.io';
 import type { DefaultEventsMap } from 'socket.io/dist/typed-events';
+import type { Prisma } from '@prisma/client';
+import type { WorkMachineExecutionClaims } from '@/app/auth/workMachineExecutionToken';
+import { permitWorkMachineExecution } from '@/app/machine/workMachineExecution';
+import { db } from '@/storage/db';
 
 /**
  * Cross-replica lookup of a user's machine (daemon) sockets.
@@ -95,13 +99,70 @@ export function newestMachineSocket<T extends { id: string; data?: any }>(socket
     return best;
 }
 
-export function findMachineSockets(
+export async function workMachineSocketCandidates<T extends { data?: Record<string, unknown> }>(
+    authorityDb: Pick<Prisma.TransactionClient, 'workMachineExecution'>,
+    accountId: string,
+    machineId: string,
+    sockets: T[],
+    now: number,
+    sessionId?: string,
+): Promise<T[]> {
+    const authority = await authorityDb.workMachineExecution.findFirst({
+        where: { accountId, machineId }, select: { deviceId: true, generation: true, frozenAt: true },
+    });
+    if (!authority) return sockets.filter(socket => !socket.data?.workMachineExecution);
+    if (authority.frozenAt) return [];
+    return sockets.filter((socket) => {
+        const claims = socket.data?.workMachineExecution as WorkMachineExecutionClaims | undefined;
+        if (!claims || claims.accountId !== accountId || claims.machineId !== machineId || claims.expiresAt <= now
+            || claims.deviceId !== authority.deviceId || claims.generation !== authority.generation) return false;
+        return sessionId === undefined ? claims.purpose === 'daemon'
+            : claims.purpose === 'session' && claims.sessionId === sessionId;
+    });
+}
+
+export async function findMachineSockets(
     io: Server,
     userId: string,
     machineId: string,
     timeoutMs: number = MACHINE_LOOKUP_TIMEOUT_MS,
 ): Promise<MachineSocketLookup<AnyRemoteSocket>> {
-    return findMachineSocketsIn(io as unknown as FetchSocketsIo<AnyRemoteSocket>, userId, machineId, timeoutMs);
+    const found = await findMachineSocketsIn(io as unknown as FetchSocketsIo<AnyRemoteSocket>, userId, machineId, timeoutMs);
+    if (found.sockets.length === 0) return found;
+    try {
+        return { ...found, sockets: await workMachineSocketCandidates(db, userId, machineId, found.sockets, Date.now()) };
+    } catch {
+        return { sockets: [], degraded: true };
+    }
+}
+
+/** Choose a single execution route for a protected machine. A missing ACK is ambiguous. */
+export async function permitMachineDispatchSockets<T extends { id: string; data?: Record<string, unknown> }>(
+    authorityDb: Pick<Prisma.TransactionClient, 'workMachineExecution' | '$queryRaw'>,
+    accountId: string,
+    machineId: string,
+    candidates: T[],
+    now: number,
+): Promise<T[]> {
+    const sockets = await workMachineSocketCandidates(authorityDb, accountId, machineId, candidates, now);
+    const target = newestMachineSocket(sockets);
+    const claims = target?.data?.workMachineExecution as WorkMachineExecutionClaims | undefined;
+    if (!target || !claims) return sockets;
+    return await permitWorkMachineExecution(authorityDb, claims, new Date(now)) ? [target] : [];
+}
+
+export async function findMachineSocketsForDispatch(
+    io: Server,
+    accountId: string,
+    machineId: string,
+): Promise<MachineSocketLookup<AnyRemoteSocket>> {
+    const found = await findMachineSocketsIn(io as unknown as FetchSocketsIo<AnyRemoteSocket>, accountId, machineId);
+    if (found.sockets.length === 0) return found;
+    try {
+        return { ...found, sockets: await permitMachineDispatchSockets(db, accountId, machineId, found.sockets, Date.now()) };
+    } catch {
+        return { sockets: [], degraded: true };
+    }
 }
 
 function connectedAtOf(socket: { data?: any }): number {

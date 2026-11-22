@@ -24,7 +24,8 @@ import { setTerminalSessionBackend, type TerminalSessionBackend } from "./socket
 import { previewWsMachineHandler, registerPreviewWsClusterListeners } from "@/modules/preview/previewWebSocketRelay";
 import { registerTerminalSessionClusterListeners } from "@/app/api/socket/terminalSessions";
 import { db } from "@/storage/db";
-import { machineSocketIdentityExists } from "./socket/machineSocketAuth";
+import { authenticateWorkMachineSessionSocket, authenticateWorkMachineSocket, legacySessionSocketAllowed, machineSocketIdentityExists, workMachineSocketMayAct } from "./socket/machineSocketAuth";
+import type { WorkMachineExecutionClaims } from "@/app/auth/workMachineExecutionToken";
 import { automationSocketHandler } from "./socket/automationSocketHandler";
 import { markMachineOffline, markMachineOnline } from "@/app/presence/machinePresence";
 import { evictSupersededMachineSockets } from "@/app/events/findMachineSockets";
@@ -224,6 +225,10 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             next(new Error('Missing authentication token'));
             return;
         }
+        // Recovered sockets retain data from their prior connection. A fresh
+        // authentication must not continue on the previous device grant.
+        delete socket.data.workMachineExecution;
+        delete socket.data.workMachineBrowser;
 
         if (clientType === 'session-scoped' && !sessionId) {
             log({ module: 'websocket' }, `Session-scoped client missing sessionId`);
@@ -235,6 +240,30 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             log({ module: 'websocket' }, `Machine-scoped client missing machineId`);
             next(new Error('Machine ID required for machine-scoped clients'));
             return;
+        }
+        if (clientType === 'machine-scoped' && machineId) {
+            const execution = await authenticateWorkMachineSocket(db, auth.workMachineExecutionIssuer, token, machineId, Date.now());
+            if (execution) {
+                socket.data.userId = execution.accountId;
+                socket.data.clientType = clientType;
+                socket.data.machineId = machineId;
+                socket.data.workMachineExecution = execution;
+                socket.data.connectedAt = Date.now();
+                next();
+                return;
+            }
+        }
+        if (clientType === 'session-scoped' && sessionId) {
+            const execution = await authenticateWorkMachineSessionSocket(db, auth.workMachineExecutionIssuer, token, sessionId, Date.now());
+            if (execution) {
+                socket.data.userId = execution.accountId;
+                socket.data.clientType = clientType;
+                socket.data.sessionId = sessionId;
+                socket.data.workMachineExecution = execution;
+                socket.data.connectedAt = Date.now();
+                next();
+                return;
+            }
         }
 
         /*
@@ -302,6 +331,7 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             // 복구는 이 미들웨어를 건너뛰고, 앞선 disconnect 가 타이머를 이미
             // 지웠기 때문이다. `socket.data` 는 복구 때 그대로 돌아온다.
             socket.data[BROWSER_SYNC_EXPIRES_AT] = browserSync.expiresAt;
+            socket.data.workMachineBrowser = browserSync.workMachineIngress === true;
             next();
             return;
         }
@@ -320,6 +350,10 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             && !await machineSocketIdentityExists(db, verified.userId, machineId!)) {
             log({ module: 'websocket' }, `Machine-scoped identity does not match a registered machine`);
             next(new Error('Invalid machine identity'));
+            return;
+        }
+        if (clientType === 'session-scoped' && !await legacySessionSocketAllowed(db, verified.userId, sessionId!)) {
+            next(new Error('Invalid session identity'));
             return;
         }
 
@@ -384,6 +418,23 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
         const sessionId = socket.data.sessionId as string | undefined;
         const machineId = socket.data.machineId as string | undefined;
         const labels = getMetricsLabelsFromSocket(socket);
+        const workMachineExecution = (socket.data.workMachineExecution ?? null) as WorkMachineExecutionClaims | null;
+
+        // This also runs for recovered sockets that skipped the handshake.
+        socket.use(([event, payload], next) => {
+            void workMachineSocketMayAct(db, {
+                accountId: userId, socketMachineId: clientType === 'machine-scoped' ? machineId : undefined,
+                socketSessionId: clientType === 'session-scoped' ? sessionId : undefined,
+                workMachineBrowser: socket.data.workMachineBrowser === true,
+                claims: workMachineExecution, event, payload, now: Date.now(),
+            }).then((allowed) => {
+                if (allowed) next();
+                else next(new Error('Work machine execution is not authorized'));
+            }, (error: unknown) => {
+                log({ module: 'websocket', level: 'warn' }, 'Work machine execution lookup failed');
+                next(error instanceof Error ? error : new Error('Work machine execution lookup failed'));
+            });
+        });
 
         log({ module: 'websocket' }, `Token verified: ${userId}, clientType: ${clientType || 'user-scoped'}, client: ${labels.client}, sessionId: ${sessionId || 'none'}, machineId: ${machineId || 'none'}, socketId: ${socket.id}`);
 

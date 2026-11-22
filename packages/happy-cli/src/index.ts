@@ -31,6 +31,13 @@ if (args[0] === 'browser-client') {
 } else if (args[0] === 'terminal-worker') {
   // aplus specs/terminal-survive-runner-restart: a detached PTY owner that outlives the daemon.
   void import('./daemon/terminalWorker/workerMain')
+} else if (args[0] === 'work-machine') {
+  void import('./commands/workMachineCommand').then(({ handleWorkMachineCommand }) =>
+    handleWorkMachineCommand(args.slice(1)),
+  ).catch(error => {
+    console.error(error instanceof Error ? error.message : 'Work machine command failed')
+    process.exitCode = 1
+  })
 } else if (args[0] === 'personal-endpoint-probe') {
   void import('./daemon/personalEndpointProbeWorker')
 } else if (args[0] === 'difficulty-routing-worker') {

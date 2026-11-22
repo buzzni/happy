@@ -55,7 +55,7 @@ vi.mock('@/app/events/eventRouter', () => {
 });
 
 vi.mock('@/storage/db', () => ({
-    db: {},
+    db: { workMachineExecution: { findFirst: async () => null } },
 }));
 
 vi.mock('@/utils/log', () => ({

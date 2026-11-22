@@ -142,3 +142,29 @@ describe('a managed runtime attaching to the Machine the parent registered', () 
         expect(machine.pushClient).toBeNull();
     });
 });
+
+describe('a work machine attaching with its current execution grant', () => {
+    async function attach() {
+        const api = await ApiClient.create({
+            token: 'wmx_daemon-grant',
+            encryption: { type: 'dataKey', publicKey: new Uint8Array(32).fill(2), machineKey: MACHINE_KEY },
+        });
+        return api.getOrCreateMachine({
+            machineId: MACHINE_ID,
+            metadata: { host: 'replacement' } as never,
+        });
+    }
+
+    it('looks up the original machine rather than registering it again', async () => {
+        expect(await attach()).toMatchObject({ id: MACHINE_ID, metadata: { host: 'runtime' }, metadataVersion: 3 });
+        expect(requests).toEqual([{
+            method: 'GET', url: `/v1/machines/${MACHINE_ID}`, authorization: 'Bearer wmx_daemon-grant',
+        }]);
+    });
+
+    it('propagates a revoked execution grant instead of starting with an offline machine', async () => {
+        respond = () => ({ status: 403, body: { error: 'Work machine grant not authorized' } });
+        await expect(attach()).rejects.toMatchObject({ response: { status: 403 } });
+        expect(requests.map(entry => entry.method)).toEqual(['GET']);
+    });
+});

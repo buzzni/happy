@@ -7,7 +7,7 @@ describe('machineSocketIdentityExists', () => {
         await expect(machineSocketIdentityExists({ machine: { findFirst } } as never, 'account-1', 'machine-1'))
             .resolves.toBe(true);
         expect(findFirst).toHaveBeenCalledWith({
-            where: { accountId: 'account-1', id: 'machine-1' },
+            where: { accountId: 'account-1', id: 'machine-1', workMachineExecution: { is: null } },
             select: { id: true },
         });
     });

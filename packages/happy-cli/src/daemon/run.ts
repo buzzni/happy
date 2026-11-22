@@ -22,6 +22,7 @@ import { ORG_SUBAGENT_OPERATION_ENV } from '@/utils/childEnv';
 import { createMachineTypeMarker } from './machineTypeMarker';
 import { createSharedPcAutoConfirm } from './sharedPcAutoConfirm';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
+import { openWorkMachineCredentials, readWorkMachineExecutionBinding, watchWorkMachineCredential } from './workMachineCredential';
 import { deliverAutomationConversation } from './automations/automationConversationRunner';
 import { scopeResumeSelection } from './sessionWriteScopeRestart';
 import { createSessionWriteScopeRuntime, isSessionWriteScopeLaunch, type SessionWriteScopeRuntime } from './sessionWriteScopeRuntime';
@@ -893,6 +894,7 @@ export async function startDaemon(): Promise<void> {
   let stopClaudeSwapSupervisor: () => void = () => undefined;
   let standaloneWindows: Awaited<ReturnType<typeof createStandaloneWindowsRuntime>>;
   let stopUsageRecovery: () => Promise<void> = async () => undefined;
+  let stopWorkMachineCredential = () => {};
   let stopScriptWorker: () => Promise<void> = async () => undefined;
   let stopBrowserAttention: () => Promise<void> = async () => undefined;
   try {
@@ -958,6 +960,24 @@ export async function startDaemon(): Promise<void> {
     // its state layout and checks its modes itself, so only BYOS is repaired.
     if (!managedCredential?.ok) hardenHappyHomePermissions();
 
+    const executionBinding = managedCredential?.ok ? null : await readWorkMachineExecutionBinding(configuration.happyHomeDir);
+    const workMachine = executionBinding && await (async () => {
+      if (process.platform !== 'linux') throw new Error('Work machine execution requires a Linux Happy CLI host');
+      const [local, settings] = await Promise.all([readCredentials(), readSettings({ strict: true })]);
+      if (local?.encryption.type !== 'dataKey' || settings.machineId !== executionBinding.machineId
+        || (configuration.machineControl === 'strict' && !local.encryption.neverEscrowed)) {
+        throw new Error('Work machine execution does not match this local machine and data key');
+      }
+      const device = await openWorkMachineCredentials(configuration.happyHomeDir, configuration.serverUrl, executionBinding);
+      const initial = await device.renew();
+      return {
+        device, initial, authSetup: {
+          credentials: { token: initial.token, encryption: local.encryption },
+          machineId: executionBinding.machineId, serverPublicKey: null,
+        },
+      };
+    })();
+
     // Ensure auth and machine registration BEFORE anything else
     const authSetup = managedCredential?.ok
       ? {
@@ -972,7 +992,7 @@ export async function startDaemon(): Promise<void> {
         machineId: managedCredential.credential.machineId,
         serverPublicKey: null,
       }
-      : await authAndSetupMachineIfNeeded();
+      : workMachine ? workMachine.authSetup : await authAndSetupMachineIfNeeded();
     const { machineId, serverPublicKey } = authSetup;
     const machineIdTwins = listMachineIdTwins(configuration.happyHomeDir, machineId);
     if (machineIdTwins.length > 0) {
@@ -982,7 +1002,7 @@ export async function startDaemon(): Promise<void> {
     // can use the machine key, strict mode replaces one the server may hold,
     // and the daemon does not start when it cannot. A managed runtime
     // registers nothing and keeps the key its parent provisioned.
-    const credentials = managedCredential?.ok
+    const credentials = managedCredential?.ok || workMachine
       ? authSetup.credentials
       : await settleMachineControl({
         mode: configuration.machineControl,
@@ -3300,8 +3320,13 @@ export async function startDaemon(): Promise<void> {
         // 2026-07-23 incident: pin preflight and child to ONE identity.
         // A child that syncs under a different account than the session owner
         // gets identical-looking 404s and exits — never spawn that child.
-        const diskCredentials = await readCredentials();
-        const credentialDecision = decideResumeCredentials({
+        if (workMachine && (tracked.userHomeDir || tracked.encryption.encryptionVariant !== 'dataKey' || options?.automation)) {
+          return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: 'Work machine execution cannot resume this session binding' };
+        }
+        const diskCredentials = workMachine ? null : await readCredentials();
+        const credentialDecision = workMachine
+          ? { kind: 'daemon' as const, token: (await workMachine.device.renew(happySessionId)).token }
+          : decideResumeCredentials({
           trackedUserHomeDir: tracked.userHomeDir,
           stagedToken: tracked.userHomeDir ? await readStagedTokenFromHomeDir(tracked.userHomeDir) : null,
           daemonToken: credentials.token,
@@ -3314,7 +3339,7 @@ export async function startDaemon(): Promise<void> {
             errorMessage: `Cannot resume session ${happySessionId}: ${credentialDecision.reason}`,
           };
         }
-        if (options?.automation
+        if (options?.automation && !workMachine
             && !tokensShareIdentity(credentialDecision.token, credentials.token)) {
           return {
             type: 'error',
@@ -4817,6 +4842,7 @@ export async function startDaemon(): Promise<void> {
       });
       logger.debug(`[DAEMON RUN] Machine registered: ${machine.id}`);
     } catch (error) {
+      if (api.usesWorkMachineExecutionGrant()) throw error;
       logger.debug('[DAEMON RUN] Machine registration failed unexpectedly, starting offline', error);
       machine = api.buildOfflineMachine({
         machineId,
@@ -6306,6 +6332,7 @@ export async function startDaemon(): Promise<void> {
         teardownCurrentDaemon: async () => {
           await drainWorktreeOperations();
           clearInterval(restartOnStaleVersionAndHeartbeat);
+          stopWorkMachineCredential();
           await stopUsageRecovery();
           await checkpointRetentionSchedule.stop();
 
@@ -6452,6 +6479,22 @@ export async function startDaemon(): Promise<void> {
     launchReadiness.markReady();
     // Connect to server
     apiMachine.connect();
+    if (workMachine) {
+      stopWorkMachineCredential = watchWorkMachineCredential({
+        initial: workMachine.initial,
+        renew: () => workMachine.device.renew(),
+        apply: renewed => {
+          credentials.token = renewed.token;
+          apiMachine.replaceToken(renewed.token);
+        },
+        retrying: () => logger.warn('[DAEMON RUN] Work machine credential refresh will retry'),
+        stop: reason => {
+          launchReadiness.closeForRestart(Date.now());
+          apiMachine.stopForExpiredCredential();
+          requestShutdown('exception', `Work machine execution credential ${reason}`);
+        },
+      });
+    }
     channelHost?.start();
 
     // Emit session-end events for dead sessions from previous daemon run
@@ -6720,6 +6763,7 @@ export async function startDaemon(): Promise<void> {
       restartDrainRuntime?.dispose();
       await drainWorktreeOperations();
       logger.debug(`[DAEMON RUN] Starting proper cleanup (source: ${source}, errorMessage: ${errorMessage})...`);
+      stopWorkMachineCredential();
       await stopUsageRecovery();
       await checkpointRetentionSchedule.stop();
 
@@ -6828,6 +6872,7 @@ export async function startDaemon(): Promise<void> {
     await cleanupAndShutdown(shutdownRequest.source, shutdownRequest.errorMessage);
   } catch (error) {
     const bashRpcsDrained = drainBashRpcs();
+    stopWorkMachineCredential();
     await stopUsageRecovery();
     await stopBrowserAttention();
     await standaloneWindows?.owner.close().catch(() => {});

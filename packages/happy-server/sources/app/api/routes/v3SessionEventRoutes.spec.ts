@@ -286,7 +286,7 @@ describe('checkpoint session event route', () => {
         expect(response.statusCode).toBe(200);
         expect(mocks.findSession).toHaveBeenCalledWith({
             where: { piiProtection: false, id: 'session-1', accountId: 'account-1' },
-            select: { id: true },
+            select: { id: true, workMachineId: true },
         });
         expect(mocks.persistCheckpointEvent).toHaveBeenCalledWith({
             sessionId: 'session-1',

@@ -84,6 +84,7 @@ export type BrowserSyncClaims = {
     /** The account this browser acts as — personal, or a company identity. */
     accountId: string;
     expiresAt: number;
+    workMachineIngress?: true;
 };
 
 export type BrowserSyncMintResult =
@@ -127,7 +128,13 @@ export function parseBrowserSyncClaims(raw: unknown): BrowserSyncClaims | null {
         return null;
     }
 
-    return { v: BROWSER_SYNC_TOKEN_VERSION, accountId, expiresAt };
+    if (record.workMachineIngress !== undefined && record.workMachineIngress !== true) return null;
+    return {
+        v: BROWSER_SYNC_TOKEN_VERSION,
+        accountId,
+        expiresAt,
+        ...(record.workMachineIngress === true ? { workMachineIngress: true } : {}),
+    };
 }
 
 export async function createBrowserSyncTokenIssuer(input: {

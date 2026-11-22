@@ -18,7 +18,7 @@ import { log } from "@/utils/log";
  * @param sessionId - ID of the session to archive
  * @returns true if the session is now inactive, false if not found or not owned by user
  */
-export async function sessionArchive(ctx: Context, sessionId: string, visibility: { piiProtection?: false } = { piiProtection: false }): Promise<boolean> {
+export async function sessionArchive(ctx: Context, sessionId: string, visibility: { piiProtection?: false; workMachineId?: null } = { piiProtection: false }): Promise<boolean> {
     return await inTx(async (tx) => {
         // Verify session exists and belongs to the user
         const session = await tx.session.findFirst({

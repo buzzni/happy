@@ -35,9 +35,26 @@ describe('refreshMcpCallerGrantIfExpiring', () => {
 
     afterEach(() => {
         vi.unstubAllGlobals();
+        vi.unstubAllEnvs();
         delete process.env.HAPPY_APLUS_MCP_CONFIG_URL;
         delete process.env.HAPPY_APLUS_MCP_CALLER_GRANT;
         resetPermanentRefreshFailuresForTest();
+    });
+
+    it('sends the current work machine proof to standalone grant renewal with its session scope', async () => {
+        vi.stubEnv('HAPPY_APLUS_STUDIO_ORIGIN', 'https://saycode.test');
+        const fetchMock = vi.fn<typeof fetch>(async () => Response.json({ grant: 'new-grant' }));
+        vi.stubGlobal('fetch', fetchMock);
+        await expect(refreshMcpCallerGrantIfExpiring('account', 'machine-1', {
+            projectId: 'P-1', sessionId: 'session-1', now: 99_000,
+            workMachineExecution: { sessionId: 'session-1', token: () => 'wmx_active' },
+        })).resolves.toBe(true);
+        expect(fetchMock).toHaveBeenCalledExactlyOnceWith('https://saycode.test/api/me/mcp-caller-grant/refresh', expect.objectContaining({
+            method: 'POST', redirect: 'error',
+            headers: expect.objectContaining({
+                'X-Aplus-Work-Machine-Execution': 'wmx_active', 'X-Aplus-Session-Id': 'session-1', 'X-Aplus-Project-Id': 'P-1',
+            }),
+        }));
     });
 
     it('exchanges an expiring grant and updates the child env', async () => {

@@ -5,6 +5,7 @@ import { scriptAdmissionSchema, scriptEncryptedValueSchema, scriptRegistrationRe
 import { verifyScriptServiceToken, hashScriptManagementRequest, scriptAutomationId, type ScriptServiceOperation } from '@slopus/happy-wire/scriptServiceToken';
 import type { Fastify } from '../types';
 import { inTx } from '@/storage/inTx';
+import { lockLegacyWorkMachineExecution } from '@/app/machine/workMachineExecution';
 import { projectAccess } from '@/app/automation/automationService';
 import { saveScriptAutomation } from '@/app/automation/scriptRegistrationService';
 import { createScriptArtifactService } from '@/app/automation/scriptArtifactService';
@@ -48,6 +49,16 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
   enabled: () => process.env.HAPPY_SCRIPT_AUTOMATIONS_ENABLED === '1' && !!process.env.SCRIPT_AUTOMATION_ADMISSION_SECRET,
   serviceSecret: () => process.env.SCRIPT_AUTOMATION_ADMISSION_SECRET,
 }) {
+  function workerTransaction<T>(
+    request: { userId: string; params: { machineId: string } },
+    operation: (tx: Prisma.TransactionClient) => Promise<T>,
+  ): Promise<T> {
+    return dependencies.transaction(async tx => {
+      if (!await lockLegacyWorkMachineExecution(tx, request.userId, request.params.machineId)) throw new Error('MACHINE_DENIED');
+      return operation(tx);
+    });
+  }
+
   function proof<T extends ScriptServiceOperation['operation']>(token: string, operation: T, scope: { projectId: string; automationId: string }) {
     const secret = dependencies.serviceSecret?.();
     if (!secret) throw new Error('SCRIPT_SERVICE_SECRET_REQUIRED');
@@ -186,7 +197,7 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
 
   app.get('/v1/machines/:machineId/script-automations', {
     preHandler: app.authenticate, schema: { params: machineParams, querystring: z.strictObject({ after: identifier.optional() }) },
-  }, (request, reply) => handle(reply, async () => dependencies.transaction(async (tx) => {
+  }, (request, reply) => handle(reply, async () => workerTransaction(request, async (tx) => {
     const rows = await tx.automation.findMany({ where: { machineAccountId: request.userId, machineId: request.params.machineId,
       payloadVersion: 3, deletedAt: null, ...(request.query.after ? { id: { gt: request.query.after } } : {}) },
       include: includes, orderBy: { id: 'asc' }, take: 100 });
@@ -198,7 +209,7 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
 
   app.get('/v1/machines/:machineId/script-automations/:automationId/artifact', {
     preHandler: app.authenticate, schema: { params: machineAutomationParams },
-  }, (request, reply) => handle(reply, async () => dependencies.transaction(async (tx) => {
+  }, (request, reply) => handle(reply, async () => workerTransaction(request, async (tx) => {
     const { row } = await validateScriptTarget(tx, request.params.automationId, request.userId, request.params.machineId);
     const revision = await tx.scriptAutomationRevision.findUniqueOrThrow({ where: {
       automationId_revision: { automationId: row.id, revision: row.revision },
@@ -212,14 +223,14 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
 
   app.post('/v1/machines/:machineId/script-automations/:automationId/ready', {
     preHandler: app.authenticate, schema: { params: machineAutomationParams, body: z.strictObject({ revision: z.number().int().positive() }) },
-  }, (request, reply) => handle(reply, async () => dependencies.transaction(async (tx) => {
+  }, (request, reply) => handle(reply, async () => workerTransaction(request, async (tx) => {
     await markScriptReady(tx, request.userId, request.params.machineId, request.params.automationId, request.body.revision, Date.now());
     return { ok: true };
   })));
 
   app.post('/v1/machines/:machineId/script-automations/:automationId/validation-failed', {
     preHandler: app.authenticate, schema: { params: machineAutomationParams, body: z.strictObject({ revision: z.number().int().positive() }) },
-  }, (request, reply) => handle(reply, async () => dependencies.transaction(async (tx) => {
+  }, (request, reply) => handle(reply, async () => workerTransaction(request, async (tx) => {
     await markScriptValidationFailed(tx, request.userId, request.params.machineId, request.params.automationId, request.body.revision);
     return { ok: true };
   })));
@@ -227,7 +238,7 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
   app.post('/v1/machines/:machineId/script-automations/:automationId/claim', {
     preHandler: app.authenticate, schema: { params: machineAutomationParams, body: z.strictObject({}) },
   }, (request, reply) => handle(reply, async () => {
-    const existing = await dependencies.transaction(async (tx) => {
+    const existing = await workerTransaction(request, async (tx) => {
       await validateScriptTarget(tx, request.params.automationId, request.userId, request.params.machineId);
       const claim = await scriptQueueInTransaction(tx).claim(request.params.automationId, request.userId, request.params.machineId, Date.now());
       const artifact = claim ? await tx.scriptArtifact.findUniqueOrThrow({ where: { id: claim.run.snapshot.artifactId } }) : null;
@@ -235,13 +246,13 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
     });
     if (existing.claim) {
       try {
-        await dependencies.transaction((tx) => enqueueDueScript(tx, request.userId, request.params.machineId, request.params.automationId, Date.now()));
+        await workerTransaction(request, (tx) => enqueueDueScript(tx, request.userId, request.params.machineId, request.params.automationId, Date.now()));
       } catch (error) {
       app.log.warn({ err: error, automationId: request.params.automationId }, 'Deferred due script admission after returning an existing claim');
       }
       return existing;
     }
-    return dependencies.transaction(async (tx) => {
+    return workerTransaction(request, async (tx) => {
       await enqueueDueScript(tx, request.userId, request.params.machineId, request.params.automationId, Date.now());
       const queued = await scriptQueueInTransaction(tx).claim(request.params.automationId, request.userId, request.params.machineId, Date.now());
       const artifact = queued ? await tx.scriptArtifact.findUniqueOrThrow({ where: { id: queued.run.snapshot.artifactId } }) : null;
@@ -259,7 +270,7 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
   app.post('/v1/machines/:machineId/script-runs/:runId/context', {
     preHandler: app.authenticate, schema: { params: runParams, body: claimBody },
   }, (request, reply) => handle(reply, async () => {
-    const outcome = await dependencies.transaction(async (tx) => {
+    const outcome = await workerTransaction(request, async (tx) => {
       const run = await ownedRun(tx, request.userId, request.params.machineId, request.params.runId);
       const { row } = await validateScriptTarget(tx, run.automationId, request.userId, request.params.machineId);
       try {
@@ -277,7 +288,7 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
     app.post(`/v1/machines/:machineId/script-runs/:runId/${operation}`, {
       preHandler: app.authenticate, schema: { params: runParams, body: claimBody.extend({ executionProof: z.string().max(8192).optional() }) },
     }, (request, reply) => handle(reply, async () => {
-      const ok = await dependencies.transaction(async (tx) => {
+      const ok = await workerTransaction(request, async (tx) => {
         const run = await ownedRun(tx, request.userId, request.params.machineId, request.params.runId);
         if (operation === 'start') {
           const { row } = await validateScriptTarget(tx, run.automationId, request.userId, request.params.machineId);
@@ -304,7 +315,7 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
       logCiphertext: z.string().max(6 * 1024 * 1024).refine((value) => {
         try { return scriptEncryptedValueSchema.safeParse(JSON.parse(value)).success; } catch { return false; }
       }), failureCode: z.string().regex(/^[A-Z0-9_]{1,100}$/).optional() }) },
-  }, (request, reply) => handle(reply, async () => dependencies.transaction(async (tx) => {
+  }, (request, reply) => handle(reply, async () => workerTransaction(request, async (tx) => {
     const run = await ownedRun(tx, request.userId, request.params.machineId, request.params.runId);
     const receipt = await scriptQueueInTransaction(tx).complete(run.id, request.body.token, request.body, Date.now());
     return { ok: true, ...receipt };
@@ -312,7 +323,7 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
   app.post('/v1/machines/:machineId/script-runs/:runId/fail', {
     preHandler: app.authenticate,
     schema: { params: runParams, body: claimBody.extend({ failureCode: z.string().regex(/^[A-Z0-9_]{1,100}$/) }) },
-  }, (request, reply) => handle(reply, async () => dependencies.transaction(async (tx) => {
+  }, (request, reply) => handle(reply, async () => workerTransaction(request, async (tx) => {
     const run = await ownedRun(tx, request.userId, request.params.machineId, request.params.runId);
     await scriptQueueInTransaction(tx).failClaim(run.id, request.body.token, request.body.failureCode, Date.now());
     return { ok: true };

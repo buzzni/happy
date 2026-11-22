@@ -4,6 +4,7 @@ import type { SetupTokenRotationState } from './types';
 import { logger } from '@/ui/logger'
 import { buildScheduledRunPrompt } from '@/utils/scheduledRunPrompt'
 import { EventEmitter } from 'node:events'
+import { watchWorkMachineCredential, type WorkMachineSessionCredentials } from '@/daemon/workMachineCredential';
 import { io, Socket } from 'socket.io-client'
 import { AgentState, ClientToServerEvents, FileEventMessage, FileEventMessageSchema, Metadata, ServerToClientEvents, Session, Update, UserMessage, UserMessageSchema, Usage } from './types'
 import { decodeBase64, decryptBlob, decrypt, encodeBase64, encrypt, encryptBlob } from './encryption';
@@ -419,7 +420,8 @@ export interface ApiSessionClientOptions {
 }
 
 export class ApiSessionClient extends EventEmitter {
-    private readonly token: string;
+    private token: string;
+    private disposeWorkMachineCredential?: () => void;
     readonly sessionId: string;
     /**
      * Identity of *this process's* attachment to the session, minted per client instance
@@ -2808,8 +2810,33 @@ export class ApiSessionClient extends EventEmitter {
         return this.options.trackShutdownStorage === true && this.storageBarrier.isCurrent(proof);
     }
 
+    bindWorkMachineCredential(credential: WorkMachineSessionCredentials, apply: (token: string) => void): void {
+        if (this.disposeWorkMachineCredential || credential.sessionId !== this.sessionId
+            || credential.initial.token !== this.token) throw new Error('Work machine session authorization mismatch');
+        this.disposeWorkMachineCredential = watchWorkMachineCredential({
+            initial: credential.initial,
+            renew: credential.renew,
+            apply: renewed => {
+                this.token = renewed.token;
+                apply(renewed.token);
+                this.socket.auth = { ...(this.socket.auth as Record<string, unknown>), token: renewed.token };
+                this.stopSmartReconnect();
+                if (this.socket.active) this.socket.disconnect();
+                this.startSmartReconnect();
+            },
+            retrying: () => logger.warn('[API] Work machine session credential refresh will retry'),
+            stop: reason => {
+                logger.warn(`[API] Work machine session authorization ${reason}`);
+                this.shutdownReceiveSeq = this.lastSeq;
+                this.stopReceivePolling();
+                this.onSyncFatal('receive', new Error('Work machine session authorization lost'));
+            },
+        });
+    }
+
     async close() {
         logger.debug('[API] socket.close() called');
+        this.disposeWorkMachineCredential?.();
         await this.finishClaudeUsageExecution();
         // socket.close() 가 부를 disconnect 핸들러보다 먼저 세운다.
         this.closed = true;

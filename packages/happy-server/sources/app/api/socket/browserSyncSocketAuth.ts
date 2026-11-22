@@ -20,6 +20,7 @@ export type BrowserSyncSocketHandshake = {
 export type BrowserSyncSocketIdentity = {
     accountId: string;
     expiresAt: number;
+    workMachineIngress?: true;
 };
 
 export async function authenticateBrowserSyncSocket(input: {
@@ -36,7 +37,11 @@ export async function authenticateBrowserSyncSocket(input: {
     const verified = await input.issuer.verify(token, input.now);
     if (!verified.ok) return null;
 
-    return { accountId: verified.claims.accountId, expiresAt: verified.claims.expiresAt };
+    return {
+        accountId: verified.claims.accountId,
+        expiresAt: verified.claims.expiresAt,
+        ...(verified.claims.workMachineIngress ? { workMachineIngress: true } : {}),
+    };
 }
 
 /** 만료 시각을 `socket.data` 에 두는 키. 복구된 연결이 이 값을 되살린다. */

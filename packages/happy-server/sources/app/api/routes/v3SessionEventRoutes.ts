@@ -7,7 +7,7 @@ import { db } from "@/storage/db";
 import { Prisma } from "@prisma/client";
 import { z } from "zod";
 import { type Fastify } from "../types";
-import { requireSessionScopeAuth } from "@/app/api/utils/enableAuthentication";
+import { requireWorkMachineSessionScopeAuth } from "@/app/api/utils/enableAuthentication";
 
 const validEventTypes = Object.values(SESSION_EVENT_TYPES) as [string, ...string[]];
 
@@ -91,7 +91,7 @@ export function v3SessionEventRoutes(app: Fastify) {
     // GET only. The POST below writes session events, which no managed
     // consumer needs, so sharing a path does not carry it in.
     app.get('/v3/sessions/:sessionId/events', {
-        preHandler: requireSessionScopeAuth(app) as never,
+        preHandler: requireWorkMachineSessionScopeAuth(app),
         schema: {
             params: z.object({
                 sessionId: z.string(),
@@ -173,11 +173,14 @@ export function v3SessionEventRoutes(app: Fastify) {
                 id: sessionId,
                 ...piiSessionVisibility(request), accountId: userId,
             },
-            select: { id: true },
+            select: { id: true, workMachineId: true },
         });
 
         if (!session) {
             return reply.code(404).send({ error: 'Session not found' });
+        }
+        if (session.workMachineId) {
+            return reply.code(403).send({ error: 'Work machine session credential required' });
         }
 
         const checkpointEvent = checkpoint

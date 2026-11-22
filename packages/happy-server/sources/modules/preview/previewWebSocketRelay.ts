@@ -32,7 +32,7 @@ import type { IncomingMessage } from "node:http";
 import type { Socket as NetSocket } from "node:net";
 import { Socket as IoSocket, type Server as IoServer } from "socket.io";
 import { eventRouter } from "@/app/events/eventRouter";
-import { findMachineSockets as findMachineSocketsCrossReplica } from "@/app/events/findMachineSockets";
+import { findMachineSocketsForDispatch } from "@/app/events/findMachineSockets";
 import {
     addTunnel, approveTunnel, deleteTunnel, hasTunnel,
     deliverDaemonData, deliverDaemonClose, dropTunnelsOwnedBy,
@@ -492,10 +492,6 @@ export function armTunnelRevocation(input: {
 }
 
 /** Cross-replica: the daemon may be attached to a different pod than this upgrade. */
-function findMachineSockets(userId: string, machineId: string) {
-    return findMachineSocketsCrossReplica(eventRouter.server, userId, machineId);
-}
-
 /**
  * Daemon-side dispatch, registered on every machine-scoped socket at connection
  * time (socket.ts). It has to live on the daemon's own replica: `proxy-ws-*`
@@ -743,7 +739,7 @@ async function handleUpgrade(req: IncomingMessage, socket: NetSocket, head: Buff
       }
     }
 
-    const { sockets: machineSockets, degraded } = await findMachineSockets(claims.userId, machineId);
+    const { sockets: machineSockets, degraded } = await findMachineSocketsForDispatch(eventRouter.server, claims.userId, machineId);
     if (machineSockets.length === 0) {
         // `degraded` = the cross-replica lookup failed, so we do not know
         // whether the daemon is there. Same 502, distinct log line.

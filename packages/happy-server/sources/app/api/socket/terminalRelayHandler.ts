@@ -33,7 +33,10 @@ import { eventRouter } from '@/app/events/eventRouter';
 import {
     findMachineSockets as findMachineSocketsCrossReplica,
     newestMachineSocket,
+    permitMachineDispatchSockets,
 } from '@/app/events/findMachineSockets';
+import { db } from '@/storage/db';
+import type { WorkMachineExecutionClaims } from '@/app/auth/workMachineExecutionToken';
 import { log } from '@/utils/log';
 import { randomUUID } from 'node:crypto';
 import {
@@ -132,6 +135,23 @@ async function resolveTerminalSide(
     if (!found) return null;
     const side = terminalSideOf(found, socket, userId);
     if (!side) return null;
+    try {
+        const authority = await db.workMachineExecution.findFirst({
+            where: { machineId: found.machineId, accountId: found.userId },
+            select: { deviceId: true, generation: true, frozenAt: true },
+        });
+        if (authority?.generation !== found.workMachineGeneration || authority?.frozenAt) return null;
+        if (authority) {
+            const grant = socket.data.workMachineExecution as WorkMachineExecutionClaims | undefined;
+            const allowed = side === 'client' ? socket.data.workMachineBrowser === true && socket.data.clientType !== 'session-scoped'
+                : grant?.purpose === 'daemon' && grant.accountId === found.userId && grant.machineId === found.machineId
+                    && grant.expiresAt > Date.now() && grant.generation === authority.generation && grant.deviceId === authority.deviceId;
+            if (!allowed) return null;
+        }
+    } catch {
+        log({ module: 'terminal-relay', level: 'warn' }, 'Terminal execution authority unavailable');
+        return null;
+    }
     const bound = side === 'client' ? found.clientSocketId : found.daemonSocketId;
     if (bound === socket.id) return { session: found, side };
     const session = await rebindTerminalSessionSocket(found.id, side, socket.id);
@@ -211,6 +231,12 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
                 return;
             }
 
+            const grant = daemonSocket.data?.workMachineExecution as WorkMachineExecutionClaims | undefined;
+            if (grant && (grant.purpose !== 'daemon' || socket.data?.workMachineBrowser !== true
+                || socket.data?.clientType === 'machine-scoped' || socket.data?.clientType === 'session-scoped')) {
+                reply({ ok: false, error: 'Work machine browser authorization required' });
+                return;
+            }
             const sessionId = randomUUID();
             // Registered before the daemon is asked: it spawns the PTY and the shell prints its prompt at
             // once, often before its ack reaches this replica. On the daemon's replica that frame must already
@@ -222,9 +248,15 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
                 clientSocketId: socket.id,
                 daemonSocketId: daemonSocket.id,
                 createdAt: Date.now(),
+                ...(grant ? { workMachineGeneration: grant.generation } : {}),
             });
             let daemonAck: unknown;
             try {
+                if (!(await permitMachineDispatchSockets(db, userId, machineId, [daemonSocket], Date.now())).length) {
+                    await removeTerminalSession(sessionId);
+                    reply({ ok: false, error: 'Work machine execution is not authorized' });
+                    return;
+                }
                 daemonAck = await daemonSocket
                     .timeout(TERMINAL_OPEN_TIMEOUT_MS)
                     .emitWithAck('terminal-open-fwd', {
@@ -259,29 +291,34 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
         }
     });
 
-    socket.on('terminal-frame', async (data: any) => {
-        // Direction is inferred from the source socket, and the session's view
-        // of that side is corrected when the id has moved. Frames from a socket
-        // that is neither side are dropped — the confused-deputy defence that
-        // matters (a *different user* guessing a sessionId) lives in
-        // terminalSideOf, which reads the verified handshake.
-        const resolved = await resolveTerminalSide(data?.sessionId, socket, userId);
-        if (!resolved) return;
-        const { session, side } = resolved;
-        if (side === 'client') {
-            emitToSocket(session.daemonSocketId, 'terminal-frame-fwd', {
-                sessionId: session.id,
-                data: data?.data,
-            });
-        } else {
-            // `seq` is the daemon's; the relay neither assigns nor validates it.
-            emitToSocket(session.clientSocketId, 'terminal-frame', {
-                sessionId: session.id,
-                seq: data?.seq,
-                data: data?.data,
-                ...pageFields(data),
-            });
-        }
+    // Authorization can wait on storage. Preserve the per-socket input order.
+    let frameTail = Promise.resolve();
+    socket.on('terminal-frame', (data: any) => {
+        frameTail = frameTail.then(async () => {
+            // Direction is inferred from the source socket, and the session's view
+            // of that side is corrected when the id has moved. Frames from a socket
+            // that is neither side are dropped — the confused-deputy defence that
+            // matters (a *different user* guessing a sessionId) lives in
+            // terminalSideOf, which reads the verified handshake.
+            const resolved = await resolveTerminalSide(data?.sessionId, socket, userId);
+            if (!resolved) return;
+            const { session, side } = resolved;
+            if (side === 'client') {
+                emitToSocket(session.daemonSocketId, 'terminal-frame-fwd', {
+                    sessionId: session.id,
+                    data: data?.data,
+                });
+            } else {
+                // `seq` is the daemon's; the relay neither assigns nor validates it.
+                emitToSocket(session.clientSocketId, 'terminal-frame', {
+                    sessionId: session.id,
+                    seq: data?.seq,
+                    data: data?.data,
+                    ...pageFields(data),
+                });
+            }
+        }).catch(reportCleanupFailure);
+        return frameTail;
     });
 
     /*

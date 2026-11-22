@@ -42,11 +42,13 @@ import { startScriptInvocationMaintenance } from "@/app/automation/scriptInvocat
 import { sessionFollowupRoutes } from "./routes/sessionFollowupRoutes";
 import { agentProfileRoutes } from "./routes/agentProfileRoutes";
 import { managedControlRoutes } from "./routes/managedControlRoutes";
+import { workMachineExecutionRoutes } from "./routes/workMachineExecutionRoutes";
 import { managedApprovalRoutes } from "@/app/api/routes/managedApprovalRoutes";
 import { managedFollowUpRoutes } from "@/app/api/routes/managedFollowUpRoutes";
 import { managedUsageReplayRoutes } from '@/app/api/routes/managedUsageReplayRoutes';
 import { managedDaemonRenewRoutes } from '@/app/api/routes/managedDaemonRenewRoutes';
 import { createManagedControlRuntime, type ManagedControlRuntime } from "@/app/managed/managedControlRuntime";
+import { createControlAssertionVerifier } from "@/app/managed/managedControlAssertion";
 import {
     activateManagedStorage,
     assertPrivateRootIsolated,
@@ -157,6 +159,10 @@ export async function startApi(opts: StartApiOptions = {}) {
     // keys; `createManagedControlRuntime` returns null when it has not, and the
     // routes then refuse rather than falling back to the account bearer.
     const managedControl: ManagedControlRuntime | null = await createManagedControlRuntime(process.env);
+    const workMachineControl = createControlAssertionVerifier({
+        audience: process.env.HAPPY_WORK_MACHINE_CONTROL_AUDIENCE,
+        verifierKeys: process.env.HAPPY_WORK_MACHINE_CONTROL_VERIFIER_KEYS,
+    });
 
     // The one configured issuer, handed to the session-data decorator. Building
     // a second here would verify against a second key.
@@ -164,6 +170,7 @@ export async function startApi(opts: StartApiOptions = {}) {
 
     // Routes
     managedControlRoutes(typed, () => managedControl);
+    workMachineExecutionRoutes(typed, () => workMachineControl);
     // The credential-recovery half of the same control plane: it extends or
     // re-reads a daemon grant that already exists and never touches machine key
     // material, so it is signed for under its own operations.
@@ -174,7 +181,7 @@ export async function startApi(opts: StartApiOptions = {}) {
     // bearer it accepts is a managed one, not a control-plane assertion.
     managedApprovalRoutes(typed);
     managedFollowUpRoutes(typed);
-    authRoutes(typed);
+    authRoutes(typed, { workMachineIngressVerifier: workMachineControl ?? undefined });
     // Self-host / Desktop-embedded only: the cloud serves this path from web-ui.
     const idleReaperMode = readSessionIdleReaperMode(process.env);
     if (idleReaperMode) sessionIdleReaperRoutes(typed, { mode: idleReaperMode });
