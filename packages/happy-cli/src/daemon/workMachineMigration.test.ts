@@ -37,6 +37,8 @@ class FakeStudio {
     puts = new Map<number, number>();
     failPuts = new Map<number, number>();
     tamperGet = new Set<number>();
+    /** What HEAD reports as the object's digest: an MD5 ETag (S3 single PUT), an opaque one, or opaque plus a sha256 checksum. */
+    headDigest: 'md5' | 'opaque' | 'opaque-sha256' = 'md5';
     manifest: { manifestB64: string; proof: unknown } | null = null;
     restored: Record<string, unknown> | null = null;
 
@@ -69,8 +71,9 @@ class FakeStudio {
                 return { status: 200 };
             }
             if (!stored) return { status: 404 };
-            const etag = `"${createHash('md5').update(stored).digest('hex')}"`;
-            if (req.method === 'HEAD') return { status: 200, headers: { 'content-length': String(stored.length), etag } };
+            const etag = this.headDigest === 'md5' ? `"${createHash('md5').update(stored).digest('hex')}"` : '"opaque-etag-1"';
+            const checksum: Record<string, string> = this.headDigest === 'opaque-sha256' ? { 'x-amz-checksum-sha256': createHash('sha256').update(stored).digest('base64') } : {};
+            if (req.method === 'HEAD') return { status: 200, headers: { 'content-length': String(stored.length), etag, ...checksum } };
             const body = Buffer.from(stored);
             if (this.tamperGet.has(n)) body[body.length - 1] ^= 1;
             return { status: 200, body, headers: { 'content-length': String(body.length) } };
@@ -277,6 +280,22 @@ describe('work machine export and import over the Studio transfer API', () => {
         await fixture.vacateSource();
         await importWorkMachine(fixture.importInput);
         expect(await readFile(join(fixture.project, 'draft.txt'), 'utf8')).toBe('untracked\n');
+    });
+
+    // Medium 14: a store whose ETag is not an MD5 (SSE-KMS, multipart) cannot vouch for a part by size alone.
+    it.each([
+        ['an opaque ETag', 'opaque', 2],
+        ['an opaque ETag with a matching sha256 checksum', 'opaque-sha256', 1],
+    ] as const)('re-uploads a part the store reports with %s only when it cannot vouch for its bytes', async (_label, headDigest, putsOfPart0) => {
+        const fixture = await machinesFixture(root, studio);
+        studio.headDigest = headDigest;
+        studio.failPuts.set(1, 100);
+        await expect(exportWorkMachine(fixture.exportInput)).rejects.toThrow('part 1');
+        studio.failPuts.clear();
+
+        await exportWorkMachine(fixture.exportInput);
+
+        expect(studio.puts.get(0)).toBe(putsOfPart0);
     });
 
     it('rejects a tampered part and places nothing', async () => {
