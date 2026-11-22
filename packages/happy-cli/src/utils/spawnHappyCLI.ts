@@ -58,7 +58,7 @@ import { logger } from '@/ui/logger';
 import { closeSync, existsSync, openSync, readFileSync, statSync, writeSync } from 'node:fs';
 import { configuration } from '@/configuration';
 import { isBun } from './runtime';
-import { sanitizeChildEnv } from './childEnv';
+import { RESIDENT_MODULE_HOST_ENV, sanitizeChildEnv } from './childEnv';
 
 type HappyCliSpawnCommand = {
   runtime: string;
@@ -94,6 +94,7 @@ export function resolveHappyCliSpawnCommand(
     isBunRuntime: isBun(),
     isElectronRuntime: !!process.versions.electron,
   },
+  useResident = false,
 ): HappyCliSpawnCommand {
   const sourceEntrypoint = join(runtime.projectRoot, 'src', 'index.ts');
   const sourceTsconfigPath = join(runtime.projectRoot, 'tsconfig.json');
@@ -111,7 +112,9 @@ export function resolveHappyCliSpawnCommand(
     };
   }
 
-  const entrypoint = join(runtime.projectRoot, 'dist', 'index.mjs');
+  const entrypoint = useResident && !runtime.isBunRuntime && !runtime.isElectronRuntime
+    ? join(runtime.projectRoot, 'bin', 'happy-resident-session.mjs')
+    : join(runtime.projectRoot, 'dist', 'index.mjs');
   return {
     // Stay on the Node that launched us (Desktop's bundled one): an older node earlier on PATH
     // ignores NODE_USE_SYSTEM_CA. Electron's binary is Node only under ELECTRON_RUN_AS_NODE.
@@ -143,7 +146,7 @@ export function spawnHappyCLI(args: string[], options: SpawnOptions = {}): Child
   if (args[0] === 'daemon' && (args[1] === 'start' || args[1] === 'start-sync')) {
     options = { ...options, cwd: homedir(), env: sanitizeChildEnv(options.env ?? process.env) };
   }
-  const command = resolveHappyCliSpawnCommand(args);
+  const command = resolveHappyCliSpawnCommand(args, undefined, !!options.env?.[RESIDENT_MODULE_HOST_ENV]);
 
   let directory: string | URL | undefined;
   if ('cwd' in options) {
