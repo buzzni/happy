@@ -126,7 +126,8 @@ export class ApiClient {
     const principal = this.principal;
     if (principal.kind !== 'work-machine-session') throw new Error('Work machine session authorization is unavailable');
     try {
-      await axios.post(`${configuration.serverUrl.replace(/\/+$/, '')}/v1/sessions/${encodeURIComponent(principal.credential.sessionId)}/work-machine-permit`, undefined, {
+      // An empty JSON object: axios sends a bodiless POST as a form, which the server's parsers refuse (415).
+      await axios.post(`${configuration.serverUrl.replace(/\/+$/, '')}/v1/sessions/${encodeURIComponent(principal.credential.sessionId)}/work-machine-permit`, {}, {
         headers: { Authorization: `Bearer ${principal.token}` }, timeout: 10_000, maxRedirects: 0,
       });
     } catch {
