@@ -111,6 +111,27 @@ describe('work machine execution authority', () => {
         }
     });
 
+    it('does not rewrite the authority row once the first execution is recorded', async () => {
+        const version = async () => (await db.$queryRaw<{ xmin: string }[]>`
+            SELECT "xmin"::text FROM "WorkMachineExecution" WHERE "machineId" = ${machineId}
+        `)[0].xmin;
+        const first = new Date('2026-11-22T00:00:00Z');
+        expect(await permitWorkMachineExecution(db, original, first)).toBe(true);
+        const recorded = await version();
+        expect(await permitWorkMachineExecution(db, original, new Date())).toBe(true);
+        expect(await version()).toBe(recorded);
+        await db.$executeRaw`UPDATE "WorkMachineExecution" SET "drainingAt" = now() WHERE "machineId" = ${machineId}`;
+        const draining = await version();
+        try {
+            expect(await permitWorkMachineExecution(db, original, new Date())).toBe(false);
+            expect(await permitWorkMachineExecution(db, original, new Date(), true)).toBe(true);
+            expect(await version()).toBe(draining);
+        } finally {
+            await db.$executeRaw`UPDATE "WorkMachineExecution" SET "drainingAt" = NULL WHERE "machineId" = ${machineId}`;
+        }
+        expect((await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt).toEqual(first);
+    });
+
     it('allows read-only preview during drain without recording first execution, but refuses it when frozen', async () => {
         const now = Date.now();
         const socket = { id: 'reader', data: { workMachineExecution: { ...original, purpose: 'daemon', expiresAt: now + 60_000 } } };
