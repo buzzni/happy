@@ -8,6 +8,8 @@
  * CODEX_HOME is ever enumerated, so account/device keys, AI logins and execution credentials stay
  * behind by construction. Files that may still carry an execution credential (provider records,
  * env-like files, Git config) are scanned and the export stops, naming the file, never the value.
+ * A conversation in this machine's sessions.json that the plan leaves out (and that is not
+ * archived) stops the export too: it would not open on the target.
  *
  * Archive layout: `happy/sessions.json` (the selected records) and `fs/<absolute path>` for every
  * selected entry. Extraction admits only those two shapes, regular files, directories and symlinks
@@ -59,6 +61,8 @@ const recordSchema = z.object({
     userHomeDir: z.never().optional(),
     deferredContinuationContextFile: z.string().optional(),
 }).passthrough();
+
+const archivedRecord = z.object({ metadata: z.object({ lifecycleState: z.literal('archived') }).passthrough() }).passthrough();
 
 /** Logins that may sit inside a project tree and never travel. */
 const LOGIN_FILES = new Set(['.git-credentials', '.netrc', '.credentials.json']);
@@ -215,6 +219,12 @@ export async function selectWorkMachineTransfer(input: {
         .filter((path, index, all) => !all.slice(0, index).some(outer => within(outer, path)));
 
     const stored = await readSessionRecords(input.happyHome);
+    // Every conversation on this machine travels or is archived: one left out would not open on the target.
+    const planned = new Set(input.sessionIds);
+    const unplanned = Object.keys(stored).filter(sessionId => !planned.has(sessionId) && !archivedRecord.safeParse(stored[sessionId]).success).sort();
+    if (unplanned.length) {
+        throw new Error(`Sessions on this machine are missing from the transfer plan: ${unplanned.join(', ')}. Add them to the plan or archive them before exporting`);
+    }
     const records: Record<string, unknown> = {};
     const sessions: WorkMachineTransferSession[] = [];
     const providerPaths: string[] = [];

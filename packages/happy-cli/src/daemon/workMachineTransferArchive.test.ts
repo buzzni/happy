@@ -39,10 +39,12 @@ async function machineFixture(root: string) {
         metadataVersion: 1, agentStateVersion: 1, savedAt: 1,
         metadata: { path: project, host: 'source', [nativeField]: nativeId }, lastProcessedSeq,
     });
+    const archived = record('claudeSessionId', '99999999-2222-4333-8444-555555555555', 1);
     const sessions = {
         'claude-session': record('claudeSessionId', claudeId, 4),
         'codex-session': record('codexThreadId', codexId, 6),
-        'other-session': record('claudeSessionId', '99999999-2222-4333-8444-555555555555', 1),
+        // Archived on this machine: closed, so a plan that leaves it out does not block.
+        'other-session': { ...archived, metadata: { ...archived.metadata, lifecycleState: 'archived' } },
     };
     await writeFile(join(home, 'sessions.json'), JSON.stringify({ sessions }), { mode: 0o600 });
     // What each planned session process left when it stopped (workMachineSessionStop.ts).
@@ -137,6 +139,19 @@ describe('work machine transfer archive selection', () => {
         fixture.stopped('codex-session', { lastProcessedSeq: 6, codexThreadId: codexId, ...fields });
 
         await expect(select(fixture)).rejects.toThrow(/codex-session .*cancel the migration.*drain longer/i);
+    });
+
+    it('blocks the export naming every session on this machine the plan leaves out', async () => {
+        const fixture = await machineFixture(root);
+        const stored = JSON.parse(await readFile(join(fixture.home, 'sessions.json'), 'utf8'));
+        stored.sessions['unplanned-b'] = stored.sessions['claude-session'];
+        stored.sessions['unplanned-a'] = stored.sessions['codex-session'];
+        await writeFile(join(fixture.home, 'sessions.json'), JSON.stringify(stored), { mode: 0o600 });
+
+        const failure = await select(fixture).catch((error: Error) => error);
+        expect((failure as Error).message).toContain('unplanned-a, unplanned-b');
+        expect((failure as Error).message).not.toContain('other-session');
+        await expect(select(fixture, { requireStopRecords: false })).rejects.toThrow('unplanned-a, unplanned-b');
     });
 
     it.each([
