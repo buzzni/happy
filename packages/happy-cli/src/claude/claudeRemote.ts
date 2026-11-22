@@ -646,8 +646,10 @@ async function runClaudeRemote(
      * overwritten by the next recall — so a late result cannot be attached to
      * a turn it did not belong to.
      */
-    const lessonTurn = opts.lessons?.sessionId ? (opts.lessons.turn ?? null) : null;
-    const lessonReview = opts.lessons?.sessionId ? (opts.lessons.review ?? null) : null;
+    // An app session answers a public end user: the machine's lessons stay out of its messages, and its turns out of their review.
+    const lessonWork = opts.lessons?.sessionId && !opts.appProfile ? opts.lessons : null;
+    const lessonTurn = lessonWork?.turn ?? null;
+    const lessonReview = lessonWork?.review ?? null;
     // Unknown means automation: a session this host cannot classify must not
     // be allowed to teach the project.
     const cancelProposal = () => opts.lessonProposalTurn?.cancel();

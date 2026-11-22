@@ -203,6 +203,15 @@ describe('claudeRemote', () => {
             expect(provide).not.toHaveBeenCalled();
         });
 
+        it("neither recalls the machine's lessons into the end user's message nor reviews the turn", async () => {
+            const turn = { recall: vi.fn(async () => ({ outcome: 'selected' as const, block: 'OWNER LESSON', ticket: { id: 'ticket-1' } as any })), acknowledge: vi.fn(async () => true) };
+            const review = { prepareReviewTurn: vi.fn(async () => ({ revision: 1 })), reviewFinishedTurn: vi.fn(async () => 'reviewed' as const) };
+            await run({ appProfile, lessons: { sessionId: 'happy-session', sessionKind: 'automation', turn, review } });
+
+            expect(turn.recall).not.toHaveBeenCalled();
+            expect(review.reviewFinishedTurn).not.toHaveBeenCalled();
+        });
+
         it('leaves a session without a profile as it was', async () => {
             const options = await run({});
 
