@@ -9,6 +9,7 @@ import { describe, it, expect } from 'vitest'
 import { randomBytes } from 'node:crypto'
 import { parseCredentials } from '@/persistence'
 import { encodeBase64 } from '@/api/encryption'
+import { deriveContentKeyPair } from '@/resume/localHappyAgentAuth'
 import { planDataKeyOnboarding } from './onboarding'
 
 const secret = new Uint8Array(randomBytes(32))
@@ -37,6 +38,8 @@ describe('planDataKeyOnboarding — 게이트 (AC2/AC5)', () => {
     expect(parsed.encryption.publicKey).toEqual(publicKey)
     expect(parsed.encryption.machineKey).toEqual(machineKey)
     expect((r.serialized as { secret?: unknown }).secret).toBeUndefined()
+    // aplus-dev-studio specs/script-automation-viewer-key R1
+    expect(parsed.encryption.viewerPublicKey).toEqual(deriveContentKeyPair(secret).publicKey)
   })
 
   it('does NOT promote when the machine already has local sessions (AC2)', () => {

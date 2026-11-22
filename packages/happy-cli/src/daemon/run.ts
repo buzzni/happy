@@ -66,6 +66,7 @@ import { BASH_PREFIX_MATCHER_CAPABILITY } from '@/claude/utils/bashPrefixMatcher
 import { logger } from '@/ui/logger';
 import { authAndSetupMachineIfNeeded } from '@/ui/auth';
 import { reseedCompanyKey, settleMachineControl } from '@/datakey/machineControl';
+import { backfillViewerPublicKey } from '@/datakey/viewerKeyBackfill';
 import { createCompanyKeyReseedHandler } from './companyKeyReseedHandler';
 import type { PayloadTrust } from '@/daemon/automations/payloadTrust';
 import { createMachineControlIo } from '@/datakey/machineControlIo';
@@ -989,14 +990,15 @@ export async function startDaemon(): Promise<void> {
     // registers nothing and keeps the key its parent provisioned.
     const credentials = managedCredential?.ok
       ? authSetup.credentials
-      : await settleMachineControl({
+      // aplus-dev-studio specs/script-automation-viewer-key R2 — agents read the viewer key from access.key.
+      : await backfillViewerPublicKey(await settleMachineControl({
         mode: configuration.machineControl,
         credentials: authSetup.credentials,
         machineId,
         serverPublicKey,
         metadata: daemonMachineMetadata,
         io: createMachineControlIo({ token: authSetup.credentials.token, machineId }),
-      });
+      }));
     logger.debug(`[DAEMON RUN] Auth and machine setup complete (machine control: ${managedCredential?.ok ? 'managed' : configuration.machineControl})`);
 
     // ── Managed runtime admission, decided before anything can accept work ──

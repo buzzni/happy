@@ -366,3 +366,69 @@ it('lists readable rows next to rows of another machine or an older key without 
   expect(listed[0]).not.toHaveProperty('name'); expect(listed[0]).not.toHaveProperty('action');
   await expect(f.tools.execute({ operation: 'get', automationId: 'legacy-1' })).rejects.toThrow('SCRIPT_MACHINE_KEY_MISMATCH');
 });
+
+// aplus-dev-studio specs/script-automation-viewer-key R4~R6 — a dataKey machine keeps the viewer key its account secret
+// derives (what the app registers) next to its customer key, and seals with whichever the project already uses.
+function keptViewerFixture(server: 'kept' | 'customer' | 'none' | 'other') {
+  const f = machineFixture(), customer = nacl.box.keyPair();
+  const serverKey = { kept: f.viewer.publicKey, customer: customer.publicKey, none: null, other: nacl.box.keyPair().publicKey }[server];
+  f.target.viewerPublicKey = serverKey ? Buffer.from(serverKey).toString('base64') : null as any;
+  const request = vi.fn(async (input: any): Promise<any> => {
+    if (input.operation === 'viewer-key') { f.target.viewerPublicKey = input.publicKey; return { keyVersion: 1 }; }
+    return f.request(input);
+  });
+  const tools = createScriptAutomationTools({ projectId: 'project', directory, viewerPublicKey: customer.publicKey, storedViewerPublicKey: f.viewer.publicKey,
+    machineReader: { machineId: 'pc', machineAccountId: 'account', mode: 'strict', key: { ...f.machine, registeredKeyVersion: 2 } }, request });
+  return { ...f, tools, request, customer };
+}
+const configuration = { projectId: 'project', resourceId: 'collect', purpose: 'configuration' as const };
+
+it('registers for a project whose viewer key is the one the app derives, and reads what the app sealed', async () => {
+  await writeFile(join(directory, 'collect.mjs'), 'console.log(1)');
+  const f = keptViewerFixture('kept');
+  expect(await f.tools.execute(f.input)).toMatchObject({ id: 'script-1', name: 'Collect' });
+  const value = decryptScriptValue({ encrypted: f.rows[0].encrypted, context: configuration, recipient: 'viewer', secretKey: f.viewer.secretKey });
+  expect(value).toMatchObject({ name: 'Collect' });
+  // The app seals as the customer; the sender trust key stays the customer key, not the viewer key.
+  f.rows[0].encrypted = encryptScriptValue({ value, context: configuration, viewerPublicKey: f.viewer.publicKey, machinePublicKey: f.machine.publicKey, sender: f.customer });
+  expect(await f.tools.execute({ operation: 'get', automationId: 'script-1' })).toMatchObject({ name: 'Collect' });
+  f.rows[0].encrypted = encryptScriptValue({ value, context: configuration, viewerPublicKey: f.viewer.publicKey, machinePublicKey: f.machine.publicKey, sender: f.viewer });
+  await expect(f.tools.execute({ operation: 'get', automationId: 'script-1' })).rejects.toThrow('PAYLOAD_SENDER_UNTRUSTED');
+});
+
+it('keeps registering for a project an agent set to the customer key', async () => {
+  await writeFile(join(directory, 'collect.mjs'), 'console.log(1)');
+  const f = keptViewerFixture('customer');
+  expect(await f.tools.execute(f.input)).toMatchObject({ id: 'script-1' });
+  expect(decryptScriptValue({ encrypted: f.rows[0].encrypted, context: configuration, recipient: 'viewer', secretKey: f.customer.secretKey })).toMatchObject({ name: 'Collect' });
+  expect(await f.tools.execute({ operation: 'list' })).toMatchObject([{ name: 'Collect' }]);
+});
+
+it('sets a new project to the kept viewer key, so the app can read it', async () => {
+  await writeFile(join(directory, 'collect.mjs'), 'console.log(1)');
+  const f = keptViewerFixture('none');
+  await f.tools.execute(f.input);
+  expect(f.request.mock.calls.find(([request]) => request.operation === 'viewer-key')?.[0]).toMatchObject({ publicKey: Buffer.from(f.viewer.publicKey).toString('base64') });
+  expect(decryptScriptValue({ encrypted: f.rows[0].encrypted, context: configuration, recipient: 'viewer', secretKey: f.viewer.secretKey })).toMatchObject({ name: 'Collect' });
+});
+
+it('refuses a viewer key neither local key matches before uploading code', async () => {
+  await writeFile(join(directory, 'collect.mjs'), 'console.log(1)');
+  const f = keptViewerFixture('other');
+  await expect(f.tools.execute(f.input)).rejects.toThrow('SCRIPT_VIEWER_KEY_MISMATCH');
+  expect(f.request.mock.calls.map(([request]) => request.operation)).not.toContain('upsert');
+});
+
+it('hands the dataKey entry point the viewer key kept in access.key', async () => {
+  await writeFile(join(directory, 'collect.mjs'), 'console.log(1)');
+  const runtimeState = runtimeFixture(), f = machineFixture();
+  runtime.credentials.mockReturnValue(null);
+  runtime.machineCredentials.mockResolvedValue({ token: 'machine-token',
+    encryption: { type: 'dataKey', publicKey: nacl.box.keyPair().publicKey, machineKey: nacl.randomBytes(32), viewerPublicKey: f.viewer.publicKey } });
+  runtime.machineKey.mockReturnValue({ ...f.machine, registeredKeyVersion: 2 });
+  runtimeState.fetch.mockImplementation(async (url: URL, init: RequestInit) => {
+    if (String(url).endsWith('/automation-reader-key')) return Response.json({ machineId: 'pc', machineAccountId: 'account', publicKey: Buffer.from(f.machine.publicKey).toString('base64'), keyVersion: 2 });
+    return Response.json(await f.request(JSON.parse(init.body as string).request));
+  });
+  expect(await runScriptAutomationTool(f.input, runtimeState.session)).toMatchObject({ id: 'script-1', revision: 1 });
+});

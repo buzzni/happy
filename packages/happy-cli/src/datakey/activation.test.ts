@@ -9,6 +9,7 @@ import { describe, it, expect } from 'vitest'
 import { randomBytes } from 'node:crypto'
 import { parseCredentials } from '@/persistence'
 import { encodeBase64 } from '@/api/encryption'
+import { deriveContentKeyPair } from '@/resume/localHappyAgentAuth'
 import {
   planDataKeyActivation,
   planDataKeyDeactivation,
@@ -121,6 +122,16 @@ describe('planDataKeyActivation — 성공 경로', () => {
     expect(parsed.encryption.publicKey).toEqual(publicKey)
     expect(parsed.encryption.machineKey).toEqual(machineKey)
     expect((result.serialized as { secret?: unknown }).secret).toBeUndefined()
+  })
+
+  // aplus-dev-studio specs/script-automation-viewer-key R1 — the secret leaves, the viewer public key it derives stays.
+  it('keeps the automation viewer public key the secret derives', async () => {
+    const result = await planDataKeyActivation({ rawCredentials: provisionedRaw, machineId: 'm1', fetchServerEnvelope: envelopePresent })
+    if (!result.ok) throw new Error(`expected ok, got ${result.reason}`)
+
+    const parsed = parseCredentials(result.serialized)
+    if (parsed?.encryption.type !== 'dataKey') throw new Error('unreachable')
+    expect(parsed.encryption.viewerPublicKey).toEqual(deriveContentKeyPair(secret).publicKey)
   })
 })
 

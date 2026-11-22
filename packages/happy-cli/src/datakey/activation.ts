@@ -16,6 +16,7 @@
  */
 import { parseCredentials } from '@/persistence'
 import { encodeBase64 } from '@/api/encryption'
+import { deriveContentKeyPair } from '@/resume/localHappyAgentAuth'
 
 export type ActivationGateFailure =
   | 'no-credentials'
@@ -27,7 +28,7 @@ export type ActivationGateFailure =
 
 export type SerializedDataKeyCredentials = {
   token: string
-  encryption: { publicKey: string; machineKey: string }
+  encryption: { publicKey: string; machineKey: string; viewerPublicKey: string }
 }
 
 export type ActivateResult =
@@ -69,6 +70,8 @@ export async function planDataKeyActivation(input: {
       encryption: {
         publicKey: encodeBase64(provisioned.publicKey),
         machineKey: encodeBase64(provisioned.machineKey),
+        // aplus-dev-studio specs/script-automation-viewer-key R1 — the secret leaves this file; the automation viewer key it derives stays.
+        viewerPublicKey: encodeBase64(deriveContentKeyPair(credentials.encryption.secret).publicKey),
       },
     },
     backup: input.rawCredentials,

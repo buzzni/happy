@@ -54,7 +54,7 @@ function deriveKey(master: Uint8Array, usage: string, path: string[]): Uint8Arra
     return state.key;
 }
 
-function deriveContentKeyPair(secret: Uint8Array): { publicKey: Uint8Array; secretKey: Uint8Array } {
+export function deriveContentKeyPair(secret: Uint8Array): { publicKey: Uint8Array; secretKey: Uint8Array } {
     const seed = deriveKey(secret, 'Happy EnCoder', ['content']);
     const hashedSeed = new Uint8Array(createHash('sha512').update(seed).digest());
     const secretKey = hashedSeed.slice(0, 32);

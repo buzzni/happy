@@ -383,3 +383,58 @@ it.each(['ready', 'missing-capability', 'wrong-key', 'anonymous-strict', 'anonym
     expect(f.request.mock.calls.filter(([r]) => r.operation === 'set_paused')).toHaveLength(success ? 1 : 0);
     if (!success) expect(f.rows[0]).toMatchObject({ paused: true, revision: 2 });
   })
+
+// aplus-dev-studio specs/script-automation-viewer-key R4~R6 — the app derives the viewer key from the account secret;
+// a dataKey machine keeps that key next to its customer key and creates with whichever the project already uses.
+describe('kept automation viewer key', () => {
+  function keptFixture(server: 'kept' | 'customer' | 'none') {
+    const f = fixture(true), customer = nacl.box.keyPair(), original = f.request.getMockImplementation()!;
+    let serverKey: string | null = { kept: Buffer.from(viewer.publicKey).toString('base64'), customer: Buffer.from(customer.publicKey).toString('base64'), none: null }[server];
+    f.request.mockImplementation(async (input: any) => {
+      if (input.operation === 'viewer_key') { serverKey = input.publicKey; return { keyVersion: 1 }; }
+      const value = await original(input);
+      if (input.operation === 'target' || input.operation === 'read_target') value.viewerPublicKey = serverKey;
+      return value;
+    });
+    const tools = createScheduledTaskTools({ projectId: 'chat:chat', sessionId: 'session', machineId: 'pc', directory: '/work/chat',
+      viewerPublicKey: customer.publicKey, storedViewerPublicKey: viewer.publicKey, machineKey: { ...machine, registeredKeyVersion: 1 }, request: f.request, ensureExecutionSupported: f.ensureExecutionSupported });
+    return { ...f, tools, customer };
+  }
+  const viewerReader = (f: ReturnType<typeof fixture>, keyPair: nacl.BoxKeyPair) => createScheduledTaskTools({ projectId: 'chat:chat', sessionId: 'session', machineId: 'pc',
+    directory: '/work/chat', viewerKeyPair: keyPair, request: f.request, ensureExecutionSupported: f.ensureExecutionSupported });
+
+  it('creates for a project whose viewer key is the one the app derives, readable by that viewer', async () => {
+    const f = keptFixture('kept');
+    expect(await f.tools.execute(create)).toMatchObject({ id: 'reservation' });
+    expect(await viewerReader(f, viewer).execute({ operation: 'get', automationId: 'reservation' })).toMatchObject({ prompt: create.prompt });
+  });
+
+  it('keeps creating for a project an agent set to the customer key', async () => {
+    const f = keptFixture('customer');
+    expect(await f.tools.execute(create)).toMatchObject({ id: 'reservation' });
+    expect(await viewerReader(f, f.customer).execute({ operation: 'get', automationId: 'reservation' })).toMatchObject({ prompt: create.prompt });
+  });
+
+  it('sets a new project to the kept viewer key', async () => {
+    const f = keptFixture('none');
+    await f.tools.execute(create);
+    expect(f.request.mock.calls.find(([r]) => r.operation === 'viewer_key')?.[0]).toMatchObject({ publicKey: Buffer.from(viewer.publicKey).toString('base64') });
+  });
+
+  it('hands the dataKey entry point the viewer key kept in access.key', async () => {
+    const f = fixture(true), machineKey = nacl.randomBytes(32);
+    runtime.credentials.mockReturnValue(null);
+    runtime.machineCredentials.mockResolvedValue({ token: 'fixture-token', encryption: { type: 'dataKey', publicKey: nacl.box.keyPair().publicKey, machineKey, viewerPublicKey: viewer.publicKey } });
+    runtime.key.mockReturnValue({ ...machine, registeredKeyVersion: 1 });
+    vi.stubEnv('HAPPY_APLUS_MCP_CONFIG_URL', 'http://studio.fixture/api/me/mcp-config?project_id=project');
+    vi.stubEnv('HAPPY_APLUS_MCP_CALLER_GRANT', Buffer.from(JSON.stringify({ personalChatId: null, projectId: 'project' })).toString('base64url') + '.signature');
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      if (String(url).endsWith('/automation-reader-key')) return Response.json({ machineId: 'pc', machineAccountId: 'owner', publicKey: Buffer.from(machine.publicKey).toString('base64'), keyVersion: 1 });
+      if (String(url).includes('/v1/machines/')) return Response.json({ machine: { id: 'pc', metadata: Buffer.from(encryptWithDataKey({ automationSupport: { conversation: true, serverBacked: true } }, machineKey)).toString('base64') } });
+      const result = await f.request(JSON.parse(init.body).request);
+      if (result.automation) result.automation.projectId = 'project';
+      return Response.json(result);
+    }));
+    expect(await runScheduledTaskTool(create, { sessionId: 'session', machineId: 'pc', directory: '/work/chat' })).toMatchObject({ id: 'reservation' });
+  });
+});

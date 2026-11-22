@@ -26,6 +26,8 @@ const crypto: AutomationCryptoAdapter = {
 export function createScheduledTaskTools(options: {
   projectId: string; sessionId: string; machineId: string; directory: string;
   viewerKeyPair?: nacl.BoxKeyPair; viewerPublicKey?: Uint8Array; machineKey?: { publicKey: Uint8Array; secretKey: Uint8Array; registeredKeyVersion: number };
+  /** The viewer key the account secret derives, kept in access.key (aplus-dev-studio specs/script-automation-viewer-key R1). */
+  storedViewerPublicKey?: Uint8Array;
   request(input: ScheduledManagementRequest): Promise<unknown>;
   ensureExecutionSupported(payloadVersion?: 4 | 6, row?: AutomationPublic): Promise<void>;
 }) {
@@ -144,16 +146,18 @@ export function createScheduledTaskTools(options: {
         }
       } else rawTarget = await options.request({ operation: 'target' });
       let target = automationTargetSchema.parse(rawTarget);
-      const publicKey = Buffer.from(viewerPublicKey).toString('base64');
+      // Only keys held here count; a key the server names is never taken as one (R6).
+      const candidates = options.viewerKeyPair ? [viewerPublicKey] : [options.storedViewerPublicKey, viewerPublicKey].filter((key): key is Uint8Array => !!key);
       verifyMachine(target);
       if (!target.viewerPublicKey) {
-        try { await options.request({ operation: 'viewer_key', expectedKeyVersion: target.viewerKeyVersion, publicKey }); }
+        try { await options.request({ operation: 'viewer_key', expectedKeyVersion: target.viewerKeyVersion, publicKey: Buffer.from(candidates[0]).toString('base64') }); }
         catch { /* A lost receipt or concurrent writer may have installed this key; verify the exact key below. */ }
         target = automationTargetSchema.parse(await options.request({ operation: options.machineKey ? 'read_target' : 'target' }));
       }
       verifyMachine(target);
-      if (target.machineId !== options.machineId || target.viewerPublicKey !== publicKey) throw new Error('SCHEDULED_TASK_VIEWER_KEY_MISMATCH');
-      encrypted = { ...await encryptAutomationPayload({ payload: intended, viewer: { publicKey: viewerPublicKey, keyVersion: target.viewerKeyVersion },
+      const viewerKey = candidates.find((key) => target.viewerPublicKey === Buffer.from(key).toString('base64'));
+      if (target.machineId !== options.machineId || !viewerKey) throw new Error('SCHEDULED_TASK_VIEWER_KEY_MISMATCH');
+      encrypted = { ...await encryptAutomationPayload({ payload: intended, viewer: { publicKey: viewerKey, keyVersion: target.viewerKeyVersion },
         machine: { publicKey: crypto.decodeBase64(target.machinePublicKey), keyVersion: target.machineKeyVersion }, crypto }), payloadVersion: 4, paused: true };
     }
     let row: AutomationPublic;
@@ -204,7 +208,7 @@ export async function runScheduledTaskTool(raw: unknown, session: { sessionId: s
       return value;
   };
   const tools = createScheduledTaskTools({ projectId: scope, sessionId: session.sessionId, directory: session.directory, machineId,
-    ...(credentials ? { viewerKeyPair: credentials.contentKeyPair } : { viewerPublicKey: encryption!.publicKey, machineKey: machineKey! }),
+    ...(credentials ? { viewerKeyPair: credentials.contentKeyPair } : { viewerPublicKey: encryption!.publicKey, storedViewerPublicKey: encryption!.viewerPublicKey, machineKey: machineKey! }),
     ensureExecutionSupported: async (payloadVersion = 4, row) => {
       if (payloadVersion === 4 && configuration.machineControl === 'strict') throw new Error('SCHEDULED_TASK_SEALING_UNSUPPORTED');
       const response = await fetch(`${configuration.serverUrl}/v1/machines/${encodeURIComponent(machineId)}`, {
