@@ -175,6 +175,38 @@ describe('work machine execution authority', () => {
         }
     });
 
+    it('lets a draining conversation answer and abort its turn but refuses new turn work', async () => {
+        const now = Date.now();
+        const emitted: string[] = [];
+        const socket = { data: { workMachineExecution: { ...original, sessionId: 'protected-session', purpose: 'session', expiresAt: now + 60_000 } },
+            timeout: () => ({ emitWithAck: async (_event: string, request: { method: string }) => { emitted.push(request.method); return {}; } }) };
+        const invoke = async (method: string) => (await executeDaemonRpcLocally({
+            io: { sockets: { sockets: new Map([['socket', socket]]) } } as never,
+            request: { requestId: crypto.randomUUID(), targetSocketId: 'socket', method: `protected-session:${method}`, params: {}, timeoutMs: 1000 },
+            onResult: () => {}, deps: { allowed: (async () => true) as never, now: () => now },
+        })).refused;
+        const firstExecution = async () => (await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt;
+        await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: new Date() } });
+        try {
+            // Stopping a turn runs nothing new.
+            expect(await invoke('abort')).toBe(false);
+            expect(await firstExecution()).toBeNull();
+            expect(await invoke('steer')).toBe(true);
+            expect(await invoke('constructor')).toBe(true);
+            expect(await firstExecution()).toBeNull();
+            // Approving a tool lets it run, so an answer counts as execution.
+            expect(await invoke('permission')).toBe(false);
+            expect(await firstExecution()).not.toBeNull();
+            expect(await invoke('permission')).toBe(false);
+            await freezeWorkMachineExecution(db, original);
+            expect(await invoke('abort')).toBe(true);
+            expect(await invoke('permission')).toBe(true);
+            expect(emitted).toEqual(['protected-session:abort', 'protected-session:permission', 'protected-session:permission']);
+        } finally {
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
+        }
+    });
+
     it('blocks handoff until admitted connector work has a confirmed outcome', async () => {
         const requestId = crypto.randomUUID();
         const secondId = crypto.randomUUID();
