@@ -110,6 +110,20 @@ describe('work machine execution authority', () => {
         }
     });
 
+    it('allows read-only preview during drain without recording first execution, but refuses it when frozen', async () => {
+        const now = Date.now();
+        const socket = { id: 'reader', data: { workMachineExecution: { ...original, purpose: 'daemon', expiresAt: now + 60_000 } } };
+        await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: new Date() } });
+        try {
+            expect(await machineSockets.permitMachineDispatchSockets(db, accountId, machineId, [socket], now, true)).toEqual([socket]);
+            expect((await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt).toBeNull();
+            await freezeWorkMachineExecution(db, original);
+            expect(await machineSockets.permitMachineDispatchSockets(db, accountId, machineId, [socket], now, true)).toEqual([]);
+        } finally {
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
+        }
+    });
+
     it('blocks handoff until admitted connector work has a confirmed outcome', async () => {
         const requestId = crypto.randomUUID();
         const secondId = crypto.randomUUID();

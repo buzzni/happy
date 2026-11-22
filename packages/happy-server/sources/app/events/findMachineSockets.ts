@@ -2,7 +2,7 @@ import type { RemoteSocket, Server } from 'socket.io';
 import type { DefaultEventsMap } from 'socket.io/dist/typed-events';
 import type { Prisma } from '@prisma/client';
 import type { WorkMachineExecutionClaims } from '@/app/auth/workMachineExecutionToken';
-import { permitWorkMachineExecution } from '@/app/machine/workMachineExecution';
+import { lockWorkMachineExecution, permitWorkMachineExecution } from '@/app/machine/workMachineExecution';
 import { db } from '@/storage/db';
 
 /**
@@ -143,23 +143,25 @@ export async function permitMachineDispatchSockets<T extends { id: string; data?
     machineId: string,
     candidates: T[],
     now: number,
+    readOnly = false,
 ): Promise<T[]> {
     const sockets = await workMachineSocketCandidates(authorityDb, accountId, machineId, candidates, now);
     const target = newestMachineSocket(sockets);
     const claims = target?.data?.workMachineExecution as WorkMachineExecutionClaims | undefined;
     if (!target || !claims) return sockets;
-    return await permitWorkMachineExecution(authorityDb, claims, new Date(now)) ? [target] : [];
+    return await (readOnly ? lockWorkMachineExecution(authorityDb, claims) : permitWorkMachineExecution(authorityDb, claims, new Date(now))) ? [target] : [];
 }
 
 export async function findMachineSocketsForDispatch(
     io: Server,
     accountId: string,
     machineId: string,
+    readOnly = false,
 ): Promise<MachineSocketLookup<AnyRemoteSocket>> {
     const found = await findMachineSocketsIn(io as unknown as FetchSocketsIo<AnyRemoteSocket>, accountId, machineId);
     if (found.sockets.length === 0) return found;
     try {
-        return { ...found, sockets: await permitMachineDispatchSockets(db, accountId, machineId, found.sockets, Date.now()) };
+        return { ...found, sockets: await permitMachineDispatchSockets(db, accountId, machineId, found.sockets, Date.now(), readOnly) };
     } catch {
         return { sockets: [], degraded: true };
     }

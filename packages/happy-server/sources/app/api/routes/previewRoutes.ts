@@ -1316,6 +1316,7 @@ export function previewRoutes(app: Fastify) {
                 // relay timeout while a fresh daemon socket is already ready.
                 const { sockets: machineSockets, degraded } = await findMachineSocketsForDispatch(
                     eventRouter.server, claims.userId, params.machineId,
+                    ['GET', 'HEAD', 'OPTIONS'].includes(request.method),
                 );
                 const failureContext = {
                     method: request.method,
