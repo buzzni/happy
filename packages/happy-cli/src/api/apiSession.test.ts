@@ -2,7 +2,7 @@ import ts from 'typescript';
 import { readFileSync } from 'node:fs';
 import { createSessionScanner } from '@/claude/utils/sessionScanner';
 import { getProjectPath } from '@/claude/utils/path';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { configuration } from '@/configuration';
@@ -27,6 +27,7 @@ import { createCodexUsageEvent } from '@/usage/providerUsageAdapters';
 import { RECONNECT_NOT_READY_POLL_MS } from './reconnectCadence';
 import { TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
 import { RuntimeProducerGate } from '@/sessionDrain/runtimeProducerGate';
+import { WorkMachineRenewalError } from '@/daemon/workMachineCredential';
 
 const {
     mockIo,
@@ -3209,6 +3210,114 @@ describe('ApiSessionClient v3 messages API migration', () => {
             expect(onUserMessage).not.toHaveBeenCalled();
             expect((client as any).lastSeq).toBe(1);
             await client.close();
+        });
+
+        describe('stop record', () => {
+            // aplus specs/work-machine-migration requirement 6: the export signs what the session
+            // process itself recorded at exit, never the daemon's last (30 s throttled) cursor.
+            let home: string;
+            beforeEach(async () => { home = await mkdtemp(join(tmpdir(), 'wm-session-stop-')); });
+            afterEach(async () => { await rm(home, { recursive: true, force: true }); });
+
+            /** A protected client whose user messages go into a real loop queue. */
+            let signalListeners: Function[];
+            beforeEach(() => { signalListeners = process.listeners('SIGTERM'); });
+            const protectedLoop = (stopRecord: string, expiresIn = 300_000, renew?: () => Promise<{ token: string; expiresAt: number }>) => {
+                const credential = { token: 'wmx_session_for_tests', expiresAt: Date.now() + expiresIn };
+                const client = new ApiSessionClient(credential.token, session);
+                client.bindWorkMachineCredential({ sessionId: session.id, initial: credential, renew: renew ?? (async () => credential), stopRecord },
+                    () => {}, async () => {});
+                const queue = new MessageQueue2<string>(mode => mode);
+                client.configureInputQueue(queue, 'remote', false);
+                client.onUserMessage(message => queue.push(message.content.text, 'default', undefined, undefined, undefined, undefined, client.queueInput(message)));
+                (client as any).lastSeq = 10;
+                return { client, queue };
+            };
+            const text = (value: string) => ({ role: 'user', content: { type: 'text', text: value } });
+            const readStop = async (path: string) => JSON.parse(await readFile(path, 'utf8'));
+
+            it('records the cursor of a message a finished turn ran after the last throttled daemon write', async () => {
+                const stopRecord = join(home, 'work-machine-sessions', `${session.id}.json`);
+                const { client, queue } = protectedLoop(stopRecord);
+                serveRows([{ seq: 11, body: text('first') }, { seq: 12, body: text('second') }]);
+                await (client as any).fetchMessages();
+                await queue.waitForMessagesAndGetAsString();
+                client.keepAlive(true, 'remote');
+                client.keepAlive(false, 'remote');
+
+                await client.close();
+
+                expect(await readStop(stopRecord)).toEqual(expect.objectContaining({
+                    sessionId: session.id, cleanStop: true, lastProcessedSeq: 12, turnInFlight: false, inputSkipped: false,
+                }));
+            });
+
+            it('lowers the cursor below a message queued behind the running turn and records the turn in flight', async () => {
+                const stopRecord = join(home, 'work-machine-sessions', `${session.id}.json`);
+                const { client, queue } = protectedLoop(stopRecord);
+                serveRows([{ seq: 11, body: text('running') }]);
+                await (client as any).fetchMessages();
+                await queue.waitForMessagesAndGetAsString();
+                client.keepAlive(true, 'remote');
+                serveRows([{ seq: 11, body: text('running') }, { seq: 12, body: text('waiting') }]);
+                await (client as any).fetchMessages();
+
+                await client.close();
+
+                expect(await readStop(stopRecord)).toEqual(expect.objectContaining({ lastProcessedSeq: 11, turnInFlight: true }));
+            });
+
+            it('records a turn that was running when the process was told to stop, even if it ended before exit', async () => {
+                const stopRecord = join(home, 'work-machine-sessions', `${session.id}.json`);
+                const { client, queue } = protectedLoop(stopRecord);
+                serveRows([{ seq: 11, body: text('running') }]);
+                await (client as any).fetchMessages();
+                await queue.waitForMessagesAndGetAsString();
+                client.keepAlive(true, 'remote');
+                // The runner's own handler (runClaude/runCodex) is there in production; it aborts the turn on the way out.
+                const runnerHandler = () => client.keepAlive(false, 'remote');
+                process.on('SIGTERM', runnerHandler);
+                try {
+                    for (const listener of process.listeners('SIGTERM').filter(listener => !signalListeners.includes(listener))) {
+                        (listener as (signal: NodeJS.Signals) => void)('SIGTERM');
+                    }
+                } finally {
+                    process.off('SIGTERM', runnerHandler);
+                }
+                await client.close();
+
+                expect(await readStop(stopRecord)).toEqual(expect.objectContaining({ lastProcessedSeq: 11, turnInFlight: true }));
+                expect(process.listeners('SIGTERM')).toEqual(signalListeners);
+            });
+
+            it('records the turn a revoked (frozen) credential stopped', async () => {
+                const stopRecord = join(home, 'work-machine-sessions', `${session.id}.json`);
+                let revoke: (() => void) | undefined;
+                // Expiring within the refresh margin: the renewal starts at once and waits for the server.
+                const { client, queue } = protectedLoop(stopRecord, 60_000,
+                    () => new Promise((_, reject) => { revoke = () => reject(new WorkMachineRenewalError(true)); }));
+                serveRows([{ seq: 11, body: text('running') }]);
+                await (client as any).fetchMessages();
+                await queue.waitForMessagesAndGetAsString();
+                client.keepAlive(true, 'remote');
+                await waitForCheck(() => expect(revoke).toBeDefined());
+                revoke!();
+                await waitForCheck(() => expect((client as any).shutdownReceiveSeq).toBe(11));
+                client.keepAlive(false, 'remote');
+                await client.close();
+
+                expect(await readStop(stopRecord)).toEqual(expect.objectContaining({ lastProcessedSeq: 11, turnInFlight: true }));
+            });
+
+            it('removes the previous process record when it binds', async () => {
+                const stopRecord = join(home, 'work-machine-sessions', `${session.id}.json`);
+                await mkdir(join(home, 'work-machine-sessions'), { recursive: true });
+                await writeFile(stopRecord, '{}');
+                const { client } = protectedLoop(stopRecord);
+
+                await expect(readFile(stopRecord)).rejects.toMatchObject({ code: 'ENOENT' });
+                await client.close();
+            });
         });
 
         it('delivers a pushed message once the authorized read returns it', async () => {
