@@ -16,6 +16,9 @@ export type SessionFollowupExecutionError =
 
 type Result<T> = { ok: true; value: T } | { ok: false; error: SessionFollowupExecutionError };
 
+/** A follow-up claim lasts this long from the claim and is never extended. */
+export const SESSION_FOLLOWUP_CLAIM_MS = 90_000;
+
 const daemonProjectInclude = {
     project: { select: { config: true } },
 } as const;
@@ -168,7 +171,7 @@ export async function claimSessionFollowup(
         return { ok: false, error: 'claim-denied' };
     }
     const claimToken = randomBytes(32).toString('base64url');
-    const claimExpiresAt = new Date(now.getTime() + 90_000);
+    const claimExpiresAt = new Date(now.getTime() + SESSION_FOLLOWUP_CLAIM_MS);
     const changed = await tx.sessionFollowup.updateMany({
         where: {
             id: input.followupId,
