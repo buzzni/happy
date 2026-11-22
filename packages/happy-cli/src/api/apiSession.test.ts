@@ -3122,6 +3122,9 @@ describe('ApiSessionClient v3 messages API migration', () => {
         };
         const userMessage = { role: 'user', content: { type: 'text', text: 'sent while the generation is frozen' } };
         const sessionEvent = { role: 'agent', content: { type: 'event', id: 'event-2', data: { type: 'message', message: 'note' } } };
+        const fileEvent = { role: 'session', content: { type: 'session', data: {
+            id: 'file-event', time: 1000, role: 'user', ev: { t: 'file', ref: 'sessions/s/attachments/a.enc', name: 'a.png', size: 64, mimeType: 'image/png' },
+        } } };
         /** The server's durable rows; each read returns those after the requested cursor. */
         const serveRows = (rows: Array<{ seq: number; body: unknown }>) => mockAxiosGet.mockImplementation(async (_url: string, config: { params: { after_seq: number } }) => ({
             data: { hasMore: false, messages: rows.filter(row => row.seq > config.params.after_seq).map(row => ({
@@ -3132,28 +3135,71 @@ describe('ApiSessionClient v3 messages API migration', () => {
 
         // aplus specs/work-machine-migration plan 5.1: drain refuses new turns. A still-running
         // generation reads while draining, so a fetched user message must not start a turn here.
-        it('leaves a fetched user message on the server while the permit to start a turn is refused', async () => {
+        it('leaves a fetched user message and its attachments on the server while the permit to start a turn is refused', async () => {
             const permitTurn = vi.fn<() => Promise<void>>()
                 .mockRejectedValueOnce(new Error('Work machine session execution was not authorized'))
                 .mockResolvedValue(undefined);
             const { client, onUserMessage } = bound(permitTurn);
             const onOtherMessage = vi.fn();
+            const onFileEvent = vi.fn();
             client.on('message', onOtherMessage);
-            serveRows([{ seq: 2, body: sessionEvent }, { seq: 3, body: userMessage }]);
+            client.onFileEvent(onFileEvent);
+            serveRows([{ seq: 2, body: sessionEvent }, { seq: 3, body: fileEvent }, { seq: 4, body: userMessage }]);
 
             await (client as any).fetchMessages();
 
             expect(onOtherMessage).toHaveBeenCalledTimes(1);
+            expect(onFileEvent).not.toHaveBeenCalled();
             expect(onUserMessage).not.toHaveBeenCalled();
             expect((client as any).lastSeq).toBe(2);
 
             await (client as any).fetchMessages();
 
             expect(permitTurn).toHaveBeenCalledTimes(2);
+            expect(onFileEvent).toHaveBeenCalledTimes(1);
             expect(onUserMessage).toHaveBeenCalledTimes(1);
-            expect(onUserMessage).toHaveBeenCalledWith(expect.objectContaining({ serverSeq: 3 }));
+            expect(onUserMessage).toHaveBeenCalledWith(expect.objectContaining({ serverSeq: 4 }));
             expect(onOtherMessage).toHaveBeenCalledTimes(1);
+            expect((client as any).lastSeq).toBe(4);
+            await client.close();
+        });
+
+        it('keeps an attachment whose message has not arrived yet on the server, then delivers both', async () => {
+            const permitTurn = vi.fn(async () => {});
+            const { client, onUserMessage } = bound(permitTurn);
+            const onFileEvent = vi.fn();
+            client.onFileEvent(onFileEvent);
+            serveRows([{ seq: 2, body: fileEvent }]);
+
+            await (client as any).fetchMessages();
+
+            expect(onFileEvent).not.toHaveBeenCalled();
+            expect((client as any).lastSeq).toBe(1);
+
+            serveRows([{ seq: 2, body: fileEvent }, { seq: 3, body: userMessage }]);
+            await (client as any).fetchMessages();
+
+            expect(onFileEvent).toHaveBeenCalledTimes(1);
+            expect(onUserMessage).toHaveBeenCalledTimes(1);
             expect((client as any).lastSeq).toBe(3);
+            await client.close();
+        });
+
+        it('asks for the permit for an attachment followed by other rows and keeps both on refusal', async () => {
+            const permitTurn = vi.fn<() => Promise<void>>().mockRejectedValue(new Error('Work machine session execution was not authorized'));
+            const { client } = bound(permitTurn);
+            const onOtherMessage = vi.fn();
+            const onFileEvent = vi.fn();
+            client.on('message', onOtherMessage);
+            client.onFileEvent(onFileEvent);
+            serveRows([{ seq: 2, body: fileEvent }, { seq: 3, body: sessionEvent }]);
+
+            await (client as any).fetchMessages();
+
+            expect(permitTurn).toHaveBeenCalledTimes(1);
+            expect(onFileEvent).not.toHaveBeenCalled();
+            expect(onOtherMessage).not.toHaveBeenCalled();
+            expect((client as any).lastSeq).toBe(1);
             await client.close();
         });
 

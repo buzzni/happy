@@ -1284,8 +1284,11 @@ export class ApiSessionClient extends EventEmitter {
         // aplus specs/work-machine-migration plan 5.1: drain refuses new turns but still lets the
         // generation read. A work machine session asks once per catch-up before a user message can
         // start a turn; refused, that message and everything after it stay for the next generation.
+        // File events carry the next message's attachments, so they wait for that decision too: held
+        // until the next row, never past the end of a catch-up.
         let turnPermitted = !this.permitWorkMachineTurn;
         let turnRefused = false;
+        const heldFileEvents: Array<{ body: unknown; id: string; seq: number }> = [];
         while (true) {
             const response = await axios.get<V3GetSessionMessagesResponse>(
                 `${configuration.serverUrl}/v3/sessions/${encodeURIComponent(this.sessionId)}/messages`,
@@ -1331,7 +1334,11 @@ export class ApiSessionClient extends EventEmitter {
 
                 try {
                     const body = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(message.content.c));
-                    if (!turnPermitted && UserMessageSchema.safeParse(body).success) {
+                    if (!turnPermitted && FileEventMessageSchema.safeParse(body).success) {
+                        heldFileEvents.push({ body, id: message.id, seq: message.seq });
+                        continue;
+                    }
+                    if (!turnPermitted && (heldFileEvents.length > 0 || UserMessageSchema.safeParse(body).success)) {
                         turnPermitted = await this.permitWorkMachineTurn!().then(() => true, () => false);
                         if (this.shutdownReceiveSeq !== null) return;
                         if (!turnPermitted) {
@@ -1339,11 +1346,12 @@ export class ApiSessionClient extends EventEmitter {
                                 sessionId: this.sessionId,
                                 seq: message.seq,
                             });
-                            maxSeq = message.seq - 1;
+                            maxSeq = (heldFileEvents[0]?.seq ?? message.seq) - 1;
                             turnRefused = true;
                             break;
                         }
                     }
+                    for (const held of heldFileEvents.splice(0)) this.deliverInput(() => this.routeIncomingMessage(held.body, held.id, held.seq));
                     this.deliverInput(() => this.routeIncomingMessage(body, message.id, message.seq));
                 } catch (error) {
                     logger.debug('[API] Failed to decrypt fetched message', {
@@ -1354,7 +1362,7 @@ export class ApiSessionClient extends EventEmitter {
                 }
             }
 
-            this.lastSeq = Math.max(this.lastSeq, maxSeq);
+            this.lastSeq = Math.max(this.lastSeq, heldFileEvents.length > 0 ? heldFileEvents[0].seq - 1 : maxSeq);
             if (turnRefused) break;
             const hasMore = !!response.data.hasMore;
             if (hasMore && maxSeq === afterSeq) {
