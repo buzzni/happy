@@ -910,6 +910,36 @@ describe('work machine execution authority', () => {
             expect((await readMcpScope({ ...mcpScopePayload, executionToken: daemonToken })).statusCode).toBe(403);
             expect((await readMcpScope(mcpScopePayload, { ...mcpScopePayload, sessionId: 'other-session' })).statusCode).toBe(403);
             expect((await readMcpScope(mcpScopePayload)).json()).toEqual(original);
+            const readDaemonScope = (executionToken: string, { asserted = executionToken, target = machineId,
+                op = 'work-machine-daemon-execution-scope' } = {}) => app.inject({
+                method: 'POST', url: `/v1/work-machines/${target}/daemon-execution-scope`, payload: { executionToken },
+                headers: {
+                    authorization: `Bearer ${bearer}`,
+                    'x-happy-control-assertion': proof({ executionToken: asserted }, op, target),
+                },
+            });
+            const mintDaemon = (claims: typeof original) => issuer.mint({ ...claims, purpose: 'daemon', expiresAt }, Date.now());
+            const daemonScope = await readDaemonScope(daemonToken);
+            expect(daemonScope.statusCode).toBe(200);
+            expect(daemonScope.json()).toEqual(original);
+            expect((await readDaemonScope(sessionToken)).statusCode).toBe(403);
+            expect((await readDaemonScope(daemonToken, { asserted: sessionToken })).statusCode).toBe(403);
+            expect((await readDaemonScope(daemonToken, { op: 'work-machine-mcp-execution-scope' })).statusCode).toBe(403);
+            expect((await readDaemonScope(daemonToken, { target: 'ordinary-machine' })).statusCode).toBe(403);
+            expect((await readDaemonScope(await mintDaemon({ ...original, deviceId: 'other-pc' }))).statusCode).toBe(403);
+            expect((await readDaemonScope(await mintDaemon({ ...original, generation: 2 }))).statusCode).toBe(403);
+            // Another account's current daemon credential, presented with this account's bearer.
+            const foreign = { accountId: 'foreign-account', machineId: 'foreign-machine', deviceId: 'foreign-pc', generation: 1 };
+            await db.account.create({ data: { id: foreign.accountId, publicKey: foreign.accountId } });
+            await db.machine.create({ data: { id: foreign.machineId, accountId: foreign.accountId, metadata: 'encrypted' } });
+            await db.workMachineExecution.create({ data: foreign });
+            expect((await readDaemonScope(await mintDaemon(foreign), { target: foreign.machineId })).statusCode).toBe(403);
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: new Date() } });
+            try {
+                expect((await readDaemonScope(daemonToken)).json()).toEqual(original);
+            } finally {
+                await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
+            }
             const call = { ...device, accountId, requestId: '68561c76-194d-4c96-858f-b04567db3221' };
             const signedCall = (action: 'admit' | 'finish', assertion?: string, payload = call) => app.inject({
                 method: 'POST', url: `/v1/work-machines/${machineId}/mcp-${action}`, payload,
@@ -924,6 +954,7 @@ describe('work machine execution authority', () => {
             expect(await freezeWorkMachineExecution(db, original)).toBe(true);
             expect((await mintState('ordinary-machine')).json()).toEqual({ fenced: true });
             expect((await readMcpScope(mcpScopePayload)).statusCode).toBe(403);
+            expect((await readDaemonScope(daemonToken)).statusCode).toBe(403);
             expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(false);
             expect((await signedCall('finish', proof(call, 'work-machine-mcp-admit'))).statusCode).toBe(403);
             expect((await signedCall('finish', proof(call, 'work-machine-mcp-finish'))).statusCode).toBe(204);

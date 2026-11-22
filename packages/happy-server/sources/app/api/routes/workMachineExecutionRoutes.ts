@@ -6,10 +6,10 @@ import type { WorkMachineExecutionClaims } from '@/app/auth/workMachineExecution
 import { requireAccountPrincipal } from '@/app/api/utils/enableAuthentication';
 import type { Fastify } from '@/app/api/types';
 import {
-    admitWorkMachineMcpCall, authorizeWorkMachineSession, drainWorkMachineExecution, enrollWorkMachineExecution,
-    finishWorkMachineMcpCall, freezeDrainedWorkMachineExecution, handoffWorkMachineExecution, listOpenWorkMachineAutomationRuns,
-    permitWorkMachineExecution,
-    reconcileWorkMachineMcpCall, redeemWorkMachineRenewal, resumeWorkMachineExecution, type WorkMachineHandoff,
+    admitWorkMachineMcpCall, authorizeWorkMachineExecution, authorizeWorkMachineSession, drainWorkMachineExecution,
+    enrollWorkMachineExecution, finishWorkMachineMcpCall, freezeDrainedWorkMachineExecution, handoffWorkMachineExecution,
+    listOpenWorkMachineAutomationRuns, permitWorkMachineExecution, reconcileWorkMachineMcpCall, redeemWorkMachineRenewal,
+    resumeWorkMachineExecution, type WorkMachineHandoff,
 } from '@/app/machine/workMachineExecution';
 import { decodeMachineDataKeyEnvelope, MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH } from '@/app/machine/machineDataKeyEnvelope';
 import { buildUpdateMachineUpdate, eventRouter } from '@/app/events/eventRouter';
@@ -174,6 +174,29 @@ export function workMachineExecutionRoutes(app: Fastify, getVerifier: () => Cont
         if (!claims || claims.purpose !== 'session' || claims.accountId !== request.userId
             || claims.machineId !== machineId || claims.sessionId !== sessionId
             || !await authorizeWorkMachineSession(db, claims)) return denied();
+        const { accountId, deviceId, generation } = claims;
+        return reply.header('Cache-Control', 'no-store').send({ accountId, machineId, deviceId, generation });
+    });
+
+    // Studio checks a daemon credential presented to it here: the current
+    // device and generation of this machine, draining included, not frozen.
+    app.post('/v1/work-machines/:machineId/daemon-execution-scope', {
+        preHandler: [app.authenticate, requireAccountPrincipal],
+        schema: {
+            params: z.object({ machineId: identifier }),
+            body: z.object({ executionToken: z.string().startsWith('wmx_').min(5).max(4096) }).strict(),
+        },
+        bodyLimit: 5_120,
+    }, async (request, reply) => {
+        const { machineId } = request.params;
+        const now = Date.now();
+        const denied = () => reply.code(403).send({ error: 'Work machine daemon scope not authorized' });
+        if (!verifiedOperation(request.headers, machineId, 'work-machine-daemon-execution-scope', request.body, now)) return denied();
+        const issuer = auth.workMachineExecutionIssuer;
+        if (!issuer) return reply.code(503).send({ error: 'Work machine credentials unavailable' });
+        const claims = await issuer.verify(request.body.executionToken, 'daemon', now);
+        if (!claims || claims.purpose !== 'daemon' || claims.accountId !== request.userId || claims.machineId !== machineId
+            || !await authorizeWorkMachineExecution(db, claims)) return denied();
         const { accountId, deviceId, generation } = claims;
         return reply.header('Cache-Control', 'no-store').send({ accountId, machineId, deviceId, generation });
     });

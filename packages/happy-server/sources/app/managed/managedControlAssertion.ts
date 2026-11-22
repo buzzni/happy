@@ -41,6 +41,7 @@ export type ControlOperation =
     | 'work-machine-mcp-admit'
     | 'work-machine-mcp-finish'
     | 'work-machine-mcp-execution-scope'
+    | 'work-machine-daemon-execution-scope'
     | 'work-machine-mcp-mint-state'
     | 'work-machine-enroll'
     | 'work-machine-drain'
@@ -135,6 +136,7 @@ export const CONTROL_OPERATIONS: readonly ControlOperation[] = [
     'work-machine-mcp-admit',
     'work-machine-mcp-finish',
     'work-machine-mcp-execution-scope',
+    'work-machine-daemon-execution-scope',
     'work-machine-mcp-mint-state',
     'work-machine-enroll',
     'work-machine-drain', 'work-machine-freeze', 'work-machine-resume',
