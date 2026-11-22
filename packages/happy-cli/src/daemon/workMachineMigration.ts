@@ -164,13 +164,8 @@ export async function createWorkMachineTargetApproval(input: {
     }
 }
 
-export async function exportWorkMachine(input: TransferEndpoint & {
-    claudeConfigDir: string;
-    codexHome: string;
-    /** Tests only; the contract is 8 MiB. */
-    partSize?: number;
-}): Promise<{ manifestSha256: string; totalBytes: number; parts: number }> {
-    const client = openWorkMachineTransfer(input);
+/** The Studio plan, checked against this home's execution binding: this must be its source. */
+async function sourcePlan(client: ReturnType<typeof openWorkMachineTransfer>, input: TransferEndpoint) {
     const plan = await client.plan();
     const binding = await readWorkMachineExecutionBinding(input.home);
     if (plan.jobId !== input.jobId || !binding || binding.machineId !== plan.machineId || binding.generation !== plan.generation) {
@@ -181,6 +176,17 @@ export async function exportWorkMachine(input: TransferEndpoint & {
         || approval.sourceDeviceId !== binding.deviceId) {
         throw new Error('The target approval in the plan is for a different job, machine, generation or source device');
     }
+    return { plan, binding, approval };
+}
+
+export async function exportWorkMachine(input: TransferEndpoint & {
+    claudeConfigDir: string;
+    codexHome: string;
+    /** Tests only; the contract is 8 MiB. */
+    partSize?: number;
+}): Promise<{ manifestSha256: string; totalBytes: number; parts: number }> {
+    const client = openWorkMachineTransfer(input);
+    const { plan, binding, approval } = await sourcePlan(client, input);
 
     const directory = await jobDirectory(input.home, input.jobId, 'export');
     const sealed = join(directory, 'transfer.bin');
