@@ -35,6 +35,8 @@ import {
 import { createWorkMachineExecutionTokenIssuer, type WorkMachineExecutionClaims } from '@/app/auth/workMachineExecutionToken';
 import * as machineSockets from '@/app/events/findMachineSockets';
 import { eventRouter } from '@/app/events/eventRouter';
+import { SCRIPT_CLAIM_LEASE_MS } from '@/app/automation/scriptInvocationService';
+import { SESSION_FOLLOWUP_CLAIM_MS } from '@/app/automation/sessionFollowupExecutionService';
 import * as authority from './workMachineExecution';
 import {
     authorizeWorkMachineExecution,
@@ -451,6 +453,96 @@ describe('work machine execution authority', () => {
         }
     }, 15_000);
 
+    it('lists the unfinished automation claims of this machine and refuses replace until each one ends', async () => {
+        const project = await db.project.create({ data: { accountId, name: 'open-claims' } });
+        const keys = {
+            payloadCiphertext: new Uint8Array(1), viewerKeyId: 'viewer', viewerKeyVersion: 1,
+            viewerKeyEnvelope: new Uint8Array(1), machineKeyVersion: 1, machineKeyEnvelope: new Uint8Array(1),
+        };
+        const automation = await db.automation.create({ data: {
+            projectId: project.id, ownerAccountId: accountId, machineAccountId: accountId, machineId, payloadVersion: 3, ...keys,
+        } });
+        await db.scriptArtifact.create({ data: { id: 'open-claims-artifact', projectId: project.id, digest: 'digest', encrypted: {} } });
+        await db.scriptAutomationRevision.create({ data: {
+            automationId: automation.id, revision: 1, artifactId: 'open-claims-artifact', digest: 'digest',
+            payloadCiphertext: 'encrypted', admission: {}, ready: true,
+        } });
+        const now = Date.now();
+        const at = (offset: number) => new Date(now + offset);
+        const run = (id: string, data: object = {}) => db.automationRun.create({ data: {
+            id, automationId: automation.id, generation: 1, scheduledFor: at(0), machineAccountId: accountId, machineId,
+            status: 'CLAIMED', claimTokenHash: createHash('sha256').update(id).digest(), claimExpiresAt: at(60_000),
+            claimedAt: at(-3_000), ...data,
+        } });
+        await run('claimed-run');
+        await run('running-run', { status: 'RUNNING', claimedAt: at(-5_000), claimExpiresAt: at(-1_000), runLeaseExpiresAt: at(60_000) });
+        await run('lapsed-run', { status: 'RUNNING', runLeaseExpiresAt: at(-1) });
+        await run('expired-claim', { claimExpiresAt: at(-1) });
+        await run('finished-run', { status: 'COMPLETED' });
+        await run('other-machine-run', { machineId: 'ordinary-machine' });
+        const script = (id: string, data: object = {}, target = machineId) => db.scriptInvocation.create({ data: {
+            id, automationId: automation.id, revision: 1, generation: 1, trigger: 'MANUAL', requestedBy: accountId,
+            idempotencyKey: id, bodyHash: 'hash', snapshot: { machineId: target, machineAccountId: accountId },
+            inputCiphertext: 'encrypted', createdAt: now - 90_000, ...data,
+        } });
+        await script('claimed-script', { status: 'CLAIMED', claimHash: 'claimed', leaseExpiresAt: now + 100_000 });
+        await script('running-script', { status: 'RUNNING', claimHash: 'running', startedAt: now - 4_000, leaseExpiresAt: now + 60_000 });
+        await script('lapsed-script', { status: 'RUNNING', claimHash: 'lapsed', startedAt: now - 400_000, leaseExpiresAt: now - 1 });
+        await script('queued-script');
+        await script('other-machine-script', { status: 'CLAIMED', claimHash: 'other', leaseExpiresAt: now + 60_000 }, 'ordinary-machine');
+        const followup = (id: string, data: object = {}) => db.sessionFollowup.create({ data: {
+            id, projectId: project.id, ownerAccountId: accountId, machineAccountId: accountId, machineId, sessionId: `${id}-session`,
+            ...keys, totalRounds: 3, currentRound: 1, responseBoundarySeq: 0, lastObservedSeq: 0, ...data,
+        } });
+        const claim = (id: string, expiresIn: number) => ({
+            claimTokenHash: createHash('sha256').update(id).digest(), claimExpiresAt: at(expiresIn), claimedGeneration: 1, claimedStep: 1,
+        });
+        await followup('claimed-followup', claim('claimed-followup', 30_000));
+        await followup('unclaimed-followup');
+        await followup('expired-followup', claim('expired-followup', -1));
+        await followup('other-machine-followup', { ...claim('other-machine-followup', 30_000), machineId: 'ordinary-machine' });
+        try {
+            expect(await authority.listOpenWorkMachineAutomationRuns(db, { accountId, machineId }, at(0))).toEqual([
+                { kind: 'session-followup', id: 'claimed-followup', claimedAt: at(30_000 - SESSION_FOLLOWUP_CLAIM_MS) },
+                { kind: 'script-invocation', id: 'claimed-script', claimedAt: at(100_000 - SCRIPT_CLAIM_LEASE_MS) },
+                { kind: 'automation-run', id: 'running-run', claimedAt: at(-5_000) },
+                { kind: 'script-invocation', id: 'running-script', claimedAt: at(-4_000) },
+                { kind: 'automation-run', id: 'claimed-run', claimedAt: at(-3_000) },
+            ]);
+            expect(await authority.listOpenWorkMachineAutomationRuns(db, { accountId, machineId: 'ordinary-machine' }, at(0)))
+                .toHaveLength(3);
+
+            expect(await freezeWorkMachineExecution(db, original)).toBe(true);
+            const finishes = [
+                () => db.sessionFollowup.update({ where: { id: 'claimed-followup' }, data: { claimTokenHash: null, claimExpiresAt: null } }),
+                () => db.scriptInvocation.update({ where: { id: 'claimed-script' }, data: { status: 'CANCELLED', completedAt: now } }),
+                () => db.automationRun.update({ where: { id: 'running-run' }, data: { status: 'COMPLETED', completedAt: at(0) } }),
+                () => db.scriptInvocation.update({ where: { id: 'running-script' }, data: { status: 'COMPLETED', completedAt: now } }),
+                () => db.automationRun.update({ where: { id: 'claimed-run' }, data: { status: 'EXPIRED', completedAt: at(0) } }),
+            ];
+            for (const finish of finishes) {
+                expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(false);
+                expect(await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } }))
+                    .toMatchObject({ deviceId: original.deviceId, generation: 1 });
+                await finish();
+            }
+            expect(await authority.listOpenWorkMachineAutomationRuns(db, { accountId, machineId }, new Date())).toEqual([]);
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
+
+            await db.automationRun.createMany({ data: Array.from({ length: 51 }, (_, index) => ({
+                id: `many-${index}`, automationId: automation.id, generation: 1, scheduledFor: at(0), machineAccountId: accountId,
+                machineId, status: 'CLAIMED' as const, claimTokenHash: createHash('sha256').update(`many-${index}`).digest(),
+                claimExpiresAt: at(60_000), claimedAt: at(index - 100),
+            })) });
+            const many = await authority.listOpenWorkMachineAutomationRuns(db, { accountId, machineId }, at(0));
+            expect(many).toHaveLength(50);
+            expect(many[0].id).toBe('many-0');
+            expect(many[49].id).toBe('many-49');
+        } finally {
+            await db.project.delete({ where: { id: project.id } });
+        }
+    });
+
     it('leaves scheduled and script automation work pending on a draining or frozen work machine', async () => {
         const priorSecret = process.env.HANDY_MASTER_SECRET;
         process.env.HANDY_MASTER_SECRET = 'work-machine-loopback-test-only';
@@ -591,7 +683,8 @@ describe('work machine execution authority', () => {
             const at = (generation: number, deviceId = source.id) => ({ deviceId, generation });
 
             expect(await state()).toEqual({
-                mode: 'device', deviceId: source.id, generation: 1, frozen: false, draining: false, firstExecution: false, openMcpCalls: [],
+                mode: 'device', deviceId: source.id, generation: 1, frozen: false, draining: false, firstExecution: false,
+                openMcpCalls: [], openAutomationRuns: [],
             });
             const unsigned = await app.inject({
                 method: 'POST', url: `/v1/work-machines/${migrating}/execution-drain`, payload: at(1),
@@ -638,6 +731,26 @@ describe('work machine execution authority', () => {
             expect((await control('mcp-reconcile', { ...at(1), requestId: crypto.randomUUID() })).statusCode).toBe(404);
             expect((await state()).openMcpCalls).toEqual([]);
 
+            // A scheduled run the old generation claimed before the drain also holds the handoff.
+            const project = await db.project.create({ data: { accountId, name: 'migrating-automation' } });
+            const automation = await db.automation.create({ data: {
+                projectId: project.id, ownerAccountId: accountId, machineAccountId: accountId, machineId: migrating,
+                payloadCiphertext: new Uint8Array(1), viewerKeyId: 'viewer', viewerKeyVersion: 1,
+                viewerKeyEnvelope: new Uint8Array(1), machineKeyVersion: 1, machineKeyEnvelope: new Uint8Array(1),
+            } });
+            const claimedAt = new Date(Date.now() - 1_000);
+            const openRun = await db.automationRun.create({ data: {
+                automationId: automation.id, generation: 1, scheduledFor: claimedAt, machineAccountId: accountId, machineId: migrating,
+                status: 'RUNNING', claimTokenHash: new Uint8Array(32).fill(9), claimExpiresAt: claimedAt, claimedAt,
+                startedAt: claimedAt, runLeaseExpiresAt: new Date(Date.now() + 300_000),
+            } });
+            expect((await state()).openAutomationRuns)
+                .toEqual([{ kind: 'automation-run', id: openRun.id, claimedAt: claimedAt.getTime() }]);
+            expect((await control('replace', replaceBody(1, nextKey))).statusCode).toBe(409);
+            expect((await db.workMachineExecution.findUniqueOrThrow({ where: { machineId: migrating } })).deviceId).toBe(source.id);
+            await db.automationRun.update({ where: { id: openRun.id }, data: { status: 'COMPLETED', completedAt: new Date() } });
+            expect((await state()).openAutomationRuns).toEqual([]);
+
             expect((await control('replace', replaceBody(1, nextKey, source))).statusCode).toBe(403);
             expect((await control('replace', replaceBody(1, nextKey, target, envelope(3)))).statusCode).toBe(403);
             expect((await control('replace', { ...replaceBody(1, nextKey), dataEncryptionKey: 'not-an-envelope' })).statusCode).toBe(400);
@@ -654,7 +767,8 @@ describe('work machine execution authority', () => {
             expect(after.metadataVersion).toBe(before.metadataVersion + 1);
             expect(after.daemonStateVersion).toBe(before.daemonStateVersion + 1);
             expect(await state()).toEqual({
-                mode: 'device', deviceId: target.id, generation: 2, frozen: false, draining: false, firstExecution: false, openMcpCalls: [],
+                mode: 'device', deviceId: target.id, generation: 2, frozen: false, draining: false, firstExecution: false,
+                openMcpCalls: [], openAutomationRuns: [],
             });
             expect(await permit(sourceToken)).toBe(403);
 
@@ -732,7 +846,7 @@ describe('work machine execution authority', () => {
             expect((await state(machineId, stateProof(machineId))).json())
                 .toEqual({
                     mode: 'device', deviceId: original.deviceId, generation: 1,
-                    frozen: false, draining: false, firstExecution: false, openMcpCalls: [],
+                    frozen: false, draining: false, firstExecution: false, openMcpCalls: [], openAutomationRuns: [],
                 });
             const mintState = (targetMachineId: string, signedTarget: string = targetMachineId) => app.inject({
                 method: 'POST',
@@ -817,7 +931,7 @@ describe('work machine execution authority', () => {
             expect((await state(machineId, stateProof(machineId))).json())
                 .toEqual({
                     mode: 'device', deviceId: original.deviceId, generation: 1,
-                    frozen: true, draining: false, firstExecution: true, openMcpCalls: [],
+                    frozen: true, draining: false, firstExecution: true, openMcpCalls: [], openAutomationRuns: [],
                 });
             expect((await readMachine(machineId)).statusCode).toBe(403);
             expect((await machineIdentity(machineId, daemonToken)).statusCode).toBe(403);
@@ -1094,6 +1208,9 @@ describe('work machine execution authority', () => {
             await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
             expect(await current('automation-run-heartbeat', runs[1])).toEqual({ ok: false, error: 'forbidden' });
             expect(await report(current, runs[1], null, 'report-frozen')).toEqual({ ok: false, error: 'forbidden' });
+            // The handoff waits for the run's lease, which the frozen generation can no longer extend.
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(false);
+            await db.automationRun.update({ where: { id: runs[1].runId }, data: { runLeaseExpiresAt: new Date(Date.now() - 1) } });
             expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
             expect(await report(current, runs[1], null, 'report-old-generation')).toEqual({ ok: false, error: 'forbidden' });
             expect((await db.automationRun.findUniqueOrThrow({ where: { id: runs[1].runId } })).status).toBe('RUNNING');
@@ -1182,6 +1299,9 @@ describe('work machine execution authority', () => {
             await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
             expect((await heartbeat(current, 'device-running-frozen', frozenToken)).statusCode).toBe(403);
             expect((await abandon(current, 'device-running-frozen', frozenToken)).statusCode).toBe(403);
+            // The handoff waits for the run's lease, which the frozen generation can no longer extend.
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(false);
+            await db.scriptInvocation.update({ where: { id: 'device-running-frozen' }, data: { leaseExpiresAt: Date.now() - 1 } });
             expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
             expect((await abandon(current, 'device-running-frozen', frozenToken)).statusCode).toBe(403);
             expect((await db.scriptInvocation.findUniqueOrThrow({ where: { id: 'device-running-frozen' } })).status).toBe('RUNNING');

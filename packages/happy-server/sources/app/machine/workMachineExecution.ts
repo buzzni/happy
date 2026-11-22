@@ -1,7 +1,10 @@
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { machineDataKeyEnvelopesEqual } from '@/app/machine/machineDataKeyEnvelope';
+import { SCRIPT_CLAIM_LEASE_MS } from '@/app/automation/scriptInvocationService';
+import { SESSION_FOLLOWUP_CLAIM_MS } from '@/app/automation/sessionFollowupExecutionService';
 
 type ExecutionDb = Pick<Prisma.TransactionClient, 'workMachineExecution' | '$queryRaw'>;
+type AutomationClaimDb = Pick<Prisma.TransactionClient, 'automationRun' | 'scriptInvocation' | 'sessionFollowup'>;
 
 /** Identity from a verified device grant. Never construct it from a request body. */
 export interface WorkMachineDeviceGrant {
@@ -188,12 +191,84 @@ export async function freezeWorkMachineExecution(
     return changed.count === 1;
 }
 
-/** The caller commits key and device changes in the same authority transaction. */
+export interface OpenWorkMachineAutomationRun {
+    kind: 'automation-run' | 'script-invocation' | 'session-followup';
+    id: string;
+    claimedAt: Date;
+}
+
+/**
+ * Scheduled runs, script runs and session follow-ups this machine claimed
+ * whose claim or run lease is still live, oldest claim first. A lapsed lease
+ * counts as ended, as it does for every other claim check, so a daemon that
+ * died mid-run cannot hold a handoff forever. Script and follow-up rows keep
+ * no claim time: it is derived from the fixed claim lifetime, and a started
+ * script reports its start.
+ */
+export async function listOpenWorkMachineAutomationRuns(
+    db: AutomationClaimDb,
+    { accountId, machineId }: Pick<WorkMachineDeviceGrant, 'accountId' | 'machineId'>,
+    now: Date,
+    limit = 50,
+): Promise<OpenWorkMachineAutomationRun[]> {
+    // One query after another: this also runs on an interactive transaction client.
+    const runs = await db.automationRun.findMany({
+        where: { machineAccountId: accountId, machineId, OR: [
+            { status: 'CLAIMED', claimExpiresAt: { gte: now } },
+            { status: 'RUNNING', runLeaseExpiresAt: { gte: now } },
+        ] },
+        orderBy: { claimedAt: 'asc' }, take: limit, select: { id: true, claimedAt: true },
+    });
+    const scripts = await db.scriptInvocation.findMany({
+        where: {
+            status: { in: ['CLAIMED', 'RUNNING'] }, leaseExpiresAt: { gt: now.getTime() },
+            AND: [
+                { snapshot: { path: ['machineAccountId'], equals: accountId } },
+                { snapshot: { path: ['machineId'], equals: machineId } },
+            ],
+        },
+        orderBy: { createdAt: 'asc' }, take: limit, select: { id: true, status: true, startedAt: true, leaseExpiresAt: true },
+    });
+    const followups = await db.sessionFollowup.findMany({
+        where: {
+            machineAccountId: accountId, machineId, deletedAt: null, status: { in: ['WAITING', 'DELIVERY_PENDING'] },
+            claimTokenHash: { not: null }, claimExpiresAt: { gte: now },
+        },
+        orderBy: { claimExpiresAt: 'asc' }, take: limit, select: { id: true, claimExpiresAt: true },
+    });
+    return [
+        ...runs.map(run => ({ kind: 'automation-run' as const, id: run.id, claimedAt: run.claimedAt })),
+        ...scripts.map(script => ({
+            kind: 'script-invocation' as const, id: script.id,
+            claimedAt: new Date(script.status === 'RUNNING' && script.startedAt !== null
+                ? script.startedAt : script.leaseExpiresAt! - SCRIPT_CLAIM_LEASE_MS),
+        })),
+        ...followups.map(followup => ({
+            kind: 'session-followup' as const, id: followup.id,
+            claimedAt: new Date(followup.claimExpiresAt!.getTime() - SESSION_FOLLOWUP_CLAIM_MS),
+        })),
+    ].sort((a, b) => a.claimedAt.getTime() - b.claimedAt.getTime()).slice(0, limit);
+}
+
+/**
+ * The caller commits key and device changes in the same authority transaction.
+ * The frozen authority row is locked first: claims and heartbeats lock it too
+ * and stop at the freeze, so no claim of this generation can start or extend
+ * its lease while the open work is checked.
+ */
 export async function replaceWorkMachineExecution(
-    db: ExecutionDb,
+    db: ExecutionDb & AutomationClaimDb,
     original: WorkMachineDeviceGrant,
     replacementDeviceId: string,
 ): Promise<boolean> {
+    const frozen = await db.$queryRaw<{ machineId: string }[]>`
+        SELECT "machineId" FROM "WorkMachineExecution"
+        WHERE "machineId" = ${original.machineId} AND "accountId" = ${original.accountId}
+          AND "deviceId" = ${original.deviceId} AND "generation" = ${original.generation}
+          AND "frozenAt" IS NOT NULL
+        FOR UPDATE
+    `;
+    if (frozen.length !== 1 || (await listOpenWorkMachineAutomationRuns(db, original, new Date(), 1)).length > 0) return false;
     const changed = await db.workMachineExecution.updateMany({
         where: { ...matchGrant(original), frozenAt: { not: null }, mcpCalls: { none: { completedAt: null } } },
         data: {

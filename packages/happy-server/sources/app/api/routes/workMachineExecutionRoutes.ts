@@ -7,7 +7,8 @@ import { requireAccountPrincipal } from '@/app/api/utils/enableAuthentication';
 import type { Fastify } from '@/app/api/types';
 import {
     admitWorkMachineMcpCall, authorizeWorkMachineSession, drainWorkMachineExecution, enrollWorkMachineExecution,
-    finishWorkMachineMcpCall, freezeDrainedWorkMachineExecution, handoffWorkMachineExecution, permitWorkMachineExecution,
+    finishWorkMachineMcpCall, freezeDrainedWorkMachineExecution, handoffWorkMachineExecution, listOpenWorkMachineAutomationRuns,
+    permitWorkMachineExecution,
     reconcileWorkMachineMcpCall, redeemWorkMachineRenewal, resumeWorkMachineExecution, type WorkMachineHandoff,
 } from '@/app/machine/workMachineExecution';
 import { decodeMachineDataKeyEnvelope, MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH } from '@/app/machine/machineDataKeyEnvelope';
@@ -26,6 +27,7 @@ const grantLifetimeMs = 5 * 60_000;
 // cannot be used again once the handoff moves past it.
 const handoffProofLifetimeMs = 24 * 60 * 60_000;
 const maxOpenMcpCalls = 50;
+const maxOpenAutomationRuns = 50;
 const deviceIdSchema = z.string().regex(/^[a-zA-Z0-9_-]{43}$/);
 const generationSchema = z.number().int().min(1).max(2_147_483_647);
 const deviceSignatureSchema = z.object({
@@ -92,12 +94,16 @@ export function workMachineExecutionRoutes(app: Fastify, getVerifier: () => Cont
         });
         if (!machine) return reply.code(404).send({ error: 'Work machine not found' });
         const authority = machine.workMachineExecution;
+        const openAutomationRuns = authority
+            ? await listOpenWorkMachineAutomationRuns(db, { accountId: request.userId, machineId }, new Date(), maxOpenAutomationRuns)
+            : [];
         return reply.header('Cache-Control', 'no-store').send(authority
             ? {
                 mode: 'device', deviceId: authority.deviceId, generation: authority.generation,
                 frozen: authority.frozenAt !== null, draining: authority.drainingAt !== null,
                 firstExecution: authority.firstExecutionAt !== null,
                 openMcpCalls: authority.mcpCalls.map(call => ({ requestId: call.requestId, admittedAt: call.admittedAt.getTime() })),
+                openAutomationRuns: openAutomationRuns.map(run => ({ kind: run.kind, id: run.id, claimedAt: run.claimedAt.getTime() })),
             }
             : { mode: 'legacy' });
     });
