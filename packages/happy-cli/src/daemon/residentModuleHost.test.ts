@@ -4,7 +4,7 @@ import { cp, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import { RESIDENT_MODULE_HOST_ENV } from '@/utils/childEnv'
 import { residentModulesEnabled, startResidentModuleHost } from './residentModuleHost'
@@ -65,6 +65,19 @@ describe('resident Happy module host', () => {
     } finally { await host.close() }
   }, 15_000)
 
+  it.skipIf(!('registerHooks' in moduleApi) || typeof moduleApi.registerHooks !== 'function')('starts the built CLI from the resident bundle', async () => {
+    const root = fileURLToPath(new URL('../../', import.meta.url))
+    const host = startResidentModuleHost(root)
+    try {
+      expect(await host.ready).toBe(true)
+      const { stdout, stderr } = await execute(process.execPath, ['bin/happy-resident-session.mjs', '--version'], {
+        cwd: root, env: { ...process.env, [RESIDENT_MODULE_HOST_ENV]: host.descriptor() }, timeout: 15_000, windowsHide: true,
+      })
+      expect(stdout).toMatch(/happy version:/i)
+      expect(stderr).toContain('resident Happy modules ready')
+    } finally { await host.close() }
+  }, 20_000)
+
   it('starts the ordinary entry if the module host has already stopped', async () => {
     const { root, launch } = await fixture()
     const host = startResidentModuleHost(root)
@@ -80,11 +93,11 @@ describe('resident Happy module host', () => {
 
 describe('resident module gate', () => {
   const plainNode = { versions: {}, hasRegisterHooks: true, env: {} }
-  it('serves the resident bundle on Windows Node with loader hooks', () => {
-    expect(residentModulesEnabled({ ...plainNode, platform: 'win32' })).toBe(true)
+  it.each(['win32', 'darwin'] as const)('serves the resident bundle on %s Node with loader hooks', platform => {
+    expect(residentModulesEnabled({ ...plainNode, platform })).toBe(true)
   })
-  it.each(['darwin', 'linux'] as const)('keeps %s on the installed module graph', platform => {
-    expect(residentModulesEnabled({ ...plainNode, platform })).toBe(false)
+  it('keeps Linux on the installed module graph until its seccomp assets travel with the bundle', () => {
+    expect(residentModulesEnabled({ ...plainNode, platform: 'linux' })).toBe(false)
   })
   it('stays off under Electron, Bun, without loader hooks, or when disabled for comparison', () => {
     expect(residentModulesEnabled({ ...plainNode, platform: 'win32', versions: { electron: '41.0.0' } })).toBe(false)
