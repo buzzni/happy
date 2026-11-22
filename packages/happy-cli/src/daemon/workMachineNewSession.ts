@@ -13,8 +13,9 @@
  * conversation with the account token.
  */
 
-import { randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { ApiClient } from '@/api/api';
+import { wrapDataEncryptionKey } from '@/api/encryption';
 import type { Metadata, Session } from '@/api/types';
 import type { Credentials } from '@/persistence';
 import type { SpawnSessionOptions } from '@/modules/common/registerCommonHandlers';
@@ -27,7 +28,7 @@ export type WorkMachineNewSession =
 
 export async function prepareWorkMachineNewSession(input: {
     protectedMachine: boolean;
-    options: Pick<SpawnSessionOptions, 'sessionId' | 'resumeClaudeSessionId' | 'resumeCodexThreadId' | 'parentSessionId'>;
+    options: Pick<SpawnSessionOptions, 'sessionId' | 'resumeClaudeSessionId' | 'resumeCodexThreadId' | 'parentSessionId' | 'initialPromptLocalId'>;
     /** The daemon's current credentials; on a protected machine the token is the device daemon credential. */
     credentials: Credentials;
     metadata: Metadata;
@@ -43,8 +44,20 @@ export async function prepareWorkMachineNewSession(input: {
         return { kind: 'refused', errorMessage: 'Work machine conversation creation requires the device credential' };
     }
     const api = await ApiClient.create(input.credentials);
+    // One conversation per spawn request. A retry of a request whose answer was lost (the same initial
+    // prompt id) sends the same tag and the same session key, so the server's get-or-create returns the
+    // conversation it already made, readable with that key. A request without an id has no retry identity.
+    const requestId = input.options.initialPromptLocalId;
+    const { encryption } = input.credentials;
+    const key = requestId && encryption.type === 'dataKey'
+        ? new Uint8Array(createHmac('sha256', encryption.machineKey).update(`happy-work-machine-spawn-key-v1\0${requestId}`).digest())
+        : null;
     // The server refuses while the generation drains, is frozen or moved to another device.
-    const session = await api.getOrCreateSession({ tag: randomUUID(), metadata: input.metadata, state: null }).catch(() => null);
+    const session = await api.getOrCreateSession({
+        tag: key ? `wm-spawn-${createHash('sha256').update(requestId!).digest('base64url')}` : randomUUID(),
+        metadata: input.metadata, state: null,
+        ...(key && encryption.type === 'dataKey' ? { dataKey: { key, wrapped: wrapDataEncryptionKey(key, encryption.publicKey) } } : {}),
+    }).catch(() => null);
     if (!session) return { kind: 'refused', errorMessage: 'Work machine conversation could not be created; retry when the server is reachable' };
     if (!await input.persist(session)) return { kind: 'refused', errorMessage: 'Work machine conversation could not be recorded locally' };
     return {
