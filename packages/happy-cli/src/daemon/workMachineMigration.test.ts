@@ -10,7 +10,7 @@ import { getProjectPath } from '@/claude/utils/path';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
 import { getWorkMachineDeviceId, saveWorkMachineExecutionBinding, workMachineSigningIdentity } from './workMachineCredential';
 import {
-    checkWorkMachineExport, createWorkMachineRestoreProof, createWorkMachineTargetApproval, exportWorkMachine, importWorkMachine,
+    assertWorkMachineTargetHome, checkWorkMachineExport, createWorkMachineRestoreProof, createWorkMachineTargetApproval, exportWorkMachine, importWorkMachine,
 } from './workMachineMigration';
 import { workMachineSessionStopPath, writeWorkMachineSessionStop } from './workMachineSessionStop';
 
@@ -334,6 +334,39 @@ describe('work machine export and import over the Studio transfer API', () => {
         await expect(lstat(fixture.claudeRecord)).rejects.toMatchObject({ code: 'ENOENT' });
         await expect(lstat(join(fixture.targetHome, 'sessions.json'))).rejects.toMatchObject({ code: 'ENOENT' });
         expect(studio.restored).toBeNull();
+    });
+
+    // Medium 13: `happy auth login` on a fresh target PC writes a machine id of its own.
+    it('takes over a home whose only machine id is the one a plain login minted', async () => {
+        const fixture = await machinesFixture(root, studio);
+        await exportWorkMachine(fixture.exportInput);
+        await fixture.vacateSource();
+
+        await expect(assertWorkMachineTargetHome(fixture.targetHome, undefined, machineId)).resolves.toBeUndefined();
+        await expect(assertWorkMachineTargetHome(fixture.targetHome, 'login-minted-machine', machineId)).resolves.toBeUndefined();
+        await expect(importWorkMachine({ ...fixture.importInput, configuredMachineId: 'login-minted-machine' })).resolves.toMatchObject({ machineId });
+        // Once it holds sessions it is a machine of its own.
+        await expect(assertWorkMachineTargetHome(fixture.targetHome, 'login-minted-machine', machineId))
+            .rejects.toThrow('Another work machine is already configured in this home');
+    });
+
+    it('refuses a target home bound to another work machine or holding sessions, before placing anything', async () => {
+        const fixture = await machinesFixture(root, studio);
+        await exportWorkMachine(fixture.exportInput);
+        await fixture.vacateSource();
+        await writeFile(join(fixture.targetHome, 'sessions.json'), JSON.stringify({ sessions: { 'local-session': {} } }), { mode: 0o600 });
+
+        await expect(importWorkMachine({ ...fixture.importInput, configuredMachineId: 'login-minted-machine' }))
+            .rejects.toThrow('Another work machine is already configured in this home');
+        await expect(lstat(fixture.project)).rejects.toMatchObject({ code: 'ENOENT' });
+
+        await rm(join(fixture.targetHome, 'sessions.json'));
+        const otherDevice = await getWorkMachineDeviceId(fixture.targetHome, 'other-machine');
+        await saveWorkMachineExecutionBinding(fixture.targetHome, {
+            accountId, machineId: 'other-machine', generation: 1, deviceId: otherDevice, serverOrigin: 'https://happy.invalid',
+        });
+        await expect(assertWorkMachineTargetHome(fixture.targetHome, 'other-machine', machineId))
+            .rejects.toThrow('Another work machine is already configured in this home');
     });
 
     it('signs a restore proof with the original device for a new data key', async () => {

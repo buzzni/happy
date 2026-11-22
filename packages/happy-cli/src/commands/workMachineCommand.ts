@@ -7,7 +7,7 @@ import {
     workMachineExecutionBindingSchema,
 } from '@/daemon/workMachineCredential';
 import {
-    checkWorkMachineExport, createWorkMachineRestoreProof, createWorkMachineTargetApproval, exportWorkMachine, importWorkMachine,
+    assertWorkMachineTargetHome, checkWorkMachineExport, createWorkMachineRestoreProof, createWorkMachineTargetApproval, exportWorkMachine, importWorkMachine,
 } from '@/daemon/workMachineMigration';
 import { stopTrackedSessionProcesses } from '@/daemon/workMachineSessionStop';
 import { readCredentials, readDaemonState, readSettings, updateSettings } from '@/persistence';
@@ -71,8 +71,7 @@ export async function handleWorkMachineCommand(args: string[]): Promise<void> {
         const { positional, options } = parseArguments(rest, ['account', 'generation', 'source-device', 'max-bytes']);
         const [targetMachineId, jobId, expiresAt] = positional;
         if (positional.length !== 3 || !options.account || !options['source-device']) throw new Error(USAGE);
-        const settings = await readSettings({ strict: true });
-        if (settings.machineId && settings.machineId !== targetMachineId) throw new Error('Another work machine is already configured in this home');
+        await assertWorkMachineTargetHome(happyHomeDir, (await readSettings({ strict: true })).machineId, targetMachineId);
         const expiry = /^\d+$/.test(expiresAt) ? Number(expiresAt) : Date.parse(expiresAt);
         console.log(JSON.stringify(await createWorkMachineTargetApproval({
             home: happyHomeDir, machineId: targetMachineId, jobId, accountId: options.account,
@@ -98,11 +97,9 @@ export async function handleWorkMachineCommand(args: string[]): Promise<void> {
             console.log(JSON.stringify(await exportWorkMachine(endpoint)));
             return;
         }
-        const imported = await importWorkMachine(endpoint);
-        await updateSettings(current => {
-            if (current.machineId && current.machineId !== imported.machineId) throw new Error('Another work machine is already configured in this home');
-            return { ...current, machineId: imported.machineId };
-        }, { strict: true });
+        // The import checked this home before placing anything (assertWorkMachineTargetHome).
+        const imported = await importWorkMachine({ ...endpoint, configuredMachineId: (await readSettings({ strict: true })).machineId });
+        await updateSettings(current => ({ ...current, machineId: imported.machineId }), { strict: true });
         console.log(JSON.stringify(imported));
         return;
     }

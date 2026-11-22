@@ -290,6 +290,17 @@ async function readSessionStore(home: string): Promise<Record<string, unknown> &
     return parsed.data;
 }
 
+/**
+ * A target home may take the logical machine id when it has none, the same one, or only the id a
+ * plain `happy auth login` minted: no work machine binding and no sessions of its own.
+ */
+export async function assertWorkMachineTargetHome(home: string, configuredMachineId: string | undefined, machineId: string): Promise<void> {
+    if (!configuredMachineId || configuredMachineId === machineId) return;
+    if (await readWorkMachineExecutionBinding(home) || Object.keys((await readSessionStore(home)).sessions).length) {
+        throw new Error('Another work machine is already configured in this home');
+    }
+}
+
 async function assertNothingToOverwrite(home: string, manifest: Manifest): Promise<void> {
     for (const path of manifest.paths) {
         if (await exists(path)) throw new Error(`Refusing to overwrite an existing path on this machine: ${path}`);
@@ -393,7 +404,12 @@ async function downloadArchive(client: ReturnType<typeof openWorkMachineTransfer
     return { sealed, receipt };
 }
 
-export async function importWorkMachine(input: TransferEndpoint & { claudeConfigDir: string; codexHome: string }): Promise<{ machineId: string; deviceId: string; manifestSha256: string }> {
+export async function importWorkMachine(input: TransferEndpoint & {
+    claudeConfigDir: string;
+    codexHome: string;
+    /** This home's settings.machineId; the caller replaces it with the imported one afterwards. */
+    configuredMachineId?: string;
+}): Promise<{ machineId: string; deviceId: string; manifestSha256: string }> {
     const client = openWorkMachineTransfer(input);
     const directory = await jobDirectory(input.home, input.jobId);
     const recipientFile = recipientFileSchema.safeParse(await readJson(join(directory, 'recipient.json')));
@@ -413,6 +429,7 @@ export async function importWorkMachine(input: TransferEndpoint & { claudeConfig
     const { manifest, sha256 } = verifiedManifest(await client.manifest(), approval, input.jobId);
     const placedPath = join(importDirectory, 'placed.json');
     if (!await exists(placedPath)) {
+        await assertWorkMachineTargetHome(input.home, input.configuredMachineId, approval.machineId);
         await assertNothingToOverwrite(input.home, manifest);
         await assertDiskSpace(importDirectory, manifest);
         const { sealed, receipt } = await downloadArchive(client, manifest, importDirectory);
