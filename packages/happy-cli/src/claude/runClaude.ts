@@ -19,6 +19,7 @@ import { describeClaudeLaunchFailure } from './utils/launchFailureMessage';
 
 import { ApiClient } from '@/api/api';
 import { openWorkMachineSessionCredentials } from '@/daemon/workMachineCredential';
+import { startsNewWorkMachineConversation } from '@/daemon/workMachineNewSession';
 import { consumeInputEvidenceOption, inputEvidenceMetadata, resolveInputEvidenceOption } from '@/utils/inputEvidenceSettings';
 import { logger } from '@/ui/logger';
 import { loop } from '@/claude/loop';
@@ -441,19 +442,21 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     const metadata = inputEvidenceMetadata(mergeReconnectSessionMetadata(reconnectSession?.metadata, freshMetadata), inputEvidenceEnabled);
     const allowAutomationReconnectPrompt = process.env.HAPPY_AUTOMATION_RESUME_PROMPT === '1';
     delete process.env.HAPPY_AUTOMATION_RESUME_PROMPT;
+    const freshLaunch = consumeReconnectFreshLaunch(process.env);
     const preparedInitialPrompt = prepareClaudeInitialPrompt({
         env: process.env,
         reconnectSessionId,
         automationRunOnceRequested,
         allowAutomationReconnectPrompt,
-        freshLaunch: consumeReconnectFreshLaunch(process.env),
+        freshLaunch,
     });
     const exitAfterFirstTurn = preparedInitialPrompt.exitAfterFirstTurn;
 
     if (workMachine) {
         const nativeId = reconnectSession?.metadata?.claudeSessionId;
-        if (!nativeId || !/^[a-f0-9-]{36}$/i.test(nativeId)
-            || !claudeCheckSession(nativeId, workingDirectory, options.claudeEnvVars?.CLAUDE_CONFIG_DIR)) {
+        // A conversation the daemon just created has no transcript yet; every other one resumes its own.
+        if (!startsNewWorkMachineConversation(freshLaunch, nativeId) && (!nativeId || !/^[a-f0-9-]{36}$/i.test(nativeId)
+            || !claudeCheckSession(nativeId, workingDirectory, options.claudeEnvVars?.CLAUDE_CONFIG_DIR))) {
             throw new Error('WORK_MACHINE_CLAUDE_TRANSCRIPT_UNAVAILABLE');
         }
         await api.permitWorkMachineSessionExecution();

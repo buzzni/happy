@@ -23,6 +23,7 @@ import { createMachineTypeMarker } from './machineTypeMarker';
 import { createSharedPcAutoConfirm } from './sharedPcAutoConfirm';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
 import { openWorkMachineCredentials, readWorkMachineExecutionBinding, watchWorkMachineCredential } from './workMachineCredential';
+import { prepareWorkMachineNewSession } from './workMachineNewSession';
 import { deliverAutomationConversation } from './automations/automationConversationRunner';
 import { scopeResumeSelection } from './sessionWriteScopeRestart';
 import { createSessionWriteScopeRuntime, isSessionWriteScopeLaunch, type SessionWriteScopeRuntime } from './sessionWriteScopeRuntime';
@@ -51,7 +52,7 @@ import { runManagedScript } from './automations/managedScriptRunner';
 
 import { ApiClient } from '@/api/api';
 import { TrackedSession, SessionEncryptionData } from './types';
-import { MachineMetadata, DaemonState, Metadata, Machine } from '@/api/types';
+import { MachineMetadata, DaemonState, Metadata, Machine, Session } from '@/api/types';
 import {
   type RecoverSessionOptions,
   type RecoverSessionResult,
@@ -2108,6 +2109,20 @@ export async function startDaemon(): Promise<void> {
       },
       warn: (message) => logger.warn(message),
     });
+    /** Metadata of a session the daemon creates before its child starts (owned and work machine launches). */
+    const daemonCreatedSessionMetadata = (options: SpawnSessionOptions): Metadata => ({ path: options.directory, host: os.hostname(),
+      version: packageJson.version, os: os.platform(), machineId,
+      homeDir: os.homedir(), happyHomeDir: configuration.happyHomeDir, happyLibDir: projectPath(), happyToolsDir: join(projectPath(), 'tools', 'unpacked'),
+      flavor: options.agent ?? 'claude', startedFromDaemon: true, startedBy: 'daemon', lifecycleState: 'running', lifecycleStateSince: Date.now(),
+      // T4RT-03: an owned session's creator and source, as a legacy child records them.
+      ...ownedSessionAuthorship(options) });
+    const persistDaemonCreatedSession = async (session: Session) => {
+      // Rotation has already persisted its execution binding; retain that trusted resume state.
+      const prior = readPersistedSessions()[session.id];
+      return persistSessionDurably(session.id, { ...prior, encryptionKey: encodeBase64(session.encryptionKey), encryptionVariant: session.encryptionVariant,
+        seq: session.seq, metadataVersion: session.metadataVersion, agentStateVersion: session.agentStateVersion, metadata: session.metadata,
+        savedAt: Date.now(), lastProcessedSeq: 0 });
+    };
     type WorkspaceLaunchObservation = { submitted: boolean; tracked: boolean; exitObserved?: boolean;
       onObservedExit?: () => Promise<void>; onUnconfirmedExit?: () => Promise<void> };
     const spawnSessionUnchecked = async (
@@ -2557,6 +2572,18 @@ export async function startDaemon(): Promise<void> {
         // can attach a child to an existing session.
         if (preparedMachineLaunch) Object.assign(extraEnv, preparedMachineLaunch.reconnectEnvironment);
         else if (options.reconnectEnvironment) Object.assign(extraEnv, options.reconnectEnvironment);
+        else {
+          // A protected machine's child cannot create a conversation; the daemon creates it with its device credential.
+          const workMachineSession = await prepareWorkMachineNewSession({
+            protectedMachine: !!workMachine, options, credentials, metadata: daemonCreatedSessionMetadata(options),
+            persist: async session => (await persistDaemonCreatedSession(session)).status === 'committed',
+          });
+          if (workMachineSession.kind === 'refused') {
+            logger.warn(`[DAEMON RUN] ${workMachineSession.errorMessage}`);
+            return { type: 'error', errorMessage: workMachineSession.errorMessage };
+          }
+          if (workMachineSession.kind === 'created') Object.assign(extraEnv, workMachineSession.environment);
+        }
         if (options.saycodeSystemPromptEnabled !== undefined) {
           extraEnv.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED = String(
             options.saycodeSystemPromptEnabled,
@@ -6095,21 +6122,11 @@ export async function startDaemon(): Promise<void> {
       // The Windows trial launch carries no capability pipe, so its owned children keep the daemon-held binding.
       launchCallers: { query: raw => callerLaunches!.query(raw), currentCaller: sessionId => callerLaunches!.currentCaller(sessionId),
         available: () => !standaloneWindows && callerLaunches!.available() },
-      metadata: options => ({ path: options.directory, host: os.hostname(), version: packageJson.version, os: os.platform(), machineId,
-        homeDir: os.homedir(), happyHomeDir: configuration.happyHomeDir, happyLibDir: projectPath(), happyToolsDir: join(projectPath(), 'tools', 'unpacked'),
-        flavor: options.agent ?? 'claude', startedFromDaemon: true, startedBy: 'daemon', lifecycleState: 'running', lifecycleStateSince: Date.now(),
-        // T4RT-03: an owned session's creator and source, as a legacy child records them.
-        ...ownedSessionAuthorship(options) }),
+      metadata: daemonCreatedSessionMetadata,
       rotation: (options, companyId) => options.agentPlan ? Promise.resolve(null) : companyId ? machineRuntimeFor(companyId) : machineRotationFor(options),
       start: (options, launch) => { if (launch) ownedMachineLaunches.set(options, launch); return ownedStartGuard.start(options, () => spawnSessionAdmitted(options)); },
       tracked: sessionId => findTrackedSessionById(sessionId) ?? sessionIdToFinishedSession.get(sessionId), live: liveLaunch,
-      persist: async session => {
-        // Rotation has already persisted its execution binding; retain that trusted resume state.
-        const prior = readPersistedSessions()[session.id];
-        return persistSessionDurably(session.id, { ...prior, encryptionKey: encodeBase64(session.encryptionKey), encryptionVariant: session.encryptionVariant,
-          seq: session.seq, metadataVersion: session.metadataVersion, agentStateVersion: session.agentStateVersion, metadata: session.metadata,
-          savedAt: Date.now(), lastProcessedSeq: 0 });
-      },
+      persist: persistDaemonCreatedSession,
     });
     if (!managedRuntimeActive && !standaloneWindows && machine.encryptionVariant === 'dataKey' && deviceKeys && deviceEnrollment && trustedStudioOrigin) {
       const enrollment = deviceEnrollment;

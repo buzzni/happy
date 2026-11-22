@@ -31,6 +31,7 @@ const CODEX_END_INPUT_BUDGET_MS = 10_000;
 import React from "react";
 import { ApiClient } from '@/api/api';
 import { openWorkMachineSessionCredentials } from '@/daemon/workMachineCredential';
+import { startsNewWorkMachineConversation } from '@/daemon/workMachineNewSession';
 import { consumeInputEvidenceOption, inputEvidenceMetadata, resolveInputEvidenceOption } from '@/utils/inputEvidenceSettings';
 import { CodexAppServerClient } from './codexAppServerClient';
 import { describeCodexFailure, describeCodexInactivityAbort } from './codexAbortNotice';
@@ -318,12 +319,13 @@ export async function runCodex(opts: {
     });
     const allowAutomationReconnectPrompt = process.env.HAPPY_AUTOMATION_RESUME_PROMPT === '1';
     delete process.env.HAPPY_AUTOMATION_RESUME_PROMPT;
+    const freshLaunch = consumeReconnectFreshLaunch(process.env);
     const preparedInitialPrompt = prepareCodexInitialPrompt({
         env: process.env,
         reconnectSessionId,
         automationRunOnceRequested,
         allowAutomationReconnectPrompt,
-        freshLaunch: consumeReconnectFreshLaunch(process.env),
+        freshLaunch,
     });
 
     // Early check: ensure Codex CLI is installed before proceeding
@@ -439,7 +441,10 @@ export async function runCodex(opts: {
     const metadata = inputEvidenceMetadata(mergeReconnectSessionMetadata(reconnectSession?.metadata, freshMetadata), inputEvidenceEnabled);
 
     if (workMachine) {
-        if (!reconnectSession?.metadata?.codexThreadId || opts.resumeThreadId !== reconnectSession.metadata.codexThreadId) {
+        const threadId = reconnectSession?.metadata?.codexThreadId;
+        // A conversation the daemon just created has no thread yet; every other one resumes its own.
+        if (startsNewWorkMachineConversation(freshLaunch, threadId) ? opts.resumeThreadId !== undefined
+            : !threadId || opts.resumeThreadId !== threadId) {
             throw new Error('WORK_MACHINE_CODEX_THREAD_UNAVAILABLE');
         }
         await api.permitWorkMachineSessionExecution();

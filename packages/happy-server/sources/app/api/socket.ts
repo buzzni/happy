@@ -580,7 +580,8 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             terminalRelayHandler(userId, socket);
         }
         if (connection.connectionType === 'machine-scoped') {
-            automationSocketHandler(userId, connection.machineId, socket);
+            automationSocketHandler(userId, connection.machineId, socket,
+                workMachineExecution?.purpose === 'daemon' ? workMachineExecution : null);
             // proxy-ws-* only ever fires on the replica the daemon is attached
             // to, so the dispatch has to be wired here rather than lazily at
             // tunnel-open time on whichever replica took the browser upgrade.

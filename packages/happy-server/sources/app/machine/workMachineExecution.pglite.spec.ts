@@ -32,8 +32,9 @@ import {
     machineSocketIdentityExists,
     workMachineSocketMayAct,
 } from '@/app/api/socket/machineSocketAuth';
-import { createWorkMachineExecutionTokenIssuer } from '@/app/auth/workMachineExecutionToken';
+import { createWorkMachineExecutionTokenIssuer, type WorkMachineExecutionClaims } from '@/app/auth/workMachineExecutionToken';
 import * as machineSockets from '@/app/events/findMachineSockets';
+import { eventRouter } from '@/app/events/eventRouter';
 import * as authority from './workMachineExecution';
 import {
     authorizeWorkMachineExecution,
@@ -975,6 +976,220 @@ describe('work machine execution authority', () => {
         } finally {
             await app.close();
             vi.unstubAllEnvs();
+            if (priorSecret === undefined) delete process.env.HANDY_MASTER_SECRET;
+            else process.env.HANDY_MASTER_SECRET = priorSecret;
+        }
+    });
+
+    it('creates a new conversation attached to the work machine only with the current device daemon credential', async () => {
+        const priorSecret = process.env.HANDY_MASTER_SECRET;
+        process.env.HANDY_MASTER_SECRET = 'work-machine-loopback-test-only';
+        const app = fastify();
+        app.setValidatorCompiler(validatorCompiler);
+        app.setSerializerCompiler(serializerCompiler);
+        const updates = vi.spyOn(eventRouter, 'emitUpdate').mockImplementation(() => {});
+        try {
+            await auth.init();
+            enableAuthentication(app as unknown as Fastify);
+            enableSessionScopeAuthentication(app as unknown as Fastify, () => null);
+            sessionRoutes(app as unknown as Fastify);
+            const daemon = (device: typeof original, target = machineId) => {
+                const now = Date.now();
+                return auth.workMachineExecutionIssuer!.mint({ ...device, machineId: target, purpose: 'daemon', expiresAt: now + 60_000 }, now);
+            };
+            const create = (token: string, tag: string, extra: object = {}) => app.inject({
+                method: 'POST', url: '/v1/sessions', headers: { authorization: `Bearer ${token}` },
+                payload: { tag, metadata: 'encrypted-new', dataEncryptionKey: Buffer.from('key').toString('base64'), ...extra },
+            });
+            const current = await daemon(original);
+
+            const created = await create(current, 'device-new-1');
+            expect(created.statusCode).toBe(200);
+            const row = await db.session.findUniqueOrThrow({ where: { id: created.json().session.id } });
+            expect(row).toMatchObject({ accountId, tag: 'device-new-1', workMachineId: machineId, metadata: 'encrypted-new' });
+            expect(updates).toHaveBeenCalledWith(expect.objectContaining({ userId: accountId, recipientFilter: { type: 'user-scoped-only' } }));
+            const retried = await create(current, 'device-new-1');
+            expect(retried.statusCode).toBe(200);
+            expect(retried.json().session.id).toBe(row.id);
+
+            // A tag already used by a conversation outside this work machine is not adopted.
+            await db.session.create({ data: { id: 'unattached-tag', tag: 'device-unattached', accountId, metadata: 'encrypted' } });
+            expect((await create(current, 'device-unattached')).statusCode).toBe(409);
+            // Proof-bound creation stays on its own path; the daemon credential cannot carry one.
+            expect((await create(current, 'device-proof', { ownershipProof: {} })).statusCode).toBe(403);
+            // An account token cannot attach a conversation to the work machine.
+            const legacy = await create(await auth.createToken(accountId), 'legacy-new');
+            expect(legacy.statusCode).toBe(200);
+            expect((await db.session.findUniqueOrThrow({ where: { id: legacy.json().session.id } })).workMachineId).toBeNull();
+            // A machine without device authority and a device that is not current are refused.
+            expect((await create(await daemon(original, 'ordinary-machine'), 'device-ordinary')).statusCode).toBe(403);
+            expect((await create(await daemon({ ...original, deviceId: 'other-pc' }), 'device-other')).statusCode).toBe(403);
+
+            for (const [state, data] of [['draining', { drainingAt: new Date() }], ['frozen', { frozenAt: new Date() }]] as const) {
+                await db.workMachineExecution.update({ where: { machineId }, data });
+                expect((await create(current, `device-${state}`)).statusCode).toBe(403);
+                expect((await create(current, 'device-new-1')).statusCode).toBe(403);
+            }
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null, frozenAt: null } });
+            await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
+            expect((await create(current, 'device-old-generation')).statusCode).toBe(403);
+            const next = await create(await daemon(replacement), 'device-new-generation');
+            expect(next.statusCode).toBe(200);
+            expect(await db.session.count({ where: { tag: { in: ['device-draining', 'device-frozen', 'device-old-generation', 'device-ordinary', 'device-other', 'device-proof'] } } })).toBe(0);
+        } finally {
+            updates.mockRestore();
+            await app.close();
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
+            if (priorSecret === undefined) delete process.env.HANDY_MASTER_SECRET;
+            else process.env.HANDY_MASTER_SECRET = priorSecret;
+        }
+    });
+
+    it('lets the current device run scheduled automation: claims stop at drain, claimed runs finish until the freeze', async () => {
+        vi.stubEnv('SAYCODE_AUTOMATION_ENABLED', 'true');
+        const project = await db.project.create({ data: { accountId, name: 'device-automation', automationViewerKeyVersion: 1 } });
+        await db.machine.update({ where: { id: machineId }, data: { automationKeyVersion: 1 } });
+        const automations = await Promise.all(['first', 'second', 'third'].map(name => db.automation.create({ data: {
+            projectId: project.id, ownerAccountId: accountId, machineAccountId: accountId, machineId, payloadVersion: 1,
+            payloadCiphertext: new Uint8Array(1), viewerKeyId: `viewer-${name}`, viewerKeyVersion: 1,
+            viewerKeyEnvelope: new Uint8Array(1), machineKeyVersion: 1, machineKeyEnvelope: new Uint8Array(1),
+            enabledAt: new Date(Date.now() - 60_000),
+        } })));
+        await db.session.create({ data: { id: 'unattached-report-target', tag: 'unattached-report-target', accountId, metadata: 'encrypted' } });
+        const expiresAt = Date.now() + 60_000;
+        const worker = (device: WorkMachineExecutionClaims | null) => {
+            const handlers = new Map<string, (data: unknown, callback: (result: unknown) => void) => Promise<void>>();
+            automationSocketHandler(accountId, machineId, { on: (event: string, handler: never) => handlers.set(event, handler) } as never,
+                device as never);
+            return (event: string, data: object) => new Promise<{ ok: boolean; value?: any; error?: string }>(resolve =>
+                void handlers.get(event)!(data, resolve as never));
+        };
+        const current = worker({ ...original, purpose: 'daemon', expiresAt });
+        const claim = (send: ReturnType<typeof worker>, automationId: string) =>
+            send('automation-claim', { automationId, generation: 1, scheduledFor: Date.now() });
+        const report = (send: ReturnType<typeof worker>, run: { runId: string; claimToken: string }, sessionId: string | null, reportId: string) =>
+            send('automation-run-report', { ...run, reportId, status: 'COMPLETED', outcome: 'WOKE', sessionId, detailCiphertext: null });
+        try {
+            expect(await claim(worker(null), automations[0].id)).toEqual({ ok: false, error: 'forbidden' });
+            const first = await claim(current, automations[0].id);
+            const second = await claim(current, automations[1].id);
+            expect(first.ok && second.ok).toBe(true);
+            const runs = [first, second].map(({ value }) => ({ runId: value.runId as string, claimToken: value.claimToken as string }));
+            for (const run of runs) expect(await current('automation-run-start', run)).toMatchObject({ ok: true });
+
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: new Date() } });
+            expect(await claim(current, automations[2].id)).toEqual({ ok: false, error: 'forbidden' });
+            expect(await current('automation-missed-record', {
+                automationId: automations[2].id, generation: 1, firstMissedAt: Date.now() - 60_000, missedCount: 1, failureCode: 'MISSED_OFFLINE',
+            })).toEqual({ ok: false, error: 'forbidden' });
+            expect(await db.automationRun.count({ where: { automationId: automations[2].id } })).toBe(0);
+            expect(await current('automation-run-heartbeat', runs[0])).toMatchObject({ ok: true });
+            // A claimed run reports only a conversation of this work machine.
+            expect(await report(current, runs[0], 'unattached-report-target', 'report-unattached')).toEqual({ ok: false, error: 'target-mismatch' });
+            expect(await report(current, runs[0], 'protected-session', 'report-first')).toMatchObject({ ok: true });
+            expect(await db.automationRun.findUniqueOrThrow({ where: { id: runs[0].runId } }))
+                .toMatchObject({ status: 'COMPLETED', sessionId: 'protected-session' });
+
+            await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
+            expect(await current('automation-run-heartbeat', runs[1])).toEqual({ ok: false, error: 'forbidden' });
+            expect(await report(current, runs[1], null, 'report-frozen')).toEqual({ ok: false, error: 'forbidden' });
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
+            expect(await report(current, runs[1], null, 'report-old-generation')).toEqual({ ok: false, error: 'forbidden' });
+            expect((await db.automationRun.findUniqueOrThrow({ where: { id: runs[1].runId } })).status).toBe('RUNNING');
+            expect(await claim(worker({ ...replacement, purpose: 'daemon', expiresAt }), automations[2].id)).toMatchObject({ ok: true });
+        } finally {
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
+            await db.project.delete({ where: { id: project.id } });
+            vi.unstubAllEnvs();
+        }
+    });
+
+    it('admits the automation socket events of the current device daemon socket only', async () => {
+        const claims = { ...original, purpose: 'daemon' as const, expiresAt: Date.now() + 60_000 };
+        const act = (event: string, input: Partial<Parameters<typeof workMachineSocketMayAct>[1]> = {}) => workMachineSocketMayAct(db, {
+            accountId, socketMachineId: machineId, claims, event, payload: { automationId: 'any' }, now: Date.now(), ...input,
+        });
+        for (const event of ['automation-claim', 'automation-run-report', 'automation-sync', 'session-followup-claim']) {
+            expect(await act(event)).toBe(true);
+        }
+        expect(await act('automation-claim', { socketMachineId: 'ordinary-machine' })).toBe(false);
+        expect(await act('automation-claim', { claims: { ...claims, purpose: 'session', sessionId: 'protected-session' } as never, socketMachineId: undefined, socketSessionId: 'protected-session' })).toBe(false);
+        expect(await act('automation-claim', { claims: null })).toBe(false);
+        await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
+        expect(await act('automation-run-report')).toBe(false);
+    });
+
+    it('lets the current device run script automation over HTTP: claims stop at drain, claimed runs report until the freeze', async () => {
+        const priorSecret = process.env.HANDY_MASTER_SECRET;
+        process.env.HANDY_MASTER_SECRET = 'work-machine-loopback-test-only';
+        const app = fastify();
+        app.setValidatorCompiler(validatorCompiler);
+        app.setSerializerCompiler(serializerCompiler);
+        const project = await db.project.create({ data: { accountId, name: 'device-script' } });
+        const automation = await db.automation.create({ data: {
+            projectId: project.id, ownerAccountId: accountId, machineAccountId: accountId, machineId, payloadVersion: 3,
+            payloadCiphertext: new Uint8Array(1), viewerKeyId: 'viewer', viewerKeyVersion: 1,
+            viewerKeyEnvelope: new Uint8Array(1), machineKeyVersion: 1, machineKeyEnvelope: new Uint8Array(1),
+        } });
+        await db.scriptArtifact.create({ data: { id: 'device-artifact', projectId: project.id, digest: 'digest', encrypted: {} } });
+        await db.scriptAutomationRevision.create({ data: {
+            automationId: automation.id, revision: 1, artifactId: 'device-artifact', digest: 'digest',
+            payloadCiphertext: 'encrypted', admission: {}, ready: true,
+        } });
+        const invocation = (id: string, status: string, token?: string) => db.scriptInvocation.create({ data: {
+            id, automationId: automation.id, revision: 1, generation: 1, trigger: 'manual', requestedBy: accountId,
+            idempotencyKey: id, bodyHash: 'hash', snapshot: { machineId, machineAccountId: accountId }, inputCiphertext: 'encrypted',
+            createdAt: Date.now(), status, ...(token ? { claimHash: createHash('sha256').update(token).digest('hex'), leaseExpiresAt: Date.now() + 300_000 } : {}),
+        } });
+        const queued = await invocation('device-queued', 'QUEUED');
+        const runningToken = 'r'.repeat(43);
+        const frozenToken = 'f'.repeat(43);
+        await invocation('device-running', 'RUNNING', runningToken);
+        await invocation('device-running-frozen', 'RUNNING', frozenToken);
+        try {
+            await auth.init();
+            enableAuthentication(app as unknown as Fastify);
+            scriptAutomationRoutes(app as unknown as Fastify, { enabled: () => true, transaction: work => db.$transaction(work) });
+            const daemon = async (device: typeof original) => {
+                const now = Date.now();
+                return auth.workMachineExecutionIssuer!.mint({ ...device, purpose: 'daemon', expiresAt: now + 60_000 }, now);
+            };
+            const current = await daemon(original);
+            const call = (token: string, method: 'GET' | 'POST', path: string, payload?: object, target = machineId) => app.inject({
+                method, url: `/v1/machines/${target}${path}`, headers: { authorization: `Bearer ${token}` }, ...(payload ? { payload } : {}),
+            });
+            // The cursor skips this test's automation, whose fixture admission is not a valid listing.
+            const list = (token: string, target?: string) => call(token, 'GET', `/script-automations?after=${automation.id}`, undefined, target);
+            const claim = (token: string) => call(token, 'POST', `/script-automations/${automation.id}/claim`, {});
+            const heartbeat = (token: string, runId: string, claimToken: string) =>
+                call(token, 'POST', `/script-runs/${runId}/heartbeat`, { token: claimToken });
+            const abandon = (token: string, runId: string, claimToken: string) =>
+                call(token, 'POST', `/script-runs/${runId}/abandon`, { token: claimToken });
+
+            expect((await list(current)).statusCode).toBe(200);
+            expect((await list(await auth.createToken(accountId))).statusCode).toBe(403);
+            expect((await list(current, 'ordinary-machine')).statusCode).toBe(403);
+            expect((await list(await daemon({ ...original, deviceId: 'other-pc' }))).statusCode).toBe(403);
+
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: new Date() } });
+            expect((await claim(current)).statusCode).toBe(403);
+            expect(await db.scriptInvocation.findUniqueOrThrow({ where: { id: queued.id } })).toMatchObject({ status: 'QUEUED', claimHash: null });
+            expect((await heartbeat(current, 'device-running', runningToken)).statusCode).toBe(200);
+            expect((await abandon(current, 'device-running', runningToken)).statusCode).toBe(200);
+            expect((await db.scriptInvocation.findUniqueOrThrow({ where: { id: 'device-running' } })).status).not.toBe('RUNNING');
+
+            await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
+            expect((await heartbeat(current, 'device-running-frozen', frozenToken)).statusCode).toBe(403);
+            expect((await abandon(current, 'device-running-frozen', frozenToken)).statusCode).toBe(403);
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
+            expect((await abandon(current, 'device-running-frozen', frozenToken)).statusCode).toBe(403);
+            expect((await db.scriptInvocation.findUniqueOrThrow({ where: { id: 'device-running-frozen' } })).status).toBe('RUNNING');
+            expect((await list(await daemon(replacement))).statusCode).toBe(200);
+        } finally {
+            await app.close();
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
+            await db.project.delete({ where: { id: project.id } });
             if (priorSecret === undefined) delete process.env.HANDY_MASTER_SECRET;
             else process.env.HANDY_MASTER_SECRET = priorSecret;
         }

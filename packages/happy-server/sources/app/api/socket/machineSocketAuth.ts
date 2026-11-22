@@ -67,6 +67,12 @@ const daemonSocketEvents = new Set([
 const daemonRelayEvents = new Set([
     'proxy-ws-data', 'proxy-ws-close', 'terminal-frame', 'terminal-snapshot', 'terminal-frame-gap', 'terminal-closed',
 ]);
+// The automation handler locks the generation per call and decides drain itself.
+const daemonAutomationEvents = new Set([
+    'automation-key-register', 'automation-sync', 'automation-sync-ack', 'automation-claim', 'automation-missed-record',
+    'automation-run-start', 'automation-run-heartbeat', 'automation-conversation-deliver', 'automation-run-report',
+    'session-followup-sync', 'session-followup-claim', 'session-followup-evaluate', 'session-followup-deliver',
+]);
 const sessionSocketEvents = new Set([
     'update-metadata', 'update-state', 'session-alive', 'session-stream', 'message', 'session-end', 'usage-report', 'provider-usage-report',
 ]);
@@ -103,7 +109,7 @@ export async function workMachineSocketMayAct(db: WorkMachineLookup, input: Mach
     if (claims) {
         if (claims.accountId !== accountId || claims.expiresAt <= now) return false;
         if (claims.purpose === 'daemon') {
-            if (claims.machineId === socketMachineId && daemonRelayEvents.has(event)) {
+            if (claims.machineId === socketMachineId && (daemonRelayEvents.has(event) || daemonAutomationEvents.has(event))) {
                 return authorizeWorkMachineExecution(db, claims);
             }
             if (claims.machineId !== socketMachineId || !daemonSocketEvents.has(event)) return false;
