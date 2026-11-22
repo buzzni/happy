@@ -37,7 +37,7 @@ import * as machineSockets from '@/app/events/findMachineSockets';
 import { eventRouter } from '@/app/events/eventRouter';
 import { SCRIPT_CLAIM_LEASE_MS } from '@/app/automation/scriptInvocationService';
 import { SESSION_FOLLOWUP_CLAIM_MS } from '@/app/automation/sessionFollowupExecutionService';
-import { SESSION_FOLLOWUP_WIRE_VERSION } from '@slopus/happy-wire';
+import { SCRIPT_AUTOMATION_PROTOCOL_VERSION, SESSION_FOLLOWUP_WIRE_VERSION } from '@slopus/happy-wire';
 import * as authority from './workMachineExecution';
 import {
     authorizeWorkMachineExecution,
@@ -1386,8 +1386,33 @@ describe('work machine execution authority', () => {
             expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
             expect((await abandon(current, 'device-running-frozen', frozenToken)).statusCode).toBe(403);
             expect((await db.scriptInvocation.findUniqueOrThrow({ where: { id: 'device-running-frozen' } })).status).toBe('RUNNING');
-            expect((await list(await daemon(replacement))).statusCode).toBe(200);
+            const next = await daemon(replacement);
+            expect((await list(next)).statusCode).toBe(200);
+            const firstExecution = async () => (await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt;
+            expect(await firstExecution()).toBeNull();
+            // The replacement claims the run the old generation left queued: it ran work, so the way back closes.
+            await db.project.update({ where: { id: project.id }, data: {
+                config: { machineId }, automationViewerPublicKey: new Uint8Array(32), automationViewerKeyVersion: 1,
+            } });
+            await db.machine.update({ where: { id: machineId }, data: {
+                automationPublicKey: new Uint8Array(32), automationKeyVersion: 1, automationProtocolVersion: SCRIPT_AUTOMATION_PROTOCOL_VERSION,
+            } });
+            await db.scriptInvocation.update({ where: { id: queued.id }, data: {
+                snapshot: { machineId, machineAccountId: accountId, artifactId: 'device-artifact' },
+            } });
+            const claimed = await claim(next);
+            expect(claimed.statusCode).toBe(200);
+            expect(claimed.json().claim).not.toBeNull();
+            expect(await firstExecution()).not.toBeNull();
+            // A claim with nothing to run (the automation is paused) records nothing.
+            await db.workMachineExecution.update({ where: { machineId }, data: { firstExecutionAt: null } });
+            await db.automation.update({ where: { id: automation.id }, data: { paused: true } });
+            const empty = await claim(next);
+            expect(empty.statusCode).toBe(200);
+            expect(empty.json().claim).toBeNull();
+            expect(await firstExecution()).toBeNull();
         } finally {
+            await db.machine.update({ where: { id: machineId }, data: { automationPublicKey: null, automationProtocolVersion: 1 } });
             await app.close();
             await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
             await db.project.delete({ where: { id: project.id } });

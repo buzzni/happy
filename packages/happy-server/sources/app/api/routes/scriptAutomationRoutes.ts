@@ -5,7 +5,7 @@ import { scriptAdmissionSchema, scriptEncryptedValueSchema, scriptRegistrationRe
 import { verifyScriptServiceToken, hashScriptManagementRequest, scriptAutomationId, type ScriptServiceOperation } from '@slopus/happy-wire/scriptServiceToken';
 import type { Fastify } from '../types';
 import { inTx } from '@/storage/inTx';
-import { lockLegacyWorkMachineExecution, lockWorkMachineExecution } from '@/app/machine/workMachineExecution';
+import { lockLegacyWorkMachineExecution, lockWorkMachineExecution, permitWorkMachineExecution } from '@/app/machine/workMachineExecution';
 import { verifyWorkMachineDaemonBearer } from '@/app/api/utils/enableAuthentication';
 import { projectAccess } from '@/app/automation/automationService';
 import { saveScriptAutomation } from '@/app/automation/scriptRegistrationService';
@@ -54,7 +54,8 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
    * A machine under work-machine authority runs scripts only with its device
    * daemon credential, and only for its own machine path. Each call locks the
    * live generation: a claim is new work and stops at drain, leaving queued
-   * runs untouched; a run already claimed keeps reporting until the freeze.
+   * runs untouched, and a claim handed out records the first execution; a run
+   * already claimed keeps reporting until the freeze.
    * Without a device credential the machine must be outside that authority.
    */
   async function authenticateWorker(request: FastifyRequest, reply: FastifyReply) {
@@ -67,15 +68,19 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
   function workerTransaction<T>(
     request: Pick<FastifyRequest, 'workMachineDaemonGrant'> & { userId: string; params: { machineId: string } },
     operation: (tx: Prisma.TransactionClient) => Promise<T>,
-    { newWork = false } = {},
+    { newWork = false, startedWork }: { newWork?: boolean; startedWork?: (result: T) => boolean } = {},
   ): Promise<T> {
     const grant = request.workMachineDaemonGrant;
     return dependencies.transaction(async tx => {
       const allowed = grant
-        ? grant.expiresAt > Date.now() && await lockWorkMachineExecution(tx, grant, { newWork })
+        ? grant.expiresAt > Date.now() && await lockWorkMachineExecution(tx, grant, { newWork: newWork || !!startedWork })
         : await lockLegacyWorkMachineExecution(tx, request.userId, request.params.machineId);
       if (!allowed) throw new Error('MACHINE_DENIED');
-      return operation(tx);
+      const result = await operation(tx);
+      // A claim handed to the device is work this generation runs: it records
+      // the first execution, which closes the way back.
+      if (grant && startedWork?.(result) && !await permitWorkMachineExecution(tx, grant, new Date())) throw new Error('MACHINE_DENIED');
+      return result;
     });
   }
 
@@ -263,7 +268,7 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
       const claim = await scriptQueueInTransaction(tx).claim(request.params.automationId, request.userId, request.params.machineId, Date.now());
       const artifact = claim ? await tx.scriptArtifact.findUniqueOrThrow({ where: { id: claim.run.snapshot.artifactId } }) : null;
       return { claim, artifact };
-    }, { newWork: true });
+    }, { startedWork: result => result.claim !== null });
     if (existing.claim) {
       try {
         await workerTransaction(request, (tx) => enqueueDueScript(tx, request.userId, request.params.machineId, request.params.automationId, Date.now()), { newWork: true });
@@ -277,7 +282,7 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
       const queued = await scriptQueueInTransaction(tx).claim(request.params.automationId, request.userId, request.params.machineId, Date.now());
       const artifact = queued ? await tx.scriptArtifact.findUniqueOrThrow({ where: { id: queued.run.snapshot.artifactId } }) : null;
       return { claim: queued, artifact };
-    }, { newWork: true });
+    }, { startedWork: result => result.claim !== null });
   }));
 
   async function ownedRun(tx: Prisma.TransactionClient, accountId: string, machineId: string, id: string) {
