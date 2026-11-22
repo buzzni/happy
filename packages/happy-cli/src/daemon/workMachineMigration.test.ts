@@ -389,6 +389,23 @@ describe('work machine export and import over the Studio transfer API', () => {
         await expect(createWorkMachineRestoreProof({ home: fixture.sourceHome, machineId: 'another-machine', generation: 4 })).rejects.toThrow();
     });
 
+    // Medium 14: a rerun after a lost answer must not replace the key the first proof names.
+    it('returns the same restore proof and key on a rerun for the same generation', async () => {
+        const fixture = await machinesFixture(root, studio);
+        await writeFile(join(fixture.sourceHome, 'access.key'), JSON.stringify({
+            token: 'source-account-token',
+            encryption: { publicKey: Buffer.from(nacl.box.keyPair().publicKey).toString('base64'), machineKey: randomBytes(32).toString('base64') },
+        }), { mode: 0o600 });
+        const first = await createWorkMachineRestoreProof({ home: fixture.sourceHome, machineId, generation: 4 });
+        const keyAfterFirst = await readFile(join(fixture.sourceHome, 'access.key'), 'utf8');
+
+        expect(await createWorkMachineRestoreProof({ home: fixture.sourceHome, machineId, generation: 4 })).toEqual(first);
+        expect(await readFile(join(fixture.sourceHome, 'access.key'), 'utf8')).toBe(keyAfterFirst);
+
+        const next = await createWorkMachineRestoreProof({ home: fixture.sourceHome, machineId, generation: 5 });
+        expect(next.dataEncryptionKey).not.toBe(first.dataEncryptionKey);
+    });
+
     it.each(['import', 'restore-proof'] as const)('keeps the access.key fields it does not own when %s replaces the key', async (operation) => {
         const fixture = await machinesFixture(root, studio);
         const home = operation === 'import' ? fixture.targetHome : fixture.sourceHome;

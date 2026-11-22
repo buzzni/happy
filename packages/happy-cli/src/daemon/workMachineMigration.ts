@@ -13,7 +13,8 @@
  *
  * State lives in `HAPPY_HOME/work-machine-transfer/<jobId>/` (0700): the recipient key, the sealed
  * export with its part digests (a rerun resumes the same bytes), downloaded parts and the restore
- * report (a rerun re-sends it after a lost answer).
+ * report (a rerun re-sends it after a lost answer). Restore proofs are kept in
+ * `HAPPY_HOME/work-machine-restore/<machineId>-<generation>.json` for the same reason.
  *
  * Uploaded object = sealed archive ‖ receipt JSON ‖ uint32be(receipt length) ‖ "WMR1". The manifest
  * field list of plan 5.6 has no receipt, so it travels inside the signed part digests.
@@ -64,6 +65,11 @@ const exportStateSchema = manifestSchema.omit({ jobId: true, machineId: true, so
     .extend({ md5: z.array(z.string()) });
 const recipientFileSchema = z.object({ approval: z.unknown(), recipientSecret: z.string() });
 const restoredSchema = z.object({ deviceId, dataEncryptionKey: z.string(), proof: z.unknown(), manifestSha256: sha256Hex });
+const restoreProofSchema = z.object({
+    deviceId, dataEncryptionKey: z.string(),
+    proof: z.object({ issuedAt: z.number(), publicKey: z.string(), signature: z.string() }),
+    machineKeySha256: sha256Hex,
+});
 
 type TransferEndpoint = {
     home: string;
@@ -117,6 +123,11 @@ function signScope(keys: DeviceKeys, scope: (issuedAt: number) => unknown[]): Wo
 }
 
 const accessKeySchema = z.object({ encryption: z.object({ machineKey: z.string() }).passthrough() }).passthrough();
+/** Names the machine key in access.key without keeping a copy of it. */
+async function machineKeyDigest(home: string): Promise<string | null> {
+    const stored = accessKeySchema.safeParse(await readJson(join(home, 'access.key')));
+    return stored.success ? createHash('sha256').update(stored.data.encryption.machineKey).digest('hex') : null;
+}
 
 /**
  * Replaces this home's machine data key and returns the new envelope (base64, as machine
@@ -477,18 +488,37 @@ export async function importWorkMachine(input: TransferEndpoint & {
     return { machineId: approval.machineId, deviceId: report.deviceId, manifestSha256: sha256 };
 }
 
+/**
+ * One restore proof per (machine, generation). The result is kept with a digest of the key it
+ * names, so a rerun after a lost answer returns the same proof instead of replacing a key the
+ * operator may already have handed to the rollback. A crash before it is kept leaves a key nobody
+ * was given, which a rerun may replace.
+ */
 export async function createWorkMachineRestoreProof(input: { home: string; machineId: string; generation: number }) {
     const binding = await readWorkMachineExecutionBinding(input.home);
     if (!binding || binding.machineId !== input.machineId) throw new Error('This home is not the original device of that work machine');
+    const pendingDirectory = join(input.home, 'work-machine-restore');
+    await mkdir(pendingDirectory, { recursive: true, mode: 0o700 });
+    const pendingPath = join(pendingDirectory, `${workMachineIdentifier.parse(input.machineId)}-${input.generation}.json`);
+    const pending = restoreProofSchema.safeParse(await readJson(pendingPath));
+    if (pending.success) {
+        const { machineKeySha256, ...proof } = pending.data;
+        if (machineKeySha256 !== await machineKeyDigest(input.home)) {
+            throw new Error(`The machine data key changed after the restore proof for generation ${input.generation} was made`);
+        }
+        return proof;
+    }
     return withDeviceKeys(input.home, input.machineId, async keys => {
         if (workMachineSigningIdentity(keys.signing.publicKey).deviceId !== binding.deviceId) {
             throw new Error('This home no longer holds the original device key');
         }
         const { dataEncryptionKey, digest } = await rotateMachineDataKey(input.home, `work-machine-restore-${input.generation}`);
-        return {
+        const proof = {
             deviceId: binding.deviceId,
             dataEncryptionKey,
             proof: signScope(keys, issuedAt => ['happy-work-machine-restore-v1', input.machineId, input.generation, binding.deviceId, digest, issuedAt]),
         };
+        await replacePrivateFile(pendingPath, JSON.stringify({ ...proof, machineKeySha256: await machineKeyDigest(input.home) }));
+        return proof;
     });
 }
