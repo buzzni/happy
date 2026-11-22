@@ -95,6 +95,19 @@ export default defineConfig({
                 },
             },
             {
+                // aplus specs/work-machine-migration 5.5 — opt-in; scripts/work-machine-rehearsal-linux.sh runs it on Linux.
+                extends: true,
+                test: {
+                    name: 'integration-work-machine-rehearsal',
+                    include: ['src/daemon/workMachineRehearsal.integration.test.ts'],
+                    setupFiles: ['./src/testing/unit.setup.ts'],
+                    fileParallelism: false,
+                    maxWorkers: 1,
+                    testTimeout: 600_000,
+                    hookTimeout: 120_000,
+                },
+            },
+            {
                 extends: true,
                 test: {
                     name: 'integration-provider-usage',
