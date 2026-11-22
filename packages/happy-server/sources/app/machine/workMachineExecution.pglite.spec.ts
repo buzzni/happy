@@ -13,6 +13,7 @@ import { promisify } from 'node:util';
 import { withSessionPiiModeMigration } from '@/testing/pgliteSessionModeFixture';
 import { auth } from '@/app/auth/auth';
 import { startSocket } from '@/app/api/socket';
+import { executeDaemonRpcLocally } from '@/app/api/socket/managedDaemonRpcRelay';
 import { machinesRoutes } from '@/app/api/routes/machinesRoutes';
 import { sessionRoutes } from '@/app/api/routes/sessionRoutes';
 import { sessionOwnershipRoutes } from '@/app/api/routes/sessionOwnershipRoutes';
@@ -119,6 +120,29 @@ describe('work machine execution authority', () => {
             expect((await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt).toBeNull();
             await freezeWorkMachineExecution(db, original);
             expect(await machineSockets.permitMachineDispatchSockets(db, accountId, machineId, [socket], now, true)).toEqual([]);
+        } finally {
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
+        }
+    });
+
+    it('allows read-only daemon RPC during drain without recording execution and rejects writes and frozen reads', async () => {
+        const now = Date.now();
+        const emitted: string[] = [];
+        const socket = { data: { workMachineExecution: { ...original, purpose: 'daemon', expiresAt: now + 60_000 } },
+            timeout: () => ({ emitWithAck: async (_event: string, request: { method: string }) => { emitted.push(request.method); return {}; } }) };
+        const invoke = async (method: string) => executeDaemonRpcLocally({
+            io: { sockets: { sockets: new Map([['socket', socket]]) } } as never,
+            request: { requestId: crypto.randomUUID(), targetSocketId: 'socket', method: `${machineId}:${method}`, params: {}, timeoutMs: 1000 },
+            onResult: () => {}, deps: { allowed: (async () => true) as never, now: () => now },
+        });
+        await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: new Date() } });
+        try {
+            expect((await invoke('readFile')).refused).toBe(false);
+            expect((await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt).toBeNull();
+            expect((await invoke('writeFile')).refused).toBe(true);
+            await freezeWorkMachineExecution(db, original);
+            expect((await invoke('readFile')).refused).toBe(true);
+            expect(emitted).toEqual([`${machineId}:readFile`]);
         } finally {
             await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
         }

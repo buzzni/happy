@@ -25,7 +25,7 @@
  */
 import type { Server, Socket } from 'socket.io';
 import type { WorkMachineExecutionClaims } from '@/app/auth/workMachineExecutionToken';
-import { permitWorkMachineExecution } from '@/app/machine/workMachineExecution';
+import { lockWorkMachineExecution, permitWorkMachineExecution } from '@/app/machine/workMachineExecution';
 import { splitRpcMethod } from '@/app/api/socket/managed/managedRpcTarget';
 import { db } from '@/storage/db';
 
@@ -104,11 +104,13 @@ export async function executeDaemonRpcLocally(input: {
     });
     const execution = socket.data?.workMachineExecution as WorkMachineExecutionClaims | undefined;
     if (allowed && execution) {
-        const scopeId = splitRpcMethod(input.request.method)?.sessionId;
+        const method = splitRpcMethod(input.request.method);
+        const scopeId = method?.sessionId;
+        const readOnly = method !== null && ['readFile', 'readFileChunk', 'listDirectory', 'listFilesPage'].includes(method.name);
         const expectedScopeId = execution.purpose === 'daemon' ? execution.machineId : execution.sessionId;
         try {
             allowed = scopeId === expectedScopeId && now() < execution.expiresAt
-                && await permitWorkMachineExecution(db, execution, new Date(now()));
+                && await (readOnly ? lockWorkMachineExecution(db, execution) : permitWorkMachineExecution(db, execution, new Date(now())));
         } catch {
             allowed = false;
         }
