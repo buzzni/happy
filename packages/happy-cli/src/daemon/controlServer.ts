@@ -1,3 +1,4 @@
+import type { ProviderIdentity } from './resumeCursorPersistence';
 import type { createDeviceEnrollment } from './deviceEnrollment';
 import { attachLocalToolAgentRelayRoutes } from './localToolAgentRelay';
 import { attachStandaloneDrain, type StandaloneDrain } from './standaloneDrain';
@@ -157,7 +158,7 @@ export function startDaemonControlServer({
    *  the conversation) — the daemon uses it to adopt sessions it isn't tracking. */
   onHappySessionRuntime?: (
     sessionId: string,
-    runtime: Partial<SessionRuntimeState> & { updatedAt: number },
+    runtime: Partial<SessionRuntimeState> & { updatedAt: number; providerIdentity?: ProviderIdentity },
     reporter?: { hostPid?: number },
   ) => void;
   /**
@@ -473,7 +474,10 @@ export function startDaemonControlServer({
           lastProcessedSeq: z.number().optional(),
           mode: z.enum(['local', 'remote']).optional(),
           /** PID of the reporting session process. Absent on older CLIs. */
-          hostPid: z.number().optional()
+          hostPid: z.number().optional(),
+          /** The provider conversation the session runs. Absent on older CLIs. */
+          claudeSessionId: z.string().min(1).max(200).optional(),
+          codexThreadId: z.string().min(1).max(200).optional(),
         }),
         response: {
           200: z.object({
@@ -486,7 +490,7 @@ export function startDaemonControlServer({
         }
       }
     }, async (request, reply) => {
-      const { sessionId, reportSeq, thinking, hasOpenToolCall, pendingUserInput, lastUserInteractionAt, lastTurnEndAt, assistantTurns, providerTokens, launchedBackgroundJob, lastProcessedSeq, mode, hostPid } = request.body;
+      const { sessionId, reportSeq, thinking, hasOpenToolCall, pendingUserInput, lastUserInteractionAt, lastTurnEndAt, assistantTurns, providerTokens, launchedBackgroundJob, lastProcessedSeq, mode, hostPid, claudeSessionId, codexThreadId } = request.body;
 
       const refusal = await refuseUnverifiedManagedReport({
         kind: 'session-runtime',
@@ -511,6 +515,7 @@ export function startDaemonControlServer({
         ...(launchedBackgroundJob !== undefined ? { launchedBackgroundJob } : {}),
         ...(lastProcessedSeq !== undefined ? { lastProcessedSeq } : {}),
         ...(mode !== undefined ? { mode } : {}),
+        ...(claudeSessionId || codexThreadId ? { providerIdentity: { ...(claudeSessionId ? { claudeSessionId } : {}), ...(codexThreadId ? { codexThreadId } : {}) } } : {}),
         updatedAt: Date.now()
       }, hostPid !== undefined ? { hostPid } : undefined);
 

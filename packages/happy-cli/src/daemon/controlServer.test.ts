@@ -345,7 +345,7 @@ describe('controlServer POST /session-runtime', () => {
   let stopServer: () => Promise<void>
   let runtimeReports: Array<{
     sessionId: string
-    runtime: { thinking?: boolean; hasOpenToolCall?: boolean; updatedAt: number }
+    runtime: { thinking?: boolean; hasOpenToolCall?: boolean; updatedAt: number; providerIdentity?: { claudeSessionId?: string; codexThreadId?: string } }
     reporter?: { hostPid?: number }
   }>
   let controlSecret = ''
@@ -404,6 +404,17 @@ describe('controlServer POST /session-runtime', () => {
       },
     })
     expect(runtimeReports[0].runtime.updatedAt).toBeGreaterThan(0)
+  })
+
+  it('forwards the provider conversation identity the session reports', async () => {
+    const res = await fetch(`${baseUrl}/session-runtime`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: 'session-1', claudeSessionId: '11111111-2222-4333-8444-555555555555' }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(runtimeReports[0].runtime).toMatchObject({ providerIdentity: { claudeSessionId: '11111111-2222-4333-8444-555555555555' } })
   })
 
   it('refuses a fractional turn-end timestamp at the door rather than merging it', async () => {

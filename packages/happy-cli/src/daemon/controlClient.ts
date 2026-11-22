@@ -281,6 +281,9 @@ export async function notifyDaemonSessionRuntime(
     launchedBackgroundJob?: boolean;
     lastProcessedSeq?: number;
     mode?: 'local' | 'remote';
+    /** The provider conversation the session runs, for the daemon's resume record. */
+    claudeSessionId?: string;
+    codexThreadId?: string;
   }
 ): Promise<{ error?: string } | any> {
   // Announce our own PID on every report. `daemonPost` re-reads daemon.state.json

@@ -2218,6 +2218,20 @@ describe('ApiSessionClient v3 messages API migration', () => {
         }));
     });
 
+    // aplus specs/work-machine-migration 5.4: a stopped work machine's export reads the provider
+    // conversation from the daemon's record, which is written before the provider names it.
+    it('reports the provider conversation identity so the daemon record can name it', () => {
+        const client = new ApiSessionClient('fake-token', { ...session, metadata: { ...session.metadata,
+            claudeSessionId: '11111111-2222-4333-8444-555555555555', codexThreadId: '019a0000-0000-7000-8000-000000000001' } });
+
+        client.keepAlive(true, 'remote');
+
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenCalledWith('test-session-id', expect.objectContaining({
+            claudeSessionId: '11111111-2222-4333-8444-555555555555',
+            codexThreadId: '019a0000-0000-7000-8000-000000000001',
+        }));
+    });
+
     // The daemon uses this as the resume skip-baseline: report the seq actually
     // delivered to the agent loop, or dead-period messages get swallowed.
     it('reports the delivered message seq as the resume skip-baseline', () => {

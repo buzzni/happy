@@ -2381,6 +2381,9 @@ export class ApiSessionClient extends EventEmitter {
             // swallows messages that arrive while the session has no process.
             lastProcessedSeq: Math.min(this.runtimeProcessedSeqCap ?? this.lastSeq, this.shutdownReceiveSeq ?? Infinity),
             mode: this.currentMode,
+            // The daemon's resume record names the provider conversation from here (a work machine export reads it).
+            ...(typeof this.metadata?.claudeSessionId === 'string' ? { claudeSessionId: this.metadata.claudeSessionId } : {}),
+            ...(typeof this.metadata?.codexThreadId === 'string' ? { codexThreadId: this.metadata.codexThreadId } : {}),
         }).then(settled, settled);
     }
 
