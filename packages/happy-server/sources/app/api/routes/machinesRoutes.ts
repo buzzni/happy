@@ -12,19 +12,7 @@ import { invalidateSessionFollowups } from "@/app/automation/sessionFollowupInva
 import { emitProjectAutomationUpdate } from "@/app/automation/automationUpdate";
 import type { ManagedControlRuntime } from "@/app/managed/managedControlRuntime";
 import { authorizeManagedDaemonRequest } from "@/app/managed/managedDaemonAccess";
-
-const MACHINE_DATA_KEY_ENVELOPE_LENGTH = 105;
-const MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH = 140;
-
-function decodeMachineDataKeyEnvelope(value: string): Uint8Array | null {
-    const decoded = Buffer.from(value, 'base64');
-    if (decoded.toString('base64') !== value
-        || decoded.length !== MACHINE_DATA_KEY_ENVELOPE_LENGTH
-        || decoded[0] !== 0x00) {
-        return null;
-    }
-    return new Uint8Array(decoded);
-}
+import { decodeMachineDataKeyEnvelope, MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH, machineDataKeyEnvelopesEqual } from "@/app/machine/machineDataKeyEnvelope";
 
 /** R21: 0x01 | attester public key (32) | nonce (24) | box (at least a statement and its tag). */
 const MACHINE_KEY_ATTESTATION_MIN_BYTES = 1 + 32 + 24 + 16 + 40;
@@ -36,10 +24,6 @@ function decodeMachineKeyAttestation(value: string): Buffer | null {
     const bytes = Buffer.from(value, 'base64');
     if (bytes.length < MACHINE_KEY_ATTESTATION_MIN_BYTES || bytes.length > MACHINE_KEY_ATTESTATION_MAX_BYTES || bytes[0] !== 1) return null;
     return bytes;
-}
-
-function machineDataKeyEnvelopesEqual(left: Uint8Array, right: Uint8Array): boolean {
-    return Buffer.from(left).equals(Buffer.from(right));
 }
 
 export function machinesRoutes(

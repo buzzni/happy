@@ -5,13 +5,29 @@ import { auth } from '@/app/auth/auth';
 import type { WorkMachineExecutionClaims } from '@/app/auth/workMachineExecutionToken';
 import { requireAccountPrincipal } from '@/app/api/utils/enableAuthentication';
 import type { Fastify } from '@/app/api/types';
-import { admitWorkMachineMcpCall, authorizeWorkMachineSession, enrollWorkMachineExecution, finishWorkMachineMcpCall, permitWorkMachineExecution, redeemWorkMachineRenewal } from '@/app/machine/workMachineExecution';
+import {
+    admitWorkMachineMcpCall, authorizeWorkMachineSession, drainWorkMachineExecution, enrollWorkMachineExecution,
+    finishWorkMachineMcpCall, freezeDrainedWorkMachineExecution, handoffWorkMachineExecution, permitWorkMachineExecution,
+    reconcileWorkMachineMcpCall, redeemWorkMachineRenewal, resumeWorkMachineExecution, type WorkMachineHandoff,
+} from '@/app/machine/workMachineExecution';
+import { decodeMachineDataKeyEnvelope, MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH } from '@/app/machine/machineDataKeyEnvelope';
+import { buildUpdateMachineUpdate, eventRouter } from '@/app/events/eventRouter';
+import { allocateUserSeq } from '@/storage/seq';
+import { inTx } from '@/storage/inTx';
+import { randomKeyNaked } from '@/utils/randomKeyNaked';
 import type { ControlAssertionVerifier, ControlOperation } from '@/app/managed/managedControlAssertion';
 import { db } from '@/storage/db';
 
 const identifier = z.string().min(1).max(200).refine(value => value.trim() === value && !value.includes(':'));
 const renewalLifetimeMs = 30_000;
 const grantLifetimeMs = 5 * 60_000;
+// The replacement signs at import and Studio forwards the proof at switch, which
+// an operator may take hours to reach. The proof names one generation, so it
+// cannot be used again once the handoff moves past it.
+const handoffProofLifetimeMs = 24 * 60 * 60_000;
+const maxOpenMcpCalls = 50;
+const deviceIdSchema = z.string().regex(/^[a-zA-Z0-9_-]{43}$/);
+const generationSchema = z.number().int().min(1).max(2_147_483_647);
 const deviceSignatureSchema = z.object({
     issuedAt: z.number().int().positive(),
     publicKey: z.string().regex(/^[a-zA-Z0-9_-]{59}$/),
@@ -66,12 +82,23 @@ export function workMachineExecutionRoutes(app: Fastify, getVerifier: () => Cont
         }
         const machine = await db.machine.findFirst({
             where: { id: machineId, accountId: request.userId },
-            select: { workMachineExecution: { select: { deviceId: true, generation: true, frozenAt: true } } },
+            select: { workMachineExecution: { select: {
+                deviceId: true, generation: true, drainingAt: true, frozenAt: true, firstExecutionAt: true,
+                mcpCalls: {
+                    where: { completedAt: null }, orderBy: { admittedAt: 'asc' }, take: maxOpenMcpCalls,
+                    select: { requestId: true, admittedAt: true },
+                },
+            } } },
         });
         if (!machine) return reply.code(404).send({ error: 'Work machine not found' });
         const authority = machine.workMachineExecution;
         return reply.header('Cache-Control', 'no-store').send(authority
-            ? { mode: 'device', deviceId: authority.deviceId, generation: authority.generation, frozen: authority.frozenAt !== null }
+            ? {
+                mode: 'device', deviceId: authority.deviceId, generation: authority.generation,
+                frozen: authority.frozenAt !== null, draining: authority.drainingAt !== null,
+                firstExecution: authority.firstExecutionAt !== null,
+                openMcpCalls: authority.mcpCalls.map(call => ({ requestId: call.requestId, admittedAt: call.admittedAt.getTime() })),
+            }
             : { mode: 'legacy' });
     });
 
@@ -223,5 +250,103 @@ export function workMachineExecutionRoutes(app: Fastify, getVerifier: () => Cont
             ? { ...scope, sessionId, expiresAt, purpose: 'session' }
             : { ...scope, expiresAt, purpose: 'daemon' };
         return reply.header('Cache-Control', 'no-store').send({ token: await issuer.mint(claims, now), expiresAt });
+    });
+
+    const transitions = {
+        drain: drainWorkMachineExecution,
+        freeze: freezeDrainedWorkMachineExecution,
+        resume: resumeWorkMachineExecution,
+    } as const;
+    for (const action of ['drain', 'freeze', 'resume'] as const) {
+        app.post(`/v1/work-machines/:machineId/execution-${action}`, {
+            preHandler: [app.authenticate, requireAccountPrincipal],
+            schema: {
+                params: z.object({ machineId: identifier }),
+                body: z.object({ deviceId: deviceIdSchema, generation: generationSchema }).strict(),
+            },
+            bodyLimit: 1_024,
+        }, async (request, reply) => {
+            const { machineId } = request.params;
+            if (!verifiedOperation(request.headers, machineId, `work-machine-${action}`, request.body, Date.now())) {
+                return reply.code(403).send({ error: 'Work machine transition not authorized' });
+            }
+            const state = await transitions[action](db, { accountId: request.userId, machineId, ...request.body });
+            if (!state) return reply.code(409).send({ error: 'Work machine transition not ready' });
+            return reply.header('Cache-Control', 'no-store').send(state);
+        });
+    }
+
+    const handoffs = {
+        replace: { nextDevice: 'replacementDeviceId', scope: 'happy-work-machine-replace-v1' },
+        restore: { nextDevice: 'originalDeviceId', scope: 'happy-work-machine-restore-v1' },
+    } as const;
+    for (const kind of ['replace', 'restore'] as const satisfies readonly WorkMachineHandoff[]) {
+        const { nextDevice, scope } = handoffs[kind];
+        app.post(`/v1/work-machines/:machineId/execution-${kind}`, {
+            preHandler: [app.authenticate, requireAccountPrincipal],
+            schema: {
+                params: z.object({ machineId: identifier }),
+                body: z.object({
+                    deviceId: deviceIdSchema,
+                    generation: generationSchema,
+                    [nextDevice]: deviceIdSchema,
+                    dataEncryptionKey: z.string().max(MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH),
+                    proof: deviceSignatureSchema,
+                }).strict(),
+            },
+            bodyLimit: 2_048,
+        }, async (request, reply) => {
+            const { machineId } = request.params;
+            const { deviceId, generation, dataEncryptionKey, proof } = request.body as {
+                deviceId: string; generation: number; dataEncryptionKey: string; proof: z.infer<typeof deviceSignatureSchema>;
+            };
+            const nextDeviceId = (request.body as Record<string, string>)[nextDevice];
+            const key = decodeMachineDataKeyEnvelope(dataEncryptionKey);
+            if (!key) return reply.code(400).send({ error: 'invalid-data-encryption-key-envelope' });
+            const now = Date.now();
+            // The next device signs the exact envelope bytes it made, so the
+            // control plane cannot pair its proof with a different key.
+            const keyDigest = createHash('sha256').update(key).digest('base64url');
+            const proofScope = [scope, machineId, generation, nextDeviceId, keyDigest, proof.issuedAt];
+            if (!verifiedOperation(request.headers, machineId, `work-machine-${kind}`, request.body, now)
+                || !verifyDeviceSignature(nextDeviceId, proof, proofScope, now, handoffProofLifetimeMs)) {
+                return reply.code(403).send({ error: 'Work machine handoff not authorized' });
+            }
+            const accountId = request.userId;
+            const result = await inTx(tx => handoffWorkMachineExecution(
+                tx, kind, { accountId, machineId, deviceId, generation }, nextDeviceId, key,
+            ));
+            if (!result) return reply.code(409).send({ error: 'Work machine handoff not ready' });
+            if (result.changed) {
+                const { metadata, metadataVersion, daemonState, daemonStateVersion } = result.machine;
+                const payload = buildUpdateMachineUpdate(machineId, await allocateUserSeq(accountId), randomKeyNaked(12),
+                    { value: metadata, version: metadataVersion },
+                    daemonState === null ? undefined : { value: daemonState, version: daemonStateVersion });
+                eventRouter.emitUpdate({ userId: accountId, payload, recipientFilter: { type: 'user-scoped-only' } });
+                eventRouter.emitUpdate({ userId: accountId, payload, recipientFilter: { type: 'machine-scoped-only', machineId } });
+            }
+            return reply.header('Cache-Control', 'no-store').send({ deviceId: nextDeviceId, generation: generation + 1 });
+        });
+    }
+
+    app.post('/v1/work-machines/:machineId/mcp-reconcile', {
+        preHandler: [app.authenticate, requireAccountPrincipal],
+        schema: {
+            params: z.object({ machineId: identifier }),
+            body: z.object({ deviceId: deviceIdSchema, generation: generationSchema, requestId: z.string().uuid() }).strict(),
+        },
+        bodyLimit: 1_024,
+    }, async (request, reply) => {
+        const { machineId } = request.params;
+        if (!verifiedOperation(request.headers, machineId, 'work-machine-mcp-reconcile', request.body, Date.now())) {
+            return reply.code(403).send({ error: 'Work machine connector reconcile not authorized' });
+        }
+        const { deviceId, generation, requestId } = request.body;
+        const result = await db.$transaction(tx => reconcileWorkMachineMcpCall(
+            tx, { accountId: request.userId, machineId, deviceId, generation }, requestId,
+        ));
+        if (result === 'not-frozen') return reply.code(409).send({ error: 'Work machine is not frozen' });
+        if (result === 'not-found') return reply.code(404).send({ error: 'Work machine connector call not found' });
+        return reply.header('Cache-Control', 'no-store').send({ requestId, reconciledAt: result.reconciledAt?.getTime() ?? null });
     });
 }

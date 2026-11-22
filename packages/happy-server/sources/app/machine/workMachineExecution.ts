@@ -1,4 +1,5 @@
 import type { Prisma, PrismaClient } from '@prisma/client';
+import { machineDataKeyEnvelopesEqual } from '@/app/machine/machineDataKeyEnvelope';
 
 type ExecutionDb = Pick<Prisma.TransactionClient, 'workMachineExecution' | '$queryRaw'>;
 
@@ -189,6 +190,7 @@ export async function replaceWorkMachineExecution(
         data: {
             deviceId: replacementDeviceId,
             generation: { increment: 1 },
+            drainingAt: null,
             frozenAt: null,
             firstExecutionAt: null,
         },
@@ -201,12 +203,13 @@ export async function permitWorkMachineExecution(
     db: ExecutionDb,
     grant: WorkMachineDeviceGrant,
     permittedAt: Date,
+    allowDraining = false,
 ): Promise<boolean> {
     const existing = await db.$queryRaw<{ machineId: string }[]>`
         SELECT "machineId" FROM "WorkMachineExecution"
         WHERE "machineId" = ${grant.machineId} AND "accountId" = ${grant.accountId}
           AND "deviceId" = ${grant.deviceId} AND "generation" = ${grant.generation}
-          AND "frozenAt" IS NULL AND "firstExecutionAt" IS NOT NULL
+          AND "frozenAt" IS NULL AND (${allowDraining} OR "drainingAt" IS NULL) AND "firstExecutionAt" IS NOT NULL
         FOR SHARE
     `;
     if (existing.length === 1) return true;
@@ -215,7 +218,7 @@ export async function permitWorkMachineExecution(
         SET "firstExecutionAt" = COALESCE("firstExecutionAt", ${permittedAt})
         WHERE "machineId" = ${grant.machineId} AND "accountId" = ${grant.accountId}
           AND "deviceId" = ${grant.deviceId} AND "generation" = ${grant.generation}
-          AND "frozenAt" IS NULL
+          AND "frozenAt" IS NULL AND (${allowDraining} OR "drainingAt" IS NULL)
         RETURNING "machineId"
     `;
     return changed.length === 1;
@@ -229,7 +232,7 @@ export async function admitWorkMachineMcpCall(
 ): Promise<boolean> {
     try {
         return await db.$transaction(async tx => {
-            if (!await permitWorkMachineExecution(tx, device, new Date())) return false;
+            if (!await permitWorkMachineExecution(tx, device, new Date(), true)) return false;
             const inserted = await tx.workMachineMcpCall.createMany({
                 data: { ...matchGrant(device), requestId },
                 skipDuplicates: true,
@@ -261,7 +264,137 @@ export async function restoreWorkMachineExecution(
 ): Promise<boolean> {
     const changed = await db.workMachineExecution.updateMany({
         where: { ...matchGrant(replacement), firstExecutionAt: null, frozenAt: null },
-        data: { deviceId: originalDeviceId, generation: { increment: 1 } },
+        data: { deviceId: originalDeviceId, generation: { increment: 1 }, drainingAt: null },
     });
     return changed.count === 1;
+}
+
+const transitionSelect = { deviceId: true, generation: true, drainingAt: true, frozenAt: true } as const;
+
+/** The generation's place in the drain → freeze sequence, as the operator routes report it. */
+export interface WorkMachineTransitionState {
+    deviceId: string;
+    generation: number;
+    draining: boolean;
+    frozen: boolean;
+}
+
+async function readTransitionState(
+    db: ExecutionDb,
+    where: Prisma.WorkMachineExecutionWhereInput,
+): Promise<WorkMachineTransitionState | null> {
+    const row = await db.workMachineExecution.findFirst({ where, select: transitionSelect });
+    return row && {
+        deviceId: row.deviceId, generation: row.generation,
+        draining: row.drainingAt !== null, frozen: row.frozenAt !== null,
+    };
+}
+
+/**
+ * Stops new work in the current generation: turn permits, write RPCs and
+ * state-changing preview requests are refused while in-turn writes continue.
+ * Repeating it, also after the freeze, reports the drained state again. Null
+ * when the row is no longer at this device and generation.
+ */
+export async function drainWorkMachineExecution(db: ExecutionDb, grant: WorkMachineDeviceGrant) {
+    await db.workMachineExecution.updateMany({
+        where: { ...matchGrant(grant), drainingAt: null, frozenAt: null },
+        data: { drainingAt: new Date() },
+    });
+    return readTransitionState(db, { ...matchGrant(grant), drainingAt: { not: null } });
+}
+
+/** Freezes a drained generation, which stops every write. Null unless it was drained first. */
+export async function freezeDrainedWorkMachineExecution(db: ExecutionDb, grant: WorkMachineDeviceGrant) {
+    await db.workMachineExecution.updateMany({
+        where: { ...matchGrant(grant), drainingAt: { not: null }, frozenAt: null },
+        data: { frozenAt: new Date() },
+    });
+    return readTransitionState(db, { ...matchGrant(grant), drainingAt: { not: null }, frozenAt: { not: null } });
+}
+
+/** Cancels a handoff before it happens: the same device and generation run again. */
+export async function resumeWorkMachineExecution(db: ExecutionDb, grant: WorkMachineDeviceGrant) {
+    await db.workMachineExecution.updateMany({
+        where: { ...matchGrant(grant), OR: [{ drainingAt: { not: null } }, { frozenAt: { not: null } }] },
+        data: { drainingAt: null, frozenAt: null },
+    });
+    return readTransitionState(db, { ...matchGrant(grant), drainingAt: null, frozenAt: null });
+}
+
+export type WorkMachineHandoff = 'replace' | 'restore';
+
+/**
+ * Moves the authority to the next device in the next generation and installs
+ * the machine data key that device created, in the caller's transaction.
+ * Replace needs a frozen generation without an open connector call; restore
+ * needs a replacement that has not received its first execution permit. The
+ * authority row is locked before the machine row, the order the daemon's
+ * machine writes use. As in a key rotation, the server envelopes and the
+ * attestation of the old key are cleared and both row versions move, so a
+ * write prepared against the old key cannot land. A retry after a lost
+ * response finds the device, generation and key in place and writes nothing.
+ */
+export async function handoffWorkMachineExecution(
+    tx: Prisma.TransactionClient,
+    kind: WorkMachineHandoff,
+    current: WorkMachineDeviceGrant,
+    nextDeviceId: string,
+    dataEncryptionKey: Uint8Array,
+) {
+    const { accountId, machineId } = current;
+    const moved = kind === 'replace'
+        ? await replaceWorkMachineExecution(tx, current, nextDeviceId)
+        : await restoreWorkMachineExecution(tx, current, nextDeviceId);
+    if (!moved) {
+        const applied = await tx.workMachineExecution.findFirst({
+            where: { accountId, machineId, deviceId: nextDeviceId, generation: current.generation + 1 },
+            select: { machine: { select: { dataEncryptionKey: true } } },
+        });
+        const key = applied?.machine.dataEncryptionKey;
+        return key && machineDataKeyEnvelopesEqual(key, dataEncryptionKey) ? { changed: false as const } : null;
+    }
+    const machine = await tx.machine.update({
+        where: { id: machineId, accountId },
+        data: {
+            dataEncryptionKey: new Uint8Array(dataEncryptionKey),
+            serverDataEncryptionKey: null,
+            serverRpcKeyEnvelope: null,
+            dataKeyAttestation: null,
+            metadataVersion: { increment: 1 },
+            daemonStateVersion: { increment: 1 },
+        },
+        select: { metadata: true, metadataVersion: true, daemonState: true, daemonStateVersion: true },
+    });
+    return { changed: true as const, machine };
+}
+
+/**
+ * The operator's verdict on a connector call whose outcome nobody can
+ * confirm. Only a frozen generation's call can be closed this way; it records
+ * `reconciledAt` and closes the call so the handoff can go ahead. A call that
+ * already finished normally stays as it was and reports no reconciliation.
+ */
+export async function reconcileWorkMachineMcpCall(
+    tx: Prisma.TransactionClient,
+    grant: WorkMachineDeviceGrant,
+    requestId: string,
+): Promise<'not-frozen' | 'not-found' | { reconciledAt: Date | null }> {
+    const frozen = await tx.$queryRaw<{ machineId: string }[]>`
+        SELECT "machineId" FROM "WorkMachineExecution"
+        WHERE "machineId" = ${grant.machineId} AND "accountId" = ${grant.accountId}
+          AND "deviceId" = ${grant.deviceId} AND "generation" = ${grant.generation}
+          AND "frozenAt" IS NOT NULL
+        FOR SHARE
+    `;
+    if (frozen.length !== 1) return 'not-frozen';
+    const now = new Date();
+    await tx.workMachineMcpCall.updateMany({
+        where: { ...matchGrant(grant), requestId, completedAt: null },
+        data: { completedAt: now, reconciledAt: now },
+    });
+    const call = await tx.workMachineMcpCall.findFirst({
+        where: { ...matchGrant(grant), requestId }, select: { reconciledAt: true },
+    });
+    return call ?? 'not-found';
 }
