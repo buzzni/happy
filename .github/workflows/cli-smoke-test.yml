@@ -82,7 +82,6 @@ jobs:
         src/daemon/sessionRetention.test.ts
         src/daemon/sessionRetentionControl.test.ts
         src/daemon/sessionIdleReaper.test.ts
-        src/daemon/residentModuleHost.test.ts
 
     - name: Verify Claude account switches preserve queued input
       if: matrix.node-version == 24
@@ -249,7 +248,6 @@ jobs:
         src/browserRuntime/desktopBrowserLogin.test.ts
         src/daemon/personalBrowserRuntime.test.ts
         src/daemon/browserSessionReconnect.test.ts
-        src/daemon/residentModuleHost.test.ts
 
     - name: Verify sessions reach their own CLI as `happy` from cmd and Git Bash
       timeout-minutes: 5

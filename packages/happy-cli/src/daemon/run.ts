@@ -1928,10 +1928,9 @@ export async function startDaemon(): Promise<void> {
     let releaseSetupTokenAccounts = (_managedAccountIds: string[]): void => {};
 
     const launchReadiness = createLaunchReadinessGate();
-    if (['win32', 'darwin', 'linux'].includes(process.platform) && !process.versions.electron && !process.versions.bun
+    if (process.platform === 'win32' && !process.versions.electron && !process.versions.bun
       && 'registerHooks' in moduleApi && typeof moduleApi.registerHooks === 'function'
-      && process.env.HAPPY_DISABLE_RESIDENT_MODULES !== '1'
-      && resolveHappyCliSpawnCommand([]).tsconfigPath === undefined) {
+      && process.env.HAPPY_DISABLE_RESIDENT_MODULES !== '1') {
       residentModules = startResidentModuleHost(projectPath());
     }
     const ownsUnresolvedJob = (pid: number) => standaloneWindows?.owner.ownsRoot(pid) ?? false;

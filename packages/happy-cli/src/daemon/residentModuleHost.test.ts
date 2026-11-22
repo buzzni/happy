@@ -4,13 +4,12 @@ import { cp, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import { RESIDENT_MODULE_HOST_ENV } from '@/utils/childEnv'
 import { startResidentModuleHost } from './residentModuleHost'
 
 const execute = promisify(execFile)
-const supportsLoaderHooks = 'registerHooks' in moduleApi && typeof moduleApi.registerHooks === 'function'
 const tempRoots: string[] = []
 afterEach(async () => {
   await Promise.all(tempRoots.splice(0).map(root => rm(root, { recursive: true, force: true })))
@@ -43,9 +42,9 @@ async function fixture() {
 }
 
 describe('resident Happy module host', () => {
-  it.skipIf(!supportsLoaderHooks)('reuses one Windows bundle across separate Claude and Codex working environments', async () => {
+  it.skipIf(!('registerHooks' in moduleApi) || typeof moduleApi.registerHooks !== 'function')('reuses one installation snapshot across separate Claude and Codex working environments', async () => {
     const { root, dist, companion, launch } = await fixture()
-    const host = startResidentModuleHost(root, 'win32')
+    const host = startResidentModuleHost(root)
     try {
       expect(await host.ready).toBe(true)
       const descriptor = host.descriptor()
@@ -66,39 +65,9 @@ describe('resident Happy module host', () => {
     } finally { await host.close() }
   }, 15_000)
 
-  it.skipIf(!supportsLoaderHooks).each(['darwin', 'linux'] as const)('keeps the original module paths for %s sessions', async platform => {
-    const { root, dist, launch } = await fixture()
-    const host = startResidentModuleHost(root, platform)
-    try {
-      expect(await host.ready).toBe(true)
-      await writeFile(join(dist, 'companion.mjs'), "export const kind = 'changed after warmup'")
-      expect(await launch(root, 'claude', platform, host.descriptor())).toMatchObject({
-        kind: 'ordinary',
-        entry: pathToFileURL(join(dist, 'index.mjs')).href,
-        tokenPresent: false,
-      })
-    } finally { await host.close() }
-  }, 15_000)
-
-  it.skipIf(!supportsLoaderHooks)('starts the built CLI using the host OS module snapshot', async () => {
-    const root = fileURLToPath(new URL('../../', import.meta.url))
-    const host = startResidentModuleHost(root)
-    try {
-      expect(await host.ready).toBe(true)
-      const { stdout, stderr } = await execute(process.execPath, ['bin/happy-resident-session.mjs', '--version'], {
-        cwd: root,
-        env: { ...process.env, [RESIDENT_MODULE_HOST_ENV]: host.descriptor() },
-        timeout: 15_000,
-        windowsHide: true,
-      })
-      expect(stdout).toMatch(/happy version:/i)
-      expect(stderr).toContain('resident Happy modules ready')
-    } finally { await host.close() }
-  }, 20_000)
-
   it('starts the ordinary entry if the module host has already stopped', async () => {
     const { root, launch } = await fixture()
-    const host = startResidentModuleHost(root, 'win32')
+    const host = startResidentModuleHost(root)
     expect(await host.ready).toBe(true)
     const descriptor = host.descriptor()
     await host.close()
