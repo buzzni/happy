@@ -6804,13 +6804,17 @@ export async function startDaemon(): Promise<void> {
         `[lesson-host] shutdown: ${(error as Error).message}`,
       ));
 
-      // Update daemon state before shutting down
-      await apiMachine.updateDaemonState((state: DaemonState | null) => ({
-        ...state,
-        status: 'shutting-down',
-        shutdownRequestedAt: Date.now(),
-        shutdownSource: source
-      }));
+      // Update daemon state before shutting down. Best effort and bounded: the server never
+      // answers a frozen work machine generation, and the stop must still finish cleanly.
+      await Promise.race([
+        apiMachine.updateDaemonState((state: DaemonState | null) => ({
+          ...state,
+          status: 'shutting-down',
+          shutdownRequestedAt: Date.now(),
+          shutdownSource: source
+        })),
+        new Promise(resolve => setTimeout(resolve, 3_000).unref()),
+      ]);
 
       // Give time for metadata update to send
       await new Promise(resolve => setTimeout(resolve, 100));
