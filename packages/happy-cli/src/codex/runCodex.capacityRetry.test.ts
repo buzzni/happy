@@ -46,6 +46,14 @@ vi.mock('@/codex/codexCapacityRetry', async (importOriginal) => ({
     CODEX_CAPACITY_RETRY_DELAYS_MS: [20, 20],
 }));
 
+/** Only the codex on disk is faked; the loop's own update-and-retry wiring is real. */
+const codexSelfUpdate = vi.hoisted(() => ({ update: vi.fn(async () => ({ text: '0.166.0', parts: [0, 166, 0], prerelease: false })), markRunning: vi.fn() }));
+vi.mock('@/codex/codexSelfUpdate', async (importOriginal) => ({
+    ...await importOriginal<typeof import('@/codex/codexSelfUpdate')>(),
+    createCodexSelfUpdater: () => ({ runningVersion: Promise.resolve(null), ...codexSelfUpdate }),
+}));
+const reconnects = vi.hoisted(() => vi.fn(async () => true));
+
 const queues: InstanceType<typeof import('@/utils/MessageQueue2').MessageQueue2>[] = [];
 vi.mock('@/utils/MessageQueue2', async (importOriginal) => {
     const original = await importOriginal<typeof import('@/utils/MessageQueue2')>();
@@ -60,7 +68,7 @@ vi.mock('@/utils/MessageQueue2', async (importOriginal) => {
 
 const protocolMessages: SessionEnvelope[] = [];
 let runtimeEvidence: TurnInputEvidence;
-type Outcome = 'overloaded' | 'ok' | 'write-failure' | 'prepare-failure' | 'sync-write-failure';
+type Outcome = 'overloaded' | 'codex-too-old' | 'ok' | 'write-failure' | 'prepare-failure' | 'sync-write-failure';
 let script: { outcome: Outcome; beforeWrite?: () => Promise<void>; after?: () => void | Promise<void> }[] = [];
 let turnsSent: string[] = [];
 let failingWrites = 0;
@@ -74,6 +82,12 @@ const OVERLOADED = {
         codexErrorInfo: 'serverOverloaded',
         additionalDetails: null,
     },
+};
+
+const CODEX_TOO_OLD = {
+    type: 'task_complete',
+    status: 'failed',
+    error: { message: "The 'gpt-6.2-sol' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.", additionalDetails: null },
 };
 
 vi.mock('@/codex/codexAppServerClient', async (importOriginal) => {
@@ -115,6 +129,7 @@ vi.mock('@/codex/codexAppServerClient', async (importOriginal) => {
             if (step.outcome === 'ok') eventHandler?.({ type: 'agent_message', phase: 'final_answer', message: 'fixed', turn_id: `turn-${turnsSent.length}` });
             eventHandler?.(step.outcome === 'overloaded'
                 ? { ...OVERLOADED, turn_id: `turn-${turnsSent.length}` }
+                : step.outcome === 'codex-too-old' ? { ...CODEX_TOO_OLD, turn_id: `turn-${turnsSent.length}` }
                 : { type: 'task_complete', status: 'completed', turn_id: `turn-${turnsSent.length}` });
             await step.after?.();
             return { aborted: false };
@@ -124,7 +139,7 @@ vi.mock('@/codex/codexAppServerClient', async (importOriginal) => {
         interruptTurn = vi.fn(async () => {});
         prepareProtectedTurn = vi.fn(() => ({ release: vi.fn() }));
         endInputAndAwaitExit = vi.fn(async () => {});
-        reconnectAndResumeThread = vi.fn(async () => ({ id: 'thread-1' }));
+        reconnectAndResumeThread = reconnects;
         setGoal = vi.fn();
         clearGoal = vi.fn();
         disconnect = vi.fn(async () => {});
@@ -196,6 +211,7 @@ const closeQueue = () => { queues[0]!.close(); };
 describe('automatic continuation after a capacity failure', () => {
     beforeEach(() => {
         protocolMessages.length = 0; queues.length = 0; sessionEvents.length = 0; rpc.clear(); turnsSent = []; failingWrites = 0; script = []; eventHandler = null; onUserMessage = null; reportCapacityFailure.mockClear();
+        codexSelfUpdate.update.mockClear(); codexSelfUpdate.markRunning.mockClear(); reconnects.mockClear();
         sessionMetadata = { path: '/workspace/project', codexThreadId: 'thread-1' };
         // Run from inside a Saycode session, the runner would otherwise pick up that
         // session's own lesson host, reconnect target and sandbox settings, and never exit.
@@ -610,6 +626,54 @@ describe('automatic continuation after a capacity failure', () => {
             expect(notices()).toHaveLength(1);
             expect(continuations()).toHaveLength(0);
             expect(turnsSent).toHaveLength(1);
+        }, 60_000);
+    });
+
+    describe('Codex CLI too old for the model', () => {
+        const updateNotices = () => sessionEvents.filter(e => e.message?.startsWith('Codex CLI'));
+        const push = async () => {
+            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 } });
+        };
+
+        it('updates codex, reconnects and sends the same input once more', async () => {
+            script = [{ outcome: 'codex-too-old' }, { outcome: 'ok', after: closeQueue }];
+            await run(push);
+
+            expect(codexSelfUpdate.update).toHaveBeenCalledTimes(1);
+            expect(reconnects).toHaveBeenCalledTimes(1);
+            expect(codexSelfUpdate.markRunning).toHaveBeenCalledWith(expect.objectContaining({ text: '0.166.0' }));
+            expect(turnsSent).toHaveLength(2);
+            expect(turnsSent[0]).toContain('fix the bug');
+            expect(turnsSent[1]).toContain('fix the bug');
+            expect(updateNotices().map(e => e.message)).toEqual([
+                'Codex CLI가 오래되어 자동 업데이트 중입니다. 완료 후 요청을 다시 시도합니다.',
+                'Codex CLI 업데이트가 완료되어 요청을 다시 시도합니다.',
+            ]);
+        }, 60_000);
+
+        it('retries an input only once, even when the retried turn is refused again', async () => {
+            script = [{ outcome: 'codex-too-old' }, { outcome: 'codex-too-old', after: closeQueue }];
+            await run(push);
+
+            expect(codexSelfUpdate.update).toHaveBeenCalledTimes(1);
+            expect(turnsSent).toHaveLength(2);
+        }, 60_000);
+
+        it('reports a failed update and does not resend the input', async () => {
+            codexSelfUpdate.update.mockRejectedValueOnce(new Error('Codex CLI is still 0.165.0 (running 0.165.0) after codex update'));
+            script = [{ outcome: 'codex-too-old', after: closeQueue }];
+            await run(push);
+
+            expect(reconnects).not.toHaveBeenCalled();
+            expect(turnsSent).toHaveLength(1);
+            expect(updateNotices().at(-1)?.message).toBe('Codex CLI 자동 업데이트에 실패했습니다: Codex CLI is still 0.165.0 (running 0.165.0) after codex update');
+        }, 60_000);
+
+        it('leaves other provider failures to the user', async () => {
+            script = [{ outcome: 'overloaded', after: () => { setTimeout(closeQueue, 200); } }];
+            await run(push);
+            expect(codexSelfUpdate.update).not.toHaveBeenCalled();
         }, 60_000);
     });
 });

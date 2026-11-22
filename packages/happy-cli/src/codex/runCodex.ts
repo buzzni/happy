@@ -41,6 +41,7 @@ import {
 } from './codexCapacityRetry';
 import type { ReasoningEffort } from './codexAppServerTypes';
 import { CodexPermissionHandler } from './utils/permissionHandler';
+import { codexUpgradeRequired, createCodexSelfUpdater } from './codexSelfUpdate';
 import { ReasoningProcessor } from './utils/reasoningProcessor';
 import { DiffProcessor } from './utils/diffProcessor';
 import { randomUUID } from 'node:crypto';
@@ -1935,6 +1936,8 @@ export async function runCodex(opts: {
 
     /** A sub-agent list was written by this runtime: from then on an emptied list must be written too. */
     let codexSubagentListWritten = false;
+    /** The provider failure of the turn in flight; a "requires a newer version of Codex" one starts the self-update. */
+    let latestCodexFailure: string | null = null;
     // Event handler: same EventMsg types as the legacy MCP server — no changes needed
     client.setEventHandler((msg) => {
         if (msg.type === 'agent_message_delta' && typeof msg.delta === 'string') activeLatency?.text(msg.delta);
@@ -2051,6 +2054,7 @@ export async function runCodex(opts: {
             // inactivity notice applies here too, not just to turn_aborted.
             const inactivityNotice = describeCodexInactivityAbort(msg);
             const failure = describeCodexFailure(msg);
+            latestCodexFailure = failure;
             if (isCodexServerOverloadedFailure(msg)) turnServerOverloaded = true;
             if (inactivityNotice) {
                 const message = failure ? `${inactivityNotice} Provider error: ${failure}` : inactivityNotice;
@@ -2065,6 +2069,7 @@ export async function runCodex(opts: {
         } else if (msg.type === 'turn_aborted') {
             const inactivityNotice = describeCodexInactivityAbort(msg);
             const failure = describeCodexFailure(msg);
+            latestCodexFailure = failure;
             if (inactivityNotice) {
                 // Our own watchdog force-stopped a hung turn: without this the turn
                 // ends silently and the user never learns why nothing came back.
@@ -2511,6 +2516,9 @@ export async function runCodex(opts: {
             else launchControl!.bind(provider, storage, runtimeGate);
         }
 
+        // aplus specs/codex-cli-update-recovery: one update and one retry per input when Codex is too old.
+        const codexSelfUpdate = createCodexSelfUpdater();
+        let codexUpgradeRetryMessage: CollectedBatch<EnhancedMode> | null = null;
         while (!shouldExit) {
             logActiveHandles('loop-top');
             let message: CollectedBatch<EnhancedMode> | null = pending;
@@ -2674,7 +2682,7 @@ export async function runCodex(opts: {
                 }
 
                 // Display user messages in the UI
-                if (message.message.trim().length > 0) {
+                if (message.message.trim().length > 0 && codexUpgradeRetryMessage !== message) {
                     messageBuffer.addMessage(message.message, 'user');
                 }
 
@@ -2965,6 +2973,7 @@ export async function runCodex(opts: {
                         if (validInput?.items) messageQueue.queue.unshift(...validInput.items);
                         continue;
                     }
+                    latestCodexFailure = null;
                     const result = await client.sendTurnAndWait(turnPrompt, {
                         beforeDispatch: () => {
                             const valid = messageQueue.revalidateBatch(message);
@@ -3001,6 +3010,25 @@ export async function runCodex(opts: {
                     latency?.finish(result.aborted ? 'cancelled' : 'completed');
                     lessonFrame.acceptingSteer = false;
                     if (lessonFrame.pendingSteer) preemptLessonReview();
+                    if (codexUpgradeRequired(latestCodexFailure) && codexUpgradeRetryMessage !== message) {
+                        codexUpgradeRetryMessage = message;
+                        // Saycode Desktop's staging patch reads this tag as "self-update is built in" and leaves the bundle alone.
+                        logger.debug('[codex-self-update] Codex CLI is too old for this turn; updating it and retrying once');
+                        messageBuffer.addMessage('Updating Codex CLI and retrying...', 'status');
+                        session.sendSessionEvent({ type: 'message', message: 'Codex CLI가 오래되어 자동 업데이트 중입니다. 완료 후 요청을 다시 시도합니다.' });
+                        try {
+                            const updatedVersion = await codexSelfUpdate.update();
+                            await client.reconnectAndResumeThread();
+                            codexSelfUpdate.markRunning(updatedVersion);
+                            pending = message;
+                            messageBuffer.addMessage('Codex CLI updated; retrying request', 'status');
+                            session.sendSessionEvent({ type: 'message', message: 'Codex CLI 업데이트가 완료되어 요청을 다시 시도합니다.' });
+                            continue;
+                        } catch (updateError) {
+                            const detail = updateError instanceof Error ? updateError.message : String(updateError);
+                            session.sendSessionEvent({ type: 'message', message: `Codex CLI 자동 업데이트에 실패했습니다: ${detail}` });
+                        }
+                    }
                     if (includeAppendSystemPrompt) {
                         appendSystemPromptInjected = true;
                     }
