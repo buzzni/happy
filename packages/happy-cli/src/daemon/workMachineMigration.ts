@@ -193,7 +193,7 @@ export async function exportWorkMachine(input: TransferEndpoint & {
         await mkdir(directory, { mode: 0o700 });
         const selection = await selectWorkMachineTransfer({
             happyHome: input.home, claudeConfigDir: input.claudeConfigDir, codexHome: input.codexHome,
-            projectPaths: plan.projectPaths, sessionIds: plan.sessions.map(session => session.sessionId),
+            projectPaths: plan.projectPaths, sessionIds: plan.sessions.map(session => session.sessionId), requireStopRecords: true,
         });
         const recordsFile = join(directory, 'records.json');
         await writeFile(recordsFile, JSON.stringify(selection.records), { mode: 0o600, flag: 'wx' });

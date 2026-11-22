@@ -20,6 +20,8 @@ import { Readable } from 'node:stream';
 import { create as createTar, extract as extractTar, list as listTar } from 'tar';
 import { z } from 'zod';
 import { getProjectPath } from '@/claude/utils/path';
+import { withReportedProviderIdentity } from './resumeCursorPersistence';
+import { readWorkMachineSessionStop, workMachineSessionStopPath } from './workMachineSessionStop';
 
 export type WorkMachineTransferSession = {
     sessionId: string;
@@ -34,7 +36,10 @@ export type WorkMachineTransferSelection = {
     /** Every absolute path archived, each root before its descendants. */
     entries: string[];
     sessions: WorkMachineTransferSession[];
-    /** The planned sessions' recovery records, verbatim from sessions.json. */
+    /**
+     * The planned sessions' recovery records from sessions.json, with the cursor and provider
+     * conversation their processes recorded when they stopped (workMachineSessionStop.ts).
+     */
     records: Record<string, unknown>;
 };
 
@@ -168,12 +173,33 @@ async function providerRoots(input: {
     return { session: { provider: 'codex', nativeId: codexThreadId! }, roots: matches };
 }
 
+/**
+ * The session's record as its process left it. The daemon's copy can trail the process by 30 s and
+ * counts input delivered to the loop, not input a turn ran; a session with no stop record, or one
+ * that stopped mid-turn, cannot say which input ran, and is never guessed at.
+ */
+async function stoppedRecord(happyHome: string, sessionId: string, stored: unknown): Promise<unknown> {
+    const stop = await readWorkMachineSessionStop(workMachineSessionStopPath(happyHome, sessionId), sessionId);
+    const drainLonger = 'Cancel the migration (resume) so the session can finish, then drain longer before freezing and exporting again';
+    if (!stop) {
+        throw new Error(`Session ${sessionId} has no clean-stop record: its process is still running or did not stop cleanly. ${drainLonger}`);
+    }
+    if (stop.turnInFlight) throw new Error(`Session ${sessionId} was stopped while a turn was still running. ${drainLonger}`);
+    if (stop.inputSkipped) throw new Error(`Session ${sessionId} stopped with an input that never started a turn before a later one did. ${drainLonger}`);
+    const record = z.object({ metadata: z.object({}).passthrough() }).passthrough().safeParse(stored);
+    if (!record.success) return stored;
+    const metadata = withReportedProviderIdentity(record.data.metadata, stop) ?? record.data.metadata;
+    return { ...record.data, metadata, lastProcessedSeq: stop.lastProcessedSeq };
+}
+
 export async function selectWorkMachineTransfer(input: {
     happyHome: string;
     claudeConfigDir: string;
     codexHome: string;
     projectPaths: string[];
     sessionIds: string[];
+    /** False only for the dry run (`export --check`), which runs while the sessions still do. */
+    requireStopRecords: boolean;
 }): Promise<WorkMachineTransferSelection> {
     const homes = [input.happyHome, input.claudeConfigDir, input.codexHome];
     for (const path of input.projectPaths) {
@@ -195,7 +221,8 @@ export async function selectWorkMachineTransfer(input: {
     for (const sessionId of [...new Set(input.sessionIds)].sort()) {
         identifier.parse(sessionId);
         if (!(sessionId in stored)) throw new Error(`Session ${sessionId} has no recovery record on this machine`);
-        const parsed = recordSchema.safeParse(stored[sessionId]);
+        const record = input.requireStopRecords ? await stoppedRecord(input.happyHome, sessionId, stored[sessionId]) : stored[sessionId];
+        const parsed = recordSchema.safeParse(record);
         if (!parsed.success) {
             throw new Error(`Session ${sessionId} is not transferable: it needs a dataKey record with a processed cursor and no staged user home`);
         }
@@ -212,7 +239,7 @@ export async function selectWorkMachineTransfer(input: {
         });
         sessions.push({ sessionId, ...provider.session, lastProcessedSeq });
         providerPaths.push(...provider.roots);
-        records[sessionId] = stored[sessionId];
+        records[sessionId] = record;
     }
     if (containsCredential(JSON.stringify(records))) {
         throw new Error(`Credential material found in ${join(input.happyHome, 'sessions.json')}; remove it before exporting`);

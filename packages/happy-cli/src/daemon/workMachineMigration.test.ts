@@ -12,6 +12,7 @@ import { getWorkMachineDeviceId, saveWorkMachineExecutionBinding, workMachineSig
 import {
     createWorkMachineRestoreProof, createWorkMachineTargetApproval, exportWorkMachine, importWorkMachine,
 } from './workMachineMigration';
+import { workMachineSessionStopPath, writeWorkMachineSessionStop } from './workMachineSessionStop';
 
 const machineId = 'logical-machine';
 const accountId = 'test-account';
@@ -131,6 +132,12 @@ async function machinesFixture(root: string, studio: FakeStudio) {
     });
     const sessions = { 'claude-session': record('claudeSessionId', claudeId, 7), 'codex-session': record('codexThreadId', codexId, 9) };
     await writeFile(join(sourceHome, 'sessions.json'), JSON.stringify({ sessions }), { mode: 0o600 });
+    // Both session processes stopped cleanly between turns (workMachineSessionStop.ts).
+    for (const [sessionId, lastProcessedSeq, provider] of [['claude-session', 7, { claudeSessionId: claudeId }], ['codex-session', 9, { codexThreadId: codexId }]] as const) {
+        writeWorkMachineSessionStop(workMachineSessionStopPath(sourceHome, sessionId), {
+            v: 1, sessionId, cleanStop: true, stoppedAt: 1_000, lastProcessedSeq, turnInFlight: false, inputSkipped: false, ...provider,
+        });
+    }
     const sourceDeviceId = await getWorkMachineDeviceId(sourceHome, machineId);
     await saveWorkMachineExecutionBinding(sourceHome, { accountId, machineId, generation, deviceId: sourceDeviceId, serverOrigin: 'https://happy.invalid' });
 
