@@ -68,7 +68,9 @@ export function appProfileSeed(profile: ClaudeAppProfile): Record<string, string
 export function consumeAppProfileSeed(env: NodeJS.ProcessEnv): ClaudeAppProfile | null {
     const raw = env[APP_PROFILE_ENV];
     delete env[APP_PROFILE_ENV];
-    if (typeof raw !== 'string' || raw.length === 0) return null;
+    if (raw === undefined) return null;
+    // Empty is the marker a resume carries for a record that no longer parsed (daemon/sessionEnv.ts).
+    if (raw.length === 0) throw new Error('App profile seed is empty');
     let value: unknown;
     try {
         value = JSON.parse(raw);

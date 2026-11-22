@@ -203,6 +203,17 @@ describe('claudeRemote', () => {
             expect(provide).not.toHaveBeenCalled();
         });
 
+        it('puts no recalled lessons or lesson instructions into the end user message', async () => {
+            const recall = vi.fn(async () => ({ outcome: 'selected', block: 'PROJECT LESSON', ticket: { id: 't' } }));
+            const lessons = { sessionId: 'app-session', sessionKind: 'interactive', turn: { recall }, review: null, observations: createLessonTurnObservations() };
+            await run({ appProfile, lessons });
+            expect(recall).not.toHaveBeenCalled();
+
+            vi.mocked(query).mockReset();
+            await run({ lessons });
+            expect(recall).toHaveBeenCalled();
+        });
+
         it('leaves a session without a profile as it was', async () => {
             const options = await run({});
 

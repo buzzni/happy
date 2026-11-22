@@ -39,6 +39,8 @@ describe('app profile seed', () => {
 
     it('fails a malformed seed instead of running without the profile', () => {
         expect(() => consumeAppProfileSeed({ [APP_PROFILE_ENV]: '{"version":1}' })).toThrow(/App profile/);
+        // The marker a resume carries for a record that no longer parses.
+        expect(() => consumeAppProfileSeed({ [APP_PROFILE_ENV]: '' })).toThrow(/App profile/);
     });
 });
 

@@ -646,8 +646,9 @@ async function runClaudeRemote(
      * overwritten by the next recall — so a late result cannot be attached to
      * a turn it did not belong to.
      */
-    const lessonTurn = opts.lessons?.sessionId ? (opts.lessons.turn ?? null) : null;
-    const lessonReview = opts.lessons?.sessionId ? (opts.lessons.review ?? null) : null;
+    // An app session answers a public service's end user: no project lesson reaches its input or is reviewed from it (T5).
+    const lessonTurn = opts.lessons?.sessionId && !opts.appProfile ? (opts.lessons.turn ?? null) : null;
+    const lessonReview = opts.lessons?.sessionId && !opts.appProfile ? (opts.lessons.review ?? null) : null;
     // Unknown means automation: a session this host cannot classify must not
     // be allowed to teach the project.
     const cancelProposal = () => opts.lessonProposalTurn?.cancel();
@@ -748,6 +749,7 @@ function readTurnText(content: unknown): string {
     const isCommandInput = (content: unknown) => /^\/\S/.test(readTurnText(content).trimStart());
     let queryClosed = false;
     const withLessons = async (content: string | ContentBlockParam[], spans?: PreparationSpan[]) => {
+        if (opts.appProfile) return content;
         // Native slash commands must remain the first provider input token. The transient retry note
         // joins the failed request, which already carries its lessons (specs/claude-transient-retry D2).
         if (isCommandInput(content) || content === CLAUDE_TRANSIENT_CONTINUE_PROMPT) {
