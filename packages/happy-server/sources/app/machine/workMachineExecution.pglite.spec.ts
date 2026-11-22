@@ -168,11 +168,16 @@ describe('work machine execution authority', () => {
         await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: new Date() } });
         try {
             expect((await invoke('readFile')).refused).toBe(false);
+            // Status the web client polls after a switch must not close the way back.
+            for (const method of ['daemon-session-state', 'mcp-status', 'getDirectoryTree', 'ripgrep', 'get-port',
+                'claude-list-rewind-points', 'codex-list-rewind-points', 'checkpoint:list', 'checkpoint:status', 'checkpoint:diff']) {
+                expect((await invoke(method)).refused, method).toBe(false);
+            }
             expect((await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt).toBeNull();
             expect((await invoke('writeFile')).refused).toBe(true);
             await freezeWorkMachineExecution(db, original);
             expect((await invoke('readFile')).refused).toBe(true);
-            expect(emitted).toEqual([`${machineId}:readFile`]);
+            expect(emitted).toHaveLength(11);
         } finally {
             await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
         }

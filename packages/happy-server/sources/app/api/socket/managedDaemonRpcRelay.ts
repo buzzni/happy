@@ -77,6 +77,10 @@ export type DaemonRpcRelayDeps = {
  */
 const workMachineRpcTiers = new Map<string, 'read' | 'turn-stop' | 'turn-answer'>([
     ['readFile', 'read'], ['readFileChunk', 'read'], ['listDirectory', 'read'], ['listFilesPage', 'read'],
+    // Status the web client polls; a poll after a switch must not close the way back.
+    ['daemon-session-state', 'read'], ['mcp-status', 'read'], ['getDirectoryTree', 'read'], ['ripgrep', 'read'],
+    ['get-port', 'read'], ['claude-list-rewind-points', 'read'], ['codex-list-rewind-points', 'read'],
+    ['checkpoint:list', 'read'], ['checkpoint:status', 'read'], ['checkpoint:diff', 'read'],
     ['abort', 'turn-stop'],
     ['permission', 'turn-answer'],
 ]);
