@@ -183,9 +183,9 @@ describe('work machine execution authority', () => {
         expect((await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt).not.toBeNull();
         expect(await freezeWorkMachineExecution(db, original)).toBe(true);
         await expect(authority.admitWorkMachineMcpCall(db, original, secondId)).resolves.toBe(false);
-        await expect(replaceWorkMachineExecution(db, original, replacement.deviceId)).resolves.toBe(false);
+        await expect(replaceWorkMachineExecution(db, original, replacement.deviceId)).resolves.toBe('open-mcp-calls');
         await authority.finishWorkMachineMcpCall(db, { ...original, generation: 2 }, requestId);
-        await expect(replaceWorkMachineExecution(db, original, replacement.deviceId)).resolves.toBe(false);
+        await expect(replaceWorkMachineExecution(db, original, replacement.deviceId)).resolves.toBe('open-mcp-calls');
         await authority.finishWorkMachineMcpCall(db, original, requestId);
         await authority.finishWorkMachineMcpCall(db, original, requestId);
         await expect(replaceWorkMachineExecution(db, original, replacement.deviceId)).resolves.toBe(true);
@@ -208,7 +208,7 @@ describe('work machine execution authority', () => {
         expect(await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } }))
             .toMatchObject({ firstExecutionAt: null });
         await expect(machineSockets.permitMachineDispatchSockets(db, accountId, machineId, [current, older], now)).resolves.toEqual([current]);
-        expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).toBe(false);
+        expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).toBe('first-execution-recorded');
         const ordinary = [{ id: 'ordinary', data: {} }];
         await expect(machineSockets.permitMachineDispatchSockets(db, accountId, 'ordinary-machine', ordinary, now)).resolves.toEqual(ordinary);
         await expect(machineSockets.permitMachineDispatchSockets(db, accountId, machineId, ordinary, now)).resolves.toEqual([]);
@@ -223,7 +223,7 @@ describe('work machine execution authority', () => {
         await expect(freezeWorkMachineExecution(db, original)).resolves.toBe(true);
         await expect(authorizeWorkMachineExecution(db, original)).resolves.toBe(false);
         await expect(replaceWorkMachineExecution(db, original, replacement.deviceId)).resolves.toBe(true);
-        await expect(replaceWorkMachineExecution(db, original, 'late-device')).resolves.toBe(false);
+        await expect(replaceWorkMachineExecution(db, original, 'late-device')).resolves.toBe('generation-mismatch');
         await expect(authorizeWorkMachineExecution(db, original)).resolves.toBe(false);
         await expect(authorizeWorkMachineExecution(db, { ...replacement, deviceId: original.deviceId })).resolves.toBe(false);
         await expect(authorizeWorkMachineExecution(db, replacement)).resolves.toBe(true);
@@ -243,7 +243,8 @@ describe('work machine execution authority', () => {
             restoreWorkMachineExecution(db, replacement, original.deviceId),
         ]);
 
-        expect(Number(allowed) + Number(restored)).toBe(1);
+        expect(Number(allowed) + Number(restored === true)).toBe(1);
+        expect(restored === true || restored === 'first-execution-recorded').toBe(true);
         const current = await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } });
         expect(current.deviceId).toBe(allowed ? replacement.deviceId : original.deviceId);
         expect(current.generation).toBe(allowed ? replacement.generation : replacement.generation + 1);
@@ -254,17 +255,17 @@ describe('work machine execution authority', () => {
     it('restores only to the device the replace moved the authority away from', async () => {
         const row = () => db.workMachineExecution.findUniqueOrThrow({ where: { machineId } });
         // An enrolled generation was never handed off, so it has nowhere to return to.
-        expect(await restoreWorkMachineExecution(db, original, 'enrolled-elsewhere')).toBe(false);
+        expect(await restoreWorkMachineExecution(db, original, 'enrolled-elsewhere')).toBe('previous-device-mismatch');
         expect(await freezeWorkMachineExecution(db, original)).toBe(true);
         expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
         expect(await row()).toMatchObject({ previousDeviceId: original.deviceId });
-        expect(await restoreWorkMachineExecution(db, replacement, 'some-other-pc')).toBe(false);
+        expect(await restoreWorkMachineExecution(db, replacement, 'some-other-pc')).toBe('previous-device-mismatch');
         expect(await row()).toMatchObject({ deviceId: replacement.deviceId, generation: replacement.generation });
         expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).toBe(true);
         expect(await row()).toMatchObject({ deviceId: original.deviceId, generation: replacement.generation + 1, previousDeviceId: null });
         // A restore does not chain back to the replacement.
         expect(await restoreWorkMachineExecution(db, { ...original, generation: replacement.generation + 1 }, replacement.deviceId))
-            .toBe(false);
+            .toBe('previous-device-mismatch');
     });
 
     it('refuses to restore while the replacement holds an unfinished automation claim', async () => {
@@ -282,7 +283,7 @@ describe('work machine execution authority', () => {
                 automationId: automation.id, generation: 1, scheduledFor: claimedAt, machineAccountId: accountId, machineId,
                 status: 'CLAIMED', claimTokenHash: new Uint8Array(32).fill(7), claimExpiresAt: new Date(Date.now() + 60_000), claimedAt,
             } });
-            expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).toBe(false);
+            expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).toBe('open-automation-runs');
             expect(await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } }))
                 .toMatchObject({ deviceId: replacement.deviceId, generation: replacement.generation });
             await db.automationRun.update({ where: { id: run.id }, data: { status: 'EXPIRED', completedAt: new Date() } });
@@ -566,7 +567,7 @@ describe('work machine execution authority', () => {
                 () => db.automationRun.update({ where: { id: 'claimed-run' }, data: { status: 'EXPIRED', completedAt: at(0) } }),
             ];
             for (const finish of finishes) {
-                expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(false);
+                expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe('open-automation-runs');
                 expect(await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } }))
                     .toMatchObject({ deviceId: original.deviceId, generation: 1 });
                 await finish();
@@ -737,8 +738,12 @@ describe('work machine execution authority', () => {
             });
             expect(unsigned.statusCode).toBe(403);
             expect((await control('drain', at(1), 'work-machine-freeze')).statusCode).toBe(403);
-            expect((await control('freeze', at(1))).statusCode).toBe(409);
-            expect((await control('drain', at(2))).statusCode).toBe(409);
+            const notDrained = await control('freeze', at(1));
+            expect(notDrained.statusCode).toBe(409);
+            expect(notDrained.json()).toMatchObject({ reason: 'not-draining' });
+            const otherGeneration = await control('drain', at(2));
+            expect(otherGeneration.statusCode).toBe(409);
+            expect(otherGeneration.json()).toMatchObject({ reason: 'generation-mismatch' });
 
             // Cancel before the handoff: drain, freeze, then resume in the same generation.
             const drained = { deviceId: source.id, generation: 1, draining: true, frozen: false };
@@ -762,12 +767,16 @@ describe('work machine execution authority', () => {
             const draining = await state();
             expect(draining).toMatchObject({ draining: true, frozen: false, firstExecution: true });
             expect(draining.openMcpCalls).toEqual([{ requestId, admittedAt: expect.any(Number) }]);
-            expect((await control('mcp-reconcile', { ...at(1), requestId })).statusCode).toBe(409);
+            const notFrozen = await control('mcp-reconcile', { ...at(1), requestId });
+            expect(notFrozen.statusCode).toBe(409);
+            expect(notFrozen.json()).toMatchObject({ reason: 'not-frozen' });
             expect((await control('freeze', at(1))).json()).toEqual(frozen);
             expect(await write(sourceToken, 'after-freeze')).toBe(403);
 
             const nextKey = envelope(2);
-            expect((await control('replace', replaceBody(1, nextKey))).statusCode).toBe(409);
+            const openCall = await control('replace', replaceBody(1, nextKey));
+            expect(openCall.statusCode).toBe(409);
+            expect(openCall.json()).toMatchObject({ reason: 'open-mcp-calls' });
             expect((await db.machine.findUniqueOrThrow({ where: { id: migrating } })).dataEncryptionKey).toEqual(new Uint8Array(envelope(1)));
             const reconciled = await control('mcp-reconcile', { ...at(1), requestId });
             expect(reconciled.statusCode).toBe(200);
@@ -791,7 +800,9 @@ describe('work machine execution authority', () => {
             } });
             expect((await state()).openAutomationRuns)
                 .toEqual([{ kind: 'automation-run', id: openRun.id, claimedAt: claimedAt.getTime() }]);
-            expect((await control('replace', replaceBody(1, nextKey))).statusCode).toBe(409);
+            const openClaim = await control('replace', replaceBody(1, nextKey));
+            expect(openClaim.statusCode).toBe(409);
+            expect(openClaim.json()).toMatchObject({ reason: 'open-automation-runs' });
             expect((await db.workMachineExecution.findUniqueOrThrow({ where: { machineId: migrating } })).deviceId).toBe(source.id);
             await db.automationRun.update({ where: { id: openRun.id }, data: { status: 'COMPLETED', completedAt: new Date() } });
             expect((await state()).openAutomationRuns).toEqual([]);
@@ -806,7 +817,9 @@ describe('work machine execution authority', () => {
             const retried = await control('replace', replaceBody(1, nextKey));
             expect(retried.statusCode).toBe(200);
             expect(retried.json()).toEqual(replaced.json());
-            expect((await control('replace', replaceBody(1, envelope(4)))).statusCode).toBe(409);
+            const otherKey = await control('replace', replaceBody(1, envelope(4)));
+            expect(otherKey.statusCode).toBe(409);
+            expect(otherKey.json()).toMatchObject({ reason: 'key-mismatch' });
             const after = await db.machine.findUniqueOrThrow({ where: { id: migrating } });
             expect(after.dataEncryptionKey).toEqual(new Uint8Array(nextKey));
             expect(after.metadataVersion).toBe(before.metadataVersion + 1);
@@ -830,7 +843,9 @@ describe('work machine execution authority', () => {
             expect((await control('replace', replaceBody(3, envelope(6)))).json()).toEqual({ deviceId: target.id, generation: 4 });
             expect(await permit(await sessionToken(target.id, 4))).toBe(204);
             expect((await state()).firstExecution).toBe(true);
-            expect((await control('restore', restoreBody(4, envelope(7)))).statusCode).toBe(409);
+            const ranAlready = await control('restore', restoreBody(4, envelope(7)));
+            expect(ranAlready.statusCode).toBe(409);
+            expect(ranAlready.json()).toMatchObject({ reason: 'first-execution-recorded' });
             expect((await state()).deviceId).toBe(target.id);
         } finally {
             await app.close();
@@ -1000,7 +1015,7 @@ describe('work machine execution authority', () => {
             expect((await mintState('ordinary-machine')).json()).toEqual({ fenced: true });
             expect((await readMcpScope(mcpScopePayload)).statusCode).toBe(403);
             expect((await readDaemonScope(daemonToken)).statusCode).toBe(403);
-            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(false);
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe('open-mcp-calls');
             expect((await signedCall('finish', proof(call, 'work-machine-mcp-admit'))).statusCode).toBe(403);
             expect((await signedCall('finish', proof(call, 'work-machine-mcp-finish'))).statusCode).toBe(204);
             expect(await db.workMachineMcpCall.count({ where: { requestId: call.requestId, completedAt: { not: null } } })).toBe(1);
@@ -1024,7 +1039,7 @@ describe('work machine execution authority', () => {
             expect((await turnPermit(newSessionBearer, 'absent-session')).statusCode).toBe(403);
             expect((await turnPermit(bearer)).statusCode).toBe(403);
             expect((await turnPermit(newSessionBearer)).statusCode).toBe(204);
-            expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).toBe(false);
+            expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).toBe('first-execution-recorded');
 
             const sourceId = 'ordinary-machine';
             const signingKey = generateKeyPairSync('ed25519');
@@ -1291,7 +1306,7 @@ describe('work machine execution authority', () => {
             expect(await current('automation-run-heartbeat', runs[1])).toEqual({ ok: false, error: 'forbidden' });
             expect(await report(current, runs[1], null, 'report-frozen')).toEqual({ ok: false, error: 'forbidden' });
             // The handoff waits for the run's lease, which the frozen generation can no longer extend.
-            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(false);
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe('open-automation-runs');
             await db.automationRun.update({ where: { id: runs[1].runId }, data: { runLeaseExpiresAt: new Date(Date.now() - 1) } });
             expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
             expect(await report(current, runs[1], null, 'report-old-generation')).toEqual({ ok: false, error: 'forbidden' });
@@ -1346,7 +1361,7 @@ describe('work machine execution authority', () => {
             expect(await send('automation-claim', { automationId: automation.id, generation: 1, scheduledFor: Date.now() }))
                 .toMatchObject({ ok: true });
             expect(await firstExecution()).not.toBeNull();
-            expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).not.toBe(true);
+            expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).toBe('first-execution-recorded');
         } finally {
             await db.project.delete({ where: { id: project.id } });
             vi.unstubAllEnvs();
@@ -1431,7 +1446,7 @@ describe('work machine execution authority', () => {
             expect((await heartbeat(current, 'device-running-frozen', frozenToken)).statusCode).toBe(403);
             expect((await abandon(current, 'device-running-frozen', frozenToken)).statusCode).toBe(403);
             // The handoff waits for the run's lease, which the frozen generation can no longer extend.
-            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(false);
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe('open-automation-runs');
             await db.scriptInvocation.update({ where: { id: 'device-running-frozen' }, data: { leaseExpiresAt: Date.now() - 1 } });
             expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
             expect((await abandon(current, 'device-running-frozen', frozenToken)).statusCode).toBe(403);

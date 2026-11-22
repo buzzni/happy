@@ -300,7 +300,7 @@ export function workMachineExecutionRoutes(app: Fastify, getVerifier: () => Cont
                 return reply.code(403).send({ error: 'Work machine transition not authorized' });
             }
             const state = await transitions[action](db, { accountId: request.userId, machineId, ...request.body });
-            if (!state) return reply.code(409).send({ error: 'Work machine transition not ready' });
+            if (typeof state === 'string') return reply.code(409).send({ error: 'Work machine transition not ready', reason: state });
             return reply.header('Cache-Control', 'no-store').send(state);
         });
     }
@@ -345,7 +345,7 @@ export function workMachineExecutionRoutes(app: Fastify, getVerifier: () => Cont
             const result = await inTx(tx => handoffWorkMachineExecution(
                 tx, kind, { accountId, machineId, deviceId, generation }, nextDeviceId, key,
             ));
-            if (!result) return reply.code(409).send({ error: 'Work machine handoff not ready' });
+            if ('refused' in result) return reply.code(409).send({ error: 'Work machine handoff not ready', reason: result.refused });
             if (result.changed) {
                 const { metadata, metadataVersion, daemonState, daemonStateVersion } = result.machine;
                 const payload = buildUpdateMachineUpdate(machineId, await allocateUserSeq(accountId), randomKeyNaked(12),
@@ -374,7 +374,7 @@ export function workMachineExecutionRoutes(app: Fastify, getVerifier: () => Cont
         const result = await db.$transaction(tx => reconcileWorkMachineMcpCall(
             tx, { accountId: request.userId, machineId, deviceId, generation }, requestId,
         ));
-        if (result === 'not-frozen') return reply.code(409).send({ error: 'Work machine is not frozen' });
+        if (result === 'not-frozen') return reply.code(409).send({ error: 'Work machine is not frozen', reason: 'not-frozen' });
         if (result === 'not-found') return reply.code(404).send({ error: 'Work machine connector call not found' });
         return reply.header('Cache-Control', 'no-store').send({ requestId, reconciledAt: result.reconciledAt?.getTime() ?? null });
     });
