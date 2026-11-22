@@ -729,6 +729,23 @@ export function shouldRunScriptAutomations(input: {
     return input.enabled === undefined || input.enabled === '1';
 }
 
+/**
+ * The account the script automation worker runs for. A protected daemon holds
+ * a device credential, not an account token, so the account profile route
+ * refuses it; its execution binding names the account that credential is
+ * issued for, which every renewal and the machine's script listing that
+ * follows the preflight check on the server. Other daemons read the profile.
+ */
+export async function scriptAutomationAccountId(input: {
+    workMachineAccountId: string | null;
+    readProfile: () => Promise<unknown>;
+}): Promise<string> {
+    if (input.workMachineAccountId) return input.workMachineAccountId;
+    const profile = await input.readProfile() as { id?: unknown };
+    if (typeof profile.id !== 'string' || !profile.id) throw new Error('SCRIPT_ACCOUNT_UNAVAILABLE');
+    return profile.id;
+}
+
 export async function startDaemon(): Promise<void> {
   // Host bootstrap belongs to this incarnation, never to spawned agent children.
   const writeScopeHostEnvironment = Object.fromEntries(Object.entries(process.env)
@@ -5495,14 +5512,16 @@ export async function startDaemon(): Promise<void> {
           if (!studioConfigUrl) throw new Error('SCRIPT_STUDIO_AUTHORIZATION_REQUIRED');
           const studioUrl = new URL(studioConfigUrl);
           if (studioUrl.protocol !== 'https:' && !(studioUrl.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(studioUrl.hostname))) throw new Error('SCRIPT_STUDIO_HTTPS_REQUIRED');
-          const profile = await request('GET', '/v1/account/profile') as { id?: unknown };
-          if (typeof profile.id !== 'string' || !profile.id) throw new Error('SCRIPT_ACCOUNT_UNAVAILABLE');
-          const ownerId = createHash('sha256').update(JSON.stringify([configuration.serverUrl, profile.id, machineId])).digest('hex');
+          const accountId = await scriptAutomationAccountId({
+            workMachineAccountId: executionBinding?.accountId ?? null,
+            readProfile: () => request('GET', '/v1/account/profile'),
+          });
+          const ownerId = createHash('sha256').update(JSON.stringify([configuration.serverUrl, accountId, machineId])).digest('hex');
           const directory = join(configuration.happyHomeDir, 'script-automations', ownerId);
           const temporaryRoot = join(directory, 'work');
           await prepareManagedScriptRuntime({ ownerId, directory: temporaryRoot, image: resolved.image });
           await request('GET', `/v1/machines/${encodeURIComponent(machineId)}/script-automations`);
-          runtime = { image: resolved.image, accountId: profile.id, ownerId, directory, temporaryRoot, studioOrigin: studioUrl.origin };
+          runtime = { image: resolved.image, accountId, ownerId, directory, temporaryRoot, studioOrigin: studioUrl.origin };
           return resolved;
         },
         createWorker: async () => {
