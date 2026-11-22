@@ -5657,7 +5657,9 @@ export async function startDaemon(): Promise<void> {
           journal: contextJournal, accountId: contextAccountId, happyOrigin: configuration.serverUrl,
           keys: deviceKeys, pin: companyId => deviceEnrollment!.orgPin(companyId),
         } } : {}) }) });
-    const contextAccountId = contextWorkspace && trustedStudioOrigin ? await authenticatedAccountId(credentials.token) : null;
+    // A protected daemon's device credential cannot read the account profile; its binding names the account.
+    const contextAccountId = contextWorkspace && trustedStudioOrigin
+      ? executionBinding?.accountId ?? await authenticatedAccountId(credentials.token) : null;
     const contextJournal = contextAccountId ? createAutomationContextLaunchJournal(configuration.happyHomeDir) : null;
     const contextReference = contextAccountId && contextJournal ? createAutomationContextReferenceReader({
       serverUrl: configuration.serverUrl, token: credentials.token, accountId: contextAccountId, machineId, journal: contextJournal,
